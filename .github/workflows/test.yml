@@ -1,0 +1,686 @@
+name: Rust Test CI
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'shared/**'
+      - 'shared/**/*.rs'
+      - 'score/**'
+      - 'score/tests/**'
+      - 'calibrate/**'
+      - 'map/**'
+      - 'map/**/*.rs'
+      - 'map/*.rs'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'shared/**'
+      - 'shared/**/*.rs'
+      - 'score/**'
+      - 'score/tests/**'
+      - 'calibrate/**'
+      - 'map/**'
+      - 'map/**/*.rs'
+      - 'map/*.rs'
+  workflow_dispatch:  # Manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    outputs:
+      rust_changes: ${{ steps.rust_changes.outputs.rust }}
+      artifact_available: ${{ steps.artifact_status.outputs.available }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Detect if any Rust-relevant files changed ------------------------------
+      - name: Detect Rust source changes
+        id: rust_changes
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            rust:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '**/*.rs'
+            core:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'shared/**'
+              - 'shared/**/*.rs'
+            score:
+              - 'score/**'
+              - 'score/**/*.rs'
+              - 'score/tests/**'
+            map:
+              - 'map/**'
+              - 'map/**/*.rs'
+              - 'map/*.rs'
+            calibrate:
+              - 'calibrate/**'
+              - 'calibrate/**/*.rs'
+              - 'calibrate/*.rs'
+      # -----------------------------------------------------------------------
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Prepare cache metadata
+        id: cache_meta
+        shell: bash
+        run: |
+          echo "week=$(date -u +%G%V)" >> "$GITHUB_OUTPUT"
+          DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
+          echo "deps_hash=$DEPS_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Cargo registry (CI speed only)
+        if: steps.rust_changes.outputs.rust == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ steps.cache_meta.outputs.deps_hash }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Restore Cargo build cache (CI speed only)
+        id: cargo_build_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-
+            ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-
+            ${{ runner.os }}-cargo-build-nightly-
+
+      # -------------------- PREWARM EVERYTHING (so artifacts are complete) --------------------
+      - name: Cargo fetch (prepopulate deps cache)
+        if: steps.rust_changes.outputs.rust == 'true'
+        run: cargo +nightly fetch
+
+      - name: "Prebuild debug (lib/bin/tests, no-run)"
+        if: steps.rust_changes.outputs.rust == 'true'
+        run: |
+          cargo +nightly build
+          cargo +nightly test --no-run
+
+      - name: Run Rust unit tests
+        id: test_step
+        if: steps.rust_changes.outputs.core == 'true'
+        run: |
+          set -euo pipefail
+          rm -f cargo-test.log
+          cargo +nightly test --release -- \
+            --show-output \
+            --skip calibrate:: \
+            --skip map:: \
+            2>&1 | tee cargo-test.log
+        continue-on-error: true
+
+      - name: Run score-specific tests
+        if: steps.rust_changes.outputs.score == 'true'
+        run: 'cargo +nightly test --release score:: -- --nocapture'
+
+      - name: Run calibrate-specific tests
+        if: steps.rust_changes.outputs.calibrate == 'true'
+        run: 'cargo +nightly test --release calib -- --nocapture'
+
+      - name: Run map-specific tests
+        if: steps.rust_changes.outputs.map == 'true'
+        run: 'cargo +nightly test --release map:: -- --nocapture'
+
+      - name: Inspect Assembly for Performance Analysis
+        if: steps.rust_changes.outputs.rust == 'false'
+        run: |
+          cargo +nightly install cargo-show-asm --features disasm
+          echo "--- Building test harness for inspection ---"
+          cargo +nightly test --release --no-run
+          TEST_HARNESS_PATH=$(find target/release/deps -name "gnomon-*" -type f -executable -print -quit)
+          if [[ -z "$TEST_HARNESS_PATH" ]]; then
+            echo "::error::Could not find compiled test harness."
+            exit 1
+          fi
+          echo "Found test harness at: $TEST_HARNESS_PATH"
+          echo "---"
+          echo "--- ASSEMBLY FOR SIMD VERSION (from library) ---"
+          echo "---"
+          # `score::batch` now lives under the `score` module, so keep the inspected symbol
+          # aligned with the library's public path to avoid false CI failures.
+          cargo +nightly asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::score::batch::process_tile 0
+
+      - name: Cache getdoc binary
+        id: getdoc_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/getdoc
+          key: ${{ runner.os }}-getdoc-v1
+
+      - name: Install getdoc
+        if: steps.rust_changes.outputs.rust == 'true' && steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
+        run: cargo +nightly install getdoc --locked
+
+      - name: Generate custom report with getdoc
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
+        run: |
+          ~/.cargo/bin/getdoc --features default
+          cat report.md
+
+      - name: Build Gnomon binaries (Release and Profiling)
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success'
+        run: |
+          cargo +nightly build --release
+          cargo +nightly build --profile profiling --features no-inline-profiling
+      # ----------------------------------------------------------------------------------------
+
+      # -------------------- EXPORT: GATHER ONLY ESSENTIAL METADATA --------------------
+      - name: Compute safe artifact names (always)
+        id: naming
+        if: always()
+        shell: bash
+        run: |
+          SAFE_REF="$(printf '%s' "${GITHUB_REF_NAME:-unknown}" | tr -c 'A-Za-z0-9_.-' '-')"
+          SHORT_SHA="$(printf '%.12s' "${GITHUB_SHA}")"
+          echo "safe_ref=$SAFE_REF" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Collect build metadata (always)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p export
+          {
+            echo "branch=${GITHUB_REF_NAME}"
+            echo "branch_sanitized=${{ steps.naming.outputs.safe_ref }}"
+            echo "commit=${GITHUB_SHA}"
+            echo "short_commit=${{ steps.naming.outputs.short_sha }}"
+            echo "week=${{ steps.cache_meta.outputs.week }}"
+            echo "deps_hash=${{ steps.cache_meta.outputs.deps_hash }}"
+            echo ""
+            echo "--- rustc ---"
+            (rustc +nightly -Vv || true)
+            echo ""
+            echo "--- cargo ---"
+            (cargo +nightly -Vv || true)
+            echo ""
+            echo "--- host uname ---"
+            (uname -a || true)
+          } > export/build-meta.txt
+
+      - name: Upload artifact – build metadata (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-meta-${{ steps.naming.outputs.safe_ref }}-${{ steps.naming.outputs.short_sha }}
+          path: export/build-meta.txt
+          retention-days: 30
+
+      - name: Pack target-all cache tar (main only)
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success' && github.ref_name == 'main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=()
+          [ -d target/release ] && paths+=("target/release")
+          [ -d target/profiling ] && paths+=("target/profiling")
+          if [ ${#paths[@]} -eq 0 ]; then
+            echo "No target/{release,profiling} to pack"; exit 0
+          fi
+          tar -cf "target-all-${{ steps.naming.outputs.short_sha }}.tar" "${paths[@]}"
+          ls -lh "target-all-${{ steps.naming.outputs.short_sha }}.tar"
+      - name: Upload artifact – target-all cache (main only)
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success' && github.ref_name == 'main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-all-${{ steps.naming.outputs.short_sha }}
+          path: target-all-${{ steps.naming.outputs.short_sha }}.tar
+          retention-days: 3
+
+      - name: Cleanup target-all tar after upload (free disk space)
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success' && github.ref_name == 'main'
+        run: rm -f target-all-*.tar
+
+      - name: Prepare trimmed build artifact (always)
+        if: always()
+        shell: bash
+        run: |
+          rm -rf build-output
+          mkdir -p build-output
+          if [[ -d target/release ]]; then
+            mkdir -p build-output/target/release
+            rsync -a \
+              --exclude 'build' \
+              --exclude 'incremental' \
+              --exclude '*.d' \
+              --exclude '*.rlib' \
+              --exclude '*.rmeta' \
+              target/release/ build-output/target/release/
+          fi
+          if [[ -d target/profiling ]]; then
+            mkdir -p build-output/target/profiling
+            rsync -a target/profiling/ build-output/target/profiling/
+          fi
+          if [[ -f report.md ]]; then
+            cp report.md build-output/
+          fi
+          if [[ -f cargo-test.log ]]; then
+            cp cargo-test.log build-output/
+          fi
+          rm -rf target/debug target/.fingerprint target/incremental
+
+      - name: Summarize Rust test failures
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
+        shell: bash
+        run: |
+          if [[ ! -s cargo-test.log ]]; then
+            echo "::warning::cargo-test.log missing or empty; skipping failure summary."
+            exit 0
+          fi
+          echo '=== Rust test failure context (FAILED ±20 lines) ==='
+          if ! rg --color=never --no-heading --context 20 'FAILED' cargo-test.log; then
+            echo "::warning::No lines containing 'FAILED' found in cargo-test.log."
+          fi
+
+      - name: Cleanup workspace leftovers (always)
+        if: always()
+        run: |
+          rm -rf export
+          du -sh build-output || true
+
+      - name: Fail job if unit tests failed
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
+        run: exit 1
+
+      - name: Upload build artifacts for all downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: build-output
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Determine artifact availability (always)
+        id: artifact_status
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f build-output/target/release/gnomon ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  python_test_integration:
+    needs: build_and_test
+    if: needs.build_and_test.outputs.artifact_available == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: .
+      - name: Restore expected artifact layout
+        run: |
+          if [ -d build-output/target ]; then
+            rm -rf target
+            mkdir -p target
+            rsync -a build-output/target/ target/
+          elif [ -d target ]; then
+            echo "Target directory already present after artifact download; leaving as-is."
+          elif [ -d build-output ]; then
+            echo "::error::Downloaded build-output artifact does not contain a target directory."
+            find build-output -maxdepth 3 -print
+            exit 1
+          else
+            echo "::error::No build-output artifact was downloaded."
+            exit 1
+          fi
+          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
+          rm -rf build-output
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.13' }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-integration-${{ hashFiles('score/tests/test.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-integration-
+      - run: pip install pandas numpy requests psutil tabulate polars pyarrow
+      - run: chmod +x target/release/gnomon
+      - run: python -u score/tests/test.py
+
+  python_test_simulation:
+    needs: build_and_test
+    if: needs.build_and_test.outputs.artifact_available == 'true' || needs.build_and_test.outputs.rust_changes == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Report absence of Rust source changes
+        if: needs.build_and_test.outputs.artifact_available != 'true'
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -eo pipefail
+          echo "No Rust source changes detected in this run; skipping python_test_simulation."
+          echo "Rust-sensitive files that remained unchanged:"
+          printf '  - Cargo.toml\n  - Cargo.lock\n  - all *.rs files\n'
+          if [ -n "${BASE_SHA:-}" ]; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA" >/dev/null 2>&1 || true
+            echo "Changed files in this run:"
+            CHANGED=$(git diff --name-only "${BASE_SHA}" "$GITHUB_SHA" || true)
+            if [ -n "$CHANGED" ]; then
+              printf '%s\n' "$CHANGED" | sed 's/^/  - /'
+            else
+              echo "  (no files changed)"
+            fi
+          else
+            echo "Changed files in this run: (base commit unavailable)"
+          fi
+          exit 0
+      - uses: actions/download-artifact@v4
+        if: needs.build_and_test.outputs.artifact_available == 'true'
+        with:
+          name: build-output
+          path: .
+      - name: Restore expected artifact layout
+        if: needs.build_and_test.outputs.artifact_available == 'true'
+        run: |
+          if [ -d build-output/target ]; then
+            rm -rf target
+            mkdir -p target
+            rsync -a build-output/target/ target/
+          elif [ -d target ]; then
+            echo "Target directory already present after artifact download; leaving as-is."
+          elif [ -d build-output ]; then
+            echo "::error::Downloaded build-output artifact does not contain a target directory."
+            find build-output -maxdepth 3 -print
+            exit 1
+          else
+            echo "::error::No build-output was downloaded."
+            exit 1
+          fi
+          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
+          rm -rf build-output
+      - uses: actions/setup-python@v4
+        if: needs.build_and_test.outputs.artifact_available == 'true'
+        with: { python-version: '3.13' }
+      - uses: actions/cache@v4
+        if: needs.build_and_test.outputs.artifact_available == 'true'
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-simulation-${{ hashFiles('score/tests/sim_test.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-simulation-
+      - run: pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
+        if: needs.build_and_test.outputs.artifact_available == 'true'
+      - run: chmod +x target/release/gnomon
+        if: needs.build_and_test.outputs.artifact_available == 'true'
+      - id: sim_test
+        if: needs.build_and_test.outputs.artifact_available == 'true'
+        run: python -u score/tests/sim_test.py
+      - if: needs.build_and_test.outputs.artifact_available == 'true' && failure()
+        run: |
+          echo "The simulation test failed. Checking for OOM errors in kernel logs..."
+          sudo dmesg | grep -i -E 'killed process|out of memory' || echo "No OOM messages found."
+
+  python_test_benchmark:
+    needs: build_and_test
+    if: needs.build_and_test.outputs.artifact_available == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: .
+      - name: Restore expected artifact layout
+        run: |
+          if [ -d build-output/target ]; then
+            rm -rf target
+            mkdir -p target
+            rsync -a build-output/target/ target/
+          elif [ -d target ]; then
+            echo "Target directory already present after artifact download; leaving as-is."
+          elif [ -d build-output ]; then
+            echo "::error::Downloaded build-output artifact does not contain a target directory."
+            find build-output -maxdepth 3 -print
+            exit 1
+          else
+            echo "::error::No build-output artifact was downloaded."
+            exit 1
+          fi
+          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
+          rm -rf build-output
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.13' }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-benchmark-${{ hashFiles('score/tests/bench.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-benchmark-
+      - run: pip install pandas numpy requests psutil tabulate polars pyarrow
+      - run: chmod +x target/release/gnomon
+      - run: python -u score/tests/bench.py
+
+  performance_reports:
+    needs: build_and_test
+    if: needs.build_and_test.outputs.artifact_available == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: .
+      - name: Restore expected artifact layout
+        run: |
+          if [ -d build-output/target ]; then
+            rm -rf target
+            mkdir -p target
+            rsync -a build-output/target/ target/
+          elif [ -d target ]; then
+            echo "Target directory already present after artifact download; leaving as-is."
+          elif [ -d build-output ]; then
+            echo "::error::Downloaded build-output artifact does not contain a target directory."
+            find build-output -maxdepth 3 -print
+            exit 1
+          else
+            echo "::error::No build-output artifact was downloaded."
+            exit 1
+          fi
+          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
+          rm -rf build-output
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Ensure profiling binary is available
+        id: profiling_binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find_profiling_binary() {
+            if [ -f target/profiling/gnomon ]; then
+              printf '%s' 'target/profiling/gnomon'
+              return
+            fi
+
+            if [ -d target/profiling ]; then
+              local found
+              found=$(find target/profiling -maxdepth 3 -type f -name 'gnomon' -print -quit 2>/dev/null || true)
+              if [ -n "$found" ]; then
+                printf '%s' "$found"
+                return
+              fi
+            fi
+
+            if [ -d target ]; then
+              local found
+              found=$(find target -maxdepth 5 -type f -name 'gnomon' -path '*/profiling/*' -print -quit 2>/dev/null || true)
+              if [ -n "$found" ]; then
+                printf '%s' "$found"
+                return
+              fi
+            fi
+
+            printf ''
+          }
+
+          BIN_PATH=$(find_profiling_binary)
+
+          if [ -z "$BIN_PATH" ]; then
+            echo "Profiling binary missing from artifact; rebuilding with cargo."
+            cargo +nightly build --profile profiling --features no-inline-profiling
+            BIN_PATH=$(find_profiling_binary)
+          fi
+
+          if [ -z "$BIN_PATH" ]; then
+            echo "::error::Unable to locate profiling binary even after rebuild."
+            exit 1
+          fi
+
+          chmod +x "$BIN_PATH"
+
+          if [ "$BIN_PATH" != "target/profiling/gnomon" ]; then
+            mkdir -p target/profiling
+            cp "$BIN_PATH" target/profiling/gnomon
+            chmod +x target/profiling/gnomon
+            BIN_PATH="target/profiling/gnomon"
+          fi
+
+          echo "path=$BIN_PATH" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.11' }
+
+      - name: Install Python dependencies
+        run: pip install pandas numpy requests psutil
+
+      - name: System Diagnostics
+        run: |
+          echo "--- System Information ---"
+          echo "Kernel: $(uname -a)"
+          echo "Distribution: $(lsb_release -a || true)"
+          echo "CPU Cores: $(nproc)"
+          echo "--- Memory ---"
+          free -h
+          echo "------------------------"
+
+      - name: Get Kernel Version for Cache Key
+        id: kernel_version
+        run: echo "version=$(uname -r)" >> $GITHUB_OUTPUT
+
+      - name: Cache APT packages for perf
+        id: apt_cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/apt/archives
+            /var/lib/apt/lists
+          key: ${{ runner.os }}-apt-perf-tools-cache-${{ steps.kernel_version.outputs.version }}
+
+      - name: Install Perf Tools
+        run: |
+          set -euo pipefail
+
+          CURRENT_KERNEL=$(uname -r)
+          KERNEL_NO_FLAVOR=${CURRENT_KERNEL%%-*}
+          KERNEL_MAJOR_MINOR=$(echo "$CURRENT_KERNEL" | cut -d. -f1-2)
+
+          if [ "${{ steps.apt_cache.outputs.cache-hit }}" != 'true' ]; then
+            sudo apt-get update -y
+          fi
+
+          install_pkg_if_available() {
+            local pkg="$1"
+            if apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: (none)'; then
+              echo "Skipping unavailable package: $pkg"
+            else
+              sudo apt-get install -y --no-install-recommends "$pkg"
+            fi
+          }
+
+          install_pkg_if_available linux-tools-common
+          install_pkg_if_available "linux-tools-${CURRENT_KERNEL}"
+          install_pkg_if_available "linux-cloud-tools-${CURRENT_KERNEL}"
+          install_pkg_if_available linux-tools-azure
+          install_pkg_if_available linux-cloud-tools-azure
+
+          ensure_perf_symlink() {
+            local candidate
+            for candidate in \
+              "/usr/bin/perf_${CURRENT_KERNEL}" \
+              "/usr/bin/perf_${KERNEL_NO_FLAVOR}" \
+              "/usr/bin/perf_${KERNEL_MAJOR_MINOR}" \
+              "/usr/lib/linux-tools-${CURRENT_KERNEL}/perf" \
+              "/usr/lib/linux-tools-${KERNEL_NO_FLAVOR}/perf" \
+              "/usr/lib/linux-tools-${KERNEL_MAJOR_MINOR}/perf"; do
+              if [ -x "$candidate" ]; then
+                echo "Linking perf from $candidate"
+                sudo ln -sf "$candidate" /usr/local/bin/perf
+                return 0
+              fi
+            done
+
+            candidate=$(find /usr/lib/linux-tools -maxdepth 2 -type f -name perf -print -quit 2>/dev/null || true)
+            if [ -n "$candidate" ]; then
+              echo "Linking perf from $candidate"
+              sudo ln -sf "$candidate" /usr/local/bin/perf
+              return 0
+            fi
+
+            return 1
+          }
+
+          if ! command -v perf >/dev/null 2>&1; then
+            ensure_perf_symlink || true
+          fi
+
+          if ! command -v perf >/dev/null 2>&1; then
+            echo "::error::perf binary not found after installation attempts"
+            exit 1
+          fi
+
+          perf --version
+
+      - name: Configure Profiler Permissions
+        run: |
+          sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
+          sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
+
+      - name: Run Profiling Harness
+        run: python score/tests/perf.py
+
+      - name: Grant Cache Permissions
+        if: always()
+        run: sudo chown -R runner:runner /var/cache/apt/archives /var/lib/apt/lists
+
+      - name: Upload Profiling Data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-data-${{ github.run_id }}
+          path: perf.data
+          if-no-files-found: ignore

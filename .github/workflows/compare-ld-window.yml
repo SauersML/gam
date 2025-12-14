@@ -1,0 +1,169 @@
+name: Compare Using Latest Release Fit LD Window Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to source artifacts from (e.g., main)"
+        required: false
+        default: "main"
+      folds:
+        description: "Number of CV folds for comparison"
+        required: false
+        default: "50"
+      random_state:
+        description: "Random seed for CV shuffling"
+        required: false
+        default: "42"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: compare-ld-window-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare-latest:
+    name: Python-only comparison using latest LD window artifacts
+    runs-on: ubuntu-22.04
+    env:
+      PY_REQ: scripts/requirements-release-fit.txt
+      WORKFLOW_NAME: Release Fit LD Window Sweep
+      ARTIFACT_PATTERN: gnomon-release-fit-*
+      DOWNLOAD_DIR: comparison
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: ${{ env.PY_REQ }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r "${PY_REQ}"
+
+      - name: Locate latest successful '${{ env.WORKFLOW_NAME }}' run
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "GH CLI version:"
+          gh --version
+          echo "Searching for workflow '${WORKFLOW_NAME}' runs on branch '${{ github.event.inputs.branch || 'main' }}'"
+          BRANCH="${{ github.event.inputs.branch || 'main' }}"
+          RUN_JSON=$(gh run list \
+            --workflow "${WORKFLOW_NAME}" \
+            --branch "${BRANCH}" \
+            --status success \
+            --limit 1 \
+            --json databaseId,headBranch,headSha,createdAt,url,displayTitle,conclusion)
+          echo "Raw gh run list JSON (successful runs): ${RUN_JSON}"
+          RUN_ID=$(echo "${RUN_JSON}" | jq -r '.[0].databaseId')
+
+          if [ -z "${RUN_ID}" ] || [ "${RUN_ID}" = "null" ]; then
+            echo "No successful runs for '${WORKFLOW_NAME}' on branch '${BRANCH}'. Falling back to most recent run regardless of conclusion." >&2
+            RUN_JSON=$(gh run list \
+              --workflow "${WORKFLOW_NAME}" \
+              --branch "${BRANCH}" \
+              --limit 1 \
+              --json databaseId,headBranch,headSha,createdAt,url,displayTitle,conclusion,status)
+            echo "Raw gh run list JSON (any conclusion): ${RUN_JSON}"
+            RUN_ID=$(echo "${RUN_JSON}" | jq -r '.[0].databaseId')
+          else
+            echo "Found successful run; skipping fallback search."
+          fi
+
+          HEAD_BRANCH=$(echo "${RUN_JSON}" | jq -r '.[0].headBranch')
+          HEAD_SHA=$(echo "${RUN_JSON}" | jq -r '.[0].headSha')
+          CREATED_AT=$(echo "${RUN_JSON}" | jq -r '.[0].createdAt')
+          RUN_URL=$(echo "${RUN_JSON}" | jq -r '.[0].url')
+          TITLE=$(echo "${RUN_JSON}" | jq -r '.[0].displayTitle')
+          CONCLUSION=$(echo "${RUN_JSON}" | jq -r '.[0].conclusion')
+          STATUS=$(echo "${RUN_JSON}" | jq -r '.[0].status // "unknown"')
+
+          test -n "${RUN_ID}" && test "${RUN_ID}" != "null" || { echo "No runs for '${WORKFLOW_NAME}' on branch '${BRANCH}'." >&2; false; }
+
+          echo "Selected run metadata:"
+          echo "  run_id=${RUN_ID}"
+          echo "  title=${TITLE}"
+          echo "  head_branch=${HEAD_BRANCH}"
+          echo "  head_sha=${HEAD_SHA}"
+          echo "  created_at=${CREATED_AT}"
+          echo "  run_url=${RUN_URL}"
+          echo "  conclusion=${CONCLUSION}"
+          echo "  status=${STATUS}"
+
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Using artifacts from::${WORKFLOW_NAME} • ${TITLE} • run_id=${RUN_ID}"
+          echo "::notice title=Run metadata::branch=${HEAD_BRANCH} sha=${HEAD_SHA} created=${CREATED_AT} url=${RUN_URL} conclusion=${CONCLUSION} status=${STATUS}"
+
+      - name: Download artifacts from that run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${DOWNLOAD_DIR}"
+          echo "Downloading artifacts matching pattern '${ARTIFACT_PATTERN}' into '${DOWNLOAD_DIR}'"
+          gh run download "${{ steps.find.outputs.run_id }}" --pattern "${ARTIFACT_PATTERN}" -D "${DOWNLOAD_DIR}" --verbose
+          echo "Download directory structure:"
+          find "${DOWNLOAD_DIR}" -maxdepth 2 -type d -print
+          echo "All files fetched (detailed listing):"
+          ls -alR "${DOWNLOAD_DIR}" || true
+
+      - name: Sanity check projection TSVs exist
+        run: |
+          set -euo pipefail
+          echo "Scanning '${DOWNLOAD_DIR}' for projection TSVs"
+          mapfile -t tsvs < <(find "${DOWNLOAD_DIR}" -name 'pca_projection_scores_*.tsv' | sort)
+          if [ "${#tsvs[@]}" -lt 2 ]; then
+            echo "Expected at least two projection TSV files but found ${#tsvs[@]}."
+            ls -R "${DOWNLOAD_DIR}" || true
+            exit 1
+          fi
+          echo "Located ${#tsvs[@]} projection TSVs:"
+          printf '%s\n' "${tsvs[@]}"
+
+      - name: Run comparison (Python only)
+        run: |
+          set -euo pipefail
+          echo "Python runtime information:"
+          python --version
+          python -m pip list
+          FOLDS="${{ github.event.inputs.folds || '50' }}"
+          SEED="${{ github.event.inputs.random_state || '42' }}"
+          echo "::notice title=Compare settings::folds=${FOLDS} seed=${SEED}"
+          args=""
+          echo "Building argument list from downloaded TSV files"
+          while IFS= read -r file; do
+            base=$(basename "$file")
+            label=${base#pca_projection_scores_}
+            label=${label%.tsv}
+            args="$args --projection ${label}=$file"
+            echo "  Added projection label='${label}' path='${file}'"
+          done < <(find "${DOWNLOAD_DIR}" -name 'pca_projection_scores_*.tsv' | sort)
+          echo "Final argument string: ${args}"
+          echo "Executing comparison script with verbose logging"
+          ls -al "${DOWNLOAD_DIR}" || true
+          du -sh "${DOWNLOAD_DIR}"/* 2>/dev/null || echo "No per-file size info available."
+          python scripts/compare_release_fit_projections.py \
+            --folds "${FOLDS}" \
+            --random-state "${SEED}" \
+            ${args} \
+            2>&1 | tee compare-ld-window.log
+
+      - name: Upload comparison outputs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: compare-ld-window-results
+          path: |
+            compare-ld-window.log
+          if-no-files-found: warn

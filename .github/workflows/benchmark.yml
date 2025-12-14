@@ -1,0 +1,28 @@
+name: Benchmark
+on:
+  workflow_dispatch:
+jobs:
+  benchmark:
+    name: Build & Run Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Rust Nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build benchmark target
+        run: cargo +nightly build --release --bench path_benchmark
+      - name: Run benchmark and print results
+        run: cargo +nightly bench --bench path_benchmark -- --nocapture

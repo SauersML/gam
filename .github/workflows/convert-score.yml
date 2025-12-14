@@ -1,0 +1,50 @@
+name: Convert consumer genomes and score examples
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'examples/convert_score.py'
+      - 'score/**'
+      - '.github/workflows/convert-score.yml'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'examples/convert_score.py'
+      - 'score/**'
+      - '.github/workflows/convert-score.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+jobs:
+  run-example:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y unzip
+
+      - name: Install convert_genome
+        run: cargo +nightly install convert_genome
+
+      - name: Download plink2
+        run: |
+          set -euo pipefail
+          curl -L -o plink2.zip https://github.com/chrchang/plink-ng/releases/latest/download/plink2_linux_x86_64.zip
+          unzip -o plink2.zip plink2
+          sudo install -m 0755 plink2 /usr/local/bin/plink2
+
+      - name: Build gnomon in release mode
+        run: cargo +nightly build --release
+
+      - name: Run convert_score example
+        run: python examples/convert_score.py --output-dir examples/ci_convert_score

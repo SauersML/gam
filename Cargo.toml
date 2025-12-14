@@ -1,0 +1,139 @@
+# ========================================================================================
+#
+#                         THE CONSTITUTION OF PROJECT GNOMON
+#
+# ========================================================================================
+
+
+[workspace]
+
+[package]
+name = "gnomon"
+version = "0.1.2"
+edition = "2024" # Nightly is required
+description = "A high-performance engine for polygenic scores."
+repository = "https://github.com/SauersML/gnomon/"
+keywords = ["bioinformatics", "genomics"]
+categories = ["science"]
+build = "shared/build.rs"
+
+[lib]
+path = "shared/lib.rs"
+
+[[bin]]
+name = "gnomon"
+path = "cli/main.rs"
+
+[dependencies]
+ahash = "0.8.12"
+clap = { version = "4.5.48", features = ["derive"] }
+memmap2 = "0.9.8"
+rayon = "1.11.0"
+crossbeam-queue = "0.3.12"
+tokio = { version = "1.47.1", features = ["rt-multi-thread"] }
+num_cpus = "1.17.0"
+rand = "0.8"
+ryu = "1.0.20"
+crossbeam-channel = "0.5.15"
+natord = "1.0.9"
+bumpalo = { version = "3.19.0", features = ["collections"] }
+
+indicatif = "0.18"
+google-cloud-storage = "1.1.0"
+google-cloud-auth = "1.0.1"
+flate2 = "=1.1.5"
+ndarray = { version = "0.16.1", features = ["serde", "rayon"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
+toml = "0.9.7"
+polars = { version = "0.51.0", features = ["csv", "ndarray", "parquet"] }
+wolfe_bfgs = "0.1.6"
+log = "0.4.28"
+faer = "0.23.2"
+dyn-stack = "0.13.2"
+noodles-bcf = "0.78.0"
+noodles-vcf = "0.81.0"
+noodles-bgzf = "0.43.0"
+reqwest = { version = "0.12.9", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+serde_json = "1.0.145"
+sysinfo = "0.30.12"
+
+infer_sex = { git = "https://github.com/SauersML/infer_sex", branch = "main" }
+
+planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+# Turn off debug info for regular 'cargo build/test'
+debug = 0
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
+
+[features]
+default = []
+no-inline-profiling = []
+survival-data = []
+
+[lints.rust]
+unused_variables = "deny"
+dead_code = "deny"
+unused_imports = "deny"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+rand_distr = "0.4.3"
+tempfile = "3.21"
+approx = "0.5"
+reqwest = { version = "0.12.8", features = ["blocking", "rustls-tls"] }
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+logtest = "2"
+serial_test = "3.2.0"
+
+[build-dependencies]
+walkdir = "2.5.0"
+grep = "0.3.2"
+
+[[bench]]
+name = "path_benchmark"
+harness = false
+
+[[test]]
+name = "calibrate"
+path = "calibrate/tests/mod.rs"
+
+# =============================================================================
+# TEMPORARY PATCH: spindle Rust 1.94+ compatibility
+# =============================================================================
+#
+# ISSUE: Rust 1.94-nightly (Dec 2025) introduced a soundness fix that forbids
+# raw pointer casts which extend trait object lifetimes. This correctly rejects
+# code in spindle 0.2.5 that was previously (unsoundly) accepted.
+#
+# Error: "raw pointer casts of trait objects cannot extend lifetimes"
+# Tracking: https://github.com/rust-lang/rust/issues/141402
+#
+# spindle is a transitive dependency via: gnomon → faer → spindle
+#
+# FIX: PR sarah-quinones/spindle#2 replaces the cast with std::mem::transmute,
+# which is sound because the barrier mechanism guarantees worker threads
+# complete before the closure is dropped.
+#
+# TO REMOVE THIS PATCH:
+#   1. Check if spindle > 0.2.5 is published: `cargo search spindle`
+#   2. If yes, delete this entire [patch.crates-io] section
+#   3. Run `cargo update` and verify build succeeds
+#
+# =============================================================================
+[patch.crates-io]
+spindle = { git = "https://github.com/TKanX/spindle", rev = "88fa33fc64f57a69c58b5f9e7c3d3b7083f3238f" }
+

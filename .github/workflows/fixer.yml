@@ -1,0 +1,177 @@
+name: Fix Non-Breaking Spaces
+
+on:
+  push:
+    branches: [ main, master, develop ]
+
+permissions:
+  contents: write
+
+jobs:
+  fix-non-breaking-spaces:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0 # Fetch all history
+
+    - name: Check for non-breaking spaces and fix them
+      id: fix-nbsp
+      run: |
+        set -ex # Enable verbose output and exit on error
+        
+        COMMIT_MSG="${{ github.event.head_commit.message }}"
+        if [[ "$COMMIT_MSG" == *"[bot] Auto-fix non-breaking spaces"* ]]; then
+          echo "Skipping: Last commit was an auto-fix by this action."
+          echo "changes_made=false" >> $GITHUB_OUTPUT
+          echo "files_changed=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        changes_made=false
+        fixed_files_list=""
+
+        find . -type f \
+          -not -path "./.git/*" \
+          -not -path "./node_modules/*" \
+          -not -path "./.venv/*" \
+          -not -path "./venv/*" \
+          -not -path "./__pycache__/*" \
+          -not -path "*/.*cache*/*" \
+          -not -path "./build/*" \
+          -not -path "./dist/*" \
+          -not -path "./.next/*" \
+          -not -path "./target/*" \
+          -not -path "./.github/*" \
+          -not -name "*.png" \
+          -not -name "*.jpg" \
+          -not -name "*.jpeg" \
+          -not -name "*.gif" \
+          -not -name "*.pdf" \
+          -not -name "*.ico" \
+          -not -name "*.woff*" \
+          -not -name "*.ttf" \
+          -not -name "*.eot" \
+          -not -name "*.zip" \
+          -not -name "*.tar.gz" \
+          -not -name "*.exe" \
+          -not -name "*.dll" \
+          -not -name "*.so" \
+          -not -name "*.dylib" \
+          -not -name "*.bin" \
+          -not -name "*.class" > files_to_check.txt
+
+        while IFS= read -r file; do
+          if [ ! -f "$file" ]; then
+            continue
+          fi
+
+          file_type_info=$(file "$file" 2>/dev/null)
+          process_this_file=false
+          if echo "$file_type_info" | grep -qiE "text|script|json|xml|html|css|javascript|python|shell|yaml|csv"; then
+            process_this_file=true
+          elif echo "$file_type_info" | grep -qiE "binary|archive|image|audio|video|font|executable.*binary"; then
+            process_this_file=false
+          else
+            if head -c 1024 "$file" 2>/dev/null | LC_ALL=C grep -q '[[:cntrl:]]' && \
+               ! head -c 1024 "$file" 2>/dev/null | LC_ALL=C grep -q $'[\t\n\r]'; then
+              process_this_file=false
+            else
+              process_this_file=true
+            fi
+          fi
+
+          if ! $process_this_file; then
+            echo "INFO: Skipping non-text or binary file: $file"
+            continue
+          fi
+          
+          # Check if file contains the UTF-8 NBSP byte sequence (c2 a0)
+          if hexdump -C "$file" 2>/dev/null | grep -q "c2 a0"; then
+            echo "INFO: Processing NBSPs in $file"
+            cp "$file" "$file.backup"
+
+            before_nbsp_count=$(hexdump -C "$file" 2>/dev/null | grep -c "c2 a0" || true)
+
+            # Use sed with LC_ALL=C for byte-wise replacement of \xc2\xa0 with a space \x20
+            # This is the sole method for replacement now.
+            if LC_ALL=C sed -i 's/\xc2\xa0/ /g' "$file"; then
+                # sed command executed successfully (exit code 0)
+                # Now verify the replacement
+                after_nbsp_count=$(hexdump -C "$file" 2>/dev/null | grep -c "c2 a0" || true)
+
+                if [ "$after_nbsp_count" -eq 0 ]; then
+                    if [ "$before_nbsp_count" -ne 0 ]; then # NBSPs were present and now are fixed
+                        echo "SUCCESS: Fixed $before_nbsp_count NBSPs in $file."
+                        fixed_files_list="$fixed_files_list $file"
+                        changes_made=true
+                    else # File had NBSPs by initial check, sed ran, after_count is 0, before_count was also 0 (unlikely path if grep -q found it)
+                         # Or, more likely, before_count was non-zero and successfully fixed.
+                        echo "INFO: $file is now clean (0 NBSPs after processing)."
+                         # If before_count was non-zero, it's already handled by the above if.
+                         # If before_count was zero initially by some fluke but grep -q passed, this ensures it's clean.
+                    fi
+                    rm -f "$file.backup"
+                else
+                    # sed ran successfully, but non-breaking spaces remain. This is unexpected with this sed command.
+                    echo "WARNING: sed ran but $file still has $after_nbsp_count NBSPs (was $before_nbsp_count). Reverting."
+                    mv "$file.backup" "$file"
+                fi
+            else
+                # sed command itself failed (e.g., permissions, disk space for temp file with -i)
+                # Since 'set -e' is active and sed is in an 'if' condition, this block will be executed on failure.
+                echo "ERROR: sed command failed to execute for $file. Reverting."
+                mv "$file.backup" "$file"
+            fi
+          else
+            echo "INFO: No NBSPs detected in $file (initial scan)."
+          fi
+        done < files_to_check.txt
+
+        rm -f files_to_check.txt
+
+        if [ "$changes_made" = true ]; then
+          echo "changes_made=true" >> $GITHUB_OUTPUT
+          echo "files_changed=${fixed_files_list# }" >> $GITHUB_OUTPUT # Remove potential leading space
+        else
+          echo "changes_made=false" >> $GITHUB_OUTPUT
+          echo "files_changed=" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Configure Git
+      if: steps.fix-nbsp.outputs.changes_made == 'true'
+      run: |
+        set -ex
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action Bot"
+
+    - name: Commit and push changes
+      if: steps.fix-nbsp.outputs.changes_made == 'true'
+      run: |
+        set -ex
+        git add .
+        if ! git diff --staged --quiet; then
+          echo "Committing NBSP fixes for files: ${{ steps.fix-nbsp.outputs.files_changed }}"
+          git commit -m "[bot] Auto-fix non-breaking spaces in:${{ steps.fix-nbsp.outputs.files_changed }} [skip ci]"
+          git push
+        else
+          echo "INFO: No changes to commit after NBSP fixing attempt."
+        fi
+
+    - name: Summary
+      if: always()
+      run: |
+        if [ "${{ steps.fix-nbsp.outputs.changes_made }}" = "true" ]; then
+          echo "✅ Non-breaking spaces were fixed in the following files:"
+          echo "${{ steps.fix-nbsp.outputs.files_changed }}"
+        else
+          if [[ "${{ github.event.head_commit.message }}" == *"[bot] Auto-fix non-breaking spaces"* && \
+                "${{ steps.fix-nbsp.outputs.changes_made }}" == "false" ]]; then
+            echo "✅ Skipped: Last commit was an auto-fix. No new non-breaking spaces processing was needed."
+          else
+            echo "✅ No non-breaking spaces were found or no files required changes."
+          fi
+        fi

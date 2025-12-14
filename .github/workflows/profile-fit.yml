@@ -1,0 +1,119 @@
+name: Profiling Fit Run
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+jobs:
+  profiling-fit:
+    name: Build, Profile & Report
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Reclaim disk space
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Ensure perf tooling is available
+        run: |
+          set -euxo pipefail
+          if ! command -v perf >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y linux-tools-common linux-tools-generic || true
+            if ! command -v perf >/dev/null 2>&1; then
+              KERNEL="$(uname -r)"
+              sudo apt-get install -y "linux-tools-$KERNEL" || true
+            fi
+          fi
+          perf --version
+
+      - name: Allow perf events recording
+        run: |
+          set -euxo pipefail
+          sudo sysctl -w kernel.perf_event_paranoid=0
+
+      - name: Build profiling binary
+        env:
+          CARGO_INCREMENTAL: 0
+        run: |
+          set -euxo pipefail
+          cargo +nightly build --profile profiling --features no-inline-profiling
+
+      - name: Profile gnomon fit workload (30 min max, disk-friendly)
+        env:
+          PERF_DATA: perf.data
+        run: |
+          set -euo pipefail
+
+          if perf record --call-graph lbr -F 50 -e task-clock:u -o /dev/null -- true 2>/dev/null; then
+            CALLGRAPH="--call-graph lbr"
+          else
+            CALLGRAPH="--call-graph dwarf,256"
+          fi
+
+          echo "Starting perf record with space-optimized settings"
+          echo "Call graph mode: $CALLGRAPH"
+          echo "Sampling frequency: 50 Hz"
+          echo "Timeout: 30 minutes hard cap"
+
+          STATUS=0
+          if ! timeout --signal=INT --kill-after=30s 30m perf record $CALLGRAPH -F 50 -e task-clock:u -z --no-buildid --no-buildid-cache -g -o "$PERF_DATA" -- target/profiling/gnomon --fit "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf" --components 16 --list "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv"; then
+            STATUS=$?
+          fi
+
+          if [ "$STATUS" -eq 124 ]; then
+            echo "::warning::perf recording stopped after 30 minutes (timeout)"
+          elif [ "$STATUS" -ne 0 ]; then
+            echo "::error::perf record failed with status $STATUS"
+            exit "$STATUS"
+          fi
+
+          if [ -f "$PERF_DATA" ]; then
+            ls -lh "$PERF_DATA"
+          else
+            echo "::error::perf.data not produced"
+            exit 1
+          fi
+
+          df -h
+
+      - name: Render perf reports
+        env:
+          PERF_DATA: perf.data
+        run: |
+          set -euo pipefail
+          if [ ! -f "$PERF_DATA" ]; then
+            echo "::error::perf.data not found"
+            exit 1
+          fi
+
+          echo "==================== PERF REPORT (flat) ===================="
+          perf report --stdio --no-children --sort=symbol --percent-limit=0.5 -i "$PERF_DATA"
+          echo "==========================================================="
+
+          echo "==================== PERF REPORT (call graph) =============="
+          perf report --stdio --call-graph=graph --percent-limit=2 -i "$PERF_DATA"
+          echo "==========================================================="
+
+      - name: Cleanup perf artifact to free space
+        env:
+          PERF_DATA: perf.data
+        run: |
+          set -euxo pipefail
+          rm -f "$PERF_DATA" || true
+          df -h

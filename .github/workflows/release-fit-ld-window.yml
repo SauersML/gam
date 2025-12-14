@@ -1,0 +1,220 @@
+name: Release Fit LD Window Sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      downsample_factor:
+        description: 'Downsampling factor applied during PCA plot generation (>=1)'
+        required: false
+        default: '1'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RELEASE_FIT_DOWNSAMPLE: ${{ github.event.inputs.downsample_factor || '1' }}
+
+jobs:
+  release-fit-ld-windows:
+    name: Timed fit and plots (--ld ${{ matrix.window.description }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        window:
+          - label: sites-3
+            description: 'sites window=3'
+            args: '--sites_window 3'
+            artifact_suffix: 'ld_sites_3'
+          - label: sites-5
+            description: 'sites window=5'
+            args: '--sites_window 5'
+            artifact_suffix: 'ld_sites_5'
+          - label: sites-11
+            description: 'sites window=11'
+            args: '--sites_window 11'
+            artifact_suffix: 'ld_sites_11'
+          - label: sites-21
+            description: 'sites window=21'
+            args: '--sites_window 21'
+            artifact_suffix: 'ld_sites_21'
+          - label: sites-31
+            description: 'sites window=31'
+            args: '--sites_window 31'
+            artifact_suffix: 'ld_sites_31'
+          - label: sites-41
+            description: 'sites window=41'
+            args: '--sites_window 41'
+            artifact_suffix: 'ld_sites_41'
+          - label: sites-51
+            description: 'sites window=51'
+            args: '--sites_window 51'
+            artifact_suffix: 'ld_sites_51'
+          - label: sites-71
+            description: 'sites window=71'
+            args: '--sites_window 71'
+            artifact_suffix: 'ld_sites_71'
+          - label: sites-101
+            description: 'sites window=101'
+            args: '--sites_window 101'
+            artifact_suffix: 'ld_sites_101'
+          - label: sites-201
+            description: 'sites window=201'
+            args: '--sites_window 201'
+            artifact_suffix: 'ld_sites_201'
+          - label: sites-301
+            description: 'sites window=301'
+            args: '--sites_window 301'
+            artifact_suffix: 'ld_sites_301'
+          - label: bp-51
+            description: 'bp window=51'
+            args: '--bp_window 51'
+            artifact_suffix: 'ld_bp_51'
+          - label: bp-101
+            description: 'bp window=101'
+            args: '--bp_window 101'
+            artifact_suffix: 'ld_bp_101'
+          - label: bp-501
+            description: 'bp window=501'
+            args: '--bp_window 501'
+            artifact_suffix: 'ld_bp_501'
+          - label: bp-1001
+            description: 'bp window=1001'
+            args: '--bp_window 1001'
+            artifact_suffix: 'ld_bp_1001'
+          - label: bp-5001
+            description: 'bp window=5001'
+            args: '--bp_window 5001'
+            artifact_suffix: 'ld_bp_5001'
+          - label: bp-10001
+            description: 'bp window=10001'
+            args: '--bp_window 10001'
+            artifact_suffix: 'ld_bp_10001'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Rebuild gnomon (release, native cpu)
+        run: |
+          set -euxo pipefail
+          cargo clean
+          RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements-release-fit.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements-release-fit.txt
+
+      - name: Timed gnomon fit run (--ld ${{ matrix.window.description }})
+        env:
+          LD_ARGS: ${{ matrix.window.args }}
+          LD_SUFFIX: ${{ matrix.window.artifact_suffix }}
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f 'elapsed=%E\nuser=%U\nsys=%S' \
+            target/release/gnomon fit \
+            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
+            --list https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv \
+            --components 20 \
+            --ld \
+            ${LD_ARGS} \
+            2>&1 | tee gnomon-fit-${LD_SUFFIX}.log
+
+      - name: Generate PCA plots from projection output
+        run: python scripts/generate_release_fit_plots.py --downsample-factor "${{ env.RELEASE_FIT_DOWNSAMPLE }}"
+
+      - name: Prepare artifacts (--ld ${{ matrix.window.description }})
+        if: ${{ always() }}
+        env:
+          LD_SUFFIX: ${{ matrix.window.artifact_suffix }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [ -f gnomon-fit-${LD_SUFFIX}.log ]; then
+            mv gnomon-fit-${LD_SUFFIX}.log artifacts/gnomon-fit-${LD_SUFFIX}.log
+          else
+            echo "Timed fit log missing; skipping move." >&2
+          fi
+          if [ -f artifacts/pc1_pc2.png ]; then
+            mv artifacts/pc1_pc2.png artifacts/pc1_pc2_${LD_SUFFIX}.png
+          else
+            echo "pc1_pc2 plot missing; skipping rename." >&2
+          fi
+          if [ -f artifacts/pc3_pc4.png ]; then
+            mv artifacts/pc3_pc4.png artifacts/pc3_pc4_${LD_SUFFIX}.png
+          else
+            echo "pc3_pc4 plot missing; skipping rename." >&2
+          fi
+          if [ -f artifacts/pca_projection_scores.tsv ]; then
+            mv artifacts/pca_projection_scores.tsv artifacts/pca_projection_scores_${LD_SUFFIX}.tsv
+          else
+            echo "Projection scores TSV missing; skipping rename." >&2
+          fi
+
+      - name: Upload PCA plot artifacts (--ld ${{ matrix.window.description }})
+        if: ${{ always() }}
+        env:
+          LD_SUFFIX: ${{ matrix.window.artifact_suffix }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnomon-release-fit-${{ matrix.window.label }}
+          path: |
+            artifacts/pc1_pc2_${LD_SUFFIX}.png
+            artifacts/pc3_pc4_${LD_SUFFIX}.png
+            artifacts/pca_projection_scores_${LD_SUFFIX}.tsv
+            artifacts/gnomon-fit-${LD_SUFFIX}.log
+          if-no-files-found: warn
+
+  compare-projections:
+    name: Compare LD window projection performance
+    runs-on: ubuntu-24.04
+    needs: release-fit-ld-windows
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements-release-fit.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements-release-fit.txt
+
+      - name: Download LD artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gnomon-release-fit-*
+          merge-multiple: true
+          path: comparison
+
+      - name: Compare projection TSV files across LD windows
+        run: |
+          set -euo pipefail
+          args=""
+          for file in $(find comparison -name 'pca_projection_scores_*.tsv' | sort); do
+            base=$(basename "$file")
+            label=${base#pca_projection_scores_}
+            label=${label%.tsv}
+            args="$args --projection ${label}=$file"
+          done
+          if [ -z "$args" ]; then
+            echo "No projection TSV files were found for comparison." >&2
+            exit 1
+          fi
+          python scripts/compare_release_fit_projections.py $args

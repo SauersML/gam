@@ -1,0 +1,112 @@
+name: Compare Using Latest Release Fit Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to source artifacts from (e.g., main)"
+        required: false
+        default: "main"
+      folds:
+        description: "Number of CV folds for comparison"
+        required: false
+        default: "50"
+      random_state:
+        description: "Random seed for CV shuffling"
+        required: false
+        default: "42"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: compare-latest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare-latest:
+    name: Python-only comparison using latest artifacts
+    runs-on: ubuntu-22.04
+    env:
+      PY_REQ: scripts/requirements-release-fit.txt
+      WORKFLOW_NAME: Release Fit Projection
+      NO_LD_ARTIFACT: gnomon-release-fit-no-ld
+      LD_ARTIFACT: gnomon-release-fit-ld
+      NO_LD_TSV: comparison/no_ld/artifacts/pca_projection_scores_no_ld.tsv
+      LD_TSV: comparison/ld/artifacts/pca_projection_scores_ld.tsv
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: ${{ env.PY_REQ }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r "${PY_REQ}"
+
+      - name: Locate latest successful '${{ env.WORKFLOW_NAME }}' run
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="${{ github.event.inputs.branch || 'main' }}"
+          RUN_JSON=$(gh run list \
+            --workflow "${WORKFLOW_NAME}" \
+            --branch "${BRANCH}" \
+            --status success \
+            --limit 1 \
+            --json databaseId,headBranch,headSha,createdAt,url,displayTitle)
+          RUN_ID=$(echo "${RUN_JSON}" | jq -r '.[0].databaseId')
+          HEAD_BRANCH=$(echo "${RUN_JSON}" | jq -r '.[0].headBranch')
+          HEAD_SHA=$(echo "${RUN_JSON}" | jq -r '.[0].headSha')
+          CREATED_AT=$(echo "${RUN_JSON}" | jq -r '.[0].createdAt')
+          RUN_URL=$(echo "${RUN_JSON}" | jq -r '.[0].url')
+          TITLE=$(echo "${RUN_JSON}" | jq -r '.[0].displayTitle')
+
+          test -n "${RUN_ID}" && test "${RUN_ID}" != "null" || { echo "No successful runs for '${WORKFLOW_NAME}' on branch '${BRANCH}'." >&2; false; }
+
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Using artifacts from::${WORKFLOW_NAME} • ${TITLE} • run_id=${RUN_ID}"
+          echo "::notice title=Run metadata::branch=${HEAD_BRANCH} sha=${HEAD_SHA} created=${CREATED_AT} url=${RUN_URL}"
+
+      - name: Download artifacts from that run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p comparison/no_ld comparison/ld
+          gh run download "${{ steps.find.outputs.run_id }}" -n "${NO_LD_ARTIFACT}" -D comparison/no_ld
+          gh run download "${{ steps.find.outputs.run_id }}" -n "${LD_ARTIFACT}"    -D comparison/ld
+          echo "Downloaded files:"
+          ls -R comparison || true
+
+      - name: Sanity check expected TSV paths exist
+        run: |
+          test -f "${NO_LD_TSV}" || { echo "Missing ${NO_LD_TSV}"; ls -R comparison/no_ld || true; false; }
+          test -f "${LD_TSV}"    || { echo "Missing ${LD_TSV}"; ls -R comparison/ld    || true; false; }
+
+      - name: Run comparison (Python only)
+        run: |
+          FOLDS="${{ github.event.inputs.folds || '50' }}"
+          SEED="${{ github.event.inputs.random_state || '42' }}"
+          echo "::notice title=Compare settings::folds=${FOLDS} seed=${SEED}"
+          python scripts/compare_release_fit_projections.py \
+            --folds "${FOLDS}" \
+            --random-state "${SEED}" \
+            --projection no-LD="${NO_LD_TSV}" \
+            --projection LD="${LD_TSV}" \
+            2>&1 | tee compare-latest.log
+
+      - name: Upload comparison outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: compare-latest-results
+          path: |
+            compare-latest.log
+            artifacts/**

@@ -1,0 +1,212 @@
+name: Release Fit Projection
+
+on:
+  workflow_dispatch:
+    inputs:
+      downsample_factor:
+        description: 'Downsampling factor applied during PCA plot generation (>=1)'
+        required: false
+        default: '1'
+  push:
+    paths:
+      - 'map/**/*.rs'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RELEASE_FIT_DOWNSAMPLE: ${{ github.event.inputs.downsample_factor || '1' }}
+
+jobs:
+  release-fit-no-ld:
+    name: Timed fit and plots (no --ld)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements-release-fit.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements-release-fit.txt
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Rebuild gnomon (release, native cpu)
+        run: |
+          set -euxo pipefail
+          cargo clean
+          RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+
+      - name: Timed gnomon fit run (no --ld)
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f 'elapsed=%E\nuser=%U\nsys=%S' \
+            target/release/gnomon fit \
+            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
+            --list https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv \
+            --components 20 \
+            2>&1 | tee gnomon-fit-no-ld.log
+
+      - name: Generate PCA plots from projection output
+        run: python scripts/generate_release_fit_plots.py --downsample-factor "${{ env.RELEASE_FIT_DOWNSAMPLE }}"
+
+      - name: Prepare artifacts (no --ld)
+        run: |
+          set -euo pipefail
+          mv artifacts/pc1_pc2.png artifacts/pc1_pc2_no_ld.png
+          mv artifacts/pc3_pc4.png artifacts/pc3_pc4_no_ld.png
+          mv artifacts/pca_projection_scores.tsv artifacts/pca_projection_scores_no_ld.tsv
+
+      - name: Upload PCA plot artifacts (no --ld)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnomon-release-fit-no-ld
+          path: |
+            artifacts/pc1_pc2_no_ld.png
+            artifacts/pc3_pc4_no_ld.png
+            artifacts/pca_projection_scores_no_ld.tsv
+            gnomon-fit-no-ld.log
+
+  release-fit-ld:
+    name: Timed fit and plots (--ld)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements-release-fit.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements-release-fit.txt
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Rebuild gnomon (release, native cpu)
+        run: |
+          set -euxo pipefail
+          cargo clean
+          RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+
+      - name: Timed gnomon fit run (--ld)
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f 'elapsed=%E\nuser=%U\nsys=%S' \
+            target/release/gnomon fit \
+            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
+            --list https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv \
+            --components 20 \
+            --ld \
+            2>&1 | tee gnomon-fit-ld.log
+
+      - name: Generate PCA plots from projection output
+        run: python scripts/generate_release_fit_plots.py --downsample-factor "${{ env.RELEASE_FIT_DOWNSAMPLE }}"
+
+      - name: Prepare artifacts (--ld)
+        run: |
+          set -euo pipefail
+          mv artifacts/pc1_pc2.png artifacts/pc1_pc2_ld.png
+          mv artifacts/pc3_pc4.png artifacts/pc3_pc4_ld.png
+          mv artifacts/pca_projection_scores.tsv artifacts/pca_projection_scores_ld.tsv
+
+      - name: Upload PCA plot artifacts (--ld)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnomon-release-fit-ld
+          path: |
+            artifacts/pc1_pc2_ld.png
+            artifacts/pc3_pc4_ld.png
+            artifacts/pca_projection_scores_ld.tsv
+            gnomon-fit-ld.log
+
+  hail-pca-warmup:
+    name: Warm up hail PCA
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements-release-fit.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements-release-fit.txt
+
+      - name: Run hail PCA warmup
+        run: |
+          set -euo pipefail
+          python scripts/hail_pca.py \
+            --data-path gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/*.bcf \
+            2>&1 | tee hail_pca.log
+
+      - name: Upload warmup log
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnomon-release-fit-hail-pca
+          path: hail_pca.log
+
+  compare-projections:
+    name: Compare LD vs no-LD projection performance
+    runs-on: ubuntu-22.04
+    needs:
+      - release-fit-no-ld
+      - release-fit-ld
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements-release-fit.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements-release-fit.txt
+
+      - name: Download no-LD artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: gnomon-release-fit-no-ld
+          path: comparison/no_ld
+
+      - name: Download LD artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: gnomon-release-fit-ld
+          path: comparison/ld
+
+      - name: Compare projection TSV files
+        run: |
+          set -euo pipefail
+          python scripts/compare_release_fit_projections.py \
+            --projection no-LD=comparison/no_ld/artifacts/pca_projection_scores_no_ld.tsv \
+            --projection LD=comparison/ld/artifacts/pca_projection_scores_ld.tsv
