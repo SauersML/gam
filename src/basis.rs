@@ -1,8 +1,8 @@
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
+use faer::Side;
 use ndarray::parallel::prelude::*;
-use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{s, Array, Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::ParallelSlice;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::{Arc, OnceLock};
@@ -684,8 +684,8 @@ impl BasisStorage for SparseStorage {
         let triplets: Vec<Triplet<usize, usize, f64>> =
             if let (true, Some(data_slice)) = (use_parallel, data.as_slice()) {
                 const CHUNK_SIZE: usize = 1024;
-                let triplet_chunks: Vec<Vec<Triplet<usize, usize, f64>>> =
-                    bspline_thread_pool().install(|| {
+                let triplet_chunks: Vec<Vec<Triplet<usize, usize, f64>>> = bspline_thread_pool()
+                    .install(|| {
                         data_slice
                             .par_chunks(CHUNK_SIZE)
                             .enumerate()
@@ -705,9 +705,7 @@ impl BasisStorage for SparseStorage {
                                             num_basis_functions,
                                             scratch,
                                             values,
-                                            |col_j, v| {
-                                                local.push(Triplet::new(row_i, col_j, v))
-                                            },
+                                            |col_j, v| local.push(Triplet::new(row_i, col_j, v)),
                                         );
                                     }
                                     local
@@ -1017,7 +1015,9 @@ fn generate_basis_nd_sparse(
                         let row_end = (chunk_start + CHUNK_SIZE).min(nrows);
                         let per_row_nnz = supports.iter().fold(1usize, |acc, &s| acc * s);
                         let mut local = Vec::with_capacity(
-                            row_end.saturating_sub(chunk_start).saturating_mul(per_row_nnz),
+                            row_end
+                                .saturating_sub(chunk_start)
+                                .saturating_mul(per_row_nnz),
                         );
                         for row_idx in chunk_start..row_end {
                             fill_tensor_row(
@@ -1390,8 +1390,12 @@ pub struct DuchonBasisSpec {
 /// Metadata returned by generic basis builders.
 #[derive(Debug, Clone)]
 pub enum BasisMetadata {
-    BSpline1D { knots: Array1<f64> },
-    ThinPlate { centers: Array2<f64> },
+    BSpline1D {
+        knots: Array1<f64>,
+    },
+    ThinPlate {
+        centers: Array2<f64>,
+    },
     Matern {
         centers: Array2<f64>,
         length_scale: f64,
@@ -1581,10 +1585,10 @@ fn select_centers_by_strategy(
             }
             Ok(centers.clone())
         }
-        CenterStrategy::EqualMass { num_centers } => {
-            select_equal_mass_centers(data, *num_centers)
+        CenterStrategy::EqualMass { num_centers } => select_equal_mass_centers(data, *num_centers),
+        CenterStrategy::FarthestPoint { num_centers } => {
+            select_thin_plate_knots(data, *num_centers)
         }
-        CenterStrategy::FarthestPoint { num_centers } => select_thin_plate_knots(data, *num_centers),
         CenterStrategy::KMeans {
             num_centers,
             max_iter,
@@ -1610,7 +1614,8 @@ pub fn build_bspline_basis_1d(
         },
         BSplineKnotSpec::Provided(knots) => KnotSource::Provided(knots.view()),
     };
-    let (basis, knots) = create_basis::<Dense>(data, knot_source, spec.degree, BasisOptions::value())?;
+    let (basis, knots) =
+        create_basis::<Dense>(data, knot_source, spec.degree, BasisOptions::value())?;
     let design = (*basis).clone();
     let p = design.ncols();
     let s_bend = create_difference_penalty_matrix(p, spec.penalty_order, None)?;
@@ -1662,6 +1667,12 @@ fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Resul
         ));
     }
 
+    // Here x = κ r with κ = 1/length_scale.
+    // For half-integer ν, the Matérn kernel admits closed forms:
+    //   ν=1/2: exp(-x)
+    //   ν=3/2: (1+x) exp(-x)
+    //   ν=5/2: (1+x+x^2/3) exp(-x)
+    // matching the standard Bessel-K reductions used in the spec.
     let x = r / length_scale;
     let k = match nu {
         MaternNu::Half => (-x).exp(),
@@ -1690,6 +1701,224 @@ fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Resul
     Ok(k)
 }
 
+#[inline(always)]
+fn bessel_i0_approx(x: f64) -> f64 {
+    let ax = x.abs();
+    if ax < 3.75 {
+        let y = (x / 3.75) * (x / 3.75);
+        1.0 + y
+            * (3.515_622_9
+                + y * (3.089_942_4
+                    + y * (1.206_749_2 + y * (0.265_973_2 + y * (0.036_076_8 + y * 0.004_581_3)))))
+    } else {
+        let y = 3.75 / ax;
+        (ax.exp() / ax.sqrt())
+            * (0.398_942_28
+                + y * (0.013_285_92
+                    + y * (0.002_253_19
+                        + y * (-0.001_575_65
+                            + y * (0.009_162_81
+                                + y * (-0.020_577_06
+                                    + y * (0.026_355_37
+                                        + y * (-0.016_476_33 + y * 0.003_923_77))))))))
+    }
+}
+
+#[inline(always)]
+fn bessel_i1_approx(x: f64) -> f64 {
+    let ax = x.abs();
+    if ax < 3.75 {
+        let y = (x / 3.75) * (x / 3.75);
+        x * (0.5
+            + y * (0.878_905_94
+                + y * (0.514_988_69
+                    + y * (0.150_849_34
+                        + y * (0.026_587_33 + y * (0.003_015_32 + y * 0.000_324_11))))))
+    } else {
+        let y = 3.75 / ax;
+        let ans = (ax.exp() / ax.sqrt())
+            * (0.398_942_28
+                + y * (-0.039_880_24
+                    + y * (-0.003_620_18
+                        + y * (0.001_638_01
+                            + y * (-0.010_315_55
+                                + y * (0.022_829_67
+                                    + y * (-0.028_953_12
+                                        + y * (0.017_876_54 - y * 0.004_200_59))))))));
+        if x < 0.0 {
+            -ans
+        } else {
+            ans
+        }
+    }
+}
+
+#[inline(always)]
+fn bessel_k0_approx(x: f64) -> f64 {
+    let x_pos = x.max(1e-300);
+    if x_pos <= 2.0 {
+        let y = (x_pos * x_pos) / 4.0;
+        -((x_pos / 2.0).ln()) * bessel_i0_approx(x_pos)
+            + (-0.577_215_66
+                + y * (0.422_784_20
+                    + y * (0.230_697_56
+                        + y * (0.034_885_90
+                            + y * (0.002_626_98 + y * (0.000_107_50 + y * 0.000_007_40))))))
+    } else {
+        let y = 2.0 / x_pos;
+        (-x_pos).exp() / x_pos.sqrt()
+            * (1.253_314_14
+                + y * (-0.078_323_58
+                    + y * (0.021_895_68
+                        + y * (-0.010_624_46
+                            + y * (0.005_878_72 + y * (-0.002_515_40 + y * 0.000_532_08))))))
+    }
+}
+
+#[inline(always)]
+fn bessel_k1_approx(x: f64) -> f64 {
+    let x_pos = x.max(1e-300);
+    if x_pos <= 2.0 {
+        let y = (x_pos * x_pos) / 4.0;
+        (x_pos / 2.0).ln() * bessel_i1_approx(x_pos)
+            + (1.0 / x_pos)
+                * (1.0
+                    + y * (0.154_431_44
+                        + y * (-0.672_785_79
+                            + y * (-0.181_568_97
+                                + y * (-0.019_194_02 + y * (-0.001_104_04 + y * -0.000_046_86))))))
+    } else {
+        let y = 2.0 / x_pos;
+        (-x_pos).exp() / x_pos.sqrt()
+            * (1.253_314_14
+                + y * (0.234_986_19
+                    + y * (-0.036_556_20
+                        + y * (0.015_042_68
+                            + y * (-0.007_803_53 + y * (0.003_256_14 + y * -0.000_682_45))))))
+    }
+}
+
+#[inline(always)]
+fn duchon_matern_p1_s4_k10_closed_form(r: f64, kappa: f64) -> f64 {
+    let z = (kappa * r).max(1e-300);
+    let k0 = bessel_k0_approx(z);
+    let k1 = bessel_k1_approx(z);
+    // Exact closed form algebraically equivalent to:
+    // K(r) = (1/96) ∫_0^1 u^3 K0(a sqrt(u)) du, a = κr.
+    // This form avoids high-order K_n terms and uses only K0, K1.
+    48.0 / z.powi(8)
+        - (1.0 / 48.0) * (k1 / z)
+        - (1.0 / 8.0) * (k0 / z.powi(2))
+        - (3.0 / 4.0) * (k1 / z.powi(3))
+        - 3.0 * (k0 / z.powi(4))
+        - 12.0 * (k1 / z.powi(5))
+        - 24.0 * (k0 / z.powi(6))
+        - 48.0 * (k1 / z.powi(7))
+}
+
+#[inline(always)]
+fn duchon_matern_p1_s4_k10_integral(r: f64, kappa: f64) -> f64 {
+    #[inline(always)]
+    fn simpson<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64) -> f64 {
+        let c = 0.5 * (a + b);
+        (b - a) * (f(a) + 4.0 * f(c) + f(b)) / 6.0
+    }
+
+    fn adaptive_simpson<F: Fn(f64) -> f64>(
+        f: &F,
+        a: f64,
+        b: f64,
+        eps: f64,
+        whole: f64,
+        depth: usize,
+    ) -> f64 {
+        let c = 0.5 * (a + b);
+        let left = simpson(f, a, c);
+        let right = simpson(f, c, b);
+        let delta = left + right - whole;
+        if depth == 0 || delta.abs() <= 15.0 * eps {
+            // Richardson extrapolation.
+            left + right + delta / 15.0
+        } else {
+            adaptive_simpson(f, a, c, eps * 0.5, left, depth - 1)
+                + adaptive_simpson(f, c, b, eps * 0.5, right, depth - 1)
+        }
+    }
+
+    let a = kappa * r;
+    // Substitute u = t^2 to eliminate the sqrt in argument and make the
+    // endpoint behavior smooth: du = 2 t dt, u^3 = t^6, so integrand is
+    // 2 t^7 K0(a t) over t in [0,1].
+    let f_t = |t: f64| -> f64 {
+        if t <= 0.0 {
+            return 0.0;
+        }
+        2.0 * t.powi(7) * bessel_k0_approx(a * t)
+    };
+    let whole = simpson(&f_t, 0.0, 1.0);
+    let integral = adaptive_simpson(&f_t, 0.0, 1.0, 1e-10, whole, 20);
+    integral / 96.0
+}
+
+fn duchon_matern_kernel_p1_s4_k10_from_distance(
+    r: f64,
+    length_scale: f64,
+) -> Result<f64, BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon-Matern kernel distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon-Matern length_scale must be finite and positive".to_string(),
+        ));
+    }
+    if r == 0.0 {
+        // Intrinsic-spline convention for the critical-borderline case.
+        return Ok(0.0);
+    }
+
+    let kappa = 1.0 / length_scale;
+    let z = kappa * r;
+    // Bifurcation to avoid catastrophic cancellation in A.11 near z -> 0.
+    // Use the integral form for small z and the explicit closed form otherwise.
+    if z <= 0.1 {
+        Ok(duchon_matern_p1_s4_k10_integral(r, kappa))
+    } else {
+        Ok(duchon_matern_p1_s4_k10_closed_form(r, kappa))
+    }
+}
+
+fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
+    let n = points.nrows();
+    let d = points.ncols();
+    if n < 2 || d == 0 {
+        return None;
+    }
+    let mut r_min = f64::INFINITY;
+    let mut r_max = 0.0_f64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = points[[i, c]] - points[[j, c]];
+                dist2 += delta * delta;
+            }
+            let r = dist2.sqrt();
+            if r.is_finite() && r > 0.0 {
+                r_min = r_min.min(r);
+                r_max = r_max.max(r);
+            }
+        }
+    }
+    if r_min.is_finite() && r_max.is_finite() && r_min > 0.0 && r_max > 0.0 {
+        Some((r_min, r_max))
+    } else {
+        None
+    }
+}
+
 /// Creates a Matérn spline basis from data and centers.
 ///
 /// The design is `[K | 1]` when `include_intercept=true` and `[K]` otherwise, where:
@@ -1698,6 +1927,9 @@ fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Resul
 /// The default kernel penalty is `alpha' S alpha` with `S_jl = k(||c_j - c_l||)`, embedded
 /// in the full coefficient space. With intercept included, that column is unpenalized by
 /// `penalty_kernel`; optional `penalty_ridge` enables double-penalty shrinkage of all terms.
+///
+/// NOTE: This follows the RKHS Gram construction S = K_CC (not K_CC^{-1}) in
+/// coefficient space, with global scaling absorbed by the smoothing parameter λ.
 pub fn create_matern_spline_basis(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -1757,6 +1989,8 @@ pub fn create_matern_spline_basis(
         });
     kernel_result?;
 
+    // Center-center Gram matrix K_CC. In RKHS form, the kernel penalty on
+    // radial coefficients is alpha^T K_CC alpha.
     let mut center_kernel = Array2::<f64>::zeros((k, k));
     let center_result: Result<(), BasisError> = center_kernel
         .axis_iter_mut(Axis(0))
@@ -1782,6 +2016,10 @@ pub fn create_matern_spline_basis(
     }
 
     let mut penalty_kernel = Array2::<f64>::zeros((total_cols, total_cols));
+    // RKHS coefficient penalty uses the center Gram matrix directly:
+    //   S = K_CC  (not K_CC^{-1}).
+    // This matches Duchon/Matérn spline theory where alpha^T K_CC alpha is the
+    // native-space quadratic form up to a global scaling absorbed by lambda.
     penalty_kernel
         .slice_mut(s![0..k, 0..k])
         .assign(&center_kernel);
@@ -1832,9 +2070,16 @@ pub fn build_matern_basis(
 /// Creates a Duchon-like basis:
 /// P(w) = ||w||^(2p) * (kappa^2 + ||w||^2)^s
 /// implemented with:
-/// - Matérn radial block for high-frequency control
+/// - exact primary-case Duchon-Matern radial block for (p=1, s=4, k=10)
 /// - explicit polynomial null-space block determined by `nullspace_order`
 /// - side-constraint projection `P(centers)^T alpha = 0` for `p > 0`
+///
+/// IMPLEMENTATION NOTE:
+/// The exact primary-case kernel uses the stable integral
+///   K(r) = (1/96) ∫_0^1 u^3 K0(kappa * r * sqrt(u)) du
+/// with kappa = 1/length_scale.
+/// The full arbitrary-(p,s,k) Riesz-Bessel kernel family is not yet implemented;
+/// unsupported configurations return an explicit error.
 pub fn create_duchon_spline_basis(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -1869,7 +2114,37 @@ pub fn create_duchon_spline_basis(
     }
 
     let poly_block = polynomial_block_from_order(data, nullspace_order);
+    // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
+    // Reparameterizing alpha = Z gamma enforces conditional-PD constraints once
+    // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.
     let z = kernel_constraint_nullspace(centers, nullspace_order)?;
+
+    let use_primary_exact = d == 10 && matches!(nullspace_order, DuchonNullspaceOrder::Linear);
+    if !use_primary_exact {
+        return Err(BasisError::InvalidInput(format!(
+            "exact Duchon-Matern kernel is currently implemented only for k=10, p=1, s=4 (Linear nullspace); got d={d}, nullspace_order={nullspace_order:?}"
+        )));
+    }
+
+    // Practical safe operating range (document Eq. D.2):
+    //   κ in [1e-2 / r_max, 1e2 / r_min]
+    // where r_min/r_max are pairwise center distance extrema.
+    // We keep user-provided κ but emit a warning outside this regime.
+    if let Some((r_min, r_max)) = pairwise_distance_bounds(centers) {
+        let kappa = 1.0 / length_scale.max(1e-300);
+        let kappa_lo = 1e-2 / r_max;
+        let kappa_hi = 1e2 / r_min;
+        if kappa < kappa_lo || kappa > kappa_hi {
+            log::warn!(
+                "Duchon-Matern κ={} is outside recommended range [{}, {}] derived from centers (r_min={}, r_max={}); numerical conditioning may degrade",
+                kappa,
+                kappa_lo,
+                kappa_hi,
+                r_min,
+                r_max
+            );
+        }
+    }
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
@@ -1883,7 +2158,8 @@ pub fn create_duchon_spline_basis(
                     let delta = data[[i, c]] - centers[[j, c]];
                     dist2 += delta * delta;
                 }
-                row[j] = matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)?;
+                let _ = nu; // Retained in signature for API compatibility.
+                row[j] = duchon_matern_kernel_p1_s4_k10_from_distance(dist2.sqrt(), length_scale)?;
             }
             Ok(())
         });
@@ -1901,13 +2177,18 @@ pub fn create_duchon_spline_basis(
                     let delta = centers[[i, c]] - centers[[j, c]];
                     dist2 += delta * delta;
                 }
-                row[j] = matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)?;
+                let _ = nu; // Retained in signature for API compatibility.
+                row[j] = duchon_matern_kernel_p1_s4_k10_from_distance(dist2.sqrt(), length_scale)?;
             }
             Ok(())
         });
     center_result?;
 
     let kernel_constrained = kernel_block.dot(&z);
+    // Constrained Gram penalty block: S_free = Z^T K_CC Z.
+    // This is the standard Duchon/thin-plate constrained coefficient penalty.
+    // Constrained (conditionally PD) penalty:
+    //   alpha = Z gamma,  Q^T alpha = 0  =>  gamma^T (Z^T K_CC Z) gamma.
     let omega_constrained = z.t().dot(&center_kernel).dot(&z);
     let kernel_cols = kernel_constrained.ncols();
     let poly_cols = poly_block.ncols();
@@ -1918,9 +2199,7 @@ pub fn create_duchon_spline_basis(
         .slice_mut(s![.., 0..kernel_cols])
         .assign(&kernel_constrained);
     if poly_cols > 0 {
-        basis
-            .slice_mut(s![.., kernel_cols..])
-            .assign(&poly_block);
+        basis.slice_mut(s![.., kernel_cols..]).assign(&poly_block);
     }
 
     let mut penalty_kernel = Array2::<f64>::zeros((total_cols, total_cols));
@@ -1956,6 +2235,8 @@ pub fn build_duchon_basis(
     let mut penalties = vec![d.penalty_kernel.clone()];
     let mut nullspace_dims = vec![d.num_polynomial_basis];
     if spec.double_penalty {
+        // Double penalty appends an identity ridge block, yielding a full-rank
+        // penalty when desired and avoiding generalized-inverse handling.
         penalties.push(d.penalty_ridge.clone());
         nullspace_dims.push(0);
     }
@@ -2000,6 +2281,8 @@ fn kernel_constraint_nullspace(
     if p_k.ncols() == 0 {
         return Ok(Array2::<f64>::eye(k));
     }
+    // Constraint system Q^T alpha = 0, where Q rows are polynomial basis
+    // functions evaluated at knot locations.
     let p_k_t = p_k.t().to_owned(); // (d+1) x k
 
     use crate::faer_ndarray::FaerSvd;
@@ -2019,6 +2302,7 @@ fn kernel_constraint_nullspace(
         // Fully constrained kernel (no wiggle block): valid pure-polynomial TPS.
         Array2::<f64>::zeros((k, 0))
     } else {
+        // Null-space basis Z for the feasible radial coefficients.
         v.slice(s![.., rank..]).to_owned() // k x q
     };
     Ok(z)
@@ -2153,9 +2437,7 @@ fn thin_plate_kernel_m2_from_dist2(dist2: f64, dimension: usize) -> Result<f64, 
         // m = 2 => 2m-d = 3 (odd): r^3 = (r^2) * r
         1 => Ok(dist2 * dist2.sqrt()),
         // m = 2 => 2m-d = 2 (even): r^2 log(r) = 0.5 * r^2 * log(r^2)
-        2 => {
-            Ok(0.5 * dist2 * dist2.ln())
-        }
+        2 => Ok(0.5 * dist2 * dist2.ln()),
         // m = 2 => 2m-d = 1 (odd): r = sqrt(r^2)
         3 => Ok(dist2.sqrt()),
         _ => Err(BasisError::InvalidInput(format!(
@@ -2347,7 +2629,10 @@ pub fn apply_sum_to_zero_constraint(
         .copied()
         .fold(0.0_f64, |acc, v| acc.max(v.abs()));
     let tol = (k.max(1) as f64) * f64::EPSILON * max_sigma.max(1.0);
-    let rank = singular_values.iter().filter(|&&sigma| sigma.abs() > tol).count();
+    let rank = singular_values
+        .iter()
+        .filter(|&&sigma| sigma.abs() > tol)
+        .count();
     if rank >= k {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
@@ -2982,7 +3267,7 @@ pub(crate) mod internal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array1, array};
+    use ndarray::{array, Array1};
 
     /// Independent recursive implementation of B-spline basis function evaluation.
     /// This implements the Cox-de Boor algorithm using recursion, following the
@@ -3137,13 +3422,7 @@ mod tests {
 
     #[test]
     fn test_thin_plate_knot_selection_shape_and_uniqueness() {
-        let data = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.5, 0.5]
-        ];
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let knots = select_thin_plate_knots(data.view(), 3).unwrap();
         assert_eq!(knots.shape(), &[3, 2]);
 
@@ -3162,13 +3441,7 @@ mod tests {
 
     #[test]
     fn test_thin_plate_with_knot_count_constructor() {
-        let data = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.5, 0.5]
-        ];
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let (tps, knots) = create_thin_plate_spline_basis_with_knot_count(data.view(), 4).unwrap();
         assert_eq!(knots.shape(), &[4, 2]);
         assert_eq!(tps.num_kernel_basis, 1);
@@ -3188,18 +3461,16 @@ mod tests {
         ];
         let k1 = select_thin_plate_knots(data.view(), 4).unwrap();
         let k2 = select_thin_plate_knots(data.view(), 4).unwrap();
-        assert_abs_diff_eq!(k1.as_slice().unwrap(), k2.as_slice().unwrap(), epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            k1.as_slice().unwrap(),
+            k2.as_slice().unwrap(),
+            epsilon = 1e-12
+        );
     }
 
     #[test]
     fn test_thin_plate_basis_reuse_knots_for_new_points() {
-        let train = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.5, 0.5]
-        ];
+        let train = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let (train_tps, knots) =
             create_thin_plate_spline_basis_with_knot_count(train.view(), 4).unwrap();
         let test = array![[0.2, 0.8], [0.8, 0.2], [0.5, 0.1]];
@@ -3210,7 +3481,10 @@ mod tests {
             train_tps.penalty_bending.shape(),
             test_tps.penalty_bending.shape()
         );
-        assert_eq!(train_tps.penalty_ridge.shape(), test_tps.penalty_ridge.shape());
+        assert_eq!(
+            train_tps.penalty_ridge.shape(),
+            test_tps.penalty_ridge.shape()
+        );
         assert_abs_diff_eq!(
             train_tps.penalty_bending.as_slice().unwrap(),
             test_tps.penalty_bending.as_slice().unwrap(),
@@ -3243,13 +3517,7 @@ mod tests {
 
     #[test]
     fn test_build_thin_plate_basis_double_penalty_outputs_two_blocks() {
-        let data = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.5, 0.5]
-        ];
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let spec = ThinPlateBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             double_penalty: true,
@@ -3517,9 +3785,7 @@ mod tests {
         // This test ensures that evaluation at the upper boundary works correctly.
 
         // Test the internal function directly with the problematic case
-        let knots = array![
-            0.0, 0.0, 0.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 10.0, 10.0, 10.0
-        ];
+        let knots = array![0.0, 0.0, 0.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 10.0, 10.0, 10.0];
         let x = 10.0; // This is the value that caused the panic
         let degree = 3;
 
@@ -4071,6 +4337,105 @@ mod tests {
             );
             assert_eq!(s_c.ncols(), n_constrained);
         }
+    }
+
+    #[test]
+    fn test_duchon_exact_primary_case_k10_builds() {
+        let n = 6usize;
+        let d = 10usize;
+        let k = 4usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        let mut centers = Array2::<f64>::zeros((k, d));
+        for i in 0..n {
+            for j in 0..d {
+                data[[i, j]] = (i as f64 + 1.0) * (j as f64 + 0.5) * 0.01;
+            }
+        }
+        for i in 0..k {
+            for j in 0..d {
+                centers[[i, j]] = (i as f64 + 0.25) * (j as f64 + 1.0) * 0.02;
+            }
+        }
+
+        let out = create_duchon_spline_basis(
+            data.view(),
+            centers.view(),
+            1.0,
+            MaternNu::Half,
+            DuchonNullspaceOrder::Linear,
+        )
+        .expect("primary Duchon-Matern case should build");
+        assert_eq!(out.dimension, d);
+        assert_eq!(out.basis.nrows(), n);
+        assert_eq!(out.penalty_kernel.nrows(), out.penalty_kernel.ncols());
+    }
+
+    #[test]
+    fn test_duchon_non_primary_case_returns_error() {
+        let data = Array2::<f64>::zeros((4, 3));
+        let centers = Array2::<f64>::zeros((3, 3));
+        let err = create_duchon_spline_basis(
+            data.view(),
+            centers.view(),
+            1.0,
+            MaternNu::Half,
+            DuchonNullspaceOrder::Linear,
+        )
+        .expect_err("non-primary Duchon config should fail explicitly");
+        match err {
+            BasisError::InvalidInput(msg) => {
+                assert!(msg.contains("exact Duchon-Matern kernel"));
+            }
+            _ => panic!("unexpected error type: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_duchon_primary_kernel_branch_policy() {
+        let kappa = 1.0;
+
+        // At the exact boundary z=0.1 we should use integral branch.
+        let r_boundary = 0.1;
+        let k_boundary_expected = duchon_matern_p1_s4_k10_integral(r_boundary, kappa);
+        let k_boundary_actual =
+            duchon_matern_kernel_p1_s4_k10_from_distance(r_boundary, 1.0).unwrap();
+        let rel =
+            (k_boundary_actual - k_boundary_expected).abs() / k_boundary_expected.abs().max(1e-12);
+        assert!(
+            rel < 1e-10,
+            "boundary should use integral branch: expected={}, actual={}, rel={}",
+            k_boundary_expected,
+            k_boundary_actual,
+            rel
+        );
+
+        // In the closed-form branch regime z>0.1, result should stay finite.
+        let k_closed = duchon_matern_kernel_p1_s4_k10_from_distance(0.2, 1.0).unwrap();
+        assert!(k_closed.is_finite());
+    }
+
+    #[test]
+    fn test_duchon_closed_form_matches_integral_at_moderate_scale() {
+        let kappa = 1.0;
+        let r = 1.0; // z=1, safely in closed-form branch
+        let k_int = duchon_matern_p1_s4_k10_integral(r, kappa);
+        let k_cf = duchon_matern_p1_s4_k10_closed_form(r, kappa);
+        let rel = (k_int - k_cf).abs() / k_int.abs().max(1e-12);
+        assert!(
+            rel < 2e-2,
+            "closed form should match integral at moderate scale: int={}, cf={}, rel={}",
+            k_int,
+            k_cf,
+            rel
+        );
+    }
+
+    #[test]
+    fn test_pairwise_distance_bounds_helper() {
+        let pts = array![[0.0, 0.0], [3.0, 4.0], [6.0, 8.0]];
+        let (r_min, r_max) = pairwise_distance_bounds(pts.view()).expect("bounds should exist");
+        assert!((r_min - 5.0).abs() < 1e-12);
+        assert!((r_max - 10.0).abs() < 1e-12);
     }
 }
 

@@ -2,7 +2,7 @@ use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
-use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
+use ndarray::{s, Array1, Array2, ArrayViewMut2, Axis};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use std::ops::Range;
 
@@ -701,11 +701,7 @@ pub fn compute_penalty_square_roots(
 
 /// Helper to construct the summed, weighted penalty matrix S_lambda.
 /// This version works with full-sized p × p penalty matrices from s_list.
-pub fn construct_s_lambda(
-    lambdas: &Array1<f64>,
-    s_list: &[Array2<f64>],
-    p: usize,
-) -> Array2<f64> {
+pub fn construct_s_lambda(lambdas: &Array1<f64>, s_list: &[Array2<f64>], p: usize) -> Array2<f64> {
     let mut s_lambda = Array2::zeros((p, p));
 
     if s_list.is_empty() {
@@ -1051,7 +1047,11 @@ pub(crate) fn stable_reparameterization_with_invariant(
         .collect();
     sorted_eigs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Use FIXED structural rank from invariant (ensures smooth objective)
+    // Use FIXED structural rank from invariant (ensures smooth objective).
+    // This mirrors the same principle as fixed null-space handling in
+    // conditionally-PD Duchon constructions: avoid rank changes during outer
+    // hyperparameter optimization, which would otherwise create non-smooth
+    // log|S| behavior.
     let structural_rank = penalized_rank.min(sorted_eigs.len());
     let selected_eigs: Vec<(usize, f64)> =
         sorted_eigs.iter().take(structural_rank).cloned().collect();
