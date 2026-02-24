@@ -4165,6 +4165,12 @@ pub mod internal {
                     }
                     _ => {
                         // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
+                        // This branch follows the common practical LAML strategy:
+                        // keep the tractable implicit-differentiation terms and avoid
+                        // explicit third-derivative tensor construction for dH/dtheta.
+                        // This is the standard GAM approximation: drop the explicit
+                        // dH/dtheta term while retaining the dominant mgcv-style
+                        // implicit-beta sensitivity terms.
                         // Replace FD with implicit differentiation for logit models.
                         // When Firth bias reduction is enabled, the inner objective is:
                         //   L*(beta, rho) = l(beta) - 0.5 * beta' S_lambda beta
