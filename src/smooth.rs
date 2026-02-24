@@ -1,6 +1,7 @@
 use crate::basis::{
-    BSplineBasisSpec, BasisBuildResult, BasisMetadata, BasisError, ThinPlateBasisSpec,
-    build_bspline_basis_1d, build_thin_plate_basis,
+    BSplineBasisSpec, BasisBuildResult, BasisMetadata, BasisError, DuchonBasisSpec,
+    MaternBasisSpec, ThinPlateBasisSpec, build_bspline_basis_1d, build_duchon_basis,
+    build_matern_basis, build_thin_plate_basis,
 };
 use crate::estimate::{EstimationError, FitOptions, FitResult, fit_gam};
 use crate::types::LikelihoodFamily;
@@ -25,6 +26,14 @@ pub enum SmoothBasisSpec {
     ThinPlate {
         feature_cols: Vec<usize>,
         spec: ThinPlateBasisSpec,
+    },
+    Matern {
+        feature_cols: Vec<usize>,
+        spec: MaternBasisSpec,
+    },
+    Duchon {
+        feature_cols: Vec<usize>,
+        spec: DuchonBasisSpec,
     },
 }
 
@@ -206,6 +215,14 @@ pub fn build_smooth_design(
                 let x = select_columns(data, feature_cols)?;
                 build_thin_plate_basis(x.view(), spec)?
             }
+            SmoothBasisSpec::Matern { feature_cols, spec } => {
+                let x = select_columns(data, feature_cols)?;
+                build_matern_basis(x.view(), spec)?
+            }
+            SmoothBasisSpec::Duchon { feature_cols, spec } => {
+                let x = select_columns(data, feature_cols)?;
+                build_duchon_basis(x.view(), spec)?
+            }
         };
 
         let p_local = built.design.ncols();
@@ -359,7 +376,10 @@ pub fn fit_term_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::{BSplineKnotSpec, CenterStrategy, ThinPlateBasisSpec};
+    use crate::basis::{
+        BSplineKnotSpec, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec,
+        MaternNu, ThinPlateBasisSpec,
+    };
     use ndarray::array;
 
     #[test]
@@ -458,5 +478,78 @@ mod tests {
         assert_eq!(design.linear_ranges.len(), 1);
         assert_eq!(design.penalties.len(), 3); // linear ridge + 2 smooth penalties
         assert_eq!(design.nullspace_dims.len(), 3);
+    }
+
+    #[test]
+    fn matern_smooth_builds_with_double_penalty_in_high_dim() {
+        let n = 12usize;
+        let d = 10usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            for j in 0..d {
+                data[[i, j]] = (i as f64) * 0.1 + (j as f64) * 0.03;
+            }
+        }
+
+        let terms = vec![SmoothTermSpec {
+            name: "matern_x".to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: (0..d).collect(),
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+                    length_scale: 0.75,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: true,
+                    double_penalty: true,
+                },
+            },
+            shape: ShapeConstraint::None,
+        }];
+
+        let sd = build_smooth_design(data.view(), &terms).unwrap();
+        assert_eq!(sd.design.nrows(), n);
+        assert_eq!(sd.terms.len(), 1);
+        // kernel + ridge penalties
+        assert_eq!(sd.penalties.len(), 2);
+        assert_eq!(sd.nullspace_dims.len(), 2);
+        // first penalty keeps 1 "almost null" intercept dimension
+        assert_eq!(sd.nullspace_dims[0], 1);
+        assert_eq!(sd.nullspace_dims[1], 0);
+    }
+
+    #[test]
+    fn duchon_linear_nullspace_builds_and_reports_nullspace_dim() {
+        let n = 14usize;
+        let d = 10usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            for j in 0..d {
+                data[[i, j]] = (i as f64) * 0.07 + (j as f64) * 0.05;
+            }
+        }
+
+        let terms = vec![SmoothTermSpec {
+            name: "duchon_x".to_string(),
+            basis: SmoothBasisSpec::Duchon {
+                feature_cols: (0..d).collect(),
+                spec: DuchonBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                    length_scale: 0.9,
+                    nu: MaternNu::FiveHalves,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    double_penalty: true,
+                },
+            },
+            shape: ShapeConstraint::None,
+        }];
+
+        let sd = build_smooth_design(data.view(), &terms).unwrap();
+        assert_eq!(sd.design.nrows(), n);
+        assert_eq!(sd.terms.len(), 1);
+        assert_eq!(sd.penalties.len(), 2);
+        assert_eq!(sd.nullspace_dims.len(), 2);
+        // Linear null space in d dimensions -> d+1 free polynomial terms
+        assert_eq!(sd.nullspace_dims[0], d + 1);
+        assert_eq!(sd.nullspace_dims[1], 0);
     }
 }

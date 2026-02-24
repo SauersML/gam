@@ -374,7 +374,7 @@ impl NutsPosterior {
 
         // === Step 5: Combined gradient in β space ===
         // ∇_β log p = ∇_β ll - ∇_β penalty
-        let mut grad_beta = &grad_ll_beta - &grad_penalty_beta;
+        let grad_beta = &grad_ll_beta - &grad_penalty_beta;
 
         // === Step 6: Chain rule to get gradient in z space ===
         // ∇_z = L^T @ ∇_β
