@@ -230,7 +230,6 @@ pub struct JointModelResult {
 
 impl<'a> JointModelState<'a> {
     /// Create new joint model state
-    #[allow(dead_code)]
     pub(crate) fn new(
         y: ArrayView1<'a, f64>,
         weights: ArrayView1<'a, f64>,
@@ -1027,8 +1026,7 @@ pub(crate) fn fit_joint_model<'a>(
     link: LinkFunction,
     config: &JointModelConfig,
 ) -> Result<JointModelResult, EstimationError> {
-    let quad_ctx = QuadratureContext::new();
-    let mut state = JointModelState::new(
+    fit_joint_model_with_reml(
         y,
         weights,
         x_base,
@@ -1036,148 +1034,8 @@ pub(crate) fn fit_joint_model<'a>(
         layout_base,
         link,
         config,
-        quad_ctx,
-    );
-
-    let mut prev_deviance = f64::INFINITY;
-    let mut converged = false;
-    let mut iter = 0;
-
-    // Get lambdas from rho (log-lambdas)
-    let n_base = state.s_base.len();
-    let mut lambda_base = Array1::<f64>::zeros(n_base);
-    for i in 0..n_base {
-        lambda_base[i] = state.rho.get(i).map(|r| r.exp()).unwrap_or(1.0);
-    }
-    let lambda_link = state.rho.get(n_base).map(|r| r.exp()).unwrap_or(1.0);
-
-    // Damping schedule: start conservative, increase as we converge
-    let initial_damping = 0.5;
-    let final_damping = 1.0;
-
-    for i in 0..config.max_backfit_iter {
-        iter = i + 1;
-
-        // Adaptive damping: increase towards 1.0 as we iterate
-        let progress = (i as f64) / (config.max_backfit_iter as f64);
-        let damping = initial_damping + progress * (final_damping - initial_damping);
-
-        // Step A: Given β, build wiggle basis and update link coefficients
-        let u = state.base_linear_predictor();
-        let b_wiggle = state
-            .build_link_basis(&u)
-            .map_err(|e| EstimationError::InvalidSpecification(e))?;
-
-        // Update link coefficients (θ) via IRLS with u as OFFSET
-        let deviance_after_g = state.irls_link_step(&b_wiggle, &u, lambda_link);
-
-        // Step B: Given g, update β using g'(u)*X design
-        // Get knot range for derivative computation
-        // Compute g'(u) for chain rule
-        let g_prime = compute_link_derivative_from_state(&state, &u, &b_wiggle);
-
-        // Update β with damping (Gauss-Newton with offset)
-        state.irls_base_step(&b_wiggle, &g_prime, &lambda_base, damping);
-
-        // Rebuild basis with updated β before computing deviance for convergence check
-        // This ensures we check convergence on the actual model state, not a stale version
-        let u_new = state.base_linear_predictor();
-        let b_new = state
-            .build_link_basis(&u_new)
-            .map_err(|e| EstimationError::InvalidSpecification(e))?;
-        let deviance = state.compute_deviance(&state.compute_eta_full(&u_new, &b_new));
-
-        // Check for convergence
-        let delta = (prev_deviance - deviance).abs() / (deviance.abs() + 1.0);
-
-        eprintln!(
-            "[JOINT] Iter {}: dev_g={:.4}, dev_β={:.4}, δ={:.6}, damp={:.2}, g'∈[{:.2},{:.2}]",
-            iter,
-            deviance_after_g,
-            deviance,
-            delta,
-            damping,
-            g_prime.iter().cloned().fold(f64::INFINITY, f64::min),
-            g_prime.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
-        );
-
-        if delta < config.backfit_tol {
-            prev_deviance = deviance;
-            converged = true;
-            eprintln!("[JOINT] Converged after {} iterations", iter);
-            break;
-        }
-        prev_deviance = deviance;
-    }
-
-    if !converged {
-        eprintln!(
-            "[JOINT] Did not converge after {} iterations",
-            config.max_backfit_iter
-        );
-    }
-
-    // Get stored values for result
-    let knot_range = state.knot_range.unwrap_or((0.0, 1.0));
-    let knot_vector = state
-        .knot_vector
-        .clone()
-        .unwrap_or_else(|| Array1::zeros(0));
-
-    // Rebuild basis with final β and refit θ to ensure consistency
-    let u_final = state.base_linear_predictor();
-    let b_final = state
-        .build_link_basis(&u_final)
-        .map_err(|e| EstimationError::InvalidSpecification(e))?;
-
-    // θ is now potentially in wrong coordinates - refit it one more time
-    state.irls_link_step(&b_final, &u_final, lambda_link);
-
-    let eta_final = state.compute_eta_full(&u_final, &b_final);
-    let mut mu_final = Array1::<f64>::zeros(state.n_obs());
-    let mut weights_final = Array1::<f64>::zeros(state.n_obs());
-    let mut z_final = Array1::<f64>::zeros(state.n_obs());
-    crate::pirls::update_glm_vectors(
-        state.y,
-        &eta_final,
-        state.link.clone(),
-        state.weights,
-        &mut mu_final,
-        &mut weights_final,
-        &mut z_final,
-    );
-    let g_prime_final = compute_link_derivative_from_state(&state, &u_final, &b_final);
-    let edf = JointRemlState::compute_joint_edf(
-        &state,
-        &b_final,
-        &g_prime_final,
-        &weights_final,
-        &lambda_base,
-        lambda_link,
+        None,
     )
-    .unwrap_or(f64::NAN);
-
-    Ok(JointModelResult {
-        beta_base: state.beta_base.clone(),
-        beta_link: state.beta_link.clone(),
-        lambdas: state.rho.mapv(f64::exp).to_vec(),
-        deviance: prev_deviance,
-        edf,
-        backfit_iterations: iter,
-        converged,
-        knot_range,
-        knot_vector,
-        link_transform: state
-            .link_transform
-            .clone()
-            .unwrap_or_else(|| Array2::eye(state.n_constrained_basis)),
-        degree: state.degree,
-        link: state.link.clone(),
-        s_link_constrained: state.s_link_constrained.clone().unwrap_or_else(|| {
-            Array2::zeros((state.n_constrained_basis, state.n_constrained_basis))
-        }),
-        ridge_used: state.ridge_used,
-    })
 }
 
 /// Engine-facing joint model entrypoint without domain `EngineDims`.
@@ -1283,7 +1141,6 @@ impl JointRemlSnapshot {
 
 impl<'a> JointRemlState<'a> {
     /// Create new REML state
-    #[allow(dead_code)]
     pub(crate) fn new(
         y: ArrayView1<'a, f64>,
         weights: ArrayView1<'a, f64>,
@@ -2860,7 +2717,6 @@ impl<'a> JointRemlState<'a> {
 ///
 /// Uses Laplace approximate marginal likelihood (LAML) with numerical gradient.
 /// For nonlinear g(u), the Hessian is Gauss-Newton (approximate).
-#[allow(dead_code)]
 pub(crate) fn fit_joint_model_with_reml<'a>(
     y: ArrayView1<'a, f64>,
     weights: ArrayView1<'a, f64>,

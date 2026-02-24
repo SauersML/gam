@@ -1,6 +1,7 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::FaerArrayView;
 use crate::hull::PeeledHull;
+use crate::estimate::FitResult;
 use crate::pirls;
 use crate::types::LinkFunction;
 use faer::linalg::matmul::matmul;
@@ -20,8 +21,7 @@ pub struct CalibratorFeatures {
     pub fisher_weights: Array1<f64>,
 }
 
-/// Compute ALO features (eta_tilde/mu_tilde, SE_tilde, signed distance) from a single base fit.
-pub fn compute_alo_features(
+fn compute_alo_features_from_pirls_impl(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
     raw_train: ArrayView2<f64>,
@@ -325,4 +325,37 @@ pub fn compute_alo_features(
         pred_identity: eta_hat,
         fisher_weights: base.final_weights.clone(),
     })
+}
+
+/// Compute ALO features (eta_tilde/mu_tilde, SE_tilde, signed distance) from a fitted GAM result.
+pub fn compute_alo_features_from_fit(
+    fit: &FitResult,
+    y: ArrayView1<f64>,
+    raw_train: ArrayView2<f64>,
+    hull_opt: Option<&PeeledHull>,
+    link: LinkFunction,
+) -> Result<CalibratorFeatures, EstimationError> {
+    compute_alo_features_from_pirls_impl(&fit.artifacts.pirls, y, raw_train, hull_opt, link)
+}
+
+/// Compute ALO features from a fitted GAM result (primary API).
+pub fn compute_alo_features(
+    fit: &FitResult,
+    y: ArrayView1<f64>,
+    raw_train: ArrayView2<f64>,
+    hull_opt: Option<&PeeledHull>,
+    link: LinkFunction,
+) -> Result<CalibratorFeatures, EstimationError> {
+    compute_alo_features_from_fit(fit, y, raw_train, hull_opt, link)
+}
+
+/// Compute ALO features from a PIRLS result for lower-level callers.
+pub fn compute_alo_features_from_pirls(
+    base: &pirls::PirlsResult,
+    y: ArrayView1<f64>,
+    raw_train: ArrayView2<f64>,
+    hull_opt: Option<&PeeledHull>,
+    link: LinkFunction,
+) -> Result<CalibratorFeatures, EstimationError> {
+    compute_alo_features_from_pirls_impl(base, y, raw_train, hull_opt, link)
 }

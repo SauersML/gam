@@ -1,7 +1,7 @@
 use crate::survival::{
     MonotonicityPenalty, PenaltyBlocks, SurvivalEngineInputs, SurvivalSpec, WorkingModelSurvival,
 };
-use ndarray::{Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 /// Flattened engine inputs for Royston-Parmar likelihood evaluation.
 pub struct RoystonParmarInputs<'a> {
@@ -53,4 +53,70 @@ pub fn expected_hessian_from_flattened(
         .update_state(&beta.to_owned())
         .map_err(|e| crate::estimate::EstimationError::InvalidSpecification(e.to_string()))?;
     Ok(state.hessian)
+}
+
+/// Options for survival smoothing-parameter optimization over `rho = log(lambda)`.
+#[derive(Clone, Debug)]
+pub struct SurvivalLambdaOptimizerOptions {
+    pub max_iter: usize,
+    pub tol: f64,
+    pub finite_diff_step: f64,
+    pub seed_config: crate::seeding::SeedConfig,
+}
+
+impl Default for SurvivalLambdaOptimizerOptions {
+    fn default() -> Self {
+        Self {
+            max_iter: 200,
+            tol: 1e-5,
+            finite_diff_step: 1e-3,
+            seed_config: crate::seeding::SeedConfig::default(),
+        }
+    }
+}
+
+/// Result of survival smoothing-parameter optimization.
+#[derive(Clone, Debug)]
+pub struct SurvivalLambdaOptimizerResult {
+    pub rho: Array1<f64>,
+    pub lambdas: Array1<f64>,
+    pub final_value: f64,
+    pub iterations: usize,
+    pub final_grad_norm: f64,
+    pub stationary: bool,
+}
+
+/// Optimize survival smoothing parameters via multi-start BFGS.
+///
+/// This wraps the engine-level optimizer with a survival-family specific contract.
+pub fn optimize_survival_lambdas_with_multistart<F>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    objective: F,
+    options: &SurvivalLambdaOptimizerOptions,
+) -> Result<SurvivalLambdaOptimizerResult, crate::estimate::EstimationError>
+where
+    F: Fn(&Array1<f64>) -> Result<f64, crate::estimate::EstimationError>,
+{
+    let core_opts = crate::estimate::SmoothingBfgsOptions {
+        max_iter: options.max_iter,
+        tol: options.tol,
+        finite_diff_step: options.finite_diff_step,
+        seed_config: options.seed_config,
+    };
+    let result = crate::estimate::optimize_log_smoothing_with_multistart(
+        num_penalties,
+        heuristic_lambdas,
+        objective,
+        &core_opts,
+    )?;
+    let lambdas = result.rho.mapv(f64::exp);
+    Ok(SurvivalLambdaOptimizerResult {
+        rho: result.rho,
+        lambdas,
+        final_value: result.final_value,
+        iterations: result.iterations,
+        final_grad_norm: result.final_grad_norm,
+        stationary: result.stationary,
+    })
 }
