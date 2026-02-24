@@ -1817,6 +1817,28 @@ fn duchon_matern_p1_s4_k10_closed_form(r: f64, kappa: f64) -> f64 {
 }
 
 #[inline(always)]
+fn duchon_matern_p1_s4_k10_small_a_series(a: f64) -> f64 {
+    // Cancellation-free small-a expansion for:
+    //   K(a) = (1/96) ∫_0^1 u^3 K0(a sqrt(u)) du, a = κr.
+    // Truncation error after a^8 term is O(a^10 log a).
+    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+    let aa = a.max(1e-300);
+    let l = -(aa * 0.5).ln() - EULER_GAMMA;
+    let a2 = aa * aa;
+    let a4 = a2 * a2;
+    let a6 = a4 * a2;
+    let a8 = a4 * a4;
+
+    l / 384.0
+        + 1.0 / 3072.0
+        + a2 * (l / 1920.0 + 11.0 / 19_200.0)
+        + a4 * (l / 36_864.0 + 19.0 / 442_368.0)
+        + a6 * (l / 1_548_288.0 + 5.0 / 4_064_256.0)
+        + a8 * (l / 113_246_208.0 + 103.0 / 5_435_817_984.0)
+}
+
+#[inline(always)]
+#[cfg(test)]
 fn duchon_matern_p1_s4_k10_integral(r: f64, kappa: f64) -> f64 {
     #[inline(always)]
     fn simpson<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64) -> f64 {
@@ -1881,10 +1903,14 @@ fn duchon_matern_kernel_p1_s4_k10_from_distance(
 
     let kappa = 1.0 / length_scale;
     let z = kappa * r;
-    // Bifurcation to avoid catastrophic cancellation in A.11 near z -> 0.
-    // Use the integral form for small z and the explicit closed form otherwise.
-    if z <= 0.1 {
-        Ok(duchon_matern_p1_s4_k10_integral(r, kappa))
+    // Robust regime split:
+    // - small z: series (no catastrophic cancellation at Sobolev boundary)
+    // - moderate z: exact closed form
+    // - large z: leading asymptotic (Bessel terms are exponentially suppressed)
+    if z < 1.0 {
+        Ok(duchon_matern_p1_s4_k10_small_a_series(z))
+    } else if z > 50.0 {
+        Ok(48.0 / z.powi(8))
     } else {
         Ok(duchon_matern_p1_s4_k10_closed_form(r, kappa))
     }
@@ -1966,6 +1992,25 @@ pub fn create_matern_spline_basis(
         return Err(BasisError::InvalidInput(
             "Matérn length_scale must be finite and positive".to_string(),
         ));
+    }
+
+    // Practical safe operating range for κ from center geometry (document Eq. D.2):
+    //   κ in [1e-2 / r_max, 1e2 / r_min], with κ = 1/length_scale.
+    // Warn rather than silently clamp so callers keep explicit control.
+    if let Some((r_min, r_max)) = pairwise_distance_bounds(centers) {
+        let kappa = 1.0 / length_scale.max(1e-300);
+        let kappa_lo = 1e-2 / r_max;
+        let kappa_hi = 1e2 / r_min;
+        if kappa < kappa_lo || kappa > kappa_hi {
+            log::warn!(
+                "Matérn κ={} is outside recommended range [{}, {}] derived from centers (r_min={}, r_max={}); kernel conditioning may degrade",
+                kappa,
+                kappa_lo,
+                kappa_hi,
+                r_min,
+                r_max
+            );
+        }
     }
 
     let poly_cols = if include_intercept { 1 } else { 0 };
@@ -4392,25 +4437,22 @@ mod tests {
 
     #[test]
     fn test_duchon_primary_kernel_branch_policy() {
-        let kappa = 1.0;
-
-        // At the exact boundary z=0.1 we should use integral branch.
-        let r_boundary = 0.1;
-        let k_boundary_expected = duchon_matern_p1_s4_k10_integral(r_boundary, kappa);
-        let k_boundary_actual =
-            duchon_matern_kernel_p1_s4_k10_from_distance(r_boundary, 1.0).unwrap();
+        // For z < 1, runtime should use the small-a series branch.
+        let z_small = 0.1;
+        let k_boundary_expected = duchon_matern_p1_s4_k10_small_a_series(z_small);
+        let k_boundary_actual = duchon_matern_kernel_p1_s4_k10_from_distance(z_small, 1.0).unwrap();
         let rel =
             (k_boundary_actual - k_boundary_expected).abs() / k_boundary_expected.abs().max(1e-12);
         assert!(
             rel < 1e-10,
-            "boundary should use integral branch: expected={}, actual={}, rel={}",
+            "small-a path should use series branch: expected={}, actual={}, rel={}",
             k_boundary_expected,
             k_boundary_actual,
             rel
         );
 
-        // In the closed-form branch regime z>0.1, result should stay finite.
-        let k_closed = duchon_matern_kernel_p1_s4_k10_from_distance(0.2, 1.0).unwrap();
+        // In the closed-form branch regime z>=1, result should stay finite.
+        let k_closed = duchon_matern_kernel_p1_s4_k10_from_distance(1.0, 1.0).unwrap();
         assert!(k_closed.is_finite());
     }
 
