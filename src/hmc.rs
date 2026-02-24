@@ -942,13 +942,12 @@ mod survival_hmc {
                 .update_state(&beta)
                 .map_err(|e| format!("Survival state update failed: {:?}", e))?;
 
-            // Convert deviance to log-posterior: logp = -0.5 * deviance
-            // (deviance = -2 * log_likelihood + penalty, so -0.5 * deviance = log_likelihood - 0.5*penalty)
-            let logp = -0.5 * state.deviance;
-
-            // The gradient from update_state is ∂deviance/∂β = -2 * ∂log_posterior/∂β
-            // So ∂log_posterior/∂β = -0.5 * gradient
-            let grad_beta = state.gradient.mapv(|g| -0.5 * g);
+            // Survival WorkingState follows the same engine contract as GAM:
+            //   deviance = -2 log-likelihood (without quadratic penalties)
+            //   penalty_term = beta' S beta (+ stabilization ridge term)
+            //   gradient = d/dβ [0.5 * (deviance + penalty_term)].
+            let logp = -0.5 * (state.deviance + state.penalty_term);
+            let grad_beta = state.gradient.mapv(|g| -g);
 
             // Chain rule to get gradient in z space: ∇_z = L^T @ ∇_β
             let grad_z = self.chol_t.dot(&grad_beta);

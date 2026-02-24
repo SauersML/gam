@@ -5,6 +5,7 @@ use crate::custom_family::{
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::DesignMatrix;
+use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, s};
 
@@ -451,23 +452,6 @@ pub enum ParameterLink {
     Wiggle,
 }
 
-fn normal_pdf(x: f64) -> f64 {
-    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    INV_SQRT_2PI * (-0.5 * x * x).exp()
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    let z = x.abs();
-    let t = 1.0 / (1.0 + 0.231_641_9 * z);
-    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
-        - 0.356_563_782)
-        * t
-        + 0.319_381_530)
-        * t;
-    let cdf_pos = 1.0 - normal_pdf(z) * poly;
-    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
-}
-
 fn signed_with_floor(v: f64, floor: f64) -> f64 {
     let a = v.abs().max(floor);
     if v >= 0.0 { a } else { -a }
@@ -519,7 +503,7 @@ fn binomial_location_scale_core(
         };
         q0[i] = (score[i] - eta_t[i]) / sigma[i].max(1e-12);
         let q = q0[i] + eta_wiggle.map_or(0.0, |w| w[i]);
-        mu[i] = normal_cdf(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
+        mu[i] = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
         dmu_dq[i] = normal_pdf(q).max(MIN_DERIV);
         ll += weights[i] * (y[i] * mu[i].ln() + (1.0 - y[i]) * (1.0 - mu[i]).ln());
     }
@@ -1098,7 +1082,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitFamily {
         for i in 0..mean.len() {
             let sigma = eta_ls[i].exp().clamp(self.sigma_min, self.sigma_max).max(1e-12);
             let q = (self.score[i] - eta_t[i]) / sigma;
-            mean[i] = normal_cdf(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
+            mean[i] = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
         }
         Ok(GenerativeSpec {
             mean,
@@ -1291,7 +1275,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {
         for i in 0..mean.len() {
             let sigma = eta_ls[i].exp().clamp(self.sigma_min, self.sigma_max).max(1e-12);
             let q0 = (self.score[i] - eta_t[i]) / sigma;
-            mean[i] = normal_cdf(q0 + eta_w[i]).clamp(MIN_PROB, 1.0 - MIN_PROB);
+            mean[i] = normal_cdf_approx(q0 + eta_w[i]).clamp(MIN_PROB, 1.0 - MIN_PROB);
         }
         Ok(GenerativeSpec {
             mean,

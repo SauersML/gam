@@ -133,6 +133,16 @@ fn compute_alo_features_from_pirls_impl(
         let t_chunk = t_chunk_storage.as_ref();
         let s_col_stride = s_chunk.col_stride();
         let t_col_stride = t_chunk.col_stride();
+        assert_eq!(
+            s_chunk.row_stride(),
+            1,
+            "s_chunk must be contiguous in memory"
+        );
+        assert_eq!(
+            t_chunk.row_stride(),
+            1,
+            "t_chunk must be contiguous in memory"
+        );
         assert!(s_col_stride >= 0 && t_col_stride >= 0);
         let s_col_stride = s_col_stride as usize;
         let t_col_stride = t_col_stride as usize;
@@ -165,11 +175,19 @@ fn compute_alo_features_from_pirls_impl(
 
             if !(0.0..=1.0).contains(&ai) || !ai.is_finite() {
                 invalid_count += 1;
-                eprintln!("[CAL] WARNING: Invalid leverage at i={}, a_ii={:.6e}", obs, ai);
+                log::warn!(
+                    "[GAM ALO] invalid leverage at i={}, a_ii={:.6e}",
+                    obs,
+                    ai
+                );
             } else if ai > 0.99 {
                 high_leverage_count += 1;
                 if ai > 0.999 {
-                    eprintln!("[CAL] Very high leverage at i={}, a_ii={:.6e}", obs, ai);
+                    log::warn!(
+                        "[GAM ALO] very high leverage at i={}, a_ii={:.6e}",
+                        obs,
+                        ai
+                    );
                 }
             }
 
@@ -186,8 +204,8 @@ fn compute_alo_features_from_pirls_impl(
             let wi = base.final_weights[obs].max(1e-12);
             let var_full = phi * (quad / wi);
             if var_full == 0.0 && base.final_weights[obs] < 1e-10 {
-                eprintln!(
-                    "[CAL] WARNING: obs {} has near-zero weight ({:.2e}) resulting in SE=0",
+                log::warn!(
+                    "[GAM ALO] obs {} has near-zero weight ({:.2e}) resulting in SE=0",
                     obs, base.final_weights[obs]
                 );
             }
@@ -195,19 +213,19 @@ fn compute_alo_features_from_pirls_impl(
             se_naive[obs] = se_full;
 
             if diag_counter < max_diag_samples {
-                println!("[GAM DIAG] SE formula (obs {}):", obs);
-                println!("  - w_i: {:.6e}", wi);
-                println!("  - a_ii: {:.6e}", ai);
-                println!("  - var_full: {:.6e}", var_full);
-                println!("  - SE_naive: {:.6e}", se_full);
+                log::debug!("[GAM ALO] SE formula (obs {}):", obs);
+                log::debug!("  - w_i: {:.6e}", wi);
+                log::debug!("  - a_ii: {:.6e}", ai);
+                log::debug!("  - var_full: {:.6e}", var_full);
+                log::debug!("  - SE_naive: {:.6e}", se_full);
                 diag_counter += 1;
             }
         }
     }
 
     if invalid_count > 0 || high_leverage_count > 0 {
-        eprintln!(
-            "[CAL] Leverage diagnostics: {} invalid values, {} high values (>0.99)",
+        log::warn!(
+            "[GAM ALO] leverage diagnostics: {} invalid values, {} high values (>0.99)",
             invalid_count, high_leverage_count
         );
     }
@@ -216,21 +234,29 @@ fn compute_alo_features_from_pirls_impl(
     for i in 0..n {
         let denom_raw = 1.0 - aii[i];
         let denom = if denom_raw <= 1e-12 {
-            eprintln!("[CAL] WARNING: 1 - a_ii ≤ eps at i={}, a_ii={:.6e}", i, aii[i]);
+            log::warn!(
+                "[GAM ALO] 1 - a_ii <= eps at i={}, a_ii={:.6e}",
+                i,
+                aii[i]
+            );
             1e-12
         } else {
             denom_raw
         };
 
         if denom <= 1e-4 {
-            eprintln!("[CAL] ALO 1-a_ii very small at i={}, a_ii={:.6e}", i, aii[i]);
+            log::warn!(
+                "[GAM ALO] ALO 1-a_ii very small at i={}, a_ii={:.6e}",
+                i,
+                aii[i]
+            );
         }
 
         eta_tilde[i] = (eta_hat[i] - aii[i] * z[i]) / denom;
 
         if !eta_tilde[i].is_finite() || eta_tilde[i].abs() > 1e6 {
-            eprintln!(
-                "[CAL] ALO eta_tilde extreme value at i={}: {}, capping",
+            log::warn!(
+                "[GAM ALO] ALO eta_tilde extreme value at i={}: {}, capping",
                 i, eta_tilde[i]
             );
             eta_tilde[i] = eta_tilde[i].clamp(-1e6, 1e6);
@@ -272,12 +298,12 @@ fn compute_alo_features_from_pirls_impl(
     let a_p99 = percentile_value(p99_idx);
     let a_max = if max_aii.is_finite() { max_aii } else { 0.0 };
 
-    eprintln!(
-        "[CAL] ALO leverage: n={}, mean={:.3e}, median={:.3e}, p95={:.3e}, p99={:.3e}, max={:.3e}",
+    log::warn!(
+        "[GAM ALO] leverage: n={}, mean={:.3e}, median={:.3e}, p95={:.3e}, p99={:.3e}, max={:.3e}",
         n, a_mean, a_median, a_p95, a_p99, a_max
     );
-    eprintln!(
-        "[CAL] ALO high-leverage: a>0.90: {:.2}%, a>0.95: {:.2}%, a>0.99: {:.2}%, dispersion phi={:.3e}",
+    log::warn!(
+        "[GAM ALO] high-leverage: a>0.90: {:.2}%, a>0.95: {:.2}%, a>0.99: {:.2}%, dispersion phi={:.3e}",
         100.0 * (a_hi_90 as f64) / (n as f64).max(1.0),
         100.0 * (a_hi_95 as f64) / (n as f64).max(1.0),
         100.0 * (a_hi_99 as f64) / (n as f64).max(1.0),
@@ -300,17 +326,17 @@ fn compute_alo_features_from_pirls_impl(
     let has_nan_dist = dist.iter().any(|&x| x.is_nan());
 
     if has_nan_pred || has_nan_se || has_nan_dist {
-        eprintln!("[CAL] ERROR: NaN values found in ALO features:");
-        eprintln!(
-            "      - pred: {} NaN values",
+        log::error!("[GAM ALO] NaN values found in ALO features:");
+        log::error!(
+            "[GAM ALO] pred: {} NaN values",
             pred.iter().filter(|&&x| x.is_nan()).count()
         );
-        eprintln!(
-            "      - se: {} NaN values",
+        log::error!(
+            "[GAM ALO] se: {} NaN values",
             se_naive.iter().filter(|&&x| x.is_nan()).count()
         );
-        eprintln!(
-            "      - dist: {} NaN values",
+        log::error!(
+            "[GAM ALO] dist: {} NaN values",
             dist.iter().filter(|&&x| x.is_nan()).count()
         );
         return Err(EstimationError::ModelIsIllConditioned {
