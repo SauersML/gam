@@ -50,7 +50,7 @@ use faer::Mat as FaerMat;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
-use faer::{Par, Side, get_global_parallelism, set_global_parallelism};
+use faer::{Par, Side};
 
 fn logit_from_prob(p: f64) -> f64 {
     let p = p.clamp(1e-8, 1.0 - 1e-8);
@@ -109,89 +109,13 @@ where
     acc.sum()
 }
 
-fn invert_square_matrix(matrix: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
-    let n = matrix.nrows();
-    if n == 0 || matrix.ncols() != n {
-        return Err(EstimationError::InvalidInput(
-            "invert_square_matrix requires a non-empty square matrix".to_string(),
-        ));
-    }
-
-    let mut aug = Array2::<f64>::zeros((n, 2 * n));
-    for r in 0..n {
-        for c in 0..n {
-            aug[[r, c]] = matrix[[r, c]];
-        }
-        aug[[r, n + r]] = 1.0;
-    }
-
-    for col in 0..n {
-        let mut pivot_row = col;
-        let mut pivot_abs = aug[[col, col]].abs();
-        for r in (col + 1)..n {
-            let v = aug[[r, col]].abs();
-            if v > pivot_abs {
-                pivot_abs = v;
-                pivot_row = r;
-            }
-        }
-        if pivot_abs <= 1e-14 || !pivot_abs.is_finite() {
-            return Err(EstimationError::LinearSystemSolveFailed(
-                FaerLinalgError::FactorizationFailed,
-            ));
-        }
-        if pivot_row != col {
-            for c in 0..(2 * n) {
-                let tmp = aug[[col, c]];
-                aug[[col, c]] = aug[[pivot_row, c]];
-                aug[[pivot_row, c]] = tmp;
-            }
-        }
-
-        let pivot = aug[[col, col]];
-        for c in 0..(2 * n) {
-            aug[[col, c]] /= pivot;
-        }
-
-        for r in 0..n {
-            if r == col {
-                continue;
-            }
-            let factor = aug[[r, col]];
-            if factor == 0.0 {
-                continue;
-            }
-            for c in 0..(2 * n) {
-                aug[[r, c]] -= factor * aug[[col, c]];
-            }
-        }
-    }
-
-    let mut inv = Array2::<f64>::zeros((n, n));
-    for r in 0..n {
-        for c in 0..n {
-            inv[[r, c]] = aug[[r, n + c]];
-        }
-    }
-    Ok(inv)
-}
-
 fn map_hessian_to_original_basis(
     pirls: &crate::pirls::PirlsResult,
 ) -> Result<Array2<f64>, EstimationError> {
-    let qs_inv = match invert_square_matrix(&pirls.reparam_result.qs) {
-        Ok(inv) => inv,
-        Err(err) => {
-            log::warn!(
-                "Failed to invert reparameterization matrix for Hessian back-transform: {}. Returning transformed-basis Hessian.",
-                err
-            );
-            return Ok(pirls.penalized_hessian_transformed.clone());
-        }
-    };
+    let qs = &pirls.reparam_result.qs;
     let h_t = &pirls.penalized_hessian_transformed;
-    let tmp = h_t.dot(&qs_inv);
-    Ok(qs_inv.t().dot(&tmp))
+    let tmp = qs.dot(h_t);
+    Ok(tmp.dot(&qs.t()))
 }
 
 #[derive(Clone, Copy)]
@@ -202,7 +126,6 @@ struct RemlConfig {
     reml_convergence_tolerance: f64,
     reml_max_iterations: u64,
     firth_bias_reduction: bool,
-    firth_curvature_mode: FirthCurvatureMode,
 }
 
 impl RemlConfig {
@@ -211,7 +134,6 @@ impl RemlConfig {
         reml_tol: f64,
         reml_max_iter: usize,
         firth_bias_reduction: bool,
-        firth_curvature_mode: FirthCurvatureMode,
     ) -> Self {
         Self {
             link_function,
@@ -220,7 +142,6 @@ impl RemlConfig {
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
-            firth_curvature_mode,
         }
     }
 
@@ -237,22 +158,7 @@ impl RemlConfig {
         }
     }
 
-    fn firth_curvature_active(&self) -> bool {
-        match self.firth_curvature_mode {
-            FirthCurvatureMode::Disabled => false,
-            FirthCurvatureMode::LogitJeffreys => {
-                self.firth_bias_reduction && matches!(self.link_function, LinkFunction::Logit)
-            }
-        }
-    }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FirthCurvatureMode {
-    Disabled,
-    LogitJeffreys,
-}
-
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
 
 fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
@@ -889,19 +795,11 @@ pub struct ExternalOptimOptions {
 
 fn resolve_external_family(
     family: crate::types::LikelihoodFamily,
-) -> Result<(LinkFunction, bool, FirthCurvatureMode), EstimationError> {
+) -> Result<(LinkFunction, bool), EstimationError> {
     match family {
-        crate::types::LikelihoodFamily::GaussianIdentity => {
-            Ok((LinkFunction::Identity, false, FirthCurvatureMode::Disabled))
-        }
-        crate::types::LikelihoodFamily::BinomialLogit => Ok((
-            LinkFunction::Logit,
-            true,
-            FirthCurvatureMode::LogitJeffreys,
-        )),
-        crate::types::LikelihoodFamily::BinomialProbit => {
-            Ok((LinkFunction::Probit, false, FirthCurvatureMode::Disabled))
-        }
+        crate::types::LikelihoodFamily::GaussianIdentity => Ok((LinkFunction::Identity, false)),
+        crate::types::LikelihoodFamily::BinomialLogit => Ok((LinkFunction::Logit, true)),
+        crate::types::LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
         crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
                 .to_string(),
@@ -1105,28 +1003,19 @@ where
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "optimize_external_design")?;
     let k = s_list.len();
-    let (link, firth_active, firth_curvature_mode) = resolve_external_family(opts.family)?;
-    let cfg = RemlConfig::external(
-        link,
-        opts.tol,
-        opts.max_iter,
-        firth_active,
-        firth_curvature_mode,
-    );
+    let (link, firth_active) = resolve_external_family(opts.family)?;
+    let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
     let rs_list = compute_penalty_square_roots(&s_list)?;
 
     // Clone inputs to own their storage and unify lifetimes inside this function
     let y_o = y.to_owned();
     let w_o = w.to_owned();
-    let x_o = match x {
-        DesignMatrix::Dense(matrix) => matrix.clone(),
-        DesignMatrix::Sparse(_) => x.to_dense(),
-    };
+    let x_o = x.clone();
     let offset_o = offset.to_owned();
     let reml_state = internal::RemlState::new_with_offset(
         y_o.view(),
-        x_o.view(),
+        x_o.clone(),
         w_o.view(),
         offset_o.view(),
         s_list,
@@ -1190,9 +1079,9 @@ where
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, chosen_solution.iterations);
     let final_rho = to_rho_from_z(&final_point);
-    let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
+    let (pirls_res, _) = pirls::fit_model_for_fixed_rho_matrix(
         LogSmoothingParamsView::new(final_rho.view()),
-        x_o.view(),
+        &x_o,
         offset_o.view(),
         y_o.view(),
         w_o.view(),
@@ -1216,7 +1105,7 @@ where
     let weighted_rss = if matches!(link, LinkFunction::Identity) {
         let fitted = {
             let mut eta = offset_o.clone();
-            eta += &x_o.dot(&beta_orig);
+            eta += &x_o.matrix_vector_multiply(&beta_orig);
             eta
         };
         let resid = y_o.to_owned() - &fitted;
@@ -1752,27 +1641,18 @@ where
     validate_full_size_penalties(s_list, p, "evaluate_external_gradients")?;
 
     
-    let (link, firth_active, firth_curvature_mode) = resolve_external_family(opts.family)?;
-    let cfg = RemlConfig::external(
-        link,
-        opts.tol,
-        opts.max_iter,
-        firth_active,
-        firth_curvature_mode,
-    );
+    let (link, firth_active) = resolve_external_family(opts.family)?;
+    let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
     let y_o = y.to_owned();
     let w_o = w.to_owned();
-    let x_o = match x {
-        DesignMatrix::Dense(matrix) => matrix.clone(),
-        DesignMatrix::Sparse(_) => x.to_dense(),
-    };
+    let x_o = x.clone();
     let offset_o = offset.to_owned();
 
     let reml_state = internal::RemlState::new_with_offset(
         y_o.view(),
-        x_o.view(),
+        x_o,
         w_o.view(),
         offset_o.view(),
         s_vec,
@@ -1816,27 +1696,18 @@ where
     validate_full_size_penalties(s_list, p, "evaluate_external_cost_and_ridge")?;
 
     
-    let (link, firth_active, firth_curvature_mode) = resolve_external_family(opts.family)?;
-    let cfg = RemlConfig::external(
-        link,
-        opts.tol,
-        opts.max_iter,
-        firth_active,
-        firth_curvature_mode,
-    );
+    let (link, firth_active) = resolve_external_family(opts.family)?;
+    let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
     let y_o = y.to_owned();
     let w_o = w.to_owned();
-    let x_o = match x {
-        DesignMatrix::Dense(matrix) => matrix.clone(),
-        DesignMatrix::Sparse(_) => x.to_dense(),
-    };
+    let x_o = x.clone();
     let offset_o = offset.to_owned();
 
     let reml_state = internal::RemlState::new_with_offset(
         y_o.view(),
-        x_o.view(),
+        x_o,
         w_o.view(),
         offset_o.view(),
         s_vec,
@@ -1877,28 +1748,6 @@ pub mod internal {
                 FaerFactor::Lblt(f) => f.solve_in_place(rhs),
                 FaerFactor::Ldlt(f) => f.solve_in_place(rhs),
             }
-        }
-    }
-
-    struct FaerParallelismGuard {
-        previous: Par,
-    }
-
-    impl FaerParallelismGuard {
-        fn new(desired: Par) -> Self {
-            let previous = get_global_parallelism();
-            set_global_parallelism(desired);
-            Self { previous }
-        }
-
-        fn current_parallelism(&self) -> Par {
-            get_global_parallelism()
-        }
-    }
-
-    impl Drop for FaerParallelismGuard {
-        fn drop(&mut self) {
-            set_global_parallelism(self.previous);
         }
     }
 
@@ -2080,7 +1929,7 @@ pub mod internal {
 
     pub(crate) struct RemlState<'a> {
         y: ArrayView1<'a, f64>,
-        x: ArrayView2<'a, f64>,
+        x: DesignMatrix,
         weights: ArrayView1<'a, f64>,
         offset: Array1<f64>,
         // Original penalty matrices S_k (p × p), ρ-independent basis
@@ -2545,15 +2394,18 @@ pub mod internal {
         }
 
         #[allow(dead_code)]
-        pub(super) fn new(
+        pub(super) fn new<X>(
             y: ArrayView1<'a, f64>,
-            x: ArrayView2<'a, f64>,
+            x: X,
             weights: ArrayView1<'a, f64>,
             s_list: Vec<Array2<f64>>,
             p: usize,
             config: &'a RemlConfig,
             nullspace_dims: Option<Vec<usize>>,
-        ) -> Result<Self, EstimationError> {
+        ) -> Result<Self, EstimationError>
+        where
+            X: Into<DesignMatrix>,
+        {
             let zero_offset = Array1::<f64>::zeros(y.len());
             Self::new_with_offset(
                 y,
@@ -2567,18 +2419,22 @@ pub mod internal {
             )
         }
 
-        pub(super) fn new_with_offset(
+        pub(super) fn new_with_offset<X>(
             y: ArrayView1<'a, f64>,
-            x: ArrayView2<'a, f64>,
+            x: X,
             weights: ArrayView1<'a, f64>,
             offset: ArrayView1<'_, f64>,
             s_list: Vec<Array2<f64>>,
             p: usize,
             config: &'a RemlConfig,
             nullspace_dims: Option<Vec<usize>>,
-        ) -> Result<Self, EstimationError> {
+        ) -> Result<Self, EstimationError>
+        where
+            X: Into<DesignMatrix>,
+        {
             // Pre-compute penalty square roots once
             let rs_list = compute_penalty_square_roots(&s_list)?;
+            let x = x.into();
 
             let expected_len = s_list.len();
             let nullspace_dims = match nullspace_dims {
@@ -2664,164 +2520,48 @@ pub mod internal {
 
             let dim = h_eff.nrows();
 
-            // Determine if Firth is active
-            let firth_active = self.config.firth_curvature_active();
+            // Compute spectral quantities from the same curvature used by inner PIRLS.
+            // We intentionally stay on H_eff here for cost/gradient consistency.
+            let h_total = h_eff.clone();
+            let (eigvals, eigvecs) = h_total
+                .eigh(Side::Lower)
+                .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
 
-            // Compute spectral quantities using WHITENED SUBTRACTION to avoid catastrophic cancellation.
-            //
-            // PROBLEM: Direct subtraction h_total = h_eff - h_phi causes catastrophic cancellation
-            // when h_eff ≈ h_phi, corrupting eigenvalues with numerical noise.
-            //
-            // SOLUTION (Golub & Van Loan, Matrix Computations, Section 8.7.2):
-            // Use the generalized eigenvalue approach:
-            //   1. Factor h_eff = L L^T (Cholesky)
-            //   2. Whiten h_phi: K = L^{-1} h_phi L^{-T}
-            //   3. Eigendecompose K = U diag(μ) U^T
-            //   4. Then h_total = L(I - K)L^T, so:
-            //      - Eigenvalues of h_total in whitened space: (1 - μ_i)
-            //      - log|h_total| = log|h_eff| + Σ log(1 - μ_i)
-            //      - Spectral factor: W = L^{-T} U diag(1/√(1-μ))
-            //
-            // This transforms the unstable matrix subtraction into stable scalar subtraction (1 - μ).
+            // Sum log(lambda) for valid eigenvalues
+            let h_total_log_det: f64 = eigvals
+                .iter()
+                .filter(|&&v| v > EIG_THRESHOLD)
+                .map(|&v| v.ln())
+                .sum();
 
-            let (h_total_log_det, w, h_total) = if firth_active {
-                // Firth case: use whitened subtraction
-                let h_phi = self.firth_hessian_logit(
-                    &pirls_result.x_transformed,
-                    &pirls_result.solve_mu,
-                    &pirls_result.solve_weights,
-                )?;
+            if !h_total_log_det.is_finite() {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
+            }
 
-                // Step 1: Cholesky factorization of h_eff
-                let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
-                    EstimationError::ModelIsIllConditioned {
-                        condition_number: f64::INFINITY,
-                    }
-                })?;
-                let l = chol.lower_triangular();
+            // Filter valid eigenvalues and construct W
+            let valid_indices: Vec<usize> = eigvals
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v > EIG_THRESHOLD { Some(i) } else { None })
+                .collect();
 
-                // Compute log|h_eff| = 2 * sum(log(diag(L)))
-                let log_det_h_eff: f64 = 2.0 * l.diag().mapv(|x| x.ln()).sum();
+            let valid_count = valid_indices.len();
+            let mut w = Array2::<f64>::zeros((dim, valid_count));
 
-                // Step 2: Compute whitened matrix K = L^{-1} h_phi L^{-T}
-                // K = L^{-1} * h_phi * L^{-T}
-                // First: Y = L^{-1} * h_phi (solve L Y = h_phi)
-                let y = Self::solve_lower_triangular(&l, &h_phi);
-                // Then: K = Y * L^{-T}
-                // To compute Y * L^{-T}: note that (Y L^{-T})^T = L^{-1} Y^T
-                // So: solve L Z^T = Y^T for Z^T, then K = Z = (Z^T)^T
-                let z_t = Self::solve_lower_triangular(&l, &y.t().to_owned());
-                let k = z_t.t().to_owned();
+            for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
+                let val = eigvals[eig_idx];
+                let scale = 1.0 / val.sqrt();
+                let u_col = eigvecs.column(eig_idx);
 
-                // L^T needed later for W computation
-                let l_t = l.t().to_owned();
-
-                // Step 3: Eigendecompose K (symmetric)
-                let (mu_vals, u_vecs) = k
-                    .eigh(Side::Lower)
-                    .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
-
-                // Step 4: Eigenvalues of h_total (in whitened space) are (1 - μ)
-                // log|h_total| = log|h_eff| + sum(log(1 - μ_i)) for valid (1-μ) > threshold
-                //
-                // Note: For numerical stability, we need (1 - μ) > threshold.
-                // If μ ≈ 1, then h_phi ≈ h_eff in that direction → h_total is near-singular there.
-                let mut log_det_correction: f64 = 0.0;
-                let mut valid_indices: Vec<usize> = Vec::new();
-
-                for (i, &mu) in mu_vals.iter().enumerate() {
-                    let one_minus_mu = 1.0 - mu;
-                    if one_minus_mu > EIG_THRESHOLD {
-                        log_det_correction += one_minus_mu.ln();
-                        valid_indices.push(i);
-                    }
-                }
-
-                let h_total_log_det = log_det_h_eff + log_det_correction;
-
-                if !h_total_log_det.is_finite() {
-                    return Err(EstimationError::ModelIsIllConditioned {
-                        condition_number: f64::INFINITY,
+                let mut w_col = w.column_mut(w_col_idx);
+                Zip::from(&mut w_col)
+                    .and(&u_col)
+                    .for_each(|w_elem, &u_elem| {
+                        *w_elem = u_elem * scale;
                     });
-                }
-
-                // Step 5: Compute spectral factor W = L^{-T} U_valid diag(1/√(1-μ_valid))
-                // H_total^{-1} = W W^T in the truncated spectral sense
-                let valid_count = valid_indices.len();
-                let mut w = Array2::<f64>::zeros((dim, valid_count));
-
-                // First compute U_scaled = U_valid * diag(1/√(1-μ))
-                let mut u_scaled = Array2::<f64>::zeros((dim, valid_count));
-                for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
-                    let one_minus_mu = 1.0 - mu_vals[eig_idx];
-                    let scale = 1.0 / one_minus_mu.sqrt();
-                    let u_col = u_vecs.column(eig_idx);
-
-                    let mut scaled_col = u_scaled.column_mut(w_col_idx);
-                    Zip::from(&mut scaled_col).and(&u_col).for_each(|s, &u| {
-                        *s = u * scale;
-                    });
-                }
-
-                // Then W = L^{-T} * U_scaled = solve L^T W = U_scaled
-                for j in 0..valid_count {
-                    let rhs_col = u_scaled.column(j).to_owned().insert_axis(ndarray::Axis(1));
-                    let w_col_result = Self::solve_upper_triangular(&l_t, &rhs_col);
-                    w.column_mut(j).assign(&w_col_result.column(0));
-                }
-
-                // Reconstruct h_total for storage (though we don't eigendecompose it directly)
-                // h_total = h_eff - h_phi (for storage/debugging, not for spectral computation)
-                let mut h_total = h_eff.clone();
-                h_total -= &h_phi;
-
-                (h_total_log_det, w, h_total)
-            } else {
-                // Non-Firth case: direct eigendecomposition (no subtraction, no cancellation risk)
-                let h_total = h_eff.clone();
-
-                let (eigvals, eigvecs) = h_total
-                    .eigh(Side::Lower)
-                    .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
-
-                // Sum log(lambda) for valid eigenvalues
-                let h_total_log_det: f64 = eigvals
-                    .iter()
-                    .filter(|&&v| v > EIG_THRESHOLD)
-                    .map(|&v| v.ln())
-                    .sum();
-
-                if !h_total_log_det.is_finite() {
-                    return Err(EstimationError::ModelIsIllConditioned {
-                        condition_number: f64::INFINITY,
-                    });
-                }
-
-                // Filter valid eigenvalues and construct W
-                let valid_indices: Vec<usize> = eigvals
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &v)| if v > EIG_THRESHOLD { Some(i) } else { None })
-                    .collect();
-
-                let valid_count = valid_indices.len();
-                let mut w = Array2::<f64>::zeros((dim, valid_count));
-
-                for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
-                    let val = eigvals[eig_idx];
-                    let scale = 1.0 / val.sqrt();
-                    let u_col = eigvecs.column(eig_idx);
-
-                    let mut w_col = w.column_mut(w_col_idx);
-                    Zip::from(&mut w_col)
-                        .and(&u_col)
-                        .for_each(|w_elem, &u_elem| {
-                            *w_elem = u_elem * scale;
-                        });
-                }
-
-                (h_total_log_det, w, h_total)
-            };
+            }
 
             // Compute pseudoinverse: H_dagger = W * W^T
             let h_pseudoinverse = w.dot(&w.t());
@@ -3036,7 +2776,7 @@ pub mod internal {
                 return Ok(Array1::zeros(0));
             }
 
-            let x = self.x;
+            let x = &self.x;
             let offset_view = self.offset.view();
             let y = self.y;
             let weights = self.weights;
@@ -3067,7 +2807,7 @@ pub mod internal {
             // and never reuse the same ρ, so the cache would not help and would require
             // synchronization across threads.
             let evaluate_penalised_ll = |rho_vec: &Array1<f64>| -> Result<f64, EstimationError> {
-                let (pirls_result, _) = pirls::fit_model_for_fixed_rho(
+                let (pirls_result, _) = pirls::fit_model_for_fixed_rho_matrix(
                     LogSmoothingParamsView::new(rho_vec.view()),
                     x,
                     offset_view,
@@ -3121,11 +2861,6 @@ pub mod internal {
                 }
             };
 
-            let faer_guard = FaerParallelismGuard::new(Par::Seq);
-            let faer_parallelism = faer_guard.current_parallelism();
-            if matches!(faer_parallelism, Par::Seq) {
-                std::hint::spin_loop();
-            }
             let grad_values = (0..len)
                 .into_par_iter()
                 .map(|k| -> Result<f64, EstimationError> {
@@ -3204,293 +2939,7 @@ pub mod internal {
 
         const MIN_DMU_DETA: f64 = 1e-6;
 
-        /// Compute the Firth curvature matrix H_phi = ∇²Φ where Φ = 0.5 log|X^T W X|.
-        /// This is needed for the exact Firth-adjusted Hessian: H_total = H_eff - H_phi.
-        /// NOTE: Uses stabilized Fisher info (matching cost path) for gradient consistency.
-        fn firth_hessian_logit(
-            &self,
-            x_transformed: &DesignMatrix,
-            mu: &Array1<f64>,
-            weights: &Array1<f64>,
-        ) -> Result<Array2<f64>, EstimationError> {
-            let n = mu.len();
-            let x_trans_dense = self.dense_design_matrix(x_transformed);
-            let n_x = x_trans_dense.nrows();
-            let p = x_trans_dense.ncols();
-            if n == 0 || p == 0 || n != n_x {
-                return Ok(Array2::zeros((p, p)));
-            }
-
-            // Match the GLM probability clamp in update_glm_vectors.
-            // When mu is clamped, the forward objective is locally constant in eta,
-            // so derivatives w.r.t. eta must be zero to avoid a gradient/cost mismatch.
-            // Note: this creates a kink at the clamp boundary (piecewise objective),
-            // which can slow quasi-Newton methods, but keeps math consistent.
-            const PROB_EPS: f64 = 1e-8;
-            // Match the GLM weight clamp in update_glm_vectors:
-            // dmu is clamped to MIN_WEIGHT before forming weights.
-            const MIN_WEIGHT: f64 = 1e-12;
-
-            let mut w_base = Array1::<f64>::zeros(n);
-            let mut u = Array1::<f64>::zeros(n);
-            let mut v = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let mu_i = mu[i];
-                let dmu = mu_i * (1.0 - mu_i);
-                w_base[i] = dmu;
-                // u = w'/w, v = w''/w for logit with clamped W.
-                // If mu is clamped, w is constant => derivatives are zero.
-                // This avoids phantom gradients in saturated regions.
-                if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || dmu < MIN_WEIGHT {
-                    u[i] = 0.0;
-                    v[i] = 0.0;
-                    continue;
-                }
-                let one_minus2 = 1.0 - 2.0 * mu_i;
-                u[i] = one_minus2;
-                v[i] = one_minus2 * one_minus2 - 2.0 * dmu;
-            }
-
-            // Build thin factor B for H_hat = B B^T with B = W^{1/2} X L_f^{-T}.
-            // This avoids forming the n×n hat matrix.
-            // Use firth_hat_factor and take only the first element (B matrix).
-            let (b, _, _) = self.firth_hat_factor(x_trans_dense.view(), weights.view())?;
-            // h_i = diag(H_hat)_i = ||b_i||^2
-            let h = Self::row_norms_squared(&b);
-
-            // term1 = X^T diag(h ⊙ v) X, where v = w''/w.
-            let mut x_weighted = x_trans_dense.clone();
-            for i in 0..n {
-                // term1 = X^T diag(h ⊙ v) X
-                let scale = h[i] * v[i];
-                if scale != 1.0 {
-                    x_weighted.row_mut(i).mapv_inplace(|v| v * scale);
-                }
-            }
-            let term1 = x_trans_dense.t().dot(&x_weighted);
-
-            // term2 = X^T (diag(u) (H_hat∘H_hat) diag(u)) X.
-            // This equals Y^T (H_hat∘H_hat) Y with Y = diag(u) X,
-            // and we evaluate it exactly using Khatri–Rao without n×n.
-            let mut y = x_trans_dense.clone();
-            for i in 0..n {
-                let s = u[i];
-                if s != 1.0 {
-                    y.row_mut(i).mapv_inplace(|v| v * s);
-                }
-            }
-            // T = (B ⊙ B)^T Y, so term2 = T^T T = Y^T (H_hat∘H_hat) Y
-            let t = Self::khatri_rao_transpose_mul(&b, &y);
-            let term2 = t.t().dot(&t);
-
-            let mut h_phi = term1;
-            h_phi -= &term2;
-            h_phi.mapv_inplace(|v| 0.5 * v);
-
-            for i in 0..p {
-                for j in 0..i {
-                    let v = 0.5 * (h_phi[(i, j)] + h_phi[(j, i)]);
-                    h_phi[(i, j)] = v;
-                    h_phi[(j, i)] = v;
-                }
-            }
-
-            Ok(h_phi)
-        }
-
-        /// Spectral version of firth log-det gradient for consistency with truncated log-det.
-        ///
-        /// Instead of using Cholesky-based C = X L_t^{-T}, this uses C = X W where
-        /// W is the spectral factor satisfying H₊† = W Wᵀ.
-        ///
-        /// This ensures ∇_β log|H₊| = tr(H₊† ∂H/∂β) uses the same spectral truncation
-        /// as the cost function log|H₊| = Σᵢ log(λᵢ) for λᵢ > ε.
-        fn firth_logh_total_grad_spectral(
-            &self,
-            x_transformed: &DesignMatrix,
-            mu: &Array1<f64>,
-            weights: &Array1<f64>,
-            spectral_w: &Array2<f64>,
-        ) -> Result<Array1<f64>, EstimationError> {
-            let x = self.dense_design_matrix(x_transformed);
-            let n = x.nrows();
-            let p = x.ncols();
-            if n == 0 || p == 0 || mu.len() != n {
-                return Ok(Array1::zeros(p));
-            }
-
-            const PROB_EPS: f64 = 1e-8;
-            const MIN_WEIGHT: f64 = 1e-12;
-
-            let mut w_base = Array1::<f64>::zeros(n);
-            let mut u = Array1::<f64>::zeros(n);
-            let mut v = Array1::<f64>::zeros(n);
-            let mut v_eta = Array1::<f64>::zeros(n);
-            let mut u_eta = Array1::<f64>::zeros(n);
-            let mut w_prime = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let mu_i = mu[i];
-                let w_b = mu_i * (1.0 - mu_i);
-                w_base[i] = w_b;
-                if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || w_b < MIN_WEIGHT {
-                    u[i] = 0.0;
-                    v[i] = 0.0;
-                    v_eta[i] = 0.0;
-                    u_eta[i] = 0.0;
-                    w_prime[i] = 0.0;
-                    continue;
-                }
-                let u_i = 1.0 - 2.0 * mu_i;
-                u[i] = u_i;
-                v[i] = u_i * u_i - 2.0 * w_b;
-                v_eta[i] = -6.0 * w_b * u_i;
-                u_eta[i] = -2.0 * w_b;
-                w_prime[i] = weights[i] * u_i;
-            }
-
-            // Forward thin factors:
-            //   B = W^{1/2} X L_f^{-T}   with H_hat = B B^T (unchanged - Fisher info)
-            //   C = X * spectral_W      with M_h = X H₊† X^T = C C^T (SPECTRAL VERSION)
-            let (b, l_f, xw) = self.firth_hat_factor(x.view(), weights.view())?;
-
-            // SPECTRAL: C = X * W instead of Cholesky-based X L_t^{-T}
-            let c = x.dot(spectral_w);
-
-            // Diagonal summaries (no n×n):
-            let h = Self::row_norms_squared(&b);
-            let mdiag = Self::row_norms_squared(&c);
-
-            // g_eta accumulates ∂J/∂eta
-            let mut g_eta = &mdiag * &w_prime;
-            for i in 0..n {
-                g_eta[i] += -0.5 * mdiag[i] * h[i] * v_eta[i];
-            }
-
-            // Backprop through H_phi diagonal term
-            let mut grad_b = Array2::<f64>::zeros((n, p));
-            for i in 0..n {
-                let scale = 0.5 * mdiag[i] * v[i];
-                if scale != 0.0 {
-                    for j in 0..p {
-                        grad_b[(i, j)] -= scale * b[(i, j)];
-                    }
-                }
-            }
-
-            // Reverse-mode AD for off-diagonal Firth correction (using spectral C).
-            // `c` can be rank-truncated (n × r), so all contractions over its axis
-            // must use `r = c.ncols()` rather than `p`.
-            let r = c.ncols();
-            let mut tensor_t = vec![0.0_f64; r * p * p];
-            let mut v_mat = faer::Mat::<f64>::zeros(n, r);
-            for i in 0..n {
-                let u_i = u[i];
-                for k in 0..r {
-                    v_mat[(i, k)] = u_i * c[(i, k)];
-                }
-            }
-
-            // Phase 2: Compute tensor slices via BLAS-3 matmul
-            for m in 0..p {
-                let mut scaled_b = faer::Mat::<f64>::zeros(n, p);
-                for j in 0..n {
-                    let b_jm = b[(j, m)];
-                    for l in 0..p {
-                        scaled_b[(j, l)] = b_jm * b[(j, l)];
-                    }
-                }
-                let mut t_slice = faer::Mat::<f64>::zeros(r, p);
-                faer::linalg::matmul::matmul(
-                    t_slice.as_mut(),
-                    faer::Accum::Replace,
-                    v_mat.as_ref().transpose(),
-                    scaled_b.as_ref(),
-                    1.0,
-                    Par::Seq,
-                );
-                for k in 0..r {
-                    for l in 0..p {
-                        tensor_t[k * p * p + l * p + m] = t_slice[(k, l)];
-                    }
-                }
-            }
-
-            // Phase 3: Contract tensor with observation vectors
-            for i in 0..n {
-                let u_i = u[i];
-                if u_i == 0.0 {
-                    continue;
-                }
-                for m in 0..p {
-                    let mut acc = 0.0;
-                    for k in 0..r {
-                        let c_ik = c[(i, k)];
-                        if c_ik == 0.0 {
-                            continue;
-                        }
-                        for l in 0..p {
-                            let b_il = b[(i, l)];
-                            if b_il == 0.0 {
-                                continue;
-                            }
-                            acc += c_ik * b_il * tensor_t[k * p * p + l * p + m];
-                        }
-                    }
-                    grad_b[(i, m)] += u_i * acc;
-                }
-            }
-
-            // Backprop through Cholesky of Fisher info (unchanged)
-            let g_y = grad_b.t().to_owned();
-            let d_xw = Self::solve_upper_triangular(&l_f.t().to_owned(), &g_y);
-            let d_l = {
-                let temp = d_xw.dot(&b);
-                let mut out = temp.t().to_owned();
-                for i in 0..p {
-                    for j in (i + 1)..p {
-                        out[(i, j)] = 0.0;
-                    }
-                }
-                out.mapv(|vv| -vv)
-            };
-            let g_f = Self::chol_reverse(&l_f, &d_l)?;
-            let mut g_xw = xw.dot(&g_f);
-            g_xw.mapv_inplace(|vv| 2.0 * vv);
-            g_xw += &d_xw.t().to_owned();
-
-            // Backprop through X_w = diag(sqrt(w)) X
-            for i in 0..n {
-                let w_i = weights[i];
-                if w_i <= 0.0 {
-                    continue;
-                }
-                let denom = w_i.sqrt();
-                let mut acc = 0.0;
-                for j in 0..p {
-                    acc += x[(i, j)] * g_xw[(i, j)];
-                }
-                let g_w = 0.5 * acc / denom;
-                g_eta[i] += g_w * w_prime[i];
-            }
-
-            // Final chain: g_beta = X^T g_eta
-            let g_beta = x.t().dot(&g_eta);
-            Ok(g_beta)
-        }
-
-        // Convert DesignMatrix to dense Array2 for Firth computations.
-
-        fn dense_design_matrix(&self, x_transformed: &DesignMatrix) -> Array2<f64> {
-            match x_transformed {
-                DesignMatrix::Dense(x_dense) => x_dense.to_owned(),
-                DesignMatrix::Sparse(x_sparse) => {
-                    let dense = x_sparse.as_ref().to_dense();
-                    Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| dense[(i, j)])
-                }
-            }
-        }
-
-        /// Compute ∂log|H|/∂β for logit GLM (non-Firth path).
+        /// Compute ∂log|H|/∂β for logit GLM.
         /// Uses the penalized Hessian factorization for leverage computation.
         fn logh_beta_grad_logit(
             &self,
@@ -3591,11 +3040,17 @@ pub mod internal {
                         }
                     } else {
                         // Fallback for non-CSR sparse (convert to dense)
-                        let x_dense = x_sparse.as_ref().to_dense();
-                        let x_dense =
-                            Array2::from_shape_fn((x_dense.nrows(), x_dense.ncols()), |(i, j)| {
-                                x_dense[(i, j)]
-                            });
+                        let mut x_dense = Array2::<f64>::zeros((x_sparse.nrows(), x_sparse.ncols()));
+                        let (symbolic, values) = x_sparse.parts();
+                        let col_ptr = symbolic.col_ptr();
+                        let row_idx = symbolic.row_idx();
+                        for col in 0..x_sparse.ncols() {
+                            let start = col_ptr[col];
+                            let end = col_ptr[col + 1];
+                            for idx in start..end {
+                                x_dense[[row_idx[idx], col]] = values[idx];
+                            }
+                        }
                         let p_dim = x_dense.ncols();
                         for chunk_start in (0..n).step_by(chunk_cols) {
                             let chunk_end = (chunk_start + chunk_cols).min(n);
@@ -3680,8 +3135,8 @@ pub mod internal {
         }
 
         // Accessor methods for private fields
-        pub(super) fn x(&self) -> ArrayView2<'a, f64> {
-            self.x
+        pub(super) fn x(&self) -> &DesignMatrix {
+            &self.x
         }
 
         #[allow(dead_code)]
@@ -3744,9 +3199,9 @@ pub mod internal {
                 } else {
                     None
                 };
-                pirls::fit_model_for_fixed_rho(
+                pirls::fit_model_for_fixed_rho_matrix(
                     LogSmoothingParamsView::new(rho.view()),
-                    self.x,
+                    &self.x,
                     self.offset.view(),
                     self.y,
                     self.weights,
@@ -4110,29 +3565,6 @@ pub mod internal {
                     let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
                     let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
 
-                    // Build raw Hessian for diagnostic condition number comparison
-                    let mut xtwx =
-                        Array2::<f64>::zeros((self.p, self.p));
-                    let x_orig = self.x();
-                    let w_orig = self.weights();
-                    for i in 0..x_orig.nrows() {
-                        let wi = w_orig[i];
-                        let xi = x_orig.row(i);
-                        for j in 0..x_orig.ncols() {
-                            for k in 0..x_orig.ncols() {
-                                xtwx[[j, k]] += wi * xi[j] * xi[k];
-                            }
-                        }
-                    }
-
-                    let mut h_raw = xtwx.clone();
-                    for (k, &lambda) in lambdas.iter().enumerate() {
-                        let s_k = &self.s_full_list[k];
-                        if lambda != 0.0 {
-                            h_raw.scaled_add(lambda, s_k);
-                        }
-                    }
-
                     let stabilized_eigs = pirls_result
                         .penalized_hessian_transformed
                         .eigh(Side::Lower)
@@ -4147,15 +3579,39 @@ pub mod internal {
                         })
                         .unwrap_or(f64::NAN);
 
-                    let raw_eigs = h_raw.eigh(Side::Lower).ok();
-                    let raw_cond = raw_eigs
-                        .as_ref()
-                        .map(|(evals, _)| {
-                            let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                            let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                            max / min.max(1e-12)
-                        })
-                        .unwrap_or(f64::NAN);
+                    // Avoid dense XtWX materialization for sparse designs in hot REML loop.
+                    let raw_cond = if matches!(self.x(), DesignMatrix::Dense(_)) {
+                        let mut xtwx = Array2::<f64>::zeros((self.p, self.p));
+                        let x_orig = self.x().to_dense();
+                        let w_orig = self.weights();
+                        for i in 0..x_orig.nrows() {
+                            let wi = w_orig[i];
+                            let xi = x_orig.row(i);
+                            for j in 0..x_orig.ncols() {
+                                for k in 0..x_orig.ncols() {
+                                    xtwx[[j, k]] += wi * xi[j] * xi[k];
+                                }
+                            }
+                        }
+                        let mut h_raw = xtwx;
+                        for (k, &lambda) in lambdas.iter().enumerate() {
+                            let s_k = &self.s_full_list[k];
+                            if lambda != 0.0 {
+                                h_raw.scaled_add(lambda, s_k);
+                            }
+                        }
+                        let raw_eigs = h_raw.eigh(Side::Lower).ok();
+                        raw_eigs
+                            .as_ref()
+                            .map(|(evals, _)| {
+                                let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                                let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                                max / min.max(1e-12)
+                            })
+                            .unwrap_or(f64::NAN)
+                    } else {
+                        f64::NAN
+                    };
 
                     self.log_gam_cost(
                         &p,
@@ -4953,24 +4409,8 @@ pub mod internal {
                                     beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
                                 }
 
-                                // For Firth bias reduction, compute the exact Hessian:
-                                // H_total = h_eff - H_phi where H_phi is the Firth curvature matrix.
-                                // For non-Firth, H_total = h_eff.
-                                //
-                                // HESSIAN PASSPORT: Use the EXACT same h_total and factorization
-                                // that was used in the cost function computation. This ensures
-                                // mathematical consistency between cost and gradient.
-                                // h_total kept for reference but no longer used directly in gradient
-                                // (spectral factor W is used instead for consistency)
-                                let h_phi_opt: Option<()> = if self.config.firth_bias_reduction
-                                    && matches!(
-                                        self.config.link_function(),
-                                        LinkFunction::Logit
-                                    ) {
-                                    Some(()) // Signal that Firth is active (h_phi already subtracted in bundle)
-                                } else {
-                                    None
-                                };
+                                // Keep outer gradient on the same Hessian surface as PIRLS.
+                                // The outer loop uses H_eff consistently (no H_phi subtraction).
 
                                 // P-IRLS already folded any stabilization ridge into h_eff.
 
@@ -5054,40 +4494,20 @@ pub mod internal {
                                     }
                                 };
 
-                                // LAML adds 0.5 * ∂log|H₊|/∂β. By Jacobi's formula:
+                                // LAML adds 0.5 * ∂log|H₊|/∂β via Jacobi's formula:
                                 //   ∂/∂β_j log|H₊| = tr(H₊† ∂H/∂β_j)
-                                // For logit, H = Xᵀ W X + S (non-Firth) or H_total = Xᵀ W X + S - H_φ (Firth).
-                                //
-                                // SPECTRAL CONSISTENCY: We use the spectral factor W (where H₊† = WWᵀ)
-                                // to ensure ∇_β log|H₊| uses the same truncation as the cost function.
-                                // This is critical for the implicit correction term to point in the
-                                // correct direction on the truncated cost surface.
+                                // For logit in this path, H = Xᵀ W X + S.
                                 let logh_beta_grad: Option<Array1<f64>> =
                                     if let LinkFunction::Logit = self
                                         .config
                                         .link_function()
                                     {
-                                        if self.config.firth_bias_reduction && h_phi_opt.is_some() {
-                                            // Use SPECTRAL version with W factor for consistency with truncated cost.
-                                            // NO FALLBACK: Spectral consistency is required for FD agreement.
-                                            // If spectral gradient fails, propagate error - don't switch to Cholesky
-                                            // which uses a different mathematical surface.
-                                            let spectral_w = bundle.spectral_factor_w.as_ref();
-                                            Some(self.firth_logh_total_grad_spectral(
-                                                &pirls_result.x_transformed,
-                                                &pirls_result.solve_mu,
-                                                &pirls_result.solve_weights,
-                                                spectral_w,
-                                            )?)
-                                        } else {
-                                            // Non-Firth path: use standard logh_beta_grad_logit (full rank)
-                                            self.logh_beta_grad_logit(
-                                                &pirls_result.x_transformed,
-                                                &pirls_result.solve_mu,
-                                                &pirls_result.solve_weights,
-                                                &factor_g,
-                                            )
-                                        }
+                                        self.logh_beta_grad_logit(
+                                            &pirls_result.x_transformed,
+                                            &pirls_result.solve_mu,
+                                            &pirls_result.solve_weights,
+                                            &factor_g,
+                                        )
                                     } else {
                                         None
                                     };

@@ -240,8 +240,7 @@ const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 
 struct GamWorkingModel<'a> {
     x_transformed: Option<DesignMatrix>,
-    x_original_dense: ArrayView2<'a, f64>,
-    x_original_sparse: Option<DesignMatrix>,
+    x_original: DesignMatrix,
     offset: Array1<f64>,
     y: ArrayView1<'a, f64>,
     prior_weights: ArrayView1<'a, f64>,
@@ -277,8 +276,7 @@ struct GamModelFinalState {
 impl<'a> GamWorkingModel<'a> {
     fn new(
         x_transformed: Option<DesignMatrix>,
-        x_original_dense: ArrayView2<'a, f64>,
-        x_original_sparse: Option<DesignMatrix>,
+        x_original: DesignMatrix,
         offset: ArrayView1<f64>,
         y: ArrayView1<'a, f64>,
         prior_weights: ArrayView1<'a, f64>,
@@ -293,18 +291,15 @@ impl<'a> GamWorkingModel<'a> {
         let n = if let Some(x_transformed) = &x_transformed {
             x_transformed.nrows()
         } else {
-            x_original_dense.nrows()
+            x_original.nrows()
         };
         let x_csr = x_transformed
             .as_ref()
             .and_then(|matrix| matrix.to_csr_cache());
-        let x_original_csr = x_original_sparse
-            .as_ref()
-            .and_then(|matrix| matrix.to_csr_cache());
+        let x_original_csr = x_original.to_csr_cache();
         GamWorkingModel {
             x_transformed,
-            x_original_dense,
-            x_original_sparse,
+            x_original,
             offset: offset.to_owned(),
             y,
             prior_weights,
@@ -351,11 +346,7 @@ impl<'a> GamWorkingModel<'a> {
         }
         let qs = self.qs.as_ref().expect("qs required for implicit design");
         let beta_orig = qs.dot(beta.as_ref());
-        if let Some(x_sparse) = &self.x_original_sparse {
-            x_sparse.matrix_vector_multiply(&beta_orig)
-        } else {
-            self.x_original_dense.dot(&beta_orig)
-        }
+        self.x_original.matrix_vector_multiply(&beta_orig)
     }
 
     fn transformed_transpose_matvec(&self, vec: &Array1<f64>) -> Array1<f64> {
@@ -363,11 +354,7 @@ impl<'a> GamWorkingModel<'a> {
             return x_transformed.transpose_vector_multiply(vec);
         }
         let qs = self.qs.as_ref().expect("qs required for implicit design");
-        let xtv = if let Some(x_sparse) = &self.x_original_sparse {
-            x_sparse.transpose_vector_multiply(vec)
-        } else {
-            self.x_original_dense.t().dot(vec)
-        };
+        let xtv = self.x_original.transpose_vector_multiply(vec);
         qs.t().dot(&xtv)
     }
 
@@ -409,38 +396,36 @@ impl<'a> GamWorkingModel<'a> {
             });
         }
 
-        let xtwx = if let Some(DesignMatrix::Sparse(matrix)) = &self.x_original_sparse {
-            self.workspace.sparse_xtwx(matrix, weights).or_else(|_| {
+        let xtwx = match &self.x_original {
+            DesignMatrix::Sparse(matrix) => self.workspace.sparse_xtwx(matrix, weights).or_else(|_| {
                 let csr = self.x_original_csr.as_ref().ok_or_else(|| {
                     EstimationError::InvalidInput("missing CSR cache".to_string())
                 })?;
                 self.workspace.compute_hessian_sparse_faer(csr, weights)
-            })?
-        } else if let Some(csr) = &self.x_original_csr {
-            self.workspace.compute_hessian_sparse_faer(csr, weights)?
-        } else {
-            self.workspace
-                .sqrt_w
-                .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
-            let sqrt_w_col = self.workspace.sqrt_w.view().insert_axis(Axis(1));
-            if self.workspace.wx.dim() != self.x_original_dense.dim() {
-                self.workspace.wx = Array2::zeros(self.x_original_dense.dim());
+            })?,
+            DesignMatrix::Dense(x_dense) => {
+                self.workspace
+                    .sqrt_w
+                    .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
+                let sqrt_w_col = self.workspace.sqrt_w.view().insert_axis(Axis(1));
+                if self.workspace.wx.dim() != x_dense.dim() {
+                    self.workspace.wx = Array2::zeros(x_dense.dim());
+                }
+                self.workspace.wx.assign(x_dense);
+                self.workspace.wx *= &sqrt_w_col;
+                let wx_view = FaerArrayView::new(&self.workspace.wx);
+                let mut xtwx = Array2::zeros((x_dense.ncols(), x_dense.ncols()));
+                let mut xtwx_view = array2_to_mat_mut(&mut xtwx);
+                matmul(
+                    xtwx_view.as_mut(),
+                    Accum::Add,
+                    wx_view.as_ref().transpose(),
+                    wx_view.as_ref(),
+                    1.0,
+                    get_global_parallelism(),
+                );
+                xtwx
             }
-            self.workspace.wx.assign(&self.x_original_dense);
-            self.workspace.wx *= &sqrt_w_col;
-            let wx_view = FaerArrayView::new(&self.workspace.wx);
-            let mut xtwx =
-                Array2::zeros((self.x_original_dense.ncols(), self.x_original_dense.ncols()));
-            let mut xtwx_view = array2_to_mat_mut(&mut xtwx);
-            matmul(
-                xtwx_view.as_mut(),
-                Accum::Add,
-                wx_view.as_ref().transpose(),
-                wx_view.as_ref(),
-                1.0,
-                get_global_parallelism(),
-            );
-            xtwx
         };
 
         let qs = self.qs.as_ref().expect("qs required for implicit design");
@@ -522,12 +507,25 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     &mut self.workspace,
                     Some(&self.s_transformed),
                 )?,
-                _ => compute_firth_hat_and_half_logdet(
-                    self.x_original_dense,
-                    weights.view(),
-                    &mut self.workspace,
-                    Some(&self.s_transformed),
-                )?,
+                _ => match (&self.x_original, &self.x_original_csr) {
+                    (DesignMatrix::Sparse(_), Some(csr)) => compute_firth_hat_and_half_logdet_sparse(
+                        csr,
+                        weights.view(),
+                        &mut self.workspace,
+                        Some(&self.s_transformed),
+                    )?,
+                    (DesignMatrix::Dense(x_dense), _) => compute_firth_hat_and_half_logdet(
+                        x_dense.view(),
+                        weights.view(),
+                        &mut self.workspace,
+                        Some(&self.s_transformed),
+                    )?,
+                    (DesignMatrix::Sparse(_), None) => {
+                        return Err(EstimationError::InvalidInput(
+                            "missing CSR cache for sparse original design".to_string(),
+                        ));
+                    }
+                },
             };
             self.firth_log_det = Some(half_log_det);
             firth_hat_diag = Some(hat_diag.clone());
@@ -601,12 +599,15 @@ pub(crate) struct SparseXtWxCache {
     xtwx_symbolic: SymbolicSparseColMat<usize>,
     xtwx_values: Vec<f64>,
     wx_values: Vec<f64>,
+    wx_t_values: Vec<f64>,
     info: SparseMatMulInfo,
     scratch: MemBuffer,
     par: Par,
     nrows: usize,
     ncols: usize,
     nnz: usize,
+    x_col_ptr: Vec<usize>,
+    x_row_idx: Vec<usize>,
     x_t_csc: SparseColMat<usize, f64>, // CSC format of X transpose for matmul
 }
 
@@ -624,6 +625,7 @@ impl SparseXtWxCache {
             })?;
         let xtwx_values = vec![0.0; xtwx_symbolic.row_idx().len()];
         let wx_values = vec![0.0; x.val().len()];
+        let wx_t_values = vec![0.0; x_t_csc.val().len()];
         let par = sparse_xtwx_par(x.ncols());
         let scratch = MemBuffer::new(sparse_sparse_matmul_numeric_scratch::<usize, f64>(
             xtwx_symbolic.as_ref(),
@@ -633,18 +635,25 @@ impl SparseXtWxCache {
             xtwx_symbolic,
             xtwx_values,
             wx_values,
+            wx_t_values,
             info,
             scratch,
             par,
             nrows: x.nrows(),
             ncols: x.ncols(),
             nnz: x.val().len(),
+            x_col_ptr: x.symbolic().col_ptr().to_vec(),
+            x_row_idx: x.symbolic().row_idx().to_vec(),
             x_t_csc,
         })
     }
 
     fn matches(&self, x: &SparseColMat<usize, f64>) -> bool {
-        self.nrows == x.nrows() && self.ncols == x.ncols() && self.nnz == x.val().len()
+        if self.nrows != x.nrows() || self.ncols != x.ncols() || self.nnz != x.val().len() {
+            return false;
+        }
+        let sym = x.symbolic();
+        self.x_col_ptr.as_slice() == sym.col_ptr() && self.x_row_idx.as_slice() == sym.row_idx()
     }
 
     fn compute_dense(
@@ -661,6 +670,7 @@ impl SparseXtWxCache {
         }
 
         let x_ref = x.as_ref();
+        // Build right factor: sqrt(W) * X (same CSC sparsity pattern as X).
         for col in 0..self.ncols {
             let rows = x_ref.row_idx_of_col_raw(col);
             let x_vals = x_ref.val_of_col(col);
@@ -672,14 +682,28 @@ impl SparseXtWxCache {
             }
         }
 
+        // Build left factor: (sqrt(W) * X)^T in CSC form, using X^T sparsity.
+        // X^T has columns corresponding to rows of X, so scale each column by sqrt(w_row).
+        let x_t_ref = self.x_t_csc.as_ref();
+        for col in 0..x_t_ref.ncols() {
+            let w = weights[col].max(0.0).sqrt();
+            let x_t_vals = x_t_ref.val_of_col(col);
+            let range = x_t_ref.col_range(col);
+            let wx_t_vals = &mut self.wx_t_values[range];
+            for (dst, &src) in wx_t_vals.iter_mut().zip(x_t_vals.iter()) {
+                *dst = src * w;
+            }
+        }
+
         let wx_ref = SparseColMatRef::new(x.symbolic(), &self.wx_values);
+        let wx_t_ref = SparseColMatRef::new(self.x_t_csc.symbolic(), &self.wx_t_values);
         let mut stack = MemStack::new(&mut self.scratch);
         let xtwx_symbolic = self.xtwx_symbolic.as_ref();
         let xtwx_mut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwx_values);
         sparse_sparse_matmul_numeric(
             xtwx_mut,
             Accum::Replace,
-            self.x_t_csc.as_ref(),
+            wx_t_ref,
             wx_ref,
             1.0,
             &self.info,
@@ -687,12 +711,19 @@ impl SparseXtWxCache {
             &mut stack,
         );
 
-        let xtwx_ref = SparseColMatRef::new(xtwx_symbolic, &self.xtwx_values);
-        let dense = xtwx_ref.to_dense();
-        Ok(Array2::from_shape_fn(
-            (dense.nrows(), dense.ncols()),
-            |(i, j)| dense[(i, j)],
-        ))
+        // Convert sparse XtWX directly into ndarray without materializing an
+        // intermediate faer dense matrix.
+        let mut out = Array2::<f64>::zeros((self.ncols, self.ncols));
+        let col_ptr = xtwx_symbolic.col_ptr();
+        let row_idx = xtwx_symbolic.row_idx();
+        for col in 0..self.ncols {
+            let start = col_ptr[col];
+            let end = col_ptr[col + 1];
+            for idx in start..end {
+                out[[row_idx[idx], col]] = self.xtwx_values[idx];
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1452,10 +1483,12 @@ pub fn fit_model_for_fixed_rho<'a>(
         .as_ref()
         .map(|matrix| maybe_sparse_design(matrix));
 
-    let x_original_sparse = if use_explicit {
-        None
+    let x_original = if use_explicit {
+        DesignMatrix::Dense(x.to_owned())
+    } else if let Some(sparse) = x_original_sparse {
+        sparse
     } else {
-        x_original_sparse
+        DesignMatrix::Dense(x.to_owned())
     };
 
     let eb_rows = eb.nrows();
@@ -1565,10 +1598,10 @@ pub fn fit_model_for_fixed_rho<'a>(
         return Ok((pirls_result, working_summary));
     }
 
+    let x_original_for_result = x_original.clone();
     let mut working_model = GamWorkingModel::new(
         x_transformed,
-        x,
-        x_original_sparse,
+        x_original,
         offset,
         y,
         prior_weights,
@@ -1699,7 +1732,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     let x_transformed = if let Some(x_transformed) = x_transformed {
         x_transformed
     } else {
-        let x_transformed_dense = x.dot(&reparam_result.qs);
+        let x_transformed_dense = design_dot_dense_rhs(&x_original_for_result, &reparam_result.qs);
         maybe_sparse_design(&x_transformed_dense)
     };
 
@@ -1726,6 +1759,247 @@ pub fn fit_model_for_fixed_rho<'a>(
         x_transformed,
     };
 
+    Ok((pirls_result, working_summary))
+}
+
+/// Design-matrix-native wrapper for `fit_model_for_fixed_rho`.
+/// This keeps sparse designs across higher-level API boundaries and only
+/// materializes dense storage inside PIRLS when required by the current
+/// reparameterization implementation.
+pub fn fit_model_for_fixed_rho_matrix(
+    rho: LogSmoothingParamsView<'_>,
+    x: &DesignMatrix,
+    offset: ArrayView1<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    prior_weights: ArrayView1<'_, f64>,
+    rs_original: &[Array2<f64>],
+    balanced_penalty_root: Option<&Array2<f64>>,
+    reparam_invariant: Option<&crate::construction::ReparamInvariant>,
+    p: usize,
+    config: &PirlsConfig,
+    warm_start_beta: Option<&Coefficients>,
+    covariate_se: Option<&Array1<f64>>,
+) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
+    match x {
+        DesignMatrix::Dense(matrix) => fit_model_for_fixed_rho(
+            rho,
+            matrix.view(),
+            offset,
+            y,
+            prior_weights,
+            rs_original,
+            balanced_penalty_root,
+            reparam_invariant,
+            p,
+            config,
+            warm_start_beta,
+            covariate_se,
+        ),
+        DesignMatrix::Sparse(x_sparse)
+            if matches!(config.link_function, LinkFunction::Logit | LinkFunction::Probit)
+                && !config.firth_bias_reduction =>
+        {
+            fit_model_for_fixed_rho_sparse_implicit(
+                rho,
+                x_sparse,
+                offset,
+                y,
+                prior_weights,
+                rs_original,
+                balanced_penalty_root,
+                reparam_invariant,
+                p,
+                config,
+                warm_start_beta,
+                covariate_se,
+            )
+        }
+        DesignMatrix::Sparse(_) => {
+            let dense = x.to_dense();
+            fit_model_for_fixed_rho(
+                rho,
+                dense.view(),
+                offset,
+                y,
+                prior_weights,
+                rs_original,
+                balanced_penalty_root,
+                reparam_invariant,
+                p,
+                config,
+                warm_start_beta,
+                covariate_se,
+            )
+        }
+    }
+}
+
+fn fit_model_for_fixed_rho_sparse_implicit(
+    rho: LogSmoothingParamsView<'_>,
+    x_sparse: &SparseColMat<usize, f64>,
+    offset: ArrayView1<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    prior_weights: ArrayView1<'_, f64>,
+    rs_original: &[Array2<f64>],
+    balanced_penalty_root: Option<&Array2<f64>>,
+    reparam_invariant: Option<&crate::construction::ReparamInvariant>,
+    p: usize,
+    config: &PirlsConfig,
+    warm_start_beta: Option<&Coefficients>,
+    covariate_se: Option<&Array1<f64>>,
+) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
+    let quad_ctx = crate::quadrature::QuadratureContext::new();
+    let lambdas = rho.exp();
+    let lambdas_slice = lambdas
+        .as_slice_memory_order()
+        .ok_or_else(|| EstimationError::InvalidInput("non-contiguous lambda storage".to_string()))?;
+    let link_function = config.link_function;
+    use crate::construction::{
+        EngineDims, create_balanced_penalty_root, stable_reparameterization_engine,
+        stable_reparameterization_with_invariant_engine,
+    };
+    let eb_cow: Cow<'_, Array2<f64>> = if let Some(precomputed) = balanced_penalty_root {
+        Cow::Borrowed(precomputed)
+    } else {
+        let mut s_list_full = Vec::with_capacity(rs_original.len());
+        for rs in rs_original {
+            s_list_full.push(rs.t().dot(rs));
+        }
+        Cow::Owned(create_balanced_penalty_root(&s_list_full, p)?)
+    };
+    let eb: &Array2<f64> = eb_cow.as_ref();
+    let reparam_result = if let Some(invariant) = reparam_invariant {
+        stable_reparameterization_with_invariant_engine(
+            rs_original,
+            lambdas_slice,
+            EngineDims::new(p, rs_original.len()),
+            invariant,
+        )?
+    } else {
+        stable_reparameterization_engine(
+            rs_original,
+            lambdas_slice,
+            EngineDims::new(p, rs_original.len()),
+        )?
+    };
+    let x_original = DesignMatrix::Sparse(x_sparse.clone());
+    let eb_rows = eb.nrows();
+    let e_rows = reparam_result.e_transformed.nrows();
+    let workspace = PirlsWorkspace::new(x_sparse.nrows(), x_sparse.ncols(), eb_rows, e_rows);
+    let mut working_model = GamWorkingModel::new(
+        None,
+        x_original.clone(),
+        offset,
+        y,
+        prior_weights,
+        reparam_result.s_transformed.clone(),
+        reparam_result.e_transformed.clone(),
+        workspace,
+        link_function,
+        false,
+        Some(reparam_result.qs.clone()),
+        quad_ctx,
+    );
+    if let Some(se) = covariate_se {
+        working_model = working_model.with_covariate_se(se.to_owned());
+    }
+    let beta_guess_original = warm_start_beta
+        .filter(|beta| beta.len() == p)
+        .map(|beta| beta.to_owned())
+        .unwrap_or_else(|| {
+            Coefficients::new(default_beta_guess_external(p, link_function, y, prior_weights))
+        });
+    let initial_beta = reparam_result.qs.t().dot(beta_guess_original.as_ref());
+    let options = WorkingModelPirlsOptions {
+        max_iterations: config.max_iterations,
+        convergence_tolerance: config.convergence_tolerance,
+        max_step_halving: 30,
+        min_step_size: 1e-10,
+        firth_bias_reduction: false,
+    };
+    let mut iteration_logger = |info: &WorkingModelIterationInfo| {
+        log::debug!(
+            "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} (halving {})",
+            info.iteration,
+            info.deviance,
+            info.gradient_norm,
+            info.step_size,
+            info.step_halving
+        );
+    };
+    let mut working_summary = run_working_model_pirls(
+        &mut working_model,
+        Coefficients::new(initial_beta),
+        &options,
+        &mut iteration_logger,
+    )?;
+    let final_state = working_model.into_final_state();
+    let GamModelFinalState {
+        x_transformed: _,
+        e_transformed,
+        final_mu,
+        final_weights,
+        final_z,
+        firth_log_det,
+        penalty_term,
+    } = final_state;
+    let penalized_hessian_transformed = working_summary.state.hessian.clone();
+    let stabilized_hessian_transformed = penalized_hessian_transformed.clone();
+    let mut edf = calculate_edf(&penalized_hessian_transformed, &e_transformed)?;
+    if !edf.is_finite() || edf.is_nan() {
+        let p = penalized_hessian_transformed.ncols() as f64;
+        let r = e_transformed.nrows() as f64;
+        edf = (p - r).max(0.0);
+    }
+    let mut status = working_summary.status;
+    if matches!(status, PirlsStatus::MaxIterationsReached) {
+        let dev_scale = working_summary.state.deviance.abs().max(1.0);
+        let dev_tol = options.convergence_tolerance * dev_scale;
+        let step_floor = options.min_step_size * 2.0;
+        if working_summary.last_deviance_change.abs() <= dev_tol
+            || working_summary.last_step_size <= step_floor
+        {
+            status = PirlsStatus::StalledAtValidMinimum;
+            working_summary.status = status;
+        }
+    }
+    let has_penalty = e_transformed.nrows() > 0;
+    if detect_logit_instability(
+        link_function,
+        has_penalty,
+        false,
+        &working_summary,
+        &final_mu,
+        &final_weights,
+        y,
+    ) {
+        status = PirlsStatus::Unstable;
+        working_summary.status = status;
+    }
+    let x_transformed_dense = design_dot_dense_rhs(&x_original, &reparam_result.qs);
+    let x_transformed = maybe_sparse_design(&x_transformed_dense);
+    let pirls_result = PirlsResult {
+        beta_transformed: working_summary.beta.clone(),
+        penalized_hessian_transformed,
+        stabilized_hessian_transformed,
+        ridge_used: working_summary.state.ridge_used,
+        deviance: working_summary.state.deviance,
+        edf,
+        stable_penalty_term: penalty_term,
+        firth_log_det,
+        firth_hat_diag: working_summary.state.firth_hat_diag.clone(),
+        final_weights: final_weights.clone(),
+        final_mu: final_mu.clone(),
+        solve_weights: final_weights.clone(),
+        solve_working_response: final_z.clone(),
+        solve_mu: final_mu,
+        status,
+        iteration: working_summary.iterations,
+        max_abs_eta: working_summary.max_abs_eta,
+        last_gradient_norm: working_summary.last_gradient_norm,
+        reparam_result,
+        x_transformed,
+    };
     Ok((pirls_result, working_summary))
 }
 
@@ -1817,6 +2091,22 @@ fn maybe_sparse_design(x: &Array2<f64>) -> DesignMatrix {
     }
 
     DesignMatrix::Dense(x.clone())
+}
+
+fn design_dot_dense_rhs(x: &DesignMatrix, rhs: &Array2<f64>) -> Array2<f64> {
+    match x {
+        DesignMatrix::Dense(matrix) => matrix.dot(rhs),
+        DesignMatrix::Sparse(_) => {
+            let nrows = x.nrows();
+            let ncols = rhs.ncols();
+            let mut out = Array2::<f64>::zeros((nrows, ncols));
+            for col in 0..ncols {
+                let v = x.matrix_vector_multiply(&rhs.column(col).to_owned());
+                out.column_mut(col).assign(&v);
+            }
+            out
+        }
+    }
 }
 
 fn sparse_from_dense_view(x: ArrayView2<f64>) -> Option<DesignMatrix> {
@@ -1911,18 +2201,17 @@ pub fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f
         );
     }
 
-    // Zero the destination vector first
+    // O(n + n_drop) two-pointer pass.
     dst.fill(0.0);
-
-    // Reinsert values from source, skipping the dropped indices
-    let mut src_idx = 0;
+    let mut src_idx = 0usize;
+    let mut drop_ptr = 0usize;
     for dst_idx in 0..dst.len() {
-        if !dropped_rows.contains(&dst_idx) {
-            // This position wasn't dropped, copy the value from source
-            dst[dst_idx] = src[src_idx];
-            src_idx += 1;
+        if drop_ptr < n_drop && dropped_rows[drop_ptr] == dst_idx {
+            drop_ptr += 1;
+            continue;
         }
-        // Otherwise, leave as zero (dropped position)
+        dst[dst_idx] = src[src_idx];
+        src_idx += 1;
     }
 }
 
@@ -1954,13 +2243,16 @@ pub fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64
         );
     }
 
-    // Copy values from source, skipping the dropped indices
-    let mut dst_idx = 0;
+    // O(n + n_drop) two-pointer pass.
+    let mut dst_idx = 0usize;
+    let mut drop_ptr = 0usize;
     for src_idx in 0..src.len() {
-        if !drop_indices.contains(&src_idx) {
-            dst[dst_idx] = src[src_idx];
-            dst_idx += 1;
+        if drop_ptr < n_drop && drop_indices[drop_ptr] == src_idx {
+            drop_ptr += 1;
+            continue;
         }
+        dst[dst_idx] = src[src_idx];
+        dst_idx += 1;
     }
 }
 
@@ -2268,21 +2560,16 @@ pub fn solve_penalized_least_squares(
     }
 
     // 5. Fixed Ridge Regularization (rho-independent)
-    // Apply a constant ridge whenever penalties are present:
+    // Apply a tiny constant ridge for all solves:
     //   H = X'WX + S_λ + ridge * I
-    // This makes the objective smooth in rho and keeps cost/gradient consistent.
+    // This keeps the linear solve, EDF, and downstream Hessian-dependent
+    // quantities consistent even when S_λ is absent/rank-deficient.
     //
     // Math note (Envelope Theorem consistency): if we solve for β using a stabilized
     // system (H + δI)β = b, then the outer objective must include the matching
     // quadratic term 0.5 * δ * ||β||². Otherwise ∇β V(β, ρ) ≠ 0 at the reported
     // solution and the standard dV/dρ formula (ignoring dβ/dρ) becomes invalid.
-    let has_penalty = e_transformed.nrows() > 0;
-    let use_svd_path = !has_penalty;
-    let nugget = if has_penalty {
-        FIXED_STABILIZATION_RIDGE
-    } else {
-        0.0
-    };
+    let nugget = FIXED_STABILIZATION_RIDGE;
 
     let mut regularized_hessian = penalized_hessian.clone();
     if nugget > 0.0 {
@@ -2295,99 +2582,37 @@ pub fn solve_penalized_least_squares(
     let rhs_vec = &workspace.vec_buf_p; // X'Wz
 
     // Track detected numerical rank and the actual stabilization used.
-    let mut ridge_used = nugget;
-    let (beta_vec, detected_rank) = if use_svd_path {
-        // SVD-based pseudoinverse for exact least squares on rank-deficient problems.
-        // Solve H β = b where H = X'WX is rank-deficient using H⁺ = V Σ⁺ U'.
-        // This gives the minimum-norm solution with exact projection property.
+    let ridge_used = nugget;
 
-        // Use eigendecomposition since H is symmetric: H = Q Λ Q'
-        // Then H⁺ = Q Λ⁺ Q' where Λ⁺ inverts non-zero eigenvalues
-        // Use the FaerEigh trait which returns (eigenvalues: Array1, eigenvectors: Array2)
-        match penalized_hessian.eigh(Side::Lower) {
-            Ok((eigenvalues, eigenvectors)) => {
-                ridge_used = 0.0;
-                // Find maximum eigenvalue for tolerance calculation
-                let max_eig: f64 = eigenvalues.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-                let tol = 1e-12 * max_eig;
-                let mut result = Array1::<f64>::zeros(p_dim);
-                let mut rank = 0usize;
+    // 6. Solve using LDLT (Robust for indefinite/near-singular), with LBLT fallback.
+    let h_reg_view = FaerArrayView::new(&regularized_hessian);
 
-                // Compute Q Λ⁺ Q' b = Σᵢ (qᵢ' b) / λᵢ * qᵢ for λᵢ > tol
-                for j in 0..p_dim {
-                    let lambda_j = eigenvalues[j];
-                    if lambda_j.abs() > tol {
-                        rank += 1;
-                        // Compute qⱼ' b
-                        let mut qt_b = 0.0;
-                        for i in 0..p_dim {
-                            qt_b += eigenvectors[(i, j)] * rhs_vec[i];
-                        }
-                        // Add (qⱼ' b) / λⱼ * qⱼ to result
-                        let scale = qt_b / lambda_j;
-                        for i in 0..p_dim {
-                            result[i] += scale * eigenvectors[(i, j)];
-                        }
-                    }
-                }
-                (result, rank)
-            }
-            Err(_) => {
-                // Fallback to LDLT with fixed ridge if eigendecomposition fails
-                let mut reg_h = penalized_hessian.clone();
-                ridge_used = if FIXED_STABILIZATION_RIDGE > 0.0 {
-                    for i in 0..p_dim {
-                        reg_h[[i, i]] += FIXED_STABILIZATION_RIDGE;
-                    }
-                    FIXED_STABILIZATION_RIDGE
-                } else {
-                    0.0
-                };
-                regularized_hessian = reg_h.clone();
-                let h_reg_view = FaerArrayView::new(&reg_h);
-                let rhs_mat = {
-                    let mut m = faer::Mat::zeros(p_dim, 1);
-                    for i in 0..p_dim {
-                        m[(i, 0)] = rhs_vec[i];
-                    }
-                    m
-                };
-                let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower).map_err(|_| {
-                    EstimationError::LinearSystemSolveFailed(FaerLinalgError::FactorizationFailed)
-                })?;
-                let sol_mat: faer::Mat<f64> = ldlt.solve(&rhs_mat);
-                let mut b = Array1::zeros(p_dim);
-                for i in 0..p_dim {
-                    b[i] = sol_mat[(i, 0)];
-                }
-                // Fallback path uses ridge, assume full rank
-                (b, p_dim)
-            }
+    // Convert to Faer structures for solve
+    let rhs_mat = {
+        let mut m = faer::Mat::zeros(p_dim, 1);
+        for i in 0..p_dim {
+            m[(i, 0)] = rhs_vec[i];
         }
+        m
+    };
+
+    // Use LDLT factorization
+    let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower);
+    let (beta_vec, detected_rank) = if let Ok(factor) = ldlt {
+        let sol_mat: faer::Mat<f64> = factor.solve(&rhs_mat);
+        let mut b = Array1::zeros(p_dim);
+        for i in 0..p_dim {
+            b[i] = sol_mat[(i, 0)];
+        }
+        (b, p_dim)
     } else {
-        // 6. Solve using LDLT (Robust for indefinite/near-singular)
-        // Faer's LDLT is pivoted and stable.
-        let h_reg_view = FaerArrayView::new(&regularized_hessian);
-
-        // Convert to Faer structures for solve
-        let rhs_mat = {
-            let mut m = faer::Mat::zeros(p_dim, 1);
-            for i in 0..p_dim {
-                m[(i, 0)] = rhs_vec[i];
-            }
-            m
-        };
-
-        // Use LDLT factorization
-        let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower);
-
-        if let Ok(factor) = ldlt {
-            let sol_mat: faer::Mat<f64> = factor.solve(&rhs_mat);
-            let mut b = Array1::zeros(p_dim);
-            for i in 0..p_dim {
-                b[i] = sol_mat[(i, 0)];
-            }
-            // Penalized path: penalties ensure full rank
+        let lblt = FaerLblt::new(h_reg_view.as_ref(), Side::Lower);
+        let sol_mat: faer::Mat<f64> = lblt.solve(&rhs_mat);
+        let mut b = Array1::zeros(p_dim);
+        for i in 0..p_dim {
+            b[i] = sol_mat[(i, 0)];
+        }
+        if b.iter().all(|v| v.is_finite()) {
             (b, p_dim)
         } else {
             return Err(EstimationError::LinearSystemSolveFailed(

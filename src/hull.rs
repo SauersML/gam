@@ -343,12 +343,19 @@ pub fn build_peeled_hull(data: &Array2<f64>, peels: usize) -> Result<PeeledHull,
         {
             break;
         }
-        // Remove rows at `verts` from current
-        let keep_mask: Vec<bool> = (0..current.nrows()).map(|i| !verts.contains(&i)).collect();
-        let mut next = Array2::zeros((keep_mask.iter().filter(|&&k| k).count(), d));
+        // Remove rows at `verts` from current.
+        // Build an O(n + |verts|) boolean drop mask instead of repeated contains() scans.
+        let mut drop_mask = vec![false; current.nrows()];
+        for &idx in &verts {
+            if idx < drop_mask.len() {
+                drop_mask[idx] = true;
+            }
+        }
+        let keep_count = drop_mask.iter().filter(|&&drop| !drop).count();
+        let mut next = Array2::zeros((keep_count, d));
         let mut r = 0;
-        for (i, &keep) in keep_mask.iter().enumerate() {
-            if keep {
+        for (i, &drop) in drop_mask.iter().enumerate() {
+            if !drop {
                 next.row_mut(r).assign(&current.row(i));
                 r += 1;
             }
@@ -417,20 +424,30 @@ fn generate_directions(d: usize, extra: usize) -> Vec<Array1<f64>> {
 
 /// Identify indices of extreme points for the current point cloud using support
 /// along a bank of directions. Returns unique indices across all directions.
-fn extreme_point_indices(points: &Array2<f64>, directions: &Vec<Array1<f64>>) -> Vec<usize> {
-    use std::collections::BTreeSet;
-    let mut set: BTreeSet<usize> = BTreeSet::new();
+fn extreme_point_indices(points: &Array2<f64>, directions: &[Array1<f64>]) -> Vec<usize> {
+    let n = points.nrows();
+    let mut mark = vec![false; n];
+    let mut unique = 0usize;
     for a in directions {
         let mut argmax = 0usize;
         let mut best = f64::NEG_INFINITY;
-        for i in 0..points.nrows() {
+        for i in 0..n {
             let s = a.dot(&points.row(i));
             if s > best {
                 best = s;
                 argmax = i;
             }
         }
-        set.insert(argmax);
+        if !mark[argmax] {
+            mark[argmax] = true;
+            unique += 1;
+        }
     }
-    set.into_iter().collect()
+    let mut out = Vec::with_capacity(unique);
+    for (i, &is_marked) in mark.iter().enumerate() {
+        if is_marked {
+            out.push(i);
+        }
+    }
+    out
 }

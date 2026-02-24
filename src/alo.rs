@@ -103,7 +103,6 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let block_cols = 8192usize;
 
     let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols));
-    let mut t_chunk_storage = FaerMat::<f64>::zeros(p, block_cols);
 
     for chunk_start in (0..n).step_by(block_cols) {
         let chunk_end = (chunk_start + block_cols).min(n);
@@ -116,9 +115,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
         let rhs_chunk_view = rhs_chunk_buf.slice(s![.., ..width]);
         let rhs_chunk = FaerArrayView::new(&rhs_chunk_view);
         let s_chunk = factor.solve(rhs_chunk.as_ref());
-        unsafe {
-            t_chunk_storage.set_dims(p, width);
-        }
+        let mut t_chunk_storage = FaerMat::<f64>::zeros(p, width);
         matmul(
             t_chunk_storage.as_mut(),
             Accum::Replace,
@@ -128,32 +125,16 @@ fn compute_alo_diagnostics_from_pirls_impl(
             Par::Seq,
         );
         let t_chunk = t_chunk_storage.as_ref();
-        let s_col_stride = s_chunk.col_stride();
-        let t_col_stride = t_chunk.col_stride();
-        assert_eq!(
-            s_chunk.row_stride(),
-            1,
-            "s_chunk must be contiguous in memory"
-        );
-        assert_eq!(
-            t_chunk.row_stride(),
-            1,
-            "t_chunk must be contiguous in memory"
-        );
-        assert!(s_col_stride >= 0 && t_col_stride >= 0);
-        let s_col_stride = s_col_stride as usize;
-        let t_col_stride = t_col_stride as usize;
-        let s_ptr = s_chunk.as_ptr();
-        let t_ptr = t_chunk.as_ptr();
 
         for local_col in 0..width {
             let obs = chunk_start + local_col;
             let u_row = u.row(obs);
-            let s_col = unsafe { std::slice::from_raw_parts(s_ptr.add(local_col * s_col_stride), p) };
-            let t_col = unsafe { std::slice::from_raw_parts(t_ptr.add(local_col * t_col_stride), p) };
             let mut ai = 0.0f64;
             let mut quad = 0.0f64;
-            for ((&s_val, &t_val), &u_val) in s_col.iter().zip(t_col.iter()).zip(u_row.iter()) {
+            for row in 0..p {
+                let s_val = s_chunk[(row, local_col)];
+                let t_val = t_chunk[(row, local_col)];
+                let u_val = u_row[row];
                 ai = s_val.mul_add(u_val, ai);
                 quad = s_val.mul_add(t_val, quad);
             }

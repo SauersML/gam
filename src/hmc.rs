@@ -33,26 +33,6 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Ensure a matrix is positive definite by adding a minimal conditional ridge.
-/// Only adds regularization if Cholesky fails, avoiding bias on well-conditioned matrices.
-fn ensure_positive_definite_hmc(mat: &mut Array2<f64>) {
-    if mat.cholesky(Side::Lower).is_ok() {
-        return; // Already positive definite, no regularization needed
-    }
-
-    // Matrix needs regularization - use diagonal-scaled nugget
-    let diag_scale = mat
-        .diag()
-        .iter()
-        .map(|&d| d.abs())
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-    let nugget = 1e-8 * diag_scale;
-    for i in 0..mat.nrows() {
-        mat[[i, i]] += nugget;
-    }
-}
-
 /// Compute split-chain R-hat and ESS using the Gelman-Rubin diagnostic.
 ///
 /// This is the standard split-chain formulation (no rank normalization).
@@ -74,11 +54,86 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
     let mut max_rhat = 0.0f64;
     let mut min_ess = f64::INFINITY;
 
-    for d in 0..dim {
-        // Collect split-chain means and variances
-        let mut chain_means = Vec::with_capacity(n_split_chains);
-        let mut chain_vars = Vec::with_capacity(n_split_chains);
+    #[inline]
+    fn split_value(samples: &Array3<f64>, n_chains: usize, half: usize, dim: usize, sc: usize, t: usize) -> f64 {
+        let chain = sc % n_chains;
+        if sc < n_chains {
+            samples[[chain, t, dim]]
+        } else {
+            samples[[chain, half + t, dim]]
+        }
+    }
 
+    fn ess_from_split_dimension(
+        samples: &Array3<f64>,
+        n_chains: usize,
+        half: usize,
+        dim: usize,
+    ) -> f64 {
+        let m = n_chains * 2;
+        let n = half;
+        if m == 0 || n < 4 {
+            return (m * n).max(1) as f64;
+        }
+
+        let mut means = vec![0.0_f64; m];
+        let mut gamma0 = vec![0.0_f64; m];
+        for sc in 0..m {
+            let mut sum = 0.0;
+            for t in 0..n {
+                sum += split_value(samples, n_chains, half, dim, sc, t);
+            }
+            let mean = sum / n as f64;
+            means[sc] = mean;
+            let mut g0 = 0.0;
+            for t in 0..n {
+                let d = split_value(samples, n_chains, half, dim, sc, t) - mean;
+                g0 += d * d;
+            }
+            gamma0[sc] = (g0 / n as f64).max(1e-16);
+        }
+
+        let max_lag = (n - 1).min(1000);
+        let mut tau = 1.0_f64;
+        let mut lag = 1usize;
+        while lag < max_lag {
+            let mut pair = 0.0_f64;
+            for l in [lag, lag + 1] {
+                if l > max_lag {
+                    continue;
+                }
+                let mut rho_l = 0.0;
+                for sc in 0..m {
+                    let mu = means[sc];
+                    let mut cov = 0.0;
+                    let denom = (n - l) as f64;
+                    for t in 0..(n - l) {
+                        let x0 = split_value(samples, n_chains, half, dim, sc, t);
+                        let x1 = split_value(samples, n_chains, half, dim, sc, t + l);
+                        cov += (x0 - mu) * (x1 - mu);
+                    }
+                    cov /= denom;
+                    rho_l += cov / gamma0[sc];
+                }
+                rho_l /= m as f64;
+                pair += rho_l;
+            }
+            if !pair.is_finite() || pair <= 0.0 {
+                break;
+            }
+            tau += 2.0 * pair;
+            lag += 2;
+        }
+        if !tau.is_finite() || tau <= 0.0 {
+            return 1.0;
+        }
+        let total = (m * n) as f64;
+        (total / tau).clamp(1.0, total)
+    }
+
+    let mut chain_means = vec![0.0_f64; n_split_chains];
+    let mut chain_vars = vec![0.0_f64; n_split_chains];
+    for d in 0..dim {
         for chain in 0..n_chains {
             // First half
             let mut sum1 = 0.0;
@@ -92,8 +147,9 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
                 var1 += diff * diff;
             }
             var1 /= (half - 1).max(1) as f64;
-            chain_means.push(mean1);
-            chain_vars.push(var1);
+            let first_idx = chain;
+            chain_means[first_idx] = mean1;
+            chain_vars[first_idx] = var1;
 
             // Second half
             let mut sum2 = 0.0;
@@ -107,15 +163,16 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
                 var2 += diff * diff;
             }
             var2 /= (half - 1).max(1) as f64;
-            chain_means.push(mean2);
-            chain_vars.push(var2);
+            let second_idx = n_chains + chain;
+            chain_means[second_idx] = mean2;
+            chain_vars[second_idx] = var2;
         }
 
         // Within-chain variance W
-        let w: f64 = chain_vars.iter().sum::<f64>() / n_split_chains as f64;
+        let w: f64 = chain_vars.iter().copied().sum::<f64>() / n_split_chains as f64;
 
         // Between-chain variance B
-        let overall_mean: f64 = chain_means.iter().sum::<f64>() / n_split_chains as f64;
+        let overall_mean: f64 = chain_means.iter().copied().sum::<f64>() / n_split_chains as f64;
         let b: f64 = chain_means
             .iter()
             .map(|m| (m - overall_mean).powi(2))
@@ -131,13 +188,8 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
         let rhat_d = if w > 1e-10 { (var_hat / w).sqrt() } else { 1.0 };
         max_rhat = max_rhat.max(rhat_d);
 
-        // ESS approximation: n_eff ≈ n * m / (1 + 2 * sum of autocorrelations)
-        // Simple approximation using variance ratio
-        let ess_d = if var_hat > 1e-10 {
-            n_split_chains as f64 * n_split_samples as f64 * w / var_hat
-        } else {
-            n_split_chains as f64 * n_split_samples as f64
-        };
+        // Real ESS via split-chain autocorrelation with Geyer IPS truncation.
+        let ess_d = ess_from_split_dimension(samples, n_chains, half, d);
         min_ess = min_ess.min(ess_d);
     }
 
@@ -218,8 +270,6 @@ pub struct NutsPosterior {
     chol_t: Array2<f64>,
     /// Link function type
     is_logit: bool,
-    /// Whether Firth bias reduction was used in training (must match for HMC)
-    firth_bias_reduction: bool,
 }
 
 impl NutsPosterior {
@@ -245,7 +295,6 @@ impl NutsPosterior {
         mode: ArrayView1<f64>,
         hessian: ArrayView2<f64>,
         is_logit: bool,
-        firth_bias_reduction: bool,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
         let dim = x.ncols();
@@ -293,7 +342,6 @@ impl NutsPosterior {
             chol,
             chol_t,
             is_logit,
-            firth_bias_reduction,
         })
     }
 
@@ -328,87 +376,11 @@ impl NutsPosterior {
         // ∇_β log p = ∇_β ll - ∇_β penalty
         let mut grad_beta = &grad_ll_beta - &grad_penalty_beta;
 
-        // === Step 5b: Firth bias reduction term (if enabled) ===
-        // Firth adds 0.5 * log|I(β)| to log-posterior, where I = X'WX is Fisher information
-        // For logistic regression, W = diag(w * μ(1-μ))
-        let firth_term = if self.firth_bias_reduction && self.is_logit {
-            let n = self.data.n_samples;
-            let p = self.data.dim;
-
-            // Compute IRLS weights: w_irls = prior_weight * μ(1-μ)
-            let mut w_irls = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let eta_i = eta[i].clamp(-700.0, 700.0);
-                let mu_i = 1.0 / (1.0 + (-eta_i).exp());
-                let mu_clamped = mu_i.clamp(1e-10, 1.0 - 1e-10);
-                w_irls[i] = self.data.weights[i] * mu_clamped * (1.0 - mu_clamped);
-            }
-
-            // Build Fisher information: I = X' W X
-            let mut fisher = Array2::<f64>::zeros((p, p));
-            for i in 0..n {
-                let w_i = w_irls[i].max(1e-10);
-                for j in 0..p {
-                    let xij = self.data.x[[i, j]];
-                    for k in 0..p {
-                        fisher[[j, k]] += w_i * xij * self.data.x[[i, k]];
-                    }
-                }
-            }
-
-            // Compute 0.5 * log|I| via Cholesky
-            // Conditional regularization for stability
-            ensure_positive_definite_hmc(&mut fisher);
-
-            match fisher.cholesky(Side::Lower) {
-                Ok(chol_i) => {
-                    let half_log_det: f64 = chol_i.lower_triangular().diag().mapv(f64::ln).sum();
-
-                    // Exact Firth gradient: ∂(0.5 log|I|)/∂β = X' h * (0.5 - μ)
-                    // where h_i = leverage = x_i' (X'WX)^{-1} x_i * w_i
-                    // Compute (X'WX)^{-1} = L^{-T} L^{-1} where L = chol(X'WX)
-                    let l = chol_i.lower_triangular();
-
-                    for i in 0..n {
-                        let eta_i = eta[i].clamp(-700.0, 700.0);
-                        let mu_i = 1.0 / (1.0 + (-eta_i).exp());
-                        let mu_clamped = mu_i.clamp(1e-10, 1.0 - 1e-10);
-                        let w_i = w_irls[i].max(1e-10);
-
-                        // Compute h_ii = w_i * x_i' (X'WX)^{-1} x_i via L^{-1}(sqrt(w_i)*x_i)
-                        // First solve L v = sqrt(w_i) * x_i
-                        let sqrt_w = w_i.sqrt();
-                        let mut v = Array1::<f64>::zeros(p);
-                        for j in 0..p {
-                            let mut sum = sqrt_w * self.data.x[[i, j]];
-                            for k in 0..j {
-                                sum -= l[[j, k]] * v[k];
-                            }
-                            v[j] = sum / l[[j, j]].max(1e-15);
-                        }
-                        // h_ii = ||v||^2
-                        let h_ii: f64 = v.iter().map(|x| x * x).sum();
-
-                        // Firth score contribution: h_ii * (0.5 - μ_i)
-                        let firth_score = h_ii * (0.5 - mu_clamped);
-                        for j in 0..p {
-                            grad_beta[j] += firth_score * self.data.x[[i, j]];
-                        }
-                    }
-
-                    half_log_det
-                }
-                Err(_) => 0.0, // Fall back to standard likelihood if Fisher is singular
-            }
-        } else {
-            0.0
-        };
-
         // === Step 6: Chain rule to get gradient in z space ===
         // ∇_z = L^T @ ∇_β
         let grad_z = self.chol_t.dot(&grad_beta);
 
-        let logp = ll - penalty + firth_term;
+        let logp = ll - penalty;
 
         (logp, grad_z)
     }
@@ -633,9 +605,15 @@ pub fn run_nuts_sampling(
     firth_bias_reduction: bool,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
+    if is_logit && firth_bias_reduction {
+        return Err(
+            "NUTS with Firth bias reduction is disabled: posterior target mismatch. Refit with firth_bias_reduction=false for consistent HMC uncertainty."
+                .to_string(),
+        );
+    }
     let dim = mode.len();
 
-    // Create posterior target with analytical gradients (Firth term included when enabled)
+    // Create posterior target with analytical gradients.
     let target = NutsPosterior::new(
         x,
         y,
@@ -644,7 +622,6 @@ pub fn run_nuts_sampling(
         mode,
         hessian,
         is_logit,
-        firth_bias_reduction,
     )?;
 
     // Get Cholesky factor for un-whitening samples later
@@ -1448,7 +1425,7 @@ pub fn run_joint_nuts_sampling(
         .unwrap_or_else(|| Array1::zeros(dim));
     let posterior_std = samples.std_axis(Axis(0), 0.0);
 
-    // Compute R-hat and ESS heuristics (simplified between/within-chain variance method)
+    // Compute split R-hat and autocorrelation-based ESS diagnostics.
     let (rhat, ess) = compute_rhat_ess(&samples_array, n_chains, n_samples_out, dim);
     let converged = rhat < 1.1 && ess > 100.0;
 
@@ -1486,76 +1463,12 @@ pub fn run_survival_nuts_sampling_flattened<'a>(
     )
 }
 
-/// Compute R-hat and ESS heuristics for MCMC samples.
-/// NOTE: This is a simplified diagnostic, NOT the full Vehtari et al. split-R-hat/ESS.
-/// Uses basic between/within chain variance ratio as a convergence heuristic.
+/// Compute split R-hat and autocorrelation-based ESS diagnostics.
 fn compute_rhat_ess(
     samples: &Array3<f64>,
-    n_chains: usize,
-    n_samples: usize,
-    dim: usize,
+    _n_chains: usize,
+    _n_samples: usize,
+    _dim: usize,
 ) -> (f64, f64) {
-    if n_chains < 2 || n_samples < 4 {
-        return (f64::NAN, (n_chains * n_samples) as f64 * 0.5);
-    }
-
-    let mut max_rhat = 1.0_f64;
-    let mut min_ess = f64::MAX;
-
-    for d in 0..dim {
-        // Compute chain means and overall mean
-        let mut chain_means = vec![0.0; n_chains];
-        let mut chain_vars = vec![0.0; n_chains];
-        let mut overall_mean = 0.0;
-
-        for c in 0..n_chains {
-            let mut sum = 0.0;
-            for s in 0..n_samples {
-                sum += samples[[c, s, d]];
-            }
-            chain_means[c] = sum / n_samples as f64;
-            overall_mean += chain_means[c];
-        }
-        overall_mean /= n_chains as f64;
-
-        // Within-chain variance W
-        for c in 0..n_chains {
-            let mut sum_sq = 0.0;
-            for s in 0..n_samples {
-                let diff = samples[[c, s, d]] - chain_means[c];
-                sum_sq += diff * diff;
-            }
-            chain_vars[c] = sum_sq / (n_samples - 1) as f64;
-        }
-        let w: f64 = chain_vars.iter().sum::<f64>() / n_chains as f64;
-
-        // Between-chain variance B
-        let b: f64 = {
-            let mut sum_sq = 0.0;
-            for c in 0..n_chains {
-                let diff = chain_means[c] - overall_mean;
-                sum_sq += diff * diff;
-            }
-            sum_sq * n_samples as f64 / (n_chains - 1) as f64
-        };
-
-        // R-hat = sqrt((n-1)/n + B/(n*W))
-        let rhat_d = if w > 1e-10 {
-            (((n_samples as f64 - 1.0) / n_samples as f64) + (b / (n_samples as f64 * w))).sqrt()
-        } else {
-            1.0
-        };
-        max_rhat = max_rhat.max(rhat_d);
-
-        // Simplified ESS = n * m * W / (W + B/n)
-        let var_total = w + b / n_samples as f64;
-        let ess_d = if var_total > 1e-10 {
-            (n_chains * n_samples) as f64 * w / var_total
-        } else {
-            (n_chains * n_samples) as f64
-        };
-        min_ess = min_ess.min(ess_d);
-    }
-
-    (max_rhat, min_ess.max(1.0))
+    compute_split_rhat_and_ess(samples)
 }

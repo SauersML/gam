@@ -202,7 +202,13 @@ fn array_to_faer(array: &Array2<f64>) -> Mat<f64> {
 }
 
 fn mat_to_array(mat: &Mat<f64>) -> Array2<f64> {
-    Array2::from_shape_fn((mat.nrows(), mat.ncols()), |(i, j)| mat[(i, j)])
+    let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
+    for j in 0..mat.ncols() {
+        for i in 0..mat.nrows() {
+            out[[i, j]] = mat[(i, j)];
+        }
+    }
+    out
 }
 
 fn mat_max_abs_element(matrix: MatRef<'_, f64>) -> f64 {
