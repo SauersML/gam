@@ -2,7 +2,7 @@ use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, fast_ata_into, fast_atv, fast_atv_into,
+    array2_to_mat_mut, fast_atv,
 };
 use crate::matrix::DesignMatrix;
 use crate::types::{LikelihoodFamily, LinkFunction};

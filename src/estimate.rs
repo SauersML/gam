@@ -201,7 +201,6 @@ struct RemlConfig {
     reml_convergence_tolerance: f64,
     reml_max_iterations: u64,
     firth_bias_reduction: bool,
-    reml_parallel_threshold: usize,
     firth_curvature_mode: FirthCurvatureMode,
 }
 
@@ -220,7 +219,6 @@ impl RemlConfig {
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
-            reml_parallel_threshold: 4,
             firth_curvature_mode,
         }
     }
@@ -467,7 +465,7 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
 /// - V_ρ = inverse Hessian of LAML w.r.t. ρ (smoothing parameter covariance)
 ///
 /// Returns the correction matrix in the ORIGINAL coefficient basis.
-pub fn compute_smoothing_correction(
+pub(crate) fn compute_smoothing_correction(
     reml_state: &internal::RemlState<'_>,
     final_rho: &Array1<f64>,
     final_fit: &pirls::PirlsResult,
@@ -2094,7 +2092,7 @@ pub mod internal {
         }
     }
 
-    pub(super) struct RemlState<'a> {
+    pub(crate) struct RemlState<'a> {
         y: ArrayView1<'a, f64>,
         x: ArrayView2<'a, f64>,
         weights: ArrayView1<'a, f64>,
@@ -2505,6 +2503,7 @@ pub mod internal {
             *repeat = 0;
         }
 
+        #[allow(dead_code)]
         pub fn reset_optimizer_tracking(&self) {
             *self.eval_count.borrow_mut() = 0;
             *self.last_cost.borrow_mut() = f64::INFINITY;
@@ -2559,6 +2558,7 @@ pub mod internal {
             })
         }
 
+        #[allow(dead_code)]
         pub(super) fn new(
             y: ArrayView1<'a, f64>,
             x: ArrayView2<'a, f64>,
@@ -2952,6 +2952,7 @@ pub mod internal {
         /// Clear warm-start state. Used in tests to ensure consistent starting points
         /// when comparing different gradient computation paths.
         #[cfg(test)]
+        #[allow(dead_code)]
         pub fn clear_warm_start(&self) {
             self.warm_start_beta.borrow_mut().take();
             self.current_eval_bundle.borrow_mut().take();
@@ -3030,6 +3031,7 @@ pub mod internal {
         /// Numerical gradient of the penalized log-likelihood part w.r.t. rho via central differences.
         /// Returns g_pll where g_pll[k] = - d/d rho_k penalised_ll(rho), suitable for COST gradient assembly.
         #[cfg(test)]
+        #[allow(dead_code)]
         fn numeric_penalised_ll_grad(
             &self,
             rho: &Array1<f64>,
@@ -3696,10 +3698,12 @@ pub mod internal {
             self.x
         }
 
+        #[allow(dead_code)]
         pub(super) fn y(&self) -> ArrayView1<'a, f64> {
             self.y
         }
 
+        #[allow(dead_code)]
         pub(super) fn rs_list_ref(&self) -> &Vec<Array2<f64>> {
             &self.rs_list
         }
@@ -3712,6 +3716,7 @@ pub mod internal {
             self.weights
         }
 
+        #[allow(dead_code)]
         pub(super) fn offset(&self) -> ArrayView1<'_, f64> {
             self.offset.view()
         }
@@ -5467,6 +5472,7 @@ pub mod internal {
         // Helper for boundary perturbation
         // Returns (perturbed_rho, optional_corrected_covariance_in_transformed_basis)
         // The covariance is V'_beta_trans
+        #[allow(dead_code)]
         pub(super) fn perform_boundary_perturbation_correction(
             &self,
             initial_rho: &Array1<f64>,
