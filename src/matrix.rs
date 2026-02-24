@@ -27,8 +27,18 @@ impl DesignMatrix {
         match self {
             Self::Dense(matrix) => matrix.clone(),
             Self::Sparse(matrix) => {
-                let dense = matrix.as_ref().to_dense();
-                Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| dense[(i, j)])
+                let mut out = Array2::<f64>::zeros((matrix.nrows(), matrix.ncols()));
+                let (symbolic, values) = matrix.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..matrix.ncols() {
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    for idx in start..end {
+                        out[[row_idx[idx], col]] = values[idx];
+                    }
+                }
+                out
             }
         }
     }

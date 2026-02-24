@@ -251,8 +251,18 @@ impl BasisOutputFormat for Dense {
                 degree,
                 eval_kind,
             )?;
-            let dense = sparse.as_ref().to_dense();
-            Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| dense[(i, j)])
+            let mut dense = Array2::<f64>::zeros((sparse.nrows(), sparse.ncols()));
+            let (symbolic, values) = sparse.parts();
+            let col_ptr = symbolic.col_ptr();
+            let row_idx = symbolic.row_idx();
+            for col in 0..sparse.ncols() {
+                let start = col_ptr[col];
+                let end = col_ptr[col + 1];
+                for idx in start..end {
+                    dense[[row_idx[idx], col]] = values[idx];
+                }
+            }
+            dense
         } else {
             generate_basis_internal::<DenseStorage>(data.view(), knot_view, degree, eval_kind)?
         };
@@ -1862,7 +1872,7 @@ pub fn create_thin_plate_spline_basis_with_knot_count(
 ///
 /// # Returns
 /// A tuple containing:
-/// - The new, constrained basis matrix (with one fewer column).
+/// - The new, constrained basis matrix (with `k - rank(c)` columns).
 /// - The transformation matrix `Z` used to create it.
 pub fn apply_sum_to_zero_constraint(
     basis_matrix: ArrayView2<f64>,
@@ -1889,20 +1899,32 @@ pub fn apply_sum_to_zero_constraint(
     };
     let c = basis_matrix.t().dot(&constraint_vector); // shape k
 
-    // Orthonormal basis for nullspace of c^T
-    // Build a k×1 matrix and compute its SVD; the columns of U after the first
-    // form an orthonormal basis for the nullspace, independent of QR shape.
+    // Orthonormal basis for nullspace of c^T.
+    // Build a k×1 matrix and compute its SVD; the trailing columns of U after
+    // the numerical rank span the nullspace.
     let mut c_mat = Array2::<f64>::zeros((k, 1));
     c_mat.column_mut(0).assign(&c);
 
     use crate::faer_ndarray::FaerSvd;
-    let (u_opt, ..) = c_mat.svd(true, false).map_err(BasisError::LinalgError)?;
+    let (u_opt, singular_values, _) = c_mat.svd(true, false).map_err(BasisError::LinalgError)?;
     let u = match u_opt {
         Some(u) => u,
         None => return Err(BasisError::ConstraintNullspaceNotFound),
     };
-    // The last k-1 columns of U span the nullspace of c^T
-    let z = u.slice(s![.., 1..]).to_owned(); // k×(k-1)
+    let max_sigma = singular_values
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let tol = (k.max(1) as f64) * f64::EPSILON * max_sigma.max(1.0);
+    let rank = singular_values.iter().filter(|&&sigma| sigma.abs() > tol).count();
+    if rank >= k {
+        return Err(BasisError::ConstraintNullspaceNotFound);
+    }
+    if rank == 0 {
+        // Already orthogonal to the intercept constraint; keep full basis unchanged.
+        return Ok((basis_matrix.to_owned(), Array2::eye(k)));
+    }
+    let z = u.slice(s![.., rank..]).to_owned();
 
     // Constrained basis
     let constrained = basis_matrix.dot(&z);
@@ -3880,12 +3902,12 @@ pub fn evaluate_bspline_second_derivative_scalar_into(
     for i in 0..num_basis {
         let denom1 = knot_vector[i + degree] - knot_vector[i];
         let denom2 = knot_vector[i + degree + 1] - knot_vector[i + 1];
-        let term1 = if denom1.abs() > 0.0 {
+        let term1 = if denom1.abs() > 1e-12 {
             k * deriv_lower[i] / denom1
         } else {
             0.0
         };
-        let term2 = if denom2.abs() > 0.0 {
+        let term2 = if denom2.abs() > 1e-12 {
             k * deriv_lower[i + 1] / denom2
         } else {
             0.0

@@ -92,7 +92,7 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     matmul(result.as_mut(), Accum::Replace, a_t, a_ref, 1.0, par);
 
     // Convert back to ndarray
-    Array2::from_shape_fn((p, p), |(i, j)| result[(i, j)])
+    mat_to_array(result.as_ref())
 }
 
 /// Compute A^T * A into a pre-allocated output buffer.
@@ -166,7 +166,7 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         par,
     );
 
-    Array2::from_shape_fn((p, q), |(i, j)| result[(i, j)])
+    mat_to_array(result.as_ref())
 }
 
 /// Compute A * B using faer's SIMD-optimized GEMM.
@@ -202,7 +202,7 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     };
     matmul(result.as_mut(), Accum::Replace, a_ref, b_ref, 1.0, par);
 
-    Array2::from_shape_fn((n, q), |(i, j)| result[(i, j)])
+    mat_to_array(result.as_ref())
 }
 
 /// Compute A^T * v into a pre-allocated output buffer.
@@ -286,16 +286,30 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         par,
     );
 
-    Array1::from_shape_fn(p, |i| result[(i, 0)])
+    let mut out = Array1::<f64>::zeros(p);
+    for i in 0..p {
+        out[i] = result[(i, 0)];
+    }
+    out
 }
 
 fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
-    Array2::from_shape_fn((mat.nrows(), mat.ncols()), |(i, j)| mat[(i, j)])
+    let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
+    for j in 0..mat.ncols() {
+        for i in 0..mat.nrows() {
+            out[[i, j]] = mat[(i, j)];
+        }
+    }
+    out
 }
 
 fn diag_to_array(diag: DiagRef<'_, f64>) -> Array1<f64> {
     let mat = diag.column_vector().as_mat();
-    Array1::from_shape_fn(mat.nrows(), |i| mat[(i, 0)])
+    let mut out = Array1::<f64>::zeros(mat.nrows());
+    for i in 0..mat.nrows() {
+        out[i] = mat[(i, 0)];
+    }
+    out
 }
 
 fn compute_bunch_kaufman_inertia(
@@ -535,7 +549,13 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
         let u_opt = u_storage.map(|mat| mat_to_array(mat.as_ref()));
         let vt_opt = v_storage.map(|mat| {
             let mat_ref = mat.as_ref();
-            Array2::from_shape_fn((mat_ref.ncols(), mat_ref.nrows()), |(i, j)| mat_ref[(j, i)])
+            let mut out = Array2::<f64>::zeros((mat_ref.ncols(), mat_ref.nrows()));
+            for j in 0..mat_ref.nrows() {
+                for i in 0..mat_ref.ncols() {
+                    out[[i, j]] = mat_ref[(j, i)];
+                }
+            }
+            out
         });
 
         Ok((u_opt, singular_values, vt_opt))
