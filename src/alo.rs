@@ -1,6 +1,5 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::FaerArrayView;
-use crate::hull::PeeledHull;
 use crate::estimate::FitResult;
 use crate::pirls;
 use crate::types::LinkFunction;
@@ -8,26 +7,24 @@ use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use faer::Mat as FaerMat;
 use faer::{Accum, Par, Side};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use std::cmp::Ordering;
 
-/// Features used to train the calibrator GAM.
+/// Approximate leave-one-out diagnostics derived from a fitted model.
 #[derive(Debug, Clone)]
-pub struct CalibratorFeatures {
-    pub pred: Array1<f64>,
+pub struct AloDiagnostics {
+    pub eta_tilde: Array1<f64>,
     pub se: Array1<f64>,
-    pub dist: Array1<f64>,
     pub pred_identity: Array1<f64>,
+    pub leverage: Array1<f64>,
     pub fisher_weights: Array1<f64>,
 }
 
-fn compute_alo_features_from_pirls_impl(
+fn compute_alo_diagnostics_from_pirls_impl(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
-    raw_train: ArrayView2<f64>,
-    hull_opt: Option<&PeeledHull>,
     link: LinkFunction,
-) -> Result<CalibratorFeatures, EstimationError> {
+) -> Result<AloDiagnostics, EstimationError> {
     let x_dense = base.x_transformed.to_dense();
     let n = x_dense.nrows();
 
@@ -310,78 +307,66 @@ fn compute_alo_features_from_pirls_impl(
         phi
     );
 
-    let dist = if let Some(hull) = hull_opt {
-        hull.signed_distance_many(raw_train)
-    } else {
-        Array1::zeros(raw_train.nrows())
-    };
-
-    let pred = match link {
+    let eta_tilde = match link {
         LinkFunction::Logit | LinkFunction::Probit => eta_tilde,
         LinkFunction::Identity => eta_tilde,
     };
 
-    let has_nan_pred = pred.iter().any(|&x| x.is_nan());
+    let has_nan_pred = eta_tilde.iter().any(|&x| x.is_nan());
     let has_nan_se = se_naive.iter().any(|&x| x.is_nan());
-    let has_nan_dist = dist.iter().any(|&x| x.is_nan());
+    let has_nan_leverage = aii.iter().any(|&x| x.is_nan());
 
-    if has_nan_pred || has_nan_se || has_nan_dist {
-        log::error!("[GAM ALO] NaN values found in ALO features:");
+    if has_nan_pred || has_nan_se || has_nan_leverage {
+        log::error!("[GAM ALO] NaN values found in ALO diagnostics:");
         log::error!(
-            "[GAM ALO] pred: {} NaN values",
-            pred.iter().filter(|&&x| x.is_nan()).count()
+            "[GAM ALO] eta_tilde: {} NaN values",
+            eta_tilde.iter().filter(|&&x| x.is_nan()).count()
         );
         log::error!(
             "[GAM ALO] se: {} NaN values",
             se_naive.iter().filter(|&&x| x.is_nan()).count()
         );
         log::error!(
-            "[GAM ALO] dist: {} NaN values",
-            dist.iter().filter(|&&x| x.is_nan()).count()
+            "[GAM ALO] leverage: {} NaN values",
+            aii.iter().filter(|&&x| x.is_nan()).count()
         );
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         });
     }
 
-    Ok(CalibratorFeatures {
-        pred,
+    Ok(AloDiagnostics {
+        eta_tilde,
         se: se_naive,
-        dist,
         pred_identity: eta_hat,
+        leverage: aii,
         fisher_weights: base.final_weights.clone(),
     })
 }
 
-/// Compute ALO features (eta_tilde/mu_tilde, SE_tilde, signed distance) from a fitted GAM result.
-pub fn compute_alo_features_from_fit(
+/// Compute ALO diagnostics (eta_tilde, SE, leverage) from a fitted GAM result.
+pub fn compute_alo_diagnostics_from_fit(
     fit: &FitResult,
     y: ArrayView1<f64>,
-    raw_train: ArrayView2<f64>,
-    hull_opt: Option<&PeeledHull>,
     link: LinkFunction,
-) -> Result<CalibratorFeatures, EstimationError> {
-    compute_alo_features_from_pirls_impl(&fit.artifacts.pirls, y, raw_train, hull_opt, link)
+) -> Result<AloDiagnostics, EstimationError> {
+    compute_alo_diagnostics_from_pirls_impl(&fit.artifacts.pirls, y, link)
 }
 
-/// Compute ALO features from a fitted GAM result (primary API).
-pub fn compute_alo_features(
+/// Compute ALO diagnostics from a fitted GAM result (primary API).
+pub fn compute_alo_diagnostics(
     fit: &FitResult,
     y: ArrayView1<f64>,
-    raw_train: ArrayView2<f64>,
-    hull_opt: Option<&PeeledHull>,
     link: LinkFunction,
-) -> Result<CalibratorFeatures, EstimationError> {
-    compute_alo_features_from_fit(fit, y, raw_train, hull_opt, link)
+) -> Result<AloDiagnostics, EstimationError> {
+    compute_alo_diagnostics_from_fit(fit, y, link)
 }
 
-/// Compute ALO features from a PIRLS result for lower-level callers.
-pub fn compute_alo_features_from_pirls(
+/// Compute ALO diagnostics from a PIRLS result for lower-level callers.
+pub fn compute_alo_diagnostics_from_pirls(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
-    raw_train: ArrayView2<f64>,
-    hull_opt: Option<&PeeledHull>,
     link: LinkFunction,
-) -> Result<CalibratorFeatures, EstimationError> {
-    compute_alo_features_from_pirls_impl(base, y, raw_train, hull_opt, link)
+) -> Result<AloDiagnostics, EstimationError> {
+    compute_alo_diagnostics_from_pirls_impl(base, y, link)
 }
