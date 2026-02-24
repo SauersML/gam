@@ -2,7 +2,7 @@ use gam::pirls::update_glm_vectors_by_family;
 use gam::{FitOptions, LikelihoodFamily, fit_gam, predict_gam};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 fn normal_cdf(x: f64) -> f64 {
     let z = x.abs();
