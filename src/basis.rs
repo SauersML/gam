@@ -1267,6 +1267,61 @@ impl ThinPlateSplineBasis {
     }
 }
 
+/// Matérn smoothness parameter `nu` (half-integer variants with closed forms).
+#[derive(Debug, Clone, Copy)]
+pub enum MaternNu {
+    Half,
+    ThreeHalves,
+    FiveHalves,
+    SevenHalves,
+    NineHalves,
+}
+
+impl MaternNu {
+    /// Recommend a conservative default for high-dimensional settings.
+    /// This corresponds to choosing `s = ceil(k/2) + 0.5`, giving `nu = s - k/2`.
+    /// For even `k`, this yields `nu = 0.5` (exponential Matérn), avoiding TPS-style
+    /// null-space inflation while preserving rotation invariance.
+    pub fn recommended_for_dimension(_dimension: usize) -> Self {
+        Self::Half
+    }
+}
+
+/// Matérn radial basis and penalties.
+#[derive(Debug, Clone)]
+pub struct MaternSplineBasis {
+    pub basis: Array2<f64>,
+    pub penalty_kernel: Array2<f64>,
+    pub penalty_ridge: Array2<f64>,
+    pub num_kernel_basis: usize,
+    pub num_polynomial_basis: usize,
+    pub dimension: usize,
+}
+
+impl MaternSplineBasis {
+    pub fn penalty_matrices(&self) -> Vec<Array2<f64>> {
+        vec![self.penalty_kernel.clone(), self.penalty_ridge.clone()]
+    }
+}
+
+/// Duchon-like radial basis and penalties with explicit low-frequency null-space order.
+#[derive(Debug, Clone)]
+pub struct DuchonSplineBasis {
+    pub basis: Array2<f64>,
+    pub penalty_kernel: Array2<f64>,
+    pub penalty_ridge: Array2<f64>,
+    pub num_kernel_basis: usize,
+    pub num_polynomial_basis: usize,
+    pub dimension: usize,
+    pub nullspace_order: DuchonNullspaceOrder,
+}
+
+impl DuchonSplineBasis {
+    pub fn penalty_matrices(&self) -> Vec<Array2<f64>> {
+        vec![self.penalty_kernel.clone(), self.penalty_ridge.clone()]
+    }
+}
+
 /// Which knot strategy to use for 1D B-spline bases.
 #[derive(Debug, Clone)]
 pub enum BSplineKnotSpec {
@@ -1303,11 +1358,52 @@ pub struct ThinPlateBasisSpec {
     pub double_penalty: bool,
 }
 
+/// Matérn basis configuration.
+#[derive(Debug, Clone)]
+pub struct MaternBasisSpec {
+    pub center_strategy: CenterStrategy,
+    pub length_scale: f64,
+    pub nu: MaternNu,
+    pub include_intercept: bool,
+    pub double_penalty: bool,
+}
+
+/// Duchon null-space order. `0` matches fully-penalized Matérn-like behavior,
+/// `1` keeps `[1, x_1, ..., x_d]` unpenalized by the primary curvature penalty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuchonNullspaceOrder {
+    Zero,
+    Linear,
+}
+
+/// Duchon-like basis configuration using a Matérn high-frequency backbone and
+/// explicit low-frequency null-space control.
+#[derive(Debug, Clone)]
+pub struct DuchonBasisSpec {
+    pub center_strategy: CenterStrategy,
+    pub length_scale: f64,
+    pub nu: MaternNu,
+    pub nullspace_order: DuchonNullspaceOrder,
+    pub double_penalty: bool,
+}
+
 /// Metadata returned by generic basis builders.
 #[derive(Debug, Clone)]
 pub enum BasisMetadata {
     BSpline1D { knots: Array1<f64> },
     ThinPlate { centers: Array2<f64> },
+    Matern {
+        centers: Array2<f64>,
+        length_scale: f64,
+        nu: MaternNu,
+        include_intercept: bool,
+    },
+    Duchon {
+        centers: Array2<f64>,
+        length_scale: f64,
+        nu: MaternNu,
+        nullspace_order: DuchonNullspaceOrder,
+    },
 }
 
 /// Standardized basis build result for engine-level composition.
@@ -1553,22 +1649,357 @@ pub fn build_thin_plate_basis(
     })
 }
 
-fn thin_plate_polynomial_block(points: ArrayView2<'_, f64>) -> Array2<f64> {
-    let n = points.nrows();
-    let d = points.ncols();
-    let mut poly = Array2::<f64>::zeros((n, d + 1));
-    poly.column_mut(0).fill(1.0);
-    for c in 0..d {
-        poly.column_mut(c + 1).assign(&points.column(c));
+#[inline(always)]
+fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Result<f64, BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn kernel distance must be finite and non-negative".to_string(),
+        ));
     }
-    poly
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn length_scale must be finite and positive".to_string(),
+        ));
+    }
+
+    let x = r / length_scale;
+    let k = match nu {
+        MaternNu::Half => (-x).exp(),
+        MaternNu::ThreeHalves => {
+            let a = 3.0_f64.sqrt() * x;
+            (1.0 + a) * (-a).exp()
+        }
+        MaternNu::FiveHalves => {
+            let a = 5.0_f64.sqrt() * x;
+            (1.0 + a + (a * a) / 3.0) * (-a).exp()
+        }
+        MaternNu::SevenHalves => {
+            let a = 7.0_f64.sqrt() * x;
+            let a2 = a * a;
+            let a3 = a2 * a;
+            (1.0 + a + (2.0 / 5.0) * a2 + (1.0 / 15.0) * a3) * (-a).exp()
+        }
+        MaternNu::NineHalves => {
+            let a = 9.0_f64.sqrt() * x;
+            let a2 = a * a;
+            let a3 = a2 * a;
+            let a4 = a2 * a2;
+            (1.0 + a + (3.0 / 7.0) * a2 + (2.0 / 21.0) * a3 + (1.0 / 105.0) * a4) * (-a).exp()
+        }
+    };
+    Ok(k)
 }
 
-fn thin_plate_kernel_constraint_nullspace(
+/// Creates a Matérn spline basis from data and centers.
+///
+/// The design is `[K | 1]` when `include_intercept=true` and `[K]` otherwise, where:
+/// - `K_ij = k(||x_i - c_j||; length_scale, nu)` is the Matérn kernel block.
+///
+/// The default kernel penalty is `alpha' S alpha` with `S_jl = k(||c_j - c_l||)`, embedded
+/// in the full coefficient space. With intercept included, that column is unpenalized by
+/// `penalty_kernel`; optional `penalty_ridge` enables double-penalty shrinkage of all terms.
+pub fn create_matern_spline_basis(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    include_intercept: bool,
+) -> Result<MaternSplineBasis, BasisError> {
+    let n = data.nrows();
+    let d = data.ncols();
+    let k = centers.nrows();
+
+    if d == 0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn basis requires at least one covariate dimension".to_string(),
+        ));
+    }
+    if k == 0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn basis requires at least one center".to_string(),
+        ));
+    }
+    if centers.ncols() != d {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Matérn basis dimension mismatch: data has {d} columns, centers have {}",
+            centers.ncols()
+        )));
+    }
+    if data.iter().any(|v| !v.is_finite()) || centers.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "Matérn basis requires finite data and center values".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn length_scale must be finite and positive".to_string(),
+        ));
+    }
+
+    let poly_cols = if include_intercept { 1 } else { 0 };
+    let total_cols = k + poly_cols;
+
+    let mut kernel_block = Array2::<f64>::zeros((n, k));
+    let kernel_result: Result<(), BasisError> = kernel_block
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                let mut dist2 = 0.0;
+                for c in 0..d {
+                    let delta = data[[i, c]] - centers[[j, c]];
+                    dist2 += delta * delta;
+                }
+                row[j] = matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)?;
+            }
+            Ok(())
+        });
+    kernel_result?;
+
+    let mut center_kernel = Array2::<f64>::zeros((k, k));
+    let center_result: Result<(), BasisError> = center_kernel
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                let mut dist2 = 0.0;
+                for c in 0..d {
+                    let delta = centers[[i, c]] - centers[[j, c]];
+                    dist2 += delta * delta;
+                }
+                row[j] = matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)?;
+            }
+            Ok(())
+        });
+    center_result?;
+
+    let mut basis = Array2::<f64>::zeros((n, total_cols));
+    basis.slice_mut(s![.., 0..k]).assign(&kernel_block);
+    if include_intercept {
+        basis.column_mut(k).fill(1.0);
+    }
+
+    let mut penalty_kernel = Array2::<f64>::zeros((total_cols, total_cols));
+    penalty_kernel
+        .slice_mut(s![0..k, 0..k])
+        .assign(&center_kernel);
+    let penalty_ridge = Array2::<f64>::eye(total_cols);
+
+    Ok(MaternSplineBasis {
+        basis,
+        penalty_kernel,
+        penalty_ridge,
+        num_kernel_basis: k,
+        num_polynomial_basis: poly_cols,
+        dimension: d,
+    })
+}
+
+/// Generic Matérn builder returning design + penalty list.
+pub fn build_matern_basis(
+    data: ArrayView2<'_, f64>,
+    spec: &MaternBasisSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let m = create_matern_spline_basis(
+        data,
+        centers.view(),
+        spec.length_scale,
+        spec.nu,
+        spec.include_intercept,
+    )?;
+    let mut penalties = vec![m.penalty_kernel.clone()];
+    let mut nullspace_dims = vec![if spec.include_intercept { 1 } else { 0 }];
+    if spec.double_penalty {
+        penalties.push(m.penalty_ridge.clone());
+        nullspace_dims.push(0);
+    }
+    Ok(BasisBuildResult {
+        design: m.basis,
+        penalties,
+        nullspace_dims,
+        metadata: BasisMetadata::Matern {
+            centers,
+            length_scale: spec.length_scale,
+            nu: spec.nu,
+            include_intercept: spec.include_intercept,
+        },
+    })
+}
+
+/// Creates a Duchon-like basis:
+/// P(w) = ||w||^(2p) * (kappa^2 + ||w||^2)^s
+/// implemented with:
+/// - Matérn radial block for high-frequency control
+/// - explicit polynomial null-space block determined by `nullspace_order`
+/// - side-constraint projection `P(centers)^T alpha = 0` for `p > 0`
+pub fn create_duchon_spline_basis(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<DuchonSplineBasis, BasisError> {
+    let n = data.nrows();
+    let d = data.ncols();
+    let k = centers.nrows();
+
+    if d == 0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon basis requires at least one covariate dimension".to_string(),
+        ));
+    }
+    if k == 0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon basis requires at least one center".to_string(),
+        ));
+    }
+    if centers.ncols() != d {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Duchon basis dimension mismatch: data has {d} columns, centers have {}",
+            centers.ncols()
+        )));
+    }
+    if data.iter().any(|v| !v.is_finite()) || centers.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "Duchon basis requires finite data and center values".to_string(),
+        ));
+    }
+
+    let poly_block = polynomial_block_from_order(data, nullspace_order);
+    let z = kernel_constraint_nullspace(centers, nullspace_order)?;
+
+    let mut kernel_block = Array2::<f64>::zeros((n, k));
+    let kernel_result: Result<(), BasisError> = kernel_block
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                let mut dist2 = 0.0;
+                for c in 0..d {
+                    let delta = data[[i, c]] - centers[[j, c]];
+                    dist2 += delta * delta;
+                }
+                row[j] = matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)?;
+            }
+            Ok(())
+        });
+    kernel_result?;
+
+    let mut center_kernel = Array2::<f64>::zeros((k, k));
+    let center_result: Result<(), BasisError> = center_kernel
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                let mut dist2 = 0.0;
+                for c in 0..d {
+                    let delta = centers[[i, c]] - centers[[j, c]];
+                    dist2 += delta * delta;
+                }
+                row[j] = matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)?;
+            }
+            Ok(())
+        });
+    center_result?;
+
+    let kernel_constrained = kernel_block.dot(&z);
+    let omega_constrained = z.t().dot(&center_kernel).dot(&z);
+    let kernel_cols = kernel_constrained.ncols();
+    let poly_cols = poly_block.ncols();
+    let total_cols = kernel_cols + poly_cols;
+
+    let mut basis = Array2::<f64>::zeros((n, total_cols));
+    basis
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&kernel_constrained);
+    if poly_cols > 0 {
+        basis
+            .slice_mut(s![.., kernel_cols..])
+            .assign(&poly_block);
+    }
+
+    let mut penalty_kernel = Array2::<f64>::zeros((total_cols, total_cols));
+    penalty_kernel
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&omega_constrained);
+    let penalty_ridge = Array2::<f64>::eye(total_cols);
+
+    Ok(DuchonSplineBasis {
+        basis,
+        penalty_kernel,
+        penalty_ridge,
+        num_kernel_basis: kernel_cols,
+        num_polynomial_basis: poly_cols,
+        dimension: d,
+        nullspace_order,
+    })
+}
+
+/// Generic Duchon builder returning design + penalty list.
+pub fn build_duchon_basis(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let d = create_duchon_spline_basis(
+        data,
+        centers.view(),
+        spec.length_scale,
+        spec.nu,
+        spec.nullspace_order,
+    )?;
+    let mut penalties = vec![d.penalty_kernel.clone()];
+    let mut nullspace_dims = vec![d.num_polynomial_basis];
+    if spec.double_penalty {
+        penalties.push(d.penalty_ridge.clone());
+        nullspace_dims.push(0);
+    }
+    Ok(BasisBuildResult {
+        design: d.basis,
+        penalties,
+        nullspace_dims,
+        metadata: BasisMetadata::Duchon {
+            centers,
+            length_scale: spec.length_scale,
+            nu: spec.nu,
+            nullspace_order: spec.nullspace_order,
+        },
+    })
+}
+
+fn polynomial_block_from_order(
+    points: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+) -> Array2<f64> {
+    let n = points.nrows();
+    let d = points.ncols();
+    match order {
+        DuchonNullspaceOrder::Zero => Array2::<f64>::zeros((n, 0)),
+        DuchonNullspaceOrder::Linear => {
+            let mut poly = Array2::<f64>::zeros((n, d + 1));
+            poly.column_mut(0).fill(1.0);
+            for c in 0..d {
+                poly.column_mut(c + 1).assign(&points.column(c));
+            }
+            poly
+        }
+    }
+}
+
+fn kernel_constraint_nullspace(
     knots: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
 ) -> Result<Array2<f64>, BasisError> {
     let k = knots.nrows();
-    let p_k = thin_plate_polynomial_block(knots);
+    let p_k = polynomial_block_from_order(knots, order);
+    if p_k.ncols() == 0 {
+        return Ok(Array2::<f64>::eye(k));
+    }
     let p_k_t = p_k.t().to_owned(); // (d+1) x k
 
     use crate::faer_ndarray::FaerSvd;
@@ -1799,7 +2230,7 @@ pub fn create_thin_plate_spline_basis(
     kernel_result?;
 
     // P block: [1, x_1, ..., x_d]
-    let poly_block = thin_plate_polynomial_block(data);
+    let poly_block = polynomial_block_from_order(data, DuchonNullspaceOrder::Linear);
 
     // Omega block on knots
     let mut omega = Array2::<f64>::zeros((k, k));
@@ -1822,7 +2253,7 @@ pub fn create_thin_plate_spline_basis(
 
     // Enforce TPS side-constraint P(knots)^T α = 0 by projecting onto
     // the nullspace of P(knots)^T.
-    let z = thin_plate_kernel_constraint_nullspace(knots)?;
+    let z = kernel_constraint_nullspace(knots, DuchonNullspaceOrder::Linear)?;
     let kernel_constrained = kernel_block.dot(&z);
     let omega_constrained = z.t().dot(&omega).dot(&z);
 

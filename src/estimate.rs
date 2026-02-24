@@ -41,7 +41,7 @@ use crate::types::{
 };
 
 // Ndarray and faer linear algebra helpers
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, Zip, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_mat_mut,
@@ -50,7 +50,7 @@ use faer::Mat as FaerMat;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
-use faer::{Par, Side};
+use faer::Side;
 
 fn logit_from_prob(p: f64) -> f64 {
     let p = p.clamp(1e-8, 1.0 - 1e-8);
@@ -1801,11 +1801,6 @@ pub mod internal {
         /// Used for TRACE term: ½ tr(H₊† ∂H/∂ρ) to match cost function's spectral truncation.
         h_pseudoinverse: Arc<Array2<f64>>,
 
-        /// Spectral factor W where H₊† = W Wᵀ and W = U_valid * diag(1/√λ_valid).
-        /// Shape: (p × rank) where rank = number of positive eigenvalues.
-        /// Used for computing ∇_β log|H₊| via M = X W Wᵀ Xᵀ = (XW)(XW)ᵀ
-        spectral_factor_w: Arc<Array2<f64>>,
-
         /// Log determinant via truncation: Σᵢ log(λᵢ) for λᵢ > ε only.
         h_total_log_det: f64,
     }
@@ -2128,134 +2123,6 @@ pub mod internal {
     // Formatting utilities moved to crate::diagnostics
     impl<'a> RemlState<'a> {
 
-        // Row-wise squared norms: diag(M) when M = C C^T.
-        // This is the "diag of Gram" trick to avoid n×n matrices.
-
-        fn row_norms_squared(matrix: &Array2<f64>) -> Array1<f64> {
-            let mut out = Array1::<f64>::zeros(matrix.nrows());
-            for i in 0..matrix.nrows() {
-                let mut acc = 0.0;
-                for j in 0..matrix.ncols() {
-                    let v = matrix[(i, j)];
-                    acc += v * v;
-                }
-                out[i] = acc;
-            }
-            out
-        }
-
-        // Compute T = (B ⊙ B)^T V without forming B ⊙ B.
-        // Each row i contributes vec(b_i b_i^T) * v_i^T, which is O(p^2) per row.
-        // This is exact and avoids n×n intermediates.
-
-        fn khatri_rao_transpose_mul(b: &Array2<f64>, v_mat: &Array2<f64>) -> Array2<f64> {
-            let n = b.nrows();
-            let p = b.ncols();
-            let m = v_mat.ncols();
-            let mut out = Array2::<f64>::zeros((p * p, m));
-            for i in 0..n {
-                for a in 0..p {
-                    let ba = b[(i, a)];
-                    if ba == 0.0 {
-                        continue;
-                    }
-                    for bcol in 0..p {
-                        let coeff = ba * b[(i, bcol)];
-                        if coeff == 0.0 {
-                            continue;
-                        }
-                        let idx = a + bcol * p;
-                        for j in 0..m {
-                            out[(idx, j)] += coeff * v_mat[(i, j)];
-                        }
-                    }
-                }
-            }
-            out
-        }
-
-        // Forward solve for L X = RHS with L lower-triangular.
-        // Used for L^{-1} and L^{-T} applications without explicit inverses.
-
-        fn solve_lower_triangular(l: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
-            let dim = l.nrows();
-            let cols = rhs.ncols();
-            let mut out = Array2::<f64>::zeros((dim, cols));
-            for j in 0..cols {
-                for i in 0..dim {
-                    let mut sum = rhs[(i, j)];
-                    for k in 0..i {
-                        sum -= l[(i, k)] * out[(k, j)];
-                    }
-                    let diag = l[(i, i)];
-                    if diag.abs() < 1e-15 {
-                        out[(i, j)] = 0.0;
-                    } else {
-                        out[(i, j)] = sum / diag;
-                    }
-                }
-            }
-            out
-        }
-
-        // Backward solve for U X = RHS with U upper-triangular.
-        // Used for L^{-T} applications by passing U = L^T.
-
-        fn solve_upper_triangular(u: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
-            let dim = u.nrows();
-            let cols = rhs.ncols();
-            let mut out = Array2::<f64>::zeros((dim, cols));
-            for j in 0..cols {
-                for i in (0..dim).rev() {
-                    let mut sum = rhs[(i, j)];
-                    for k in (i + 1)..dim {
-                        sum -= u[(i, k)] * out[(k, j)];
-                    }
-                    let diag = u[(i, i)];
-                    if diag.abs() < 1e-15 {
-                        out[(i, j)] = 0.0;
-                    } else {
-                        out[(i, j)] = sum / diag;
-                    }
-                }
-            }
-            out
-        }
-
-        // Reverse-mode for A = L L^T (Cholesky).
-        // Given L̄ = ∂J/∂L (lower-triangular), return Ā = ∂J/∂A.
-        //
-        // Exact formula (Giles 2008):
-        //   S = L^T L̄
-        //   S = Φ(S)  (keep lower triangle, half diagonal)
-        //   Ā = L^{-T} (S + S^T) L^{-1}
-        //
-        // This enforces symmetry and respects the triangular dof of L.
-
-        fn chol_reverse(
-            l: &Array2<f64>,
-            grad_l: &Array2<f64>,
-        ) -> Result<Array2<f64>, EstimationError> {
-            // S = L^T L̄
-            let mut s = l.t().dot(grad_l);
-            let dim = s.nrows();
-            // Φ: keep lower triangle, halve the diagonal
-            for i in 0..dim {
-                for j in (i + 1)..dim {
-                    s[(i, j)] = 0.0;
-                }
-                s[(i, i)] *= 0.5;
-            }
-            // sym(Φ(·)) = 0.5 * (S + S^T) with the outer 1/2 required by the
-            // exact reverse-mode formula for Cholesky.
-            let sym = 0.5 * (&s + &s.t().to_owned());
-            // Left solve: Z = L^{-T} sym
-            let z = Self::solve_upper_triangular(&l.t().to_owned(), &sym);
-            // Right solve: Ā = Z L^{-1} by solving L * Ā^T = Z^T
-            let a_bar_t = Self::solve_lower_triangular(l, &z.t().to_owned());
-            Ok(a_bar_t.t().to_owned())
-        }
-
         fn log_det_s_with_ridge(
             s_transformed: &Array2<f64>,
             ridge: f64,
@@ -2573,7 +2440,6 @@ pub mod internal {
                 ridge_used,
                 h_total: Arc::new(h_total),
                 h_pseudoinverse: Arc::new(h_pseudoinverse),
-                spectral_factor_w: Arc::new(w),
                 h_total_log_det,
             })
         }
@@ -3093,45 +2959,6 @@ pub mod internal {
                 }
             }
             Some(logh_grad)
-        }
-
-        // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
-        // We return (B, L_f, X_w) because reverse-mode needs L_f and X_w.
-        // NOTE: We apply the same stabilization ridge as compute_firth_hat_and_half_logdet
-        // to ensure the gradient is computed on the same regularized surface as the cost.
-        // This is essential for gradient consistency (finite-diff checks will fail otherwise).
-
-        fn firth_hat_factor(
-            &self,
-            x: ArrayView2<'_, f64>,
-            weights: ArrayView1<'_, f64>,
-        ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), EstimationError> {
-            use crate::faer_ndarray::FaerCholesky;
-            let n = x.nrows();
-            let mut xw = x.to_owned();
-            for i in 0..n {
-                let s = weights[i].max(0.0).sqrt();
-                if s != 1.0 {
-                    xw.row_mut(i).mapv_inplace(|v| v * s);
-                }
-            }
-            let mut fisher = xw.t().dot(&xw);
-            // Apply the same stabilization ridge as compute_firth_hat_and_half_logdet
-            // to ensure gradient is computed on the same regularized surface as the cost.
-            crate::pirls::ensure_positive_definite_with_label(
-                &mut fisher,
-                "Firth Fisher information (gradient)",
-            )?;
-            let chol = fisher.cholesky(Side::Lower).map_err(|_| {
-                EstimationError::HessianNotPositiveDefinite {
-                    min_eigenvalue: f64::NEG_INFINITY,
-                }
-            })?;
-            let l = chol.lower_triangular();
-            // Solve L_f * Y = X_w^T  =>  B = Y^T = X_w L_f^{-T}
-            let y = Self::solve_lower_triangular(&l, &xw.t().to_owned());
-            let b = y.t().to_owned();
-            Ok((b, l, xw))
         }
 
         // Accessor methods for private fields
