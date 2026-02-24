@@ -75,7 +75,7 @@ impl PenaltyBlocks {
             let b = beta.slice(ndarray::s![block.range.clone()]).to_owned();
             let g = block.matrix.dot(&b);
             let mut dst = grad.slice_mut(ndarray::s![block.range.clone()]);
-            dst += &(2.0 * block.lambda * g);
+            dst += &(block.lambda * g);
         }
         grad
     }
@@ -89,7 +89,7 @@ impl PenaltyBlocks {
             let r = block.range.clone();
             for (i_local, i) in r.clone().enumerate() {
                 for (j_local, j) in r.clone().enumerate() {
-                    h[[i, j]] += 2.0 * block.lambda * block.matrix[[i_local, j_local]];
+                    h[[i, j]] += block.lambda * block.matrix[[i_local, j_local]];
                 }
             }
         }
@@ -195,50 +195,94 @@ impl WorkingModelSurvival {
         let n = self.x_exit.nrows();
         let p = self.x_exit.ncols();
 
+        // Royston-Parmar contract used throughout engine and adapter:
+        // eta(t) = log(H(t)), where H is cumulative hazard.
         let eta_entry = self.x_entry.dot(beta);
         let eta_exit = self.x_exit.dot(beta);
+        let derivative_raw = self.x_derivative.dot(beta);
 
-        let hazard_entry = eta_entry.mapv(f64::exp);
-        let hazard_exit = eta_exit.mapv(f64::exp);
-
-        let dt = &self.age_exit - &self.age_entry;
-        let cum = (&hazard_entry + &hazard_exit) * 0.5 * &dt;
+        let h_entry = eta_entry.mapv(f64::exp);
+        let h_exit = eta_exit.mapv(f64::exp);
+        if h_entry.iter().any(|v| !v.is_finite()) || h_exit.iter().any(|v| !v.is_finite()) {
+            return Err(EstimationError::InvalidInput(
+                "survival linear predictor produced non-finite cumulative hazard".to_string(),
+            ));
+        }
 
         let mut nll = 0.0;
-        let mut d_nll_d_eta_exit = Array1::<f64>::zeros(n);
-        let mut d_nll_d_eta_entry = Array1::<f64>::zeros(n);
+        let mut grad = Array1::<f64>::zeros(p);
+        let mut h = Array2::<f64>::zeros((p, p));
 
+        // Guard derivative terms for log(hazard) = eta + log(d eta / d t)
+        let derivative_guard = self.monotonicity.tolerance.max(1e-12);
         for i in 0..n {
             let w = self.sample_weight[i];
-            let e_target = self.event_target[i] as f64;
-            let _e_competing = self.event_competing[i] as f64;
+            if w <= 0.0 {
+                continue;
+            }
+            let entry_age = self.age_entry[i];
+            let exit_age = self.age_exit[i];
+            if !entry_age.is_finite() || !exit_age.is_finite() || exit_age < entry_age {
+                return Err(EstimationError::InvalidInput(
+                    "survival ages must be finite with age_exit >= age_entry".to_string(),
+                ));
+            }
+            let _e_competing = self.event_competing[i];
+            let d = f64::from(self.event_target[i]);
 
-            nll += w * cum[i];
-            if e_target > 0.0 {
-                nll += -w * eta_exit[i];
+            let h_s = h_entry[i];
+            let h_e = h_exit[i];
+            nll += w * (h_e - h_s);
+
+            let x_s = self.x_entry.row(i);
+            let x_e = self.x_exit.row(i);
+
+            // Interval contribution: H(exit) - H(entry)
+            for j in 0..p {
+                grad[j] += w * (h_e * x_e[j] - h_s * x_s[j]);
             }
 
-            d_nll_d_eta_exit[i] = w * (0.5 * dt[i] * hazard_exit[i] - e_target);
-            d_nll_d_eta_entry[i] = w * (0.5 * dt[i] * hazard_entry[i]);
-        }
+            // Hessian from interval contribution.
+            for r in 0..p {
+                let xe_r = x_e[r];
+                let xs_r = x_s[r];
+                for c in 0..p {
+                    h[[r, c]] += w * (h_e * xe_r * x_e[c] - h_s * xs_r * x_s[c]);
+                }
+            }
 
-        let mut grad = self.x_exit.t().dot(&d_nll_d_eta_exit);
-        grad += &self.x_entry.t().dot(&d_nll_d_eta_entry);
+            if d > 0.0 {
+                let deriv = derivative_raw[i];
+                let safe_deriv = if deriv > derivative_guard {
+                    deriv
+                } else {
+                    derivative_guard
+                };
+                let inv_deriv = if deriv > derivative_guard {
+                    1.0 / deriv
+                } else {
+                    0.0
+                };
+                let d_row = self.x_derivative.row(i);
+                nll += -w * (eta_exit[i] + safe_deriv.ln());
 
-        let mut h = Array2::<f64>::zeros((p, p));
-        let w_exit = (&self.sample_weight * &dt * &hazard_exit) * 0.5;
-        let w_entry = (&self.sample_weight * &dt * &hazard_entry) * 0.5;
+                // Event contribution gradient: -x_exit - (1/deriv)*x_derivative
+                for j in 0..p {
+                    grad[j] += -w * (x_e[j] + inv_deriv * d_row[j]);
+                }
 
-        let mut wx_exit = self.x_exit.clone();
-        for (mut row, &wi) in wx_exit.axis_iter_mut(Axis(0)).zip(w_exit.iter()) {
-            row *= wi.sqrt();
+                // Event contribution Hessian from -log(deriv): + (1/deriv^2) d d^T
+                let inv_deriv_sq = inv_deriv * inv_deriv;
+                if inv_deriv_sq > 0.0 {
+                    for r in 0..p {
+                        let dr = d_row[r];
+                        for c in 0..p {
+                            h[[r, c]] += w * inv_deriv_sq * dr * d_row[c];
+                        }
+                    }
+                }
+            }
         }
-        let mut wx_entry = self.x_entry.clone();
-        for (mut row, &wi) in wx_entry.axis_iter_mut(Axis(0)).zip(w_entry.iter()) {
-            row *= wi.sqrt();
-        }
-        h += &wx_exit.t().dot(&wx_exit);
-        h += &wx_entry.t().dot(&wx_entry);
 
         let penalty_grad = self.penalties.gradient(beta);
         let penalty_hessian = self.penalties.hessian(p);
@@ -271,24 +315,28 @@ impl WorkingModelSurvival {
 
         h += &penalty_hessian;
         h += &mono_h;
+        const SURVIVAL_STABILIZATION_RIDGE: f64 = 1e-8;
+        let ridge_used = SURVIVAL_STABILIZATION_RIDGE;
         for d in 0..p {
-            h[[d, d]] += 1e-8;
+            h[[d, d]] += ridge_used;
         }
+        total_grad += &beta.mapv(|v| ridge_used * v);
+        let ridge_penalty = ridge_used * beta.dot(beta);
 
-        let mut deviance = 2.0 * (nll + penalty_dev + mono_dev);
+        let mut deviance = 2.0 * (nll + mono_dev);
         if matches!(self.spec, SurvivalSpec::Crude) {
             deviance *= 1.0;
         }
 
         Ok(WorkingState {
             eta: LinearPredictor::new(eta_exit),
-            gradient: total_grad * 2.0,
-            hessian: h * 2.0,
+            gradient: total_grad,
+            hessian: h,
             deviance,
-            penalty_term: penalty_dev,
+            penalty_term: penalty_dev + ridge_penalty,
             firth_log_det: None,
             firth_hat_diag: None,
-            ridge_used: 1e-8,
+            ridge_used,
         })
     }
 }

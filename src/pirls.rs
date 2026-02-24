@@ -5,6 +5,7 @@ use crate::faer_ndarray::{
     array2_to_mat_mut, fast_atv,
 };
 use crate::matrix::DesignMatrix;
+use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::{LikelihoodFamily, LinkFunction};
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use dyn_stack::{MemBuffer, MemStack};
@@ -1824,6 +1825,10 @@ fn sparse_from_dense_view(x: ArrayView2<f64>) -> Option<DesignMatrix> {
     if nrows == 0 || ncols == 0 {
         return None;
     }
+    // Narrow matrices are faster in dense form; avoid any sparsity scan overhead.
+    if ncols <= 32 {
+        return None;
+    }
 
     const ZERO_EPS: f64 = 1e-12;
     let total = nrows.saturating_mul(ncols);
@@ -1841,10 +1846,6 @@ fn sparse_from_dense_view(x: ArrayView2<f64>) -> Option<DesignMatrix> {
             }
         }
     }
-    if ncols <= 32 {
-        return None;
-    }
-
     let mut triplets = Vec::with_capacity(nnz);
     for (row_idx, row) in x.outer_iter().enumerate() {
         for (col_idx, &val) in row.iter().enumerate() {
@@ -1964,26 +1965,6 @@ pub fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64
 }
 
 /// Zero-allocation update of GLM working vectors using pre-allocated buffers.
-#[inline]
-fn normal_pdf(x: f64) -> f64 {
-    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    INV_SQRT_2PI * (-0.5 * x * x).exp()
-}
-
-#[inline]
-fn normal_cdf(x: f64) -> f64 {
-    // Abramowitz-Stegun style approximation with max abs error ~7.5e-8.
-    let z = x.abs();
-    let t = 1.0 / (1.0 + 0.231_641_9 * z);
-    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
-        - 0.356_563_782)
-        * t
-        + 0.319_381_530)
-        * t;
-    let cdf_pos = 1.0 - normal_pdf(z) * poly;
-    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
-}
-
 /// Zero-allocation update of GLM working vectors using pre-allocated buffers.
 #[inline]
 pub fn update_glm_vectors(
@@ -2024,7 +2005,7 @@ pub fn update_glm_vectors(
             let n = eta.len();
             for i in 0..n {
                 let e = eta[i].clamp(-30.0, 30.0);
-                let mu_i = normal_cdf(e).clamp(PROB_EPS, 1.0 - PROB_EPS);
+                let mu_i = normal_cdf_approx(e).clamp(PROB_EPS, 1.0 - PROB_EPS);
                 mu[i] = mu_i;
                 let dmu = normal_pdf(e).max(MIN_D_FOR_Z);
                 let variance = (mu_i * (1.0 - mu_i)).max(PROB_EPS);

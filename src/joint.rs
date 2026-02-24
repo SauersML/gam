@@ -25,6 +25,7 @@ use crate::construction::{
     stable_reparameterization_with_invariant_engine,
 };
 use crate::estimate::EstimationError;
+use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::LinkFunction;
 use crate::quadrature::QuadratureContext;
 use crate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
@@ -33,25 +34,6 @@ use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::cell::RefCell;
 use wolfe_bfgs::BfgsSolution;
-
-#[inline]
-fn normal_pdf_joint(x: f64) -> f64 {
-    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    INV_SQRT_2PI * (-0.5 * x * x).exp()
-}
-
-#[inline]
-fn normal_cdf_joint(x: f64) -> f64 {
-    let z = x.abs();
-    let t = 1.0 / (1.0 + 0.231_641_9 * z);
-    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
-        - 0.356_563_782)
-        * t
-        + 0.319_381_530)
-        * t;
-    let cdf_pos = 1.0 - normal_pdf_joint(z) * poly;
-    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
-}
 
 // NOTE on z standardization:
 // We standardize u = Xβ into z_raw = (u - min_u) / (max_u - min_u).
@@ -1323,9 +1305,9 @@ impl<'a> JointRemlState<'a> {
                 const MIN_DMU: f64 = 1e-6;
                 for i in 0..n {
                     let e = eta[i].clamp(-30.0, 30.0);
-                    let mu_i = normal_cdf_joint(e).clamp(PROB_EPS, 1.0 - PROB_EPS);
+                    let mu_i = normal_cdf_approx(e).clamp(PROB_EPS, 1.0 - PROB_EPS);
                     mu[i] = mu_i;
-                    let dmu = normal_pdf_joint(e).max(MIN_DMU);
+                    let dmu = normal_pdf(e).max(MIN_DMU);
                     let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
                     let w = ((dmu * dmu) / var).max(MIN_WEIGHT);
                     weights[i] = state.weights[i] * w;
@@ -3290,7 +3272,7 @@ pub fn predict_joint(
                     )
                 })
                 .collect::<Array1<f64>>(),
-            LinkFunction::Probit => eta_cal.mapv(normal_cdf_joint),
+            LinkFunction::Probit => eta_cal.mapv(normal_cdf_approx),
             LinkFunction::Identity => eta_cal.clone(),
         };
 
@@ -3298,7 +3280,7 @@ pub fn predict_joint(
     } else {
         let probs = match result.link {
             LinkFunction::Logit => eta_cal.mapv(|e| 1.0 / (1.0 + (-e).exp())),
-            LinkFunction::Probit => eta_cal.mapv(normal_cdf_joint),
+            LinkFunction::Probit => eta_cal.mapv(normal_cdf_approx),
             LinkFunction::Identity => eta_cal.clone(),
         };
         (probs, None)

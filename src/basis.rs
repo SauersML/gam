@@ -1,13 +1,11 @@
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use ahash::{AHashMap, AHasher};
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use rayon::prelude::ParallelSlice;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -94,13 +92,6 @@ pub enum BasisError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
-}
-
-/// Runtime statistics for the optional B-spline basis cache.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BasisCacheStats {
-    pub hits: u64,
-    pub misses: u64,
 }
 
 // ============================================================================
@@ -251,21 +242,9 @@ impl BasisOutputFormat for Dense {
         knot_vec: Array1<f64>,
     ) -> Result<(Self::Output, Array1<f64>), BasisError> {
         let knot_view = knot_vec.view();
-        let cache_key = if should_use_basis_cache(data.len(), degree) {
-            Some(make_cache_key(knot_view, degree, data, eval_kind.order()))
-        } else {
-            None
-        };
-
-        if let Some(key) = cache_key.as_ref() {
-            if let Some(cached) = global_basis_cache().get(key) {
-                return Ok((cached, knot_vec));
-            }
-        }
 
         let num_basis_functions = knot_view.len().saturating_sub(degree + 1);
         let basis_matrix = if should_use_sparse_basis(num_basis_functions, degree, 1) {
-            // Build sparse internally then convert to dense for cache parity
             let sparse = generate_basis_internal::<SparseStorage>(
                 data.view(),
                 knot_view,
@@ -278,12 +257,7 @@ impl BasisOutputFormat for Dense {
             generate_basis_internal::<DenseStorage>(data.view(), knot_view, degree, eval_kind)?
         };
 
-        let basis_arc = Arc::new(basis_matrix);
-        if let Some(key) = cache_key {
-            global_basis_cache().insert(key, Arc::clone(&basis_arc));
-        }
-
-        Ok((basis_arc, knot_vec))
+        Ok((Arc::new(basis_matrix), knot_vec))
     }
 }
 
@@ -331,270 +305,6 @@ pub fn baseline_lambda_seed(knot_vector: &Array1<f64>, degree: usize, penalty_or
     lambda.clamp(1e-6, 1e3)
 }
 
-const DEFAULT_BASIS_CACHE_CAPACITY: usize = 1_000;
-const BASIS_CACHE_MAX_POINTS: usize = 20_000;
-const BASIS_CACHE_MIN_DEGREE: usize = 2;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct BasisCacheKey {
-    knot_hash: u64,
-    degree: usize,
-    data_hash: u64,
-    derivative: usize,
-}
-
-#[derive(Debug)]
-struct BasisCacheInner {
-    map: AHashMap<BasisCacheKey, (Arc<Array2<f64>>, u64)>,
-    order: VecDeque<(BasisCacheKey, u64)>,
-    max_size: usize,
-    hits: u64,
-    misses: u64,
-    generation: u64,
-}
-
-impl BasisCacheInner {
-    fn new(max_size: usize) -> Self {
-        Self {
-            map: AHashMap::with_capacity(max_size.max(1)),
-            order: VecDeque::with_capacity(max_size.max(1)),
-            max_size,
-            hits: 0,
-            misses: 0,
-            generation: 0,
-        }
-    }
-
-    fn evict_one(&mut self) {
-        while let Some((candidate_key, candidate_gen)) = self.order.pop_front() {
-            match self.map.get(&candidate_key) {
-                Some((_, stored_gen)) if *stored_gen == candidate_gen => {
-                    self.map.remove(&candidate_key);
-                    break;
-                }
-                Some(_) => continue,
-                None => continue,
-            }
-        }
-    }
-
-    fn insert(&mut self, key: BasisCacheKey, basis: Arc<Array2<f64>>) {
-        if self.max_size == 0 {
-            return;
-        }
-
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-
-        self.order.push_back((key.clone(), generation));
-        self.map.insert(key, (basis, generation));
-
-        while self.map.len() > self.max_size {
-            self.evict_one();
-        }
-    }
-
-    fn set_max_size(&mut self, new_max: usize) {
-        self.max_size = new_max;
-        if self.max_size == 0 {
-            self.map.clear();
-            self.order.clear();
-            return;
-        }
-
-        while self.map.len() > self.max_size {
-            self.evict_one();
-        }
-
-        if self.order.capacity() < self.max_size {
-            self.order.reserve(self.max_size - self.order.capacity());
-        }
-    }
-}
-
-#[derive(Debug)]
-struct BasisCache {
-    inner: Mutex<BasisCacheInner>,
-}
-
-impl BasisCache {
-    fn new(max_size: usize) -> Self {
-        Self {
-            inner: Mutex::new(BasisCacheInner::new(max_size)),
-        }
-    }
-
-    fn get(&self, key: &BasisCacheKey) -> Option<Arc<Array2<f64>>> {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("basis cache mutex should not be poisoned");
-        if guard.map.contains_key(key) {
-            guard.hits = guard.hits.saturating_add(1);
-            guard.generation = guard.generation.wrapping_add(1);
-            let new_generation = guard.generation;
-            let basis_clone = {
-                let (basis, generation) = guard
-                    .map
-                    .get_mut(key)
-                    .expect("entry should exist after contains_key");
-                *generation = new_generation;
-                Arc::clone(basis)
-            };
-            guard.order.push_back((key.clone(), new_generation));
-            Some(basis_clone)
-        } else {
-            guard.misses = guard.misses.saturating_add(1);
-            None
-        }
-    }
-
-    fn insert(&self, key: BasisCacheKey, basis: Arc<Array2<f64>>) {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("basis cache mutex should not be poisoned");
-        guard.insert(key, basis);
-    }
-
-    fn clear(&self) {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("basis cache mutex should not be poisoned");
-        guard.map.clear();
-        guard.order.clear();
-        guard.hits = 0;
-        guard.misses = 0;
-        guard.generation = 0;
-    }
-
-    fn stats(&self) -> BasisCacheStats {
-        let guard = self
-            .inner
-            .lock()
-            .expect("basis cache mutex should not be poisoned");
-        BasisCacheStats {
-            hits: guard.hits,
-            misses: guard.misses,
-        }
-    }
-
-    fn set_max_size(&self, new_max: usize) {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("basis cache mutex should not be poisoned");
-        guard.set_max_size(new_max);
-    }
-}
-
-fn global_basis_cache() -> &'static BasisCache {
-    static CACHE: OnceLock<BasisCache> = OnceLock::new();
-    CACHE.get_or_init(|| BasisCache::new(DEFAULT_BASIS_CACHE_CAPACITY))
-}
-
-fn quantize_value(value: f64) -> i64 {
-    if value.is_nan() {
-        i64::MIN
-    } else {
-        let scaled = (value * 1e12).round();
-        if !scaled.is_finite() {
-            i64::MAX
-        } else {
-            let clamped = scaled.max(i64::MIN as f64).min(i64::MAX as f64);
-            clamped as i64
-        }
-    }
-}
-
-fn hash_array_view(view: ArrayView1<'_, f64>) -> u64 {
-    let mut hasher = AHasher::default();
-    for &value in view.iter() {
-        quantize_value(value).hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-fn hash_array_views(views: &[ArrayView1<'_, f64>]) -> u64 {
-    let mut hasher = AHasher::default();
-    for view in views {
-        view.len().hash(&mut hasher);
-        for &value in view.iter() {
-            quantize_value(value).hash(&mut hasher);
-        }
-    }
-    hasher.finish()
-}
-
-fn hash_usize_slice(values: &[usize]) -> u64 {
-    let mut hasher = AHasher::default();
-    values.len().hash(&mut hasher);
-    for &value in values {
-        value.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-fn make_cache_key(
-    knots: ArrayView1<'_, f64>,
-    degree: usize,
-    data: ArrayView1<'_, f64>,
-    derivative: usize,
-) -> BasisCacheKey {
-    BasisCacheKey {
-        knot_hash: hash_array_view(knots),
-        degree,
-        data_hash: hash_array_view(data),
-        derivative,
-    }
-}
-
-fn make_cache_key_multi(
-    knots: &[ArrayView1<'_, f64>],
-    degrees: &[usize],
-    data: &[ArrayView1<'_, f64>],
-    eval_kinds: &[BasisEvalKind],
-) -> BasisCacheKey {
-    let mut knot_hasher = AHasher::default();
-    let degree_hash = hash_usize_slice(degrees);
-    degree_hash.hash(&mut knot_hasher);
-    for kind in eval_kinds {
-        kind.order().hash(&mut knot_hasher);
-    }
-    for view in knots {
-        view.len().hash(&mut knot_hasher);
-        for &value in view.iter() {
-            quantize_value(value).hash(&mut knot_hasher);
-        }
-    }
-
-    let knot_hash = knot_hasher.finish();
-    let data_hash = hash_array_views(data);
-    BasisCacheKey {
-        knot_hash,
-        degree: degrees.len(),
-        data_hash,
-        derivative: 0,
-    }
-}
-
-fn should_use_basis_cache(data_len: usize, degree: usize) -> bool {
-    degree >= BASIS_CACHE_MIN_DEGREE && data_len <= BASIS_CACHE_MAX_POINTS
-}
-
-pub fn clear_basis_cache() {
-    global_basis_cache().clear();
-}
-
-pub fn set_basis_cache_max_size(max_size: usize) {
-    global_basis_cache().set_max_size(max_size);
-}
-
-pub fn basis_cache_stats() -> BasisCacheStats {
-    global_basis_cache().stats()
-}
-
 fn validate_knots_for_degree(
     knot_vector: ArrayView1<f64>,
     degree: usize,
@@ -636,16 +346,6 @@ pub enum BasisEvalKind {
     Basis,
     FirstDerivative,
     SecondDerivative,
-}
-
-impl BasisEvalKind {
-    fn order(self) -> usize {
-        match self {
-            BasisEvalKind::Basis => 0,
-            BasisEvalKind::FirstDerivative => 1,
-            BasisEvalKind::SecondDerivative => 2,
-        }
-    }
 }
 
 struct BasisEvalScratch {
@@ -973,25 +673,33 @@ impl BasisStorage for SparseStorage {
 
         let triplets: Vec<Triplet<usize, usize, f64>> =
             if let (true, Some(data_slice)) = (use_parallel, data.as_slice()) {
-                let triplet_chunks: Vec<Vec<Triplet<usize, usize, f64>>> = bspline_thread_pool()
-                    .install(|| {
+                const CHUNK_SIZE: usize = 1024;
+                let triplet_chunks: Vec<Vec<Triplet<usize, usize, f64>>> =
+                    bspline_thread_pool().install(|| {
                         data_slice
-                            .par_iter()
+                            .par_chunks(CHUNK_SIZE)
                             .enumerate()
                             .map_init(
                                 || (BasisEvalScratch::new(degree), vec![0.0; support]),
-                                |(scratch, values), (row_i, &x)| {
-                                    let mut local = Vec::with_capacity(support);
-                                    evaluate_bspline_row_entries(
-                                        x,
-                                        degree,
-                                        knot_view,
-                                        eval_kind,
-                                        num_basis_functions,
-                                        scratch,
-                                        values,
-                                        |col_j, v| local.push(Triplet::new(row_i, col_j, v)),
-                                    );
+                                |(scratch, values), (chunk_idx, chunk)| {
+                                    let base_row = chunk_idx * CHUNK_SIZE;
+                                    let mut local =
+                                        Vec::with_capacity(chunk.len().saturating_mul(support));
+                                    for (i, &x) in chunk.iter().enumerate() {
+                                        let row_i = base_row + i;
+                                        evaluate_bspline_row_entries(
+                                            x,
+                                            degree,
+                                            knot_view,
+                                            eval_kind,
+                                            num_basis_functions,
+                                            scratch,
+                                            values,
+                                            |col_j, v| {
+                                                local.push(Triplet::new(row_i, col_j, v))
+                                            },
+                                        );
+                                    }
                                     local
                                 },
                             )
@@ -1279,7 +987,9 @@ fn generate_basis_nd_sparse(
     const PAR_THRESHOLD: usize = 256;
     let triplets: Vec<Triplet<usize, usize, f64>> = if nrows >= PAR_THRESHOLD {
         bspline_thread_pool().install(|| {
-            (0..nrows)
+            const CHUNK_SIZE: usize = 1024;
+            let row_starts: Vec<usize> = (0..nrows).step_by(CHUNK_SIZE).collect();
+            row_starts
                 .into_par_iter()
                 .map_init(
                     || {
@@ -1293,24 +1003,29 @@ fn generate_basis_nd_sparse(
                             vec![0usize; dims],
                         )
                     },
-                    |(scratch, values, starts, indices), row_idx| {
-                        let mut local =
-                            Vec::with_capacity(supports.iter().fold(1usize, |acc, &s| acc * s));
-                        fill_tensor_row(
-                            row_idx,
-                            data,
-                            knot_vectors,
-                            degrees,
-                            eval_kinds,
-                            &num_basis,
-                            &supports,
-                            &strides,
-                            scratch,
-                            values,
-                            starts,
-                            indices,
-                            |_, col, value| local.push(Triplet::new(row_idx, col, value)),
+                    |(scratch, values, starts, indices), chunk_start| {
+                        let row_end = (chunk_start + CHUNK_SIZE).min(nrows);
+                        let per_row_nnz = supports.iter().fold(1usize, |acc, &s| acc * s);
+                        let mut local = Vec::with_capacity(
+                            row_end.saturating_sub(chunk_start).saturating_mul(per_row_nnz),
                         );
+                        for row_idx in chunk_start..row_end {
+                            fill_tensor_row(
+                                row_idx,
+                                data,
+                                knot_vectors,
+                                degrees,
+                                eval_kinds,
+                                &num_basis,
+                                &supports,
+                                &strides,
+                                scratch,
+                                values,
+                                starts,
+                                indices,
+                                |_, col, value| local.push(Triplet::new(row_idx, col, value)),
+                            );
+                        }
                         local
                     },
                 )
@@ -1354,20 +1069,6 @@ fn generate_basis_nd_sparse(
         .map_err(|err| BasisError::SparseCreation(format!("{err:?}")))
 }
 
-/// Creates a B-spline basis matrix using a pre-computed knot vector.
-/// This function is used during prediction to ensure exact reproduction of training basis.
-///
-/// # Arguments
-///
-/// * `data`: A 1D view of the data points to be transformed.
-/// * `knot_vector`: The knot vector to use for basis generation.
-/// * `degree`: The degree of the B-spline polynomials (e.g., 3 for cubic).
-///
-/// # Returns
-///
-/// On success, returns a `Result` containing a tuple `(Arc<Array2<f64>>, Array1<f64>)`:
-/// - The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
-/// - A copy of the **knot vector** used.
 /// Returns true if the B-spline basis should be built in sparse form based on density.
 pub fn should_use_sparse_basis(num_basis_cols: usize, degree: usize, dim: usize) -> bool {
     if num_basis_cols == 0 {
@@ -1404,31 +1105,8 @@ fn create_bspline_basis_nd_with_knots_internal(
     let knot_vecs: Vec<Array1<f64>> = knot_vectors.iter().map(|v| v.to_owned()).collect();
     let knot_views: Vec<ArrayView1<'_, f64>> = knot_vecs.iter().map(|v| v.view()).collect();
 
-    let cache_key = if degrees
-        .iter()
-        .copied()
-        .max()
-        .map(|d| should_use_basis_cache(data[0].len(), d))
-        .unwrap_or(false)
-    {
-        Some(make_cache_key_multi(&knot_views, degrees, data, eval_kinds))
-    } else {
-        None
-    };
-
-    if let Some(key) = cache_key.as_ref()
-        && let Some(cached) = global_basis_cache().get(key)
-    {
-        return Ok((cached, knot_vecs));
-    }
-
     let basis_matrix = generate_basis_nd_dense(data, &knot_views, degrees, eval_kinds)?;
-    let basis_arc = Arc::new(basis_matrix);
-    if let Some(key) = cache_key {
-        global_basis_cache().insert(key, Arc::clone(&basis_arc));
-    }
-
-    Ok((basis_arc, knot_vecs))
+    Ok((Arc::new(basis_matrix), knot_vecs))
 }
 
 /// Creates a multi-dimensional tensor-product B-spline basis using pre-computed knot vectors.
@@ -3305,45 +2983,6 @@ mod tests {
                 (sum - 1.0).abs() < 1e-9,
                 "Basis at evaluation points did not sum to 1, got {}",
                 sum
-            );
-        }
-    }
-
-    #[test]
-    fn test_basis_cache_returns_identical_results() {
-        clear_basis_cache();
-
-        let data = Array::linspace(0.0, 1.0, 25);
-        let (fresh_basis, knots) = create_basis::<Dense>(
-            data.view(),
-            KnotSource::Generate {
-                data_range: (0.0, 1.0),
-                num_internal_knots: 5,
-            },
-            3,
-            BasisOptions::value(),
-        )
-        .expect("fresh basis");
-
-        let (cached_basis, _) = create_basis::<Dense>(
-            data.view(),
-            KnotSource::Provided(knots.view()),
-            3,
-            BasisOptions::value(),
-        )
-        .expect("cached basis");
-
-        assert_abs_diff_eq!(
-            fresh_basis.as_slice().unwrap(),
-            cached_basis.as_slice().unwrap(),
-            epsilon = 1e-14
-        );
-
-        let stats = basis_cache_stats();
-        if stats.misses > 0 || stats.hits > 0 {
-            assert!(
-                stats.misses >= 1 && stats.hits >= 1,
-                "basis cache should register at least one miss and one hit after reuse"
             );
         }
     }

@@ -34,6 +34,7 @@ use crate::construction::{
 };
 use crate::matrix::DesignMatrix;
 use crate::pirls::{self, PirlsResult};
+use crate::probability::normal_cdf_approx;
 use crate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
 use crate::types::{
     Coefficients, LinkFunction, LogSmoothingParams, LogSmoothingParamsView,
@@ -1396,21 +1397,6 @@ pub struct PredictResult {
     pub mean: Array1<f64>,
 }
 
-#[inline]
-fn normal_cdf_predict(x: f64) -> f64 {
-    let z = x.clamp(-30.0, 30.0).abs();
-    let t = 1.0 / (1.0 + 0.231_641_9 * z);
-    let inv_sqrt_2pi = 0.398_942_280_401_432_7;
-    let pdf = inv_sqrt_2pi * (-0.5 * z * z).exp();
-    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
-        - 0.356_563_782)
-        * t
-        + 0.319_381_530)
-        * t;
-    let cdf_pos = 1.0 - pdf * poly;
-    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
-}
-
 /// Canonical engine entrypoint for external designs.
 /// Likelihood dispatch is determined exclusively by `family`.
 pub fn fit_gam<X>(
@@ -1500,7 +1486,7 @@ where
                 1.0 / (1.0 + (-z).exp())
             })
         }
-        crate::types::LikelihoodFamily::BinomialProbit => eta.mapv(normal_cdf_predict),
+        crate::types::LikelihoodFamily::BinomialProbit => eta.mapv(normal_cdf_approx),
         crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
     };
 

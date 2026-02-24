@@ -1,22 +1,9 @@
 use gam::pirls::update_glm_vectors_by_family;
+use gam::probability::normal_cdf_approx;
 use gam::{FitOptions, LikelihoodFamily, fit_gam, predict_gam};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-
-fn normal_cdf(x: f64) -> f64 {
-    let z = x.abs();
-    let t = 1.0 / (1.0 + 0.231_641_9 * z);
-    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
-        - 0.356_563_782)
-        * t
-        + 0.319_381_530)
-        * t;
-    let inv_sqrt_2pi = 0.398_942_280_401_432_7;
-    let pdf = inv_sqrt_2pi * (-0.5 * z * z).exp();
-    let cdf_pos = 1.0 - pdf * poly;
-    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
-}
 
 #[test]
 fn probit_fit_and_predict_fast_integration() {
@@ -28,7 +15,7 @@ fn probit_fit_and_predict_fast_integration() {
     for i in 0..n {
         let xi = -2.0 + 4.0 * (i as f64) / (n as f64 - 1.0);
         let eta = -0.3 + 1.1 * xi;
-        let p = normal_cdf(eta).clamp(1e-8, 1.0 - 1e-8);
+        let p = normal_cdf_approx(eta).clamp(1e-8, 1.0 - 1e-8);
         x[[i, 0]] = 1.0;
         x[[i, 1]] = xi;
         y[i] = if rng.random::<f64>() < p { 1.0 } else { 0.0 };

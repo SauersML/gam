@@ -17,6 +17,7 @@ pub mod hull;
 pub mod joint;
 pub mod matrix;
 pub mod pirls;
+pub mod probability;
 pub mod quadrature;
 pub mod seeding;
 pub mod smooth;
