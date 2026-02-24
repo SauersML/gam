@@ -36,7 +36,7 @@ use crate::construction::{
 use crate::construction::TrainingData;
 use crate::hull::build_peeled_hull;
 use crate::matrix::DesignMatrix;
-use crate::model::{ModelConfig, TrainedModel};
+use crate::types::ModelConfig;
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
 use crate::types::{
@@ -2744,7 +2744,7 @@ pub fn train_survival_model(
         firth_bias_reduction: config.firth_bias_reduction
             && matches!(
                 config.model_family,
-                crate::model::ModelFamily::Gam(LinkFunction::Logit)
+                crate::types::ModelFamily::Gam(LinkFunction::Logit)
             ),
     };
 
@@ -3426,7 +3426,7 @@ where
     }
 
     use crate::construction::compute_penalty_square_roots;
-    use crate::model::ModelConfig;
+    use crate::types::ModelConfig;
 
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "optimize_external_design")?;
@@ -4016,7 +4016,7 @@ where
     let p = x.ncols();
     validate_full_size_penalties(s_list, p, "evaluate_external_gradients")?;
 
-    use crate::model::ModelConfig;
+    use crate::types::ModelConfig;
 
     let (link, firth_active) = resolve_external_family(opts.family)?;
     let cfg = ModelConfig::external(link, opts.tol, opts.max_iter, firth_active);
@@ -4075,7 +4075,7 @@ where
     let p = x.ncols();
     validate_full_size_penalties(s_list, p, "evaluate_external_cost_and_ridge")?;
 
-    use crate::model::ModelConfig;
+    use crate::types::ModelConfig;
 
     let (link, firth_active) = resolve_external_family(opts.family)?;
     let cfg = ModelConfig::external(link, opts.tol, opts.max_iter, firth_active);
@@ -8098,7 +8098,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
-                reml_parallel_threshold: crate::model::default_reml_parallel_threshold(),
+                reml_parallel_threshold: crate::types::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,

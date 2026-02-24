@@ -5,7 +5,7 @@ use crate::faer_ndarray::{
     array2_to_mat_mut, fast_ata_into, fast_atv, fast_atv_into,
 };
 use crate::matrix::DesignMatrix;
-use crate::model::{ModelConfig, ModelFamily};
+use crate::types::{ModelConfig, ModelFamily};
 use crate::types::{LikelihoodFamily, LinkFunction};
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use dyn_stack::{MemBuffer, MemStack};
@@ -2750,7 +2750,7 @@ mod tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
             firth_bias_reduction: matches!(link_function, LinkFunction::Logit),
-            reml_parallel_threshold: crate::model::default_reml_parallel_threshold(),
+            reml_parallel_threshold: crate::types::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 5,
                 degree: 3,
@@ -3400,7 +3400,7 @@ mod tests {
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
             firth_bias_reduction: false,
-            reml_parallel_threshold: crate::model::default_reml_parallel_threshold(),
+            reml_parallel_threshold: crate::types::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -3540,7 +3540,7 @@ mod tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
             firth_bias_reduction: true,
-            reml_parallel_threshold: crate::model::default_reml_parallel_threshold(),
+            reml_parallel_threshold: crate::types::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 5,
                 degree: 3,
@@ -3679,7 +3679,7 @@ mod tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
             firth_bias_reduction: true,
-            reml_parallel_threshold: crate::model::default_reml_parallel_threshold(),
+            reml_parallel_threshold: crate::types::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 5,
                 degree: 3,

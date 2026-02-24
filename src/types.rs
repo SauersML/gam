@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
 pub use crate::hull::PeeledHull;
-pub use crate::model::JointLinkModel;
+use crate::survival::SurvivalSpec;
 
 /// Shared engine-level link selector for generalized models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +18,84 @@ pub enum LikelihoodFamily {
     GaussianIdentity,
     BinomialLogit,
     RoystonParmar,
+}
+
+/// Engine-level model family selector used by internal solver pipelines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelFamily {
+    Gam(LinkFunction),
+    Survival(SurvivalSpec),
+}
+
+pub fn default_reml_parallel_threshold() -> usize {
+    4
+}
+
+pub fn default_mcmc_enabled() -> bool {
+    true
+}
+
+/// Engine-only optimizer configuration.
+/// This intentionally excludes any domain feature configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub model_family: ModelFamily,
+    pub convergence_tolerance: f64,
+    pub max_iterations: usize,
+    pub reml_convergence_tolerance: f64,
+    pub reml_max_iterations: u64,
+    #[serde(default)]
+    pub firth_bias_reduction: bool,
+    #[serde(default = "default_reml_parallel_threshold")]
+    pub reml_parallel_threshold: usize,
+    #[serde(default = "default_mcmc_enabled")]
+    pub mcmc_enabled: bool,
+}
+
+impl ModelConfig {
+    pub fn external(
+        link: LinkFunction,
+        reml_tol: f64,
+        reml_max_iter: usize,
+        firth_bias_reduction: bool,
+    ) -> Self {
+        Self {
+            model_family: ModelFamily::Gam(link),
+            convergence_tolerance: reml_tol,
+            max_iterations: 500,
+            reml_convergence_tolerance: reml_tol,
+            reml_max_iterations: reml_max_iter as u64,
+            firth_bias_reduction,
+            reml_parallel_threshold: default_reml_parallel_threshold(),
+            mcmc_enabled: true,
+        }
+    }
+
+    pub fn link_function(&self) -> Result<LinkFunction, &'static str> {
+        match self.model_family {
+            ModelFamily::Gam(link) => Ok(link),
+            ModelFamily::Survival(_) => {
+                Err("link_function is not applicable for survival model family")
+            }
+        }
+    }
+
+    pub fn survival_spec(&self) -> Option<SurvivalSpec> {
+        match self.model_family {
+            ModelFamily::Gam(_) => None,
+            ModelFamily::Survival(spec) => Some(spec),
+        }
+    }
+}
+
+/// Optional joint single-index link data for calibrated predictions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JointLinkModel {
+    pub knot_range: (f64, f64),
+    pub knot_vector: Array1<f64>,
+    pub link_transform: ndarray::Array2<f64>,
+    pub beta_link: Array1<f64>,
+    pub degree: usize,
 }
 
 #[repr(transparent)]
