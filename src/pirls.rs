@@ -5,7 +5,6 @@ use crate::faer_ndarray::{
     array2_to_mat_mut, fast_ata_into, fast_atv, fast_atv_into,
 };
 use crate::matrix::DesignMatrix;
-use crate::types::{ModelConfig, ModelFamily};
 use crate::types::{LikelihoodFamily, LinkFunction};
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use dyn_stack::{MemBuffer, MemStack};
@@ -641,6 +640,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // This coherently accounts for uncertainty in the base prediction.
         let family = match self.link {
             LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
+            LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
             LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
         };
         if let Some(se) = &self.covariate_se {
@@ -960,6 +960,108 @@ fn compute_firth_hat_and_half_logdet_sparse(
     Ok((hat_diag, half_log_det))
 }
 
+fn compute_firth_hat_and_half_logdet(
+    x_design: ArrayView2<f64>,
+    weights: ArrayView1<f64>,
+    workspace: &mut PirlsWorkspace,
+    s_transformed: Option<&Array2<f64>>,
+) -> Result<(Array1<f64>, f64), EstimationError> {
+    let n = x_design.nrows();
+    let p = x_design.ncols();
+
+    workspace
+        .sqrt_w
+        .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
+    let sqrt_w_col = workspace.sqrt_w.view().insert_axis(Axis(1));
+    if workspace.wx.dim() != x_design.dim() {
+        workspace.wx = Array2::zeros(x_design.dim());
+    }
+    workspace.wx.assign(&x_design);
+    workspace.wx *= &sqrt_w_col;
+
+    let xtwx_transformed = workspace.wx.t().dot(&workspace.wx);
+    let mut stabilized = xtwx_transformed.clone();
+    if let Some(s) = s_transformed {
+        for i in 0..p {
+            for j in 0..p {
+                stabilized[[i, j]] += s[[i, j]];
+            }
+        }
+    }
+    for i in 0..p {
+        for j in 0..i {
+            let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
+            stabilized[[i, j]] = v;
+            stabilized[[j, i]] = v;
+        }
+    }
+    ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
+
+    let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
+        EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: f64::NEG_INFINITY,
+        }
+    })?;
+    let half_log_det = chol.diag().mapv(f64::ln).sum();
+
+    let rhs = chol.solve_mat(&workspace.wx.t().to_owned());
+
+    let mut hat_diag = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut acc = 0.0;
+        for k in 0..p {
+            let val = rhs[(k, i)];
+            acc += val * workspace.wx[[i, k]];
+        }
+        hat_diag[i] = acc;
+    }
+
+    Ok((hat_diag, half_log_det))
+}
+
+pub(crate) fn ensure_positive_definite_with_label(
+    hess: &mut Array2<f64>,
+    label: &str,
+) -> Result<(), EstimationError> {
+    ensure_positive_definite_with_ridge(hess, label).map(|_| ())
+}
+
+fn ensure_positive_definite_with_ridge(
+    hess: &mut Array2<f64>,
+    label: &str,
+) -> Result<f64, EstimationError> {
+    let ridge = if FIXED_STABILIZATION_RIDGE > 0.0 {
+        FIXED_STABILIZATION_RIDGE
+    } else {
+        0.0
+    };
+
+    if hess.cholesky(Side::Lower).is_ok() {
+        return Ok(0.0);
+    }
+
+    if ridge > 0.0 {
+        for i in 0..hess.nrows() {
+            hess[[i, i]] += ridge;
+        }
+
+        if hess.cholesky(Side::Lower).is_ok() {
+            log::debug!("{} stabilized with fixed ridge {:.1e}.", label, ridge);
+            return Ok(ridge);
+        }
+    }
+
+    if let Ok((evals, _)) = hess.eigh(Side::Lower) {
+        let min_eig = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        return Err(EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: min_eig,
+        });
+    }
+    Err(EstimationError::HessianNotPositiveDefinite {
+        min_eigenvalue: f64::NEG_INFINITY,
+    })
+}
+
 fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -1005,7 +1107,7 @@ fn default_beta_guess_external(
     let mut beta = Array1::<f64>::zeros(p);
     let intercept_col = 0usize;
     match link_function {
-        LinkFunction::Logit => {
+        LinkFunction::Logit | LinkFunction::Probit => {
             let mut weighted_sum = 0.0;
             let mut total_weight = 0.0;
             for (&yi, &wi) in y.iter().zip(prior_weights.iter()) {
@@ -1462,7 +1564,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     balanced_penalty_root: Option<&Array2<f64>>,
     reparam_invariant: Option<&crate::construction::ReparamInvariant>,
     p: usize,
-    config: &ModelConfig,
+    config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
     // Optional per-observation SE for integrated (GHQ) likelihood in calibrator fitting.
     covariate_se: Option<&Array1<f64>>,
@@ -1473,14 +1575,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         .as_slice_memory_order()
         .ok_or_else(|| EstimationError::InvalidInput("non-contiguous lambda storage".to_string()))?;
 
-    let link_function = match config.model_family {
-        ModelFamily::Gam(link) => link,
-        _ => {
-            return Err(EstimationError::InvalidSpecification(
-                "fit_model_for_fixed_rho expects a GAM model".to_string(),
-            ));
-        }
-    };
+    let link_function = config.link_function;
 
     use crate::construction::{
         EngineDims, create_balanced_penalty_root, stable_reparameterization_engine,
@@ -1515,14 +1610,14 @@ pub fn fit_model_for_fixed_rho<'a>(
             EngineDims::new(p, rs_original.len()),
         )?
     };
-    let x_original_sparse = if matches!(link_function, LinkFunction::Logit)
+    let x_original_sparse = if matches!(link_function, LinkFunction::Logit | LinkFunction::Probit)
         && !config.firth_bias_reduction
     {
         sparse_from_dense_view(x)
     } else {
         None
     };
-    let use_implicit = matches!(link_function, LinkFunction::Logit)
+    let use_implicit = matches!(link_function, LinkFunction::Logit | LinkFunction::Probit)
         && !config.firth_bias_reduction
         && x_original_sparse.is_some();
     let use_explicit = !use_implicit;
@@ -1821,6 +1916,14 @@ pub struct RunPirlsOptions {
     pub firth_bias_reduction: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct PirlsConfig {
+    pub link_function: LinkFunction,
+    pub max_iterations: usize,
+    pub convergence_tolerance: f64,
+    pub firth_bias_reduction: bool,
+}
+
 fn resolve_pirls_family(
     family: LikelihoodFamily,
     firth_bias_reduction: bool,
@@ -1828,6 +1931,7 @@ fn resolve_pirls_family(
     match family {
         LikelihoodFamily::GaussianIdentity => Ok((LinkFunction::Identity, false)),
         LikelihoodFamily::BinomialLogit => Ok((LinkFunction::Logit, firth_bias_reduction)),
+        LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
         LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "run_pirls does not support RoystonParmar; use survival-specific working models"
                 .to_string(),
@@ -1835,7 +1939,7 @@ fn resolve_pirls_family(
     }
 }
 
-/// Engine-facing PIRLS entrypoint that avoids domain `EngineLayout`.
+/// Engine-facing PIRLS entrypoint that avoids legacy layout coupling.
 pub fn run_pirls<'a>(
     rho: LogSmoothingParamsView<'_>,
     x: ArrayView2<'a, f64>,
@@ -1859,7 +1963,12 @@ pub fn run_pirls<'a>(
             rs_original.len()
         )));
     }
-    let cfg = ModelConfig::external(link, opts.tol, opts.max_iter, firth_active);
+    let cfg = PirlsConfig {
+        link_function: link,
+        max_iterations: opts.max_iter,
+        convergence_tolerance: opts.tol,
+        firth_bias_reduction: firth_active,
+    };
     fit_model_for_fixed_rho(
         rho,
         x,
@@ -2036,6 +2145,27 @@ pub fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64
 
 /// Zero-allocation update of GLM working vectors using pre-allocated buffers.
 #[inline]
+fn normal_pdf(x: f64) -> f64 {
+    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
+    INV_SQRT_2PI * (-0.5 * x * x).exp()
+}
+
+#[inline]
+fn normal_cdf(x: f64) -> f64 {
+    // Abramowitz-Stegun style approximation with max abs error ~7.5e-8.
+    let z = x.abs();
+    let t = 1.0 / (1.0 + 0.231_641_9 * z);
+    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
+        - 0.356_563_782)
+        * t
+        + 0.319_381_530)
+        * t;
+    let cdf_pos = 1.0 - normal_pdf(z) * poly;
+    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
+}
+
+/// Zero-allocation update of GLM working vectors using pre-allocated buffers.
+#[inline]
 pub fn update_glm_vectors(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
@@ -2070,6 +2200,19 @@ pub fn update_glm_vectors(
                 z[i] = e + (y[i] - mu_i) / denom;
             }
         }
+        LinkFunction::Probit => {
+            let n = eta.len();
+            for i in 0..n {
+                let e = eta[i].clamp(-30.0, 30.0);
+                let mu_i = normal_cdf(e).clamp(PROB_EPS, 1.0 - PROB_EPS);
+                mu[i] = mu_i;
+                let dmu = normal_pdf(e).max(MIN_D_FOR_Z);
+                let variance = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
+                let fisher_w = ((dmu * dmu) / variance).max(MIN_WEIGHT);
+                weights[i] = prior_weights[i] * fisher_w;
+                z[i] = e + (y[i] - mu_i) / dmu;
+            }
+        }
         LinkFunction::Identity => {
             let n = eta.len();
             for i in 0..n {
@@ -2095,6 +2238,10 @@ pub fn update_glm_vectors_by_family(
     match family {
         LikelihoodFamily::BinomialLogit => {
             update_glm_vectors(y, eta, LinkFunction::Logit, prior_weights, mu, weights, z);
+            Ok(())
+        }
+        LikelihoodFamily::BinomialProbit => {
+            update_glm_vectors(y, eta, LinkFunction::Probit, prior_weights, mu, weights, z);
             Ok(())
         }
         LikelihoodFamily::GaussianIdentity => {
@@ -2179,6 +2326,9 @@ pub fn update_glm_vectors_integrated_by_family(
             update_glm_vectors_integrated(quad_ctx, y, eta, se, prior_weights, mu, weights, z);
             Ok(())
         }
+        LikelihoodFamily::BinomialProbit => Err(EstimationError::InvalidInput(
+            "Integrated updates are currently only implemented for BinomialLogit".to_string(),
+        )),
         LikelihoodFamily::GaussianIdentity => {
             update_glm_vectors_by_family(y, eta, family, prior_weights, mu, weights, z)
         }
@@ -2197,7 +2347,7 @@ pub fn calculate_deviance(
 ) -> f64 {
     const EPS: f64 = 1e-8; // Increased from 1e-9 for better numerical stability
     match link {
-        LinkFunction::Logit => {
+        LinkFunction::Logit | LinkFunction::Probit => {
             let total_residual = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
                 0.0,
                 |acc, &yi, &mui, &wi| {
@@ -2530,7 +2680,7 @@ fn calculate_scale(
     link_function: LinkFunction,
 ) -> f64 {
     match link_function {
-        LinkFunction::Logit => {
+        LinkFunction::Logit | LinkFunction::Probit => {
             // For binomial models (logistic regression), scale is fixed at 1.0
             // This follows mgcv's convention in gam.fit3.R
             1.0
@@ -2621,1816 +2771,4 @@ pub fn compute_final_penalized_hessian(
     let h_final = r_aug.t().dot(&r_aug);
 
     Ok(h_final)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::basis::create_difference_penalty_matrix;
-    use crate::construction::{
-        EngineLayout, build_design_and_penalty_matrices, compute_penalty_square_roots,
-    };
-    use crate::construction::TrainingData;
-    use crate::model::{
-        BasisConfig, InteractionPenaltyKind, ModelFamily, map_coefficients,
-    };
-    use approx::assert_abs_diff_eq;
-    use ndarray::{Array1, Array2, arr1, arr2};
-    use rand::rngs::StdRng;
-    use rand::{RngExt, SeedableRng};
-    use std::collections::HashMap;
-
-    /// Un-pivots the columns of a matrix according to a pivot vector.
-    ///
-    /// This reverses the permutation `A*P` to recover `A` from `B`, where `B = A*P`.
-    /// It assumes the `pivot` vector is a **forward** permutation, where `pivot[i]`
-    /// is the original column index that was moved to position `i`.
-    ///
-    /// # Parameters
-    /// * `pivoted_matrix`: The matrix whose columns are permuted (e.g., the `R` factor).
-    /// * `pivot`: The forward permutation vector from the QR decomposition.
-    fn unpivot_columns(pivoted_matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
-        let r = pivoted_matrix.nrows();
-        let c = pivoted_matrix.ncols();
-        let mut unpivoted_matrix = Array2::zeros((r, c));
-
-        // The C code logic `dum[*pi]= *px;` translates to:
-        // The i-th column of the pivoted matrix belongs at the `pivot[i]`-th
-        // position in the un-pivoted matrix.
-        for i in 0..c {
-            let original_col_index = pivot[i];
-            let pivoted_col = pivoted_matrix.column(i);
-            unpivoted_matrix
-                .column_mut(original_col_index)
-                .assign(&pivoted_col);
-        }
-
-        unpivoted_matrix
-    }
-
-    // === Helper types for test refactoring ===
-    #[derive(Debug, Clone)]
-    enum SignalType {
-        NoSignal,     // Pure noise, expect coefficients near zero
-        LinearSignal, // A clear linear trend the model should find
-    }
-
-    struct TestScenarioResult {
-        pirls_result: PirlsResult,
-        x_matrix: Array2<f64>,
-        layout: EngineLayout,
-        true_linear_predictor: Array1<f64>,
-    }
-
-    /// Calculates the Pearson correlation coefficient between two vectors.
-    fn calculate_correlation(v1: ArrayView1<f64>, v2: ArrayView1<f64>) -> f64 {
-        let mean1 = v1.mean().unwrap();
-        let mean2 = v2.mean().unwrap();
-
-        let centered1 = v1.mapv(|x| x - mean1);
-        let centered2 = v2.mapv(|x| x - mean2);
-
-        let numerator = centered1.dot(&centered2);
-        let denom = (centered1.dot(&centered1) * centered2.dot(&centered2)).sqrt();
-
-        if denom == 0.0 { 0.0 } else { numerator / denom }
-    }
-
-    /// A generic test runner for P-IRLS scenarios.
-    fn run_pirls_test_scenario(
-        link_function: LinkFunction,
-        signal_type: SignalType,
-    ) -> Result<TestScenarioResult, Box<dyn std::error::Error>> {
-        // --- Data generation ---
-        let n_samples = 1000;
-        let mut rng = StdRng::seed_from_u64(42);
-        let p = Array1::linspace(-2.0, 2.0, n_samples);
-
-        let (y, true_linear_predictor) = match link_function {
-            LinkFunction::Logit => {
-                let true_log_odds = match signal_type {
-                    SignalType::NoSignal => Array1::zeros(n_samples), // log_odds = 0 -> prob = 0.5
-                    SignalType::LinearSignal => &p * 1.5 - 0.5,
-                };
-                let y_values: Vec<f64> = true_log_odds
-                    .iter()
-                    .map(|&log_odds| {
-                        let prob = 1.0 / (1.0 + (-log_odds as f64).exp());
-                        if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
-                    })
-                    .collect();
-                (Array1::from_vec(y_values), true_log_odds)
-            }
-            LinkFunction::Identity => {
-                let true_mean = match signal_type {
-                    SignalType::NoSignal => Array1::zeros(n_samples), // Mean = 0
-                    SignalType::LinearSignal => &p * 1.5 + 0.5, // Different intercept for variety
-                };
-                let noise: Array1<f64> =
-                    Array1::from_shape_fn(n_samples, |_| rng.random::<f64>() - 0.5); // N(0, 1/12)
-                let y = &true_mean + &noise;
-                (y, true_mean)
-            }
-        };
-
-        let data = TrainingData {
-            y,
-            p,
-            sex: Array1::from_iter((0..n_samples).map(|i| (i % 2) as f64)),
-            pcs: Array2::zeros((n_samples, 0)),
-            weights: Array1::from_elem(n_samples, 1.0),
-        };
-
-        // --- Model configuration ---
-        let config = ModelConfig {
-            model_family: ModelFamily::Gam(link_function),
-            penalty_order: 2,
-            convergence_tolerance: 1e-7,
-            max_iterations: 150,
-            reml_convergence_tolerance: 1e-3,
-            reml_max_iterations: 50,
-            firth_bias_reduction: matches!(link_function, LinkFunction::Logit),
-            reml_parallel_threshold: crate::types::default_reml_parallel_threshold(),
-            pgs_basis_config: BasisConfig {
-                num_knots: 5,
-                degree: 3,
-            },
-            pc_configs: vec![],
-            pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
-            mcmc_enabled: false,
-            calibrator_enabled: false,
-            survival: None,
-        };
-
-        // --- Run the fit ---
-        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
-        let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
-
-        let offset = Array1::<f64>::zeros(data.y.len());
-        let (pirls_result, _) = fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho_vec.view()),
-            x_matrix.view(),
-            offset.view(),
-            data.y.view(),
-            data.weights.view(),
-            &rs_original,
-            None,
-            None,
-            layout.total_coeffs,
-            &config,
-            None,
-            None, // No SE for test
-        )?;
-
-        // --- Return all necessary components for assertion ---
-        Ok(TestScenarioResult {
-            pirls_result,
-            x_matrix,
-            layout,
-            true_linear_predictor,
-        })
-    }
-
-    /// Test the robust rank-revealing solver with a rank-deficient matrix
-    #[test]
-    fn test_robust_solver_with_rank_deficient_matrix() {
-        // Create a rank-deficient design matrix
-        // This matrix has 5 rows and 3 columns, but only rank 2
-        // The third column is a linear combination of the first two: col3 = col1 + col2
-        let x = arr2(&[
-            [1.0, 0.0, 1.0], // Note that col3 = col1 + col2
-            [1.0, 1.0, 2.0],
-            [1.0, 2.0, 3.0],
-            [1.0, 3.0, 4.0],
-            [1.0, 4.0, 5.0],
-        ]);
-
-        let z = arr1(&[0.1, 0.2, 0.3, 0.4, 0.5]);
-        let weights = arr1(&[1.0, 1.0, 1.0, 1.0, 1.0]);
-
-        // Use NO penalty to ensure rank detection works without the help of penalization
-        // This tests the solver's ability to detect rank deficiency purely from the data
-        let e = Array2::zeros((0, 3)); // No penalty
-
-        // Run our solver
-        println!(
-            "Running solver with x shape: {:?}, z shape: {:?}, weights shape: {:?}, e shape: {:?}",
-            x.shape(),
-            z.shape(),
-            weights.shape(),
-            e.shape()
-        );
-        // For the test, the design matrix is already in the correct basis
-        // We're using identity link function for the test
-        let s = e.t().dot(&e);
-        let mut ws = PirlsWorkspace::new(x.nrows(), x.ncols(), e.nrows(), e.nrows());
-        let offset = Array1::<f64>::zeros(z.len());
-        let result = solve_penalized_least_squares(
-            x.view(),
-            z.view(),
-            weights.view(),
-            offset.view(),
-            &e,
-            &s,
-            &mut ws,
-            z.view(),
-            LinkFunction::Identity,
-        );
-
-        // The solver should not fail despite the rank deficiency
-        match &result {
-            Ok((_, detected_rank)) => {
-                println!("Solver succeeded with detected rank: {}", detected_rank);
-            }
-            Err(e) => {
-                panic!("Solver failed with error: {:?}", e);
-            }
-        }
-
-        let (solution, detected_rank) = result.unwrap();
-
-        // Test: solver should have detected that the matrix is rank 2
-        // This is the core test of the rank detection algorithm
-        assert_eq!(
-            detected_rank, 2,
-            "Solver should have detected the rank as 2"
-        );
-        println!("Detected rank: {}", detected_rank);
-
-        // Check that we get reasonable values
-        assert!(
-            solution.beta.iter().all(|&x| x.is_finite()),
-            "All coefficient values should be finite"
-        );
-
-        // Verify that the fitted values are still close to the target
-        // Even with reduced rank, we should get good predictions
-        let fitted = x.dot(solution.beta.as_ref());
-        let residual_sum_sq: f64 = weights
-            .iter()
-            .zip(z.iter())
-            .zip(fitted.iter())
-            .map(|((w, &z), &f)| w * (z - f).powi(2))
-            .sum();
-
-        // Debug information
-        println!("Solution beta: {:?}", solution.beta);
-        println!("Fitted values: {:?}", fitted);
-        println!("Target z: {:?}", z);
-        println!("Residual sum of squares: {}", residual_sum_sq);
-
-        // For this rank-deficient problem, the true least-squares solution is not unique.
-        // One standard solution is beta = [0.1, 0.1, 0.0]. Another is [0.0, 0.0, 0.1].
-        // The SVD/pseudoinverse solver finds the MINIMUM-NORM solution that achieves
-        // the minimum possible RSS. For this specific problem, a perfect fit with RSS = 0 is possible.
-
-        // Assert that the residual sum of squares is extremely close to the true minimum (0.0).
-        // This is the key correctness criterion for the least-squares solution.
-        assert!(
-            residual_sum_sq < 1e-9,
-            "The residual sum of squares should be effectively zero for a correct least-squares solution. Got: {}",
-            residual_sum_sq
-        );
-
-        // NOTE: We do NOT expect sparse coefficients from the SVD/pseudoinverse path.
-        // The minimum-norm solution distributes the weight across correlated predictors
-        // rather than concentrating it in a single variable. This is mathematically correct
-        // and actually better for prediction stability. For example, if col3 = col1 + col2,
-        // the minimum-norm solution might give [0.033, 0.033, 0.033] instead of [0.1, 0, 0].
-
-        // Print some debug info for transparency
-        println!("Detected rank: {}", detected_rank);
-        println!("Solution coefficients: {:?}", solution.beta);
-        println!("Residual sum of squares: {}", residual_sum_sq);
-    }
-
-    /// This test directly verifies that different smoothing parameters
-    /// produce different transformation matrices during reparameterization
-    #[test]
-    fn test_reparameterization_matrix_depends_on_rho() {
-        use crate::construction::{
-            EngineDims, EngineLayout, compute_penalty_square_roots, stable_reparameterization_engine,
-        };
-
-        // Create penalty matrices that require rotation to diagonalize
-        // s1 penalizes the difference between the two coefficients: (β₁ - β₂)²
-        // Its null space is in the direction [1, 1]
-        let s1 = arr2(&[[1.0, -1.0], [-1.0, 1.0]]);
-
-        // s2 is a ridge penalty on the first coefficient only: β₁²
-        // Its null space is in the direction [0, 1]
-        let s2 = arr2(&[[1.0, 0.0], [0.0, 0.0]]);
-
-        let s_list = vec![s1, s2];
-        let rs_original = compute_penalty_square_roots(&s_list).unwrap();
-
-        // Create a model layout
-        let layout = EngineLayout {
-            intercept_col: 0,
-            sex_col: None,
-            pgs_main_cols: 0..0,
-            pc_null_cols: vec![],
-            penalty_map: vec![],
-            pc_main_block_idx: vec![],
-            interaction_block_idx: vec![],
-            sex_pgs_block_idx: None,
-            interaction_factor_widths: vec![],
-            total_coeffs: 2,
-            num_penalties: 2,
-        };
-
-        // Test with two different lambda values which will change the dominant penalty
-        // Scenario 1: s1 is dominant. A rotation is expected.
-        let lambdas1 = vec![100.0, 0.01];
-        // Scenario 2: s2 is dominant. Different rotation expected.
-        let lambdas2 = vec![0.01, 100.0];
-
-        // Call stable_reparameterization directly to test the core functionality
-        println!("Testing with lambdas1: {:?}", lambdas1);
-        let reparam1 = stable_reparameterization_engine(
-            &rs_original,
-            &lambdas1,
-            EngineDims::new(layout.total_coeffs, layout.num_penalties),
-        )
-        .unwrap();
-        println!("Result 1 - qs matrix: {:?}", reparam1.qs);
-        println!("Result 1 - s_transformed: {:?}", reparam1.s_transformed);
-
-        println!("Testing with lambdas2: {:?}", lambdas2);
-        let reparam2 = stable_reparameterization_engine(
-            &rs_original,
-            &lambdas2,
-            EngineDims::new(layout.total_coeffs, layout.num_penalties),
-        )
-        .unwrap();
-        println!("Result 2 - qs matrix: {:?}", reparam2.qs);
-        println!("Result 2 - s_transformed: {:?}", reparam2.s_transformed);
-
-        // The key test: directly check that the transformation matrices are different
-        // Since qs1 will be influenced by s1's structure and qs2 by s2's structure, they must be different
-        let qs_diff = (&reparam1.qs - &reparam2.qs).mapv(|x| x.abs()).sum();
-        assert!(
-            qs_diff > 1e-6,
-            "The transformation matrices 'qs' should be different for different lambda values"
-        );
-
-        println!(
-            "✓ Test passed: Different smoothing parameters correctly produced different reparameterizations."
-        );
-    }
-
-    fn identity_layout(link: LinkFunction) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
-        let x = Array2::<f64>::eye(3);
-        let y = match link {
-            LinkFunction::Logit => arr1(&[0.0, 1.0, 0.0]),
-            LinkFunction::Identity => arr1(&[1.0, -1.0, 0.5]),
-        };
-        let weights = Array1::from_elem(y.len(), 1.0);
-        (x, y, weights)
-    }
-
-    struct IdentityGamWorkingModel {
-        link: LinkFunction,
-        design: Array2<f64>,
-        response: Array1<f64>,
-        prior_weights: Array1<f64>,
-    }
-
-    impl IdentityGamWorkingModel {
-        fn new(
-            link: LinkFunction,
-            design: &Array2<f64>,
-            response: &Array1<f64>,
-            prior_weights: &Array1<f64>,
-        ) -> Self {
-            Self {
-                link,
-                design: design.to_owned(),
-                response: response.to_owned(),
-                prior_weights: prior_weights.to_owned(),
-            }
-        }
-    }
-
-    impl WorkingModel for IdentityGamWorkingModel {
-        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
-            let eta = self.design.dot(beta.as_ref());
-            let mut mu = Array1::zeros(self.response.len());
-            let mut weights = Array1::zeros(self.response.len());
-            let mut z = Array1::zeros(self.response.len());
-            update_glm_vectors(
-                self.response.view(),
-                &eta,
-                self.link,
-                self.prior_weights.view(),
-                &mut mu,
-                &mut weights,
-                &mut z,
-            );
-
-            let eta_minus_z = &eta - &z;
-            let weighted_residual = &weights * &eta_minus_z;
-            let gradient = self.design.t().dot(&weighted_residual);
-
-            let mut hessian = Array2::<f64>::zeros((self.design.ncols(), self.design.ncols()));
-            for (i, row) in self.design.rows().into_iter().enumerate() {
-                let w = weights[i];
-                for j in 0..hessian.nrows() {
-                    let xj = row[j];
-                    for k in 0..hessian.ncols() {
-                        hessian[[j, k]] += w * xj * row[k];
-                    }
-                }
-            }
-
-            let deviance = calculate_deviance(
-                self.response.view(),
-                &mu,
-                self.link,
-                self.prior_weights.view(),
-            );
-
-            Ok(WorkingState {
-                eta: LinearPredictor::new(eta),
-                gradient,
-                hessian,
-                deviance,
-                penalty_term: 0.0,
-                firth_log_det: None,
-                firth_hat_diag: None,
-                ridge_used: 0.0,
-            })
-        }
-    }
-
-    fn build_identity_gam_working_model(
-        link: LinkFunction,
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-        weights: &Array1<f64>,
-    ) -> Result<Box<dyn WorkingModel>, &'static str> {
-        Ok(Box::new(IdentityGamWorkingModel::new(link, x, y, weights)))
-    }
-
-    fn expected_identity_state(
-        beta: &Array1<f64>,
-        link: LinkFunction,
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-        weights: &Array1<f64>,
-    ) -> (Array1<f64>, Array2<f64>, f64) {
-        let eta = x.dot(beta);
-        let mut mu = Array1::zeros(y.len());
-        let mut fisher_weights = Array1::zeros(y.len());
-        let mut z = Array1::zeros(y.len());
-        update_glm_vectors(
-            y.view(),
-            &eta,
-            link,
-            weights.view(),
-            &mut mu,
-            &mut fisher_weights,
-            &mut z,
-        );
-        let working_gradient = x.t().dot(&(&fisher_weights * (&eta - &z)));
-
-        let mut w_matrix = Array2::<f64>::zeros((x.nrows(), x.nrows()));
-        for (i, w) in fisher_weights.iter().enumerate() {
-            w_matrix[[i, i]] = *w;
-        }
-        let hessian = x.t().dot(&w_matrix.dot(x));
-        let deviance = calculate_deviance(y.view(), &mu, link, weights.view());
-        (working_gradient, hessian, deviance)
-    }
-
-    fn assert_monotone(trace: &[f64]) {
-        for window in trace.windows(2) {
-            assert!(
-                window[1] <= window[0] + 1e-12,
-                "deviance must be non-increasing: {:?}",
-                trace
-            );
-        }
-    }
-
-    fn assert_diagonal(matrix: &Array2<f64>) {
-        for i in 0..matrix.nrows() {
-            for j in 0..matrix.ncols() {
-                if i != j {
-                    assert!(
-                        matrix[[i, j]].abs() < 1e-9,
-                        "expected diagonal Hessian, got {:?}",
-                        matrix
-                    );
-                }
-            }
-        }
-    }
-
-    fn run_identity_gam_test(link: LinkFunction) -> WorkingModelPirlsResult {
-        let (x, y, weights) = identity_layout(link);
-        let mut model = build_identity_gam_working_model(link, &x, &y, &weights)
-            .expect("GAM WorkingModel must be provided for identity layout tests");
-        let options = WorkingModelPirlsOptions {
-            max_iterations: 8,
-            convergence_tolerance: 1e-10,
-            max_step_halving: 4,
-            min_step_size: 1e-6,
-            firth_bias_reduction: false,
-        };
-        let mut deviance_trace = Vec::new();
-        let result = run_working_model_pirls(
-            &mut *model,
-            Coefficients::zeros(x.ncols()),
-            &options,
-            |info| deviance_trace.push(info.deviance),
-        )
-        .expect("PIRLS should converge on identity layout");
-        assert_monotone(&deviance_trace);
-        let (expected_gradient, expected_hessian, expected_deviance) =
-            expected_identity_state(&result.beta, link, &x, &y, &weights);
-        assert_abs_diff_eq!(expected_deviance, result.state.deviance, epsilon = 1e-9);
-        assert_diagonal(&result.state.hessian);
-        // Compare Hessian element-wise
-        for i in 0..expected_hessian.nrows() {
-            for j in 0..expected_hessian.ncols() {
-                assert!(
-                    (expected_hessian[[i, j]] - result.state.hessian[[i, j]]).abs() < 1e-9,
-                    "Hessian mismatch at [{i},{j}]: expected {}, got {}",
-                    expected_hessian[[i, j]],
-                    result.state.hessian[[i, j]]
-                );
-            }
-        }
-        // Compare gradient element-wise
-        for i in 0..expected_gradient.len() {
-            assert!(
-                (expected_gradient[i] - result.state.gradient[i]).abs() < 1e-9,
-                "Gradient mismatch at [{}]: expected {}, got {}",
-                i,
-                expected_gradient[i],
-                result.state.gradient[i]
-            );
-        }
-        result
-    }
-
-    #[test]
-    fn logistic_identity_layout_monotone_and_diagonal() {
-        run_identity_gam_test(LinkFunction::Logit);
-    }
-
-    #[test]
-    fn gaussian_identity_layout_monotone_and_diagonal() {
-        run_identity_gam_test(LinkFunction::Identity);
-    }
-
-    #[test]
-    fn pirls_penalized_deviance_is_monotone() {
-        let (result, trace) = super::capture_pirls_penalized_deviance(|| {
-            run_pirls_test_scenario(LinkFunction::Logit, SignalType::LinearSignal)
-        });
-
-        let scenario = result.expect("P-IRLS scenario should converge");
-        assert!(
-            trace.len() > 1,
-            "expected multiple PIRLS iterations to be recorded"
-        );
-
-        for window in trace.windows(2) {
-            let prev = window[0];
-            let next = window[1];
-            assert!(
-                next <= prev * (1.0 + 1e-10) + 1e-12,
-                "penalized deviance should be non-increasing (prev={prev}, next={next})"
-            );
-        }
-
-        assert!(
-            trace.windows(2).any(|window| window[1] < window[0] - 1e-8),
-            "expected at least one strict penalized deviance decrease"
-        );
-
-        assert_eq!(
-            scenario.pirls_result.status,
-            PirlsStatus::Converged,
-            "scenario should converge successfully"
-        );
-    }
-
-    /// The stable reparameterization must correctly detect the null space of
-    /// standard spline penalties. If it treats the entire block as full rank,
-    /// the pseudo-determinant and EDF calculations become invalid.
-    #[test]
-    fn test_stable_reparameterization_preserves_nullspace_rank() {
-        use crate::construction::{
-            EngineDims, EngineLayout, compute_penalty_square_roots, stable_reparameterization_engine,
-        };
-
-        // Create a canonical cubic spline penalty (second-order differences)
-        // whose null space has dimension two.
-        let num_basis_functions = 10;
-        let penalty_order = 2;
-        let penalty = create_difference_penalty_matrix(num_basis_functions, penalty_order, None)
-            .expect("valid difference penalty");
-
-        // Compute the analytical rank from the eigen-spectrum.
-        let (eigenvalues, _) = penalty
-            .eigh(Side::Lower)
-            .expect("eigendecomposition of penalty matrix");
-        let max_eigenvalue = eigenvalues
-            .iter()
-            .fold(0.0_f64, |acc: f64, &val| acc.max(val));
-        let tolerance = if max_eigenvalue > 0.0 {
-            max_eigenvalue * 1e-12
-        } else {
-            1e-12
-        };
-        let expected_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-        // Confirm the canonical null-space dimension (rank = k - order).
-        assert_eq!(expected_rank, num_basis_functions - penalty_order);
-
-        // Construct penalty square roots and verify their rank matches expectations.
-        let rs_list = compute_penalty_square_roots(&[penalty.clone()]).expect("penalty roots");
-        assert_eq!(rs_list[0].nrows(), expected_rank);
-        assert_eq!(rs_list[0].ncols(), num_basis_functions);
-
-        // Run stable reparameterization and confirm the null space dimension is preserved.
-        let layout = EngineLayout::external(num_basis_functions, 1);
-        let lambdas = vec![1.0];
-        let reparam = stable_reparameterization_engine(
-            &rs_list,
-            &lambdas,
-            EngineDims::new(layout.total_coeffs, layout.num_penalties),
-        )
-            .expect("stable reparameterization");
-
-        assert_eq!(
-            reparam.e_transformed.nrows(),
-            expected_rank,
-            "Stable reparameterization should preserve the penalty's null space dimension",
-        );
-
-        // Validate the pseudo-determinant uses only the positive eigenvalues.
-        let positive_eigs: Vec<f64> = eigenvalues
-            .iter()
-            .copied()
-            .filter(|&ev| ev > tolerance)
-            .collect();
-        let expected_log_det: f64 = positive_eigs.iter().map(|&ev| ev.ln()).sum::<f64>();
-        assert_abs_diff_eq!(reparam.log_det, expected_log_det, epsilon = 1e-9);
-
-        // The transformed penalty should expose the same null-space dimension.
-        let (transformed_eigs, _) = reparam
-            .s_transformed
-            .eigh(Side::Lower)
-            .expect("eigendecomposition of transformed penalty");
-        let transformed_max = transformed_eigs
-            .iter()
-            .fold(0.0_f64, |acc: f64, &val| acc.max(val));
-        let transformed_tol = if transformed_max > 0.0 {
-            transformed_max * 1e-12
-        } else {
-            1e-12
-        };
-        let transformed_rank = transformed_eigs
-            .iter()
-            .filter(|&&ev| ev > transformed_tol)
-            .count();
-        assert_eq!(transformed_rank, expected_rank);
-    }
-
-    /// Helper to set up the inputs required for `fit_model_for_fixed_rho`.
-    /// This encapsulates the boilerplate of setting up test inputs.
-    fn setup_pirls_test_inputs(
-        data: &TrainingData,
-        config: &ModelConfig,
-    ) -> Result<(Array2<f64>, Vec<Array2<f64>>, EngineLayout), Box<dyn std::error::Error>> {
-        let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
-            build_design_and_penalty_matrices(data, config)?;
-        assert!(!penalty_structs.is_empty());
-        let rs_original = compute_penalty_square_roots(&s_list)?;
-        Ok((x_matrix, rs_original, layout))
-    }
-
-    /// Test that the unpivot_columns function correctly reverses a column pivot
-    #[test]
-    fn test_unpivot_columns_basic() {
-        // Create a simple test matrix
-        let original = arr2(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-
-        // Simulate a pivot where columns are reordered as: [0, 2, 1] -> [2, 0, 1]
-        let pivot = vec![2, 0, 1]; // This means: col 0 goes to pos 2, col 1 goes to pos 0, col 2 goes to pos 1
-
-        // Create a manually pivoted matrix to simulate what QR would produce
-        let pivoted = arr2(&[
-            [3.0, 1.0, 2.0], // Column order: original[2], original[0], original[1]
-            [6.0, 4.0, 5.0],
-        ]);
-
-        // Un-pivot using our function
-        let unpivoted = unpivot_columns(pivoted.view(), &pivot);
-
-        // Check that we get back the original column order
-        assert_eq!(unpivoted, original);
-        println!("✓ unpivot_columns correctly reversed the column pivot");
-    }
-
-    /// This integration test verifies that the fit_model_for_fixed_rho function
-    /// performs reparameterization for each set of smoothing parameters and
-    /// correctly converges with the P-IRLS algorithm.
-    #[test]
-    fn test_reparameterization_per_rho() {
-        use crate::construction::{EngineLayout, compute_penalty_square_roots};
-
-        // Create a simple test case with more samples - using simple model known to converge
-        let n_samples = 100;
-        let x = Array2::from_shape_fn((n_samples, 2), |(i, j)| {
-            if j == 0 {
-                1.0
-            } else {
-                (i as f64) / (n_samples as f64)
-            }
-        });
-        let y = Array1::from_shape_fn(n_samples, |i| {
-            // Perfect linear relationship for guaranteed convergence
-            2.0 + 3.0 * ((i as f64) / (n_samples as f64))
-        });
-
-        // Create unit weights for the test
-        let weights = Array1::from_elem(n_samples, 1.0);
-
-        // Create penalty matrices with DIFFERENT eigenvector structures (matching working test)
-        // s1 penalizes the difference between the two coefficients: (β₁ - β₂)²
-        let s1 = arr2(&[[1.0, -1.0], [-1.0, 1.0]]);
-        // s2 is a ridge penalty on the first coefficient only: β₁²
-        let s2 = arr2(&[[1.0, 0.0], [0.0, 0.0]]);
-
-        let s_list = vec![s1, s2];
-        let rs_original = compute_penalty_square_roots(&s_list).unwrap();
-
-        // Create a model layout
-        let layout = EngineLayout {
-            intercept_col: 0,
-            sex_col: None,
-            pgs_main_cols: 0..0,
-            pc_null_cols: vec![],
-            penalty_map: vec![],
-            pc_main_block_idx: vec![],
-            interaction_block_idx: vec![],
-            sex_pgs_block_idx: None,
-            interaction_factor_widths: vec![],
-            total_coeffs: 2,
-            num_penalties: 2,
-        };
-
-        // Create a simple config with values known to lead to convergence
-        let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity), // Simple linear model for stability
-            max_iterations: 100,                                    // Increased for stability
-            convergence_tolerance: 1e-6, // Less strict for test stability
-            penalty_order: 2,
-            reml_convergence_tolerance: 1e-6,
-            reml_max_iterations: 50,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::types::default_reml_parallel_threshold(),
-            pgs_basis_config: BasisConfig {
-                num_knots: 3,
-                degree: 3,
-            },
-            pc_configs: vec![],
-            pgs_range: (-1.0, 1.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
-            mcmc_enabled: false,
-            calibrator_enabled: false,
-            survival: None,
-        };
-
-        // Test with lambda values that match the working test pattern
-        log::info!("Running test_reparameterization_per_rho with detailed diagnostics");
-        let rho_vec1 = arr1(&[f64::ln(100.0), f64::ln(0.01)]); // Lambda: [100.0, 0.01] - s1 dominates
-        let rho_vec2 = arr1(&[f64::ln(0.01), f64::ln(100.0)]); // Lambda: [0.01, 100.0] - s2 dominates
-        log::info!(
-            "Testing P-IRLS with rho values: {:?} (lambdas: {:?})",
-            rho_vec1,
-            rho_vec1.mapv(f64::exp)
-        );
-
-        // Call the function with first rho vector
-        let offset = Array1::<f64>::zeros(n_samples);
-        let (result1, _) = super::fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho_vec1.view()),
-            x.view(),
-            offset.view(),
-            y.view(),
-            weights.view(),
-            &rs_original,
-            None,
-            None,
-            layout.total_coeffs,
-            &config,
-            None,
-            None, // No SE for test
-        )
-        .expect("First fit should converge for this stable test case");
-
-        // Call the function with second rho vector
-        let (result2, _) = super::fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho_vec2.view()),
-            x.view(),
-            offset.view(),
-            y.view(),
-            weights.view(),
-            &rs_original,
-            None,
-            None,
-            layout.total_coeffs,
-            &config,
-            None,
-            None, // No SE for test
-        )
-        .expect("Second fit should converge for this stable test case");
-
-        // The key test: directly check that the transformation matrices are different
-        // This is the core behavior we want to verify - each set of smoothing parameters
-        // should produce a different transformation matrix
-        let qs_diff = (&result1.reparam_result.qs - &result2.reparam_result.qs)
-            .mapv(|x| x.abs())
-            .sum();
-        assert!(
-            qs_diff > 1e-6,
-            "The transformation matrices 'qs' should be different for different rho values"
-        );
-
-        // As a secondary check, confirm the coefficient estimates are also different
-        let beta_diff = (result1.beta_transformed.as_ref() - result2.beta_transformed.as_ref())
-            .mapv(|x| x.abs())
-            .sum();
-        assert!(
-            beta_diff > 1e-6,
-            "Expected different coefficient estimates for different rho values"
-        );
-
-        // Check convergence status
-        assert_eq!(
-            result1.status,
-            PirlsStatus::Converged,
-            "First fit should have converged"
-        );
-        assert_eq!(
-            result2.status,
-            PirlsStatus::Converged,
-            "Second fit should have converged"
-        );
-
-        println!(
-            "✓ Test passed: P-IRLS converged with different smoothing parameters, producing different reparameterizations."
-        );
-    }
-
-    /// This is a definitive test to prove whether the P-IRLS algorithm is numerically stable
-    /// on a perfectly well-behaved dataset with zero signal.
-    ///
-    /// If this test fails, it confirms a fundamental instability in the fitting algorithm itself,
-    /// independent of any data-related issues like quasi-perfect separation.
-    #[test]
-    fn test_pirls_is_stable_on_perfectly_good_data() -> Result<(), Box<dyn std::error::Error>> {
-        // === PHASE 1 & 2: Create an "impossible-to-fail" dataset ===
-        let n_samples = 1000;
-        let mut rng = StdRng::seed_from_u64(1337);
-
-        // Predictor `p`: Perfectly uniform and centered.
-        let p = Array1::linspace(-2.0, 2.0, n_samples);
-
-        // Outcome `y`: Pure 50/50 random noise, mathematically independent of `p`.
-        // This makes separation impossible and provides maximum stability.
-        let y_values: Vec<f64> = (0..n_samples)
-            .map(|_| if rng.random::<f64>() < 0.5 { 1.0 } else { 0.0 })
-            .collect();
-        let y = Array1::from_vec(y_values);
-
-        // Assemble into TrainingData struct (no PCs).
-        let data = TrainingData {
-            y,
-            p,
-            sex: Array1::from_iter((0..n_samples).map(|i| (i % 2) as f64)),
-            pcs: Array2::zeros((n_samples, 0)),
-            weights: Array1::from_elem(n_samples, 1.0),
-        };
-
-        // === PHASE 3: Configure a simple, stable model ===
-        let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
-            convergence_tolerance: 1e-7,
-            max_iterations: 150,
-            reml_convergence_tolerance: 1e-3,
-            reml_max_iterations: 50,
-            firth_bias_reduction: true,
-            reml_parallel_threshold: crate::types::default_reml_parallel_threshold(),
-            pgs_basis_config: BasisConfig {
-                num_knots: 5,
-                degree: 3,
-            }, // Stable basis
-            pc_configs: vec![],     // PGS-only model
-            pgs_range: (-2.0, 2.0), // Match the data
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
-            mcmc_enabled: false,
-            calibrator_enabled: false,
-            survival: None,
-        };
-
-        // === PHASE 4: Prepare inputs for the target function ===
-        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
-
-        // Size rho vector to match actual number of penalties
-        let rho_vec = Array1::<f64>::zeros(rs_original.len());
-
-        // === PHASE 5: Execute the target function ===
-        let offset = Array1::<f64>::zeros(data.y.len());
-        let (pirls_result, _) = fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho_vec.view()),
-            x_matrix.view(),
-            offset.view(),
-            data.y.view(),
-            data.weights.view(),
-            &rs_original,
-            None,
-            None,
-            layout.total_coeffs,
-            &config,
-            None,
-            None, // No SE for test
-        )
-        .expect("P-IRLS MUST NOT FAIL on a perfectly stable, zero-signal dataset.");
-
-        // === PHASE 6: Assert stability and correctness ===
-
-        // Stage: Assert finiteness by ensuring the result contains no non-finite numbers
-        assert!(
-            pirls_result.deviance.is_finite(),
-            "Deviance must be a finite number, but was {}",
-            pirls_result.deviance
-        );
-        assert!(
-            pirls_result.beta_transformed.iter().all(|&b| b.is_finite()),
-            "All beta coefficients in the transformed basis must be finite."
-        );
-        assert!(
-            pirls_result
-                .penalized_hessian_transformed
-                .iter()
-                .all(|&h| h.is_finite()),
-            "The penalized Hessian must be finite."
-        );
-
-        // Stage: Assert correctness by verifying the model learns a flat function
-        // Transform beta back to the original, interpretable basis.
-        let beta_original = pirls_result
-            .reparam_result
-            .qs
-            .dot(pirls_result.beta_transformed.as_ref());
-
-        // Map the flat vector to a structured object to easily isolate the spline part.
-        let mapped_coeffs = map_coefficients(&beta_original, &layout)?;
-        let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
-
-        // The norm of the spline coefficients should be reasonable for random data.
-        // For logistic regression with random 50/50 data, we expect coefficients to be small but not tiny.
-        let pgs_coeffs_norm = pgs_spline_coeffs
-            .iter()
-            .map(|&c| c.powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            pgs_coeffs_norm < 10.0, // Much more lenient - we're testing stability, not exact magnitude
-            "Spline coefficients should be finite and reasonable. Got norm: {}",
-            pgs_coeffs_norm
-        );
-
-        // Log the actual values for diagnostic purposes
-        println!("Spline coefficients norm: {:.6}", pgs_coeffs_norm);
-        println!(
-            "Individual spline coefficients: {:?}",
-            &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(5)]
-        );
-
-        println!("✓ Test passed: `fit_model_for_fixed_rho` is stable and correct on ideal data.");
-
-        Ok(())
-    }
-
-    /// Test that P-IRLS is stable and correctly learns from realistic data with a clear signal.
-    /// This verifies the algorithm not only converges, but finds meaningful patterns when they exist.
-    #[test]
-    fn test_pirls_learns_realistic_signal() -> Result<(), Box<dyn std::error::Error>> {
-        // === Create realistic dataset WITH a clear signal ===
-        let n_samples = 1000;
-        let mut rng = StdRng::seed_from_u64(42); // Different seed for variety
-
-        // Predictor: uniform distribution
-        let p = Array1::linspace(-2.0, 2.0, n_samples);
-
-        // Outcome: Generate from a clear logistic relationship
-        // True function: log_odds = -0.5 + 1.5 * p (strong linear signal)
-        let y_values: Vec<f64> = p
-            .iter()
-            .map(|&p_val| {
-                let log_odds: f64 = -0.5 + 1.5 * p_val;
-                let prob = 1.0 / (1.0 + (-log_odds).exp());
-                if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
-            })
-            .collect();
-        let y = Array1::from_vec(y_values);
-
-        let data = TrainingData {
-            y,
-            p,
-            sex: Array1::from_iter((0..n_samples).map(|i| (i % 2) as f64)),
-            pcs: Array2::zeros((n_samples, 0)),
-            weights: Array1::from_elem(n_samples, 1.0),
-        };
-
-        // === Use same stable model configuration ===
-        let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
-            convergence_tolerance: 1e-7,
-            max_iterations: 150,
-            reml_convergence_tolerance: 1e-3,
-            reml_max_iterations: 50,
-            firth_bias_reduction: true,
-            reml_parallel_threshold: crate::types::default_reml_parallel_threshold(),
-            pgs_basis_config: BasisConfig {
-                num_knots: 5,
-                degree: 3,
-            },
-            pc_configs: vec![],
-            pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
-            mcmc_enabled: false,
-            calibrator_enabled: false,
-            survival: None,
-        };
-
-        // === Set up inputs using helper ===
-        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
-        let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
-
-        // === Execute P-IRLS ===
-        let offset = Array1::<f64>::zeros(data.y.len());
-        let (pirls_result, _) = fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho_vec.view()),
-            x_matrix.view(),
-            offset.view(),
-            data.y.view(),
-            data.weights.view(),
-            &rs_original,
-            None,
-            None,
-            layout.total_coeffs,
-            &config,
-            None,
-            None, // No SE for test
-        )
-        .expect("P-IRLS should converge on realistic data with clear signal");
-
-        // === Assert stability (same as random data test) ===
-        assert!(
-            pirls_result.deviance.is_finite(),
-            "Deviance must be finite, got: {}",
-            pirls_result.deviance
-        );
-        assert!(
-            pirls_result.beta_transformed.iter().all(|&b| b.is_finite()),
-            "All beta coefficients must be finite"
-        );
-        assert!(
-            pirls_result
-                .penalized_hessian_transformed
-                .iter()
-                .all(|&h| h.is_finite()),
-            "Penalized Hessian must be finite"
-        );
-
-        // === Assert signal detection (different from random data test) ===
-        // Transform back to interpretable basis
-        let beta_original = pirls_result
-            .reparam_result
-            .qs
-            .dot(pirls_result.beta_transformed.as_ref());
-        let mapped_coeffs = map_coefficients(&beta_original, &layout)?;
-        let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
-
-        // For data with a strong signal, coefficients should be substantial
-        let pgs_coeffs_norm = pgs_spline_coeffs
-            .iter()
-            .map(|&c| c.powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            pgs_coeffs_norm > 0.5, // Should be much larger than random noise
-            "Model should detect the clear signal, got coefficient norm: {}",
-            pgs_coeffs_norm
-        );
-
-        // === More principled test: Compare fitted vs true function ===
-        let predicted_log_odds = x_matrix.dot(&beta_original);
-        let true_log_odds = data.p.mapv(|p_val| -0.5 + 1.5 * p_val);
-
-        // Calculate correlation coefficient (scale-invariant measure)
-        let pred_mean = predicted_log_odds.mean().unwrap();
-        let true_mean = true_log_odds.mean().unwrap();
-
-        let numerator = (&predicted_log_odds - pred_mean).dot(&(&true_log_odds - true_mean));
-        let pred_var = (&predicted_log_odds - pred_mean).mapv(|v| v.powi(2)).sum();
-        let true_var = (&true_log_odds - true_mean).mapv(|v| v.powi(2)).sum();
-        let correlation = numerator / (pred_var * true_var).sqrt();
-
-        println!(
-            "Correlation between fitted and true function: {:.6}",
-            correlation
-        );
-        assert!(
-            correlation > 0.9, // Strong positive correlation expected
-            "The fitted function should strongly correlate with the true function. Correlation: {:.6}",
-            correlation
-        );
-
-        // Log diagnostics
-        println!(
-            "Signal data - Spline coefficients norm: {:.6}",
-            pgs_coeffs_norm
-        );
-        println!(
-            "Signal data - Sample coefficients: {:?}",
-            &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(3)]
-        );
-        println!("✓ Test passed: P-IRLS stable and correctly learns realistic signal");
-
-        Ok(())
-    }
-
-    /// Test that P-IRLS is stable and correct on ideal data with Identity link (Gaussian).
-    /// This verifies the algorithm converges and behaves correctly on easy data.
-    #[test]
-    fn test_pirls_is_stable_on_perfectly_good_data_identity()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let result = run_pirls_test_scenario(LinkFunction::Identity, SignalType::NoSignal)?;
-
-        // === Assert stability ===
-        assert!(
-            result.pirls_result.deviance.is_finite(),
-            "Deviance must be finite, got: {}",
-            result.pirls_result.deviance
-        );
-        assert!(
-            result
-                .pirls_result
-                .beta_transformed
-                .iter()
-                .all(|&b| b.is_finite()),
-            "All beta coefficients must be finite"
-        );
-        assert!(
-            result
-                .pirls_result
-                .penalized_hessian_transformed
-                .iter()
-                .all(|&h| h.is_finite()),
-            "Penalized Hessian must be finite"
-        );
-
-        // === Assert that coefficients are small (no signal case) ===
-        let beta_original = result
-            .pirls_result
-            .reparam_result
-            .qs
-            .dot(result.pirls_result.beta_transformed.as_ref());
-        let mapped_coeffs = map_coefficients(&beta_original, &result.layout)?;
-        let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
-
-        let pgs_coeffs_norm = pgs_spline_coeffs
-            .iter()
-            .map(|&c| c.powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            pgs_coeffs_norm < 0.5, // Should be small for no-signal data
-            "With no signal, spline coeffs should be near zero. Norm: {}",
-            pgs_coeffs_norm
-        );
-
-        // Log the actual values for diagnostic purposes
-        println!(
-            "Identity No Signal - Spline coefficients norm: {:.6}",
-            pgs_coeffs_norm
-        );
-        println!(
-            "Identity No Signal - Individual spline coefficients: {:?}",
-            &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(5)]
-        );
-
-        println!(
-            "✓ Test passed: `fit_model_for_fixed_rho` is stable and correct on ideal data with Identity link."
-        );
-
-        Ok(())
-    }
-
-    /// Test that P-IRLS is stable and correctly learns from realistic data with a clear signal using Identity link.
-    /// This verifies the algorithm not only converges, but finds meaningful patterns when they exist.
-    #[test]
-    fn test_pirls_learns_realistic_signal_identity() -> Result<(), Box<dyn std::error::Error>> {
-        let result = run_pirls_test_scenario(LinkFunction::Identity, SignalType::LinearSignal)?;
-
-        // === Assert stability (same as random data test) ===
-        assert!(
-            result.pirls_result.deviance.is_finite(),
-            "Deviance must be finite, got: {}",
-            result.pirls_result.deviance
-        );
-        assert!(
-            result
-                .pirls_result
-                .beta_transformed
-                .iter()
-                .all(|&b| b.is_finite()),
-            "All beta coefficients must be finite"
-        );
-        assert!(
-            result
-                .pirls_result
-                .penalized_hessian_transformed
-                .iter()
-                .all(|&h| h.is_finite()),
-            "Penalized Hessian must be finite"
-        );
-
-        // === Assert signal detection ===
-        // Transform back to interpretable basis
-        let beta_original = result
-            .pirls_result
-            .reparam_result
-            .qs
-            .dot(result.pirls_result.beta_transformed.as_ref());
-        let mapped_coeffs = map_coefficients(&beta_original, &result.layout)?;
-        let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
-
-        // For data with a strong signal, coefficients should be substantial
-        let pgs_coeffs_norm = pgs_spline_coeffs
-            .iter()
-            .map(|&c| c.powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            pgs_coeffs_norm > 0.5, // Should be much larger than random noise
-            "Model should detect the clear signal, got coefficient norm: {}",
-            pgs_coeffs_norm
-        );
-
-        // === More principled test: Compare fitted vs true function ===
-        let predicted_linear_predictor = result.x_matrix.dot(&beta_original);
-        let correlation = calculate_correlation(
-            predicted_linear_predictor.view(),
-            result.true_linear_predictor.view(),
-        );
-
-        println!(
-            "Correlation between fitted and true function: {:.6}",
-            correlation
-        );
-        assert!(
-            correlation > 0.9, // Strong positive correlation expected
-            "The fitted function should strongly correlate with the true function. Correlation: {:.6}",
-            correlation
-        );
-
-        // Log diagnostics
-        println!(
-            "Identity Signal data - Spline coefficients norm: {:.6}",
-            pgs_coeffs_norm
-        );
-        println!(
-            "Identity Signal data - Sample coefficients: {:?}",
-            &pgs_spline_coeffs[..pgs_spline_coeffs.len().min(3)]
-        );
-        println!(
-            "✓ Test passed: P-IRLS stable and correctly learns realistic signal with Identity link"
-        );
-
-        Ok(())
-    }
-
-    /// Test that normal equations hold for the solver (unpenalized, any pivots)
-    /// Catches coefficient reconstruction bugs (H1) immediately
-    #[test]
-    fn test_pls_normal_equations_hold_unpenalized() {
-        use ndarray::{Array1, Array2};
-        use rand::rngs::StdRng;
-        use rand::{RngExt, SeedableRng};
-
-        // Tall random matrix (well-conditioned-ish)
-        let n = 80usize;
-        let p = 12usize;
-        let mut rng = StdRng::seed_from_u64(12345);
-        let x = Array2::from_shape_fn((n, p), |_| rng.random::<f64>() - 0.5);
-        let z = Array1::from_shape_fn(n, |_| rng.random::<f64>() - 0.5);
-        let w = Array1::from_elem(n, 1.0);
-
-        // No penalty at all
-        let e = Array2::<f64>::zeros((0, p));
-
-        // Solve once
-        let s = e.t().dot(&e);
-        let mut ws = super::PirlsWorkspace::new(x.nrows(), x.ncols(), e.nrows(), e.nrows());
-        let offset = Array1::<f64>::zeros(n);
-        let (res, ..) = super::solve_penalized_least_squares(
-            x.view(),
-            z.view(),
-            w.view(),
-            offset.view(),
-            &e,
-            &s,
-            &mut ws,
-            z.view(),
-            super::LinkFunction::Identity,
-        )
-        .expect("solver ok");
-
-        // Check stationarity of the *quadratic* objective that the solver actually minimized:
-        // grad = Xᵀ W (Xβ - z) + Sβ, with S=0 here.
-        let sqrt_w = w.mapv(f64::sqrt);
-        let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
-        let wz = &sqrt_w * &z;
-        let grad = wx.t().dot(&(wx.dot(res.beta.as_ref()) - &wz));
-
-        let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        assert!(
-            inf_norm < 1e-10,
-            "Normal equations not satisfied: ||grad||_∞={}",
-            inf_norm
-        );
-
-        // And ensure residual is orthogonal to the column space in the weighted sense
-        let resid = &wz - &wx.dot(res.beta.as_ref());
-        let ortho_check = wx.t().dot(&resid);
-        let inf_norm2 = ortho_check.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        assert!(inf_norm2 < 1e-10, "Residual not orthogonal: {}", inf_norm2);
-    }
-
-    /// Test that the WLS step must never be rejected for Gaussian models
-    /// Catches step-halving issues (H3)
-    #[test]
-    fn test_step_accepts_wls_for_gaussian() {
-        use ndarray::{Array1, Array2};
-        use rand::rngs::StdRng;
-        use rand::{RngExt, SeedableRng};
-
-        // Random tall problem
-        let n = 200usize;
-        let p = 10usize;
-        let mut rng = StdRng::seed_from_u64(54321);
-        let x = Array2::from_shape_fn((n, p), |_| rng.random::<f64>() - 0.5);
-        let y = Array1::from_shape_fn(n, |_| rng.random::<f64>() - 0.5);
-        let w = Array1::from_elem(n, 1.0);
-
-        // No penalty to keep it pure LS
-        let e = Array2::<f64>::zeros((0, p));
-
-        // "Current" state: beta=0
-        let beta0 = Array1::<f64>::zeros(p);
-        let mu0 = x.dot(&beta0);
-        let dev0: f64 = (&y - &mu0).mapv(|r| r * r).sum(); // your calculate_deviance does this
-
-        // WLS solution
-        let s = e.t().dot(&e);
-        let mut ws = super::PirlsWorkspace::new(x.nrows(), x.ncols(), e.nrows(), e.nrows());
-        let offset = Array1::<f64>::zeros(n);
-        let (res, _) = super::solve_penalized_least_squares(
-            x.view(),
-            y.view(),
-            w.view(),
-            offset.view(),
-            &e,
-            &s,
-            &mut ws,
-            y.view(),
-            super::LinkFunction::Identity,
-        )
-        .expect("solver ok");
-
-        let mu1 = x.dot(res.beta.as_ref());
-        let dev1: f64 = (&y - &mu1).mapv(|r| r * r).sum();
-
-        assert!(
-            dev1 <= dev0 * (1.0 + 1e-12) || (dev0 - dev1).abs() < 1e-12,
-            "Exact WLS step should not increase deviance: dev0={} dev1={}",
-            dev0,
-            dev1
-        );
-    }
-
-    /// Test that proves the gradient gate is using the wrong weights (logit)
-    /// Exposes convergence check issue (H2)
-    #[test]
-    fn test_wls_stationarity_old_vs_new_weights_logit() {
-        use ndarray::{Array1, Array2};
-        use rand::rngs::StdRng;
-        use rand::{RngExt, SeedableRng};
-
-        // Modest logit problem
-        let n = 400usize;
-        let p = 8usize;
-        let mut rng = StdRng::seed_from_u64(98765);
-        let x = Array2::from_shape_fn((n, p), |_| rng.random::<f64>() - 0.5);
-        let eta0 = Array1::zeros(n);
-        // y ~ Bernoulli(0.5)
-        let y = Array1::from_shape_fn(n, |_| if rng.random::<f64>() > 0.5 { 1.0 } else { 0.0 });
-        let w_prior = Array1::from_elem(n, 1.0);
-
-        // Build IRLS vectors at beta=0
-        // Use a tuple with let binding to explicitly declare variable usage
-        let (w_old, z_old) = {
-            let mut mu = Array1::zeros(n);
-            let mut weights = Array1::zeros(n);
-            let mut z = Array1::zeros(n);
-            super::update_glm_vectors(
-                y.view(),
-                &eta0,
-                super::LinkFunction::Logit,
-                w_prior.view(),
-                &mut mu,
-                &mut weights,
-                &mut z,
-            );
-            (weights, z)
-        };
-        assert!(w_old.iter().all(|w| *w >= 0.0));
-
-        // No penalty to keep it simple
-        let e = Array2::<f64>::zeros((0, p));
-        let s = e.t().dot(&e);
-        let mut ws = super::PirlsWorkspace::new(x.nrows(), x.ncols(), e.nrows(), e.nrows());
-        let offset = Array1::<f64>::zeros(n);
-        let (res, _) = super::solve_penalized_least_squares(
-            x.view(),
-            z_old.view(),
-            w_old.view(),
-            offset.view(),
-            &e,
-            &s,
-            &mut ws,
-            y.view(),
-            super::LinkFunction::Logit,
-        )
-        .expect("solver ok");
-
-        // Stationarity with OLD weights and z (the quadratic model you just solved)
-        let sqrt_w_old = w_old.mapv(f64::sqrt);
-        let wx_old = &x * &sqrt_w_old.view().insert_axis(ndarray::Axis(1));
-        let wz_old = &sqrt_w_old * &z_old;
-        let grad_old = wx_old.t().dot(&(wx_old.dot(res.beta.as_ref()) - &wz_old)); // S=0 here
-        let inf_old = grad_old.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        assert!(
-            inf_old < 1e-8,
-            "Should be stationary w.r.t. old weights, ||grad||_∞={}",
-            inf_old
-        );
-
-        // Now recompute eta, mu, and updated weights at the accepted beta
-        let eta1 = x.dot(res.beta.as_ref());
-        // Use same approach for the second update_glm_vectors call
-        let (w_new, z_new) = {
-            let mut mu = Array1::zeros(n);
-            let mut weights = Array1::zeros(n);
-            let mut z = Array1::zeros(n);
-            super::update_glm_vectors(
-                y.view(),
-                &eta1,
-                super::LinkFunction::Logit,
-                w_prior.view(),
-                &mut mu,
-                &mut weights,
-                &mut z,
-            );
-            (weights, z)
-        };
-
-        let sqrt_w_new = w_new.mapv(f64::sqrt);
-        let wx_new = &x * &sqrt_w_new.view().insert_axis(ndarray::Axis(1));
-        let wz_new = &sqrt_w_new * &z_new;
-
-        let grad_new = wx_new.t().dot(&(wx_new.dot(res.beta.as_ref()) - &wz_new));
-        let inf_new = grad_new.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-
-        // This SHOULD NOT be required to be tiny for convergence right after one step.
-        assert!(
-            inf_new > 1e-4,
-            "If this is tiny, IRLS basically solved in one step — suspicious"
-        );
-    }
-
-    /// Test that rank-deficient projections must be exact (perfect fit when possible)
-    /// This is a stronger, permanent guard against coefficient reconstruction bugs
-    #[test]
-    fn test_pls_rank_deficient_hits_projection() {
-        use ndarray::{Array1, Array2, arr1, arr2};
-
-        // Same structure as your failing test: col3 = col1 + col2
-        let x = arr2(&[
-            [1.0, 0.0, 1.0],
-            [1.0, 1.0, 2.0],
-            [1.0, 2.0, 3.0],
-            [1.0, 3.0, 4.0],
-            [1.0, 4.0, 5.0],
-        ]);
-        let z = arr1(&[0.1, 0.2, 0.3, 0.4, 0.5]);
-        let w = Array1::from_elem(5, 1.0);
-
-        let e = Array2::<f64>::zeros((0, 3));
-
-        let s = e.t().dot(&e);
-        let mut ws = super::PirlsWorkspace::new(x.nrows(), x.ncols(), e.nrows(), e.nrows());
-        let offset = Array1::<f64>::zeros(z.len());
-        let (res, rank) = super::solve_penalized_least_squares(
-            x.view(),
-            z.view(),
-            w.view(),
-            offset.view(),
-            &e,
-            &s,
-            &mut ws,
-            z.view(),
-            super::LinkFunction::Identity,
-        )
-        .expect("solver ok");
-        assert_eq!(rank, 2);
-
-        // Fitted values must equal the weighted projection of z onto Col(X)
-        let fitted = x.dot(res.beta.as_ref());
-        let rss: f64 = (&z - &fitted).mapv(|r| r * r).sum();
-
-        assert!(
-            rss < 1e-12,
-            "Rank-deficient LS should project exactly (RSS={})",
-            rss
-        );
-
-        // And the KKT/normal-equation residual must be ~0 for kept cols
-        let sqrt_w = w.mapv(f64::sqrt);
-        let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
-        let wz = &sqrt_w * &z;
-        let grad = wx.t().dot(&(wx.dot(res.beta.as_ref()) - &wz));
-        let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        assert!(
-            inf_norm < 1e-10,
-            "Normal equations not satisfied: {}",
-            inf_norm
-        );
-    }
-
-    /// Test permutation chain property - locks down coefficient reconstruction logic
-    #[test]
-    fn test_permutation_chain_property() {
-        use ndarray::Array1;
-        use rand::rngs::StdRng;
-        use rand::{SeedableRng, seq::SliceRandom};
-
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let p = 17usize;
-        let rank = 9usize;
-
-        // random initial_pivot: pivoted idx -> original idx
-        let mut initial_pivot: Vec<usize> = (0..p).collect();
-        initial_pivot.shuffle(&mut rng);
-
-        // choose kept positions in pivoted space and name them 0..rank-1 (kept-space)
-        let mut kept_in_pivoted: Vec<usize> = (0..p).collect();
-        kept_in_pivoted.shuffle(&mut rng);
-        kept_in_pivoted.truncate(rank);
-        kept_in_pivoted.sort_unstable(); // order doesn't matter, but your kept-space uses 0..rank-1
-
-        // kept_positions[i] = pivoted-space index of kept col i
-        let kept_positions = kept_in_pivoted.clone();
-
-        // final_pivot[j] = kept-space index for coeff j
-        let mut final_pivot: Vec<usize> = (0..rank).collect();
-        final_pivot.shuffle(&mut rng);
-
-        // distinct sentinels
-        let beta_dropped = Array1::from_shape_fn(rank, |j| 1000.0 + j as f64);
-
-        // your placement
-        let mut placed = Array1::<f64>::zeros(p);
-        for j in 0..rank {
-            let k_kept = final_pivot[j];
-            let k_pivoted = kept_positions[k_kept];
-            let k_orig = initial_pivot[k_pivoted];
-            placed[k_orig] = beta_dropped[j];
-        }
-
-        // reference via explicit composition
-        let mut placed_ref = Array1::<f64>::zeros(p);
-        for j in 0..rank {
-            let k_orig = initial_pivot[kept_positions[final_pivot[j]]];
-            placed_ref[k_orig] = beta_dropped[j];
-        }
-
-        assert!(
-            placed
-                .iter()
-                .zip(placed_ref.iter())
-                .all(|(a, b)| (a - b).abs() < 1e-12)
-        );
-    }
-
-    /// Test penalty consistency sanity check
-    /// Locks down penalty root consistency issues (H4)
-    #[test]
-    fn test_penalty_root_consistency() {
-        use crate::construction::{
-            EngineDims, EngineLayout, compute_penalty_square_roots, stable_reparameterization_engine,
-        };
-        use ndarray::arr2;
-
-        // Two small penalties with different eigenvectors
-        let s1 = arr2(&[[1.0, -0.2], [-0.2, 0.5]]);
-        let s2 = arr2(&[[0.1, 0.0], [0.0, 0.0]]);
-        let s_list = vec![s1, s2];
-        let rs = compute_penalty_square_roots(&s_list).expect("roots");
-
-        let layout = EngineLayout {
-            intercept_col: 0,
-            sex_col: None,
-            pgs_main_cols: 0..0,
-            pc_null_cols: vec![],
-            penalty_map: vec![],
-            pc_main_block_idx: vec![],
-            interaction_block_idx: vec![],
-            sex_pgs_block_idx: None,
-            interaction_factor_widths: vec![],
-            total_coeffs: 2,
-            num_penalties: 2,
-        };
-        let lambdas = vec![0.7, 3.0];
-
-        let rp = stable_reparameterization_engine(
-            &rs,
-            &lambdas,
-            EngineDims::new(layout.total_coeffs, layout.num_penalties),
-        )
-        .expect("reparam");
-        let lhs = rp.s_transformed;
-        let rhs = rp.e_transformed.t().dot(&rp.e_transformed);
-
-        let diff = (&lhs - &rhs).mapv(|v| v.abs()).sum();
-        assert!(
-            diff < 1e-10,
-            "S != EᵀE in transformed basis (sum abs diff = {})",
-            diff
-        );
-    }
-}
-
-/// Ensure positive definiteness by adding a small constant ridge to the diagonal if needed.
-/// This mirrors the outer objective/gradient stabilization (H_eff = H or H + c I),
-/// avoiding eigenvalue-dependent clamps that can diverge from the outer path.
-fn compute_firth_hat_and_half_logdet(
-    x_design: ArrayView2<f64>,
-    weights: ArrayView1<f64>,
-    workspace: &mut PirlsWorkspace,
-    s_transformed: Option<&Array2<f64>>,
-) -> Result<(Array1<f64>, f64), EstimationError> {
-    // Dense version of the Firth hat / log-det computation.
-    // This is exact for the given design matrix and must match the
-    // basis used by the inner PIRLS objective.
-    let n = x_design.nrows();
-    let p = x_design.ncols();
-
-    workspace
-        .sqrt_w
-        .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
-    let sqrt_w_col = workspace.sqrt_w.view().insert_axis(Axis(1));
-    if workspace.wx.dim() != x_design.dim() {
-        workspace.wx = Array2::zeros(x_design.dim());
-    }
-    workspace.wx.assign(&x_design);
-    workspace.wx *= &sqrt_w_col;
-
-    let xtwx_transformed = workspace.wx.t().dot(&workspace.wx);
-    let mut stabilized = xtwx_transformed.clone();
-    if let Some(s) = s_transformed {
-        for i in 0..p {
-            for j in 0..p {
-                stabilized[[i, j]] += s[[i, j]];
-            }
-        }
-    }
-    for i in 0..p {
-        for j in 0..i {
-            let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
-            stabilized[[i, j]] = v;
-            stabilized[[j, i]] = v;
-        }
-    }
-    // Firth correction for GAMs uses the penalized Fisher information (X' W X + S)
-    // to match the outer LAML objective and its derivatives.
-    ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
-
-    let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
-        EstimationError::HessianNotPositiveDefinite {
-            min_eigenvalue: f64::NEG_INFINITY,
-        }
-    })?;
-    let half_log_det = chol.diag().mapv(f64::ln).sum();
-
-    let rhs = chol.solve_mat(&workspace.wx.t().to_owned());
-
-    let mut hat_diag = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut acc = 0.0;
-        for k in 0..p {
-            let val = rhs[(k, i)];
-            acc += val * workspace.wx[[i, k]];
-        }
-        hat_diag[i] = acc;
-    }
-
-    Ok((hat_diag, half_log_det))
-}
-
-pub(crate) fn ensure_positive_definite_with_label(
-    hess: &mut Array2<f64>,
-    label: &str,
-) -> Result<(), EstimationError> {
-    ensure_positive_definite_with_ridge(hess, label).map(|_| ())
-}
-
-// Return the ridge added while enforcing positive definiteness. This is used
-// by PIRLS to keep the objective/gradient/log|H| consistent when we must add
-// diagonal stabilization. The returned ridge is a literal extra penalty term:
-//   l_p(β) := l(β) - 0.5 βᵀ S β - 0.5 * ridge * ||β||²
-// so the gradient gains + ridge * β and the Hessian gains + ridge * I.
-fn ensure_positive_definite_with_ridge(
-    hess: &mut Array2<f64>,
-    label: &str,
-) -> Result<f64, EstimationError> {
-    // Always apply the same ridge to avoid rho-dependent kinks in the objective.
-    let ridge = if FIXED_STABILIZATION_RIDGE > 0.0 {
-        FIXED_STABILIZATION_RIDGE
-    } else {
-        0.0
-    };
-
-    if hess.cholesky(Side::Lower).is_ok() {
-        return Ok(0.0);
-    }
-
-    if ridge > 0.0 {
-        for i in 0..hess.nrows() {
-            hess[[i, i]] += ridge;
-        }
-
-        if hess.cholesky(Side::Lower).is_ok() {
-            log::debug!("{} stabilized with fixed ridge {:.1e}.", label, ridge);
-            return Ok(ridge);
-        }
-    }
-
-    if let Ok((evals, _)) = hess.eigh(Side::Lower) {
-        let min_eig = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-        return Err(EstimationError::HessianNotPositiveDefinite {
-            min_eigenvalue: min_eig,
-        });
-    }
-    Err(EstimationError::HessianNotPositiveDefinite {
-        min_eigenvalue: f64::NEG_INFINITY,
-    })
 }

@@ -1548,6 +1548,630 @@ pub fn create_difference_penalty_matrix(
     Ok(s)
 }
 
+/// Thin-plate regression spline basis and penalty (order m=2).
+///
+/// The returned basis has columns `[K_c | P]` where:
+/// - `K_c` is the constrained radial basis block (`K * Z`) with
+///   `P(knots)^T * α = 0` enforced via nullspace projection
+/// - `P` is the polynomial null-space block `[1, x_1, ..., x_d]`
+///
+/// The returned penalty matrix is block-diagonal with:
+/// - upper-left `Omega_c = Z^T Omega Z` for the constrained radial block
+/// - zero lower-right block for unpenalized polynomial terms.
+///
+/// For double-penalty GAMs, a second ridge penalty `I` is also returned so the
+/// caller can optimize `(lambda_bending, lambda_ridge)` jointly.
+#[derive(Debug, Clone)]
+pub struct ThinPlateSplineBasis {
+    pub basis: Array2<f64>,
+    pub penalty_bending: Array2<f64>,
+    pub penalty_ridge: Array2<f64>,
+    pub num_kernel_basis: usize,
+    pub num_polynomial_basis: usize,
+    pub dimension: usize,
+}
+
+impl ThinPlateSplineBasis {
+    /// Returns the two standard TPS penalties for double-penalty REML:
+    /// `[S_bending, I_ridge]`.
+    pub fn penalty_matrices(&self) -> Vec<Array2<f64>> {
+        vec![self.penalty_bending.clone(), self.penalty_ridge.clone()]
+    }
+}
+
+/// Which knot strategy to use for 1D B-spline bases.
+#[derive(Debug, Clone)]
+pub enum BSplineKnotSpec {
+    Generate {
+        data_range: (f64, f64),
+        num_internal_knots: usize,
+    },
+    Provided(Array1<f64>),
+}
+
+/// 1D B-spline basis configuration.
+#[derive(Debug, Clone)]
+pub struct BSplineBasisSpec {
+    pub degree: usize,
+    pub penalty_order: usize,
+    pub knot_spec: BSplineKnotSpec,
+    pub double_penalty: bool,
+}
+
+/// Thin-plate center selection strategy.
+#[derive(Debug, Clone)]
+pub enum CenterStrategy {
+    UserProvided(Array2<f64>),
+    EqualMass { num_centers: usize },
+    FarthestPoint { num_centers: usize },
+    KMeans { num_centers: usize, max_iter: usize },
+    UniformGrid { points_per_dim: usize },
+}
+
+/// Thin-plate basis configuration.
+#[derive(Debug, Clone)]
+pub struct ThinPlateBasisSpec {
+    pub center_strategy: CenterStrategy,
+    pub double_penalty: bool,
+}
+
+/// Metadata returned by generic basis builders.
+#[derive(Debug, Clone)]
+pub enum BasisMetadata {
+    BSpline1D { knots: Array1<f64> },
+    ThinPlate { centers: Array2<f64> },
+}
+
+/// Standardized basis build result for engine-level composition.
+#[derive(Debug, Clone)]
+pub struct BasisBuildResult {
+    pub design: Array2<f64>,
+    pub penalties: Vec<Array2<f64>>,
+    pub nullspace_dims: Vec<usize>,
+    pub metadata: BasisMetadata,
+}
+
+fn validate_center_count(num_centers: usize) -> Result<(), BasisError> {
+    if num_centers == 0 {
+        return Err(BasisError::InvalidInput(
+            "center count must be positive".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn select_equal_mass_centers(
+    data: ArrayView2<'_, f64>,
+    num_centers: usize,
+) -> Result<Array2<f64>, BasisError> {
+    validate_center_count(num_centers)?;
+    let n = data.nrows();
+    let d = data.ncols();
+    if num_centers > n {
+        return Err(BasisError::InvalidInput(format!(
+            "equal-mass center selection requested {num_centers} centers but data has {n} rows"
+        )));
+    }
+    if d == 0 {
+        return Err(BasisError::InvalidInput(
+            "equal-mass center selection requires at least one column".to_string(),
+        ));
+    }
+    // Deterministic equal-mass partition on first coordinate, with medoid rows.
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| data[[a, 0]].total_cmp(&data[[b, 0]]));
+    let mut centers = Array2::<f64>::zeros((num_centers, d));
+    for c in 0..num_centers {
+        let start = c * n / num_centers;
+        let end = ((c + 1) * n / num_centers).max(start + 1).min(n);
+        let mid = idx[(start + end - 1) / 2];
+        centers.row_mut(c).assign(&data.row(mid));
+    }
+    Ok(centers)
+}
+
+fn select_kmeans_centers(
+    data: ArrayView2<'_, f64>,
+    num_centers: usize,
+    max_iter: usize,
+) -> Result<Array2<f64>, BasisError> {
+    validate_center_count(num_centers)?;
+    let n = data.nrows();
+    let d = data.ncols();
+    if num_centers > n {
+        return Err(BasisError::InvalidInput(format!(
+            "kmeans requested {num_centers} centers but data has {n} rows"
+        )));
+    }
+    let mut centers = select_thin_plate_knots(data, num_centers)?;
+    let mut assign = vec![0usize; n];
+    let iters = max_iter.max(1);
+
+    for _ in 0..iters {
+        // Assignment
+        for i in 0..n {
+            let mut best = 0usize;
+            let mut best_d2 = f64::INFINITY;
+            for k in 0..num_centers {
+                let mut d2 = 0.0;
+                for c in 0..d {
+                    let delta = data[[i, c]] - centers[[k, c]];
+                    d2 += delta * delta;
+                }
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best = k;
+                }
+            }
+            assign[i] = best;
+        }
+        // Update
+        let mut sums = Array2::<f64>::zeros((num_centers, d));
+        let mut counts = vec![0usize; num_centers];
+        for i in 0..n {
+            let k = assign[i];
+            counts[k] += 1;
+            for c in 0..d {
+                sums[[k, c]] += data[[i, c]];
+            }
+        }
+        for k in 0..num_centers {
+            if counts[k] == 0 {
+                continue;
+            }
+            let inv = 1.0 / counts[k] as f64;
+            for c in 0..d {
+                centers[[k, c]] = sums[[k, c]] * inv;
+            }
+        }
+    }
+    Ok(centers)
+}
+
+fn cartesian_grid_axes(axes: &[Array1<f64>]) -> Result<Array2<f64>, BasisError> {
+    if axes.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "uniform grid requires at least one axis".to_string(),
+        ));
+    }
+    let d = axes.len();
+    let total = axes.iter().try_fold(1usize, |acc, axis| {
+        acc.checked_mul(axis.len())
+            .ok_or_else(|| BasisError::DimensionMismatch("uniform grid is too large".to_string()))
+    })?;
+    let mut out = Array2::<f64>::zeros((total, d));
+    for r in 0..total {
+        let mut q = r;
+        for c in (0..d).rev() {
+            let len = axes[c].len();
+            let idx = q % len;
+            q /= len;
+            out[[r, c]] = axes[c][idx];
+        }
+    }
+    Ok(out)
+}
+
+fn select_uniform_grid_centers(
+    data: ArrayView2<'_, f64>,
+    points_per_dim: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if points_per_dim == 0 {
+        return Err(BasisError::InvalidInput(
+            "uniform-grid points_per_dim must be positive".to_string(),
+        ));
+    }
+    let d = data.ncols();
+    if d == 0 {
+        return Err(BasisError::InvalidInput(
+            "uniform-grid center selection requires at least one column".to_string(),
+        ));
+    }
+    let mut axes = Vec::with_capacity(d);
+    for c in 0..d {
+        let col = data.column(c);
+        let min_v = col.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max_v = col.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        axes.push(Array::linspace(min_v, max_v, points_per_dim));
+    }
+    cartesian_grid_axes(&axes)
+}
+
+fn select_centers_by_strategy(
+    data: ArrayView2<'_, f64>,
+    strategy: &CenterStrategy,
+) -> Result<Array2<f64>, BasisError> {
+    match strategy {
+        CenterStrategy::UserProvided(centers) => {
+            if centers.ncols() != data.ncols() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "user centers have {} columns but data has {}",
+                    centers.ncols(),
+                    data.ncols()
+                )));
+            }
+            if centers.nrows() == 0 {
+                return Err(BasisError::InvalidInput(
+                    "user-provided center list cannot be empty".to_string(),
+                ));
+            }
+            Ok(centers.clone())
+        }
+        CenterStrategy::EqualMass { num_centers } => {
+            select_equal_mass_centers(data, *num_centers)
+        }
+        CenterStrategy::FarthestPoint { num_centers } => select_thin_plate_knots(data, *num_centers),
+        CenterStrategy::KMeans {
+            num_centers,
+            max_iter,
+        } => select_kmeans_centers(data, *num_centers, *max_iter),
+        CenterStrategy::UniformGrid { points_per_dim } => {
+            select_uniform_grid_centers(data, *points_per_dim)
+        }
+    }
+}
+
+/// Generic 1D B-spline builder returning design + penalty list.
+pub fn build_bspline_basis_1d(
+    data: ArrayView1<'_, f64>,
+    spec: &BSplineBasisSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    let knot_source = match &spec.knot_spec {
+        BSplineKnotSpec::Generate {
+            data_range,
+            num_internal_knots,
+        } => KnotSource::Generate {
+            data_range: *data_range,
+            num_internal_knots: *num_internal_knots,
+        },
+        BSplineKnotSpec::Provided(knots) => KnotSource::Provided(knots.view()),
+    };
+    let (basis, knots) = create_basis::<Dense>(data, knot_source, spec.degree, BasisOptions::value())?;
+    let design = (*basis).clone();
+    let p = design.ncols();
+    let s_bend = create_difference_penalty_matrix(p, spec.penalty_order, None)?;
+    let mut penalties = vec![s_bend];
+    let mut nullspace_dims = vec![spec.penalty_order];
+    if spec.double_penalty {
+        penalties.push(Array2::<f64>::eye(p));
+        nullspace_dims.push(0);
+    }
+    Ok(BasisBuildResult {
+        design,
+        penalties,
+        nullspace_dims,
+        metadata: BasisMetadata::BSpline1D { knots },
+    })
+}
+
+/// Generic thin-plate builder returning design + penalty list.
+pub fn build_thin_plate_basis(
+    data: ArrayView2<'_, f64>,
+    spec: &ThinPlateBasisSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let tps = create_thin_plate_spline_basis(data, centers.view())?;
+    let mut penalties = vec![tps.penalty_bending.clone()];
+    let mut nullspace_dims = vec![tps.num_polynomial_basis];
+    if spec.double_penalty {
+        penalties.push(tps.penalty_ridge.clone());
+        nullspace_dims.push(0);
+    }
+    Ok(BasisBuildResult {
+        design: tps.basis,
+        penalties,
+        nullspace_dims,
+        metadata: BasisMetadata::ThinPlate { centers },
+    })
+}
+
+fn thin_plate_polynomial_block(points: ArrayView2<'_, f64>) -> Array2<f64> {
+    let n = points.nrows();
+    let d = points.ncols();
+    let mut poly = Array2::<f64>::zeros((n, d + 1));
+    poly.column_mut(0).fill(1.0);
+    for c in 0..d {
+        poly.column_mut(c + 1).assign(&points.column(c));
+    }
+    poly
+}
+
+fn thin_plate_kernel_constraint_nullspace(
+    knots: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let k = knots.nrows();
+    let p_k = thin_plate_polynomial_block(knots);
+    let p_k_t = p_k.t().to_owned(); // (d+1) x k
+
+    use crate::faer_ndarray::FaerSvd;
+    let (_, singular_values, vt_opt) = p_k_t.svd(false, true).map_err(BasisError::LinalgError)?;
+    let vt = match vt_opt {
+        Some(vt) => vt,
+        None => return Err(BasisError::ConstraintNullspaceNotFound),
+    };
+    let v = vt.t().to_owned(); // k x k
+
+    let max_sigma = singular_values
+        .iter()
+        .fold(0.0_f64, |max_val, &sigma| max_val.max(sigma));
+    let tol = (k as f64) * 1e-12 * max_sigma.max(1.0);
+    let rank = singular_values.iter().filter(|&&sigma| sigma > tol).count();
+    let z = if rank >= k {
+        // Fully constrained kernel (no wiggle block): valid pure-polynomial TPS.
+        Array2::<f64>::zeros((k, 0))
+    } else {
+        v.slice(s![.., rank..]).to_owned() // k x q
+    };
+    Ok(z)
+}
+
+/// Deterministically selects thin-plate knots via farthest-point sampling.
+///
+/// This produces a space-filling subset without introducing RNG/state coupling.
+pub fn select_thin_plate_knots(
+    data: ArrayView2<f64>,
+    num_knots: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let n = data.nrows();
+    let d = data.ncols();
+    if d == 0 {
+        return Err(BasisError::InvalidInput(
+            "thin-plate spline requires at least one covariate dimension".to_string(),
+        ));
+    }
+    if n == 0 {
+        return Err(BasisError::InvalidInput(
+            "cannot select thin-plate knots from empty data".to_string(),
+        ));
+    }
+    if data.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "thin-plate spline knot selection requires finite data".to_string(),
+        ));
+    }
+    if num_knots == 0 {
+        return Err(BasisError::InvalidInput(
+            "thin-plate spline knot count must be positive".to_string(),
+        ));
+    }
+    if num_knots > n {
+        return Err(BasisError::InvalidInput(format!(
+            "requested {} knots but only {} rows are available",
+            num_knots, n
+        )));
+    }
+
+    // Deterministic seed point: lexicographically smallest row.
+    let mut seed_idx = 0usize;
+    for i in 1..n {
+        let mut choose_i = false;
+        for c in 0..d {
+            let ai = data[[i, c]];
+            let as_ = data[[seed_idx, c]];
+            if ai < as_ {
+                choose_i = true;
+                break;
+            }
+            if ai > as_ {
+                break;
+            }
+        }
+        if choose_i {
+            seed_idx = i;
+        }
+    }
+
+    let mut selected = Vec::with_capacity(num_knots);
+    let mut chosen = vec![false; n];
+    let mut min_dist2 = vec![f64::INFINITY; n];
+
+    selected.push(seed_idx);
+    chosen[seed_idx] = true;
+
+    for i in 0..n {
+        let mut d2 = 0.0;
+        for c in 0..d {
+            let delta = data[[i, c]] - data[[seed_idx, c]];
+            d2 += delta * delta;
+        }
+        min_dist2[i] = d2;
+    }
+    min_dist2[seed_idx] = 0.0;
+
+    while selected.len() < num_knots {
+        let mut best_idx = None;
+        let mut best_dist2 = f64::NEG_INFINITY;
+        for i in 0..n {
+            if chosen[i] {
+                continue;
+            }
+            let cand = min_dist2[i];
+            if cand > best_dist2 {
+                best_dist2 = cand;
+                best_idx = Some(i);
+            }
+        }
+        let next_idx = match best_idx {
+            Some(i) => i,
+            None => break,
+        };
+        selected.push(next_idx);
+        chosen[next_idx] = true;
+
+        for i in 0..n {
+            if chosen[i] {
+                continue;
+            }
+            let mut d2 = 0.0;
+            for c in 0..d {
+                let delta = data[[i, c]] - data[[next_idx, c]];
+                d2 += delta * delta;
+            }
+            if d2 < min_dist2[i] {
+                min_dist2[i] = d2;
+            }
+        }
+    }
+
+    let mut knots = Array2::<f64>::zeros((selected.len(), d));
+    for (r, &idx) in selected.iter().enumerate() {
+        knots.row_mut(r).assign(&data.row(idx));
+    }
+    Ok(knots)
+}
+
+#[inline(always)]
+fn thin_plate_kernel_m2_from_dist2(dist2: f64, dimension: usize) -> Result<f64, BasisError> {
+    if !dist2.is_finite() || dist2 < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "thin-plate kernel distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if dist2 == 0.0 {
+        return Ok(0.0);
+    }
+    match dimension {
+        // m = 2 => 2m-d = 3 (odd): r^3 = (r^2) * r
+        1 => Ok(dist2 * dist2.sqrt()),
+        // m = 2 => 2m-d = 2 (even): r^2 log(r) = 0.5 * r^2 * log(r^2)
+        2 => {
+            Ok(0.5 * dist2 * dist2.ln())
+        }
+        // m = 2 => 2m-d = 1 (odd): r = sqrt(r^2)
+        3 => Ok(dist2.sqrt()),
+        _ => Err(BasisError::InvalidInput(format!(
+            "thin-plate spline (m=2) currently supports dimensions 1..=3, got {dimension}"
+        ))),
+    }
+}
+
+/// Creates a thin-plate regression spline basis (m=2) from data and knot locations.
+///
+/// # Arguments
+/// * `data` - `n x d` matrix of evaluation points
+/// * `knots` - `k x d` matrix of knot locations
+///
+/// # Returns
+/// `ThinPlateSplineBasis` containing:
+/// - `basis`: `n x (k + d + 1)` matrix (`[K | P]`)
+/// - `penalty_bending`: constrained TPS curvature penalty
+/// - `penalty_ridge`: identity penalty for null-space shrinkage
+pub fn create_thin_plate_spline_basis(
+    data: ArrayView2<f64>,
+    knots: ArrayView2<f64>,
+) -> Result<ThinPlateSplineBasis, BasisError> {
+    let n = data.nrows();
+    let k = knots.nrows();
+    let d = data.ncols();
+
+    if d == 0 {
+        return Err(BasisError::InvalidInput(
+            "thin-plate spline requires at least one covariate dimension".to_string(),
+        ));
+    }
+    if d != knots.ncols() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "thin-plate spline dimension mismatch: data has {} columns, knots have {} columns",
+            d,
+            knots.ncols()
+        )));
+    }
+    if k < d + 1 {
+        return Err(BasisError::InvalidInput(format!(
+            "thin-plate spline requires at least d+1 knots ({}), got {}",
+            d + 1,
+            k
+        )));
+    }
+    if data.iter().any(|v| !v.is_finite()) || knots.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "thin-plate spline requires finite data and knot values".to_string(),
+        ));
+    }
+
+    let poly_cols = d + 1;
+
+    // K block: radial basis evaluations data -> knots
+    let mut kernel_block = Array2::<f64>::zeros((n, k));
+    let kernel_result: Result<(), BasisError> = kernel_block
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                let mut dist2 = 0.0;
+                for c in 0..d {
+                    let delta = data[[i, c]] - knots[[j, c]];
+                    dist2 += delta * delta;
+                }
+                row[j] = thin_plate_kernel_m2_from_dist2(dist2, d)?;
+            }
+            Ok(())
+        });
+    kernel_result?;
+
+    // P block: [1, x_1, ..., x_d]
+    let poly_block = thin_plate_polynomial_block(data);
+
+    // Omega block on knots
+    let mut omega = Array2::<f64>::zeros((k, k));
+    let omega_result: Result<(), BasisError> = omega
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                let mut dist2 = 0.0;
+                for c in 0..d {
+                    let delta = knots[[i, c]] - knots[[j, c]];
+                    dist2 += delta * delta;
+                }
+                row[j] = thin_plate_kernel_m2_from_dist2(dist2, d)?;
+            }
+            Ok(())
+        });
+    omega_result?;
+
+    // Enforce TPS side-constraint P(knots)^T α = 0 by projecting onto
+    // the nullspace of P(knots)^T.
+    let z = thin_plate_kernel_constraint_nullspace(knots)?;
+    let kernel_constrained = kernel_block.dot(&z);
+    let omega_constrained = z.t().dot(&omega).dot(&z);
+
+    let kernel_cols = kernel_constrained.ncols();
+    let total_cols = kernel_cols + poly_cols;
+    let mut basis = Array2::<f64>::zeros((n, total_cols));
+    basis
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&kernel_constrained);
+    basis.slice_mut(s![.., kernel_cols..]).assign(&poly_block);
+
+    let mut penalty_bending = Array2::<f64>::zeros((total_cols, total_cols));
+    penalty_bending
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&omega_constrained);
+    let penalty_ridge = Array2::<f64>::eye(total_cols);
+
+    Ok(ThinPlateSplineBasis {
+        basis,
+        penalty_bending,
+        penalty_ridge,
+        num_kernel_basis: kernel_cols,
+        num_polynomial_basis: poly_cols,
+        dimension: d,
+    })
+}
+
+/// High-level TPS constructor: selects knots from data, then builds basis+penalty.
+pub fn create_thin_plate_spline_basis_with_knot_count(
+    data: ArrayView2<f64>,
+    num_knots: usize,
+) -> Result<(ThinPlateSplineBasis, Array2<f64>), BasisError> {
+    let knots = select_thin_plate_knots(data, num_knots)?;
+    let basis = create_thin_plate_spline_basis(data, knots.view())?;
+    Ok((basis, knots))
+}
+
 /// Applies a sum-to-zero constraint to a basis matrix for model identifiability.
 ///
 /// This is achieved by reparameterizing the basis to be orthogonal to the weighted intercept.
@@ -2326,6 +2950,247 @@ mod tests {
             expected_s.as_slice().unwrap(),
             epsilon = 1e-9
         );
+    }
+
+    #[test]
+    fn test_thin_plate_basis_shapes_and_penalty_blocks() {
+        let data = array![[0.0, 0.0], [0.5, 0.2], [1.0, 1.0]];
+        let knots = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+
+        let tps = create_thin_plate_spline_basis(data.view(), knots.view()).unwrap();
+        assert_eq!(tps.dimension, 2);
+        assert_eq!(tps.num_kernel_basis, 1); // k - rank(Pk) = 4 - 3
+        assert_eq!(tps.num_polynomial_basis, 3);
+        assert_eq!(tps.basis.shape(), &[3, 4]);
+        assert_eq!(tps.penalty_bending.shape(), &[4, 4]);
+        assert_eq!(tps.penalty_ridge.shape(), &[4, 4]);
+
+        // Polynomial block is unpenalized.
+        let p0 = tps.num_kernel_basis;
+        let p = tps.basis.ncols();
+        for i in p0..p {
+            for j in 0..p {
+                assert_abs_diff_eq!(tps.penalty_bending[[i, j]], 0.0, epsilon = 1e-12);
+                assert_abs_diff_eq!(tps.penalty_bending[[j, i]], 0.0, epsilon = 1e-12);
+            }
+        }
+
+        // Ridge penalty must cover all coefficients, including polynomial columns.
+        for i in 0..p {
+            for j in 0..p {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert_abs_diff_eq!(tps.penalty_ridge[[i, j]], expected, epsilon = 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn test_thin_plate_basis_and_penalty_finite() {
+        let data = array![[0.0, 0.0]];
+        let knots = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let tps = create_thin_plate_spline_basis(data.view(), knots.view()).unwrap();
+        assert!(tps.basis.iter().all(|v| v.is_finite()));
+        assert!(tps.penalty_bending.iter().all(|v| v.is_finite()));
+        assert!(tps.penalty_ridge.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_thin_plate_dimension_mismatch_errors() {
+        let data = array![[0.0, 0.0], [1.0, 1.0]];
+        let knots_bad_dim = array![[0.0], [1.0], [2.0]];
+        match create_thin_plate_spline_basis(data.view(), knots_bad_dim.view()) {
+            Err(BasisError::DimensionMismatch(_)) => {}
+            other => panic!("Expected DimensionMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_thin_plate_knot_selection_shape_and_uniqueness() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5]
+        ];
+        let knots = select_thin_plate_knots(data.view(), 3).unwrap();
+        assert_eq!(knots.shape(), &[3, 2]);
+
+        // Selected knots come directly from data rows.
+        for r in 0..knots.nrows() {
+            let mut found = false;
+            for i in 0..data.nrows() {
+                if (0..data.ncols()).all(|c| (knots[[r, c]] - data[[i, c]]).abs() < 1e-12) {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "selected knot row {r} not found in source data");
+        }
+    }
+
+    #[test]
+    fn test_thin_plate_with_knot_count_constructor() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5]
+        ];
+        let (tps, knots) = create_thin_plate_spline_basis_with_knot_count(data.view(), 4).unwrap();
+        assert_eq!(knots.shape(), &[4, 2]);
+        assert_eq!(tps.num_kernel_basis, 1);
+        assert_eq!(tps.basis.nrows(), data.nrows());
+        assert_eq!(tps.basis.ncols(), tps.num_kernel_basis + 3); // constrained kernel + [1, x, y]
+    }
+
+    #[test]
+    fn test_thin_plate_knot_selection_is_deterministic() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.25, 0.75]
+        ];
+        let k1 = select_thin_plate_knots(data.view(), 4).unwrap();
+        let k2 = select_thin_plate_knots(data.view(), 4).unwrap();
+        assert_abs_diff_eq!(k1.as_slice().unwrap(), k2.as_slice().unwrap(), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_thin_plate_basis_reuse_knots_for_new_points() {
+        let train = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5]
+        ];
+        let (train_tps, knots) =
+            create_thin_plate_spline_basis_with_knot_count(train.view(), 4).unwrap();
+        let test = array![[0.2, 0.8], [0.8, 0.2], [0.5, 0.1]];
+        let test_tps = create_thin_plate_spline_basis(test.view(), knots.view()).unwrap();
+
+        assert_eq!(train_tps.basis.ncols(), test_tps.basis.ncols());
+        assert_eq!(
+            train_tps.penalty_bending.shape(),
+            test_tps.penalty_bending.shape()
+        );
+        assert_eq!(train_tps.penalty_ridge.shape(), test_tps.penalty_ridge.shape());
+        assert_abs_diff_eq!(
+            train_tps.penalty_bending.as_slice().unwrap(),
+            test_tps.penalty_bending.as_slice().unwrap(),
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(
+            train_tps.penalty_ridge.as_slice().unwrap(),
+            test_tps.penalty_ridge.as_slice().unwrap(),
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn test_thin_plate_unsupported_dimension_rejected() {
+        let data = array![[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]];
+        let knots = array![
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ];
+        match create_thin_plate_spline_basis(data.view(), knots.view()) {
+            Err(BasisError::InvalidInput(msg)) => {
+                assert!(msg.contains("supports dimensions 1..=3"));
+            }
+            other => panic!("Expected InvalidInput for unsupported TPS dimension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_thin_plate_basis_double_penalty_outputs_two_blocks() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5]
+        ];
+        let spec = ThinPlateBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+            double_penalty: true,
+        };
+        let result = build_thin_plate_basis(data.view(), &spec).unwrap();
+        assert_eq!(result.penalties.len(), 2);
+        assert_eq!(result.nullspace_dims, vec![3, 0]);
+        assert_eq!(result.design.nrows(), data.nrows());
+    }
+
+    #[test]
+    fn test_build_thin_plate_basis_center_strategies() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.2, 0.8],
+            [0.8, 0.2]
+        ];
+        let specs = vec![
+            ThinPlateBasisSpec {
+                center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
+                double_penalty: false,
+            },
+            ThinPlateBasisSpec {
+                center_strategy: CenterStrategy::KMeans {
+                    num_centers: 4,
+                    max_iter: 5,
+                },
+                double_penalty: false,
+            },
+            ThinPlateBasisSpec {
+                center_strategy: CenterStrategy::UniformGrid { points_per_dim: 2 },
+                double_penalty: false,
+            },
+            ThinPlateBasisSpec {
+                center_strategy: CenterStrategy::UserProvided(array![
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 1.0]
+                ]),
+                double_penalty: false,
+            },
+        ];
+        for spec in specs {
+            let result = build_thin_plate_basis(data.view(), &spec).unwrap();
+            assert!(!result.design.is_empty());
+            assert_eq!(result.penalties.len(), 1);
+            assert_eq!(result.penalties[0].nrows(), result.design.ncols());
+            assert_eq!(result.penalties[0].ncols(), result.design.ncols());
+        }
+    }
+
+    #[test]
+    fn test_build_bspline_basis_1d_double_penalty() {
+        let x = Array::linspace(0.0, 1.0, 32);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 6,
+            },
+            double_penalty: true,
+        };
+        let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        assert_eq!(result.penalties.len(), 2);
+        assert_eq!(result.nullspace_dims, vec![2, 0]);
+        assert_eq!(result.design.nrows(), x.len());
     }
 
     #[test]

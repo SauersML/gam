@@ -71,7 +71,7 @@ pub fn compute_alo_features(
     let xtwx = ut.dot(&u);
 
     let phi = match link {
-        LinkFunction::Logit => 1.0,
+        LinkFunction::Logit | LinkFunction::Probit => 1.0,
         LinkFunction::Identity => {
             let mut rss = 0.0;
             for i in 0..n {
@@ -291,7 +291,7 @@ pub fn compute_alo_features(
     };
 
     let pred = match link {
-        LinkFunction::Logit => eta_tilde,
+        LinkFunction::Logit | LinkFunction::Probit => eta_tilde,
         LinkFunction::Identity => eta_tilde,
     };
 

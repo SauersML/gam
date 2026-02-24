@@ -44,7 +44,7 @@
 //!
 //! B-spline local support: At any evaluation point, only ~k+1 spline basis
 //! functions are nonzero (typically 4 for cubic splines). However, the linear
-//! predictor also includes PGS, sex effects, interactions, and PC effects, so
+//! predictor can include main and interaction effects, so
 //! the total remains a sum of many terms.
 //!
 //! # Alternative: HMC

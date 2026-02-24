@@ -30,19 +30,14 @@ use self::internal::RemlState;
 // Crate-level imports
 use crate::basis;
 use crate::construction::{
-    ReparamInvariant, build_design_and_penalty_matrices, calculate_condition_number,
+    ReparamInvariant, calculate_condition_number,
     compute_penalty_square_roots, create_balanced_penalty_root, precompute_reparam_invariant,
 };
-use crate::construction::TrainingData;
-use crate::hull::build_peeled_hull;
 use crate::matrix::DesignMatrix;
-use crate::types::ModelConfig;
 use crate::pirls::{self, PirlsResult};
-use crate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
 use crate::types::{
-    Coefficients, LinearPredictor, LinkFunction, LogSmoothingParams, LogSmoothingParamsView,
+    Coefficients, LinkFunction, LogSmoothingParams, LogSmoothingParamsView,
 };
-use crate::visualizer;
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, Zip, s};
@@ -50,7 +45,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, Zip, 
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_mat_mut,
 };
-use crate::hmc;
 use faer::Mat as FaerMat;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
@@ -68,6 +62,7 @@ use crate::diagnostics::{
     quantize_value, quantize_vec, should_emit_grad_diag, should_emit_h_min_eig_diag,
 };
 
+#[allow(dead_code)]
 fn log_basis_cache_stats(context: &str) {
     let stats = basis::basis_cache_stats();
     let total = stats.hits.saturating_add(stats.misses);
@@ -129,6 +124,50 @@ where
         acc.add(value);
     }
     acc.sum()
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct RemlConfig {
+    link_function: LinkFunction,
+    convergence_tolerance: f64,
+    max_iterations: usize,
+    reml_convergence_tolerance: f64,
+    reml_max_iterations: u64,
+    firth_bias_reduction: bool,
+    reml_parallel_threshold: usize,
+}
+
+impl RemlConfig {
+    fn external(
+        link_function: LinkFunction,
+        reml_tol: f64,
+        reml_max_iter: usize,
+        firth_bias_reduction: bool,
+    ) -> Self {
+        Self {
+            link_function,
+            convergence_tolerance: reml_tol,
+            max_iterations: 500,
+            reml_convergence_tolerance: reml_tol,
+            reml_max_iterations: reml_max_iter as u64,
+            firth_bias_reduction,
+            reml_parallel_threshold: 4,
+        }
+    }
+
+    fn link_function(&self) -> LinkFunction {
+        self.link_function
+    }
+
+    fn as_pirls_config(&self) -> pirls::PirlsConfig {
+        pirls::PirlsConfig {
+            link_function: self.link_function,
+            max_iterations: self.max_iterations,
+            convergence_tolerance: self.convergence_tolerance,
+            firth_bias_reduction: self.firth_bias_reduction,
+        }
+    }
 }
 
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
@@ -236,8 +275,11 @@ const RHO_BOUND: f64 = 30.0;
 // affecting the optimum when the data are informative.
 const RHO_SOFT_PRIOR_WEIGHT: f64 = 1e-6;
 const RHO_SOFT_PRIOR_SHARPNESS: f64 = 4.0;
+#[allow(dead_code)]
 const MAX_CONSECUTIVE_INNER_ERRORS: usize = 3;
+#[allow(dead_code)]
 const SYM_VS_ASYM_MARGIN: f64 = 1.001; // 0.1% preference
+#[allow(dead_code)]
 const DESIGN_MATRIX_CONDITION_THRESHOLD: f64 = 1e12;
 
 #[inline]
@@ -306,6 +348,7 @@ fn project_rho_gradient(rho: &Array1<f64>, grad: &mut Array1<f64>) {
     }
 }
 
+#[allow(dead_code)]
 fn build_asymmetric_fallback(len: usize) -> Array1<f64> {
     let mut fallback = Array1::zeros(len);
     for i in 0..fallback.len() {
@@ -354,6 +397,7 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
 /// - V_ρ = inverse Hessian of LAML w.r.t. ρ (smoothing parameter covariance)
 ///
 /// Returns the correction matrix in the ORIGINAL coefficient basis.
+#[allow(dead_code)]
 fn compute_smoothing_correction(
     reml_state: &internal::RemlState<'_>,
     final_rho: &Array1<f64>,
@@ -524,6 +568,7 @@ fn compute_smoothing_correction(
     Some(v_corr_orig)
 }
 
+#[allow(dead_code)]
 fn run_gradient_check(
     label: &str,
     reml_state: &RemlState<'_>,
@@ -710,6 +755,7 @@ fn run_gradient_check(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn check_rho_gradient_stationarity(
     label: &str,
     reml_state: &RemlState<'_>,
@@ -769,10 +815,11 @@ fn check_rho_gradient_stationarity(
     Ok((grad_norm_rho, is_stationary))
 }
 
+#[allow(dead_code)]
 fn run_bfgs_for_candidate(
     label: &str,
     reml_state: &RemlState<'_>,
-    config: &ModelConfig,
+    config: &RemlConfig,
     initial_z: Array1<f64>,
 ) -> Result<(BfgsSolution, f64, bool), EstimationError> {
     eprintln!("\n[Candidate {label}] Running BFGS optimization from queued seed");
@@ -883,22 +930,22 @@ pub enum EstimationError {
     #[error(
         "Model is over-parameterized: {num_coeffs} coefficients for {num_samples} samples.\n\n\
         Coefficient Breakdown:\n\
-          - Intercept:               {intercept_coeffs}\n\
-          - Sex Main Effect:         {sex_main_coeffs}\n\
-          - PGS Main Effects:        {pgs_main_coeffs}\n\
-          - Sex×PGS Interaction:     {sex_pgs_interaction_coeffs}\n\
-          - PC Main Effects:         {pc_main_coeffs}\n\
-          - PC×PGS Interaction:      {interaction_coeffs}"
+          - Intercept:                     {intercept_coeffs}\n\
+          - Binary Main Effects:           {binary_main_coeffs}\n\
+          - Primary Smooth Effects:        {primary_smooth_coeffs}\n\
+          - Binary×Primary Interactions:   {binary_primary_interaction_coeffs}\n\
+          - Auxiliary Main Effects:        {aux_main_coeffs}\n\
+          - Auxiliary Interactions:        {aux_interaction_coeffs}"
     )]
     ModelOverparameterized {
         num_coeffs: usize,
         num_samples: usize,
         intercept_coeffs: usize,
-        sex_main_coeffs: usize,
-        pgs_main_coeffs: usize,
-        pc_main_coeffs: usize,
-        sex_pgs_interaction_coeffs: usize,
-        interaction_coeffs: usize,
+        binary_main_coeffs: usize,
+        primary_smooth_coeffs: usize,
+        aux_main_coeffs: usize,
+        binary_primary_interaction_coeffs: usize,
+        aux_interaction_coeffs: usize,
     },
 
     #[error(
@@ -928,6 +975,7 @@ impl core::fmt::Debug for EstimationError {
 
 /// Compute g'(u) using analytic B-spline derivatives (same as HMC).
 /// g(u) = u + B(z(u)) @ θ, so g'(u) = 1 + dB/dz @ θ / range_width
+#[allow(dead_code)]
 fn compute_analytic_gprime_terms(
     eta_base: &Array1<f64>,
     result: &crate::joint::JointModelResult,
@@ -1035,6 +1083,7 @@ fn compute_analytic_gprime_terms(
 ///     [ B'g'WX,         B'WB + S_link ]
 /// ```
 /// where W is the weight matrix (varies by link function), g' is the link derivative.
+#[allow(dead_code)]
 fn compute_joint_penalized_hessian(
     x_matrix: &Array2<f64>,
     result: &crate::joint::JointModelResult,
@@ -1220,12 +1269,21 @@ pub struct ExternalOptimResult {
     pub pirls_status: crate::pirls::PirlsStatus,
 }
 
+#[derive(Clone)]
+pub struct ExternalOptimOptions {
+    pub family: crate::types::LikelihoodFamily,
+    pub max_iter: usize,
+    pub tol: f64,
+    pub nullspace_dims: Vec<usize>,
+}
+
 fn resolve_external_family(
     family: crate::types::LikelihoodFamily,
 ) -> Result<(LinkFunction, bool), EstimationError> {
     match family {
         crate::types::LikelihoodFamily::GaussianIdentity => Ok((LinkFunction::Identity, false)),
-        crate::types::LikelihoodFamily::BinomialLogit => Ok((LinkFunction::Logit, false)),
+        crate::types::LikelihoodFamily::BinomialLogit => Ok((LinkFunction::Logit, true)),
+        crate::types::LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
         crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
                 .to_string(),
@@ -1274,13 +1332,12 @@ where
     }
 
     use crate::construction::compute_penalty_square_roots;
-    use crate::types::ModelConfig;
-
+    
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "optimize_external_design")?;
     let k = s_list.len();
     let (link, firth_active) = resolve_external_family(opts.family)?;
-    let cfg = ModelConfig::external(link, opts.tol, opts.max_iter, firth_active);
+    let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
     let rs_list = compute_penalty_square_roots(&s_list)?;
 
@@ -1344,7 +1401,7 @@ where
         Some(reml_state.balanced_penalty_root()),
         None,
         p,
-        &cfg,
+        &cfg.as_pirls_config(),
         None,
         None, // No SE for base external optimization
     )?;
@@ -1466,7 +1523,7 @@ where
             let denom = (n - edf_total).max(1.0);
             weighted_rss / denom
         }
-        LinkFunction::Logit => 1.0,
+        LinkFunction::Logit | LinkFunction::Probit => 1.0,
     };
 
     // Compute gradient norm at final rho for reporting
@@ -1515,6 +1572,21 @@ pub struct FitResult {
 pub struct PredictResult {
     pub eta: Array1<f64>,
     pub mean: Array1<f64>,
+}
+
+#[inline]
+fn normal_cdf_predict(x: f64) -> f64 {
+    let z = x.clamp(-30.0, 30.0).abs();
+    let t = 1.0 / (1.0 + 0.231_641_9 * z);
+    let inv_sqrt_2pi = 0.398_942_280_401_432_7;
+    let pdf = inv_sqrt_2pi * (-0.5 * z * z).exp();
+    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
+        - 0.356_563_782)
+        * t
+        + 0.319_381_530)
+        * t;
+    let cdf_pos = 1.0 - pdf * poly;
+    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
 }
 
 /// Canonical engine entrypoint for external designs.
@@ -1600,6 +1672,7 @@ where
                 1.0 / (1.0 + (-z).exp())
             })
         }
+        crate::types::LikelihoodFamily::BinomialProbit => eta.mapv(normal_cdf_predict),
         crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
     };
 
@@ -1864,10 +1937,9 @@ where
     let p = x.ncols();
     validate_full_size_penalties(s_list, p, "evaluate_external_gradients")?;
 
-    use crate::types::ModelConfig;
-
+    
     let (link, firth_active) = resolve_external_family(opts.family)?;
-    let cfg = ModelConfig::external(link, opts.tol, opts.max_iter, firth_active);
+    let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
     let y_o = y.to_owned();
@@ -1923,10 +1995,9 @@ where
     let p = x.ncols();
     validate_full_size_penalties(s_list, p, "evaluate_external_cost_and_ridge")?;
 
-    use crate::types::ModelConfig;
-
+    
     let (link, firth_active) = resolve_external_family(opts.family)?;
-    let cfg = ModelConfig::external(link, opts.tol, opts.max_iter, firth_active);
+    let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
     let y_o = y.to_owned();
@@ -1954,11 +2025,12 @@ where
 }
 
 /// Helper to log the final model structure.
+#[allow(dead_code)]
 fn log_layout_info(
     total_coeffs: usize,
     num_penalties: usize,
-    main_pgs_len: usize,
-    pc_terms: usize,
+    primary_smooth_len: usize,
+    aux_main_terms: usize,
     interaction_terms: usize,
 ) {
     log::info!(
@@ -1966,10 +2038,10 @@ fn log_layout_info(
         total_coeffs
     );
     log::info!("  - Intercept: 1 coefficient.");
-    if main_pgs_len > 0 {
-        log::info!("  - PGS Main Effect: {main_pgs_len} coefficients.");
+    if primary_smooth_len > 0 {
+        log::info!("  - Primary Smooth Effect: {primary_smooth_len} coefficients.");
     }
-    log::info!("  - PC Main Effects: {pc_terms} terms.");
+    log::info!("  - Auxiliary Main Effects: {aux_main_terms} terms.");
     log::info!("  - Interaction Effects: {interaction_terms} terms.");
     log::info!("Total penalized terms: {}", num_penalties);
 }
@@ -2213,7 +2285,7 @@ pub mod internal {
         balanced_penalty_root: Array2<f64>,
         reparam_invariant: ReparamInvariant,
         p: usize,
-        config: &'a ModelConfig,
+        config: &'a RemlConfig,
         nullspace_dims: Vec<usize>,
 
         cache: RefCell<HashMap<Vec<u64>, Arc<PirlsResult>>>,
@@ -2401,6 +2473,7 @@ pub mod internal {
     }
 
     // Formatting utilities moved to crate::diagnostics
+    #[allow(dead_code)]
     impl<'a> RemlState<'a> {
 
         // Row-wise squared norms: diag(M) when M = C C^T.
@@ -2673,7 +2746,7 @@ pub mod internal {
             weights: ArrayView1<'a, f64>,
             s_list: Vec<Array2<f64>>,
             p: usize,
-            config: &'a ModelConfig,
+            config: &'a RemlConfig,
             nullspace_dims: Option<Vec<usize>>,
         ) -> Result<Self, EstimationError> {
             let zero_offset = Array1::<f64>::zeros(y.len());
@@ -2696,7 +2769,7 @@ pub mod internal {
             offset: ArrayView1<'_, f64>,
             s_list: Vec<Array2<f64>>,
             p: usize,
-            config: &'a ModelConfig,
+            config: &'a RemlConfig,
             nullspace_dims: Option<Vec<usize>>,
         ) -> Result<Self, EstimationError> {
             // Pre-compute penalty square roots once
@@ -2789,7 +2862,7 @@ pub mod internal {
             // Determine if Firth is active
             let firth_active = self.config.firth_bias_reduction
                 && matches!(
-                    self.config.link_function().expect("link fn"),
+                    self.config.link_function(),
                     LinkFunction::Logit
                 );
 
@@ -3170,8 +3243,7 @@ pub mod internal {
             let firth_bias = config.firth_bias_reduction;
             let link_is_logit = matches!(
                 config
-                    .link_function()
-                    .expect("link_function called on survival model"),
+                    .link_function(),
                 LinkFunction::Logit
             );
             let balanced_root = &self.balanced_penalty_root;
@@ -3202,7 +3274,7 @@ pub mod internal {
                     Some(balanced_root),
                     Some(reparam_invariant),
                     p_dim,
-                    config,
+                    &config.as_pirls_config(),
                     warm_start_initial.as_ref(),
                     None, // No SE for base model
                 )?;
@@ -3502,12 +3574,15 @@ pub mod internal {
                 }
             }
 
-            // Reverse-mode AD for off-diagonal Firth correction (using spectral C)
-            let mut tensor_t = vec![0.0_f64; p * p * p];
-            let mut v_mat = faer::Mat::<f64>::zeros(n, p);
+            // Reverse-mode AD for off-diagonal Firth correction (using spectral C).
+            // `c` can be rank-truncated (n × r), so all contractions over its axis
+            // must use `r = c.ncols()` rather than `p`.
+            let r = c.ncols();
+            let mut tensor_t = vec![0.0_f64; r * p * p];
+            let mut v_mat = faer::Mat::<f64>::zeros(n, r);
             for i in 0..n {
                 let u_i = u[i];
-                for k in 0..p {
+                for k in 0..r {
                     v_mat[(i, k)] = u_i * c[(i, k)];
                 }
             }
@@ -3521,7 +3596,7 @@ pub mod internal {
                         scaled_b[(j, l)] = b_jm * b[(j, l)];
                     }
                 }
-                let mut t_slice = faer::Mat::<f64>::zeros(p, p);
+                let mut t_slice = faer::Mat::<f64>::zeros(r, p);
                 faer::linalg::matmul::matmul(
                     t_slice.as_mut(),
                     faer::Accum::Replace,
@@ -3530,7 +3605,7 @@ pub mod internal {
                     1.0,
                     Par::Seq,
                 );
-                for k in 0..p {
+                for k in 0..r {
                     for l in 0..p {
                         tensor_t[k * p * p + l * p + m] = t_slice[(k, l)];
                     }
@@ -3545,7 +3620,7 @@ pub mod internal {
                 }
                 for m in 0..p {
                     let mut acc = 0.0;
-                    for k in 0..p {
+                    for k in 0..r {
                         let c_ik = c[(i, k)];
                         if c_ik == 0.0 {
                             continue;
@@ -3873,7 +3948,7 @@ pub mod internal {
                     Some(&self.balanced_penalty_root),
                     Some(&self.reparam_invariant),
                     self.p,
-                    self.config,
+                    &self.config.as_pirls_config(),
                     warm_start_ref,
                     None, // No SE for base model
                 )
@@ -3939,7 +4014,7 @@ pub mod internal {
             }
         }
     }
-
+    #[allow(dead_code)]
     impl<'a> RemlState<'a> {
         /// Compute the objective function for BFGS optimization.
         /// For Gaussian models (Identity link), this is the exact REML score.
@@ -4068,7 +4143,6 @@ pub mod internal {
             match self
                 .config
                 .link_function()
-                .expect("link_function called on survival model")
             {
                 LinkFunction::Identity => {
                     // For Gaussian models, use the exact REML score
@@ -4188,8 +4262,7 @@ pub mod internal {
                     if self.config.firth_bias_reduction
                         && matches!(
                             self.config
-                                .link_function()
-                                .expect("link_function called on survival model"),
+                                .link_function(),
                             LinkFunction::Logit
                         )
                     {
@@ -4752,7 +4825,6 @@ pub mod internal {
                 match self
                     .config
                     .link_function()
-                    .expect("link_function called on survival model")
                 {
                     LinkFunction::Identity => {
                         // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
@@ -5032,8 +5104,7 @@ pub mod internal {
                         // back to H_pen for stability.
                         if !matches!(
                             self.config
-                                .link_function()
-                                .expect("link_function called on survival model"),
+                                .link_function(),
                             LinkFunction::Logit
                         ) {
                             let g_pll =
@@ -5088,7 +5159,7 @@ pub mod internal {
                                 // (spectral factor W is used instead for consistency)
                                 let h_phi_opt: Option<()> = if self.config.firth_bias_reduction
                                     && matches!(
-                                        self.config.link_function().expect("link fn"),
+                                        self.config.link_function(),
                                         LinkFunction::Logit
                                     ) {
                                     Some(()) // Signal that Firth is active (h_phi already subtracted in bundle)
@@ -5190,7 +5261,6 @@ pub mod internal {
                                     if let LinkFunction::Logit = self
                                         .config
                                         .link_function()
-                                        .expect("link_function called on survival model")
                                     {
                                         if self.config.firth_bias_reduction && h_phi_opt.is_some() {
                                             // Use SPECTRAL version with W factor for consistency with truncated cost.
@@ -5910,3 +5980,4 @@ pub mod internal {
         Ok(log_det)
     }
 
+}
