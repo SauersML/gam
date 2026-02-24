@@ -29,7 +29,10 @@ pub use basis::{
     ThinPlateBasisSpec, ThinPlateSplineBasis, build_bspline_basis_1d, build_thin_plate_basis,
     create_thin_plate_spline_basis, create_thin_plate_spline_basis_with_knot_count, select_thin_plate_knots,
 };
-pub use estimate::{FitOptions, FitResult, PredictResult, fit_gam, optimize_external_design, predict_gam};
+pub use estimate::{
+    FitArtifacts, FitOptions, FitResult, PredictResult, fit_gam, optimize_external_design,
+    predict_gam,
+};
 pub use generative::{
     CustomFamilyGenerative, GenerativeSpec, NoiseModel, custom_generative_spec,
     generative_spec_from_gam, generative_spec_from_predict, sample_observation_replicates,
