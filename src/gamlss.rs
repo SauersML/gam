@@ -1,17 +1,26 @@
-use crate::basis::{BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix};
+use crate::basis::{
+    create_basis, create_difference_penalty_matrix, BasisOptions, Dense, KnotSource,
+};
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
-    KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
+    fit_custom_family, BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily,
+    FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::DesignMatrix;
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::LinkFunction;
-use ndarray::{Array1, Array2, ArrayView1, s};
+use faer::linalg::solvers::{
+    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
+};
+use faer::Mat as FaerMat;
+use faer::Side;
+use ndarray::{s, Array1, Array2, ArrayView1};
 
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
+const BETA_RANGE_WARN_THRESHOLD: f64 = 1.10;
+const BINOMIAL_EFFECTIVE_N_WARN_THRESHOLD: f64 = 25.0;
 
 /// Generic block input for high-level built-in family APIs.
 #[derive(Clone)]
@@ -179,8 +188,8 @@ pub fn build_wiggle_block_input_from_knots(
     }
     let design = full.slice(s![.., 1..]).to_owned();
     let p = design.ncols();
-    let mut penalties = vec![create_difference_penalty_matrix(p, penalty_order, None)
-        .map_err(|e| e.to_string())?];
+    let mut penalties =
+        vec![create_difference_penalty_matrix(p, penalty_order, None).map_err(|e| e.to_string())?];
     if double_penalty {
         penalties.push(Array2::<f64>::eye(p));
     }
@@ -219,6 +228,317 @@ fn validate_block_rows(name: &str, n: usize, block: &ParameterBlockInput) -> Res
         n,
         block.design.nrows(),
     )
+}
+
+fn initial_log_lambdas_or_zeros(block: &ParameterBlockInput) -> Result<Array1<f64>, String> {
+    let k = block.penalties.len();
+    let lambdas = block
+        .initial_log_lambdas
+        .clone()
+        .unwrap_or_else(|| Array1::<f64>::zeros(k));
+    if lambdas.len() != k {
+        return Err(format!(
+            "initial_log_lambdas length mismatch: got {}, expected {}",
+            lambdas.len(),
+            k
+        ));
+    }
+    Ok(lambdas)
+}
+
+fn solve_weighted_projection(
+    design: &DesignMatrix,
+    offset: &Array1<f64>,
+    target_eta: &Array1<f64>,
+    weights: &Array1<f64>,
+    ridge_floor: f64,
+) -> Result<Array1<f64>, String> {
+    let x = design.to_dense();
+    let n = x.nrows();
+    let p = x.ncols();
+    if offset.len() != n || target_eta.len() != n || weights.len() != n {
+        return Err("solve_weighted_projection dimension mismatch".to_string());
+    }
+
+    let mut xtwx = Array2::<f64>::zeros((p, p));
+    let mut xtwy = Array1::<f64>::zeros(p);
+
+    for i in 0..n {
+        let wi = weights[i].max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        let y_star = target_eta[i] - offset[i];
+        let row = x.row(i);
+        for a in 0..p {
+            let xa = row[a];
+            xtwy[a] += wi * xa * y_star;
+            for b in a..p {
+                xtwx[[a, b]] += wi * xa * row[b];
+            }
+        }
+    }
+    for a in 0..p {
+        for b in 0..a {
+            xtwx[[a, b]] = xtwx[[b, a]];
+        }
+        xtwx[[a, a]] += ridge_floor.max(1e-12);
+    }
+
+    let h = crate::faer_ndarray::FaerArrayView::new(&xtwx);
+    let mut rhs_mat = FaerMat::zeros(p, 1);
+    for i in 0..p {
+        rhs_mat[(i, 0)] = xtwy[i];
+    }
+
+    if let Ok(ch) = FaerLlt::new(h.as_ref(), Side::Lower) {
+        ch.solve_in_place(rhs_mat.as_mut());
+    } else if let Ok(ld) = FaerLdlt::new(h.as_ref(), Side::Lower) {
+        ld.solve_in_place(rhs_mat.as_mut());
+    } else {
+        let lb = FaerLblt::new(h.as_ref(), Side::Lower);
+        lb.solve_in_place(rhs_mat.as_mut());
+    }
+
+    let mut beta = Array1::<f64>::zeros(p);
+    for i in 0..p {
+        beta[i] = rhs_mat[(i, 0)];
+    }
+    if beta.iter().any(|v| !v.is_finite()) {
+        return Err("solve_weighted_projection produced non-finite coefficients".to_string());
+    }
+    Ok(beta)
+}
+
+fn weighted_prevalence(y: &Array1<f64>, weights: &Array1<f64>) -> f64 {
+    let w_sum: f64 = weights.iter().copied().sum();
+    if w_sum <= 0.0 {
+        return 0.5;
+    }
+    let y_w_sum: f64 = y.iter().zip(weights.iter()).map(|(&yi, &wi)| yi * wi).sum();
+    (y_w_sum / w_sum).clamp(0.0, 1.0)
+}
+
+fn emit_binomial_alpha_beta_warnings(
+    context: &str,
+    beta_values: &Array1<f64>,
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+) {
+    if beta_values.is_empty() {
+        return;
+    }
+    let beta_min = beta_values.iter().copied().fold(f64::INFINITY, f64::min);
+    let beta_max = beta_values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    if !beta_min.is_finite() || !beta_max.is_finite() || beta_min <= 0.0 {
+        log::warn!(
+            "[GAMLSS][{}] non-positive or non-finite beta encountered (min={}, max={})",
+            context,
+            beta_min,
+            beta_max
+        );
+    } else {
+        let ratio = beta_max / beta_min;
+        if ratio > BETA_RANGE_WARN_THRESHOLD {
+            log::warn!(
+                "[GAMLSS][{}] beta range ratio {:.3} exceeds {:.3}; transformed-penalty distortion risk is elevated",
+                context,
+                ratio,
+                BETA_RANGE_WARN_THRESHOLD
+            );
+        }
+    }
+
+    let pi = weighted_prevalence(y, weights);
+    let w_sum: f64 = weights.iter().copied().sum();
+    let n_eff = w_sum * pi * (1.0 - pi);
+    if n_eff < BINOMIAL_EFFECTIVE_N_WARN_THRESHOLD {
+        log::warn!(
+            "[GAMLSS][{}] low effective sample size N_eff={:.3} (sum_w={:.3}, prevalence={:.3}); location-scale separation artifacts are more likely",
+            context,
+            n_eff,
+            w_sum,
+            pi
+        );
+    }
+}
+
+#[derive(Clone)]
+struct BinomialAlphaBetaWarmStartFamily {
+    y: Array1<f64>,
+    score: Array1<f64>,
+    weights: Array1<f64>,
+    beta_min: f64,
+    beta_max: f64,
+}
+
+impl BinomialAlphaBetaWarmStartFamily {
+    const BLOCK_ALPHA: usize = 0;
+    const BLOCK_BETA: usize = 1;
+}
+
+impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialAlphaBetaWarmStartFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_alpha = &block_states[Self::BLOCK_ALPHA].eta;
+        let eta_beta = &block_states[Self::BLOCK_BETA].eta;
+        if eta_alpha.len() != n
+            || eta_beta.len() != n
+            || self.score.len() != n
+            || self.weights.len() != n
+        {
+            return Err("BinomialAlphaBetaWarmStartFamily input size mismatch".to_string());
+        }
+
+        let mut z_alpha = Array1::<f64>::zeros(n);
+        let mut w_alpha = Array1::<f64>::zeros(n);
+        let mut z_beta = Array1::<f64>::zeros(n);
+        let mut w_beta = Array1::<f64>::zeros(n);
+        let mut ll = 0.0_f64;
+
+        for i in 0..n {
+            let raw_beta = eta_beta[i];
+            let beta = raw_beta.clamp(self.beta_min, self.beta_max);
+            let dbeta_deta = if raw_beta >= self.beta_min && raw_beta <= self.beta_max {
+                1.0
+            } else {
+                0.0
+            };
+            let q = eta_alpha[i] + beta * self.score[i];
+            let mu = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
+            let dmu_dq = normal_pdf(q).max(MIN_DERIV);
+            let var = (mu * (1.0 - mu)).max(MIN_PROB);
+
+            ll += self.weights[i] * (self.y[i] * mu.ln() + (1.0 - self.y[i]) * (1.0 - mu).ln());
+
+            let dmu_alpha = dmu_dq;
+            w_alpha[i] = (self.weights[i] * (dmu_alpha * dmu_alpha / var)).max(MIN_WEIGHT);
+            z_alpha[i] = eta_alpha[i] + (self.y[i] - mu) / signed_with_floor(dmu_alpha, MIN_DERIV);
+
+            let chain_beta = self.score[i] * dbeta_deta;
+            let dmu_beta = dmu_dq * chain_beta;
+            w_beta[i] = (self.weights[i] * (dmu_beta * dmu_beta / var)).max(MIN_WEIGHT);
+            z_beta[i] = eta_beta[i] + (self.y[i] - mu) / signed_with_floor(dmu_beta, MIN_DERIV);
+        }
+
+        Ok(FamilyEvaluation {
+            log_likelihood: ll,
+            block_working_sets: vec![
+                BlockWorkingSet {
+                    working_response: z_alpha,
+                    working_weights: w_alpha,
+                    gradient_eta: None,
+                },
+                BlockWorkingSet {
+                    working_response: z_beta,
+                    working_weights: w_beta,
+                    gradient_eta: None,
+                },
+            ],
+        })
+    }
+
+    fn post_update_beta(
+        &self,
+        block_index: usize,
+        beta: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        if block_index != Self::BLOCK_BETA {
+            return Ok(beta);
+        }
+        Ok(beta.mapv(|v| v.clamp(self.beta_min, self.beta_max)))
+    }
+}
+
+fn try_binomial_alpha_beta_warm_start(
+    y: &Array1<f64>,
+    score: &Array1<f64>,
+    weights: &Array1<f64>,
+    sigma_min: f64,
+    sigma_max: f64,
+    threshold_block: &ParameterBlockInput,
+    log_sigma_block: &ParameterBlockInput,
+    options: &BlockwiseFitOptions,
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+    let beta_min = (1.0 / sigma_max.max(1e-12)).max(1e-12);
+    let beta_max = (1.0 / sigma_min.max(1e-12)).max(beta_min + 1e-12);
+    let warm_family = BinomialAlphaBetaWarmStartFamily {
+        y: y.clone(),
+        score: score.clone(),
+        weights: weights.clone(),
+        beta_min,
+        beta_max,
+    };
+
+    let alpha_spec = ParameterBlockSpec {
+        name: "alpha_warm".to_string(),
+        design: threshold_block.design.clone(),
+        offset: threshold_block.offset.clone(),
+        penalties: threshold_block.penalties.clone(),
+        initial_log_lambdas: initial_log_lambdas_or_zeros(threshold_block)?,
+        initial_beta: None,
+    };
+    let beta_spec = ParameterBlockSpec {
+        name: "beta_warm".to_string(),
+        design: log_sigma_block.design.clone(),
+        offset: log_sigma_block.offset.clone(),
+        penalties: log_sigma_block.penalties.clone(),
+        initial_log_lambdas: initial_log_lambdas_or_zeros(log_sigma_block)?,
+        initial_beta: None,
+    };
+
+    let warm_options = BlockwiseFitOptions {
+        inner_max_cycles: options.inner_max_cycles.min(40).max(5),
+        inner_tol: options.inner_tol,
+        outer_max_iter: options.outer_max_iter.min(20).max(3),
+        outer_tol: options.outer_tol.max(1e-6),
+        min_weight: options.min_weight,
+        ridge_floor: options.ridge_floor.max(1e-10),
+        // Warm start optimization focuses on robust initialization, not REML correction.
+        use_reml_objective: false,
+    };
+    let warm_fit = fit_custom_family(&warm_family, &[alpha_spec, beta_spec], &warm_options)?;
+    let eta_alpha = &warm_fit.block_states[BinomialAlphaBetaWarmStartFamily::BLOCK_ALPHA].eta;
+    let eta_beta = &warm_fit.block_states[BinomialAlphaBetaWarmStartFamily::BLOCK_BETA].eta;
+    if eta_alpha.len() != y.len() || eta_beta.len() != y.len() {
+        return Err("warm start eta length mismatch".to_string());
+    }
+
+    let beta_obs = eta_beta.mapv(|v| v.clamp(beta_min, beta_max));
+    let t_target = Array1::from_iter(
+        eta_alpha
+            .iter()
+            .zip(beta_obs.iter())
+            .map(|(&a, &b)| -a / b.max(1e-12)),
+    );
+    let log_sigma_target = beta_obs.mapv(|b| -b.max(1e-12).ln());
+
+    let beta_t = solve_weighted_projection(
+        &threshold_block.design,
+        &threshold_block.offset,
+        &t_target,
+        weights,
+        options.ridge_floor.max(1e-10),
+    )?;
+    let beta_log_sigma = solve_weighted_projection(
+        &log_sigma_block.design,
+        &log_sigma_block.offset,
+        &log_sigma_target,
+        weights,
+        options.ridge_floor.max(1e-10),
+    )?;
+
+    Ok((beta_t, beta_log_sigma, beta_obs))
 }
 
 #[derive(Clone)]
@@ -286,7 +606,11 @@ pub fn fit_gaussian_location_scale(
     let n = spec.y.len();
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validate_weights(&spec.weights, "fit_gaussian_location_scale")?;
-    validate_sigma_bounds(spec.sigma_min, spec.sigma_max, "fit_gaussian_location_scale")?;
+    validate_sigma_bounds(
+        spec.sigma_min,
+        spec.sigma_max,
+        "fit_gaussian_location_scale",
+    )?;
     validate_block_rows("mu", n, &spec.mu_block)?;
     validate_block_rows("log_sigma", n, &spec.log_sigma_block)?;
 
@@ -379,18 +703,57 @@ pub fn fit_binomial_location_scale_probit(
     validate_block_rows("threshold", n, &spec.threshold_block)?;
     validate_block_rows("log_sigma", n, &spec.log_sigma_block)?;
 
+    let BinomialLocationScaleProbitSpec {
+        y,
+        score,
+        weights,
+        sigma_min,
+        sigma_max,
+        mut threshold_block,
+        mut log_sigma_block,
+    } = spec;
+
+    match try_binomial_alpha_beta_warm_start(
+        &y,
+        &score,
+        &weights,
+        sigma_min,
+        sigma_max,
+        &threshold_block,
+        &log_sigma_block,
+        options,
+    ) {
+        Ok((beta_t0, beta_ls0, beta_warm)) => {
+            threshold_block.initial_beta = Some(beta_t0);
+            log_sigma_block.initial_beta = Some(beta_ls0);
+            emit_binomial_alpha_beta_warnings("warm-start", &beta_warm, &y, &weights);
+        }
+        Err(err) => {
+            log::warn!(
+                "[GAMLSS][fit_binomial_location_scale_probit] alpha/beta warm start failed, falling back to direct initialization: {}",
+                err
+            );
+        }
+    }
+
     let family = BinomialLocationScaleProbitFamily {
-        y: spec.y,
-        score: spec.score,
-        weights: spec.weights,
-        sigma_min: spec.sigma_min,
-        sigma_max: spec.sigma_max,
+        y: y.clone(),
+        score: score.clone(),
+        weights: weights.clone(),
+        sigma_min,
+        sigma_max,
     };
     let blocks = vec![
-        spec.threshold_block.into_spec("threshold")?,
-        spec.log_sigma_block.into_spec("log_sigma")?,
+        threshold_block.into_spec("threshold")?,
+        log_sigma_block.into_spec("log_sigma")?,
     ];
-    fit_custom_family(&family, &blocks, options)
+    let fit = fit_custom_family(&family, &blocks, options)?;
+    let beta_final = fit.block_states[BinomialLocationScaleProbitFamily::BLOCK_LOG_SIGMA]
+        .eta
+        .mapv(f64::exp)
+        .mapv(|s| 1.0 / s.clamp(sigma_min, sigma_max).max(1e-12));
+    emit_binomial_alpha_beta_warnings("final-fit", &beta_final, &y, &weights);
+    Ok(fit)
 }
 
 pub fn fit_binomial_location_scale_probit_wiggle(
@@ -424,21 +787,63 @@ pub fn fit_binomial_location_scale_probit_wiggle(
         ));
     }
 
+    let BinomialLocationScaleProbitWiggleSpec {
+        y,
+        score,
+        weights,
+        sigma_min,
+        sigma_max,
+        wiggle_knots,
+        wiggle_degree,
+        mut threshold_block,
+        mut log_sigma_block,
+        wiggle_block,
+    } = spec;
+
+    match try_binomial_alpha_beta_warm_start(
+        &y,
+        &score,
+        &weights,
+        sigma_min,
+        sigma_max,
+        &threshold_block,
+        &log_sigma_block,
+        options,
+    ) {
+        Ok((beta_t0, beta_ls0, beta_warm)) => {
+            threshold_block.initial_beta = Some(beta_t0);
+            log_sigma_block.initial_beta = Some(beta_ls0);
+            emit_binomial_alpha_beta_warnings("warm-start-wiggle", &beta_warm, &y, &weights);
+        }
+        Err(err) => {
+            log::warn!(
+                "[GAMLSS][fit_binomial_location_scale_probit_wiggle] alpha/beta warm start failed, falling back to direct initialization: {}",
+                err
+            );
+        }
+    }
+
     let family = BinomialLocationScaleProbitWiggleFamily {
-        y: spec.y,
-        score: spec.score,
-        weights: spec.weights,
-        sigma_min: spec.sigma_min,
-        sigma_max: spec.sigma_max,
-        wiggle_knots: spec.wiggle_knots,
-        wiggle_degree: spec.wiggle_degree,
+        y: y.clone(),
+        score: score.clone(),
+        weights: weights.clone(),
+        sigma_min,
+        sigma_max,
+        wiggle_knots,
+        wiggle_degree,
     };
     let blocks = vec![
-        spec.threshold_block.into_spec("threshold")?,
-        spec.log_sigma_block.into_spec("log_sigma")?,
-        spec.wiggle_block.into_spec("wiggle")?,
+        threshold_block.into_spec("threshold")?,
+        log_sigma_block.into_spec("log_sigma")?,
+        wiggle_block.into_spec("wiggle")?,
     ];
-    fit_custom_family(&family, &blocks, options)
+    let fit = fit_custom_family(&family, &blocks, options)?;
+    let beta_final = fit.block_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_LOG_SIGMA]
+        .eta
+        .mapv(f64::exp)
+        .mapv(|s| 1.0 / s.clamp(sigma_min, sigma_max).max(1e-12));
+    emit_binomial_alpha_beta_warnings("final-fit-wiggle", &beta_final, &y, &weights);
+    Ok(fit)
 }
 
 /// Link identifiers for distribution parameters in multi-parameter GAMLSS families.
@@ -454,7 +859,11 @@ pub enum ParameterLink {
 
 fn signed_with_floor(v: f64, floor: f64) -> f64 {
     let a = v.abs().max(floor);
-    if v >= 0.0 { a } else { -a }
+    if v >= 0.0 {
+        a
+    } else {
+        -a
+    }
 }
 
 struct BinomialLocationScaleCore {
@@ -693,7 +1102,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
 }
 
 impl CustomFamilyGenerative for GaussianLocationScaleFamily {
-    fn generative_spec(&self, block_states: &[ParameterBlockState]) -> Result<GenerativeSpec, String> {
+    fn generative_spec(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 2 {
             return Err(format!(
                 "GaussianLocationScaleFamily expects 2 blocks, got {}",
@@ -781,16 +1193,19 @@ impl CustomFamily for BinomialLogitFamily {
 }
 
 impl CustomFamilyGenerative for BinomialLogitFamily {
-    fn generative_spec(&self, block_states: &[ParameterBlockState]) -> Result<GenerativeSpec, String> {
+    fn generative_spec(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 1 {
             return Err(format!(
                 "BinomialLogitFamily expects 1 block, got {}",
                 block_states.len()
             ));
         }
-        let mean = block_states[Self::BLOCK_ETA]
-            .eta
-            .mapv(|e| (1.0 / (1.0 + (-e.clamp(-30.0, 30.0)).exp())).clamp(MIN_PROB, 1.0 - MIN_PROB));
+        let mean = block_states[Self::BLOCK_ETA].eta.mapv(|e| {
+            (1.0 / (1.0 + (-e.clamp(-30.0, 30.0)).exp())).clamp(MIN_PROB, 1.0 - MIN_PROB)
+        });
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Bernoulli,
@@ -874,7 +1289,10 @@ impl CustomFamily for PoissonLogFamily {
 }
 
 impl CustomFamilyGenerative for PoissonLogFamily {
-    fn generative_spec(&self, block_states: &[ParameterBlockState]) -> Result<GenerativeSpec, String> {
+    fn generative_spec(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 1 {
             return Err(format!(
                 "PoissonLogFamily expects 1 block, got {}",
@@ -971,7 +1389,10 @@ impl CustomFamily for GammaLogFamily {
 }
 
 impl CustomFamilyGenerative for GammaLogFamily {
-    fn generative_spec(&self, block_states: &[ParameterBlockState]) -> Result<GenerativeSpec, String> {
+    fn generative_spec(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 1 {
             return Err(format!(
                 "GammaLogFamily expects 1 block, got {}",
@@ -1035,7 +1456,8 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n || self.score.len() != n {
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n || self.score.len() != n
+        {
             return Err("BinomialLocationScaleProbitFamily input size mismatch".to_string());
         }
 
@@ -1066,7 +1488,10 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleProbitFamily {
-    fn generative_spec(&self, block_states: &[ParameterBlockState]) -> Result<GenerativeSpec, String> {
+    fn generative_spec(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 2 {
             return Err(format!(
                 "BinomialLocationScaleProbitFamily expects 2 blocks, got {}",
@@ -1080,7 +1505,10 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitFamily {
         }
         let mut mean = Array1::<f64>::zeros(self.score.len());
         for i in 0..mean.len() {
-            let sigma = eta_ls[i].exp().clamp(self.sigma_min, self.sigma_max).max(1e-12);
+            let sigma = eta_ls[i]
+                .exp()
+                .clamp(self.sigma_min, self.sigma_max)
+                .max(1e-12);
             let q = (self.score[i] - eta_t[i]) / sigma;
             mean[i] = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
         }
@@ -1118,7 +1546,11 @@ impl BinomialLocationScaleProbitWiggleFamily {
     }
 
     pub fn parameter_links() -> &'static [ParameterLink] {
-        &[ParameterLink::Probit, ParameterLink::Log, ParameterLink::Wiggle]
+        &[
+            ParameterLink::Probit,
+            ParameterLink::Log,
+            ParameterLink::Wiggle,
+        ]
     }
 
     pub fn metadata() -> FamilyMetadata {
@@ -1241,7 +1673,10 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         }
         let mut q0 = Array1::<f64>::zeros(self.score.len());
         for i in 0..q0.len() {
-            let sigma = eta_ls[i].exp().clamp(self.sigma_min, self.sigma_max).max(1e-12);
+            let sigma = eta_ls[i]
+                .exp()
+                .clamp(self.sigma_min, self.sigma_max)
+                .max(1e-12);
             q0[i] = (self.score[i] - eta_t[i]) / sigma;
         }
         let x = self.wiggle_design(q0.view())?;
@@ -1258,7 +1693,10 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {
-    fn generative_spec(&self, block_states: &[ParameterBlockState]) -> Result<GenerativeSpec, String> {
+    fn generative_spec(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 3 {
             return Err(format!(
                 "BinomialLocationScaleProbitWiggleFamily expects 3 blocks, got {}",
@@ -1268,12 +1706,20 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let eta_w = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != self.score.len() || eta_ls.len() != self.score.len() || eta_w.len() != self.score.len() {
-            return Err("BinomialLocationScaleProbitWiggleFamily generative size mismatch".to_string());
+        if eta_t.len() != self.score.len()
+            || eta_ls.len() != self.score.len()
+            || eta_w.len() != self.score.len()
+        {
+            return Err(
+                "BinomialLocationScaleProbitWiggleFamily generative size mismatch".to_string(),
+            );
         }
         let mut mean = Array1::<f64>::zeros(self.score.len());
         for i in 0..mean.len() {
-            let sigma = eta_ls[i].exp().clamp(self.sigma_min, self.sigma_max).max(1e-12);
+            let sigma = eta_ls[i]
+                .exp()
+                .clamp(self.sigma_min, self.sigma_max)
+                .max(1e-12);
             let q0 = (self.score[i] - eta_t[i]) / sigma;
             mean[i] = normal_cdf_approx(q0 + eta_w[i]).clamp(MIN_PROB, 1.0 - MIN_PROB);
         }
@@ -1281,5 +1727,84 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {
             mean,
             noise: NoiseModel::Bernoulli,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn intercept_block(n: usize) -> ParameterBlockInput {
+        ParameterBlockInput {
+            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            offset: Array1::zeros(n),
+            penalties: Vec::new(),
+            initial_log_lambdas: None,
+            initial_beta: None,
+        }
+    }
+
+    #[test]
+    fn weighted_projection_returns_finite_coefficients() {
+        let n = 8usize;
+        let design = DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0));
+        let offset = Array1::zeros(n);
+        let target_eta = Array1::from_vec(vec![0.2; n]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let beta =
+            solve_weighted_projection(&design, &offset, &target_eta, &weights, 1e-10).unwrap();
+        assert_eq!(beta.len(), 1);
+        assert!(beta[0].is_finite());
+        assert!((beta[0] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn alpha_beta_warm_start_produces_finite_targets() {
+        let n = 16usize;
+        let y = Array1::from_vec((0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect());
+        let score = Array1::from_vec((0..n).map(|i| i as f64 / n as f64 - 0.5).collect());
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold = intercept_block(n);
+        let log_sigma = intercept_block(n);
+
+        let (beta_t, beta_ls, beta_obs) = try_binomial_alpha_beta_warm_start(
+            &y,
+            &score,
+            &weights,
+            0.25,
+            4.0,
+            &threshold,
+            &log_sigma,
+            &BlockwiseFitOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(beta_t.len(), 1);
+        assert_eq!(beta_ls.len(), 1);
+        assert!(beta_t[0].is_finite());
+        assert!(beta_ls[0].is_finite());
+        assert!(beta_obs.iter().all(|v| v.is_finite() && *v > 0.0));
+    }
+
+    #[test]
+    fn fit_binomial_location_scale_probit_runs_with_warm_start_path() {
+        let n = 32usize;
+        let y = Array1::from_vec((0..n).map(|i| if i % 4 == 0 { 1.0 } else { 0.0 }).collect());
+        let score = Array1::from_vec((0..n).map(|i| (i as f64 - 16.0) / 10.0).collect());
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let spec = BinomialLocationScaleProbitSpec {
+            y,
+            score,
+            weights,
+            sigma_min: 0.3,
+            sigma_max: 3.0,
+            threshold_block: intercept_block(n),
+            log_sigma_block: intercept_block(n),
+        };
+
+        let fit = fit_binomial_location_scale_probit(spec, &BlockwiseFitOptions::default())
+            .expect("binomial location-scale probit should fit");
+        assert_eq!(fit.block_states.len(), 2);
+        assert!(fit.log_likelihood.is_finite());
     }
 }
