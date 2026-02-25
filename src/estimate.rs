@@ -75,9 +75,8 @@ fn eta_from_mu_for_link(mu: f64, link: LinkFunction) -> f64 {
 }
 
 use crate::diagnostics::{
-    GRAD_DIAG_BETA_COLLAPSE_COUNT, GRAD_DIAG_DELTA_ZERO_COUNT, GRAD_DIAG_KKT_SKIP_COUNT,
     approx_f64, format_compact_series, format_cond, format_range, quantize_value, quantize_vec,
-    should_emit_grad_diag, should_emit_h_min_eig_diag,
+    should_emit_h_min_eig_diag,
 };
 
 // Note: deflate_weights_by_se was removed. We now use integrated (GHQ) likelihood
@@ -1100,13 +1099,11 @@ fn run_newton_for_candidate(
         }
     }
 
-    if !stationary {
-        let mut grad = reml_state.compute_gradient(&best_rho)?;
-        maybe_audit_gradient(reml_state, &best_rho, iter_done as u64, &mut grad);
-        project_rho_gradient(&best_rho, &mut grad);
-        best_grad_norm = grad_norm_in_z_space(&best_rho, &grad);
-        stationary = best_grad_norm <= tol;
-    }
+    let final_z = to_z_from_rho(&best_rho);
+    let (verified_grad_norm, verified_stationary) =
+        check_rho_gradient_stationarity(label, reml_state, &final_z, tol)?;
+    best_grad_norm = verified_grad_norm;
+    stationary = verified_stationary;
 
     Ok(OuterSolveResult {
         final_rho: best_rho,
@@ -3977,128 +3974,6 @@ pub mod internal {
 
         const MIN_DMU_DETA: f64 = 1e-6;
 
-        /// Compute ∂log|H|/∂β given w'_i = dW_ii/dη_i.
-        /// Uses the penalized Hessian factorization for leverage computation.
-        fn logh_beta_grad_from_wprime(
-            &self,
-            x_transformed: &DesignMatrix,
-            w_prime: &Array1<f64>,
-            factor: &Arc<FaerFactor>,
-        ) -> Option<Array1<f64>> {
-            let n = w_prime.len();
-            if n == 0 {
-                return None;
-            }
-
-            // Always use full rank path (Cholesky solve).
-            // This is consistent with compute_cost which now uses full log|H| via Cholesky.
-            // Previously, truncation was used here but it caused gradient mismatch.
-
-            let mut leverage = Array1::<f64>::zeros(n);
-            let chunk_cols = 1024usize;
-            match x_transformed {
-                DesignMatrix::Dense(x_dense) => {
-                    let p_dim = x_dense.ncols();
-                    for chunk_start in (0..n).step_by(chunk_cols) {
-                        let chunk_end = (chunk_start + chunk_cols).min(n);
-                        let width = chunk_end - chunk_start;
-
-                        // Full rank path (standard Cholesky solve)
-                        let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                        for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                            rhs.column_mut(local).assign(&x_dense.row(row_idx));
-                        }
-                        let rhs_view = FaerArrayView::new(&rhs);
-                        let sol = factor.solve(rhs_view.as_ref());
-                        for local in 0..width {
-                            let row_idx = chunk_start + local;
-                            let mut acc = 0.0;
-                            for j in 0..p_dim {
-                                acc += x_dense[[row_idx, j]] * sol[(j, local)];
-                            }
-                            leverage[row_idx] = acc;
-                        }
-                    }
-                }
-                DesignMatrix::Sparse(x_sparse) => {
-                    let p_dim = x_sparse.ncols();
-                    let csr_opt = x_sparse.as_ref().to_row_major().ok();
-                    if let Some(x_csr) = csr_opt {
-                        let symbolic = x_csr.symbolic();
-                        let values = x_csr.val();
-                        let row_ptr = symbolic.row_ptr();
-                        let col_idx = symbolic.col_idx();
-                        for chunk_start in (0..n).step_by(chunk_cols) {
-                            let chunk_end = (chunk_start + chunk_cols).min(n);
-                            let width = chunk_end - chunk_start;
-
-                            // Full rank sparse path
-                            let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                let start = row_ptr[row_idx];
-                                let end = row_ptr[row_idx + 1];
-                                for idx in start..end {
-                                    rhs[[col_idx[idx], local]] = values[idx];
-                                }
-                            }
-                            let rhs_view = FaerArrayView::new(&rhs);
-                            let sol = factor.solve(rhs_view.as_ref());
-                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                let mut acc = 0.0;
-                                let start = row_ptr[row_idx];
-                                let end = row_ptr[row_idx + 1];
-                                for idx in start..end {
-                                    let col = col_idx[idx];
-                                    acc += values[idx] * sol[(col, local)];
-                                }
-                                leverage[row_idx] = acc;
-                            }
-                        }
-                    } else {
-                        // Fallback for non-CSR sparse (convert to dense)
-                        let mut x_dense =
-                            Array2::<f64>::zeros((x_sparse.nrows(), x_sparse.ncols()));
-                        let (symbolic, values) = x_sparse.parts();
-                        let col_ptr = symbolic.col_ptr();
-                        let row_idx = symbolic.row_idx();
-                        for col in 0..x_sparse.ncols() {
-                            let start = col_ptr[col];
-                            let end = col_ptr[col + 1];
-                            for idx in start..end {
-                                x_dense[[row_idx[idx], col]] = values[idx];
-                            }
-                        }
-                        let p_dim = x_dense.ncols();
-                        for chunk_start in (0..n).step_by(chunk_cols) {
-                            let chunk_end = (chunk_start + chunk_cols).min(n);
-                            let width = chunk_end - chunk_start;
-
-                            let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                rhs.column_mut(local).assign(&x_dense.row(row_idx));
-                            }
-                            let rhs_view = FaerArrayView::new(&rhs);
-                            let sol = factor.solve(rhs_view.as_ref());
-                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                let mut acc = 0.0;
-                                for j in 0..p_dim {
-                                    acc += x_dense[[row_idx, j]] * sol[(j, local)];
-                                }
-                                leverage[row_idx] = acc;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let mut weight_vec = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                weight_vec[i] = leverage[i] * w_prime[i];
-            }
-            let logh_grad = x_transformed.transpose_vector_multiply(&weight_vec);
-            Some(logh_grad)
-        }
-
         // Accessor methods for private fields
         pub(super) fn x(&self) -> &DesignMatrix {
             &self.x
@@ -5670,29 +5545,6 @@ pub mod internal {
 
                             // P-IRLS already folded any stabilization ridge into h_eff.
 
-                            // Create local factor_g for the non-Firth path and Firth fallback.
-                            // This branch uses full-rank Cholesky (not pseudoinverse);
-                            // see logh_beta_grad_logit notes on truncation interactions.
-                            let factor_g = {
-                                let h_total = bundle.h_total.as_ref();
-                                let h_view = FaerArrayView::new(h_total);
-                                if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-                                    Arc::new(FaerFactor::Llt(f))
-                                } else {
-                                    // Fallback to LDLT
-                                    match FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-                                        Ok(f) => Arc::new(FaerFactor::Ldlt(f)),
-                                        Err(_) => {
-                                            // Last resort: use the RidgePlanner
-                                            // But we don't have easy access to self.get_faer_factor here without rho.
-                                            // We'll panic or return error if this fails, which is rare for h_total.
-                                            // Or better, use get_faer_factor since we have rho.
-                                            self.get_faer_factor(p, h_total)
-                                        }
-                                    }
-                                }
-                            };
-
                             // TRACE TERM COMPUTATION (exact non-Gaussian/logit dH term):
                             //   tr(H_+^\dagger H_k), with
                             //   H_k = S_k - X^T diag(c ⊙ (X v_k)) X,  v_k = H_+^\dagger (S_k beta).
@@ -5793,215 +5645,17 @@ pub mod internal {
                             // because P_N H_+^\dagger = 0.
                             let truncation_corrections = vec![0.0; k_count];
 
-                            let residual_grad = {
-                                let eta = pirls_result
-                                    .solve_mu
-                                    .mapv(|m| eta_from_mu_for_link(m, self.config.link_function()));
-                                let working_residual = &eta - &pirls_result.solve_working_response;
-                                let weighted_residual =
-                                    &pirls_result.solve_weights * &working_residual;
-                                let gradient_data = pirls_result
-                                    .x_transformed
-                                    .transpose_vector_multiply(&weighted_residual);
-                                let s_beta = reparam_result.s_transformed.dot(beta_ref);
-                                // When Firth bias reduction is active, the working response already
-                                // includes the Jeffreys adjustment via the hat diagonal. That means
-                                // the Firth score term is embedded in this residual gradient; do not
-                                // add any extra ∂log|I|/∂β term here or it will be double-counted.
-                                // If PIRLS added a stabilization ridge, the objective being
-                                // optimized is l_p(β) - 0.5 * ridge * ||β||². The gradient
-                                // therefore gains + ridge * β, included here so the implicit
-                                // correction is taken on the same stabilized objective.
-                                if ridge_passport.quadratic_penalty_ridge() > 0.0 {
-                                    gradient_data
-                                        + s_beta
-                                        + beta_ref
-                                            .mapv(|v| ridge_passport.quadratic_penalty_ridge() * v)
-                                } else {
-                                    gradient_data + s_beta
-                                }
-                            };
-
-                            // LAML adds 0.5 * ∂log|H₊|/∂β via Jacobi's formula:
-                            //   ∂/∂β_j log|H₊| = tr(H₊† ∂H/∂β_j)
-                            // For logit in this path, H = Xᵀ W X + S.
-                            let logh_beta_grad: Option<Array1<f64>> = self
-                                .logh_beta_grad_from_wprime(
-                                    &pirls_result.x_transformed,
-                                    &w_prime,
-                                    &factor_g,
-                                );
-
-                            let mut grad_beta = if self.config.firth_bias_reduction {
-                                // Chain-rule term for Firth-LAML:
-                                //
-                                //   ∂V/∂β = -∂l_p^*/∂β + 0.5 * ∂log|H_total|/∂β
-                                //
-                                // where l_p^* is the *actual* inner objective optimized by PIRLS
-                                // (log-likelihood + Jeffreys adjustment - 0.5 βᵀ S β - 0.5 ridge ||β||²).
-                                //
-                                // At a perfect optimum, ∂l_p^*/∂β = 0 and the residual term vanishes.
-                                // In practice, PIRLS stops at a tolerance and may add a stabilization ridge,
-                                // so ∂l_p^*/∂β can be non-zero. Dropping it breaks the chain rule and makes
-                                // the implicit correction term collapse (exactly the observed failure mode).
-                                //
-                                // The working response already includes the Jeffreys (Firth) score, so
-                                // residual_grad is the correct score of the *inner* objective. Therefore
-                                // the exact ∂V/∂β is:
-                                //
-                                //   residual_grad + 0.5 * ∂log|H_total|/∂β
-                                //
-                                // which is what we construct here.
-
-                                // ## 3. The Full Gradient Expression
-                                // Combining into the total derivative:
-                                // dV/drho = Direct Terms + Implicit Correction
-                                // Direct Terms = 0.5 * beta_quad + 0.5 * log|H| - 0.5 * log|S|
-                                // Implicit Correction = (grad_beta)^T * (-H_total^-1 * lambda * S_k * beta)
-                                let mut g = residual_grad.clone();
-
-                                if let Some(logh_grad) = logh_beta_grad.as_ref() {
-                                    g += &(0.5 * logh_grad);
-                                }
-                                g
-                            } else {
-                                // Non-Firth case matches standard LAML
-                                residual_grad.clone()
-                            };
-                            if !self.config.firth_bias_reduction {
-                                if let Some(logh_grad) = logh_beta_grad {
-                                    // At the PIRLS optimum (with or without Firth), the
-                                    // residual term cancels, leaving +0.5 * ∂log|H|/∂β.
-                                    grad_beta += &(0.5 * &logh_grad);
-                                    let res_inf = residual_grad
-                                        .iter()
-                                        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-                                    let logh_inf =
-                                        logh_grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-                                    let grad_inf =
-                                        grad_beta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-                                    if logh_inf < 1e-8 || grad_inf < 1e-8 {
-                                        let (should_print, count) =
-                                            should_emit_grad_diag(&GRAD_DIAG_BETA_COLLAPSE_COUNT);
-                                        if should_print {
-                                            eprintln!(
-                                                "[GRAD DIAG #{count}] beta-grad collapse: max|residual|={:.3e} max|logh|={:.3e} max|grad_beta|={:.3e}",
-                                                res_inf, logh_inf, grad_inf
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Compute KKT residual norm to check if envelope theorem applies.
-                            // The Implicit Function Theorem (used for delta_opt) assumes that β moves
-                            // to maintain ∇V = 0 as ρ changes. If P-IRLS hasn't converged (large residual),
-                            // β is effectively "stuck" on a ledge and doesn't move as predicted by IFT.
-                            // In that case, we skip the implicit correction.
-                            let kkt_norm = residual_grad
-                                .iter()
-                                .fold(0.0_f64, |acc, &v| acc + v * v)
-                                .sqrt();
-                            let kkt_tol = self.config.convergence_tolerance.max(1e-4);
-                            let kkt_ok = kkt_norm <= kkt_tol;
-
-                            if !grad_beta.iter().all(|v| v.is_finite()) {
-                                log::warn!(
-                                    "Skipping IFT correction: non-finite gradient entries (kkt_norm={:.2e}).",
-                                    kkt_norm
-                                );
-                            }
-                            if !kkt_ok {
-                                let (should_print, count) =
-                                    should_emit_grad_diag(&GRAD_DIAG_KKT_SKIP_COUNT);
-                                if should_print {
-                                    eprintln!(
-                                        "[GRAD DIAG #{count}] skipping IFT correction: kkt_norm={:.3e} tol={:.3e}",
-                                        kkt_norm, kkt_tol
-                                    );
-                                }
-                            }
-
-                            let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) && kkt_ok {
-                                // IMPLICIT DERIVATIVE: d/dρ beta_hat = -H^-1 S_k beta.
-                                // For spectral consistency with truncated log|H| we use H_+^\dagger.
-                                // Apply in factor form to avoid dense H_+^\dagger materialization:
-                                //   H_+^\dagger v = W (W^T v), W = U_+ diag(1/sqrt(lambda_+)).
-                                let delta: Array1<f64> = if w_pos.ncols() == 0 {
-                                    Array1::zeros(grad_beta.len())
-                                } else {
-                                    let wtg = w_pos.t().dot(&grad_beta);
-                                    w_pos.dot(&wtg)
-                                };
-
-                                let delta_inf = delta
-                                    .iter()
-                                    .fold(0.0_f64, |acc: f64, &v: &f64| acc.max(v.abs()));
-                                if delta_inf < 1e-8 {
-                                    let (should_print, count) =
-                                        should_emit_grad_diag(&GRAD_DIAG_DELTA_ZERO_COUNT);
-                                    if should_print {
-                                        eprintln!(
-                                            "[GRAD DIAG #{count}] delta ~0: max|delta|={:.3e} max|grad_beta|={:.3e}",
-                                            delta_inf,
-                                            grad_beta
-                                                .iter()
-                                                .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-                                        );
-                                    }
-                                }
-                                Some(delta)
-                            } else {
-                                None
-                            };
-
                             for k in 0..k_count {
                                 let log_det_h_grad_term = 0.5 * lambdas[k] * trace_terms[k];
                                 let corrected_log_det_h =
                                     log_det_h_grad_term - truncation_corrections[k];
                                 let log_det_s_grad_term = 0.5 * det1_values[k];
 
-                                // Exact LAML gradient assembly in this loop:
-                                //   g_k =
-                                //     0.5 * β̂ᵀ S_k^ρ β̂
-                                //   - 0.5 * tr(S^+ S_k^ρ)
-                                //   + 0.5 * tr(H^{-1} H_k)
-                                //   + (∇_β V)ᵀ (dβ̂/dρ_k)
-                                //
-                                // Direct terms:
-                                //   0.5 * beta_terms[k]      = 0.5 * β̂ᵀ S_k^ρ β̂
-                                //   log_det_s_grad_term      = 0.5 * tr(S^+ S_k^ρ)
-                                //   corrected_log_det_h      = 0.5 * tr(H^{-1} H_k)
-                                //
-                                // Implicit chain-rule term:
-                                //   dβ̂/dρ_k = -H^{-1}(S_k^ρ β̂), so
-                                //   (∇_β V)ᵀ(dβ̂/dρ_k) = -(H^{-1}∇_βV)ᵀ(S_k^ρβ̂) = -δᵀu_k.
-                                //
-                                // This is exactly the first-order IFT term required by:
-                                //   dV/dρ_k = ∂V/∂ρ_k + (∇_β V)ᵀ (∂β̂/∂ρ_k).
-                                //
-                                // In the ideal inner optimum, ∇_βV contributions from residual score
-                                // vanish by envelope arguments; in finite-iteration PIRLS we keep this
-                                // correction explicitly to remain consistent with the solved inner system.
-                                let mut gradient_value =
+                                // Exact LAML gradient assembly for the implemented objective:
+                                //   g_k = 0.5 * β̂ᵀ A_k β̂ - 0.5 * tr(S^+ A_k) + 0.5 * tr(H^{-1} H_k)
+                                // where A_k = ∂S/∂ρ_k = λ_k S_k and H_k is the total derivative.
+                                let gradient_value =
                                     0.5 * beta_terms[k] + corrected_log_det_h - log_det_s_grad_term;
-
-                                // Add Implicit Correction (Section 2.1 & 4.3):
-                                // term = (nabla_beta V)^T * (d_beta / d_rho)
-                                //      = (grad_beta)^T * (-H^-1 * lambda * S_k * beta)
-                                //      = - (H^-1 grad_beta)^T * (lambda * S_k * beta)
-                                //      = - delta_opt^T * u_k
-
-                                if let Some(delta_ref) = delta_opt.as_ref() {
-                                    let u_k: Array1<f64> = s_k_beta_all[k].mapv(|v| v * lambdas[k]);
-                                    // Indirect term from chain rule:
-                                    // dV/dρ_k = ∂V/∂ρ_k + (∇β V)ᵀ dβ/dρ_k.
-                                    // Differentiate stationarity g = score - Sβ (+ Firth): ∂g/∂β = -H,
-                                    // ∂g/∂ρ_k = -S_k β, so dβ/dρ_k = -H^{-1} S_k β and
-                                    // the implicit correction is -(∇β V)ᵀ H^{-1} (S_k β) = -δᵀ u_k.
-                                    let correction = -delta_ref.dot(&u_k);
-                                    gradient_value += correction;
-                                }
                                 laml_grad.push(gradient_value);
                             }
                             workspace
