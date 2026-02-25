@@ -1,7 +1,7 @@
+use crate::faer_ndarray::FaerCholesky;
 use crate::faer_ndarray::{fast_ata, fast_atv};
 use crate::matrix::DesignMatrix;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
-use crate::faer_ndarray::FaerCholesky;
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
@@ -311,7 +311,9 @@ fn weighted_normal_equations(
     if w.len() != n {
         return Err("weighted normal-equation dimension mismatch".to_string());
     }
-    if let Some(y) = y_star && y.len() != n {
+    if let Some(y) = y_star
+        && y.len() != n
+    {
         return Err("weighted RHS dimension mismatch".to_string());
     }
 
@@ -530,11 +532,8 @@ fn blockwise_logdet_terms<F: CustomFamily>(
         h += &s_lambda;
         logdet_h_total +=
             stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?;
-        logdet_s_total += stable_logdet_with_ridge_policy(
-            &s_lambda,
-            options.ridge_floor,
-            options.ridge_policy,
-        )?;
+        logdet_s_total +=
+            stable_logdet_with_ridge_policy(&s_lambda, options.ridge_floor, options.ridge_policy)?;
     }
     Ok((logdet_h_total, logdet_s_total))
 }

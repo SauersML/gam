@@ -54,11 +54,24 @@
 //! posterior), Hamiltonian Monte Carlo could sample β directly and compute
 //! risk for each sample. This is 100-1000x more expensive but makes no
 //! distributional assumptions.
+//!
+//! Practical scope of "exact" special-function formulas:
+//! - Logistic-normal mean/variance can be written exactly with Faddeeva-series
+//!   representations and are useful as oracle references.
+//! - These formulas are mathematically exact representations distinct from the
+//!   GHQ-based moment computations used elsewhere in this module.
 
 use std::sync::OnceLock;
 
 /// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
 const N_POINTS: usize = 7;
+const SQRT_2: f64 = std::f64::consts::SQRT_2;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Complex {
+    re: f64,
+    im: f64,
+}
 
 /// Quadrature context that owns Gauss-Hermite caches.
 pub struct QuadratureContext {
@@ -231,7 +244,7 @@ fn symmetric_tridiagonal_eigen(
         if !converged {
             // Guaranteed progress fallback: force trailing deflation if QR did not
             // converge within max_iter. For our tiny fixed-size Jacobi matrices this
-            // is extremely rare and preferable to a potential infinite loop.
+            // is extremely rare and avoids a potential infinite loop.
             off_diag[n - 2] = 0.0;
             n -= 1;
         }
@@ -370,6 +383,139 @@ pub fn logit_posterior_mean_batch(
         .map_collect(|&e, &se| logit_posterior_mean(ctx, e, se))
 }
 
+/// Oracle-only exact logistic-normal mean using the Faddeeva-series representation.
+///
+/// For η ~ N(mu, sigma^2):
+///   E[sigmoid(η)] = 1/2 - (sqrt(2π)/sigma) * Σ_{n>=1} Im[w((i a_n - mu)/(sqrt(2)sigma))]
+/// where a_n = (2n-1)π and w is the Faddeeva function.
+///
+/// Deterministic integration-free equivalent representation:
+/// Let m=mu, s=sigma, and erfcx(x)=exp(x^2)erfc(x). Then an exact convergent form is
+///
+///   E[sigmoid(η)]
+///   = Φ(m/s)
+///     + 0.5 * exp(-m^2/(2s^2))
+///       * Σ_{k>=1} (-1)^{k-1}
+///         [ erfcx((k s^2 + m)/(sqrt(2)s)) - erfcx((k s^2 - m)/(sqrt(2)s)) ].
+///
+/// A matching exact second-moment representation uses the same erfcx building
+/// blocks U_k/V_k plus the boundary term -φ_{m,s}(0):
+///
+///   U_k(m,s) = 0.5 * exp(-m^2/(2s^2)) * erfcx((k s^2 - m)/(sqrt(2)s))
+///   V_k(m,s) = 0.5 * exp(-m^2/(2s^2)) * erfcx((k s^2 + m)/(sqrt(2)s))
+///
+///   E[sigmoid(η)^2]
+///     = Φ(m/s)
+///       + Σ_{k>=1} (k+1)(-1)^k U_k
+///       + Σ_{k>=2} (k-1)(-1)^k V_k
+///       - φ_{m,s}(0),
+///
+/// and therefore
+///
+///   Var(sigmoid(η)) = E[sigmoid(η)^2] - E[sigmoid(η)]^2.
+///
+/// Derivation sketch:
+/// 1) sigmoid(t) = 1/2 + 1/2 tanh(t/2)
+/// 2) tanh has a partial-fraction expansion over odd poles ±i(2n-1)π
+/// 3) Taking Gaussian expectations termwise yields rational expectations of the form
+///      E[ 1 / (Z - i a_n) ], Z~N(mu,sigma^2)
+/// 4) Those are exactly representable by the Faddeeva function:
+///      E[ 1 / (Z - i a) ] = i*sqrt(pi)/(sqrt(2)*sigma) * w((i a - mu)/(sqrt(2)*sigma))
+/// 5) Taking imaginary parts and summing odd a_n gives the stated series.
+///
+/// Therefore this routine is mathematically exact up to numerical truncation and
+/// numerical evaluation error of w(z).
+pub fn logit_posterior_mean_exact(mu: f64, sigma: f64) -> f64 {
+    if !(mu.is_finite() && sigma.is_finite()) || sigma <= 0.0 {
+        return sigmoid(mu).clamp(1e-12, 1.0 - 1e-12);
+    }
+    if sigma < 1e-10 {
+        return sigmoid(mu).clamp(1e-12, 1.0 - 1e-12);
+    }
+
+    let sqrt2_sigma = SQRT_2 * sigma;
+    let coeff = (2.0_f64 * std::f64::consts::PI).sqrt() / sigma;
+    let mut sum_im = 0.0_f64;
+    let mut stable_small_terms = 0usize;
+
+    for n in 1..=4096usize {
+        let a_n = (2.0 * (n as f64) - 1.0) * std::f64::consts::PI;
+        let z = Complex {
+            re: -mu / sqrt2_sigma,
+            im: a_n / sqrt2_sigma, // strictly positive
+        };
+        let w = faddeeva_upper_halfplane(z);
+        if !w.im.is_finite() {
+            break;
+        }
+        let term = w.im;
+        sum_im += term;
+
+        let contrib = (coeff * term).abs();
+        if contrib < 1e-14 {
+            stable_small_terms += 1;
+            if stable_small_terms >= 8 {
+                break;
+            }
+        } else {
+            stable_small_terms = 0;
+        }
+    }
+
+    (0.5 - coeff * sum_im).clamp(1e-12, 1.0 - 1e-12)
+}
+
+/// Faddeeva function w(z)=exp(-z^2)erfc(-iz) for Im(z)>0.
+///
+/// Uses the Cauchy-type integral representation:
+///   w(z) = (i/π) ∫ exp(-t^2)/(z-t) dt,  t in R, Im(z)>0.
+///
+/// Writing z=x+iy (y>0), this gives:
+///   Re w(z) = (1/π) ∫ exp(-t^2) * y / ((x-t)^2 + y^2) dt
+///   Im w(z) = (1/π) ∫ exp(-t^2) * (x-t) / ((x-t)^2 + y^2) dt
+///
+/// We evaluate both with composite Simpson's rule.
+fn faddeeva_upper_halfplane(z: Complex) -> Complex {
+    let x = z.re;
+    let y = z.im.max(1e-12);
+    let span = (x.abs() + 10.0).max(14.0);
+    let a = -span;
+    let b = span;
+    let n = 4000usize; // even
+    let h = (b - a) / (n as f64);
+
+    let eval = |t: f64| -> Complex {
+        let u = x - t;
+        let den = (u * u + y * y).max(1e-300);
+        let e = (-t * t).exp();
+        // i/(z-t) = y/den + i*u/den
+        Complex {
+            re: e * y / den,
+            im: e * u / den,
+        }
+    };
+
+    let mut s_re = 0.0_f64;
+    let mut s_im = 0.0_f64;
+    let f0 = eval(a);
+    let fn_ = eval(b);
+    s_re += f0.re + fn_.re;
+    s_im += f0.im + fn_.im;
+
+    for i in 1..n {
+        let t = a + (i as f64) * h;
+        let f = eval(t);
+        let w = if i % 2 == 0 { 2.0 } else { 4.0 };
+        s_re += w * f.re;
+        s_im += w * f.im;
+    }
+    let scale = (h / 3.0) / std::f64::consts::PI;
+    Complex {
+        re: s_re * scale,
+        im: s_im * scale,
+    }
+}
+
 /// Standard sigmoid function with numerical stability.
 #[inline]
 fn sigmoid(x: f64) -> f64 {
@@ -394,6 +540,85 @@ mod tests {
 
     fn normal_pdf(z: f64) -> f64 {
         (-(z * z) * 0.5).exp() / (2.0 * std::f64::consts::PI).sqrt()
+    }
+
+    // Test-only real erfcx approximation based on A&S erf polynomial.
+    // For x >= 0:
+    //   erfcx(x) = exp(x^2) erfc(x) ≈ P(t), t = 1/(1+p x),
+    // where erfc(x) ≈ exp(-x^2) P(t). This avoids large exp(x^2) factors.
+    // For x < 0 use the reflection identity:
+    //   erfcx(-x) = 2 exp(x^2) - erfcx(x).
+    fn erfcx_test(x: f64) -> f64 {
+        // Coefficients from the common A&S 7.1.26 erf approximation.
+        const P: f64 = 0.3275911;
+        const A1: f64 = 0.254_829_592;
+        const A2: f64 = -0.284_496_736;
+        const A3: f64 = 1.421_413_741;
+        const A4: f64 = -1.453_152_027;
+        const A5: f64 = 1.061_405_429;
+
+        if x >= 0.0 {
+            let t = 1.0 / (1.0 + P * x);
+            (((((A5 * t + A4) * t + A3) * t + A2) * t + A1) * t).max(0.0)
+        } else {
+            let xp = -x;
+            // Reflection: erfcx(-xp) = 2*exp(xp^2) - erfcx(xp).
+            // In this test helper, cap exponent to avoid inf in extreme synthetic inputs.
+            let exp_term = (xp * xp).min(700.0).exp();
+            2.0 * exp_term - erfcx_test(xp)
+        }
+    }
+
+    // Test-only deterministic erfcx-series oracle for E[sigmoid(N(m,s^2))].
+    // Formula:
+    // E = Phi(m/s) + 0.5*exp(-m^2/(2s^2)) * Σ_{k>=1} (-1)^{k-1}
+    //     [erfcx((k s^2 + m)/(sqrt(2)s)) - erfcx((k s^2 - m)/(sqrt(2)s))].
+    fn exact_logistic_expectation_erfcx_series(m: f64, s: f64) -> f64 {
+        if !(m.is_finite() && s.is_finite()) || s <= 0.0 {
+            return sigmoid(m).clamp(1e-12, 1.0 - 1e-12);
+        }
+        if s < 1e-10 {
+            return sigmoid(m).clamp(1e-12, 1.0 - 1e-12);
+        }
+
+        let pref = 0.5 * (-(m * m) / (2.0 * s * s)).exp();
+        let z = std::f64::consts::SQRT_2 * s;
+        let mut sum = 0.0_f64;
+        let mut stable_pairs = 0usize;
+
+        // Pair terms (k,k+1) for faster alternating-series stabilization.
+        let mut k = 1usize;
+        while k <= 4096 {
+            let kf = k as f64;
+            let a1 = (kf * s * s + m) / z;
+            let b1 = (kf * s * s - m) / z;
+            let t1 = erfcx_test(a1) - erfcx_test(b1);
+            let signed_t1 = if k % 2 == 1 { t1 } else { -t1 };
+            sum += signed_t1;
+
+            if k + 1 <= 4096 {
+                let k2f = (k + 1) as f64;
+                let a2 = (k2f * s * s + m) / z;
+                let b2 = (k2f * s * s - m) / z;
+                let t2 = erfcx_test(a2) - erfcx_test(b2);
+                let signed_t2 = if (k + 1) % 2 == 1 { t2 } else { -t2 };
+                sum += signed_t2;
+
+                let pair_mag = (signed_t1 + signed_t2).abs() * pref;
+                if pair_mag < 1e-13 {
+                    stable_pairs += 1;
+                    if stable_pairs >= 6 {
+                        break;
+                    }
+                } else {
+                    stable_pairs = 0;
+                }
+            }
+            k += 2;
+        }
+
+        let phi_term = crate::probability::normal_cdf_approx(m / s);
+        (phi_term + pref * sum).clamp(1e-12, 1.0 - 1e-12)
     }
 
     fn high_res_sigmoid_integral(eta: f64, se: f64) -> f64 {
@@ -426,7 +651,7 @@ mod tests {
             let j = N_POINTS - 1 - i;
             assert_relative_eq!(gh.nodes[i], -gh.nodes[j], epsilon = 1e-12);
         }
-        // Middle node should be zero
+        // Middle node is expected to be zero
         assert_relative_eq!(gh.nodes[N_POINTS / 2], 0.0, epsilon = 1e-12);
     }
 
@@ -490,7 +715,7 @@ mod tests {
 
     #[test]
     fn test_zero_se_returns_mode() {
-        // When SE is zero, posterior mean should equal mode
+        // When SE is zero, posterior mean is expected to equal mode
         let eta = 1.5;
         let se = 0.0;
         let ctx = QuadratureContext::new();
@@ -501,7 +726,7 @@ mod tests {
 
     #[test]
     fn test_symmetric_at_zero() {
-        // At eta=0 (50% probability), mean should still be ~50%
+        // At eta=0 (50% probability), mean is expected to be ~50%
         let eta = 0.0;
         let se = 1.0;
         let ctx = QuadratureContext::new();
@@ -512,14 +737,14 @@ mod tests {
 
     #[test]
     fn test_shrinkage_at_extremes() {
-        // At extreme eta, mean should be pulled toward 0.5
+        // At extreme eta, mean is expected to be pulled toward 0.5
         let eta = 3.0; // mode = sigmoid(3) ≈ 0.953
         let se = 1.0;
         let ctx = QuadratureContext::new();
         let mean = logit_posterior_mean(&ctx, eta, se);
         let mode = sigmoid(eta);
 
-        // Mean should be less than mode (shrunk toward 0.5)
+        // Mean is expected to be less than mode (shrunk toward 0.5)
         assert!(mean < mode, "Expected mean {} < mode {}", mean, mode);
         // But still reasonably high
         assert!(mean > 0.8, "Mean {} should still be high", mean);
@@ -556,7 +781,7 @@ mod tests {
 
     #[test]
     fn test_quadrature_integrates_x_squared() {
-        // The quadrature should exactly integrate x² against exp(-x²)
+        // The quadrature exactly integrates x² against exp(-x²)
         // ∫ x² exp(-x²) dx = sqrt(π)/2
         let ctx = QuadratureContext::new();
         let gh = ctx.gauss_hermite();
@@ -570,7 +795,7 @@ mod tests {
 
     #[test]
     fn test_quadrature_integrates_x_fourth() {
-        // The quadrature should exactly integrate x⁴ against exp(-x²)
+        // The quadrature exactly integrates x⁴ against exp(-x²)
         // ∫ x⁴ exp(-x²) dx = 3*sqrt(π)/4
         let ctx = QuadratureContext::new();
         let gh = ctx.gauss_hermite();
@@ -629,6 +854,52 @@ mod tests {
             let ghq = logit_posterior_mean(&ctx, eta, se);
             let numeric = high_res_sigmoid_integral(eta, se);
             assert_relative_eq!(ghq, numeric, epsilon = 8e-4);
+        }
+    }
+
+    #[test]
+    fn test_logit_posterior_mean_exact_symmetry_identity() {
+        let cases = [(-3.0, 0.5), (-1.2, 1.7), (0.0, 2.2), (2.3, 0.8)];
+        for (mu, sigma) in cases {
+            let p = logit_posterior_mean_exact(mu, sigma);
+            let q = logit_posterior_mean_exact(-mu, sigma);
+            assert_relative_eq!(p + q, 1.0, epsilon = 3e-5);
+        }
+    }
+
+    #[test]
+    fn test_logit_posterior_mean_exact_matches_high_res_integral() {
+        let cases = [(-2.0, 0.4), (-0.7, 1.1), (0.8, 0.9), (2.4, 1.7)];
+        for (mu, sigma) in cases {
+            let exact = logit_posterior_mean_exact(mu, sigma);
+            let numeric = high_res_sigmoid_integral(mu, sigma);
+            assert_relative_eq!(exact, numeric, epsilon = 2e-4);
+        }
+    }
+
+    #[test]
+    fn test_ghq7_close_to_exact_oracle() {
+        let ctx = QuadratureContext::new();
+        let cases = [(-3.0, 0.3), (-1.0, 0.8), (0.5, 1.2), (2.8, 1.0)];
+        for (eta, se) in cases {
+            let ghq = logit_posterior_mean(&ctx, eta, se);
+            let exact = logit_posterior_mean_exact(eta, se);
+            assert_relative_eq!(ghq, exact, epsilon = 2.5e-3);
+        }
+    }
+
+    #[test]
+    fn test_ghq7_matches_real_erfcx_series_oracle() {
+        let ctx = QuadratureContext::new();
+        let m_values = [-3.0, -1.0, 0.0, 1.0, 3.0];
+        let s_values = [0.1, 0.5, 1.0, 2.0];
+
+        for &m in &m_values {
+            for &s in &s_values {
+                let ghq = logit_posterior_mean(&ctx, m, s);
+                let oracle = exact_logistic_expectation_erfcx_series(m, s);
+                assert_relative_eq!(ghq, oracle, epsilon = 2e-3, max_relative = 3e-3);
+            }
         }
     }
 }

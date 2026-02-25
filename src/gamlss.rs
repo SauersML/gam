@@ -1229,12 +1229,7 @@ impl CustomFamily for BinomialLogitFamily {
         if eta.len() != n || self.weights.len() != n {
             return Err("BinomialLogitFamily input size mismatch".to_string());
         }
-        evaluate_single_block_glm(
-            LikelihoodFamily::BinomialLogit,
-            &self.y,
-            &self.weights,
-            eta,
-        )
+        evaluate_single_block_glm(LikelihoodFamily::BinomialLogit, &self.y, &self.weights, eta)
     }
 }
 

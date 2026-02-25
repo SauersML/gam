@@ -25,6 +25,34 @@ pub enum FaerLinalgError {
     Ldlt(solvers::LdltError),
 }
 
+pub enum FaerSymmetricFactor {
+    Llt(FaerLlt<f64>),
+    Ldlt(FaerLdlt<f64>),
+}
+
+impl FaerSymmetricFactor {
+    #[inline]
+    pub fn solve(&self, rhs: MatRef<'_, f64>) -> Mat<f64> {
+        match self {
+            FaerSymmetricFactor::Llt(f) => f.solve(rhs),
+            FaerSymmetricFactor::Ldlt(f) => f.solve(rhs),
+        }
+    }
+}
+
+/// Factorize a symmetric system with an LLT first attempt and LDLT fallback.
+#[inline]
+pub fn factorize_symmetric_with_fallback(
+    matrix: MatRef<'_, f64>,
+    side: Side,
+) -> Result<FaerSymmetricFactor, FaerLinalgError> {
+    if let Ok(llt) = FaerLlt::new(matrix, side) {
+        return Ok(FaerSymmetricFactor::Llt(llt));
+    }
+    let ldlt = FaerLdlt::new(matrix, side).map_err(FaerLinalgError::Ldlt)?;
+    Ok(FaerSymmetricFactor::Ldlt(ldlt))
+}
+
 #[inline]
 fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
     // Small, centralized dispatch policy:
@@ -32,7 +60,8 @@ fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
     // - switch to faer GEMM/GEMV for moderate+ sizes.
     const MIN_DIM: usize = 32;
     const MIN_FLOP_SCALE: usize = 64 * 64;
-    (m >= MIN_DIM || n >= MIN_DIM || k >= MIN_DIM) && m.saturating_mul(n).saturating_mul(k) >= MIN_FLOP_SCALE
+    (m >= MIN_DIM || n >= MIN_DIM || k >= MIN_DIM)
+        && m.saturating_mul(n).saturating_mul(k) >= MIN_FLOP_SCALE
 }
 
 #[inline]
@@ -491,7 +520,9 @@ mod tests {
     }
 
     fn inertia_from_eigs(a: &Array2<f64>, tol: f64) -> (usize, usize, usize) {
-        let (evals, _) = a.eigh(Side::Lower).expect("eigen decomposition should succeed");
+        let (evals, _) = a
+            .eigh(Side::Lower)
+            .expect("eigen decomposition should succeed");
         let mut pos = 0usize;
         let mut neg = 0usize;
         let mut zero = 0usize;

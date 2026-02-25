@@ -16,8 +16,9 @@
 //! - LAML cost computed via logdet of joint Gauss-Newton Hessian
 
 use crate::basis::{
-    BasisOptions, Dense, KnotSource, baseline_lambda_seed, compute_geometric_constraint_transform,
-    create_basis, create_difference_penalty_matrix,
+    BasisOptions, Dense, KnotSource, apply_linear_extension_from_first_derivative,
+    baseline_lambda_seed, compute_geometric_constraint_transform, create_basis,
+    create_difference_penalty_matrix,
 };
 use crate::construction::{
     EngineDims, ReparamInvariant, ReparamResult, compute_penalty_square_roots,
@@ -398,33 +399,14 @@ impl<'a> JointModelState<'a> {
         match basis_result {
             Ok((bspline_basis, knots)) => {
                 let mut bspline_basis = bspline_basis.as_ref().clone();
-                // Linear extension outside [0,1]: B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c).
-                let mut needs_ext = false;
-                for i in 0..z_raw.len() {
-                    if (z_raw[i] - z_c[i]).abs() > 1e-12 {
-                        needs_ext = true;
-                        break;
-                    }
-                }
-                if needs_ext {
-                    let (b_prime_arc, _) = create_basis::<Dense>(
-                        z_c.view(),
-                        KnotSource::Provided(knots.view()),
-                        degree,
-                        BasisOptions::first_derivative(),
-                    )
-                    .map_err(|e| format!("B-spline derivative basis construction failed: {e}"))?;
-                    let b_prime = b_prime_arc.as_ref();
-                    for i in 0..z_raw.len() {
-                        let dz = z_raw[i] - z_c[i];
-                        if dz.abs() <= 1e-12 {
-                            continue;
-                        }
-                        for j in 0..bspline_basis.ncols() {
-                            bspline_basis[[i, j]] += dz * b_prime[[i, j]];
-                        }
-                    }
-                }
+                apply_linear_extension_from_first_derivative(
+                    z_raw.view(),
+                    z_c.view(),
+                    knots.view(),
+                    degree,
+                    &mut bspline_basis,
+                )
+                .map_err(|e| format!("B-spline extension failed: {e}"))?;
 
                 // Store knot vector and initialize geometric constraint if first call
                 let first_init = self.knot_vector.is_none();
@@ -490,33 +472,17 @@ impl<'a> JointModelState<'a> {
             Err(_) => return Array2::zeros((n, 0)),
         };
 
-        // Apply the same linear extension used during training.
         let mut b_raw = b_raw;
-        let mut needs_ext = false;
-        for i in 0..z_raw.len() {
-            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
-                needs_ext = true;
-                break;
-            }
-        }
-        if needs_ext {
-            if let Ok((b_prime_arc, _)) = create_basis::<Dense>(
-                z_c.view(),
-                KnotSource::Provided(knot_vector.view()),
-                self.degree,
-                BasisOptions::first_derivative(),
-            ) {
-                let b_prime = b_prime_arc.as_ref();
-                for i in 0..z_raw.len() {
-                    let dz = z_raw[i] - z_c[i];
-                    if dz.abs() <= 1e-12 {
-                        continue;
-                    }
-                    for j in 0..b_raw.ncols() {
-                        b_raw[[i, j]] += dz * b_prime[[i, j]];
-                    }
-                }
-            }
+        if apply_linear_extension_from_first_derivative(
+            z_raw.view(),
+            z_c.view(),
+            knot_vector.view(),
+            self.degree,
+            &mut b_raw,
+        )
+        .is_err()
+        {
+            return Array2::zeros((n, 0));
         }
 
         // Use geometric transform (preferred) or fall back to link_transform
@@ -2307,10 +2273,14 @@ impl<'a> JointRemlState<'a> {
             let delta_beta = delta.slice(s![..p_base]).to_owned();
             let delta_theta = delta.slice(s![p_base..]).to_owned();
 
-            dot_u.assign(&fast_ab(
-                &state.x_base,
-                &delta_beta.clone().insert_axis(ndarray::Axis(1)),
-            ).column(0).to_owned());
+            dot_u.assign(
+                &fast_ab(
+                    &state.x_base,
+                    &delta_beta.clone().insert_axis(ndarray::Axis(1)),
+                )
+                .column(0)
+                .to_owned(),
+            );
 
             // dot_z_raw = d/ dρ_k [ (u - min_u) / range_width ]
             //          = (1 / range_width) * dot_u.
@@ -2320,10 +2290,11 @@ impl<'a> JointRemlState<'a> {
                 dot_z[i] = dot_u[i] * inv_rw;
             }
 
-            dot_eta.assign(&fast_ab(
-                &j_mat,
-                &delta.clone().insert_axis(ndarray::Axis(1)),
-            ).column(0).to_owned());
+            dot_eta.assign(
+                &fast_ab(&j_mat, &delta.clone().insert_axis(ndarray::Axis(1)))
+                    .column(0)
+                    .to_owned(),
+            );
 
             // w' for logit (clamped)
             if matches!(state.link, LinkFunction::Logit) {
@@ -3234,33 +3205,13 @@ pub fn predict_joint(
     ) {
         Ok((basis, _)) => {
             let mut raw = basis.as_ref().clone();
-            // B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c)
-            let mut needs_ext = false;
-            for i in 0..z_raw.len() {
-                if (z_raw[i] - z_c[i]).abs() > 1e-12 {
-                    needs_ext = true;
-                    break;
-                }
-            }
-            if needs_ext {
-                if let Ok((b_prime_arc, _)) = create_basis::<Dense>(
-                    z_c.view(),
-                    KnotSource::Provided(result.knot_vector.view()),
-                    result.degree,
-                    BasisOptions::first_derivative(),
-                ) {
-                    let b_prime = b_prime_arc.as_ref();
-                    for i in 0..z_raw.len() {
-                        let dz = z_raw[i] - z_c[i];
-                        if dz.abs() <= 1e-12 {
-                            continue;
-                        }
-                        for j in 0..raw.ncols() {
-                            raw[[i, j]] += dz * b_prime[[i, j]];
-                        }
-                    }
-                }
-            }
+            let _ = apply_linear_extension_from_first_derivative(
+                z_raw.view(),
+                z_c.view(),
+                result.knot_vector.view(),
+                result.degree,
+                &mut raw,
+            );
             if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
                 raw.dot(&result.link_transform)
             } else {

@@ -8,6 +8,8 @@ pub mod construction;
 pub mod custom_family;
 pub mod diagnostics;
 pub mod estimate;
+#[cfg(test)]
+mod exact_oracle_tests;
 pub mod faer_ndarray;
 pub mod families;
 pub mod gamlss;
@@ -15,6 +17,7 @@ pub mod generative;
 pub mod hmc;
 pub mod hull;
 pub mod joint;
+pub mod layout;
 pub mod matrix;
 pub mod pirls;
 pub mod probability;
@@ -26,9 +29,9 @@ pub mod types;
 pub mod visualizer;
 
 pub use alo::{
-    AloDiagnostics, AloOptions, AloSeMode, compute_alo_diagnostics, compute_alo_diagnostics_from_fit,
-    compute_alo_diagnostics_from_pirls, compute_alo_diagnostics_from_pirls_with_options,
-    compute_alo_diagnostics_with_options,
+    AloDiagnostics, AloOptions, AloSeMode, compute_alo_diagnostics,
+    compute_alo_diagnostics_from_fit, compute_alo_diagnostics_from_pirls,
+    compute_alo_diagnostics_from_pirls_with_options, compute_alo_diagnostics_with_options,
 };
 pub use basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
@@ -63,6 +66,9 @@ pub use generative::{
     CustomFamilyGenerative, GenerativeSpec, NoiseModel, custom_generative_spec,
     generative_spec_from_gam, generative_spec_from_predict, sample_observation_replicates,
     sample_observations,
+};
+pub use layout::{
+    EngineLayout, EngineLayoutBuilder, EngineTerm, EngineTermKind, EngineTermSpec, PenaltySpec,
 };
 pub use smooth::{
     FittedTermCollection, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec,

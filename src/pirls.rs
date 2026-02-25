@@ -7,9 +7,7 @@ use crate::faer_ndarray::{
 use crate::matrix::DesignMatrix;
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
-use crate::types::{
-    LikelihoodFamily, LinkFunction, RidgePassport, RidgePolicy,
-};
+use crate::types::{LikelihoodFamily, LinkFunction, RidgePassport, RidgePolicy};
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
@@ -131,12 +129,9 @@ impl WorkingLikelihood for LikelihoodFamily {
                 Ok(())
             }
             (LikelihoodFamily::BinomialProbit, Some(_))
-            | (LikelihoodFamily::BinomialCLogLog, Some(_)) => Err(
-                EstimationError::InvalidInput(
-                    "Integrated updates are currently only implemented for BinomialLogit"
-                        .to_string(),
-                ),
-            ),
+            | (LikelihoodFamily::BinomialCLogLog, Some(_)) => Err(EstimationError::InvalidInput(
+                "Integrated updates are currently only implemented for BinomialLogit".to_string(),
+            )),
             (LikelihoodFamily::RoystonParmar, Some(_)) => Err(EstimationError::InvalidInput(
                 "RoystonParmar requires survival-specific integrated updates".to_string(),
             )),
@@ -153,7 +148,15 @@ impl WorkingLikelihood for LikelihoodFamily {
                 Ok(())
             }
             (LikelihoodFamily::GaussianIdentity, _) => {
-                update_glm_vectors(y, eta, LinkFunction::Identity, prior_weights, mu, weights, z);
+                update_glm_vectors(
+                    y,
+                    eta,
+                    LinkFunction::Identity,
+                    prior_weights,
+                    mu,
+                    weights,
+                    z,
+                );
                 Ok(())
             }
             (LikelihoodFamily::RoystonParmar, None) => Err(EstimationError::InvalidInput(

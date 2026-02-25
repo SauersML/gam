@@ -1,6 +1,4 @@
-use crate::faer_ndarray::{
-    FaerEigh, FaerLinalgError, FaerSvd, fast_ab, fast_ata, fast_atb,
-};
+use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd, fast_ab, fast_ata, fast_atb};
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
@@ -219,6 +217,66 @@ pub fn create_basis<O: BasisOutputFormat>(
     };
 
     O::build_basis(data, degree, eval_kind, knot_vec)
+}
+
+/// Applies first-order linear extension outside `[0, 1]` to a basis matrix
+/// that was evaluated at clamped coordinates.
+///
+/// Given `z_raw` and `z_clamped = clamp(z_raw, 0, 1)`, this mutates
+/// `basis_values` in-place as:
+/// `B_ext(z_raw) = B(z_clamped) + (z_raw - z_clamped) * B'(z_clamped)`.
+pub fn apply_linear_extension_from_first_derivative(
+    z_raw: ArrayView1<f64>,
+    z_clamped: ArrayView1<f64>,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    basis_values: &mut Array2<f64>,
+) -> Result<(), BasisError> {
+    if z_raw.len() != z_clamped.len() {
+        return Err(BasisError::DimensionMismatch(
+            "z_raw and z_clamped must have equal length".to_string(),
+        ));
+    }
+    if basis_values.nrows() != z_raw.len() {
+        return Err(BasisError::DimensionMismatch(
+            "basis row count must match z length".to_string(),
+        ));
+    }
+
+    let mut needs_ext = false;
+    for i in 0..z_raw.len() {
+        if (z_raw[i] - z_clamped[i]).abs() > 1e-12 {
+            needs_ext = true;
+            break;
+        }
+    }
+    if !needs_ext {
+        return Ok(());
+    }
+
+    let (b_prime_arc, _) = create_basis::<Dense>(
+        z_clamped,
+        KnotSource::Provided(knot_vector),
+        degree,
+        BasisOptions::first_derivative(),
+    )?;
+    let b_prime = b_prime_arc.as_ref();
+    if b_prime.nrows() != basis_values.nrows() || b_prime.ncols() != basis_values.ncols() {
+        return Err(BasisError::DimensionMismatch(
+            "basis derivative shape mismatch".to_string(),
+        ));
+    }
+
+    for i in 0..z_raw.len() {
+        let dz = z_raw[i] - z_clamped[i];
+        if dz.abs() <= 1e-12 {
+            continue;
+        }
+        for j in 0..basis_values.ncols() {
+            basis_values[[i, j]] += dz * b_prime[[i, j]];
+        }
+    }
+    Ok(())
 }
 
 /// Trait for building basis matrices with different storage formats.
@@ -1824,9 +1882,8 @@ pub fn build_bspline_basis_1d(
             num_internal_knots,
             placement,
         } => {
-            let inferred = num_internal_knots.unwrap_or_else(|| {
-                default_internal_knot_count_for_data(data.len(), spec.degree)
-            });
+            let inferred = num_internal_knots
+                .unwrap_or_else(|| default_internal_knot_count_for_data(data.len(), spec.degree));
             let knots = match placement {
                 BSplineKnotPlacement::Uniform => {
                     let range = finite_data_range(data)?;
@@ -1887,7 +1944,8 @@ fn apply_bspline_identifiability_policy(
     let (design_c, z_opt): (Array2<f64>, Option<Array2<f64>>) = match identifiability {
         BSplineIdentifiability::None => (design, None),
         BSplineIdentifiability::WeightedSumToZero { weights } => {
-            let (b_c, z) = apply_sum_to_zero_constraint(design.view(), weights.as_ref().map(|w| w.view()))?;
+            let (b_c, z) =
+                apply_sum_to_zero_constraint(design.view(), weights.as_ref().map(|w| w.view()))?;
             (b_c, Some(z))
         }
         BSplineIdentifiability::RemoveLinearTrend => {
@@ -4853,9 +4911,21 @@ mod tests {
         let mut d1 = vec![0.0; support];
         let mut d2 = vec![0.0; support];
 
-        let _ = evaluate_splines_derivative_sparse_into(-10.0, degree, knots.view(), &mut d1, &mut scratch);
+        let _ = evaluate_splines_derivative_sparse_into(
+            -10.0,
+            degree,
+            knots.view(),
+            &mut d1,
+            &mut scratch,
+        );
         assert!(d1.iter().all(|v| v.abs() < 1e-12));
-        let _ = evaluate_splines_derivative_sparse_into(10.0, degree, knots.view(), &mut d1, &mut scratch);
+        let _ = evaluate_splines_derivative_sparse_into(
+            10.0,
+            degree,
+            knots.view(),
+            &mut d1,
+            &mut scratch,
+        );
         assert!(d1.iter().all(|v| v.abs() < 1e-12));
 
         let _ = evaluate_splines_second_derivative_sparse_into(
