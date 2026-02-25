@@ -51,6 +51,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10d() {
 
     let spec = TermCollectionSpec {
         linear_terms: vec![],
+        random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
             name: "duchon_10d".to_string(),
             basis: SmoothBasisSpec::Duchon {
