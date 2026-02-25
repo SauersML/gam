@@ -1022,8 +1022,6 @@ fn run_newton_for_candidate(
 
     let mut best_rho = rho.clone();
     let mut best_cost = f64::INFINITY;
-    let mut best_grad_norm = f64::INFINITY;
-    let mut stationary = false;
     let mut iter_done = 0usize;
 
     for iter in 0..max_iter {
@@ -1032,14 +1030,11 @@ fn run_newton_for_candidate(
         let mut grad = reml_state.compute_gradient(&rho)?;
         maybe_audit_gradient(reml_state, &rho, iter_done as u64, &mut grad);
         project_rho_gradient(&rho, &mut grad);
-        let grad_norm = grad_norm_in_z_space(&rho, &grad);
         if cost.is_finite() && (cost < best_cost || !best_cost.is_finite()) {
             best_cost = cost;
             best_rho = rho.clone();
-            best_grad_norm = grad_norm;
         }
-        if grad_norm <= tol {
-            stationary = true;
+        if grad_norm_in_z_space(&rho, &grad) <= tol {
             break;
         }
 
@@ -1102,15 +1097,13 @@ fn run_newton_for_candidate(
     let final_z = to_z_from_rho(&best_rho);
     let (verified_grad_norm, verified_stationary) =
         check_rho_gradient_stationarity(label, reml_state, &final_z, tol)?;
-    best_grad_norm = verified_grad_norm;
-    stationary = verified_stationary;
 
     Ok(OuterSolveResult {
         final_rho: best_rho,
         final_value: best_cost,
         iterations: iter_done,
-        grad_norm_rho: best_grad_norm,
-        stationary,
+        grad_norm_rho: verified_grad_norm,
+        stationary: verified_stationary,
     })
 }
 
@@ -1503,6 +1496,7 @@ where
     let mut best_solution: Option<OuterSolveResult> = None;
     let mut best_grad_norm = f64::INFINITY;
     let mut found_stationary = false;
+    let near_stationary_tol = (cfg.reml_convergence_tolerance.max(1e-12)) * 2.0;
     let use_newton = true;
     for (label, initial_z) in candidate_seeds {
         let solution = if use_newton {
@@ -1568,6 +1562,13 @@ where
         if better {
             best_grad_norm = solution.grad_norm_rho;
             best_solution = Some(solution);
+        }
+        if best_grad_norm <= near_stationary_tol {
+            eprintln!(
+                "[external] early stop on near-stationary candidate (grad_norm={:.3e}, tol={:.3e})",
+                best_grad_norm, near_stationary_tol
+            );
+            break;
         }
     }
     let chosen_solution = best_solution.ok_or_else(|| {
