@@ -357,6 +357,16 @@ fn compute_bunch_kaufman_inertia(
     (positive, negative, zero)
 }
 
+/// Computes a symmetric-indefinite rook-pivoted `LBL^T` factorization.
+///
+/// Returns `(l_unit_lower, d_diag, d_subdiag, perm_fwd, perm_inv, inertia)` where:
+/// - `l_unit_lower`: unit-lower-triangular `L`.
+/// - `d_diag`: diagonal entries of block-diagonal `B`.
+/// - `d_subdiag`: off-diagonal entries for `2x2` blocks in `B` (zeros for `1x1` pivots).
+/// - `perm_fwd`, `perm_inv`: permutation arrays from faer.
+/// - `inertia`: `(n_pos, n_neg, n_zero)` computed from `B` blocks.
+///
+/// This mirrors faer's bunch-kaufman storage contract for `cholesky_in_place`.
 pub fn ldlt_rook(
     matrix: &Array2<f64>,
 ) -> Result<
@@ -377,16 +387,26 @@ pub fn ldlt_rook(
         ));
     }
     let n = nrows;
-    let mut factor = matrix.to_owned();
-    let mut subdiag = Array1::<f64>::zeros(n);
+    // faer LBLT contract (bunch-kaufman::factor::cholesky_in_place):
+    // - `matrix` (in-place output) stores:
+    //   - strict lower triangle: L (unit-lower multipliers),
+    //   - diagonal: diagonal of block-diagonal B factor (1x1 and 2x2 blocks).
+    // - `DiagMut` argument stores only the off-diagonal terms of 2x2 blocks in B.
+    //
+    // We keep these as explicit outputs:
+    // - `l_unit_lower`: L with diagonal normalized to 1, upper triangle zeroed.
+    // - `d_diag`: diagonal of B.
+    // - `d_subdiag`: subdiagonal entries for 2x2 B blocks.
+    let mut l_unit_lower = matrix.to_owned();
+    let mut d_subdiag = Array1::<f64>::zeros(n);
     let mut perm_fwd = vec![0usize; n];
     let mut perm_inv = vec![0usize; n];
 
-    let mut faer_mat = array2_to_mat_mut(&mut factor);
-    let subdiag_slice = subdiag
+    let mut faer_mat = array2_to_mat_mut(&mut l_unit_lower);
+    let subdiag_slice = d_subdiag
         .as_slice_memory_order_mut()
         .expect("1-D array should expose contiguous slice");
-    let mut diag_mut = DiagMut::from_slice_mut(subdiag_slice);
+    let mut b_subdiag_mut = DiagMut::from_slice_mut(subdiag_slice);
     let par = get_global_parallelism();
     let mut params = <LbltParams as Auto<f64>>::auto();
     params.pivoting = PivotingStrategy::Rook;
@@ -400,7 +420,7 @@ pub fn ldlt_rook(
 
     factor::cholesky_in_place(
         faer_mat.as_mut(),
-        diag_mut.as_mut(),
+        b_subdiag_mut.as_mut(),
         &mut perm_fwd,
         &mut perm_inv,
         par,
@@ -408,18 +428,108 @@ pub fn ldlt_rook(
         params_spec,
     );
 
-    let mut diag = Array1::<f64>::zeros(n);
+    // Extract B diagonal from faer in-place diagonal, then normalize L diagonal to 1.
+    let mut d_diag = Array1::<f64>::zeros(n);
     for i in 0..n {
-        diag[i] = factor[(i, i)];
-        factor[(i, i)] = 1.0;
+        d_diag[i] = l_unit_lower[(i, i)];
+        l_unit_lower[(i, i)] = 1.0;
         for j in i + 1..n {
-            factor[(i, j)] = 0.0;
+            l_unit_lower[(i, j)] = 0.0;
         }
     }
 
-    let inertia = compute_bunch_kaufman_inertia(&diag, &subdiag);
+    let inertia = compute_bunch_kaufman_inertia(&d_diag, &d_subdiag);
 
-    Ok((factor, diag, subdiag, perm_fwd, perm_inv, inertia))
+    Ok((l_unit_lower, d_diag, d_subdiag, perm_fwd, perm_inv, inertia))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn reconstruct_from_ldlt(
+        l_unit_lower: &Array2<f64>,
+        d_diag: &Array1<f64>,
+        d_subdiag: &Array1<f64>,
+        perm_inv: &[usize],
+    ) -> Array2<f64> {
+        let n = d_diag.len();
+        let mut b = Array2::<f64>::zeros((n, n));
+        let mut i = 0usize;
+        while i < n {
+            if i + 1 < n && d_subdiag[i].abs() > 1e-12 {
+                b[[i, i]] = d_diag[i];
+                b[[i, i + 1]] = d_subdiag[i];
+                b[[i + 1, i]] = d_subdiag[i];
+                b[[i + 1, i + 1]] = d_diag[i + 1];
+                i += 2;
+            } else {
+                b[[i, i]] = d_diag[i];
+                i += 1;
+            }
+        }
+
+        let tmp = l_unit_lower.dot(&b).dot(&l_unit_lower.t());
+        let mut out = Array2::<f64>::zeros((n, n));
+        for row in 0..n {
+            for col in 0..n {
+                out[[row, col]] = tmp[[perm_inv[row], perm_inv[col]]];
+            }
+        }
+        out
+    }
+
+    fn inertia_from_eigs(a: &Array2<f64>, tol: f64) -> (usize, usize, usize) {
+        let (evals, _) = a.eigh(Side::Lower).expect("eigen decomposition should succeed");
+        let mut pos = 0usize;
+        let mut neg = 0usize;
+        let mut zero = 0usize;
+        for &v in &evals {
+            if v > tol {
+                pos += 1;
+            } else if v < -tol {
+                neg += 1;
+            } else {
+                zero += 1;
+            }
+        }
+        (pos, neg, zero)
+    }
+
+    #[test]
+    fn ldlt_rook_reconstructs_input_and_matches_inertia() {
+        // Symmetric indefinite matrix that exercises rook pivoting / 2x2 blocks.
+        let a = array![
+            [0.0, 2.0, 0.5, 0.0],
+            [2.0, 0.0, -1.0, 0.3],
+            [0.5, -1.0, 1.5, 0.4],
+            [0.0, 0.3, 0.4, -0.2]
+        ];
+
+        let (l, d_diag, d_subdiag, _perm_fwd, perm_inv, inertia) =
+            ldlt_rook(&a).expect("ldlt_rook should succeed");
+
+        // L should be unit-lower and upper triangle should be zeroed by construction.
+        for i in 0..l.nrows() {
+            assert!((l[[i, i]] - 1.0).abs() < 1e-12);
+            for j in i + 1..l.ncols() {
+                assert!(l[[i, j]].abs() < 1e-12);
+            }
+        }
+
+        let a_rec = reconstruct_from_ldlt(&l, &d_diag, &d_subdiag, &perm_inv);
+        let max_abs_err = (&a_rec - &a)
+            .iter()
+            .fold(0.0f64, |acc, &x| acc.max(x.abs()));
+        assert!(
+            max_abs_err < 1e-8,
+            "reconstruction error too large: {max_abs_err:e}"
+        );
+
+        let eig_inertia = inertia_from_eigs(&a, 1e-9);
+        assert_eq!(inertia, eig_inertia);
+    }
 }
 
 pub struct FaerArrayView<'a> {

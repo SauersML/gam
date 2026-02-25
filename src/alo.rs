@@ -14,7 +14,14 @@ use std::cmp::Ordering;
 #[derive(Debug, Clone)]
 pub struct AloDiagnostics {
     pub eta_tilde: Array1<f64>,
+    /// Backward-compatible alias of `se_sandwich`.
     pub se: Array1<f64>,
+    /// Bayesian/conditional standard error on eta:
+    /// sqrt(phi * x_i^T H^{-1} x_i).
+    pub se_bayes: Array1<f64>,
+    /// Frequentist sandwich-style standard error on eta:
+    /// sqrt(phi * x_i^T H^{-1} X^T W X H^{-1} x_i).
+    pub se_sandwich: Array1<f64>,
     pub pred_identity: Array1<f64>,
     pub leverage: Array1<f64>,
     pub fisher_weights: Array1<f64>,
@@ -29,6 +36,19 @@ fn alo_eta_update_with_offset(eta_hat: f64, z: f64, offset: f64, aii: f64) -> f6
     let eta_centered = eta_hat - offset;
     let z_centered = z - offset;
     offset + (eta_centered - aii * z_centered) / denom
+}
+
+#[inline]
+fn bayes_var_eta(phi: f64, x_hinv_x: f64) -> f64 {
+    phi * x_hinv_x
+}
+
+#[inline]
+fn sandwich_var_eta(phi: f64, x_hinv_x: f64, es_norm2: f64, ridge: f64, s_norm2: f64) -> f64 {
+    // With H = X'WX + S + ridge*I and t = H^{-1}x_i:
+    // t'X'WXt = t'Ht - t'St - ridge*||t||^2
+    //         = x_i't - ||E t||^2 - ridge*||t||^2.
+    phi * (x_hinv_x - es_norm2 - ridge * s_norm2)
 }
 
 fn compute_alo_diagnostics_from_pirls_impl(
@@ -93,7 +113,8 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let e_view = FaerArrayView::new(e);
     let ridge = base.ridge_used.max(0.0);
     let mut aii = Array1::<f64>::zeros(n);
-    let mut se_naive = Array1::<f64>::zeros(n);
+    let mut se_bayes = Array1::<f64>::zeros(n);
+    let mut se_sandwich = Array1::<f64>::zeros(n);
     let eta_hat = base.final_eta.clone();
     let offset = &base.final_offset;
     let z = &base.solve_working_response;
@@ -156,13 +177,6 @@ fn compute_alo_diagnostics_from_pirls_impl(
                     es_norm2 = v.mul_add(v, es_norm2);
                 }
             }
-            // Using H = X'WX + S + ridge I and t = H^{-1}x_i:
-            //   t'X'WXt = t'Ht - t'St - ridge*||t||^2
-            //          = x_i't - ||E t||^2 - ridge*||t||^2
-            // where S = E'E (E is e_transformed).
-            //
-            // This form avoids dividing by w_i and remains stable when w_i -> 0.
-            let quad = x_hinv_x - es_norm2 - ridge * s_norm2;
             aii[obs] = ai;
             percentiles_data.push(ai);
 
@@ -196,24 +210,29 @@ fn compute_alo_diagnostics_from_pirls_impl(
                 a_hi_99 += 1;
             }
 
-            let var_full = phi * quad;
-            if var_full == 0.0 && base.final_weights[obs] < 1e-10 {
+            let var_bayes = bayes_var_eta(phi, x_hinv_x);
+            let var_sandwich = sandwich_var_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
+            if var_sandwich == 0.0 && base.final_weights[obs] < 1e-10 {
                 log::warn!(
                     "[GAM ALO] obs {} has near-zero weight ({:.2e}) resulting in SE=0",
                     obs,
                     base.final_weights[obs]
                 );
             }
-            let se_full = var_full.max(0.0).sqrt();
-            se_naive[obs] = se_full;
+            let se_bayes_i = var_bayes.max(0.0).sqrt();
+            let se_sandwich_i = var_sandwich.max(0.0).sqrt();
+            se_bayes[obs] = se_bayes_i;
+            se_sandwich[obs] = se_sandwich_i;
 
             if diag_counter < max_diag_samples {
                 log::debug!("[GAM ALO] SE formula (obs {}):", obs);
                 log::debug!("  - w_i: {:.6e}", base.final_weights[obs]);
                 log::debug!("  - a_ii: {:.6e}", ai);
                 log::debug!("  - x_i'H^-1 x_i: {:.6e}", x_hinv_x);
-                log::debug!("  - var_full: {:.6e}", var_full);
-                log::debug!("  - SE_naive: {:.6e}", se_full);
+                log::debug!("  - var_bayes: {:.6e}", var_bayes);
+                log::debug!("  - var_sandwich: {:.6e}", var_sandwich);
+                log::debug!("  - SE_bayes: {:.6e}", se_bayes_i);
+                log::debug!("  - SE_sandwich: {:.6e}", se_sandwich_i);
                 diag_counter += 1;
             }
         }
@@ -317,18 +336,23 @@ fn compute_alo_diagnostics_from_pirls_impl(
     };
 
     let has_nan_pred = eta_tilde.iter().any(|&x| x.is_nan());
-    let has_nan_se = se_naive.iter().any(|&x| x.is_nan());
+    let has_nan_se_bayes = se_bayes.iter().any(|&x| x.is_nan());
+    let has_nan_se_sandwich = se_sandwich.iter().any(|&x| x.is_nan());
     let has_nan_leverage = aii.iter().any(|&x| x.is_nan());
 
-    if has_nan_pred || has_nan_se || has_nan_leverage {
+    if has_nan_pred || has_nan_se_bayes || has_nan_se_sandwich || has_nan_leverage {
         log::error!("[GAM ALO] NaN values found in ALO diagnostics:");
         log::error!(
             "[GAM ALO] eta_tilde: {} NaN values",
             eta_tilde.iter().filter(|&&x| x.is_nan()).count()
         );
         log::error!(
-            "[GAM ALO] se: {} NaN values",
-            se_naive.iter().filter(|&&x| x.is_nan()).count()
+            "[GAM ALO] se_bayes: {} NaN values",
+            se_bayes.iter().filter(|&&x| x.is_nan()).count()
+        );
+        log::error!(
+            "[GAM ALO] se_sandwich: {} NaN values",
+            se_sandwich.iter().filter(|&&x| x.is_nan()).count()
         );
         log::error!(
             "[GAM ALO] leverage: {} NaN values",
@@ -341,7 +365,10 @@ fn compute_alo_diagnostics_from_pirls_impl(
 
     Ok(AloDiagnostics {
         eta_tilde,
-        se: se_naive,
+        // Keep legacy `se` field as the frequentist/sandwich flavor.
+        se: se_sandwich.clone(),
+        se_bayes,
+        se_sandwich,
         pred_identity: eta_hat,
         leverage: aii,
         fisher_weights: base.final_weights.clone(),
@@ -350,7 +377,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::alo_eta_update_with_offset;
+    use super::{alo_eta_update_with_offset, bayes_var_eta, sandwich_var_eta};
 
     #[test]
     fn alo_offset_update_matches_centered_algebra() {
@@ -371,6 +398,34 @@ mod tests {
         let aii = 0.35;
         let expected = (eta_hat - aii * z) / (1.0 - aii);
         let got = alo_eta_update_with_offset(eta_hat, z, 0.0, aii);
+        assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gaussian_unpenalized_sandwich_equals_bayes() {
+        // In Gaussian linear model with S=0 and ridge=0:
+        // H = X'WX, so sandwich and bayes eta variances are identical.
+        let phi = 2.5;
+        let x_hinv_x = 0.3;
+        let es_norm2 = 0.0;
+        let ridge = 0.0;
+        let s_norm2 = 0.0;
+        let vb = bayes_var_eta(phi, x_hinv_x);
+        let vs = sandwich_var_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
+        assert!((vb - vs).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sandwich_matches_direct_linear_gaussian_formula() {
+        // Small brute-force linear Gaussian check:
+        // var_sandwich(eta_i) = phi * x_i^T H^{-1} X'WX H^{-1} x_i.
+        let phi = 1.7;
+        let x_hinv_x = 0.41;
+        let es_norm2 = 0.05;
+        let ridge = 1e-3;
+        let s_norm2 = 2.0;
+        let got = sandwich_var_eta(phi, x_hinv_x, es_norm2, ridge, s_norm2);
+        let expected = phi * (x_hinv_x - es_norm2 - ridge * s_norm2);
         assert!((got - expected).abs() < 1e-12);
     }
 }

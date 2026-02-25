@@ -3,6 +3,7 @@ name = "gam"
 version = "0.0.0"
 edition = "2024"
 description = "Generalized penalized likelihood engine"
+license = "Apache-2.0"
 
 [lib]
 path = "src/lib.rs"

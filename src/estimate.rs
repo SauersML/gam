@@ -504,10 +504,9 @@ impl RidgePlanner {
 }
 
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
-use std::sync::{Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 
 const LAML_RIDGE: f64 = 1e-8;

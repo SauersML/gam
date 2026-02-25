@@ -118,6 +118,7 @@ pub struct TermCollectionDesign {
     pub design: Array2<f64>,
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
+    pub intercept_range: Range<usize>,
     pub linear_ranges: Vec<(String, Range<usize>)>,
     pub random_effect_ranges: Vec<(String, Range<usize>)>,
     pub smooth: SmoothDesign,
@@ -513,22 +514,25 @@ pub fn build_term_collection_design(
         }
     }
 
+    let p_intercept = 1usize;
     let p_lin = spec.linear_terms.len();
     let p_rand: usize = random_blocks.iter().map(|b| b.design.ncols()).sum();
     let p_smooth = smooth.design.ncols();
-    let p_total = p_lin + p_rand + p_smooth;
+    let p_total = p_intercept + p_lin + p_rand + p_smooth;
     let mut design = Array2::<f64>::zeros((n, p_total));
+    design.column_mut(0).fill(1.0);
 
     let mut linear_ranges = Vec::<(String, Range<usize>)>::with_capacity(p_lin);
     for (j, linear) in spec.linear_terms.iter().enumerate() {
+        let col = p_intercept + j;
         design
-            .column_mut(j)
+            .column_mut(col)
             .assign(&data.column(linear.feature_col));
-        linear_ranges.push((linear.name.clone(), j..(j + 1)));
+        linear_ranges.push((linear.name.clone(), col..(col + 1)));
     }
     let mut random_effect_ranges =
         Vec::<(String, Range<usize>)>::with_capacity(random_blocks.len());
-    let mut col_cursor = p_lin;
+    let mut col_cursor = p_intercept + p_lin;
     for block in &random_blocks {
         let q = block.design.ncols();
         let end = col_cursor + q;
@@ -540,7 +544,7 @@ pub fn build_term_collection_design(
     }
     if p_smooth > 0 {
         design
-            .slice_mut(s![.., (p_lin + p_rand)..])
+            .slice_mut(s![.., (p_intercept + p_lin + p_rand)..])
             .assign(&smooth.design);
     }
 
@@ -551,8 +555,9 @@ pub fn build_term_collection_design(
         if !linear.double_penalty {
             continue;
         }
+        let col = p_intercept + j;
         let mut s = Array2::<f64>::zeros((p_total, p_total));
-        s[[j, j]] = 1.0;
+        s[[col, col]] = 1.0;
         penalties.push(s);
         nullspace_dims.push(0);
     }
@@ -568,7 +573,7 @@ pub fn build_term_collection_design(
 
     for (s_local, &ns) in smooth.penalties.iter().zip(smooth.nullspace_dims.iter()) {
         let mut s = Array2::<f64>::zeros((p_total, p_total));
-        let start = p_lin + p_rand;
+        let start = p_intercept + p_lin + p_rand;
         s.slice_mut(s![start..(start + p_smooth), start..(start + p_smooth)])
             .assign(s_local);
         penalties.push(s);
@@ -579,6 +584,7 @@ pub fn build_term_collection_design(
         design,
         penalties,
         nullspace_dims,
+        intercept_range: 0..1,
         linear_ranges,
         random_effect_ranges,
         smooth,
@@ -742,7 +748,13 @@ mod tests {
         };
         let design = build_term_collection_design(data.view(), &spec).unwrap();
         assert_eq!(design.design.nrows(), data.nrows());
-        assert!(design.design.ncols() >= 1);
+        assert_eq!(design.intercept_range, 0..1);
+        assert!(design
+            .design
+            .column(design.intercept_range.start)
+            .iter()
+            .all(|&v| (v - 1.0).abs() < 1e-12));
+        assert!(design.design.ncols() >= 2);
         assert_eq!(design.linear_ranges.len(), 1);
         assert_eq!(design.random_effect_ranges.len(), 0);
         assert_eq!(design.penalties.len(), 3); // linear ridge + 2 smooth penalties
@@ -769,13 +781,15 @@ mod tests {
             smooth_terms: vec![],
         };
         let design = build_term_collection_design(data.view(), &spec).unwrap();
+        assert_eq!(design.intercept_range, 0..1);
         // 3 observed levels -> 3 dummy columns
-        assert_eq!(design.design.ncols(), 3);
+        assert_eq!(design.design.ncols(), 4);
         assert_eq!(design.random_effect_ranges.len(), 1);
         assert_eq!(design.penalties.len(), 1);
         assert_eq!(design.nullspace_dims, vec![0]);
+        let (_name, range) = &design.random_effect_ranges[0];
         for i in 0..design.design.nrows() {
-            let row_sum: f64 = design.design.row(i).sum();
+            let row_sum: f64 = design.design.slice(s![i, range.clone()]).sum();
             assert!((row_sum - 1.0).abs() < 1e-12);
         }
     }
