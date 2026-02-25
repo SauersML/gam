@@ -1211,6 +1211,9 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
     if penalty_roots.iter().any(|r| r.ncols() != p) {
         return Err("estimate_logit_pg_rao_blackwell_terms: root width mismatch".to_string());
     }
+    // Precompute transposed root blocks once:
+    //   R_k^T is the RHS used for batched solves Q X = R_k^T.
+    let penalty_roots_t: Vec<Array2<f64>> = penalty_roots.iter().map(|r| r.t().to_owned()).collect();
 
     let mut rng = StdRng::seed_from_u64(config.seed);
     let n_iter = config.n_warmup + config.n_samples;
@@ -1233,7 +1236,6 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
     let mut rb_sum = Array1::<f64>::zeros(penalty_roots.len());
     let mut z = Array1::<f64>::zeros(p);
     let mut noise = Array1::<f64>::zeros(p);
-    let mut row_buf = Array1::<f64>::zeros(p);
 
     let mut kept = 0usize;
     for chain in 0..config.n_chains {
@@ -1294,13 +1296,14 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
                 let r_mu = r_k.dot(&mean);
                 let mu_quad = r_mu.dot(&r_mu);
 
+                // Batched trace solve:
+                //   V_k = Q^{-1} R_k^T  (single multi-RHS solve)
+                // then tr(R_k Q^{-1} R_k^T) = <R_k, V_k^T>_F.
+                let solved_mat = factor.solve_mat(&penalty_roots_t[k]); // (p, r_k)
+                let solved_t = solved_mat.t();
                 let mut trace_term = 0.0_f64;
-                for row_idx in 0..r_k.nrows() {
-                    row_buf.assign(&r_k.row(row_idx));
-                    // tr(S_k Q^{-1}) = tr(R_k Q^{-1} R_k^T)
-                    //                = sum_j r_j^T Q^{-1} r_j.
-                    let solved = factor.solve_vec(&row_buf);
-                    trace_term += row_buf.dot(&solved);
+                for (&a, &b) in r_k.iter().zip(solved_t.iter()) {
+                    trace_term += a * b;
                 }
 
                 rb_sum[k] += trace_term + mu_quad;
@@ -1311,7 +1314,11 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
     if kept == 0 {
         return Err("estimate_logit_pg_rao_blackwell_terms: no retained samples".to_string());
     }
-    Ok(rb_sum.mapv(|v| v / (kept as f64)))
+    let out = rb_sum.mapv(|v| v / (kept as f64));
+    if !out.iter().all(|v| v.is_finite()) {
+        return Err("estimate_logit_pg_rao_blackwell_terms: non-finite expectation".to_string());
+    }
+    Ok(out)
 }
 
 /// Runs NUTS sampling using general-mcmc with whitened parameter space.
