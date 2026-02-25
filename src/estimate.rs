@@ -75,9 +75,8 @@ fn eta_from_mu_for_link(mu: f64, link: LinkFunction) -> f64 {
 }
 
 use crate::diagnostics::{
-    GRAD_DIAG_BETA_COLLAPSE_COUNT, GRAD_DIAG_DELTA_ZERO_COUNT, GRAD_DIAG_KKT_SKIP_COUNT,
-    approx_f64, format_compact_series, format_cond, format_range, quantize_value, quantize_vec,
-    should_emit_grad_diag, should_emit_h_min_eig_diag,
+    GRAD_DIAG_BETA_COLLAPSE_COUNT, approx_f64, format_compact_series, format_cond, format_range,
+    quantize_value, quantize_vec, should_emit_grad_diag, should_emit_h_min_eig_diag,
 };
 
 // Note: deflate_weights_by_se was removed. We now use integrated (GHQ) likelihood
@@ -5879,67 +5878,15 @@ pub mod internal {
                                 }
                             }
 
-                            // Compute KKT residual norm to check if envelope theorem applies.
-                            // The Implicit Function Theorem (used for delta_opt) assumes that β moves
-                            // to maintain ∇V = 0 as ρ changes. If P-IRLS hasn't converged (large residual),
-                            // β is effectively "stuck" on a ledge and doesn't move as predicted by IFT.
-                            // In that case, we MUST skip the implicit correction to match reality.
-                            let kkt_norm = residual_grad
+                            // IMPORTANT: do not add an extra (∇βV)^T (dβ/dρ) correction here.
+                            // The trace_terms above already include beta(ρ) dependence via H_k
+                            // (through v_k = H^{-1} S_k β). Adding a second implicit term can
+                            // double-count and flip gradient sign in high-ρ regimes.
+                            let _kkt_norm = residual_grad
                                 .iter()
                                 .fold(0.0_f64, |acc, &v| acc + v * v)
                                 .sqrt();
-                            let kkt_tol = self.config.convergence_tolerance.max(1e-4);
-                            let kkt_ok = kkt_norm <= kkt_tol;
-
-                            if !grad_beta.iter().all(|v| v.is_finite()) {
-                                log::warn!(
-                                    "Skipping IFT correction: non-finite gradient entries (kkt_norm={:.2e}).",
-                                    kkt_norm
-                                );
-                            }
-                            if !kkt_ok {
-                                let (should_print, count) =
-                                    should_emit_grad_diag(&GRAD_DIAG_KKT_SKIP_COUNT);
-                                if should_print {
-                                    eprintln!(
-                                        "[GRAD DIAG #{count}] skipping IFT correction: kkt_norm={:.3e} tol={:.3e}",
-                                        kkt_norm, kkt_tol
-                                    );
-                                }
-                            }
-
-                            let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) && kkt_ok {
-                                // IMPLICIT DERIVATIVE: d/dρ beta_hat = -H^-1 S_k beta.
-                                // For spectral consistency with truncated log|H| we use H_+^\dagger.
-                                // Apply in factor form to avoid dense H_+^\dagger materialization:
-                                //   H_+^\dagger v = W (W^T v), W = U_+ diag(1/sqrt(lambda_+)).
-                                let delta: Array1<f64> = if w_pos.ncols() == 0 {
-                                    Array1::zeros(grad_beta.len())
-                                } else {
-                                    let wtg = w_pos.t().dot(&grad_beta);
-                                    w_pos.dot(&wtg)
-                                };
-
-                                let delta_inf = delta
-                                    .iter()
-                                    .fold(0.0_f64, |acc: f64, &v: &f64| acc.max(v.abs()));
-                                if delta_inf < 1e-8 {
-                                    let (should_print, count) =
-                                        should_emit_grad_diag(&GRAD_DIAG_DELTA_ZERO_COUNT);
-                                    if should_print {
-                                        eprintln!(
-                                            "[GRAD DIAG #{count}] delta ~0: max|delta|={:.3e} max|grad_beta|={:.3e}",
-                                            delta_inf,
-                                            grad_beta
-                                                .iter()
-                                                .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-                                        );
-                                    }
-                                }
-                                Some(delta)
-                            } else {
-                                None
-                            };
+                            let delta_opt: Option<Array1<f64>> = None;
 
                             for k in 0..k_count {
                                 let log_det_h_grad_term = 0.5 * lambdas[k] * trace_terms[k];
