@@ -1,5 +1,5 @@
 use crate::basis::{
-    BSplineBasisSpec, BasisBuildResult, BasisMetadata, BasisError, DuchonBasisSpec,
+    BSplineBasisSpec, BasisBuildResult, BasisError, BasisMetadata, DuchonBasisSpec,
     MaternBasisSpec, ThinPlateBasisSpec, build_bspline_basis_1d, build_duchon_basis,
     build_matern_basis, build_thin_plate_basis,
 };
@@ -108,41 +108,6 @@ fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f6
     Ok(out)
 }
 
-fn shape_linear_reparameterization(
-    size: usize,
-    shape: ShapeConstraint,
-) -> Result<Array2<f64>, BasisError> {
-    if size == 0 {
-        return Err(BasisError::InvalidInput(
-            "shape reparameterization requires a positive basis size".to_string(),
-        ));
-    }
-    let identity = Array2::<f64>::eye(size);
-    match shape {
-        ShapeConstraint::None => Ok(identity),
-        // First cumulative sum transform.
-        ShapeConstraint::MonotoneIncreasing | ShapeConstraint::MonotoneDecreasing => {
-            let mut t = Array2::<f64>::zeros((size, size));
-            for i in 0..size {
-                for j in 0..=i {
-                    t[[i, j]] = 1.0;
-                }
-            }
-            Ok(t)
-        }
-        // Second cumulative sum transform.
-        ShapeConstraint::Convex | ShapeConstraint::Concave => {
-            let mut first = Array2::<f64>::zeros((size, size));
-            for i in 0..size {
-                for j in 0..=i {
-                    first[[i, j]] = 1.0;
-                }
-            }
-            Ok(first.dot(&first))
-        }
-    }
-}
-
 fn cumulative_exp(values: &Array1<f64>, sign: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(values.len());
     let mut run = 0.0;
@@ -199,6 +164,12 @@ pub fn build_smooth_design(
     let mut local_dims = Vec::<usize>::with_capacity(terms.len());
 
     for term in terms {
+        if term.shape != ShapeConstraint::None {
+            return Err(BasisError::InvalidInput(format!(
+                "ShapeConstraint::{:?} is not enforced in the current linear fit pipeline; use ShapeConstraint::None or a constrained/nonlinear solver",
+                term.shape
+            )));
+        }
         let built: BasisBuildResult = match &term.basis {
             SmoothBasisSpec::BSpline1D { feature_col, spec } => {
                 if *feature_col >= data.ncols() {
@@ -226,13 +197,8 @@ pub fn build_smooth_design(
         };
 
         let p_local = built.design.ncols();
-        let shape_t = shape_linear_reparameterization(p_local, term.shape)?;
-        let design_t = built.design.dot(&shape_t);
-        let penalties_t: Vec<Array2<f64>> = built
-            .penalties
-            .iter()
-            .map(|s| shape_t.t().dot(s).dot(&shape_t))
-            .collect();
+        let design_t = built.design;
+        let penalties_t: Vec<Array2<f64>> = built.penalties;
 
         local_dims.push(p_local);
         local_designs.push(design_t);
@@ -256,7 +222,10 @@ pub fn build_smooth_design(
             .slice_mut(s![.., col_start..col_end])
             .assign(&local_designs[idx]);
 
-        for (s_local, &ns) in local_penalties[idx].iter().zip(local_nullspaces[idx].iter()) {
+        for (s_local, &ns) in local_penalties[idx]
+            .iter()
+            .zip(local_nullspaces[idx].iter())
+        {
             let mut s_global = Array2::<f64>::zeros((total_p, total_p));
             s_global
                 .slice_mut(s![col_start..col_end, col_start..col_end])
@@ -309,7 +278,9 @@ pub fn build_term_collection_design(
 
     let mut linear_ranges = Vec::<(String, Range<usize>)>::with_capacity(p_lin);
     for (j, linear) in spec.linear_terms.iter().enumerate() {
-        design.column_mut(j).assign(&data.column(linear.feature_col));
+        design
+            .column_mut(j)
+            .assign(&data.column(linear.feature_col));
         linear_ranges.push((linear.name.clone(), j..(j + 1)));
     }
     if p_smooth > 0 {
@@ -419,7 +390,7 @@ mod tests {
                         double_penalty: true,
                     },
                 },
-                shape: ShapeConstraint::MonotoneIncreasing,
+                shape: ShapeConstraint::None,
             },
         ];
 
@@ -441,6 +412,35 @@ mod tests {
             .unwrap();
         for i in 1..beta.len() {
             assert!(beta[i] >= beta[i - 1]);
+        }
+    }
+
+    #[test]
+    fn build_smooth_design_rejects_non_none_shape_constraints() {
+        let data = array![
+            [0.0, 0.0],
+            [0.5, 0.2],
+            [1.0, 0.4],
+            [1.5, 0.6],
+        ];
+        let terms = vec![SmoothTermSpec {
+            name: "tps_shape".to_string(),
+            basis: SmoothBasisSpec::ThinPlate {
+                feature_cols: vec![0, 1],
+                spec: ThinPlateBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 3 },
+                    double_penalty: false,
+                },
+            },
+            shape: ShapeConstraint::MonotoneIncreasing,
+        }];
+
+        let err = build_smooth_design(data.view(), &terms).expect_err("shape should be rejected");
+        match err {
+            BasisError::InvalidInput(msg) => {
+                assert!(msg.contains("not enforced"));
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 

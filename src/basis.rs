@@ -1,8 +1,8 @@
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use faer::sparse::{SparseColMat, Triplet};
 use faer::Side;
+use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
-use ndarray::{s, Array, Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::ParallelSlice;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::{Arc, OnceLock};
@@ -497,6 +497,12 @@ fn evaluate_splines_second_derivative_sparse_into(
             .ensure_degree(lower_lower_degree);
     }
 
+    // Build B'_{i, k-1}(x) (first derivative of the lower-degree basis, k-1).
+    // We then apply the derivative recursion one more time:
+    // B''_{i,k}(x) = k * ( B'_{i,k-1}(x)/(t_{i+k}-t_i)
+    //                  -B'_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}) )
+    //
+    // So `scratch.lower_basis` below stores derivative values, not raw basis values.
     let start_lower = evaluate_splines_derivative_sparse_into_with_lower(
         x,
         lower_degree,
@@ -512,6 +518,7 @@ fn evaluate_splines_second_derivative_sparse_into(
         let i = start_col + offset;
         let left_idx = i as isize - start_lower as isize;
         let right_idx = (i + 1) as isize - start_lower as isize;
+        // These are B'_{i,k-1} and B'_{i+1,k-1} aligned from the sparse lower block.
         let left = if left_idx >= 0 && (left_idx as usize) < lower_support {
             scratch.lower_basis[left_idx as usize]
         } else {
@@ -1702,7 +1709,13 @@ fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Resul
 }
 
 #[inline(always)]
-fn bessel_i0_approx(x: f64) -> f64 {
+fn bessel_i0_manual(x: f64) -> f64 {
+    // Manual Cephes-style approximation with two regions:
+    //  - |x| < 3.75: polynomial in y=(x/3.75)^2
+    //  - otherwise : asymptotic exp(|x|)/sqrt(|x|) times polynomial in y=3.75/|x|
+    //
+    // This avoids external dependencies and is numerically stable for the
+    // argument ranges used by Duchon-Matern K0/K1 evaluation.
     let ax = x.abs();
     if ax < 3.75 {
         let y = (x / 3.75) * (x / 3.75);
@@ -1725,7 +1738,8 @@ fn bessel_i0_approx(x: f64) -> f64 {
 }
 
 #[inline(always)]
-fn bessel_i1_approx(x: f64) -> f64 {
+fn bessel_i1_manual(x: f64) -> f64 {
+    // Same split strategy as I0; odd symmetry is enforced for x<0.
     let ax = x.abs();
     if ax < 3.75 {
         let y = (x / 3.75) * (x / 3.75);
@@ -1745,20 +1759,22 @@ fn bessel_i1_approx(x: f64) -> f64 {
                                 + y * (0.022_829_67
                                     + y * (-0.028_953_12
                                         + y * (0.017_876_54 - y * 0.004_200_59))))))));
-        if x < 0.0 {
-            -ans
-        } else {
-            ans
-        }
+        if x < 0.0 { -ans } else { ans }
     }
 }
 
 #[inline(always)]
-fn bessel_k0_approx(x: f64) -> f64 {
+fn bessel_k0_stable(x: f64) -> f64 {
     let x_pos = x.max(1e-300);
+    // Manual Cephes-style K0 approximation with region split:
+    //  - x<=2: logarithmic singular form with I0 coupling
+    //  - x>2 : asymptotic exp(-x)/sqrt(x) form.
+    //
+    // This is dependency-free and deterministic, which keeps outer REML/BFGS
+    // objectives smooth and reproducible run-to-run.
     if x_pos <= 2.0 {
         let y = (x_pos * x_pos) / 4.0;
-        -((x_pos / 2.0).ln()) * bessel_i0_approx(x_pos)
+        -((x_pos / 2.0).ln()) * bessel_i0_manual(x_pos)
             + (-0.577_215_66
                 + y * (0.422_784_20
                     + y * (0.230_697_56
@@ -1776,11 +1792,11 @@ fn bessel_k0_approx(x: f64) -> f64 {
 }
 
 #[inline(always)]
-fn bessel_k1_approx(x: f64) -> f64 {
+fn bessel_k1_stable(x: f64) -> f64 {
     let x_pos = x.max(1e-300);
     if x_pos <= 2.0 {
         let y = (x_pos * x_pos) / 4.0;
-        (x_pos / 2.0).ln() * bessel_i1_approx(x_pos)
+        (x_pos / 2.0).ln() * bessel_i1_manual(x_pos)
             + (1.0 / x_pos)
                 * (1.0
                     + y * (0.154_431_44
@@ -1798,29 +1814,85 @@ fn bessel_k1_approx(x: f64) -> f64 {
     }
 }
 
+const DUCHON_SERIES_Z_CUTOFF: f64 = 1.0;
+const DUCHON_ASYMPTOTIC_Z_CUTOFF: f64 = 35.0;
+
+#[inline(always)]
+fn duchon_matern_p1_s4_k10_asymptotic(z: f64) -> f64 {
+    // For large z = κr, Bessel terms in the exact closed form are exponentially
+    // suppressed, leaving the algebraic leading term.
+    let invz = 1.0 / z.max(1e-300);
+    let invz2 = invz * invz;
+    let invz4 = invz2 * invz2;
+    48.0 * invz4 * invz4
+}
+
 #[inline(always)]
 fn duchon_matern_p1_s4_k10_closed_form(r: f64, kappa: f64) -> f64 {
+    // Mathematical derivation (primary case: p=1, s=4, k=10):
+    //
+    // Spectral kernel:
+    //   K^(ω) ∝ 1 / (|ω|^(2p) * (κ^2 + |ω|^2)^s)
+    // so here:
+    //   K^(ω) ∝ 1 / (|ω|^2 * (κ^2 + |ω|^2)^4).
+    //
+    // For this specific tuple (p,s,k), the radial kernel is equivalently:
+    //   K(a) = (1/96) ∫_0^1 u^3 K0(a*sqrt(u)) du,   a = κr.
+    //
+    // This function evaluates an exact algebraic reduction of that integral:
+    //   K(a)= 48/a^8
+    //         - (1/48) K1(a)/a
+    //         - (1/8)  K0(a)/a^2
+    //         - (3/4)  K1(a)/a^3
+    //         - 3      K0(a)/a^4
+    //         - 12     K1(a)/a^5
+    //         - 24     K0(a)/a^6
+    //         - 48     K1(a)/a^7.
+    //
+    // IMPORTANT: this representation is exact but numerically ill-conditioned as a->0,
+    // because each term is large and cancellation leaves an O(log a) remainder.
+    // We therefore call this only in the moderate-a regime from the dispatcher.
     let z = (kappa * r).max(1e-300);
-    let k0 = bessel_k0_approx(z);
-    let k1 = bessel_k1_approx(z);
-    // Exact closed form algebraically equivalent to:
-    // K(r) = (1/96) ∫_0^1 u^3 K0(a sqrt(u)) du, a = κr.
-    // This form avoids high-order K_n terms and uses only K0, K1.
-    48.0 / z.powi(8)
-        - (1.0 / 48.0) * (k1 / z)
-        - (1.0 / 8.0) * (k0 / z.powi(2))
-        - (3.0 / 4.0) * (k1 / z.powi(3))
-        - 3.0 * (k0 / z.powi(4))
-        - 12.0 * (k1 / z.powi(5))
-        - 24.0 * (k0 / z.powi(6))
-        - 48.0 * (k1 / z.powi(7))
+    // Hot-path speedup: for very large z the exact Bessel terms are negligible.
+    if z > DUCHON_ASYMPTOTIC_Z_CUTOFF {
+        return duchon_matern_p1_s4_k10_asymptotic(z);
+    }
+    let k0 = bessel_k0_stable(z);
+    let k1 = bessel_k1_stable(z);
+    // Faster and slightly more accurate than repeated powi/division:
+    // build reciprocal powers once and evaluate grouped terms.
+    let invz = 1.0 / z;
+    let invz2 = invz * invz;
+    let invz3 = invz2 * invz;
+    let invz4 = invz2 * invz2;
+    let invz5 = invz4 * invz;
+    let invz6 = invz3 * invz3;
+    let invz7 = invz6 * invz;
+    let invz8 = invz4 * invz4;
+    let k1_block = (1.0 / 48.0) * invz + (3.0 / 4.0) * invz3 + 12.0 * invz5 + 48.0 * invz7;
+    let k0_block = (1.0 / 8.0) * invz2 + 3.0 * invz4 + 24.0 * invz6;
+    48.0 * invz8 - k1 * k1_block - k0 * k0_block
 }
 
 #[inline(always)]
 fn duchon_matern_p1_s4_k10_small_a_series(a: f64) -> f64 {
-    // Cancellation-free small-a expansion for:
-    //   K(a) = (1/96) ∫_0^1 u^3 K0(a sqrt(u)) du, a = κr.
-    // Truncation error after a^8 term is O(a^10 log a).
+    // Cancellation-free small-a expansion:
+    //
+    // Start from:
+    //   K(a) = (1/96) ∫_0^1 u^3 K0(a*sqrt(u)) du.
+    //
+    // Expand K0(z) for z->0:
+    //   K0(z) = -log(z/2) - γ + O(z^2 log z),
+    // then integrate term-by-term in u. This yields:
+    //   K(a) =
+    //     L/384 + 1/3072
+    //     + a^2( L/1920 + 11/19200 )
+    //     + a^4( L/36864 + 19/442368 )
+    //     + a^6( L/1548288 + 5/4064256 )
+    //     + a^8( L/113246208 + 103/5435817984 )
+    //   where L = -log(a/2) - γ.
+    //
+    // Remainder after retained a^8 term: O(a^10 log a).
     const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
     let aa = a.max(1e-300);
     let l = -(aa * 0.5).ln() - EULER_GAMMA;
@@ -1875,7 +1947,7 @@ fn duchon_matern_p1_s4_k10_integral(r: f64, kappa: f64) -> f64 {
         if t <= 0.0 {
             return 0.0;
         }
-        2.0 * t.powi(7) * bessel_k0_approx(a * t)
+        2.0 * t.powi(7) * bessel_k0_stable(a * t)
     };
     let whole = simpson(&f_t, 0.0, 1.0);
     let integral = adaptive_simpson(&f_t, 0.0, 1.0, 1e-10, whole, 20);
@@ -1897,20 +1969,40 @@ fn duchon_matern_kernel_p1_s4_k10_from_distance(
         ));
     }
     if r == 0.0 {
-        // Intrinsic-spline convention for the critical-borderline case.
+        // Borderline regularity note for the current primary case:
+        //   p=1, s=4, k=10  =>  p+s = k/2 (equivalently 2p+2s = k).
+        // In this regime point-evaluation is not strictly proper (log-type
+        // singularity at r->0 in the underlying generalized kernel). For the
+        // spline penalty workflow we therefore use an intrinsic convention on
+        // the diagonal and rely on constrained coefficients + lambda scaling.
         return Ok(0.0);
     }
 
     let kappa = 1.0 / length_scale;
     let z = kappa * r;
-    // Robust regime split:
-    // - small z: series (no catastrophic cancellation at Sobolev boundary)
-    // - moderate z: exact closed form
-    // - large z: leading asymptotic (Bessel terms are exponentially suppressed)
-    if z < 1.0 {
+    // Numerically stable regime split:
+    //
+    // 1) z < 1: series branch.
+    //    Avoids catastrophic cancellation in the closed form near the Sobolev
+    //    boundary p+s=k/2 where the true behavior is logarithmic.
+    //
+    // 2) 1 <= z <= 50: exact closed form with K0/K1.
+    //    Stable in this window and significantly faster than quadrature.
+    //
+    // 3) z > 50: asymptotic branch.
+    //    Kν(z) terms are exponentially small, so dominant algebraic term is 48/z^8.
+    //
+    // We intentionally do NOT evaluate the raw Hankel/inverse-Fourier integral
+    // in production:
+    //   - it is oscillatory with slowly decaying tails,
+    //   - per-entry quadrature cost is too high for O(M^2) kernel builds, and
+    //   - numerical quadrature noise degrades K_CC conditioning and REML gradients.
+    // The integral implementation is retained under #[cfg(test)] only as a
+    // verification oracle against this branch-wise closed-form evaluator.
+    if z < DUCHON_SERIES_Z_CUTOFF {
         Ok(duchon_matern_p1_s4_k10_small_a_series(z))
-    } else if z > 50.0 {
-        Ok(48.0 / z.powi(8))
+    } else if z > DUCHON_ASYMPTOTIC_Z_CUTOFF {
+        Ok(duchon_matern_p1_s4_k10_asymptotic(z))
     } else {
         Ok(duchon_matern_p1_s4_k10_closed_form(r, kappa))
     }
@@ -2037,22 +2129,18 @@ pub fn create_matern_spline_basis(
     // Center-center Gram matrix K_CC. In RKHS form, the kernel penalty on
     // radial coefficients is alpha^T K_CC alpha.
     let mut center_kernel = Array2::<f64>::zeros((k, k));
-    let center_result: Result<(), BasisError> = center_kernel
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .try_for_each(|(i, mut row)| {
-            for j in 0..k {
-                let mut dist2 = 0.0;
-                for c in 0..d {
-                    let delta = centers[[i, c]] - centers[[j, c]];
-                    dist2 += delta * delta;
-                }
-                row[j] = matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)?;
+    for i in 0..k {
+        for j in i..k {
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = centers[[i, c]] - centers[[j, c]];
+                dist2 += delta * delta;
             }
-            Ok(())
-        });
-    center_result?;
+            let kij = matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)?;
+            center_kernel[[i, j]] = kij;
+            center_kernel[[j, i]] = kij;
+        }
+    }
 
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     basis.slice_mut(s![.., 0..k]).assign(&kernel_block);
@@ -2120,11 +2208,20 @@ pub fn build_matern_basis(
 /// - side-constraint projection `P(centers)^T alpha = 0` for `p > 0`
 ///
 /// IMPLEMENTATION NOTE:
-/// The exact primary-case kernel uses the stable integral
+/// For production we evaluate the primary-case kernel via explicit small/medium/large
+/// argument formulas (series + exact closed form + asymptotic), not via direct Hankel
+/// quadrature. This keeps O(M^2) kernel assembly and optimizer derivatives stable.
+///
+/// The finite integral
 ///   K(r) = (1/96) ∫_0^1 u^3 K0(kappa * r * sqrt(u)) du
-/// with kappa = 1/length_scale.
-/// The full arbitrary-(p,s,k) Riesz-Bessel kernel family is not yet implemented;
-/// unsupported configurations return an explicit error.
+/// is used only in tests to validate the closed-form implementation.
+///
+/// Extension guidance for arbitrary integer (p,s):
+/// prefer the partial-fraction finite-sum construction
+///   K(r) = Σ a_m Φ_{k,m}(r) + Σ b_n M_{k,n,κ}(r)
+/// (polyharmonic + Matérn blocks), rather than runtime oscillatory quadrature.
+/// The full arbitrary-(p,s,k) family is not yet implemented; unsupported
+/// configurations currently return an explicit error.
 pub fn create_duchon_spline_basis(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -2170,6 +2267,10 @@ pub fn create_duchon_spline_basis(
             "exact Duchon-Matern kernel is currently implemented only for k=10, p=1, s=4 (Linear nullspace); got d={d}, nullspace_order={nullspace_order:?}"
         )));
     }
+    // Important: this enforced primary case is the documented/validated path.
+    // If we add general (p,s,k), we should maintain the same architecture:
+    // closed-form finite sums + constrained Gram penalties, not per-entry
+    // numerical Hankel integration.
 
     // Practical safe operating range (document Eq. D.2):
     //   κ in [1e-2 / r_max, 1e2 / r_min]
@@ -2211,23 +2312,19 @@ pub fn create_duchon_spline_basis(
     kernel_result?;
 
     let mut center_kernel = Array2::<f64>::zeros((k, k));
-    let center_result: Result<(), BasisError> = center_kernel
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .try_for_each(|(i, mut row)| {
-            for j in 0..k {
-                let mut dist2 = 0.0;
-                for c in 0..d {
-                    let delta = centers[[i, c]] - centers[[j, c]];
-                    dist2 += delta * delta;
-                }
-                let _ = nu; // Retained in signature for API compatibility.
-                row[j] = duchon_matern_kernel_p1_s4_k10_from_distance(dist2.sqrt(), length_scale)?;
+    for i in 0..k {
+        for j in i..k {
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = centers[[i, c]] - centers[[j, c]];
+                dist2 += delta * delta;
             }
-            Ok(())
-        });
-    center_result?;
+            let _ = nu; // Retained in signature for API compatibility.
+            let kij = duchon_matern_kernel_p1_s4_k10_from_distance(dist2.sqrt(), length_scale)?;
+            center_kernel[[i, j]] = kij;
+            center_kernel[[j, i]] = kij;
+        }
+    }
 
     let kernel_constrained = kernel_block.dot(&z);
     // Constrained Gram penalty block: S_free = Z^T K_CC Z.
@@ -2561,22 +2658,18 @@ pub fn create_thin_plate_spline_basis(
 
     // Omega block on knots
     let mut omega = Array2::<f64>::zeros((k, k));
-    let omega_result: Result<(), BasisError> = omega
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .try_for_each(|(i, mut row)| {
-            for j in 0..k {
-                let mut dist2 = 0.0;
-                for c in 0..d {
-                    let delta = knots[[i, c]] - knots[[j, c]];
-                    dist2 += delta * delta;
-                }
-                row[j] = thin_plate_kernel_m2_from_dist2(dist2, d)?;
+    for i in 0..k {
+        for j in i..k {
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = knots[[i, c]] - knots[[j, c]];
+                dist2 += delta * delta;
             }
-            Ok(())
-        });
-    omega_result?;
+            let kij = thin_plate_kernel_m2_from_dist2(dist2, d)?;
+            omega[[i, j]] = kij;
+            omega[[j, i]] = kij;
+        }
+    }
 
     // Enforce TPS side-constraint P(knots)^T α = 0 by projecting onto
     // the nullspace of P(knots)^T.
@@ -3312,7 +3405,7 @@ pub(crate) mod internal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array1};
+    use ndarray::{Array1, array};
 
     /// Independent recursive implementation of B-spline basis function evaluation.
     /// This implements the Cox-de Boor algorithm using recursion, following the
@@ -3830,7 +3923,9 @@ mod tests {
         // This test ensures that evaluation at the upper boundary works correctly.
 
         // Test the internal function directly with the problematic case
-        let knots = array![0.0, 0.0, 0.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 10.0, 10.0, 10.0];
+        let knots = array![
+            0.0, 0.0, 0.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 10.0, 10.0, 10.0
+        ];
         let x = 10.0; // This is the value that caused the panic
         let degree = 3;
 
@@ -4280,6 +4375,49 @@ mod tests {
     }
 
     #[test]
+    fn test_sparse_second_derivative_matches_scalar() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
+        let degree = 3;
+        let num_basis = knots.len() - degree - 1;
+        let mut sparse_values = vec![0.0; degree + 1];
+        let mut scalar_values = vec![0.0; num_basis];
+        let mut scratch = BasisEvalScratch::new(degree);
+
+        let xs = [0.05, 0.2, 0.37, 0.61, 0.9];
+        for &x in &xs {
+            let start = evaluate_splines_second_derivative_sparse_into(
+                x,
+                degree,
+                knots.view(),
+                &mut sparse_values,
+                &mut scratch,
+            );
+
+            evaluate_bspline_second_derivative_scalar(x, knots.view(), degree, &mut scalar_values)
+                .expect("scalar second derivative");
+
+            let mut reconstructed = vec![0.0; num_basis];
+            for (offset, &value) in sparse_values.iter().enumerate() {
+                let col = start + offset;
+                if col < num_basis {
+                    reconstructed[col] = value;
+                }
+            }
+
+            for j in 0..num_basis {
+                assert!(
+                    (reconstructed[j] - scalar_values[j]).abs() < 1e-11,
+                    "sparse second derivative mismatch at x={}, basis {}: sparse={}, scalar={}",
+                    x,
+                    j,
+                    reconstructed[j],
+                    scalar_values[j]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_greville_abscissae_cubic() {
         // Uniform cubic spline on [0, 1] with 1 internal knot at 0.5
         // Knot vector: [0, 0, 0, 0, 0.5, 1, 1, 1, 1] (9 knots)
@@ -4468,6 +4606,21 @@ mod tests {
             "closed form should match integral at moderate scale: int={}, cf={}, rel={}",
             k_int,
             k_cf,
+            rel
+        );
+    }
+
+    #[test]
+    fn test_duchon_asymptotic_matches_closed_form_large_z() {
+        let z = DUCHON_ASYMPTOTIC_Z_CUTOFF;
+        let k_cf = duchon_matern_p1_s4_k10_closed_form(z, 1.0);
+        let k_asym = duchon_matern_p1_s4_k10_asymptotic(z);
+        let rel = (k_cf - k_asym).abs() / k_cf.abs().max(1e-14);
+        assert!(
+            rel < 1e-8,
+            "asymptotic shortcut should match closed form at cutoff: cf={}, asym={}, rel={}",
+            k_cf,
+            k_asym,
             rel
         );
     }

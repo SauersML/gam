@@ -55,7 +55,14 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
     let mut min_ess = f64::INFINITY;
 
     #[inline]
-    fn split_value(samples: &Array3<f64>, n_chains: usize, half: usize, dim: usize, sc: usize, t: usize) -> f64 {
+    fn split_value(
+        samples: &Array3<f64>,
+        n_chains: usize,
+        half: usize,
+        dim: usize,
+        sc: usize,
+        t: usize,
+    ) -> f64 {
         let chain = sc % n_chains;
         if sc < n_chains {
             samples[[chain, t, dim]]
@@ -273,6 +280,25 @@ pub struct NutsPosterior {
 }
 
 impl NutsPosterior {
+    #[inline]
+    fn log1pexp(eta: f64) -> f64 {
+        if eta > 0.0 {
+            eta + (-eta).exp().ln_1p()
+        } else {
+            eta.exp().ln_1p()
+        }
+    }
+
+    #[inline]
+    fn sigmoid_stable(eta: f64) -> f64 {
+        if eta >= 0.0 {
+            1.0 / (1.0 + (-eta).exp())
+        } else {
+            let e = eta.exp();
+            e / (1.0 + e)
+        }
+    }
+
     /// Creates a new posterior target from ndarray data.
     ///
     /// # Arguments
@@ -392,17 +418,17 @@ impl NutsPosterior {
         let mut residual = Array1::<f64>::zeros(n);
 
         for i in 0..n {
-            let eta_i = eta[i].clamp(-700.0, 700.0);
-            let mu_i = 1.0 / (1.0 + (-eta_i).exp());
-            let mu_clamped = mu_i.clamp(1e-10, 1.0 - 1e-10);
-
-            // Log-likelihood: y*log(μ) + (1-y)*log(1-μ)
+            let eta_i = eta[i];
             let y_i = self.data.y[i];
             let w_i = self.data.weights[i];
-            ll += w_i * (y_i * mu_clamped.ln() + (1.0 - y_i) * (1.0 - mu_clamped).ln());
+            // Use stable Bernoulli-logit log-likelihood directly:
+            //   log p(y|eta) = y*eta - log(1 + exp(eta))
+            // This keeps the target smooth and consistent with its gradient.
+            ll += w_i * (y_i * eta_i - Self::log1pexp(eta_i));
 
             // Residual for gradient: y - μ (canonical link, score function)
-            residual[i] = w_i * (y_i - mu_clamped);
+            let mu = Self::sigmoid_stable(eta_i);
+            residual[i] = w_i * (y_i - mu);
         }
 
         // Gradient of log-likelihood: X^T @ (w * (y - μ))
@@ -443,6 +469,212 @@ impl NutsPosterior {
     /// Get dimension
     pub fn dim(&self) -> usize {
         self.data.dim
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JointLinkPosterior, JointSplineArtifacts, NutsPosterior};
+    use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
+    use ndarray::{Array2, array};
+
+    #[test]
+    fn log1pexp_is_finite_for_extreme_eta() {
+        assert!(NutsPosterior::log1pexp(1000.0).is_finite());
+        assert!(NutsPosterior::log1pexp(-1000.0).is_finite());
+        assert!((NutsPosterior::log1pexp(-1000.0) - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sigmoid_stable_behaves_at_extremes() {
+        let hi = NutsPosterior::sigmoid_stable(1000.0);
+        let lo = NutsPosterior::sigmoid_stable(-1000.0);
+        assert!(hi <= 1.0 && hi >= 1.0 - 1e-12);
+        assert!(lo >= 0.0 && lo <= 1e-12);
+    }
+
+    #[test]
+    fn nuts_logit_gradient_matches_finite_difference() {
+        let x = array![[1.0, -0.5], [0.2, 0.7], [-1.0, 0.3], [0.5, -1.2]];
+        let y = array![1.0, 0.0, 1.0, 0.0];
+        let w = array![1.0, 1.5, 0.8, 1.2];
+        let penalty = array![[0.4, 0.0], [0.0, 0.6]];
+        let mode = array![0.1, -0.2];
+        let hessian = array![[2.0, 0.2], [0.2, 1.7]]; // SPD
+
+        let posterior = NutsPosterior::new(
+            x.view(),
+            y.view(),
+            w.view(),
+            penalty.view(),
+            mode.view(),
+            hessian.view(),
+            true,
+        )
+        .expect("posterior");
+
+        let z = array![0.15, -0.35];
+        let (_logp, grad) = posterior.compute_logp_and_grad_nd(&z);
+
+        let eps = 1e-6;
+        for j in 0..z.len() {
+            let mut z_plus = z.clone();
+            let mut z_minus = z.clone();
+            z_plus[j] += eps;
+            z_minus[j] -= eps;
+            let (lp, _) = posterior.compute_logp_and_grad_nd(&z_plus);
+            let (lm, _) = posterior.compute_logp_and_grad_nd(&z_minus);
+            let fd = (lp - lm) / (2.0 * eps);
+            assert!(
+                (grad[j] - fd).abs() < 1e-5,
+                "gradient mismatch at {}: analytic={}, fd={}",
+                j,
+                grad[j],
+                fd
+            );
+        }
+    }
+
+    #[test]
+    fn joint_link_uses_c1_extension_outside_knot_range() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
+        let degree = 3usize;
+        let n_raw = knots.len() - degree - 1;
+        let z = Array2::<f64>::eye(n_raw);
+        let spline = JointSplineArtifacts {
+            knot_range: (0.0, 1.0),
+            knot_vector: knots.clone(),
+            link_transform: z.clone(),
+            degree,
+        };
+        let x = array![[1.0], [1.0], [1.0]];
+        let y = array![0.0, 1.0, 0.0];
+        let w = array![1.0, 1.0, 1.0];
+        let penalty_base = array![[1.0]];
+        let penalty_link = Array2::<f64>::eye(n_raw);
+        let mode_beta = array![0.0];
+        let mode_theta = array![0.1, -0.2, 0.3, -0.1, 0.2];
+        let hessian = Array2::<f64>::eye(1 + n_raw);
+        let posterior = JointLinkPosterior::new(
+            x.view(),
+            y.view(),
+            w.view(),
+            penalty_base.view(),
+            penalty_link.view(),
+            mode_beta.view(),
+            mode_theta.view(),
+            hessian.view(),
+            spline,
+            true,
+            1.0,
+        )
+        .expect("joint posterior");
+
+        // Outside [0,1] for first and third entries; middle is interior.
+        let u = array![-0.25, 0.5, 1.2];
+        let theta = mode_theta.clone();
+        let (b_eval, _eta) = posterior.evaluate_link(&u, &theta);
+
+        let rw = 1.0;
+        let z_raw = u.mapv(|ui| ui / rw);
+        let z_c = z_raw.mapv(|zi| zi.clamp(0.0, 1.0));
+        let (b_arc, _) = create_basis::<Dense>(
+            z_c.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .expect("basis");
+        let (bp_arc, _) = create_basis::<Dense>(
+            z_c.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .expect("basis derivative");
+        let mut b_expected = b_arc.as_ref().clone();
+        let bp = bp_arc.as_ref();
+        for i in 0..u.len() {
+            let dz = z_raw[i] - z_c[i];
+            if dz.abs() <= 1e-12 {
+                continue;
+            }
+            for j in 0..b_expected.ncols() {
+                b_expected[[i, j]] += dz * bp[[i, j]];
+            }
+        }
+
+        for i in 0..u.len() {
+            for j in 0..n_raw {
+                assert!(
+                    (b_eval[[i, j]] - b_expected[[i, j]]).abs() < 1e-10,
+                    "C1 extension mismatch at ({}, {}): eval={}, expected={}",
+                    i,
+                    j,
+                    b_eval[[i, j]],
+                    b_expected[[i, j]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn joint_link_g_prime_uses_extension_derivative_outside_range() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
+        let degree = 3usize;
+        let n_raw = knots.len() - degree - 1;
+        let z = Array2::<f64>::eye(n_raw);
+        let spline = JointSplineArtifacts {
+            knot_range: (0.0, 1.0),
+            knot_vector: knots.clone(),
+            link_transform: z.clone(),
+            degree,
+        };
+        let x = array![[1.0], [1.0], [1.0]];
+        let y = array![0.0, 1.0, 0.0];
+        let w = array![1.0, 1.0, 1.0];
+        let penalty_base = array![[1.0]];
+        let penalty_link = Array2::<f64>::eye(n_raw);
+        let mode_beta = array![0.0];
+        let mode_theta = array![0.0, 1.0, 2.0, 3.0, 4.0];
+        let hessian = Array2::<f64>::eye(1 + n_raw);
+        let posterior = JointLinkPosterior::new(
+            x.view(),
+            y.view(),
+            w.view(),
+            penalty_base.view(),
+            penalty_link.view(),
+            mode_beta.view(),
+            mode_theta.view(),
+            hessian.view(),
+            spline,
+            true,
+            1.0,
+        )
+        .expect("joint posterior");
+
+        let u = array![-0.25, 0.5, 1.2];
+        let g = posterior.compute_g_prime(&u, &mode_theta);
+        let (_z_raw, z_c, rw) = posterior.standardized_z(&u);
+        let (bp_arc, _) = create_basis::<Dense>(
+            z_c.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .expect("basis derivative");
+        let bp = bp_arc.as_ref();
+        for i in 0..u.len() {
+            let dwdz: f64 = (0..n_raw).map(|j| bp[[i, j]] * mode_theta[j]).sum();
+            let expected = 1.0 + dwdz / rw;
+            assert!(
+                (g[i] - expected).abs() < 1e-10,
+                "g' mismatch at {}: got {}, expected {}",
+                i,
+                g[i],
+                expected
+            );
+        }
     }
 }
 
@@ -614,15 +846,7 @@ pub fn run_nuts_sampling(
     let dim = mode.len();
 
     // Create posterior target with analytical gradients.
-    let target = NutsPosterior::new(
-        x,
-        y,
-        weights,
-        penalty_matrix,
-        mode,
-        hessian,
-        is_logit,
-    )?;
+    let target = NutsPosterior::new(x, y, weights, penalty_matrix, mode, hessian, is_logit)?;
 
     // Get Cholesky factor for un-whitening samples later
     let chol = target.chol().clone();
@@ -762,7 +986,8 @@ pub fn run_nuts_sampling_flattened_family(
             config,
         ),
         (LikelihoodFamily::BinomialProbit, FamilyNutsInputs::Glm(_)) => Err(
-            "BinomialProbit NUTS is not implemented yet; use fit_gam/predict_gam for probit models".to_string(),
+            "BinomialProbit NUTS is not implemented yet; use fit_gam/predict_gam for probit models"
+                .to_string(),
         ),
         (LikelihoodFamily::RoystonParmar, FamilyNutsInputs::Survival(survival)) => {
             survival_hmc::run_survival_nuts_sampling(
@@ -783,8 +1008,7 @@ pub fn run_nuts_sampling_flattened_family(
             )
         }
         (LikelihoodFamily::RoystonParmar, FamilyNutsInputs::Glm(_)) => Err(
-            "RoystonParmar family requires FamilyNutsInputs::Survival flattened inputs"
-                .to_string(),
+            "RoystonParmar family requires FamilyNutsInputs::Survival flattened inputs".to_string(),
         ),
         (_, FamilyNutsInputs::Survival(_)) => Err(
             "Survival flattened inputs are only valid for LikelihoodFamily::RoystonParmar"
@@ -1064,7 +1288,6 @@ mod survival_hmc {
             converged,
         })
     }
-
 }
 
 // ============================================================================
@@ -1105,6 +1328,15 @@ pub struct JointLinkPosterior {
 }
 
 impl JointLinkPosterior {
+    #[inline]
+    fn standardized_z(&self, u: &Array1<f64>) -> (Array1<f64>, Array1<f64>, f64) {
+        let (min_u, max_u) = self.spline.knot_range;
+        let rw = (max_u - min_u).max(1e-6);
+        let z_raw: Array1<f64> = u.mapv(|v| (v - min_u) / rw);
+        let z_c: Array1<f64> = z_raw.mapv(|z| z.clamp(0.0, 1.0));
+        (z_raw, z_c, rw)
+    }
+
     /// Creates a new joint posterior target.
     /// `is_logit`: true for Bernoulli-logit, false for Gaussian-identity
     /// `scale`: dispersion parameter (ignored if is_logit=true)
@@ -1227,10 +1459,8 @@ impl JointLinkPosterior {
     }
 
     fn evaluate_link(&self, u: &Array1<f64>, theta: &Array1<f64>) -> (Array2<f64>, Array1<f64>) {
-        use crate::basis::{SplineScratch, evaluate_bspline_basis_scalar};
+        use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
         let n = u.len();
-        let (min_u, max_u) = self.spline.knot_range;
-        let rw = (max_u - min_u).max(1e-6);
         let n_raw = self
             .spline
             .knot_vector
@@ -1241,42 +1471,60 @@ impl JointLinkPosterior {
             // Return (n, 0) matrix when no link basis - avoids dimension mismatch downstream
             return (Array2::zeros((n, 0)), u.clone());
         }
-        let z: Array1<f64> = u.mapv(|v| ((v - min_u) / rw).clamp(0.0, 1.0));
-        let mut b = Array2::<f64>::zeros((n, n_c));
-        let mut raw = vec![0.0; n_raw];
-        let mut scratch = SplineScratch::new(self.spline.degree);
+
+        let (z_raw, z_c, _rw) = self.standardized_z(u);
+        let Ok((b_raw_arc, _)) = create_basis::<Dense>(
+            z_c.view(),
+            KnotSource::Provided(self.spline.knot_vector.view()),
+            self.spline.degree,
+            BasisOptions::value(),
+        ) else {
+            return (Array2::zeros((n, n_c)), u.clone());
+        };
+        let mut b_raw = b_raw_arc.as_ref().clone();
+
+        // Match joint training/prediction model: C^1 linear extension outside [0, 1]
+        // B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c)
+        let mut needs_ext = false;
         for i in 0..n {
-            raw.fill(0.0);
-            if evaluate_bspline_basis_scalar(
-                z[i],
-                self.spline.knot_vector.view(),
+            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
+                needs_ext = true;
+                break;
+            }
+        }
+        if needs_ext
+            && let Ok((b_prime_arc, _)) = create_basis::<Dense>(
+                z_c.view(),
+                KnotSource::Provided(self.spline.knot_vector.view()),
                 self.spline.degree,
-                &mut raw,
-                &mut scratch,
+                BasisOptions::first_derivative(),
             )
-            .is_ok()
-                && self.spline.link_transform.nrows() == n_raw
-            {
-                for c in 0..n_c {
-                    b[[i, c]] = raw
-                        .iter()
-                        .zip(self.spline.link_transform.column(c).iter())
-                        .map(|(&r, &t)| r * t)
-                        .sum();
+        {
+            let b_prime = b_prime_arc.as_ref();
+            for i in 0..n {
+                let dz = z_raw[i] - z_c[i];
+                if dz.abs() <= 1e-12 {
+                    continue;
+                }
+                for j in 0..b_raw.ncols() {
+                    b_raw[[i, j]] += dz * b_prime[[i, j]];
                 }
             }
         }
+
+        let b = if self.spline.link_transform.nrows() == n_raw {
+            b_raw.dot(&self.spline.link_transform)
+        } else {
+            Array2::zeros((n, n_c))
+        };
         (b.clone(), u + &b.dot(theta))
     }
 
     fn compute_g_prime(&self, u: &Array1<f64>, theta: &Array1<f64>) -> Array1<f64> {
-        use crate::basis::{
-            evaluate_bspline_derivative_scalar_into, internal::BsplineScratch,
-        };
+        use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
         let n = u.len();
         let mut g = Array1::<f64>::ones(n);
-        let (min_u, max_u) = self.spline.knot_range;
-        let rw = (max_u - min_u).max(1e-6);
+        let (_z_raw, z_c, rw) = self.standardized_z(u);
         let n_raw = self
             .spline
             .knot_vector
@@ -1287,56 +1535,24 @@ impl JointLinkPosterior {
             return g;
         }
 
-        // Pre-allocate all buffers ONCE outside the loop
-        let mut deriv_raw = vec![0.0; n_raw];
-        let num_basis_lower = self
-            .spline
-            .knot_vector
-            .len()
-            .saturating_sub(self.spline.degree);
-        let mut lower_basis = vec![0.0; num_basis_lower];
-        let mut lower_scratch = BsplineScratch::new(self.spline.degree.saturating_sub(1));
-
+        // For the C^1 extension B_ext(z_raw)=B(z_c)+(z_raw-z_c)B'(z_c),
+        // dB_ext/dz_raw = B'(z_c) everywhere (including outside [0,1]).
+        let Ok((b_prime_raw_arc, _)) = create_basis::<Dense>(
+            z_c.view(),
+            KnotSource::Provided(self.spline.knot_vector.view()),
+            self.spline.degree,
+            BasisOptions::first_derivative(),
+        ) else {
+            return g;
+        };
+        let b_prime_raw = b_prime_raw_arc.as_ref();
+        if self.spline.link_transform.nrows() != n_raw {
+            return g;
+        }
+        let b_prime_constrained = b_prime_raw.dot(&self.spline.link_transform);
+        let d_wiggle_dz = b_prime_constrained.dot(theta);
         for i in 0..n {
-            let u_i = u[i];
-            let z_i = ((u_i - min_u) / rw).clamp(0.0, 1.0);
-
-            // At boundaries, g'(u) = 1 (wiggle is constant)
-            if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
-                g[i] = 1.0;
-                continue;
-            }
-
-            // Zero-allocation eval using pre-allocated buffers
-            deriv_raw.fill(0.0);
-            if evaluate_bspline_derivative_scalar_into(
-                z_i,
-                self.spline.knot_vector.view(),
-                self.spline.degree,
-                &mut deriv_raw,
-                &mut lower_basis,
-                &mut lower_scratch,
-            )
-            .is_err()
-            {
-                continue;
-            }
-
-            // d(wiggle)/dz = B'(z) @ Z @ θ
-            let d_wiggle_dz: f64 = if self.spline.link_transform.nrows() == n_raw {
-                (0..n_c)
-                    .map(|c| {
-                        let b_prime_c: f64 = (0..n_raw)
-                            .map(|r| deriv_raw[r] * self.spline.link_transform[[r, c]])
-                            .sum();
-                        b_prime_c * theta[c]
-                    })
-                    .sum()
-            } else {
-                0.0
-            };
-
-            g[i] = 1.0 + d_wiggle_dz / rw;
+            g[i] = 1.0 + d_wiggle_dz[i] / rw;
         }
         g
     }

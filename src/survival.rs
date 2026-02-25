@@ -162,7 +162,10 @@ impl WorkingModelSurvival {
 
         if inputs.age_entry.iter().any(|v| !v.is_finite())
             || inputs.age_exit.iter().any(|v| !v.is_finite())
-            || inputs.sample_weight.iter().any(|v| !v.is_finite() || *v < 0.0)
+            || inputs
+                .sample_weight
+                .iter()
+                .any(|v| !v.is_finite() || *v < 0.0)
             || inputs.x_entry.iter().any(|v| !v.is_finite())
             || inputs.x_exit.iter().any(|v| !v.is_finite())
             || inputs.x_derivative.iter().any(|v| !v.is_finite())

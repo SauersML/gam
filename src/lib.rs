@@ -33,32 +33,32 @@ pub use basis::{
     create_matern_spline_basis, create_thin_plate_spline_basis,
     create_thin_plate_spline_basis_with_knot_count, select_thin_plate_knots,
 };
+pub use custom_family::{
+    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
+    KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
+};
 pub use estimate::{
     FitArtifacts, FitOptions, FitResult, PredictResult, fit_gam, optimize_external_design,
     predict_gam,
+};
+pub use gamlss::{
+    BinomialLocationScaleProbitFamily, BinomialLocationScaleProbitSpec,
+    BinomialLocationScaleProbitWiggleFamily, BinomialLocationScaleProbitWiggleSpec,
+    BinomialLogitFamily, BinomialLogitSpec, FamilyMetadata, GammaLogFamily, GammaLogSpec,
+    GaussianLocationScaleFamily, GaussianLocationScaleSpec, ParameterBlockInput, ParameterLink,
+    PoissonLogFamily, PoissonLogSpec, WiggleBlockConfig, build_wiggle_block_input_from_knots,
+    build_wiggle_block_input_from_seed, fit_binomial_location_scale_probit,
+    fit_binomial_location_scale_probit_wiggle, fit_binomial_logit, fit_gamma_log,
+    fit_gaussian_location_scale, fit_poisson_log, initialize_wiggle_knots_from_seed,
 };
 pub use generative::{
     CustomFamilyGenerative, GenerativeSpec, NoiseModel, custom_generative_spec,
     generative_spec_from_gam, generative_spec_from_predict, sample_observation_replicates,
     sample_observations,
 };
-pub use custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
-    KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
-};
-pub use gamlss::{
-    BinomialLocationScaleProbitFamily, BinomialLocationScaleProbitWiggleFamily,
-    BinomialLocationScaleProbitSpec, BinomialLocationScaleProbitWiggleSpec, BinomialLogitFamily,
-    BinomialLogitSpec, FamilyMetadata, GammaLogFamily, GammaLogSpec, GaussianLocationScaleFamily,
-    GaussianLocationScaleSpec, ParameterBlockInput, ParameterLink, PoissonLogFamily,
-    PoissonLogSpec, WiggleBlockConfig, build_wiggle_block_input_from_knots,
-    build_wiggle_block_input_from_seed, fit_binomial_location_scale_probit,
-    fit_binomial_location_scale_probit_wiggle, fit_binomial_logit, fit_gamma_log,
-    fit_gaussian_location_scale, fit_poisson_log, initialize_wiggle_knots_from_seed,
-};
 pub use smooth::{
-    FittedTermCollection, LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothDesign, SmoothTerm,
-    SmoothTermSpec, TermCollectionDesign, TermCollectionSpec, build_smooth_design,
+    FittedTermCollection, LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothDesign,
+    SmoothTerm, SmoothTermSpec, TermCollectionDesign, TermCollectionSpec, build_smooth_design,
     build_term_collection_design, fit_term_collection,
 };
 pub use types::{LikelihoodFamily, LinkFunction};

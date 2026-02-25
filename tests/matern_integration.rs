@@ -95,7 +95,10 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
     .expect("prediction on fitted Matérn design should succeed");
     assert!(pred.mean.iter().all(|v| v.is_finite()));
 
-    let mse_model = (&pred.mean - &y_true).mapv(|v| v * v).mean().unwrap_or(f64::INFINITY);
+    let mse_model = (&pred.mean - &y_true)
+        .mapv(|v| v * v)
+        .mean()
+        .unwrap_or(f64::INFINITY);
     let y_mean = y_true.mean().unwrap_or(0.0);
     let mse_baseline = y_true
         .iter()

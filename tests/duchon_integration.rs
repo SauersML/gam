@@ -1,7 +1,7 @@
 use gam::{
-    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, FitOptions, LikelihoodFamily,
-    MaternNu, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
-    fit_term_collection, predict_gam,
+    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, FitOptions, LikelihoodFamily, MaternNu,
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, fit_term_collection,
+    predict_gam,
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -97,7 +97,10 @@ fn duchon_fit_term_collection_gaussian_simulated_10d() {
     .expect("prediction on fitted Duchon design should succeed");
     assert!(pred.mean.iter().all(|v| v.is_finite()));
 
-    let mse_model = (&pred.mean - &y_true).mapv(|v| v * v).mean().unwrap_or(f64::INFINITY);
+    let mse_model = (&pred.mean - &y_true)
+        .mapv(|v| v * v)
+        .mean()
+        .unwrap_or(f64::INFINITY);
     let y_mean = y_true.mean().unwrap_or(0.0);
     let mse_baseline = y_true
         .iter()

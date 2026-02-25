@@ -122,16 +122,33 @@ impl PeeledHull {
         points: ArrayView2<f64>,
     ) -> (Array1<f64>, Array2<f64>) {
         let n = points.nrows();
-        let d = points.ncols();
         let mut dist = Array1::zeros(n);
-        let mut proj = Array2::zeros((n, d));
+        let mut proj = Array2::zeros((n, points.ncols()));
         if n == 0 {
             return (dist, proj);
         }
 
-        let results: Vec<(f64, Vec<f64>)> = (0..n)
+        // First pass: compute projections in parallel without per-row allocations.
+        proj.axis_iter_mut(Axis(0))
             .into_par_iter()
-            .map(|i| {
+            .enumerate()
+            .for_each(|(i, mut out_row)| {
+                let point_row = points.row(i);
+                if self.is_inside(point_row) {
+                    out_row.assign(&point_row);
+                } else {
+                    let zi = self.project_point(point_row);
+                    out_row.assign(&zi);
+                }
+            });
+
+        // Second pass: distances from original points to projection (outside) or
+        // negative boundary slack (inside).
+        dist.as_slice_mut()
+            .expect("contiguous slice")
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, slot)| {
                 let point_row = points.row(i);
                 if self.is_inside(point_row) {
                     let mut min_slack = f64::INFINITY;
@@ -141,23 +158,12 @@ impl PeeledHull {
                             min_slack = slack;
                         }
                     }
-                    let dist_val = -min_slack.max(0.0);
-                    let proj_vec = point_row.to_vec();
-                    (dist_val, proj_vec)
+                    *slot = -min_slack.max(0.0);
                 } else {
-                    let zi = self.project_point(point_row);
-                    let diff = point_row.to_owned() - &zi;
-                    let dist_val = diff.mapv(|v| v * v).sum().sqrt();
-                    let proj_vec = zi.to_vec();
-                    (dist_val, proj_vec)
+                    let diff = point_row.to_owned() - proj.row(i).to_owned();
+                    *slot = diff.mapv(|v| v * v).sum().sqrt();
                 }
-            })
-            .collect();
-
-        for (i, (dist_val, proj_vec)) in results.into_iter().enumerate() {
-            dist[i] = dist_val;
-            proj.row_mut(i).assign(&ArrayView1::from(&proj_vec));
-        }
+            });
 
         (dist, proj)
     }

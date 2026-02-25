@@ -29,28 +29,26 @@ use self::internal::RemlState;
 
 // Crate-level imports
 use crate::construction::{
-    ReparamInvariant, calculate_condition_number,
-    compute_penalty_square_roots, create_balanced_penalty_root, precompute_reparam_invariant,
+    ReparamInvariant, calculate_condition_number, compute_penalty_square_roots,
+    create_balanced_penalty_root, precompute_reparam_invariant,
 };
 use crate::matrix::DesignMatrix;
 use crate::pirls::{self, PirlsResult};
 use crate::probability::normal_cdf_approx;
 use crate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
-use crate::types::{
-    Coefficients, LinkFunction, LogSmoothingParams, LogSmoothingParamsView,
-};
+use crate::types::{Coefficients, LinkFunction, LogSmoothingParams, LogSmoothingParamsView};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_mat_mut,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_mat_mut, fast_ata,
 };
 use faer::Mat as FaerMat;
+use faer::Side;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
-use faer::Side;
 
 fn logit_from_prob(p: f64) -> f64 {
     let p = p.clamp(1e-8, 1.0 - 1e-8);
@@ -157,7 +155,6 @@ impl RemlConfig {
             firth_bias_reduction: self.firth_bias_reduction,
         }
     }
-
 }
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
 
@@ -909,8 +906,9 @@ where
         let mut optimizer = Bfgs::new(initial_z.clone(), |z| {
             let rho = to_rho_from_z(z);
             let cost = objective(&rho).unwrap_or(f64::INFINITY);
-            let grad_rho = finite_diff_gradient_external(&rho, options.finite_diff_step, &objective)
-                .unwrap_or_else(|_| Array1::<f64>::zeros(rho.len()));
+            let grad_rho =
+                finite_diff_gradient_external(&rho, options.finite_diff_step, &objective)
+                    .unwrap_or_else(|_| Array1::<f64>::zeros(rho.len()));
             let jac = jacobian_drho_dz_from_rho(&rho);
             let mut grad_z = &grad_rho * &jac;
             for g in grad_z.iter_mut() {
@@ -999,7 +997,7 @@ where
     }
 
     use crate::construction::compute_penalty_square_roots;
-    
+
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "optimize_external_design")?;
     let k = s_list.len();
@@ -1369,12 +1367,10 @@ where
 
     let mean = match family {
         crate::types::LikelihoodFamily::GaussianIdentity => eta.clone(),
-        crate::types::LikelihoodFamily::BinomialLogit => {
-            eta.mapv(|v| {
-                let z = v.clamp(-30.0, 30.0);
-                1.0 / (1.0 + (-z).exp())
-            })
-        }
+        crate::types::LikelihoodFamily::BinomialLogit => eta.mapv(|v| {
+            let z = v.clamp(-30.0, 30.0);
+            1.0 / (1.0 + (-z).exp())
+        }),
         crate::types::LikelihoodFamily::BinomialProbit => eta.mapv(normal_cdf_approx),
         crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
     };
@@ -1640,7 +1636,6 @@ where
     let p = x.ncols();
     validate_full_size_penalties(s_list, p, "evaluate_external_gradients")?;
 
-    
     let (link, firth_active) = resolve_external_family(opts.family)?;
     let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
@@ -1695,7 +1690,6 @@ where
     let p = x.ncols();
     validate_full_size_penalties(s_list, p, "evaluate_external_cost_and_ridge")?;
 
-    
     let (link, firth_active) = resolve_external_family(opts.family)?;
     let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
@@ -1797,9 +1791,13 @@ pub mod internal {
         //                  Pseudoinverse → 0 or ∞ (WRONG: ignores ridge physics)
         //
         // ══════════════════════════════════════════════════════════════════════
-        /// Pseudoinverse of H_total from positive eigenvalues only: H₊† = Σᵢ (1/λᵢ) uᵢuᵢᵀ
-        /// Used for TRACE term: ½ tr(H₊† ∂H/∂ρ) to match cost function's spectral truncation.
-        h_pseudoinverse: Arc<Array2<f64>>,
+        /// Positive-spectrum factor W = U_+ diag(1/sqrt(lambda_+)).
+        /// This avoids materializing H₊† = W Wᵀ in hot paths.
+        ///
+        /// We use identities:
+        ///   H₊† v = W (Wᵀ v)
+        ///   tr(H₊† S_k) = ||R_k W||_F², where S_k = R_kᵀ R_k.
+        h_pos_factor_w: Arc<Array2<f64>>,
 
         /// Log determinant via truncation: Σᵢ log(λᵢ) for λᵢ > ε only.
         h_total_log_det: f64,
@@ -1947,6 +1945,9 @@ pub mod internal {
         cost_last: RefCell<Option<CostAgg>>,
         cost_repeat: RefCell<u64>,
         cost_last_emit: RefCell<u64>,
+        cost_eval_count: RefCell<u64>,
+        raw_cond_snapshot: RefCell<f64>,
+        gaussian_cond_snapshot: RefCell<f64>,
         workspace: Mutex<RemlWorkspace>,
         pub(super) warm_start_beta: RefCell<Option<Coefficients>>,
         warm_start_enabled: Cell<bool>,
@@ -2122,6 +2123,13 @@ pub mod internal {
 
     // Formatting utilities moved to crate::diagnostics
     impl<'a> RemlState<'a> {
+        #[inline]
+        fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
+            // Keep expensive diagnostics out of the hot path unless they can
+            // be surfaced. This has zero effect on optimization math.
+            (log::log_enabled!(log::Level::Info) || log::log_enabled!(log::Level::Warn))
+                && (eval_idx == 1 || eval_idx % 200 == 0)
+        }
 
         fn log_det_s_with_ridge(
             s_transformed: &Array2<f64>,
@@ -2216,6 +2224,9 @@ pub mod internal {
             self.cost_last.borrow_mut().take();
             *self.cost_repeat.borrow_mut() = 0;
             *self.cost_last_emit.borrow_mut() = 0;
+            *self.cost_eval_count.borrow_mut() = 0;
+            *self.raw_cond_snapshot.borrow_mut() = f64::NAN;
+            *self.gaussian_cond_snapshot.borrow_mut() = f64::NAN;
         }
 
         /// Compute soft prior cost without needing workspace
@@ -2348,6 +2359,9 @@ pub mod internal {
                 cost_last: RefCell::new(None),
                 cost_repeat: RefCell::new(0),
                 cost_last_emit: RefCell::new(0),
+                cost_eval_count: RefCell::new(0),
+                raw_cond_snapshot: RefCell::new(f64::NAN),
+                gaussian_cond_snapshot: RefCell::new(f64::NAN),
                 workspace: Mutex::new(workspace),
                 warm_start_beta: RefCell::new(None),
                 warm_start_enabled: Cell::new(true),
@@ -2407,7 +2421,7 @@ pub mod internal {
                 });
             }
 
-            // Filter valid eigenvalues and construct W
+            // Filter valid eigenvalues and construct W = U_+ diag(1/sqrt(lambda_+)).
             let valid_indices: Vec<usize> = eigvals
                 .iter()
                 .enumerate()
@@ -2430,16 +2444,13 @@ pub mod internal {
                     });
             }
 
-            // Compute pseudoinverse: H_dagger = W * W^T
-            let h_pseudoinverse = w.dot(&w.t());
-
             Ok(EvalShared {
                 key,
                 pirls_result,
                 h_eff: Arc::new(h_eff),
                 ridge_used,
                 h_total: Arc::new(h_total),
-                h_pseudoinverse: Arc::new(h_pseudoinverse),
+                h_pos_factor_w: Arc::new(w),
                 h_total_log_det,
             })
         }
@@ -2650,11 +2661,7 @@ pub mod internal {
             let p_dim = self.p;
             let config = self.config;
             let firth_bias = config.firth_bias_reduction;
-            let link_is_logit = matches!(
-                config
-                    .link_function(),
-                LinkFunction::Logit
-            );
+            let link_is_logit = matches!(config.link_function(), LinkFunction::Logit);
             let balanced_root = &self.balanced_penalty_root;
             let reparam_invariant = &self.reparam_invariant;
 
@@ -2906,7 +2913,8 @@ pub mod internal {
                         }
                     } else {
                         // Fallback for non-CSR sparse (convert to dense)
-                        let mut x_dense = Array2::<f64>::zeros((x_sparse.nrows(), x_sparse.ncols()));
+                        let mut x_dense =
+                            Array2::<f64>::zeros((x_sparse.nrows(), x_sparse.ncols()));
                         let (symbolic, values) = x_sparse.parts();
                         let col_ptr = symbolic.col_ptr();
                         let row_idx = symbolic.row_idx();
@@ -3107,6 +3115,11 @@ pub mod internal {
         /// For Gaussian models (Identity link), this is the exact REML score.
         /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
         pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
+            let cost_call_idx = {
+                let mut calls = self.cost_eval_count.borrow_mut();
+                *calls += 1;
+                *calls
+            };
             let bundle = match self.obtain_eval_bundle(p) {
                 Ok(bundle) => bundle,
                 Err(EstimationError::ModelIsIllConditioned { .. }) => {
@@ -3194,6 +3207,7 @@ pub mod internal {
             // Don't barrier on non-PD; we'll stabilize and continue like mgcv
             // Only check eigenvalues if we needed to add a ridge
             const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
+            let want_hot_diag = self.should_compute_hot_diagnostics(cost_call_idx);
             if ridge_used > 0.0
                 && let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
                 && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
@@ -3212,7 +3226,9 @@ pub mod internal {
                     );
                 }
 
-                if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
+                if want_hot_diag
+                    && (!min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE)
+                {
                     let condition_number =
                         calculate_condition_number(&pirls_result.penalized_hessian_transformed)
                             .ok()
@@ -3227,10 +3243,7 @@ pub mod internal {
             // Use stable penalty calculation - no need to reconstruct matrices
             // The penalty term is already calculated stably in the P-IRLS loop
 
-            match self
-                .config
-                .link_function()
-            {
+            match self.config.link_function() {
                 LinkFunction::Identity => {
                     // For Gaussian models, use the exact REML score
                     // From Wood (2017), Chapter 6, Eq. 6.24:
@@ -3238,22 +3251,35 @@ pub mod internal {
                     // where D_p = ||y - Xβ̂||² + β̂'S_λβ̂ is the PENALIZED deviance
 
                     // Check condition number with improved thresholds per Wood (2011)
-                    const MAX_CONDITION_NUMBER: f64 = 1e12; // More generous threshold
-                    match calculate_condition_number(&pirls_result.penalized_hessian_transformed) {
-                        Ok(condition_number) => {
-                            if condition_number > MAX_CONDITION_NUMBER {
-                                log::warn!(
-                                    "Penalized Hessian very ill-conditioned (cond={:.2e}); proceeding despite poor conditioning.",
-                                    condition_number
-                                );
-                            } else if condition_number > 1e8 {
-                                log::warn!(
-                                    "Penalized Hessian is ill-conditioned but proceeding: condition number = {condition_number:.2e}"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            println!("Failed to compute condition number (non-critical): {e:?}");
+                    const MAX_CONDITION_NUMBER: f64 = 1e12;
+                    if want_hot_diag {
+                        let cond = pirls_result
+                            .penalized_hessian_transformed
+                            .eigh(Side::Lower)
+                            .ok()
+                            .map(|(evals, _)| {
+                                let max_ev = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                                let min_ev = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                                if min_ev <= 1e-12 {
+                                    f64::INFINITY
+                                } else {
+                                    max_ev / min_ev
+                                }
+                            })
+                            .unwrap_or(f64::NAN);
+                        *self.gaussian_cond_snapshot.borrow_mut() = cond;
+                    }
+                    let condition_number = *self.gaussian_cond_snapshot.borrow();
+                    if condition_number.is_finite() {
+                        if condition_number > MAX_CONDITION_NUMBER {
+                            log::warn!(
+                                "Penalized Hessian very ill-conditioned (cond={:.2e}); proceeding despite poor conditioning.",
+                                condition_number
+                            );
+                        } else if condition_number > 1e8 {
+                            log::warn!(
+                                "Penalized Hessian is ill-conditioned but proceeding: condition number = {condition_number:.2e}"
+                            );
                         }
                     }
 
@@ -3280,12 +3306,13 @@ pub mod internal {
                     let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
                     let mp = self.p.saturating_sub(penalty_rank) as f64;
 
-                    // Use the edf_from_h_and_rk helper for diagnostics only; φ no longer depends on EDF.
-                    let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
-                    log::debug!("[Diag] EDF total={:.3}", edf);
-
-                    if n - edf < 1.0 {
-                        log::warn!("Effective DoF exceeds samples; model may be overfit.");
+                    // EDF diagnostics are expensive; compute only when diagnostics are enabled.
+                    if want_hot_diag {
+                        let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
+                        log::debug!("[Diag] EDF total={:.3}", edf);
+                        if n - edf < 1.0 {
+                            log::warn!("Effective DoF exceeds samples; model may be overfit.");
+                        }
                     }
 
                     let denom = (n - mp).max(LAML_RIDGE);
@@ -3347,11 +3374,7 @@ pub mod internal {
                     let ridge_used = pirls_result.ridge_used;
                     // Include Firth log-det term in LAML for consistency with inner PIRLS
                     if self.config.firth_bias_reduction
-                        && matches!(
-                            self.config
-                                .link_function(),
-                            LinkFunction::Logit
-                        )
+                        && matches!(self.config.link_function(), LinkFunction::Logit)
                     {
                         if let Some(firth_log_det) = pirls_result.firth_log_det {
                             penalised_ll += firth_log_det; // Jeffreys prior contribution
@@ -3386,69 +3409,65 @@ pub mod internal {
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
-                    // Diagnostics: effective degrees of freedom via trace identity
-                    // EDF = p - tr(H^{-1} S_λ), computed using the same stabilized Hessian
-                    let p_eff = pirls_result.beta_transformed.len() as f64;
-                    let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
-                    let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
+                    // Diagnostics below are expensive and not needed for objective value.
+                    let (edf, trace_h_inv_s_lambda, stab_cond) = if want_hot_diag {
+                        let p_eff = pirls_result.beta_transformed.len() as f64;
+                        let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
+                        let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
+                        let stab_cond = pirls_result
+                            .penalized_hessian_transformed
+                            .eigh(Side::Lower)
+                            .ok()
+                            .map(|(evals, _)| {
+                                let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                                let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                                max / min.max(1e-12)
+                            })
+                            .unwrap_or(f64::NAN);
+                        (edf, trace_h_inv_s_lambda, stab_cond)
+                    } else {
+                        (f64::NAN, f64::NAN, f64::NAN)
+                    };
 
-                    let stabilized_eigs = pirls_result
-                        .penalized_hessian_transformed
-                        .eigh(Side::Lower)
-                        .ok();
-
-                    let stab_cond = stabilized_eigs
-                        .as_ref()
-                        .map(|(evals, _)| {
-                            let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                            let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                            max / min.max(1e-12)
-                        })
-                        .unwrap_or(f64::NAN);
-
-                    // Avoid dense XtWX materialization for sparse designs in hot REML loop.
-                    let raw_cond = if matches!(self.x(), DesignMatrix::Dense(_)) {
-                        let mut xtwx = Array2::<f64>::zeros((self.p, self.p));
+                    // Expensive raw-condition diagnostics are rate-limited in the hot loop.
+                    // We only refresh occasionally, and keep the last snapshot otherwise.
+                    let raw_cond = if matches!(self.x(), DesignMatrix::Dense(_)) && want_hot_diag {
                         let x_orig = self.x().to_dense();
                         let w_orig = self.weights();
-                        for i in 0..x_orig.nrows() {
-                            let wi = w_orig[i];
-                            let xi = x_orig.row(i);
-                            for j in 0..x_orig.ncols() {
-                                for k in 0..x_orig.ncols() {
-                                    xtwx[[j, k]] += wi * xi[j] * xi[k];
-                                }
-                            }
-                        }
-                        let mut h_raw = xtwx;
+                        let sqrt_w = w_orig.mapv(|w| w.max(0.0).sqrt());
+                        let wx = &x_orig * &sqrt_w.insert_axis(Axis(1));
+                        let mut h_raw = fast_ata(&wx);
                         for (k, &lambda) in lambdas.iter().enumerate() {
                             let s_k = &self.s_full_list[k];
                             if lambda != 0.0 {
                                 h_raw.scaled_add(lambda, s_k);
                             }
                         }
-                        let raw_eigs = h_raw.eigh(Side::Lower).ok();
-                        raw_eigs
-                            .as_ref()
+                        let raw = h_raw
+                            .eigh(Side::Lower)
+                            .ok()
                             .map(|(evals, _)| {
                                 let min = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
                                 let max = evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
                                 max / min.max(1e-12)
                             })
-                            .unwrap_or(f64::NAN)
+                            .unwrap_or(f64::NAN);
+                        *self.raw_cond_snapshot.borrow_mut() = raw;
+                        raw
                     } else {
-                        f64::NAN
+                        *self.raw_cond_snapshot.borrow()
                     };
-
-                    self.log_gam_cost(
-                        &p,
-                        lambdas.as_slice().unwrap_or(&[]),
-                        laml,
-                        stab_cond,
-                        raw_cond,
-                        edf,
-                        trace_h_inv_s_lambda,
-                    );
+                    if want_hot_diag {
+                        self.log_gam_cost(
+                            &p,
+                            lambdas.as_slice().unwrap_or(&[]),
+                            laml,
+                            stab_cond,
+                            raw_cond,
+                            edf,
+                            trace_h_inv_s_lambda,
+                        );
+                    }
 
                     let prior_cost = self.compute_soft_prior_cost(p);
 
@@ -3465,6 +3484,9 @@ pub mod internal {
                 *count += 1;
                 *count
             };
+            let verbose_opt = std::env::var("GAM_VERBOSE_OPT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
 
             // Map from unbounded z to bounded rho via rho = RHO_BOUND * tanh(z / RHO_BOUND)
             let rho = LogSmoothingParams::new(z.mapv(|v| {
@@ -3506,13 +3528,15 @@ pub mod internal {
                             } else {
                                 "trial"
                             };
-                            crate::visualizer::update(
-                                cost,
-                                grad_norm,
-                                status,
-                                eval_num as f64,
-                                eval_state,
-                            );
+                            if verbose_opt {
+                                crate::visualizer::update(
+                                    cost,
+                                    grad_norm,
+                                    status,
+                                    eval_num as f64,
+                                    eval_state,
+                                );
+                            }
 
                             // --- Correct State Management: Only Update on Actual Improvement ---
                             // Print summary every 50 steps to avoid spam (graph shows real-time anyway)
@@ -3520,15 +3544,17 @@ pub mod internal {
                             let should_print = eval_num == 1 || eval_num % PRINT_INTERVAL == 0;
 
                             if eval_num == 1 {
-                                println!("\n[BFGS] Starting optimization...");
-                                println!(
-                                    "  -> Initial Cost: {cost:.7} | Grad Norm: {grad_norm:.6e}"
-                                );
+                                if verbose_opt {
+                                    println!("\n[BFGS] Starting optimization...");
+                                    println!(
+                                        "  -> Initial Cost: {cost:.7} | Grad Norm: {grad_norm:.6e}"
+                                    );
+                                }
                                 *self.last_cost.borrow_mut() = cost;
                                 *self.last_grad_norm.borrow_mut() = grad_norm;
                             } else if cost < *self.last_cost.borrow() {
                                 let improvement = *self.last_cost.borrow() - cost;
-                                if should_print {
+                                if should_print && verbose_opt {
                                     println!(
                                         "[BFGS Step {eval_num}] Cost: {cost:.7} (Δ={improvement:.2e}) | Grad: {grad_norm:.6e}"
                                     );
@@ -3537,7 +3563,7 @@ pub mod internal {
                                 *self.last_grad_norm.borrow_mut() = grad_norm;
                             } else {
                                 // Trial step that didn't improve - only log every PRINT_INTERVAL
-                                if should_print {
+                                if should_print && verbose_opt {
                                     println!(
                                         "[BFGS Step {eval_num}] Trial (no improvement) | Best: {:.7}",
                                         *self.last_cost.borrow()
@@ -3548,9 +3574,11 @@ pub mod internal {
                             (cost, grad_z)
                         }
                         Err(e) => {
-                            println!(
-                                "\n[BFGS FAILED Step #{eval_num}] -> Gradient calculation error: {e:?}"
-                            );
+                            if verbose_opt {
+                                println!(
+                                    "\n[BFGS FAILED Step #{eval_num}] -> Gradient calculation error: {e:?}"
+                                );
+                            }
                             // Generate retreat gradient toward heavier smoothing in rho-space
                             let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
                             let jac = jacobian_drho_dz_from_rho(&rho);
@@ -3561,9 +3589,11 @@ pub mod internal {
                 }
                 // Special handling for infinite costs
                 Ok(cost) if cost.is_infinite() => {
-                    println!(
-                        "\n[BFGS Step #{eval_num}] -> Cost is infinite, computing retreat gradient"
-                    );
+                    if verbose_opt {
+                        println!(
+                            "\n[BFGS Step #{eval_num}] -> Cost is infinite, computing retreat gradient"
+                        );
+                    }
                     // Diagnostics: report which rho are at bounds
                     if !rho.is_empty() {
                         let at_lower: Vec<usize> = rho
@@ -3584,7 +3614,9 @@ pub mod internal {
                                 |(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None },
                             )
                             .collect();
-                        eprintln!("  -> Rho bounds: lower={:?} upper={:?}", at_lower, at_upper);
+                        if verbose_opt {
+                            eprintln!("  -> Rho bounds: lower={:?} upper={:?}", at_lower, at_upper);
+                        }
                     }
                     // Try to get a useful gradient direction to move away from problematic region
                     let gradient = match self.compute_gradient(&rho) {
@@ -3600,7 +3632,9 @@ pub mod internal {
                     let jac = jacobian_drho_dz_from_rho(&rho);
                     let gradient = &gradient * &jac;
                     let grad_norm = gradient.dot(&gradient).sqrt();
-                    println!("  -> Retreat gradient norm: {grad_norm:.6e}");
+                    if verbose_opt {
+                        println!("  -> Retreat gradient norm: {grad_norm:.6e}");
+                    }
 
                     (cost, gradient)
                 }
@@ -3616,9 +3650,11 @@ pub mod internal {
                         *cnt += 1;
                     }
                     *self.last_cost_error_msg.borrow_mut() = Some(format!("{:?}", e));
-                    println!(
-                        "\n[BFGS FAILED Step #{eval_num}] -> Cost computation failed. Optimizer will backtrack."
-                    );
+                    if verbose_opt {
+                        println!(
+                            "\n[BFGS FAILED Step #{eval_num}] -> Cost computation failed. Optimizer will backtrack."
+                        );
+                    }
                     // Generate retreat gradient toward heavier smoothing in rho-space
                     let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
                     let jac = jacobian_drho_dz_from_rho(&rho);
@@ -3627,9 +3663,11 @@ pub mod internal {
                 }
                 // Cost was non-finite or an error occurred.
                 _ => {
-                    println!(
-                        "\n[BFGS FAILED Step #{eval_num}] -> Cost is non-finite or errored. Optimizer will backtrack."
-                    );
+                    if verbose_opt {
+                        println!(
+                            "\n[BFGS FAILED Step #{eval_num}] -> Cost is non-finite or errored. Optimizer will backtrack."
+                        );
+                    }
 
                     // For infinite costs, compute a more informed gradient instead of zeros
                     // Generate retreat gradient toward heavier smoothing in rho-space
@@ -3910,10 +3948,7 @@ pub mod internal {
                 // Implement Wood (2011) exact REML/LAML gradient formulas
                 // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
 
-                match self
-                    .config
-                    .link_function()
-                {
+                match self.config.link_function() {
                     LinkFunction::Identity => {
                         // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
@@ -4196,11 +4231,7 @@ pub mod internal {
                         // we add H_phi. Below we compute H_phi and use H_total for the
                         // implicit solve (d beta_hat / d rho). If that fails, we fall
                         // back to H_pen for stability.
-                        if !matches!(
-                            self.config
-                                .link_function(),
-                            LinkFunction::Logit
-                        ) {
+                        if !matches!(self.config.link_function(), LinkFunction::Logit) {
                             let g_pll =
                                 self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
                             let g_half_logh =
@@ -4271,25 +4302,18 @@ pub mod internal {
                                 };
 
                                 // TRACE TERM COMPUTATION: tr(H_+^\dagger S_k)
-                                // We use the precomputed pseudoinverse from the eval bundle.
-                                // This guarantees spectral consistency with the cost function.
-                                let h_dagger = bundle.h_pseudoinverse.as_ref();
+                                // Use factor form to avoid materializing H_+^\dagger = W W^T:
+                                // tr(H_+^\dagger S_k) = ||R_k W||_F^2.
+                                let w_pos = bundle.h_pos_factor_w.as_ref();
 
                                 let mut trace_terms = vec![0.0; k_count];
                                 for k_idx in 0..k_count {
-                                    let rt = &rs_transformed[k_idx];
-                                    if rt.ncols() == 0 {
+                                    let r_k = &rs_transformed[k_idx];
+                                    if r_k.ncols() == 0 || w_pos.ncols() == 0 {
                                         continue;
                                     }
-                                    // Compute H_dagger * rt^T
-                                    // H_dagger is (p x p), rt is (rank x p).
-                                    // We want H_dagger * rt^T -> (p x rank).
-                                    let h_dag_rt_t = h_dagger.dot(&rt.t());
-
-                                    // Trace term: tr(H_dagger * S_k) = tr(H_dagger * rt^T * rt)
-                                    // = tr(rt * H_dagger * rt^T)
-                                    // Computed idiomatically via matrix product + diagonal sum.
-                                    trace_terms[k_idx] = rt.dot(&h_dag_rt_t).diag().iter().sum();
+                                    let rkw = r_k.dot(w_pos);
+                                    trace_terms[k_idx] = rkw.iter().map(|v| v * v).sum();
                                 }
 
                                 // We do NOT need to set workspace.solved_rows as we aren't using the workspace solver.
@@ -4331,10 +4355,7 @@ pub mod internal {
                                 //   ∂/∂β_j log|H₊| = tr(H₊† ∂H/∂β_j)
                                 // For logit in this path, H = Xᵀ W X + S.
                                 let logh_beta_grad: Option<Array1<f64>> =
-                                    if let LinkFunction::Logit = self
-                                        .config
-                                        .link_function()
-                                    {
+                                    if let LinkFunction::Logit = self.config.link_function() {
                                         self.logh_beta_grad_logit(
                                             &pirls_result.x_transformed,
                                             &pirls_result.solve_mu,
@@ -4441,11 +4462,15 @@ pub mod internal {
                                 let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) && kkt_ok
                                 {
                                     // IMPLICIT DERIVATIVE: d/dρ beta_hat = -H^-1 S_k beta.
-                                    // We need delta = H† * grad_beta (where grad_beta comes from stationarity or envelope).
-                                    // Use the PSEUDOINVERSE (H†) here for spectral consistency with the cost function.
-                                    // The cost uses log|H|_+ (spectral truncation), so the gradient must use H†
-                                    // to ensure ∂V/∂ρ matches the actual cost surface. This matches joint.rs.
-                                    let delta: Array1<f64> = h_dagger.dot(&grad_beta);
+                                    // For spectral consistency with truncated log|H| we use H_+^\dagger.
+                                    // Apply in factor form to avoid dense H_+^\dagger materialization:
+                                    //   H_+^\dagger v = W (W^T v), W = U_+ diag(1/sqrt(lambda_+)).
+                                    let delta: Array1<f64> = if w_pos.ncols() == 0 {
+                                        Array1::zeros(grad_beta.len())
+                                    } else {
+                                        let wtg = w_pos.t().dot(&grad_beta);
+                                        w_pos.dot(&wtg)
+                                    };
 
                                     let delta_inf = delta
                                         .iter()
@@ -5038,5 +5063,4 @@ pub mod internal {
 
         Ok(log_det)
     }
-
 }

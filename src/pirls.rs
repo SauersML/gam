@@ -6,8 +6,8 @@ use crate::faer_ndarray::{
 };
 use crate::matrix::DesignMatrix;
 use crate::probability::{normal_cdf_approx, normal_pdf};
-use crate::types::{LikelihoodFamily, LinkFunction};
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
+use crate::types::{LikelihoodFamily, LinkFunction};
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
@@ -397,12 +397,14 @@ impl<'a> GamWorkingModel<'a> {
         }
 
         let xtwx = match &self.x_original {
-            DesignMatrix::Sparse(matrix) => self.workspace.sparse_xtwx(matrix, weights).or_else(|_| {
-                let csr = self.x_original_csr.as_ref().ok_or_else(|| {
-                    EstimationError::InvalidInput("missing CSR cache".to_string())
-                })?;
-                self.workspace.compute_hessian_sparse_faer(csr, weights)
-            })?,
+            DesignMatrix::Sparse(matrix) => {
+                self.workspace.sparse_xtwx(matrix, weights).or_else(|_| {
+                    let csr = self.x_original_csr.as_ref().ok_or_else(|| {
+                        EstimationError::InvalidInput("missing CSR cache".to_string())
+                    })?;
+                    self.workspace.compute_hessian_sparse_faer(csr, weights)
+                })?
+            }
             DesignMatrix::Dense(x_dense) => {
                 self.workspace
                     .sqrt_w
@@ -508,12 +510,14 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     Some(&self.s_transformed),
                 )?,
                 _ => match (&self.x_original, &self.x_original_csr) {
-                    (DesignMatrix::Sparse(_), Some(csr)) => compute_firth_hat_and_half_logdet_sparse(
-                        csr,
-                        weights.view(),
-                        &mut self.workspace,
-                        Some(&self.s_transformed),
-                    )?,
+                    (DesignMatrix::Sparse(_), Some(csr)) => {
+                        compute_firth_hat_and_half_logdet_sparse(
+                            csr,
+                            weights.view(),
+                            &mut self.workspace,
+                            Some(&self.s_transformed),
+                        )?
+                    }
                     (DesignMatrix::Dense(x_dense), _) => compute_firth_hat_and_half_logdet(
                         x_dense.view(),
                         weights.view(),
@@ -1302,6 +1306,8 @@ pub struct PirlsResult {
     pub final_weights: Array1<f64>,
     // Additional PIRLS state captured at the accepted step to support
     // cost/gradient consistency in the outer optimization
+    pub final_offset: Array1<f64>,
+    pub final_eta: Array1<f64>,
     pub final_mu: Array1<f64>,
     pub solve_weights: Array1<f64>,
     pub solve_working_response: Array1<f64>,
@@ -1423,9 +1429,9 @@ pub fn fit_model_for_fixed_rho<'a>(
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let quad_ctx = crate::quadrature::QuadratureContext::new();
     let lambdas = rho.exp();
-    let lambdas_slice = lambdas
-        .as_slice_memory_order()
-        .ok_or_else(|| EstimationError::InvalidInput("non-contiguous lambda storage".to_string()))?;
+    let lambdas_slice = lambdas.as_slice_memory_order().ok_or_else(|| {
+        EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
+    })?;
 
     let link_function = config.link_function;
 
@@ -1441,10 +1447,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         for rs in rs_original {
             s_list_full.push(rs.t().dot(rs));
         }
-        Cow::Owned(create_balanced_penalty_root(
-            &s_list_full,
-            p,
-        )?)
+        Cow::Owned(create_balanced_penalty_root(&s_list_full, p)?)
     };
     let eb: &Array2<f64> = eb_cow.as_ref();
 
@@ -1520,6 +1523,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         let prior_weights_owned = prior_weights.to_owned();
         let mut eta = offset.to_owned();
         eta += &x_transformed_dense.dot(beta_transformed.as_ref());
+        let final_eta = eta.clone();
         let final_mu = eta.clone();
         let final_z = y.to_owned();
 
@@ -1583,6 +1587,8 @@ pub fn fit_model_for_fixed_rho<'a>(
             firth_log_det: None,
             firth_hat_diag: None,
             final_weights: prior_weights_owned.clone(),
+            final_offset: offset.to_owned(),
+            final_eta: final_eta.clone(),
             final_mu: final_mu.clone(),
             solve_weights: prior_weights_owned,
             solve_working_response: final_z.clone(),
@@ -1628,7 +1634,12 @@ pub fn fit_model_for_fixed_rho<'a>(
         .filter(|beta| beta.len() == p)
         .map(|beta| beta.to_owned())
         .unwrap_or_else(|| {
-            Coefficients::new(default_beta_guess_external(p, link_function, y, prior_weights))
+            Coefficients::new(default_beta_guess_external(
+                p,
+                link_function,
+                y,
+                prior_weights,
+            ))
         });
     let initial_beta = reparam_result.qs.t().dot(beta_guess_original.as_ref());
 
@@ -1747,6 +1758,8 @@ pub fn fit_model_for_fixed_rho<'a>(
         firth_log_det,
         firth_hat_diag: working_summary.state.firth_hat_diag.clone(),
         final_weights: final_weights.clone(),
+        final_offset: offset.to_owned(),
+        final_eta: working_summary.state.eta.as_ref().clone(),
         final_mu: final_mu.clone(),
         solve_weights: final_weights.clone(),
         solve_working_response: final_z.clone(),
@@ -1796,8 +1809,10 @@ pub fn fit_model_for_fixed_rho_matrix(
             covariate_se,
         ),
         DesignMatrix::Sparse(x_sparse)
-            if matches!(config.link_function, LinkFunction::Logit | LinkFunction::Probit)
-                && !config.firth_bias_reduction =>
+            if matches!(
+                config.link_function,
+                LinkFunction::Logit | LinkFunction::Probit
+            ) && !config.firth_bias_reduction =>
         {
             fit_model_for_fixed_rho_sparse_implicit(
                 rho,
@@ -1850,9 +1865,9 @@ fn fit_model_for_fixed_rho_sparse_implicit(
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let quad_ctx = crate::quadrature::QuadratureContext::new();
     let lambdas = rho.exp();
-    let lambdas_slice = lambdas
-        .as_slice_memory_order()
-        .ok_or_else(|| EstimationError::InvalidInput("non-contiguous lambda storage".to_string()))?;
+    let lambdas_slice = lambdas.as_slice_memory_order().ok_or_else(|| {
+        EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
+    })?;
     let link_function = config.link_function;
     use crate::construction::{
         EngineDims, create_balanced_penalty_root, stable_reparameterization_engine,
@@ -1907,7 +1922,12 @@ fn fit_model_for_fixed_rho_sparse_implicit(
         .filter(|beta| beta.len() == p)
         .map(|beta| beta.to_owned())
         .unwrap_or_else(|| {
-            Coefficients::new(default_beta_guess_external(p, link_function, y, prior_weights))
+            Coefficients::new(default_beta_guess_external(
+                p,
+                link_function,
+                y,
+                prior_weights,
+            ))
         });
     let initial_beta = reparam_result.qs.t().dot(beta_guess_original.as_ref());
     let options = WorkingModelPirlsOptions {
@@ -1989,6 +2009,8 @@ fn fit_model_for_fixed_rho_sparse_implicit(
         firth_log_det,
         firth_hat_diag: working_summary.state.firth_hat_diag.clone(),
         final_weights: final_weights.clone(),
+        final_offset: offset.to_owned(),
+        final_eta: working_summary.state.eta.as_ref().clone(),
         final_mu: final_mu.clone(),
         solve_weights: final_weights.clone(),
         solve_working_response: final_z.clone(),
@@ -2338,7 +2360,15 @@ pub fn update_glm_vectors_by_family(
             Ok(())
         }
         LikelihoodFamily::GaussianIdentity => {
-            update_glm_vectors(y, eta, LinkFunction::Identity, prior_weights, mu, weights, z);
+            update_glm_vectors(
+                y,
+                eta,
+                LinkFunction::Identity,
+                prior_weights,
+                mu,
+                weights,
+                z,
+            );
             Ok(())
         }
         LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
@@ -2625,7 +2655,15 @@ pub fn solve_penalized_least_squares(
     // Re-use `regularized_hessian` for EDF to consistency.
     let edf = calculate_edf(&regularized_hessian, e_transformed)?;
 
-    let scale = calculate_scale(&beta_vec, x_transformed, y, weights, edf, link_function);
+    let scale = calculate_scale(
+        &beta_vec,
+        x_transformed,
+        y,
+        weights,
+        offset,
+        edf,
+        link_function,
+    );
 
     Ok((
         StablePLSResult {
@@ -2702,6 +2740,7 @@ fn calculate_scale(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>, // This is the original response, not the working response z
     weights: ArrayView1<f64>,
+    offset: ArrayView1<f64>,
     edf: f64,
     link_function: LinkFunction,
 ) -> f64 {
@@ -2713,7 +2752,10 @@ fn calculate_scale(
         }
         LinkFunction::Identity => {
             // For Gaussian models, scale is estimated from the residual sum of squares
-            let fitted = x.dot(beta);
+            // IMPORTANT: the fitted mean is eta = offset + Xβ. Using Xβ alone
+            // silently biases dispersion whenever offsets are present.
+            let mut fitted = x.dot(beta);
+            fitted += &offset;
             let residuals = &y - &fitted;
             let weighted_rss: f64 = weights
                 .iter()
@@ -2727,6 +2769,76 @@ fn calculate_scale(
             let effective_n = y.len() as f64;
             weighted_rss / (effective_n - edf).max(1.0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calculate_scale;
+    use crate::types::LinkFunction;
+    use ndarray::{array, Array1};
+
+    #[test]
+    fn gaussian_scale_uses_offset_in_residuals() {
+        // Perfect fit only if offset is included: y = offset + Xβ.
+        // If offset were dropped, weighted RSS would be non-zero.
+        let x = array![[1.0], [2.0], [3.0]];
+        let beta = array![2.0];
+        let offset = array![10.0, 20.0, 30.0];
+        let y = array![12.0, 24.0, 36.0]; // offset + x * beta
+        let w = Array1::ones(3);
+
+        let scale = calculate_scale(
+            &beta,
+            x.view(),
+            y.view(),
+            w.view(),
+            offset.view(),
+            0.0,
+            LinkFunction::Identity,
+        );
+
+        assert!(
+            scale.abs() < 1e-12,
+            "scale must be ~0 for exact fit with offset; got {}",
+            scale
+        );
+    }
+
+    #[test]
+    fn gaussian_scale_matches_weighted_rss_with_offset() {
+        let x = array![[1.0], [2.0], [4.0]];
+        let beta = array![1.5];
+        let offset = array![0.5, -1.0, 2.0];
+        let y = array![2.2, 2.0, 7.5];
+        let w = array![1.0, 2.0, 0.5];
+        let edf = 1.25;
+
+        let scale = calculate_scale(
+            &beta,
+            x.view(),
+            y.view(),
+            w.view(),
+            offset.view(),
+            edf,
+            LinkFunction::Identity,
+        );
+
+        let mut fitted = x.dot(&beta);
+        fitted += &offset;
+        let rss: f64 = w
+            .iter()
+            .zip(y.iter().zip(fitted.iter()))
+            .map(|(&wi, (&yi, &fi))| wi * (yi - fi).powi(2))
+            .sum();
+        let expected = rss / ((y.len() as f64 - edf).max(1.0));
+
+        assert!(
+            (scale - expected).abs() < 1e-12,
+            "scale mismatch: got {}, expected {}",
+            scale,
+            expected
+        );
     }
 }
 
