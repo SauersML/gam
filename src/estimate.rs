@@ -908,38 +908,12 @@ fn check_rho_gradient_stationarity(
     let max_abs_rho = rho.iter().fold(0.0_f64, |acc, &val| acc.max(val.abs()));
 
     let tol_rho = tol_z.max(1e-12);
-    let mut is_stationary = grad_norm_rho <= tol_rho;
-
-    let boundary_margin = 1.0_f64;
-    let mut boundary_push = false;
-    for (&rho_i, &grad_i) in rho.iter().zip(grad_rho_raw.iter()) {
-        let dist_to_bound = RHO_BOUND - rho_i.abs();
-        if dist_to_bound <= boundary_margin {
-            if rho_i > 0.0 && grad_i < -tol_rho {
-                boundary_push = true;
-                break;
-            }
-            if rho_i < 0.0 && grad_i > tol_rho {
-                boundary_push = true;
-                break;
-            }
-        }
-    }
-
-    if boundary_push {
-        is_stationary = false;
-        eprintln!(
-            "[Candidate {label}] Gradient pushes outside rho bound (max|rho|={:.2}, max|∇ρ|={:.3e}); marking as non-stationary",
-            max_abs_rho, max_abs_grad
-        );
-    }
-
-    if !boundary_push && grad_norm_rho > tol_rho {
+    let is_stationary = grad_norm_rho <= tol_rho;
+    if grad_norm_rho > tol_rho {
         eprintln!(
             "[Candidate {label}] projected rho-space gradient norm {:.3e} exceeds tolerance {:.3e}; marking as non-stationary",
             grad_norm_rho, tol_rho
         );
-        is_stationary = false;
     }
 
     eprintln!(
@@ -1528,7 +1502,30 @@ where
     for (label, initial_z) in candidate_seeds {
         let solution = if use_newton {
             match run_newton_for_candidate(&label, &reml_state, &cfg, initial_z.clone()) {
-                Ok(sol) => sol,
+                Ok(sol) => {
+                    if sol.stationary {
+                        sol
+                    } else {
+                        eprintln!(
+                            "[Candidate {label}] Newton ended non-stationary (grad_norm={:.3e}); retrying with BFGS.",
+                            sol.grad_norm_rho
+                        );
+                        let (bfgs_solution, grad_norm_rho, stationary) =
+                            run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z)?;
+                        let bfgs_outer = OuterSolveResult {
+                            final_rho: to_rho_from_z(&bfgs_solution.final_point),
+                            final_value: bfgs_solution.final_value,
+                            iterations: bfgs_solution.iterations,
+                            grad_norm_rho,
+                            stationary,
+                        };
+                        if bfgs_outer.stationary || bfgs_outer.final_value <= sol.final_value {
+                            bfgs_outer
+                        } else {
+                            sol
+                        }
+                    }
+                }
                 Err(err) => {
                     eprintln!("[Candidate {label}] Newton failed ({err}); falling back to BFGS.");
                     let (bfgs_solution, grad_norm_rho, stationary) =
@@ -1718,9 +1715,10 @@ where
     };
 
     // Compute gradient norm at final rho for reporting
-    let final_grad = reml_state
+    let mut final_grad = reml_state
         .compute_gradient(&final_rho)
         .unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
+    project_rho_gradient(&final_rho, &mut final_grad);
     let final_grad_norm_rho = final_grad.dot(&final_grad).sqrt();
     let final_grad_norm = if final_grad_norm_rho.is_finite() {
         final_grad_norm_rho
