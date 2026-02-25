@@ -41,7 +41,8 @@ zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 logtest = "2"
 serial_test = "3.2.0"
 
-[dependencies.mini-mcmc]
+[dependencies.general-mcmc]
+package = "general-mcmc"
 git = "https://github.com/SauersML/general-mcmc"
 branch = "main"
 default-features = false
