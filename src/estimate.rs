@@ -378,6 +378,10 @@ impl RemlConfig {
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
+            // External optimization defaults to objective-consistent finite differences for
+            // non-Identity links. This keeps the BFGS search direction aligned with the exact
+            // cost surface being minimized (including all stabilization/truncation/ridge choices),
+            // instead of relying on fragile closed-form LAML derivatives in difficult regimes.
             objective_consistent_fd_gradient: true,
         }
     }
@@ -1308,6 +1312,13 @@ fn finite_diff_gradient_external<F>(
 where
     F: FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
 {
+    // Central-difference gradient in rho-space:
+    //   g_k ≈ [V(rho + h e_k) - V(rho - h e_k)] / (2h).
+    //
+    // This is intentionally objective-level (black-box) differentiation, so the returned
+    // gradient is exactly consistent with whatever nonlinearities the objective currently
+    // includes (Laplace terms, truncation conventions, ridge policies, survival constraints,
+    // etc.). That consistency is often more robust than brittle closed-form expressions.
     let mut grad = Array1::<f64>::zeros(rho.len());
     for i in 0..rho.len() {
         let mut rp = rho.clone();
@@ -1325,6 +1336,16 @@ where
 ///
 /// This is intended for likelihoods whose outer objective is exposed as a scalar
 /// function of `rho` (for example survival workflows built on working-model PIRLS).
+///
+/// Mathematically, this optimizer searches:
+///   rho* = argmin_rho V(rho),
+/// where `V` is supplied by the caller.
+///
+/// The gradient seen by BFGS is always computed by finite differences on `V`:
+///   grad_k = dV/drho_k ≈ [V(rho+h e_k)-V(rho-h e_k)]/(2h).
+/// This makes the direction field fully consistent with the exact scalar objective,
+/// which is particularly useful for complicated non-Gaussian/survival objectives where
+/// exact analytic outer derivatives are either expensive or error-prone.
 pub fn optimize_log_smoothing_with_multistart<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
@@ -1389,6 +1410,116 @@ where
         let rho = to_rho_from_z(&solution.final_point);
         let mut grad_rho =
             finite_diff_gradient_external(&rho, options.finite_diff_step, &mut objective)?;
+        project_rho_gradient(&rho, &mut grad_rho);
+        let grad_norm = grad_rho.dot(&grad_rho).sqrt();
+        let stationary = grad_norm <= options.tol.max(1e-6);
+        let candidate = SmoothingBfgsResult {
+            rho,
+            final_value: solution.final_value,
+            iterations: solution.iterations,
+            final_grad_norm: grad_norm,
+            stationary,
+        };
+
+        let replace = match &best {
+            None => true,
+            Some(current) => {
+                if candidate.stationary != current.stationary {
+                    candidate.stationary
+                } else if candidate.stationary {
+                    candidate.final_value < current.final_value
+                } else {
+                    candidate.final_grad_norm < current.final_grad_norm
+                }
+            }
+        };
+        if replace {
+            best = Some(candidate);
+        }
+    }
+
+    best.ok_or_else(|| {
+        EstimationError::RemlOptimizationFailed(
+            "all smoothing BFGS starts failed before producing a candidate".to_string(),
+        )
+    })
+}
+
+/// Generic multi-start BFGS smoothing optimizer over log-smoothing parameters (`rho`)
+/// when the caller can provide an exact objective gradient in rho-space.
+///
+/// The callback must return:
+/// - `value = V(rho)`
+/// - `grad_rho = dV/drho` (same dimension/order as `rho`)
+///
+/// Internally we optimize in unconstrained `z` coordinates and apply the chain rule:
+///   grad_z = diag(drho_dz) * grad_rho.
+pub fn optimize_log_smoothing_with_multistart_with_gradient<F>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    mut objective_with_gradient: F,
+    options: &SmoothingBfgsOptions,
+) -> Result<SmoothingBfgsResult, EstimationError>
+where
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError>,
+{
+    if num_penalties == 0 {
+        let rho = Array1::<f64>::zeros(0);
+        let (value, grad) = objective_with_gradient(&rho)?;
+        let grad_norm = grad.dot(&grad).sqrt();
+        return Ok(SmoothingBfgsResult {
+            rho,
+            final_value: value,
+            iterations: 0,
+            final_grad_norm: grad_norm,
+            stationary: grad_norm <= options.tol.max(1e-6),
+        });
+    }
+
+    let seeds = generate_rho_candidates(num_penalties, heuristic_lambdas, &options.seed_config);
+    if seeds.is_empty() {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "no smoothing seeds produced".to_string(),
+        ));
+    }
+
+    let mut best: Option<SmoothingBfgsResult> = None;
+    for (idx, rho_seed) in seeds.iter().enumerate() {
+        let initial_z = to_z_from_rho(rho_seed);
+        let mut optimizer = Bfgs::new(initial_z.clone(), |z| {
+            let rho = to_rho_from_z(z);
+            match objective_with_gradient(&rho) {
+                Ok((cost, grad_rho)) => {
+                    let jac = jacobian_drho_dz_from_rho(&rho);
+                    let mut grad_z = &grad_rho * &jac;
+                    for g in grad_z.iter_mut() {
+                        if !g.is_finite() {
+                            *g = 0.0;
+                        }
+                    }
+                    (cost, grad_z)
+                }
+                Err(_) => (f64::INFINITY, Array1::<f64>::zeros(rho.len())),
+            }
+        })
+        .with_tolerance(options.tol)
+        .with_max_iterations(options.max_iter)
+        .with_fp_tolerances(1e2, 1e2)
+        .with_no_improve_stop(1e-8, 5)
+        .with_rng_seed(0x5EED_u64.wrapping_add(idx as u64));
+
+        let solution = match optimizer.run() {
+            Ok(sol) => sol,
+            Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+            Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
+            Err(_) => continue,
+        };
+
+        let rho = to_rho_from_z(&solution.final_point);
+        let mut grad_rho = match objective_with_gradient(&rho) {
+            Ok((_, g)) => g,
+            Err(_) => Array1::<f64>::zeros(rho.len()),
+        };
         project_rho_gradient(&rho, &mut grad_rho);
         let grad_norm = grad_rho.dot(&grad_rho).sqrt();
         let stationary = grad_norm <= options.tol.max(1e-6);
@@ -4990,35 +5121,35 @@ pub mod internal {
         /// Helper function that computes gradient using a shared evaluation bundle
         /// so cost and gradient reuse the identical stabilized Hessian and PIRLS state.
         ///
-        /// # Derivation of the Analytic Gradient for Firth-Adjusted LAML
+        /// # Exact Outer-Gradient Identity Used by This Function
         ///
-        /// This function implements the exact gradient of the Laplace Approximate Marginal Likelihood (LAML)
-        /// with respect to the smoothing parameters $\rho$.
+        /// Notation:
+        /// - `rho[k]` are log-smoothing parameters; `lambda[k] = exp(rho[k])`.
+        /// - `S(rho) = Σ_k lambda[k] S_k`.
+        /// - `A_k = ∂S/∂rho_k = lambda[k] S_k`.
+        /// - `beta_hat(rho)` is the inner PIRLS mode.
+        /// - `H(rho)` is the Laplace curvature matrix used by this objective path.
         ///
-        /// The Outer Objective (LAML) is:
-        /// $$ V(\rho) = - \mathcal{L}(\hat{\beta}, \rho) + \frac{1}{2} \log |H_{total}| - \frac{1}{2} \log |S_\lambda|_+ $$
+        /// Outer objective:
+        ///   V(rho) = [penalized data-fit at beta_hat]
+        ///          + 0.5 log|H(rho)| - 0.5 log|S(rho)|_+.
         ///
-        /// The gradient is computed via the Total Derivative:
-        /// $$ \frac{d V}{d \rho_k} = \frac{\partial V}{\partial \rho_k} \bigg|_{\hat{\beta}} + \left( \nabla_\beta V \right)^\top \frac{d \hat{\beta}}{d \rho_k} $$
+        /// Exact derivative form:
+        ///   dV/drho_k
+        ///   = 0.5 * beta_hat^T A_k beta_hat
+        ///   + 0.5 * tr(H^{-1} H_k)
+        ///   - 0.5 * tr(S^+ A_k),
+        /// where H_k = dH/drho_k is the *total* derivative (includes beta_hat movement).
         ///
-        /// ## Term 1: Direct Partial Derivative $\frac{\partial V}{\partial \rho_k}$
-        /// $$ \frac{\partial V}{\partial \rho_k} = \frac{1}{2} \lambda_k \hat{\beta}^\top S_k \hat{\beta} + \frac{1}{2} \lambda_k \text{tr}(H_{total}^{-1} S_k) - \frac{1}{2} \lambda_k \text{tr}(S_\lambda^+ S_k) $$
-        /// - **Beta Quadratic:** $0.5 \lambda_k \beta^\top S_k \beta$ (`0.5 * beta_terms`)
-        /// - **Log-Det Hessian:** $0.5 \lambda_k \text{tr}(H_{total}^{-1} S_k)$ (`log_det_h_grad_term`)
-        /// - **Log-Det Penalty:** $-0.5 \lambda_k \text{tr}(S^+ S_k)$ (`-0.5 * det1_values`)
+        /// Important implementation point:
+        /// - We do NOT add a separate `(∇_beta V)^T (d beta_hat / d rho_k)` term on top of
+        ///   `tr(H^{-1} H_k)`. That dependence is already inside `H_k`.
         ///
-        /// ## Term 2: Implicit Correction
-        /// The implicit derivative of the coefficients $\frac{d \hat{\beta}}{d \rho_k}$ accounts for the fact that
-        /// $\hat{\beta}$ moves as $\rho$ changes to maintain the stationarity condition $\nabla_\beta \mathcal{L} = 0$.
-        ///
-        /// $$ \frac{d \hat{\beta}}{d \rho_k} = - H_{total}^{-1} (\lambda_k S_k \hat{\beta}) $$
-        ///
-        /// The correction term is:
-        /// $$ (\nabla_\beta V)^\top \frac{d \hat{\beta}}{d \rho_k} = - (\nabla_\beta V)^\top H_{total}^{-1} (\lambda_k S_k \hat{\beta}) $$
-        ///
-        /// Where $\nabla_\beta V = -\nabla_\beta \mathcal{L} + \frac{1}{2} \nabla_\beta \log |H_{total}|$.
-        /// - At a perfect optimum, $\nabla_\beta \mathcal{L} = 0$; `residual_grad` keeps the finite-iteration term explicit.
-        /// - $\frac{1}{2} \nabla_\beta \log |H_{total}|$ is computed via `firth_logh_total_grad`.
+        /// Variable mapping in this function:
+        /// - `beta_terms[k]`     => beta_hat^T A_k beta_hat
+        /// - `det1_values[k]`    => tr(S^+ A_k)
+        /// - `trace_terms[k]`    => tr(H^{-1} H_k) / lambda[k] (before the outer lambda factor)
+        /// - final assembly       => 0.5*beta_terms + 0.5*lambda*trace_terms - 0.5*det1
         ///
         /// ## Exact non-Gaussian Hessian system (reference for this implementation)
         ///
@@ -5471,7 +5602,12 @@ pub mod internal {
                         //   2) solve/apply H_+^† to get v_k and leverage terms,
                         //   3) evaluate tr(H_+^† H_k) as
                         //        tr(H_+^† S_k) - tr(H_+^† Xᵀ diag(c ⊙ X v_k) X),
-                        //   4) add envelope/direct pieces and the chain-rule implicit correction.
+                        //   4) assemble
+                        //        0.5*β̂ᵀA_kβ̂ + 0.5*tr(H_+^†H_k) - 0.5*tr(S^+A_k).
+                        //
+                        // There is intentionally no extra "(∇_β V)^T dβ/dρ" add-on here:
+                        // the beta-dependence path is already encoded in H_k through the
+                        // third-derivative contraction term.
                         // Replace FD with implicit differentiation for logit models.
                         // When Firth bias reduction is enabled, the inner objective is:
                         //   L*(beta, rho) = l(beta) - 0.5 * beta' S_lambda beta
