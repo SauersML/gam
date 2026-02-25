@@ -2,7 +2,7 @@ use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, fast_atv,
+    array2_to_mat_mut, fast_ab, fast_ata, fast_atv,
 };
 use crate::matrix::DesignMatrix;
 use crate::probability::{normal_cdf_approx, normal_pdf};
@@ -438,8 +438,8 @@ impl<'a> GamWorkingModel<'a> {
         };
 
         let qs = self.qs.as_ref().expect("qs required for implicit design");
-        let tmp = qs.t().dot(&xtwx);
-        Ok(tmp.dot(qs) + &self.s_transformed)
+        let tmp = crate::faer_ndarray::fast_atb(qs, &xtwx);
+        Ok(fast_ab(&tmp, qs) + &self.s_transformed)
     }
 }
 
@@ -835,7 +835,7 @@ fn compute_firth_hat_and_half_logdet(
     workspace.wx.assign(&x_design);
     workspace.wx *= &sqrt_w_col;
 
-    let xtwx_transformed = workspace.wx.t().dot(&workspace.wx);
+    let xtwx_transformed = fast_ata(&workspace.wx);
     let mut stabilized = xtwx_transformed.clone();
     if let Some(s) = s_transformed {
         for i in 0..p {
