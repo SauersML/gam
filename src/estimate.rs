@@ -622,6 +622,13 @@ fn project_rho_gradient(rho: &Array1<f64>, grad: &mut Array1<f64>) {
     }
 }
 
+#[inline]
+fn grad_norm_in_z_space(rho: &Array1<f64>, grad_rho: &Array1<f64>) -> f64 {
+    let jac = jacobian_drho_dz_from_rho(rho);
+    let grad_z = grad_rho * &jac;
+    grad_z.dot(&grad_z).sqrt()
+}
+
 /// Smooth approximation of `max(dp, DP_FLOOR)` that is differentiable.
 ///
 /// Returns the smoothed value and its derivative with respect to `dp`.
@@ -901,27 +908,28 @@ fn check_rho_gradient_stationarity(
     let mut grad_rho = reml_state.compute_gradient(&rho)?;
     let grad_rho_raw = grad_rho.clone();
     project_rho_gradient(&rho, &mut grad_rho);
+    let grad_norm_z = grad_norm_in_z_space(&rho, &grad_rho);
     let grad_norm_rho = grad_rho.dot(&grad_rho).sqrt();
     let max_abs_grad = grad_rho_raw
         .iter()
         .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
     let max_abs_rho = rho.iter().fold(0.0_f64, |acc, &val| acc.max(val.abs()));
 
-    let tol_rho = tol_z.max(1e-12);
-    let is_stationary = grad_norm_rho <= tol_rho;
-    if grad_norm_rho > tol_rho {
+    let tol_z = tol_z.max(1e-12);
+    let is_stationary = grad_norm_z <= tol_z;
+    if grad_norm_z > tol_z {
         eprintln!(
-            "[Candidate {label}] projected rho-space gradient norm {:.3e} exceeds tolerance {:.3e}; marking as non-stationary",
-            grad_norm_rho, tol_rho
+            "[Candidate {label}] z-space gradient norm {:.3e} exceeds tolerance {:.3e}; marking as non-stationary",
+            grad_norm_z, tol_z
         );
     }
 
     eprintln!(
-        "[Candidate {label}] rho-space gradient norm {:.3e} (tol {:.3e}); max|∇ρ| {:.3e}; max|ρ| {:.2}; stationary = {}",
-        grad_norm_rho, tol_rho, max_abs_grad, max_abs_rho, is_stationary
+        "[Candidate {label}] z-space gradient norm {:.3e} (tol {:.3e}); projected rho-space norm {:.3e}; max|∇ρ| {:.3e}; max|ρ| {:.2}; stationary = {}",
+        grad_norm_z, tol_z, grad_norm_rho, max_abs_grad, max_abs_rho, is_stationary
     );
 
-    Ok((grad_norm_rho, is_stationary))
+    Ok((grad_norm_z, is_stationary))
 }
 
 fn run_bfgs_for_candidate(
@@ -1025,7 +1033,7 @@ fn run_newton_for_candidate(
         let mut grad = reml_state.compute_gradient(&rho)?;
         maybe_audit_gradient(reml_state, &rho, iter_done as u64, &mut grad);
         project_rho_gradient(&rho, &mut grad);
-        let grad_norm = grad.dot(&grad).sqrt();
+        let grad_norm = grad_norm_in_z_space(&rho, &grad);
         if cost.is_finite() && (cost < best_cost || !best_cost.is_finite()) {
             best_cost = cost;
             best_rho = rho.clone();
@@ -1096,7 +1104,7 @@ fn run_newton_for_candidate(
         let mut grad = reml_state.compute_gradient(&best_rho)?;
         maybe_audit_gradient(reml_state, &best_rho, iter_done as u64, &mut grad);
         project_rho_gradient(&best_rho, &mut grad);
-        best_grad_norm = grad.dot(&grad).sqrt();
+        best_grad_norm = grad_norm_in_z_space(&best_rho, &grad);
         stationary = best_grad_norm <= tol;
     }
 
@@ -1719,9 +1727,9 @@ where
         .compute_gradient(&final_rho)
         .unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
     project_rho_gradient(&final_rho, &mut final_grad);
-    let final_grad_norm_rho = final_grad.dot(&final_grad).sqrt();
-    let final_grad_norm = if final_grad_norm_rho.is_finite() {
-        final_grad_norm_rho
+    let final_grad_norm_z = grad_norm_in_z_space(&final_rho, &final_grad);
+    let final_grad_norm = if final_grad_norm_z.is_finite() {
+        final_grad_norm_z
     } else {
         best_grad_norm
     };
