@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd, fast_atv};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
@@ -527,7 +527,7 @@ fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
         return Array1::zeros(x.ncols());
     }
     // Vectorized: means = (X^T w) / sum(w)
-    x.t().dot(w) / denom
+    fast_atv(x, w) / denom
 }
 
 /// Centers the columns of a matrix using weighted means.

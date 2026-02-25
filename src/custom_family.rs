@@ -1,5 +1,6 @@
 use crate::matrix::DesignMatrix;
-use crate::types::LinkFunction;
+use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
+use crate::faer_ndarray::FaerCholesky;
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
@@ -94,6 +95,8 @@ pub struct BlockwiseFitOptions {
     pub outer_tol: f64,
     pub min_weight: f64,
     pub ridge_floor: f64,
+    /// Shared ridge semantics used by solve/quadratic/logdet terms.
+    pub ridge_policy: RidgePolicy,
     /// If true, outer smoothing optimization uses a Laplace/REML-style objective:
     ///   -loglik + penalty + 0.5(log|H| - log|S|_+)
     /// where H is blockwise working curvature and S is blockwise penalty.
@@ -109,6 +112,7 @@ impl Default for BlockwiseFitOptions {
             outer_tol: 1e-5,
             min_weight: 1e-12,
             ridge_floor: 1e-12,
+            ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_reml_objective: true,
         }
     }
@@ -302,6 +306,7 @@ fn solve_block_weighted_system(
     w: &Array1<f64>,
     s_lambda: &Array2<f64>,
     ridge_floor: f64,
+    ridge_policy: RidgePolicy,
 ) -> Result<Array1<f64>, String> {
     let n = x.nrows();
     let p = x.ncols();
@@ -334,7 +339,11 @@ fn solve_block_weighted_system(
 
     xtwx += s_lambda;
 
-    let ridge = effective_solver_ridge(ridge_floor);
+    let ridge = if ridge_policy.include_laplace_hessian {
+        effective_solver_ridge(ridge_floor)
+    } else {
+        0.0
+    };
     for d in 0..p {
         xtwx[[d, d]] += ridge;
     }
@@ -369,7 +378,11 @@ fn effective_solver_ridge(ridge_floor: f64) -> f64 {
     ridge_floor.max(1e-15)
 }
 
-fn stable_logdet_pospart(matrix: &Array2<f64>, ridge_floor: f64) -> Result<f64, String> {
+fn stable_logdet_with_ridge_policy(
+    matrix: &Array2<f64>,
+    ridge_floor: f64,
+    ridge_policy: RidgePolicy,
+) -> Result<f64, String> {
     let mut a = matrix.clone();
     let p = a.nrows();
     for i in 0..p {
@@ -379,20 +392,35 @@ fn stable_logdet_pospart(matrix: &Array2<f64>, ridge_floor: f64) -> Result<f64, 
             a[[j, i]] = v;
         }
     }
-    let ridge = effective_solver_ridge(ridge_floor);
+    let ridge = if ridge_policy.include_penalty_logdet {
+        effective_solver_ridge(ridge_floor)
+    } else {
+        0.0
+    };
     for i in 0..p {
         a[[i, i]] += ridge;
     }
-    let (evals, _) = crate::faer_ndarray::FaerEigh::eigh(&a, Side::Lower)
-        .map_err(|e| format!("eigh failed while computing logdet: {e}"))?;
-    let floor = ridge.max(1e-14);
-    let mut logdet = 0.0;
-    for &ev in &evals {
-        if ev > floor {
-            logdet += ev.ln();
+
+    match ridge_policy.determinant_mode {
+        RidgeDeterminantMode::Full => {
+            let chol = a.clone().cholesky(Side::Lower).map_err(|_| {
+                "cholesky failed while computing full ridge-aware logdet".to_string()
+            })?;
+            Ok(2.0 * chol.diag().mapv(f64::ln).sum())
+        }
+        RidgeDeterminantMode::PositivePart => {
+            let (evals, _) = crate::faer_ndarray::FaerEigh::eigh(&a, Side::Lower)
+                .map_err(|e| format!("eigh failed while computing logdet: {e}"))?;
+            let floor = ridge.max(1e-14);
+            let mut logdet = 0.0;
+            for &ev in &evals {
+                if ev > floor {
+                    logdet += ev.ln();
+                }
+            }
+            Ok(logdet)
         }
     }
-    Ok(logdet)
 }
 
 fn blockwise_logdet_terms<F: CustomFamily>(
@@ -456,8 +484,13 @@ fn blockwise_logdet_terms<F: CustomFamily>(
 
         let mut h = xtwx;
         h += &s_lambda;
-        logdet_h_total += stable_logdet_pospart(&h, options.ridge_floor)?;
-        logdet_s_total += stable_logdet_pospart(&s_lambda, options.ridge_floor)?;
+        logdet_h_total +=
+            stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?;
+        logdet_s_total += stable_logdet_with_ridge_policy(
+            &s_lambda,
+            options.ridge_floor,
+            options.ridge_policy,
+        )?;
     }
     Ok((logdet_h_total, logdet_s_total))
 }
@@ -539,6 +572,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 &work.working_weights.mapv(|wi| wi.max(options.min_weight)),
                 &s_lambda,
                 options.ridge_floor,
+                options.ridge_policy,
             )?;
             let beta_new = family.post_update_beta(b, beta_new_raw)?;
 
@@ -569,8 +603,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
     let final_eval = family.evaluate(&states)?;
     let mut penalty_value = 0.0;
     // Keep the objective coherent with the stabilized block solves/log-dets:
-    // if we solve with (S_lambda + ridge*I), then the quadratic term must also
-    // include 0.5 * ridge * ||beta||^2 to maintain stationarity consistency.
+    // Single policy contract: if solve path includes ridge in curvature, include
+    // the same ridge in quadratic penalty iff policy demands it.
     let ridge = effective_solver_ridge(options.ridge_floor);
     for (b, spec) in specs.iter().enumerate() {
         let lambdas = block_log_lambdas[b].mapv(f64::exp);
@@ -578,7 +612,9 @@ fn inner_blockwise_fit<F: CustomFamily>(
             let sb = s.dot(&states[b].beta);
             penalty_value += 0.5 * lambdas[k] * states[b].beta.dot(&sb);
         }
-        penalty_value += 0.5 * ridge * states[b].beta.dot(&states[b].beta);
+        if options.ridge_policy.include_quadratic_penalty {
+            penalty_value += 0.5 * ridge * states[b].beta.dot(&states[b].beta);
+        }
     }
 
     let (block_logdet_h, block_logdet_s) =
@@ -738,6 +774,7 @@ mod tests {
             outer_tol: 1e-8,
             min_weight: 1e-12,
             ridge_floor: 1e-4,
+            ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_reml_objective: false,
         };
 

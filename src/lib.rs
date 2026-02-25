@@ -25,6 +25,11 @@ pub mod survival;
 pub mod types;
 pub mod visualizer;
 
+pub use alo::{
+    AloDiagnostics, AloOptions, AloSeMode, compute_alo_diagnostics, compute_alo_diagnostics_from_fit,
+    compute_alo_diagnostics_from_pirls, compute_alo_diagnostics_from_pirls_with_options,
+    compute_alo_diagnostics_with_options,
+};
 pub use basis::{
     BSplineBasisSpec, BSplineKnotPlacement, BSplineKnotSpec, BasisBuildResult, BasisMetadata,
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonSplineBasis, MaternBasisSpec,
@@ -38,8 +43,10 @@ pub use custom_family::{
     KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
 pub use estimate::{
-    FitArtifacts, FitOptions, FitResult, PredictResult, fit_gam, optimize_external_design,
-    predict_gam,
+    CoefficientUncertaintyResult, FitArtifacts, FitOptions, FitResult, InferenceCovarianceMode,
+    MeanIntervalMethod, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
+    coefficient_uncertainty, coefficient_uncertainty_with_mode, fit_gam, optimize_external_design,
+    predict_gam, predict_gam_with_uncertainty,
 };
 pub use gamlss::{
     BinomialLocationScaleProbitFamily, BinomialLocationScaleProbitSpec,

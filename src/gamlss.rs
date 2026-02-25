@@ -504,6 +504,7 @@ fn try_binomial_alpha_beta_warm_start(
         outer_tol: options.outer_tol.max(1e-6),
         min_weight: options.min_weight,
         ridge_floor: options.ridge_floor.max(1e-10),
+        ridge_policy: options.ridge_policy,
         // Warm start optimization focuses on robust initialization, not REML correction.
         use_reml_objective: false,
     };

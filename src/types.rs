@@ -23,6 +23,105 @@ pub enum LikelihoodFamily {
     RoystonParmar,
 }
 
+/// How ridge-adjusted determinants should be evaluated for outer criteria.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RidgeDeterminantMode {
+    /// Use full log-determinant of the ridged matrix (requires SPD in practice).
+    Full,
+    /// Use positive-part pseudo-determinant (sum log ev for ev > floor).
+    PositivePart,
+}
+
+/// Storage form of the ridge penalty matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RidgeMatrixForm {
+    /// Ridge matrix is `delta * I`.
+    ScaledIdentity,
+}
+
+/// Global policy governing how a stabilization ridge participates in objectives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RidgePolicy {
+    /// Must remain independent of smoothing parameters (`rho`) for smooth outer derivatives.
+    pub rho_independent: bool,
+    /// Include ridge in quadratic penalty term: `0.5 * delta * ||beta||^2`.
+    pub include_quadratic_penalty: bool,
+    /// Include ridge in penalty determinant term (e.g. `log|S_lambda + delta I|`).
+    pub include_penalty_logdet: bool,
+    /// Include ridge in Hessian used by Laplace term / implicit differentiation.
+    pub include_laplace_hessian: bool,
+    /// Determinant evaluation mode when ridge participates in logdet terms.
+    pub determinant_mode: RidgeDeterminantMode,
+}
+
+impl RidgePolicy {
+    /// Default policy used by PIRLS/REML path:
+    /// treat stabilization ridge as an explicit `delta I` prior contribution.
+    pub fn explicit_stabilization_full() -> Self {
+        Self {
+            rho_independent: true,
+            include_quadratic_penalty: true,
+            include_penalty_logdet: true,
+            include_laplace_hessian: true,
+            determinant_mode: RidgeDeterminantMode::Full,
+        }
+    }
+
+    /// Variant used when pseudo-determinants are required for indefinite matrices.
+    pub fn explicit_stabilization_pospart() -> Self {
+        Self {
+            determinant_mode: RidgeDeterminantMode::PositivePart,
+            ..Self::explicit_stabilization_full()
+        }
+    }
+}
+
+/// Concrete ridge metadata stamped into a fitted PIRLS result.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RidgePassport {
+    /// Stabilization magnitude for matrix form `delta * I`.
+    pub delta: f64,
+    pub matrix_form: RidgeMatrixForm,
+    pub policy: RidgePolicy,
+}
+
+impl RidgePassport {
+    pub fn scaled_identity(delta: f64, policy: RidgePolicy) -> Self {
+        Self {
+            delta,
+            matrix_form: RidgeMatrixForm::ScaledIdentity,
+            policy,
+        }
+    }
+
+    #[inline]
+    pub fn quadratic_penalty_ridge(self) -> f64 {
+        if self.policy.include_quadratic_penalty {
+            self.delta
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    pub fn penalty_logdet_ridge(self) -> f64 {
+        if self.policy.include_penalty_logdet {
+            self.delta
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    pub fn laplace_hessian_ridge(self) -> f64 {
+        if self.policy.include_laplace_hessian {
+            self.delta
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Optional joint single-index link data for calibrated predictions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JointLinkModel {

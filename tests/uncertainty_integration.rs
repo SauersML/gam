@@ -1,6 +1,6 @@
 use gam::{
-    FitOptions, LikelihoodFamily, MeanIntervalMethod, PredictUncertaintyOptions,
-    coefficient_uncertainty, fit_gam, predict_gam_with_uncertainty,
+    FitOptions, InferenceCovarianceMode, LikelihoodFamily, MeanIntervalMethod,
+    PredictUncertaintyOptions, coefficient_uncertainty, fit_gam, predict_gam_with_uncertainty,
 };
 use ndarray::{Array1, Array2};
 
@@ -106,6 +106,7 @@ fn prediction_uncertainty_is_finite_and_well_shaped() {
         &PredictUncertaintyOptions {
             confidence_level: 0.95,
             prefer_corrected_covariance: true,
+            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             include_observation_interval: true,
         },

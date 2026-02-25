@@ -1,4 +1,6 @@
-use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use crate::faer_ndarray::{
+    FaerEigh, FaerLinalgError, FaerSvd, fast_ab, fast_ata, fast_atb,
+};
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
@@ -1286,7 +1288,7 @@ pub fn create_difference_penalty_matrix(
     }
 
     // The penalty matrix S = D' * D
-    let s = d.t().dot(&d);
+    let s = fast_ata(&d);
     Ok(s)
 }
 
@@ -2808,12 +2810,15 @@ pub fn create_duchon_spline_basis(
         }
     }
 
-    let kernel_constrained = kernel_block.dot(&z);
+    let kernel_constrained = fast_ab(&kernel_block, &z);
     // Constrained Gram penalty block: S_free = Z^T K_CC Z.
     // This is the standard Duchon/thin-plate constrained coefficient penalty.
     // Constrained (conditionally PD) penalty:
     //   alpha = Z gamma,  Q^T alpha = 0  =>  gamma^T (Z^T K_CC Z) gamma.
-    let omega_constrained = z.t().dot(&center_kernel).dot(&z);
+    let omega_constrained = {
+        let zt_k = fast_atb(&z, &center_kernel);
+        fast_ab(&zt_k, &z)
+    };
     let kernel_cols = kernel_constrained.ncols();
     let poly_cols = poly_block.ncols();
     let total_cols = kernel_cols + poly_cols;
@@ -3156,8 +3161,11 @@ pub fn create_thin_plate_spline_basis(
     // Enforce TPS side-constraint P(knots)^T α = 0 by projecting onto
     // the nullspace of P(knots)^T.
     let z = kernel_constraint_nullspace(knots, DuchonNullspaceOrder::Linear)?;
-    let kernel_constrained = kernel_block.dot(&z);
-    let omega_constrained = z.t().dot(&omega).dot(&z);
+    let kernel_constrained = fast_ab(&kernel_block, &z);
+    let omega_constrained = {
+        let zt_o = fast_atb(&z, &omega);
+        fast_ab(&zt_o, &z)
+    };
 
     let kernel_cols = kernel_constrained.ncols();
     let total_cols = kernel_cols + poly_cols;
@@ -3497,7 +3505,10 @@ pub fn compute_geometric_constraint_transform(
 
     // 7. Build raw penalty and project: S_c = Z' S Z
     let s_raw = create_difference_penalty_matrix(k, penalty_order, Some(g.view()))?;
-    let s_constrained = z.t().dot(&s_raw).dot(&z);
+    let s_constrained = {
+        let zt_s = fast_atb(&z, &s_raw);
+        fast_ab(&zt_s, &z)
+    };
 
     Ok((z, s_constrained))
 }
@@ -3545,7 +3556,7 @@ pub fn null_range_whiten(s_1d: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>
         // Use max(evals[i], 0.0) to ensure we don't try to take sqrt of a negative number
         d_inv_sqrt[[j, j]] = 1.0 / (evals[i].max(0.0)).sqrt();
     }
-    let z_range_whiten = select_columns(&evecs, &idx_r).dot(&d_inv_sqrt);
+    let z_range_whiten = fast_ab(&select_columns(&evecs, &idx_r), &d_inv_sqrt);
 
     Ok((z_null, z_range_whiten))
 }

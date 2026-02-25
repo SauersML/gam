@@ -26,6 +26,16 @@ pub enum FaerLinalgError {
 }
 
 #[inline]
+fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
+    // Small, centralized dispatch policy:
+    // - stay on ndarray for tiny products to avoid setup overhead,
+    // - switch to faer GEMM/GEMV for moderate+ sizes.
+    const MIN_DIM: usize = 32;
+    const MIN_FLOP_SCALE: usize = 64 * 64;
+    (m >= MIN_DIM || n >= MIN_DIM || k >= MIN_DIM) && m.saturating_mul(n).saturating_mul(k) >= MIN_FLOP_SCALE
+}
+
+#[inline]
 pub fn array2_to_mat_mut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
     let (rows, cols) = array.dim();
     let strides = array.strides();
@@ -73,7 +83,7 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
 
     // For very small matrices, ndarray might be faster due to less overhead
     // Threshold chosen empirically - faer wins above ~64 elements in inner dim
-    if n < 64 {
+    if !should_use_faer_matmul(p, p, n) {
         return a.t().dot(a);
     }
 
@@ -107,7 +117,7 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
     debug_assert_eq!(out.nrows(), p, "output rows must match p");
     debug_assert_eq!(out.ncols(), p, "output cols must match p");
 
-    if n < 64 {
+    if !should_use_faer_matmul(p, p, n) {
         out.assign(&a.t().dot(a));
         return;
     }
@@ -141,7 +151,7 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     debug_assert_eq!(n_a, n_b, "A and B must have same number of rows");
 
     // For very small matrices, ndarray might be faster due to less overhead
-    if n_a < 64 {
+    if !should_use_faer_matmul(p, q, n_a) {
         return a.t().dot(b);
     }
 
@@ -185,7 +195,7 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (p_b, q) = b.dim();
     debug_assert_eq!(p, p_b, "A and B must have compatible inner dimensions");
 
-    if n < 64 {
+    if !should_use_faer_matmul(n, q, p) {
         return a.dot(b);
     }
 
@@ -221,7 +231,7 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
     debug_assert_eq!(v.len(), n, "vector length must match A rows");
     debug_assert_eq!(out.len(), p, "output length must match A cols");
 
-    if n < 64 {
+    if !should_use_faer_matmul(p, 1, n) {
         out.assign(&a.t().dot(v));
         return;
     }
@@ -261,7 +271,7 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     debug_assert_eq!(n, v.len(), "A rows must match v length");
 
     // For very small arrays, ndarray might be faster
-    if n < 64 {
+    if !should_use_faer_matmul(p, 1, n) {
         return a.t().dot(v);
     }
 

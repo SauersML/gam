@@ -36,7 +36,10 @@ use crate::matrix::DesignMatrix;
 use crate::pirls::{self, PirlsResult};
 use crate::probability::normal_cdf_approx;
 use crate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
-use crate::types::{Coefficients, LinkFunction, LogSmoothingParams, LogSmoothingParamsView};
+use crate::types::{
+    Coefficients, LinkFunction, LogSmoothingParams, LogSmoothingParamsView, RidgeDeterminantMode,
+    RidgePassport,
+};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
@@ -1604,11 +1607,24 @@ pub struct PredictResult {
     pub mean: Array1<f64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InferenceCovarianceMode {
+    /// Use conditional posterior covariance only: Var(beta | lambda).
+    Conditional,
+    /// Prefer smoothing-corrected covariance when available, else use conditional.
+    ConditionalPlusSmoothingPreferred,
+    /// Require smoothing-corrected covariance; error if unavailable.
+    ConditionalPlusSmoothingRequired,
+}
+
 pub struct PredictUncertaintyOptions {
     /// Central interval level in (0, 1), e.g. 0.95.
     pub confidence_level: f64,
-    /// If true, use smoothing-parameter-corrected covariance when available.
+    /// Legacy flag for corrected covariance preference.
+    /// If this conflicts with `covariance_mode`, `covariance_mode` takes precedence.
     pub prefer_corrected_covariance: bool,
+    /// Covariance mode used for eta/mean intervals.
+    pub covariance_mode: InferenceCovarianceMode,
     /// Mean-scale interval construction method.
     pub mean_interval_method: MeanIntervalMethod,
     /// For Gaussian identity, also return observation intervals using
@@ -1621,6 +1637,7 @@ impl Default for PredictUncertaintyOptions {
         Self {
             confidence_level: 0.95,
             prefer_corrected_covariance: true,
+            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             include_observation_interval: true,
         }
@@ -1648,6 +1665,10 @@ pub struct PredictUncertaintyResult {
     /// Optional Gaussian observation interval bounds.
     pub observation_lower: Option<Array1<f64>>,
     pub observation_upper: Option<Array1<f64>>,
+    /// Covariance mode requested by caller.
+    pub covariance_mode_requested: InferenceCovarianceMode,
+    /// True if smoothing-corrected covariance was used.
+    pub covariance_corrected_used: bool,
 }
 
 pub struct CoefficientUncertaintyResult {
@@ -1656,6 +1677,7 @@ pub struct CoefficientUncertaintyResult {
     pub lower: Array1<f64>,
     pub upper: Array1<f64>,
     pub corrected: bool,
+    pub covariance_mode_requested: InferenceCovarianceMode,
 }
 
 /// Canonical engine entrypoint for external designs.
@@ -1791,18 +1813,44 @@ where
         )));
     }
 
-    let cov = if options.prefer_corrected_covariance {
-        fit.beta_covariance_corrected
-            .as_ref()
-            .or(fit.beta_covariance.as_ref())
+    let requested_mode = if options.covariance_mode
+        == InferenceCovarianceMode::ConditionalPlusSmoothingPreferred
+        && !options.prefer_corrected_covariance
+    {
+        // Preserve legacy behavior when callers only toggle the historical flag.
+        InferenceCovarianceMode::Conditional
     } else {
-        fit.beta_covariance.as_ref()
-    }
-    .ok_or_else(|| {
-        EstimationError::InvalidInput(
-            "fit result does not contain a usable posterior covariance".to_string(),
-        )
-    })?;
+        options.covariance_mode
+    };
+    let (cov, covariance_corrected_used) = match requested_mode {
+        InferenceCovarianceMode::Conditional => (
+            fit.beta_covariance.as_ref().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "fit result does not contain conditional covariance".to_string(),
+                )
+            })?,
+            false,
+        ),
+        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
+            if let Some(cov_corr) = fit.beta_covariance_corrected.as_ref() {
+                (cov_corr, true)
+            } else if let Some(cov_base) = fit.beta_covariance.as_ref() {
+                (cov_base, false)
+            } else {
+                return Err(EstimationError::InvalidInput(
+                    "fit result does not contain a usable posterior covariance".to_string(),
+                ));
+            }
+        }
+        InferenceCovarianceMode::ConditionalPlusSmoothingRequired => (
+            fit.beta_covariance_corrected.as_ref().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "fit result does not contain smoothing-corrected covariance".to_string(),
+                )
+            })?,
+            true,
+        ),
+    };
 
     if cov.nrows() != beta.len() || cov.ncols() != beta.len() {
         return Err(EstimationError::InvalidInput(format!(
@@ -1890,6 +1938,8 @@ where
         mean_upper,
         observation_lower,
         observation_upper,
+        covariance_mode_requested: requested_mode,
+        covariance_corrected_used,
     })
 }
 
@@ -1899,28 +1949,59 @@ pub fn coefficient_uncertainty(
     confidence_level: f64,
     prefer_corrected_covariance: bool,
 ) -> Result<CoefficientUncertaintyResult, EstimationError> {
+    let mode = if prefer_corrected_covariance {
+        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred
+    } else {
+        InferenceCovarianceMode::Conditional
+    };
+    coefficient_uncertainty_with_mode(fit, confidence_level, mode)
+}
+
+/// Coefficient-level uncertainty and confidence intervals with explicit covariance mode.
+pub fn coefficient_uncertainty_with_mode(
+    fit: &FitResult,
+    confidence_level: f64,
+    covariance_mode: InferenceCovarianceMode,
+) -> Result<CoefficientUncertaintyResult, EstimationError> {
     if !(confidence_level.is_finite() && confidence_level > 0.0 && confidence_level < 1.0) {
         return Err(EstimationError::InvalidInput(format!(
             "confidence_level must be in (0,1), got {}",
             confidence_level
         )));
     }
-    let (se, corrected) = if prefer_corrected_covariance {
-        if let Some(se_corr) = fit.beta_standard_errors_corrected.as_ref() {
-            (se_corr.clone(), true)
-        } else if let Some(se_base) = fit.beta_standard_errors.as_ref() {
-            (se_base.clone(), false)
-        } else {
-            return Err(EstimationError::InvalidInput(
-                "fit result does not contain coefficient standard errors".to_string(),
-            ));
+    let (se, corrected) = match covariance_mode {
+        InferenceCovarianceMode::Conditional => (
+            fit.beta_standard_errors.as_ref().cloned().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "fit result does not contain conditional coefficient standard errors"
+                        .to_string(),
+                )
+            })?,
+            false,
+        ),
+        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
+            if let Some(se_corr) = fit.beta_standard_errors_corrected.as_ref() {
+                (se_corr.clone(), true)
+            } else if let Some(se_base) = fit.beta_standard_errors.as_ref() {
+                (se_base.clone(), false)
+            } else {
+                return Err(EstimationError::InvalidInput(
+                    "fit result does not contain coefficient standard errors".to_string(),
+                ));
+            }
         }
-    } else if let Some(se_base) = fit.beta_standard_errors.as_ref() {
-        (se_base.clone(), false)
-    } else {
-        return Err(EstimationError::InvalidInput(
-            "fit result does not contain coefficient standard errors".to_string(),
-        ));
+        InferenceCovarianceMode::ConditionalPlusSmoothingRequired => (
+            fit.beta_standard_errors_corrected
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "fit result does not contain smoothing-corrected coefficient standard errors"
+                            .to_string(),
+                    )
+                })?,
+            true,
+        ),
     };
 
     if se.len() != fit.beta.len() {
@@ -1940,6 +2021,7 @@ pub fn coefficient_uncertainty(
         lower,
         upper,
         corrected,
+        covariance_mode_requested: covariance_mode,
     })
 }
 
@@ -2376,7 +2458,7 @@ pub mod internal {
         key: Option<Vec<u64>>,
         pirls_result: Arc<PirlsResult>,
         h_eff: Arc<Array2<f64>>,
-        ridge_used: f64,
+        ridge_passport: RidgePassport,
         /// The exact H_total matrix used for LAML cost computation.
         /// For Firth: h_eff - h_phi. For non-Firth: h_eff.
         h_total: Arc<Array2<f64>>,
@@ -2748,30 +2830,36 @@ pub mod internal {
 
         fn log_det_s_with_ridge(
             s_transformed: &Array2<f64>,
-            ridge: f64,
+            ridge_passport: RidgePassport,
             base_log_det: f64,
         ) -> Result<f64, EstimationError> {
+            let ridge = ridge_passport.penalty_logdet_ridge();
             if ridge <= 0.0 {
                 return Ok(base_log_det);
             }
 
-            // When a stabilization ridge is treated as an explicit penalty term,
-            // the penalty matrix becomes S_λ + ridge * I. The LAML cost must use
-            // log|S_λ + ridge I|_+ for exact consistency. Without this, the cost
-            // would be evaluating a different prior than the one implied by the
-            // PIRLS stationarity condition and the stabilized Hessian.
             let p = s_transformed.nrows();
             let mut s_ridge = s_transformed.clone();
             for i in 0..p {
                 s_ridge[[i, i]] += ridge;
             }
-            let chol = s_ridge.clone().cholesky(Side::Lower).map_err(|_| {
-                EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
+            match ridge_passport.policy.determinant_mode {
+                RidgeDeterminantMode::Full => {
+                    let chol = s_ridge.clone().cholesky(Side::Lower).map_err(|_| {
+                        EstimationError::ModelIsIllConditioned {
+                            condition_number: f64::INFINITY,
+                        }
+                    })?;
+                    Ok(2.0 * chol.diag().mapv(f64::ln).sum())
                 }
-            })?;
-            let log_det = 2.0 * chol.diag().mapv(f64::ln).sum();
-            Ok(log_det)
+                RidgeDeterminantMode::PositivePart => {
+                    let (evals, _) = s_ridge
+                        .eigh(Side::Lower)
+                        .map_err(EstimationError::EigendecompositionFailed)?;
+                    let floor = ridge.max(1e-14);
+                    Ok(evals.iter().filter(|&&v| v > floor).map(|&v| v.ln()).sum())
+                }
+            }
         }
 
         fn log_gam_cost(
@@ -2874,11 +2962,11 @@ pub mod internal {
         fn effective_hessian(
             &self,
             pr: &PirlsResult,
-        ) -> Result<(Array2<f64>, f64), EstimationError> {
+        ) -> Result<(Array2<f64>, RidgePassport), EstimationError> {
             let base = pr.stabilized_hessian_transformed.clone();
 
             if base.cholesky(Side::Lower).is_ok() {
-                return Ok((base, pr.ridge_used));
+                return Ok((base, pr.ridge_passport));
             }
 
             Err(EstimationError::ModelIsIllConditioned {
@@ -3008,7 +3096,7 @@ pub mod internal {
             key: Option<Vec<u64>>,
         ) -> Result<EvalShared, EstimationError> {
             let pirls_result = self.execute_pirls_if_needed(rho)?;
-            let (h_eff, ridge_used) = self.effective_hessian(pirls_result.as_ref())?;
+            let (h_eff, ridge_passport) = self.effective_hessian(pirls_result.as_ref())?;
 
             // Spectral consistency threshold for eigenvalue truncation.
             //
@@ -3071,7 +3159,7 @@ pub mod internal {
                 key,
                 pirls_result,
                 h_eff: Arc::new(h_eff),
-                ridge_used,
+                ridge_passport,
                 h_total: Arc::new(h_total),
                 h_pos_factor_w: Arc::new(w),
                 h_total_log_det,
@@ -3094,7 +3182,7 @@ pub mod internal {
             self.current_eval_bundle
                 .read().unwrap()
                 .as_ref()
-                .map(|bundle| bundle.ridge_used)
+                .map(|bundle| bundle.ridge_passport.delta)
         }
 
         /// Calculate effective degrees of freedom (EDF) using a consistent approach
@@ -3803,7 +3891,7 @@ pub mod internal {
             };
             let pirls_result = bundle.pirls_result.as_ref();
             let h_eff = bundle.h_eff.as_ref();
-            let ridge_used = bundle.ridge_used;
+            let ridge_used = bundle.ridge_passport.delta;
 
             let lambdas = p.mapv(f64::exp);
 
@@ -3967,10 +4055,10 @@ pub mod internal {
 
                     // log |S_λ + ridge I|_+ (pseudo-determinant) to match the
                     // stabilized penalty used by PIRLS.
-                    let ridge_used = pirls_result.ridge_used;
+                    let ridge_passport = pirls_result.ridge_passport;
                     let log_det_s_plus = Self::log_det_s_with_ridge(
                         &pirls_result.reparam_result.s_transformed,
-                        ridge_used,
+                        ridge_passport,
                         pirls_result.reparam_result.log_det,
                     )?;
 
@@ -3994,7 +4082,7 @@ pub mod internal {
                     let mut penalised_ll =
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
 
-                    let ridge_used = pirls_result.ridge_used;
+                    let ridge_passport = pirls_result.ridge_passport;
                     // Include Firth log-det term in LAML for consistency with inner PIRLS
                     if self.config.firth_bias_reduction
                         && matches!(self.config.link_function(), LinkFunction::Logit)
@@ -4007,7 +4095,7 @@ pub mod internal {
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
                     let log_det_s = Self::log_det_s_with_ridge(
                         &pirls_result.reparam_result.s_transformed,
-                        ridge_used,
+                        ridge_passport,
                         pirls_result.reparam_result.log_det,
                     )?;
 
@@ -4454,7 +4542,7 @@ pub mod internal {
 
             let pirls_result = bundle.pirls_result.as_ref();
             let h_eff = bundle.h_eff.as_ref();
-            let ridge_used = bundle.ridge_used;
+            let ridge_passport = bundle.ridge_passport;
 
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             let kλ = p.len();
@@ -4505,7 +4593,7 @@ pub mod internal {
                 //
                 // which can be evaluated without explicitly forming S_k by using
                 // the penalty roots R_k (S_k = R_kᵀ R_k).
-                let det1_values = if ridge_used > 0.0 {
+                let det1_values = if ridge_passport.penalty_logdet_ridge() > 0.0 {
                     // If a stabilization ridge is treated as an explicit penalty term,
                     // the penalty matrix becomes S_λ + ridge * I. The gradient term
                     // d/dρ_k log|S_λ + ridge I| uses:
@@ -4513,7 +4601,7 @@ pub mod internal {
                     let p_dim = reparam_result.s_transformed.nrows();
                     let mut s_ridge = reparam_result.s_transformed.clone();
                     for i in 0..p_dim {
-                        s_ridge[[i, i]] += ridge_used;
+                        s_ridge[[i, i]] += ridge_passport.penalty_logdet_ridge();
                     }
                     let s_view = FaerArrayView::new(&s_ridge);
                     let chol = FaerLlt::new(s_view.as_ref(), Side::Lower).map_err(|_| {
@@ -4540,10 +4628,10 @@ pub mod internal {
 
                 // --- Use Single Stabilized Hessian from P-IRLS ---
                 // Use the same effective Hessian as the cost function for consistency.
-                if ridge_used > 0.0 {
+                if ridge_passport.laplace_hessian_ridge() > 0.0 {
                     log::debug!(
                         "Gradient path using PIRLS-stabilized Hessian (ridge {:.3e})",
-                        ridge_used
+                        ridge_passport.laplace_hessian_ridge()
                     );
                 }
 
@@ -4965,8 +5053,11 @@ pub mod internal {
                                 // optimized is l_p(β) - 0.5 * ridge * ||β||². The gradient
                                 // therefore gains + ridge * β, which must be included here
                                 // so the implicit correction matches the stabilized objective.
-                                if ridge_used > 0.0 {
-                                    gradient_data + s_beta + beta_ref.mapv(|v| ridge_used * v)
+                                if ridge_passport.quadratic_penalty_ridge() > 0.0 {
+                                    gradient_data
+                                        + s_beta
+                                        + beta_ref
+                                            .mapv(|v| ridge_passport.quadratic_penalty_ridge() * v)
                                 } else {
                                     gradient_data + s_beta
                                 }
@@ -5214,14 +5305,14 @@ pub mod internal {
             let mut report = GradientDiagnosticReport::new();
 
             let pirls_result = bundle.pirls_result.as_ref();
-            let ridge_used = bundle.ridge_used;
+            let ridge_used = bundle.ridge_passport.delta;
             let beta = pirls_result.beta_transformed.as_ref();
             let lambdas: Array1<f64> = rho.mapv(f64::exp);
 
             // === Strategy 4: Dual-Ridge Consistency Check ===
             // The ridge used by PIRLS must match what gradient/cost assume
             let dual_ridge = compute_dual_ridge_check(
-                pirls_result.ridge_used, // Ridge from PIRLS
+                pirls_result.ridge_passport.delta, // Ridge from PIRLS passport
                 ridge_used,              // Ridge passed to cost
                 ridge_used,              // Ridge passed to gradient (same bundle)
                 beta,
@@ -5253,7 +5344,7 @@ pub mod internal {
             let envelope_audit = compute_envelope_audit(
                 &score_grad,
                 &penalty_grad,
-                pirls_result.ridge_used,
+                pirls_result.ridge_passport.delta,
                 ridge_used, // What gradient assumes
                 beta,
                 config.kkt_tolerance,
