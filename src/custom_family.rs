@@ -1,3 +1,4 @@
+use crate::faer_ndarray::{fast_ata, fast_atv};
 use crate::matrix::DesignMatrix;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use crate::faer_ndarray::FaerCholesky;
@@ -300,8 +301,91 @@ fn refresh_all_block_etas<F: CustomFamily>(
     Ok(())
 }
 
+fn weighted_normal_equations(
+    x: &DesignMatrix,
+    w: &Array1<f64>,
+    y_star: Option<&Array1<f64>>,
+) -> Result<(Array2<f64>, Option<Array1<f64>>), String> {
+    let n = x.nrows();
+    let p = x.ncols();
+    if w.len() != n {
+        return Err("weighted normal-equation dimension mismatch".to_string());
+    }
+    if let Some(y) = y_star && y.len() != n {
+        return Err("weighted RHS dimension mismatch".to_string());
+    }
+
+    match x {
+        DesignMatrix::Dense(xd) => {
+            // Dense path: Xw = diag(sqrt(w)) X, XtWX = Xw'Xw, XtWy = Xw'(sqrt(w) y*)
+            let mut xw = xd.clone();
+            for i in 0..n {
+                let sw = w[i].max(0.0).sqrt();
+                if sw != 1.0 {
+                    let mut row = xw.row_mut(i);
+                    row *= sw;
+                }
+            }
+            let xtwx = fast_ata(&xw);
+            let xtwy = y_star.map(|y| {
+                let mut y_w = y.clone();
+                for i in 0..n {
+                    y_w[i] *= w[i].max(0.0).sqrt();
+                }
+                fast_atv(&xw, &y_w)
+            });
+            Ok((xtwx, xtwy))
+        }
+        DesignMatrix::Sparse(xs) => {
+            // Sparse path using CSR row iteration; cost is O(sum_i nnz_i^2).
+            let csr = xs
+                .as_ref()
+                .to_row_major()
+                .map_err(|_| "failed to obtain CSR view for sparse block design".to_string())?;
+            let sym = csr.symbolic();
+            let row_ptr = sym.row_ptr();
+            let col_idx = sym.col_idx();
+            let vals = csr.val();
+
+            let mut xtwx = Array2::<f64>::zeros((p, p));
+            let mut xtwy = y_star.map(|_| Array1::<f64>::zeros(p));
+
+            for i in 0..n {
+                let wi = w[i].max(0.0);
+                if wi == 0.0 {
+                    continue;
+                }
+                let start = row_ptr[i];
+                let end = row_ptr[i + 1];
+
+                for a_ptr in start..end {
+                    let a = col_idx[a_ptr];
+                    let xa = vals[a_ptr];
+
+                    if let (Some(y), Some(ref mut rhs)) = (y_star, xtwy.as_mut()) {
+                        rhs[a] += wi * xa * y[i];
+                    }
+
+                    for b_ptr in a_ptr..end {
+                        let b = col_idx[b_ptr];
+                        let xb = vals[b_ptr];
+                        xtwx[[a, b]] += wi * xa * xb;
+                    }
+                }
+            }
+            for a in 0..p {
+                for b in 0..a {
+                    xtwx[[a, b]] = xtwx[[b, a]];
+                }
+            }
+
+            Ok((xtwx, xtwy))
+        }
+    }
+}
+
 fn solve_block_weighted_system(
-    x: &Array2<f64>,
+    x: &DesignMatrix,
     y_star: &Array1<f64>,
     w: &Array1<f64>,
     s_lambda: &Array2<f64>,
@@ -314,28 +398,8 @@ fn solve_block_weighted_system(
         return Err("weighted-system dimension mismatch".to_string());
     }
 
-    let mut xtwx = Array2::<f64>::zeros((p, p));
-    let mut xtwy = Array1::<f64>::zeros(p);
-
-    for i in 0..n {
-        let wi = w[i].max(0.0);
-        if wi == 0.0 {
-            continue;
-        }
-        let row = x.row(i);
-        for a in 0..p {
-            let xa = row[a];
-            xtwy[a] += wi * xa * y_star[i];
-            for b in a..p {
-                xtwx[[a, b]] += wi * xa * row[b];
-            }
-        }
-    }
-    for a in 0..p {
-        for b in 0..a {
-            xtwx[[a, b]] = xtwx[[b, a]];
-        }
-    }
+    let (mut xtwx, xtwy_opt) = weighted_normal_equations(x, w, Some(y_star))?;
+    let xtwy = xtwy_opt.ok_or_else(|| "missing weighted RHS in block solve".to_string())?;
 
     xtwx += s_lambda;
 
@@ -453,28 +517,8 @@ fn blockwise_logdet_terms<F: CustomFamily>(
                 x_dyn.ncols()
             ));
         }
-        let x = x_dyn.to_dense();
         let w = work.working_weights.mapv(|wi| wi.max(options.min_weight));
-
-        let mut xtwx = Array2::<f64>::zeros((p, p));
-        for i in 0..x.nrows() {
-            let wi = w[i];
-            if wi == 0.0 {
-                continue;
-            }
-            let row = x.row(i);
-            for a in 0..p {
-                let xa = row[a];
-                for c in a..p {
-                    xtwx[[a, c]] += wi * xa * row[c];
-                }
-            }
-        }
-        for a in 0..p {
-            for c in 0..a {
-                xtwx[[a, c]] = xtwx[[c, a]];
-            }
-        }
+        let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
 
         let lambdas = block_log_lambdas[b].mapv(f64::exp);
         let mut s_lambda = Array2::<f64>::zeros((p, p));
@@ -556,7 +600,6 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 ));
             }
 
-            let x = x_dyn.to_dense();
             let mut y_star = work.working_response.clone();
             y_star -= &off_dyn;
 
@@ -567,7 +610,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
             }
 
             let beta_new_raw = solve_block_weighted_system(
-                &x,
+                &x_dyn,
                 &y_star,
                 &work.working_weights.mapv(|wi| wi.max(options.min_weight)),
                 &s_lambda,
@@ -726,6 +769,7 @@ pub fn fit_custom_family<F: CustomFamily>(
 mod tests {
     use super::*;
     use crate::matrix::DesignMatrix;
+    use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, array};
 
     #[derive(Clone)]
@@ -789,5 +833,60 @@ mod tests {
             result.penalized_objective,
             expected_penalty
         );
+    }
+
+    #[test]
+    fn block_solve_sparse_matches_dense() {
+        let x_dense = array![
+            [1.0, 0.0, 2.0],
+            [0.0, 3.0, 0.0],
+            [4.0, 0.0, 5.0],
+            [0.0, 6.0, 0.0]
+        ];
+        let y_star = array![1.0, -1.0, 0.5, 2.0];
+        let w = array![1.0, 0.5, 2.0, 1.5];
+        let s_lambda = Array2::<f64>::eye(3) * 0.1;
+
+        let mut triplets = Vec::new();
+        for i in 0..x_dense.nrows() {
+            for j in 0..x_dense.ncols() {
+                let v = x_dense[[i, j]];
+                if v != 0.0 {
+                    triplets.push(Triplet::new(i, j, v));
+                }
+            }
+        }
+        let x_sparse = SparseColMat::try_new_from_triplets(4, 3, &triplets)
+            .expect("sparse matrix build should succeed");
+
+        let beta_dense = solve_block_weighted_system(
+            &DesignMatrix::Dense(x_dense.clone()),
+            &y_star,
+            &w,
+            &s_lambda,
+            1e-12,
+            RidgePolicy::explicit_stabilization_pospart(),
+        )
+        .expect("dense solve should succeed");
+
+        let beta_sparse = solve_block_weighted_system(
+            &DesignMatrix::from(x_sparse),
+            &y_star,
+            &w,
+            &s_lambda,
+            1e-12,
+            RidgePolicy::explicit_stabilization_pospart(),
+        )
+        .expect("sparse solve should succeed");
+
+        for j in 0..beta_dense.len() {
+            assert!(
+                (beta_dense[j] - beta_sparse[j]).abs() < 1e-10,
+                "dense/sparse mismatch at {}: {} vs {}",
+                j,
+                beta_dense[j],
+                beta_sparse[j]
+            );
+        }
     }
 }

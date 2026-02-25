@@ -5,10 +5,12 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
     KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
+use crate::faer_ndarray::{fast_ata, fast_atv};
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::DesignMatrix;
+use crate::pirls::WorkingLikelihood as EngineWorkingLikelihood;
 use crate::probability::{normal_cdf_approx, normal_pdf};
-use crate::types::LinkFunction;
+use crate::types::{LikelihoodFamily, LinkFunction};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
@@ -230,6 +232,37 @@ fn validate_block_rows(name: &str, n: usize, block: &ParameterBlockInput) -> Res
     )
 }
 
+/// Shared single-block GLM evaluation adapter backed by the engine-level
+/// `WorkingLikelihood` implementation used by PIRLS.
+fn evaluate_single_block_glm(
+    family: LikelihoodFamily,
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    eta: &Array1<f64>,
+) -> Result<FamilyEvaluation, String> {
+    let n = y.len();
+    if eta.len() != n || weights.len() != n {
+        return Err("single-block GLM input size mismatch".to_string());
+    }
+    let mut mu = Array1::<f64>::zeros(n);
+    let mut z = Array1::<f64>::zeros(n);
+    let mut w = Array1::<f64>::zeros(n);
+    family
+        .irls_update(y.view(), eta, weights.view(), &mut mu, &mut w, &mut z, None)
+        .map_err(|e| e.to_string())?;
+    let ll = family
+        .log_likelihood(y.view(), eta, &mu, weights.view())
+        .map_err(|e| e.to_string())?;
+    Ok(FamilyEvaluation {
+        log_likelihood: ll,
+        block_working_sets: vec![BlockWorkingSet {
+            working_response: z,
+            working_weights: w,
+            gradient_eta: None,
+        }],
+    })
+}
+
 fn initial_log_lambdas_or_zeros(block: &ParameterBlockInput) -> Result<Array1<f64>, String> {
     let k = block.penalties.len();
     let lambdas = block
@@ -253,35 +286,70 @@ fn solve_weighted_projection(
     weights: &Array1<f64>,
     ridge_floor: f64,
 ) -> Result<Array1<f64>, String> {
-    let x = design.to_dense();
-    let n = x.nrows();
-    let p = x.ncols();
+    let n = design.nrows();
+    let p = design.ncols();
     if offset.len() != n || target_eta.len() != n || weights.len() != n {
         return Err("solve_weighted_projection dimension mismatch".to_string());
     }
 
-    let mut xtwx = Array2::<f64>::zeros((p, p));
-    let mut xtwy = Array1::<f64>::zeros(p);
-
-    for i in 0..n {
-        let wi = weights[i].max(0.0);
-        if wi == 0.0 {
-            continue;
-        }
-        let y_star = target_eta[i] - offset[i];
-        let row = x.row(i);
-        for a in 0..p {
-            let xa = row[a];
-            xtwy[a] += wi * xa * y_star;
-            for b in a..p {
-                xtwx[[a, b]] += wi * xa * row[b];
+    let (mut xtwx, xtwy) = match design {
+        DesignMatrix::Dense(x) => {
+            let mut xw = x.clone();
+            for i in 0..n {
+                let sw = weights[i].max(0.0).sqrt();
+                if sw != 1.0 {
+                    let mut row = xw.row_mut(i);
+                    row *= sw;
+                }
             }
+            let xtwx = fast_ata(&xw);
+            let mut y_w = target_eta - offset;
+            for i in 0..n {
+                y_w[i] *= weights[i].max(0.0).sqrt();
+            }
+            let xtwy = fast_atv(&xw, &y_w);
+            (xtwx, xtwy)
         }
-    }
+        DesignMatrix::Sparse(xs) => {
+            let csr = xs
+                .as_ref()
+                .to_row_major()
+                .map_err(|_| "failed to obtain CSR view for weighted projection".to_string())?;
+            let sym = csr.symbolic();
+            let row_ptr = sym.row_ptr();
+            let col_idx = sym.col_idx();
+            let vals = csr.val();
+            let mut xtwx = Array2::<f64>::zeros((p, p));
+            let mut xtwy = Array1::<f64>::zeros(p);
+
+            for i in 0..n {
+                let wi = weights[i].max(0.0);
+                if wi == 0.0 {
+                    continue;
+                }
+                let y_star = target_eta[i] - offset[i];
+                let start = row_ptr[i];
+                let end = row_ptr[i + 1];
+                for a_ptr in start..end {
+                    let a = col_idx[a_ptr];
+                    let xa = vals[a_ptr];
+                    xtwy[a] += wi * xa * y_star;
+                    for b_ptr in a_ptr..end {
+                        let b = col_idx[b_ptr];
+                        let xb = vals[b_ptr];
+                        xtwx[[a, b]] += wi * xa * xb;
+                    }
+                }
+            }
+            for a in 0..p {
+                for b in 0..a {
+                    xtwx[[a, b]] = xtwx[[b, a]];
+                }
+            }
+            (xtwx, xtwy)
+        }
+    };
     for a in 0..p {
-        for b in 0..a {
-            xtwx[[a, b]] = xtwx[[b, a]];
-        }
         xtwx[[a, a]] += ridge_floor.max(1e-12);
     }
 
@@ -1161,31 +1229,12 @@ impl CustomFamily for BinomialLogitFamily {
         if eta.len() != n || self.weights.len() != n {
             return Err("BinomialLogitFamily input size mismatch".to_string());
         }
-
-        let mut mu = Array1::<f64>::zeros(n);
-        let mut ll = 0.0;
-        let mut z = Array1::<f64>::zeros(n);
-        let mut w = Array1::<f64>::zeros(n);
-
-        for i in 0..n {
-            let e = eta[i].clamp(-30.0, 30.0);
-            let p = (1.0 / (1.0 + (-e).exp())).clamp(MIN_PROB, 1.0 - MIN_PROB);
-            mu[i] = p;
-            ll += self.weights[i] * (self.y[i] * p.ln() + (1.0 - self.y[i]) * (1.0 - p).ln());
-            let dmu = (p * (1.0 - p)).max(MIN_DERIV);
-            let var = (p * (1.0 - p)).max(MIN_PROB);
-            w[i] = (self.weights[i] * (dmu * dmu / var)).max(MIN_WEIGHT);
-            z[i] = e + (self.y[i] - p) / signed_with_floor(dmu, MIN_DERIV);
-        }
-
-        Ok(FamilyEvaluation {
-            log_likelihood: ll,
-            block_working_sets: vec![BlockWorkingSet {
-                working_response: z,
-                working_weights: w,
-                gradient_eta: None,
-            }],
-        })
+        evaluate_single_block_glm(
+            LikelihoodFamily::BinomialLogit,
+            &self.y,
+            &self.weights,
+            eta,
+        )
     }
 }
 

@@ -59,6 +59,185 @@ pub trait WorkingModel {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError>;
 }
 
+/// Uncertainty inputs for integrated (GHQ) IRLS updates.
+#[derive(Clone, Copy)]
+pub struct IntegratedWorkingInput<'a> {
+    pub quad_ctx: &'a crate::quadrature::QuadratureContext,
+    pub se: ArrayView1<'a, f64>,
+}
+
+/// Shared likelihood interface used by PIRLS working updates.
+///
+/// This keeps the update/deviance math in one place so engine-level likelihoods
+/// and higher-level wrappers (custom family, GAMLSS warm starts) can share a
+/// consistent implementation.
+pub trait WorkingLikelihood {
+    fn irls_update(
+        &self,
+        y: ArrayView1<f64>,
+        eta: &Array1<f64>,
+        prior_weights: ArrayView1<f64>,
+        mu: &mut Array1<f64>,
+        weights: &mut Array1<f64>,
+        z: &mut Array1<f64>,
+        integrated: Option<IntegratedWorkingInput<'_>>,
+    ) -> Result<(), EstimationError>;
+
+    fn loglik_deviance(
+        &self,
+        y: ArrayView1<f64>,
+        mu: &Array1<f64>,
+        prior_weights: ArrayView1<f64>,
+    ) -> Result<f64, EstimationError>;
+
+    /// Weighted log-likelihood used by blockwise/custom-family wrappers.
+    ///
+    /// Conventions:
+    /// - Binomial families return the full Bernoulli log-likelihood.
+    /// - Gaussian identity returns the quadratic term `-0.5 * sum w*(y-mu)^2`
+    ///   (constant terms omitted, consistent with optimization use).
+    fn log_likelihood(
+        &self,
+        y: ArrayView1<f64>,
+        eta: &Array1<f64>,
+        mu: &Array1<f64>,
+        prior_weights: ArrayView1<f64>,
+    ) -> Result<f64, EstimationError>;
+}
+
+impl WorkingLikelihood for LikelihoodFamily {
+    fn irls_update(
+        &self,
+        y: ArrayView1<f64>,
+        eta: &Array1<f64>,
+        prior_weights: ArrayView1<f64>,
+        mu: &mut Array1<f64>,
+        weights: &mut Array1<f64>,
+        z: &mut Array1<f64>,
+        integrated: Option<IntegratedWorkingInput<'_>>,
+    ) -> Result<(), EstimationError> {
+        match (self, integrated) {
+            (LikelihoodFamily::BinomialLogit, Some(integ)) => {
+                update_glm_vectors_integrated(
+                    integ.quad_ctx,
+                    y,
+                    eta,
+                    integ.se,
+                    prior_weights,
+                    mu,
+                    weights,
+                    z,
+                );
+                Ok(())
+            }
+            (LikelihoodFamily::BinomialProbit, Some(_))
+            | (LikelihoodFamily::BinomialCLogLog, Some(_)) => Err(
+                EstimationError::InvalidInput(
+                    "Integrated updates are currently only implemented for BinomialLogit"
+                        .to_string(),
+                ),
+            ),
+            (LikelihoodFamily::RoystonParmar, Some(_)) => Err(EstimationError::InvalidInput(
+                "RoystonParmar requires survival-specific integrated updates".to_string(),
+            )),
+            (LikelihoodFamily::BinomialLogit, None) => {
+                update_glm_vectors(y, eta, LinkFunction::Logit, prior_weights, mu, weights, z);
+                Ok(())
+            }
+            (LikelihoodFamily::BinomialProbit, None) => {
+                update_glm_vectors(y, eta, LinkFunction::Probit, prior_weights, mu, weights, z);
+                Ok(())
+            }
+            (LikelihoodFamily::BinomialCLogLog, None) => {
+                update_glm_vectors(y, eta, LinkFunction::CLogLog, prior_weights, mu, weights, z);
+                Ok(())
+            }
+            (LikelihoodFamily::GaussianIdentity, _) => {
+                update_glm_vectors(y, eta, LinkFunction::Identity, prior_weights, mu, weights, z);
+                Ok(())
+            }
+            (LikelihoodFamily::RoystonParmar, None) => Err(EstimationError::InvalidInput(
+                "RoystonParmar requires survival-specific working model updates".to_string(),
+            )),
+        }
+    }
+
+    fn loglik_deviance(
+        &self,
+        y: ArrayView1<f64>,
+        mu: &Array1<f64>,
+        prior_weights: ArrayView1<f64>,
+    ) -> Result<f64, EstimationError> {
+        match self {
+            LikelihoodFamily::GaussianIdentity => Ok(calculate_deviance(
+                y,
+                mu,
+                LinkFunction::Identity,
+                prior_weights,
+            )),
+            LikelihoodFamily::BinomialLogit => Ok(calculate_deviance(
+                y,
+                mu,
+                LinkFunction::Logit,
+                prior_weights,
+            )),
+            LikelihoodFamily::BinomialProbit => Ok(calculate_deviance(
+                y,
+                mu,
+                LinkFunction::Probit,
+                prior_weights,
+            )),
+            LikelihoodFamily::BinomialCLogLog => Ok(calculate_deviance(
+                y,
+                mu,
+                LinkFunction::CLogLog,
+                prior_weights,
+            )),
+            LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
+                "RoystonParmar deviance is survival-specific and not computed via GLM helper"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn log_likelihood(
+        &self,
+        y: ArrayView1<f64>,
+        _eta: &Array1<f64>,
+        mu: &Array1<f64>,
+        prior_weights: ArrayView1<f64>,
+    ) -> Result<f64, EstimationError> {
+        const EPS: f64 = 1e-8;
+        match self {
+            LikelihoodFamily::GaussianIdentity => {
+                let ll = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
+                    0.0,
+                    |acc, &yi, &mui, &wi| {
+                        let r = yi - mui;
+                        acc - 0.5 * wi * r * r
+                    },
+                );
+                Ok(ll)
+            }
+            LikelihoodFamily::BinomialLogit
+            | LikelihoodFamily::BinomialProbit
+            | LikelihoodFamily::BinomialCLogLog => {
+                let ll = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
+                    0.0,
+                    |acc, &yi, &mui, &wi| {
+                        let p = mui.clamp(EPS, 1.0 - EPS);
+                        acc + wi * (yi * p.ln() + (1.0 - yi) * (1.0 - p).ln())
+                    },
+                );
+                Ok(ll)
+            }
+            LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
+                "RoystonParmar log-likelihood is survival-specific".to_string(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkingState {
     pub eta: LinearPredictor,
@@ -254,7 +433,7 @@ struct GamWorkingModel<'a> {
     s_transformed: Array2<f64>,
     e_transformed: Array2<f64>,
     workspace: PirlsWorkspace,
-    link: LinkFunction,
+    likelihood: LikelihoodFamily,
     firth_bias_reduction: bool,
     firth_log_det: Option<f64>,
     last_mu: Array1<f64>,
@@ -304,6 +483,7 @@ impl<'a> GamWorkingModel<'a> {
             .as_ref()
             .and_then(|matrix| matrix.to_csr_cache());
         let x_original_csr = x_original.to_csr_cache();
+        let likelihood = likelihood_from_link(link);
         GamWorkingModel {
             x_transformed,
             x_original,
@@ -313,7 +493,7 @@ impl<'a> GamWorkingModel<'a> {
             s_transformed,
             e_transformed,
             workspace,
-            link,
+            likelihood,
             firth_bias_reduction,
             firth_log_det: None,
             last_mu: Array1::zeros(n),
@@ -453,35 +633,19 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
 
         // Use integrated (GHQ) likelihood if per-observation SE is available.
         // This coherently accounts for uncertainty in the base prediction.
-        let family = match self.link {
-            LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
-            LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
-            LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
-            LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
-        };
-        if let Some(se) = &self.covariate_se {
-            update_glm_vectors_integrated_by_family(
-                &self.quad_ctx,
-                self.y,
-                &self.workspace.eta_buf,
-                se.view(),
-                family,
-                self.prior_weights,
-                &mut self.last_mu,
-                &mut self.last_weights,
-                &mut self.last_z,
-            )?;
-        } else {
-            update_glm_vectors_by_family(
-                self.y,
-                &self.workspace.eta_buf,
-                family,
-                self.prior_weights,
-                &mut self.last_mu,
-                &mut self.last_weights,
-                &mut self.last_z,
-            )?;
-        }
+        let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
+            quad_ctx: &self.quad_ctx,
+            se: se.view(),
+        });
+        self.likelihood.irls_update(
+            self.y,
+            &self.workspace.eta_buf,
+            self.prior_weights,
+            &mut self.last_mu,
+            &mut self.last_weights,
+            &mut self.last_z,
+            integrated,
+        )?;
         let weights = self.last_weights.clone();
         let mu = self.last_mu.clone();
         let mut firth_hat_diag: Option<Array1<f64>> = None;
@@ -580,7 +744,9 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let ridge_used =
             ensure_positive_definite_with_ridge(&mut penalized_hessian, "PIRLS penalized Hessian")?;
 
-        let deviance = calculate_deviance(self.y, &mu, self.link, self.prior_weights);
+        let deviance = self
+            .likelihood
+            .loglik_deviance(self.y, &mu, self.prior_weights)?;
 
         let mut penalty_term = beta.as_ref().dot(&s_beta);
         if ridge_used > 0.0 {
@@ -1328,6 +1494,12 @@ pub struct PirlsResult {
     pub solve_weights: Array1<f64>,
     pub solve_working_response: Array1<f64>,
     pub solve_mu: Array1<f64>,
+    /// First eta-derivative of the diagonal working curvature W(eta):
+    /// c_i := dW_i/deta_i at the accepted PIRLS solution.
+    pub solve_c_array: Array1<f64>,
+    /// Second eta-derivative of the diagonal working curvature W(eta):
+    /// d_i := d²W_i/deta_i² at the accepted PIRLS solution.
+    pub solve_d_array: Array1<f64>,
 
     // Keep all other fields as they are
     pub status: PirlsStatus,
@@ -1592,6 +1764,13 @@ pub fn fit_model_for_fixed_rho<'a>(
             max_abs_eta,
         };
 
+        let (solve_c_array, solve_d_array) = compute_working_weight_derivatives(
+            link_function,
+            &final_eta,
+            &final_mu,
+            prior_weights_owned.view(),
+            &prior_weights_owned,
+        );
         let pirls_result = PirlsResult {
             beta_transformed,
             penalized_hessian_transformed: penalized_hessian,
@@ -1613,6 +1792,8 @@ pub fn fit_model_for_fixed_rho<'a>(
             solve_weights: prior_weights_owned,
             solve_working_response: final_z.clone(),
             solve_mu: final_mu.clone(),
+            solve_c_array,
+            solve_d_array,
             status: PirlsStatus::Converged,
             iteration: 1,
             max_abs_eta,
@@ -1767,6 +1948,14 @@ pub fn fit_model_for_fixed_rho<'a>(
         maybe_sparse_design(&x_transformed_dense)
     };
 
+    let final_eta_arr = working_summary.state.eta.as_ref().clone();
+    let (solve_c_array, solve_d_array) = compute_working_weight_derivatives(
+        link_function,
+        &final_eta_arr,
+        &final_mu,
+        prior_weights,
+        &final_weights,
+    );
     let pirls_result = PirlsResult {
         beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
@@ -1783,11 +1972,13 @@ pub fn fit_model_for_fixed_rho<'a>(
         firth_hat_diag: working_summary.state.firth_hat_diag.clone(),
         final_weights: final_weights.clone(),
         final_offset: offset.to_owned(),
-        final_eta: working_summary.state.eta.as_ref().clone(),
+        final_eta: final_eta_arr,
         final_mu: final_mu.clone(),
         solve_weights: final_weights.clone(),
         solve_working_response: final_z.clone(),
         solve_mu: final_mu.clone(),
+        solve_c_array,
+        solve_d_array,
         status,
         iteration: working_summary.iterations,
         max_abs_eta: working_summary.max_abs_eta,
@@ -1854,7 +2045,8 @@ pub fn fit_model_for_fixed_rho_matrix(
             )
         }
         DesignMatrix::Sparse(_) => {
-            let dense = x.to_dense();
+            let dense_arc = x.to_dense_arc();
+            let dense = dense_arc.as_ref();
             fit_model_for_fixed_rho(
                 rho,
                 dense.view(),
@@ -1921,7 +2113,7 @@ fn fit_model_for_fixed_rho_sparse_implicit(
             EngineDims::new(p, rs_original.len()),
         )?
     };
-    let x_original = DesignMatrix::Sparse(x_sparse.clone());
+    let x_original = DesignMatrix::from(x_sparse.clone());
     let eb_rows = eb.nrows();
     let e_rows = reparam_result.e_transformed.nrows();
     let workspace = PirlsWorkspace::new(x_sparse.nrows(), x_sparse.ncols(), eb_rows, e_rows);
@@ -2022,6 +2214,14 @@ fn fit_model_for_fixed_rho_sparse_implicit(
     }
     let x_transformed_dense = design_dot_dense_rhs(&x_original, &reparam_result.qs);
     let x_transformed = maybe_sparse_design(&x_transformed_dense);
+    let final_eta_arr = working_summary.state.eta.as_ref().clone();
+    let (solve_c_array, solve_d_array) = compute_working_weight_derivatives(
+        link_function,
+        &final_eta_arr,
+        &final_mu,
+        prior_weights,
+        &final_weights,
+    );
     let pirls_result = PirlsResult {
         beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
@@ -2038,11 +2238,13 @@ fn fit_model_for_fixed_rho_sparse_implicit(
         firth_hat_diag: working_summary.state.firth_hat_diag.clone(),
         final_weights: final_weights.clone(),
         final_offset: offset.to_owned(),
-        final_eta: working_summary.state.eta.as_ref().clone(),
+        final_eta: final_eta_arr,
         final_mu: final_mu.clone(),
         solve_weights: final_weights.clone(),
         solve_working_response: final_z.clone(),
         solve_mu: final_mu,
+        solve_c_array,
+        solve_d_array,
         status,
         iteration: working_summary.iterations,
         max_abs_eta: working_summary.max_abs_eta,
@@ -2219,7 +2421,7 @@ fn sparse_from_dense_view(x: ArrayView2<f64>) -> Option<DesignMatrix> {
     }
     SparseColMat::try_new_from_triplets(nrows, ncols, &triplets)
         .ok()
-        .map(DesignMatrix::Sparse)
+        .map(DesignMatrix::from)
 }
 
 /// Insert zero rows into a vector at locations specified by `drop_indices`.
@@ -2417,35 +2619,7 @@ pub fn update_glm_vectors_by_family(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
-    match family {
-        LikelihoodFamily::BinomialLogit => {
-            update_glm_vectors(y, eta, LinkFunction::Logit, prior_weights, mu, weights, z);
-            Ok(())
-        }
-        LikelihoodFamily::BinomialProbit => {
-            update_glm_vectors(y, eta, LinkFunction::Probit, prior_weights, mu, weights, z);
-            Ok(())
-        }
-        LikelihoodFamily::BinomialCLogLog => {
-            update_glm_vectors(y, eta, LinkFunction::CLogLog, prior_weights, mu, weights, z);
-            Ok(())
-        }
-        LikelihoodFamily::GaussianIdentity => {
-            update_glm_vectors(
-                y,
-                eta,
-                LinkFunction::Identity,
-                prior_weights,
-                mu,
-                weights,
-                z,
-            );
-            Ok(())
-        }
-        LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-            "RoystonParmar requires survival-specific working model updates".to_string(),
-        )),
-    }
+    family.irls_update(y, eta, prior_weights, mu, weights, z, None)
 }
 
 /// Updates GLM working vectors using integrated (uncertainty-aware) likelihood.
@@ -2515,23 +2689,132 @@ pub fn update_glm_vectors_integrated_by_family(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
-    match family {
-        LikelihoodFamily::BinomialLogit => {
-            update_glm_vectors_integrated(quad_ctx, y, eta, se, prior_weights, mu, weights, z);
-            Ok(())
+    family.irls_update(
+        y,
+        eta,
+        prior_weights,
+        mu,
+        weights,
+        z,
+        Some(IntegratedWorkingInput { quad_ctx, se }),
+    )
+}
+
+/// Compute first/second eta derivatives of the PIRLS working curvature W(eta),
+/// consistent with the clamping/flooring used by `update_glm_vectors`.
+pub fn compute_working_weight_derivatives(
+    link: LinkFunction,
+    eta: &Array1<f64>,
+    mu: &Array1<f64>,
+    prior_weights: ArrayView1<f64>,
+    solve_weights: &Array1<f64>,
+) -> (Array1<f64>, Array1<f64>) {
+    const PROB_EPS: f64 = 1e-8;
+    const MIN_WEIGHT: f64 = 1e-12;
+    const MIN_D_FOR_Z: f64 = 1e-6;
+    let n = eta.len();
+    let mut c = Array1::<f64>::zeros(n);
+    let mut d = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let eta_i = eta[i];
+        let mu_i = mu[i];
+        let prior_w = prior_weights[i];
+        match link {
+            LinkFunction::Identity => {
+                c[i] = 0.0;
+                d[i] = 0.0;
+            }
+            LinkFunction::Logit => {
+                let eta_c = eta_i.clamp(-700.0, 700.0);
+                let g = mu_i * (1.0 - mu_i); // dmu/deta
+                let clamped =
+                    eta_i != eta_c || mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || g < MIN_WEIGHT;
+                if clamped {
+                    c[i] = 0.0;
+                    d[i] = 0.0;
+                } else {
+                    let g1 = g * (1.0 - 2.0 * mu_i);
+                    let g2 = g * (1.0 - 6.0 * g);
+                    c[i] = prior_w * g1;
+                    d[i] = prior_w * g2;
+                }
+            }
+            LinkFunction::Probit => {
+                let eta_c = eta_i.clamp(-30.0, 30.0);
+                if eta_i != eta_c || mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS {
+                    continue;
+                }
+                let g = normal_pdf(eta_c); // dmu/deta
+                if g <= MIN_D_FOR_Z {
+                    continue;
+                }
+                let g1 = -eta_c * g; // d²mu/deta²
+                let g2 = (eta_c * eta_c - 1.0) * g; // d³mu/deta³
+                let v = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
+                let v1 = g * (1.0 - 2.0 * mu_i);
+                let v2 = g1 * (1.0 - 2.0 * mu_i) - 2.0 * g * g;
+                let n0 = g * g;
+                let n1 = 2.0 * g * g1;
+                let n2 = 2.0 * (g1 * g1 + g * g2);
+                let f = n0 / v;
+                if f <= MIN_WEIGHT {
+                    continue;
+                }
+                let f1 = (n1 * v - n0 * v1) / (v * v);
+                let f2 = (n2 * v - n0 * v2) / (v * v) - 2.0 * (n1 * v - n0 * v1) * v1 / (v * v * v);
+                c[i] = prior_w * f1;
+                d[i] = prior_w * f2;
+            }
+            LinkFunction::CLogLog => {
+                let eta_c = eta_i.clamp(-30.0, 30.0);
+                if eta_i != eta_c || mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS {
+                    continue;
+                }
+                let t = eta_c.exp();
+                let s = (-t).exp();
+                let g = t * s; // dmu/deta
+                if g <= MIN_D_FOR_Z {
+                    continue;
+                }
+                let g1 = g * (1.0 - t);
+                let g2 = g * (1.0 - 3.0 * t + t * t);
+                let v = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
+                let v1 = g * (1.0 - 2.0 * mu_i);
+                let v2 = g1 * (1.0 - 2.0 * mu_i) - 2.0 * g * g;
+                let n0 = g * g;
+                let n1 = 2.0 * g * g1;
+                let n2 = 2.0 * (g1 * g1 + g * g2);
+                let f = n0 / v;
+                if f <= MIN_WEIGHT {
+                    continue;
+                }
+                let f1 = (n1 * v - n0 * v1) / (v * v);
+                let f2 = (n2 * v - n0 * v2) / (v * v) - 2.0 * (n1 * v - n0 * v1) * v1 / (v * v * v);
+                c[i] = prior_w * f1;
+                d[i] = prior_w * f2;
+            }
         }
-        LikelihoodFamily::BinomialProbit => Err(EstimationError::InvalidInput(
-            "Integrated updates are currently only implemented for BinomialLogit".to_string(),
-        )),
-        LikelihoodFamily::BinomialCLogLog => Err(EstimationError::InvalidInput(
-            "Integrated updates are currently only implemented for BinomialLogit".to_string(),
-        )),
-        LikelihoodFamily::GaussianIdentity => {
-            update_glm_vectors_by_family(y, eta, family, prior_weights, mu, weights, z)
+        if !c[i].is_finite() {
+            c[i] = 0.0;
         }
-        LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-            "RoystonParmar requires survival-specific integrated updates".to_string(),
-        )),
+        if !d[i].is_finite() {
+            d[i] = 0.0;
+        }
+        if solve_weights[i] <= 0.0 {
+            c[i] = 0.0;
+            d[i] = 0.0;
+        }
+    }
+    (c, d)
+}
+
+#[inline]
+fn likelihood_from_link(link: LinkFunction) -> LikelihoodFamily {
+    match link {
+        LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
+        LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
+        LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+        LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
     }
 }
 
