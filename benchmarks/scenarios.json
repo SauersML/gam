@@ -1,0 +1,23 @@
+{
+  "scenarios": [
+    {
+      "name": "small_dense",
+      "n": 1000,
+      "p": 10,
+      "seed": 7
+    },
+    {
+      "name": "medium",
+      "n": 50000,
+      "p": 50,
+      "seed": 11
+    },
+    {
+      "name": "pathological_ill_conditioned",
+      "n": 50000,
+      "p": 80,
+      "seed": 17
+    }
+  ]
+}
+
