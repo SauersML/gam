@@ -75,8 +75,9 @@ fn eta_from_mu_for_link(mu: f64, link: LinkFunction) -> f64 {
 }
 
 use crate::diagnostics::{
-    GRAD_DIAG_BETA_COLLAPSE_COUNT, approx_f64, format_compact_series, format_cond, format_range,
-    quantize_value, quantize_vec, should_emit_grad_diag, should_emit_h_min_eig_diag,
+    GRAD_DIAG_BETA_COLLAPSE_COUNT, GRAD_DIAG_DELTA_ZERO_COUNT, GRAD_DIAG_KKT_SKIP_COUNT,
+    approx_f64, format_compact_series, format_cond, format_range, quantize_value, quantize_vec,
+    should_emit_grad_diag, should_emit_h_min_eig_diag,
 };
 
 // Note: deflate_weights_by_se was removed. We now use integrated (GHQ) likelihood
@@ -361,6 +362,7 @@ struct RemlConfig {
     reml_convergence_tolerance: f64,
     reml_max_iterations: u64,
     firth_bias_reduction: bool,
+    objective_consistent_fd_gradient: bool,
 }
 
 impl RemlConfig {
@@ -377,6 +379,7 @@ impl RemlConfig {
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
+            objective_consistent_fd_gradient: true,
         }
     }
 
@@ -2382,7 +2385,7 @@ fn maybe_audit_gradient(
     if audit_cfg.every == 0 || rho.is_empty() || eval_num % (audit_cfg.every as u64) != 0 {
         return;
     }
-    match compute_fd_gradient_internal(reml_state, rho, false) {
+    match compute_fd_gradient_internal(reml_state, rho, false, true) {
         Ok(fd_grad) => {
             if let Some((rel_l2, max_abs, ref_l2, ref_max_abs)) =
                 gradient_audit_stats(grad, &fd_grad)
@@ -2530,6 +2533,7 @@ fn compute_fd_gradient_internal(
     reml_state: &internal::RemlState,
     rho: &Array1<f64>,
     emit_logs: bool,
+    allow_analytic_fallback: bool,
 ) -> Result<Array1<f64>, EstimationError> {
     let mut fd_grad = Array1::zeros(rho.len());
     let mut analytic_fallback: Option<Array1<f64>> = None;
@@ -2663,7 +2667,7 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
             }
         }
 
-        if derivative.is_none() {
+        if derivative.is_none() && allow_analytic_fallback {
             if analytic_fallback.is_none() {
                 analytic_fallback = Some(reml_state.compute_gradient(rho)?);
             }
@@ -2703,7 +2707,7 @@ fn compute_fd_gradient(
     reml_state: &internal::RemlState,
     rho: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
-    compute_fd_gradient_internal(reml_state, rho, true)
+    compute_fd_gradient_internal(reml_state, rho, true, true)
 }
 
 /// Evaluate both analytic and finite-difference gradients for the external REML objective.
@@ -5078,6 +5082,11 @@ pub mod internal {
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+            if self.config.objective_consistent_fd_gradient
+                && self.config.link_function() != LinkFunction::Identity
+            {
+                return compute_fd_gradient_internal(self, p, false, false);
+            }
             // Get the converged P-IRLS result for the current rho (`p`)
             let bundle = match self.obtain_eval_bundle(p) {
                 Ok(bundle) => bundle,
@@ -5878,15 +5887,67 @@ pub mod internal {
                                 }
                             }
 
-                            // IMPORTANT: do not add an extra (∇βV)^T (dβ/dρ) correction here.
-                            // The trace_terms above already include beta(ρ) dependence via H_k
-                            // (through v_k = H^{-1} S_k β). Adding a second implicit term can
-                            // double-count and flip gradient sign in high-ρ regimes.
-                            let _kkt_norm = residual_grad
+                            // Compute KKT residual norm to check if envelope theorem applies.
+                            // The Implicit Function Theorem (used for delta_opt) assumes that β moves
+                            // to maintain ∇V = 0 as ρ changes. If P-IRLS hasn't converged (large residual),
+                            // β is effectively "stuck" on a ledge and doesn't move as predicted by IFT.
+                            // In that case, we skip the implicit correction.
+                            let kkt_norm = residual_grad
                                 .iter()
                                 .fold(0.0_f64, |acc, &v| acc + v * v)
                                 .sqrt();
-                            let delta_opt: Option<Array1<f64>> = None;
+                            let kkt_tol = self.config.convergence_tolerance.max(1e-4);
+                            let kkt_ok = kkt_norm <= kkt_tol;
+
+                            if !grad_beta.iter().all(|v| v.is_finite()) {
+                                log::warn!(
+                                    "Skipping IFT correction: non-finite gradient entries (kkt_norm={:.2e}).",
+                                    kkt_norm
+                                );
+                            }
+                            if !kkt_ok {
+                                let (should_print, count) =
+                                    should_emit_grad_diag(&GRAD_DIAG_KKT_SKIP_COUNT);
+                                if should_print {
+                                    eprintln!(
+                                        "[GRAD DIAG #{count}] skipping IFT correction: kkt_norm={:.3e} tol={:.3e}",
+                                        kkt_norm, kkt_tol
+                                    );
+                                }
+                            }
+
+                            let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) && kkt_ok {
+                                // IMPLICIT DERIVATIVE: d/dρ beta_hat = -H^-1 S_k beta.
+                                // For spectral consistency with truncated log|H| we use H_+^\dagger.
+                                // Apply in factor form to avoid dense H_+^\dagger materialization:
+                                //   H_+^\dagger v = W (W^T v), W = U_+ diag(1/sqrt(lambda_+)).
+                                let delta: Array1<f64> = if w_pos.ncols() == 0 {
+                                    Array1::zeros(grad_beta.len())
+                                } else {
+                                    let wtg = w_pos.t().dot(&grad_beta);
+                                    w_pos.dot(&wtg)
+                                };
+
+                                let delta_inf = delta
+                                    .iter()
+                                    .fold(0.0_f64, |acc: f64, &v: &f64| acc.max(v.abs()));
+                                if delta_inf < 1e-8 {
+                                    let (should_print, count) =
+                                        should_emit_grad_diag(&GRAD_DIAG_DELTA_ZERO_COUNT);
+                                    if should_print {
+                                        eprintln!(
+                                            "[GRAD DIAG #{count}] delta ~0: max|delta|={:.3e} max|grad_beta|={:.3e}",
+                                            delta_inf,
+                                            grad_beta
+                                                .iter()
+                                                .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                                        );
+                                    }
+                                }
+                                Some(delta)
+                            } else {
+                                None
+                            };
 
                             for k in 0..k_count {
                                 let log_det_h_grad_term = 0.5 * lambdas[k] * trace_terms[k];

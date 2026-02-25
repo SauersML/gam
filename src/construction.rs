@@ -936,7 +936,6 @@ pub fn stable_reparameterization_with_invariant(
     p: usize,
     invariant: &ReparamInvariant,
 ) -> Result<ReparamResult, EstimationError> {
-    use std::cmp::Ordering;
 
     let m = rs_list.len();
 
@@ -1016,7 +1015,7 @@ pub fn stable_reparameterization_with_invariant(
         range_order.sort_by(|&i, &j| {
             range_eigenvalues[j]
                 .partial_cmp(&range_eigenvalues[i])
-                .unwrap_or(Ordering::Equal)
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then(i.cmp(&j))
         });
 
