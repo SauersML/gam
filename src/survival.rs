@@ -1,6 +1,10 @@
 use crate::estimate::EstimationError;
+use crate::faer_ndarray::{
+    FaerArrayView, FaerCholesky, FaerEigh, factorize_symmetric_with_fallback,
+};
 use crate::pirls::{WorkingModel as PirlsWorkingModel, WorkingState};
 use crate::types::{Coefficients, LinearPredictor};
+use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -198,8 +202,24 @@ impl WorkingModelSurvival {
         let n = self.x_exit.nrows();
         let p = self.x_exit.ncols();
 
-        // Royston-Parmar contract used throughout engine and adapter:
-        // eta(t) = log(H(t)), where H is cumulative hazard.
+        // Royston-Parmar contract used throughout the engine:
+        //   eta(t) = log(H(t)), where H(t) is cumulative hazard.
+        //
+        // With row-vectors (per subject i):
+        //   a1_i^T := x_exit_i^T,  a0_i^T := x_entry_i^T,  d_i^T := x_derivative_i^T
+        // and scalars:
+        //   eta1_i = a1_i^T beta,  eta0_i = a0_i^T beta,  s_i = d_i^T beta.
+        //
+        // The per-subject negative log-likelihood used below is
+        //   NLL_i(beta) = exp(eta1_i) - exp(eta0_i) - delta_i * (eta1_i + log(s_i)),
+        // with delta_i = event_target_i.
+        //
+        // This is exactly the form whose derivatives are:
+        //   grad_i = exp(eta1_i) a1_i - exp(eta0_i) a0_i - delta_i * (a1_i + d_i / s_i)
+        //   Hess_i = exp(eta1_i) a1_i a1_i^T - exp(eta0_i) a0_i a0_i^T
+        //            + delta_i * (d_i d_i^T) / s_i^2.
+        //
+        // The loop below computes those terms directly, then adds penalties.
         let eta_entry = self.x_entry.dot(beta);
         let eta_exit = self.x_exit.dot(beta);
         let derivative_raw = self.x_derivative.dot(beta);
@@ -240,12 +260,16 @@ impl WorkingModelSurvival {
             let x_s = self.x_entry.row(i);
             let x_e = self.x_exit.row(i);
 
-            // Interval contribution: H(exit) - H(entry)
+            // Interval contribution to NLL:
+            //   exp(eta_exit) - exp(eta_entry)
+            // Gradient piece:
+            //   exp(eta_exit) * x_exit - exp(eta_entry) * x_entry
             for j in 0..p {
                 grad[j] += w * (h_e * x_e[j] - h_s * x_s[j]);
             }
 
-            // Hessian from interval contribution.
+            // Hessian piece from interval contribution:
+            //   exp(eta_exit) * x_exit x_exit^T - exp(eta_entry) * x_entry x_entry^T
             for r in 0..p {
                 let xe_r = x_e[r];
                 let xs_r = x_s[r];
@@ -269,12 +293,19 @@ impl WorkingModelSurvival {
                 let d_row = self.x_derivative.row(i);
                 nll += -w * (eta_exit[i] + safe_deriv.ln());
 
-                // Event contribution gradient: -x_exit - (1/deriv)*x_derivative
+                // Event contribution:
+                //   - (eta_exit + log(s_i)), with s_i = d_i^T beta = derivative_raw[i].
+                //
+                // Gradient piece:
+                //   -x_exit - d_i / s_i
+                // implemented as -x_exit - inv_deriv * d_row.
                 for j in 0..p {
                     grad[j] += -w * (x_e[j] + inv_deriv * d_row[j]);
                 }
 
-                // Event contribution Hessian from -log(deriv): + (1/deriv^2) d d^T
+                // Hessian piece from -log(s_i):
+                //   + (d_i d_i^T) / s_i^2
+                // i.e. + inv_deriv_sq * d_row d_row^T.
                 let inv_deriv_sq = inv_deriv * inv_deriv;
                 if inv_deriv_sq > 0.0 {
                     for r in 0..p {
@@ -341,6 +372,193 @@ impl WorkingModelSurvival {
             firth_hat_diag: None,
             ridge_used,
         })
+    }
+
+    /// Evaluate a Laplace-style survival outer objective and exact rho-gradient
+    /// from a converged inner state without finite-difference outer probes.
+    ///
+    /// Derivation map (symbols -> code):
+    /// - `rho_k = log(lambda_k)` and `A_k = dS/drho_k = 2 * lambda_k * S_k`.
+    ///   The `2` factor comes from this module's penalty convention, where
+    ///   `penalty_grad = 2 * lambda * S_k * beta`.
+    /// - `V(rho) = f(beta_hat, rho) + 0.5 log|H| - 0.5 log|S|_+`.
+    ///   Here `f` is represented by `0.5 * deviance + penalty_deviance`.
+    /// - `dV/drho_k = 0.5 * beta^T A_k beta
+    ///               + 0.5 * tr(H^{-1} dH/drho_k)
+    ///               - 0.5 * tr(S^+ A_k)`.
+    /// - `tr(H^{-1} dH/drho_k)` is evaluated with a tensor-free contraction:
+    ///   `tr(H^{-1} A_k)` plus third-derivative terms induced by
+    ///   `exp(eta_exit)`, `exp(eta_entry)`, and `log(d^T beta)`.
+    ///   We avoid any explicit `p x p x p` tensor by precomputing:
+    ///   `q1_i = x_exit_i^T H^{-1} x_exit_i`,
+    ///   `q0_i = x_entry_i^T H^{-1} x_entry_i`,
+    ///   `qd_i = d_i^T H^{-1} d_i`.
+    ///
+    /// Outer objective:
+    ///   V(rho) = [0.5 * deviance(beta_hat) + penalty_deviance(beta_hat)]
+    ///          + 0.5 log|H| - 0.5 log|S|_+.
+    ///
+    /// Gradient:
+    ///   dV/drho_k = 0.5 * beta^T A_k beta + 0.5 * tr(H^{-1} H_k) - 0.5 * tr(S^+ A_k),
+    /// where A_k = dS/drho_k in this module's parameterization.
+    pub fn laml_objective_and_rho_gradient(
+        &self,
+        beta: &Array1<f64>,
+        state: &WorkingState,
+    ) -> Result<(f64, Array1<f64>), EstimationError> {
+        let p = beta.len();
+        let k_count = self.penalties.blocks.len();
+        if k_count == 0 {
+            return Ok((0.5 * state.deviance, Array1::zeros(0)));
+        }
+        if state.hessian.nrows() != p || state.hessian.ncols() != p {
+            return Err(EstimationError::LayoutError(
+                "survival laml gradient: Hessian/beta dimension mismatch".to_string(),
+            ));
+        }
+
+        // Reuse one symmetric factorization for all H^{-1} applications.
+        let h_view = FaerArrayView::new(&state.hessian);
+        let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower)
+            .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+        let eye = Array2::<f64>::eye(p);
+        let eye_view = FaerArrayView::new(&eye);
+        let h_inv_faer = factor.solve(eye_view.as_ref());
+        let h_inv = Array2::from_shape_fn((p, p), |(i, j)| h_inv_faer[(i, j)]);
+
+        let eta_entry = self.x_entry.dot(beta);
+        let eta_exit = self.x_exit.dot(beta);
+        let deriv_raw = self.x_derivative.dot(beta);
+        let exp_entry = eta_entry.mapv(f64::exp);
+        let exp_exit = eta_exit.mapv(f64::exp);
+        let guard = self.monotonicity.tolerance.max(1e-12);
+
+        // Leverage-like diagonals used by the third-derivative contraction.
+        let x1_hinv = self.x_exit.dot(&h_inv);
+        let x0_hinv = self.x_entry.dot(&h_inv);
+        let xd_hinv = self.x_derivative.dot(&h_inv);
+        let n = self.x_exit.nrows();
+        let mut q1 = Array1::<f64>::zeros(n);
+        let mut q0 = Array1::<f64>::zeros(n);
+        let mut qd = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            q1[i] = self.x_exit.row(i).dot(&x1_hinv.row(i)).max(0.0);
+            q0[i] = self.x_entry.row(i).dot(&x0_hinv.row(i)).max(0.0);
+            qd[i] = self.x_derivative.row(i).dot(&xd_hinv.row(i)).max(0.0);
+        }
+
+        // Assemble S(rho) in the same scaling used by update_state.
+        let mut s_total = Array2::<f64>::zeros((p, p));
+        for block in &self.penalties.blocks {
+            if block.lambda == 0.0 {
+                continue;
+            }
+            let r = block.range.clone();
+            let scale = 2.0 * block.lambda;
+            for (i_local, i) in r.clone().enumerate() {
+                for (j_local, j) in r.clone().enumerate() {
+                    s_total[[i, j]] += scale * block.matrix[[i_local, j_local]];
+                }
+            }
+        }
+
+        // Pseudo-logdet and pseudoinverse for S:
+        // d/drho_k [-0.5 log|S|_+] = -0.5 tr(S^+ A_k).
+        let (s_eval, s_evec) = s_total
+            .eigh(Side::Lower)
+            .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+        let max_s_eval = s_eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let s_tol = (max_s_eval * 1e-12).max(1e-14);
+        let mut logdet_s = 0.0_f64;
+        let mut s_pinv = Array2::<f64>::zeros((p, p));
+        for j in 0..p {
+            let ev = s_eval[j];
+            if ev > s_tol {
+                logdet_s += ev.ln();
+                let inv_ev = 1.0 / ev;
+                for r in 0..p {
+                    let ur = s_evec[(r, j)];
+                    for c in 0..p {
+                        s_pinv[[r, c]] += inv_ev * ur * s_evec[(c, j)];
+                    }
+                }
+            }
+        }
+
+        // Robust logdet for H: Cholesky on SPD path, eigen fallback otherwise.
+        let logdet_h = if let Ok(chol) = state.hessian.clone().cholesky(Side::Lower) {
+            let l = chol.lower_triangular();
+            2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>()
+        } else {
+            let (eval, _) = state
+                .hessian
+                .eigh(Side::Lower)
+                .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+            let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+            let tol = (max_eval * 1e-12).max(1e-14);
+            eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum()
+        };
+
+        let objective = 0.5 * state.deviance + self.penalties.deviance(beta) + 0.5 * logdet_h
+            - 0.5 * logdet_s;
+
+        let mut grad = Array1::<f64>::zeros(k_count);
+        for (k, block) in self.penalties.blocks.iter().enumerate() {
+            let lambda = block.lambda;
+            let r = block.range.clone();
+
+            let b_block = beta.slice(ndarray::s![r.clone()]).to_owned();
+            let a_k_beta_block = block.matrix.dot(&b_block).mapv(|v| 2.0 * lambda * v);
+            let mut a_k_beta = Array1::<f64>::zeros(p);
+            a_k_beta
+                .slice_mut(ndarray::s![r.clone()])
+                .assign(&a_k_beta_block);
+
+            // Implicit inner derivative:
+            // d beta_hat / d rho_k = -H^{-1} A_k beta_hat.
+            let u_k = -h_inv.dot(&a_k_beta);
+            let s1k = self.x_exit.dot(&u_k);
+            let s0k = self.x_entry.dot(&u_k);
+            let sdk = self.x_derivative.dot(&u_k);
+
+            let mut trace_hinv_ak = 0.0_f64;
+            for (i_local, i) in r.clone().enumerate() {
+                for (j_local, j) in r.clone().enumerate() {
+                    trace_hinv_ak +=
+                        h_inv[[i, j]] * (2.0 * lambda * block.matrix[[j_local, i_local]]);
+                }
+            }
+
+            // Tensor-free contraction of third-derivative terms:
+            // + sum_i exp(eta_exit_i)  (x_exit_i^T u_k) q1_i
+            // - sum_i exp(eta_entry_i) (x_entry_i^T u_k) q0_i
+            // - 2 sum_events (d_i^T u_k) qd_i / (d_i^T beta)^3
+            // The last term is from differentiating delta_i * log(d_i^T beta).
+            let mut trace_third = 0.0_f64;
+            for i in 0..n {
+                let w_i = self.sample_weight[i];
+                trace_third += w_i * exp_exit[i] * s1k[i] * q1[i];
+                trace_third -= w_i * exp_entry[i] * s0k[i] * q0[i];
+                if self.event_target[i] > 0 {
+                    let s_i = deriv_raw[i];
+                    if s_i > guard {
+                        trace_third -= 2.0 * w_i * sdk[i] * qd[i] / (s_i * s_i * s_i);
+                    }
+                }
+            }
+            let t_k = trace_hinv_ak + trace_third;
+
+            let mut p_k = 0.0_f64;
+            for (i_local, i) in r.clone().enumerate() {
+                for (j_local, j) in r.clone().enumerate() {
+                    p_k += s_pinv[[i, j]] * (2.0 * lambda * block.matrix[[j_local, i_local]]);
+                }
+            }
+
+            grad[k] = 0.5 * beta.dot(&a_k_beta) + 0.5 * t_k - 0.5 * p_k;
+        }
+
+        Ok((objective, grad))
     }
 }
 

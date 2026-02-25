@@ -89,6 +89,15 @@ pub struct SurvivalLambdaOptimizerResult {
 /// Optimize survival smoothing parameters via multi-start BFGS.
 ///
 /// This wraps the engine-level optimizer with a survival-family specific contract.
+///
+/// The survival objective is provided as a black-box `objective(rho)`.
+/// The optimizer in `estimate.rs` differentiates this objective by central
+/// finite differences in `rho`, i.e.
+///   dV/drho_k ≈ [V(rho+h e_k)-V(rho-h e_k)]/(2h),
+/// then runs multi-start BFGS in the unconstrained `rho = log(lambda)` space.
+/// This keeps the gradient numerically aligned with the exact implemented
+/// objective surface without requiring family-specific closed-form outer
+/// derivatives.
 pub fn optimize_survival_lambdas_with_multistart<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
@@ -108,6 +117,42 @@ where
         num_penalties,
         heuristic_lambdas,
         objective,
+        &core_opts,
+    )?;
+    let lambdas = result.rho.mapv(f64::exp);
+    Ok(SurvivalLambdaOptimizerResult {
+        rho: result.rho,
+        lambdas,
+        final_value: result.final_value,
+        iterations: result.iterations,
+        final_grad_norm: result.final_grad_norm,
+        stationary: result.stationary,
+    })
+}
+
+/// Optimize survival smoothing parameters via multi-start BFGS when the caller
+/// can provide an exact gradient in rho-space.
+pub fn optimize_survival_lambdas_with_multistart_with_gradient<F>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    objective_with_gradient: F,
+    options: &SurvivalLambdaOptimizerOptions,
+) -> Result<SurvivalLambdaOptimizerResult, crate::estimate::EstimationError>
+where
+    F: FnMut(
+        &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>), crate::estimate::EstimationError>,
+{
+    let core_opts = crate::estimate::SmoothingBfgsOptions {
+        max_iter: options.max_iter,
+        tol: options.tol,
+        finite_diff_step: options.finite_diff_step,
+        seed_config: options.seed_config,
+    };
+    let result = crate::estimate::optimize_log_smoothing_with_multistart_with_gradient(
+        num_penalties,
+        heuristic_lambdas,
+        objective_with_gradient,
         &core_opts,
     )?;
     let lambdas = result.rho.mapv(f64::exp);
