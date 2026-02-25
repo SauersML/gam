@@ -393,14 +393,10 @@ impl WorkingModelSurvival {
     ///   `q1_i = x_exit_i^T H^{-1} x_exit_i`,
     ///   `q0_i = x_entry_i^T H^{-1} x_entry_i`,
     ///   `qd_i = d_i^T H^{-1} d_i`.
-    ///
-    /// Outer objective:
-    ///   V(rho) = [0.5 * deviance(beta_hat) + penalty_deviance(beta_hat)]
-    ///          + 0.5 log|H| - 0.5 log|S|_+.
-    ///
-    /// Gradient:
-    ///   dV/drho_k = 0.5 * beta^T A_k beta + 0.5 * tr(H^{-1} H_k) - 0.5 * tr(S^+ A_k),
-    /// where A_k = dS/drho_k in this module's parameterization.
+    /// Event-log term note:
+    /// - the contribution from `delta_i * log(d_i^T beta)` appears in the
+    ///   third-derivative contraction as:
+    ///   `-2 * (d_i^T u_k) * qd_i / (d_i^T beta)^3` for event rows.
     pub fn laml_objective_and_rho_gradient(
         &self,
         beta: &Array1<f64>,
