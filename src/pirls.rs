@@ -107,30 +107,31 @@ pub struct PirlsWorkspace {
 
 impl PirlsWorkspace {
     pub fn new(n: usize, p: usize, eb_rows: usize, e_rows: usize) -> Self {
-        // Max rows used in Stage 2 and 4
-        let scaled_rows_max = p + eb_rows;
-        let final_aug_rows_max = p + e_rows;
+        // Stage buffers are allocated lazily: historically these were pre-sized to
+        // worst-case dimensions (p + eb_rows / p + e_rows), which inflates memory
+        // when many PIRLS workspaces exist concurrently (e.g. parallel REML evals).
+        // The active code paths resize-on-demand where needed.
+        let _ = (eb_rows, e_rows);
 
         PirlsWorkspace {
             sqrt_w: Array1::zeros(n),
             wx: Array2::zeros((n, p).f()),
             wz: Array1::zeros(n),
             eta_buf: Array1::zeros(n),
-            scaled_matrix: Array2::zeros((scaled_rows_max, p).f()),
-            final_aug_matrix: Array2::zeros((final_aug_rows_max, p).f()),
-            rhs_full: Array1::zeros(final_aug_rows_max),
+            scaled_matrix: Array2::zeros((0, 0).f()),
+            final_aug_matrix: Array2::zeros((0, 0).f()),
+            rhs_full: Array1::zeros(0),
             working_residual: Array1::zeros(n),
             weighted_residual: Array1::zeros(n),
             delta_eta: Array1::zeros(n),
             vec_buf_p: Array1::zeros(p),
             sparse_xtwx_cache: None,
-            // Allocate scratch for LDLT (max possible size for p)
+            // Keep scratch minimal at init; grow only if/when a factorization path
+            // needs it.
             factorization_scratch: {
-                // Using estimated max requirements (p x p matrix)
                 let par = faer::Par::Seq;
-                // Note: using cholesky_in_place_scratch from llt::factor
                 let req = faer::linalg::cholesky::llt::factor::cholesky_in_place_scratch::<f64>(
-                    p,
+                    1,
                     par,
                     Spec::new(<LltParams as Auto<f64>>::auto()),
                 );
@@ -138,8 +139,8 @@ impl PirlsWorkspace {
             },
             perm: vec![0; p],
             perm_inv: vec![0; p],
-            factorization_matrix: Array2::zeros((p, p)),
-            weighted_x_values: Vec::with_capacity(n * 10), // Initial guess, will grow
+            factorization_matrix: Array2::zeros((0, 0)),
+            weighted_x_values: Vec::new(),
         }
     }
 
@@ -453,6 +454,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let family = match self.link {
             LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
             LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
+            LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
             LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
         };
         if let Some(se) = &self.covariate_se {
@@ -548,13 +550,10 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         }
 
         let mut penalized_hessian = self.penalized_hessian(&weights)?;
-        for i in 0..penalized_hessian.nrows() {
-            for j in 0..i {
-                let val = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
-                penalized_hessian[[i, j]] = val;
-                penalized_hessian[[j, i]] = val;
-            }
-        }
+        // Hot path: avoid explicit O(p^2) averaging each PIRLS iteration.
+        // H = X'WX + S is symmetric by construction; keep a debug-time guard.
+        #[cfg(debug_assertions)]
+        debug_assert_symmetric_tol(&penalized_hessian, "PIRLS penalized Hessian", 1e-8);
 
         let z = &self.last_z;
         self.workspace
@@ -767,13 +766,8 @@ fn compute_firth_hat_and_half_logdet_sparse(
             }
         }
     }
-    for i in 0..p {
-        for j in 0..i {
-            let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
-            stabilized[[i, j]] = v;
-            stabilized[[j, i]] = v;
-        }
-    }
+    #[cfg(debug_assertions)]
+    debug_assert_symmetric_tol(&stabilized, "Firth Fisher information (sparse)", 1e-8);
     // Firth correction for GAMs uses the penalized Fisher information (X' W X + S).
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
@@ -848,13 +842,8 @@ fn compute_firth_hat_and_half_logdet(
             }
         }
     }
-    for i in 0..p {
-        for j in 0..i {
-            let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
-            stabilized[[i, j]] = v;
-            stabilized[[j, i]] = v;
-        }
-    }
+    #[cfg(debug_assertions)]
+    debug_assert_symmetric_tol(&stabilized, "Firth Fisher information (dense)", 1e-8);
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
     let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
@@ -930,6 +919,7 @@ fn solve_newton_direction_dense(
     if direction_out.len() != gradient.len() {
         *direction_out = Array1::zeros(gradient.len());
     }
+
     let h_view = FaerArrayView::new(hessian);
     direction_out.assign(gradient);
     if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
@@ -971,7 +961,7 @@ fn default_beta_guess_external(
     let mut beta = Array1::<f64>::zeros(p);
     let intercept_col = 0usize;
     match link_function {
-        LinkFunction::Logit | LinkFunction::Probit => {
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
             let mut weighted_sum = 0.0;
             let mut total_weight = 0.0;
             for (&yi, &wi) in y.iter().zip(prior_weights.iter()) {
@@ -981,7 +971,13 @@ fn default_beta_guess_external(
             if total_weight > 0.0 {
                 let prevalence =
                     ((weighted_sum + 0.5) / (total_weight + 1.0)).clamp(1e-6, 1.0 - 1e-6);
-                beta[intercept_col] = (prevalence / (1.0 - prevalence)).ln();
+                beta[intercept_col] = match link_function {
+                    LinkFunction::Logit | LinkFunction::Probit => {
+                        (prevalence / (1.0 - prevalence)).ln()
+                    }
+                    LinkFunction::CLogLog => (-(1.0 - prevalence).ln()).ln(),
+                    LinkFunction::Identity => unreachable!(),
+                };
             }
         }
         LinkFunction::Identity => {
@@ -2064,6 +2060,7 @@ fn resolve_pirls_family(
         LikelihoodFamily::GaussianIdentity => Ok((LinkFunction::Identity, false)),
         LikelihoodFamily::BinomialLogit => Ok((LinkFunction::Logit, firth_bias_reduction)),
         LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
+        LikelihoodFamily::BinomialCLogLog => Ok((LinkFunction::CLogLog, false)),
         LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "run_pirls does not support RoystonParmar; use survival-specific working models"
                 .to_string(),
@@ -2128,6 +2125,28 @@ fn maybe_sparse_design(x: &Array2<f64>) -> DesignMatrix {
     }
 
     DesignMatrix::Dense(x.clone())
+}
+
+#[inline]
+#[cfg(debug_assertions)]
+fn debug_assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
+    let n = matrix.nrows().min(matrix.ncols());
+    let mut max_asym = 0.0_f64;
+    for i in 0..n {
+        for j in 0..i {
+            let diff = (matrix[[i, j]] - matrix[[j, i]]).abs();
+            if diff > max_asym {
+                max_asym = diff;
+            }
+        }
+    }
+    debug_assert!(
+        max_asym <= tol,
+        "{} asymmetry too large: {:.3e} (tol {:.3e})",
+        label,
+        max_asym,
+        tol
+    );
 }
 
 fn design_dot_dense_rhs(x: &DesignMatrix, rhs: &Array2<f64>) -> Array2<f64> {
@@ -2343,6 +2362,22 @@ pub fn update_glm_vectors(
                 z[i] = e + (y[i] - mu_i) / dmu;
             }
         }
+        LinkFunction::CLogLog => {
+            let n = eta.len();
+            for i in 0..n {
+                let e = eta[i].clamp(-30.0, 30.0);
+                let exp_eta = e.exp();
+                let surv = (-exp_eta).exp();
+                let mu_i = (1.0 - surv).clamp(PROB_EPS, 1.0 - PROB_EPS);
+                mu[i] = mu_i;
+                // dmu/deta = exp(eta - exp(eta)) = exp(eta) * exp(-exp(eta))
+                let dmu = (exp_eta * surv).max(MIN_D_FOR_Z);
+                let variance = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
+                let fisher_w = ((dmu * dmu) / variance).max(MIN_WEIGHT);
+                weights[i] = prior_weights[i] * fisher_w;
+                z[i] = e + (y[i] - mu_i) / dmu;
+            }
+        }
         LinkFunction::Identity => {
             let n = eta.len();
             for i in 0..n {
@@ -2372,6 +2407,10 @@ pub fn update_glm_vectors_by_family(
         }
         LikelihoodFamily::BinomialProbit => {
             update_glm_vectors(y, eta, LinkFunction::Probit, prior_weights, mu, weights, z);
+            Ok(())
+        }
+        LikelihoodFamily::BinomialCLogLog => {
+            update_glm_vectors(y, eta, LinkFunction::CLogLog, prior_weights, mu, weights, z);
             Ok(())
         }
         LikelihoodFamily::GaussianIdentity => {
@@ -2467,6 +2506,9 @@ pub fn update_glm_vectors_integrated_by_family(
         LikelihoodFamily::BinomialProbit => Err(EstimationError::InvalidInput(
             "Integrated updates are currently only implemented for BinomialLogit".to_string(),
         )),
+        LikelihoodFamily::BinomialCLogLog => Err(EstimationError::InvalidInput(
+            "Integrated updates are currently only implemented for BinomialLogit".to_string(),
+        )),
         LikelihoodFamily::GaussianIdentity => {
             update_glm_vectors_by_family(y, eta, family, prior_weights, mu, weights, z)
         }
@@ -2485,7 +2527,7 @@ pub fn calculate_deviance(
 ) -> f64 {
     const EPS: f64 = 1e-8; // Increased from 1e-9 for better numerical stability
     match link {
-        LinkFunction::Logit | LinkFunction::Probit => {
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
             let total_residual = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
                 0.0,
                 |acc, &yi, &mui, &wi| {
@@ -2595,13 +2637,27 @@ pub fn solve_penalized_least_squares(
     );
 
     // 4. Form Penalized Hessian: H = X'WX + S
-    // Symmetrize to be safe
-    for i in 0..p_dim {
-        for j in 0..i {
-            let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
-            penalized_hessian[[i, j]] = v;
-            penalized_hessian[[j, i]] = v;
+    //
+    // Hot-path note:
+    // X'WX is symmetric by construction, and S is pre-built as symmetric.
+    // Avoid O(p^2) averaging every PIRLS iteration. In debug builds we verify
+    // symmetry tolerance to catch regressions in matrix construction.
+    #[cfg(debug_assertions)]
+    {
+        let mut max_asym = 0.0_f64;
+        for i in 0..p_dim {
+            for j in 0..i {
+                let diff = (penalized_hessian[[i, j]] - penalized_hessian[[j, i]]).abs();
+                if diff > max_asym {
+                    max_asym = diff;
+                }
+            }
         }
+        debug_assert!(
+            max_asym <= 1e-8,
+            "penalized_hessian asymmetry too large: {}",
+            max_asym
+        );
     }
 
     // 5. Fixed Ridge Regularization (rho-independent)
@@ -2751,14 +2807,14 @@ fn calculate_edf_with_workspace(
     if workspace.final_aug_matrix.nrows() != p || workspace.final_aug_matrix.ncols() != r {
         workspace.final_aug_matrix = Array2::zeros((p, r));
     }
+    for j in 0..r {
+        for i in 0..p {
+            workspace.final_aug_matrix[[i, j]] = e_transformed[[j, i]];
+        }
+    }
 
     // Try LLᵀ first
     if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-        for j in 0..r {
-            for i in 0..p {
-                workspace.final_aug_matrix[[i, j]] = e_transformed[[j, i]];
-            }
-        }
         let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
         ch.solve_in_place(rhs_view.as_mut());
         let mut tr = 0.0;
@@ -2772,6 +2828,7 @@ fn calculate_edf_with_workspace(
 
     // Try LDLᵀ (semi-definite)
     if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+        workspace.final_aug_matrix.fill(0.0);
         for j in 0..r {
             for i in 0..p {
                 workspace.final_aug_matrix[[i, j]] = e_transformed[[j, i]];
@@ -2790,6 +2847,7 @@ fn calculate_edf_with_workspace(
 
     // Last resort: symmetric indefinite LBLᵀ (Bunch–Kaufman)
     let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
+    workspace.final_aug_matrix.fill(0.0);
     for j in 0..r {
         for i in 0..p {
             workspace.final_aug_matrix[[i, j]] = e_transformed[[j, i]];
@@ -2827,7 +2885,7 @@ fn calculate_scale(
     link_function: LinkFunction,
 ) -> f64 {
     match link_function {
-        LinkFunction::Logit | LinkFunction::Probit => {
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
             // For binomial models (logistic regression), scale is fixed at 1.0
             // This follows mgcv's convention in gam.fit3.R
             1.0
@@ -2858,7 +2916,7 @@ fn calculate_scale(
 mod tests {
     use super::calculate_scale;
     use crate::types::LinkFunction;
-    use ndarray::{array, Array1};
+    use ndarray::{Array1, array};
 
     #[test]
     fn gaussian_scale_uses_offset_in_residuals() {

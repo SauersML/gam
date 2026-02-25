@@ -62,7 +62,9 @@ pub fn generative_spec_from_predict(
                 },
             })
         }
-        LikelihoodFamily::BinomialLogit | LikelihoodFamily::BinomialProbit => Ok(GenerativeSpec {
+        LikelihoodFamily::BinomialLogit
+        | LikelihoodFamily::BinomialProbit
+        | LikelihoodFamily::BinomialCLogLog => Ok(GenerativeSpec {
             mean: prediction.mean,
             noise: NoiseModel::Bernoulli,
         }),

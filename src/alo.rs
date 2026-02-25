@@ -7,7 +7,7 @@ use faer::Mat as FaerMat;
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use faer::{Accum, Par, Side};
-use ndarray::{Array1, Array2, ArrayView1, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, s};
 use std::cmp::Ordering;
 
 /// Approximate leave-one-out diagnostics derived from a fitted model.
@@ -40,10 +40,6 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let n = x_dense.nrows();
 
     let w = &base.final_weights;
-    let sqrt_w = w.mapv(f64::sqrt);
-    let mut u = x_dense.clone();
-    let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
-    u *= &sqrt_w_col;
 
     // Use the exact stabilized Hessian from PIRLS. This keeps ALO linearization
     // consistent with the curvature used in fitting and avoids adding a second,
@@ -75,10 +71,10 @@ fn compute_alo_diagnostics_from_pirls_impl(
         })?)
     };
 
-    let ut = u.t();
+    let xt = x_dense.t();
 
     let phi = match link {
-        LinkFunction::Logit | LinkFunction::Probit => 1.0,
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => 1.0,
         LinkFunction::Identity => {
             let mut rss = 0.0;
             for i in 0..n {
@@ -124,7 +120,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
 
         rhs_chunk_buf
             .slice_mut(s![.., ..width])
-            .assign(&ut.slice(s![.., chunk_start..chunk_end]));
+            .assign(&xt.slice(s![.., chunk_start..chunk_end]));
 
         let rhs_chunk_view = rhs_chunk_buf.slice(s![.., ..width]);
         let rhs_chunk = FaerArrayView::new(&rhs_chunk_view);
@@ -143,15 +139,16 @@ fn compute_alo_diagnostics_from_pirls_impl(
 
         for local_col in 0..width {
             let obs = chunk_start + local_col;
-            let u_row = u.row(obs);
-            let mut ai = 0.0f64;
+            let x_row = x_dense.row(obs);
+            let mut x_hinv_x = 0.0f64;
             let mut s_norm2 = 0.0f64;
             for row in 0..p {
                 let s_val = s_chunk[(row, local_col)];
-                let u_val = u_row[row];
-                ai = s_val.mul_add(u_val, ai);
+                let x_val = x_row[row];
+                x_hinv_x = s_val.mul_add(x_val, x_hinv_x);
                 s_norm2 = s_val.mul_add(s_val, s_norm2);
             }
+            let ai = w[obs].max(0.0) * x_hinv_x;
             let mut es_norm2 = 0.0f64;
             if e_rank > 0 {
                 for r in 0..e_rank {
@@ -159,10 +156,13 @@ fn compute_alo_diagnostics_from_pirls_impl(
                     es_norm2 = v.mul_add(v, es_norm2);
                 }
             }
-            // Using H = X'WX + S + ridge I and s = H^{-1}u:
-            //   s'X'WXs = s'Hs - s'Ss - ridge*||s||^2 = aii - ||E s||^2 - ridge||s||^2
+            // Using H = X'WX + S + ridge I and t = H^{-1}x_i:
+            //   t'X'WXt = t'Ht - t'St - ridge*||t||^2
+            //          = x_i't - ||E t||^2 - ridge*||t||^2
             // where S = E'E (E is e_transformed).
-            let quad = ai - es_norm2 - ridge * s_norm2;
+            //
+            // This form avoids dividing by w_i and remains stable when w_i -> 0.
+            let quad = x_hinv_x - es_norm2 - ridge * s_norm2;
             aii[obs] = ai;
             percentiles_data.push(ai);
 
@@ -196,8 +196,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
                 a_hi_99 += 1;
             }
 
-            let wi = base.final_weights[obs].max(1e-12);
-            let var_full = phi * (quad / wi);
+            let var_full = phi * quad;
             if var_full == 0.0 && base.final_weights[obs] < 1e-10 {
                 log::warn!(
                     "[GAM ALO] obs {} has near-zero weight ({:.2e}) resulting in SE=0",
@@ -210,8 +209,9 @@ fn compute_alo_diagnostics_from_pirls_impl(
 
             if diag_counter < max_diag_samples {
                 log::debug!("[GAM ALO] SE formula (obs {}):", obs);
-                log::debug!("  - w_i: {:.6e}", wi);
+                log::debug!("  - w_i: {:.6e}", base.final_weights[obs]);
                 log::debug!("  - a_ii: {:.6e}", ai);
+                log::debug!("  - x_i'H^-1 x_i: {:.6e}", x_hinv_x);
                 log::debug!("  - var_full: {:.6e}", var_full);
                 log::debug!("  - SE_naive: {:.6e}", se_full);
                 diag_counter += 1;
@@ -310,8 +310,10 @@ fn compute_alo_diagnostics_from_pirls_impl(
     );
 
     let eta_tilde = match link {
-        LinkFunction::Logit | LinkFunction::Probit => eta_tilde,
-        LinkFunction::Identity => eta_tilde,
+        LinkFunction::Logit
+        | LinkFunction::Probit
+        | LinkFunction::CLogLog
+        | LinkFunction::Identity => eta_tilde,
     };
 
     let has_nan_pred = eta_tilde.iter().any(|&x| x.is_nan());

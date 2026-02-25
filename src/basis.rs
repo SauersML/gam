@@ -760,8 +760,16 @@ fn generate_basis_internal<S: BasisStorage>(
 ) -> Result<S::Output, BasisError> {
     let num_basis_functions = knot_view.len().saturating_sub(degree + 1);
     let support = degree + 1;
-    const PAR_THRESHOLD: usize = 256;
-    let use_parallel = data.len() >= PAR_THRESHOLD && data.as_slice().is_some();
+    // Parallel dispatch heuristic:
+    // Lower degrees have cheaper per-row evaluation and need larger batches to
+    // amortize Rayon scheduling overhead. Cubic+ rows are costlier, so parallel
+    // wins earlier.
+    let par_threshold = match degree {
+        0 | 1 => 512,
+        2 | 3 => 128,
+        _ => 64,
+    };
+    let use_parallel = data.len() >= par_threshold && data.as_slice().is_some();
     S::build(
         data,
         knot_view,
@@ -904,9 +912,18 @@ fn generate_basis_nd_dense(
     })?;
 
     let mut basis_matrix = Array2::zeros((nrows, total_cols));
-    const PAR_THRESHOLD: usize = 256;
+    // Degree-adaptive threshold for tensor-product rows.
+    // Higher total degree means more per-row work, so parallelism wins earlier.
+    let total_degree: usize = degrees.iter().sum();
+    let par_threshold = if total_degree <= dims {
+        512
+    } else if total_degree <= 3 * dims {
+        128
+    } else {
+        64
+    };
 
-    if nrows >= PAR_THRESHOLD {
+    if nrows >= par_threshold {
         bspline_thread_pool().install(|| {
             basis_matrix
                 .axis_iter_mut(Axis(0))
@@ -999,8 +1016,16 @@ fn generate_basis_nd_sparse(
             .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
     })?;
 
-    const PAR_THRESHOLD: usize = 256;
-    let triplets: Vec<Triplet<usize, usize, f64>> = if nrows >= PAR_THRESHOLD {
+    // Match dense tensor threshold policy for consistent medium-size behavior.
+    let total_degree: usize = degrees.iter().sum();
+    let par_threshold = if total_degree <= dims {
+        512
+    } else if total_degree <= 3 * dims {
+        128
+    } else {
+        64
+    };
+    let triplets: Vec<Triplet<usize, usize, f64>> = if nrows >= par_threshold {
         bspline_thread_pool().install(|| {
             const CHUNK_SIZE: usize = 1024;
             let row_starts: Vec<usize> = (0..nrows).step_by(CHUNK_SIZE).collect();
@@ -1452,15 +1477,109 @@ fn select_equal_mass_centers(
             "equal-mass center selection requires at least one column".to_string(),
         ));
     }
-    // Deterministic equal-mass partition on first coordinate, with medoid rows.
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| data[[a, 0]].total_cmp(&data[[b, 0]]));
+    #[derive(Clone)]
+    struct Leaf {
+        indices: Vec<usize>,
+    }
+
+    // Recursive equal-mass partition that always splits the leaf along its widest
+    // coordinate dimension. This addresses the root cause of PC1-only slicing by
+    // adapting splits to the local geometry of each partition.
+    let mut leaves = vec![Leaf {
+        indices: (0..n).collect(),
+    }];
+
+    let choose_split_dim = |idxs: &[usize]| -> usize {
+        let mut best_dim = 0usize;
+        let mut best_span = f64::NEG_INFINITY;
+        for j in 0..d {
+            let mut min_v = f64::INFINITY;
+            let mut max_v = f64::NEG_INFINITY;
+            for &idx in idxs {
+                let v = data[[idx, j]];
+                if v < min_v {
+                    min_v = v;
+                }
+                if v > max_v {
+                    max_v = v;
+                }
+            }
+            let span = max_v - min_v;
+            if span > best_span {
+                best_span = span;
+                best_dim = j;
+            }
+        }
+        best_dim
+    };
+
+    while leaves.len() < num_centers {
+        let mut split_pos = None;
+        let mut split_size = 0usize;
+        for (i, leaf) in leaves.iter().enumerate() {
+            if leaf.indices.len() > split_size && leaf.indices.len() > 1 {
+                split_size = leaf.indices.len();
+                split_pos = Some(i);
+            }
+        }
+        let Some(pos) = split_pos else {
+            break;
+        };
+
+        let leaf = leaves.swap_remove(pos);
+        let split_dim = choose_split_dim(&leaf.indices);
+        let mut sorted = leaf.indices;
+        sorted.sort_by(|&a, &b| {
+            let ord = data[[a, split_dim]].total_cmp(&data[[b, split_dim]]);
+            if ord.is_eq() { a.cmp(&b) } else { ord }
+        });
+        let mid = sorted.len() / 2;
+        let left = sorted[..mid].to_vec();
+        let right = sorted[mid..].to_vec();
+
+        if left.is_empty() || right.is_empty() {
+            leaves.push(Leaf { indices: sorted });
+            break;
+        }
+
+        leaves.push(Leaf { indices: left });
+        leaves.push(Leaf { indices: right });
+    }
+
+    if leaves.len() < num_centers {
+        return Err(BasisError::InvalidInput(format!(
+            "equal-mass partition produced {} leaves, expected {num_centers}",
+            leaves.len()
+        )));
+    }
+
     let mut centers = Array2::<f64>::zeros((num_centers, d));
-    for c in 0..num_centers {
-        let start = c * n / num_centers;
-        let end = ((c + 1) * n / num_centers).max(start + 1).min(n);
-        let mid = idx[(start + end - 1) / 2];
-        centers.row_mut(c).assign(&data.row(mid));
+    for (c, leaf) in leaves.iter().take(num_centers).enumerate() {
+        let m = leaf.indices.len() as f64;
+        let mut centroid = vec![0.0_f64; d];
+        for &idx in &leaf.indices {
+            for j in 0..d {
+                centroid[j] += data[[idx, j]];
+            }
+        }
+        for v in &mut centroid {
+            *v /= m.max(1.0);
+        }
+
+        let mut best_idx = leaf.indices[0];
+        let mut best_d2 = f64::INFINITY;
+        for &idx in &leaf.indices {
+            let mut d2 = 0.0;
+            for j in 0..d {
+                let delta = data[[idx, j]] - centroid[j];
+                d2 += delta * delta;
+            }
+            if d2 < best_d2 || (d2 == best_d2 && idx < best_idx) {
+                best_d2 = d2;
+                best_idx = idx;
+            }
+        }
+        centers.row_mut(c).assign(&data.row(best_idx));
     }
     Ok(centers)
 }
@@ -1674,12 +1793,14 @@ fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Resul
         ));
     }
 
-    // Here x = κ r with κ = 1/length_scale.
-    // For half-integer ν, the Matérn kernel admits closed forms:
-    //   ν=1/2: exp(-x)
-    //   ν=3/2: (1+x) exp(-x)
-    //   ν=5/2: (1+x+x^2/3) exp(-x)
-    // matching the standard Bessel-K reductions used in the spec.
+    // Parameterization used here:
+    //   x = r / length_scale
+    //   a = sqrt(2ν) * x
+    // and the half-integer Matérn closed forms are in terms of `a`:
+    //   ν=1/2: exp(-a)
+    //   ν=3/2: (1+a) exp(-a)
+    //   ν=5/2: (1+a+a^2/3) exp(-a)
+    // (for ν=1/2, a=x since sqrt(2ν)=1).
     let x = r / length_scale;
     let k = match nu {
         MaternNu::Half => (-x).exp(),
@@ -1816,6 +1937,249 @@ fn bessel_k1_stable(x: f64) -> f64 {
 
 const DUCHON_SERIES_Z_CUTOFF: f64 = 1.0;
 const DUCHON_ASYMPTOTIC_Z_CUTOFF: f64 = 35.0;
+
+#[inline(always)]
+fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usize {
+    match order {
+        DuchonNullspaceOrder::Zero => 0,
+        DuchonNullspaceOrder::Linear => 1,
+    }
+}
+
+#[inline(always)]
+fn duchon_s_from_nu(nu: MaternNu) -> usize {
+    // Map half-integer nu values to integer s in the spectral factor
+    // (kappa^2 + |w|^2)^s. This preserves a compact API while enabling the
+    // general integer (p,s,k) construction.
+    match nu {
+        MaternNu::Half => 1,
+        MaternNu::ThreeHalves => 2,
+        MaternNu::FiveHalves => 3,
+        MaternNu::SevenHalves => 4,
+        MaternNu::NineHalves => 5,
+    }
+}
+
+#[inline(always)]
+fn binomial_f64(n: usize, k: usize) -> f64 {
+    if k > n {
+        return 0.0;
+    }
+    if k == 0 || k == n {
+        return 1.0;
+    }
+    let kk = k.min(n - k);
+    let mut c = 1.0_f64;
+    for i in 0..kk {
+        c *= (n - i) as f64;
+        c /= (i + 1) as f64;
+    }
+    c
+}
+
+#[inline(always)]
+fn gamma_lanczos(x: f64) -> f64 {
+    // Numerical Recipes / Lanczos approximation with reflection formula.
+    const G: f64 = 7.0;
+    const P: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_571e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if x < 0.5 {
+        let pix = std::f64::consts::PI * x;
+        return std::f64::consts::PI / (pix.sin() * gamma_lanczos(1.0 - x));
+    }
+    let z = x - 1.0;
+    let mut a = P[0];
+    for (i, coeff) in P.iter().enumerate().skip(1) {
+        a += coeff / (z + i as f64);
+    }
+    let t = z + G + 0.5;
+    (2.0 * std::f64::consts::PI).sqrt() * t.powf(z + 0.5) * (-t).exp() * a
+}
+
+#[inline(always)]
+fn bessel_k_integer_order(n: usize, z: f64) -> f64 {
+    let zz = z.max(1e-300);
+    if n == 0 {
+        return bessel_k0_stable(zz);
+    }
+    if n == 1 {
+        return bessel_k1_stable(zz);
+    }
+    let mut km1 = bessel_k0_stable(zz);
+    let mut k = bessel_k1_stable(zz);
+    for m in 1..n {
+        let kp1 = km1 + 2.0 * (m as f64) * k / zz;
+        km1 = k;
+        k = kp1;
+    }
+    k
+}
+
+#[inline(always)]
+fn bessel_k_half_integer_order(l: usize, z: f64) -> f64 {
+    // K_{l+1/2}(z) = sqrt(pi/(2z)) exp(-z) * sum_{j=0}^l c_j (1/(2z))^j
+    // where c_j = (l+j)! / (j! (l-j)!).
+    let zz = z.max(1e-300);
+    let inv2z = 0.5 / zz;
+    let mut sum = 0.0_f64;
+    for j in 0..=l {
+        let coeff = gamma_lanczos((l + j + 1) as f64)
+            / (gamma_lanczos((j + 1) as f64) * gamma_lanczos((l - j + 1) as f64));
+        sum += coeff * inv2z.powi(j as i32);
+    }
+    (std::f64::consts::PI / (2.0 * zz)).sqrt() * (-zz).exp() * sum
+}
+
+#[inline(always)]
+fn bessel_k_real_half_integer_or_integer(nu_abs: f64, z: f64) -> Result<f64, BasisError> {
+    let two_nu = (2.0 * nu_abs).round();
+    if (two_nu - 2.0 * nu_abs).abs() > 1e-12 {
+        return Err(BasisError::InvalidInput(format!(
+            "unsupported Bessel-K order ν={nu_abs}; only integer/half-integer orders are supported"
+        )));
+    }
+    let two_nu_i = two_nu as i64;
+    if two_nu_i % 2 == 0 {
+        let n = (two_nu_i / 2).max(0) as usize;
+        Ok(bessel_k_integer_order(n, z))
+    } else {
+        let l = ((two_nu_i - 1) / 2).max(0) as usize;
+        Ok(bessel_k_half_integer_order(l, z))
+    }
+}
+
+#[inline(always)]
+fn duchon_polyharmonic_block(r: f64, m: usize, k_dim: usize) -> f64 {
+    if r <= 0.0 {
+        return 0.0;
+    }
+    let k_half = 0.5 * k_dim as f64;
+    let power_i = 2_i64 * (m as i64) - (k_dim as i64);
+    let power_f = power_i as f64;
+    // Log case: k even and m >= k/2 (gamma pole in generic power form).
+    if k_dim % 2 == 0 && m >= (k_dim / 2) {
+        let c = ((-1.0_f64).powi(m as i32))
+            / (2.0_f64.powi((2 * m - 1) as i32)
+                * std::f64::consts::PI.powf(k_half)
+                * gamma_lanczos(m as f64)
+                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+        return c * r.powf(power_f) * r.max(1e-300).ln();
+    }
+    let c = gamma_lanczos(k_half - m as f64)
+        / (4.0_f64.powi(m as i32) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m as f64));
+    c * r.powf(power_f)
+}
+
+#[inline(always)]
+fn duchon_matern_block(
+    r: f64,
+    kappa: f64,
+    n_order: usize,
+    k_dim: usize,
+) -> Result<f64, BasisError> {
+    let n = n_order as f64;
+    let k_half = 0.5 * k_dim as f64;
+    let nu = n - k_half;
+    let nu_abs = nu.abs();
+    let c = kappa.powf(k_half - n)
+        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
+    if r <= 0.0 {
+        if nu_abs > 0.0 && nu > 0.0 {
+            // lim_{z->0} z^nu K_nu(z) = 2^{nu-1} Γ(nu), nu>0.
+            return Ok(c * 2.0_f64.powf(nu - 1.0) * gamma_lanczos(nu));
+        }
+        // Borderline/singular cases use intrinsic convention on the diagonal.
+        return Ok(0.0);
+    }
+    let z = (kappa * r).max(1e-300);
+    let k_nu = bessel_k_real_half_integer_or_integer(nu_abs, z)?;
+    Ok(c * r.powf(nu) * k_nu)
+}
+
+#[inline(always)]
+fn duchon_partial_fraction_coeffs(
+    p_order: usize,
+    s_order: usize,
+    kappa: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    // 1/(ρ^{2p}(κ²+ρ²)^s) = Σ a_m/ρ^{2m} + Σ b_n/(κ²+ρ²)^n
+    let mut a = vec![0.0_f64; p_order + 1]; // 1-based m
+    let mut b = vec![0.0_f64; s_order + 1]; // 1-based n
+    for m in 1..=p_order {
+        let sign = if (p_order - m) % 2 == 0 { 1.0 } else { -1.0 };
+        let expo = -2.0 * (s_order + p_order - m) as f64;
+        let comb = binomial_f64(s_order + p_order - m - 1, p_order - m);
+        a[m] = sign * kappa.powf(expo) * comb;
+    }
+    for n in 1..=s_order {
+        let sign = if p_order % 2 == 0 { 1.0 } else { -1.0 };
+        let expo = -2.0 * (p_order + s_order - n) as f64;
+        let comb = if p_order == 0 && n == s_order {
+            // p=0 reduces to the pure Matérn block 1/(κ²+ρ²)^s.
+            1.0
+        } else {
+            let top = p_order + s_order - n - 1;
+            binomial_f64(top, s_order - n)
+        };
+        b[n] = sign * kappa.powf(expo) * comb;
+    }
+    (a, b)
+}
+
+fn duchon_matern_kernel_general_from_distance(
+    r: f64,
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+) -> Result<f64, BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon-Matern kernel distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon-Matern length_scale must be finite and positive".to_string(),
+        ));
+    }
+    let kappa = 1.0 / length_scale;
+    // Preserve the exact validated closed-form branch for the original primary case.
+    if p_order == 1 && s_order == 4 && k_dim == 10 {
+        return duchon_matern_kernel_p1_s4_k10_from_distance(r, length_scale);
+    }
+
+    // For intrinsic p>0 kernels, diagonal values are not uniquely defined in the
+    // generalized-kernel sense; use intrinsic convention.
+    if r == 0.0 && p_order > 0 {
+        return Ok(0.0);
+    }
+
+    let (a, b) = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let mut val = 0.0_f64;
+    for (m, coeff) in a.iter().enumerate().skip(1) {
+        if *coeff == 0.0 {
+            continue;
+        }
+        val += coeff * duchon_polyharmonic_block(r, m, k_dim);
+    }
+    for (n, coeff) in b.iter().enumerate().skip(1) {
+        if *coeff == 0.0 {
+            continue;
+        }
+        val += coeff * duchon_matern_block(r, kappa, n, k_dim)?;
+    }
+    Ok(val)
+}
 
 #[inline(always)]
 fn duchon_matern_p1_s4_k10_asymptotic(z: f64) -> f64 {
@@ -2200,28 +2564,28 @@ pub fn build_matern_basis(
     })
 }
 
-/// Creates a Duchon-like basis:
-/// P(w) = ||w||^(2p) * (kappa^2 + ||w||^2)^s
-/// implemented with:
-/// - exact primary-case Duchon-Matern radial block for (p=1, s=4, k=10)
-/// - explicit polynomial null-space block determined by `nullspace_order`
-/// - side-constraint projection `P(centers)^T alpha = 0` for `p > 0`
+/// Creates a Duchon-like basis with spectral penalty
+///   P(w) = ||w||^(2p) * (kappa^2 + ||w||^2)^s
+/// using:
+/// - integer-parameter partial-fraction decomposition in spectral space,
+/// - finite spatial kernel sum of polyharmonic + Matérn blocks,
+/// - explicit polynomial null-space block determined by `nullspace_order`,
+/// - side-constraint projection `P(centers)^T alpha = 0` for `p > 0`.
 ///
-/// IMPLEMENTATION NOTE:
-/// For production we evaluate the primary-case kernel via explicit small/medium/large
-/// argument formulas (series + exact closed form + asymptotic), not via direct Hankel
-/// quadrature. This keeps O(M^2) kernel assembly and optimizer derivatives stable.
+/// API mapping:
+/// - `p` is determined by `nullspace_order`:
+///   - `Zero`   -> p = 0
+///   - `Linear` -> p = 1
+/// - `s` is determined by `nu`:
+///   - `Half`         -> s = 1
+///   - `ThreeHalves`  -> s = 2
+///   - `FiveHalves`   -> s = 3
+///   - `SevenHalves`  -> s = 4
+///   - `NineHalves`   -> s = 5
 ///
-/// The finite integral
-///   K(r) = (1/96) ∫_0^1 u^3 K0(kappa * r * sqrt(u)) du
-/// is used only in tests to validate the closed-form implementation.
-///
-/// Extension guidance for arbitrary integer (p,s):
-/// prefer the partial-fraction finite-sum construction
-///   K(r) = Σ a_m Φ_{k,m}(r) + Σ b_n M_{k,n,κ}(r)
-/// (polyharmonic + Matérn blocks), rather than runtime oscillatory quadrature.
-/// The full arbitrary-(p,s,k) family is not yet implemented; unsupported
-/// configurations currently return an explicit error.
+/// For the historical primary case `(p=1, s=4, k=10)` we retain the exact
+/// specialized branch (series + closed-form + asymptotic) for speed and
+/// numerical stability near the Sobolev boundary.
 pub fn create_duchon_spline_basis(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -2261,16 +2625,22 @@ pub fn create_duchon_spline_basis(
     // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.
     let z = kernel_constraint_nullspace(centers, nullspace_order)?;
 
-    let use_primary_exact = d == 10 && matches!(nullspace_order, DuchonNullspaceOrder::Linear);
-    if !use_primary_exact {
-        return Err(BasisError::InvalidInput(format!(
-            "exact Duchon-Matern kernel is currently implemented only for k=10, p=1, s=4 (Linear nullspace); got d={d}, nullspace_order={nullspace_order:?}"
-        )));
+    let p_order = duchon_p_from_nullspace_order(nullspace_order);
+    let s_order = duchon_s_from_nu(nu);
+
+    // Point-evaluation sufficiency check: 2p + 2s > k for a proper RKHS kernel.
+    // For intrinsic constructions (p>0), borderline or subcritical settings may
+    // still be usable with side constraints, but can become numerically delicate.
+    let regularity_margin = 2 * p_order + 2 * s_order;
+    if regularity_margin <= d {
+        log::warn!(
+            "Duchon regularity is at/below point-evaluation threshold: 2p+2s={} <= k={} (p={}, s={}); using intrinsic diagonal convention",
+            regularity_margin,
+            d,
+            p_order,
+            s_order
+        );
     }
-    // Important: this enforced primary case is the documented/validated path.
-    // If we add general (p,s,k), we should maintain the same architecture:
-    // closed-form finite sums + constrained Gram penalties, not per-entry
-    // numerical Hankel integration.
 
     // Practical safe operating range (document Eq. D.2):
     //   κ in [1e-2 / r_max, 1e2 / r_min]
@@ -2304,8 +2674,13 @@ pub fn create_duchon_spline_basis(
                     let delta = data[[i, c]] - centers[[j, c]];
                     dist2 += delta * delta;
                 }
-                let _ = nu; // Retained in signature for API compatibility.
-                row[j] = duchon_matern_kernel_p1_s4_k10_from_distance(dist2.sqrt(), length_scale)?;
+                row[j] = duchon_matern_kernel_general_from_distance(
+                    dist2.sqrt(),
+                    length_scale,
+                    p_order,
+                    s_order,
+                    d,
+                )?;
             }
             Ok(())
         });
@@ -2319,8 +2694,13 @@ pub fn create_duchon_spline_basis(
                 let delta = centers[[i, c]] - centers[[j, c]];
                 dist2 += delta * delta;
             }
-            let _ = nu; // Retained in signature for API compatibility.
-            let kij = duchon_matern_kernel_p1_s4_k10_from_distance(dist2.sqrt(), length_scale)?;
+            let kij = duchon_matern_kernel_general_from_distance(
+                dist2.sqrt(),
+                length_scale,
+                p_order,
+                s_order,
+                d,
+            )?;
             center_kernel[[i, j]] = kij;
             center_kernel[[j, i]] = kij;
         }
@@ -3713,6 +4093,52 @@ mod tests {
     }
 
     #[test]
+    fn test_equal_mass_centers_uses_non_first_dimensions() {
+        // Regression guard for the prior bug where equal-mass partitioning only
+        // looked at column 0 (PC1), which made center selection invariant to all
+        // other coordinates.
+        //
+        // We construct two datasets with identical first coordinate and different
+        // second-coordinate layouts. If selection used only column 0, both outputs
+        // would be identical. The recursive alternating-dimension splitter should
+        // produce different center sets.
+        let mut data_a = Array2::<f64>::zeros((16, 2));
+        let mut data_b = Array2::<f64>::zeros((16, 2));
+        for i in 0..16 {
+            data_a[[i, 0]] = i as f64;
+            data_b[[i, 0]] = i as f64;
+        }
+
+        // First x-half: same x, different y ordering.
+        // A: interleaved low/high; B: grouped low then high.
+        let y_a_h1 = [0.0, 100.0, 1.0, 101.0, 2.0, 102.0, 3.0, 103.0];
+        let y_b_h1 = [0.0, 1.0, 2.0, 3.0, 100.0, 101.0, 102.0, 103.0];
+        // Second x-half: same pattern shifted to keep deterministic separation.
+        let y_a_h2 = [10.0, 110.0, 11.0, 111.0, 12.0, 112.0, 13.0, 113.0];
+        let y_b_h2 = [10.0, 11.0, 12.0, 13.0, 110.0, 111.0, 112.0, 113.0];
+
+        for i in 0..8 {
+            data_a[[i, 1]] = y_a_h1[i];
+            data_b[[i, 1]] = y_b_h1[i];
+            data_a[[i + 8, 1]] = y_a_h2[i];
+            data_b[[i + 8, 1]] = y_b_h2[i];
+        }
+
+        let ca = select_equal_mass_centers(data_a.view(), 4).unwrap();
+        let cb = select_equal_mass_centers(data_b.view(), 4).unwrap();
+
+        let mut xa: Vec<f64> = ca.column(0).iter().copied().collect();
+        let mut xb: Vec<f64> = cb.column(0).iter().copied().collect();
+        xa.sort_by(f64::total_cmp);
+        xb.sort_by(f64::total_cmp);
+
+        assert_ne!(
+            xa, xb,
+            "equal-mass center selection unexpectedly ignored non-first dimensions"
+        );
+    }
+
+    #[test]
     fn test_build_bspline_basis_1d_double_penalty() {
         let x = Array::linspace(0.0, 1.0, 32);
         let spec = BSplineBasisSpec {
@@ -4554,23 +4980,20 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_non_primary_case_returns_error() {
+    fn test_duchon_non_primary_case_builds_with_general_kernel() {
         let data = Array2::<f64>::zeros((4, 3));
         let centers = Array2::<f64>::zeros((3, 3));
-        let err = create_duchon_spline_basis(
+        let out = create_duchon_spline_basis(
             data.view(),
             centers.view(),
             1.0,
             MaternNu::Half,
             DuchonNullspaceOrder::Linear,
         )
-        .expect_err("non-primary Duchon config should fail explicitly");
-        match err {
-            BasisError::InvalidInput(msg) => {
-                assert!(msg.contains("exact Duchon-Matern kernel"));
-            }
-            _ => panic!("unexpected error type: {err:?}"),
-        }
+        .expect("general integer (p,s,k) Duchon kernel should build");
+        assert_eq!(out.dimension, 3);
+        assert_eq!(out.basis.nrows(), 4);
+        assert_eq!(out.penalty_kernel.nrows(), out.penalty_kernel.ncols());
     }
 
     #[test]
@@ -4631,6 +5054,64 @@ mod tests {
         let (r_min, r_max) = pairwise_distance_bounds(pts.view()).expect("bounds should exist");
         assert!((r_min - 5.0).abs() < 1e-12);
         assert!((r_max - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_duchon_general_kernel_symmetric_and_finite() {
+        let n = 7usize;
+        let d = 5usize;
+        let k = 5usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        let mut centers = Array2::<f64>::zeros((k, d));
+        for i in 0..n {
+            for j in 0..d {
+                data[[i, j]] = 0.03 * (i as f64 + 1.0) * (j as f64 + 0.5);
+            }
+        }
+        for i in 0..k {
+            for j in 0..d {
+                centers[[i, j]] = 0.07 * (i as f64 + 0.2) * (j as f64 + 0.8);
+            }
+        }
+        let out = create_duchon_spline_basis(
+            data.view(),
+            centers.view(),
+            0.9,
+            MaternNu::NineHalves,         // s=5
+            DuchonNullspaceOrder::Linear, // p=1
+        )
+        .expect("general Duchon basis should build");
+        assert!(out.basis.iter().all(|v| v.is_finite()));
+        assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
+        for i in 0..out.penalty_kernel.nrows() {
+            for j in 0..out.penalty_kernel.ncols() {
+                let a = out.penalty_kernel[[i, j]];
+                let b = out.penalty_kernel[[j, i]];
+                assert!((a - b).abs() < 1e-8, "kernel penalty must be symmetric");
+            }
+        }
+    }
+
+    #[test]
+    fn test_duchon_general_p0_case_builds() {
+        let data = array![
+            [0.0, 0.1, 0.2, 0.3],
+            [0.2, 0.0, 0.1, 0.5],
+            [0.4, 0.2, 0.3, 0.1],
+            [0.6, 0.4, 0.5, 0.2],
+            [0.8, 0.5, 0.7, 0.4]
+        ];
+        let centers = data.slice(s![0..4, ..]).to_owned();
+        let out = create_duchon_spline_basis(
+            data.view(),
+            centers.view(),
+            1.2,
+            MaternNu::SevenHalves,      // s=4
+            DuchonNullspaceOrder::Zero, // p=0
+        )
+        .expect("p=0 Duchon case should build");
+        assert_eq!(out.num_polynomial_basis, 0);
+        assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
     }
 }
 
