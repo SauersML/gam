@@ -1085,6 +1085,145 @@ pub fn run_logit_polya_gamma_gibbs(
     })
 }
 
+/// Estimate E_{ω|y,ρ}[ tr(S_k Q^{-1}) + μᵀ S_k μ ] with PG Gibbs + Rao-Blackwellization.
+///
+/// For each retained Gibbs state ω:
+///   Q = S + Xᵀ diag(ω) X,  μ = Q^{-1} Xᵀ(y-1/2),
+/// and with S_k = R_kᵀ R_k:
+///   tr(S_k Q^{-1}) + μᵀ S_k μ
+/// = tr(R_k Q^{-1} R_kᵀ) + ||R_k μ||².
+///
+/// Returns one expectation per penalty block k, averaged over retained draws.
+pub fn estimate_logit_pg_rao_blackwell_terms(
+    x: ArrayView2<f64>,
+    y: ArrayView1<f64>,
+    weights: ArrayView1<f64>,
+    penalty_matrix: ArrayView2<f64>,
+    mode: ArrayView1<f64>,
+    penalty_roots: &[Array2<f64>],
+    config: &NutsConfig,
+) -> Result<Array1<f64>, String> {
+    let n = x.nrows();
+    let p = x.ncols();
+    if y.len() != n || weights.len() != n {
+        return Err("estimate_logit_pg_rao_blackwell_terms: input length mismatch".to_string());
+    }
+    if mode.len() != p || penalty_matrix.nrows() != p || penalty_matrix.ncols() != p {
+        return Err(
+            "estimate_logit_pg_rao_blackwell_terms: coefficient/penalty dimension mismatch"
+                .to_string(),
+        );
+    }
+    if !weights.iter().all(|w| (*w - 1.0).abs() <= 1e-10) {
+        return Err(
+            "estimate_logit_pg_rao_blackwell_terms requires unit weights (PG(1,·))".to_string(),
+        );
+    }
+    if penalty_roots.iter().any(|r| r.ncols() != p) {
+        return Err("estimate_logit_pg_rao_blackwell_terms: root width mismatch".to_string());
+    }
+
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let n_iter = config.n_warmup + config.n_samples;
+
+    // Logistic PG identity uses kappa_i = y_i - 1/2 so that
+    // b = X^T kappa in the Gaussian conditional for beta|omega.
+    let mut kappa = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        kappa[i] = y[i] - 0.5;
+    }
+    let rhs_b = fast_atv(&x, &kappa);
+
+    let penalty = penalty_matrix.to_owned();
+    let mut eta = Array1::<f64>::zeros(n);
+    let mut omega = Array1::<f64>::ones(n);
+    let mut xw = x.to_owned();
+    let mut xt_omega_x = Array2::<f64>::zeros((p, p));
+    let mut q = Array2::<f64>::zeros((p, p));
+    let mut mean = Array1::<f64>::zeros(p);
+    let mut rb_sum = Array1::<f64>::zeros(penalty_roots.len());
+
+    let mut kept = 0usize;
+    for chain in 0..config.n_chains {
+        let mut pg_rng = StdRng08::seed_from_u64(
+            config.seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul((chain as u64) + 1)),
+        );
+        let pg = PolyaGamma::new(1.0);
+        let mut beta = mode.to_owned();
+        for j in 0..p {
+            beta[j] += 0.05 * sample_standard_normal(&mut rng);
+        }
+
+        for iter in 0..n_iter {
+            eta.assign(&x.dot(&beta));
+            for i in 0..n {
+                omega[i] = pg.draw(&mut pg_rng, eta[i]).max(1e-12);
+            }
+
+            for i in 0..n {
+                let s = omega[i].sqrt();
+                for j in 0..p {
+                    xw[[i, j]] = x[[i, j]] * s;
+                }
+            }
+            fast_ata_into(&xw, &mut xt_omega_x);
+
+            // Conditional precision:
+            //   Q = S + X^T diag(omega) X.
+            q.assign(&penalty);
+            q += &xt_omega_x;
+
+            let factor = q
+                .cholesky(Side::Lower)
+                .map_err(|e| format!("PG Rao-Blackwell failed to factor Q: {:?}", e))?;
+            // Conditional mean:
+            //   mu = Q^{-1} b,  b = X^T(y - 1/2).
+            mean.assign(&factor.solve_vec(&rhs_b));
+
+            // Draw beta for the next Gibbs state.
+            let mut z = Array1::<f64>::zeros(p);
+            let mut noise = Array1::<f64>::zeros(p);
+            for j in 0..p {
+                z[j] = sample_standard_normal(&mut rng);
+            }
+            let l = factor.lower_triangular();
+            forward_solve_lower_triangular(&l, &z, &mut noise);
+            beta.assign(&(&mean + &noise));
+
+            if iter < config.n_warmup {
+                continue;
+            }
+            kept += 1;
+
+            for (k, r_k) in penalty_roots.iter().enumerate() {
+                if r_k.nrows() == 0 {
+                    continue;
+                }
+
+                // mu^T S_k mu via root form S_k = R_k^T R_k.
+                let r_mu = r_k.dot(&mean);
+                let mu_quad = r_mu.dot(&r_mu);
+
+                let mut trace_term = 0.0_f64;
+                for row_idx in 0..r_k.nrows() {
+                    let row = r_k.row(row_idx).to_owned();
+                    // tr(S_k Q^{-1}) = tr(R_k Q^{-1} R_k^T)
+                    //                = sum_j r_j^T Q^{-1} r_j.
+                    let solved = factor.solve_vec(&row);
+                    trace_term += row.dot(&solved);
+                }
+
+                rb_sum[k] += trace_term + mu_quad;
+            }
+        }
+    }
+
+    if kept == 0 {
+        return Err("estimate_logit_pg_rao_blackwell_terms: no retained samples".to_string());
+    }
+    Ok(rb_sum.mapv(|v| v / (kept as f64)))
+}
+
 /// Runs NUTS sampling using general-mcmc with whitened parameter space.
 ///
 /// # Arguments

@@ -1452,8 +1452,17 @@ where
 /// - `value = V(rho)`
 /// - `grad_rho = dV/drho` (same dimension/order as `rho`)
 ///
-/// Internally we optimize in unconstrained `z` coordinates and apply the chain rule:
-///   grad_z = diag(drho_dz) * grad_rho.
+/// Internally we optimize in unconstrained `z` coordinates:
+/// - `rho = to_rho_from_z(z)` (bounded/smoothed map used by this module)
+/// - chain rule for BFGS objective gradient:
+///   `grad_z = diag(drho_dz(rho)) * grad_rho`.
+///
+/// Why this exists:
+/// - finite-difference outer gradients require repeated inner solves per coordinate,
+/// - exact outer gradients can be injected directly here,
+/// - multi-start seed handling and stationarity ranking remain identical to the
+///   FD-based optimizer, so behavior is comparable while much faster when exact
+///   gradients are available.
 pub fn optimize_log_smoothing_with_multistart_with_gradient<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
@@ -1487,6 +1496,8 @@ where
     for (idx, rho_seed) in seeds.iter().enumerate() {
         let initial_z = to_z_from_rho(rho_seed);
         let mut optimizer = Bfgs::new(initial_z.clone(), |z| {
+            // Evaluate objective in rho-space, then map gradient to z-space so
+            // Wolfe-BFGS operates on a consistent unconstrained parameterization.
             let rho = to_rho_from_z(z);
             match objective_with_gradient(&rho) {
                 Ok((cost, grad_rho)) => {
@@ -1494,6 +1505,8 @@ where
                     let mut grad_z = &grad_rho * &jac;
                     for g in grad_z.iter_mut() {
                         if !g.is_finite() {
+                            // Keep the line search stable if the callback emits
+                            // a non-finite coordinate near parameter bounds.
                             *g = 0.0;
                         }
                     }
@@ -1520,6 +1533,8 @@ where
             Ok((_, g)) => g,
             Err(_) => Array1::<f64>::zeros(rho.len()),
         };
+        // Apply the same post-projection used by the FD path so candidate
+        // stationarity is judged under identical boundary rules.
         project_rho_gradient(&rho, &mut grad_rho);
         let grad_norm = grad_rho.dot(&grad_rho).sqrt();
         let stationary = grad_norm <= options.tol.max(1e-6);
@@ -4935,6 +4950,8 @@ pub mod internal {
         ///   ∂_{ρ_k} log L
         ///   = -0.5 * exp(ρ_k) *
         ///     E_{ω|y,ρ}[ tr(S_k Q^{-1}) + μᵀ S_k μ ],  μ=Q^{-1}b.
+        /// Equivalently, since β|ω,y,ρ ~ N(μ,Q^{-1}):
+        ///   E[βᵀS_kβ | ω,y,ρ] = tr(S_k Q^{-1}) + μᵀS_kμ.
         ///
         /// For Poisson-log, exact Mellin-Barnes / multi-index reductions exist,
         /// yielding exact (but high-dimensional) contour integrals / series after
@@ -5893,11 +5910,34 @@ pub mod internal {
             p: &Array1<f64>,
             bundle: &EvalShared,
         ) -> Result<Array1<f64>, EstimationError> {
-            // Exact identity used here (for minimization cost with log-penalty normalization):
-            //   ∂Cost/∂ρ_k = 0.5 * λ_k * E_post[βᵀ S_k β] - 0.5 * λ_k * tr(S^+ S_k).
-            // We estimate E_post[·] from posterior samples at fixed ρ.
+            // Derivation sketch (sign convention used by this minimization objective):
             //
-            // This evaluates the exact identity using posterior samples at fixed ρ.
+            // 1) Penalized evidence identity (logit):
+            //      Z(ρ) = ∫ exp(l(β) - 0.5 βᵀS(ρ)β) dβ,   S(ρ)=Σ_j exp(ρ_j) S_j.
+            //
+            // 2) Fisher/PG identity for each coordinate:
+            //      ∂/∂ρ_k log Z(ρ) = -0.5 * λ_k * E_{π(β|y,ρ)}[βᵀ S_k β],   λ_k=exp(ρ_k).
+            //
+            // 3) This code optimizes a cost that includes the pseudo-determinant
+            //    normalization of the improper Gaussian penalty, yielding:
+            //      g_k = ∂Cost/∂ρ_k
+            //          = 0.5 * λ_k * E[βᵀS_kβ] - 0.5 * λ_k * tr(S(ρ)^+ S_k).
+            //
+            // 4) Root-factor rewrite used numerically:
+            //      S_k = R_kᵀR_k  =>  βᵀS_kβ = ||R_kβ||².
+            //
+            // 5) Implementation mapping:
+            //      PG-Rao-Blackwell average of tr(S_kQ^{-1})+μᵀS_kμ -> E[βᵀS_kβ],
+            //      det1_values[k]                                 -> λ_k tr(S(ρ)^+S_k),
+            //      grad[k]                                        -> g_k.
+            // Equation-to-code map for this fallback path (logit, fixed ρ):
+            //   g_k := ∂Cost/∂ρ_k
+            //      = 0.5 * λ_k * E_{π(β|y,ρ)}[βᵀ S_k β]
+            //        - 0.5 * λ_k * tr(S(ρ)^+ S_k),
+            //   λ_k = exp(ρ_k).
+            //
+            // The first expectation is evaluated by PG Gibbs + Rao-Blackwellization.
+            // The second term is deterministic via structural pseudo-logdet derivatives.
             let pirls_result = bundle.pirls_result.as_ref();
             let beta_mode = pirls_result.beta_transformed.as_ref();
             let s_transformed = &pirls_result.reparam_result.s_transformed;
@@ -5907,32 +5947,21 @@ pub mod internal {
             let weights = self.weights;
             let h_eff = bundle.h_eff.as_ref();
 
-            let mcmc_cfg = crate::hmc::NutsConfig {
-                n_samples: 120,
-                n_warmup: 160,
+            // PG-Gibbs Rao-Blackwell fallback: fewer samples are needed than β-NUTS
+            // because each retained ω state contributes the analytic conditional moment
+            // tr(S_k Q^{-1}) + μᵀ S_k μ instead of a raw quadratic draw.
+            let pg_cfg = crate::hmc::NutsConfig {
+                n_samples: 24,
+                n_warmup: 48,
                 n_chains: 2,
                 target_accept: 0.85,
                 seed: 17_391,
             };
 
-            let nuts_result = crate::hmc::run_nuts_sampling_flattened_family(
-                crate::types::LikelihoodFamily::BinomialLogit,
-                crate::hmc::FamilyNutsInputs::Glm(crate::hmc::GlmFlatInputs {
-                    x: x_dense.view(),
-                    y,
-                    weights,
-                    penalty_matrix: s_transformed.view(),
-                    mode: beta_mode.view(),
-                    hessian: h_eff.view(),
-                    firth_bias_reduction: self.config.firth_bias_reduction,
-                }),
-                &mcmc_cfg,
-            )
-            .map_err(EstimationError::InvalidInput)?;
-
             let len = p.len();
             let mut lambda = Array1::<f64>::zeros(len);
             for k in 0..len {
+                // Outer parameters are ρ; penalties are λ = exp(ρ).
                 lambda[k] = p[k].exp();
             }
 
@@ -5942,29 +5971,73 @@ pub mod internal {
                 pirls_result.reparam_result.e_transformed.nrows(),
                 bundle.ridge_passport.penalty_logdet_ridge(),
             )?;
+            // det1_values[k] = ∂ log|S(ρ)|_+ / ∂ρ_k = λ_k tr(S(ρ)^+ S_k).
 
-            let samples = &nuts_result.samples;
-            let n_draws = samples.nrows().max(1);
-            let mut expected_quad = vec![0.0_f64; len];
-            for draw in 0..samples.nrows() {
-                let beta_draw = samples.row(draw).to_owned();
-                for k in 0..len {
-                    let r_k = &pirls_result.reparam_result.rs_transformed[k];
-                    let r_beta = r_k.dot(&beta_draw);
-                    expected_quad[k] += r_beta.dot(&r_beta);
-                }
-            }
-            let inv_draws = 1.0 / (n_draws as f64);
-            for v in &mut expected_quad {
-                *v *= inv_draws;
-            }
+            let rb_terms_result = crate::hmc::estimate_logit_pg_rao_blackwell_terms(
+                x_dense.view(),
+                y,
+                weights,
+                s_transformed.view(),
+                beta_mode.view(),
+                &pirls_result.reparam_result.rs_transformed,
+                &pg_cfg,
+            );
 
             let mut grad = Array1::<f64>::zeros(len);
-            for k in 0..len {
-                // Exact identity for minimization cost with normalized penalty:
-                //   ∂Cost/∂ρ_k = 0.5 λ_k E[βᵀ S_k β] - 0.5 λ_k tr(S^+ S_k)
-                // and det1_values[k] already stores λ_k tr(S^+ S_k).
-                grad[k] = 0.5 * lambda[k] * expected_quad[k] - 0.5 * det1_values[k];
+            if let Ok(rb_terms) = rb_terms_result {
+                for k in 0..len {
+                    // Rao-Blackwellized exact identity:
+                    //   g_k = 0.5 * λ_k * E_ω[ tr(S_k Q^{-1}) + μᵀ S_k μ ] - 0.5 * det1_values[k].
+                    grad[k] = 0.5 * lambda[k] * rb_terms[k] - 0.5 * det1_values[k];
+                }
+            } else {
+                let err = rb_terms_result.err().unwrap_or_else(|| "unknown PG error".to_string());
+                log::warn!(
+                    "[REML] PG Rao-Blackwell fallback failed ({}); reverting to NUTS beta averaging",
+                    err
+                );
+
+                let nuts_cfg = crate::hmc::NutsConfig {
+                    n_samples: 120,
+                    n_warmup: 160,
+                    n_chains: 2,
+                    target_accept: 0.85,
+                    seed: 17_391,
+                };
+
+                let nuts_result = crate::hmc::run_nuts_sampling_flattened_family(
+                    crate::types::LikelihoodFamily::BinomialLogit,
+                    crate::hmc::FamilyNutsInputs::Glm(crate::hmc::GlmFlatInputs {
+                        x: x_dense.view(),
+                        y,
+                        weights,
+                        penalty_matrix: s_transformed.view(),
+                        mode: beta_mode.view(),
+                        hessian: h_eff.view(),
+                        firth_bias_reduction: self.config.firth_bias_reduction,
+                    }),
+                    &nuts_cfg,
+                )
+                .map_err(EstimationError::InvalidInput)?;
+
+                let samples = &nuts_result.samples;
+                let n_draws = samples.nrows().max(1);
+                let mut expected_quad = vec![0.0_f64; len];
+                for draw in 0..samples.nrows() {
+                    let beta_draw = samples.row(draw).to_owned();
+                    for k in 0..len {
+                        let r_k = &pirls_result.reparam_result.rs_transformed[k];
+                        let r_beta = r_k.dot(&beta_draw);
+                        expected_quad[k] += r_beta.dot(&r_beta);
+                    }
+                }
+                let inv_draws = 1.0 / (n_draws as f64);
+                for v in &mut expected_quad {
+                    *v *= inv_draws;
+                }
+                for k in 0..len {
+                    grad[k] = 0.5 * lambda[k] * expected_quad[k] - 0.5 * det1_values[k];
+                }
             }
             grad += &self.compute_soft_prior_grad(p);
             Ok(grad)
