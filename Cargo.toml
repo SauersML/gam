@@ -15,6 +15,8 @@ crossbeam-queue = "0.3.12"
 tokio = { version = "1.47.1", features = ["rt-multi-thread"] }
 num_cpus = "1.17.0"
 rand = "0.10.0"
+rand08 = { package = "rand", version = "0.8.5" }
+polya-gamma = "0.5.3"
 ryu = "1.0.20"
 crossbeam-channel = "0.5.15"
 indicatif = "0.18"

@@ -1,11 +1,10 @@
 use crate::estimate::EstimationError;
 use crate::estimate::FitResult;
-use crate::faer_ndarray::FaerArrayView;
+use crate::faer_ndarray::{FaerArrayView, factorize_symmetric_with_fallback};
 use crate::pirls;
 use crate::types::LinkFunction;
 use faer::Mat as FaerMat;
 use faer::linalg::matmul::matmul;
-use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use faer::{Accum, Par, Side};
 use ndarray::{Array1, Array2, ArrayView1, s};
 use std::cmp::Ordering;
@@ -103,28 +102,11 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let p = k.nrows();
     let k_view = FaerArrayView::new(&k);
 
-    enum Factor {
-        Llt(FaerLlt<f64>),
-        Ldlt(FaerLdlt<f64>),
-    }
-    impl Factor {
-        fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
-            match self {
-                Factor::Llt(f) => f.solve(rhs),
-                Factor::Ldlt(f) => f.solve(rhs),
-            }
-        }
-    }
-
-    let factor = if let Ok(f) = FaerLlt::new(k_view.as_ref(), Side::Lower) {
-        Factor::Llt(f)
-    } else {
-        Factor::Ldlt(FaerLdlt::new(k_view.as_ref(), Side::Lower).map_err(|_| {
+    let factor = factorize_symmetric_with_fallback(k_view.as_ref(), Side::Lower).map_err(|_| {
             EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
             }
-        })?)
-    };
+        })?;
 
     let xt = x_dense.t();
 
@@ -414,7 +396,8 @@ fn compute_alo_diagnostics_from_pirls_impl(
         AloSeMode::Conditional => se_bayes.clone(),
     };
     let mut sandwich_fallback_count = 0usize;
-    if matches!(options.se_mode, AloSeMode::Sandwich) && options.fallback_to_conditional_on_instability
+    if matches!(options.se_mode, AloSeMode::Sandwich)
+        && options.fallback_to_conditional_on_instability
     {
         for i in 0..n {
             if !sandwich_stable[i] {

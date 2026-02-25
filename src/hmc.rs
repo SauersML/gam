@@ -23,13 +23,15 @@
 //! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
 //! sharing across chains without duplication when general-mcmc clones the target.
 
-use crate::faer_ndarray::{FaerCholesky, fast_atv};
+use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
 use crate::types::LikelihoodFamily;
 use faer::Side;
 use general_mcmc::generic_hmc::HamiltonianTarget;
 use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation, NUTSMassMatrixConfig};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
+use polya_gamma::PolyaGamma;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+use rand08::{SeedableRng as SeedableRng08, rngs::StdRng as StdRng08};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -474,8 +476,12 @@ impl NutsPosterior {
 
 #[cfg(test)]
 mod tests {
-    use super::{JointLinkPosterior, JointSplineArtifacts, NutsPosterior};
+    use super::{
+        FamilyNutsInputs, GlmFlatInputs, JointLinkPosterior, JointSplineArtifacts, NutsConfig,
+        NutsPosterior, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
+    };
     use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
+    use crate::types::LikelihoodFamily;
     use ndarray::{Array2, array};
 
     #[test]
@@ -676,6 +682,69 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn logit_pg_gibbs_returns_finite_samples() {
+        let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
+        let y = array![1.0, 0.0, 1.0, 0.0];
+        let w = array![1.0, 1.0, 1.0, 1.0];
+        let penalty = array![[0.2, 0.0], [0.0, 0.4]];
+        let mode = array![0.0, 0.0];
+        let cfg = NutsConfig {
+            n_samples: 30,
+            n_warmup: 30,
+            n_chains: 2,
+            target_accept: 0.8,
+            seed: 123,
+        };
+        let out = run_logit_polya_gamma_gibbs(
+            x.view(),
+            y.view(),
+            w.view(),
+            penalty.view(),
+            mode.view(),
+            &cfg,
+        )
+        .expect("pg gibbs should run");
+        assert_eq!(out.samples.ncols(), 2);
+        assert_eq!(out.samples.nrows(), cfg.n_samples * cfg.n_chains);
+        assert!(out.samples.iter().all(|v| v.is_finite()));
+        assert!(out.posterior_mean.iter().all(|v| v.is_finite()));
+        assert!(out.posterior_std.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn family_dispatch_uses_pg_gibbs_for_standard_logit() {
+        let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
+        let y = array![1.0, 0.0, 1.0, 0.0];
+        let w = array![1.0, 1.0, 1.0, 1.0];
+        let penalty = array![[0.2, 0.0], [0.0, 0.4]];
+        let mode = array![0.0, 0.0];
+        let non_spd_hessian = array![[0.0, 0.0], [0.0, 0.0]];
+        let cfg = NutsConfig {
+            n_samples: 20,
+            n_warmup: 20,
+            n_chains: 2,
+            target_accept: 0.8,
+            seed: 456,
+        };
+        let out = run_nuts_sampling_flattened_family(
+            LikelihoodFamily::BinomialLogit,
+            FamilyNutsInputs::Glm(GlmFlatInputs {
+                x: x.view(),
+                y: y.view(),
+                weights: w.view(),
+                penalty_matrix: penalty.view(),
+                mode: mode.view(),
+                hessian: non_spd_hessian.view(),
+                firth_bias_reduction: false,
+            }),
+            &cfg,
+        )
+        .expect("dispatch should use PG Gibbs and not require Hessian factorization");
+        assert_eq!(out.samples.nrows(), cfg.n_samples * cfg.n_chains);
+        assert!(out.samples.iter().all(|v| v.is_finite()));
+    }
 }
 
 /// Implement HamiltonianTarget for NUTS with analytical gradients.
@@ -734,8 +803,8 @@ fn robust_survival_mass_matrix_config(dim: usize, n_warmup: usize) -> NUTSMassMa
     if n_warmup < 80 {
         return NUTSMassMatrixConfig::disabled();
     }
-    // Survival posteriors with censoring/rare events are often skewed; prefer diagonal
-    // adaptation for stability over aggressive dense fitting.
+    // Survival posteriors with censoring/rare events are often skewed; this
+    // configuration uses diagonal adaptation.
     let start_buffer = (n_warmup / 8).clamp(30, 180);
     let end_buffer = (n_warmup / 6).clamp(30, 180);
     let initial_window = (n_warmup / 10).clamp(25, 140);
@@ -855,6 +924,165 @@ impl NutsResult {
             values[upper_idx.min(n.saturating_sub(1))],
         )
     }
+}
+
+#[inline]
+fn sample_standard_normal<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
+    let u1 = rng.random::<f64>().max(1e-16);
+    let u2 = rng.random::<f64>();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+#[inline]
+fn forward_solve_lower_triangular(l: &Array2<f64>, rhs: &Array1<f64>, out: &mut Array1<f64>) {
+    let p = rhs.len();
+    debug_assert_eq!(l.nrows(), p);
+    debug_assert_eq!(l.ncols(), p);
+    debug_assert_eq!(out.len(), p);
+    for i in 0..p {
+        let mut v = rhs[i];
+        for j in 0..i {
+            v -= l[[i, j]] * out[j];
+        }
+        let d = l[[i, i]];
+        out[i] = if d.abs() > 1e-14 { v / d } else { 0.0 };
+    }
+}
+
+/// Runs a Pólya-Gamma Gibbs sampler for Bernoulli-logit models.
+///
+/// This sampler is gradient-free: each iteration alternates
+/// 1) ω_i | β, y ~ PG(1, x_i^T β), and
+/// 2) β | ω, y ~ N(Q^{-1} b, Q^{-1}), with Q = S + X^T diag(ω) X, b = X^T(y - 1/2).
+///
+/// For weighted data, this implementation is defined for weights ≈ 1.0 because it
+/// samples PG(1,·) latent variables.
+pub fn run_logit_polya_gamma_gibbs(
+    x: ArrayView2<f64>,
+    y: ArrayView1<f64>,
+    weights: ArrayView1<f64>,
+    penalty_matrix: ArrayView2<f64>,
+    mode: ArrayView1<f64>,
+    config: &NutsConfig,
+) -> Result<NutsResult, String> {
+    let n = x.nrows();
+    let p = x.ncols();
+    if y.len() != n || weights.len() != n {
+        return Err("run_logit_polya_gamma_gibbs: input length mismatch".to_string());
+    }
+    if mode.len() != p || penalty_matrix.nrows() != p || penalty_matrix.ncols() != p {
+        return Err(
+            "run_logit_polya_gamma_gibbs: coefficient/penalty dimension mismatch".to_string(),
+        );
+    }
+    if !weights.iter().all(|w| (*w - 1.0).abs() <= 1e-10) {
+        return Err(
+            "run_logit_polya_gamma_gibbs requires unit weights (PG(1,·)); use NUTS for non-unit weights".to_string(),
+        );
+    }
+
+    let n_iter = config.n_warmup + config.n_samples;
+    let mut rng = StdRng::seed_from_u64(config.seed);
+
+    // b = X^T (y - 1/2), constant across iterations.
+    let mut kappa = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        kappa[i] = y[i] - 0.5;
+    }
+    let rhs_b = fast_atv(&x, &kappa);
+
+    let mut samples_array = Array3::<f64>::zeros((config.n_chains, config.n_samples, p));
+    let mut eta = Array1::<f64>::zeros(n);
+    let mut omega = Array1::<f64>::ones(n);
+    let mut xw = x.to_owned();
+    let mut xt_omega_x = Array2::<f64>::zeros((p, p));
+    let penalty = penalty_matrix.to_owned();
+    let mut q = Array2::<f64>::zeros((p, p));
+    let mut mean = Array1::<f64>::zeros(p);
+    let mut z = Array1::<f64>::zeros(p);
+    let mut noise = Array1::<f64>::zeros(p);
+
+    for chain in 0..config.n_chains {
+        let mut pg_rng = StdRng08::seed_from_u64(
+            config.seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul((chain as u64) + 1)),
+        );
+        let pg = PolyaGamma::new(1.0);
+        let mut beta = mode.to_owned();
+        // Small jitter so chains are not perfectly coupled.
+        for j in 0..p {
+            beta[j] += 0.05 * sample_standard_normal(&mut rng);
+        }
+
+        for iter in 0..n_iter {
+            eta.assign(&x.dot(&beta));
+            for i in 0..n {
+                omega[i] = pg.draw(&mut pg_rng, eta[i]).max(1e-12);
+            }
+
+            // Build X_weighted = diag(sqrt(ω)) X and compute X^T Ω X via faer GEMM.
+            for i in 0..n {
+                let s = omega[i].sqrt();
+                for j in 0..p {
+                    xw[[i, j]] = x[[i, j]] * s;
+                }
+            }
+            fast_ata_into(&xw, &mut xt_omega_x);
+
+            q.assign(&penalty);
+            q += &xt_omega_x;
+
+            // β | ω,y ~ N(Q^{-1} b, Q^{-1})
+            let factor = q
+                .cholesky(Side::Lower)
+                .map_err(|e| format!("PG Gibbs failed to factor Q: {:?}", e))?;
+            mean.assign(&factor.solve_vec(&rhs_b));
+
+            for j in 0..p {
+                z[j] = sample_standard_normal(&mut rng);
+            }
+            let l = factor.lower_triangular();
+            forward_solve_lower_triangular(&l, &z, &mut noise);
+            beta.assign(&(&mean + &noise));
+
+            if iter >= config.n_warmup {
+                let keep_idx = iter - config.n_warmup;
+                samples_array
+                    .slice_mut(ndarray::s![chain, keep_idx, ..])
+                    .assign(&beta);
+            }
+        }
+    }
+
+    let total_samples = config.n_chains * config.n_samples;
+    let mut samples = Array2::<f64>::zeros((total_samples, p));
+    for chain in 0..config.n_chains {
+        for s in 0..config.n_samples {
+            let idx = chain * config.n_samples + s;
+            samples
+                .row_mut(idx)
+                .assign(&samples_array.slice(ndarray::s![chain, s, ..]));
+        }
+    }
+
+    let posterior_mean = samples
+        .mean_axis(Axis(0))
+        .unwrap_or_else(|| Array1::zeros(p));
+    let posterior_std = samples.std_axis(Axis(0), 0.0);
+    let (rhat, ess) = if config.n_chains >= 2 && config.n_samples >= 4 {
+        compute_split_rhat_and_ess(&samples_array)
+    } else {
+        (1.0, (total_samples as f64) * 0.5)
+    };
+    let converged = rhat < 1.1 && ess > 100.0;
+
+    Ok(NutsResult {
+        samples,
+        posterior_mean,
+        posterior_std,
+        rhat,
+        ess,
+        converged,
+    })
 }
 
 /// Runs NUTS sampling using general-mcmc with whitened parameter space.
@@ -1023,17 +1251,32 @@ pub fn run_nuts_sampling_flattened_family(
             glm.firth_bias_reduction,
             config,
         ),
-        (LikelihoodFamily::BinomialLogit, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
-            glm.x,
-            glm.y,
-            glm.weights,
-            glm.penalty_matrix,
-            glm.mode,
-            glm.hessian,
-            true,
-            glm.firth_bias_reduction,
-            config,
-        ),
+        (LikelihoodFamily::BinomialLogit, FamilyNutsInputs::Glm(glm)) => {
+            // Auto-select PG Gibbs when assumptions hold; otherwise fall back to NUTS.
+            // This gives gradient-free posterior draws for standard Bernoulli logit GAMs.
+            if !glm.firth_bias_reduction && glm.weights.iter().all(|w| (*w - 1.0).abs() <= 1e-10) {
+                run_logit_polya_gamma_gibbs(
+                    glm.x,
+                    glm.y,
+                    glm.weights,
+                    glm.penalty_matrix,
+                    glm.mode,
+                    config,
+                )
+            } else {
+                run_nuts_sampling(
+                    glm.x,
+                    glm.y,
+                    glm.weights,
+                    glm.penalty_matrix,
+                    glm.mode,
+                    glm.hessian,
+                    true,
+                    glm.firth_bias_reduction,
+                    config,
+                )
+            }
+        }
         (LikelihoodFamily::BinomialProbit, FamilyNutsInputs::Glm(_)) => Err(
             "BinomialProbit NUTS is not implemented yet; use fit_gam/predict_gam for probit models"
                 .to_string(),

@@ -3,7 +3,7 @@
 //! This module orchestrates the core model fitting procedure for Generalized Additive
 //! Models (GAMs). It determines optimal smoothing parameters directly from the data,
 //! moving beyond simple hyperparameter-driven models. This is achieved through a
-//! nested optimization scheme, a standard and robust approach for this class of models:
+//! nested optimization scheme, a standard approach for this class of models:
 //!
 //! 1.  Outer Loop (BFGS): Optimizes the log-smoothing parameters (`rho`) by
 //!     maximizing a marginal likelihood criterion. For non-Gaussian models (e.g., Logit),
@@ -540,15 +540,19 @@ const DP_FLOOR: f64 = 1e-12;
 /// sharp kink when the penalized deviance is near zero, yet still tiny relative
 /// to the typical residual sums of squares encountered during estimation.
 const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
-// Use a unified rho bound corresponding to lambda in [exp(-RHO_BOUND), exp(RHO_BOUND)].
-// Allow additional headroom so the optimizer rarely collides with the hard box even
-// when the likelihood prefers effectively infinite smoothing.
+// Unified rho bound corresponding to lambda in [exp(-RHO_BOUND), exp(RHO_BOUND)].
+// Additional headroom reduces frequent contact with the hard box constraints.
 const RHO_BOUND: f64 = 30.0;
-// Soft interior prior that nudges rho away from the hard walls without meaningfully
-// affecting the optimum when the data are informative.
+// Soft interior prior on rho near the box boundaries.
 const RHO_SOFT_PRIOR_WEIGHT: f64 = 1e-6;
 const RHO_SOFT_PRIOR_SHARPNESS: f64 = 4.0;
 const MAX_CONSECUTIVE_INNER_ERRORS: usize = 3;
+// Adaptive cubature guardrails for bounded correction latency.
+const AUTO_CUBATURE_MAX_RHO_DIM: usize = 12;
+const AUTO_CUBATURE_MAX_EIGENVECTORS: usize = 4;
+const AUTO_CUBATURE_TARGET_VAR_FRAC: f64 = 0.95;
+const AUTO_CUBATURE_MAX_BETA_DIM: usize = 1600;
+const AUTO_CUBATURE_BOUNDARY_MARGIN: f64 = 2.0;
 
 #[inline]
 fn stable_atanh(x: f64) -> f64 {
@@ -646,27 +650,41 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
     (dp_c, sigma)
 }
 
-/// Compute the smoothing parameter uncertainty correction matrix V_corr = J * V_ρ * J^T.
+/// Compute the smoothing parameter uncertainty correction matrix `V_corr = J * V_rho * J^T`.
 ///
 /// This implements the Wood et al. (2016) correction for smoothing parameter uncertainty.
-/// The corrected covariance for β is: V*_β = V_β + J * V_ρ * J^T
+/// The corrected covariance for `beta` is: `V*_beta = V_beta + J * V_rho * J^T`.
 /// where:
-/// - V_β = H^{-1} (the conditional covariance treating λ as fixed)
-/// - J = dβ/dρ (the Jacobian of coefficients w.r.t. log-smoothing parameters)
-/// - V_ρ = inverse Hessian of LAML w.r.t. ρ (smoothing parameter covariance)
+/// - `V_beta = H^{-1}` (conditional covariance treating `lambda` as fixed)
+/// - `J = d(beta)/d(rho)` (Jacobian wrt log-smoothing parameters)
+/// - `V_rho = (d^2 LAML / d rho^2)^{-1}` (outer covariance)
 ///
 /// Returns the correction matrix in the ORIGINAL coefficient basis.
 ///
 /// FULL CORRECTION REFERENCE
 /// -------------------------
-/// Exact first-order propagation around the outer optimum ρ*:
+/// Let `rho ~ N(mu, Sigma)` with `mu = rho_hat`, `Sigma = V_rho`,
+/// and define:
+/// - `A(rho) = H_rho^{-1}`
+/// - `b(rho) = beta_hat_rho`
 ///
-///   Var(β̂) ≈ Var(β̂ | ρ̂) + (dβ̂/dρ) Var(ρ̂) (dβ̂/dρ)ᵀ
-///          = V_β + J V_ρ Jᵀ.
+/// The exact Gaussian-mixture identity is:
+///   `Var(beta) = E[A(rho)] + Var(b(rho))`.
+///
+/// Around `mu`, this routine keeps the first-order terms:
+///
+///   `E[A(rho)]      ~= A(mu) = H_mu^{-1}`
+///   `Var(b(rho))    ~= J Sigma J^T`
+///   `Var(beta)      ~= H_mu^{-1} + J V_rho J^T`.
+///
+/// Equivalent first-order propagation around the outer optimum `rho*`:
+///
+///   `Var(beta_hat) ~= Var(beta_hat | rho_hat) + (d beta_hat / d rho) Var(rho_hat) (d beta_hat / d rho)^T`
+///                  `= V_beta + J V_rho J^T`.
 ///
 /// Components:
-///   J[:,k] = ∂β̂/∂ρ_k = -H^{-1}(A_k β̂),  A_k = exp(ρ_k) S_k
-///   V_ρ    = (∇²_{ρρ} V(ρ*))^{-1}
+///   `J[:,k] = d(beta_hat)/d(rho_k) = -H^{-1}(A_k beta_hat),  A_k = exp(rho_k) S_k`
+///   `V_rho  = (d^2 V / d rho^2 at rho*)^{-1}`
 ///
 /// Exact non-Gaussian V_ρ^{-1} requires the full Hessian with:
 ///   - tr(H^{-1}H_{kℓ})
@@ -674,8 +692,14 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
 ///   - pseudo-det second derivatives in S
 ///   - and H_{kℓ} terms containing fourth-likelihood derivatives.
 ///
-/// For runtime/robustness, this routine estimates V_ρ^{-1} by finite-differencing
-/// the implemented analytic gradient and then regularizes before inversion.
+/// This routine estimates V_ρ^{-1} by finite-differencing
+/// the implemented analytic gradient and then regularizing before inversion.
+///
+/// Notes on omitted higher-order terms:
+/// - The exact `E[A(rho)]` and `Var(b(rho))` can be written with the Gaussian
+///   smoothing/heat operator `exp(0.5 * Delta_Sigma)` (equivalently Wick/Isserlis
+///   contractions of high-order derivatives).
+/// - Those infinite-series corrections are not expanded in this routine.
 pub(crate) fn compute_smoothing_correction(
     reml_state: &internal::RemlState<'_>,
     final_rho: &Array1<f64>,
@@ -693,7 +717,7 @@ pub(crate) fn compute_smoothing_correction(
     let n_coeffs_orig = final_fit.reparam_result.qs.nrows();
     let lambdas: Array1<f64> = final_rho.mapv(f64::exp);
 
-    // Step 1: Compute the Jacobian J = dβ/dρ in transformed space.
+    // Step 1: Compute the Jacobian J = d(beta)/d(rho) in transformed space.
     //
     // Exact implicit-function identity at the inner optimum:
     //   dβ̂/dρ_k = -H^{-1}(S_k^ρ β̂),   S_k^ρ = λ_k S_k, λ_k = exp(ρ_k).
@@ -738,7 +762,8 @@ pub(crate) fn compute_smoothing_correction(
         jacobian_trans.column_mut(k).assign(&delta);
     }
 
-    // Step 2: Use exact analytic LAML Hessian when available; fallback to finite differences.
+    // Step 2: Build V_rho by inverting the LAML Hessian in rho-space.
+    // Prefer the exact analytic Hessian; fallback to finite differences.
     let mut hessian_rho = match reml_state.compute_laml_hessian_exact(&final_rho) {
         Ok(h) => h,
         Err(err) => {
@@ -780,7 +805,7 @@ pub(crate) fn compute_smoothing_correction(
         }
     }
 
-    // Step 3: Invert Hessian to get V_ρ.
+    // Step 3: Invert Hessian to get V_rho.
     // Add a small ridge before factorization to regularize weakly identified ρ directions.
     let ridge = 1e-8
         * hessian_rho
@@ -809,7 +834,7 @@ pub(crate) fn compute_smoothing_correction(
         }
     };
 
-    // Step 4: Compute V_corr = J * V_ρ * J^T in transformed space.
+    // Step 4: Compute V_corr = J * V_rho * J^T in transformed space.
     //
     // This is the first-order smoothing-parameter uncertainty inflation:
     //   Var(β̂) ≈ Var(β̂|ρ̂) + (dβ̂/dρ) Var(ρ̂) (dβ̂/dρ)ᵀ.
@@ -1202,7 +1227,7 @@ impl core::fmt::Debug for EstimationError {
 ///
 /// The model is: η = g(Xβ) where g is a learned flexible link function.
 
-// Domain-specific training orchestration is intentionally owned by caller adapters.
+// Domain-specific training orchestration is handled by caller adapters.
 // The gam engine exposes matrix/family-based APIs: fit_gam / optimize_external_design.
 
 pub struct ExternalOptimResult {
@@ -1225,8 +1250,10 @@ pub struct ExternalOptimResult {
     pub beta_covariance: Option<Array2<f64>>,
     /// Marginal SEs from `beta_covariance`.
     pub beta_standard_errors: Option<Array1<f64>>,
-    /// Optional smoothing-parameter-corrected covariance:
-    /// Var*(β) ≈ Var(β|λ) + J Var(ρ) J^T
+    /// Optional smoothing-parameter-corrected covariance.
+    /// Usually this is first-order:
+    /// Var*(β) ≈ Var(β|λ) + J Var(ρ) J^T.
+    /// In high-risk regimes the engine may use adaptive cubature for higher-order terms.
     pub beta_covariance_corrected: Option<Array2<f64>>,
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
@@ -1501,9 +1528,7 @@ where
             match run_newton_for_candidate(&label, &reml_state, &cfg, initial_z.clone()) {
                 Ok(sol) => sol,
                 Err(err) => {
-                    eprintln!(
-                        "[Candidate {label}] Newton failed ({err}); falling back to BFGS."
-                    );
+                    eprintln!("[Candidate {label}] Newton failed ({err}); falling back to BFGS.");
                     let (bfgs_solution, grad_norm_rho, stationary) =
                         run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z)?;
                     OuterSolveResult {
@@ -1695,15 +1720,27 @@ where
         .compute_gradient(&final_rho)
         .unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
     let final_grad_norm_rho = final_grad.dot(&final_grad).sqrt();
-    let final_grad_norm = if final_grad_norm_rho.is_finite() { final_grad_norm_rho } else { best_grad_norm };
+    let final_grad_norm = if final_grad_norm_rho.is_finite() {
+        final_grad_norm_rho
+    } else {
+        best_grad_norm
+    };
 
-    let smoothing_correction = compute_smoothing_correction(&reml_state, &final_rho, &pirls_res);
     let penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
     let beta_covariance =
         matrix_inverse_with_regularization(&penalized_hessian, "posterior covariance");
+    let smoothing_correction = reml_state.compute_smoothing_correction_auto(
+        &final_rho,
+        &pirls_res,
+        beta_covariance.as_ref(),
+        final_grad_norm,
+    );
     let beta_standard_errors = beta_covariance.as_ref().map(se_from_covariance);
     let beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
         (Some(base_cov), Some(corr)) if base_cov.dim() == corr.dim() => {
+            // First-order total covariance assembly:
+            //   Var(beta) ~= Var(beta | rho_hat) + J Var(rho_hat) J^T
+            //             ~= base_cov + corr.
             let mut corrected = base_cov.clone();
             corrected += corr;
             // Keep covariance symmetric after numerical addition.
@@ -1788,8 +1825,10 @@ pub struct FitResult {
     pub beta_covariance: Option<Array2<f64>>,
     /// Marginal SEs from `beta_covariance`.
     pub beta_standard_errors: Option<Array1<f64>>,
-    /// Optional smoothing-parameter-corrected covariance:
-    /// Var*(β) ≈ Var(β|λ) + J Var(ρ) J^T
+    /// Optional smoothing-parameter-corrected covariance.
+    /// Usually this is first-order:
+    /// Var*(β) ≈ Var(β|λ) + J Var(ρ) J^T.
+    /// In high-risk regimes the engine may use adaptive cubature for higher-order terms.
     pub beta_covariance_corrected: Option<Array2<f64>>,
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
@@ -1802,18 +1841,21 @@ pub struct PredictResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InferenceCovarianceMode {
-    /// Use conditional posterior covariance only: Var(beta | lambda).
+    /// Use conditional posterior covariance only:
+    ///   Var(beta | lambda_hat) ~= H_{rho_hat}^{-1}.
     Conditional,
-    /// Prefer smoothing-corrected covariance when available, else use conditional.
+    /// Prefer first-order smoothing-corrected covariance when available:
+    ///   Var(beta) ~= H_{rho_hat}^{-1} + J Var(rho_hat) J^T.
+    /// Falls back to conditional if correction is unavailable.
     ConditionalPlusSmoothingPreferred,
-    /// Require smoothing-corrected covariance; error if unavailable.
+    /// Require the first-order smoothing-corrected covariance; error if unavailable.
     ConditionalPlusSmoothingRequired,
 }
 
 pub struct PredictUncertaintyOptions {
     /// Central interval level in (0, 1), e.g. 0.95.
     pub confidence_level: f64,
-    /// Legacy flag for corrected covariance preference.
+    /// Legacy flag associated with corrected covariance preference.
     /// If this conflicts with `covariance_mode`, `covariance_mode` takes precedence.
     pub prefer_corrected_covariance: bool,
     /// Covariance mode used for eta/mean intervals.
@@ -1970,6 +2012,41 @@ where
 ///
 /// Mean-scale SEs are delta-method approximations:
 /// Var(μ_i) ≈ (dμ/dη)^2 Var(η_i)
+///
+/// Math note (logit family, Gaussian η posterior):
+///
+/// If η_i | D ≈ N(m_i, v_i), then the exact posterior predictive mean on the
+/// probability scale is the logistic-normal integral
+///
+///   E[sigmoid(η_i)] = ∫ sigmoid(x) N(x; m_i, v_i) dx.
+///
+/// This does not reduce to an elementary closed form. Two exact representations
+/// often used in the literature are:
+///
+/// 1) Theta/Appell-Lerch style representations (via Poisson summation / Mordell integrals).
+/// 2) Absolutely convergent complex-error-function (Faddeeva) series obtained from
+///    partial-fraction expansions of tanh/logistic.
+///
+/// A practical exact series form is:
+///
+///   E[sigmoid(η)] = 1/2
+///                   - (sqrt(2π)/σ) * Σ_{n>=1} Im[ w((i a_n - μ)/(sqrt(2)σ)) ],
+///   where a_n = (2n-1)π, σ = sqrt(v), and w is the Faddeeva function
+///   w(z) = exp(-z^2) erfc(-i z).
+///
+/// The formulas above define the exact logistic-normal target moments under
+/// Gaussian η uncertainty.
+///
+/// CLogLog note (exact target):
+/// If p = 1 - exp(-exp(η)) and η ~ N(μ,σ²), then
+///   E[p] = 1 - I(1),  E[p²] = 1 - 2I(1) + I(2),  Var(p) = I(2) - I(1)²
+/// where I(λ) = E[exp(-λ exp(η))] is the lognormal Laplace transform.
+/// This identity is exact, and highlights that the moments are determined by
+/// the lognormal Laplace transform values at λ=1 and λ=2.
+///
+/// Exact analytic representation (Mellin-Barnes) for I(λ):
+///   I(λ) = (1/(2πi)) ∫_{c-i∞}^{c+i∞} Γ(z) λ^{-z} exp(-μ z + 0.5 σ² z²) dz, c>0.
+/// This Mellin-Barnes integral is mathematically exact.
 pub fn predict_gam_with_uncertainty<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
@@ -2015,6 +2092,9 @@ where
     } else {
         options.covariance_mode
     };
+    // Covariance selection corresponds to approximation order:
+    // - Conditional: uses only A(mu) = H_mu^{-1}
+    // - Corrected: adds first-order Var(b(rho)) term J V_rho J^T
     let (cov, covariance_corrected_used) = match requested_mode {
         InferenceCovarianceMode::Conditional => (
             fit.beta_covariance.as_ref().ok_or_else(|| {
@@ -2066,6 +2146,22 @@ where
     let eta_lower = &eta - &eta_standard_error.mapv(|s| z * s);
     let eta_upper = &eta + &eta_standard_error.mapv(|s| z * s);
 
+    // Derivative of inverse link g^{-1}(η) used for delta-method:
+    //   Var(μ_i) ≈ [d g^{-1}(η_i)/dη]^2 Var(η_i).
+    //
+    // For logit:
+    //   g^{-1}(η)=sigmoid(η), dμ/dη=μ(1-μ).
+    // If η itself is uncertain (η ~ N(m,v)), the exact predictive mean is
+    // E[sigmoid(η)] (logistic-normal integral) as documented above.
+    //
+    // For cloglog:
+    //   g^{-1}(η)=1-exp(-exp(η)), dμ/dη=exp(η)exp(-exp(η)).
+    // With uncertain η the exact moments can be written via I(λ)=E[exp(-λexp(η))],
+    // and:
+    //   E[μ]   = 1 - I(1),
+    //   E[μ²]  = 1 - 2I(1) + I(2),
+    //   Var(μ) = I(2) - I(1)^2.
+    // These identities characterize the exact cloglog moments under Gaussian η uncertainty.
     let mut mean_standard_error = Array1::<f64>::zeros(eta.len());
     for i in 0..eta.len() {
         let dmu_deta = match family {
@@ -2162,6 +2258,9 @@ pub fn coefficient_uncertainty_with_mode(
             confidence_level
         )));
     }
+    // Coefficient SEs are extracted from either:
+    // - conditional covariance H^{-1}, or
+    // - first-order corrected covariance H^{-1} + J V_rho J^T.
     let (se, corrected) = match covariance_mode {
         InferenceCovarianceMode::Conditional => (
             fit.beta_standard_errors.as_ref().cloned().ok_or_else(|| {
@@ -2286,7 +2385,8 @@ fn maybe_audit_gradient(
     }
     match compute_fd_gradient_internal(reml_state, rho, false) {
         Ok(fd_grad) => {
-            if let Some((rel_l2, max_abs, ref_l2, ref_max_abs)) = gradient_audit_stats(grad, &fd_grad)
+            if let Some((rel_l2, max_abs, ref_l2, ref_max_abs)) =
+                gradient_audit_stats(grad, &fd_grad)
             {
                 let mismatch = rel_l2 > audit_cfg.rel_tol || max_abs > audit_cfg.abs_tol;
                 if mismatch {
@@ -2774,7 +2874,7 @@ pub mod internal {
         //    - Cost defines log|H| = Σᵢ log(λᵢ) for λᵢ > ε only (truncated)
         //    - Derivative: ∂J/∂ρ = ½ tr(H₊† ∂H/∂ρ)
         //    - H₊† = Σᵢ (1/λᵢ) uᵢuᵢᵀ for positive λᵢ only
-        //    - Negative eigenvalues contribute 0 to cost, so derivative must be 0
+        //    - Negative eigenvalues contribute 0 to cost, so their derivative contribution is 0
         //
         // 2. IMPLICIT TERM (dβ/dρ): Uses RIDGED FACTOR (H + δI)⁻¹
         //    - PIRLS stabilizes indefinite H by adding ridge: solves (H + δI)β = ...
@@ -3267,15 +3367,30 @@ pub mod internal {
             cost * RHO_SOFT_PRIOR_WEIGHT
         }
 
+        /// Compute soft prior gradient without workspace mutation.
+        fn compute_soft_prior_grad(&self, rho: &Array1<f64>) -> Array1<f64> {
+            let len = rho.len();
+            let mut grad = Array1::<f64>::zeros(len);
+            if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
+                return grad;
+            }
+            let inv_bound = 1.0 / RHO_BOUND;
+            let sharp = RHO_SOFT_PRIOR_SHARPNESS;
+            for (g, &ri) in grad.iter_mut().zip(rho.iter()) {
+                let scaled = sharp * ri * inv_bound;
+                *g = sharp * inv_bound * scaled.tanh() * RHO_SOFT_PRIOR_WEIGHT;
+            }
+            grad
+        }
+
         /// Returns the effective Hessian and the ridge value used (if any).
-        /// This ensures we use the same Hessian matrix in both cost and gradient calculations.
+        /// Uses the same Hessian matrix in both cost and gradient calculations.
         ///
         /// PIRLS folds any stabilization ridge directly into the penalized objective:
         ///   l_p(β; ρ) = l(β) - 0.5 * βᵀ (S_λ + ridge I) β.
-        /// Therefore the curvature used in LAML must be
+        /// Therefore the curvature used in LAML is
         ///   H_eff = X'WX + S_λ + ridge I,
-        /// and we must not add another ridge here or the Laplace expansion
-        /// would be centered on a different surface.
+        /// and adding another ridge here places the Laplace expansion on a different surface.
         fn effective_hessian(
             &self,
             pr: &PirlsResult,
@@ -3389,7 +3504,7 @@ pub mod internal {
         }
 
         /// Creates a sanitized cache key from rho values.
-        /// Returns None if any component is NaN, which indicates that caching should be skipped.
+        /// Returns None if any component is NaN, in which case caching is skipped.
         /// Maps -0.0 to 0.0 to ensure consistency in caching.
         fn rho_key_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
             let mut key = Vec::with_capacity(rho.len());
@@ -3428,7 +3543,7 @@ pub mod internal {
             let dim = h_eff.nrows();
 
             // Compute spectral quantities from the same curvature used by inner PIRLS.
-            // We intentionally stay on H_eff here for cost/gradient consistency.
+            // This path stays on H_eff for cost/gradient consistency.
             let h_total = h_eff.clone();
             let (eigvals, eigvecs) = h_total
                 .eigh(Side::Lower)
@@ -3508,7 +3623,8 @@ pub mod internal {
 
         pub(super) fn last_ridge_used(&self) -> Option<f64> {
             self.current_eval_bundle
-                .read().unwrap()
+                .read()
+                .unwrap()
                 .as_ref()
                 .map(|bundle| bundle.ridge_passport.delta)
         }
@@ -3559,7 +3675,7 @@ pub mod internal {
             };
 
             // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
-            // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly (numerically robust)
+            // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly.
             let e_t = pr.reparam_result.e_transformed.t().to_owned(); // (p × rank_total)
             let e_view = FaerArrayView::new(&e_t);
             let x = factor.solve(e_view.as_ref());
@@ -3582,7 +3698,8 @@ pub mod internal {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
                     let beta_original = pr.reparam_result.qs.dot(pr.beta_transformed.as_ref());
                     self.warm_start_beta
-                        .write().unwrap()
+                        .write()
+                        .unwrap()
                         .replace(Coefficients::new(beta_original));
                 }
                 _ => {
@@ -3650,7 +3767,7 @@ pub mod internal {
             // This design is still brittle: adding a new code path that calls `get_faer_factor`
             // with a different H for the same ρ would silently reuse the wrong factor.  If such a
             // path ever appears, extend the key (for example by tagging the Hessian variant) or
-            // split the cache.  Until then we prefer the cheaper key because it maximizes cache
+            // split the cache.  The current key maximizes cache
             // hits across repeated EDF/gradient evaluations for the same smoothing parameters.
             let key_opt = self.rho_key_sanitized(rho);
             if let Some(key) = &key_opt
@@ -4071,7 +4188,8 @@ pub mod internal {
                     // This is a successful fit. Cache only if key is valid (not NaN).
                     if let Some(key) = key_opt {
                         self.cache
-                            .write().unwrap()
+                            .write()
+                            .unwrap()
                             .insert(key, Arc::clone(&pirls_result));
                     }
                     Ok(pirls_result)
@@ -4152,7 +4270,7 @@ pub mod internal {
         ///      + const.
         ///
         /// Consistency rule enforced throughout:
-        ///   The exact same stabilized matrices/factorizations must be used for
+        ///   The same stabilized matrices/factorizations are used for
         ///   objective and gradient/Hessian terms. Mixing different H/S variants
         ///   causes deterministic gradient mismatch and unstable outer optimization.
         ///
@@ -4386,7 +4504,7 @@ pub mod internal {
                     // log |H| = log |X'X + S_λ + ridge I| using the single effective
                     // Hessian shared with the gradient. Ridge is already baked into h_eff.
                     //
-                    // This must be the exact same stabilized H used in compute_gradient;
+                    // This is the same stabilized H used in compute_gradient;
                     // otherwise the chain-rule pieces and determinant pieces are taken on
                     // different objective surfaces and the optimizer sees inconsistent derivatives.
                     let h_for_det = h_eff.clone();
@@ -4479,7 +4597,7 @@ pub mod internal {
 
                     // Compute null space dimension using the TRANSFORMED, STABLE basis
                     // Use the rank of the lambda-weighted transformed penalty root (e_transformed)
-                    // to determine M_p robustly, avoiding contamination from dominant penalties.
+                    // to determine M_p with the transformed penalty basis.
                     let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
                     let mp = self.p.saturating_sub(penalty_rank) as f64;
 
@@ -4506,7 +4624,7 @@ pub mod internal {
                         (f64::NAN, f64::NAN, f64::NAN)
                     };
 
-                    // Expensive raw-condition diagnostics are rate-limited in the hot loop.
+                    // Raw-condition diagnostics are rate-limited in this loop.
                     // We only refresh occasionally, and keep the last snapshot otherwise.
                     let raw_cond = if matches!(self.x(), DesignMatrix::Dense(_)) && want_hot_diag {
                         let x_orig_arc = self.x().to_dense_arc();
@@ -4757,6 +4875,62 @@ pub mod internal {
         }
         /// Compute the gradient of the REML/LAML score with respect to the log-smoothing parameters (ρ).
         ///
+        /// -------------------------------------------------------------------------
+        /// Exact non-Laplace evidence identities (reference comments; not runtime path)
+        /// -------------------------------------------------------------------------
+        /// We optimize a Laplace-style outer objective for scalability, but the exact
+        /// marginal likelihood for non-Gaussian models can be written analytically as:
+        ///
+        ///   L(ρ) = ∫ exp(l(β) - 0.5 βᵀ S(ρ) β) dβ,   S(ρ)=Σ_k exp(ρ_k) S_k.
+        ///
+        /// Universal exact gradient identity (when differentiation under the integral
+        /// is justified and L(ρ) < ∞):
+        ///
+        ///   ∂_{ρ_k} log L(ρ)
+        ///   = -0.5 * exp(ρ_k) * E_{π(β|y,ρ)}[ βᵀ S_k β ].
+        ///
+        /// Laplace bridge to implemented terms:
+        /// - If π(β|y,ρ) is approximated locally by N(β̂, H^{-1}), then
+        ///     E[βᵀ S_k β] ≈ β̂ᵀ S_k β̂ + tr(H^{-1} S_k),
+        ///   giving the familiar quadratic + trace structure.
+        /// - In this code those appear as:
+        ///     0.5 * β̂ᵀ S_k^ρ β̂,
+        ///     -0.5 * tr(S^+ S_k^ρ),
+        ///     +0.5 * tr(H^{-1} H_k).
+        ///
+        /// Why this does NOT collapse to only tr(H^{-1}S_k):
+        /// - The exact identity differentiates the true integral measure.
+        /// - LAML differentiates a moving approximation:
+        ///     V_LAML(ρ) = -ℓ(β̂(ρ)) + 0.5 β̂(ρ)ᵀ S(ρ) β̂(ρ)
+        ///                 + 0.5 log|H(ρ)| - 0.5 log|S(ρ)|_+.
+        /// - Here both center β̂(ρ) and curvature H(ρ) move with ρ.
+        /// - For non-Gaussian families, H_k includes the third-derivative tensor path
+        ///   through β̂(ρ), i.e. H_k != S_k^ρ. These are the explicit dH/dρ_k terms
+        ///   retained below to differentiate the Laplace objective exactly.
+        ///
+        /// For Bernoulli-logit, an exact Pólya-Gamma augmentation gives:
+        ///
+        ///   L(ρ) = 2^{-n} (2π)^{p/2}
+        ///          E_{ω_i ~ PG(1,0)} [ |Q(ω,ρ)|^{-1/2} exp(0.5 bᵀ Q^{-1} b) ],
+        ///   Q(ω,ρ)=S(ρ)+XᵀΩX, b=Xᵀ(y-1/2).
+        ///
+        /// and
+        ///
+        ///   ∂_{ρ_k} log L
+        ///   = -0.5 * exp(ρ_k) *
+        ///     E_{ω|y,ρ}[ tr(S_k Q^{-1}) + μᵀ S_k μ ],  μ=Q^{-1}b.
+        ///
+        /// For Poisson-log, exact Mellin-Barnes / multi-index reductions exist,
+        /// yielding exact (but high-dimensional) contour integrals / series after
+        /// analytically integrating β.
+        ///
+        /// Practical note:
+        /// - These are exact equalities but generally not polynomial-time tractable
+        ///   for arbitrary dense (X, n, p).
+        /// - This code therefore uses deterministic Laplace/implicit-differentiation
+        ///   machinery for the main optimizer path, with exact tensor terms where
+        ///   feasible (H_k, H_{kℓ}, c/d arrays), and scalable trace backends.
+        ///
         /// FULL OUTER-DERIVATIVE REFERENCE (exact system, sign convention used here)
         /// -------------------------------------------------------------------------
         /// This optimizer minimizes an outer cost V(ρ).
@@ -4802,7 +4976,7 @@ pub mod internal {
         ///   P_{kℓ} = -0.5 ∂²_{kℓ} log|S|_+
         ///
         /// Here, this function computes the exact gradient terms (including dH/dρ_k via d_i).
-        /// The full exact Hessian is not assembled in the hot loop because it requires B_{kℓ}
+        /// The full exact Hessian is not assembled in this loop because it requires B_{kℓ}
         /// solves and fourth-derivative terms for every (k,ℓ) pair.
         ///
         /// Gaussian REML note:
@@ -4857,7 +5031,7 @@ pub mod internal {
         ///   for a fixed set of smoothing parameters ρ.
         /// - The outer loop (BFGS) finds smoothing parameters ρ that maximize the marginal likelihood.
         ///
-        /// Since β̂ is an implicit function of ρ, we must use the total derivative:
+        /// Since β̂ is an implicit function of ρ, the total derivative is:
         ///
         ///    dV_R/dρ_k = (∂V_R/∂β̂)ᵀ(∂β̂/∂ρ_k) + ∂V_R/∂ρ_k
         ///
@@ -4869,7 +5043,7 @@ pub mod internal {
         ///   contribution reduces to the penalty-only derivative, yielding the familiar
         ///   (β̂ᵀS_kβ̂)/σ² piece in the gradient.
         /// - Non-Gaussian (LAML): there is no cancellation of the penalty derivative within the
-        ///   deviance component. The derivative of the penalized deviance must include both
+        ///   deviance component. The derivative of the penalized deviance contains both
         ///   d(D)/dρ_k and d(βᵀSβ)/dρ_k. Our implementation follows mgcv’s gdi1: we add the penalty
         ///   derivative to the deviance derivative before applying the 1/2 factor.
         // Stage: Start with the chain rule for any λₖ,
@@ -4953,7 +5127,7 @@ pub mod internal {
         /// $$ (\nabla_\beta V)^\top \frac{d \hat{\beta}}{d \rho_k} = - (\nabla_\beta V)^\top H_{total}^{-1} (\lambda_k S_k \hat{\beta}) $$
         ///
         /// Where $\nabla_\beta V = -\nabla_\beta \mathcal{L} + \frac{1}{2} \nabla_\beta \log |H_{total}|$.
-        /// - At a perfect optimum, $\nabla_\beta \mathcal{L} = 0$, but we include `residual_grad` for robustness.
+        /// - At a perfect optimum, $\nabla_\beta \mathcal{L} = 0$; `residual_grad` keeps the finite-iteration term explicit.
         /// - $\frac{1}{2} \nabla_\beta \log |H_{total}|$ is computed via `firth_logh_total_grad`.
         ///
         /// ## Exact non-Gaussian Hessian system (reference for this implementation)
@@ -4979,7 +5153,7 @@ pub mod internal {
         ///       - 0.5 ∂² log|S|_+ /(∂ρ_k∂ρ_ℓ)
         ///
         /// This function computes the exact gradient terms (including the third-derivative
-        /// contribution in H_k for logit). Full explicit H_{kℓ} assembly is intentionally not
+        /// contribution in H_k for logit). Full explicit H_{kℓ} assembly is not
         /// performed in the hot optimization loop because it requires B_{kℓ} solves and
         /// fourth-derivative likelihood terms for every (k,ℓ) pair.
         fn compute_gradient_with_bundle(
@@ -5483,8 +5657,8 @@ pub mod internal {
                             // P-IRLS already folded any stabilization ridge into h_eff.
 
                             // Create local factor_g for the non-Firth path and Firth fallback.
-                            // The non-Firth path intentionally uses full-rank Cholesky (not pseudoinverse)
-                            // because truncation caused gradient mismatch (see logh_beta_grad_logit).
+                            // This branch uses full-rank Cholesky (not pseudoinverse);
+                            // see logh_beta_grad_logit notes on truncation interactions.
                             let factor_g = {
                                 let h_total = bundle.h_total.as_ref();
                                 let h_view = FaerArrayView::new(h_total);
@@ -5535,14 +5709,16 @@ pub mod internal {
                                     DesignMatrix::Dense(x_dense) => {
                                         let xw = x_dense.dot(w_pos);
                                         for i in 0..xw.nrows() {
-                                            leverage_h_pos[i] = xw.row(i).iter().map(|v| v * v).sum();
+                                            leverage_h_pos[i] =
+                                                xw.row(i).iter().map(|v| v * v).sum();
                                         }
                                     }
                                     DesignMatrix::Sparse(_) => {
                                         for col in 0..w_pos.ncols() {
                                             let w_col = w_pos.column(col).to_owned();
-                                            let xw_col =
-                                                pirls_result.x_transformed.matrix_vector_multiply(&w_col);
+                                            let xw_col = pirls_result
+                                                .x_transformed
+                                                .matrix_vector_multiply(&w_col);
                                             Zip::from(&mut leverage_h_pos)
                                                 .and(&xw_col)
                                                 .for_each(|h, &v| *h += v * v);
@@ -5579,7 +5755,8 @@ pub mod internal {
                                     let s_k_beta = &s_k_beta_all[k_idx];
                                     let wt_sk_beta = w_pos.t().dot(s_k_beta);
                                     let v_k = w_pos.dot(&wt_sk_beta);
-                                    let x_v_k = pirls_result.x_transformed.matrix_vector_multiply(&v_k);
+                                    let x_v_k =
+                                        pirls_result.x_transformed.matrix_vector_multiply(&v_k);
                                     let trace_third = kahan_sum(
                                         c_vec
                                             .iter()
@@ -5619,8 +5796,8 @@ pub mod internal {
                                 // add any extra ∂log|I|/∂β term here or it will be double-counted.
                                 // If PIRLS added a stabilization ridge, the objective being
                                 // optimized is l_p(β) - 0.5 * ridge * ||β||². The gradient
-                                // therefore gains + ridge * β, which must be included here
-                                // so the implicit correction matches the stabilized objective.
+                                // therefore gains + ridge * β, included here so the implicit
+                                // correction is taken on the same stabilized objective.
                                 if ridge_passport.quadratic_penalty_ridge() > 0.0 {
                                     gradient_data
                                         + s_beta
@@ -5854,7 +6031,138 @@ pub mod internal {
                 self.run_gradient_diagnostics(p, bundle, &gradient_snapshot, None);
             }
 
+            if self.should_use_stochastic_exact_gradient(bundle, &gradient_result) {
+                match self.compute_logit_stochastic_exact_gradient(p, bundle) {
+                    Ok(stochastic_grad) => {
+                        log::warn!(
+                            "[REML] using stochastic exact log-marginal gradient fallback (posterior-sampled expectation)"
+                        );
+                        return Ok(stochastic_grad);
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "[REML] stochastic exact gradient fallback failed; keeping analytic gradient: {:?}",
+                            err
+                        );
+                    }
+                }
+            }
+
             Ok(gradient_result)
+        }
+
+        fn should_use_stochastic_exact_gradient(
+            &self,
+            bundle: &EvalShared,
+            gradient: &Array1<f64>,
+        ) -> bool {
+            // Gate for the posterior-sampled gradient path.
+            // This predicate checks for non-finite or unstable analytic states.
+            if self.config.link_function() != LinkFunction::Logit {
+                return false;
+            }
+            if self.config.firth_bias_reduction {
+                // Firth-adjusted inner objective does not match the plain PG/NUTS posterior target here.
+                return false;
+            }
+            if gradient.is_empty() {
+                return false;
+            }
+            if !gradient.iter().all(|g| g.is_finite()) {
+                return true;
+            }
+            let pirls = bundle.pirls_result.as_ref();
+            if matches!(pirls.status, pirls::PirlsStatus::Unstable) {
+                return true;
+            }
+            let kkt_like = pirls.last_gradient_norm;
+            if !kkt_like.is_finite() || kkt_like > 1e2 {
+                return true;
+            }
+            let grad_inf = gradient.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+            !grad_inf.is_finite() || grad_inf > 1e9
+        }
+
+        fn compute_logit_stochastic_exact_gradient(
+            &self,
+            p: &Array1<f64>,
+            bundle: &EvalShared,
+        ) -> Result<Array1<f64>, EstimationError> {
+            // Exact identity used here (for minimization cost with log-penalty normalization):
+            //   ∂Cost/∂ρ_k = 0.5 * λ_k * E_post[βᵀ S_k β] - 0.5 * λ_k * tr(S^+ S_k).
+            // We estimate E_post[·] from posterior samples at fixed ρ.
+            //
+            // This evaluates the exact identity using posterior samples at fixed ρ.
+            let pirls_result = bundle.pirls_result.as_ref();
+            let beta_mode = pirls_result.beta_transformed.as_ref();
+            let s_transformed = &pirls_result.reparam_result.s_transformed;
+            let x_arc = pirls_result.x_transformed.to_dense_arc();
+            let x_dense = x_arc.as_ref();
+            let y = self.y;
+            let weights = self.weights;
+            let h_eff = bundle.h_eff.as_ref();
+
+            let mcmc_cfg = crate::hmc::NutsConfig {
+                n_samples: 120,
+                n_warmup: 160,
+                n_chains: 2,
+                target_accept: 0.85,
+                seed: 17_391,
+            };
+
+            let nuts_result = crate::hmc::run_nuts_sampling_flattened_family(
+                crate::types::LikelihoodFamily::BinomialLogit,
+                crate::hmc::FamilyNutsInputs::Glm(crate::hmc::GlmFlatInputs {
+                    x: x_dense.view(),
+                    y,
+                    weights,
+                    penalty_matrix: s_transformed.view(),
+                    mode: beta_mode.view(),
+                    hessian: h_eff.view(),
+                    firth_bias_reduction: self.config.firth_bias_reduction,
+                }),
+                &mcmc_cfg,
+            )
+            .map_err(EstimationError::InvalidInput)?;
+
+            let len = p.len();
+            let mut lambda = Array1::<f64>::zeros(len);
+            for k in 0..len {
+                lambda[k] = p[k].exp();
+            }
+
+            let (det1_values, _) = self.structural_penalty_logdet_derivatives(
+                &pirls_result.reparam_result.rs_transformed,
+                &lambda,
+                pirls_result.reparam_result.e_transformed.nrows(),
+                bundle.ridge_passport.penalty_logdet_ridge(),
+            )?;
+
+            let samples = &nuts_result.samples;
+            let n_draws = samples.nrows().max(1);
+            let mut expected_quad = vec![0.0_f64; len];
+            for draw in 0..samples.nrows() {
+                let beta_draw = samples.row(draw).to_owned();
+                for k in 0..len {
+                    let r_k = &pirls_result.reparam_result.rs_transformed[k];
+                    let r_beta = r_k.dot(&beta_draw);
+                    expected_quad[k] += r_beta.dot(&r_beta);
+                }
+            }
+            let inv_draws = 1.0 / (n_draws as f64);
+            for v in &mut expected_quad {
+                *v *= inv_draws;
+            }
+
+            let mut grad = Array1::<f64>::zeros(len);
+            for k in 0..len {
+                // Exact identity for minimization cost with normalized penalty:
+                //   ∂Cost/∂ρ_k = 0.5 λ_k E[βᵀ S_k β] - 0.5 λ_k tr(S^+ S_k)
+                // and det1_values[k] already stores λ_k tr(S^+ S_k).
+                grad[k] = 0.5 * lambda[k] * expected_quad[k] - 0.5 * det1_values[k];
+            }
+            grad += &self.compute_soft_prior_grad(p);
+            Ok(grad)
         }
 
         fn xt_diag_x_dense_into(
@@ -5893,7 +6201,11 @@ pub mod internal {
             }))
         }
 
-        fn bilinear_form(mat: &Array2<f64>, left: ndarray::ArrayView1<'_, f64>, right: ndarray::ArrayView1<'_, f64>) -> f64 {
+        fn bilinear_form(
+            mat: &Array2<f64>,
+            left: ndarray::ArrayView1<'_, f64>,
+            right: ndarray::ArrayView1<'_, f64>,
+        ) -> f64 {
             let n = mat.nrows();
             debug_assert_eq!(mat.ncols(), n);
             debug_assert_eq!(left.len(), n);
@@ -5921,24 +6233,25 @@ pub mod internal {
             let w_npk = (n_obs as u128)
                 .saturating_mul(p_dim as u128)
                 .saturating_mul(k as u128);
-            let w_pk2 = (p_dim as u128)
-                .saturating_mul((k as u128).saturating_mul(k as u128));
+            let w_pk2 = (p_dim as u128).saturating_mul((k as u128).saturating_mul(k as u128));
 
             if p_dim <= 700 && k <= 20 && w_npk <= 220_000_000 && w_pk2 <= 20_000_000 {
                 return TraceBackend::Exact;
             }
 
-            let very_large = p_dim >= 1_800
-                || k >= 28
-                || w_npk >= 1_100_000_000
-                || w_pk2 >= 85_000_000;
+            let very_large =
+                p_dim >= 1_800 || k >= 28 || w_npk >= 1_100_000_000 || w_pk2 >= 85_000_000;
             if very_large {
                 let sketch = if p_dim >= 3_500 || w_npk >= 2_500_000_000 {
                     12
                 } else {
                     8
                 };
-                let probes = if k >= 36 || w_pk2 >= 150_000_000 { 28 } else { 22 };
+                let probes = if k >= 36 || w_pk2 >= 150_000_000 {
+                    28
+                } else {
+                    22
+                };
                 return TraceBackend::HutchPP { probes, sketch };
             }
 
@@ -5966,7 +6279,8 @@ pub mod internal {
             for j in 0..cols {
                 for i in 0..rows {
                     let h = Self::splitmix64(
-                        seed ^ ((i as u64).wrapping_mul(0x9E37)) ^ ((j as u64).wrapping_mul(0x85EB)),
+                        seed ^ ((i as u64).wrapping_mul(0x9E37))
+                            ^ ((j as u64).wrapping_mul(0x85EB)),
                     );
                     out[[i, j]] = if (h & 1) == 0 { -1.0 } else { 1.0 };
                 }
@@ -6115,6 +6429,27 @@ pub mod internal {
             //
             // Here `c` and `d` are the per-observation 3rd/4th eta-derivative arrays
             // prepared by PIRLS (`solve_c_array`, `solve_d_array`).
+            //
+            // Full exact Hessian entry used below:
+            //
+            //   ∂²V/(∂ρ_k∂ρ_ℓ) = Q_{kℓ} + L_{kℓ} + P_{kℓ}
+            //
+            // with
+            //   Q_{kℓ} = B_ℓᵀ A_k β̂ + 0.5 δ_{kℓ} β̂ᵀ A_k β̂
+            //   L_{kℓ} = 0.5 [ -tr(H^{-1}H_ℓ H^{-1}H_k) + tr(H^{-1}H_{kℓ}) ]
+            //   P_{kℓ} = -0.5 ∂² log|S|_+ /(∂ρ_k∂ρ_ℓ)
+            //
+            // Numerically, this function computes:
+            // - Q exactly from B_k solves,
+            // - P exactly from reduced-penalty logdet derivatives,
+            // - L either exactly or stochastically, depending on workload.
+            //
+            // Stochastic trace identities used when backend != Exact:
+            //   tr(A) = E[zᵀAz],  z_i∈{±1}.
+            //   tr(H^{-1}H_ℓH^{-1}H_k) estimated by shared-probe contractions.
+            //   tr(H^{-1}H_{kℓ}) estimated by probe bilinear forms.
+            // Hutch++ augments this with a low-rank deflation subspace Q to reduce
+            // variance before Hutchinson residual estimation.
             let bundle = self.obtain_eval_bundle(rho)?;
             let pirls_result = bundle.pirls_result.as_ref();
             let beta = pirls_result.beta_transformed.as_ref();
@@ -6194,11 +6529,13 @@ pub mod internal {
             let (exact_trace_mode, n_probe, n_sketch) = match trace_backend {
                 TraceBackend::Exact => (true, 0usize, 0usize),
                 TraceBackend::Hutchinson { probes } => (false, probes.max(1), 0usize),
-                TraceBackend::HutchPP { probes, sketch } => {
-                    (false, probes.max(1), sketch.max(1))
-                }
+                TraceBackend::HutchPP { probes, sketch } => (false, probes.max(1), sketch.max(1)),
             };
             let use_hutchpp = matches!(trace_backend, TraceBackend::HutchPP { .. });
+            // Backend semantics:
+            // - Exact: deterministic traces via explicit H^{-1} contractions.
+            // - Hutchinson/Hutch++: Monte-Carlo trace estimators (unbiased/low-bias in
+            //   expectation) trading tiny stochastic noise for major scaling gains.
 
             let h_inv = if exact_trace_mode {
                 Some(solve_h(&Array2::<f64>::eye(p_dim)))
@@ -6291,7 +6628,9 @@ pub mod internal {
                     }
                 }
                 let z = probe_z.as_ref().expect("probes present in stochastic mode");
-                let u = probe_u.as_ref().expect("solved probes present in stochastic mode");
+                let u = probe_u
+                    .as_ref()
+                    .expect("solved probes present in stochastic mode");
                 let xz = probe_xz
                     .as_ref()
                     .expect("X probes present in stochastic mode");
@@ -6368,11 +6707,7 @@ pub mod internal {
                         } else {
                             Array2::<f64>::zeros((p_dim, p_dim))
                         };
-                        h_kl += &Self::xt_diag_x_dense_into(
-                            x_dense,
-                            &diag,
-                            &mut weighted_xtdx_kl,
-                        );
+                        h_kl += &Self::xt_diag_x_dense_into(x_dense, &diag, &mut weighted_xtdx_kl);
                         let h_inv_ref = h_inv.as_ref().expect("h_inv present in exact mode");
                         Self::trace_product(h_inv_ref, &h_kl)
                     } else {
@@ -6401,7 +6736,9 @@ pub mod internal {
                             }
                         }
                         let z = probe_z.as_ref().expect("probes present in stochastic mode");
-                        let u = probe_u.as_ref().expect("solved probes present in stochastic mode");
+                        let u = probe_u
+                            .as_ref()
+                            .expect("solved probes present in stochastic mode");
                         let xz = probe_xz
                             .as_ref()
                             .expect("X probes present in stochastic mode");
@@ -6437,6 +6774,234 @@ pub mod internal {
             Ok(hess)
         }
 
+        pub(super) fn compute_smoothing_correction_auto(
+            &self,
+            final_rho: &Array1<f64>,
+            final_fit: &PirlsResult,
+            base_covariance: Option<&Array2<f64>>,
+            final_grad_norm: f64,
+        ) -> Option<Array2<f64>> {
+            // Always compute the fast first-order correction first.
+            let first_order = super::compute_smoothing_correction(self, final_rho, final_fit);
+            let n_rho = final_rho.len();
+            if n_rho == 0 {
+                return first_order;
+            }
+            if n_rho > AUTO_CUBATURE_MAX_RHO_DIM {
+                return first_order;
+            }
+            if final_fit.beta_transformed.len() > AUTO_CUBATURE_MAX_BETA_DIM {
+                return first_order;
+            }
+
+            let near_boundary = final_rho
+                .iter()
+                .any(|&v| (RHO_BOUND - v.abs()) <= AUTO_CUBATURE_BOUNDARY_MARGIN);
+            let grad_norm = if final_grad_norm.is_finite() {
+                final_grad_norm
+            } else {
+                0.0
+            };
+            let high_grad = grad_norm > 1e-3;
+            if !near_boundary && !high_grad {
+                // Keep the hot path cheap when the local linearization is likely sufficient.
+                return first_order;
+            }
+
+            // Build V_rho from the outer Hessian around rho_hat.
+            let mut hessian_rho = match self.compute_laml_hessian_exact(final_rho) {
+                Ok(h) => h,
+                Err(err) => {
+                    log::debug!(
+                        "Auto cubature skipped: exact rho Hessian unavailable ({}).",
+                        err
+                    );
+                    return first_order;
+                }
+            };
+            for i in 0..n_rho {
+                for j in (i + 1)..n_rho {
+                    let avg = 0.5 * (hessian_rho[[i, j]] + hessian_rho[[j, i]]);
+                    hessian_rho[[i, j]] = avg;
+                    hessian_rho[[j, i]] = avg;
+                }
+            }
+            let ridge = 1e-8
+                * hessian_rho
+                    .diag()
+                    .iter()
+                    .map(|&v| v.abs())
+                    .fold(0.0, f64::max)
+                    .max(1e-8);
+            for i in 0..n_rho {
+                hessian_rho[[i, i]] += ridge;
+            }
+            let hessian_rho_inv =
+                match matrix_inverse_with_regularization(&hessian_rho, "auto cubature rho Hessian")
+                {
+                    Some(v) => v,
+                    None => return first_order,
+                };
+
+            let max_rho_var = hessian_rho_inv
+                .diag()
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            if !near_boundary && !high_grad && max_rho_var < 0.1 {
+                return first_order;
+            }
+
+            use crate::faer_ndarray::FaerEigh;
+            use faer::Side;
+            let (evals, evecs) = match hessian_rho_inv.eigh(Side::Lower) {
+                Ok(x) => x,
+                Err(_) => return first_order,
+            };
+            let mut eig_pairs: Vec<(usize, f64)> = evals
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite() && *v > 1e-12)
+                .collect();
+            if eig_pairs.is_empty() {
+                return first_order;
+            }
+            eig_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let total_var: f64 = eig_pairs.iter().map(|(_, v)| *v).sum();
+            if !total_var.is_finite() || total_var <= 0.0 {
+                return first_order;
+            }
+
+            let mut rank = 0usize;
+            let mut captured = 0.0_f64;
+            for (_, eig) in eig_pairs
+                .iter()
+                .take(AUTO_CUBATURE_MAX_EIGENVECTORS.min(eig_pairs.len()))
+            {
+                captured += *eig;
+                rank += 1;
+                if captured / total_var >= AUTO_CUBATURE_TARGET_VAR_FRAC {
+                    break;
+                }
+            }
+            if rank == 0 {
+                return first_order;
+            }
+
+            let base_cov = match base_covariance {
+                Some(v) => v,
+                None => return first_order,
+            };
+            let p = base_cov.nrows();
+            let radius = (rank as f64).sqrt();
+            let mut sigma_points: Vec<Array1<f64>> = Vec::with_capacity(2 * rank);
+            for (eig_idx, eig_val) in eig_pairs.iter().take(rank) {
+                let axis = evecs.column(*eig_idx).to_owned();
+                let scale = radius * eig_val.sqrt();
+                let delta = axis.mapv(|v| v * scale);
+
+                for sign in [1.0_f64, -1.0_f64] {
+                    let mut rho_point = final_rho.clone();
+                    for i in 0..n_rho {
+                        rho_point[i] = (rho_point[i] + sign * delta[i])
+                            .clamp(-RHO_BOUND + 1e-8, RHO_BOUND - 1e-8);
+                    }
+                    sigma_points.push(rho_point);
+                }
+            }
+            if sigma_points.is_empty() {
+                return first_order;
+            }
+
+            // Disable warm-start coupling while evaluating sigma points in parallel.
+            // This keeps point evaluations independent and deterministic.
+            struct WarmStartRestoreGuard<'a> {
+                flag: &'a AtomicBool,
+                prev: bool,
+            }
+            impl Drop for WarmStartRestoreGuard<'_> {
+                fn drop(&mut self) {
+                    self.flag.store(self.prev, Ordering::SeqCst);
+                }
+            }
+            let prev_warm_start = self.warm_start_enabled.swap(false, Ordering::SeqCst);
+            let _warm_start_guard = WarmStartRestoreGuard {
+                flag: &self.warm_start_enabled,
+                prev: prev_warm_start,
+            };
+            let point_results: Vec<Option<(Array2<f64>, Array1<f64>)>> = (0..sigma_points.len())
+                .into_par_iter()
+                .map(|idx| {
+                    let fit_point = self.execute_pirls_if_needed(&sigma_points[idx]).ok()?;
+                    let h_point = map_hessian_to_original_basis(fit_point.as_ref()).ok()?;
+                    let cov_point =
+                        matrix_inverse_with_regularization(&h_point, "auto cubature point")?;
+                    let beta_point = fit_point
+                        .reparam_result
+                        .qs
+                        .dot(fit_point.beta_transformed.as_ref());
+                    Some((cov_point, beta_point))
+                })
+                .collect();
+
+            if point_results.iter().any(|r| r.is_none()) {
+                return first_order;
+            }
+
+            let w = 1.0 / (sigma_points.len() as f64);
+            let mut mean_hinv = Array2::<f64>::zeros((p, p));
+            let mut mean_beta = Array1::<f64>::zeros(p);
+            let mut second_beta = Array2::<f64>::zeros((p, p));
+            for (cov_point, beta_point) in point_results.into_iter().flatten() {
+                mean_hinv += &cov_point.mapv(|v| w * v);
+                mean_beta += &beta_point.mapv(|v| w * v);
+                for i in 0..p {
+                    let bi = beta_point[i];
+                    for j in 0..p {
+                        second_beta[[i, j]] += w * bi * beta_point[j];
+                    }
+                }
+            }
+
+            let mut var_beta = second_beta;
+            for i in 0..p {
+                for j in 0..p {
+                    var_beta[[i, j]] -= mean_beta[i] * mean_beta[j];
+                }
+            }
+
+            let mut total_cov = mean_hinv + var_beta;
+            for i in 0..p {
+                for j in (i + 1)..p {
+                    let avg = 0.5 * (total_cov[[i, j]] + total_cov[[j, i]]);
+                    total_cov[[i, j]] = avg;
+                    total_cov[[j, i]] = avg;
+                }
+            }
+            if !total_cov.iter().all(|v| v.is_finite()) {
+                return first_order;
+            }
+
+            let mut corr = total_cov - base_cov;
+            for i in 0..p {
+                for j in (i + 1)..p {
+                    let avg = 0.5 * (corr[[i, j]] + corr[[j, i]]);
+                    corr[[i, j]] = avg;
+                    corr[[j, i]] = avg;
+                }
+            }
+
+            log::info!(
+                "Using adaptive cubature smoothing correction (rank={}, points={}, near_boundary={}, grad_norm={:.2e}, max_var={:.2e})",
+                rank,
+                2 * rank,
+                near_boundary,
+                grad_norm,
+                max_rho_var
+            );
+            Some(corr)
+        }
+
         /// Run comprehensive gradient diagnostics implementing four strategies:
         /// 1. KKT/Envelope Theorem Audit
         /// 2. Component-wise Finite Difference
@@ -6465,11 +7030,11 @@ pub mod internal {
             let lambdas: Array1<f64> = rho.mapv(f64::exp);
 
             // === Strategy 4: Dual-Ridge Consistency Check ===
-            // The ridge used by PIRLS must match what gradient/cost assume
+            // Compare the PIRLS ridge with the ridge used by cost/gradient paths.
             let dual_ridge = compute_dual_ridge_check(
                 pirls_result.ridge_passport.delta, // Ridge from PIRLS passport
-                ridge_used,              // Ridge passed to cost
-                ridge_used,              // Ridge passed to gradient (same bundle)
+                ridge_used,                        // Ridge passed to cost
+                ridge_used,                        // Ridge passed to gradient (same bundle)
                 beta,
             );
             report.dual_ridge = Some(dual_ridge);
@@ -6730,15 +7295,25 @@ pub mod internal {
                 }
             }
 
-            // 3. Compute correction: J * V_ρ * Jᵀ.
+            // 3. Compute smoothing-parameter uncertainty correction: J * V_rho * J^T.
+            //
+            // Notation mapping to the exact Gaussian-mixture identity:
+            //   rho ~ N(mu, Sigma),  mu = rho_hat,  Sigma = V_rho
+            //   A(rho) = H_rho^{-1},  b(rho) = beta_hat_rho
+            //   Var(beta) = E[A(rho)] + Var(b(rho))   (exact, no truncation)
+            //
+            // This implementation uses the standard first-order truncation around mu:
+            //   E[A(rho)]      ≈ A(mu) = H_p^{-1} = V_beta_cond
+            //   Var(b(rho))    ≈ J * V_rho * J^T,  J = dbeta_hat/drho |_{rho=mu}
+            // so:
+            //   V_total ≈ V_beta_cond + J * V_rho * J^T.
+            //
+            // Exact higher-order terms from the heat-operator / Wick expansion are
+            // not included here.
             //
             // Jacobian identity used here:
-            //   dβ̂/dρ_k = -H_p^{-1}(S_k^ρ β̂),   S_k^ρ = λ_k S_k.
+            //   d(beta_hat)/d(rho_k) = -H_p^{-1}(S_k^rho * beta_hat), S_k^rho = lambda_k S_k.
             // This is the same implicit derivative used in the main gradient code.
-            //
-            // This block is the same first-order uncertainty propagation used in
-            // REML/LAML smoothing-parameter correction:
-            //   V*_β = V_β + J V_ρ Jᵀ.
 
             // We need H_p and beta at the perturbed rho.
             let pirls_res = self.execute_pirls_if_needed(&current_rho)?;
@@ -6750,13 +7325,14 @@ pub mod internal {
 
             let p_dim = beta.len();
 
-            // Invert H_p to get V_beta_cond (conditional covariance)
+            // Invert H_p to get V_beta_cond = H_p^{-1}, i.e. A(mu) in the
+            // first-order approximation above.
             let mut v_beta_cond = Array2::<f64>::zeros((p_dim, p_dim));
             {
                 use crate::faer_ndarray::{FaerArrayView, array2_to_mat_mut};
                 use faer::Side;
                 let h_view = FaerArrayView::new(h_p);
-                // H_p should be PD at convergence
+                // At convergence H_p is typically PD.
                 if let Ok(chol) = faer::linalg::solvers::Llt::new(h_view.as_ref(), Side::Lower) {
                     let mut eye = Array2::<f64>::eye(p_dim);
                     let mut eye_view = array2_to_mat_mut(&mut eye);
@@ -6803,7 +7379,8 @@ pub mod internal {
                 jacobian.column_mut(k).assign(&col);
             }
 
-            // V_corr = J * V_rho * J^T
+            // V_corr approximates Var(b(rho)) under first-order linearization.
+            // V_corr = J * V_rho * J^T.
             let temp = jacobian.dot(&v_rho); // (p, k) * (k, k) -> (p, k)
             let v_corr = temp.dot(&jacobian.t()); // (p, k) * (k, p) -> (p, p)
 
@@ -6812,7 +7389,7 @@ pub mod internal {
                 v_corr.iter().fold(0.0_f64, |a, &b| a.max(b.abs()))
             );
 
-            // Total Covariance
+            // First-order total covariance approximation to Var(beta).
             let v_total = v_beta_cond + v_corr;
 
             Ok((current_rho, Some(v_total)))

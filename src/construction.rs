@@ -573,6 +573,47 @@ pub fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     result
 }
 
+/// Frobenius norm of a dense matrix.
+pub fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
+    matrix.iter().map(|&x| x * x).sum::<f64>().sqrt()
+}
+
+/// Computes the row-wise tensor product (Khatri-Rao product) of two matrices.
+pub fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+    let n_samples = a.nrows();
+    assert_eq!(
+        n_samples,
+        b.nrows(),
+        "Matrices must have same number of rows"
+    );
+
+    let a_cols = a.ncols();
+    let b_cols = b.ncols();
+
+    if n_samples == 0 || a_cols == 0 || b_cols == 0 {
+        return Array2::zeros((n_samples, a_cols * b_cols));
+    }
+
+    let mut result = Array2::zeros((n_samples, a_cols * b_cols));
+    result
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(r, mut row)| {
+            let ar = a.row(r);
+            let br = b.row(r);
+            let mut k = 0;
+            for i in 0..a_cols {
+                let ai = ar[i];
+                for j in 0..b_cols {
+                    row[k] = ai * br[j];
+                    k += 1;
+                }
+            }
+        });
+    result
+}
+
 /// Result of the stable reparameterization algorithm from Wood (2011) Appendix B
 #[derive(Clone)]
 pub struct ReparamResult {
@@ -879,7 +920,7 @@ pub fn precompute_reparam_invariant(
 /// defines the model’s coefficient structure. The function returns the
 /// transformed penalties, the orthogonal basis, and log-determinant
 /// information required by PIRLS.
-pub(crate) fn stable_reparameterization(
+pub fn stable_reparameterization(
     rs_list: &[Array2<f64>],
     lambdas: &[f64],
     p: usize,
@@ -889,7 +930,7 @@ pub(crate) fn stable_reparameterization(
 }
 
 /// Apply stable reparameterization using precomputed lambda-invariant structures.
-pub(crate) fn stable_reparameterization_with_invariant(
+pub fn stable_reparameterization_with_invariant(
     rs_list: &[Array2<f64>],
     lambdas: &[f64],
     p: usize,

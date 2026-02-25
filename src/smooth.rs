@@ -1,8 +1,8 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BasisBuildResult, BasisError, BasisMetadata,
-    DuchonBasisSpec,
-    MaternBasisSpec, ThinPlateBasisSpec, build_bspline_basis_1d, build_duchon_basis,
-    build_matern_basis, build_thin_plate_basis, create_bspline_basis_nd_with_knots,
+    DuchonBasisSpec, MaternBasisSpec, ThinPlateBasisSpec, build_bspline_basis_1d,
+    build_duchon_basis, build_matern_basis, build_thin_plate_basis,
+    create_bspline_basis_nd_with_knots,
 };
 use crate::construction::kronecker_product;
 use crate::estimate::{EstimationError, FitOptions, FitResult, fit_gam};
@@ -208,7 +208,11 @@ fn build_tensor_bspline_basis(
 
     // Reuse the robust 1D builder to ensure the same knot validation and
     // marginal difference-penalty construction as standalone smooth terms.
-    for (dim, (&col, marginal_spec)) in feature_cols.iter().zip(spec.marginal_specs.iter()).enumerate() {
+    for (dim, (&col, marginal_spec)) in feature_cols
+        .iter()
+        .zip(spec.marginal_specs.iter())
+        .enumerate()
+    {
         // Tensor basis uses raw marginal knot-product columns. Applying 1D
         // identifiability constraints here would change marginal penalty sizes
         // without changing the tensor design construction, causing dimension
@@ -238,16 +242,11 @@ fn build_tensor_bspline_basis(
                 })?
                 .clone(),
         );
-        marginal_null_dims.push(
-            *built
-                .nullspace_dims
-                .first()
-                .ok_or_else(|| {
-                    BasisError::InvalidInput(format!(
-                        "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"
-                    ))
-                })?,
-        );
+        marginal_null_dims.push(*built.nullspace_dims.first().ok_or_else(|| {
+            BasisError::InvalidInput(format!(
+                "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"
+            ))
+        })?);
     }
 
     let data_views: Vec<_> = feature_cols.iter().map(|&c| data.column(c)).collect();
@@ -357,9 +356,7 @@ fn build_random_effect_block(
     let mut design = Array2::<f64>::zeros((n, q));
     for (i, &v) in col.iter().enumerate() {
         let bits = v.to_bits();
-        let pos = kept_levels
-            .binary_search(&bits)
-            .ok();
+        let pos = kept_levels.binary_search(&bits).ok();
         if let Some(j) = pos {
             design[[i, j]] = 1.0;
         }
@@ -698,12 +695,7 @@ mod tests {
 
     #[test]
     fn build_smooth_design_rejects_non_none_shape_constraints() {
-        let data = array![
-            [0.0, 0.0],
-            [0.5, 0.2],
-            [1.0, 0.4],
-            [1.5, 0.6],
-        ];
+        let data = array![[0.0, 0.0], [0.5, 0.2], [1.0, 0.4], [1.5, 0.6],];
         let terms = vec![SmoothTermSpec {
             name: "tps_shape".to_string(),
             basis: SmoothBasisSpec::ThinPlate {
@@ -757,11 +749,13 @@ mod tests {
         let design = build_term_collection_design(data.view(), &spec).unwrap();
         assert_eq!(design.design.nrows(), data.nrows());
         assert_eq!(design.intercept_range, 0..1);
-        assert!(design
-            .design
-            .column(design.intercept_range.start)
-            .iter()
-            .all(|&v| (v - 1.0).abs() < 1e-12));
+        assert!(
+            design
+                .design
+                .column(design.intercept_range.start)
+                .iter()
+                .all(|&v| (v - 1.0).abs() < 1e-12)
+        );
         assert!(design.design.ncols() >= 2);
         assert_eq!(design.linear_ranges.len(), 1);
         assert_eq!(design.random_effect_ranges.len(), 0);
