@@ -1151,18 +1151,18 @@ impl<'a> JointRemlState<'a> {
         let base_reparam_invariant =
             precompute_reparam_invariant(&base_rs_list, state.layout_base.p).ok();
         Self {
-            state: RefCell::new(state),
+            state: RwLock::new(state),
             config: config.clone(),
-            cached_beta_base: RefCell::new(cached_beta_base),
-            cached_beta_link: RefCell::new(cached_beta_link),
-            cached_laml: RefCell::new(None),
-            cached_rho: RefCell::new(Array1::zeros(n_base + 1)),
-            cached_edf: RefCell::new(None),
-            last_backfit_iterations: RefCell::new(0),
-            last_converged: RefCell::new(false),
+            cached_beta_base: RwLock::new(cached_beta_base),
+            cached_beta_link: RwLock::new(cached_beta_link),
+            cached_laml: RwLock::new(None),
+            cached_rho: RwLock::new(Array1::zeros(n_base + 1)),
+            cached_edf: RwLock::new(None),
+            last_backfit_iterations: RwLock::new(0),
+            last_converged: RwLock::new(false),
             base_reparam_invariant,
             base_rs_list,
-            eval_count: RefCell::new(0),
+            eval_count: RwLock::new(0),
         }
     }
 
