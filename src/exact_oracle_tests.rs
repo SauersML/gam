@@ -151,6 +151,11 @@ fn laml_gradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f
     analytic_grad[0]
 }
 
+#[inline]
+fn rel_err(a: f64, b: f64) -> f64 {
+    (a - b).abs() / b.abs().max(1e-8)
+}
+
 #[test]
 fn tiny_logit_oracle_gradient_identity_matches_fd_of_log_evidence() {
     let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
@@ -201,6 +206,48 @@ fn tiny_logit_laml_vs_exact_oracle_regular_regime() {
 }
 
 #[test]
+fn tiny_logit_laml_vs_exact_oracle_regular_regime_sweep_is_stable() {
+    let x = array![[1.0, -0.3], [1.0, 0.6], [1.0, 1.2]];
+    let y = array![0.0, 1.0, 1.0];
+    let cfg = OracleConfig::default();
+
+    let mut g_exacts = Vec::new();
+    let mut g_lamls = Vec::new();
+    let mut rels = Vec::new();
+    for rho in [-0.6, -0.3, 0.0, 0.3, 0.6] {
+        let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
+        let g_laml = laml_gradient_external_logit(&y, &x, rho);
+        assert!(g_exact.is_finite() && g_laml.is_finite());
+        g_exacts.push(g_exact);
+        g_lamls.push(g_laml);
+        rels.push(rel_err(g_laml, g_exact));
+    }
+
+    let a = Array1::from_vec(g_lamls);
+    let b = Array1::from_vec(g_exacts);
+    let dot = a.dot(&b);
+    let na = a.dot(&a).sqrt();
+    let nb = b.dot(&b).sqrt();
+    let cosine = if na * nb > 1e-12 { dot / (na * nb) } else { 1.0 };
+    rels.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let median_rel = rels[rels.len() / 2];
+    let max_rel = rels.iter().copied().fold(0.0_f64, f64::max);
+
+    assert!(
+        cosine > 0.85,
+        "regular sweep cosine too low: cosine={cosine:.6}"
+    );
+    assert!(
+        median_rel < 1.0,
+        "regular sweep median relative error too high: median_rel={median_rel:.3e}"
+    );
+    assert!(
+        max_rel < 1.25,
+        "regular sweep max relative error too high: max_rel={max_rel:.3e}"
+    );
+}
+
+#[test]
 fn tiny_logit_laml_vs_exact_oracle_near_separation_stress() {
     // Deliberately near-separable toy design. The point is to track discrepancy
     // behavior under stress, not to enforce tight approximation.
@@ -232,6 +279,38 @@ fn tiny_logit_laml_vs_exact_oracle_near_separation_stress() {
         worst_rel < 2.5,
         "stress-case discrepancy exploded: worst_rel={:.3e}",
         worst_rel
+    );
+}
+
+#[test]
+fn tiny_logit_laml_vs_exact_oracle_stress_sweep_direction_consistent() {
+    let x = array![[1.0, -6.0], [1.0, 0.2], [1.0, 5.8]];
+    let y = array![0.0, 0.0, 1.0];
+    let cfg = OracleConfig {
+        grid_bound: 9.0,
+        steps: 261,
+    };
+
+    let mut mismatches = 0usize;
+    let mut worst_rel = 0.0_f64;
+    for rho in [-0.8, -0.3, 0.2, 0.7, 1.2] {
+        let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
+        let g_laml = laml_gradient_external_logit(&y, &x, rho);
+        if g_exact.is_finite() && g_laml.is_finite() {
+            if g_exact.abs() > 1e-8 && g_laml.abs() > 1e-8 && g_exact.signum() != g_laml.signum() {
+                mismatches += 1;
+            }
+            worst_rel = worst_rel.max(rel_err(g_laml, g_exact));
+        }
+    }
+
+    assert!(
+        mismatches <= 1,
+        "stress sweep produced too many sign mismatches: {mismatches}"
+    );
+    assert!(
+        worst_rel < 2.5,
+        "stress sweep relative error exploded: worst_rel={worst_rel:.3e}"
     );
 }
 
@@ -320,8 +399,13 @@ fn isolation_reparam_pgs_pc_mains_firth() {
     let na = analytic.dot(&analytic).sqrt();
     let nf = fd.dot(&fd).sqrt();
     let cosine = if na * nf > 1e-12 { dot / (na * nf) } else { 1.0 };
+    let rel_l2 = (&analytic - &fd).dot(&(&analytic - &fd)).sqrt() / na.max(nf).max(1e-12);
     assert!(
         cosine > 0.99,
         "isolation mismatch: cosine={cosine:.6}, analytic={analytic:?}, fd={fd:?}"
+    );
+    assert!(
+        rel_l2 < 3e-1,
+        "isolation mismatch: rel_l2={rel_l2:.3e}, analytic={analytic:?}, fd={fd:?}"
     );
 }

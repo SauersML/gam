@@ -75,7 +75,7 @@ impl PenaltyBlocks {
             let b = beta.slice(ndarray::s![block.range.clone()]).to_owned();
             let g = block.matrix.dot(&b);
             let mut dst = grad.slice_mut(ndarray::s![block.range.clone()]);
-            dst += &(block.lambda * g);
+            dst += &(2.0 * block.lambda * g);
         }
         grad
     }
@@ -89,7 +89,7 @@ impl PenaltyBlocks {
             let r = block.range.clone();
             for (i_local, i) in r.clone().enumerate() {
                 for (j_local, j) in r.clone().enumerate() {
-                    h[[i, j]] += block.lambda * block.matrix[[i_local, j_local]];
+                    h[[i, j]] += 2.0 * block.lambda * block.matrix[[i_local, j_local]];
                 }
             }
         }
@@ -347,5 +347,59 @@ impl WorkingModelSurvival {
 impl PirlsWorkingModel for WorkingModelSurvival {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
         self.update_state(beta)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{array, s};
+
+    fn toy_penalties() -> PenaltyBlocks {
+        let s = array![[2.0, 0.5], [0.5, 3.0]];
+        PenaltyBlocks::new(vec![PenaltyBlock {
+            matrix: s,
+            lambda: 1.7,
+            range: 1..3,
+        }])
+    }
+
+    #[test]
+    fn penalty_hessian_matches_gradient_jacobian() {
+        let penalties = toy_penalties();
+        let beta = array![10.0, -0.3, 1.2, 7.0];
+
+        let grad = penalties.gradient(&beta);
+        let h = penalties.hessian(beta.len());
+        let b_block = beta.slice(s![1..3]).to_owned();
+        let expected = 2.0 * 1.7 * array![[2.0, 0.5], [0.5, 3.0]].dot(&b_block);
+
+        assert!((grad[1] - expected[0]).abs() < 1e-12);
+        assert!((grad[2] - expected[1]).abs() < 1e-12);
+        assert!((h[[1, 1]] - 2.0 * 1.7 * 2.0).abs() < 1e-12);
+        assert!((h[[1, 2]] - 2.0 * 1.7 * 0.5).abs() < 1e-12);
+        assert!((h[[2, 1]] - 2.0 * 1.7 * 0.5).abs() < 1e-12);
+        assert!((h[[2, 2]] - 2.0 * 1.7 * 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn penalty_gradient_matches_deviance_finite_difference() {
+        let penalties = toy_penalties();
+        let beta = array![10.0, -0.3, 1.2, 7.0];
+        let grad = penalties.gradient(&beta);
+        let eps = 1e-7;
+
+        for idx in 0..beta.len() {
+            let mut plus = beta.clone();
+            let mut minus = beta.clone();
+            plus[idx] += eps;
+            minus[idx] -= eps;
+            let fd = (penalties.deviance(&plus) - penalties.deviance(&minus)) / (2.0 * eps);
+            assert!(
+                (grad[idx] - fd).abs() < 1e-6,
+                "gradient/deviance mismatch at idx={idx}: grad={} fd={fd}",
+                grad[idx]
+            );
+        }
     }
 }
