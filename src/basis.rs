@@ -1440,6 +1440,11 @@ pub enum BasisMetadata {
         nu: MaternNu,
         nullspace_order: DuchonNullspaceOrder,
     },
+    TensorBSpline {
+        feature_cols: Vec<usize>,
+        knots: Vec<Array1<f64>>,
+        degrees: Vec<usize>,
+    },
 }
 
 /// Standardized basis build result for engine-level composition.

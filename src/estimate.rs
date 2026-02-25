@@ -1130,10 +1130,10 @@ pub struct SmoothingBfgsResult {
 fn finite_diff_gradient_external<F>(
     rho: &Array1<f64>,
     step: f64,
-    objective: &F,
+    objective: &mut F,
 ) -> Result<Array1<f64>, EstimationError>
 where
-    F: Fn(&Array1<f64>) -> Result<f64, EstimationError>,
+    F: FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
 {
     let mut grad = Array1::<f64>::zeros(rho.len());
     for i in 0..rho.len() {
@@ -1155,11 +1155,11 @@ where
 pub fn optimize_log_smoothing_with_multistart<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
-    objective: F,
+    mut objective: F,
     options: &SmoothingBfgsOptions,
 ) -> Result<SmoothingBfgsResult, EstimationError>
 where
-    F: Fn(&Array1<f64>) -> Result<f64, EstimationError>,
+    F: FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
 {
     if num_penalties == 0 {
         let rho = Array1::<f64>::zeros(0);
@@ -1186,7 +1186,7 @@ where
             let rho = to_rho_from_z(z);
             let cost = objective(&rho).unwrap_or(f64::INFINITY);
             let grad_rho =
-                finite_diff_gradient_external(&rho, options.finite_diff_step, &objective)
+                finite_diff_gradient_external(&rho, options.finite_diff_step, &mut objective)
                     .unwrap_or_else(|_| Array1::<f64>::zeros(rho.len()));
             let jac = jacobian_drho_dz_from_rho(&rho);
             let mut grad_z = &grad_rho * &jac;
@@ -1215,7 +1215,7 @@ where
 
         let rho = to_rho_from_z(&solution.final_point);
         let mut grad_rho =
-            finite_diff_gradient_external(&rho, options.finite_diff_step, &objective)?;
+            finite_diff_gradient_external(&rho, options.finite_diff_step, &mut objective)?;
         project_rho_gradient(&rho, &mut grad_rho);
         let grad_norm = grad_rho.dot(&grad_rho).sqrt();
         let stationary = grad_norm <= options.tol.max(1e-6);

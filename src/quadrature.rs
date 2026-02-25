@@ -17,10 +17,9 @@
 //!
 //! # Implementation
 //!
-//! We use adaptive Gauss-Hermite quadrature over increasing node counts
-//! (`7, 11, 15, 21, 31`) and stop when successive rules agree within tolerance.
-//! This preserves the low cost of small rules for well-behaved cases while
-//! capturing wider Gaussian tails when `se_eta` is large.
+//! We use 7-point Gauss-Hermite quadrature, which is exact for polynomials up
+//! to degree 13. For the smooth link functions used in practice, this provides
+//! excellent accuracy with minimal computational cost.
 //!
 //! The nodes and weights are computed at compile time using the Golub-Welsch
 //! algorithm, which finds eigenvalues of the symmetric tridiagonal Jacobi matrix.
@@ -58,63 +57,32 @@
 
 use std::sync::OnceLock;
 
-/// Candidate quadrature orders used by the adaptive rule.
-const ADAPTIVE_ORDERS: [usize; 5] = [7, 11, 15, 21, 31];
-const MIN_SE_FOR_INTEGRATION: f64 = 1e-10;
-const MIN_PROB: f64 = 1e-10;
-const MAX_PROB: f64 = 1.0 - MIN_PROB;
-const MIN_DERIV: f64 = 1e-6;
-const DEFAULT_ABS_TOL: f64 = 5e-8;
-const DEFAULT_REL_TOL: f64 = 5e-7;
+/// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
+const N_POINTS: usize = 7;
 
 /// Quadrature context that owns Gauss-Hermite caches.
 pub struct QuadratureContext {
-    gh_cache: OnceLock<Vec<GaussHermiteRule>>,
-    abs_tol: f64,
-    rel_tol: f64,
+    gh_cache: OnceLock<GaussHermiteRule>,
 }
 
 impl QuadratureContext {
     pub fn new() -> Self {
-        Self::with_tolerance(DEFAULT_ABS_TOL, DEFAULT_REL_TOL)
-    }
-
-    pub fn with_tolerance(abs_tol: f64, rel_tol: f64) -> Self {
         Self {
             gh_cache: OnceLock::new(),
-            abs_tol: abs_tol.max(0.0),
-            rel_tol: rel_tol.max(0.0),
         }
     }
 
-    fn gauss_hermites(&self) -> &[GaussHermiteRule] {
-        self.gh_cache.get_or_init(|| {
-            ADAPTIVE_ORDERS
-                .iter()
-                .copied()
-                .map(compute_gauss_hermite)
-                .collect()
-        })
-    }
-
-    fn converged(&self, prev: f64, curr: f64) -> bool {
-        let scale = prev.abs().max(curr.abs()).max(1.0);
-        (curr - prev).abs() <= self.abs_tol.max(self.rel_tol * scale)
-    }
-}
-
-impl Default for QuadratureContext {
-    fn default() -> Self {
-        Self::new()
+    fn gauss_hermite(&self) -> &GaussHermiteRule {
+        self.gh_cache.get_or_init(compute_gauss_hermite)
     }
 }
 
 /// Gauss-Hermite quadrature rule: nodes and weights.
 struct GaussHermiteRule {
     /// Quadrature nodes (roots of Hermite polynomial)
-    nodes: Vec<f64>,
+    nodes: [f64; N_POINTS],
     /// Quadrature weights (for physicist's Hermite, sum to sqrt(π))
-    weights: Vec<f64>,
+    weights: [f64; N_POINTS],
 }
 
 /// Compute Gauss-Hermite quadrature nodes and weights using the Golub-Welsch algorithm.
@@ -129,17 +97,17 @@ struct GaussHermiteRule {
 ///
 /// The nodes are the eigenvalues, and weights are derived from the first
 /// component of each eigenvector.
-fn compute_gauss_hermite(n_points: usize) -> GaussHermiteRule {
+fn compute_gauss_hermite() -> GaussHermiteRule {
     // Build symmetric tridiagonal Jacobi matrix for physicist's Hermite polynomials
     // For the recurrence aₙHₙ₊₁ = (x - bₙ)Hₙ - cₙHₙ₋₁ where cₙ = n/(2aₙ₋₁)
     // The Jacobi matrix has: J[i,i] = 0, J[i,i+1] = J[i+1,i] = sqrt((i+1)/2)
 
-    let mut diag = vec![0.0f64; n_points]; // All zeros for Hermite
-    let mut off_diag = vec![0.0f64; n_points.saturating_sub(1)];
+    let mut diag = [0.0f64; N_POINTS]; // All zeros for Hermite
+    let mut off_diag = [0.0f64; N_POINTS - 1];
 
-    for (i, od) in off_diag.iter_mut().enumerate() {
+    for i in 0..(N_POINTS - 1) {
         // Off-diagonal: sqrt((i+1)/2) for physicist's Hermite
-        *od = (((i + 1) as f64) / 2.0).sqrt();
+        off_diag[i] = (((i + 1) as f64) / 2.0).sqrt();
     }
 
     // Find eigenvalues and eigenvectors using symmetric tridiagonal QR algorithm
@@ -148,22 +116,22 @@ fn compute_gauss_hermite(n_points: usize) -> GaussHermiteRule {
 
     // Nodes are the eigenvalues (sorted)
     let nodes = eigenvalues;
-    let mut weights = vec![0.0f64; n_points];
+    let mut weights = [0.0f64; N_POINTS];
 
     // Weights: wᵢ = μ₀ * (first component of eigenvector)²
     // For physicist's Hermite: μ₀ = ∫exp(-x²)dx = sqrt(π)
     let mu0 = std::f64::consts::PI.sqrt();
-    for i in 0..n_points {
+    for i in 0..N_POINTS {
         let v0 = eigenvectors[i][0];
         weights[i] = mu0 * v0 * v0;
     }
 
     // Sort nodes (and corresponding weights) in ascending order
-    let mut indices: Vec<usize> = (0..n_points).collect();
+    let mut indices: [usize; N_POINTS] = [0, 1, 2, 3, 4, 5, 6];
     indices.sort_by(|&a, &b| nodes[a].partial_cmp(&nodes[b]).unwrap());
 
-    let sorted_nodes: Vec<f64> = indices.iter().map(|&i| nodes[i]).collect();
-    let sorted_weights: Vec<f64> = indices.iter().map(|&i| weights[i]).collect();
+    let sorted_nodes: [f64; N_POINTS] = std::array::from_fn(|i| nodes[indices[i]]);
+    let sorted_weights: [f64; N_POINTS] = std::array::from_fn(|i| weights[indices[i]]);
 
     GaussHermiteRule {
         nodes: sorted_nodes,
@@ -175,21 +143,20 @@ fn compute_gauss_hermite(n_points: usize) -> GaussHermiteRule {
 ///
 /// Returns (eigenvalues, eigenvectors) where eigenvectors[i] is the i-th eigenvector.
 fn symmetric_tridiagonal_eigen(
-    diag: &mut [f64],
-    off_diag: &mut [f64],
-) -> (Vec<f64>, Vec<Vec<f64>>) {
-    let n_total = diag.len();
+    diag: &mut [f64; N_POINTS],
+    off_diag: &mut [f64; N_POINTS - 1],
+) -> ([f64; N_POINTS], [[f64; N_POINTS]; N_POINTS]) {
     // Initialize eigenvector matrix as identity
-    let mut z: Vec<Vec<f64>> = vec![vec![0.0; n_total]; n_total];
-    for (i, row) in z.iter_mut().enumerate().take(n_total) {
-        row[i] = 1.0;
+    let mut z: [[f64; N_POINTS]; N_POINTS] = [[0.0; N_POINTS]; N_POINTS];
+    for i in 0..N_POINTS {
+        z[i][i] = 1.0;
     }
 
     let eps = 1e-15;
     let max_iter = 100;
 
     // Work on successively smaller submatrices
-    let mut n = n_total;
+    let mut n = N_POINTS;
     while n > 1 {
         // Check for convergence of last off-diagonal element
         for _ in 0..max_iter {
@@ -247,7 +214,7 @@ fn symmetric_tridiagonal_eigen(
                 }
 
                 // Accumulate rotation into eigenvector matrix
-                for i in 0..n_total {
+                for i in 0..N_POINTS {
                     let t = z[k][i];
                     z[k][i] = c * t - s * z[k + 1][i];
                     z[k + 1][i] = s * t + c * z[k + 1][i];
@@ -256,51 +223,7 @@ fn symmetric_tridiagonal_eigen(
         }
     }
 
-    (diag.to_vec(), z)
-}
-
-#[inline]
-fn integrate_logit_with_rule(gh: &GaussHermiteRule, eta: f64, se_eta: f64) -> (f64, f64) {
-    let scale = std::f64::consts::SQRT_2 * se_eta;
-    let norm = 1.0 / std::f64::consts::PI.sqrt();
-
-    let mut sum_mu = 0.0;
-    let mut sum_dmu = 0.0;
-
-    for (&node, &weight) in gh.nodes.iter().zip(gh.weights.iter()) {
-        let eta_i = eta + scale * node;
-        let prob_i = sigmoid(eta_i);
-        let deriv_i = prob_i * (1.0 - prob_i);
-        sum_mu += weight * prob_i;
-        sum_dmu += weight * deriv_i;
-    }
-
-    let mu = (sum_mu * norm).clamp(MIN_PROB, MAX_PROB);
-    let dmu = (sum_dmu * norm).max(MIN_DERIV);
-    (mu, dmu)
-}
-
-#[inline]
-fn adaptive_logit_mean_and_deriv(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
-    let mut prev_mu: Option<f64> = None;
-    let mut prev_dmu: Option<f64> = None;
-    let mut latest = (sigmoid(eta), MIN_DERIV);
-
-    for gh in ctx.gauss_hermites() {
-        let current = integrate_logit_with_rule(gh, eta, se_eta);
-        latest = current;
-
-        if let (Some(pm), Some(pd)) = (prev_mu, prev_dmu) {
-            if ctx.converged(pm, current.0) && ctx.converged(pd, current.1) {
-                break;
-            }
-        }
-
-        prev_mu = Some(current.0);
-        prev_dmu = Some(current.1);
-    }
-
-    latest
+    (*diag, z)
 }
 
 /// Computes the posterior mean probability for a logistic model using
@@ -316,10 +239,29 @@ fn adaptive_logit_mean_and_deriv(ctx: &QuadratureContext, eta: f64, se_eta: f64)
 #[inline]
 pub fn logit_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
     // If SE is negligible, return the mode (standard sigmoid)
-    if se_eta < MIN_SE_FOR_INTEGRATION {
+    if se_eta < 1e-10 {
         return sigmoid(eta);
     }
-    adaptive_logit_mean_and_deriv(ctx, eta, se_eta).0
+
+    let gh = ctx.gauss_hermite();
+
+    // Gauss-Hermite integration: E[f(η)] = ∫ f(η) φ(η) dη
+    // Transform: η = eta + sqrt(2) * se_eta * x, where x ~ standard Hermite measure
+    // This gives: E[f(η)] ≈ (1/sqrt(π)) Σᵢ wᵢ f(eta + sqrt(2) * se_eta * xᵢ)
+    let scale = std::f64::consts::SQRT_2 * se_eta;
+    let mut sum = 0.0;
+
+    for i in 0..N_POINTS {
+        let eta_i = eta + scale * gh.nodes[i];
+        let prob_i = sigmoid(eta_i);
+        sum += gh.weights[i] * prob_i;
+    }
+
+    // Normalize by sqrt(pi) since Hermite weights are for exp(-x²) measure
+    let mean_prob = sum / std::f64::consts::PI.sqrt();
+
+    // Clamp to valid probability range
+    mean_prob.clamp(1e-10, 1.0 - 1e-10)
 }
 
 /// Computes the integrated probability AND its derivative with respect to eta.
@@ -335,13 +277,35 @@ pub fn logit_posterior_mean_with_deriv(
     eta: f64,
     se_eta: f64,
 ) -> (f64, f64) {
+    const MIN_DERIV: f64 = 1e-6;
+
     // If SE is negligible, return standard sigmoid and its derivative
-    if se_eta < MIN_SE_FOR_INTEGRATION {
+    if se_eta < 1e-10 {
         let mu = sigmoid(eta);
         let dmu = (mu * (1.0 - mu)).max(MIN_DERIV);
         return (mu, dmu);
     }
-    adaptive_logit_mean_and_deriv(ctx, eta, se_eta)
+
+    let gh = ctx.gauss_hermite();
+    let scale = std::f64::consts::SQRT_2 * se_eta;
+    let norm = 1.0 / std::f64::consts::PI.sqrt();
+
+    let mut sum_mu = 0.0;
+    let mut sum_dmu = 0.0;
+
+    for i in 0..N_POINTS {
+        let eta_i = eta + scale * gh.nodes[i];
+        let prob_i = sigmoid(eta_i);
+        let deriv_i = prob_i * (1.0 - prob_i); // σ'(η) = σ(η)(1-σ(η))
+
+        sum_mu += gh.weights[i] * prob_i;
+        sum_dmu += gh.weights[i] * deriv_i;
+    }
+
+    let mu = (sum_mu * norm).clamp(1e-10, 1.0 - 1e-10);
+    let dmu = (sum_dmu * norm).max(MIN_DERIV);
+
+    (mu, dmu)
 }
 
 /// Batch version of logit_posterior_mean_with_deriv.
@@ -389,28 +353,61 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
+    fn even_moment_exp_neg_x2(power: usize) -> f64 {
+        debug_assert!(power % 2 == 0);
+        let m = power / 2;
+        let mut odd_double_factorial = 1.0_f64;
+        for k in 0..m {
+            odd_double_factorial *= (2 * k + 1) as f64;
+        }
+        odd_double_factorial * std::f64::consts::PI.sqrt() / 2.0_f64.powi(m as i32)
+    }
+
+    fn normal_pdf(z: f64) -> f64 {
+        (-(z * z) * 0.5).exp() / (2.0 * std::f64::consts::PI).sqrt()
+    }
+
+    fn high_res_sigmoid_integral(eta: f64, se: f64) -> f64 {
+        // Composite Simpson rule over a wide finite interval under N(0,1).
+        let a = -12.0_f64;
+        let b = 12.0_f64;
+        let n = 20_000usize; // even
+        let h = (b - a) / n as f64;
+
+        let integrand = |z: f64| -> f64 { sigmoid(eta + se * z) * normal_pdf(z) };
+
+        let mut sum = integrand(a) + integrand(b);
+        for i in 1..n {
+            let x = a + (i as f64) * h;
+            if i % 2 == 0 {
+                sum += 2.0 * integrand(x);
+            } else {
+                sum += 4.0 * integrand(x);
+            }
+        }
+        (sum * h / 3.0).clamp(1e-10, 1.0 - 1e-10)
+    }
+
     #[test]
     fn test_computed_nodes_symmetric() {
         // Verify computed nodes are symmetric around zero
         let ctx = QuadratureContext::new();
-        let gh = &ctx.gauss_hermites()[0];
-        let n = gh.nodes.len();
-        for i in 0..n / 2 {
-            let j = n - 1 - i;
+        let gh = ctx.gauss_hermite();
+        for i in 0..N_POINTS / 2 {
+            let j = N_POINTS - 1 - i;
             assert_relative_eq!(gh.nodes[i], -gh.nodes[j], epsilon = 1e-12);
         }
         // Middle node should be zero
-        assert_relative_eq!(gh.nodes[n / 2], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(gh.nodes[N_POINTS / 2], 0.0, epsilon = 1e-12);
     }
 
     #[test]
     fn test_computed_weights_symmetric() {
         // Verify computed weights are symmetric
         let ctx = QuadratureContext::new();
-        let gh = &ctx.gauss_hermites()[0];
-        let n = gh.weights.len();
-        for i in 0..n / 2 {
-            let j = n - 1 - i;
+        let gh = ctx.gauss_hermite();
+        for i in 0..N_POINTS / 2 {
+            let j = N_POINTS - 1 - i;
             assert_relative_eq!(gh.weights[i], gh.weights[j], epsilon = 1e-12);
         }
     }
@@ -419,9 +416,38 @@ mod tests {
     fn test_weights_sum_to_sqrt_pi() {
         // Verify weights sum to sqrt(pi) for physicist's Hermite
         let ctx = QuadratureContext::new();
-        let gh = &ctx.gauss_hermites()[0];
+        let gh = ctx.gauss_hermite();
         let sum: f64 = gh.weights.iter().sum();
         assert_relative_eq!(sum, std::f64::consts::PI.sqrt(), epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_matches_known_7_point_constants() {
+        let known_nodes = [
+            -2.651_961_356_835_233_4,
+            -1.673_551_628_767_471_4,
+            -0.816_287_882_858_964_7,
+            0.0,
+            0.816_287_882_858_964_7,
+            1.673_551_628_767_471_4,
+            2.651_961_356_835_233_4,
+        ];
+        let known_weights = [
+            0.000_971_781_245_099_519_1,
+            0.054_515_582_819_127_03,
+            0.425_607_252_610_127_8,
+            0.810_264_617_556_807_3,
+            0.425_607_252_610_127_8,
+            0.054_515_582_819_127_03,
+            0.000_971_781_245_099_519_1,
+        ];
+
+        let ctx = QuadratureContext::new();
+        let gh = ctx.gauss_hermite();
+        for i in 0..N_POINTS {
+            assert_relative_eq!(gh.nodes[i], known_nodes[i], epsilon = 1e-12);
+            assert_relative_eq!(gh.weights[i], known_weights[i], epsilon = 1e-12);
+        }
     }
 
     #[test]
@@ -495,9 +521,9 @@ mod tests {
         // The quadrature should exactly integrate x² against exp(-x²)
         // ∫ x² exp(-x²) dx = sqrt(π)/2
         let ctx = QuadratureContext::new();
-        let gh = &ctx.gauss_hermites()[0];
+        let gh = ctx.gauss_hermite();
         let mut sum = 0.0;
-        for i in 0..gh.nodes.len() {
+        for i in 0..N_POINTS {
             sum += gh.weights[i] * gh.nodes[i] * gh.nodes[i];
         }
         let expected = std::f64::consts::PI.sqrt() / 2.0;
@@ -509,9 +535,9 @@ mod tests {
         // The quadrature should exactly integrate x⁴ against exp(-x²)
         // ∫ x⁴ exp(-x²) dx = 3*sqrt(π)/4
         let ctx = QuadratureContext::new();
-        let gh = &ctx.gauss_hermites()[0];
+        let gh = ctx.gauss_hermite();
         let mut sum = 0.0;
-        for i in 0..gh.nodes.len() {
+        for i in 0..N_POINTS {
             let x = gh.nodes[i];
             sum += gh.weights[i] * x * x * x * x;
         }
@@ -520,31 +546,51 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_matches_high_order_reference_for_wide_se() {
-        let eta = 2.5;
-        let se = 2.2;
-
+    fn test_moment_exactness_up_to_degree_13() {
         let ctx = QuadratureContext::new();
-        let adaptive = logit_posterior_mean(&ctx, eta, se);
+        let gh = ctx.gauss_hermite();
 
-        let gh7 = compute_gauss_hermite(7);
-        let fixed7 = integrate_logit_with_rule(&gh7, eta, se).0;
+        for degree in 0..=13usize {
+            let approx: f64 = (0..N_POINTS)
+                .map(|i| gh.weights[i] * gh.nodes[i].powi(degree as i32))
+                .sum();
 
-        let reference = {
-            let max_rule = ctx
-                .gauss_hermites()
-                .last()
-                .expect("adaptive rules are non-empty");
-            integrate_logit_with_rule(max_rule, eta, se).0
-        };
+            let expected = if degree % 2 == 1 {
+                0.0
+            } else {
+                even_moment_exp_neg_x2(degree)
+            };
 
-        let err_adaptive = (adaptive - reference).abs();
-        let err_fixed7 = (fixed7 - reference).abs();
-        assert!(
-            err_adaptive <= err_fixed7,
-            "adaptive err {} should be <= fixed 7-point err {}",
-            err_adaptive,
-            err_fixed7
-        );
+            let err = (approx - expected).abs();
+            let rel_scale = approx.abs().max(expected.abs()).max(1.0);
+            assert!(
+                err <= 1e-10 || err / rel_scale <= 1e-10,
+                "degree={} approx={} expected={} abs_err={}",
+                degree,
+                approx,
+                expected,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_integrated_sigmoid_matches_high_res_integral_random_pairs() {
+        let ctx = QuadratureContext::new();
+        let mut rng_state = 0x4d595df4d0f33173u64;
+
+        for _ in 0..20 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u_eta = (rng_state as f64) / (u64::MAX as f64);
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u_se = (rng_state as f64) / (u64::MAX as f64);
+
+            let eta = -6.0 + 12.0 * u_eta;
+            let se = 0.02 + 1.5 * u_se;
+
+            let ghq = logit_posterior_mean(&ctx, eta, se);
+            let numeric = high_res_sigmoid_integral(eta, se);
+            assert_relative_eq!(ghq, numeric, epsilon = 8e-4);
+        }
     }
 }

@@ -32,7 +32,6 @@ use crate::types::LinkFunction;
 use crate::visualizer;
 use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use std::sync::RwLock;
 use wolfe_bfgs::BfgsSolution;
 
 // NOTE on z standardization:
@@ -1033,23 +1032,29 @@ pub fn fit_joint_model_engine<'a>(
 
 /// State for REML optimization of the joint model
 /// Wraps JointModelState and provides cost_and_grad for BFGS
-pub struct JointRemlState<'a> {
-    /// The underlying model state (uses RefCell for interior mutability during optimization)
-    state: RwLock<JointModelState<'a>>,
-    /// Configuration
+pub struct JointCore<'a> {
+    state: JointModelState<'a>,
     config: JointModelConfig,
-    /// Cached warm-start coefficients
-    cached_beta_base: RwLock<Array1<f64>>,
-    cached_beta_link: RwLock<Array1<f64>>,
-    /// Cached LAML value for gradient computation
-    cached_laml: RwLock<Option<f64>>,
-    cached_rho: RwLock<Array1<f64>>,
-    cached_edf: RwLock<Option<f64>>,
-    last_backfit_iterations: RwLock<usize>,
-    last_converged: RwLock<bool>,
     base_reparam_invariant: Option<ReparamInvariant>,
     base_rs_list: Vec<Array2<f64>>,
-    eval_count: RwLock<usize>,
+}
+
+pub struct JointEvalContext {
+    /// Cached warm-start coefficients
+    cached_beta_base: Array1<f64>,
+    cached_beta_link: Array1<f64>,
+    /// Cached LAML value for gradient computation
+    cached_laml: Option<f64>,
+    cached_rho: Array1<f64>,
+    cached_edf: Option<f64>,
+    last_backfit_iterations: usize,
+    last_converged: bool,
+    eval_count: usize,
+}
+
+pub struct JointRemlState<'a> {
+    core: JointCore<'a>,
+    eval: JointEvalContext,
 }
 
 struct JointRemlSnapshot {
@@ -1072,7 +1077,7 @@ struct JointRemlSnapshot {
 
 impl JointRemlSnapshot {
     fn new(reml: &JointRemlState<'_>) -> Self {
-        let state = reml.state.read().unwrap();
+        let state = &reml.core.state;
         Self {
             beta_base: state.beta_base.clone(),
             beta_link: state.beta_link.clone(),
@@ -1082,18 +1087,18 @@ impl JointRemlSnapshot {
             link_transform: state.link_transform.clone(),
             s_link_constrained: state.s_link_constrained.clone(),
             n_constrained_basis: state.n_constrained_basis,
-            cached_beta_base: reml.cached_beta_base.read().unwrap().clone(),
-            cached_beta_link: reml.cached_beta_link.read().unwrap().clone(),
-            cached_rho: reml.cached_rho.read().unwrap().clone(),
-            cached_laml: *reml.cached_laml.read().unwrap(),
-            cached_edf: *reml.cached_edf.read().unwrap(),
-            last_backfit_iterations: *reml.last_backfit_iterations.read().unwrap(),
-            last_converged: *reml.last_converged.read().unwrap(),
+            cached_beta_base: reml.eval.cached_beta_base.clone(),
+            cached_beta_link: reml.eval.cached_beta_link.clone(),
+            cached_rho: reml.eval.cached_rho.clone(),
+            cached_laml: reml.eval.cached_laml,
+            cached_edf: reml.eval.cached_edf,
+            last_backfit_iterations: reml.eval.last_backfit_iterations,
+            last_converged: reml.eval.last_converged,
         }
     }
 
-    fn restore(&self, reml: &JointRemlState<'_>) {
-        let mut state = reml.state.write().unwrap();
+    fn restore(&self, reml: &mut JointRemlState<'_>) {
+        let state = &mut reml.core.state;
         state.beta_base = self.beta_base.clone();
         state.beta_link = self.beta_link.clone();
         state.rho = self.rho.clone();
@@ -1102,13 +1107,13 @@ impl JointRemlSnapshot {
         state.link_transform = self.link_transform.clone();
         state.s_link_constrained = self.s_link_constrained.clone();
         state.n_constrained_basis = self.n_constrained_basis;
-        *reml.cached_beta_base.write().unwrap() = self.cached_beta_base.clone();
-        *reml.cached_beta_link.write().unwrap() = self.cached_beta_link.clone();
-        *reml.cached_rho.write().unwrap() = self.cached_rho.clone();
-        *reml.cached_laml.write().unwrap() = self.cached_laml;
-        *reml.cached_edf.write().unwrap() = self.cached_edf;
-        *reml.last_backfit_iterations.write().unwrap() = self.last_backfit_iterations;
-        *reml.last_converged.write().unwrap() = self.last_converged;
+        reml.eval.cached_beta_base = self.cached_beta_base.clone();
+        reml.eval.cached_beta_link = self.cached_beta_link.clone();
+        reml.eval.cached_rho = self.cached_rho.clone();
+        reml.eval.cached_laml = self.cached_laml;
+        reml.eval.cached_edf = self.cached_edf;
+        reml.eval.last_backfit_iterations = self.last_backfit_iterations;
+        reml.eval.last_converged = self.last_converged;
     }
 }
 
@@ -1151,31 +1156,35 @@ impl<'a> JointRemlState<'a> {
         let base_reparam_invariant =
             precompute_reparam_invariant(&base_rs_list, state.layout_base.p).ok();
         Self {
-            state: RwLock::new(state),
-            config: config.clone(),
-            cached_beta_base: RwLock::new(cached_beta_base),
-            cached_beta_link: RwLock::new(cached_beta_link),
-            cached_laml: RwLock::new(None),
-            cached_rho: RwLock::new(Array1::zeros(n_base + 1)),
-            cached_edf: RwLock::new(None),
-            last_backfit_iterations: RwLock::new(0),
-            last_converged: RwLock::new(false),
-            base_reparam_invariant,
-            base_rs_list,
-            eval_count: RwLock::new(0),
+            core: JointCore {
+                state,
+                config: config.clone(),
+                base_reparam_invariant,
+                base_rs_list,
+            },
+            eval: JointEvalContext {
+                cached_beta_base,
+                cached_beta_link,
+                cached_laml: None,
+                cached_rho: Array1::zeros(n_base + 1),
+                cached_edf: None,
+                last_backfit_iterations: 0,
+                last_converged: false,
+                eval_count: 0,
+            },
         }
     }
 
     /// Compute LAML cost for a given ρ
     /// LAML = deviance + log|H_pen| - log|S_λ| (+ prior on ρ)
-    pub fn compute_cost(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-        let mut state = self.state.write().unwrap();
+    pub fn compute_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        let state = &mut self.core.state;
         let n_base = state.s_base.len();
 
         // Set ρ and warm-start from cached coefficients
         state.set_rho(rho.clone());
-        state.beta_base = self.cached_beta_base.read().unwrap().clone();
-        state.beta_link = self.cached_beta_link.read().unwrap().clone();
+        state.beta_base = self.eval.cached_beta_base.clone();
+        state.beta_link = self.eval.cached_beta_link.clone();
 
         // Run inner alternating to convergence
         let mut lambda_base = Array1::<f64>::zeros(n_base);
@@ -1187,8 +1196,8 @@ impl<'a> JointRemlState<'a> {
         let mut prev_deviance = f64::INFINITY;
         let mut iter_count = 0;
         let mut converged = false;
-        for i in 0..self.config.max_backfit_iter {
-            let progress = (i as f64) / (self.config.max_backfit_iter as f64);
+        for i in 0..self.core.config.max_backfit_iter {
+            let progress = (i as f64) / (self.core.config.max_backfit_iter as f64);
             let damping = 0.5 + progress * 0.5;
 
             let u = state.base_linear_predictor();
@@ -1202,7 +1211,7 @@ impl<'a> JointRemlState<'a> {
 
             let delta = (prev_deviance - deviance).abs() / (deviance.abs() + 1.0);
             iter_count = i + 1;
-            if delta < self.config.backfit_tol {
+            if delta < self.core.config.backfit_tol {
                 converged = true;
                 break;
             }
@@ -1210,18 +1219,24 @@ impl<'a> JointRemlState<'a> {
         }
 
         // Cache converged coefficients for warm-start
-        *self.cached_beta_base.write().unwrap() = state.beta_base.clone();
-        *self.cached_beta_link.write().unwrap() = state.beta_link.clone();
+        self.eval.cached_beta_base = state.beta_base.clone();
+        self.eval.cached_beta_link = state.beta_link.clone();
 
         // Compute LAML = deviance + log|H_pen| - log|S_λ|
-        let (laml, edf) = self.compute_laml_at_convergence(&state, &lambda_base, lambda_link);
+        let (laml, edf) = Self::compute_laml_at_convergence(
+            state,
+            &lambda_base,
+            lambda_link,
+            self.core.base_reparam_invariant.as_ref(),
+            &self.core.base_rs_list,
+        );
 
         // Cache for gradient
-        *self.cached_laml.write().unwrap() = Some(laml);
-        *self.cached_rho.write().unwrap() = rho.clone();
-        *self.cached_edf.write().unwrap() = edf;
-        *self.last_backfit_iterations.write().unwrap() = iter_count;
-        *self.last_converged.write().unwrap() = converged;
+        self.eval.cached_laml = Some(laml);
+        self.eval.cached_rho = rho.clone();
+        self.eval.cached_edf = edf;
+        self.eval.last_backfit_iterations = iter_count;
+        self.eval.last_converged = converged;
 
         Ok(-laml)
     }
@@ -1229,10 +1244,11 @@ impl<'a> JointRemlState<'a> {
     /// Compute LAML at the converged solution.
     /// Note: for nonlinear g(u), this uses a Gauss-Newton Hessian approximation.
     fn compute_laml_at_convergence(
-        &self,
         state: &JointModelState,
         lambda_base: &Array1<f64>,
         lambda_link: f64,
+        base_reparam_invariant: Option<&ReparamInvariant>,
+        base_rs_list: &[Array2<f64>],
     ) -> (f64, Option<f64>) {
         let n = state.n_obs();
         let u = state.base_linear_predictor();
@@ -1298,23 +1314,6 @@ impl<'a> JointRemlState<'a> {
                     let mu_i = normal_cdf_approx(e).clamp(PROB_EPS, 1.0 - PROB_EPS);
                     mu[i] = mu_i;
                     let dmu = normal_pdf(e).max(MIN_DMU);
-                    let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
-                    let w = ((dmu * dmu) / var).max(MIN_WEIGHT);
-                    weights[i] = state.weights[i] * w;
-                    residual[i] = weights[i] * (mu_i - state.y[i]) / dmu;
-                }
-            }
-            (LinkFunction::CLogLog, _) => {
-                const PROB_EPS: f64 = 1e-8;
-                const MIN_WEIGHT: f64 = 1e-12;
-                const MIN_DMU: f64 = 1e-6;
-                for i in 0..n {
-                    let e = eta[i].clamp(-30.0, 30.0);
-                    let exp_eta = e.exp();
-                    let surv = (-exp_eta).exp();
-                    let mu_i = (1.0 - surv).clamp(PROB_EPS, 1.0 - PROB_EPS);
-                    mu[i] = mu_i;
-                    let dmu = (exp_eta * surv).max(MIN_DMU);
                     let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
                     let w = ((dmu * dmu) / var).max(MIN_WEIGHT);
                     weights[i] = state.weights[i] * w;
@@ -1442,18 +1441,18 @@ impl<'a> JointRemlState<'a> {
         };
 
         // log|Sλ|_+ from stable reparameterization (base) and eigenvalues (link)
-        let base_reparam = if let Some(invariant) = self.base_reparam_invariant.as_ref() {
+        let base_reparam = if let Some(invariant) = base_reparam_invariant {
             stable_reparameterization_with_invariant_engine(
-                &self.base_rs_list,
+                base_rs_list,
                 &lambda_base.to_vec(),
-                EngineDims::new(state.layout_base.p, self.base_rs_list.len()),
+                EngineDims::new(state.layout_base.p, base_rs_list.len()),
                 invariant,
             )
         } else {
             stable_reparameterization_engine(
-                &self.base_rs_list,
+                base_rs_list,
                 &lambda_base.to_vec(),
-                EngineDims::new(state.layout_base.p, self.base_rs_list.len()),
+                EngineDims::new(state.layout_base.p, base_rs_list.len()),
             )
         }
         .unwrap_or_else(|_| ReparamResult {
@@ -1578,7 +1577,7 @@ impl<'a> JointRemlState<'a> {
         }
 
         let laml = match state.link {
-            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+            LinkFunction::Logit | LinkFunction::Probit => {
                 let penalised_ll = -0.5 * deviance - 0.5 * penalty_term;
                 let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_a
                     + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
@@ -1719,7 +1718,7 @@ impl<'a> JointRemlState<'a> {
     }
 
     /// Compute numerical gradient of LAML w.r.t. ρ using central differences
-    fn compute_gradient_fd(&self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+    fn compute_gradient_fd(&mut self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         let h = 1e-4; // Step size for numerical differentiation
         let n_rho = rho.len();
         let mut grad = Array1::<f64>::zeros(n_rho);
@@ -1767,10 +1766,10 @@ impl<'a> JointRemlState<'a> {
     /// Compute analytic gradient of LAML w.r.t. ρ using a Gauss-Newton Hessian
     /// and explicit differentiation of weights and constrained basis.
     fn compute_gradient_analytic(
-        &self,
+        &mut self,
         rho: &Array1<f64>,
     ) -> Result<(Array1<f64>, bool), EstimationError> {
-        let mut state = self.state.write().unwrap();
+        let state = &mut self.core.state;
         let n_base = state.s_base.len();
 
         if rho.len() != n_base + 1 {
@@ -1788,8 +1787,8 @@ impl<'a> JointRemlState<'a> {
 
         // Set ρ and warm-start from cached coefficients
         state.set_rho(rho.clone());
-        state.beta_base = self.cached_beta_base.read().unwrap().clone();
-        state.beta_link = self.cached_beta_link.read().unwrap().clone();
+        state.beta_base = self.eval.cached_beta_base.clone();
+        state.beta_link = self.eval.cached_beta_link.clone();
 
         let mut lambda_base = Array1::<f64>::zeros(n_base);
         for i in 0..n_base {
@@ -1800,8 +1799,8 @@ impl<'a> JointRemlState<'a> {
         // Run inner alternating to convergence (same as compute_cost).
         let mut prev_deviance = f64::INFINITY;
         let mut converged = false;
-        for i in 0..self.config.max_backfit_iter {
-            let progress = (i as f64) / (self.config.max_backfit_iter as f64);
+        for i in 0..self.core.config.max_backfit_iter {
+            let progress = (i as f64) / (self.core.config.max_backfit_iter as f64);
             let damping = 0.5 + progress * 0.5;
 
             let u = state.base_linear_predictor();
@@ -1814,7 +1813,7 @@ impl<'a> JointRemlState<'a> {
             let deviance = state.irls_base_step(&b_wiggle, &g_prime, &lambda_base, damping);
 
             let delta = (prev_deviance - deviance).abs() / (deviance.abs() + 1.0);
-            if delta < self.config.backfit_tol {
+            if delta < self.core.config.backfit_tol {
                 converged = true;
                 break;
             }
@@ -1822,9 +1821,9 @@ impl<'a> JointRemlState<'a> {
         }
 
         // Cache converged coefficients for warm-start
-        *self.cached_beta_base.write().unwrap() = state.beta_base.clone();
-        *self.cached_beta_link.write().unwrap() = state.beta_link.clone();
-        *self.last_converged.write().unwrap() = converged;
+        self.eval.cached_beta_base = state.beta_base.clone();
+        self.eval.cached_beta_link = state.beta_link.clone();
+        self.eval.last_converged = converged;
 
         let n = state.n_obs();
         let u = state.base_linear_predictor();
@@ -2189,18 +2188,18 @@ impl<'a> JointRemlState<'a> {
         let clamp_mu_frac = clamp_mu_count as f64 / n.max(1) as f64;
         let audit_needed = !converged || clamp_z_frac > 0.05 || clamp_mu_frac > 0.05;
         // Penalty det derivative for base penalties.
-        let base_reparam = if let Some(invariant) = self.base_reparam_invariant.as_ref() {
+        let base_reparam = if let Some(invariant) = self.core.base_reparam_invariant.as_ref() {
             stable_reparameterization_with_invariant_engine(
-                &self.base_rs_list,
+                &self.core.base_rs_list,
                 &lambda_base.to_vec(),
-                EngineDims::new(state.layout_base.p, self.base_rs_list.len()),
+                EngineDims::new(state.layout_base.p, self.core.base_rs_list.len()),
                 invariant,
             )
         } else {
             stable_reparameterization_engine(
-                &self.base_rs_list,
+                &self.core.base_rs_list,
                 &lambda_base.to_vec(),
-                EngineDims::new(state.layout_base.p, self.base_rs_list.len()),
+                EngineDims::new(state.layout_base.p, self.core.base_rs_list.len()),
             )
         }
         .unwrap_or_else(|_| ReparamResult {
@@ -2565,7 +2564,7 @@ impl<'a> JointRemlState<'a> {
     }
 
     /// Compute gradient of LAML w.r.t. ρ using analytic path, with FD fallback.
-    pub fn compute_gradient(&self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+    pub fn compute_gradient(&mut self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         match self.compute_gradient_analytic(rho) {
             Ok((grad, audit_needed)) => {
                 const GRAD_FD_REL_TOL: f64 = 1e-2;
@@ -2605,7 +2604,7 @@ impl<'a> JointRemlState<'a> {
 
     #[cfg(test)]
     pub fn compute_gradient_analytic_for_test(
-        &self,
+        &mut self,
         rho: &Array1<f64>,
     ) -> Result<(Array1<f64>, bool), EstimationError> {
         self.compute_gradient_analytic(rho)
@@ -2613,19 +2612,16 @@ impl<'a> JointRemlState<'a> {
 
     #[cfg(test)]
     pub fn compute_gradient_fd_for_test(
-        &self,
+        &mut self,
         rho: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         self.compute_gradient_fd(rho)
     }
 
     /// Combined cost and gradient for BFGS
-    pub fn cost_and_grad(&self, rho: &Array1<f64>) -> (f64, Array1<f64>) {
-        let eval_num = {
-            let mut count = self.eval_count.write().unwrap();
-            *count += 1;
-            *count
-        };
+    pub fn cost_and_grad(&mut self, rho: &Array1<f64>) -> (f64, Array1<f64>) {
+        self.eval.eval_count += 1;
+        let eval_num = self.eval.eval_count;
         let cost = match self.compute_cost(rho) {
             Ok(val) if val.is_finite() => val,
             Ok(_) => {
@@ -2651,10 +2647,10 @@ impl<'a> JointRemlState<'a> {
 
     /// Extract final result after optimization
     pub fn into_result(self) -> JointModelResult {
-        let cached_edf = *self.cached_edf.read().unwrap();
-        let cached_iters = *self.last_backfit_iterations.read().unwrap();
-        let cached_converged = *self.last_converged.read().unwrap();
-        let state = self.state.into_inner();
+        let cached_edf = self.eval.cached_edf;
+        let cached_iters = self.eval.last_backfit_iterations;
+        let cached_converged = self.eval.last_converged;
+        let state = self.core.state;
         let rho = state.rho.clone();
         let knot_range = state.knot_range.unwrap_or((0.0, 1.0));
         let knot_vector = state
@@ -2717,7 +2713,7 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
     let quad_ctx = QuadratureContext::new();
 
     // Create REML state
-    let reml_state = JointRemlState::new(
+    let mut reml_state = JointRemlState::new(
         y,
         weights,
         x_base,
@@ -2729,9 +2725,9 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
         quad_ctx,
     );
 
-    let n_base = reml_state.state.read().unwrap().s_base.len();
+    let n_base = reml_state.core.state.s_base.len();
     let heuristic_lambda = {
-        let state = reml_state.state.read().unwrap();
+        let state = &reml_state.core.state;
         state
             .knot_vector
             .as_ref()
@@ -2813,7 +2809,7 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
             best_asymmetric_seed = Some((seed.clone(), cost, i));
         }
     }
-    snapshot.restore(&reml_state);
+    snapshot.restore(&mut reml_state);
 
     eprintln!(
         "[JOINT][Seed scan] candidates={} finite={} +inf={} failed={}",
@@ -2871,7 +2867,7 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
             eprintln!("[JOINT][Candidate {label}] Seed cost: {cost:.6}");
         }
 
-        snapshot.restore(&reml_state);
+        snapshot.restore(&mut reml_state);
         let initial_z = rho_to_z(&rho);
         let mut solver = Bfgs::new(initial_z, |z| {
             let rho = z_to_rho(z);
@@ -3273,10 +3269,6 @@ pub fn predict_joint(
                 .map(|i| crate::quadrature::logit_posterior_mean(&quad_ctx, eta_cal[i], eff_se[i]))
                 .collect::<Array1<f64>>(),
             LinkFunction::Probit => eta_cal.mapv(normal_cdf_approx),
-            LinkFunction::CLogLog => eta_cal.mapv(|e| {
-                let z = e.clamp(-30.0, 30.0);
-                1.0 - (-(z.exp())).exp()
-            }),
             LinkFunction::Identity => eta_cal.clone(),
         };
 
@@ -3285,10 +3277,6 @@ pub fn predict_joint(
         let probs = match result.link {
             LinkFunction::Logit => eta_cal.mapv(|e| 1.0 / (1.0 + (-e).exp())),
             LinkFunction::Probit => eta_cal.mapv(normal_cdf_approx),
-            LinkFunction::CLogLog => eta_cal.mapv(|e| {
-                let z = e.clamp(-30.0, 30.0);
-                1.0 - (-(z.exp())).exp()
-            }),
             LinkFunction::Identity => eta_cal.clone(),
         };
         (probs, None)
@@ -3485,7 +3473,7 @@ mod tests {
                     };
                 }
 
-                let reml_state = JointRemlState::new(
+                let mut reml_state = JointRemlState::new(
                     y.view(),
                     weights.view(),
                     x.view(),
@@ -3497,9 +3485,9 @@ mod tests {
                     QuadratureContext::new(),
                 );
                 {
-                    let mut state = reml_state.state.write().unwrap();
+                    let state = &mut reml_state.core.state;
                     state.beta_base = beta_true.clone();
-                    *reml_state.cached_beta_base.write().unwrap() = beta_true.clone();
+                    reml_state.eval.cached_beta_base = beta_true.clone();
                     // Reset knot range and constraints so basis is built from the current u,
                     // not the zero-initialized predictor from JointRemlState::new.
                     state.knot_range = None;

@@ -1,16 +1,14 @@
 use crate::basis::{
     BSplineBasisSpec, BasisBuildResult, BasisError, BasisMetadata, DuchonBasisSpec,
     MaternBasisSpec, ThinPlateBasisSpec, build_bspline_basis_1d, build_duchon_basis,
-    build_matern_basis, build_thin_plate_basis,
+    build_matern_basis, build_thin_plate_basis, create_bspline_basis_nd_with_knots,
 };
-use crate::estimate::{
-    EstimationError, ExternalOptimOptions, FitOptions, FitResult, evaluate_external_cost_and_ridge,
-    evaluate_external_gradients, fit_gam,
-};
+use crate::construction::kronecker_product;
+use crate::estimate::{EstimationError, FitOptions, FitResult, fit_gam};
 use crate::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, ArrayView2, s};
+use std::collections::BTreeSet;
 use std::ops::Range;
-use wolfe_bfgs::Bfgs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShapeConstraint {
@@ -39,6 +37,25 @@ pub enum SmoothBasisSpec {
         feature_cols: Vec<usize>,
         spec: DuchonBasisSpec,
     },
+    /// Tensor-product smooth built from 1D B-spline marginals.
+    ///
+    /// This is the `te()`-style construction used when axes have different units/scales
+    /// (for example, space x time) and isotropic radial kernels are not appropriate.
+    TensorBSpline {
+        feature_cols: Vec<usize>,
+        spec: TensorBSplineSpec,
+    },
+}
+
+/// Tensor-product B-spline smooth specification.
+///
+/// `marginal_specs[i]` is the 1D B-spline setup for `feature_cols[i]`.
+/// The final penalty set is one Kronecker penalty per margin:
+/// `S_i = I ⊗ ... ⊗ S_marginal_i ⊗ ... ⊗ I`, plus optional global ridge.
+#[derive(Debug, Clone)]
+pub struct TensorBSplineSpec {
+    pub marginal_specs: Vec<BSplineBasisSpec>,
+    pub double_penalty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -75,9 +92,24 @@ pub struct LinearTermSpec {
     pub double_penalty: bool,
 }
 
+/// Random-effects term specification.
+///
+/// The selected feature column is interpreted as a categorical grouping variable.
+/// The term contributes a one-hot dummy block with an identity penalty on group
+/// coefficients, equivalent to i.i.d. Gaussian random effects.
+#[derive(Debug, Clone)]
+pub struct RandomEffectTermSpec {
+    pub name: String,
+    pub feature_col: usize,
+    /// If true, drop the lexicographically first group level to use treatment coding.
+    /// If false, keep all levels (full one-hot block, still identifiable under ridge).
+    pub drop_first_level: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TermCollectionSpec {
     pub linear_terms: Vec<LinearTermSpec>,
+    pub random_effect_terms: Vec<RandomEffectTermSpec>,
     pub smooth_terms: Vec<SmoothTermSpec>,
 }
 
@@ -87,6 +119,7 @@ pub struct TermCollectionDesign {
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
     pub linear_ranges: Vec<(String, Range<usize>)>,
+    pub random_effect_ranges: Vec<(String, Range<usize>)>,
     pub smooth: SmoothDesign,
 }
 
@@ -95,32 +128,10 @@ pub struct FittedTermCollection {
     pub design: TermCollectionDesign,
 }
 
-#[derive(Clone, Debug)]
-struct ShapeBlock {
-    range: Range<usize>,
-    shape: ShapeConstraint,
-}
-
 #[derive(Debug, Clone)]
-pub enum MaternLengthScaleOptimization {
-    Fixed,
-    HeuristicDefault,
-    ProfileGrid {
-        num_points: usize,
-        kappa_min_factor: f64,
-        kappa_max_factor: f64,
-    },
-    JointBfgs {
-        max_iter: usize,
-        tol: f64,
-        kappa_fd_step: f64,
-    },
-}
-
-impl Default for MaternLengthScaleOptimization {
-    fn default() -> Self {
-        Self::HeuristicDefault
-    }
+struct RandomEffectBlock {
+    name: String,
+    design: Array2<f64>,
 }
 
 fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f64>, BasisError> {
@@ -140,169 +151,216 @@ fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f6
     Ok(out)
 }
 
-fn nu_to_value(nu: crate::basis::MaternNu) -> f64 {
-    match nu {
-        crate::basis::MaternNu::Half => 0.5,
-        crate::basis::MaternNu::ThreeHalves => 1.5,
-        crate::basis::MaternNu::FiveHalves => 2.5,
-        crate::basis::MaternNu::SevenHalves => 3.5,
-        crate::basis::MaternNu::NineHalves => 4.5,
-    }
-}
-
-fn median_pairwise_distance(x: ArrayView2<'_, f64>) -> Option<f64> {
-    let n = x.nrows();
-    let d = x.ncols();
-    if n < 2 || d == 0 {
-        return None;
-    }
-    let mut dists = Vec::<f64>::with_capacity(n * (n.saturating_sub(1)) / 2);
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let mut dist2 = 0.0;
-            for c in 0..d {
-                let delta = x[[i, c]] - x[[j, c]];
-                dist2 += delta * delta;
-            }
-            let dist = dist2.sqrt();
-            if dist.is_finite() && dist > 0.0 {
-                dists.push(dist);
-            }
-        }
-    }
-    if dists.is_empty() {
-        return None;
-    }
-    dists.sort_by(f64::total_cmp);
-    let m = dists.len();
-    Some(if m % 2 == 1 {
-        dists[m / 2]
-    } else {
-        0.5 * (dists[m / 2 - 1] + dists[m / 2])
-    })
-}
-
-fn matern_heuristic_length_scale(
-    data: ArrayView2<'_, f64>,
-    feature_cols: &[usize],
-    nu: crate::basis::MaternNu,
-) -> Option<f64> {
-    let x = select_columns(data, feature_cols).ok()?;
-    let med = median_pairwise_distance(x.view())?;
-    let kappa = (2.0 * nu_to_value(nu)).sqrt() / med.max(1e-12);
-    Some(1.0 / kappa.max(1e-12))
-}
-
-fn collect_matern_terms(spec: &TermCollectionSpec) -> Vec<(usize, Vec<usize>, MaternBasisSpec)> {
-    let mut out = Vec::new();
-    for (idx, term) in spec.smooth_terms.iter().enumerate() {
-        if let SmoothBasisSpec::Matern {
-            feature_cols,
-            spec: mspec,
-        } = &term.basis
-        {
-            out.push((idx, feature_cols.clone(), mspec.clone()));
-        }
+fn cumulative_exp(values: &Array1<f64>, sign: f64) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(values.len());
+    let mut run = 0.0;
+    for i in 0..values.len() {
+        run += values[i].exp();
+        out[i] = sign * run;
     }
     out
 }
 
-fn apply_matern_length_scales(
-    data: ArrayView2<'_, f64>,
-    spec: &TermCollectionSpec,
-    mode: &MaternLengthScaleOptimization,
-    override_kappas: Option<&[f64]>,
-) -> Result<TermCollectionSpec, EstimationError> {
-    let mut updated = spec.clone();
-    let mut override_i = 0usize;
-    for term in &mut updated.smooth_terms {
-        let SmoothBasisSpec::Matern {
-            feature_cols,
-            spec: mspec,
-        } = &mut term.basis
-        else {
-            continue;
-        };
-
-        if let Some(kappas) = override_kappas {
-            if override_i >= kappas.len() {
-                return Err(EstimationError::InvalidInput(
-                    "override kappas length is smaller than number of Matérn terms".to_string(),
-                ));
-            }
-            let kappa = kappas[override_i];
-            mspec.length_scale = 1.0 / kappa.max(1e-12);
-            override_i += 1;
-            continue;
-        }
-
-        match mode {
-            MaternLengthScaleOptimization::HeuristicDefault => {
-                if !(mspec.length_scale.is_finite() && mspec.length_scale > 0.0)
-                    && let Some(ls) = matern_heuristic_length_scale(data, feature_cols, mspec.nu)
-                {
-                    mspec.length_scale = ls;
-                }
-            }
-            MaternLengthScaleOptimization::Fixed
-            | MaternLengthScaleOptimization::ProfileGrid { .. }
-            | MaternLengthScaleOptimization::JointBfgs { .. } => {}
-        }
+fn second_cumulative_exp(values: &Array1<f64>, sign: f64) -> Array1<f64> {
+    let first = cumulative_exp(values, sign);
+    let mut out = Array1::<f64>::zeros(values.len());
+    let mut run = 0.0;
+    for i in 0..values.len() {
+        run += first[i];
+        out[i] = run;
     }
-    if let Some(kappas) = override_kappas
-        && override_i != kappas.len()
-    {
-        return Err(EstimationError::InvalidInput(format!(
-            "override kappas length mismatch: consumed {}, provided {}",
-            override_i,
-            kappas.len()
+    out
+}
+
+fn build_tensor_bspline_basis(
+    data: ArrayView2<'_, f64>,
+    feature_cols: &[usize],
+    spec: &TensorBSplineSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    if feature_cols.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "TensorBSpline requires at least one feature column".to_string(),
+        ));
+    }
+    if feature_cols.len() != spec.marginal_specs.len() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "TensorBSpline feature/spec mismatch: feature_cols={}, marginal_specs={}",
+            feature_cols.len(),
+            spec.marginal_specs.len()
         )));
     }
-    Ok(updated)
-}
-
-fn single_matern_term(spec: &TermCollectionSpec) -> Option<(usize, Vec<usize>, MaternBasisSpec)> {
-    let all = collect_matern_terms(spec);
-    if all.len() == 1 {
-        Some(all[0].clone())
-    } else {
-        None
+    let p = data.ncols();
+    for &c in feature_cols {
+        if c >= p {
+            return Err(BasisError::DimensionMismatch(format!(
+                "tensor feature column {c} is out of bounds for data with {p} columns"
+            )));
+        }
     }
+
+    let mut marginal_knots = Vec::<Array1<f64>>::with_capacity(feature_cols.len());
+    let mut marginal_degrees = Vec::<usize>::with_capacity(feature_cols.len());
+    let mut marginal_num_basis = Vec::<usize>::with_capacity(feature_cols.len());
+    let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
+    let mut marginal_null_dims = Vec::<usize>::with_capacity(feature_cols.len());
+
+    // Reuse the robust 1D builder to ensure the same knot validation and
+    // marginal difference-penalty construction as standalone smooth terms.
+    for (dim, (&col, marginal_spec)) in feature_cols.iter().zip(spec.marginal_specs.iter()).enumerate() {
+        let built = build_bspline_basis_1d(data.column(col), marginal_spec)?;
+        let knots = match built.metadata {
+            BasisMetadata::BSpline1D { knots } => knots,
+            _ => {
+                return Err(BasisError::InvalidInput(format!(
+                    "internal TensorBSpline error at dim {dim}: expected BSpline1D metadata"
+                )));
+            }
+        };
+        marginal_knots.push(knots);
+        marginal_degrees.push(marginal_spec.degree);
+        marginal_num_basis.push(built.design.ncols());
+        marginal_penalties.push(
+            built
+                .penalties
+                .first()
+                .ok_or_else(|| {
+                    BasisError::InvalidInput(format!(
+                        "internal TensorBSpline error at dim {dim}: missing marginal penalty"
+                    ))
+                })?
+                .clone(),
+        );
+        marginal_null_dims.push(
+            *built
+                .nullspace_dims
+                .first()
+                .ok_or_else(|| {
+                    BasisError::InvalidInput(format!(
+                        "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"
+                    ))
+                })?,
+        );
+    }
+
+    let data_views: Vec<_> = feature_cols.iter().map(|&c| data.column(c)).collect();
+    let knot_views: Vec<_> = marginal_knots.iter().map(|k| k.view()).collect();
+    let (basis, _) =
+        create_bspline_basis_nd_with_knots(&data_views, &knot_views, &marginal_degrees)?;
+    let design = (*basis).clone();
+
+    let total_cols = design.ncols();
+    let mut penalties = Vec::<Array2<f64>>::with_capacity(
+        marginal_penalties.len() + if spec.double_penalty { 1 } else { 0 },
+    );
+    let mut nullspace_dims = Vec::<usize>::with_capacity(
+        marginal_null_dims.len() + if spec.double_penalty { 1 } else { 0 },
+    );
+
+    for dim in 0..marginal_penalties.len() {
+        let mut s_dim = Array2::<f64>::eye(1);
+        for (j, &qj) in marginal_num_basis.iter().enumerate() {
+            let factor = if j == dim {
+                marginal_penalties[j].clone()
+            } else {
+                Array2::<f64>::eye(qj)
+            };
+            s_dim = kronecker_product(&s_dim, &factor);
+        }
+
+        let mut null_dim = marginal_null_dims[dim];
+        for (j, &qj) in marginal_num_basis.iter().enumerate() {
+            if j == dim {
+                continue;
+            }
+            null_dim = null_dim.checked_mul(qj).ok_or_else(|| {
+                BasisError::DimensionMismatch(
+                    "TensorBSpline null-space dimension overflow".to_string(),
+                )
+            })?;
+        }
+
+        penalties.push(s_dim);
+        nullspace_dims.push(null_dim);
+    }
+
+    if spec.double_penalty {
+        penalties.push(Array2::<f64>::eye(total_cols));
+        nullspace_dims.push(0);
+    }
+
+    Ok(BasisBuildResult {
+        design,
+        penalties,
+        nullspace_dims,
+        metadata: BasisMetadata::TensorBSpline {
+            feature_cols: feature_cols.to_vec(),
+            knots: marginal_knots,
+            degrees: marginal_degrees,
+        },
+    })
 }
 
-fn fit_with_spec(
+fn build_random_effect_block(
     data: ArrayView2<'_, f64>,
-    y: Array1<f64>,
-    weights: Array1<f64>,
-    offset: Array1<f64>,
-    spec: &TermCollectionSpec,
-    family: LikelihoodFamily,
-    options: &FitOptions,
-) -> Result<FittedTermCollection, EstimationError> {
-    let design = build_term_collection_design(data, spec)?;
-    let mut fit = fit_gam(
-        design.design.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &design.penalties,
-        family,
-        &FitOptions {
-            max_iter: options.max_iter,
-            tol: options.tol,
-            nullspace_dims: design.nullspace_dims.clone(),
-        },
-    )?;
-    apply_shape_constraints_if_needed(
-        &mut fit,
-        &design,
-        y.view(),
-        weights.view(),
-        offset.view(),
-        family,
-        options,
-    )?;
-    Ok(FittedTermCollection { fit, design })
+    spec: &RandomEffectTermSpec,
+) -> Result<RandomEffectBlock, BasisError> {
+    let n = data.nrows();
+    let p = data.ncols();
+    if spec.feature_col >= p {
+        return Err(BasisError::DimensionMismatch(format!(
+            "random-effect term '{}' feature column {} out of bounds for {} columns",
+            spec.name, spec.feature_col, p
+        )));
+    }
+
+    let col = data.column(spec.feature_col);
+    if col.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(format!(
+            "random-effect term '{}' contains non-finite group values",
+            spec.name
+        )));
+    }
+
+    let mut levels_set = BTreeSet::<u64>::new();
+    for &v in col {
+        levels_set.insert(v.to_bits());
+    }
+    if levels_set.is_empty() {
+        return Err(BasisError::InvalidInput(format!(
+            "random-effect term '{}' has no observed levels",
+            spec.name
+        )));
+    }
+    let levels: Vec<u64> = levels_set.into_iter().collect();
+    let start_idx = if spec.drop_first_level && levels.len() > 1 {
+        1usize
+    } else {
+        0usize
+    };
+    let kept_levels = &levels[start_idx..];
+    if kept_levels.is_empty() {
+        return Err(BasisError::InvalidInput(format!(
+            "random-effect term '{}' drops all levels; keep at least one level",
+            spec.name
+        )));
+    }
+
+    let q = kept_levels.len();
+    let mut design = Array2::<f64>::zeros((n, q));
+    for (i, &v) in col.iter().enumerate() {
+        let bits = v.to_bits();
+        let pos = kept_levels
+            .binary_search(&bits)
+            .ok();
+        if let Some(j) = pos {
+            design[[i, j]] = 1.0;
+        }
+    }
+
+    Ok(RandomEffectBlock {
+        name: spec.name.clone(),
+        design,
+    })
 }
 
 impl SmoothDesign {
@@ -317,7 +375,14 @@ impl SmoothDesign {
                 "unconstrained coefficient vector cannot be empty".to_string(),
             ));
         }
-        Ok(theta_to_beta_range(unconstrained.view(), shape))
+        let mapped = match shape {
+            ShapeConstraint::None => unconstrained.clone(),
+            ShapeConstraint::MonotoneIncreasing => cumulative_exp(unconstrained, 1.0),
+            ShapeConstraint::MonotoneDecreasing => cumulative_exp(unconstrained, -1.0),
+            ShapeConstraint::Convex => second_cumulative_exp(unconstrained, 1.0),
+            ShapeConstraint::Concave => second_cumulative_exp(unconstrained, -1.0),
+        };
+        Ok(mapped)
     }
 }
 
@@ -333,6 +398,12 @@ pub fn build_smooth_design(
     let mut local_dims = Vec::<usize>::with_capacity(terms.len());
 
     for term in terms {
+        if term.shape != ShapeConstraint::None {
+            return Err(BasisError::InvalidInput(format!(
+                "ShapeConstraint::{:?} is not enforced in the current linear fit pipeline; use ShapeConstraint::None or a constrained/nonlinear solver",
+                term.shape
+            )));
+        }
         let built: BasisBuildResult = match &term.basis {
             SmoothBasisSpec::BSpline1D { feature_col, spec } => {
                 if *feature_col >= data.ncols() {
@@ -356,6 +427,9 @@ pub fn build_smooth_design(
             SmoothBasisSpec::Duchon { feature_cols, spec } => {
                 let x = select_columns(data, feature_cols)?;
                 build_duchon_basis(x.view(), spec)?
+            }
+            SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
+                build_tensor_bspline_basis(data, feature_cols, spec)?
             }
         };
 
@@ -417,312 +491,6 @@ pub fn build_smooth_design(
     })
 }
 
-fn stable_exp(theta: f64) -> f64 {
-    theta.clamp(-40.0, 40.0).exp()
-}
-
-fn theta_to_beta_range(theta: ndarray::ArrayView1<'_, f64>, shape: ShapeConstraint) -> Array1<f64> {
-    let n = theta.len();
-    let mut beta = Array1::<f64>::zeros(n);
-    match shape {
-        ShapeConstraint::None => beta.assign(&theta),
-        ShapeConstraint::MonotoneIncreasing | ShapeConstraint::MonotoneDecreasing => {
-            let sign = if shape == ShapeConstraint::MonotoneIncreasing {
-                1.0
-            } else {
-                -1.0
-            };
-            if n == 0 {
-                return beta;
-            }
-            let base = theta[0];
-            let mut run = 0.0;
-            beta[0] = base;
-            for i in 1..n {
-                run += stable_exp(theta[i]);
-                beta[i] = base + sign * run;
-            }
-        }
-        ShapeConstraint::Convex | ShapeConstraint::Concave => {
-            let sign = if shape == ShapeConstraint::Convex {
-                1.0
-            } else {
-                -1.0
-            };
-            if n == 0 {
-                return beta;
-            }
-            beta[0] = theta[0];
-            if n == 1 {
-                return beta;
-            }
-            let mut first = theta[1];
-            beta[1] = beta[0] + first;
-            for i in 2..n {
-                first += sign * stable_exp(theta[i]);
-                beta[i] = beta[i - 1] + first;
-            }
-        }
-    }
-    beta
-}
-
-fn add_shape_chain_rule_grad(
-    grad_theta: &mut Array1<f64>,
-    grad_beta: ndarray::ArrayView1<'_, f64>,
-    theta: ndarray::ArrayView1<'_, f64>,
-    block: &ShapeBlock,
-) {
-    match block.shape {
-        ShapeConstraint::None => {
-            for i in 0..block.range.len() {
-                grad_theta[block.range.start + i] = grad_beta[i];
-            }
-        }
-        ShapeConstraint::MonotoneIncreasing | ShapeConstraint::MonotoneDecreasing => {
-            let sign = if block.shape == ShapeConstraint::MonotoneIncreasing {
-                1.0
-            } else {
-                -1.0
-            };
-            let n = block.range.len();
-            if n == 0 {
-                return;
-            }
-            grad_theta[block.range.start] = grad_beta.sum();
-            let mut suffix = 0.0;
-            for k_rev in 0..(n - 1) {
-                let k = n - 1 - k_rev;
-                suffix += grad_beta[k];
-                grad_theta[block.range.start + k] = sign * stable_exp(theta[k]) * suffix;
-            }
-        }
-        ShapeConstraint::Convex | ShapeConstraint::Concave => {
-            let sign = if block.shape == ShapeConstraint::Convex {
-                1.0
-            } else {
-                -1.0
-            };
-            let n = block.range.len();
-            if n == 0 {
-                return;
-            }
-            // Base intercept contribution.
-            grad_theta[block.range.start] = grad_beta.sum();
-            if n == 1 {
-                return;
-            }
-            // Initial slope (theta[1]) contributes to beta[i] for i>=1 with weight i.
-            let mut slope_grad = 0.0;
-            for i in 1..n {
-                slope_grad += (i as f64) * grad_beta[i];
-            }
-            grad_theta[block.range.start + 1] = slope_grad;
-
-            let mut s1 = 0.0; // Σ_{i>=k} grad_beta[i]
-            let mut s2 = 0.0; // Σ_{i>=k} i*grad_beta[i] (local index)
-            for k_rev in 0..(n - 2) {
-                let k = n - 1 - k_rev;
-                let g = grad_beta[k];
-                s1 += g;
-                s2 += (k as f64) * g;
-                let weighted = s2 - ((k as f64) - 1.0) * s1; // Σ_{i>=k} (i-k+1) g_i
-                grad_theta[block.range.start + k] = sign * stable_exp(theta[k]) * weighted;
-            }
-        }
-    }
-}
-
-fn initial_theta_from_beta(beta: ndarray::ArrayView1<'_, f64>, block: &ShapeBlock) -> Array1<f64> {
-    let n = block.range.len();
-    let mut theta = Array1::<f64>::zeros(n);
-    let eps = 1e-6;
-    match block.shape {
-        ShapeConstraint::None => theta.assign(&beta),
-        ShapeConstraint::MonotoneIncreasing => {
-            if n == 0 {
-                return theta;
-            }
-            theta[0] = beta[0];
-            let mut prev = beta[0];
-            for i in 1..n {
-                let inc = (beta[i] - prev).max(eps);
-                theta[i] = inc.ln();
-                prev = beta[i];
-            }
-        }
-        ShapeConstraint::MonotoneDecreasing => {
-            if n == 0 {
-                return theta;
-            }
-            theta[0] = beta[0];
-            let mut prev = beta[0];
-            for i in 1..n {
-                let inc = (-(beta[i] - prev)).max(eps);
-                theta[i] = inc.ln();
-                prev = beta[i];
-            }
-        }
-        ShapeConstraint::Convex => {
-            if n == 0 {
-                return theta;
-            }
-            theta[0] = beta[0];
-            if n == 1 {
-                return theta;
-            }
-            let mut prev_first = beta[1] - beta[0];
-            theta[1] = prev_first;
-            for i in 2..n {
-                let first = beta[i] - beta[i - 1];
-                let inc = (first - prev_first).max(eps);
-                theta[i] = inc.ln();
-                prev_first = first;
-            }
-        }
-        ShapeConstraint::Concave => {
-            if n == 0 {
-                return theta;
-            }
-            theta[0] = beta[0];
-            if n == 1 {
-                return theta;
-            }
-            let mut prev_first = beta[1] - beta[0];
-            theta[1] = prev_first;
-            for i in 2..n {
-                let first = beta[i] - beta[i - 1];
-                let inc = (-(first - prev_first)).max(eps);
-                theta[i] = inc.ln();
-                prev_first = first;
-            }
-        }
-    }
-    theta
-}
-
-fn apply_shape_constraints_if_needed(
-    fit: &mut FitResult,
-    design: &TermCollectionDesign,
-    y: ndarray::ArrayView1<'_, f64>,
-    weights: ndarray::ArrayView1<'_, f64>,
-    offset: ndarray::ArrayView1<'_, f64>,
-    family: LikelihoodFamily,
-    options: &FitOptions,
-) -> Result<(), EstimationError> {
-    let p_lin = design.linear_ranges.len();
-    let mut shape_blocks: Vec<ShapeBlock> = Vec::new();
-    for term in &design.smooth.terms {
-        if term.shape == ShapeConstraint::None {
-            continue;
-        }
-        let start = p_lin + term.coeff_range.start;
-        let end = p_lin + term.coeff_range.end;
-        shape_blocks.push(ShapeBlock {
-            range: start..end,
-            shape: term.shape,
-        });
-    }
-    if shape_blocks.is_empty() {
-        return Ok(());
-    }
-    if !matches!(family, LikelihoodFamily::GaussianIdentity) {
-        return Err(EstimationError::InvalidInput(
-            "Shape constraints are currently supported for GaussianIdentity in fit_term_collection"
-                .to_string(),
-        ));
-    }
-
-    let x = &design.design;
-    let n = x.nrows();
-    let p = x.ncols();
-    let mut s_lambda = Array2::<f64>::zeros((p, p));
-    for (k, s) in design.penalties.iter().enumerate() {
-        let lambda = fit.lambdas.get(k).copied().unwrap_or(0.0);
-        if lambda == 0.0 {
-            continue;
-        }
-        s_lambda = s_lambda + &(s * lambda);
-    }
-
-    let mut theta0 = fit.beta.clone();
-    for block in &shape_blocks {
-        let beta_local = fit.beta.slice(s![block.range.start..block.range.end]);
-        let t_local = initial_theta_from_beta(beta_local, block);
-        theta0
-            .slice_mut(s![block.range.start..block.range.end])
-            .assign(&t_local);
-    }
-
-    let eval = |theta: &Array1<f64>| -> (f64, Array1<f64>) {
-        let mut beta = theta.clone();
-        for block in &shape_blocks {
-            let local_theta = theta.slice(s![block.range.start..block.range.end]);
-            let beta_local = theta_to_beta_range(local_theta, block.shape);
-            beta.slice_mut(s![block.range.start..block.range.end])
-                .assign(&beta_local);
-        }
-
-        let mut eta = x.dot(&beta);
-        eta += &offset;
-        let resid = y.to_owned() - &eta;
-        let w_resid = &resid * &weights;
-        let data_term = 0.5 * weights.dot(&resid.mapv(|r| r * r));
-        let penalty_term = 0.5 * beta.dot(&s_lambda.dot(&beta));
-        let cost = data_term + penalty_term;
-
-        let grad_beta = -x.t().dot(&w_resid) + s_lambda.dot(&beta);
-        let mut grad_theta = grad_beta.clone();
-        for block in &shape_blocks {
-            let gb = grad_beta.slice(s![block.range.start..block.range.end]);
-            let lt = theta.slice(s![block.range.start..block.range.end]);
-            add_shape_chain_rule_grad(&mut grad_theta, gb, lt, block);
-        }
-        (cost, grad_theta)
-    };
-
-    let mut solver = Bfgs::new(theta0, eval)
-        .with_tolerance(options.tol.max(1e-8))
-        .with_max_iterations(options.max_iter.max(100))
-        .with_rng_seed(0x5A1E_u64);
-    let solution = match solver.run() {
-        Ok(sol) => sol,
-        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
-        Err(e) => {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "shape-constrained coefficient optimization failed: {e:?}"
-            )));
-        }
-    };
-    let theta_star = solution.final_point;
-    let mut beta_star = theta_star.clone();
-    for block in &shape_blocks {
-        let local_theta = theta_star.slice(s![block.range.start..block.range.end]);
-        let beta_local = theta_to_beta_range(local_theta, block.shape);
-        beta_star
-            .slice_mut(s![block.range.start..block.range.end])
-            .assign(&beta_local);
-    }
-    fit.beta = beta_star;
-
-    // Recompute Gaussian scale after constrained coefficient update.
-    let mut eta = x.dot(&fit.beta);
-    eta += &offset;
-    let resid = y.to_owned() - &eta;
-    let wrss = weights.dot(&resid.mapv(|r| r * r));
-    fit.scale = wrss / ((n as f64 - fit.edf_total).max(1.0));
-
-    // Existing covariance fields come from unconstrained PIRLS and are invalid after
-    // nonlinear constrained re-optimization. Clear them to avoid misleading inference.
-    fit.beta_covariance = None;
-    fit.beta_standard_errors = None;
-    fit.beta_covariance_corrected = None;
-    fit.beta_standard_errors_corrected = None;
-
-    Ok(())
-}
-
 pub fn build_term_collection_design(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
@@ -730,6 +498,11 @@ pub fn build_term_collection_design(
     let n = data.nrows();
     let p_data = data.ncols();
     let smooth = build_smooth_design(data, &spec.smooth_terms)?;
+    let random_blocks: Vec<RandomEffectBlock> = spec
+        .random_effect_terms
+        .iter()
+        .map(|term| build_random_effect_block(data, term))
+        .collect::<Result<_, _>>()?;
 
     for linear in &spec.linear_terms {
         if linear.feature_col >= p_data {
@@ -741,8 +514,9 @@ pub fn build_term_collection_design(
     }
 
     let p_lin = spec.linear_terms.len();
+    let p_rand: usize = random_blocks.iter().map(|b| b.design.ncols()).sum();
     let p_smooth = smooth.design.ncols();
-    let p_total = p_lin + p_smooth;
+    let p_total = p_lin + p_rand + p_smooth;
     let mut design = Array2::<f64>::zeros((n, p_total));
 
     let mut linear_ranges = Vec::<(String, Range<usize>)>::with_capacity(p_lin);
@@ -752,8 +526,22 @@ pub fn build_term_collection_design(
             .assign(&data.column(linear.feature_col));
         linear_ranges.push((linear.name.clone(), j..(j + 1)));
     }
+    let mut random_effect_ranges =
+        Vec::<(String, Range<usize>)>::with_capacity(random_blocks.len());
+    let mut col_cursor = p_lin;
+    for block in &random_blocks {
+        let q = block.design.ncols();
+        let end = col_cursor + q;
+        design
+            .slice_mut(s![.., col_cursor..end])
+            .assign(&block.design);
+        random_effect_ranges.push((block.name.clone(), col_cursor..end));
+        col_cursor = end;
+    }
     if p_smooth > 0 {
-        design.slice_mut(s![.., p_lin..]).assign(&smooth.design);
+        design
+            .slice_mut(s![.., (p_lin + p_rand)..])
+            .assign(&smooth.design);
     }
 
     let mut penalties = Vec::<Array2<f64>>::new();
@@ -769,11 +557,20 @@ pub fn build_term_collection_design(
         nullspace_dims.push(0);
     }
 
+    for (_name, range) in &random_effect_ranges {
+        let mut s = Array2::<f64>::zeros((p_total, p_total));
+        for j in range.clone() {
+            s[[j, j]] = 1.0;
+        }
+        penalties.push(s);
+        nullspace_dims.push(0);
+    }
+
     for (s_local, &ns) in smooth.penalties.iter().zip(smooth.nullspace_dims.iter()) {
         let mut s = Array2::<f64>::zeros((p_total, p_total));
-        let start = p_lin;
-        let end = p_lin + p_smooth;
-        s.slice_mut(s![start..end, start..end]).assign(s_local);
+        let start = p_lin + p_rand;
+        s.slice_mut(s![start..(start + p_smooth), start..(start + p_smooth)])
+            .assign(s_local);
         penalties.push(s);
         nullspace_dims.push(ns);
     }
@@ -783,6 +580,7 @@ pub fn build_term_collection_design(
         penalties,
         nullspace_dims,
         linear_ranges,
+        random_effect_ranges,
         smooth,
     })
 }
@@ -796,284 +594,21 @@ pub fn fit_term_collection(
     family: LikelihoodFamily,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
-    fit_term_collection_with_matern_optimization(
-        data,
-        y,
-        weights,
-        offset,
-        spec,
+    let design = build_term_collection_design(data, spec)?;
+    let fit = fit_gam(
+        design.design.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &design.penalties,
         family,
-        options,
-        &MaternLengthScaleOptimization::HeuristicDefault,
-    )
-}
-
-pub fn fit_term_collection_with_matern_optimization(
-    data: ArrayView2<'_, f64>,
-    y: Array1<f64>,
-    weights: Array1<f64>,
-    offset: Array1<f64>,
-    spec: &TermCollectionSpec,
-    family: LikelihoodFamily,
-    options: &FitOptions,
-    tuning: &MaternLengthScaleOptimization,
-) -> Result<FittedTermCollection, EstimationError> {
-    match tuning {
-        MaternLengthScaleOptimization::Fixed | MaternLengthScaleOptimization::HeuristicDefault => {
-            let resolved = apply_matern_length_scales(data, spec, tuning, None)?;
-            fit_with_spec(data, y, weights, offset, &resolved, family, options)
-        }
-        MaternLengthScaleOptimization::ProfileGrid {
-            num_points,
-            kappa_min_factor,
-            kappa_max_factor,
-        } => {
-            let Some((_, feature_cols, mspec)) = single_matern_term(spec) else {
-                return Err(EstimationError::InvalidInput(
-                    "ProfileGrid requires exactly one Matérn smooth term".to_string(),
-                ));
-            };
-            let base_kappa = if mspec.length_scale.is_finite() && mspec.length_scale > 0.0 {
-                1.0 / mspec.length_scale
-            } else {
-                let ls = matern_heuristic_length_scale(data, &feature_cols, mspec.nu).ok_or_else(
-                    || {
-                        EstimationError::InvalidInput(
-                            "Unable to compute Matérn heuristic length scale".to_string(),
-                        )
-                    },
-                )?;
-                1.0 / ls
-            };
-            let m = (*num_points).clamp(5, 8);
-            let k_lo = base_kappa * kappa_min_factor.max(1e-6);
-            let k_hi = base_kappa * kappa_max_factor.max(kappa_min_factor + 1e-6);
-            let log_lo = k_lo.ln();
-            let log_hi = k_hi.ln();
-            let mut best: Option<(f64, FittedTermCollection)> = None;
-
-            for i in 0..m {
-                let t = if m == 1 {
-                    0.0
-                } else {
-                    i as f64 / (m - 1) as f64
-                };
-                let kappa = (log_lo + t * (log_hi - log_lo)).exp();
-                let one = [kappa];
-                let resolved = apply_matern_length_scales(data, spec, tuning, Some(&one))?;
-                let candidate = fit_with_spec(
-                    data,
-                    y.clone(),
-                    weights.clone(),
-                    offset.clone(),
-                    &resolved,
-                    family,
-                    options,
-                )?;
-                let rho = candidate.fit.lambdas.mapv(|v| v.max(1e-300).ln());
-                let ext_opts = ExternalOptimOptions {
-                    family,
-                    max_iter: options.max_iter,
-                    tol: options.tol,
-                    nullspace_dims: candidate.design.nullspace_dims.clone(),
-                };
-                let (cost, _) = evaluate_external_cost_and_ridge(
-                    y.view(),
-                    weights.view(),
-                    candidate.design.design.view(),
-                    offset.view(),
-                    &candidate.design.penalties,
-                    &ext_opts,
-                    &rho,
-                )?;
-                if best.as_ref().map(|(c, _)| cost < *c).unwrap_or(true) {
-                    best = Some((cost, candidate));
-                }
-            }
-
-            best.map(|(_, fit)| fit).ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "Matérn profile grid produced no candidates".to_string(),
-                )
-            })
-        }
-        MaternLengthScaleOptimization::JointBfgs {
-            max_iter,
-            tol,
-            kappa_fd_step,
-        } => {
-            let matern_terms = collect_matern_terms(spec);
-            if matern_terms.is_empty() {
-                return Err(EstimationError::InvalidInput(
-                    "JointBfgs requested but no Matérn smooth terms are present".to_string(),
-                ));
-            }
-
-            let mut base_kappas = Vec::with_capacity(matern_terms.len());
-            for (_, feature_cols, mspec) in &matern_terms {
-                let kappa = if mspec.length_scale.is_finite() && mspec.length_scale > 0.0 {
-                    1.0 / mspec.length_scale
-                } else {
-                    let ls = matern_heuristic_length_scale(data, feature_cols, mspec.nu)
-                        .ok_or_else(|| {
-                            EstimationError::InvalidInput(
-                                "Unable to compute Matérn heuristic length scale".to_string(),
-                            )
-                        })?;
-                    1.0 / ls
-                };
-                base_kappas.push(kappa.max(1e-12));
-            }
-
-            let seed = apply_matern_length_scales(data, spec, tuning, Some(&base_kappas))?;
-            let seeded_fit = fit_with_spec(
-                data,
-                y.clone(),
-                weights.clone(),
-                offset.clone(),
-                &seed,
-                family,
-                options,
-            )?;
-            let k = seeded_fit.design.penalties.len();
-            let m = base_kappas.len();
-            let mut theta0 = Array1::<f64>::zeros(k + m);
-            for i in 0..k {
-                theta0[i] = seeded_fit.fit.lambdas[i].max(1e-300).ln();
-            }
-            for j in 0..m {
-                theta0[k + j] = base_kappas[j].ln();
-            }
-
-            let evaluate_theta =
-                |theta: &Array1<f64>| -> Result<(f64, Array1<f64>), EstimationError> {
-                    let k = seeded_fit.design.penalties.len();
-                    let m = matern_terms.len();
-                    if theta.len() != k + m {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "joint theta length mismatch: got {}, expected {}",
-                            theta.len(),
-                            k + m
-                        )));
-                    }
-                    let rho = theta.slice(s![..k]).to_owned();
-                    let mut kappas = Vec::with_capacity(m);
-                    for j in 0..m {
-                        kappas.push(theta[k + j].exp().max(1e-12));
-                    }
-                    let resolved = apply_matern_length_scales(data, spec, tuning, Some(&kappas))?;
-                    let design = build_term_collection_design(data, &resolved)?;
-                    let ext_opts = ExternalOptimOptions {
-                        family,
-                        max_iter: options.max_iter,
-                        tol: options.tol,
-                        nullspace_dims: design.nullspace_dims.clone(),
-                    };
-                    let (cost, _) = evaluate_external_cost_and_ridge(
-                        y.view(),
-                        weights.view(),
-                        design.design.view(),
-                        offset.view(),
-                        &design.penalties,
-                        &ext_opts,
-                        &rho,
-                    )?;
-                    let (analytic_grad_rho, _) = evaluate_external_gradients(
-                        y.view(),
-                        weights.view(),
-                        design.design.view(),
-                        offset.view(),
-                        &design.penalties,
-                        &ext_opts,
-                        &rho,
-                    )?;
-
-                    let h = (*kappa_fd_step).max(1e-4);
-                    let mut grad = Array1::<f64>::zeros(k + m);
-                    grad.slice_mut(s![..k]).assign(&analytic_grad_rho);
-                    for j in 0..m {
-                        let mut kappas_p = kappas.clone();
-                        let mut kappas_m = kappas.clone();
-                        kappas_p[j] = (theta[k + j] + h).exp().max(1e-12);
-                        kappas_m[j] = (theta[k + j] - h).exp().max(1e-12);
-                        let resolved_p =
-                            apply_matern_length_scales(data, spec, tuning, Some(&kappas_p))?;
-                        let resolved_m =
-                            apply_matern_length_scales(data, spec, tuning, Some(&kappas_m))?;
-                        let design_p = build_term_collection_design(data, &resolved_p)?;
-                        let design_m = build_term_collection_design(data, &resolved_m)?;
-                        let ext_opts_p = ExternalOptimOptions {
-                            family,
-                            max_iter: options.max_iter,
-                            tol: options.tol,
-                            nullspace_dims: design_p.nullspace_dims.clone(),
-                        };
-                        let ext_opts_m = ExternalOptimOptions {
-                            family,
-                            max_iter: options.max_iter,
-                            tol: options.tol,
-                            nullspace_dims: design_m.nullspace_dims.clone(),
-                        };
-                        let (cp, _) = evaluate_external_cost_and_ridge(
-                            y.view(),
-                            weights.view(),
-                            design_p.design.view(),
-                            offset.view(),
-                            &design_p.penalties,
-                            &ext_opts_p,
-                            &rho,
-                        )?;
-                        let (cm, _) = evaluate_external_cost_and_ridge(
-                            y.view(),
-                            weights.view(),
-                            design_m.design.view(),
-                            offset.view(),
-                            &design_m.penalties,
-                            &ext_opts_m,
-                            &rho,
-                        )?;
-                        grad[k + j] = (cp - cm) / (2.0 * h);
-                    }
-                    Ok((cost, grad))
-                };
-
-            let mut solver = Bfgs::new(theta0, |theta| match evaluate_theta(theta) {
-                Ok(v) => v,
-                Err(_) => {
-                    let mut grad = Array1::<f64>::zeros(theta.len());
-                    for g in &mut grad {
-                        *g = -1.0;
-                    }
-                    (f64::INFINITY, grad)
-                }
-            })
-            .with_tolerance(*tol)
-            .with_max_iterations(*max_iter)
-            .with_rng_seed(0xBADC0DE_u64);
-
-            let solution = match solver.run() {
-                Ok(sol) => sol,
-                Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
-                    *last_solution
-                }
-                Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
-                    *last_solution
-                }
-                Err(e) => {
-                    return Err(EstimationError::RemlOptimizationFailed(format!(
-                        "joint Matérn (rho, log-kappa[]) BFGS failed: {e:?}"
-                    )));
-                }
-            };
-            let theta_star = solution.final_point;
-            let mut kappas_star = Vec::with_capacity(matern_terms.len());
-            for j in 0..matern_terms.len() {
-                kappas_star.push(theta_star[k + j].exp().max(1e-12));
-            }
-            let resolved = apply_matern_length_scales(data, spec, tuning, Some(&kappas_star))?;
-            fit_with_spec(data, y, weights, offset, &resolved, family, options)
-        }
-    }
+        &FitOptions {
+            max_iter: options.max_iter,
+            tol: options.tol,
+            nullspace_dims: design.nullspace_dims.clone(),
+        },
+    )?;
+    Ok(FittedTermCollection { fit, design })
 }
 
 #[cfg(test)]
@@ -1148,8 +683,13 @@ mod tests {
     }
 
     #[test]
-    fn build_smooth_design_accepts_shape_constraints() {
-        let data = array![[0.0, 0.0], [0.5, 0.2], [1.0, 0.4], [1.5, 0.6],];
+    fn build_smooth_design_rejects_non_none_shape_constraints() {
+        let data = array![
+            [0.0, 0.0],
+            [0.5, 0.2],
+            [1.0, 0.4],
+            [1.5, 0.6],
+        ];
         let terms = vec![SmoothTermSpec {
             name: "tps_shape".to_string(),
             basis: SmoothBasisSpec::ThinPlate {
@@ -1161,9 +701,14 @@ mod tests {
             },
             shape: ShapeConstraint::MonotoneIncreasing,
         }];
-        let sd = build_smooth_design(data.view(), &terms).expect("shape should be accepted");
-        assert_eq!(sd.terms.len(), 1);
-        assert_eq!(sd.terms[0].shape, ShapeConstraint::MonotoneIncreasing);
+
+        let err = build_smooth_design(data.view(), &terms).expect_err("shape should be rejected");
+        match err {
+            BasisError::InvalidInput(msg) => {
+                assert!(msg.contains("not enforced"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -1182,6 +727,7 @@ mod tests {
                 feature_col: 0,
                 double_penalty: true,
             }],
+            random_effect_terms: vec![],
             smooth_terms: vec![SmoothTermSpec {
                 name: "tps_x1x2".to_string(),
                 basis: SmoothBasisSpec::ThinPlate {
@@ -1198,8 +744,40 @@ mod tests {
         assert_eq!(design.design.nrows(), data.nrows());
         assert!(design.design.ncols() >= 1);
         assert_eq!(design.linear_ranges.len(), 1);
+        assert_eq!(design.random_effect_ranges.len(), 0);
         assert_eq!(design.penalties.len(), 3); // linear ridge + 2 smooth penalties
         assert_eq!(design.nullspace_dims.len(), 3);
+    }
+
+    #[test]
+    fn term_collection_design_adds_random_effect_dummy_block_with_ridge() {
+        let data = array![
+            [0.1, 0.0],
+            [0.2, 1.0],
+            [0.3, 0.0],
+            [0.4, 2.0],
+            [0.5, 1.0],
+            [0.6, 2.0],
+        ];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![RandomEffectTermSpec {
+                name: "id".to_string(),
+                feature_col: 1,
+                drop_first_level: false,
+            }],
+            smooth_terms: vec![],
+        };
+        let design = build_term_collection_design(data.view(), &spec).unwrap();
+        // 3 observed levels -> 3 dummy columns
+        assert_eq!(design.design.ncols(), 3);
+        assert_eq!(design.random_effect_ranges.len(), 1);
+        assert_eq!(design.penalties.len(), 1);
+        assert_eq!(design.nullspace_dims, vec![0]);
+        for i in 0..design.design.nrows() {
+            let row_sum: f64 = design.design.row(i).sum();
+            assert!((row_sum - 1.0).abs() < 1e-12);
+        }
     }
 
     #[test]
@@ -1276,358 +854,52 @@ mod tests {
     }
 
     #[test]
-    fn fit_term_collection_matern_heuristic_default_handles_nonpositive_length_scale() {
-        let n = 20usize;
-        let d = 3usize;
-        let mut data = Array2::<f64>::zeros((n, d));
-        let mut y = Array1::<f64>::zeros(n);
+    fn tensor_bspline_term_builds_te_style_design_and_penalties() {
+        let n = 10usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
-            let x0 = i as f64 / (n as f64 - 1.0);
-            let x1 = (i as f64 * 0.17).sin();
-            let x2 = (i as f64 * 0.11).cos();
-            data[[i, 0]] = x0;
-            data[[i, 1]] = x1;
-            data[[i, 2]] = x2;
-            y[i] = 0.5 + 1.2 * x0 - 0.7 * x1 + 0.3 * x2;
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+            data[[i, 1]] = (i as f64 / (n as f64 - 1.0)).powi(2);
         }
-        let weights = Array1::<f64>::ones(n);
-        let offset = Array1::<f64>::zeros(n);
 
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "matern_auto".to_string(),
-                basis: SmoothBasisSpec::Matern {
-                    feature_cols: vec![0, 1, 2],
-                    spec: MaternBasisSpec {
-                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                        length_scale: 0.0, // invalid sentinel -> heuristic default
-                        nu: MaternNu::FiveHalves,
-                        include_intercept: true,
-                        double_penalty: true,
-                    },
-                },
-                shape: ShapeConstraint::None,
-            }],
+        let spec_x = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 3,
+            },
+            double_penalty: false,
+        };
+        let spec_y = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 2,
+            },
+            double_penalty: false,
         };
 
-        let fit = fit_term_collection_with_matern_optimization(
-            data.view(),
-            y,
-            weights,
-            offset,
-            &spec,
-            LikelihoodFamily::GaussianIdentity,
-            &FitOptions {
-                max_iter: 25,
-                tol: 1e-4,
-                nullspace_dims: vec![],
-            },
-            &MaternLengthScaleOptimization::HeuristicDefault,
-        )
-        .expect("heuristic default Matérn tuning should succeed");
-
-        assert!(fit.fit.scale.is_finite());
-        assert!(fit.fit.lambdas.iter().all(|v| v.is_finite() && *v > 0.0));
-    }
-
-    #[test]
-    fn fit_term_collection_matern_joint_bfgs_runs() {
-        let n = 24usize;
-        let d = 3usize;
-        let mut data = Array2::<f64>::zeros((n, d));
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let x0 = i as f64 / (n as f64 - 1.0);
-            let x1 = (i as f64 * 0.23).sin();
-            let x2 = (i as f64 * 0.19).cos();
-            data[[i, 0]] = x0;
-            data[[i, 1]] = x1;
-            data[[i, 2]] = x2;
-            y[i] = 0.2 + 1.1 * x0 - 0.4 * x1 + 0.25 * x2;
-        }
-        let weights = Array1::<f64>::ones(n);
-        let offset = Array1::<f64>::zeros(n);
-
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "matern_joint".to_string(),
-                basis: SmoothBasisSpec::Matern {
-                    feature_cols: vec![0, 1, 2],
-                    spec: MaternBasisSpec {
-                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                        length_scale: 0.0, // let joint tuning choose kappa from heuristic seed
-                        nu: MaternNu::FiveHalves,
-                        include_intercept: true,
-                        double_penalty: true,
-                    },
+        let terms = vec![SmoothTermSpec {
+            name: "te_xy".to_string(),
+            basis: SmoothBasisSpec::TensorBSpline {
+                feature_cols: vec![0, 1],
+                spec: TensorBSplineSpec {
+                    marginal_specs: vec![spec_x, spec_y],
+                    double_penalty: true,
                 },
-                shape: ShapeConstraint::None,
-            }],
-        };
-
-        let fit = fit_term_collection_with_matern_optimization(
-            data.view(),
-            y,
-            weights,
-            offset,
-            &spec,
-            LikelihoodFamily::GaussianIdentity,
-            &FitOptions {
-                max_iter: 20,
-                tol: 1e-4,
-                nullspace_dims: vec![],
             },
-            &MaternLengthScaleOptimization::JointBfgs {
-                max_iter: 6,
-                tol: 1e-3,
-                kappa_fd_step: 5e-3,
-            },
-        )
-        .expect("joint Matérn BFGS tuning should run");
+            shape: ShapeConstraint::None,
+        }];
 
-        assert!(fit.fit.scale.is_finite());
-        assert!(fit.fit.lambdas.iter().all(|v| v.is_finite() && *v > 0.0));
-    }
-
-    #[test]
-    fn fit_term_collection_matern_profile_grid_runs() {
-        let n = 30usize;
-        let d = 3usize;
-        let mut data = Array2::<f64>::zeros((n, d));
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let x0 = i as f64 / (n as f64 - 1.0);
-            let x1 = (i as f64 * 0.21).sin();
-            let x2 = (i as f64 * 0.13).cos();
-            data[[i, 0]] = x0;
-            data[[i, 1]] = x1;
-            data[[i, 2]] = x2;
-            y[i] = 0.3 + 0.8 * x0 - 0.5 * x1 + 0.2 * x2;
-        }
-        let weights = Array1::<f64>::ones(n);
-        let offset = Array1::<f64>::zeros(n);
-
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "matern_grid".to_string(),
-                basis: SmoothBasisSpec::Matern {
-                    feature_cols: vec![0, 1, 2],
-                    spec: MaternBasisSpec {
-                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
-                        length_scale: 0.0, // force heuristic seed for grid center
-                        nu: MaternNu::FiveHalves,
-                        include_intercept: true,
-                        double_penalty: true,
-                    },
-                },
-                shape: ShapeConstraint::None,
-            }],
-        };
-
-        let fit = fit_term_collection_with_matern_optimization(
-            data.view(),
-            y,
-            weights,
-            offset,
-            &spec,
-            LikelihoodFamily::GaussianIdentity,
-            &FitOptions {
-                max_iter: 25,
-                tol: 1e-4,
-                nullspace_dims: vec![],
-            },
-            &MaternLengthScaleOptimization::ProfileGrid {
-                num_points: 6,
-                kappa_min_factor: 0.2,
-                kappa_max_factor: 5.0,
-            },
-        )
-        .expect("Matérn profile-grid tuning should run");
-
-        assert!(fit.fit.scale.is_finite());
-        assert!(fit.fit.lambdas.iter().all(|v| v.is_finite() && *v > 0.0));
-    }
-
-    #[test]
-    fn fit_term_collection_enforces_monotone_shape_gaussian() {
-        let n = 80usize;
-        let mut data = Array2::<f64>::zeros((n, 1));
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let x = i as f64 / (n as f64 - 1.0);
-            data[[i, 0]] = x;
-            // Intentionally mildly wiggly signal; monotone constraint should smooth
-            // out local decreases in fitted term coefficients.
-            y[i] = 0.2 + 0.8 * x + 0.08 * (12.0 * x).sin();
-        }
-        let weights = Array1::<f64>::ones(n);
-        let offset = Array1::<f64>::zeros(n);
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "mono_bspline".to_string(),
-                basis: SmoothBasisSpec::BSpline1D {
-                    feature_col: 0,
-                    spec: BSplineBasisSpec {
-                        degree: 3,
-                        penalty_order: 2,
-                        knot_spec: BSplineKnotSpec::Generate {
-                            data_range: (0.0, 1.0),
-                            num_internal_knots: 8,
-                        },
-                        double_penalty: true,
-                    },
-                },
-                shape: ShapeConstraint::MonotoneIncreasing,
-            }],
-        };
-
-        let fitted = fit_term_collection(
-            data.view(),
-            y,
-            weights,
-            offset,
-            &spec,
-            LikelihoodFamily::GaussianIdentity,
-            &FitOptions {
-                max_iter: 80,
-                tol: 1e-6,
-                nullspace_dims: vec![],
-            },
-        )
-        .expect("shape-constrained fit should succeed");
-
-        let term = &fitted.design.smooth.terms[0];
-        let beta = fitted
-            .fit
-            .beta
-            .slice(s![term.coeff_range.start..term.coeff_range.end]);
-        for i in 1..beta.len() {
-            assert!(
-                beta[i] >= beta[i - 1] - 1e-9,
-                "monotone coefficients violated at {}: {} < {}",
-                i,
-                beta[i],
-                beta[i - 1]
-            );
-        }
-    }
-
-    #[test]
-    fn fit_term_collection_enforces_convex_shape_gaussian() {
-        let n = 90usize;
-        let mut data = Array2::<f64>::zeros((n, 1));
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let x = i as f64 / (n as f64 - 1.0);
-            data[[i, 0]] = x;
-            y[i] = -0.2 + 0.4 * x + 0.9 * x * x + 0.05 * (14.0 * x).sin();
-        }
-        let weights = Array1::<f64>::ones(n);
-        let offset = Array1::<f64>::zeros(n);
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "conv_bspline".to_string(),
-                basis: SmoothBasisSpec::BSpline1D {
-                    feature_col: 0,
-                    spec: BSplineBasisSpec {
-                        degree: 3,
-                        penalty_order: 2,
-                        knot_spec: BSplineKnotSpec::Generate {
-                            data_range: (0.0, 1.0),
-                            num_internal_knots: 10,
-                        },
-                        double_penalty: true,
-                    },
-                },
-                shape: ShapeConstraint::Convex,
-            }],
-        };
-
-        let fitted = fit_term_collection(
-            data.view(),
-            y,
-            weights,
-            offset,
-            &spec,
-            LikelihoodFamily::GaussianIdentity,
-            &FitOptions {
-                max_iter: 100,
-                tol: 1e-6,
-                nullspace_dims: vec![],
-            },
-        )
-        .expect("convex constrained fit should succeed");
-
-        let term = &fitted.design.smooth.terms[0];
-        let beta = fitted
-            .fit
-            .beta
-            .slice(s![term.coeff_range.start..term.coeff_range.end]);
-        if beta.len() >= 3 {
-            for i in 2..beta.len() {
-                let d2 = beta[i] - 2.0 * beta[i - 1] + beta[i - 2];
-                assert!(
-                    d2 >= -1e-8,
-                    "convex coefficients violated at {}: d2={}",
-                    i,
-                    d2
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn fit_term_collection_rejects_shape_constraints_for_non_gaussian() {
-        let data = array![[0.0], [0.3], [0.6], [1.0], [1.3], [1.7], [2.0]];
-        let y = array![0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0];
-        let weights = Array1::<f64>::ones(data.nrows());
-        let offset = Array1::<f64>::zeros(data.nrows());
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "mono_logit".to_string(),
-                basis: SmoothBasisSpec::BSpline1D {
-                    feature_col: 0,
-                    spec: BSplineBasisSpec {
-                        degree: 3,
-                        penalty_order: 2,
-                        knot_spec: BSplineKnotSpec::Generate {
-                            data_range: (0.0, 2.0),
-                            num_internal_knots: 4,
-                        },
-                        double_penalty: true,
-                    },
-                },
-                shape: ShapeConstraint::MonotoneIncreasing,
-            }],
-        };
-
-        let result = fit_term_collection(
-            data.view(),
-            y,
-            weights,
-            offset,
-            &spec,
-            LikelihoodFamily::BinomialLogit,
-            &FitOptions {
-                max_iter: 30,
-                tol: 1e-6,
-                nullspace_dims: vec![],
-            },
-        );
-        match result {
-            Err(EstimationError::InvalidInput(msg)) => {
-                assert!(
-                    msg.contains("Shape constraints are currently supported for GaussianIdentity")
-                );
-            }
-            Err(other) => panic!("unexpected error type: {other:?}"),
-            Ok(_) => panic!("expected non-gaussian shaped fit to be rejected"),
-        }
+        let sd = build_smooth_design(data.view(), &terms).unwrap();
+        assert_eq!(sd.design.nrows(), n);
+        assert_eq!(sd.terms.len(), 1);
+        // one Kronecker penalty per marginal + optional ridge
+        assert_eq!(sd.penalties.len(), 3);
+        assert_eq!(sd.nullspace_dims.len(), 3);
+        assert!(sd.penalties.iter().all(|s| s.nrows() == sd.design.ncols()));
+        assert!(sd.penalties.iter().all(|s| s.ncols() == sd.design.ncols()));
     }
 }
