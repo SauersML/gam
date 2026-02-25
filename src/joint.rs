@@ -25,6 +25,7 @@ use crate::construction::{
     stable_reparameterization_with_invariant_engine,
 };
 use crate::estimate::EstimationError;
+use crate::faer_ndarray::{fast_ab, fast_ata, fast_atb, fast_atv};
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::quadrature::QuadratureContext;
 use crate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
@@ -688,7 +689,7 @@ impl<'a> JointModelState<'a> {
             }
 
             // Build Fisher information: H = B'WB (no smoothing penalty for Firth adjustment)
-            let btb = b_weighted.t().dot(&b_weighted);
+            let btb = fast_ata(&b_weighted);
             let mut h_fisher = btb;
             // Conditional regularization for stability without changing the objective form
             ensure_positive_definite_joint(&mut h_fisher);
@@ -883,7 +884,7 @@ impl<'a> JointModelState<'a> {
             }
 
             // Build Fisher information: H = X'W_effX (no smoothing penalty for Firth adjustment)
-            let xtx = x_weighted.t().dot(&x_weighted);
+            let xtx = fast_ata(&x_weighted);
             let mut h_fisher = xtx;
             ensure_positive_definite_joint(&mut h_fisher);
 
@@ -1991,7 +1992,7 @@ impl<'a> JointRemlState<'a> {
         // H† = U diag(1/λ_i) U' where 1/λ_i = 0 for small eigenvalues
         // K = H† J' = U diag(1/λ_i) U' J' = U diag(1/λ_i) (J U)'
         // Compute J @ U (n x p_total)
-        let j_u = j_mat.dot(&h_vecs);
+        let j_u = fast_ab(&j_mat, &h_vecs);
 
         // Compute H† J' = U @ diag(1/λ) @ (J U)'
         // This is (p_total x n) matrix
@@ -2084,8 +2085,8 @@ impl<'a> JointRemlState<'a> {
             // Q = H† V H† using pseudo-inverse for spectral consistency
             // H† V H† = U diag(1/λ) U' V U diag(1/λ) U'
             // Let W = U' V U, then Q = U diag(1/λ) W diag(1/λ) U'
-            let u_t_v = h_vecs.t().dot(&v_mat); // U' V
-            let w_mat = u_t_v.dot(&h_vecs); // U' V U
+            let u_t_v = fast_atb(&h_vecs, &v_mat); // U' V
+            let w_mat = fast_ab(&u_t_v, &h_vecs); // U' V U
 
             // Apply diag(1/λ) on both sides and reconstruct
             // Q_ij = Σ_k Σ_l (1/λ_k)(1/λ_l) U_ik W_kl U_jl
@@ -2292,7 +2293,7 @@ impl<'a> JointRemlState<'a> {
             // Compute delta = H† rhs using pseudo-inverse for spectral consistency
             // delta = ∂β/∂ρ_k represents how the coefficients move when smoothing changes
             // H† rhs = U diag(1/λ) U' rhs = U diag(1/λ) c where c = U' rhs
-            let c = h_vecs.t().dot(&rhs);
+            let c = fast_atv(&h_vecs, &rhs);
             let mut delta = Array1::<f64>::zeros(p_total);
             for i in 0..p_total {
                 let eig_i = h_eigs[i];
@@ -2306,7 +2307,10 @@ impl<'a> JointRemlState<'a> {
             let delta_beta = delta.slice(s![..p_base]).to_owned();
             let delta_theta = delta.slice(s![p_base..]).to_owned();
 
-            dot_u.assign(&state.x_base.dot(&delta_beta));
+            dot_u.assign(&fast_ab(
+                &state.x_base,
+                &delta_beta.clone().insert_axis(ndarray::Axis(1)),
+            ).column(0).to_owned());
 
             // dot_z_raw = d/ dρ_k [ (u - min_u) / range_width ]
             //          = (1 / range_width) * dot_u.
@@ -2316,7 +2320,10 @@ impl<'a> JointRemlState<'a> {
                 dot_z[i] = dot_u[i] * inv_rw;
             }
 
-            dot_eta.assign(&j_mat.dot(&delta));
+            dot_eta.assign(&fast_ab(
+                &j_mat,
+                &delta.clone().insert_axis(ndarray::Axis(1)),
+            ).column(0).to_owned());
 
             // w' for logit (clamped)
             if matches!(state.link, LinkFunction::Logit) {

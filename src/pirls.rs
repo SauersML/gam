@@ -7,7 +7,9 @@ use crate::faer_ndarray::{
 use crate::matrix::DesignMatrix;
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
-use crate::types::{LikelihoodFamily, LinkFunction};
+use crate::types::{
+    LikelihoodFamily, LinkFunction, RidgePassport, RidgePolicy,
+};
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
@@ -1291,8 +1293,11 @@ pub struct PirlsResult {
     pub penalized_hessian_transformed: Array2<f64>,
     // Single stabilized Hessian for consistent cost/gradient computation
     pub stabilized_hessian_transformed: Array2<f64>,
+    /// Canonical ridge metadata passport consumed by outer objective/gradient code.
+    pub ridge_passport: RidgePassport,
     // Ridge added to make the stabilized Hessian positive definite. When > 0, this
     // ridge is treated as a literal penalty term (0.5 * ridge * ||beta||^2).
+    // Backward-compatible mirror of `ridge_passport.delta`.
     pub ridge_used: f64,
 
     // The unpenalized deviance, calculated from mu and y
@@ -1591,6 +1596,10 @@ pub fn fit_model_for_fixed_rho<'a>(
             beta_transformed,
             penalized_hessian_transformed: penalized_hessian,
             stabilized_hessian_transformed: stabilized_hessian,
+            ridge_passport: RidgePassport::scaled_identity(
+                ridge_used,
+                RidgePolicy::explicit_stabilization_full(),
+            ),
             ridge_used,
             deviance,
             edf,
@@ -1762,6 +1771,10 @@ pub fn fit_model_for_fixed_rho<'a>(
         beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
         stabilized_hessian_transformed,
+        ridge_passport: RidgePassport::scaled_identity(
+            working_summary.state.ridge_used,
+            RidgePolicy::explicit_stabilization_full(),
+        ),
         ridge_used: working_summary.state.ridge_used,
         deviance: working_summary.state.deviance,
         edf,
@@ -2013,6 +2026,10 @@ fn fit_model_for_fixed_rho_sparse_implicit(
         beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
         stabilized_hessian_transformed,
+        ridge_passport: RidgePassport::scaled_identity(
+            working_summary.state.ridge_used,
+            RidgePolicy::explicit_stabilization_full(),
+        ),
         ridge_used: working_summary.state.ridge_used,
         deviance: working_summary.state.deviance,
         edf,
