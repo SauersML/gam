@@ -45,7 +45,8 @@ use crate::types::{
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_mat_mut, fast_ata,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_mat_mut, fast_ab, fast_ata,
+    fast_atb,
 };
 use faer::Mat as FaerMat;
 use faer::Side;
@@ -58,10 +59,25 @@ fn logit_from_prob(p: f64) -> f64 {
     (p / (1.0 - p)).ln()
 }
 
+fn eta_from_mu_for_link(mu: f64, link: LinkFunction) -> f64 {
+    match link {
+        LinkFunction::Identity => mu,
+        LinkFunction::Logit => logit_from_prob(mu),
+        LinkFunction::Probit => {
+            let p = mu.clamp(1e-8, 1.0 - 1e-8);
+            standard_normal_quantile(p).unwrap_or(0.0)
+        }
+        LinkFunction::CLogLog => {
+            let p = mu.clamp(1e-12, 1.0 - 1e-12);
+            (-(1.0 - p).ln()).ln()
+        }
+    }
+}
+
 use crate::diagnostics::{
     GRAD_DIAG_BETA_COLLAPSE_COUNT, GRAD_DIAG_DELTA_ZERO_COUNT, GRAD_DIAG_KKT_SKIP_COUNT,
-    GRAD_DIAG_LOGH_CLAMPED_COUNT, approx_f64, format_compact_series, format_cond, format_range,
-    quantize_value, quantize_vec, should_emit_grad_diag, should_emit_h_min_eig_diag,
+    approx_f64, format_compact_series, format_cond, format_range, quantize_value, quantize_vec,
+    should_emit_grad_diag, should_emit_h_min_eig_diag,
 };
 
 // Note: deflate_weights_by_se was removed. We now use integrated (GHQ) likelihood
@@ -326,7 +342,8 @@ fn linear_predictor_variance(x: &DesignMatrix, cov: &Array2<f64>) -> Array1<f64>
                     out[i] = acc.max(0.0);
                 }
             } else {
-                let dense = x.to_dense();
+                let dense_arc = x.to_dense_arc();
+                let dense = dense_arc.as_ref();
                 let xc = dense.dot(cov);
                 for i in 0..dense.nrows() {
                     out[i] = dense.row(i).dot(&xc.row(i)).max(0.0);
@@ -639,6 +656,26 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
 /// - V_ρ = inverse Hessian of LAML w.r.t. ρ (smoothing parameter covariance)
 ///
 /// Returns the correction matrix in the ORIGINAL coefficient basis.
+///
+/// FULL CORRECTION REFERENCE
+/// -------------------------
+/// Exact first-order propagation around the outer optimum ρ*:
+///
+///   Var(β̂) ≈ Var(β̂ | ρ̂) + (dβ̂/dρ) Var(ρ̂) (dβ̂/dρ)ᵀ
+///          = V_β + J V_ρ Jᵀ.
+///
+/// Components:
+///   J[:,k] = ∂β̂/∂ρ_k = -H^{-1}(A_k β̂),  A_k = exp(ρ_k) S_k
+///   V_ρ    = (∇²_{ρρ} V(ρ*))^{-1}
+///
+/// Exact non-Gaussian V_ρ^{-1} requires the full Hessian with:
+///   - tr(H^{-1}H_{kℓ})
+///   - tr(H^{-1}H_k H^{-1}H_ℓ)
+///   - pseudo-det second derivatives in S
+///   - and H_{kℓ} terms containing fourth-likelihood derivatives.
+///
+/// For runtime/robustness, this routine estimates V_ρ^{-1} by finite-differencing
+/// the implemented analytic gradient and then regularizes before inversion.
 pub(crate) fn compute_smoothing_correction(
     reml_state: &internal::RemlState<'_>,
     final_rho: &Array1<f64>,
@@ -656,9 +693,14 @@ pub(crate) fn compute_smoothing_correction(
     let n_coeffs_orig = final_fit.reparam_result.qs.nrows();
     let lambdas: Array1<f64> = final_rho.mapv(f64::exp);
 
-    // Step 1: Compute the Jacobian J = dβ/dρ in transformed space
-    // For each k: dβ/dρ_k = -H^{-1}(λ_k S_k β)
-    // where H is the penalized Hessian and S_k is the k-th penalty matrix.
+    // Step 1: Compute the Jacobian J = dβ/dρ in transformed space.
+    //
+    // Exact implicit-function identity at the inner optimum:
+    //   dβ̂/dρ_k = -H^{-1}(S_k^ρ β̂),   S_k^ρ = λ_k S_k, λ_k = exp(ρ_k).
+    //
+    // In transformed coordinates with root penalties S_k = R_kᵀR_k:
+    //   S_k β̂ = R_kᵀ(R_k β̂),
+    // so each Jacobian column is one linear solve with H.
 
     // Get the effective Hessian from the fit - use stabilized version for consistency
     let h_trans = &final_fit.stabilized_hessian_transformed;
@@ -696,32 +738,38 @@ pub(crate) fn compute_smoothing_correction(
         jacobian_trans.column_mut(k).assign(&delta);
     }
 
-    // Step 2: Compute V_ρ via finite differences of the LAML gradient
-    // V_ρ^{-1} = d²LAML/dρ² (Hessian of LAML w.r.t. ρ)
-    let h_step = 1e-4;
-    let mut hessian_rho = Array2::<f64>::zeros((n_rho, n_rho));
+    // Step 2: Use exact analytic LAML Hessian when available; fallback to finite differences.
+    let mut hessian_rho = match reml_state.compute_laml_hessian_exact(&final_rho) {
+        Ok(h) => h,
+        Err(err) => {
+            log::warn!(
+                "Exact LAML Hessian unavailable ({}); falling back to FD Hessian for smoothing correction.",
+                err
+            );
+            let h_step = 1e-4;
+            let mut hessian_fd = Array2::<f64>::zeros((n_rho, n_rho));
+            for k in 0..n_rho {
+                let mut rho_plus = final_rho.clone();
+                rho_plus[k] += h_step;
+                let mut rho_minus = final_rho.clone();
+                rho_minus[k] -= h_step;
 
-    // Compute Hessian via central differences of gradient
-    for k in 0..n_rho {
-        let mut rho_plus = final_rho.clone();
-        rho_plus[k] += h_step;
-        let mut rho_minus = final_rho.clone();
-        rho_minus[k] -= h_step;
+                let grad_plus = match reml_state.compute_gradient(&rho_plus) {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                let grad_minus = match reml_state.compute_gradient(&rho_minus) {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
 
-        let grad_plus = match reml_state.compute_gradient(&rho_plus) {
-            Ok(g) => g,
-            Err(_) => continue,
-        };
-        let grad_minus = match reml_state.compute_gradient(&rho_minus) {
-            Ok(g) => g,
-            Err(_) => continue,
-        };
-
-        // Central difference: d²f/dρ_k dρ_j ≈ (∂f/∂ρ_j|ρ_k+h - ∂f/∂ρ_j|ρ_k-h) / (2h)
-        for j in 0..n_rho {
-            hessian_rho[[k, j]] = (grad_plus[j] - grad_minus[j]) / (2.0 * h_step);
+                for j in 0..n_rho {
+                    hessian_fd[[k, j]] = (grad_plus[j] - grad_minus[j]) / (2.0 * h_step);
+                }
+            }
+            hessian_fd
         }
-    }
+    };
 
     // Symmetrize the Hessian
     for i in 0..n_rho {
@@ -732,8 +780,8 @@ pub(crate) fn compute_smoothing_correction(
         }
     }
 
-    // Step 3: Invert Hessian to get V_ρ
-    // Add small ridge for numerical stability
+    // Step 3: Invert Hessian to get V_ρ.
+    // Add a small ridge before factorization to regularize weakly identified ρ directions.
     let ridge = 1e-8
         * hessian_rho
             .diag()
@@ -761,11 +809,18 @@ pub(crate) fn compute_smoothing_correction(
         }
     };
 
-    // Step 4: Compute V_corr = J * V_ρ * J^T in transformed space
+    // Step 4: Compute V_corr = J * V_ρ * J^T in transformed space.
+    //
+    // This is the first-order smoothing-parameter uncertainty inflation:
+    //   Var(β̂) ≈ Var(β̂|ρ̂) + (dβ̂/dρ) Var(ρ̂) (dβ̂/dρ)ᵀ.
+    //
+    // Here:
+    //   J = dβ̂/dρ,  J[:,k] = -H^{-1}(A_k β̂),
+    //   V_ρ = (∇²_{ρρ}V)^{-1} evaluated at the final ρ.
     let j_v_rho = jacobian_trans.dot(&v_rho); // (n_coeffs_trans x n_rho)
     let v_corr_trans = j_v_rho.dot(&jacobian_trans.t()); // (n_coeffs_trans x n_coeffs_trans)
 
-    // Step 5: Transform back to original coefficient basis
+    // Step 5: Transform back to original coefficient basis:
     // V_corr_orig = Qs * V_corr_trans * Qs^T
     let qs = &final_fit.reparam_result.qs;
     let qs_v = qs.dot(&v_corr_trans);
@@ -936,6 +991,121 @@ fn run_bfgs_for_candidate(
     )?;
 
     Ok((solution, grad_norm_rho, is_stationary))
+}
+
+struct OuterSolveResult {
+    final_rho: Array1<f64>,
+    final_value: f64,
+    iterations: usize,
+    grad_norm_rho: f64,
+    stationary: bool,
+}
+
+fn run_newton_for_candidate(
+    label: &str,
+    reml_state: &RemlState<'_>,
+    config: &RemlConfig,
+    initial_z: Array1<f64>,
+) -> Result<OuterSolveResult, EstimationError> {
+    eprintln!("\n[Candidate {label}] Running exact Newton optimization from queued seed");
+    let mut rho = to_rho_from_z(&initial_z);
+    let max_iter = config.reml_max_iterations as usize;
+    let tol = config.reml_convergence_tolerance.max(1e-8);
+
+    let mut best_rho = rho.clone();
+    let mut best_cost = f64::INFINITY;
+    let mut best_grad_norm = f64::INFINITY;
+    let mut stationary = false;
+    let mut iter_done = 0usize;
+
+    for iter in 0..max_iter {
+        iter_done = iter + 1;
+        let cost = reml_state.compute_cost(&rho)?;
+        let mut grad = reml_state.compute_gradient(&rho)?;
+        maybe_audit_gradient(reml_state, &rho, iter_done as u64, &mut grad);
+        project_rho_gradient(&rho, &mut grad);
+        let grad_norm = grad.dot(&grad).sqrt();
+        if cost.is_finite() && (cost < best_cost || !best_cost.is_finite()) {
+            best_cost = cost;
+            best_rho = rho.clone();
+            best_grad_norm = grad_norm;
+        }
+        if grad_norm <= tol {
+            stationary = true;
+            break;
+        }
+
+        let hess = reml_state.compute_laml_hessian_exact(&rho)?;
+        let mut hreg = hess.clone();
+        let mut ridge = 0.0_f64;
+        let step = loop {
+            if ridge > 0.0 {
+                for i in 0..hreg.nrows() {
+                    hreg[[i, i]] = hess[[i, i]] + ridge;
+                }
+            }
+            let h_view = FaerArrayView::new(&hreg);
+            if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+                let mut rhs = grad.mapv(|v| -v).insert_axis(Axis(1));
+                let mut rhs_view = array2_to_mat_mut(&mut rhs);
+                ch.solve_in_place(rhs_view.as_mut());
+                break rhs.column(0).to_owned();
+            }
+            if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+                let mut rhs = grad.mapv(|v| -v).insert_axis(Axis(1));
+                let mut rhs_view = array2_to_mat_mut(&mut rhs);
+                ld.solve_in_place(rhs_view.as_mut());
+                break rhs.column(0).to_owned();
+            }
+            ridge = if ridge == 0.0 { 1e-8 } else { ridge * 10.0 };
+            if ridge > 1e8 {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "Newton Hessian factorization failed repeatedly".to_string(),
+                ));
+            }
+            hreg.assign(&hess);
+        };
+
+        let armijo_c = 1e-4;
+        let descent = grad.dot(&step);
+        let mut alpha = 1.0_f64;
+        let mut accepted = false;
+        for _ in 0..30 {
+            let mut trial = &rho + &(step.mapv(|v| alpha * v));
+            for i in 0..trial.len() {
+                trial[i] = trial[i].clamp(-RHO_BOUND, RHO_BOUND);
+            }
+            let trial_cost = reml_state.compute_cost(&trial)?;
+            if trial_cost.is_finite() && trial_cost <= cost + armijo_c * alpha * descent {
+                rho = trial;
+                accepted = true;
+                break;
+            }
+            alpha *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+        if alpha * step.iter().map(|v| v * v).sum::<f64>().sqrt() < 1e-10 {
+            break;
+        }
+    }
+
+    if !stationary {
+        let mut grad = reml_state.compute_gradient(&best_rho)?;
+        maybe_audit_gradient(reml_state, &best_rho, iter_done as u64, &mut grad);
+        project_rho_gradient(&best_rho, &mut grad);
+        best_grad_norm = grad.dot(&grad).sqrt();
+        stationary = best_grad_norm <= tol;
+    }
+
+    Ok(OuterSolveResult {
+        final_rho: best_rho,
+        final_value: best_cost,
+        iterations: iter_done,
+        grad_norm_rho: best_grad_norm,
+        stationary,
+    })
 }
 
 /// A comprehensive error type for the model estimation process.
@@ -1322,15 +1492,43 @@ where
         candidate_seeds.push(("fallback_zero".to_string(), to_z_from_rho(&primary_rho)));
     }
 
-    let mut best_solution: Option<BfgsSolution> = None;
+    let mut best_solution: Option<OuterSolveResult> = None;
     let mut best_grad_norm = f64::INFINITY;
     let mut found_stationary = false;
+    let use_newton = true;
     for (label, initial_z) in candidate_seeds {
-        let (solution, grad_norm_rho, stationary) =
-            run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z)?;
-        if stationary {
+        let solution = if use_newton {
+            match run_newton_for_candidate(&label, &reml_state, &cfg, initial_z.clone()) {
+                Ok(sol) => sol,
+                Err(err) => {
+                    eprintln!(
+                        "[Candidate {label}] Newton failed ({err}); falling back to BFGS."
+                    );
+                    let (bfgs_solution, grad_norm_rho, stationary) =
+                        run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z)?;
+                    OuterSolveResult {
+                        final_rho: to_rho_from_z(&bfgs_solution.final_point),
+                        final_value: bfgs_solution.final_value,
+                        iterations: bfgs_solution.iterations,
+                        grad_norm_rho,
+                        stationary,
+                    }
+                }
+            }
+        } else {
+            let (bfgs_solution, grad_norm_rho, stationary) =
+                run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z)?;
+            OuterSolveResult {
+                final_rho: to_rho_from_z(&bfgs_solution.final_point),
+                final_value: bfgs_solution.final_value,
+                iterations: bfgs_solution.iterations,
+                grad_norm_rho,
+                stationary,
+            }
+        };
+        if solution.stationary {
+            best_grad_norm = solution.grad_norm_rho;
             best_solution = Some(solution);
-            best_grad_norm = grad_norm_rho;
             found_stationary = true;
             break;
         }
@@ -1339,7 +1537,7 @@ where
             Some(current) => solution.final_value < current.final_value,
         };
         if better {
-            best_grad_norm = grad_norm_rho;
+            best_grad_norm = solution.grad_norm_rho;
             best_solution = Some(solution);
         }
     }
@@ -1354,10 +1552,9 @@ where
             best_grad_norm
         );
     }
-    let final_point = chosen_solution.final_point.clone();
+    let final_rho = chosen_solution.final_rho.clone();
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, chosen_solution.iterations);
-    let final_rho = to_rho_from_z(&final_point);
     let (pirls_res, _) = pirls::fit_model_for_fixed_rho_matrix(
         LogSmoothingParamsView::new(final_rho.view()),
         &x_o,
@@ -1498,11 +1695,7 @@ where
         .compute_gradient(&final_rho)
         .unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
     let final_grad_norm_rho = final_grad.dot(&final_grad).sqrt();
-    let final_grad_norm = if final_grad_norm_rho.is_finite() {
-        final_grad_norm_rho
-    } else {
-        best_grad_norm
-    };
+    let final_grad_norm = if final_grad_norm_rho.is_finite() { final_grad_norm_rho } else { best_grad_norm };
 
     let smoothing_correction = compute_smoothing_correction(&reml_state, &final_rho, &pirls_res);
     let penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
@@ -2032,6 +2225,99 @@ const FD_MAX_REFINEMENTS: usize = 4;
 const FD_RIDGE_REL_JITTER_THRESHOLD: f64 = 1e-3;
 const FD_RIDGE_ABS_JITTER_THRESHOLD: f64 = 1e-12;
 
+#[derive(Clone, Copy, Debug)]
+struct GradAuditConfig {
+    every: usize,
+    rel_tol: f64,
+    abs_tol: f64,
+    fallback_to_fd: bool,
+}
+
+fn grad_audit_config() -> GradAuditConfig {
+    GradAuditConfig {
+        every: 10,
+        rel_tol: 5e-2,
+        abs_tol: 1e-4,
+        fallback_to_fd: true,
+    }
+}
+
+fn gradient_audit_stats(
+    analytic: &Array1<f64>,
+    reference: &Array1<f64>,
+) -> Option<(f64, f64, f64, f64)> {
+    if analytic.len() != reference.len() {
+        return None;
+    }
+    let mut sq_diff = 0.0_f64;
+    let mut sq_ref = 0.0_f64;
+    let mut max_abs = 0.0_f64;
+    let mut max_ref_abs = 0.0_f64;
+    for (&a, &r) in analytic.iter().zip(reference.iter()) {
+        if !(a.is_finite() && r.is_finite()) {
+            return None;
+        }
+        let d = a - r;
+        sq_diff += d * d;
+        sq_ref += r * r;
+        max_abs = max_abs.max(d.abs());
+        max_ref_abs = max_ref_abs.max(r.abs());
+    }
+    let rel_l2 = sq_diff.sqrt() / sq_ref.sqrt().max(1e-12);
+    Some((rel_l2, max_abs, sq_ref.sqrt(), max_ref_abs))
+}
+
+fn maybe_audit_gradient(
+    reml_state: &internal::RemlState<'_>,
+    rho: &Array1<f64>,
+    eval_num: u64,
+    grad: &mut Array1<f64>,
+) {
+    let audit_cfg = grad_audit_config();
+    if audit_cfg.every == 0 || rho.is_empty() || eval_num % (audit_cfg.every as u64) != 0 {
+        return;
+    }
+    match compute_fd_gradient_internal(reml_state, rho, false) {
+        Ok(fd_grad) => {
+            if let Some((rel_l2, max_abs, ref_l2, ref_max_abs)) = gradient_audit_stats(grad, &fd_grad)
+            {
+                let mismatch = rel_l2 > audit_cfg.rel_tol || max_abs > audit_cfg.abs_tol;
+                if mismatch {
+                    log::warn!(
+                        "[GRAD AUDIT] eval={} rel_l2={:.3e} (tol {:.3e}) max_abs={:.3e} (tol {:.3e}) ref_l2={:.3e} ref_max={:.3e}",
+                        eval_num,
+                        rel_l2,
+                        audit_cfg.rel_tol,
+                        max_abs,
+                        audit_cfg.abs_tol,
+                        ref_l2,
+                        ref_max_abs,
+                    );
+                    if audit_cfg.fallback_to_fd {
+                        log::warn!(
+                            "[GRAD AUDIT] eval={} replacing analytic gradient with FD gradient for this step",
+                            eval_num
+                        );
+                        *grad = fd_grad;
+                    }
+                }
+            } else {
+                log::warn!(
+                    "[GRAD AUDIT] eval={} produced non-finite comparison stats; skipping audit decision",
+                    eval_num
+                );
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "[GRAD AUDIT] eval={} failed FD gradient computation: {:?}",
+                eval_num,
+                e
+            );
+        }
+    }
+}
+
 struct FdEval {
     f_p: f64,
     f_m: f64,
@@ -2134,9 +2420,10 @@ fn select_fd_derivative(d_small: f64, d_big: f64, same_sign: bool) -> f64 {
     }
 }
 
-fn compute_fd_gradient(
+fn compute_fd_gradient_internal(
     reml_state: &internal::RemlState,
     rho: &Array1<f64>,
+    emit_logs: bool,
 ) -> Result<Array1<f64>, EstimationError> {
     let mut fd_grad = Array1::zeros(rho.len());
     let mut analytic_fallback: Option<Array1<f64>> = None;
@@ -2299,11 +2586,18 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
         ));
     }
 
-    if !log_lines.is_empty() {
+    if emit_logs && !log_lines.is_empty() {
         println!("{}", log_lines.join("\n"));
     }
 
     Ok(fd_grad)
+}
+
+fn compute_fd_gradient(
+    reml_state: &internal::RemlState,
+    rho: &Array1<f64>,
+) -> Result<Array1<f64>, EstimationError> {
+    compute_fd_gradient_internal(reml_state, rho, true)
 }
 
 /// Evaluate both analytic and finite-difference gradients for the external REML objective.
@@ -2833,6 +3127,22 @@ pub mod internal {
             ridge_passport: RidgePassport,
             base_log_det: f64,
         ) -> Result<f64, EstimationError> {
+            // Penalty determinant convention:
+            //   S(ρ) = Σ_k λ_k S_k + δI,   λ_k = exp(ρ_k).
+            //
+            // For outer derivatives we require a rank-stable interpretation of log|S|_+:
+            //   log|S|_+ = sum_{i in penalized subspace} log(σ_i(S)),
+            // with a fixed structural nullspace convention.
+            //
+            // In this code path, `s_transformed` is already in the stabilized transformed basis
+            // produced by reparameterization. When ridge participates in determinant terms
+            // (`penalty_logdet_ridge > 0`), we evaluate log|S + ridge I| according to policy:
+            //   - Full: ordinary SPD logdet (Cholesky).
+            //   - PositivePart: positive-eigenvalue pseudo-logdet.
+            //
+            // Matching this convention between cost and gradient is mandatory because
+            // det1[k] represents:
+            //   ∂/∂ρ_k log|S(ρ)|_+ = tr(S^+ S_k^ρ),  S_k^ρ = λ_k S_k.
             let ridge = ridge_passport.penalty_logdet_ridge();
             if ridge <= 0.0 {
                 return Ok(base_log_det);
@@ -3119,7 +3429,12 @@ pub mod internal {
             let max_eig = eigvals.iter().copied().fold(0.0_f64, f64::max);
             let eig_threshold = (max_eig * EIG_REL_THRESHOLD).max(EIG_ABS_FLOOR);
 
-            // Sum log(lambda) for valid eigenvalues
+            // Positive-part Hessian log-determinant convention:
+            //   log|H|_+ = Σ_{λ_i(H) > τ} log λ_i(H),
+            // where τ is a relative+absolute cutoff tied to spectrum scale.
+            //
+            // This avoids unstable rank flips from tiny signed eigenvalues and keeps
+            // logdet/traces/pseudoinverse operations on the same effective subspace.
             let h_total_log_det: f64 = eigvals
                 .iter()
                 .filter(|&&v| v > eig_threshold)
@@ -3132,7 +3447,13 @@ pub mod internal {
                 });
             }
 
-            // Filter valid eigenvalues and construct W = U_+ diag(1/sqrt(lambda_+)).
+            // Build factor W for the Moore-Penrose pseudoinverse on the kept subspace:
+            //   H_+^† = U_+ diag(1/λ_+) U_+ᵀ = W Wᵀ,
+            //   W := U_+ diag(1/sqrt(λ_+)).
+            //
+            // Later trace terms use this representation directly, e.g.
+            //   tr(H_+^† S_k) = ||R_k W||_F^2
+            // without materializing H_+^† as a dense matrix.
             let valid_indices: Vec<usize> = eigvals
                 .iter()
                 .enumerate()
@@ -3523,39 +3844,17 @@ pub mod internal {
 
         const MIN_DMU_DETA: f64 = 1e-6;
 
-        /// Compute ∂log|H|/∂β for logit GLM.
+        /// Compute ∂log|H|/∂β given w'_i = dW_ii/dη_i.
         /// Uses the penalized Hessian factorization for leverage computation.
-        fn logh_beta_grad_logit(
+        fn logh_beta_grad_from_wprime(
             &self,
             x_transformed: &DesignMatrix,
-            mu: &Array1<f64>,
-            weights: &Array1<f64>,
+            w_prime: &Array1<f64>,
             factor: &Arc<FaerFactor>,
         ) -> Option<Array1<f64>> {
-            let n = mu.len();
+            let n = w_prime.len();
             if n == 0 {
                 return None;
-            }
-
-            // Match the GLM probability clamp in update_glm_vectors.
-            // The clamp makes w(eta) constant in saturated regions, so dw/deta = 0.
-            // Using the unclamped derivative there would create a phantom gradient.
-            const PROB_EPS: f64 = 1e-8;
-            // Match the GLM weight clamp in update_glm_vectors:
-            // if dmu is clamped, weights are constant and w' = 0.
-            const MIN_WEIGHT: f64 = 1e-12;
-            let mut w_prime = Array1::<f64>::zeros(n);
-            let mut clamped = 0usize;
-            for i in 0..n {
-                let mu_i = mu[i];
-                let w_base = mu_i * (1.0 - mu_i);
-                if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || w_base < MIN_WEIGHT {
-                    clamped += 1;
-                    w_prime[i] = 0.0;
-                    continue;
-                }
-                let one_minus2 = 1.0 - 2.0 * mu_i;
-                w_prime[i] = weights[i] * one_minus2;
             }
 
             // Always use full rank path (Cholesky solve).
@@ -3664,19 +3963,6 @@ pub mod internal {
                 weight_vec[i] = leverage[i] * w_prime[i];
             }
             let logh_grad = x_transformed.transpose_vector_multiply(&weight_vec);
-            let logh_norm = logh_grad
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, |a, b| a.max(b));
-            if clamped > 0 && logh_norm < 1e-8 {
-                let (should_print, count) = should_emit_grad_diag(&GRAD_DIAG_LOGH_CLAMPED_COUNT);
-                if should_print {
-                    eprintln!(
-                        "[GRAD DIAG #{count}] logh_beta_grad ~0 with clamped weights: clamped={}/{}, max|logh_beta_grad|={:.3e}",
-                        clamped, n, logh_norm
-                    );
-                }
-            }
             Some(logh_grad)
         }
 
@@ -3825,6 +4111,49 @@ pub mod internal {
         /// Compute the objective function for BFGS optimization.
         /// For Gaussian models (Identity link), this is the exact REML score.
         /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
+        ///
+        /// FULL OBJECTIVE REFERENCE
+        /// ------------------------
+        /// This function returns the scalar outer cost minimized over ρ.
+        ///
+        /// Non-Gaussian branch (negative LAML form used by optimizer):
+        ///   V_LAML(ρ) =
+        ///      -ℓ(β̂(ρ))
+        ///      + 0.5 β̂(ρ)ᵀ S(ρ) β̂(ρ)
+        ///      + 0.5 log|H(ρ)|
+        ///      - 0.5 log|S(ρ)|_+
+        ///      + const
+        ///
+        /// where:
+        ///   S(ρ) = Σ_k exp(ρ_k) S_k + δI
+        ///   H(ρ) = -∇²ℓ(β̂(ρ)) + S(ρ)
+        ///
+        /// Gaussian identity-link REML branch:
+        ///   V_REML(ρ, φ) =
+        ///      D_p(ρ)/(2φ)
+        ///      + (n_r/2) log φ
+        ///      + 0.5 log|H(ρ)|
+        ///      - 0.5 log|S(ρ)|_+
+        ///      + const
+        ///
+        /// with profiled φ:
+        ///   φ̂(ρ) = D_p(ρ)/n_r
+        ///   V_REML,prof(ρ) =
+        ///      (n_r/2) log D_p(ρ)
+        ///      + 0.5 log|H(ρ)|
+        ///      - 0.5 log|S(ρ)|_+
+        ///      + const.
+        ///
+        /// Consistency rule enforced throughout:
+        ///   The exact same stabilized matrices/factorizations must be used for
+        ///   objective and gradient/Hessian terms. Mixing different H/S variants
+        ///   causes deterministic gradient mismatch and unstable outer optimization.
+        ///
+        /// Determinant conventions:
+        ///   - log|H| may use positive-part/stabilized spectrum conventions when needed.
+        ///   - log|S|_+ follows fixed-rank pseudo-determinant conventions in the
+        ///     transformed penalty basis, optionally including ridge policy.
+        /// These conventions are mirrored in gradient code via corresponding trace terms.
         pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
             let cost_call_idx = {
                 let mut calls = self.cost_eval_count.write().unwrap();
@@ -3960,6 +4289,17 @@ pub mod internal {
                     // From Wood (2017), Chapter 6, Eq. 6.24:
                     // V_r(λ) = D_p/(2φ) + (r/2φ) + ½log|X'X/φ + S_λ/φ| - ½log|S_λ/φ|_+
                     // where D_p = ||y - Xβ̂||² + β̂'S_λβ̂ is the PENALIZED deviance
+                    //
+                    // With profiled dispersion φ̂ = D_p/(n-M_p), this becomes:
+                    //   V_REML(ρ) =
+                    //     D_p/(2φ̂)
+                    //   + 0.5 log|H|
+                    //   - 0.5 log|S|_+
+                    //   + ((n-M_p)/2) log(2πφ̂),
+                    // where H = XᵀW0X + S(ρ), S(ρ)=Σ_k exp(ρ_k) S_k + δI.
+                    //
+                    // Because Gaussian identity has c=d=0, there is no third/fourth derivative
+                    // correction in H_k: ∂H/∂ρ_k = S_k^ρ exactly.
 
                     // Check condition number with improved thresholds per Wood (2011)
                     const MAX_CONDITION_NUMBER: f64 = 1e12;
@@ -4038,6 +4378,10 @@ pub mod internal {
 
                     // log |H| = log |X'X + S_λ + ridge I| using the single effective
                     // Hessian shared with the gradient. Ridge is already baked into h_eff.
+                    //
+                    // This must be the exact same stabilized H used in compute_gradient;
+                    // otherwise the chain-rule pieces and determinant pieces are taken on
+                    // different objective surfaces and the optimizer sees inconsistent derivatives.
                     let h_for_det = h_eff.clone();
 
                     let chol = h_for_det.cholesky(Side::Lower).map_err(|_| {
@@ -4055,6 +4399,10 @@ pub mod internal {
 
                     // log |S_λ + ridge I|_+ (pseudo-determinant) to match the
                     // stabilized penalty used by PIRLS.
+                    //
+                    // Fixed-rank rule: unpenalized/null directions do not contribute to the
+                    // pseudo-logdet. This keeps the objective continuous in ρ when S is singular
+                    // (or near-singular before ridge augmentation).
                     let ridge_passport = pirls_result.ridge_passport;
                     let log_det_s_plus = Self::log_det_s_with_ridge(
                         &pirls_result.reparam_result.s_transformed,
@@ -4104,6 +4452,17 @@ pub mod internal {
                     // from the bundle to ensure exact consistency with gradient computation.
                     // For Firth: h_total = h_eff - h_phi (computed in prepare_eval_bundle)
                     // For non-Firth: h_total = h_eff
+                    //
+                    // LAML objective:
+                    //   V_LAML(ρ) =
+                    //      -ℓ(β̂) + 0.5 β̂ᵀSβ̂
+                    //    - 0.5 log|S|_+
+                    //    + 0.5 log|H|
+                    //    + const.
+                    //
+                    // For non-Gaussian families, H depends on ρ both directly through S and
+                    // indirectly through β̂(ρ), which induces the dH/dρ_k third-derivative term in
+                    // the exact gradient path (documented in compute_gradient).
                     let log_det_h = bundle.h_total_log_det;
 
                     // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2πφ)
@@ -4143,10 +4502,11 @@ pub mod internal {
                     // Expensive raw-condition diagnostics are rate-limited in the hot loop.
                     // We only refresh occasionally, and keep the last snapshot otherwise.
                     let raw_cond = if matches!(self.x(), DesignMatrix::Dense(_)) && want_hot_diag {
-                        let x_orig = self.x().to_dense();
+                        let x_orig_arc = self.x().to_dense_arc();
+                        let x_orig = x_orig_arc.as_ref();
                         let w_orig = self.weights();
                         let sqrt_w = w_orig.mapv(|w| w.max(0.0).sqrt());
-                        let wx = &x_orig * &sqrt_w.insert_axis(Axis(1));
+                        let wx = x_orig * &sqrt_w.insert_axis(Axis(1));
                         let mut h_raw = fast_ata(&wx);
                         for (k, &lambda) in lambdas.iter().enumerate() {
                             let s_k = &self.s_full_list[k];
@@ -4195,9 +4555,7 @@ pub mod internal {
                 *count += 1;
                 *count
             };
-            let verbose_opt = std::env::var("GAM_VERBOSE_OPT")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+            let verbose_opt = false;
 
             // Map from unbounded z to bounded rho via rho = RHO_BOUND * tanh(z / RHO_BOUND)
             let rho = LogSmoothingParams::new(z.mapv(|v| {
@@ -4218,6 +4576,7 @@ pub mod internal {
                     *self.consecutive_cost_errors.write().unwrap() = 0;
                     match self.compute_gradient(&rho) {
                         Ok(mut grad) => {
+                            maybe_audit_gradient(self, &rho, eval_num, &mut grad);
                             // Projected/KKT handling at active bounds in rho-space
                             project_rho_gradient(&rho, &mut grad);
                             // Chain rule: dCost/dz = dCost/drho * drho/dz, where drho/dz|_{z=0} = 1
@@ -4391,6 +4750,65 @@ pub mod internal {
         }
         /// Compute the gradient of the REML/LAML score with respect to the log-smoothing parameters (ρ).
         ///
+        /// FULL OUTER-DERIVATIVE REFERENCE (exact system, sign convention used here)
+        /// -------------------------------------------------------------------------
+        /// This optimizer minimizes an outer cost V(ρ).
+        ///
+        /// Common definitions:
+        ///   λ_k = exp(ρ_k)
+        ///   S(ρ) = Σ_k λ_k S_k + δI
+        ///   A_k = ∂S/∂ρ_k = λ_k S_k
+        ///   A_{kℓ} = ∂²S/(∂ρ_k∂ρ_ℓ) = δ_{kℓ} A_k
+        ///
+        /// Inner mode (β̂):
+        ///   ∇_β ℓ(β̂) - S(ρ) β̂ = 0
+        ///
+        /// Curvature:
+        ///   H(ρ) = -∇²_β ℓ(β̂(ρ)) + S(ρ)
+        ///
+        /// For GLM single-index structure (η = Xβ + o), define per-observation derivatives:
+        ///   w_i = -∂²ℓ_i/∂η_i²
+        ///   d_i = -∂³ℓ_i/∂η_i³
+        ///   e_i = -∂⁴ℓ_i/∂η_i⁴
+        ///
+        /// Then:
+        ///   H_k = A_k + Xᵀ diag(d ⊙ u_k) X,     u_k := X B_k
+        ///   H_{kℓ} = δ_{kℓ}A_k + Xᵀ diag(e ⊙ u_k ⊙ u_ℓ + d ⊙ u_{kℓ}) X
+        ///
+        /// with implicit derivatives:
+        ///   B_k := ∂β̂/∂ρ_k = -H^{-1}(A_k β̂)
+        ///   H B_{kℓ} = -(H_ℓ B_k + δ_{kℓ}A_k β̂ + A_k B_ℓ)
+        ///
+        /// Non-Gaussian negative LAML cost:
+        ///   V(ρ) = -ℓ(β̂) + 0.5 β̂ᵀSβ̂ + 0.5 log|H| - 0.5 log|S|_+
+        ///
+        /// Exact gradient:
+        ///   g_k = 0.5 β̂ᵀA_kβ̂ + 0.5 tr(H^{-1}H_k) - 0.5 ∂_k log|S|_+
+        ///
+        /// Exact Hessian decomposition:
+        ///   ∂²V/(∂ρ_k∂ρ_ℓ) = Q_{kℓ} + L_{kℓ} + P_{kℓ}
+        ///
+        ///   Q_{kℓ} = 0.5 δ_{kℓ} β̂ᵀA_kβ̂ - B_ℓᵀ H B_k
+        ///
+        ///   L_{kℓ} = 0.5 [ tr(H^{-1}H_{kℓ}) - tr(H^{-1}H_k H^{-1}H_ℓ) ]
+        ///
+        ///   P_{kℓ} = -0.5 ∂²_{kℓ} log|S|_+
+        ///
+        /// Here, this function computes the exact gradient terms (including dH/dρ_k via d_i).
+        /// The full exact Hessian is not assembled in the hot loop because it requires B_{kℓ}
+        /// solves and fourth-derivative terms for every (k,ℓ) pair.
+        ///
+        /// Gaussian REML note:
+        ///   In identity-link Gaussian, d=e=0 so H_k=A_k and H_{kℓ}=δ_{kℓ}A_k.
+        ///   With profiled φ, use either:
+        ///   - explicit profiled objective derivatives, or
+        ///   - Schur complement in (ρ, log φ):
+        ///       H_prof = H_{ρρ} - H_{ρα} H_{αα}^{-1} H_{αρ}.
+        ///
+        /// Pseudo-determinant note:
+        ///   The code uses fixed-rank/stabilized conventions for log|S|_+ to keep objective
+        ///   derivatives smooth and consistent with the transformed penalty basis used by PIRLS.
+        ///
         /// This is the core of the outer optimization loop and provides the search direction for the BFGS algorithm.
         /// The calculation differs significantly between the Gaussian (REML) and non-Gaussian (LAML) cases.
         ///
@@ -4530,6 +4948,33 @@ pub mod internal {
         /// Where $\nabla_\beta V = -\nabla_\beta \mathcal{L} + \frac{1}{2} \nabla_\beta \log |H_{total}|$.
         /// - At a perfect optimum, $\nabla_\beta \mathcal{L} = 0$, but we include `residual_grad` for robustness.
         /// - $\frac{1}{2} \nabla_\beta \log |H_{total}|$ is computed via `firth_logh_total_grad`.
+        ///
+        /// ## Exact non-Gaussian Hessian system (reference for this implementation)
+        ///
+        /// For outer parameters ρ with λ_k = exp(ρ_k), A_k = ∂S/∂ρ_k = λ_k S_k, and
+        /// H = -∇²ℓ(β̂(ρ)) + S(ρ), exact derivatives are:
+        ///
+        ///   B_k := ∂β̂/∂ρ_k = -H^{-1}(A_k β̂)
+        ///
+        ///   H_k := ∂H/∂ρ_k = A_k + D(-∇²ℓ)[B_k]
+        ///
+        ///   B_{kℓ} solves:
+        ///     H B_{kℓ} = -(H_ℓ B_k + δ_{kℓ} A_k β̂ + A_k B_ℓ)
+        ///
+        ///   H_{kℓ} := ∂²H/(∂ρ_k∂ρ_ℓ)
+        ///     = δ_{kℓ}A_k + D²(-∇²ℓ)[B_k,B_ℓ] + D(-∇²ℓ)[B_{kℓ}]
+        ///
+        /// Then the exact outer Hessian for V(ρ) = -ℓ(β̂)+0.5β̂ᵀSβ̂+0.5log|H|-0.5log|S|_+ is:
+        ///
+        ///   ∂²V/(∂ρ_k∂ρ_ℓ)
+        ///     = 0.5 δ_{kℓ} β̂ᵀA_kβ̂ - B_ℓᵀ H B_k
+        ///       + 0.5[ tr(H^{-1}H_{kℓ}) - tr(H^{-1}H_k H^{-1}H_ℓ) ]
+        ///       - 0.5 ∂² log|S|_+ /(∂ρ_k∂ρ_ℓ)
+        ///
+        /// This function computes the exact gradient terms (including the third-derivative
+        /// contribution in H_k for logit). Full explicit H_{kℓ} assembly is intentionally not
+        /// performed in the hot optimization loop because it requires B_{kℓ} solves and
+        /// fourth-derivative likelihood terms for every (k,ℓ) pair.
         fn compute_gradient_with_bundle(
             &self,
             p: &Array1<f64>,
@@ -4579,52 +5024,16 @@ pub mod internal {
                 workspace.zero_cost_gradient(len);
                 let lambdas = workspace.lambda_view(len).to_owned();
 
-                // When we treat a stabilization ridge as a true penalty term, the
-                // penalty matrix becomes S_λ + ridge * I. For exactness, both the
-                // log|S| term in the cost and the derivative d/dρ_k log|S| must be
-                // computed using this ridged matrix. The derivative follows from
-                // Jacobi's formula:
-                //   d/dρ_k log|S_λ + δI|
-                //     = tr((S_λ + δI)^{-1} dS_λ/dρ_k)
-                //     = λ_k tr((S_λ + δI)^{-1} S_k).
-                //
-                //   det1[k] = d/dρ_k log|S_λ + ridge I|
-                //           = λ_k * tr((S_λ + ridge I)^{-1} S_k)
-                //
-                // which can be evaluated without explicitly forming S_k by using
-                // the penalty roots R_k (S_k = R_kᵀ R_k).
-                let det1_values = if ridge_passport.penalty_logdet_ridge() > 0.0 {
-                    // If a stabilization ridge is treated as an explicit penalty term,
-                    // the penalty matrix becomes S_λ + ridge * I. The gradient term
-                    // d/dρ_k log|S_λ + ridge I| uses:
-                    //   det1[k] = λ_k * tr((S_λ + ridge I)^{-1} S_k)
-                    let p_dim = reparam_result.s_transformed.nrows();
-                    let mut s_ridge = reparam_result.s_transformed.clone();
-                    for i in 0..p_dim {
-                        s_ridge[[i, i]] += ridge_passport.penalty_logdet_ridge();
-                    }
-                    let s_view = FaerArrayView::new(&s_ridge);
-                    let chol = FaerLlt::new(s_view.as_ref(), Side::Lower).map_err(|_| {
-                        EstimationError::ModelIsIllConditioned {
-                            condition_number: f64::INFINITY,
-                        }
-                    })?;
-
-                    let mut det1 = Array1::<f64>::zeros(len);
-                    for (k, rt) in rs_transposed.iter().enumerate() {
-                        if rt.ncols() == 0 {
-                            continue;
-                        }
-                        let mut rhs = rt.to_owned();
-                        let mut rhs_view = array2_to_mat_mut(&mut rhs);
-                        chol.solve_in_place(rhs_view.as_mut());
-                        let trace = kahan_sum(rhs.iter().zip(rt.iter()).map(|(&x, &y)| x * y));
-                        det1[k] = lambdas[k] * trace;
-                    }
-                    det1
-                } else {
-                    reparam_result.det1.clone()
-                };
+                // Fixed structural-rank pseudo-determinant derivatives:
+                // d/dρ_k log|S|_+ and d²/(dρ_k dρ_ℓ) log|S|_+ are evaluated on a
+                // reduced structural subspace (rank = e_transformed.nrows()) with a
+                // smooth floor in that reduced block. This avoids adaptive rank flips.
+                let (det1_values, _) = self.structural_penalty_logdet_derivatives(
+                    rs_transformed,
+                    &lambdas,
+                    reparam_result.e_transformed.nrows(),
+                    ridge_passport.penalty_logdet_ridge(),
+                )?;
 
                 // --- Use Single Stabilized Hessian from P-IRLS ---
                 // Use the same effective Hessian as the cost function for consistency.
@@ -4676,6 +5085,12 @@ pub mod internal {
                         let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
                         let mp = self.p.saturating_sub(penalty_rank) as f64;
                         let scale = dp_c / (n - mp).max(LAML_RIDGE);
+                        // Gaussian profiled-scale identity used by this branch:
+                        //   φ̂(ρ) = D_p(ρ)/(n-M_p), with D_p = rss + β̂ᵀSβ̂.
+                        // The gradient therefore includes the profiled contribution
+                        //   (n-M_p)/2 * D_k / D_p
+                        // which is exactly represented by `deviance_grad_term` below.
+                        // (Equivalent to Schur-complement profiling in (ρ, log φ).)
 
                         if dp_c <= DP_FLOOR + DP_FLOOR_SMOOTH_WIDTH {
                             eprintln!(
@@ -4856,18 +5271,59 @@ pub mod internal {
                         let solved_ref = &workspace.solved;
                         let concat_ref = &workspace.concat;
                         let gaussian_corrections_ref = &gaussian_corrections;
+                        // Exact Gaussian identity REML gradient (profiled scale) in log-smoothing coordinates:
+                        //
+                        //   V_REML(ρ) =
+                        //     0.5 * log|H|
+                        //   - 0.5 * log|S|_+
+                        //   + ((n - M_p)/2) * log(2π φ̂)
+                        //   + const,
+                        //
+                        // where H = Xᵀ W0 X + S(ρ), S(ρ) = Σ_k λ_k S_k + δI, λ_k = exp(ρ_k),
+                        // and φ̂ = D_p / (n - M_p), D_p = ||W0^(1/2)(y - Xβ̂ - o)||² + β̂ᵀ S β̂.
+                        //
+                        // Because Gaussian identity has c_i = d_i = 0, we have:
+                        //   H_k := ∂H/∂ρ_k = S_k^ρ = λ_k S_k.
+                        // Envelope theorem at β̂(ρ) gives:
+                        //   ∂D_p/∂ρ_k = β̂ᵀ S_k^ρ β̂.
+                        // Therefore:
+                        //   ∂V_REML/∂ρ_k =
+                        //     0.5 * tr(H^{-1} S_k^ρ)
+                        //   - 0.5 * tr(S^+ S_k^ρ)
+                        //   + (1/(2 φ̂)) * β̂ᵀ S_k^ρ β̂.
+                        //
+                        // Mapping to variables below:
+                        //   d1 / (2*scale)                     -> (1/(2 φ̂)) * β̂ᵀ S_k^ρ β̂
+                        //   log_det_h_grad_term (or numeric)   -> 0.5 * tr(H^{-1} S_k^ρ)
+                        //   0.5 * det1_values[k]               -> 0.5 * tr(S^+ S_k^ρ)
                         let compute_gaussian_grad = |k: usize| -> f64 {
                             let r_k = &rs_transformed[k];
                             // Avoid forming S_k: compute S_k β = Rᵀ (R β)
                             let r_beta = r_k.dot(beta_ref);
                             let s_k_beta_transformed = r_k.t().dot(&r_beta);
 
-                            // Component 1: derivative of the penalized deviance.
-                            // For Gaussian models, the Envelope Theorem simplifies this to only the penalty term.
+                            // Component 1 derivation (profiled Gaussian REML):
+                            //
+                            //   V_prof includes (n-M_p)/2 * log D_p(ρ), so
+                            //   ∂V_prof/∂ρ_k contributes (n-M_p)/2 * D_k / D_p = D_k/(2φ̂),
+                            //   φ̂ = D_p/(n-M_p).
+                            //
+                            // At β̂, envelope cancellation gives:
+                            //   D_k = β̂ᵀ A_k β̂ = λ_k β̂ᵀ S_k β̂.
+                            //
+                            // `d1` stores D_k, and the expression below is D_k/(2φ̂)
+                            // with the smooth-floor derivative factor `dp_c_grad`.
                             let d1 = lambdas[k] * beta_ref.dot(&s_k_beta_transformed);
                             let deviance_grad_term = dp_c_grad * (d1 / (2.0 * scale));
 
-                            // Component 2: derivative of the penalized Hessian determinant.
+                            // Component 2 derivation:
+                            //   ∂/∂ρ_k [0.5 log|H|] = 0.5 tr(H^{-1} H_k),
+                            // and for Gaussian identity H_k = A_k = λ_k S_k.
+                            //
+                            // Root form gives:
+                            //   tr(H^{-1}A_k) = λ_k tr(H^{-1}R_kᵀR_k)
+                            //                = λ_k tr(R_k H^{-1} R_kᵀ),
+                            // computed by solving H X = R_kᵀ and taking tr(R_k X).
                             let log_det_h_grad_term = if let Some(g) = numeric_logh_grad_ref {
                                 g[k]
                             } else if solved_rows > 0 {
@@ -4895,7 +5351,9 @@ pub mod internal {
                             let corrected_log_det_h =
                                 log_det_h_grad_term - gaussian_corrections_ref[k];
 
-                            // Component 3: derivative of the penalty pseudo-determinant.
+                            // Component 3 derivation:
+                            //   -0.5 * ∂/∂ρ_k log|S|_+,
+                            // with `det1_values[k]` already equal to ∂ log|S|_+ / ∂ρ_k.
                             let log_det_s_grad_term = 0.5 * det1_values[k];
 
                             deviance_grad_term + corrected_log_det_h - log_det_s_grad_term
@@ -4910,13 +5368,39 @@ pub mod internal {
                             .assign(&Array1::from_vec(gaussian_grad));
                     }
                     _ => {
-                        // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
-                        // This branch follows the common practical LAML strategy:
-                        // keep the tractable implicit-differentiation terms and avoid
-                        // explicit third-derivative tensor construction for dH/dtheta.
-                        // This is the standard GAM approximation: drop the explicit
-                        // dH/dtheta term while retaining the dominant mgcv-style
-                        // implicit-beta sensitivity terms.
+                        // NON-GAUSSIAN LAML GRADIENT (exact in ρ, including dH/dρ third-derivative term)
+                        //
+                        // Objective:
+                        //   V_LAML(ρ) =
+                        //     -ℓ(β̂) + 0.5 β̂ᵀ S β̂
+                        //   - 0.5 log|S|_+
+                        //   + 0.5 log|H|
+                        //   + const
+                        //
+                        // with H(ρ) = J(β̂(ρ)) + S(ρ), J = Xᵀ diag(b) X.
+                        //
+                        // Exact gradient:
+                        //   ∂V/∂ρ_k =
+                        //     0.5 β̂ᵀ S_k^ρ β̂
+                        //   - 0.5 tr(S^+ S_k^ρ)
+                        //   + 0.5 tr(H^{-1} H_k)
+                        //
+                        // where:
+                        //   S_k^ρ = λ_k S_k, λ_k = exp(ρ_k),
+                        //   v_k   = H^{-1}(S_k^ρ β̂),
+                        //   H_k   = S_k^ρ - Xᵀ diag(c ⊙ (X v_k)) X,
+                        // and c_i = -∂^3 ℓ_i / ∂η_i^3.
+                        //
+                        // The second term inside H_k is the exact "missing tensor term":
+                        //   ∂H/∂ρ_k ≠ S_k^ρ
+                        // for non-Gaussian families; dropping it yields the usual approximation.
+                        //
+                        // Implementation strategy here (logit path):
+                        //   1) build S_k β̂ in transformed basis via penalty roots R_k,
+                        //   2) solve/apply H_+^† to get v_k and leverage terms,
+                        //   3) evaluate tr(H_+^† H_k) as
+                        //        tr(H_+^† S_k) - tr(H_+^† Xᵀ diag(c ⊙ X v_k) X),
+                        //   4) add envelope/direct pieces and the chain-rule implicit correction.
                         // Replace FD with implicit differentiation for logit models.
                         // When Firth bias reduction is enabled, the inner objective is:
                         //   L*(beta, rho) = l(beta) - 0.5 * beta' S_lambda beta
@@ -4942,7 +5426,8 @@ pub mod internal {
                         // we add H_phi. Below we compute H_phi and use H_total for the
                         // implicit solve (d beta_hat / d rho). If that fails, we fall
                         // back to H_pen for stability.
-                        if !matches!(self.config.link_function(), LinkFunction::Logit) {
+                        let w_prime = pirls_result.solve_c_array.clone();
+                        if !w_prime.iter().all(|v| v.is_finite()) {
                             let g_pll =
                                 self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
                             let g_half_logh =
@@ -4976,11 +5461,13 @@ pub mod internal {
                             let mut laml_grad = Vec::with_capacity(k_count);
                             let beta_ref = beta_transformed;
                             let mut beta_terms = Array1::<f64>::zeros(k_count);
+                            let mut s_k_beta_all: Vec<Array1<f64>> = Vec::with_capacity(k_count);
                             for k in 0..k_count {
                                 let r_k = &rs_transformed[k];
                                 let r_beta = r_k.dot(beta_ref);
                                 let s_k_beta = r_k.t().dot(&r_beta);
                                 beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
+                                s_k_beta_all.push(s_k_beta);
                             }
 
                             // Keep outer gradient on the same Hessian surface as PIRLS.
@@ -5011,20 +5498,92 @@ pub mod internal {
                                 }
                             };
 
-                            // TRACE TERM COMPUTATION: tr(H_+^\dagger S_k)
-                            // Use factor form to avoid materializing H_+^\dagger = W W^T:
-                            // tr(H_+^\dagger S_k) = ||R_k W||_F^2.
+                            // TRACE TERM COMPUTATION (exact non-Gaussian/logit dH term):
+                            //   tr(H_+^\dagger H_k), with
+                            //   H_k = S_k - X^T diag(c ⊙ (X v_k)) X,  v_k = H_+^\dagger (S_k beta).
+                            //
+                            // We evaluate this without explicit third-derivative tensors:
+                            //   tr(H_+^\dagger S_k) = ||R_k W||_F^2
+                            //   tr(H_+^\dagger X^T diag(t_k) X) = Σ_i t_k[i] * h_i,
+                            // where t_k = c ⊙ (X v_k), h_i = x_i^T H_+^\dagger x_i, and H_+^\dagger = W W^T.
+                            //
+                            // This is the matrix-free realization of the exact identity:
+                            //   tr(H^{-1}H_k) = tr(H^{-1}A_k) + tr(H^{-1}D(-∇²ℓ)[B_k]),
+                            // with B_k = -H^{-1}(A_kβ̂).
+                            //
+                            // For GLM single-index structure:
+                            //   D(-∇²ℓ)[B_k] = Xᵀ diag(d ⊙ (X B_k)) X,
+                            // where d_i = -∂³ℓ_i/∂η_i³. Here `c_vec` stores this per-observation
+                            // third derivative quantity in the stabilized logit path.
                             let w_pos = bundle.h_pos_factor_w.as_ref();
+                            let n_obs = pirls_result.solve_mu.len();
 
-                            let mut trace_terms = vec![0.0; k_count];
-                            for k_idx in 0..k_count {
-                                let r_k = &rs_transformed[k_idx];
-                                if r_k.ncols() == 0 || w_pos.ncols() == 0 {
-                                    continue;
+                            // c_i = dW_ii/deta_i for H = Xᵀ W X + S (exact for this objective surface).
+                            let c_vec = w_prime.clone();
+
+                            // h_i = x_i^T H_+^\dagger x_i = ||(XW)_{i,*}||^2.
+                            let mut leverage_h_pos = Array1::<f64>::zeros(n_obs);
+                            if w_pos.ncols() > 0 {
+                                match &pirls_result.x_transformed {
+                                    DesignMatrix::Dense(x_dense) => {
+                                        let xw = x_dense.dot(w_pos);
+                                        for i in 0..xw.nrows() {
+                                            leverage_h_pos[i] = xw.row(i).iter().map(|v| v * v).sum();
+                                        }
+                                    }
+                                    DesignMatrix::Sparse(_) => {
+                                        for col in 0..w_pos.ncols() {
+                                            let w_col = w_pos.column(col).to_owned();
+                                            let xw_col =
+                                                pirls_result.x_transformed.matrix_vector_multiply(&w_col);
+                                            Zip::from(&mut leverage_h_pos)
+                                                .and(&xw_col)
+                                                .for_each(|h, &v| *h += v * v);
+                                        }
+                                    }
                                 }
-                                let rkw = r_k.dot(w_pos);
-                                trace_terms[k_idx] = rkw.iter().map(|v| v * v).sum();
                             }
+
+                            let trace_terms: Vec<f64> = (0..k_count)
+                                .into_par_iter()
+                                .map(|k_idx| {
+                                    let r_k = &rs_transformed[k_idx];
+                                    if r_k.ncols() == 0 || w_pos.ncols() == 0 {
+                                        return 0.0;
+                                    }
+
+                                    // First piece derivation:
+                                    //   tr(H_+^† S_k) = tr(H_+^† R_kᵀR_k) = ||R_k W||_F^2
+                                    // when H_+^† = W Wᵀ.
+                                    let rkw = r_k.dot(w_pos);
+                                    let trace_h_inv_s_k: f64 = rkw.iter().map(|v| v * v).sum();
+
+                                    // Second piece derivation (exact dH/dρ_k correction):
+                                    //
+                                    //   H_k = A_k + Xᵀdiag(c ⊙ X B_k)X,
+                                    //   B_k = -H^{-1}(A_k β̂).
+                                    //
+                                    // Here we evaluate the non-penalty part through:
+                                    //   tr(H_+^† Xᵀdiag(c ⊙ X v_k)X)
+                                    // = Σ_i [c_i (Xv_k)_i] * h_i,
+                                    //   h_i = x_iᵀH_+^†x_i.
+                                    //
+                                    // `v_k` uses H_+^†(S_k β̂); λ_k is multiplied outside.
+                                    let s_k_beta = &s_k_beta_all[k_idx];
+                                    let wt_sk_beta = w_pos.t().dot(s_k_beta);
+                                    let v_k = w_pos.dot(&wt_sk_beta);
+                                    let x_v_k = pirls_result.x_transformed.matrix_vector_multiply(&v_k);
+                                    let trace_third = kahan_sum(
+                                        c_vec
+                                            .iter()
+                                            .zip(x_v_k.iter())
+                                            .zip(leverage_h_pos.iter())
+                                            .map(|((&c_i, &xv_i), &h_i)| c_i * xv_i * h_i),
+                                    );
+
+                                    trace_h_inv_s_k - trace_third
+                                })
+                                .collect();
 
                             // We do NOT need to set workspace.solved_rows as we aren't using the workspace solver.
                             workspace.solved_rows = 0;
@@ -5037,7 +5596,9 @@ pub mod internal {
                             let truncation_corrections = vec![0.0; k_count];
 
                             let residual_grad = {
-                                let eta = pirls_result.solve_mu.mapv(|m| logit_from_prob(m));
+                                let eta = pirls_result
+                                    .solve_mu
+                                    .mapv(|m| eta_from_mu_for_link(m, self.config.link_function()));
                                 let working_residual = &eta - &pirls_result.solve_working_response;
                                 let weighted_residual =
                                     &pirls_result.solve_weights * &working_residual;
@@ -5066,17 +5627,12 @@ pub mod internal {
                             // LAML adds 0.5 * ∂log|H₊|/∂β via Jacobi's formula:
                             //   ∂/∂β_j log|H₊| = tr(H₊† ∂H/∂β_j)
                             // For logit in this path, H = Xᵀ W X + S.
-                            let logh_beta_grad: Option<Array1<f64>> =
-                                if let LinkFunction::Logit = self.config.link_function() {
-                                    self.logh_beta_grad_logit(
-                                        &pirls_result.x_transformed,
-                                        &pirls_result.solve_mu,
-                                        &pirls_result.solve_weights,
-                                        &factor_g,
-                                    )
-                                } else {
-                                    None
-                                };
+                            let logh_beta_grad: Option<Array1<f64>> = self
+                                .logh_beta_grad_from_wprime(
+                                    &pirls_result.x_transformed,
+                                    &w_prime,
+                                    &factor_g,
+                                );
 
                             let mut grad_beta = if self.config.firth_bias_reduction {
                                 // Chain-rule term for Firth-LAML:
@@ -5207,13 +5763,28 @@ pub mod internal {
                                     log_det_h_grad_term - truncation_corrections[k];
                                 let log_det_s_grad_term = 0.5 * det1_values[k];
 
-                                // REML gradient formula (Wood 2017, Section 6.5) / User Derivation Section 2.2:
-                                //   ∂V/∂ρ_k = 0.5 * λ_k * β'S_k β   (penalty on coefficients)
-                                //           + 0.5 * λ_k * tr(H⁻¹ S_k)  (Hessian log-det derivative)
-                                //           - 0.5 * det1[k]            (penalty log-det derivative)
+                                // Exact LAML gradient assembly in this loop:
+                                //   g_k =
+                                //     0.5 * β̂ᵀ S_k^ρ β̂
+                                //   - 0.5 * tr(S^+ S_k^ρ)
+                                //   + 0.5 * tr(H^{-1} H_k)
+                                //   + (∇_β V)ᵀ (dβ̂/dρ_k)
                                 //
-                                // Note: log_det_h_grad_term already contains the 0.5 factor and λ_k
-                                // Note: det1_values[k] already contains λ_k * tr(S^{-1} S_k)
+                                // Direct terms:
+                                //   0.5 * beta_terms[k]      = 0.5 * β̂ᵀ S_k^ρ β̂
+                                //   log_det_s_grad_term      = 0.5 * tr(S^+ S_k^ρ)
+                                //   corrected_log_det_h      = 0.5 * tr(H^{-1} H_k)
+                                //
+                                // Implicit chain-rule term:
+                                //   dβ̂/dρ_k = -H^{-1}(S_k^ρ β̂), so
+                                //   (∇_β V)ᵀ(dβ̂/dρ_k) = -(H^{-1}∇_βV)ᵀ(S_k^ρβ̂) = -δᵀu_k.
+                                //
+                                // This is exactly the first-order IFT term required by:
+                                //   dV/dρ_k = ∂V/∂ρ_k + (∇_β V)ᵀ (∂β̂/∂ρ_k).
+                                //
+                                // In the ideal inner optimum, ∇_βV contributions from residual score
+                                // vanish by envelope arguments; in finite-iteration PIRLS we keep this
+                                // correction explicitly to remain consistent with the solved inner system.
                                 let mut gradient_value =
                                     0.5 * beta_terms[k] + corrected_log_det_h - log_det_s_grad_term;
 
@@ -5224,10 +5795,7 @@ pub mod internal {
                                 //      = - delta_opt^T * u_k
 
                                 if let Some(delta_ref) = delta_opt.as_ref() {
-                                    let r_k = &rs_transformed[k];
-                                    let r_beta = r_k.dot(beta_ref);
-                                    let s_k_beta = r_k.t().dot(&r_beta);
-                                    let u_k: Array1<f64> = s_k_beta.mapv(|v| v * lambdas[k]);
+                                    let u_k: Array1<f64> = s_k_beta_all[k].mapv(|v| v * lambdas[k]);
                                     // Indirect term from chain rule:
                                     // dV/dρ_k = ∂V/∂ρ_k + (∇β V)ᵀ dβ/dρ_k.
                                     // Differentiate stationarity g = score - Sβ (+ Firth): ∂g/∂β = -H,
@@ -5282,6 +5850,544 @@ pub mod internal {
             Ok(gradient_result)
         }
 
+        fn xt_diag_x_dense_into(
+            x: &Array2<f64>,
+            diag: &Array1<f64>,
+            weighted: &mut Array2<f64>,
+        ) -> Array2<f64> {
+            let n = x.nrows();
+            weighted.assign(x);
+            for i in 0..n {
+                let w = diag[i];
+                for j in 0..x.ncols() {
+                    weighted[[i, j]] *= w;
+                }
+            }
+            fast_atb(x, weighted)
+        }
+
+        fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+            debug_assert_eq!(a.nrows(), b.ncols());
+            debug_assert_eq!(a.ncols(), b.nrows());
+            let elems = a.nrows().saturating_mul(a.ncols());
+            if elems >= 32 * 32 {
+                let a_view = FaerArrayView::new(a);
+                let b_view = FaerArrayView::new(b);
+                return faer_frob_inner(a_view.as_ref(), b_view.as_ref().transpose());
+            }
+            let m = a.nrows();
+            let n = a.ncols();
+            kahan_sum((0..m).map(|i| {
+                let mut acc = 0.0_f64;
+                for j in 0..n {
+                    acc += a[[i, j]] * b[[j, i]];
+                }
+                acc
+            }))
+        }
+
+        fn bilinear_form(mat: &Array2<f64>, left: ndarray::ArrayView1<'_, f64>, right: ndarray::ArrayView1<'_, f64>) -> f64 {
+            let n = mat.nrows();
+            debug_assert_eq!(mat.ncols(), n);
+            debug_assert_eq!(left.len(), n);
+            debug_assert_eq!(right.len(), n);
+            let mut acc = KahanSum::default();
+            for i in 0..n {
+                let mut row_dot = 0.0_f64;
+                for j in 0..n {
+                    row_dot += mat[[i, j]] * right[j];
+                }
+                acc.add(left[i] * row_dot);
+            }
+            acc.sum()
+        }
+
+        #[inline]
+        fn splitmix64(mut x: u64) -> u64 {
+            x = x.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+
+        fn rademacher_matrix(rows: usize, cols: usize, seed: u64) -> Array2<f64> {
+            let mut out = Array2::<f64>::zeros((rows, cols));
+            for j in 0..cols {
+                for i in 0..rows {
+                    let h = Self::splitmix64(
+                        seed ^ ((i as u64).wrapping_mul(0x9E37)) ^ ((j as u64).wrapping_mul(0x85EB)),
+                    );
+                    out[[i, j]] = if (h & 1) == 0 { -1.0 } else { 1.0 };
+                }
+            }
+            out
+        }
+
+        fn orthonormalize_columns(a: &Array2<f64>, tol: f64) -> Array2<f64> {
+            let p = a.nrows();
+            let c = a.ncols();
+            let mut q = Array2::<f64>::zeros((p, c));
+            let mut kept = 0usize;
+            for j in 0..c {
+                let mut v = a.column(j).to_owned();
+                for t in 0..kept {
+                    let qt = q.column(t);
+                    let proj = qt.dot(&v);
+                    v -= &qt.mapv(|x| x * proj);
+                }
+                let nrm = v.dot(&v).sqrt();
+                if nrm > tol {
+                    q.column_mut(kept).assign(&v.mapv(|x| x / nrm));
+                    kept += 1;
+                }
+            }
+            if kept == c {
+                q
+            } else {
+                q.slice(ndarray::s![.., 0..kept]).to_owned()
+            }
+        }
+
+        fn structural_penalty_logdet_derivatives(
+            &self,
+            rs_transformed: &[Array2<f64>],
+            lambdas: &Array1<f64>,
+            structural_rank: usize,
+            ridge: f64,
+        ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
+            let k_count = lambdas.len();
+            let p_dim = self.p;
+            if k_count == 0 || structural_rank == 0 {
+                return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
+            }
+            let rank = structural_rank.min(p_dim);
+            if rank == 0 {
+                return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
+            }
+
+            let mut s_k_full = Vec::with_capacity(k_count);
+            let mut s_lambda = Array2::<f64>::zeros((p_dim, p_dim));
+            for k in 0..k_count {
+                let r_k = &rs_transformed[k];
+                let s_k = r_k.t().dot(r_k);
+                s_lambda += &s_k.mapv(|v| lambdas[k] * v);
+                s_k_full.push(s_k);
+            }
+            if ridge > 0.0 {
+                for i in 0..p_dim {
+                    s_lambda[[i, i]] += ridge;
+                }
+            }
+
+            let (evals, evecs) = s_lambda
+                .eigh(Side::Lower)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let mut order: Vec<usize> = (0..p_dim).collect();
+            order.sort_by(|&a, &b| {
+                evals[b]
+                    .partial_cmp(&evals[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(&b))
+            });
+
+            let mut u1 = Array2::<f64>::zeros((p_dim, rank));
+            for (col_out, &col_in) in order.iter().take(rank).enumerate() {
+                u1.column_mut(col_out).assign(&evecs.column(col_in));
+            }
+            let mut s_r = u1.t().dot(&s_lambda).dot(&u1);
+            let max_diag = s_r
+                .diag()
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            let eps = 1e-12 * max_diag;
+            for i in 0..rank {
+                s_r[[i, i]] += eps;
+            }
+            let s_r_inv = matrix_inverse_with_regularization(&s_r, "structural penalty block")
+                .ok_or_else(|| EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                })?;
+
+            let mut s_k_reduced = Vec::with_capacity(k_count);
+            let mut det1 = Array1::<f64>::zeros(k_count);
+            for k in 0..k_count {
+                let s_kr = u1.t().dot(&s_k_full[k]).dot(&u1);
+                let tr = kahan_sum((0..rank).map(|i| {
+                    let mut acc = 0.0;
+                    for j in 0..rank {
+                        acc += s_r_inv[[i, j]] * s_kr[[j, i]];
+                    }
+                    acc
+                }));
+                det1[k] = lambdas[k] * tr;
+                s_k_reduced.push(s_kr);
+            }
+
+            let mut det2 = Array2::<f64>::zeros((k_count, k_count));
+            for k in 0..k_count {
+                for l in 0..=k {
+                    let a = s_r_inv.dot(&s_k_reduced[k]);
+                    let b = s_r_inv.dot(&s_k_reduced[l]);
+                    let tr_ab = kahan_sum((0..rank).map(|i| {
+                        let mut acc = 0.0;
+                        for j in 0..rank {
+                            acc += a[[i, j]] * b[[j, i]];
+                        }
+                        acc
+                    }));
+                    let mut val = -lambdas[k] * lambdas[l] * tr_ab;
+                    if k == l {
+                        val += det1[k];
+                    }
+                    det2[[k, l]] = val;
+                    det2[[l, k]] = val;
+                }
+            }
+            Ok((det1, det2))
+        }
+
+        pub(super) fn compute_laml_hessian_exact(
+            &self,
+            rho: &Array1<f64>,
+        ) -> Result<Array2<f64>, EstimationError> {
+            // Exact non-Gaussian outer Hessian components (ρ-space):
+            //
+            //   B_k   = ∂β̂/∂ρ_k = -H^{-1}(A_k β̂)
+            //   B_{kℓ}= ∂²β̂/(∂ρ_k∂ρ_ℓ) from
+            //          H B_{kℓ} = -(H_ℓ B_k + A_k B_ℓ + δ_{kℓ} A_k β̂)
+            //
+            //   H_k   = A_k + Xᵀ diag(c ⊙ u_k) X,        u_k   = X B_k
+            //   H_{kℓ}= δ_{kℓ}A_k + Xᵀ diag(d ⊙ u_k ⊙ u_ℓ + c ⊙ u_{kℓ}) X,
+            //           where u_{kℓ}=X B_{kℓ}
+            //
+            // Here `c` and `d` are the per-observation 3rd/4th eta-derivative arrays
+            // prepared by PIRLS (`solve_c_array`, `solve_d_array`).
+            let bundle = self.obtain_eval_bundle(rho)?;
+            let pirls_result = bundle.pirls_result.as_ref();
+            let beta = pirls_result.beta_transformed.as_ref();
+            let reparam_result = &pirls_result.reparam_result;
+            let rs_transformed = &reparam_result.rs_transformed;
+            let h_total = bundle.h_total.as_ref();
+            let h_factor = self.get_faer_factor(rho, h_total);
+            let solve_h = |rhs: &Array2<f64>| -> Array2<f64> {
+                let mut out = rhs.clone();
+                let mut out_view = array2_to_mat_mut(&mut out);
+                h_factor.solve_in_place(out_view.as_mut());
+                out
+            };
+
+            let k_count = rho.len();
+            if k_count == 0 {
+                return Ok(Array2::zeros((0, 0)));
+            }
+            let lambdas = rho.mapv(f64::exp);
+            let x_dense_arc = pirls_result.x_transformed.to_dense_arc();
+            let x_dense = x_dense_arc.as_ref();
+            let n = x_dense.nrows();
+            let p_dim = x_dense.ncols();
+            let c = &pirls_result.solve_c_array;
+            let d = &pirls_result.solve_d_array;
+            if c.len() != n || d.len() != n {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Exact Hessian derivative arrays size mismatch: n={}, c.len()={}, d.len()={}",
+                    n,
+                    c.len(),
+                    d.len()
+                )));
+            }
+
+            let mut a_k_mats = Vec::with_capacity(k_count);
+            let mut a_k_beta = Vec::with_capacity(k_count);
+            let mut rhs_bk = Array2::<f64>::zeros((p_dim, k_count));
+            let mut q_diag = vec![0.0; k_count];
+            for k in 0..k_count {
+                let r_k = &rs_transformed[k];
+                let s_k = r_k.t().dot(r_k);
+                let r_beta = r_k.dot(beta);
+                let s_k_beta = r_k.t().dot(&r_beta);
+                let a_k = s_k.mapv(|v| lambdas[k] * v);
+                let a_kb = s_k_beta.mapv(|v| lambdas[k] * v);
+                q_diag[k] = beta.dot(&a_kb);
+                rhs_bk.column_mut(k).assign(&a_kb.mapv(|v| -v));
+                a_k_mats.push(a_k);
+                a_k_beta.push(a_kb);
+            }
+
+            let b_mat = solve_h(&rhs_bk);
+            let u_mat = fast_ab(x_dense, &b_mat);
+
+            let mut h_k = Vec::with_capacity(k_count);
+            let mut weighted_xtdx = Array2::<f64>::zeros(x_dense.raw_dim());
+            for k in 0..k_count {
+                let mut diag = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    diag[i] = c[i] * u_mat[[i, k]];
+                }
+                let mut hk = a_k_mats[k].clone();
+                hk += &Self::xt_diag_x_dense_into(x_dense, &diag, &mut weighted_xtdx);
+                h_k.push(hk);
+            }
+            let s_cols: Vec<Array1<f64>> = (0..k_count)
+                .map(|k| {
+                    let mut s = Array1::<f64>::zeros(n);
+                    for i in 0..n {
+                        s[i] = c[i] * u_mat[[i, k]];
+                    }
+                    s
+                })
+                .collect();
+
+            let exact_trace_mode = p_dim <= 700;
+            let use_hutchpp = !exact_trace_mode && p_dim >= 1500;
+            let n_probe = if exact_trace_mode {
+                0
+            } else if use_hutchpp {
+                20
+            } else {
+                28
+            };
+            let n_sketch = if use_hutchpp { 8 } else { 0 };
+
+            let h_inv = if exact_trace_mode {
+                Some(solve_h(&Array2::<f64>::eye(p_dim)))
+            } else {
+                None
+            };
+            let m_k: Option<Vec<Array2<f64>>> = h_inv
+                .as_ref()
+                .map(|hinv| h_k.iter().map(|hk| hinv.dot(hk)).collect());
+
+            let mut probe_z: Option<Array2<f64>> = None;
+            let mut probe_u: Option<Array2<f64>> = None;
+            let mut probe_xz: Option<Array2<f64>> = None;
+            let mut probe_xu: Option<Array2<f64>> = None;
+            let mut sketch_q: Option<Array2<f64>> = None;
+            let mut sketch_uq: Option<Array2<f64>> = None;
+            let mut sketch_xq: Option<Array2<f64>> = None;
+            let mut sketch_xuq: Option<Array2<f64>> = None;
+
+            if !exact_trace_mode {
+                let mut z = Self::rademacher_matrix(p_dim, n_probe, 0xC0DEC0DE5EEDu64);
+                if use_hutchpp && n_sketch > 0 {
+                    let g = Self::rademacher_matrix(p_dim, n_sketch, 0xBADC0FFEE0DDF00Du64);
+                    let y = solve_h(&g);
+                    let q = Self::orthonormalize_columns(&y, 1e-10);
+                    if q.ncols() > 0 {
+                        for r in 0..n_probe {
+                            let mut zr = z.column(r).to_owned();
+                            let qt_z = q.t().dot(&zr);
+                            let proj = q.dot(&qt_z);
+                            zr -= &proj;
+                            z.column_mut(r).assign(&zr);
+                        }
+                        let uq = solve_h(&q);
+                        let xq = fast_ab(x_dense, &q);
+                        let xuq = fast_ab(x_dense, &uq);
+                        sketch_q = Some(q);
+                        sketch_uq = Some(uq);
+                        sketch_xq = Some(xq);
+                        sketch_xuq = Some(xuq);
+                    }
+                }
+                let u = solve_h(&z);
+                let xz = fast_ab(x_dense, &z);
+                let xu = fast_ab(x_dense, &u);
+                probe_z = Some(z);
+                probe_u = Some(u);
+                probe_xz = Some(xz);
+                probe_xu = Some(xu);
+            }
+
+            let mut t1_mat = Array2::<f64>::zeros((k_count, k_count));
+            if exact_trace_mode {
+                let mk = m_k.as_ref().expect("m_k present in exact mode");
+                for l in 0..k_count {
+                    for k in 0..k_count {
+                        t1_mat[[l, k]] = Self::trace_product(&mk[l], &mk[k]);
+                    }
+                }
+            } else {
+                if let (Some(q), Some(uq), Some(xq), Some(xuq)) = (
+                    sketch_q.as_ref(),
+                    sketch_uq.as_ref(),
+                    sketch_xq.as_ref(),
+                    sketch_xuq.as_ref(),
+                ) {
+                    let rdim = q.ncols();
+                    for j in 0..rdim {
+                        let qj = q.column(j).to_owned();
+                        let uqj = uq.column(j).to_owned();
+                        let xqj = xq.column(j).to_owned();
+                        let xuqj = xuq.column(j).to_owned();
+                        let mut bq = Array2::<f64>::zeros((p_dim, k_count));
+                        for k in 0..k_count {
+                            let mut hkq = a_k_mats[k].dot(&qj);
+                            let weighted = &s_cols[k] * &xqj;
+                            hkq += &x_dense.t().dot(&weighted);
+                            bq.column_mut(k).assign(&hkq);
+                        }
+                        let wq = solve_h(&bq);
+                        let xwq = fast_ab(x_dense, &wq);
+                        for l in 0..k_count {
+                            let alu = a_k_mats[l].dot(&uqj);
+                            let sxu = &s_cols[l] * &xuqj;
+                            for k in 0..k_count {
+                                let val = alu.dot(&wq.column(k)) + sxu.dot(&xwq.column(k));
+                                t1_mat[[l, k]] += val;
+                            }
+                        }
+                    }
+                }
+                let z = probe_z.as_ref().expect("probes present in stochastic mode");
+                let u = probe_u.as_ref().expect("solved probes present in stochastic mode");
+                let xz = probe_xz
+                    .as_ref()
+                    .expect("X probes present in stochastic mode");
+                let xu = probe_xu
+                    .as_ref()
+                    .expect("X solved probes present in stochastic mode");
+                for r in 0..n_probe {
+                    let zr = z.column(r).to_owned();
+                    let ur = u.column(r).to_owned();
+                    let xzr = xz.column(r).to_owned();
+                    let xur = xu.column(r).to_owned();
+                    let mut bz = Array2::<f64>::zeros((p_dim, k_count));
+                    for k in 0..k_count {
+                        let mut hkz = a_k_mats[k].dot(&zr);
+                        let weighted = &s_cols[k] * &xzr;
+                        hkz += &x_dense.t().dot(&weighted);
+                        bz.column_mut(k).assign(&hkz);
+                    }
+                    let wz = solve_h(&bz);
+                    let xwz = fast_ab(x_dense, &wz);
+                    for l in 0..k_count {
+                        let alu = a_k_mats[l].dot(&ur);
+                        let sxu = &s_cols[l] * &xur;
+                        for k in 0..k_count {
+                            let val = alu.dot(&wz.column(k)) + sxu.dot(&xwz.column(k));
+                            t1_mat[[l, k]] += val / (n_probe as f64);
+                        }
+                    }
+                }
+            }
+            for i in 0..k_count {
+                for j in 0..i {
+                    let avg = 0.5 * (t1_mat[[i, j]] + t1_mat[[j, i]]);
+                    t1_mat[[i, j]] = avg;
+                    t1_mat[[j, i]] = avg;
+                }
+            }
+
+            let (_, d2logs) = self.structural_penalty_logdet_derivatives(
+                rs_transformed,
+                &lambdas,
+                reparam_result.e_transformed.nrows(),
+                bundle.ridge_passport.penalty_logdet_ridge(),
+            )?;
+
+            let mut hess = Array2::<f64>::zeros((k_count, k_count));
+            for l in 0..k_count {
+                let bl = b_mat.column(l).to_owned();
+                let mut rhs_kl_all = Array2::<f64>::zeros((p_dim, k_count));
+                for k in l..k_count {
+                    let bk = b_mat.column(k).to_owned();
+                    let mut rhs_kl = -h_k[l].dot(&bk);
+                    rhs_kl -= &a_k_mats[k].dot(&bl);
+                    if k == l {
+                        rhs_kl -= &a_k_beta[k];
+                    }
+                    rhs_kl_all.column_mut(k).assign(&rhs_kl);
+                }
+                let b_kl_all = solve_h(&rhs_kl_all);
+                let u_kl_all = fast_ab(x_dense, &b_kl_all);
+
+                let mut weighted_xtdx_kl = Array2::<f64>::zeros(x_dense.raw_dim());
+                for k in l..k_count {
+                    let mut diag = Array1::<f64>::zeros(n);
+                    for i in 0..n {
+                        diag[i] = d[i] * u_mat[[i, k]] * u_mat[[i, l]] + c[i] * u_kl_all[[i, k]];
+                    }
+
+                    let q = bl.dot(&a_k_beta[k]) + if k == l { 0.5 * q_diag[k] } else { 0.0 };
+                    let t1 = t1_mat[[l, k]];
+                    let t2 = if exact_trace_mode {
+                        let mut h_kl = if k == l {
+                            a_k_mats[k].clone()
+                        } else {
+                            Array2::<f64>::zeros((p_dim, p_dim))
+                        };
+                        h_kl += &Self::xt_diag_x_dense_into(
+                            x_dense,
+                            &diag,
+                            &mut weighted_xtdx_kl,
+                        );
+                        let h_inv_ref = h_inv.as_ref().expect("h_inv present in exact mode");
+                        Self::trace_product(h_inv_ref, &h_kl)
+                    } else {
+                        let mut t2_acc = 0.0_f64;
+                        if let (Some(q), Some(uq), Some(xq), Some(xuq)) = (
+                            sketch_q.as_ref(),
+                            sketch_uq.as_ref(),
+                            sketch_xq.as_ref(),
+                            sketch_xuq.as_ref(),
+                        ) {
+                            for j in 0..q.ncols() {
+                                let qj = q.column(j);
+                                let uqj = uq.column(j);
+                                let xqj = xq.column(j);
+                                let xuqj = xuq.column(j);
+                                let mut term = 0.0_f64;
+                                if k == l {
+                                    term += Self::bilinear_form(&a_k_mats[k], uqj, qj);
+                                }
+                                let mut quad = 0.0_f64;
+                                for i in 0..n {
+                                    quad += xuqj[i] * diag[i] * xqj[i];
+                                }
+                                term += quad;
+                                t2_acc += term;
+                            }
+                        }
+                        let z = probe_z.as_ref().expect("probes present in stochastic mode");
+                        let u = probe_u.as_ref().expect("solved probes present in stochastic mode");
+                        let xz = probe_xz
+                            .as_ref()
+                            .expect("X probes present in stochastic mode");
+                        let xu = probe_xu
+                            .as_ref()
+                            .expect("X solved probes present in stochastic mode");
+                        let mut res = 0.0_f64;
+                        for r in 0..n_probe {
+                            let zr = z.column(r);
+                            let ur = u.column(r);
+                            let xzr = xz.column(r);
+                            let xur = xu.column(r);
+                            let mut term = 0.0_f64;
+                            if k == l {
+                                term += Self::bilinear_form(&a_k_mats[k], ur, zr);
+                            }
+                            let mut quad = 0.0_f64;
+                            for i in 0..n {
+                                quad += xur[i] * diag[i] * xzr[i];
+                            }
+                            term += quad;
+                            res += term;
+                        }
+                        t2_acc + res / (n_probe as f64)
+                    };
+                    let l_term = 0.5 * (-t1 + t2);
+                    let p_term = -0.5 * d2logs[[k, l]];
+                    let val = q + l_term + p_term;
+                    hess[[k, l]] = val;
+                    hess[[l, k]] = val;
+                }
+            }
+            Ok(hess)
+        }
+
         /// Run comprehensive gradient diagnostics implementing four strategies:
         /// 1. KKT/Envelope Theorem Audit
         /// 2. Component-wise Finite Difference
@@ -5326,15 +6432,9 @@ pub mod internal {
             let penalty_grad = reparam.s_transformed.dot(beta);
 
             // Approximate score gradient using working residuals from PIRLS
-            let eta = pirls_result.solve_mu.mapv(|m| {
-                if m <= 1e-10 {
-                    (-700.0_f64).max((m / (1.0 - m + 1e-10)).ln())
-                } else if m >= 1.0 - 1e-10 {
-                    (700.0_f64).min((m / (1.0 - m)).ln())
-                } else {
-                    (m / (1.0 - m)).ln()
-                }
-            });
+            let eta = pirls_result
+                .solve_mu
+                .mapv(|m| eta_from_mu_for_link(m, self.config.link_function()));
             let working_residual = &pirls_result.solve_working_response - &eta;
             let weighted_residual = &pirls_result.solve_weights * &working_residual;
             let score_grad = pirls_result
@@ -5521,38 +6621,40 @@ pub mod internal {
                 return Ok((current_rho, None));
             }
 
-            // 2. Compute LAML Hessian at perturbed rho
-            // Finite difference on gradient
-            let h_step = 1e-4;
             let n_rho = current_rho.len();
-            let mut laml_hessian = Array2::<f64>::zeros((n_rho, n_rho));
-
-            // We need the gradient at the perturbed point
-            let grad_center = self.compute_gradient(&current_rho)?;
-
-            for j in 0..n_rho {
-                let mut rho_plus = current_rho.clone();
-                rho_plus[j] += h_step;
-                let grad_plus = self.compute_gradient(&rho_plus)?;
-
-                // Use forward difference for Hessian columns: H_j approx (g(rho+h) - g(rho)) / h
-                let col_diff = (&grad_plus - &grad_center) / h_step;
-                for i in 0..n_rho {
-                    laml_hessian[[i, j]] = col_diff[i];
+            let mut laml_hessian = match self.compute_laml_hessian_exact(&current_rho) {
+                Ok(h) => h,
+                Err(err) => {
+                    log::warn!(
+                        "Exact boundary Hessian unavailable ({}); falling back to FD Hessian.",
+                        err
+                    );
+                    let h_step = 1e-4;
+                    let mut h_fd = Array2::<f64>::zeros((n_rho, n_rho));
+                    let grad_center = self.compute_gradient(&current_rho)?;
+                    for j in 0..n_rho {
+                        let mut rho_plus = current_rho.clone();
+                        rho_plus[j] += h_step;
+                        let grad_plus = self.compute_gradient(&rho_plus)?;
+                        let col_diff = (&grad_plus - &grad_center) / h_step;
+                        for i in 0..n_rho {
+                            h_fd[[i, j]] = col_diff[i];
+                        }
+                    }
+                    for i in 0..n_rho {
+                        for j in 0..i {
+                            let avg = 0.5 * (h_fd[[i, j]] + h_fd[[j, i]]);
+                            h_fd[[i, j]] = avg;
+                            h_fd[[j, i]] = avg;
+                        }
+                    }
+                    h_fd
                 }
-            }
+            };
 
-            // Symmetrize
-            for i in 0..n_rho {
-                for j in 0..i {
-                    let avg = 0.5 * (laml_hessian[[i, j]] + laml_hessian[[j, i]]);
-                    laml_hessian[[i, j]] = avg;
-                    laml_hessian[[j, i]] = avg;
-                }
-            }
-
-            // Invert LAML Hessian to get V_rho
-            // Use faer for robust inversion
+            // Invert local Hessian to obtain V_ρ.
+            // Stabilization ridge is applied before Cholesky to control near-singularity
+            // in weakly identified smoothing directions.
             let mut v_rho = Array2::<f64>::zeros((n_rho, n_rho));
             {
                 use crate::faer_ndarray::{FaerArrayView, array2_to_mat_mut};
@@ -5579,8 +6681,15 @@ pub mod internal {
                 }
             }
 
-            // 3. Compute Correction: J * V_rho * J^T
-            // J = d beta / d rho = - H_p^-1 * [S_1 beta lambda_1, ..., S_k beta lambda_k]
+            // 3. Compute correction: J * V_ρ * Jᵀ.
+            //
+            // Jacobian identity used here:
+            //   dβ̂/dρ_k = -H_p^{-1}(S_k^ρ β̂),   S_k^ρ = λ_k S_k.
+            // This is the same implicit derivative used in the main gradient code.
+            //
+            // This block is the same first-order uncertainty propagation used in
+            // REML/LAML smoothing-parameter correction:
+            //   V*_β = V_β + J V_ρ Jᵀ.
 
             // We need H_p and beta at the perturbed rho.
             let pirls_res = self.execute_pirls_if_needed(&current_rho)?;
@@ -5619,7 +6728,10 @@ pub mod internal {
                 }
             }
 
-            // Compute Jacobian columns: u_k = - V_beta_cond * (S_k * beta * lambda_k)
+            // Compute Jacobian columns:
+            //   J[:,k] = -H_p^{-1}(S_k^ρ β̂)
+            //          = -V_beta_cond * (S_k β̂ * λ_k)
+            // with S_k β̂ assembled as R_kᵀ(R_k β̂).
             // S_k = R_k^T R_k.
             let mut jacobian = Array2::<f64>::zeros((p_dim, n_rho));
 
