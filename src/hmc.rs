@@ -1,11 +1,11 @@
-//! NUTS Sampler using mini-mcmc
+//! NUTS Sampler using general-mcmc
 //!
 //! This module provides NUTS (No-U-Turn Sampler) for honest uncertainty
 //! quantification after PIRLS convergence.
 //!
 //! # Design
 //!
-//! Since mini-mcmc's NUTS uses an identity mass matrix, we whiten the
+//! Since general-mcmc's NUTS uses an identity mass matrix, we whiten the
 //! parameter space using the Cholesky decomposition of the inverse Hessian:
 //!
 //! - Transform: β = μ + L @ z  (where L L^T = H^{-1})
@@ -21,13 +21,13 @@
 //! # Memory Efficiency
 //!
 //! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
-//! sharing across chains without duplication when mini-mcmc clones the target.
+//! sharing across chains without duplication when general-mcmc clones the target.
 
 use crate::faer_ndarray::{FaerCholesky, fast_atv};
 use crate::types::LikelihoodFamily;
 use faer::Side;
-use mini_mcmc::generic_hmc::HamiltonianTarget;
-use mini_mcmc::generic_nuts::GenericNUTS;
+use general_mcmc::generic_hmc::HamiltonianTarget;
+use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation, NUTSMassMatrixConfig};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
@@ -243,7 +243,7 @@ fn solve_upper_triangular_transpose(l: &Array2<f64>, dim: usize) -> Array2<f64> 
 /// Shared data for NUTS posterior (wrapped in Arc to prevent cloning).
 ///
 /// This struct holds read-only data that is shared across all chains.
-/// Using Arc prevents memory explosion when mini-mcmc clones the target.
+/// Using Arc prevents memory explosion when general-mcmc clones the target.
 #[derive(Clone)]
 struct SharedData {
     /// Design matrix X [n_samples, dim]
@@ -707,6 +707,29 @@ fn default_nuts_seed() -> u64 {
     42
 }
 
+fn robust_mass_matrix_config(dim: usize, n_warmup: usize) -> NUTSMassMatrixConfig {
+    if n_warmup < 80 {
+        return NUTSMassMatrixConfig::disabled();
+    }
+    let start_buffer = (n_warmup / 10).clamp(25, 150);
+    let end_buffer = (n_warmup / 8).clamp(25, 150);
+    let initial_window = (n_warmup / 12).clamp(20, 120);
+    let dense_allowed = dim <= 50;
+    NUTSMassMatrixConfig {
+        adaptation: if dense_allowed {
+            MassMatrixAdaptation::Dense
+        } else {
+            MassMatrixAdaptation::Diagonal
+        },
+        start_buffer,
+        end_buffer,
+        initial_window,
+        regularize: if dense_allowed { 0.03 } else { 0.08 },
+        jitter: 1e-6,
+        dense_max_dim: 75,
+    }
+}
+
 impl Default for NutsConfig {
     fn default() -> Self {
         Self {
@@ -814,7 +837,7 @@ impl NutsResult {
     }
 }
 
-/// Runs NUTS sampling using mini-mcmc with whitened parameter space.
+/// Runs NUTS sampling using general-mcmc with whitened parameter space.
 ///
 /// # Arguments
 /// * `x` - Design matrix [n_samples, dim]
@@ -866,7 +889,9 @@ pub fn run_nuts_sampling(
         .collect();
 
     // Create GenericNUTS sampler - it auto-tunes step size!
-    let mut sampler = GenericNUTS::new(target, initial_positions, config.target_accept);
+    let mass_cfg = robust_mass_matrix_config(dim, config.n_warmup);
+    let mut sampler =
+        GenericNUTS::new_with_mass_matrix(target, initial_positions, config.target_accept, mass_cfg);
 
     // Note: run_progress() has blocking issues in some contexts, using run() instead
     let samples_array = sampler.run(config.n_samples, config.n_warmup);
@@ -1240,7 +1265,13 @@ mod survival_hmc {
             .collect();
 
         // Create GenericNUTS sampler
-        let mut sampler = GenericNUTS::new(target, initial_positions, config.target_accept);
+        let mass_cfg = robust_mass_matrix_config(dim, config.n_warmup);
+        let mut sampler = GenericNUTS::new_with_mass_matrix(
+            target,
+            initial_positions,
+            config.target_accept,
+            mass_cfg,
+        );
 
         // Run sampling with progress bar
         let (samples_array, run_stats) = sampler
@@ -1622,7 +1653,9 @@ pub fn run_joint_nuts_sampling(
             })
         })
         .collect();
-    let mut sampler = GenericNUTS::new(target, initial_positions, config.target_accept);
+    let mass_cfg = robust_mass_matrix_config(dim, config.n_warmup);
+    let mut sampler =
+        GenericNUTS::new_with_mass_matrix(target, initial_positions, config.target_accept, mass_cfg);
     let samples_array = sampler.run(config.n_samples, config.n_warmup);
     let (n_chains, n_samples_out) = (samples_array.shape()[0], samples_array.shape()[1]);
     let total_samples = n_chains * n_samples_out;
