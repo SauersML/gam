@@ -2233,6 +2233,13 @@ struct GradAuditConfig {
     fallback_to_fd: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TraceBackend {
+    Exact,
+    Hutchinson { probes: usize },
+    HutchPP { probes: usize, sketch: usize },
+}
+
 fn grad_audit_config() -> GradAuditConfig {
     GradAuditConfig {
         every: 10,
@@ -5902,6 +5909,49 @@ pub mod internal {
             acc.sum()
         }
 
+        fn select_trace_backend(n_obs: usize, p_dim: usize, k_count: usize) -> TraceBackend {
+            // Workload-aware policy driven by (n, p, K):
+            // - Exact for moderate total complexity.
+            // - Hutchinson/Hutch++ as n·p·K and p²·K² costs grow.
+            //
+            // Proxies:
+            //   w_npk   ~ n*p*K   (X/Xᵀ + diagonal contractions)
+            //   w_pk2   ~ p*K²    (pairwise rho-Hessian assembly)
+            let k = k_count.max(1);
+            let w_npk = (n_obs as u128)
+                .saturating_mul(p_dim as u128)
+                .saturating_mul(k as u128);
+            let w_pk2 = (p_dim as u128)
+                .saturating_mul((k as u128).saturating_mul(k as u128));
+
+            if p_dim <= 700 && k <= 20 && w_npk <= 220_000_000 && w_pk2 <= 20_000_000 {
+                return TraceBackend::Exact;
+            }
+
+            let very_large = p_dim >= 1_800
+                || k >= 28
+                || w_npk >= 1_100_000_000
+                || w_pk2 >= 85_000_000;
+            if very_large {
+                let sketch = if p_dim >= 3_500 || w_npk >= 2_500_000_000 {
+                    12
+                } else {
+                    8
+                };
+                let probes = if k >= 36 || w_pk2 >= 150_000_000 { 28 } else { 22 };
+                return TraceBackend::HutchPP { probes, sketch };
+            }
+
+            let probes = if w_npk >= 700_000_000 || k >= 24 {
+                34
+            } else if w_npk >= 350_000_000 {
+                28
+            } else {
+                22
+            };
+            TraceBackend::Hutchinson { probes }
+        }
+
         #[inline]
         fn splitmix64(mut x: u64) -> u64 {
             x = x.wrapping_add(0x9E3779B97F4A7C15);
@@ -6140,16 +6190,15 @@ pub mod internal {
                 })
                 .collect();
 
-            let exact_trace_mode = p_dim <= 700;
-            let use_hutchpp = !exact_trace_mode && p_dim >= 1500;
-            let n_probe = if exact_trace_mode {
-                0
-            } else if use_hutchpp {
-                20
-            } else {
-                28
+            let trace_backend = Self::select_trace_backend(n, p_dim, k_count);
+            let (exact_trace_mode, n_probe, n_sketch) = match trace_backend {
+                TraceBackend::Exact => (true, 0usize, 0usize),
+                TraceBackend::Hutchinson { probes } => (false, probes.max(1), 0usize),
+                TraceBackend::HutchPP { probes, sketch } => {
+                    (false, probes.max(1), sketch.max(1))
+                }
             };
-            let n_sketch = if use_hutchpp { 8 } else { 0 };
+            let use_hutchpp = matches!(trace_backend, TraceBackend::HutchPP { .. });
 
             let h_inv = if exact_trace_mode {
                 Some(solve_h(&Array2::<f64>::eye(p_dim)))
