@@ -32,19 +32,23 @@ pub struct LltView<'a> {
 }
 
 impl<'a> LltView<'a> {
-    pub fn solve(&self, rhs: MatRef<f64>, stack: &mut MemStack) -> Array2<f64> {
-        let mut result = Array2::<f64>::zeros((rhs.nrows(), rhs.ncols()));
-        let mut result_mat = array2_to_mat_mut(&mut result);
-        // Copy rhs to result
-        result_mat.as_mut().copy_from(rhs);
-
-        // Solve in place A x = b (x stored in result_mat)
+    pub fn solve_into(&self, rhs: MatRef<f64>, out: &mut Array2<f64>, stack: &mut MemStack) {
+        if out.nrows() != rhs.nrows() || out.ncols() != rhs.ncols() {
+            *out = Array2::<f64>::zeros((rhs.nrows(), rhs.ncols()));
+        }
+        let mut out_mat = array2_to_mat_mut(out);
+        out_mat.as_mut().copy_from(rhs);
         faer::linalg::cholesky::llt::solve::solve_in_place(
             self.matrix,
-            result_mat.as_mut(),
+            out_mat.as_mut(),
             faer::Par::Seq,
             stack,
         );
+    }
+
+    pub fn solve(&self, rhs: MatRef<f64>, stack: &mut MemStack) -> Array2<f64> {
+        let mut result = Array2::<f64>::zeros((rhs.nrows(), rhs.ncols()));
+        self.solve_into(rhs, &mut result, stack);
         result
     }
 }
@@ -921,34 +925,38 @@ fn ensure_positive_definite_with_ridge(
 fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
-) -> Result<Array1<f64>, EstimationError> {
+    direction_out: &mut Array1<f64>,
+) -> Result<(), EstimationError> {
+    if direction_out.len() != gradient.len() {
+        *direction_out = Array1::zeros(gradient.len());
+    }
     let h_view = FaerArrayView::new(hessian);
+    direction_out.assign(gradient);
     if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-        let mut rhs = gradient.to_owned();
-        let mut rhs_view = array1_to_col_mat_mut(&mut rhs);
+        let mut rhs_view = array1_to_col_mat_mut(direction_out);
         ch.solve_in_place(rhs_view.as_mut());
-        rhs.mapv_inplace(|v| -v);
-        return Ok(rhs);
+        direction_out.mapv_inplace(|v| -v);
+        return Ok(());
     }
 
     let ldlt_err = match FaerLdlt::new(h_view.as_ref(), Side::Lower) {
         Ok(ld) => {
-            let mut rhs = gradient.to_owned();
-            let mut rhs_view = array1_to_col_mat_mut(&mut rhs);
+            direction_out.assign(gradient);
+            let mut rhs_view = array1_to_col_mat_mut(direction_out);
             ld.solve_in_place(rhs_view.as_mut());
-            rhs.mapv_inplace(|v| -v);
-            return Ok(rhs);
+            direction_out.mapv_inplace(|v| -v);
+            return Ok(());
         }
         Err(err) => FaerLinalgError::Ldlt(err),
     };
 
     let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
-    let mut rhs = gradient.to_owned();
-    let mut rhs_view = array1_to_col_mat_mut(&mut rhs);
+    direction_out.assign(gradient);
+    let mut rhs_view = array1_to_col_mat_mut(direction_out);
     lb.solve_in_place(rhs_view.as_mut());
-    rhs.mapv_inplace(|v| -v);
-    if rhs.iter().all(|v| v.is_finite()) {
-        return Ok(rhs);
+    direction_out.mapv_inplace(|v| -v);
+    if direction_out.iter().all(|v| v.is_finite()) {
+        return Ok(());
     }
 
     Err(EstimationError::LinearSystemSolveFailed(ldlt_err))
@@ -1009,6 +1017,7 @@ where
     let mut status = PirlsStatus::MaxIterationsReached;
     let mut iterations = 0usize;
     let mut final_state: Option<WorkingState> = None;
+    let mut newton_direction = Array1::<f64>::zeros(beta.len());
 
     let penalized_objective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
@@ -1049,8 +1058,12 @@ where
                 regularized[[i, i]] += loop_lambda;
             }
 
-            let direction = match solve_newton_direction_dense(&regularized, &state.gradient) {
-                Ok(d) => d,
+            let direction = match solve_newton_direction_dense(
+                &regularized,
+                &state.gradient,
+                &mut newton_direction,
+            ) {
+                Ok(()) => &newton_direction,
                 Err(_) => {
                     // Singular even with ridge (unlikely unless huge). Increase lambda.
                     if loop_lambda < 1e12 {
@@ -1058,7 +1071,9 @@ where
                         continue;
                     } else {
                         // Fallback to gradient descent
-                        state.gradient.mapv(|g| -g)
+                        newton_direction.assign(&state.gradient);
+                        newton_direction.mapv_inplace(|g| -g);
+                        &newton_direction
                     }
                 }
             };
@@ -1068,13 +1083,13 @@ where
             // Actually, we should check against the model: m(0) - m(δ)
             // m(δ) = L_old + g'δ + 0.5 δ'Hδ.
             // Reduction = -(g'δ + 0.5 δ'Hδ)
-            let q_term = state.hessian.dot(&direction);
+            let q_term = state.hessian.dot(direction);
             let quad = 0.5 * direction.dot(&q_term);
-            let lin = state.gradient.dot(&direction);
+            let lin = state.gradient.dot(direction);
             let predicted_reduction = -(lin + quad);
 
             // 3. Compute Actual Reduction
-            let candidate_beta = Coefficients::new(&*beta + &direction);
+            let candidate_beta = Coefficients::new(&*beta + direction);
             match model.update(&candidate_beta) {
                 Ok(candidate_state) => {
                     let candidate_penalized = penalized_objective(&candidate_state);
@@ -2617,33 +2632,22 @@ pub fn solve_penalized_least_squares(
     // 6. Solve using LDLT (Robust for indefinite/near-singular), with LBLT fallback.
     let h_reg_view = FaerArrayView::new(&regularized_hessian);
 
-    // Convert to Faer structures for solve
-    let rhs_mat = {
-        let mut m = faer::Mat::zeros(p_dim, 1);
-        for i in 0..p_dim {
-            m[(i, 0)] = rhs_vec[i];
-        }
-        m
-    };
-
     // Use LDLT factorization
     let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower);
+    if workspace.rhs_full.len() != p_dim {
+        workspace.rhs_full = Array1::zeros(p_dim);
+    }
+    workspace.rhs_full.assign(rhs_vec);
     let (beta_vec, detected_rank) = if let Ok(factor) = ldlt {
-        let sol_mat: faer::Mat<f64> = factor.solve(&rhs_mat);
-        let mut b = Array1::zeros(p_dim);
-        for i in 0..p_dim {
-            b[i] = sol_mat[(i, 0)];
-        }
-        (b, p_dim)
+        let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
+        factor.solve_in_place(rhs_view.as_mut());
+        (workspace.rhs_full.clone(), p_dim)
     } else {
         let lblt = FaerLblt::new(h_reg_view.as_ref(), Side::Lower);
-        let sol_mat: faer::Mat<f64> = lblt.solve(&rhs_mat);
-        let mut b = Array1::zeros(p_dim);
-        for i in 0..p_dim {
-            b[i] = sol_mat[(i, 0)];
-        }
-        if b.iter().all(|v| v.is_finite()) {
-            (b, p_dim)
+        let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
+        lblt.solve_in_place(rhs_view.as_mut());
+        if workspace.rhs_full.iter().all(|v| v.is_finite()) {
+            (workspace.rhs_full.clone(), p_dim)
         } else {
             return Err(EstimationError::LinearSystemSolveFailed(
                 FaerLinalgError::FactorizationFailed,
@@ -2653,7 +2657,7 @@ pub fn solve_penalized_least_squares(
 
     // 7. Calculate EDF and Scale
     // Re-use `regularized_hessian` for EDF to consistency.
-    let edf = calculate_edf(&regularized_hessian, e_transformed)?;
+    let edf = calculate_edf_with_workspace(&regularized_hessian, e_transformed, workspace)?;
 
     let scale = calculate_scale(
         &beta_vec,
@@ -2722,6 +2726,84 @@ fn calculate_edf(
         for j in 0..r {
             for i in 0..p {
                 tr += sol[(i, j)] * e_transformed[(j, i)];
+            }
+        }
+        return Ok((p as f64 - tr).clamp(mp, p as f64));
+    }
+
+    Err(EstimationError::ModelIsIllConditioned {
+        condition_number: f64::INFINITY,
+    })
+}
+
+fn calculate_edf_with_workspace(
+    penalized_hessian: &Array2<f64>,
+    e_transformed: &Array2<f64>,
+    workspace: &mut PirlsWorkspace,
+) -> Result<f64, EstimationError> {
+    let p = penalized_hessian.ncols();
+    let r = e_transformed.nrows();
+    let mp = ((p - r) as f64).max(0.0);
+    if r == 0 {
+        return Ok(p as f64);
+    }
+    let h_view = FaerArrayView::new(penalized_hessian);
+    if workspace.final_aug_matrix.nrows() != p || workspace.final_aug_matrix.ncols() != r {
+        workspace.final_aug_matrix = Array2::zeros((p, r));
+    }
+
+    // Try LLᵀ first
+    if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+        for j in 0..r {
+            for i in 0..p {
+                workspace.final_aug_matrix[[i, j]] = e_transformed[[j, i]];
+            }
+        }
+        let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
+        ch.solve_in_place(rhs_view.as_mut());
+        let mut tr = 0.0;
+        for j in 0..r {
+            for i in 0..p {
+                tr += workspace.final_aug_matrix[(i, j)] * e_transformed[(j, i)];
+            }
+        }
+        return Ok((p as f64 - tr).clamp(mp, p as f64));
+    }
+
+    // Try LDLᵀ (semi-definite)
+    if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+        for j in 0..r {
+            for i in 0..p {
+                workspace.final_aug_matrix[[i, j]] = e_transformed[[j, i]];
+            }
+        }
+        let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
+        ld.solve_in_place(rhs_view.as_mut());
+        let mut tr = 0.0;
+        for j in 0..r {
+            for i in 0..p {
+                tr += workspace.final_aug_matrix[(i, j)] * e_transformed[(j, i)];
+            }
+        }
+        return Ok((p as f64 - tr).clamp(mp, p as f64));
+    }
+
+    // Last resort: symmetric indefinite LBLᵀ (Bunch–Kaufman)
+    let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
+    for j in 0..r {
+        for i in 0..p {
+            workspace.final_aug_matrix[[i, j]] = e_transformed[[j, i]];
+        }
+    }
+    {
+        let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
+        lb.solve_in_place(rhs_view.as_mut());
+    }
+    if workspace.final_aug_matrix.nrows() == p && workspace.final_aug_matrix.ncols() == r {
+        let mut tr = 0.0;
+        for j in 0..r {
+            for i in 0..p {
+                tr += workspace.final_aug_matrix[(i, j)] * e_transformed[(j, i)];
             }
         }
         return Ok((p as f64 - tr).clamp(mp, p as f64));
