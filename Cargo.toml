@@ -43,6 +43,5 @@ serial_test = "3.2.0"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
-git = "https://github.com/SauersML/general-mcmc"
-branch = "main"
+version = "0.8.0"
 default-features = false
