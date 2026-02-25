@@ -730,6 +730,26 @@ fn robust_mass_matrix_config(dim: usize, n_warmup: usize) -> NUTSMassMatrixConfi
     }
 }
 
+fn robust_survival_mass_matrix_config(dim: usize, n_warmup: usize) -> NUTSMassMatrixConfig {
+    if n_warmup < 80 {
+        return NUTSMassMatrixConfig::disabled();
+    }
+    // Survival posteriors with censoring/rare events are often skewed; prefer diagonal
+    // adaptation for stability over aggressive dense fitting.
+    let start_buffer = (n_warmup / 8).clamp(30, 180);
+    let end_buffer = (n_warmup / 6).clamp(30, 180);
+    let initial_window = (n_warmup / 10).clamp(25, 140);
+    NUTSMassMatrixConfig {
+        adaptation: MassMatrixAdaptation::Diagonal,
+        start_buffer,
+        end_buffer,
+        initial_window,
+        regularize: if dim > 50 { 0.12 } else { 0.08 },
+        jitter: 1e-6,
+        dense_max_dim: 75,
+    }
+}
+
 impl Default for NutsConfig {
     fn default() -> Self {
         Self {
@@ -1265,7 +1285,7 @@ mod survival_hmc {
             .collect();
 
         // Create GenericNUTS sampler
-        let mass_cfg = robust_mass_matrix_config(dim, config.n_warmup);
+        let mass_cfg = robust_survival_mass_matrix_config(dim, config.n_warmup);
         let mut sampler = GenericNUTS::new_with_mass_matrix(
             target,
             initial_positions,
