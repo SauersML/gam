@@ -5984,59 +5984,61 @@ pub mod internal {
             );
 
             let mut grad = Array1::<f64>::zeros(len);
-            if let Ok(rb_terms) = rb_terms_result {
-                for k in 0..len {
-                    // Rao-Blackwellized exact identity:
-                    //   g_k = 0.5 * λ_k * E_ω[ tr(S_k Q^{-1}) + μᵀ S_k μ ] - 0.5 * det1_values[k].
-                    grad[k] = 0.5 * lambda[k] * rb_terms[k] - 0.5 * det1_values[k];
-                }
-            } else {
-                let err = rb_terms_result.err().unwrap_or_else(|| "unknown PG error".to_string());
-                log::warn!(
-                    "[REML] PG Rao-Blackwell fallback failed ({}); reverting to NUTS beta averaging",
-                    err
-                );
-
-                let nuts_cfg = crate::hmc::NutsConfig {
-                    n_samples: 120,
-                    n_warmup: 160,
-                    n_chains: 2,
-                    target_accept: 0.85,
-                    seed: 17_391,
-                };
-
-                let nuts_result = crate::hmc::run_nuts_sampling_flattened_family(
-                    crate::types::LikelihoodFamily::BinomialLogit,
-                    crate::hmc::FamilyNutsInputs::Glm(crate::hmc::GlmFlatInputs {
-                        x: x_dense.view(),
-                        y,
-                        weights,
-                        penalty_matrix: s_transformed.view(),
-                        mode: beta_mode.view(),
-                        hessian: h_eff.view(),
-                        firth_bias_reduction: self.config.firth_bias_reduction,
-                    }),
-                    &nuts_cfg,
-                )
-                .map_err(EstimationError::InvalidInput)?;
-
-                let samples = &nuts_result.samples;
-                let n_draws = samples.nrows().max(1);
-                let mut expected_quad = vec![0.0_f64; len];
-                for draw in 0..samples.nrows() {
-                    let beta_draw = samples.row(draw).to_owned();
+            match rb_terms_result {
+                Ok(rb_terms) => {
                     for k in 0..len {
-                        let r_k = &pirls_result.reparam_result.rs_transformed[k];
-                        let r_beta = r_k.dot(&beta_draw);
-                        expected_quad[k] += r_beta.dot(&r_beta);
+                        // Rao-Blackwellized exact identity:
+                        //   g_k = 0.5 * λ_k * E_ω[ tr(S_k Q^{-1}) + μᵀ S_k μ ] - 0.5 * det1_values[k].
+                        grad[k] = 0.5 * lambda[k] * rb_terms[k] - 0.5 * det1_values[k];
                     }
                 }
-                let inv_draws = 1.0 / (n_draws as f64);
-                for v in &mut expected_quad {
-                    *v *= inv_draws;
-                }
-                for k in 0..len {
-                    grad[k] = 0.5 * lambda[k] * expected_quad[k] - 0.5 * det1_values[k];
+                Err(err) => {
+                    log::warn!(
+                        "[REML] PG Rao-Blackwell fallback failed ({}); reverting to NUTS beta averaging",
+                        err
+                    );
+
+                    let nuts_cfg = crate::hmc::NutsConfig {
+                        n_samples: 120,
+                        n_warmup: 160,
+                        n_chains: 2,
+                        target_accept: 0.85,
+                        seed: 17_391,
+                    };
+
+                    let nuts_result = crate::hmc::run_nuts_sampling_flattened_family(
+                        crate::types::LikelihoodFamily::BinomialLogit,
+                        crate::hmc::FamilyNutsInputs::Glm(crate::hmc::GlmFlatInputs {
+                            x: x_dense.view(),
+                            y,
+                            weights,
+                            penalty_matrix: s_transformed.view(),
+                            mode: beta_mode.view(),
+                            hessian: h_eff.view(),
+                            firth_bias_reduction: self.config.firth_bias_reduction,
+                        }),
+                        &nuts_cfg,
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
+
+                    let samples = &nuts_result.samples;
+                    let n_draws = samples.nrows().max(1);
+                    let mut expected_quad = vec![0.0_f64; len];
+                    for draw in 0..samples.nrows() {
+                        let beta_draw = samples.row(draw).to_owned();
+                        for k in 0..len {
+                            let r_k = &pirls_result.reparam_result.rs_transformed[k];
+                            let r_beta = r_k.dot(&beta_draw);
+                            expected_quad[k] += r_beta.dot(&r_beta);
+                        }
+                    }
+                    let inv_draws = 1.0 / (n_draws as f64);
+                    for v in &mut expected_quad {
+                        *v *= inv_draws;
+                    }
+                    for k in 0..len {
+                        grad[k] = 0.5 * lambda[k] * expected_quad[k] - 0.5 * det1_values[k];
+                    }
                 }
             }
             grad += &self.compute_soft_prior_grad(p);

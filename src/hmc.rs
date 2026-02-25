@@ -745,6 +745,95 @@ mod tests {
         assert_eq!(out.samples.nrows(), cfg.n_samples * cfg.n_chains);
         assert!(out.samples.iter().all(|v| v.is_finite()));
     }
+
+    #[test]
+    fn logit_pg_rao_blackwell_returns_finite_terms() {
+        let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
+        let y = array![1.0, 0.0, 1.0, 0.0];
+        let w = array![1.0, 1.0, 1.0, 1.0];
+        let penalty = array![[0.2, 0.0], [0.0, 0.4]];
+        let mode = array![0.0, 0.0];
+        let roots = vec![array![[0.2_f64.sqrt(), 0.0], [0.0, 0.4_f64.sqrt()]]];
+        let cfg = NutsConfig {
+            n_samples: 30,
+            n_warmup: 30,
+            n_chains: 2,
+            target_accept: 0.8,
+            seed: 789,
+        };
+
+        let rb = super::estimate_logit_pg_rao_blackwell_terms(
+            x.view(),
+            y.view(),
+            w.view(),
+            penalty.view(),
+            mode.view(),
+            &roots,
+            &cfg,
+        )
+        .expect("rao-blackwell PG should run");
+
+        assert_eq!(rb.len(), 1);
+        assert!(rb[0].is_finite());
+        assert!(rb[0] >= 0.0);
+    }
+
+    #[test]
+    fn logit_pg_rao_blackwell_matches_beta_quadratic_moment_sanity() {
+        let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
+        let y = array![1.0, 0.0, 1.0, 0.0];
+        let w = array![1.0, 1.0, 1.0, 1.0];
+        let penalty = array![[0.2, 0.0], [0.0, 0.4]];
+        let mode = array![0.0, 0.0];
+        let roots = vec![array![[0.2_f64.sqrt(), 0.0], [0.0, 0.4_f64.sqrt()]]];
+        let cfg = NutsConfig {
+            n_samples: 120,
+            n_warmup: 80,
+            n_chains: 2,
+            target_accept: 0.8,
+            seed: 901,
+        };
+
+        let gibbs = run_logit_polya_gamma_gibbs(
+            x.view(),
+            y.view(),
+            w.view(),
+            penalty.view(),
+            mode.view(),
+            &cfg,
+        )
+        .expect("pg gibbs should run");
+        let mc_quad = gibbs
+            .samples
+            .rows()
+            .into_iter()
+            .map(|beta| {
+                let sb = penalty.dot(&beta.to_owned());
+                beta.dot(&sb)
+            })
+            .sum::<f64>()
+            / (gibbs.samples.nrows() as f64);
+
+        let rb = super::estimate_logit_pg_rao_blackwell_terms(
+            x.view(),
+            y.view(),
+            w.view(),
+            penalty.view(),
+            mode.view(),
+            &roots,
+            &cfg,
+        )
+        .expect("rao-blackwell PG should run");
+
+        let diff = (rb[0] - mc_quad).abs();
+        assert!(
+            diff < 0.35,
+            "Rao-Blackwell vs beta-moment mismatch too large: rb={}, mc={}, diff={}",
+            rb[0],
+            mc_quad,
+            diff
+        );
+    }
 }
 
 /// Implement HamiltonianTarget for NUTS with analytical gradients.
@@ -1142,6 +1231,9 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
     let mut q = Array2::<f64>::zeros((p, p));
     let mut mean = Array1::<f64>::zeros(p);
     let mut rb_sum = Array1::<f64>::zeros(penalty_roots.len());
+    let mut z = Array1::<f64>::zeros(p);
+    let mut noise = Array1::<f64>::zeros(p);
+    let mut row_buf = Array1::<f64>::zeros(p);
 
     let mut kept = 0usize;
     for chain in 0..config.n_chains {
@@ -1181,8 +1273,6 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
             mean.assign(&factor.solve_vec(&rhs_b));
 
             // Draw beta for the next Gibbs state.
-            let mut z = Array1::<f64>::zeros(p);
-            let mut noise = Array1::<f64>::zeros(p);
             for j in 0..p {
                 z[j] = sample_standard_normal(&mut rng);
             }
@@ -1206,11 +1296,11 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 
                 let mut trace_term = 0.0_f64;
                 for row_idx in 0..r_k.nrows() {
-                    let row = r_k.row(row_idx).to_owned();
+                    row_buf.assign(&r_k.row(row_idx));
                     // tr(S_k Q^{-1}) = tr(R_k Q^{-1} R_k^T)
                     //                = sum_j r_j^T Q^{-1} r_j.
-                    let solved = factor.solve_vec(&row);
-                    trace_term += row.dot(&solved);
+                    let solved = factor.solve_vec(&row_buf);
+                    trace_term += row_buf.dot(&solved);
                 }
 
                 rb_sum[k] += trace_term + mu_quad;

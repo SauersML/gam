@@ -382,7 +382,9 @@ impl WorkingModelSurvival {
     ///   The `2` factor comes from this module's penalty convention, where
     ///   `penalty_grad = 2 * lambda * S_k * beta`.
     /// - `V(rho) = f(beta_hat, rho) + 0.5 log|H| - 0.5 log|S|_+`.
-    ///   Here `f` is represented by `0.5 * deviance + penalty_deviance`.
+    ///   Here `f` is represented by `0.5 * deviance + penalty_term`, where
+    ///   `penalty_term` includes both configured penalties and the tiny solver
+    ///   stabilization ridge used in `update_state`.
     /// - `dV/drho_k = 0.5 * beta^T A_k beta
     ///               + 0.5 * tr(H^{-1} dH/drho_k)
     ///               - 0.5 * tr(S^+ A_k)`.
@@ -397,6 +399,13 @@ impl WorkingModelSurvival {
     /// - the contribution from `delta_i * log(d_i^T beta)` appears in the
     ///   third-derivative contraction as:
     ///   `-2 * (d_i^T u_k) * qd_i / (d_i^T beta)^3` for event rows.
+    ///
+    /// Ridge note:
+    /// - `state.penalty_term` includes a tiny stabilization ridge used by the
+    ///   inner solve, so the objective value stays consistent with the solved
+    ///   mode.
+    /// - that ridge is constant w.r.t. `rho`, so it does not contribute to
+    ///   `A_k` or the `-0.5 * tr(S^+ A_k)` pseudo-determinant derivative.
     pub fn laml_objective_and_rho_gradient(
         &self,
         beta: &Array1<f64>,
@@ -495,8 +504,10 @@ impl WorkingModelSurvival {
             eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum()
         };
 
-        let objective = 0.5 * state.deviance + self.penalties.deviance(beta) + 0.5 * logdet_h
-            - 0.5 * logdet_s;
+        // Use the same inner objective components reported by update_state:
+        //   0.5 * deviance + penalty_term.
+        // This keeps the outer value consistent with the solved inner mode.
+        let objective = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h - 0.5 * logdet_s;
 
         let mut grad = Array1::<f64>::zeros(k_count);
         for (k, block) in self.penalties.blocks.iter().enumerate() {
@@ -547,6 +558,7 @@ impl WorkingModelSurvival {
             let mut p_k = 0.0_f64;
             for (i_local, i) in r.clone().enumerate() {
                 for (j_local, j) in r.clone().enumerate() {
+                    // p_k = tr(S^+ A_k) restricted to this block.
                     p_k += s_pinv[[i, j]] * (2.0 * lambda * block.matrix[[j_local, i_local]]);
                 }
             }
