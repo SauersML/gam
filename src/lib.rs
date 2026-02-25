@@ -38,8 +38,9 @@ pub use custom_family::{
     KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
 pub use estimate::{
-    FitArtifacts, FitOptions, FitResult, PredictResult, fit_gam, optimize_external_design,
-    predict_gam,
+    CoefficientUncertaintyResult, FitArtifacts, FitOptions, FitResult, MeanIntervalMethod,
+    PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult, coefficient_uncertainty,
+    fit_gam, optimize_external_design, predict_gam, predict_gam_with_uncertainty,
 };
 pub use gamlss::{
     BinomialLocationScaleProbitFamily, BinomialLocationScaleProbitSpec,
@@ -57,8 +58,9 @@ pub use generative::{
     sample_observations,
 };
 pub use smooth::{
-    FittedTermCollection, LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothDesign,
-    SmoothTerm, SmoothTermSpec, TermCollectionDesign, TermCollectionSpec, build_smooth_design,
-    build_term_collection_design, fit_term_collection,
+    FittedTermCollection, LinearTermSpec, MaternLengthScaleOptimization, ShapeConstraint,
+    SmoothBasisSpec, SmoothDesign, SmoothTerm, SmoothTermSpec, TermCollectionDesign,
+    TermCollectionSpec, build_smooth_design, build_term_collection_design, fit_term_collection,
+    fit_term_collection_with_matern_optimization,
 };
 pub use types::{LikelihoodFamily, LinkFunction};

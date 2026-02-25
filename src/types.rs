@@ -9,6 +9,7 @@ pub use crate::hull::PeeledHull;
 pub enum LinkFunction {
     Logit,
     Probit,
+    CLogLog,
     Identity,
 }
 
@@ -18,6 +19,7 @@ pub enum LikelihoodFamily {
     GaussianIdentity,
     BinomialLogit,
     BinomialProbit,
+    BinomialCLogLog,
     RoystonParmar,
 }
 

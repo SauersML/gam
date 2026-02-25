@@ -910,8 +910,12 @@ pub fn run_nuts_sampling(
 
     // Create GenericNUTS sampler - it auto-tunes step size!
     let mass_cfg = robust_mass_matrix_config(dim, config.n_warmup);
-    let mut sampler =
-        GenericNUTS::new_with_mass_matrix(target, initial_positions, config.target_accept, mass_cfg);
+    let mut sampler = GenericNUTS::new_with_mass_matrix(
+        target,
+        initial_positions,
+        config.target_accept,
+        mass_cfg,
+    );
 
     // Note: run_progress() has blocking issues in some contexts, using run() instead
     let samples_array = sampler.run(config.n_samples, config.n_warmup);
@@ -1032,6 +1036,10 @@ pub fn run_nuts_sampling_flattened_family(
         ),
         (LikelihoodFamily::BinomialProbit, FamilyNutsInputs::Glm(_)) => Err(
             "BinomialProbit NUTS is not implemented yet; use fit_gam/predict_gam for probit models"
+                .to_string(),
+        ),
+        (LikelihoodFamily::BinomialCLogLog, FamilyNutsInputs::Glm(_)) => Err(
+            "BinomialCLogLog NUTS is not implemented yet; use fit_gam/predict_gam for cloglog models"
                 .to_string(),
         ),
         (LikelihoodFamily::RoystonParmar, FamilyNutsInputs::Survival(survival)) => {
@@ -1674,8 +1682,12 @@ pub fn run_joint_nuts_sampling(
         })
         .collect();
     let mass_cfg = robust_mass_matrix_config(dim, config.n_warmup);
-    let mut sampler =
-        GenericNUTS::new_with_mass_matrix(target, initial_positions, config.target_accept, mass_cfg);
+    let mut sampler = GenericNUTS::new_with_mass_matrix(
+        target,
+        initial_positions,
+        config.target_accept,
+        mass_cfg,
+    );
     let samples_array = sampler.run(config.n_samples, config.n_warmup);
     let (n_chains, n_samples_out) = (samples_array.shape()[0], samples_array.shape()[1]);
     let total_samples = n_chains * n_samples_out;

@@ -696,7 +696,10 @@ mod tests {
     struct OneBlockIdentityFamily;
 
     impl CustomFamily for OneBlockIdentityFamily {
-        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
             let n = block_states[0].eta.len();
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
