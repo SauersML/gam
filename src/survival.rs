@@ -8,6 +8,7 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -16,6 +17,8 @@ pub enum SurvivalError {
     DimensionMismatch,
     #[error("inputs contain non-finite values")]
     NonFiniteInput,
+    #[error("crude risk integration setup is invalid")]
+    InvalidIntegrationSetup,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -616,6 +619,192 @@ impl WorkingModelSurvival {
 
         Ok((objective, grad))
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CrudeRiskResult {
+    pub risk: f64,
+    pub disease_gradient: Array1<f64>,
+    pub mortality_gradient: Array1<f64>,
+}
+
+fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
+    let mut nodes_weights = Vec::with_capacity(n);
+    let m = n.div_ceil(2);
+
+    for i in 0..m {
+        let mut z = (std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
+        let mut pp = 0.0;
+
+        for _ in 0..100 {
+            let mut p1 = 1.0;
+            let mut p2 = 0.0;
+            for j in 0..n {
+                let p3 = p2;
+                p2 = p1;
+                p1 = ((2.0 * j as f64 + 1.0) * z * p2 - j as f64 * p3) / (j as f64 + 1.0);
+            }
+            pp = n as f64 * (z * p1 - p2) / (z * z - 1.0);
+            let z_prev = z;
+            z = z_prev - p1 / pp;
+            if (z - z_prev).abs() < 1e-14 {
+                break;
+            }
+        }
+
+        let x = z;
+        let w = 2.0 / ((1.0 - z * z) * pp * pp);
+        if !n.is_multiple_of(2) && i == m - 1 {
+            nodes_weights.push((0.0, w));
+        } else {
+            nodes_weights.push((-x, w));
+            nodes_weights.push((x, w));
+        }
+    }
+
+    nodes_weights.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    nodes_weights
+}
+
+fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
+    static CACHE: OnceLock<Vec<(f64, f64)>> = OnceLock::new();
+    CACHE.get_or_init(|| compute_gauss_legendre_nodes(40))
+}
+
+/// Engine-level crude risk quadrature with exact delta-method gradients.
+///
+/// This routine owns the numerical integration and gradient accumulation math:
+/// - It integrates `h_d(u) * S_total(u | t0)` over `[t0, t1]` by high-order
+///   Gauss-Legendre quadrature.
+/// - It computes gradients w.r.t. disease and mortality coefficients:
+///   d Risk / d beta_d and d Risk / d beta_m.
+///
+/// The adapter provides the domain-specific point evaluator callback `eval_at`,
+/// which fills design rows and returns:
+/// - instantaneous disease hazard at age `u`,
+/// - cumulative disease hazard `H_d(u)`,
+/// - cumulative mortality hazard `H_m(u)`.
+///
+/// This keeps biology/data wiring out of `gam` while centralizing the
+/// integration engine in one place.
+pub fn calculate_crude_risk_quadrature<F>(
+    t0: f64,
+    t1: f64,
+    breakpoints: &[f64],
+    h_dis_t0: f64,
+    h_mor_t0: f64,
+    design_d_t0: ArrayView1<'_, f64>,
+    design_m_t0: ArrayView1<'_, f64>,
+    mut eval_at: F,
+) -> Result<CrudeRiskResult, SurvivalError>
+where
+    F: FnMut(
+        f64,
+        &mut Array1<f64>,
+        &mut Array1<f64>,
+        &mut Array1<f64>,
+    ) -> Result<(f64, f64, f64), SurvivalError>,
+{
+    let coeff_len_d = design_d_t0.len();
+    let coeff_len_m = design_m_t0.len();
+    if coeff_len_d == 0 || coeff_len_m == 0 {
+        return Err(SurvivalError::InvalidIntegrationSetup);
+    }
+    if !t0.is_finite()
+        || !t1.is_finite()
+        || !h_dis_t0.is_finite()
+        || !h_mor_t0.is_finite()
+        || design_d_t0.iter().any(|v| !v.is_finite())
+        || design_m_t0.iter().any(|v| !v.is_finite())
+    {
+        return Err(SurvivalError::NonFiniteInput);
+    }
+    if t1 <= t0 {
+        return Ok(CrudeRiskResult {
+            risk: 0.0,
+            disease_gradient: Array1::zeros(coeff_len_d),
+            mortality_gradient: Array1::zeros(coeff_len_m),
+        });
+    }
+
+    let mut sorted_breaks: Vec<f64> = breakpoints
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite() && *x >= t0 && *x <= t1)
+        .collect();
+    sorted_breaks.push(t0);
+    sorted_breaks.push(t1);
+    sorted_breaks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted_breaks.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    if sorted_breaks.len() < 2 {
+        return Err(SurvivalError::InvalidIntegrationSetup);
+    }
+
+    let mut total_risk = 0.0;
+    let mut disease_gradient = Array1::zeros(coeff_len_d);
+    let mut mortality_gradient = Array1::zeros(coeff_len_m);
+    let nodes_weights = gauss_legendre_quadrature();
+
+    let mut design_d = Array1::<f64>::zeros(coeff_len_d);
+    let mut deriv_d = Array1::<f64>::zeros(coeff_len_d);
+    let mut design_m = Array1::<f64>::zeros(coeff_len_m);
+
+    for segment in sorted_breaks.windows(2) {
+        let a = segment[0];
+        let b = segment[1];
+        let center = 0.5 * (b + a);
+        let half_width = 0.5 * (b - a);
+        if half_width <= 0.0 {
+            continue;
+        }
+
+        for &(x, w) in nodes_weights {
+            let u = center + half_width * x;
+            let (inst_hazard_d, hazard_d, hazard_m) =
+                eval_at(u, &mut design_d, &mut deriv_d, &mut design_m)?;
+            if !inst_hazard_d.is_finite() || !hazard_d.is_finite() || !hazard_m.is_finite() {
+                return Err(SurvivalError::NonFiniteInput);
+            }
+
+            let h_dis_cond = (hazard_d - h_dis_t0).max(0.0);
+            let h_mor_cond = (hazard_m - h_mor_t0).max(0.0);
+            let s_total = (-(h_dis_cond + h_mor_cond)).exp();
+
+            total_risk += w * inst_hazard_d * s_total * half_width;
+
+            // d Risk / d beta_d:
+            //   integral [ d h_d * S_total - h_d * S_total * d H_d ] du
+            if inst_hazard_d > 0.0 {
+                let weight = w * s_total * half_width;
+                let mut grad_contrib = design_d.mapv(|v| inst_hazard_d * (1.0 - hazard_d) * v);
+                grad_contrib.zip_mut_with(&deriv_d, |g, &d| {
+                    *g += hazard_d * d;
+                });
+                grad_contrib.zip_mut_with(&design_d_t0, |g, &x0| {
+                    *g += inst_hazard_d * h_dis_t0 * x0;
+                });
+                grad_contrib.mapv_inplace(|v| v * weight);
+                disease_gradient += &grad_contrib;
+            }
+
+            // d Risk / d beta_m:
+            //   -integral h_d * S_total * d H_m(u|t0) du
+            if inst_hazard_d > 0.0 && hazard_m > 0.0 {
+                let weight = w * inst_hazard_d * s_total * half_width;
+                let mut mort_grad_contrib = design_m.mapv(|v| -weight * hazard_m * v);
+                mort_grad_contrib.zip_mut_with(&design_m_t0, |g, &x0| {
+                    *g += weight * h_mor_t0 * x0;
+                });
+                mortality_gradient += &mort_grad_contrib;
+            }
+        }
+    }
+
+    Ok(CrudeRiskResult {
+        risk: total_risk,
+        disease_gradient,
+        mortality_gradient,
+    })
 }
 
 impl PirlsWorkingModel for WorkingModelSurvival {
