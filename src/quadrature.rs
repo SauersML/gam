@@ -118,7 +118,9 @@ fn compute_gauss_hermite() -> GaussHermiteRule {
     let nodes = eigenvalues;
     let mut weights = [0.0f64; N_POINTS];
 
-    // Weights: wᵢ = μ₀ * (first component of eigenvector)²
+    // Weights: wᵢ = μ₀ * (first component of eigenvector)².
+    // `symmetric_tridiagonal_eigen` accumulates left rotations and returns Z = Q^T,
+    // so q_{0i} is stored at eigenvectors[i][0].
     // For physicist's Hermite: μ₀ = ∫exp(-x²)dx = sqrt(π)
     let mu0 = std::f64::consts::PI.sqrt();
     for i in 0..N_POINTS {
@@ -158,6 +160,7 @@ fn symmetric_tridiagonal_eigen(
     // Work on successively smaller submatrices
     let mut n = N_POINTS;
     while n > 1 {
+        let mut converged = false;
         // Check for convergence of last off-diagonal element
         for _ in 0..max_iter {
             // Find the largest unreduced block
@@ -173,13 +176,13 @@ fn symmetric_tridiagonal_eigen(
             if m == n - 1 {
                 // Last element converged
                 n -= 1;
+                converged = true;
                 break;
             }
 
-            // Wilkinson shift: eigenvalue of trailing 2x2 closer to diag[n-1]
-            let d = (diag[n - 2] - diag[n - 1]) / 2.0;
-            let e = off_diag[n - 2];
-            let shift = diag[n - 1] - e * e / (d + d.signum() * (d * d + e * e).sqrt());
+            // Wilkinson shift: eigenvalue of trailing 2x2 closer to diag[n-1].
+            // Use sign(0)=+1 (not f64::signum) to avoid zero denominator when d=0.
+            let shift = wilkinson_shift(diag[n - 2], diag[n - 1], off_diag[n - 2]);
 
             // Implicit QR step with shift
             let mut x = diag[m] - shift;
@@ -188,15 +191,19 @@ fn symmetric_tridiagonal_eigen(
             for k in m..(n - 1) {
                 // Givens rotation to zero out y
                 let (c, s) = if y.abs() > eps {
-                    let r = (x * x + y * y).sqrt();
-                    (x / r, -y / r)
+                    let r = x.hypot(y);
+                    if r > 0.0 && r.is_finite() {
+                        (x / r, -y / r)
+                    } else {
+                        (1.0, 0.0)
+                    }
                 } else {
                     (1.0, 0.0)
                 };
 
                 // Apply rotation to tridiagonal matrix
                 if k > m {
-                    off_diag[k - 1] = (x * x + y * y).sqrt();
+                    off_diag[k - 1] = x.hypot(y);
                 }
 
                 let d1 = diag[k];
@@ -221,9 +228,31 @@ fn symmetric_tridiagonal_eigen(
                 }
             }
         }
+        if !converged {
+            // Guaranteed progress fallback: force trailing deflation if QR did not
+            // converge within max_iter. For our tiny fixed-size Jacobi matrices this
+            // is extremely rare and preferable to a potential infinite loop.
+            off_diag[n - 2] = 0.0;
+            n -= 1;
+        }
     }
 
     (*diag, z)
+}
+
+#[inline]
+fn wilkinson_shift(a: f64, c: f64, b: f64) -> f64 {
+    let d = (a - c) * 0.5;
+    let t = d.hypot(b);
+    let sgn = if d >= 0.0 { 1.0 } else { -1.0 }; // sign(0)=+1
+    let denom = d + sgn * t;
+
+    if denom.abs() > f64::EPSILON * t.max(1.0) {
+        c - (b * b) / denom
+    } else {
+        // Degenerate fallback: equivalent limiting shift when denominator collapses.
+        c - t
+    }
 }
 
 /// Computes the posterior mean probability for a logistic model using
@@ -419,6 +448,15 @@ mod tests {
         let gh = ctx.gauss_hermite();
         let sum: f64 = gh.weights.iter().sum();
         assert_relative_eq!(sum, std::f64::consts::PI.sqrt(), epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_wilkinson_shift_finite_when_d_is_zero() {
+        // Trailing 2x2 with equal diagonal entries => d=0.
+        // Regression: using f64::signum() would produce denominator 0 here.
+        let shift = wilkinson_shift(0.0, 0.0, 1.25);
+        assert!(shift.is_finite());
+        assert_relative_eq!(shift, -1.25, epsilon = 1e-14);
     }
 
     #[test]

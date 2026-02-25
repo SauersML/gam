@@ -26,9 +26,9 @@ pub mod types;
 pub mod visualizer;
 
 pub use basis::{
-    BSplineBasisSpec, BSplineKnotSpec, BasisBuildResult, BasisMetadata, CenterStrategy,
-    DuchonBasisSpec, DuchonNullspaceOrder, DuchonSplineBasis, MaternBasisSpec, MaternNu,
-    MaternSplineBasis, ThinPlateBasisSpec, ThinPlateSplineBasis, build_bspline_basis_1d,
+    BSplineBasisSpec, BSplineKnotPlacement, BSplineKnotSpec, BasisBuildResult, BasisMetadata,
+    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonSplineBasis, MaternBasisSpec,
+    MaternNu, MaternSplineBasis, ThinPlateBasisSpec, ThinPlateSplineBasis, build_bspline_basis_1d,
     build_duchon_basis, build_matern_basis, build_thin_plate_basis, create_duchon_spline_basis,
     create_matern_spline_basis, create_thin_plate_spline_basis,
     create_thin_plate_spline_basis_with_knot_count, select_thin_plate_knots,

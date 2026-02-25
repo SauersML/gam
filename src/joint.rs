@@ -1320,6 +1320,23 @@ impl<'a> JointRemlState<'a> {
                     residual[i] = weights[i] * (mu_i - state.y[i]) / dmu;
                 }
             }
+            (LinkFunction::CLogLog, _) => {
+                const PROB_EPS: f64 = 1e-8;
+                const MIN_WEIGHT: f64 = 1e-12;
+                const MIN_DMU: f64 = 1e-6;
+                for i in 0..n {
+                    let e = eta[i].clamp(-30.0, 30.0);
+                    let exp_eta = e.exp();
+                    let surv = (-exp_eta).exp();
+                    let mu_i = (1.0 - surv).clamp(PROB_EPS, 1.0 - PROB_EPS);
+                    mu[i] = mu_i;
+                    let dmu = (exp_eta * surv).max(MIN_DMU);
+                    let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
+                    let w = ((dmu * dmu) / var).max(MIN_WEIGHT);
+                    weights[i] = state.weights[i] * w;
+                    residual[i] = weights[i] * (mu_i - state.y[i]) / dmu;
+                }
+            }
         }
         let deviance = state.compute_deviance(&mu);
 
@@ -1577,7 +1594,7 @@ impl<'a> JointRemlState<'a> {
         }
 
         let laml = match state.link {
-            LinkFunction::Logit | LinkFunction::Probit => {
+            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
                 let penalised_ll = -0.5 * deviance - 0.5 * penalty_term;
                 let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_a
                     + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
@@ -3269,6 +3286,10 @@ pub fn predict_joint(
                 .map(|i| crate::quadrature::logit_posterior_mean(&quad_ctx, eta_cal[i], eff_se[i]))
                 .collect::<Array1<f64>>(),
             LinkFunction::Probit => eta_cal.mapv(normal_cdf_approx),
+            LinkFunction::CLogLog => eta_cal.mapv(|e| {
+                let e = e.clamp(-30.0, 30.0);
+                1.0 - (-(e.exp())).exp()
+            }),
             LinkFunction::Identity => eta_cal.clone(),
         };
 
@@ -3277,6 +3298,10 @@ pub fn predict_joint(
         let probs = match result.link {
             LinkFunction::Logit => eta_cal.mapv(|e| 1.0 / (1.0 + (-e).exp())),
             LinkFunction::Probit => eta_cal.mapv(normal_cdf_approx),
+            LinkFunction::CLogLog => eta_cal.mapv(|e| {
+                let e = e.clamp(-30.0, 30.0);
+                1.0 - (-(e.exp())).exp()
+            }),
             LinkFunction::Identity => eta_cal.clone(),
         };
         (probs, None)

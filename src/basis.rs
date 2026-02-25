@@ -389,6 +389,17 @@ fn evaluate_splines_derivative_sparse_into_with_lower(
     lower_values: &mut [f64],
     lower_scratch: &mut internal::BsplineScratch,
 ) -> usize {
+    let num_basis = knot_view.len().saturating_sub(degree + 1);
+    if num_basis > 0 {
+        let left = knot_view[degree];
+        let right = knot_view[num_basis];
+        // Constant extrapolation outside the domain implies zero derivatives.
+        if x < left || x > right {
+            values.fill(0.0);
+            return 0;
+        }
+    }
+
     let start_col =
         internal::evaluate_splines_sparse_into(x, degree, knot_view, values, basis_scratch);
     if degree == 0 {
@@ -474,6 +485,17 @@ fn evaluate_splines_second_derivative_sparse_into(
     values: &mut [f64],
     scratch: &mut BasisEvalScratch,
 ) -> usize {
+    let num_basis = knot_view.len().saturating_sub(degree + 1);
+    if num_basis > 0 {
+        let left = knot_view[degree];
+        let right = knot_view[num_basis];
+        // Constant extrapolation outside the domain implies zero derivatives.
+        if x < left || x > right {
+            values.fill(0.0);
+            return 0;
+        }
+    }
+
     let start_col =
         internal::evaluate_splines_sparse_into(x, degree, knot_view, values, &mut scratch.basis);
     if degree < 2 {
@@ -1361,7 +1383,18 @@ pub enum BSplineKnotSpec {
         data_range: (f64, f64),
         num_internal_knots: usize,
     },
+    Automatic {
+        num_internal_knots: Option<usize>,
+        placement: BSplineKnotPlacement,
+    },
     Provided(Array1<f64>),
+}
+
+/// Internal-knot placement strategy when knots are automatically inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BSplineKnotPlacement {
+    Uniform,
+    Quantile,
 }
 
 /// 1D B-spline basis configuration.
@@ -1735,18 +1768,49 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    let knot_source = match &spec.knot_spec {
+    let (basis, knots) = match &spec.knot_spec {
         BSplineKnotSpec::Generate {
             data_range,
             num_internal_knots,
-        } => KnotSource::Generate {
-            data_range: *data_range,
-            num_internal_knots: *num_internal_knots,
-        },
-        BSplineKnotSpec::Provided(knots) => KnotSource::Provided(knots.view()),
+        } => create_basis::<Dense>(
+            data,
+            KnotSource::Generate {
+                data_range: *data_range,
+                num_internal_knots: *num_internal_knots,
+            },
+            spec.degree,
+            BasisOptions::value(),
+        )?,
+        BSplineKnotSpec::Provided(knots) => create_basis::<Dense>(
+            data,
+            KnotSource::Provided(knots.view()),
+            spec.degree,
+            BasisOptions::value(),
+        )?,
+        BSplineKnotSpec::Automatic {
+            num_internal_knots,
+            placement,
+        } => {
+            let inferred = num_internal_knots.unwrap_or_else(|| {
+                default_internal_knot_count_for_data(data.len(), spec.degree)
+            });
+            let knots = match placement {
+                BSplineKnotPlacement::Uniform => {
+                    let range = finite_data_range(data)?;
+                    internal::generate_full_knot_vector(range, inferred, spec.degree)?
+                }
+                BSplineKnotPlacement::Quantile => {
+                    internal::generate_full_knot_vector_quantile(data, inferred, spec.degree)?
+                }
+            };
+            create_basis::<Dense>(
+                data,
+                KnotSource::Provided(knots.view()),
+                spec.degree,
+                BasisOptions::value(),
+            )?
+        }
     };
-    let (basis, knots) =
-        create_basis::<Dense>(data, knot_source, spec.degree, BasisOptions::value())?;
     let design = (*basis).clone();
     let p = design.ncols();
     let s_bend = create_difference_penalty_matrix(p, spec.penalty_order, None)?;
@@ -1762,6 +1826,39 @@ pub fn build_bspline_basis_1d(
         nullspace_dims,
         metadata: BasisMetadata::BSpline1D { knots },
     })
+}
+
+fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {
+    if n < 8 {
+        return 0;
+    }
+    let heuristic = if n < 16 { 3 } else { (n / 4).max(3) };
+    let max_reasonable = n.saturating_sub(degree + 2);
+    heuristic.min(40).min(max_reasonable)
+}
+
+fn finite_data_range(data: ArrayView1<'_, f64>) -> Result<(f64, f64), BasisError> {
+    if data.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "cannot infer knot range from empty data".to_string(),
+        ));
+    }
+    if data.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "automatic knot placement requires finite data values".to_string(),
+        ));
+    }
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+    for &x in data {
+        if x < min_v {
+            min_v = x;
+        }
+        if x > max_v {
+            max_v = x;
+        }
+    }
+    Ok((min_v, max_v))
 }
 
 /// Generic thin-plate builder returning design + penalty list.
@@ -3544,16 +3641,68 @@ pub(crate) mod internal {
         Ok(Array::from_vec(knots))
     }
 
+    /// Generates a clamped full knot vector with internal knots placed at empirical quantiles.
+    pub(super) fn generate_full_knot_vector_quantile(
+        data: ArrayView1<'_, f64>,
+        num_internal_knots: usize,
+        degree: usize,
+    ) -> Result<Array1<f64>, BasisError> {
+        if data.is_empty() {
+            return Err(BasisError::InvalidInput(
+                "cannot generate quantile knots from empty data".to_string(),
+            ));
+        }
+        if data.iter().any(|x| !x.is_finite()) {
+            return Err(BasisError::InvalidInput(
+                "quantile knot placement requires finite data".to_string(),
+            ));
+        }
+
+        let mut sorted: Vec<f64> = data.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let min_val = sorted[0];
+        let max_val = *sorted.last().unwrap_or(&min_val);
+        if min_val == max_val && num_internal_knots > 0 {
+            return Err(BasisError::DegenerateRange(num_internal_knots));
+        }
+
+        let total_knots = num_internal_knots + 2 * (degree + 1);
+        let mut knots = Vec::with_capacity(total_knots);
+        for _ in 0..=degree {
+            knots.push(min_val);
+        }
+
+        if num_internal_knots > 0 {
+            let n = sorted.len();
+            for j in 1..=num_internal_knots {
+                let p = j as f64 / (num_internal_knots + 1) as f64;
+                let pos = p * (n.saturating_sub(1) as f64);
+                let lo = pos.floor() as usize;
+                let hi = pos.ceil() as usize;
+                let frac = pos - lo as f64;
+                let q = if lo == hi {
+                    sorted[lo]
+                } else {
+                    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+                };
+                knots.push(q.clamp(min_val, max_val));
+            }
+        }
+
+        for _ in 0..=degree {
+            knots.push(max_val);
+        }
+
+        Ok(Array::from_vec(knots))
+    }
+
     /// Evaluates all B-spline basis functions at a single point `x`.
     /// This uses a numerically stable implementation of the Cox-de Boor algorithm,
     /// based on Algorithm A2.2 from "The NURBS Book" by Piegl and Tiller.
     ///
-    /// IMPORTANT: Do not clamp `x` to the knot domain here. Upstream Peeled Hull
-    /// Clamping (PHC) provides geometric projection. This function must honor the
-    /// provided `x` value. For out-of-domain `x`, we select the boundary span and
-    /// evaluate the polynomial there. This results in polynomial extrapolation
-    /// (not zeros), which may produce large values far from the boundary. Callers
-    /// should use PHC or other projection to keep `x` within reasonable bounds.
+    /// For x outside the spline domain [t_degree, t_num_basis], we apply constant
+    /// boundary extrapolation by clamping x to the nearest boundary before running
+    /// Cox-de Boor recursion.
     #[inline]
     pub(super) fn evaluate_splines_at_point_into(
         x: f64,
@@ -3586,7 +3735,7 @@ pub(crate) mod internal {
         scratch.left.fill(0.0);
         scratch.right.fill(0.0);
 
-        let x_eval = x;
+        let x_eval = x.clamp(knots[DEGREE], knots[num_basis]);
 
         let mu = {
             if x_eval >= knots[num_basis] {
@@ -3651,7 +3800,7 @@ pub(crate) mod internal {
         scratch.left.fill(0.0);
         scratch.right.fill(0.0);
 
-        let x_eval = x;
+        let x_eval = x.clamp(knots[degree], knots[num_basis]);
 
         let mu = {
             if x_eval >= knots[num_basis] {
@@ -3718,7 +3867,7 @@ pub(crate) mod internal {
         scratch.left.fill(0.0);
         scratch.right.fill(0.0);
 
-        let x_eval = x;
+        let x_eval = x.clamp(knots[degree], knots[num_basis]);
 
         let mu = {
             if x_eval >= knots[num_basis] {
@@ -4162,6 +4311,57 @@ mod tests {
     }
 
     #[test]
+    fn test_build_bspline_basis_1d_automatic_uniform_uses_data_range() {
+        let x = array![2.0, 3.0, 4.5, 6.0, 7.0, 8.0];
+        let spec = BSplineBasisSpec {
+            degree: 2,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(3),
+                placement: BSplineKnotPlacement::Uniform,
+            },
+            double_penalty: false,
+        };
+
+        let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        let knots = match result.metadata {
+            BasisMetadata::BSpline1D { knots } => knots,
+            _ => panic!("expected BSpline1D metadata"),
+        };
+        assert_eq!(knots.len(), 3 + 2 * (spec.degree + 1));
+        assert!((knots[0] - 2.0).abs() < 1e-12);
+        assert!((knots[knots.len() - 1] - 8.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_build_bspline_basis_1d_automatic_quantile_is_not_uniform_for_skewed_data() {
+        let x = array![0.0, 0.1, 0.2, 0.3, 0.35, 0.4, 0.45, 10.0, 10.5, 11.0, 12.0];
+        let spec = BSplineBasisSpec {
+            degree: 2,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(3),
+                placement: BSplineKnotPlacement::Quantile,
+            },
+            double_penalty: false,
+        };
+
+        let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        let knots = match result.metadata {
+            BasisMetadata::BSpline1D { knots } => knots,
+            _ => panic!("expected BSpline1D metadata"),
+        };
+        let start = spec.degree + 1;
+        let internal = &knots.as_slice().unwrap()[start..(start + 3)];
+        let d1 = internal[1] - internal[0];
+        let d2 = internal[2] - internal[1];
+        assert!(
+            (d1 - d2).abs() > 1e-6,
+            "quantile spacing should be non-uniform for skewed data"
+        );
+    }
+
+    #[test]
     fn test_bspline_basis_sums_to_one() {
         let data = Array::linspace(0.1, 9.9, 100);
         let (basis, _) = create_basis::<Dense>(
@@ -4412,6 +4612,54 @@ mod tests {
                 panic!("Partition of unity failed at x={}", x);
             }
         }
+    }
+
+    #[test]
+    fn test_constant_extrapolation_matches_boundary_basis_values() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
+        let degree = 3usize;
+        let left_boundary = internal::evaluate_splines_at_point(0.0, degree, knots.view());
+        let right_boundary = internal::evaluate_splines_at_point(4.0, degree, knots.view());
+
+        let left_out = internal::evaluate_splines_at_point(-100.0, degree, knots.view());
+        let right_out = internal::evaluate_splines_at_point(100.0, degree, knots.view());
+
+        for i in 0..left_boundary.len() {
+            assert_abs_diff_eq!(left_out[i], left_boundary[i], epsilon = 1e-12);
+            assert_abs_diff_eq!(right_out[i], right_boundary[i], epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_sparse_derivatives_are_zero_outside_domain() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
+        let degree = 3usize;
+        let support = degree + 1;
+        let mut scratch = BasisEvalScratch::new(degree);
+        let mut d1 = vec![0.0; support];
+        let mut d2 = vec![0.0; support];
+
+        let _ = evaluate_splines_derivative_sparse_into(-10.0, degree, knots.view(), &mut d1, &mut scratch);
+        assert!(d1.iter().all(|v| v.abs() < 1e-12));
+        let _ = evaluate_splines_derivative_sparse_into(10.0, degree, knots.view(), &mut d1, &mut scratch);
+        assert!(d1.iter().all(|v| v.abs() < 1e-12));
+
+        let _ = evaluate_splines_second_derivative_sparse_into(
+            -10.0,
+            degree,
+            knots.view(),
+            &mut d2,
+            &mut scratch,
+        );
+        assert!(d2.iter().all(|v| v.abs() < 1e-12));
+        let _ = evaluate_splines_second_derivative_sparse_into(
+            10.0,
+            degree,
+            knots.view(),
+            &mut d2,
+            &mut scratch,
+        );
+        assert!(d2.iter().all(|v| v.abs() < 1e-12));
     }
 
     #[test]
