@@ -426,10 +426,17 @@ impl WorkingModelSurvival {
         let h_view = FaerArrayView::new(&state.hessian);
         let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower)
             .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
-        let eye = Array2::<f64>::eye(p);
-        let eye_view = FaerArrayView::new(&eye);
-        let h_inv_faer = factor.solve(eye_view.as_ref());
-        let h_inv = Array2::from_shape_fn((p, p), |(i, j)| h_inv_faer[(i, j)]);
+
+        let solve_mat = |rhs: &Array2<f64>| -> Array2<f64> {
+            let rhs_view = FaerArrayView::new(rhs);
+            let solved = factor.solve(rhs_view.as_ref());
+            Array2::from_shape_fn((solved.nrows(), solved.ncols()), |(i, j)| solved[(i, j)])
+        };
+        let solve_vec = |rhs: &Array1<f64>| -> Array1<f64> {
+            let rhs_mat = rhs.clone().insert_axis(Axis(1));
+            let solved = solve_mat(&rhs_mat);
+            solved.column(0).to_owned()
+        };
 
         let eta_entry = self.x_entry.dot(beta);
         let eta_exit = self.x_exit.dot(beta);
@@ -438,18 +445,20 @@ impl WorkingModelSurvival {
         let exp_exit = eta_exit.mapv(f64::exp);
         let guard = self.monotonicity.tolerance.max(1e-12);
 
-        // Leverage-like diagonals used by the third-derivative contraction.
-        let x1_hinv = self.x_exit.dot(&h_inv);
-        let x0_hinv = self.x_entry.dot(&h_inv);
-        let xd_hinv = self.x_derivative.dot(&h_inv);
+        // Leverage-like diagonals used by the third-derivative contraction:
+        // q_i = x_i^T H^{-1} x_i.
+        // Compute via factor-solve against transposed design blocks (no dense H^{-1} build).
+        let z1 = solve_mat(&self.x_exit.t().to_owned());
+        let z0 = solve_mat(&self.x_entry.t().to_owned());
+        let zd = solve_mat(&self.x_derivative.t().to_owned());
         let n = self.x_exit.nrows();
         let mut q1 = Array1::<f64>::zeros(n);
         let mut q0 = Array1::<f64>::zeros(n);
         let mut qd = Array1::<f64>::zeros(n);
         for i in 0..n {
-            q1[i] = self.x_exit.row(i).dot(&x1_hinv.row(i)).max(0.0);
-            q0[i] = self.x_entry.row(i).dot(&x0_hinv.row(i)).max(0.0);
-            qd[i] = self.x_derivative.row(i).dot(&xd_hinv.row(i)).max(0.0);
+            q1[i] = self.x_exit.row(i).dot(&z1.column(i)).max(0.0);
+            q0[i] = self.x_entry.row(i).dot(&z0.column(i)).max(0.0);
+            qd[i] = self.x_derivative.row(i).dot(&zd.column(i)).max(0.0);
         }
 
         // Assemble S(rho) in the same scaling used by update_state.
@@ -523,16 +532,24 @@ impl WorkingModelSurvival {
 
             // Implicit inner derivative:
             // d beta_hat / d rho_k = -H^{-1} A_k beta_hat.
-            let u_k = -h_inv.dot(&a_k_beta);
+            let u_k = -solve_vec(&a_k_beta);
             let s1k = self.x_exit.dot(&u_k);
             let s0k = self.x_entry.dot(&u_k);
             let sdk = self.x_derivative.dot(&u_k);
 
+            // trace(H^{-1} A_k) on block support via solves against block unit vectors.
+            let block_dim = r.len();
+            let mut block_basis = Array2::<f64>::zeros((p, block_dim));
+            for (j_local, j) in r.clone().enumerate() {
+                block_basis[[j, j_local]] = 1.0;
+            }
+            let solved_basis = solve_mat(&block_basis);
             let mut trace_hinv_ak = 0.0_f64;
             for (i_local, i) in r.clone().enumerate() {
-                for (j_local, j) in r.clone().enumerate() {
-                    trace_hinv_ak +=
-                        h_inv[[i, j]] * (2.0 * lambda * block.matrix[[j_local, i_local]]);
+                for (j_local, _j) in r.clone().enumerate() {
+                    // solved_basis[i, j_local] = H^{-1}_{i, r[j_local]}.
+                    trace_hinv_ak += solved_basis[[i, j_local]]
+                        * (2.0 * lambda * block.matrix[[j_local, i_local]]);
                 }
             }
 
