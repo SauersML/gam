@@ -46,11 +46,29 @@ fn base_values(strategy: SeedStrategy, bounds: (f64, f64)) -> Vec<f64> {
             } else {
                 (bounds.1, bounds.0)
             };
+            // Center-first ordering finds well-conditioned basins earlier while
+            // preserving deterministic exhaustive coverage of the search range.
             let mut values = Vec::new();
-            let mut v = hi;
-            while v >= lo - 1e-9 {
-                values.push(v);
-                v -= step;
+            let mut center = 0.0_f64.clamp(lo, hi);
+            center = ((center - lo) / step).round() * step + lo;
+            if center < lo {
+                center = lo;
+            }
+            if center > hi {
+                center = hi;
+            }
+            values.push(center);
+            let mut delta = step;
+            while center - delta >= lo - 1e-9 || center + delta <= hi + 1e-9 {
+                let left = center - delta;
+                let right = center + delta;
+                if left >= lo - 1e-9 {
+                    values.push(left);
+                }
+                if right <= hi + 1e-9 {
+                    values.push(right);
+                }
+                delta += step;
             }
             values
         }
@@ -60,8 +78,8 @@ fn base_values(strategy: SeedStrategy, bounds: (f64, f64)) -> Vec<f64> {
 fn single_axis_values(strategy: SeedStrategy) -> Vec<f64> {
     match strategy {
         SeedStrategy::Single => Vec::new(),
-        SeedStrategy::Light => vec![8.0, -8.0],
-        SeedStrategy::Exhaustive => vec![12.0, 4.0, -4.0, -12.0],
+        SeedStrategy::Light => vec![4.0, -4.0, 8.0, -8.0],
+        SeedStrategy::Exhaustive => vec![4.0, -4.0, 8.0, -8.0, 12.0, -12.0],
     }
 }
 
