@@ -2,8 +2,9 @@ use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
-use ndarray::{s, Array1, Array2, ArrayViewMut2, Axis};
+use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use std::collections::HashSet;
 use std::ops::Range;
 
 #[derive(Clone)]
@@ -46,17 +47,26 @@ impl PenaltyRepresentation {
             PenaltyRepresentation::Banded { bands, offsets } => {
                 let dim = self.block_dimension();
                 let mut dense = Array2::zeros((dim, dim));
+                let positive_offsets: HashSet<usize> = offsets
+                    .iter()
+                    .filter_map(|&off| (off >= 0).then_some(off as usize))
+                    .collect();
                 for (band, &offset) in bands.iter().zip(offsets.iter()) {
-                    if offset >= 0 {
-                        let off = offset as usize;
-                        for (idx, &value) in band.iter().enumerate() {
-                            dense[[idx, idx + off]] = value;
+                    let off = offset.unsigned_abs() as usize;
+                    if offset < 0 && positive_offsets.contains(&off) {
+                        continue;
+                    }
+                    for (idx, &value) in band.iter().enumerate() {
+                        let (i, j) = if offset >= 0 {
+                            (idx, idx + off)
+                        } else {
+                            (idx + off, idx)
+                        };
+                        if i >= dim || j >= dim {
+                            continue;
                         }
-                    } else {
-                        let off = (-offset) as usize;
-                        for (idx, &value) in band.iter().enumerate() {
-                            dense[[idx + off, idx]] = value;
-                        }
+                        dense[[i, j]] = value;
+                        dense[[j, i]] = value;
                     }
                 }
                 dense
@@ -100,18 +110,29 @@ impl PenaltyMatrix {
                 dest.scaled_add(weight, block);
             }
             PenaltyRepresentation::Banded { bands, offsets } => {
+                let positive_offsets: HashSet<usize> = offsets
+                    .iter()
+                    .filter_map(|&off| (off >= 0).then_some(off as usize))
+                    .collect();
                 for (band, &offset) in bands.iter().zip(offsets.iter()) {
-                    if offset >= 0 {
-                        let off = offset as usize;
-                        for (idx, &value) in band.iter().enumerate() {
-                            let entry = dest.get_mut((idx, idx + off)).expect("banded index");
-                            *entry += weight * value;
-                        }
-                    } else {
-                        let off = (-offset) as usize;
-                        for (idx, &value) in band.iter().enumerate() {
-                            let entry = dest.get_mut((idx + off, idx)).expect("banded index");
-                            *entry += weight * value;
+                    let off = offset.unsigned_abs() as usize;
+                    if offset < 0 && positive_offsets.contains(&off) {
+                        continue;
+                    }
+                    for (idx, &value) in band.iter().enumerate() {
+                        let (i, j) = if offset >= 0 {
+                            (idx, idx + off)
+                        } else {
+                            (idx + off, idx)
+                        };
+                        let Some(entry_ij) = dest.get_mut((i, j)) else {
+                            continue;
+                        };
+                        *entry_ij += weight * value;
+                        if i != j {
+                            if let Some(entry_ji) = dest.get_mut((j, i)) {
+                                *entry_ji += weight * value;
+                            }
                         }
                     }
                 }
@@ -701,21 +722,25 @@ pub fn compute_penalty_square_roots(
 
 /// Helper to construct the summed, weighted penalty matrix S_lambda.
 /// This version works with full-sized p × p penalty matrices from s_list.
-pub fn construct_s_lambda(lambdas: &Array1<f64>, s_list: &[Array2<f64>], p: usize) -> Array2<f64> {
+pub fn construct_s_lambda(
+    lambdas: &Array1<f64>,
+    s_list: &[Array2<f64>],
+    p: usize,
+) -> Result<Array2<f64>, EstimationError> {
     let mut s_lambda = Array2::zeros((p, p));
 
     if s_list.is_empty() {
-        return s_lambda;
+        return Ok(s_lambda);
     }
 
     // Validation: lambdas length must match number of penalty matrices
     if lambdas.len() != s_list.len() {
-        panic!(
-            "Lambda count mismatch: expected {} lambdas for {} penalty matrices, got {}",
+        return Err(EstimationError::InvalidInput(format!(
+            "lambda count mismatch: expected {} lambdas for {} penalty matrices, got {}",
             s_list.len(),
             s_list.len(),
             lambdas.len()
-        );
+        )));
     }
 
     // Simple weighted sum since all matrices are now p × p
@@ -724,7 +749,7 @@ pub fn construct_s_lambda(lambdas: &Array1<f64>, s_list: &[Array2<f64>], p: usiz
         s_lambda.scaled_add(lambdas[i], s_k);
     }
 
-    s_lambda
+    Ok(s_lambda)
 }
 
 /// Lambda-independent reparameterization invariants derived from penalty structure.

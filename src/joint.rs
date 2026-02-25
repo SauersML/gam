@@ -26,9 +26,9 @@ use crate::construction::{
 };
 use crate::estimate::EstimationError;
 use crate::probability::{normal_cdf_approx, normal_pdf};
-use crate::types::LinkFunction;
 use crate::quadrature::QuadratureContext;
 use crate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
+use crate::types::LinkFunction;
 use crate::visualizer;
 use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -1008,16 +1008,7 @@ pub(crate) fn fit_joint_model<'a>(
     link: LinkFunction,
     config: &JointModelConfig,
 ) -> Result<JointModelResult, EstimationError> {
-    fit_joint_model_with_reml(
-        y,
-        weights,
-        x_base,
-        s_base,
-        layout_base,
-        link,
-        config,
-        None,
-    )
+    fit_joint_model_with_reml(y, weights, x_base, s_base, layout_base, link, config, None)
 }
 
 /// Engine-facing joint model entrypoint without domain `EngineDims`.
@@ -1262,12 +1253,11 @@ impl<'a> JointRemlState<'a> {
                 for i in 0..n {
                     let e = eta[i].clamp(-700.0, 700.0);
                     let se_i = se[i].max(0.0);
-                    let (mu_i, dmu_deta) =
-                        crate::quadrature::logit_posterior_mean_with_deriv(
-                            &state.quad_ctx,
-                            e,
-                            se_i,
-                        );
+                    let (mu_i, dmu_deta) = crate::quadrature::logit_posterior_mean_with_deriv(
+                        &state.quad_ctx,
+                        e,
+                        se_i,
+                    );
                     let mu_c = mu_i.clamp(PROB_EPS, 1.0 - PROB_EPS);
                     mu[i] = mu_c;
                     let var = (mu_c * (1.0 - mu_c)).max(PROB_EPS);
@@ -2333,10 +2323,7 @@ impl<'a> JointRemlState<'a> {
             // This eliminates the entire M_dot computation and constraint sensitivity terms.
             let z_dot = Array2::<f64>::zeros((n_raw, p_link));
 
-            dot_j_theta.assign(&crate::faer_ndarray::fast_ab(
-                &b_dot,
-                link_transform,
-            ));
+            dot_j_theta.assign(&crate::faer_ndarray::fast_ab(&b_dot, link_transform));
             dot_j_theta += &crate::faer_ndarray::fast_ab(&b_raw, &z_dot);
 
             // dot_g_prime
@@ -3266,11 +3253,7 @@ pub fn predict_joint(
 
         let probs = match result.link {
             LinkFunction::Logit => (0..n)
-                .map(|i| {
-                    crate::quadrature::logit_posterior_mean(
-                        &quad_ctx, eta_cal[i], eff_se[i],
-                    )
-                })
+                .map(|i| crate::quadrature::logit_posterior_mean(&quad_ctx, eta_cal[i], eff_se[i]))
                 .collect::<Array1<f64>>(),
             LinkFunction::Probit => eta_cal.mapv(normal_cdf_approx),
             LinkFunction::Identity => eta_cal.clone(),

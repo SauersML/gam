@@ -75,5 +75,4 @@ fn enforce_engine_domain_boundary() {
         }
         panic!("domain leakage in gam engine modules");
     }
-
 }

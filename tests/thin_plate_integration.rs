@@ -61,7 +61,10 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
     )
     .expect("predict_gam should succeed");
 
-    let mse = (&pred.mean - &y).mapv(|v| v * v).mean().unwrap_or(f64::INFINITY);
+    let mse = (&pred.mean - &y)
+        .mapv(|v| v * v)
+        .mean()
+        .unwrap_or(f64::INFINITY);
     assert!(
         mse < 5e-2,
         "TPS integration fit is too inaccurate, mse={mse:.6e}"
@@ -87,8 +90,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
         x_train[[i, 1]] = x2;
 
         let r2 = (x1 - 0.25).powi(2) + (x2 + 0.15).powi(2);
-        let f = 1.1 * (-r2 / (2.0 * 0.38 * 0.38)).exp()
-            + 0.45 * (std::f64::consts::PI * x1).sin()
+        let f = 1.1 * (-r2 / (2.0 * 0.38 * 0.38)).exp() + 0.45 * (std::f64::consts::PI * x1).sin()
             - 0.30 * x2
             + 0.25 * x1 * x2;
         y_train_true[i] = f;
@@ -137,8 +139,8 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
             - 0.30 * x2
             + 0.25 * x1 * x2;
     }
-    let tps_test =
-        gam::basis::create_thin_plate_spline_basis(x_test.view(), knots.view()).expect("TPS test basis");
+    let tps_test = gam::basis::create_thin_plate_spline_basis(x_test.view(), knots.view())
+        .expect("TPS test basis");
     let pred = predict_gam(
         tps_test.basis.view(),
         fit.beta.view(),

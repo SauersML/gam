@@ -54,13 +54,20 @@ fn probit_fit_and_predict_fast_integration() {
     )
     .expect("probit predict should succeed");
 
-    assert!(pred.mean.iter().all(|v| v.is_finite() && *v > 0.0 && *v < 1.0));
+    assert!(
+        pred.mean
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
+    );
 
     let brier = (&pred.mean - &y)
         .mapv(|v| v * v)
         .mean()
         .unwrap_or(f64::INFINITY);
-    assert!(brier < 0.25, "unexpectedly poor probit fit: brier={brier:.6e}");
+    assert!(
+        brier < 0.25,
+        "unexpectedly poor probit fit: brier={brier:.6e}"
+    );
 }
 
 #[test]

@@ -8,6 +8,7 @@ pub use faer::linalg::solvers::{
 use faer::linalg::svd::{self, ComputeSvdVectors};
 use faer::{Auto, Mat, MatMut, MatRef, Par, Side, Spec, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
+use std::marker::PhantomData;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -422,45 +423,114 @@ pub fn ldlt_rook(
 }
 
 pub struct FaerArrayView<'a> {
-    view: MatRef<'a, f64>,
+    ptr: *const f64,
+    rows: usize,
+    cols: usize,
+    row_stride: isize,
+    col_stride: isize,
+    owned: Option<Array2<f64>>,
+    _marker: PhantomData<&'a f64>,
 }
 
 impl<'a> FaerArrayView<'a> {
     pub fn new<S: Data<Elem = f64>>(array: &'a ArrayBase<S, Ix2>) -> Self {
         let (rows, cols) = array.dim();
         let strides = array.strides();
-        // SAFETY: `ArrayBase` guarantees that the pointer returned by `as_ptr` is valid for the
-        // lifetime of the array view, and the stride metadata from `strides()` accurately describes
-        // how to traverse the 2-D view in memory. We forward this information to faer so that it can
-        // operate on the ndarray-backed storage without performing any intermediate copies.
-        let view =
-            unsafe { MatRef::from_raw_parts(array.as_ptr(), rows, cols, strides[0], strides[1]) };
-        Self { view }
+        // Guard against layouts that can alias or reverse memory traversal (e.g.
+        // negative/zero strides). These can violate assumptions in faer kernels.
+        // For such layouts we materialize a compact owned copy.
+        if strides[0] <= 0 || strides[1] <= 0 {
+            let owned = array.to_owned();
+            let owned_strides = owned.strides();
+            return Self {
+                ptr: owned.as_ptr(),
+                rows,
+                cols,
+                row_stride: owned_strides[0],
+                col_stride: owned_strides[1],
+                owned: Some(owned),
+                _marker: PhantomData,
+            };
+        }
+
+        Self {
+            ptr: array.as_ptr(),
+            rows,
+            cols,
+            row_stride: strides[0],
+            col_stride: strides[1],
+            owned: None,
+            _marker: PhantomData,
+        }
     }
 
     #[inline]
     pub fn as_ref(&self) -> MatRef<'_, f64> {
-        self.view
+        let (ptr, rows, cols, row_stride, col_stride) = if let Some(owned) = &self.owned {
+            let strides = owned.strides();
+            (
+                owned.as_ptr(),
+                owned.nrows(),
+                owned.ncols(),
+                strides[0],
+                strides[1],
+            )
+        } else {
+            (
+                self.ptr,
+                self.rows,
+                self.cols,
+                self.row_stride,
+                self.col_stride,
+            )
+        };
+        // SAFETY: pointer/shape/strides either come directly from a live ndarray
+        // view with positive strides, or from an owned compact copy stored inside
+        // this wrapper, which guarantees validity for the returned view lifetime.
+        unsafe { MatRef::from_raw_parts(ptr, rows, cols, row_stride, col_stride) }
     }
 }
 
 pub struct FaerColView<'a> {
-    view: MatRef<'a, f64>,
+    ptr: *const f64,
+    len: usize,
+    stride: isize,
+    owned: Option<Array1<f64>>,
+    _marker: PhantomData<&'a f64>,
 }
 
 impl<'a> FaerColView<'a> {
     pub fn new<S: Data<Elem = f64>>(array: &'a ArrayBase<S, Ix1>) -> Self {
         let len = array.len();
         let stride = array.strides()[0];
-        // SAFETY: identical reasoning as `FaerArrayView::new`; here we reinterpret the 1-D ndarray
-        // storage as an n×1 matrix so that faer can consume it directly.
-        let view = unsafe { MatRef::from_raw_parts(array.as_ptr(), len, 1, stride, 0) };
-        Self { view }
+        if stride <= 0 {
+            let owned = array.to_owned();
+            return Self {
+                ptr: owned.as_ptr(),
+                len,
+                stride: 1,
+                owned: Some(owned),
+                _marker: PhantomData,
+            };
+        }
+        Self {
+            ptr: array.as_ptr(),
+            len,
+            stride,
+            owned: None,
+            _marker: PhantomData,
+        }
     }
 
     #[inline]
     pub fn as_ref(&self) -> MatRef<'_, f64> {
-        self.view
+        let (ptr, len, stride) = if let Some(owned) = &self.owned {
+            (owned.as_ptr(), owned.len(), 1)
+        } else {
+            (self.ptr, self.len, self.stride)
+        };
+        // SAFETY: analogous to FaerArrayView::as_ref.
+        unsafe { MatRef::from_raw_parts(ptr, len, 1, stride, 0) }
     }
 }
 

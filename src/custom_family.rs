@@ -1,9 +1,10 @@
 use crate::matrix::DesignMatrix;
 use crate::types::LinkFunction;
-use crate::faer_ndarray::FaerEigh;
-use faer::linalg::solvers::{Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use faer::Mat as FaerMat;
 use faer::Side;
+use faer::linalg::solvers::{
+    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
+};
 use ndarray::{Array1, Array2};
 use wolfe_bfgs::Bfgs;
 
@@ -202,7 +203,10 @@ fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
     out
 }
 
-fn split_log_lambdas(flat: &Array1<f64>, penalty_counts: &[usize]) -> Result<Vec<Array1<f64>>, String> {
+fn split_log_lambdas(
+    flat: &Array1<f64>,
+    penalty_counts: &[usize],
+) -> Result<Vec<Array1<f64>>, String> {
     let expected: usize = penalty_counts.iter().sum();
     if flat.len() != expected {
         return Err(format!(
@@ -330,7 +334,7 @@ fn solve_block_weighted_system(
 
     xtwx += s_lambda;
 
-    let ridge = ridge_floor.max(1e-15);
+    let ridge = effective_solver_ridge(ridge_floor);
     for d in 0..p {
         xtwx[[d, d]] += ridge;
     }
@@ -360,6 +364,11 @@ fn solve_block_weighted_system(
     Ok(rhs)
 }
 
+#[inline]
+fn effective_solver_ridge(ridge_floor: f64) -> f64 {
+    ridge_floor.max(1e-15)
+}
+
 fn stable_logdet_pospart(matrix: &Array2<f64>, ridge_floor: f64) -> Result<f64, String> {
     let mut a = matrix.clone();
     let p = a.nrows();
@@ -370,13 +379,13 @@ fn stable_logdet_pospart(matrix: &Array2<f64>, ridge_floor: f64) -> Result<f64, 
             a[[j, i]] = v;
         }
     }
+    let ridge = effective_solver_ridge(ridge_floor);
     for i in 0..p {
-        a[[i, i]] += ridge_floor.max(0.0);
+        a[[i, i]] += ridge;
     }
-    let (evals, _) = a
-        .eigh(Side::Lower)
+    let (evals, _) = crate::faer_ndarray::FaerEigh::eigh(&a, Side::Lower)
         .map_err(|e| format!("eigh failed while computing logdet: {e}"))?;
-    let floor = ridge_floor.max(1e-14);
+    let floor = ridge.max(1e-14);
     let mut logdet = 0.0;
     for &ev in &evals {
         if ev > floor {
@@ -559,12 +568,17 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
     let final_eval = family.evaluate(&states)?;
     let mut penalty_value = 0.0;
+    // Keep the objective coherent with the stabilized block solves/log-dets:
+    // if we solve with (S_lambda + ridge*I), then the quadratic term must also
+    // include 0.5 * ridge * ||beta||^2 to maintain stationarity consistency.
+    let ridge = effective_solver_ridge(options.ridge_floor);
     for (b, spec) in specs.iter().enumerate() {
         let lambdas = block_log_lambdas[b].mapv(f64::exp);
         for (k, s) in spec.penalties.iter().enumerate() {
             let sb = s.dot(&states[b].beta);
             penalty_value += 0.5 * lambdas[k] * states[b].beta.dot(&sb);
         }
+        penalty_value += 0.5 * ridge * states[b].beta.dot(&states[b].beta);
     }
 
     let (block_logdet_h, block_logdet_s) =
@@ -594,7 +608,8 @@ pub fn fit_custom_family<F: CustomFamily>(
     let rho0 = flatten_log_lambdas(specs);
 
     if rho0.is_empty() {
-        let inner = inner_blockwise_fit(family, specs, &vec![Array1::zeros(0); specs.len()], options)?;
+        let inner =
+            inner_blockwise_fit(family, specs, &vec![Array1::zeros(0); specs.len()], options)?;
         let reml_term = if options.use_reml_objective {
             0.5 * (inner.block_logdet_h - inner.block_logdet_s)
         } else {
@@ -643,8 +658,8 @@ pub fn fit_custom_family<F: CustomFamily>(
         Ok(pair) => pair,
         Err(_) => (f64::INFINITY, Array1::<f64>::zeros(x.len())),
     })
-        .with_tolerance(options.outer_tol)
-        .with_max_iterations(options.outer_max_iter);
+    .with_tolerance(options.outer_tol)
+    .with_max_iterations(options.outer_max_iter);
     let sol = solver
         .run()
         .map_err(|e| format!("outer smoothing optimization failed: {e:?}"))?;
@@ -659,7 +674,8 @@ pub fn fit_custom_family<F: CustomFamily>(
         log_lambdas: rho_star.clone(),
         lambdas: rho_star.mapv(f64::exp),
         penalized_objective: if options.use_reml_objective {
-            -inner.log_likelihood + inner.penalty_value
+            -inner.log_likelihood
+                + inner.penalty_value
                 + 0.5 * (inner.block_logdet_h - inner.block_logdet_s)
         } else {
             -inner.log_likelihood + inner.penalty_value
@@ -668,4 +684,70 @@ pub fn fit_custom_family<F: CustomFamily>(
         inner_cycles: inner.cycles,
         converged: inner.converged,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::matrix::DesignMatrix;
+    use ndarray::{Array1, array};
+
+    #[derive(Clone)]
+    struct OneBlockIdentityFamily;
+
+    impl CustomFamily for OneBlockIdentityFamily {
+        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            let n = block_states[0].eta.len();
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                block_working_sets: vec![BlockWorkingSet {
+                    working_response: Array1::ones(n),
+                    working_weights: Array1::ones(n),
+                    gradient_eta: None,
+                }],
+            })
+        }
+    }
+
+    #[test]
+    fn effective_ridge_is_never_below_solver_floor() {
+        assert!((effective_solver_ridge(0.0) - 1e-15).abs() < 1e-30);
+        assert!((effective_solver_ridge(1e-8) - 1e-8).abs() < 1e-20);
+    }
+
+    #[test]
+    fn objective_includes_solver_ridge_quadratic_term() {
+        // One-parameter block with X=1, y*=1, w=1, no explicit penalties.
+        // Inner solve gives beta = 1 / (1 + ridge), so objective should include
+        // 0.5 * ridge * beta^2 even when no smoothing penalties are present.
+        let spec = ParameterBlockSpec {
+            name: "b0".to_string(),
+            design: DesignMatrix::Dense(array![[1.0]]),
+            offset: array![0.0],
+            penalties: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+        };
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            inner_tol: 0.0,
+            outer_max_iter: 1,
+            outer_tol: 1e-8,
+            min_weight: 1e-12,
+            ridge_floor: 1e-4,
+            use_reml_objective: false,
+        };
+
+        let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
+            .expect("custom family fit should succeed");
+        let ridge = effective_solver_ridge(options.ridge_floor);
+        let beta = result.block_states[0].beta[0];
+        let expected_penalty = 0.5 * ridge * beta * beta;
+        assert!(
+            (result.penalized_objective - expected_penalty).abs() < 1e-12,
+            "penalized objective should equal ridge quadratic term when ll=0 and S=0; got {}, expected {}",
+            result.penalized_objective,
+            expected_penalty
+        );
+    }
 }

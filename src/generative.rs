@@ -36,9 +36,9 @@ impl GenerativeSpec {
         match &self.noise {
             NoiseModel::Gaussian { sigma } => sigma.mapv(|s| s * s),
             NoiseModel::Poisson => self.mean.mapv(|m| m.max(0.0)),
-            NoiseModel::Gamma { shape } => self
-                .mean
-                .mapv(|m| ((m * m) / shape.max(1e-12)).max(0.0)),
+            NoiseModel::Gamma { shape } => {
+                self.mean.mapv(|m| ((m * m) / shape.max(1e-12)).max(0.0))
+            }
             NoiseModel::Bernoulli => self.mean.mapv(|m| (m * (1.0 - m)).max(0.0)),
         }
     }
@@ -126,9 +126,7 @@ pub fn sample_observations<R: rand::Rng + ?Sized>(
             for i in 0..y.len() {
                 let lam = spec.mean[i].max(1e-12);
                 let dist = rand_distr::Poisson::new(lam).map_err(|e| {
-                    EstimationError::InvalidInput(format!(
-                        "invalid Poisson mean at index {i}: {e}"
-                    ))
+                    EstimationError::InvalidInput(format!("invalid Poisson mean at index {i}: {e}"))
                 })?;
                 let draw = rand_distr::Distribution::sample(&dist, rng);
                 y[i] = draw as f64;
@@ -146,9 +144,7 @@ pub fn sample_observations<R: rand::Rng + ?Sized>(
                 let mu = spec.mean[i].max(1e-12);
                 let scale = (mu / *shape).max(1e-12);
                 let dist = rand_distr::Gamma::new(*shape, scale).map_err(|e| {
-                    EstimationError::InvalidInput(format!(
-                        "invalid Gamma params at index {i}: {e}"
-                    ))
+                    EstimationError::InvalidInput(format!("invalid Gamma params at index {i}: {e}"))
                 })?;
                 y[i] = rand_distr::Distribution::sample(&dist, rng);
             }
@@ -192,7 +188,10 @@ pub fn sample_observation_replicates<R: rand::Rng + ?Sized>(
 /// Extension trait for custom multi-block families that provide explicit
 /// generative semantics (mean + observation noise) at a fitted state.
 pub trait CustomFamilyGenerative: CustomFamily {
-    fn generative_spec(&self, block_states: &[ParameterBlockState]) -> Result<GenerativeSpec, String>;
+    fn generative_spec(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<GenerativeSpec, String>;
 }
 
 /// Build custom-family generative spec from a fitted multi-block model.

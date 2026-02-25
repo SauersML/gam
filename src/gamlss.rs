@@ -1,20 +1,20 @@
 use crate::basis::{
-    create_basis, create_difference_penalty_matrix, BasisOptions, Dense, KnotSource,
+    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
 };
 use crate::custom_family::{
-    fit_custom_family, BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily,
-    FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState,
+    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
+    KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::DesignMatrix;
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::LinkFunction;
+use faer::Mat as FaerMat;
+use faer::Side;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
-use faer::Mat as FaerMat;
-use faer::Side;
-use ndarray::{s, Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, s};
 
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
@@ -859,11 +859,7 @@ pub enum ParameterLink {
 
 fn signed_with_floor(v: f64, floor: f64) -> f64 {
     let a = v.abs().max(floor);
-    if v >= 0.0 {
-        a
-    } else {
-        -a
-    }
+    if v >= 0.0 { a } else { -a }
 }
 
 struct BinomialLocationScaleCore {
