@@ -1,0 +1,53 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "benches/**"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "benches/**"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Criterion Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Detect benchmark targets
+        id: benches
+        shell: bash
+        run: |
+          if cargo metadata --no-deps --format-version 1 | jq -e '.packages[].targets[] | select(.kind[] == "bench")' >/dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run benchmarks
+        if: steps.benches.outputs.present == 'true'
+        run: cargo +nightly bench --all-features -- --noplot
+
+      - name: Skip (no benchmark targets yet)
+        if: steps.benches.outputs.present != 'true'
+        run: echo "No [[bench]] targets found. Add benches/ to enable performance CI."
