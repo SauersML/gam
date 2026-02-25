@@ -105,6 +105,8 @@ where
         &Array1<f64>,
     ) -> Result<(f64, Array1<f64>), crate::estimate::EstimationError>,
 {
+    // Default path is exact-gradient-first for survival models.
+    // This avoids repeated inner re-solves required by finite differences.
     let core_opts = crate::estimate::SmoothingBfgsOptions {
         max_iter: options.max_iter,
         tol: options.tol,
@@ -139,6 +141,8 @@ pub fn optimize_survival_lambdas_with_multistart_fd<F>(
 where
     F: Fn(&Array1<f64>) -> Result<f64, crate::estimate::EstimationError>,
 {
+    // Explicit fallback path for callers that only provide V(rho).
+    // Gradient is approximated numerically in estimate.rs.
     let core_opts = crate::estimate::SmoothingBfgsOptions {
         max_iter: options.max_iter,
         tol: options.tol,

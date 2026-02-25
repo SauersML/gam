@@ -378,10 +378,10 @@ impl RemlConfig {
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
-            // External optimization defaults to objective-consistent finite differences for
-            // non-Identity links. This keeps the BFGS search direction aligned with the exact
-            // cost surface being minimized (including all stabilization/truncation/ridge choices),
-            // instead of relying on fragile closed-form LAML derivatives in difficult regimes.
+            // Keep FD as default for external non-Identity links.
+            // The analytic path is faster and now optimized, but external
+            // objective variants can still diverge from the strict assumptions
+            // needed for sign-consistent gradients in all regimes.
             objective_consistent_fd_gradient: true,
         }
     }
@@ -5747,47 +5747,46 @@ pub mod internal {
                                 }
                             }
 
-                            let trace_terms: Vec<f64> = (0..k_count)
-                                .into_par_iter()
-                                .map(|k_idx| {
-                                    let r_k = &rs_transformed[k_idx];
-                                    if r_k.ncols() == 0 || w_pos.ncols() == 0 {
-                                        return 0.0;
-                                    }
+                            // Precompute r = X^T (c ⊙ h) once:
+                            //   trace_third_k = (c ⊙ h)^T (X v_k) = r^T v_k.
+                            // This removes the per-k O(np) multiply X*v_k from the hot loop.
+                            let c_times_h = &c_vec * &leverage_h_pos;
+                            let r_third =
+                                pirls_result.x_transformed.transpose_vector_multiply(&c_times_h);
 
-                                    // First piece derivation:
-                                    //   tr(H_+^† S_k) = tr(H_+^† R_kᵀR_k) = ||R_k W||_F^2
-                                    // when H_+^† = W Wᵀ.
-                                    let rkw = r_k.dot(w_pos);
-                                    let trace_h_inv_s_k: f64 = rkw.iter().map(|v| v * v).sum();
+                            // Batch all v_k = H_+^† (S_k beta) into one BLAS-3 path:
+                            //   V = W (W^T [S_1 beta, ..., S_K beta]).
+                            let mut s_k_beta_mat = Array2::<f64>::zeros((beta_ref.len(), k_count));
+                            for (k_idx, s_k_beta) in s_k_beta_all.iter().enumerate() {
+                                s_k_beta_mat.column_mut(k_idx).assign(s_k_beta);
+                            }
+                            let v_all = if w_pos.ncols() > 0 && k_count > 0 {
+                                let wt_sk_beta_all = w_pos.t().dot(&s_k_beta_mat);
+                                w_pos.dot(&wt_sk_beta_all)
+                            } else {
+                                Array2::<f64>::zeros((beta_ref.len(), k_count))
+                            };
 
-                                    // Second piece derivation (exact dH/dρ_k correction):
-                                    //
-                                    //   H_k = A_k + Xᵀdiag(c ⊙ X B_k)X,
-                                    //   B_k = -H^{-1}(A_k β̂).
-                                    //
-                                    // Here we evaluate the non-penalty part through:
-                                    //   tr(H_+^† Xᵀdiag(c ⊙ X v_k)X)
-                                    // = Σ_i [c_i (Xv_k)_i] * h_i,
-                                    //   h_i = x_iᵀH_+^†x_i.
-                                    //
-                                    // `v_k` uses H_+^†(S_k β̂); λ_k is multiplied outside.
-                                    let s_k_beta = &s_k_beta_all[k_idx];
-                                    let wt_sk_beta = w_pos.t().dot(s_k_beta);
-                                    let v_k = w_pos.dot(&wt_sk_beta);
-                                    let x_v_k =
-                                        pirls_result.x_transformed.matrix_vector_multiply(&v_k);
-                                    let trace_third = kahan_sum(
-                                        c_vec
-                                            .iter()
-                                            .zip(x_v_k.iter())
-                                            .zip(leverage_h_pos.iter())
-                                            .map(|((&c_i, &xv_i), &h_i)| c_i * xv_i * h_i),
-                                    );
+                            let mut trace_terms: Vec<f64> = Vec::with_capacity(k_count);
+                            for k_idx in 0..k_count {
+                                let r_k = &rs_transformed[k_idx];
+                                if r_k.ncols() == 0 || w_pos.ncols() == 0 {
+                                    trace_terms.push(0.0);
+                                    continue;
+                                }
 
-                                    trace_h_inv_s_k - trace_third
-                                })
-                                .collect();
+                                // First piece:
+                                //   tr(H_+^† S_k) = ||R_k W||_F^2, with H_+^† = W W^T.
+                                let rkw = r_k.dot(w_pos);
+                                let trace_h_inv_s_k: f64 = rkw.iter().map(|v| v * v).sum();
+
+                                // Exact third-derivative contraction:
+                                //   tr(H_+^† X^T diag(c ⊙ X v_k) X) = r^T v_k.
+                                let v_k = v_all.column(k_idx);
+                                let trace_third = r_third.dot(&v_k);
+
+                                trace_terms.push(trace_h_inv_s_k - trace_third);
+                            }
 
                             // We do NOT need to set workspace.solved_rows as we aren't using the workspace solver.
                             workspace.solved_rows = 0;

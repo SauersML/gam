@@ -374,38 +374,60 @@ impl WorkingModelSurvival {
         })
     }
 
-    /// Evaluate a Laplace-style survival outer objective and exact rho-gradient
-    /// from a converged inner state without finite-difference outer probes.
+    /// Evaluate the survival outer objective and exact `rho`-gradient at a
+    /// converged inner state.
     ///
-    /// Derivation map (symbols -> code):
-    /// - `rho_k = log(lambda_k)` and `A_k = dS/drho_k = 2 * lambda_k * S_k`.
-    ///   The `2` factor comes from this module's penalty convention, where
-    ///   `penalty_grad = 2 * lambda * S_k * beta`.
-    /// - `V(rho) = f(beta_hat, rho) + 0.5 log|H| - 0.5 log|S|_+`.
-    ///   Here `f` is represented by `0.5 * deviance + penalty_term`, where
-    ///   `penalty_term` includes both configured penalties and the tiny solver
-    ///   stabilization ridge used in `update_state`.
-    /// - `dV/drho_k = 0.5 * beta^T A_k beta
-    ///               + 0.5 * tr(H^{-1} dH/drho_k)
-    ///               - 0.5 * tr(S^+ A_k)`.
-    /// - `tr(H^{-1} dH/drho_k)` is evaluated with a tensor-free contraction:
-    ///   `tr(H^{-1} A_k)` plus third-derivative terms induced by
-    ///   `exp(eta_exit)`, `exp(eta_entry)`, and `log(d^T beta)`.
-    ///   We avoid any explicit `p x p x p` tensor by precomputing:
-    ///   `q1_i = x_exit_i^T H^{-1} x_exit_i`,
-    ///   `q0_i = x_entry_i^T H^{-1} x_entry_i`,
-    ///   `qd_i = d_i^T H^{-1} d_i`.
-    /// Event-log term note:
-    /// - the contribution from `delta_i * log(d_i^T beta)` appears in the
-    ///   third-derivative contraction as:
-    ///   `-2 * (d_i^T u_k) * qd_i / (d_i^T beta)^3` for event rows.
+    /// Objective and notation in this implementation:
+    /// - `rho_k = log(lambda_k)`, `lambda_k = exp(rho_k)`.
+    /// - `S(rho) = sum_k A_k`, where `A_k = dS/drho_k = 2 * lambda_k * S_k`.
+    ///   (Factor `2` matches this module's penalty convention:
+    ///   `penalty_grad = 2 * lambda * S_k * beta`.)
+    /// - `H = X^T W X + S(rho)` from the inner model state.
+    /// - `V(rho) = 0.5*deviance(beta_hat) + penalty_term(beta_hat)
+    ///           + 0.5*log|H| - 0.5*log|S|_+`.
+    ///
+    /// Exact gradient used here (no finite differences):
+    ///   dV/drho_k
+    ///     = 0.5 * beta_hat^T A_k beta_hat
+    ///     + 0.5 * tr(H^{-1} dH/drho_k)
+    ///     - 0.5 * tr(S^+ A_k).
+    ///
+    /// For this Royston-Parmar survival likelihood, the hard part is the
+    /// `tr(H^{-1} dH/drho_k)` contraction. We evaluate it exactly without
+    /// building any 3-tensor:
+    ///   tr(H^{-1} dH/drho_k) = tr(H^{-1} A_k) + third_derivative_contraction.
+    ///
+    /// The contraction is reduced to vector operations with leverage-like
+    /// diagonals:
+    /// - `q1_i = x_exit_i^T H^{-1} x_exit_i`
+    /// - `q0_i = x_entry_i^T H^{-1} x_entry_i`
+    /// - `qd_i = d_i^T H^{-1} d_i`
+    ///
+    /// and `u_k = d beta_hat / d rho_k = -H^{-1} A_k beta_hat`.
+    ///
+    /// Then:
+    /// - `+ sum_i w_i * exp(eta_exit_i)  * (x_exit_i^T u_k) * q1_i`
+    /// - `- sum_i w_i * exp(eta_entry_i) * (x_entry_i^T u_k) * q0_i`
+    /// - `- 2 * sum_events w_i * (d_i^T u_k) * qd_i / (d_i^T beta_hat)^3`
+    ///
+    /// The last term is the exact contribution from differentiating
+    /// `delta_i * log(d_i^T beta)` through the Hessian.
+    ///
+    /// Fast exact trace-contraction implementation details:
+    /// - factorize `H` once,
+    /// - compute `H^{-1}` actions by solves (`solve_vec` / `solve_mat`),
+    /// - compute leverages by solving `H Z = X^T` blocks,
+    /// - avoid explicit dense `H^{-1}` materialization.
+    ///
+    /// Complexity per outer evaluation (dense):
+    /// - shared precompute: `O(np^2 + p^3)`,
+    /// - per penalty block `k`: `O(np + p^2 + nnz(S_k))`.
     ///
     /// Ridge note:
-    /// - `state.penalty_term` includes a tiny stabilization ridge used by the
-    ///   inner solve, so the objective value stays consistent with the solved
-    ///   mode.
-    /// - that ridge is constant w.r.t. `rho`, so it does not contribute to
-    ///   `A_k` or the `-0.5 * tr(S^+ A_k)` pseudo-determinant derivative.
+    /// - `state.penalty_term` includes the tiny stabilization ridge used in the
+    ///   inner solve, so the objective value is consistent with the solved mode.
+    /// - this ridge is constant in `rho`, so it does not enter `A_k` nor
+    ///   `tr(S^+ A_k)`.
     pub fn laml_objective_and_rho_gradient(
         &self,
         beta: &Array1<f64>,
@@ -423,6 +445,8 @@ impl WorkingModelSurvival {
         }
 
         // Reuse one symmetric factorization for all H^{-1} applications.
+        // This is the core speed-up: exact contractions via solves, no dense
+        // inverse assembly.
         let h_view = FaerArrayView::new(&state.hessian);
         let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower)
             .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
@@ -446,8 +470,7 @@ impl WorkingModelSurvival {
         let guard = self.monotonicity.tolerance.max(1e-12);
 
         // Leverage-like diagonals used by the third-derivative contraction:
-        // q_i = x_i^T H^{-1} x_i.
-        // Compute via factor-solve against transposed design blocks (no dense H^{-1} build).
+        // q_i = x_i^T H^{-1} x_i, computed via solves against X^T blocks.
         let z1 = solve_mat(&self.x_exit.t().to_owned());
         let z0 = solve_mat(&self.x_entry.t().to_owned());
         let zd = solve_mat(&self.x_derivative.t().to_owned());
@@ -488,8 +511,11 @@ impl WorkingModelSurvival {
         for j in 0..p {
             let ev = s_eval[j];
             if ev > s_tol {
+                // Positive-eigenspace pseudo-determinant:
+                //   log|S|_+ = sum_{ev_j > tol} log(ev_j)
                 logdet_s += ev.ln();
                 let inv_ev = 1.0 / ev;
+                // Build S^+ = U_+ diag(1/ev_j) U_+^T in-place by rank-1 updates.
                 for r in 0..p {
                     let ur = s_evec[(r, j)];
                     for c in 0..p {
@@ -538,6 +564,8 @@ impl WorkingModelSurvival {
             let sdk = self.x_derivative.dot(&u_k);
 
             // trace(H^{-1} A_k) on block support via solves against block unit vectors.
+            // This is equivalent to Frobenius inner product <H^{-1}, A_k>, but
+            // computed from selected solved columns only.
             let block_dim = r.len();
             let mut block_basis = Array2::<f64>::zeros((p, block_dim));
             for (j_local, j) in r.clone().enumerate() {
@@ -553,7 +581,7 @@ impl WorkingModelSurvival {
                 }
             }
 
-            // Tensor-free contraction of third-derivative terms:
+            // Tensor-free exact third-derivative contraction:
             // + sum_i exp(eta_exit_i)  (x_exit_i^T u_k) q1_i
             // - sum_i exp(eta_entry_i) (x_entry_i^T u_k) q0_i
             // - 2 sum_events (d_i^T u_k) qd_i / (d_i^T beta)^3
@@ -580,6 +608,9 @@ impl WorkingModelSurvival {
                 }
             }
 
+            // Final exact component:
+            // 0.5 * beta^T A_k beta + 0.5 * tr(H^{-1} dH/drho_k) - 0.5 * tr(S^+ A_k),
+            // with tr(H^{-1} dH/drho_k) = trace_hinv_ak + trace_third.
             grad[k] = 0.5 * beta.dot(&a_k_beta) + 0.5 * t_k - 0.5 * p_k;
         }
 
