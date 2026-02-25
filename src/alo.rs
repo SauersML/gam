@@ -90,7 +90,8 @@ fn compute_alo_diagnostics_from_pirls_impl(
     link: LinkFunction,
     options: AloOptions,
 ) -> Result<AloDiagnostics, EstimationError> {
-    let x_dense = base.x_transformed.to_dense();
+    let x_dense_arc = base.x_transformed.to_dense_arc();
+    let x_dense = x_dense_arc.as_ref();
     let n = x_dense.nrows();
 
     let w = &base.final_weights;

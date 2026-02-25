@@ -1,5 +1,6 @@
 use crate::basis::{
-    BSplineBasisSpec, BasisBuildResult, BasisError, BasisMetadata, DuchonBasisSpec,
+    BSplineBasisSpec, BSplineIdentifiability, BasisBuildResult, BasisError, BasisMetadata,
+    DuchonBasisSpec,
     MaternBasisSpec, ThinPlateBasisSpec, build_bspline_basis_1d, build_duchon_basis,
     build_matern_basis, build_thin_plate_basis, create_bspline_basis_nd_with_knots,
 };
@@ -208,7 +209,13 @@ fn build_tensor_bspline_basis(
     // Reuse the robust 1D builder to ensure the same knot validation and
     // marginal difference-penalty construction as standalone smooth terms.
     for (dim, (&col, marginal_spec)) in feature_cols.iter().zip(spec.marginal_specs.iter()).enumerate() {
-        let built = build_bspline_basis_1d(data.column(col), marginal_spec)?;
+        // Tensor basis uses raw marginal knot-product columns. Applying 1D
+        // identifiability constraints here would change marginal penalty sizes
+        // without changing the tensor design construction, causing dimension
+        // mismatch. Keep marginal builders unconstrained at this stage.
+        let mut marginal_unconstrained = marginal_spec.clone();
+        marginal_unconstrained.identifiability = BSplineIdentifiability::None;
+        let built = build_bspline_basis_1d(data.column(col), &marginal_unconstrained)?;
         let knots = match built.metadata {
             BasisMetadata::BSpline1D { knots } => knots,
             _ => {
@@ -621,8 +628,8 @@ pub fn fit_term_collection(
 mod tests {
     use super::*;
     use crate::basis::{
-        BSplineKnotSpec, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec,
-        MaternNu, ThinPlateBasisSpec,
+        BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
+        DuchonNullspaceOrder, MaternBasisSpec, MaternNu, ThinPlateBasisSpec,
     };
     use ndarray::array;
 
@@ -650,6 +657,7 @@ mod tests {
                             num_internal_knots: 4,
                         },
                         double_penalty: true,
+                        identifiability: BSplineIdentifiability::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -884,6 +892,7 @@ mod tests {
                 num_internal_knots: 3,
             },
             double_penalty: false,
+            identifiability: BSplineIdentifiability::default(),
         };
         let spec_y = BSplineBasisSpec {
             degree: 3,
@@ -893,6 +902,7 @@ mod tests {
                 num_internal_knots: 2,
             },
             double_penalty: false,
+            identifiability: BSplineIdentifiability::default(),
         };
 
         let terms = vec![SmoothTermSpec {

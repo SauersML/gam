@@ -31,12 +31,13 @@ pub use alo::{
     compute_alo_diagnostics_with_options,
 };
 pub use basis::{
-    BSplineBasisSpec, BSplineKnotPlacement, BSplineKnotSpec, BasisBuildResult, BasisMetadata,
-    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonSplineBasis, MaternBasisSpec,
-    MaternNu, MaternSplineBasis, ThinPlateBasisSpec, ThinPlateSplineBasis, build_bspline_basis_1d,
-    build_duchon_basis, build_matern_basis, build_thin_plate_basis, create_duchon_spline_basis,
-    create_matern_spline_basis, create_thin_plate_spline_basis,
-    create_thin_plate_spline_basis_with_knot_count, select_thin_plate_knots,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
+    BasisBuildResult, BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
+    DuchonSplineBasis, MaternBasisSpec, MaternNu, MaternSplineBasis, ThinPlateBasisSpec,
+    ThinPlateSplineBasis, build_bspline_basis_1d, build_duchon_basis, build_matern_basis,
+    build_thin_plate_basis, create_duchon_spline_basis, create_matern_spline_basis,
+    create_thin_plate_spline_basis, create_thin_plate_spline_basis_with_knot_count,
+    select_thin_plate_knots,
 };
 pub use custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,

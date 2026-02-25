@@ -1406,6 +1406,37 @@ pub struct BSplineBasisSpec {
     pub penalty_order: usize,
     pub knot_spec: BSplineKnotSpec,
     pub double_penalty: bool,
+    pub identifiability: BSplineIdentifiability,
+}
+
+/// Per-smooth identifiability policy for 1D B-spline bases.
+///
+/// These constraints are applied directly in the builder via a reparameterization
+/// `B_constrained = B * Z`, and every penalty matrix is projected as
+/// `S_constrained = Z' S Z`, so solver geometry stays consistent.
+#[derive(Debug, Clone)]
+pub enum BSplineIdentifiability {
+    /// Keep unconstrained basis columns.
+    None,
+    /// Enforce weighted sum-to-zero: `B' w = 0` (or unweighted when `weights=None`).
+    WeightedSumToZero { weights: Option<Array1<f64>> },
+    /// Remove intercept + linear trend in coefficient space using Greville geometry.
+    RemoveLinearTrend,
+    /// Enforce orthogonality to supplied design columns `C` (n x q):
+    /// `B_c' W C = 0` (or unweighted when `weights=None`).
+    ///
+    /// To enforce `[intercept, x, ...]`, provide `columns` with those columns.
+    OrthogonalToDesignColumns {
+        columns: Array2<f64>,
+        weights: Option<Array1<f64>>,
+    },
+}
+
+impl Default for BSplineIdentifiability {
+    fn default() -> Self {
+        // Smooth terms should be centered by default to avoid intercept confounding.
+        Self::WeightedSumToZero { weights: None }
+    }
 }
 
 /// Thin-plate center selection strategy.
@@ -1813,14 +1844,30 @@ pub fn build_bspline_basis_1d(
             )?
         }
     };
-    let design = (*basis).clone();
-    let p = design.ncols();
-    let s_bend = create_difference_penalty_matrix(p, spec.penalty_order, None)?;
-    let mut penalties = vec![s_bend];
-    let mut nullspace_dims = vec![spec.penalty_order];
+    let design_raw = (*basis).clone();
+    let p_raw = design_raw.ncols();
+    let s_bend_raw = create_difference_penalty_matrix(p_raw, spec.penalty_order, None)?;
+    let mut penalties_raw = vec![s_bend_raw];
     if spec.double_penalty {
-        penalties.push(Array2::<f64>::eye(p));
-        nullspace_dims.push(0);
+        penalties_raw.push(Array2::<f64>::eye(p_raw));
+    }
+
+    let (design, penalties) = apply_bspline_identifiability_policy(
+        design_raw,
+        penalties_raw,
+        &knots,
+        spec.degree,
+        &spec.identifiability,
+    )?;
+    let nullspace_dims = penalties
+        .iter()
+        .map(estimate_penalty_nullity)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if penalties.len() != nullspace_dims.len() {
+        return Err(BasisError::InvalidInput(
+            "penalty/nullspace dimension mismatch after identifiability transform".to_string(),
+        ));
     }
     Ok(BasisBuildResult {
         design,
@@ -1828,6 +1875,76 @@ pub fn build_bspline_basis_1d(
         nullspace_dims,
         metadata: BasisMetadata::BSpline1D { knots },
     })
+}
+
+fn apply_bspline_identifiability_policy(
+    design: Array2<f64>,
+    penalties: Vec<Array2<f64>>,
+    knots: &Array1<f64>,
+    degree: usize,
+    identifiability: &BSplineIdentifiability,
+) -> Result<(Array2<f64>, Vec<Array2<f64>>), BasisError> {
+    let (design_c, z_opt): (Array2<f64>, Option<Array2<f64>>) = match identifiability {
+        BSplineIdentifiability::None => (design, None),
+        BSplineIdentifiability::WeightedSumToZero { weights } => {
+            let (b_c, z) = apply_sum_to_zero_constraint(design.view(), weights.as_ref().map(|w| w.view()))?;
+            (b_c, Some(z))
+        }
+        BSplineIdentifiability::RemoveLinearTrend => {
+            let (z, _s_constrained) = compute_geometric_constraint_transform(knots, degree, 2)?;
+            (design.dot(&z), Some(z))
+        }
+        BSplineIdentifiability::OrthogonalToDesignColumns { columns, weights } => {
+            let (b_c, z) = apply_weighted_orthogonality_constraint(
+                design.view(),
+                columns.view(),
+                weights.as_ref().map(|w| w.view()),
+            )?;
+            (b_c, Some(z))
+        }
+    };
+
+    let penalties_c = if let Some(z) = z_opt {
+        penalties
+            .into_iter()
+            .map(|s| {
+                let zt_s = fast_atb(&z, &s);
+                fast_ab(&zt_s, &z)
+            })
+            .collect()
+    } else {
+        penalties
+    };
+
+    Ok((design_c, penalties_c))
+}
+
+fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, BasisError> {
+    if penalty.nrows() != penalty.ncols() {
+        return Err(BasisError::DimensionMismatch(
+            "penalty matrix must be square when estimating nullspace".to_string(),
+        ));
+    }
+    if penalty.nrows() == 0 {
+        return Ok(0);
+    }
+
+    let mut sym = penalty.clone();
+    for i in 0..sym.nrows() {
+        for j in 0..i {
+            let v = 0.5 * (sym[[i, j]] + sym[[j, i]]);
+            sym[[i, j]] = v;
+            sym[[j, i]] = v;
+        }
+    }
+
+    let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+    let max_ev = evals
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let tol = (sym.nrows().max(1) as f64) * 1e-10 * max_ev.max(1.0);
+    Ok(evals.iter().filter(|&&ev| ev.abs() <= tol).count())
 }
 
 fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {
@@ -4314,10 +4431,13 @@ mod tests {
                 num_internal_knots: 6,
             },
             double_penalty: true,
+            identifiability: BSplineIdentifiability::default(),
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         assert_eq!(result.penalties.len(), 2);
-        assert_eq!(result.nullspace_dims, vec![2, 0]);
+        // Default identifiability centers the smooth, removing one null-space
+        // dimension from the raw second-difference penalty.
+        assert_eq!(result.nullspace_dims, vec![1, 0]);
         assert_eq!(result.design.nrows(), x.len());
     }
 
@@ -4332,6 +4452,7 @@ mod tests {
                 placement: BSplineKnotPlacement::Uniform,
             },
             double_penalty: false,
+            identifiability: BSplineIdentifiability::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -4355,6 +4476,7 @@ mod tests {
                 placement: BSplineKnotPlacement::Quantile,
             },
             double_penalty: false,
+            identifiability: BSplineIdentifiability::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -4370,6 +4492,87 @@ mod tests {
             (d1 - d2).abs() > 1e-6,
             "quantile spacing should be non-uniform for skewed data"
         );
+    }
+
+    #[test]
+    fn test_bspline_identifiability_default_weighted_sum_to_zero() {
+        let x = Array::linspace(0.0, 1.0, 40);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 5,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::default(),
+        };
+
+        let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        for j in 0..built.design.ncols() {
+            let col_sum = built.design.column(j).sum();
+            assert!(
+                col_sum.abs() < 1e-8,
+                "default weighted-sum-to-zero failed for column {j}: {col_sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bspline_identifiability_remove_linear_trend_reduces_two_dims() {
+        let x = Array::linspace(0.0, 1.0, 50);
+        let raw = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 6,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+        };
+        let constrained = BSplineBasisSpec {
+            identifiability: BSplineIdentifiability::RemoveLinearTrend,
+            ..raw.clone()
+        };
+
+        let b_raw = build_bspline_basis_1d(x.view(), &raw).unwrap();
+        let b_constrained = build_bspline_basis_1d(x.view(), &constrained).unwrap();
+        assert_eq!(b_constrained.design.ncols() + 2, b_raw.design.ncols());
+    }
+
+    #[test]
+    fn test_bspline_identifiability_orthogonal_to_design_columns() {
+        let x = Array::linspace(0.0, 1.0, 40);
+        let mut constraints = Array2::<f64>::zeros((x.len(), 2));
+        constraints.column_mut(0).fill(1.0);
+        constraints.column_mut(1).assign(&x);
+
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 5,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::OrthogonalToDesignColumns {
+                columns: constraints.clone(),
+                weights: None,
+            },
+        };
+
+        let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        let cross = built.design.t().dot(&constraints);
+        for i in 0..cross.nrows() {
+            for j in 0..cross.ncols() {
+                assert!(
+                    cross[[i, j]].abs() < 1e-8,
+                    "orthogonality violation at ({i},{j}) = {}",
+                    cross[[i, j]]
+                );
+            }
+        }
     }
 
     #[test]
