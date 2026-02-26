@@ -1343,7 +1343,18 @@ where
                         if loop_lambda > 1e12 {
                             // Exhausted attempts
                             if attempts > 30 {
-                                status = PirlsStatus::StalledAtValidMinimum;
+                                let state_grad_norm =
+                                    state.gradient.dot(&state.gradient).sqrt();
+                                last_gradient_norm = state_grad_norm;
+                                // Only accept "stalled but valid" when we are near stationarity.
+                                // Otherwise report MaxIterationsReached so callers can fail fast.
+                                if state_grad_norm
+                                    <= options.convergence_tolerance.max(1e-6) * 10.0
+                                {
+                                    status = PirlsStatus::StalledAtValidMinimum;
+                                } else {
+                                    status = PirlsStatus::MaxIterationsReached;
+                                }
                                 // Preserve the structural ridge from the model state.
                                 final_state = Some(state.clone());
                                 break 'pirls_loop;
@@ -1964,10 +1975,14 @@ pub fn fit_model_for_fixed_rho<'a>(
         let dev_scale = working_summary.state.deviance.abs().max(1.0);
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
-        if working_summary.last_deviance_change.abs() <= dev_tol
-            || working_summary.last_step_size <= step_floor
+        let grad_ok = working_summary.last_gradient_norm
+            <= options.convergence_tolerance.max(1e-6) * 10.0;
+        if (working_summary.last_deviance_change.abs() <= dev_tol
+            || working_summary.last_step_size <= step_floor)
+            && grad_ok
         {
             // Treat as a stalled but usable minimum when progress has effectively stopped.
+            // Require near-stationarity to keep envelope diagnostics meaningful.
             status = PirlsStatus::StalledAtValidMinimum;
             working_summary.status = status.clone();
         }
@@ -1976,11 +1991,15 @@ pub fn fit_model_for_fixed_rho<'a>(
         let dev_scale = working_summary.state.deviance.abs().max(1.0);
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
-        if working_summary.last_deviance_change.abs() <= dev_tol
-            || working_summary.last_step_size <= step_floor
+        let grad_ok = working_summary.last_gradient_norm
+            <= options.convergence_tolerance.max(1e-6) * 10.0;
+        if (working_summary.last_deviance_change.abs() <= dev_tol
+            || working_summary.last_step_size <= step_floor)
+            && grad_ok
         {
             // Firth-adjusted fits can stall; accept when the objective stops changing
             // or steps have shrunk to the minimum scale.
+            // Keep the same near-stationarity guard as the non-Firth path.
             status = PirlsStatus::StalledAtValidMinimum;
             working_summary.status = status.clone();
         }
@@ -2304,7 +2323,7 @@ fn resolve_pirls_family(
     }
 }
 
-/// Engine-facing PIRLS entrypoint that avoids legacy layout coupling.
+/// Engine-facing PIRLS entrypoint with the canonical layout contract.
 pub fn run_pirls<'a>(
     rho: LogSmoothingParamsView<'_>,
     x: ArrayView2<'a, f64>,

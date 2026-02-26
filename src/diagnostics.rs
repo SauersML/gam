@@ -356,25 +356,22 @@ impl GradientDiagnosticReport {
 /// significant and the gradient will be wrong.
 ///
 /// # Arguments
-/// * `penalty_gradient` - The penalty gradient S_λ β
+/// * `kkt_residual_norm` - Norm of the full inner gradient ||∇_β L|| at the PIRLS solution
+/// * `reference_gradient` - Reference gradient scale (typically S_λ β) for relative normalization
 /// * `ridge_used` - Ridge added by PIRLS for stabilization
 /// * `beta` - Current coefficient estimate
 /// * `tolerance` - Threshold for flagging violations
 pub fn compute_envelope_audit(
-    penalty_gradient: &Array1<f64>,
+    kkt_residual_norm: f64,
+    reference_gradient: &Array1<f64>,
     ridge_used: f64,
     ridge_assumed: f64,
     beta: &Array1<f64>,
     abs_tolerance: f64,
     rel_tolerance: f64,
 ) -> EnvelopeAudit {
-    let mut kkt_residual = penalty_gradient.clone();
-    if ridge_used > 0.0 {
-        kkt_residual = &kkt_residual - &beta.mapv(|b| ridge_used * b);
-    }
-
-    let kkt_norm = kkt_residual.dot(&kkt_residual).sqrt();
-    let penalty_norm = penalty_gradient.dot(penalty_gradient).sqrt();
+    let kkt_norm = kkt_residual_norm;
+    let penalty_norm = reference_gradient.dot(reference_gradient).sqrt();
     let beta_norm = beta.dot(beta).sqrt();
     let scale = penalty_norm.max((ridge_assumed.abs() * beta_norm).max(1e-12));
     let rel_kkt = if scale > 0.0 { kkt_norm / scale } else { 0.0 };
@@ -742,9 +739,9 @@ mod tests {
 
     #[test]
     fn test_envelope_audit_no_violation() {
-        let penalty = arr1(&[0.0, 0.0, 0.0]);
+        let reference = arr1(&[0.0, 0.0, 0.0]);
         let beta = arr1(&[0.1, 0.2, 0.3]);
-        let result = compute_envelope_audit(&penalty, 0.0, 0.0, &beta, 1e-8, 1e-6);
+        let result = compute_envelope_audit(0.0, &reference, 0.0, 0.0, &beta, 1e-8, 1e-6);
 
         assert!(!result.is_violated);
         assert!(result.kkt_residual_norm < 1e-10);
@@ -752,9 +749,9 @@ mod tests {
 
     #[test]
     fn test_envelope_audit_ridge_mismatch() {
-        let penalty = arr1(&[0.9, 1.9, 2.9]);
+        let reference = arr1(&[0.9, 1.9, 2.9]);
         let beta = arr1(&[1.0, 1.0, 1.0]);
-        let result = compute_envelope_audit(&penalty, 0.1, 0.0, &beta, 1e-8, 1e-6);
+        let result = compute_envelope_audit(1e-10, &reference, 0.1, 0.0, &beta, 1e-8, 1e-6);
 
         // PIRLS used ridge 0.1, but gradient assumes 0.0
         assert!(result.is_violated);
