@@ -57,6 +57,22 @@ pub struct SurvivalEngineInputs<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub struct SurvivalBaselineOffsets<'a> {
+    /// Baseline target contribution to eta at entry time: eta_target(t_entry).
+    pub eta_entry: ArrayView1<'a, f64>,
+    /// Baseline target contribution to eta at exit time: eta_target(t_exit).
+    pub eta_exit: ArrayView1<'a, f64>,
+    /// Baseline target contribution to d eta / d t at exit: eta_target'(t_exit).
+    ///
+    /// This is used in event terms where log-hazard requires
+    /// log(d eta / d t). By threading this as an explicit offset, we get
+    /// "parametric default + spline deviation" behavior:
+    /// - strong penalty => deviation ~ 0 => model collapses to baseline target,
+    /// - weak penalty   => deviation can bend away where data supports it.
+    pub derivative_exit: ArrayView1<'a, f64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct PenaltyBlock {
     pub matrix: Array2<f64>,
     pub lambda: f64,
@@ -141,6 +157,9 @@ pub struct WorkingModelSurvival {
     x_entry: Array2<f64>,
     x_exit: Array2<f64>,
     x_derivative: Array2<f64>,
+    offset_eta_entry: Array1<f64>,
+    offset_eta_exit: Array1<f64>,
+    offset_derivative_exit: Array1<f64>,
     penalties: PenaltyBlocks,
     monotonicity: MonotonicityPenalty,
     spec: SurvivalSpec,
@@ -153,6 +172,24 @@ impl WorkingModelSurvival {
         monotonicity: MonotonicityPenalty,
         spec: SurvivalSpec,
     ) -> Result<Self, SurvivalError> {
+        Self::from_engine_inputs_with_offsets(inputs, None, penalties, monotonicity, spec)
+    }
+
+    pub fn from_engine_inputs_with_offsets(
+        inputs: SurvivalEngineInputs<'_>,
+        offsets: Option<SurvivalBaselineOffsets<'_>>,
+        penalties: PenaltyBlocks,
+        monotonicity: MonotonicityPenalty,
+        spec: SurvivalSpec,
+    ) -> Result<Self, SurvivalError> {
+        // This constructor is the engine-level hook for transformation-model style
+        // baselines:
+        //   eta(t, x) = eta_target(t) + eta_deviation(t, x).
+        //
+        // Existing design matrices continue to represent eta_deviation. Offsets
+        // inject eta_target and its derivative. This keeps identifiability and
+        // allows REML-selected penalties to control how far we depart from the
+        // target in sparse-vs-rich data regimes.
         let n = inputs.age_entry.len();
         if inputs.age_exit.len() != n
             || inputs.event_target.len() != n
@@ -180,6 +217,31 @@ impl WorkingModelSurvival {
             return Err(SurvivalError::NonFiniteInput);
         }
 
+        let (offset_eta_entry, offset_eta_exit, offset_derivative_exit) = if let Some(off) = offsets
+        {
+            if off.eta_entry.len() != n || off.eta_exit.len() != n || off.derivative_exit.len() != n
+            {
+                return Err(SurvivalError::DimensionMismatch);
+            }
+            if off.eta_entry.iter().any(|v| !v.is_finite())
+                || off.eta_exit.iter().any(|v| !v.is_finite())
+                || off.derivative_exit.iter().any(|v| !v.is_finite())
+            {
+                return Err(SurvivalError::NonFiniteInput);
+            }
+            (
+                off.eta_entry.to_owned(),
+                off.eta_exit.to_owned(),
+                off.derivative_exit.to_owned(),
+            )
+        } else {
+            (
+                Array1::zeros(n),
+                Array1::zeros(n),
+                Array1::zeros(n),
+            )
+        };
+
         Ok(Self {
             age_entry: inputs.age_entry.to_owned(),
             age_exit: inputs.age_exit.to_owned(),
@@ -189,6 +251,9 @@ impl WorkingModelSurvival {
             x_entry: inputs.x_entry.to_owned(),
             x_exit: inputs.x_exit.to_owned(),
             x_derivative: inputs.x_derivative.to_owned(),
+            offset_eta_entry,
+            offset_eta_exit,
+            offset_derivative_exit,
             penalties,
             monotonicity,
             spec,
@@ -223,9 +288,12 @@ impl WorkingModelSurvival {
         //            + delta_i * (d_i d_i^T) / s_i^2.
         //
         // The loop below computes those terms directly, then adds penalties.
-        let eta_entry = self.x_entry.dot(beta);
-        let eta_exit = self.x_exit.dot(beta);
-        let derivative_raw = self.x_derivative.dot(beta);
+        // Total predictor = target offset + learned deviation.
+        // This is the same architecture used for flexible binary links:
+        // principled default, plus penalized wiggle/deviation.
+        let eta_entry = self.x_entry.dot(beta) + &self.offset_eta_entry;
+        let eta_exit = self.x_exit.dot(beta) + &self.offset_eta_exit;
+        let derivative_raw = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
 
         let h_entry = eta_entry.mapv(f64::exp);
         let h_exit = eta_exit.mapv(f64::exp);
@@ -864,5 +932,73 @@ mod tests {
                 grad[idx]
             );
         }
+    }
+
+    #[test]
+    fn zero_offsets_match_default_survival_state() {
+        let age_entry = array![1.0_f64, 2.0_f64];
+        let age_exit = array![2.0_f64, 3.5_f64];
+        let event_target = array![1u8, 0u8];
+        let event_competing = array![0u8, 0u8];
+        let sample_weight = array![1.0, 1.0];
+        let x_entry = array![[1.0, age_entry[0].ln()], [1.0, age_entry[1].ln()]];
+        let x_exit = array![[1.0, age_exit[0].ln()], [1.0, age_exit[1].ln()]];
+        let x_derivative = array![[0.0, 1.0 / age_exit[0]], [0.0, 1.0 / age_exit[1]]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 1e-8,
+        };
+        let beta = array![-1.0, 0.8];
+
+        let base = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties.clone(),
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct base survival model");
+
+        let zero_offsets = WorkingModelSurvival::from_engine_inputs_with_offsets(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            Some(SurvivalBaselineOffsets {
+                eta_entry: array![0.0, 0.0].view(),
+                eta_exit: array![0.0, 0.0].view(),
+                derivative_exit: array![0.0, 0.0].view(),
+            }),
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct offset survival model");
+
+        let state_base = base.update_state(&beta).expect("base state");
+        let state_zero = zero_offsets.update_state(&beta).expect("zero-offset state");
+        assert!((state_base.deviance - state_zero.deviance).abs() < 1e-12);
+        assert!(
+            state_base
+                .gradient
+                .iter()
+                .zip(state_zero.gradient.iter())
+                .all(|(a, b)| (a - b).abs() < 1e-12)
+        );
     }
 }

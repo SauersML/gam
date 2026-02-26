@@ -1,5 +1,6 @@
 use crate::survival::{
-    MonotonicityPenalty, PenaltyBlocks, SurvivalEngineInputs, SurvivalSpec, WorkingModelSurvival,
+    MonotonicityPenalty, PenaltyBlocks, SurvivalBaselineOffsets, SurvivalEngineInputs,
+    SurvivalSpec, WorkingModelSurvival,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -13,6 +14,9 @@ pub struct RoystonParmarInputs<'a> {
     pub x_entry: ArrayView2<'a, f64>,
     pub x_exit: ArrayView2<'a, f64>,
     pub x_derivative: ArrayView2<'a, f64>,
+    pub eta_offset_entry: Option<ArrayView1<'a, f64>>,
+    pub eta_offset_exit: Option<ArrayView1<'a, f64>>,
+    pub derivative_offset_exit: Option<ArrayView1<'a, f64>>,
 }
 
 /// Build an engine survival working model from flattened arrays.
@@ -22,7 +26,23 @@ pub fn working_model_from_flattened(
     spec: SurvivalSpec,
     inputs: RoystonParmarInputs<'_>,
 ) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {
-    WorkingModelSurvival::from_engine_inputs(
+    let offsets = match (
+        inputs.eta_offset_entry,
+        inputs.eta_offset_exit,
+        inputs.derivative_offset_exit,
+    ) {
+        (Some(eta_entry), Some(eta_exit), Some(derivative_exit)) => Some(SurvivalBaselineOffsets {
+            eta_entry,
+            eta_exit,
+            derivative_exit,
+        }),
+        (None, None, None) => None,
+        _ => {
+            return Err(crate::survival::SurvivalError::DimensionMismatch);
+        }
+    };
+
+    WorkingModelSurvival::from_engine_inputs_with_offsets(
         SurvivalEngineInputs {
             age_entry: inputs.age_entry,
             age_exit: inputs.age_exit,
@@ -33,6 +53,7 @@ pub fn working_model_from_flattened(
             x_exit: inputs.x_exit,
             x_derivative: inputs.x_derivative,
         },
+        offsets,
         penalties,
         monotonicity,
         spec,

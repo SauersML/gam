@@ -11,14 +11,18 @@ use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, MaternBasisSpec, MaternNu, ThinPlateBasisSpec,
+    build_bspline_basis_1d, evaluate_bspline_derivative_scalar,
 };
 use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, fit_gam,
     optimize_external_design, predict_gam,
 };
 use gam::gamlss::{
-    BinomialLocationScaleProbitSpec, GaussianLocationScaleSpec, ParameterBlockInput,
-    fit_binomial_location_scale_probit, fit_gaussian_location_scale,
+    BinomialLocationScaleProbitSpec, BinomialLocationScaleProbitWiggleSpec,
+    GaussianLocationScaleSpec, ParameterBlockInput, WiggleBlockConfig,
+    build_wiggle_block_input_from_knots, build_wiggle_block_input_from_seed,
+    fit_binomial_location_scale_probit, fit_binomial_location_scale_probit_wiggle,
+    fit_gaussian_location_scale,
 };
 use gam::generative::{generative_spec_from_predict, sample_observation_replicates};
 use gam::hmc::{FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family};
@@ -81,6 +85,16 @@ struct FitArgs {
     flexible_link: bool,
     #[arg(long = "firth", default_value_t = false)]
     firth: bool,
+    #[arg(long = "learn-link-wiggle", default_value_t = false)]
+    learn_link_wiggle: bool,
+    #[arg(long = "link-wiggle-degree", default_value_t = 3)]
+    link_wiggle_degree: usize,
+    #[arg(long = "link-wiggle-internal-knots", default_value_t = 7)]
+    link_wiggle_internal_knots: usize,
+    #[arg(long = "link-wiggle-penalty-order", default_value_t = 2)]
+    link_wiggle_penalty_order: usize,
+    #[arg(long = "link-wiggle-double-penalty", default_value_t = false)]
+    link_wiggle_double_penalty: bool,
     #[arg(long = "out")]
     out: Option<PathBuf>,
 }
@@ -114,6 +128,26 @@ struct SurvivalArgs {
     monotonicity_lambda: f64,
     #[arg(long = "spec", default_value = "net")]
     spec: String,
+    #[arg(long = "survival-likelihood", default_value = "transformation")]
+    survival_likelihood: String,
+    #[arg(long = "baseline-target", default_value = "linear")]
+    baseline_target: String,
+    #[arg(long = "baseline-scale")]
+    baseline_scale: Option<f64>,
+    #[arg(long = "baseline-shape")]
+    baseline_shape: Option<f64>,
+    #[arg(long = "baseline-rate")]
+    baseline_rate: Option<f64>,
+    #[arg(long = "time-basis", default_value = "linear")]
+    time_basis: String,
+    #[arg(long = "time-degree", default_value_t = 3)]
+    time_degree: usize,
+    #[arg(long = "time-num-internal-knots", default_value_t = 8)]
+    time_num_internal_knots: usize,
+    #[arg(long = "time-smooth-lambda", default_value_t = 1e-2)]
+    time_smooth_lambda: f64,
+    #[arg(long = "ridge-lambda", default_value_t = 1e-4)]
+    ridge_lambda: f64,
     #[arg(long = "out")]
     out: Option<PathBuf>,
 }
@@ -192,6 +226,12 @@ struct SavedModel {
     #[serde(default)]
     joint_ridge_used: Option<f64>,
     #[serde(default)]
+    probit_wiggle_knots: Option<Vec<f64>>,
+    #[serde(default)]
+    probit_wiggle_degree: Option<usize>,
+    #[serde(default)]
+    beta_wiggle: Option<Vec<f64>>,
+    #[serde(default)]
     survival_entry: Option<String>,
     #[serde(default)]
     survival_exit: Option<String>,
@@ -201,6 +241,26 @@ struct SavedModel {
     survival_spec: Option<String>,
     #[serde(default)]
     survival_monotonicity_lambda: Option<f64>,
+    #[serde(default)]
+    survival_baseline_target: Option<String>,
+    #[serde(default)]
+    survival_baseline_scale: Option<f64>,
+    #[serde(default)]
+    survival_baseline_shape: Option<f64>,
+    #[serde(default)]
+    survival_baseline_rate: Option<f64>,
+    #[serde(default)]
+    survival_time_basis: Option<String>,
+    #[serde(default)]
+    survival_time_degree: Option<usize>,
+    #[serde(default)]
+    survival_time_knots: Option<Vec<f64>>,
+    #[serde(default)]
+    survival_time_smooth_lambda: Option<f64>,
+    #[serde(default)]
+    survival_ridge_lambda: Option<f64>,
+    #[serde(default)]
+    survival_likelihood: Option<String>,
     fit_max_iter: usize,
     fit_tol: f64,
     beta: Vec<f64>,
@@ -323,6 +383,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             "--firth is not supported with --predict-noise location-scale fitting".to_string(),
         );
     }
+    if args.learn_link_wiggle && args.predict_noise.is_none() {
+        return Err(
+            "--learn-link-wiggle currently requires --predict-noise with binomial-probit location-scale fitting"
+                .to_string(),
+        );
+    }
     if args.firth && effective_link != LinkFunction::Logit {
         return Err("--firth requires logit link".to_string());
     }
@@ -405,31 +471,76 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         let sigma_max = 20.0;
         let score = Array1::<f64>::zeros(y.len());
         let options = gam::BlockwiseFitOptions::default();
-        let fit = fit_binomial_location_scale_probit(
-            BinomialLocationScaleProbitSpec {
-                y: y.clone(),
-                score,
-                weights: Array1::ones(y.len()),
-                sigma_min,
-                sigma_max,
-                threshold_block: ParameterBlockInput {
-                    design: DesignMatrix::Dense(mean_design.design.clone()),
-                    offset: Array1::zeros(y.len()),
-                    penalties: mean_design.penalties.clone(),
-                    initial_log_lambdas: None,
-                    initial_beta: None,
-                },
-                log_sigma_block: ParameterBlockInput {
-                    design: DesignMatrix::Dense(noise_design.design.clone()),
-                    offset: Array1::zeros(y.len()),
-                    penalties: noise_design.penalties.clone(),
-                    initial_log_lambdas: None,
-                    initial_beta: None,
-                },
-            },
-            &options,
-        )
-        .map_err(|e| format!("fit_binomial_location_scale_probit failed: {e}"))?;
+        let threshold_block = ParameterBlockInput {
+            design: DesignMatrix::Dense(mean_design.design.clone()),
+            offset: Array1::zeros(y.len()),
+            penalties: mean_design.penalties.clone(),
+            initial_log_lambdas: None,
+            initial_beta: None,
+        };
+        let log_sigma_block = ParameterBlockInput {
+            design: DesignMatrix::Dense(noise_design.design.clone()),
+            offset: Array1::zeros(y.len()),
+            penalties: noise_design.penalties.clone(),
+            initial_log_lambdas: None,
+            initial_beta: None,
+        };
+
+        let (fit, wiggle_meta): (gam::BlockwiseFitResult, Option<(Array1<f64>, usize, Vec<f64>)>) =
+            if args.learn_link_wiggle {
+                if args.link_wiggle_degree < 1 {
+                    return Err("--link-wiggle-degree must be >= 1".to_string());
+                }
+                if args.link_wiggle_internal_knots == 0 {
+                    return Err("--link-wiggle-internal-knots must be > 0".to_string());
+                }
+                let cfg = WiggleBlockConfig {
+                    degree: args.link_wiggle_degree,
+                    num_internal_knots: args.link_wiggle_internal_knots,
+                    penalty_order: args.link_wiggle_penalty_order,
+                    double_penalty: args.link_wiggle_double_penalty,
+                };
+                let (wiggle_block, wiggle_knots) =
+                    build_wiggle_block_input_from_seed(score.view(), &cfg)
+                        .map_err(|e| format!("failed to build link wiggle block: {e}"))?;
+                let fit = fit_binomial_location_scale_probit_wiggle(
+                    BinomialLocationScaleProbitWiggleSpec {
+                        y: y.clone(),
+                        score: score.clone(),
+                        weights: Array1::ones(y.len()),
+                        sigma_min,
+                        sigma_max,
+                        wiggle_knots: wiggle_knots.clone(),
+                        wiggle_degree: cfg.degree,
+                        threshold_block,
+                        log_sigma_block,
+                        wiggle_block,
+                    },
+                    &options,
+                )
+                .map_err(|e| format!("fit_binomial_location_scale_probit_wiggle failed: {e}"))?;
+                let beta_wiggle = fit
+                    .block_states
+                    .get(2)
+                    .map(|b| b.beta.to_vec())
+                    .unwrap_or_default();
+                (fit, Some((wiggle_knots, cfg.degree, beta_wiggle)))
+            } else {
+                let fit = fit_binomial_location_scale_probit(
+                    BinomialLocationScaleProbitSpec {
+                        y: y.clone(),
+                        score: score.clone(),
+                        weights: Array1::ones(y.len()),
+                        sigma_min,
+                        sigma_max,
+                        threshold_block,
+                        log_sigma_block,
+                    },
+                    &options,
+                )
+                .map_err(|e| format!("fit_binomial_location_scale_probit failed: {e}"))?;
+                (fit, None)
+            };
 
         println!(
             "model fit complete | family={} | outer_iter={} | converged={}",
@@ -437,7 +548,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         );
 
         if let Some(out) = args.out {
-            let model = build_location_scale_saved_model(
+            let mut model = build_location_scale_saved_model(
                 formula_text,
                 FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT.to_string(),
                 Some("probit".to_string()),
@@ -451,6 +562,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 sigma_max,
                 fit.lambdas.to_vec(),
             );
+            if let Some((knots, degree, beta_wiggle)) = wiggle_meta {
+                model.probit_wiggle_knots = Some(knots.to_vec());
+                model.probit_wiggle_degree = Some(degree);
+                model.beta_wiggle = Some(beta_wiggle);
+            }
             write_model_json(&out, &model)?;
         }
         return Ok(());
@@ -524,11 +640,24 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     joint_link_transform: Some(array2_to_nested_vec(&joint.link_transform)),
                     joint_degree: Some(joint.degree),
                     joint_ridge_used: Some(joint.ridge_used),
+                    probit_wiggle_knots: None,
+                    probit_wiggle_degree: None,
+                    beta_wiggle: None,
                     survival_entry: None,
                     survival_exit: None,
                     survival_event: None,
                     survival_spec: None,
                     survival_monotonicity_lambda: None,
+                    survival_baseline_target: None,
+                    survival_baseline_scale: None,
+                    survival_baseline_shape: None,
+                    survival_baseline_rate: None,
+                    survival_time_basis: None,
+                    survival_time_degree: None,
+                    survival_time_knots: None,
+                    survival_time_smooth_lambda: None,
+                    survival_ridge_lambda: None,
+                    survival_likelihood: None,
                     fit_max_iter,
                     fit_tol,
                     beta: joint.beta_base.to_vec(),
@@ -600,11 +729,24 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             joint_link_transform: None,
             joint_degree: None,
             joint_ridge_used: None,
+            probit_wiggle_knots: None,
+            probit_wiggle_degree: None,
+            beta_wiggle: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
             survival_spec: None,
             survival_monotonicity_lambda: None,
+            survival_baseline_target: None,
+            survival_baseline_scale: None,
+            survival_baseline_shape: None,
+            survival_baseline_rate: None,
+            survival_time_basis: None,
+            survival_time_degree: None,
+            survival_time_knots: None,
+            survival_time_smooth_lambda: None,
+            survival_ridge_lambda: None,
+            survival_likelihood: None,
             fit_max_iter,
             fit_tol,
             beta: fit.beta.to_vec(),
@@ -656,14 +798,24 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             .map_err(|e| format!("failed to build survival prediction design: {e}"))?;
         let n = ds.values.nrows();
         let p_cov = cov_design.design.ncols();
-        let p = p_cov + 2;
-        let mut x_exit = Array2::<f64>::zeros((n, p));
+        let mut age_entry = Array1::<f64>::zeros(n);
+        let mut age_exit = Array1::<f64>::zeros(n);
         for i in 0..n {
             let t1 = ds.values[[i, exit_col]].max(1e-9);
-            x_exit[[i, 0]] = 1.0;
-            x_exit[[i, 1]] = t1.ln();
+            age_exit[i] = t1;
+            age_entry[i] = t1;
+        }
+        let time_cfg = load_survival_time_basis_config_from_model(&model)?;
+        let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg, None)?;
+        let p_time = time_build.x_exit_time.ncols();
+        let p = p_time + p_cov;
+        let mut x_exit = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p_time {
+                x_exit[[i, j]] = time_build.x_exit_time[[i, j]];
+            }
             for j in 0..p_cov {
-                x_exit[[i, j + 2]] = cov_design.design[[i, j]];
+                x_exit[[i, p_time + j]] = cov_design.design[[i, j]];
             }
         }
         let beta = Array1::from_vec(model.beta.clone());
@@ -674,7 +826,15 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 p
             ));
         }
-        let eta = x_exit.dot(&beta);
+        let baseline_cfg = survival_baseline_config_from_model(&model)?;
+        let mut eta_offset_exit = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let (eta0, _) = evaluate_survival_baseline(age_exit[i], &baseline_cfg)?;
+            eta_offset_exit[i] = eta0;
+        }
+        // Prediction uses the same target+deviation decomposition as fitting.
+        // This avoids silent drift between train-time and predict-time baselines.
+        let eta = x_exit.dot(&beta) + eta_offset_exit;
         let mean = survival_probability_from_eta(eta.view());
         let mut eta_se = None;
         let mut mean_lo = None;
@@ -823,12 +983,14 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         let sigma_min = model.sigma_min.unwrap_or(0.05);
         let sigma_max = model.sigma_max.unwrap_or(20.0);
         let sigma = eta_noise.mapv(|v| v.exp().clamp(sigma_min, sigma_max));
-        let eta = Array1::from_iter(
+        let q0 = Array1::from_iter(
             eta_t
                 .iter()
                 .zip(sigma.iter())
                 .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
         );
+        let eta = apply_saved_probit_wiggle(&q0, &model)?
+            .mapv(|v| v.clamp(-30.0, 30.0));
         let mean = eta.mapv(normal_cdf_approx);
         let mut mean_lo = None;
         let mut mean_hi = None;
@@ -1076,6 +1238,459 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurvivalBaselineTarget {
+    // "No additional parametric target":
+    // eta_target(t) = 0, so regularized model defaults to linear log-cumulative hazard
+    // from the existing time basis.
+    Linear,
+    // Parametric target: Weibull baseline encoded in eta_target(t) = log(H0(t)).
+    Weibull,
+    // Parametric target: Gompertz baseline encoded in eta_target(t) = log(H0(t)).
+    Gompertz,
+}
+
+#[derive(Clone, Debug)]
+struct SurvivalBaselineConfig {
+    target: SurvivalBaselineTarget,
+    scale: Option<f64>,
+    shape: Option<f64>,
+    rate: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+enum SurvivalTimeBasisConfig {
+    Linear,
+    BSpline {
+        degree: usize,
+        knots: Array1<f64>,
+        smooth_lambda: f64,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct SurvivalTimeBuildOutput {
+    x_entry_time: Array2<f64>,
+    x_exit_time: Array2<f64>,
+    x_derivative_time: Array2<f64>,
+    penalties: Vec<Array2<f64>>,
+    basis_name: String,
+    degree: Option<usize>,
+    knots: Option<Vec<f64>>,
+    smooth_lambda: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurvivalLikelihoodMode {
+    Transformation,
+    Weibull,
+}
+
+fn parse_survival_baseline_config(
+    target_raw: &str,
+    scale: Option<f64>,
+    shape: Option<f64>,
+    rate: Option<f64>,
+) -> Result<SurvivalBaselineConfig, String> {
+    // Design principle:
+    // baseline-target selects what the penalty shrinks *toward*.
+    // - linear   => generic default,
+    // - weibull/gompertz => story-informed default.
+    //
+    // In all cases, the fitted deviation can move away when data supports it.
+    let target = match target_raw.to_ascii_lowercase().as_str() {
+        "linear" => SurvivalBaselineTarget::Linear,
+        "weibull" => SurvivalBaselineTarget::Weibull,
+        "gompertz" => SurvivalBaselineTarget::Gompertz,
+        other => {
+            return Err(format!(
+                "unsupported --baseline-target '{other}'; use linear|weibull|gompertz"
+            ));
+        }
+    };
+
+    match target {
+        SurvivalBaselineTarget::Linear => Ok(SurvivalBaselineConfig {
+            target,
+            scale: None,
+            shape: None,
+            rate: None,
+        }),
+        SurvivalBaselineTarget::Weibull => {
+            let scale = scale.ok_or_else(|| {
+                "--baseline-target weibull requires --baseline-scale > 0".to_string()
+            })?;
+            let shape = shape.ok_or_else(|| {
+                "--baseline-target weibull requires --baseline-shape > 0".to_string()
+            })?;
+            if !scale.is_finite() || scale <= 0.0 || !shape.is_finite() || shape <= 0.0 {
+                return Err(
+                    "weibull baseline requires finite positive --baseline-scale and --baseline-shape"
+                        .to_string(),
+                );
+            }
+            Ok(SurvivalBaselineConfig {
+                target,
+                scale: Some(scale),
+                shape: Some(shape),
+                rate: None,
+            })
+        }
+        SurvivalBaselineTarget::Gompertz => {
+            let rate = rate.ok_or_else(|| {
+                "--baseline-target gompertz requires --baseline-rate > 0".to_string()
+            })?;
+            let shape = shape.ok_or_else(|| {
+                "--baseline-target gompertz requires --baseline-shape".to_string()
+            })?;
+            if !rate.is_finite() || rate <= 0.0 || !shape.is_finite() {
+                return Err(
+                    "gompertz baseline requires finite --baseline-shape and positive --baseline-rate"
+                        .to_string(),
+                );
+            }
+            Ok(SurvivalBaselineConfig {
+                target,
+                scale: None,
+                shape: Some(shape),
+                rate: Some(rate),
+            })
+        }
+    }
+}
+
+fn parse_survival_likelihood_mode(raw: &str) -> Result<SurvivalLikelihoodMode, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "transformation" => Ok(SurvivalLikelihoodMode::Transformation),
+        "weibull" => Ok(SurvivalLikelihoodMode::Weibull),
+        other => Err(format!(
+            "unsupported --survival-likelihood '{other}'; use transformation|weibull"
+        )),
+    }
+}
+
+fn survival_likelihood_mode_name(mode: SurvivalLikelihoodMode) -> &'static str {
+    match mode {
+        SurvivalLikelihoodMode::Transformation => "transformation",
+        SurvivalLikelihoodMode::Weibull => "weibull",
+    }
+}
+
+fn survival_baseline_config_from_model(model: &SavedModel) -> Result<SurvivalBaselineConfig, String> {
+    parse_survival_baseline_config(
+        model.survival_baseline_target.as_deref().unwrap_or("linear"),
+        model.survival_baseline_scale,
+        model.survival_baseline_shape,
+        model.survival_baseline_rate,
+    )
+}
+
+fn survival_baseline_target_name(target: SurvivalBaselineTarget) -> &'static str {
+    match target {
+        SurvivalBaselineTarget::Linear => "linear",
+        SurvivalBaselineTarget::Weibull => "weibull",
+        SurvivalBaselineTarget::Gompertz => "gompertz",
+    }
+}
+
+fn parse_survival_time_basis_config(args: &SurvivalArgs) -> Result<SurvivalTimeBasisConfig, String> {
+    match args.time_basis.to_ascii_lowercase().as_str() {
+        "linear" => Ok(SurvivalTimeBasisConfig::Linear),
+        "bspline" => {
+            if args.time_degree < 1 {
+                return Err("--time-degree must be >= 1 for bspline time basis".to_string());
+            }
+            if args.time_num_internal_knots == 0 {
+                return Err("--time-num-internal-knots must be > 0 for bspline time basis".to_string());
+            }
+            if !args.time_smooth_lambda.is_finite() || args.time_smooth_lambda < 0.0 {
+                return Err("--time-smooth-lambda must be finite and >= 0".to_string());
+            }
+            // Placeholder knots; real knots are inferred from training data.
+            Ok(SurvivalTimeBasisConfig::BSpline {
+                degree: args.time_degree,
+                knots: Array1::zeros(0),
+                smooth_lambda: args.time_smooth_lambda,
+            })
+        }
+        other => Err(format!("unsupported --time-basis '{other}'; use linear|bspline")),
+    }
+}
+
+fn load_survival_time_basis_config_from_model(
+    model: &SavedModel,
+) -> Result<SurvivalTimeBasisConfig, String> {
+    match model
+        .survival_time_basis
+        .as_deref()
+        .unwrap_or("linear")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "linear" => Ok(SurvivalTimeBasisConfig::Linear),
+        "bspline" => {
+            let degree = model
+                .survival_time_degree
+                .ok_or_else(|| "saved survival bspline model missing survival_time_degree".to_string())?;
+            let knots = model
+                .survival_time_knots
+                .clone()
+                .ok_or_else(|| "saved survival bspline model missing survival_time_knots".to_string())?;
+            let smooth_lambda = model.survival_time_smooth_lambda.unwrap_or(1e-2);
+            if degree < 1 || knots.is_empty() {
+                return Err("saved survival bspline time basis metadata is invalid".to_string());
+            }
+            Ok(SurvivalTimeBasisConfig::BSpline {
+                degree,
+                knots: Array1::from_vec(knots),
+                smooth_lambda,
+            })
+        }
+        other => Err(format!("unsupported saved survival_time_basis '{other}'")),
+    }
+}
+
+fn build_survival_time_basis(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    cfg: SurvivalTimeBasisConfig,
+    infer_knots_if_needed: Option<(usize, f64)>,
+) -> Result<SurvivalTimeBuildOutput, String> {
+    let n = age_entry.len();
+    if n != age_exit.len() {
+        return Err("survival time basis requires matching entry/exit lengths".to_string());
+    }
+    let log_entry = age_entry.mapv(|t| t.max(1e-9).ln());
+    let log_exit = age_exit.mapv(|t| t.max(1e-9).ln());
+
+    match cfg {
+        SurvivalTimeBasisConfig::Linear => {
+            let mut x_entry_time = Array2::<f64>::zeros((n, 2));
+            let mut x_exit_time = Array2::<f64>::zeros((n, 2));
+            let mut x_derivative_time = Array2::<f64>::zeros((n, 2));
+            for i in 0..n {
+                x_entry_time[[i, 0]] = 1.0;
+                x_exit_time[[i, 0]] = 1.0;
+                x_entry_time[[i, 1]] = log_entry[i];
+                x_exit_time[[i, 1]] = log_exit[i];
+                x_derivative_time[[i, 1]] = 1.0 / age_exit[i].max(1e-9);
+            }
+            Ok(SurvivalTimeBuildOutput {
+                x_entry_time,
+                x_exit_time,
+                x_derivative_time,
+                penalties: Vec::new(),
+                basis_name: "linear".to_string(),
+                degree: None,
+                knots: None,
+                smooth_lambda: None,
+            })
+        }
+        SurvivalTimeBasisConfig::BSpline {
+            degree,
+            knots,
+            smooth_lambda,
+        } => {
+            let knot_vec = if knots.is_empty() {
+                let (num_internal_knots, _ridge_lambda) = infer_knots_if_needed.ok_or_else(|| {
+                    "internal error: bspline time basis requested without knot source".to_string()
+                })?;
+                let mut combined = Array1::<f64>::zeros(2 * n);
+                for i in 0..n {
+                    combined[i] = log_entry[i];
+                    combined[n + i] = log_exit[i];
+                }
+                let built = build_bspline_basis_1d(
+                    combined.view(),
+                    &BSplineBasisSpec {
+                        degree,
+                        penalty_order: 2,
+                        knot_spec: BSplineKnotSpec::Automatic {
+                            num_internal_knots: Some(num_internal_knots),
+                            placement: gam::basis::BSplineKnotPlacement::Quantile,
+                        },
+                        double_penalty: false,
+                        identifiability: BSplineIdentifiability::None,
+                    },
+                )
+                .map_err(|e| format!("failed to build bspline time basis: {e}"))?;
+                match built.metadata {
+                    gam::basis::BasisMetadata::BSpline1D { knots } => knots,
+                    _ => {
+                        return Err(
+                            "internal error: expected BSpline1D metadata for time basis".to_string()
+                        )
+                    }
+                }
+            } else {
+                knots
+            };
+
+            let entry_basis = build_bspline_basis_1d(
+                log_entry.view(),
+                &BSplineBasisSpec {
+                    degree,
+                    penalty_order: 2,
+                    knot_spec: BSplineKnotSpec::Provided(knot_vec.clone()),
+                    double_penalty: false,
+                    identifiability: BSplineIdentifiability::None,
+                },
+            )
+            .map_err(|e| format!("failed to build bspline entry basis: {e}"))?;
+            let exit_basis = build_bspline_basis_1d(
+                log_exit.view(),
+                &BSplineBasisSpec {
+                    degree,
+                    penalty_order: 2,
+                    knot_spec: BSplineKnotSpec::Provided(knot_vec.clone()),
+                    double_penalty: false,
+                    identifiability: BSplineIdentifiability::None,
+                },
+            )
+            .map_err(|e| format!("failed to build bspline exit basis: {e}"))?;
+
+            let p_time = exit_basis.design.ncols();
+            let mut x_derivative_time = Array2::<f64>::zeros((n, p_time));
+            let mut deriv_buf = vec![0.0_f64; p_time];
+            for i in 0..n {
+                deriv_buf.fill(0.0);
+                evaluate_bspline_derivative_scalar(
+                    log_exit[i],
+                    knot_vec.view(),
+                    degree,
+                    &mut deriv_buf,
+                )
+                .map_err(|e| format!("failed to evaluate bspline derivative: {e}"))?;
+                let chain = 1.0 / age_exit[i].max(1e-9);
+                for j in 0..p_time {
+                    x_derivative_time[[i, j]] = deriv_buf[j] * chain;
+                }
+            }
+
+            Ok(SurvivalTimeBuildOutput {
+                x_entry_time: entry_basis.design,
+                x_exit_time: exit_basis.design,
+                x_derivative_time,
+                penalties: entry_basis.penalties,
+                basis_name: "bspline".to_string(),
+                degree: Some(degree),
+                knots: Some(knot_vec.to_vec()),
+                smooth_lambda: Some(smooth_lambda),
+            })
+        }
+    }
+}
+
+fn evaluate_survival_baseline(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<(f64, f64), String> {
+    // Returns (eta_target(age), d eta_target / d age).
+    // Survival engine uses eta on the log-cumulative-hazard scale.
+    if !age.is_finite() || age <= 0.0 {
+        return Err("survival ages must be finite and positive for baseline target evaluation".to_string());
+    }
+    match cfg.target {
+        SurvivalBaselineTarget::Linear => Ok((0.0, 0.0)),
+        SurvivalBaselineTarget::Weibull => {
+            let scale = cfg.scale.unwrap_or(1.0);
+            let shape = cfg.shape.unwrap_or(1.0);
+            let eta = shape * (age.ln() - scale.ln());
+            let derivative = shape / age;
+            Ok((eta, derivative))
+        }
+        SurvivalBaselineTarget::Gompertz => {
+            let rate = cfg.rate.unwrap_or(1.0);
+            let shape = cfg.shape.unwrap_or(0.0);
+            if shape.abs() < 1e-10 {
+                let h = rate * age;
+                if h <= 0.0 || !h.is_finite() {
+                    return Err("invalid gompertz baseline at near-zero shape".to_string());
+                }
+                return Ok((h.ln(), 1.0 / age));
+            }
+            let exp_term = (shape * age).exp();
+            let h = (rate / shape) * (exp_term - 1.0);
+            if h <= 0.0 || !h.is_finite() {
+                return Err("gompertz baseline produced non-positive cumulative hazard".to_string());
+            }
+            let inst = rate * exp_term;
+            let derivative = inst / h;
+            Ok((h.ln(), derivative))
+        }
+    }
+}
+
+fn build_survival_baseline_offsets(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+    // Materialize target contributions once per row and thread them into the
+    // engine as offsets. This keeps training/prediction/sample paths consistent.
+    if age_entry.len() != age_exit.len() {
+        return Err("survival baseline offsets require matching entry/exit lengths".to_string());
+    }
+    let n = age_entry.len();
+    let mut eta_entry = Array1::<f64>::zeros(n);
+    let mut eta_exit = Array1::<f64>::zeros(n);
+    let mut derivative_exit = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let (e0, _) = evaluate_survival_baseline(age_entry[i], cfg)?;
+        let (e1, d1) = evaluate_survival_baseline(age_exit[i], cfg)?;
+        if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
+            return Err("non-finite survival baseline offsets computed".to_string());
+        }
+        eta_entry[i] = e0;
+        eta_exit[i] = e1;
+        derivative_exit[i] = d1;
+    }
+    Ok((eta_entry, eta_exit, derivative_exit))
+}
+
+fn apply_saved_probit_wiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
+    match (
+        model.probit_wiggle_knots.as_ref(),
+        model.probit_wiggle_degree,
+        model.beta_wiggle.as_ref(),
+    ) {
+        (None, None, None) => Ok(q0.clone()),
+        (Some(knots), Some(degree), Some(beta_wiggle)) => {
+            let knot_arr = Array1::from_vec(knots.clone());
+            let block = build_wiggle_block_input_from_knots(
+                q0.view(),
+                &knot_arr,
+                degree,
+                2,
+                false,
+            )
+            .map_err(|e| format!("failed to evaluate saved probit wiggle basis: {e}"))?;
+            let x_wiggle = match block.design {
+                DesignMatrix::Dense(m) => m,
+                _ => {
+                    return Err(
+                        "saved probit wiggle basis design must be dense in current implementation"
+                            .to_string(),
+                    )
+                }
+            };
+            if beta_wiggle.len() != x_wiggle.ncols() {
+                return Err(format!(
+                    "saved probit wiggle dimension mismatch: beta_wiggle has {} coefficients but basis has {} columns",
+                    beta_wiggle.len(),
+                    x_wiggle.ncols()
+                ));
+            }
+            let w = x_wiggle.dot(&Array1::from_vec(beta_wiggle.clone()));
+            Ok(q0 + &w)
+        }
+        _ => Err(
+            "saved model has partial probit wiggle metadata; expected knots+degree+beta_wiggle together"
+                .to_string(),
+        ),
+    }
+}
+
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let ds = load_dataset(&args.data)?;
     let col_map: HashMap<String, usize> = ds
@@ -1105,6 +1720,23 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         "crude" => SurvivalSpec::Crude,
         other => return Err(format!("unsupported --spec '{other}'; use net|crude")),
     };
+    let likelihood_mode = parse_survival_likelihood_mode(&args.survival_likelihood)?;
+    let baseline_cfg = match likelihood_mode {
+        SurvivalLikelihoodMode::Transformation => parse_survival_baseline_config(
+            &args.baseline_target,
+            args.baseline_scale,
+            args.baseline_shape,
+            args.baseline_rate,
+        )?,
+        SurvivalLikelihoodMode::Weibull => parse_survival_baseline_config("linear", None, None, None)?,
+    };
+    if !args.ridge_lambda.is_finite() || args.ridge_lambda < 0.0 {
+        return Err("--ridge-lambda must be finite and >= 0".to_string());
+    }
+    let time_basis_cfg = match likelihood_mode {
+        SurvivalLikelihoodMode::Transformation => parse_survival_time_basis_config(&args)?,
+        SurvivalLikelihoodMode::Weibull => SurvivalTimeBasisConfig::Linear,
+    };
 
     let formula = format!("__survival__ ~ {}", args.formula);
     let parsed = parse_formula(&formula)?;
@@ -1113,15 +1745,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to build survival term collection design: {e}"))?;
 
     let p_cov = cov_design.design.ncols();
-    let p = p_cov + 2;
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     let mut event_target = Array1::<u8>::zeros(n);
     let event_competing = Array1::<u8>::zeros(n);
     let weights = Array1::<f64>::ones(n);
-    let mut x_entry = Array2::<f64>::zeros((n, p));
-    let mut x_exit = Array2::<f64>::zeros((n, p));
-    let mut x_derivative = Array2::<f64>::zeros((n, p));
 
     for i in 0..n {
         let t0_raw = ds.values[[i, entry_col]];
@@ -1135,29 +1763,57 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         age_entry[i] = t0;
         age_exit[i] = t1;
         event_target[i] = if ev >= 0.5 { 1 } else { 0 };
-
-        x_entry[[i, 0]] = 1.0;
-        x_exit[[i, 0]] = 1.0;
-        x_entry[[i, 1]] = t0.ln();
-        x_exit[[i, 1]] = t1.ln();
-        x_derivative[[i, 1]] = 1.0 / t1;
-
+    }
+    let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
+        build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
+    let time_build = build_survival_time_basis(
+        &age_entry,
+        &age_exit,
+        time_basis_cfg,
+        Some((args.time_num_internal_knots, args.ridge_lambda)),
+    )?;
+    let p_time = time_build.x_exit_time.ncols();
+    let p = p_time + p_cov;
+    let mut x_entry = Array2::<f64>::zeros((n, p));
+    let mut x_exit = Array2::<f64>::zeros((n, p));
+    let mut x_derivative = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        for j in 0..p_time {
+            x_entry[[i, j]] = time_build.x_entry_time[[i, j]];
+            x_exit[[i, j]] = time_build.x_exit_time[[i, j]];
+            x_derivative[[i, j]] = time_build.x_derivative_time[[i, j]];
+        }
         for j in 0..p_cov {
             let z = cov_design.design[[i, j]];
-            x_entry[[i, j + 2]] = z;
-            x_exit[[i, j + 2]] = z;
+            x_entry[[i, p_time + j]] = z;
+            x_exit[[i, p_time + j]] = z;
         }
     }
 
-    let mut ridge = Array2::<f64>::zeros((p - 1, p - 1));
-    for d in 0..(p - 1) {
-        ridge[[d, d]] = 1.0;
+    let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
+    for s in &time_build.penalties {
+        if s.nrows() == p_time && s.ncols() == p_time {
+            penalty_blocks.push(PenaltyBlock {
+                matrix: s.clone(),
+                lambda: time_build.smooth_lambda.unwrap_or(1e-2),
+                range: 0..p_time,
+            });
+        }
     }
-    let penalties = PenaltyBlocks::new(vec![PenaltyBlock {
-        matrix: ridge,
-        lambda: 1e-4,
-        range: 1..p,
-    }]);
+    let ridge_range_start = if time_build.basis_name == "linear" { 1 } else { 0 };
+    if args.ridge_lambda > 0.0 && p > ridge_range_start {
+        let dim = p - ridge_range_start;
+        let mut ridge = Array2::<f64>::zeros((dim, dim));
+        for d in 0..dim {
+            ridge[[d, d]] = 1.0;
+        }
+        penalty_blocks.push(PenaltyBlock {
+            matrix: ridge,
+            lambda: args.ridge_lambda,
+            range: ridge_range_start..p,
+        });
+    }
+    let penalties = PenaltyBlocks::new(penalty_blocks.clone());
 
     let model = gam::families::royston_parmar::working_model_from_flattened(
         penalties,
@@ -1175,6 +1831,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             x_entry: x_entry.view(),
             x_exit: x_exit.view(),
             x_derivative: x_derivative.view(),
+            eta_offset_entry: Some(eta_offset_entry.view()),
+            eta_offset_exit: Some(eta_offset_exit.view()),
+            derivative_offset_exit: Some(derivative_offset_exit.view()),
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
@@ -1248,15 +1907,28 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             joint_link_transform: None,
             joint_degree: None,
             joint_ridge_used: None,
+            probit_wiggle_knots: None,
+            probit_wiggle_degree: None,
+            beta_wiggle: None,
             survival_entry: Some(args.entry),
             survival_exit: Some(args.exit),
             survival_event: Some(args.event),
             survival_spec: Some(args.spec),
             survival_monotonicity_lambda: Some(args.monotonicity_lambda),
+            survival_baseline_target: Some(survival_baseline_target_name(baseline_cfg.target).to_string()),
+            survival_baseline_scale: baseline_cfg.scale,
+            survival_baseline_shape: baseline_cfg.shape,
+            survival_baseline_rate: baseline_cfg.rate,
+            survival_time_basis: Some(time_build.basis_name.clone()),
+            survival_time_degree: time_build.degree,
+            survival_time_knots: time_build.knots.clone(),
+            survival_time_smooth_lambda: time_build.smooth_lambda,
+            survival_ridge_lambda: Some(args.ridge_lambda),
+            survival_likelihood: Some(survival_likelihood_mode_name(likelihood_mode).to_string()),
             fit_max_iter: 400,
             fit_tol: 1e-6,
             beta: beta.to_vec(),
-            lambdas: vec![1e-4],
+            lambdas: penalty_blocks.iter().map(|b| b.lambda).collect(),
             scale: 1.0,
             covariance_conditional: Some(array2_to_nested_vec(&cov)),
             covariance_corrected: Some(array2_to_nested_vec(&cov)),
@@ -1325,15 +1997,11 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             .map_err(|e| format!("failed to build survival design: {e}"))?;
         let n = ds.values.nrows();
         let p_cov = cov_design.design.ncols();
-        let p = p_cov + 2;
         let mut age_entry = Array1::<f64>::zeros(n);
         let mut age_exit = Array1::<f64>::zeros(n);
         let mut event_target = Array1::<u8>::zeros(n);
         let event_competing = Array1::<u8>::zeros(n);
         let weights = Array1::<f64>::ones(n);
-        let mut x_entry = Array2::<f64>::zeros((n, p));
-        let mut x_exit = Array2::<f64>::zeros((n, p));
-        let mut x_derivative = Array2::<f64>::zeros((n, p));
         for i in 0..n {
             let t0 = ds.values[[i, entry_col]].max(1e-9);
             let t1 = ds.values[[i, exit_col]].max(t0 + 1e-9);
@@ -1344,27 +2012,56 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             } else {
                 0
             };
-            x_entry[[i, 0]] = 1.0;
-            x_exit[[i, 0]] = 1.0;
-            x_entry[[i, 1]] = t0.ln();
-            x_exit[[i, 1]] = t1.ln();
-            x_derivative[[i, 1]] = 1.0 / t1;
+        }
+        let time_cfg = load_survival_time_basis_config_from_model(&model)?;
+        let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg, None)?;
+        let p_time = time_build.x_exit_time.ncols();
+        let p = p_time + p_cov;
+        let mut x_entry = Array2::<f64>::zeros((n, p));
+        let mut x_exit = Array2::<f64>::zeros((n, p));
+        let mut x_derivative = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p_time {
+                x_entry[[i, j]] = time_build.x_entry_time[[i, j]];
+                x_exit[[i, j]] = time_build.x_exit_time[[i, j]];
+                x_derivative[[i, j]] = time_build.x_derivative_time[[i, j]];
+            }
             for j in 0..p_cov {
                 let z = cov_design.design[[i, j]];
-                x_entry[[i, j + 2]] = z;
-                x_exit[[i, j + 2]] = z;
+                x_entry[[i, p_time + j]] = z;
+                x_exit[[i, p_time + j]] = z;
             }
         }
-
-        let mut ridge = Array2::<f64>::zeros((p - 1, p - 1));
-        for d in 0..(p - 1) {
-            ridge[[d, d]] = 1.0;
+        let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
+        for s in &time_build.penalties {
+            if s.nrows() == p_time && s.ncols() == p_time {
+                penalty_blocks.push(PenaltyBlock {
+                    matrix: s.clone(),
+                    lambda: time_build.smooth_lambda.unwrap_or(1e-2),
+                    range: 0..p_time,
+                });
+            }
         }
-        let penalties = PenaltyBlocks::new(vec![PenaltyBlock {
-            matrix: ridge,
-            lambda: model.lambdas.first().copied().unwrap_or(1e-4),
-            range: 1..p,
-        }]);
+        let ridge_lambda = model.survival_ridge_lambda.unwrap_or(1e-4);
+        let ridge_range_start = if time_build.basis_name == "linear" { 1 } else { 0 };
+        if ridge_lambda > 0.0 && p > ridge_range_start {
+            let dim = p - ridge_range_start;
+            let mut ridge = Array2::<f64>::zeros((dim, dim));
+            for d in 0..dim {
+                ridge[[d, d]] = 1.0;
+            }
+            penalty_blocks.push(PenaltyBlock {
+                matrix: ridge,
+                lambda: ridge_lambda,
+                range: ridge_range_start..p,
+            });
+        }
+        for (idx, block) in penalty_blocks.iter_mut().enumerate() {
+            if let Some(&lam) = model.lambdas.get(idx) {
+                block.lambda = lam;
+            }
+        }
+        let penalties = PenaltyBlocks::new(penalty_blocks);
         let survival_spec = match model
             .survival_spec
             .as_deref()
@@ -1380,6 +2077,9 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             lambda: model.survival_monotonicity_lambda.unwrap_or(10.0),
             tolerance: 1e-8,
         };
+        let baseline_cfg = survival_baseline_config_from_model(&model)?;
+        let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
+            build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
         let model_surv = gam::families::royston_parmar::working_model_from_flattened(
             penalties.clone(),
             monotonicity,
@@ -1393,6 +2093,9 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
+                eta_offset_entry: Some(eta_offset_entry.view()),
+                eta_offset_exit: Some(eta_offset_exit.view()),
+                derivative_offset_exit: Some(derivative_offset_exit.view()),
             },
         )
         .map_err(|e| format!("failed to construct survival model: {e}"))?;
@@ -1550,12 +2253,14 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
             .design
             .dot(&beta_noise)
             .mapv(|v| v.exp().clamp(sigma_min, sigma_max));
-        let mean = Array1::from_iter(
+        let q0 = Array1::from_iter(
             eta_t
                 .iter()
                 .zip(sigma.iter())
-                .map(|(&t, &s)| normal_cdf_approx((-t / s.max(1e-12)).clamp(-30.0, 30.0))),
+                .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
         );
+        let mean = apply_saved_probit_wiggle(&q0, &model)?
+            .mapv(|v| normal_cdf_approx(v.clamp(-30.0, 30.0)));
         gam::generative::GenerativeSpec {
             mean,
             noise: gam::generative::NoiseModel::Bernoulli,
@@ -1654,11 +2359,24 @@ fn build_location_scale_saved_model(
         joint_link_transform: None,
         joint_degree: None,
         joint_ridge_used: None,
+        probit_wiggle_knots: None,
+        probit_wiggle_degree: None,
+        beta_wiggle: None,
         survival_entry: None,
         survival_exit: None,
         survival_event: None,
         survival_spec: None,
         survival_monotonicity_lambda: None,
+        survival_baseline_target: None,
+        survival_baseline_scale: None,
+        survival_baseline_shape: None,
+        survival_baseline_rate: None,
+        survival_time_basis: None,
+        survival_time_degree: None,
+        survival_time_knots: None,
+        survival_time_smooth_lambda: None,
+        survival_ridge_lambda: None,
+        survival_likelihood: None,
         fit_max_iter: 80,
         fit_tol: 1e-6,
         beta,
