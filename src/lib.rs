@@ -4,7 +4,6 @@
 pub mod alo;
 pub mod basis;
 pub mod construction;
-pub mod custom_family;
 pub mod diagnostics;
 pub mod estimate;
 pub mod faer_ndarray;
@@ -24,6 +23,8 @@ pub mod smooth;
 pub mod survival;
 pub mod types;
 pub mod visualizer;
+
+pub use families::custom_family;
 
 pub use alo::{
     AloDiagnostics, AloOptions, AloSeMode, compute_alo_diagnostics,
