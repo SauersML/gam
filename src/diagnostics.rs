@@ -510,8 +510,8 @@ pub fn compute_component_fd(
 /// Compute the spectral bleed diagnostic for truncation consistency.
 ///
 /// When eigenvalues are truncated in the penalty matrix (to compute log|S|_+),
-/// the gradient must include a correction term for the energy "leaking" into
-/// the truncated subspace. This diagnostic checks if the correction is adequate.
+/// the gradient must include a correction term for the truncated-subspace
+/// H-weighted trace contribution. This diagnostic checks if the correction is adequate.
 ///
 /// # Arguments
 /// * `r_k` - Penalty root matrix for penalty k (R_k where S_k = R_k' R_k)
@@ -596,7 +596,7 @@ pub fn compute_spectral_bleed(
 
     let message = if has_bleed {
         format!(
-            "Spectral Bleed at k={}: Penalty S_{} has energy {:.2e} in truncated subspace. \
+            "Spectral Bleed at k={}: Penalty S_{} has H-weighted trace term {:.2e} in truncated subspace. \
              Expected correction {:.2e}, but applied {:.2e} (rel diff = {:.1}%)",
             penalty_k,
             penalty_k,
@@ -607,7 +607,7 @@ pub fn compute_spectral_bleed(
         )
     } else {
         format!(
-            "Spectral OK at k={}: Truncated energy = {:.2e}, correction matches.",
+            "Spectral OK at k={}: Truncated H-weighted trace term = {:.2e}, correction matches.",
             penalty_k, truncated_energy
         )
     };

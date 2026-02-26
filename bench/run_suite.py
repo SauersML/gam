@@ -46,6 +46,7 @@ CV_SPLITS = 5
 CV_SEED = 42
 _RUST_BIN_PATH: Path | None = None
 HEARTBEAT_INTERVAL_SEC = 15.0
+HGDP_1KG_PC_TSV = DATASET_DIR / "hgdp_1kg_pc_data.tsv"
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1080,284 @@ def _synthetic_papuan_oce_dataset(n=6000, seed=20260315, n_pcs=16):
     }
 
 
+def _pairwise_dist(x):
+    s = np.sum(x * x, axis=1, keepdims=True)
+    d2 = s + s.T - 2.0 * (x @ x.T)
+    np.maximum(d2, 0.0, out=d2)
+    return np.sqrt(d2)
+
+
+def _path_length(path, d):
+    if len(path) <= 1:
+        return 0.0
+    return float(np.sum(d[path[:-1], path[1:]]))
+
+
+def _nearest_neighbor_path(d, start):
+    n = d.shape[0]
+    unused = set(range(n))
+    unused.remove(start)
+    path = [start]
+    while unused:
+        cur = path[-1]
+        nxt = min(unused, key=lambda j: d[cur, j])
+        path.append(nxt)
+        unused.remove(nxt)
+    return np.array(path, dtype=int)
+
+
+def _two_opt_open(path, d, max_passes=20):
+    n = len(path)
+    if n < 4:
+        return path.copy()
+    p = path.copy()
+    for _ in range(max_passes):
+        improved = False
+        for i in range(n - 3):
+            a, b = p[i], p[i + 1]
+            for j in range(i + 2, n - 1):
+                c, e = p[j], p[j + 1]
+                before = d[a, b] + d[c, e]
+                after = d[a, c] + d[b, e]
+                if after + 1e-12 < before:
+                    p[i + 1 : j + 1] = p[i + 1 : j + 1][::-1]
+                    improved = True
+        if not improved:
+            break
+    return p
+
+
+def _best_1d_order(d):
+    n = d.shape[0]
+    best = None
+    best_len = np.inf
+    for start in range(n):
+        p0 = _nearest_neighbor_path(d, start)
+        p1 = _two_opt_open(p0, d)
+        l = _path_length(p1, d)
+        if l < best_len:
+            best_len = l
+            best = p1
+    if best is None:
+        raise RuntimeError("failed to derive subpopulation 1D ordering")
+    return best
+
+
+def _geo_subpop16_scenario_cfg(name):
+    m = re.match(r"^geo_subpop16_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
+    if m is None:
+        return None
+    basis_code = m.group(1)
+    knots = max(4, int(m.group(2)))
+    if basis_code == "psperpc":
+        return {
+            "smooth_basis": "bspline_per_pc",
+            "smooth_cols": [f"pc{i}" for i in range(1, 17)],
+            "linear_cols": [],
+            "knots": knots,
+            "basis_code": basis_code,
+            "n_pcs": 16,
+        }
+    smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
+    return {
+        "smooth_basis": smooth_basis,
+        "smooth_cols": [f"pc{i}" for i in range(1, 4)],
+        "linear_cols": [f"pc{i}" for i in range(4, 17)],
+        "knots": knots,
+        "basis_code": basis_code,
+        "n_pcs": 16,
+    }
+
+
+def _geo_latlon_scenario_cfg(name):
+    m = re.match(r"^geo_latlon_(superpopnoise|equatornoise)_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
+    if m is None:
+        return None
+    mode_code = m.group(1)
+    basis_code = m.group(2)
+    knots = max(4, int(m.group(3)))
+    if basis_code == "psperpc":
+        return {
+            "mode_code": mode_code,
+            "smooth_basis": "bspline_per_pc",
+            "smooth_cols": [f"pc{i}" for i in range(1, 7)],
+            "linear_cols": [],
+            "knots": knots,
+            "basis_code": basis_code,
+            "n_pcs": 6,
+        }
+    smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
+    return {
+        "mode_code": mode_code,
+        "smooth_basis": smooth_basis,
+        "smooth_cols": [f"pc{i}" for i in range(1, 4)],
+        "linear_cols": [f"pc{i}" for i in range(4, 7)],
+        "knots": knots,
+        "basis_code": basis_code,
+        "n_pcs": 6,
+    }
+
+
+def _load_hgdp_pc_with_imputed_latlon():
+    if not HGDP_1KG_PC_TSV.exists():
+        raise RuntimeError(f"missing required PC dataset: {HGDP_1KG_PC_TSV}")
+    raw = pd.read_csv(HGDP_1KG_PC_TSV, sep="\t")
+    pc_cols = [f"PC{i}" for i in range(1, 17)]
+    required = {"sample_id", "Superpopulation", "Subpopulation", "Latitude", "Longitude", *pc_cols}
+    missing = sorted(required - set(raw.columns))
+    if missing:
+        raise RuntimeError(f"hgdp_1kg_pc_data.tsv is missing required columns: {missing}")
+
+    d = raw[["sample_id", "Superpopulation", "Subpopulation", "Latitude", "Longitude", *pc_cols]].copy()
+    d["Subpopulation"] = d["Subpopulation"].astype(str)
+    d["Superpopulation"] = d["Superpopulation"].astype(str)
+    for c in pc_cols:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=pc_cols).copy()
+    if d.empty:
+        raise RuntimeError("hgdp_1kg_pc_data.tsv has no complete rows for PC1..PC16")
+
+    centroids = d.groupby("Subpopulation", dropna=False)[pc_cols].mean(numeric_only=True)
+    sub_latlon_known = (
+        d.dropna(subset=["Latitude", "Longitude"])
+        .groupby("Subpopulation", dropna=False)[["Latitude", "Longitude"]]
+        .mean(numeric_only=True)
+    )
+
+    known_subpops = [sp for sp in centroids.index if sp in sub_latlon_known.index]
+    if len(known_subpops) < 2:
+        # Fallback for datasets where Latitude/Longitude are entirely missing:
+        # derive deterministic pseudo-anchors from centroid PC geometry.
+        c2 = centroids.reset_index()[["Subpopulation", "PC1", "PC2"]].copy()
+        pc1 = c2["PC1"].to_numpy(dtype=float)
+        pc2 = c2["PC2"].to_numpy(dtype=float)
+        pc1_lo, pc1_hi = float(np.min(pc1)), float(np.max(pc1))
+        pc2_lo, pc2_hi = float(np.min(pc2)), float(np.max(pc2))
+        pc1_den = max(pc1_hi - pc1_lo, 1e-8)
+        pc2_den = max(pc2_hi - pc2_lo, 1e-8)
+        c2["Latitude"] = -60.0 + 120.0 * ((pc1 - pc1_lo) / pc1_den)
+        c2["Longitude"] = -170.0 + 340.0 * ((pc2 - pc2_lo) / pc2_den)
+        sub_latlon_known = c2.set_index("Subpopulation")[["Latitude", "Longitude"]]
+        known_subpops = [sp for sp in centroids.index if sp in sub_latlon_known.index]
+
+    known_x = centroids.loc[known_subpops].to_numpy(dtype=float)
+    known_latlon = sub_latlon_known.loc[known_subpops][["Latitude", "Longitude"]].to_numpy(dtype=float)
+    full_subpops = centroids.index.tolist()
+
+    subpop_to_latlon = {}
+    for sp in full_subpops:
+        if sp in sub_latlon_known.index:
+            ll = sub_latlon_known.loc[sp]
+            subpop_to_latlon[sp] = (float(ll["Latitude"]), float(ll["Longitude"]))
+            continue
+        x0 = centroids.loc[sp].to_numpy(dtype=float)
+        dist = np.sqrt(np.maximum(np.sum((known_x - x0) ** 2, axis=1), 0.0))
+        nn = np.argsort(dist)[:2]
+        imputed = np.mean(known_latlon[nn], axis=0)
+        subpop_to_latlon[sp] = (float(imputed[0]), float(imputed[1]))
+
+    sample_lat = []
+    sample_lon = []
+    for _, row in d.iterrows():
+        lat_raw = row["Latitude"]
+        lon_raw = row["Longitude"]
+        if np.isfinite(lat_raw) and np.isfinite(lon_raw):
+            sample_lat.append(float(lat_raw))
+            sample_lon.append(float(lon_raw))
+        else:
+            lat_i, lon_i = subpop_to_latlon[str(row["Subpopulation"])]
+            sample_lat.append(lat_i)
+            sample_lon.append(lon_i)
+    d["lat_imputed"] = np.asarray(sample_lat, dtype=float)
+    d["lon_imputed"] = np.asarray(sample_lon, dtype=float)
+
+    return d
+
+
+def _geo_latlon_dataset(mode_code, seed=20260401, prevalence_min=0.01, prevalence_max=0.10):
+    mode_code = str(mode_code)
+    if mode_code not in {"superpopnoise", "equatornoise"}:
+        raise RuntimeError(f"unsupported geo_latlon mode: {mode_code}")
+    rng = np.random.default_rng(int(seed))
+    d = _load_hgdp_pc_with_imputed_latlon().copy()
+
+    lat_norm = np.clip(np.abs(d["lat_imputed"].to_numpy(dtype=float)) / 90.0, 0.0, 1.0)
+    lon_norm = np.clip((d["lon_imputed"].to_numpy(dtype=float) + 180.0) / 360.0, 0.0, 1.0)
+    westness = 1.0 - lon_norm
+
+    if mode_code == "superpopnoise":
+        risk_latlon = 0.68 * lat_norm + 0.32 * westness
+        base_prev = float(prevalence_min) + (float(prevalence_max) - float(prevalence_min)) * np.clip(risk_latlon, 0.0, 1.0)
+        superpops = sorted(d["Superpopulation"].astype(str).unique().tolist())
+        superpop_noise = {sp: float(rng.uniform(0.10, 0.90)) for sp in superpops}
+        noise_sd = d["Superpopulation"].astype(str).map(superpop_noise).to_numpy(dtype=float)
+    else:
+        edge_risk = np.clip(np.abs(d["lon_imputed"].to_numpy(dtype=float)) / 180.0, 0.0, 1.0)
+        base_prev = float(prevalence_min) + (float(prevalence_max) - float(prevalence_min)) * edge_risk
+        equator_close = 1.0 - lat_norm
+        noise_sd = 0.05 + 1.25 * np.clip(equator_close, 0.0, 1.0)
+
+    base_prev = np.clip(base_prev, 1e-5, 1.0 - 1e-5)
+    eta = np.log(base_prev / (1.0 - base_prev)) + rng.normal(0.0, noise_sd, size=len(d))
+    p = 1.0 / (1.0 + np.exp(-eta))
+    y = (rng.random(len(d)) < p).astype(float)
+
+    rows = []
+    for i, row in d.iterrows():
+        out = {f"pc{j}": float(row[f"PC{j}"]) for j in range(1, 7)}
+        out["y"] = float(y[i])
+        rows.append(out)
+    return {
+        "family": "binomial",
+        "rows": rows,
+        "features": [f"pc{i}" for i in range(1, 7)],
+        "target": "y",
+    }
+
+
+def _geo_subpop16_dataset(seed=20260330, prevalence_min=0.02, prevalence_max=0.40):
+    if not HGDP_1KG_PC_TSV.exists():
+        raise RuntimeError(f"missing required PC dataset: {HGDP_1KG_PC_TSV}")
+
+    rng = np.random.default_rng(int(seed))
+    raw = pd.read_csv(HGDP_1KG_PC_TSV, sep="\t")
+    pc_cols = [f"PC{i}" for i in range(1, 17)]
+    required = {"Subpopulation", *pc_cols}
+    missing = sorted(required - set(raw.columns))
+    if missing:
+        raise RuntimeError(f"hgdp_1kg_pc_data.tsv is missing required columns: {missing}")
+
+    d = raw[["Subpopulation", *pc_cols]].dropna().copy()
+    d["Subpopulation"] = d["Subpopulation"].astype(str)
+    if d.empty:
+        raise RuntimeError("hgdp_1kg_pc_data.tsv has no complete rows for Subpopulation + PC1..PC16")
+
+    centroids = d.groupby("Subpopulation", dropna=False)[pc_cols].mean(numeric_only=True).reset_index()
+    if len(centroids) < 2:
+        raise RuntimeError("need at least two subpopulations for centroid ordering")
+    x = centroids[pc_cols].to_numpy(dtype=float)
+    order_idx = _best_1d_order(_pairwise_dist(x))
+    ordered_subpops = centroids.iloc[order_idx]["Subpopulation"].astype(str).tolist()
+
+    base_prev = np.linspace(float(prevalence_min), float(prevalence_max), len(ordered_subpops))
+    prevalence_map = dict(zip(ordered_subpops, base_prev))
+    d["baseline_prevalence"] = d["Subpopulation"].map(prevalence_map).astype(float)
+    d["y"] = (rng.random(len(d)) < d["baseline_prevalence"].to_numpy(dtype=float)).astype(float)
+
+    rows = []
+    for _, row in d.iterrows():
+        out = {f"pc{i}": float(row[f"PC{i}"]) for i in range(1, 17)}
+        out["y"] = float(row["y"])
+        rows.append(out)
+
+    return {
+        "family": "binomial",
+        "rows": rows,
+        "features": [f"pc{i}" for i in range(1, 17)],
+        "target": "y",
+    }
+
+
 def dataset_for_scenario(s):
     name = s["name"]
     if name in {"small_dense", "medium", "pathological_ill_conditioned"}:
@@ -1091,6 +1370,20 @@ def dataset_for_scenario(s):
         return _synthetic_papuan_oce_dataset(s.get("n", 6000), s.get("seed", 20260315), n_pcs=4)
     if name.startswith("papuan_oce_"):
         return _synthetic_papuan_oce_dataset(s.get("n", 6000), s.get("seed", 20260315), n_pcs=16)
+    if name.startswith("geo_subpop16_"):
+        return _geo_subpop16_dataset(
+            seed=s.get("seed", 20260330),
+            prevalence_min=s.get("prevalence_min", 0.02),
+            prevalence_max=s.get("prevalence_max", 0.40),
+        )
+    geo_latlon_cfg = _geo_latlon_scenario_cfg(name)
+    if geo_latlon_cfg is not None:
+        return _geo_latlon_dataset(
+            mode_code=geo_latlon_cfg["mode_code"],
+            seed=s.get("seed", 20260401),
+            prevalence_min=s.get("prevalence_min", 0.01),
+            prevalence_max=s.get("prevalence_max", 0.10),
+        )
     if name.startswith("geo_disease_"):
         return _synthetic_geo_disease_dataset(s.get("n", 4000), s.get("seed", 20260226))
     if name == "lidar_semipar":
@@ -1211,6 +1504,8 @@ def write_dataset_csv(ds, path):
 def _rust_fit_mapping(scenario_name):
     geo_eas_cfg = _geo_disease_eas_scenario_cfg(scenario_name)
     papuan_cfg = _papuan_oce_scenario_cfg(scenario_name)
+    subpop_cfg = _geo_subpop16_scenario_cfg(scenario_name)
+    latlon_cfg = _geo_latlon_scenario_cfg(scenario_name)
     if geo_eas_cfg is not None:
         return {
             "family": "binomial-logit",
@@ -1226,6 +1521,22 @@ def _rust_fit_mapping(scenario_name):
             "smooth_basis": papuan_cfg["smooth_basis"],
             "linear_cols": papuan_cfg["linear_cols"],
             "knots": int(papuan_cfg["knots"]),
+        }
+    if subpop_cfg is not None:
+        return {
+            "family": "binomial-logit",
+            "smooth_cols": subpop_cfg["smooth_cols"],
+            "smooth_basis": subpop_cfg["smooth_basis"],
+            "linear_cols": subpop_cfg["linear_cols"],
+            "knots": int(subpop_cfg["knots"]),
+        }
+    if latlon_cfg is not None:
+        return {
+            "family": "binomial-logit",
+            "smooth_cols": latlon_cfg["smooth_cols"],
+            "smooth_basis": latlon_cfg["smooth_basis"],
+            "linear_cols": latlon_cfg["linear_cols"],
+            "knots": int(latlon_cfg["knots"]),
         }
     return {
         "small_dense": dict(
@@ -1485,6 +1796,8 @@ def rust_cli_cv_args(scenario_name, ds):
 
     geo_eas_cfg = _geo_disease_eas_scenario_cfg(scenario_name)
     papuan_cfg = _papuan_oce_scenario_cfg(scenario_name)
+    subpop_cfg = _geo_subpop16_scenario_cfg(scenario_name)
+    latlon_cfg = _geo_latlon_scenario_cfg(scenario_name)
     if geo_eas_cfg is not None:
         cfg = {
             "family": "binomial",
@@ -1502,6 +1815,24 @@ def rust_cli_cv_args(scenario_name, ds):
             "linear_cols": papuan_cfg["linear_cols"],
             "knots": papuan_cfg["knots"],
             "double_penalty": not papuan_cfg["is_basic"],
+        }
+    elif subpop_cfg is not None:
+        cfg = {
+            "family": "binomial",
+            "smooth_cols": subpop_cfg["smooth_cols"],
+            "smooth_basis": subpop_cfg["smooth_basis"],
+            "linear_cols": subpop_cfg["linear_cols"],
+            "knots": subpop_cfg["knots"],
+            "double_penalty": True,
+        }
+    elif latlon_cfg is not None:
+        cfg = {
+            "family": "binomial",
+            "smooth_cols": latlon_cfg["smooth_cols"],
+            "smooth_basis": latlon_cfg["smooth_basis"],
+            "linear_cols": latlon_cfg["linear_cols"],
+            "knots": latlon_cfg["knots"],
+            "double_penalty": True,
         }
     else:
         cfg = {
@@ -1865,6 +2196,119 @@ def run_rust_scenario_cv(scenario):
     }
 
 
+def run_rust_gamlss_scenario_cv(scenario):
+    scenario_name = scenario["name"]
+    if _geo_subpop16_scenario_cfg(scenario_name) is None and _geo_latlon_scenario_cfg(scenario_name) is None:
+        return None
+
+    ds = dataset_for_scenario(scenario)
+    if ds["family"] != "binomial":
+        return None
+    folds = folds_for_dataset(ds)
+
+    try:
+        rust_bin = _ensure_rust_binary()
+    except Exception as e:
+        return {
+            "contender": "rust_gamlss",
+            "scenario_name": scenario_name,
+            "status": "failed",
+            "error": str(e),
+        }
+
+    _, mean_formula = _rust_formula_for_scenario(scenario_name, ds)
+    noise_formula = "y ~ " + " + ".join(f"linear({c})" for c in ds["features"])
+    base_df = pd.DataFrame(ds["rows"])
+    cv_rows = []
+
+    with tempfile.TemporaryDirectory(prefix="gam_bench_rust_gamlss_cv_", dir=str(BENCH_DIR)) as td:
+        td_path = Path(td)
+        for fold_id, fold in enumerate(folds):
+            train_df = base_df.iloc[fold.train_idx].copy()
+            test_df = base_df.iloc[fold.test_idx].copy()
+            train_path = td_path / f"train_{fold_id}.csv"
+            test_path = td_path / f"test_{fold_id}.csv"
+            model_path = td_path / f"model_{fold_id}.json"
+            pred_path = td_path / f"pred_{fold_id}.csv"
+
+            train_df.to_csv(train_path, index=False)
+            test_df.to_csv(test_path, index=False)
+
+            fit_cmd = [
+                str(rust_bin),
+                "fit",
+                "--family",
+                "binomial-probit",
+                "--formula",
+                mean_formula,
+                "--predict-noise",
+                noise_formula,
+                "--out",
+                str(model_path),
+                str(train_path),
+            ]
+            t0 = perf_counter()
+            code, out, err = run_cmd(fit_cmd, cwd=ROOT)
+            fit_sec = perf_counter() - t0
+            if code != 0:
+                return {
+                    "contender": "rust_gamlss",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "error": (err.strip() or out.strip() or "rust gamlss fit failed"),
+                }
+
+            pred_cmd = [
+                str(rust_bin),
+                "predict",
+                str(model_path),
+                str(test_path),
+                "--out",
+                str(pred_path),
+            ]
+            t1 = perf_counter()
+            code, out, err = run_cmd(pred_cmd, cwd=ROOT)
+            pred_sec = perf_counter() - t1
+            if code != 0:
+                return {
+                    "contender": "rust_gamlss",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "error": (err.strip() or out.strip() or "rust gamlss predict failed"),
+                }
+            pred_df = pd.read_csv(pred_path)
+            if "mean" not in pred_df.columns:
+                return {
+                    "contender": "rust_gamlss",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "error": "rust gamlss prediction output missing 'mean' column",
+                }
+            pred = pred_df["mean"].to_numpy(dtype=float)
+            y_test = test_df[ds["target"]].to_numpy(dtype=float)
+            cv_rows.append(
+                {
+                    "fit_sec": float(fit_sec),
+                    "predict_sec": float(pred_sec),
+                    "auc": auc_score(y_test, pred),
+                    "brier": brier_score(y_test, pred),
+                    "logloss": log_loss_score(y_test, pred),
+                    "n_test": int(len(fold.test_idx)),
+                    "model_spec": "gamlss binomial-probit location-scale via release binary [5-fold CV]",
+                }
+            )
+
+    metrics = aggregate_cv_rows(cv_rows, ds["family"])
+    return {
+        "contender": "rust_gamlss",
+        "family": ds["family"],
+        "scenario_name": scenario_name,
+        "status": "ok",
+        **metrics,
+        "model_spec": cv_rows[0]["model_spec"],
+    }
+
+
 def run_external_mgcv_cv(scenario):
     ds = dataset_for_scenario(scenario)
     folds = folds_for_dataset(ds)
@@ -2043,6 +2487,34 @@ if (family_name == "survival") {
     linear_terms <- if (n_pcs > smooth_hi) paste(sprintf("pc%d", (smooth_hi + 1):n_pcs), collapse = " + ") else ""
     rhs <- if (nchar(linear_terms) > 0) paste(smooth_terms, linear_terms, sep = " + ") else smooth_terms
     ftxt <- paste("y ~", rhs)
+  }
+} else if (grepl("^geo_subpop16_", scenario_name)) {
+  match <- regmatches(scenario_name, regexec("^geo_subpop16_(tp|duchon|matern|psperpc)_k([0-9]+)$", scenario_name))[[1]]
+  if (length(match) != 3) stop(sprintf("Invalid geo_subpop16 scenario name: %s", scenario_name))
+  basis_code <- match[2]
+  k_raw <- as.integer(match[3])
+  if (!is.finite(k_raw) || k_raw < 4) k_raw <- 4
+  if (basis_code == "psperpc") {
+    ftxt <- paste("y ~", paste(sprintf("s(pc%d, bs='ps', k=min(%d, nrow(train_df)-1))", 1:16, k_raw), collapse = " + "))
+  } else {
+    bs_code <- if (basis_code == "tp") "tp" else if (basis_code == "duchon") "ds" else "ts"
+    smooth_terms <- paste(sprintf("s(pc%d, bs='%s', k=min(%d, nrow(train_df)-1))", 1:3, bs_code, k_raw), collapse = " + ")
+    linear_terms <- paste(sprintf("pc%d", 4:16), collapse = " + ")
+    ftxt <- paste("y ~", smooth_terms, "+", linear_terms)
+  }
+} else if (grepl("^geo_latlon_", scenario_name)) {
+  match <- regmatches(scenario_name, regexec("^geo_latlon_(superpopnoise|equatornoise)_(tp|duchon|matern|psperpc)_k([0-9]+)$", scenario_name))[[1]]
+  if (length(match) != 4) stop(sprintf("Invalid geo_latlon scenario name: %s", scenario_name))
+  basis_code <- match[3]
+  k_raw <- as.integer(match[4])
+  if (!is.finite(k_raw) || k_raw < 4) k_raw <- 4
+  if (basis_code == "psperpc") {
+    ftxt <- paste("y ~", paste(sprintf("s(pc%d, bs='ps', k=min(%d, nrow(train_df)-1))", 1:6, k_raw), collapse = " + "))
+  } else {
+    bs_code <- if (basis_code == "tp") "tp" else if (basis_code == "duchon") "ds" else "ts"
+    smooth_terms <- paste(sprintf("s(pc%d, bs='%s', k=min(%d, nrow(train_df)-1))", 1:3, bs_code, k_raw), collapse = " + ")
+    linear_terms <- paste(sprintf("pc%d", 4:6), collapse = " + ")
+    ftxt <- paste("y ~", smooth_terms, "+", linear_terms)
   }
 } else {
   ftxt <- "y ~ x1 + s(x2, bs='ps', k=min(8, nrow(train_df)-1))"
@@ -2288,6 +2760,42 @@ def run_external_pygam_cv(scenario):
                         f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, "
                         f"n_splines={k}, basis={papuan_cfg['basis_code']}) [papuan_oce]"
                     )
+            elif _geo_subpop16_scenario_cfg(scenario["name"]) is not None:
+                sub_cfg = _geo_subpop16_scenario_cfg(scenario["name"])
+                k = int(sub_cfg["knots"])
+                if sub_cfg["basis_code"] == "psperpc":
+                    terms = s(0, n_splines=k)
+                    for j in range(1, x.shape[1]):
+                        terms = terms + s(j, n_splines=k)
+                    model = LogisticGAM(terms)
+                    model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..15) [subpop16]"
+                else:
+                    terms = s(0, n_splines=k) + s(1, n_splines=k) + s(2, n_splines=k)
+                    for j in range(3, x.shape[1]):
+                        terms = terms + l(j)
+                    model = LogisticGAM(terms)
+                    model_spec = (
+                        f"LogisticGAM(s(0)+s(1)+s(2)+linear(3:15), "
+                        f"n_splines={k}, basis={sub_cfg['basis_code']}) [subpop16]"
+                    )
+            elif _geo_latlon_scenario_cfg(scenario["name"]) is not None:
+                latlon_cfg = _geo_latlon_scenario_cfg(scenario["name"])
+                k = int(latlon_cfg["knots"])
+                if latlon_cfg["basis_code"] == "psperpc":
+                    terms = s(0, n_splines=k)
+                    for j in range(1, x.shape[1]):
+                        terms = terms + s(j, n_splines=k)
+                    model = LogisticGAM(terms)
+                    model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..5) [geo_latlon]"
+                else:
+                    terms = s(0, n_splines=k) + s(1, n_splines=k) + s(2, n_splines=k)
+                    for j in range(3, x.shape[1]):
+                        terms = terms + l(j)
+                    model = LogisticGAM(terms)
+                    model_spec = (
+                        f"LogisticGAM(s(0)+s(1)+s(2)+linear(3:5), "
+                        f"n_splines={k}, basis={latlon_cfg['basis_code']}) [geo_latlon]"
+                    )
             elif scenario["name"] == "icu_survival_death":
                 model = LogisticGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))
                 model_spec = "LogisticGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))"
@@ -2402,6 +2910,9 @@ def main():
     results = []
     for s_cfg in scenarios:
         results.append(run_rust_scenario_cv(s_cfg))
+        rust_gamlss_row = run_rust_gamlss_scenario_cv(s_cfg)
+        if rust_gamlss_row is not None:
+            results.append(rust_gamlss_row)
         results.append(run_external_mgcv_cv(s_cfg))
         results.append(run_external_pygam_cv(s_cfg))
 

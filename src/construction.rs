@@ -505,6 +505,21 @@ fn assess_subspace_leakage(
     }
 }
 
+fn compose_qs_from_split(q_pen: &Mat<f64>, q_null: &Mat<f64>, p: usize) -> Mat<f64> {
+    let rank = q_pen.ncols();
+    let null_count = q_null.ncols();
+    let mut qs = Mat::<f64>::zeros(p, p);
+    for i in 0..p {
+        for j in 0..rank {
+            qs[(i, j)] = q_pen[(i, j)];
+        }
+        for j in 0..null_count {
+            qs[(i, rank + j)] = q_null[(i, j)];
+        }
+    }
+    qs
+}
+
 /// Computes weighted column means for functional ANOVA decomposition.
 /// Returns the weighted means that would be subtracted by center_columns_in_place.
 fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
@@ -781,10 +796,78 @@ pub fn construct_s_lambda(
 
 /// Lambda-independent reparameterization invariants derived from penalty structure.
 #[derive(Clone)]
+struct SubspaceSplit {
+    q_pen: Array2<f64>,
+    q_null: Array2<f64>,
+}
+
+impl SubspaceSplit {
+    fn identity(p: usize) -> Self {
+        Self {
+            q_pen: Array2::zeros((p, 0)),
+            q_null: Array2::eye(p),
+        }
+    }
+
+    fn from_ordered_qs(qs: &Mat<f64>, penalized_rank: usize, p: usize) -> Result<Self, EstimationError> {
+        if qs.nrows() != p || qs.ncols() != p {
+            return Err(EstimationError::LayoutError(format!(
+                "Invalid Q basis dimensions: expected {p}x{p}, got {}x{}",
+                qs.nrows(),
+                qs.ncols()
+            )));
+        }
+        if penalized_rank > p {
+            return Err(EstimationError::LayoutError(format!(
+                "Invalid penalized rank {penalized_rank} for p={p}"
+            )));
+        }
+
+        let null_count = p - penalized_rank;
+        let mut q_pen = Array2::<f64>::zeros((p, penalized_rank));
+        let mut q_null = Array2::<f64>::zeros((p, null_count));
+        for i in 0..p {
+            for j in 0..penalized_rank {
+                q_pen[(i, j)] = qs[(i, j)];
+            }
+            for j in 0..null_count {
+                q_null[(i, j)] = qs[(i, penalized_rank + j)];
+            }
+        }
+
+        Ok(Self { q_pen, q_null })
+    }
+
+    fn rank(&self) -> usize {
+        self.q_pen.ncols()
+    }
+
+    fn p(&self) -> usize {
+        self.q_pen.nrows()
+    }
+
+    fn compose_qs(&self) -> Array2<f64> {
+        let p = self.p();
+        let rank = self.rank();
+        let null_count = self.q_null.ncols();
+        let mut qs = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..rank {
+                qs[(i, j)] = self.q_pen[(i, j)];
+            }
+            for j in 0..null_count {
+                qs[(i, rank + j)] = self.q_null[(i, j)];
+            }
+        }
+        qs
+    }
+}
+
+/// Lambda-independent reparameterization invariants derived from penalty structure.
+#[derive(Clone)]
 pub struct ReparamInvariant {
-    qs_base: Array2<f64>,
+    split: SubspaceSplit,
     rs_transformed_base: Vec<Array2<f64>>,
-    penalized_rank: usize,
     has_nonzero: bool,
 }
 
@@ -799,9 +882,8 @@ pub fn precompute_reparam_invariant(
 
     if m == 0 {
         return Ok(ReparamInvariant {
-            qs_base: Array2::eye(p),
+            split: SubspaceSplit::identity(p),
             rs_transformed_base: Vec::new(),
-            penalized_rank: 0,
             has_nonzero: false,
         });
     }
@@ -826,9 +908,8 @@ pub fn precompute_reparam_invariant(
 
     if !has_nonzero {
         return Ok(ReparamInvariant {
-            qs_base: Array2::eye(p),
+            split: SubspaceSplit::identity(p),
             rs_transformed_base: rs_list.to_vec(),
-            penalized_rank: 0,
             has_nonzero: false,
         });
     }
@@ -867,6 +948,7 @@ pub fn precompute_reparam_invariant(
         .iter()
         .take_while(|&&val| val > rank_tol)
         .count();
+    let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p)?;
 
     let mut rs_transformed_base: Vec<Mat<f64>> = Vec::with_capacity(m);
     for rs in &rs_faer {
@@ -883,9 +965,8 @@ pub fn precompute_reparam_invariant(
     }
 
     Ok(ReparamInvariant {
-        qs_base: mat_to_array(&qs),
+        split,
         rs_transformed_base: rs_transformed_base.iter().map(mat_to_array).collect(),
-        penalized_rank,
         has_nonzero,
     })
 }
@@ -959,39 +1040,33 @@ pub fn stable_reparameterization_with_invariant(
             s_transformed: Array2::zeros((p, p)),
             log_det: 0.0,
             det1: Array1::zeros(m),
-            qs: invariant.qs_base.clone(),
+            qs: invariant.split.compose_qs(),
             rs_transformed: rs_list.to_vec(),
             rs_transposed: rs_list.iter().map(transpose_owned).collect(),
             e_transformed: Array2::zeros((0, p)),
-            u_truncated: Array2::zeros((p, p)), // All modes truncated when zero penalty
+            u_truncated: invariant.split.q_null.clone(), // All modes truncated when zero penalty
         });
     }
 
-    let mut qs = array_to_faer(&invariant.qs_base);
+    let mut q_pen = array_to_faer(&invariant.split.q_pen);
+    let q_null = array_to_faer(&invariant.split.q_null);
     let mut rs_transformed: Vec<Mat<f64>> = invariant
         .rs_transformed_base
         .iter()
         .map(array_to_faer)
         .collect();
 
-    let penalized_rank = invariant.penalized_rank;
-
-    let mut s_lambda = Mat::<f64>::zeros(p, p);
-    for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
-        let s_k = penalty_from_root_faer(rs_k);
-        for i in 0..p {
-            for j in 0..p {
-                s_lambda[(i, j)] += *lambda * s_k[(i, j)];
-            }
-        }
-    }
+    let penalized_rank = invariant.split.rank();
 
     let mut range_eigenvalues_sorted: Vec<f64> = Vec::new();
     if penalized_rank > 0 {
         let mut range_block = Mat::<f64>::zeros(penalized_rank, penalized_rank);
-        for i in 0..penalized_rank {
-            for j in 0..penalized_rank {
-                range_block[(i, j)] = s_lambda[(i, j)];
+        for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
+            let s_k = penalty_from_root_faer(rs_k);
+            for i in 0..penalized_rank {
+                for j in 0..penalized_rank {
+                    range_block[(i, j)] += *lambda * s_k[(i, j)];
+                }
             }
         }
         let (range_eigenvalues, range_eigenvectors) =
@@ -1016,26 +1091,16 @@ pub fn stable_reparameterization_with_invariant(
             }
         }
 
-        let mut qs_subset = Mat::<f64>::zeros(p, penalized_rank);
-        for row in 0..p {
-            for col in 0..penalized_rank {
-                qs_subset[(row, col)] = qs[(row, col)];
-            }
-        }
         let mut qs_range = Mat::<f64>::zeros(p, penalized_rank);
         matmul(
             qs_range.as_mut(),
             Accum::Replace,
-            qs_subset.as_ref(),
+            q_pen.as_ref(),
             range_rotation.as_ref(),
             1.0,
             Par::Seq,
         );
-        for row in 0..p {
-            for col in 0..penalized_rank {
-                qs[(row, col)] = qs_range[(row, col)];
-            }
-        }
+        q_pen = qs_range;
 
         for rs in rs_transformed.iter_mut() {
             if rs.ncols() >= penalized_rank {
@@ -1082,6 +1147,7 @@ pub fn stable_reparameterization_with_invariant(
         .fold(0.0_f64, f64::max)
         .max(1.0);
     let eigenvalue_floor = max_eig * 1e-12;
+    let qs = compose_qs_from_split(&q_pen, &q_null, p);
 
     // Guard against any accidental penalized/null mixing. The transformed penalty
     // roots must have negligible support on null columns by construction.
@@ -1102,14 +1168,7 @@ pub fn stable_reparameterization_with_invariant(
     }
 
     // Truncated basis is the structural null-space basis (fixed Q_n).
-    let truncated_count = p.saturating_sub(structural_rank);
-    let mut u_truncated_mat = Mat::<f64>::zeros(p, truncated_count);
-    for col_out in 0..truncated_count {
-        let col_in = structural_rank + col_out;
-        for row in 0..p {
-            u_truncated_mat[(row, col_out)] = qs[(row, col_in)];
-        }
-    }
+    let u_truncated_mat = q_null.clone();
 
     // E rows correspond to sqrt(eigenvalue) * q_j^T over fixed penalized columns.
     let mut e_transformed_mat = Mat::<f64>::zeros(structural_rank, p);
@@ -1117,7 +1176,7 @@ pub fn stable_reparameterization_with_invariant(
         let safe_eigenval = range_eigs_sorted[row_idx].max(eigenvalue_floor);
         let sqrt_eigenval = safe_eigenval.sqrt();
         for row in 0..p {
-            e_transformed_mat[(row_idx, row)] = qs[(row, row_idx)] * sqrt_eigenval;
+            e_transformed_mat[(row_idx, row)] = q_pen[(row, row_idx)] * sqrt_eigenval;
         }
     }
 
@@ -1136,9 +1195,9 @@ pub fn stable_reparameterization_with_invariant(
         if eigenval > eigenvalue_floor {
             let inv = 1.0 / eigenval;
             for i in 0..p {
-                let vi = qs[(i, eig_idx)];
+                let vi = q_pen[(i, eig_idx)];
                 for j in 0..p {
-                    s_plus[(i, j)] += inv * vi * qs[(j, eig_idx)];
+                    s_plus[(i, j)] += inv * vi * q_pen[(j, eig_idx)];
                 }
             }
         }

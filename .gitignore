@@ -13,4 +13,8 @@ benchmarks/results*.json
 benchmarks/*.png
 benchmarks/*_fitted.csv
 benchmarks/datasets/hgdp_1kg_pc_data.tsv
+# Bench runtime outputs
+bench/results*.json
+bench/results-shards/*.json
+bench/gam_bench_rust_cv_*/
 *.png
