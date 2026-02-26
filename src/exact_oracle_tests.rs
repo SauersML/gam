@@ -136,6 +136,7 @@ fn laml_gradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f
         max_iter: 60,
         tol: 1e-8,
         nullspace_dims: vec![0],
+        firth_bias_reduction: None,
     };
     let rho_arr = array![rho];
     let (analytic_grad, _fd_grad) = evaluate_external_gradients(
@@ -228,7 +229,11 @@ fn tiny_logit_laml_vs_exact_oracle_regular_regime_sweep_is_stable() {
     let dot = a.dot(&b);
     let na = a.dot(&a).sqrt();
     let nb = b.dot(&b).sqrt();
-    let cosine = if na * nb > 1e-12 { dot / (na * nb) } else { 1.0 };
+    let cosine = if na * nb > 1e-12 {
+        dot / (na * nb)
+    } else {
+        1.0
+    };
     rels.sort_by(|x, y| x.partial_cmp(y).unwrap());
     let median_rel = rels[rels.len() / 2];
     let max_rel = rels.iter().copied().fold(0.0_f64, f64::max);
@@ -364,7 +369,13 @@ fn isolation_reparam_pgs_pc_mains_firth() {
     }
     let beta_true = array![0.1, 0.8, -0.4, 0.5, -0.3, 0.2, -0.1];
     let eta = x.dot(&beta_true);
-    let y = eta.mapv(|e| if 1.0 / (1.0 + (-e).exp()) > 0.5 { 1.0 } else { 0.0 });
+    let y = eta.mapv(|e| {
+        if 1.0 / (1.0 + (-e).exp()) > 0.5 {
+            1.0
+        } else {
+            0.0
+        }
+    });
     let w = Array1::ones(n);
     let offset = Array1::zeros(n);
 
@@ -382,6 +393,7 @@ fn isolation_reparam_pgs_pc_mains_firth() {
         max_iter: 120,
         tol: 1e-10,
         nullspace_dims: vec![1, 0],
+        firth_bias_reduction: None,
     };
     let rho = array![1.5, 0.8];
     let (analytic, fd) = evaluate_external_gradients(
@@ -398,7 +410,11 @@ fn isolation_reparam_pgs_pc_mains_firth() {
     let dot = analytic.dot(&fd);
     let na = analytic.dot(&analytic).sqrt();
     let nf = fd.dot(&fd).sqrt();
-    let cosine = if na * nf > 1e-12 { dot / (na * nf) } else { 1.0 };
+    let cosine = if na * nf > 1e-12 {
+        dot / (na * nf)
+    } else {
+        1.0
+    };
     let rel_l2 = (&analytic - &fd).dot(&(&analytic - &fd)).sqrt() / na.max(nf).max(1e-12);
     assert!(
         cosine > 0.99,

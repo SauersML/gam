@@ -101,9 +101,7 @@ pub fn optimize_survival_lambdas_with_multistart<F>(
     options: &SurvivalLambdaOptimizerOptions,
 ) -> Result<SurvivalLambdaOptimizerResult, crate::estimate::EstimationError>
 where
-    F: FnMut(
-        &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), crate::estimate::EstimationError>,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), crate::estimate::EstimationError>,
 {
     // Default path is exact-gradient-first for survival models.
     // This avoids repeated inner re-solves required by finite differences.
@@ -174,9 +172,7 @@ pub fn optimize_survival_lambdas_with_multistart_with_gradient<F>(
     options: &SurvivalLambdaOptimizerOptions,
 ) -> Result<SurvivalLambdaOptimizerResult, crate::estimate::EstimationError>
 where
-    F: FnMut(
-        &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), crate::estimate::EstimationError>,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), crate::estimate::EstimationError>,
 {
     optimize_survival_lambdas_with_multistart(
         num_penalties,

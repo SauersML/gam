@@ -529,7 +529,7 @@ mod tests {
     use approx::assert_relative_eq;
 
     fn even_moment_exp_neg_x2(power: usize) -> f64 {
-        debug_assert!(power % 2 == 0);
+        debug_assert!(power.is_multiple_of(2));
         let m = power / 2;
         let mut odd_double_factorial = 1.0_f64;
         for k in 0..m {
@@ -596,7 +596,7 @@ mod tests {
             let signed_t1 = if k % 2 == 1 { t1 } else { -t1 };
             sum += signed_t1;
 
-            if k + 1 <= 4096 {
+            if k < 4096 {
                 let k2f = (k + 1) as f64;
                 let a2 = (k2f * s * s + m) / z;
                 let b2 = (k2f * s * s - m) / z;

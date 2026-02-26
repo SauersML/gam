@@ -1213,7 +1213,8 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
     }
     // Precompute transposed root blocks once:
     //   R_k^T is the RHS used for batched solves Q X = R_k^T.
-    let penalty_roots_t: Vec<Array2<f64>> = penalty_roots.iter().map(|r| r.t().to_owned()).collect();
+    let penalty_roots_t: Vec<Array2<f64>> =
+        penalty_roots.iter().map(|r| r.t().to_owned()).collect();
 
     let mut rng = StdRng::seed_from_u64(config.seed);
     let n_iter = config.n_warmup + config.n_samples;

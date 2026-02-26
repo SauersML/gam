@@ -936,7 +936,6 @@ pub fn stable_reparameterization_with_invariant(
     p: usize,
     invariant: &ReparamInvariant,
 ) -> Result<ReparamResult, EstimationError> {
-
     let m = rs_list.len();
 
     if lambdas.len() != m {

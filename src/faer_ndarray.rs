@@ -482,97 +482,6 @@ pub fn ldlt_rook(
     Ok((l_unit_lower, d_diag, d_subdiag, perm_fwd, perm_inv, inertia))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ndarray::array;
-
-    fn reconstruct_from_ldlt(
-        l_unit_lower: &Array2<f64>,
-        d_diag: &Array1<f64>,
-        d_subdiag: &Array1<f64>,
-        perm_inv: &[usize],
-    ) -> Array2<f64> {
-        let n = d_diag.len();
-        let mut b = Array2::<f64>::zeros((n, n));
-        let mut i = 0usize;
-        while i < n {
-            if i + 1 < n && d_subdiag[i].abs() > 1e-12 {
-                b[[i, i]] = d_diag[i];
-                b[[i, i + 1]] = d_subdiag[i];
-                b[[i + 1, i]] = d_subdiag[i];
-                b[[i + 1, i + 1]] = d_diag[i + 1];
-                i += 2;
-            } else {
-                b[[i, i]] = d_diag[i];
-                i += 1;
-            }
-        }
-
-        let tmp = l_unit_lower.dot(&b).dot(&l_unit_lower.t());
-        let mut out = Array2::<f64>::zeros((n, n));
-        for row in 0..n {
-            for col in 0..n {
-                out[[row, col]] = tmp[[perm_inv[row], perm_inv[col]]];
-            }
-        }
-        out
-    }
-
-    fn inertia_from_eigs(a: &Array2<f64>, tol: f64) -> (usize, usize, usize) {
-        let (evals, _) = a
-            .eigh(Side::Lower)
-            .expect("eigen decomposition should succeed");
-        let mut pos = 0usize;
-        let mut neg = 0usize;
-        let mut zero = 0usize;
-        for &v in &evals {
-            if v > tol {
-                pos += 1;
-            } else if v < -tol {
-                neg += 1;
-            } else {
-                zero += 1;
-            }
-        }
-        (pos, neg, zero)
-    }
-
-    #[test]
-    fn ldlt_rook_reconstructs_input_and_matches_inertia() {
-        // Symmetric indefinite matrix that exercises rook pivoting / 2x2 blocks.
-        let a = array![
-            [0.0, 2.0, 0.5, 0.0],
-            [2.0, 0.0, -1.0, 0.3],
-            [0.5, -1.0, 1.5, 0.4],
-            [0.0, 0.3, 0.4, -0.2]
-        ];
-
-        let (l, d_diag, d_subdiag, _perm_fwd, perm_inv, inertia) =
-            ldlt_rook(&a).expect("ldlt_rook should succeed");
-
-        // L should be unit-lower and upper triangle should be zeroed by construction.
-        for i in 0..l.nrows() {
-            assert!((l[[i, i]] - 1.0).abs() < 1e-12);
-            for j in i + 1..l.ncols() {
-                assert!(l[[i, j]].abs() < 1e-12);
-            }
-        }
-
-        let a_rec = reconstruct_from_ldlt(&l, &d_diag, &d_subdiag, &perm_inv);
-        let max_abs_err = (&a_rec - &a)
-            .iter()
-            .fold(0.0f64, |acc, &x| acc.max(x.abs()));
-        assert!(
-            max_abs_err < 1e-8,
-            "reconstruction error too large: {max_abs_err:e}"
-        );
-
-        let eig_inertia = inertia_from_eigs(&a, 1e-9);
-        assert_eq!(inertia, eig_inertia);
-    }
-}
-
 pub struct FaerArrayView<'a> {
     ptr: *const f64,
     rows: usize,
@@ -854,5 +763,96 @@ impl<S: Data<Elem = f64>> FaerQr for ArrayBase<S, Ix2> {
         let q = qr.compute_Q();
         let r = qr.R();
         Ok((mat_to_array(q.as_ref()), mat_to_array(r)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn reconstruct_from_ldlt(
+        l_unit_lower: &Array2<f64>,
+        d_diag: &Array1<f64>,
+        d_subdiag: &Array1<f64>,
+        perm_inv: &[usize],
+    ) -> Array2<f64> {
+        let n = d_diag.len();
+        let mut b = Array2::<f64>::zeros((n, n));
+        let mut i = 0usize;
+        while i < n {
+            if i + 1 < n && d_subdiag[i].abs() > 1e-12 {
+                b[[i, i]] = d_diag[i];
+                b[[i, i + 1]] = d_subdiag[i];
+                b[[i + 1, i]] = d_subdiag[i];
+                b[[i + 1, i + 1]] = d_diag[i + 1];
+                i += 2;
+            } else {
+                b[[i, i]] = d_diag[i];
+                i += 1;
+            }
+        }
+
+        let tmp = l_unit_lower.dot(&b).dot(&l_unit_lower.t());
+        let mut out = Array2::<f64>::zeros((n, n));
+        for row in 0..n {
+            for col in 0..n {
+                out[[row, col]] = tmp[[perm_inv[row], perm_inv[col]]];
+            }
+        }
+        out
+    }
+
+    fn inertia_from_eigs(a: &Array2<f64>, tol: f64) -> (usize, usize, usize) {
+        let (evals, _) = a
+            .eigh(Side::Lower)
+            .expect("eigen decomposition should succeed");
+        let mut pos = 0usize;
+        let mut neg = 0usize;
+        let mut zero = 0usize;
+        for &v in &evals {
+            if v > tol {
+                pos += 1;
+            } else if v < -tol {
+                neg += 1;
+            } else {
+                zero += 1;
+            }
+        }
+        (pos, neg, zero)
+    }
+
+    #[test]
+    fn ldlt_rook_reconstructs_input_and_matches_inertia() {
+        // Symmetric indefinite matrix that exercises rook pivoting / 2x2 blocks.
+        let a = array![
+            [0.0, 2.0, 0.5, 0.0],
+            [2.0, 0.0, -1.0, 0.3],
+            [0.5, -1.0, 1.5, 0.4],
+            [0.0, 0.3, 0.4, -0.2]
+        ];
+
+        let (l, d_diag, d_subdiag, _perm_fwd, perm_inv, inertia) =
+            ldlt_rook(&a).expect("ldlt_rook should succeed");
+
+        // L should be unit-lower and upper triangle should be zeroed by construction.
+        for i in 0..l.nrows() {
+            assert!((l[[i, i]] - 1.0).abs() < 1e-12);
+            for j in i + 1..l.ncols() {
+                assert!(l[[i, j]].abs() < 1e-12);
+            }
+        }
+
+        let a_rec = reconstruct_from_ldlt(&l, &d_diag, &d_subdiag, &perm_inv);
+        let max_abs_err = (&a_rec - &a)
+            .iter()
+            .fold(0.0f64, |acc, &x| acc.max(x.abs()));
+        assert!(
+            max_abs_err < 1e-8,
+            "reconstruction error too large: {max_abs_err:e}"
+        );
+
+        let eig_inertia = inertia_from_eigs(&a, 1e-9);
+        assert_eq!(inertia, eig_inertia);
     }
 }

@@ -1387,7 +1387,7 @@ where
 #[cfg(test)]
 thread_local! {
     static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -3031,7 +3031,7 @@ pub fn solve_penalized_least_squares(
     Ok((
         StablePLSResult {
             beta: Coefficients::new(beta_vec),
-            penalized_hessian: penalized_hessian, // Return original H for derivatives
+            penalized_hessian, // Return original H for derivatives
             edf,
             scale,
             ridge_used,
@@ -3215,6 +3215,75 @@ fn calculate_scale(
     }
 }
 
+/// Compute penalized Hessian matrix X'WX + S_λ correctly handling negative weights
+/// Used after P-IRLS convergence for final result
+pub fn compute_final_penalized_hessian(
+    x: ArrayView2<f64>,
+    weights: &Array1<f64>,
+    s_lambda: &Array2<f64>, // This is S_lambda = Σλ_k * S_k
+) -> Result<Array2<f64>, EstimationError> {
+    use crate::faer_ndarray::{FaerEigh, FaerQr};
+    use ndarray::s;
+
+    let p = x.ncols();
+
+    // Stage: Perform the QR decomposition of sqrt(W)X to get R_bar
+    let sqrt_w = weights.mapv(|w| w.max(0.0).sqrt());
+    let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
+    let (_, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
+    let r_rows = r_bar.nrows().min(p);
+    let r1_full = r_bar.slice(s![..r_rows, ..]);
+
+    // Stage: Get the square root of the penalty matrix, E
+    // We need to use eigendecomposition as S_lambda is not necessarily from a single root
+    let (eigenvalues, eigenvectors) = s_lambda
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
+
+    // Find the maximum eigenvalue to create a relative tolerance
+    let max_eigenval = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
+
+    // Define a relative tolerance. Use an absolute fallback for zero matrices.
+    let tolerance = if max_eigenval > 0.0 {
+        max_eigenval * 1e-12
+    } else {
+        1e-12
+    };
+
+    let rank_s = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+
+    let mut e = Array2::zeros((p, rank_s));
+    let mut col_idx = 0;
+    for (i, &eigenval) in eigenvalues.iter().enumerate() {
+        if eigenval > tolerance {
+            let scaled_eigvec = eigenvectors.column(i).mapv(|v| v * eigenval.sqrt());
+            e.column_mut(col_idx).assign(&scaled_eigvec);
+            col_idx += 1;
+        }
+    }
+
+    // Stage: Form the augmented matrix [R1; E_t]
+    // Note: Here we use the full, un-truncated matrices because we are just computing
+    // the Hessian for a given model, not performing rank detection.
+    let e_t = e.t();
+    let nr = r_rows + e_t.nrows();
+    let mut augmented_matrix = Array2::zeros((nr, p));
+    augmented_matrix
+        .slice_mut(s![..r_rows, ..])
+        .assign(&r1_full);
+    augmented_matrix.slice_mut(s![r_rows.., ..]).assign(&e_t);
+
+    // Stage: Perform the QR decomposition on the augmented matrix
+    let (_, r_aug) = augmented_matrix
+        .qr()
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
+
+    // Stage: Recognize that the penalized Hessian is R_aug' * R_aug
+    let h_final = r_aug.t().dot(&r_aug);
+
+    Ok(h_final)
+}
+
 #[cfg(test)]
 mod tests {
     use super::calculate_scale;
@@ -3283,73 +3352,4 @@ mod tests {
             expected
         );
     }
-}
-
-/// Compute penalized Hessian matrix X'WX + S_λ correctly handling negative weights
-/// Used after P-IRLS convergence for final result
-pub fn compute_final_penalized_hessian(
-    x: ArrayView2<f64>,
-    weights: &Array1<f64>,
-    s_lambda: &Array2<f64>, // This is S_lambda = Σλ_k * S_k
-) -> Result<Array2<f64>, EstimationError> {
-    use crate::faer_ndarray::{FaerEigh, FaerQr};
-    use ndarray::s;
-
-    let p = x.ncols();
-
-    // Stage: Perform the QR decomposition of sqrt(W)X to get R_bar
-    let sqrt_w = weights.mapv(|w| w.max(0.0).sqrt());
-    let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
-    let (_, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
-    let r_rows = r_bar.nrows().min(p);
-    let r1_full = r_bar.slice(s![..r_rows, ..]);
-
-    // Stage: Get the square root of the penalty matrix, E
-    // We need to use eigendecomposition as S_lambda is not necessarily from a single root
-    let (eigenvalues, eigenvectors) = s_lambda
-        .eigh(Side::Lower)
-        .map_err(EstimationError::EigendecompositionFailed)?;
-
-    // Find the maximum eigenvalue to create a relative tolerance
-    let max_eigenval = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-
-    // Define a relative tolerance. Use an absolute fallback for zero matrices.
-    let tolerance = if max_eigenval > 0.0 {
-        max_eigenval * 1e-12
-    } else {
-        1e-12
-    };
-
-    let rank_s = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-
-    let mut e = Array2::zeros((p, rank_s));
-    let mut col_idx = 0;
-    for (i, &eigenval) in eigenvalues.iter().enumerate() {
-        if eigenval > tolerance {
-            let scaled_eigvec = eigenvectors.column(i).mapv(|v| v * eigenval.sqrt());
-            e.column_mut(col_idx).assign(&scaled_eigvec);
-            col_idx += 1;
-        }
-    }
-
-    // Stage: Form the augmented matrix [R1; E_t]
-    // Note: Here we use the full, un-truncated matrices because we are just computing
-    // the Hessian for a given model, not performing rank detection.
-    let e_t = e.t();
-    let nr = r_rows + e_t.nrows();
-    let mut augmented_matrix = Array2::zeros((nr, p));
-    augmented_matrix
-        .slice_mut(s![..r_rows, ..])
-        .assign(&r1_full);
-    augmented_matrix.slice_mut(s![r_rows.., ..]).assign(&e_t);
-
-    // Stage: Perform the QR decomposition on the augmented matrix
-    let (_, r_aug) = augmented_matrix
-        .qr()
-        .map_err(EstimationError::LinearSystemSolveFailed)?;
-
-    // Stage: Recognize that the penalized Hessian is R_aug' * R_aug
-    let h_final = r_aug.t().dot(&r_aug);
-
-    Ok(h_final)
 }

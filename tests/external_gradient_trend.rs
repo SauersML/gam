@@ -6,7 +6,9 @@ use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-fn make_binary_external_problem(seed: u64) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<Array2<f64>>) {
+fn make_binary_external_problem(
+    seed: u64,
+) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<Array2<f64>>) {
     let n = 100;
     let p = 8;
     let mut rng = StdRng::seed_from_u64(seed);
@@ -47,6 +49,7 @@ fn analytic_gradient_matches_cost_trend() {
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![1],
+        firth_bias_reduction: None,
     };
 
     let (analytic, _fd) = evaluate_external_gradients(
@@ -123,6 +126,7 @@ fn hypothesis_analytic_gradient_matches_cost_trend() {
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![1],
+        firth_bias_reduction: None,
     };
 
     let mut same_sign = 0usize;

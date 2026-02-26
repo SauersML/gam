@@ -17,7 +17,62 @@
       "n": 50000,
       "p": 80,
       "seed": 17
+    },
+    {
+      "name": "lidar_semipar",
+      "dataset": "lidar"
+    },
+    {
+      "name": "bone_gamair",
+      "dataset": "bone"
+    },
+    {
+      "name": "prostate_gamair",
+      "dataset": "prostate"
+    },
+    {
+      "name": "wine_gamair",
+      "dataset": "wine"
+    },
+    {
+      "name": "wine_temp_vs_year",
+      "dataset": "wine_temp_year"
+    },
+    {
+      "name": "wine_price_vs_temp",
+      "dataset": "wine_price_temp"
+    },
+    {
+      "name": "horse_colic",
+      "dataset": "horse"
+    },
+    {
+      "name": "us48_demand_5day",
+      "dataset": "five_day"
+    },
+    {
+      "name": "us48_demand_31day",
+      "dataset": "31_day"
+    },
+    {
+      "name": "haberman_survival",
+      "dataset": "haberman"
+    },
+    {
+      "name": "icu_survival_death",
+      "dataset": "icu_survival_death"
+    },
+    {
+      "name": "icu_survival_los",
+      "dataset": "icu_survival_los"
+    },
+    {
+      "name": "heart_failure_survival",
+      "dataset": "heart_failure_clinical_records_dataset"
+    },
+    {
+      "name": "cirrhosis_survival",
+      "dataset": "cirrhosis"
     }
   ]
 }
-
