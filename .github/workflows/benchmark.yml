@@ -127,12 +127,43 @@ jobs:
           BENCH_GAM_BIN: ${{ github.workspace }}/bench/runtime/gam
         run: |
           set -euo pipefail
+          echo "== Benchmark shard diagnostics =="
+          echo "pwd: $(pwd)"
+          echo "scenario: ${{ matrix.scenario }}"
+          echo "python: $(command -v python3)"
+          python3 --version
+          echo "Rscript: $(command -v Rscript)"
+          Rscript --version
+          echo "BENCH_GAM_BIN=${BENCH_GAM_BIN}"
+          echo "PYTHONPATH=${PYTHONPATH}"
+          echo "R_LIBS_USER=${R_LIBS_USER}"
+          echo "bench/runtime tree:"
+          ls -la bench/runtime || true
+          ls -la bench/runtime/pydeps | sed -n '1,40p' || true
+          ls -la bench/runtime/r-lib | sed -n '1,40p' || true
+          echo "gam binary before chmod:"
+          ls -l "${BENCH_GAM_BIN}" || true
+          file "${BENCH_GAM_BIN}" || true
+          chmod +x "${BENCH_GAM_BIN}" || true
+          echo "gam binary after chmod:"
+          ls -l "${BENCH_GAM_BIN}" || true
+          file "${BENCH_GAM_BIN}" || true
           test -x "${BENCH_GAM_BIN}"
+          echo "smoke-import python deps"
+          python3 - <<'PY'
+          import numpy, pandas, pygam, lifelines
+          print("python deps ok")
+          PY
+          echo "smoke-load R deps"
+          Rscript -e 'library(mgcv); library(jsonlite); cat("R deps ok\n")'
           mkdir -p bench/results-shards
+          echo "running benchmark shard..."
           python3 bench/run_suite.py \
             --scenarios bench/scenarios.json \
             --scenario-name "${{ matrix.scenario }}" \
             --out "bench/results-shards/${{ matrix.scenario }}.json"
+          echo "shard output:"
+          ls -l "bench/results-shards/${{ matrix.scenario }}.json"
 
       - name: Upload shard artifact
         uses: actions/upload-artifact@v4
