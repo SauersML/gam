@@ -128,8 +128,6 @@ struct SurvivalArgs {
     event: String,
     #[arg(long = "formula")]
     formula: String,
-    #[arg(long = "monotonicity-lambda", default_value_t = 1.0)]
-    monotonicity_lambda: f64,
     /// Net or crude risk target.
     #[arg(long = "spec", default_value = "net")]
     spec: String,
@@ -254,8 +252,6 @@ struct SavedModel {
     survival_event: Option<String>,
     #[serde(default)]
     survival_spec: Option<String>,
-    #[serde(default)]
-    survival_monotonicity_lambda: Option<f64>,
     #[serde(default)]
     survival_baseline_target: Option<String>,
     #[serde(default)]
@@ -668,7 +664,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     survival_exit: None,
                     survival_event: None,
                     survival_spec: None,
-                    survival_monotonicity_lambda: None,
                     survival_baseline_target: None,
                     survival_baseline_scale: None,
                     survival_baseline_shape: None,
@@ -757,7 +752,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             survival_exit: None,
             survival_event: None,
             survival_spec: None,
-            survival_monotonicity_lambda: None,
             survival_baseline_target: None,
             survival_baseline_scale: None,
             survival_baseline_shape: None,
@@ -1885,7 +1879,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let model = gam::families::royston_parmar::working_model_from_flattened(
         penalties,
         MonotonicityPenalty {
-            lambda: args.monotonicity_lambda,
+            lambda: 0.0,
             tolerance: 1e-8,
         },
         survival_spec,
@@ -1985,7 +1979,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             survival_exit: Some(args.exit),
             survival_event: Some(args.event),
             survival_spec: Some(args.spec),
-            survival_monotonicity_lambda: Some(args.monotonicity_lambda),
             survival_baseline_target: Some(
                 survival_baseline_target_name(baseline_cfg.target).to_string(),
             ),
@@ -2151,7 +2144,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             other => return Err(format!("unsupported saved survival spec '{other}'")),
         };
         let monotonicity = MonotonicityPenalty {
-            lambda: model.survival_monotonicity_lambda.unwrap_or(10.0),
+            lambda: 0.0,
             tolerance: 1e-8,
         };
         let baseline_cfg = survival_baseline_config_from_model(&model)?;
@@ -2443,7 +2436,6 @@ fn build_location_scale_saved_model(
         survival_exit: None,
         survival_event: None,
         survival_spec: None,
-        survival_monotonicity_lambda: None,
         survival_baseline_target: None,
         survival_baseline_scale: None,
         survival_baseline_shape: None,

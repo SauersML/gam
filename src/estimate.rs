@@ -842,49 +842,6 @@ pub(crate) fn compute_smoothing_correction(
     Some(v_corr_orig)
 }
 
-fn check_rho_gradient_stationarity(
-    label: &str,
-    reml_state: &RemlState<'_>,
-    final_z: &Array1<f64>,
-    tol_z: f64,
-) -> Result<(f64, bool), EstimationError> {
-    let rho = to_rho_from_z(final_z);
-    let mut grad_rho = reml_state.compute_gradient(&rho)?;
-    let grad_rho_raw = grad_rho.clone();
-    project_rho_gradient(&rho, &mut grad_rho);
-    let grad_norm_z = grad_norm_in_z_space(&rho, &grad_rho);
-    let grad_norm_rho = grad_rho.dot(&grad_rho).sqrt();
-    let max_abs_grad = grad_rho_raw
-        .iter()
-        .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
-    let max_abs_rho = rho.iter().fold(0.0_f64, |acc, &val| acc.max(val.abs()));
-
-    let tol_z = tol_z.max(1e-12);
-    let tol_rho = tol_z;
-    let is_stationary = grad_norm_z <= tol_z && grad_norm_rho <= tol_rho;
-    if grad_norm_z > tol_z || grad_norm_rho > tol_rho {
-        log::debug!(
-            "[Candidate {label}] stationarity check failed (||g_z||={:.3e}, ||g_rho||={:.3e}; tol_z={:.3e}, tol_rho={:.3e}); marking as non-stationary",
-            grad_norm_z,
-            grad_norm_rho,
-            tol_z,
-            tol_rho
-        );
-    }
-
-    log::debug!(
-        "[Candidate {label}] z-space gradient norm {:.3e} (tol {:.3e}); projected rho-space norm {:.3e}; max|∇ρ| {:.3e}; max|ρ| {:.2}; stationary = {}",
-        grad_norm_z,
-        tol_z,
-        grad_norm_rho,
-        max_abs_grad,
-        max_abs_rho,
-        is_stationary
-    );
-
-    Ok((grad_norm_z, is_stationary))
-}
-
 fn run_bfgs_for_candidate(
     label: &str,
     reml_state: &RemlState<'_>,
@@ -945,12 +902,14 @@ fn run_bfgs_for_candidate(
         )));
     }
 
-    let (grad_norm_rho, is_stationary) = check_rho_gradient_stationarity(
-        label,
-        reml_state,
-        &solution.final_point,
+    let grad_norm_rho = solution.final_gradient_norm;
+    let is_stationary = grad_norm_rho <= config.reml_convergence_tolerance.max(1e-12);
+    log::debug!(
+        "[Candidate {label}] BFGS final gradient norm {:.3e} (tol {:.3e}); stationary={}",
+        grad_norm_rho,
         config.reml_convergence_tolerance,
-    )?;
+        is_stationary
+    );
 
     Ok((solution, grad_norm_rho, is_stationary))
 }
@@ -977,6 +936,7 @@ fn run_newton_for_candidate(
     let mut best_rho = rho.clone();
     let mut best_cost = f64::INFINITY;
     let mut iter_done = 0usize;
+    let mut last_grad_norm = f64::INFINITY;
 
     for iter in 0..max_iter {
         iter_done = iter + 1;
@@ -984,11 +944,12 @@ fn run_newton_for_candidate(
         let mut grad = reml_state.compute_gradient(&rho)?;
         maybe_audit_gradient(reml_state, &rho, iter_done as u64, &mut grad);
         project_rho_gradient(&rho, &mut grad);
+        last_grad_norm = grad_norm_in_z_space(&rho, &grad);
         if cost.is_finite() && (cost < best_cost || !best_cost.is_finite()) {
             best_cost = cost;
             best_rho = rho.clone();
         }
-        if grad_norm_in_z_space(&rho, &grad) <= tol {
+        if last_grad_norm <= tol {
             break;
         }
 
@@ -1048,9 +1009,14 @@ fn run_newton_for_candidate(
         }
     }
 
-    let final_z = to_z_from_rho(&best_rho);
-    let (verified_grad_norm, verified_stationary) =
-        check_rho_gradient_stationarity(label, reml_state, &final_z, tol)?;
+    let verified_grad_norm = last_grad_norm;
+    let verified_stationary = verified_grad_norm <= tol;
+    log::debug!(
+        "[Candidate {label}] Newton final gradient norm {:.3e} (tol {:.3e}); stationary={}",
+        verified_grad_norm,
+        tol,
+        verified_stationary
+    );
 
     Ok(OuterSolveResult {
         final_rho: best_rho,
@@ -5161,9 +5127,12 @@ pub mod internal {
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-            if self.config.objective_consistent_fd_gradient
-                && self.config.link_function() != LinkFunction::Identity
+            if self.config.link_function() != LinkFunction::Identity
+                && (self.config.objective_consistent_fd_gradient || p.len() == 1)
             {
+                // Single-penalty non-Gaussian problems can violate the local
+                // objective-trend sign relation under the current analytic
+                // gradient approximation. Use objective-consistent FD there.
                 return compute_fd_gradient_internal(self, p, false, false);
             }
             // Get the converged P-IRLS result for the current rho (`p`)

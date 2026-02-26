@@ -422,32 +422,15 @@ impl WorkingModelSurvival {
         // Keep monotonicity regularization aligned with the hazard derivative
         // used in the likelihood: baseline-target offset + learned deviation.
         let slope = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
-        let mut mono_dev = 0.0;
-        let mut mono_grad = Array1::<f64>::zeros(p);
-        let mut mono_h = Array2::<f64>::zeros((p, p));
-        if self.monotonicity.lambda > 0.0 {
-            for i in 0..n {
-                let s = slope[i] - self.monotonicity.tolerance;
-                if s < 0.0 {
-                    let v = -s;
-                    mono_dev += self.monotonicity.lambda * v * v;
-                    let xi = self.x_derivative.row(i).to_owned();
-                    mono_grad += &(2.0 * self.monotonicity.lambda * s * &xi);
-                    let outer = xi
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xi.view().insert_axis(Axis(0)));
-                    mono_h += &(2.0 * self.monotonicity.lambda * outer);
-                }
-            }
-        }
+        // Hard monotonicity is enforced by construction through the guarded
+        // derivative map used in the event term (safe_deriv > 0 always).
+        // The raw slope itself is not penalized.
+        let _ = slope;
 
         let mut total_grad = grad;
         total_grad += &penalty_grad;
-        total_grad += &mono_grad;
 
         h += &penalty_hessian;
-        h += &mono_h;
         const SURVIVAL_STABILIZATION_RIDGE: f64 = 1e-8;
         let ridge_used = SURVIVAL_STABILIZATION_RIDGE;
         for d in 0..p {
@@ -456,7 +439,7 @@ impl WorkingModelSurvival {
         total_grad += &beta.mapv(|v| ridge_used * v);
         let ridge_penalty = ridge_used * beta.dot(beta);
 
-        let mut deviance = 2.0 * (nll + mono_dev);
+        let mut deviance = 2.0 * nll;
         if matches!(self.spec, SurvivalSpec::Crude) {
             deviance *= 1.0;
         }
