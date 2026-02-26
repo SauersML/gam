@@ -2,6 +2,7 @@
 name = "gam"
 version = "0.1.11"
 edition = "2024"
+default-run = "gam"
 description = "Generalized penalized likelihood engine"
 license = "Apache-2.0"
 
@@ -10,6 +11,8 @@ path = "src/lib.rs"
 
 [dependencies]
 ahash = "0.8.12"
+clap = { version = "4.5.39", features = ["derive"] }
+comfy-table = "7.1.4"
 rayon = "1.11.0"
 crossbeam-queue = "0.3.12"
 tokio = { version = "1.47.1", features = ["rt-multi-thread"] }
@@ -26,6 +29,7 @@ thiserror = "2.0.17"
 toml = "0.9.7"
 wolfe_bfgs = "0.2.2"
 log = "0.4.28"
+csv = "1.4.0"
 faer = "0.23.2"
 spindle = "0.2.6"
 dyn-stack = "0.13.2"
