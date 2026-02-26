@@ -1175,77 +1175,15 @@ def rust_cli_cv_args(scenario_name, ds):
 
 
 def run_rust_scenario_cv(scenario):
-    ds = dataset_for_scenario(scenario)
-    folds = folds_for_dataset(ds)
-
-    build_code, build_out, build_err = run_cmd(
-        ["cargo", "build", "--release", "--bin", "gam"], cwd=ROOT
-    )
-    if build_code != 0:
-        return {
-            "contender": "rust_gam",
-            "scenario_name": scenario["name"],
-            "status": "failed",
-            "error": build_err.strip() or build_out.strip(),
-        }
-
-    bin_path = ROOT / "target" / "release" / "gam"
-    with tempfile.TemporaryDirectory(prefix="gam_bench_rust_cv_") as td:
-        td_path = Path(td)
-        data_csv = td_path / "data.csv"
-        write_dataset_csv(ds, data_csv)
-
-        cv_rows = []
-        for fold_id, fold in enumerate(folds):
-            train_idx_path = td_path / f"train_idx_{fold_id}.txt"
-            test_idx_path = td_path / f"test_idx_{fold_id}.txt"
-            train_idx_path.write_text("\n".join(str(int(i)) for i in fold.train_idx) + "\n")
-            test_idx_path.write_text("\n".join(str(int(i)) for i in fold.test_idx) + "\n")
-
-            code, out, err = run_cmd(
-                [
-                    str(bin_path),
-                    "bench-cv",
-                    "--data",
-                    str(data_csv),
-                    "--train-idx",
-                    str(train_idx_path),
-                    "--test-idx",
-                    str(test_idx_path),
-                    *rust_cli_cv_args(scenario["name"], ds),
-                ],
-                cwd=ROOT,
-            )
-            if code != 0:
-                return {
-                    "contender": "rust_gam",
-                    "scenario_name": scenario["name"],
-                    "status": "failed",
-                    "error": err.strip() or out.strip(),
-                }
-            line = out.strip().splitlines()[-1]
-            fold_row = json.loads(line)
-            if fold_row.get("status") != "ok":
-                return {
-                    "contender": "rust_gam",
-                    "scenario_name": scenario["name"],
-                    "status": "failed",
-                    "error": json.dumps(fold_row),
-                }
-            fold_row["n_test"] = int(len(fold.test_idx))
-            cv_rows.append(fold_row)
-
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    out = {
+    return {
         "contender": "rust_gam",
         "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": "5-fold CV (train-only spline fit; holdout scoring)",
+        "status": "failed",
+        "error": (
+            "Rust benchmark path disabled: no benchmark-specific logic is allowed in the gam CLI. "
+            "Port run_suite.py to drive Rust via public `gam fit`/`gam predict` commands."
+        ),
     }
-    if ds["family"] == "survival":
-        out["model_spec"] = "5-fold CV (Rust native Royston-Parmar survival)"
-    return out
 
 
 def run_external_mgcv_cv(scenario):

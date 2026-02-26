@@ -1,0 +1,52 @@
+{
+  "created_at_utc": "2026-02-26T00:12:15.474452+00:00",
+  "results": [
+    {
+      "engine": "gam",
+      "scenario": {
+        "n": 1000,
+        "p": 10
+      },
+      "fit_sec": 0.633296,
+      "predict_sec": 2.2e-05,
+      "auc": 0.833935,
+      "brier": 0.165786,
+      "rmse": null,
+      "r2": null,
+      "edf_total": 9.801617,
+      "contender": "rust_gam",
+      "scenario_name": "small_dense",
+      "status": "ok"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario": "medium",
+      "status": "failed",
+      "error": "Finished `release` profile [optimized] target(s) in 0.28s\n     Running `target/release/examples/bench_fit --n 50000 --p 50 --seed 11`\n\n[Candidate seed_0] Running exact Newton optimization from queued seed\n[Candidate seed_0] z-space gradient norm 8.647e-6 exceeds tolerance 1.000e-6; marking as non-stationary\n[Candidate seed_0] z-space gradient norm 8.647e-6 (tol 1.000e-6); projected rho-space norm 8.730e-6; max|\u2207\u03c1| 8.730e-6; max|\u03c1| 2.93; stationary = false\n[Candidate seed_0] Newton ended non-stationary (grad_norm=8.647e-6); retrying with BFGS.\n\n[Candidate seed_0] Running BFGS optimization from queued seed\n\n[Candidate seed_0] BFGS converged successfully according to tolerance.\n[Candidate seed_0] z-space gradient norm 2.362e-6 exceeds tolerance 1.000e-6; marking as non-stationary\n[Candidate seed_0] z-space gradient norm 2.362e-6 (tol 1.000e-6); projected rho-space norm 2.385e-6; max|\u2207\u03c1| 2.385e-6; max|\u03c1| 2.93; stationary = false\n\n[Candidate seed_1] Running exact Newton optimization from queued seed\n[Candidate seed_1] z-space gradient norm 5.294e-5 exceeds tolerance 1.000e-6; marking as non-stationary\n[Candidate seed_1] z-space gradient norm 5.294e-5 (tol 1.000e-6); projected rho-space norm 5.345e-5; max|\u2207\u03c1| 5.345e-5; max|\u03c1| 2.93; stationary = false\n[Candidate seed_1] Newton ended non-stationary (grad_norm=5.294e-5); retrying with BFGS.\n\n[Candidate seed_1] Running BFGS optimization from queued seed"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario": "pathological_ill_conditioned",
+      "status": "failed",
+      "error": "Finished `release` profile [optimized] target(s) in 1.88s\n     Running `target/release/examples/bench_fit --n 50000 --p 80 --seed 17`\n\n[Candidate seed_0] Running exact Newton optimization from queued seed\n[Candidate seed_0] z-space gradient norm 2.844e-5 exceeds tolerance 1.000e-6; marking as non-stationary\n[Candidate seed_0] z-space gradient norm 2.844e-5 (tol 1.000e-6); projected rho-space norm 2.880e-5; max|\u2207\u03c1| 2.880e-5; max|\u03c1| 3.36; stationary = false\n[Candidate seed_0] Newton ended non-stationary (grad_norm=2.844e-5); retrying with BFGS.\n\n[Candidate seed_0] Running BFGS optimization from queued seed\n\n[Candidate seed_0] BFGS converged successfully according to tolerance.\n[Candidate seed_0] z-space gradient norm 4.226e-4 exceeds tolerance 1.000e-6; marking as non-stationary\n[Candidate seed_0] z-space gradient norm 4.226e-4 (tol 1.000e-6); projected rho-space norm 4.280e-4; max|\u2207\u03c1| 4.280e-4; max|\u03c1| 3.36; stationary = false\n\n[Candidate seed_1] Running exact Newton optimization from queued seed"
+    },
+    {
+      "engine": "gam",
+      "scenario": {
+        "dataset": "lidar",
+        "n": 221,
+        "p": 28
+      },
+      "fit_sec": 0.060984,
+      "predict_sec": 1.3e-05,
+      "auc": null,
+      "brier": null,
+      "rmse": 0.077617,
+      "r2": 0.924156,
+      "edf_total": 10.014168,
+      "contender": "rust_gam",
+      "scenario_name": "lidar_semipar",
+      "status": "ok"
+    }
+  ]
+}

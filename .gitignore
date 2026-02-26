@@ -13,3 +13,4 @@ benchmarks/results*.json
 benchmarks/*.png
 benchmarks/*_fitted.csv
 benchmarks/datasets/hgdp_1kg_pc_data.tsv
+*.png

@@ -1,9 +1,7 @@
-#![cfg(test)]
-
 use ndarray::{Array1, Array2, array};
 
-use crate::estimate::{ExternalOptimOptions, evaluate_external_gradients};
-use crate::types::LikelihoodFamily;
+use gam::estimate::{ExternalOptimOptions, evaluate_external_gradients};
+use gam::types::LikelihoodFamily;
 
 #[inline]
 fn softplus(x: f64) -> f64 {

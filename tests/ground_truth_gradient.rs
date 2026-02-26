@@ -1,4 +1,3 @@
-#![allow(clippy::too_many_arguments)]
 
 use gam::estimate::{
     ExternalOptimOptions, evaluate_external_cost_and_ridge, evaluate_external_gradients,
