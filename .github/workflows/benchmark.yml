@@ -62,6 +62,9 @@ jobs:
       OPENBLAS_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Shared setup
         uses: ./.github/actions/bench-setup
 

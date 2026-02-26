@@ -21,7 +21,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-bench-pip-${{ hashFiles('benchmarks/run_suite.py', '.github/actions/bench-setup/action.yml') }}
+        key: ${{ runner.os }}-bench-pip-${{ hashFiles('bench/run_suite.py', '.github/actions/bench-setup/action.yml') }}
         restore-keys: |
           ${{ runner.os }}-bench-pip-
 
@@ -29,7 +29,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ${{ github.workspace }}/.r-lib
-        key: ${{ runner.os }}-bench-rlib-${{ hashFiles('benchmarks/run_suite.py', '.github/actions/bench-setup/action.yml') }}
+        key: ${{ runner.os }}-bench-rlib-${{ hashFiles('bench/run_suite.py', '.github/actions/bench-setup/action.yml') }}
         restore-keys: |
           ${{ runner.os }}-bench-rlib-
 
