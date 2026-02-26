@@ -14,7 +14,6 @@
       "predict_sec": 0.000529,
       "auc": 0.6528523482499999,
       "brier": null,
-      "c_index": 0.6528523482499999,
       "rmse": null,
       "r2": null,
       "model_spec": "5-fold CV (Rust native Royston-Parmar survival)"
@@ -27,7 +26,6 @@
       "predict_sec": 0.008,
       "auc": 0.69208142,
       "brier": null,
-      "c_index": 0.69208142,
       "rmse": null,
       "r2": null,
       "model_spec": "Surv(time, event) ~ age + bmi + hr_max + sysbp_min [5-fold CV]"
@@ -40,10 +38,8 @@
       "predict_sec": 0.016652,
       "auc": 0.6920783391542049,
       "brier": null,
-      "c_index": 0.6920783391542049,
       "rmse": null,
       "r2": null,
-      "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4) [5-fold CV]"
     }
   ]
 }

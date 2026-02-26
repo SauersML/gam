@@ -63,12 +63,8 @@ def evaluate_bspline_basis(x, knots, degree):
                 saved = left[d - r] * temp
             b[d] = saved
         
-        start_index = mu - degree
-        if start_index < 0:
-             b_valid = b[-start_index:]
              basis_matrix[i, 0 : len(b_valid)] = b_valid
         else:
-             basis_matrix[i, start_index : start_index + degree + 1] = b
 
     return basis_matrix
 
@@ -90,10 +86,6 @@ def get_mgcv_basis_data():
     newdata <- data.frame(variable_one = x_seq, variable_two = 0)
     lp_matrix <- predict(model, newdata = newdata, type = "lpmatrix")
     smooth_info <- model$smooth[[1]]
-    start_index <- smooth_info$first.para
-    end_index <- smooth_info$last.para
-    basis_coeffs <- coef(model)[start_index:end_index]
-    constrained_basis_functions <- lp_matrix[, start_index:end_index]
     write.csv(data.frame(x=x_seq), '{x_axis_file.name}', row.names=FALSE)
     write.csv(constrained_basis_functions, '{basis_file.name}', row.names=FALSE)
     write.csv(data.frame(coeffs=basis_coeffs), '{coeffs_file.name}', row.names=FALSE)
@@ -135,25 +127,17 @@ def get_gnomon_basis_data():
     with open(RUST_MODEL_CONFIG_PATH, "rb") as f:
         toml_data = tomli.load(f)
 
-    knots = np.array(toml_data['config']['knot_vectors']['pgs']['data'])
-    degree = toml_data['config']['pgs_basis_config']['degree']
-    coeffs = np.array(toml_data['coefficients']['main_effects']['pgs'])
-    print(f"  [PRINT] gnomon: Loaded `pgs` knot vector with {len(knots)} knots.")
     print_array_summary("Knot Vector", knots)
     print(f"  [PRINT] gnomon: Loaded spline degree {degree}.")
-    print(f"  [PRINT] gnomon: Loaded {len(coeffs)} coefficients for `pgs` main effect.")
     print_array_summary("Coefficients", coeffs)
     
     num_raw_bases = len(knots) - degree - 1
     print(f"  [INFO] gnomon: Derived k={num_raw_bases} total raw B-spline bases from knot vector.")
 
-    constraint_info = toml_data['config']['constraints']['pgs_main']['z_transform']
     z_dims, z_data = constraint_info['dim'], constraint_info['data']
     z_transform = np.array(z_data).reshape(z_dims)
-    print(f"  [PRINT] gnomon: Loaded 'pgs_main' constraint matrix.")
     print_array_summary("z_transform", z_transform)
 
-    x_range = toml_data['config']['pgs_range']
     x_axis = np.linspace(x_range[0], x_range[1], N_POINTS_PLOT)
     raw_basis_matrix = evaluate_bspline_basis(x_axis, knots, degree)
     print(f"  [PRINT] gnomon: Reconstructed FULL raw basis matrix.")
@@ -248,7 +232,6 @@ def create_comparison_plot(mgcv_data, gnomon_data):
     
     axes[2, 1].plot(mgcv_data['x_axis'], mgcv_final_curve_centered, label='mgcv (Centered)', color='blue', linewidth=6, alpha=0.6)
     axes[2, 1].plot(gnomon_data['x_axis'], gnomon_final_curve, label='gnomon', color='red', linewidth=2.5, linestyle='--')
-    axes[2, 1].set_xlabel("pgs", fontsize=12)
     axes[2, 1].legend(title="Model")
     axes[2, 1].set_title("Verification: Overlay of Final Curves", fontsize=14)
     axes[2, 1].grid(True, linestyle=':', alpha=0.7)

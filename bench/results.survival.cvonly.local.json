@@ -14,7 +14,6 @@
       "predict_sec": 7e-06,
       "auc": 0.6618195317725752,
       "brier": null,
-      "c_index": 0.6618195317725752,
       "rmse": null,
       "r2": null,
       "model_spec": "5-fold CV (Rust native Royston-Parmar survival)"
@@ -27,7 +26,6 @@
       "predict_sec": 0.006,
       "auc": 0.6987548494983278,
       "brier": null,
-      "c_index": 0.6987548494983278,
       "rmse": null,
       "r2": null,
       "model_spec": "Surv(time, event) ~ age + anaemia + log_creatinine_phosphokinase + diabetes + ejection_fraction + high_blood_pressure + log_platelets + log_serum_creatinine + serum_sodium + sex + smoking [5-fold CV]"
@@ -40,10 +38,8 @@
       "predict_sec": 0.005685,
       "auc": 0.6987326735179947,
       "brier": null,
-      "c_index": 0.6987326735179947,
       "rmse": null,
       "r2": null,
-      "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4) [5-fold CV]"
     }
   ]
 }

@@ -49,7 +49,6 @@ impl EngineTermSpec {
 /// Resolved layout entry for a single term.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineTerm {
-    pub term_index: usize,
     pub kind: EngineTermKind,
     pub col_range: Range<usize>,
     pub penalty_indices: Vec<usize>,
@@ -123,23 +122,21 @@ impl EngineLayoutBuilder {
             PenaltySpec::Existing(indices) => {
                 if indices.is_empty() {
                     return Err(LayoutBuildError::new(
-                        "existing-penalty spec must reference at least one penalty index",
+                        "existing-penalty spec must provide at least one index",
                     ));
                 }
                 indices
             }
         };
 
-        let term_index = self.terms.len();
         let col_range = self.next_col..self.next_col + spec.width;
         self.next_col += spec.width;
         self.terms.push(EngineTerm {
-            term_index,
             kind: spec.kind,
             col_range,
             penalty_indices: penalties,
         });
-        Ok(term_index)
+        Ok(self.terms.len() - 1)
     }
 
     pub fn build(self) -> EngineLayout {

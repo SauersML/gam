@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RUN_SUITE = ROOT / "bench" / "run_suite.py"
-SCENARIOS = ROOT / "benchmarks" / "scenarios.json"
+SCENARIOS = ROOT / "bench" / "scenarios.json"
 
 
 def run_cmd(cmd):
@@ -27,7 +27,6 @@ def fmt(v):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Magic benchmark runner (no fold/index plumbing)."
     )
     p.add_argument(
         "--scenario",
@@ -62,10 +61,8 @@ def main():
     payload = json.loads(out_path.read_text())
     rows = payload.get("results", [])
 
-    print("contender | scenario | status | auc/c-index | brier | rmse | r2")
     print("-" * 78)
     for r in rows:
-        metric = r.get("c_index")
         if metric is None:
             metric = r.get("auc")
         print(

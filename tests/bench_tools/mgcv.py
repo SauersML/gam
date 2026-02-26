@@ -93,7 +93,6 @@ def create_binned_plots(df, alpha, linear_mode=False, noise_mode=False):
     df['v1_bin'] = pd.cut(df['variable_one'], bins=N_BINS)
     binned_empirical = df.groupby('v1_bin', observed=True)['outcome'].mean()
     binned_true = df.groupby('v1_bin', observed=True)['final_probability'].mean()
-    bin_centers_v1 = [b.mid for b in binned_empirical.index]
     axes[0].plot(bin_centers_v1, binned_empirical.values, 'o-', label='Binned Empirical P(1)')
     axes[0].plot(bin_centers_v1, binned_true.values, 'r--', label='True Final Probability')
 
@@ -108,7 +107,6 @@ def create_binned_plots(df, alpha, linear_mode=False, noise_mode=False):
     df['v2_bin'] = pd.cut(df['variable_two'], bins=N_BINS)
     binned_empirical_v2 = df.groupby('v2_bin', observed=True)['outcome'].mean()
     binned_true_v2 = df.groupby('v2_bin', observed=True)['final_probability'].mean()
-    bin_centers_v2 = [b.mid for b in binned_empirical_v2.index]
     axes[1].plot(bin_centers_v2, binned_empirical_v2.values, 'o-', label='Binned Empirical P(1)')
     axes[1].plot(bin_centers_v2, binned_true_v2.values, 'r--', label='True Final Probability')
 
@@ -158,7 +156,6 @@ def main():
         linear_mode=args.linear,
         noise_mode=args.noise
     )
-    training_data.to_csv(TRAIN_OUTPUT_FILENAME, index=False)
     print(f"\nTraining data ({N_SAMPLES_TRAIN} rows) saved to '{TRAIN_OUTPUT_FILENAME}'")
     print("\nTraining Data Head (with new probability columns):")
     print(training_data.head())
@@ -173,7 +170,6 @@ def main():
         linear_mode=args.linear,
         noise_mode=args.noise
     )
-    test_data.to_csv(TEST_OUTPUT_FILENAME, index=False)
     print(f"\nTest data ({N_SAMPLES_TEST} rows) saved to '{TEST_OUTPUT_FILENAME}'")
     print("\nTest Data Outcome Distribution (should be ~50/50):")
     print(test_data['outcome'].value_counts(normalize=True))

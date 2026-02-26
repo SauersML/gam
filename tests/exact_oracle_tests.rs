@@ -351,7 +351,7 @@ fn test_laml_gradient_firth_exact_formula_ground_truth() {
 }
 
 #[test]
-fn isolation_reparam_pgs_pc_mains_firth() {
+fn test_external_gradient_adapter_isolated_matches_fd_direction() {
     let n = 96usize;
     let p = 7usize;
     let mut x = Array2::<f64>::zeros((n, p));

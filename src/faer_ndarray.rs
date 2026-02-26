@@ -421,9 +421,7 @@ pub fn ldlt_rook(
 > {
     let (nrows, ncols) = matrix.dim();
     if nrows != ncols {
-        return Err(FaerLinalgError::Cholesky(
-            solvers::LltError::NonPositivePivot { index: 0 },
-        ));
+        return Err(FaerLinalgError::FactorizationFailed);
     }
     let n = nrows;
     // faer LBLT contract (bunch-kaufman::factor::cholesky_in_place):

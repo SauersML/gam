@@ -98,7 +98,7 @@ impl PenaltyBlocks {
             let b = beta.slice(ndarray::s![block.range.clone()]).to_owned();
             let g = block.matrix.dot(&b);
             let mut dst = grad.slice_mut(ndarray::s![block.range.clone()]);
-            dst += &(2.0 * block.lambda * g);
+            dst += &(block.lambda * g);
         }
         grad
     }
@@ -112,7 +112,7 @@ impl PenaltyBlocks {
             let r = block.range.clone();
             for (i_local, i) in r.clone().enumerate() {
                 for (j_local, j) in r.clone().enumerate() {
-                    h[[i, j]] += 2.0 * block.lambda * block.matrix[[i_local, j_local]];
+                    h[[i, j]] += block.lambda * block.matrix[[i_local, j_local]];
                 }
             }
         }
@@ -126,7 +126,7 @@ impl PenaltyBlocks {
                 continue;
             }
             let b = beta.slice(ndarray::s![block.range.clone()]).to_owned();
-            value += block.lambda * b.dot(&block.matrix.dot(&b));
+            value += 0.5 * block.lambda * b.dot(&block.matrix.dot(&b));
         }
         value
     }
@@ -446,9 +446,7 @@ impl WorkingModelSurvival {
     ///
     /// Objective and notation in this implementation:
     /// - `rho_k = log(lambda_k)`, `lambda_k = exp(rho_k)`.
-    /// - `S(rho) = sum_k A_k`, where `A_k = dS/drho_k = 2 * lambda_k * S_k`.
-    ///   (Factor `2` matches this module's penalty convention:
-    ///   `penalty_grad = 2 * lambda * S_k * beta`.)
+    /// - `S(rho) = sum_k A_k`, where `A_k = dS/drho_k = lambda_k * S_k`.
     /// - `H = X^T W X + S(rho)` from the inner model state.
     /// - `V(rho) = 0.5*deviance(beta_hat) + penalty_term(beta_hat)
     ///           + 0.5*log|H| - 0.5*log|S|_+`.
@@ -558,7 +556,7 @@ impl WorkingModelSurvival {
                 continue;
             }
             let r = block.range.clone();
-            let scale = 2.0 * block.lambda;
+            let scale = block.lambda;
             for (i_local, i) in r.clone().enumerate() {
                 for (j_local, j) in r.clone().enumerate() {
                     s_total[[i, j]] += scale * block.matrix[[i_local, j_local]];
@@ -617,7 +615,7 @@ impl WorkingModelSurvival {
             let r = block.range.clone();
 
             let b_block = beta.slice(ndarray::s![r.clone()]).to_owned();
-            let a_k_beta_block = block.matrix.dot(&b_block).mapv(|v| 2.0 * lambda * v);
+            let a_k_beta_block = block.matrix.dot(&b_block).mapv(|v| lambda * v);
             let mut a_k_beta = Array1::<f64>::zeros(p);
             a_k_beta
                 .slice_mut(ndarray::s![r.clone()])
@@ -643,8 +641,8 @@ impl WorkingModelSurvival {
             for (i_local, i) in r.clone().enumerate() {
                 for (j_local, _j) in r.clone().enumerate() {
                     // solved_basis[i, j_local] = H^{-1}_{i, r[j_local]}.
-                    trace_hinv_ak += solved_basis[[i, j_local]]
-                        * (2.0 * lambda * block.matrix[[j_local, i_local]]);
+                    trace_hinv_ak +=
+                        solved_basis[[i, j_local]] * (lambda * block.matrix[[j_local, i_local]]);
                 }
             }
 
@@ -671,7 +669,7 @@ impl WorkingModelSurvival {
             for (i_local, i) in r.clone().enumerate() {
                 for (j_local, j) in r.clone().enumerate() {
                     // p_k = tr(S^+ A_k) restricted to this block.
-                    p_k += s_pinv[[i, j]] * (2.0 * lambda * block.matrix[[j_local, i_local]]);
+                    p_k += s_pinv[[i, j]] * (lambda * block.matrix[[j_local, i_local]]);
                 }
             }
 
@@ -899,14 +897,14 @@ mod tests {
         let grad = penalties.gradient(&beta);
         let h = penalties.hessian(beta.len());
         let b_block = beta.slice(s![1..3]).to_owned();
-        let expected = 2.0 * 1.7 * array![[2.0, 0.5], [0.5, 3.0]].dot(&b_block);
+        let expected = 1.7 * array![[2.0, 0.5], [0.5, 3.0]].dot(&b_block);
 
         assert!((grad[1] - expected[0]).abs() < 1e-12);
         assert!((grad[2] - expected[1]).abs() < 1e-12);
-        assert!((h[[1, 1]] - 2.0 * 1.7 * 2.0).abs() < 1e-12);
-        assert!((h[[1, 2]] - 2.0 * 1.7 * 0.5).abs() < 1e-12);
-        assert!((h[[2, 1]] - 2.0 * 1.7 * 0.5).abs() < 1e-12);
-        assert!((h[[2, 2]] - 2.0 * 1.7 * 3.0).abs() < 1e-12);
+        assert!((h[[1, 1]] - 1.7 * 2.0).abs() < 1e-12);
+        assert!((h[[1, 2]] - 1.7 * 0.5).abs() < 1e-12);
+        assert!((h[[2, 1]] - 1.7 * 0.5).abs() < 1e-12);
+        assert!((h[[2, 2]] - 1.7 * 3.0).abs() < 1e-12);
     }
 
     #[test]

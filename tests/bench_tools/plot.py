@@ -22,7 +22,6 @@ if 'DISPLAY' not in os.environ or not os.environ['DISPLAY']:
 import matplotlib.pyplot as plt
 
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, confusion_matrix
 from sklearn.isotonic import IsotonicRegression
 
 # --- Path Configuration ---
@@ -86,17 +85,13 @@ def simulate_data(n_samples: int, seed: int):
         seed: The random seed for reproducibility.
 
     Returns:
-        A pandas DataFrame with columns for 'phenotype', 'score', 'PC1',
         the pure 'signal_prob', and the final 'oracle_prob'.
     """
     np.random.seed(seed)
-    score = np.random.uniform(-3, 3, n_samples)
     pc1 = np.random.normal(0, 1.2, n_samples)
 
     # The true, noise-free relationship between features and the outcome logit
     true_logit = SIMULATION_SIGNAL_STRENGTH * (
-        0.8 * np.cos(score * 2) - 1.2 * np.tanh(pc1) +
-        1.5 * np.sin(score) * pc1 - 0.5 * (score**2 + pc1**2)
     )
 
     # Calculate the "signal" probability (the ideal, noise-free probability)
@@ -113,7 +108,6 @@ def simulate_data(n_samples: int, seed: int):
     oracle_probability = 1 / (1 + np.exp(-(true_logit + noise)))
     phenotype = np.random.binomial(1, oracle_probability, n_samples)
 
-    df = pd.DataFrame({"phenotype": phenotype, "score": score, "PC1": pc1})
     # Add both the pure signal and the final oracle probabilities for evaluation
     df['signal_prob'] = signal_probability
     df['oracle_prob'] = oracle_probability
@@ -138,7 +132,6 @@ def run_subprocess(command, cwd):
 def tjurs_r2(y_true, y_prob):
     """Calculates Tjur's Coefficient of Discrimination (R-squared)."""
     y_true = pd.Series(y_true)
-    y_prob = pd.Series(y_prob, index=y_true.index)
     mean_prob_cases = y_prob[y_true == 1].mean()
     mean_prob_controls = y_prob[y_true == 0].mean()
     return mean_prob_cases - mean_prob_controls
@@ -183,16 +176,12 @@ def safe_auc(y_true, y_prob):
     y, p = _prep_vec(y_true, y_prob)
     if len(np.unique(y)) < 2:  # Need both classes for ROC
         return np.nan
-    from sklearn.metrics import roc_auc_score
-    return roc_auc_score(y, p)
 
 def safe_pr_auc(y_true, y_prob):
     """Safely calculate PR-AUC with proper edge case handling."""
     y, p = _prep_vec(y_true, y_prob)
     if (y==1).sum() == 0 or (y==0).sum() == 0:  # Need both classes
         return np.nan
-    from sklearn.metrics import average_precision_score
-    return average_precision_score(y, p)
 
 def safe_logloss(y_true, y_prob):
     """Safely calculate log loss with proper edge case handling."""
@@ -218,8 +207,6 @@ def best_threshold_youden(y_true, y_prob):
     
     from sklearn.metrics import roc_curve
     fpr, tpr, thresholds = roc_curve(y, p)
-    j_scores = tpr - fpr  # Youden's J = sensitivity + specificity - 1 = tpr + (1-fpr) - 1 = tpr - fpr
-    best_idx = np.argmax(j_scores)
     return float(thresholds[best_idx])
 
 def _ece_from_edges(y, p, edges):
@@ -308,7 +295,6 @@ def ece_randomized_quantile(y_true, y_prob, bin_counts=(10,20,40), repeats=50, m
     }
 
 def wilson_ci(k, n, z=1.959963984540054):  # 95% CI
-    """Calculate Wilson score confidence interval for a binomial proportion."""
     if n == 0: 
         return (np.nan, np.nan)
     p = k/n
@@ -349,7 +335,6 @@ def bin_stats(y, p, edges):
     return pd.DataFrame(rows)
 
 def ici_isotonic(y_true, y_prob):
-    """Calculate Integrated Calibration Index using isotonic regression.
     
     This is a bin-free calibration metric measuring the mean absolute
     difference between predictions and an isotonic fit of outcomes.
@@ -510,7 +495,6 @@ def ece_rq_shared_edges_bootstrap_ci(models, y_true, n_boot=500, alpha=0.05, rng
 
 
 def brier_decomposition(y_true, y_prob, n_bins=20):
-    """Decompose Brier score into reliability, resolution, and uncertainty components.
     
     Args:
         y_true: True binary labels
@@ -581,16 +565,13 @@ def generate_performance_report(df_results):
         pr_auc_val = safe_pr_auc(y_true, y_prob)
         print(f"  - {name:<28}: AUC={auc:.4f} | PR-AUC={pr_auc_val:.4f}")
 
-    print("\n[Probabilistic Accuracy: Brier Score & Log Loss]")
     print("Lower is better. Brier for squared error, Log Loss for likelihood-based assessment.")
     for name, y_prob in models.items():
         y, p = _prep_vec(y_true, y_prob)  # Handle NaNs and invalid values
-        brier = brier_score_loss(y, p) if len(y) > 0 else np.nan
         logloss = safe_logloss(y_true, y_prob)
         print(f"  - {name:<28}: Brier={brier:.4f} | LogLoss={logloss:.4f}")
 
     print("\n[Fit: Nagelkerke's R-squared]")
-    print("Higher is better (0-1). Likelihood-based, common in PGS literature.")
     for name, y_prob in models.items():
         r2_n = nagelkerkes_r2(y_true, y_prob)
         print(f"  - {name:<28}: {r2_n:.4f}")
@@ -625,13 +606,10 @@ def generate_performance_report(df_results):
         print(f"      Bootstrap 95% CI for shared-edges ECE: [{ci['lo']:.4f}, {ci['hi']:.4f}]")
             
     # Add Brier decomposition
-    print("\n[Brier Score Decomposition]")
     print("reliability ↓, resolution ↑, uncertainty (data)")
     for name, y_prob in models.items():
         y_clean, p_clean = _prep_vec(y_true, y_prob)  # Handle NaNs and invalid values
         rel, res, unc = brier_decomposition(y_clean, p_clean, n_bins=20)
-        brier = brier_score_loss(y_clean, p_clean) if len(y_clean) > 0 else np.nan
-        # Verify Brier score decomposition identity: brier ≈ rel - res + unc
         err = abs(brier - (rel - res + unc))
         print(f"  - {name:<28}: rel={rel:.4f}, res={res:.4f}, unc={unc:.4f} (brier={brier:.4f})")
         if err > 1e-4:  # Check if identity doesn't hold within tolerance
@@ -668,7 +646,6 @@ def generate_performance_report(df_results):
     print("\n" + "="*60)
 
 
-def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, pc1_grid, save_plots=False, output_dir=None):
     """Generates a 2x2 grid of plots for model analysis."""
     fig, axes = plt.subplots(2, 2, figsize=(18, 16))
     fig.suptitle("Comprehensive GAM Model Analysis vs. Baseline and Oracle", fontsize=22, y=0.98)
@@ -678,24 +655,19 @@ def create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, p
 
     # --- 1. Top-Left: Ground Truth (Signal) Surface ---
     ax1 = axes[0, 0]
-    contour1 = ax1.contourf(score_grid, pc1_grid, signal_surface, levels=20, cmap="viridis", vmin=vmin, vmax=vmax)
     fig.colorbar(contour1, ax=ax1, label="True Signal Probability")
     ax1.set_title("1. Ground Truth (Noise-Free) Signal Surface", fontsize=16)
-    ax1.set_xlabel("Polygenic Score (score)")
     ax1.set_ylabel("Principal Component 1 (PC1)")
     ax1.grid(True, linestyle='--', alpha=0.5)
 
     # --- 2. Top-Right: GAM's Learned Surface with Test Points Overlay ---
     ax2 = axes[0, 1]
-    contour2 = ax2.contourf(score_grid, pc1_grid, gam_surface, levels=20, cmap="viridis", vmin=vmin, vmax=vmax)
     fig.colorbar(contour2, ax=ax2, label="GAM Predicted Probability")
     ax2.scatter(
-        results_df["score"], results_df["PC1"], c=results_df["prediction"],
         cmap="viridis", edgecolor="k", linewidth=0.5, s=40, vmin=vmin, vmax=vmax,
         alpha=0.8
     )
     ax2.set_title("2. GAM's Learned Surface with Predictions Overlay", fontsize=16)
-    ax2.set_xlabel("Polygenic Score (score)")
     ax2.set_ylabel("Principal Component 1 (PC1)")
     ax2.grid(True, linestyle='--', alpha=0.5)
 
@@ -805,20 +777,17 @@ def main():
         # 1. Simulate and prepare training data
         print(f"--- Simulating {N_SAMPLES_TRAIN} samples for training ---")
         train_df = simulate_data(N_SAMPLES_TRAIN, seed=42)
-        train_df[['phenotype', 'score', 'PC1']].to_csv(TRAIN_DATA_PATH, sep="\t", index=False)
         print(f"Saved training data to '{TRAIN_DATA_PATH}'")
 
         # 2. Train baseline Logistic Regression model
         print("\n--- Training Baseline Logistic Regression Model ---")
         baseline_model = LogisticRegression(solver='liblinear')
-        baseline_model.fit(train_df[['score', 'PC1']], train_df['phenotype'])
         print("Baseline model trained.")
 
         # 3. Run the gnomon 'train' command
         print("\n--- Running 'train' command for GAM model ---")
         train_command = [
             str(EXECUTABLE_PATH), "train", "--num-pcs", str(NUM_PCS),
-            "--pgs-knots", "3", "--pc-knots", "3", "--pgs-degree", "2", "--pc-degree", "2",
             str(TRAIN_DATA_PATH)
         ]
         run_subprocess(train_command, cwd=PROJECT_ROOT)
@@ -827,12 +796,10 @@ def main():
         # 4. Simulate and prepare test data
         print(f"\n--- Simulating {N_SAMPLES_TEST} samples for inference ---")
         test_df_full = simulate_data(N_SAMPLES_TEST, seed=101)
-        test_df_full[['score', 'PC1']].to_csv(TEST_DATA_PATH, sep="\t", index=False)
         print(f"Saved test data to '{TEST_DATA_PATH}'")
 
         # 5. Get predictions from baseline model
         print("\n--- Generating predictions with Baseline Model ---")
-        baseline_probs = baseline_model.predict_proba(test_df_full[['score', 'PC1']])[:, 1]
         
         # 6. Run 'infer' for GAM on test data and load results
         print("\n--- Running 'infer' command for GAM model on test data ---")
@@ -843,15 +810,11 @@ def main():
 
         # 7. Combine all results for reporting
         print("\n--- Analyzing Results ---")
-        results_df = pd.concat([test_df_full.reset_index(drop=True), gam_test_predictions], axis=1)
         results_df['baseline_prediction'] = baseline_probs
         generate_performance_report(results_df)
         
         # 8. Generate a grid of data points to visualize the model's learned surface
         print("\n--- Generating GAM surface plot data ---")
-        score_grid, pc1_grid = np.meshgrid(np.linspace(-3, 3, 100), np.linspace(-3.5, 3.5, 100))
-        grid_df = pd.DataFrame({'score': score_grid.ravel(), 'PC1': pc1_grid.ravel()})
-        grid_df.to_csv(GRID_DATA_PATH, sep='\t', index=False)
         
         # NOTE: The 'gnomon' tool uses a fixed output file. The following command
         # will overwrite 'predictions.tsv' with the results from the grid data.
@@ -861,18 +824,14 @@ def main():
         
         # Load the newly-overwritten 'predictions.tsv' file for the surface plot
         grid_preds_df = pd.read_csv(PREDICTIONS_PATH, sep="\t")
-        gam_surface = grid_preds_df['prediction'].values.reshape(score_grid.shape)
         print("GAM surface data generated.")
 
         # 9. Calculate the true signal surface for comparison in the plot
         true_logit_surface = SIMULATION_SIGNAL_STRENGTH * (
-            0.8 * np.cos(score_grid * 2) - 1.2 * np.tanh(pc1_grid) +
-            1.5 * np.sin(score_grid) * pc1_grid - 0.5 * (score_grid**2 + pc1_grid**2)
         )
         signal_surface = 1 / (1 + np.exp(-true_logit_surface))
 
         # 10. Generate and display the final analysis plots
-        create_analysis_plots(results_df, gam_surface, signal_surface, score_grid, pc1_grid, save_plots, output_dir)
 
     finally:
         # Clean up temporary files created during the run

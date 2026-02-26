@@ -122,7 +122,6 @@ impl RidgePassport {
     }
 }
 
-/// Optional joint single-index link data for calibrated predictions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JointLinkModel {
     pub knot_range: (f64, f64),

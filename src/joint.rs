@@ -1,4 +1,3 @@
-//! Joint Single-Index Model with Backfitting
 //!
 //! This module implements a unified model where the base linear predictor and
 //! the flexible link correction are fitted jointly in one REML optimization.
@@ -83,7 +82,6 @@ fn ensure_positive_definite_joint(mat: &mut Array2<f64>) -> f64 {
     FIXED_STABILIZATION_RIDGE
 }
 
-/// State for the joint single-index model optimization.
 pub struct JointModelState<'a> {
     /// Response variable
     y: ArrayView1<'a, f64>,
@@ -929,7 +927,6 @@ impl<'a> JointModelState<'a> {
     }
 }
 
-/// Fit joint single-index model via Gauss-Newton PIRLS with outer REML optimization
 ///
 /// Architecture:
 /// - Outer loop: BFGS over smoothing params ρ (same as existing GAM fitting)
@@ -2829,12 +2826,12 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
     let total_candidates = candidate_plans.len();
     let mut candidate_idx = 0usize;
 
-    for (label, rho, seed_index, seed_cost) in candidate_plans.into_iter() {
+    for (label, rho, seed_idx, seed_cost) in candidate_plans {
         candidate_idx += 1;
         visualizer::set_stage("joint", &format!("candidate {label}"));
         visualizer::set_progress("Candidates", candidate_idx, Some(total_candidates));
-        if let Some(idx) = seed_index {
-            eprintln!("[JOINT][Candidate {label}] Seed index: {idx}");
+        if let Some(idx) = seed_idx {
+            eprintln!("[JOINT][Candidate {label}] Seed source index: {idx}");
         }
         if let Some(cost) = seed_cost {
             eprintln!("[JOINT][Candidate {label}] Seed cost: {cost:.6}");

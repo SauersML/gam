@@ -9,6 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -16,11 +17,12 @@ from lifelines import CoxPHFitter
 from pygam import LinearGAM, LogisticGAM, l, s
 
 ROOT = Path(__file__).resolve().parent.parent
-BENCH_DIR = ROOT / "benchmarks"
+BENCH_DIR = ROOT / "bench"
 DEFAULT_SCENARIOS = BENCH_DIR / "scenarios.json"
 DATASET_DIR = BENCH_DIR / "datasets"
 CV_SPLITS = 5
 CV_SEED = 42
+_RUST_BIN_PATH: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -70,7 +72,6 @@ def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42, stratified: boo
     return folds
 
 
-def auc_score(y: np.ndarray, p: np.ndarray) -> float:
     order = np.argsort(p)
     y_sorted = y[order]
     n_pos = float(np.sum(y_sorted > 0.5))
@@ -82,15 +83,12 @@ def auc_score(y: np.ndarray, p: np.ndarray) -> float:
     return (rank_sum_pos - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)
 
 
-def brier_score(y: np.ndarray, p: np.ndarray) -> float:
     return float(np.mean((y - p) ** 2))
 
 
-def rmse_score(y: np.ndarray, mu: np.ndarray) -> float:
     return math.sqrt(float(np.mean((y - mu) ** 2)))
 
 
-def r2_score(y: np.ndarray, mu: np.ndarray) -> float:
     sst = float(np.sum((y - float(np.mean(y))) ** 2))
     if sst <= 0.0:
         return 0.0
@@ -946,7 +944,6 @@ def aggregate_cv_rows(cv_rows, family):
             "predict_sec": predict_sec,
             "auc": wavg("auc"),
             "brier": wavg("brier"),
-            "c_index": None,
             "rmse": None,
             "r2": None,
         }
@@ -954,9 +951,7 @@ def aggregate_cv_rows(cv_rows, family):
         return {
             "fit_sec": fit_sec,
             "predict_sec": predict_sec,
-            "auc": wavg("auc"),  # concordance index
             "brier": None,
-            "c_index": wavg("auc"),
             "rmse": None,
             "r2": None,
         }
@@ -965,7 +960,6 @@ def aggregate_cv_rows(cv_rows, family):
         "predict_sec": predict_sec,
         "auc": None,
         "brier": None,
-        "c_index": None,
         "rmse": wavg("rmse"),
         "r2": wavg("r2"),
     }
@@ -981,6 +975,218 @@ def write_dataset_csv(ds, path):
         writer.writeheader()
         for row in ds["rows"]:
             writer.writerow({k: row[k] for k in cols})
+
+
+def _rust_fit_mapping(scenario_name):
+    geo_eas_cfg = _geo_disease_eas_scenario_cfg(scenario_name)
+    papuan_cfg = _papuan_oce_scenario_cfg(scenario_name)
+    if geo_eas_cfg is not None:
+        return {
+            "family": "binomial-logit",
+            "smooth_cols": geo_eas_cfg["smooth_cols"],
+            "smooth_basis": geo_eas_cfg["smooth_basis"],
+            "linear_cols": geo_eas_cfg["linear_cols"],
+            "knots": int(geo_eas_cfg["knots"]),
+        }
+    if papuan_cfg is not None:
+        return {
+            "family": "binomial-logit",
+            "smooth_cols": papuan_cfg["smooth_cols"],
+            "smooth_basis": papuan_cfg["smooth_basis"],
+            "linear_cols": papuan_cfg["linear_cols"],
+            "knots": int(papuan_cfg["knots"]),
+        }
+    return {
+        "small_dense": dict(family="binomial-logit", smooth_col="x2", linear_cols=["x1"], smooth_basis="ps", knots=7),
+        "medium": dict(family="binomial-logit", smooth_col="x2", linear_cols=["x1"], smooth_basis="ps", knots=7),
+        "pathological_ill_conditioned": dict(
+            family="binomial-logit", smooth_col="x2", linear_cols=["x1"], smooth_basis="ps", knots=7
+        ),
+        "lidar_semipar": dict(family="gaussian", smooth_col="range", linear_cols=[], smooth_basis="ps", knots=24),
+        "bone_gamair": dict(family="binomial-logit", smooth_col="t", linear_cols=["trt_auto"], smooth_basis="ps", knots=8),
+        "prostate_gamair": dict(family="binomial-logit", smooth_col="pc2", linear_cols=["pc1"], smooth_basis="ps", knots=8),
+        "horse_colic": dict(
+            family="binomial-logit",
+            smooth_col="pulse",
+            linear_cols=["rectal_temp", "packed_cell_volume"],
+            smooth_basis="ps",
+            knots=8,
+        ),
+        "wine_gamair": dict(
+            family="gaussian",
+            smooth_col="s_temp",
+            linear_cols=["year", "h_rain", "w_rain", "h_temp"],
+            smooth_basis="ps",
+            knots=7,
+        ),
+        "wine_temp_vs_year": dict(
+            family="gaussian", smooth_col="year", linear_cols=[], smooth_basis="ps", knots=7
+        ),
+        "wine_price_vs_temp": dict(
+            family="gaussian", smooth_col="temp", linear_cols=[], smooth_basis="ps", knots=7
+        ),
+        "us48_demand_5day": dict(
+            family="gaussian",
+            smooth_col="hour",
+            linear_cols=["demand_forecast", "net_generation", "total_interchange"],
+            smooth_basis="ps",
+            knots=8,
+        ),
+        "us48_demand_31day": dict(
+            family="gaussian",
+            smooth_col="hour",
+            linear_cols=["demand_forecast", "net_generation", "total_interchange"],
+            smooth_basis="ps",
+            knots=12,
+        ),
+        "haberman_survival": dict(
+            family="binomial-logit", smooth_col="axil_nodes", linear_cols=["age", "op_year"], smooth_basis="ps", knots=8
+        ),
+        "icu_survival_death": dict(
+            family="binomial-logit",
+            smooth_col="time",
+            linear_cols=["age", "bmi", "hr_max", "sysbp_min"],
+            smooth_basis="ps",
+            knots=7,
+        ),
+        "icu_survival_los": dict(
+            family="binomial-logit",
+            smooth_col="age",
+            linear_cols=["bmi", "hr_max", "sysbp_min", "temp_apache", "time"],
+            smooth_basis="ps",
+            knots=7,
+        ),
+        "geo_disease_tp": dict(
+            family="binomial-logit",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="thinplate",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+        ),
+        "geo_disease_tp_basic": dict(
+            family="binomial-logit",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="thinplate",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+        ),
+        "geo_disease_duchon": dict(
+            family="binomial-logit",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="duchon",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+        ),
+        "geo_disease_duchon_basic": dict(
+            family="binomial-logit",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="duchon",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+        ),
+        "geo_disease_matern": dict(
+            family="binomial-logit",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="matern",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+        ),
+        "geo_disease_shrinkage": dict(
+            family="binomial-logit",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="matern",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+        ),
+        "geo_disease_matern_basic": dict(
+            family="binomial-logit",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="matern",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+        ),
+        "geo_disease_ps_per_pc": dict(
+            family="binomial-logit",
+            smooth_cols=[f"pc{i}" for i in range(1, 17)],
+            smooth_basis="ps",
+            linear_cols=[],
+            knots=10,
+        ),
+        "geo_disease_ps_per_pc_basic": dict(
+            family="binomial-logit",
+            smooth_cols=[f"pc{i}" for i in range(1, 17)],
+            smooth_basis="ps",
+            linear_cols=[],
+            knots=10,
+        ),
+    }.get(scenario_name)
+
+
+def _rust_formula_for_scenario(scenario_name, ds):
+    cfg = _rust_fit_mapping(scenario_name)
+    if cfg is None:
+        raise RuntimeError(f"No Rust formula mapping configured for scenario '{scenario_name}'")
+    target = ds["target"]
+    terms = [f"linear({c})" for c in cfg.get("linear_cols", [])]
+    basis = str(cfg.get("smooth_basis", "ps")).lower()
+    knots = int(cfg.get("knots", 8))
+    smooth_cols = cfg.get("smooth_cols")
+    if smooth_cols:
+        for col in smooth_cols:
+            if basis in {"ps", "bspline", "p-spline"}:
+                terms.append(f"s({col}, type=ps, knots={knots})")
+            elif basis in {"thinplate", "tps"}:
+                terms.append(f"s({col}, type=tps, centers={knots})")
+            elif basis == "duchon":
+                terms.append(f"s({col}, type=duchon, centers={knots})")
+            elif basis == "matern":
+                terms.append(f"s({col}, type=matern, centers={knots})")
+            else:
+                terms.append(f"s({col}, type=ps, knots={knots})")
+    else:
+        col = cfg["smooth_col"]
+        terms.append(f"s({col}, type=ps, knots={knots})")
+
+    if not terms:
+        raise RuntimeError(f"empty Rust term list for scenario '{scenario_name}'")
+    formula = f"{target} ~ " + " + ".join(terms)
+    return cfg["family"], formula
+
+
+def _rust_survival_formula_for_scenario(scenario_name):
+    if scenario_name == "icu_survival_death":
+        return "linear(age) + linear(bmi) + linear(hr_max) + linear(sysbp_min)"
+    if scenario_name == "heart_failure_survival":
+        return (
+            "linear(age) + linear(anaemia) + linear(log_creatinine_phosphokinase) + linear(diabetes) + "
+            "linear(ejection_fraction) + linear(high_blood_pressure) + linear(log_platelets) + "
+            "linear(log_serum_creatinine) + linear(serum_sodium) + linear(sex) + linear(smoking)"
+        )
+    if scenario_name == "cirrhosis_survival":
+        return (
+            "linear(drug) + linear(sex_male) + linear(ascites) + linear(hepatomegaly) + linear(spiders) + "
+            "linear(edema) + linear(age) + linear(bilirubin) + linear(cholesterol) + linear(albumin) + "
+            "linear(copper) + linear(alk_phos) + linear(sgot) + linear(tryglicerides) + linear(platelets) + "
+            "linear(prothrombin) + linear(stage)"
+        )
+    if scenario_name == "haberman_survival":
+        return "linear(age) + linear(op_year) + s(axil_nodes, type=ps, knots=8)"
+    if scenario_name == "icu_survival_los":
+        return "linear(age) + linear(bmi) + linear(hr_max) + linear(sysbp_min) + linear(temp_apache)"
+    raise RuntimeError(f"No Rust survival formula configured for scenario '{scenario_name}'")
+
+
+def _ensure_rust_binary():
+    global _RUST_BIN_PATH
+    if _RUST_BIN_PATH is not None:
+        return _RUST_BIN_PATH
+    code, out, err = run_cmd(["cargo", "build", "--release", "--bin", "gam"], cwd=ROOT)
+    if code != 0:
+        raise RuntimeError((err or out).strip() or "failed to build Rust release binary")
+    _RUST_BIN_PATH = ROOT / "target" / "release" / "gam"
+    if not _RUST_BIN_PATH.exists():
+        raise RuntimeError(f"missing Rust binary at {_RUST_BIN_PATH}")
+    return _RUST_BIN_PATH
 
 
 def rust_cli_cv_args(scenario_name, ds):
@@ -1175,14 +1381,142 @@ def rust_cli_cv_args(scenario_name, ds):
 
 
 def run_rust_scenario_cv(scenario):
+    scenario_name = scenario["name"]
+    ds = dataset_for_scenario(scenario)
+    folds = folds_for_dataset(ds)
+
+    try:
+        rust_bin = _ensure_rust_binary()
+    except Exception as e:
+        return {
+            "contender": "rust_gam",
+            "scenario_name": scenario_name,
+            "status": "failed",
+            "error": str(e),
+        }
+
+    base_df = pd.DataFrame(ds["rows"])
+    cv_rows = []
+    with tempfile.TemporaryDirectory(prefix="gam_bench_rust_cv_") as td:
+        td_path = Path(td)
+        for fold_id, fold in enumerate(folds):
+            train_df = base_df.iloc[fold.train_idx].copy()
+            test_df = base_df.iloc[fold.test_idx].copy()
+            train_path = td_path / f"train_{fold_id}.csv"
+            test_path = td_path / f"test_{fold_id}.csv"
+            model_path = td_path / f"model_{fold_id}.json"
+            pred_path = td_path / f"pred_{fold_id}.csv"
+
+            if ds["family"] == "survival":
+                formula = _rust_survival_formula_for_scenario(scenario_name)
+                fit_cmd = [
+                    str(rust_bin),
+                    "survival",
+                    str(train_path),
+                    "--entry",
+                    ds["time_col"],
+                    "--exit",
+                    ds["time_col"],
+                    "--event",
+                    ds["event_col"],
+                    "--formula",
+                    formula,
+                    "--out",
+                    str(model_path),
+                ]
+            else:
+                family, formula = _rust_formula_for_scenario(scenario_name, ds)
+                fit_cmd = [
+                    str(rust_bin),
+                    "fit",
+                    "--family",
+                    family,
+                    "--formula",
+                    formula,
+                    "--out",
+                    str(model_path),
+                    str(train_path),
+                ]
+
+            t0 = perf_counter()
+            code, out, err = run_cmd(fit_cmd, cwd=ROOT)
+            fit_sec = perf_counter() - t0
+            if code != 0:
+                return {
+                    "contender": "rust_gam",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "error": (err.strip() or out.strip() or "rust fit failed"),
+                }
+
+            pred_cmd = [
+                str(rust_bin),
+                "predict",
+                str(model_path),
+                str(test_path),
+                "--out",
+                str(pred_path),
+            ]
+            t1 = perf_counter()
+            code, out, err = run_cmd(pred_cmd, cwd=ROOT)
+            pred_sec = perf_counter() - t1
+            if code != 0:
+                return {
+                    "contender": "rust_gam",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "error": (err.strip() or out.strip() or "rust predict failed"),
+                }
+            pred_df = pd.read_csv(pred_path)
+            if "mean" not in pred_df.columns:
+                return {
+                    "contender": "rust_gam",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "error": "rust prediction output missing 'mean' column",
+                }
+            pred = pred_df["mean"].to_numpy(dtype=float)
+
+            if ds["family"] == "binomial":
+                y_test = test_df[ds["target"]].to_numpy(dtype=float)
+                cv_rows.append(
+                    {
+                        "fit_sec": float(fit_sec),
+                        "predict_sec": float(pred_sec),
+                        "n_test": int(len(fold.test_idx)),
+                        "model_spec": "gam fit/predict via release binary [5-fold CV]",
+                    }
+                )
+            elif ds["family"] == "gaussian":
+                y_test = test_df[ds["target"]].to_numpy(dtype=float)
+                cv_rows.append(
+                    {
+                        "fit_sec": float(fit_sec),
+                        "predict_sec": float(pred_sec),
+                        "n_test": int(len(fold.test_idx)),
+                        "model_spec": "gam fit/predict via release binary [5-fold CV]",
+                    }
+                )
+            else:
+                event_times = test_df[ds["time_col"]].to_numpy(dtype=float)
+                events = test_df[ds["event_col"]].to_numpy(dtype=float)
+                cv_rows.append(
+                    {
+                        "fit_sec": float(fit_sec),
+                        "predict_sec": float(pred_sec),
+                        "auc": cidx,
+                        "n_test": int(len(fold.test_idx)),
+                        "model_spec": "gam survival/predict via release binary [5-fold CV]",
+                    }
+                )
+
+    metrics = aggregate_cv_rows(cv_rows, ds["family"])
     return {
         "contender": "rust_gam",
-        "scenario_name": scenario["name"],
-        "status": "failed",
-        "error": (
-            "Rust benchmark path disabled: no benchmark-specific logic is allowed in the gam CLI. "
-            "Port run_suite.py to drive Rust via public `gam fit`/`gam predict` commands."
-        ),
+        "scenario_name": scenario_name,
+        "status": "ok",
+        **metrics,
+        "model_spec": cv_rows[0]["model_spec"],
     }
 
 
@@ -1604,8 +1938,6 @@ def run_external_pygam_cv(scenario):
                 {
                     "fit_sec": fit_sec,
                     "predict_sec": pred_sec,
-                    "auc": auc_score(y_test, pred),
-                    "brier": brier_score(y_test, pred),
                     "n_test": int(len(fold.test_idx)),
                     "model_spec": model_spec,
                 }
@@ -1641,8 +1973,6 @@ def run_external_pygam_cv(scenario):
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
-                "rmse": rmse_score(y_test, pred),
-                "r2": r2_score(y_test, pred),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": model_spec,
             }

@@ -137,7 +137,6 @@ TRUSTED_REFERENCE_JSON = {
         },
         "static_covariate_layout": {
             "column_names": [
-                "pgs",
                 "sex"
             ],
             "ranges": [
@@ -194,7 +193,6 @@ TRUSTED_REFERENCE_JSON = {
         [],
         []
     ],
-    "pgs": [
         0.0,
         0.0,
         0.0,

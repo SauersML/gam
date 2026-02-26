@@ -10,7 +10,6 @@
       },
       "fit_sec": 0.009,
       "predict_sec": 0.001,
-      "c_index": 0.8563,
       "model_spec": "survreg Weibull (all engineered linear covariates)",
       "status": "ok",
       "contender": "r_survival"
@@ -24,7 +23,6 @@
       },
       "fit_sec": 0.025,
       "predict_sec": 0.008,
-      "c_index": 0.783,
       "model_spec": "mgcv::gam cox.ph linear terms only",
       "contender": "r_mgcv_survival_linear",
       "status": "ok"
@@ -38,7 +36,6 @@
       },
       "fit_sec": 0.128,
       "predict_sec": 0.003,
-      "c_index": 0.7886,
       "model_spec": "mgcv::gam cox.ph semi-parametric (4 psplines + linear terms)",
       "contender": "r_mgcv_survival_semi",
       "status": "ok"
@@ -52,7 +49,6 @@
       },
       "fit_sec": 1.155,
       "predict_sec": 0.005,
-      "c_index": 0.7849,
       "model_spec": "mgcv::gam cox.ph smooth-all continuous + linear categorical",
       "contender": "r_mgcv_survival_smooth_all",
       "status": "ok"
@@ -66,7 +62,6 @@
       },
       "fit_sec": 0.051,
       "predict_sec": 0.011,
-      "c_index": 0.8574,
       "model_spec": "rstpm2::stpm2 (Royston-Parmar) df=3",
       "contender": "r_royston_parmar_df3",
       "status": "ok"
@@ -80,7 +75,6 @@
       },
       "fit_sec": 0.025,
       "predict_sec": 0.004,
-      "c_index": 0.8568,
       "model_spec": "rstpm2::stpm2 (Royston-Parmar) df=5",
       "contender": "r_royston_parmar_df5",
       "status": "ok"
@@ -94,7 +88,6 @@
       },
       "fit_sec": 0.05356962500081863,
       "predict_sec": 0.001114416001655627,
-      "c_index": 0.8567828139376725,
       "model_spec": "lifelines CoxPHFitter (all engineered linear covariates)",
       "contender": "python_lifelines_coxph",
       "status": "ok"
@@ -108,7 +101,6 @@
       },
       "fit_sec": 0.13708154200139688,
       "predict_sec": 0.00229849999959697,
-      "c_index": 0.8562627515301836,
       "model_spec": "lifelines WeibullAFTFitter (all engineered linear covariates)",
       "contender": "python_lifelines_weibull_aft",
       "status": "ok"
@@ -122,7 +114,6 @@
       },
       "fit_sec": 0.03029733400035184,
       "predict_sec": 0.00012224999954923987,
-      "c_index": 0.8568228187382486,
       "model_spec": "sksurv CoxPHSurvivalAnalysis (all engineered linear covariates)",
       "contender": "python_sksurv_coxph",
       "status": "ok"
@@ -136,7 +127,6 @@
       },
       "fit_sec": 0.3835792079989915,
       "predict_sec": 0.07770008399893413,
-      "c_index": 0.9209505140616874,
       "model_spec": "sksurv RandomSurvivalForest (300 trees)",
       "contender": "python_sksurv_rsf",
       "status": "ok"
@@ -144,7 +134,6 @@
     {
       "contender": "python_statsmodels_phreg",
       "status": "failed",
-      "error": "non-finite PHReg risk scores"
     }
   ]
 }

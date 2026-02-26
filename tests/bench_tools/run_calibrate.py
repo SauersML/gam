@@ -38,7 +38,6 @@ def prepare_data_for_rust():
     # Define the mapping from the CSV columns to the Rust tool's required names
     # This mapping is CRITICAL to ensure the correct penalization is applied.
     column_mapping = {
-        'variable_one': 'score',      # Mapped to 'score' to be UNPENALIZED
         'variable_two': 'PC1',        # Mapped to 'PC1' to be PENALIZED
         'outcome':      'phenotype'   # The response variable
     }
@@ -47,14 +46,11 @@ def prepare_data_for_rust():
     data_renamed = data.rename(columns=column_mapping)
 
     # Ensure all required columns are present after renaming
-    required_cols = ['phenotype', 'score', 'PC1']
     if not all(col in data_renamed.columns for col in required_cols):
-        print("\n--- ERROR: After renaming, not all required columns (phenotype, score, PC1) were found. ---")
         print(f"Columns found: {list(data_renamed.columns)}")
         sys.exit(1)
 
     # Save to the TSV format that the Rust tool expects
-    data_renamed.to_csv(RUST_TRAIN_DATA_PATH, sep='\t', index=False)
     print(f"Successfully created formatted data at '{RUST_TRAIN_DATA_PATH}'\n")
 
 def build_rust_project():
@@ -108,9 +104,7 @@ def main():
         str(EXECUTABLE_PATH), "train",
         "--num-pcs", str(NUM_PCS),
         # These knot/degree values are analogous to the basis complexity in the R code
-        "--pgs-knots", "11",  # for 'score' (variable_one)
         "--pc-knots", "11",   # for 'PC1' (variable_two)
-        "--pgs-degree", "3",
         "--pc-degree", "3",
         str(RUST_TRAIN_DATA_PATH),
     ]

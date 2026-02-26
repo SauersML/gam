@@ -221,7 +221,6 @@ impl fmt::Display for ComponentFdResult {
 /// Result of spectral bleed trace diagnostic
 #[derive(Clone, Debug)]
 pub struct SpectralBleedResult {
-    /// Penalty index
     pub penalty_k: usize,
     /// Energy of penalty S_k in the truncated subspace: trace(U_⊥' S_k U_⊥)
     pub truncated_energy: f64,
@@ -357,13 +356,11 @@ impl GradientDiagnosticReport {
 /// significant and the gradient will be wrong.
 ///
 /// # Arguments
-/// * `score_gradient` - The score gradient ∂l/∂β (log-likelihood contribution)
 /// * `penalty_gradient` - The penalty gradient S_λ β
 /// * `ridge_used` - Ridge added by PIRLS for stabilization
 /// * `beta` - Current coefficient estimate
 /// * `tolerance` - Threshold for flagging violations
 pub fn compute_envelope_audit(
-    score_gradient: &Array1<f64>,
     penalty_gradient: &Array1<f64>,
     ridge_used: f64,
     ridge_assumed: f64,
@@ -371,17 +368,15 @@ pub fn compute_envelope_audit(
     abs_tolerance: f64,
     rel_tolerance: f64,
 ) -> EnvelopeAudit {
-    // KKT residual: ∇_β L = score - S_λ β - ridge * β (if ridge is present)
-    let mut kkt_residual = score_gradient - penalty_gradient;
+    let mut kkt_residual = penalty_gradient.clone();
     if ridge_used > 0.0 {
         kkt_residual = &kkt_residual - &beta.mapv(|b| ridge_used * b);
     }
 
     let kkt_norm = kkt_residual.dot(&kkt_residual).sqrt();
-    let score_norm = score_gradient.dot(score_gradient).sqrt();
     let penalty_norm = penalty_gradient.dot(penalty_gradient).sqrt();
     let beta_norm = beta.dot(beta).sqrt();
-    let scale = score_norm + penalty_norm + ridge_used.abs() * beta_norm;
+    let scale = penalty_norm.max((ridge_assumed.abs() * beta_norm).max(1e-12));
     let rel_kkt = if scale > 0.0 { kkt_norm / scale } else { 0.0 };
     let ridge_mismatch = (ridge_used - ridge_assumed).abs() > 1e-12;
     let kkt_violation = kkt_norm > abs_tolerance && rel_kkt > rel_tolerance;
@@ -522,7 +517,6 @@ pub fn compute_component_fd(
 /// the truncated subspace. This diagnostic checks if the correction is adequate.
 ///
 /// # Arguments
-/// * `penalty_k` - Index of this penalty
 /// * `r_k` - Penalty root matrix for penalty k (R_k where S_k = R_k' R_k)
 /// * `u_truncated` - Eigenvectors of the truncated (null) subspace
 /// * `h_inv_u_truncated` - H⁻¹ U_⊥ (pre-solved for efficiency)
@@ -748,23 +742,21 @@ mod tests {
 
     #[test]
     fn test_envelope_audit_no_violation() {
-        let score = arr1(&[1.0, 2.0, 3.0]);
-        let penalty = arr1(&[1.0, 2.0, 3.0]);
+        let penalty = arr1(&[0.0, 0.0, 0.0]);
         let beta = arr1(&[0.1, 0.2, 0.3]);
+        let result = compute_envelope_audit(&penalty, 0.0, 0.0, &beta, 1e-8, 1e-6);
 
-        let result = compute_envelope_audit(&score, &penalty, 0.0, 0.0, &beta, 1e-4, 1e-2);
         assert!(!result.is_violated);
         assert!(result.kkt_residual_norm < 1e-10);
     }
 
     #[test]
     fn test_envelope_audit_ridge_mismatch() {
-        let score = arr1(&[1.0, 2.0, 3.0]);
         let penalty = arr1(&[0.9, 1.9, 2.9]);
         let beta = arr1(&[1.0, 1.0, 1.0]);
+        let result = compute_envelope_audit(&penalty, 0.1, 0.0, &beta, 1e-8, 1e-6);
 
         // PIRLS used ridge 0.1, but gradient assumes 0.0
-        let result = compute_envelope_audit(&score, &penalty, 0.1, 0.0, &beta, 1e-4, 1e-2);
         assert!(result.is_violated);
         assert!(
             result.message.contains("Ridge Mismatch")

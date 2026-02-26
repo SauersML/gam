@@ -11,7 +11,6 @@
 //! the posterior mean `E[g⁻¹(η)]` where `η ~ N(η̂, σ²)`.
 //!
 //! The posterior mean:
-//! - Minimizes squared prediction error (Brier score)
 //! - Is more conservative at extreme predictions
 //! - Accounts for parameter uncertainty in the final probability
 //!

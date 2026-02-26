@@ -1,12 +1,10 @@
 use crate::faer_ndarray::FaerCholesky;
-use crate::faer_ndarray::{fast_ata, fast_atv};
+use crate::faer_ndarray::{FaerArrayView, FaerEigh, fast_ata, fast_atv};
 use crate::matrix::DesignMatrix;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
-use faer::linalg::solvers::{
-    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
-};
+use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
 use ndarray::{Array1, Array2};
 use wolfe_bfgs::Bfgs;
 
@@ -14,7 +12,6 @@ use wolfe_bfgs::Bfgs;
 #[derive(Debug, Clone, Copy)]
 pub struct KnownLinkWiggle {
     pub base_link: LinkFunction,
-    /// Index of the block that parameterizes the wiggle term, if any.
     pub wiggle_block: Option<usize>,
 }
 
@@ -46,7 +43,6 @@ pub struct BlockWorkingSet {
     pub working_response: Array1<f64>,
     /// IRLS working weights for this block (non-negative, length n).
     pub working_weights: Array1<f64>,
-    /// Optional score wrt this block's linear predictor (diagnostics / custom control).
     pub gradient_eta: Option<Array1<f64>>,
 }
 
@@ -71,7 +67,6 @@ pub trait CustomFamily {
     /// current values of other blocks.
     fn block_geometry(
         &self,
-        _block_index: usize,
         _block_states: &[ParameterBlockState],
         spec: &ParameterBlockSpec,
     ) -> Result<(DesignMatrix, Array1<f64>), String> {
@@ -79,11 +74,7 @@ pub trait CustomFamily {
     }
 
     /// Optional per-block coefficient projection applied after each block update.
-    fn post_update_beta(
-        &self,
-        _block_index: usize,
-        beta: Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
+    fn post_update_beta(&self, beta: Array1<f64>) -> Result<Array1<f64>, String> {
         Ok(beta)
     }
 }
@@ -239,7 +230,7 @@ fn build_block_states<F: CustomFamily>(
             .initial_beta
             .clone()
             .unwrap_or_else(|| Array1::<f64>::zeros(p));
-        let (x_dyn, off_dyn) = family.block_geometry(b, &states, spec)?;
+        let (x_dyn, off_dyn) = family.block_geometry(&states, spec)?;
         if x_dyn.nrows() != spec.design.nrows() {
             return Err(format!(
                 "block {b} dynamic design row mismatch: got {}, expected {}",
@@ -275,7 +266,7 @@ fn refresh_all_block_etas<F: CustomFamily>(
     for b in 0..specs.len() {
         let spec = &specs[b];
         let p = states[b].beta.len();
-        let (x_dyn, off_dyn) = family.block_geometry(b, states, spec)?;
+        let (x_dyn, off_dyn) = family.block_geometry(states, spec)?;
         if x_dyn.nrows() != spec.design.nrows() {
             return Err(format!(
                 "block {b} dynamic design row mismatch: got {}, expected {}",
@@ -400,43 +391,49 @@ fn solve_block_weighted_system(
         return Err("weighted-system dimension mismatch".to_string());
     }
 
-    let (mut xtwx, xtwy_opt) = weighted_normal_equations(x, w, Some(y_star))?;
+    let (xtwx_base, xtwy_opt) = weighted_normal_equations(x, w, Some(y_star))?;
     let xtwy = xtwy_opt.ok_or_else(|| "missing weighted RHS in block solve".to_string())?;
-
-    xtwx += s_lambda;
-
-    let ridge = if ridge_policy.include_laplace_hessian {
+    let base_ridge = if ridge_policy.include_laplace_hessian {
         effective_solver_ridge(ridge_floor)
     } else {
         0.0
     };
-    for d in 0..p {
-        xtwx[[d, d]] += ridge;
-    }
 
-    let h = crate::faer_ndarray::FaerArrayView::new(&xtwx);
-    let mut rhs = xtwy.clone();
-    let mut rhs_mat = FaerMat::zeros(p, 1);
-    for i in 0..p {
-        rhs_mat[(i, 0)] = rhs[i];
-    }
+    for retry in 0..8 {
+        let ridge = if base_ridge > 0.0 {
+            base_ridge * 10f64.powi(retry)
+        } else {
+            0.0
+        };
 
-    if let Ok(ch) = FaerLlt::new(h.as_ref(), Side::Lower) {
-        ch.solve_in_place(rhs_mat.as_mut());
-    } else if let Ok(ld) = FaerLdlt::new(h.as_ref(), Side::Lower) {
-        ld.solve_in_place(rhs_mat.as_mut());
-    } else {
-        let lb = FaerLblt::new(h.as_ref(), Side::Lower);
-        lb.solve_in_place(rhs_mat.as_mut());
-    }
+        let mut xtwx = xtwx_base.clone();
+        xtwx += s_lambda;
+        for d in 0..p {
+            xtwx[[d, d]] += ridge;
+        }
 
-    for i in 0..p {
-        rhs[i] = rhs_mat[(i, 0)];
+        let h = crate::faer_ndarray::FaerArrayView::new(&xtwx);
+        let mut rhs = xtwy.clone();
+        let mut rhs_mat = FaerMat::zeros(p, 1);
+        for i in 0..p {
+            rhs_mat[(i, 0)] = rhs[i];
+        }
+
+        if let Ok(ch) = FaerLlt::new(h.as_ref(), Side::Lower) {
+            ch.solve_in_place(rhs_mat.as_mut());
+            for i in 0..p {
+                rhs[i] = rhs_mat[(i, 0)];
+            }
+            if rhs.iter().all(|v| v.is_finite()) {
+                return Ok(rhs);
+            }
+        }
+
+        if !ridge_policy.include_laplace_hessian {
+            break;
+        }
     }
-    if rhs.iter().any(|v| !v.is_finite()) {
-        return Err("block solve produced non-finite coefficients".to_string());
-    }
-    Ok(rhs)
+    Err("block solve failed after ridge retries".to_string())
 }
 
 #[inline]
@@ -489,6 +486,76 @@ fn stable_logdet_with_ridge_policy(
     }
 }
 
+fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    let (r, c) = a.dim();
+    let mut t = 0.0;
+    for i in 0..r {
+        for j in 0..c {
+            t += a[[i, j]] * b[[j, i]];
+        }
+    }
+    t
+}
+
+fn inverse_spd_with_retry(
+    matrix: &Array2<f64>,
+    base_ridge: f64,
+    max_retry: usize,
+) -> Result<Array2<f64>, String> {
+    let p = matrix.nrows();
+    for retry in 0..max_retry {
+        let ridge = if base_ridge > 0.0 {
+            base_ridge * 10f64.powi(retry as i32)
+        } else {
+            0.0
+        };
+        let mut h = matrix.clone();
+        for d in 0..p {
+            h[[d, d]] += ridge;
+        }
+        let h_view = FaerArrayView::new(&h);
+        if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+            let mut i_mat = FaerMat::zeros(p, p);
+            for d in 0..p {
+                i_mat[(d, d)] = 1.0;
+            }
+            ch.solve_in_place(i_mat.as_mut());
+            let mut inv = Array2::<f64>::zeros((p, p));
+            for i in 0..p {
+                for j in 0..p {
+                    inv[[i, j]] = i_mat[(i, j)];
+                }
+            }
+            if inv.iter().all(|v| v.is_finite()) {
+                return Ok(inv);
+            }
+        }
+    }
+    Err("failed to invert SPD system after ridge retries".to_string())
+}
+
+fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
+    let (evals, evecs) = FaerEigh::eigh(matrix, Side::Lower)
+        .map_err(|e| format!("eigh failed in positive-part pseudoinverse: {e}"))?;
+    let p = matrix.nrows();
+    let max_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let tol = (max_eval * 1e-12).max(ridge_floor.max(1e-14));
+    let mut pinv = Array2::<f64>::zeros((p, p));
+    for k in 0..p {
+        let ev = evals[k];
+        if ev > tol {
+            let inv_ev = 1.0 / ev;
+            for i in 0..p {
+                let uik = evecs[(i, k)];
+                for j in 0..p {
+                    pinv[[i, j]] += inv_ev * uik * evecs[(j, k)];
+                }
+            }
+        }
+    }
+    Ok(pinv)
+}
+
 fn blockwise_logdet_terms<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -512,7 +579,7 @@ fn blockwise_logdet_terms<F: CustomFamily>(
         let spec = &specs[b];
         let work = &eval.block_working_sets[b];
         let p = spec.design.ncols();
-        let (x_dyn, _) = family.block_geometry(b, states, spec)?;
+        let (x_dyn, _) = family.block_geometry(states, spec)?;
         if x_dyn.ncols() != p {
             return Err(format!(
                 "block {b} dynamic design col mismatch: got {}, expected {p}",
@@ -553,6 +620,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
     for cycle in 0..options.inner_max_cycles {
         let mut max_beta_step = 0.0_f64;
 
+        let mut ll_cycle_prev = last_ll;
         for b in 0..specs.len() {
             // Keep all blocks synchronized with any dynamic geometry.
             refresh_all_block_etas(family, specs, &mut states)?;
@@ -577,7 +645,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 ));
             }
 
-            let (x_dyn, off_dyn) = family.block_geometry(b, &states, spec)?;
+            let (x_dyn, off_dyn) = family.block_geometry(&states, spec)?;
             if x_dyn.nrows() != spec.design.nrows() {
                 return Err(format!(
                     "block {b} dynamic design row mismatch: got {}, expected {}",
@@ -616,17 +684,34 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 options.ridge_floor,
                 options.ridge_policy,
             )?;
-            let beta_new = family.post_update_beta(b, beta_new_raw)?;
-
-            let step = (&beta_new - &states[b].beta)
-                .iter()
-                .copied()
-                .map(f64::abs)
-                .fold(0.0, f64::max);
+            let beta_new = family.post_update_beta(beta_new_raw)?;
+            let beta_old = states[b].beta.clone();
+            let delta = &beta_new - &beta_old;
+            let step = delta.iter().copied().map(f64::abs).fold(0.0, f64::max);
             max_beta_step = max_beta_step.max(step);
+            if step <= options.inner_tol {
+                continue;
+            }
 
-            states[b].beta = beta_new;
-            refresh_all_block_etas(family, specs, &mut states)?;
+            // Damped update: require non-decreasing likelihood under dynamic geometry.
+            let mut accepted = false;
+            for bt in 0..8 {
+                let alpha = 0.5f64.powi(bt);
+                let trial_beta_raw = &beta_old + &delta.mapv(|v| alpha * v);
+                let trial_beta = family.post_update_beta(trial_beta_raw)?;
+                states[b].beta = trial_beta;
+                refresh_all_block_etas(family, specs, &mut states)?;
+                let trial_ll = family.evaluate(&states)?.log_likelihood;
+                if trial_ll.is_finite() && trial_ll >= ll_cycle_prev - 1e-10 {
+                    ll_cycle_prev = trial_ll;
+                    accepted = true;
+                    break;
+                }
+            }
+            if !accepted {
+                states[b].beta = beta_old;
+                refresh_all_block_etas(family, specs, &mut states)?;
+            }
         }
 
         refresh_all_block_etas(family, specs, &mut states)?;
@@ -636,7 +721,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
         last_ll = ll;
         cycles_done = cycle + 1;
 
-        if max_beta_step <= options.inner_tol && ll_change <= options.inner_tol {
+        let ll_tol = options.inner_tol * (1.0 + ll.abs());
+        if max_beta_step <= options.inner_tol && ll_change <= ll_tol {
             converged = true;
             break;
         }
@@ -677,6 +763,92 @@ fn inner_blockwise_fit<F: CustomFamily>(
 ///
 /// Inner loop: cyclic blockwise penalized weighted regressions.
 /// Outer loop: joint optimization of all log-smoothing parameters.
+fn outer_objective_and_gradient<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    penalty_counts: &[usize],
+    rho: &Array1<f64>,
+) -> Result<(f64, Array1<f64>), String> {
+    let per_block = split_log_lambdas(rho, penalty_counts)?;
+    let mut inner = inner_blockwise_fit(family, specs, &per_block, options)?;
+    let reml_term = if options.use_reml_objective {
+        0.5 * (inner.block_logdet_h - inner.block_logdet_s)
+    } else {
+        0.0
+    };
+    let objective = -inner.log_likelihood + inner.penalty_value + reml_term;
+    let mut grad = Array1::<f64>::zeros(rho.len());
+
+    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    let eval = family.evaluate(&inner.block_states)?;
+    let mut at = 0usize;
+    for b in 0..specs.len() {
+        let spec = &specs[b];
+        let work = &eval.block_working_sets[b];
+        let p = spec.design.ncols();
+        let (x_dyn, _) = family.block_geometry(&inner.block_states, spec)?;
+        let w = work.working_weights.mapv(|wi| wi.max(options.min_weight));
+        let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
+
+        let lambdas = per_block[b].mapv(f64::exp);
+        let mut s_lambda = Array2::<f64>::zeros((p, p));
+        for (k, s) in spec.penalties.iter().enumerate() {
+            s_lambda.scaled_add(lambdas[k], s);
+        }
+
+        let mut h_for_logdet = xtwx;
+        h_for_logdet += &s_lambda;
+        if options.ridge_policy.include_penalty_logdet {
+            let ridge = effective_solver_ridge(options.ridge_floor);
+            for d in 0..p {
+                h_for_logdet[[d, d]] += ridge;
+            }
+        }
+        let h_inv = inverse_spd_with_retry(
+            &h_for_logdet,
+            effective_solver_ridge(options.ridge_floor),
+            8,
+        )?;
+
+        let mut s_for_logdet = s_lambda.clone();
+        if options.ridge_policy.include_penalty_logdet {
+            let ridge = effective_solver_ridge(options.ridge_floor);
+            for d in 0..p {
+                s_for_logdet[[d, d]] += ridge;
+            }
+        }
+        let s_pinv = if options.use_reml_objective {
+            Some(pinv_positive_part(&s_for_logdet, options.ridge_floor)?)
+        } else {
+            None
+        };
+
+        let beta = &inner.block_states[b].beta;
+        for (k, s_k) in spec.penalties.iter().enumerate() {
+            let a_k = s_k.mapv(|v| lambdas[k] * v);
+            let a_k_beta = a_k.dot(beta);
+            let g_pen = 0.5 * beta.dot(&a_k_beta);
+            let g = if options.use_reml_objective {
+                let g_logh = 0.5 * trace_product(&h_inv, &a_k);
+                let g_logs = 0.5
+                    * trace_product(
+                        s_pinv
+                            .as_ref()
+                            .ok_or_else(|| "missing S^+ for REML gradient".to_string())?,
+                        &a_k,
+                    );
+                g_pen + g_logh - g_logs
+            } else {
+                g_pen
+            };
+            grad[at + k] = g;
+        }
+        at += spec.penalties.len();
+    }
+    Ok((objective, grad))
+}
+
 pub fn fit_custom_family<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -705,36 +877,11 @@ pub fn fit_custom_family<F: CustomFamily>(
         });
     }
 
-    let objective = |rho: &Array1<f64>| -> Result<f64, String> {
-        let per_block = split_log_lambdas(rho, &penalty_counts)?;
-        let inner = inner_blockwise_fit(family, specs, &per_block, options)?;
-        let reml_term = if options.use_reml_objective {
-            0.5 * (inner.block_logdet_h - inner.block_logdet_s)
-        } else {
-            0.0
-        };
-        Ok(-inner.log_likelihood + inner.penalty_value + reml_term)
-    };
-
-    let cost_grad = |rho: &Array1<f64>| -> Result<(f64, Array1<f64>), String> {
-        let f0 = objective(rho)?;
-        let mut g = Array1::<f64>::zeros(rho.len());
-        for j in 0..rho.len() {
-            let h = 1e-4_f64 * (1.0 + rho[j].abs());
-            let mut plus = rho.clone();
-            let mut minus = rho.clone();
-            plus[j] += h;
-            minus[j] -= h;
-            let fp = objective(&plus)?;
-            let fm = objective(&minus)?;
-            g[j] = (fp - fm) / (2.0 * h);
+    let mut solver = Bfgs::new(rho0.clone(), |x| {
+        match outer_objective_and_gradient(family, specs, options, &penalty_counts, x) {
+            Ok(pair) => pair,
+            Err(_) => (f64::INFINITY, Array1::<f64>::from_elem(x.len(), 1e6)),
         }
-        Ok((f0, g))
-    };
-
-    let mut solver = Bfgs::new(rho0.clone(), |x| match cost_grad(x) {
-        Ok(pair) => pair,
-        Err(_) => (f64::INFINITY, Array1::<f64>::zeros(x.len())),
     })
     .with_tolerance(options.outer_tol)
     .with_max_iterations(options.outer_max_iter);
@@ -791,6 +938,30 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct OneBlockGaussianFamily {
+        y: Array1<f64>,
+    }
+
+    impl CustomFamily for OneBlockGaussianFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let eta = &block_states[0].eta;
+            let resid = eta - &self.y;
+            let ll = -0.5 * resid.dot(&resid);
+            Ok(FamilyEvaluation {
+                log_likelihood: ll,
+                block_working_sets: vec![BlockWorkingSet {
+                    working_response: self.y.clone(),
+                    working_weights: Array1::ones(self.y.len()),
+                    gradient_eta: None,
+                }],
+            })
+        }
+    }
+
     #[test]
     fn effective_ridge_is_never_below_solver_floor() {
         assert!((effective_solver_ridge(0.0) - 1e-15).abs() < 1e-30);
@@ -831,6 +1002,66 @@ mod tests {
             "penalized objective should equal ridge quadratic term when ll=0 and S=0; got {}, expected {}",
             result.penalized_objective,
             expected_penalty
+        );
+    }
+
+    #[test]
+    fn outer_gradient_matches_finite_difference_for_one_block() {
+        let n = 8usize;
+        let y = Array1::from_vec(vec![0.4, -0.2, 0.8, 1.0, -0.5, 0.3, 0.1, -0.7]);
+        let spec = ParameterBlockSpec {
+            name: "b0".to_string(),
+            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            offset: Array1::zeros(n),
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.2],
+            initial_beta: None,
+        };
+        let options = BlockwiseFitOptions {
+            use_reml_objective: true,
+            ridge_floor: 1e-10,
+            ..BlockwiseFitOptions::default()
+        };
+        let penalty_counts = vec![1usize];
+        let rho = array![0.1];
+        let (f0, g0) = outer_objective_and_gradient(
+            &OneBlockGaussianFamily { y: y.clone() },
+            std::slice::from_ref(&spec),
+            &options,
+            &penalty_counts,
+            &rho,
+        )
+        .expect("objective/gradient");
+
+        let h = 1e-5;
+        let rho_p = array![rho[0] + h];
+        let rho_m = array![rho[0] - h];
+        let (fp, _) = outer_objective_and_gradient(
+            &OneBlockGaussianFamily { y: y.clone() },
+            std::slice::from_ref(&spec),
+            &options,
+            &penalty_counts,
+            &rho_p,
+        )
+        .expect("objective+");
+        let (fm, _) = outer_objective_and_gradient(
+            &OneBlockGaussianFamily { y },
+            std::slice::from_ref(&spec),
+            &options,
+            &penalty_counts,
+            &rho_m,
+        )
+        .expect("objective-");
+        let g_fd = (fp - fm) / (2.0 * h);
+        let rel = (g0[0] - g_fd).abs() / g_fd.abs().max(1e-8);
+
+        assert!(f0.is_finite());
+        assert!(
+            rel < 5e-3,
+            "outer gradient mismatch: analytic={} fd={} rel={}",
+            g0[0],
+            g_fd,
+            rel
         );
     }
 

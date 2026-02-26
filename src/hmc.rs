@@ -428,7 +428,6 @@ impl NutsPosterior {
             // This keeps the target smooth and consistent with its gradient.
             ll += w_i * (y_i * eta_i - Self::log1pexp(eta_i));
 
-            // Residual for gradient: y - μ (canonical link, score function)
             let mu = Self::sigmoid_stable(eta_i);
             residual[i] = w_i * (y_i - mu);
         }
@@ -993,7 +992,6 @@ impl NutsResult {
     }
 
     /// Computes percentiles of a function applied to coefficients.
-    /// Returns (0.0, 0.0) if samples is empty to avoid index-out-of-bounds.
     pub fn posterior_interval_of<F>(&self, f: F, lower_pct: f64, upper_pct: f64) -> (f64, f64)
     where
         F: Fn(ArrayView1<f64>) -> f64,
