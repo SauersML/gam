@@ -1071,4 +1071,3 @@ pub fn run_internal_bench_mode(args: &[String]) -> Result<(), String> {
         Err(e) => Err(e),
     }
 }
-

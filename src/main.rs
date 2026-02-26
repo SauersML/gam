@@ -15,7 +15,10 @@ use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, fit_gam,
     optimize_external_design, predict_gam,
 };
-use gam::gamlss::{GaussianLocationScaleSpec, ParameterBlockInput, fit_gaussian_location_scale};
+use gam::gamlss::{
+    BinomialLocationScaleProbitSpec, GaussianLocationScaleSpec, ParameterBlockInput,
+    fit_binomial_location_scale_probit, fit_gaussian_location_scale,
+};
 use gam::generative::{generative_spec_from_predict, sample_observation_replicates};
 use gam::hmc::{FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family};
 use gam::joint::{
@@ -63,8 +66,6 @@ struct FitArgs {
     data: PathBuf,
     #[arg(short = 'f', long = "formula", alias = "predict-mean")]
     formula: Option<String>,
-    #[arg(long = "predict-mean", hide = true)]
-    predict_mean: Option<String>,
     #[arg(long = "predict-noise", alias = "predict-variance")]
     predict_noise: Option<String>,
     #[arg(long = "target")]
@@ -178,7 +179,7 @@ struct BenchCvArgs {
     double_penalty: bool,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum FamilyArg {
     Auto,
     Gaussian,
@@ -278,6 +279,9 @@ struct LinkChoice {
     mode: LinkMode,
     link: LinkFunction,
 }
+
+const FAMILY_GAUSSIAN_LOCATION_SCALE: &str = "gaussian-location-scale";
+const FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT: &str = "binomial-location-scale-probit";
 
 #[derive(Clone, Debug)]
 struct Dataset {
@@ -380,24 +384,29 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let y = ds.values.column(y_col).to_owned();
 
     let link_choice = parse_link_choice(args.link.as_deref(), args.flexible_link)?;
-    let family = resolve_family(args.family, link_choice, y.view())?;
+    let mut family = resolve_family(args.family, link_choice, y.view())?;
     let effective_link = link_choice
         .map(|c| c.link)
         .unwrap_or_else(|| family_to_link(family));
 
+    if args.predict_noise.is_some()
+        && family == LikelihoodFamily::BinomialLogit
+        && args.family == FamilyArg::Auto
+        && link_choice.is_none()
+    {
+        family = LikelihoodFamily::BinomialProbit;
+    }
+
     if args.firth && args.predict_noise.is_some() {
-        return Err("--firth is not supported with --predict-noise location-scale fitting".to_string());
+        return Err(
+            "--firth is not supported with --predict-noise location-scale fitting".to_string(),
+        );
     }
     if args.firth && effective_link != LinkFunction::Logit {
         return Err("--firth requires logit link".to_string());
     }
 
     if let Some(noise_formula_raw) = &args.predict_noise {
-        if family != LikelihoodFamily::GaussianIdentity {
-            return Err(
-                "--predict-noise is currently supported only with Gaussian mean family".to_string(),
-            );
-        }
         let noise_formula = normalize_noise_formula(noise_formula_raw, &parsed.response);
         let parsed_noise = parse_formula(&noise_formula)?;
         let noise_spec = build_term_spec(&parsed_noise.terms, &ds, &col_map)?;
@@ -408,18 +417,103 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         let mean_design = build_term_collection_design(ds.values.view(), &mean_spec)
             .map_err(|e| format!("failed to build mean term collection design: {e}"))?;
 
-        let sd = sample_std(y.view()).max(1e-6);
-        let sigma_min = (sd * 1e-3).max(1e-6);
-        let sigma_max = (sd * 1e3).max(sigma_min * 10.0);
+        if family == LikelihoodFamily::GaussianIdentity {
+            let sd = sample_std(y.view()).max(1e-6);
+            let sigma_min = (sd * 1e-3).max(1e-6);
+            let sigma_max = (sd * 1e3).max(sigma_min * 10.0);
 
+            let options = gam::BlockwiseFitOptions::default();
+            let fit = fit_gaussian_location_scale(
+                GaussianLocationScaleSpec {
+                    y: y.clone(),
+                    weights: Array1::ones(y.len()),
+                    sigma_min,
+                    sigma_max,
+                    mu_block: ParameterBlockInput {
+                        design: DesignMatrix::Dense(mean_design.design.clone()),
+                        offset: Array1::zeros(y.len()),
+                        penalties: mean_design.penalties.clone(),
+                        initial_log_lambdas: None,
+                        initial_beta: None,
+                    },
+                    log_sigma_block: ParameterBlockInput {
+                        design: DesignMatrix::Dense(noise_design.design.clone()),
+                        offset: Array1::zeros(y.len()),
+                        penalties: noise_design.penalties.clone(),
+                        initial_log_lambdas: None,
+                        initial_beta: None,
+                    },
+                },
+                &options,
+            )
+            .map_err(|e| format!("fit_gaussian_location_scale failed: {e}"))?;
+
+            println!(
+                "model fit complete | family={} | outer_iter={} | converged={}",
+                FAMILY_GAUSSIAN_LOCATION_SCALE, fit.outer_iterations, fit.converged
+            );
+
+            if let Some(out) = args.out {
+                let model = SavedModel {
+                    version: 1,
+                    formula: formula_text,
+                    family: FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
+                    link: link_choice.map(link_choice_to_string),
+                    formula_noise: Some(noise_formula),
+                    beta_noise: fit.block_states.get(1).map(|b| b.beta.to_vec()),
+                    sigma_min: Some(sigma_min),
+                    sigma_max: Some(sigma_max),
+                    joint_beta_link: None,
+                    joint_knot_range: None,
+                    joint_knot_vector: None,
+                    joint_link_transform: None,
+                    joint_degree: None,
+                    joint_ridge_used: None,
+                    survival_entry: None,
+                    survival_exit: None,
+                    survival_event: None,
+                    survival_spec: None,
+                    survival_monotonicity_lambda: None,
+                    fit_max_iter: 80,
+                    fit_tol: 1e-6,
+                    beta: fit
+                        .block_states
+                        .first()
+                        .map(|b| b.beta.to_vec())
+                        .unwrap_or_default(),
+                    lambdas: fit.lambdas.to_vec(),
+                    scale: 1.0,
+                    covariance_conditional: None,
+                    covariance_corrected: None,
+                };
+                let payload = serde_json::to_string_pretty(&model)
+                    .map_err(|e| format!("failed to serialize model: {e}"))?;
+                fs::write(&out, payload)
+                    .map_err(|e| format!("failed to write model '{}': {e}", out.display()))?;
+                println!("saved model: {}", out.display());
+            }
+            return Ok(());
+        }
+
+        if family != LikelihoodFamily::BinomialProbit {
+            return Err(
+                "--predict-noise currently supports Gaussian and Binomial-Probit families; use --family binomial-probit (or --link probit) for binary outcomes"
+                    .to_string(),
+            );
+        }
+
+        let sigma_min = 0.05;
+        let sigma_max = 20.0;
+        let score = Array1::<f64>::zeros(y.len());
         let options = gam::BlockwiseFitOptions::default();
-        let fit = fit_gaussian_location_scale(
-            GaussianLocationScaleSpec {
+        let fit = fit_binomial_location_scale_probit(
+            BinomialLocationScaleProbitSpec {
                 y: y.clone(),
+                score,
                 weights: Array1::ones(y.len()),
                 sigma_min,
                 sigma_max,
-                mu_block: ParameterBlockInput {
+                threshold_block: ParameterBlockInput {
                     design: DesignMatrix::Dense(mean_design.design.clone()),
                     offset: Array1::zeros(y.len()),
                     penalties: mean_design.penalties.clone(),
@@ -436,19 +530,19 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             },
             &options,
         )
-        .map_err(|e| format!("fit_gaussian_location_scale failed: {e}"))?;
+        .map_err(|e| format!("fit_binomial_location_scale_probit failed: {e}"))?;
 
         println!(
-            "model fit complete | family=gaussian-location-scale | outer_iter={} | converged={}",
-            fit.outer_iterations, fit.converged
+            "model fit complete | family={} | outer_iter={} | converged={}",
+            FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT, fit.outer_iterations, fit.converged
         );
 
         if let Some(out) = args.out {
             let model = SavedModel {
                 version: 1,
                 formula: formula_text,
-                family: "gaussian-location-scale".to_string(),
-                link: link_choice.map(link_choice_to_string),
+                family: FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT.to_string(),
+                link: Some("probit".to_string()),
                 formula_noise: Some(noise_formula),
                 beta_noise: fit.block_states.get(1).map(|b| b.beta.to_vec()),
                 sigma_min: Some(sigma_min),
@@ -496,13 +590,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if let Some(choice) = link_choice {
         if matches!(choice.mode, LinkMode::Flexible) {
             if !is_binomial_family(family) {
-                return Err(
-                    "--flexible-link currently requires a binomial family/link"
-                        .to_string(),
-                );
+                return Err("--flexible-link currently requires a binomial family/link".to_string());
             }
             if args.firth && choice.link != LinkFunction::Logit {
-                return Err("--firth with --flexible-link currently requires logit base link".to_string());
+                return Err(
+                    "--firth with --flexible-link currently requires logit base link".to_string(),
+                );
             }
             let config = JointModelConfig {
                 firth_bias_reduction: args.firth,
@@ -674,7 +767,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         .enumerate()
         .map(|(i, h)| (h.clone(), i))
         .collect();
-    if model.family == "gaussian-location-scale" {
+    if model.family == FAMILY_GAUSSIAN_LOCATION_SCALE {
         let spec_mu = build_term_spec(&parsed.terms, &ds, &col_map)?;
         let design_mu = build_term_collection_design(ds.values.view(), &spec_mu)
             .map_err(|e| format!("failed to build mean prediction design: {e}"))?;
@@ -732,6 +825,75 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             "wrote predictions: {} (rows={})",
             args.out.display(),
             eta_mu.len()
+        );
+        return Ok(());
+    }
+    if model.family == FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT {
+        let spec_t = build_term_spec(&parsed.terms, &ds, &col_map)?;
+        let design_t = build_term_collection_design(ds.values.view(), &spec_t)
+            .map_err(|e| format!("failed to build threshold prediction design: {e}"))?;
+        let beta_t = Array1::from_vec(model.beta.clone());
+        if beta_t.len() != design_t.design.ncols() {
+            return Err(format!(
+                "threshold model/design mismatch: beta has {} coefficients but design has {} columns",
+                beta_t.len(),
+                design_t.design.ncols()
+            ));
+        }
+        let noise_formula = model.formula_noise.as_ref().ok_or_else(|| {
+            "binomial-location-scale-probit model is missing formula_noise".to_string()
+        })?;
+        let parsed_noise = parse_formula(noise_formula)?;
+        let spec_noise = build_term_spec(&parsed_noise.terms, &ds, &col_map)?;
+        let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
+            .map_err(|e| format!("failed to build noise prediction design: {e}"))?;
+        let beta_noise = Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
+            "binomial-location-scale-probit model is missing beta_noise".to_string()
+        })?);
+        if beta_noise.len() != design_noise.design.ncols() {
+            return Err(format!(
+                "noise model/design mismatch: beta has {} coefficients but design has {} columns",
+                beta_noise.len(),
+                design_noise.design.ncols()
+            ));
+        }
+        let eta_t = design_t.design.dot(&beta_t);
+        let eta_noise = design_noise.design.dot(&beta_noise);
+        let sigma_min = model.sigma_min.unwrap_or(0.05);
+        let sigma_max = model.sigma_max.unwrap_or(20.0);
+        let sigma = eta_noise.mapv(|v| v.exp().clamp(sigma_min, sigma_max));
+        let eta = Array1::from_iter(
+            eta_t
+                .iter()
+                .zip(sigma.iter())
+                .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
+        );
+        let mean = eta.mapv(normal_cdf_approx);
+        let mut mean_lo = None;
+        let mut mean_hi = None;
+        let mut se = None;
+        if args.uncertainty {
+            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+                return Err(format!("--level must be in (0,1), got {}", args.level));
+            }
+            let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+            let se_mean = mean.mapv(|p| (p * (1.0 - p)).max(1e-12).sqrt());
+            mean_lo = Some((&mean - &se_mean.mapv(|v| z * v)).mapv(|v| v.clamp(0.0, 1.0)));
+            mean_hi = Some((&mean + &se_mean.mapv(|v| z * v)).mapv(|v| v.clamp(0.0, 1.0)));
+            se = Some(se_mean);
+        }
+        write_prediction_csv(
+            &args.out,
+            eta.view(),
+            mean.view(),
+            se.as_ref().map(|a| a.view()),
+            mean_lo.as_ref().map(|a| a.view()),
+            mean_hi.as_ref().map(|a| a.view()),
+        )?;
+        println!(
+            "wrote predictions: {} (rows={})",
+            args.out.display(),
+            mean.len()
         );
         return Ok(());
     }
@@ -1151,9 +1313,11 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     let model: SavedModel =
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
 
-    if model.family == "gaussian-location-scale" {
+    if model.family == FAMILY_GAUSSIAN_LOCATION_SCALE
+        || model.family == FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT
+    {
         return Err(
-            "sample for gaussian-location-scale models is not available yet; sample the mean-only model instead"
+            "sample for location-scale models is not available yet; sample the mean-only model instead"
                 .to_string(),
         );
     }
@@ -1216,7 +1380,11 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             let t1 = ds.values[[i, exit_col]].max(t0 + 1e-9);
             age_entry[i] = t0;
             age_exit[i] = t1;
-            event_target[i] = if ds.values[[i, event_col]] >= 0.5 { 1 } else { 0 };
+            event_target[i] = if ds.values[[i, event_col]] >= 0.5 {
+                1
+            } else {
+                0
+            };
             x_entry[[i, 0]] = 1.0;
             x_exit[[i, 0]] = 1.0;
             x_entry[[i, 1]] = t0.ln();
@@ -1371,7 +1539,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build design: {e}"))?;
 
-    let spec = if model.family == "gaussian-location-scale" {
+    let spec = if model.family == FAMILY_GAUSSIAN_LOCATION_SCALE {
         let beta_mu = Array1::from_vec(model.beta.clone());
         let noise_formula = model
             .formula_noise
@@ -1381,12 +1549,10 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         let spec_noise = build_term_spec(&parsed_noise.terms, &ds, &col_map)?;
         let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
             .map_err(|e| format!("failed to build noise design: {e}"))?;
-        let beta_noise = Array1::from_vec(
-            model
-                .beta_noise
-                .clone()
-                .ok_or_else(|| "gaussian-location-scale model is missing beta_noise".to_string())?,
-        );
+        let beta_noise =
+            Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
+                "gaussian-location-scale model is missing beta_noise".to_string()
+            })?);
         if beta_mu.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols()
         {
             return Err("location-scale model/design dimension mismatch".to_string());
@@ -1401,6 +1567,39 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         gam::generative::GenerativeSpec {
             mean,
             noise: gam::generative::NoiseModel::Gaussian { sigma },
+        }
+    } else if model.family == FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT {
+        let beta_t = Array1::from_vec(model.beta.clone());
+        let noise_formula = model.formula_noise.as_ref().ok_or_else(|| {
+            "binomial-location-scale-probit model is missing formula_noise".to_string()
+        })?;
+        let parsed_noise = parse_formula(noise_formula)?;
+        let spec_noise = build_term_spec(&parsed_noise.terms, &ds, &col_map)?;
+        let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
+            .map_err(|e| format!("failed to build noise design: {e}"))?;
+        let beta_noise = Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
+            "binomial-location-scale-probit model is missing beta_noise".to_string()
+        })?);
+        if beta_t.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols()
+        {
+            return Err("location-scale model/design dimension mismatch".to_string());
+        }
+        let sigma_min = model.sigma_min.unwrap_or(0.05);
+        let sigma_max = model.sigma_max.unwrap_or(20.0);
+        let eta_t = design.design.dot(&beta_t);
+        let sigma = design_noise
+            .design
+            .dot(&beta_noise)
+            .mapv(|v| v.exp().clamp(sigma_min, sigma_max));
+        let mean = Array1::from_iter(
+            eta_t
+                .iter()
+                .zip(sigma.iter())
+                .map(|(&t, &s)| normal_cdf_approx((-t / s.max(1e-12)).clamp(-30.0, 30.0))),
+        );
+        gam::generative::GenerativeSpec {
+            mean,
+            noise: gam::generative::NoiseModel::Bernoulli,
         }
     } else {
         let family = family_from_string(&model.family)?;
@@ -1426,19 +1625,19 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                 noise: gam::generative::NoiseModel::Bernoulli,
             }
         } else {
-        let beta = Array1::from_vec(model.beta.clone());
-        if beta.len() != design.design.ncols() {
-            return Err(format!(
-                "model/design mismatch: model beta has {} coefficients but design has {} columns",
-                beta.len(),
-                design.design.ncols()
-            ));
-        }
-        let offset = Array1::zeros(design.design.nrows());
-        let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
-            .map_err(|e| format!("predict_gam failed: {e}"))?;
-        generative_spec_from_predict(pred, family, Some(model.scale))
-            .map_err(|e| format!("failed to build generative spec: {e}"))?
+            let beta = Array1::from_vec(model.beta.clone());
+            if beta.len() != design.design.ncols() {
+                return Err(format!(
+                    "model/design mismatch: model beta has {} coefficients but design has {} columns",
+                    beta.len(),
+                    design.design.ncols()
+                ));
+            }
+            let offset = Array1::zeros(design.design.nrows());
+            let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
+                .map_err(|e| format!("predict_gam failed: {e}"))?;
+            generative_spec_from_predict(pred, family, Some(model.scale))
+                .map_err(|e| format!("failed to build generative spec: {e}"))?
         }
     };
 
@@ -1458,16 +1657,16 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
 }
 
 fn choose_formula(args: &FitArgs) -> Result<String, String> {
-    if let Some(v) = &args.predict_mean {
-        return Ok(v.clone());
-    }
     if let Some(v) = &args.formula {
         return Ok(v.clone());
     }
     if let (Some(target), Some(features)) = (&args.target, &args.features) {
         return compose_formula_from_target_features(target, features);
     }
-    Err("one of --formula/--predict-mean OR (--target and --features) is required".to_string())
+    Err(
+        "one of --formula (alias: --predict-mean) OR (--target and --features) is required"
+            .to_string(),
+    )
 }
 
 fn compose_formula_from_target_features(target: &str, features: &str) -> Result<String, String> {
