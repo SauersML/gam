@@ -436,6 +436,75 @@ fn robust_eigh(
     Ok((Array1::from_vec(eigenvalues), mat_to_array(&eigenvectors)))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SubspaceLeakageMetrics {
+    max_abs_sq: f64,
+    max_rel_sq: f64,
+    worst_penalty: usize,
+    max_cross_gram_abs: f64,
+}
+
+fn assess_subspace_leakage(
+    qs: &Mat<f64>,
+    rs_transformed: &[Mat<f64>],
+    structural_rank: usize,
+    p: usize,
+) -> SubspaceLeakageMetrics {
+    let mut max_abs_sq = 0.0_f64;
+    let mut max_rel_sq = 0.0_f64;
+    let mut worst_penalty = 0usize;
+
+    for (k, rs) in rs_transformed.iter().enumerate() {
+        let rows = rs.nrows();
+        let cols = rs.ncols().min(p);
+        let null_start = structural_rank.min(cols);
+        let mut abs_sq = 0.0_f64;
+        let mut total_sq = 0.0_f64;
+        for i in 0..rows {
+            for j in 0..cols {
+                let v = rs[(i, j)];
+                let vv = v * v;
+                total_sq += vv;
+                if j >= null_start {
+                    abs_sq += vv;
+                }
+            }
+        }
+        let rel_sq = if total_sq > 0.0 {
+            abs_sq / total_sq
+        } else {
+            0.0
+        };
+        if rel_sq > max_rel_sq {
+            max_rel_sq = rel_sq;
+            worst_penalty = k;
+        }
+        max_abs_sq = max_abs_sq.max(abs_sq);
+    }
+
+    let mut max_cross_gram_abs = 0.0_f64;
+    let null_count = p.saturating_sub(structural_rank);
+    if structural_rank > 0 && null_count > 0 {
+        for i in 0..structural_rank {
+            for j in 0..null_count {
+                let qn_col = structural_rank + j;
+                let mut dot = 0.0_f64;
+                for r in 0..p {
+                    dot += qs[(r, i)] * qs[(r, qn_col)];
+                }
+                max_cross_gram_abs = max_cross_gram_abs.max(dot.abs());
+            }
+        }
+    }
+
+    SubspaceLeakageMetrics {
+        max_abs_sq,
+        max_rel_sq,
+        worst_penalty,
+        max_cross_gram_abs,
+    }
+}
+
 /// Computes weighted column means for functional ANOVA decomposition.
 /// Returns the weighted means that would be subtracted by center_columns_in_place.
 fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
@@ -917,6 +986,7 @@ pub fn stable_reparameterization_with_invariant(
         }
     }
 
+    let mut range_eigenvalues_sorted: Vec<f64> = Vec::new();
     if penalized_rank > 0 {
         let mut range_block = Mat::<f64>::zeros(penalized_rank, penalized_rank);
         for i in 0..penalized_rank {
@@ -934,6 +1004,10 @@ pub fn stable_reparameterization_with_invariant(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(i.cmp(&j))
         });
+        range_eigenvalues_sorted = range_order
+            .iter()
+            .map(|&idx| range_eigenvalues[idx])
+            .collect();
 
         let mut range_rotation = Mat::<f64>::zeros(penalized_rank, penalized_rank);
         for (col_idx, &idx) in range_order.iter().enumerate() {
@@ -990,104 +1064,81 @@ pub fn stable_reparameterization_with_invariant(
         }
     }
 
-    let mut s_transformed = Mat::<f64>::zeros(p, p);
     let mut s_k_transformed_cache: Vec<Mat<f64>> = Vec::with_capacity(m);
-    for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
+    for rs_k in rs_transformed.iter() {
         let s_k = penalty_from_root_faer(rs_k);
-        for i in 0..p {
-            for j in 0..p {
-                s_transformed[(i, j)] += *lambda * s_k[(i, j)];
-            }
-        }
         s_k_transformed_cache.push(s_k);
     }
 
-    let (s_eigenvalues_raw, s_eigenvectors) =
-        robust_eigh_faer(&s_transformed, Side::Lower, "combined penalty matrix")?;
-
-    // Use FIXED STRUCTURAL RANK to ensure C² smoothness of the LAML objective.
-    //
-    // The LAML objective includes log|S_λ|_+ (log-pseudo-determinant of the penalty).
-    // The structural rank is determined at precompute time from the balanced penalties
-    // and represents the number of truly penalized directions in the model geometry.
-    //
-    // CRITICAL: Using adaptive rank (based on current eigenvalues) creates DISCONTINUITIES
-    // in the objective function. When an eigenvalue crosses the threshold, the rank jumps,
-    // causing a step change in log|S|_+. This violates the C² assumption required by BFGS.
-    //
-    // To handle noise eigenvalues without discontinuities:
-    // 1. Use FIXED structural rank (smooth, continuous objective)
-    // 2. Clamp eigenvalues to a relative floor when computing log_det
-    //    This bounds the contribution of noise without changing the rank.
-
-    // Sort eigenvalues descending with their indices
-    let mut sorted_eigs: Vec<(usize, f64)> = s_eigenvalues_raw
+    // Subspace-invariant penalty spectral calculus:
+    // - Penalized and null spaces are fixed by the lambda-invariant basis `qs_base`.
+    // - Runtime lambda dependence only appears in the penalized block eigenvalues.
+    // This avoids basis mixing inside the degenerate zero-eigenspace.
+    let structural_rank = penalized_rank;
+    let range_eigs_sorted: Vec<f64> = range_eigenvalues_sorted;
+    let max_eig = range_eigs_sorted
         .iter()
-        .enumerate()
-        .map(|(i, &ev)| (i, ev))
-        .collect();
-    sorted_eigs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Use FIXED structural rank from invariant (ensures smooth objective).
-    // This mirrors the same principle as fixed null-space handling in
-    // conditionally-PD Duchon constructions: avoid rank changes during outer
-    // hyperparameter optimization, which would otherwise create non-smooth
-    // log|S| behavior.
-    let structural_rank = penalized_rank.min(sorted_eigs.len());
-    let selected_eigs: Vec<(usize, f64)> =
-        sorted_eigs.iter().take(structural_rank).cloned().collect();
-
-    // Relative floor for log_det: clamp small eigenvalues to avoid ln(noise)
-    // This is applied when computing log_det, NOT when selecting rank
-    let max_eig = sorted_eigs.first().map(|(_, v)| *v).unwrap_or(1.0);
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
     let eigenvalue_floor = max_eig * 1e-12;
 
-    // Extract truncated eigenvector indices (those NOT in selected_eigs)
-    // These span the null space and are needed for gradient correction
-    let truncated_indices: Vec<usize> = sorted_eigs
-        .iter()
-        .skip(structural_rank)
-        .map(|&(idx, _)| idx)
-        .collect();
-    let truncated_count = truncated_indices.len();
+    // Guard against any accidental penalized/null mixing. The transformed penalty
+    // roots must have negligible support on null columns by construction.
+    let leakage = assess_subspace_leakage(&qs, &rs_transformed, structural_rank, p);
+    let leakage_rel_tol = 1e-10;
+    let leakage_abs_tol = 1e-12;
+    let orth_tol = 1e-10;
+    if leakage.max_rel_sq > leakage_rel_tol && leakage.max_abs_sq > leakage_abs_tol
+        || leakage.max_cross_gram_abs > orth_tol
+    {
+        return Err(EstimationError::LayoutError(format!(
+            "Reparameterization subspace split is inconsistent: max null leakage {:.3e} (rel {:.3e}, worst penalty {}), max |Qp'Qn| {:.3e}",
+            leakage.max_abs_sq.sqrt(),
+            leakage.max_rel_sq.sqrt(),
+            leakage.worst_penalty,
+            leakage.max_cross_gram_abs,
+        )));
+    }
 
-    // Build u_truncated matrix (p × truncated_count)
+    // Truncated basis is the structural null-space basis (fixed Q_n).
+    let truncated_count = p.saturating_sub(structural_rank);
     let mut u_truncated_mat = Mat::<f64>::zeros(p, truncated_count);
-    for (col_out, &col_in) in truncated_indices.iter().enumerate() {
+    for col_out in 0..truncated_count {
+        let col_in = structural_rank + col_out;
         for row in 0..p {
-            u_truncated_mat[(row, col_out)] = s_eigenvectors[(row, col_in)];
+            u_truncated_mat[(row, col_out)] = qs[(row, col_in)];
         }
     }
 
-    // Use relative floor for eigenvalue clamping (prevents ln(noise) without changing rank)
-    // eigenvalue_floor = max_eig * 1e-12 ensures bounded contribution from noise modes
-
+    // E rows correspond to sqrt(eigenvalue) * q_j^T over fixed penalized columns.
     let mut e_transformed_mat = Mat::<f64>::zeros(structural_rank, p);
-    for (row_idx, &(eig_idx, eigenval)) in selected_eigs.iter().enumerate() {
-        let safe_eigenval = eigenval.max(eigenvalue_floor);
+    for row_idx in 0..structural_rank {
+        let safe_eigenval = range_eigs_sorted[row_idx].max(eigenvalue_floor);
         let sqrt_eigenval = safe_eigenval.sqrt();
         for row in 0..p {
-            e_transformed_mat[(row_idx, row)] = s_eigenvectors[(row, eig_idx)] * sqrt_eigenval;
+            e_transformed_mat[(row_idx, row)] = qs[(row, row_idx)] * sqrt_eigenval;
         }
     }
 
-    // Clamp eigenvalues to floor when computing log_det (bounded noise contribution)
-    let log_det: f64 = selected_eigs
+    // Positive-part pseudo-logdet on fixed structural rank.
+    let log_det: f64 = range_eigs_sorted
         .iter()
-        .map(|&(_, ev)| ev.max(eigenvalue_floor).ln())
+        .take(structural_rank)
+        .map(|&ev| ev.max(eigenvalue_floor).ln())
         .sum();
 
     let mut det1_vec = vec![0.0; lambdas.len()];
 
-    // Build S⁺ using the selected eigenvalues (structural rank)
+    // Build S⁺ on fixed penalized subspace using Q_p and penalized eigenvalues.
     let mut s_plus = Mat::<f64>::zeros(p, p);
-    for &(eig_idx, eigenval) in selected_eigs.iter() {
+    for (eig_idx, &eigenval) in range_eigs_sorted.iter().take(structural_rank).enumerate() {
         if eigenval > eigenvalue_floor {
             let inv = 1.0 / eigenval;
             for i in 0..p {
-                let vi = s_eigenvectors[(i, eig_idx)];
+                let vi = qs[(i, eig_idx)];
                 for j in 0..p {
-                    s_plus[(i, j)] += inv * vi * s_eigenvectors[(j, eig_idx)];
+                    s_plus[(i, j)] += inv * vi * qs[(j, eig_idx)];
                 }
             }
         }
@@ -1255,4 +1306,59 @@ pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinal
         return Ok(f64::INFINITY);
     }
     Ok(max_sv / min_sv)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SubspaceLeakageMetrics, assess_subspace_leakage};
+    use faer::Mat;
+
+    fn metrics_for(
+        qs: &Mat<f64>,
+        rs: &[Mat<f64>],
+        structural_rank: usize,
+        p: usize,
+    ) -> SubspaceLeakageMetrics {
+        assess_subspace_leakage(qs, rs, structural_rank, p)
+    }
+
+    #[test]
+    fn subspace_leakage_is_zero_for_clean_split() {
+        let p = 4usize;
+        let structural_rank = 2usize;
+        let qs = Mat::<f64>::identity(p, p);
+        let mut r0 = Mat::<f64>::zeros(2, p);
+        r0[(0, 0)] = 1.0;
+        r0[(1, 1)] = 2.0;
+
+        let m = metrics_for(&qs, &[r0], structural_rank, p);
+        assert!(m.max_abs_sq <= 1e-16);
+        assert!(m.max_rel_sq <= 1e-16);
+        assert!(m.max_cross_gram_abs <= 1e-16);
+    }
+
+    #[test]
+    fn subspace_leakage_detects_null_column_energy() {
+        let p = 4usize;
+        let structural_rank = 2usize;
+        let qs = Mat::<f64>::identity(p, p);
+        let mut r0 = Mat::<f64>::zeros(1, p);
+        r0[(0, 2)] = 3.0;
+
+        let m = metrics_for(&qs, &[r0], structural_rank, p);
+        assert!(m.max_abs_sq > 0.0);
+        assert!(m.max_rel_sq > 0.99);
+    }
+
+    #[test]
+    fn subspace_leakage_detects_qp_qn_nonorthogonality() {
+        let p = 3usize;
+        let structural_rank = 1usize;
+        let mut qs = Mat::<f64>::identity(p, p);
+        qs[(0, 1)] = 0.2;
+        let r0 = Mat::<f64>::zeros(1, p);
+
+        let m = metrics_for(&qs, &[r0], structural_rank, p);
+        assert!(m.max_cross_gram_abs > 1e-3);
+    }
 }
