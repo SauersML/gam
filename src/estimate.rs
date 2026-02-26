@@ -35,7 +35,7 @@ use crate::construction::{
 use crate::matrix::DesignMatrix;
 use crate::pirls::{self, PirlsResult};
 use crate::probability::{inverse_link_array, standard_normal_quantile};
-use crate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
+use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use crate::types::{
     Coefficients, LinkFunction, LogSmoothingParams, LogSmoothingParamsView, RidgeDeterminantMode,
     RidgePassport,
@@ -1213,7 +1213,10 @@ impl Default for SmoothingBfgsOptions {
             max_iter: 200,
             tol: 1e-5,
             finite_diff_step: 1e-3,
-            seed_config: SeedConfig::default(),
+            seed_config: SeedConfig {
+                risk_profile: SeedRiskProfile::GeneralizedLinear,
+                ..SeedConfig::default()
+            },
         }
     }
 }
@@ -1287,15 +1290,17 @@ fn should_replace_smoothing_candidate(
     }
 }
 
-fn run_multistart_bfgs<C, Eval>(
+fn run_multistart_bfgs<C, Eval, Screen>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     context: &mut C,
     eval_cost_grad_rho: &mut Eval,
+    seed_screen_cost: &mut Screen,
     options: &SmoothingBfgsOptions,
 ) -> Result<SmoothingBfgsResult, EstimationError>
 where
     Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError>,
+    Screen: FnMut(&mut C, &Array1<f64>) -> Result<f64, EstimationError>,
 {
     let seeds = generate_rho_candidates(num_penalties, heuristic_lambdas, &options.seed_config);
     if seeds.is_empty() {
@@ -1304,8 +1309,56 @@ where
         ));
     }
 
-    let mut best: Option<SmoothingBfgsResult> = None;
+    // Cheap initial triage: evaluate each seed once and only fully optimize
+    // the most promising starts.
+    let mut screened: Vec<(usize, Array1<f64>, f64)> = Vec::with_capacity(seeds.len());
     for (idx, rho_seed) in seeds.iter().enumerate() {
+        match seed_screen_cost(context, rho_seed) {
+            Ok(cost) if cost.is_finite() => screened.push((idx, rho_seed.clone(), cost)),
+            _ => {}
+        }
+    }
+    if screened.len() < 2 && num_penalties > 0 {
+        let (lo, hi) = if options.seed_config.bounds.0 <= options.seed_config.bounds.1 {
+            options.seed_config.bounds
+        } else {
+            (options.seed_config.bounds.1, options.seed_config.bounds.0)
+        };
+        let conservative_levels: &[f64] = match options.seed_config.risk_profile {
+            SeedRiskProfile::Gaussian => &[2.0, 4.0],
+            SeedRiskProfile::GeneralizedLinear => &[4.0, 6.0],
+            SeedRiskProfile::Survival => &[6.0, 8.0],
+        };
+        for &lvl in conservative_levels {
+            let rho = lvl.clamp(lo, hi);
+            let probe = Array1::from_elem(num_penalties, rho);
+            if let Ok(cost) = seed_screen_cost(context, &probe) && cost.is_finite() {
+                screened.push((usize::MAX, probe, cost));
+            }
+        }
+    }
+    screened.sort_by(|a, b| a.2.total_cmp(&b.2));
+    let screening_budget = options
+        .seed_config
+        .screening_budget
+        .max(1)
+        .min(if num_penalties >= 12 { 4 } else { 6 });
+    let candidate_seeds: Vec<(usize, Array1<f64>)> = screened
+        .into_iter()
+        .take(screening_budget)
+        .map(|(idx, rho, _)| (idx, rho))
+        .collect();
+
+    let candidate_seeds = if candidate_seeds.is_empty() {
+        vec![(0usize, Array1::<f64>::zeros(num_penalties))]
+    } else {
+        candidate_seeds
+    };
+
+    let mut best: Option<SmoothingBfgsResult> = None;
+    let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
+    let mut best_grad_norm = f64::INFINITY;
+    for (seed_idx, rho_seed) in candidate_seeds.iter() {
         let initial_z = to_z_from_rho(rho_seed);
         let mut last_eval: Option<(Array1<f64>, Array1<f64>)> = None;
         let mut optimizer = Bfgs::new(initial_z.clone(), |z| {
@@ -1328,7 +1381,7 @@ where
         .with_max_iterations(options.max_iter)
         .with_fp_tolerances(1e2, 1e2)
         .with_no_improve_stop(1e-8, 5)
-        .with_rng_seed(0x5EED_u64.wrapping_add(idx as u64));
+        .with_rng_seed(0x5EED_u64.wrapping_add(*seed_idx as u64));
 
         let solution = match optimizer.run() {
             Ok(sol) => sol,
@@ -1359,6 +1412,10 @@ where
 
         if should_replace_smoothing_candidate(&best, &candidate) {
             best = Some(candidate);
+        }
+        best_grad_norm = best_grad_norm.min(grad_norm);
+        if best.as_ref().is_some_and(|s| s.stationary) && best_grad_norm <= near_stationary_tol {
+            break;
         }
     }
 
@@ -1408,11 +1465,13 @@ where
         let grad_rho = finite_diff_gradient_external(rho, options.finite_diff_step, objective)?;
         Ok((cost, grad_rho))
     };
+    let mut seed_screen_cost = |objective: &mut F, rho: &Array1<f64>| objective(rho);
     run_multistart_bfgs(
         num_penalties,
         heuristic_lambdas,
         &mut objective,
         &mut eval_cost_grad_rho,
+        &mut seed_screen_cost,
         options,
     )
 }
@@ -1458,11 +1517,13 @@ where
     }
 
     let mut eval_cost_grad_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
+    let mut seed_screen_cost = |objective: &mut F, rho: &Array1<f64>| objective(rho).map(|v| v.0);
     run_multistart_bfgs(
         num_penalties,
         heuristic_lambdas,
         &mut objective_with_gradient,
         &mut eval_cost_grad_rho,
+        &mut seed_screen_cost,
         options,
     )
 }
@@ -1516,14 +1577,32 @@ where
         &cfg,
         Some(opts.nullspace_dims.clone()),
     )?;
-    let seed_strategy = if k >= 10 {
-        SeedStrategy::Light
-    } else {
-        SeedStrategy::Exhaustive
-    };
     let seed_config = SeedConfig {
-        strategy: seed_strategy,
         bounds: (-12.0, 12.0),
+        max_seeds: if k <= 4 {
+            8
+        } else if k <= 12 {
+            10
+        } else {
+            12
+        },
+        screening_budget: if k <= 2 {
+            2
+        } else if k <= 6 {
+            2
+        } else {
+            3
+        },
+        screen_max_inner_iterations: if matches!(link, LinkFunction::Identity) {
+            3
+        } else {
+            5
+        },
+        risk_profile: if matches!(link, LinkFunction::Identity) {
+            SeedRiskProfile::Gaussian
+        } else {
+            SeedRiskProfile::GeneralizedLinear
+        },
     };
     let rho_seeds = generate_rho_candidates(k, None, &seed_config);
     let mut candidate_seeds: Vec<(String, Array1<f64>)> = rho_seeds
@@ -1544,17 +1623,11 @@ where
     // Two-stage seed handling:
     // 1) evaluate each seed once with compute_cost (cheap relative to a full outer solve),
     // 2) fully optimize only the most promising seeds.
-    let screening_budget = if k <= 2 {
-        4
-    } else if k <= 6 {
-        6
-    } else {
-        8
-    };
+    let screening_budget = seed_config.screening_budget.max(1);
     let mut screened: Vec<(String, Array1<f64>, f64)> = Vec::with_capacity(candidate_seeds.len());
     for (label, initial_z) in candidate_seeds.drain(..) {
         let rho0 = to_rho_from_z(&initial_z);
-        match reml_state.compute_cost(&rho0) {
+        match reml_state.screen_seed_cost(&rho0, seed_config.screen_max_inner_iterations) {
             Ok(cost0) if cost0.is_finite() => screened.push((label, initial_z, cost0)),
             Ok(cost0) => {
                 candidate_failures.push(format!(
@@ -4229,6 +4302,94 @@ pub mod internal {
 
         pub(super) fn last_cost_error_string(&self) -> Option<String> {
             self.last_cost_error_msg.read().unwrap().clone()
+        }
+
+        /// Fast seed-screening surrogate for outer smoothing starts.
+        ///
+        /// Uses a reduced PIRLS budget to quickly reject clearly unstable seeds
+        /// (separation/divergence) and rank plausible starts before expensive
+        /// full LAML optimization.
+        pub(super) fn screen_seed_cost(
+            &self,
+            rho: &Array1<f64>,
+            max_inner_iterations: usize,
+        ) -> Result<f64, EstimationError> {
+            let mut quick_cfg = self.config.as_pirls_config();
+            quick_cfg.max_iterations = max_inner_iterations.clamp(3, 5);
+            quick_cfg.convergence_tolerance = (quick_cfg.convergence_tolerance * 50.0).max(1e-4);
+
+            let warm_start_holder = self.warm_start_beta.read().unwrap();
+            let warm_start_ref = if self.warm_start_enabled.load(Ordering::Relaxed) {
+                warm_start_holder.as_ref()
+            } else {
+                None
+            };
+
+            let (pirls_result, _) = pirls::fit_model_for_fixed_rho_matrix(
+                LogSmoothingParamsView::new(rho.view()),
+                &self.x,
+                self.offset.view(),
+                self.y,
+                self.weights,
+                &self.rs_list,
+                Some(&self.balanced_penalty_root),
+                Some(&self.reparam_invariant),
+                self.p,
+                &quick_cfg,
+                warm_start_ref,
+                None,
+            )?;
+
+            match pirls_result.status {
+                pirls::PirlsStatus::Unstable => Err(EstimationError::PerfectSeparationDetected {
+                    iteration: pirls_result.iteration,
+                    max_abs_eta: pirls_result.max_abs_eta,
+                }),
+                pirls::PirlsStatus::MaxIterationsReached
+                    if pirls_result.last_gradient_norm > 20.0 =>
+                {
+                    Err(EstimationError::PirlsDidNotConverge {
+                        max_iterations: pirls_result.iteration,
+                        last_change: pirls_result.last_gradient_norm,
+                    })
+                }
+                _ => {
+                    if !pirls_result.last_gradient_norm.is_finite()
+                        || !pirls_result.max_abs_eta.is_finite()
+                        || pirls_result.max_abs_eta > 40.0
+                        || pirls_result.last_step_halving >= 20
+                    {
+                        return Err(EstimationError::PirlsDidNotConverge {
+                            max_iterations: pirls_result.iteration,
+                            last_change: pirls_result.last_gradient_norm,
+                        });
+                    }
+
+                    // Partial LAML surrogate on a 3-5 iteration horizon.
+                    let mut partial =
+                        0.5 * pirls_result.deviance + 0.5 * pirls_result.stable_penalty_term;
+                    if self.config.firth_bias_reduction
+                        && matches!(self.config.link_function(), LinkFunction::Logit)
+                        && let Some(firth_log_det) = pirls_result.firth_log_det
+                    {
+                        partial -= firth_log_det;
+                    }
+
+                    // Favor seeds that already reduce objective cleanly without heavy
+                    // damping/halving pressure in the opening iterations.
+                    if pirls_result.last_deviance_change <= 0.0 {
+                        partial += 1_000.0;
+                    }
+                    partial += 0.5 * pirls_result.last_step_halving as f64;
+                    partial += 0.05 * pirls_result.last_gradient_norm.min(200.0);
+
+                    if partial.is_finite() {
+                        Ok(partial)
+                    } else {
+                        Ok(f64::INFINITY)
+                    }
+                }
+            }
         }
 
         /// Runs the inner P-IRLS loop, caching the result.
