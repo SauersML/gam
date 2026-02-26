@@ -8,10 +8,11 @@ use crate::construction::kronecker_product;
 use crate::estimate::{EstimationError, FitOptions, FitResult, fit_gam};
 use crate::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, ArrayView2, s};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeConstraint {
     None,
     MonotoneIncreasing,
@@ -20,7 +21,7 @@ pub enum ShapeConstraint {
     Concave,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SmoothBasisSpec {
     BSpline1D {
         feature_col: usize,
@@ -53,13 +54,13 @@ pub enum SmoothBasisSpec {
 /// `marginal_specs[i]` is the 1D B-spline setup for `feature_cols[i]`.
 /// The final penalty set is one Kronecker penalty per margin:
 /// `S_i = I ⊗ ... ⊗ S_marginal_i ⊗ ... ⊗ I`, plus optional global ridge.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorBSplineSpec {
     pub marginal_specs: Vec<BSplineBasisSpec>,
     pub double_penalty: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmoothTermSpec {
     pub name: String,
     pub basis: SmoothBasisSpec,
@@ -84,7 +85,7 @@ pub struct SmoothDesign {
     pub terms: Vec<SmoothTerm>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearTermSpec {
     pub name: String,
     pub feature_col: usize,
@@ -98,16 +99,20 @@ pub struct LinearTermSpec {
 /// The selected feature column is interpreted as a categorical grouping variable.
 /// The term contributes a one-hot dummy block with an identity penalty on group
 /// coefficients, equivalent to i.i.d. Gaussian random effects.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RandomEffectTermSpec {
     pub name: String,
     pub feature_col: usize,
     /// If true, drop the lexicographically first group level to use treatment coding.
     /// If false, keep all levels (full one-hot block, still identifiable under ridge).
     pub drop_first_level: bool,
+    /// Optional fixed kept-level set (sorted by f64 bit pattern) captured at fit time.
+    /// When present, prediction uses exactly these columns to avoid design drift.
+    #[serde(default)]
+    pub frozen_levels: Option<Vec<u64>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TermCollectionSpec {
     pub linear_terms: Vec<LinearTermSpec>,
     pub random_effect_terms: Vec<RandomEffectTermSpec>,
@@ -122,6 +127,7 @@ pub struct TermCollectionDesign {
     pub intercept_range: Range<usize>,
     pub linear_ranges: Vec<(String, Range<usize>)>,
     pub random_effect_ranges: Vec<(String, Range<usize>)>,
+    pub random_effect_levels: Vec<(String, Vec<u64>)>,
     pub smooth: SmoothDesign,
 }
 
@@ -134,6 +140,7 @@ pub struct FittedTermCollection {
 struct RandomEffectBlock {
     name: String,
     design: Array2<f64>,
+    kept_levels: Vec<u64>,
 }
 
 fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f64>, BasisError> {
@@ -221,7 +228,7 @@ fn build_tensor_bspline_basis(
         marginal_unconstrained.identifiability = BSplineIdentifiability::None;
         let built = build_bspline_basis_1d(data.column(col), &marginal_unconstrained)?;
         let knots = match built.metadata {
-            BasisMetadata::BSpline1D { knots } => knots,
+            BasisMetadata::BSpline1D { knots, .. } => knots,
             _ => {
                 return Err(BasisError::InvalidInput(format!(
                     "internal TensorBSpline error at dim {dim}: expected BSpline1D metadata"
@@ -328,23 +335,36 @@ fn build_random_effect_block(
         )));
     }
 
-    let mut levels_set = BTreeSet::<u64>::new();
-    for &v in col {
-        levels_set.insert(v.to_bits());
-    }
-    if levels_set.is_empty() {
-        return Err(BasisError::InvalidInput(format!(
-            "random-effect term '{}' has no observed levels",
-            spec.name
-        )));
-    }
-    let levels: Vec<u64> = levels_set.into_iter().collect();
-    let start_idx = if spec.drop_first_level && levels.len() > 1 {
-        1usize
+    let mut kept_levels: Vec<u64> = if let Some(levels) = spec.frozen_levels.as_ref() {
+        if levels.is_empty() {
+            return Err(BasisError::InvalidInput(format!(
+                "random-effect term '{}' has empty frozen_levels",
+                spec.name
+            )));
+        }
+        levels.clone()
     } else {
-        0usize
+        let mut levels_set = BTreeSet::<u64>::new();
+        for &v in col {
+            levels_set.insert(v.to_bits());
+        }
+        if levels_set.is_empty() {
+            return Err(BasisError::InvalidInput(format!(
+                "random-effect term '{}' has no observed levels",
+                spec.name
+            )));
+        }
+        let levels: Vec<u64> = levels_set.into_iter().collect();
+        let start_idx = if spec.drop_first_level && levels.len() > 1 {
+            1usize
+        } else {
+            0usize
+        };
+        levels[start_idx..].to_vec()
     };
-    let kept_levels = &levels[start_idx..];
+    kept_levels.sort_unstable();
+    kept_levels.dedup();
+
     if kept_levels.is_empty() {
         return Err(BasisError::InvalidInput(format!(
             "random-effect term '{}' drops all levels; keep at least one level",
@@ -365,6 +385,7 @@ fn build_random_effect_block(
     Ok(RandomEffectBlock {
         name: spec.name.clone(),
         design,
+        kept_levels,
     })
 }
 
@@ -536,6 +557,7 @@ pub fn build_term_collection_design(
     }
     let mut random_effect_ranges =
         Vec::<(String, Range<usize>)>::with_capacity(random_blocks.len());
+    let mut random_effect_levels = Vec::<(String, Vec<u64>)>::with_capacity(random_blocks.len());
     let mut col_cursor = p_intercept + p_lin;
     for block in &random_blocks {
         let q = block.design.ncols();
@@ -544,6 +566,7 @@ pub fn build_term_collection_design(
             .slice_mut(s![.., col_cursor..end])
             .assign(&block.design);
         random_effect_ranges.push((block.name.clone(), col_cursor..end));
+        random_effect_levels.push((block.name.clone(), block.kept_levels.clone()));
         col_cursor = end;
     }
     if p_smooth > 0 {
@@ -591,6 +614,7 @@ pub fn build_term_collection_design(
         intercept_range: 0..1,
         linear_ranges,
         random_effect_ranges,
+        random_effect_levels,
         smooth,
     })
 }
@@ -779,6 +803,7 @@ mod tests {
                 name: "id".to_string(),
                 feature_col: 1,
                 drop_first_level: false,
+                frozen_levels: None,
             }],
             smooth_terms: vec![],
         };

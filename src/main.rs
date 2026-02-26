@@ -8,9 +8,9 @@ use faer::linalg::solvers::{
 };
 use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
-    DuchonNullspaceOrder, MaternBasisSpec, MaternNu, ThinPlateBasisSpec, build_bspline_basis_1d,
-    evaluate_bspline_derivative_scalar,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy,
+    DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, MaternNu, ThinPlateBasisSpec,
+    build_bspline_basis_1d, evaluate_bspline_derivative_scalar,
 };
 use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, fit_gam,
@@ -212,6 +212,8 @@ enum CovarianceModeArg {
     Corrected,
 }
 
+const MODEL_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SavedModel {
     version: u32,
@@ -272,6 +274,12 @@ struct SavedModel {
     survival_ridge_lambda: Option<f64>,
     #[serde(default)]
     survival_likelihood: Option<String>,
+    #[serde(default)]
+    training_headers: Option<Vec<String>>,
+    #[serde(default)]
+    resolved_term_spec: Option<TermCollectionSpec>,
+    #[serde(default)]
+    resolved_term_spec_noise: Option<TermCollectionSpec>,
     fit_max_iter: usize,
     fit_tol: f64,
     beta: Vec<f64>,
@@ -414,6 +422,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         let mean_spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
         let mean_design = build_term_collection_design(ds.values.view(), &mean_spec)
             .map_err(|e| format!("failed to build mean term collection design: {e}"))?;
+        let frozen_mean_spec = freeze_term_collection_spec(&mean_spec, &mean_design)?;
+        let frozen_noise_spec = freeze_term_collection_spec(&noise_spec, &noise_design)?;
 
         if family == LikelihoodFamily::GaussianIdentity {
             if args.learn_link_wiggle {
@@ -463,6 +473,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
                     link_choice.map(link_choice_to_string),
                     noise_formula.clone(),
+                    ds.headers.clone(),
+                    frozen_mean_spec.clone(),
+                    frozen_noise_spec.clone(),
                     fit.block_states
                         .first()
                         .map(|b| b.beta.to_vec())
@@ -570,6 +583,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT.to_string(),
                 Some("probit".to_string()),
                 noise_formula,
+                ds.headers.clone(),
+                frozen_mean_spec,
+                frozen_noise_spec,
                 fit.block_states
                     .first()
                     .map(|b| b.beta.to_vec())
@@ -592,6 +608,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
+    let frozen_spec = freeze_term_collection_spec(&spec, &design)?;
 
     let fit_max_iter = 80usize;
     let fit_tol = 1e-6f64;
@@ -643,7 +660,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
             if let Some(out) = args.out {
                 let model = SavedModel {
-                    version: 1,
+                    version: MODEL_VERSION,
                     formula: formula_text,
                     family: family_to_string(family).to_string(),
                     link: Some(link_choice_to_string(choice)),
@@ -674,6 +691,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     survival_time_smooth_lambda: None,
                     survival_ridge_lambda: None,
                     survival_likelihood: None,
+                    training_headers: Some(ds.headers.clone()),
+                    resolved_term_spec: Some(frozen_spec.clone()),
+                    resolved_term_spec_noise: None,
                     fit_max_iter,
                     fit_tol,
                     beta: joint.beta_base.to_vec(),
@@ -731,7 +751,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     if let Some(out) = args.out {
         let model = SavedModel {
-            version: 1,
+            version: MODEL_VERSION,
             formula: formula_text,
             family: family_to_string(family).to_string(),
             link: link_choice.map(link_choice_to_string),
@@ -762,6 +782,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             survival_time_smooth_lambda: None,
             survival_ridge_lambda: None,
             survival_likelihood: None,
+            training_headers: Some(ds.headers.clone()),
+            resolved_term_spec: Some(frozen_spec),
+            resolved_term_spec_noise: None,
             fit_max_iter,
             fit_tol,
             beta: fit.beta.to_vec(),
@@ -784,8 +807,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to read model '{}': {e}", args.model.display()))?;
     let model: SavedModel =
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
+    validate_saved_model_for_inference_stability(&model)?;
 
-    let parsed = parse_formula(&model.formula)?;
     let ds = load_dataset(&args.new_data)?;
     let col_map: HashMap<String, usize> = ds
         .headers
@@ -793,6 +816,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         .enumerate()
         .map(|(i, h)| (h.clone(), i))
         .collect();
+    let training_headers = model.training_headers.as_ref();
     if model.family == family_to_string(LikelihoodFamily::RoystonParmar) {
         let entry_name = model
             .survival_entry
@@ -808,7 +832,12 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         let exit_col = *col_map
             .get(exit_name)
             .ok_or_else(|| format!("exit column '{}' not found", exit_name))?;
-        let term_spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+        let term_spec = resolve_term_spec_for_prediction(
+            &model.resolved_term_spec,
+            training_headers,
+            &col_map,
+            "resolved_term_spec",
+        )?;
         let cov_design = build_term_collection_design(ds.values.view(), &term_spec)
             .map_err(|e| format!("failed to build survival prediction design: {e}"))?;
         let n = ds.values.nrows();
@@ -894,7 +923,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             mean_lo = Some(survival_probability_from_eta(eta_upper.view()));
             mean_hi = Some(survival_probability_from_eta(eta_lower.view()));
         }
-        write_prediction_csv(
+        write_survival_prediction_csv(
             &args.out,
             eta.view(),
             mean.view(),
@@ -910,7 +939,12 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         return Ok(());
     }
     if model.family == FAMILY_GAUSSIAN_LOCATION_SCALE {
-        let spec_mu = build_term_spec(&parsed.terms, &ds, &col_map)?;
+        let spec_mu = resolve_term_spec_for_prediction(
+            &model.resolved_term_spec,
+            training_headers,
+            &col_map,
+            "resolved_term_spec",
+        )?;
         let design_mu = build_term_collection_design(ds.values.view(), &spec_mu)
             .map_err(|e| format!("failed to build mean prediction design: {e}"))?;
         let beta_mu = Array1::from_vec(model.beta.clone());
@@ -921,12 +955,16 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 design_mu.design.ncols()
             ));
         }
-        let noise_formula = model
+        let _noise_formula = model
             .formula_noise
             .as_ref()
             .ok_or_else(|| "gaussian-location-scale model is missing formula_noise".to_string())?;
-        let parsed_noise = parse_formula(noise_formula)?;
-        let spec_noise = build_term_spec(&parsed_noise.terms, &ds, &col_map)?;
+        let spec_noise = resolve_term_spec_for_prediction(
+            &model.resolved_term_spec_noise,
+            training_headers,
+            &col_map,
+            "resolved_term_spec_noise",
+        )?;
         let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
             .map_err(|e| format!("failed to build noise prediction design: {e}"))?;
         let beta_noise =
@@ -971,7 +1009,12 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         return Ok(());
     }
     if model.family == FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT {
-        let spec_t = build_term_spec(&parsed.terms, &ds, &col_map)?;
+        let spec_t = resolve_term_spec_for_prediction(
+            &model.resolved_term_spec,
+            training_headers,
+            &col_map,
+            "resolved_term_spec",
+        )?;
         let design_t = build_term_collection_design(ds.values.view(), &spec_t)
             .map_err(|e| format!("failed to build threshold prediction design: {e}"))?;
         let beta_t = Array1::from_vec(model.beta.clone());
@@ -982,11 +1025,15 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 design_t.design.ncols()
             ));
         }
-        let noise_formula = model.formula_noise.as_ref().ok_or_else(|| {
+        let _noise_formula = model.formula_noise.as_ref().ok_or_else(|| {
             "binomial-location-scale-probit model is missing formula_noise".to_string()
         })?;
-        let parsed_noise = parse_formula(noise_formula)?;
-        let spec_noise = build_term_spec(&parsed_noise.terms, &ds, &col_map)?;
+        let spec_noise = resolve_term_spec_for_prediction(
+            &model.resolved_term_spec_noise,
+            training_headers,
+            &col_map,
+            "resolved_term_spec_noise",
+        )?;
         let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
             .map_err(|e| format!("failed to build noise prediction design: {e}"))?;
         let beta_noise = Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
@@ -1041,7 +1088,12 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    let spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+    let spec = resolve_term_spec_for_prediction(
+        &model.resolved_term_spec,
+        training_headers,
+        &col_map,
+        "resolved_term_spec",
+    )?;
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build prediction design: {e}"))?;
 
@@ -1193,7 +1245,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to read model '{}': {e}", args.model.display()))?;
     let model: SavedModel =
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
-
+    validate_saved_model_for_inference_stability(&model)?;
     let parsed = parse_formula(&model.formula)?;
     let ds = load_dataset(&args.data)?;
     let col_map: HashMap<String, usize> = ds
@@ -1202,12 +1254,18 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         .enumerate()
         .map(|(i, h)| (h.clone(), i))
         .collect();
+    let training_headers = model.training_headers.as_ref();
     let y_col = *col_map
         .get(&parsed.response)
         .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
 
     let y = ds.values.column(y_col).to_owned();
-    let spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+    let spec = resolve_term_spec_for_prediction(
+        &model.resolved_term_spec,
+        training_headers,
+        &col_map,
+        "resolved_term_spec",
+    )?;
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
 
@@ -1547,7 +1605,7 @@ fn build_survival_time_basis(
                 )
                 .map_err(|e| format!("failed to build bspline time basis: {e}"))?;
                 match built.metadata {
-                    gam::basis::BasisMetadata::BSpline1D { knots } => knots,
+                    gam::basis::BasisMetadata::BSpline1D { knots, .. } => knots,
                     _ => {
                         return Err("internal error: expected BSpline1D metadata for time basis"
                             .to_string());
@@ -1800,6 +1858,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let term_spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
     let cov_design = build_term_collection_design(ds.values.view(), &term_spec)
         .map_err(|e| format!("failed to build survival term collection design: {e}"))?;
+    let frozen_term_spec = freeze_term_collection_spec(&term_spec, &cov_design)?;
 
     let p_cov = cov_design.design.ncols();
     let mut age_entry = Array1::<f64>::zeros(n);
@@ -1958,7 +2017,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             }
         };
         let model_out = SavedModel {
-            version: 1,
+            version: MODEL_VERSION,
             formula,
             family: family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             link: None,
@@ -1991,6 +2050,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             survival_time_smooth_lambda: time_build.smooth_lambda,
             survival_ridge_lambda: Some(args.ridge_lambda),
             survival_likelihood: Some(survival_likelihood_mode_name(likelihood_mode).to_string()),
+            training_headers: Some(ds.headers.clone()),
+            resolved_term_spec: Some(frozen_term_spec),
+            resolved_term_spec_noise: None,
             fit_max_iter: 400,
             fit_tol: 1e-6,
             beta: beta.to_vec(),
@@ -2009,6 +2071,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to read model '{}': {e}", args.model.display()))?;
     let model: SavedModel =
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
+    validate_saved_model_for_inference_stability(&model)?;
 
     if model.family == FAMILY_GAUSSIAN_LOCATION_SCALE
         || model.family == FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT
@@ -2027,6 +2090,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         .enumerate()
         .map(|(i, h)| (h.clone(), i))
         .collect();
+    let training_headers = model.training_headers.as_ref();
     let family = family_from_string(&model.family)?;
     let cfg = NutsConfig {
         n_samples: args.samples,
@@ -2058,7 +2122,12 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             .get(event_name)
             .ok_or_else(|| format!("event column '{}' not found", event_name))?;
 
-        let term_spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+        let term_spec = resolve_term_spec_for_prediction(
+            &model.resolved_term_spec,
+            training_headers,
+            &col_map,
+            "resolved_term_spec",
+        )?;
         let cov_design = build_term_collection_design(ds.values.view(), &term_spec)
             .map_err(|e| format!("failed to build survival design: {e}"))?;
         let n = ds.values.nrows();
@@ -2197,7 +2266,12 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             .get(&parsed.response)
             .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
         let y = ds.values.column(y_col).to_owned();
-        let spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+        let spec = resolve_term_spec_for_prediction(
+            &model.resolved_term_spec,
+            training_headers,
+            &col_map,
+            "resolved_term_spec",
+        )?;
         let design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
         let weights = Array1::ones(ds.values.nrows());
@@ -2251,6 +2325,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to read model '{}': {e}", args.model.display()))?;
     let model: SavedModel =
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
+    validate_saved_model_for_inference_stability(&model)?;
 
     if model.family == family_to_string(LikelihoodFamily::RoystonParmar) {
         return Err(
@@ -2259,7 +2334,6 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         );
     }
 
-    let parsed = parse_formula(&model.formula)?;
     let ds = load_dataset(&args.data)?;
     let col_map: HashMap<String, usize> = ds
         .headers
@@ -2267,18 +2341,28 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         .enumerate()
         .map(|(i, h)| (h.clone(), i))
         .collect();
-    let spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+    let training_headers = model.training_headers.as_ref();
+    let spec = resolve_term_spec_for_prediction(
+        &model.resolved_term_spec,
+        training_headers,
+        &col_map,
+        "resolved_term_spec",
+    )?;
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build design: {e}"))?;
 
     let spec = if model.family == FAMILY_GAUSSIAN_LOCATION_SCALE {
         let beta_mu = Array1::from_vec(model.beta.clone());
-        let noise_formula = model
+        let _noise_formula = model
             .formula_noise
             .as_ref()
             .ok_or_else(|| "gaussian-location-scale model is missing formula_noise".to_string())?;
-        let parsed_noise = parse_formula(noise_formula)?;
-        let spec_noise = build_term_spec(&parsed_noise.terms, &ds, &col_map)?;
+        let spec_noise = resolve_term_spec_for_prediction(
+            &model.resolved_term_spec_noise,
+            training_headers,
+            &col_map,
+            "resolved_term_spec_noise",
+        )?;
         let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
             .map_err(|e| format!("failed to build noise design: {e}"))?;
         let beta_noise =
@@ -2302,11 +2386,15 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         }
     } else if model.family == FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT {
         let beta_t = Array1::from_vec(model.beta.clone());
-        let noise_formula = model.formula_noise.as_ref().ok_or_else(|| {
+        let _noise_formula = model.formula_noise.as_ref().ok_or_else(|| {
             "binomial-location-scale-probit model is missing formula_noise".to_string()
         })?;
-        let parsed_noise = parse_formula(noise_formula)?;
-        let spec_noise = build_term_spec(&parsed_noise.terms, &ds, &col_map)?;
+        let spec_noise = resolve_term_spec_for_prediction(
+            &model.resolved_term_spec_noise,
+            training_headers,
+            &col_map,
+            "resolved_term_spec_noise",
+        )?;
         let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
             .map_err(|e| format!("failed to build noise design: {e}"))?;
         let beta_noise = Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
@@ -2403,11 +2491,191 @@ fn choose_formula(args: &FitArgs) -> Result<String, String> {
     )
 }
 
+fn freeze_term_collection_spec(
+    spec: &TermCollectionSpec,
+    design: &gam::smooth::TermCollectionDesign,
+) -> Result<TermCollectionSpec, String> {
+    if spec.smooth_terms.len() != design.smooth.terms.len() {
+        return Err(format!(
+            "internal freeze mismatch: smooth spec count {} != fitted smooth term count {}",
+            spec.smooth_terms.len(),
+            design.smooth.terms.len()
+        ));
+    }
+    if spec.random_effect_terms.len() != design.random_effect_levels.len() {
+        return Err(format!(
+            "internal freeze mismatch: random-effect spec count {} != fitted random-effect term count {}",
+            spec.random_effect_terms.len(),
+            design.random_effect_levels.len()
+        ));
+    }
+
+    let mut frozen = spec.clone();
+    for (term, fitted) in frozen
+        .smooth_terms
+        .iter_mut()
+        .zip(design.smooth.terms.iter())
+    {
+        match (&mut term.basis, &fitted.metadata) {
+            (
+                SmoothBasisSpec::BSpline1D { spec: s, .. },
+                BasisMetadata::BSpline1D {
+                    knots,
+                    identifiability_transform,
+                },
+            ) => {
+                s.knot_spec = BSplineKnotSpec::Provided(knots.clone());
+                s.identifiability = match identifiability_transform {
+                    Some(z) => BSplineIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => BSplineIdentifiability::None,
+                };
+            }
+            (SmoothBasisSpec::ThinPlate { spec: s, .. }, BasisMetadata::ThinPlate { centers }) => {
+                s.center_strategy = CenterStrategy::UserProvided(centers.clone());
+            }
+            (
+                SmoothBasisSpec::Matern { spec: s, .. },
+                BasisMetadata::Matern {
+                    centers,
+                    length_scale,
+                    nu,
+                    include_intercept,
+                },
+            ) => {
+                s.center_strategy = CenterStrategy::UserProvided(centers.clone());
+                s.length_scale = *length_scale;
+                s.nu = *nu;
+                s.include_intercept = *include_intercept;
+            }
+            (
+                SmoothBasisSpec::Duchon { spec: s, .. },
+                BasisMetadata::Duchon {
+                    centers,
+                    length_scale,
+                    nu,
+                    nullspace_order,
+                },
+            ) => {
+                s.center_strategy = CenterStrategy::UserProvided(centers.clone());
+                s.length_scale = *length_scale;
+                s.nu = *nu;
+                s.nullspace_order = *nullspace_order;
+            }
+            (
+                SmoothBasisSpec::TensorBSpline {
+                    feature_cols,
+                    spec: s,
+                },
+                BasisMetadata::TensorBSpline {
+                    feature_cols: fitted_cols,
+                    knots,
+                    degrees,
+                },
+            ) => {
+                if s.marginal_specs.len() != knots.len() || s.marginal_specs.len() != degrees.len()
+                {
+                    return Err(format!(
+                        "tensor freeze mismatch for '{}': marginal_specs={}, knots={}, degrees={}",
+                        term.name,
+                        s.marginal_specs.len(),
+                        knots.len(),
+                        degrees.len()
+                    ));
+                }
+                *feature_cols = fitted_cols.clone();
+                for i in 0..s.marginal_specs.len() {
+                    s.marginal_specs[i].degree = degrees[i];
+                    s.marginal_specs[i].knot_spec = BSplineKnotSpec::Provided(knots[i].clone());
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "smooth metadata/spec mismatch while freezing term '{}'",
+                    term.name
+                ));
+            }
+        }
+    }
+
+    for (idx, rt) in frozen.random_effect_terms.iter_mut().enumerate() {
+        let (_name, kept_levels) = &design.random_effect_levels[idx];
+        rt.frozen_levels = Some(kept_levels.clone());
+    }
+
+    Ok(frozen)
+}
+
+fn remap_term_collection_spec_columns(
+    spec: &TermCollectionSpec,
+    training_headers: &[String],
+    pred_col_map: &HashMap<String, usize>,
+) -> Result<TermCollectionSpec, String> {
+    let mut out = spec.clone();
+    let resolve_training_index = |idx: usize| -> Result<usize, String> {
+        let name = training_headers
+            .get(idx)
+            .ok_or_else(|| format!("saved training column index {idx} is out of bounds"))?;
+        pred_col_map
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("prediction data is missing required column '{name}'"))
+    };
+
+    for lt in &mut out.linear_terms {
+        lt.feature_col = resolve_training_index(lt.feature_col)?;
+    }
+    for rt in &mut out.random_effect_terms {
+        rt.feature_col = resolve_training_index(rt.feature_col)?;
+    }
+    for st in &mut out.smooth_terms {
+        match &mut st.basis {
+            SmoothBasisSpec::BSpline1D { feature_col, .. } => {
+                *feature_col = resolve_training_index(*feature_col)?;
+            }
+            SmoothBasisSpec::ThinPlate { feature_cols, .. }
+            | SmoothBasisSpec::Matern { feature_cols, .. }
+            | SmoothBasisSpec::Duchon { feature_cols, .. }
+            | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
+                for c in feature_cols.iter_mut() {
+                    *c = resolve_training_index(*c)?;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn resolve_term_spec_for_prediction(
+    model_spec: &Option<TermCollectionSpec>,
+    training_headers: Option<&Vec<String>>,
+    col_map: &HashMap<String, usize>,
+    spec_label: &str,
+) -> Result<TermCollectionSpec, String> {
+    let saved = model_spec.as_ref().ok_or_else(|| {
+        format!(
+            "model is missing {spec_label}; refit with the current CLI to guarantee train/predict design consistency"
+        )
+    })?;
+    validate_frozen_term_collection_spec(saved, spec_label)?;
+    let headers = training_headers.ok_or_else(|| {
+        "model is missing training_headers; refit with the current CLI to guarantee stable feature mapping at prediction time"
+            .to_string()
+    })?;
+    let remapped = remap_term_collection_spec_columns(saved, headers, col_map)?;
+    validate_frozen_term_collection_spec(&remapped, spec_label)?;
+    Ok(remapped)
+}
+
 fn build_location_scale_saved_model(
     formula: String,
     family: String,
     link: Option<String>,
     noise_formula: String,
+    training_headers: Vec<String>,
+    resolved_term_spec: TermCollectionSpec,
+    resolved_term_spec_noise: TermCollectionSpec,
     beta: Vec<f64>,
     beta_noise: Option<Vec<f64>>,
     sigma_min: f64,
@@ -2415,7 +2683,7 @@ fn build_location_scale_saved_model(
     lambdas: Vec<f64>,
 ) -> SavedModel {
     SavedModel {
-        version: 1,
+        version: MODEL_VERSION,
         formula,
         family,
         link,
@@ -2446,6 +2714,9 @@ fn build_location_scale_saved_model(
         survival_time_smooth_lambda: None,
         survival_ridge_lambda: None,
         survival_likelihood: None,
+        training_headers: Some(training_headers),
+        resolved_term_spec: Some(resolved_term_spec),
+        resolved_term_spec_noise: Some(resolved_term_spec_noise),
         fit_max_iter: 80,
         fit_tol: 1e-6,
         beta,
@@ -2456,7 +2727,96 @@ fn build_location_scale_saved_model(
     }
 }
 
+fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<(), String> {
+    if model.training_headers.is_none() {
+        return Err(
+            "model is missing training_headers; refit with the current CLI to guarantee stable feature mapping at prediction time"
+                .to_string(),
+        );
+    }
+    let spec = model.resolved_term_spec.as_ref().ok_or_else(|| {
+        "model is missing resolved_term_spec; refit with the current CLI to guarantee train/predict design consistency"
+            .to_string()
+    })?;
+    validate_frozen_term_collection_spec(spec, "resolved_term_spec")?;
+
+    if model.formula_noise.is_some() && model.resolved_term_spec_noise.is_none() {
+        return Err(
+            "model defines formula_noise but is missing resolved_term_spec_noise; refit with the current CLI"
+                .to_string(),
+        );
+    }
+    if let Some(spec_noise) = model.resolved_term_spec_noise.as_ref() {
+        validate_frozen_term_collection_spec(spec_noise, "resolved_term_spec_noise")?;
+    }
+    Ok(())
+}
+
+fn validate_frozen_term_collection_spec(
+    spec: &TermCollectionSpec,
+    label: &str,
+) -> Result<(), String> {
+    for st in &spec.smooth_terms {
+        match &st.basis {
+            SmoothBasisSpec::BSpline1D { spec, .. } => {
+                if !matches!(spec.knot_spec, BSplineKnotSpec::Provided(_)) {
+                    return Err(format!(
+                        "{label} term '{}' is not frozen: BSpline knot_spec must be Provided",
+                        st.name
+                    ));
+                }
+            }
+            SmoothBasisSpec::ThinPlate { spec, .. } => {
+                if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
+                    return Err(format!(
+                        "{label} term '{}' is not frozen: ThinPlate centers must be UserProvided",
+                        st.name
+                    ));
+                }
+            }
+            SmoothBasisSpec::Matern { spec, .. } => {
+                if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
+                    return Err(format!(
+                        "{label} term '{}' is not frozen: Matern centers must be UserProvided",
+                        st.name
+                    ));
+                }
+            }
+            SmoothBasisSpec::Duchon { spec, .. } => {
+                if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
+                    return Err(format!(
+                        "{label} term '{}' is not frozen: Duchon centers must be UserProvided",
+                        st.name
+                    ));
+                }
+            }
+            SmoothBasisSpec::TensorBSpline { spec, .. } => {
+                for (dim, marginal) in spec.marginal_specs.iter().enumerate() {
+                    if !matches!(marginal.knot_spec, BSplineKnotSpec::Provided(_)) {
+                        return Err(format!(
+                            "{label} term '{}' dim {} is not frozen: tensor marginal knot_spec must be Provided",
+                            st.name, dim
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for rt in &spec.random_effect_terms {
+        if rt.frozen_levels.is_none() {
+            return Err(format!(
+                "{label} random-effect term '{}' is not frozen: missing frozen_levels",
+                rt.name
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn write_model_json(path: &Path, model: &SavedModel) -> Result<(), String> {
+    validate_saved_model_for_inference_stability(model)?;
     let payload = serde_json::to_string_pretty(model)
         .map_err(|e| format!("failed to serialize model: {e}"))?;
     fs::write(path, payload)
@@ -2907,6 +3267,7 @@ fn build_term_spec(
                                 name: name.clone(),
                                 feature_col: col,
                                 drop_first_level: false,
+                                frozen_levels: None,
                             });
                         }
                     }
@@ -2918,6 +3279,7 @@ fn build_term_spec(
                     name: name.clone(),
                     feature_col: col,
                     drop_first_level: false,
+                    frozen_levels: None,
                 });
             }
             ParsedTerm::Smooth {
@@ -3645,4 +4007,154 @@ fn write_prediction_csv(
     wtr.flush()
         .map_err(|e| format!("failed to flush csv writer: {e}"))?;
     Ok(())
+}
+
+fn write_survival_prediction_csv(
+    path: &Path,
+    eta: ArrayView1<'_, f64>,
+    survival_prob: ArrayView1<'_, f64>,
+    eta_se: Option<ArrayView1<'_, f64>>,
+    survival_lower: Option<ArrayView1<'_, f64>>,
+    survival_upper: Option<ArrayView1<'_, f64>>,
+) -> Result<(), String> {
+    let mut wtr = WriterBuilder::new()
+        .has_headers(true)
+        .from_path(path)
+        .map_err(|e| format!("failed to create output csv '{}': {e}", path.display()))?;
+
+    if eta_se.is_some() {
+        wtr.write_record([
+            "eta",
+            "mean",
+            "survival_prob",
+            "risk_score",
+            "failure_prob",
+            "effective_se",
+            "mean_lower",
+            "mean_upper",
+        ])
+        .map_err(|e| format!("failed writing csv header: {e}"))?;
+    } else {
+        wtr.write_record(["eta", "mean", "survival_prob", "risk_score", "failure_prob"])
+            .map_err(|e| format!("failed writing csv header: {e}"))?;
+    }
+
+    for i in 0..eta.len() {
+        let surv = survival_prob[i].clamp(0.0, 1.0);
+        let failure = (1.0 - surv).clamp(0.0, 1.0);
+        let risk_score = eta[i];
+        if let Some(se) = eta_se {
+            let lo = survival_lower.as_ref().ok_or_else(|| {
+                "internal error: survival_lower missing while effective_se is present".to_string()
+            })?;
+            let hi = survival_upper.as_ref().ok_or_else(|| {
+                "internal error: survival_upper missing while effective_se is present".to_string()
+            })?;
+            wtr.write_record([
+                format!("{:.12}", eta[i]),
+                format!("{:.12}", surv),
+                format!("{:.12}", surv),
+                format!("{:.12}", risk_score),
+                format!("{:.12}", failure),
+                format!("{:.12}", se[i]),
+                format!("{:.12}", lo[i]),
+                format!("{:.12}", hi[i]),
+            ])
+            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
+        } else {
+            wtr.write_record([
+                format!("{:.12}", eta[i]),
+                format!("{:.12}", surv),
+                format!("{:.12}", surv),
+                format!("{:.12}", risk_score),
+                format!("{:.12}", failure),
+            ])
+            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
+        }
+    }
+
+    wtr.flush()
+        .map_err(|e| format!("failed to flush csv writer: {e}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::survival_probability_from_eta;
+    use ndarray::array;
+
+    fn cindex_uncensored_risk(time: &[f64], score: &[f64]) -> f64 {
+        let mut concordant = 0.0;
+        let mut total = 0.0;
+        for i in 0..time.len() {
+            for j in (i + 1)..time.len() {
+                if (time[i] - time[j]).abs() < 1e-12 {
+                    continue;
+                }
+                total += 1.0;
+                let correct = (time[i] < time[j] && score[i] > score[j])
+                    || (time[j] < time[i] && score[j] > score[i]);
+                if correct {
+                    concordant += 1.0;
+                }
+            }
+        }
+        if total == 0.0 {
+            0.0
+        } else {
+            concordant / total
+        }
+    }
+
+    fn cindex_uncensored_survival(time: &[f64], score: &[f64]) -> f64 {
+        let mut concordant = 0.0;
+        let mut total = 0.0;
+        for i in 0..time.len() {
+            for j in (i + 1)..time.len() {
+                if (time[i] - time[j]).abs() < 1e-12 {
+                    continue;
+                }
+                total += 1.0;
+                let correct = (time[i] < time[j] && score[i] < score[j])
+                    || (time[j] < time[i] && score[j] < score[i]);
+                if correct {
+                    concordant += 1.0;
+                }
+            }
+        }
+        if total == 0.0 {
+            0.0
+        } else {
+            concordant / total
+        }
+    }
+
+    #[test]
+    fn survival_probability_is_bounded_and_monotone_decreasing_in_eta() {
+        let eta = array![-3.0, -1.0, 0.0, 1.0, 2.0];
+        let surv = survival_probability_from_eta(eta.view());
+        assert!(surv.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0));
+        assert!(surv.windows(2).into_iter().all(|w| w[1] <= w[0] + 1e-12));
+    }
+
+    #[test]
+    fn concordance_depends_on_score_semantics() {
+        let time = [12.0, 10.0, 8.0, 6.0, 4.0, 2.0];
+        let eta = array![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+        let surv = survival_probability_from_eta(eta.view()).to_vec();
+        let risk = eta.to_vec();
+        let neg_risk = eta.mapv(|v| -v).to_vec();
+
+        // Risk-oriented c-index expects larger score => earlier failure.
+        let c_risk_on_eta = cindex_uncensored_risk(&time, &risk);
+        let c_risk_on_surv = cindex_uncensored_risk(&time, &surv);
+        assert!(c_risk_on_eta > 0.99);
+        assert!(c_risk_on_surv < 0.01);
+
+        // Survival-oriented c-index expects larger score => longer survival.
+        let c_surv_on_neg_eta = cindex_uncensored_survival(&time, &neg_risk);
+        let c_surv_on_surv = cindex_uncensored_survival(&time, &surv);
+        assert!(c_surv_on_neg_eta > 0.99);
+        assert!(c_surv_on_surv > 0.99);
+    }
 }
