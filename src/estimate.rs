@@ -289,11 +289,9 @@ impl RemlConfig {
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
-            // Keep FD as default for external non-Identity links.
-            // The analytic path is faster and now optimized, but external
-            // objective variants can still diverge from the strict assumptions
-            // needed for sign-consistent gradients in all regimes.
-            objective_consistent_fd_gradient: true,
+            // Use analytic outer gradients for external fits to avoid
+            // expensive FD sweeps that repeatedly re-run PIRLS.
+            objective_consistent_fd_gradient: false,
         }
     }
 
@@ -486,7 +484,8 @@ fn next_toward_zero(x: f64) -> f64 {
     } else if x > 0.0 {
         f64::from_bits(x.to_bits() - 1)
     } else {
-        f64::from_bits(x.to_bits() + 1)
+        // For negative values, decreasing the bit pattern moves toward +0.0.
+        f64::from_bits(x.to_bits() - 1)
     }
 }
 
@@ -521,6 +520,37 @@ fn jacobian_drho_dz_from_rho(rho: &Array1<f64>) -> Array1<f64> {
         // Numerical guard: can be slightly negative near the walls; clamp to [0, 1].
         (1.0 - (r / RHO_BOUND).powi(2)).max(0.0)
     })
+}
+
+#[cfg(test)]
+mod rho_mapping_tests {
+    use super::{RHO_BOUND, next_toward_zero, to_rho_from_z, to_z_from_rho};
+    use ndarray::arr1;
+
+    #[test]
+    fn next_toward_zero_moves_toward_zero_for_both_signs() {
+        let p = next_toward_zero(1.0);
+        let n = next_toward_zero(-1.0);
+        assert!(p.is_finite() && n.is_finite());
+        assert!(p < 1.0 && p > 0.0, "positive side should move inward");
+        assert!(n > -1.0 && n < 0.0, "negative side should move inward");
+    }
+
+    #[test]
+    fn rho_to_z_is_finite_at_box_boundaries() {
+        let rho = arr1(&[-RHO_BOUND, RHO_BOUND]);
+        let z = to_z_from_rho(&rho);
+        assert!(z.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn rho_z_roundtrip_stays_finite_and_within_bounds() {
+        let rho = arr1(&[-RHO_BOUND, 0.0, RHO_BOUND]);
+        let z = to_z_from_rho(&rho);
+        let rho_back = to_rho_from_z(&z);
+        assert!(rho_back.iter().all(|v| v.is_finite()));
+        assert!(rho_back.iter().all(|v| v.abs() <= RHO_BOUND));
+    }
 }
 
 #[inline]
@@ -1957,9 +1987,6 @@ pub enum InferenceCovarianceMode {
 pub struct PredictUncertaintyOptions {
     /// Central interval level in (0, 1), e.g. 0.95.
     pub confidence_level: f64,
-    /// Legacy flag associated with corrected covariance preference.
-    /// If this conflicts with `covariance_mode`, `covariance_mode` takes precedence.
-    pub prefer_corrected_covariance: bool,
     /// Covariance mode used for eta/mean intervals.
     pub covariance_mode: InferenceCovarianceMode,
     /// Mean-scale interval construction method.
@@ -1973,7 +2000,6 @@ impl Default for PredictUncertaintyOptions {
     fn default() -> Self {
         Self {
             confidence_level: 0.95,
-            prefer_corrected_covariance: true,
             covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             include_observation_interval: true,
@@ -2227,15 +2253,7 @@ where
         )));
     }
 
-    let requested_mode = if options.covariance_mode
-        == InferenceCovarianceMode::ConditionalPlusSmoothingPreferred
-        && !options.prefer_corrected_covariance
-    {
-        // Preserve legacy behavior when callers only toggle the historical flag.
-        InferenceCovarianceMode::Conditional
-    } else {
-        options.covariance_mode
-    };
+    let requested_mode = options.covariance_mode;
     // Covariance selection corresponds to approximation order:
     // - Conditional: uses only A(mu) = H_mu^{-1}
     // - Corrected: adds first-order Var(b(rho)) term J V_rho J^T
@@ -2381,14 +2399,9 @@ where
 pub fn coefficient_uncertainty(
     fit: &FitResult,
     confidence_level: f64,
-    prefer_corrected_covariance: bool,
+    covariance_mode: InferenceCovarianceMode,
 ) -> Result<CoefficientUncertaintyResult, EstimationError> {
-    let mode = if prefer_corrected_covariance {
-        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred
-    } else {
-        InferenceCovarianceMode::Conditional
-    };
-    coefficient_uncertainty_with_mode(fit, confidence_level, mode)
+    coefficient_uncertainty_with_mode(fit, confidence_level, covariance_mode)
 }
 
 /// Coefficient-level uncertainty and confidence intervals with explicit covariance mode.
@@ -4333,10 +4346,12 @@ pub mod internal {
                         .enumerate()
                         .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
                         .collect();
-                    eprintln!(
-                        "[Diag] rho bounds: lower={:?} upper={:?}",
-                        at_lower, at_upper
-                    );
+                    if !(at_lower.is_empty() && at_upper.is_empty()) {
+                        eprintln!(
+                            "[Diag] rho bounds: lower={:?} upper={:?}",
+                            at_lower, at_upper
+                        );
+                    }
                     return Ok(f64::INFINITY);
                 }
                 Err(e) => {
@@ -4359,10 +4374,12 @@ pub mod internal {
                         .enumerate()
                         .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
                         .collect();
-                    eprintln!(
-                        "[Diag] rho bounds: lower={:?} upper={:?}",
-                        at_lower, at_upper
-                    );
+                    if !(at_lower.is_empty() && at_upper.is_empty()) {
+                        eprintln!(
+                            "[Diag] rho bounds: lower={:?} upper={:?}",
+                            at_lower, at_upper
+                        );
+                    }
                     return Err(e);
                 }
             };
@@ -6908,6 +6925,7 @@ pub mod internal {
             let penalty_grad = reparam.s_transformed.dot(beta);
 
             let envelope_audit = compute_envelope_audit(
+                pirls_result.last_gradient_norm,
                 &penalty_grad,
                 pirls_result.ridge_passport.delta,
                 ridge_used, // What gradient assumes
