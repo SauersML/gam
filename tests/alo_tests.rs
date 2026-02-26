@@ -135,9 +135,9 @@ fn alo_se_calculation_correct() {
         let wi = fit.final_weights[irow].max(1e-300);
         let expected_se = (quad / wi).max(0.0).sqrt();
         assert!(
-            (alo.se[irow] - expected_se).abs() < 1e-10,
+            (alo.se_sandwich[irow] - expected_se).abs() < 1e-10,
             "SE mismatch at row {irow}: got {}, expected {}",
-            alo.se[irow],
+            alo.se_sandwich[irow],
             expected_se
         );
     }
@@ -243,7 +243,7 @@ fn alo_matches_exact_linearized_loo_small_n_binomial() {
     }
 
     let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
-        loo_compare(&alo.eta_tilde, &alo.se, &loo_pred, &naive_se);
+        loo_compare(&alo.eta_tilde, &alo.se_sandwich, &loo_pred, &naive_se);
     assert!(rmse_pred <= 1e-9);
     assert!(max_abs_pred <= 1e-8);
     assert!(rmse_se <= 1e-9);
@@ -304,7 +304,7 @@ fn alo_matches_true_loo_small_n_binomial_refit() {
     }
 
     let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
-        loo_compare(&alo.eta_tilde, &alo.se, &loo_pred, &naive_se);
+        loo_compare(&alo.eta_tilde, &alo.se_sandwich, &loo_pred, &naive_se);
     assert!(rmse_pred <= 1e-2);
     assert!(max_abs_pred <= 8e-2);
     assert!(rmse_se <= 1e-10);
@@ -382,7 +382,8 @@ fn alo_error_is_driven_by_saturated_points() {
         loo_se[i] = quad.sqrt();
     }
 
-    let (rmse_pred, max_abs_pred, _, _) = loo_compare(&alo.eta_tilde, &alo.se, &loo_pred, &loo_se);
+    let (rmse_pred, max_abs_pred, _, _) =
+        loo_compare(&alo.eta_tilde, &alo.se_sandwich, &loo_pred, &loo_se);
     let beta_full = beta_in_original_basis(&fit);
     let eta_full = x.dot(&beta_full);
     let z_full = &fit.solve_working_response;

@@ -1573,6 +1573,53 @@ where
     let mut best_nonstationary: Option<OuterSolveResult> = None;
     let mut best_grad_norm = f64::INFINITY;
     let mut candidate_failures: Vec<String> = Vec::new();
+
+    // Two-stage seed handling:
+    // 1) evaluate each seed once with compute_cost (cheap relative to a full outer solve),
+    // 2) fully optimize only the most promising seeds.
+    let screening_budget = if k <= 2 {
+        4
+    } else if k <= 6 {
+        6
+    } else {
+        8
+    };
+    let mut screened: Vec<(String, Array1<f64>, f64)> = Vec::with_capacity(candidate_seeds.len());
+    for (label, initial_z) in candidate_seeds.drain(..) {
+        let rho0 = to_rho_from_z(&initial_z);
+        match reml_state.compute_cost(&rho0) {
+            Ok(cost0) if cost0.is_finite() => screened.push((label, initial_z, cost0)),
+            Ok(cost0) => {
+                candidate_failures.push(format!(
+                    "[Seed screen {}] non-finite initial cost {}",
+                    label, cost0
+                ));
+            }
+            Err(err) => {
+                candidate_failures.push(format!("[Seed screen {}] {}", label, err));
+            }
+        }
+    }
+    screened.sort_by(|a, b| a.2.total_cmp(&b.2));
+    let candidate_seeds: Vec<(String, Array1<f64>)> = screened
+        .into_iter()
+        .take(screening_budget.max(1))
+        .map(|(label, z, _)| (label, z))
+        .collect();
+    if candidate_seeds.is_empty() {
+        candidate_failures.push(
+            "[Seed screen] all candidate seeds failed initial screening; reverting to zero seed"
+                .to_string(),
+        );
+    }
+    let candidate_seeds = if candidate_seeds.is_empty() {
+        vec![(
+            "fallback_zero".to_string(),
+            to_z_from_rho(&Array1::<f64>::zeros(k)),
+        )]
+    } else {
+        candidate_seeds
+    };
     let near_stationary_tol = (cfg.reml_convergence_tolerance.max(1e-12)) * 2.0;
     let use_newton = true;
     for (label, initial_z) in candidate_seeds {

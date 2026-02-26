@@ -9,51 +9,16 @@ use faer::{Accum, Par, Side};
 use ndarray::{Array1, Array2, ArrayView1, s};
 use std::cmp::Ordering;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum AloSeMode {
-    /// Frequentist influence-style SE:
-    /// sqrt(phi * x_i^T H^{-1} X^T W X H^{-1} x_i).
-    Sandwich,
-    /// Bayesian/conditional SE:
-    /// sqrt(phi * x_i^T H^{-1} x_i).
-    Conditional,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct AloOptions {
-    /// Which SE to expose in the legacy `AloDiagnostics::se` field.
-    pub se_mode: AloSeMode,
-    /// If true and `se_mode=Sandwich`, replace numerically invalid sandwich values
-    /// (negative or non-finite variance) with conditional values in `se`.
-    pub fallback_to_conditional_on_instability: bool,
-}
-
-impl Default for AloOptions {
-    fn default() -> Self {
-        Self {
-            // ALO is an influence diagnostic by construction; keep sandwich as default.
-            se_mode: AloSeMode::Sandwich,
-            fallback_to_conditional_on_instability: true,
-        }
-    }
-}
-
 /// Approximate leave-one-out diagnostics derived from a fitted model.
 #[derive(Debug, Clone)]
 pub struct AloDiagnostics {
     pub eta_tilde: Array1<f64>,
-    /// Backward-compatible selected SE channel configured by `AloOptions::se_mode`.
-    pub se: Array1<f64>,
     /// Bayesian/conditional standard error on eta:
     /// sqrt(phi * x_i^T H^{-1} x_i).
     pub se_bayes: Array1<f64>,
     /// Frequentist sandwich-style standard error on eta:
     /// sqrt(phi * x_i^T H^{-1} X^T W X H^{-1} x_i).
     pub se_sandwich: Array1<f64>,
-    /// The mode used to populate `se`.
-    pub se_mode: AloSeMode,
-    /// Count of entries where `se` fell back from sandwich to conditional.
-    pub sandwich_fallback_count: usize,
     pub pred_identity: Array1<f64>,
     pub leverage: Array1<f64>,
     pub fisher_weights: Array1<f64>,
@@ -87,7 +52,6 @@ fn compute_alo_diagnostics_from_pirls_impl(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
     link: LinkFunction,
-    options: AloOptions,
 ) -> Result<AloDiagnostics, EstimationError> {
     let x_dense_arc = base.x_transformed.to_dense_arc();
     let x_dense = x_dense_arc.as_ref();
@@ -132,7 +96,6 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let mut aii = Array1::<f64>::zeros(n);
     let mut se_bayes = Array1::<f64>::zeros(n);
     let mut se_sandwich = Array1::<f64>::zeros(n);
-    let mut sandwich_stable = vec![true; n];
     let eta_hat = base.final_eta.clone();
     let offset = &base.final_offset;
     let z = &base.solve_working_response;
@@ -238,13 +201,11 @@ fn compute_alo_diagnostics_from_pirls_impl(
                 );
             }
             let var_sandwich_stable = var_sandwich.is_finite() && var_sandwich >= 0.0;
-            sandwich_stable[obs] = var_sandwich_stable;
             if !var_sandwich_stable {
                 log::warn!(
-                    "[GAM ALO] unstable sandwich variance at i={}, var={:.6e}; conditional fallback eligible={}",
+                    "[GAM ALO] unstable sandwich variance at i={}, var={:.6e}",
                     obs,
-                    var_sandwich,
-                    options.fallback_to_conditional_on_instability
+                    var_sandwich
                 );
             }
             let se_bayes_i = var_bayes.max(0.0).sqrt();
@@ -391,29 +352,10 @@ fn compute_alo_diagnostics_from_pirls_impl(
         });
     }
 
-    let mut se_selected = match options.se_mode {
-        AloSeMode::Sandwich => se_sandwich.clone(),
-        AloSeMode::Conditional => se_bayes.clone(),
-    };
-    let mut sandwich_fallback_count = 0usize;
-    if matches!(options.se_mode, AloSeMode::Sandwich)
-        && options.fallback_to_conditional_on_instability
-    {
-        for i in 0..n {
-            if !sandwich_stable[i] {
-                se_selected[i] = se_bayes[i];
-                sandwich_fallback_count += 1;
-            }
-        }
-    }
-
     Ok(AloDiagnostics {
         eta_tilde,
-        se: se_selected,
         se_bayes,
         se_sandwich,
-        se_mode: options.se_mode,
-        sandwich_fallback_count,
         pred_identity: eta_hat,
         leverage: aii,
         fisher_weights: base.final_weights.clone(),
@@ -426,7 +368,7 @@ pub fn compute_alo_diagnostics_from_fit(
     y: ArrayView1<f64>,
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(&fit.artifacts.pirls, y, link, AloOptions::default())
+    compute_alo_diagnostics_from_pirls_impl(&fit.artifacts.pirls, y, link)
 }
 
 /// Compute ALO diagnostics from a fitted GAM result (primary API).
@@ -438,33 +380,13 @@ pub fn compute_alo_diagnostics(
     compute_alo_diagnostics_from_fit(fit, y, link)
 }
 
-/// Compute ALO diagnostics from a fitted GAM result with explicit ALO options.
-pub fn compute_alo_diagnostics_with_options(
-    fit: &FitResult,
-    y: ArrayView1<f64>,
-    link: LinkFunction,
-    options: AloOptions,
-) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(&fit.artifacts.pirls, y, link, options)
-}
-
 /// Compute ALO diagnostics from a PIRLS result for lower-level callers.
 pub fn compute_alo_diagnostics_from_pirls(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(base, y, link, AloOptions::default())
-}
-
-/// Compute ALO diagnostics from a PIRLS result with explicit ALO options.
-pub fn compute_alo_diagnostics_from_pirls_with_options(
-    base: &pirls::PirlsResult,
-    y: ArrayView1<f64>,
-    link: LinkFunction,
-    options: AloOptions,
-) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(base, y, link, options)
+    compute_alo_diagnostics_from_pirls_impl(base, y, link)
 }
 
 #[cfg(test)]

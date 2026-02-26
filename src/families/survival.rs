@@ -151,6 +151,7 @@ impl Default for MonotonicityPenalty {
 pub struct WorkingModelSurvival {
     age_entry: Array1<f64>,
     age_exit: Array1<f64>,
+    entry_at_origin: Array1<bool>,
     event_target: Array1<u8>,
     event_competing: Array1<u8>,
     sample_weight: Array1<f64>,
@@ -163,6 +164,33 @@ pub struct WorkingModelSurvival {
     penalties: PenaltyBlocks,
     monotonicity: MonotonicityPenalty,
     spec: SurvivalSpec,
+}
+
+#[inline]
+fn smooth_guarded_derivative(derivative: f64, guard: f64, softness: f64) -> (f64, f64, f64) {
+    let tau = softness.max(1e-12);
+    let z = (derivative - guard) / tau;
+
+    if z >= 40.0 {
+        return (derivative, 1.0, 0.0);
+    }
+    if z <= -40.0 {
+        let ez = z.exp();
+        let safe = guard + tau * ez;
+        let d1 = ez;
+        let d2 = ez / tau;
+        return (safe, d1, d2);
+    }
+
+    let softplus = if z > 0.0 {
+        z + (-z).exp().ln_1p()
+    } else {
+        z.exp().ln_1p()
+    };
+    let sigma = 1.0 / (1.0 + (-z).exp());
+    let d2 = sigma * (1.0 - sigma) / tau;
+    let safe = guard + tau * softplus;
+    (safe, sigma, d2)
 }
 
 impl WorkingModelSurvival {
@@ -241,6 +269,7 @@ impl WorkingModelSurvival {
         Ok(Self {
             age_entry: inputs.age_entry.to_owned(),
             age_exit: inputs.age_exit.to_owned(),
+            entry_at_origin: inputs.age_entry.mapv(|t| t <= 1e-8),
             event_target: inputs.event_target.to_owned(),
             event_competing: inputs.event_competing.to_owned(),
             sample_weight: inputs.sample_weight.to_owned(),
@@ -303,8 +332,10 @@ impl WorkingModelSurvival {
         let mut grad = Array1::<f64>::zeros(p);
         let mut h = Array2::<f64>::zeros((p, p));
 
-        // Guard derivative terms for log(hazard) = eta + log(d eta / d t)
+        // Smoothly guard derivative terms for log(hazard) = eta + log(d eta / d t)
+        // so event contributions stay informative near/below the lower bound.
         let derivative_guard = self.monotonicity.tolerance.max(1e-12);
+        let derivative_softness = derivative_guard.max(1e-6);
         for i in 0..n {
             let w = self.sample_weight[i];
             if w <= 0.0 {
@@ -320,7 +351,8 @@ impl WorkingModelSurvival {
             let _e_competing = self.event_competing[i];
             let d = f64::from(self.event_target[i]);
 
-            let h_s = h_entry[i];
+            let has_entry_interval = !self.entry_at_origin[i];
+            let h_s = if has_entry_interval { h_entry[i] } else { 0.0 };
             let h_e = h_exit[i];
             nll += w * (h_e - h_s);
 
@@ -332,7 +364,11 @@ impl WorkingModelSurvival {
             // Gradient piece:
             //   exp(eta_exit) * x_exit - exp(eta_entry) * x_entry
             for j in 0..p {
-                grad[j] += w * (h_e * x_e[j] - h_s * x_s[j]);
+                let mut g_j = h_e * x_e[j];
+                if has_entry_interval {
+                    g_j -= h_s * x_s[j];
+                }
+                grad[j] += w * g_j;
             }
 
             // Hessian piece from interval contribution:
@@ -341,22 +377,19 @@ impl WorkingModelSurvival {
                 let xe_r = x_e[r];
                 let xs_r = x_s[r];
                 for c in 0..p {
-                    h[[r, c]] += w * (h_e * xe_r * x_e[c] - h_s * xs_r * x_s[c]);
+                    let mut h_rc = h_e * xe_r * x_e[c];
+                    if has_entry_interval {
+                        h_rc -= h_s * xs_r * x_s[c];
+                    }
+                    h[[r, c]] += w * h_rc;
                 }
             }
 
             if d > 0.0 {
                 let deriv = derivative_raw[i];
-                let safe_deriv = if deriv > derivative_guard {
-                    deriv
-                } else {
-                    derivative_guard
-                };
-                let inv_deriv = if deriv > derivative_guard {
-                    1.0 / deriv
-                } else {
-                    0.0
-                };
+                let (safe_deriv, safe_d1, safe_d2) =
+                    smooth_guarded_derivative(deriv, derivative_guard, derivative_softness);
+                let inv_safe_deriv = 1.0 / safe_deriv;
                 let d_row = self.x_derivative.row(i);
                 nll += -w * (eta_exit[i] + safe_deriv.ln());
 
@@ -364,22 +397,19 @@ impl WorkingModelSurvival {
                 //   - (eta_exit + log(s_i)), with s_i = d_i^T beta = derivative_raw[i].
                 //
                 // Gradient piece:
-                //   -x_exit - d_i / s_i
-                // implemented as -x_exit - inv_deriv * d_row.
+                //   -x_exit - d_i / s_i (with smooth guarded s_i).
                 for j in 0..p {
-                    grad[j] += -w * (x_e[j] + inv_deriv * d_row[j]);
+                    grad[j] += -w * (x_e[j] + (safe_d1 * inv_safe_deriv) * d_row[j]);
                 }
 
-                // Hessian piece from -log(s_i):
-                //   + (d_i d_i^T) / s_i^2
-                // i.e. + inv_deriv_sq * d_row d_row^T.
-                let inv_deriv_sq = inv_deriv * inv_deriv;
-                if inv_deriv_sq > 0.0 {
-                    for r in 0..p {
-                        let dr = d_row[r];
-                        for c in 0..p {
-                            h[[r, c]] += w * inv_deriv_sq * dr * d_row[c];
-                        }
+                // Hessian from smooth -log(s_i), where raw slope enters through
+                // a softplus-guarded map to keep derivatives continuous.
+                let log_s_second =
+                    (safe_d1 * safe_d1 - safe_deriv * safe_d2) * inv_safe_deriv * inv_safe_deriv;
+                for r in 0..p {
+                    let dr = d_row[r];
+                    for c in 0..p {
+                        h[[r, c]] += w * log_s_second * dr * d_row[c];
                     }
                 }
             }
@@ -389,7 +419,9 @@ impl WorkingModelSurvival {
         let penalty_hessian = self.penalties.hessian(p);
         let penalty_dev = self.penalties.deviance(beta);
 
-        let slope = self.x_derivative.dot(beta);
+        // Keep monotonicity regularization aligned with the hazard derivative
+        // used in the likelihood: baseline-target offset + learned deviation.
+        let slope = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
         let mut mono_dev = 0.0;
         let mut mono_grad = Array1::<f64>::zeros(p);
         let mut mono_h = Array2::<f64>::zeros((p, p));
@@ -527,12 +559,15 @@ impl WorkingModelSurvival {
             solved.column(0).to_owned()
         };
 
-        let eta_entry = self.x_entry.dot(beta);
-        let eta_exit = self.x_exit.dot(beta);
-        let deriv_raw = self.x_derivative.dot(beta);
+        // Keep outer gradient contractions consistent with the fitted inner state:
+        // the working predictor includes target baseline offsets plus learned deviation.
+        let eta_entry = self.x_entry.dot(beta) + &self.offset_eta_entry;
+        let eta_exit = self.x_exit.dot(beta) + &self.offset_eta_exit;
+        let deriv_raw = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
         let exp_entry = eta_entry.mapv(f64::exp);
         let exp_exit = eta_exit.mapv(f64::exp);
         let guard = self.monotonicity.tolerance.max(1e-12);
+        let derivative_softness = guard.max(1e-6);
 
         // Leverage-like diagonals used by the third-derivative contraction:
         // q_i = x_i^T H^{-1} x_i, computed via solves against X^T blocks.
@@ -545,7 +580,11 @@ impl WorkingModelSurvival {
         let mut qd = Array1::<f64>::zeros(n);
         for i in 0..n {
             q1[i] = self.x_exit.row(i).dot(&z1.column(i)).max(0.0);
-            q0[i] = self.x_entry.row(i).dot(&z0.column(i)).max(0.0);
+            q0[i] = if self.entry_at_origin[i] {
+                0.0
+            } else {
+                self.x_entry.row(i).dot(&z0.column(i)).max(0.0)
+            };
             qd[i] = self.x_derivative.row(i).dot(&zd.column(i)).max(0.0);
         }
 
@@ -655,12 +694,13 @@ impl WorkingModelSurvival {
             for i in 0..n {
                 let w_i = self.sample_weight[i];
                 trace_third += w_i * exp_exit[i] * s1k[i] * q1[i];
-                trace_third -= w_i * exp_entry[i] * s0k[i] * q0[i];
+                if !self.entry_at_origin[i] {
+                    trace_third -= w_i * exp_entry[i] * s0k[i] * q0[i];
+                }
                 if self.event_target[i] > 0 {
-                    let s_i = deriv_raw[i];
-                    if s_i > guard {
-                        trace_third -= 2.0 * w_i * sdk[i] * qd[i] / (s_i * s_i * s_i);
-                    }
+                    let (s_i, _d1, _d2) =
+                        smooth_guarded_derivative(deriv_raw[i], guard, derivative_softness);
+                    trace_third -= 2.0 * w_i * sdk[i] * qd[i] / (s_i * s_i * s_i);
                 }
             }
             let t_k = trace_hinv_ak + trace_third;
@@ -994,5 +1034,183 @@ mod tests {
                 .zip(state_zero.gradient.iter())
                 .all(|(a, b)| (a - b).abs() < 1e-12)
         );
+    }
+
+    fn model_with_rho(base: &WorkingModelSurvival, rho: &Array1<f64>) -> WorkingModelSurvival {
+        let mut model = base.clone();
+        assert_eq!(model.penalties.blocks.len(), rho.len());
+        for (k, block) in model.penalties.blocks.iter_mut().enumerate() {
+            block.lambda = rho[k].exp();
+        }
+        model
+    }
+
+    fn solve_vec_h(h: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
+        let h_view = FaerArrayView::new(h);
+        let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower)
+            .expect("Hessian factorization should succeed in survival test solve");
+        let rhs_mat = rhs.clone().insert_axis(Axis(1));
+        let rhs_view = FaerArrayView::new(&rhs_mat);
+        let solved = factor.solve(rhs_view.as_ref());
+        Array1::from_shape_fn(rhs.len(), |i| solved[(i, 0)])
+    }
+
+    fn solve_inner_mode(model: &WorkingModelSurvival, beta_init: &Array1<f64>) -> Array1<f64> {
+        let mut beta = beta_init.clone();
+        let mut best_state = model.update_state(&beta).expect("initial survival state");
+        let mut best_obj = 0.5 * best_state.deviance + best_state.penalty_term;
+
+        for _ in 0..30 {
+            let grad_norm = best_state.gradient.dot(&best_state.gradient).sqrt();
+            if grad_norm < 1e-7 {
+                break;
+            }
+
+            let step = solve_vec_h(&best_state.hessian, &best_state.gradient);
+            let mut accepted = false;
+            for ls in 0..12 {
+                let alpha = 0.5_f64.powi(ls);
+                let candidate = &beta - &(alpha * &step);
+                let cand_state = model
+                    .update_state(&candidate)
+                    .expect("line-search survival state");
+                let cand_obj = 0.5 * cand_state.deviance + cand_state.penalty_term;
+                if cand_obj.is_finite() && cand_obj <= best_obj {
+                    beta = candidate;
+                    best_obj = cand_obj;
+                    best_state = cand_state;
+                    accepted = true;
+                    break;
+                }
+            }
+            if !accepted {
+                break;
+            }
+        }
+
+        beta
+    }
+
+    fn laml_objective_at_rho(
+        base: &WorkingModelSurvival,
+        rho: &Array1<f64>,
+        beta_init: &Array1<f64>,
+    ) -> (f64, Array1<f64>, Array1<f64>) {
+        let model = model_with_rho(base, rho);
+        let beta_hat = solve_inner_mode(&model, beta_init);
+        let state = model
+            .update_state(&beta_hat)
+            .expect("state at inner mode for outer objective");
+        let (obj, grad) = model
+            .laml_objective_and_rho_gradient(&beta_hat, &state)
+            .expect("analytic laml objective/gradient");
+        (obj, grad, beta_hat)
+    }
+
+    #[test]
+    fn laml_rho_gradient_matches_fd_with_nonzero_offsets() {
+        let n = 8usize;
+        let p = 3usize;
+
+        let age_entry = array![40.0, 45.0, 50.0, 55.0, 60.0, 43.0, 52.0, 58.0];
+        let age_exit = array![44.0, 49.0, 55.0, 61.0, 66.0, 48.0, 56.0, 63.0];
+        let event_target = array![1u8, 0u8, 1u8, 1u8, 0u8, 1u8, 0u8, 1u8];
+        let event_competing = Array1::<u8>::zeros(n);
+        let sample_weight = Array1::ones(n);
+
+        let mut x_entry = Array2::<f64>::zeros((n, p));
+        let mut x_exit = Array2::<f64>::zeros((n, p));
+        let mut x_derivative = Array2::<f64>::zeros((n, p));
+        let mut off_eta_entry = Array1::<f64>::zeros(n);
+        let mut off_eta_exit = Array1::<f64>::zeros(n);
+        let mut off_deriv_exit = Array1::<f64>::zeros(n);
+
+        for i in 0..n {
+            let te = (age_entry[i] / 50.0) - 1.0;
+            let tx = (age_exit[i] / 50.0) - 1.0;
+            x_entry[[i, 0]] = 1.0;
+            x_entry[[i, 1]] = te;
+            x_entry[[i, 2]] = te * te;
+            x_exit[[i, 0]] = 1.0;
+            x_exit[[i, 1]] = tx;
+            x_exit[[i, 2]] = tx * tx;
+            x_derivative[[i, 0]] = 0.0;
+            x_derivative[[i, 1]] = 0.02;
+            x_derivative[[i, 2]] = 0.001 * age_exit[i];
+
+            off_eta_entry[i] = -2.4 + 0.03 * age_entry[i];
+            off_eta_exit[i] = -2.4 + 0.03 * age_exit[i];
+            off_deriv_exit[i] = 0.08 + 0.0005 * age_exit[i];
+        }
+
+        let penalties = PenaltyBlocks::new(vec![
+            PenaltyBlock {
+                matrix: array![[1.0]],
+                lambda: 1.0,
+                range: 1..2,
+            },
+            PenaltyBlock {
+                matrix: array![[1.0]],
+                lambda: 1.0,
+                range: 2..3,
+            },
+        ]);
+        let mono = MonotonicityPenalty {
+            lambda: 0.5,
+            tolerance: 1e-6,
+        };
+
+        let base_model = WorkingModelSurvival::from_engine_inputs_with_offsets(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            Some(SurvivalBaselineOffsets {
+                eta_entry: off_eta_entry.view(),
+                eta_exit: off_eta_exit.view(),
+                derivative_exit: off_deriv_exit.view(),
+            }),
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct nonzero-offset survival model");
+
+        let rho = array![(-0.3f64), (0.45f64)];
+        let beta0 = Array1::<f64>::zeros(p);
+        let (obj, analytic, beta_hat) = laml_objective_at_rho(&base_model, &rho, &beta0);
+        assert!(obj.is_finite());
+        assert!(analytic.iter().all(|v| v.is_finite()));
+
+        let eps = 1e-4;
+        let mut fd = Array1::<f64>::zeros(rho.len());
+        for k in 0..rho.len() {
+            let mut rho_plus = rho.clone();
+            rho_plus[k] += eps;
+            let mut rho_minus = rho.clone();
+            rho_minus[k] -= eps;
+            let (obj_plus, _, beta_plus) = laml_objective_at_rho(&base_model, &rho_plus, &beta_hat);
+            let (obj_minus, _, _) = laml_objective_at_rho(&base_model, &rho_minus, &beta_plus);
+            fd[k] = (obj_plus - obj_minus) / (2.0 * eps);
+        }
+
+        for k in 0..rho.len() {
+            let abs_err = (analytic[k] - fd[k]).abs();
+            let rel_err = abs_err / fd[k].abs().max(1e-6);
+            assert!(
+                rel_err < 2.5e-2 || abs_err < 2e-2,
+                "rho-grad mismatch at k={k}: analytic={:.6e} fd={:.6e} abs={:.3e} rel={:.3e}",
+                analytic[k],
+                fd[k],
+                abs_err,
+                rel_err
+            );
+        }
     }
 }

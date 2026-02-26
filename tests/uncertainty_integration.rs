@@ -53,7 +53,12 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     assert_eq!(se.len(), fit.beta.len());
     assert!(se.iter().all(|v| v.is_finite() && *v >= 0.0));
 
-    let coef_ci = coefficient_uncertainty(&fit, 0.95, true).expect("coefficient CI should work");
+    let coef_ci = coefficient_uncertainty(
+        &fit,
+        0.95,
+        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+    )
+    .expect("coefficient CI should work");
     assert_eq!(coef_ci.estimate.len(), fit.beta.len());
     assert_eq!(coef_ci.standard_error.len(), fit.beta.len());
     assert!(
@@ -105,7 +110,6 @@ fn prediction_uncertainty_is_finite_and_well_shaped() {
         &fit,
         &PredictUncertaintyOptions {
             confidence_level: 0.95,
-            prefer_corrected_covariance: true,
             covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             include_observation_interval: true,
