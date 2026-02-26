@@ -564,13 +564,18 @@ impl<'a> GamWorkingModel<'a> {
                     let mut xtwx = self.s_transformed.clone();
                     let wx_view = FaerArrayView::new(&self.workspace.wx);
                     let mut xtwx_view = array2_to_mat_mut(&mut xtwx);
+                    let par = if matrix.ncols() <= 64 {
+                        Par::Seq
+                    } else {
+                        get_global_parallelism()
+                    };
                     matmul(
                         xtwx_view.as_mut(),
                         Accum::Add,
                         wx_view.as_ref().transpose(),
                         wx_view.as_ref(),
                         1.0,
-                        get_global_parallelism(),
+                        par,
                     );
                     xtwx
                 }
@@ -608,13 +613,18 @@ impl<'a> GamWorkingModel<'a> {
                 let wx_view = FaerArrayView::new(&self.workspace.wx);
                 let mut xtwx = Array2::zeros((x_dense.ncols(), x_dense.ncols()));
                 let mut xtwx_view = array2_to_mat_mut(&mut xtwx);
+                let par = if x_dense.ncols() <= 64 {
+                    Par::Seq
+                } else {
+                    get_global_parallelism()
+                };
                 matmul(
                     xtwx_view.as_mut(),
                     Accum::Add,
                     wx_view.as_ref().transpose(),
                     wx_view.as_ref(),
                     1.0,
-                    get_global_parallelism(),
+                    par,
                 );
                 xtwx
             }

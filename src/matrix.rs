@@ -3,6 +3,78 @@ use ndarray::{Array1, Array2, ArrayView2};
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
+#[inline]
+fn dense_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<f64> {
+    let nrows = matrix.nrows();
+    let ncols = matrix.ncols();
+    let mut out = Array1::<f64>::zeros(nrows);
+
+    if ncols == 0 || nrows == 0 {
+        return out;
+    }
+
+    if matrix.is_standard_layout()
+        && let (Some(ms), Some(vs), Some(os)) = (
+            matrix.as_slice_memory_order(),
+            vector.as_slice(),
+            out.as_slice_mut(),
+        )
+    {
+        for (i, row) in ms.chunks_exact(ncols).enumerate() {
+            let mut acc = 0.0_f64;
+            for j in 0..ncols {
+                acc += row[j] * vs[j];
+            }
+            os[i] = acc;
+        }
+        return out;
+    }
+
+    for i in 0..nrows {
+        let mut acc = 0.0_f64;
+        for j in 0..ncols {
+            acc += matrix[[i, j]] * vector[j];
+        }
+        out[i] = acc;
+    }
+    out
+}
+
+#[inline]
+fn dense_transpose_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<f64> {
+    let nrows = matrix.nrows();
+    let ncols = matrix.ncols();
+    let mut out = Array1::<f64>::zeros(ncols);
+
+    if ncols == 0 || nrows == 0 {
+        return out;
+    }
+
+    if matrix.is_standard_layout()
+        && let (Some(ms), Some(vs), Some(os)) = (
+            matrix.as_slice_memory_order(),
+            vector.as_slice(),
+            out.as_slice_mut(),
+        )
+    {
+        for (i, row) in ms.chunks_exact(ncols).enumerate() {
+            let vi = vs[i];
+            for j in 0..ncols {
+                os[j] += row[j] * vi;
+            }
+        }
+        return out;
+    }
+
+    for i in 0..nrows {
+        let vi = vector[i];
+        for j in 0..ncols {
+            out[j] += matrix[[i, j]] * vi;
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct SparseDesignMatrix {
     matrix: SparseColMat<usize, f64>,
@@ -107,7 +179,7 @@ impl DesignMatrix {
 
     pub fn matrix_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
         match self {
-            Self::Dense(matrix) => matrix.dot(vector),
+            Self::Dense(matrix) => dense_matvec(matrix, vector),
             Self::Sparse(matrix) => {
                 let mut output = Array1::<f64>::zeros(matrix.nrows());
                 let (symbolic, values) = matrix.parts();
@@ -129,7 +201,7 @@ impl DesignMatrix {
 
     pub fn transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
         match self {
-            Self::Dense(matrix) => matrix.t().dot(vector),
+            Self::Dense(matrix) => dense_transpose_matvec(matrix, vector),
             Self::Sparse(matrix) => {
                 let mut output = Array1::<f64>::zeros(matrix.ncols());
                 let (symbolic, values) = matrix.parts();
@@ -184,5 +256,33 @@ impl From<&SparseColMat<usize, f64>> for DesignMatrix {
 impl From<&DesignMatrix> for DesignMatrix {
     fn from(value: &DesignMatrix) -> Self {
         value.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dense_matvec, dense_transpose_matvec};
+    use ndarray::array;
+
+    #[test]
+    fn dense_matvec_matches_ndarray_dot() {
+        let x = array![[1.0, 2.0, -1.0], [0.5, -3.0, 4.0], [2.0, 0.0, 1.5]];
+        let v = array![0.25, -1.0, 2.0];
+        let expected = x.dot(&v);
+        let got = dense_matvec(&x, &v);
+        for i in 0..expected.len() {
+            assert!((expected[i] - got[i]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn dense_transpose_matvec_matches_ndarray_dot() {
+        let x = array![[1.0, 2.0, -1.0], [0.5, -3.0, 4.0], [2.0, 0.0, 1.5]];
+        let v = array![0.25, -1.0, 2.0];
+        let expected = x.t().dot(&v);
+        let got = dense_transpose_matvec(&x, &v);
+        for i in 0..expected.len() {
+            assert!((expected[i] - got[i]).abs() < 1e-12);
+        }
     }
 }
