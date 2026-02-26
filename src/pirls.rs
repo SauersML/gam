@@ -1516,6 +1516,63 @@ pub struct PirlsResult {
     pub x_transformed: DesignMatrix,
 }
 
+fn assemble_pirls_result(
+    working_summary: &WorkingModelPirlsResult,
+    link_function: LinkFunction,
+    prior_weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    penalized_hessian_transformed: Array2<f64>,
+    stabilized_hessian_transformed: Array2<f64>,
+    edf: f64,
+    penalty_term: f64,
+    firth_log_det: Option<f64>,
+    final_mu: &Array1<f64>,
+    final_weights: &Array1<f64>,
+    final_z: &Array1<f64>,
+    status: PirlsStatus,
+    reparam_result: ReparamResult,
+    x_transformed: DesignMatrix,
+) -> PirlsResult {
+    let final_eta_arr = working_summary.state.eta.as_ref().clone();
+    let (solve_c_array, solve_d_array) = compute_working_weight_derivatives(
+        link_function,
+        &final_eta_arr,
+        final_mu,
+        prior_weights,
+        final_weights,
+    );
+    PirlsResult {
+        beta_transformed: working_summary.beta.clone(),
+        penalized_hessian_transformed,
+        stabilized_hessian_transformed,
+        ridge_passport: RidgePassport::scaled_identity(
+            working_summary.state.ridge_used,
+            RidgePolicy::explicit_stabilization_full(),
+        ),
+        ridge_used: working_summary.state.ridge_used,
+        deviance: working_summary.state.deviance,
+        edf,
+        stable_penalty_term: penalty_term,
+        firth_log_det,
+        firth_hat_diag: working_summary.state.firth_hat_diag.clone(),
+        final_weights: final_weights.clone(),
+        final_offset: offset.to_owned(),
+        final_eta: final_eta_arr,
+        final_mu: final_mu.clone(),
+        solve_weights: final_weights.clone(),
+        solve_working_response: final_z.clone(),
+        solve_mu: final_mu.clone(),
+        solve_c_array,
+        solve_d_array,
+        status,
+        iteration: working_summary.iterations,
+        max_abs_eta: working_summary.max_abs_eta,
+        last_gradient_norm: working_summary.last_gradient_norm,
+        reparam_result,
+        x_transformed,
+    }
+}
+
 fn detect_logit_instability(
     link: LinkFunction,
     has_penalty: bool,
@@ -1951,44 +2008,23 @@ pub fn fit_model_for_fixed_rho<'a>(
         maybe_sparse_design(&x_transformed_dense)
     };
 
-    let final_eta_arr = working_summary.state.eta.as_ref().clone();
-    let (solve_c_array, solve_d_array) = compute_working_weight_derivatives(
+    let pirls_result = assemble_pirls_result(
+        &working_summary,
         link_function,
-        &final_eta_arr,
-        &final_mu,
         prior_weights,
-        &final_weights,
-    );
-    let pirls_result = PirlsResult {
-        beta_transformed: working_summary.beta.clone(),
+        offset.view(),
         penalized_hessian_transformed,
         stabilized_hessian_transformed,
-        ridge_passport: RidgePassport::scaled_identity(
-            working_summary.state.ridge_used,
-            RidgePolicy::explicit_stabilization_full(),
-        ),
-        ridge_used: working_summary.state.ridge_used,
-        deviance: working_summary.state.deviance,
         edf,
-        stable_penalty_term: penalty_term,
+        penalty_term,
         firth_log_det,
-        firth_hat_diag: working_summary.state.firth_hat_diag.clone(),
-        final_weights: final_weights.clone(),
-        final_offset: offset.to_owned(),
-        final_eta: final_eta_arr,
-        final_mu: final_mu.clone(),
-        solve_weights: final_weights.clone(),
-        solve_working_response: final_z.clone(),
-        solve_mu: final_mu.clone(),
-        solve_c_array,
-        solve_d_array,
+        &final_mu,
+        &final_weights,
+        &final_z,
         status,
-        iteration: working_summary.iterations,
-        max_abs_eta: working_summary.max_abs_eta,
-        last_gradient_norm: working_summary.last_gradient_norm,
         reparam_result,
         x_transformed,
-    };
+    );
 
     Ok((pirls_result, working_summary))
 }
@@ -2217,44 +2253,23 @@ fn fit_model_for_fixed_rho_sparse_implicit(
     }
     let x_transformed_dense = design_dot_dense_rhs(&x_original, &reparam_result.qs);
     let x_transformed = maybe_sparse_design(&x_transformed_dense);
-    let final_eta_arr = working_summary.state.eta.as_ref().clone();
-    let (solve_c_array, solve_d_array) = compute_working_weight_derivatives(
+    let pirls_result = assemble_pirls_result(
+        &working_summary,
         link_function,
-        &final_eta_arr,
-        &final_mu,
         prior_weights,
-        &final_weights,
-    );
-    let pirls_result = PirlsResult {
-        beta_transformed: working_summary.beta.clone(),
+        offset.view(),
         penalized_hessian_transformed,
         stabilized_hessian_transformed,
-        ridge_passport: RidgePassport::scaled_identity(
-            working_summary.state.ridge_used,
-            RidgePolicy::explicit_stabilization_full(),
-        ),
-        ridge_used: working_summary.state.ridge_used,
-        deviance: working_summary.state.deviance,
         edf,
-        stable_penalty_term: penalty_term,
+        penalty_term,
         firth_log_det,
-        firth_hat_diag: working_summary.state.firth_hat_diag.clone(),
-        final_weights: final_weights.clone(),
-        final_offset: offset.to_owned(),
-        final_eta: final_eta_arr,
-        final_mu: final_mu.clone(),
-        solve_weights: final_weights.clone(),
-        solve_working_response: final_z.clone(),
-        solve_mu: final_mu,
-        solve_c_array,
-        solve_d_array,
+        &final_mu,
+        &final_weights,
+        &final_z,
         status,
-        iteration: working_summary.iterations,
-        max_abs_eta: working_summary.max_abs_eta,
-        last_gradient_norm: working_summary.last_gradient_norm,
         reparam_result,
         x_transformed,
-    };
+    );
     Ok((pirls_result, working_summary))
 }
 

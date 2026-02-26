@@ -171,52 +171,6 @@ impl PenaltyMatrix {
     }
 }
 
-fn max_abs_element(matrix: &Array2<f64>) -> f64 {
-    matrix
-        .iter()
-        .filter(|v| v.is_finite())
-        .fold(0.0_f64, |acc, &val| acc.max(val.abs()))
-}
-
-fn sanitize_symmetric(matrix: &Array2<f64>) -> Array2<f64> {
-    let (rows, cols) = matrix.dim();
-    debug_assert_eq!(rows, cols, "Matrix must be square for sanitization");
-
-    let mut sanitized = matrix.clone();
-
-    for i in 0..rows {
-        let diag = sanitized[[i, i]];
-        if !diag.is_finite() {
-            sanitized[[i, i]] = 0.0;
-        }
-        for j in (i + 1)..cols {
-            let mut upper = sanitized[[i, j]];
-            let mut lower = sanitized[[j, i]];
-            if !upper.is_finite() {
-                upper = 0.0;
-            }
-            if !lower.is_finite() {
-                lower = 0.0;
-            }
-            let avg = 0.5 * (upper + lower);
-            sanitized[[i, j]] = avg;
-            sanitized[[j, i]] = avg;
-        }
-    }
-
-    let scale = max_abs_element(&sanitized);
-    let tiny = (scale * 1e-14).max(1e-30);
-    for val in sanitized.iter_mut() {
-        if !val.is_finite() {
-            *val = 0.0;
-        } else if val.abs() < tiny {
-            *val = 0.0;
-        }
-    }
-
-    sanitized
-}
-
 fn array_to_faer(array: &Array2<f64>) -> Mat<f64> {
     let (rows, cols) = array.dim();
     Mat::from_fn(rows, cols, |i, j| array[[i, j]])
@@ -224,8 +178,8 @@ fn array_to_faer(array: &Array2<f64>) -> Mat<f64> {
 
 fn mat_to_array(mat: &Mat<f64>) -> Array2<f64> {
     let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
-    for j in 0..mat.ncols() {
-        for i in 0..mat.nrows() {
+    for i in 0..mat.nrows() {
+        for j in 0..mat.ncols() {
             out[[i, j]] = mat[(i, j)];
         }
     }
@@ -316,103 +270,81 @@ fn penalty_from_root_faer(root: &Mat<f64>) -> Mat<f64> {
     sanitize_symmetric_faer(&full)
 }
 
-fn robust_eigh_faer(
-    matrix: &Mat<f64>,
-    side: Side,
-    context: &str,
-) -> Result<(Vec<f64>, Mat<f64>), EstimationError> {
-    let (rows, cols) = matrix.as_ref().shape();
-    for i in 0..rows {
-        for j in 0..cols {
-            let val = matrix[(i, j)];
-            if !val.is_finite() {
-                let max_abs = mat_max_abs_element(matrix.as_ref());
-                return Err(EstimationError::InvalidInput(format!(
-                    "{} contains non-finite entries (max finite magnitude {:.3e})",
-                    context, max_abs
-                )));
+fn clamp_eigenvalues_for_stability(eigenvalues: &mut [f64], context: &str) {
+    let scale = eigenvalues
+        .iter()
+        .filter(|v| v.is_finite())
+        .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
+    let tolerance = if scale.is_finite() {
+        (scale * 1e-12).max(1e-12)
+    } else {
+        1e-12
+    };
+
+    for val in eigenvalues.iter_mut() {
+        if !val.is_finite() {
+            *val = 0.0;
+            continue;
+        }
+        if val.abs() < tolerance {
+            *val = 0.0;
+        } else if *val < 0.0 {
+            if val.abs() <= tolerance * 10.0 {
+                *val = 0.0;
+            } else {
+                log::warn!(
+                    "{} produced large negative eigenvalue {:.3e}; clamping for stability",
+                    context,
+                    *val
+                );
+                *val = 0.0;
             }
         }
     }
+}
 
-    let mut candidate = sanitize_symmetric_faer(matrix);
+fn robust_eigh_with_policy<M, V, E, Validate, Sanitize, EigCall, DiagScale, AddRidge, MapErr>(
+    matrix: &M,
+    context: &str,
+    validate_input: Validate,
+    sanitize: Sanitize,
+    mut eig_call: EigCall,
+    diag_scale: DiagScale,
+    mut add_ridge_to_diag: AddRidge,
+    map_error: MapErr,
+) -> Result<(Vec<f64>, V), EstimationError>
+where
+    Validate: Fn(&M, &str) -> Result<(), EstimationError>,
+    Sanitize: Fn(&M) -> M,
+    EigCall: FnMut(&M) -> Result<(Vec<f64>, V), E>,
+    DiagScale: Fn(&M) -> f64,
+    AddRidge: FnMut(&mut M, f64),
+    MapErr: Fn(E) -> EstimationError,
+{
+    validate_input(matrix, context)?;
+
+    let mut candidate = sanitize(matrix);
     let mut ridge = 0.0_f64;
 
     for attempt in 0..4 {
-        match candidate.as_ref().self_adjoint_eigen(side) {
-            Ok(eig) => {
-                let diag = eig.S();
-                let diag_len = diag.dim();
-                let mut eigenvalues = Vec::with_capacity(diag_len);
-                let mut scale = 0.0_f64;
-                for idx in 0..diag_len {
-                    let val = diag[idx];
-                    if val.is_finite() {
-                        scale = scale.max(val.abs());
-                    }
-                    eigenvalues.push(val);
-                }
-                let tolerance = if scale.is_finite() {
-                    (scale * 1e-12).max(1e-12)
-                } else {
-                    1e-12
-                };
-
-                for val in eigenvalues.iter_mut() {
-                    if !val.is_finite() {
-                        *val = 0.0;
-                        continue;
-                    }
-                    if val.abs() < tolerance {
-                        *val = 0.0;
-                    } else if *val < 0.0 {
-                        if val.abs() <= tolerance * 10.0 {
-                            *val = 0.0;
-                        } else {
-                            log::warn!(
-                                "{} produced large negative eigenvalue {:.3e}; clamping for stability",
-                                context,
-                                *val
-                            );
-                            *val = 0.0;
-                        }
-                    }
-                }
-
-                let vectors_ref = eig.U();
-                let mut eigenvectors = Mat::<f64>::zeros(vectors_ref.nrows(), vectors_ref.ncols());
-                for i in 0..vectors_ref.nrows() {
-                    for j in 0..vectors_ref.ncols() {
-                        eigenvectors[(i, j)] = vectors_ref[(i, j)];
-                    }
-                }
-
+        match eig_call(&candidate) {
+            Ok((mut eigenvalues, eigenvectors)) => {
+                clamp_eigenvalues_for_stability(&mut eigenvalues, context);
                 return Ok((eigenvalues, eigenvectors));
             }
             Err(err) => {
                 if attempt == 3 {
-                    return Err(EstimationError::EigendecompositionFailed(
-                        FaerLinalgError::SelfAdjointEigen(err),
-                    ));
+                    return Err(map_error(err));
                 }
 
-                let mut diag_scale = 0.0_f64;
-                for idx in 0..candidate.nrows() {
-                    let val = candidate[(idx, idx)];
-                    if val.is_finite() {
-                        diag_scale = diag_scale.max(val.abs());
-                    }
-                }
-                let base = if diag_scale.is_finite() {
-                    (diag_scale * 1e-8).max(1e-10)
+                let scale = diag_scale(&candidate);
+                let base = if scale.is_finite() {
+                    (scale * 1e-8).max(1e-10)
                 } else {
                     1e-8
                 };
-
                 ridge = if ridge == 0.0 { base } else { ridge * 10.0 };
-                for idx in 0..candidate.nrows() {
-                    candidate[(idx, idx)] += ridge;
-                }
+                add_ridge_to_diag(&mut candidate, ridge);
 
                 log::warn!(
                     "{} eigendecomposition failed on attempt {}. Added ridge {:.3e} before retrying.",
@@ -424,7 +356,68 @@ fn robust_eigh_faer(
         }
     }
 
-    unreachable!("robust_eigh_faer should return or error within 4 attempts")
+    unreachable!("robust_eigh_with_policy should return or error within 4 attempts")
+}
+
+fn robust_eigh_faer(
+    matrix: &Mat<f64>,
+    side: Side,
+    context: &str,
+) -> Result<(Vec<f64>, Mat<f64>), EstimationError> {
+    robust_eigh_with_policy(
+        matrix,
+        context,
+        |mat, ctx| {
+            let (rows, cols) = mat.as_ref().shape();
+            for i in 0..rows {
+                for j in 0..cols {
+                    let val = mat[(i, j)];
+                    if !val.is_finite() {
+                        let max_abs = mat_max_abs_element(mat.as_ref());
+                        return Err(EstimationError::InvalidInput(format!(
+                            "{} contains non-finite entries (max finite magnitude {:.3e})",
+                            ctx, max_abs
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        },
+        sanitize_symmetric_faer,
+        |candidate| {
+            let eig = candidate.as_ref().self_adjoint_eigen(side)?;
+            let diag = eig.S();
+            let mut eigenvalues = Vec::with_capacity(diag.dim());
+            for idx in 0..diag.dim() {
+                eigenvalues.push(diag[idx]);
+            }
+
+            let vectors_ref = eig.U();
+            let mut eigenvectors = Mat::<f64>::zeros(vectors_ref.nrows(), vectors_ref.ncols());
+            for i in 0..vectors_ref.nrows() {
+                for j in 0..vectors_ref.ncols() {
+                    eigenvectors[(i, j)] = vectors_ref[(i, j)];
+                }
+            }
+            Ok((eigenvalues, eigenvectors))
+        },
+        |candidate| {
+            let mut scale = 0.0_f64;
+            for idx in 0..candidate.nrows() {
+                let val = candidate[(idx, idx)];
+                if val.is_finite() {
+                    scale = scale.max(val.abs());
+                }
+            }
+            scale
+        },
+        |candidate, ridge| {
+            for idx in 0..candidate.nrows() {
+                candidate[(idx, idx)] += ridge;
+            }
+        },
+        |err| EstimationError::EigendecompositionFailed(FaerLinalgError::SelfAdjointEigen(err)),
+    )
 }
 
 fn transpose_owned(matrix: &Array2<f64>) -> Array2<f64> {
@@ -438,85 +431,9 @@ fn robust_eigh(
     side: Side,
     context: &str,
 ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
-    if matrix.iter().any(|v| !v.is_finite()) {
-        let max_abs = max_abs_element(matrix);
-        return Err(EstimationError::InvalidInput(format!(
-            "{} contains non-finite entries (max finite magnitude {:.3e})",
-            context, max_abs
-        )));
-    }
-
-    let mut candidate = sanitize_symmetric(matrix);
-    let mut ridge = 0.0_f64;
-
-    for attempt in 0..4 {
-        match candidate.eigh(side) {
-            Ok((mut eigenvalues, eigenvectors)) => {
-                let scale = eigenvalues
-                    .iter()
-                    .filter(|v| v.is_finite())
-                    .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
-                let tolerance = if scale.is_finite() {
-                    (scale * 1e-12).max(1e-12)
-                } else {
-                    1e-12
-                };
-
-                for val in eigenvalues.iter_mut() {
-                    if !val.is_finite() {
-                        *val = 0.0;
-                        continue;
-                    }
-                    if val.abs() < tolerance {
-                        *val = 0.0;
-                    } else if *val < 0.0 {
-                        if val.abs() <= tolerance * 10.0 {
-                            *val = 0.0;
-                        } else {
-                            log::warn!(
-                                "{} produced large negative eigenvalue {:.3e}; clamping for stability",
-                                context,
-                                *val
-                            );
-                            *val = 0.0;
-                        }
-                    }
-                }
-
-                return Ok((eigenvalues, eigenvectors));
-            }
-            Err(err) => {
-                if attempt == 3 {
-                    return Err(EstimationError::EigendecompositionFailed(err));
-                }
-
-                let diag_scale = candidate
-                    .diag()
-                    .iter()
-                    .filter(|v| v.is_finite())
-                    .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
-                let base = if diag_scale.is_finite() {
-                    (diag_scale * 1e-8).max(1e-10)
-                } else {
-                    1e-8
-                };
-
-                ridge = if ridge == 0.0 { base } else { ridge * 10.0 };
-                for i in 0..candidate.nrows() {
-                    candidate[[i, i]] += ridge;
-                }
-
-                log::warn!(
-                    "{} eigendecomposition failed on attempt {}. Added ridge {:.3e} before retrying.",
-                    context,
-                    attempt + 1,
-                    ridge
-                );
-            }
-        }
-    }
-
-    unreachable!("robust_eigh should return or error within 4 attempts")
+    let matrix_faer = array_to_faer(matrix);
+    let (eigenvalues, eigenvectors) = robust_eigh_faer(&matrix_faer, side, context)?;
+    Ok((Array1::from_vec(eigenvalues), mat_to_array(&eigenvectors)))
 }
 
 /// Computes weighted column means for functional ANOVA decomposition.

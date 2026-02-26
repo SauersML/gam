@@ -375,43 +375,21 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             );
 
             if let Some(out) = args.out {
-                let model = SavedModel {
-                    version: 1,
-                    formula: formula_text,
-                    family: FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
-                    link: link_choice.map(link_choice_to_string),
-                    formula_noise: Some(noise_formula),
-                    beta_noise: fit.block_states.get(1).map(|b| b.beta.to_vec()),
-                    sigma_min: Some(sigma_min),
-                    sigma_max: Some(sigma_max),
-                    joint_beta_link: None,
-                    joint_knot_range: None,
-                    joint_knot_vector: None,
-                    joint_link_transform: None,
-                    joint_degree: None,
-                    joint_ridge_used: None,
-                    survival_entry: None,
-                    survival_exit: None,
-                    survival_event: None,
-                    survival_spec: None,
-                    survival_monotonicity_lambda: None,
-                    fit_max_iter: 80,
-                    fit_tol: 1e-6,
-                    beta: fit
-                        .block_states
+                let model = build_location_scale_saved_model(
+                    formula_text.clone(),
+                    FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
+                    link_choice.map(link_choice_to_string),
+                    noise_formula.clone(),
+                    fit.block_states
                         .first()
                         .map(|b| b.beta.to_vec())
                         .unwrap_or_default(),
-                    lambdas: fit.lambdas.to_vec(),
-                    scale: 1.0,
-                    covariance_conditional: None,
-                    covariance_corrected: None,
-                };
-                let payload = serde_json::to_string_pretty(&model)
-                    .map_err(|e| format!("failed to serialize model: {e}"))?;
-                fs::write(&out, payload)
-                    .map_err(|e| format!("failed to write model '{}': {e}", out.display()))?;
-                println!("saved model: {}", out.display());
+                    fit.block_states.get(1).map(|b| b.beta.to_vec()),
+                    sigma_min,
+                    sigma_max,
+                    fit.lambdas.to_vec(),
+                );
+                write_model_json(&out, &model)?;
             }
             return Ok(());
         }
@@ -459,43 +437,21 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         );
 
         if let Some(out) = args.out {
-            let model = SavedModel {
-                version: 1,
-                formula: formula_text,
-                family: FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT.to_string(),
-                link: Some("probit".to_string()),
-                formula_noise: Some(noise_formula),
-                beta_noise: fit.block_states.get(1).map(|b| b.beta.to_vec()),
-                sigma_min: Some(sigma_min),
-                sigma_max: Some(sigma_max),
-                joint_beta_link: None,
-                joint_knot_range: None,
-                joint_knot_vector: None,
-                joint_link_transform: None,
-                joint_degree: None,
-                joint_ridge_used: None,
-                survival_entry: None,
-                survival_exit: None,
-                survival_event: None,
-                survival_spec: None,
-                survival_monotonicity_lambda: None,
-                fit_max_iter: 80,
-                fit_tol: 1e-6,
-                beta: fit
-                    .block_states
+            let model = build_location_scale_saved_model(
+                formula_text,
+                FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT.to_string(),
+                Some("probit".to_string()),
+                noise_formula,
+                fit.block_states
                     .first()
                     .map(|b| b.beta.to_vec())
                     .unwrap_or_default(),
-                lambdas: fit.lambdas.to_vec(),
-                scale: 1.0,
-                covariance_conditional: None,
-                covariance_corrected: None,
-            };
-            let payload = serde_json::to_string_pretty(&model)
-                .map_err(|e| format!("failed to serialize model: {e}"))?;
-            fs::write(&out, payload)
-                .map_err(|e| format!("failed to write model '{}': {e}", out.display()))?;
-            println!("saved model: {}", out.display());
+                fit.block_states.get(1).map(|b| b.beta.to_vec()),
+                sigma_min,
+                sigma_max,
+                fit.lambdas.to_vec(),
+            );
+            write_model_json(&out, &model)?;
         }
         return Ok(());
     }
@@ -581,11 +537,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     covariance_conditional: None,
                     covariance_corrected: None,
                 };
-                let payload = serde_json::to_string_pretty(&model)
-                    .map_err(|e| format!("failed to serialize model: {e}"))?;
-                fs::write(&out, payload)
-                    .map_err(|e| format!("failed to write model '{}': {e}", out.display()))?;
-                println!("saved model: {}", out.display());
+                write_model_json(&out, &model)?;
             }
             return Ok(());
         }
@@ -664,11 +616,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 .as_ref()
                 .map(array2_to_nested_vec),
         };
-        let payload = serde_json::to_string_pretty(&model)
-            .map_err(|e| format!("failed to serialize model: {e}"))?;
-        fs::write(&out, payload)
-            .map_err(|e| format!("failed to write model '{}': {e}", out.display()))?;
-        println!("saved model: {}", out.display());
+        write_model_json(&out, &model)?;
     }
 
     Ok(())
@@ -1313,11 +1261,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             covariance_conditional: Some(array2_to_nested_vec(&cov)),
             covariance_corrected: Some(array2_to_nested_vec(&cov)),
         };
-        let payload = serde_json::to_string_pretty(&model_out)
-            .map_err(|e| format!("failed to serialize survival model: {e}"))?;
-        fs::write(&out, payload)
-            .map_err(|e| format!("failed to write model '{}': {e}", out.display()))?;
-        println!("saved model: {}", out.display());
+        write_model_json(&out, &model_out)?;
     }
     Ok(())
 }
@@ -1682,6 +1626,56 @@ fn choose_formula(args: &FitArgs) -> Result<String, String> {
         "one of --formula (alias: --predict-mean) OR (--target and --features) is required"
             .to_string(),
     )
+}
+
+fn build_location_scale_saved_model(
+    formula: String,
+    family: String,
+    link: Option<String>,
+    noise_formula: String,
+    beta: Vec<f64>,
+    beta_noise: Option<Vec<f64>>,
+    sigma_min: f64,
+    sigma_max: f64,
+    lambdas: Vec<f64>,
+) -> SavedModel {
+    SavedModel {
+        version: 1,
+        formula,
+        family,
+        link,
+        formula_noise: Some(noise_formula),
+        beta_noise,
+        sigma_min: Some(sigma_min),
+        sigma_max: Some(sigma_max),
+        joint_beta_link: None,
+        joint_knot_range: None,
+        joint_knot_vector: None,
+        joint_link_transform: None,
+        joint_degree: None,
+        joint_ridge_used: None,
+        survival_entry: None,
+        survival_exit: None,
+        survival_event: None,
+        survival_spec: None,
+        survival_monotonicity_lambda: None,
+        fit_max_iter: 80,
+        fit_tol: 1e-6,
+        beta,
+        lambdas,
+        scale: 1.0,
+        covariance_conditional: None,
+        covariance_corrected: None,
+    }
+}
+
+fn write_model_json(path: &Path, model: &SavedModel) -> Result<(), String> {
+    let payload = serde_json::to_string_pretty(model)
+        .map_err(|e| format!("failed to serialize model: {e}"))?;
+    fs::write(path, payload)
+        .map_err(|e| format!("failed to write model '{}': {e}", path.display()))?;
+    println!("saved model: {}", path.display());
+    Ok(())
 }
 
 fn compose_formula_from_target_features(target: &str, features: &str) -> Result<String, String> {

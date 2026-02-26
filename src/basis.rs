@@ -3906,80 +3906,14 @@ pub(crate) mod internal {
     }
 
     #[inline]
-    fn evaluate_splines_at_point_fixed<const DEGREE: usize>(
-        x: f64,
-        knots: ArrayView1<f64>,
-        basis_values: &mut [f64],
-        scratch: &mut BsplineScratch,
-    ) {
-        let num_knots = knots.len();
-        let num_basis = num_knots - DEGREE - 1;
-        debug_assert_eq!(basis_values.len(), num_basis);
-
-        scratch.ensure_degree(DEGREE);
-        scratch.n.fill(0.0);
-        scratch.left.fill(0.0);
-        scratch.right.fill(0.0);
-
-        let x_eval = x.clamp(knots[DEGREE], knots[num_basis]);
-
-        let mu = {
-            if x_eval >= knots[num_basis] {
-                num_basis - 1
-            } else if x_eval < knots[DEGREE] {
-                DEGREE
-            } else {
-                let mut span = DEGREE;
-                while span < num_basis && x_eval >= knots[span + 1] {
-                    span += 1;
-                }
-                span
-            }
-        };
-
-        let left = &mut scratch.left;
-        let right = &mut scratch.right;
-        let n = &mut scratch.n;
-
-        n[0] = 1.0;
-
-        for d in 1..=DEGREE {
-            left[d] = x_eval - knots[mu + 1 - d];
-            right[d] = knots[mu + d] - x_eval;
-
-            let mut saved = 0.0;
-
-            for r in 0..d {
-                let den = right[r + 1] + left[d - r];
-                let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
-
-                n[r] = saved + right[r + 1] * temp;
-                saved = left[d - r] * temp;
-            }
-            n[d] = saved;
-        }
-
-        basis_values.fill(0.0);
-        let start_index = mu.saturating_sub(DEGREE);
-        for i in 0..=DEGREE {
-            let global_idx = start_index + i;
-            if global_idx < num_basis {
-                basis_values[global_idx] = n[i];
-            }
-        }
-    }
-
-    #[inline]
-    fn evaluate_splines_at_point_dynamic(
+    fn evaluate_spline_local_values(
         x: f64,
         degree: usize,
         knots: ArrayView1<f64>,
-        basis_values: &mut [f64],
         scratch: &mut BsplineScratch,
-    ) {
+    ) -> (usize, usize) {
         let num_knots = knots.len();
         let num_basis = num_knots - degree - 1;
-        debug_assert_eq!(basis_values.len(), num_basis);
 
         scratch.ensure_degree(degree);
         scratch.n.fill(0.0);
@@ -4013,17 +3947,49 @@ pub(crate) mod internal {
             right[d] = knots[mu + d] - x_eval;
 
             let mut saved = 0.0;
-
             for r in 0..d {
                 let den = right[r + 1] + left[d - r];
                 let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
-
                 n[r] = saved + right[r + 1] * temp;
                 saved = left[d - r] * temp;
             }
             n[d] = saved;
         }
 
+        (mu, num_basis)
+    }
+
+    #[inline]
+    fn evaluate_splines_at_point_fixed<const DEGREE: usize>(
+        x: f64,
+        knots: ArrayView1<f64>,
+        basis_values: &mut [f64],
+        scratch: &mut BsplineScratch,
+    ) {
+        let (mu, num_basis) = evaluate_spline_local_values(x, DEGREE, knots, scratch);
+        debug_assert_eq!(basis_values.len(), num_basis);
+        let n = &scratch.n;
+        basis_values.fill(0.0);
+        let start_index = mu.saturating_sub(DEGREE);
+        for i in 0..=DEGREE {
+            let global_idx = start_index + i;
+            if global_idx < num_basis {
+                basis_values[global_idx] = n[i];
+            }
+        }
+    }
+
+    #[inline]
+    fn evaluate_splines_at_point_dynamic(
+        x: f64,
+        degree: usize,
+        knots: ArrayView1<f64>,
+        basis_values: &mut [f64],
+        scratch: &mut BsplineScratch,
+    ) {
+        let (mu, num_basis) = evaluate_spline_local_values(x, degree, knots, scratch);
+        debug_assert_eq!(basis_values.len(), num_basis);
+        let n = &scratch.n;
         basis_values.fill(0.0);
         let start_index = mu.saturating_sub(degree);
         for i in 0..=degree {
@@ -4044,53 +4010,9 @@ pub(crate) mod internal {
         values: &mut [f64],
         scratch: &mut BsplineScratch,
     ) -> usize {
-        let num_knots = knots.len();
-        let num_basis = num_knots - degree - 1;
+        let (mu, _num_basis) = evaluate_spline_local_values(x, degree, knots, scratch);
         debug_assert_eq!(values.len(), degree + 1);
-
-        scratch.ensure_degree(degree);
-        scratch.n.fill(0.0);
-        scratch.left.fill(0.0);
-        scratch.right.fill(0.0);
-
-        let x_eval = x.clamp(knots[degree], knots[num_basis]);
-
-        let mu = {
-            if x_eval >= knots[num_basis] {
-                num_basis - 1
-            } else if x_eval < knots[degree] {
-                degree
-            } else {
-                let mut span = degree;
-                while span < num_basis && x_eval >= knots[span + 1] {
-                    span += 1;
-                }
-                span
-            }
-        };
-
-        let left = &mut scratch.left;
-        let right = &mut scratch.right;
-        let n = &mut scratch.n;
-
-        n[0] = 1.0;
-
-        for d in 1..=degree {
-            left[d] = x_eval - knots[mu + 1 - d];
-            right[d] = knots[mu + d] - x_eval;
-
-            let mut saved = 0.0;
-
-            for r in 0..d {
-                let den = right[r + 1] + left[d - r];
-                let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
-
-                n[r] = saved + right[r + 1] * temp;
-                saved = left[d - r] * temp;
-            }
-            n[d] = saved;
-        }
-
+        let n = &scratch.n;
         for i in 0..=degree {
             values[i] = n[i];
         }
