@@ -49,9 +49,49 @@ jobs:
           print(json.dumps(matrix))
           PY
 
+  bootstrap-runtime:
+    name: Bootstrap benchmark runtime
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+
+      - name: Build shared runtime once
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bench/runtime/pydeps bench/runtime/r-lib
+          python3 -m pip install --upgrade pip setuptools wheel
+          python3 -m pip install --target bench/runtime/pydeps numpy pandas pygam lifelines
+          Rscript -e 'install.packages(c("mgcv","jsonlite"), repos="https://cloud.r-project.org", lib="bench/runtime/r-lib")'
+          cargo build --release --bin gam
+          cp target/release/gam bench/runtime/gam
+          chmod +x bench/runtime/gam
+
+      - name: Upload shared runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-runtime
+          path: bench/runtime
+          if-no-files-found: error
+
   bench-shard:
     name: Bench ${{ matrix.scenario }}
-    needs: prepare
+    needs:
+      - prepare
+      - bootstrap-runtime
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -65,12 +105,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Shared setup
-        uses: ./.github/actions/bench-setup
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+
+      - name: Download shared runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-runtime
+          path: bench/runtime
 
       - name: Run scenario shard
         shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/bench/runtime/pydeps
+          R_LIBS_USER: ${{ github.workspace }}/bench/runtime/r-lib
+          BENCH_GAM_BIN: ${{ github.workspace }}/bench/runtime/gam
         run: |
+          set -euo pipefail
+          test -x "${BENCH_GAM_BIN}"
           mkdir -p bench/results-shards
           python3 bench/run_suite.py \
             --scenarios bench/scenarios.json \

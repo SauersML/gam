@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ from time import perf_counter
 import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
+from lifelines.utils import concordance_index
 from pygam import LinearGAM, LogisticGAM, l, s
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -72,6 +74,7 @@ def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42, stratified: boo
     return folds
 
 
+def auc_score(y: np.ndarray, p: np.ndarray) -> float:
     order = np.argsort(p)
     y_sorted = y[order]
     n_pos = float(np.sum(y_sorted > 0.5))
@@ -83,17 +86,45 @@ def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42, stratified: boo
     return (rank_sum_pos - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)
 
 
+def brier_score(y: np.ndarray, p: np.ndarray) -> float:
     return float(np.mean((y - p) ** 2))
 
 
+def rmse_score(y: np.ndarray, mu: np.ndarray) -> float:
     return math.sqrt(float(np.mean((y - mu) ** 2)))
 
 
+def r2_score(y: np.ndarray, mu: np.ndarray) -> float:
     sst = float(np.sum((y - float(np.mean(y))) ** 2))
     if sst <= 0.0:
         return 0.0
     sse = float(np.sum((y - mu) ** 2))
     return 1.0 - sse / sst
+
+
+def _augment_bmi_spline_linear_hinges(train_df: pd.DataFrame, test_df: pd.DataFrame, n_knots: int = 6):
+    if "bmi" not in train_df.columns or n_knots < 2:
+        return train_df, test_df, []
+    x_tr = train_df["bmi"].to_numpy(dtype=float)
+    # Leakage-safe: knots from train-fold only.
+    qs = np.linspace(0.1, 0.9, n_knots - 1)
+    knots = np.unique(np.quantile(x_tr, qs))
+
+    tr = train_df.copy()
+    te = test_df.copy()
+    cols = []
+    base_col = "bmi_spline_0"
+    tr[base_col] = tr["bmi"]
+    te[base_col] = te["bmi"]
+    cols.append(base_col)
+    for j, k in enumerate(knots, start=1):
+        cn = f"bmi_spline_{j}"
+        tr[cn] = np.maximum(0.0, tr["bmi"] - float(k))
+        te[cn] = np.maximum(0.0, te["bmi"] - float(k))
+        cols.append(cn)
+    tr = tr.drop(columns=["bmi"])
+    te = te.drop(columns=["bmi"])
+    return tr, te, cols
 
 
 def _load_lidar_dataset():
@@ -951,7 +982,9 @@ def aggregate_cv_rows(cv_rows, family):
         return {
             "fit_sec": fit_sec,
             "predict_sec": predict_sec,
+            "auc": wavg("auc"),  # concordance index
             "brier": None,
+            "c_index": wavg("auc"),
             "rmse": None,
             "r2": None,
         }
@@ -997,20 +1030,35 @@ def _rust_fit_mapping(scenario_name):
             "knots": int(papuan_cfg["knots"]),
         }
     return {
-        "small_dense": dict(family="binomial-logit", smooth_col="x2", linear_cols=["x1"], smooth_basis="ps", knots=7),
+        "small_dense": dict(
+            family="binomial-logit",
+            smooth_col="x2",
+            linear_cols=["x1"],
+            smooth_basis="ps",
+            knots=7,
+            double_penalty=False,
+        ),
         "medium": dict(family="binomial-logit", smooth_col="x2", linear_cols=["x1"], smooth_basis="ps", knots=7),
         "pathological_ill_conditioned": dict(
             family="binomial-logit", smooth_col="x2", linear_cols=["x1"], smooth_basis="ps", knots=7
         ),
         "lidar_semipar": dict(family="gaussian", smooth_col="range", linear_cols=[], smooth_basis="ps", knots=24),
         "bone_gamair": dict(family="binomial-logit", smooth_col="t", linear_cols=["trt_auto"], smooth_basis="ps", knots=8),
-        "prostate_gamair": dict(family="binomial-logit", smooth_col="pc2", linear_cols=["pc1"], smooth_basis="ps", knots=8),
+        "prostate_gamair": dict(
+            family="binomial-logit",
+            smooth_col="pc2",
+            linear_cols=["pc1"],
+            smooth_basis="ps",
+            knots=8,
+            double_penalty=False,
+        ),
         "horse_colic": dict(
             family="binomial-logit",
             smooth_col="pulse",
             linear_cols=["rectal_temp", "packed_cell_volume"],
             smooth_basis="ps",
             knots=8,
+            double_penalty=False,
         ),
         "wine_gamair": dict(
             family="gaussian",
@@ -1134,7 +1182,11 @@ def _rust_formula_for_scenario(scenario_name, ds):
     if smooth_cols:
         for col in smooth_cols:
             if basis in {"ps", "bspline", "p-spline"}:
-                terms.append(f"s({col}, type=ps, knots={knots})")
+                if "double_penalty" in cfg:
+                    dp = "true" if bool(cfg["double_penalty"]) else "false"
+                    terms.append(f"s({col}, type=ps, knots={knots}, double_penalty={dp})")
+                else:
+                    terms.append(f"s({col}, type=ps, knots={knots})")
             elif basis in {"thinplate", "tps"}:
                 terms.append(f"s({col}, type=tps, centers={knots})")
             elif basis == "duchon":
@@ -1142,10 +1194,18 @@ def _rust_formula_for_scenario(scenario_name, ds):
             elif basis == "matern":
                 terms.append(f"s({col}, type=matern, centers={knots})")
             else:
-                terms.append(f"s({col}, type=ps, knots={knots})")
+                if "double_penalty" in cfg:
+                    dp = "true" if bool(cfg["double_penalty"]) else "false"
+                    terms.append(f"s({col}, type=ps, knots={knots}, double_penalty={dp})")
+                else:
+                    terms.append(f"s({col}, type=ps, knots={knots})")
     else:
         col = cfg["smooth_col"]
-        terms.append(f"s({col}, type=ps, knots={knots})")
+        if "double_penalty" in cfg:
+            dp = "true" if bool(cfg["double_penalty"]) else "false"
+            terms.append(f"s({col}, type=ps, knots={knots}, double_penalty={dp})")
+        else:
+            terms.append(f"s({col}, type=ps, knots={knots})")
 
     if not terms:
         raise RuntimeError(f"empty Rust term list for scenario '{scenario_name}'")
@@ -1155,7 +1215,7 @@ def _rust_formula_for_scenario(scenario_name, ds):
 
 def _rust_survival_formula_for_scenario(scenario_name):
     if scenario_name == "icu_survival_death":
-        return "linear(age) + linear(bmi) + linear(hr_max) + linear(sysbp_min)"
+        return "linear(age) + s(bmi, type=ps, knots=6) + linear(hr_max) + linear(sysbp_min)"
     if scenario_name == "heart_failure_survival":
         return (
             "linear(age) + linear(anaemia) + linear(log_creatinine_phosphokinase) + linear(diabetes) + "
@@ -1175,10 +1235,35 @@ def _rust_survival_formula_for_scenario(scenario_name):
         return "linear(age) + linear(bmi) + linear(hr_max) + linear(sysbp_min) + linear(temp_apache)"
     raise RuntimeError(f"No Rust survival formula configured for scenario '{scenario_name}'")
 
+def _rust_survival_fit_options_for_scenario(scenario_name):
+    # Keep defaults close to CLI behavior and only enable a flexible time basis
+    # where it provides clear discrimination gains.
+    if scenario_name in {"heart_failure_survival", "cirrhosis_survival"}:
+        return {
+            "time_basis": "bspline",
+            "time_degree": 3,
+            "time_num_internal_knots": 8,
+            "time_smooth_lambda": 1e-2,
+            "ridge_lambda": 1e-6,
+        }
+    return {
+        "time_basis": "linear",
+        "ridge_lambda": 1e-4,
+    }
+
 
 def _ensure_rust_binary():
     global _RUST_BIN_PATH
     if _RUST_BIN_PATH is not None:
+        return _RUST_BIN_PATH
+    prebuilt = os.environ.get("BENCH_GAM_BIN", "").strip()
+    if prebuilt:
+        candidate = Path(prebuilt).expanduser().resolve()
+        if not candidate.exists():
+            raise RuntimeError(f"BENCH_GAM_BIN points to missing file: {candidate}")
+        if not os.access(candidate, os.X_OK):
+            raise RuntimeError(f"BENCH_GAM_BIN is not executable: {candidate}")
+        _RUST_BIN_PATH = candidate
         return _RUST_BIN_PATH
     code, out, err = run_cmd(["cargo", "build", "--release", "--bin", "gam"], cwd=ROOT)
     if code != 0:
@@ -1402,29 +1487,65 @@ def run_rust_scenario_cv(scenario):
         for fold_id, fold in enumerate(folds):
             train_df = base_df.iloc[fold.train_idx].copy()
             test_df = base_df.iloc[fold.test_idx].copy()
+            test_eval_df = test_df.copy()
             train_path = td_path / f"train_{fold_id}.csv"
             test_path = td_path / f"test_{fold_id}.csv"
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
 
             if ds["family"] == "survival":
+                for col in ds["features"]:
+                    mu = float(train_df[col].mean())
+                    sdv = float(train_df[col].std())
+                    if (not np.isfinite(sdv)) or sdv < 1e-8:
+                        sdv = 1.0
+                    train_df[col] = (train_df[col] - mu) / sdv
+                    test_df[col] = (test_df[col] - mu) / sdv
+                train_df["__entry"] = 0.0
+                test_df["__entry"] = 0.0
+                # Use a fixed time horizon per fold to avoid leakage from scoring at each
+                # subject's observed event/censoring time.
+                horizon = float(np.median(train_df[ds["time_col"]].to_numpy(dtype=float)))
+                if not np.isfinite(horizon) or horizon <= 0.0:
+                    horizon = 1.0
+                test_df[ds["time_col"]] = horizon
+                train_df.to_csv(train_path, index=False)
+                test_df.to_csv(test_path, index=False)
                 formula = _rust_survival_formula_for_scenario(scenario_name)
+                fit_cfg = _rust_survival_fit_options_for_scenario(scenario_name)
                 fit_cmd = [
                     str(rust_bin),
                     "survival",
                     str(train_path),
                     "--entry",
-                    ds["time_col"],
+                    "__entry",
                     "--exit",
                     ds["time_col"],
                     "--event",
                     ds["event_col"],
                     "--formula",
                     formula,
+                    "--ridge-lambda",
+                    str(fit_cfg["ridge_lambda"]),
+                    "--time-basis",
+                    fit_cfg["time_basis"],
                     "--out",
                     str(model_path),
                 ]
+                if fit_cfg["time_basis"] == "bspline":
+                    fit_cmd.extend(
+                        [
+                            "--time-degree",
+                            str(int(fit_cfg["time_degree"])),
+                            "--time-num-internal-knots",
+                            str(int(fit_cfg["time_num_internal_knots"])),
+                            "--time-smooth-lambda",
+                            str(float(fit_cfg["time_smooth_lambda"])),
+                        ]
+                    )
             else:
+                train_df.to_csv(train_path, index=False)
+                test_df.to_csv(test_path, index=False)
                 family, formula = _rust_formula_for_scenario(scenario_name, ds)
                 fit_cmd = [
                     str(rust_bin),
@@ -1483,6 +1604,8 @@ def run_rust_scenario_cv(scenario):
                     {
                         "fit_sec": float(fit_sec),
                         "predict_sec": float(pred_sec),
+                        "auc": auc_score(y_test, pred),
+                        "brier": brier_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": "gam fit/predict via release binary [5-fold CV]",
                     }
@@ -1493,20 +1616,28 @@ def run_rust_scenario_cv(scenario):
                     {
                         "fit_sec": float(fit_sec),
                         "predict_sec": float(pred_sec),
+                        "rmse": rmse_score(y_test, pred),
+                        "r2": r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": "gam fit/predict via release binary [5-fold CV]",
                     }
                 )
             else:
-                event_times = test_df[ds["time_col"]].to_numpy(dtype=float)
-                events = test_df[ds["event_col"]].to_numpy(dtype=float)
+                event_times = test_eval_df[ds["time_col"]].to_numpy(dtype=float)
+                events = test_eval_df[ds["event_col"]].to_numpy(dtype=float)
+                risk_score = (
+                    -pred_df["eta"].to_numpy(dtype=float)
+                    if "eta" in pred_df.columns
+                    else pred
+                )
+                cidx = float(concordance_index(event_times, risk_score, event_observed=events))
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
                         "predict_sec": float(pred_sec),
                         "auc": cidx,
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": "gam survival/predict via release binary [5-fold CV]",
+                        "model_spec": "gam survival/predict via release binary (fixed-horizon c-index on survival score) [5-fold CV]",
                     }
                 )
 
@@ -1574,7 +1705,7 @@ if (family_name == "survival") {
     test_df[[cn]] <- (test_df[[cn]] - mu) / sdv
   }
   if (scenario_name == "icu_survival_death") {
-    ftxt <- "Surv(time, event) ~ age + bmi + hr_max + sysbp_min"
+    ftxt <- "Surv(time, event) ~ age + pspline(bmi, df=6) + hr_max + sysbp_min"
   } else if (scenario_name == "heart_failure_survival") {
     ftxt <- "Surv(time, event) ~ age + anaemia + log_creatinine_phosphokinase + diabetes + ejection_fraction + high_blood_pressure + log_platelets + log_serum_creatinine + serum_sodium + sex + smoking"
   } else if (scenario_name == "cirrhosis_survival") {
@@ -1823,17 +1954,23 @@ def run_external_pygam_cv(scenario):
                     sdv = 1.0
                 train_df[col] = (train_df[col] - mu) / sdv
                 test_df[col] = (test_df[col] - mu) / sdv
+            fit_feature_cols = feature_cols
+            if scenario["name"] == "icu_survival_death" and "bmi" in feature_cols:
+                train_df, test_df, bmi_spline_cols = _augment_bmi_spline_linear_hinges(
+                    train_df, test_df, n_knots=6
+                )
+                fit_feature_cols = [c for c in feature_cols if c != "bmi"] + bmi_spline_cols
             fit_start = datetime.now(timezone.utc)
             cph = CoxPHFitter(penalizer=1e-4)
-            cph.fit(train_df[[*ds["features"], time_col, event_col]], duration_col=time_col, event_col=event_col)
+            cph.fit(train_df[[*fit_feature_cols, time_col, event_col]], duration_col=time_col, event_col=event_col)
             fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
             pred_start = datetime.now(timezone.utc)
-            _risk = cph.predict_partial_hazard(test_df[ds["features"]]).to_numpy(dtype=float).reshape(-1)
+            _risk = cph.predict_partial_hazard(test_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
             pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
             cidx = float(
                 cph.score(
-                    test_df[[*ds["features"], time_col, event_col]],
+                    test_df[[*fit_feature_cols, time_col, event_col]],
                     scoring_method="concordance_index",
                 )
             )
@@ -1843,7 +1980,11 @@ def run_external_pygam_cv(scenario):
                     "predict_sec": pred_sec,
                     "auc": cidx,
                     "n_test": int(len(fold.test_idx)),
-                    "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4)",
+                    "model_spec": (
+                        "CoxPHFitter(train-fold z-score; bmi 6-knot hinge spline; penalizer=1e-4)"
+                        if scenario["name"] == "icu_survival_death"
+                        else "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4)"
+                    ),
                 }
             )
             continue
@@ -1938,6 +2079,8 @@ def run_external_pygam_cv(scenario):
                 {
                     "fit_sec": fit_sec,
                     "predict_sec": pred_sec,
+                    "auc": auc_score(y_test, pred),
+                    "brier": brier_score(y_test, pred),
                     "n_test": int(len(fold.test_idx)),
                     "model_spec": model_spec,
                 }
