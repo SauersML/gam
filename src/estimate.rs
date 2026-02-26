@@ -438,12 +438,13 @@ impl RidgePlanner {
 }
 
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 
 const LAML_RIDGE: f64 = 1e-8;
+const MAX_PIRLS_CACHE_ENTRIES: usize = 128;
 /// Smallest penalized deviance value we allow when profiling the Gaussian scale.
 /// Prevents logarithms and divisions by nearly-zero D_p from destabilizing the
 /// REML objective and its gradient in near-perfect-fit regimes.
@@ -3191,6 +3192,56 @@ pub mod internal {
         }
     }
 
+    struct PirlsLruCache {
+        map: HashMap<Vec<u64>, Arc<PirlsResult>>,
+        order: VecDeque<Vec<u64>>,
+        capacity: usize,
+    }
+
+    impl PirlsLruCache {
+        fn new(capacity: usize) -> Self {
+            Self {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                capacity: capacity.max(1),
+            }
+        }
+
+        fn touch(&mut self, key: &Vec<u64>) {
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key.clone());
+        }
+
+        fn get(&mut self, key: &Vec<u64>) -> Option<Arc<PirlsResult>> {
+            let value = self.map.get(key).cloned();
+            if value.is_some() {
+                self.touch(key);
+            }
+            value
+        }
+
+        fn insert(&mut self, key: Vec<u64>, value: Arc<PirlsResult>) {
+            if self.map.contains_key(&key) {
+                self.map.insert(key.clone(), value);
+                self.touch(&key);
+                return;
+            }
+
+            while self.map.len() >= self.capacity {
+                if let Some(evict_key) = self.order.pop_front() {
+                    self.map.remove(&evict_key);
+                } else {
+                    break;
+                }
+            }
+
+            self.order.push_back(key.clone());
+            self.map.insert(key, value);
+        }
+    }
+
     pub(crate) struct RemlState<'a> {
         y: ArrayView1<'a, f64>,
         x: DesignMatrix,
@@ -3205,8 +3256,9 @@ pub mod internal {
         config: &'a RemlConfig,
         nullspace_dims: Vec<usize>,
 
-        cache: RwLock<HashMap<Vec<u64>, Arc<PirlsResult>>>,
+        cache: RwLock<PirlsLruCache>,
         faer_factor_cache: RwLock<HashMap<Vec<u64>, Arc<FaerFactor>>>,
+        pirls_cache_enabled: AtomicBool,
         eval_count: RwLock<u64>,
         last_cost: RwLock<f64>,
         last_grad_norm: RwLock<f64>,
@@ -3656,8 +3708,9 @@ pub mod internal {
                 p,
                 config,
                 nullspace_dims,
-                cache: RwLock::new(HashMap::new()),
+                cache: RwLock::new(PirlsLruCache::new(MAX_PIRLS_CACHE_ENTRIES)),
                 faer_factor_cache: RwLock::new(HashMap::new()),
+                pirls_cache_enabled: AtomicBool::new(true),
                 eval_count: RwLock::new(0),
                 last_cost: RwLock::new(f64::INFINITY),
                 last_grad_norm: RwLock::new(f64::INFINITY),
@@ -4183,13 +4236,12 @@ pub mod internal {
             &self,
             rho: &Array1<f64>,
         ) -> Result<Arc<PirlsResult>, EstimationError> {
+            let use_cache = self.pirls_cache_enabled.load(Ordering::Relaxed);
             // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
             let key_opt = self.rho_key_sanitized(rho);
-            if let Some(key) = &key_opt
-                && let Some(cached) = {
-                    let cache_ref = self.cache.read().unwrap();
-                    cache_ref.get(key).cloned()
-                }
+            if use_cache
+                && let Some(key) = &key_opt
+                && let Some(cached) = self.cache.write().unwrap().get(key)
             {
                 if self.warm_start_enabled.load(Ordering::Relaxed) {
                     self.update_warm_start_from(cached.as_ref());
@@ -4237,7 +4289,7 @@ pub mod internal {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
                     self.update_warm_start_from(pirls_result.as_ref());
                     // This is a successful fit. Cache only if key is valid (not NaN).
-                    if let Some(key) = key_opt {
+                    if use_cache && let Some(key) = key_opt {
                         self.cache
                             .write()
                             .unwrap()
@@ -5252,7 +5304,7 @@ pub mod internal {
             let rs_transposed = &reparam_result.rs_transposed;
 
             let includes_prior = false;
-            let (gradient_result, gradient_snapshot, _) = {
+            let (gradient_result, gradient_snapshot, applied_truncation_corrections) = {
                 let mut workspace_ref = self.workspace.lock().unwrap();
                 let workspace = &mut *workspace_ref;
                 let len = p.len();
@@ -5260,6 +5312,7 @@ pub mod internal {
                 workspace.set_lambda_values(p);
                 workspace.zero_cost_gradient(len);
                 let lambdas = workspace.lambda_view(len).to_owned();
+                let mut applied_truncation_corrections: Option<Vec<f64>> = None;
 
                 // Fixed structural-rank pseudo-determinant derivatives:
                 // d/dρ_k log|S|_+ and d²/(dρ_k dρ_ℓ) log|S|_+ are evaluated on a
@@ -5603,6 +5656,7 @@ pub mod internal {
                         workspace
                             .cost_gradient_view(len)
                             .assign(&Array1::from_vec(gaussian_grad));
+                        applied_truncation_corrections = Some(gaussian_corrections);
                     }
                     _ => {
                         // NON-GAUSSIAN LAML GRADIENT (exact in ρ, including dH/dρ third-derivative term)
@@ -5854,7 +5908,11 @@ pub mod internal {
                     Some(gradient_result.clone())
                 };
 
-                (gradient_result, gradient_snapshot, None::<Vec<f64>>)
+                (
+                    gradient_result,
+                    gradient_snapshot,
+                    applied_truncation_corrections,
+                )
             };
 
             // The gradient buffer stored in the workspace already holds -∇V(ρ),
@@ -5866,7 +5924,12 @@ pub mod internal {
                 && !p.is_empty()
             {
                 // Run all diagnostics and emit a single summary if issues found
-                self.run_gradient_diagnostics(p, bundle, &gradient_snapshot, None);
+                self.run_gradient_diagnostics(
+                    p,
+                    bundle,
+                    &gradient_snapshot,
+                    applied_truncation_corrections.as_deref(),
+                );
             }
 
             if self.should_use_stochastic_exact_gradient(bundle, &gradient_result) {
@@ -6956,7 +7019,9 @@ pub mod internal {
             let u_truncated = &reparam.u_truncated;
             let truncated_count = u_truncated.ncols();
 
-            if truncated_count > 0 {
+            if truncated_count > 0
+                && let Some(applied_values) = applied_truncation_corrections
+            {
                 let h_eff = bundle.h_eff.as_ref();
 
                 // Solve H⁻¹ U_⊥ for spectral bleed calculation
@@ -6967,9 +7032,7 @@ pub mod internal {
                     chol.solve_in_place(rhs_view.as_mut());
 
                     for (k, r_k) in reparam.rs_transformed.iter().enumerate() {
-                        let applied_correction = applied_truncation_corrections
-                            .and_then(|values| values.get(k).copied())
-                            .unwrap_or(0.0);
+                        let applied_correction = applied_values.get(k).copied().unwrap_or(0.0);
                         let bleed = compute_spectral_bleed(
                             k,
                             r_k.view(),
@@ -6989,6 +7052,21 @@ pub mod internal {
             // === Strategy 2: Component-wise FD (only if we detected other issues) ===
             // This is expensive, so only do it when other diagnostics flag problems
             if report.has_issues() {
+                struct CacheToggleGuard<'a> {
+                    flag: &'a AtomicBool,
+                    prev: bool,
+                }
+                impl Drop for CacheToggleGuard<'_> {
+                    fn drop(&mut self) {
+                        self.flag.store(self.prev, Ordering::Relaxed);
+                    }
+                }
+                let prev_cache = self.pirls_cache_enabled.swap(false, Ordering::Relaxed);
+                let _cache_guard = CacheToggleGuard {
+                    flag: &self.pirls_cache_enabled,
+                    prev: prev_cache,
+                };
+
                 let h = config.fd_step_size;
                 let mut numeric_grad = Array1::<f64>::zeros(rho.len());
 

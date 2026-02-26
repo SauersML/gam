@@ -13,7 +13,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from time import perf_counter
+from time import monotonic, perf_counter
 
 # Hard-force single-thread execution across Python/R/Rust/native math libs.
 _SERIAL_ENV_OVERRIDES = {
@@ -45,12 +45,132 @@ DATASET_DIR = BENCH_DIR / "datasets"
 CV_SPLITS = 5
 CV_SEED = 42
 _RUST_BIN_PATH: Path | None = None
+HEARTBEAT_INTERVAL_SEC = 15.0
 
 
 @dataclass(frozen=True)
 class Fold:
     train_idx: np.ndarray
     test_idx: np.ndarray
+
+
+def _fmt_kib(kib):
+    if kib is None:
+        return "n/a"
+    gib = float(kib) / (1024.0 * 1024.0)
+    return f"{gib:.2f} GiB"
+
+
+def _read_meminfo():
+    out = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                if not rest:
+                    continue
+                val = rest.strip().split()[0]
+                if val.isdigit():
+                    out[key] = int(val)
+    except Exception:
+        return {}
+    return out
+
+
+def _read_proc_status_kib(pid, key):
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8") as fh:
+            prefix = f"{key}:"
+            for line in fh:
+                if line.startswith(prefix):
+                    val = line.split(":", 1)[1].strip().split()[0]
+                    if val.isdigit():
+                        return int(val)
+    except Exception:
+        return None
+    return None
+
+
+def _read_cgroup_memory_kib():
+    paths = [
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ]
+    for current_path, max_path in paths:
+        try:
+            current_raw = Path(current_path).read_text(encoding="utf-8").strip()
+            max_raw = Path(max_path).read_text(encoding="utf-8").strip()
+            current_kib = int(current_raw) // 1024 if current_raw.isdigit() else None
+            if max_raw == "max":
+                max_kib = None
+            elif max_raw.isdigit():
+                max_kib = int(max_raw) // 1024
+            else:
+                max_kib = None
+            return current_kib, max_kib
+        except Exception:
+            continue
+    return None, None
+
+
+def _read_ps_snapshot(pid):
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "pid=,%cpu=,%mem=,rss=,vsz=,etimes=,stat=,comm="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        line = proc.stdout.strip()
+        if not line:
+            return {}
+        parts = line.split(None, 7)
+        if len(parts) < 8:
+            return {}
+        return {
+            "pid": parts[0],
+            "cpu_pct": parts[1],
+            "mem_pct": parts[2],
+            "rss_kib": int(parts[3]) if parts[3].isdigit() else None,
+            "vsz_kib": int(parts[4]) if parts[4].isdigit() else None,
+            "etimes": parts[5],
+            "stat": parts[6],
+            "comm": parts[7],
+        }
+    except Exception:
+        return {}
+
+
+def _heartbeat_loop(proc, cmd, stop_event, stats):
+    cmd_preview = " ".join(str(x) for x in cmd[:5])
+    if len(cmd) > 5:
+        cmd_preview += " ..."
+    start = monotonic()
+    while not stop_event.wait(HEARTBEAT_INTERVAL_SEC):
+        if proc.poll() is not None:
+            break
+        ps = _read_ps_snapshot(proc.pid)
+        rss_kib = ps.get("rss_kib")
+        if isinstance(rss_kib, int):
+            stats["peak_proc_rss_kib"] = max(stats.get("peak_proc_rss_kib", 0), rss_kib)
+        py_rss_kib = _read_proc_status_kib(os.getpid(), "VmRSS")
+        meminfo = _read_meminfo()
+        cg_cur_kib, cg_max_kib = _read_cgroup_memory_kib()
+        elapsed = monotonic() - start
+        load = os.getloadavg() if hasattr(os, "getloadavg") else (None, None, None)
+        line = (
+            f"[HEARTBEAT] elapsed={elapsed:8.1f}s cmd='{cmd_preview}' "
+            f"pid={proc.pid} p_cpu={ps.get('cpu_pct', 'n/a')}% p_mem={ps.get('mem_pct', 'n/a')}% "
+            f"p_rss={_fmt_kib(rss_kib)} p_vsz={_fmt_kib(ps.get('vsz_kib'))} "
+            f"py_rss={_fmt_kib(py_rss_kib)} "
+            f"sys_avail={_fmt_kib(meminfo.get('MemAvailable'))} "
+            f"swap_free={_fmt_kib(meminfo.get('SwapFree'))} "
+            f"cgroup={_fmt_kib(cg_cur_kib)}/{_fmt_kib(cg_max_kib)} "
+            f"load1={load[0] if load[0] is not None else 'n/a'}"
+        )
+        print(line, file=sys.stderr, flush=True)
+        stats["samples"] = stats.get("samples", 0) + 1
 
 
 def run_cmd(cmd, cwd=None):
@@ -68,6 +188,8 @@ def run_cmd(cmd, cwd=None):
 
     out_buf = []
     err_buf = []
+    hb_stop = threading.Event()
+    hb_stats = {"peak_proc_rss_kib": 0, "samples": 0}
 
     def _pump(stream, sink, buf):
         try:
@@ -80,11 +202,22 @@ def run_cmd(cmd, cwd=None):
 
     t_out = threading.Thread(target=_pump, args=(proc.stdout, sys.stdout, out_buf), daemon=True)
     t_err = threading.Thread(target=_pump, args=(proc.stderr, sys.stderr, err_buf), daemon=True)
+    t_hb = threading.Thread(target=_heartbeat_loop, args=(proc, cmd, hb_stop, hb_stats), daemon=True)
     t_out.start()
     t_err.start()
+    t_hb.start()
     rc = proc.wait()
+    hb_stop.set()
     t_out.join()
     t_err.join()
+    t_hb.join(timeout=1.0)
+    print(
+        f"[HEARTBEAT] command-exit rc={rc} pid={proc.pid} "
+        f"samples={hb_stats.get('samples', 0)} "
+        f"peak_proc_rss={_fmt_kib(hb_stats.get('peak_proc_rss_kib', 0))}",
+        file=sys.stderr,
+        flush=True,
+    )
     return rc, "".join(out_buf), "".join(err_buf)
 
 
@@ -2061,13 +2194,6 @@ def run_external_pygam_cv(scenario):
                     event_col=event_col,
                 )
             conv_warn = [w for w in wlist if issubclass(w.category, ConvergenceWarning)]
-            if conv_warn:
-                return {
-                    "contender": "python_lifelines",
-                    "scenario_name": scenario["name"],
-                    "status": "failed",
-                    "error": f"lifelines convergence warning: {str(conv_warn[0].message)}",
-                }
             fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
             pred_start = datetime.now(timezone.utc)
@@ -2082,6 +2208,11 @@ def run_external_pygam_cv(scenario):
                     "predict_sec": pred_sec,
                     "auc": cidx,
                     "n_test": int(len(fold.test_idx)),
+                    "warning": (
+                        f"lifelines convergence warning: {str(conv_warn[0].message)}"
+                        if conv_warn
+                        else None
+                    ),
                     "model_spec": (
                         "CoxPHFitter(train-fold z-score; bmi 6-knot hinge spline; penalizer=1e-4)"
                         if scenario["name"] == "icu_survival_death"
