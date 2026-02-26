@@ -215,109 +215,6 @@ impl PeeledHull {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ndarray::array;
-
-    fn unit_square_hull() -> PeeledHull {
-        // 0 <= x <= 1, 0 <= y <= 1
-        PeeledHull {
-            facets: vec![
-                (array![1.0, 0.0], 1.0),  // x <= 1
-                (array![-1.0, 0.0], 0.0), // -x <= 0 -> x >= 0
-                (array![0.0, 1.0], 1.0),  // y <= 1
-                (array![0.0, -1.0], 0.0), // -y <= 0 -> y >= 0
-            ],
-            dim: 2,
-        }
-    }
-
-    #[test]
-    fn test_is_inside_unit_square() {
-        let h = unit_square_hull();
-        assert!(h.is_inside(array![0.5, 0.5].view())); // inside
-        assert!(h.is_inside(array![1.0, 0.5].view())); // on edge
-        assert!(h.is_inside(array![0.0, 0.0].view())); // corner
-        assert!(!h.is_inside(array![1.1, 0.5].view())); // outside +x
-        assert!(!h.is_inside(array![-0.1, 0.5].view())); // outside -x
-        assert!(!h.is_inside(array![0.5, 1.1].view())); // outside +y
-        assert!(!h.is_inside(array![0.5, -0.1].view())); // outside -y
-    }
-
-    #[test]
-    fn test_project_point_unit_square() {
-        let h = unit_square_hull();
-        // Inside point stays unchanged
-        let p_in = array![0.5, 0.5];
-        let proj_in = h.project_point(p_in.view());
-        assert!((&proj_in - &p_in).mapv(|v| v.abs()).sum() < 1e-12);
-
-        // Project onto a face
-        let p_face = array![1.5, 0.5];
-        let proj_face = h.project_point(p_face.view());
-        assert!((&proj_face - &array![1.0, 0.5]).mapv(|v| v.abs()).sum() < 1e-8);
-
-        // Project onto a corner
-        let p_corner = array![1.5, -0.5];
-        let proj_corner = h.project_point(p_corner.view());
-        assert!((&proj_corner - &array![1.0, 0.0]).mapv(|v| v.abs()).sum() < 1e-6);
-    }
-
-    #[test]
-    fn test_project_if_needed_with_outliers() {
-        // Build a small 2D clustered training set in [-1, 1]^2
-        let mut pts = Vec::new();
-        for x in [-1.0, 0.0, 1.0] {
-            for y in [-1.0, 0.0, 1.0] {
-                pts.push([x, y]);
-            }
-        }
-        let data = ndarray::Array2::from(pts);
-        let hull = build_peeled_hull(&data, 2).expect("hull build failed");
-
-        // Mix of inside and outliers
-        let test = ndarray::arr2(&[[0.2, 0.2], [2.0, 2.0], [-2.0, -2.0]]);
-        let (corrected, num_proj) = hull.project_if_needed(test.view());
-        assert_eq!(num_proj, 2);
-        // First point unchanged
-        assert!(
-            (corrected.row(0).to_owned() - test.row(0).to_owned())
-                .mapv(|v| v.abs())
-                .sum()
-                < 1e-12
-        );
-        // All corrected points must be inside
-        for i in 0..corrected.nrows() {
-            assert!(hull.is_inside(corrected.row(i)));
-        }
-    }
-
-    #[test]
-    fn test_signed_distance_unit_square() {
-        let h = unit_square_hull();
-        // Inside center: nearest boundary at distance 0.5 (negative inside)
-        let d_center = h.signed_distance(array![0.5, 0.5].view());
-        assert!((d_center + 0.5).abs() < 1e-12);
-
-        // Inside near left edge: distance ~0.2 (negative)
-        let d_inside = h.signed_distance(array![0.2, 0.8].view());
-        assert!((d_inside + 0.2).abs() < 1e-12);
-
-        // On edge: exactly zero (treat as on/inside)
-        let d_edge = h.signed_distance(array![1.0, 0.3].view());
-        assert!(d_edge.abs() < 1e-12);
-
-        // Outside along +x: distance 0.5
-        let d_out_x = h.signed_distance(array![1.5, 0.5].view());
-        assert!((d_out_x - 0.5).abs() < 1e-8);
-
-        // Outside towards corner: distance sqrt(0.5^2 + 0.5^2)
-        let d_out_corner = h.signed_distance(array![1.5, -0.5].view());
-        assert!((d_out_corner - (0.5f64.hypot(0.5))).abs() < 1e-6);
-    }
-}
-
 /// Builds a peeled hull from data using iterative peeling with directional supports.
 /// This uses a fixed bank of direction vectors to compute supporting halfspaces and
 /// approximate the convex hull robustly without external dependencies.
@@ -456,4 +353,107 @@ fn extreme_point_indices(points: &Array2<f64>, directions: &[Array1<f64>]) -> Ve
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn unit_square_hull() -> PeeledHull {
+        // 0 <= x <= 1, 0 <= y <= 1
+        PeeledHull {
+            facets: vec![
+                (array![1.0, 0.0], 1.0),  // x <= 1
+                (array![-1.0, 0.0], 0.0), // -x <= 0 -> x >= 0
+                (array![0.0, 1.0], 1.0),  // y <= 1
+                (array![0.0, -1.0], 0.0), // -y <= 0 -> y >= 0
+            ],
+            dim: 2,
+        }
+    }
+
+    #[test]
+    fn test_is_inside_unit_square() {
+        let h = unit_square_hull();
+        assert!(h.is_inside(array![0.5, 0.5].view())); // inside
+        assert!(h.is_inside(array![1.0, 0.5].view())); // on edge
+        assert!(h.is_inside(array![0.0, 0.0].view())); // corner
+        assert!(!h.is_inside(array![1.1, 0.5].view())); // outside +x
+        assert!(!h.is_inside(array![-0.1, 0.5].view())); // outside -x
+        assert!(!h.is_inside(array![0.5, 1.1].view())); // outside +y
+        assert!(!h.is_inside(array![0.5, -0.1].view())); // outside -y
+    }
+
+    #[test]
+    fn test_project_point_unit_square() {
+        let h = unit_square_hull();
+        // Inside point stays unchanged
+        let p_in = array![0.5, 0.5];
+        let proj_in = h.project_point(p_in.view());
+        assert!((&proj_in - &p_in).mapv(|v| v.abs()).sum() < 1e-12);
+
+        // Project onto a face
+        let p_face = array![1.5, 0.5];
+        let proj_face = h.project_point(p_face.view());
+        assert!((&proj_face - &array![1.0, 0.5]).mapv(|v| v.abs()).sum() < 1e-8);
+
+        // Project onto a corner
+        let p_corner = array![1.5, -0.5];
+        let proj_corner = h.project_point(p_corner.view());
+        assert!((&proj_corner - &array![1.0, 0.0]).mapv(|v| v.abs()).sum() < 1e-6);
+    }
+
+    #[test]
+    fn test_project_if_needed_with_outliers() {
+        // Build a small 2D clustered training set in [-1, 1]^2
+        let mut pts = Vec::new();
+        for x in [-1.0, 0.0, 1.0] {
+            for y in [-1.0, 0.0, 1.0] {
+                pts.push([x, y]);
+            }
+        }
+        let data = ndarray::Array2::from(pts);
+        let hull = build_peeled_hull(&data, 2).expect("hull build failed");
+
+        // Mix of inside and outliers
+        let test = ndarray::arr2(&[[0.2, 0.2], [2.0, 2.0], [-2.0, -2.0]]);
+        let (corrected, num_proj) = hull.project_if_needed(test.view());
+        assert_eq!(num_proj, 2);
+        // First point unchanged
+        assert!(
+            (corrected.row(0).to_owned() - test.row(0).to_owned())
+                .mapv(|v| v.abs())
+                .sum()
+                < 1e-12
+        );
+        // All corrected points must be inside
+        for i in 0..corrected.nrows() {
+            assert!(hull.is_inside(corrected.row(i)));
+        }
+    }
+
+    #[test]
+    fn test_signed_distance_unit_square() {
+        let h = unit_square_hull();
+        // Inside center: nearest boundary at distance 0.5 (negative inside)
+        let d_center = h.signed_distance(array![0.5, 0.5].view());
+        assert!((d_center + 0.5).abs() < 1e-12);
+
+        // Inside near left edge: distance ~0.2 (negative)
+        let d_inside = h.signed_distance(array![0.2, 0.8].view());
+        assert!((d_inside + 0.2).abs() < 1e-12);
+
+        // On edge: exactly zero (treat as on/inside)
+        let d_edge = h.signed_distance(array![1.0, 0.3].view());
+        assert!(d_edge.abs() < 1e-12);
+
+        // Outside along +x: distance 0.5
+        let d_out_x = h.signed_distance(array![1.5, 0.5].view());
+        assert!((d_out_x - 0.5).abs() < 1e-8);
+
+        // Outside towards corner: distance sqrt(0.5^2 + 0.5^2)
+        let d_out_corner = h.signed_distance(array![1.5, -0.5].view());
+        assert!((d_out_corner - (0.5f64.hypot(0.5))).abs() < 1e-6);
+    }
 }

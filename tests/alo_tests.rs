@@ -1,10 +1,8 @@
+use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_pirls;
-use gam::faer_ndarray::{
-    FaerArrayView, FaerColView, factorize_symmetric_with_fallback, fast_ata,
-};
+use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetric_with_fallback, fast_ata};
 use gam::pirls::{self, PirlsConfig};
 use gam::types::{LinkFunction, LogSmoothingParamsView};
-use faer::Side;
 use ndarray::{Array1, Array2, Axis};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -317,8 +315,8 @@ fn alo_matches_true_loo_small_n_binomial_refit() {
 fn alo_error_is_driven_by_saturated_points() {
     let large = 12.0;
     let mut rows = Vec::new();
-    rows.extend(std::iter::repeat((-large, 0.0)).take(40));
-    rows.extend(std::iter::repeat((large, 1.0)).take(20));
+    rows.extend(std::iter::repeat_n((-large, 0.0), 40));
+    rows.extend(std::iter::repeat_n((large, 1.0), 20));
     rows.push((-large, 1.0));
     rows.push((large, 0.0));
 

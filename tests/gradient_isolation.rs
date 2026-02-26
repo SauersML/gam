@@ -46,6 +46,7 @@ fn default_logit_opts() -> ExternalOptimOptions {
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![1],
+        firth_bias_reduction: None,
     }
 }
 
@@ -148,7 +149,10 @@ fn optimizer_reduces_external_objective() {
     .map(|(c, _)| c)
     .expect("final cost");
 
-    assert!(c1 <= c0 + 1e-6, "optimizer did not improve cost: c0={c0} c1={c1}");
+    assert!(
+        c1 <= c0 + 1e-6,
+        "optimizer did not improve cost: c0={c0} c1={c1}"
+    );
 }
 
 #[test]
@@ -167,7 +171,10 @@ fn gradient_components_remain_finite_across_rho_sweep() {
             &array![rho],
         )
         .expect("sweep gradient");
-        assert!(analytic[0].is_finite(), "analytic gradient non-finite at rho={rho}");
+        assert!(
+            analytic[0].is_finite(),
+            "analytic gradient non-finite at rho={rho}"
+        );
         assert!(fd[0].is_finite(), "fd gradient non-finite at rho={rho}");
     }
 }

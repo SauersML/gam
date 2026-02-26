@@ -33,9 +33,13 @@ fn exact_gradient_optimizer_matches_fd_on_quadratic_objective() {
     };
 
     let fd_res = optimize_log_smoothing_with_multistart(2, None, objective, &opts).unwrap();
-    let exact_res =
-        optimize_log_smoothing_with_multistart_with_gradient(2, None, objective_with_gradient, &opts)
-            .unwrap();
+    let exact_res = optimize_log_smoothing_with_multistart_with_gradient(
+        2,
+        None,
+        objective_with_gradient,
+        &opts,
+    )
+    .unwrap();
 
     assert!((fd_res.rho[0] - 1.5).abs() < 1e-4);
     assert!((fd_res.rho[1] + 0.25).abs() < 1e-4);

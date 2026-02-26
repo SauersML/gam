@@ -919,11 +919,12 @@ fn check_rho_gradient_stationarity(
     let max_abs_rho = rho.iter().fold(0.0_f64, |acc, &val| acc.max(val.abs()));
 
     let tol_z = tol_z.max(1e-12);
-    let is_stationary = grad_norm_z <= tol_z;
-    if grad_norm_z > tol_z {
+    let tol_rho = tol_z;
+    let is_stationary = grad_norm_z <= tol_z && grad_norm_rho <= tol_rho;
+    if grad_norm_z > tol_z || grad_norm_rho > tol_rho {
         eprintln!(
-            "[Candidate {label}] z-space gradient norm {:.3e} exceeds tolerance {:.3e}; marking as non-stationary",
-            grad_norm_z, tol_z
+            "[Candidate {label}] stationarity check failed (||g_z||={:.3e}, ||g_rho||={:.3e}; tol_z={:.3e}, tol_rho={:.3e}); marking as non-stationary",
+            grad_norm_z, grad_norm_rho, tol_z, tol_rho
         );
     }
 
@@ -1198,13 +1199,12 @@ impl core::fmt::Debug for EstimationError {
     }
 }
 
-/// Train a joint single-index model with flexible link calibration
-///
-/// This uses the joint model architecture where the base predictor and
-/// flexible link are fitted together in one optimization with REML.
-///
-/// The model is: η = g(Xβ) where g is a learned flexible link function.
-
+// Train a joint single-index model with flexible link calibration.
+//
+// This uses the joint model architecture where the base predictor and
+// flexible link are fitted together in one optimization with REML.
+//
+// The model is: η = g(Xβ) where g is a learned flexible link function.
 // Domain-specific training orchestration is handled by caller adapters.
 // The gam engine exposes matrix/family-based APIs: fit_gam / optimize_external_design.
 
@@ -1243,14 +1243,22 @@ pub struct ExternalOptimOptions {
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
+    /// Optional explicit Firth override for binomial-logit external fitting.
+    /// - `Some(true)`: force Firth on
+    /// - `Some(false)`: force Firth off
+    /// - `None`: use family default behavior
+    pub firth_bias_reduction: Option<bool>,
 }
 
 fn resolve_external_family(
     family: crate::types::LikelihoodFamily,
+    firth_override: Option<bool>,
 ) -> Result<(LinkFunction, bool), EstimationError> {
     match family {
         crate::types::LikelihoodFamily::GaussianIdentity => Ok((LinkFunction::Identity, false)),
-        crate::types::LikelihoodFamily::BinomialLogit => Ok((LinkFunction::Logit, true)),
+        crate::types::LikelihoodFamily::BinomialLogit => {
+            Ok((LinkFunction::Logit, firth_override.unwrap_or(true)))
+        }
         crate::types::LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
         crate::types::LikelihoodFamily::BinomialCLogLog => Ok((LinkFunction::CLogLog, false)),
         crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
@@ -1599,7 +1607,7 @@ where
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "optimize_external_design")?;
     let k = s_list.len();
-    let (link, firth_active) = resolve_external_family(opts.family)?;
+    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
     let rs_list = compute_penalty_square_roots(&s_list)?;
@@ -1639,9 +1647,9 @@ where
         candidate_seeds.push(("fallback_zero".to_string(), to_z_from_rho(&primary_rho)));
     }
 
-    let mut best_solution: Option<OuterSolveResult> = None;
+    let mut best_stationary: Option<OuterSolveResult> = None;
+    let mut best_nonstationary: Option<OuterSolveResult> = None;
     let mut best_grad_norm = f64::INFINITY;
-    let mut found_stationary = false;
     let near_stationary_tol = (cfg.reml_convergence_tolerance.max(1e-12)) * 2.0;
     let use_newton = true;
     for (label, initial_z) in candidate_seeds {
@@ -1695,21 +1703,27 @@ where
                 stationary,
             }
         };
+        let grad_norm = solution.grad_norm_rho;
         if solution.stationary {
-            best_grad_norm = solution.grad_norm_rho;
-            best_solution = Some(solution);
-            found_stationary = true;
-            break;
+            let better = match &best_stationary {
+                None => true,
+                Some(current) => solution.final_value < current.final_value,
+            };
+            if better {
+                best_stationary = Some(solution);
+            }
+        } else {
+            let better = match &best_nonstationary {
+                None => true,
+                Some(current) => solution.final_value < current.final_value,
+            };
+            if better {
+                best_nonstationary = Some(solution);
+            }
         }
-        let better = match &best_solution {
-            None => true,
-            Some(current) => solution.final_value < current.final_value,
-        };
-        if better {
-            best_grad_norm = solution.grad_norm_rho;
-            best_solution = Some(solution);
-        }
-        if best_grad_norm <= near_stationary_tol {
+
+        best_grad_norm = best_grad_norm.min(grad_norm);
+        if best_stationary.is_some() && best_grad_norm <= near_stationary_tol {
             eprintln!(
                 "[external] early stop on near-stationary candidate (grad_norm={:.3e}, tol={:.3e})",
                 best_grad_norm, near_stationary_tol
@@ -1717,7 +1731,8 @@ where
             break;
         }
     }
-    let chosen_solution = best_solution.ok_or_else(|| {
+    let found_stationary = best_stationary.is_some();
+    let chosen_solution = best_stationary.or(best_nonstationary).ok_or_else(|| {
         EstimationError::RemlOptimizationFailed(
             "no valid BFGS solution produced by candidate seeds".to_string(),
         )
@@ -2088,13 +2103,55 @@ where
         ));
     }
     validate_full_size_penalties(s_list, x.ncols(), "fit_gam")?;
-    let ext_opts = ExternalOptimOptions {
+    let mut ext_opts = ExternalOptimOptions {
         family,
         max_iter: opts.max_iter,
         tol: opts.tol,
         nullspace_dims: opts.nullspace_dims.clone(),
+        firth_bias_reduction: None,
     };
-    let result = optimize_external_design(y, weights, &x, offset, s_list.to_vec(), &ext_opts)?;
+
+    let result = if matches!(family, crate::types::LikelihoodFamily::BinomialLogit) {
+        let weighted_events = y
+            .iter()
+            .zip(weights.iter())
+            .map(|(&yy, &ww)| yy.max(0.0).min(1.0) * ww.max(0.0))
+            .sum::<f64>();
+        let weighted_total = weights.iter().map(|w| w.max(0.0)).sum::<f64>();
+        let weighted_nonevents = (weighted_total - weighted_events).max(0.0);
+        let low_event_support = weighted_events.min(weighted_nonevents) < 20.0;
+
+        // Start without Firth unless support is clearly too small.
+        ext_opts.firth_bias_reduction = Some(low_event_support);
+        let first_try =
+            optimize_external_design(y, weights, &x, offset, s_list.to_vec(), &ext_opts);
+
+        match first_try {
+            Ok(res) => {
+                let unstable_status = matches!(
+                    res.pirls_status,
+                    crate::pirls::PirlsStatus::MaxIterationsReached
+                        | crate::pirls::PirlsStatus::Unstable
+                );
+                let extreme_eta = res.artifacts.pirls.max_abs_eta > 15.0;
+                if !low_event_support && (unstable_status || extreme_eta) {
+                    ext_opts.firth_bias_reduction = Some(true);
+                    optimize_external_design(y, weights, &x, offset, s_list.to_vec(), &ext_opts)?
+                } else {
+                    res
+                }
+            }
+            Err(err) => {
+                if low_event_support {
+                    return Err(err);
+                }
+                ext_opts.firth_bias_reduction = Some(true);
+                optimize_external_design(y, weights, &x, offset, s_list.to_vec(), &ext_opts)?
+            }
+        }
+    } else {
+        optimize_external_design(y, weights, &x, offset, s_list.to_vec(), &ext_opts)?
+    };
     Ok(FitResult {
         beta: result.beta,
         lambdas: result.lambdas,
@@ -2887,7 +2944,7 @@ where
     let p = x.ncols();
     validate_full_size_penalties(s_list, p, "evaluate_external_gradients")?;
 
-    let (link, firth_active) = resolve_external_family(opts.family)?;
+    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
@@ -2941,7 +2998,7 @@ where
     let p = x.ncols();
     validate_full_size_penalties(s_list, p, "evaluate_external_cost_and_ridge")?;
 
-    let (link, firth_active) = resolve_external_family(opts.family)?;
+    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let cfg = RemlConfig::external(link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
@@ -5751,8 +5808,9 @@ pub mod internal {
                             //   trace_third_k = (c ⊙ h)^T (X v_k) = r^T v_k.
                             // This removes the per-k O(np) multiply X*v_k from the hot loop.
                             let c_times_h = &c_vec * &leverage_h_pos;
-                            let r_third =
-                                pirls_result.x_transformed.transpose_vector_multiply(&c_times_h);
+                            let r_third = pirls_result
+                                .x_transformed
+                                .transpose_vector_multiply(&c_times_h);
 
                             // Batch all v_k = H_+^† (S_k beta) into one BLAS-3 path:
                             //   V = W (W^T [S_1 beta, ..., S_K beta]).

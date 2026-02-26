@@ -61,7 +61,9 @@ fn fit_beta_norm(
         None,
     )
     .expect("fit");
-    fit.beta_transformed.dot(fit.beta_transformed.as_ref()).sqrt()
+    fit.beta_transformed
+        .dot(fit.beta_transformed.as_ref())
+        .sqrt()
 }
 
 fn proxy_cost_with_pirls(
@@ -110,6 +112,7 @@ fn firth_fd_step_size_sensitivity() {
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![1],
+        firth_bias_reduction: None,
     };
     let base_rho = 12.0;
     let cost_at = |rho: f64| -> f64 {
@@ -142,7 +145,9 @@ fn firth_fd_step_size_sensitivity() {
 fn firth_beta_monotonicity_comparison() {
     let (x, y, w, s_list) = make_problem(31);
     let rs = compute_penalty_square_roots(&s_list).expect("roots");
-    let deltas = [-0.010_f64, -0.005, -0.002, -0.001, 0.0, 0.001, 0.002, 0.005, 0.010];
+    let deltas = [
+        -0.010_f64, -0.005, -0.002, -0.001, 0.0, 0.001, 0.002, 0.005, 0.010,
+    ];
     let betas_firth: Vec<f64> = deltas
         .iter()
         .map(|&d| fit_beta_norm(&x, &y, &w, &rs, 12.0 + d, true))

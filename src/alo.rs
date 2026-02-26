@@ -103,10 +103,10 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let k_view = FaerArrayView::new(&k);
 
     let factor = factorize_symmetric_with_fallback(k_view.as_ref(), Side::Lower).map_err(|_| {
-            EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            }
-        })?;
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        }
+    })?;
 
     let xt = x_dense.t();
 
@@ -420,6 +420,53 @@ fn compute_alo_diagnostics_from_pirls_impl(
     })
 }
 
+/// Compute ALO diagnostics (eta_tilde, SE, leverage) from a fitted GAM result.
+pub fn compute_alo_diagnostics_from_fit(
+    fit: &FitResult,
+    y: ArrayView1<f64>,
+    link: LinkFunction,
+) -> Result<AloDiagnostics, EstimationError> {
+    compute_alo_diagnostics_from_pirls_impl(&fit.artifacts.pirls, y, link, AloOptions::default())
+}
+
+/// Compute ALO diagnostics from a fitted GAM result (primary API).
+pub fn compute_alo_diagnostics(
+    fit: &FitResult,
+    y: ArrayView1<f64>,
+    link: LinkFunction,
+) -> Result<AloDiagnostics, EstimationError> {
+    compute_alo_diagnostics_from_fit(fit, y, link)
+}
+
+/// Compute ALO diagnostics from a fitted GAM result with explicit ALO options.
+pub fn compute_alo_diagnostics_with_options(
+    fit: &FitResult,
+    y: ArrayView1<f64>,
+    link: LinkFunction,
+    options: AloOptions,
+) -> Result<AloDiagnostics, EstimationError> {
+    compute_alo_diagnostics_from_pirls_impl(&fit.artifacts.pirls, y, link, options)
+}
+
+/// Compute ALO diagnostics from a PIRLS result for lower-level callers.
+pub fn compute_alo_diagnostics_from_pirls(
+    base: &pirls::PirlsResult,
+    y: ArrayView1<f64>,
+    link: LinkFunction,
+) -> Result<AloDiagnostics, EstimationError> {
+    compute_alo_diagnostics_from_pirls_impl(base, y, link, AloOptions::default())
+}
+
+/// Compute ALO diagnostics from a PIRLS result with explicit ALO options.
+pub fn compute_alo_diagnostics_from_pirls_with_options(
+    base: &pirls::PirlsResult,
+    y: ArrayView1<f64>,
+    link: LinkFunction,
+    options: AloOptions,
+) -> Result<AloDiagnostics, EstimationError> {
+    compute_alo_diagnostics_from_pirls_impl(base, y, link, options)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{alo_eta_update_with_offset, bayes_var_eta, sandwich_var_eta};
@@ -473,51 +520,4 @@ mod tests {
         let expected = phi * (x_hinv_x - es_norm2 - ridge * s_norm2);
         assert!((got - expected).abs() < 1e-12);
     }
-}
-
-/// Compute ALO diagnostics (eta_tilde, SE, leverage) from a fitted GAM result.
-pub fn compute_alo_diagnostics_from_fit(
-    fit: &FitResult,
-    y: ArrayView1<f64>,
-    link: LinkFunction,
-) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(&fit.artifacts.pirls, y, link, AloOptions::default())
-}
-
-/// Compute ALO diagnostics from a fitted GAM result (primary API).
-pub fn compute_alo_diagnostics(
-    fit: &FitResult,
-    y: ArrayView1<f64>,
-    link: LinkFunction,
-) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_fit(fit, y, link)
-}
-
-/// Compute ALO diagnostics from a fitted GAM result with explicit ALO options.
-pub fn compute_alo_diagnostics_with_options(
-    fit: &FitResult,
-    y: ArrayView1<f64>,
-    link: LinkFunction,
-    options: AloOptions,
-) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(&fit.artifacts.pirls, y, link, options)
-}
-
-/// Compute ALO diagnostics from a PIRLS result for lower-level callers.
-pub fn compute_alo_diagnostics_from_pirls(
-    base: &pirls::PirlsResult,
-    y: ArrayView1<f64>,
-    link: LinkFunction,
-) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(base, y, link, AloOptions::default())
-}
-
-/// Compute ALO diagnostics from a PIRLS result with explicit ALO options.
-pub fn compute_alo_diagnostics_from_pirls_with_options(
-    base: &pirls::PirlsResult,
-    y: ArrayView1<f64>,
-    link: LinkFunction,
-    options: AloOptions,
-) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(base, y, link, options)
 }

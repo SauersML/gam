@@ -1,53 +1,132 @@
-name: Benchmark
+name: Benchmark Suite
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [main]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - "benches/**"
-  push:
-    branches: [main]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - "benches/**"
+  schedule:
+    - cron: "0 4 * * *"
 
 env:
   CARGO_TERM_COLOR: always
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  R_LIBS_USER: ${{ github.workspace }}/.r-lib
 
 jobs:
-  benchmark:
-    name: Criterion Benchmarks
+  prepare:
+    name: Prepare benchmark matrix
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Detect benchmark targets
-        id: benches
+      - name: Build scenario matrix
+        id: matrix
         shell: bash
         run: |
-          if cargo metadata --no-deps --format-version 1 | jq -e '.packages[].targets[] | select(.kind[] == "bench")' >/dev/null; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          cfg = json.loads(Path("benchmarks/scenarios.json").read_text())
+          scenarios = cfg.get("scenarios", [])
+          include = [{"scenario": s["name"]} for s in scenarios if "name" in s]
+          if not include:
+              raise SystemExit("No benchmark scenarios found in benchmarks/scenarios.json")
+          matrix = {"include": include}
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          with out.open("a", encoding="utf-8") as fh:
+              fh.write(f"matrix={json.dumps(matrix)}\n")
+          print(json.dumps(matrix))
+          PY
 
-      - name: Run benchmarks
-        if: steps.benches.outputs.present == 'true'
-        run: cargo +nightly bench --all-features -- --noplot
+  bench-shard:
+    name: Bench ${{ matrix.scenario }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - name: Shared setup
+        uses: ./.github/actions/bench-setup
 
-      - name: Skip (no benchmark targets yet)
-        if: steps.benches.outputs.present != 'true'
-        run: echo "No [[bench]] targets found. Add benches/ to enable performance CI."
+      - name: Run scenario shard
+        shell: bash
+        run: |
+          mkdir -p benchmarks/results-shards
+          python3 bench/run_suite.py \
+            --scenarios benchmarks/scenarios.json \
+            --scenario-name "${{ matrix.scenario }}" \
+            --out "benchmarks/results-shards/${{ matrix.scenario }}.json"
+
+      - name: Upload shard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.scenario }}
+          path: benchmarks/results-shards/${{ matrix.scenario }}.json
+          if-no-files-found: error
+
+  aggregate:
+    name: Aggregate benchmark results
+    needs: bench-shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: benchmarks/artifacts
+
+      - name: Merge shard JSON outputs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          artifacts = Path("benchmarks/artifacts")
+          files = sorted(artifacts.rglob("*.json"))
+          if not files:
+              raise SystemExit("No shard artifacts found to merge.")
+
+          merged = []
+          for fp in files:
+              payload = json.loads(fp.read_text())
+              merged.extend(payload.get("results", []))
+
+          out = Path("benchmarks/results.nightly.json")
+          out.write_text(
+              json.dumps(
+                  {
+                      "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                      "results": merged,
+                  },
+                  indent=2,
+              )
+          )
+          print(f"Wrote {out} from {len(files)} shard files with {len(merged)} rows.")
+          PY
+
+      - name: Upload merged nightly results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-nightly
+          path: benchmarks/results.nightly.json
+          if-no-files-found: error

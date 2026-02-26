@@ -1,4 +1,8 @@
-use gam::estimate::{ExternalOptimOptions, evaluate_external_cost_and_ridge, evaluate_external_gradients};
+#![allow(clippy::too_many_arguments)]
+
+use gam::estimate::{
+    ExternalOptimOptions, evaluate_external_cost_and_ridge, evaluate_external_gradients,
+};
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -71,8 +75,8 @@ fn fd_gradient(
 
 #[test]
 fn test_log_det_gradient_formula() {
-    use gam::faer_ndarray::FaerCholesky;
     use faer::Side;
+    use gam::faer_ndarray::FaerCholesky;
 
     fn log_det_chol(mat: &Array2<f64>) -> Option<f64> {
         mat.cholesky(Side::Lower).ok().map(|chol| {
@@ -92,8 +96,8 @@ fn test_log_det_gradient_formula() {
             a_minus[[i, j]] -= h;
             a_plus[[j, i]] = a_plus[[i, j]];
             a_minus[[j, i]] = a_minus[[i, j]];
-            grad_fd[[i, j]] = (log_det_chol(&a_plus).unwrap() - log_det_chol(&a_minus).unwrap())
-                / (2.0 * h);
+            grad_fd[[i, j]] =
+                (log_det_chol(&a_plus).unwrap() - log_det_chol(&a_minus).unwrap()) / (2.0 * h);
         }
     }
 
@@ -141,8 +145,7 @@ fn test_laml_gradient_nonfirth_well_conditioned() {
     let x = build_design(42, n, p);
     let mut rng = StdRng::seed_from_u64(420);
     let beta = Array1::from_shape_fn(p, |j| if j == 0 { 0.3 } else { 0.5 / j as f64 });
-    let y =
-        x.dot(&beta) + Array1::from_shape_fn(n, |_| rng.random_range(-0.2..0.2));
+    let y = x.dot(&beta) + Array1::from_shape_fn(n, |_| rng.random_range(-0.2..0.2));
     let w = Array1::<f64>::ones(n);
     let offset = Array1::<f64>::zeros(n);
     let s_list = one_penalty(p);
@@ -151,6 +154,7 @@ fn test_laml_gradient_nonfirth_well_conditioned() {
         max_iter: 200,
         tol: 1e-10,
         nullspace_dims: vec![1],
+        firth_bias_reduction: None,
     };
     let rho = array![0.0];
     let (analytic, _) = evaluate_external_gradients(
@@ -168,7 +172,11 @@ fn test_laml_gradient_nonfirth_well_conditioned() {
     let dot = analytic.dot(&fd);
     let n_a = analytic.dot(&analytic).sqrt();
     let n_f = fd.dot(&fd).sqrt();
-    let cosine = if n_a * n_f > 1e-12 { dot / (n_a * n_f) } else { 1.0 };
+    let cosine = if n_a * n_f > 1e-12 {
+        dot / (n_a * n_f)
+    } else {
+        1.0
+    };
     let rel_l2 = (&analytic - &fd).mapv(|v| v * v).sum().sqrt() / n_f.max(n_a).max(1.0);
     assert!(cosine > 0.99, "cosine={cosine}");
     assert!(rel_l2 < 0.1, "rel_l2={rel_l2}");
@@ -180,7 +188,13 @@ fn test_laml_gradient_logit_with_firth_well_conditioned() {
     let p = 8;
     let x = build_design(123, n, p);
     let mut rng = StdRng::seed_from_u64(1234);
-    let beta = Array1::from_shape_fn(p, |j| if j == 0 { -0.2 } else { 0.35 / (j as f64).sqrt() });
+    let beta = Array1::from_shape_fn(p, |j| {
+        if j == 0 {
+            -0.2
+        } else {
+            0.35 / (j as f64).sqrt()
+        }
+    });
     let eta = x.dot(&beta);
     let y = eta.mapv(|e| {
         let prob = 1.0 / (1.0 + (-e).exp());
@@ -194,6 +208,7 @@ fn test_laml_gradient_logit_with_firth_well_conditioned() {
         max_iter: 200,
         tol: 1e-10,
         nullspace_dims: vec![1],
+        firth_bias_reduction: None,
     };
     let rho = array![0.0];
     let (analytic, _) = evaluate_external_gradients(
@@ -211,7 +226,11 @@ fn test_laml_gradient_logit_with_firth_well_conditioned() {
     let dot = analytic.dot(&fd);
     let n_a = analytic.dot(&analytic).sqrt();
     let n_f = fd.dot(&fd).sqrt();
-    let cosine = if n_a * n_f > 1e-12 { dot / (n_a * n_f) } else { 1.0 };
+    let cosine = if n_a * n_f > 1e-12 {
+        dot / (n_a * n_f)
+    } else {
+        1.0
+    };
     let rel_l2 = (&analytic - &fd).mapv(|v| v * v).sum().sqrt() / n_f.max(n_a).max(1.0);
     assert!(cosine > 0.95, "cosine={cosine}");
     assert!(rel_l2 < 0.2, "rel_l2={rel_l2}");
@@ -224,8 +243,13 @@ fn stress_test_firth_gradient_vs_conditioning() {
     for (n, p) in configs {
         let x = build_design(999 + n as u64 + p as u64, n, p);
         let mut rng = StdRng::seed_from_u64(9999 + n as u64);
-        let beta =
-            Array1::from_shape_fn(p, |j| if j == 0 { 0.0 } else { 0.25 / (j as f64).sqrt() });
+        let beta = Array1::from_shape_fn(p, |j| {
+            if j == 0 {
+                0.0
+            } else {
+                0.25 / (j as f64).sqrt()
+            }
+        });
         let eta = x.dot(&beta);
         let y = eta.mapv(|e| {
             let prob = 1.0 / (1.0 + (-e).exp());
@@ -239,6 +263,7 @@ fn stress_test_firth_gradient_vs_conditioning() {
             max_iter: 150,
             tol: 1e-8,
             nullspace_dims: vec![1],
+            firth_bias_reduction: None,
         };
         let rho = array![0.0];
         let Ok((analytic, _)) = evaluate_external_gradients(
@@ -256,7 +281,11 @@ fn stress_test_firth_gradient_vs_conditioning() {
         let dot = analytic.dot(&fd);
         let n_a = analytic.dot(&analytic).sqrt();
         let n_f = fd.dot(&fd).sqrt();
-        let cosine = if n_a * n_f > 1e-12 { dot / (n_a * n_f) } else { 1.0 };
+        let cosine = if n_a * n_f > 1e-12 {
+            dot / (n_a * n_f)
+        } else {
+            1.0
+        };
         let max_a = analytic.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         if cosine > 0.9 && max_a < 1e8 {
             saw_ok = true;
