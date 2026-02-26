@@ -9,8 +9,8 @@ What it does:
 - Produces a single HTML report with a flamegraph (if inferno is installed)
   and a filtered raw-text perf call-graph report under it.
 
-Outputs are written under bench/parity and bench/parity/bench_workdir.
-Run simply as:  python3 bench/parity/bench.py
+Outputs are written under tests/bench_tools and tests/bench_tools/bench_workdir.
+Run simply as:  python3 tests/bench_tools/bench.py
 """
 
 import os
@@ -29,7 +29,7 @@ import mgcv  # same directory import
 
 # Paths
 SCRIPT_DIR = Path(__file__).resolve().parent
-# repo root from tests/parity/
+# repo root from tests/bench_tools/
 WORKSPACE_ROOT = SCRIPT_DIR.parent.parent
 WORKDIR = SCRIPT_DIR / "bench_workdir"
 WORKDIR.mkdir(exist_ok=True)

@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -577,10 +578,300 @@ def _synthetic_binomial_dataset(n, p, seed):
     }
 
 
+def _synthetic_geo_disease_dataset(n=4000, seed=20260226):
+    n = int(max(500, n))
+    rng = np.random.default_rng(int(seed))
+
+    # Hidden geospatial drivers (never exposed as model features).
+    lat = rng.uniform(-1.0, 1.0, size=n)
+    lon = rng.uniform(-1.0, 1.0, size=n)
+
+    # Disease prevalence is highest near the equator (lat ~= 0).
+    equator_closeness = 1.0 - np.abs(lat)
+    geo_signal = (
+        -1.00
+        + 2.20 * equator_closeness
+        + 0.55 * np.sin(np.pi * lon)
+        + 0.35 * np.cos(2.25 * np.pi * lon)
+        + 0.30 * np.sin(2.0 * np.pi * equator_closeness * lon)
+    )
+
+    # Heteroscedastic latent noise: stronger farther south (lat < 0).
+    southness = np.clip(-lat, 0.0, 1.0)
+    eta_noise_sd = 0.20 + 0.85 * (southness**1.35)
+    eta = geo_signal + rng.normal(0.0, eta_noise_sd, size=n)
+    pr = 1.0 / (1.0 + np.exp(-eta))
+    y = (rng.random(n) < pr).astype(float)
+
+    # PCs are noisy transforms of hidden geo variables.
+    rows = []
+    for i in range(n):
+        row = {}
+        for j in range(16):
+            a = 0.95 - 0.045 * j
+            b = 0.25 + 0.035 * j
+            c = ((-1.0) ** j) * (0.10 + 0.01 * j)
+            noise_sd = 0.15 + 0.015 * j
+            pc = a * lat[i] + b * lon[i] + c * lat[i] * lon[i] + rng.normal(0.0, noise_sd)
+            row[f"pc{j + 1}"] = float(pc)
+        row["y"] = float(y[i])
+        rows.append(row)
+
+    return {
+        "family": "binomial",
+        "rows": rows,
+        "features": [f"pc{i}" for i in range(1, 17)],
+        "target": "y",
+    }
+
+
+def _synthetic_geo_disease_eas_dataset(n=6000, seed=20260301, n_pcs=16):
+    n = int(max(1000, n))
+    n_pcs = int(max(3, n_pcs))
+    rng = np.random.default_rng(int(seed))
+
+    # Hidden superpopulation assignment.
+    eas = rng.random(n) < 0.23
+    n_eas = int(np.sum(eas))
+
+    # Hidden geographic coordinates.
+    lat = rng.uniform(-55.0, 70.0, size=n)
+    lon = rng.uniform(-175.0, 175.0, size=n)
+
+    # East Asia geographic region for the EAS superpopulation.
+    lat[eas] = rng.uniform(15.0, 52.0, size=n_eas)
+    lon[eas] = rng.uniform(95.0, 145.0, size=n_eas)
+
+    eta = np.full(n, math.log(0.02 / 0.98), dtype=float)
+    eta[eas] = math.log(0.10 / 0.90)
+
+    # Massive longitude/latitude effects are EAS-only by construction.
+    lat_e = (lat[eas] - 33.5) / 11.0
+    lon_e = (lon[eas] - 120.0) / 10.0
+    eas_geo_signal = (
+        3.25 * np.sin(1.35 * lat_e)
+        - 2.85 * np.cos(1.55 * lon_e)
+        + 2.50 * np.sin(1.10 * lat_e * lon_e)
+        + 1.90 * np.cos(1.60 * lat_e + 0.45 * lon_e)
+    )
+    eas_geo_signal = eas_geo_signal - float(np.mean(eas_geo_signal))
+    eta[eas] = eta[eas] + eas_geo_signal + rng.normal(0.0, 0.20, size=n_eas)
+    eta[~eas] = eta[~eas] + rng.normal(0.0, 0.08, size=int(np.sum(~eas)))
+
+    pr = 1.0 / (1.0 + np.exp(-eta))
+    y = (rng.random(n) < pr).astype(float)
+
+    lat_s = lat / 90.0
+    lon_s = lon / 180.0
+
+    rows = []
+    for i in range(n):
+        row = {}
+        for j in range(n_pcs):
+            a = 0.98 - 0.05 * j
+            b = 0.26 + 0.03 * j
+            c = ((-1.0) ** j) * (0.12 + 0.01 * j)
+            d = 0.22 if j >= 8 else 0.06
+            noise_sd = 0.13 + 0.018 * j
+            pc = (
+                a * lat_s[i]
+                + b * lon_s[i]
+                + c * lat_s[i] * lon_s[i]
+                + d * float(eas[i])
+                + rng.normal(0.0, noise_sd)
+            )
+            row[f"pc{j + 1}"] = float(pc)
+        row["y"] = float(y[i])
+        rows.append(row)
+
+    return {
+        "family": "binomial",
+        "rows": rows,
+        "features": [f"pc{i}" for i in range(1, n_pcs + 1)],
+        "target": "y",
+    }
+
+
+def _geo_disease_eas_scenario_cfg(name):
+    m = re.match(r"^geo_disease_(eas|eas3)_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
+    if m is None:
+        return None
+    family_code = m.group(1)
+    basis_code = m.group(2)
+    knots = max(4, int(m.group(3)))
+    n_pcs = 3 if family_code == "eas3" else 16
+    smooth_pcs = 3 if n_pcs == 3 else 3
+    linear_start = smooth_pcs + 1
+    if basis_code == "tp":
+        return {
+            "smooth_basis": "thinplate",
+            "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+            "linear_cols": [f"pc{i}" for i in range(linear_start, n_pcs + 1)],
+            "knots": knots,
+            "basis_code": basis_code,
+            "n_pcs": n_pcs,
+        }
+    if basis_code == "duchon":
+        return {
+            "smooth_basis": "duchon",
+            "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+            "linear_cols": [f"pc{i}" for i in range(linear_start, n_pcs + 1)],
+            "knots": knots,
+            "basis_code": basis_code,
+            "n_pcs": n_pcs,
+        }
+    if basis_code == "matern":
+        return {
+            "smooth_basis": "matern",
+            "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+            "linear_cols": [f"pc{i}" for i in range(linear_start, n_pcs + 1)],
+            "knots": knots,
+            "basis_code": basis_code,
+            "n_pcs": n_pcs,
+        }
+    return {
+        "smooth_basis": "bspline_per_pc",
+        "smooth_cols": [f"pc{i}" for i in range(1, n_pcs + 1)],
+        "linear_cols": [],
+        "knots": knots,
+        "basis_code": basis_code,
+        "n_pcs": n_pcs,
+    }
+
+
+def _papuan_oce_scenario_cfg(name):
+    m = re.match(r"^papuan_oce(4)?_(tp|duchon|matern|psperpc)(_basic)?_k([0-9]+)$", str(name))
+    if m is None:
+        return None
+    is_four_pc = m.group(1) is not None
+    basis_code = m.group(2)
+    is_basic = m.group(3) is not None
+    knots = max(4, int(m.group(4)))
+    n_pcs = 4 if is_four_pc else 16
+    if basis_code == "psperpc":
+        return {
+            "smooth_basis": "bspline_per_pc",
+            "smooth_cols": [f"pc{i}" for i in range(1, n_pcs + 1)],
+            "linear_cols": [],
+            "knots": knots,
+            "basis_code": basis_code,
+            "n_pcs": n_pcs,
+            "is_basic": is_basic,
+        }
+    smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
+    return {
+        "smooth_basis": smooth_basis,
+        "smooth_cols": [f"pc{i}" for i in range(1, min(3, n_pcs) + 1)],
+        "linear_cols": [f"pc{i}" for i in range(min(3, n_pcs) + 1, n_pcs + 1)],
+        "knots": knots,
+        "basis_code": basis_code,
+        "n_pcs": n_pcs,
+        "is_basic": is_basic,
+    }
+
+
+def _compute_pcs_from_genotypes(g, n_pcs=16):
+    # Proper PCA from standardized genotype-like matrix using SVD.
+    n = g.shape[0]
+    x = g.astype(float)
+    mu = x.mean(axis=0, keepdims=True)
+    sd = x.std(axis=0, ddof=1, keepdims=True)
+    sd[~np.isfinite(sd) | (sd < 1e-8)] = 1.0
+    x = (x - mu) / sd
+    u, s, _ = np.linalg.svd(x, full_matrices=False)
+    k = min(int(n_pcs), u.shape[1])
+    pcs = u[:, :k] * s[:k]
+    pcs = pcs / max(math.sqrt(max(n - 1, 1)), 1.0)
+    pcs_mu = pcs.mean(axis=0, keepdims=True)
+    pcs_sd = pcs.std(axis=0, ddof=1, keepdims=True)
+    pcs_sd[~np.isfinite(pcs_sd) | (pcs_sd < 1e-8)] = 1.0
+    return (pcs - pcs_mu) / pcs_sd
+
+
+def _synthetic_papuan_oce_dataset(n=6000, seed=20260315, n_pcs=16):
+    n = int(max(1200, n))
+    rng = np.random.default_rng(int(seed))
+
+    # Hidden group assignment only; labels are never emitted as model features.
+    groups = [
+        ("Papuan", 0.12),
+        ("Papuan Sepik", 0.08),
+        ("Papuan,Papuan Highlands", 0.06),
+        ("Papuan,Papuan Sepik", 0.06),
+        ("Bougainville", 0.08),
+        ("Han", 0.17),
+        ("Japanese", 0.10),
+        ("CEU", 0.14),
+        ("Yoruba", 0.11),
+        ("Pima", 0.08),
+    ]
+    names = [g[0] for g in groups]
+    probs = np.array([g[1] for g in groups], dtype=float)
+    probs = probs / probs.sum()
+    pop_idx = rng.choice(len(names), size=n, p=probs)
+    pop = np.array([names[i] for i in pop_idx], dtype=object)
+
+    # Latent ancestry coordinates and genotype-like matrix.
+    centers = {
+        "Papuan": np.array([2.7, -0.8, 1.7, 0.7]),
+        "Papuan Sepik": np.array([3.0, -0.6, 1.5, 0.8]),
+        "Papuan,Papuan Highlands": np.array([2.9, -0.3, 1.9, 0.4]),
+        "Papuan,Papuan Sepik": np.array([3.1, -0.5, 1.6, 0.8]),
+        "Bougainville": np.array([2.5, -1.0, 1.8, 0.5]),
+        "Han": np.array([0.4, 2.0, -0.1, 0.2]),
+        "Japanese": np.array([0.7, 1.8, -0.2, 0.1]),
+        "CEU": np.array([-2.1, 0.4, 0.1, -0.2]),
+        "Yoruba": np.array([-1.9, -2.2, 0.5, 0.0]),
+        "Pima": np.array([-0.3, -0.9, -1.6, 0.4]),
+    }
+
+    z = np.zeros((n, 4), dtype=float)
+    for i in range(n):
+        z[i] = centers[str(pop[i])] + rng.normal(0.0, 0.55, size=4)
+
+    n_snps = 700
+    loadings = rng.normal(0.0, 0.28, size=(4, n_snps))
+    logits = -0.2 + z @ loadings + rng.normal(0.0, 0.35, size=(n, n_snps))
+    p = 1.0 / (1.0 + np.exp(-np.clip(logits, -10.0, 10.0)))
+    g = rng.binomial(2, p).astype(float)
+
+    pcs = _compute_pcs_from_genotypes(g, n_pcs=max(3, int(n_pcs)))
+    if pcs.shape[1] < n_pcs:
+        pcs = np.concatenate([pcs, np.zeros((n, n_pcs - pcs.shape[1]), dtype=float)], axis=1)
+
+    # Prevalence: 0.4 in Papuan* and Bougainville; 0.02 in all others.
+    high_risk = np.array([("Papuan" in str(lbl)) or (str(lbl) == "Bougainville") for lbl in pop], dtype=bool)
+    prevalence = np.where(high_risk, 0.40, 0.02)
+    y = (rng.random(n) < prevalence).astype(float)
+
+    rows = []
+    for i in range(n):
+        row = {f"pc{j + 1}": float(pcs[i, j]) for j in range(int(n_pcs))}
+        row["y"] = float(y[i])
+        rows.append(row)
+
+    return {
+        "family": "binomial",
+        "rows": rows,
+        "features": [f"pc{i}" for i in range(1, int(n_pcs) + 1)],
+        "target": "y",
+    }
+
+
 def dataset_for_scenario(s):
     name = s["name"]
     if name in {"small_dense", "medium", "pathological_ill_conditioned"}:
         return _synthetic_binomial_dataset(s["n"], s["p"], s.get("seed", 42))
+    if name.startswith("geo_disease_eas3_"):
+        return _synthetic_geo_disease_eas_dataset(s.get("n", 6000), s.get("seed", 20260301), n_pcs=3)
+    if name.startswith("geo_disease_eas_"):
+        return _synthetic_geo_disease_eas_dataset(s.get("n", 6000), s.get("seed", 20260301))
+    if name.startswith("papuan_oce4_"):
+        return _synthetic_papuan_oce_dataset(s.get("n", 6000), s.get("seed", 20260315), n_pcs=4)
+    if name.startswith("papuan_oce_"):
+        return _synthetic_papuan_oce_dataset(s.get("n", 6000), s.get("seed", 20260315), n_pcs=16)
+    if name.startswith("geo_disease_"):
+        return _synthetic_geo_disease_dataset(s.get("n", 4000), s.get("seed", 20260226))
     if name == "lidar_semipar":
         return _load_lidar_dataset()
     if name == "bone_gamair":
@@ -703,7 +994,28 @@ def rust_cli_cv_args(scenario_name, ds):
             ds["event_col"],
         ]
 
-    cfg = {
+    geo_eas_cfg = _geo_disease_eas_scenario_cfg(scenario_name)
+    papuan_cfg = _papuan_oce_scenario_cfg(scenario_name)
+    if geo_eas_cfg is not None:
+        cfg = {
+            "family": "binomial",
+            "smooth_cols": geo_eas_cfg["smooth_cols"],
+            "smooth_basis": geo_eas_cfg["smooth_basis"],
+            "linear_cols": geo_eas_cfg["linear_cols"],
+            "knots": geo_eas_cfg["knots"],
+            "double_penalty": True,
+        }
+    elif papuan_cfg is not None:
+        cfg = {
+            "family": "binomial",
+            "smooth_cols": papuan_cfg["smooth_cols"],
+            "smooth_basis": papuan_cfg["smooth_basis"],
+            "linear_cols": papuan_cfg["linear_cols"],
+            "knots": papuan_cfg["knots"],
+            "double_penalty": not papuan_cfg["is_basic"],
+        }
+    else:
+        cfg = {
         "small_dense": dict(family="binomial", smooth_col="x2", linear_cols=["x1"], knots=7, double_penalty=True),
         "medium": dict(family="binomial", smooth_col="x2", linear_cols=["x1"], knots=7, double_penalty=True),
         "pathological_ill_conditioned": dict(
@@ -763,17 +1075,88 @@ def rust_cli_cv_args(scenario_name, ds):
             knots=7,
             double_penalty=False,
         ),
-    }.get(scenario_name)
+        "geo_disease_tp": dict(
+            family="binomial",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="thinplate",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+            double_penalty=True,
+        ),
+        "geo_disease_tp_basic": dict(
+            family="binomial",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="thinplate",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+            double_penalty=False,
+        ),
+        "geo_disease_duchon": dict(
+            family="binomial",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="duchon",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+            double_penalty=True,
+        ),
+        "geo_disease_duchon_basic": dict(
+            family="binomial",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="duchon",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+            double_penalty=False,
+        ),
+        "geo_disease_matern": dict(
+            family="binomial",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="matern",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+            double_penalty=True,
+        ),
+        # Backward-compatible alias.
+        "geo_disease_shrinkage": dict(
+            family="binomial",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="matern",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+            double_penalty=True,
+        ),
+        "geo_disease_matern_basic": dict(
+            family="binomial",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="matern",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=12,
+            double_penalty=False,
+        ),
+        "geo_disease_ps_per_pc": dict(
+            family="binomial",
+            smooth_cols=[f"pc{i}" for i in range(1, 17)],
+            smooth_basis="bspline_per_pc",
+            linear_cols=[],
+            knots=10,
+            double_penalty=True,
+        ),
+        "geo_disease_ps_per_pc_basic": dict(
+            family="binomial",
+            smooth_cols=[f"pc{i}" for i in range(1, 17)],
+            smooth_basis="bspline_per_pc",
+            linear_cols=[],
+            knots=10,
+            double_penalty=False,
+        ),
+        }.get(scenario_name)
     if cfg is None:
         raise RuntimeError(f"No Rust CLI CV mapping configured for scenario '{scenario_name}'")
 
-    return [
+    args = [
         "--family",
         cfg["family"],
         "--target-col",
         ds["target"],
-        "--smooth-col",
-        cfg["smooth_col"],
         "--linear-cols",
         ",".join(cfg["linear_cols"]),
         "--num-internal-knots",
@@ -781,6 +1164,14 @@ def rust_cli_cv_args(scenario_name, ds):
         "--double-penalty",
         "true" if cfg["double_penalty"] else "false",
     ]
+    if cfg.get("smooth_basis"):
+        args.extend(["--smooth-basis", cfg["smooth_basis"]])
+    smooth_cols = cfg.get("smooth_cols")
+    if smooth_cols:
+        args.extend(["--smooth-cols", ",".join(smooth_cols)])
+    else:
+        args.extend(["--smooth-col", cfg["smooth_col"]])
+    return args
 
 
 def run_rust_scenario_cv(scenario):
@@ -968,12 +1359,79 @@ if (family_name == "survival") {
   ftxt <- "y ~ rectal_temp + s(pulse, bs='ps', k=min(8, nrow(train_df)-1)) + packed_cell_volume"
 } else if (scenario_name == "haberman_survival") {
   ftxt <- "y ~ age + op_year + s(axil_nodes, bs='ps', k=min(8, nrow(train_df)-1))"
+} else if (scenario_name == "geo_disease_tp" || scenario_name == "geo_disease_tp_basic") {
+  ftxt <- paste(
+    "y ~",
+    "s(pc1, bs='tp', k=min(12, nrow(train_df)-1)) +",
+    "s(pc2, bs='tp', k=min(12, nrow(train_df)-1)) +",
+    "s(pc3, bs='tp', k=min(12, nrow(train_df)-1)) +",
+    "s(pc4, bs='tp', k=min(12, nrow(train_df)-1)) +",
+    paste(sprintf("pc%d", 5:16), collapse = " + ")
+  )
+} else if (scenario_name == "geo_disease_duchon" || scenario_name == "geo_disease_duchon_basic") {
+  ftxt <- paste(
+    "y ~",
+    "s(pc1, bs='ds', k=min(12, nrow(train_df)-1)) +",
+    "s(pc2, bs='ds', k=min(12, nrow(train_df)-1)) +",
+    "s(pc3, bs='ds', k=min(12, nrow(train_df)-1)) +",
+    "s(pc4, bs='ds', k=min(12, nrow(train_df)-1)) +",
+    paste(sprintf("pc%d", 5:16), collapse = " + ")
+  )
+} else if (scenario_name == "geo_disease_shrinkage" || scenario_name == "geo_disease_matern" || scenario_name == "geo_disease_matern_basic") {
+  ftxt <- paste(
+    "y ~",
+    "s(pc1, bs='ts', k=min(12, nrow(train_df)-1)) +",
+    "s(pc2, bs='ts', k=min(12, nrow(train_df)-1)) +",
+    "s(pc3, bs='ts', k=min(12, nrow(train_df)-1)) +",
+    "s(pc4, bs='ts', k=min(12, nrow(train_df)-1)) +",
+    paste(sprintf("pc%d", 5:16), collapse = " + ")
+  )
+} else if (scenario_name == "geo_disease_ps_per_pc" || scenario_name == "geo_disease_ps_per_pc_basic") {
+  ftxt <- paste("y ~", paste(sprintf("s(pc%d, bs='ps', k=min(10, nrow(train_df)-1))", 1:16), collapse = " + "))
+} else if (grepl("^geo_disease_eas3?_", scenario_name)) {
+  match <- regmatches(scenario_name, regexec("^geo_disease_(eas|eas3)_(tp|duchon|matern|psperpc)_k([0-9]+)$", scenario_name))[[1]]
+  if (length(match) != 4) stop(sprintf("Invalid geo_disease_eas/eas3 scenario name: %s", scenario_name))
+  family_code <- match[2]
+  basis_code <- match[3]
+  k_raw <- as.integer(match[4])
+  n_pcs <- if (family_code == "eas3") 3 else 16
+  if (!is.finite(k_raw) || k_raw < 4) k_raw <- 4
+  if (basis_code == "psperpc") {
+    ftxt <- paste("y ~", paste(sprintf("s(pc%d, bs='ps', k=min(%d, nrow(train_df)-1))", 1:n_pcs, k_raw), collapse = " + "))
+  } else {
+    bs_code <- if (basis_code == "tp") "tp" else if (basis_code == "duchon") "ds" else "ts"
+    smooth_terms <- paste(sprintf("s(pc%d, bs='%s', k=min(%d, nrow(train_df)-1))", 1:3, bs_code, k_raw), collapse = " + ")
+    linear_terms <- if (n_pcs > 3) paste(sprintf("pc%d", 4:n_pcs), collapse = " + ") else ""
+    rhs <- if (nchar(linear_terms) > 0) paste(smooth_terms, linear_terms, sep = " + ") else smooth_terms
+    ftxt <- paste(
+      "y ~", rhs
+    )
+  }
+} else if (grepl("^papuan_oce4?_", scenario_name)) {
+  match <- regmatches(scenario_name, regexec("^papuan_oce(4)?_(tp|duchon|matern|psperpc)(_basic)?_k([0-9]+)$", scenario_name))[[1]]
+  if (length(match) != 5) stop(sprintf("Invalid papuan_oce scenario name: %s", scenario_name))
+  family_code <- match[2]
+  basis_code <- match[3]
+  k_raw <- as.integer(match[5])
+  n_pcs <- if (family_code == "4") 4 else 16
+  if (!is.finite(k_raw) || k_raw < 4) k_raw <- 4
+  if (basis_code == "psperpc") {
+    ftxt <- paste("y ~", paste(sprintf("s(pc%d, bs='ps', k=min(%d, nrow(train_df)-1))", 1:n_pcs, k_raw), collapse = " + "))
+  } else {
+    bs_code <- if (basis_code == "tp") "tp" else if (basis_code == "duchon") "ds" else "ts"
+    smooth_hi <- min(3, n_pcs)
+    smooth_terms <- paste(sprintf("s(pc%d, bs='%s', k=min(%d, nrow(train_df)-1))", 1:smooth_hi, bs_code, k_raw), collapse = " + ")
+    linear_terms <- if (n_pcs > smooth_hi) paste(sprintf("pc%d", (smooth_hi + 1):n_pcs), collapse = " + ") else ""
+    rhs <- if (nchar(linear_terms) > 0) paste(smooth_terms, linear_terms, sep = " + ") else smooth_terms
+    ftxt <- paste("y ~", rhs)
+  }
 } else {
   ftxt <- "y ~ x1 + s(x2, bs='ps', k=min(8, nrow(train_df)-1))"
 }
 
 t0 <- proc.time()[["elapsed"]]
-fit <- gam(as.formula(ftxt), family=fam, data=train_df, method="REML")
+use_select <- !grepl("_basic$", scenario_name)
+fit <- gam(as.formula(ftxt), family=fam, data=train_df, method="REML", select=use_select)
 fit_sec <- proc.time()[["elapsed"]] - t0
 
 pred_t0 <- proc.time()[["elapsed"]]
@@ -1122,6 +1580,68 @@ def run_external_pygam_cv(scenario):
             if x.shape[1] == 1:
                 model = LogisticGAM(s(0, n_splines=8))
                 model_spec = "LogisticGAM(s(0, n_splines=8))"
+            elif scenario["name"] in {
+                "geo_disease_tp",
+                "geo_disease_tp_basic",
+                "geo_disease_duchon",
+                "geo_disease_duchon_basic",
+                "geo_disease_shrinkage",
+                "geo_disease_matern",
+                "geo_disease_matern_basic",
+            }:
+                terms = s(0, n_splines=12) + s(1, n_splines=12) + s(2, n_splines=12)
+                for j in range(3, x.shape[1]):
+                    terms = terms + l(j)
+                model = LogisticGAM(terms)
+                model_spec = "LogisticGAM(s(0)+s(1)+s(2)+linear(3:15), n_splines=12)"
+            elif scenario["name"] in {"geo_disease_ps_per_pc", "geo_disease_ps_per_pc_basic"}:
+                terms = s(0, n_splines=10)
+                for j in range(1, x.shape[1]):
+                    terms = terms + s(j, n_splines=10)
+                model = LogisticGAM(terms)
+                model_spec = "LogisticGAM(sum_j s(j, n_splines=10), j=0..15)"
+            elif _geo_disease_eas_scenario_cfg(scenario["name"]) is not None:
+                geo_cfg = _geo_disease_eas_scenario_cfg(scenario["name"])
+                k = int(geo_cfg["knots"])
+                n_pcs = int(geo_cfg["n_pcs"])
+                if geo_cfg["basis_code"] == "psperpc":
+                    terms = s(0, n_splines=k)
+                    for j in range(1, x.shape[1]):
+                        terms = terms + s(j, n_splines=k)
+                    model = LogisticGAM(terms)
+                    model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..{n_pcs - 1})"
+                else:
+                    terms = s(0, n_splines=k) + s(1, n_splines=k) + s(2, n_splines=k)
+                    for j in range(3, x.shape[1]):
+                        terms = terms + l(j)
+                    model = LogisticGAM(terms)
+                    linear_hi = n_pcs - 1
+                    linear_part = f"+linear(3:{linear_hi})" if linear_hi >= 3 else ""
+                    model_spec = (
+                        f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, "
+                        f"n_splines={k}, basis={geo_cfg['basis_code']})"
+                    )
+            elif _papuan_oce_scenario_cfg(scenario["name"]) is not None:
+                papuan_cfg = _papuan_oce_scenario_cfg(scenario["name"])
+                k = int(papuan_cfg["knots"])
+                n_pcs = int(papuan_cfg["n_pcs"])
+                if papuan_cfg["basis_code"] == "psperpc":
+                    terms = s(0, n_splines=k)
+                    for j in range(1, x.shape[1]):
+                        terms = terms + s(j, n_splines=k)
+                    model = LogisticGAM(terms)
+                    model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..{n_pcs - 1}) [papuan_oce]"
+                else:
+                    terms = s(0, n_splines=k) + s(1, n_splines=k) + s(2, n_splines=k)
+                    for j in range(3, x.shape[1]):
+                        terms = terms + l(j)
+                    model = LogisticGAM(terms)
+                    linear_hi = n_pcs - 1
+                    linear_part = f"+linear(3:{linear_hi})" if linear_hi >= 3 else ""
+                    model_spec = (
+                        f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, "
+                        f"n_splines={k}, basis={papuan_cfg['basis_code']}) [papuan_oce]"
+                    )
             elif scenario["name"] == "icu_survival_death":
                 model = LogisticGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))
                 model_spec = "LogisticGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))"
@@ -1199,7 +1719,7 @@ def run_external_pygam_cv(scenario):
         "model_spec": (
             f"{cv_rows[0]['model_spec']} [5-fold CV]"
             if ds["family"] == "survival"
-            else f"{cv_rows[0]['model_spec']} [lam by AICc; 5-fold CV]"
+            else f"{cv_rows[0]['model_spec']} [lam by UBRE/GCV; 5-fold CV]"
         ),
     }
 

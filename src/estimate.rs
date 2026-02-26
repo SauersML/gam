@@ -1650,57 +1650,78 @@ where
     let mut best_stationary: Option<OuterSolveResult> = None;
     let mut best_nonstationary: Option<OuterSolveResult> = None;
     let mut best_grad_norm = f64::INFINITY;
+    let mut candidate_failures: Vec<String> = Vec::new();
     let near_stationary_tol = (cfg.reml_convergence_tolerance.max(1e-12)) * 2.0;
     let use_newton = true;
     for (label, initial_z) in candidate_seeds {
-        let solution = if use_newton {
+        let solution_result: Result<OuterSolveResult, EstimationError> = if use_newton {
             match run_newton_for_candidate(&label, &reml_state, &cfg, initial_z.clone()) {
                 Ok(sol) => {
                     if sol.stationary {
-                        sol
+                        Ok(sol)
                     } else {
                         eprintln!(
                             "[Candidate {label}] Newton ended non-stationary (grad_norm={:.3e}); retrying with BFGS.",
                             sol.grad_norm_rho
                         );
-                        let (bfgs_solution, grad_norm_rho, stationary) =
-                            run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z)?;
-                        let bfgs_outer = OuterSolveResult {
-                            final_rho: to_rho_from_z(&bfgs_solution.final_point),
-                            final_value: bfgs_solution.final_value,
-                            iterations: bfgs_solution.iterations,
-                            grad_norm_rho,
-                            stationary,
-                        };
-                        if bfgs_outer.stationary || bfgs_outer.final_value <= sol.final_value {
-                            bfgs_outer
-                        } else {
-                            sol
+                        match run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z) {
+                            Ok((bfgs_solution, grad_norm_rho, stationary)) => {
+                                let bfgs_outer = OuterSolveResult {
+                                    final_rho: to_rho_from_z(&bfgs_solution.final_point),
+                                    final_value: bfgs_solution.final_value,
+                                    iterations: bfgs_solution.iterations,
+                                    grad_norm_rho,
+                                    stationary,
+                                };
+                                if bfgs_outer.stationary
+                                    || bfgs_outer.final_value <= sol.final_value
+                                {
+                                    Ok(bfgs_outer)
+                                } else {
+                                    Ok(sol)
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "[Candidate {label}] BFGS fallback failed ({err}); keeping non-stationary Newton solution."
+                                );
+                                Ok(sol)
+                            }
                         }
                     }
                 }
                 Err(err) => {
                     eprintln!("[Candidate {label}] Newton failed ({err}); falling back to BFGS.");
-                    let (bfgs_solution, grad_norm_rho, stationary) =
-                        run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z)?;
-                    OuterSolveResult {
-                        final_rho: to_rho_from_z(&bfgs_solution.final_point),
-                        final_value: bfgs_solution.final_value,
-                        iterations: bfgs_solution.iterations,
-                        grad_norm_rho,
-                        stationary,
+                    match run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z) {
+                        Ok((bfgs_solution, grad_norm_rho, stationary)) => Ok(OuterSolveResult {
+                            final_rho: to_rho_from_z(&bfgs_solution.final_point),
+                            final_value: bfgs_solution.final_value,
+                            iterations: bfgs_solution.iterations,
+                            grad_norm_rho,
+                            stationary,
+                        }),
+                        Err(bfgs_err) => Err(EstimationError::RemlOptimizationFailed(format!(
+                            "Candidate {label}: Newton failed ({err}); BFGS fallback failed ({bfgs_err})"
+                        ))),
                     }
                 }
             }
         } else {
-            let (bfgs_solution, grad_norm_rho, stationary) =
-                run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z)?;
-            OuterSolveResult {
-                final_rho: to_rho_from_z(&bfgs_solution.final_point),
-                final_value: bfgs_solution.final_value,
-                iterations: bfgs_solution.iterations,
-                grad_norm_rho,
-                stationary,
+            run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z).map(
+                |(bfgs_solution, grad_norm_rho, stationary)| OuterSolveResult {
+                    final_rho: to_rho_from_z(&bfgs_solution.final_point),
+                    final_value: bfgs_solution.final_value,
+                    iterations: bfgs_solution.iterations,
+                    grad_norm_rho,
+                    stationary,
+                },
+            )
+        };
+        let solution = match solution_result {
+            Ok(sol) => sol,
+            Err(err) => {
+                candidate_failures.push(format!("[Candidate {label}] {err}"));
+                continue;
             }
         };
         let grad_norm = solution.grad_norm_rho;
@@ -1731,12 +1752,33 @@ where
             break;
         }
     }
-    let found_stationary = best_stationary.is_some();
-    let chosen_solution = best_stationary.or(best_nonstationary).ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "no valid BFGS solution produced by candidate seeds".to_string(),
-        )
-    })?;
+    let mut found_stationary = best_stationary.is_some();
+    let chosen_solution = if let Some(sol) = best_stationary.or(best_nonstationary) {
+        sol
+    } else {
+        eprintln!(
+            "[external] all candidate seeds failed; using emergency fixed-rho fallback (rho=0)."
+        );
+        if !candidate_failures.is_empty() {
+            eprintln!(
+                "[external] candidate failures summary ({}):\n{}",
+                candidate_failures.len(),
+                candidate_failures.join("\n")
+            );
+        }
+        found_stationary = false;
+        let fallback_rho = Array1::<f64>::zeros(k);
+        let fallback_value = reml_state
+            .compute_cost(&fallback_rho)
+            .unwrap_or(f64::INFINITY);
+        OuterSolveResult {
+            final_rho: fallback_rho,
+            final_value: fallback_value,
+            iterations: 1,
+            grad_norm_rho: f64::INFINITY,
+            stationary: false,
+        }
+    };
     if !found_stationary {
         eprintln!(
             "[external] no stationary candidate found; using best non-stationary solution with grad_norm={:.3e}",

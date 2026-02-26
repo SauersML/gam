@@ -1,4 +1,5 @@
 #![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
 
 use gam::estimate::{FitOptions, fit_gam, predict_gam};
 use gam::families::royston_parmar::{RoystonParmarInputs, working_model_from_flattened};
@@ -6,7 +7,9 @@ use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSp
 use gam::types::LikelihoodFamily;
 use gam::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec, BasisMetadata,
-    build_bspline_basis_1d,
+    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, MaternNu,
+    ThinPlateBasisSpec, build_bspline_basis_1d, build_duchon_basis, build_matern_basis,
+    build_thin_plate_basis,
 };
 use ndarray::{Array1, Array2, ArrayView1, s};
 use std::collections::HashSet;
@@ -65,7 +68,10 @@ fn parse_string_arg(args: &[String], flag: &str) -> Option<String> {
 
 fn parse_bool_arg(args: &[String], flag: &str, default: bool) -> bool {
     match parse_string_arg(args, flag) {
-        Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "y"),
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "y"
+        ),
         None => default,
     }
 }
@@ -448,11 +454,12 @@ fn load_wine_price_vs_temp_dataset() -> Result<(Array1<f64>, Array1<f64>), Strin
 
 struct CvData {
     y: Vec<f64>,
-    smooth: Vec<f64>,
+    smooth_cols: Vec<Vec<f64>>,
     linear_cols: Vec<Vec<f64>>,
     family: LikelihoodFamily,
     num_internal_knots: usize,
     double_penalty: bool,
+    smooth_basis: String,
 }
 
 fn parse_indices(path: &str) -> Result<Vec<usize>, String> {
@@ -557,14 +564,21 @@ fn load_cv_data(
     path: &str,
     family: LikelihoodFamily,
     target_col: &str,
-    smooth_col: &str,
+    smooth_cols: &[String],
+    smooth_basis: &str,
     linear_names: &[String],
     num_internal_knots: usize,
     double_penalty: bool,
 ) -> Result<CvData, String> {
     let (header_s, rows_s) = parse_delimited_table(path)?;
     let header = header_s.iter().map(|s| s.as_str()).collect::<Vec<_>>();
-    let smooth_idx = header_pos(&header, smooth_col)?;
+    if smooth_cols.is_empty() {
+        return Err("at least one smooth column is required".to_string());
+    }
+    let smooth_idx = smooth_cols
+        .iter()
+        .map(|name| header_pos(&header, name.as_str()))
+        .collect::<Result<Vec<_>, _>>()?;
     let y_idx = header_pos(&header, target_col)?;
     let linear_idx = linear_names
         .iter()
@@ -572,7 +586,7 @@ fn load_cv_data(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut y = Vec::<f64>::new();
-    let mut smooth = Vec::<f64>::new();
+    let mut smooth_vals: Vec<Vec<f64>> = smooth_idx.iter().map(|_| Vec::<f64>::new()).collect();
     let mut linear_cols: Vec<Vec<f64>> = linear_idx.iter().map(|_| Vec::<f64>::new()).collect();
 
     for (line_no, parts_s) in rows_s.iter().enumerate() {
@@ -584,7 +598,9 @@ fn load_cv_data(
                 .parse::<f64>()
                 .map_err(|e| format!("invalid {col} at line {}: {e}", line_no + 2))
         };
-        smooth.push(parse_at(smooth_idx, smooth_col)?);
+        for (j, &idx) in smooth_idx.iter().enumerate() {
+            smooth_vals[j].push(parse_at(idx, smooth_cols[j].as_str())?);
+        }
         y.push(parse_at(y_idx, "y")?);
         for (j, &idx) in linear_idx.iter().enumerate() {
             linear_cols[j].push(parse_at(idx, linear_names[j].as_str())?);
@@ -595,11 +611,12 @@ fn load_cv_data(
     }
     Ok(CvData {
         y,
-        smooth,
+        smooth_cols: smooth_vals,
         linear_cols,
         family,
         num_internal_knots,
         double_penalty,
+        smooth_basis: smooth_basis.to_string(),
     })
 }
 
@@ -612,6 +629,23 @@ fn select_vec(v: &[f64], idx: &[usize]) -> Result<Array1<f64>, String> {
         );
     }
     Ok(Array1::from_vec(out))
+}
+
+fn select_matrix(cols: &[Vec<f64>], idx: &[usize]) -> Result<Array2<f64>, String> {
+    if cols.is_empty() {
+        return Ok(Array2::<f64>::zeros((idx.len(), 0)));
+    }
+    let n = idx.len();
+    let p = cols.len();
+    let mut out = Array2::<f64>::zeros((n, p));
+    for (j, col) in cols.iter().enumerate() {
+        for (i_out, &i_src) in idx.iter().enumerate() {
+            out[[i_out, j]] = *col
+                .get(i_src)
+                .ok_or_else(|| format!("index {i_src} out of bounds {}", col.len()))?;
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -651,7 +685,11 @@ fn c_index_survival(time: &[f64], event: &[u8], risk: &[f64]) -> f64 {
     }
 }
 
-fn load_survival_cv_data(path: &str, time_col: &str, event_col: &str) -> Result<SurvivalCvData, String> {
+fn load_survival_cv_data(
+    path: &str,
+    time_col: &str,
+    event_col: &str,
+) -> Result<SurvivalCvData, String> {
     let (header_s, rows_s) = parse_delimited_table(path)?;
     let header = header_s.iter().map(|s| s.as_str()).collect::<Vec<_>>();
 
@@ -912,7 +950,8 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
 
     let mut family_s = parse_string_arg(args, "--family").unwrap_or_default();
     if family_s.is_empty() {
-        if header_set.contains("time") && (header_set.contains("event") || header_set.contains("y")) {
+        if header_set.contains("time") && (header_set.contains("event") || header_set.contains("y"))
+        {
             family_s = "survival".to_string();
         } else {
             let target_guess = if header_set.contains("y") {
@@ -959,7 +998,7 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
             return Err(format!(
                 "unsupported --family '{}'; expected gaussian|binomial|survival",
                 other
-            ))
+            ));
         }
     };
     let target_col = parse_string_arg(args, "--target-col").unwrap_or_else(|| {
@@ -968,43 +1007,24 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
         } else if header_set.contains("event") {
             "event".to_string()
         } else {
-            header_s
-                .get(*numeric_idx.last().unwrap_or(&0))
-                .cloned()
-                .unwrap_or_else(|| "y".to_string())
+            String::new()
         }
     });
-    let smooth_col = parse_string_arg(args, "--smooth-col").unwrap_or_else(|| {
-        let preferred = [
-            "s_temp",
-            "x2",
-            "range",
-            "t",
-            "pc2",
-            "pulse",
-            "hour",
-            "axil_nodes",
-            "temp",
-            "year",
-            "time",
-            "age",
-        ];
-        preferred
-            .iter()
-            .find(|&&name| header_set.contains(name) && name != target_col.as_str())
-            .map(|s| (*s).to_string())
-            .or_else(|| {
-                numeric_idx.iter().find_map(|&j| {
-                    let n = header_s[j].as_str();
-                    if n == target_col.as_str() || n == "time" || n == "event" {
-                        None
-                    } else {
-                        Some(n.to_string())
-                    }
-                })
-            })
-            .unwrap_or_else(|| target_col.clone())
-    });
+    if target_col.is_empty() {
+        return Err("missing --target-col and no 'y' or 'event' column found".to_string());
+    }
+    let smooth_basis =
+        parse_string_arg(args, "--smooth-basis").unwrap_or_else(|| "bspline".to_string());
+    let smooth_cols = {
+        let cols = parse_csv_list_arg(args, "--smooth-cols");
+        if !cols.is_empty() {
+            cols
+        } else if let Some(col) = parse_string_arg(args, "--smooth-col") {
+            vec![col]
+        } else {
+            return Err("missing --smooth-col/--smooth-cols in internal bench mode".to_string());
+        }
+    };
     let linear_cols = {
         let explicit = parse_csv_list_arg(args, "--linear-cols");
         if !explicit.is_empty() {
@@ -1015,7 +1035,7 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
                 .filter_map(|&j| {
                     let n = header_s[j].as_str();
                     if n == target_col.as_str()
-                        || n == smooth_col.as_str()
+                        || smooth_cols.iter().any(|sc| sc.as_str() == n)
                         || n == "time"
                         || n == "event"
                     {
@@ -1028,12 +1048,13 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
         }
     };
     let num_internal_knots = parse_arg(args, "--num-internal-knots", 7);
-    let double_penalty = parse_bool_arg(args, "--double-penalty", family == LikelihoodFamily::BinomialLogit);
+    let double_penalty = parse_bool_arg(args, "--double-penalty", true);
     let cv_data = load_cv_data(
         &data_path,
         family,
         &target_col,
-        &smooth_col,
+        &smooth_cols,
+        &smooth_basis,
         &linear_cols,
         num_internal_knots,
         double_penalty,
@@ -1041,42 +1062,244 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
 
     let y_train = select_vec(&cv_data.y, &train_idx)?;
     let y_test = select_vec(&cv_data.y, &test_idx)?;
-    let smooth_train = select_vec(&cv_data.smooth, &train_idx)?;
-    let smooth_test = select_vec(&cv_data.smooth, &test_idx)?;
+    let smooth_train_mat = select_matrix(&cv_data.smooth_cols, &train_idx)?;
+    let smooth_test_mat = select_matrix(&cv_data.smooth_cols, &test_idx)?;
 
-    let spec_train = BSplineBasisSpec {
-        degree: 3,
-        penalty_order: 2,
-        knot_spec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(cv_data.num_internal_knots),
-            placement: BSplineKnotPlacement::Quantile,
-        },
-        double_penalty: cv_data.double_penalty,
-        identifiability: BSplineIdentifiability::None,
-    };
-    let built_train =
-        build_bspline_basis_1d(smooth_train.view(), &spec_train).map_err(|e| e.to_string())?;
-    let knots = match &built_train.metadata {
-        BasisMetadata::BSpline1D { knots } => knots.clone(),
-        _ => return Err("unexpected basis metadata in CV mode".to_string()),
-    };
-    let spec_test = BSplineBasisSpec {
-        degree: 3,
-        penalty_order: 2,
-        knot_spec: BSplineKnotSpec::Provided(knots),
-        double_penalty: cv_data.double_penalty,
-        identifiability: BSplineIdentifiability::None,
-    };
-    let built_test =
-        build_bspline_basis_1d(smooth_test.view(), &spec_test).map_err(|e| e.to_string())?;
+    let n_train = train_idx.len();
+    let n_test = test_idx.len();
+    let center_count = n_train.clamp(25, 200);
 
-    let q = built_train.design.ncols();
+    let (smooth_train_design, smooth_test_design, smooth_penalties, smooth_nullspace_dims) =
+        match cv_data.smooth_basis.as_str() {
+            "thinplate" => {
+                let spec = ThinPlateBasisSpec {
+                    center_strategy: CenterStrategy::EqualMass {
+                        num_centers: center_count,
+                    },
+                    double_penalty: cv_data.double_penalty,
+                };
+                let built_train = build_thin_plate_basis(smooth_train_mat.view(), &spec)
+                    .map_err(|e| e.to_string())?;
+                let centers = match &built_train.metadata {
+                    BasisMetadata::ThinPlate { centers } => centers.clone(),
+                    _ => return Err("unexpected thin-plate metadata in CV mode".to_string()),
+                };
+                let spec_test = ThinPlateBasisSpec {
+                    center_strategy: CenterStrategy::UserProvided(centers),
+                    double_penalty: cv_data.double_penalty,
+                };
+                let built_test = build_thin_plate_basis(smooth_test_mat.view(), &spec_test)
+                    .map_err(|e| e.to_string())?;
+                (
+                    built_train.design,
+                    built_test.design,
+                    built_train
+                        .penalties
+                        .into_iter()
+                        .map(|p| (0usize, p))
+                        .collect::<Vec<_>>(),
+                    built_train.nullspace_dims,
+                )
+            }
+            "duchon" => {
+                let spec = DuchonBasisSpec {
+                    center_strategy: CenterStrategy::EqualMass {
+                        num_centers: center_count,
+                    },
+                    length_scale: 1.0,
+                    nu: MaternNu::FiveHalves,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    double_penalty: cv_data.double_penalty,
+                };
+                let built_train = build_duchon_basis(smooth_train_mat.view(), &spec)
+                    .map_err(|e| e.to_string())?;
+                let (centers, length_scale, nu, nullspace_order) = match &built_train.metadata {
+                    BasisMetadata::Duchon {
+                        centers,
+                        length_scale,
+                        nu,
+                        nullspace_order,
+                    } => (centers.clone(), *length_scale, *nu, *nullspace_order),
+                    _ => return Err("unexpected Duchon metadata in CV mode".to_string()),
+                };
+                let spec_test = DuchonBasisSpec {
+                    center_strategy: CenterStrategy::UserProvided(centers),
+                    length_scale,
+                    nu,
+                    nullspace_order,
+                    double_penalty: cv_data.double_penalty,
+                };
+                let built_test = build_duchon_basis(smooth_test_mat.view(), &spec_test)
+                    .map_err(|e| e.to_string())?;
+                (
+                    built_train.design,
+                    built_test.design,
+                    built_train
+                        .penalties
+                        .into_iter()
+                        .map(|p| (0usize, p))
+                        .collect::<Vec<_>>(),
+                    built_train.nullspace_dims,
+                )
+            }
+            "matern" => {
+                let spec = MaternBasisSpec {
+                    center_strategy: CenterStrategy::EqualMass {
+                        num_centers: center_count,
+                    },
+                    length_scale: 1.0,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: cv_data.double_penalty,
+                };
+                let built_train = build_matern_basis(smooth_train_mat.view(), &spec)
+                    .map_err(|e| e.to_string())?;
+                let (centers, length_scale, nu, include_intercept) = match &built_train.metadata {
+                    BasisMetadata::Matern {
+                        centers,
+                        length_scale,
+                        nu,
+                        include_intercept,
+                    } => (centers.clone(), *length_scale, *nu, *include_intercept),
+                    _ => return Err("unexpected Matérn metadata in CV mode".to_string()),
+                };
+                let spec_test = MaternBasisSpec {
+                    center_strategy: CenterStrategy::UserProvided(centers),
+                    length_scale,
+                    nu,
+                    include_intercept,
+                    double_penalty: cv_data.double_penalty,
+                };
+                let built_test = build_matern_basis(smooth_test_mat.view(), &spec_test)
+                    .map_err(|e| e.to_string())?;
+                (
+                    built_train.design,
+                    built_test.design,
+                    built_train
+                        .penalties
+                        .into_iter()
+                        .map(|p| (0usize, p))
+                        .collect::<Vec<_>>(),
+                    built_train.nullspace_dims,
+                )
+            }
+            "bspline_per_pc" => {
+                let mut train_blocks = Vec::<Array2<f64>>::new();
+                let mut test_blocks = Vec::<Array2<f64>>::new();
+                let mut penalties = Vec::<(usize, Array2<f64>)>::new();
+                let mut nullspace_dims = Vec::<usize>::new();
+                let mut q_off = 0usize;
+                let m = smooth_train_mat.ncols();
+                for j in 0..m {
+                    let s_train = smooth_train_mat.column(j).to_owned();
+                    let s_test = smooth_test_mat.column(j).to_owned();
+                    let spec_train = BSplineBasisSpec {
+                        degree: 3,
+                        penalty_order: 2,
+                        knot_spec: BSplineKnotSpec::Automatic {
+                            num_internal_knots: Some(cv_data.num_internal_knots),
+                            placement: BSplineKnotPlacement::Quantile,
+                        },
+                        double_penalty: cv_data.double_penalty,
+                        identifiability: BSplineIdentifiability::None,
+                    };
+                    let built_train = build_bspline_basis_1d(s_train.view(), &spec_train)
+                        .map_err(|e| e.to_string())?;
+                    let knots = match &built_train.metadata {
+                        BasisMetadata::BSpline1D { knots } => knots.clone(),
+                        _ => return Err("unexpected B-spline metadata in CV mode".to_string()),
+                    };
+                    let spec_test = BSplineBasisSpec {
+                        degree: 3,
+                        penalty_order: 2,
+                        knot_spec: BSplineKnotSpec::Provided(knots),
+                        double_penalty: cv_data.double_penalty,
+                        identifiability: BSplineIdentifiability::None,
+                    };
+                    let built_test = build_bspline_basis_1d(s_test.view(), &spec_test)
+                        .map_err(|e| e.to_string())?;
+                    let qj = built_train.design.ncols();
+                    penalties.extend(
+                        built_train
+                            .penalties
+                            .into_iter()
+                            .map(|p| (q_off, p))
+                            .collect::<Vec<_>>(),
+                    );
+                    nullspace_dims
+                        .extend(built_train.nullspace_dims.into_iter().map(|d| d + q_off));
+                    train_blocks.push(built_train.design);
+                    test_blocks.push(built_test.design);
+                    q_off += qj;
+                }
+                let q_total = q_off;
+                let mut train_design = Array2::<f64>::zeros((n_train, q_total));
+                let mut test_design = Array2::<f64>::zeros((n_test, q_total));
+                let mut off = 0usize;
+                for b in train_blocks {
+                    let qj = b.ncols();
+                    train_design.slice_mut(s![.., off..(off + qj)]).assign(&b);
+                    off += qj;
+                }
+                let mut off_t = 0usize;
+                for b in test_blocks {
+                    let qj = b.ncols();
+                    test_design
+                        .slice_mut(s![.., off_t..(off_t + qj)])
+                        .assign(&b);
+                    off_t += qj;
+                }
+                (train_design, test_design, penalties, nullspace_dims)
+            }
+            _ => {
+                if smooth_train_mat.ncols() != 1 {
+                    return Err("bspline smooth requires exactly one smooth column".to_string());
+                }
+                let smooth_train = smooth_train_mat.column(0).to_owned();
+                let smooth_test = smooth_test_mat.column(0).to_owned();
+                let spec_train = BSplineBasisSpec {
+                    degree: 3,
+                    penalty_order: 2,
+                    knot_spec: BSplineKnotSpec::Automatic {
+                        num_internal_knots: Some(cv_data.num_internal_knots),
+                        placement: BSplineKnotPlacement::Quantile,
+                    },
+                    double_penalty: cv_data.double_penalty,
+                    identifiability: BSplineIdentifiability::None,
+                };
+                let built_train = build_bspline_basis_1d(smooth_train.view(), &spec_train)
+                    .map_err(|e| e.to_string())?;
+                let knots = match &built_train.metadata {
+                    BasisMetadata::BSpline1D { knots } => knots.clone(),
+                    _ => return Err("unexpected B-spline metadata in CV mode".to_string()),
+                };
+                let spec_test = BSplineBasisSpec {
+                    degree: 3,
+                    penalty_order: 2,
+                    knot_spec: BSplineKnotSpec::Provided(knots),
+                    double_penalty: cv_data.double_penalty,
+                    identifiability: BSplineIdentifiability::None,
+                };
+                let built_test = build_bspline_basis_1d(smooth_test.view(), &spec_test)
+                    .map_err(|e| e.to_string())?;
+                (
+                    built_train.design,
+                    built_test.design,
+                    built_train
+                        .penalties
+                        .into_iter()
+                        .map(|p| (0usize, p))
+                        .collect::<Vec<_>>(),
+                    built_train.nullspace_dims,
+                )
+            }
+        };
+
+    let q = smooth_train_design.ncols();
     let n_linear = cv_data.linear_cols.len();
     let p_total = 1 + n_linear + q;
     let smooth_offset = 1 + n_linear;
 
-    let n_train = train_idx.len();
-    let n_test = test_idx.len();
     let mut x_train = Array2::<f64>::zeros((n_train, p_total));
     let mut x_test = Array2::<f64>::zeros((n_test, p_total));
     for i in 0..n_train {
@@ -1085,7 +1308,7 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
             x_train[[i, 1 + j]] = cv_data.linear_cols[j][train_idx[i]];
         }
         for j in 0..q {
-            x_train[[i, smooth_offset + j]] = built_train.design[[i, j]];
+            x_train[[i, smooth_offset + j]] = smooth_train_design[[i, j]];
         }
     }
     for i in 0..n_test {
@@ -1094,25 +1317,27 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
             x_test[[i, 1 + j]] = cv_data.linear_cols[j][test_idx[i]];
         }
         for j in 0..q {
-            x_test[[i, smooth_offset + j]] = built_test.design[[i, j]];
+            x_test[[i, smooth_offset + j]] = smooth_test_design[[i, j]];
         }
     }
 
-    let s_list = built_train
-        .penalties
+    let s_list = smooth_penalties
         .iter()
-        .map(|s_small| {
+        .map(|(q_local_offset, s_small)| {
             let mut s_full = Array2::<f64>::zeros((p_total, p_total));
-            for i in 0..q {
-                for j in 0..q {
-                    s_full[[smooth_offset + i, smooth_offset + j]] = s_small[[i, j]];
+            let qj = s_small.nrows();
+            for i in 0..qj {
+                for j in 0..qj {
+                    s_full[[
+                        smooth_offset + q_local_offset + i,
+                        smooth_offset + q_local_offset + j,
+                    ]] = s_small[[i, j]];
                 }
             }
             s_full
         })
         .collect::<Vec<_>>();
-    let nullspace_dims = built_train
-        .nullspace_dims
+    let nullspace_dims = smooth_nullspace_dims
         .iter()
         .map(|d| d + smooth_offset)
         .collect::<Vec<_>>();
