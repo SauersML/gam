@@ -36,17 +36,63 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
           from pathlib import Path
+
+          def choose_single_knot(variants):
+              # Prefer k12 when present for comparability across families.
+              by_k = {v["k"]: v for v in variants}
+              if 12 in by_k:
+                  return by_k[12]["scenario"]
+              ordered = sorted(variants, key=lambda v: v["k"])
+              return ordered[len(ordered) // 2]["scenario"]
+
           cfg = json.loads(Path("bench/scenarios.json").read_text())
           scenarios = cfg.get("scenarios", [])
-          include = [{"scenario": s["name"]} for s in scenarios if "name" in s]
+          names = [s["name"] for s in scenarios if "name" in s]
+          if not names:
+              raise SystemExit("No benchmark scenarios found in bench/scenarios.json")
+
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "").strip().lower()
+          is_nightly = event_name == "schedule"
+
+          if is_nightly:
+              # Nightly: run full matrix (all knot variants).
+              selected = names
+          else:
+              # Push/manual: run one representative knot per *_kN family.
+              k_pat = re.compile(r"^(?P<base>.+)_k(?P<k>\d+)$")
+              families = {}
+              selected = []
+              for name in names:
+                  m = k_pat.match(name)
+                  if not m:
+                      selected.append(name)
+                      continue
+                  base = m.group("base")
+                  families.setdefault(base, []).append(
+                      {"scenario": name, "k": int(m.group("k"))}
+                  )
+              for base in sorted(families):
+                  selected.append(choose_single_knot(families[base]))
+
+          include = [{"scenario": name} for name in selected]
           if not include:
               raise SystemExit("No benchmark scenarios found in bench/scenarios.json")
           matrix = {"include": include}
           out = Path(os.environ["GITHUB_OUTPUT"])
           with out.open("a", encoding="utf-8") as fh:
               fh.write(f"matrix={json.dumps(matrix)}\n")
-          print(json.dumps(matrix))
+          print(
+              json.dumps(
+                  {
+                      "event": event_name,
+                      "nightly_full_matrix": is_nightly,
+                      "scenario_count": len(selected),
+                      "matrix": matrix,
+                  }
+              )
+          )
           PY
 
   bootstrap-runtime:
