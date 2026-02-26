@@ -814,6 +814,7 @@ def run_rust_scenario_cv(scenario):
             code, out, err = run_cmd(
                 [
                     str(bin_path),
+                    "__bench_cv",
                     "--data",
                     str(data_csv),
                     "--train-idx",
