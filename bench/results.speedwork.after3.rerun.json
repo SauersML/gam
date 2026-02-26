@@ -1,0 +1,163 @@
+{
+  "created_at_utc": "2026-02-26T17:35:27.839270+00:00",
+  "cv": {
+    "n_splits": 5,
+    "seed": 42,
+    "leakage_safe": true
+  },
+  "results": [
+    {
+      "contender": "rust_gam",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.47589666600106284,
+      "predict_sec": 0.02921416500612395,
+      "auc": 0.7951671610685705,
+      "brier": 0.18199731146468007,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.267,
+      "predict_sec": 0.014,
+      "auc": 0.7965382999999999,
+      "brier": 0.1812196,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ x1 + s(x2, bs='ps', k=min(8, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.410993,
+      "predict_sec": 0.0019979999999999998,
+      "auc": 0.7961680855665147,
+      "brier": 0.18110164187119415,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8)) [lam by UBRE/GCV; 5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "icu_survival_death",
+      "status": "ok",
+      "fit_sec": 0.17743091599550098,
+      "predict_sec": 0.04048641600093106,
+      "auc": 0.4358174715849504,
+      "brier": null,
+      "c_index": 0.4358174715849504,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam survival/predict via release binary (c-index on eta risk score) [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "icu_survival_death",
+      "status": "ok",
+      "fit_sec": 0.221,
+      "predict_sec": 0.009000000000000001,
+      "auc": 0.69208142,
+      "brier": null,
+      "c_index": 0.69208142,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "Surv(time, event) ~ age + bmi + hr_max + sysbp_min [5-fold CV]"
+    },
+    {
+      "contender": "python_lifelines",
+      "scenario_name": "icu_survival_death",
+      "status": "ok",
+      "fit_sec": 1.064465,
+      "predict_sec": 0.010829,
+      "auc": 0.6920783391542049,
+      "brier": null,
+      "c_index": 0.6920783391542049,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4) [5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "heart_failure_survival",
+      "status": "ok",
+      "fit_sec": 0.050581958996190224,
+      "predict_sec": 0.03320150200306671,
+      "auc": 0.5020853958681405,
+      "brier": null,
+      "c_index": 0.5020853958681405,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam survival/predict via release binary (c-index on eta risk score) [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "heart_failure_survival",
+      "status": "ok",
+      "fit_sec": 0.041,
+      "predict_sec": 0.006,
+      "auc": 0.6987548494983278,
+      "brier": null,
+      "c_index": 0.6987548494983278,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "Surv(time, event) ~ age + anaemia + log_creatinine_phosphokinase + diabetes + ejection_fraction + high_blood_pressure + log_platelets + log_serum_creatinine + serum_sodium + sex + smoking [5-fold CV]"
+    },
+    {
+      "contender": "python_lifelines",
+      "scenario_name": "heart_failure_survival",
+      "status": "ok",
+      "fit_sec": 0.10857,
+      "predict_sec": 0.005308,
+      "auc": 0.6987326735179947,
+      "brier": null,
+      "c_index": 0.6987326735179947,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4) [5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "cirrhosis_survival",
+      "status": "ok",
+      "fit_sec": 0.09941545800393214,
+      "predict_sec": 0.0679852489993209,
+      "auc": 0.5,
+      "brier": null,
+      "c_index": 0.5,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam survival/predict via release binary (c-index on eta risk score) [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "cirrhosis_survival",
+      "status": "ok",
+      "fit_sec": 0.042,
+      "predict_sec": 0.008,
+      "auc": 0.809320652173913,
+      "brier": null,
+      "c_index": 0.809320652173913,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "Surv(time, event) ~ drug + sex_male + ascites + hepatomegaly + spiders + edema + age + bilirubin + cholesterol + albumin + copper + alk_phos + sgot + tryglicerides + platelets + prothrombin + stage [5-fold CV]"
+    },
+    {
+      "contender": "python_lifelines",
+      "scenario_name": "cirrhosis_survival",
+      "status": "ok",
+      "fit_sec": 0.227452,
+      "predict_sec": 0.006640999999999999,
+      "auc": 0.7900064309330305,
+      "brier": null,
+      "c_index": 0.7900064309330305,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4) [5-fold CV]"
+    }
+  ]
+}

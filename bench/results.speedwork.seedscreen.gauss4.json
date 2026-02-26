@@ -1,0 +1,154 @@
+{
+  "created_at_utc": "2026-02-26T18:15:41.926018+00:00",
+  "cv": {
+    "n_splits": 5,
+    "seed": 42,
+    "leakage_safe": true
+  },
+  "results": [
+    {
+      "contender": "rust_gam",
+      "scenario_name": "wine_gamair",
+      "status": "ok",
+      "fit_sec": 0.9823089590063319,
+      "predict_sec": 0.029148166002414655,
+      "auc": null,
+      "brier": null,
+      "rmse": 14.515423635487256,
+      "r2": 0.09293361061597773,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "wine_gamair",
+      "status": "ok",
+      "fit_sec": 0.145,
+      "predict_sec": 0.014,
+      "auc": null,
+      "brier": null,
+      "rmse": 11.832847368421051,
+      "r2": 0.2937368421052632,
+      "model_spec": "y ~ year + h_rain + w_rain + h_temp + s(s_temp, bs='ps', k=min(10, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "wine_gamair",
+      "status": "ok",
+      "fit_sec": 0.31042800000000004,
+      "predict_sec": 0.002199,
+      "auc": null,
+      "brier": null,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LinearGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10)) [lam by UBRE/GCV; 5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "wine_temp_vs_year",
+      "status": "ok",
+      "fit_sec": 0.05956325099396054,
+      "predict_sec": 0.02579150000383379,
+      "auc": null,
+      "brier": null,
+      "rmse": 0.7031926201776859,
+      "r2": 0.24335331064136836,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "wine_temp_vs_year",
+      "status": "ok",
+      "fit_sec": 0.122,
+      "predict_sec": 0.015,
+      "auc": null,
+      "brier": null,
+      "rmse": 0.6570170212765958,
+      "r2": 0.4203255319148936,
+      "model_spec": "y ~ s(year, bs='ps', k=min(10, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "wine_temp_vs_year",
+      "status": "ok",
+      "fit_sec": 0.205268,
+      "predict_sec": 0.001286,
+      "auc": null,
+      "brier": null,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LinearGAM(s(0, n_splines=10)) [lam by UBRE/GCV; 5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "wine_price_vs_temp",
+      "status": "ok",
+      "fit_sec": 0.23064062399498653,
+      "predict_sec": 0.027558916997804772,
+      "auc": null,
+      "brier": null,
+      "rmse": 15.974556044669226,
+      "r2": -0.06404972371883626,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "wine_price_vs_temp",
+      "status": "ok",
+      "fit_sec": 0.14,
+      "predict_sec": 0.014,
+      "auc": null,
+      "brier": null,
+      "rmse": 16.566236842105265,
+      "r2": -0.08584473684210527,
+      "model_spec": "y ~ s(temp, bs='ps', k=min(10, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "wine_price_vs_temp",
+      "status": "ok",
+      "fit_sec": 0.199484,
+      "predict_sec": 0.001277,
+      "auc": null,
+      "brier": null,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LinearGAM(s(0, n_splines=10)) [lam by UBRE/GCV; 5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "us48_demand_5day",
+      "status": "ok",
+      "fit_sec": 0.9575342910029576,
+      "predict_sec": 0.030326790998515207,
+      "auc": null,
+      "brier": null,
+      "rmse": 2985.2609594147984,
+      "r2": 0.9941031448438103,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "us48_demand_5day",
+      "status": "ok",
+      "fit_sec": 0.119,
+      "predict_sec": 0.013000000000000001,
+      "auc": null,
+      "brier": null,
+      "rmse": 2765.706588541667,
+      "r2": 0.9950572916666666,
+      "model_spec": "y ~ s(hour, bs='ps', k=min(10, nrow(train_df)-1)) + demand_forecast + net_generation + total_interchange [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "us48_demand_5day",
+      "status": "ok",
+      "fit_sec": 0.281109,
+      "predict_sec": 0.001984,
+      "auc": null,
+      "brier": null,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LinearGAM(s(0, n_splines=10) + l(1) + l(2) + l(3)) [lam by UBRE/GCV; 5-fold CV]"
+    }
+  ]
+}
