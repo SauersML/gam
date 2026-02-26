@@ -5,6 +5,7 @@ use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::ParallelSlice;
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 
@@ -1382,7 +1383,7 @@ impl ThinPlateSplineBasis {
 }
 
 /// Matérn smoothness parameter `nu` (half-integer variants with closed forms).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum MaternNu {
     Half,
     ThreeHalves,
@@ -1437,7 +1438,7 @@ impl DuchonSplineBasis {
 }
 
 /// Which knot strategy to use for 1D B-spline bases.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BSplineKnotSpec {
     Generate {
         data_range: (f64, f64),
@@ -1451,14 +1452,14 @@ pub enum BSplineKnotSpec {
 }
 
 /// Internal-knot placement strategy when knots are automatically inferred.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BSplineKnotPlacement {
     Uniform,
     Quantile,
 }
 
 /// 1D B-spline basis configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BSplineBasisSpec {
     pub degree: usize,
     pub penalty_order: usize,
@@ -1472,7 +1473,7 @@ pub struct BSplineBasisSpec {
 /// These constraints are applied directly in the builder via a reparameterization
 /// `B_constrained = B * Z`, and every penalty matrix is projected as
 /// `S_constrained = Z' S Z`, so solver geometry stays consistent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BSplineIdentifiability {
     /// Keep unconstrained basis columns.
     None,
@@ -1488,6 +1489,11 @@ pub enum BSplineIdentifiability {
         columns: Array2<f64>,
         weights: Option<Array1<f64>>,
     },
+    /// Apply an explicit coefficient-space transform `Z` learned at fit time.
+    ///
+    /// This freezes identifiability behavior so prediction cannot drift based on
+    /// new-data distribution. The constrained basis is `B * Z`.
+    FrozenTransform { transform: Array2<f64> },
 }
 
 impl Default for BSplineIdentifiability {
@@ -1498,7 +1504,7 @@ impl Default for BSplineIdentifiability {
 }
 
 /// Thin-plate center selection strategy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CenterStrategy {
     UserProvided(Array2<f64>),
     EqualMass { num_centers: usize },
@@ -1508,14 +1514,14 @@ pub enum CenterStrategy {
 }
 
 /// Thin-plate basis configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinPlateBasisSpec {
     pub center_strategy: CenterStrategy,
     pub double_penalty: bool,
 }
 
 /// Matérn basis configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaternBasisSpec {
     pub center_strategy: CenterStrategy,
     pub length_scale: f64,
@@ -1526,7 +1532,7 @@ pub struct MaternBasisSpec {
 
 /// Duchon null-space order. `0` matches fully-penalized Matérn-like behavior,
 /// `1` keeps `[1, x_1, ..., x_d]` unpenalized by the primary curvature penalty.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DuchonNullspaceOrder {
     Zero,
     Linear,
@@ -1534,7 +1540,7 @@ pub enum DuchonNullspaceOrder {
 
 /// Duchon-like basis configuration using a Matérn high-frequency backbone and
 /// explicit low-frequency null-space control.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuchonBasisSpec {
     pub center_strategy: CenterStrategy,
     pub length_scale: f64,
@@ -1548,6 +1554,7 @@ pub struct DuchonBasisSpec {
 pub enum BasisMetadata {
     BSpline1D {
         knots: Array1<f64>,
+        identifiability_transform: Option<Array2<f64>>,
     },
     ThinPlate {
         centers: Array2<f64>,
@@ -1909,7 +1916,7 @@ pub fn build_bspline_basis_1d(
         penalties_raw.push(Array2::<f64>::eye(p_raw));
     }
 
-    let (design, penalties) = apply_bspline_identifiability_policy(
+    let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
         design_raw,
         penalties_raw,
         &knots,
@@ -1930,7 +1937,10 @@ pub fn build_bspline_basis_1d(
         design,
         penalties,
         nullspace_dims,
-        metadata: BasisMetadata::BSpline1D { knots },
+        metadata: BasisMetadata::BSpline1D {
+            knots,
+            identifiability_transform,
+        },
     })
 }
 
@@ -1940,7 +1950,7 @@ fn apply_bspline_identifiability_policy(
     knots: &Array1<f64>,
     degree: usize,
     identifiability: &BSplineIdentifiability,
-) -> Result<(Array2<f64>, Vec<Array2<f64>>), BasisError> {
+) -> Result<(Array2<f64>, Vec<Array2<f64>>, Option<Array2<f64>>), BasisError> {
     let (design_c, z_opt): (Array2<f64>, Option<Array2<f64>>) = match identifiability {
         BSplineIdentifiability::None => (design, None),
         BSplineIdentifiability::WeightedSumToZero { weights } => {
@@ -1960,9 +1970,20 @@ fn apply_bspline_identifiability_policy(
             )?;
             (b_c, Some(z))
         }
+        BSplineIdentifiability::FrozenTransform { transform } => {
+            let z = transform.clone();
+            if design.ncols() != z.nrows() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen identifiability transform mismatch: design has {} columns but transform has {} rows",
+                    design.ncols(),
+                    z.nrows()
+                )));
+            }
+            (design.dot(&z), Some(z))
+        }
     };
 
-    let penalties_c = if let Some(z) = z_opt {
+    let penalties_c = if let Some(ref z) = z_opt {
         penalties
             .into_iter()
             .map(|s| {
@@ -1974,7 +1995,7 @@ fn apply_bspline_identifiability_policy(
         penalties
     };
 
-    Ok((design_c, penalties_c))
+    Ok((design_c, penalties_c, z_opt))
 }
 
 fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, BasisError> {
@@ -4707,7 +4728,7 @@ mod tests {
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         let knots = match result.metadata {
-            BasisMetadata::BSpline1D { knots } => knots,
+            BasisMetadata::BSpline1D { knots, .. } => knots,
             _ => panic!("expected BSpline1D metadata"),
         };
         assert_eq!(knots.len(), 3 + 2 * (spec.degree + 1));
@@ -4731,7 +4752,7 @@ mod tests {
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         let knots = match result.metadata {
-            BasisMetadata::BSpline1D { knots } => knots,
+            BasisMetadata::BSpline1D { knots, .. } => knots,
             _ => panic!("expected BSpline1D metadata"),
         };
         let start = spec.degree + 1;
