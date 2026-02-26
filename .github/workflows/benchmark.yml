@@ -37,11 +37,11 @@ jobs:
           import json
           import os
           from pathlib import Path
-          cfg = json.loads(Path("benchmarks/scenarios.json").read_text())
+          cfg = json.loads(Path("bench/scenarios.json").read_text())
           scenarios = cfg.get("scenarios", [])
           include = [{"scenario": s["name"]} for s in scenarios if "name" in s]
           if not include:
-              raise SystemExit("No benchmark scenarios found in benchmarks/scenarios.json")
+              raise SystemExit("No benchmark scenarios found in bench/scenarios.json")
           matrix = {"include": include}
           out = Path(os.environ["GITHUB_OUTPUT"])
           with out.open("a", encoding="utf-8") as fh:
@@ -68,17 +68,17 @@ jobs:
       - name: Run scenario shard
         shell: bash
         run: |
-          mkdir -p benchmarks/results-shards
+          mkdir -p bench/results-shards
           python3 bench/run_suite.py \
-            --scenarios benchmarks/scenarios.json \
+            --scenarios bench/scenarios.json \
             --scenario-name "${{ matrix.scenario }}" \
-            --out "benchmarks/results-shards/${{ matrix.scenario }}.json"
+            --out "bench/results-shards/${{ matrix.scenario }}.json"
 
       - name: Upload shard artifact
         uses: actions/upload-artifact@v4
         with:
           name: bench-${{ matrix.scenario }}
-          path: benchmarks/results-shards/${{ matrix.scenario }}.json
+          path: bench/results-shards/${{ matrix.scenario }}.json
           if-no-files-found: error
 
   aggregate:
@@ -94,7 +94,7 @@ jobs:
       - name: Download all shard artifacts
         uses: actions/download-artifact@v4
         with:
-          path: benchmarks/artifacts
+          path: bench/artifacts
 
       - name: Merge shard JSON outputs
         shell: bash
@@ -104,7 +104,7 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
 
-          artifacts = Path("benchmarks/artifacts")
+          artifacts = Path("bench/artifacts")
           files = sorted(artifacts.rglob("*.json"))
           if not files:
               raise SystemExit("No shard artifacts found to merge.")
@@ -114,7 +114,7 @@ jobs:
               payload = json.loads(fp.read_text())
               merged.extend(payload.get("results", []))
 
-          out = Path("benchmarks/results.nightly.json")
+          out = Path("bench/results.nightly.json")
           out.write_text(
               json.dumps(
                   {
@@ -131,5 +131,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results-nightly
-          path: benchmarks/results.nightly.json
+          path: bench/results.nightly.json
           if-no-files-found: error
