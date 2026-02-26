@@ -66,8 +66,8 @@ jobs:
           set -euo pipefail
           cargo +nightly test --all-features -- --nocapture 2>&1 | tee /tmp/cargo-test.log
 
-          # Treat runtime optimizer/model-path errors as test failures even when tests return 0.
-          forbidden='P-IRLS INNER LOOP FAILED|Perfect or quasi-perfect separation detected|all candidate seeds failed|no stationary candidate found|BFGS fallback failed|Newton failed \('
+          # Treat runtime optimizer/model-path degradations as hard failures even when tests return 0.
+          forbidden='P-IRLS INNER LOOP FAILED|Perfect or quasi-perfect separation detected|all candidate seeds failed|no stationary candidate found|BFGS fallback failed|Newton failed \(|falling back to BFGS|Line search stopped early|marking as non-stationary|non-stationary solution|range penalty block contains non-finite entries'
           if grep -nE "$forbidden" /tmp/cargo-test.log; then
             echo "::error::Forbidden runtime error signatures were found in test output."
             exit 1
