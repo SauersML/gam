@@ -73,6 +73,291 @@
     {
       "name": "cirrhosis_survival",
       "dataset": "cirrhosis"
+    },
+    {
+      "name": "geo_disease_tp",
+      "n": 4000,
+      "seed": 20260226
+    },
+    {
+      "name": "geo_disease_tp_basic",
+      "n": 4000,
+      "seed": 20260226
+    },
+    {
+      "name": "geo_disease_duchon",
+      "n": 4000,
+      "seed": 20260226
+    },
+    {
+      "name": "geo_disease_duchon_basic",
+      "n": 4000,
+      "seed": 20260226
+    },
+    {
+      "name": "geo_disease_matern",
+      "n": 4000,
+      "seed": 20260226
+    },
+    {
+      "name": "geo_disease_matern_basic",
+      "n": 4000,
+      "seed": 20260226
+    },
+    {
+      "name": "geo_disease_shrinkage",
+      "n": 4000,
+      "seed": 20260226
+    },
+    {
+      "name": "geo_disease_ps_per_pc",
+      "n": 4000,
+      "seed": 20260226
+    },
+    {
+      "name": "geo_disease_ps_per_pc_basic",
+      "n": 4000,
+      "seed": 20260226
+    },
+    {
+      "name": "geo_disease_eas_tp_k6",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_tp_k12",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_tp_k24",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k6",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k12",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k24",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_matern_k6",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_matern_k12",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_matern_k24",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_psperpc_k6",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_psperpc_k12",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_psperpc_k24",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_tp_k6",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_tp_k12",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_tp_k24",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_duchon_k6",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_duchon_k12",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_duchon_k24",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_matern_k6",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_matern_k12",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_matern_k24",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_psperpc_k6",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_psperpc_k12",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas3_psperpc_k24",
+      "n": 6000,
+      "seed": 20260301
+    },
+    {
+      "name": "papuan_oce_tp_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce_tp_basic_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce_duchon_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce_duchon_basic_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce_matern_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce_matern_basic_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce_psperpc_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce_psperpc_basic_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_tp_k6",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_tp_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_tp_k24",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_tp_basic_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_duchon_k6",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_duchon_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_duchon_k24",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_duchon_basic_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_matern_k6",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_matern_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_matern_k24",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_matern_basic_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_psperpc_k6",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_psperpc_k12",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_psperpc_k24",
+      "n": 6000,
+      "seed": 20260315
+    },
+    {
+      "name": "papuan_oce4_psperpc_basic_k12",
+      "n": 6000,
+      "seed": 20260315
     }
   ]
 }

@@ -16,7 +16,7 @@ It measures:
 
 Canonical benchmark Python code lives in:
 - `/Users/user/gam/bench`
-- `/Users/user/gam/bench/parity`
+- `/Users/user/gam/tests/bench_tools`
 
 ## Quick start
 
