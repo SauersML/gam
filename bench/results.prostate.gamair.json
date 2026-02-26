@@ -1,0 +1,47 @@
+{
+  "created_at_utc": "2026-02-26T03:05:42.341790+00:00",
+  "results": [
+    {
+      "engine": "gam",
+      "scenario": {
+        "dataset": "prostate",
+        "n": 654,
+        "p": 13
+      },
+      "fit_sec": 2.04641,
+      "predict_sec": 2.1e-05,
+      "auc": 0.463593,
+      "brier": 0.248091,
+      "rmse": null,
+      "r2": null,
+      "edf_total": 2.000001,
+      "contender": "rust_gam",
+      "scenario_name": "prostate_gamair",
+      "status": "ok"
+    },
+    {
+      "status": "ok",
+      "fit_sec": 0.042,
+      "predict_sec": 0.003,
+      "auc": 0.7069,
+      "brier": 0.2144,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ pc1 + s(pc2, bs='ps', k=min(8, nrow(df)-1))",
+      "contender": "r_mgcv",
+      "scenario_name": "prostate_gamair"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "prostate_gamair",
+      "status": "ok",
+      "fit_sec": 0.016145,
+      "predict_sec": 0.000616,
+      "auc": 0.7066299790356394,
+      "brier": 0.2143689716151198,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8))"
+    }
+  ]
+}

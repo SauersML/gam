@@ -1,27 +1,5 @@
 #![deny(dead_code)]
 #![deny(unused_imports)]
-#![allow(non_snake_case)]
-#![allow(clippy::clone_on_copy)]
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::doc_lazy_continuation)]
-#![allow(clippy::doc_overindented_list_items)]
-#![allow(clippy::if_same_then_else)]
-#![allow(clippy::io_other_error)]
-#![allow(clippy::let_and_return)]
-#![allow(clippy::manual_clamp)]
-#![allow(clippy::manual_is_multiple_of)]
-#![allow(clippy::manual_memcpy)]
-#![allow(clippy::manual_range_contains)]
-#![allow(clippy::needless_borrow)]
-#![allow(clippy::needless_range_loop)]
-#![allow(clippy::needless_return)]
-#![allow(clippy::new_without_default)]
-#![allow(clippy::redundant_closure)]
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::type_complexity)]
-#![allow(clippy::unnecessary_cast)]
-#![allow(clippy::unnecessary_fold)]
-#![allow(clippy::unnecessary_lazy_evaluations)]
 
 pub mod alo;
 pub mod basis;
@@ -29,8 +7,6 @@ pub mod construction;
 pub mod custom_family;
 pub mod diagnostics;
 pub mod estimate;
-#[cfg(test)]
-mod exact_oracle_tests;
 pub mod faer_ndarray;
 pub mod families;
 pub mod gamlss;

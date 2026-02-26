@@ -1,0 +1,88 @@
+{
+  "created_at_utc": "2026-02-26T02:55:52.159812+00:00",
+  "results": [
+    {
+      "engine": "gam",
+      "scenario": {
+        "n": 1000,
+        "p": 10
+      },
+      "fit_sec": 0.21427,
+      "predict_sec": 1.9e-05,
+      "auc": 0.795424,
+      "brier": 0.182595,
+      "rmse": null,
+      "r2": null,
+      "edf_total": 3.000001,
+      "contender": "rust_gam",
+      "scenario_name": "small_dense",
+      "status": "ok"
+    },
+    {
+      "status": "ok",
+      "fit_sec": 0.035,
+      "predict_sec": 0.003,
+      "auc": 0.7973,
+      "brier": 0.1807,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ x1 + s(x2, bs='ps', k=min(8, nrow(df)-1))",
+      "contender": "r_mgcv",
+      "scenario_name": "small_dense"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.013629,
+      "predict_sec": 0.000761,
+      "auc": 0.7977564742965026,
+      "brier": 0.18044110245770012,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8))"
+    },
+    {
+      "engine": "gam",
+      "scenario": {
+        "dataset": "prostate",
+        "n": 654,
+        "p": 13
+      },
+      "fit_sec": 2.177521,
+      "predict_sec": 1.6e-05,
+      "auc": 0.463593,
+      "brier": 0.248091,
+      "rmse": null,
+      "r2": null,
+      "edf_total": 2.000001,
+      "contender": "rust_gam",
+      "scenario_name": "prostate_gamair",
+      "status": "ok"
+    },
+    {
+      "status": "ok",
+      "fit_sec": 0.032,
+      "predict_sec": 0.003,
+      "auc": 0.7069,
+      "brier": 0.2144,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ pc1 + s(pc2, bs='ps', k=min(8, nrow(df)-1))",
+      "contender": "r_mgcv",
+      "scenario_name": "prostate_gamair"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "prostate_gamair",
+      "status": "ok",
+      "fit_sec": 0.006625,
+      "predict_sec": 0.000541,
+      "auc": 0.7066299790356394,
+      "brier": 0.2143689716151198,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8))"
+    }
+  ]
+}

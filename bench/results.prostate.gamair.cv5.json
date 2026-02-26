@@ -1,0 +1,46 @@
+{
+  "created_at_utc": "2026-02-26T03:22:07.218970+00:00",
+  "cv": {
+    "n_splits": 5,
+    "seed": 42,
+    "leakage_safe": true
+  },
+  "results": [
+    {
+      "contender": "rust_gam",
+      "scenario_name": "prostate_gamair",
+      "status": "ok",
+      "fit_sec": 10.740731,
+      "predict_sec": 4.2e-05,
+      "auc": 0.7036297064220184,
+      "brier": 0.2161752981651376,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "5-fold CV (train-only spline fit; holdout scoring)"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "prostate_gamair",
+      "status": "ok",
+      "fit_sec": 0.14200000000000002,
+      "predict_sec": 0.012,
+      "auc": 0.7037622324159021,
+      "brier": 0.21508776758409784,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ pc1 + s(pc2, bs='ps', k=min(8, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "prostate_gamair",
+      "status": "ok",
+      "fit_sec": 0.331271,
+      "predict_sec": 0.001804,
+      "auc": 0.7050944229476446,
+      "brier": 0.21545577928857157,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8)) [lam by AICc; 5-fold CV]"
+    }
+  ]
+}

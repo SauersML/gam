@@ -1,0 +1,74 @@
+{
+  "created_at_utc": "2026-02-26T06:07:45.615154+00:00",
+  "cv": {
+    "n_splits": 5,
+    "seed": 42,
+    "leakage_safe": true
+  },
+  "results": [
+    {
+      "contender": "rust_gam",
+      "scenario_name": "small_dense",
+      "status": "failed",
+      "error": "error: unexpected argument 'true' found\n\nUsage: gam bench-cv [OPTIONS] --data <DATA> --train-idx <TRAIN_IDX> --test-idx <TEST_IDX>\n\nFor more information, try '--help'."
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.249,
+      "predict_sec": 0.01,
+      "auc": 0.7965382999999999,
+      "brier": 0.1812196,
+      "c_index": null,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ x1 + s(x2, bs='ps', k=min(8, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 1.0897,
+      "predict_sec": 0.008434,
+      "auc": 0.7961680855665147,
+      "brier": 0.18110164187119415,
+      "c_index": null,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8)) [lam by UBRE/GCV; 5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "bone_gamair",
+      "status": "failed",
+      "error": "error: unexpected argument 'true' found\n\nUsage: gam bench-cv [OPTIONS] --data <DATA> --train-idx <TRAIN_IDX> --test-idx <TEST_IDX>\n\nFor more information, try '--help'."
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "bone_gamair",
+      "status": "ok",
+      "fit_sec": 0.20700000000000002,
+      "predict_sec": 0.014,
+      "auc": 0.8550652173913044,
+      "brier": 0.1549782608695652,
+      "c_index": null,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ trt_auto + s(t, bs='ps', k=min(8, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "bone_gamair",
+      "status": "ok",
+      "fit_sec": 0.623974,
+      "predict_sec": 0.004229,
+      "auc": 0.9275362318840579,
+      "brier": 0.11272063975447084,
+      "c_index": null,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8)) [lam by UBRE/GCV; 5-fold CV]"
+    }
+  ]
+}

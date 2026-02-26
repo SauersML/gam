@@ -1,0 +1,49 @@
+{
+  "created_at_utc": "2026-02-26T04:04:03.478001+00:00",
+  "cv": {
+    "n_splits": 5,
+    "seed": 42,
+    "leakage_safe": true
+  },
+  "results": [
+    {
+      "contender": "rust_gam",
+      "scenario_name": "cirrhosis_survival",
+      "status": "ok",
+      "fit_sec": 0.004013,
+      "predict_sec": 1.2e-05,
+      "auc": 0.8248214166666666,
+      "brier": null,
+      "c_index": 0.8248214166666666,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "5-fold CV (Rust native Royston-Parmar survival)"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "cirrhosis_survival",
+      "status": "ok",
+      "fit_sec": 0.044,
+      "predict_sec": 0.005,
+      "auc": 0.809320652173913,
+      "brier": null,
+      "c_index": 0.809320652173913,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "Surv(time, event) ~ drug + sex_male + ascites + hepatomegaly + spiders + edema + age + bilirubin + cholesterol + albumin + copper + alk_phos + sgot + tryglicerides + platelets + prothrombin + stage [5-fold CV]"
+    },
+    {
+      "contender": "python_lifelines",
+      "scenario_name": "cirrhosis_survival",
+      "status": "ok",
+      "fit_sec": 0.260369,
+      "predict_sec": 0.00752,
+      "auc": 0.7900064309330305,
+      "brier": null,
+      "c_index": 0.7900064309330305,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4) [5-fold CV]"
+    }
+  ]
+}
