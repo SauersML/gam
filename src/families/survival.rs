@@ -235,11 +235,7 @@ impl WorkingModelSurvival {
                 off.derivative_exit.to_owned(),
             )
         } else {
-            (
-                Array1::zeros(n),
-                Array1::zeros(n),
-                Array1::zeros(n),
-            )
+            (Array1::zeros(n), Array1::zeros(n), Array1::zeros(n))
         };
 
         Ok(Self {

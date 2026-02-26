@@ -853,15 +853,23 @@ fn check_rho_gradient_stationarity(
     let tol_rho = tol_z;
     let is_stationary = grad_norm_z <= tol_z && grad_norm_rho <= tol_rho;
     if grad_norm_z > tol_z || grad_norm_rho > tol_rho {
-        eprintln!(
+        log::debug!(
             "[Candidate {label}] stationarity check failed (||g_z||={:.3e}, ||g_rho||={:.3e}; tol_z={:.3e}, tol_rho={:.3e}); marking as non-stationary",
-            grad_norm_z, grad_norm_rho, tol_z, tol_rho
+            grad_norm_z,
+            grad_norm_rho,
+            tol_z,
+            tol_rho
         );
     }
 
-    eprintln!(
+    log::debug!(
         "[Candidate {label}] z-space gradient norm {:.3e} (tol {:.3e}); projected rho-space norm {:.3e}; max|∇ρ| {:.3e}; max|ρ| {:.2}; stationary = {}",
-        grad_norm_z, tol_z, grad_norm_rho, max_abs_grad, max_abs_rho, is_stationary
+        grad_norm_z,
+        tol_z,
+        grad_norm_rho,
+        max_abs_grad,
+        max_abs_rho,
+        is_stationary
     );
 
     Ok((grad_norm_z, is_stationary))
@@ -873,7 +881,7 @@ fn run_bfgs_for_candidate(
     config: &RemlConfig,
     initial_z: Array1<f64>,
 ) -> Result<(BfgsSolution, f64, bool), EstimationError> {
-    eprintln!("\n[Candidate {label}] Running BFGS optimization from queued seed");
+    log::debug!("[Candidate {label}] Running BFGS optimization from queued seed");
     let mut solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
         .with_tolerance(config.reml_convergence_tolerance)
         .with_max_iterations(config.reml_max_iterations as usize)
@@ -883,20 +891,20 @@ fn run_bfgs_for_candidate(
 
     let solution = match solver.run() {
         Ok(solution) => {
-            eprintln!("\n[Candidate {label}] BFGS converged successfully according to tolerance.");
+            log::debug!("[Candidate {label}] BFGS converged successfully according to tolerance.");
             solution
         }
         Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
-            eprintln!(
+            log::debug!(
                 "[Candidate {label}] Line search stopped early; using best-so-far parameters."
             );
             *last_solution
         }
         Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
-            eprintln!(
-                "\n[Candidate {label}] WARNING: BFGS hit the iteration cap; using best-so-far parameters."
+            log::warn!(
+                "[Candidate {label}] BFGS hit the iteration cap; using best-so-far parameters."
             );
-            eprintln!(
+            log::debug!(
                 "[Candidate {label}] Last recorded gradient norm: {:.2e}",
                 last_solution.final_gradient_norm
             );
@@ -951,7 +959,7 @@ fn run_newton_for_candidate(
     config: &RemlConfig,
     initial_z: Array1<f64>,
 ) -> Result<OuterSolveResult, EstimationError> {
-    eprintln!("\n[Candidate {label}] Running exact Newton optimization from queued seed");
+    log::debug!("[Candidate {label}] Running exact Newton optimization from queued seed");
     let mut rho = to_rho_from_z(&initial_z);
     let max_iter = config.reml_max_iterations as usize;
     let tol = config.reml_convergence_tolerance.max(1e-8);
@@ -1565,7 +1573,7 @@ where
                     if sol.stationary {
                         Ok(sol)
                     } else {
-                        eprintln!(
+                        log::debug!(
                             "[Candidate {label}] Newton ended non-stationary (grad_norm={:.3e}); retrying with BFGS.",
                             sol.grad_norm_rho
                         );
@@ -1587,7 +1595,7 @@ where
                                 }
                             }
                             Err(err) => {
-                                eprintln!(
+                                log::warn!(
                                     "[Candidate {label}] BFGS fallback failed ({err}); keeping non-stationary Newton solution."
                                 );
                                 Ok(sol)
@@ -1596,7 +1604,7 @@ where
                     }
                 }
                 Err(err) => {
-                    eprintln!("[Candidate {label}] Newton failed ({err}); falling back to BFGS.");
+                    log::warn!("[Candidate {label}] Newton failed ({err}); falling back to BFGS.");
                     match run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z) {
                         Ok((bfgs_solution, grad_norm_rho, stationary)) => Ok(OuterSolveResult {
                             final_rho: to_rho_from_z(&bfgs_solution.final_point),
@@ -1650,9 +1658,10 @@ where
 
         best_grad_norm = best_grad_norm.min(grad_norm);
         if best_stationary.is_some() && best_grad_norm <= near_stationary_tol {
-            eprintln!(
+            log::debug!(
                 "[external] early stop on near-stationary candidate (grad_norm={:.3e}, tol={:.3e})",
-                best_grad_norm, near_stationary_tol
+                best_grad_norm,
+                near_stationary_tol
             );
             break;
         }
@@ -1661,11 +1670,11 @@ where
     let chosen_solution = if let Some(sol) = best_stationary.or(best_nonstationary) {
         sol
     } else {
-        eprintln!(
+        log::warn!(
             "[external] all candidate seeds failed; using emergency fixed-rho fallback (rho=0)."
         );
         if !candidate_failures.is_empty() {
-            eprintln!(
+            log::warn!(
                 "[external] candidate failures summary ({}):\n{}",
                 candidate_failures.len(),
                 candidate_failures.join("\n")
@@ -1685,7 +1694,7 @@ where
         }
     };
     if !found_stationary {
-        eprintln!(
+        log::debug!(
             "[external] no stationary candidate found; using best non-stationary solution with grad_norm={:.3e}",
             best_grad_norm
         );
@@ -2461,8 +2470,8 @@ pub fn coefficient_uncertainty_with_mode(
         )));
     }
 
-    let z =
-        standard_normal_quantile(0.5 + 0.5 * confidence_level).map_err(EstimationError::InvalidInput)?;
+    let z = standard_normal_quantile(0.5 + 0.5 * confidence_level)
+        .map_err(EstimationError::InvalidInput)?;
     let lower = &fit.beta - &se.mapv(|s| z * s);
     let upper = &fit.beta + &se.mapv(|s| z * s);
     Ok(CoefficientUncertaintyResult {
@@ -4388,19 +4397,19 @@ pub mod internal {
 
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             if !p.is_empty() {
-                let kλ = p.len();
-                let kR = pirls_result.reparam_result.rs_transformed.len();
-                let kD = pirls_result.reparam_result.det1.len();
-                if !(kλ == kR && kR == kD) {
+                let k_lambda = p.len();
+                let k_r = pirls_result.reparam_result.rs_transformed.len();
+                let k_d = pirls_result.reparam_result.det1.len();
+                if !(k_lambda == k_r && k_r == k_d) {
                     return Err(EstimationError::LayoutError(format!(
                         "Penalty dimension mismatch: lambdas={}, R={}, det1={}",
-                        kλ, kR, kD
+                        k_lambda, k_r, k_d
                     )));
                 }
-                if self.nullspace_dims.len() != kλ {
+                if self.nullspace_dims.len() != k_lambda {
                     return Err(EstimationError::LayoutError(format!(
                         "Nullspace dimension mismatch: expected {} entries, got {}",
-                        kλ,
+                        k_lambda,
                         self.nullspace_dims.len()
                     )));
                 }
@@ -5215,19 +5224,19 @@ pub mod internal {
             let ridge_passport = bundle.ridge_passport;
 
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
-            let kλ = p.len();
-            let kR = pirls_result.reparam_result.rs_transformed.len();
-            let kD = pirls_result.reparam_result.det1.len();
-            if !(kλ == kR && kR == kD) {
+            let k_lambda = p.len();
+            let k_r = pirls_result.reparam_result.rs_transformed.len();
+            let k_d = pirls_result.reparam_result.det1.len();
+            if !(k_lambda == k_r && k_r == k_d) {
                 return Err(EstimationError::LayoutError(format!(
                     "Penalty dimension mismatch: lambdas={}, R={}, det1={}",
-                    kλ, kR, kD
+                    k_lambda, k_r, k_d
                 )));
             }
-            if self.nullspace_dims.len() != kλ {
+            if self.nullspace_dims.len() != k_lambda {
                 return Err(EstimationError::LayoutError(format!(
                     "Nullspace dimension mismatch: expected {} entries, got {}",
-                    kλ,
+                    k_lambda,
                     self.nullspace_dims.len()
                 )));
             }
