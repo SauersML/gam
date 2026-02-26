@@ -1,2 +1,15 @@
 target/
 Cargo.lock
+__pycache__/
+bench/**/__pycache__/
+benchmarks/**/__pycache__/
+tests/**/__pycache__/
+=
+benchmarks/results.cv_*.json
+benchmarks/results.*.local.json
+benchmarks/results.*.debug.json
+benchmarks/results.*.fair.json
+benchmarks/results*.json
+benchmarks/*.png
+benchmarks/*_fitted.csv
+benchmarks/datasets/hgdp_1kg_pc_data.tsv

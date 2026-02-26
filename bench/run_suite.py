@@ -1179,7 +1179,7 @@ def run_rust_scenario_cv(scenario):
     folds = folds_for_dataset(ds)
 
     build_code, build_out, build_err = run_cmd(
-        ["cargo", "build", "--release", "--bin", "cli"], cwd=ROOT
+        ["cargo", "build", "--release", "--bin", "gam"], cwd=ROOT
     )
     if build_code != 0:
         return {
@@ -1189,7 +1189,7 @@ def run_rust_scenario_cv(scenario):
             "error": build_err.strip() or build_out.strip(),
         }
 
-    bin_path = ROOT / "target" / "release" / "cli"
+    bin_path = ROOT / "target" / "release" / "gam"
     with tempfile.TemporaryDirectory(prefix="gam_bench_rust_cv_") as td:
         td_path = Path(td)
         data_csv = td_path / "data.csv"
@@ -1205,7 +1205,7 @@ def run_rust_scenario_cv(scenario):
             code, out, err = run_cmd(
                 [
                     str(bin_path),
-                    "__bench_cv",
+                    "bench-cv",
                     "--data",
                     str(data_csv),
                     "--train-idx",
