@@ -8,7 +8,6 @@ pub mod diagnostics;
 pub mod estimate;
 pub mod faer_ndarray;
 pub mod families;
-pub mod gamlss;
 pub mod generative;
 pub mod hmc;
 pub mod hull;
@@ -20,11 +19,12 @@ pub mod probability;
 pub mod quadrature;
 pub mod seeding;
 pub mod smooth;
-pub mod survival;
 pub mod types;
 pub mod visualizer;
 
 pub use families::custom_family;
+pub use families::gamlss;
+pub use families::survival;
 
 pub use alo::{
     AloDiagnostics, AloOptions, AloSeMode, compute_alo_diagnostics,
