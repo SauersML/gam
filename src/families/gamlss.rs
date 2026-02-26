@@ -438,7 +438,6 @@ fn emit_binomial_alpha_beta_warnings(
 #[derive(Clone)]
 struct BinomialAlphaBetaWarmStartFamily {
     y: Array1<f64>,
-    score: Array1<f64>,
     weights: Array1<f64>,
     beta_min: f64,
     beta_max: f64,
@@ -460,11 +459,7 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
         let n = self.y.len();
         let eta_alpha = &block_states[Self::BLOCK_ALPHA].eta;
         let eta_beta = &block_states[Self::BLOCK_BETA].eta;
-        if eta_alpha.len() != n
-            || eta_beta.len() != n
-            || self.score.len() != n
-            || self.weights.len() != n
-        {
+        if eta_alpha.len() != n || eta_beta.len() != n || self.weights.len() != n {
             return Err("BinomialAlphaBetaWarmStartFamily input size mismatch".to_string());
         }
 
@@ -482,7 +477,8 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
             } else {
                 0.0
             };
-            let q = eta_alpha[i] + beta * self.score[i];
+            let q = eta_alpha[i];
+            let chain_beta = 0.0 * dbeta_deta * beta;
             let mu = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
             let dmu_dq = normal_pdf(q).max(MIN_DERIV);
             let var = (mu * (1.0 - mu)).max(MIN_PROB);
@@ -493,7 +489,6 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
             w_alpha[i] = (self.weights[i] * (dmu_alpha * dmu_alpha / var)).max(MIN_WEIGHT);
             z_alpha[i] = eta_alpha[i] + (self.y[i] - mu) / signed_with_floor(dmu_alpha, MIN_DERIV);
 
-            let chain_beta = self.score[i] * dbeta_deta;
             let dmu_beta = dmu_dq * chain_beta;
             w_beta[i] = (self.weights[i] * (dmu_beta * dmu_beta / var)).max(MIN_WEIGHT);
             z_beta[i] = eta_beta[i] + (self.y[i] - mu) / signed_with_floor(dmu_beta, MIN_DERIV);
@@ -516,21 +511,13 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
         })
     }
 
-    fn post_update_beta(
-        &self,
-        block_index: usize,
-        beta: Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        if block_index != Self::BLOCK_BETA {
-            return Ok(beta);
-        }
+    fn post_update_beta(&self, beta: Array1<f64>) -> Result<Array1<f64>, String> {
         Ok(beta.mapv(|v| v.clamp(self.beta_min, self.beta_max)))
     }
 }
 
 fn try_binomial_alpha_beta_warm_start(
     y: &Array1<f64>,
-    score: &Array1<f64>,
     weights: &Array1<f64>,
     sigma_min: f64,
     sigma_max: f64,
@@ -542,7 +529,6 @@ fn try_binomial_alpha_beta_warm_start(
     let beta_max = (1.0 / sigma_min.max(1e-12)).max(beta_min + 1e-12);
     let warm_family = BinomialAlphaBetaWarmStartFamily {
         y: y.clone(),
-        score: score.clone(),
         weights: weights.clone(),
         beta_min,
         beta_max,
@@ -591,12 +577,20 @@ fn try_binomial_alpha_beta_warm_start(
             .map(|(&a, &b)| -a / b.max(1e-12)),
     );
     let log_sigma_target = beta_obs.mapv(|b| -b.max(1e-12).ln());
+    // T = -alpha/beta is noisy when beta is small (large sigma). Weight the
+    // projection by beta^2 (inverse variance of T under fixed alpha noise).
+    let t_projection_w = Array1::from_iter(
+        weights
+            .iter()
+            .zip(beta_obs.iter())
+            .map(|(&w, &b)| w * b * b),
+    );
 
     let beta_t = solve_weighted_projection(
         &threshold_block.design,
         &threshold_block.offset,
         &t_target,
-        weights,
+        &t_projection_w,
         options.ridge_floor.max(1e-10),
     )?;
     let beta_log_sigma = solve_weighted_projection(
@@ -646,7 +640,6 @@ pub struct GammaLogSpec {
 #[derive(Clone)]
 pub struct BinomialLocationScaleProbitSpec {
     pub y: Array1<f64>,
-    pub score: Array1<f64>,
     pub weights: Array1<f64>,
     pub sigma_min: f64,
     pub sigma_max: f64,
@@ -657,7 +650,6 @@ pub struct BinomialLocationScaleProbitSpec {
 #[derive(Clone)]
 pub struct BinomialLocationScaleProbitWiggleSpec {
     pub y: Array1<f64>,
-    pub score: Array1<f64>,
     pub weights: Array1<f64>,
     pub sigma_min: f64,
     pub sigma_max: f64,
@@ -760,7 +752,6 @@ pub fn fit_binomial_location_scale_probit(
     options: &BlockwiseFitOptions,
 ) -> Result<BlockwiseFitResult, String> {
     let n = spec.y.len();
-    validate_len_match("score vs y", n, spec.score.len())?;
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validate_weights(&spec.weights, "fit_binomial_location_scale_probit")?;
     validate_binomial_response(&spec.y, "fit_binomial_location_scale_probit")?;
@@ -774,7 +765,6 @@ pub fn fit_binomial_location_scale_probit(
 
     let BinomialLocationScaleProbitSpec {
         y,
-        score,
         weights,
         sigma_min,
         sigma_max,
@@ -784,7 +774,6 @@ pub fn fit_binomial_location_scale_probit(
 
     match try_binomial_alpha_beta_warm_start(
         &y,
-        &score,
         &weights,
         sigma_min,
         sigma_max,
@@ -807,7 +796,6 @@ pub fn fit_binomial_location_scale_probit(
 
     let family = BinomialLocationScaleProbitFamily {
         y: y.clone(),
-        score: score.clone(),
         weights: weights.clone(),
         sigma_min,
         sigma_max,
@@ -830,7 +818,6 @@ pub fn fit_binomial_location_scale_probit_wiggle(
     options: &BlockwiseFitOptions,
 ) -> Result<BlockwiseFitResult, String> {
     let n = spec.y.len();
-    validate_len_match("score vs y", n, spec.score.len())?;
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validate_weights(&spec.weights, "fit_binomial_location_scale_probit_wiggle")?;
     validate_binomial_response(&spec.y, "fit_binomial_location_scale_probit_wiggle")?;
@@ -858,7 +845,6 @@ pub fn fit_binomial_location_scale_probit_wiggle(
 
     let BinomialLocationScaleProbitWiggleSpec {
         y,
-        score,
         weights,
         sigma_min,
         sigma_max,
@@ -871,7 +857,6 @@ pub fn fit_binomial_location_scale_probit_wiggle(
 
     match try_binomial_alpha_beta_warm_start(
         &y,
-        &score,
         &weights,
         sigma_min,
         sigma_max,
@@ -894,7 +879,6 @@ pub fn fit_binomial_location_scale_probit_wiggle(
 
     let family = BinomialLocationScaleProbitWiggleFamily {
         y: y.clone(),
-        score: score.clone(),
         weights: weights.clone(),
         sigma_min,
         sigma_max,
@@ -942,7 +926,6 @@ struct BinomialLocationScaleCore {
 
 fn binomial_location_scale_core(
     y: &Array1<f64>,
-    score: &Array1<f64>,
     weights: &Array1<f64>,
     eta_t: &Array1<f64>,
     eta_ls: &Array1<f64>,
@@ -951,7 +934,7 @@ fn binomial_location_scale_core(
     sigma_max: f64,
 ) -> Result<BinomialLocationScaleCore, String> {
     let n = y.len();
-    if score.len() != n || weights.len() != n || eta_t.len() != n || eta_ls.len() != n {
+    if weights.len() != n || eta_t.len() != n || eta_ls.len() != n {
         return Err("binomial location-scale core size mismatch".to_string());
     }
     if let Some(w) = eta_wiggle {
@@ -975,7 +958,7 @@ fn binomial_location_scale_core(
         } else {
             0.0
         };
-        q0[i] = (score[i] - eta_t[i]) / sigma[i].max(1e-12);
+        q0[i] = -eta_t[i] / sigma[i].max(1e-12);
         let q = q0[i] + eta_wiggle.map_or(0.0, |w| w[i]);
         mu[i] = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
         dmu_dq[i] = normal_pdf(q).max(MIN_DERIV);
@@ -998,6 +981,7 @@ fn binomial_location_scale_working_sets(
     eta_t: &Array1<f64>,
     eta_ls: &Array1<f64>,
     eta_wiggle: Option<&Array1<f64>>,
+    dq_dq0: Option<&Array1<f64>>,
     core: &BinomialLocationScaleCore,
 ) -> (BlockWorkingSet, BlockWorkingSet, Option<BlockWorkingSet>) {
     let n = y.len();
@@ -1010,9 +994,10 @@ fn binomial_location_scale_working_sets(
 
     for i in 0..n {
         let var = (core.mu[i] * (1.0 - core.mu[i])).max(MIN_PROB);
+        let link_chain = dq_dq0.map_or(1.0, |v| v[i]);
 
         // Location/threshold chain: dq/deta_t = -1/sigma
-        let chain_t = -1.0 / core.sigma[i].max(1e-12);
+        let chain_t = -link_chain / core.sigma[i].max(1e-12);
         let dmu_t = core.dmu_dq[i] * chain_t;
         w_t[i] = (weights[i] * (dmu_t * dmu_t / var)).max(MIN_WEIGHT);
         z_t[i] = eta_t[i] + (y[i] - core.mu[i]) / signed_with_floor(dmu_t, MIN_DERIV);
@@ -1021,7 +1006,7 @@ fn binomial_location_scale_working_sets(
         // This is the generic location-scale structure; the -Z multiplier appears here.
         let chain_ls = {
             let s = core.sigma[i].max(1e-12);
-            -core.q0[i] * core.dsigma_deta[i] / s
+            -link_chain * core.q0[i] * core.dsigma_deta[i] / s
         };
         let dmu_ls = core.dmu_dq[i] * chain_ls;
         w_ls[i] = (weights[i] * (dmu_ls * dmu_ls / var)).max(MIN_WEIGHT);
@@ -1122,7 +1107,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
 
         let mut z_mu = Array1::<f64>::zeros(n);
         let mut w_mu = Array1::<f64>::zeros(n);
-        let mut z_ls = Array1::<f64>::zeros(n);
+        let z_ls = Array1::<f64>::zeros(n);
         let mut w_ls = Array1::<f64>::zeros(n);
 
         for i in 0..n {
@@ -1134,17 +1119,13 @@ impl CustomFamily for GaussianLocationScaleFamily {
             w_mu[i] = (self.weights[i] / s2).max(MIN_WEIGHT);
             z_mu[i] = eta_mu[i] + r;
 
-            // log-sigma block using score + expected information (Fisher)
-            // score_u = ((y-mu)^2 / sigma^2 - 1) * d(log sigma)/du, with u = eta_log_sigma.
             // Here d(log sigma)/du = dsigma/(sigma du).
             let dlogsigma_du = if dsigma_deta[i] == 0.0 {
                 0.0
             } else {
                 (dsigma_deta[i] / s).clamp(-1.0, 1.0)
             };
-            let score_u = self.weights[i] * ((r * r / s2) - 1.0) * dlogsigma_du;
             let info_u = (2.0 * self.weights[i] * dlogsigma_du * dlogsigma_du).max(MIN_WEIGHT);
-            z_ls[i] = eta_log_sigma[i] + score_u / info_u;
             w_ls[i] = info_u;
         }
 
@@ -1455,11 +1436,9 @@ impl CustomFamilyGenerative for GammaLogFamily {
 /// Parameters:
 /// - Block 0: threshold/location T(covariates)
 /// - Block 1: log-scale log σ(covariates)
-/// - fixed score input enters as q = (score - T) / σ
 #[derive(Clone)]
 pub struct BinomialLocationScaleProbitFamily {
     pub y: Array1<f64>,
-    pub score: Array1<f64>,
     pub weights: Array1<f64>,
     pub sigma_min: f64,
     pub sigma_max: f64,
@@ -1497,14 +1476,12 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n || self.score.len() != n
-        {
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
             return Err("BinomialLocationScaleProbitFamily input size mismatch".to_string());
         }
 
         let core = binomial_location_scale_core(
             &self.y,
-            &self.score,
             &self.weights,
             eta_t,
             eta_ls,
@@ -1517,6 +1494,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             &self.weights,
             eta_t,
             eta_ls,
+            None,
             None,
             &core,
         );
@@ -1541,16 +1519,16 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitFamily {
         }
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != self.score.len() || eta_ls.len() != self.score.len() {
+        if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() {
             return Err("BinomialLocationScaleProbitFamily generative size mismatch".to_string());
         }
-        let mut mean = Array1::<f64>::zeros(self.score.len());
+        let mut mean = Array1::<f64>::zeros(self.y.len());
         for i in 0..mean.len() {
             let sigma = eta_ls[i]
                 .exp()
                 .clamp(self.sigma_min, self.sigma_max)
                 .max(1e-12);
-            let q = (self.score[i] - eta_t[i]) / sigma;
+            let q = -eta_t[i] / sigma;
             mean[i] = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
         }
         Ok(GenerativeSpec {
@@ -1569,7 +1547,6 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitFamily {
 #[derive(Clone)]
 pub struct BinomialLocationScaleProbitWiggleFamily {
     pub y: Array1<f64>,
-    pub score: Array1<f64>,
     pub weights: Array1<f64>,
     pub sigma_min: f64,
     pub sigma_max: f64,
@@ -1625,6 +1602,33 @@ impl BinomialLocationScaleProbitWiggleFamily {
         Ok(full.slice(s![.., 1..]).to_owned())
     }
 
+    fn wiggle_dq_dq0(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        beta_wiggle: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let (dbasis, _) = create_basis::<Dense>(
+            q0,
+            KnotSource::Provided(self.wiggle_knots.view()),
+            self.wiggle_degree,
+            BasisOptions::first_derivative(),
+        )
+        .map_err(|e| e.to_string())?;
+        let full = (*dbasis).clone();
+        if full.ncols() < 2 {
+            return Err("wiggle derivative basis has fewer than two columns".to_string());
+        }
+        let d_no_intercept = full.slice(s![.., 1..]).to_owned();
+        if d_no_intercept.ncols() != beta_wiggle.len() {
+            return Err(format!(
+                "wiggle derivative col mismatch: got {}, expected {}",
+                d_no_intercept.ncols(),
+                beta_wiggle.len()
+            ));
+        }
+        Ok(d_no_intercept.dot(&beta_wiggle) + 1.0)
+    }
+
     /// Build a turnkey wiggle block from a q-seed vector and knot settings.
     /// Returns both the block input and the generated knot vector.
     pub fn build_wiggle_block_input(
@@ -1658,13 +1662,12 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let eta_w = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != n || eta_ls.len() != n || eta_w.len() != n || self.score.len() != n {
+        if eta_t.len() != n || eta_ls.len() != n || eta_w.len() != n || self.weights.len() != n {
             return Err("BinomialLocationScaleProbitWiggleFamily input size mismatch".to_string());
         }
 
         let core = binomial_location_scale_core(
             &self.y,
-            &self.score,
             &self.weights,
             eta_t,
             eta_ls,
@@ -1672,12 +1675,15 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             self.sigma_min,
             self.sigma_max,
         )?;
+        let dq_dq0 =
+            self.wiggle_dq_dq0(core.q0.view(), block_states[Self::BLOCK_WIGGLE].beta.view())?;
         let (t_ws, ls_ws, w_ws) = binomial_location_scale_working_sets(
             &self.y,
             &self.weights,
             eta_t,
             eta_ls,
             Some(eta_w),
+            Some(&dq_dq0),
             &core,
         );
         let w_ws = w_ws.ok_or_else(|| "wiggle working set missing".to_string())?;
@@ -1697,11 +1703,10 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
 
     fn block_geometry(
         &self,
-        block_index: usize,
         block_states: &[ParameterBlockState],
         spec: &crate::custom_family::ParameterBlockSpec,
     ) -> Result<(DesignMatrix, Array1<f64>), String> {
-        if block_index != Self::BLOCK_WIGGLE {
+        if spec.name != "wiggle" {
             return Ok((spec.design.clone(), spec.offset.clone()));
         }
         if block_states.len() < 2 {
@@ -1709,16 +1714,16 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         }
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != self.score.len() || eta_ls.len() != self.score.len() {
+        if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() {
             return Err("wiggle geometry input size mismatch".to_string());
         }
-        let mut q0 = Array1::<f64>::zeros(self.score.len());
+        let mut q0 = Array1::<f64>::zeros(eta_t.len());
         for i in 0..q0.len() {
             let sigma = eta_ls[i]
                 .exp()
                 .clamp(self.sigma_min, self.sigma_max)
                 .max(1e-12);
-            q0[i] = (self.score[i] - eta_t[i]) / sigma;
+            q0[i] = -eta_t[i] / sigma;
         }
         let x = self.wiggle_design(q0.view())?;
         if x.ncols() != spec.design.ncols() {
@@ -1747,21 +1752,21 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let eta_w = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != self.score.len()
-            || eta_ls.len() != self.score.len()
-            || eta_w.len() != self.score.len()
+        if eta_t.len() != self.y.len()
+            || eta_ls.len() != self.y.len()
+            || eta_w.len() != self.y.len()
         {
             return Err(
                 "BinomialLocationScaleProbitWiggleFamily generative size mismatch".to_string(),
             );
         }
-        let mut mean = Array1::<f64>::zeros(self.score.len());
+        let mut mean = Array1::<f64>::zeros(self.y.len());
         for i in 0..mean.len() {
             let sigma = eta_ls[i]
                 .exp()
                 .clamp(self.sigma_min, self.sigma_max)
                 .max(1e-12);
-            let q0 = (self.score[i] - eta_t[i]) / sigma;
+            let q0 = -eta_t[i] / sigma;
             mean[i] = normal_cdf_approx(q0 + eta_w[i]).clamp(MIN_PROB, 1.0 - MIN_PROB);
         }
         Ok(GenerativeSpec {
@@ -1803,14 +1808,12 @@ mod tests {
     fn alpha_beta_warm_start_produces_finite_targets() {
         let n = 16usize;
         let y = Array1::from_vec((0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect());
-        let score = Array1::from_vec((0..n).map(|i| i as f64 / n as f64 - 0.5).collect());
         let weights = Array1::from_vec(vec![1.0; n]);
         let threshold = intercept_block(n);
         let log_sigma = intercept_block(n);
 
         let (beta_t, beta_ls, beta_obs) = try_binomial_alpha_beta_warm_start(
             &y,
-            &score,
             &weights,
             0.25,
             4.0,
@@ -1831,11 +1834,9 @@ mod tests {
     fn fit_binomial_location_scale_probit_runs_with_warm_start_path() {
         let n = 32usize;
         let y = Array1::from_vec((0..n).map(|i| if i % 4 == 0 { 1.0 } else { 0.0 }).collect());
-        let score = Array1::from_vec((0..n).map(|i| (i as f64 - 16.0) / 10.0).collect());
         let weights = Array1::from_vec(vec![1.0; n]);
         let spec = BinomialLocationScaleProbitSpec {
             y,
-            score,
             weights,
             sigma_min: 0.3,
             sigma_max: 3.0,
@@ -1847,5 +1848,95 @@ mod tests {
             .expect("binomial location-scale probit should fit");
         assert_eq!(fit.block_states.len(), 2);
         assert!(fit.log_likelihood.is_finite());
+    }
+
+    #[test]
+    fn wiggle_chain_rule_scales_location_and_scale_working_weights() {
+        let n = 6usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let eta_t = Array1::from_vec(vec![0.3, -0.2, 0.4, -0.1, 0.2, -0.3]);
+        let eta_ls = Array1::from_vec(vec![-0.4, -0.1, 0.0, 0.1, 0.2, -0.2]);
+
+        let q_seed = Array1::from_vec(vec![-1.5, -0.8, -0.1, 0.4, 1.1, 1.7]);
+        let (wiggle_block, knots) =
+            BinomialLocationScaleProbitWiggleFamily::build_wiggle_block_input(
+                q_seed.view(),
+                2,
+                3,
+                2,
+                false,
+            )
+            .expect("wiggle block");
+        let family = BinomialLocationScaleProbitWiggleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            sigma_min: 0.05,
+            sigma_max: 20.0,
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+        };
+
+        let core_for_q0 = binomial_location_scale_core(
+            &y,
+            &weights,
+            &eta_t,
+            &eta_ls,
+            None,
+            family.sigma_min,
+            family.sigma_max,
+        )
+        .expect("core q0");
+        let beta_wiggle = Array1::from_vec(vec![0.1; wiggle_block.design.ncols()]);
+        let eta_w = family
+            .wiggle_design(core_for_q0.q0.view())
+            .expect("wiggle design")
+            .dot(&beta_wiggle);
+
+        let core = binomial_location_scale_core(
+            &y,
+            &weights,
+            &eta_t,
+            &eta_ls,
+            Some(&eta_w),
+            family.sigma_min,
+            family.sigma_max,
+        )
+        .expect("core");
+        let dq_dq0 = family
+            .wiggle_dq_dq0(core.q0.view(), beta_wiggle.view())
+            .expect("dq/dq0");
+        let (t_ws, ls_ws, _w) = binomial_location_scale_working_sets(
+            &y,
+            &weights,
+            &eta_t,
+            &eta_ls,
+            Some(&eta_w),
+            Some(&dq_dq0),
+            &core,
+        );
+
+        for i in 0..n {
+            let var = (core.mu[i] * (1.0 - core.mu[i])).max(MIN_PROB);
+            let s = core.sigma[i].max(1e-12);
+            let dmu_t = core.dmu_dq[i] * (-dq_dq0[i] / s);
+            let dmu_ls = core.dmu_dq[i] * (-dq_dq0[i] * core.q0[i] * core.dsigma_deta[i] / s);
+            let expected_w_t = (weights[i] * (dmu_t * dmu_t / var)).max(MIN_WEIGHT);
+            let expected_w_ls = (weights[i] * (dmu_ls * dmu_ls / var)).max(MIN_WEIGHT);
+            assert!(
+                (t_ws.working_weights[i] - expected_w_t).abs() < 1e-10,
+                "threshold weight mismatch at {}: got {}, expected {}",
+                i,
+                t_ws.working_weights[i],
+                expected_w_t
+            );
+            assert!(
+                (ls_ws.working_weights[i] - expected_w_ls).abs() < 1e-10,
+                "log-sigma weight mismatch at {}: got {}, expected {}",
+                i,
+                ls_ws.working_weights[i],
+                expected_w_ls
+            );
+        }
     }
 }

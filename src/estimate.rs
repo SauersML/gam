@@ -54,26 +54,6 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 
-fn logit_from_prob(p: f64) -> f64 {
-    let p = p.clamp(1e-8, 1.0 - 1e-8);
-    (p / (1.0 - p)).ln()
-}
-
-fn eta_from_mu_for_link(mu: f64, link: LinkFunction) -> f64 {
-    match link {
-        LinkFunction::Identity => mu,
-        LinkFunction::Logit => logit_from_prob(mu),
-        LinkFunction::Probit => {
-            let p = mu.clamp(1e-8, 1.0 - 1e-8);
-            standard_normal_quantile(p).unwrap_or(0.0)
-        }
-        LinkFunction::CLogLog => {
-            let p = mu.clamp(1e-12, 1.0 - 1e-12);
-            (-(1.0 - p).ln()).ln()
-        }
-    }
-}
-
 use crate::diagnostics::{
     approx_f64, format_compact_series, format_cond, format_range, quantize_value, quantize_vec,
     should_emit_h_min_eig_diag,
@@ -1138,7 +1118,6 @@ impl core::fmt::Debug for EstimationError {
     }
 }
 
-// Train a joint single-index model with flexible link calibration.
 //
 // This uses the joint model architecture where the base predictor and
 // flexible link are fitted together in one optimization with REML.
@@ -4280,8 +4259,6 @@ pub mod internal {
     }
     impl<'a> RemlState<'a> {
         /// Compute the objective function for BFGS optimization.
-        /// For Gaussian models (Identity link), this is the exact REML score.
-        /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
         ///
         /// FULL OBJECTIVE REFERENCE
         /// ------------------------
@@ -4456,7 +4433,6 @@ pub mod internal {
 
             match self.config.link_function() {
                 LinkFunction::Identity => {
-                    // For Gaussian models, use the exact REML score
                     // From Wood (2017), Chapter 6, Eq. 6.24:
                     // V_r(λ) = D_p/(2φ) + (r/2φ) + ½log|X'X/φ + S_λ/φ| - ½log|S_λ/φ|_+
                     // where D_p = ||y - Xβ̂||² + β̂'S_λβ̂ is the PENALIZED deviance
@@ -4590,12 +4566,10 @@ pub mod internal {
 
                     let prior_cost = self.compute_soft_prior_cost(p);
 
-                    // Return the REML score (which is a negative log-likelihood, i.e., a cost to be minimized)
                     Ok(reml + prior_cost)
                 }
                 _ => {
                     // For non-Gaussian GLMs, use the LAML approximation
-                    // Penalized log-likelihood part of the score.
                     // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
                     // Use stable penalty term calculated in P-IRLS
                     let mut penalised_ll =
@@ -4636,7 +4610,6 @@ pub mod internal {
                     // the exact gradient path (documented in compute_gradient).
                     let log_det_h = bundle.h_total_log_det;
 
-                    // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2πφ)
                     // Mp is null space dimension (number of unpenalized coefficients)
                     // For logit, scale parameter is typically fixed at 1.0, but include for completeness
                     let phi = 1.0; // Logit family typically has dispersion parameter = 1
@@ -4919,7 +4892,6 @@ pub mod internal {
                 }
             }
         }
-        /// Compute the gradient of the REML/LAML score with respect to the log-smoothing parameters (ρ).
         ///
         /// -------------------------------------------------------------------------
         /// Exact non-Laplace evidence identities (reference comments; not runtime path)
@@ -4968,7 +4940,6 @@ pub mod internal {
         /// Equivalently, since β|ω,y,ρ ~ N(μ,Q^{-1}):
         ///   E[βᵀS_kβ | ω,y,ρ] = tr(S_k Q^{-1}) + μᵀS_kμ.
         ///
-        /// For Poisson-log, exact Mellin-Barnes / multi-index reductions exist,
         /// yielding exact (but high-dimensional) contour integrals / series after
         /// analytically integrating β.
         ///
@@ -4995,7 +4966,6 @@ pub mod internal {
         /// Curvature:
         ///   H(ρ) = -∇²_β ℓ(β̂(ρ)) + S(ρ)
         ///
-        /// For GLM single-index structure (η = Xβ + o), define per-observation derivatives:
         ///   w_i = -∂²ℓ_i/∂η_i²
         ///   d_i = -∂³ℓ_i/∂η_i³
         ///   e_i = -∂⁴ℓ_i/∂η_i⁴
@@ -5727,7 +5697,6 @@ pub mod internal {
                             //   tr(H^{-1}H_k) = tr(H^{-1}A_k) + tr(H^{-1}D(-∇²ℓ)[B_k]),
                             // with B_k = -H^{-1}(A_kβ̂).
                             //
-                            // For GLM single-index structure:
                             //   D(-∇²ℓ)[B_k] = Xᵀ diag(d ⊙ (X B_k)) X,
                             // where d_i = -∂³ℓ_i/∂η_i³. Here `c_vec` stores this per-observation
                             // third derivative quantity in the stabilized logit path.
@@ -5855,7 +5824,6 @@ pub mod internal {
                 (gradient_result, gradient_snapshot, None::<Vec<f64>>)
             };
 
-            // The optimizer MINIMIZES a cost function. The score is MAXIMIZED.
             // The gradient buffer stored in the workspace already holds -∇V(ρ),
             // which is exactly what the optimizer needs.
             // No final negation is needed.
@@ -6936,22 +6904,10 @@ pub mod internal {
 
             // === Strategy 1: KKT/Envelope Theorem Audit ===
             // Check if the inner solver actually reached stationarity
-            // Compute score gradient (X'W(y-μ) for GLM) and penalty gradient (S_λ β)
             let reparam = &pirls_result.reparam_result;
             let penalty_grad = reparam.s_transformed.dot(beta);
 
-            // Approximate score gradient using working residuals from PIRLS
-            let eta = pirls_result
-                .solve_mu
-                .mapv(|m| eta_from_mu_for_link(m, self.config.link_function()));
-            let working_residual = &pirls_result.solve_working_response - &eta;
-            let weighted_residual = &pirls_result.solve_weights * &working_residual;
-            let score_grad = pirls_result
-                .x_transformed
-                .transpose_vector_multiply(&weighted_residual);
-
             let envelope_audit = compute_envelope_audit(
-                &score_grad,
                 &penalty_grad,
                 pirls_result.ridge_passport.delta,
                 ridge_used, // What gradient assumes

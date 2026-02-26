@@ -966,7 +966,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
         let cols = x_view.col_idx_of_row_raw(i);
         if cols.len() != vals.len() {
             return Err(EstimationError::InvalidInput(
-                "sparse row value/index length mismatch".to_string(),
+                "sparse row structure mismatch: column/value lengths differ".to_string(),
             ));
         }
         let mut quad = 0.0;
@@ -1451,7 +1451,6 @@ pub enum PirlsStatus {
 ///
 /// The coefficients returned by PIRLS are the **posterior mode** (Maximum A Posteriori estimate),
 /// not the posterior mean. For risk predictions, the posterior mean is theoretically preferable
-/// because it minimizes Brier score / squared prediction error. If the posterior is symmetric,
 /// mode ≈ mean and it doesn't matter. For asymmetric posteriors (rare events, boundary effects),
 /// the mean would give more accurate calibrated probabilities. To obtain the posterior mean,
 /// one would need MCMC sampling from the posterior and average f(patient, β) over samples.

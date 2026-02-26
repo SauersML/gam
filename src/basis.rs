@@ -3736,7 +3736,6 @@ pub fn null_range_whiten(s_1d: &Array2<f64>) -> Result<(Array2<f64>, Array2<f64>
     Ok((z_null, z_range_whiten))
 }
 
-/// Helper function to select specific columns from a matrix by index.
 /// This is needed because ndarray doesn't have a direct way to select non-contiguous columns.
 fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
     let nrows = matrix.nrows();
@@ -3970,11 +3969,13 @@ pub(crate) mod internal {
         debug_assert_eq!(basis_values.len(), num_basis);
         let n = &scratch.n;
         basis_values.fill(0.0);
-        let start_index = mu.saturating_sub(DEGREE);
         for i in 0..=DEGREE {
-            let global_idx = start_index + i;
-            if global_idx < num_basis {
-                basis_values[global_idx] = n[i];
+            let gi = mu as isize + i as isize - DEGREE as isize;
+            if gi >= 0 {
+                let global_idx = gi as usize;
+                if global_idx < num_basis {
+                    basis_values[global_idx] = n[i];
+                }
             }
         }
     }
@@ -3991,11 +3992,13 @@ pub(crate) mod internal {
         debug_assert_eq!(basis_values.len(), num_basis);
         let n = &scratch.n;
         basis_values.fill(0.0);
-        let start_index = mu.saturating_sub(degree);
         for i in 0..=degree {
-            let global_idx = start_index + i;
-            if global_idx < num_basis {
-                basis_values[global_idx] = n[i];
+            let gi = mu as isize + i as isize - degree as isize;
+            if gi >= 0 {
+                let global_idx = gi as usize;
+                if global_idx < num_basis {
+                    basis_values[global_idx] = n[i];
+                }
             }
         }
     }
@@ -4330,10 +4333,9 @@ mod tests {
     /// This can be used to cross-validate the iterative implementation in evaluate_splines_at_point.
     fn evaluate_bspline(x: f64, knots: &Array1<f64>, i: usize, degree: usize) -> f64 {
         let last_knot = *knots.last().expect("knot vector should be non-empty");
-        let last_basis_index = knots.len() - degree - 2;
-
         if (x - last_knot).abs() < 1e-12 {
-            return if i == last_basis_index { 1.0 } else { 0.0 };
+            let num_basis = knots.len() - degree - 1;
+            return if i + 1 == num_basis { 1.0 } else { 0.0 };
         }
 
         // Base case for degree 0
@@ -4344,13 +4346,6 @@ mod tests {
             if x >= knots[i] && x < knots[i + 1] {
                 return 1.0;
             }
-            // This is the critical special case for the end of the domain.
-            // If it's the last possible interval AND x is exactly at the end of that interval, it's 1.
-            // This ensures partition of unity holds at the rightmost boundary.
-            if i == knots.len() - 2 && x == knots[i + 1] {
-                return 1.0;
-            }
-
             return 0.0;
         } else {
             // Recursion for degree > 0
@@ -5298,7 +5293,6 @@ mod tests {
         let predictions_on_grid = intercept_coeff + main_basis_con.dot(&main_coeffs);
 
         // --- On-grid consistency check ---
-        // Let's test the point x=0.6, which corresponds to index 6 in our `data` grid.
         let test_point_on_grid_x = 0.6;
         let on_grid_idx = 6;
 

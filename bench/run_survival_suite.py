@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RUN_SUITE = ROOT / "bench" / "run_suite.py"
-SCENARIOS = ROOT / "benchmarks" / "scenarios.json"
+SCENARIOS = ROOT / "bench" / "scenarios.json"
 DEFAULT_SURVIVAL_SCENARIOS = [
     "heart_failure_survival",
     "icu_survival_death",
@@ -28,7 +28,7 @@ def main() -> int:
     parser.add_argument(
         "--out",
         type=Path,
-        default=ROOT / "benchmarks" / "results.survival.json",
+        default=ROOT / "bench" / "results.survival.json",
     )
     args = parser.parse_args()
 

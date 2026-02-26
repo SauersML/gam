@@ -42,7 +42,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(name = "gam")]
@@ -70,10 +69,7 @@ struct FitArgs {
     data: PathBuf,
     #[arg(short = 'f', long = "formula", alias = "predict-mean")]
     formula: Option<String>,
-    /// Observed score/liability proxy column S used in binomial location-scale probit:
     /// P(Y=1|S,x)=Phi((S-T(x))/sigma(x)).
-    #[arg(long = "score-column")]
-    score_column: Option<String>,
     #[arg(long = "predict-noise", alias = "predict-variance")]
     predict_noise: Option<String>,
     #[arg(long = "target")]
@@ -228,8 +224,6 @@ struct SavedModel {
     formula_noise: Option<String>,
     #[serde(default)]
     beta_noise: Option<Vec<f64>>,
-    #[serde(default)]
-    score_column: Option<String>,
     #[serde(default)]
     sigma_min: Option<f64>,
     #[serde(default)]
@@ -404,11 +398,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             "--firth is not supported with --predict-noise location-scale fitting".to_string(),
         );
     }
-    if args.score_column.is_some() && args.predict_noise.is_none() {
-        return Err(
-            "--score-column is only used with --predict-noise location-scale fitting".to_string(),
-        );
-    }
     if args.learn_link_wiggle && args.predict_noise.is_none() {
         return Err(
             "--learn-link-wiggle currently requires --predict-noise with binomial-probit location-scale fitting"
@@ -431,9 +420,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             .map_err(|e| format!("failed to build mean term collection design: {e}"))?;
 
         if family == LikelihoodFamily::GaussianIdentity {
-            if args.score_column.is_some() {
+            if args.learn_link_wiggle {
                 return Err(
-                    "--score-column applies to binomial-probit location-scale only, not Gaussian"
+                    "--learn-link-wiggle is currently supported only for binomial-probit location-scale fitting"
                         .to_string(),
                 );
             }
@@ -478,7 +467,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
                     link_choice.map(link_choice_to_string),
                     noise_formula.clone(),
-                    None,
                     fit.block_states
                         .first()
                         .map(|b| b.beta.to_vec())
@@ -502,14 +490,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
         let sigma_min = 0.05;
         let sigma_max = 20.0;
-        let score = if let Some(col_name) = &args.score_column {
-            let score_col = *col_map
-                .get(col_name)
-                .ok_or_else(|| format!("score column '{}' not found", col_name))?;
-            ds.values.column(score_col).to_owned()
-        } else {
-            Array1::<f64>::zeros(y.len())
-        };
+        let q_seed = Array1::<f64>::zeros(y.len());
         let options = gam::BlockwiseFitOptions::default();
         let threshold_block = ParameterBlockInput {
             design: DesignMatrix::Dense(mean_design.design.clone()),
@@ -543,12 +524,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 double_penalty: args.link_wiggle_double_penalty,
             };
             let (wiggle_block, wiggle_knots) =
-                build_wiggle_block_input_from_seed(score.view(), &cfg)
+                build_wiggle_block_input_from_seed(q_seed.view(), &cfg)
                     .map_err(|e| format!("failed to build link wiggle block: {e}"))?;
             let fit = fit_binomial_location_scale_probit_wiggle(
                 BinomialLocationScaleProbitWiggleSpec {
                     y: y.clone(),
-                    score: score.clone(),
                     weights: Array1::ones(y.len()),
                     sigma_min,
                     sigma_max,
@@ -571,7 +551,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             let fit = fit_binomial_location_scale_probit(
                 BinomialLocationScaleProbitSpec {
                     y: y.clone(),
-                    score: score.clone(),
                     weights: Array1::ones(y.len()),
                     sigma_min,
                     sigma_max,
@@ -595,7 +574,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT.to_string(),
                 Some("probit".to_string()),
                 noise_formula,
-                args.score_column.clone(),
                 fit.block_states
                     .first()
                     .map(|b| b.beta.to_vec())
@@ -674,7 +652,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     family: family_to_string(family).to_string(),
                     link: Some(link_choice_to_string(choice)),
                     formula_noise: None,
-                    score_column: None,
                     beta_noise: None,
                     sigma_min: None,
                     sigma_max: None,
@@ -764,7 +741,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             family: family_to_string(family).to_string(),
             link: link_choice.map(link_choice_to_string),
             formula_noise: None,
-            score_column: None,
             beta_noise: None,
             sigma_min: None,
             sigma_max: None,
@@ -1028,20 +1004,11 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         let sigma_min = model.sigma_min.unwrap_or(0.05);
         let sigma_max = model.sigma_max.unwrap_or(20.0);
         let sigma = eta_noise.mapv(|v| v.exp().clamp(sigma_min, sigma_max));
-        let score = if let Some(col_name) = &model.score_column {
-            let score_col = *col_map
-                .get(col_name)
-                .ok_or_else(|| format!("score column '{}' not found", col_name))?;
-            ds.values.column(score_col).to_owned()
-        } else {
-            Array1::<f64>::zeros(eta_t.len())
-        };
         let q0 = Array1::from_iter(
-            score
+            eta_t
                 .iter()
-                .zip(eta_t.iter())
                 .zip(sigma.iter())
-                .map(|((&s_obs, &t), &s)| ((s_obs - t) / s.max(1e-12)).clamp(-30.0, 30.0)),
+                .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
         );
         let eta = apply_saved_probit_wiggle(&q0, &model)?.mapv(|v| v.clamp(-30.0, 30.0));
         let mean = eta.mapv(normal_cdf_approx);
@@ -1932,13 +1899,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
 
-    let fit_start = Instant::now();
     let mut beta = Array1::<f64>::zeros(p);
     beta[0] = -3.0;
     beta[1] = 1.0;
-    let mut iterations = 0usize;
     let mut last_obj = f64::INFINITY;
-    for iter in 0..400usize {
+    for _ in 0..400usize {
         let state = model
             .update_state(&beta)
             .map_err(|e| format!("survival update_state failed: {e}"))?;
@@ -1946,7 +1911,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let grad = state.gradient;
         let grad_norm = grad.dot(&grad).sqrt();
         if grad_norm < 1e-6 || (last_obj - obj).abs() < 1e-9 {
-            iterations = iter + 1;
             break;
         }
         let direction = grad.mapv(|g| -g);
@@ -1965,23 +1929,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             }
             step *= 0.5;
         }
-        iterations = iter + 1;
         if !accepted {
             break;
         }
     }
-    let fit_sec = fit_start.elapsed().as_secs_f64();
 
     let state = model
         .update_state(&beta)
         .map_err(|e| format!("survival final state failed: {e}"))?;
-    let score = state.eta.0.clone();
-    let c_index = c_index_survival(&age_exit.to_vec(), &event_target.to_vec(), &score.to_vec());
 
-    println!(
-        "{{\"status\":\"ok\",\"fit_sec\":{:.6},\"iterations\":{},\"c_index\":{:.6},\"n\":{},\"p\":{}}}",
-        fit_sec, iterations, c_index, n, p
-    );
+    println!();
     println!(
         "survival config | likelihood={} | time_basis={} | baseline_target={}",
         survival_likelihood_mode_name(likelihood_mode),
@@ -1998,7 +1955,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             family: family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             link: None,
             formula_noise: None,
-            score_column: None,
             beta_noise: None,
             sigma_min: None,
             sigma_max: None,
@@ -2360,20 +2316,11 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
             .design
             .dot(&beta_noise)
             .mapv(|v| v.exp().clamp(sigma_min, sigma_max));
-        let score = if let Some(col_name) = &model.score_column {
-            let score_col = *col_map
-                .get(col_name)
-                .ok_or_else(|| format!("score column '{}' not found", col_name))?;
-            ds.values.column(score_col).to_owned()
-        } else {
-            Array1::<f64>::zeros(eta_t.len())
-        };
         let q0 = Array1::from_iter(
-            score
+            eta_t
                 .iter()
-                .zip(eta_t.iter())
                 .zip(sigma.iter())
-                .map(|((&s_obs, &t), &s)| ((s_obs - t) / s.max(1e-12)).clamp(-30.0, 30.0)),
+                .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
         );
         let mean = apply_saved_probit_wiggle(&q0, &model)?
             .mapv(|v| normal_cdf_approx(v.clamp(-30.0, 30.0)));
@@ -2454,7 +2401,6 @@ fn build_location_scale_saved_model(
     family: String,
     link: Option<String>,
     noise_formula: String,
-    score_column: Option<String>,
     beta: Vec<f64>,
     beta_noise: Option<Vec<f64>>,
     sigma_min: f64,
@@ -2467,7 +2413,6 @@ fn build_location_scale_saved_model(
         family,
         link,
         formula_noise: Some(noise_formula),
-        score_column,
         beta_noise,
         sigma_min: Some(sigma_min),
         sigma_max: Some(sigma_max),
@@ -3684,39 +3629,4 @@ fn write_prediction_csv(
     wtr.flush()
         .map_err(|e| format!("failed to flush csv writer: {e}"))?;
     Ok(())
-}
-
-fn c_index_survival(time: &[f64], event: &[u8], risk: &[f64]) -> f64 {
-    let n = time.len().min(event.len()).min(risk.len());
-    if n < 2 {
-        return 0.5;
-    }
-    let mut concordant = 0.0;
-    let mut tied = 0.0;
-    let mut comparable = 0.0;
-    for i in 0..n {
-        if event[i] == 0 {
-            continue;
-        }
-        for j in 0..n {
-            if i == j {
-                continue;
-            }
-            if time[i] < time[j] {
-                comparable += 1.0;
-                let ri = risk[i];
-                let rj = risk[j];
-                if ri > rj {
-                    concordant += 1.0;
-                } else if (ri - rj).abs() < 1e-12 {
-                    tied += 1.0;
-                }
-            }
-        }
-    }
-    if comparable <= 0.0 {
-        0.5
-    } else {
-        (concordant + 0.5 * tied) / comparable
-    }
 }

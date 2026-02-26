@@ -14,7 +14,6 @@
       "predict_sec": 1.2e-05,
       "auc": 0.8248214166666666,
       "brier": null,
-      "c_index": 0.8248214166666666,
       "rmse": null,
       "r2": null,
       "model_spec": "5-fold CV (Rust native Royston-Parmar survival)"
@@ -27,7 +26,6 @@
       "predict_sec": 0.005,
       "auc": 0.809320652173913,
       "brier": null,
-      "c_index": 0.809320652173913,
       "rmse": null,
       "r2": null,
       "model_spec": "Surv(time, event) ~ drug + sex_male + ascites + hepatomegaly + spiders + edema + age + bilirubin + cholesterol + albumin + copper + alk_phos + sgot + tryglicerides + platelets + prothrombin + stage [5-fold CV]"
@@ -40,10 +38,8 @@
       "predict_sec": 0.00752,
       "auc": 0.7900064309330305,
       "brier": null,
-      "c_index": 0.7900064309330305,
       "rmse": null,
       "r2": null,
-      "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4) [5-fold CV]"
     }
   ]
 }

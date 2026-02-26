@@ -115,9 +115,7 @@ pub fn sample_observations<R: rand::Rng + ?Sized>(
                     continue;
                 }
                 let dist = rand_distr::Normal::new(0.0, sd).map_err(|e| {
-                    EstimationError::InvalidInput(format!(
-                        "invalid Gaussian sigma at index {i}: {e}"
-                    ))
+                    EstimationError::InvalidInput(format!("invalid Gaussian noise scale {sd}: {e}"))
                 })?;
                 y[i] += rand_distr::Distribution::sample(&dist, rng);
             }
@@ -128,7 +126,7 @@ pub fn sample_observations<R: rand::Rng + ?Sized>(
             for i in 0..y.len() {
                 let lam = spec.mean[i].max(1e-12);
                 let dist = rand_distr::Poisson::new(lam).map_err(|e| {
-                    EstimationError::InvalidInput(format!("invalid Poisson mean at index {i}: {e}"))
+                    EstimationError::InvalidInput(format!("invalid Poisson rate {lam}: {e}"))
                 })?;
                 let draw = rand_distr::Distribution::sample(&dist, rng);
                 y[i] = draw as f64;
@@ -146,7 +144,10 @@ pub fn sample_observations<R: rand::Rng + ?Sized>(
                 let mu = spec.mean[i].max(1e-12);
                 let scale = (mu / *shape).max(1e-12);
                 let dist = rand_distr::Gamma::new(*shape, scale).map_err(|e| {
-                    EstimationError::InvalidInput(format!("invalid Gamma params at index {i}: {e}"))
+                    EstimationError::InvalidInput(format!(
+                        "invalid Gamma params shape={} scale={scale}: {e}",
+                        *shape
+                    ))
                 })?;
                 y[i] = rand_distr::Distribution::sample(&dist, rng);
             }
@@ -157,9 +158,7 @@ pub fn sample_observations<R: rand::Rng + ?Sized>(
             for i in 0..y.len() {
                 let p = spec.mean[i].clamp(1e-12, 1.0 - 1e-12);
                 let dist = rand_distr::Bernoulli::new(p).map_err(|e| {
-                    EstimationError::InvalidInput(format!(
-                        "invalid Bernoulli probability at index {i}: {e}"
-                    ))
+                    EstimationError::InvalidInput(format!("invalid Bernoulli probability {p}: {e}"))
                 })?;
                 y[i] = if rand_distr::Distribution::sample(&dist, rng) {
                     1.0

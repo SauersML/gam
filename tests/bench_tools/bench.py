@@ -192,7 +192,6 @@ def _dedup_label_blocks(lines: list[str]) -> list[str]:
 def prepare_training_tsv_from_df(df: pd.DataFrame, out_path: Path):
     # Map mgcv columns -> calibrate training schema
     mapping = {
-        "variable_one": "score",   # unpenalized PGS-like
         "variable_two": "PC1",     # penalized PC-like
         "outcome": "phenotype",
     }
@@ -200,7 +199,6 @@ def prepare_training_tsv_from_df(df: pd.DataFrame, out_path: Path):
     if not required.issubset(df.columns):
         raise RuntimeError(f"Input DF missing required columns: {sorted(required - set(df.columns))}")
     df2 = df.rename(columns=mapping)
-    df2[["phenotype", "score", "PC1"]].to_csv(out_path, sep="\t", index=False)
 
 
 def _run_perf_record(app_cmd: list[str], perf_data: Path, env: dict) -> float:
@@ -254,7 +252,6 @@ def train_with_perf(train_tsv: Path, tag: str):
     cmd = [
         str(EXECUTABLE_PATH), "train",
         "--num-pcs", "1",
-        "--pgs-knots", "8", "--pgs-degree", "3",
         "--pc-knots", "8", "--pc-degree", "3",
         str(train_tsv),
     ]
@@ -462,7 +459,6 @@ def condensed_hot_paths(perf_data_path: Path) -> tuple[bool, str]:
 
         # Useful extras: subsequent non-duplicate frames with high global weight
         extras_added = 0
-        for j in range((start_extra if first_non_g_after is None else frames.index(first_non_g_after) + 1), len(frames)):
             f = frames[j]
             if f in path:
                 continue

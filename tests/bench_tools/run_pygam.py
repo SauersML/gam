@@ -28,7 +28,6 @@ def main():
 
     lam_grid = np.logspace(-3, 3, 11)
 
-    best_score = np.inf
     best_gam = None
     best_lams = None
 
@@ -40,10 +39,7 @@ def main():
         try:
             gam = LogisticGAM(gam_formula, lam=current_lams).fit(X, y)
             
-            score = gam.statistics_['UBRE']
 
-            if score < best_score:
-                best_score = score
                 best_gam = gam
                 best_lams = current_lams
 
@@ -55,7 +51,6 @@ def main():
         return
 
     print("\nManual grid search finished.")
-    print(f"Best UBRE score: {best_score:.4f}")
     print(f"Found best lambdas: {best_lams}")
 
     print("\n--- Best GAM Model Summary ---\n")

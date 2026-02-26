@@ -14,7 +14,6 @@
       "predict_sec": 0.005268,
       "auc": 0.8378471203333333,
       "brier": 0.066263513,
-      "c_index": null,
       "rmse": null,
       "r2": null,
       "model_spec": "5-fold CV (train-only spline fit; holdout scoring)"
@@ -27,7 +26,6 @@
       "predict_sec": 0.23,
       "auc": 0.8352200666666667,
       "brier": 0.06653971666666668,
-      "c_index": null,
       "rmse": null,
       "r2": null,
       "model_spec": "y ~ s(pc1, bs='tp', k=min(6, nrow(train_df)-1)) + s(pc2, bs='tp', k=min(6, nrow(train_df)-1)) + s(pc3, bs='tp', k=min(6, nrow(train_df)-1)) + pc4 + pc5 + pc6 + pc7 + pc8 + pc9 + pc10 + pc11 + pc12 + pc13 + pc14 + pc15 + pc16 [5-fold CV]"
@@ -40,7 +38,6 @@
       "predict_sec": 0.01391,
       "auc": 0.8372304228527668,
       "brier": 0.06677496373152057,
-      "c_index": null,
       "rmse": null,
       "r2": null,
       "model_spec": "LogisticGAM(s(0)+s(1)+s(2)+linear(3:15), n_splines=6, basis=tp) [lam by AICc; 5-fold CV]"

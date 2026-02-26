@@ -4,7 +4,6 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss, average_precision_score
 from sklearn.calibration import calibration_curve
 from sklearn.linear_model import LogisticRegression
 import joblib
@@ -51,12 +50,9 @@ def safe_auc(y_true, y_prob):
     y, p = _prep(y_true, y_prob)
     if len(np.unique(y)) < 2:  # Check if we have both classes
         return np.nan
-    return roc_auc_score(y, p)
 
 def safe_brier(y_true, y_prob):
-    """Safely calculates Brier score with proper edge case handling."""
     y, p = _prep(y_true, y_prob)
-    return brier_score_loss(y, p)
 
 def safe_logloss(y_true, y_prob):
     """Safely calculates log loss (cross-entropy) with proper edge case handling."""
@@ -83,8 +79,6 @@ def nagelkerkes_r2(y_true, y_prob):
     max_r2_cs = 1 - np.exp((2/n)*ll_null)
     return r2_cs / max_r2_cs if max_r2_cs > 0 else np.nan
 
-def brier_skill_score(y_true, y_prob):
-    """Calculates Brier Skill Score compared to a constant-prevalence baseline."""
     y, p = _prep(y_true, y_prob)
     bs_model = ((p - y)**2).mean()
     bs_ref = ((y.mean() - y)**2).mean()  # Baseline model always predicting prevalence
@@ -95,7 +89,6 @@ def pr_auc(y_true, y_prob):
     y, p = _prep(y_true, y_prob)
     if (y==1).sum()==0:  # Need positive examples for PR-AUC
         return np.nan
-    return average_precision_score(y, p)
 
 def calibration_intercept_slope(y_true, y_prob):
     """Calculate calibration intercept and slope via logistic regression."""
@@ -243,7 +236,6 @@ def ece_randomized_quantile(y_true, y_prob,
     }
 
 def brier_decomposition(y_true, y_prob, n_bins=20):
-    """Decompose Brier score into reliability, resolution, and uncertainty components."""
     y, p = _prep(y_true, y_prob)
     # Reliability diagram bins
     bins = np.linspace(0,1,n_bins+1)
@@ -308,7 +300,6 @@ def bootstrap_metric_ci(y_true, y_prob, metric_fn, n_boot=1000, alpha=0.05, rng=
 
 
 def wilson_ci(k, n, alpha=0.05):
-    """Calculate Wilson score confidence interval for a binomial proportion.
     
     Parameters:
     -----------
@@ -327,7 +318,6 @@ def wilson_ci(k, n, alpha=0.05):
         return (np.nan, np.nan)
         
     from scipy.stats import norm
-    z = norm.ppf(1 - alpha/2)  # Two-tailed z-score
     p = k/n
     
     denom = 1 + z**2/n
@@ -496,12 +486,10 @@ def run_r_inference(input_csv, output_csv):
 def run_rust_inference(input_csv, temp_tsv, output_csv):
     """Generic function to get predictions from the Rust/gnomon model."""
     print(f"--- Running Rust/gnomon inference on '{input_csv.name}'")
-    pd.read_csv(input_csv).rename(columns={'variable_one':'score','variable_two':'PC1'}).to_csv(temp_tsv,sep='\t',index=False)
     cmd = [str(GNOMON_EXECUTABLE), "infer", "--model", RUST_MODEL_CONFIG_PATH.name, str(temp_tsv.relative_to(PROJECT_ROOT))]
     try:
         subprocess.run(cmd, check=True, text=True, cwd=PROJECT_ROOT)
         rust_output_path = PROJECT_ROOT / 'predictions.tsv'
-        pd.read_csv(rust_output_path, sep='\t').rename(columns={'prediction':'rust_prediction'}).to_csv(output_csv, index=False)
         rust_output_path.unlink()
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"\nERROR: gnomon failed. Is it built? Error:\n{e}"); sys.exit(1)
@@ -534,7 +522,6 @@ def run_python_inference(input_csv, output_csv):
         predictions = model.predict_proba(X)
         
         # Save predictions to CSV
-        pd.DataFrame({'pygam_prediction': predictions}).to_csv(output_csv, index=False)
         return True
         
     except Exception as e:
@@ -593,13 +580,10 @@ def print_performance_report(df, bootstrap_ci=True, n_boot=1000, seed=42):
         else:
             print(f"  - {n:<20}: Brier={safe_brier(y_true, p):.4f} | LogLoss={safe_logloss(y_true, p):.4f}")
 
-    print("\n[Skill vs baseline: Brier Skill Score] (higher is better)")
     for n, p in models.items():
         if bootstrap_ci:
-            est, lo, hi = bootstrap_metric_ci(y_true, p, brier_skill_score, n_boot=n_boot, rng=rng)
             print(f"  - {n:<20}: {est:.4f} [{lo:.4f}, {hi:.4f}]")
         else:
-            print(f"  - {n:<20}: {brier_skill_score(y_true, p):.4f}")
 
     print("\n[Fit proxies: Nagelkerke R², Tjur R²] (higher is better)")
     for n, p in models.items():
@@ -1013,7 +997,6 @@ def plot_model_surfaces(test_df):
 
     # C. Get predictions from the models over the generated grid
     grid_df = pd.DataFrame({'variable_one': v1_grid.flatten(), 'variable_two': v2_grid.flatten()})
-    grid_csv_path = SCRIPT_DIR / 'temp_grid_data.csv'; grid_df.to_csv(grid_csv_path, index=False)
     grid_tsv_path = SCRIPT_DIR / 'temp_rust_grid_data.tsv'
     r_preds_path = SCRIPT_DIR / 'temp_r_surface_preds.csv'
     rust_preds_path = SCRIPT_DIR / 'temp_rust_surface_preds.csv'
