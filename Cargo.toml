@@ -2,6 +2,7 @@
 name = "gam"
 version = "0.1.11"
 edition = "2024"
+autobins = false
 default-run = "gam"
 description = "Generalized penalized likelihood engine"
 license = "Apache-2.0"
@@ -52,3 +53,7 @@ serial_test = "3.2.0"
 package = "general-mcmc"
 version = "0.8.0"
 default-features = false
+
+[[bin]]
+name = "gam"
+path = "src/main.rs"

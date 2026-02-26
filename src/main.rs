@@ -1,7 +1,9 @@
 #![allow(clippy::assign_op_pattern)]
 #![allow(clippy::collapsible_if)]
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+mod cli;
+
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_FULL};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
 use gam::alo::compute_alo_diagnostics_from_fit;
@@ -9,10 +11,16 @@ use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, MaternBasisSpec, MaternNu, ThinPlateBasisSpec,
 };
-use gam::estimate::{FitOptions, fit_gam, predict_gam};
+use gam::estimate::{
+    ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, fit_gam,
+    optimize_external_design, predict_gam,
+};
 use gam::gamlss::{GaussianLocationScaleSpec, ParameterBlockInput, fit_gaussian_location_scale};
 use gam::generative::{generative_spec_from_predict, sample_observation_replicates};
 use gam::hmc::{FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family};
+use gam::joint::{
+    JointLinkGeometry, JointModelConfig, JointModelResult, fit_joint_model_engine, predict_joint,
+};
 use gam::matrix::DesignMatrix;
 use gam::smooth::{
     LinearTermSpec, RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
@@ -47,6 +55,7 @@ enum Command {
     Sample(SampleArgs),
     #[command(alias = "simulate")]
     Generate(GenerateArgs),
+    BenchCv(BenchCvArgs),
 }
 
 #[derive(Args, Debug)]
@@ -139,6 +148,36 @@ struct GenerateArgs {
     out: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+struct BenchCvArgs {
+    #[arg(long = "data")]
+    data: PathBuf,
+    #[arg(long = "train-idx")]
+    train_idx: PathBuf,
+    #[arg(long = "test-idx")]
+    test_idx: PathBuf,
+    #[arg(long = "family")]
+    family: Option<String>,
+    #[arg(long = "target-col")]
+    target_col: Option<String>,
+    #[arg(long = "time-col")]
+    time_col: Option<String>,
+    #[arg(long = "event-col")]
+    event_col: Option<String>,
+    #[arg(long = "smooth-basis")]
+    smooth_basis: Option<String>,
+    #[arg(long = "smooth-cols")]
+    smooth_cols: Option<String>,
+    #[arg(long = "smooth-col")]
+    smooth_col: Option<String>,
+    #[arg(long = "linear-cols")]
+    linear_cols: Option<String>,
+    #[arg(long = "num-internal-knots", default_value_t = 7)]
+    num_internal_knots: usize,
+    #[arg(long = "double-penalty", action = ArgAction::Set, default_value_t = true)]
+    double_penalty: bool,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum FamilyArg {
     Auto,
@@ -168,6 +207,18 @@ struct SavedModel {
     sigma_min: Option<f64>,
     #[serde(default)]
     sigma_max: Option<f64>,
+    #[serde(default)]
+    joint_beta_link: Option<Vec<f64>>,
+    #[serde(default)]
+    joint_knot_range: Option<(f64, f64)>,
+    #[serde(default)]
+    joint_knot_vector: Option<Vec<f64>>,
+    #[serde(default)]
+    joint_link_transform: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
+    joint_degree: Option<usize>,
+    #[serde(default)]
+    joint_ridge_used: Option<f64>,
     #[serde(default)]
     survival_entry: Option<String>,
     #[serde(default)]
@@ -258,13 +309,60 @@ fn run() -> Result<(), String> {
         Command::Diagnose(args) => run_diagnose(args),
         Command::Sample(args) => run_sample(args),
         Command::Generate(args) => run_generate(args),
+        Command::BenchCv(args) => run_bench_cv(args),
     }
 }
 
-fn run_fit(args: FitArgs) -> Result<(), String> {
-    if args.firth {
-        return Err("--firth is not yet wired in this CLI entrypoint".to_string());
+fn run_bench_cv(args: BenchCvArgs) -> Result<(), String> {
+    let mut bench_args = vec![
+        "bench-cv".to_string(),
+        "--data".to_string(),
+        args.data.to_string_lossy().to_string(),
+        "--train-idx".to_string(),
+        args.train_idx.to_string_lossy().to_string(),
+        "--test-idx".to_string(),
+        args.test_idx.to_string_lossy().to_string(),
+        "--num-internal-knots".to_string(),
+        args.num_internal_knots.to_string(),
+        "--double-penalty".to_string(),
+        if args.double_penalty { "true" } else { "false" }.to_string(),
+    ];
+    if let Some(v) = args.family {
+        bench_args.push("--family".to_string());
+        bench_args.push(v);
     }
+    if let Some(v) = args.target_col {
+        bench_args.push("--target-col".to_string());
+        bench_args.push(v);
+    }
+    if let Some(v) = args.time_col {
+        bench_args.push("--time-col".to_string());
+        bench_args.push(v);
+    }
+    if let Some(v) = args.event_col {
+        bench_args.push("--event-col".to_string());
+        bench_args.push(v);
+    }
+    if let Some(v) = args.smooth_basis {
+        bench_args.push("--smooth-basis".to_string());
+        bench_args.push(v);
+    }
+    if let Some(v) = args.smooth_cols {
+        bench_args.push("--smooth-cols".to_string());
+        bench_args.push(v);
+    }
+    if let Some(v) = args.smooth_col {
+        bench_args.push("--smooth-col".to_string());
+        bench_args.push(v);
+    }
+    if let Some(v) = args.linear_cols {
+        bench_args.push("--linear-cols".to_string());
+        bench_args.push(v);
+    }
+    cli::run_internal_bench_mode(&bench_args)
+}
+
+fn run_fit(args: FitArgs) -> Result<(), String> {
     let formula_text = choose_formula(&args)?;
     let parsed = parse_formula(&formula_text)?;
     let ds = load_dataset(&args.data)?;
@@ -283,6 +381,16 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     let link_choice = parse_link_choice(args.link.as_deref(), args.flexible_link)?;
     let family = resolve_family(args.family, link_choice, y.view())?;
+    let effective_link = link_choice
+        .map(|c| c.link)
+        .unwrap_or_else(|| family_to_link(family));
+
+    if args.firth && args.predict_noise.is_some() {
+        return Err("--firth is not supported with --predict-noise location-scale fitting".to_string());
+    }
+    if args.firth && effective_link != LinkFunction::Logit {
+        return Err("--firth requires logit link".to_string());
+    }
 
     if let Some(noise_formula_raw) = &args.predict_noise {
         if family != LikelihoodFamily::GaussianIdentity {
@@ -345,6 +453,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 beta_noise: fit.block_states.get(1).map(|b| b.beta.to_vec()),
                 sigma_min: Some(sigma_min),
                 sigma_max: Some(sigma_max),
+                joint_beta_link: None,
+                joint_knot_range: None,
+                joint_knot_vector: None,
+                joint_link_transform: None,
+                joint_degree: None,
+                joint_ridge_used: None,
                 survival_entry: None,
                 survival_exit: None,
                 survival_event: None,
@@ -379,29 +493,128 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let fit_tol = 1e-6f64;
     let weights = Array1::ones(ds.values.nrows());
     let offset = Array1::zeros(ds.values.nrows());
-    let fit = fit_gam(
-        design.design.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &design.penalties,
-        family,
-        &FitOptions {
-            max_iter: fit_max_iter,
-            tol: fit_tol,
-            nullspace_dims: design.nullspace_dims.clone(),
-        },
-    )
-    .map_err(|e| format!("fit_gam failed: {e}"))?;
-
     if let Some(choice) = link_choice {
         if matches!(choice.mode, LinkMode::Flexible) {
+            if !is_binomial_family(family) {
+                return Err(
+                    "--flexible-link currently requires a binomial family/link"
+                        .to_string(),
+                );
+            }
+            if args.firth && choice.link != LinkFunction::Logit {
+                return Err("--firth with --flexible-link currently requires logit base link".to_string());
+            }
+            let config = JointModelConfig {
+                firth_bias_reduction: args.firth,
+                ..JointModelConfig::default()
+            };
+            let geometry = JointLinkGeometry {
+                n_link_knots: config.n_link_knots,
+                degree: 3,
+            };
+            let joint = fit_joint_model_engine(
+                y.view(),
+                weights.view(),
+                design.design.view(),
+                design.penalties.clone(),
+                choice.link,
+                geometry,
+                config,
+            )
+            .map_err(|e| format!("flexible-link fit failed: {e}"))?;
+
             println!(
-                "note: flexible link '{}' requested; currently fitting strict link while flexible-link training is being wired.",
-                link_name(choice.link)
+                "model fit complete | family={} | flexible_link={} | converged={} | backfit_iter={} | edf={:.4}",
+                family_to_string(family),
+                link_name(choice.link),
+                joint.converged,
+                joint.backfit_iterations,
+                joint.edf
             );
+            println!(
+                "flexible-link geometry | knots={} | degree={} | ridge={:.3e}",
+                joint.knot_vector.len(),
+                joint.degree,
+                joint.ridge_used
+            );
+
+            if let Some(out) = args.out {
+                let model = SavedModel {
+                    version: 1,
+                    formula: formula_text,
+                    family: family_to_string(family).to_string(),
+                    link: Some(link_choice_to_string(choice)),
+                    formula_noise: None,
+                    beta_noise: None,
+                    sigma_min: None,
+                    sigma_max: None,
+                    joint_beta_link: Some(joint.beta_link.to_vec()),
+                    joint_knot_range: Some(joint.knot_range),
+                    joint_knot_vector: Some(joint.knot_vector.to_vec()),
+                    joint_link_transform: Some(array2_to_nested_vec(&joint.link_transform)),
+                    joint_degree: Some(joint.degree),
+                    joint_ridge_used: Some(joint.ridge_used),
+                    survival_entry: None,
+                    survival_exit: None,
+                    survival_event: None,
+                    survival_spec: None,
+                    survival_monotonicity_lambda: None,
+                    fit_max_iter,
+                    fit_tol,
+                    beta: joint.beta_base.to_vec(),
+                    lambdas: joint.lambdas,
+                    scale: 1.0,
+                    covariance_conditional: None,
+                    covariance_corrected: None,
+                };
+                let payload = serde_json::to_string_pretty(&model)
+                    .map_err(|e| format!("failed to serialize model: {e}"))?;
+                fs::write(&out, payload)
+                    .map_err(|e| format!("failed to write model '{}': {e}", out.display()))?;
+                println!("saved model: {}", out.display());
+            }
+            return Ok(());
         }
     }
+    let fit: FitResult = if args.firth {
+        if family != LikelihoodFamily::BinomialLogit {
+            return Err(
+                "--firth currently requires a binomial-logit mean model (set --family binomial-logit or --link logit)"
+                    .to_string(),
+            );
+        }
+        let ext = optimize_external_design(
+            y.view(),
+            weights.view(),
+            design.design.view(),
+            offset.view(),
+            design.penalties.clone(),
+            &ExternalOptimOptions {
+                family,
+                max_iter: fit_max_iter,
+                tol: fit_tol,
+                nullspace_dims: design.nullspace_dims.clone(),
+                firth_bias_reduction: Some(true),
+            },
+        )
+        .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;
+        fit_result_from_external(ext)
+    } else {
+        fit_gam(
+            design.design.view(),
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &design.penalties,
+            family,
+            &FitOptions {
+                max_iter: fit_max_iter,
+                tol: fit_tol,
+                nullspace_dims: design.nullspace_dims.clone(),
+            },
+        )
+        .map_err(|e| format!("fit_gam failed: {e}"))?
+    };
 
     print_fit_summary(&design, &fit, family);
 
@@ -415,6 +628,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             beta_noise: None,
             sigma_min: None,
             sigma_max: None,
+            joint_beta_link: None,
+            joint_knot_range: None,
+            joint_knot_vector: None,
+            joint_link_transform: None,
+            joint_degree: None,
+            joint_ridge_used: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -532,6 +751,75 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
 
     let offset = Array1::zeros(design.design.nrows());
     let family = family_from_string(&model.family)?;
+    if let Some(joint) = load_joint_result(&model, family)? {
+        let beta_base = Array1::from_vec(model.beta.clone());
+        if beta_base.len() != design.design.ncols() {
+            return Err(format!(
+                "joint model/design mismatch: beta has {} coefficients but design has {} columns",
+                beta_base.len(),
+                design.design.ncols()
+            ));
+        }
+        let eta_base = design.design.dot(&beta_base);
+        let mut se_base = None;
+        if args.uncertainty {
+            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+                return Err(format!("--level must be in (0,1), got {}", args.level));
+            }
+            let cov = match args.covariance_mode {
+                CovarianceModeArg::Corrected => model
+                    .covariance_corrected
+                    .as_ref()
+                    .or(model.covariance_conditional.as_ref()),
+                CovarianceModeArg::Conditional => model.covariance_conditional.as_ref(),
+            }
+            .ok_or_else(|| {
+                "model file does not include requested covariance matrix for uncertainty"
+                    .to_string()
+            })?;
+            let cov_mat = nested_vec_to_array2(cov)?;
+            if cov_mat.nrows() != beta_base.len() || cov_mat.ncols() != beta_base.len() {
+                return Err(format!(
+                    "covariance shape mismatch: got {}x{}, expected {}x{}",
+                    cov_mat.nrows(),
+                    cov_mat.ncols(),
+                    beta_base.len(),
+                    beta_base.len()
+                ));
+            }
+            se_base = Some(linear_predictor_se(design.design.view(), &cov_mat));
+        }
+
+        let pred = predict_joint(&joint, &eta_base, se_base.as_ref());
+        let mut mean_lo = None;
+        let mut mean_hi = None;
+        if args.uncertainty {
+            let eff = pred
+                .effective_se
+                .as_ref()
+                .ok_or_else(|| "internal error: joint effective_se missing".to_string())?;
+            let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+            let eta_lower = &pred.eta - &eff.mapv(|v| z * v);
+            let eta_upper = &pred.eta + &eff.mapv(|v| z * v);
+            mean_lo = Some(inverse_link_array(family, eta_lower.view()));
+            mean_hi = Some(inverse_link_array(family, eta_upper.view()));
+        }
+        write_prediction_csv(
+            &args.out,
+            pred.eta.view(),
+            pred.probabilities.view(),
+            pred.effective_se.as_ref().map(|a| a.view()),
+            mean_lo.as_ref().map(|a| a.view()),
+            mean_hi.as_ref().map(|a| a.view()),
+        )?;
+        println!(
+            "wrote predictions: {} (rows={})",
+            args.out.display(),
+            pred.probabilities.len()
+        );
+        return Ok(());
+    }
+
     let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
         .map_err(|e| format!("predict_gam failed: {e}"))?;
 
@@ -829,6 +1117,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             beta_noise: None,
             sigma_min: None,
             sigma_max: None,
+            joint_beta_link: None,
+            joint_knot_range: None,
+            joint_knot_vector: None,
+            joint_link_transform: None,
+            joint_degree: None,
+            joint_ridge_used: None,
             survival_entry: Some(args.entry),
             survival_exit: Some(args.exit),
             survival_event: Some(args.event),
@@ -1110,6 +1404,28 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         }
     } else {
         let family = family_from_string(&model.family)?;
+        if let Some(joint) = load_joint_result(&model, family)? {
+            if !is_binomial_family(family) {
+                return Err(
+                    "generate for flexible-link models currently supports binomial families only"
+                        .to_string(),
+                );
+            }
+            let beta_base = Array1::from_vec(model.beta.clone());
+            if beta_base.len() != design.design.ncols() {
+                return Err(format!(
+                    "joint model/design mismatch: beta has {} coefficients but design has {} columns",
+                    beta_base.len(),
+                    design.design.ncols()
+                ));
+            }
+            let eta_base = design.design.dot(&beta_base);
+            let pred = predict_joint(&joint, &eta_base, None);
+            gam::generative::GenerativeSpec {
+                mean: pred.probabilities,
+                noise: gam::generative::NoiseModel::Bernoulli,
+            }
+        } else {
         let beta = Array1::from_vec(model.beta.clone());
         if beta.len() != design.design.ncols() {
             return Err(format!(
@@ -1123,6 +1439,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
             .map_err(|e| format!("predict_gam failed: {e}"))?;
         generative_spec_from_predict(pred, family, Some(model.scale))
             .map_err(|e| format!("failed to build generative spec: {e}"))?
+        }
     };
 
     let mut rng = StdRng::seed_from_u64(42);
@@ -1978,6 +2295,69 @@ fn family_to_link(f: LikelihoodFamily) -> LinkFunction {
     }
 }
 
+fn is_binomial_family(f: LikelihoodFamily) -> bool {
+    matches!(
+        f,
+        LikelihoodFamily::BinomialLogit
+            | LikelihoodFamily::BinomialProbit
+            | LikelihoodFamily::BinomialCLogLog
+    )
+}
+
+fn load_joint_result(
+    model: &SavedModel,
+    family: LikelihoodFamily,
+) -> Result<Option<JointModelResult>, String> {
+    let Some(beta_link_vec) = &model.joint_beta_link else {
+        return Ok(None);
+    };
+    let (knot_min, knot_max) = model
+        .joint_knot_range
+        .ok_or_else(|| "saved joint model is missing knot range".to_string())?;
+    let knot_vec = model
+        .joint_knot_vector
+        .as_ref()
+        .ok_or_else(|| "saved joint model is missing knot vector".to_string())?;
+    let link_transform_nested = model
+        .joint_link_transform
+        .as_ref()
+        .ok_or_else(|| "saved joint model is missing link transform".to_string())?;
+
+    let link = parse_link_choice(model.link.as_deref(), false)?
+        .map(|c| c.link)
+        .unwrap_or_else(|| family_to_link(family));
+    let link_transform = nested_vec_to_array2(link_transform_nested)?;
+    let beta_link = Array1::from_vec(beta_link_vec.clone());
+    if link_transform.ncols() != beta_link.len() {
+        return Err(format!(
+            "saved joint model link transform mismatch: {} columns vs {} beta_link coefficients",
+            link_transform.ncols(),
+            beta_link.len()
+        ));
+    }
+    let p_link = beta_link.len();
+    let mut s_link = Array2::<f64>::zeros((p_link, p_link));
+    for i in 0..p_link {
+        s_link[[i, i]] = 1.0;
+    }
+    Ok(Some(JointModelResult {
+        beta_base: Array1::from_vec(model.beta.clone()),
+        beta_link,
+        lambdas: model.lambdas.clone(),
+        deviance: 0.0,
+        edf: 0.0,
+        backfit_iterations: 0,
+        converged: true,
+        knot_range: (knot_min, knot_max),
+        knot_vector: Array1::from_vec(knot_vec.clone()),
+        link_transform,
+        degree: model.joint_degree.unwrap_or(3),
+        link,
+        s_link_constrained: s_link,
+        ridge_used: model.joint_ridge_used.unwrap_or(0.0),
+    }))
+}
+
 fn print_fit_summary(
     design: &gam::smooth::TermCollectionDesign,
     fit: &gam::estimate::FitResult,
@@ -2129,6 +2509,29 @@ fn weighted_penalty_matrix(
         out = out + &(s * lam);
     }
     Ok(out)
+}
+
+fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
+    FitResult {
+        beta: ext.beta,
+        lambdas: ext.lambdas,
+        scale: ext.scale,
+        edf_by_block: ext.edf_by_block,
+        edf_total: ext.edf_total,
+        iterations: ext.iterations,
+        final_grad_norm: ext.final_grad_norm,
+        pirls_status: ext.pirls_status,
+        smoothing_correction: ext.smoothing_correction,
+        penalized_hessian: ext.penalized_hessian,
+        working_weights: ext.working_weights,
+        working_response: ext.working_response,
+        reparam_qs: ext.reparam_qs,
+        artifacts: ext.artifacts,
+        beta_covariance: ext.beta_covariance,
+        beta_standard_errors: ext.beta_standard_errors,
+        beta_covariance_corrected: ext.beta_covariance_corrected,
+        beta_standard_errors_corrected: ext.beta_standard_errors_corrected,
+    }
 }
 
 fn write_matrix_csv(path: &Path, mat: &Array2<f64>, prefix: &str) -> Result<(), String> {
