@@ -128,7 +128,7 @@ struct SurvivalArgs {
     event: String,
     #[arg(long = "formula")]
     formula: String,
-    #[arg(long = "monotonicity-lambda", default_value_t = 10.0)]
+    #[arg(long = "monotonicity-lambda", default_value_t = 1.0)]
     monotonicity_lambda: f64,
     /// Net or crude risk target.
     #[arg(long = "spec", default_value = "net")]
@@ -161,7 +161,7 @@ struct SurvivalArgs {
     #[arg(long = "time-smooth-lambda", default_value_t = 1e-2)]
     time_smooth_lambda: f64,
     /// Additional ridge penalty applied to non-intercept coefficients.
-    #[arg(long = "ridge-lambda", default_value_t = 1e-4)]
+    #[arg(long = "ridge-lambda", default_value_t = 1e-6)]
     ridge_lambda: f64,
     #[arg(long = "out")]
     out: Option<PathBuf>,
@@ -808,7 +808,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             .survival_exit
             .as_ref()
             .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
-        let _entry_col = *col_map
+        let entry_col = *col_map
             .get(entry_name)
             .ok_or_else(|| format!("entry column '{}' not found", entry_name))?;
         let exit_col = *col_map
@@ -822,9 +822,15 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         let mut age_entry = Array1::<f64>::zeros(n);
         let mut age_exit = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let t1 = ds.values[[i, exit_col]].max(1e-9);
+            let t0_raw = ds.values[[i, entry_col]];
+            let t1_raw = ds.values[[i, exit_col]];
+            if !t0_raw.is_finite() || !t1_raw.is_finite() {
+                return Err(format!("non-finite survival times at row {}", i + 1));
+            }
+            let t0 = t0_raw.max(1e-9);
+            let t1 = t1_raw.max(t0 + 1e-9);
+            age_entry[i] = t0;
             age_exit[i] = t1;
-            age_entry[i] = t1;
         }
         let time_cfg = load_survival_time_basis_config_from_model(&model)?;
         let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg, None)?;
@@ -1235,7 +1241,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         .map_err(|e| format!("compute_alo_diagnostics_from_fit failed: {e}"))?;
 
     let mut rows: Vec<(usize, f64, f64, f64)> = (0..alo.leverage.len())
-        .map(|i| (i, alo.leverage[i], alo.eta_tilde[i], alo.se[i]))
+        .map(|i| (i, alo.leverage[i], alo.eta_tilde[i], alo.se_sandwich[i]))
         .collect();
     rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -1947,8 +1953,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     );
 
     if let Some(out) = args.out {
-        let cov = invert_symmetric_matrix(&state.hessian)
-            .map_err(|e| format!("failed to invert survival Hessian for covariance: {e}"))?;
+        let cov = match invert_symmetric_matrix(&state.hessian) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to invert survival Hessian for covariance ({}); saving model without covariance",
+                    e
+                );
+                None
+            }
+        };
         let model_out = SavedModel {
             version: 1,
             formula,
@@ -1989,8 +2003,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             beta: beta.to_vec(),
             lambdas: penalty_blocks.iter().map(|b| b.lambda).collect(),
             scale: 1.0,
-            covariance_conditional: Some(array2_to_nested_vec(&cov)),
-            covariance_corrected: Some(array2_to_nested_vec(&cov)),
+            covariance_conditional: cov.as_ref().map(array2_to_nested_vec),
+            covariance_corrected: cov.as_ref().map(array2_to_nested_vec),
         };
         write_model_json(&out, &model_out)?;
     }
@@ -2948,6 +2962,7 @@ fn build_smooth_basis(
     options: &BTreeMap<String, String>,
     ds: &Dataset,
 ) -> Result<SmoothBasisSpec, String> {
+    let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
     let type_opt = options
         .get("type")
         .map(|s| s.to_ascii_lowercase())
@@ -2978,7 +2993,7 @@ fn build_smooth_basis(
                             data_range: (min_v, max_v),
                             num_internal_knots: n_knots,
                         },
-                        double_penalty: true,
+                        double_penalty: smooth_double_penalty,
                         identifiability: BSplineIdentifiability::None,
                     })
                 })
@@ -2987,7 +3002,7 @@ fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: TensorBSplineSpec {
                     marginal_specs: specs,
-                    double_penalty: true,
+                    double_penalty: smooth_double_penalty,
                 },
             })
         }
@@ -3011,7 +3026,7 @@ fn build_smooth_basis(
                         data_range: (min_v, max_v),
                         num_internal_knots: n_knots,
                     },
-                    double_penalty: true,
+                    double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
                 },
             })
@@ -3025,7 +3040,7 @@ fn build_smooth_basis(
                     center_strategy: CenterStrategy::FarthestPoint {
                         num_centers: centers,
                     },
-                    double_penalty: true,
+                    double_penalty: smooth_double_penalty,
                 },
             })
         }
@@ -3042,7 +3057,7 @@ fn build_smooth_basis(
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
                     nu,
                     include_intercept: true,
-                    double_penalty: true,
+                    double_penalty: smooth_double_penalty,
                 },
             })
         }
@@ -3061,7 +3076,7 @@ fn build_smooth_basis(
                         0 => DuchonNullspaceOrder::Zero,
                         _ => DuchonNullspaceOrder::Linear,
                     },
-                    double_penalty: true,
+                    double_penalty: smooth_double_penalty,
                 },
             })
         }
@@ -3082,6 +3097,15 @@ fn option_usize(map: &BTreeMap<String, String>, key: &str) -> Option<usize> {
 
 fn option_f64(map: &BTreeMap<String, String>, key: &str) -> Option<f64> {
     map.get(key).and_then(|v| v.parse::<f64>().ok())
+}
+
+fn option_bool(map: &BTreeMap<String, String>, key: &str) -> Option<bool> {
+    map.get(key)
+        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "y" => Some(true),
+            "false" | "0" | "no" | "n" => Some(false),
+            _ => None,
+        })
 }
 
 fn col_minmax(col: ArrayView1<'_, f64>) -> Result<(f64, f64), String> {

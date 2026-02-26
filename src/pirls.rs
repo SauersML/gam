@@ -1343,13 +1343,11 @@ where
                         if loop_lambda > 1e12 {
                             // Exhausted attempts
                             if attempts > 30 {
-                                let state_grad_norm =
-                                    state.gradient.dot(&state.gradient).sqrt();
+                                let state_grad_norm = state.gradient.dot(&state.gradient).sqrt();
                                 last_gradient_norm = state_grad_norm;
                                 // Only accept "stalled but valid" when we are near stationarity.
                                 // Otherwise report MaxIterationsReached so callers can fail fast.
-                                if state_grad_norm
-                                    <= options.convergence_tolerance.max(1e-6) * 10.0
+                                if state_grad_norm <= options.convergence_tolerance.max(1e-6) * 10.0
                                 {
                                     status = PirlsStatus::StalledAtValidMinimum;
                                 } else {
@@ -1975,8 +1973,8 @@ pub fn fit_model_for_fixed_rho<'a>(
         let dev_scale = working_summary.state.deviance.abs().max(1.0);
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
-        let grad_ok = working_summary.last_gradient_norm
-            <= options.convergence_tolerance.max(1e-6) * 10.0;
+        let grad_ok =
+            working_summary.last_gradient_norm <= options.convergence_tolerance.max(1e-6) * 10.0;
         if (working_summary.last_deviance_change.abs() <= dev_tol
             || working_summary.last_step_size <= step_floor)
             && grad_ok
@@ -1991,8 +1989,8 @@ pub fn fit_model_for_fixed_rho<'a>(
         let dev_scale = working_summary.state.deviance.abs().max(1.0);
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
-        let grad_ok = working_summary.last_gradient_norm
-            <= options.convergence_tolerance.max(1e-6) * 10.0;
+        let grad_ok =
+            working_summary.last_gradient_norm <= options.convergence_tolerance.max(1e-6) * 10.0;
         if (working_summary.last_deviance_change.abs() <= dev_tol
             || working_summary.last_step_size <= step_floor)
             && grad_ok

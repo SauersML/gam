@@ -27,9 +27,8 @@ pub use families::gamlss;
 pub use families::survival;
 
 pub use alo::{
-    AloDiagnostics, AloOptions, AloSeMode, compute_alo_diagnostics,
-    compute_alo_diagnostics_from_fit, compute_alo_diagnostics_from_pirls,
-    compute_alo_diagnostics_from_pirls_with_options, compute_alo_diagnostics_with_options,
+    AloDiagnostics, compute_alo_diagnostics, compute_alo_diagnostics_from_fit,
+    compute_alo_diagnostics_from_pirls,
 };
 pub use basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
