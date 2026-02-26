@@ -1,0 +1,127 @@
+{
+  "created_at_utc": "2026-02-26T17:39:09.085496+00:00",
+  "cv": {
+    "n_splits": 5,
+    "seed": 42,
+    "leakage_safe": true
+  },
+  "results": [
+    {
+      "contender": "rust_gam",
+      "scenario_name": "icu_survival_death",
+      "status": "ok",
+      "fit_sec": 1.0339884999921196,
+      "predict_sec": 0.053014958000858314,
+      "auc": 0.4358174715849504,
+      "brier": null,
+      "c_index": 0.4358174715849504,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam survival/predict via release binary (c-index on fixed-horizon risk score) [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "icu_survival_death",
+      "status": "ok",
+      "fit_sec": 0.307,
+      "predict_sec": 0.03,
+      "auc": 0.69208142,
+      "brier": null,
+      "c_index": 0.69208142,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "Surv(time, event) ~ age + bmi + hr_max + sysbp_min [5-fold CV]"
+    },
+    {
+      "contender": "python_lifelines",
+      "scenario_name": "icu_survival_death",
+      "status": "ok",
+      "fit_sec": 1.063381,
+      "predict_sec": 0.012060999999999999,
+      "auc": 0.6920783391542049,
+      "brier": null,
+      "c_index": 0.6920783391542049,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4) [5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "heart_failure_survival",
+      "status": "ok",
+      "fit_sec": 0.04744433499581646,
+      "predict_sec": 0.028886125997814815,
+      "auc": 0.5020853958681405,
+      "brier": null,
+      "c_index": 0.5020853958681405,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam survival/predict via release binary (c-index on fixed-horizon risk score) [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "heart_failure_survival",
+      "status": "ok",
+      "fit_sec": 0.041,
+      "predict_sec": 0.005,
+      "auc": 0.6987548494983278,
+      "brier": null,
+      "c_index": 0.6987548494983278,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "Surv(time, event) ~ age + anaemia + log_creatinine_phosphokinase + diabetes + ejection_fraction + high_blood_pressure + log_platelets + log_serum_creatinine + serum_sodium + sex + smoking [5-fold CV]"
+    },
+    {
+      "contender": "python_lifelines",
+      "scenario_name": "heart_failure_survival",
+      "status": "ok",
+      "fit_sec": 0.10794999999999999,
+      "predict_sec": 0.0062439999999999996,
+      "auc": 0.6987326735179947,
+      "brier": null,
+      "c_index": 0.6987326735179947,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4) [5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "cirrhosis_survival",
+      "status": "ok",
+      "fit_sec": 0.06747166800050763,
+      "predict_sec": 0.028848166999523528,
+      "auc": 0.5,
+      "brier": null,
+      "c_index": 0.5,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam survival/predict via release binary (c-index on fixed-horizon risk score) [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "cirrhosis_survival",
+      "status": "ok",
+      "fit_sec": 0.055999999999999994,
+      "predict_sec": 0.005,
+      "auc": 0.809320652173913,
+      "brier": null,
+      "c_index": 0.809320652173913,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "Surv(time, event) ~ drug + sex_male + ascites + hepatomegaly + spiders + edema + age + bilirubin + cholesterol + albumin + copper + alk_phos + sgot + tryglicerides + platelets + prothrombin + stage [5-fold CV]"
+    },
+    {
+      "contender": "python_lifelines",
+      "scenario_name": "cirrhosis_survival",
+      "status": "ok",
+      "fit_sec": 0.218768,
+      "predict_sec": 0.007266,
+      "auc": 0.7900064309330305,
+      "brier": null,
+      "c_index": 0.7900064309330305,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4) [5-fold CV]"
+    }
+  ]
+}

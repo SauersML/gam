@@ -1,0 +1,118 @@
+{
+  "created_at_utc": "2026-02-26T17:31:11.614789+00:00",
+  "cv": {
+    "n_splits": 5,
+    "seed": 42,
+    "leakage_safe": true
+  },
+  "results": [
+    {
+      "contender": "rust_gam",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.4749087900054292,
+      "predict_sec": 0.02682937402278185,
+      "auc": 0.7951671610685705,
+      "brier": 0.18199731146468007,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.27,
+      "predict_sec": 0.014,
+      "auc": 0.7965382999999999,
+      "brier": 0.1812196,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ x1 + s(x2, bs='ps', k=min(8, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.894193,
+      "predict_sec": 0.006154,
+      "auc": 0.7961680855665147,
+      "brier": 0.18110164187119415,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8)) [lam by UBRE/GCV; 5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "prostate_gamair",
+      "status": "ok",
+      "fit_sec": 0.2256865830058814,
+      "predict_sec": 0.026778708001074847,
+      "auc": 0.7050307450771779,
+      "brier": 0.21937824898270158,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "prostate_gamair",
+      "status": "ok",
+      "fit_sec": 0.224,
+      "predict_sec": 0.012,
+      "auc": 0.7038428134556575,
+      "brier": 0.21506804281345562,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ pc1 + s(pc2, bs='ps', k=min(8, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "prostate_gamair",
+      "status": "ok",
+      "fit_sec": 0.793404,
+      "predict_sec": 0.003881,
+      "auc": 0.7050944229476446,
+      "brier": 0.21545577928857157,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8)) [lam by UBRE/GCV; 5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "horse_colic",
+      "status": "ok",
+      "fit_sec": 0.6137547920006909,
+      "predict_sec": 0.031158417994447518,
+      "auc": 0.8083827464574591,
+      "brier": 0.16518242994719562,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "horse_colic",
+      "status": "ok",
+      "fit_sec": 0.162,
+      "predict_sec": 0.015,
+      "auc": 0.8142884259259259,
+      "brier": 0.16603333333333334,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ rectal_temp + s(pulse, bs='ps', k=min(8, nrow(train_df)-1)) + packed_cell_volume [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "horse_colic",
+      "status": "ok",
+      "fit_sec": 0.999391,
+      "predict_sec": 0.005071,
+      "auc": 0.8181638843276774,
+      "brier": 0.1625395398162507,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8) + l(2)) [lam by UBRE/GCV; 5-fold CV]"
+    }
+  ]
+}

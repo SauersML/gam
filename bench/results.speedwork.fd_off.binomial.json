@@ -1,0 +1,118 @@
+{
+  "created_at_utc": "2026-02-26T18:04:37.331709+00:00",
+  "cv": {
+    "n_splits": 5,
+    "seed": 42,
+    "leakage_safe": true
+  },
+  "results": [
+    {
+      "contender": "rust_gam",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.4013755419946392,
+      "predict_sec": 0.03043962399533484,
+      "auc": 0.7951671610685705,
+      "brier": 0.18199731203376154,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.249,
+      "predict_sec": 0.012,
+      "auc": 0.7965382999999999,
+      "brier": 0.1812196,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ x1 + s(x2, bs='ps', k=min(8, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "small_dense",
+      "status": "ok",
+      "fit_sec": 0.39292,
+      "predict_sec": 0.0020239999999999998,
+      "auc": 0.7961680855665147,
+      "brier": 0.18110164187119415,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8)) [lam by UBRE/GCV; 5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "medium",
+      "status": "ok",
+      "fit_sec": 18.447943791994476,
+      "predict_sec": 0.06393308199767489,
+      "auc": 0.790340509155664,
+      "brier": 0.18582370699369477,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "medium",
+      "status": "ok",
+      "fit_sec": 15.965,
+      "predict_sec": 0.072,
+      "auc": 0.79382,
+      "brier": 0.18384,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ x1 + s(x2, bs='ps', k=min(8, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "medium",
+      "status": "ok",
+      "fit_sec": 7.8905769999999995,
+      "predict_sec": 0.017287999999999998,
+      "auc": 0.7938465565581365,
+      "brier": 0.18382485508098206,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8)) [lam by UBRE/GCV; 5-fold CV]"
+    },
+    {
+      "contender": "rust_gam",
+      "scenario_name": "pathological_ill_conditioned",
+      "status": "ok",
+      "fit_sec": 46.71492791599303,
+      "predict_sec": 0.48157075000199256,
+      "auc": 0.7827262693667566,
+      "brier": 0.18927678972426912,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "gam fit/predict via release binary [5-fold CV]"
+    },
+    {
+      "contender": "r_mgcv",
+      "scenario_name": "pathological_ill_conditioned",
+      "status": "ok",
+      "fit_sec": 9.157,
+      "predict_sec": 0.10200000000000001,
+      "auc": 0.791679948,
+      "brier": 0.184600024,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "y ~ x1 + s(x2, bs='ps', k=min(8, nrow(train_df)-1)) [5-fold CV]"
+    },
+    {
+      "contender": "python_pygam",
+      "scenario_name": "pathological_ill_conditioned",
+      "status": "ok",
+      "fit_sec": 6.841164,
+      "predict_sec": 0.01788,
+      "auc": 0.7916638677192225,
+      "brier": 0.18458872744364035,
+      "rmse": null,
+      "r2": null,
+      "model_spec": "LogisticGAM(l(0) + s(1, n_splines=8)) [lam by UBRE/GCV; 5-fold CV]"
+    }
+  ]
+}
