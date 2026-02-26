@@ -320,18 +320,13 @@ def r2_score(y: np.ndarray, mu: np.ndarray) -> float:
 
 
 def _survival_risk_from_rust_pred(pred_df: pd.DataFrame) -> tuple[np.ndarray, str]:
-    # Common survival target across contenders: failure probability at evaluation horizon.
-    if "failure_prob" in pred_df.columns:
-        return pred_df["failure_prob"].to_numpy(dtype=float), "failure_prob"
-    if "survival_prob" in pred_df.columns:
-        return (1.0 - pred_df["survival_prob"].to_numpy(dtype=float)), "survival_prob"
-    if "mean" in pred_df.columns:
-        # Backward compatibility: survival models previously exposed mean=survival_prob.
-        return (1.0 - pred_df["mean"].to_numpy(dtype=float)), "mean"
-    raise RuntimeError(
-        "rust survival prediction output missing required probability column; "
-        "expected one of failure_prob/survival_prob/mean"
-    )
+    # Canonical survival target across contenders: failure probability at horizon.
+    if "failure_prob" not in pred_df.columns:
+        raise RuntimeError(
+            "rust survival prediction output missing required 'failure_prob' column; "
+            "refit/predict with current CLI"
+        )
+    return pred_df["failure_prob"].to_numpy(dtype=float), "failure_prob"
 
 
 def _lifelines_cindex_from_risk(event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray) -> float:
@@ -1741,7 +1736,8 @@ def _rust_formula_for_scenario(scenario_name, ds):
     terms = [f"linear({c})" for c in cfg.get("linear_cols", [])]
     basis = str(cfg.get("smooth_basis", "ps")).lower()
     if (
-        ds.get("family") == "gaussian"
+        scenario_name in {"wine_gamair", "wine_temp_vs_year"}
+        and ds.get("family") == "gaussian"
         and basis in {"ps", "bspline", "p-spline"}
         and len(ds.get("rows", [])) <= 100
         and (

@@ -3242,17 +3242,10 @@ fn build_term_spec(
                 } else {
                     match auto_kind {
                         ColumnKind::Continuous => {
-                            let basis = build_smooth_basis(
-                                SmoothKind::S,
-                                std::slice::from_ref(name),
-                                &[col],
-                                &BTreeMap::new(),
-                                ds,
-                            )?;
-                            smooth_terms.push(SmoothTermSpec {
-                                name: format!("smooth({name})"),
-                                basis,
-                                shape: ShapeConstraint::None,
+                            linear_terms.push(LinearTermSpec {
+                                name: name.clone(),
+                                feature_col: col,
+                                double_penalty: false,
                             });
                         }
                         ColumnKind::Binary => {
@@ -4080,8 +4073,10 @@ fn write_survival_prediction_csv(
 
 #[cfg(test)]
 mod tests {
-    use super::survival_probability_from_eta;
+    use super::{survival_probability_from_eta, write_survival_prediction_csv};
     use ndarray::array;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn cindex_uncensored_risk(time: &[f64], score: &[f64]) -> f64 {
         let mut concordant = 0.0;
@@ -4156,5 +4151,29 @@ mod tests {
         let c_surv_on_surv = cindex_uncensored_survival(&time, &surv);
         assert!(c_surv_on_neg_eta > 0.99);
         assert!(c_surv_on_surv > 0.99);
+    }
+
+    #[test]
+    fn survival_prediction_csv_includes_explicit_semantics_columns() {
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        path.push(format!("gam_survival_pred_schema_{ts}.csv"));
+
+        let eta = array![0.5, -0.25];
+        let surv = survival_probability_from_eta(eta.view());
+        write_survival_prediction_csv(&path, eta.view(), surv.view(), None, None, None)
+            .expect("write survival prediction csv");
+
+        let text = fs::read_to_string(&path).expect("read csv");
+        let header = text.lines().next().unwrap_or("");
+        assert_eq!(
+            header, "eta,mean,survival_prob,risk_score,failure_prob",
+            "survival output schema changed unexpectedly"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 }
