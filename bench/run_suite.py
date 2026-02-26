@@ -6,6 +6,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 from dataclasses import dataclass
