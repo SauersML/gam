@@ -49,6 +49,24 @@ Default scenarios:
 - `heart_failure_survival` (real heart-failure dataset; time-to-event benchmark on follow-up `time` and death event with clinical covariates)
 - `cirrhosis_survival` (real cirrhosis dataset; time-to-event benchmark with imputation/encoding and Cox-style survival modeling)
 
+## Survival score semantics
+
+`lifelines.utils.concordance_index` expects a **survival-oriented** score:
+- higher score = longer survival / lower risk
+
+Rust survival prediction CSV now emits explicit columns:
+- `risk_score`: higher = higher risk (earlier failure)
+- `survival_prob`: higher = longer survival
+- `failure_prob`: `1 - survival_prob`
+- `eta`: linear predictor (risk-oriented in current Royston-Parmar implementation)
+- `mean`: kept for backward compatibility and equals `survival_prob` for survival models
+
+`bench/run_suite.py` uses one global, leakage-safe survival C-index policy:
+- predict at train-fold median follow-up time (constant within a fold)
+- evaluate concordance against true test follow-up/event outcomes
+
+For Rust survival predictions, `risk_score` is required so score direction is explicit.
+
 Dataset files live in:
 - `/Users/user/gam/benchmarks/datasets`
 
