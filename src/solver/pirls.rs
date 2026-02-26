@@ -1527,6 +1527,8 @@ pub struct PirlsResult {
     pub iteration: usize,
     pub max_abs_eta: f64,
     pub last_gradient_norm: f64,
+    pub last_deviance_change: f64,
+    pub last_step_halving: usize,
 
     // Pass through the entire reparameterization result for use in the gradient
     pub reparam_result: ReparamResult,
@@ -1586,6 +1588,8 @@ fn assemble_pirls_result(
         iteration: working_summary.iterations,
         max_abs_eta: working_summary.max_abs_eta,
         last_gradient_norm: working_summary.last_gradient_norm,
+        last_deviance_change: working_summary.last_deviance_change,
+        last_step_halving: working_summary.last_step_halving,
         reparam_result,
         x_transformed,
     }
@@ -1876,6 +1880,8 @@ pub fn fit_model_for_fixed_rho<'a>(
             iteration: 1,
             max_abs_eta,
             last_gradient_norm: gradient_norm,
+            last_deviance_change: 0.0,
+            last_step_halving: 0,
             reparam_result,
             x_transformed,
         };

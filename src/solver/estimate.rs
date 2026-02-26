@@ -1641,7 +1641,28 @@ where
         }
     }
     screened.sort_by(|a, b| a.2.total_cmp(&b.2));
-    let candidate_seeds: Vec<(String, Array1<f64>)> = screened
+    let promotion_budget = screened
+        .len()
+        .min((screening_budget.max(1) * 2).max(3))
+        .min(6);
+    let mut promoted: Vec<(String, Array1<f64>, f64)> = Vec::new();
+    for (label, z, _screen_cost) in screened.into_iter().take(promotion_budget) {
+        let rho0 = to_rho_from_z(&z);
+        match reml_state.compute_cost(&rho0) {
+            Ok(full_cost) if full_cost.is_finite() => promoted.push((label, z, full_cost)),
+            Ok(non_finite) => {
+                candidate_failures.push(format!(
+                    "[Seed promote {label}] non-finite full cost {}",
+                    non_finite
+                ));
+            }
+            Err(err) => {
+                candidate_failures.push(format!("[Seed promote {label}] {}", err));
+            }
+        }
+    }
+    promoted.sort_by(|a, b| a.2.total_cmp(&b.2));
+    let candidate_seeds: Vec<(String, Array1<f64>)> = promoted
         .into_iter()
         .take(screening_budget.max(1))
         .map(|(label, z, _)| (label, z))
@@ -1661,7 +1682,7 @@ where
         candidate_seeds
     };
     let near_stationary_tol = (cfg.reml_convergence_tolerance.max(1e-12)) * 2.0;
-    let use_newton = true;
+    let use_newton = matches!(link, LinkFunction::Identity) && k <= 8;
     for (label, initial_z) in candidate_seeds {
         let solution_result: Result<OuterSolveResult, EstimationError> = if use_newton {
             match run_newton_for_candidate(&label, &reml_state, &cfg, initial_z.clone()) {
@@ -4365,6 +4386,36 @@ pub mod internal {
                         });
                     }
 
+                    let dev_change = pirls_result.last_deviance_change;
+                    if !dev_change.is_finite() || dev_change <= 0.0 {
+                        return Err(EstimationError::PirlsDidNotConverge {
+                            max_iterations: pirls_result.iteration,
+                            last_change: pirls_result.last_gradient_norm,
+                        });
+                    }
+
+                    if matches!(self.config.link_function(), LinkFunction::Logit) {
+                        let n = pirls_result.final_mu.len().max(1) as f64;
+                        let sat_fraction = pirls_result
+                            .final_mu
+                            .iter()
+                            .filter(|&&m| m <= 1e-3 || m >= 1.0 - 1e-3)
+                            .count() as f64
+                            / n;
+                        let weight_collapse_fraction = pirls_result
+                            .final_weights
+                            .iter()
+                            .filter(|&&w| w <= 1e-8 || !w.is_finite())
+                            .count() as f64
+                            / n;
+                        if sat_fraction > 0.995 || weight_collapse_fraction > 0.98 {
+                            return Err(EstimationError::PerfectSeparationDetected {
+                                iteration: pirls_result.iteration,
+                                max_abs_eta: pirls_result.max_abs_eta,
+                            });
+                        }
+                    }
+
                     // Partial LAML surrogate on a 3-5 iteration horizon.
                     let mut partial =
                         0.5 * pirls_result.deviance + 0.5 * pirls_result.stable_penalty_term;
@@ -4377,11 +4428,10 @@ pub mod internal {
 
                     // Favor seeds that already reduce objective cleanly without heavy
                     // damping/halving pressure in the opening iterations.
-                    if pirls_result.last_deviance_change <= 0.0 {
-                        partial += 1_000.0;
-                    }
                     partial += 0.5 * pirls_result.last_step_halving as f64;
                     partial += 0.05 * pirls_result.last_gradient_norm.min(200.0);
+                    partial += 0.1 * pirls_result.max_abs_eta.min(60.0);
+                    partial -= 0.5 * dev_change.min(50.0);
 
                     if partial.is_finite() {
                         Ok(partial)

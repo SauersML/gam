@@ -1911,9 +1911,9 @@ pub fn build_bspline_basis_1d(
     let design_raw = (*basis).clone();
     let p_raw = design_raw.ncols();
     let s_bend_raw = create_difference_penalty_matrix(p_raw, spec.penalty_order, None)?;
-    let mut penalties_raw = vec![s_bend_raw];
+    let mut penalties_raw = vec![s_bend_raw.clone()];
     if spec.double_penalty {
-        penalties_raw.push(Array2::<f64>::eye(p_raw));
+        penalties_raw.push(nullspace_shrinkage_penalty(&s_bend_raw)?);
     }
 
     let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
@@ -2026,6 +2026,57 @@ fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, BasisError> 
     Ok(evals.iter().filter(|&&ev| ev.abs() <= tol).count())
 }
 
+fn nullspace_shrinkage_penalty(penalty: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+    if penalty.nrows() != penalty.ncols() {
+        return Err(BasisError::DimensionMismatch(
+            "penalty matrix must be square when building nullspace shrinkage penalty".to_string(),
+        ));
+    }
+    if penalty.nrows() == 0 {
+        return Ok(Array2::<f64>::zeros((0, 0)));
+    }
+
+    let mut sym = penalty.clone();
+    for i in 0..sym.nrows() {
+        for j in 0..i {
+            let v = 0.5 * (sym[[i, j]] + sym[[j, i]]);
+            sym[[i, j]] = v;
+            sym[[j, i]] = v;
+        }
+    }
+
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+    let max_ev = evals
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let tol = (sym.nrows().max(1) as f64) * 1e-10 * max_ev.max(1.0);
+
+    let zero_idx: Vec<usize> = evals
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &ev)| (ev.abs() <= tol).then_some(i))
+        .collect();
+    let mut shrink = Array2::<f64>::eye(sym.nrows()) * 1e-6;
+    if !zero_idx.is_empty() {
+        let z = evecs.select(Axis(1), &zero_idx);
+        shrink += &fast_ab(&z, &z.t().to_owned());
+    }
+    Ok(shrink)
+}
+
+fn with_fixed_shrinkage(base: &Array2<f64>, shrink: &Array2<f64>) -> Array2<f64> {
+    let scale = base
+        .diag()
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max)
+        .max(1.0)
+        * 1e-6;
+    base + &shrink.mapv(|v| v * scale)
+}
+
 fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {
     if n < 8 {
         return 0;
@@ -2066,12 +2117,16 @@ pub fn build_thin_plate_basis(
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let tps = create_thin_plate_spline_basis(data, centers.view())?;
-    let mut penalties = vec![tps.penalty_bending.clone()];
-    let mut nullspace_dims = vec![tps.num_polynomial_basis];
-    if spec.double_penalty {
-        penalties.push(tps.penalty_ridge.clone());
-        nullspace_dims.push(0);
-    }
+    let penalties = vec![if spec.double_penalty {
+        with_fixed_shrinkage(&tps.penalty_bending, &tps.penalty_ridge)
+    } else {
+        tps.penalty_bending.clone()
+    }];
+    let nullspace_dims = vec![if spec.double_penalty {
+        0
+    } else {
+        tps.num_polynomial_basis
+    }];
     Ok(BasisBuildResult {
         design: tps.basis,
         penalties,
@@ -2708,7 +2763,8 @@ fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
 ///
 /// The default kernel penalty is `alpha' S alpha` with `S_jl = k(||c_j - c_l||)`, embedded
 /// in the full coefficient space. With intercept included, that column is unpenalized by
-/// `penalty_kernel`; optional `penalty_ridge` enables double-penalty shrinkage of all terms.
+/// `penalty_kernel`; optional `penalty_ridge` is a nullspace projector used for
+/// double-penalty shrinkage of previously unpenalized directions.
 ///
 /// NOTE: This follows the RKHS Gram construction S = K_CC (not K_CC^{-1}) in
 /// coefficient space, with global scaling absorbed by the smoothing parameter λ.
@@ -2820,7 +2876,7 @@ pub fn create_matern_spline_basis(
     penalty_kernel
         .slice_mut(s![0..k, 0..k])
         .assign(&center_kernel);
-    let penalty_ridge = Array2::<f64>::eye(total_cols);
+    let penalty_ridge = nullspace_shrinkage_penalty(&penalty_kernel)?;
 
     Ok(MaternSplineBasis {
         basis,
@@ -2845,12 +2901,18 @@ pub fn build_matern_basis(
         spec.nu,
         spec.include_intercept,
     )?;
-    let mut penalties = vec![m.penalty_kernel.clone()];
-    let mut nullspace_dims = vec![if spec.include_intercept { 1 } else { 0 }];
-    if spec.double_penalty {
-        penalties.push(m.penalty_ridge.clone());
-        nullspace_dims.push(0);
-    }
+    let penalties = vec![if spec.double_penalty {
+        with_fixed_shrinkage(&m.penalty_kernel, &m.penalty_ridge)
+    } else {
+        m.penalty_kernel.clone()
+    }];
+    let nullspace_dims = vec![if spec.double_penalty {
+        0
+    } else if spec.include_intercept {
+        1
+    } else {
+        0
+    }];
     Ok(BasisBuildResult {
         design: m.basis,
         penalties,
@@ -3031,7 +3093,7 @@ pub fn create_duchon_spline_basis(
     penalty_kernel
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&omega_constrained);
-    let penalty_ridge = Array2::<f64>::eye(total_cols);
+    let penalty_ridge = nullspace_shrinkage_penalty(&penalty_kernel)?;
 
     Ok(DuchonSplineBasis {
         basis,
@@ -3057,14 +3119,16 @@ pub fn build_duchon_basis(
         spec.nu,
         spec.nullspace_order,
     )?;
-    let mut penalties = vec![d.penalty_kernel.clone()];
-    let mut nullspace_dims = vec![d.num_polynomial_basis];
-    if spec.double_penalty {
-        // Double penalty appends an identity ridge block, yielding a full-rank
-        // penalty when desired and avoiding generalized-inverse handling.
-        penalties.push(d.penalty_ridge.clone());
-        nullspace_dims.push(0);
-    }
+    let penalties = vec![if spec.double_penalty {
+        with_fixed_shrinkage(&d.penalty_kernel, &d.penalty_ridge)
+    } else {
+        d.penalty_kernel.clone()
+    }];
+    let nullspace_dims = vec![if spec.double_penalty {
+        0
+    } else {
+        d.num_polynomial_basis
+    }];
     Ok(BasisBuildResult {
         design: d.basis,
         penalties,
@@ -3375,7 +3439,7 @@ pub fn create_thin_plate_spline_basis(
     penalty_bending
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&omega_constrained);
-    let penalty_ridge = Array2::<f64>::eye(total_cols);
+    let penalty_ridge = nullspace_shrinkage_penalty(&penalty_bending)?;
 
     Ok(ThinPlateSplineBasis {
         basis,
@@ -4462,11 +4526,17 @@ mod tests {
             }
         }
 
-        // Ridge penalty must cover all coefficients, including polynomial columns.
+        // Double-penalty shrinkage should primarily target the polynomial/nullspace
+        // block, while keeping only a tiny numerical ridge elsewhere.
         for i in 0..p {
             for j in 0..p {
-                let expected = if i == j { 1.0 } else { 0.0 };
-                assert_abs_diff_eq!(tps.penalty_ridge[[i, j]], expected, epsilon = 1e-12);
+                if i == j && i < p0 {
+                    assert!(tps.penalty_ridge[[i, j]] < 1e-3);
+                } else if i == j {
+                    assert!(tps.penalty_ridge[[i, j]] > 0.5);
+                } else {
+                    assert_abs_diff_eq!(tps.penalty_ridge[[i, j]], 0.0, epsilon = 1e-8);
+                }
             }
         }
     }
@@ -4594,8 +4664,8 @@ mod tests {
             double_penalty: true,
         };
         let result = build_thin_plate_basis(data.view(), &spec).unwrap();
-        assert_eq!(result.penalties.len(), 2);
-        assert_eq!(result.nullspace_dims, vec![3, 0]);
+        assert_eq!(result.penalties.len(), 1);
+        assert_eq!(result.nullspace_dims, vec![0]);
         assert_eq!(result.design.nrows(), data.nrows());
     }
 

@@ -28,7 +28,7 @@ use crate::estimate::EstimationError;
 use crate::faer_ndarray::{fast_ab, fast_ata, fast_atb, fast_atv};
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::quadrature::QuadratureContext;
-use crate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
+use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use crate::types::LinkFunction;
 use crate::visualizer;
 use ndarray::s;
@@ -2703,10 +2703,19 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
             .as_ref()
             .map(|knots| baseline_lambda_seed(knots, state.degree, 2))
     };
-    let heuristic_lambdas = heuristic_lambda.map(|lambda| vec![lambda]);
+    let heuristic_lambdas = heuristic_lambda.map(|lambda| vec![lambda; n_base + 1]);
     let seed_config = SeedConfig {
-        strategy: SeedStrategy::Exhaustive,
         bounds: (-12.0, 12.0),
+        max_seeds: if n_base + 1 <= 4 { 12 } else { 16 },
+        screening_budget: if n_base + 1 <= 2 {
+            2
+        } else if n_base + 1 <= 6 {
+            3
+        } else {
+            4
+        },
+        screen_max_inner_iterations: 5,
+        risk_profile: SeedRiskProfile::Survival,
     };
     let seed_candidates =
         generate_rho_candidates(n_base + 1, heuristic_lambdas.as_deref(), &seed_config);

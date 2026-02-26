@@ -809,7 +809,11 @@ impl SubspaceSplit {
         }
     }
 
-    fn from_ordered_qs(qs: &Mat<f64>, penalized_rank: usize, p: usize) -> Result<Self, EstimationError> {
+    fn from_ordered_qs(
+        qs: &Mat<f64>,
+        penalized_rank: usize,
+        p: usize,
+    ) -> Result<Self, EstimationError> {
         if qs.nrows() != p || qs.ncols() != p {
             return Err(EstimationError::LayoutError(format!(
                 "Invalid Q basis dimensions: expected {p}x{p}, got {}x{}",
