@@ -62,6 +62,17 @@ def _fmt_kib(kib):
     return f"{gib:.2f} GiB"
 
 
+def _fmt_cpu_total_pct(cpu_pct):
+    if cpu_pct in (None, "n/a"):
+        return "n/a"
+    try:
+        cpu_val = float(cpu_pct)
+    except Exception:
+        return "n/a"
+    ncpu = os.cpu_count() or 1
+    return f"{(cpu_val / float(ncpu)):.1f}"
+
+
 def _read_meminfo():
     out = {}
     try:
@@ -162,7 +173,7 @@ def _heartbeat_loop(proc, cmd, stop_event, stats):
         load = os.getloadavg() if hasattr(os, "getloadavg") else (None, None, None)
         line = (
             f"[HEARTBEAT] elapsed={elapsed:8.1f}s cmd='{cmd_preview}' "
-            f"pid={proc.pid} p_cpu={ps.get('cpu_pct', 'n/a')}% p_mem={ps.get('mem_pct', 'n/a')}% "
+            f"pid={proc.pid} p_cpu={_fmt_cpu_total_pct(ps.get('cpu_pct', 'n/a'))}% p_mem={ps.get('mem_pct', 'n/a')}% "
             f"p_rss={_fmt_kib(rss_kib)} p_vsz={_fmt_kib(ps.get('vsz_kib'))} "
             f"py_rss={_fmt_kib(py_rss_kib)} "
             f"sys_avail={_fmt_kib(meminfo.get('MemAvailable'))} "
@@ -287,12 +298,55 @@ def mae_score(y: np.ndarray, mu: np.ndarray) -> float:
     return float(np.mean(np.abs(y - mu)))
 
 
+def zscore_train_test(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    tr = train_df.copy()
+    te = test_df.copy()
+    for col in feature_cols:
+        mu = float(tr[col].mean())
+        sdv = float(tr[col].std())
+        if (not np.isfinite(sdv)) or sdv < 1e-8:
+            sdv = 1.0
+        tr[col] = (tr[col] - mu) / sdv
+        te[col] = (te[col] - mu) / sdv
+    return tr, te
+
+
 def r2_score(y: np.ndarray, mu: np.ndarray) -> float:
     sst = float(np.sum((y - float(np.mean(y))) ** 2))
     if sst <= 0.0:
         return 0.0
     sse = float(np.sum((y - mu) ** 2))
     return 1.0 - sse / sst
+
+
+def _survival_risk_from_rust_pred(pred_df: pd.DataFrame) -> tuple[np.ndarray, str]:
+    # Common survival target across contenders: failure probability at evaluation horizon.
+    if "failure_prob" in pred_df.columns:
+        return pred_df["failure_prob"].to_numpy(dtype=float), "failure_prob"
+    if "survival_prob" in pred_df.columns:
+        return (1.0 - pred_df["survival_prob"].to_numpy(dtype=float)), "survival_prob"
+    if "mean" in pred_df.columns:
+        # Backward compatibility: survival models previously exposed mean=survival_prob.
+        return (1.0 - pred_df["mean"].to_numpy(dtype=float)), "mean"
+    raise RuntimeError(
+        "rust survival prediction output missing required probability column; "
+        "expected one of failure_prob/survival_prob/mean"
+    )
+
+
+def _lifelines_cindex_from_risk(event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray) -> float:
+    # Convert risk (higher => earlier failure) to lifelines survival score.
+    return float(concordance_index(event_times, -risk_score, event_observed=events))
+
+
+def _survival_eval_horizon(train_df: pd.DataFrame, time_col: str) -> float:
+    # Global policy for survival benchmarking: fold-specific fixed horizon from
+    # train data only. For time-invariant-risk models (e.g., Cox), this is
+    # mathematically neutral but keeps evaluation policy uniform.
+    horizon = float(np.median(train_df[time_col].to_numpy(dtype=float)))
+    if (not np.isfinite(horizon)) or horizon <= 0.0:
+        horizon = 1.0
+    return horizon
 
 
 def _augment_bmi_spline_linear_hinges(train_df: pd.DataFrame, test_df: pd.DataFrame, n_knots: int = 6):
@@ -1644,21 +1698,21 @@ def _rust_fit_mapping(scenario_name):
         "geo_disease_matern": dict(
             family="binomial-logit",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="matern",
+            smooth_basis="thinplate",
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
         ),
         "geo_disease_shrinkage": dict(
             family="binomial-logit",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="matern",
+            smooth_basis="thinplate",
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
         ),
         "geo_disease_matern_basic": dict(
             family="binomial-logit",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="matern",
+            smooth_basis="thinplate",
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
         ),
@@ -1686,31 +1740,39 @@ def _rust_formula_for_scenario(scenario_name, ds):
     target = ds["target"]
     terms = [f"linear({c})" for c in cfg.get("linear_cols", [])]
     basis = str(cfg.get("smooth_basis", "ps")).lower()
+    if (
+        ds.get("family") == "gaussian"
+        and basis in {"ps", "bspline", "p-spline"}
+        and len(ds.get("rows", [])) <= 100
+        and (
+            (cfg.get("smooth_cols") is not None and len(cfg.get("smooth_cols", [])) == 1)
+            or ("smooth_col" in cfg)
+        )
+    ):
+        basis = "tps"
     knots = int(cfg.get("knots", 8))
+    dp_opt = ""
+    if "double_penalty" in cfg:
+        dp = "true" if bool(cfg["double_penalty"]) else "false"
+        dp_opt = f", double_penalty={dp}"
     smooth_cols = cfg.get("smooth_cols")
     if smooth_cols:
         for col in smooth_cols:
             if basis in {"ps", "bspline", "p-spline"}:
-                if "double_penalty" in cfg:
-                    dp = "true" if bool(cfg["double_penalty"]) else "false"
-                    terms.append(f"s({col}, type=ps, knots={knots}, double_penalty={dp})")
-                else:
-                    terms.append(f"s({col}, type=ps, knots={knots})")
+                terms.append(f"s({col}, type=ps, knots={knots}{dp_opt})")
             elif basis in {"thinplate", "tps"}:
-                terms.append(f"s({col}, type=tps, centers={knots})")
+                terms.append(f"s({col}, type=tps, centers={knots}{dp_opt})")
             elif basis == "duchon":
-                terms.append(f"s({col}, type=duchon, centers={knots})")
+                terms.append(f"s({col}, type=duchon, centers={knots}{dp_opt})")
             elif basis == "matern":
-                terms.append(f"s({col}, type=matern, centers={knots})")
+                terms.append(f"s({col}, type=matern, centers={knots}{dp_opt})")
             else:
-                if "double_penalty" in cfg:
-                    dp = "true" if bool(cfg["double_penalty"]) else "false"
-                    terms.append(f"s({col}, type=ps, knots={knots}, double_penalty={dp})")
-                else:
-                    terms.append(f"s({col}, type=ps, knots={knots})")
+                terms.append(f"s({col}, type=ps, knots={knots}{dp_opt})")
     else:
         col = cfg["smooth_col"]
-        if "double_penalty" in cfg:
+        if basis in {"thinplate", "tps"}:
+            terms.append(f"s({col}, type=tps, centers={knots}{dp_opt})")
+        elif "double_penalty" in cfg:
             dp = "true" if bool(cfg["double_penalty"]) else "false"
             terms.append(f"s({col}, type=ps, knots={knots}, double_penalty={dp})")
         else:
@@ -1930,7 +1992,7 @@ def rust_cli_cv_args(scenario_name, ds):
         "geo_disease_matern": dict(
             family="binomial",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="matern",
+            smooth_basis="thinplate",
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
             double_penalty=True,
@@ -1939,7 +2001,7 @@ def rust_cli_cv_args(scenario_name, ds):
         "geo_disease_shrinkage": dict(
             family="binomial",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="matern",
+            smooth_basis="thinplate",
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
             double_penalty=True,
@@ -1947,7 +2009,7 @@ def rust_cli_cv_args(scenario_name, ds):
         "geo_disease_matern_basic": dict(
             family="binomial",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="matern",
+            smooth_basis="thinplate",
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
             double_penalty=False,
@@ -2032,9 +2094,13 @@ def run_rust_scenario_cv(scenario):
                     train_df[col] = (train_df[col] - mu) / sdv
                     test_df[col] = (test_df[col] - mu) / sdv
                 train_df["__entry"] = 0.0
-                test_df["__entry"] = 0.0
+                # Global survival metric policy: evaluate at fold-specific fixed horizon.
+                horizon = _survival_eval_horizon(train_df, ds["time_col"])
+                test_pred_df = test_df.copy()
+                test_pred_df["__entry"] = 0.0
+                test_pred_df[ds["time_col"]] = horizon
                 train_df.to_csv(train_path, index=False)
-                test_df.to_csv(test_path, index=False)
+                test_pred_df.to_csv(test_path, index=False)
                 formula = _rust_survival_formula_for_scenario(scenario_name)
                 fit_cfg = _rust_survival_fit_options_for_scenario(scenario_name)
                 fit_cmd = [
@@ -2068,6 +2134,7 @@ def run_rust_scenario_cv(scenario):
                         ]
                     )
             else:
+                train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
                 train_df.to_csv(train_path, index=False)
                 test_df.to_csv(test_path, index=False)
                 family, formula = _rust_formula_for_scenario(scenario_name, ds)
@@ -2166,22 +2233,28 @@ def run_rust_scenario_cv(scenario):
             else:
                 event_times = test_eval_df[ds["time_col"]].to_numpy(dtype=float)
                 events = test_eval_df[ds["event_col"]].to_numpy(dtype=float)
-                if "eta" not in pred_df.columns:
+                try:
+                    risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
+                except RuntimeError as e:
                     return {
                         "contender": "rust_gam",
                         "scenario_name": scenario_name,
                         "status": "failed",
-                        "error": "rust survival prediction output missing 'eta' column",
+                        "error": str(e),
                     }
-                risk_score = -pred_df["eta"].to_numpy(dtype=float)
-                cidx = float(concordance_index(event_times, risk_score, event_observed=events))
+                cidx = _lifelines_cindex_from_risk(event_times, risk_score, events)
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
                         "predict_sec": float(pred_sec),
                         "auc": cidx,
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": "gam survival/predict via release binary (time-aware c-index on survival score) [5-fold CV]",
+                        "predict_horizon": float(horizon),
+                        "predict_horizon_policy": "global train-fold median time",
+                        "model_spec": (
+                            "survival model via release binary "
+                            f"(c-index on failure probability from '{score_src}') [5-fold CV]"
+                        ),
                     }
                 )
 
@@ -2328,6 +2401,7 @@ data_path <- args[1]
 out_path <- args[2]
 train_idx_path <- args[3]
 test_idx_path <- args[4]
+horizon <- as.numeric(args[5])
 
 suppressPackageStartupMessages({
   library(mgcv)
@@ -2351,6 +2425,17 @@ if (family_name != "survival") {
 }
 
 fam <- if (family_name == "binomial") binomial(link="logit") else gaussian(link="identity")
+
+if (family_name != "survival") {
+  feature_cols <- as.character(payload$dataset$features)
+  for (cn in feature_cols) {
+    mu <- mean(train_df[[cn]])
+    sdv <- stats::sd(train_df[[cn]])
+    if (!is.finite(sdv) || sdv < 1e-8) sdv <- 1.0
+    train_df[[cn]] <- (train_df[[cn]] - mu) / sdv
+    test_df[[cn]] <- (test_df[[cn]] - mu) / sdv
+  }
+}
 
 if (family_name == "survival") {
   suppressPackageStartupMessages(library(survival))
@@ -2379,12 +2464,15 @@ if (family_name == "survival") {
   lp <- as.numeric(predict(fit, newdata=test_df, type="lp"))
   pred_sec <- proc.time()[["elapsed"]] - pred_t0
 
-  cidx <- as.numeric(concordance(Surv(time, event) ~ lp, data=test_df, reverse=TRUE)$concordance)
+  bh <- basehaz(fit, centered=FALSE)
+  H0 <- as.numeric(stats::approx(bh$time, bh$hazard, xout=horizon, method="linear", ties="ordered", rule=2)$y)
+  risk <- as.numeric(1.0 - exp(-H0 * exp(lp)))
   out <- list(
     status="ok",
     fit_sec=fit_sec,
     predict_sec=pred_sec,
-    auc=cidx,
+    auc=NULL,
+    risk=risk,
     brier=NULL,
     logloss=NULL,
     rmse=NULL,
@@ -2584,11 +2672,13 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         script_path.write_text(script)
 
         cv_rows = []
+        all_df = pd.DataFrame(ds["rows"])
         for fold_id, fold in enumerate(folds):
             train_idx_path = td_path / f"train_idx_{fold_id}.txt"
             test_idx_path = td_path / f"test_idx_{fold_id}.txt"
             train_idx_path.write_text("\n".join(str(int(i)) for i in fold.train_idx) + "\n")
             test_idx_path.write_text("\n".join(str(int(i)) for i in fold.test_idx) + "\n")
+            horizon = _survival_eval_horizon(all_df.iloc[fold.train_idx].copy(), ds["time_col"]) if ds["family"] == "survival" else None
 
             code, out, err = run_cmd(
                 [
@@ -2598,6 +2688,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     str(out_path),
                     str(train_idx_path),
                     str(test_idx_path),
+                    str(float(horizon)) if horizon is not None else "0",
                 ],
                 cwd=ROOT,
             )
@@ -2609,6 +2700,27 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     "error": err.strip() or out.strip(),
                 }
             fold_row = json.loads(out_path.read_text())
+            if ds["family"] == "survival":
+                all_df = pd.DataFrame(ds["rows"])
+                train_df = all_df.iloc[fold.train_idx].copy()
+                test_df = all_df.iloc[fold.test_idx].copy()
+                event_times = test_df[ds["time_col"]].to_numpy(dtype=float)
+                events = test_df[ds["event_col"]].to_numpy(dtype=float)
+                risk = np.asarray(fold_row.get("risk", []), dtype=float).reshape(-1)
+                if risk.shape[0] != event_times.shape[0]:
+                    return {
+                        "contender": "r_mgcv",
+                        "scenario_name": scenario["name"],
+                        "status": "failed",
+                        "error": (
+                            "r_mgcv survival fold output missing/invalid risk vector "
+                            f"(got {risk.shape[0]}, expected {event_times.shape[0]})"
+                        ),
+                    }
+                fold_row["auc"] = _lifelines_cindex_from_risk(event_times, risk, events)
+                fold_row["predict_horizon"] = _survival_eval_horizon(train_df, ds["time_col"])
+                fold_row["predict_horizon_policy"] = "global train-fold median time"
+                fold_row.pop("risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
@@ -2643,6 +2755,7 @@ def run_external_pygam_cv(scenario):
             train_df = df.iloc[fold.train_idx].copy()
             test_df = df.iloc[fold.test_idx].copy()
             feature_cols = ds["features"]
+            horizon = _survival_eval_horizon(train_df, time_col)
             for col in feature_cols:
                 mu = float(train_df[col].mean())
                 sdv = float(train_df[col].std())
@@ -2669,30 +2782,45 @@ def run_external_pygam_cv(scenario):
             fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
             pred_start = datetime.now(timezone.utc)
-            risk = cph.predict_partial_hazard(test_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
+            surv_at_h = cph.predict_survival_function(
+                test_df[fit_feature_cols],
+                times=[horizon],
+            )
+            risk = (1.0 - surv_at_h.iloc[0].to_numpy(dtype=float).reshape(-1))
             pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
             event_times = test_df[time_col].to_numpy(dtype=float)
             events = test_df[event_col].to_numpy(dtype=float)
-            cidx = float(concordance_index(event_times, -risk, event_observed=events))
+            cidx = _lifelines_cindex_from_risk(event_times, risk, events)
             cv_rows.append(
                 {
                     "fit_sec": fit_sec,
                     "predict_sec": pred_sec,
                     "auc": cidx,
                     "n_test": int(len(fold.test_idx)),
+                    "predict_horizon": float(horizon),
+                    "predict_horizon_policy": "global train-fold median time",
                     "warning": (
                         f"lifelines convergence warning: {str(conv_warn[0].message)}"
                         if conv_warn
                         else None
                     ),
                     "model_spec": (
-                        "CoxPHFitter(train-fold z-score; bmi 6-knot hinge spline; penalizer=1e-4)"
+                        "CoxPHFitter(train-fold z-score; bmi 6-knot hinge spline; penalizer=1e-4; "
+                        "c-index on failure probability at global fold horizon)"
                         if scenario["name"] == "icu_survival_death"
-                        else "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4)"
+                        else "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4; "
+                        "c-index on failure probability at global fold horizon)"
                     ),
                 }
             )
             continue
+
+        if x_train.shape[1] > 0:
+            mu = np.mean(x_train, axis=0)
+            sdv = np.std(x_train, axis=0, ddof=1)
+            sdv[~np.isfinite(sdv) | (sdv < 1e-8)] = 1.0
+            x_train = (x_train - mu) / sdv
+            x_test = (x_test - mu) / sdv
 
         if ds["family"] == "binomial":
             if x.shape[1] == 1:
