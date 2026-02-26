@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,7 @@ for _k, _v in _SERIAL_ENV_OVERRIDES.items():
 import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
+from lifelines.exceptions import ConvergenceWarning
 from lifelines.utils import concordance_index
 from pygam import LinearGAM, LogisticGAM, l, s
 
@@ -138,8 +140,17 @@ def brier_score(y: np.ndarray, p: np.ndarray) -> float:
     return float(np.mean((y - p) ** 2))
 
 
+def log_loss_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> float:
+    p_clipped = np.clip(p, eps, 1.0 - eps)
+    return float(-np.mean(y * np.log(p_clipped) + (1.0 - y) * np.log(1.0 - p_clipped)))
+
+
 def rmse_score(y: np.ndarray, mu: np.ndarray) -> float:
     return math.sqrt(float(np.mean((y - mu) ** 2)))
+
+
+def mae_score(y: np.ndarray, mu: np.ndarray) -> float:
+    return float(np.mean(np.abs(y - mu)))
 
 
 def r2_score(y: np.ndarray, mu: np.ndarray) -> float:
@@ -1023,7 +1034,9 @@ def aggregate_cv_rows(cv_rows, family):
             "predict_sec": predict_sec,
             "auc": wavg("auc"),
             "brier": wavg("brier"),
+            "logloss": wavg("logloss"),
             "rmse": None,
+            "mae": None,
             "r2": None,
         }
     if family == "survival":
@@ -1032,8 +1045,10 @@ def aggregate_cv_rows(cv_rows, family):
             "predict_sec": predict_sec,
             "auc": wavg("auc"),  # concordance index
             "brier": None,
+            "logloss": None,
             "c_index": wavg("auc"),
             "rmse": None,
+            "mae": None,
             "r2": None,
         }
     return {
@@ -1041,7 +1056,9 @@ def aggregate_cv_rows(cv_rows, family):
         "predict_sec": predict_sec,
         "auc": None,
         "brier": None,
+        "logloss": None,
         "rmse": wavg("rmse"),
+        "mae": wavg("mae"),
         "r2": wavg("r2"),
     }
 
@@ -1552,12 +1569,6 @@ def run_rust_scenario_cv(scenario):
                     test_df[col] = (test_df[col] - mu) / sdv
                 train_df["__entry"] = 0.0
                 test_df["__entry"] = 0.0
-                # Use a fixed time horizon per fold to avoid leakage from scoring at each
-                # subject's observed event/censoring time.
-                horizon = float(np.median(train_df[ds["time_col"]].to_numpy(dtype=float)))
-                if not np.isfinite(horizon) or horizon <= 0.0:
-                    horizon = 1.0
-                test_df[ds["time_col"]] = horizon
                 train_df.to_csv(train_path, index=False)
                 test_df.to_csv(test_path, index=False)
                 formula = _rust_survival_formula_for_scenario(scenario_name)
@@ -1670,6 +1681,7 @@ def run_rust_scenario_cv(scenario):
                         "predict_sec": float(pred_sec),
                         "auc": auc_score(y_test, pred),
                         "brier": brier_score(y_test, pred),
+                        "logloss": log_loss_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": "gam fit/predict via release binary [5-fold CV]",
                     }
@@ -1681,6 +1693,7 @@ def run_rust_scenario_cv(scenario):
                         "fit_sec": float(fit_sec),
                         "predict_sec": float(pred_sec),
                         "rmse": rmse_score(y_test, pred),
+                        "mae": mae_score(y_test, pred),
                         "r2": r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": "gam fit/predict via release binary [5-fold CV]",
@@ -1689,11 +1702,14 @@ def run_rust_scenario_cv(scenario):
             else:
                 event_times = test_eval_df[ds["time_col"]].to_numpy(dtype=float)
                 events = test_eval_df[ds["event_col"]].to_numpy(dtype=float)
-                risk_score = (
-                    -pred_df["eta"].to_numpy(dtype=float)
-                    if "eta" in pred_df.columns
-                    else pred
-                )
+                if "eta" not in pred_df.columns:
+                    return {
+                        "contender": "rust_gam",
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "error": "rust survival prediction output missing 'eta' column",
+                    }
+                risk_score = -pred_df["eta"].to_numpy(dtype=float)
                 cidx = float(concordance_index(event_times, risk_score, event_observed=events))
                 cv_rows.append(
                     {
@@ -1701,13 +1717,14 @@ def run_rust_scenario_cv(scenario):
                         "predict_sec": float(pred_sec),
                         "auc": cidx,
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": "gam survival/predict via release binary (fixed-horizon c-index on survival score) [5-fold CV]",
+                        "model_spec": "gam survival/predict via release binary (time-aware c-index on survival score) [5-fold CV]",
                     }
                 )
 
     metrics = aggregate_cv_rows(cv_rows, ds["family"])
     return {
         "contender": "rust_gam",
+        "family": ds["family"],
         "scenario_name": scenario_name,
         "status": "ok",
         **metrics,
@@ -1792,7 +1809,9 @@ if (family_name == "survival") {
     predict_sec=pred_sec,
     auc=cidx,
     brier=NULL,
+    logloss=NULL,
     rmse=NULL,
+    mae=NULL,
     r2=NULL,
     model_spec=ftxt
   )
@@ -1918,18 +1937,23 @@ if (family_name == "binomial") {
     auc <- (rank_sum_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
   }
   brier <- mean((y_test - p)^2)
+  p_safe <- pmin(pmax(p, 1e-12), 1 - 1e-12)
+  logloss <- mean(-(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe)))
   out <- list(
     status="ok",
     fit_sec=fit_sec,
     predict_sec=pred_sec,
     auc=auc,
     brier=brier,
+    logloss=logloss,
     rmse=NULL,
+    mae=NULL,
     r2=NULL,
     model_spec=ftxt
   )
 } else {
   rmse <- sqrt(mean((y_test - p)^2))
+  mae <- mean(abs(y_test - p))
   sst <- sum((y_test - mean(y_test))^2)
   if (sst <= 0) {
     r2 <- 0.0
@@ -1942,7 +1966,9 @@ if (family_name == "binomial") {
     predict_sec=pred_sec,
     auc=NULL,
     brier=NULL,
+    logloss=NULL,
     rmse=rmse,
+    mae=mae,
     r2=r2,
     model_spec=ftxt
   )
@@ -1984,6 +2010,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     metrics = aggregate_cv_rows(cv_rows, ds["family"])
     return {
         "contender": "r_mgcv",
+        "family": ds["family"],
         "scenario_name": scenario["name"],
         "status": "ok",
         **metrics,
@@ -2026,18 +2053,29 @@ def run_external_pygam_cv(scenario):
                 fit_feature_cols = [c for c in feature_cols if c != "bmi"] + bmi_spline_cols
             fit_start = datetime.now(timezone.utc)
             cph = CoxPHFitter(penalizer=1e-4)
-            cph.fit(train_df[[*fit_feature_cols, time_col, event_col]], duration_col=time_col, event_col=event_col)
+            with warnings.catch_warnings(record=True) as wlist:
+                warnings.simplefilter("always")
+                cph.fit(
+                    train_df[[*fit_feature_cols, time_col, event_col]],
+                    duration_col=time_col,
+                    event_col=event_col,
+                )
+            conv_warn = [w for w in wlist if issubclass(w.category, ConvergenceWarning)]
+            if conv_warn:
+                return {
+                    "contender": "python_lifelines",
+                    "scenario_name": scenario["name"],
+                    "status": "failed",
+                    "error": f"lifelines convergence warning: {str(conv_warn[0].message)}",
+                }
             fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
             pred_start = datetime.now(timezone.utc)
-            _risk = cph.predict_partial_hazard(test_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
+            risk = cph.predict_partial_hazard(test_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
             pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
-            cidx = float(
-                cph.score(
-                    test_df[[*fit_feature_cols, time_col, event_col]],
-                    scoring_method="concordance_index",
-                )
-            )
+            event_times = test_df[time_col].to_numpy(dtype=float)
+            events = test_df[event_col].to_numpy(dtype=float)
+            cidx = float(concordance_index(event_times, -risk, event_observed=events))
             cv_rows.append(
                 {
                     "fit_sec": fit_sec,
@@ -2145,6 +2183,7 @@ def run_external_pygam_cv(scenario):
                     "predict_sec": pred_sec,
                     "auc": auc_score(y_test, pred),
                     "brier": brier_score(y_test, pred),
+                    "logloss": log_loss_score(y_test, pred),
                     "n_test": int(len(fold.test_idx)),
                     "model_spec": model_spec,
                 }
@@ -2180,6 +2219,9 @@ def run_external_pygam_cv(scenario):
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
+                "rmse": rmse_score(y_test, pred),
+                "mae": mae_score(y_test, pred),
+                "r2": r2_score(y_test, pred),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": model_spec,
             }
@@ -2188,6 +2230,7 @@ def run_external_pygam_cv(scenario):
     metrics = aggregate_cv_rows(cv_rows, ds["family"])
     return {
         "contender": "python_lifelines" if ds["family"] == "survival" else "python_pygam",
+        "family": ds["family"],
         "scenario_name": scenario["name"],
         "status": "ok",
         **metrics,

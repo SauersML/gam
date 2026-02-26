@@ -250,26 +250,83 @@ jobs:
           if summary_path:
               ok_count = sum(1 for r in merged_sorted if str(r.get("status", "")) == "ok")
               fail_count = len(merged_sorted) - ok_count
+              family_labels = {"binomial": "Classification", "gaussian": "Regression", "survival": "Survival"}
+              family_rows = {}
+              for r in merged_sorted:
+                  fam = str(r.get("family") or "unknown")
+                  family_rows.setdefault(fam, []).append(r)
+
+              def primary_metric(row):
+                  fam = str(row.get("family") or "")
+                  if fam == "binomial":
+                      return "Brier", row.get("brier"), "min"
+                  if fam == "gaussian":
+                      return "RMSE", row.get("rmse"), "min"
+                  if fam == "survival":
+                      return "C-index", row.get("auc"), "max"
+                  return "n/a", None, "min"
+
+              def winner_for_family(fam):
+                  rows = [r for r in family_rows.get(fam, []) if str(r.get("status", "")) == "ok"]
+                  if not rows:
+                      return None
+                  vals = []
+                  for r in rows:
+                      _, v, mode = primary_metric(r)
+                      if v is None:
+                          continue
+                      vals.append((float(v), r, mode))
+                  if not vals:
+                      return None
+                  mode = vals[0][2]
+                  return (min(vals, key=lambda x: x[0]) if mode == "min" else max(vals, key=lambda x: x[0]))[1]
+
               lines = []
-              lines.append("## Benchmark Summary")
+              lines.append("## Benchmark Results")
               lines.append("")
               lines.append(f"- Generated: `{datetime.now(timezone.utc).isoformat()}`")
               lines.append(f"- Shards merged: `{len(files)}`")
               lines.append(f"- Result rows: `{len(merged_sorted)}` (`{ok_count}` ok, `{fail_count}` failed)")
+              lines.append("- Primary metrics by task:")
+              lines.append("  - Classification: lower Brier (with AUC + LogLoss shown)")
+              lines.append("  - Regression: lower RMSE (with MAE + R2 shown)")
+              lines.append("  - Survival: higher C-index")
               lines.append("")
-              lines.append("| Scenario | Contender | Status | AUC/C-Index | Brier | RMSE | R2 | Fit (s) | Predict (s) |")
-              lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|")
+              lines.append("### Leaders")
+              lines.append("")
+              lines.append("| Task | Winner | Primary Metric | Value |")
+              lines.append("|---|---|---|---:|")
+              for fam in ("binomial", "gaussian", "survival"):
+                  winner = winner_for_family(fam)
+                  if winner is None:
+                      lines.append(f"| {family_labels.get(fam, fam)} | — | — | — |")
+                      continue
+                  m_name, m_val, _ = primary_metric(winner)
+                  lines.append(
+                      f"| {family_labels.get(fam, fam)} | "
+                      f"{md_escape(winner.get('contender'))} ({md_escape(winner.get('scenario_name'))}) | "
+                      f"{m_name} | {fmt_num(m_val)} |"
+                  )
+              lines.append("")
+              lines.append("### Full Table")
+              lines.append("")
+              lines.append("| Task | Scenario | Contender | Status | C-index/AUC | Brier | LogLoss | RMSE | MAE | R2 | Fit (s) | Predict (s) |")
+              lines.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
               for r in merged_sorted:
+                  fam = str(r.get("family") or "unknown")
                   lines.append(
                       "| "
                       + " | ".join(
                           [
+                              md_escape(family_labels.get(fam, fam)),
                               md_escape(r.get("scenario_name")),
                               md_escape(r.get("contender")),
                               md_escape(fmt_status(r)),
                               fmt_num(r.get("auc")),
                               fmt_num(r.get("brier")),
+                              fmt_num(r.get("logloss")),
                               fmt_num(r.get("rmse")),
+                              fmt_num(r.get("mae")),
                               fmt_num(r.get("r2")),
                               fmt_num(r.get("fit_sec")),
                               fmt_num(r.get("predict_sec")),
