@@ -1,36 +1,27 @@
 #![deny(dead_code)]
 #![deny(unused_imports)]
 
-pub mod alo;
-pub mod basis;
-pub mod construction;
-pub mod diagnostics;
-pub mod estimate;
-pub mod faer_ndarray;
 pub mod families;
-pub mod generative;
-pub mod hmc;
-pub mod hull;
-pub mod joint;
-pub mod layout;
-pub mod matrix;
-pub mod pirls;
-pub mod probability;
-pub mod quadrature;
-pub mod seeding;
-pub mod smooth;
+pub mod inference;
+pub mod linalg;
+pub mod solver;
+pub mod terms;
 pub mod types;
-pub mod visualizer;
+
+pub use inference::{alo, diagnostics, generative, hmc, probability, quadrature};
+pub use linalg::{faer_ndarray, matrix};
+pub use solver::{estimate, joint, pirls, seeding, visualizer};
+pub use terms::{basis, construction, hull, layout, smooth};
 
 pub use families::custom_family;
 pub use families::gamlss;
 pub use families::survival;
 
-pub use alo::{
+pub use inference::alo::{
     AloDiagnostics, compute_alo_diagnostics, compute_alo_diagnostics_from_fit,
     compute_alo_diagnostics_from_pirls,
 };
-pub use basis::{
+pub use terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
     BasisBuildResult, BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
     DuchonSplineBasis, MaternBasisSpec, MaternNu, MaternSplineBasis, ThinPlateBasisSpec,
@@ -39,17 +30,17 @@ pub use basis::{
     create_thin_plate_spline_basis, create_thin_plate_spline_basis_with_knot_count,
     select_thin_plate_knots,
 };
-pub use custom_family::{
+pub use families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
     KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
-pub use estimate::{
+pub use solver::estimate::{
     CoefficientUncertaintyResult, FitArtifacts, FitOptions, FitResult, InferenceCovarianceMode,
     MeanIntervalMethod, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
     coefficient_uncertainty, coefficient_uncertainty_with_mode, fit_gam, optimize_external_design,
     predict_gam, predict_gam_with_uncertainty,
 };
-pub use gamlss::{
+pub use families::gamlss::{
     BinomialLocationScaleProbitFamily, BinomialLocationScaleProbitSpec,
     BinomialLocationScaleProbitWiggleFamily, BinomialLocationScaleProbitWiggleSpec,
     BinomialLogitFamily, BinomialLogitSpec, FamilyMetadata, GammaLogFamily, GammaLogSpec,
@@ -59,15 +50,15 @@ pub use gamlss::{
     fit_binomial_location_scale_probit_wiggle, fit_binomial_logit, fit_gamma_log,
     fit_gaussian_location_scale, fit_poisson_log, initialize_wiggle_knots_from_seed,
 };
-pub use generative::{
+pub use inference::generative::{
     CustomFamilyGenerative, GenerativeSpec, NoiseModel, custom_generative_spec,
     generative_spec_from_gam, generative_spec_from_predict, sample_observation_replicates,
     sample_observations,
 };
-pub use layout::{
+pub use terms::layout::{
     EngineLayout, EngineLayoutBuilder, EngineTerm, EngineTermKind, EngineTermSpec, PenaltySpec,
 };
-pub use smooth::{
+pub use terms::smooth::{
     FittedTermCollection, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec,
     SmoothDesign, SmoothTerm, SmoothTermSpec, TensorBSplineSpec, TermCollectionDesign,
     TermCollectionSpec, build_smooth_design, build_term_collection_design, fit_term_collection,

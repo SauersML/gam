@@ -2,7 +2,7 @@ use gam::estimate::{
     SmoothingBfgsOptions, optimize_log_smoothing_with_multistart,
     optimize_log_smoothing_with_multistart_with_gradient,
 };
-use gam::seeding::{SeedConfig, SeedStrategy};
+use gam::seeding::{SeedConfig, SeedRiskProfile};
 use ndarray::array;
 
 #[test]
@@ -27,8 +27,11 @@ fn exact_gradient_optimizer_matches_fd_on_quadratic_objective() {
         tol: 1e-8,
         finite_diff_step: 1e-4,
         seed_config: SeedConfig {
-            strategy: SeedStrategy::Light,
             bounds: (-4.0, 4.0),
+            max_seeds: 16,
+            screening_budget: 6,
+            screen_max_inner_iterations: 5,
+            risk_profile: SeedRiskProfile::Gaussian,
         },
     };
 

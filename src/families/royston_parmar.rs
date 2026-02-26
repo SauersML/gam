@@ -91,7 +91,10 @@ impl Default for SurvivalLambdaOptimizerOptions {
             max_iter: 200,
             tol: 1e-5,
             finite_diff_step: 1e-3,
-            seed_config: crate::seeding::SeedConfig::default(),
+            seed_config: crate::seeding::SeedConfig {
+                risk_profile: crate::seeding::SeedRiskProfile::Survival,
+                ..crate::seeding::SeedConfig::default()
+            },
         }
     }
 }
