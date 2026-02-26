@@ -6,6 +6,11 @@ mod cli;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_FULL};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
+use faer::Mat as FaerMat;
+use faer::Side;
+use faer::linalg::solvers::{
+    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
+};
 use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
@@ -767,6 +772,98 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         .enumerate()
         .map(|(i, h)| (h.clone(), i))
         .collect();
+    if model.family == family_to_string(LikelihoodFamily::RoystonParmar) {
+        let entry_name = model
+            .survival_entry
+            .as_ref()
+            .ok_or_else(|| "survival model missing entry column metadata".to_string())?;
+        let exit_name = model
+            .survival_exit
+            .as_ref()
+            .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
+        let _entry_col = *col_map
+            .get(entry_name)
+            .ok_or_else(|| format!("entry column '{}' not found", entry_name))?;
+        let exit_col = *col_map
+            .get(exit_name)
+            .ok_or_else(|| format!("exit column '{}' not found", exit_name))?;
+        let term_spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+        let cov_design = build_term_collection_design(ds.values.view(), &term_spec)
+            .map_err(|e| format!("failed to build survival prediction design: {e}"))?;
+        let n = ds.values.nrows();
+        let p_cov = cov_design.design.ncols();
+        let p = p_cov + 2;
+        let mut x_exit = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let t1 = ds.values[[i, exit_col]].max(1e-9);
+            x_exit[[i, 0]] = 1.0;
+            x_exit[[i, 1]] = t1.ln();
+            for j in 0..p_cov {
+                x_exit[[i, j + 2]] = cov_design.design[[i, j]];
+            }
+        }
+        let beta = Array1::from_vec(model.beta.clone());
+        if beta.len() != p {
+            return Err(format!(
+                "survival model/design mismatch: beta has {} coefficients but design has {} columns",
+                beta.len(),
+                p
+            ));
+        }
+        let eta = x_exit.dot(&beta);
+        let mean = survival_probability_from_eta(eta.view());
+        let mut eta_se = None;
+        let mut mean_lo = None;
+        let mut mean_hi = None;
+        if args.uncertainty {
+            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+                return Err(format!("--level must be in (0,1), got {}", args.level));
+            }
+            let cov = match args.covariance_mode {
+                CovarianceModeArg::Corrected => model
+                    .covariance_corrected
+                    .as_ref()
+                    .or(model.covariance_conditional.as_ref()),
+                CovarianceModeArg::Conditional => model.covariance_conditional.as_ref(),
+            }
+            .ok_or_else(|| {
+                "survival model file does not include covariance; refit with current CLI to enable --uncertainty"
+                    .to_string()
+            })?;
+            let cov_mat = nested_vec_to_array2(cov)?;
+            if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
+                return Err(format!(
+                    "covariance shape mismatch: got {}x{}, expected {}x{}",
+                    cov_mat.nrows(),
+                    cov_mat.ncols(),
+                    beta.len(),
+                    beta.len()
+                ));
+            }
+            let se = linear_predictor_se(x_exit.view(), &cov_mat);
+            let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+            let eta_lower = &eta - &se.mapv(|v| z * v);
+            let eta_upper = &eta + &se.mapv(|v| z * v);
+            eta_se = Some(se);
+            // Survival decreases as eta increases.
+            mean_lo = Some(survival_probability_from_eta(eta_upper.view()));
+            mean_hi = Some(survival_probability_from_eta(eta_lower.view()));
+        }
+        write_prediction_csv(
+            &args.out,
+            eta.view(),
+            mean.view(),
+            eta_se.as_ref().map(|a| a.view()),
+            mean_lo.as_ref().map(|a| a.view()),
+            mean_hi.as_ref().map(|a| a.view()),
+        )?;
+        println!(
+            "wrote predictions: {} (rows={})",
+            args.out.display(),
+            mean.len()
+        );
+        return Ok(());
+    }
     if model.family == FAMILY_GAUSSIAN_LOCATION_SCALE {
         let spec_mu = build_term_spec(&parsed.terms, &ds, &col_map)?;
         let design_mu = build_term_collection_design(ds.values.view(), &spec_mu)
@@ -1270,6 +1367,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     );
 
     if let Some(out) = args.out {
+        let cov = invert_symmetric_matrix(&state.hessian)
+            .map_err(|e| format!("failed to invert survival Hessian for covariance: {e}"))?;
         let model_out = SavedModel {
             version: 1,
             formula,
@@ -1295,8 +1394,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             beta: beta.to_vec(),
             lambdas: vec![1e-4],
             scale: 1.0,
-            covariance_conditional: None,
-            covariance_corrected: None,
+            covariance_conditional: Some(array2_to_nested_vec(&cov)),
+            covariance_corrected: Some(array2_to_nested_vec(&cov)),
         };
         let payload = serde_json::to_string_pretty(&model_out)
             .map_err(|e| format!("failed to serialize survival model: {e}"))?;
@@ -2678,6 +2777,40 @@ fn linear_predictor_se(x: ndarray::ArrayView2<'_, f64>, cov: &Array2<f64>) -> Ar
     out
 }
 
+fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, String> {
+    if a.nrows() != a.ncols() {
+        return Err(format!(
+            "matrix must be square for inversion; got {}x{}",
+            a.nrows(),
+            a.ncols()
+        ));
+    }
+    let n = a.nrows();
+    let h = gam::faer_ndarray::FaerArrayView::new(a);
+    let mut rhs = FaerMat::zeros(n, n);
+    for i in 0..n {
+        rhs[(i, i)] = 1.0;
+    }
+    if let Ok(ch) = FaerLlt::new(h.as_ref(), Side::Lower) {
+        ch.solve_in_place(rhs.as_mut());
+    } else if let Ok(ld) = FaerLdlt::new(h.as_ref(), Side::Lower) {
+        ld.solve_in_place(rhs.as_mut());
+    } else {
+        let lb = FaerLblt::new(h.as_ref(), Side::Lower);
+        lb.solve_in_place(rhs.as_mut());
+    }
+    let mut out = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            out[[i, j]] = rhs[(i, j)];
+        }
+    }
+    if out.iter().any(|v| !v.is_finite()) {
+        return Err("inversion produced non-finite entries".to_string());
+    }
+    Ok(out)
+}
+
 fn weighted_penalty_matrix(
     penalties: &[Array2<f64>],
     lambdas: ArrayView1<'_, f64>,
@@ -2769,6 +2902,10 @@ fn inverse_link_array(family: LikelihoodFamily, eta: ArrayView1<'_, f64>) -> Arr
         }),
         LikelihoodFamily::RoystonParmar => eta.to_owned(),
     }
+}
+
+fn survival_probability_from_eta(eta: ArrayView1<'_, f64>) -> Array1<f64> {
+    eta.mapv(|v| (-v.clamp(-30.0, 30.0).exp()).exp().clamp(0.0, 1.0))
 }
 
 fn write_prediction_csv(
