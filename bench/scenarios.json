@@ -358,6 +358,222 @@
       "name": "papuan_oce4_psperpc_basic_k12",
       "n": 6000,
       "seed": 20260315
+    },
+    {
+      "name": "geo_subpop16_tp_k6",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_tp_k12",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_tp_k24",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_duchon_k6",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_duchon_k12",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_duchon_k24",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_matern_k6",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_matern_k12",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_matern_k24",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_psperpc_k6",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_psperpc_k12",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_subpop16_psperpc_k24",
+      "seed": 20260330,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4
+    },
+    {
+      "name": "geo_latlon_superpopnoise_tp_k6",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_tp_k12",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_tp_k24",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_duchon_k6",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_duchon_k12",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_duchon_k24",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_matern_k6",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_matern_k12",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_matern_k24",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_psperpc_k6",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_psperpc_k12",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_superpopnoise_psperpc_k24",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_tp_k6",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_tp_k12",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_tp_k24",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_duchon_k6",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_duchon_k12",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_duchon_k24",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_matern_k6",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_matern_k12",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_matern_k24",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_psperpc_k6",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_psperpc_k12",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
+    },
+    {
+      "name": "geo_latlon_equatornoise_psperpc_k24",
+      "seed": 20260401,
+      "prevalence_min": 0.01,
+      "prevalence_max": 0.1
     }
   ]
 }
