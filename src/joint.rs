@@ -722,34 +722,7 @@ impl<'a> JointModelState<'a> {
 
         // Recompute deviance using updated coefficients
         let eta_updated = self.compute_eta_full(u, b_wiggle);
-        let mut mu_updated = Array1::<f64>::zeros(n);
-        let mut weights_updated = Array1::<f64>::zeros(n);
-        let mut z_updated = Array1::<f64>::zeros(n);
-
-        // Use integrated likelihood for final deviance if SE available
-        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
-            crate::pirls::update_glm_vectors_integrated(
-                &self.quad_ctx,
-                self.y,
-                &eta_updated,
-                se.view(),
-                self.weights,
-                &mut mu_updated,
-                &mut weights_updated,
-                &mut z_updated,
-            );
-        } else {
-            crate::pirls::update_glm_vectors(
-                self.y,
-                &eta_updated,
-                self.link.clone(),
-                self.weights,
-                &mut mu_updated,
-                &mut weights_updated,
-                &mut z_updated,
-            );
-        }
-        self.compute_deviance(&mu_updated)
+        self.recompute_deviance_from_eta(&eta_updated)
     }
 
     /// Perform one IRLS step for the base β block
@@ -905,34 +878,7 @@ impl<'a> JointModelState<'a> {
             };
         let eta_updated: Array1<f64> = &u_updated + &wiggle_updated;
         self.last_eta = Some(eta_updated.clone());
-        let mut mu_updated = Array1::<f64>::zeros(n);
-        let mut weights_updated = Array1::<f64>::zeros(n);
-        let mut z_updated = Array1::<f64>::zeros(n);
-
-        // Use integrated likelihood for final deviance if SE available
-        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
-            crate::pirls::update_glm_vectors_integrated(
-                &self.quad_ctx,
-                self.y,
-                &eta_updated,
-                se.view(),
-                self.weights,
-                &mut mu_updated,
-                &mut weights_updated,
-                &mut z_updated,
-            );
-        } else {
-            crate::pirls::update_glm_vectors(
-                self.y,
-                &eta_updated,
-                self.link.clone(),
-                self.weights,
-                &mut mu_updated,
-                &mut weights_updated,
-                &mut z_updated,
-            );
-        }
-        self.compute_deviance(&mu_updated)
+        self.recompute_deviance_from_eta(&eta_updated)
     }
 
     /// Compute current linear predictor: η = u + B_wiggle · θ
@@ -943,6 +889,38 @@ impl<'a> JointModelState<'a> {
         } else {
             u.clone()
         }
+    }
+
+    /// Recompute deviance by refreshing GLM working vectors at a supplied linear predictor.
+    fn recompute_deviance_from_eta(&self, eta: &Array1<f64>) -> f64 {
+        let n = self.n_obs();
+        let mut mu_updated = Array1::<f64>::zeros(n);
+        let mut weights_updated = Array1::<f64>::zeros(n);
+        let mut z_updated = Array1::<f64>::zeros(n);
+
+        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
+            crate::pirls::update_glm_vectors_integrated(
+                &self.quad_ctx,
+                self.y,
+                eta,
+                se.view(),
+                self.weights,
+                &mut mu_updated,
+                &mut weights_updated,
+                &mut z_updated,
+            );
+        } else {
+            crate::pirls::update_glm_vectors(
+                self.y,
+                eta,
+                self.link.clone(),
+                self.weights,
+                &mut mu_updated,
+                &mut weights_updated,
+                &mut z_updated,
+            );
+        }
+        self.compute_deviance(&mu_updated)
     }
 
     /// Compute deviance based on link function

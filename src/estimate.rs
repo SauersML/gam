@@ -1259,16 +1259,130 @@ where
     // includes (Laplace terms, truncation conventions, ridge policies, survival constraints,
     // etc.). That consistency is often more robust than brittle closed-form expressions.
     let mut grad = Array1::<f64>::zeros(rho.len());
+    let mut rp = rho.clone();
+    let mut rm = rho.clone();
     for i in 0..rho.len() {
-        let mut rp = rho.clone();
         rp[i] += step;
         let fp = objective(&rp)?;
-        let mut rm = rho.clone();
         rm[i] -= step;
         let fm = objective(&rm)?;
         grad[i] = (fp - fm) / (2.0 * step);
+        rp[i] = rho[i];
+        rm[i] = rho[i];
     }
     Ok(grad)
+}
+
+fn approx_same_rho_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if (a[i] - b[i]).abs() > 1e-12 {
+            return false;
+        }
+    }
+    true
+}
+
+fn should_replace_smoothing_candidate(
+    best: &Option<SmoothingBfgsResult>,
+    candidate: &SmoothingBfgsResult,
+) -> bool {
+    match best {
+        None => true,
+        Some(current) => {
+            if candidate.stationary != current.stationary {
+                candidate.stationary
+            } else if candidate.stationary {
+                candidate.final_value < current.final_value
+            } else {
+                candidate.final_grad_norm < current.final_grad_norm
+            }
+        }
+    }
+}
+
+fn run_multistart_bfgs<C, Eval>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    context: &mut C,
+    eval_cost_grad_rho: &mut Eval,
+    options: &SmoothingBfgsOptions,
+) -> Result<SmoothingBfgsResult, EstimationError>
+where
+    Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError>,
+{
+    let seeds = generate_rho_candidates(num_penalties, heuristic_lambdas, &options.seed_config);
+    if seeds.is_empty() {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "no smoothing seeds produced".to_string(),
+        ));
+    }
+
+    let mut best: Option<SmoothingBfgsResult> = None;
+    for (idx, rho_seed) in seeds.iter().enumerate() {
+        let initial_z = to_z_from_rho(rho_seed);
+        let mut last_eval: Option<(Array1<f64>, Array1<f64>)> = None;
+        let mut optimizer = Bfgs::new(initial_z.clone(), |z| {
+            let rho = to_rho_from_z(z);
+            let (cost, grad_rho) = match eval_cost_grad_rho(context, &rho) {
+                Ok(v) => v,
+                Err(_) => (f64::INFINITY, Array1::<f64>::zeros(rho.len())),
+            };
+            last_eval = Some((rho.clone(), grad_rho.clone()));
+            let jac = jacobian_drho_dz_from_rho(&rho);
+            let mut grad_z = &grad_rho * &jac;
+            for g in grad_z.iter_mut() {
+                if !g.is_finite() {
+                    *g = 0.0;
+                }
+            }
+            (cost, grad_z)
+        })
+        .with_tolerance(options.tol)
+        .with_max_iterations(options.max_iter)
+        .with_fp_tolerances(1e2, 1e2)
+        .with_no_improve_stop(1e-8, 5)
+        .with_rng_seed(0x5EED_u64.wrapping_add(idx as u64));
+
+        let solution = match optimizer.run() {
+            Ok(sol) => sol,
+            Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+            Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
+            Err(_) => continue,
+        };
+
+        let rho = to_rho_from_z(&solution.final_point);
+        let mut grad_rho = match &last_eval {
+            Some((rho_cached, grad_cached)) if approx_same_rho_point(&rho, rho_cached) => {
+                grad_cached.clone()
+            }
+            _ => match eval_cost_grad_rho(context, &rho) {
+                Ok((_, grad)) => grad,
+                Err(_) => Array1::<f64>::zeros(rho.len()),
+            },
+        };
+        project_rho_gradient(&rho, &mut grad_rho);
+        let grad_norm = grad_rho.dot(&grad_rho).sqrt();
+        let candidate = SmoothingBfgsResult {
+            rho,
+            final_value: solution.final_value,
+            iterations: solution.iterations,
+            final_grad_norm: grad_norm,
+            stationary: grad_norm <= options.tol.max(1e-6),
+        };
+
+        if should_replace_smoothing_candidate(&best, &candidate) {
+            best = Some(candidate);
+        }
+    }
+
+    best.ok_or_else(|| {
+        EstimationError::RemlOptimizationFailed(
+            "all smoothing BFGS starts failed before producing a candidate".to_string(),
+        )
+    })
 }
 
 /// Generic multi-start BFGS smoothing optimizer over log-smoothing parameters (`rho`).
@@ -1305,83 +1419,18 @@ where
         });
     }
 
-    let seeds = generate_rho_candidates(num_penalties, heuristic_lambdas, &options.seed_config);
-    if seeds.is_empty() {
-        return Err(EstimationError::RemlOptimizationFailed(
-            "no smoothing seeds produced".to_string(),
-        ));
-    }
-
-    let mut best: Option<SmoothingBfgsResult> = None;
-    for (idx, rho_seed) in seeds.iter().enumerate() {
-        let initial_z = to_z_from_rho(rho_seed);
-        let mut optimizer = Bfgs::new(initial_z.clone(), |z| {
-            let rho = to_rho_from_z(z);
-            let cost = objective(&rho).unwrap_or(f64::INFINITY);
-            let grad_rho =
-                finite_diff_gradient_external(&rho, options.finite_diff_step, &mut objective)
-                    .unwrap_or_else(|_| Array1::<f64>::zeros(rho.len()));
-            let jac = jacobian_drho_dz_from_rho(&rho);
-            let mut grad_z = &grad_rho * &jac;
-            for g in grad_z.iter_mut() {
-                if !g.is_finite() {
-                    *g = 0.0;
-                }
-            }
-            (cost, grad_z)
-        })
-        .with_tolerance(options.tol)
-        .with_max_iterations(options.max_iter)
-        .with_fp_tolerances(1e2, 1e2)
-        .with_no_improve_stop(1e-8, 5)
-        .with_rng_seed(0x5EED_u64.wrapping_add(idx as u64));
-
-        let solution = match optimizer.run() {
-            Ok(sol) => sol,
-            Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-            Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
-            Err(err) => {
-                let _ = err;
-                continue;
-            }
-        };
-
-        let rho = to_rho_from_z(&solution.final_point);
-        let mut grad_rho =
-            finite_diff_gradient_external(&rho, options.finite_diff_step, &mut objective)?;
-        project_rho_gradient(&rho, &mut grad_rho);
-        let grad_norm = grad_rho.dot(&grad_rho).sqrt();
-        let stationary = grad_norm <= options.tol.max(1e-6);
-        let candidate = SmoothingBfgsResult {
-            rho,
-            final_value: solution.final_value,
-            iterations: solution.iterations,
-            final_grad_norm: grad_norm,
-            stationary,
-        };
-
-        let replace = match &best {
-            None => true,
-            Some(current) => {
-                if candidate.stationary != current.stationary {
-                    candidate.stationary
-                } else if candidate.stationary {
-                    candidate.final_value < current.final_value
-                } else {
-                    candidate.final_grad_norm < current.final_grad_norm
-                }
-            }
-        };
-        if replace {
-            best = Some(candidate);
-        }
-    }
-
-    best.ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "all smoothing BFGS starts failed before producing a candidate".to_string(),
-        )
-    })
+    let mut eval_cost_grad_rho = |objective: &mut F, rho: &Array1<f64>| {
+        let cost = objective(rho)?;
+        let grad_rho = finite_diff_gradient_external(rho, options.finite_diff_step, objective)?;
+        Ok((cost, grad_rho))
+    };
+    run_multistart_bfgs(
+        num_penalties,
+        heuristic_lambdas,
+        &mut objective,
+        &mut eval_cost_grad_rho,
+        options,
+    )
 }
 
 /// Generic multi-start BFGS smoothing optimizer over log-smoothing parameters (`rho`)
@@ -1424,89 +1473,14 @@ where
         });
     }
 
-    let seeds = generate_rho_candidates(num_penalties, heuristic_lambdas, &options.seed_config);
-    if seeds.is_empty() {
-        return Err(EstimationError::RemlOptimizationFailed(
-            "no smoothing seeds produced".to_string(),
-        ));
-    }
-
-    let mut best: Option<SmoothingBfgsResult> = None;
-    for (idx, rho_seed) in seeds.iter().enumerate() {
-        let initial_z = to_z_from_rho(rho_seed);
-        let mut optimizer = Bfgs::new(initial_z.clone(), |z| {
-            // Evaluate objective in rho-space, then map gradient to z-space so
-            // Wolfe-BFGS operates on a consistent unconstrained parameterization.
-            let rho = to_rho_from_z(z);
-            match objective_with_gradient(&rho) {
-                Ok((cost, grad_rho)) => {
-                    let jac = jacobian_drho_dz_from_rho(&rho);
-                    let mut grad_z = &grad_rho * &jac;
-                    for g in grad_z.iter_mut() {
-                        if !g.is_finite() {
-                            // Keep the line search stable if the callback emits
-                            // a non-finite coordinate near parameter bounds.
-                            *g = 0.0;
-                        }
-                    }
-                    (cost, grad_z)
-                }
-                Err(_) => (f64::INFINITY, Array1::<f64>::zeros(rho.len())),
-            }
-        })
-        .with_tolerance(options.tol)
-        .with_max_iterations(options.max_iter)
-        .with_fp_tolerances(1e2, 1e2)
-        .with_no_improve_stop(1e-8, 5)
-        .with_rng_seed(0x5EED_u64.wrapping_add(idx as u64));
-
-        let solution = match optimizer.run() {
-            Ok(sol) => sol,
-            Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-            Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
-            Err(_) => continue,
-        };
-
-        let rho = to_rho_from_z(&solution.final_point);
-        let mut grad_rho = match objective_with_gradient(&rho) {
-            Ok((_, g)) => g,
-            Err(_) => Array1::<f64>::zeros(rho.len()),
-        };
-        // Apply the same post-projection used by the FD path so candidate
-        // stationarity is judged under identical boundary rules.
-        project_rho_gradient(&rho, &mut grad_rho);
-        let grad_norm = grad_rho.dot(&grad_rho).sqrt();
-        let stationary = grad_norm <= options.tol.max(1e-6);
-        let candidate = SmoothingBfgsResult {
-            rho,
-            final_value: solution.final_value,
-            iterations: solution.iterations,
-            final_grad_norm: grad_norm,
-            stationary,
-        };
-
-        let replace = match &best {
-            None => true,
-            Some(current) => {
-                if candidate.stationary != current.stationary {
-                    candidate.stationary
-                } else if candidate.stationary {
-                    candidate.final_value < current.final_value
-                } else {
-                    candidate.final_grad_norm < current.final_grad_norm
-                }
-            }
-        };
-        if replace {
-            best = Some(candidate);
-        }
-    }
-
-    best.ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "all smoothing BFGS starts failed before producing a candidate".to_string(),
-        )
-    })
+    let mut eval_cost_grad_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
+    run_multistart_bfgs(
+        num_penalties,
+        heuristic_lambdas,
+        &mut objective_with_gradient,
+        &mut eval_cost_grad_rho,
+        options,
+    )
 }
 
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
