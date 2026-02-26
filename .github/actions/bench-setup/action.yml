@@ -43,5 +43,5 @@ runs:
         python3 --version
         Rscript --version
         python3 -m pip install --upgrade pip setuptools wheel
-        python3 -m pip install numpy pandas pygam
+        python3 -m pip install numpy pandas pygam lifelines
         Rscript -e 'install.packages(c("mgcv","jsonlite"), repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"))'
