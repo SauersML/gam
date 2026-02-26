@@ -7,10 +7,27 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
+
+# Hard-force single-thread execution across Python/R/Rust/native math libs.
+_SERIAL_ENV_OVERRIDES = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "BLIS_NUM_THREADS": "1",
+    "RAYON_NUM_THREADS": "1",
+    "CARGO_BUILD_JOBS": "1",
+    "OMP_DYNAMIC": "FALSE",
+    "MKL_DYNAMIC": "FALSE",
+}
+for _k, _v in _SERIAL_ENV_OVERRIDES.items():
+    os.environ[_k] = _v
 
 import numpy as np
 import pandas as pd
@@ -34,8 +51,38 @@ class Fold:
 
 
 def run_cmd(cmd, cwd=None):
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    return proc.returncode, proc.stdout, proc.stderr
+    env = os.environ.copy()
+    env.update(_SERIAL_ENV_OVERRIDES)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        bufsize=1,
+    )
+
+    out_buf = []
+    err_buf = []
+
+    def _pump(stream, sink, buf):
+        try:
+            for line in iter(stream.readline, ""):
+                sink.write(line)
+                sink.flush()
+                buf.append(line)
+        finally:
+            stream.close()
+
+    t_out = threading.Thread(target=_pump, args=(proc.stdout, sys.stdout, out_buf), daemon=True)
+    t_err = threading.Thread(target=_pump, args=(proc.stderr, sys.stderr, err_buf), daemon=True)
+    t_out.start()
+    t_err.start()
+    rc = proc.wait()
+    t_out.join()
+    t_err.join()
+    return rc, "".join(out_buf), "".join(err_buf)
 
 
 def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42, stratified: bool = False):
@@ -1482,7 +1529,8 @@ def run_rust_scenario_cv(scenario):
 
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
-    with tempfile.TemporaryDirectory(prefix="gam_bench_rust_cv_") as td:
+    # Use a workspace-local temp root to reduce /tmp lifecycle flakiness in CI.
+    with tempfile.TemporaryDirectory(prefix="gam_bench_rust_cv_", dir=str(BENCH_DIR)) as td:
         td_path = Path(td)
         for fold_id, fold in enumerate(folds):
             train_df = base_df.iloc[fold.train_idx].copy()
@@ -1559,8 +1607,20 @@ def run_rust_scenario_cv(scenario):
                     str(train_path),
                 ]
 
+            def _looks_like_missing_csv(msg: str) -> bool:
+                m = (msg or "").lower()
+                return ("failed to open csv" in m) and ("no such file or directory" in m)
+
+            def _ensure_fold_csvs():
+                train_df.to_csv(train_path, index=False)
+                test_df.to_csv(test_path, index=False)
+
             t0 = perf_counter()
             code, out, err = run_cmd(fit_cmd, cwd=ROOT)
+            # Defensive retry for sporadic CI file-not-found while opening fold CSVs.
+            if code != 0 and _looks_like_missing_csv(err or out):
+                _ensure_fold_csvs()
+                code, out, err = run_cmd(fit_cmd, cwd=ROOT)
             fit_sec = perf_counter() - t0
             if code != 0:
                 return {
@@ -1580,6 +1640,9 @@ def run_rust_scenario_cv(scenario):
             ]
             t1 = perf_counter()
             code, out, err = run_cmd(pred_cmd, cwd=ROOT)
+            if code != 0 and _looks_like_missing_csv(err or out):
+                _ensure_fold_csvs()
+                code, out, err = run_cmd(pred_cmd, cwd=ROOT)
             pred_sec = perf_counter() - t1
             if code != 0:
                 return {
@@ -2166,6 +2229,16 @@ def main():
         results.append(run_rust_scenario_cv(s_cfg))
         results.append(run_external_mgcv_cv(s_cfg))
         results.append(run_external_pygam_cv(s_cfg))
+
+    # Hard guard: benchmark runs must fail fast in CI if any contender fails.
+    failed = [r for r in results if r.get("status") != "ok"]
+    if failed:
+        msgs = []
+        for r in failed:
+            msgs.append(
+                f"{r.get('contender','?')} / {r.get('scenario_name','?')}: {r.get('error','unknown error')}"
+            )
+        raise SystemExit("benchmark run failed:\n" + "\n".join(msgs))
 
     # Hard guard: benchmark outputs must remain CV-based and leakage-safe.
     for r in results:

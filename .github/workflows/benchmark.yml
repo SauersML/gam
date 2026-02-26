@@ -161,8 +161,29 @@ jobs:
         run: |
           python3 - <<'PY'
           import json
+          import os
           from datetime import datetime, timezone
           from pathlib import Path
+
+          def fmt_num(v, digits=4):
+              if v is None:
+                  return "—"
+              try:
+                  return f"{float(v):.{digits}f}"
+              except Exception:
+                  return "—"
+
+          def fmt_status(row):
+              status = str(row.get("status", "unknown"))
+              if status == "ok":
+                  return "ok"
+              return f"failed: {row.get('error', 'unknown error')}"
+
+          def md_escape(v):
+              if v is None:
+                  return "—"
+              s = str(v).replace("\n", " ").strip()
+              return s.replace("|", "\\|")
 
           artifacts = Path("bench/artifacts")
           files = sorted(artifacts.rglob("*.json"))
@@ -173,6 +194,14 @@ jobs:
           for fp in files:
               payload = json.loads(fp.read_text())
               merged.extend(payload.get("results", []))
+
+          merged_sorted = sorted(
+              merged,
+              key=lambda r: (
+                  str(r.get("scenario_name", "")),
+                  str(r.get("contender", "")),
+              ),
+          )
 
           out = Path("bench/results.nightly.json")
           out.write_text(
@@ -185,6 +214,48 @@ jobs:
               )
           )
           print(f"Wrote {out} from {len(files)} shard files with {len(merged)} rows.")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              ok_count = sum(1 for r in merged_sorted if str(r.get("status", "")) == "ok")
+              fail_count = len(merged_sorted) - ok_count
+              lines = []
+              lines.append("## Benchmark Summary")
+              lines.append("")
+              lines.append(f"- Generated: `{datetime.now(timezone.utc).isoformat()}`")
+              lines.append(f"- Shards merged: `{len(files)}`")
+              lines.append(f"- Result rows: `{len(merged_sorted)}` (`{ok_count}` ok, `{fail_count}` failed)")
+              lines.append("")
+              lines.append("| Scenario | Contender | Status | AUC/C-Index | Brier | RMSE | R2 | Fit (s) | Predict (s) |")
+              lines.append("|---|---|---|---:|---:|---:|---:|---:|---:|")
+              for r in merged_sorted:
+                  lines.append(
+                      "| "
+                      + " | ".join(
+                          [
+                              md_escape(r.get("scenario_name")),
+                              md_escape(r.get("contender")),
+                              md_escape(fmt_status(r)),
+                              fmt_num(r.get("auc")),
+                              fmt_num(r.get("brier")),
+                              fmt_num(r.get("rmse")),
+                              fmt_num(r.get("r2")),
+                              fmt_num(r.get("fit_sec")),
+                              fmt_num(r.get("predict_sec")),
+                          ]
+                      )
+                      + " |"
+                  )
+              lines.append("")
+              lines.append("### Model Specs")
+              lines.append("")
+              lines.append("| Scenario | Contender | Model Spec |")
+              lines.append("|---|---|---|")
+              for r in merged_sorted:
+                  lines.append(
+                      f"| {md_escape(r.get('scenario_name'))} | {md_escape(r.get('contender'))} | {md_escape(r.get('model_spec'))} |"
+                  )
+              Path(summary_path).write_text("\n".join(lines) + "\n")
           PY
 
       - name: Upload merged nightly results

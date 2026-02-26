@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -7,6 +8,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 RUN_SUITE = ROOT / "bench" / "run_suite.py"
 SCENARIOS = ROOT / "bench" / "scenarios.json"
+SERIAL_ENV_OVERRIDES = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "BLIS_NUM_THREADS": "1",
+    "RAYON_NUM_THREADS": "1",
+    "CARGO_BUILD_JOBS": "1",
+    "OMP_DYNAMIC": "FALSE",
+    "MKL_DYNAMIC": "FALSE",
+}
 DEFAULT_SURVIVAL_SCENARIOS = [
     "heart_failure_survival",
     "icu_survival_death",
@@ -44,7 +57,9 @@ def main() -> int:
     for scenario in scenarios:
         cmd.extend(["--scenario-name", scenario])
 
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    env = os.environ.copy()
+    env.update(SERIAL_ENV_OVERRIDES)
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=env)
     if proc.returncode != 0:
         print((proc.stderr or proc.stdout).strip(), file=sys.stderr)
         return proc.returncode
