@@ -9,6 +9,7 @@ use gam::{
     build_bspline_basis_1d,
 };
 use ndarray::{Array1, Array2, ArrayView1, s};
+use std::collections::HashSet;
 use std::fs;
 use std::time::Instant;
 
@@ -477,7 +478,79 @@ fn header_pos(header: &[&str], name: &str) -> Result<usize, String> {
     header
         .iter()
         .position(|h| *h == name)
-        .ok_or_else(|| format!("column '{name}' not found in CSV header"))
+        .ok_or_else(|| format!("column '{name}' not found in data header"))
+}
+
+fn parse_delimited_table(path: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("failed to read data file: {e}"))?;
+    let mut lines = raw.lines();
+    let header_line = lines
+        .next()
+        .ok_or_else(|| "data file is empty".to_string())?;
+    let delim = if header_line.contains('\t') {
+        '\t'
+    } else if header_line.contains(';') {
+        ';'
+    } else {
+        ','
+    };
+    let header = header_line
+        .split(delim)
+        .map(|s| s.trim().to_string())
+        .collect::<Vec<_>>();
+    let mut rows = Vec::<Vec<String>>::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        rows.push(
+            line.split(delim)
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok((header, rows))
+}
+
+fn infer_numeric_col_indices(rows: &[Vec<String>], n_cols: usize) -> Vec<usize> {
+    (0..n_cols)
+        .filter(|&j| {
+            let mut any = false;
+            for r in rows {
+                if let Some(v) = r.get(j) {
+                    let t = v.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    any = true;
+                    if t.parse::<f64>().is_err() {
+                        return false;
+                    }
+                }
+            }
+            any
+        })
+        .collect()
+}
+
+fn infer_binary_numeric_col(rows: &[Vec<String>], idx: usize) -> bool {
+    let mut any = false;
+    for r in rows {
+        let Some(v) = r.get(idx) else { continue };
+        let t = v.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Ok(x) = t.parse::<f64>() else {
+            return false;
+        };
+        any = true;
+        if (x - 0.0).abs() > 1e-12 && (x - 1.0).abs() > 1e-12 {
+            return false;
+        }
+    }
+    any
 }
 
 fn load_cv_data(
@@ -489,12 +562,8 @@ fn load_cv_data(
     num_internal_knots: usize,
     double_penalty: bool,
 ) -> Result<CvData, String> {
-    let raw = fs::read_to_string(path).map_err(|e| format!("failed to read data csv: {e}"))?;
-    let mut lines = raw.lines();
-    let header_line = lines
-        .next()
-        .ok_or_else(|| "data csv is empty".to_string())?;
-    let header: Vec<&str> = header_line.split(',').collect();
+    let (header_s, rows_s) = parse_delimited_table(path)?;
+    let header = header_s.iter().map(|s| s.as_str()).collect::<Vec<_>>();
     let smooth_idx = header_pos(&header, smooth_col)?;
     let y_idx = header_pos(&header, target_col)?;
     let linear_idx = linear_names
@@ -506,12 +575,8 @@ fn load_cv_data(
     let mut smooth = Vec::<f64>::new();
     let mut linear_cols: Vec<Vec<f64>> = linear_idx.iter().map(|_| Vec::<f64>::new()).collect();
 
-    for (line_no, line) in lines.enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split(',').collect();
+    for (line_no, parts_s) in rows_s.iter().enumerate() {
+        let parts = parts_s.iter().map(|s| s.as_str()).collect::<Vec<_>>();
         let parse_at = |idx: usize, col: &str| -> Result<f64, String> {
             parts
                 .get(idx)
@@ -526,7 +591,7 @@ fn load_cv_data(
         }
     }
     if y.is_empty() {
-        return Err("data csv has zero rows".to_string());
+        return Err("data has zero rows".to_string());
     }
     Ok(CvData {
         y,
@@ -587,12 +652,8 @@ fn c_index_survival(time: &[f64], event: &[u8], risk: &[f64]) -> f64 {
 }
 
 fn load_survival_cv_data(path: &str, time_col: &str, event_col: &str) -> Result<SurvivalCvData, String> {
-    let raw = fs::read_to_string(path).map_err(|e| format!("failed to read data csv: {e}"))?;
-    let mut lines = raw.lines();
-    let header_line = lines
-        .next()
-        .ok_or_else(|| "data csv is empty".to_string())?;
-    let header: Vec<&str> = header_line.split(',').collect();
+    let (header_s, rows_s) = parse_delimited_table(path)?;
+    let header = header_s.iter().map(|s| s.as_str()).collect::<Vec<_>>();
 
     let time_idx = header_pos(&header, time_col)?;
     let event_idx = header_pos(&header, event_col)?;
@@ -606,19 +667,15 @@ fn load_survival_cv_data(path: &str, time_col: &str, event_col: &str) -> Result<
         cov_names.push((*col).to_string());
     }
     if cov_idx.is_empty() {
-        return Err("survival csv has no covariate columns".to_string());
+        return Err("survival data has no covariate columns".to_string());
     }
 
     let mut time = Vec::<f64>::new();
     let mut event = Vec::<u8>::new();
     let mut covariates = Vec::<Vec<f64>>::new();
 
-    for (line_no, line) in lines.enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split(',').collect();
+    for (line_no, parts_s) in rows_s.iter().enumerate() {
+        let parts = parts_s.iter().map(|s| s.as_str()).collect::<Vec<_>>();
         let parse_at = |idx: usize, col: &str| -> Result<f64, String> {
             parts
                 .get(idx)
@@ -647,7 +704,7 @@ fn load_survival_cv_data(path: &str, time_col: &str, event_col: &str) -> Result<
     }
 
     if time.is_empty() {
-        return Err("survival csv has zero rows".to_string());
+        return Err("survival data has zero rows".to_string());
     }
     Ok(SurvivalCvData {
         time,
@@ -835,7 +892,7 @@ fn run_survival_cv(
 }
 
 fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
-    let Some(data_csv) = parse_string_arg(args, "--data-csv") else {
+    let Some(data_path) = parse_string_arg(args, "--data") else {
         return Ok(false);
     };
     let train_idx_path =
@@ -845,12 +902,54 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
     let train_idx = parse_indices(&train_idx_path)?;
     let test_idx = parse_indices(&test_idx_path)?;
 
-    let family_s = parse_string_arg(args, "--family").unwrap_or_else(|| "gaussian".to_string());
+    let (header_s, rows_s) = parse_delimited_table(&data_path)?;
+    if rows_s.is_empty() {
+        return Err("data file has no rows".to_string());
+    }
+    let header_refs = header_s.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+    let header_set: HashSet<&str> = header_refs.iter().copied().collect();
+    let numeric_idx = infer_numeric_col_indices(&rows_s, header_s.len());
+
+    let mut family_s = parse_string_arg(args, "--family").unwrap_or_default();
+    if family_s.is_empty() {
+        if header_set.contains("time") && (header_set.contains("event") || header_set.contains("y")) {
+            family_s = "survival".to_string();
+        } else {
+            let target_guess = if header_set.contains("y") {
+                Some("y")
+            } else if header_set.contains("event") {
+                Some("event")
+            } else {
+                None
+            };
+            let is_binomial = target_guess
+                .and_then(|name| header_pos(&header_refs, name).ok())
+                .map(|idx| infer_binary_numeric_col(&rows_s, idx))
+                .unwrap_or(false);
+            family_s = if is_binomial { "binomial" } else { "gaussian" }.to_string();
+        }
+    }
     if family_s == "survival" {
-        let time_col = parse_string_arg(args, "--time-col").unwrap_or_else(|| "time".to_string());
-        let event_col =
-            parse_string_arg(args, "--event-col").unwrap_or_else(|| "event".to_string());
-        run_survival_cv(&data_csv, &train_idx, &test_idx, &time_col, &event_col)?;
+        let time_col = parse_string_arg(args, "--time-col").unwrap_or_else(|| {
+            if header_set.contains("time") {
+                "time".to_string()
+            } else {
+                header_s
+                    .get(*numeric_idx.first().unwrap_or(&0))
+                    .cloned()
+                    .unwrap_or_else(|| "time".to_string())
+            }
+        });
+        let event_col = parse_string_arg(args, "--event-col").unwrap_or_else(|| {
+            if header_set.contains("event") {
+                "event".to_string()
+            } else if header_set.contains("y") {
+                "y".to_string()
+            } else {
+                "event".to_string()
+            }
+        });
+        run_survival_cv(&data_path, &train_idx, &test_idx, &time_col, &event_col)?;
         return Ok(true);
     }
     let family = match family_s.as_str() {
@@ -863,14 +962,75 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
             ))
         }
     };
-    let target_col = parse_string_arg(args, "--target-col").unwrap_or_else(|| "y".to_string());
-    let smooth_col = parse_string_arg(args, "--smooth-col")
-        .ok_or_else(|| "missing --smooth-col in CV mode".to_string())?;
-    let linear_cols = parse_csv_list_arg(args, "--linear-cols");
+    let target_col = parse_string_arg(args, "--target-col").unwrap_or_else(|| {
+        if header_set.contains("y") {
+            "y".to_string()
+        } else if header_set.contains("event") {
+            "event".to_string()
+        } else {
+            header_s
+                .get(*numeric_idx.last().unwrap_or(&0))
+                .cloned()
+                .unwrap_or_else(|| "y".to_string())
+        }
+    });
+    let smooth_col = parse_string_arg(args, "--smooth-col").unwrap_or_else(|| {
+        let preferred = [
+            "s_temp",
+            "x2",
+            "range",
+            "t",
+            "pc2",
+            "pulse",
+            "hour",
+            "axil_nodes",
+            "temp",
+            "year",
+            "time",
+            "age",
+        ];
+        preferred
+            .iter()
+            .find(|&&name| header_set.contains(name) && name != target_col.as_str())
+            .map(|s| (*s).to_string())
+            .or_else(|| {
+                numeric_idx.iter().find_map(|&j| {
+                    let n = header_s[j].as_str();
+                    if n == target_col.as_str() || n == "time" || n == "event" {
+                        None
+                    } else {
+                        Some(n.to_string())
+                    }
+                })
+            })
+            .unwrap_or_else(|| target_col.clone())
+    });
+    let linear_cols = {
+        let explicit = parse_csv_list_arg(args, "--linear-cols");
+        if !explicit.is_empty() {
+            explicit
+        } else {
+            numeric_idx
+                .iter()
+                .filter_map(|&j| {
+                    let n = header_s[j].as_str();
+                    if n == target_col.as_str()
+                        || n == smooth_col.as_str()
+                        || n == "time"
+                        || n == "event"
+                    {
+                        None
+                    } else {
+                        Some(n.to_string())
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+    };
     let num_internal_knots = parse_arg(args, "--num-internal-knots", 7);
-    let double_penalty = parse_bool_arg(args, "--double-penalty", false);
+    let double_penalty = parse_bool_arg(args, "--double-penalty", family == LikelihoodFamily::BinomialLogit);
     let cv_data = load_cv_data(
-        &data_csv,
+        &data_path,
         family,
         &target_col,
         &smooth_col,
@@ -1011,12 +1171,18 @@ fn maybe_run_cv_mode(args: &[String]) -> Result<bool, String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    match maybe_run_cv_mode(&args) {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(2);
+    if args.get(1).map(|s| s == "__bench_cv").unwrap_or(false) {
+        let cv_args = args[1..].to_vec();
+        match maybe_run_cv_mode(&cv_args) {
+            Ok(true) => return,
+            Ok(false) => {
+                eprintln!("missing --data in internal bench mode");
+                std::process::exit(2);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
         }
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
