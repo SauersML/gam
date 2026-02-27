@@ -129,7 +129,7 @@ pub fn sample_observations<R: rand::Rng + ?Sized>(
                     EstimationError::InvalidInput(format!("invalid Poisson rate {lam}: {e}"))
                 })?;
                 let draw = rand_distr::Distribution::sample(&dist, rng);
-                y[i] = draw as f64;
+                y[i] = draw;
             }
             Ok(y)
         }

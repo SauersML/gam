@@ -59,6 +59,8 @@ fn fit_beta_norm(
         &cfg,
         None,
         None,
+        None,
+        None,
     )
     .expect("fit");
     fit.beta_transformed
@@ -95,6 +97,8 @@ fn proxy_cost_with_pirls(
         &cfg,
         None,
         None,
+        None,
+        None,
     )
     .expect("fit");
     let lambda = rho.exp();
@@ -112,6 +116,7 @@ fn firth_fd_step_size_sensitivity() {
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![1],
+        linear_constraints: None,
         firth_bias_reduction: None,
     };
     let base_rho = 12.0;

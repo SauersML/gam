@@ -62,6 +62,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10d() {
                     nu: MaternNu::FiveHalves,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     double_penalty: true,
+                    identifiability: gam::basis::SpatialIdentifiability::default(),
                 },
             },
             shape: ShapeConstraint::None,
@@ -81,12 +82,14 @@ fn duchon_fit_term_collection_gaussian_simulated_10d() {
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![],
+            linear_constraints: None,
         },
     )
     .expect("Duchon term-collection fit should succeed");
 
-    // Double penalty -> two lambdas (kernel + ridge) for the single Duchon term.
-    assert_eq!(fitted.fit.lambdas.len(), 2);
+    // With full-shrinkage single-block parameterization, Duchon double-penalty
+    // is represented as one effective smooth penalty block.
+    assert_eq!(fitted.fit.lambdas.len(), 1);
     assert!(fitted.fit.edf_total.is_finite());
 
     let pred = predict_gam(

@@ -2706,10 +2706,10 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
     let heuristic_lambdas = heuristic_lambda.map(|lambda| vec![lambda; n_base + 1]);
     let seed_config = SeedConfig {
         bounds: (-12.0, 12.0),
-        max_seeds: if n_base + 1 <= 4 { 12 } else { 16 },
-        screening_budget: if n_base + 1 <= 2 {
+        max_seeds: if n_base < 4 { 12 } else { 16 },
+        screening_budget: if n_base < 2 {
             2
-        } else if n_base + 1 <= 6 {
+        } else if n_base < 6 {
             3
         } else {
             4
@@ -3231,7 +3231,9 @@ pub fn predict_joint(
                 .map(|i| crate::quadrature::probit_posterior_mean(eta_cal[i], eff_se[i]))
                 .collect::<Array1<f64>>(),
             LinkFunction::CLogLog => (0..n)
-                .map(|i| crate::quadrature::cloglog_posterior_mean(&quad_ctx, eta_cal[i], eff_se[i]))
+                .map(|i| {
+                    crate::quadrature::cloglog_posterior_mean(&quad_ctx, eta_cal[i], eff_se[i])
+                })
                 .collect::<Array1<f64>>(),
             LinkFunction::Identity => eta_cal.clone(),
         };

@@ -63,6 +63,8 @@ fn fit_unpenalized(
         &cfg,
         None,
         None,
+        None,
+        None,
     )
     .expect("unpenalized PIRLS fit");
     res

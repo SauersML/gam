@@ -49,6 +49,7 @@ fn analytic_gradient_matches_cost_trend() {
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![1],
+        linear_constraints: None,
         firth_bias_reduction: None,
     };
 
@@ -126,6 +127,7 @@ fn hypothesis_analytic_gradient_matches_cost_trend() {
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![1],
+        linear_constraints: None,
         firth_bias_reduction: None,
     };
 

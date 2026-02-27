@@ -38,6 +38,7 @@ fn probit_fit_and_predict_fast_integration() {
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![1],
+            linear_constraints: None,
         },
     )
     .expect("probit fit should succeed");
@@ -129,6 +130,7 @@ fn cloglog_fit_and_predict_fast_integration() {
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![1],
+            linear_constraints: None,
         },
     )
     .expect("cloglog fit should succeed");

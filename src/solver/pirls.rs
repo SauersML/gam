@@ -1799,8 +1799,8 @@ where
                 regularized[[i, i]] += loop_lambda;
             }
 
-            let has_constraints = options.linear_constraints.is_some()
-                || options.coefficient_lower_bounds.is_some();
+            let has_constraints =
+                options.linear_constraints.is_some() || options.coefficient_lower_bounds.is_some();
             let direction = match if let Some(lin) = options.linear_constraints.as_ref() {
                 solve_newton_direction_with_linear_constraints(
                     &regularized,
@@ -2463,9 +2463,9 @@ pub fn fit_model_for_fixed_rho<'a>(
             last_step_size: 1.0,
             last_step_halving: 0,
             max_abs_eta,
-            constraint_kkt: linear_constraints
-                .as_ref()
-                .map(|lin| compute_constraint_kkt_diagnostics(beta_transformed.as_ref(), &gradient, lin)),
+            constraint_kkt: linear_constraints.as_ref().map(|lin| {
+                compute_constraint_kkt_diagnostics(beta_transformed.as_ref(), &gradient, lin)
+            }),
         };
 
         let (solve_c_array, solve_d_array) = compute_working_weight_derivatives(
@@ -4062,9 +4062,7 @@ pub fn compute_final_penalized_hessian(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LinearInequalityConstraints, calculate_scale, compute_constraint_kkt_diagnostics,
-    };
+    use super::{LinearInequalityConstraints, calculate_scale, compute_constraint_kkt_diagnostics};
     use crate::types::LinkFunction;
     use ndarray::{Array1, array};
 

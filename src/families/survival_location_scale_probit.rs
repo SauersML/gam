@@ -537,7 +537,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
 
             // q derivatives (shared by threshold/log-sigma blocks)
             d1_q[i] = w * (r0 + d * (-u1) + (1.0 - d) * (-r1));
-            d2_q[i] = w * (dr0 + d * (-1.0) + (1.0 - d) * (-dr1));
+            d2_q[i] = w * (dr0 - d + (1.0 - d) * (-dr1));
 
             // time block eta-derivatives
             grad_time_eta_h0[i] = -w * r0;
@@ -545,7 +545,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             grad_time_eta_d[i] = w * d / g;
 
             h_time_h0[i] = -w * dr0;
-            h_time_h1[i] = -w * (d * (-1.0) + (1.0 - d) * (-dr1));
+            h_time_h1[i] = -w * (-d + (1.0 - d) * (-dr1));
             h_time_d[i] = w * d / (g * g);
         }
 
@@ -675,7 +675,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             // d²ℓ/dq² = w [ r0' - d - (1-d) r1' ]
             // d³ℓ/dq³ = w [ r0'' - (1-d) r1'' ]
             d1_q[i] = w * (r0 + d * (-u1) + (1.0 - d) * (-r1));
-            d2_q[i] = w * (dr0 + d * (-1.0) + (1.0 - d) * (-dr1));
+            d2_q[i] = w * (dr0 - d + (1.0 - d) * (-dr1));
             d3_q[i] = w * (ddr0 + (1.0 - d) * (-ddr1));
 
             // Time block contributions use u0/u1 direct dependence,

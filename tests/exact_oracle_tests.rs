@@ -134,6 +134,7 @@ fn laml_gradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f
         max_iter: 60,
         tol: 1e-8,
         nullspace_dims: vec![0],
+        linear_constraints: None,
         firth_bias_reduction: None,
     };
     let rho_arr = array![rho];
@@ -391,6 +392,7 @@ fn test_external_gradient_adapter_isolated_matches_fd_direction() {
         max_iter: 120,
         tol: 1e-10,
         nullspace_dims: vec![1, 0],
+        linear_constraints: None,
         firth_bias_reduction: None,
     };
     let rho = array![1.5, 0.8];

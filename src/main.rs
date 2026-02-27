@@ -39,9 +39,8 @@ use gam::smooth::{
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale_probit::{
     CovariateBlockInput, ResidualDistribution, ResidualDistributionOps,
-    SurvivalLocationScaleProbitPredictInput,
-    SurvivalLocationScaleProbitSpec, TimeBlockInput, fit_survival_location_scale_probit,
-    predict_survival_location_scale_probit,
+    SurvivalLocationScaleProbitPredictInput, SurvivalLocationScaleProbitSpec, TimeBlockInput,
+    fit_survival_location_scale_probit, predict_survival_location_scale_probit,
 };
 use gam::types::{LikelihoodFamily, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
@@ -985,12 +984,15 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 let (eta0, _) = evaluate_survival_baseline(age_exit[i], &baseline_cfg)?;
                 eta_offset_exit[i] = eta0;
             }
-            let distribution =
-                parse_survival_distribution(model.survival_distribution.as_deref().unwrap_or("gaussian"))?;
+            let distribution = parse_survival_distribution(
+                model.survival_distribution.as_deref().unwrap_or("gaussian"),
+            )?;
             let sigma_min = model.survival_sigma_min.unwrap_or(0.05);
             let sigma_max = model.survival_sigma_max.unwrap_or(20.0);
-            let eta_t = DesignMatrix::Dense(cov_design.design.clone()).matrix_vector_multiply(&beta_threshold);
-            let eta_ls = DesignMatrix::Dense(cov_design.design.clone()).matrix_vector_multiply(&beta_log_sigma);
+            let eta_t = DesignMatrix::Dense(cov_design.design.clone())
+                .matrix_vector_multiply(&beta_threshold);
+            let eta_ls = DesignMatrix::Dense(cov_design.design.clone())
+                .matrix_vector_multiply(&beta_log_sigma);
             let (sigma, ds) = sigma_and_deriv_from_eta(eta_ls.view(), sigma_min, sigma_max);
             let pred = predict_survival_location_scale_probit(
                 &SurvivalLocationScaleProbitPredictInput {
@@ -1048,14 +1050,18 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 }
                 let eta_se = linear_predictor_se(grad.view(), &cov_mat);
                 let cov_hh = cov_mat.slice(s![0..p_time, 0..p_time]).to_owned();
-                let cov_tt = cov_mat.slice(s![p_time..p_time + p_t, p_time..p_time + p_t]).to_owned();
+                let cov_tt = cov_mat
+                    .slice(s![p_time..p_time + p_t, p_time..p_time + p_t])
+                    .to_owned();
                 let cov_ll = cov_mat
                     .slice(s![
                         p_time + p_t..p_time + p_t + p_ls,
                         p_time + p_t..p_time + p_t + p_ls
                     ])
                     .to_owned();
-                let cov_ht = cov_mat.slice(s![0..p_time, p_time..p_time + p_t]).to_owned();
+                let cov_ht = cov_mat
+                    .slice(s![0..p_time, p_time..p_time + p_t])
+                    .to_owned();
                 let cov_hl = cov_mat
                     .slice(s![0..p_time, p_time + p_t..p_time + p_t + p_ls])
                     .to_owned();
@@ -1217,7 +1223,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 ));
             }
             let se = linear_predictor_se(x_exit.view(), &cov_mat);
-            (survival_posterior_mean_from_eta(eta.view(), se.view()), Some(se))
+            (
+                survival_posterior_mean_from_eta(eta.view(), se.view()),
+                Some(se),
+            )
         } else {
             (survival_probability_from_eta(eta.view()), None)
         };
@@ -1250,7 +1259,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 eta.view(),
                 se.view(),
             );
-            let (lo, hi) = response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
+            let (lo, hi) =
+                response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
             mean_lo = Some(lo);
             mean_hi = Some(hi);
         }
@@ -1441,11 +1451,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 let quad_ctx = gam::quadrature::QuadratureContext::new();
                 Array1::from_iter((0..eta.len()).map(|i| {
                     let var_t = design_t.design.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
-                    let var_ls = design_noise
-                        .design
-                        .row(i)
-                        .dot(&xd_l_covll.row(i))
-                        .max(0.0);
+                    let var_ls = design_noise.design.row(i).dot(&xd_l_covll.row(i)).max(0.0);
                     let cov_tls = design_noise.design.row(i).dot(&xd_t_covtl.row(i));
                     gam::quadrature::normal_expectation_2d_adaptive(
                         &quad_ctx,
@@ -1496,11 +1502,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 let mut out = Array1::<f64>::zeros(eta.len());
                 for i in 0..eta.len() {
                     let var_t = design_t.design.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
-                    let var_ls = design_noise
-                        .design
-                        .row(i)
-                        .dot(&xd_l_covll.row(i))
-                        .max(0.0);
+                    let var_ls = design_noise.design.row(i).dot(&xd_l_covll.row(i)).max(0.0);
                     let cov_tls = design_noise.design.row(i).dot(&xd_t_covtl.row(i));
                     let suv_t = xd_t_covtw.row(i).to_owned();
                     let suv_ls = xd_l_covlw.row(i).to_owned();
@@ -1547,7 +1549,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                             // Conditional-Gaussian integration of wiggle uncertainty:
                             // beta_w | (eta_t, eta_ls) is Gaussian under joint covariance,
                             // and q = q0 + x_w(q0)^T beta_w is linear in beta_w at each node.
-                            let mean_w = q0 + xw.dot(&beta_w) + dt * xw.dot(&k0) + dls * xw.dot(&k1);
+                            let mean_w =
+                                q0 + xw.dot(&beta_w) + dt * xw.dot(&k0) + dls * xw.dot(&k1);
                             let mut var_w = 0.0;
                             for r in 0..p_w {
                                 let xr = xw[r];
@@ -1574,15 +1577,21 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 return Err(format!("--level must be in (0,1), got {}", args.level));
             }
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-            let se_base = eta_se_base
-                .as_ref()
-                .ok_or_else(|| "internal error: uncertainty requested but eta SE missing".to_string())?;
+            let se_base = eta_se_base.as_ref().ok_or_else(|| {
+                "internal error: uncertainty requested but eta SE missing".to_string()
+            })?;
             let response_sd = response_sd_from_eta_for_family(
                 LikelihoodFamily::BinomialProbit,
                 eta.view(),
                 se_base.view(),
             );
-            let (lo, hi) = response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 1e-10, 1.0 - 1e-10);
+            let (lo, hi) = response_interval_from_mean_sd(
+                mean.view(),
+                response_sd.view(),
+                z,
+                1e-10,
+                1.0 - 1e-10,
+            );
             mean_lo = Some(lo);
             mean_hi = Some(hi);
             se = Some(se_base.clone());
@@ -1666,9 +1675,15 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 .ok_or_else(|| "internal error: joint effective_se missing".to_string())?;
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
             if nonlinear {
-                let response_sd = response_sd_from_eta_for_family(family, pred.eta.view(), eff.view());
-                let (lo, hi) =
-                    response_interval_from_mean_sd(pred.probabilities.view(), response_sd.view(), z, 1e-10, 1.0 - 1e-10);
+                let response_sd =
+                    response_sd_from_eta_for_family(family, pred.eta.view(), eff.view());
+                let (lo, hi) = response_interval_from_mean_sd(
+                    pred.probabilities.view(),
+                    response_sd.view(),
+                    z,
+                    1e-10,
+                    1.0 - 1e-10,
+                );
                 mean_lo = Some(lo);
                 mean_hi = Some(hi);
             } else {
@@ -1740,15 +1755,20 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
             return Err(format!("--level must be in (0,1), got {}", args.level));
         }
-        let se = se_opt
-            .as_ref()
-            .ok_or_else(|| "internal error: eta SE unavailable for uncertainty interval".to_string())?;
+        let se = se_opt.as_ref().ok_or_else(|| {
+            "internal error: eta SE unavailable for uncertainty interval".to_string()
+        })?;
         let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
         eta_se = Some(se.clone());
         if nonlinear {
             let response_sd = response_sd_from_eta_for_family(family, eta.view(), se.view());
-            let (lo, hi) =
-                response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 1e-10, 1.0 - 1e-10);
+            let (lo, hi) = response_interval_from_mean_sd(
+                mean.view(),
+                response_sd.view(),
+                z,
+                1e-10,
+                1.0 - 1e-10,
+            );
             mean_lo = Some(lo);
             mean_hi = Some(hi);
         } else {
@@ -2390,7 +2410,10 @@ fn saved_probit_wiggle_design(
     }
 }
 
-fn saved_probit_wiggle_basis_row_scalar(q0: f64, model: &SavedModel) -> Result<Array1<f64>, String> {
+fn saved_probit_wiggle_basis_row_scalar(
+    q0: f64,
+    model: &SavedModel,
+) -> Result<Array1<f64>, String> {
     let q = Array1::from_vec(vec![q0]);
     let x = saved_probit_wiggle_design(&q, model)?.ok_or_else(|| {
         "saved model is missing probit wiggle metadata while wiggle path requested".to_string()
@@ -2427,7 +2450,10 @@ fn invert_2x2_with_jitter(a11: f64, a12: f64, a22: f64) -> [[f64; 2]; 2] {
     [[1.0 / d11.max(1e-8), 0.0], [0.0, 1.0 / d22.max(1e-8)]]
 }
 
-fn saved_probit_wiggle_derivative_q0(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
+fn saved_probit_wiggle_derivative_q0(
+    q0: &Array1<f64>,
+    model: &SavedModel,
+) -> Result<Array1<f64>, String> {
     if model.probit_wiggle_knots.is_none() {
         return Ok(Array1::ones(q0.len()));
     }
@@ -2679,8 +2705,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 beta: fit.beta_time.to_vec(),
                 lambdas,
                 scale: 1.0,
-                covariance_conditional: fit.covariance_conditional.as_ref().map(array2_to_nested_vec),
-                covariance_corrected: fit.covariance_conditional.as_ref().map(array2_to_nested_vec),
+                covariance_conditional: fit
+                    .covariance_conditional
+                    .as_ref()
+                    .map(array2_to_nested_vec),
+                covariance_corrected: fit
+                    .covariance_conditional
+                    .as_ref()
+                    .map(array2_to_nested_vec),
             };
             write_model_json(&out, &model_out)?;
         }
@@ -4866,7 +4898,10 @@ fn linear_predictor_se(x: ndarray::ArrayView2<'_, f64>, cov: &Array2<f64>) -> Ar
     out
 }
 
-fn covariance_from_model(model: &SavedModel, mode: CovarianceModeArg) -> Result<Array2<f64>, String> {
+fn covariance_from_model(
+    model: &SavedModel,
+    mode: CovarianceModeArg,
+) -> Result<Array2<f64>, String> {
     let cov = match mode {
         CovarianceModeArg::Corrected => model
             .covariance_corrected
@@ -4881,7 +4916,10 @@ fn covariance_from_model(model: &SavedModel, mode: CovarianceModeArg) -> Result<
     nested_vec_to_array2(cov)
 }
 
-fn survival_posterior_mean_from_eta(eta: ArrayView1<'_, f64>, eta_se: ArrayView1<'_, f64>) -> Array1<f64> {
+fn survival_posterior_mean_from_eta(
+    eta: ArrayView1<'_, f64>,
+    eta_se: ArrayView1<'_, f64>,
+) -> Array1<f64> {
     let quad_ctx = gam::quadrature::QuadratureContext::new();
     Array1::from_iter(
         eta.iter()
@@ -4899,19 +4937,23 @@ fn response_sd_from_eta_for_family(
     Array1::from_iter((0..eta.len()).map(|i| {
         let var = match family {
             LikelihoodFamily::BinomialLogit => {
-                let (_, v) = gam::quadrature::logit_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
+                let (_, v) =
+                    gam::quadrature::logit_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
                 v
             }
             LikelihoodFamily::BinomialProbit => {
-                let (_, v) = gam::quadrature::probit_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
+                let (_, v) =
+                    gam::quadrature::probit_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
                 v
             }
             LikelihoodFamily::BinomialCLogLog => {
-                let (_, v) = gam::quadrature::cloglog_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
+                let (_, v) =
+                    gam::quadrature::cloglog_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
                 v
             }
             LikelihoodFamily::RoystonParmar => {
-                let (_, v) = gam::quadrature::survival_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
+                let (_, v) =
+                    gam::quadrature::survival_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
                 v
             }
             LikelihoodFamily::GaussianIdentity => 0.0,

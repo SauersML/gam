@@ -12,6 +12,8 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib.colors import LinearSegmentedColormap
 
 ROOT = Path(__file__).resolve().parent.parent
 DATASET_DIR = ROOT / "bench" / "datasets"
@@ -507,6 +509,7 @@ def _simulate_smooth_paths(
     surv_curve: np.ndarray,
     n_paths: int,
     seed: int,
+    enforce_start_one: bool = True,
 ) -> np.ndarray:
     rng = np.random.default_rng(seed)
     t_max = float(times[-1])
@@ -522,7 +525,8 @@ def _simulate_smooth_paths(
         eps = _smooth_noise(rng, len(times), scale=0.020)
         p = p + eps * (0.15 + p * (1.0 - p))
         p = np.clip(p, 0.0, 1.0)
-        p[0] = 1.0
+        if enforce_start_one:
+            p[0] = 1.0
         p = np.minimum.accumulate(p)
         paths[i, :] = p
     return paths
@@ -816,6 +820,406 @@ def generate_plot_for_dataset(
     return out_path
 
 
+def _predict_failure_prob_at_horizon(
+    rust_bin: Path,
+    model_path: Path,
+    rows_df: pd.DataFrame,
+    features: list[str],
+    time_col: str,
+    horizon: float,
+    tmpdir: Path,
+) -> np.ndarray:
+    pred_in = rows_df[features].copy()
+    pred_in["__entry"] = 0.0
+    pred_in[time_col] = float(horizon)
+    in_path = tmpdir / "risk_input.csv"
+    out_path = tmpdir / "risk_pred.csv"
+    pred_in.to_csv(in_path, index=False)
+    _run_cmd([str(rust_bin), "predict", str(model_path), str(in_path), "--out", str(out_path)], cwd=ROOT)
+    pred = pd.read_csv(out_path)
+    if "failure_prob" in pred.columns:
+        return pred["failure_prob"].to_numpy(dtype=float)
+    if "survival_prob" in pred.columns:
+        return (1.0 - pred["survival_prob"].to_numpy(dtype=float)).astype(float)
+    if "mean" in pred.columns:
+        return (1.0 - pred["mean"].to_numpy(dtype=float)).astype(float)
+    raise RuntimeError("prediction output missing failure/survival probability columns")
+
+
+def _plot_bmi_sweep_frame(
+    times: np.ndarray,
+    surv_curve: np.ndarray,
+    sim_paths: np.ndarray,
+    color_rgba: tuple[float, float, float, float],
+    bmi_value: float,
+    percentile: float,
+    y_lo: float,
+    y_hi: float,
+    out_path: Path,
+) -> None:
+    fg = "#1f2133"
+    bg = "#ffffff"
+    fig = plt.figure(figsize=(12.5, 8.0), dpi=220)
+    ax = fig.add_subplot(111)
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+
+    x_vals, x_label = _convert_time_axis_if_long(times, "Days since ICU admission (ICU mortality dataset)")
+    y_label = "Chance an ICU patient is still alive"
+
+    line_color = (color_rgba[0], color_rgba[1], color_rgba[2], 0.30)
+    for i in range(sim_paths.shape[0]):
+        ax.plot(x_vals, sim_paths[i], color=line_color, lw=1.0, solid_capstyle="round", zorder=2)
+    ax.plot(x_vals, surv_curve, color=fg, lw=3.0, alpha=0.98, zorder=4)
+
+    ax.set_xlim(float(x_vals[0]), float(x_vals[-1]))
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_xlabel(x_label, fontsize=18, color=fg, labelpad=12)
+    ax.set_ylabel(y_label, fontsize=18, color=fg, labelpad=12)
+    ax.tick_params(axis="both", colors=fg, labelsize=13)
+    ax.grid(axis="x", color=fg, alpha=0.06, lw=0.6)
+    ax.grid(axis="y", color=fg, alpha=0.05, lw=0.6)
+    for spine in ax.spines.values():
+        spine.set_color(fg)
+        spine.set_alpha(0.35)
+
+    ax.text(
+        0.015,
+        0.985,
+        f"Body mass index: {bmi_value:.0f}\nRisk percentile in full ICU dataset: {percentile*100:.1f}%",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=15,
+        color=fg,
+        linespacing=1.2,
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor=fg, alpha=0.85, linewidth=0.7),
+        zorder=5,
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def generate_bmi_sweep_mp4_preview(
+    rust_bin: Path,
+    out_dir: Path,
+    n_grid: int,
+    seed: int,
+    samples_per_bmi: int = 50,
+    first_n: int = 5,
+    fps: int = 5,
+) -> Path:
+    ds = load_icu_survival_death()
+    raw_df = ds.rows.copy().reset_index(drop=True)
+    fit_df = raw_df.copy()
+    fit_df["__entry"] = 0.0
+    fit_df, stats = _zscore_by_train(fit_df, ds.features)
+
+    with tempfile.TemporaryDirectory(prefix="bmi_sweep_", dir=str(ROOT / "bench")) as td:
+        td_path = Path(td)
+        train_path = td_path / "train.csv"
+        model_path = td_path / "model.json"
+        fit_df.to_csv(train_path, index=False)
+
+        # Use transformation mode for stable, non-pathological surfaces in sweep animation.
+        _fit_survival_model(rust_bin, ds, train_path, model_path, likelihood="transformation")
+
+        t_obs = fit_df[ds.time_col].to_numpy(dtype=float)
+        t_base = max(float(np.quantile(t_obs, 0.995)), float(np.max(t_obs)), 1.0)
+        t_max = t_base
+        mean_row_z = pd.Series({f: 0.0 for f in ds.features})  # z-scored mean profile
+        surv_probe = None
+        for _ in range(4):
+            times_probe = np.linspace(0.0, t_max, int(n_grid))
+            surv_probe = _predict_survival_curve(
+                rust_bin=rust_bin,
+                model_path=model_path,
+                base_row=mean_row_z,
+                features=ds.features,
+                time_col=ds.time_col,
+                times=times_probe,
+                tmpdir=td_path,
+            )
+            surv_probe = _normalize_from_baseline_survival(surv_probe)
+            if float(surv_probe[-1]) <= 0.15:
+                break
+            t_max *= 1.6
+
+        times = np.linspace(0.0, t_max, int(n_grid))
+        horizon = float(np.median(fit_df[ds.time_col].to_numpy(dtype=float)))
+        all_risk = _predict_failure_prob_at_horizon(
+            rust_bin=rust_bin,
+            model_path=model_path,
+            rows_df=fit_df,
+            features=ds.features,
+            time_col=ds.time_col,
+            horizon=horizon,
+            tmpdir=td_path,
+        )
+
+        bmi_min = int(np.floor(raw_df["bmi"].min()))
+        bmi_max = int(np.ceil(raw_df["bmi"].max()))
+        all_bmi_values = list(range(bmi_min, bmi_max + 1))
+        bmi_values = all_bmi_values[: max(1, int(first_n))]
+        is_full_range = len(bmi_values) >= len(all_bmi_values)
+
+        frames_dir = out_dir / ("bmi_sweep_frames_full" if is_full_range else "bmi_sweep_frames_preview")
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        # Better perceptual contrast while preserving semantics:
+        # green = lower risk, red = higher risk.
+        cmap = LinearSegmentedColormap.from_list(
+            "risk_better",
+            ["#1f9e59", "#f2d95c", "#d7303f"],
+            N=256,
+        )
+
+        means_raw = {f: float(raw_df[f].mean()) for f in ds.features}
+        frame_payload = []
+        for i, bmi in enumerate(bmi_values):
+            profile_raw = dict(means_raw)
+            profile_raw["bmi"] = float(bmi)
+            profile_z = {f: (profile_raw[f] - stats[f][0]) / stats[f][1] for f in ds.features}
+            row_z = pd.Series(profile_z)
+
+            surv = _predict_survival_curve(
+                rust_bin=rust_bin,
+                model_path=model_path,
+                base_row=row_z,
+                features=ds.features,
+                time_col=ds.time_col,
+                times=times,
+                tmpdir=td_path,
+            )
+            sim_paths = _simulate_smooth_paths(
+                times,
+                surv,
+                n_paths=int(samples_per_bmi),
+                seed=seed + i * 101,
+                enforce_start_one=False,
+            )
+
+            risk = _predict_failure_prob_at_horizon(
+                rust_bin=rust_bin,
+                model_path=model_path,
+                rows_df=pd.DataFrame([profile_z]),
+                features=ds.features,
+                time_col=ds.time_col,
+                horizon=horizon,
+                tmpdir=td_path,
+            )[0]
+            percentile = float(np.mean(all_risk <= risk))
+            color = cmap(np.clip(percentile, 0.0, 1.0))
+            frame_payload.append((i, float(bmi), percentile, color, surv, sim_paths))
+
+        min_surv = min(float(np.min(surv)) for _, _, _, _, surv, _ in frame_payload)
+        max_surv = max(float(np.max(surv)) for _, _, _, _, surv, _ in frame_payload)
+        y_lo = max(0.0, min_surv - 0.03)
+        y_hi = min(1.02, max_surv + 0.02)
+
+        for i, bmi, percentile, color, surv, sim_paths in frame_payload:
+            frame_path = frames_dir / f"frame_{i:03d}.png"
+            _plot_bmi_sweep_frame(
+                times,
+                surv,
+                sim_paths,
+                color,
+                bmi,
+                percentile,
+                y_lo,
+                y_hi,
+                frame_path,
+            )
+
+        mp4_path = out_dir / ("icu_bmi_sweep_full.mp4" if is_full_range else "icu_bmi_sweep_preview_first5.mp4")
+        _run_cmd(
+            [
+                "ffmpeg",
+                "-y",
+                "-framerate",
+                str(max(1, int(fps))),
+                "-i",
+                str(frames_dir / "frame_%03d.png"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(mp4_path),
+            ],
+            cwd=ROOT,
+        )
+    return mp4_path
+
+
+def generate_icu_sysbp_sweep_mp4(
+    rust_bin: Path,
+    out_dir: Path,
+    n_grid: int,
+    seed: int,
+    samples_per_frame: int = 100,
+    n_frames: int = 100,
+    fps: int = 15,
+) -> Path:
+    ds = load_icu_survival_death()
+    raw_df = ds.rows.copy().reset_index(drop=True)
+    fit_df = raw_df.copy()
+    fit_df["__entry"] = 0.0
+    fit_df, stats = _zscore_by_train(fit_df, ds.features)
+
+    with tempfile.TemporaryDirectory(prefix="sysbp_sweep_", dir=str(ROOT / "bench")) as td:
+        td_path = Path(td)
+        train_path = td_path / "train.csv"
+        model_path = td_path / "model.json"
+        fit_df.to_csv(train_path, index=False)
+        _fit_survival_model(rust_bin, ds, train_path, model_path, likelihood="transformation")
+
+        t_obs = fit_df[ds.time_col].to_numpy(dtype=float)
+        t_base = max(float(np.quantile(t_obs, 0.995)), float(np.max(t_obs)), 1.0)
+        t_max = t_base
+        probe = pd.Series({f: 0.0 for f in ds.features})
+        for _ in range(4):
+            times = np.linspace(0.0, t_max, int(n_grid))
+            surv_probe = _predict_survival_curve(
+                rust_bin=rust_bin,
+                model_path=model_path,
+                base_row=probe,
+                features=ds.features,
+                time_col=ds.time_col,
+                times=times,
+                tmpdir=td_path,
+            )
+            if float(surv_probe[-1]) <= 0.15:
+                break
+            t_max *= 1.6
+        times = np.linspace(0.0, t_max, int(n_grid))
+        x_vals, x_label = _convert_time_axis_if_long(times, "Days since ICU admission (ICU mortality dataset)")
+
+        horizon = float(np.median(fit_df[ds.time_col].to_numpy(dtype=float)))
+        all_risk = _predict_failure_prob_at_horizon(
+            rust_bin=rust_bin,
+            model_path=model_path,
+            rows_df=fit_df,
+            features=ds.features,
+            time_col=ds.time_col,
+            horizon=horizon,
+            tmpdir=td_path,
+        )
+
+        q = np.linspace(0.0, 1.0, int(max(2, n_frames)))
+        sysbp_values = np.quantile(raw_df["sysbp_min"].to_numpy(dtype=float), q)
+        means_raw = {f: float(raw_df[f].mean()) for f in ds.features}
+        cmap = LinearSegmentedColormap.from_list(
+            "risk_better",
+            ["#1f9e59", "#f2d95c", "#d7303f"],
+            N=256,
+        )
+
+        frame_payload = []
+        for i, sbp in enumerate(sysbp_values):
+            profile_raw = dict(means_raw)
+            profile_raw["sysbp_min"] = float(sbp)
+            profile_z = {f: (profile_raw[f] - stats[f][0]) / stats[f][1] for f in ds.features}
+            row_z = pd.Series(profile_z)
+            surv = _predict_survival_curve(
+                rust_bin=rust_bin,
+                model_path=model_path,
+                base_row=row_z,
+                features=ds.features,
+                time_col=ds.time_col,
+                times=times,
+                tmpdir=td_path,
+            )
+            sim_paths = _simulate_smooth_paths(
+                times,
+                surv,
+                n_paths=int(samples_per_frame),
+                seed=seed + i * 37,
+                enforce_start_one=False,
+            )
+            risk = _predict_failure_prob_at_horizon(
+                rust_bin=rust_bin,
+                model_path=model_path,
+                rows_df=pd.DataFrame([profile_z]),
+                features=ds.features,
+                time_col=ds.time_col,
+                horizon=horizon,
+                tmpdir=td_path,
+            )[0]
+            percentile = float(np.mean(all_risk <= risk))
+            color = cmap(np.clip(percentile, 0.0, 1.0))
+            frame_payload.append((i, float(sbp), surv, sim_paths, color))
+
+        all_surv_vals = np.concatenate([s.ravel() for _, _, s, _, _ in frame_payload])
+        lo = float(np.quantile(all_surv_vals, 0.01))
+        hi = float(np.quantile(all_surv_vals, 0.99))
+        y_lo = max(0.0, lo - 0.02)
+        y_hi = min(1.02, hi + 0.02)
+
+        frames_dir = out_dir / "sysbp_sweep_frames_full"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        fg = "#1f2133"
+        bg = "#ffffff"
+        for i, sbp, surv, sim_paths, color in frame_payload:
+            fig = plt.figure(figsize=(12.5, 8.0), dpi=220)
+            ax = fig.add_subplot(111)
+            fig.patch.set_facecolor(bg)
+            ax.set_facecolor(bg)
+
+            line_color = (color[0], color[1], color[2], 0.20)
+            for k in range(sim_paths.shape[0]):
+                ax.plot(x_vals, sim_paths[k], color=line_color, lw=0.8, solid_capstyle="round", zorder=2)
+            ax.plot(x_vals, surv, color=fg, lw=4.0, alpha=1.0, zorder=4)
+
+            ax.set_xlim(float(x_vals[0]), float(x_vals[-1]))
+            ax.set_ylim(y_lo, y_hi)
+            ax.set_xlabel(x_label, fontsize=18, color=fg, labelpad=12)
+            ax.set_ylabel("Chance an ICU patient is still alive", fontsize=18, color=fg, labelpad=12)
+            ax.tick_params(axis="both", colors=fg, labelsize=13)
+            ax.grid(axis="x", color=fg, alpha=0.06, lw=0.6)
+            ax.grid(axis="y", color=fg, alpha=0.05, lw=0.6)
+            for spine in ax.spines.values():
+                spine.set_color(fg)
+                spine.set_alpha(0.35)
+
+            ax.text(
+                0.015,
+                0.985,
+                f"Minimum systolic blood pressure: {sbp:.1f} mmHg",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=18,
+                color=fg,
+                bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor=fg, alpha=0.85, linewidth=0.7),
+                zorder=5,
+            )
+            frame_path = frames_dir / f"frame_{i:03d}.png"
+            fig.tight_layout()
+            fig.savefig(frame_path, bbox_inches="tight")
+            plt.close(fig)
+
+        mp4_path = out_dir / "icu_death_min_systolic_blood_pressure_sweep_full.mp4"
+        _run_cmd(
+            [
+                "ffmpeg",
+                "-y",
+                "-framerate",
+                str(max(1, int(fps))),
+                "-i",
+                str(frames_dir / "frame_%03d.png"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(mp4_path),
+            ],
+            cwd=ROOT,
+        )
+    return mp4_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fit Rust GAM survival GAMLSS-style models and render generative digital-twin path plots."
@@ -824,6 +1228,14 @@ def main() -> None:
     parser.add_argument("--paths", type=int, default=2000, help="Number of simulated trajectories per dataset.")
     parser.add_argument("--grid", type=int, default=260, help="Number of time points in the plotted survival curve.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--bmi-sweep-preview", action="store_true", help="Generate ICU BMI sweep MP4 preview.")
+    parser.add_argument("--bmi-first-n", type=int, default=5, help="Number of BMI values to include in preview.")
+    parser.add_argument("--bmi-samples", type=int, default=50, help="Simulated paths per BMI value in preview mode.")
+    parser.add_argument("--bmi-fps", type=int, default=5, help="Frames per second for BMI sweep MP4.")
+    parser.add_argument("--sysbp-sweep", action="store_true", help="Generate ICU death minimum systolic blood pressure sweep MP4.")
+    parser.add_argument("--sysbp-frames", type=int, default=100, help="Number of systolic blood pressure frames.")
+    parser.add_argument("--sysbp-samples", type=int, default=100, help="Simulated paths per systolic blood pressure frame.")
+    parser.add_argument("--sysbp-fps", type=int, default=15, help="Frames per second for systolic blood pressure sweep MP4.")
     args = parser.parse_args()
 
     loaders: list[Callable[[], SurvivalDataset]] = [
@@ -834,6 +1246,34 @@ def main() -> None:
     ]
 
     rust_bin = _ensure_rust_binary()
+    if args.sysbp_sweep:
+        mp4 = generate_icu_sysbp_sweep_mp4(
+            rust_bin=rust_bin,
+            out_dir=args.out_dir,
+            n_grid=max(80, int(args.grid)),
+            seed=int(args.seed),
+            samples_per_frame=max(10, int(args.sysbp_samples)),
+            n_frames=max(2, int(args.sysbp_frames)),
+            fps=max(1, int(args.sysbp_fps)),
+        )
+        print("Generated systolic blood pressure sweep MP4:")
+        print(mp4)
+        return
+
+    if args.bmi_sweep_preview:
+        mp4 = generate_bmi_sweep_mp4_preview(
+            rust_bin=rust_bin,
+            out_dir=args.out_dir,
+            n_grid=max(80, int(args.grid)),
+            seed=int(args.seed),
+            samples_per_bmi=max(10, int(args.bmi_samples)),
+            first_n=max(1, int(args.bmi_first_n)),
+            fps=max(1, int(args.bmi_fps)),
+        )
+        print("Generated BMI sweep preview MP4:")
+        print(mp4)
+        return
+
     outputs: list[Path] = []
     for loader in loaders:
         ds = loader()

@@ -199,13 +199,13 @@ fn validate_block_specs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, Stri
             ));
         }
         let p = spec.design.ncols();
-        if let Some(beta0) = &spec.initial_beta {
-            if beta0.len() != p {
-                return Err(format!(
-                    "block {b} initial_beta length mismatch: got {}, expected {p}",
-                    beta0.len()
-                ));
-            }
+        if let Some(beta0) = &spec.initial_beta
+            && beta0.len() != p
+        {
+            return Err(format!(
+                "block {b} initial_beta length mismatch: got {}, expected {p}",
+                beta0.len()
+            ));
         }
         if spec.initial_log_lambdas.len() != spec.penalties.len() {
             return Err(format!(
@@ -564,7 +564,9 @@ fn solve_kkt_step(
             direction[i] = rhs_mat[(i, 0)];
         }
         if !direction.iter().all(|v| v.is_finite()) {
-            return Err("constrained unconstrained-step solve produced non-finite values".to_string());
+            return Err(
+                "constrained unconstrained-step solve produced non-finite values".to_string(),
+            );
         }
         return Ok((direction, Array1::zeros(0)));
     }
@@ -573,7 +575,8 @@ fn solve_kkt_step(
     kkt.slice_mut(ndarray::s![0..p, 0..p]).assign(hessian);
     kkt.slice_mut(ndarray::s![0..p, p..(p + m)])
         .assign(&active_a.t());
-    kkt.slice_mut(ndarray::s![p..(p + m), 0..p]).assign(active_a);
+    kkt.slice_mut(ndarray::s![p..(p + m), 0..p])
+        .assign(active_a);
 
     let mut rhs = Array1::<f64>::zeros(p + m);
     for i in 0..p {
@@ -1076,23 +1079,30 @@ fn inner_blockwise_fit<F: CustomFamily>(
                     let w_clamped = working_weights.mapv(|wi| wi.max(options.min_weight));
                     if let Some(constraints) = linear_constraints.as_ref() {
                         check_linear_feasibility(&states[b].beta, constraints, 1e-8).map_err(
-                            |e| format!("block {b} ({}) constrained diagonal solve: {e}", spec.name),
+                            |e| {
+                                format!("block {b} ({}) constrained diagonal solve: {e}", spec.name)
+                            },
                         )?;
-                        let (mut lhs, rhs_opt) = weighted_normal_equations(&x_dyn, &w_clamped, Some(&y_star))?;
+                        let (mut lhs, rhs_opt) =
+                            weighted_normal_equations(&x_dyn, &w_clamped, Some(&y_star))?;
                         let rhs = rhs_opt.ok_or_else(|| {
                             "missing weighted RHS in constrained diagonal solve".to_string()
                         })?;
                         lhs += &s_lambda;
-                        let (beta_constrained, active_set) = solve_quadratic_with_linear_constraints(
-                            &lhs,
-                            &rhs,
-                            &states[b].beta,
-                            constraints,
-                            cached_active_sets[b].as_deref(),
-                        )
-                        .map_err(|e| {
-                            format!("block {b} ({}) constrained diagonal solve failed: {e}", spec.name)
-                        })?;
+                        let (beta_constrained, active_set) =
+                            solve_quadratic_with_linear_constraints(
+                                &lhs,
+                                &rhs,
+                                &states[b].beta,
+                                constraints,
+                                cached_active_sets[b].as_deref(),
+                            )
+                            .map_err(|e| {
+                                format!(
+                                    "block {b} ({}) constrained diagonal solve failed: {e}",
+                                    spec.name
+                                )
+                            })?;
                         cached_active_sets[b] = Some(active_set);
                         beta_constrained
                     } else {
@@ -1133,18 +1143,27 @@ fn inner_blockwise_fit<F: CustomFamily>(
                     rhs += gradient;
                     if let Some(constraints) = linear_constraints.as_ref() {
                         check_linear_feasibility(&states[b].beta, constraints, 1e-8).map_err(
-                            |e| format!("block {b} ({}) constrained exact-newton solve: {e}", spec.name),
+                            |e| {
+                                format!(
+                                    "block {b} ({}) constrained exact-newton solve: {e}",
+                                    spec.name
+                                )
+                            },
                         )?;
-                        let (beta_constrained, active_set) = solve_quadratic_with_linear_constraints(
-                            &lhs,
-                            &rhs,
-                            &states[b].beta,
-                            constraints,
-                            cached_active_sets[b].as_deref(),
-                        )
-                        .map_err(|e| {
-                            format!("block {b} ({}) constrained exact-newton solve failed: {e}", spec.name)
-                        })?;
+                        let (beta_constrained, active_set) =
+                            solve_quadratic_with_linear_constraints(
+                                &lhs,
+                                &rhs,
+                                &states[b].beta,
+                                constraints,
+                                cached_active_sets[b].as_deref(),
+                            )
+                            .map_err(|e| {
+                                format!(
+                                    "block {b} ({}) constrained exact-newton solve failed: {e}",
+                                    spec.name
+                                )
+                            })?;
                         cached_active_sets[b] = Some(active_set);
                         beta_constrained
                     } else {
@@ -1444,12 +1463,16 @@ fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
     out
 }
 
-fn flatten_state_betas(states: &[ParameterBlockState], specs: &[ParameterBlockSpec]) -> Array1<f64> {
+fn flatten_state_betas(
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+) -> Array1<f64> {
     let total = specs.iter().map(|s| s.design.ncols()).sum::<usize>();
     let mut beta = Array1::<f64>::zeros(total);
     let ranges = block_param_ranges(specs);
     for (b, (start, end)) in ranges.into_iter().enumerate() {
-        beta.slice_mut(ndarray::s![start..end]).assign(&states[b].beta);
+        beta.slice_mut(ndarray::s![start..end])
+            .assign(&states[b].beta);
     }
     beta
 }
@@ -1525,11 +1548,7 @@ fn compute_joint_hessian_from_objective<F: CustomFamily>(
     refresh_all_block_etas(family, specs, &mut states_f0)?;
     let f0 = penalized_objective_at_beta(family, specs, &states_f0, per_block_log_lambdas)?;
 
-    let steps = Array1::from_iter(
-        beta_hat
-            .iter()
-            .map(|&b| (1e-4 * (1.0 + b.abs())).max(1e-6)),
-    );
+    let steps = Array1::from_iter(beta_hat.iter().map(|&b| (1e-4 * (1.0 + b.abs())).max(1e-6)));
 
     for i in 0..total {
         let hi = steps[i];
@@ -1625,14 +1644,13 @@ pub fn fit_custom_family<F: CustomFamily>(
     let rho0 = flatten_log_lambdas(specs);
 
     if rho0.is_empty() {
-        let mut inner =
-            inner_blockwise_fit(
-                family,
-                specs,
-                &vec![Array1::zeros(0); specs.len()],
-                options,
-                None,
-            )?;
+        let mut inner = inner_blockwise_fit(
+            family,
+            specs,
+            &vec![Array1::zeros(0); specs.len()],
+            options,
+            None,
+        )?;
         refresh_all_block_etas(family, specs, &mut inner.block_states)?;
         let covariance_conditional = compute_joint_covariance(
             family,

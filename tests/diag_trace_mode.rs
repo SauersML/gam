@@ -56,6 +56,7 @@ fn compare_trace_third_modes_against_fd() {
         max_iter: 80,
         tol: 1e-6,
         nullspace_dims: vec![0, 0],
+        linear_constraints: None,
         firth_bias_reduction: Some(false),
     };
     let rho = Array1::from_vec(vec![1.0, 1.5]);

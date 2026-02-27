@@ -43,7 +43,7 @@ pub const MIN_EIG_DIAG_THRESHOLD: f64 = 1e-4;
 /// Returns (should_print, count) - prints on first occurrence, then every DIAG_PRINT_INTERVAL
 pub fn should_emit_grad_diag(counter: &AtomicUsize) -> (bool, usize) {
     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    let should_print = count == 1 || count % DIAG_PRINT_INTERVAL == 0;
+    let should_print = count == 1 || count.is_multiple_of(DIAG_PRINT_INTERVAL);
     (should_print, count)
 }
 
@@ -63,7 +63,7 @@ pub fn should_emit_h_min_eig_diag(min_eig: f64) -> bool {
     };
     let last = H_MIN_EIG_LOG_BUCKET.load(Ordering::Relaxed);
     let count = H_MIN_EIG_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if bucket != last || count % MIN_EIG_DIAG_EVERY == 0 {
+    if bucket != last || count.is_multiple_of(MIN_EIG_DIAG_EVERY) {
         H_MIN_EIG_LOG_BUCKET.store(bucket, Ordering::Relaxed);
         true
     } else {

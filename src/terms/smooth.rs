@@ -1,12 +1,13 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BasisBuildResult, BasisError, BasisMetadata,
-    DuchonBasisSpec, MaternBasisSpec, SpatialIdentifiability, ThinPlateBasisSpec,
-    apply_sum_to_zero_constraint, apply_weighted_orthogonality_constraint, build_bspline_basis_1d,
-    build_duchon_basis, build_matern_basis, build_thin_plate_basis,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
+    BasisMetadata, DuchonBasisSpec, MaternBasisSpec, MaternIdentifiability, SpatialIdentifiability,
+    ThinPlateBasisSpec, apply_sum_to_zero_constraint, apply_weighted_orthogonality_constraint,
+    build_bspline_basis_1d, build_duchon_basis, build_matern_basis, build_thin_plate_basis,
     create_bspline_basis_nd_with_knots, estimate_penalty_nullity,
 };
 use crate::construction::kronecker_product;
 use crate::estimate::{EstimationError, FitOptions, FitResult, fit_gam};
+use crate::pirls::LinearInequalityConstraints;
 use crate::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
@@ -95,6 +96,9 @@ pub struct SmoothTerm {
     /// Optional term-local lower bounds for constrained coefficients.
     /// `-inf` means unconstrained.
     pub lower_bounds_local: Option<Array1<f64>>,
+    /// Optional term-local inequality constraints in local coefficient coordinates.
+    /// `A_local * beta_local >= b_local`.
+    pub linear_constraints_local: Option<LinearInequalityConstraints>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +110,9 @@ pub struct SmoothDesign {
     /// Optional smooth-block lower bounds in smooth coefficient coordinates.
     /// Length equals `design.ncols()` when present.
     pub coefficient_lower_bounds: Option<Array1<f64>>,
+    /// Optional smooth-block inequality constraints:
+    /// `A_smooth * beta_smooth >= b`.
+    pub linear_constraints: Option<LinearInequalityConstraints>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +157,9 @@ pub struct TermCollectionDesign {
     /// Optional global coefficient lower bounds for constrained fitting.
     /// Length equals `design.ncols()` when present. Unconstrained entries are `-inf`.
     pub coefficient_lower_bounds: Option<Array1<f64>>,
+    /// Optional global inequality constraints:
+    /// `A * beta >= b`.
+    pub linear_constraints: Option<LinearInequalityConstraints>,
     pub intercept_range: Range<usize>,
     pub linear_ranges: Vec<(String, Range<usize>)>,
     pub random_effect_ranges: Vec<(String, Range<usize>)>,
@@ -288,13 +298,303 @@ fn shape_lower_bounds_local(shape: ShapeConstraint, dim: usize) -> Option<Array1
 }
 
 fn shape_supports_basis(term: &SmoothTermSpec) -> bool {
-    if term.shape == ShapeConstraint::None {
-        return true;
-    }
+    let _ = term;
+    true
+}
+
+fn shape_uses_box_reparameterization(basis: &SmoothBasisSpec) -> bool {
     matches!(
-        &term.basis,
+        basis,
         SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. }
     )
+}
+
+fn build_shape_constraint_grid_1d(x: ArrayView1<'_, f64>) -> Result<Array1<f64>, BasisError> {
+    if x.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "shape-constrained smooth requires non-empty covariate values".to_string(),
+        ));
+    }
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "shape-constrained smooth requires finite covariate values".to_string(),
+        ));
+    }
+
+    let mut x_sorted: Vec<f64> = x.iter().copied().collect();
+    x_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut x_unique: Vec<f64> = Vec::with_capacity(x_sorted.len());
+    let mut last: Option<f64> = None;
+    for v in x_sorted {
+        let take = match last {
+            None => true,
+            Some(prev) => (v - prev).abs() > 1e-12 * prev.abs().max(v.abs()).max(1.0),
+        };
+        if take {
+            x_unique.push(v);
+            last = Some(v);
+        }
+    }
+    if x_unique.len() < 2 {
+        return Err(BasisError::InvalidInput(
+            "shape-constrained smooth requires at least two unique covariate values".to_string(),
+        ));
+    }
+
+    let min_x = x_unique[0];
+    let max_x = *x_unique
+        .last()
+        .expect("x_unique has at least two elements by construction");
+    if (max_x - min_x).abs() <= 1e-12 {
+        return Err(BasisError::InvalidInput(
+            "shape-constrained smooth requires non-degenerate covariate range".to_string(),
+        ));
+    }
+
+    let target_points = x_unique.len().clamp(96, 320);
+    let mut grid = Array1::<f64>::zeros(target_points);
+    let denom = (target_points - 1) as f64;
+    for i in 0..target_points {
+        let t = i as f64 / denom;
+        grid[i] = min_x + t * (max_x - min_x);
+    }
+    Ok(grid)
+}
+
+fn build_shape_constraint_design_1d(
+    data: ArrayView2<'_, f64>,
+    term: &SmoothTermSpec,
+    metadata: &BasisMetadata,
+    axis_col: usize,
+) -> Result<(Array1<f64>, Array2<f64>), BasisError> {
+    let x_grid = build_shape_constraint_grid_1d(data.column(axis_col))?;
+    let grid_2d = x_grid
+        .clone()
+        .into_shape_with_order((x_grid.len(), 1))
+        .map_err(|e| {
+            BasisError::InvalidInput(format!(
+                "failed to construct 1D shape grid matrix for term '{}': {e}",
+                term.name
+            ))
+        })?;
+
+    let design = match (&term.basis, metadata) {
+        (
+            SmoothBasisSpec::BSpline1D { spec, .. },
+            BasisMetadata::BSpline1D {
+                knots,
+                identifiability_transform,
+            },
+        ) => {
+            let eval_spec = BSplineBasisSpec {
+                degree: spec.degree,
+                penalty_order: spec.penalty_order,
+                knot_spec: BSplineKnotSpec::Provided(knots.clone()),
+                double_penalty: false,
+                identifiability: identifiability_transform
+                    .as_ref()
+                    .map(|z| BSplineIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    })
+                    .unwrap_or(BSplineIdentifiability::None),
+            };
+            build_bspline_basis_1d(x_grid.view(), &eval_spec)?.design
+        }
+        (SmoothBasisSpec::ThinPlate { .. }, BasisMetadata::ThinPlate { centers, .. }) => {
+            let eval_spec = ThinPlateBasisSpec {
+                center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
+                double_penalty: false,
+                identifiability: SpatialIdentifiability::None,
+            };
+            build_thin_plate_basis(grid_2d.view(), &eval_spec)?.design
+        }
+        (
+            SmoothBasisSpec::Matern { .. },
+            BasisMetadata::Matern {
+                centers,
+                length_scale,
+                nu,
+                include_intercept,
+                identifiability_transform,
+            },
+        ) => {
+            let ident = identifiability_transform
+                .as_ref()
+                .map(|z| MaternIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                })
+                .unwrap_or(MaternIdentifiability::None);
+            let eval_spec = MaternBasisSpec {
+                center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
+                length_scale: *length_scale,
+                nu: *nu,
+                include_intercept: *include_intercept,
+                double_penalty: false,
+                identifiability: ident,
+            };
+            build_matern_basis(grid_2d.view(), &eval_spec)?.design
+        }
+        (
+            SmoothBasisSpec::Duchon { spec, .. },
+            BasisMetadata::Duchon {
+                centers,
+                length_scale,
+                nu,
+                nullspace_order,
+                ..
+            },
+        ) => {
+            let eval_spec = DuchonBasisSpec {
+                center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
+                length_scale: *length_scale,
+                nu: *nu,
+                nullspace_order: *nullspace_order,
+                double_penalty: false,
+                identifiability: spec.identifiability.clone(),
+            };
+            build_duchon_basis(grid_2d.view(), &eval_spec)?.design
+        }
+        _ => {
+            return Err(BasisError::InvalidInput(format!(
+                "shape-constraint grid reconstruction metadata mismatch for term '{}'",
+                term.name
+            )));
+        }
+    };
+
+    Ok((x_grid, design))
+}
+
+fn build_shape_linear_constraints_1d(
+    x: ArrayView1<'_, f64>,
+    design_local: ArrayView2<'_, f64>,
+    shape: ShapeConstraint,
+) -> Result<Option<LinearInequalityConstraints>, BasisError> {
+    let (order, sign) = match shape_order_and_sign(shape) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let n = x.len();
+    let p = design_local.ncols();
+    if n == 0 || p == 0 {
+        return Ok(None);
+    }
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "shape-constrained smooth requires finite covariate values".to_string(),
+        ));
+    }
+
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&i, &j| x[i].partial_cmp(&x[j]).unwrap_or(std::cmp::Ordering::Equal));
+
+    let x_scale = x.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())).max(1.0);
+    let x_tol = 1e-12 * x_scale;
+    let mut collapsed_rows: Vec<Array1<f64>> = Vec::new();
+    let mut group_sum = Array1::<f64>::zeros(p);
+    let mut group_count = 0usize;
+    let mut last_x: Option<f64> = None;
+    for &r in &idx {
+        let xr = x[r];
+        let start_new = match last_x {
+            None => false,
+            Some(prev) => (xr - prev).abs() > x_tol,
+        };
+        if start_new {
+            if group_count > 0 {
+                collapsed_rows.push(group_sum.mapv(|v| v / group_count as f64));
+            }
+            group_sum.fill(0.0);
+            group_count = 0;
+        }
+        group_sum += &design_local.row(r).to_owned();
+        group_count += 1;
+        last_x = Some(xr);
+    }
+    if group_count > 0 {
+        collapsed_rows.push(group_sum.mapv(|v| v / group_count as f64));
+    }
+
+    let m = collapsed_rows.len();
+    if m <= order {
+        return Err(BasisError::InvalidInput(format!(
+            "shape-constrained smooth requires at least {} unique covariate locations; found {}",
+            order + 1,
+            m
+        )));
+    }
+
+    let q_raw = m - order;
+    let mut a_rows: Vec<Array1<f64>> = Vec::with_capacity(q_raw);
+    for i in 0..q_raw {
+        let row = if order == 1 {
+            &collapsed_rows[i + 1] - &collapsed_rows[i]
+        } else {
+            &collapsed_rows[i + 2] - &collapsed_rows[i + 1].mapv(|v| 2.0 * v) + &collapsed_rows[i]
+        };
+        let mut row_signed = row;
+        if sign < 0.0 {
+            row_signed.mapv_inplace(|v| -v);
+        }
+        let norm = row_signed.dot(&row_signed).sqrt();
+        if norm > 1e-12 {
+            a_rows.push(row_signed);
+        }
+    }
+    if a_rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut a = Array2::<f64>::zeros((a_rows.len(), p));
+    for (i, row) in a_rows.iter().enumerate() {
+        a.row_mut(i).assign(row);
+    }
+    let b = Array1::<f64>::zeros(a.nrows());
+    Ok(Some(LinearInequalityConstraints { a, b }))
+}
+
+fn linear_constraints_from_lower_bounds_global(
+    lower_bounds: &Array1<f64>,
+) -> Option<LinearInequalityConstraints> {
+    let rows: Vec<usize> = (0..lower_bounds.len())
+        .filter(|&i| lower_bounds[i].is_finite())
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let p = lower_bounds.len();
+    let mut a = Array2::<f64>::zeros((rows.len(), p));
+    let mut b = Array1::<f64>::zeros(rows.len());
+    for (r, &idx) in rows.iter().enumerate() {
+        a[[r, idx]] = 1.0;
+        b[r] = lower_bounds[idx];
+    }
+    Some(LinearInequalityConstraints { a, b })
+}
+
+fn merge_linear_constraints_global(
+    first: Option<LinearInequalityConstraints>,
+    second: Option<LinearInequalityConstraints>,
+) -> Option<LinearInequalityConstraints> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(c), None) | (None, Some(c)) => Some(c),
+        (Some(a), Some(b)) => {
+            if a.a.ncols() != b.a.ncols() {
+                return None;
+            }
+            let m1 = a.a.nrows();
+            let m2 = b.a.nrows();
+            let p = a.a.ncols();
+            let mut mat = Array2::<f64>::zeros((m1 + m2, p));
+            mat.slice_mut(s![0..m1, ..]).assign(&a.a);
+            mat.slice_mut(s![m1..(m1 + m2), ..]).assign(&b.a);
+            let mut rhs = Array1::<f64>::zeros(m1 + m2);
+            rhs.slice_mut(s![0..m1]).assign(&a.b);
+            rhs.slice_mut(s![m1..(m1 + m2)]).assign(&b.b);
+            Some(LinearInequalityConstraints { a: mat, b: rhs })
+        }
+    }
 }
 
 fn build_tensor_bspline_basis(
@@ -560,14 +860,18 @@ pub fn build_smooth_design(
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(terms.len());
     let mut local_metadata = Vec::<BasisMetadata>::with_capacity(terms.len());
     let mut local_dims = Vec::<usize>::with_capacity(terms.len());
+    let mut local_linear_constraints =
+        Vec::<Option<LinearInequalityConstraints>>::with_capacity(terms.len());
+    let mut local_box_reparam = Vec::<bool>::with_capacity(terms.len());
 
     for term in terms {
         if !shape_supports_basis(term) {
             return Err(BasisError::InvalidInput(format!(
-                "ShapeConstraint::{:?} for term '{}' is currently supported only for BSpline1D/TensorBSpline bases",
+                "ShapeConstraint::{:?} is unsupported for term '{}'",
                 term.shape, term.name
             )));
         }
+        let mut shape_axis_col: Option<usize> = None;
         let built: BasisBuildResult = match &term.basis {
             SmoothBasisSpec::BSpline1D { feature_col, spec } => {
                 if *feature_col >= data.ncols() {
@@ -587,14 +891,47 @@ pub fn build_smooth_design(
                 build_bspline_basis_1d(data.column(*feature_col), &spec_local)?
             }
             SmoothBasisSpec::ThinPlate { feature_cols, spec } => {
+                if term.shape != ShapeConstraint::None {
+                    if feature_cols.len() != 1 {
+                        return Err(BasisError::InvalidInput(format!(
+                            "ShapeConstraint::{:?} for term '{}' on ThinPlate basis requires exactly 1 feature axis; found {}",
+                            term.shape,
+                            term.name,
+                            feature_cols.len()
+                        )));
+                    }
+                    shape_axis_col = Some(feature_cols[0]);
+                }
                 let x = select_columns(data, feature_cols)?;
                 build_thin_plate_basis(x.view(), spec)?
             }
             SmoothBasisSpec::Matern { feature_cols, spec } => {
+                if term.shape != ShapeConstraint::None {
+                    if feature_cols.len() != 1 {
+                        return Err(BasisError::InvalidInput(format!(
+                            "ShapeConstraint::{:?} for term '{}' on Matern basis requires exactly 1 feature axis; found {}",
+                            term.shape,
+                            term.name,
+                            feature_cols.len()
+                        )));
+                    }
+                    shape_axis_col = Some(feature_cols[0]);
+                }
                 let x = select_columns(data, feature_cols)?;
                 build_matern_basis(x.view(), spec)?
             }
             SmoothBasisSpec::Duchon { feature_cols, spec } => {
+                if term.shape != ShapeConstraint::None {
+                    if feature_cols.len() != 1 {
+                        return Err(BasisError::InvalidInput(format!(
+                            "ShapeConstraint::{:?} for term '{}' on Duchon basis requires exactly 1 feature axis; found {}",
+                            term.shape,
+                            term.name,
+                            feature_cols.len()
+                        )));
+                    }
+                    shape_axis_col = Some(feature_cols[0]);
+                }
                 let x = select_columns(data, feature_cols)?;
                 build_duchon_basis(x.view(), spec)?
             }
@@ -608,9 +945,14 @@ pub fn build_smooth_design(
         };
 
         let p_local = built.design.ncols();
+        let metadata = built.metadata.clone();
         let mut design_t = built.design;
         let mut penalties_t: Vec<Array2<f64>> = built.penalties;
-        if let Some((order, sign)) = shape_order_and_sign(term.shape) {
+        let use_box_reparam =
+            term.shape != ShapeConstraint::None && shape_uses_box_reparameterization(&term.basis);
+        if let Some((order, sign)) = shape_order_and_sign(term.shape)
+            && use_box_reparam
+        {
             let t = cumulative_sum_transform_matrix(p_local, order, sign);
             design_t = design_t.dot(&t);
             penalties_t = penalties_t
@@ -623,6 +965,23 @@ pub fn build_smooth_design(
                 })
                 .collect();
         }
+        let linear_constraints_local = if term.shape != ShapeConstraint::None && !use_box_reparam {
+            let axis = shape_axis_col.ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "internal shape-constraint axis missing for term '{}'",
+                    term.name
+                ))
+            })?;
+            let (x_shape_eval, design_shape_eval) =
+                build_shape_constraint_design_1d(data, term, &metadata, axis)?;
+            build_shape_linear_constraints_1d(
+                x_shape_eval.view(),
+                design_shape_eval.view(),
+                term.shape,
+            )?
+        } else {
+            None
+        };
 
         let nullspaces_t = penalties_t
             .iter()
@@ -633,7 +992,9 @@ pub fn build_smooth_design(
         local_designs.push(design_t);
         local_penalties.push(penalties_t);
         local_nullspaces.push(nullspaces_t);
-        local_metadata.push(built.metadata);
+        local_metadata.push(metadata);
+        local_linear_constraints.push(linear_constraints_local);
+        local_box_reparam.push(use_box_reparam);
     }
 
     let total_p: usize = local_dims.iter().sum();
@@ -643,12 +1004,18 @@ pub fn build_smooth_design(
     let mut nullspace_dims_global = Vec::<usize>::new();
     let mut coefficient_lower_bounds = Array1::<f64>::from_elem(total_p, f64::NEG_INFINITY);
     let mut any_bounds = false;
+    let mut linear_constraints_rows: Vec<Array1<f64>> = Vec::new();
+    let mut linear_constraints_b: Vec<f64> = Vec::new();
 
     let mut col_start = 0usize;
     for (idx, term) in terms.iter().enumerate() {
         let p_local = local_dims[idx];
         let col_end = col_start + p_local;
-        let lb_local = shape_lower_bounds_local(term.shape, p_local);
+        let lb_local = if local_box_reparam[idx] {
+            shape_lower_bounds_local(term.shape, p_local)
+        } else {
+            None
+        };
 
         design
             .slice_mut(s![.., col_start..col_end])
@@ -674,7 +1041,17 @@ pub fn build_smooth_design(
             nullspace_dims: local_nullspaces[idx].clone(),
             metadata: local_metadata[idx].clone(),
             lower_bounds_local: lb_local.clone(),
+            linear_constraints_local: local_linear_constraints[idx].clone(),
         });
+        if let Some(lin_local) = &local_linear_constraints[idx] {
+            for r in 0..lin_local.a.nrows() {
+                let mut row = Array1::<f64>::zeros(total_p);
+                row.slice_mut(s![col_start..col_end])
+                    .assign(&lin_local.a.row(r));
+                linear_constraints_rows.push(row);
+                linear_constraints_b.push(lin_local.b[r]);
+            }
+        }
         if let Some(lb_local) = lb_local {
             coefficient_lower_bounds
                 .slice_mut(s![col_start..col_end])
@@ -694,6 +1071,18 @@ pub fn build_smooth_design(
             Some(coefficient_lower_bounds)
         } else {
             None
+        },
+        linear_constraints: if linear_constraints_rows.is_empty() {
+            None
+        } else {
+            let mut a = Array2::<f64>::zeros((linear_constraints_rows.len(), total_p));
+            for (i, row) in linear_constraints_rows.iter().enumerate() {
+                a.row_mut(i).assign(row);
+            }
+            Some(LinearInequalityConstraints {
+                a,
+                b: Array1::from_vec(linear_constraints_b),
+            })
         },
     })
 }
@@ -767,6 +1156,7 @@ pub fn build_term_collection_design(
     let mut nullspace_dims = Vec::<usize>::new();
     let mut coefficient_lower_bounds = Array1::<f64>::from_elem(p_total, f64::NEG_INFINITY);
     let mut any_bounds = false;
+    let mut linear_constraints = None;
 
     for (j, linear) in spec.linear_terms.iter().enumerate() {
         if !linear.double_penalty {
@@ -804,6 +1194,28 @@ pub fn build_term_collection_design(
             .assign(lb_smooth);
         any_bounds = true;
     }
+    if let Some(lin_smooth) = smooth.linear_constraints.as_ref() {
+        let mut a_global = Array2::<f64>::zeros((lin_smooth.a.nrows(), p_total));
+        let start = p_intercept + p_lin + p_rand;
+        a_global
+            .slice_mut(s![.., start..(start + p_smooth)])
+            .assign(&lin_smooth.a);
+        linear_constraints = Some(LinearInequalityConstraints {
+            a: a_global,
+            b: lin_smooth.b.clone(),
+        });
+    }
+
+    // Canonical constraint path: convert any explicit lower bounds into linear
+    // inequalities and merge into the global constraint matrix. This keeps fitting
+    // behavior independent of user-facing lower-bound options.
+    let lower_bound_constraints = if any_bounds {
+        linear_constraints_from_lower_bounds_global(&coefficient_lower_bounds)
+    } else {
+        None
+    };
+    linear_constraints =
+        merge_linear_constraints_global(linear_constraints, lower_bound_constraints);
 
     Ok(TermCollectionDesign {
         design,
@@ -814,6 +1226,7 @@ pub fn build_term_collection_design(
         } else {
             None
         },
+        linear_constraints,
         intercept_range: 0..1,
         linear_ranges,
         random_effect_ranges,
@@ -855,9 +1268,12 @@ fn apply_spatial_orthogonality_to_parametric(
 
     // Fast-path: if no spatial term participates in Option 5 (orthogonal or frozen),
     // return the smooth bundle unchanged and skip all matrix work.
-    let any_spatial_transform = smooth_specs
-        .iter()
-        .any(|t| !matches!(spatial_identifiability_policy(t), Some(SpatialIdentifiability::None) | None));
+    let any_spatial_transform = smooth_specs.iter().any(|t| {
+        !matches!(
+            spatial_identifiability_policy(t),
+            Some(SpatialIdentifiability::None) | None
+        )
+    });
     if !any_spatial_transform {
         return Ok(smooth);
     }
@@ -880,6 +1296,8 @@ fn apply_spatial_orthogonality_to_parametric(
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(smooth.terms.len());
     let mut local_metadata = Vec::<BasisMetadata>::with_capacity(smooth.terms.len());
     let mut local_dims = Vec::<usize>::with_capacity(smooth.terms.len());
+    let mut local_linear_constraints =
+        Vec::<Option<LinearInequalityConstraints>>::with_capacity(smooth.terms.len());
 
     for (idx, term) in smooth.terms.iter().enumerate() {
         let term_spec = &smooth_specs[idx];
@@ -926,11 +1344,25 @@ fn apply_spatial_orthogonality_to_parametric(
             penalties_constrained.push(s_con);
             nullspace_constrained.push(ns);
         }
+        let linear_constraints_constrained =
+            if let Some(lin_local) = term.linear_constraints_local.as_ref() {
+                if let Some(z) = z_opt.as_ref() {
+                    Some(LinearInequalityConstraints {
+                        a: lin_local.a.dot(z),
+                        b: lin_local.b.clone(),
+                    })
+                } else {
+                    Some(lin_local.clone())
+                }
+            } else {
+                None
+            };
 
         local_dims.push(design_constrained.ncols());
         local_designs.push(design_constrained);
         local_penalties.push(penalties_constrained);
         local_nullspaces.push(nullspace_constrained);
+        local_linear_constraints.push(linear_constraints_constrained);
         local_metadata.push(with_spatial_identifiability_transform(
             &term.metadata,
             z_opt.as_ref(),
@@ -944,6 +1376,8 @@ fn apply_spatial_orthogonality_to_parametric(
     let mut nullspace_dims_global = Vec::<usize>::new();
     let mut coefficient_lower_bounds = Array1::<f64>::from_elem(total_p, f64::NEG_INFINITY);
     let mut any_bounds = false;
+    let mut linear_constraints_rows: Vec<Array1<f64>> = Vec::new();
+    let mut linear_constraints_b: Vec<f64> = Vec::new();
 
     let mut col_start = 0usize;
     for idx in 0..smooth.terms.len() {
@@ -973,7 +1407,17 @@ fn apply_spatial_orthogonality_to_parametric(
             nullspace_dims: local_nullspaces[idx].clone(),
             metadata: local_metadata[idx].clone(),
             lower_bounds_local: smooth.terms[idx].lower_bounds_local.clone(),
+            linear_constraints_local: local_linear_constraints[idx].clone(),
         });
+        if let Some(lin_local) = &local_linear_constraints[idx] {
+            for r in 0..lin_local.a.nrows() {
+                let mut row = Array1::<f64>::zeros(total_p);
+                row.slice_mut(s![col_start..col_end])
+                    .assign(&lin_local.a.row(r));
+                linear_constraints_rows.push(row);
+                linear_constraints_b.push(lin_local.b[r]);
+            }
+        }
         if let Some(lb_local) = smooth.terms[idx].lower_bounds_local.as_ref() {
             if lb_local.len() == p_local {
                 coefficient_lower_bounds
@@ -995,6 +1439,18 @@ fn apply_spatial_orthogonality_to_parametric(
             Some(coefficient_lower_bounds)
         } else {
             None
+        },
+        linear_constraints: if linear_constraints_rows.is_empty() {
+            None
+        } else {
+            let mut a = Array2::<f64>::zeros((linear_constraints_rows.len(), total_p));
+            for (i, row) in linear_constraints_rows.iter().enumerate() {
+                a.row_mut(i).assign(row);
+            }
+            Some(LinearInequalityConstraints {
+                a,
+                b: Array1::from_vec(linear_constraints_b),
+            })
         },
     })
 }
@@ -1151,10 +1607,80 @@ fn fit_term_collection_for_spec(
             max_iter: options.max_iter,
             tol: options.tol,
             nullspace_dims: design.nullspace_dims.clone(),
-            coefficient_lower_bounds: design.coefficient_lower_bounds.clone(),
+            linear_constraints: design.linear_constraints.clone(),
         },
     )?;
+    enforce_term_constraint_feasibility(&design, &fit)?;
     Ok(FittedTermCollection { fit, design })
+}
+
+fn enforce_term_constraint_feasibility(
+    design: &TermCollectionDesign,
+    fit: &FitResult,
+) -> Result<(), EstimationError> {
+    let tol = 1e-7;
+    let smooth_start = design
+        .design
+        .ncols()
+        .saturating_sub(design.smooth.design.ncols());
+    let mut violations: Vec<String> = Vec::new();
+    for term in &design.smooth.terms {
+        let gr = (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
+        let beta_local = fit.beta.slice(s![gr.clone()]).to_owned();
+        if let Some(lb) = term.lower_bounds_local.as_ref() {
+            let mut worst = 0.0_f64;
+            let mut worst_idx = 0usize;
+            for i in 0..lb.len().min(beta_local.len()) {
+                if lb[i].is_finite() {
+                    let viol = (lb[i] - beta_local[i]).max(0.0);
+                    if viol > worst {
+                        worst = viol;
+                        worst_idx = i;
+                    }
+                }
+            }
+            if worst > tol {
+                violations.push(format!(
+                    "term='{}' kind=lower-bound max_violation={:.3e} coeff_index={}",
+                    term.name, worst, worst_idx
+                ));
+            }
+        }
+        if let Some(lin) = term.linear_constraints_local.as_ref() {
+            let slack = lin.a.dot(&beta_local) - &lin.b;
+            let mut worst = 0.0_f64;
+            let mut worst_row = 0usize;
+            for (i, &v) in slack.iter().enumerate() {
+                let viol = (-v).max(0.0);
+                if viol > worst {
+                    worst = viol;
+                    worst_row = i;
+                }
+            }
+            if worst > tol {
+                violations.push(format!(
+                    "term='{}' kind=linear-inequality max_violation={:.3e} row={}",
+                    term.name, worst, worst_row
+                ));
+            }
+        }
+    }
+
+    if !violations.is_empty() {
+        let mut msg = format!(
+            "constraint violation after fit ({} violating term constraints): {}",
+            violations.len(),
+            violations.join(" | ")
+        );
+        if let Some(kkt) = fit.artifacts.pirls.constraint_kkt.as_ref() {
+            msg.push_str(&format!(
+                "; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}]",
+                kkt.primal_feasibility, kkt.dual_feasibility, kkt.complementarity, kkt.stationarity
+            ));
+        }
+        return Err(EstimationError::ParameterConstraintViolation(msg));
+    }
+    Ok(())
 }
 
 fn matern_term_indices(spec: &TermCollectionSpec) -> Vec<usize> {
@@ -1713,7 +2239,7 @@ mod tests {
     }
 
     #[test]
-    fn build_smooth_design_rejects_non_none_shape_constraints() {
+    fn build_smooth_design_rejects_multiaxis_spatial_shape_constraints() {
         let data = array![[0.0, 0.0], [0.5, 0.2], [1.0, 0.4], [1.5, 0.6],];
         let terms = vec![SmoothTermSpec {
             name: "tps_shape".to_string(),
@@ -1731,10 +2257,94 @@ mod tests {
         let err = build_smooth_design(data.view(), &terms).expect_err("shape should be rejected");
         match err {
             BasisError::InvalidInput(msg) => {
-                assert!(msg.contains("supported only for BSpline1D/TensorBSpline"));
+                assert!(msg.contains("requires exactly 1 feature axis"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_smooth_design_accepts_monotone_thin_plate_1d_with_linear_constraints() {
+        let data = array![[0.0], [0.25], [0.5], [0.75], [1.0]];
+        let terms = vec![SmoothTermSpec {
+            name: "mono_tps".to_string(),
+            basis: SmoothBasisSpec::ThinPlate {
+                feature_cols: vec![0],
+                spec: ThinPlateBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                    double_penalty: false,
+                    identifiability: SpatialIdentifiability::default(),
+                },
+            },
+            shape: ShapeConstraint::MonotoneIncreasing,
+        }];
+        let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained thin-plate");
+        assert!(sd.coefficient_lower_bounds.is_none());
+        let lin = sd
+            .linear_constraints
+            .as_ref()
+            .expect("linear constraints should be generated");
+        assert!(lin.a.nrows() > 0);
+        assert_eq!(lin.a.ncols(), sd.design.ncols());
+        assert_eq!(lin.b.len(), lin.a.nrows());
+    }
+
+    #[test]
+    fn build_smooth_design_accepts_monotone_matern_1d_with_linear_constraints() {
+        let data = array![[0.0], [0.2], [0.4], [0.6], [0.8], [1.0]];
+        let terms = vec![SmoothTermSpec {
+            name: "mono_matern".to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: vec![0],
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                    length_scale: 0.7,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: false,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                },
+            },
+            shape: ShapeConstraint::MonotoneIncreasing,
+        }];
+        let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained Matérn");
+        assert!(sd.coefficient_lower_bounds.is_none());
+        let lin = sd
+            .linear_constraints
+            .as_ref()
+            .expect("linear constraints should be generated");
+        assert!(lin.a.nrows() > 0);
+        assert_eq!(lin.a.ncols(), sd.design.ncols());
+        assert_eq!(lin.b.len(), lin.a.nrows());
+    }
+
+    #[test]
+    fn build_smooth_design_accepts_monotone_duchon_1d_with_linear_constraints() {
+        let data = array![[0.0], [0.2], [0.4], [0.6], [0.8], [1.0]];
+        let terms = vec![SmoothTermSpec {
+            name: "mono_duchon".to_string(),
+            basis: SmoothBasisSpec::Duchon {
+                feature_cols: vec![0],
+                spec: DuchonBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                    length_scale: 0.9,
+                    nu: MaternNu::FiveHalves,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    double_penalty: false,
+                    identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                },
+            },
+            shape: ShapeConstraint::MonotoneIncreasing,
+        }];
+        let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained Duchon");
+        assert!(sd.coefficient_lower_bounds.is_none());
+        let lin = sd
+            .linear_constraints
+            .as_ref()
+            .expect("linear constraints should be generated");
+        assert!(lin.a.nrows() > 0);
+        assert_eq!(lin.a.ncols(), sd.design.ncols());
+        assert_eq!(lin.b.len(), lin.a.nrows());
     }
 
     #[test]
@@ -2300,7 +2910,7 @@ mod tests {
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![],
-            coefficient_lower_bounds: None,
+            linear_constraints: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);

@@ -717,7 +717,7 @@ pub(crate) fn compute_smoothing_correction(
 
     // Step 2: Build V_rho by inverting the LAML Hessian in rho-space.
     // Prefer the exact analytic Hessian; fallback to finite differences.
-    let mut hessian_rho = match reml_state.compute_laml_hessian_exact(&final_rho) {
+    let mut hessian_rho = match reml_state.compute_laml_hessian_exact(final_rho) {
         Ok(h) => h,
         Err(err) => {
             log::warn!(
@@ -1590,13 +1590,7 @@ where
         } else {
             12
         },
-        screening_budget: if k <= 2 {
-            2
-        } else if k <= 6 {
-            2
-        } else {
-            3
-        },
+        screening_budget: if k <= 6 { 2 } else { 3 },
         screen_max_inner_iterations: if matches!(link, LinkFunction::Identity) {
             3
         } else {
@@ -2014,7 +2008,7 @@ where
     let working_response = pirls_res.solve_working_response.clone();
     let reparam_qs = pirls_res.reparam_result.qs.clone();
 
-    let pirls_status = pirls_res.status.clone();
+    let pirls_status = pirls_res.status;
 
     Ok(ExternalOptimResult {
         beta: beta_orig,
@@ -2198,7 +2192,7 @@ where
         let weighted_events = y
             .iter()
             .zip(weights.iter())
-            .map(|(&yy, &ww)| yy.max(0.0).min(1.0) * ww.max(0.0))
+            .map(|(&yy, &ww)| yy.clamp(0.0, 1.0) * ww.max(0.0))
             .sum::<f64>();
         let weighted_total = weights.iter().map(|w| w.max(0.0)).sum::<f64>();
         let weighted_nonevents = (weighted_total - weighted_events).max(0.0);
@@ -4146,10 +4140,8 @@ pub mod internal {
                         }
                     }
                     if worst > 0.0 {
-                        worst_row_msg = format!(
-                            "; worst_row={} worst_violation={:.3e}",
-                            worst_row, worst
-                        );
+                        worst_row_msg =
+                            format!("; worst_row={} worst_violation={:.3e}", worst_row, worst);
                     }
                 }
                 return Err(EstimationError::ParameterConstraintViolation(format!(
@@ -6212,8 +6204,7 @@ pub mod internal {
                             // This removes the per-k O(np) multiply X*v_k from the hot loop.
                             // Section C.1 step (4): r := X^T (w' ⊙ h).
                             let c_times_h = c_vec * &leverage_h_pos;
-                            let r_third =
-                                x_transformed_eval.transpose_vector_multiply(&c_times_h);
+                            let r_third = x_transformed_eval.transpose_vector_multiply(&c_times_h);
 
                             // Batch all v_k = H_+^† (S_k beta) into one BLAS-3 path:
                             //   V = W (W^T [S_1 beta, ..., S_K beta]).
