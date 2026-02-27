@@ -1677,6 +1677,17 @@ fn solve_newton_direction_with_linear_constraints(
 
     let (worst, row) = max_linear_constraint_violation(&x, constraints);
     let kkt = compute_constraint_kkt_diagnostics(&x, &g_cur, constraints);
+    // Degenerate active sets can cycle near machine precision despite being
+    // effectively feasible/stationary. Accept such directions and let the
+    // outer LM loop decide step quality via actual objective reduction.
+    if worst <= 1e-8 && kkt.dual_feasibility <= 1e-8 && kkt.stationarity <= 1e-6 {
+        if let Some(hint) = active_hint {
+            hint.clear();
+            hint.extend(active.iter().copied());
+        }
+        direction_out.assign(&d_total);
+        return Ok(());
+    }
     Err(EstimationError::ParameterConstraintViolation(format!(
         "linear-constrained Newton active-set failed to converge; max(Aβ-b violation)={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
         kkt.primal_feasibility,
