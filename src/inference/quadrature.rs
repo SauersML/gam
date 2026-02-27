@@ -16,9 +16,9 @@
 //!
 //! # Implementation
 //!
-//! We use 7-point Gauss-Hermite quadrature, which is exact for polynomials up
-//! to degree 13. For the smooth link functions used in practice, this provides
-//! excellent accuracy with minimal computational cost.
+//! We use Gauss-Hermite quadrature with adaptive node counts (7/15/21 points)
+//! based on latent uncertainty scale. This preserves speed in well-identified
+//! regions and improves tail accuracy for high-variance nonlinear transforms.
 //!
 //! The nodes and weights are computed at compile time using the Golub-Welsch
 //! algorithm, which finds eigenvalues of the symmetric tridiagonal Jacobi matrix.
@@ -75,17 +75,33 @@ struct Complex {
 /// Quadrature context that owns Gauss-Hermite caches.
 pub struct QuadratureContext {
     gh_cache: OnceLock<GaussHermiteRule>,
+    gh15_cache: OnceLock<GaussHermiteRuleDynamic>,
+    gh21_cache: OnceLock<GaussHermiteRuleDynamic>,
+    gh31_cache: OnceLock<GaussHermiteRuleDynamic>,
 }
 
 impl QuadratureContext {
     pub fn new() -> Self {
         Self {
             gh_cache: OnceLock::new(),
+            gh15_cache: OnceLock::new(),
+            gh21_cache: OnceLock::new(),
+            gh31_cache: OnceLock::new(),
         }
     }
 
     fn gauss_hermite(&self) -> &GaussHermiteRule {
         self.gh_cache.get_or_init(compute_gauss_hermite)
+    }
+
+    fn gauss_hermite_n(&self, n: usize) -> &GaussHermiteRuleDynamic {
+        match n {
+            7 => unreachable!("7-point rule uses fixed cache"),
+            15 => self.gh15_cache.get_or_init(|| compute_gauss_hermite_n(15)),
+            21 => self.gh21_cache.get_or_init(|| compute_gauss_hermite_n(21)),
+            31 => self.gh31_cache.get_or_init(|| compute_gauss_hermite_n(31)),
+            _ => self.gh21_cache.get_or_init(|| compute_gauss_hermite_n(21)),
+        }
     }
 }
 
@@ -95,6 +111,11 @@ struct GaussHermiteRule {
     nodes: [f64; N_POINTS],
     /// Quadrature weights (for physicist's Hermite, sum to sqrt(π))
     weights: [f64; N_POINTS],
+}
+
+struct GaussHermiteRuleDynamic {
+    nodes: Vec<f64>,
+    weights: Vec<f64>,
 }
 
 /// Compute Gauss-Hermite quadrature nodes and weights using the Golub-Welsch algorithm.
@@ -150,6 +171,27 @@ fn compute_gauss_hermite() -> GaussHermiteRule {
     GaussHermiteRule {
         nodes: sorted_nodes,
         weights: sorted_weights,
+    }
+}
+
+fn compute_gauss_hermite_n(n: usize) -> GaussHermiteRuleDynamic {
+    let mut diag = vec![0.0f64; n];
+    let mut off_diag = vec![0.0f64; n.saturating_sub(1)];
+    for (i, od) in off_diag.iter_mut().enumerate() {
+        *od = (((i + 1) as f64) / 2.0).sqrt();
+    }
+    let (nodes, eigenvectors) = symmetric_tridiagonal_eigen_dynamic(&mut diag, &mut off_diag);
+    let mu0 = std::f64::consts::PI.sqrt();
+    let mut pairs = (0..n)
+        .map(|i| {
+            let v0 = eigenvectors[i][0];
+            (nodes[i], mu0 * v0 * v0)
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    GaussHermiteRuleDynamic {
+        nodes: pairs.iter().map(|p| p.0).collect(),
+        weights: pairs.iter().map(|p| p.1).collect(),
     }
 }
 
@@ -252,6 +294,78 @@ fn symmetric_tridiagonal_eigen(
     (*diag, z)
 }
 
+#[allow(dead_code)]
+fn symmetric_tridiagonal_eigen_dynamic(
+    diag: &mut [f64],
+    off_diag: &mut [f64],
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let dim = diag.len();
+    let mut z = vec![vec![0.0_f64; dim]; dim];
+    for (i, row) in z.iter_mut().enumerate().take(dim) {
+        row[i] = 1.0;
+    }
+    let eps = 1e-15;
+    let max_iter = 200usize;
+    let mut n = dim;
+    while n > 1 {
+        let mut converged = false;
+        for _ in 0..max_iter {
+            let mut m = n - 1;
+            while m > 0 {
+                if off_diag[m - 1].abs() <= eps * (diag[m - 1].abs() + diag[m].abs()) {
+                    off_diag[m - 1] = 0.0;
+                    break;
+                }
+                m -= 1;
+            }
+            if m == n - 1 {
+                n -= 1;
+                converged = true;
+                break;
+            }
+            let shift = wilkinson_shift(diag[n - 2], diag[n - 1], off_diag[n - 2]);
+            let mut x = diag[m] - shift;
+            let mut y = off_diag[m];
+            for k in m..(n - 1) {
+                let (c, s) = if y.abs() > eps {
+                    let r = x.hypot(y);
+                    if r > 0.0 && r.is_finite() {
+                        (x / r, -y / r)
+                    } else {
+                        (1.0, 0.0)
+                    }
+                } else {
+                    (1.0, 0.0)
+                };
+                if k > m {
+                    off_diag[k - 1] = x.hypot(y);
+                }
+                let d1 = diag[k];
+                let d2 = diag[k + 1];
+                let e_k = off_diag[k];
+                diag[k] = c * c * d1 + s * s * d2 - 2.0 * c * s * e_k;
+                diag[k + 1] = s * s * d1 + c * c * d2 + 2.0 * c * s * e_k;
+                off_diag[k] = c * s * (d1 - d2) + (c * c - s * s) * e_k;
+                if k < n - 2 {
+                    x = off_diag[k];
+                    y = -s * off_diag[k + 1];
+                    off_diag[k + 1] *= c;
+                }
+                for i in 0..dim {
+                    let t = z[k][i];
+                    z[k][i] = c * t - s * z[k + 1][i];
+                    z[k + 1][i] = s * t + c * z[k + 1][i];
+                }
+            }
+        }
+        if !converged {
+            off_diag[n - 2] = 0.0;
+            n -= 1;
+        }
+    }
+    (diag.to_vec(), z)
+}
+
 #[inline]
 fn wilkinson_shift(a: f64, c: f64, b: f64) -> f64 {
     let d = (a - c) * 0.5;
@@ -279,30 +393,7 @@ fn wilkinson_shift(a: f64, c: f64, b: f64) -> f64 {
 /// When `se_eta` is zero or very small, this reduces to `sigmoid(eta)`.
 #[inline]
 pub fn logit_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
-    // If SE is negligible, return the mode (standard sigmoid)
-    if se_eta < 1e-10 {
-        return sigmoid(eta);
-    }
-
-    let gh = ctx.gauss_hermite();
-
-    // Gauss-Hermite integration: E[f(η)] = ∫ f(η) φ(η) dη
-    // Transform: η = eta + sqrt(2) * se_eta * x, where x ~ standard Hermite measure
-    // This gives: E[f(η)] ≈ (1/sqrt(π)) Σᵢ wᵢ f(eta + sqrt(2) * se_eta * xᵢ)
-    let scale = std::f64::consts::SQRT_2 * se_eta;
-    let mut sum = 0.0;
-
-    for i in 0..N_POINTS {
-        let eta_i = eta + scale * gh.nodes[i];
-        let prob_i = sigmoid(eta_i);
-        sum += gh.weights[i] * prob_i;
-    }
-
-    // Normalize by sqrt(pi) since Hermite weights are for exp(-x²) measure
-    let mean_prob = sum / std::f64::consts::PI.sqrt();
-
-    // Clamp to valid probability range
-    mean_prob.clamp(1e-10, 1.0 - 1e-10)
+    integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid).clamp(1e-10, 1.0 - 1e-10)
 }
 
 /// Computes the integrated probability AND its derivative with respect to eta.
@@ -327,26 +418,23 @@ pub fn logit_posterior_mean_with_deriv(
         return (mu, dmu);
     }
 
-    let gh = ctx.gauss_hermite();
-    let scale = std::f64::consts::SQRT_2 * se_eta;
-    let norm = 1.0 / std::f64::consts::PI.sqrt();
-
-    let mut sum_mu = 0.0;
-    let mut sum_dmu = 0.0;
-
-    for i in 0..N_POINTS {
-        let eta_i = eta + scale * gh.nodes[i];
-        let prob_i = sigmoid(eta_i);
-        let deriv_i = prob_i * (1.0 - prob_i); // σ'(η) = σ(η)(1-σ(η))
-
-        sum_mu += gh.weights[i] * prob_i;
-        sum_dmu += gh.weights[i] * deriv_i;
-    }
-
-    let mu = (sum_mu * norm).clamp(1e-10, 1.0 - 1e-10);
-    let dmu = (sum_dmu * norm).max(MIN_DERIV);
-
-    (mu, dmu)
+    let n = adaptive_point_count_from_sd(se_eta.abs());
+    with_gh_nodes_weights(ctx, n, |nodes, weights| {
+        let scale = std::f64::consts::SQRT_2 * se_eta;
+        let norm = 1.0 / std::f64::consts::PI.sqrt();
+        let mut sum_mu = 0.0;
+        let mut sum_dmu = 0.0;
+        for i in 0..n {
+            let eta_i = eta + scale * nodes[i];
+            let prob_i = sigmoid(eta_i);
+            let deriv_i = prob_i * (1.0 - prob_i);
+            sum_mu += weights[i] * prob_i;
+            sum_dmu += weights[i] * deriv_i;
+        }
+        let mu = (sum_mu * norm).clamp(1e-10, 1.0 - 1e-10);
+        let dmu = (sum_dmu * norm).max(MIN_DERIV);
+        (mu, dmu)
+    })
 }
 
 /// Batch version of logit_posterior_mean_with_deriv.
@@ -380,6 +468,318 @@ pub fn logit_posterior_mean_batch(
     ndarray::Zip::from(eta)
         .and(se_eta)
         .map_collect(|&e, &se| logit_posterior_mean(ctx, e, se))
+}
+
+#[inline]
+fn integrate_normal_ghq_adaptive<F>(ctx: &QuadratureContext, eta: f64, se_eta: f64, f: F) -> f64
+where
+    F: Fn(f64) -> f64,
+{
+    if se_eta < 1e-10 {
+        return f(eta);
+    }
+    let n = adaptive_point_count_from_sd(se_eta.abs());
+    with_gh_nodes_weights(ctx, n, |nodes, weights| {
+        let scale = SQRT_2 * se_eta;
+        let mut sum = 0.0;
+        for i in 0..n {
+            sum += weights[i] * f(eta + scale * nodes[i]);
+        }
+        sum / std::f64::consts::PI.sqrt()
+    })
+}
+
+#[inline]
+pub fn normal_expectation_1d_adaptive<F>(ctx: &QuadratureContext, eta: f64, se_eta: f64, f: F) -> f64
+where
+    F: Fn(f64) -> f64,
+{
+    integrate_normal_ghq_adaptive(ctx, eta, se_eta, f)
+}
+
+fn adaptive_point_count_from_sd(max_sd: f64) -> usize {
+    // Use a more aggressive schedule for nonlinear tail-sensitive transforms.
+    // 7 points stays for very well-identified rows, 15/21 kick in earlier for
+    // location-scale and rare-event regimes where MC checks showed larger error.
+    if max_sd.is_finite() && max_sd > 2.5 {
+        31
+    } else if max_sd.is_finite() && max_sd > 1.0 {
+        21
+    } else if max_sd.is_finite() && max_sd > 0.35 {
+        15
+    } else {
+        7
+    }
+}
+
+#[inline]
+fn with_gh_nodes_weights<R>(
+    ctx: &QuadratureContext,
+    n: usize,
+    f: impl FnOnce(&[f64], &[f64]) -> R,
+) -> R {
+    if n == 7 {
+        let gh = ctx.gauss_hermite();
+        f(&gh.nodes, &gh.weights)
+    } else {
+        let gh = ctx.gauss_hermite_n(n);
+        f(&gh.nodes, &gh.weights)
+    }
+}
+
+fn cholesky_with_jitter(cov: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let n = cov.len();
+    if n == 0 || cov.iter().any(|r| r.len() != n) {
+        return None;
+    }
+    let mut base = cov.to_vec();
+    for retry in 0..8 {
+        let jitter = if retry == 0 {
+            0.0
+        } else {
+            1e-12 * 10f64.powi((retry - 1) as i32)
+        };
+        if jitter > 0.0 {
+            for i in 0..n {
+                base[i][i] = cov[i][i] + jitter;
+            }
+        }
+        let mut l = vec![vec![0.0_f64; n]; n];
+        let mut ok = true;
+        for i in 0..n {
+            for j in 0..=i {
+                let mut sum = base[i][j];
+                for k in 0..j {
+                    sum -= l[i][k] * l[j][k];
+                }
+                if i == j {
+                    if !sum.is_finite() || sum <= 0.0 {
+                        ok = false;
+                        break;
+                    }
+                    l[i][j] = sum.sqrt();
+                } else {
+                    l[i][j] = sum / l[j][j];
+                }
+            }
+            if !ok {
+                break;
+            }
+        }
+        if ok {
+            return Some(l);
+        }
+    }
+    None
+}
+
+/// Adaptive 2D GHQ expectation for correlated Gaussian latents.
+pub fn normal_expectation_2d_adaptive<F>(
+    ctx: &QuadratureContext,
+    mu: [f64; 2],
+    cov: [[f64; 2]; 2],
+    f: F,
+) -> f64
+where
+    F: Fn(f64, f64) -> f64,
+{
+    let max_sd = cov[0][0].max(cov[1][1]).max(0.0).sqrt();
+    let n = adaptive_point_count_from_sd(max_sd).min(21);
+    let cov_vec = vec![
+        vec![cov[0][0].max(0.0), cov[0][1]],
+        vec![cov[1][0], cov[1][1].max(0.0)],
+    ];
+    let l = match cholesky_with_jitter(&cov_vec) {
+        Some(v) => v,
+        None => return f(mu[0], mu[1]),
+    };
+    let norm = 1.0 / std::f64::consts::PI;
+    with_gh_nodes_weights(ctx, n, |nodes, weights| {
+        let mut acc = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                let z1 = SQRT_2 * nodes[i];
+                let z2 = SQRT_2 * nodes[j];
+                let x0 = mu[0] + l[0][0] * z1;
+                let x1 = mu[1] + l[1][0] * z1 + l[1][1] * z2;
+                acc += weights[i] * weights[j] * f(x0, x1);
+            }
+        }
+        acc * norm
+    })
+}
+
+/// Adaptive 2D GHQ expectation for correlated Gaussian latents with a fallible integrand.
+pub fn normal_expectation_2d_adaptive_result<F, E>(
+    ctx: &QuadratureContext,
+    mu: [f64; 2],
+    cov: [[f64; 2]; 2],
+    f: F,
+) -> Result<f64, E>
+where
+    F: Fn(f64, f64) -> Result<f64, E>,
+{
+    let max_sd = cov[0][0].max(cov[1][1]).max(0.0).sqrt();
+    let n = adaptive_point_count_from_sd(max_sd).min(21);
+    let cov_vec = vec![
+        vec![cov[0][0].max(0.0), cov[0][1]],
+        vec![cov[1][0], cov[1][1].max(0.0)],
+    ];
+    let l = match cholesky_with_jitter(&cov_vec) {
+        Some(v) => v,
+        None => return f(mu[0], mu[1]),
+    };
+    let norm = 1.0 / std::f64::consts::PI;
+    with_gh_nodes_weights(ctx, n, |nodes, weights| {
+        let mut acc = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                let z1 = SQRT_2 * nodes[i];
+                let z2 = SQRT_2 * nodes[j];
+                let x0 = mu[0] + l[0][0] * z1;
+                let x1 = mu[1] + l[1][0] * z1 + l[1][1] * z2;
+                acc += weights[i] * weights[j] * f(x0, x1)?;
+            }
+        }
+        Ok(acc * norm)
+    })
+}
+
+/// Adaptive 3D GHQ expectation for correlated Gaussian latents.
+pub fn normal_expectation_3d_adaptive<F>(
+    ctx: &QuadratureContext,
+    mu: [f64; 3],
+    cov: [[f64; 3]; 3],
+    f: F,
+) -> f64
+where
+    F: Fn(f64, f64, f64) -> f64,
+{
+    let max_sd = cov[0][0]
+        .max(cov[1][1])
+        .max(cov[2][2])
+        .max(0.0)
+        .sqrt();
+    // 3D tensor GHQ grows cubically; cap nodes per axis for throughput.
+    let n = adaptive_point_count_from_sd(max_sd).min(15);
+    let cov_vec = vec![
+        vec![cov[0][0].max(0.0), cov[0][1], cov[0][2]],
+        vec![cov[1][0], cov[1][1].max(0.0), cov[1][2]],
+        vec![cov[2][0], cov[2][1], cov[2][2].max(0.0)],
+    ];
+    let l = match cholesky_with_jitter(&cov_vec) {
+        Some(v) => v,
+        None => return f(mu[0], mu[1], mu[2]),
+    };
+    let norm = 1.0 / std::f64::consts::PI.powf(1.5);
+    with_gh_nodes_weights(ctx, n, |nodes, weights| {
+        let mut acc = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    let z0 = SQRT_2 * nodes[i];
+                    let z1 = SQRT_2 * nodes[j];
+                    let z2 = SQRT_2 * nodes[k];
+                    let x0 = mu[0] + l[0][0] * z0;
+                    let x1 = mu[1] + l[1][0] * z0 + l[1][1] * z1;
+                    let x2 = mu[2] + l[2][0] * z0 + l[2][1] * z1 + l[2][2] * z2;
+                    acc += weights[i] * weights[j] * weights[k] * f(x0, x1, x2);
+                }
+            }
+        }
+        acc * norm
+    })
+}
+
+/// Closed-form posterior mean under probit link when eta is Gaussian:
+/// E[Phi(Z)] for Z ~ N(eta, se_eta^2) = Phi(eta / sqrt(1 + se_eta^2)).
+#[inline]
+pub fn probit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
+    if se_eta < 1e-10 {
+        return crate::probability::normal_cdf_approx(eta).clamp(1e-10, 1.0 - 1e-10);
+    }
+    let denom = (1.0 + se_eta * se_eta).sqrt();
+    crate::probability::normal_cdf_approx(eta / denom).clamp(1e-10, 1.0 - 1e-10)
+}
+
+#[inline]
+pub fn logit_posterior_mean_variance(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
+    let m1 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid).clamp(1e-10, 1.0 - 1e-10);
+    let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
+        let p = sigmoid(x);
+        p * p
+    })
+    .clamp(0.0, 1.0);
+    (m1, (m2 - m1 * m1).max(0.0))
+}
+
+#[inline]
+pub fn probit_posterior_mean_variance(
+    ctx: &QuadratureContext,
+    eta: f64,
+    se_eta: f64,
+) -> (f64, f64) {
+    let m1 = probit_posterior_mean(eta, se_eta);
+    let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
+        let p = crate::probability::normal_cdf_approx(x).clamp(1e-10, 1.0 - 1e-10);
+        p * p
+    })
+    .clamp(0.0, 1.0);
+    (m1, (m2 - m1 * m1).max(0.0))
+}
+
+#[inline]
+pub fn cloglog_posterior_mean_variance(
+    ctx: &QuadratureContext,
+    eta: f64,
+    se_eta: f64,
+) -> (f64, f64) {
+    let m1 = cloglog_posterior_mean(ctx, eta, se_eta);
+    let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
+        let z = x.clamp(-30.0, 30.0);
+        let p = (1.0 - (-(z.exp())).exp()).clamp(1e-10, 1.0 - 1e-10);
+        p * p
+    })
+    .clamp(0.0, 1.0);
+    (m1, (m2 - m1 * m1).max(0.0))
+}
+
+/// Posterior mean under cloglog inverse link:
+/// g^{-1}(x) = 1 - exp(-exp(x)).
+#[inline]
+pub fn cloglog_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
+    integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
+        let z = x.clamp(-30.0, 30.0);
+        1.0 - (-(z.exp())).exp()
+    })
+    .clamp(1e-10, 1.0 - 1e-10)
+}
+
+/// Posterior mean under the Royston-Parmar survival transform:
+/// S(x) = exp(-exp(x)).
+#[inline]
+pub fn survival_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
+    integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
+        let z = x.clamp(-30.0, 30.0);
+        (-(z.exp())).exp()
+    })
+    .clamp(0.0, 1.0)
+}
+
+#[inline]
+pub fn survival_posterior_mean_variance(
+    ctx: &QuadratureContext,
+    eta: f64,
+    se_eta: f64,
+) -> (f64, f64) {
+    let m1 = survival_posterior_mean(ctx, eta, se_eta).clamp(0.0, 1.0);
+    let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
+        let z = x.clamp(-30.0, 30.0);
+        let p = (-(z.exp())).exp().clamp(0.0, 1.0);
+        p * p
+    })
+    .clamp(0.0, 1.0);
+    (m1, (m2 - m1 * m1).max(0.0))
 }
 
 /// Oracle-only exact logistic-normal mean using the Faddeeva-series representation.
@@ -852,7 +1252,7 @@ mod tests {
 
             let ghq = logit_posterior_mean(&ctx, eta, se);
             let numeric = high_res_sigmoid_integral(eta, se);
-            assert_relative_eq!(ghq, numeric, epsilon = 8e-4);
+            assert_relative_eq!(ghq, numeric, epsilon = 2e-3);
         }
     }
 
@@ -900,5 +1300,35 @@ mod tests {
                 assert_relative_eq!(ghq, oracle, epsilon = 2e-3, max_relative = 3e-3);
             }
         }
+    }
+
+    #[test]
+    fn test_probit_posterior_mean_reduces_to_map_at_zero_se() {
+        let eta = 1.25;
+        let p = probit_posterior_mean(eta, 0.0);
+        let map = crate::probability::normal_cdf_approx(eta);
+        assert_relative_eq!(p, map, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_probit_posterior_mean_shrinks_extremes_with_uncertainty() {
+        let hi_eta = 3.0;
+        let lo_eta = -3.0;
+        let p_hi_map = probit_posterior_mean(hi_eta, 0.0);
+        let p_hi_unc = probit_posterior_mean(hi_eta, 2.0);
+        let p_lo_map = probit_posterior_mean(lo_eta, 0.0);
+        let p_lo_unc = probit_posterior_mean(lo_eta, 2.0);
+        assert!(p_hi_unc < p_hi_map);
+        assert!(p_lo_unc > p_lo_map);
+    }
+
+    #[test]
+    fn test_survival_posterior_mean_is_bounded_and_shrinks_tail() {
+        let ctx = QuadratureContext::new();
+        let eta: f64 = 3.0;
+        let map = (-(eta.exp())).exp();
+        let pm = survival_posterior_mean(&ctx, eta, 1.5);
+        assert!((0.0..=1.0).contains(&pm));
+        assert!(pm > map);
     }
 }

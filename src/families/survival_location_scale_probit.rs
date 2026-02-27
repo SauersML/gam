@@ -4,6 +4,7 @@ use crate::custom_family::{
 };
 use crate::faer_ndarray::FaerSvd;
 use crate::matrix::DesignMatrix;
+use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use ndarray::{Array1, Array2, s};
 
@@ -146,6 +147,7 @@ pub struct SurvivalLocationScaleProbitFitResult {
     pub penalized_objective: f64,
     pub iterations: usize,
     pub converged: bool,
+    pub covariance_conditional: Option<Array2<f64>>,
 }
 
 #[derive(Clone)]
@@ -165,15 +167,6 @@ pub struct SurvivalLocationScaleProbitPredictResult {
     pub survival_prob: Array1<f64>,
 }
 
-#[derive(Clone)]
-struct GuardedDerivative {
-    safe: Array1<f64>,
-    d1: Array1<f64>,
-    d2: Array1<f64>,
-    d3: Array1<f64>,
-}
-
-#[derive(Clone)]
 struct SurvivalLocationScaleProbitFamily {
     n: usize,
     y: Array1<f64>,
@@ -182,10 +175,10 @@ struct SurvivalLocationScaleProbitFamily {
     sigma_max: f64,
     distribution: ResidualDistribution,
     derivative_guard: f64,
-    derivative_softness: f64,
     x_time_entry: Array2<f64>,
     x_time_exit: Array2<f64>,
     x_time_deriv: Array2<f64>,
+    offset_time_deriv: Array1<f64>,
     x_threshold: Array2<f64>,
     x_log_sigma: Array2<f64>,
 }
@@ -456,44 +449,6 @@ fn safe_sigma_from_eta(
     (sigma, ds, d2s)
 }
 
-fn guarded_derivative(raw: &Array1<f64>, guard: f64, tau: f64) -> GuardedDerivative {
-    let g = guard.max(1e-12);
-    let t = tau.max(1e-9);
-    let mut safe = Array1::<f64>::zeros(raw.len());
-    let mut d1 = Array1::<f64>::zeros(raw.len());
-    let mut d2 = Array1::<f64>::zeros(raw.len());
-    let mut d3 = Array1::<f64>::zeros(raw.len());
-    for i in 0..raw.len() {
-        let z = (raw[i] - g) / t;
-        if z >= 30.0 {
-            safe[i] = raw[i];
-            d1[i] = 1.0;
-            d2[i] = 0.0;
-            d3[i] = 0.0;
-            continue;
-        }
-        if z <= -30.0 {
-            let ez = z.exp();
-            safe[i] = g + t * ez;
-            d1[i] = ez;
-            d2[i] = ez / t;
-            d3[i] = ez / (t * t);
-            continue;
-        }
-        let softplus = if z > 0.0 {
-            z + (-z).exp().ln_1p()
-        } else {
-            z.exp().ln_1p()
-        };
-        let sig = 1.0 / (1.0 + (-z).exp());
-        safe[i] = g + t * softplus;
-        d1[i] = sig;
-        d2[i] = sig * (1.0 - sig) / t;
-        d3[i] = sig * (1.0 - sig) * (1.0 - 2.0 * sig) / (t * t);
-    }
-    GuardedDerivative { safe, d1, d2, d3 }
-}
-
 fn xt_diag_x(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
     let n = x.nrows();
     let p = x.ncols();
@@ -532,7 +487,6 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
         let h0 = eta_time.slice(s![0..n]).to_owned();
         let h1 = eta_time.slice(s![n..2 * n]).to_owned();
         let d_raw = eta_time.slice(s![2 * n..3 * n]).to_owned();
-        let d_guard = guarded_derivative(&d_raw, self.derivative_guard, self.derivative_softness);
 
         let (sigma, ds, d2s) = safe_sigma_from_eta(eta_ls, self.sigma_min, self.sigma_max);
         let q = Array1::from_iter(
@@ -566,7 +520,13 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             let phi1 = self.distribution.pdf(u1).max(MIN_PROB);
             let s0 = (1.0 - self.distribution.cdf(u0)).clamp(MIN_PROB, 1.0);
             let s1 = (1.0 - self.distribution.cdf(u1)).clamp(MIN_PROB, 1.0);
-            let g = d_guard.safe[i].max(MIN_PROB);
+            let g = d_raw[i];
+            if !g.is_finite() || g <= self.derivative_guard.max(1e-12) {
+                return Err(format!(
+                    "survival probit-location-scale monotonicity violated at row {i}: d_eta/dt={g:.3e} <= guard={:.3e}",
+                    self.derivative_guard.max(1e-12)
+                ));
+            }
 
             ll += w * (d * (phi1.ln() + g.ln()) + (1.0 - d) * s1.ln() - s0.ln());
 
@@ -582,12 +542,11 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             // time block eta-derivatives
             grad_time_eta_h0[i] = -w * r0;
             grad_time_eta_h1[i] = -w * (d * (-u1) + (1.0 - d) * (-r1));
-            grad_time_eta_d[i] = w * d * d_guard.d1[i] / g;
+            grad_time_eta_d[i] = w * d / g;
 
             h_time_h0[i] = -w * dr0;
             h_time_h1[i] = -w * (d * (-1.0) + (1.0 - d) * (-dr1));
-            h_time_d[i] =
-                -w * d * ((d_guard.d2[i] / g) - (d_guard.d1[i] * d_guard.d1[i]) / (g * g));
+            h_time_d[i] = w * d / (g * g);
         }
 
         // Block 0: exact beta-space gradient/Hessian
@@ -670,7 +629,6 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
         let h0 = eta_time.slice(s![0..n]).to_owned();
         let h1 = eta_time.slice(s![n..2 * n]).to_owned();
         let d_raw = eta_time.slice(s![2 * n..3 * n]).to_owned();
-        let d_guard = guarded_derivative(&d_raw, self.derivative_guard, self.derivative_softness);
 
         let (sigma, ds, d2s) = safe_sigma_from_eta(eta_ls, self.sigma_min, self.sigma_max);
         let q = Array1::from_iter(
@@ -724,12 +682,14 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             // while derivative row uses log(d_safe) term only for events.
             d_h_h0[i] = w * ddr0;
             d_h_h1[i] = -w * (1.0 - d) * ddr1;
-            let g = d_guard.safe[i].max(MIN_PROB);
-            let a = d_guard.d1[i];
-            let b = d_guard.d2[i];
-            let c = d_guard.d3[i];
-            let de = c / g - 3.0 * a * b / (g * g) + 2.0 * a * a * a / (g * g * g);
-            d_h_d[i] = -w * d * de;
+            let g = d_raw[i];
+            if !g.is_finite() || g <= self.derivative_guard.max(1e-12) {
+                return Err(format!(
+                    "survival probit-location-scale monotonicity violated in Hessian directional derivative at row {i}: d_eta/dt={g:.3e} <= guard={:.3e}",
+                    self.derivative_guard.max(1e-12)
+                ));
+            }
+            d_h_d[i] = -2.0 * w * d / (g * g * g);
         }
 
         match block_idx {
@@ -829,6 +789,36 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             }
             _ => Ok(None),
         }
+    }
+
+    fn block_linear_constraints(
+        &self,
+        _block_states: &[ParameterBlockState],
+        block_idx: usize,
+        _spec: &ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        if block_idx != Self::BLOCK_TIME {
+            return Ok(None);
+        }
+        let n = self.x_time_deriv.nrows();
+        let p = self.x_time_deriv.ncols();
+        if self.offset_time_deriv.len() != n {
+            return Err(format!(
+                "time derivative offset length mismatch: got {}, expected {n}",
+                self.offset_time_deriv.len()
+            ));
+        }
+        if n == 0 || p == 0 {
+            return Ok(None);
+        }
+        let mut a = Array2::<f64>::zeros((n, p));
+        a.assign(&self.x_time_deriv);
+        let mut b = Array1::<f64>::zeros(n);
+        let guard = self.derivative_guard.max(1e-12);
+        for i in 0..n {
+            b[i] = guard - self.offset_time_deriv[i];
+        }
+        Ok(Some(LinearInequalityConstraints { a, b }))
     }
 }
 
@@ -956,10 +946,10 @@ pub fn fit_survival_location_scale_probit(
         sigma_max: spec.sigma_max,
         distribution: spec.distribution,
         derivative_guard: spec.derivative_guard,
-        derivative_softness: spec.derivative_softness,
         x_time_entry: time_prepared.design_entry,
         x_time_exit: time_prepared.design_exit,
         x_time_deriv: time_prepared.design_derivative_exit,
+        offset_time_deriv: spec.time_block.derivative_offset_exit.clone(),
         x_threshold,
         x_log_sigma,
     };
@@ -991,15 +981,41 @@ pub fn fit_survival_location_scale_probit(
         .beta
         .clone();
     let beta_time = time_prepared.transform.z.dot(&beta_time_reduced);
+    let beta_threshold = fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
+        .beta
+        .clone();
+    let beta_log_sigma = fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_LOG_SIGMA]
+        .beta
+        .clone();
+
+    let covariance_conditional = fit.covariance_conditional.as_ref().map(|cov_reduced| {
+        let z = &time_prepared.transform.z;
+        let p_time_reduced = beta_time_reduced.len();
+        let p_time = beta_time.len();
+        let p_t = beta_threshold.len();
+        let p_ls = beta_log_sigma.len();
+        let p_reduced = p_time_reduced + p_t + p_ls;
+        let p_full = p_time + p_t + p_ls;
+        if cov_reduced.nrows() != p_reduced || cov_reduced.ncols() != p_reduced {
+            return cov_reduced.clone();
+        }
+        // Lift reduced-basis covariance into full time basis while preserving
+        // all cross-block covariance terms.
+        let mut t_map = Array2::<f64>::zeros((p_full, p_reduced));
+        t_map.slice_mut(s![0..p_time, 0..p_time_reduced]).assign(z);
+        for j in 0..p_t {
+            t_map[[p_time + j, p_time_reduced + j]] = 1.0;
+        }
+        for j in 0..p_ls {
+            t_map[[p_time + p_t + j, p_time_reduced + p_t + j]] = 1.0;
+        }
+        t_map.dot(cov_reduced).dot(&t_map.t())
+    });
 
     Ok(SurvivalLocationScaleProbitFitResult {
         beta_time,
-        beta_threshold: fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
-            .beta
-            .clone(),
-        beta_log_sigma: fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_LOG_SIGMA]
-            .beta
-            .clone(),
+        beta_threshold,
+        beta_log_sigma,
         lambdas_time,
         lambdas_threshold,
         lambdas_log_sigma,
@@ -1007,6 +1023,7 @@ pub fn fit_survival_location_scale_probit(
         penalized_objective: fit.penalized_objective,
         iterations: fit.inner_cycles,
         converged: fit.converged,
+        covariance_conditional,
     })
 }
 

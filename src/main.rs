@@ -10,11 +10,12 @@ use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy,
     DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu,
-    ThinPlateBasisSpec, build_bspline_basis_1d, evaluate_bspline_derivative_scalar,
+    SpatialIdentifiability, ThinPlateBasisSpec, build_bspline_basis_1d,
+    evaluate_bspline_derivative_scalar,
 };
 use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, fit_gam,
-    optimize_external_design, predict_gam,
+    optimize_external_design, predict_gam, predict_gam_posterior_mean,
 };
 use gam::gamlss::{
     BinomialLocationScaleProbitTermSpec, BinomialLocationScaleProbitWiggleTermSpec,
@@ -37,7 +38,8 @@ use gam::smooth::{
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale_probit::{
-    CovariateBlockInput, ResidualDistribution, SurvivalLocationScaleProbitPredictInput,
+    CovariateBlockInput, ResidualDistribution, ResidualDistributionOps,
+    SurvivalLocationScaleProbitPredictInput,
     SurvivalLocationScaleProbitSpec, TimeBlockInput, fit_survival_location_scale_probit,
     predict_survival_location_scale_probit,
 };
@@ -103,7 +105,6 @@ struct FitArgs {
     /// - `slope`: penalize first differences
     /// - `curvature` (default): penalize second differences
     /// - `curvature-change`: penalize third differences
-    /// Numeric aliases are also accepted for compatibility: `1|2|3`.
     #[arg(long = "link-wiggle-penalty-order", value_enum, default_value_t = LinkWigglePenaltyMode::Curvature)]
     link_wiggle_penalty_order: LinkWigglePenaltyMode,
     /// Add a ridge-style double-penalty to the probit link wiggle block.
@@ -125,6 +126,8 @@ struct PredictArgs {
     level: f64,
     #[arg(long = "covariance-mode", value_enum, default_value_t = CovarianceModeArg::Corrected)]
     covariance_mode: CovarianceModeArg,
+    #[arg(long = "mode", value_enum, default_value_t = PredictModeArg::PosteriorMean)]
+    mode: PredictModeArg,
 }
 
 #[derive(Args, Debug)]
@@ -232,13 +235,17 @@ enum CovarianceModeArg {
     Corrected,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
+enum PredictModeArg {
+    PosteriorMean,
+    Map,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum LinkWigglePenaltyMode {
-    #[value(alias = "1")]
     Slope,
-    #[value(alias = "2")]
     Curvature,
-    #[value(name = "curvature-change", alias = "3")]
+    #[value(name = "curvature-change")]
     CurvatureChange,
 }
 
@@ -511,6 +518,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             );
 
             if let Some(out) = args.out {
+                let cov_flat = fit.covariance_conditional.as_ref();
                 let model = build_location_scale_saved_model(
                     formula_text.clone(),
                     FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
@@ -527,6 +535,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     sigma_min,
                     sigma_max,
                     fit.lambdas.to_vec(),
+                    cov_flat.map(array2_to_nested_vec),
+                    cov_flat.map(array2_to_nested_vec),
                 );
                 write_model_json(&out, &model)?;
             }
@@ -642,6 +652,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         );
 
         if let Some(out) = args.out {
+            let cov_flat = fit.covariance_conditional.as_ref();
             let mut model = build_location_scale_saved_model(
                 formula_text,
                 FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT.to_string(),
@@ -658,6 +669,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 sigma_min,
                 sigma_max,
                 fit.lambdas.to_vec(),
+                cov_flat.map(array2_to_nested_vec),
+                cov_flat.map(array2_to_nested_vec),
             );
             if let Some((knots, degree, beta_wiggle)) = wiggle_meta {
                 model.probit_wiggle_knots = Some(knots.to_vec());
@@ -801,12 +814,15 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 max_iter: fit_max_iter,
                 tol: fit_tol,
                 nullspace_dims: design.nullspace_dims.clone(),
+                linear_constraints: design.linear_constraints.clone(),
                 firth_bias_reduction: Some(true),
             },
         )
         .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;
         (fit_result_from_external(ext), design, spec.clone())
     } else {
+        let bootstrap_design = build_term_collection_design(ds.values.view(), &spec)
+            .map_err(|e| format!("failed to build term collection design: {e}"))?;
         let fitted = fit_term_collection_with_matern_kappa_optimization(
             ds.values.view(),
             y.clone(),
@@ -818,6 +834,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 max_iter: fit_max_iter,
                 tol: fit_tol,
                 nullspace_dims: vec![],
+                linear_constraints: bootstrap_design.linear_constraints.clone(),
             },
             &MaternKappaOptimizationOptions::default(),
         )
@@ -950,12 +967,6 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 .unwrap_or("transformation"),
         )?;
         if saved_likelihood_mode == SurvivalLikelihoodMode::ProbitLocationScale {
-            if args.uncertainty {
-                return Err(
-                    "--uncertainty is not implemented for survival-likelihood=probit-location-scale"
-                        .to_string(),
-                );
-            }
             let beta_time =
                 Array1::from_vec(model.survival_beta_time.clone().ok_or_else(|| {
                     "saved probit-location-scale model missing survival_beta_time".to_string()
@@ -974,22 +985,27 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 let (eta0, _) = evaluate_survival_baseline(age_exit[i], &baseline_cfg)?;
                 eta_offset_exit[i] = eta0;
             }
+            let distribution =
+                parse_survival_distribution(model.survival_distribution.as_deref().unwrap_or("gaussian"))?;
+            let sigma_min = model.survival_sigma_min.unwrap_or(0.05);
+            let sigma_max = model.survival_sigma_max.unwrap_or(20.0);
+            let eta_t = DesignMatrix::Dense(cov_design.design.clone()).matrix_vector_multiply(&beta_threshold);
+            let eta_ls = DesignMatrix::Dense(cov_design.design.clone()).matrix_vector_multiply(&beta_log_sigma);
+            let (sigma, ds) = sigma_and_deriv_from_eta(eta_ls.view(), sigma_min, sigma_max);
             let pred = predict_survival_location_scale_probit(
                 &SurvivalLocationScaleProbitPredictInput {
                     x_time_exit: time_build.x_exit_time.clone(),
-                    eta_time_offset_exit: eta_offset_exit,
+                    eta_time_offset_exit: eta_offset_exit.clone(),
                     x_threshold: DesignMatrix::Dense(cov_design.design.clone()),
                     x_log_sigma: DesignMatrix::Dense(cov_design.design.clone()),
-                    sigma_min: model.survival_sigma_min.unwrap_or(0.05),
-                    sigma_max: model.survival_sigma_max.unwrap_or(20.0),
-                    distribution: parse_survival_distribution(
-                        model.survival_distribution.as_deref().unwrap_or("gaussian"),
-                    )?,
+                    sigma_min,
+                    sigma_max,
+                    distribution,
                 },
                 &gam::survival_location_scale_probit::SurvivalLocationScaleProbitFitResult {
-                    beta_time,
-                    beta_threshold,
-                    beta_log_sigma,
+                    beta_time: beta_time.clone(),
+                    beta_threshold: beta_threshold.clone(),
+                    beta_log_sigma: beta_log_sigma.clone(),
                     lambdas_time: Array1::zeros(0),
                     lambdas_threshold: Array1::zeros(0),
                     lambdas_log_sigma: Array1::zeros(0),
@@ -997,21 +1013,167 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     penalized_objective: f64::NAN,
                     iterations: 0,
                     converged: true,
+                    covariance_conditional: None,
                 },
             )
             .map_err(|e| format!("survival probit-location-scale predict failed: {e}"))?;
-            write_survival_prediction_csv(
-                &args.out,
-                pred.eta.view(),
-                pred.survival_prob.view(),
-                None,
-                None,
-                None,
-            )?;
+            let (mean, eta_se_default) = if args.mode == PredictModeArg::PosteriorMean {
+                let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+                let p_time = beta_time.len();
+                let p_t = beta_threshold.len();
+                let p_ls = beta_log_sigma.len();
+                let p_total = p_time + p_t + p_ls;
+                if cov_mat.nrows() != p_total || cov_mat.ncols() != p_total {
+                    return Err(format!(
+                        "covariance shape mismatch for probit-location-scale survival: got {}x{}, expected {}x{}",
+                        cov_mat.nrows(),
+                        cov_mat.ncols(),
+                        p_total,
+                        p_total
+                    ));
+                }
+                let mut grad = Array2::<f64>::zeros((n, p_total));
+                for i in 0..n {
+                    for j in 0..p_time {
+                        grad[[i, j]] = -time_build.x_exit_time[[i, j]];
+                    }
+                    let inv_sigma = 1.0 / sigma[i].max(1e-12);
+                    for j in 0..p_t {
+                        grad[[i, p_time + j]] = -cov_design.design[[i, j]] * inv_sigma;
+                    }
+                    let coeff_ls = eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
+                    for j in 0..p_ls {
+                        grad[[i, p_time + p_t + j]] = coeff_ls * cov_design.design[[i, j]];
+                    }
+                }
+                let eta_se = linear_predictor_se(grad.view(), &cov_mat);
+                let cov_hh = cov_mat.slice(s![0..p_time, 0..p_time]).to_owned();
+                let cov_tt = cov_mat.slice(s![p_time..p_time + p_t, p_time..p_time + p_t]).to_owned();
+                let cov_ll = cov_mat
+                    .slice(s![
+                        p_time + p_t..p_time + p_t + p_ls,
+                        p_time + p_t..p_time + p_t + p_ls
+                    ])
+                    .to_owned();
+                let cov_ht = cov_mat.slice(s![0..p_time, p_time..p_time + p_t]).to_owned();
+                let cov_hl = cov_mat
+                    .slice(s![0..p_time, p_time + p_t..p_time + p_t + p_ls])
+                    .to_owned();
+                let cov_tl = cov_mat
+                    .slice(s![p_time..p_time + p_t, p_time + p_t..p_time + p_t + p_ls])
+                    .to_owned();
+                let xh_hh = time_build.x_exit_time.dot(&cov_hh);
+                let xt_tt = cov_design.design.dot(&cov_tt);
+                let xl_ll = cov_design.design.dot(&cov_ll);
+                let xh_ht = time_build.x_exit_time.dot(&cov_ht);
+                let xh_hl = time_build.x_exit_time.dot(&cov_hl);
+                let xt_tl = cov_design.design.dot(&cov_tl);
+
+                let quad_ctx = gam::quadrature::QuadratureContext::new();
+                let mean = Array1::from_iter((0..n).map(|i| {
+                    let mu_h = time_build.x_exit_time.row(i).dot(&beta_time) + eta_offset_exit[i];
+                    let mu_t = cov_design.design.row(i).dot(&beta_threshold);
+                    let mu_ls = cov_design.design.row(i).dot(&beta_log_sigma);
+                    let var_h = time_build.x_exit_time.row(i).dot(&xh_hh.row(i)).max(0.0);
+                    let var_t = cov_design.design.row(i).dot(&xt_tt.row(i)).max(0.0);
+                    let var_ls = cov_design.design.row(i).dot(&xl_ll.row(i)).max(0.0);
+                    let cov_ht_i = cov_design.design.row(i).dot(&xh_ht.row(i));
+                    let cov_hl_i = cov_design.design.row(i).dot(&xh_hl.row(i));
+                    let cov_tl_i = cov_design.design.row(i).dot(&xt_tl.row(i));
+                    gam::quadrature::normal_expectation_3d_adaptive(
+                        &quad_ctx,
+                        [mu_h, mu_t, mu_ls],
+                        [
+                            [var_h, cov_ht_i, cov_hl_i],
+                            [cov_ht_i, var_t, cov_tl_i],
+                            [cov_hl_i, cov_tl_i, var_ls],
+                        ],
+                        |h, t, ls| {
+                            let sigma = ls.exp().clamp(sigma_min, sigma_max);
+                            let eta_loc = -h - t / sigma.max(1e-12);
+                            distribution.cdf(eta_loc).clamp(0.0, 1.0)
+                        },
+                    )
+                }));
+                (mean, Some(eta_se))
+            } else {
+                (pred.survival_prob.clone(), None)
+            };
+            if args.uncertainty {
+                if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+                    return Err(format!("--level must be in (0,1), got {}", args.level));
+                }
+                let eta_se = if let Some(se) = eta_se_default.as_ref() {
+                    se.clone()
+                } else {
+                    let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+                    let p_time = beta_time.len();
+                    let p_t = beta_threshold.len();
+                    let p_ls = beta_log_sigma.len();
+                    let p_total = p_time + p_t + p_ls;
+                    if cov_mat.nrows() != p_total || cov_mat.ncols() != p_total {
+                        return Err(format!(
+                            "covariance shape mismatch for probit-location-scale survival: got {}x{}, expected {}x{}",
+                            cov_mat.nrows(),
+                            cov_mat.ncols(),
+                            p_total,
+                            p_total
+                        ));
+                    }
+                    let mut grad = Array2::<f64>::zeros((n, p_total));
+                    for i in 0..n {
+                        for j in 0..p_time {
+                            grad[[i, j]] = -time_build.x_exit_time[[i, j]];
+                        }
+                        let inv_sigma = 1.0 / sigma[i].max(1e-12);
+                        for j in 0..p_t {
+                            grad[[i, p_time + j]] = -cov_design.design[[i, j]] * inv_sigma;
+                        }
+                        let coeff_ls = eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
+                        for j in 0..p_ls {
+                            grad[[i, p_time + p_t + j]] = coeff_ls * cov_design.design[[i, j]];
+                        }
+                    }
+                    linear_predictor_se(grad.view(), &cov_mat)
+                };
+                let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+                let quad_ctx = gam::quadrature::QuadratureContext::new();
+                let response_sd = Array1::from_iter((0..pred.eta.len()).map(|i| {
+                    let m2 = gam::quadrature::normal_expectation_1d_adaptive(
+                        &quad_ctx,
+                        pred.eta[i],
+                        eta_se[i],
+                        |x| {
+                            let p = distribution.cdf(x).clamp(0.0, 1.0);
+                            p * p
+                        },
+                    );
+                    (m2 - mean[i] * mean[i]).max(0.0).sqrt()
+                }));
+                let (mean_lo, mean_hi) =
+                    response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
+                write_survival_prediction_csv(
+                    &args.out,
+                    pred.eta.view(),
+                    mean.view(),
+                    Some(eta_se.view()),
+                    Some(mean_lo.view()),
+                    Some(mean_hi.view()),
+                )?;
+            } else {
+                write_survival_prediction_csv(
+                    &args.out,
+                    pred.eta.view(),
+                    mean.view(),
+                    None,
+                    None,
+                    None,
+                )?;
+            }
             println!(
                 "wrote predictions: {} (rows={})",
                 args.out.display(),
-                pred.survival_prob.len()
+                mean.len()
             );
             return Ok(());
         }
@@ -1043,26 +1205,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         // Prediction uses the same target+deviation decomposition as fitting.
         // This avoids silent drift between train-time and predict-time baselines.
         let eta = x_exit.dot(&beta) + eta_offset_exit;
-        let mean = survival_probability_from_eta(eta.view());
-        let mut eta_se = None;
-        let mut mean_lo = None;
-        let mut mean_hi = None;
-        if args.uncertainty {
-            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-                return Err(format!("--level must be in (0,1), got {}", args.level));
-            }
-            let cov = match args.covariance_mode {
-                CovarianceModeArg::Corrected => model
-                    .covariance_corrected
-                    .as_ref()
-                    .or(model.covariance_conditional.as_ref()),
-                CovarianceModeArg::Conditional => model.covariance_conditional.as_ref(),
-            }
-            .ok_or_else(|| {
-                "survival model file does not include covariance; refit with current CLI to enable --uncertainty"
-                    .to_string()
-            })?;
-            let cov_mat = nested_vec_to_array2(cov)?;
+        let (mean, se_default) = if args.mode == PredictModeArg::PosteriorMean {
+            let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
             if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
                 return Err(format!(
                     "covariance shape mismatch: got {}x{}, expected {}x{}",
@@ -1073,13 +1217,42 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 ));
             }
             let se = linear_predictor_se(x_exit.view(), &cov_mat);
+            (survival_posterior_mean_from_eta(eta.view(), se.view()), Some(se))
+        } else {
+            (survival_probability_from_eta(eta.view()), None)
+        };
+        let mut eta_se = None;
+        let mut mean_lo = None;
+        let mut mean_hi = None;
+        if args.uncertainty {
+            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+                return Err(format!("--level must be in (0,1), got {}", args.level));
+            }
+            let se = if let Some(se) = se_default.as_ref() {
+                se.clone()
+            } else {
+                let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+                if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
+                    return Err(format!(
+                        "covariance shape mismatch: got {}x{}, expected {}x{}",
+                        cov_mat.nrows(),
+                        cov_mat.ncols(),
+                        beta.len(),
+                        beta.len()
+                    ));
+                }
+                linear_predictor_se(x_exit.view(), &cov_mat)
+            };
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-            let eta_lower = &eta - &se.mapv(|v| z * v);
-            let eta_upper = &eta + &se.mapv(|v| z * v);
-            eta_se = Some(se);
-            // Survival decreases as eta increases.
-            mean_lo = Some(survival_probability_from_eta(eta_upper.view()));
-            mean_hi = Some(survival_probability_from_eta(eta_lower.view()));
+            eta_se = Some(se.clone());
+            let response_sd = response_sd_from_eta_for_family(
+                LikelihoodFamily::RoystonParmar,
+                eta.view(),
+                se.view(),
+            );
+            let (lo, hi) = response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
+            mean_lo = Some(lo);
+            mean_hi = Some(hi);
         }
         write_survival_prediction_csv(
             &args.out,
@@ -1208,7 +1381,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         let eta_noise = design_noise.design.dot(&beta_noise);
         let sigma_min = model.sigma_min.unwrap_or(0.05);
         let sigma_max = model.sigma_max.unwrap_or(20.0);
-        let sigma = eta_noise.mapv(|v| v.exp().clamp(sigma_min, sigma_max));
+        let (sigma, dsigma) = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max);
         let q0 = Array1::from_iter(
             eta_t
                 .iter()
@@ -1216,7 +1389,183 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
         );
         let eta = apply_saved_probit_wiggle(&q0, &model)?.mapv(|v| v.clamp(-30.0, 30.0));
-        let mean = eta.mapv(normal_cdf_approx);
+        let wiggle_design = saved_probit_wiggle_design(&q0, &model)?;
+        let dq_dq0 = saved_probit_wiggle_derivative_q0(&q0, &model)?;
+        let p_t = beta_t.len();
+        let p_ls = beta_noise.len();
+        let p_w = wiggle_design.as_ref().map(|m| m.ncols()).unwrap_or(0);
+        let p_total = p_t + p_ls + p_w;
+        let eta_se_base = if args.mode == PredictModeArg::PosteriorMean || args.uncertainty {
+            let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+            if cov_mat.nrows() != p_total || cov_mat.ncols() != p_total {
+                return Err(format!(
+                    "covariance shape mismatch for binomial-location-scale-probit: got {}x{}, expected {}x{}",
+                    cov_mat.nrows(),
+                    cov_mat.ncols(),
+                    p_total,
+                    p_total
+                ));
+            }
+            let mut grad = Array2::<f64>::zeros((eta.len(), p_total));
+            for i in 0..eta.len() {
+                let scale = dq_dq0[i];
+                let inv_sigma = 1.0 / sigma[i].max(1e-12);
+                for j in 0..p_t {
+                    grad[[i, j]] = -scale * design_t.design[[i, j]] * inv_sigma;
+                }
+                let coeff_ls = scale * eta_t[i] * dsigma[i] / sigma[i].powi(2).max(1e-12);
+                for j in 0..p_ls {
+                    grad[[i, p_t + j]] = coeff_ls * design_noise.design[[i, j]];
+                }
+                if let Some(wd) = wiggle_design.as_ref() {
+                    for j in 0..p_w {
+                        grad[[i, p_t + p_ls + j]] = wd[[i, j]];
+                    }
+                }
+            }
+            Some(linear_predictor_se(grad.view(), &cov_mat))
+        } else {
+            None
+        };
+        let mean = if args.mode == PredictModeArg::PosteriorMean {
+            if p_w == 0 {
+                let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+                let cov_tt = cov_mat.slice(s![0..p_t, 0..p_t]).to_owned();
+                let cov_ll = cov_mat
+                    .slice(s![p_t..p_t + p_ls, p_t..p_t + p_ls])
+                    .to_owned();
+                let cov_tl = cov_mat.slice(s![0..p_t, p_t..p_t + p_ls]).to_owned();
+                let xd_t_covtt = design_t.design.dot(&cov_tt);
+                let xd_l_covll = design_noise.design.dot(&cov_ll);
+                let xd_t_covtl = design_t.design.dot(&cov_tl);
+                let quad_ctx = gam::quadrature::QuadratureContext::new();
+                Array1::from_iter((0..eta.len()).map(|i| {
+                    let var_t = design_t.design.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
+                    let var_ls = design_noise
+                        .design
+                        .row(i)
+                        .dot(&xd_l_covll.row(i))
+                        .max(0.0);
+                    let cov_tls = design_noise.design.row(i).dot(&xd_t_covtl.row(i));
+                    gam::quadrature::normal_expectation_2d_adaptive(
+                        &quad_ctx,
+                        [eta_t[i], eta_noise[i]],
+                        [[var_t, cov_tls], [cov_tls, var_ls]],
+                        |t, ls| {
+                            let sigma = ls.exp().clamp(sigma_min, sigma_max);
+                            normal_cdf_approx((-t / sigma.max(1e-12)).clamp(-30.0, 30.0))
+                                .clamp(1e-10, 1.0 - 1e-10)
+                        },
+                    )
+                }))
+            } else {
+                let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+                let cov_tt = cov_mat.slice(s![0..p_t, 0..p_t]).to_owned();
+                let cov_ll = cov_mat
+                    .slice(s![p_t..p_t + p_ls, p_t..p_t + p_ls])
+                    .to_owned();
+                let cov_tl = cov_mat.slice(s![0..p_t, p_t..p_t + p_ls]).to_owned();
+                let cov_tw = cov_mat
+                    .slice(s![0..p_t, p_t + p_ls..p_t + p_ls + p_w])
+                    .to_owned();
+                let cov_lw = cov_mat
+                    .slice(s![p_t..p_t + p_ls, p_t + p_ls..p_t + p_ls + p_w])
+                    .to_owned();
+                let cov_ww = cov_mat
+                    .slice(s![
+                        p_t + p_ls..p_t + p_ls + p_w,
+                        p_t + p_ls..p_t + p_ls + p_w
+                    ])
+                    .to_owned();
+                let xd_t_covtt = design_t.design.dot(&cov_tt);
+                let xd_l_covll = design_noise.design.dot(&cov_ll);
+                let xd_t_covtl = design_t.design.dot(&cov_tl);
+                let xd_t_covtw = design_t.design.dot(&cov_tw);
+                let xd_l_covlw = design_noise.design.dot(&cov_lw);
+                let quad_ctx = gam::quadrature::QuadratureContext::new();
+                let beta_w = Array1::from_vec(model.beta_wiggle.clone().ok_or_else(|| {
+                    "binomial-location-scale-probit wiggle model is missing beta_wiggle".to_string()
+                })?);
+                if beta_w.len() != p_w {
+                    return Err(format!(
+                        "wiggle model/design mismatch: beta_wiggle has {} coefficients but expected {}",
+                        beta_w.len(),
+                        p_w
+                    ));
+                }
+                let mut out = Array1::<f64>::zeros(eta.len());
+                for i in 0..eta.len() {
+                    let var_t = design_t.design.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
+                    let var_ls = design_noise
+                        .design
+                        .row(i)
+                        .dot(&xd_l_covll.row(i))
+                        .max(0.0);
+                    let cov_tls = design_noise.design.row(i).dot(&xd_t_covtl.row(i));
+                    let suv_t = xd_t_covtw.row(i).to_owned();
+                    let suv_ls = xd_l_covlw.row(i).to_owned();
+                    let inv_uu = invert_2x2_with_jitter(var_t, cov_tls, var_ls);
+                    let mut k0 = Array1::<f64>::zeros(p_w);
+                    let mut k1 = Array1::<f64>::zeros(p_w);
+                    for j in 0..p_w {
+                        k0[j] = suv_t[j] * inv_uu[0][0] + suv_ls[j] * inv_uu[1][0];
+                        k1[j] = suv_t[j] * inv_uu[0][1] + suv_ls[j] * inv_uu[1][1];
+                    }
+                    let mut cov_w_cond = cov_ww.clone();
+                    for r in 0..p_w {
+                        for c in 0..p_w {
+                            cov_w_cond[[r, c]] -= k0[r] * suv_t[c] + k1[r] * suv_ls[c];
+                        }
+                    }
+                    for d in 0..p_w {
+                        cov_w_cond[[d, d]] = cov_w_cond[[d, d]].max(0.0);
+                    }
+                    for r in 0..p_w {
+                        for c in 0..r {
+                            let v = 0.5 * (cov_w_cond[[r, c]] + cov_w_cond[[c, r]]);
+                            cov_w_cond[[r, c]] = v;
+                            cov_w_cond[[c, r]] = v;
+                        }
+                    }
+                    out[i] = gam::quadrature::normal_expectation_2d_adaptive_result(
+                        &quad_ctx,
+                        [eta_t[i], eta_noise[i]],
+                        [[var_t, cov_tls], [cov_tls, var_ls]],
+                        |t, ls| {
+                            let sigma = ls.exp().clamp(sigma_min, sigma_max).max(1e-12);
+                            let q0 = (-t / sigma).clamp(-30.0, 30.0);
+                            let xw = saved_probit_wiggle_basis_row_scalar(q0, &model)?;
+                            if xw.len() != p_w {
+                                return Err(format!(
+                                    "saved probit wiggle scalar basis width mismatch: got {}, expected {}",
+                                    xw.len(),
+                                    p_w
+                                ));
+                            }
+                            let dt = t - eta_t[i];
+                            let dls = ls - eta_noise[i];
+                            // Conditional-Gaussian integration of wiggle uncertainty:
+                            // beta_w | (eta_t, eta_ls) is Gaussian under joint covariance,
+                            // and q = q0 + x_w(q0)^T beta_w is linear in beta_w at each node.
+                            let mean_w = q0 + xw.dot(&beta_w) + dt * xw.dot(&k0) + dls * xw.dot(&k1);
+                            let mut var_w = 0.0;
+                            for r in 0..p_w {
+                                let xr = xw[r];
+                                for c in 0..p_w {
+                                    var_w += xr * cov_w_cond[[r, c]] * xw[c];
+                                }
+                            }
+                            let denom = (1.0 + var_w.max(0.0)).sqrt().max(1e-12);
+                            Ok(normal_cdf_approx((mean_w / denom).clamp(-30.0, 30.0))
+                                .clamp(1e-10, 1.0 - 1e-10))
+                        },
+                    )?;
+                }
+                out
+            }
+        } else {
+            eta.mapv(normal_cdf_approx)
+        };
         let mut mean_lo = None;
         let mut mean_hi = None;
         let mut se = None;
@@ -1225,10 +1574,18 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 return Err(format!("--level must be in (0,1), got {}", args.level));
             }
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-            let se_mean = mean.mapv(|p| (p * (1.0 - p)).max(1e-12).sqrt());
-            mean_lo = Some((&mean - &se_mean.mapv(|v| z * v)).mapv(|v| v.clamp(0.0, 1.0)));
-            mean_hi = Some((&mean + &se_mean.mapv(|v| z * v)).mapv(|v| v.clamp(0.0, 1.0)));
-            se = Some(se_mean);
+            let se_base = eta_se_base
+                .as_ref()
+                .ok_or_else(|| "internal error: uncertainty requested but eta SE missing".to_string())?;
+            let response_sd = response_sd_from_eta_for_family(
+                LikelihoodFamily::BinomialProbit,
+                eta.view(),
+                se_base.view(),
+            );
+            let (lo, hi) = response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 1e-10, 1.0 - 1e-10);
+            mean_lo = Some(lo);
+            mean_hi = Some(hi);
+            se = Some(se_base.clone());
         }
         write_prediction_csv(
             &args.out,
@@ -1276,23 +1633,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             ));
         }
         let eta_base = design.design.dot(&beta_base);
+        let nonlinear = !matches!(family, LikelihoodFamily::GaussianIdentity);
         let mut se_base = None;
-        if args.uncertainty {
-            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-                return Err(format!("--level must be in (0,1), got {}", args.level));
-            }
-            let cov = match args.covariance_mode {
-                CovarianceModeArg::Corrected => model
-                    .covariance_corrected
-                    .as_ref()
-                    .or(model.covariance_conditional.as_ref()),
-                CovarianceModeArg::Conditional => model.covariance_conditional.as_ref(),
-            }
-            .ok_or_else(|| {
-                "model file does not include requested covariance matrix for uncertainty"
-                    .to_string()
-            })?;
-            let cov_mat = nested_vec_to_array2(cov)?;
+        if (nonlinear && args.mode == PredictModeArg::PosteriorMean) || args.uncertainty {
+            let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
             if cov_mat.nrows() != beta_base.len() || cov_mat.ncols() != beta_base.len() {
                 return Err(format!(
                     "covariance shape mismatch: got {}x{}, expected {}x{}",
@@ -1305,19 +1649,34 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             se_base = Some(linear_predictor_se(design.design.view(), &cov_mat));
         }
 
-        let pred = predict_joint(&joint, &eta_base, se_base.as_ref());
+        let pred = if args.mode == PredictModeArg::PosteriorMean {
+            predict_joint(&joint, &eta_base, se_base.as_ref())
+        } else {
+            predict_joint(&joint, &eta_base, None)
+        };
         let mut mean_lo = None;
         let mut mean_hi = None;
         if args.uncertainty {
+            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+                return Err(format!("--level must be in (0,1), got {}", args.level));
+            }
             let eff = pred
                 .effective_se
                 .as_ref()
                 .ok_or_else(|| "internal error: joint effective_se missing".to_string())?;
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-            let eta_lower = &pred.eta - &eff.mapv(|v| z * v);
-            let eta_upper = &pred.eta + &eff.mapv(|v| z * v);
-            mean_lo = Some(inverse_link_array(family, eta_lower.view()));
-            mean_hi = Some(inverse_link_array(family, eta_upper.view()));
+            if nonlinear {
+                let response_sd = response_sd_from_eta_for_family(family, pred.eta.view(), eff.view());
+                let (lo, hi) =
+                    response_interval_from_mean_sd(pred.probabilities.view(), response_sd.view(), z, 1e-10, 1.0 - 1e-10);
+                mean_lo = Some(lo);
+                mean_hi = Some(hi);
+            } else {
+                let eta_lower = &pred.eta - &eff.mapv(|v| z * v);
+                let eta_upper = &pred.eta + &eff.mapv(|v| z * v);
+                mean_lo = Some(inverse_link_array(family, eta_lower.view()));
+                mean_hi = Some(inverse_link_array(family, eta_upper.view()));
+            }
         }
         write_prediction_csv(
             &args.out,
@@ -1335,8 +1694,43 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
-        .map_err(|e| format!("predict_gam failed: {e}"))?;
+    let nonlinear = matches!(
+        family,
+        LikelihoodFamily::BinomialLogit
+            | LikelihoodFamily::BinomialProbit
+            | LikelihoodFamily::BinomialCLogLog
+    );
+    let (eta, mean, se_opt) = if nonlinear && args.mode == PredictModeArg::PosteriorMean {
+        let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+        let pm = predict_gam_posterior_mean(
+            design.design.view(),
+            beta.view(),
+            offset.view(),
+            family,
+            cov_mat.view(),
+        )
+        .map_err(|e| format!("predict_gam_posterior_mean failed: {e}"))?;
+        (pm.eta, pm.mean, Some(pm.eta_standard_error))
+    } else {
+        let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
+            .map_err(|e| format!("predict_gam failed: {e}"))?;
+        let se = if args.uncertainty {
+            let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+            if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
+                return Err(format!(
+                    "covariance shape mismatch: got {}x{}, expected {}x{}",
+                    cov_mat.nrows(),
+                    cov_mat.ncols(),
+                    beta.len(),
+                    beta.len()
+                ));
+            }
+            Some(linear_predictor_se(design.design.view(), &cov_mat))
+        } else {
+            None
+        };
+        (pred.eta, pred.mean, se)
+    };
 
     let mut eta_se = None;
     let mut mean_lo = None;
@@ -1346,41 +1740,29 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
             return Err(format!("--level must be in (0,1), got {}", args.level));
         }
-        let cov = match args.covariance_mode {
-            CovarianceModeArg::Corrected => model
-                .covariance_corrected
-                .as_ref()
-                .or(model.covariance_conditional.as_ref()),
-            CovarianceModeArg::Conditional => model.covariance_conditional.as_ref(),
-        }
-        .ok_or_else(|| {
-            "model file does not include requested covariance matrix for uncertainty".to_string()
-        })?;
-
-        let cov_mat = nested_vec_to_array2(cov)?;
-        if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
-            return Err(format!(
-                "covariance shape mismatch: got {}x{}, expected {}x{}",
-                cov_mat.nrows(),
-                cov_mat.ncols(),
-                beta.len(),
-                beta.len()
-            ));
-        }
-
-        let se = linear_predictor_se(design.design.view(), &cov_mat);
+        let se = se_opt
+            .as_ref()
+            .ok_or_else(|| "internal error: eta SE unavailable for uncertainty interval".to_string())?;
         let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-        let eta_lower = &pred.eta - &se.mapv(|v| z * v);
-        let eta_upper = &pred.eta + &se.mapv(|v| z * v);
         eta_se = Some(se.clone());
-        mean_lo = Some(inverse_link_array(family, eta_lower.view()));
-        mean_hi = Some(inverse_link_array(family, eta_upper.view()));
+        if nonlinear {
+            let response_sd = response_sd_from_eta_for_family(family, eta.view(), se.view());
+            let (lo, hi) =
+                response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 1e-10, 1.0 - 1e-10);
+            mean_lo = Some(lo);
+            mean_hi = Some(hi);
+        } else {
+            let eta_lower = &eta - &se.mapv(|v| z * v);
+            let eta_upper = &eta + &se.mapv(|v| z * v);
+            mean_lo = Some(inverse_link_array(family, eta_lower.view()));
+            mean_hi = Some(inverse_link_array(family, eta_upper.view()));
+        }
     }
 
     write_prediction_csv(
         &args.out,
-        pred.eta.view(),
-        pred.mean.view(),
+        eta.view(),
+        mean.view(),
         eta_se.as_ref().map(|a| a.view()),
         mean_lo.as_ref().map(|a| a.view()),
         mean_hi.as_ref().map(|a| a.view()),
@@ -1389,7 +1771,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     println!(
         "wrote predictions: {} (rows={})",
         args.out.display(),
-        pred.mean.len()
+        mean.len()
     );
     Ok(())
 }
@@ -1443,6 +1825,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             max_iter: model.fit_max_iter,
             tol: model.fit_tol,
             nullspace_dims: design.nullspace_dims.clone(),
+            linear_constraints: design.linear_constraints.clone(),
         },
     )
     .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
@@ -1962,6 +2345,104 @@ fn apply_saved_probit_wiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Arr
     }
 }
 
+fn saved_probit_wiggle_design(
+    q0: &Array1<f64>,
+    model: &SavedModel,
+) -> Result<Option<Array2<f64>>, String> {
+    match (
+        model.probit_wiggle_knots.as_ref(),
+        model.probit_wiggle_degree,
+        model.beta_wiggle.as_ref(),
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(knots), Some(degree), Some(beta_wiggle)) => {
+            let knot_arr = Array1::from_vec(knots.clone());
+            let block = build_wiggle_block_input_from_knots(
+                q0.view(),
+                &knot_arr,
+                degree,
+                2,
+                false,
+            )
+            .map_err(|e| format!("failed to evaluate saved probit wiggle basis: {e}"))?;
+            let x_wiggle = match block.design {
+                DesignMatrix::Dense(m) => m,
+                _ => {
+                    return Err(
+                        "saved probit wiggle basis design must be dense in current implementation"
+                            .to_string(),
+                    )
+                }
+            };
+            if beta_wiggle.len() != x_wiggle.ncols() {
+                return Err(format!(
+                    "saved probit wiggle dimension mismatch: beta_wiggle has {} coefficients but basis has {} columns",
+                    beta_wiggle.len(),
+                    x_wiggle.ncols()
+                ));
+            }
+            Ok(Some(x_wiggle))
+        }
+        _ => Err(
+            "saved model has partial probit wiggle metadata; expected knots+degree+beta_wiggle together"
+                .to_string(),
+        ),
+    }
+}
+
+fn saved_probit_wiggle_basis_row_scalar(q0: f64, model: &SavedModel) -> Result<Array1<f64>, String> {
+    let q = Array1::from_vec(vec![q0]);
+    let x = saved_probit_wiggle_design(&q, model)?.ok_or_else(|| {
+        "saved model is missing probit wiggle metadata while wiggle path requested".to_string()
+    })?;
+    if x.nrows() != 1 {
+        return Err(format!(
+            "saved probit wiggle scalar evaluation expected 1 row, got {}",
+            x.nrows()
+        ));
+    }
+    Ok(x.row(0).to_owned())
+}
+
+fn invert_2x2_with_jitter(a11: f64, a12: f64, a22: f64) -> [[f64; 2]; 2] {
+    let mut d11 = a11.max(0.0);
+    let mut d22 = a22.max(0.0);
+    let mut d12 = a12;
+    for retry in 0..8 {
+        let jitter = if retry == 0 {
+            0.0
+        } else {
+            1e-12 * 10f64.powi((retry - 1) as i32)
+        };
+        let e11 = d11 + jitter;
+        let e22 = d22 + jitter;
+        let det = e11 * e22 - d12 * d12;
+        if det.is_finite() && det > 1e-24 {
+            return [[e22 / det, -d12 / det], [-d12 / det, e11 / det]];
+        }
+        d12 *= 0.999;
+        d11 = d11.max(1e-16);
+        d22 = d22.max(1e-16);
+    }
+    [[1.0 / d11.max(1e-8), 0.0], [0.0, 1.0 / d22.max(1e-8)]]
+}
+
+fn saved_probit_wiggle_derivative_q0(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
+    if model.probit_wiggle_knots.is_none() {
+        return Ok(Array1::ones(q0.len()));
+    }
+    let eps = 1e-5;
+    let mut out = Array1::<f64>::ones(q0.len());
+    for i in 0..q0.len() {
+        let qp = Array1::from_vec(vec![q0[i] + eps]);
+        let qm = Array1::from_vec(vec![q0[i] - eps]);
+        let ep = apply_saved_probit_wiggle(&qp, model)?[0];
+        let em = apply_saved_probit_wiggle(&qm, model)?[0];
+        out[i] = ((ep - em) / (2.0 * eps)).max(-1e6).min(1e6);
+    }
+    Ok(out)
+}
+
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let ds = load_dataset(&args.data)?;
     let col_map: HashMap<String, usize> = ds
@@ -2198,8 +2679,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 beta: fit.beta_time.to_vec(),
                 lambdas,
                 scale: 1.0,
-                covariance_conditional: None,
-                covariance_corrected: None,
+                covariance_conditional: fit.covariance_conditional.as_ref().map(array2_to_nested_vec),
+                covariance_corrected: fit.covariance_conditional.as_ref().map(array2_to_nested_vec),
             };
             write_model_json(&out, &model_out)?;
         }
@@ -2235,7 +2716,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     let penalties = PenaltyBlocks::new(penalty_blocks.clone());
 
-    let model = gam::families::royston_parmar::working_model_from_flattened(
+    let mut model = gam::families::royston_parmar::working_model_from_flattened(
         penalties,
         MonotonicityPenalty {
             lambda: 0.0,
@@ -2258,44 +2739,57 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
 
-    let mut beta = Array1::<f64>::zeros(p);
-    beta[0] = -3.0;
-    beta[1] = 1.0;
-    let mut last_obj = f64::INFINITY;
-    for _ in 0..400usize {
-        let state = model
-            .update_state(&beta)
-            .map_err(|e| format!("survival update_state failed: {e}"))?;
-        let obj = 0.5 * state.deviance + state.penalty_term;
-        let grad = state.gradient;
-        let grad_norm = grad.dot(&grad).sqrt();
-        if grad_norm < 1e-6 || (last_obj - obj).abs() < 1e-9 {
-            break;
-        }
-        let direction = grad.mapv(|g| -g);
-        let mut step = 0.2;
-        let mut accepted = false;
-        for _ in 0..30 {
-            let cand = &beta + &(direction.mapv(|d| step * d));
-            if let Ok(cand_state) = model.update_state(&cand) {
-                let cand_obj = 0.5 * cand_state.deviance + cand_state.penalty_term;
-                if cand_obj.is_finite() && cand_obj < obj {
-                    beta = cand;
-                    last_obj = cand_obj;
-                    accepted = true;
-                    break;
-                }
-            }
-            step *= 0.5;
-        }
-        if !accepted {
-            break;
+    let mut beta0 = Array1::<f64>::zeros(p);
+    beta0[0] = -3.0;
+    beta0[1] = 1.0;
+    let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
+        max_iterations: 400,
+        convergence_tolerance: 1e-6,
+        max_step_halving: 40,
+        min_step_size: 1e-12,
+        firth_bias_reduction: false,
+        coefficient_lower_bounds: None,
+        linear_constraints: model.monotonicity_linear_constraints(),
+    };
+    let summary = gam::pirls::run_working_model_pirls(
+        &mut model,
+        gam::types::Coefficients::new(beta0),
+        &pirls_opts,
+        |_info| {},
+    )
+    .map_err(|e| format!("survival constrained PIRLS failed: {e}"))?;
+    let beta = summary.beta.0;
+    let state = summary.state;
+    match summary.status {
+        gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum => {}
+        other => {
+            return Err(format!(
+                "survival constrained PIRLS did not converge: status={other:?}, grad_norm={:.3e}",
+                summary.last_gradient_norm
+            ));
         }
     }
-
-    let state = model
-        .update_state(&beta)
-        .map_err(|e| format!("survival final state failed: {e}"))?;
+    if let Some(kkt) = summary.constraint_kkt.as_ref() {
+        let tol_primal = 1e-7;
+        let tol_dual = 1e-7;
+        let tol_comp = 1e-7;
+        let tol_stat = 5e-6;
+        if kkt.primal_feasibility > tol_primal
+            || kkt.dual_feasibility > tol_dual
+            || kkt.complementarity > tol_comp
+            || kkt.stationarity > tol_stat
+        {
+            return Err(format!(
+                "survival constrained PIRLS failed KKT checks: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}; active={}/{}",
+                kkt.primal_feasibility,
+                kkt.dual_feasibility,
+                kkt.complementarity,
+                kkt.stationarity,
+                kkt.n_active,
+                kkt.n_constraints
+            ));
+        }
+    }
 
     println!();
     println!(
@@ -2605,6 +3099,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
                 max_iter: model.fit_max_iter,
                 tol: model.fit_tol,
                 nullspace_dims: design.nullspace_dims.clone(),
+                linear_constraints: design.linear_constraints.clone(),
             },
         )
         .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
@@ -2850,8 +3345,20 @@ fn freeze_term_collection_spec(
                     None => BSplineIdentifiability::None,
                 };
             }
-            (SmoothBasisSpec::ThinPlate { spec: s, .. }, BasisMetadata::ThinPlate { centers }) => {
+            (
+                SmoothBasisSpec::ThinPlate { spec: s, .. },
+                BasisMetadata::ThinPlate {
+                    centers,
+                    identifiability_transform,
+                },
+            ) => {
                 s.center_strategy = CenterStrategy::UserProvided(centers.clone());
+                s.identifiability = match identifiability_transform {
+                    Some(z) => SpatialIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => SpatialIdentifiability::None,
+                };
             }
             (
                 SmoothBasisSpec::Matern { spec: s, .. },
@@ -2881,12 +3388,19 @@ fn freeze_term_collection_spec(
                     length_scale,
                     nu,
                     nullspace_order,
+                    identifiability_transform,
                 },
             ) => {
                 s.center_strategy = CenterStrategy::UserProvided(centers.clone());
                 s.length_scale = *length_scale;
                 s.nu = *nu;
                 s.nullspace_order = *nullspace_order;
+                s.identifiability = match identifiability_transform {
+                    Some(z) => SpatialIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => SpatialIdentifiability::None,
+                };
             }
             (
                 SmoothBasisSpec::TensorBSpline {
@@ -3013,6 +3527,8 @@ fn build_location_scale_saved_model(
     sigma_min: f64,
     sigma_max: f64,
     lambdas: Vec<f64>,
+    covariance_conditional: Option<Vec<Vec<f64>>>,
+    covariance_corrected: Option<Vec<Vec<f64>>>,
 ) -> SavedModel {
     SavedModel {
         version: MODEL_VERSION,
@@ -3060,8 +3576,8 @@ fn build_location_scale_saved_model(
         beta,
         lambdas,
         scale: 1.0,
-        covariance_conditional: None,
-        covariance_corrected: None,
+        covariance_conditional,
+        covariance_corrected,
     }
 }
 
@@ -3132,6 +3648,15 @@ fn validate_frozen_term_collection_spec(
                         st.name
                     ));
                 }
+                if matches!(
+                    spec.identifiability,
+                    SpatialIdentifiability::OrthogonalToParametric
+                ) {
+                    return Err(format!(
+                        "{label} term '{}' is not frozen: ThinPlate identifiability must be FrozenTransform or None",
+                        st.name
+                    ));
+                }
             }
             SmoothBasisSpec::Matern { spec, .. } => {
                 if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
@@ -3145,6 +3670,15 @@ fn validate_frozen_term_collection_spec(
                 if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
                     return Err(format!(
                         "{label} term '{}' is not frozen: Duchon centers must be UserProvided",
+                        st.name
+                    ));
+                }
+                if matches!(
+                    spec.identifiability,
+                    SpatialIdentifiability::OrthogonalToParametric
+                ) {
+                    return Err(format!(
+                        "{label} term '{}' is not frozen: Duchon identifiability must be FrozenTransform or None",
                         st.name
                     ));
                 }
@@ -3762,6 +4296,7 @@ fn build_smooth_basis(
                         num_centers: centers,
                     },
                     double_penalty: smooth_double_penalty,
+                    identifiability: parse_spatial_identifiability(options)?,
                 },
             })
         }
@@ -3805,6 +4340,7 @@ fn build_smooth_basis(
                         _ => DuchonNullspaceOrder::Linear,
                     },
                     double_penalty: smooth_double_penalty,
+                    identifiability: parse_spatial_identifiability(options)?,
                 },
             })
         }
@@ -3903,6 +4439,27 @@ fn parse_matern_identifiability(
         }
         other => Err(format!(
             "invalid Matérn identifiability '{other}'; expected one of: none, sum_to_zero, linear"
+        )),
+    }
+}
+
+fn parse_spatial_identifiability(
+    options: &BTreeMap<String, String>,
+) -> Result<SpatialIdentifiability, String> {
+    let Some(raw) = options.get("identifiability").map(String::as_str) else {
+        return Ok(SpatialIdentifiability::default());
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(SpatialIdentifiability::None),
+        "orthogonal"
+        | "orthogonal_to_parametric"
+        | "orthogonal-to-parametric"
+        | "parametric_orthogonal" => Ok(SpatialIdentifiability::OrthogonalToParametric),
+        "frozen" => Err(
+            "spatial identifiability 'frozen' is internal-only; use none or orthogonal_to_parametric".to_string(),
+        ),
+        other => Err(format!(
+            "invalid spatial identifiability '{other}'; expected one of: none, orthogonal_to_parametric"
         )),
     }
 }
@@ -4307,6 +4864,98 @@ fn linear_predictor_se(x: ndarray::ArrayView2<'_, f64>, cov: &Array2<f64>) -> Ar
         out[i] = v.sqrt();
     }
     out
+}
+
+fn covariance_from_model(model: &SavedModel, mode: CovarianceModeArg) -> Result<Array2<f64>, String> {
+    let cov = match mode {
+        CovarianceModeArg::Corrected => model
+            .covariance_corrected
+            .as_ref()
+            .or(model.covariance_conditional.as_ref()),
+        CovarianceModeArg::Conditional => model.covariance_conditional.as_ref(),
+    }
+    .ok_or_else(|| {
+        "nonlinear posterior-mean prediction requires covariance; refit model with current CLI"
+            .to_string()
+    })?;
+    nested_vec_to_array2(cov)
+}
+
+fn survival_posterior_mean_from_eta(eta: ArrayView1<'_, f64>, eta_se: ArrayView1<'_, f64>) -> Array1<f64> {
+    let quad_ctx = gam::quadrature::QuadratureContext::new();
+    Array1::from_iter(
+        eta.iter()
+            .zip(eta_se.iter())
+            .map(|(&e, &se)| gam::quadrature::survival_posterior_mean(&quad_ctx, e, se)),
+    )
+}
+
+fn response_sd_from_eta_for_family(
+    family: LikelihoodFamily,
+    eta: ArrayView1<'_, f64>,
+    eta_se: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let quad_ctx = gam::quadrature::QuadratureContext::new();
+    Array1::from_iter((0..eta.len()).map(|i| {
+        let var = match family {
+            LikelihoodFamily::BinomialLogit => {
+                let (_, v) = gam::quadrature::logit_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
+                v
+            }
+            LikelihoodFamily::BinomialProbit => {
+                let (_, v) = gam::quadrature::probit_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
+                v
+            }
+            LikelihoodFamily::BinomialCLogLog => {
+                let (_, v) = gam::quadrature::cloglog_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
+                v
+            }
+            LikelihoodFamily::RoystonParmar => {
+                let (_, v) = gam::quadrature::survival_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
+                v
+            }
+            LikelihoodFamily::GaussianIdentity => 0.0,
+        };
+        var.max(0.0).sqrt()
+    }))
+}
+
+fn response_interval_from_mean_sd(
+    mean: ArrayView1<'_, f64>,
+    response_sd: ArrayView1<'_, f64>,
+    z: f64,
+    lo: f64,
+    hi: f64,
+) -> (Array1<f64>, Array1<f64>) {
+    let lower = Array1::from_iter(
+        mean.iter()
+            .zip(response_sd.iter())
+            .map(|(&m, &s)| (m - z * s).clamp(lo, hi)),
+    );
+    let upper = Array1::from_iter(
+        mean.iter()
+            .zip(response_sd.iter())
+            .map(|(&m, &s)| (m + z * s).clamp(lo, hi)),
+    );
+    (lower, upper)
+}
+
+fn sigma_and_deriv_from_eta(
+    eta: ArrayView1<'_, f64>,
+    sigma_min: f64,
+    sigma_max: f64,
+) -> (Array1<f64>, Array1<f64>) {
+    let span = (sigma_max - sigma_min).max(1e-12);
+    let mut sigma = Array1::<f64>::zeros(eta.len());
+    let mut ds = Array1::<f64>::zeros(eta.len());
+    for i in 0..eta.len() {
+        let z = eta[i].clamp(-40.0, 40.0);
+        let p = 1.0 / (1.0 + (-z).exp());
+        let d1 = p * (1.0 - p);
+        sigma[i] = sigma_min + span * p;
+        ds[i] = span * d1;
+    }
+    (sigma, ds)
 }
 
 fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, String> {

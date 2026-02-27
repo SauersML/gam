@@ -21,7 +21,7 @@ use faer::sparse::{SparseColMat, Triplet};
 use faer::sparse::{SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat};
 use faer::{Accum, Par, Side, Unbind, get_global_parallelism};
 use log;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, ShapeBuilder};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, ShapeBuilder, s};
 
 use faer::linalg::cholesky::llt::factor::LltParams;
 use faer::{Auto, MatRef, Spec};
@@ -392,6 +392,18 @@ pub struct WorkingModelPirlsOptions {
     pub max_step_halving: usize,
     pub min_step_size: f64,
     pub firth_bias_reduction: bool,
+    /// Optional lower bounds on coefficients (same coordinate system as `beta`).
+    /// Use `-inf` for unconstrained entries.
+    pub coefficient_lower_bounds: Option<Array1<f64>>,
+    /// Optional linear inequality constraints in current coefficient coordinates:
+    ///   A * beta >= b.
+    pub linear_constraints: Option<LinearInequalityConstraints>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LinearInequalityConstraints {
+    pub a: Array2<f64>,
+    pub b: Array1<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -401,6 +413,28 @@ pub struct WorkingModelIterationInfo {
     pub gradient_norm: f64,
     pub step_size: f64,
     pub step_halving: usize,
+}
+
+/// KKT diagnostics for inequality-constrained PIRLS subproblems.
+///
+/// Constraints are represented as `A * beta >= b` in the same coefficient
+/// coordinate system as the returned `beta`.
+#[derive(Clone, Debug)]
+pub struct ConstraintKktDiagnostics {
+    /// Number of inequality rows.
+    pub n_constraints: usize,
+    /// Number of rows considered active (`slack <= active_tolerance`).
+    pub n_active: usize,
+    /// Maximum primal feasibility violation: `max_i max(0, b_i - a_i^T beta)`.
+    pub primal_feasibility: f64,
+    /// Maximum dual feasibility violation: `max_i max(0, -lambda_i)`.
+    pub dual_feasibility: f64,
+    /// Maximum complementarity residual: `max_i |lambda_i * slack_i|`.
+    pub complementarity: f64,
+    /// Stationarity residual: `||grad - A^T lambda||_inf`.
+    pub stationarity: f64,
+    /// Tolerance used to classify active constraints from slacks.
+    pub active_tolerance: f64,
 }
 
 #[derive(Clone)]
@@ -414,6 +448,7 @@ pub struct WorkingModelPirlsResult {
     pub last_step_size: f64,
     pub last_step_halving: usize,
     pub max_abs_eta: f64,
+    pub constraint_kkt: Option<ConstraintKktDiagnostics>,
 }
 
 // Fixed stabilization ridge for PIRLS/PLS. This is treated as an explicit penalty
@@ -1133,6 +1168,526 @@ fn solve_newton_direction_dense(
     Err(EstimationError::LinearSystemSolveFailed(ldlt_err))
 }
 
+fn project_coefficients_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &Array1<f64>) {
+    for i in 0..beta.len() {
+        let lb = lower_bounds[i];
+        if lb.is_finite() && beta[i] < lb {
+            beta[i] = lb;
+        }
+    }
+}
+
+fn solve_subsystem_direction(
+    h_sub: &Array2<f64>,
+    g_sub: &Array1<f64>,
+    out: &mut Array1<f64>,
+) -> Result<(), EstimationError> {
+    if out.len() != g_sub.len() {
+        *out = Array1::zeros(g_sub.len());
+    }
+    out.assign(g_sub);
+    let h_view = FaerArrayView::new(h_sub);
+    if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+        let mut rhs = array1_to_col_mat_mut(out);
+        ch.solve_in_place(rhs.as_mut());
+        out.mapv_inplace(|v| -v);
+        return Ok(());
+    }
+    if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+        let mut rhs = array1_to_col_mat_mut(out);
+        ld.solve_in_place(rhs.as_mut());
+        out.mapv_inplace(|v| -v);
+        return Ok(());
+    }
+    let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
+    let mut rhs = array1_to_col_mat_mut(out);
+    lb.solve_in_place(rhs.as_mut());
+    out.mapv_inplace(|v| -v);
+    if out.iter().all(|v| v.is_finite()) {
+        return Ok(());
+    }
+    Err(EstimationError::InvalidInput(
+        "bounded Newton subsystem solve produced non-finite values".to_string(),
+    ))
+}
+
+fn solve_symmetric_system(
+    matrix: &Array2<f64>,
+    rhs: &Array1<f64>,
+    out: &mut Array1<f64>,
+) -> Result<(), EstimationError> {
+    if out.len() != rhs.len() {
+        *out = Array1::zeros(rhs.len());
+    }
+    out.assign(rhs);
+    let matrix_view = FaerArrayView::new(matrix);
+    if let Ok(ch) = FaerLlt::new(matrix_view.as_ref(), Side::Lower) {
+        let mut rhs_view = array1_to_col_mat_mut(out);
+        ch.solve_in_place(rhs_view.as_mut());
+        return Ok(());
+    }
+    if let Ok(ld) = FaerLdlt::new(matrix_view.as_ref(), Side::Lower) {
+        let mut rhs_view = array1_to_col_mat_mut(out);
+        ld.solve_in_place(rhs_view.as_mut());
+        return Ok(());
+    }
+    let lb = FaerLblt::new(matrix_view.as_ref(), Side::Lower);
+    let mut rhs_view = array1_to_col_mat_mut(out);
+    lb.solve_in_place(rhs_view.as_mut());
+    if out.iter().all(|v| v.is_finite()) {
+        return Ok(());
+    }
+    Err(EstimationError::InvalidInput(
+        "symmetric system solve produced non-finite values".to_string(),
+    ))
+}
+
+fn linear_constraints_from_lower_bounds(
+    lower_bounds: &Array1<f64>,
+) -> Option<LinearInequalityConstraints> {
+    let active_rows: Vec<usize> = (0..lower_bounds.len())
+        .filter(|&i| lower_bounds[i].is_finite())
+        .collect();
+    if active_rows.is_empty() {
+        return None;
+    }
+    let p = lower_bounds.len();
+    let mut a = Array2::<f64>::zeros((active_rows.len(), p));
+    let mut b = Array1::<f64>::zeros(active_rows.len());
+    for (r, &idx) in active_rows.iter().enumerate() {
+        a[[r, idx]] = 1.0;
+        b[r] = lower_bounds[idx];
+    }
+    Some(LinearInequalityConstraints { a, b })
+}
+
+fn compute_constraint_kkt_diagnostics(
+    beta: &Array1<f64>,
+    gradient: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+) -> ConstraintKktDiagnostics {
+    let m = constraints.a.nrows();
+    let active_tolerance = 1e-8;
+
+    let mut slack = Array1::<f64>::zeros(m);
+    let mut primal_feasibility: f64 = 0.0;
+    for i in 0..m {
+        let s_i = constraints.a.row(i).dot(beta) - constraints.b[i];
+        slack[i] = s_i;
+        primal_feasibility = primal_feasibility.max((-s_i).max(0.0));
+    }
+
+    let active_idx: Vec<usize> = (0..m).filter(|&i| slack[i] <= active_tolerance).collect();
+    let mut lambda = Array1::<f64>::zeros(m);
+    if !active_idx.is_empty() {
+        let n_active = active_idx.len();
+        let p = constraints.a.ncols();
+        let mut a_active = Array2::<f64>::zeros((n_active, p));
+        for (r, &idx) in active_idx.iter().enumerate() {
+            a_active.row_mut(r).assign(&constraints.a.row(idx));
+        }
+        let mut gram = a_active.dot(&a_active.t());
+        let mut rhs = a_active.dot(gradient);
+        let ridge_scale = gram.diag().iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let ridge = 1e-12 * ridge_scale.max(1.0);
+        for i in 0..n_active {
+            gram[[i, i]] += ridge;
+        }
+        let mut lambda_active = Array1::<f64>::zeros(n_active);
+        if solve_symmetric_system(&gram, &rhs, &mut lambda_active).is_ok() {
+            for (r, &idx) in active_idx.iter().enumerate() {
+                lambda[idx] = lambda_active[r];
+            }
+        } else {
+            rhs.fill(0.0);
+        }
+    }
+
+    let mut dual_feasibility: f64 = 0.0;
+    let mut complementarity: f64 = 0.0;
+    for i in 0..m {
+        dual_feasibility = dual_feasibility.max((-lambda[i]).max(0.0));
+        complementarity = complementarity.max((lambda[i] * slack[i]).abs());
+    }
+    let stationarity = {
+        let mut resid = gradient.to_owned();
+        resid -= &constraints.a.t().dot(&lambda);
+        resid.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+    };
+
+    ConstraintKktDiagnostics {
+        n_constraints: m,
+        n_active: active_idx.len(),
+        primal_feasibility,
+        dual_feasibility,
+        complementarity,
+        stationarity,
+        active_tolerance,
+    }
+}
+
+fn max_linear_constraint_violation(
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+) -> (f64, usize) {
+    let mut worst = 0.0_f64;
+    let mut worst_row = 0usize;
+    for i in 0..constraints.a.nrows() {
+        let slack = constraints.a.row(i).dot(beta) - constraints.b[i];
+        let viol = (-slack).max(0.0);
+        if viol > worst {
+            worst = viol;
+            worst_row = i;
+        }
+    }
+    (worst, worst_row)
+}
+
+fn max_lower_bound_violation(beta: &Array1<f64>, lower_bounds: &Array1<f64>) -> (f64, usize) {
+    let mut worst = 0.0_f64;
+    let mut worst_idx = 0usize;
+    for i in 0..beta.len().min(lower_bounds.len()) {
+        let lb = lower_bounds[i];
+        if lb.is_finite() {
+            let viol = (lb - beta[i]).max(0.0);
+            if viol > worst {
+                worst = viol;
+                worst_idx = i;
+            }
+        }
+    }
+    (worst, worst_idx)
+}
+
+fn solve_newton_direction_with_lower_bounds(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+    beta: &Array1<f64>,
+    lower_bounds: &Array1<f64>,
+    direction_out: &mut Array1<f64>,
+    active_hint: Option<&mut Vec<usize>>,
+) -> Result<(), EstimationError> {
+    // Bound-constrained Newton step on the local quadratic model:
+    //
+    //   min_d  g^T d + 0.5 d^T H d
+    //   s.t.   beta + d >= l
+    //
+    // KKT conditions for active bounds A:
+    //   d_A = 0,
+    //   H_FF d_F = -g_F,
+    //   lambda_A = g_A + (H d)_A >= 0.
+    //
+    // We solve the free subsystem, enforce primal feasibility by clipping to the
+    // first boundary hit, then enforce dual feasibility by releasing active bounds
+    // with negative multipliers. This is the standard primal active-set loop for
+    // strictly convex box QPs.
+    let p = gradient.len();
+    if lower_bounds.len() != p || beta.len() != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "lower-bound size mismatch: beta={}, gradient={}, bounds={}",
+            beta.len(),
+            gradient.len(),
+            lower_bounds.len()
+        )));
+    }
+    if direction_out.len() != p {
+        *direction_out = Array1::zeros(p);
+    }
+    direction_out.fill(0.0);
+
+    // Fast path: if unconstrained Newton step is already feasible for all lower
+    // bounds, it is the exact constrained minimizer (strict convex quadratic).
+    if solve_newton_direction_dense(hessian, gradient, direction_out).is_ok() {
+        let mut feasible = true;
+        for i in 0..p {
+            let lb = lower_bounds[i];
+            if lb.is_finite() && beta[i] + direction_out[i] < lb {
+                feasible = false;
+                break;
+            }
+        }
+        if feasible {
+            return Ok(());
+        }
+    }
+
+    let mut active = vec![false; p];
+    if let Some(hint) = active_hint.as_ref() {
+        for &idx in hint.iter() {
+            if idx < p {
+                active[idx] = true;
+            }
+        }
+    }
+    let active_tol = 1e-12;
+    for i in 0..p {
+        let lb = lower_bounds[i];
+        if lb.is_finite() && beta[i] <= lb + active_tol && gradient[i] > 0.0 {
+            active[i] = true;
+        }
+    }
+
+    let mut d_free = Array1::<f64>::zeros(p);
+    for _ in 0..(p + 4) {
+        let free_idx: Vec<usize> = (0..p).filter(|&i| !active[i]).collect();
+        if free_idx.is_empty() {
+            direction_out.fill(0.0);
+            if let Some(hint) = active_hint {
+                hint.clear();
+                hint.extend((0..p).filter(|&i| active[i]));
+            }
+            return Ok(());
+        }
+
+        let n_free = free_idx.len();
+        let mut h_ff = Array2::<f64>::zeros((n_free, n_free));
+        let mut g_f = Array1::<f64>::zeros(n_free);
+        for (ii, &i) in free_idx.iter().enumerate() {
+            g_f[ii] = gradient[i];
+            for (jj, &j) in free_idx.iter().enumerate() {
+                h_ff[[ii, jj]] = hessian[[i, j]];
+            }
+        }
+        solve_subsystem_direction(&h_ff, &g_f, &mut d_free)?;
+        direction_out.fill(0.0);
+        for (ii, &i) in free_idx.iter().enumerate() {
+            direction_out[i] = d_free[ii];
+        }
+
+        // Enforce primal feasibility for bound-constrained coefficients.
+        let mut hit_idx: Option<usize> = None;
+        let mut best_alpha = 1.0_f64;
+        for &i in &free_idx {
+            let lb = lower_bounds[i];
+            if !lb.is_finite() {
+                continue;
+            }
+            let di = direction_out[i];
+            if di < 0.0 {
+                let alpha_i = (lb - beta[i]) / di;
+                if alpha_i.is_finite() && alpha_i >= 0.0 && alpha_i < best_alpha {
+                    best_alpha = alpha_i;
+                    hit_idx = Some(i);
+                }
+            }
+        }
+        if let Some(i_hit) = hit_idx {
+            for i in 0..p {
+                direction_out[i] *= best_alpha;
+            }
+            active[i_hit] = true;
+            continue;
+        }
+
+        // Dual feasibility on active constraints:
+        // λ_i = g_i + (H d)_i must be >= 0 for all active lower bounds.
+        let hd = hessian.dot(direction_out);
+        let mut worst_violation = 0.0_f64;
+        let mut release_idx: Option<usize> = None;
+        for i in 0..p {
+            if !active[i] {
+                continue;
+            }
+            let lambda_i = gradient[i] + hd[i];
+            if lambda_i < worst_violation {
+                worst_violation = lambda_i;
+                release_idx = Some(i);
+            }
+        }
+        if let Some(idx) = release_idx {
+            active[idx] = false;
+            continue;
+        }
+
+        if let Some(hint) = active_hint {
+            hint.clear();
+            hint.extend((0..p).filter(|&i| active[i]));
+        }
+        return Ok(());
+    }
+
+    let (worst, idx) = max_lower_bound_violation(beta, lower_bounds);
+    Err(EstimationError::ParameterConstraintViolation(format!(
+        "bounded-constraint Newton active-set failed to converge; max lower-bound violation={worst:.3e} at coefficient index {idx}"
+    )))
+}
+
+fn solve_kkt_direction(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+    active_a: &Array2<f64>,
+) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+    let p = hessian.nrows();
+    let m = active_a.nrows();
+    if m == 0 {
+        let mut d = Array1::<f64>::zeros(p);
+        solve_newton_direction_dense(hessian, gradient, &mut d)?;
+        return Ok((d, Array1::zeros(0)));
+    }
+    let mut kkt = Array2::<f64>::zeros((p + m, p + m));
+    kkt.slice_mut(s![0..p, 0..p]).assign(hessian);
+    kkt.slice_mut(s![0..p, p..(p + m)]).assign(&active_a.t());
+    kkt.slice_mut(s![p..(p + m), 0..p]).assign(active_a);
+
+    let mut rhs = Array1::<f64>::zeros(p + m);
+    for i in 0..p {
+        rhs[i] = -gradient[i];
+    }
+
+    let kkt_view = FaerArrayView::new(&kkt);
+    let lb = FaerLblt::new(kkt_view.as_ref(), Side::Lower);
+    let mut rhs_col = array1_to_col_mat_mut(&mut rhs);
+    lb.solve_in_place(rhs_col.as_mut());
+    if !rhs.iter().all(|v| v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "KKT solve produced non-finite values".to_string(),
+        ));
+    }
+    let d = rhs.slice(s![0..p]).to_owned();
+    let lambda = rhs.slice(s![p..(p + m)]).to_owned();
+    Ok((d, lambda))
+}
+
+fn solve_newton_direction_with_linear_constraints(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    direction_out: &mut Array1<f64>,
+    active_hint: Option<&mut Vec<usize>>,
+) -> Result<(), EstimationError> {
+    let p = gradient.len();
+    if direction_out.len() != p {
+        *direction_out = Array1::zeros(p);
+    }
+    let m = constraints.a.nrows();
+    if constraints.a.ncols() != p || constraints.b.len() != m || beta.len() != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "linear constraint shape mismatch: A={}x{}, b={}, p={}",
+            constraints.a.nrows(),
+            constraints.a.ncols(),
+            constraints.b.len(),
+            p
+        )));
+    }
+
+    let tol_active = 1e-10;
+    let tol_step = 1e-12;
+    let tol_dual = 1e-10;
+    let mut x = beta.to_owned();
+    let mut d_total = Array1::<f64>::zeros(p);
+    let mut g_cur = gradient.to_owned();
+
+    // Fast path: unconstrained Newton step already satisfies all inequalities.
+    if solve_newton_direction_dense(hessian, gradient, direction_out).is_ok() {
+        let candidate = beta + &*direction_out;
+        let mut feasible = true;
+        for i in 0..m {
+            let slack = constraints.a.row(i).dot(&candidate) - constraints.b[i];
+            if slack < -1e-10 {
+                feasible = false;
+                break;
+            }
+        }
+        if feasible {
+            return Ok(());
+        }
+    }
+
+    let mut active: Vec<usize> = Vec::new();
+    let mut is_active = vec![false; m];
+    if let Some(hint) = active_hint.as_ref() {
+        for &idx in hint.iter() {
+            if idx < m && !is_active[idx] {
+                active.push(idx);
+                is_active[idx] = true;
+            }
+        }
+    }
+    for i in 0..m {
+        let slack = constraints.a.row(i).dot(&x) - constraints.b[i];
+        if slack <= tol_active && !is_active[i] {
+            active.push(i);
+            is_active[i] = true;
+        }
+    }
+
+    for _ in 0..((p + m + 8) * 4) {
+        let mut a_w = Array2::<f64>::zeros((active.len(), p));
+        for (r, &idx) in active.iter().enumerate() {
+            a_w.row_mut(r).assign(&constraints.a.row(idx));
+        }
+        let (d, lambda_w) = solve_kkt_direction(hessian, &g_cur, &a_w)?;
+        let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if step_norm <= tol_step {
+            if active.is_empty() {
+                direction_out.assign(&d_total);
+                return Ok(());
+            }
+            let mut remove_pos: Option<usize> = None;
+            let mut most_negative = -tol_dual;
+            for (pos, &lam) in lambda_w.iter().enumerate() {
+                if lam < most_negative {
+                    most_negative = lam;
+                    remove_pos = Some(pos);
+                }
+            }
+            if let Some(pos) = remove_pos {
+                let idx = active.remove(pos);
+                is_active[idx] = false;
+                continue;
+            }
+            if let Some(hint) = active_hint {
+                hint.clear();
+                hint.extend(active.iter().copied());
+            }
+            direction_out.assign(&d_total);
+            return Ok(());
+        }
+
+        let mut alpha = 1.0_f64;
+        let mut entering: Option<usize> = None;
+        for i in 0..m {
+            if is_active[i] {
+                continue;
+            }
+            let ai = constraints.a.row(i);
+            let slack = ai.dot(&x) - constraints.b[i];
+            let ai_d = ai.dot(&d);
+            if ai_d < -1e-14 {
+                let cand = (slack / (-ai_d)).max(0.0);
+                if cand < alpha {
+                    alpha = cand;
+                    entering = Some(i);
+                }
+            }
+        }
+
+        x += &(d.mapv(|v| alpha * v));
+        d_total += &(d.mapv(|v| alpha * v));
+        g_cur = gradient + &hessian.dot(&d_total);
+
+        if let Some(idx) = entering
+            && !is_active[idx]
+        {
+            active.push(idx);
+            is_active[idx] = true;
+        }
+    }
+
+    let (worst, row) = max_linear_constraint_violation(&x, constraints);
+    let kkt = compute_constraint_kkt_diagnostics(&x, &g_cur, constraints);
+    Err(EstimationError::ParameterConstraintViolation(format!(
+        "linear-constrained Newton active-set failed to converge; max(Aβ-b violation)={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
+        kkt.primal_feasibility,
+        kkt.dual_feasibility,
+        kkt.complementarity,
+        kkt.stationarity,
+        kkt.n_active,
+        kkt.n_constraints
+    )))
+}
+
 fn default_beta_guess_external(
     p: usize,
     link_function: LinkFunction,
@@ -1186,6 +1741,9 @@ where
     M: WorkingModel + ?Sized,
     F: FnMut(&WorkingModelIterationInfo),
 {
+    if let Some(lb) = options.coefficient_lower_bounds.as_ref() {
+        project_coefficients_to_lower_bounds(&mut beta.0, lb);
+    }
     let mut last_gradient_norm = f64::INFINITY;
     let mut last_deviance_change = f64::INFINITY;
     let mut last_step_size = 0.0;
@@ -1195,6 +1753,12 @@ where
     let mut iterations = 0usize;
     let mut final_state: Option<WorkingState> = None;
     let mut newton_direction = Array1::<f64>::zeros(beta.len());
+    let mut linear_active_hint: Option<Vec<usize>> =
+        options.linear_constraints.as_ref().map(|_| Vec::new());
+    let mut bound_active_hint: Option<Vec<usize>> = options
+        .coefficient_lower_bounds
+        .as_ref()
+        .map(|_| Vec::new());
 
     let penalized_objective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
@@ -1235,13 +1799,36 @@ where
                 regularized[[i, i]] += loop_lambda;
             }
 
-            let direction = match solve_newton_direction_dense(
-                &regularized,
-                &state.gradient,
-                &mut newton_direction,
-            ) {
+            let has_constraints = options.linear_constraints.is_some()
+                || options.coefficient_lower_bounds.is_some();
+            let direction = match if let Some(lin) = options.linear_constraints.as_ref() {
+                solve_newton_direction_with_linear_constraints(
+                    &regularized,
+                    &state.gradient,
+                    beta.as_ref(),
+                    lin,
+                    &mut newton_direction,
+                    linear_active_hint.as_mut(),
+                )
+            } else if let Some(lb) = options.coefficient_lower_bounds.as_ref() {
+                solve_newton_direction_with_lower_bounds(
+                    &regularized,
+                    &state.gradient,
+                    beta.as_ref(),
+                    lb,
+                    &mut newton_direction,
+                    bound_active_hint.as_mut(),
+                )
+            } else {
+                solve_newton_direction_dense(&regularized, &state.gradient, &mut newton_direction)
+            } {
                 Ok(()) => &newton_direction,
-                Err(_) => {
+                Err(e) => {
+                    if has_constraints {
+                        return Err(EstimationError::ParameterConstraintViolation(format!(
+                            "constrained PIRLS step solve failed at iteration {iter} with damping λ={loop_lambda:.3e}: {e}"
+                        )));
+                    }
                     // Singular even with ridge (unlikely unless huge). Increase lambda.
                     if loop_lambda < 1e12 {
                         loop_lambda *= lambda_factor;
@@ -1266,7 +1853,13 @@ where
             let predicted_reduction = -(lin + quad);
 
             // 3. Compute Actual Reduction
-            let candidate_beta = Coefficients::new(&*beta + direction);
+            let mut candidate_vec = &*beta + direction;
+            if options.linear_constraints.is_none()
+                && let Some(lb) = options.coefficient_lower_bounds.as_ref()
+            {
+                project_coefficients_to_lower_bounds(&mut candidate_vec, lb);
+            }
+            let candidate_beta = Coefficients::new(candidate_vec);
             match model.update(&candidate_beta) {
                 Ok(candidate_state) => {
                     let candidate_penalized = penalized_objective(&candidate_state);
@@ -1391,6 +1984,17 @@ where
     }
 
     Ok(WorkingModelPirlsResult {
+        constraint_kkt: options
+            .linear_constraints
+            .as_ref()
+            .map(|lin| compute_constraint_kkt_diagnostics(beta.as_ref(), &state.gradient, lin))
+            .or_else(|| {
+                options.coefficient_lower_bounds.as_ref().and_then(|lb| {
+                    linear_constraints_from_lower_bounds(lb).map(|lin| {
+                        compute_constraint_kkt_diagnostics(beta.as_ref(), &state.gradient, &lin)
+                    })
+                })
+            }),
         beta,
         state,
         status,
@@ -1529,6 +2133,11 @@ pub struct PirlsResult {
     pub last_gradient_norm: f64,
     pub last_deviance_change: f64,
     pub last_step_halving: usize,
+    /// Optional KKT diagnostics when inequality constraints were active.
+    pub constraint_kkt: Option<ConstraintKktDiagnostics>,
+    /// Linear inequality system enforced in transformed PIRLS coordinates:
+    /// `A * beta_transformed >= b`.
+    pub linear_constraints_transformed: Option<LinearInequalityConstraints>,
 
     // Pass through the entire reparameterization result for use in the gradient
     pub reparam_result: ReparamResult,
@@ -1552,6 +2161,7 @@ fn assemble_pirls_result(
     status: PirlsStatus,
     reparam_result: ReparamResult,
     x_transformed: DesignMatrix,
+    linear_constraints_transformed: Option<LinearInequalityConstraints>,
 ) -> PirlsResult {
     let final_eta_arr = working_summary.state.eta.as_ref().clone();
     let (solve_c_array, solve_d_array) = compute_working_weight_derivatives(
@@ -1590,6 +2200,8 @@ fn assemble_pirls_result(
         last_gradient_norm: working_summary.last_gradient_norm,
         last_deviance_change: working_summary.last_deviance_change,
         last_step_halving: working_summary.last_step_halving,
+        constraint_kkt: working_summary.constraint_kkt.clone(),
+        linear_constraints_transformed,
         reparam_result,
         x_transformed,
     }
@@ -1694,6 +2306,8 @@ pub fn fit_model_for_fixed_rho<'a>(
     p: usize,
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
+    coefficient_lower_bounds: Option<&Array1<f64>>,
+    linear_constraints_original: Option<&LinearInequalityConstraints>,
     // Optional per-observation SE for integrated (GHQ) likelihood in calibrator fitting.
     covariate_se: Option<&Array1<f64>>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
@@ -1735,6 +2349,11 @@ pub fn fit_model_for_fixed_rho<'a>(
             EngineDims::new(p, rs_original.len()),
         )?
     };
+    let transformed_bounds =
+        build_transformed_lower_bound_constraints(&reparam_result.qs, coefficient_lower_bounds);
+    let transformed_linear =
+        build_transformed_linear_constraints(&reparam_result.qs, linear_constraints_original);
+    let linear_constraints = merge_linear_constraints(transformed_bounds, transformed_linear);
     let x_original_sparse = if matches!(link_function, LinkFunction::Logit | LinkFunction::Probit)
         && !config.firth_bias_reduction
     {
@@ -1844,6 +2463,9 @@ pub fn fit_model_for_fixed_rho<'a>(
             last_step_size: 1.0,
             last_step_halving: 0,
             max_abs_eta,
+            constraint_kkt: linear_constraints
+                .as_ref()
+                .map(|lin| compute_constraint_kkt_diagnostics(beta_transformed.as_ref(), &gradient, lin)),
         };
 
         let (solve_c_array, solve_d_array) = compute_working_weight_derivatives(
@@ -1882,6 +2504,8 @@ pub fn fit_model_for_fixed_rho<'a>(
             last_gradient_norm: gradient_norm,
             last_deviance_change: 0.0,
             last_step_halving: 0,
+            constraint_kkt: working_summary.constraint_kkt.clone(),
+            linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
             x_transformed,
         };
@@ -1915,7 +2539,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         working_model = working_model.with_covariate_se(se.to_owned());
     }
 
-    let beta_guess_original = warm_start_beta
+    let mut beta_guess_original = warm_start_beta
         .filter(|beta| beta.len() == p)
         .map(|beta| beta.to_owned())
         .unwrap_or_else(|| {
@@ -1926,8 +2550,10 @@ pub fn fit_model_for_fixed_rho<'a>(
                 prior_weights,
             ))
         });
+    if let Some(lb) = coefficient_lower_bounds {
+        project_coefficients_to_lower_bounds(&mut beta_guess_original.0, lb);
+    }
     let initial_beta = reparam_result.qs.t().dot(beta_guess_original.as_ref());
-
     let firth_active = config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit);
     let options = WorkingModelPirlsOptions {
         // Firth logit fits often need more inner iterations to settle.
@@ -1940,6 +2566,8 @@ pub fn fit_model_for_fixed_rho<'a>(
         max_step_halving: if firth_active { 60 } else { 30 },
         min_step_size: if firth_active { 1e-12 } else { 1e-10 },
         firth_bias_reduction: firth_active,
+        coefficient_lower_bounds: None,
+        linear_constraints: linear_constraints.clone(),
     };
 
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
@@ -2056,6 +2684,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         status,
         reparam_result,
         x_transformed,
+        linear_constraints,
     );
 
     Ok((pirls_result, working_summary))
@@ -2077,6 +2706,8 @@ pub fn fit_model_for_fixed_rho_matrix(
     p: usize,
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
+    coefficient_lower_bounds: Option<&Array1<f64>>,
+    linear_constraints_original: Option<&LinearInequalityConstraints>,
     covariate_se: Option<&Array1<f64>>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     match x {
@@ -2092,6 +2723,8 @@ pub fn fit_model_for_fixed_rho_matrix(
             p,
             config,
             warm_start_beta,
+            coefficient_lower_bounds,
+            linear_constraints_original,
             covariate_se,
         ),
         DesignMatrix::Sparse(x_sparse)
@@ -2112,6 +2745,8 @@ pub fn fit_model_for_fixed_rho_matrix(
                 p,
                 config,
                 warm_start_beta,
+                coefficient_lower_bounds,
+                linear_constraints_original,
                 covariate_se,
             )
         }
@@ -2130,6 +2765,8 @@ pub fn fit_model_for_fixed_rho_matrix(
                 p,
                 config,
                 warm_start_beta,
+                coefficient_lower_bounds,
+                linear_constraints_original,
                 covariate_se,
             )
         }
@@ -2148,6 +2785,8 @@ fn fit_model_for_fixed_rho_sparse_implicit(
     p: usize,
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
+    coefficient_lower_bounds: Option<&Array1<f64>>,
+    linear_constraints_original: Option<&LinearInequalityConstraints>,
     covariate_se: Option<&Array1<f64>>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let quad_ctx = crate::quadrature::QuadratureContext::new();
@@ -2205,7 +2844,7 @@ fn fit_model_for_fixed_rho_sparse_implicit(
     if let Some(se) = covariate_se {
         working_model = working_model.with_covariate_se(se.to_owned());
     }
-    let beta_guess_original = warm_start_beta
+    let mut beta_guess_original = warm_start_beta
         .filter(|beta| beta.len() == p)
         .map(|beta| beta.to_owned())
         .unwrap_or_else(|| {
@@ -2216,13 +2855,23 @@ fn fit_model_for_fixed_rho_sparse_implicit(
                 prior_weights,
             ))
         });
+    if let Some(lb) = coefficient_lower_bounds {
+        project_coefficients_to_lower_bounds(&mut beta_guess_original.0, lb);
+    }
     let initial_beta = reparam_result.qs.t().dot(beta_guess_original.as_ref());
+    let transformed_bounds =
+        build_transformed_lower_bound_constraints(&reparam_result.qs, coefficient_lower_bounds);
+    let transformed_linear =
+        build_transformed_linear_constraints(&reparam_result.qs, linear_constraints_original);
+    let linear_constraints = merge_linear_constraints(transformed_bounds, transformed_linear);
     let options = WorkingModelPirlsOptions {
         max_iterations: config.max_iterations,
         convergence_tolerance: config.convergence_tolerance,
         max_step_halving: 30,
         min_step_size: 1e-10,
         firth_bias_reduction: false,
+        coefficient_lower_bounds: None,
+        linear_constraints: linear_constraints.clone(),
     };
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
         log::debug!(
@@ -2301,6 +2950,7 @@ fn fit_model_for_fixed_rho_sparse_implicit(
         status,
         reparam_result,
         x_transformed,
+        linear_constraints,
     );
     Ok((pirls_result, working_summary))
 }
@@ -2351,6 +3001,8 @@ pub fn run_pirls<'a>(
     k: usize,
     opts: &RunPirlsOptions,
     warm_start_beta: Option<&Coefficients>,
+    coefficient_lower_bounds: Option<&Array1<f64>>,
+    linear_constraints_original: Option<&LinearInequalityConstraints>,
     covariate_se: Option<&Array1<f64>>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let (link, firth_active) = resolve_pirls_family(opts.family, opts.firth_bias_reduction)?;
@@ -2379,6 +3031,8 @@ pub fn run_pirls<'a>(
         p,
         &cfg,
         warm_start_beta,
+        coefficient_lower_bounds,
+        linear_constraints_original,
         covariate_se,
     )
 }
@@ -2430,6 +3084,65 @@ fn design_dot_dense_rhs(x: &DesignMatrix, rhs: &Array2<f64>) -> Array2<f64> {
                 out.column_mut(col).assign(&v);
             }
             out
+        }
+    }
+}
+
+fn build_transformed_lower_bound_constraints(
+    qs: &Array2<f64>,
+    coefficient_lower_bounds: Option<&Array1<f64>>,
+) -> Option<LinearInequalityConstraints> {
+    let lb = coefficient_lower_bounds?;
+    if lb.len() != qs.nrows() {
+        return None;
+    }
+    let active_rows: Vec<usize> = (0..lb.len()).filter(|&i| lb[i].is_finite()).collect();
+    if active_rows.is_empty() {
+        return None;
+    }
+    let mut a = Array2::<f64>::zeros((active_rows.len(), qs.ncols()));
+    let mut b = Array1::<f64>::zeros(active_rows.len());
+    for (r, &idx) in active_rows.iter().enumerate() {
+        a.row_mut(r).assign(&qs.row(idx));
+        b[r] = lb[idx];
+    }
+    Some(LinearInequalityConstraints { a, b })
+}
+
+fn build_transformed_linear_constraints(
+    qs: &Array2<f64>,
+    linear_constraints: Option<&LinearInequalityConstraints>,
+) -> Option<LinearInequalityConstraints> {
+    let lc = linear_constraints?;
+    if lc.a.ncols() != qs.nrows() {
+        return None;
+    }
+    Some(LinearInequalityConstraints {
+        a: lc.a.dot(qs),
+        b: lc.b.clone(),
+    })
+}
+
+fn merge_linear_constraints(
+    first: Option<LinearInequalityConstraints>,
+    second: Option<LinearInequalityConstraints>,
+) -> Option<LinearInequalityConstraints> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(c), None) | (None, Some(c)) => Some(c),
+        (Some(c1), Some(c2)) => {
+            if c1.a.ncols() != c2.a.ncols() {
+                return None;
+            }
+            let rows = c1.a.nrows() + c2.a.nrows();
+            let cols = c1.a.ncols();
+            let mut a = Array2::<f64>::zeros((rows, cols));
+            a.slice_mut(s![0..c1.a.nrows(), ..]).assign(&c1.a);
+            a.slice_mut(s![c1.a.nrows()..rows, ..]).assign(&c2.a);
+            let mut b = Array1::<f64>::zeros(rows);
+            b.slice_mut(s![0..c1.b.len()]).assign(&c1.b);
+            b.slice_mut(s![c1.b.len()..rows]).assign(&c2.b);
+            Some(LinearInequalityConstraints { a, b })
         }
     }
 }
@@ -3349,7 +4062,9 @@ pub fn compute_final_penalized_hessian(
 
 #[cfg(test)]
 mod tests {
-    use super::calculate_scale;
+    use super::{
+        LinearInequalityConstraints, calculate_scale, compute_constraint_kkt_diagnostics,
+    };
     use crate::types::LinkFunction;
     use ndarray::{Array1, array};
 
@@ -3414,5 +4129,37 @@ mod tests {
             scale,
             expected
         );
+    }
+
+    #[test]
+    fn kkt_diagnostics_zero_for_strictly_feasible_stationary_point() {
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 0.0], [0.0, 1.0]],
+            b: array![0.0, 0.0],
+        };
+        let beta = array![1.0, 2.0];
+        let grad = array![0.0, 0.0];
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        assert!(diag.primal_feasibility <= 1e-12);
+        assert!(diag.dual_feasibility <= 1e-12);
+        assert!(diag.complementarity <= 1e-12);
+        assert!(diag.stationarity <= 1e-12);
+    }
+
+    #[test]
+    fn kkt_diagnostics_capture_active_lower_bound_solution() {
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 0.0], [0.0, 1.0]],
+            b: array![0.0, 0.0],
+        };
+        let beta = array![0.0, 1.5];
+        let grad = array![2.0, 0.0];
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        assert_eq!(diag.n_constraints, 2);
+        assert_eq!(diag.n_active, 1);
+        assert!(diag.primal_feasibility <= 1e-12);
+        assert!(diag.dual_feasibility <= 1e-12);
+        assert!(diag.complementarity <= 1e-12);
+        assert!(diag.stationarity <= 1e-10);
     }
 }
