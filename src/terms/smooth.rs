@@ -1,15 +1,13 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BasisBuildResult, BasisError, BasisMetadata,
-    DuchonBasisSpec, MaternBasisSpec, ThinPlateBasisSpec, build_bspline_basis_1d,
-    build_duchon_basis, build_matern_basis, build_thin_plate_basis,
-    create_bspline_basis_nd_with_knots,
+    DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, ThinPlateBasisSpec,
+    apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis, build_matern_basis,
+    build_thin_plate_basis, create_bspline_basis_nd_with_knots, estimate_penalty_nullity,
 };
-#[cfg(test)]
-use crate::basis::MaternIdentifiability;
 use crate::construction::kronecker_product;
 use crate::estimate::{EstimationError, FitOptions, FitResult, fit_gam};
 use crate::types::LikelihoodFamily;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -60,6 +58,21 @@ pub enum SmoothBasisSpec {
 pub struct TensorBSplineSpec {
     pub marginal_specs: Vec<BSplineBasisSpec>,
     pub double_penalty: bool,
+    #[serde(default)]
+    pub identifiability: TensorBSplineIdentifiability,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TensorBSplineIdentifiability {
+    None,
+    SumToZero,
+    FrozenTransform { transform: Array2<f64> },
+}
+
+impl Default for TensorBSplineIdentifiability {
+    fn default() -> Self {
+        Self::SumToZero
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,7 +270,6 @@ fn build_tensor_bspline_basis(
     let mut marginal_degrees = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_num_basis = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
-    let mut marginal_null_dims = Vec::<usize>::with_capacity(feature_cols.len());
 
     // Reuse the robust 1D builder to ensure the same knot validation and
     // marginal difference-penalty construction as standalone smooth terms.
@@ -295,25 +307,22 @@ fn build_tensor_bspline_basis(
                 })?
                 .clone(),
         );
-        marginal_null_dims.push(*built.nullspace_dims.first().ok_or_else(|| {
+        let _ = built.nullspace_dims.first().ok_or_else(|| {
             BasisError::InvalidInput(format!(
                 "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"
             ))
-        })?);
+        })?;
     }
 
     let data_views: Vec<_> = feature_cols.iter().map(|&c| data.column(c)).collect();
     let knot_views: Vec<_> = marginal_knots.iter().map(|k| k.view()).collect();
     let (basis, _) =
         create_bspline_basis_nd_with_knots(&data_views, &knot_views, &marginal_degrees)?;
-    let design = (*basis).clone();
+    let mut design = (*basis).clone();
 
     let total_cols = design.ncols();
     let mut penalties = Vec::<Array2<f64>>::with_capacity(
         marginal_penalties.len() + if spec.double_penalty { 1 } else { 0 },
-    );
-    let mut nullspace_dims = Vec::<usize>::with_capacity(
-        marginal_null_dims.len() + if spec.double_penalty { 1 } else { 0 },
     );
 
     for dim in 0..marginal_penalties.len() {
@@ -327,26 +336,51 @@ fn build_tensor_bspline_basis(
             s_dim = kronecker_product(&s_dim, &factor);
         }
 
-        let mut null_dim = marginal_null_dims[dim];
-        for (j, &qj) in marginal_num_basis.iter().enumerate() {
-            if j == dim {
-                continue;
-            }
-            null_dim = null_dim.checked_mul(qj).ok_or_else(|| {
-                BasisError::DimensionMismatch(
-                    "TensorBSpline null-space dimension overflow".to_string(),
-                )
-            })?;
-        }
-
         penalties.push(s_dim);
-        nullspace_dims.push(null_dim);
     }
 
     if spec.double_penalty {
         penalties.push(Array2::<f64>::eye(total_cols));
-        nullspace_dims.push(0);
     }
+
+    let z_opt = match &spec.identifiability {
+        TensorBSplineIdentifiability::None => None,
+        TensorBSplineIdentifiability::SumToZero => {
+            if total_cols < 2 {
+                return Err(BasisError::InvalidInput(
+                    "TensorBSpline requires at least 2 basis coefficients to enforce sum-to-zero identifiability".to_string(),
+                ));
+            }
+            let (_design_constrained, z) = apply_sum_to_zero_constraint(design.view(), None)?;
+            Some(z)
+        }
+        TensorBSplineIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != total_cols {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen tensor identifiability transform mismatch: design has {} columns but transform has {} rows",
+                    total_cols,
+                    transform.nrows()
+                )));
+            }
+            Some(transform.clone())
+        }
+    };
+
+    if let Some(z) = z_opt.as_ref() {
+        design = design.dot(z);
+        penalties = penalties
+            .into_iter()
+            .map(|s| {
+                let zt_s = z.t().dot(&s);
+                zt_s.dot(z)
+            })
+            .collect();
+    }
+
+    let nullspace_dims = penalties
+        .iter()
+        .map(estimate_penalty_nullity)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(BasisBuildResult {
         design,
@@ -356,6 +390,7 @@ fn build_tensor_bspline_basis(
             feature_cols: feature_cols.to_vec(),
             knots: marginal_knots,
             degrees: marginal_degrees,
+            identifiability_transform: z_opt,
         },
     })
 }
@@ -569,7 +604,7 @@ pub fn build_term_collection_design(
 ) -> Result<TermCollectionDesign, BasisError> {
     let n = data.nrows();
     let p_data = data.ncols();
-    let smooth = build_smooth_design(data, &spec.smooth_terms)?;
+    let smooth_raw = build_smooth_design(data, &spec.smooth_terms)?;
     let random_blocks: Vec<RandomEffectBlock> = spec
         .random_effect_terms
         .iter()
@@ -584,6 +619,11 @@ pub fn build_term_collection_design(
             )));
         }
     }
+
+    let linear_feature_cols: BTreeSet<usize> =
+        spec.linear_terms.iter().map(|t| t.feature_col).collect();
+    let smooth =
+        prune_spatial_polynomial_overlaps(smooth_raw, &spec.smooth_terms, &linear_feature_cols)?;
 
     let p_intercept = 1usize;
     let p_lin = spec.linear_terms.len();
@@ -663,6 +703,144 @@ pub fn build_term_collection_design(
         random_effect_levels,
         smooth,
     })
+}
+
+fn prune_spatial_polynomial_overlaps(
+    smooth: SmoothDesign,
+    smooth_specs: &[SmoothTermSpec],
+    linear_feature_cols: &BTreeSet<usize>,
+) -> Result<SmoothDesign, BasisError> {
+    if smooth_specs.len() != smooth.terms.len() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "smooth spec count ({}) does not match built term count ({})",
+            smooth_specs.len(),
+            smooth.terms.len()
+        )));
+    }
+
+    let n = smooth.design.nrows();
+    let mut local_designs = Vec::<Array2<f64>>::with_capacity(smooth.terms.len());
+    let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(smooth.terms.len());
+    let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(smooth.terms.len());
+    let mut local_dims = Vec::<usize>::with_capacity(smooth.terms.len());
+
+    for (idx, term) in smooth.terms.iter().enumerate() {
+        let term_spec = &smooth_specs[idx];
+        let design_local = smooth
+            .design
+            .slice(s![.., term.coeff_range.clone()])
+            .to_owned();
+        let keep = spatial_keep_columns(term_spec, design_local.ncols(), linear_feature_cols);
+
+        let design_pruned = design_local.select(Axis(1), &keep);
+        let mut penalties_pruned = Vec::<Array2<f64>>::with_capacity(term.penalties_local.len());
+        let mut nullspace_pruned = Vec::<usize>::with_capacity(term.penalties_local.len());
+        for s_local in &term.penalties_local {
+            let s_rows = s_local.select(Axis(0), &keep);
+            let s_pruned = s_rows.select(Axis(1), &keep);
+            let ns = estimate_penalty_nullity(&s_pruned)?;
+            penalties_pruned.push(s_pruned);
+            nullspace_pruned.push(ns);
+        }
+
+        local_dims.push(design_pruned.ncols());
+        local_designs.push(design_pruned);
+        local_penalties.push(penalties_pruned);
+        local_nullspaces.push(nullspace_pruned);
+    }
+
+    let total_p: usize = local_dims.iter().sum();
+    let mut design = Array2::<f64>::zeros((n, total_p));
+    let mut terms_out = Vec::<SmoothTerm>::with_capacity(smooth.terms.len());
+    let mut penalties_global = Vec::<Array2<f64>>::new();
+    let mut nullspace_dims_global = Vec::<usize>::new();
+
+    let mut col_start = 0usize;
+    for idx in 0..smooth.terms.len() {
+        let p_local = local_dims[idx];
+        let col_end = col_start + p_local;
+        design
+            .slice_mut(s![.., col_start..col_end])
+            .assign(&local_designs[idx]);
+
+        for (s_local, &ns) in local_penalties[idx]
+            .iter()
+            .zip(local_nullspaces[idx].iter())
+        {
+            let mut s_global = Array2::<f64>::zeros((total_p, total_p));
+            s_global
+                .slice_mut(s![col_start..col_end, col_start..col_end])
+                .assign(s_local);
+            penalties_global.push(s_global);
+            nullspace_dims_global.push(ns);
+        }
+
+        terms_out.push(SmoothTerm {
+            name: smooth.terms[idx].name.clone(),
+            coeff_range: col_start..col_end,
+            shape: smooth.terms[idx].shape,
+            penalties_local: local_penalties[idx].clone(),
+            nullspace_dims: local_nullspaces[idx].clone(),
+            metadata: smooth.terms[idx].metadata.clone(),
+        });
+
+        col_start = col_end;
+    }
+
+    Ok(SmoothDesign {
+        design,
+        penalties: penalties_global,
+        nullspace_dims: nullspace_dims_global,
+        terms: terms_out,
+    })
+}
+
+fn spatial_keep_columns(
+    term_spec: &SmoothTermSpec,
+    p_local: usize,
+    linear_feature_cols: &BTreeSet<usize>,
+) -> Vec<usize> {
+    let mut keep = vec![true; p_local];
+    match &term_spec.basis {
+        SmoothBasisSpec::ThinPlate { feature_cols, .. } => {
+            mark_spatial_poly_overlap_drops(&mut keep, feature_cols, linear_feature_cols);
+        }
+        SmoothBasisSpec::Duchon {
+            feature_cols, spec, ..
+        } => {
+            if spec.nullspace_order == DuchonNullspaceOrder::Linear {
+                mark_spatial_poly_overlap_drops(&mut keep, feature_cols, linear_feature_cols);
+            }
+        }
+        _ => {}
+    }
+    keep.into_iter()
+        .enumerate()
+        .filter_map(|(j, kept)| kept.then_some(j))
+        .collect()
+}
+
+fn mark_spatial_poly_overlap_drops(
+    keep: &mut [bool],
+    feature_cols: &[usize],
+    linear_feature_cols: &BTreeSet<usize>,
+) {
+    let p_local = keep.len();
+    let d = feature_cols.len();
+    let poly_cols = d + 1;
+    if p_local < poly_cols {
+        return;
+    }
+    let kernel_cols = p_local - poly_cols;
+
+    // The full term collection always has a global intercept at column 0.
+    keep[kernel_cols] = false;
+
+    for (j, &feature_col) in feature_cols.iter().enumerate() {
+        if linear_feature_cols.contains(&feature_col) {
+            keep[kernel_cols + 1 + j] = false;
+        }
+    }
 }
 
 pub fn fit_term_collection(
@@ -852,7 +1030,7 @@ where
         blocks.push((false, *idx));
     }
 
-    for outer in 0..kappa_options.max_outer_iter {
+    for _outer in 0..kappa_options.max_outer_iter {
         let mut any_improvement = false;
         for (is_mean_block, term_idx) in &blocks {
             let spec_ref = if *is_mean_block {
@@ -1176,7 +1354,33 @@ mod tests {
         BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
         DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu, ThinPlateBasisSpec,
     };
+    use crate::faer_ndarray::FaerSvd;
     use ndarray::array;
+
+    fn numerical_rank(x: &Array2<f64>) -> usize {
+        let (_, s, _) = x
+            .svd(false, false)
+            .expect("SVD should succeed in rank test");
+        let sigma_max = s.iter().copied().fold(0.0_f64, f64::max);
+        let tol = (x.nrows().max(x.ncols()).max(1) as f64) * f64::EPSILON * sigma_max.max(1.0);
+        s.iter().filter(|&&sv| sv > tol).count()
+    }
+
+    fn residual_norm_to_column_space(x: &Array2<f64>, y: &Array1<f64>) -> f64 {
+        let (u_opt, _, _) = x
+            .svd(true, false)
+            .expect("SVD should succeed in projection residual test");
+        let u = u_opt.expect("left singular vectors should be present");
+        let rank = numerical_rank(x);
+        let mut proj = Array1::<f64>::zeros(y.len());
+        for j in 0..rank.min(u.ncols()) {
+            let uj = u.column(j);
+            let coeff = uj.dot(y);
+            proj += &(&uj.to_owned() * coeff);
+        }
+        let resid = y - &proj;
+        resid.dot(&resid).sqrt()
+    }
 
     #[test]
     fn smooth_design_assembles_terms_and_penalties() {
@@ -1223,8 +1427,10 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), data.nrows());
         assert_eq!(sd.terms.len(), 2);
-        assert_eq!(sd.penalties.len(), 4);
-        assert_eq!(sd.nullspace_dims.len(), 4);
+        // bspline double-penalty contributes two blocks; tps double-penalty is
+        // represented as one fully-shrunk block.
+        assert_eq!(sd.penalties.len(), 3);
+        assert_eq!(sd.nullspace_dims.len(), 3);
         for s in &sd.penalties {
             assert_eq!(s.nrows(), sd.design.ncols());
             assert_eq!(s.ncols(), sd.design.ncols());
@@ -1307,8 +1513,103 @@ mod tests {
         assert!(design.design.ncols() >= 2);
         assert_eq!(design.linear_ranges.len(), 1);
         assert_eq!(design.random_effect_ranges.len(), 0);
-        assert_eq!(design.penalties.len(), 3); // linear ridge + 2 smooth penalties
-        assert_eq!(design.nullspace_dims.len(), 3);
+        assert_eq!(design.penalties.len(), 2); // linear ridge + 1 smooth penalty
+        assert_eq!(design.nullspace_dims.len(), 2);
+    }
+
+    #[test]
+    fn spatial_smooth_columns_do_not_duplicate_global_intercept() {
+        let data = array![
+            [0.0, 0.0],
+            [0.2, 0.1],
+            [0.4, 0.3],
+            [0.6, 0.6],
+            [0.8, 0.7],
+            [1.0, 1.0],
+        ];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "tps_xy".to_string(),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![0, 1],
+                    spec: ThinPlateBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        double_penalty: false,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).unwrap();
+        let smooth_start = 1usize;
+        let smooth_end = smooth_start + design.smooth.design.ncols();
+        for col in smooth_start..smooth_end {
+            let is_all_ones = design
+                .design
+                .column(col)
+                .iter()
+                .all(|&v| (v - 1.0).abs() < 1e-12);
+            assert!(
+                !is_all_ones,
+                "smooth column {col} unexpectedly duplicated intercept"
+            );
+        }
+    }
+
+    #[test]
+    fn spatial_smooth_drops_matching_linear_trend_columns() {
+        let data = array![
+            [0.0, 0.1],
+            [0.2, 0.0],
+            [0.3, 0.4],
+            [0.5, 0.2],
+            [0.7, 0.9],
+            [1.0, 0.8],
+        ];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "lin_x0".to_string(),
+                feature_col: 0,
+                double_penalty: false,
+            }],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "tps_xy".to_string(),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![0, 1],
+                    spec: ThinPlateBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        double_penalty: false,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).unwrap();
+
+        // Raw TPS width for k=4,d=2 is 4; we drop intercept + matching x0 linear component.
+        assert_eq!(design.smooth.design.ncols(), 2);
+
+        let lin_col = design.linear_ranges[0].1.start;
+        let lin_values = design.design.column(lin_col).to_owned();
+        let smooth_start = 1 + spec.linear_terms.len();
+        let smooth_end = smooth_start + design.smooth.design.ncols();
+        for col in smooth_start..smooth_end {
+            let same_as_linear = design
+                .design
+                .column(col)
+                .iter()
+                .zip(lin_values.iter())
+                .all(|(&a, &b)| (a - b).abs() < 1e-12);
+            assert!(
+                !same_as_linear,
+                "smooth column {col} unexpectedly duplicated linear term column"
+            );
+        }
     }
 
     #[test]
@@ -1375,12 +1676,10 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        // kernel + ridge penalties
-        assert_eq!(sd.penalties.len(), 2);
-        assert_eq!(sd.nullspace_dims.len(), 2);
-        // centered Matérn smooth has no unpenalized intercept mode
+        // Matérn double-penalty is represented as one fully-shrunk block.
+        assert_eq!(sd.penalties.len(), 1);
+        assert_eq!(sd.nullspace_dims.len(), 1);
         assert_eq!(sd.nullspace_dims[0], 0);
-        assert_eq!(sd.nullspace_dims[1], 0);
     }
 
     #[test]
@@ -1412,11 +1711,10 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        assert_eq!(sd.penalties.len(), 2);
-        assert_eq!(sd.nullspace_dims.len(), 2);
-        // Linear null space in d dimensions -> d+1 free polynomial terms
-        assert_eq!(sd.nullspace_dims[0], d + 1);
-        assert_eq!(sd.nullspace_dims[1], 0);
+        // Duchon double-penalty is represented as one fully-shrunk block.
+        assert_eq!(sd.penalties.len(), 1);
+        assert_eq!(sd.nullspace_dims.len(), 1);
+        assert_eq!(sd.nullspace_dims[0], 0);
     }
 
     #[test]
@@ -1456,6 +1754,7 @@ mod tests {
                 spec: TensorBSplineSpec {
                     marginal_specs: vec![spec_x, spec_y],
                     double_penalty: true,
+                    identifiability: TensorBSplineIdentifiability::default(),
                 },
             },
             shape: ShapeConstraint::None,
@@ -1469,6 +1768,67 @@ mod tests {
         assert_eq!(sd.nullspace_dims.len(), 3);
         assert!(sd.penalties.iter().all(|s| s.nrows() == sd.design.ncols()));
         assert!(sd.penalties.iter().all(|s| s.ncols() == sd.design.ncols()));
+    }
+
+    #[test]
+    fn tensor_bspline_design_is_identifiable_against_global_intercept() {
+        let n = 120usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (3.0 * t).sin();
+        }
+
+        let tensor_term = SmoothTermSpec {
+            name: "te_xy".to_string(),
+            basis: SmoothBasisSpec::TensorBSpline {
+                feature_cols: vec![0, 1],
+                spec: TensorBSplineSpec {
+                    marginal_specs: vec![
+                        BSplineBasisSpec {
+                            degree: 3,
+                            penalty_order: 2,
+                            knot_spec: BSplineKnotSpec::Generate {
+                                data_range: (0.0, 1.0),
+                                num_internal_knots: 6,
+                            },
+                            double_penalty: false,
+                            identifiability: BSplineIdentifiability::default(),
+                        },
+                        BSplineBasisSpec {
+                            degree: 3,
+                            penalty_order: 2,
+                            knot_spec: BSplineKnotSpec::Generate {
+                                data_range: (-1.0, 1.0),
+                                num_internal_knots: 6,
+                            },
+                            double_penalty: false,
+                            identifiability: BSplineIdentifiability::default(),
+                        },
+                    ],
+                    double_penalty: false,
+                    identifiability: TensorBSplineIdentifiability::default(),
+                },
+            },
+            shape: ShapeConstraint::None,
+        };
+
+        let sd = build_smooth_design(data.view(), &[tensor_term.clone()]).unwrap();
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![tensor_term],
+        };
+        let full = build_term_collection_design(data.view(), &spec).unwrap();
+        let ones = Array1::<f64>::ones(n);
+        let residual_vs_tensor = residual_norm_to_column_space(&sd.design, &ones);
+        let residual_vs_full = residual_norm_to_column_space(&full.design, &ones);
+
+        // Tensor block alone must not be able to represent the constant surface.
+        assert!(residual_vs_tensor > 1e-6);
+        // With explicit intercept, constants should be represented (near) exactly.
+        assert!(residual_vs_full < 1e-8);
     }
 
     #[test]

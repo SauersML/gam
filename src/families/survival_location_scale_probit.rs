@@ -2,6 +2,7 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
     ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
+use crate::faer_ndarray::FaerSvd;
 use crate::matrix::DesignMatrix;
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use ndarray::{Array1, Array2, s};
@@ -19,6 +20,7 @@ pub trait ResidualDistributionOps {
     fn cdf(&self, z: f64) -> f64;
     fn pdf(&self, z: f64) -> f64;
     fn pdf_derivative(&self, z: f64) -> f64;
+    fn pdf_second_derivative(&self, z: f64) -> f64;
 }
 
 impl ResidualDistributionOps for ResidualDistribution {
@@ -66,6 +68,25 @@ impl ResidualDistributionOps for ResidualDistribution {
             }
         }
     }
+
+    fn pdf_second_derivative(&self, z: f64) -> f64 {
+        match self {
+            ResidualDistribution::Gaussian => {
+                let f = normal_pdf(z);
+                (z * z - 1.0) * f
+            }
+            ResidualDistribution::Gumbel => {
+                let ez = z.clamp(-40.0, 40.0).exp();
+                let f = ez * (-ez).exp();
+                f * (1.0 - 3.0 * ez + ez * ez)
+            }
+            ResidualDistribution::Logistic => {
+                let s = self.cdf(z);
+                let f = s * (1.0 - s);
+                f * (1.0 - 6.0 * s + 6.0 * s * s)
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -101,6 +122,11 @@ pub struct SurvivalLocationScaleProbitSpec {
     pub distribution: ResidualDistribution,
     pub derivative_guard: f64,
     pub derivative_softness: f64,
+    /// Optional anchor time for identifiability of h(t).
+    ///
+    /// If `None`, the model anchors at the earliest observed entry time.
+    /// If `Some(t_anchor)`, the nearest observed entry-time row is used.
+    pub time_anchor: Option<f64>,
     pub max_iter: usize,
     pub tol: f64,
     pub time_block: TimeBlockInput,
@@ -144,6 +170,7 @@ struct GuardedDerivative {
     safe: Array1<f64>,
     d1: Array1<f64>,
     d2: Array1<f64>,
+    d3: Array1<f64>,
 }
 
 #[derive(Clone)]
@@ -272,6 +299,88 @@ fn stack_time_offset(input: &TimeBlockInput) -> Array1<f64> {
     out
 }
 
+#[derive(Clone)]
+struct TimeIdentifiabilityTransform {
+    z: Array2<f64>,
+}
+
+#[derive(Clone)]
+struct TimeBlockPrepared {
+    design_entry: Array2<f64>,
+    design_exit: Array2<f64>,
+    design_derivative_exit: Array2<f64>,
+    penalties: Vec<Array2<f64>>,
+    initial_beta: Option<Array1<f64>>,
+    transform: TimeIdentifiabilityTransform,
+}
+
+fn prepare_identified_time_block(
+    input: &TimeBlockInput,
+    anchor_row: usize,
+) -> Result<TimeBlockPrepared, String> {
+    let p = input.design_exit.ncols();
+    if p < 2 {
+        return Err(format!(
+            "time_block needs at least 2 columns for identifiability, got {p}"
+        ));
+    }
+    if anchor_row >= input.design_exit.nrows() {
+        return Err(format!(
+            "time_block anchor row out of bounds: got {anchor_row}, nrows={}",
+            input.design_exit.nrows()
+        ));
+    }
+
+    // Identifiability: enforce h(t_anchor)=0 by constraining c^T beta = 0,
+    // where c is the time basis row at anchor time. Reparameterize beta = Z theta
+    // with columns of Z spanning null(c^T), so the constraint is exact for all theta.
+    let c = input.design_exit.row(anchor_row).to_owned();
+    let mut c_mat = Array2::<f64>::zeros((p, 1));
+    c_mat.column_mut(0).assign(&c);
+    let (u_opt, singular_values, _) = c_mat
+        .svd(true, false)
+        .map_err(|e| format!("time_block identifiability SVD failed: {e}"))?;
+    let u = u_opt.ok_or_else(|| "time_block identifiability SVD returned no U".to_string())?;
+    let max_sigma = singular_values
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let tol = (p.max(1) as f64) * f64::EPSILON * max_sigma.max(1.0);
+    let rank = singular_values
+        .iter()
+        .filter(|&&sigma| sigma.abs() > tol)
+        .count();
+    if rank >= p {
+        return Err(
+            "time_block identifiability constraint removed all columns; add richer time basis"
+                .to_string(),
+        );
+    }
+    let z = if rank == 0 {
+        Array2::<f64>::eye(p)
+    } else {
+        u.slice(s![.., rank..]).to_owned()
+    };
+    let design_entry = input.design_entry.dot(&z);
+    let design_exit = input.design_exit.dot(&z);
+    let design_derivative_exit = input.design_derivative_exit.dot(&z);
+    let penalties = input
+        .penalties
+        .iter()
+        .map(|s| z.t().dot(s).dot(&z))
+        .collect::<Vec<_>>();
+    let initial_beta = input.initial_beta.as_ref().map(|b| z.t().dot(b));
+
+    Ok(TimeBlockPrepared {
+        design_entry,
+        design_exit,
+        design_derivative_exit,
+        penalties,
+        initial_beta,
+        transform: TimeIdentifiabilityTransform { z },
+    })
+}
+
 fn initial_log_lambdas(
     penalties: &[Array2<f64>],
     rho0: Option<Array1<f64>>,
@@ -285,6 +394,37 @@ fn initial_log_lambdas(
         ));
     }
     Ok(rho)
+}
+
+fn select_anchor_row(age_entry: &Array1<f64>, time_anchor: Option<f64>) -> Result<usize, String> {
+    if age_entry.is_empty() {
+        return Err("select_anchor_row: empty age_entry".to_string());
+    }
+    match time_anchor {
+        None => age_entry
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .ok_or_else(|| "select_anchor_row: failed to select earliest entry".to_string()),
+        Some(t_anchor) => {
+            if !t_anchor.is_finite() {
+                return Err(format!(
+                    "fit_survival_location_scale_probit: non-finite time_anchor {t_anchor}"
+                ));
+            }
+            age_entry
+                .iter()
+                .enumerate()
+                .min_by(|a, b| {
+                    let da = (a.1 - t_anchor).abs();
+                    let db = (b.1 - t_anchor).abs();
+                    da.total_cmp(&db)
+                })
+                .map(|(i, _)| i)
+                .ok_or_else(|| "select_anchor_row: failed to select nearest entry".to_string())
+        }
+    }
 }
 
 fn dense_design(design: &DesignMatrix, name: &str) -> Result<Array2<f64>, String> {
@@ -322,12 +462,14 @@ fn guarded_derivative(raw: &Array1<f64>, guard: f64, tau: f64) -> GuardedDerivat
     let mut safe = Array1::<f64>::zeros(raw.len());
     let mut d1 = Array1::<f64>::zeros(raw.len());
     let mut d2 = Array1::<f64>::zeros(raw.len());
+    let mut d3 = Array1::<f64>::zeros(raw.len());
     for i in 0..raw.len() {
         let z = (raw[i] - g) / t;
         if z >= 30.0 {
             safe[i] = raw[i];
             d1[i] = 1.0;
             d2[i] = 0.0;
+            d3[i] = 0.0;
             continue;
         }
         if z <= -30.0 {
@@ -335,6 +477,7 @@ fn guarded_derivative(raw: &Array1<f64>, guard: f64, tau: f64) -> GuardedDerivat
             safe[i] = g + t * ez;
             d1[i] = ez;
             d2[i] = ez / t;
+            d3[i] = ez / (t * t);
             continue;
         }
         let softplus = if z > 0.0 {
@@ -346,8 +489,9 @@ fn guarded_derivative(raw: &Array1<f64>, guard: f64, tau: f64) -> GuardedDerivat
         safe[i] = g + t * softplus;
         d1[i] = sig;
         d2[i] = sig * (1.0 - sig) / t;
+        d3[i] = sig * (1.0 - sig) * (1.0 - 2.0 * sig) / (t * t);
     }
-    GuardedDerivative { safe, d1, d2 }
+    GuardedDerivative { safe, d1, d2, d3 }
 }
 
 fn xt_diag_x(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
@@ -502,6 +646,190 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             ],
         })
     }
+
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        d_beta: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 3 {
+            return Err(format!(
+                "SurvivalLocationScaleProbitFamily expects 3 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.n;
+        let eta_time = &block_states[Self::BLOCK_TIME].eta;
+        let eta_t = &block_states[Self::BLOCK_THRESHOLD].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_time.len() != 3 * n || eta_t.len() != n || eta_ls.len() != n {
+            return Err("survival probit-location-scale eta dimension mismatch".to_string());
+        }
+
+        let h0 = eta_time.slice(s![0..n]).to_owned();
+        let h1 = eta_time.slice(s![n..2 * n]).to_owned();
+        let d_raw = eta_time.slice(s![2 * n..3 * n]).to_owned();
+        let d_guard = guarded_derivative(&d_raw, self.derivative_guard, self.derivative_softness);
+
+        let (sigma, ds, d2s) = safe_sigma_from_eta(eta_ls, self.sigma_min, self.sigma_max);
+        let q = Array1::from_iter(
+            eta_t
+                .iter()
+                .zip(sigma.iter())
+                .map(|(&t, &s)| -t / s.max(1e-12)),
+        );
+
+        let mut d1_q = Array1::<f64>::zeros(n);
+        let mut d2_q = Array1::<f64>::zeros(n);
+        let mut d3_q = Array1::<f64>::zeros(n);
+        let mut d_h_h0 = Array1::<f64>::zeros(n);
+        let mut d_h_h1 = Array1::<f64>::zeros(n);
+        let mut d_h_d = Array1::<f64>::zeros(n);
+
+        for i in 0..n {
+            let w = self.w[i];
+            if w <= 0.0 {
+                continue;
+            }
+            let d = self.y[i].clamp(0.0, 1.0);
+            let u0 = -h0[i] + q[i];
+            let u1 = -h1[i] + q[i];
+            let phi0 = self.distribution.pdf(u0).max(MIN_PROB);
+            let phi1 = self.distribution.pdf(u1).max(MIN_PROB);
+            let s0 = (1.0 - self.distribution.cdf(u0)).clamp(MIN_PROB, 1.0);
+            let s1 = (1.0 - self.distribution.cdf(u1)).clamp(MIN_PROB, 1.0);
+            let fp0 = self.distribution.pdf_derivative(u0);
+            let fp1 = self.distribution.pdf_derivative(u1);
+            let fpp0 = self.distribution.pdf_second_derivative(u0);
+            let fpp1 = self.distribution.pdf_second_derivative(u1);
+
+            let r0 = phi0 / s0;
+            let r1 = phi1 / s1;
+            let dr0 = (r0 * r0) - fp0 / s0;
+            let dr1 = (r1 * r1) - fp1 / s1;
+            let ddr0 = 2.0 * r0 * dr0 - (fpp0 / s0 + fp0 * phi0 / (s0 * s0));
+            let ddr1 = 2.0 * r1 * dr1 - (fpp1 / s1 + fp1 * phi1 / (s1 * s1));
+
+            // q-derivatives of the per-row log-likelihood contribution.
+            // With u0=-h0+q, u1=-h1+q:
+            // dℓ/dq   = w [ r0 - d*u1 - (1-d) r1 ]
+            // d²ℓ/dq² = w [ r0' - d - (1-d) r1' ]
+            // d³ℓ/dq³ = w [ r0'' - (1-d) r1'' ]
+            d1_q[i] = w * (r0 + d * (-u1) + (1.0 - d) * (-r1));
+            d2_q[i] = w * (dr0 + d * (-1.0) + (1.0 - d) * (-dr1));
+            d3_q[i] = w * (ddr0 + (1.0 - d) * (-ddr1));
+
+            // Time block contributions use u0/u1 direct dependence,
+            // while derivative row uses log(d_safe) term only for events.
+            d_h_h0[i] = w * ddr0;
+            d_h_h1[i] = -w * (1.0 - d) * ddr1;
+            let g = d_guard.safe[i].max(MIN_PROB);
+            let a = d_guard.d1[i];
+            let b = d_guard.d2[i];
+            let c = d_guard.d3[i];
+            let de = c / g - 3.0 * a * b / (g * g) + 2.0 * a * a * a / (g * g * g);
+            d_h_d[i] = -w * d * de;
+        }
+
+        match block_idx {
+            Self::BLOCK_TIME => {
+                if d_beta.len() != self.x_time_entry.ncols() {
+                    return Err(format!(
+                        "time block d_beta length mismatch: got {}, expected {}",
+                        d_beta.len(),
+                        self.x_time_entry.ncols()
+                    ));
+                }
+                let d_eta_h0 = self.x_time_entry.dot(d_beta);
+                let d_eta_h1 = self.x_time_exit.dot(d_beta);
+                let d_eta_d = self.x_time_deriv.dot(d_beta);
+                let w0 = &d_h_h0 * &d_eta_h0;
+                let w1 = &d_h_h1 * &d_eta_h1;
+                let wd = &d_h_d * &d_eta_d;
+                let d_h = xt_diag_x(&self.x_time_entry, &w0)
+                    + xt_diag_x(&self.x_time_exit, &w1)
+                    + xt_diag_x(&self.x_time_deriv, &wd);
+                Ok(Some(d_h))
+            }
+            Self::BLOCK_THRESHOLD => {
+                if d_beta.len() != self.x_threshold.ncols() {
+                    return Err(format!(
+                        "threshold block d_beta length mismatch: got {}, expected {}",
+                        d_beta.len(),
+                        self.x_threshold.ncols()
+                    ));
+                }
+                let dq_t = sigma.mapv(|s| -1.0 / s.max(1e-12));
+                let d_eta_t = self.x_threshold.dot(d_beta);
+                // Since q(eta_t) is linear in eta_t, only dq_t is nonzero:
+                // dH[u] = X^T diag( d³ℓ/dq³ * (dq_t)^3 * u_eta ) X.
+                let d_h_eta = &d3_q * &dq_t.mapv(|v| v * v * v) * &d_eta_t;
+                let d_h = xt_diag_x(&self.x_threshold, &d_h_eta);
+                Ok(Some(d_h))
+            }
+            Self::BLOCK_LOG_SIGMA => {
+                if d_beta.len() != self.x_log_sigma.ncols() {
+                    return Err(format!(
+                        "log-sigma block d_beta length mismatch: got {}, expected {}",
+                        d_beta.len(),
+                        self.x_log_sigma.ncols()
+                    ));
+                }
+                let span = (self.sigma_max - self.sigma_min).max(1e-12);
+                // sigma(eta) = sigma_min + span * p, p = logistic(eta)
+                // ds   = span * a,                 a = p(1-p)
+                // d2s  = span * a(1-2p)
+                // d3s  = span * (a(1-2p)^2 - 2a^2)
+                let d3s = Array1::from_iter(eta_ls.iter().map(|&z_raw| {
+                    let z = z_raw.clamp(-40.0, 40.0);
+                    let p = 1.0 / (1.0 + (-z).exp());
+                    let a = p * (1.0 - p);
+                    span * (a * (1.0 - 2.0 * p) * (1.0 - 2.0 * p) - 2.0 * a * a)
+                }));
+
+                let dq = Array1::from_iter(
+                    eta_t
+                        .iter()
+                        .zip(sigma.iter())
+                        .zip(ds.iter())
+                        .map(|((&t, &s), &d1)| t * d1 / (s * s).max(1e-12)),
+                );
+                let d2q = Array1::from_iter(
+                    eta_t
+                        .iter()
+                        .zip(sigma.iter())
+                        .zip(ds.iter())
+                        .zip(d2s.iter())
+                        .map(|(((&t, &s), &d1), &d2)| {
+                            t * (d2 / (s * s).max(1e-12) - 2.0 * d1 * d1 / (s * s * s).max(1e-12))
+                        }),
+                );
+                let d3q = Array1::from_iter(
+                    eta_t
+                        .iter()
+                        .zip(sigma.iter())
+                        .zip(ds.iter())
+                        .zip(d2s.iter())
+                        .zip(d3s.iter())
+                        .map(|((((&t, &s), &d1), &d2), &d3)| {
+                            t * (d3 / (s * s).max(1e-12) - 6.0 * d1 * d2 / (s * s * s).max(1e-12)
+                                + 6.0 * d1 * d1 * d1 / (s * s * s * s).max(1e-12))
+                        }),
+                );
+                let d_eta_ls = self.x_log_sigma.dot(d_beta);
+                // Full third-order chain rule:
+                // d/deta [d²ℓ/deta²] = d³ℓ/dq³ (dq)^3 + 3 d²ℓ/dq² dq d²q + dℓ/dq d³q.
+                let d_h_eta = (&d3_q * &dq.mapv(|v| v * v * v)
+                    + &(&d2_q * &(3.0 * &dq * &d2q))
+                    + &(&d1_q * &d3q))
+                    * &d_eta_ls;
+                let d_h = xt_diag_x(&self.x_log_sigma, &d_h_eta);
+                Ok(Some(d_h))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 pub fn fit_survival_location_scale_probit(
@@ -571,19 +899,31 @@ pub fn fit_survival_location_scale_probit(
     let x_threshold = dense_design(&spec.threshold_block.design, "threshold_block")?;
     let x_log_sigma = dense_design(&spec.log_sigma_block.design, "log_sigma_block")?;
 
-    let time_stacked_design = stack_time_design(&spec.time_block);
+    let anchor_row = select_anchor_row(&spec.age_entry, spec.time_anchor)?;
+    let time_prepared = prepare_identified_time_block(&spec.time_block, anchor_row)?;
+    let time_stacked_design = stack_time_design(&TimeBlockInput {
+        design_entry: time_prepared.design_entry.clone(),
+        design_exit: time_prepared.design_exit.clone(),
+        design_derivative_exit: time_prepared.design_derivative_exit.clone(),
+        offset_entry: spec.time_block.offset_entry.clone(),
+        offset_exit: spec.time_block.offset_exit.clone(),
+        derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
+        penalties: time_prepared.penalties.clone(),
+        initial_log_lambdas: spec.time_block.initial_log_lambdas.clone(),
+        initial_beta: time_prepared.initial_beta.clone(),
+    });
     let time_stacked_offset = stack_time_offset(&spec.time_block);
 
     let time_spec = ParameterBlockSpec {
         name: "time_transform".to_string(),
         design: DesignMatrix::Dense(time_stacked_design),
         offset: time_stacked_offset,
-        penalties: spec.time_block.penalties.clone(),
+        penalties: time_prepared.penalties.clone(),
         initial_log_lambdas: initial_log_lambdas(
-            &spec.time_block.penalties,
+            &time_prepared.penalties,
             spec.time_block.initial_log_lambdas.clone(),
         )?,
-        initial_beta: spec.time_block.initial_beta.clone(),
+        initial_beta: time_prepared.initial_beta.clone(),
     };
     let threshold_spec = ParameterBlockSpec {
         name: "threshold".to_string(),
@@ -617,9 +957,9 @@ pub fn fit_survival_location_scale_probit(
         distribution: spec.distribution,
         derivative_guard: spec.derivative_guard,
         derivative_softness: spec.derivative_softness,
-        x_time_entry: spec.time_block.design_entry,
-        x_time_exit: spec.time_block.design_exit,
-        x_time_deriv: spec.time_block.design_derivative_exit,
+        x_time_entry: time_prepared.design_entry,
+        x_time_exit: time_prepared.design_exit,
+        x_time_deriv: time_prepared.design_derivative_exit,
         x_threshold,
         x_log_sigma,
     };
@@ -647,10 +987,13 @@ pub fn fit_survival_location_scale_probit(
         .slice(s![k_time + k_t..k_time + k_t + k_ls])
         .to_owned();
 
+    let beta_time_reduced = fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_TIME]
+        .beta
+        .clone();
+    let beta_time = time_prepared.transform.z.dot(&beta_time_reduced);
+
     Ok(SurvivalLocationScaleProbitFitResult {
-        beta_time: fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_TIME]
-            .beta
-            .clone(),
+        beta_time,
         beta_threshold: fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
             .beta
             .clone(),
@@ -703,4 +1046,42 @@ pub fn predict_survival_location_scale_probit(
     );
     let survival_prob = eta.mapv(|v| input.distribution.cdf(v).clamp(0.0, 1.0));
     Ok(SurvivalLocationScaleProbitPredictResult { eta, survival_prob })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn identified_time_block_zeroes_anchor_row() {
+        let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
+        let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
+        let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
+        let time_block = TimeBlockInput {
+            design_entry,
+            design_exit,
+            design_derivative_exit,
+            offset_entry: Array1::zeros(3),
+            offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::zeros(3),
+            penalties: vec![Array2::eye(3)],
+            initial_log_lambdas: None,
+            initial_beta: None,
+        };
+        let prepared = prepare_identified_time_block(&time_block, 0).expect("prepare time block");
+        let anchor_row = prepared.design_exit.row(0);
+        let max_abs = anchor_row.iter().copied().map(f64::abs).fold(0.0, f64::max);
+        assert!(
+            max_abs <= 1e-10,
+            "anchor row not zero after identifiability transform: max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn select_anchor_row_defaults_to_earliest_entry() {
+        let age_entry = array![5.0, 1.0, 3.0];
+        let idx = select_anchor_row(&age_entry, None).expect("select default anchor");
+        assert_eq!(idx, 1);
+    }
 }

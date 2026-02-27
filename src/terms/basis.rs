@@ -1604,6 +1604,7 @@ pub enum BasisMetadata {
         feature_cols: Vec<usize>,
         knots: Vec<Array1<f64>>,
         degrees: Vec<usize>,
+        identifiability_transform: Option<Array2<f64>>,
     },
 }
 
@@ -2027,7 +2028,7 @@ fn apply_bspline_identifiability_policy(
     Ok((design_c, penalties_c, z_opt))
 }
 
-fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, BasisError> {
+pub(crate) fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, BasisError> {
     if penalty.nrows() != penalty.ncols() {
         return Err(BasisError::DimensionMismatch(
             "penalty matrix must be square when estimating nullspace".to_string(),
@@ -2947,13 +2948,7 @@ pub fn build_matern_basis(
 
     // Build an unconstrained kernel block first, then apply center-based
     // coefficient constraints in a deterministic way.
-    let m = create_matern_spline_basis(
-        data,
-        centers.view(),
-        spec.length_scale,
-        spec.nu,
-        false,
-    )?;
+    let m = create_matern_spline_basis(data, centers.view(), spec.length_scale, spec.nu, false)?;
     let (design, penalty_kernel, identifiability_transform) = if let Some(z) = z_opt {
         let kernel_raw = m.basis.slice(s![.., 0..m.num_kernel_basis]).to_owned();
         let kernel_constrained = fast_ab(&kernel_raw, &z);
@@ -2970,7 +2965,9 @@ pub fn build_matern_basis(
             let n = design.nrows();
             let p = design.ncols();
             let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
-            design_with_intercept.slice_mut(s![.., 0..p]).assign(&design);
+            design_with_intercept
+                .slice_mut(s![.., 0..p])
+                .assign(&design);
             design_with_intercept.column_mut(p).fill(1.0);
             design = design_with_intercept;
         }
@@ -5998,6 +5995,56 @@ mod tests {
                 assert!((a - b).abs() < 1e-8, "kernel penalty must be symmetric");
             }
         }
+    }
+
+    #[test]
+    fn test_matern_center_sum_to_zero_produces_kernel_transform() {
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let spec = MaternBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            length_scale: 0.7,
+            nu: MaternNu::FiveHalves,
+            include_intercept: false,
+            double_penalty: false,
+            identifiability: MaternIdentifiability::CenterSumToZero,
+        };
+        let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
+        assert_eq!(out.design.nrows(), data.nrows());
+        assert_eq!(out.design.ncols(), centers.nrows() - 1);
+        assert_eq!(out.penalties[0].nrows(), out.design.ncols());
+        assert_eq!(out.penalties[0].ncols(), out.design.ncols());
+        let BasisMetadata::Matern {
+            identifiability_transform,
+            ..
+        } = out.metadata
+        else {
+            panic!("expected Matérn metadata");
+        };
+        let z = identifiability_transform.expect("sum-to-zero should store transform");
+        assert_eq!(z.nrows(), centers.nrows());
+        assert_eq!(z.ncols(), centers.nrows() - 1);
+        let ones = Array1::<f64>::ones(centers.nrows());
+        let residual = ones.dot(&z).mapv(f64::abs).sum();
+        assert!(residual < 1e-10, "constant mode not removed: {residual}");
+    }
+
+    #[test]
+    fn test_matern_include_intercept_keeps_single_unpenalized_dimension() {
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.7]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let spec = MaternBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            length_scale: 1.1,
+            nu: MaternNu::ThreeHalves,
+            include_intercept: true,
+            double_penalty: false,
+            identifiability: MaternIdentifiability::CenterSumToZero,
+        };
+        let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
+        // (k-1) constrained kernel cols + explicit intercept.
+        assert_eq!(out.design.ncols(), centers.nrows());
+        assert_eq!(out.nullspace_dims, vec![1]);
     }
 
     #[test]

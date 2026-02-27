@@ -89,6 +89,24 @@ pub trait CustomFamily {
     fn post_update_beta(&self, beta: Array1<f64>) -> Result<Array1<f64>, String> {
         Ok(beta)
     }
+
+    /// Optional exact directional derivative of a block's ExactNewton Hessian.
+    ///
+    /// Returns `Some(dH)` where:
+    /// - `dH` is the directional derivative of the block Hessian with respect to
+    ///   the provided coefficient-space direction `d_beta` at current state.
+    /// - shape is `(p_block, p_block)`.
+    ///
+    /// Default `None` means the caller may fall back to numerical directional
+    /// differentiation for the `H_rho` correction in LAML gradients.
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _block_idx: usize,
+        _d_beta: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -556,6 +574,52 @@ fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     t
 }
 
+fn matrix_inf_norm(a: &Array2<f64>) -> f64 {
+    let (r, c) = a.dim();
+    let mut best = 0.0f64;
+    for i in 0..r {
+        let mut row_sum = 0.0f64;
+        for j in 0..c {
+            row_sum += a[[i, j]].abs();
+        }
+        best = best.max(row_sum);
+    }
+    best
+}
+
+fn extract_exact_newton_hessian<F: CustomFamily>(
+    family: &F,
+    states: &[ParameterBlockState],
+    block_idx: usize,
+    p: usize,
+) -> Result<Array2<f64>, String> {
+    let eval = family.evaluate(states)?;
+    let work = eval
+        .block_working_sets
+        .get(block_idx)
+        .ok_or_else(|| format!("missing block working set at index {block_idx}"))?;
+    match work {
+        BlockWorkingSet::ExactNewton {
+            gradient: _,
+            hessian,
+        } => {
+            if hessian.nrows() != p || hessian.ncols() != p {
+                return Err(format!(
+                    "exact-newton Hessian shape mismatch while extracting block {block_idx}: got {}x{}, expected {}x{}",
+                    hessian.nrows(),
+                    hessian.ncols(),
+                    p,
+                    p
+                ));
+            }
+            Ok(hessian.clone())
+        }
+        BlockWorkingSet::Diagonal { .. } => Err(format!(
+            "requested exact-newton Hessian for diagonal block {block_idx}"
+        )),
+    }
+}
+
 fn inverse_spd_with_retry(
     matrix: &Array2<f64>,
     base_ridge: f64,
@@ -790,6 +854,11 @@ fn inner_blockwise_fit<F: CustomFamily>(
                     }
                     let mut lhs = hessian.clone();
                     lhs += &s_lambda;
+                    // Newton system in coefficient space:
+                    //   β_new = β_old - (H+S)^{-1}(-g + Sβ_old)
+                    // Rearranged to a single linear solve:
+                    //   (H+S) β_new = H β_old + g
+                    // where H = -∇² log L and g = ∇ log L.
                     let mut rhs = hessian.dot(&states[b].beta);
                     rhs += gradient;
                     solve_spd_system_with_policy(
@@ -977,7 +1046,84 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                             .ok_or_else(|| "missing S^+ for REML gradient".to_string())?,
                         &a_k,
                     );
-                g_pen + g_logh - g_logs
+                // Exact-Newton hyper-gradient correction (H_rho term)
+                //
+                // For LAML:
+                //   d/dρ [0.5 log|H(ρ)|] = 0.5 tr(H^{-1} dH/dρ),
+                //   dH/dρ = A_k + H_ρ,  A_k = dS/dρ_k = λ_k S_k.
+                //
+                // The usual GAM term g_logh covers 0.5 tr(H^{-1} A_k).
+                // When H depends on β (non-Gaussian / transformation models), we add:
+                //   g_hbeta = 0.5 tr(H^{-1} H_ρ),
+                // with implicit derivative
+                //   dβ/dρ_k = -H^{-1} A_k β.
+                //
+                // We evaluate H_ρ via directional differentiation of the family's
+                // exact block Hessian along u_k = dβ/dρ_k.
+                let g_hbeta = if matches!(work, BlockWorkingSet::ExactNewton { .. }) {
+                    let u_k = -h_inv.dot(&a_k_beta);
+                    let u_norm = u_k.dot(&u_k).sqrt();
+                    if u_norm <= 1e-14 {
+                        0.0
+                    } else {
+                        let h_rho = if let Some(h_exact) = family
+                            .exact_newton_hessian_directional_derivative(
+                                &inner.block_states,
+                                b,
+                                &u_k,
+                            )? {
+                            if h_exact.nrows() != p || h_exact.ncols() != p {
+                                return Err(format!(
+                                    "block {b} exact-newton dH shape mismatch: got {}x{}, expected {}x{}",
+                                    h_exact.nrows(),
+                                    h_exact.ncols(),
+                                    p,
+                                    p
+                                ));
+                            }
+                            h_exact
+                        } else {
+                            // Default path: no finite-difference correction.
+                            // Fallback to FD only when the local system looks unstable.
+                            let cond_proxy =
+                                matrix_inf_norm(&h_for_logdet) * matrix_inf_norm(&h_inv);
+                            let h_inv_max = h_inv.iter().copied().map(f64::abs).fold(0.0, f64::max);
+                            let unstable = !cond_proxy.is_finite()
+                                || cond_proxy > 1e10
+                                || h_inv_max > 1e8
+                                || !g_pen.is_finite()
+                                || !g_logh.is_finite()
+                                || !g_logs.is_finite();
+
+                            if unstable {
+                                let beta_norm = beta.dot(beta).sqrt().max(1.0);
+                                let eps = (1e-5 / u_norm).min(1e-3 / beta_norm).max(1e-8);
+
+                                let mut states_plus = inner.block_states.clone();
+                                let mut states_minus = inner.block_states.clone();
+                                states_plus[b].beta = &states_plus[b].beta + &u_k.mapv(|v| eps * v);
+                                states_minus[b].beta =
+                                    &states_minus[b].beta - &u_k.mapv(|v| eps * v);
+
+                                refresh_all_block_etas(family, specs, &mut states_plus)?;
+                                refresh_all_block_etas(family, specs, &mut states_minus)?;
+
+                                let h_plus =
+                                    extract_exact_newton_hessian(family, &states_plus, b, p)?;
+                                let h_minus =
+                                    extract_exact_newton_hessian(family, &states_minus, b, p)?;
+                                (&h_plus - &h_minus).mapv(|v| v / (2.0 * eps))
+                            } else {
+                                Array2::<f64>::zeros((p, p))
+                            }
+                        };
+                        0.5 * trace_product(&h_inv, &h_rho)
+                    }
+                } else {
+                    0.0
+                };
+
+                g_pen + g_logh + g_hbeta - g_logs
             } else {
                 g_pen
             };

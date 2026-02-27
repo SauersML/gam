@@ -3189,14 +3189,10 @@ pub mod internal {
         grad_secondary: Array1<f64>,
         cost_gradient: Array1<f64>,
         prior_gradient: Array1<f64>,
-        concat: Array2<f64>,
-        solved: Array2<f64>,
-        block_ranges: Vec<(usize, usize)>,
-        solved_rows: usize,
     }
 
     impl RemlWorkspace {
-        fn new(max_penalties: usize, coeffs: usize, total_rank: usize) -> Self {
+        fn new(max_penalties: usize) -> Self {
             RemlWorkspace {
                 rho_plus: Array1::zeros(max_penalties),
                 rho_minus: Array1::zeros(max_penalties),
@@ -3205,16 +3201,10 @@ pub mod internal {
                 grad_secondary: Array1::zeros(max_penalties),
                 cost_gradient: Array1::zeros(max_penalties),
                 prior_gradient: Array1::zeros(max_penalties),
-                concat: Array2::zeros((coeffs, total_rank)),
-                solved: Array2::zeros((coeffs, total_rank)),
-                block_ranges: Vec::with_capacity(max_penalties),
-                solved_rows: coeffs,
             }
         }
 
         fn reset_for_eval(&mut self, penalties: usize) {
-            self.block_ranges.clear();
-            self.solved_rows = 0;
             if penalties == 0 {
                 return;
             }
@@ -3222,11 +3212,6 @@ pub mod internal {
             self.grad_secondary.slice_mut(s![..penalties]).fill(0.0);
             self.cost_gradient.slice_mut(s![..penalties]).fill(0.0);
             self.prior_gradient.slice_mut(s![..penalties]).fill(0.0);
-        }
-
-        fn reset_block_ranges(&mut self) {
-            self.block_ranges.clear();
-            self.solved_rows = 0;
         }
 
         fn set_lambda_values(&mut self, rho: &Array1<f64>) {
@@ -3787,8 +3772,7 @@ pub mod internal {
             };
 
             let penalty_count = rs_list.len();
-            let total_rank: usize = rs_list.iter().map(|rk| rk.nrows()).sum();
-            let workspace = RemlWorkspace::new(penalty_count, p, total_rank);
+            let workspace = RemlWorkspace::new(penalty_count);
 
             let balanced_penalty_root = create_balanced_penalty_root(&s_list, p)?;
             let reparam_invariant = precompute_reparam_invariant(&rs_list, p)?;
@@ -5553,7 +5537,6 @@ pub mod internal {
             let reparam_result = &pirls_result.reparam_result;
             // Use cached X·Qs from PIRLS
             let rs_transformed = &reparam_result.rs_transformed;
-            let rs_transposed = &reparam_result.rs_transposed;
 
             let includes_prior = false;
             let (gradient_result, gradient_snapshot, applied_truncation_corrections) = {
@@ -5633,7 +5616,6 @@ pub mod internal {
                         let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
                         let (dp_c, dp_c_grad) = smooth_floor_dp(dp);
 
-                        let factor_g = self.get_faer_factor(p, h_eff);
                         let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
                         let mp = self.p.saturating_sub(penalty_rank) as f64;
                         let scale = dp_c / (n - mp).max(LAML_RIDGE);
@@ -5699,142 +5681,14 @@ pub mod internal {
                             None
                         };
 
-                        workspace.reset_block_ranges();
-                        let mut total_rank = 0;
-                        for rt in rs_transposed {
-                            let cols = rt.ncols();
-                            workspace.block_ranges.push((total_rank, total_rank + cols));
-                            total_rank += cols;
-                        }
-                        workspace.solved_rows = h_eff.nrows();
-
-                        if numeric_logh_grad.is_none() && total_rank > 0 {
-                            workspace.concat.fill(0.0);
-                            let rows = h_eff.nrows();
-                            for ((start, end), rt) in
-                                workspace.block_ranges.iter().zip(rs_transposed.iter())
-                            {
-                                if *end > *start {
-                                    workspace
-                                        .concat
-                                        .slice_mut(s![..rows, *start..*end])
-                                        .assign(rt);
-                                }
-                            }
-                            let rows = h_eff.nrows();
-                            let cols = total_rank;
-                            {
-                                let mut solved_slice =
-                                    workspace.solved.slice_mut(s![..rows, ..cols]);
-                                solved_slice.assign(&workspace.concat.slice(s![..rows, ..cols]));
-                                if let Some(slice) = solved_slice.as_slice_mut() {
-                                    let mut solved_view =
-                                        faer::MatMut::from_row_major_slice_mut(slice, rows, cols);
-                                    factor_g.solve_in_place(solved_view.as_mut());
-                                } else {
-                                    let mut temp =
-                                        faer::Mat::from_fn(rows, cols, |i, j| solved_slice[(i, j)]);
-                                    factor_g.solve_in_place(temp.as_mut());
-                                    for j in 0..cols {
-                                        for i in 0..rows {
-                                            solved_slice[(i, j)] = temp[(i, j)];
-                                        }
-                                    }
-                                }
-                            }
-                            workspace.solved_rows = rows;
-                        } else {
-                            workspace.solved_rows = 0;
-                        }
-
-                        // A.1/A.5 (fixed positive-part subspace):
-                        // If log|H|_+ is evaluated on a fixed kept subspace projector P,
-                        // then d log|H|_+ = tr(H_+^† dH). When a complementary truncated
-                        // projector P_⊥ is tracked explicitly, this correction subtracts
-                        // the truncated-subspace leakage:
-                        //   Error_k = 0.5 * λ_k * tr(M_⊥ * (U_⊥^T S_k U_⊥)),
-                        //   M_⊥ = U_⊥^T H^{-1} U_⊥.
-                        //
-                        // Path/coordinate contract:
-                        //   u_truncated  <- ReparamResult.u_truncated
-                        //                 (constructed from q_null in terms/construction.rs)
-                        //   H, R_k       <- transformed-basis objects in this routine.
-                        // This term is valid only if U_⊥, H, and R_k are represented in
-                        // the same coefficient coordinate system.
-                        let u_truncated_gauss = &reparam_result.u_truncated;
-                        let truncated_count_gauss = u_truncated_gauss.ncols();
-
-                        let gaussian_corrections: Vec<f64> =
-                            if truncated_count_gauss > 0 && workspace.solved_rows > 0 {
-                                let rows = h_eff.nrows();
-                                let mut h_inv_u_perp =
-                                    faer::Mat::<f64>::zeros(rows, truncated_count_gauss);
-
-                                for i in 0..rows.min(u_truncated_gauss.nrows()) {
-                                    for j in 0..truncated_count_gauss {
-                                        h_inv_u_perp[(i, j)] = u_truncated_gauss[(i, j)];
-                                    }
-                                }
-
-                                factor_g.solve_in_place(h_inv_u_perp.as_mut());
-
-                                let mut m_perp = faer::Mat::<f64>::zeros(
-                                    truncated_count_gauss,
-                                    truncated_count_gauss,
-                                );
-                                for i in 0..truncated_count_gauss {
-                                    for j in 0..truncated_count_gauss {
-                                        let mut sum = 0.0;
-                                        for r in 0..rows.min(u_truncated_gauss.nrows()) {
-                                            sum += u_truncated_gauss[(r, i)] * h_inv_u_perp[(r, j)];
-                                        }
-                                        m_perp[(i, j)] = sum;
-                                    }
-                                }
-
-                                let mut corrections = vec![0.0; lambdas.len()];
-                                for k_idx in 0..lambdas.len() {
-                                    let r_k = &rs_transformed[k_idx];
-                                    let rank_k = r_k.nrows();
-
-                                    let mut w_k =
-                                        faer::Mat::<f64>::zeros(rank_k, truncated_count_gauss);
-                                    for i in 0..rank_k {
-                                        for j in 0..truncated_count_gauss {
-                                            let mut sum = 0.0;
-                                            for l in 0..r_k.ncols().min(u_truncated_gauss.nrows()) {
-                                                sum += r_k[(i, l)] * u_truncated_gauss[(l, j)];
-                                            }
-                                            w_k[(i, j)] = sum;
-                                        }
-                                    }
-
-                                    let mut trace_error = 0.0;
-                                    for i in 0..truncated_count_gauss {
-                                        for j in 0..truncated_count_gauss {
-                                            let mut wtw_ij = 0.0;
-                                            for l in 0..rank_k {
-                                                wtw_ij += w_k[(l, i)] * w_k[(l, j)];
-                                            }
-                                            trace_error += m_perp[(i, j)] * wtw_ij;
-                                        }
-                                    }
-
-                                    corrections[k_idx] = 0.5 * lambdas[k_idx] * trace_error;
-                                }
-                                corrections
-                            } else {
-                                vec![0.0; lambdas.len()]
-                            };
-
                         let numeric_logh_grad_ref = numeric_logh_grad.as_ref();
                         let det1_values = &det1_values;
                         let beta_ref = beta_transformed;
-                        let solved_rows = workspace.solved_rows;
-                        let block_ranges_ref = &workspace.block_ranges;
-                        let solved_ref = &workspace.solved;
-                        let concat_ref = &workspace.concat;
-                        let gaussian_corrections_ref = &gaussian_corrections;
+                        // Use the same positive-part Hessian factor as cost evaluation:
+                        //   H_+^† = W W^T.
+                        // Then tr(H_+^† A_k) = λ_k ||R_k W||_F^2 directly, with no separate
+                        // truncated-subspace subtraction term.
+                        let w_pos = bundle.h_pos_factor_w.as_ref();
                         // Exact Gaussian identity REML gradient (profiled scale) in log-smoothing coordinates:
                         //
                         //   V_REML(ρ) =
@@ -5881,39 +5735,21 @@ pub mod internal {
                             let deviance_grad_term = dp_c_grad * (d1 / (2.0 * scale));
 
                             // A.3/A.5 Component 2 derivation:
-                            //   ∂/∂ρ_k [0.5 log|H|] = 0.5 tr(H^{-1} H_k),
+                            //   ∂/∂ρ_k [0.5 log|H|_+] = 0.5 tr(H_+^† H_k),
                             // and for Gaussian identity H_k = A_k = λ_k S_k.
                             //
-                            // Root form gives:
-                            //   tr(H^{-1}A_k) = λ_k tr(H^{-1}R_kᵀR_k)
-                            //                = λ_k tr(R_k H^{-1} R_kᵀ),
-                            // computed by solving H X = R_kᵀ and taking tr(R_k X).
+                            // Root form on kept subspace:
+                            //   tr(H_+^† A_k) = λ_k tr(H_+^† R_kᵀR_k)
+                            //                = λ_k ||R_k W||_F², H_+^†=W W^T.
                             let log_det_h_grad_term = if let Some(g) = numeric_logh_grad_ref {
                                 g[k]
-                            } else if solved_rows > 0 {
-                                let (start, end) = block_ranges_ref[k];
-                                if end > start {
-                                    let solved_block =
-                                        solved_ref.slice(s![..solved_rows, start..end]);
-                                    let rt_block = concat_ref.slice(s![..solved_rows, start..end]);
-                                    let trace_h_inv_s_k = kahan_sum(
-                                        solved_block
-                                            .iter()
-                                            .zip(rt_block.iter())
-                                            .map(|(&x, &y)| x * y),
-                                    );
-                                    let tra1 = lambdas[k] * trace_h_inv_s_k;
-                                    tra1 / 2.0
-                                } else {
-                                    0.0
-                                }
                             } else {
-                                0.0
+                                let rkw = r_k.dot(w_pos);
+                                let trace_h_pos_inv_s_k: f64 = rkw.iter().map(|v| v * v).sum();
+                                0.5 * lambdas[k] * trace_h_pos_inv_s_k
                             };
 
-                            // A.1 fixed-subspace correction for log|H|_+.
-                            let corrected_log_det_h =
-                                log_det_h_grad_term - gaussian_corrections_ref[k];
+                            let corrected_log_det_h = log_det_h_grad_term;
 
                             // Component 3 derivation:
                             //   -0.5 * ∂/∂ρ_k log|S|_+,
@@ -5923,14 +5759,15 @@ pub mod internal {
                             deviance_grad_term + corrected_log_det_h - log_det_s_grad_term
                         };
 
-                        let mut gaussian_grad = Vec::with_capacity(lambdas.len());
-                        for k in 0..lambdas.len() {
-                            gaussian_grad.push(compute_gaussian_grad(k));
+                        {
+                            let mut grad_view = workspace.cost_gradient_view(len);
+                            for k in 0..lambdas.len() {
+                                grad_view[k] = compute_gaussian_grad(k);
+                            }
                         }
-                        workspace
-                            .cost_gradient_view(len)
-                            .assign(&Array1::from_vec(gaussian_grad));
-                        applied_truncation_corrections = Some(gaussian_corrections);
+                        // No explicit truncation correction vector is needed in this branch:
+                        // the H_+^† trace is evaluated directly on the kept subspace.
+                        applied_truncation_corrections = None;
                     }
                     _ => {
                         // NON-GAUSSIAN LAML GRADIENT (A.4 exact dH/dρ path)
@@ -6005,21 +5842,18 @@ pub mod internal {
                         // we add H_phi. Below we compute H_phi and use H_total for the
                         // implicit solve (d beta_hat / d rho). If that fails, we fall
                         // back to H_pen for stability.
-                        let w_prime = pirls_result.solve_c_array.clone();
+                        let w_prime = &pirls_result.solve_c_array;
                         if !w_prime.iter().all(|v| v.is_finite()) {
                             let g_pll =
                                 self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
                             let g_half_logh =
                                 self.numeric_half_logh_grad_with_workspace(p, workspace)?;
-                            let det1_full = det1_values.clone();
-                            let mut laml_grad = Vec::with_capacity(lambdas.len());
-                            for k in 0..lambdas.len() {
-                                let gradient_value = g_pll[k] + g_half_logh[k] - 0.5 * det1_full[k];
-                                laml_grad.push(gradient_value);
+                            {
+                                let mut grad_view = workspace.cost_gradient_view(len);
+                                for k in 0..lambdas.len() {
+                                    grad_view[k] = g_pll[k] + g_half_logh[k] - 0.5 * det1_values[k];
+                                }
                             }
-                            workspace
-                                .cost_gradient_view(len)
-                                .assign(&Array1::from_vec(laml_grad));
                             // Continue to prior-gradient adjustment below.
                         } else {
                             let clamp_nonsmooth = self.config.firth_bias_reduction
@@ -6041,16 +5875,18 @@ pub mod internal {
                             }
                             let k_count = lambdas.len();
                             let det1_values = &det1_values;
-                            let mut laml_grad = Vec::with_capacity(k_count);
                             let beta_ref = beta_transformed;
                             let mut beta_terms = Array1::<f64>::zeros(k_count);
-                            let mut s_k_beta_all: Vec<Array1<f64>> = Vec::with_capacity(k_count);
+                            let mut s_k_beta_mat = Array2::<f64>::zeros((beta_ref.len(), k_count));
                             for k in 0..k_count {
                                 let r_k = &rs_transformed[k];
                                 let r_beta = r_k.dot(beta_ref);
                                 let s_k_beta = r_k.t().dot(&r_beta);
+                                // Section C.1 step (1):
+                                //   q_k = β̂^T A_k β̂ = λ_k β̂^T S_k β̂,
+                                // with S_k β̂ assembled as R_k^T (R_k β̂).
                                 beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
-                                s_k_beta_all.push(s_k_beta);
+                                s_k_beta_mat.column_mut(k).assign(&s_k_beta);
                             }
 
                             // Keep outer gradient on the same Hessian surface as PIRLS.
@@ -6081,7 +5917,7 @@ pub mod internal {
                             // In smooth regimes this matches the required third-derivative object
                             // in dH/dρ. In clamped/floored regimes c_i may behave like a subgradient
                             // proxy rather than a classical derivative; see pirls.rs comments.
-                            let c_vec = w_prime.clone();
+                            let c_vec = w_prime;
 
                             // h_i = x_i^T H_+^\dagger x_i = ||(XW)_{i,*}||^2.
                             let mut leverage_h_pos = Array1::<f64>::zeros(n_obs);
@@ -6111,17 +5947,14 @@ pub mod internal {
                             // Precompute r = X^T (c ⊙ h) once:
                             //   trace_third_k = (c ⊙ h)^T (X v_k) = r^T v_k.
                             // This removes the per-k O(np) multiply X*v_k from the hot loop.
-                            let c_times_h = &c_vec * &leverage_h_pos;
+                            // Section C.1 step (4): r := X^T (w' ⊙ h).
+                            let c_times_h = c_vec * &leverage_h_pos;
                             let r_third = pirls_result
                                 .x_transformed
                                 .transpose_vector_multiply(&c_times_h);
 
                             // Batch all v_k = H_+^† (S_k beta) into one BLAS-3 path:
                             //   V = W (W^T [S_1 beta, ..., S_K beta]).
-                            let mut s_k_beta_mat = Array2::<f64>::zeros((beta_ref.len(), k_count));
-                            for (k_idx, s_k_beta) in s_k_beta_all.iter().enumerate() {
-                                s_k_beta_mat.column_mut(k_idx).assign(s_k_beta);
-                            }
                             let v_all = if w_pos.ncols() > 0 && k_count > 0 {
                                 let wt_sk_beta_all = w_pos.t().dot(&s_k_beta_mat);
                                 w_pos.dot(&wt_sk_beta_all)
@@ -6129,63 +5962,56 @@ pub mod internal {
                                 Array2::<f64>::zeros((beta_ref.len(), k_count))
                             };
 
-                            let mut trace_terms: Vec<f64> = Vec::with_capacity(k_count);
                             let trace_mode = std::env::var("GAM_DIAG_TRACE_THIRD_MODE")
                                 .unwrap_or_else(|_| "minus".to_string());
-                            for k_idx in 0..k_count {
-                                let r_k = &rs_transformed[k_idx];
-                                if r_k.ncols() == 0 || w_pos.ncols() == 0 {
-                                    trace_terms.push(0.0);
-                                    continue;
+                            let trace_mode_code = match trace_mode.as_str() {
+                                "plus" => 1u8,
+                                "zero" => 2u8,
+                                _ => 0u8,
+                            };
+                            {
+                                let mut grad_view = workspace.cost_gradient_view(len);
+                                for k_idx in 0..k_count {
+                                    let r_k = &rs_transformed[k_idx];
+                                    if r_k.ncols() == 0 || w_pos.ncols() == 0 {
+                                        let log_det_h_grad_term = 0.0;
+                                        let log_det_s_grad_term = 0.5 * det1_values[k_idx];
+                                        grad_view[k_idx] = 0.5 * beta_terms[k_idx]
+                                            + log_det_h_grad_term
+                                            - log_det_s_grad_term;
+                                        continue;
+                                    }
+
+                                    // First piece:
+                                    //   tr(H_+^† S_k) = ||R_k W||_F^2, with H_+^† = W W^T.
+                                    let rkw = r_k.dot(w_pos);
+                                    let trace_h_inv_s_k: f64 = rkw.iter().map(|v| v * v).sum();
+
+                                    // Exact third-derivative contraction:
+                                    //   tr(H_+^† X^T diag(c ⊙ X v_k) X) = r^T v_k.
+                                    let v_k = v_all.column(k_idx);
+                                    let trace_third = r_third.dot(&v_k);
+
+                                    // Diagnostic switch for term-by-term identification of
+                                    // analytic-vs-FD disagreement. Production behavior is "minus",
+                                    // matching the smooth-theory formula tr(H^{-1}A_k) - tr(H^{-1}Xᵀdiag(c⊙Xv_k)X).
+                                    let trace_term = match trace_mode_code {
+                                        1 => trace_h_inv_s_k + trace_third,
+                                        2 => trace_h_inv_s_k,
+                                        _ => trace_h_inv_s_k - trace_third,
+                                    };
+                                    let log_det_h_grad_term = 0.5 * lambdas[k_idx] * trace_term;
+                                    let corrected_log_det_h = log_det_h_grad_term;
+                                    let log_det_s_grad_term = 0.5 * det1_values[k_idx];
+
+                                    // Exact LAML gradient assembly for the implemented objective:
+                                    //   g_k = 0.5 * β̂ᵀ A_k β̂ - 0.5 * tr(S^+ A_k) + 0.5 * tr(H^{-1} H_k)
+                                    // where A_k = ∂S/∂ρ_k = λ_k S_k and H_k is the total derivative.
+                                    grad_view[k_idx] = 0.5 * beta_terms[k_idx]
+                                        + corrected_log_det_h
+                                        - log_det_s_grad_term;
                                 }
-
-                                // First piece:
-                                //   tr(H_+^† S_k) = ||R_k W||_F^2, with H_+^† = W W^T.
-                                let rkw = r_k.dot(w_pos);
-                                let trace_h_inv_s_k: f64 = rkw.iter().map(|v| v * v).sum();
-
-                                // Exact third-derivative contraction:
-                                //   tr(H_+^† X^T diag(c ⊙ X v_k) X) = r^T v_k.
-                                let v_k = v_all.column(k_idx);
-                                let trace_third = r_third.dot(&v_k);
-
-                                // Diagnostic switch for term-by-term identification of
-                                // analytic-vs-FD disagreement. Production behavior is "minus",
-                                // matching the smooth-theory formula tr(H^{-1}A_k) - tr(H^{-1}Xᵀdiag(c⊙Xv_k)X).
-                                let trace_term = match trace_mode.as_str() {
-                                    "plus" => trace_h_inv_s_k + trace_third,
-                                    "zero" => trace_h_inv_s_k,
-                                    _ => trace_h_inv_s_k - trace_third,
-                                };
-                                trace_terms.push(trace_term);
                             }
-
-                            // We do NOT need to set workspace.solved_rows as we aren't using the workspace solver.
-                            workspace.solved_rows = 0;
-
-                            // Implicit Truncation Correction:
-                            // By using H_+^\dagger essentially constructed from U_R D_R^{-1} U_R^T,
-                            // we automatically project dS onto the valid subspace P_R.
-                            // The phantom spectral bleed term (tr(H^-1 P_N dS P_N)) is identically zero
-                            // because P_N H_+^\dagger = 0.
-                            let truncation_corrections = vec![0.0; k_count];
-
-                            for k in 0..k_count {
-                                let log_det_h_grad_term = 0.5 * lambdas[k] * trace_terms[k];
-                                let corrected_log_det_h =
-                                    log_det_h_grad_term - truncation_corrections[k];
-                                let log_det_s_grad_term = 0.5 * det1_values[k];
-
-                                // Exact LAML gradient assembly for the implemented objective:
-                                //   g_k = 0.5 * β̂ᵀ A_k β̂ - 0.5 * tr(S^+ A_k) + 0.5 * tr(H^{-1} H_k)
-                                // where A_k = ∂S/∂ρ_k = λ_k S_k and H_k is the total derivative.
-                                let gradient_value =
-                                    0.5 * beta_terms[k] + corrected_log_det_h - log_det_s_grad_term;
-                                laml_grad.push(gradient_value);
-                            }
-                            workspace
-                                .cost_gradient_view(len)
-                                .assign(&Array1::from_vec(laml_grad));
                         }
                     }
                 }
@@ -7326,12 +7152,13 @@ pub mod internal {
 
             // === Strategy 3: Spectral Bleed Trace ===
             // Check if truncated eigenspace corrections are adequate
-            let u_truncated = &reparam.u_truncated;
+            // Diagnostics must compare quantities in a common frame.
+            // `u_truncated`, `h_eff`, and `rs_transformed` are all in transformed coordinates.
+            let u_truncated = reparam.u_truncated.clone();
             let truncated_count = u_truncated.ncols();
             // Path/coordinate contract for diagnostics:
-            // - `u_truncated` comes from ReparamResult (q_null-derived storage path).
-            // - `h_eff` and `reparam.rs_transformed` are in transformed coordinates.
-            // If frames differ, bleed diagnostics report systematic mismatch.
+            // - `u_truncated` comes from ReparamResult (already transformed).
+            // - `h_eff` and `reparam.rs_transformed` are transformed as well.
 
             if truncated_count > 0
                 && let Some(applied_values) = applied_truncation_corrections

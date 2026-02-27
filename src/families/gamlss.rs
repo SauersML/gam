@@ -1,5 +1,5 @@
 use crate::basis::{
-    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
+    BasisOptions, Dense, KnotSource, compute_geometric_constraint_transform, create_basis,
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
@@ -20,8 +20,7 @@ use faer::Side;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
-use ndarray::{Array1, Array2, ArrayView1, s};
-
+use ndarray::{Array1, Array2, ArrayView1};
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
@@ -189,13 +188,21 @@ pub fn build_wiggle_block_input_from_knots(
     )
     .map_err(|e| e.to_string())?;
     let full = (*basis).clone();
-    if full.ncols() < 2 {
-        return Err("wiggle basis has fewer than two columns".to_string());
+    if full.ncols() < 3 {
+        return Err("wiggle basis has fewer than three columns".to_string());
     }
-    let design = full.slice(s![.., 1..]).to_owned();
+    let (z, s_constrained) = compute_geometric_constraint_transform(knots, degree, penalty_order)
+        .map_err(|e| e.to_string())?;
+    if full.ncols() != z.nrows() {
+        return Err(format!(
+            "wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
+            full.ncols(),
+            z.nrows()
+        ));
+    }
+    let design = full.dot(&z);
     let p = design.ncols();
-    let mut penalties =
-        vec![create_difference_penalty_matrix(p, penalty_order, None).map_err(|e| e.to_string())?];
+    let mut penalties = vec![s_constrained];
     if double_penalty {
         penalties.push(Array2::<f64>::eye(p));
     }
@@ -1781,6 +1788,13 @@ impl BinomialLocationScaleProbitWiggleFamily {
         initialize_wiggle_knots_from_seed(q_seed, degree, num_internal_knots)
     }
 
+    fn wiggle_constraint_transform(&self) -> Result<Array2<f64>, String> {
+        let (z, _s_constrained) =
+            compute_geometric_constraint_transform(&self.wiggle_knots, self.wiggle_degree, 2)
+                .map_err(|e| e.to_string())?;
+        Ok(z)
+    }
+
     fn wiggle_design(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
         let (basis, _) = create_basis::<Dense>(
             q0,
@@ -1790,10 +1804,18 @@ impl BinomialLocationScaleProbitWiggleFamily {
         )
         .map_err(|e| e.to_string())?;
         let full = (*basis).clone();
-        if full.ncols() < 2 {
-            return Err("wiggle basis has fewer than two columns".to_string());
+        if full.ncols() < 3 {
+            return Err("wiggle basis has fewer than three columns".to_string());
         }
-        Ok(full.slice(s![.., 1..]).to_owned())
+        let z = self.wiggle_constraint_transform()?;
+        if full.ncols() != z.nrows() {
+            return Err(format!(
+                "wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
+                full.ncols(),
+                z.nrows()
+            ));
+        }
+        Ok(full.dot(&z))
     }
 
     fn wiggle_dq_dq0(
@@ -1809,18 +1831,26 @@ impl BinomialLocationScaleProbitWiggleFamily {
         )
         .map_err(|e| e.to_string())?;
         let full = (*dbasis).clone();
-        if full.ncols() < 2 {
-            return Err("wiggle derivative basis has fewer than two columns".to_string());
+        if full.ncols() < 3 {
+            return Err("wiggle derivative basis has fewer than three columns".to_string());
         }
-        let d_no_intercept = full.slice(s![.., 1..]).to_owned();
-        if d_no_intercept.ncols() != beta_wiggle.len() {
+        let z = self.wiggle_constraint_transform()?;
+        if full.ncols() != z.nrows() {
+            return Err(format!(
+                "wiggle derivative/constraint mismatch: basis has {} columns but transform has {} rows",
+                full.ncols(),
+                z.nrows()
+            ));
+        }
+        let d_constrained = full.dot(&z);
+        if d_constrained.ncols() != beta_wiggle.len() {
             return Err(format!(
                 "wiggle derivative col mismatch: got {}, expected {}",
-                d_no_intercept.ncols(),
+                d_constrained.ncols(),
                 beta_wiggle.len()
             ));
         }
-        Ok(d_no_intercept.dot(&beta_wiggle) + 1.0)
+        Ok(d_constrained.dot(&beta_wiggle) + 1.0)
     }
 
     /// Build a turnkey wiggle block from a q-seed vector and knot settings.
@@ -1973,6 +2003,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basis::compute_greville_abscissae;
 
     fn intercept_block(n: usize) -> ParameterBlockInput {
         ParameterBlockInput {
@@ -2149,6 +2180,91 @@ mod tests {
                 ls_w[i],
                 expected_w_ls
             );
+        }
+    }
+
+    #[test]
+    fn wiggle_constraint_removes_constant_and_linear_modes() {
+        let q_seed = Array1::linspace(-2.0, 2.0, 17);
+        let degree = 3usize;
+        let num_internal_knots = 6usize;
+        let penalty_order = 2usize;
+
+        let (block, knots) = BinomialLocationScaleProbitWiggleFamily::build_wiggle_block_input(
+            q_seed.view(),
+            degree,
+            num_internal_knots,
+            penalty_order,
+            false,
+        )
+        .expect("wiggle block");
+        let (z, _s_constrained) =
+            compute_geometric_constraint_transform(&knots, degree, penalty_order)
+                .expect("constraint transform");
+        let g = compute_greville_abscissae(&knots, degree).expect("greville abscissae");
+
+        assert_eq!(block.design.ncols(), z.ncols());
+
+        let beta = Array1::from_vec(vec![0.2; z.ncols()]);
+        let theta = z.dot(&beta);
+        let c0 = theta.sum();
+        let c1 = theta.dot(&g);
+        assert!(
+            c0.abs() < 1e-9,
+            "constant mode leaked through wiggle constraint: {}",
+            c0
+        );
+        assert!(
+            c1.abs() < 1e-9,
+            "linear mode leaked through wiggle constraint: {}",
+            c1
+        );
+    }
+
+    #[test]
+    fn wiggle_block_design_matches_constrained_basis_projection() {
+        let q_seed = Array1::linspace(-1.0, 1.0, 11);
+        let degree = 2usize;
+        let num_internal_knots = 4usize;
+        let penalty_order = 2usize;
+
+        let (block, knots) = BinomialLocationScaleProbitWiggleFamily::build_wiggle_block_input(
+            q_seed.view(),
+            degree,
+            num_internal_knots,
+            penalty_order,
+            false,
+        )
+        .expect("wiggle block");
+        let (basis, _) = create_basis::<Dense>(
+            q_seed.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .expect("full basis");
+        let full = (*basis).clone();
+        let (z, _s_constrained) =
+            compute_geometric_constraint_transform(&knots, degree, penalty_order)
+                .expect("constraint transform");
+        let expected = full.dot(&z);
+
+        let got = match &block.design {
+            DesignMatrix::Dense(x) => x.clone(),
+            DesignMatrix::Sparse(_) => panic!("expected dense wiggle design"),
+        };
+        assert_eq!(got.dim(), expected.dim());
+        for i in 0..got.nrows() {
+            for j in 0..got.ncols() {
+                assert!(
+                    (got[[i, j]] - expected[[i, j]]).abs() < 1e-10,
+                    "wiggle design mismatch at ({}, {}): got {}, expected {}",
+                    i,
+                    j,
+                    got[[i, j]],
+                    expected[[i, j]]
+                );
+            }
         }
     }
 }
