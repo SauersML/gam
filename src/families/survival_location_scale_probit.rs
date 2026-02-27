@@ -638,9 +638,12 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             let fpp1 = v1.pdf_second_derivative;
             let raw_s0 = 1.0 - v0.cdf;
             let raw_s1 = 1.0 - v1.cdf;
-            let (s0, r0, dr0, _ddr0) = Self::clamped_survival_neglog_derivatives(raw_s0, f0, fp0, fpp0);
-            let (s1, r1, dr1, _ddr1) = Self::clamped_survival_neglog_derivatives(raw_s1, f1, fp1, fpp1);
-            let (log_phi1, dlogphi1, d2logphi1) = Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1);
+            let (s0, r0, dr0, _ddr0) =
+                Self::clamped_survival_neglog_derivatives(raw_s0, f0, fp0, fpp0);
+            let (s1, r1, dr1, _ddr1) =
+                Self::clamped_survival_neglog_derivatives(raw_s1, f1, fp1, fpp1);
+            let (log_phi1, dlogphi1, d2logphi1) =
+                Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1);
             let g = d_raw[i];
             if !g.is_finite() || g <= self.derivative_guard.max(1e-12) {
                 return Err(format!(
@@ -789,7 +792,8 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                 Self::clamped_survival_neglog_derivatives(raw_s0, f0, fp0, fpp0);
             let (_s1, r1, dr1, ddr1) =
                 Self::clamped_survival_neglog_derivatives(raw_s1, f1, fp1, fpp1);
-            let (_log_phi1, dlogphi1, d2logphi1) = Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1);
+            let (_log_phi1, dlogphi1, d2logphi1) =
+                Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1);
 
             // q-derivatives of the per-row log-likelihood contribution.
             // With u0=-h0+q, u1=-h1+q:
@@ -1339,8 +1343,14 @@ mod tests {
             }
         }
 
-        assert!(saw_strict_dr, "expected at least one non-degenerate dr check");
-        assert!(saw_strict_ddr, "expected at least one non-degenerate ddr check");
+        assert!(
+            saw_strict_dr,
+            "expected at least one non-degenerate dr check"
+        );
+        assert!(
+            saw_strict_ddr,
+            "expected at least one non-degenerate ddr check"
+        );
     }
 
     #[test]
@@ -1402,7 +1412,8 @@ mod tests {
         let f = MIN_PROB * 0.1;
         let fp = 3.0;
         let fpp = -7.0;
-        let (logf, d1, d2) = SurvivalLocationScaleProbitFamily::clamped_log_pdf_with_derivatives(f, fp, fpp);
+        let (logf, d1, d2) =
+            SurvivalLocationScaleProbitFamily::clamped_log_pdf_with_derivatives(f, fp, fpp);
         assert!((logf - MIN_PROB.ln()).abs() <= 1e-15);
         assert_eq!(d1, 0.0);
         assert_eq!(d2, 0.0);
@@ -1426,10 +1437,7 @@ mod tests {
         // Upper clamp active.
         let (s_high, r_high, dr_high, ddr_high) =
             SurvivalLocationScaleProbitFamily::clamped_survival_neglog_derivatives(
-                1.1,
-                0.2,
-                -0.3,
-                0.4,
+                1.1, 0.2, -0.3, 0.4,
             );
         assert_eq!(s_high, 1.0);
         assert_eq!(r_high, 0.0);

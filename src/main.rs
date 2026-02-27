@@ -8,10 +8,10 @@ use faer::linalg::solvers::{
 };
 use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy,
-    DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu,
-    SpatialIdentifiability, ThinPlateBasisSpec, build_bspline_basis_1d,
-    evaluate_bspline_derivative_scalar,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions,
+    CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource, MaternBasisSpec,
+    MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
+    build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
 };
 use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, fit_gam,
@@ -175,13 +175,13 @@ struct SurvivalArgs {
     /// Time basis for h(t) in transformation mode.
     #[arg(long = "time-basis", default_value = "linear")]
     time_basis: String,
-    /// Spline degree for time-basis=bspline.
+    /// Spline degree for time-basis=bspline|ispline.
     #[arg(long = "time-degree", default_value_t = 3)]
     time_degree: usize,
-    /// Number of internal knots for time-basis=bspline.
+    /// Number of internal knots for time-basis=bspline|ispline.
     #[arg(long = "time-num-internal-knots", default_value_t = 8)]
     time_num_internal_knots: usize,
-    /// Smoothing lambda for the time bspline block.
+    /// Smoothing lambda for the time bspline/ispline block.
     #[arg(long = "time-smooth-lambda", default_value_t = 1e-2)]
     time_smooth_lambda: f64,
     /// Additional ridge penalty applied to non-intercept coefficients.
@@ -1909,6 +1909,11 @@ enum SurvivalTimeBasisConfig {
         knots: Array1<f64>,
         smooth_lambda: f64,
     },
+    ISpline {
+        degree: usize,
+        knots: Array1<f64>,
+        smooth_lambda: f64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -2087,8 +2092,26 @@ fn parse_survival_time_basis_config(
                 smooth_lambda: args.time_smooth_lambda,
             })
         }
+        "ispline" => {
+            if args.time_degree < 1 {
+                return Err("--time-degree must be >= 1 for ispline time basis".to_string());
+            }
+            if args.time_num_internal_knots == 0 {
+                return Err(
+                    "--time-num-internal-knots must be > 0 for ispline time basis".to_string(),
+                );
+            }
+            if !args.time_smooth_lambda.is_finite() || args.time_smooth_lambda < 0.0 {
+                return Err("--time-smooth-lambda must be finite and >= 0".to_string());
+            }
+            Ok(SurvivalTimeBasisConfig::ISpline {
+                degree: args.time_degree,
+                knots: Array1::zeros(0),
+                smooth_lambda: args.time_smooth_lambda,
+            })
+        }
         other => Err(format!(
-            "unsupported --time-basis '{other}'; use linear|bspline"
+            "unsupported --time-basis '{other}'; use linear|bspline|ispline"
         )),
     }
 }
@@ -2116,6 +2139,23 @@ fn load_survival_time_basis_config_from_model(
                 return Err("saved survival bspline time basis metadata is invalid".to_string());
             }
             Ok(SurvivalTimeBasisConfig::BSpline {
+                degree,
+                knots: Array1::from_vec(knots),
+                smooth_lambda,
+            })
+        }
+        "ispline" => {
+            let degree = model.survival_time_degree.ok_or_else(|| {
+                "saved survival ispline model missing survival_time_degree".to_string()
+            })?;
+            let knots = model.survival_time_knots.clone().ok_or_else(|| {
+                "saved survival ispline model missing survival_time_knots".to_string()
+            })?;
+            let smooth_lambda = model.survival_time_smooth_lambda.unwrap_or(1e-2);
+            if degree < 1 || knots.is_empty() {
+                return Err("saved survival ispline time basis metadata is invalid".to_string());
+            }
+            Ok(SurvivalTimeBasisConfig::ISpline {
                 degree,
                 knots: Array1::from_vec(knots),
                 smooth_lambda,
@@ -2249,6 +2289,122 @@ fn build_survival_time_basis(
                 x_derivative_time,
                 penalties: entry_basis.penalties,
                 basis_name: "bspline".to_string(),
+                degree: Some(degree),
+                knots: Some(knot_vec.to_vec()),
+                smooth_lambda: Some(smooth_lambda),
+            })
+        }
+        SurvivalTimeBasisConfig::ISpline {
+            degree,
+            knots,
+            smooth_lambda,
+        } => {
+            let bspline_degree = degree
+                .checked_add(1)
+                .ok_or_else(|| "ispline degree overflow while building knot basis".to_string())?;
+            let knot_vec = if knots.is_empty() {
+                let (num_internal_knots, _ridge_lambda) =
+                    infer_knots_if_needed.ok_or_else(|| {
+                        "internal error: ispline time basis requested without knot source"
+                            .to_string()
+                    })?;
+                let mut combined = Array1::<f64>::zeros(2 * n);
+                for i in 0..n {
+                    combined[i] = log_entry[i];
+                    combined[n + i] = log_exit[i];
+                }
+                let built = build_bspline_basis_1d(
+                    combined.view(),
+                    &BSplineBasisSpec {
+                        degree: bspline_degree,
+                        penalty_order: 2,
+                        knot_spec: BSplineKnotSpec::Automatic {
+                            num_internal_knots: Some(num_internal_knots),
+                            placement: gam::basis::BSplineKnotPlacement::Quantile,
+                        },
+                        double_penalty: false,
+                        identifiability: BSplineIdentifiability::None,
+                    },
+                )
+                .map_err(|e| format!("failed to build ispline knot basis: {e}"))?;
+                match built.metadata {
+                    BasisMetadata::BSpline1D { knots, .. } => knots,
+                    _ => {
+                        return Err(
+                            "internal error: expected BSpline1D metadata for ispline time basis"
+                                .to_string(),
+                        );
+                    }
+                }
+            } else {
+                knots
+            };
+
+            let (entry_arc, _) = create_basis::<Dense>(
+                log_entry.view(),
+                KnotSource::Provided(knot_vec.view()),
+                degree,
+                BasisOptions::i_spline(),
+            )
+            .map_err(|e| format!("failed to build ispline entry basis: {e}"))?;
+            let (exit_arc, _) = create_basis::<Dense>(
+                log_exit.view(),
+                KnotSource::Provided(knot_vec.view()),
+                degree,
+                BasisOptions::i_spline(),
+            )
+            .map_err(|e| format!("failed to build ispline exit basis: {e}"))?;
+            let (m_exit_arc, _) = create_basis::<Dense>(
+                log_exit.view(),
+                KnotSource::Provided(knot_vec.view()),
+                degree,
+                BasisOptions::m_spline(),
+            )
+            .map_err(|e| format!("failed to build mspline derivative basis: {e}"))?;
+
+            let x_entry_time = entry_arc.as_ref().clone();
+            let x_exit_time = exit_arc.as_ref().clone();
+            let m_exit = m_exit_arc.as_ref();
+            let p_time = x_exit_time.ncols();
+            if m_exit.ncols() < p_time {
+                return Err(
+                    "internal error: m-spline derivative basis has fewer columns than i-spline basis"
+                        .to_string(),
+                );
+            }
+            let mut x_derivative_time = Array2::<f64>::zeros((n, p_time));
+            for i in 0..n {
+                // eta(log t); d eta / dt = (d eta / d log t) * (1 / t)
+                let chain = 1.0 / age_exit[i].max(1e-9);
+                for j in 0..p_time {
+                    x_derivative_time[[i, j]] = m_exit[[i, j]] * chain;
+                }
+            }
+
+            // Reuse a B-spline roughness penalty on the same knot grid and
+            // basis dimension (degree+1 B-splines have the same column count
+            // as degree I-splines).
+            let penalty_basis = build_bspline_basis_1d(
+                log_exit.view(),
+                &BSplineBasisSpec {
+                    degree: bspline_degree,
+                    penalty_order: 2,
+                    knot_spec: BSplineKnotSpec::Provided(knot_vec.clone()),
+                    double_penalty: false,
+                    identifiability: BSplineIdentifiability::None,
+                },
+            )
+            .map_err(|e| format!("failed to build ispline smoothing penalty: {e}"))?;
+            if penalty_basis.design.ncols() != p_time {
+                return Err("internal error: ispline penalty dimension mismatch".to_string());
+            }
+
+            Ok(SurvivalTimeBuildOutput {
+                x_entry_time,
+                x_exit_time,
+                x_derivative_time,
+                penalties: penalty_basis.penalties,
+                basis_name: "ispline".to_string(),
                 degree: Some(degree),
                 knots: Some(knot_vec.to_vec()),
                 smooth_lambda: Some(smooth_lambda),
@@ -2850,6 +3006,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
+    if time_build.basis_name == "ispline" {
+        model
+            .set_structural_monotonicity(true, p_time)
+            .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
+    }
 
     let mut beta0 = Array1::<f64>::zeros(p);
     beta0[0] = -3.0;
@@ -3149,7 +3310,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         let baseline_cfg = survival_baseline_config_from_model(&model)?;
         let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
             build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
-        let model_surv = gam::families::royston_parmar::working_model_from_flattened(
+        let mut model_surv = gam::families::royston_parmar::working_model_from_flattened(
             penalties.clone(),
             monotonicity,
             survival_spec,
@@ -3168,6 +3329,11 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             },
         )
         .map_err(|e| format!("failed to construct survival model: {e}"))?;
+        if time_build.basis_name == "ispline" {
+            model_surv
+                .set_structural_monotonicity(true, p_time)
+                .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
+        }
         let beta0 = Array1::from_vec(model.beta.clone());
         let state = model_surv
             .update_state(&beta0)
@@ -3186,6 +3352,8 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             penalties,
             monotonicity,
             survival_spec,
+            time_build.basis_name == "ispline",
+            p_time,
             beta0.view(),
             state.hessian.view(),
             &cfg,
@@ -5298,8 +5466,13 @@ fn write_survival_prediction_csv(
 
 #[cfg(test)]
 mod tests {
-    use super::{survival_probability_from_eta, write_survival_prediction_csv};
-    use ndarray::array;
+    use super::{
+        SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
+        parse_survival_time_basis_config, survival_probability_from_eta,
+        write_survival_prediction_csv,
+    };
+    use gam::basis::{BasisOptions, Dense, KnotSource, create_basis};
+    use ndarray::{Array1, array};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5400,5 +5573,70 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_survival_time_basis_accepts_ispline() {
+        let args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            spec: "net".to_string(),
+            survival_likelihood: "transformation".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 2,
+            time_num_internal_knots: 6,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            out: None,
+        };
+        let cfg = parse_survival_time_basis_config(&args).expect("parse ispline time basis");
+        assert!(matches!(cfg, SurvivalTimeBasisConfig::ISpline { .. }));
+    }
+
+    #[test]
+    fn ispline_time_basis_derivative_uses_mspline_chain_rule() {
+        let age_entry = Array1::from_vec(vec![1.0, 1.5, 2.0, 2.5]);
+        let age_exit = Array1::from_vec(vec![1.2, 1.9, 2.8, 3.1]);
+        let knots = Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.8, 1.2, 1.6, 1.6, 1.6, 1.6]);
+        let degree = 2usize;
+        let built = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree,
+                knots: knots.clone(),
+                smooth_lambda: 1e-2,
+            },
+            None,
+        )
+        .expect("build ispline time basis");
+
+        let log_exit = age_exit.mapv(|t| t.max(1e-9).ln());
+        let (m_exit, _) = create_basis::<Dense>(
+            log_exit.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::m_spline(),
+        )
+        .expect("build mspline for derivative check");
+        let m_exit = m_exit.as_ref();
+        let p_time = built.x_exit_time.ncols();
+        assert!(m_exit.ncols() >= p_time);
+        for i in 0..age_exit.len() {
+            let chain = 1.0 / age_exit[i].max(1e-9);
+            for j in 0..p_time {
+                let expected = m_exit[[i, j]] * chain;
+                assert!((built.x_derivative_time[[i, j]] - expected).abs() <= 1e-12);
+            }
+        }
     }
 }

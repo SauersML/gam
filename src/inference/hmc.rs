@@ -480,8 +480,10 @@ mod tests {
         NutsPosterior, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
     };
     use crate::basis::{BasisOptions, Dense, KnotSource, create_basis};
+    use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
     use crate::types::LikelihoodFamily;
-    use ndarray::{Array2, array};
+    use general_mcmc::generic_hmc::HamiltonianTarget;
+    use ndarray::{Array1, Array2, array};
 
     #[test]
     fn log1pexp_is_finite_for_extreme_eta() {
@@ -869,6 +871,121 @@ mod tests {
             mc_quad,
             diff
         );
+    }
+
+    #[test]
+    fn survival_hmc_structural_monotonic_fallback_returns_finite_values() {
+        let age_entry = array![1.0];
+        let age_exit = array![2.0];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[1.0, 0.2]];
+        let x_exit = array![[1.0, 0.6]];
+        let x_derivative = array![[0.0, 1.0]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        // Force fallback by setting tolerance above d_eta/dt near the mode.
+        let monotonicity = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 3.0,
+        };
+        let mode = array![0.0, 0.0];
+        let hessian = Array2::<f64>::eye(2);
+
+        let posterior = super::survival_hmc::SurvivalPosterior::new(
+            age_entry.view(),
+            age_exit.view(),
+            event_target.view(),
+            event_competing.view(),
+            sample_weight.view(),
+            x_entry.view(),
+            x_exit.view(),
+            x_derivative.view(),
+            penalties,
+            monotonicity,
+            SurvivalSpec::Net,
+            true,
+            2,
+            mode.view(),
+            hessian.view(),
+        )
+        .expect("construct survival posterior");
+
+        let position = array![0.0, 0.0];
+        let mut grad = Array1::<f64>::zeros(2);
+        let logp = HamiltonianTarget::logp_and_grad(&posterior, &position, &mut grad);
+        assert!(logp.is_finite());
+        assert!(grad.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn survival_hmc_fallback_respects_structural_chain_rule() {
+        let age_entry = array![1.0];
+        let age_exit = array![2.0];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[0.2, 0.1]];
+        let x_exit = array![[0.6, 0.3]];
+        let x_derivative = array![[1.0, 0.0]];
+        let monotonicity = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 3.0,
+        };
+        let mode = array![0.0, 0.0];
+        let hessian = Array2::<f64>::eye(2);
+        let z = array![std::f64::consts::LN_2, 0.0];
+
+        let posterior_linear = super::survival_hmc::SurvivalPosterior::new(
+            age_entry.view(),
+            age_exit.view(),
+            event_target.view(),
+            event_competing.view(),
+            sample_weight.view(),
+            x_entry.view(),
+            x_exit.view(),
+            x_derivative.view(),
+            PenaltyBlocks::new(Vec::new()),
+            monotonicity,
+            SurvivalSpec::Net,
+            false,
+            0,
+            mode.view(),
+            hessian.view(),
+        )
+        .expect("construct linear posterior");
+        let mut grad_linear = Array1::<f64>::zeros(2);
+        let _ = HamiltonianTarget::logp_and_grad(&posterior_linear, &z, &mut grad_linear);
+
+        let posterior_struct = super::survival_hmc::SurvivalPosterior::new(
+            age_entry.view(),
+            age_exit.view(),
+            event_target.view(),
+            event_competing.view(),
+            sample_weight.view(),
+            x_entry.view(),
+            x_exit.view(),
+            x_derivative.view(),
+            PenaltyBlocks::new(Vec::new()),
+            monotonicity,
+            SurvivalSpec::Net,
+            true,
+            2,
+            mode.view(),
+            hessian.view(),
+        )
+        .expect("construct structural posterior");
+        let mut grad_struct = Array1::<f64>::zeros(2);
+        let _ = HamiltonianTarget::logp_and_grad(&posterior_struct, &z, &mut grad_struct);
+
+        // Structural fallback must differ from linear fallback because:
+        // d_eta/dt uses exp(beta_0) and chain-rule scaling by exp(beta_0).
+        assert!(
+            (grad_struct[0] - grad_linear[0]).abs() > 1e-6,
+            "expected structural and linear fallback gradients to differ"
+        );
+        assert!(grad_struct[0].is_finite());
+        assert!(grad_linear[0].is_finite());
     }
 }
 
@@ -1495,6 +1612,8 @@ pub struct SurvivalNutsInputs<'a> {
     pub penalties: crate::survival::PenaltyBlocks,
     pub monotonicity: crate::survival::MonotonicityPenalty,
     pub spec: crate::survival::SurvivalSpec,
+    pub structurally_monotonic: bool,
+    pub structural_time_columns: usize,
     pub mode: ArrayView1<'a, f64>,
     pub hessian: ArrayView2<'a, f64>,
 }
@@ -1570,6 +1689,8 @@ pub fn run_nuts_sampling_flattened_family(
                 survival.penalties,
                 survival.monotonicity,
                 survival.spec,
+                survival.structurally_monotonic,
+                survival.structural_time_columns,
                 survival.mode,
                 survival.hessian,
                 config,
@@ -1621,6 +1742,10 @@ mod survival_hmc {
         monotonicity: Arc<MonotonicityPenalty>,
         /// Survival spec
         spec: SurvivalSpec,
+        /// Whether structural monotonic reparameterization is active.
+        structurally_monotonic: bool,
+        /// Number of leading time columns in the structural reparameterization.
+        structural_time_columns: usize,
         /// MAP estimate (mode) μ [dim]
         mode: Arc<Array1<f64>>,
     }
@@ -1637,6 +1762,84 @@ mod survival_hmc {
     }
 
     impl SurvivalPosterior {
+        #[inline]
+        fn softplus(x: f64) -> f64 {
+            if x > 0.0 {
+                x + (-x).exp().ln_1p()
+            } else {
+                x.exp().ln_1p()
+            }
+        }
+
+        #[inline]
+        fn sigmoid(x: f64) -> f64 {
+            if x >= 0.0 {
+                let z = (-x).exp();
+                1.0 / (1.0 + z)
+            } else {
+                let z = x.exp();
+                z / (1.0 + z)
+            }
+        }
+
+        /// Smooth fallback target used only when the exact survival likelihood is
+        /// undefined due to monotonicity violations (`d_eta/dt <= tolerance`).
+        ///
+        /// This avoids an HMC brick wall (`-inf`) and provides a gradient that
+        /// pushes trajectories back toward the feasible monotone region.
+        fn monotonicity_surrogate_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
+            // Transform z (whitened) -> β (original): β = μ + L @ z
+            let beta = self.data.mode.as_ref() + &self.chol.dot(z);
+            let p = beta.len();
+            let mut theta = beta.clone();
+            let mut jac = Array1::<f64>::ones(p);
+            if self.data.structurally_monotonic {
+                let time_cols = self.data.structural_time_columns.min(p);
+                for j in 0..time_cols {
+                    let w = beta[j].exp();
+                    theta[j] = w;
+                    jac[j] = w;
+                }
+            }
+            let d_eta_dt = self.data.x_derivative.dot(&theta);
+            let tol = self.data.monotonicity.tolerance.max(1e-12);
+
+            // Barrier settings: smooth enough for HMC geometry, steep enough to
+            // strongly repel invalid monotonicity proposals.
+            let soft_scale = (0.1 * tol).max(1e-6);
+            let barrier_weight = 100.0_f64;
+
+            let mut barrier = 0.0_f64;
+            let mut grad_beta = Array1::<f64>::zeros(beta.len());
+
+            for i in 0..d_eta_dt.len() {
+                let w = self.data.sample_weight[i];
+                if w <= 0.0 {
+                    continue;
+                }
+                let u = (tol - d_eta_dt[i]) / soft_scale;
+                let sp = Self::softplus(u);
+                let sig = Self::sigmoid(u);
+                barrier += w * sp * sp;
+
+                // d/d(d_eta_dt) [-barrier_weight * w * softplus(u)^2]
+                // where u = (tol - d_eta_dt)/soft_scale.
+                let dlogp_dd = barrier_weight * w * 2.0 * sp * sig / soft_scale;
+                let x_row = self.data.x_derivative.row(i);
+                for j in 0..grad_beta.len() {
+                    grad_beta[j] += dlogp_dd * x_row[j] * jac[j];
+                }
+            }
+
+            // Weak quadratic anchor in whitened coordinates prevents runaway
+            // excursions when the exact target is undefined.
+            let z2 = z.dot(z);
+            let logp = -0.5 * z2 - barrier_weight * barrier;
+            let mut grad_z = self.chol_t.dot(&grad_beta);
+            grad_z -= z;
+            (logp, grad_z)
+        }
+
         /// Creates a new survival posterior target.
         #[allow(clippy::too_many_arguments)]
         pub fn new(
@@ -1651,6 +1854,8 @@ mod survival_hmc {
             penalties: PenaltyBlocks,
             monotonicity: MonotonicityPenalty,
             spec: SurvivalSpec,
+            structurally_monotonic: bool,
+            structural_time_columns: usize,
             mode: ArrayView1<f64>,
             hessian: ArrayView2<f64>,
         ) -> Result<Self, String> {
@@ -1677,6 +1882,8 @@ mod survival_hmc {
                 penalties: Arc::new(penalties),
                 monotonicity: Arc::new(monotonicity),
                 spec,
+                structurally_monotonic,
+                structural_time_columns,
                 mode: Arc::new(mode.to_owned()),
             };
 
@@ -1689,7 +1896,7 @@ mod survival_hmc {
             let beta = self.data.mode.as_ref() + &self.chol.dot(z);
 
             // Create a temporary working model to compute likelihood
-            let model = WorkingModelSurvival::from_engine_inputs(
+            let mut model = WorkingModelSurvival::from_engine_inputs(
                 SurvivalEngineInputs {
                     age_entry: self.data.age_entry.view(),
                     age_exit: self.data.age_exit.view(),
@@ -1705,6 +1912,13 @@ mod survival_hmc {
                 self.data.spec,
             )
             .map_err(|e| format!("Survival state construction failed: {:?}", e))?;
+            if self.data.structurally_monotonic {
+                model
+                    .set_structural_monotonicity(true, self.data.structural_time_columns)
+                    .map_err(|e| {
+                        format!("Failed to enable structural monotonicity in survival HMC: {e}")
+                    })?;
+            }
 
             // Compute state (deviance and gradient in beta space)
             let state = model
@@ -1743,11 +1957,20 @@ mod survival_hmc {
                     logp
                 }
                 Err(e) => {
-                    // On error (e.g., monotonicity violation), return -infinity log-prob
-                    // This causes NUTS to reject the proposal
-                    log::warn!("Survival posterior evaluation failed: {}", e);
-                    grad.fill(0.0);
-                    f64::NEG_INFINITY
+                    if e.contains("monotonicity violated") {
+                        let (logp, grad_z) = self.monotonicity_surrogate_logp_and_grad(position);
+                        grad.assign(&grad_z);
+                        log::debug!(
+                            "Survival posterior monotonicity fallback engaged (smooth barrier): {}",
+                            e
+                        );
+                        logp
+                    } else {
+                        // Non-monotonicity errors remain hard failures.
+                        log::warn!("Survival posterior evaluation failed: {}", e);
+                        grad.fill(0.0);
+                        f64::NEG_INFINITY
+                    }
                 }
             }
         }
@@ -1767,6 +1990,8 @@ mod survival_hmc {
         penalties: PenaltyBlocks,
         monotonicity: MonotonicityPenalty,
         spec: SurvivalSpec,
+        structurally_monotonic: bool,
+        structural_time_columns: usize,
         mode: ArrayView1<f64>,
         hessian: ArrayView2<f64>,
         config: &NutsConfig,
@@ -1786,6 +2011,8 @@ mod survival_hmc {
             penalties,
             monotonicity,
             spec,
+            structurally_monotonic,
+            structural_time_columns,
             mode,
             hessian,
         )?;
@@ -2241,6 +2468,8 @@ pub fn run_survival_nuts_sampling_flattened<'a>(
     penalties: crate::survival::PenaltyBlocks,
     monotonicity: crate::survival::MonotonicityPenalty,
     spec: crate::survival::SurvivalSpec,
+    structurally_monotonic: bool,
+    structural_time_columns: usize,
     mode: ArrayView1<'a, f64>,
     hessian: ArrayView2<'a, f64>,
     config: &NutsConfig,
@@ -2252,6 +2481,8 @@ pub fn run_survival_nuts_sampling_flattened<'a>(
             penalties,
             monotonicity,
             spec,
+            structurally_monotonic,
+            structural_time_columns,
             mode,
             hessian,
         }),
