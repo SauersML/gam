@@ -1719,6 +1719,10 @@ pub fn fit_custom_family<F: CustomFamily>(
     })
     .with_bounds(lower, upper, 1e-6)
     .with_tolerance(options.outer_tol)
+    .with_fp_tolerances(1e2, 1e2)
+    .with_accept_flat_midpoint_once(true)
+    .with_jiggle_on_flats(true, 1e-3)
+    .with_multi_direction_rescue(true)
     .with_max_iterations(options.outer_max_iter);
     let sol = solver
         .run()
