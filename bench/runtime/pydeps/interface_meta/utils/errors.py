@@ -1,2 +1,0 @@
-class InterfaceConformanceError(RuntimeError):
-    pass
