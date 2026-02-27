@@ -4,7 +4,9 @@ use crate::matrix::DesignMatrix;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
-use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
+use faer::linalg::solvers::{
+    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
+};
 use ndarray::{Array1, Array2};
 use wolfe_bfgs::Bfgs;
 
@@ -38,12 +40,22 @@ pub struct ParameterBlockState {
 
 /// Working quantities supplied by a custom family for one block.
 #[derive(Clone)]
-pub struct BlockWorkingSet {
-    /// IRLS pseudo-response for this block's linear predictor.
-    pub working_response: Array1<f64>,
-    /// IRLS working weights for this block (non-negative, length n).
-    pub working_weights: Array1<f64>,
-    pub gradient_eta: Option<Array1<f64>>,
+pub enum BlockWorkingSet {
+    /// Standard IRLS/GLM-style diagonal working set for eta-space updates.
+    Diagonal {
+        /// IRLS pseudo-response for this block's linear predictor.
+        working_response: Array1<f64>,
+        /// IRLS working weights for this block (non-negative, length n).
+        working_weights: Array1<f64>,
+    },
+    /// Exact Newton block update in coefficient space.
+    ///
+    /// `gradient` is ∇ log L wrt block coefficients.
+    /// `hessian` is -∇² log L wrt block coefficients (positive semidefinite near optimum).
+    ExactNewton {
+        gradient: Array1<f64>,
+        hessian: Array2<f64>,
+    },
 }
 
 /// Family evaluation over all parameter blocks.
@@ -133,23 +145,18 @@ pub struct BlockwiseFitResult {
     pub converged: bool,
 }
 
-fn validate_block_specs(specs: &[ParameterBlockSpec]) -> Result<(usize, Vec<usize>), String> {
+fn validate_block_specs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
     if specs.is_empty() {
         return Err("fit_custom_family requires at least one parameter block".to_string());
     }
-    let n = specs[0].design.nrows();
     let mut penalty_counts = Vec::with_capacity(specs.len());
     for (b, spec) in specs.iter().enumerate() {
-        if spec.design.nrows() != n {
-            return Err(format!(
-                "block {b} row mismatch: got {}, expected {n}",
-                spec.design.nrows()
-            ));
-        }
+        let n = spec.design.nrows();
         if spec.offset.len() != n {
             return Err(format!(
-                "block {b} offset length mismatch: got {}, expected {n}",
-                spec.offset.len()
+                "block {b} offset length mismatch: got {}, expected {}",
+                spec.offset.len(),
+                n
             ));
         }
         let p = spec.design.ncols();
@@ -178,7 +185,7 @@ fn validate_block_specs(specs: &[ParameterBlockSpec]) -> Result<(usize, Vec<usiz
         }
         penalty_counts.push(spec.penalties.len());
     }
-    Ok((n, penalty_counts))
+    Ok(penalty_counts)
 }
 
 fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
@@ -436,6 +443,58 @@ fn solve_block_weighted_system(
     Err("block solve failed after ridge retries".to_string())
 }
 
+fn solve_spd_system_with_policy(
+    lhs: &Array2<f64>,
+    rhs: &Array1<f64>,
+    ridge_floor: f64,
+    ridge_policy: RidgePolicy,
+) -> Result<Array1<f64>, String> {
+    let p = lhs.nrows();
+    if lhs.ncols() != p || rhs.len() != p {
+        return Err("exact-newton system dimension mismatch".to_string());
+    }
+    let base_ridge = if ridge_policy.include_laplace_hessian {
+        effective_solver_ridge(ridge_floor)
+    } else {
+        0.0
+    };
+    for retry in 0..8 {
+        let ridge = if base_ridge > 0.0 {
+            base_ridge * 10f64.powi(retry)
+        } else {
+            0.0
+        };
+        let mut a = lhs.clone();
+        for d in 0..p {
+            a[[d, d]] += ridge;
+        }
+        let h = crate::faer_ndarray::FaerArrayView::new(&a);
+        let mut rhs_mat = FaerMat::zeros(p, 1);
+        for i in 0..p {
+            rhs_mat[(i, 0)] = rhs[i];
+        }
+        if let Ok(ch) = FaerLlt::new(h.as_ref(), Side::Lower) {
+            ch.solve_in_place(rhs_mat.as_mut());
+        } else if let Ok(ld) = FaerLdlt::new(h.as_ref(), Side::Lower) {
+            ld.solve_in_place(rhs_mat.as_mut());
+        } else {
+            let lb = FaerLblt::new(h.as_ref(), Side::Lower);
+            lb.solve_in_place(rhs_mat.as_mut());
+        }
+        let mut out = Array1::<f64>::zeros(p);
+        for i in 0..p {
+            out[i] = rhs_mat[(i, 0)];
+        }
+        if out.iter().all(|v| v.is_finite()) {
+            return Ok(out);
+        }
+        if !ridge_policy.include_laplace_hessian {
+            break;
+        }
+    }
+    Err("exact-newton block solve failed after ridge retries".to_string())
+}
+
 #[inline]
 fn effective_solver_ridge(ridge_floor: f64) -> f64 {
     ridge_floor.max(1e-15)
@@ -579,15 +638,38 @@ fn blockwise_logdet_terms<F: CustomFamily>(
         let spec = &specs[b];
         let work = &eval.block_working_sets[b];
         let p = spec.design.ncols();
-        let (x_dyn, _) = family.block_geometry(states, spec)?;
-        if x_dyn.ncols() != p {
-            return Err(format!(
-                "block {b} dynamic design col mismatch: got {}, expected {p}",
-                x_dyn.ncols()
-            ));
-        }
-        let w = work.working_weights.mapv(|wi| wi.max(options.min_weight));
-        let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
+        let xtwx = match work {
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights,
+            } => {
+                let (x_dyn, _) = family.block_geometry(states, spec)?;
+                if x_dyn.ncols() != p {
+                    return Err(format!(
+                        "block {b} dynamic design col mismatch: got {}, expected {p}",
+                        x_dyn.ncols()
+                    ));
+                }
+                let w = working_weights.mapv(|wi| wi.max(options.min_weight));
+                let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
+                xtwx
+            }
+            BlockWorkingSet::ExactNewton {
+                gradient: _,
+                hessian,
+            } => {
+                if hessian.nrows() != p || hessian.ncols() != p {
+                    return Err(format!(
+                        "block {b} exact-newton Hessian shape mismatch: got {}x{}, expected {}x{}",
+                        hessian.nrows(),
+                        hessian.ncols(),
+                        p,
+                        p
+                    ));
+                }
+                hessian.clone()
+            }
+        };
 
         let lambdas = block_log_lambdas[b].mapv(f64::exp);
         let mut s_lambda = Array2::<f64>::zeros((p, p));
@@ -636,39 +718,6 @@ fn inner_blockwise_fit<F: CustomFamily>(
             let spec = &specs[b];
             let work = &eval.block_working_sets[b];
             let p = spec.design.ncols();
-            if work.working_response.len() != spec.design.nrows()
-                || work.working_weights.len() != spec.design.nrows()
-            {
-                return Err(format!(
-                    "family working-set size mismatch on block {b} ({})",
-                    spec.name
-                ));
-            }
-
-            let (x_dyn, off_dyn) = family.block_geometry(&states, spec)?;
-            if x_dyn.nrows() != spec.design.nrows() {
-                return Err(format!(
-                    "block {b} dynamic design row mismatch: got {}, expected {}",
-                    x_dyn.nrows(),
-                    spec.design.nrows()
-                ));
-            }
-            if x_dyn.ncols() != p {
-                return Err(format!(
-                    "block {b} dynamic design col mismatch: got {}, expected {p}",
-                    x_dyn.ncols()
-                ));
-            }
-            if off_dyn.len() != spec.design.nrows() {
-                return Err(format!(
-                    "block {b} dynamic offset length mismatch: got {}, expected {}",
-                    off_dyn.len(),
-                    spec.design.nrows()
-                ));
-            }
-
-            let mut y_star = work.working_response.clone();
-            y_star -= &off_dyn;
 
             let lambdas = block_log_lambdas[b].mapv(f64::exp);
             let mut s_lambda = Array2::<f64>::zeros((p, p));
@@ -676,14 +725,81 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 s_lambda.scaled_add(lambdas[k], s);
             }
 
-            let beta_new_raw = solve_block_weighted_system(
-                &x_dyn,
-                &y_star,
-                &work.working_weights.mapv(|wi| wi.max(options.min_weight)),
-                &s_lambda,
-                options.ridge_floor,
-                options.ridge_policy,
-            )?;
+            let beta_new_raw = match work {
+                BlockWorkingSet::Diagonal {
+                    working_response,
+                    working_weights,
+                } => {
+                    if working_response.len() != spec.design.nrows()
+                        || working_weights.len() != spec.design.nrows()
+                    {
+                        return Err(format!(
+                            "family diagonal working-set size mismatch on block {b} ({})",
+                            spec.name
+                        ));
+                    }
+
+                    let (x_dyn, off_dyn) = family.block_geometry(&states, spec)?;
+                    if x_dyn.nrows() != spec.design.nrows() {
+                        return Err(format!(
+                            "block {b} dynamic design row mismatch: got {}, expected {}",
+                            x_dyn.nrows(),
+                            spec.design.nrows()
+                        ));
+                    }
+                    if x_dyn.ncols() != p {
+                        return Err(format!(
+                            "block {b} dynamic design col mismatch: got {}, expected {p}",
+                            x_dyn.ncols()
+                        ));
+                    }
+                    if off_dyn.len() != spec.design.nrows() {
+                        return Err(format!(
+                            "block {b} dynamic offset length mismatch: got {}, expected {}",
+                            off_dyn.len(),
+                            spec.design.nrows()
+                        ));
+                    }
+
+                    let mut y_star = working_response.clone();
+                    y_star -= &off_dyn;
+                    solve_block_weighted_system(
+                        &x_dyn,
+                        &y_star,
+                        &working_weights.mapv(|wi| wi.max(options.min_weight)),
+                        &s_lambda,
+                        options.ridge_floor,
+                        options.ridge_policy,
+                    )?
+                }
+                BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                    if gradient.len() != p {
+                        return Err(format!(
+                            "block {b} exact-newton gradient length mismatch: got {}, expected {p}",
+                            gradient.len()
+                        ));
+                    }
+                    if hessian.nrows() != p || hessian.ncols() != p {
+                        return Err(format!(
+                            "block {b} exact-newton Hessian shape mismatch: got {}x{}, expected {}x{}",
+                            hessian.nrows(),
+                            hessian.ncols(),
+                            p,
+                            p
+                        ));
+                    }
+                    let mut lhs = hessian.clone();
+                    lhs += &s_lambda;
+                    let mut rhs = hessian.dot(&states[b].beta);
+                    rhs += gradient;
+                    solve_spd_system_with_policy(
+                        &lhs,
+                        &rhs,
+                        options.ridge_floor,
+                        options.ridge_policy,
+                    )?
+                }
+            };
             let beta_new = family.post_update_beta(beta_new_raw)?;
             let beta_old = states[b].beta.clone();
             let delta = &beta_new - &beta_old;
@@ -787,9 +903,32 @@ fn outer_objective_and_gradient<F: CustomFamily>(
         let spec = &specs[b];
         let work = &eval.block_working_sets[b];
         let p = spec.design.ncols();
-        let (x_dyn, _) = family.block_geometry(&inner.block_states, spec)?;
-        let w = work.working_weights.mapv(|wi| wi.max(options.min_weight));
-        let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
+        let xtwx = match work {
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights,
+            } => {
+                let (x_dyn, _) = family.block_geometry(&inner.block_states, spec)?;
+                let w = working_weights.mapv(|wi| wi.max(options.min_weight));
+                let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
+                xtwx
+            }
+            BlockWorkingSet::ExactNewton {
+                gradient: _,
+                hessian,
+            } => {
+                if hessian.nrows() != p || hessian.ncols() != p {
+                    return Err(format!(
+                        "block {b} exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
+                        hessian.nrows(),
+                        hessian.ncols(),
+                        p,
+                        p
+                    ));
+                }
+                hessian.clone()
+            }
+        };
 
         let lambdas = per_block[b].mapv(f64::exp);
         let mut s_lambda = Array2::<f64>::zeros((p, p));
@@ -854,7 +993,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<BlockwiseFitResult, String> {
-    let (_n, penalty_counts) = validate_block_specs(specs)?;
+    let penalty_counts = validate_block_specs(specs)?;
     let rho0 = flatten_log_lambdas(specs);
 
     if rho0.is_empty() {
@@ -929,10 +1068,9 @@ mod tests {
             let n = block_states[0].eta.len();
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
-                block_working_sets: vec![BlockWorkingSet {
+                block_working_sets: vec![BlockWorkingSet::Diagonal {
                     working_response: Array1::ones(n),
                     working_weights: Array1::ones(n),
-                    gradient_eta: None,
                 }],
             })
         }
@@ -953,10 +1091,9 @@ mod tests {
             let ll = -0.5 * resid.dot(&resid);
             Ok(FamilyEvaluation {
                 log_likelihood: ll,
-                block_working_sets: vec![BlockWorkingSet {
+                block_working_sets: vec![BlockWorkingSet::Diagonal {
                     working_response: self.y.clone(),
                     working_weights: Array1::ones(self.y.len()),
-                    gradient_eta: None,
                 }],
             })
         }

@@ -633,9 +633,18 @@ pub struct ReparamResult {
     /// Lambda-dependent penalty square root from s_transformed (rank x p matrix)
     /// This is used for applying the actual penalty in the least squares solve
     pub e_transformed: Array2<f64>,
-    /// Truncated eigenvectors (p × m where m = p - structural_rank)
-    /// These span the null space of the effective penalty and are needed for
-    /// gradient correction: subtract tr(H⁻¹ P_⊥ S_k P_⊥) from the full trace.
+    /// Truncated eigenvectors (p × m where m = p - structural_rank).
+    ///
+    /// Coordinate frame note:
+    /// - This matrix is stored in the ORIGINAL coefficient frame (pre-`Qs`),
+    ///   because it is sourced from `q_null`.
+    /// - Consumers performing trace/correction math with `rs_transformed`,
+    ///   `beta_transformed`, or transformed Hessians must first map this basis
+    ///   into the same frame, or use an equivalent projector already expressed
+    ///   in transformed coordinates.
+    ///
+    /// These vectors span the structural null space used by positive-part
+    /// log-determinant conventions.
     pub u_truncated: Array2<f64>,
 }
 
@@ -1171,7 +1180,8 @@ pub fn stable_reparameterization_with_invariant(
         )));
     }
 
-    // Truncated basis is the structural null-space basis (fixed Q_n).
+    // Truncated basis is the structural null-space basis (fixed Q_n) in the
+    // ORIGINAL coefficient frame (before transformed-basis operations).
     let u_truncated_mat = q_null.clone();
 
     // E rows correspond to sqrt(eigenvalue) * q_j^T over fixed penalized columns.

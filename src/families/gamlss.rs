@@ -10,6 +10,10 @@ use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::DesignMatrix;
 use crate::pirls::WorkingLikelihood as EngineWorkingLikelihood;
 use crate::probability::{normal_cdf_approx, normal_pdf};
+use crate::smooth::{
+    MaternKappaOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
+    optimize_two_block_matern_kappa,
+};
 use crate::types::{LikelihoodFamily, LinkFunction};
 use faer::Mat as FaerMat;
 use faer::Side;
@@ -255,10 +259,9 @@ fn evaluate_single_block_glm(
         .map_err(|e| e.to_string())?;
     Ok(FamilyEvaluation {
         log_likelihood: ll,
-        block_working_sets: vec![BlockWorkingSet {
+        block_working_sets: vec![BlockWorkingSet::Diagonal {
             working_response: z,
             working_weights: w,
-            gradient_eta: None,
         }],
     })
 }
@@ -497,15 +500,13 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
         Ok(FamilyEvaluation {
             log_likelihood: ll,
             block_working_sets: vec![
-                BlockWorkingSet {
+                BlockWorkingSet::Diagonal {
                     working_response: z_alpha,
                     working_weights: w_alpha,
-                    gradient_eta: None,
                 },
-                BlockWorkingSet {
+                BlockWorkingSet::Diagonal {
                     working_response: z_beta,
                     working_weights: w_beta,
-                    gradient_eta: None,
                 },
             ],
         })
@@ -658,6 +659,47 @@ pub struct BinomialLocationScaleProbitWiggleSpec {
     pub threshold_block: ParameterBlockInput,
     pub log_sigma_block: ParameterBlockInput,
     pub wiggle_block: ParameterBlockInput,
+}
+
+#[derive(Clone)]
+pub struct GaussianLocationScaleTermSpec {
+    pub y: Array1<f64>,
+    pub weights: Array1<f64>,
+    pub sigma_min: f64,
+    pub sigma_max: f64,
+    pub mean_spec: TermCollectionSpec,
+    pub log_sigma_spec: TermCollectionSpec,
+}
+
+#[derive(Clone)]
+pub struct BinomialLocationScaleProbitTermSpec {
+    pub y: Array1<f64>,
+    pub weights: Array1<f64>,
+    pub sigma_min: f64,
+    pub sigma_max: f64,
+    pub threshold_spec: TermCollectionSpec,
+    pub log_sigma_spec: TermCollectionSpec,
+}
+
+#[derive(Clone)]
+pub struct BinomialLocationScaleProbitWiggleTermSpec {
+    pub y: Array1<f64>,
+    pub weights: Array1<f64>,
+    pub sigma_min: f64,
+    pub sigma_max: f64,
+    pub threshold_spec: TermCollectionSpec,
+    pub log_sigma_spec: TermCollectionSpec,
+    pub wiggle_knots: Array1<f64>,
+    pub wiggle_degree: usize,
+    pub wiggle_block: ParameterBlockInput,
+}
+
+pub struct BlockwiseTermFitResult {
+    pub fit: BlockwiseFitResult,
+    pub mean_spec_resolved: TermCollectionSpec,
+    pub noise_spec_resolved: TermCollectionSpec,
+    pub mean_design: TermCollectionDesign,
+    pub noise_design: TermCollectionDesign,
 }
 
 pub fn fit_gaussian_location_scale(
@@ -899,6 +941,165 @@ pub fn fit_binomial_location_scale_probit_wiggle(
     Ok(fit)
 }
 
+pub fn fit_gaussian_location_scale_terms(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: GaussianLocationScaleTermSpec,
+    options: &BlockwiseFitOptions,
+    kappa_options: &MaternKappaOptimizationOptions,
+) -> Result<BlockwiseTermFitResult, String> {
+    let y = spec.y;
+    let weights = spec.weights;
+    let sigma_min = spec.sigma_min;
+    let sigma_max = spec.sigma_max;
+    let solved = optimize_two_block_matern_kappa(
+        data,
+        &spec.mean_spec,
+        &spec.log_sigma_spec,
+        kappa_options,
+        |mean_design, noise_design| {
+            fit_gaussian_location_scale(
+                GaussianLocationScaleSpec {
+                    y: y.clone(),
+                    weights: weights.clone(),
+                    sigma_min,
+                    sigma_max,
+                    mu_block: ParameterBlockInput {
+                        design: DesignMatrix::Dense(mean_design.design.clone()),
+                        offset: Array1::zeros(y.len()),
+                        penalties: mean_design.penalties.clone(),
+                        initial_log_lambdas: None,
+                        initial_beta: None,
+                    },
+                    log_sigma_block: ParameterBlockInput {
+                        design: DesignMatrix::Dense(noise_design.design.clone()),
+                        offset: Array1::zeros(y.len()),
+                        penalties: noise_design.penalties.clone(),
+                        initial_log_lambdas: None,
+                        initial_beta: None,
+                    },
+                },
+                options,
+            )
+        },
+        |fit| fit.penalized_objective,
+    )?;
+    Ok(BlockwiseTermFitResult {
+        fit: solved.fit,
+        mean_spec_resolved: solved.resolved_mean_spec,
+        noise_spec_resolved: solved.resolved_noise_spec,
+        mean_design: solved.mean_design,
+        noise_design: solved.noise_design,
+    })
+}
+
+pub fn fit_binomial_location_scale_probit_terms(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: BinomialLocationScaleProbitTermSpec,
+    options: &BlockwiseFitOptions,
+    kappa_options: &MaternKappaOptimizationOptions,
+) -> Result<BlockwiseTermFitResult, String> {
+    let y = spec.y;
+    let weights = spec.weights;
+    let sigma_min = spec.sigma_min;
+    let sigma_max = spec.sigma_max;
+    let solved = optimize_two_block_matern_kappa(
+        data,
+        &spec.threshold_spec,
+        &spec.log_sigma_spec,
+        kappa_options,
+        |threshold_design, noise_design| {
+            fit_binomial_location_scale_probit(
+                BinomialLocationScaleProbitSpec {
+                    y: y.clone(),
+                    weights: weights.clone(),
+                    sigma_min,
+                    sigma_max,
+                    threshold_block: ParameterBlockInput {
+                        design: DesignMatrix::Dense(threshold_design.design.clone()),
+                        offset: Array1::zeros(y.len()),
+                        penalties: threshold_design.penalties.clone(),
+                        initial_log_lambdas: None,
+                        initial_beta: None,
+                    },
+                    log_sigma_block: ParameterBlockInput {
+                        design: DesignMatrix::Dense(noise_design.design.clone()),
+                        offset: Array1::zeros(y.len()),
+                        penalties: noise_design.penalties.clone(),
+                        initial_log_lambdas: None,
+                        initial_beta: None,
+                    },
+                },
+                options,
+            )
+        },
+        |fit| fit.penalized_objective,
+    )?;
+    Ok(BlockwiseTermFitResult {
+        fit: solved.fit,
+        mean_spec_resolved: solved.resolved_mean_spec,
+        noise_spec_resolved: solved.resolved_noise_spec,
+        mean_design: solved.mean_design,
+        noise_design: solved.noise_design,
+    })
+}
+
+pub fn fit_binomial_location_scale_probit_wiggle_terms(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: BinomialLocationScaleProbitWiggleTermSpec,
+    options: &BlockwiseFitOptions,
+    kappa_options: &MaternKappaOptimizationOptions,
+) -> Result<BlockwiseTermFitResult, String> {
+    let y = spec.y;
+    let weights = spec.weights;
+    let sigma_min = spec.sigma_min;
+    let sigma_max = spec.sigma_max;
+    let wiggle_knots = spec.wiggle_knots;
+    let wiggle_degree = spec.wiggle_degree;
+    let wiggle_block = spec.wiggle_block;
+    let solved = optimize_two_block_matern_kappa(
+        data,
+        &spec.threshold_spec,
+        &spec.log_sigma_spec,
+        kappa_options,
+        |threshold_design, noise_design| {
+            fit_binomial_location_scale_probit_wiggle(
+                BinomialLocationScaleProbitWiggleSpec {
+                    y: y.clone(),
+                    weights: weights.clone(),
+                    sigma_min,
+                    sigma_max,
+                    wiggle_knots: wiggle_knots.clone(),
+                    wiggle_degree,
+                    threshold_block: ParameterBlockInput {
+                        design: DesignMatrix::Dense(threshold_design.design.clone()),
+                        offset: Array1::zeros(y.len()),
+                        penalties: threshold_design.penalties.clone(),
+                        initial_log_lambdas: None,
+                        initial_beta: None,
+                    },
+                    log_sigma_block: ParameterBlockInput {
+                        design: DesignMatrix::Dense(noise_design.design.clone()),
+                        offset: Array1::zeros(y.len()),
+                        penalties: noise_design.penalties.clone(),
+                        initial_log_lambdas: None,
+                        initial_beta: None,
+                    },
+                    wiggle_block: wiggle_block.clone(),
+                },
+                options,
+            )
+        },
+        |fit| fit.penalized_objective,
+    )?;
+    Ok(BlockwiseTermFitResult {
+        fit: solved.fit,
+        mean_spec_resolved: solved.resolved_mean_spec,
+        noise_spec_resolved: solved.resolved_noise_spec,
+        mean_design: solved.mean_design,
+        noise_design: solved.noise_design,
+    })
+}
+
 /// Link identifiers for distribution parameters in multi-parameter GAMLSS families.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParameterLink {
@@ -1020,21 +1221,18 @@ fn binomial_location_scale_working_sets(
         }
     }
 
-    let t_ws = BlockWorkingSet {
+    let t_ws = BlockWorkingSet::Diagonal {
         working_response: z_t,
         working_weights: w_t,
-        gradient_eta: None,
     };
-    let ls_ws = BlockWorkingSet {
+    let ls_ws = BlockWorkingSet::Diagonal {
         working_response: z_ls,
         working_weights: w_ls,
-        gradient_eta: None,
     };
     let w_ws = match (z_w, w_w) {
-        (Some(z), Some(w)) => Some(BlockWorkingSet {
+        (Some(z), Some(w)) => Some(BlockWorkingSet::Diagonal {
             working_response: z,
             working_weights: w,
-            gradient_eta: None,
         }),
         _ => None,
     };
@@ -1132,15 +1330,13 @@ impl CustomFamily for GaussianLocationScaleFamily {
         Ok(FamilyEvaluation {
             log_likelihood: ll,
             block_working_sets: vec![
-                BlockWorkingSet {
+                BlockWorkingSet::Diagonal {
                     working_response: z_mu,
                     working_weights: w_mu,
-                    gradient_eta: None,
                 },
-                BlockWorkingSet {
+                BlockWorkingSet::Diagonal {
                     working_response: z_ls,
                     working_weights: w_ls,
-                    gradient_eta: None,
                 },
             ],
         })
@@ -1301,10 +1497,9 @@ impl CustomFamily for PoissonLogFamily {
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            block_working_sets: vec![BlockWorkingSet {
+            block_working_sets: vec![BlockWorkingSet::Diagonal {
                 working_response: z,
                 working_weights: w,
-                gradient_eta: None,
             }],
         })
     }
@@ -1401,10 +1596,9 @@ impl CustomFamily for GammaLogFamily {
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
-            block_working_sets: vec![BlockWorkingSet {
+            block_working_sets: vec![BlockWorkingSet::Diagonal {
                 working_response: z,
                 working_weights: w,
-                gradient_eta: None,
             }],
         })
     }
@@ -1915,6 +2109,24 @@ mod tests {
             Some(&dq_dq0),
             &core,
         );
+        let t_w = match &t_ws {
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights,
+            } => working_weights,
+            BlockWorkingSet::ExactNewton { .. } => {
+                panic!("expected diagonal working set for threshold block")
+            }
+        };
+        let ls_w = match &ls_ws {
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights,
+            } => working_weights,
+            BlockWorkingSet::ExactNewton { .. } => {
+                panic!("expected diagonal working set for log-sigma block")
+            }
+        };
 
         for i in 0..n {
             let var = (core.mu[i] * (1.0 - core.mu[i])).max(MIN_PROB);
@@ -1924,17 +2136,17 @@ mod tests {
             let expected_w_t = (weights[i] * (dmu_t * dmu_t / var)).max(MIN_WEIGHT);
             let expected_w_ls = (weights[i] * (dmu_ls * dmu_ls / var)).max(MIN_WEIGHT);
             assert!(
-                (t_ws.working_weights[i] - expected_w_t).abs() < 1e-10,
+                (t_w[i] - expected_w_t).abs() < 1e-10,
                 "threshold weight mismatch at {}: got {}, expected {}",
                 i,
-                t_ws.working_weights[i],
+                t_w[i],
                 expected_w_t
             );
             assert!(
-                (ls_ws.working_weights[i] - expected_w_ls).abs() < 1e-10,
+                (ls_w[i] - expected_w_ls).abs() < 1e-10,
                 "log-sigma weight mismatch at {}: got {}, expected {}",
                 i,
-                ls_ws.working_weights[i],
+                ls_w[i],
                 expected_w_ls
             );
         }

@@ -9,7 +9,8 @@ use faer::linalg::solvers::{
 use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy,
-    DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, MaternNu, ThinPlateBasisSpec,
+    DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    ThinPlateBasisSpec,
     build_bspline_basis_1d, evaluate_bspline_derivative_scalar,
 };
 use gam::estimate::{
@@ -17,11 +18,10 @@ use gam::estimate::{
     optimize_external_design, predict_gam,
 };
 use gam::gamlss::{
-    BinomialLocationScaleProbitSpec, BinomialLocationScaleProbitWiggleSpec,
-    GaussianLocationScaleSpec, ParameterBlockInput, WiggleBlockConfig,
-    build_wiggle_block_input_from_knots, build_wiggle_block_input_from_seed,
-    fit_binomial_location_scale_probit, fit_binomial_location_scale_probit_wiggle,
-    fit_gaussian_location_scale,
+    BinomialLocationScaleProbitTermSpec, BinomialLocationScaleProbitWiggleTermSpec,
+    GaussianLocationScaleTermSpec, WiggleBlockConfig, build_wiggle_block_input_from_knots,
+    build_wiggle_block_input_from_seed, fit_binomial_location_scale_probit_terms,
+    fit_binomial_location_scale_probit_wiggle_terms, fit_gaussian_location_scale_terms,
 };
 use gam::generative::{generative_spec_from_predict, sample_observation_replicates};
 use gam::hmc::{FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family};
@@ -31,10 +31,16 @@ use gam::joint::{
 use gam::matrix::DesignMatrix;
 use gam::probability::{inverse_link_array, normal_cdf_approx, standard_normal_quantile};
 use gam::smooth::{
-    LinearTermSpec, RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-    TensorBSplineSpec, TermCollectionSpec, build_term_collection_design,
+    LinearTermSpec, MaternKappaOptimizationOptions, RandomEffectTermSpec, ShapeConstraint,
+    SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec,
+    build_term_collection_design, fit_term_collection_with_matern_kappa_optimization,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
+use gam::survival_location_scale_probit::{
+    CovariateBlockInput, ResidualDistribution, SurvivalLocationScaleProbitPredictInput,
+    SurvivalLocationScaleProbitSpec, TimeBlockInput, fit_survival_location_scale_probit,
+    predict_survival_location_scale_probit,
+};
 use gam::types::{LikelihoodFamily, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
@@ -131,9 +137,15 @@ struct SurvivalArgs {
     /// Net or crude risk target.
     #[arg(long = "spec", default_value = "net")]
     spec: String,
-    /// Survival likelihood mode: transformation (flexible time shape) or weibull (parametric time shape).
+    /// Survival likelihood mode:
+    /// - transformation: Royston-Parmar log-cumulative-hazard with flexible time shape.
+    /// - weibull: parametric Royston-Parmar time shape.
+    /// - probit-location-scale: transformation-family on probit scale with time/location/log-sigma blocks.
     #[arg(long = "survival-likelihood", default_value = "transformation")]
     survival_likelihood: String,
+    /// Residual distribution used by probit-location-scale transformation survival mode.
+    #[arg(long = "survival-distribution", default_value = "gaussian")]
+    survival_distribution: String,
     /// Baseline target that penalties shrink toward in transformation mode.
     #[arg(long = "baseline-target", default_value = "linear")]
     baseline_target: String,
@@ -274,6 +286,18 @@ struct SavedModel {
     survival_ridge_lambda: Option<f64>,
     #[serde(default)]
     survival_likelihood: Option<String>,
+    #[serde(default)]
+    survival_sigma_min: Option<f64>,
+    #[serde(default)]
+    survival_sigma_max: Option<f64>,
+    #[serde(default)]
+    survival_beta_time: Option<Vec<f64>>,
+    #[serde(default)]
+    survival_beta_threshold: Option<Vec<f64>>,
+    #[serde(default)]
+    survival_beta_log_sigma: Option<Vec<f64>>,
+    #[serde(default)]
+    survival_distribution: Option<String>,
     #[serde(default)]
     training_headers: Option<Vec<String>>,
     #[serde(default)]
@@ -416,14 +440,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         let noise_formula = normalize_noise_formula(noise_formula_raw, &parsed.response);
         let parsed_noise = parse_formula(&noise_formula)?;
         let noise_spec = build_term_spec(&parsed_noise.terms, &ds, &col_map)?;
-        let noise_design = build_term_collection_design(ds.values.view(), &noise_spec)
-            .map_err(|e| format!("failed to build noise term collection design: {e}"))?;
-
         let mean_spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
-        let mean_design = build_term_collection_design(ds.values.view(), &mean_spec)
-            .map_err(|e| format!("failed to build mean term collection design: {e}"))?;
-        let frozen_mean_spec = freeze_term_collection_spec(&mean_spec, &mean_design)?;
-        let frozen_noise_spec = freeze_term_collection_spec(&noise_spec, &noise_design)?;
 
         if family == LikelihoodFamily::GaussianIdentity {
             if args.learn_link_wiggle {
@@ -437,30 +454,28 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             let sigma_max = (sd * 1e3).max(sigma_min * 10.0);
 
             let options = gam::BlockwiseFitOptions::default();
-            let fit = fit_gaussian_location_scale(
-                GaussianLocationScaleSpec {
+            let solved = fit_gaussian_location_scale_terms(
+                ds.values.view(),
+                GaussianLocationScaleTermSpec {
                     y: y.clone(),
                     weights: Array1::ones(y.len()),
                     sigma_min,
                     sigma_max,
-                    mu_block: ParameterBlockInput {
-                        design: DesignMatrix::Dense(mean_design.design.clone()),
-                        offset: Array1::zeros(y.len()),
-                        penalties: mean_design.penalties.clone(),
-                        initial_log_lambdas: None,
-                        initial_beta: None,
-                    },
-                    log_sigma_block: ParameterBlockInput {
-                        design: DesignMatrix::Dense(noise_design.design.clone()),
-                        offset: Array1::zeros(y.len()),
-                        penalties: noise_design.penalties.clone(),
-                        initial_log_lambdas: None,
-                        initial_beta: None,
-                    },
+                    mean_spec: mean_spec.clone(),
+                    log_sigma_spec: noise_spec.clone(),
                 },
                 &options,
+                &MaternKappaOptimizationOptions::default(),
             )
-            .map_err(|e| format!("fit_gaussian_location_scale failed: {e}"))?;
+            .map_err(|e| format!("fit_gaussian_location_scale_terms failed: {e}"))?;
+            let fit = solved.fit;
+            let resolved_mean_spec = solved.mean_spec_resolved;
+            let resolved_noise_spec = solved.noise_spec_resolved;
+            let mean_design = solved.mean_design;
+            let noise_design = solved.noise_design;
+            let frozen_mean_spec = freeze_term_collection_spec(&resolved_mean_spec, &mean_design)?;
+            let frozen_noise_spec =
+                freeze_term_collection_spec(&resolved_noise_spec, &noise_design)?;
 
             println!(
                 "model fit complete | family={} | outer_iter={} | converged={}",
@@ -501,22 +516,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         let sigma_max = 20.0;
         let q_seed = Array1::<f64>::zeros(y.len());
         let options = gam::BlockwiseFitOptions::default();
-        let threshold_block = ParameterBlockInput {
-            design: DesignMatrix::Dense(mean_design.design.clone()),
-            offset: Array1::zeros(y.len()),
-            penalties: mean_design.penalties.clone(),
-            initial_log_lambdas: None,
-            initial_beta: None,
-        };
-        let log_sigma_block = ParameterBlockInput {
-            design: DesignMatrix::Dense(noise_design.design.clone()),
-            offset: Array1::zeros(y.len()),
-            penalties: noise_design.penalties.clone(),
-            initial_log_lambdas: None,
-            initial_beta: None,
-        };
-
-        let (fit, wiggle_meta): (
+        let (resolved_mean_spec, resolved_noise_spec, mean_design, noise_design, fit, wiggle_meta): (
+            TermCollectionSpec,
+            TermCollectionSpec,
+            gam::smooth::TermCollectionDesign,
+            gam::smooth::TermCollectionDesign,
             gam::BlockwiseFitResult,
             Option<(Array1<f64>, usize, Vec<f64>)>,
         ) = if args.learn_link_wiggle {
@@ -535,42 +539,74 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             let (wiggle_block, wiggle_knots) =
                 build_wiggle_block_input_from_seed(q_seed.view(), &cfg)
                     .map_err(|e| format!("failed to build link wiggle block: {e}"))?;
-            let fit = fit_binomial_location_scale_probit_wiggle(
-                BinomialLocationScaleProbitWiggleSpec {
+            let wiggle_block_for_fit = wiggle_block.clone();
+            let wiggle_knots_for_fit = wiggle_knots.clone();
+            let solved = fit_binomial_location_scale_probit_wiggle_terms(
+                ds.values.view(),
+                BinomialLocationScaleProbitWiggleTermSpec {
                     y: y.clone(),
                     weights: Array1::ones(y.len()),
                     sigma_min,
                     sigma_max,
-                    wiggle_knots: wiggle_knots.clone(),
+                    threshold_spec: mean_spec.clone(),
+                    log_sigma_spec: noise_spec.clone(),
+                    wiggle_knots: wiggle_knots_for_fit.clone(),
                     wiggle_degree: cfg.degree,
-                    threshold_block,
-                    log_sigma_block,
-                    wiggle_block,
+                    wiggle_block: wiggle_block_for_fit.clone(),
                 },
                 &options,
+                &MaternKappaOptimizationOptions::default(),
             )
-            .map_err(|e| format!("fit_binomial_location_scale_probit_wiggle failed: {e}"))?;
+            .map_err(|e| format!("fit_binomial_location_scale_probit_wiggle_terms failed: {e}"))?;
+            let fit = solved.fit;
+            let resolved_mean_spec = solved.mean_spec_resolved;
+            let resolved_noise_spec = solved.noise_spec_resolved;
+            let mean_design = solved.mean_design;
+            let noise_design = solved.noise_design;
             let beta_wiggle = fit
                 .block_states
                 .get(2)
                 .map(|b| b.beta.to_vec())
                 .unwrap_or_default();
-            (fit, Some((wiggle_knots, cfg.degree, beta_wiggle)))
+            (
+                resolved_mean_spec,
+                resolved_noise_spec,
+                mean_design,
+                noise_design,
+                fit,
+                Some((wiggle_knots, cfg.degree, beta_wiggle)),
+            )
         } else {
-            let fit = fit_binomial_location_scale_probit(
-                BinomialLocationScaleProbitSpec {
+            let solved = fit_binomial_location_scale_probit_terms(
+                ds.values.view(),
+                BinomialLocationScaleProbitTermSpec {
                     y: y.clone(),
                     weights: Array1::ones(y.len()),
                     sigma_min,
                     sigma_max,
-                    threshold_block,
-                    log_sigma_block,
+                    threshold_spec: mean_spec.clone(),
+                    log_sigma_spec: noise_spec.clone(),
                 },
                 &options,
+                &MaternKappaOptimizationOptions::default(),
             )
-            .map_err(|e| format!("fit_binomial_location_scale_probit failed: {e}"))?;
-            (fit, None)
+            .map_err(|e| format!("fit_binomial_location_scale_probit_terms failed: {e}"))?;
+            let fit = solved.fit;
+            let resolved_mean_spec = solved.mean_spec_resolved;
+            let resolved_noise_spec = solved.noise_spec_resolved;
+            let mean_design = solved.mean_design;
+            let noise_design = solved.noise_design;
+            (
+                resolved_mean_spec,
+                resolved_noise_spec,
+                mean_design,
+                noise_design,
+                fit,
+                None,
+            )
         };
+        let frozen_mean_spec = freeze_term_collection_spec(&resolved_mean_spec, &mean_design)?;
+        let frozen_noise_spec = freeze_term_collection_spec(&resolved_noise_spec, &noise_design)?;
 
         println!(
             "model fit complete | family={} | outer_iter={} | converged={}",
@@ -606,9 +642,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
 
     let spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
-    let design = build_term_collection_design(ds.values.view(), &spec)
+    let initial_design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
-    let frozen_spec = freeze_term_collection_spec(&spec, &design)?;
+    let initial_frozen_spec = freeze_term_collection_spec(&spec, &initial_design)?;
 
     let fit_max_iter = 80usize;
     let fit_tol = 1e-6f64;
@@ -635,8 +671,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             let joint = fit_joint_model_engine(
                 y.view(),
                 weights.view(),
-                design.design.view(),
-                design.penalties.clone(),
+                initial_design.design.view(),
+                initial_design.penalties.clone(),
                 choice.link,
                 geometry,
                 config,
@@ -691,8 +727,14 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     survival_time_smooth_lambda: None,
                     survival_ridge_lambda: None,
                     survival_likelihood: None,
+                    survival_sigma_min: None,
+                    survival_sigma_max: None,
+                    survival_beta_time: None,
+                    survival_beta_threshold: None,
+                    survival_beta_log_sigma: None,
+                    survival_distribution: None,
                     training_headers: Some(ds.headers.clone()),
-                    resolved_term_spec: Some(frozen_spec.clone()),
+                    resolved_term_spec: Some(initial_frozen_spec.clone()),
                     resolved_term_spec_noise: None,
                     fit_max_iter,
                     fit_tol,
@@ -707,7 +749,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             return Ok(());
         }
     }
-    let fit: FitResult = if args.firth {
+    let (fit, design, resolved_spec): (
+        FitResult,
+        gam::smooth::TermCollectionDesign,
+        TermCollectionSpec,
+    ) = if args.firth {
+        let design = build_term_collection_design(ds.values.view(), &spec)
+            .map_err(|e| format!("failed to build term collection design: {e}"))?;
         if family != LikelihoodFamily::BinomialLogit {
             return Err(
                 "--firth currently requires a binomial-logit mean model (set --family binomial-logit or --link logit)"
@@ -729,23 +777,27 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             },
         )
         .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;
-        fit_result_from_external(ext)
+        (fit_result_from_external(ext), design, spec.clone())
     } else {
-        fit_gam(
-            design.design.view(),
-            y.view(),
-            weights.view(),
-            offset.view(),
-            &design.penalties,
+        let fitted = fit_term_collection_with_matern_kappa_optimization(
+            ds.values.view(),
+            y.clone(),
+            weights.clone(),
+            offset.clone(),
+            &spec,
             family,
             &FitOptions {
                 max_iter: fit_max_iter,
                 tol: fit_tol,
-                nullspace_dims: design.nullspace_dims.clone(),
+                nullspace_dims: vec![],
             },
+            &MaternKappaOptimizationOptions::default(),
         )
-        .map_err(|e| format!("fit_gam failed: {e}"))?
+        .map_err(|e| format!("fit_term_collection (with Matérn κ optimization) failed: {e}"))?;
+        (fitted.fit, fitted.design, fitted.resolved_spec)
     };
+
+    let frozen_spec = freeze_term_collection_spec(&resolved_spec, &design)?;
 
     print_fit_summary(&design, &fit, family);
 
@@ -782,6 +834,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             survival_time_smooth_lambda: None,
             survival_ridge_lambda: None,
             survival_likelihood: None,
+            survival_sigma_min: None,
+            survival_sigma_max: None,
+            survival_beta_time: None,
+            survival_beta_threshold: None,
+            survival_beta_log_sigma: None,
+            survival_distribution: None,
             training_headers: Some(ds.headers.clone()),
             resolved_term_spec: Some(frozen_spec),
             resolved_term_spec_noise: None,
@@ -857,6 +915,81 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         }
         let time_cfg = load_survival_time_basis_config_from_model(&model)?;
         let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg, None)?;
+        let saved_likelihood_mode = parse_survival_likelihood_mode(
+            model
+                .survival_likelihood
+                .as_deref()
+                .unwrap_or("transformation"),
+        )?;
+        if saved_likelihood_mode == SurvivalLikelihoodMode::ProbitLocationScale {
+            if args.uncertainty {
+                return Err(
+                    "--uncertainty is not implemented for survival-likelihood=probit-location-scale"
+                        .to_string(),
+                );
+            }
+            let beta_time =
+                Array1::from_vec(model.survival_beta_time.clone().ok_or_else(|| {
+                    "saved probit-location-scale model missing survival_beta_time".to_string()
+                })?);
+            let beta_threshold =
+                Array1::from_vec(model.survival_beta_threshold.clone().ok_or_else(|| {
+                    "saved probit-location-scale model missing survival_beta_threshold".to_string()
+                })?);
+            let beta_log_sigma =
+                Array1::from_vec(model.survival_beta_log_sigma.clone().ok_or_else(|| {
+                    "saved probit-location-scale model missing survival_beta_log_sigma".to_string()
+                })?);
+            let baseline_cfg = survival_baseline_config_from_model(&model)?;
+            let mut eta_offset_exit = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let (eta0, _) = evaluate_survival_baseline(age_exit[i], &baseline_cfg)?;
+                eta_offset_exit[i] = eta0;
+            }
+            let pred = predict_survival_location_scale_probit(
+                &SurvivalLocationScaleProbitPredictInput {
+                    x_time_exit: time_build.x_exit_time.clone(),
+                    eta_time_offset_exit: eta_offset_exit,
+                    x_threshold: DesignMatrix::Dense(cov_design.design.clone()),
+                    x_log_sigma: DesignMatrix::Dense(cov_design.design.clone()),
+                    sigma_min: model.survival_sigma_min.unwrap_or(0.05),
+                    sigma_max: model.survival_sigma_max.unwrap_or(20.0),
+                    distribution: parse_survival_distribution(
+                        model
+                            .survival_distribution
+                            .as_deref()
+                            .unwrap_or("gaussian"),
+                    )?,
+                },
+                &gam::survival_location_scale_probit::SurvivalLocationScaleProbitFitResult {
+                    beta_time,
+                    beta_threshold,
+                    beta_log_sigma,
+                    lambdas_time: Array1::zeros(0),
+                    lambdas_threshold: Array1::zeros(0),
+                    lambdas_log_sigma: Array1::zeros(0),
+                    log_likelihood: f64::NAN,
+                    penalized_objective: f64::NAN,
+                    iterations: 0,
+                    converged: true,
+                },
+            )
+            .map_err(|e| format!("survival probit-location-scale predict failed: {e}"))?;
+            write_survival_prediction_csv(
+                &args.out,
+                pred.eta.view(),
+                pred.survival_prob.view(),
+                None,
+                None,
+                None,
+            )?;
+            println!(
+                "wrote predictions: {} (rows={})",
+                args.out.display(),
+                pred.survival_prob.len()
+            );
+            return Ok(());
+        }
         let p_time = time_build.x_exit_time.ncols();
         let p = p_time + p_cov;
         let mut x_exit = Array2::<f64>::zeros((n, p));
@@ -1362,6 +1495,7 @@ struct SurvivalTimeBuildOutput {
 enum SurvivalLikelihoodMode {
     Transformation,
     Weibull,
+    ProbitLocationScale,
 }
 
 fn parse_survival_baseline_config(
@@ -1441,8 +1575,9 @@ fn parse_survival_likelihood_mode(raw: &str) -> Result<SurvivalLikelihoodMode, S
     match raw.to_ascii_lowercase().as_str() {
         "transformation" => Ok(SurvivalLikelihoodMode::Transformation),
         "weibull" => Ok(SurvivalLikelihoodMode::Weibull),
+        "probit-location-scale" => Ok(SurvivalLikelihoodMode::ProbitLocationScale),
         other => Err(format!(
-            "unsupported --survival-likelihood '{other}'; use transformation|weibull"
+            "unsupported --survival-likelihood '{other}'; use transformation|weibull|probit-location-scale"
         )),
     }
 }
@@ -1451,6 +1586,26 @@ fn survival_likelihood_mode_name(mode: SurvivalLikelihoodMode) -> &'static str {
     match mode {
         SurvivalLikelihoodMode::Transformation => "transformation",
         SurvivalLikelihoodMode::Weibull => "weibull",
+        SurvivalLikelihoodMode::ProbitLocationScale => "probit-location-scale",
+    }
+}
+
+fn parse_survival_distribution(raw: &str) -> Result<ResidualDistribution, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "gaussian" | "probit" => Ok(ResidualDistribution::Gaussian),
+        "gumbel" | "cloglog" => Ok(ResidualDistribution::Gumbel),
+        "logistic" | "logit" => Ok(ResidualDistribution::Logistic),
+        other => Err(format!(
+            "unsupported --survival-distribution '{other}'; use gaussian|gumbel|logistic"
+        )),
+    }
+}
+
+fn survival_distribution_name(dist: ResidualDistribution) -> &'static str {
+    match dist {
+        ResidualDistribution::Gaussian => "gaussian",
+        ResidualDistribution::Gumbel => "gumbel",
+        ResidualDistribution::Logistic => "logistic",
     }
 }
 
@@ -1812,6 +1967,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         other => return Err(format!("unsupported --spec '{other}'; use net|crude")),
     };
     let likelihood_mode = parse_survival_likelihood_mode(&args.survival_likelihood)?;
+    let survival_distribution = parse_survival_distribution(&args.survival_distribution)?;
     if likelihood_mode == SurvivalLikelihoodMode::Weibull {
         if !args.baseline_target.eq_ignore_ascii_case("linear")
             || args.baseline_scale.is_some()
@@ -1835,12 +1991,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
     }
     let baseline_cfg = match likelihood_mode {
-        SurvivalLikelihoodMode::Transformation => parse_survival_baseline_config(
-            &args.baseline_target,
-            args.baseline_scale,
-            args.baseline_shape,
-            args.baseline_rate,
-        )?,
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::ProbitLocationScale => {
+            parse_survival_baseline_config(
+                &args.baseline_target,
+                args.baseline_scale,
+                args.baseline_shape,
+                args.baseline_rate,
+            )?
+        }
         SurvivalLikelihoodMode::Weibull => {
             parse_survival_baseline_config("linear", None, None, None)?
         }
@@ -1849,7 +2007,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         return Err("--ridge-lambda must be finite and >= 0".to_string());
     }
     let time_basis_cfg = match likelihood_mode {
-        SurvivalLikelihoodMode::Transformation => parse_survival_time_basis_config(&args)?,
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::ProbitLocationScale => {
+            parse_survival_time_basis_config(&args)?
+        }
         SurvivalLikelihoodMode::Weibull => SurvivalTimeBasisConfig::Linear,
     };
 
@@ -1904,6 +2064,118 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             x_entry[[i, p_time + j]] = z;
             x_exit[[i, p_time + j]] = z;
         }
+    }
+
+    if likelihood_mode == SurvivalLikelihoodMode::ProbitLocationScale {
+        let mut time_initial_log_lambdas = None;
+        if !time_build.penalties.is_empty() {
+            let lambda0 = time_build.smooth_lambda.unwrap_or(1e-2).max(1e-12).ln();
+            time_initial_log_lambdas = Some(Array1::from_elem(time_build.penalties.len(), lambda0));
+        }
+        let probit_spec = SurvivalLocationScaleProbitSpec {
+            age_entry: age_entry.clone(),
+            age_exit: age_exit.clone(),
+            event_target: event_target.mapv(f64::from),
+            weights: weights.clone(),
+            sigma_min: 0.05,
+            sigma_max: 20.0,
+            distribution: survival_distribution,
+            derivative_guard: 1e-8,
+            derivative_softness: 1e-6,
+            max_iter: 400,
+            tol: 1e-6,
+            time_block: TimeBlockInput {
+                design_entry: time_build.x_entry_time.clone(),
+                design_exit: time_build.x_exit_time.clone(),
+                design_derivative_exit: time_build.x_derivative_time.clone(),
+                offset_entry: eta_offset_entry.clone(),
+                offset_exit: eta_offset_exit.clone(),
+                derivative_offset_exit: derivative_offset_exit.clone(),
+                penalties: time_build.penalties.clone(),
+                initial_log_lambdas: time_initial_log_lambdas,
+                initial_beta: None,
+            },
+            threshold_block: CovariateBlockInput {
+                design: DesignMatrix::Dense(cov_design.design.clone()),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            },
+            log_sigma_block: CovariateBlockInput {
+                design: DesignMatrix::Dense(cov_design.design.clone()),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            },
+        };
+        let fit = fit_survival_location_scale_probit(probit_spec)
+            .map_err(|e| format!("survival probit-location-scale fit failed: {e}"))?;
+        println!(
+            "survival probit-location-scale fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
+            fit.converged, fit.iterations, fit.log_likelihood, fit.penalized_objective
+        );
+        if let Some(out) = args.out {
+            let mut lambdas = fit.lambdas_time.to_vec();
+            lambdas.extend(fit.lambdas_threshold.iter().copied());
+            lambdas.extend(fit.lambdas_log_sigma.iter().copied());
+            let model_out = SavedModel {
+                version: MODEL_VERSION,
+                formula,
+                family: family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+                link: None,
+                formula_noise: None,
+                beta_noise: None,
+                sigma_min: None,
+                sigma_max: None,
+                joint_beta_link: None,
+                joint_knot_range: None,
+                joint_knot_vector: None,
+                joint_link_transform: None,
+                joint_degree: None,
+                joint_ridge_used: None,
+                probit_wiggle_knots: None,
+                probit_wiggle_degree: None,
+                beta_wiggle: None,
+                survival_entry: Some(args.entry),
+                survival_exit: Some(args.exit),
+                survival_event: Some(args.event),
+                survival_spec: Some(args.spec),
+                survival_baseline_target: Some(
+                    survival_baseline_target_name(baseline_cfg.target).to_string(),
+                ),
+                survival_baseline_scale: baseline_cfg.scale,
+                survival_baseline_shape: baseline_cfg.shape,
+                survival_baseline_rate: baseline_cfg.rate,
+                survival_time_basis: Some(time_build.basis_name.clone()),
+                survival_time_degree: time_build.degree,
+                survival_time_knots: time_build.knots.clone(),
+                survival_time_smooth_lambda: time_build.smooth_lambda,
+                survival_ridge_lambda: Some(args.ridge_lambda),
+                survival_likelihood: Some(
+                    survival_likelihood_mode_name(likelihood_mode).to_string(),
+                ),
+                survival_sigma_min: Some(0.05),
+                survival_sigma_max: Some(20.0),
+                survival_beta_time: Some(fit.beta_time.to_vec()),
+                survival_beta_threshold: Some(fit.beta_threshold.to_vec()),
+                survival_beta_log_sigma: Some(fit.beta_log_sigma.to_vec()),
+                survival_distribution: Some(survival_distribution_name(survival_distribution).to_string()),
+                training_headers: Some(ds.headers.clone()),
+                resolved_term_spec: Some(frozen_term_spec),
+                resolved_term_spec_noise: None,
+                fit_max_iter: 400,
+                fit_tol: 1e-6,
+                beta: fit.beta_time.to_vec(),
+                lambdas,
+                scale: 1.0,
+                covariance_conditional: None,
+                covariance_corrected: None,
+            };
+            write_model_json(&out, &model_out)?;
+        }
+        return Ok(());
     }
 
     let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
@@ -2050,6 +2322,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             survival_time_smooth_lambda: time_build.smooth_lambda,
             survival_ridge_lambda: Some(args.ridge_lambda),
             survival_likelihood: Some(survival_likelihood_mode_name(likelihood_mode).to_string()),
+            survival_sigma_min: None,
+            survival_sigma_max: None,
+            survival_beta_time: None,
+            survival_beta_threshold: None,
+            survival_beta_log_sigma: None,
+            survival_distribution: None,
             training_headers: Some(ds.headers.clone()),
             resolved_term_spec: Some(frozen_term_spec),
             resolved_term_spec_noise: None,
@@ -2100,6 +2378,18 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     };
 
     let nuts = if family == LikelihoodFamily::RoystonParmar {
+        let saved_likelihood_mode = parse_survival_likelihood_mode(
+            model
+                .survival_likelihood
+                .as_deref()
+                .unwrap_or("transformation"),
+        )?;
+        if saved_likelihood_mode == SurvivalLikelihoodMode::ProbitLocationScale {
+            return Err(
+                "sample for survival-likelihood=probit-location-scale is not implemented yet"
+                    .to_string(),
+            );
+        }
         let entry_name = model
             .survival_entry
             .as_ref()
@@ -2542,12 +2832,19 @@ fn freeze_term_collection_spec(
                     length_scale,
                     nu,
                     include_intercept,
+                    identifiability_transform,
                 },
             ) => {
                 s.center_strategy = CenterStrategy::UserProvided(centers.clone());
                 s.length_scale = *length_scale;
                 s.nu = *nu;
                 s.include_intercept = *include_intercept;
+                s.identifiability = match identifiability_transform {
+                    Some(z) => MaternIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => MaternIdentifiability::None,
+                };
             }
             (
                 SmoothBasisSpec::Duchon { spec: s, .. },
@@ -2714,6 +3011,12 @@ fn build_location_scale_saved_model(
         survival_time_smooth_lambda: None,
         survival_ridge_lambda: None,
         survival_likelihood: None,
+        survival_sigma_min: None,
+        survival_sigma_max: None,
+        survival_beta_time: None,
+        survival_beta_threshold: None,
+        survival_beta_log_sigma: None,
+        survival_distribution: None,
         training_headers: Some(training_headers),
         resolved_term_spec: Some(resolved_term_spec),
         resolved_term_spec_noise: Some(resolved_term_spec_noise),
@@ -2748,6 +3051,24 @@ fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<()
     }
     if let Some(spec_noise) = model.resolved_term_spec_noise.as_ref() {
         validate_frozen_term_collection_spec(spec_noise, "resolved_term_spec_noise")?;
+    }
+    if model.family == family_to_string(LikelihoodFamily::RoystonParmar)
+        && parse_survival_likelihood_mode(
+            model
+                .survival_likelihood
+                .as_deref()
+                .unwrap_or("transformation"),
+        )? == SurvivalLikelihoodMode::ProbitLocationScale
+    {
+        if model.survival_beta_time.is_none()
+            || model.survival_beta_threshold.is_none()
+            || model.survival_beta_log_sigma.is_none()
+        {
+            return Err(
+                "saved probit-location-scale survival model is missing block coefficients; refit with current CLI"
+                    .to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -3327,14 +3648,15 @@ fn build_smooth_basis(
                     vars.join(",")
                 ));
             }
-            let n_knots = option_usize(options, "knots")
-                .unwrap_or_else(|| heuristic_knots(ds.values.nrows()));
+            let degree = 3usize;
+            let n_knots =
+                parse_ps_internal_knots(options, degree, heuristic_knots(ds.values.nrows()))?;
             let specs = cols
                 .iter()
                 .map(|&c| {
                     let (min_v, max_v) = col_minmax(ds.values.column(c))?;
                     Ok(BSplineBasisSpec {
-                        degree: 3,
+                        degree,
                         penalty_order: 2,
                         knot_spec: BSplineKnotSpec::Generate {
                             data_range: (min_v, max_v),
@@ -3362,12 +3684,13 @@ fn build_smooth_basis(
             }
             let c = cols[0];
             let (min_v, max_v) = col_minmax(ds.values.column(c))?;
-            let n_knots = option_usize(options, "knots")
-                .unwrap_or_else(|| heuristic_knots(ds.values.nrows()));
+            let degree = option_usize(options, "degree").unwrap_or(3);
+            let n_knots =
+                parse_ps_internal_knots(options, degree, heuristic_knots(ds.values.nrows()))?;
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
-                    degree: option_usize(options, "degree").unwrap_or(3),
+                    degree,
                     penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
                     knot_spec: BSplineKnotSpec::Generate {
                         data_range: (min_v, max_v),
@@ -3379,8 +3702,11 @@ fn build_smooth_basis(
             })
         }
         "tps" | "thinplate" | "thin-plate" => {
-            let centers = option_usize(options, "centers")
-                .unwrap_or_else(|| heuristic_centers(ds.values.nrows()));
+            let centers = parse_count_with_basis_alias(
+                options,
+                "centers",
+                heuristic_centers(ds.values.nrows()),
+            )?;
             Ok(SmoothBasisSpec::ThinPlate {
                 feature_cols: cols.to_vec(),
                 spec: ThinPlateBasisSpec {
@@ -3392,8 +3718,11 @@ fn build_smooth_basis(
             })
         }
         "matern" => {
-            let centers = option_usize(options, "centers")
-                .unwrap_or_else(|| heuristic_centers(ds.values.nrows()));
+            let centers = parse_count_with_basis_alias(
+                options,
+                "centers",
+                heuristic_centers(ds.values.nrows()),
+            )?;
             let nu = parse_matern_nu(options.get("nu").map(String::as_str).unwrap_or("5/2"))?;
             Ok(SmoothBasisSpec::Matern {
                 feature_cols: cols.to_vec(),
@@ -3403,14 +3732,18 @@ fn build_smooth_basis(
                     },
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
                     nu,
-                    include_intercept: true,
+                    include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,
+                    identifiability: parse_matern_identifiability(options)?,
                 },
             })
         }
         "duchon" => {
-            let centers = option_usize(options, "centers")
-                .unwrap_or_else(|| heuristic_centers(ds.values.nrows()));
+            let centers = parse_count_with_basis_alias(
+                options,
+                "centers",
+                heuristic_centers(ds.values.nrows()),
+            )?;
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
@@ -3442,6 +3775,58 @@ fn option_usize(map: &BTreeMap<String, String>, key: &str) -> Option<usize> {
     map.get(key).and_then(|v| v.parse::<usize>().ok())
 }
 
+fn option_usize_any(map: &BTreeMap<String, String>, keys: &[&str]) -> Option<usize> {
+    for key in keys {
+        if let Some(v) = option_usize(map, key) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn parse_ps_internal_knots(
+    options: &BTreeMap<String, String>,
+    degree: usize,
+    default_internal_knots: usize,
+) -> Result<usize, String> {
+    let knots_internal = option_usize(options, "knots");
+    let basis_dim = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
+    if knots_internal.is_some() && basis_dim.is_some() {
+        return Err(
+            "ps/bspline smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)"
+                .to_string(),
+        );
+    }
+    if let Some(k) = basis_dim {
+        let min_k = degree + 1;
+        if k < min_k {
+            return Err(format!(
+                "ps/bspline smooth: k={} too small for degree {}; expected k >= {}",
+                k, degree, min_k
+            ));
+        }
+        Ok(k - min_k)
+    } else {
+        Ok(knots_internal.unwrap_or(default_internal_knots))
+    }
+}
+
+fn parse_count_with_basis_alias(
+    options: &BTreeMap<String, String>,
+    primary_key: &str,
+    default_count: usize,
+) -> Result<usize, String> {
+    let primary = option_usize(options, primary_key);
+    let basis_dim = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
+    if primary.is_some() && basis_dim.is_some() {
+        return Err(format!(
+            "specify either {}=<count> or k=<basis_dim> (not both)",
+            primary_key
+        ));
+    }
+    Ok(primary.or(basis_dim).unwrap_or(default_count))
+}
+
 fn option_f64(map: &BTreeMap<String, String>, key: &str) -> Option<f64> {
     map.get(key).and_then(|v| v.parse::<f64>().ok())
 }
@@ -3453,6 +3838,25 @@ fn option_bool(map: &BTreeMap<String, String>, key: &str) -> Option<bool> {
             "false" | "0" | "no" | "n" => Some(false),
             _ => None,
         })
+}
+
+fn parse_matern_identifiability(
+    options: &BTreeMap<String, String>,
+) -> Result<MaternIdentifiability, String> {
+    let Some(raw) = options.get("identifiability").map(String::as_str) else {
+        return Ok(MaternIdentifiability::default());
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(MaternIdentifiability::None),
+        "sum_to_zero" | "sum-to-zero" | "center_sum_to_zero" | "center-sum-to-zero"
+        | "centered" => Ok(MaternIdentifiability::CenterSumToZero),
+        "linear" | "center_linear_orthogonal" | "center-linear-orthogonal" => {
+            Ok(MaternIdentifiability::CenterLinearOrthogonal)
+        }
+        other => Err(format!(
+            "invalid Matérn identifiability '{other}'; expected one of: none, sum_to_zero, linear"
+        )),
+    }
 }
 
 fn col_minmax(col: ArrayView1<'_, f64>) -> Result<(f64, f64), String> {

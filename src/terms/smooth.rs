@@ -4,10 +4,12 @@ use crate::basis::{
     build_duchon_basis, build_matern_basis, build_thin_plate_basis,
     create_bspline_basis_nd_with_knots,
 };
+#[cfg(test)]
+use crate::basis::MaternIdentifiability;
 use crate::construction::kronecker_product;
 use crate::estimate::{EstimationError, FitOptions, FitResult, fit_gam};
 use crate::types::LikelihoodFamily;
-use ndarray::{Array1, Array2, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -134,6 +136,50 @@ pub struct TermCollectionDesign {
 pub struct FittedTermCollection {
     pub fit: FitResult,
     pub design: TermCollectionDesign,
+}
+
+pub struct FittedTermCollectionWithSpec {
+    pub fit: FitResult,
+    pub design: TermCollectionDesign,
+    pub resolved_spec: TermCollectionSpec,
+}
+
+pub struct TwoBlockMaternKappaOptimizationResult<FitOut> {
+    pub resolved_mean_spec: TermCollectionSpec,
+    pub resolved_noise_spec: TermCollectionSpec,
+    pub mean_design: TermCollectionDesign,
+    pub noise_design: TermCollectionDesign,
+    pub fit: FitOut,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaternKappaOptimizationOptions {
+    /// Enable outer-loop optimization over Matérn κ (= 1 / length_scale).
+    pub enabled: bool,
+    /// Maximum number of coordinate-descent passes over Matérn terms.
+    pub max_outer_iter: usize,
+    /// Relative improvement threshold for accepting a κ update.
+    pub rel_tol: f64,
+    /// Half-width of local search bracket in log(length_scale) units.
+    pub log_step: f64,
+    /// Minimum allowed length_scale during κ search.
+    pub min_length_scale: f64,
+    /// Maximum allowed length_scale during κ search.
+    pub max_length_scale: f64,
+}
+
+impl Default for MaternKappaOptimizationOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_outer_iter: 3,
+            rel_tol: 1e-4,
+            // Search around current scale by approximately x0.5 and x2.0.
+            log_step: std::f64::consts::LN_2,
+            min_length_scale: 1e-3,
+            max_length_scale: 1e3,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -628,12 +674,37 @@ pub fn fit_term_collection(
     family: LikelihoodFamily,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
+    let out = fit_term_collection_with_matern_kappa_optimization(
+        data,
+        y,
+        weights,
+        offset,
+        spec,
+        family,
+        options,
+        &MaternKappaOptimizationOptions::default(),
+    )?;
+    Ok(FittedTermCollection {
+        fit: out.fit,
+        design: out.design,
+    })
+}
+
+fn fit_term_collection_for_spec(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError> {
     let design = build_term_collection_design(data, spec)?;
     let fit = fit_gam(
         design.design.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
+        y,
+        weights,
+        offset,
         &design.penalties,
         family,
         &FitOptions {
@@ -645,12 +716,465 @@ pub fn fit_term_collection(
     Ok(FittedTermCollection { fit, design })
 }
 
+fn matern_term_indices(spec: &TermCollectionSpec) -> Vec<usize> {
+    spec.smooth_terms
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, term)| match term.basis {
+            SmoothBasisSpec::Matern { .. } => Some(idx),
+            _ => None,
+        })
+        .collect()
+}
+
+fn fit_score(fit: &FitResult) -> f64 {
+    let pirls = &fit.artifacts.pirls;
+    // Use the penalized objective from the converged inner fit as a practical
+    // comparison score across κ candidates. Each candidate has its own B and S,
+    // so we compare fully refit objectives rather than reusing lambda estimates.
+    let score = 0.5 * pirls.deviance + 0.5 * pirls.stable_penalty_term;
+    if score.is_finite() {
+        score
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn set_matern_length_scale(
+    spec: &mut TermCollectionSpec,
+    term_idx: usize,
+    length_scale: f64,
+) -> Result<(), EstimationError> {
+    let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
+        return Err(EstimationError::InvalidInput(format!(
+            "matérn term index {term_idx} out of range"
+        )));
+    };
+    match &mut term.basis {
+        SmoothBasisSpec::Matern { spec, .. } => {
+            spec.length_scale = length_scale;
+            Ok(())
+        }
+        _ => Err(EstimationError::InvalidInput(format!(
+            "term '{}' is not Matérn",
+            term.name
+        ))),
+    }
+}
+
+fn get_matern_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> Option<f64> {
+    spec.smooth_terms
+        .get(term_idx)
+        .and_then(|term| match &term.basis {
+            SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
+            _ => None,
+        })
+}
+
+fn get_matern_double_penalty(spec: &TermCollectionSpec, term_idx: usize) -> Option<bool> {
+    spec.smooth_terms
+        .get(term_idx)
+        .and_then(|term| match &term.basis {
+            SmoothBasisSpec::Matern { spec, .. } => Some(spec.double_penalty),
+            _ => None,
+        })
+}
+
+pub fn optimize_two_block_matern_kappa<FitOut, FitFn, ScoreFn>(
+    data: ArrayView2<'_, f64>,
+    mean_spec: &TermCollectionSpec,
+    noise_spec: &TermCollectionSpec,
+    kappa_options: &MaternKappaOptimizationOptions,
+    mut fit_fn: FitFn,
+    score_fn: ScoreFn,
+) -> Result<TwoBlockMaternKappaOptimizationResult<FitOut>, String>
+where
+    FitFn: FnMut(&TermCollectionDesign, &TermCollectionDesign) -> Result<FitOut, String>,
+    ScoreFn: Fn(&FitOut) -> f64,
+{
+    // For location-scale models, κ (Matérn length_scale) is block-specific.
+    // We optimize κ for mean/noise blocks separately, while each candidate
+    // evaluation re-runs fitting so λ/δ are re-optimized.
+    let mut best_mean_spec = mean_spec.clone();
+    let mut best_noise_spec = noise_spec.clone();
+    let mean_terms = matern_term_indices(&best_mean_spec);
+    let noise_terms = matern_term_indices(&best_noise_spec);
+
+    let build_pair = |ms: &TermCollectionSpec,
+                      ns: &TermCollectionSpec|
+     -> Result<(TermCollectionDesign, TermCollectionDesign), String> {
+        let d_mean = build_term_collection_design(data, ms)
+            .map_err(|e| format!("failed to build mean design during κ optimization: {e}"))?;
+        let d_noise = build_term_collection_design(data, ns)
+            .map_err(|e| format!("failed to build noise design during κ optimization: {e}"))?;
+        Ok((d_mean, d_noise))
+    };
+
+    let (mut best_mean_design, mut best_noise_design) =
+        build_pair(&best_mean_spec, &best_noise_spec)?;
+    let mut best_fit = fit_fn(&best_mean_design, &best_noise_design)?;
+    let mut best_score = score_fn(&best_fit);
+    if !best_score.is_finite() {
+        best_score = f64::INFINITY;
+    }
+
+    if !kappa_options.enabled || (mean_terms.is_empty() && noise_terms.is_empty()) {
+        return Ok(TwoBlockMaternKappaOptimizationResult {
+            resolved_mean_spec: best_mean_spec,
+            resolved_noise_spec: best_noise_spec,
+            mean_design: best_mean_design,
+            noise_design: best_noise_design,
+            fit: best_fit,
+        });
+    }
+    if kappa_options.max_outer_iter == 0 {
+        return Err("Matérn κ optimization requires max_outer_iter >= 1".to_string());
+    }
+    if !(kappa_options.log_step.is_finite() && kappa_options.log_step > 0.0) {
+        return Err("Matérn κ optimization requires log_step > 0".to_string());
+    }
+    if !(kappa_options.min_length_scale.is_finite()
+        && kappa_options.max_length_scale.is_finite()
+        && kappa_options.min_length_scale > 0.0
+        && kappa_options.max_length_scale >= kappa_options.min_length_scale)
+    {
+        return Err(
+            "Matérn κ optimization requires valid positive length_scale bounds".to_string(),
+        );
+    }
+
+    let rel_tol = kappa_options.rel_tol.max(0.0);
+    let mut blocks: Vec<(bool, usize)> = Vec::new();
+    for idx in &mean_terms {
+        blocks.push((true, *idx));
+    }
+    for idx in &noise_terms {
+        blocks.push((false, *idx));
+    }
+
+    for outer in 0..kappa_options.max_outer_iter {
+        let mut any_improvement = false;
+        for (is_mean_block, term_idx) in &blocks {
+            let spec_ref = if *is_mean_block {
+                &best_mean_spec
+            } else {
+                &best_noise_spec
+            };
+            let Some(current_ls) = get_matern_length_scale(spec_ref, *term_idx) else {
+                continue;
+            };
+            let current_ls = current_ls.clamp(
+                kappa_options.min_length_scale,
+                kappa_options.max_length_scale,
+            );
+            let double_penalty = get_matern_double_penalty(spec_ref, *term_idx).unwrap_or(false);
+            let step = if double_penalty {
+                kappa_options.log_step
+            } else {
+                0.5 * kappa_options.log_step
+            };
+            let log0 = current_ls.ln();
+            let mut candidates = if double_penalty {
+                vec![
+                    log0 - 2.0 * step,
+                    log0 - step,
+                    log0,
+                    log0 + step,
+                    log0 + 2.0 * step,
+                ]
+            } else {
+                vec![log0 - step, log0, log0 + step]
+            };
+            candidates.sort_by(|a, b| a.total_cmp(b));
+            candidates.dedup_by(|a, b| (*a - *b).abs() <= 1e-12);
+
+            let term_rel_tol = if double_penalty {
+                rel_tol
+            } else {
+                rel_tol.max(5e-4)
+            };
+            let mut local_best_score = best_score;
+            let mut local_best_fit: Option<FitOut> = None;
+            let mut local_best_mean_spec: Option<TermCollectionSpec> = None;
+            let mut local_best_noise_spec: Option<TermCollectionSpec> = None;
+            let mut local_best_mean_design: Option<TermCollectionDesign> = None;
+            let mut local_best_noise_design: Option<TermCollectionDesign> = None;
+
+            for cand_log in candidates {
+                let cand_ls = cand_log.exp().clamp(
+                    kappa_options.min_length_scale,
+                    kappa_options.max_length_scale,
+                );
+                if (cand_ls - current_ls).abs() <= 1e-15 {
+                    continue;
+                }
+                let mut cand_mean_spec = best_mean_spec.clone();
+                let mut cand_noise_spec = best_noise_spec.clone();
+                if *is_mean_block {
+                    set_matern_length_scale(&mut cand_mean_spec, *term_idx, cand_ls)
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    set_matern_length_scale(&mut cand_noise_spec, *term_idx, cand_ls)
+                        .map_err(|e| e.to_string())?;
+                }
+                let (cand_mean_design, cand_noise_design) =
+                    build_pair(&cand_mean_spec, &cand_noise_spec)?;
+                let cand_fit = match fit_fn(&cand_mean_design, &cand_noise_design) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        log::warn!(
+                            "[location-scale][Matern-kappa] block={} term={} length_scale={:.6e} fit failed: {}",
+                            if *is_mean_block { "mean" } else { "noise" },
+                            term_idx,
+                            cand_ls,
+                            err
+                        );
+                        continue;
+                    }
+                };
+                let cand_score = score_fn(&cand_fit);
+                if cand_score + term_rel_tol * local_best_score.abs().max(1.0) < local_best_score {
+                    local_best_score = cand_score;
+                    local_best_fit = Some(cand_fit);
+                    local_best_mean_spec = Some(cand_mean_spec);
+                    local_best_noise_spec = Some(cand_noise_spec);
+                    local_best_mean_design = Some(cand_mean_design);
+                    local_best_noise_design = Some(cand_noise_design);
+                }
+            }
+
+            if let (
+                Some(next_fit),
+                Some(next_mean_spec),
+                Some(next_noise_spec),
+                Some(next_mean_design),
+                Some(next_noise_design),
+            ) = (
+                local_best_fit,
+                local_best_mean_spec,
+                local_best_noise_spec,
+                local_best_mean_design,
+                local_best_noise_design,
+            ) {
+                best_fit = next_fit;
+                best_score = local_best_score;
+                best_mean_spec = next_mean_spec;
+                best_noise_spec = next_noise_spec;
+                best_mean_design = next_mean_design;
+                best_noise_design = next_noise_design;
+                any_improvement = true;
+            }
+        }
+        if !any_improvement {
+            break;
+        }
+    }
+
+    Ok(TwoBlockMaternKappaOptimizationResult {
+        resolved_mean_spec: best_mean_spec,
+        resolved_noise_spec: best_noise_spec,
+        mean_design: best_mean_design,
+        noise_design: best_noise_design,
+        fit: best_fit,
+    })
+}
+
+pub fn fit_term_collection_with_matern_kappa_optimization(
+    data: ArrayView2<'_, f64>,
+    y: Array1<f64>,
+    weights: Array1<f64>,
+    offset: Array1<f64>,
+    spec: &TermCollectionSpec,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+    kappa_options: &MaternKappaOptimizationOptions,
+) -> Result<FittedTermCollectionWithSpec, EstimationError> {
+    // κ (= 1/length_scale) changes kernel geometry nonlinearly.
+    // That means both basis values B and penalty blocks S change, so each κ
+    // proposal requires a full basis rebuild and a fresh lambda optimization.
+    let mut resolved_spec = spec.clone();
+    let matern_terms = matern_term_indices(&resolved_spec);
+    let n = data.nrows();
+    if !(y.len() == n && weights.len() == n && offset.len() == n) {
+        return Err(EstimationError::InvalidInput(format!(
+            "fit_term_collection_with_matern_kappa_optimization row mismatch: n={}, y={}, weights={}, offset={}",
+            n,
+            y.len(),
+            weights.len(),
+            offset.len()
+        )));
+    }
+    if !kappa_options.enabled || matern_terms.is_empty() {
+        let out = fit_term_collection_for_spec(
+            data,
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &resolved_spec,
+            family,
+            options,
+        )?;
+        return Ok(FittedTermCollectionWithSpec {
+            fit: out.fit,
+            design: out.design,
+            resolved_spec,
+        });
+    }
+    if kappa_options.max_outer_iter == 0 {
+        return Err(EstimationError::InvalidInput(
+            "Matern kappa optimization requires max_outer_iter >= 1".to_string(),
+        ));
+    }
+    if !(kappa_options.log_step.is_finite() && kappa_options.log_step > 0.0) {
+        return Err(EstimationError::InvalidInput(
+            "Matern kappa optimization requires log_step > 0".to_string(),
+        ));
+    }
+    if !(kappa_options.min_length_scale.is_finite()
+        && kappa_options.max_length_scale.is_finite()
+        && kappa_options.min_length_scale > 0.0
+        && kappa_options.max_length_scale >= kappa_options.min_length_scale)
+    {
+        return Err(EstimationError::InvalidInput(
+            "Matern kappa optimization requires valid positive length_scale bounds".to_string(),
+        ));
+    }
+
+    let mut best = fit_term_collection_for_spec(
+        data,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &resolved_spec,
+        family,
+        options,
+    )?;
+    let mut best_score = fit_score(&best.fit);
+    if !best_score.is_finite() {
+        best_score = f64::INFINITY;
+    }
+    let rel_tol = kappa_options.rel_tol.max(0.0);
+
+    for outer in 0..kappa_options.max_outer_iter {
+        let mut any_improvement = false;
+        for &term_idx in &matern_terms {
+            let Some(current_ls) = get_matern_length_scale(&resolved_spec, term_idx) else {
+                continue;
+            };
+            let double_penalty =
+                get_matern_double_penalty(&resolved_spec, term_idx).unwrap_or(false);
+            let current_ls = current_ls.clamp(
+                kappa_options.min_length_scale,
+                kappa_options.max_length_scale,
+            );
+            let log0 = current_ls.ln();
+            // λ and κ are partially confounded for single-penalty Matérn terms.
+            // With double-penalty enabled we gain an extra shrinkage degree of freedom,
+            // so we can search κ more aggressively (wider local bracket).
+            let step = if double_penalty {
+                kappa_options.log_step
+            } else {
+                0.5 * kappa_options.log_step
+            };
+            let mut candidates = if double_penalty {
+                vec![
+                    log0 - 2.0 * step,
+                    log0 - step,
+                    log0,
+                    log0 + step,
+                    log0 + 2.0 * step,
+                ]
+            } else {
+                vec![log0 - step, log0, log0 + step]
+            };
+            candidates.sort_by(|a, b| a.total_cmp(b));
+            candidates.dedup_by(|a, b| (*a - *b).abs() <= 1e-12);
+
+            let mut local_best_score = best_score;
+            let mut local_best_fit: Option<FittedTermCollection> = None;
+            let mut local_best_spec: Option<TermCollectionSpec> = None;
+            let term_rel_tol = if double_penalty {
+                rel_tol
+            } else {
+                // Require a clearer gain when only one penalty knob is available.
+                rel_tol.max(5e-4)
+            };
+            // Coordinate update on one Matérn term at a time in log(length_scale)
+            // to keep search stable under λ/κ partial confounding.
+            for cand_log in candidates {
+                let cand_ls = cand_log.exp().clamp(
+                    kappa_options.min_length_scale,
+                    kappa_options.max_length_scale,
+                );
+                if (cand_ls - current_ls).abs() <= 1e-15 {
+                    continue;
+                }
+                let mut cand_spec = resolved_spec.clone();
+                set_matern_length_scale(&mut cand_spec, term_idx, cand_ls)?;
+                // Full refit at candidate κ: rebuild design/penalties, then run
+                // standard REML/LAML outer optimization for λ on that basis.
+                let cand_fit = match fit_term_collection_for_spec(
+                    data,
+                    y.view(),
+                    weights.view(),
+                    offset.view(),
+                    &cand_spec,
+                    family,
+                    options,
+                ) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        log::warn!(
+                            "[Matern-kappa] term={} length_scale={:.6e} fit failed: {}",
+                            term_idx,
+                            cand_ls,
+                            err
+                        );
+                        continue;
+                    }
+                };
+                let cand_score = fit_score(&cand_fit.fit);
+                if cand_score + term_rel_tol * local_best_score.abs().max(1.0) < local_best_score {
+                    local_best_score = cand_score;
+                    local_best_fit = Some(cand_fit);
+                    local_best_spec = Some(cand_spec);
+                }
+            }
+
+            if let (Some(next_fit), Some(next_spec)) = (local_best_fit, local_best_spec) {
+                best = next_fit;
+                best_score = local_best_score;
+                resolved_spec = next_spec;
+                any_improvement = true;
+                if let Some(new_ls) = get_matern_length_scale(&resolved_spec, term_idx) {
+                    log::info!(
+                        "[Matern-kappa] outer={} term={} accepted length_scale={:.6e} (score={:.6e})",
+                        outer + 1,
+                        term_idx,
+                        new_ls,
+                        best_score
+                    );
+                }
+            }
+        }
+        if !any_improvement {
+            break;
+        }
+    }
+
+    Ok(FittedTermCollectionWithSpec {
+        fit: best.fit,
+        design: best.design,
+        resolved_spec,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::basis::{
         BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
-        DuchonNullspaceOrder, MaternBasisSpec, MaternNu, ThinPlateBasisSpec,
+        DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu, ThinPlateBasisSpec,
     };
     use ndarray::array;
 
@@ -840,8 +1364,9 @@ mod tests {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                     length_scale: 0.75,
                     nu: MaternNu::FiveHalves,
-                    include_intercept: true,
+                    include_intercept: false,
                     double_penalty: true,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
                 },
             },
             shape: ShapeConstraint::None,
@@ -853,8 +1378,8 @@ mod tests {
         // kernel + ridge penalties
         assert_eq!(sd.penalties.len(), 2);
         assert_eq!(sd.nullspace_dims.len(), 2);
-        // first penalty keeps 1 "almost null" intercept dimension
-        assert_eq!(sd.nullspace_dims[0], 1);
+        // centered Matérn smooth has no unpenalized intercept mode
+        assert_eq!(sd.nullspace_dims[0], 0);
         assert_eq!(sd.nullspace_dims[1], 0);
     }
 
@@ -944,5 +1469,88 @@ mod tests {
         assert_eq!(sd.nullspace_dims.len(), 3);
         assert!(sd.penalties.iter().all(|s| s.nrows() == sd.design.ncols()));
         assert!(sd.penalties.iter().all(|s| s.ncols() == sd.design.ncols()));
+    }
+
+    #[test]
+    fn matern_kappa_optimization_monotone_improves_or_keeps_score() {
+        let n = 60usize;
+        let d = 3usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (i as f64 * 0.13).sin();
+            let x2 = (i as f64 * 0.07).cos();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+            data[[i, 2]] = x2;
+            y[i] = (2.5 * x0).sin() + 0.4 * x1 - 0.2 * x2;
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1, 2],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                        length_scale: 20.0,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            max_iter: 40,
+            tol: 1e-6,
+            nullspace_dims: vec![],
+        };
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+
+        let baseline = fit_term_collection_for_spec(
+            data.view(),
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &fit_opts,
+        )
+        .expect("baseline fit should succeed");
+        let baseline_score = fit_score(&baseline.fit);
+
+        let optimized = fit_term_collection_with_matern_kappa_optimization(
+            data.view(),
+            y.clone(),
+            weights.clone(),
+            offset.clone(),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &fit_opts,
+            &MaternKappaOptimizationOptions {
+                enabled: true,
+                max_outer_iter: 2,
+                rel_tol: 1e-5,
+                log_step: std::f64::consts::LN_2,
+                min_length_scale: 1e-3,
+                max_length_scale: 1e3,
+            },
+        )
+        .expect("optimized fit should succeed");
+        let optimized_score = fit_score(&optimized.fit);
+        assert!(optimized_score <= baseline_score + 1e-10);
+
+        let ls = match &optimized.resolved_spec.smooth_terms[0].basis {
+            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
+            _ => panic!("expected Matérn term"),
+        };
+        assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
     }
 }

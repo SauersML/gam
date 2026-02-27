@@ -1735,18 +1735,11 @@ def _rust_formula_for_scenario(scenario_name, ds):
     target = ds["target"]
     terms = [f"linear({c})" for c in cfg.get("linear_cols", [])]
     basis = str(cfg.get("smooth_basis", "ps")).lower()
-    if (
-        scenario_name in {"wine_gamair", "wine_temp_vs_year"}
-        and ds.get("family") == "gaussian"
-        and basis in {"ps", "bspline", "p-spline"}
-        and len(ds.get("rows", [])) <= 100
-        and (
-            (cfg.get("smooth_cols") is not None and len(cfg.get("smooth_cols", [])) == 1)
-            or ("smooth_col" in cfg)
+    knot_count = int(cfg.get("knots", 8))
+    if knot_count < 0:
+        raise RuntimeError(
+            f"Invalid knot count {knot_count} for scenario '{scenario_name}'; expected >= 0."
         )
-    ):
-        basis = "tps"
-    knots = int(cfg.get("knots", 8))
     dp_opt = ""
     if "double_penalty" in cfg:
         dp = "true" if bool(cfg["double_penalty"]) else "false"
@@ -1755,29 +1748,79 @@ def _rust_formula_for_scenario(scenario_name, ds):
     if smooth_cols:
         for col in smooth_cols:
             if basis in {"ps", "bspline", "p-spline"}:
-                terms.append(f"s({col}, type=ps, knots={knots}{dp_opt})")
+                terms.append(f"s({col}, type=ps, knots={knot_count}{dp_opt})")
             elif basis in {"thinplate", "tps"}:
-                terms.append(f"s({col}, type=tps, centers={knots}{dp_opt})")
+                terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
             elif basis == "duchon":
-                terms.append(f"s({col}, type=duchon, centers={knots}{dp_opt})")
+                terms.append(f"s({col}, type=duchon, centers={knot_count}{dp_opt})")
             elif basis == "matern":
-                terms.append(f"s({col}, type=matern, centers={knots}{dp_opt})")
+                terms.append(f"s({col}, type=matern, centers={knot_count}{dp_opt})")
             else:
-                terms.append(f"s({col}, type=ps, knots={knots}{dp_opt})")
+                raise RuntimeError(
+                    f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
+                )
     else:
         col = cfg["smooth_col"]
         if basis in {"thinplate", "tps"}:
-            terms.append(f"s({col}, type=tps, centers={knots}{dp_opt})")
-        elif "double_penalty" in cfg:
+            terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
+        elif basis in {"ps", "bspline", "p-spline"} and "double_penalty" in cfg:
             dp = "true" if bool(cfg["double_penalty"]) else "false"
-            terms.append(f"s({col}, type=ps, knots={knots}, double_penalty={dp})")
+            terms.append(f"s({col}, type=ps, knots={knot_count}, double_penalty={dp})")
+        elif basis in {"ps", "bspline", "p-spline"}:
+            terms.append(f"s({col}, type=ps, knots={knot_count})")
+        elif basis in {"duchon", "matern"}:
+            terms.append(f"s({col}, type={basis}, centers={knot_count}{dp_opt})")
+        elif "double_penalty" in cfg:
+            raise RuntimeError(
+                f"double_penalty is only supported with ps basis in Rust formula; got basis='{basis}' for '{scenario_name}'"
+            )
         else:
-            terms.append(f"s({col}, type=ps, knots={knots})")
+            raise RuntimeError(
+                f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
+            )
 
     if not terms:
         raise RuntimeError(f"empty Rust term list for scenario '{scenario_name}'")
     formula = f"{target} ~ " + " + ".join(terms)
     return cfg["family"], formula
+
+
+def _mgcv_formula_for_scenario(scenario_name, ds):
+    cfg = _rust_fit_mapping(scenario_name)
+    if cfg is None:
+        raise RuntimeError(f"No shared smooth mapping configured for scenario '{scenario_name}'")
+    target = ds["target"]
+    terms = [str(c) for c in cfg.get("linear_cols", [])]
+    basis = str(cfg.get("smooth_basis", "ps")).lower()
+    knot_count = int(cfg.get("knots", 8))
+
+    if basis in {"ps", "bspline", "p-spline"}:
+        bs_code = "ps"
+    elif basis in {"thinplate", "tps"}:
+        bs_code = "tp"
+    elif basis == "duchon":
+        bs_code = "ds"
+    elif basis == "matern":
+        # mgcv has no direct Matern basis; nearest comparator used here.
+        bs_code = "ts"
+    else:
+        raise RuntimeError(
+            f"Unsupported mgcv smooth basis '{basis}' for scenario '{scenario_name}'"
+        )
+
+    smooth_cols = cfg.get("smooth_cols")
+    if smooth_cols:
+        for col in smooth_cols:
+            k_val = knot_count + 4 if bs_code == "ps" else knot_count
+            terms.append(f"s({col}, bs='{bs_code}', k=min({k_val}, nrow(train_df)-1))")
+    else:
+        col = cfg.get("smooth_col")
+        if col:
+            k_val = knot_count + 4 if bs_code == "ps" else knot_count
+            terms.append(f"s({col}, bs='{bs_code}', k=min({k_val}, nrow(train_df)-1))")
+    if not terms:
+        raise RuntimeError(f"empty mgcv term list for scenario '{scenario_name}'")
+    return f"{target} ~ " + " + ".join(terms)
 
 
 def _rust_survival_formula_for_scenario(scenario_name):
@@ -2381,6 +2424,13 @@ def run_rust_gamlss_scenario_cv(scenario):
 def run_external_mgcv_cv(scenario):
     ds = dataset_for_scenario(scenario)
     folds = folds_for_dataset(ds)
+    mgcv_formula = None
+    if ds["family"] != "survival":
+        mgcv_formula = _mgcv_formula_for_scenario(scenario["name"], ds)
+        if not mgcv_formula:
+            raise RuntimeError(
+                f"Missing required shared mgcv formula for non-survival scenario '{scenario['name']}'"
+            )
 
     with tempfile.TemporaryDirectory(prefix="gam_bench_mgcv_cv_") as td:
         td_path = Path(td)
@@ -2388,7 +2438,7 @@ def run_external_mgcv_cv(scenario):
         out_path = td_path / "out.json"
         script_path = td_path / "run_mgcv_cv.R"
 
-        payload = {"dataset": ds, "scenario_name": scenario["name"]}
+        payload = {"dataset": ds, "scenario_name": scenario["name"], "mgcv_formula": mgcv_formula}
         data_path.write_text(json.dumps(payload))
 
         script = r'''
@@ -2408,6 +2458,10 @@ payload <- fromJSON(data_path, simplifyVector = TRUE)
 df <- as.data.frame(payload$dataset$rows)
 family_name <- as.character(payload$dataset$family)
 scenario_name <- as.character(payload$scenario_name)
+mgcv_formula <- NULL
+if (!is.null(payload$mgcv_formula)) {
+  mgcv_formula <- as.character(payload$mgcv_formula)
+}
 
 train_idx <- scan(train_idx_path, what=integer(), quiet=TRUE) + 1L
 test_idx <- scan(test_idx_path, what=integer(), quiet=TRUE) + 1L
@@ -2480,129 +2534,10 @@ if (family_name == "survival") {
   quit(save="no")
 }
 
-  if (family_name == "gaussian") {
-  if (scenario_name == "lidar_semipar") {
-    ftxt <- "y ~ s(range, bs='ps', k=min(25, nrow(train_df)-1))"
-  } else if (scenario_name == "us48_demand_5day" || scenario_name == "us48_demand_31day") {
-    ftxt <- "y ~ s(hour, bs='ps', k=min(10, nrow(train_df)-1)) + demand_forecast + net_generation + total_interchange"
-  } else if (scenario_name == "wine_gamair") {
-    ftxt <- "y ~ year + h_rain + w_rain + h_temp + s(s_temp, bs='ps', k=min(10, nrow(train_df)-1))"
-  } else if (scenario_name == "wine_temp_vs_year") {
-    ftxt <- "y ~ s(year, bs='ps', k=min(10, nrow(train_df)-1))"
-  } else if (scenario_name == "wine_price_vs_temp") {
-    ftxt <- "y ~ s(temp, bs='ps', k=min(10, nrow(train_df)-1))"
-  } else if (scenario_name == "icu_survival_los") {
-    ftxt <- "y ~ bmi + hr_max + sysbp_min + temp_apache + s(age, bs='ps', k=min(10, nrow(train_df)-1))"
-  } else {
-    ftxt <- "y ~ s(range, bs='ps', k=min(25, nrow(train_df)-1))"
-  }
-} else if (scenario_name == "bone_gamair") {
-  ftxt <- "y ~ trt_auto + s(t, bs='ps', k=min(8, nrow(train_df)-1))"
-} else if (scenario_name == "prostate_gamair") {
-  ftxt <- "y ~ pc1 + s(pc2, bs='ps', k=min(8, nrow(train_df)-1))"
-} else if (scenario_name == "icu_survival_death") {
-  ftxt <- "y ~ age + bmi + hr_max + sysbp_min + s(los_days, bs='ps', k=min(10, nrow(train_df)-1))"
-} else if (scenario_name == "horse_colic") {
-  ftxt <- "y ~ rectal_temp + s(pulse, bs='ps', k=min(8, nrow(train_df)-1)) + packed_cell_volume"
-} else if (scenario_name == "haberman_survival") {
-  ftxt <- "y ~ age + op_year + s(axil_nodes, bs='ps', k=min(8, nrow(train_df)-1))"
-} else if (scenario_name == "geo_disease_tp" || scenario_name == "geo_disease_tp_basic") {
-  ftxt <- paste(
-    "y ~",
-    "s(pc1, bs='tp', k=min(12, nrow(train_df)-1)) +",
-    "s(pc2, bs='tp', k=min(12, nrow(train_df)-1)) +",
-    "s(pc3, bs='tp', k=min(12, nrow(train_df)-1)) +",
-    "s(pc4, bs='tp', k=min(12, nrow(train_df)-1)) +",
-    paste(sprintf("pc%d", 5:16), collapse = " + ")
-  )
-} else if (scenario_name == "geo_disease_duchon" || scenario_name == "geo_disease_duchon_basic") {
-  ftxt <- paste(
-    "y ~",
-    "s(pc1, bs='ds', k=min(12, nrow(train_df)-1)) +",
-    "s(pc2, bs='ds', k=min(12, nrow(train_df)-1)) +",
-    "s(pc3, bs='ds', k=min(12, nrow(train_df)-1)) +",
-    "s(pc4, bs='ds', k=min(12, nrow(train_df)-1)) +",
-    paste(sprintf("pc%d", 5:16), collapse = " + ")
-  )
-} else if (scenario_name == "geo_disease_shrinkage" || scenario_name == "geo_disease_matern" || scenario_name == "geo_disease_matern_basic") {
-  ftxt <- paste(
-    "y ~",
-    "s(pc1, bs='ts', k=min(12, nrow(train_df)-1)) +",
-    "s(pc2, bs='ts', k=min(12, nrow(train_df)-1)) +",
-    "s(pc3, bs='ts', k=min(12, nrow(train_df)-1)) +",
-    "s(pc4, bs='ts', k=min(12, nrow(train_df)-1)) +",
-    paste(sprintf("pc%d", 5:16), collapse = " + ")
-  )
-} else if (scenario_name == "geo_disease_ps_per_pc" || scenario_name == "geo_disease_ps_per_pc_basic") {
-  ftxt <- paste("y ~", paste(sprintf("s(pc%d, bs='ps', k=min(10, nrow(train_df)-1))", 1:16), collapse = " + "))
-} else if (grepl("^geo_disease_eas3?_", scenario_name)) {
-  match <- regmatches(scenario_name, regexec("^geo_disease_(eas|eas3)_(tp|duchon|matern|psperpc)_k([0-9]+)$", scenario_name))[[1]]
-  if (length(match) != 4) stop(sprintf("Invalid geo_disease_eas/eas3 scenario name: %s", scenario_name))
-  family_code <- match[2]
-  basis_code <- match[3]
-  k_raw <- as.integer(match[4])
-  n_pcs <- if (family_code == "eas3") 3 else 16
-  if (!is.finite(k_raw) || k_raw < 4) k_raw <- 4
-  if (basis_code == "psperpc") {
-    ftxt <- paste("y ~", paste(sprintf("s(pc%d, bs='ps', k=min(%d, nrow(train_df)-1))", 1:n_pcs, k_raw), collapse = " + "))
-  } else {
-    bs_code <- if (basis_code == "tp") "tp" else if (basis_code == "duchon") "ds" else "ts"
-    smooth_terms <- paste(sprintf("s(pc%d, bs='%s', k=min(%d, nrow(train_df)-1))", 1:3, bs_code, k_raw), collapse = " + ")
-    linear_terms <- if (n_pcs > 3) paste(sprintf("pc%d", 4:n_pcs), collapse = " + ") else ""
-    rhs <- if (nchar(linear_terms) > 0) paste(smooth_terms, linear_terms, sep = " + ") else smooth_terms
-    ftxt <- paste(
-      "y ~", rhs
-    )
-  }
-} else if (grepl("^papuan_oce4?_", scenario_name)) {
-  match <- regmatches(scenario_name, regexec("^papuan_oce(4)?_(tp|duchon|matern|psperpc)(_basic)?_k([0-9]+)$", scenario_name))[[1]]
-  if (length(match) != 5) stop(sprintf("Invalid papuan_oce scenario name: %s", scenario_name))
-  family_code <- match[2]
-  basis_code <- match[3]
-  k_raw <- as.integer(match[5])
-  n_pcs <- if (family_code == "4") 4 else 16
-  if (!is.finite(k_raw) || k_raw < 4) k_raw <- 4
-  if (basis_code == "psperpc") {
-    ftxt <- paste("y ~", paste(sprintf("s(pc%d, bs='ps', k=min(%d, nrow(train_df)-1))", 1:n_pcs, k_raw), collapse = " + "))
-  } else {
-    bs_code <- if (basis_code == "tp") "tp" else if (basis_code == "duchon") "ds" else "ts"
-    smooth_hi <- min(3, n_pcs)
-    smooth_terms <- paste(sprintf("s(pc%d, bs='%s', k=min(%d, nrow(train_df)-1))", 1:smooth_hi, bs_code, k_raw), collapse = " + ")
-    linear_terms <- if (n_pcs > smooth_hi) paste(sprintf("pc%d", (smooth_hi + 1):n_pcs), collapse = " + ") else ""
-    rhs <- if (nchar(linear_terms) > 0) paste(smooth_terms, linear_terms, sep = " + ") else smooth_terms
-    ftxt <- paste("y ~", rhs)
-  }
-} else if (grepl("^geo_subpop16_", scenario_name)) {
-  match <- regmatches(scenario_name, regexec("^geo_subpop16_(tp|duchon|matern|psperpc)_k([0-9]+)$", scenario_name))[[1]]
-  if (length(match) != 3) stop(sprintf("Invalid geo_subpop16 scenario name: %s", scenario_name))
-  basis_code <- match[2]
-  k_raw <- as.integer(match[3])
-  if (!is.finite(k_raw) || k_raw < 4) k_raw <- 4
-  if (basis_code == "psperpc") {
-    ftxt <- paste("y ~", paste(sprintf("s(pc%d, bs='ps', k=min(%d, nrow(train_df)-1))", 1:16, k_raw), collapse = " + "))
-  } else {
-    bs_code <- if (basis_code == "tp") "tp" else if (basis_code == "duchon") "ds" else "ts"
-    smooth_terms <- paste(sprintf("s(pc%d, bs='%s', k=min(%d, nrow(train_df)-1))", 1:3, bs_code, k_raw), collapse = " + ")
-    linear_terms <- paste(sprintf("pc%d", 4:16), collapse = " + ")
-    ftxt <- paste("y ~", smooth_terms, "+", linear_terms)
-  }
-} else if (grepl("^geo_latlon_", scenario_name)) {
-  match <- regmatches(scenario_name, regexec("^geo_latlon_(superpopnoise|equatornoise)_(tp|duchon|matern|psperpc)_k([0-9]+)$", scenario_name))[[1]]
-  if (length(match) != 4) stop(sprintf("Invalid geo_latlon scenario name: %s", scenario_name))
-  basis_code <- match[3]
-  k_raw <- as.integer(match[4])
-  if (!is.finite(k_raw) || k_raw < 4) k_raw <- 4
-  if (basis_code == "psperpc") {
-    ftxt <- paste("y ~", paste(sprintf("s(pc%d, bs='ps', k=min(%d, nrow(train_df)-1))", 1:6, k_raw), collapse = " + "))
-  } else {
-    bs_code <- if (basis_code == "tp") "tp" else if (basis_code == "duchon") "ds" else "ts"
-    smooth_terms <- paste(sprintf("s(pc%d, bs='%s', k=min(%d, nrow(train_df)-1))", 1:3, bs_code, k_raw), collapse = " + ")
-    linear_terms <- paste(sprintf("pc%d", 4:6), collapse = " + ")
-    ftxt <- paste("y ~", smooth_terms, "+", linear_terms)
-  }
-} else {
-  ftxt <- "y ~ x1 + s(x2, bs='ps', k=min(8, nrow(train_df)-1))"
+if (is.null(mgcv_formula) || !nzchar(mgcv_formula)) {
+  stop(sprintf("missing shared mgcv formula for scenario: %s", scenario_name))
 }
+ftxt <- mgcv_formula
 
 t0 <- proc.time()[["elapsed"]]
 use_select <- !grepl("_basic$", scenario_name)

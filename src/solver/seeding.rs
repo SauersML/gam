@@ -96,11 +96,7 @@ pub fn generate_rho_candidates(
         if vals.len() != num_penalties {
             for &lambda in vals {
                 let rho = rho_from_lambda(lambda, bounds);
-                add_seed_dedup(
-                    &mut seeds,
-                    &mut seen,
-                    Array1::from_elem(num_penalties, rho),
-                );
+                add_seed_dedup(&mut seeds, &mut seen, Array1::from_elem(num_penalties, rho));
             }
         }
     }
