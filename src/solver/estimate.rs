@@ -21,7 +21,9 @@
 //! each smooth term directly from the data.
 
 // External Crate for Optimization
-use wolfe_bfgs::{BfgsSolution, NewtonTrustRegion};
+use wolfe_bfgs::{
+    BfgsSolution, NewtonTrustRegion, ObjectiveEvalError, ObjectiveRequest, ObjectiveSample,
+};
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -742,35 +744,63 @@ fn run_newton_for_candidate(
     log::debug!("[Candidate {label}] Running Newton trust-region optimization from queued seed");
     let lower = Array1::<f64>::from_elem(initial_rho.len(), -RHO_BOUND);
     let upper = Array1::<f64>::from_elem(initial_rho.len(), RHO_BOUND);
-    let mut solver = NewtonTrustRegion::new(initial_rho, |rho| {
-        let cost = match reml_state.compute_cost(rho) {
-            Ok(v) => v,
-            Err(_) => f64::INFINITY,
-        };
-        if !cost.is_finite() {
-            return (
-                f64::INFINITY,
-                Array1::<f64>::from_elem(rho.len(), f64::NAN),
-                Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
-            );
+    let mut cached_full: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
+    let mut cached_cost: Option<(Array1<f64>, f64)> = None;
+    let mut solver = NewtonTrustRegion::new(initial_rho, |rho, request| {
+        if let Some((rho_c, cost_c, grad_c, hess_c)) = &cached_full
+            && approx_same_rho_point(rho, rho_c)
+        {
+            return Ok(match request {
+                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                ObjectiveRequest::CostAndGradient => {
+                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                }
+                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                    ObjectiveSample::cost_gradient_hessian(*cost_c, grad_c.clone(), hess_c.clone())
+                }
+            });
         }
-        let grad = match reml_state.compute_gradient(rho) {
-            Ok(grad) if grad.iter().all(|g| g.is_finite()) => grad,
-            _ => {
-                return (
-                    f64::INFINITY,
-                    Array1::<f64>::from_elem(rho.len(), f64::NAN),
-                    Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
-                );
+
+        let get_cost = |rho: &Array1<f64>| -> f64 {
+            if let Some((rho_c, cost_c)) = &cached_cost
+                && approx_same_rho_point(rho, rho_c)
+            {
+                *cost_c
+            } else {
+                match reml_state.compute_cost(rho) {
+                    Ok(v) => v,
+                    Err(_) => f64::INFINITY,
+                }
             }
         };
-        match reml_state.compute_laml_hessian_exact(rho) {
-            Ok(h) if h.iter().all(|v| v.is_finite()) => (cost, grad, h),
-            _ => (
-                f64::INFINITY,
-                Array1::<f64>::from_elem(rho.len(), f64::NAN),
-                Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
-            ),
+        let cost = get_cost(rho);
+        if !cost.is_finite() {
+            return Err(ObjectiveEvalError::recoverable("non-finite REML cost"));
+        }
+        match request {
+            ObjectiveRequest::CostOnly => {
+                cached_cost = Some((rho.clone(), cost));
+                Ok(ObjectiveSample::cost_only(cost))
+            }
+            ObjectiveRequest::CostAndGradient => {
+                let grad = match reml_state.compute_gradient(rho) {
+                    Ok(grad) if grad.iter().all(|g| g.is_finite()) => grad,
+                    _ => return Err(ObjectiveEvalError::recoverable("non-finite REML gradient")),
+                };
+                Ok(ObjectiveSample::cost_and_gradient(cost, grad))
+            }
+            ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                let grad = match reml_state.compute_gradient(rho) {
+                    Ok(grad) if grad.iter().all(|g| g.is_finite()) => grad,
+                    _ => return Err(ObjectiveEvalError::recoverable("non-finite REML gradient")),
+                };
+                let hess = match reml_state.compute_laml_hessian_exact(rho) {
+                    Ok(h) if h.iter().all(|v| v.is_finite()) => h,
+                    _ => return Err(ObjectiveEvalError::recoverable("non-finite REML Hessian")),
+                };
+                cached_full = Some((rho.clone(), cost, grad.clone(), hess.clone()));
+                Ok(ObjectiveSample::cost_gradient_hessian(cost, grad, hess))
+            }
         }
     })
     .with_bounds(lower, upper, 1e-6)
@@ -1187,28 +1217,89 @@ where
         let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
         let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
         let mut last_eval: Option<(Array1<f64>, Array1<f64>)> = None;
-        let mut optimizer = NewtonTrustRegion::new(rho_seed.clone(), |rho| {
-            let (cost, grad_rho) = match eval_cost_grad_rho(context, rho) {
-                Ok(v) => v,
-                Err(_) => {
-                    return (
-                        f64::INFINITY,
-                        Array1::<f64>::from_elem(rho.len(), f64::NAN),
-                        Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
-                    );
+        let mut full_cache: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
+        let mut cg_cache: Option<(Array1<f64>, f64, Array1<f64>)> = None;
+        let mut optimizer = NewtonTrustRegion::new(rho_seed.clone(), |rho, request| {
+            if let Some((rho_c, cost_c, grad_c, hess_c)) = &full_cache
+                && approx_same_rho_point(rho, rho_c)
+            {
+                return Ok(match request {
+                    ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                    ObjectiveRequest::CostAndGradient => {
+                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                    }
+                    ObjectiveRequest::GradientAndHessian
+                    | ObjectiveRequest::CostGradientHessian => {
+                        ObjectiveSample::cost_gradient_hessian(
+                            *cost_c,
+                            grad_c.clone(),
+                            hess_c.clone(),
+                        )
+                    }
+                });
+            }
+
+            let eval_cost_grad = |rho: &Array1<f64>,
+                                  context: &mut C,
+                                  eval_cost_grad_rho: &mut Eval|
+             -> Result<(f64, Array1<f64>), ObjectiveEvalError> {
+                let (cost, grad_rho) = eval_cost_grad_rho(context, rho)
+                    .map_err(|e| ObjectiveEvalError::recoverable(format!("{e}")))?;
+                if !cost.is_finite() || grad_rho.iter().any(|v| !v.is_finite()) {
+                    return Err(ObjectiveEvalError::recoverable(
+                        "non-finite smoothing objective/gradient",
+                    ));
                 }
+                Ok((cost, grad_rho))
             };
-            let hess_rho = match finite_diff_hessian_from_gradient_external(
-                context,
-                rho,
-                options.finite_diff_step,
-                eval_cost_grad_rho,
-            ) {
-                Ok(h) => h,
-                Err(_) => Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
-            };
-            last_eval = Some((rho.clone(), grad_rho.clone()));
-            (cost, grad_rho, hess_rho)
+            match request {
+                ObjectiveRequest::CostOnly => {
+                    let (cost, grad_rho) = eval_cost_grad(rho, context, eval_cost_grad_rho)?;
+                    last_eval = Some((rho.clone(), grad_rho.clone()));
+                    cg_cache = Some((rho.clone(), cost, grad_rho));
+                    Ok(ObjectiveSample::cost_only(cost))
+                }
+                ObjectiveRequest::CostAndGradient => {
+                    let (cost, grad_rho) = if let Some((rho_c, cost_c, grad_c)) = &cg_cache {
+                        if approx_same_rho_point(rho, rho_c) {
+                            (*cost_c, grad_c.clone())
+                        } else {
+                            eval_cost_grad(rho, context, eval_cost_grad_rho)?
+                        }
+                    } else {
+                        eval_cost_grad(rho, context, eval_cost_grad_rho)?
+                    };
+                    last_eval = Some((rho.clone(), grad_rho.clone()));
+                    cg_cache = Some((rho.clone(), cost, grad_rho.clone()));
+                    Ok(ObjectiveSample::cost_and_gradient(cost, grad_rho))
+                }
+                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                    let (cost, grad_rho) = if let Some((rho_c, cost_c, grad_c)) = &cg_cache {
+                        if approx_same_rho_point(rho, rho_c) {
+                            (*cost_c, grad_c.clone())
+                        } else {
+                            eval_cost_grad(rho, context, eval_cost_grad_rho)?
+                        }
+                    } else {
+                        eval_cost_grad(rho, context, eval_cost_grad_rho)?
+                    };
+                    last_eval = Some((rho.clone(), grad_rho.clone()));
+                    cg_cache = Some((rho.clone(), cost, grad_rho.clone()));
+                    let hess_rho = match finite_diff_hessian_from_gradient_external(
+                        context,
+                        rho,
+                        options.finite_diff_step,
+                        eval_cost_grad_rho,
+                    ) {
+                        Ok(h) => h,
+                        Err(e) => return Err(ObjectiveEvalError::recoverable(format!("{e}"))),
+                    };
+                    full_cache = Some((rho.clone(), cost, grad_rho.clone(), hess_rho.clone()));
+                    Ok(ObjectiveSample::cost_gradient_hessian(
+                        cost, grad_rho, hess_rho,
+                    ))
+                }
+            }
         })
         .with_bounds(lower, upper, 1e-6)
         .with_tolerance(options.tol)
