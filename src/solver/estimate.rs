@@ -37,7 +37,7 @@ use crate::pirls::{self, PirlsResult};
 use crate::probability::{inverse_link_array, standard_normal_quantile};
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use crate::types::{
-    Coefficients, LinkFunction, LogSmoothingParams, LogSmoothingParamsView, RidgePassport,
+    Coefficients, LinkFunction, LogSmoothingParamsView, RidgePassport,
 };
 
 // Ndarray and faer linear algebra helpers
@@ -271,7 +271,6 @@ struct RemlConfig {
     reml_convergence_tolerance: f64,
     reml_max_iterations: u64,
     firth_bias_reduction: bool,
-    objective_consistent_fd_gradient: bool,
 }
 
 impl RemlConfig {
@@ -288,9 +287,6 @@ impl RemlConfig {
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
-            // Use analytic outer gradients for external fits to avoid
-            // expensive FD sweeps that repeatedly re-run PIRLS.
-            objective_consistent_fd_gradient: false,
         }
     }
 
@@ -461,118 +457,12 @@ const RHO_BOUND: f64 = 30.0;
 // Soft interior prior on rho near the box boundaries.
 const RHO_SOFT_PRIOR_WEIGHT: f64 = 1e-6;
 const RHO_SOFT_PRIOR_SHARPNESS: f64 = 4.0;
-const MAX_CONSECUTIVE_INNER_ERRORS: usize = 3;
 // Adaptive cubature guardrails for bounded correction latency.
 const AUTO_CUBATURE_MAX_RHO_DIM: usize = 12;
 const AUTO_CUBATURE_MAX_EIGENVECTORS: usize = 4;
 const AUTO_CUBATURE_TARGET_VAR_FRAC: f64 = 0.95;
 const AUTO_CUBATURE_MAX_BETA_DIM: usize = 1600;
 const AUTO_CUBATURE_BOUNDARY_MARGIN: f64 = 2.0;
-
-#[inline]
-fn stable_atanh(x: f64) -> f64 {
-    // Use a formulation that remains accurate for |x| close to 1 while
-    // avoiding spurious infinities from catastrophic cancellation.
-    //
-    // atanh(x) = 0.5 * [ln(1 + x) - ln(1 - x)]
-    0.5 * ((1.0 + x).ln() - (1.0 - x).ln())
-}
-
-#[inline]
-fn next_toward_zero(x: f64) -> f64 {
-    if x == 0.0 {
-        0.0
-    } else if x > 0.0 {
-        f64::from_bits(x.to_bits() - 1)
-    } else {
-        // For negative values, decreasing the bit pattern moves toward +0.0.
-        f64::from_bits(x.to_bits() - 1)
-    }
-}
-
-#[inline]
-fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
-    rho.mapv(|r| {
-        // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via z = RHO_BOUND * atanh(r/RHO_BOUND)
-        let ratio = r / RHO_BOUND;
-        let xr = if ratio <= -1.0 {
-            next_toward_zero(-1.0)
-        } else if ratio >= 1.0 {
-            next_toward_zero(1.0)
-        } else {
-            ratio
-        };
-        let z = RHO_BOUND * stable_atanh(xr);
-        z.clamp(-1e6, 1e6)
-    })
-}
-
-#[inline]
-fn to_rho_from_z(z: &Array1<f64>) -> Array1<f64> {
-    z.mapv(|v| {
-        let scaled = v / RHO_BOUND;
-        RHO_BOUND * scaled.tanh()
-    })
-}
-
-#[inline]
-fn jacobian_drho_dz_from_rho(rho: &Array1<f64>) -> Array1<f64> {
-    rho.mapv(|r| {
-        // Numerical guard: can be slightly negative near the walls; clamp to [0, 1].
-        (1.0 - (r / RHO_BOUND).powi(2)).max(0.0)
-    })
-}
-
-#[cfg(test)]
-mod rho_mapping_tests {
-    use super::{RHO_BOUND, next_toward_zero, to_rho_from_z, to_z_from_rho};
-    use ndarray::arr1;
-
-    #[test]
-    fn next_toward_zero_moves_toward_zero_for_both_signs() {
-        let p = next_toward_zero(1.0);
-        let n = next_toward_zero(-1.0);
-        assert!(p.is_finite() && n.is_finite());
-        assert!(p < 1.0 && p > 0.0, "positive side should move inward");
-        assert!(n > -1.0 && n < 0.0, "negative side should move inward");
-    }
-
-    #[test]
-    fn rho_to_z_is_finite_at_box_boundaries() {
-        let rho = arr1(&[-RHO_BOUND, RHO_BOUND]);
-        let z = to_z_from_rho(&rho);
-        assert!(z.iter().all(|v| v.is_finite()));
-    }
-
-    #[test]
-    fn rho_z_roundtrip_stays_finite_and_within_bounds() {
-        let rho = arr1(&[-RHO_BOUND, 0.0, RHO_BOUND]);
-        let z = to_z_from_rho(&rho);
-        let rho_back = to_rho_from_z(&z);
-        assert!(rho_back.iter().all(|v| v.is_finite()));
-        assert!(rho_back.iter().all(|v| v.abs() <= RHO_BOUND));
-    }
-}
-
-#[inline]
-fn project_rho_gradient(rho: &Array1<f64>, grad: &mut Array1<f64>) {
-    let tol = 1e-8;
-    for i in 0..rho.len() {
-        if rho[i] <= -RHO_BOUND + tol && grad[i] > 0.0 {
-            grad[i] = 0.0;
-        }
-        if rho[i] >= RHO_BOUND - tol && grad[i] < 0.0 {
-            grad[i] = 0.0;
-        }
-    }
-}
-
-#[inline]
-fn grad_norm_in_z_space(rho: &Array1<f64>, grad_rho: &Array1<f64>) -> f64 {
-    let jac = jacobian_drho_dz_from_rho(rho);
-    let grad_z = grad_rho * &jac;
-    grad_z.dot(&grad_z).sqrt()
-}
 
 /// Smooth approximation of `max(dp, DP_FLOOR)` that is differentiable.
 ///
@@ -847,10 +737,25 @@ fn run_bfgs_for_candidate(
     label: &str,
     reml_state: &RemlState<'_>,
     config: &RemlConfig,
-    initial_z: Array1<f64>,
+    initial_rho: Array1<f64>,
 ) -> Result<(BfgsSolution, f64, bool), EstimationError> {
     log::debug!("[Candidate {label}] Running BFGS optimization from queued seed");
-    let mut solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
+    let lower = Array1::<f64>::from_elem(initial_rho.len(), -RHO_BOUND);
+    let upper = Array1::<f64>::from_elem(initial_rho.len(), RHO_BOUND);
+    let mut solver = Bfgs::new(initial_rho, |rho| {
+        let cost = match reml_state.compute_cost(rho) {
+            Ok(v) => v,
+            Err(_) => f64::INFINITY,
+        };
+        if !cost.is_finite() {
+            return (f64::INFINITY, Array1::<f64>::from_elem(rho.len(), f64::NAN));
+        }
+        match reml_state.compute_gradient(rho) {
+            Ok(grad) if grad.iter().all(|g| g.is_finite()) => (cost, grad),
+            _ => (f64::INFINITY, Array1::<f64>::from_elem(rho.len(), f64::NAN)),
+        }
+    })
+        .with_bounds(lower, upper, 1e-6)
         .with_tolerance(config.reml_convergence_tolerance)
         .with_max_iterations(config.reml_max_iterations as usize)
         .with_fp_tolerances(1e2, 1e2)
@@ -885,17 +790,6 @@ fn run_bfgs_for_candidate(
         }
     };
 
-    if reml_state.consecutive_cost_error_count() >= MAX_CONSECUTIVE_INNER_ERRORS {
-        let last_msg = reml_state
-            .last_cost_error_string()
-            .unwrap_or_else(|| "unknown error".to_string());
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "Candidate {label} aborted due to repeated inner-loop failures ({} consecutive). Last error: {}",
-            reml_state.consecutive_cost_error_count(),
-            last_msg
-        )));
-    }
-
     if !solution.final_value.is_finite() {
         return Err(EstimationError::RemlOptimizationFailed(format!(
             "Candidate {label} produced a non-finite final value: {}",
@@ -921,111 +815,6 @@ struct OuterSolveResult {
     iterations: usize,
     grad_norm_rho: f64,
     stationary: bool,
-}
-
-fn run_newton_for_candidate(
-    label: &str,
-    reml_state: &RemlState<'_>,
-    config: &RemlConfig,
-    initial_z: Array1<f64>,
-) -> Result<OuterSolveResult, EstimationError> {
-    log::debug!("[Candidate {label}] Running exact Newton optimization from queued seed");
-    let mut rho = to_rho_from_z(&initial_z);
-    let max_iter = config.reml_max_iterations as usize;
-    let tol = config.reml_convergence_tolerance.max(1e-8);
-
-    let mut best_rho = rho.clone();
-    let mut best_cost = f64::INFINITY;
-    let mut iter_done = 0usize;
-    let mut last_grad_norm = f64::INFINITY;
-
-    for iter in 0..max_iter {
-        iter_done = iter + 1;
-        let cost = reml_state.compute_cost(&rho)?;
-        let mut grad = reml_state.compute_gradient(&rho)?;
-        maybe_audit_gradient(reml_state, &rho, iter_done as u64, &mut grad);
-        project_rho_gradient(&rho, &mut grad);
-        last_grad_norm = grad_norm_in_z_space(&rho, &grad);
-        if cost.is_finite() && (cost < best_cost || !best_cost.is_finite()) {
-            best_cost = cost;
-            best_rho = rho.clone();
-        }
-        if last_grad_norm <= tol {
-            break;
-        }
-
-        let hess = reml_state.compute_laml_hessian_exact(&rho)?;
-        let mut hreg = hess.clone();
-        let mut ridge = 0.0_f64;
-        let step = loop {
-            if ridge > 0.0 {
-                for i in 0..hreg.nrows() {
-                    hreg[[i, i]] = hess[[i, i]] + ridge;
-                }
-            }
-            let h_view = FaerArrayView::new(&hreg);
-            if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-                let mut rhs = grad.mapv(|v| -v).insert_axis(Axis(1));
-                let mut rhs_view = array2_to_mat_mut(&mut rhs);
-                ch.solve_in_place(rhs_view.as_mut());
-                break rhs.column(0).to_owned();
-            }
-            if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-                let mut rhs = grad.mapv(|v| -v).insert_axis(Axis(1));
-                let mut rhs_view = array2_to_mat_mut(&mut rhs);
-                ld.solve_in_place(rhs_view.as_mut());
-                break rhs.column(0).to_owned();
-            }
-            ridge = if ridge == 0.0 { 1e-8 } else { ridge * 10.0 };
-            if ridge > 1e8 {
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "Newton Hessian factorization failed repeatedly".to_string(),
-                ));
-            }
-            hreg.assign(&hess);
-        };
-
-        let armijo_c = 1e-4;
-        let descent = grad.dot(&step);
-        let mut alpha = 1.0_f64;
-        let mut accepted = false;
-        for _ in 0..30 {
-            let mut trial = &rho + &(step.mapv(|v| alpha * v));
-            for i in 0..trial.len() {
-                trial[i] = trial[i].clamp(-RHO_BOUND, RHO_BOUND);
-            }
-            let trial_cost = reml_state.compute_cost(&trial)?;
-            if trial_cost.is_finite() && trial_cost <= cost + armijo_c * alpha * descent {
-                rho = trial;
-                accepted = true;
-                break;
-            }
-            alpha *= 0.5;
-        }
-        if !accepted {
-            break;
-        }
-        if alpha * step.iter().map(|v| v * v).sum::<f64>().sqrt() < 1e-10 {
-            break;
-        }
-    }
-
-    let verified_grad_norm = last_grad_norm;
-    let verified_stationary = verified_grad_norm <= tol;
-    log::debug!(
-        "[Candidate {label}] Newton final gradient norm {:.3e} (tol {:.3e}); stationary={}",
-        verified_grad_norm,
-        tol,
-        verified_stationary
-    );
-
-    Ok(OuterSolveResult {
-        final_rho: best_rho,
-        final_value: best_cost,
-        iterations: iter_done,
-        grad_norm_rho: verified_grad_norm,
-        stationary: verified_stationary,
-    })
 }
 
 /// A comprehensive error type for the model estimation process.
@@ -1291,17 +1080,15 @@ fn should_replace_smoothing_candidate(
     }
 }
 
-fn run_multistart_bfgs<C, Eval, Screen>(
+fn run_multistart_bfgs<C, Eval>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     context: &mut C,
     eval_cost_grad_rho: &mut Eval,
-    seed_screen_cost: &mut Screen,
     options: &SmoothingBfgsOptions,
 ) -> Result<SmoothingBfgsResult, EstimationError>
 where
     Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError>,
-    Screen: FnMut(&mut C, &Array1<f64>) -> Result<f64, EstimationError>,
 {
     let seeds = generate_rho_candidates(num_penalties, heuristic_lambdas, &options.seed_config);
     if seeds.is_empty() {
@@ -1309,77 +1096,27 @@ where
             "no smoothing seeds produced".to_string(),
         ));
     }
-
-    // Cheap initial triage: evaluate each seed once and only fully optimize
-    // the most promising starts.
-    let mut screened: Vec<(usize, Array1<f64>, f64)> = Vec::with_capacity(seeds.len());
-    for (idx, rho_seed) in seeds.iter().enumerate() {
-        match seed_screen_cost(context, rho_seed) {
-            Ok(cost) if cost.is_finite() => screened.push((idx, rho_seed.clone(), cost)),
-            _ => {}
-        }
-    }
-    if screened.len() < 2 && num_penalties > 0 {
-        let (lo, hi) = if options.seed_config.bounds.0 <= options.seed_config.bounds.1 {
-            options.seed_config.bounds
-        } else {
-            (options.seed_config.bounds.1, options.seed_config.bounds.0)
-        };
-        let conservative_levels: &[f64] = match options.seed_config.risk_profile {
-            SeedRiskProfile::Gaussian => &[2.0, 4.0],
-            SeedRiskProfile::GeneralizedLinear => &[4.0, 6.0],
-            SeedRiskProfile::Survival => &[6.0, 8.0],
-        };
-        for &lvl in conservative_levels {
-            let rho = lvl.clamp(lo, hi);
-            let probe = Array1::from_elem(num_penalties, rho);
-            if let Ok(cost) = seed_screen_cost(context, &probe)
-                && cost.is_finite()
-            {
-                screened.push((usize::MAX, probe, cost));
-            }
-        }
-    }
-    screened.sort_by(|a, b| a.2.total_cmp(&b.2));
-    let screening_budget = options
-        .seed_config
-        .screening_budget
-        .max(1)
-        .min(if num_penalties >= 12 { 4 } else { 6 });
-    let candidate_seeds: Vec<(usize, Array1<f64>)> = screened
-        .into_iter()
-        .take(screening_budget)
-        .map(|(idx, rho, _)| (idx, rho))
-        .collect();
-
-    let candidate_seeds = if candidate_seeds.is_empty() {
-        vec![(0usize, Array1::<f64>::zeros(num_penalties))]
-    } else {
-        candidate_seeds
-    };
+    let candidate_seeds: Vec<(usize, Array1<f64>)> =
+        seeds.into_iter().enumerate().collect();
 
     let mut best: Option<SmoothingBfgsResult> = None;
     let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
     let mut best_grad_norm = f64::INFINITY;
     for (seed_idx, rho_seed) in candidate_seeds.iter() {
-        let initial_z = to_z_from_rho(rho_seed);
+        let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
+        let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
         let mut last_eval: Option<(Array1<f64>, Array1<f64>)> = None;
-        let mut optimizer = Bfgs::new(initial_z.clone(), |z| {
-            let rho = to_rho_from_z(z);
-            let (cost, grad_rho) = match eval_cost_grad_rho(context, &rho) {
+        let mut optimizer = Bfgs::new(rho_seed.clone(), |rho| {
+            let (cost, grad_rho) = match eval_cost_grad_rho(context, rho) {
                 Ok(v) => v,
-                Err(_) => (f64::INFINITY, Array1::<f64>::zeros(rho.len())),
+                // Do not fabricate search directions: if evaluation fails, hand
+                // back a non-finite sentinel so the line search can reject it.
+                Err(_) => (f64::INFINITY, Array1::<f64>::from_elem(rho.len(), f64::NAN)),
             };
             last_eval = Some((rho.clone(), grad_rho.clone()));
-            let jac = jacobian_drho_dz_from_rho(&rho);
-            let mut grad_z = &grad_rho * &jac;
-            for g in grad_z.iter_mut() {
-                if !g.is_finite() {
-                    *g = 0.0;
-                }
-            }
-            (cost, grad_z)
+            (cost, grad_rho)
         })
+        .with_bounds(lower, upper, 1e-6)
         .with_tolerance(options.tol)
         .with_max_iterations(options.max_iter)
         .with_fp_tolerances(1e2, 1e2)
@@ -1393,17 +1130,21 @@ where
             Err(_) => continue,
         };
 
-        let rho = to_rho_from_z(&solution.final_point);
+        let rho = solution.final_point.clone();
         let mut grad_rho = match &last_eval {
             Some((rho_cached, grad_cached)) if approx_same_rho_point(&rho, rho_cached) => {
                 grad_cached.clone()
             }
             _ => match eval_cost_grad_rho(context, &rho) {
                 Ok((_, grad)) => grad,
-                Err(_) => Array1::<f64>::zeros(rho.len()),
+                Err(_) => Array1::<f64>::from_elem(rho.len(), f64::NAN),
             },
         };
-        project_rho_gradient(&rho, &mut grad_rho);
+        for g in grad_rho.iter_mut() {
+            if !g.is_finite() {
+                *g = f64::NAN;
+            }
+        }
         let grad_norm = grad_rho.dot(&grad_rho).sqrt();
         let candidate = SmoothingBfgsResult {
             rho,
@@ -1468,13 +1209,11 @@ where
         let grad_rho = finite_diff_gradient_external(rho, options.finite_diff_step, objective)?;
         Ok((cost, grad_rho))
     };
-    let mut seed_screen_cost = |objective: &mut F, rho: &Array1<f64>| objective(rho);
     run_multistart_bfgs(
         num_penalties,
         heuristic_lambdas,
         &mut objective,
         &mut eval_cost_grad_rho,
-        &mut seed_screen_cost,
         options,
     )
 }
@@ -1486,10 +1225,8 @@ where
 /// - `value = V(rho)`
 /// - `grad_rho = dV/drho` (same dimension/order as `rho`)
 ///
-/// Internally we optimize in unconstrained `z` coordinates:
-/// - `rho = to_rho_from_z(z)` (bounded/smoothed map used by this module)
-/// - chain rule for BFGS objective gradient:
-///   `grad_z = diag(drho_dz(rho)) * grad_rho`.
+/// Internally we optimize directly in `rho` coordinates with no additional
+/// reparameterization layer.
 ///
 /// Why this exists:
 /// - finite-difference outer gradients require repeated inner solves per coordinate,
@@ -1520,13 +1257,11 @@ where
     }
 
     let mut eval_cost_grad_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
-    let mut seed_screen_cost = |objective: &mut F, rho: &Array1<f64>| objective(rho).map(|v| v.0);
     run_multistart_bfgs(
         num_penalties,
         heuristic_lambdas,
         &mut objective_with_gradient,
         &mut eval_cost_grad_rho,
-        &mut seed_screen_cost,
         options,
     )
 }
@@ -1604,148 +1339,33 @@ where
         },
     };
     let rho_seeds = generate_rho_candidates(k, None, &seed_config);
-    let mut candidate_seeds: Vec<(String, Array1<f64>)> = rho_seeds
+    let candidate_seeds: Vec<(String, Array1<f64>)> = rho_seeds
         .into_iter()
         .enumerate()
-        .map(|(idx, rho)| (format!("seed_{idx}"), to_z_from_rho(&rho)))
+        .map(|(idx, rho)| (format!("seed_{idx}"), rho))
         .collect();
-    if candidate_seeds.is_empty() {
-        let primary_rho = Array1::<f64>::zeros(k);
-        candidate_seeds.push(("fallback_zero".to_string(), to_z_from_rho(&primary_rho)));
-    }
 
     let mut best_stationary: Option<OuterSolveResult> = None;
     let mut best_nonstationary: Option<OuterSolveResult> = None;
     let mut best_grad_norm = f64::INFINITY;
     let mut candidate_failures: Vec<String> = Vec::new();
-
-    // Two-stage seed handling:
-    // 1) evaluate each seed once with compute_cost (cheap relative to a full outer solve),
-    // 2) fully optimize only the most promising seeds.
-    let screening_budget = seed_config.screening_budget.max(1);
-    let mut screened: Vec<(String, Array1<f64>, f64)> = Vec::with_capacity(candidate_seeds.len());
-    for (label, initial_z) in candidate_seeds.drain(..) {
-        let rho0 = to_rho_from_z(&initial_z);
-        match reml_state.screen_seed_cost(&rho0, seed_config.screen_max_inner_iterations) {
-            Ok(cost0) if cost0.is_finite() => screened.push((label, initial_z, cost0)),
-            Ok(cost0) => {
-                candidate_failures.push(format!(
-                    "[Seed screen {}] non-finite initial cost {}",
-                    label, cost0
-                ));
-            }
-            Err(err) => {
-                candidate_failures.push(format!("[Seed screen {}] {}", label, err));
-            }
-        }
-    }
-    screened.sort_by(|a, b| a.2.total_cmp(&b.2));
-    let promotion_budget = screened
-        .len()
-        .min((screening_budget.max(1) * 2).max(3))
-        .min(6);
-    let mut promoted: Vec<(String, Array1<f64>, f64)> = Vec::new();
-    for (label, z, _screen_cost) in screened.into_iter().take(promotion_budget) {
-        let rho0 = to_rho_from_z(&z);
-        match reml_state.compute_cost(&rho0) {
-            Ok(full_cost) if full_cost.is_finite() => promoted.push((label, z, full_cost)),
-            Ok(non_finite) => {
-                candidate_failures.push(format!(
-                    "[Seed promote {label}] non-finite full cost {}",
-                    non_finite
-                ));
-            }
-            Err(err) => {
-                candidate_failures.push(format!("[Seed promote {label}] {}", err));
-            }
-        }
-    }
-    promoted.sort_by(|a, b| a.2.total_cmp(&b.2));
-    let candidate_seeds: Vec<(String, Array1<f64>)> = promoted
-        .into_iter()
-        .take(screening_budget.max(1))
-        .map(|(label, z, _)| (label, z))
-        .collect();
     if candidate_seeds.is_empty() {
-        candidate_failures.push(
-            "[Seed screen] all candidate seeds failed initial screening; reverting to zero seed"
-                .to_string(),
-        );
+        return Err(EstimationError::RemlOptimizationFailed(
+            "no smoothing seeds produced for external optimization".to_string(),
+        ));
     }
-    let candidate_seeds = if candidate_seeds.is_empty() {
-        vec![(
-            "fallback_zero".to_string(),
-            to_z_from_rho(&Array1::<f64>::zeros(k)),
-        )]
-    } else {
-        candidate_seeds
-    };
     let near_stationary_tol = (cfg.reml_convergence_tolerance.max(1e-12)) * 2.0;
-    let use_newton = true;
-    for (label, initial_z) in candidate_seeds {
-        let solution_result: Result<OuterSolveResult, EstimationError> = if use_newton {
-            match run_newton_for_candidate(&label, &reml_state, &cfg, initial_z.clone()) {
-                Ok(sol) => {
-                    if sol.stationary {
-                        Ok(sol)
-                    } else {
-                        log::debug!(
-                            "[Candidate {label}] Newton ended non-stationary (grad_norm={:.3e}); retrying with BFGS.",
-                            sol.grad_norm_rho
-                        );
-                        match run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z) {
-                            Ok((bfgs_solution, grad_norm_rho, stationary)) => {
-                                let bfgs_outer = OuterSolveResult {
-                                    final_rho: to_rho_from_z(&bfgs_solution.final_point),
-                                    final_value: bfgs_solution.final_value,
-                                    iterations: bfgs_solution.iterations,
-                                    grad_norm_rho,
-                                    stationary,
-                                };
-                                if bfgs_outer.stationary
-                                    || bfgs_outer.final_value <= sol.final_value
-                                {
-                                    Ok(bfgs_outer)
-                                } else {
-                                    Ok(sol)
-                                }
-                            }
-                            Err(err) => {
-                                log::warn!(
-                                    "[Candidate {label}] BFGS fallback failed ({err}); keeping non-stationary Newton solution."
-                                );
-                                Ok(sol)
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    log::warn!("[Candidate {label}] Newton failed ({err}); falling back to BFGS.");
-                    match run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z) {
-                        Ok((bfgs_solution, grad_norm_rho, stationary)) => Ok(OuterSolveResult {
-                            final_rho: to_rho_from_z(&bfgs_solution.final_point),
-                            final_value: bfgs_solution.final_value,
-                            iterations: bfgs_solution.iterations,
-                            grad_norm_rho,
-                            stationary,
-                        }),
-                        Err(bfgs_err) => Err(EstimationError::RemlOptimizationFailed(format!(
-                            "Candidate {label}: Newton failed ({err}); BFGS fallback failed ({bfgs_err})"
-                        ))),
-                    }
-                }
-            }
-        } else {
-            run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_z).map(
+    for (label, initial_rho) in candidate_seeds {
+        let solution_result: Result<OuterSolveResult, EstimationError> =
+            run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_rho).map(
                 |(bfgs_solution, grad_norm_rho, stationary)| OuterSolveResult {
-                    final_rho: to_rho_from_z(&bfgs_solution.final_point),
+                    final_rho: bfgs_solution.final_point,
                     final_value: bfgs_solution.final_value,
                     iterations: bfgs_solution.iterations,
                     grad_norm_rho,
                     stationary,
                 },
-            )
-        };
+            );
         let solution = match solution_result {
             Ok(sol) => sol,
             Err(err) => {
@@ -1782,33 +1402,18 @@ where
             break;
         }
     }
-    let mut found_stationary = best_stationary.is_some();
-    let chosen_solution = if let Some(sol) = best_stationary.or(best_nonstationary) {
-        sol
-    } else {
-        log::warn!(
-            "[external] all candidate seeds failed; using emergency fixed-rho fallback (rho=0)."
-        );
-        if !candidate_failures.is_empty() {
-            log::warn!(
-                "[external] candidate failures summary ({}):\n{}",
-                candidate_failures.len(),
+    let found_stationary = best_stationary.is_some();
+    let chosen_solution = best_stationary.or(best_nonstationary).ok_or_else(|| {
+        let detail = if candidate_failures.is_empty() {
+            "all candidate seeds failed without a recoverable last solution".to_string()
+        } else {
+            format!(
+                "all candidate seeds failed; details:\n{}",
                 candidate_failures.join("\n")
-            );
-        }
-        found_stationary = false;
-        let fallback_rho = Array1::<f64>::zeros(k);
-        let fallback_value = reml_state
-            .compute_cost(&fallback_rho)
-            .unwrap_or(f64::INFINITY);
-        OuterSolveResult {
-            final_rho: fallback_rho,
-            final_value: fallback_value,
-            iterations: 1,
-            grad_norm_rho: f64::INFINITY,
-            stationary: false,
-        }
-    };
+            )
+        };
+        EstimationError::RemlOptimizationFailed(detail)
+    })?;
     if !found_stationary {
         log::debug!(
             "[external] no stationary candidate found; using best non-stationary solution with grad_norm={:.3e}",
@@ -1956,13 +1561,12 @@ where
     };
 
     // Compute gradient norm at final rho for reporting
-    let mut final_grad = reml_state
+    let final_grad = reml_state
         .compute_gradient(&final_rho)
         .unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
-    project_rho_gradient(&final_rho, &mut final_grad);
-    let final_grad_norm_z = grad_norm_in_z_space(&final_rho, &final_grad);
-    let final_grad_norm = if final_grad_norm_z.is_finite() {
-        final_grad_norm_z
+    let final_grad_norm_rho = final_grad.dot(&final_grad).sqrt();
+    let final_grad_norm = if final_grad_norm_rho.is_finite() {
+        final_grad_norm_rho
     } else {
         best_grad_norm
     };
@@ -2680,104 +2284,10 @@ const FD_RIDGE_REL_JITTER_THRESHOLD: f64 = 1e-3;
 const FD_RIDGE_ABS_JITTER_THRESHOLD: f64 = 1e-12;
 
 #[derive(Clone, Copy, Debug)]
-struct GradAuditConfig {
-    every: usize,
-    rel_tol: f64,
-    abs_tol: f64,
-    fallback_to_fd: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
 enum TraceBackend {
     Exact,
     Hutchinson { probes: usize },
     HutchPP { probes: usize, sketch: usize },
-}
-
-fn grad_audit_config() -> GradAuditConfig {
-    GradAuditConfig {
-        every: 10,
-        rel_tol: 5e-2,
-        abs_tol: 1e-4,
-        fallback_to_fd: true,
-    }
-}
-
-fn gradient_audit_stats(
-    analytic: &Array1<f64>,
-    reference: &Array1<f64>,
-) -> Option<(f64, f64, f64, f64)> {
-    if analytic.len() != reference.len() {
-        return None;
-    }
-    let mut sq_diff = 0.0_f64;
-    let mut sq_ref = 0.0_f64;
-    let mut max_abs = 0.0_f64;
-    let mut max_ref_abs = 0.0_f64;
-    for (&a, &r) in analytic.iter().zip(reference.iter()) {
-        if !(a.is_finite() && r.is_finite()) {
-            return None;
-        }
-        let d = a - r;
-        sq_diff += d * d;
-        sq_ref += r * r;
-        max_abs = max_abs.max(d.abs());
-        max_ref_abs = max_ref_abs.max(r.abs());
-    }
-    let rel_l2 = sq_diff.sqrt() / sq_ref.sqrt().max(1e-12);
-    Some((rel_l2, max_abs, sq_ref.sqrt(), max_ref_abs))
-}
-
-fn maybe_audit_gradient(
-    reml_state: &internal::RemlState<'_>,
-    rho: &Array1<f64>,
-    eval_num: u64,
-    grad: &mut Array1<f64>,
-) {
-    let audit_cfg = grad_audit_config();
-    if audit_cfg.every == 0 || rho.is_empty() || eval_num % (audit_cfg.every as u64) != 0 {
-        return;
-    }
-    match compute_fd_gradient_internal(reml_state, rho, false, true) {
-        Ok(fd_grad) => {
-            if let Some((rel_l2, max_abs, ref_l2, ref_max_abs)) =
-                gradient_audit_stats(grad, &fd_grad)
-            {
-                let mismatch = rel_l2 > audit_cfg.rel_tol || max_abs > audit_cfg.abs_tol;
-                if mismatch {
-                    log::warn!(
-                        "[GRAD AUDIT] eval={} rel_l2={:.3e} (tol {:.3e}) max_abs={:.3e} (tol {:.3e}) ref_l2={:.3e} ref_max={:.3e}",
-                        eval_num,
-                        rel_l2,
-                        audit_cfg.rel_tol,
-                        max_abs,
-                        audit_cfg.abs_tol,
-                        ref_l2,
-                        ref_max_abs,
-                    );
-                    if audit_cfg.fallback_to_fd {
-                        log::warn!(
-                            "[GRAD AUDIT] eval={} replacing analytic gradient with FD gradient for this step",
-                            eval_num
-                        );
-                        *grad = fd_grad;
-                    }
-                }
-            } else {
-                log::warn!(
-                    "[GRAD AUDIT] eval={} produced non-finite comparison stats; skipping audit decision",
-                    eval_num
-                );
-            }
-        }
-        Err(e) => {
-            log::warn!(
-                "[GRAD AUDIT] eval={} failed FD gradient computation: {:?}",
-                eval_num,
-                e
-            );
-        }
-    }
 }
 
 struct FdEval {
@@ -3432,11 +2942,6 @@ pub mod internal {
         cache: RwLock<PirlsLruCache>,
         faer_factor_cache: RwLock<HashMap<Vec<u64>, Arc<FaerFactor>>>,
         pirls_cache_enabled: AtomicBool,
-        eval_count: RwLock<u64>,
-        last_cost: RwLock<f64>,
-        last_grad_norm: RwLock<f64>,
-        consecutive_cost_errors: RwLock<usize>,
-        last_cost_error_msg: RwLock<Option<String>>,
         current_eval_bundle: RwLock<Option<EvalShared>>,
         cost_last: RwLock<Option<CostAgg>>,
         cost_repeat: RwLock<u64>,
@@ -3447,7 +2952,6 @@ pub mod internal {
         workspace: Mutex<RemlWorkspace>,
         pub(super) warm_start_beta: RwLock<Option<Coefficients>>,
         warm_start_enabled: AtomicBool,
-        gradient_consistency_force_fd: AtomicBool,
     }
 
     #[derive(Clone)]
@@ -3649,7 +3153,7 @@ pub mod internal {
             let mut last_opt = self.cost_last.write().unwrap();
             let mut repeat = self.cost_repeat.write().unwrap();
             let mut last_emit = self.cost_last_emit.write().unwrap();
-            let eval_idx = *self.eval_count.read().unwrap();
+            let eval_idx = *self.cost_eval_count.read().unwrap();
 
             if let Some(last) = last_opt.as_mut() {
                 if last.key.approx_eq(&key) {
@@ -3684,11 +3188,6 @@ pub mod internal {
 
         #[allow(dead_code)]
         pub fn reset_optimizer_tracking(&self) {
-            *self.eval_count.write().unwrap() = 0;
-            *self.last_cost.write().unwrap() = f64::INFINITY;
-            *self.last_grad_norm.write().unwrap() = f64::INFINITY;
-            *self.consecutive_cost_errors.write().unwrap() = 0;
-            *self.last_cost_error_msg.write().unwrap() = None;
             self.current_eval_bundle.write().unwrap().take();
             self.cost_last.write().unwrap().take();
             *self.cost_repeat.write().unwrap() = 0;
@@ -3842,11 +3341,6 @@ pub mod internal {
                 cache: RwLock::new(PirlsLruCache::new(MAX_PIRLS_CACHE_ENTRIES)),
                 faer_factor_cache: RwLock::new(HashMap::new()),
                 pirls_cache_enabled: AtomicBool::new(true),
-                eval_count: RwLock::new(0),
-                last_cost: RwLock::new(f64::INFINITY),
-                last_grad_norm: RwLock::new(f64::INFINITY),
-                consecutive_cost_errors: RwLock::new(0),
-                last_cost_error_msg: RwLock::new(None),
                 current_eval_bundle: RwLock::new(None),
                 cost_last: RwLock::new(None),
                 cost_repeat: RwLock::new(0),
@@ -3857,7 +3351,6 @@ pub mod internal {
                 workspace: Mutex::new(workspace),
                 warm_start_beta: RwLock::new(None),
                 warm_start_enabled: AtomicBool::new(true),
-                gradient_consistency_force_fd: AtomicBool::new(false),
             })
         }
 
@@ -4164,34 +3657,48 @@ pub mod internal {
             zt_m.dot(z)
         }
 
-        fn penalty_rank_and_logdet_pos(
+        fn fixed_subspace_penalty_rank_and_logdet(
             &self,
-            s: &Array2<f64>,
+            e_transformed: &Array2<f64>,
             ridge_passport: RidgePassport,
         ) -> Result<(usize, f64), EstimationError> {
-            if s.nrows() == 0 {
+            let structural_rank = e_transformed.nrows().min(e_transformed.ncols());
+            if structural_rank == 0 {
                 return Ok((0, 0.0));
             }
-            let mut s_r = s.clone();
+
+            // Keep objective rank fixed to the structural penalty rank to avoid
+            // rho-dependent rank flips from tiny eigenvalue jitter.
+            let mut s_lambda = e_transformed.t().dot(e_transformed);
             let ridge = ridge_passport.penalty_logdet_ridge();
             if ridge > 0.0 {
-                for i in 0..s_r.nrows() {
-                    s_r[[i, i]] += ridge;
+                for i in 0..s_lambda.nrows() {
+                    s_lambda[[i, i]] += ridge;
                 }
             }
-            let (evals, _) = s_r
+            let (evals, _) = s_lambda
                 .eigh(Side::Lower)
                 .map_err(EstimationError::EigendecompositionFailed)?;
-            let floor = ridge.max(1e-10);
-            let mut rank = 0usize;
-            let mut log_det = 0.0_f64;
-            for &v in &evals {
-                if v > floor {
-                    rank += 1;
-                    log_det += v.ln();
-                }
-            }
-            Ok((rank, log_det))
+            let mut order: Vec<usize> = (0..evals.len()).collect();
+            order.sort_by(|&a, &b| {
+                evals[b]
+                    .partial_cmp(&evals[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(&b))
+            });
+
+            let max_ev = order
+                .first()
+                .map(|&idx| evals[idx].abs())
+                .unwrap_or(1.0)
+                .max(1.0);
+            let floor = (1e-12 * max_ev).max(1e-12);
+            let log_det = order
+                .iter()
+                .take(structural_rank)
+                .map(|&idx| evals[idx].max(floor).ln())
+                .sum();
+            Ok((structural_rank, log_det))
         }
 
         fn update_warm_start_from(&self, pr: &PirlsResult) {
@@ -4501,134 +4008,6 @@ pub mod internal {
         #[allow(dead_code)]
         pub(super) fn offset(&self) -> ArrayView1<'_, f64> {
             self.offset.view()
-        }
-
-        // Expose error tracking state to parent module
-        pub(super) fn consecutive_cost_error_count(&self) -> usize {
-            *self.consecutive_cost_errors.read().unwrap()
-        }
-
-        pub(super) fn last_cost_error_string(&self) -> Option<String> {
-            self.last_cost_error_msg.read().unwrap().clone()
-        }
-
-        /// Fast seed-screening surrogate for outer smoothing starts.
-        ///
-        /// Uses a reduced PIRLS budget to quickly reject clearly unstable seeds
-        /// (separation/divergence) and rank plausible starts before expensive
-        /// full LAML optimization.
-        pub(super) fn screen_seed_cost(
-            &self,
-            rho: &Array1<f64>,
-            max_inner_iterations: usize,
-        ) -> Result<f64, EstimationError> {
-            let mut quick_cfg = self.config.as_pirls_config();
-            quick_cfg.max_iterations = max_inner_iterations.clamp(3, 5);
-            quick_cfg.convergence_tolerance = (quick_cfg.convergence_tolerance * 50.0).max(1e-4);
-
-            let warm_start_holder = self.warm_start_beta.read().unwrap();
-            let warm_start_ref = if self.warm_start_enabled.load(Ordering::Relaxed) {
-                warm_start_holder.as_ref()
-            } else {
-                None
-            };
-
-            let (pirls_result, _) = pirls::fit_model_for_fixed_rho_matrix(
-                LogSmoothingParamsView::new(rho.view()),
-                &self.x,
-                self.offset.view(),
-                self.y,
-                self.weights,
-                &self.rs_list,
-                Some(&self.balanced_penalty_root),
-                Some(&self.reparam_invariant),
-                self.p,
-                &quick_cfg,
-                warm_start_ref,
-                self.coefficient_lower_bounds.as_ref(),
-                self.linear_constraints.as_ref(),
-                None,
-            )?;
-
-            match pirls_result.status {
-                pirls::PirlsStatus::Unstable => Err(EstimationError::PerfectSeparationDetected {
-                    iteration: pirls_result.iteration,
-                    max_abs_eta: pirls_result.max_abs_eta,
-                }),
-                pirls::PirlsStatus::MaxIterationsReached
-                    if pirls_result.last_gradient_norm > 20.0 =>
-                {
-                    Err(EstimationError::PirlsDidNotConverge {
-                        max_iterations: pirls_result.iteration,
-                        last_change: pirls_result.last_gradient_norm,
-                    })
-                }
-                _ => {
-                    if !pirls_result.last_gradient_norm.is_finite()
-                        || !pirls_result.max_abs_eta.is_finite()
-                        || pirls_result.max_abs_eta > 40.0
-                        || pirls_result.last_step_halving >= 20
-                    {
-                        return Err(EstimationError::PirlsDidNotConverge {
-                            max_iterations: pirls_result.iteration,
-                            last_change: pirls_result.last_gradient_norm,
-                        });
-                    }
-
-                    let dev_change = pirls_result.last_deviance_change;
-
-                    if matches!(self.config.link_function(), LinkFunction::Logit) {
-                        let n = pirls_result.final_mu.len().max(1) as f64;
-                        let sat_fraction = pirls_result
-                            .final_mu
-                            .iter()
-                            .filter(|&&m| m <= 1e-3 || m >= 1.0 - 1e-3)
-                            .count() as f64
-                            / n;
-                        let weight_collapse_fraction = pirls_result
-                            .final_weights
-                            .iter()
-                            .filter(|&&w| w <= 1e-8 || !w.is_finite())
-                            .count() as f64
-                            / n;
-                        if sat_fraction > 0.995 || weight_collapse_fraction > 0.98 {
-                            return Err(EstimationError::PerfectSeparationDetected {
-                                iteration: pirls_result.iteration,
-                                max_abs_eta: pirls_result.max_abs_eta,
-                            });
-                        }
-                    }
-
-                    // Partial LAML surrogate on a 3-5 iteration horizon.
-                    let mut partial =
-                        0.5 * pirls_result.deviance + 0.5 * pirls_result.stable_penalty_term;
-                    if self.config.firth_bias_reduction
-                        && matches!(self.config.link_function(), LinkFunction::Logit)
-                        && let Some(firth_log_det) = pirls_result.firth_log_det
-                    {
-                        partial -= firth_log_det;
-                    }
-
-                    // Favor seeds that already reduce objective cleanly without heavy
-                    // damping/halving pressure in the opening iterations.
-                    partial += 0.5 * pirls_result.last_step_halving as f64;
-                    partial += 0.05 * pirls_result.last_gradient_norm.min(200.0);
-                    partial += 0.1 * pirls_result.max_abs_eta.min(60.0);
-                    if !dev_change.is_finite() {
-                        partial += 500.0;
-                    } else if dev_change <= 0.0 {
-                        partial += 200.0;
-                    } else {
-                        partial -= 0.25 * dev_change.min(20.0);
-                    }
-
-                    if partial.is_finite() {
-                        Ok(partial)
-                    } else {
-                        Ok(f64::INFINITY)
-                    }
-                }
-            }
         }
 
         /// Runs the inner P-IRLS loop, caching the result.
@@ -4997,7 +4376,7 @@ pub mod internal {
                     // Nullspace dimension M_p is constant with respect to ρ.  Use it to profile φ
                     // following the standard REML identity φ = D_p / (n - M_p).
                     let (penalty_rank, log_det_s_plus) =
-                        self.penalty_rank_and_logdet_pos(&e_eval.t().dot(&e_eval), ridge_passport)?;
+                        self.fixed_subspace_penalty_rank_and_logdet(&e_eval, ridge_passport)?;
                     let p_eff_dim = h_eff.ncols();
                     let mp = p_eff_dim.saturating_sub(penalty_rank) as f64;
 
@@ -5077,7 +4456,7 @@ pub mod internal {
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
                     let (_penalty_rank, log_det_s) =
-                        self.penalty_rank_and_logdet_pos(&e_eval.t().dot(&e_eval), ridge_passport)?;
+                        self.fixed_subspace_penalty_rank_and_logdet(&e_eval, ridge_passport)?;
 
                     // Log-determinant of the effective Hessian.
                     // HESSIAN PASSPORT: Use the pre-computed h_total and its factorization
@@ -5117,7 +4496,7 @@ pub mod internal {
                     // Use the rank of the lambda-weighted transformed penalty root (e_transformed)
                     // to determine M_p with the transformed penalty basis.
                     let (penalty_rank, _) =
-                        self.penalty_rank_and_logdet_pos(&e_eval.t().dot(&e_eval), ridge_passport)?;
+                        self.fixed_subspace_penalty_rank_and_logdet(&e_eval, ridge_passport)?;
                     let p_eff_dim = h_eff.ncols();
                     let mp = p_eff_dim.saturating_sub(penalty_rank) as f64;
 
@@ -5192,207 +4571,6 @@ pub mod internal {
             }
         }
 
-        /// The state-aware closure method for the BFGS optimizer.
-        /// Accepts unconstrained parameters `z`, maps to bounded `rho = RHO_BOUND * tanh(z / RHO_BOUND)`.
-        pub fn cost_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
-            let eval_num = {
-                let mut count = self.eval_count.write().unwrap();
-                *count += 1;
-                *count
-            };
-            let verbose_opt = false;
-
-            // Map from unbounded z to bounded rho via rho = RHO_BOUND * tanh(z / RHO_BOUND)
-            let rho = LogSmoothingParams::new(z.mapv(|v| {
-                if v.is_finite() {
-                    let scaled = v / RHO_BOUND;
-                    RHO_BOUND * scaled.tanh()
-                } else {
-                    0.0
-                }
-            }));
-
-            // Attempt to compute the cost and gradient.
-            let cost_result = self.compute_cost(&rho);
-
-            match cost_result {
-                Ok(cost) if cost.is_finite() => {
-                    // Reset consecutive error counter on successful finite cost
-                    *self.consecutive_cost_errors.write().unwrap() = 0;
-                    match self.compute_gradient(&rho) {
-                        Ok(mut grad) => {
-                            maybe_audit_gradient(self, &rho, eval_num, &mut grad);
-                            // Projected/KKT handling at active bounds in rho-space
-                            project_rho_gradient(&rho, &mut grad);
-                            // Chain rule: dCost/dz = dCost/drho * drho/dz, where drho/dz|_{z=0} = 1
-                            let jac = jacobian_drho_dz_from_rho(&rho);
-                            let grad_z = &grad * &jac;
-                            let grad_norm = grad_z.dot(&grad_z).sqrt();
-                            let last_cost_before = *self.last_cost.read().unwrap();
-                            let status = if eval_num == 1 {
-                                "Initializing"
-                            } else if cost < last_cost_before {
-                                "Improving"
-                            } else {
-                                "Exploring"
-                            };
-                            let eval_state = if eval_num == 1 {
-                                "initial"
-                            } else if cost < last_cost_before {
-                                "accepted"
-                            } else {
-                                "trial"
-                            };
-                            if verbose_opt {
-                                crate::visualizer::update(
-                                    cost,
-                                    grad_norm,
-                                    status,
-                                    eval_num as f64,
-                                    eval_state,
-                                );
-                            }
-
-                            // --- Correct State Management: Only Update on Actual Improvement ---
-                            // Print summary every 50 steps to avoid spam (graph shows real-time anyway)
-                            const PRINT_INTERVAL: u64 = 50;
-                            let should_print = eval_num == 1 || eval_num % PRINT_INTERVAL == 0;
-
-                            if eval_num == 1 {
-                                if verbose_opt {
-                                    println!("\n[BFGS] Starting optimization...");
-                                    println!(
-                                        "  -> Initial Cost: {cost:.7} | Grad Norm: {grad_norm:.6e}"
-                                    );
-                                }
-                                *self.last_cost.write().unwrap() = cost;
-                                *self.last_grad_norm.write().unwrap() = grad_norm;
-                            } else if cost < *self.last_cost.read().unwrap() {
-                                let improvement = *self.last_cost.read().unwrap() - cost;
-                                if should_print && verbose_opt {
-                                    println!(
-                                        "[BFGS Step {eval_num}] Cost: {cost:.7} (Δ={improvement:.2e}) | Grad: {grad_norm:.6e}"
-                                    );
-                                }
-                                *self.last_cost.write().unwrap() = cost;
-                                *self.last_grad_norm.write().unwrap() = grad_norm;
-                            } else {
-                                // Trial step that didn't improve - only log every PRINT_INTERVAL
-                                if should_print && verbose_opt {
-                                    println!(
-                                        "[BFGS Step {eval_num}] Trial (no improvement) | Best: {:.7}",
-                                        *self.last_cost.read().unwrap()
-                                    );
-                                }
-                            }
-
-                            (cost, grad_z)
-                        }
-                        Err(e) => {
-                            if verbose_opt {
-                                println!(
-                                    "\n[BFGS FAILED Step #{eval_num}] -> Gradient calculation error: {e:?}"
-                                );
-                            }
-                            // Generate retreat gradient toward heavier smoothing in rho-space
-                            let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
-                            let jac = jacobian_drho_dz_from_rho(&rho);
-                            let retreat_gradient = &retreat_rho_grad * &jac;
-                            (f64::INFINITY, retreat_gradient)
-                        }
-                    }
-                }
-                // Special handling for infinite costs
-                Ok(cost) if cost.is_infinite() => {
-                    if verbose_opt {
-                        println!(
-                            "\n[BFGS Step #{eval_num}] -> Cost is infinite, computing retreat gradient"
-                        );
-                    }
-                    // Diagnostics: report which rho are at bounds
-                    if !rho.is_empty() {
-                        let at_lower: Vec<usize> = rho
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, &v)| {
-                                if v <= -RHO_BOUND + 1e-8 {
-                                    Some(i)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        let at_upper: Vec<usize> = rho
-                            .iter()
-                            .enumerate()
-                            .filter_map(
-                                |(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None },
-                            )
-                            .collect();
-                        if verbose_opt {
-                            eprintln!("  -> Rho bounds: lower={:?} upper={:?}", at_lower, at_upper);
-                        }
-                    }
-                    // Try to get a useful gradient direction to move away from problematic region
-                    let gradient = match self.compute_gradient(&rho) {
-                        Ok(grad) => grad,
-                        Err(_) => z.mapv(|v| {
-                            if v.is_finite() {
-                                v.signum().max(0.0) + 1.0
-                            } else {
-                                1.0
-                            }
-                        }),
-                    };
-                    let jac = jacobian_drho_dz_from_rho(&rho);
-                    let gradient = &gradient * &jac;
-                    let grad_norm = gradient.dot(&gradient).sqrt();
-                    if verbose_opt {
-                        println!("  -> Retreat gradient norm: {grad_norm:.6e}");
-                    }
-
-                    (cost, gradient)
-                }
-                // Explicitly handle underlying error to avoid swallowing details
-                Err(e) => {
-                    log::warn!(
-                        "[BFGS Step #{eval_num}] Underlying cost computation failed: {:?}. Retreating.",
-                        e
-                    );
-                    // Track consecutive errors so we can abort after repeated failures
-                    {
-                        let mut cnt = self.consecutive_cost_errors.write().unwrap();
-                        *cnt += 1;
-                    }
-                    *self.last_cost_error_msg.write().unwrap() = Some(format!("{:?}", e));
-                    if verbose_opt {
-                        println!(
-                            "\n[BFGS FAILED Step #{eval_num}] -> Cost computation failed. Optimizer will backtrack."
-                        );
-                    }
-                    // Generate retreat gradient toward heavier smoothing in rho-space
-                    let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
-                    let jac = jacobian_drho_dz_from_rho(&rho);
-                    let retreat_gradient = &retreat_rho_grad * &jac;
-                    (f64::INFINITY, retreat_gradient)
-                }
-                // Cost was non-finite or an error occurred.
-                _ => {
-                    if verbose_opt {
-                        println!(
-                            "\n[BFGS FAILED Step #{eval_num}] -> Cost is non-finite or errored. Optimizer will backtrack."
-                        );
-                    }
-
-                    // For infinite costs, compute a more informed gradient instead of zeros
-                    // Generate retreat gradient toward heavier smoothing in rho-space
-                    let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
-                    let jac = jacobian_drho_dz_from_rho(&rho);
-                    let retreat_gradient = &retreat_rho_grad * &jac;
-                    (f64::INFINITY, retreat_gradient)
-                }
-            }
-        }
         ///
         /// -------------------------------------------------------------------------
         /// Exact non-Laplace evidence identities (reference comments; not runtime path)
@@ -5598,31 +4776,12 @@ pub mod internal {
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-            if std::env::var("GAM_FORCE_FD_GRAD").ok().as_deref() == Some("1") {
-                return compute_fd_gradient_internal(self, p, false, false);
-            }
-            if self.gradient_consistency_force_fd.load(Ordering::Relaxed) {
-                return compute_fd_gradient_internal(self, p, false, false);
-            }
-            let disable_grad_gate =
-                std::env::var("GAM_DISABLE_GRAD_GATE").ok().as_deref() == Some("1");
-            if self.config.link_function() != LinkFunction::Identity
-                && (self.config.objective_consistent_fd_gradient || p.len() == 1)
-            {
-                // Single-penalty non-Gaussian problems can violate the local
-                // objective-trend sign relation under the current analytic
-                // gradient approximation. Use objective-consistent FD there.
-                return compute_fd_gradient_internal(self, p, false, false);
-            }
             // Get the converged P-IRLS result for the current rho (`p`)
             let bundle = match self.obtain_eval_bundle(p) {
                 Ok(bundle) => bundle,
-                Err(EstimationError::ModelIsIllConditioned { .. }) => {
+                Err(err @ EstimationError::ModelIsIllConditioned { .. }) => {
                     self.current_eval_bundle.write().unwrap().take();
-                    // Push toward heavier smoothing: larger rho
-                    // Minimizer steps along -grad, so use negative values
-                    let grad = p.mapv(|rho| -(rho.abs() + 1.0));
-                    return Ok(grad);
+                    return Err(err);
                 }
                 Err(e) => {
                     self.current_eval_bundle.write().unwrap().take();
@@ -5630,27 +4789,6 @@ pub mod internal {
                 }
             };
             let analytic = self.compute_gradient_with_bundle(p, &bundle)?;
-
-            if !disable_grad_gate
-                && self.config.link_function() != LinkFunction::Identity
-                && !self.gradient_consistency_force_fd.load(Ordering::Relaxed)
-                && p.len() > 1
-                && let Ok(fd_grad) = compute_fd_gradient_internal(self, p, false, false)
-                && let Some((rel_l2, max_abs, _, _)) = gradient_audit_stats(&analytic, &fd_grad)
-            {
-                let mismatch = rel_l2 > 5e-2 || max_abs > 1e-4;
-                if mismatch {
-                    self.gradient_consistency_force_fd
-                        .store(true, Ordering::Relaxed);
-                    log::warn!(
-                        "[GRAD GATE] switching to FD gradients for this fit (rel_l2={:.3e}, max_abs={:.3e})",
-                        rel_l2,
-                        max_abs
-                    );
-                    return Ok(fd_grad);
-                }
-            }
-
             Ok(analytic)
         }
 

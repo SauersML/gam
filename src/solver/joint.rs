@@ -25,12 +25,13 @@ use crate::construction::{
     stable_reparameterization_with_invariant_engine,
 };
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{fast_ab, fast_ata, fast_atb, fast_atv};
+use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::quadrature::QuadratureContext;
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use crate::types::LinkFunction;
 use crate::visualizer;
+use faer::Side;
 use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use wolfe_bfgs::BfgsSolution;
@@ -1183,6 +1184,59 @@ impl<'a> JointRemlState<'a> {
         Ok(-laml)
     }
 
+    fn fixed_subspace_logdet_for_penalty(
+        s_lambda: &Array2<f64>,
+        structural_rank: usize,
+        ridge: f64,
+    ) -> Result<f64, EstimationError> {
+        if structural_rank == 0 || s_lambda.nrows() == 0 || s_lambda.ncols() == 0 {
+            return Ok(0.0);
+        }
+        let rank = structural_rank.min(s_lambda.nrows()).min(s_lambda.ncols());
+        let mut s_eval = s_lambda.clone();
+        if ridge > 0.0 {
+            let d = s_eval.nrows().min(s_eval.ncols());
+            for i in 0..d {
+                s_eval[[i, i]] += ridge;
+            }
+        }
+
+        let (evals, _) = s_eval
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let mut order: Vec<usize> = (0..evals.len()).collect();
+        order.sort_by(|&a, &b| {
+            evals[b]
+                .partial_cmp(&evals[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        let max_ev: f64 = order
+            .first()
+            .map(|&idx| evals[idx].abs())
+            .unwrap_or(1.0_f64)
+            .max(1.0_f64);
+        let floor = (1e-12_f64 * max_ev).max(1e-12_f64);
+        Ok(order
+            .iter()
+            .take(rank)
+            .map(|&idx| evals[idx].max(floor).ln())
+            .sum())
+    }
+
+    fn structural_rank_from_penalty(s: &Array2<f64>) -> Result<usize, EstimationError> {
+        if s.nrows() == 0 || s.ncols() == 0 {
+            return Ok(0);
+        }
+        let (evals, _) = s
+            .clone()
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let max_ev = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let tol = if max_ev > 0.0 { max_ev * 1e-12 } else { 1e-12 };
+        Ok(evals.iter().filter(|&&ev| ev > tol).count())
+    }
+
     /// Compute LAML at the converged solution.
     /// Note: for nonlinear g(u), this uses a Gauss-Newton Hessian approximation.
     fn compute_laml_at_convergence(
@@ -1432,72 +1486,41 @@ impl<'a> JointRemlState<'a> {
         //     log|S_λ + δI| = log|S_λ|_+ + M_p * log(δ)   (when S_λ is rank-deficient).
         //   Using log|S_λ|_+ while also adding 0.5*δ||β||² in the quadratic term defines
         //   an incoherent objective and breaks the envelope-theorem simplification.
-        let base_log_det_s = if state.ridge_base_used > 0.0 {
-            use crate::faer_ndarray::FaerCholesky;
-            let p = base_reparam.s_transformed.nrows();
-            let mut s_ridge = base_reparam.s_transformed.clone();
-            for i in 0..p {
-                s_ridge[[i, i]] += state.ridge_base_used;
+        let base_rank_usize = base_reparam.e_transformed.nrows();
+        let base_rank = base_rank_usize as f64;
+        let base_log_det_s = match Self::fixed_subspace_logdet_for_penalty(
+            &base_reparam.s_transformed,
+            base_rank_usize,
+            state.ridge_base_used,
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("[LAML] Base penalty eigendecomposition failed");
+                return (f64::INFINITY, None);
             }
-            let chol = match s_ridge.clone().cholesky(Side::Lower) {
-                Ok(ch) => ch,
-                Err(_) => {
-                    eprintln!(
-                        "[LAML] Failed to factor S_base + ridge I (ridge={:.1e}); aborting cost.",
-                        state.ridge_base_used
-                    );
-                    return (f64::INFINITY, None);
-                }
-            };
-            2.0 * chol.diag().mapv(f64::ln).sum()
-        } else {
-            base_reparam.log_det
         };
-        let base_rank = base_reparam.e_transformed.nrows() as f64;
 
         let (link_log_det_s, link_rank) = if p_link > 0 {
-            let (eigs, _) = match link_penalty.clone().eigh(Side::Lower) {
-                Ok(res) => res,
+            let rank = match Self::structural_rank_from_penalty(&link_penalty) {
+                Ok(v) => v,
                 Err(_) => {
                     eprintln!("[LAML] Link penalty eigendecomposition failed");
                     return (f64::INFINITY, None);
                 }
             };
-            let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-            let tol = if max_eig > 0.0 {
-                max_eig * 1e-12
-            } else {
-                1e-12
-            };
-            let positive: Vec<f64> = eigs.iter().cloned().filter(|&ev| ev > tol).collect();
-            let rank = positive.len() as f64;
-            if state.ridge_link_used > 0.0 {
-                use crate::faer_ndarray::FaerCholesky;
-                // Use full log|λ S + δ I| to match the stabilized link solve.
-                let mut s_ridge = link_penalty.mapv(|v| v * lambda_link);
-                for i in 0..p_link {
-                    s_ridge[[i, i]] += state.ridge_link_used;
+            let s_link_lambda = link_penalty.mapv(|v| v * lambda_link);
+            let log_det = match Self::fixed_subspace_logdet_for_penalty(
+                &s_link_lambda,
+                rank,
+                state.ridge_link_used,
+            ) {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("[LAML] Link penalty eigendecomposition failed");
+                    return (f64::INFINITY, None);
                 }
-                let chol = match s_ridge.clone().cholesky(Side::Lower) {
-                    Ok(ch) => ch,
-                    Err(_) => {
-                        eprintln!(
-                            "[LAML] Failed to factor S_link*λ + ridge I (ridge={:.1e}); aborting cost.",
-                            state.ridge_link_used
-                        );
-                        return (f64::INFINITY, None);
-                    }
-                };
-                let log_det = 2.0 * chol.diag().mapv(f64::ln).sum();
-                (log_det, rank)
-            } else {
-                // Spectral log|λ*S|_+ = Σ log(λ*σ_i) for positive eigenvalues
-                let log_det = positive
-                    .iter()
-                    .map(|&ev| (lambda_link * ev).max(1e-300).ln())
-                    .sum::<f64>();
-                (log_det, rank)
-            }
+            };
+            (log_det, rank as f64)
         } else {
             (0.0, 0.0)
         };
@@ -2719,142 +2742,42 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
     };
     let seed_candidates =
         generate_rho_candidates(n_base + 1, heuristic_lambdas.as_deref(), &seed_config);
-    visualizer::set_stage("joint", "seed scan");
-    visualizer::set_progress("Seed scan", 0, Some(seed_candidates.len()));
-
-    // Bounded ρ optimization using tanh transformation (consistent with non-joint path)
-    // This prevents exp(ρ) overflow/underflow and keeps Hessians well-conditioned
+    // Bounded ρ optimization.
     const RHO_BOUND: f64 = 30.0;
 
-    fn rho_to_z(rho: &Array1<f64>) -> Array1<f64> {
-        rho.mapv(|r| {
-            let ratio = (r / RHO_BOUND).clamp(-0.9999, 0.9999);
-            RHO_BOUND * ratio.atanh()
-        })
-    }
-
-    fn z_to_rho(z: &Array1<f64>) -> Array1<f64> {
-        z.mapv(|v| RHO_BOUND * (v / RHO_BOUND).tanh())
-    }
-
-    fn drho_dz(rho: &Array1<f64>) -> Array1<f64> {
-        rho.mapv(|r| (1.0 - (r / RHO_BOUND).powi(2)).max(0.0))
-    }
-
     use wolfe_bfgs::Bfgs;
-    const SYM_VS_ASYM_MARGIN: f64 = 1.001;
-
-    let snapshot = JointRemlSnapshot::new(&reml_state);
-    let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
-    let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
-    let total_candidates = seed_candidates.len();
-    let mut finite_count = 0usize;
-    let mut inf_count = 0usize;
-    let mut fail_count = 0usize;
-
-    for (i, seed) in seed_candidates.iter().enumerate() {
-        visualizer::set_stage(
-            "joint",
-            &format!("seed scan {}/{}", i + 1, seed_candidates.len()),
-        );
-        visualizer::set_progress("Seed scan", i + 1, Some(seed_candidates.len()));
-        let cost = match reml_state.compute_cost(seed) {
-            Ok(c) if c.is_finite() => {
-                finite_count += 1;
-                c
-            }
-            Ok(_) => {
-                inf_count += 1;
-                continue;
-            }
-            Err(_) => {
-                fail_count += 1;
-                continue;
-            }
-        };
-
-        let is_symmetric = if seed.len() < 2 {
-            true
-        } else {
-            let first_val = seed[0];
-            seed.iter().all(|&val| (val - first_val).abs() < 1e-9)
-        };
-
-        if is_symmetric {
-            if cost < best_symmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
-                best_symmetric_seed = Some((seed.clone(), cost, i));
-            }
-        } else if cost < best_asymmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
-            best_asymmetric_seed = Some((seed.clone(), cost, i));
-        }
-    }
-    snapshot.restore(&mut reml_state);
-
-    eprintln!(
-        "[JOINT][Seed scan] candidates={} finite={} +inf={} failed={}",
-        total_candidates, finite_count, inf_count, fail_count
-    );
-
-    let pick_asym = match (best_asymmetric_seed.as_ref(), best_symmetric_seed.as_ref()) {
-        (Some((_, asym_cost, _)), Some((_, sym_cost, _))) => {
-            *asym_cost <= *sym_cost * SYM_VS_ASYM_MARGIN + 1e-6
-        }
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => false,
-    };
-
-    let mut candidate_plans: Vec<(String, Array1<f64>, Option<usize>, Option<f64>)> = Vec::new();
-    if pick_asym {
-        if let Some((rho, cost, idx)) = best_asymmetric_seed {
-            candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-        if let Some((rho, cost, idx)) = best_symmetric_seed {
-            candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
+    let mut candidate_plans: Vec<(String, Array1<f64>)> = if seed_candidates.is_empty() {
+        vec![("fallback-symmetric".to_string(), Array1::zeros(n_base + 1))]
     } else {
-        if let Some((rho, cost, idx)) = best_symmetric_seed {
-            candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-        if let Some((rho, cost, idx)) = best_asymmetric_seed {
-            candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-    }
-
-    if candidate_plans.is_empty() {
-        candidate_plans.push((
-            "fallback-symmetric".to_string(),
-            Array1::zeros(n_base + 1),
-            None,
-            None,
-        ));
-    }
+        seed_candidates
+            .into_iter()
+            .enumerate()
+            .map(|(i, rho)| (format!("seed_{i}"), rho))
+            .collect()
+    };
 
     let mut successful_runs: Vec<(String, BfgsSolution, f64)> = Vec::new();
     let mut last_error: Option<EstimationError> = None;
     let total_candidates = candidate_plans.len();
     let mut candidate_idx = 0usize;
+    let snapshot = JointRemlSnapshot::new(&reml_state);
 
-    for (label, rho, seed_idx, seed_cost) in candidate_plans {
+    for (label, rho) in candidate_plans.drain(..) {
         candidate_idx += 1;
         visualizer::set_stage("joint", &format!("candidate {label}"));
         visualizer::set_progress("Candidates", candidate_idx, Some(total_candidates));
-        if let Some(idx) = seed_idx {
-            eprintln!("[JOINT][Candidate {label}] Seed source index: {idx}");
-        }
-        if let Some(cost) = seed_cost {
-            eprintln!("[JOINT][Candidate {label}] Seed cost: {cost:.6}");
-        }
 
         snapshot.restore(&mut reml_state);
-        let initial_z = rho_to_z(&rho);
-        let mut solver = Bfgs::new(initial_z, |z| {
-            let rho = z_to_rho(z);
-            let (cost, grad_rho) = reml_state.cost_and_grad(&rho);
-            let jac = drho_dz(&rho);
-            let grad_z = &grad_rho * &jac;
-            (cost, grad_z)
+        let lower = Array1::<f64>::from_elem(rho.len(), -RHO_BOUND);
+        let upper = Array1::<f64>::from_elem(rho.len(), RHO_BOUND);
+        let mut solver = Bfgs::new(rho, |rho| {
+            let (cost, grad_rho) = reml_state.cost_and_grad(rho);
+            if !cost.is_finite() || grad_rho.iter().any(|g| !g.is_finite()) {
+                return (f64::INFINITY, Array1::<f64>::from_elem(rho.len(), f64::NAN));
+            }
+            (cost, grad_rho)
         })
+        .with_bounds(lower, upper, 1e-6)
         .with_tolerance(config.reml_tol)
         .with_max_iterations(config.max_reml_iter)
         .with_fp_tolerances(1e2, 1e2)
@@ -2893,7 +2816,7 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
             }
         };
 
-    let best_rho = z_to_rho(&best_solution.final_point);
+    let best_rho = best_solution.final_point;
     let _ = reml_state.compute_cost(&best_rho)?;
     Ok(reml_state.into_result())
 }
