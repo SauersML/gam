@@ -2752,6 +2752,17 @@ pub fn update_glm_vectors_integrated_by_family(
 
 /// Compute first/second eta derivatives of the PIRLS working curvature W(eta),
 /// consistent with the clamping/flooring used by `update_glm_vectors`.
+///
+/// Math note:
+/// - In the smooth interior (no clamps/floors active), `c[i]` and `d[i]` are
+///   classical derivatives of the diagonal PIRLS curvature W_i(eta):
+///     c_i = dW_i/dη_i,  d_i = d²W_i/dη_i².
+/// - These feed outer LAML derivatives through dH/dρ terms.
+/// - When clamps/floors activate (e.g. η saturation, μ near {0,1}, tiny weights),
+///   the update map is piecewise and no longer C². Setting c_i=d_i=0 is a
+///   practical subgradient-like choice to avoid unstable explosive derivatives.
+///   In that regime analytic and central-FD gradients can diverge because FD may
+///   straddle a kink.
 pub fn compute_working_weight_derivatives(
     link: LinkFunction,
     eta: &Array1<f64>,
@@ -2763,6 +2774,8 @@ pub fn compute_working_weight_derivatives(
     const MIN_WEIGHT: f64 = 1e-12;
     const MIN_D_FOR_Z: f64 = 1e-6;
     let n = eta.len();
+    let disable_logit_clamp_zero =
+        std::env::var("GAM_DIAG_NO_LOGIT_C_CLAMP").ok().as_deref() == Some("1");
     let mut c = Array1::<f64>::zeros(n);
     let mut d = Array1::<f64>::zeros(n);
     for i in 0..n {
@@ -2779,7 +2792,10 @@ pub fn compute_working_weight_derivatives(
                 let g = mu_i * (1.0 - mu_i); // dmu/deta
                 let clamped =
                     eta_i != eta_c || mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || g < MIN_WEIGHT;
-                if clamped {
+                if clamped && !disable_logit_clamp_zero {
+                    // Piecewise branch: treat derivative as zero on the clamped face.
+                    // This stabilizes outer derivatives but means c,d are not the
+                    // smooth-theory derivatives at that point.
                     c[i] = 0.0;
                     d[i] = 0.0;
                 } else {

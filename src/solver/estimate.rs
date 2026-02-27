@@ -1332,7 +1332,9 @@ where
         for &lvl in conservative_levels {
             let rho = lvl.clamp(lo, hi);
             let probe = Array1::from_elem(num_penalties, rho);
-            if let Ok(cost) = seed_screen_cost(context, &probe) && cost.is_finite() {
+            if let Ok(cost) = seed_screen_cost(context, &probe)
+                && cost.is_finite()
+            {
                 screened.push((usize::MAX, probe, cost));
             }
         }
@@ -1682,7 +1684,7 @@ where
         candidate_seeds
     };
     let near_stationary_tol = (cfg.reml_convergence_tolerance.max(1e-12)) * 2.0;
-    let use_newton = matches!(link, LinkFunction::Identity) && k <= 8;
+    let use_newton = true;
     for (label, initial_z) in candidate_seeds {
         let solution_result: Result<OuterSolveResult, EstimationError> = if use_newton {
             match run_newton_for_candidate(&label, &reml_state, &cfg, initial_z.clone()) {
@@ -3368,6 +3370,7 @@ pub mod internal {
         workspace: Mutex<RemlWorkspace>,
         pub(super) warm_start_beta: RwLock<Option<Coefficients>>,
         warm_start_enabled: AtomicBool,
+        gradient_consistency_force_fd: AtomicBool,
     }
 
     #[derive(Clone)]
@@ -3820,6 +3823,7 @@ pub mod internal {
                 workspace: Mutex::new(workspace),
                 warm_start_beta: RwLock::new(None),
                 warm_start_enabled: AtomicBool::new(true),
+                gradient_consistency_force_fd: AtomicBool::new(false),
             })
         }
 
@@ -3869,7 +3873,14 @@ pub mod internal {
                 .eigh(Side::Lower)
                 .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
             let max_eig = eigvals.iter().copied().fold(0.0_f64, f64::max);
-            let eig_threshold = (max_eig * EIG_REL_THRESHOLD).max(EIG_ABS_FLOOR);
+            // Non-Gaussian outer gradients consume trace(H^{-1} H_k) terms that are
+            // sensitive to dropped low modes. Since PIRLS already stabilizes H with a
+            // structural ridge, keep the full stabilized spectrum for these families.
+            let eig_threshold = if self.config.link_function() == LinkFunction::Identity {
+                (max_eig * EIG_REL_THRESHOLD).max(EIG_ABS_FLOOR)
+            } else {
+                EIG_ABS_FLOOR
+            };
 
             // Positive-part Hessian log-determinant convention:
             //   log|H|_+ = Σ_{λ_i(H) > τ} log λ_i(H),
@@ -4387,12 +4398,6 @@ pub mod internal {
                     }
 
                     let dev_change = pirls_result.last_deviance_change;
-                    if !dev_change.is_finite() || dev_change <= 0.0 {
-                        return Err(EstimationError::PirlsDidNotConverge {
-                            max_iterations: pirls_result.iteration,
-                            last_change: pirls_result.last_gradient_norm,
-                        });
-                    }
 
                     if matches!(self.config.link_function(), LinkFunction::Logit) {
                         let n = pirls_result.final_mu.len().max(1) as f64;
@@ -4431,7 +4436,13 @@ pub mod internal {
                     partial += 0.5 * pirls_result.last_step_halving as f64;
                     partial += 0.05 * pirls_result.last_gradient_norm.min(200.0);
                     partial += 0.1 * pirls_result.max_abs_eta.min(60.0);
-                    partial -= 0.5 * dev_change.min(50.0);
+                    if !dev_change.is_finite() {
+                        partial += 500.0;
+                    } else if dev_change <= 0.0 {
+                        partial += 200.0;
+                    } else {
+                        partial -= 0.25 * dev_change.min(20.0);
+                    }
 
                     if partial.is_finite() {
                         Ok(partial)
@@ -5390,6 +5401,14 @@ pub mod internal {
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+            if std::env::var("GAM_FORCE_FD_GRAD").ok().as_deref() == Some("1") {
+                return compute_fd_gradient_internal(self, p, false, false);
+            }
+            if self.gradient_consistency_force_fd.load(Ordering::Relaxed) {
+                return compute_fd_gradient_internal(self, p, false, false);
+            }
+            let disable_grad_gate =
+                std::env::var("GAM_DISABLE_GRAD_GATE").ok().as_deref() == Some("1");
             if self.config.link_function() != LinkFunction::Identity
                 && (self.config.objective_consistent_fd_gradient || p.len() == 1)
             {
@@ -5413,7 +5432,29 @@ pub mod internal {
                     return Err(e);
                 }
             };
-            self.compute_gradient_with_bundle(p, &bundle)
+            let analytic = self.compute_gradient_with_bundle(p, &bundle)?;
+
+            if !disable_grad_gate
+                && self.config.link_function() != LinkFunction::Identity
+                && !self.gradient_consistency_force_fd.load(Ordering::Relaxed)
+                && p.len() > 1
+                && let Ok(fd_grad) = compute_fd_gradient_internal(self, p, false, false)
+                && let Some((rel_l2, max_abs, _, _)) = gradient_audit_stats(&analytic, &fd_grad)
+            {
+                let mismatch = rel_l2 > 5e-2 || max_abs > 1e-4;
+                if mismatch {
+                    self.gradient_consistency_force_fd
+                        .store(true, Ordering::Relaxed);
+                    log::warn!(
+                        "[GRAD GATE] switching to FD gradients for this fit (rel_l2={:.3e}, max_abs={:.3e})",
+                        rel_l2,
+                        max_abs
+                    );
+                    return Ok(fd_grad);
+                }
+            }
+
+            Ok(analytic)
         }
 
         /// Helper function that computes gradient using a shared evaluation bundle
@@ -5566,7 +5607,17 @@ pub mod internal {
 
                 let n = self.y.len() as f64;
 
-                // Implement Wood (2011) exact REML/LAML gradient formulas
+                // -------------------------------------------------------------------------
+                // Math map to user derivation (Section A):
+                //   A.0: λ_k = exp(ρ_k), A_k = ∂S/∂ρ_k = λ_k S_k.
+                //   A.2: Envelope theorem at inner stationarity removes explicit dβ̂/dρ term
+                //        from the penalized-fit block.
+                //   A.3: Outer gradient assembly
+                //        ∂V/∂ρ_k = 0.5 β̂^T A_k β̂ + 0.5 tr(H_+^† H_k) - 0.5 tr(S_+^† A_k).
+                //   A.1/A.4: H_k differs by family:
+                //        Gaussian: H_k = A_k.
+                //        Non-Gaussian: H_k = A_k + d(X^T W(η̂) X)/dρ_k (third-derivative path).
+                // -------------------------------------------------------------------------
                 // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
 
                 match self.config.link_function() {
@@ -5696,8 +5747,20 @@ pub mod internal {
                             workspace.solved_rows = 0;
                         }
 
-                        // Gradient correction for spectral truncation (same as Logit path).
-                        // Error_k = 0.5 * λ_k * tr(M_⊥ * (U_⊥^T S_k U_⊥)) where M_⊥ = U_⊥^T H⁻¹ U_⊥.
+                        // A.1/A.5 (fixed positive-part subspace):
+                        // If log|H|_+ is evaluated on a fixed kept subspace projector P,
+                        // then d log|H|_+ = tr(H_+^† dH). When a complementary truncated
+                        // projector P_⊥ is tracked explicitly, this correction subtracts
+                        // the truncated-subspace leakage:
+                        //   Error_k = 0.5 * λ_k * tr(M_⊥ * (U_⊥^T S_k U_⊥)),
+                        //   M_⊥ = U_⊥^T H^{-1} U_⊥.
+                        //
+                        // Path/coordinate contract:
+                        //   u_truncated  <- ReparamResult.u_truncated
+                        //                 (constructed from q_null in terms/construction.rs)
+                        //   H, R_k       <- transformed-basis objects in this routine.
+                        // This term is valid only if U_⊥, H, and R_k are represented in
+                        // the same coefficient coordinate system.
                         let u_truncated_gauss = &reparam_result.u_truncated;
                         let truncated_count_gauss = u_truncated_gauss.ncols();
 
@@ -5817,7 +5880,7 @@ pub mod internal {
                             let d1 = lambdas[k] * beta_ref.dot(&s_k_beta_transformed);
                             let deviance_grad_term = dp_c_grad * (d1 / (2.0 * scale));
 
-                            // Component 2 derivation:
+                            // A.3/A.5 Component 2 derivation:
                             //   ∂/∂ρ_k [0.5 log|H|] = 0.5 tr(H^{-1} H_k),
                             // and for Gaussian identity H_k = A_k = λ_k S_k.
                             //
@@ -5848,7 +5911,7 @@ pub mod internal {
                                 0.0
                             };
 
-                            // Apply truncation correction to match truncated cost function
+                            // A.1 fixed-subspace correction for log|H|_+.
                             let corrected_log_det_h =
                                 log_det_h_grad_term - gaussian_corrections_ref[k];
 
@@ -5870,7 +5933,7 @@ pub mod internal {
                         applied_truncation_corrections = Some(gaussian_corrections);
                     }
                     _ => {
-                        // NON-GAUSSIAN LAML GRADIENT (exact in ρ, including dH/dρ third-derivative term)
+                        // NON-GAUSSIAN LAML GRADIENT (A.4 exact dH/dρ path)
                         //
                         // Objective:
                         //   V_LAML(ρ) =
@@ -5881,7 +5944,7 @@ pub mod internal {
                         //
                         // with H(ρ) = J(β̂(ρ)) + S(ρ), J = Xᵀ diag(b) X.
                         //
-                        // Exact gradient:
+                        // Exact gradient (cost minimization convention):
                         //   ∂V/∂ρ_k =
                         //     0.5 β̂ᵀ S_k^ρ β̂
                         //   - 0.5 tr(S^+ S_k^ρ)
@@ -5889,9 +5952,18 @@ pub mod internal {
                         //
                         // where:
                         //   S_k^ρ = λ_k S_k, λ_k = exp(ρ_k),
-                        //   v_k   = H^{-1}(S_k^ρ β̂),
-                        //   H_k   = S_k^ρ - Xᵀ diag(c ⊙ (X v_k)) X,
+                        //   b_k   = ∂β̂/∂ρ_k = -H^{-1}(S_k^ρ β̂),
+                        //   v_k   = H^{-1}(S_k^ρ β̂) = -b_k,
+                        //   H_k   = S_k^ρ + Xᵀ diag(w' ⊙ X b_k) X
+                        //         = S_k^ρ - Xᵀ diag(w' ⊙ (X v_k)) X,
                         // and c_i = -∂^3 ℓ_i / ∂η_i^3.
+                        //
+                        // Derivation anchor:
+                        //   V(ρ) = -ℓ(β̂) + 0.5 β̂ᵀ S β̂ + 0.5 log|H|_+ - 0.5 log|S|_+
+                        //   with stationarity g(β̂,ρ)=∂/∂β[-ℓ + 0.5 βᵀSβ]=0.
+                        // Envelope theorem removes explicit (∂V/∂β̂)(dβ̂/dρ_k) from the
+                        // penalized-fit block, but β̂-dependence still enters via dH/dρ_k.
+                        // The dH term is exactly what the third-derivative contraction encodes.
                         //
                         // The second term inside H_k is the exact "missing tensor term":
                         //   ∂H/∂ρ_k ≠ S_k^ρ
@@ -5959,6 +6031,10 @@ pub mod internal {
                                 // Keep analytic gradient as the optimizer default even when IRLS
                                 // weights are clamped, to avoid FD ridge-jitter artifacts in
                                 // line-search/BFGS updates.
+                                // Section B note:
+                                // hard clamps/floors make the objective only piecewise-smooth;
+                                // c_i values then act like a selected generalized derivative
+                                // (Clarke-subgradient style), so central FD may disagree at kinks.
                                 log::debug!(
                                     "[REML] IRLS weight clamp detected; continuing with analytic gradient"
                                 );
@@ -6001,7 +6077,10 @@ pub mod internal {
                             let w_pos = bundle.h_pos_factor_w.as_ref();
                             let n_obs = pirls_result.solve_mu.len();
 
-                            // c_i = dW_ii/deta_i for H = Xᵀ W X + S (exact for this objective surface).
+                            // c_i = dW_ii/dη_i for H = Xᵀ W X + S.
+                            // In smooth regimes this matches the required third-derivative object
+                            // in dH/dρ. In clamped/floored regimes c_i may behave like a subgradient
+                            // proxy rather than a classical derivative; see pirls.rs comments.
                             let c_vec = w_prime.clone();
 
                             // h_i = x_i^T H_+^\dagger x_i = ||(XW)_{i,*}||^2.
@@ -6051,6 +6130,8 @@ pub mod internal {
                             };
 
                             let mut trace_terms: Vec<f64> = Vec::with_capacity(k_count);
+                            let trace_mode = std::env::var("GAM_DIAG_TRACE_THIRD_MODE")
+                                .unwrap_or_else(|_| "minus".to_string());
                             for k_idx in 0..k_count {
                                 let r_k = &rs_transformed[k_idx];
                                 if r_k.ncols() == 0 || w_pos.ncols() == 0 {
@@ -6068,7 +6149,15 @@ pub mod internal {
                                 let v_k = v_all.column(k_idx);
                                 let trace_third = r_third.dot(&v_k);
 
-                                trace_terms.push(trace_h_inv_s_k - trace_third);
+                                // Diagnostic switch for term-by-term identification of
+                                // analytic-vs-FD disagreement. Production behavior is "minus",
+                                // matching the smooth-theory formula tr(H^{-1}A_k) - tr(H^{-1}Xᵀdiag(c⊙Xv_k)X).
+                                let trace_term = match trace_mode.as_str() {
+                                    "plus" => trace_h_inv_s_k + trace_third,
+                                    "zero" => trace_h_inv_s_k,
+                                    _ => trace_h_inv_s_k - trace_third,
+                                };
+                                trace_terms.push(trace_term);
                             }
 
                             // We do NOT need to set workspace.solved_rows as we aren't using the workspace solver.
@@ -6490,6 +6579,13 @@ pub mod internal {
             structural_rank: usize,
             ridge: f64,
         ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
+            // Section A.1/A.3 (penalty pseudo-logdet path):
+            //   det1[k] = ∂/∂ρ_k log|S(ρ)|_+ = tr(S_+^† A_k),
+            //   A_k = λ_k S_k, S_k = R_k^T R_k.
+            //
+            // This helper computes det1/det2 on a fixed-rank structural subspace to
+            // keep the objective differentiable w.r.t. ρ under the implemented
+            // positive-part convention (A+-fixed active subspace assumption).
             let k_count = lambdas.len();
             let p_dim = self.p;
             if k_count == 0 || structural_rank == 0 {
@@ -6504,6 +6600,7 @@ pub mod internal {
             let mut s_lambda = Array2::<f64>::zeros((p_dim, p_dim));
             for k in 0..k_count {
                 let r_k = &rs_transformed[k];
+                // Path: rs_transformed[k] is already in transformed coefficient frame.
                 let s_k = r_k.t().dot(r_k);
                 s_lambda += &s_k.mapv(|v| lambdas[k] * v);
                 s_k_full.push(s_k);
@@ -6549,6 +6646,7 @@ pub mod internal {
             let mut det1 = Array1::<f64>::zeros(k_count);
             for k in 0..k_count {
                 let s_kr = u1.t().dot(&s_k_full[k]).dot(&u1);
+                // tr(S_r^{-1} S_{k,r}) = tr(S_+^† S_k) on kept subspace.
                 let tr = kahan_sum((0..rank).map(|i| {
                     let mut acc = 0.0;
                     for j in 0..rank {
@@ -6556,6 +6654,7 @@ pub mod internal {
                     }
                     acc
                 }));
+                // A_k = λ_k S_k => tr(S_+^† A_k) = λ_k tr(S_+^† S_k).
                 det1[k] = lambdas[k] * tr;
                 s_k_reduced.push(s_kr);
             }
@@ -7229,6 +7328,10 @@ pub mod internal {
             // Check if truncated eigenspace corrections are adequate
             let u_truncated = &reparam.u_truncated;
             let truncated_count = u_truncated.ncols();
+            // Path/coordinate contract for diagnostics:
+            // - `u_truncated` comes from ReparamResult (q_null-derived storage path).
+            // - `h_eff` and `reparam.rs_transformed` are in transformed coordinates.
+            // If frames differ, bleed diagnostics report systematic mismatch.
 
             if truncated_count > 0
                 && let Some(applied_values) = applied_truncation_corrections

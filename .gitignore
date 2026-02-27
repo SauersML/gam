@@ -17,4 +17,13 @@ benchmarks/datasets/hgdp_1kg_pc_data.tsv
 bench/results*.json
 bench/results-shards/*.json
 bench/gam_bench_rust_cv_*/
+bench/gam_bench_*/
+bench/_profile*
+bench/artifacts/
+bench/tmp_debug/
+bench/ab_*/
+bench/diagf_*/
+bench/scenarios.*.json
+scripts/__pycache__/
+scripts/latest_benchmark_summary.md
 *.png

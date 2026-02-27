@@ -1,6 +1,7 @@
 use gam::{
-    CenterStrategy, FitOptions, LikelihoodFamily, MaternBasisSpec, MaternNu, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, fit_term_collection, predict_gam,
+    CenterStrategy, FitOptions, LikelihoodFamily, MaternBasisSpec, MaternIdentifiability,
+    MaternNu, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
+    fit_term_collection, predict_gam,
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -58,8 +59,9 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 34 },
                     length_scale: 0.95,
                     nu: MaternNu::FiveHalves,
-                    include_intercept: true,
+                    include_intercept: false,
                     double_penalty: true,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
                 },
             },
             shape: ShapeConstraint::None,

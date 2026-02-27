@@ -746,6 +746,43 @@ mod tests {
     }
 
     #[test]
+    fn family_dispatch_rejects_probit_for_nuts_entrypoint() {
+        let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
+        let y = array![1.0, 0.0, 1.0, 0.0];
+        let w = array![1.0, 1.0, 1.0, 1.0];
+        let penalty = array![[0.2, 0.0], [0.0, 0.4]];
+        let mode = array![0.0, 0.0];
+        let non_spd_hessian = array![[0.0, 0.0], [0.0, 0.0]];
+        let cfg = NutsConfig {
+            n_samples: 20,
+            n_warmup: 20,
+            n_chains: 2,
+            target_accept: 0.8,
+            seed: 654,
+        };
+
+        let err = run_nuts_sampling_flattened_family(
+            LikelihoodFamily::BinomialProbit,
+            FamilyNutsInputs::Glm(GlmFlatInputs {
+                x: x.view(),
+                y: y.view(),
+                weights: w.view(),
+                penalty_matrix: penalty.view(),
+                mode: mode.view(),
+                hessian: non_spd_hessian.view(),
+                firth_bias_reduction: false,
+            }),
+            &cfg,
+        )
+        .expect_err("probit family should not route through logit PG/NUTS dispatch");
+
+        assert!(
+            err.contains("BinomialProbit NUTS is not implemented yet"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn logit_pg_rao_blackwell_returns_finite_terms() {
         let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
         let y = array![1.0, 0.0, 1.0, 0.0];

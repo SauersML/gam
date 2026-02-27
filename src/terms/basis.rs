@@ -1526,8 +1526,36 @@ pub struct MaternBasisSpec {
     pub center_strategy: CenterStrategy,
     pub length_scale: f64,
     pub nu: MaternNu,
+    #[serde(default)]
     pub include_intercept: bool,
     pub double_penalty: bool,
+    #[serde(default)]
+    pub identifiability: MaternIdentifiability,
+}
+
+/// Per-smooth identifiability policy for Matérn kernel coefficients.
+///
+/// These constraints are geometric (center-based), so they are stable across
+/// train/predict and do not depend on response weights.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MaternIdentifiability {
+    /// Keep the unconstrained kernel coefficient space.
+    None,
+    /// Enforce `1^T alpha = 0` at center locations (removes constant drift).
+    CenterSumToZero,
+    /// Enforce orthogonality to `[1, c_1, ..., c_d]` at centers.
+    /// Use this when explicit linear terms should own global trends.
+    CenterLinearOrthogonal,
+    /// Freeze a fit-time transform `Z` so prediction cannot drift.
+    FrozenTransform { transform: Array2<f64> },
+}
+
+impl Default for MaternIdentifiability {
+    fn default() -> Self {
+        // Safe default with model intercepts: prevent kernel block from absorbing
+        // a global mean level.
+        Self::CenterSumToZero
+    }
 }
 
 /// Duchon null-space order. `0` matches fully-penalized Matérn-like behavior,
@@ -1564,6 +1592,7 @@ pub enum BasisMetadata {
         length_scale: f64,
         nu: MaternNu,
         include_intercept: bool,
+        identifiability_transform: Option<Array2<f64>>,
     },
     Duchon {
         centers: Array2<f64>,
@@ -2894,17 +2923,72 @@ pub fn build_matern_basis(
     spec: &MaternBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let k = centers.nrows();
+    let z_opt = match &spec.identifiability {
+        MaternIdentifiability::None => None,
+        MaternIdentifiability::CenterSumToZero => {
+            let q = Array2::<f64>::ones((k, 1));
+            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
+        }
+        MaternIdentifiability::CenterLinearOrthogonal => {
+            let q = polynomial_block_from_order(centers.view(), DuchonNullspaceOrder::Linear);
+            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
+        }
+        MaternIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != k {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen Matérn identifiability transform mismatch: centers={k}, transform rows={}",
+                    transform.nrows()
+                )));
+            }
+            Some(transform.clone())
+        }
+    };
+
+    // Build an unconstrained kernel block first, then apply center-based
+    // coefficient constraints in a deterministic way.
     let m = create_matern_spline_basis(
         data,
         centers.view(),
         spec.length_scale,
         spec.nu,
-        spec.include_intercept,
+        false,
     )?;
-    let penalties = vec![if spec.double_penalty {
-        with_fixed_shrinkage(&m.penalty_kernel, &m.penalty_ridge)
+    let (design, penalty_kernel, identifiability_transform) = if let Some(z) = z_opt {
+        let kernel_raw = m.basis.slice(s![.., 0..m.num_kernel_basis]).to_owned();
+        let kernel_constrained = fast_ab(&kernel_raw, &z);
+        let omega_raw = m
+            .penalty_kernel
+            .slice(s![0..m.num_kernel_basis, 0..m.num_kernel_basis])
+            .to_owned();
+        let omega_constrained = {
+            let zt_k = fast_atb(&z, &omega_raw);
+            fast_ab(&zt_k, &z)
+        };
+        let mut design = kernel_constrained;
+        if spec.include_intercept {
+            let n = design.nrows();
+            let p = design.ncols();
+            let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
+            design_with_intercept.slice_mut(s![.., 0..p]).assign(&design);
+            design_with_intercept.column_mut(p).fill(1.0);
+            design = design_with_intercept;
+        }
+        let total_cols = design.ncols();
+        let mut penalty = Array2::<f64>::zeros((total_cols, total_cols));
+        let kernel_cols = omega_constrained.ncols();
+        penalty
+            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&omega_constrained);
+        (design, penalty, Some(z))
     } else {
-        m.penalty_kernel.clone()
+        (m.basis, m.penalty_kernel, None)
+    };
+    let penalty_ridge = nullspace_shrinkage_penalty(&penalty_kernel)?;
+    let penalties = vec![if spec.double_penalty {
+        with_fixed_shrinkage(&penalty_kernel, &penalty_ridge)
+    } else {
+        penalty_kernel.clone()
     }];
     let nullspace_dims = vec![if spec.double_penalty {
         0
@@ -2914,7 +2998,7 @@ pub fn build_matern_basis(
         0
     }];
     Ok(BasisBuildResult {
-        design: m.basis,
+        design,
         penalties,
         nullspace_dims,
         metadata: BasisMetadata::Matern {
@@ -2922,6 +3006,7 @@ pub fn build_matern_basis(
             length_scale: spec.length_scale,
             nu: spec.nu,
             include_intercept: spec.include_intercept,
+            identifiability_transform,
         },
     })
 }
@@ -3161,21 +3246,19 @@ fn polynomial_block_from_order(
     }
 }
 
-fn kernel_constraint_nullspace(
-    knots: ArrayView2<'_, f64>,
-    order: DuchonNullspaceOrder,
+fn kernel_constraint_nullspace_from_matrix(
+    constraint_matrix: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    let k = knots.nrows();
-    let p_k = polynomial_block_from_order(knots, order);
-    if p_k.ncols() == 0 {
+    let k = constraint_matrix.nrows();
+    let q = constraint_matrix.ncols();
+    if q == 0 {
         return Ok(Array2::<f64>::eye(k));
     }
-    // Constraint system Q^T alpha = 0, where Q rows are polynomial basis
-    // functions evaluated at knot locations.
-    let p_k_t = p_k.t().to_owned(); // (d+1) x k
+    // Constraint system Q^T alpha = 0. The nullspace of Q^T gives feasible
+    // kernel coefficients that cannot represent constrained polynomial content.
+    let q_t = constraint_matrix.t().to_owned(); // q x k
 
-    use crate::faer_ndarray::FaerSvd;
-    let (_, singular_values, vt_opt) = p_k_t.svd(false, true).map_err(BasisError::LinalgError)?;
+    let (_, singular_values, vt_opt) = q_t.svd(false, true).map_err(BasisError::LinalgError)?;
     let vt = match vt_opt {
         Some(vt) => vt,
         None => return Err(BasisError::ConstraintNullspaceNotFound),
@@ -3188,13 +3271,19 @@ fn kernel_constraint_nullspace(
     let tol = (k as f64) * 1e-12 * max_sigma.max(1.0);
     let rank = singular_values.iter().filter(|&&sigma| sigma > tol).count();
     let z = if rank >= k {
-        // Fully constrained kernel (no wiggle block): valid pure-polynomial TPS.
         Array2::<f64>::zeros((k, 0))
     } else {
-        // Null-space basis Z for the feasible radial coefficients.
-        v.slice(s![.., rank..]).to_owned() // k x q
+        v.slice(s![.., rank..]).to_owned()
     };
     Ok(z)
+}
+
+fn kernel_constraint_nullspace(
+    knots: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+) -> Result<Array2<f64>, BasisError> {
+    let p_k = polynomial_block_from_order(knots, order);
+    kernel_constraint_nullspace_from_matrix(p_k.view())
 }
 
 /// Deterministically selects thin-plate knots via farthest-point sampling.
