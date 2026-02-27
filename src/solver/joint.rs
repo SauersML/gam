@@ -2065,26 +2065,25 @@ impl<'a> JointRemlState<'a> {
             let u_t_v = fast_atb(&h_vecs, &v_mat); // U' V
             let w_mat = fast_ab(&u_t_v, &h_vecs); // U' V U
 
-            // Apply diag(1/λ) on both sides and reconstruct
-            // Q_ij = Σ_k Σ_l (1/λ_k)(1/λ_l) U_ik W_kl U_jl
-            for k in 0..p_total {
-                let eig_k = h_eigs[k];
-                if eig_k > h_tol {
-                    let inv_k = 1.0 / eig_k;
-                    for l in 0..p_total {
-                        let eig_l = h_eigs[l];
-                        if eig_l > h_tol {
-                            let inv_l = 1.0 / eig_l;
-                            let scale = inv_k * inv_l * w_mat[[k, l]];
-                            for i in 0..p_total {
-                                for j in 0..p_total {
-                                    q_firth[[i, j]] += scale * h_vecs[[i, k]] * h_vecs[[j, l]];
-                                }
-                            }
-                        }
-                    }
+            // Apply pseudo-inverse eigenvalue scaling and reconstruct via matmuls:
+            //   Q = U (D^{-1} W D^{-1}) U^T,  D^{-1}_{ii}=1/λ_i for λ_i>tol else 0.
+            // This is algebraically identical to the previous 4-deep summation but
+            // reduces reconstruction from O(p^4) scalar updates to O(p^3) BLAS-style ops.
+            let mut inv_diag = Array1::<f64>::zeros(p_total);
+            for i in 0..p_total {
+                let eig = h_eigs[i];
+                if eig > h_tol {
+                    inv_diag[i] = 1.0 / eig;
                 }
             }
+            let mut m_mat = w_mat;
+            for k in 0..p_total {
+                for l in 0..p_total {
+                    m_mat[[k, l]] *= inv_diag[k] * inv_diag[l];
+                }
+            }
+            let um = fast_ab(&h_vecs, &m_mat); // U M
+            q_firth = fast_ab(&um, &h_vecs.t().to_owned()); // U M U^T
         }
 
         // Prepare basis derivatives for constraint sensitivity.

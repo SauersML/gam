@@ -6808,19 +6808,26 @@ pub mod internal {
                 return first_order;
             }
 
-            // Disable warm-start coupling while evaluating sigma points in parallel.
-            // This keeps point evaluations independent and deterministic.
-            struct WarmStartRestoreGuard<'a> {
+            // Disable warm-start and PIRLS-cache coupling while evaluating sigma
+            // points in parallel. Cache lookups/inserts use an exclusive lock in
+            // execute_pirls_if_needed(), so leaving cache enabled serializes this
+            // block under contention.
+            struct FlagRestoreGuard<'a> {
                 flag: &'a AtomicBool,
                 prev: bool,
             }
-            impl Drop for WarmStartRestoreGuard<'_> {
+            impl Drop for FlagRestoreGuard<'_> {
                 fn drop(&mut self) {
                     self.flag.store(self.prev, Ordering::SeqCst);
                 }
             }
+            let prev_cache = self.pirls_cache_enabled.swap(false, Ordering::SeqCst);
+            let _cache_guard = FlagRestoreGuard {
+                flag: &self.pirls_cache_enabled,
+                prev: prev_cache,
+            };
             let prev_warm_start = self.warm_start_enabled.swap(false, Ordering::SeqCst);
-            let _warm_start_guard = WarmStartRestoreGuard {
+            let _warm_start_guard = FlagRestoreGuard {
                 flag: &self.warm_start_enabled,
                 prev: prev_warm_start,
             };

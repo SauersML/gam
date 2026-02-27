@@ -348,13 +348,12 @@ fn solve_weighted_projection(
                     for b_ptr in a_ptr..end {
                         let b = col_idx[b_ptr];
                         let xb = vals[b_ptr];
-                        xtwx[[a, b]] += wi * xa * xb;
+                        let v = wi * xa * xb;
+                        xtwx[[a, b]] += v;
+                        if a != b {
+                            xtwx[[b, a]] += v;
+                        }
                     }
-                }
-            }
-            for a in 0..p {
-                for b in 0..a {
-                    xtwx[[a, b]] = xtwx[[b, a]];
                 }
             }
             (xtwx, xtwy)

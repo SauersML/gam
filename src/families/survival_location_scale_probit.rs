@@ -25,6 +25,14 @@ pub trait ResidualDistributionOps {
     fn pdf_second_derivative(&self, z: f64) -> f64;
 }
 
+#[derive(Clone, Copy)]
+struct DistributionEval {
+    cdf: f64,
+    pdf: f64,
+    pdf_derivative: f64,
+    pdf_second_derivative: f64,
+}
+
 impl ResidualDistributionOps for ResidualDistribution {
     fn cdf(&self, z: f64) -> f64 {
         match self {
@@ -86,6 +94,53 @@ impl ResidualDistributionOps for ResidualDistribution {
                 let s = self.cdf(z);
                 let f = s * (1.0 - s);
                 f * (1.0 - 6.0 * s + 6.0 * s * s)
+            }
+        }
+    }
+}
+
+impl ResidualDistribution {
+    #[inline]
+    fn eval_all(self, z: f64) -> DistributionEval {
+        match self {
+            ResidualDistribution::Gaussian => {
+                let cdf = normal_cdf_approx(z);
+                let pdf = normal_pdf(z);
+                let pdf_derivative = -z * pdf;
+                let pdf_second_derivative = (z * z - 1.0) * pdf;
+                DistributionEval {
+                    cdf,
+                    pdf,
+                    pdf_derivative,
+                    pdf_second_derivative,
+                }
+            }
+            ResidualDistribution::Gumbel => {
+                let ez = z.clamp(-40.0, 40.0).exp();
+                let emez = (-ez).exp();
+                let cdf = 1.0 - emez;
+                let pdf = ez * emez;
+                let pdf_derivative = pdf * (1.0 - ez);
+                let pdf_second_derivative = pdf * (1.0 - 3.0 * ez + ez * ez);
+                DistributionEval {
+                    cdf,
+                    pdf,
+                    pdf_derivative,
+                    pdf_second_derivative,
+                }
+            }
+            ResidualDistribution::Logistic => {
+                let zc = z.clamp(-40.0, 40.0);
+                let cdf = 1.0 / (1.0 + (-zc).exp());
+                let pdf = cdf * (1.0 - cdf);
+                let pdf_derivative = pdf * (1.0 - 2.0 * cdf);
+                let pdf_second_derivative = pdf * (1.0 - 6.0 * cdf + 6.0 * cdf * cdf);
+                DistributionEval {
+                    cdf,
+                    pdf,
+                    pdf_derivative,
+                    pdf_second_derivative,
+                }
             }
         }
     }
@@ -188,6 +243,77 @@ impl SurvivalLocationScaleProbitFamily {
     const BLOCK_TIME: usize = 0;
     const BLOCK_THRESHOLD: usize = 1;
     const BLOCK_LOG_SIGMA: usize = 2;
+
+    /// Hazard-like survival ratio and its first derivative.
+    ///
+    /// Let `F` be the CDF, `f = F'` the PDF, and `S = 1 - F` the survival
+    /// function so `S' = -f`.
+    ///
+    /// Define `r = f / S`. By quotient rule:
+    /// `r' = (f' S - f S') / S^2`.
+    /// Since `S' = -f`, this becomes:
+    /// `r' = f'/S + f^2/S^2 = f'/S + r^2`.
+    ///
+    /// Sign note: the `f'/S` term is strictly additive. A minus here is wrong.
+    fn survival_ratio_first_derivative(f: f64, fp: f64, s: f64) -> (f64, f64) {
+        let r = f / s;
+        let dr = (r * r) + fp / s;
+        (r, dr)
+    }
+
+    /// Second derivative of the survival ratio `r = f/S`.
+    ///
+    /// Starting from `r' = f'/S + r^2`:
+    /// `r'' = d/du[f'/S] + 2 r r'`.
+    /// With `S' = -f`, we get:
+    /// `d/du[f'/S] = f''/S + f' f / S^2`.
+    /// Therefore:
+    /// `r'' = 2 r r' + f''/S + f' f / S^2`.
+    ///
+    /// Equivalent expanded form:
+    /// `r'' = f''/S + 3 f f' / S^2 + 2 f^3 / S^3`.
+    fn survival_ratio_second_derivative(r: f64, dr: f64, f: f64, fp: f64, fpp: f64, s: f64) -> f64 {
+        (2.0 * r * dr) + (fpp / s + fp * f / (s * s))
+    }
+
+    /// Clamp-aware log-pdf and its first/second derivatives.
+    ///
+    /// The objective uses `log(max(f, MIN_PROB))`, so in the saturated region
+    /// `f <= MIN_PROB` the function is constant and derivatives must be zero.
+    fn clamped_log_pdf_with_derivatives(f: f64, fp: f64, fpp: f64) -> (f64, f64, f64) {
+        if f <= MIN_PROB {
+            (MIN_PROB.ln(), 0.0, 0.0)
+        } else {
+            let d1 = fp / f;
+            let d2 = fpp / f - d1 * d1;
+            (f.ln(), d1, d2)
+        }
+    }
+
+    /// Clamp-aware survival value and derivatives of `-log(clamp(S, MIN_PROB, 1))`.
+    ///
+    /// Returns `(S_clamped, r, dr, ddr)` where:
+    /// - `r   = d/du[-log S_clamped]`
+    /// - `dr  = d²/du²[-log S_clamped]`
+    /// - `ddr = d³/du³[-log S_clamped]`
+    ///
+    /// If `S` is clamped at either bound (`S <= MIN_PROB` or `S >= 1`), these
+    /// derivatives are all zero because the clamped log term is locally constant.
+    fn clamped_survival_neglog_derivatives(
+        raw_s: f64,
+        f: f64,
+        fp: f64,
+        fpp: f64,
+    ) -> (f64, f64, f64, f64) {
+        let s = raw_s.clamp(MIN_PROB, 1.0);
+        if raw_s <= MIN_PROB || raw_s >= 1.0 {
+            (s, 0.0, 0.0, 0.0)
+        } else {
+            let (r, dr) = Self::survival_ratio_first_derivative(f, fp, s);
+            let ddr = Self::survival_ratio_second_derivative(r, dr, f, fp, fpp, s);
+            (s, r, dr, ddr)
+        }
+    }
 }
 
 fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(), String> {
@@ -441,8 +567,12 @@ fn xt_diag_x(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
         }
         for a in 0..p {
             let xa = x[[i, a]];
-            for b in 0..p {
-                out[[a, b]] += wi * xa * x[[i, b]];
+            let wxa = wi * xa;
+            out[[a, a]] += wxa * x[[i, a]];
+            for b in (a + 1)..p {
+                let update = wxa * x[[i, b]];
+                out[[a, b]] += update;
+                out[[b, a]] += update;
             }
         }
     }
@@ -465,9 +595,9 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             return Err("survival probit-location-scale eta dimension mismatch".to_string());
         }
 
-        let h0 = eta_time.slice(s![0..n]).to_owned();
-        let h1 = eta_time.slice(s![n..2 * n]).to_owned();
-        let d_raw = eta_time.slice(s![2 * n..3 * n]).to_owned();
+        let h0 = eta_time.slice(s![0..n]);
+        let h1 = eta_time.slice(s![n..2 * n]);
+        let d_raw = eta_time.slice(s![2 * n..3 * n]);
 
         let (sigma, ds, d2s, _d3s) =
             bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
@@ -498,10 +628,19 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             let d = self.y[i].clamp(0.0, 1.0);
             let u0 = -h0[i] + q[i];
             let u1 = -h1[i] + q[i];
-            let phi0 = self.distribution.pdf(u0).max(MIN_PROB);
-            let phi1 = self.distribution.pdf(u1).max(MIN_PROB);
-            let s0 = (1.0 - self.distribution.cdf(u0)).clamp(MIN_PROB, 1.0);
-            let s1 = (1.0 - self.distribution.cdf(u1)).clamp(MIN_PROB, 1.0);
+            let v0 = self.distribution.eval_all(u0);
+            let v1 = self.distribution.eval_all(u1);
+            let f0 = v0.pdf;
+            let f1 = v1.pdf;
+            let fp0 = v0.pdf_derivative;
+            let fp1 = v1.pdf_derivative;
+            let fpp0 = v0.pdf_second_derivative;
+            let fpp1 = v1.pdf_second_derivative;
+            let raw_s0 = 1.0 - v0.cdf;
+            let raw_s1 = 1.0 - v1.cdf;
+            let (s0, r0, dr0, _ddr0) = Self::clamped_survival_neglog_derivatives(raw_s0, f0, fp0, fpp0);
+            let (s1, r1, dr1, _ddr1) = Self::clamped_survival_neglog_derivatives(raw_s1, f1, fp1, fpp1);
+            let (log_phi1, dlogphi1, d2logphi1) = Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1);
             let g = d_raw[i];
             if !g.is_finite() || g <= self.derivative_guard.max(1e-12) {
                 return Err(format!(
@@ -510,26 +649,18 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                 ));
             }
 
-            ll += w * (d * (phi1.ln() + g.ln()) + (1.0 - d) * s1.ln() - s0.ln());
+            ll += w * (d * (log_phi1 + g.ln()) + (1.0 - d) * s1.ln() - s0.ln());
 
-            let r0 = phi0 / s0;
-            let r1 = phi1 / s1;
-            let dr0 = (r0 * r0) - self.distribution.pdf_derivative(u0) / s0;
-            let dr1 = (r1 * r1) - self.distribution.pdf_derivative(u1) / s1;
-
-            // d(log phi)/du = phi'(u)/phi(u). For Gaussian this equals -u,
-            // but for Gumbel/Logistic it is distribution-specific.
-            let dlogphi1 = self.distribution.pdf_derivative(u1) / phi1;
-            // d²(log phi)/du² = phi''(u)/phi(u) - (phi'(u)/phi(u))².
-            // For Gaussian this equals -1.
-            let d2logphi1 =
-                self.distribution.pdf_second_derivative(u1) / phi1 - dlogphi1 * dlogphi1;
-
-            // q derivatives (shared by threshold/log-sigma blocks)
+            // q derivatives (shared by threshold/log-sigma blocks).
+            // Chain rule map:
+            //   u0 = -h0 + q, u1 = -h1 + q  =>  du0/dq = du1/dq = +1.
+            // So dℓ/dq and d²ℓ/dq² keep the same local signs as r', d²logphi/du².
             d1_q[i] = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));
             d2_q[i] = w * (dr0 + d * d2logphi1 + (1.0 - d) * (-dr1));
 
             // time block eta-derivatives
+            // BlockWorkingSet::ExactNewton stores H = -∂²ℓ/∂β² (PSD near optimum),
+            // which is why the row-wise second-derivative terms carry a leading minus.
             grad_time_eta_h0[i] = -w * r0;
             grad_time_eta_h1[i] = -w * (d * dlogphi1 + (1.0 - d) * (-r1));
             grad_time_eta_d[i] = w * d / g;
@@ -616,9 +747,9 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             return Err("survival probit-location-scale eta dimension mismatch".to_string());
         }
 
-        let h0 = eta_time.slice(s![0..n]).to_owned();
-        let h1 = eta_time.slice(s![n..2 * n]).to_owned();
-        let d_raw = eta_time.slice(s![2 * n..3 * n]).to_owned();
+        let h0 = eta_time.slice(s![0..n]);
+        let h1 = eta_time.slice(s![n..2 * n]);
+        let d_raw = eta_time.slice(s![2 * n..3 * n]);
 
         let (sigma, ds, d2s, d3s) =
             bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
@@ -644,26 +775,21 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             let d = self.y[i].clamp(0.0, 1.0);
             let u0 = -h0[i] + q[i];
             let u1 = -h1[i] + q[i];
-            let phi0 = self.distribution.pdf(u0).max(MIN_PROB);
-            let phi1 = self.distribution.pdf(u1).max(MIN_PROB);
-            let s0 = (1.0 - self.distribution.cdf(u0)).clamp(MIN_PROB, 1.0);
-            let s1 = (1.0 - self.distribution.cdf(u1)).clamp(MIN_PROB, 1.0);
-            let fp0 = self.distribution.pdf_derivative(u0);
-            let fp1 = self.distribution.pdf_derivative(u1);
-            let fpp0 = self.distribution.pdf_second_derivative(u0);
-            let fpp1 = self.distribution.pdf_second_derivative(u1);
-
-            let r0 = phi0 / s0;
-            let r1 = phi1 / s1;
-            let dr0 = (r0 * r0) - fp0 / s0;
-            let dr1 = (r1 * r1) - fp1 / s1;
-            let ddr0 = 2.0 * r0 * dr0 - (fpp0 / s0 + fp0 * phi0 / (s0 * s0));
-            let ddr1 = 2.0 * r1 * dr1 - (fpp1 / s1 + fp1 * phi1 / (s1 * s1));
-            // d(log phi)/du = phi'(u)/phi(u). For Gaussian this equals -u.
-            let dlogphi1 = fp1 / phi1;
-            // d²(log phi)/du² = phi''(u)/phi(u) - (phi'(u)/phi(u))².
-            // For Gaussian this equals -1.
-            let d2logphi1 = fpp1 / phi1 - dlogphi1 * dlogphi1;
+            let v0 = self.distribution.eval_all(u0);
+            let v1 = self.distribution.eval_all(u1);
+            let f0 = v0.pdf;
+            let f1 = v1.pdf;
+            let fp0 = v0.pdf_derivative;
+            let fp1 = v1.pdf_derivative;
+            let fpp0 = v0.pdf_second_derivative;
+            let fpp1 = v1.pdf_second_derivative;
+            let raw_s0 = 1.0 - v0.cdf;
+            let raw_s1 = 1.0 - v1.cdf;
+            let (_s0, r0, dr0, ddr0) =
+                Self::clamped_survival_neglog_derivatives(raw_s0, f0, fp0, fpp0);
+            let (_s1, r1, dr1, ddr1) =
+                Self::clamped_survival_neglog_derivatives(raw_s1, f1, fp1, fpp1);
+            let (_log_phi1, dlogphi1, d2logphi1) = Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1);
 
             // q-derivatives of the per-row log-likelihood contribution.
             // With u0=-h0+q, u1=-h1+q:
@@ -680,8 +806,12 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             // small error for Gumbel/Logistic in the Hessian directional derivative).
             d3_q[i] = w * (ddr0 + (1.0 - d) * (-ddr1));
 
-            // Time block contributions use u0/u1 direct dependence,
-            // while derivative row uses log(d_safe) term only for events.
+            // Time block contributions use u0/u1 direct dependence.
+            // Chain rule map:
+            //   du0/dh0 = -1, du1/dh1 = -1.
+            // Then BlockWorkingSet::ExactNewton uses H = -∂²ℓ/∂β², so one more
+            // leading minus appears when assembling per-row second derivatives.
+            // The derivative row uses log(d_safe) only for events.
             d_h_h0[i] = w * ddr0;
             d_h_h1[i] = -w * (1.0 - d) * ddr1;
             let g = d_raw[i];
@@ -1091,5 +1221,219 @@ mod tests {
         let age_entry = array![5.0, 1.0, 3.0];
         let idx = select_anchor_row(&age_entry, None).expect("select default anchor");
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn survival_ratio_derivatives_prefer_correct_signs() {
+        let dists = [
+            ResidualDistribution::Gaussian,
+            ResidualDistribution::Gumbel,
+            ResidualDistribution::Logistic,
+        ];
+        let zs = [-1.2, -0.5, 0.4, 0.6, 1.1];
+        let h = 1e-6_f64;
+        let tie_tol = 1e-12_f64;
+        let nondeg_tol = 1e-12_f64;
+        let mut saw_strict_dr = false;
+        let mut saw_strict_ddr = false;
+
+        for &dist in &dists {
+            for &z in &zs {
+                let r = |u: f64| {
+                    let f = dist.pdf(u);
+                    let s = 1.0 - dist.cdf(u);
+                    f / s
+                };
+                let dr_plus = |u: f64| {
+                    let f = dist.pdf(u);
+                    let s = 1.0 - dist.cdf(u);
+                    let fp = dist.pdf_derivative(u);
+                    let ratio = f / s;
+                    (ratio * ratio) + fp / s
+                };
+                let dr_minus = |u: f64| {
+                    let f = dist.pdf(u);
+                    let s = 1.0 - dist.cdf(u);
+                    let fp = dist.pdf_derivative(u);
+                    let ratio = f / s;
+                    (ratio * ratio) - fp / s
+                };
+                let ddr_plus = |u: f64| {
+                    let f = dist.pdf(u);
+                    let s = 1.0 - dist.cdf(u);
+                    let fp = dist.pdf_derivative(u);
+                    let fpp = dist.pdf_second_derivative(u);
+                    let ratio = f / s;
+                    let dr = (ratio * ratio) + fp / s;
+                    (2.0 * ratio * dr) + (fpp / s + fp * f / (s * s))
+                };
+                let ddr_minus = |u: f64| {
+                    let f = dist.pdf(u);
+                    let s = 1.0 - dist.cdf(u);
+                    let fp = dist.pdf_derivative(u);
+                    let fpp = dist.pdf_second_derivative(u);
+                    let ratio = f / s;
+                    let dr = (ratio * ratio) - fp / s;
+                    (2.0 * ratio * dr) - (fpp / s + fp * f / (s * s))
+                };
+
+                let dr_fd = (r(z + h) - r(z - h)) / (2.0 * h);
+                let ddr_fd = (dr_plus(z + h) - dr_plus(z - h)) / (2.0 * h);
+                let dr_plus_err = (dr_plus(z) - dr_fd).abs();
+                let dr_minus_err = (dr_minus(z) - dr_fd).abs();
+                let ddr_plus_err = (ddr_plus(z) - ddr_fd).abs();
+                let ddr_minus_err = (ddr_minus(z) - ddr_fd).abs();
+                let f = dist.pdf(z);
+                let s = 1.0 - dist.cdf(z);
+                let fp = dist.pdf_derivative(z);
+                let fpp = dist.pdf_second_derivative(z);
+                let dr_signal = (fp / s).abs();
+                let ddr_signal = (fpp / s + fp * f / (s * s)).abs();
+
+                if dr_signal > nondeg_tol {
+                    saw_strict_dr = true;
+                    assert!(
+                        dr_plus_err + tie_tol < dr_minus_err,
+                        "dr sign check failed for {:?} at z={}: plus_err={}, minus_err={}, signal={}",
+                        dist,
+                        z,
+                        dr_plus_err,
+                        dr_minus_err,
+                        dr_signal
+                    );
+                } else {
+                    // At stationary points (fp≈0), plus/minus formulas coincide to first order.
+                    assert!(
+                        (dr_plus_err - dr_minus_err).abs() <= tie_tol,
+                        "dr tie check failed for {:?} at z={}: plus_err={}, minus_err={}, signal={}",
+                        dist,
+                        z,
+                        dr_plus_err,
+                        dr_minus_err,
+                        dr_signal
+                    );
+                }
+
+                if ddr_signal > nondeg_tol {
+                    saw_strict_ddr = true;
+                    assert!(
+                        ddr_plus_err + tie_tol < ddr_minus_err,
+                        "ddr sign check failed for {:?} at z={}: plus_err={}, minus_err={}, signal={}",
+                        dist,
+                        z,
+                        ddr_plus_err,
+                        ddr_minus_err,
+                        ddr_signal
+                    );
+                } else {
+                    assert!(
+                        (ddr_plus_err - ddr_minus_err).abs() <= tie_tol,
+                        "ddr tie check failed for {:?} at z={}: plus_err={}, minus_err={}, signal={}",
+                        dist,
+                        z,
+                        ddr_plus_err,
+                        ddr_minus_err,
+                        ddr_signal
+                    );
+                }
+            }
+        }
+
+        assert!(saw_strict_dr, "expected at least one non-degenerate dr check");
+        assert!(saw_strict_ddr, "expected at least one non-degenerate ddr check");
+    }
+
+    #[test]
+    fn survival_ratio_helper_matches_closed_form_identities() {
+        let dists = [
+            ResidualDistribution::Gaussian,
+            ResidualDistribution::Gumbel,
+            ResidualDistribution::Logistic,
+        ];
+        let zs = [-1.4, -0.7, -0.1, 0.3, 0.9, 1.4];
+
+        for &dist in &dists {
+            for &z in &zs {
+                let f = dist.pdf(z);
+                let s = (1.0 - dist.cdf(z)).clamp(MIN_PROB, 1.0);
+                let fp = dist.pdf_derivative(z);
+                let fpp = dist.pdf_second_derivative(z);
+
+                let (r, dr) =
+                    SurvivalLocationScaleProbitFamily::survival_ratio_first_derivative(f, fp, s);
+                let ddr = SurvivalLocationScaleProbitFamily::survival_ratio_second_derivative(
+                    r, dr, f, fp, fpp, s,
+                );
+
+                let r_expected = f / s;
+                let dr_expected = (r_expected * r_expected) + fp / s;
+                let ddr_expected = (2.0 * r_expected * dr_expected) + (fpp / s + fp * f / (s * s));
+
+                assert!(
+                    (r - r_expected).abs() <= 1e-14,
+                    "r mismatch for {:?} at z={}: got {}, expected {}",
+                    dist,
+                    z,
+                    r,
+                    r_expected
+                );
+                assert!(
+                    (dr - dr_expected).abs() <= 1e-12,
+                    "dr mismatch for {:?} at z={}: got {}, expected {}",
+                    dist,
+                    z,
+                    dr,
+                    dr_expected
+                );
+                assert!(
+                    (ddr - ddr_expected).abs() <= 1e-10,
+                    "ddr mismatch for {:?} at z={}: got {}, expected {}",
+                    dist,
+                    z,
+                    ddr,
+                    ddr_expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clamped_log_pdf_derivatives_are_zero_in_saturated_region() {
+        let f = MIN_PROB * 0.1;
+        let fp = 3.0;
+        let fpp = -7.0;
+        let (logf, d1, d2) = SurvivalLocationScaleProbitFamily::clamped_log_pdf_with_derivatives(f, fp, fpp);
+        assert!((logf - MIN_PROB.ln()).abs() <= 1e-15);
+        assert_eq!(d1, 0.0);
+        assert_eq!(d2, 0.0);
+    }
+
+    #[test]
+    fn clamped_survival_neglog_derivatives_are_zero_on_clamp_bounds() {
+        // Lower clamp active.
+        let (s_low, r_low, dr_low, ddr_low) =
+            SurvivalLocationScaleProbitFamily::clamped_survival_neglog_derivatives(
+                MIN_PROB * 0.1,
+                0.2,
+                -0.3,
+                0.4,
+            );
+        assert_eq!(s_low, MIN_PROB);
+        assert_eq!(r_low, 0.0);
+        assert_eq!(dr_low, 0.0);
+        assert_eq!(ddr_low, 0.0);
+
+        // Upper clamp active.
+        let (s_high, r_high, dr_high, ddr_high) =
+            SurvivalLocationScaleProbitFamily::clamped_survival_neglog_derivatives(
+                1.1,
+                0.2,
+                -0.3,
+                0.4,
+            );
+        assert_eq!(s_high, 1.0);
+        assert_eq!(r_high, 0.0);
+        assert_eq!(dr_high, 0.0);
+        assert_eq!(ddr_high, 0.0);
     }
 }

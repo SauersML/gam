@@ -95,7 +95,7 @@ impl PenaltyBlocks {
             if block.lambda == 0.0 {
                 continue;
             }
-            let b = beta.slice(ndarray::s![block.range.clone()]).to_owned();
+            let b = beta.slice(ndarray::s![block.range.clone()]);
             let g = block.matrix.dot(&b);
             let mut dst = grad.slice_mut(ndarray::s![block.range.clone()]);
             dst += &(block.lambda * g);
@@ -105,6 +105,23 @@ impl PenaltyBlocks {
 
     pub fn hessian(&self, dim: usize) -> Array2<f64> {
         let mut h = Array2::zeros((dim, dim));
+        self.add_hessian_inplace(&mut h);
+        h
+    }
+
+    pub fn deviance(&self, beta: &Array1<f64>) -> f64 {
+        let mut value = 0.0;
+        for block in &self.blocks {
+            if block.lambda == 0.0 {
+                continue;
+            }
+            let b = beta.slice(ndarray::s![block.range.clone()]);
+            value += 0.5 * block.lambda * b.dot(&block.matrix.dot(&b));
+        }
+        value
+    }
+
+    pub fn add_hessian_inplace(&self, h: &mut Array2<f64>) {
         for block in &self.blocks {
             if block.lambda == 0.0 {
                 continue;
@@ -116,19 +133,6 @@ impl PenaltyBlocks {
                 }
             }
         }
-        h
-    }
-
-    pub fn deviance(&self, beta: &Array1<f64>) -> f64 {
-        let mut value = 0.0;
-        for block in &self.blocks {
-            if block.lambda == 0.0 {
-                continue;
-            }
-            let b = beta.slice(ndarray::s![block.range.clone()]).to_owned();
-            value += 0.5 * block.lambda * b.dot(&block.matrix.dot(&b));
-        }
-        value
     }
 }
 
@@ -285,6 +289,7 @@ impl WorkingModelSurvival {
                 "survival beta dimension mismatch".to_string(),
             ));
         }
+        let _ = self.spec;
 
         let n = self.x_exit.nrows();
         let p = self.x_exit.ncols();
@@ -414,13 +419,12 @@ impl WorkingModelSurvival {
         }
 
         let penalty_grad = self.penalties.gradient(beta);
-        let penalty_hessian = self.penalties.hessian(p);
         let penalty_dev = self.penalties.deviance(beta);
 
         let mut total_grad = grad;
         total_grad += &penalty_grad;
 
-        h += &penalty_hessian;
+        self.penalties.add_hessian_inplace(&mut h);
         const SURVIVAL_STABILIZATION_RIDGE: f64 = 1e-8;
         let ridge_used = SURVIVAL_STABILIZATION_RIDGE;
         for d in 0..p {
@@ -432,10 +436,7 @@ impl WorkingModelSurvival {
         // which correspond to 0.5 * ridge * ||beta||^2.
         let ridge_penalty = 0.5 * ridge_used * beta.dot(beta);
 
-        let mut deviance = 2.0 * nll;
-        if matches!(self.spec, SurvivalSpec::Crude) {
-            deviance *= 1.0;
-        }
+        let deviance = 2.0 * nll;
 
         Ok(WorkingState {
             eta: LinearPredictor::new(eta_exit),
@@ -509,13 +510,32 @@ impl WorkingModelSurvival {
     ) -> Result<(f64, Array1<f64>), EstimationError> {
         let p = beta.len();
         let k_count = self.penalties.blocks.len();
-        if k_count == 0 {
-            return Ok((0.5 * state.deviance, Array1::zeros(0)));
-        }
         if state.hessian.nrows() != p || state.hessian.ncols() != p {
             return Err(EstimationError::LayoutError(
                 "survival laml gradient: Hessian/beta dimension mismatch".to_string(),
             ));
+        }
+
+        // Robust logdet for H: Cholesky on SPD path, eigen fallback otherwise.
+        let logdet_h = if let Ok(chol) = state.hessian.clone().cholesky(Side::Lower) {
+            let l = chol.lower_triangular();
+            2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>()
+        } else {
+            let (eval, _) = state
+                .hessian
+                .eigh(Side::Lower)
+                .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+            let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+            let tol = (max_eval * 1e-12).max(1e-14);
+            eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum()
+        };
+
+        if k_count == 0 {
+            // With no penalty blocks, S=0 and log|S|_+ = 0 by convention.
+            // Keep objective consistent with the documented form:
+            //   0.5*deviance + penalty_term + 0.5*log|H|.
+            let objective = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h;
+            return Ok((objective, Array1::zeros(0)));
         }
 
         // Reuse one symmetric factorization for all H^{-1} applications.
@@ -605,20 +625,6 @@ impl WorkingModelSurvival {
                 }
             }
         }
-
-        // Robust logdet for H: Cholesky on SPD path, eigen fallback otherwise.
-        let logdet_h = if let Ok(chol) = state.hessian.clone().cholesky(Side::Lower) {
-            let l = chol.lower_triangular();
-            2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>()
-        } else {
-            let (eval, _) = state
-                .hessian
-                .eigh(Side::Lower)
-                .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
-            let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-            let tol = (max_eval * 1e-12).max(1e-14);
-            eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum()
-        };
 
         // Use the same inner objective components reported by update_state:
         //   0.5 * deviance + penalty_term.
@@ -860,26 +866,22 @@ where
             //   integral [ d h_d * S_total - h_d * S_total * d H_d ] du
             if inst_hazard_d > 0.0 {
                 let weight = w * s_total * half_width;
-                let mut grad_contrib = design_d.mapv(|v| inst_hazard_d * (1.0 - hazard_d) * v);
-                grad_contrib.zip_mut_with(&deriv_d, |g, &d| {
-                    *g += hazard_d * d;
-                });
-                grad_contrib.zip_mut_with(&design_d_t0, |g, &x0| {
-                    *g += inst_hazard_d * h_dis_t0 * x0;
-                });
-                grad_contrib.mapv_inplace(|v| v * weight);
-                disease_gradient += &grad_contrib;
+                for j in 0..coeff_len_d {
+                    let mut g = inst_hazard_d * (1.0 - hazard_d) * design_d[j];
+                    g += hazard_d * deriv_d[j];
+                    g += inst_hazard_d * h_dis_t0 * design_d_t0[j];
+                    disease_gradient[j] += weight * g;
+                }
             }
 
             // d Risk / d beta_m:
             //   -integral h_d * S_total * d H_m(u|t0) du
             if inst_hazard_d > 0.0 && hazard_m > 0.0 {
                 let weight = w * inst_hazard_d * s_total * half_width;
-                let mut mort_grad_contrib = design_m.mapv(|v| -weight * hazard_m * v);
-                mort_grad_contrib.zip_mut_with(&design_m_t0, |g, &x0| {
-                    *g += weight * h_mor_t0 * x0;
-                });
-                mortality_gradient += &mort_grad_contrib;
+                for j in 0..coeff_len_m {
+                    let g = -hazard_m * design_m[j] + h_mor_t0 * design_m_t0[j];
+                    mortality_gradient[j] += weight * g;
+                }
             }
         }
     }
@@ -1176,6 +1178,83 @@ mod tests {
             .laml_objective_and_rho_gradient(&beta_hat, &state)
             .expect("analytic laml objective/gradient");
         (obj, grad, beta_hat)
+    }
+
+    #[test]
+    fn laml_no_penalties_matches_documented_objective() {
+        let age_entry = array![40.0, 45.0, 50.0, 55.0];
+        let age_exit = array![44.0, 49.0, 54.0, 59.0];
+        let event_target = array![1u8, 0u8, 1u8, 0u8];
+        let event_competing = Array1::<u8>::zeros(4);
+        let sample_weight = Array1::ones(4);
+        let x_entry = array![
+            [1.0, -0.2, 0.04],
+            [1.0, -0.1, 0.01],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.1, 0.01]
+        ];
+        let x_exit = array![
+            [1.0, -0.12, 0.0144],
+            [1.0, -0.02, 0.0004],
+            [1.0, 0.08, 0.0064],
+            [1.0, 0.18, 0.0324]
+        ];
+        let x_derivative = array![
+            [0.0, 0.02, 0.001],
+            [0.0, 0.02, 0.001],
+            [0.0, 0.02, 0.001],
+            [0.0, 0.02, 0.001]
+        ];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 1e-8,
+        };
+        let beta = array![-2.0, 0.7, 0.2];
+
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct survival model");
+
+        let state = model.update_state(&beta).expect("state at beta");
+        let (obj, grad) = model
+            .laml_objective_and_rho_gradient(&beta, &state)
+            .expect("laml objective for no-penalty model");
+
+        let logdet_h = if let Ok(chol) = state.hessian.clone().cholesky(Side::Lower) {
+            let l = chol.lower_triangular();
+            2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>()
+        } else {
+            let (eval, _) = state
+                .hessian
+                .eigh(Side::Lower)
+                .expect("eigh fallback for hessian logdet");
+            let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+            let tol = (max_eval * 1e-12).max(1e-14);
+            eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum()
+        };
+        let expected = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h;
+
+        assert_eq!(grad.len(), 0);
+        assert!(
+            (obj - expected).abs() < 1e-10,
+            "no-penalty LAML objective mismatch: obj={} expected={}",
+            obj,
+            expected
+        );
     }
 
     #[test]
