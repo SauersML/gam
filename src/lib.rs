@@ -53,16 +53,17 @@ pub use inference::generative::{
 };
 pub use solver::estimate::{
     CoefficientUncertaintyResult, FitArtifacts, FitOptions, FitResult, InferenceCovarianceMode,
-    MeanIntervalMethod, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
+    MeanIntervalMethod, PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions,
+    PredictUncertaintyResult,
     coefficient_uncertainty, coefficient_uncertainty_with_mode, fit_gam, optimize_external_design,
-    predict_gam, predict_gam_with_uncertainty,
+    predict_gam, predict_gam_posterior_mean, predict_gam_with_uncertainty,
 };
 pub use terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
     BasisBuildResult, BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
     DuchonSplineBasis, MaternBasisSpec, MaternIdentifiability, MaternNu, MaternSplineBasis,
-    ThinPlateBasisSpec, ThinPlateSplineBasis, build_bspline_basis_1d, build_duchon_basis,
-    build_matern_basis, build_thin_plate_basis, create_duchon_spline_basis,
+    SpatialIdentifiability, ThinPlateBasisSpec, ThinPlateSplineBasis, build_bspline_basis_1d,
+    build_duchon_basis, build_matern_basis, build_thin_plate_basis, create_duchon_spline_basis,
     create_matern_spline_basis, create_thin_plate_spline_basis,
     create_thin_plate_spline_basis_with_knot_count, select_thin_plate_knots,
 };

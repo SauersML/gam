@@ -3227,11 +3227,12 @@ pub fn predict_joint(
             LinkFunction::Logit => (0..n)
                 .map(|i| crate::quadrature::logit_posterior_mean(&quad_ctx, eta_cal[i], eff_se[i]))
                 .collect::<Array1<f64>>(),
-            LinkFunction::Probit => eta_cal.mapv(normal_cdf_approx),
-            LinkFunction::CLogLog => eta_cal.mapv(|e| {
-                let e = e.clamp(-30.0, 30.0);
-                1.0 - (-(e.exp())).exp()
-            }),
+            LinkFunction::Probit => (0..n)
+                .map(|i| crate::quadrature::probit_posterior_mean(eta_cal[i], eff_se[i]))
+                .collect::<Array1<f64>>(),
+            LinkFunction::CLogLog => (0..n)
+                .map(|i| crate::quadrature::cloglog_posterior_mean(&quad_ctx, eta_cal[i], eff_se[i]))
+                .collect::<Array1<f64>>(),
             LinkFunction::Identity => eta_cal.clone(),
         };
 

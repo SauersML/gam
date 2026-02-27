@@ -1,6 +1,7 @@
 use crate::faer_ndarray::FaerCholesky;
 use crate::faer_ndarray::{FaerArrayView, FaerEigh, fast_ata, fast_atv};
 use crate::matrix::DesignMatrix;
+use crate::pirls::LinearInequalityConstraints;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
@@ -90,6 +91,17 @@ pub trait CustomFamily {
         Ok(beta)
     }
 
+    /// Optional linear inequality constraints for a block update:
+    /// `A * beta_block >= b`.
+    fn block_linear_constraints(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _block_idx: usize,
+        _spec: &ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        Ok(None)
+    }
+
     /// Optional exact directional derivative of a block's ExactNewton Hessian.
     ///
     /// Returns `Some(dH)` where:
@@ -143,6 +155,7 @@ impl Default for BlockwiseFitOptions {
 #[derive(Clone)]
 pub struct BlockwiseInnerResult {
     pub block_states: Vec<ParameterBlockState>,
+    pub active_sets: Vec<Option<Vec<usize>>>,
     pub log_likelihood: f64,
     pub penalty_value: f64,
     pub cycles: usize,
@@ -152,11 +165,19 @@ pub struct BlockwiseInnerResult {
 }
 
 #[derive(Clone)]
+struct ConstrainedWarmStart {
+    rho: Array1<f64>,
+    block_beta: Vec<Array1<f64>>,
+    active_sets: Vec<Option<Vec<usize>>>,
+}
+
+#[derive(Clone)]
 pub struct BlockwiseFitResult {
     pub block_states: Vec<ParameterBlockState>,
     pub log_likelihood: f64,
     pub log_lambdas: Array1<f64>,
     pub lambdas: Array1<f64>,
+    pub covariance_conditional: Option<Array2<f64>>,
     pub penalized_objective: f64,
     pub outer_iterations: usize,
     pub inner_cycles: usize,
@@ -513,6 +534,216 @@ fn solve_spd_system_with_policy(
     Err("exact-newton block solve failed after ridge retries".to_string())
 }
 
+fn solve_kkt_step(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+    active_a: &Array2<f64>,
+) -> Result<(Array1<f64>, Array1<f64>), String> {
+    let p = hessian.nrows();
+    if hessian.ncols() != p || gradient.len() != p || active_a.ncols() != p {
+        return Err("constrained KKT step: dimension mismatch".to_string());
+    }
+    let m = active_a.nrows();
+    if m == 0 {
+        let p = gradient.len();
+        let h_view = FaerArrayView::new(hessian);
+        let mut rhs_mat = FaerMat::zeros(p, 1);
+        for i in 0..p {
+            rhs_mat[(i, 0)] = -gradient[i];
+        }
+        if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+            ch.solve_in_place(rhs_mat.as_mut());
+        } else if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+            ld.solve_in_place(rhs_mat.as_mut());
+        } else {
+            let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
+            lb.solve_in_place(rhs_mat.as_mut());
+        }
+        let mut direction = Array1::<f64>::zeros(p);
+        for i in 0..p {
+            direction[i] = rhs_mat[(i, 0)];
+        }
+        if !direction.iter().all(|v| v.is_finite()) {
+            return Err("constrained unconstrained-step solve produced non-finite values".to_string());
+        }
+        return Ok((direction, Array1::zeros(0)));
+    }
+
+    let mut kkt = Array2::<f64>::zeros((p + m, p + m));
+    kkt.slice_mut(ndarray::s![0..p, 0..p]).assign(hessian);
+    kkt.slice_mut(ndarray::s![0..p, p..(p + m)])
+        .assign(&active_a.t());
+    kkt.slice_mut(ndarray::s![p..(p + m), 0..p]).assign(active_a);
+
+    let mut rhs = Array1::<f64>::zeros(p + m);
+    for i in 0..p {
+        rhs[i] = -gradient[i];
+    }
+
+    let kkt_view = FaerArrayView::new(&kkt);
+    let lb = FaerLblt::new(kkt_view.as_ref(), Side::Lower);
+    let mut rhs_mat = FaerMat::zeros(p + m, 1);
+    for i in 0..(p + m) {
+        rhs_mat[(i, 0)] = rhs[i];
+    }
+    lb.solve_in_place(rhs_mat.as_mut());
+
+    let mut direction = Array1::<f64>::zeros(p);
+    let mut lambda = Array1::<f64>::zeros(m);
+    for i in 0..p {
+        direction[i] = rhs_mat[(i, 0)];
+    }
+    for i in 0..m {
+        lambda[i] = rhs_mat[(p + i, 0)];
+    }
+    if !direction.iter().all(|v| v.is_finite()) || !lambda.iter().all(|v| v.is_finite()) {
+        return Err("constrained KKT step produced non-finite values".to_string());
+    }
+    Ok((direction, lambda))
+}
+
+fn check_linear_feasibility(
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    tol: f64,
+) -> Result<(), String> {
+    if constraints.a.ncols() != beta.len() || constraints.a.nrows() != constraints.b.len() {
+        return Err("linear constraints: shape mismatch".to_string());
+    }
+    let slack = constraints.a.dot(beta) - &constraints.b;
+    let mut worst = 0.0_f64;
+    let mut worst_idx = 0usize;
+    for (i, &s) in slack.iter().enumerate() {
+        let v = (-s).max(0.0);
+        if v > worst {
+            worst = v;
+            worst_idx = i;
+        }
+    }
+    if worst > tol {
+        return Err(format!(
+            "infeasible iterate: max(Aβ-b violation)={worst:.3e} at constraint row {worst_idx}"
+        ));
+    }
+    Ok(())
+}
+
+fn solve_quadratic_with_linear_constraints(
+    hessian: &Array2<f64>,
+    rhs: &Array1<f64>,
+    beta_start: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    warm_active_set: Option<&[usize]>,
+) -> Result<(Array1<f64>, Vec<usize>), String> {
+    let p = hessian.nrows();
+    let m = constraints.a.nrows();
+    if hessian.ncols() != p || rhs.len() != p || beta_start.len() != p {
+        return Err("constrained quadratic solve: system dimension mismatch".to_string());
+    }
+    if constraints.a.ncols() != p || constraints.b.len() != m {
+        return Err("constrained quadratic solve: constraint dimension mismatch".to_string());
+    }
+    let tol_active = 1e-10;
+    let tol_step = 1e-12;
+    let tol_dual = 1e-10;
+    let feas_tol = 1e-8;
+
+    check_linear_feasibility(beta_start, constraints, feas_tol)?;
+
+    // Fast path: unconstrained optimum is feasible.
+    if let Ok(beta_unc) = solve_spd_system_with_policy(
+        hessian,
+        rhs,
+        0.0,
+        RidgePolicy::explicit_stabilization_pospart(),
+    ) {
+        let slack = constraints.a.dot(&beta_unc) - &constraints.b;
+        if slack.iter().all(|&s| s >= -feas_tol) {
+            return Ok((beta_unc, Vec::new()));
+        }
+    }
+
+    let mut x = beta_start.to_owned();
+    let mut slack = constraints.a.dot(&x) - &constraints.b;
+    let mut active: Vec<usize> = Vec::new();
+    let mut is_active = vec![false; m];
+    if let Some(seed) = warm_active_set {
+        for &idx in seed {
+            if idx < m && !is_active[idx] {
+                active.push(idx);
+                is_active[idx] = true;
+            }
+        }
+    }
+    for i in 0..m {
+        if slack[i] <= tol_active && !is_active[i] {
+            active.push(i);
+            is_active[i] = true;
+        }
+    }
+    for &idx in &active {
+        is_active[idx] = true;
+    }
+
+    for _ in 0..((p + m + 8) * 4) {
+        let gradient = hessian.dot(&x) - rhs;
+        let mut a_w = Array2::<f64>::zeros((active.len(), p));
+        for (r, &idx) in active.iter().enumerate() {
+            a_w.row_mut(r).assign(&constraints.a.row(idx));
+        }
+        let (direction, lambda) = solve_kkt_step(hessian, &gradient, &a_w)?;
+        let step_norm = direction.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if step_norm <= tol_step {
+            if active.is_empty() {
+                return Ok((x, active));
+            }
+            let mut most_positive = tol_dual;
+            let mut remove_pos: Option<usize> = None;
+            for (pos, &lam) in lambda.iter().enumerate() {
+                if lam > most_positive {
+                    most_positive = lam;
+                    remove_pos = Some(pos);
+                }
+            }
+            if let Some(pos) = remove_pos {
+                let idx = active.remove(pos);
+                is_active[idx] = false;
+                continue;
+            }
+            return Ok((x, active));
+        }
+
+        let mut alpha = 1.0_f64;
+        let mut entering: Option<usize> = None;
+        for i in 0..m {
+            if is_active[i] {
+                continue;
+            }
+            let ai = constraints.a.row(i);
+            let ai_d = ai.dot(&direction);
+            if ai_d < -1e-14 {
+                let cand = (slack[i] / (-ai_d)).max(0.0);
+                if cand < alpha {
+                    alpha = cand;
+                    entering = Some(i);
+                }
+            }
+        }
+
+        x += &direction.mapv(|v| alpha * v);
+        slack = constraints.a.dot(&x) - &constraints.b;
+
+        if let Some(idx) = entering
+            && !is_active[idx]
+        {
+            active.push(idx);
+            is_active[idx] = true;
+        }
+    }
+
+    Err("constrained quadratic active-set solver failed to converge".to_string())
+}
+
 #[inline]
 fn effective_solver_ridge(ridge_floor: f64) -> f64 {
     ridge_floor.max(1e-15)
@@ -756,9 +987,23 @@ fn inner_blockwise_fit<F: CustomFamily>(
     specs: &[ParameterBlockSpec],
     block_log_lambdas: &[Array1<f64>],
     options: &BlockwiseFitOptions,
+    warm_start: Option<&ConstrainedWarmStart>,
 ) -> Result<BlockwiseInnerResult, String> {
     let mut states = build_block_states(family, specs)?;
     refresh_all_block_etas(family, specs, &mut states)?;
+    let mut cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; specs.len()];
+    if let Some(seed) = warm_start
+        && seed.block_beta.len() == states.len()
+        && seed.active_sets.len() == states.len()
+    {
+        for (b, beta_seed) in seed.block_beta.iter().enumerate() {
+            if beta_seed.len() == states[b].beta.len() {
+                states[b].beta.assign(beta_seed);
+            }
+        }
+        cached_active_sets = seed.active_sets.clone();
+        refresh_all_block_etas(family, specs, &mut states)?;
+    }
     let mut last_ll = f64::NEG_INFINITY;
     let mut converged = false;
     let mut cycles_done = 0usize;
@@ -782,6 +1027,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
             let spec = &specs[b];
             let work = &eval.block_working_sets[b];
             let p = spec.design.ncols();
+            let linear_constraints = family.block_linear_constraints(&states, b, spec)?;
 
             let lambdas = block_log_lambdas[b].mapv(f64::exp);
             let mut s_lambda = Array2::<f64>::zeros((p, p));
@@ -827,14 +1073,38 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
                     let mut y_star = working_response.clone();
                     y_star -= &off_dyn;
-                    solve_block_weighted_system(
-                        &x_dyn,
-                        &y_star,
-                        &working_weights.mapv(|wi| wi.max(options.min_weight)),
-                        &s_lambda,
-                        options.ridge_floor,
-                        options.ridge_policy,
-                    )?
+                    let w_clamped = working_weights.mapv(|wi| wi.max(options.min_weight));
+                    if let Some(constraints) = linear_constraints.as_ref() {
+                        check_linear_feasibility(&states[b].beta, constraints, 1e-8).map_err(
+                            |e| format!("block {b} ({}) constrained diagonal solve: {e}", spec.name),
+                        )?;
+                        let (mut lhs, rhs_opt) = weighted_normal_equations(&x_dyn, &w_clamped, Some(&y_star))?;
+                        let rhs = rhs_opt.ok_or_else(|| {
+                            "missing weighted RHS in constrained diagonal solve".to_string()
+                        })?;
+                        lhs += &s_lambda;
+                        let (beta_constrained, active_set) = solve_quadratic_with_linear_constraints(
+                            &lhs,
+                            &rhs,
+                            &states[b].beta,
+                            constraints,
+                            cached_active_sets[b].as_deref(),
+                        )
+                        .map_err(|e| {
+                            format!("block {b} ({}) constrained diagonal solve failed: {e}", spec.name)
+                        })?;
+                        cached_active_sets[b] = Some(active_set);
+                        beta_constrained
+                    } else {
+                        solve_block_weighted_system(
+                            &x_dyn,
+                            &y_star,
+                            &w_clamped,
+                            &s_lambda,
+                            options.ridge_floor,
+                            options.ridge_policy,
+                        )?
+                    }
                 }
                 BlockWorkingSet::ExactNewton { gradient, hessian } => {
                     if gradient.len() != p {
@@ -861,12 +1131,30 @@ fn inner_blockwise_fit<F: CustomFamily>(
                     // where H = -∇² log L and g = ∇ log L.
                     let mut rhs = hessian.dot(&states[b].beta);
                     rhs += gradient;
-                    solve_spd_system_with_policy(
-                        &lhs,
-                        &rhs,
-                        options.ridge_floor,
-                        options.ridge_policy,
-                    )?
+                    if let Some(constraints) = linear_constraints.as_ref() {
+                        check_linear_feasibility(&states[b].beta, constraints, 1e-8).map_err(
+                            |e| format!("block {b} ({}) constrained exact-newton solve: {e}", spec.name),
+                        )?;
+                        let (beta_constrained, active_set) = solve_quadratic_with_linear_constraints(
+                            &lhs,
+                            &rhs,
+                            &states[b].beta,
+                            constraints,
+                            cached_active_sets[b].as_deref(),
+                        )
+                        .map_err(|e| {
+                            format!("block {b} ({}) constrained exact-newton solve failed: {e}", spec.name)
+                        })?;
+                        cached_active_sets[b] = Some(active_set);
+                        beta_constrained
+                    } else {
+                        solve_spd_system_with_policy(
+                            &lhs,
+                            &rhs,
+                            options.ridge_floor,
+                            options.ridge_policy,
+                        )?
+                    }
                 }
             };
             let beta_new = family.post_update_beta(beta_new_raw)?;
@@ -935,6 +1223,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
     Ok(BlockwiseInnerResult {
         block_states: states,
+        active_sets: cached_active_sets,
         log_likelihood: final_eval.log_likelihood,
         penalty_value,
         cycles: cycles_done,
@@ -954,9 +1243,10 @@ fn outer_objective_and_gradient<F: CustomFamily>(
     options: &BlockwiseFitOptions,
     penalty_counts: &[usize],
     rho: &Array1<f64>,
-) -> Result<(f64, Array1<f64>), String> {
+    warm_start: Option<&ConstrainedWarmStart>,
+) -> Result<(f64, Array1<f64>, ConstrainedWarmStart), String> {
     let per_block = split_log_lambdas(rho, penalty_counts)?;
-    let mut inner = inner_blockwise_fit(family, specs, &per_block, options)?;
+    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
     let reml_term = if options.use_reml_objective {
         0.5 * (inner.block_logdet_h - inner.block_logdet_s)
     } else {
@@ -1131,7 +1421,199 @@ fn outer_objective_and_gradient<F: CustomFamily>(
         }
         at += spec.penalties.len();
     }
-    Ok((objective, grad))
+    let warm = ConstrainedWarmStart {
+        rho: rho.clone(),
+        block_beta: inner
+            .block_states
+            .iter()
+            .map(|st| st.beta.clone())
+            .collect(),
+        active_sets: inner.active_sets,
+    };
+    Ok((objective, grad, warm))
+}
+
+fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(specs.len());
+    let mut at = 0usize;
+    for spec in specs {
+        let p = spec.design.ncols();
+        out.push((at, at + p));
+        at += p;
+    }
+    out
+}
+
+fn flatten_state_betas(states: &[ParameterBlockState], specs: &[ParameterBlockSpec]) -> Array1<f64> {
+    let total = specs.iter().map(|s| s.design.ncols()).sum::<usize>();
+    let mut beta = Array1::<f64>::zeros(total);
+    let ranges = block_param_ranges(specs);
+    for (b, (start, end)) in ranges.into_iter().enumerate() {
+        beta.slice_mut(ndarray::s![start..end]).assign(&states[b].beta);
+    }
+    beta
+}
+
+fn set_states_from_flat_beta(
+    states: &mut [ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    beta_flat: &Array1<f64>,
+) -> Result<(), String> {
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if beta_flat.len() != total {
+        return Err(format!(
+            "flat beta length mismatch: got {}, expected {}",
+            beta_flat.len(),
+            total
+        ));
+    }
+    for (b, (start, end)) in ranges.into_iter().enumerate() {
+        states[b]
+            .beta
+            .assign(&beta_flat.slice(ndarray::s![start..end]).to_owned());
+    }
+    Ok(())
+}
+
+fn penalized_objective_at_beta<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    per_block_log_lambdas: &[Array1<f64>],
+) -> Result<f64, String> {
+    let eval = family.evaluate(states)?;
+    if eval.block_working_sets.len() != specs.len() {
+        return Err(format!(
+            "family returned {} block working sets, expected {}",
+            eval.block_working_sets.len(),
+            specs.len()
+        ));
+    }
+    let mut penalty = 0.0_f64;
+    for b in 0..specs.len() {
+        let spec = &specs[b];
+        let beta = &states[b].beta;
+        let lambdas = per_block_log_lambdas
+            .get(b)
+            .cloned()
+            .unwrap_or_else(|| Array1::zeros(spec.penalties.len()))
+            .mapv(f64::exp);
+        for (k, s) in spec.penalties.iter().enumerate() {
+            if k < lambdas.len() {
+                let sb = s.dot(beta);
+                penalty += 0.5 * lambdas[k] * beta.dot(&sb);
+            }
+        }
+    }
+    Ok(-eval.log_likelihood + penalty)
+}
+
+fn compute_joint_hessian_from_objective<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    per_block_log_lambdas: &[Array1<f64>],
+) -> Result<Array2<f64>, String> {
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    let beta_hat = flatten_state_betas(states, specs);
+    let mut h = Array2::<f64>::zeros((total, total));
+
+    let mut states_f0 = states.to_vec();
+    set_states_from_flat_beta(&mut states_f0, specs, &beta_hat)?;
+    refresh_all_block_etas(family, specs, &mut states_f0)?;
+    let f0 = penalized_objective_at_beta(family, specs, &states_f0, per_block_log_lambdas)?;
+
+    let steps = Array1::from_iter(
+        beta_hat
+            .iter()
+            .map(|&b| (1e-4 * (1.0 + b.abs())).max(1e-6)),
+    );
+
+    for i in 0..total {
+        let hi = steps[i];
+        let mut bp = beta_hat.clone();
+        bp[i] += hi;
+        let mut sp = states.to_vec();
+        set_states_from_flat_beta(&mut sp, specs, &bp)?;
+        refresh_all_block_etas(family, specs, &mut sp)?;
+        let fp = penalized_objective_at_beta(family, specs, &sp, per_block_log_lambdas)?;
+
+        let mut bm = beta_hat.clone();
+        bm[i] -= hi;
+        let mut sm = states.to_vec();
+        set_states_from_flat_beta(&mut sm, specs, &bm)?;
+        refresh_all_block_etas(family, specs, &mut sm)?;
+        let fm = penalized_objective_at_beta(family, specs, &sm, per_block_log_lambdas)?;
+
+        h[[i, i]] = ((fp - 2.0 * f0 + fm) / (hi * hi)).max(0.0);
+
+        for j in 0..i {
+            let hj = steps[j];
+            let mut bpp = beta_hat.clone();
+            bpp[i] += hi;
+            bpp[j] += hj;
+            let mut spp = states.to_vec();
+            set_states_from_flat_beta(&mut spp, specs, &bpp)?;
+            refresh_all_block_etas(family, specs, &mut spp)?;
+            let fpp = penalized_objective_at_beta(family, specs, &spp, per_block_log_lambdas)?;
+
+            let mut bpm = beta_hat.clone();
+            bpm[i] += hi;
+            bpm[j] -= hj;
+            let mut spm = states.to_vec();
+            set_states_from_flat_beta(&mut spm, specs, &bpm)?;
+            refresh_all_block_etas(family, specs, &mut spm)?;
+            let fpm = penalized_objective_at_beta(family, specs, &spm, per_block_log_lambdas)?;
+
+            let mut bmp = beta_hat.clone();
+            bmp[i] -= hi;
+            bmp[j] += hj;
+            let mut smp = states.to_vec();
+            set_states_from_flat_beta(&mut smp, specs, &bmp)?;
+            refresh_all_block_etas(family, specs, &mut smp)?;
+            let fmp = penalized_objective_at_beta(family, specs, &smp, per_block_log_lambdas)?;
+
+            let mut bmm = beta_hat.clone();
+            bmm[i] -= hi;
+            bmm[j] -= hj;
+            let mut smm = states.to_vec();
+            set_states_from_flat_beta(&mut smm, specs, &bmm)?;
+            refresh_all_block_etas(family, specs, &mut smm)?;
+            let fmm = penalized_objective_at_beta(family, specs, &smm, per_block_log_lambdas)?;
+
+            let hij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            h[[i, j]] = hij;
+            h[[j, i]] = hij;
+        }
+    }
+    for i in 0..total {
+        h[[i, i]] = h[[i, i]].max(1e-12);
+    }
+    Ok(h)
+}
+
+fn compute_joint_covariance<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    per_block_log_lambdas: &[Array1<f64>],
+    options: &BlockwiseFitOptions,
+) -> Result<Array2<f64>, String> {
+    let mut h = compute_joint_hessian_from_objective(family, specs, states, per_block_log_lambdas)?;
+    let p_total = h.nrows();
+    for i in 0..p_total {
+        for j in 0..i {
+            let v = 0.5 * (h[[i, j]] + h[[j, i]]);
+            h[[i, j]] = v;
+            h[[j, i]] = v;
+        }
+    }
+    match inverse_spd_with_retry(&h, effective_solver_ridge(options.ridge_floor), 8) {
+        Ok(cov) => Ok(cov),
+        Err(_) => pinv_positive_part(&h, effective_solver_ridge(options.ridge_floor)),
+    }
 }
 
 pub fn fit_custom_family<F: CustomFamily>(
@@ -1143,8 +1625,23 @@ pub fn fit_custom_family<F: CustomFamily>(
     let rho0 = flatten_log_lambdas(specs);
 
     if rho0.is_empty() {
-        let inner =
-            inner_blockwise_fit(family, specs, &vec![Array1::zeros(0); specs.len()], options)?;
+        let mut inner =
+            inner_blockwise_fit(
+                family,
+                specs,
+                &vec![Array1::zeros(0); specs.len()],
+                options,
+                None,
+            )?;
+        refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+        let covariance_conditional = compute_joint_covariance(
+            family,
+            specs,
+            &inner.block_states,
+            &vec![Array1::zeros(0); specs.len()],
+            options,
+        )
+        .ok();
         let reml_term = if options.use_reml_objective {
             0.5 * (inner.block_logdet_h - inner.block_logdet_s)
         } else {
@@ -1155,6 +1652,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             log_likelihood: inner.log_likelihood,
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
+            covariance_conditional,
             penalized_objective: -inner.log_likelihood + inner.penalty_value + reml_term,
             outer_iterations: 0,
             inner_cycles: inner.cycles,
@@ -1162,9 +1660,38 @@ pub fn fit_custom_family<F: CustomFamily>(
         });
     }
 
+    let warm_cache = std::sync::Mutex::new(None::<ConstrainedWarmStart>);
     let mut solver = Bfgs::new(rho0.clone(), |x| {
-        match outer_objective_and_gradient(family, specs, options, &penalty_counts, x) {
-            Ok(pair) => pair,
+        let cached = warm_cache.lock().ok().and_then(|g| g.clone());
+        match outer_objective_and_gradient(
+            family,
+            specs,
+            options,
+            &penalty_counts,
+            x,
+            cached.as_ref(),
+        ) {
+            Ok((obj, grad, warm)) => {
+                if let Ok(mut guard) = warm_cache.lock() {
+                    // Keep only close-by rho seeds to avoid harmful warm starts.
+                    let seed_ok = cached
+                        .as_ref()
+                        .map(|c| {
+                            c.rho.len() == x.len()
+                                && c.rho
+                                    .iter()
+                                    .zip(x.iter())
+                                    .all(|(&a, &b)| (a - b).abs() <= 1.5)
+                        })
+                        .unwrap_or(true);
+                    if seed_ok {
+                        *guard = Some(warm);
+                    } else {
+                        *guard = None;
+                    }
+                }
+                (obj, grad)
+            }
             Err(_) => (f64::INFINITY, Array1::<f64>::from_elem(x.len(), 1e6)),
         }
     })
@@ -1176,13 +1703,18 @@ pub fn fit_custom_family<F: CustomFamily>(
 
     let rho_star = sol.final_point;
     let per_block = split_log_lambdas(&rho_star, &penalty_counts)?;
-    let inner = inner_blockwise_fit(family, specs, &per_block, options)?;
+    let final_seed = warm_cache.lock().ok().and_then(|g| g.clone());
+    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, final_seed.as_ref())?;
+    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    let covariance_conditional =
+        compute_joint_covariance(family, specs, &inner.block_states, &per_block, options).ok();
 
     Ok(BlockwiseFitResult {
         block_states: inner.block_states,
         log_likelihood: inner.log_likelihood,
         log_lambdas: rho_star.clone(),
         lambdas: rho_star.mapv(f64::exp),
+        covariance_conditional,
         penalized_objective: if options.use_reml_objective {
             -inner.log_likelihood
                 + inner.penalty_value
@@ -1242,6 +1774,51 @@ mod tests {
                     working_weights: Array1::ones(self.y.len()),
                 }],
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct OneBlockConstrainedExactFamily {
+        target: f64,
+        lower: f64,
+    }
+
+    impl CustomFamily for OneBlockConstrainedExactFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let beta = block_states
+                .first()
+                .ok_or_else(|| "missing block 0".to_string())?
+                .beta
+                .first()
+                .copied()
+                .ok_or_else(|| "missing coefficient".to_string())?;
+            let g = self.target - beta;
+            let ll = -0.5 * (beta - self.target) * (beta - self.target);
+            Ok(FamilyEvaluation {
+                log_likelihood: ll,
+                block_working_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient: array![g],
+                    hessian: array![[1.0]],
+                }],
+            })
+        }
+
+        fn block_linear_constraints(
+            &self,
+            _block_states: &[ParameterBlockState],
+            block_idx: usize,
+            _spec: &ParameterBlockSpec,
+        ) -> Result<Option<LinearInequalityConstraints>, String> {
+            if block_idx != 0 {
+                return Ok(None);
+            }
+            Ok(Some(LinearInequalityConstraints {
+                a: array![[1.0]],
+                b: array![self.lower],
+            }))
         }
     }
 
@@ -1307,32 +1884,35 @@ mod tests {
         };
         let penalty_counts = vec![1usize];
         let rho = array![0.1];
-        let (f0, g0) = outer_objective_and_gradient(
+        let (f0, g0, _) = outer_objective_and_gradient(
             &OneBlockGaussianFamily { y: y.clone() },
             std::slice::from_ref(&spec),
             &options,
             &penalty_counts,
             &rho,
+            None,
         )
         .expect("objective/gradient");
 
         let h = 1e-5;
         let rho_p = array![rho[0] + h];
         let rho_m = array![rho[0] - h];
-        let (fp, _) = outer_objective_and_gradient(
+        let (fp, _, _) = outer_objective_and_gradient(
             &OneBlockGaussianFamily { y: y.clone() },
             std::slice::from_ref(&spec),
             &options,
             &penalty_counts,
             &rho_p,
+            None,
         )
         .expect("objective+");
-        let (fm, _) = outer_objective_and_gradient(
+        let (fm, _, _) = outer_objective_and_gradient(
             &OneBlockGaussianFamily { y },
             std::slice::from_ref(&spec),
             &options,
             &penalty_counts,
             &rho_m,
+            None,
         )
         .expect("objective-");
         let g_fd = (fp - fm) / (2.0 * h);
@@ -1401,5 +1981,28 @@ mod tests {
                 beta_sparse[j]
             );
         }
+    }
+
+    #[test]
+    fn exact_newton_block_enforces_linear_constraints() {
+        let spec = ParameterBlockSpec {
+            name: "exact_block".to_string(),
+            design: DesignMatrix::Dense(array![[1.0]]),
+            offset: array![0.0],
+            penalties: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![1.5]),
+        };
+        let family = OneBlockConstrainedExactFamily {
+            target: 0.0,
+            lower: 1.0,
+        };
+        let fit = fit_custom_family(&family, &[spec], &BlockwiseFitOptions::default())
+            .expect("constrained exact-newton fit");
+        let beta = fit.block_states[0].beta[0];
+        assert!(
+            (beta - 1.0).abs() < 1e-8,
+            "expected constrained optimum at lower bound, got {beta}"
+        );
     }
 }

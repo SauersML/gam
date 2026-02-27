@@ -37,12 +37,11 @@ use crate::pirls::{self, PirlsResult};
 use crate::probability::{inverse_link_array, standard_normal_quantile};
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use crate::types::{
-    Coefficients, LinkFunction, LogSmoothingParams, LogSmoothingParamsView, RidgeDeterminantMode,
-    RidgePassport,
+    Coefficients, LinkFunction, LogSmoothingParams, LogSmoothingParamsView, RidgePassport,
 };
 
 // Ndarray and faer linear algebra helpers
-use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_mat_mut, fast_ab, fast_ata,
@@ -1158,6 +1157,7 @@ pub struct ExternalOptimOptions {
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
+    pub linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
     /// Optional explicit Firth override for binomial-logit external fitting.
     /// - `Some(true)`: force Firth on
     /// - `Some(false)`: force Firth off
@@ -1578,6 +1578,8 @@ where
         p,
         &cfg,
         Some(opts.nullspace_dims.clone()),
+        None,
+        opts.linear_constraints.clone(),
     )?;
     let seed_config = SeedConfig {
         bounds: (-12.0, 12.0),
@@ -1833,6 +1835,8 @@ where
         p,
         &cfg.as_pirls_config(),
         None,
+        None,
+        opts.linear_constraints.as_ref(),
         None, // No SE for base external optimization
     )?;
 
@@ -2039,6 +2043,7 @@ pub struct FitOptions {
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
+    pub linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
 }
 
 /// Post-fit artifacts needed by downstream diagnostics/inference without
@@ -2078,6 +2083,12 @@ pub struct FitResult {
 
 pub struct PredictResult {
     pub eta: Array1<f64>,
+    pub mean: Array1<f64>,
+}
+
+pub struct PredictPosteriorMeanResult {
+    pub eta: Array1<f64>,
+    pub eta_standard_error: Array1<f64>,
     pub mean: Array1<f64>,
 }
 
@@ -2179,6 +2190,7 @@ where
         max_iter: opts.max_iter,
         tol: opts.tol,
         nullspace_dims: opts.nullspace_dims.clone(),
+        linear_constraints: opts.linear_constraints.clone(),
         firth_bias_reduction: None,
     };
 
@@ -2283,6 +2295,85 @@ where
     let mean = apply_family_inverse_link(&eta, family)?;
 
     Ok(PredictResult { eta, mean })
+}
+
+/// Nonlinear posterior-mean prediction with coefficient uncertainty propagation.
+///
+/// For nonlinear links, returns E[g^{-1}(eta_tilde)] where eta_tilde ~ N(eta_hat, se_eta^2).
+/// For Gaussian identity, this equals the standard plug-in mean.
+pub fn predict_gam_posterior_mean<X>(
+    x: X,
+    beta: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    family: crate::types::LikelihoodFamily,
+    covariance: ArrayView2<'_, f64>,
+) -> Result<PredictPosteriorMeanResult, EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    let x = x.into();
+    if x.ncols() != beta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "predict_gam_posterior_mean dimension mismatch: X has {} columns but beta has length {}",
+            x.ncols(),
+            beta.len()
+        )));
+    }
+    if x.nrows() != offset.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "predict_gam_posterior_mean dimension mismatch: X has {} rows but offset has length {}",
+            x.nrows(),
+            offset.len()
+        )));
+    }
+    if covariance.nrows() != beta.len() || covariance.ncols() != beta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "predict_gam_posterior_mean covariance dimension mismatch: expected {}x{}, got {}x{}",
+            beta.len(),
+            beta.len(),
+            covariance.nrows(),
+            covariance.ncols()
+        )));
+    }
+    if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
+        return Err(EstimationError::InvalidInput(
+            "predict_gam_posterior_mean does not support RoystonParmar; use survival prediction APIs"
+                .to_string(),
+        ));
+    }
+
+    let mut eta = x.matrix_vector_multiply(&beta.to_owned());
+    eta += &offset;
+
+    let eta_var = linear_predictor_variance(&x, &covariance.to_owned());
+    let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
+    let quad_ctx = crate::quadrature::QuadratureContext::new();
+
+    let mean = match family {
+        crate::types::LikelihoodFamily::GaussianIdentity => eta.clone(),
+        crate::types::LikelihoodFamily::BinomialLogit => Array1::from_iter(
+            eta.iter()
+                .zip(eta_standard_error.iter())
+                .map(|(&e, &se)| crate::quadrature::logit_posterior_mean(&quad_ctx, e, se)),
+        ),
+        crate::types::LikelihoodFamily::BinomialProbit => Array1::from_iter(
+            eta.iter()
+                .zip(eta_standard_error.iter())
+                .map(|(&e, &se)| crate::quadrature::probit_posterior_mean(e, se)),
+        ),
+        crate::types::LikelihoodFamily::BinomialCLogLog => Array1::from_iter(
+            eta.iter()
+                .zip(eta_standard_error.iter())
+                .map(|(&e, &se)| crate::quadrature::cloglog_posterior_mean(&quad_ctx, e, se)),
+        ),
+        crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
+    };
+
+    Ok(PredictPosteriorMeanResult {
+        eta,
+        eta_standard_error,
+        mean,
+    })
 }
 
 /// Prediction with coefficient uncertainty propagation.
@@ -3022,6 +3113,8 @@ where
         p,
         &cfg,
         Some(opts.nullspace_dims.clone()),
+        None,
+        opts.linear_constraints.clone(),
     )?;
 
     let analytic_grad = reml_state.compute_gradient(rho)?;
@@ -3076,6 +3169,8 @@ where
         p,
         &cfg,
         Some(opts.nullspace_dims.clone()),
+        None,
+        opts.linear_constraints.clone(),
     )?;
 
     let cost = reml_state.compute_cost(rho)?;
@@ -3336,6 +3431,8 @@ pub mod internal {
         p: usize,
         config: &'a RemlConfig,
         nullspace_dims: Vec<usize>,
+        coefficient_lower_bounds: Option<Array1<f64>>,
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
 
         cache: RwLock<PirlsLruCache>,
         faer_factor_cache: RwLock<HashMap<Vec<u64>, Arc<FaerFactor>>>,
@@ -3536,56 +3633,6 @@ pub mod internal {
                 && (eval_idx == 1 || eval_idx % 200 == 0)
         }
 
-        fn log_det_s_with_ridge(
-            s_transformed: &Array2<f64>,
-            ridge_passport: RidgePassport,
-            base_log_det: f64,
-        ) -> Result<f64, EstimationError> {
-            // Penalty determinant convention:
-            //   S(ρ) = Σ_k λ_k S_k + δI,   λ_k = exp(ρ_k).
-            //
-            // For outer derivatives we require a rank-stable interpretation of log|S|_+:
-            //   log|S|_+ = sum_{i in penalized subspace} log(σ_i(S)),
-            // with a fixed structural nullspace convention.
-            //
-            // In this code path, `s_transformed` is already in the stabilized transformed basis
-            // produced by reparameterization. When ridge participates in determinant terms
-            // (`penalty_logdet_ridge > 0`), we evaluate log|S + ridge I| according to policy:
-            //   - Full: ordinary SPD logdet (Cholesky).
-            //   - PositivePart: positive-eigenvalue pseudo-logdet.
-            //
-            // Matching this convention between cost and gradient is mandatory because
-            // det1[k] represents:
-            //   ∂/∂ρ_k log|S(ρ)|_+ = tr(S^+ S_k^ρ),  S_k^ρ = λ_k S_k.
-            let ridge = ridge_passport.penalty_logdet_ridge();
-            if ridge <= 0.0 {
-                return Ok(base_log_det);
-            }
-
-            let p = s_transformed.nrows();
-            let mut s_ridge = s_transformed.clone();
-            for i in 0..p {
-                s_ridge[[i, i]] += ridge;
-            }
-            match ridge_passport.policy.determinant_mode {
-                RidgeDeterminantMode::Full => {
-                    let chol = s_ridge.clone().cholesky(Side::Lower).map_err(|_| {
-                        EstimationError::ModelIsIllConditioned {
-                            condition_number: f64::INFINITY,
-                        }
-                    })?;
-                    Ok(2.0 * chol.diag().mapv(f64::ln).sum())
-                }
-                RidgeDeterminantMode::PositivePart => {
-                    let (evals, _) = s_ridge
-                        .eigh(Side::Lower)
-                        .map_err(EstimationError::EigendecompositionFailed)?;
-                    let floor = ridge.max(1e-14);
-                    Ok(evals.iter().filter(|&&v| v > floor).map(|&v| v.ln()).sum())
-                }
-            }
-        }
-
         fn log_gam_cost(
             &self,
             rho: &Array1<f64>,
@@ -3722,6 +3769,8 @@ pub mod internal {
             p: usize,
             config: &'a RemlConfig,
             nullspace_dims: Option<Vec<usize>>,
+            coefficient_lower_bounds: Option<Array1<f64>>,
+            linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
         ) -> Result<Self, EstimationError>
         where
             X: Into<DesignMatrix>,
@@ -3736,6 +3785,8 @@ pub mod internal {
                 p,
                 config,
                 nullspace_dims,
+                coefficient_lower_bounds,
+                linear_constraints,
             )
         }
 
@@ -3748,6 +3799,8 @@ pub mod internal {
             p: usize,
             config: &'a RemlConfig,
             nullspace_dims: Option<Vec<usize>>,
+            coefficient_lower_bounds: Option<Array1<f64>>,
+            linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
         ) -> Result<Self, EstimationError>
         where
             X: Into<DesignMatrix>,
@@ -3789,6 +3842,8 @@ pub mod internal {
                 p,
                 config,
                 nullspace_dims,
+                coefficient_lower_bounds,
+                linear_constraints,
                 cache: RwLock::new(PirlsLruCache::new(MAX_PIRLS_CACHE_ENTRIES)),
                 faer_factor_cache: RwLock::new(HashMap::new()),
                 pirls_cache_enabled: AtomicBool::new(true),
@@ -3954,11 +4009,11 @@ pub mod internal {
         ///
         /// # Returns
         /// * Effective degrees of freedom value
-        fn edf_from_h_and_rk(
+        fn edf_from_h_and_e(
             &self,
-            pr: &PirlsResult,
+            e_transformed: &Array2<f64>, // rank x p_eff
             lambdas: ArrayView1<'_, f64>,
-            h_eff: &Array2<f64>,
+            h_eff: &Array2<f64>, // p_eff x p_eff
         ) -> Result<f64, EstimationError> {
             // Why caching by ρ is sound:
             // The effective degrees of freedom (EDF) calculation is one of only two places where
@@ -3991,18 +4046,159 @@ pub mod internal {
 
             // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
             // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly.
-            let e_t = pr.reparam_result.e_transformed.t().to_owned(); // (p × rank_total)
+            let e_t = e_transformed.t().to_owned(); // (p_eff × rank_total)
             let e_view = FaerArrayView::new(&e_t);
             let x = factor.solve(e_view.as_ref());
             let trace_h_inv_s_lambda = faer_frob_inner(x.as_ref(), e_view.as_ref());
 
             // Calculate EDF as p - trace, clamped to the penalty nullspace dimension
-            let p = pr.beta_transformed.len() as f64;
-            let rank_s = pr.reparam_result.e_transformed.nrows() as f64;
+            let p = h_eff.ncols() as f64;
+            let rank_s = e_transformed.nrows() as f64;
             let mp = (p - rank_s).max(0.0);
             let edf = (p - trace_h_inv_s_lambda).clamp(mp, p);
 
             Ok(edf)
+        }
+
+        fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
+            let lin = pr.linear_constraints_transformed.as_ref()?;
+            let active_tol = 1e-8;
+            let beta_t = pr.beta_transformed.as_ref();
+            let mut active_rows: Vec<Array1<f64>> = Vec::new();
+            for i in 0..lin.a.nrows() {
+                let slack = lin.a.row(i).dot(beta_t) - lin.b[i];
+                if slack <= active_tol {
+                    active_rows.push(lin.a.row(i).to_owned());
+                }
+            }
+            if active_rows.is_empty() {
+                return None;
+            }
+
+            let p_t = lin.a.ncols();
+            let mut a_t = Array2::<f64>::zeros((p_t, active_rows.len()));
+            for (j, row) in active_rows.iter().enumerate() {
+                for k in 0..p_t {
+                    a_t[[k, j]] = row[k];
+                }
+            }
+
+            let q_row = Self::orthonormalize_columns(&a_t, 1e-10); // basis for active row-space^T
+            let rank = q_row.ncols();
+            if rank == 0 {
+                return None;
+            }
+            if rank >= p_t {
+                return Some(Array2::<f64>::zeros((p_t, 0)));
+            }
+
+            // Build orthonormal basis for null(A_active) as complement of row-space.
+            let mut z = Array2::<f64>::zeros((p_t, p_t - rank));
+            let mut kept = 0usize;
+            for j in 0..p_t {
+                let mut v = Array1::<f64>::zeros(p_t);
+                v[j] = 1.0;
+                for t in 0..rank {
+                    let qt = q_row.column(t);
+                    let proj = qt.dot(&v);
+                    v -= &qt.mapv(|x| x * proj);
+                }
+                for t in 0..kept {
+                    let zt = z.column(t);
+                    let proj = zt.dot(&v);
+                    v -= &zt.mapv(|x| x * proj);
+                }
+                let nrm = v.dot(&v).sqrt();
+                if nrm > 1e-10 {
+                    z.column_mut(kept).assign(&v.mapv(|x| x / nrm));
+                    kept += 1;
+                    if kept == p_t - rank {
+                        break;
+                    }
+                }
+            }
+            Some(z.slice(ndarray::s![.., 0..kept]).to_owned())
+        }
+
+        fn enforce_constraint_kkt(&self, pr: &PirlsResult) -> Result<(), EstimationError> {
+            let Some(kkt) = pr.constraint_kkt.as_ref() else {
+                return Ok(());
+            };
+            let tol_primal = 1e-7;
+            let tol_dual = 1e-7;
+            let tol_comp = 1e-7;
+            let tol_stat = 5e-6;
+            if kkt.primal_feasibility > tol_primal
+                || kkt.dual_feasibility > tol_dual
+                || kkt.complementarity > tol_comp
+                || kkt.stationarity > tol_stat
+            {
+                let mut worst_row_msg = String::new();
+                if let Some(lin) = pr.linear_constraints_transformed.as_ref() {
+                    let mut worst = 0.0_f64;
+                    let mut worst_row = 0usize;
+                    for i in 0..lin.a.nrows() {
+                        let slack = lin.a.row(i).dot(&pr.beta_transformed.0) - lin.b[i];
+                        let viol = (-slack).max(0.0);
+                        if viol > worst {
+                            worst = viol;
+                            worst_row = i;
+                        }
+                    }
+                    if worst > 0.0 {
+                        worst_row_msg = format!(
+                            "; worst_row={} worst_violation={:.3e}",
+                            worst_row, worst
+                        );
+                    }
+                }
+                return Err(EstimationError::ParameterConstraintViolation(format!(
+                    "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}; active={}/{}{}",
+                    kkt.primal_feasibility,
+                    kkt.dual_feasibility,
+                    kkt.complementarity,
+                    kkt.stationarity,
+                    kkt.n_active,
+                    kkt.n_constraints,
+                    worst_row_msg
+                )));
+            }
+            Ok(())
+        }
+
+        fn project_with_basis(matrix: &Array2<f64>, z: &Array2<f64>) -> Array2<f64> {
+            let zt_m = z.t().dot(matrix);
+            zt_m.dot(z)
+        }
+
+        fn penalty_rank_and_logdet_pos(
+            &self,
+            s: &Array2<f64>,
+            ridge_passport: RidgePassport,
+        ) -> Result<(usize, f64), EstimationError> {
+            if s.nrows() == 0 {
+                return Ok((0, 0.0));
+            }
+            let mut s_r = s.clone();
+            let ridge = ridge_passport.penalty_logdet_ridge();
+            if ridge > 0.0 {
+                for i in 0..s_r.nrows() {
+                    s_r[[i, i]] += ridge;
+                }
+            }
+            let (evals, _) = s_r
+                .eigh(Side::Lower)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let floor = ridge.max(1e-10);
+            let mut rank = 0usize;
+            let mut log_det = 0.0_f64;
+            for &v in &evals {
+                if v > floor {
+                    rank += 1;
+                    log_det += v.ln();
+                }
+            }
+            Ok((rank, log_det))
         }
 
         fn update_warm_start_from(&self, pr: &PirlsResult) {
@@ -4163,8 +4359,11 @@ pub mod internal {
                     p_dim,
                     &config.as_pirls_config(),
                     warm_start_initial.as_ref(),
+                    self.coefficient_lower_bounds.as_ref(),
+                    self.linear_constraints.as_ref(),
                     None, // No SE for base model
                 )?;
+                self.enforce_constraint_kkt(&pirls_result)?;
 
                 match pirls_result.status {
                     pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
@@ -4353,6 +4552,8 @@ pub mod internal {
                 self.p,
                 &quick_cfg,
                 warm_start_ref,
+                self.coefficient_lower_bounds.as_ref(),
+                self.linear_constraints.as_ref(),
                 None,
             )?;
 
@@ -4476,6 +4677,8 @@ pub mod internal {
                     self.p,
                     &self.config.as_pirls_config(),
                     warm_start_ref,
+                    self.coefficient_lower_bounds.as_ref(),
+                    self.linear_constraints.as_ref(),
                     None, // No SE for base model
                 )
             };
@@ -4489,6 +4692,7 @@ pub mod internal {
 
             let (pirls_result, _) = pirls_result?; // Propagate error if it occurred
             let pirls_result = Arc::new(pirls_result);
+            self.enforce_constraint_kkt(pirls_result.as_ref())?;
 
             // Check the status returned by the P-IRLS routine.
             match pirls_result.status {
@@ -4655,10 +4859,19 @@ pub mod internal {
                 }
             };
             let pirls_result = bundle.pirls_result.as_ref();
-            let h_eff = bundle.h_eff.as_ref();
             let ridge_used = bundle.ridge_passport.delta;
 
             let lambdas = p.mapv(f64::exp);
+            let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+            let mut h_eff_eval = bundle.h_eff.as_ref().clone();
+            let mut h_total_eval = bundle.h_total.as_ref().clone();
+            let mut e_eval = pirls_result.reparam_result.e_transformed.clone();
+            if let Some(z) = free_basis_opt.as_ref() {
+                h_eff_eval = Self::project_with_basis(bundle.h_eff.as_ref(), z);
+                h_total_eval = Self::project_with_basis(bundle.h_total.as_ref(), z);
+                e_eval = pirls_result.reparam_result.e_transformed.dot(z);
+            }
+            let h_eff = &h_eff_eval;
 
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             if !p.is_empty() {
@@ -4721,6 +4934,7 @@ pub mod internal {
 
             match self.config.link_function() {
                 LinkFunction::Identity => {
+                    let ridge_passport = pirls_result.ridge_passport;
                     // From Wood (2017), Chapter 6, Eq. 6.24:
                     // V_r(λ) = D_p/(2φ) + (r/2φ) + ½log|X'X/φ + S_λ/φ| - ½log|S_λ/φ|_+
                     // where D_p = ||y - Xβ̂||² + β̂'S_λβ̂ is the PENALIZED deviance
@@ -4789,12 +5003,14 @@ pub mod internal {
 
                     // Nullspace dimension M_p is constant with respect to ρ.  Use it to profile φ
                     // following the standard REML identity φ = D_p / (n - M_p).
-                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
-                    let mp = self.p.saturating_sub(penalty_rank) as f64;
+                    let (penalty_rank, log_det_s_plus) =
+                        self.penalty_rank_and_logdet_pos(&e_eval.t().dot(&e_eval), ridge_passport)?;
+                    let p_eff_dim = h_eff.ncols();
+                    let mp = p_eff_dim.saturating_sub(penalty_rank) as f64;
 
                     // EDF diagnostics are expensive; compute only when diagnostics are enabled.
                     if want_hot_diag {
-                        let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
+                        let edf = self.edf_from_h_and_e(&e_eval, lambdas.view(), h_eff)?;
                         log::debug!("[Diag] EDF total={:.3}", edf);
                         if n - edf < 1.0 {
                             log::warn!("Effective DoF exceeds samples; model may be overfit.");
@@ -4838,13 +5054,6 @@ pub mod internal {
                     // Fixed-rank rule: unpenalized/null directions do not contribute to the
                     // pseudo-logdet. This keeps the objective continuous in ρ when S is singular
                     // (or near-singular before ridge augmentation).
-                    let ridge_passport = pirls_result.ridge_passport;
-                    let log_det_s_plus = Self::log_det_s_with_ridge(
-                        &pirls_result.reparam_result.s_transformed,
-                        ridge_passport,
-                        pirls_result.reparam_result.log_det,
-                    )?;
-
                     // Standard REML expression from Wood (2017), Section 6.5.1
                     // V = (n/2)log(2πσ²) + D_p/(2σ²) + ½log|H| - ½log|S_λ|_+ + (M_p-1)/2 log(2πσ²)
                     // Simplifying: V = D_p/(2φ) + ½log|H| - ½log|S_λ|_+ + ((n-M_p)/2) log(2πφ)
@@ -4874,11 +5083,8 @@ pub mod internal {
                     }
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
-                    let log_det_s = Self::log_det_s_with_ridge(
-                        &pirls_result.reparam_result.s_transformed,
-                        ridge_passport,
-                        pirls_result.reparam_result.log_det,
-                    )?;
+                    let (_penalty_rank, log_det_s) =
+                        self.penalty_rank_and_logdet_pos(&e_eval.t().dot(&e_eval), ridge_passport)?;
 
                     // Log-determinant of the effective Hessian.
                     // HESSIAN PASSPORT: Use the pre-computed h_total and its factorization
@@ -4896,7 +5102,19 @@ pub mod internal {
                     // For non-Gaussian families, H depends on ρ both directly through S and
                     // indirectly through β̂(ρ), which induces the dH/dρ_k third-derivative term in
                     // the exact gradient path (documented in compute_gradient).
-                    let log_det_h = bundle.h_total_log_det;
+                    let log_det_h = if free_basis_opt.is_some() {
+                        if h_total_eval.nrows() == 0 {
+                            0.0
+                        } else {
+                            let (evals, _) = h_total_eval
+                                .eigh(Side::Lower)
+                                .map_err(EstimationError::EigendecompositionFailed)?;
+                            let floor = 1e-10;
+                            evals.iter().filter(|&&v| v > floor).map(|&v| v.ln()).sum()
+                        }
+                    } else {
+                        bundle.h_total_log_det
+                    };
 
                     // Mp is null space dimension (number of unpenalized coefficients)
                     // For logit, scale parameter is typically fixed at 1.0, but include for completeness
@@ -4905,16 +5123,18 @@ pub mod internal {
                     // Compute null space dimension using the TRANSFORMED, STABLE basis
                     // Use the rank of the lambda-weighted transformed penalty root (e_transformed)
                     // to determine M_p with the transformed penalty basis.
-                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
-                    let mp = self.p.saturating_sub(penalty_rank) as f64;
+                    let (penalty_rank, _) =
+                        self.penalty_rank_and_logdet_pos(&e_eval.t().dot(&e_eval), ridge_passport)?;
+                    let p_eff_dim = h_eff.ncols();
+                    let mp = p_eff_dim.saturating_sub(penalty_rank) as f64;
 
                     let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
                         + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
                     // Diagnostics below are expensive and not needed for objective value.
                     let (edf, trace_h_inv_s_lambda, stab_cond) = if want_hot_diag {
-                        let p_eff = pirls_result.beta_transformed.len() as f64;
-                        let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
+                        let p_eff = h_eff.ncols() as f64;
+                        let edf = self.edf_from_h_and_e(&e_eval, lambdas.view(), h_eff)?;
                         let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
                         let stab_cond = pirls_result
                             .penalized_hessian_transformed
@@ -5511,12 +5731,57 @@ pub mod internal {
             }
 
             let pirls_result = bundle.pirls_result.as_ref();
-            let h_eff = bundle.h_eff.as_ref();
             let ridge_passport = bundle.ridge_passport;
+
+            let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+            let reparam_result = &pirls_result.reparam_result;
+            let mut h_eff_eval = bundle.h_eff.as_ref().clone();
+            let mut e_eval = reparam_result.e_transformed.clone();
+            let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
+            let mut rs_eval = reparam_result.rs_transformed.clone();
+            let mut x_transformed_eval = pirls_result.x_transformed.clone();
+            let mut h_pos_factor_w_eval = bundle.h_pos_factor_w.as_ref().clone();
+
+            if let Some(z) = free_basis_opt.as_ref() {
+                h_eff_eval = Self::project_with_basis(bundle.h_eff.as_ref(), z);
+                e_eval = reparam_result.e_transformed.dot(z);
+                beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
+                rs_eval = reparam_result
+                    .rs_transformed
+                    .iter()
+                    .map(|r| r.dot(z))
+                    .collect();
+                let x_dense_arc = pirls_result.x_transformed.to_dense_arc();
+                x_transformed_eval = DesignMatrix::Dense(x_dense_arc.as_ref().dot(z));
+
+                let (eigvals, eigvecs) = h_eff_eval
+                    .eigh(Side::Lower)
+                    .map_err(EstimationError::EigendecompositionFailed)?;
+                let max_ev = eigvals.iter().copied().fold(0.0_f64, |a, b| a.max(b.abs()));
+                let tol = (h_eff_eval.nrows().max(1) as f64) * f64::EPSILON * max_ev.max(1.0);
+                let valid_indices: Vec<usize> = eigvals
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, &val)| if val > tol { Some(idx) } else { None })
+                    .collect();
+                let p_eff = h_eff_eval.nrows();
+                let mut w = Array2::<f64>::zeros((p_eff, valid_indices.len()));
+                for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
+                    let val = eigvals[eig_idx];
+                    let scale = 1.0 / val.sqrt();
+                    let u_col = eigvecs.column(eig_idx);
+                    let mut w_col = w.column_mut(w_col_idx);
+                    Zip::from(&mut w_col)
+                        .and(&u_col)
+                        .for_each(|w_elem, &u_elem| *w_elem = u_elem * scale);
+                }
+                h_pos_factor_w_eval = w;
+            }
+            let h_eff = &h_eff_eval;
 
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             let k_lambda = p.len();
-            let k_r = pirls_result.reparam_result.rs_transformed.len();
+            let k_r = rs_eval.len();
             let k_d = pirls_result.reparam_result.det1.len();
             if !(k_lambda == k_r && k_r == k_d) {
                 return Err(EstimationError::LayoutError(format!(
@@ -5533,10 +5798,9 @@ pub mod internal {
             }
 
             // --- Extract stable transformed quantities ---
-            let beta_transformed = pirls_result.beta_transformed.as_ref();
-            let reparam_result = &pirls_result.reparam_result;
+            let beta_transformed = &beta_eval;
             // Use cached X·Qs from PIRLS
-            let rs_transformed = &reparam_result.rs_transformed;
+            let rs_transformed = &rs_eval;
 
             let includes_prior = false;
             let (gradient_result, gradient_snapshot, applied_truncation_corrections) = {
@@ -5556,7 +5820,7 @@ pub mod internal {
                 let (det1_values, _) = self.structural_penalty_logdet_derivatives(
                     rs_transformed,
                     &lambdas,
-                    reparam_result.e_transformed.nrows(),
+                    e_eval.nrows(),
                     ridge_passport.penalty_logdet_ridge(),
                 )?;
 
@@ -5616,8 +5880,8 @@ pub mod internal {
                         let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
                         let (dp_c, dp_c_grad) = smooth_floor_dp(dp);
 
-                        let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
-                        let mp = self.p.saturating_sub(penalty_rank) as f64;
+                        let penalty_rank = e_eval.nrows();
+                        let mp = h_eff.ncols().saturating_sub(penalty_rank) as f64;
                         let scale = dp_c / (n - mp).max(LAML_RIDGE);
                         // Gaussian profiled-scale identity used by this branch:
                         //   φ̂(ρ) = D_p(ρ)/(n-M_p), with D_p = rss + β̂ᵀSβ̂.
@@ -5688,7 +5952,7 @@ pub mod internal {
                         //   H_+^† = W W^T.
                         // Then tr(H_+^† A_k) = λ_k ||R_k W||_F^2 directly, with no separate
                         // truncated-subspace subtraction term.
-                        let w_pos = bundle.h_pos_factor_w.as_ref();
+                        let w_pos = &h_pos_factor_w_eval;
                         // Exact Gaussian identity REML gradient (profiled scale) in log-smoothing coordinates:
                         //
                         //   V_REML(ρ) =
@@ -5910,7 +6174,7 @@ pub mod internal {
                             //   D(-∇²ℓ)[B_k] = Xᵀ diag(d ⊙ (X B_k)) X,
                             // where d_i = -∂³ℓ_i/∂η_i³. Here `c_vec` stores this per-observation
                             // third derivative quantity in the stabilized logit path.
-                            let w_pos = bundle.h_pos_factor_w.as_ref();
+                            let w_pos = &h_pos_factor_w_eval;
                             let n_obs = pirls_result.solve_mu.len();
 
                             // c_i = dW_ii/dη_i for H = Xᵀ W X + S.
@@ -5922,7 +6186,7 @@ pub mod internal {
                             // h_i = x_i^T H_+^\dagger x_i = ||(XW)_{i,*}||^2.
                             let mut leverage_h_pos = Array1::<f64>::zeros(n_obs);
                             if w_pos.ncols() > 0 {
-                                match &pirls_result.x_transformed {
+                                match &x_transformed_eval {
                                     DesignMatrix::Dense(x_dense) => {
                                         let xw = x_dense.dot(w_pos);
                                         for i in 0..xw.nrows() {
@@ -5933,9 +6197,8 @@ pub mod internal {
                                     DesignMatrix::Sparse(_) => {
                                         for col in 0..w_pos.ncols() {
                                             let w_col = w_pos.column(col).to_owned();
-                                            let xw_col = pirls_result
-                                                .x_transformed
-                                                .matrix_vector_multiply(&w_col);
+                                            let xw_col =
+                                                x_transformed_eval.matrix_vector_multiply(&w_col);
                                             Zip::from(&mut leverage_h_pos)
                                                 .and(&xw_col)
                                                 .for_each(|h, &v| *h += v * v);
@@ -5949,9 +6212,8 @@ pub mod internal {
                             // This removes the per-k O(np) multiply X*v_k from the hot loop.
                             // Section C.1 step (4): r := X^T (w' ⊙ h).
                             let c_times_h = c_vec * &leverage_h_pos;
-                            let r_third = pirls_result
-                                .x_transformed
-                                .transpose_vector_multiply(&c_times_h);
+                            let r_third =
+                                x_transformed_eval.transpose_vector_multiply(&c_times_h);
 
                             // Batch all v_k = H_+^† (S_k beta) into one BLAS-3 path:
                             //   V = W (W^T [S_1 beta, ..., S_K beta]).
@@ -6547,15 +6809,53 @@ pub mod internal {
             // variance before Hutchinson residual estimation.
             let bundle = self.obtain_eval_bundle(rho)?;
             let pirls_result = bundle.pirls_result.as_ref();
-            let beta = pirls_result.beta_transformed.as_ref();
             let reparam_result = &pirls_result.reparam_result;
-            let rs_transformed = &reparam_result.rs_transformed;
-            let h_total = bundle.h_total.as_ref();
-            let h_factor = self.get_faer_factor(rho, h_total);
+
+            // Active-constraint-aware exact Hessian path:
+            // Evaluate all non-Gaussian second-order terms on the current active-free subspace
+            // span(Z), consistent with cost/gradient projection.
+            let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+            let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
+            let mut rs_eval = reparam_result.rs_transformed.clone();
+            let x_dense_orig_arc = pirls_result.x_transformed.to_dense_arc();
+            let mut x_dense_eval = x_dense_orig_arc.as_ref().to_owned();
+            let mut h_total_eval = bundle.h_total.as_ref().clone();
+            let mut e_eval = reparam_result.e_transformed.clone();
+
+            if let Some(z) = free_basis_opt.as_ref() {
+                h_total_eval = Self::project_with_basis(bundle.h_total.as_ref(), z);
+                beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
+                rs_eval = reparam_result
+                    .rs_transformed
+                    .iter()
+                    .map(|r| r.dot(z))
+                    .collect();
+                x_dense_eval = x_dense_orig_arc.as_ref().dot(z);
+                e_eval = reparam_result.e_transformed.dot(z);
+            }
+
+            let beta = &beta_eval;
+            let rs_transformed = &rs_eval;
+            let h_total = &h_total_eval;
+            let use_cached_factor = free_basis_opt.is_none();
+            let h_factor_cached = if use_cached_factor {
+                Some(self.get_faer_factor(rho, h_total))
+            } else {
+                None
+            };
+            let h_factor_local = if use_cached_factor {
+                None
+            } else {
+                Some(self.factorize_faer(h_total))
+            };
             let solve_h = |rhs: &Array2<f64>| -> Array2<f64> {
                 let mut out = rhs.clone();
                 let mut out_view = array2_to_mat_mut(&mut out);
-                h_factor.solve_in_place(out_view.as_mut());
+                if let Some(f) = h_factor_cached.as_ref() {
+                    f.solve_in_place(out_view.as_mut());
+                } else if let Some(f) = h_factor_local.as_ref() {
+                    f.solve_in_place(out_view.as_mut());
+                }
                 out
             };
 
@@ -6564,10 +6864,24 @@ pub mod internal {
                 return Ok(Array2::zeros((0, 0)));
             }
             let lambdas = rho.mapv(f64::exp);
-            let x_dense_arc = pirls_result.x_transformed.to_dense_arc();
-            let x_dense = x_dense_arc.as_ref();
+            let x_dense = &x_dense_eval;
             let n = x_dense.nrows();
             let p_dim = x_dense.ncols();
+            if p_dim == 0 {
+                let (_, d2logs) = self.structural_penalty_logdet_derivatives(
+                    rs_transformed,
+                    &lambdas,
+                    e_eval.nrows(),
+                    bundle.ridge_passport.penalty_logdet_ridge(),
+                )?;
+                let mut hess = Array2::<f64>::zeros((k_count, k_count));
+                for l in 0..k_count {
+                    for k in 0..k_count {
+                        hess[[k, l]] = -0.5 * d2logs[[k, l]];
+                    }
+                }
+                return Ok(hess);
+            }
             let c = &pirls_result.solve_c_array;
             let d = &pirls_result.solve_d_array;
             if c.len() != n || d.len() != n {
@@ -6767,7 +7081,7 @@ pub mod internal {
             let (_, d2logs) = self.structural_penalty_logdet_derivatives(
                 rs_transformed,
                 &lambdas,
-                reparam_result.e_transformed.nrows(),
+                e_eval.nrows(),
                 bundle.ridge_passport.penalty_logdet_ridge(),
             )?;
 
