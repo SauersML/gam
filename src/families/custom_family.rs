@@ -752,6 +752,32 @@ fn effective_solver_ridge(ridge_floor: f64) -> f64 {
     ridge_floor.max(1e-15)
 }
 
+fn block_quadratic_penalty(
+    beta: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> f64 {
+    let mut value = 0.5 * beta.dot(&s_lambda.dot(beta));
+    if ridge_policy.include_quadratic_penalty {
+        value += 0.5 * ridge * beta.dot(beta);
+    }
+    value
+}
+
+fn total_quadratic_penalty(
+    states: &[ParameterBlockState],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> f64 {
+    let mut total = 0.0;
+    for (state, s_lambda) in states.iter().zip(s_lambdas.iter()) {
+        total += block_quadratic_penalty(&state.beta, s_lambda, ridge, ridge_policy);
+    }
+    total
+}
+
 fn stable_logdet_with_ridge_policy(
     matrix: &Array2<f64>,
     ridge_floor: f64,
@@ -994,6 +1020,17 @@ fn inner_blockwise_fit<F: CustomFamily>(
 ) -> Result<BlockwiseInnerResult, String> {
     let mut states = build_block_states(family, specs)?;
     refresh_all_block_etas(family, specs, &mut states)?;
+    let mut s_lambdas = Vec::with_capacity(specs.len());
+    for (b, spec) in specs.iter().enumerate() {
+        let p = spec.design.ncols();
+        let lambdas = block_log_lambdas[b].mapv(f64::exp);
+        let mut s_lambda = Array2::<f64>::zeros((p, p));
+        for (k, s) in spec.penalties.iter().enumerate() {
+            s_lambda.scaled_add(lambdas[k], s);
+        }
+        s_lambdas.push(s_lambda);
+    }
+    let ridge = effective_solver_ridge(options.ridge_floor);
     let mut cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; specs.len()];
     if let Some(seed) = warm_start
         && seed.block_beta.len() == states.len()
@@ -1007,14 +1044,17 @@ fn inner_blockwise_fit<F: CustomFamily>(
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
     }
-    let mut last_ll = f64::NEG_INFINITY;
+    let initial_eval = family.evaluate(&states)?;
+    let mut current_penalty =
+        total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+    let mut last_objective = -initial_eval.log_likelihood + current_penalty;
     let mut converged = false;
     let mut cycles_done = 0usize;
 
     for cycle in 0..options.inner_max_cycles {
         let mut max_beta_step = 0.0_f64;
 
-        let mut ll_cycle_prev = last_ll;
+        let mut objective_cycle_prev = last_objective;
         for b in 0..specs.len() {
             // Keep all blocks synchronized with any dynamic geometry.
             refresh_all_block_etas(family, specs, &mut states)?;
@@ -1031,12 +1071,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
             let work = &eval.block_working_sets[b];
             let p = spec.design.ncols();
             let linear_constraints = family.block_linear_constraints(&states, b, spec)?;
-
-            let lambdas = block_log_lambdas[b].mapv(f64::exp);
-            let mut s_lambda = Array2::<f64>::zeros((p, p));
-            for (k, s) in spec.penalties.iter().enumerate() {
-                s_lambda.scaled_add(lambdas[k], s);
-            }
+            let s_lambda = &s_lambdas[b];
 
             let beta_new_raw = match work {
                 BlockWorkingSet::Diagonal {
@@ -1088,7 +1123,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                         let rhs = rhs_opt.ok_or_else(|| {
                             "missing weighted RHS in constrained diagonal solve".to_string()
                         })?;
-                        lhs += &s_lambda;
+                        lhs += s_lambda;
                         let (beta_constrained, active_set) =
                             solve_quadratic_with_linear_constraints(
                                 &lhs,
@@ -1110,7 +1145,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                             &x_dyn,
                             &y_star,
                             &w_clamped,
-                            &s_lambda,
+                            s_lambda,
                             options.ridge_floor,
                             options.ridge_policy,
                         )?
@@ -1133,7 +1168,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                         ));
                     }
                     let mut lhs = hessian.clone();
-                    lhs += &s_lambda;
+                    lhs += s_lambda;
                     // Newton system in coefficient space:
                     //   β_new = β_old - (H+S)^{-1}(-g + Sβ_old)
                     // Rearranged to a single linear solve:
@@ -1179,13 +1214,15 @@ fn inner_blockwise_fit<F: CustomFamily>(
             let beta_new = family.post_update_beta(beta_new_raw)?;
             let beta_old = states[b].beta.clone();
             let delta = &beta_new - &beta_old;
+            let old_block_penalty =
+                block_quadratic_penalty(&beta_old, s_lambda, ridge, options.ridge_policy);
             let step = delta.iter().copied().map(f64::abs).fold(0.0, f64::max);
             max_beta_step = max_beta_step.max(step);
             if step <= options.inner_tol {
                 continue;
             }
 
-            // Damped update: require non-decreasing likelihood under dynamic geometry.
+            // Damped update: require non-increasing penalized objective under dynamic geometry.
             let mut accepted = false;
             for bt in 0..8 {
                 let alpha = 0.5f64.powi(bt);
@@ -1193,9 +1230,14 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 let trial_beta = family.post_update_beta(trial_beta_raw)?;
                 states[b].beta = trial_beta;
                 refresh_all_block_etas(family, specs, &mut states)?;
-                let trial_ll = family.evaluate(&states)?.log_likelihood;
-                if trial_ll.is_finite() && trial_ll >= ll_cycle_prev - 1e-10 {
-                    ll_cycle_prev = trial_ll;
+                let trial_eval = family.evaluate(&states)?;
+                let trial_block_penalty =
+                    block_quadratic_penalty(&states[b].beta, s_lambda, ridge, options.ridge_policy);
+                let trial_penalty = current_penalty - old_block_penalty + trial_block_penalty;
+                let trial_objective = -trial_eval.log_likelihood + trial_penalty;
+                if trial_objective.is_finite() && trial_objective <= objective_cycle_prev + 1e-10 {
+                    objective_cycle_prev = trial_objective;
+                    current_penalty = trial_penalty;
                     accepted = true;
                     break;
                 }
@@ -1208,34 +1250,21 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
         refresh_all_block_etas(family, specs, &mut states)?;
         let eval = family.evaluate(&states)?;
-        let ll = eval.log_likelihood;
-        let ll_change = (ll - last_ll).abs();
-        last_ll = ll;
+        current_penalty = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+        let objective = -eval.log_likelihood + current_penalty;
+        let objective_change = (objective - last_objective).abs();
+        last_objective = objective;
         cycles_done = cycle + 1;
 
-        let ll_tol = options.inner_tol * (1.0 + ll.abs());
-        if max_beta_step <= options.inner_tol && ll_change <= ll_tol {
+        let objective_tol = options.inner_tol * (1.0 + objective.abs());
+        if max_beta_step <= options.inner_tol && objective_change <= objective_tol {
             converged = true;
             break;
         }
     }
 
     let final_eval = family.evaluate(&states)?;
-    let mut penalty_value = 0.0;
-    // Keep the objective coherent with the stabilized block solves/log-dets:
-    // Single policy contract: if solve path includes ridge in curvature, include
-    // the same ridge in quadratic penalty iff policy demands it.
-    let ridge = effective_solver_ridge(options.ridge_floor);
-    for (b, spec) in specs.iter().enumerate() {
-        let lambdas = block_log_lambdas[b].mapv(f64::exp);
-        for (k, s) in spec.penalties.iter().enumerate() {
-            let sb = s.dot(&states[b].beta);
-            penalty_value += 0.5 * lambdas[k] * states[b].beta.dot(&sb);
-        }
-        if options.ridge_policy.include_quadratic_penalty {
-            penalty_value += 0.5 * ridge * states[b].beta.dot(&states[b].beta);
-        }
-    }
+    let penalty_value = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
 
     let (block_logdet_h, block_logdet_s) =
         blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
@@ -2100,6 +2129,50 @@ mod tests {
             "penalized objective should equal ridge quadratic term when ll=0 and S=0; got {}, expected {}",
             result.penalized_objective,
             expected_penalty
+        );
+    }
+
+    #[test]
+    fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() {
+        let family = OneBlockGaussianFamily { y: array![1.0] };
+        let spec = ParameterBlockSpec {
+            name: "b0".to_string(),
+            design: DesignMatrix::Dense(array![[1.0]]),
+            offset: array![0.0],
+            penalties: vec![array![[1.0]]],
+            initial_log_lambdas: array![10.0_f64.ln()],
+            initial_beta: Some(array![1.0]),
+        };
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 20,
+            inner_tol: 1e-10,
+            outer_max_iter: 1,
+            outer_tol: 1e-8,
+            min_weight: 1e-12,
+            ridge_floor: 0.0,
+            ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
+            use_reml_objective: false,
+        };
+        let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
+        let inner = inner_blockwise_fit(
+            &family,
+            &[spec],
+            &per_block_log_lambdas,
+            &options,
+            None,
+        )
+        .expect("inner blockwise fit should succeed");
+
+        let beta = inner.block_states[0].beta[0];
+        assert!(
+            beta < 0.5,
+            "beta should shrink toward penalized mode; got {}",
+            beta
+        );
+        assert!(
+            inner.log_likelihood < -1e-8,
+            "raw log-likelihood should drop for this strongly penalized move; got {}",
+            inner.log_likelihood
         );
     }
 
