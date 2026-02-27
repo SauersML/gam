@@ -1011,13 +1011,12 @@ def _geo_disease_eas_scenario_cfg(name):
 
 
 def _papuan_oce_scenario_cfg(name):
-    m = re.match(r"^papuan_oce(4)?_(tp|duchon|matern|psperpc)(_basic)?_k([0-9]+)$", str(name))
+    m = re.match(r"^papuan_oce(4)?_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
     if m is None:
         return None
     is_four_pc = m.group(1) is not None
     basis_code = m.group(2)
-    is_basic = m.group(3) is not None
-    knots = max(4, int(m.group(4)))
+    knots = max(4, int(m.group(3)))
     n_pcs = 4 if is_four_pc else 16
     if basis_code == "psperpc":
         return {
@@ -1027,7 +1026,6 @@ def _papuan_oce_scenario_cfg(name):
             "knots": knots,
             "basis_code": basis_code,
             "n_pcs": n_pcs,
-            "is_basic": is_basic,
         }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
     return {
@@ -1037,7 +1035,6 @@ def _papuan_oce_scenario_cfg(name):
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": n_pcs,
-        "is_basic": is_basic,
     }
 
 
@@ -1670,21 +1667,7 @@ def _rust_fit_mapping(scenario_name):
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
         ),
-        "geo_disease_tp_basic": dict(
-            family="binomial-logit",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="thinplate",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
-            knots=12,
-        ),
         "geo_disease_duchon": dict(
-            family="binomial-logit",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="duchon",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
-            knots=12,
-        ),
-        "geo_disease_duchon_basic": dict(
             family="binomial-logit",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
             smooth_basis="duchon",
@@ -1705,21 +1688,7 @@ def _rust_fit_mapping(scenario_name):
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
         ),
-        "geo_disease_matern_basic": dict(
-            family="binomial-logit",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="matern",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
-            knots=12,
-        ),
         "geo_disease_ps_per_pc": dict(
-            family="binomial-logit",
-            smooth_cols=[f"pc{i}" for i in range(1, 17)],
-            smooth_basis="ps",
-            linear_cols=[],
-            knots=10,
-        ),
-        "geo_disease_ps_per_pc_basic": dict(
             family="binomial-logit",
             smooth_cols=[f"pc{i}" for i in range(1, 17)],
             smooth_basis="ps",
@@ -1749,10 +1718,8 @@ def _rust_formula_for_scenario(scenario_name, ds):
         raise RuntimeError(
             f"Invalid knot count {knot_count} for scenario '{scenario_name}'; expected >= 0."
         )
-    # Keep shrinkage policy explicit and aligned with mgcv `select`:
-    # - default to shrinkage on non-`_basic` scenarios
-    # - allow per-scenario override via cfg["double_penalty"].
-    use_double_penalty = bool(cfg.get("double_penalty", not scenario_name.endswith("_basic")))
+    # Keep shrinkage policy explicit and aligned with mgcv `select`.
+    use_double_penalty = bool(cfg.get("double_penalty", True))
     dp_opt = f", double_penalty={'true' if use_double_penalty else 'false'}"
     smooth_cols = cfg.get("smooth_cols")
     if smooth_cols:
@@ -1947,7 +1914,7 @@ def rust_cli_cv_args(scenario_name, ds):
             "smooth_basis": papuan_cfg["smooth_basis"],
             "linear_cols": papuan_cfg["linear_cols"],
             "knots": papuan_cfg["knots"],
-            "double_penalty": not papuan_cfg["is_basic"],
+            "double_penalty": True,
         }
     elif subpop_cfg is not None:
         cfg = {
@@ -2036,14 +2003,6 @@ def rust_cli_cv_args(scenario_name, ds):
             knots=12,
             double_penalty=True,
         ),
-        "geo_disease_tp_basic": dict(
-            family="binomial",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="thinplate",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
-            knots=12,
-            double_penalty=False,
-        ),
         "geo_disease_duchon": dict(
             family="binomial",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
@@ -2051,14 +2010,6 @@ def rust_cli_cv_args(scenario_name, ds):
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
             double_penalty=True,
-        ),
-        "geo_disease_duchon_basic": dict(
-            family="binomial",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="duchon",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
-            knots=12,
-            double_penalty=False,
         ),
         "geo_disease_matern": dict(
             family="binomial",
@@ -2077,14 +2028,6 @@ def rust_cli_cv_args(scenario_name, ds):
             knots=12,
             double_penalty=True,
         ),
-        "geo_disease_matern_basic": dict(
-            family="binomial",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="matern",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
-            knots=12,
-            double_penalty=False,
-        ),
         "geo_disease_ps_per_pc": dict(
             family="binomial",
             smooth_cols=[f"pc{i}" for i in range(1, 17)],
@@ -2092,14 +2035,6 @@ def rust_cli_cv_args(scenario_name, ds):
             linear_cols=[],
             knots=10,
             double_penalty=True,
-        ),
-        "geo_disease_ps_per_pc_basic": dict(
-            family="binomial",
-            smooth_cols=[f"pc{i}" for i in range(1, 17)],
-            smooth_basis="ps",
-            linear_cols=[],
-            knots=10,
-            double_penalty=False,
         ),
         }.get(scenario_name)
     if cfg is None:
@@ -2470,9 +2405,7 @@ def run_external_mgcv_cv(scenario):
     folds = folds_for_dataset(ds)
     mgcv_formula = None
     rust_cfg = _rust_fit_mapping(scenario["name"])
-    use_select = bool(
-        (rust_cfg or {}).get("double_penalty", not scenario["name"].endswith("_basic"))
-    )
+    use_select = bool((rust_cfg or {}).get("double_penalty", True))
     if ds["family"] != "survival":
         mgcv_formula = _mgcv_formula_for_scenario(scenario["name"], ds)
         if not mgcv_formula:
@@ -2815,12 +2748,9 @@ def run_external_pygam_cv(scenario):
                 model_spec = "LogisticGAM(s(0, n_splines=8))"
             elif scenario["name"] in {
                 "geo_disease_tp",
-                "geo_disease_tp_basic",
                 "geo_disease_duchon",
-                "geo_disease_duchon_basic",
                 "geo_disease_shrinkage",
                 "geo_disease_matern",
-                "geo_disease_matern_basic",
             }:
                 terms = s(0, n_splines=12) + s(1, n_splines=12) + s(2, n_splines=12)
                 for j in range(3, x.shape[1]):
@@ -2830,7 +2760,7 @@ def run_external_pygam_cv(scenario):
                     "LogisticGAM(s(0)+s(1)+s(2)+linear(3:15), n_splines=12) "
                     "[pygam basis fallback=ps]"
                 )
-            elif scenario["name"] in {"geo_disease_ps_per_pc", "geo_disease_ps_per_pc_basic"}:
+            elif scenario["name"] in {"geo_disease_ps_per_pc"}:
                 terms = s(0, n_splines=10)
                 for j in range(1, x.shape[1]):
                     terms = terms + s(j, n_splines=10)

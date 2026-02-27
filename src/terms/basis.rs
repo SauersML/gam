@@ -220,10 +220,10 @@ pub fn create_basis<O: BasisOutputFormat>(
     O::build_basis(data, degree, eval_kind, knot_vec)
 }
 
-/// Applies first-order linear extension outside `[0, 1]` to a basis matrix
+/// Applies first-order linear extension outside a knot-domain interval to a basis matrix
 /// that was evaluated at clamped coordinates.
 ///
-/// Given `z_raw` and `z_clamped = clamp(z_raw, 0, 1)`, this mutates
+/// Given `z_raw` and `z_clamped = clamp(z_raw, left, right)`, this mutates
 /// `basis_values` in-place as:
 /// `B_ext(z_raw) = B(z_clamped) + (z_raw - z_clamped) * B'(z_clamped)`.
 pub fn apply_linear_extension_from_first_derivative(
@@ -320,7 +320,7 @@ impl BasisOutputFormat for Dense {
                 let start = col_ptr[col];
                 let end = col_ptr[col + 1];
                 for idx in start..end {
-                    dense[[row_idx[idx], col]] = values[idx];
+                    dense[[row_idx[idx], col]] += values[idx];
                 }
             }
             dense
@@ -748,6 +748,50 @@ impl BasisStorage for DenseStorage {
                     &mut values,
                     |col_j, v| row_slice[col_j] = v,
                 );
+            }
+        }
+
+        if num_basis_functions > 0 {
+            let left = knot_view[degree];
+            let right = knot_view[num_basis_functions];
+
+            // For linear continuation, d/dx outside domain should equal the boundary slope.
+            // Sparse derivative kernels still zero outside, so patch dense rows here.
+            if matches!(eval_kind, BasisEvalKind::FirstDerivative) {
+                let num_basis_lower = knot_view.len().saturating_sub(degree);
+                let mut lower_basis = vec![0.0; num_basis_lower];
+                let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(1));
+                for (i, &x) in data.iter().enumerate() {
+                    if x >= left && x <= right {
+                        continue;
+                    }
+                    let x_c = x.clamp(left, right);
+                    let mut row = basis_matrix.row_mut(i);
+                    let row_slice = row
+                        .as_slice_mut()
+                        .expect("basis matrix rows should be contiguous");
+                    evaluate_bspline_derivative_scalar_into(
+                        x_c,
+                        knot_view,
+                        degree,
+                        row_slice,
+                        &mut lower_basis,
+                        &mut lower_scratch,
+                    )?;
+                }
+            }
+
+            // Apply C1 linear continuation outside the knot domain for basis-value
+            // evaluation so extrapolation is not artificially flat.
+            if matches!(eval_kind, BasisEvalKind::Basis) {
+                let z_clamped = data.mapv(|x| x.clamp(left, right));
+                apply_linear_extension_from_first_derivative(
+                    data,
+                    z_clamped.view(),
+                    knot_view,
+                    degree,
+                    &mut basis_matrix,
+                )?;
             }
         }
 
@@ -1349,6 +1393,75 @@ pub fn create_difference_penalty_matrix(
     // The penalty matrix S = D' * D
     let s = fast_ata(&d);
     Ok(s)
+}
+
+fn is_effectively_uniform_knot_geometry(knot_vector: &Array1<f64>, degree: usize) -> bool {
+    if knot_vector.len() <= degree + 2 {
+        return true;
+    }
+
+    let min_k = knot_vector[0];
+    let max_k = knot_vector[knot_vector.len() - 1];
+    let scale = (max_k - min_k).abs().max(1.0);
+    let tol = 1e-10 * scale;
+
+    // Any repeated interior knot (beyond clamped boundaries) implies irregular geometry.
+    let mut left = 0usize;
+    while left + 1 < knot_vector.len() && (knot_vector[left + 1] - min_k).abs() <= tol {
+        left += 1;
+    }
+    let mut right = knot_vector.len() - 1;
+    while right > 0 && (knot_vector[right - 1] - max_k).abs() <= tol {
+        right -= 1;
+    }
+    if right > left + 1 {
+        for i in (left + 1)..=right {
+            if (knot_vector[i] - knot_vector[i - 1]).abs() <= tol {
+                return false;
+            }
+        }
+    }
+
+    let mut breakpoints = Vec::<f64>::with_capacity(knot_vector.len());
+    for &k in knot_vector {
+        if breakpoints
+            .last()
+            .map(|last| (k - *last).abs() > tol)
+            .unwrap_or(true)
+        {
+            breakpoints.push(k);
+        }
+    }
+
+    if breakpoints.len() <= 2 {
+        return true;
+    }
+
+    let h0 = breakpoints[1] - breakpoints[0];
+    for i in 2..breakpoints.len() {
+        let hi = breakpoints[i] - breakpoints[i - 1];
+        if (hi - h0).abs() > 1e-8 * scale {
+            return false;
+        }
+    }
+    true
+}
+
+/// Selects Greville abscissae for difference-penalty scaling when knot geometry is non-uniform.
+///
+/// For regular, uniformly spaced breakpoint grids this returns `None` to preserve
+/// classical P-spline integer-difference penalties. For irregular grids (including
+/// repeated interior knots), this returns `Some(Greville)` so divided-difference
+/// scaling is applied by [`create_difference_penalty_matrix`].
+pub fn penalty_greville_abscissae_for_knots(
+    knot_vector: &Array1<f64>,
+    degree: usize,
+) -> Result<Option<Array1<f64>>, BasisError> {
+    if is_effectively_uniform_knot_geometry(knot_vector, degree) {
+        Ok(None)
+    } else {
+        Ok(Some(compute_greville_abscissae(knot_vector, degree)?))
+    }
 }
 
 /// Thin-plate regression spline basis and penalty (order m=2).
@@ -1971,7 +2084,12 @@ pub fn build_bspline_basis_1d(
     };
     let design_raw = (*basis).clone();
     let p_raw = design_raw.ncols();
-    let s_bend_raw = create_difference_penalty_matrix(p_raw, spec.penalty_order, None)?;
+    let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
+    let s_bend_raw = create_difference_penalty_matrix(
+        p_raw,
+        spec.penalty_order,
+        greville_for_penalty.as_ref().map(|g| g.view()),
+    )?;
     let mut penalties_raw = vec![s_bend_raw.clone()];
     if spec.double_penalty {
         penalties_raw.push(nullspace_shrinkage_penalty(&s_bend_raw)?);
@@ -4966,6 +5084,56 @@ mod tests {
     }
 
     #[test]
+    fn test_penalty_greville_selector_none_for_uniform_breakpoints() {
+        let degree = 3usize;
+        let knots = internal::generate_full_knot_vector((0.0, 1.0), 5, degree).unwrap();
+        let g = penalty_greville_abscissae_for_knots(&knots, degree).unwrap();
+        assert!(g.is_none());
+    }
+
+    #[test]
+    fn test_build_bspline_basis_1d_quantile_uses_divided_difference_penalty() {
+        let x = array![0.0, 0.1, 0.2, 0.3, 0.35, 0.4, 0.45, 10.0, 10.5, 11.0, 12.0];
+        let spec = BSplineBasisSpec {
+            degree: 2,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(3),
+                placement: BSplineKnotPlacement::Quantile,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+        };
+
+        let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        let knots = match &built.metadata {
+            BasisMetadata::BSpline1D { knots, .. } => knots,
+            _ => panic!("expected BSpline1D metadata"),
+        };
+        let g = penalty_greville_abscissae_for_knots(knots, spec.degree)
+            .unwrap()
+            .expect("quantile knots should trigger Greville scaling");
+        let expected = create_difference_penalty_matrix(
+            built.design.ncols(),
+            spec.penalty_order,
+            Some(g.view()),
+        )
+        .unwrap();
+
+        let got = &built.penalties[0];
+        let mut max_abs = 0.0_f64;
+        for i in 0..got.nrows() {
+            for j in 0..got.ncols() {
+                max_abs = max_abs.max((got[[i, j]] - expected[[i, j]]).abs());
+            }
+        }
+        assert!(
+            max_abs < 1e-10,
+            "quantile penalty mismatch: max_abs_diff={max_abs:.3e}"
+        );
+    }
+
+    #[test]
     fn test_bspline_identifiability_default_weighted_sum_to_zero() {
         let x = Array::linspace(0.0, 1.0, 40);
         let spec = BSplineBasisSpec {
@@ -5312,6 +5480,76 @@ mod tests {
         for i in 0..left_boundary.len() {
             assert_abs_diff_eq!(left_out[i], left_boundary[i], epsilon = 1e-12);
             assert_abs_diff_eq!(right_out[i], right_boundary[i], epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_create_basis_uses_linear_extension_outside_domain() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
+        let degree = 3usize;
+        let x = array![-0.5, 4.5];
+        let x_c = array![0.0, 4.0];
+        let (b_raw, _) = create_basis::<Dense>(
+            x.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .unwrap();
+        let (b_c, _) = create_basis::<Dense>(
+            x_c.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .unwrap();
+        let (db_c, _) = create_basis::<Dense>(
+            x_c.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .unwrap();
+
+        let b_raw = b_raw.as_ref();
+        let b_c = b_c.as_ref();
+        let db_c = db_c.as_ref();
+        for i in 0..x.len() {
+            let dz = x[i] - x_c[i];
+            for j in 0..b_raw.ncols() {
+                let expected = b_c[[i, j]] + dz * db_c[[i, j]];
+                assert_abs_diff_eq!(b_raw[[i, j]], expected, epsilon = 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_basis_first_derivative_uses_boundary_slope_outside_domain() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
+        let degree = 3usize;
+        let x = array![-0.25, 4.25];
+        let x_c = array![0.0, 4.0];
+        let (db_raw, _) = create_basis::<Dense>(
+            x.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .unwrap();
+        let (db_c, _) = create_basis::<Dense>(
+            x_c.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .unwrap();
+        let db_raw = db_raw.as_ref();
+        let db_c = db_c.as_ref();
+        assert_eq!(db_raw.dim(), db_c.dim());
+        for i in 0..db_raw.nrows() {
+            for j in 0..db_raw.ncols() {
+                assert_abs_diff_eq!(db_raw[[i, j]], db_c[[i, j]], epsilon = 1e-10);
+            }
         }
     }
 

@@ -30,6 +30,10 @@ use gam::joint::{
 };
 use gam::matrix::DesignMatrix;
 use gam::probability::{inverse_link_array, normal_cdf_approx, standard_normal_quantile};
+use gam::sigma_link::{
+    bounded_sigma_and_deriv_from_eta as sigma_and_deriv_from_eta,
+    bounded_sigma_from_eta_scalar as sigma_from_eta_scalar,
+};
 use gam::smooth::{
     LinearTermSpec, MaternKappaOptimizationOptions, RandomEffectTermSpec, ShapeConstraint,
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
@@ -1095,7 +1099,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                             [cov_hl_i, cov_tl_i, var_ls],
                         ],
                         |h, t, ls| {
-                            let sigma = ls.exp().clamp(sigma_min, sigma_max);
+                            let sigma = sigma_from_eta_scalar(ls, sigma_min, sigma_max);
                             let eta_loc = -h - t / sigma.max(1e-12);
                             distribution.cdf(eta_loc).clamp(0.0, 1.0)
                         },
@@ -1324,7 +1328,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         let eta_noise = design_noise.design.dot(&beta_noise);
         let sigma_min = model.sigma_min.unwrap_or(1e-6);
         let sigma_max = model.sigma_max.unwrap_or(1e6);
-        let sigma = eta_noise.mapv(|v| v.exp().clamp(sigma_min, sigma_max));
+        let sigma = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max).0;
 
         let mut mean_lo = None;
         let mut mean_hi = None;
@@ -1458,7 +1462,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                         [eta_t[i], eta_noise[i]],
                         [[var_t, cov_tls], [cov_tls, var_ls]],
                         |t, ls| {
-                            let sigma = ls.exp().clamp(sigma_min, sigma_max);
+                            let sigma = sigma_from_eta_scalar(ls, sigma_min, sigma_max);
                             normal_cdf_approx((-t / sigma.max(1e-12)).clamp(-30.0, 30.0))
                                 .clamp(1e-10, 1.0 - 1e-10)
                         },
@@ -1534,7 +1538,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                         [eta_t[i], eta_noise[i]],
                         [[var_t, cov_tls], [cov_tls, var_ls]],
                         |t, ls| {
-                            let sigma = ls.exp().clamp(sigma_min, sigma_max).max(1e-12);
+                            let sigma = sigma_from_eta_scalar(ls, sigma_min, sigma_max).max(1e-12);
                             let q0 = (-t / sigma).clamp(-30.0, 30.0);
                             let xw = saved_probit_wiggle_basis_row_scalar(q0, &model)?;
                             if xw.len() != p_w {
@@ -3303,10 +3307,8 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         let mean = design.design.dot(&beta_mu);
         let sigma_min = model.sigma_min.unwrap_or(1e-6);
         let sigma_max = model.sigma_max.unwrap_or(1e6);
-        let sigma = design_noise
-            .design
-            .dot(&beta_noise)
-            .mapv(|v| v.exp().clamp(sigma_min, sigma_max));
+        let eta_noise = design_noise.design.dot(&beta_noise);
+        let sigma = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max).0;
         gam::generative::GenerativeSpec {
             mean,
             noise: gam::generative::NoiseModel::Gaussian { sigma },
@@ -3334,10 +3336,8 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         let sigma_min = model.sigma_min.unwrap_or(0.05);
         let sigma_max = model.sigma_max.unwrap_or(20.0);
         let eta_t = design.design.dot(&beta_t);
-        let sigma = design_noise
-            .design
-            .dot(&beta_noise)
-            .mapv(|v| v.exp().clamp(sigma_min, sigma_max));
+        let eta_noise = design_noise.design.dot(&beta_noise);
+        let sigma = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max).0;
         let q0 = Array1::from_iter(
             eta_t
                 .iter()
@@ -5062,24 +5062,6 @@ fn response_interval_from_mean_sd(
             .map(|(&m, &s)| (m + z * s).clamp(lo, hi)),
     );
     (lower, upper)
-}
-
-fn sigma_and_deriv_from_eta(
-    eta: ArrayView1<'_, f64>,
-    sigma_min: f64,
-    sigma_max: f64,
-) -> (Array1<f64>, Array1<f64>) {
-    let span = (sigma_max - sigma_min).max(1e-12);
-    let mut sigma = Array1::<f64>::zeros(eta.len());
-    let mut ds = Array1::<f64>::zeros(eta.len());
-    for i in 0..eta.len() {
-        let z = eta[i].clamp(-40.0, 40.0);
-        let p = 1.0 / (1.0 + (-z).exp());
-        let d1 = p * (1.0 - p);
-        sigma[i] = sigma_min + span * p;
-        ds[i] = span * d1;
-    }
-    (sigma, ds)
 }
 
 fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, String> {

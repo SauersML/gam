@@ -610,11 +610,11 @@ pub(crate) fn compute_smoothing_correction(
 
     // Step 2: Build V_rho by inverting the LAML Hessian in rho-space.
     // Prefer the exact analytic Hessian; fallback to finite differences.
-    let mut hessian_rho = match reml_state.compute_laml_hessian_exact(final_rho) {
+    let mut hessian_rho = match reml_state.compute_laml_hessian_consistent(final_rho) {
         Ok(h) => h,
         Err(err) => {
             log::warn!(
-                "Exact LAML Hessian unavailable ({}); falling back to FD Hessian for smoothing correction.",
+                "LAML Hessian unavailable ({}); falling back to FD Hessian for smoothing correction.",
                 err
             );
             let h_step = 1e-4;
@@ -794,7 +794,7 @@ fn run_newton_for_candidate(
                     Ok(grad) if grad.iter().all(|g| g.is_finite()) => grad,
                     _ => return Err(ObjectiveEvalError::recoverable("non-finite REML gradient")),
                 };
-                let hess = match reml_state.compute_laml_hessian_exact(rho) {
+                let hess = match reml_state.compute_laml_hessian_consistent(rho) {
                     Ok(h) if h.iter().all(|v| v.is_finite()) => h,
                     _ => return Err(ObjectiveEvalError::recoverable("non-finite REML Hessian")),
                 };
@@ -3459,6 +3459,32 @@ pub mod internal {
             grad
         }
 
+        /// Add the exact Hessian of the soft rho prior in place.
+        ///
+        /// Prior definition per coordinate:
+        ///   C_i(rho_i) = w * log(cosh(a * rho_i)),
+        ///   a = RHO_SOFT_PRIOR_SHARPNESS / RHO_BOUND,
+        ///   w = RHO_SOFT_PRIOR_WEIGHT.
+        ///
+        /// Then:
+        ///   dC_i/drho_i   = w * a * tanh(a * rho_i),
+        ///   d²C_i/drho_i² = w * a² * sech²(a * rho_i)
+        ///                = w * a² * (1 - tanh²(a * rho_i)).
+        ///
+        /// The prior is separable across coordinates, so off-diagonals are zero.
+        fn add_soft_prior_hessian_in_place(&self, rho: &Array1<f64>, hess: &mut Array2<f64>) {
+            let len = rho.len();
+            if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
+                return;
+            }
+            let a = RHO_SOFT_PRIOR_SHARPNESS / RHO_BOUND;
+            let prefactor = RHO_SOFT_PRIOR_WEIGHT * a * a;
+            for i in 0..len {
+                let t = (a * rho[i]).tanh();
+                hess[[i, i]] += prefactor * (1.0 - t * t);
+            }
+        }
+
         /// Returns the effective Hessian and the ridge value used (if any).
         /// Uses the same Hessian matrix in both cost and gradient calculations.
         ///
@@ -5004,9 +5030,7 @@ pub mod internal {
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-            if self.config.link_function() != LinkFunction::Identity
-                && (self.config.objective_consistent_fd_gradient || p.len() == 1)
-            {
+            if self.uses_objective_consistent_fd_gradient(p) {
                 // Fixed-choice gradient definition for this fit (no mid-flight swapping):
                 // use objective-consistent FD in the known sign-unstable 1D non-Gaussian path.
                 return compute_fd_gradient_internal(self, p, false, false);
@@ -5025,6 +5049,12 @@ pub mod internal {
             };
             let analytic = self.compute_gradient_with_bundle(p, &bundle)?;
             Ok(analytic)
+        }
+
+        #[inline]
+        fn uses_objective_consistent_fd_gradient(&self, rho: &Array1<f64>) -> bool {
+            self.config.link_function() != LinkFunction::Identity
+                && (self.config.objective_consistent_fd_gradient || rho.len() == 1)
         }
 
         /// Helper function that computes gradient using a shared evaluation bundle
@@ -6040,10 +6070,33 @@ pub mod internal {
             // keep the objective differentiable w.r.t. ρ under the implemented
             // positive-part convention (A+-fixed active subspace assumption).
             let k_count = lambdas.len();
-            let p_dim = self.p;
-            if k_count == 0 || structural_rank == 0 {
+            if rs_transformed.len() != k_count {
+                return Err(EstimationError::LayoutError(format!(
+                    "Penalty root/lambda count mismatch in structural logdet derivatives: roots={}, lambdas={}",
+                    rs_transformed.len(),
+                    k_count
+                )));
+            }
+            if k_count == 0 {
                 return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
             }
+
+            // IMPORTANT: dimensions must follow the *actual* transformed coefficient frame
+            // presented by callers (possibly active-constraint projected), not self.p.
+            let p_dim = rs_transformed[0].ncols();
+            for (k, r_k) in rs_transformed.iter().enumerate() {
+                if r_k.ncols() != p_dim {
+                    return Err(EstimationError::LayoutError(format!(
+                        "Inconsistent penalty root width at k={k}: got {}, expected {}",
+                        r_k.ncols(),
+                        p_dim
+                    )));
+                }
+            }
+            if p_dim == 0 || structural_rank == 0 {
+                return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
+            }
+
             let rank = structural_rank.min(p_dim);
             if rank == 0 {
                 return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
@@ -6135,6 +6188,71 @@ pub mod internal {
             Ok((det1, det2))
         }
 
+        fn compute_hessian_fd_from_active_gradient(
+            &self,
+            rho: &Array1<f64>,
+        ) -> Result<Array2<f64>, EstimationError> {
+            let k = rho.len();
+            let mut h = Array2::<f64>::zeros((k, k));
+            if k == 0 {
+                return Ok(h);
+            }
+
+            for j in 0..k {
+                let h_step = (1e-4 * (1.0 + rho[j].abs())).max(1e-6);
+                let mut rho_plus = rho.clone();
+                rho_plus[j] += h_step;
+                let mut rho_minus = rho.clone();
+                rho_minus[j] -= h_step;
+
+                let grad_plus = self.compute_gradient(&rho_plus)?;
+                let grad_minus = self.compute_gradient(&rho_minus)?;
+                if grad_plus.len() != k || grad_minus.len() != k {
+                    return Err(EstimationError::RemlOptimizationFailed(
+                        "FD Hessian gradient length mismatch".to_string(),
+                    ));
+                }
+
+                for i in 0..k {
+                    h[[i, j]] = (grad_plus[i] - grad_minus[i]) / (2.0 * h_step);
+                }
+            }
+
+            for i in 0..k {
+                for j in 0..i {
+                    let avg = 0.5 * (h[[i, j]] + h[[j, i]]);
+                    h[[i, j]] = avg;
+                    h[[j, i]] = avg;
+                }
+            }
+
+            if h.iter().any(|v| !v.is_finite()) {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "FD Hessian produced non-finite values".to_string(),
+                ));
+            }
+            Ok(h)
+        }
+
+        pub(super) fn compute_laml_hessian_consistent(
+            &self,
+            rho: &Array1<f64>,
+        ) -> Result<Array2<f64>, EstimationError> {
+            if self.uses_objective_consistent_fd_gradient(rho) {
+                return self.compute_hessian_fd_from_active_gradient(rho);
+            }
+            match self.compute_laml_hessian_exact(rho) {
+                Ok(h) => Ok(h),
+                Err(err) => {
+                    log::warn!(
+                        "Exact LAML Hessian unavailable ({}); falling back to FD Hessian from active gradient.",
+                        err
+                    );
+                    self.compute_hessian_fd_from_active_gradient(rho)
+                }
+            }
+        }
+
         pub(super) fn compute_laml_hessian_exact(
             &self,
             rho: &Array1<f64>,
@@ -6165,6 +6283,10 @@ pub mod internal {
             // - Q exactly from B_k solves,
             // - P exactly from reduced-penalty logdet derivatives,
             // - L either exactly or stochastically, depending on workload.
+            //
+            // The objective also includes the separable soft rho prior used by
+            // compute_cost/compute_gradient; its exact diagonal Hessian is added
+            // to every return path below for full objective consistency.
             //
             // Stochastic trace identities used when backend != Exact:
             //   tr(A) = E[zᵀAz],  z_i∈{±1}.
@@ -6245,6 +6367,7 @@ pub mod internal {
                         hess[[k, l]] = -0.5 * d2logs[[k, l]];
                     }
                 }
+                self.add_soft_prior_hessian_in_place(rho, &mut hess);
                 return Ok(hess);
             }
             let c = &pirls_result.solve_c_array;
@@ -6545,6 +6668,7 @@ pub mod internal {
                     hess[[l, k]] = val;
                 }
             }
+            self.add_soft_prior_hessian_in_place(rho, &mut hess);
             Ok(hess)
         }
 
@@ -6583,13 +6707,10 @@ pub mod internal {
             }
 
             // Build V_rho from the outer Hessian around rho_hat.
-            let mut hessian_rho = match self.compute_laml_hessian_exact(final_rho) {
+            let mut hessian_rho = match self.compute_laml_hessian_consistent(final_rho) {
                 Ok(h) => h,
                 Err(err) => {
-                    log::debug!(
-                        "Auto cubature skipped: exact rho Hessian unavailable ({}).",
-                        err
-                    );
+                    log::debug!("Auto cubature skipped: rho Hessian unavailable ({}).", err);
                     return first_order;
                 }
             };
@@ -7042,11 +7163,11 @@ pub mod internal {
             }
 
             let n_rho = current_rho.len();
-            let mut laml_hessian = match self.compute_laml_hessian_exact(&current_rho) {
+            let mut laml_hessian = match self.compute_laml_hessian_consistent(&current_rho) {
                 Ok(h) => h,
                 Err(err) => {
                     log::warn!(
-                        "Exact boundary Hessian unavailable ({}); falling back to FD Hessian.",
+                        "Boundary Hessian unavailable ({}); falling back to FD Hessian.",
                         err
                     );
                     let h_step = 1e-4;

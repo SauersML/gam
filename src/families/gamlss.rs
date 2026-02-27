@@ -10,6 +10,7 @@ use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::DesignMatrix;
 use crate::pirls::WorkingLikelihood as EngineWorkingLikelihood;
 use crate::probability::{normal_cdf_approx, normal_pdf};
+use crate::sigma_link::{bounded_sigma_and_deriv_from_eta_scalar, bounded_sigma_from_eta_scalar};
 use crate::smooth::{
     MaternKappaOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
     optimize_two_block_matern_kappa,
@@ -856,8 +857,7 @@ pub fn fit_binomial_location_scale_probit(
     let fit = fit_custom_family(&family, &blocks, options)?;
     let beta_final = fit.block_states[BinomialLocationScaleProbitFamily::BLOCK_LOG_SIGMA]
         .eta
-        .mapv(f64::exp)
-        .mapv(|s| 1.0 / s.clamp(sigma_min, sigma_max).max(1e-12));
+        .mapv(|eta| 1.0 / bounded_sigma_from_eta_scalar(eta, sigma_min, sigma_max).max(1e-12));
     emit_binomial_alpha_beta_warnings("final-fit", &beta_final, &y, &weights);
     Ok(fit)
 }
@@ -942,8 +942,7 @@ pub fn fit_binomial_location_scale_probit_wiggle(
     let fit = fit_custom_family(&family, &blocks, options)?;
     let beta_final = fit.block_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_LOG_SIGMA]
         .eta
-        .mapv(f64::exp)
-        .mapv(|s| 1.0 / s.clamp(sigma_min, sigma_max).max(1e-12));
+        .mapv(|eta| 1.0 / bounded_sigma_from_eta_scalar(eta, sigma_min, sigma_max).max(1e-12));
     emit_binomial_alpha_beta_warnings("final-fit-wiggle", &beta_final, &y, &weights);
     Ok(fit)
 }
@@ -1159,15 +1158,10 @@ fn binomial_location_scale_core(
     let mut ll = 0.0;
 
     for i in 0..n {
-        // Use bounded sigmoid link: sigma = sigma_min + span * logistic(eta)
-        // This MUST match sigma_and_deriv_from_eta() used in the prediction path
-        // and safe_sigma_from_eta() used in survival. Previously this used exp(),
-        // creating a train/predict mismatch that destroyed accuracy.
-        let span = (sigma_max - sigma_min).max(1e-12);
-        let z = eta_ls[i].clamp(-40.0, 40.0);
-        let p = 1.0 / (1.0 + (-z).exp());
-        sigma[i] = sigma_min + span * p;
-        dsigma_deta[i] = span * p * (1.0 - p);
+        let (sigma_i, dsigma_deta_i) =
+            bounded_sigma_and_deriv_from_eta_scalar(eta_ls[i], sigma_min, sigma_max);
+        sigma[i] = sigma_i;
+        dsigma_deta[i] = dsigma_deta_i;
         q0[i] = -eta_t[i] / sigma[i].max(1e-12);
         let q = q0[i] + eta_wiggle.map_or(0.0, |w| w[i]);
         mu[i] = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
@@ -1299,13 +1293,14 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let mut dsigma_deta = Array1::<f64>::zeros(n);
         let mut ll = 0.0;
 
-        let span = (self.sigma_max - self.sigma_min).max(1e-12);
         for i in 0..n {
-            // Use bounded sigmoid link matching prediction/survival paths
-            let z = eta_log_sigma[i].clamp(-40.0, 40.0);
-            let p = 1.0 / (1.0 + (-z).exp());
-            sigma[i] = self.sigma_min + span * p;
-            dsigma_deta[i] = span * p * (1.0 - p);
+            let (sigma_i, dsigma_deta_i) = bounded_sigma_and_deriv_from_eta_scalar(
+                eta_log_sigma[i],
+                self.sigma_min,
+                self.sigma_max,
+            );
+            sigma[i] = sigma_i;
+            dsigma_deta[i] = dsigma_deta_i;
             let r = self.y[i] - eta_mu[i];
             let s2 = (sigma[i] * sigma[i]).max(1e-20);
             ll += self.weights[i] * (-0.5 * (r * r / s2 + (2.0 * std::f64::consts::PI * s2).ln()));
@@ -1370,8 +1365,7 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
         let mu = block_states[Self::BLOCK_MU].eta.clone();
         let sigma = block_states[Self::BLOCK_LOG_SIGMA]
             .eta
-            .mapv(f64::exp)
-            .mapv(|s| s.clamp(self.sigma_min, self.sigma_max));
+            .mapv(|eta| bounded_sigma_from_eta_scalar(eta, self.sigma_min, self.sigma_max));
         Ok(GenerativeSpec {
             mean: mu,
             noise: NoiseModel::Gaussian { sigma },
@@ -1731,10 +1725,8 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitFamily {
         }
         let mut mean = Array1::<f64>::zeros(self.y.len());
         for i in 0..mean.len() {
-            let sigma = eta_ls[i]
-                .exp()
-                .clamp(self.sigma_min, self.sigma_max)
-                .max(1e-12);
+            let sigma =
+                bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
             let q = -eta_t[i] / sigma;
             mean[i] = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
         }
@@ -1949,10 +1941,8 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         }
         let mut q0 = Array1::<f64>::zeros(eta_t.len());
         for i in 0..q0.len() {
-            let sigma = eta_ls[i]
-                .exp()
-                .clamp(self.sigma_min, self.sigma_max)
-                .max(1e-12);
+            let sigma =
+                bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
             q0[i] = -eta_t[i] / sigma;
         }
         let x = self.wiggle_design(q0.view())?;
@@ -1992,10 +1982,8 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {
         }
         let mut mean = Array1::<f64>::zeros(self.y.len());
         for i in 0..mean.len() {
-            let sigma = eta_ls[i]
-                .exp()
-                .clamp(self.sigma_min, self.sigma_max)
-                .max(1e-12);
+            let sigma =
+                bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
             let q0 = -eta_t[i] / sigma;
             mean[i] = normal_cdf_approx(q0 + eta_w[i]).clamp(MIN_PROB, 1.0 - MIN_PROB);
         }
@@ -2271,6 +2259,157 @@ mod tests {
                     expected[[i, j]]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn binomial_location_scale_probit_generative_matches_core_mu() {
+        let n = 7usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let eta_t = Array1::from_vec(vec![0.8, -0.4, 0.2, -1.1, 0.0, 0.5, -0.7]);
+        let eta_ls = Array1::from_vec(vec![-3.0, -1.2, -0.1, 0.3, 1.1, 2.0, 4.0]);
+
+        let family = BinomialLocationScaleProbitFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            sigma_min: 0.05,
+            sigma_max: 10.0,
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: eta_t.clone(),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: eta_ls.clone(),
+            },
+        ];
+        let spec = family.generative_spec(&states).expect("generative spec");
+        let core = binomial_location_scale_core(
+            &y,
+            &weights,
+            &eta_t,
+            &eta_ls,
+            None,
+            family.sigma_min,
+            family.sigma_max,
+        )
+        .expect("core");
+        for i in 0..n {
+            assert!(
+                (spec.mean[i] - core.mu[i]).abs() < 1e-12,
+                "mean mismatch at {i}: got {}, expected {}",
+                spec.mean[i],
+                core.mu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn wiggle_geometry_and_generative_use_same_sigma_link_as_core() {
+        let n = 8usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let eta_t = Array1::from_vec(vec![0.5, -0.6, 0.1, -0.3, 0.9, -0.2, 0.4, -0.8]);
+        let eta_ls = Array1::from_vec(vec![-2.5, -1.5, -0.5, 0.0, 0.7, 1.4, 2.2, 3.0]);
+
+        let q_seed = Array1::linspace(-1.5, 1.5, n);
+        let (wiggle_block, knots) =
+            BinomialLocationScaleProbitWiggleFamily::build_wiggle_block_input(
+                q_seed.view(),
+                2,
+                3,
+                2,
+                false,
+            )
+            .expect("wiggle block");
+
+        let family = BinomialLocationScaleProbitWiggleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            sigma_min: 0.1,
+            sigma_max: 8.0,
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+        };
+
+        let core_for_q0 = binomial_location_scale_core(
+            &y,
+            &weights,
+            &eta_t,
+            &eta_ls,
+            None,
+            family.sigma_min,
+            family.sigma_max,
+        )
+        .expect("core q0");
+        let beta_w = Array1::from_vec(vec![0.15; wiggle_block.design.ncols()]);
+        let eta_w = family
+            .wiggle_design(core_for_q0.q0.view())
+            .expect("wiggle design")
+            .dot(&beta_w);
+
+        let states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: eta_t.clone(),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: eta_ls.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_w.clone(),
+                eta: eta_w.clone(),
+            },
+        ];
+
+        let wiggle_spec = wiggle_block
+            .clone()
+            .into_spec("wiggle")
+            .expect("wiggle spec");
+        let (geom_x, _geom_offset) = family
+            .block_geometry(&states, &wiggle_spec)
+            .expect("block geometry");
+        let geom = match geom_x {
+            DesignMatrix::Dense(x) => x,
+            DesignMatrix::Sparse(_) => panic!("expected dense wiggle geometry design"),
+        };
+        let expected_geom = family
+            .wiggle_design(core_for_q0.q0.view())
+            .expect("expected wiggle geometry");
+        assert_eq!(geom.dim(), expected_geom.dim());
+        for i in 0..geom.nrows() {
+            for j in 0..geom.ncols() {
+                assert!(
+                    (geom[[i, j]] - expected_geom[[i, j]]).abs() < 1e-12,
+                    "geometry mismatch at ({i}, {j}): got {}, expected {}",
+                    geom[[i, j]],
+                    expected_geom[[i, j]]
+                );
+            }
+        }
+
+        let generated = family.generative_spec(&states).expect("generative spec");
+        let core = binomial_location_scale_core(
+            &y,
+            &weights,
+            &eta_t,
+            &eta_ls,
+            Some(&eta_w),
+            family.sigma_min,
+            family.sigma_max,
+        )
+        .expect("core with wiggle");
+        for i in 0..n {
+            assert!(
+                (generated.mean[i] - core.mu[i]).abs() < 1e-12,
+                "wiggle mean mismatch at {i}: got {}, expected {}",
+                generated.mean[i],
+                core.mu[i]
+            );
         }
     }
 }

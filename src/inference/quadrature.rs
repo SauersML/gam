@@ -415,12 +415,10 @@ pub fn logit_posterior_mean_with_deriv(
     eta: f64,
     se_eta: f64,
 ) -> (f64, f64) {
-    const MIN_DERIV: f64 = 1e-6;
-
     // If SE is negligible, return standard sigmoid and its derivative
     if se_eta < 1e-10 {
         let mu = sigmoid(eta);
-        let dmu = (mu * (1.0 - mu)).max(MIN_DERIV);
+        let dmu = mu * (1.0 - mu);
         return (mu, dmu);
     }
 
@@ -438,7 +436,8 @@ pub fn logit_posterior_mean_with_deriv(
             sum_dmu += weights[i] * deriv_i;
         }
         let mu = (sum_mu * norm).clamp(1e-10, 1.0 - 1e-10);
-        let dmu = (sum_dmu * norm).max(MIN_DERIV);
+        // dmu can be arbitrarily close to 0 in the tails; do not floor it.
+        let dmu = (sum_dmu * norm).max(0.0);
         (mu, dmu)
     })
 }
@@ -1261,6 +1260,34 @@ mod tests {
             let numeric = high_res_sigmoid_integral(eta, se);
             assert_relative_eq!(ghq, numeric, epsilon = 2e-3);
         }
+    }
+
+    #[test]
+    fn test_logit_posterior_derivative_not_hard_floored() {
+        let ctx = QuadratureContext::new();
+        let eta = 20.0;
+        let se = 0.0;
+        let (_, dmu) = logit_posterior_mean_with_deriv(&ctx, eta, se);
+        assert!(dmu > 0.0);
+        assert!(
+            dmu < 1e-6,
+            "tail derivative should be below legacy floor, got {dmu}"
+        );
+    }
+
+    #[test]
+    fn test_logit_posterior_derivative_matches_central_difference() {
+        let ctx = QuadratureContext::new();
+        let eta = 1.7;
+        let se = 0.9;
+        let h = 1e-5;
+
+        let (_, dmu) = logit_posterior_mean_with_deriv(&ctx, eta, se);
+        let mu_plus = logit_posterior_mean(&ctx, eta + h, se);
+        let mu_minus = logit_posterior_mean(&ctx, eta - h, se);
+        let dmu_fd = (mu_plus - mu_minus) / (2.0 * h);
+
+        assert_relative_eq!(dmu, dmu_fd, epsilon = 5e-6, max_relative = 2e-4);
     }
 
     #[test]

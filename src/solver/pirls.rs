@@ -5,7 +5,7 @@ use crate::faer_ndarray::{
     array2_to_mat_mut, fast_ab, fast_ata, fast_atv,
 };
 use crate::matrix::DesignMatrix;
-use crate::probability::{normal_cdf_approx, normal_pdf};
+use crate::probability::{normal_cdf_approx, normal_pdf, standard_normal_quantile};
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{LikelihoodFamily, LinkFunction, RidgePassport, RidgePolicy};
 use dyn_stack::{MemBuffer, MemStack};
@@ -51,6 +51,28 @@ impl<'a> LltView<'a> {
         self.solve_into(rhs, &mut result, stack);
         result
     }
+}
+
+#[inline]
+fn array1_is_finite(values: &Array1<f64>) -> bool {
+    values.iter().all(|v| v.is_finite())
+}
+
+#[inline]
+fn array2_is_finite(values: &Array2<f64>) -> bool {
+    values.iter().all(|v| v.is_finite())
+}
+
+#[inline]
+fn matref_is_finite(mat: MatRef<'_, f64>) -> bool {
+    for j in 0..mat.ncols() {
+        for i in 0..mat.nrows() {
+            if !mat[(i, j)].is_finite() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub trait WorkingModel {
@@ -251,9 +273,10 @@ pub struct WorkingState {
     pub firth_log_det: Option<f64>,
     pub firth_hat_diag: Option<Array1<f64>>,
     // Ridge added to ensure positive definiteness of the penalized Hessian.
-    // This is treated as an explicit penalty term (0.5 * ridge * ||beta||^2),
-    // so the PIRLS objective, the Hessian used for log|H|, and the gradient
-    // remain mathematically consistent.
+    // `penalty_term` stores the full quadratic form contribution
+    // ridge * ||beta||^2. The optimization objective uses
+    // 0.5 * (deviance + penalty_term), so this corresponds to
+    // 0.5 * ridge * ||beta||^2 on the log-likelihood scale.
     pub ridge_used: f64,
 }
 
@@ -451,8 +474,9 @@ pub struct WorkingModelPirlsResult {
     pub constraint_kkt: Option<ConstraintKktDiagnostics>,
 }
 
-// Fixed stabilization ridge for PIRLS/PLS. This is treated as an explicit penalty
-// term (0.5 * ridge * ||beta||^2) and is constant w.r.t. rho.
+// Fixed stabilization ridge for PIRLS/PLS. `penalty_term` carries this as
+// ridge * ||beta||^2 (equivalently 0.5 * ridge * ||beta||^2 in the
+// 0.5 * (deviance + penalty_term) objective), and it is constant w.r.t. rho.
 //
 // Math note:
 //   Objective: V(ρ) includes log|H(ρ)| with H(ρ) = X' W X + S_λ(ρ) + δ I.
@@ -943,7 +967,7 @@ impl SparseXtWxCache {
             let start = col_ptr[col];
             let end = col_ptr[col + 1];
             for idx in start..end {
-                out[[row_idx[idx], col]] = self.xtwx_values[idx];
+                out[[row_idx[idx], col]] += self.xtwx_values[idx];
             }
         }
         Ok(out)
@@ -1142,26 +1166,33 @@ fn solve_newton_direction_dense(
         let mut rhs_view = array1_to_col_mat_mut(direction_out);
         ch.solve_in_place(rhs_view.as_mut());
         direction_out.mapv_inplace(|v| -v);
-        return Ok(());
+        if array1_is_finite(direction_out) {
+            return Ok(());
+        }
     }
 
-    let ldlt_err = match FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+    let mut ldlt_err = FaerLinalgError::FactorizationFailed;
+    match FaerLdlt::new(h_view.as_ref(), Side::Lower) {
         Ok(ld) => {
             direction_out.assign(gradient);
             let mut rhs_view = array1_to_col_mat_mut(direction_out);
             ld.solve_in_place(rhs_view.as_mut());
             direction_out.mapv_inplace(|v| -v);
-            return Ok(());
+            if array1_is_finite(direction_out) {
+                return Ok(());
+            }
         }
-        Err(err) => FaerLinalgError::Ldlt(err),
-    };
+        Err(err) => {
+            ldlt_err = FaerLinalgError::Ldlt(err);
+        }
+    }
 
     let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
     direction_out.assign(gradient);
     let mut rhs_view = array1_to_col_mat_mut(direction_out);
     lb.solve_in_place(rhs_view.as_mut());
     direction_out.mapv_inplace(|v| -v);
-    if direction_out.iter().all(|v| v.is_finite()) {
+    if array1_is_finite(direction_out) {
         return Ok(());
     }
 
@@ -1191,19 +1222,25 @@ fn solve_subsystem_direction(
         let mut rhs = array1_to_col_mat_mut(out);
         ch.solve_in_place(rhs.as_mut());
         out.mapv_inplace(|v| -v);
-        return Ok(());
+        if array1_is_finite(out) {
+            return Ok(());
+        }
     }
     if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+        out.assign(g_sub);
         let mut rhs = array1_to_col_mat_mut(out);
         ld.solve_in_place(rhs.as_mut());
         out.mapv_inplace(|v| -v);
-        return Ok(());
+        if array1_is_finite(out) {
+            return Ok(());
+        }
     }
+    out.assign(g_sub);
     let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
     let mut rhs = array1_to_col_mat_mut(out);
     lb.solve_in_place(rhs.as_mut());
     out.mapv_inplace(|v| -v);
-    if out.iter().all(|v| v.is_finite()) {
+    if array1_is_finite(out) {
         return Ok(());
     }
     Err(EstimationError::InvalidInput(
@@ -1224,17 +1261,23 @@ fn solve_symmetric_system(
     if let Ok(ch) = FaerLlt::new(matrix_view.as_ref(), Side::Lower) {
         let mut rhs_view = array1_to_col_mat_mut(out);
         ch.solve_in_place(rhs_view.as_mut());
-        return Ok(());
+        if array1_is_finite(out) {
+            return Ok(());
+        }
     }
     if let Ok(ld) = FaerLdlt::new(matrix_view.as_ref(), Side::Lower) {
+        out.assign(rhs);
         let mut rhs_view = array1_to_col_mat_mut(out);
         ld.solve_in_place(rhs_view.as_mut());
-        return Ok(());
+        if array1_is_finite(out) {
+            return Ok(());
+        }
     }
+    out.assign(rhs);
     let lb = FaerLblt::new(matrix_view.as_ref(), Side::Lower);
     let mut rhs_view = array1_to_col_mat_mut(out);
     lb.solve_in_place(rhs_view.as_mut());
-    if out.iter().all(|v| v.is_finite()) {
+    if array1_is_finite(out) {
         return Ok(());
     }
     Err(EstimationError::InvalidInput(
@@ -1755,8 +1798,13 @@ fn default_beta_guess_external(
                 let prevalence =
                     ((weighted_sum + 0.5) / (total_weight + 1.0)).clamp(1e-6, 1.0 - 1e-6);
                 beta[intercept_col] = match link_function {
-                    LinkFunction::Logit | LinkFunction::Probit => {
-                        (prevalence / (1.0 - prevalence)).ln()
+                    LinkFunction::Logit => (prevalence / (1.0 - prevalence)).ln(),
+                    LinkFunction::Probit => {
+                        standard_normal_quantile(prevalence).unwrap_or_else(|_| {
+                            // `prevalence` is clamped to (0, 1); this fallback is
+                            // only for defensive robustness under non-finite upstream inputs.
+                            (prevalence / (1.0 - prevalence)).ln()
+                        })
                     }
                     LinkFunction::CLogLog => (-(1.0 - prevalence).ln()).ln(),
                     LinkFunction::Identity => unreachable!(),
@@ -2133,8 +2181,9 @@ pub struct PirlsResult {
     pub stabilized_hessian_transformed: Array2<f64>,
     /// Canonical ridge metadata passport consumed by outer objective/gradient code.
     pub ridge_passport: RidgePassport,
-    // Ridge added to make the stabilized Hessian positive definite. When > 0, this
-    // ridge is treated as a literal penalty term (0.5 * ridge * ||beta||^2).
+    // Ridge added to make the stabilized Hessian positive definite. When > 0,
+    // `stable_penalty_term` includes ridge_used * ||beta||^2 (which contributes
+    // 0.5 * ridge_used * ||beta||^2 in -0.5 * (deviance + stable_penalty_term)).
     // Backward-compatible mirror of `ridge_passport.delta`.
     pub ridge_used: f64,
 
@@ -3454,7 +3503,6 @@ pub fn update_glm_vectors_integrated(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
 ) {
-    const MIN_WEIGHT: f64 = 1e-12;
     const MIN_D_FOR_Z: f64 = 1e-6;
     const PROB_EPS: f64 = 1e-8;
 
@@ -3474,7 +3522,8 @@ pub fn update_glm_vectors_integrated(
         // For Bernoulli: Var(Y|μ) = μ(1-μ)
         let variance = (mu_clamped * (1.0 - mu_clamped)).max(PROB_EPS);
         let dmu_sq = dmu_deta * dmu_deta;
-        let fisher_w = (dmu_sq / variance).max(MIN_WEIGHT);
+        // Use the true integrated derivative for curvature; no derivative/weight floor.
+        let fisher_w = dmu_sq / variance;
         weights[i] = prior_weights[i] * fisher_w;
 
         // Working response using general formula:
@@ -3823,12 +3872,26 @@ pub fn solve_penalized_least_squares(
     let (beta_vec, detected_rank) = if let Ok(factor) = ldlt {
         let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
         factor.solve_in_place(rhs_view.as_mut());
-        (workspace.rhs_full.clone(), p_dim)
+        if array1_is_finite(&workspace.rhs_full) {
+            (workspace.rhs_full.clone(), p_dim)
+        } else {
+            let lblt = FaerLblt::new(h_reg_view.as_ref(), Side::Lower);
+            workspace.rhs_full.assign(rhs_vec);
+            let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
+            lblt.solve_in_place(rhs_view.as_mut());
+            if array1_is_finite(&workspace.rhs_full) {
+                (workspace.rhs_full.clone(), p_dim)
+            } else {
+                return Err(EstimationError::LinearSystemSolveFailed(
+                    FaerLinalgError::FactorizationFailed,
+                ));
+            }
+        }
     } else {
         let lblt = FaerLblt::new(h_reg_view.as_ref(), Side::Lower);
         let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
         lblt.solve_in_place(rhs_view.as_mut());
-        if workspace.rhs_full.iter().all(|v| v.is_finite()) {
+        if array1_is_finite(&workspace.rhs_full) {
             (workspace.rhs_full.clone(), p_dim)
         } else {
             return Err(EstimationError::LinearSystemSolveFailed(
@@ -3879,31 +3942,39 @@ fn calculate_edf(
     // Try LLᵀ first
     if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
         let sol = ch.solve(rhs_view.as_ref());
-        let mut tr = 0.0;
-        for j in 0..r {
-            for i in 0..p {
-                tr += sol[(i, j)] * e_transformed[(j, i)];
+        if !matref_is_finite(sol.as_ref()) {
+            // Retry with more permissive factorizations.
+        } else {
+            let mut tr = 0.0;
+            for j in 0..r {
+                for i in 0..p {
+                    tr += sol[(i, j)] * e_transformed[(j, i)];
+                }
             }
+            return Ok((p as f64 - tr).clamp(mp, p as f64));
         }
-        return Ok((p as f64 - tr).clamp(mp, p as f64));
     }
 
     // Try LDLᵀ (semi-definite)
     if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
         let sol = ld.solve(rhs_view.as_ref());
-        let mut tr = 0.0;
-        for j in 0..r {
-            for i in 0..p {
-                tr += sol[(i, j)] * e_transformed[(j, i)];
+        if !matref_is_finite(sol.as_ref()) {
+            // Retry with LBLT.
+        } else {
+            let mut tr = 0.0;
+            for j in 0..r {
+                for i in 0..p {
+                    tr += sol[(i, j)] * e_transformed[(j, i)];
+                }
             }
+            return Ok((p as f64 - tr).clamp(mp, p as f64));
         }
-        return Ok((p as f64 - tr).clamp(mp, p as f64));
     }
 
     // Last resort: symmetric indefinite LBLᵀ (Bunch–Kaufman)
     let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
     let sol = lb.solve(rhs_view.as_ref());
-    if sol.nrows() == p && sol.ncols() == r {
+    if sol.nrows() == p && sol.ncols() == r && matref_is_finite(sol.as_ref()) {
         let mut tr = 0.0;
         for j in 0..r {
             for i in 0..p {
@@ -3943,13 +4014,15 @@ fn calculate_edf_with_workspace(
     if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
         let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
         ch.solve_in_place(rhs_view.as_mut());
-        let mut tr = 0.0;
-        for j in 0..r {
-            for i in 0..p {
-                tr += workspace.final_aug_matrix[(i, j)] * e_transformed[(j, i)];
+        if array2_is_finite(&workspace.final_aug_matrix) {
+            let mut tr = 0.0;
+            for j in 0..r {
+                for i in 0..p {
+                    tr += workspace.final_aug_matrix[(i, j)] * e_transformed[(j, i)];
+                }
             }
+            return Ok((p as f64 - tr).clamp(mp, p as f64));
         }
-        return Ok((p as f64 - tr).clamp(mp, p as f64));
     }
 
     // Try LDLᵀ (semi-definite)
@@ -3962,13 +4035,15 @@ fn calculate_edf_with_workspace(
         }
         let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
         ld.solve_in_place(rhs_view.as_mut());
-        let mut tr = 0.0;
-        for j in 0..r {
-            for i in 0..p {
-                tr += workspace.final_aug_matrix[(i, j)] * e_transformed[(j, i)];
+        if array2_is_finite(&workspace.final_aug_matrix) {
+            let mut tr = 0.0;
+            for j in 0..r {
+                for i in 0..p {
+                    tr += workspace.final_aug_matrix[(i, j)] * e_transformed[(j, i)];
+                }
             }
+            return Ok((p as f64 - tr).clamp(mp, p as f64));
         }
-        return Ok((p as f64 - tr).clamp(mp, p as f64));
     }
 
     // Last resort: symmetric indefinite LBLᵀ (Bunch–Kaufman)
@@ -3983,7 +4058,10 @@ fn calculate_edf_with_workspace(
         let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
         lb.solve_in_place(rhs_view.as_mut());
     }
-    if workspace.final_aug_matrix.nrows() == p && workspace.final_aug_matrix.ncols() == r {
+    if workspace.final_aug_matrix.nrows() == p
+        && workspace.final_aug_matrix.ncols() == r
+        && array2_is_finite(&workspace.final_aug_matrix)
+    {
         let mut tr = 0.0;
         for j in 0..r {
             for i in 0..p {
@@ -4109,7 +4187,11 @@ pub fn compute_final_penalized_hessian(
 
 #[cfg(test)]
 mod tests {
-    use super::{LinearInequalityConstraints, calculate_scale, compute_constraint_kkt_diagnostics};
+    use super::{
+        LinearInequalityConstraints, calculate_scale, compute_constraint_kkt_diagnostics,
+        default_beta_guess_external,
+    };
+    use crate::probability::standard_normal_quantile;
     use crate::types::LinkFunction;
     use ndarray::{Array1, array};
 
@@ -4206,5 +4288,34 @@ mod tests {
         assert!(diag.dual_feasibility <= 1e-12);
         assert!(diag.complementarity <= 1e-12);
         assert!(diag.stationarity <= 1e-10);
+    }
+
+    #[test]
+    fn default_beta_guess_logit_uses_log_odds_prevalence() {
+        let y = array![0.0, 1.0, 1.0, 1.0];
+        let w = Array1::ones(4);
+        let beta = default_beta_guess_external(3, LinkFunction::Logit, y.view(), w.view());
+        let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
+        let prevalence = prevalence.max(1e-6_f64).min(1.0_f64 - 1e-6_f64);
+        let expected = (prevalence / (1.0 - prevalence)).ln();
+        assert!((beta[0] - expected).abs() < 1e-12);
+        assert_eq!(beta[1], 0.0);
+        assert_eq!(beta[2], 0.0);
+    }
+
+    #[test]
+    fn default_beta_guess_probit_uses_standard_normal_quantile() {
+        let y = array![0.0, 1.0, 1.0, 1.0];
+        let w = Array1::ones(4);
+        let beta = default_beta_guess_external(3, LinkFunction::Probit, y.view(), w.view());
+        let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
+        let prevalence = prevalence.max(1e-6_f64).min(1.0_f64 - 1e-6_f64);
+        let log_odds = (prevalence / (1.0 - prevalence)).ln();
+        let expected =
+            standard_normal_quantile(prevalence).expect("clamped prevalence must be valid");
+        assert!((expected - log_odds).abs() > 1e-3);
+        assert!((beta[0] - expected).abs() < 1e-12);
+        assert_eq!(beta[1], 0.0);
+        assert_eq!(beta[2], 0.0);
     }
 }

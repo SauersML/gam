@@ -11,6 +11,12 @@ use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use std::marker::PhantomData;
 use thiserror::Error;
 
+const BK_BLOCK_TOL: f64 = 1e-12;
+const SYMMETRY_REL_TOL: f64 = 1e-12;
+const SYMMETRY_ABS_TOL: f64 = 1e-12;
+const RECONSTRUCTION_REL_TOL: f64 = 1e-8;
+const RECONSTRUCTION_ABS_TOL: f64 = 1e-12;
+
 #[derive(Debug, Error)]
 pub enum FaerLinalgError {
     #[error("Factorization failed")]
@@ -362,7 +368,7 @@ fn compute_bunch_kaufman_inertia(
     let n = diag.len();
     let mut idx = 0usize;
     while idx < n {
-        if idx + 1 < n && subdiag[idx].abs() > 1e-12 {
+        if idx + 1 < n && subdiag[idx].abs() > BK_BLOCK_TOL {
             let a = diag[idx];
             let b = subdiag[idx];
             let c = diag[idx + 1];
@@ -372,9 +378,9 @@ fn compute_bunch_kaufman_inertia(
             let root = discr.sqrt();
             let eigenvalues = [trace / 2.0 + root, trace / 2.0 - root];
             for value in eigenvalues.iter() {
-                if *value > 1e-12 {
+                if *value > BK_BLOCK_TOL {
                     positive += 1;
-                } else if *value < -1e-12 {
+                } else if *value < -BK_BLOCK_TOL {
                     negative += 1;
                 } else {
                     zero += 1;
@@ -383,9 +389,9 @@ fn compute_bunch_kaufman_inertia(
             idx += 2;
         } else {
             let value = diag[idx];
-            if value > 1e-12 {
+            if value > BK_BLOCK_TOL {
                 positive += 1;
-            } else if value < -1e-12 {
+            } else if value < -BK_BLOCK_TOL {
                 negative += 1;
             } else {
                 zero += 1;
@@ -394,6 +400,122 @@ fn compute_bunch_kaufman_inertia(
         }
     }
     (positive, negative, zero)
+}
+
+fn is_symmetric_with_tolerance(matrix: &Array2<f64>, rel_tol: f64, abs_tol: f64) -> bool {
+    let (nrows, ncols) = matrix.dim();
+    if nrows != ncols {
+        return false;
+    }
+    let mut scale = 0.0f64;
+    for i in 0..nrows {
+        for j in 0..ncols {
+            scale = scale.max(matrix[[i, j]].abs());
+        }
+    }
+    let tol = abs_tol + rel_tol * scale.max(1.0);
+    for i in 0..nrows {
+        for j in i + 1..ncols {
+            if (matrix[[i, j]] - matrix[[j, i]]).abs() > tol {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn reconstruct_from_bunch_kaufman(
+    l_unit_lower: &Array2<f64>,
+    d_diag: &Array1<f64>,
+    d_subdiag: &Array1<f64>,
+    perm_inv: &[usize],
+) -> Array2<f64> {
+    let n = d_diag.len();
+    let mut b = Array2::<f64>::zeros((n, n));
+    let mut i = 0usize;
+    while i < n {
+        if i + 1 < n && d_subdiag[i].abs() > BK_BLOCK_TOL {
+            b[[i, i]] = d_diag[i];
+            b[[i, i + 1]] = d_subdiag[i];
+            b[[i + 1, i]] = d_subdiag[i];
+            b[[i + 1, i + 1]] = d_diag[i + 1];
+            i += 2;
+        } else {
+            b[[i, i]] = d_diag[i];
+            i += 1;
+        }
+    }
+
+    let tmp = l_unit_lower.dot(&b).dot(&l_unit_lower.t());
+    let mut out = Array2::<f64>::zeros((n, n));
+    for row in 0..n {
+        for col in 0..n {
+            out[[row, col]] = tmp[[perm_inv[row], perm_inv[col]]];
+        }
+    }
+    out
+}
+
+fn is_valid_inverse_permutation(perm_fwd: &[usize], perm_inv: &[usize], n: usize) -> bool {
+    if perm_fwd.len() != n || perm_inv.len() != n {
+        return false;
+    }
+
+    let mut seen_fwd = vec![false; n];
+    for &p in perm_fwd {
+        if p >= n || seen_fwd[p] {
+            return false;
+        }
+        seen_fwd[p] = true;
+    }
+
+    let mut seen_inv = vec![false; n];
+    for &p in perm_inv {
+        if p >= n || seen_inv[p] {
+            return false;
+        }
+        seen_inv[p] = true;
+    }
+
+    for i in 0..n {
+        if perm_inv[perm_fwd[i]] != i || perm_fwd[perm_inv[i]] != i {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn validate_ldlt_rook_outputs(
+    matrix: &Array2<f64>,
+    l_unit_lower: &Array2<f64>,
+    d_diag: &Array1<f64>,
+    d_subdiag: &Array1<f64>,
+    perm_fwd: &[usize],
+    perm_inv: &[usize],
+) -> bool {
+    let n = matrix.nrows();
+    if !is_valid_inverse_permutation(perm_fwd, perm_inv, n) {
+        return false;
+    }
+
+    if !l_unit_lower.iter().all(|v| v.is_finite())
+        || !d_diag.iter().all(|v| v.is_finite())
+        || !d_subdiag.iter().all(|v| v.is_finite())
+    {
+        return false;
+    }
+
+    let reconstructed = reconstruct_from_bunch_kaufman(l_unit_lower, d_diag, d_subdiag, perm_inv);
+    if !reconstructed.iter().all(|v| v.is_finite()) {
+        return false;
+    }
+    let max_abs_err = (&reconstructed - matrix)
+        .iter()
+        .fold(0.0f64, |acc, &x| acc.max(x.abs()));
+    let input_scale = matrix.iter().fold(0.0f64, |acc, &x| acc.max(x.abs()));
+    let tol = RECONSTRUCTION_ABS_TOL + RECONSTRUCTION_REL_TOL * input_scale.max(1.0);
+    max_abs_err <= tol
 }
 
 /// Computes a symmetric-indefinite rook-pivoted `LBL^T` factorization.
@@ -421,6 +543,12 @@ pub fn ldlt_rook(
 > {
     let (nrows, ncols) = matrix.dim();
     if nrows != ncols {
+        return Err(FaerLinalgError::FactorizationFailed);
+    }
+    if !matrix.iter().all(|v| v.is_finite()) {
+        return Err(FaerLinalgError::FactorizationFailed);
+    }
+    if !is_symmetric_with_tolerance(matrix, SYMMETRY_REL_TOL, SYMMETRY_ABS_TOL) {
         return Err(FaerLinalgError::FactorizationFailed);
     }
     let n = nrows;
@@ -473,6 +601,17 @@ pub fn ldlt_rook(
         for j in i + 1..n {
             l_unit_lower[(i, j)] = 0.0;
         }
+    }
+
+    if !validate_ldlt_rook_outputs(
+        matrix,
+        &l_unit_lower,
+        &d_diag,
+        &d_subdiag,
+        &perm_fwd,
+        &perm_inv,
+    ) {
+        return Err(FaerLinalgError::FactorizationFailed);
     }
 
     let inertia = compute_bunch_kaufman_inertia(&d_diag, &d_subdiag);
@@ -769,38 +908,6 @@ mod tests {
     use super::*;
     use ndarray::array;
 
-    fn reconstruct_from_ldlt(
-        l_unit_lower: &Array2<f64>,
-        d_diag: &Array1<f64>,
-        d_subdiag: &Array1<f64>,
-        perm_inv: &[usize],
-    ) -> Array2<f64> {
-        let n = d_diag.len();
-        let mut b = Array2::<f64>::zeros((n, n));
-        let mut i = 0usize;
-        while i < n {
-            if i + 1 < n && d_subdiag[i].abs() > 1e-12 {
-                b[[i, i]] = d_diag[i];
-                b[[i, i + 1]] = d_subdiag[i];
-                b[[i + 1, i]] = d_subdiag[i];
-                b[[i + 1, i + 1]] = d_diag[i + 1];
-                i += 2;
-            } else {
-                b[[i, i]] = d_diag[i];
-                i += 1;
-            }
-        }
-
-        let tmp = l_unit_lower.dot(&b).dot(&l_unit_lower.t());
-        let mut out = Array2::<f64>::zeros((n, n));
-        for row in 0..n {
-            for col in 0..n {
-                out[[row, col]] = tmp[[perm_inv[row], perm_inv[col]]];
-            }
-        }
-        out
-    }
-
     fn inertia_from_eigs(a: &Array2<f64>, tol: f64) -> (usize, usize, usize) {
         let (evals, _) = a
             .eigh(Side::Lower)
@@ -841,7 +948,7 @@ mod tests {
             }
         }
 
-        let a_rec = reconstruct_from_ldlt(&l, &d_diag, &d_subdiag, &perm_inv);
+        let a_rec = reconstruct_from_bunch_kaufman(&l, &d_diag, &d_subdiag, &perm_inv);
         let max_abs_err = (&a_rec - &a)
             .iter()
             .fold(0.0f64, |acc, &x| acc.max(x.abs()));
@@ -852,5 +959,30 @@ mod tests {
 
         let eig_inertia = inertia_from_eigs(&a, 1e-9);
         assert_eq!(inertia, eig_inertia);
+    }
+
+    #[test]
+    fn ldlt_rook_rejects_non_finite_input() {
+        let a = array![[1.0, f64::NAN], [f64::NAN, 2.0]];
+        assert!(matches!(
+            ldlt_rook(&a),
+            Err(FaerLinalgError::FactorizationFailed)
+        ));
+    }
+
+    #[test]
+    fn ldlt_rook_rejects_non_symmetric_input() {
+        let a = array![[1.0, 10.0], [0.0, 1.0]];
+        assert!(matches!(
+            ldlt_rook(&a),
+            Err(FaerLinalgError::FactorizationFailed)
+        ));
+    }
+
+    #[test]
+    fn ldlt_rook_accepts_tiny_symmetry_roundoff() {
+        let eps = 1e-14;
+        let a = array![[2.0, 1.0 + eps], [1.0, 3.0]];
+        assert!(ldlt_rook(&a).is_ok());
     }
 }
