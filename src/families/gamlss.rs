@@ -488,7 +488,7 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
                 0.0
             };
             let q = eta_alpha[i];
-            let chain_beta = 0.0 * dbeta_deta * beta;
+            let chain_beta = dbeta_deta * beta;
             let mu = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
             let dmu_dq = normal_pdf(q).max(MIN_DERIV);
             let var = (mu * (1.0 - mu)).max(MIN_PROB);
@@ -1159,13 +1159,15 @@ fn binomial_location_scale_core(
     let mut ll = 0.0;
 
     for i in 0..n {
-        let raw = eta_ls[i].exp();
-        sigma[i] = raw.clamp(sigma_min, sigma_max);
-        dsigma_deta[i] = if raw >= sigma_min && raw <= sigma_max {
-            raw
-        } else {
-            0.0
-        };
+        // Use bounded sigmoid link: sigma = sigma_min + span * logistic(eta)
+        // This MUST match sigma_and_deriv_from_eta() used in the prediction path
+        // and safe_sigma_from_eta() used in survival. Previously this used exp(),
+        // creating a train/predict mismatch that destroyed accuracy.
+        let span = (sigma_max - sigma_min).max(1e-12);
+        let z = eta_ls[i].clamp(-40.0, 40.0);
+        let p = 1.0 / (1.0 + (-z).exp());
+        sigma[i] = sigma_min + span * p;
+        dsigma_deta[i] = span * p * (1.0 - p);
         q0[i] = -eta_t[i] / sigma[i].max(1e-12);
         let q = q0[i] + eta_wiggle.map_or(0.0, |w| w[i]);
         mu[i] = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
@@ -1297,14 +1299,13 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let mut dsigma_deta = Array1::<f64>::zeros(n);
         let mut ll = 0.0;
 
+        let span = (self.sigma_max - self.sigma_min).max(1e-12);
         for i in 0..n {
-            let raw = eta_log_sigma[i].exp();
-            sigma[i] = raw.clamp(self.sigma_min, self.sigma_max);
-            dsigma_deta[i] = if raw >= self.sigma_min && raw <= self.sigma_max {
-                raw
-            } else {
-                0.0
-            };
+            // Use bounded sigmoid link matching prediction/survival paths
+            let z = eta_log_sigma[i].clamp(-40.0, 40.0);
+            let p = 1.0 / (1.0 + (-z).exp());
+            sigma[i] = self.sigma_min + span * p;
+            dsigma_deta[i] = span * p * (1.0 - p);
             let r = self.y[i] - eta_mu[i];
             let s2 = (sigma[i] * sigma[i]).max(1e-20);
             ll += self.weights[i] * (-0.5 * (r * r / s2 + (2.0 * std::f64::consts::PI * s2).ln()));
@@ -1312,7 +1313,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
 
         let mut z_mu = Array1::<f64>::zeros(n);
         let mut w_mu = Array1::<f64>::zeros(n);
-        let z_ls = Array1::<f64>::zeros(n);
+        let mut z_ls = Array1::<f64>::zeros(n);
         let mut w_ls = Array1::<f64>::zeros(n);
 
         for i in 0..n {
@@ -1324,7 +1325,9 @@ impl CustomFamily for GaussianLocationScaleFamily {
             w_mu[i] = (self.weights[i] / s2).max(MIN_WEIGHT);
             z_mu[i] = eta_mu[i] + r;
 
-            // Here d(log sigma)/du = dsigma/(sigma du).
+            // log-sigma block: IRLS working response and weights.
+            // The score for log-sigma is d(ll)/d(eta_ls) = (r²/s² - 1) * dsigma/(sigma * deta).
+            // Working response: z_ls = eta_ls + score / info.
             let dlogsigma_du = if dsigma_deta[i] == 0.0 {
                 0.0
             } else {
@@ -1332,6 +1335,9 @@ impl CustomFamily for GaussianLocationScaleFamily {
             };
             let info_u = (2.0 * self.weights[i] * dlogsigma_du * dlogsigma_du).max(MIN_WEIGHT);
             w_ls[i] = info_u;
+            // Score: d(ll)/d(eta_ls) = w_i * (r²/s² - 1) * dsigma/sigma
+            let score_ls = self.weights[i] * (r * r / s2 - 1.0) * dlogsigma_du;
+            z_ls[i] = eta_log_sigma[i] + score_ls / info_u;
         }
 
         Ok(FamilyEvaluation {

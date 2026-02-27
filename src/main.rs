@@ -4448,8 +4448,8 @@ fn build_smooth_basis(
                         num_centers: centers,
                     },
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
-                    nu: parse_matern_nu(options.get("nu").map(String::as_str).unwrap_or("5/2"))?,
-                    nullspace_order: match option_usize(options, "order").unwrap_or(1) {
+                    nu: parse_matern_nu(options.get("nu").map(String::as_str).unwrap_or("1/2"))?,
+                    nullspace_order: match option_usize(options, "order").unwrap_or(0) {
                         0 => DuchonNullspaceOrder::Zero,
                         _ => DuchonNullspaceOrder::Linear,
                     },

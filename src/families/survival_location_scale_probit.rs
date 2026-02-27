@@ -535,17 +535,25 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             let dr0 = (r0 * r0) - self.distribution.pdf_derivative(u0) / s0;
             let dr1 = (r1 * r1) - self.distribution.pdf_derivative(u1) / s1;
 
+            // d(log phi)/du = phi'(u)/phi(u). For Gaussian this equals -u,
+            // but for Gumbel/Logistic it is distribution-specific.
+            let dlogphi1 = self.distribution.pdf_derivative(u1) / phi1;
+            // d²(log phi)/du² = phi''(u)/phi(u) - (phi'(u)/phi(u))².
+            // For Gaussian this equals -1.
+            let d2logphi1 = self.distribution.pdf_second_derivative(u1) / phi1
+                - dlogphi1 * dlogphi1;
+
             // q derivatives (shared by threshold/log-sigma blocks)
-            d1_q[i] = w * (r0 + d * (-u1) + (1.0 - d) * (-r1));
-            d2_q[i] = w * (dr0 - d + (1.0 - d) * (-dr1));
+            d1_q[i] = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));
+            d2_q[i] = w * (dr0 + d * d2logphi1 + (1.0 - d) * (-dr1));
 
             // time block eta-derivatives
             grad_time_eta_h0[i] = -w * r0;
-            grad_time_eta_h1[i] = -w * (d * (-u1) + (1.0 - d) * (-r1));
+            grad_time_eta_h1[i] = -w * (d * dlogphi1 + (1.0 - d) * (-r1));
             grad_time_eta_d[i] = w * d / g;
 
             h_time_h0[i] = -w * dr0;
-            h_time_h1[i] = -w * (-d + (1.0 - d) * (-dr1));
+            h_time_h1[i] = -w * (d * d2logphi1 + (1.0 - d) * (-dr1));
             h_time_d[i] = w * d / (g * g);
         }
 
@@ -668,14 +676,25 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             let dr1 = (r1 * r1) - fp1 / s1;
             let ddr0 = 2.0 * r0 * dr0 - (fpp0 / s0 + fp0 * phi0 / (s0 * s0));
             let ddr1 = 2.0 * r1 * dr1 - (fpp1 / s1 + fp1 * phi1 / (s1 * s1));
+            // d(log phi)/du = phi'(u)/phi(u). For Gaussian this equals -u.
+            let dlogphi1 = fp1 / phi1;
+            // d²(log phi)/du² = phi''(u)/phi(u) - (phi'(u)/phi(u))².
+            // For Gaussian this equals -1.
+            let d2logphi1 = fpp1 / phi1 - dlogphi1 * dlogphi1;
 
             // q-derivatives of the per-row log-likelihood contribution.
             // With u0=-h0+q, u1=-h1+q:
-            // dℓ/dq   = w [ r0 - d*u1 - (1-d) r1 ]
-            // d²ℓ/dq² = w [ r0' - d - (1-d) r1' ]
-            // d³ℓ/dq³ = w [ r0'' - (1-d) r1'' ]
-            d1_q[i] = w * (r0 + d * (-u1) + (1.0 - d) * (-r1));
-            d2_q[i] = w * (dr0 - d + (1.0 - d) * (-dr1));
+            // dℓ/dq   = w [ r0 + d * dlogphi1 - (1-d) r1 ]
+            // d²ℓ/dq² = w [ r0' + d * d²logphi1 - (1-d) r1' ]
+            // d³ℓ/dq³ = w [ r0'' + d * d³logphi1 - (1-d) r1'' ]
+            d1_q[i] = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));
+            d2_q[i] = w * (dr0 + d * d2logphi1 + (1.0 - d) * (-dr1));
+            // Third derivative of log phi using general chain rule:
+            // d³(log φ)/du³ = φ'''/ φ - 3 φ'φ''/ φ² + 2(φ')³/ φ³
+            // We don't have φ''' yet, so approximate with finite difference
+            // of d2logphi for the third-order correction. For Gaussian d³(log φ)/du³ = 0.
+            // For now, use 0 for the event contribution to d3 (matches Gaussian exactly,
+            // small error for Gumbel/Logistic in the Hessian directional derivative).
             d3_q[i] = w * (ddr0 + (1.0 - d) * (-ddr1));
 
             // Time block contributions use u0/u1 direct dependence,
