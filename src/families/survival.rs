@@ -168,10 +168,18 @@ pub struct WorkingModelSurvival {
     penalties: PenaltyBlocks,
     monotonicity: MonotonicityPenalty,
     spec: SurvivalSpec,
+    structurally_monotonic: bool,
+    structural_time_columns: usize,
 }
 
 impl WorkingModelSurvival {
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
+        if self.structurally_monotonic {
+            // With structural monotonic reparameterization, feasibility is enforced
+            // through positive time weights (exp-map), so linear constraints no longer
+            // represent the active geometry.
+            return None;
+        }
         let tol = self.monotonicity.tolerance.max(1e-12);
         let p = self.x_derivative.ncols();
         if p == 0 {
@@ -280,7 +288,66 @@ impl WorkingModelSurvival {
             penalties,
             monotonicity,
             spec,
+            structurally_monotonic: false,
+            structural_time_columns: 0,
         })
+    }
+
+    /// Enable/disable structural monotonicity for the time block.
+    ///
+    /// When enabled, the first `time_columns` coefficients are mapped with `exp`
+    /// before entering the predictor. This guarantees strictly positive weights
+    /// on the monotone time basis.
+    ///
+    /// Any unconstrained intercept should live outside this structural time block
+    /// (for example in the parametric/covariate design).
+    pub fn set_structural_monotonicity(
+        &mut self,
+        enabled: bool,
+        time_columns: usize,
+    ) -> Result<(), EstimationError> {
+        let p = self.x_exit.ncols();
+        if time_columns > p {
+            return Err(EstimationError::InvalidInput(format!(
+                "structural time columns {} exceed coefficient dimension {}",
+                time_columns, p
+            )));
+        }
+        if enabled && time_columns == 0 {
+            return Err(EstimationError::InvalidInput(
+                "structural monotonicity requires at least one time column".to_string(),
+            ));
+        }
+        self.structurally_monotonic = enabled;
+        self.structural_time_columns = if enabled { time_columns } else { 0 };
+        Ok(())
+    }
+
+    fn transformed_coefficients(
+        &self,
+        beta: &Array1<f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        let p = beta.len();
+        let mut theta = beta.clone();
+        let mut jac = Array1::<f64>::ones(p);
+        let mut curvature = Array1::<f64>::zeros(p);
+
+        if self.structurally_monotonic {
+            let time_cols = self.structural_time_columns.min(p);
+            for j in 0..time_cols {
+                let w = beta[j].exp();
+                if !w.is_finite() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "non-finite exp(beta[{j}]) in structural monotonic parameterization"
+                    )));
+                }
+                theta[j] = w;
+                jac[j] = w;
+                curvature[j] = w;
+            }
+        }
+
+        Ok((theta, jac, curvature))
     }
 
     pub fn update_state(&self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
@@ -311,13 +378,25 @@ impl WorkingModelSurvival {
         //   Hess_i = exp(eta1_i) a1_i a1_i^T - exp(eta0_i) a0_i a0_i^T
         //            + delta_i * (d_i d_i^T) / s_i^2.
         //
-        // The loop below computes those terms directly, then adds penalties.
+        // Structural-monotonic option:
+        //   beta_time = [beta0, beta1, ..., beta_{K-1}] (all in the structural block),
+        //   theta_j = exp(beta_j) for j in the structural block,
+        //   theta_cov = beta_cov outside the structural block.
+        // Then eta = X * theta + offset.
+        // Chain rule to beta-space:
+        //   d eta / d beta_j = X_j * d theta_j/d beta_j
+        //   d² eta / d beta_j² = X_j * d² theta_j/d beta_j²
+        // where (for transformed time columns) both first and second derivatives are exp(beta_j).
+        //
+        // The loop below computes exact beta-space derivatives for either mode,
+        // then adds penalties.
         // Total predictor = target offset + learned deviation.
         // This is the same architecture used for flexible binary links:
         // principled default, plus penalized wiggle/deviation.
-        let eta_entry = self.x_entry.dot(beta) + &self.offset_eta_entry;
-        let eta_exit = self.x_exit.dot(beta) + &self.offset_eta_exit;
-        let derivative_raw = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
+        let (theta, jac, curvature) = self.transformed_coefficients(beta)?;
+        let eta_entry = self.x_entry.dot(&theta) + &self.offset_eta_entry;
+        let eta_exit = self.x_exit.dot(&theta) + &self.offset_eta_exit;
+        let derivative_raw = self.x_derivative.dot(&theta) + &self.offset_derivative_exit;
 
         let h_entry = eta_entry.mapv(f64::exp);
         let h_exit = eta_exit.mapv(f64::exp);
@@ -358,28 +437,46 @@ impl WorkingModelSurvival {
 
             let x_s = self.x_entry.row(i);
             let x_e = self.x_exit.row(i);
+            let d_row = self.x_derivative.row(i);
 
             // Interval contribution to NLL:
             //   exp(eta_exit) - exp(eta_entry)
             // Gradient piece:
-            //   exp(eta_exit) * x_exit - exp(eta_entry) * x_entry
+            //   exp(eta_exit) * d_eta_exit/d_beta - exp(eta_entry) * d_eta_entry/d_beta
+            let mut g_eta_exit = vec![0.0_f64; p];
+            let mut g_eta_entry = vec![0.0_f64; p];
+            let mut h_eta_exit_diag = vec![0.0_f64; p];
+            let mut h_eta_entry_diag = vec![0.0_f64; p];
             for j in 0..p {
-                let mut g_j = h_e * x_e[j];
+                g_eta_exit[j] = x_e[j] * jac[j];
+                g_eta_entry[j] = x_s[j] * jac[j];
+                h_eta_exit_diag[j] = x_e[j] * curvature[j];
+                h_eta_entry_diag[j] = x_s[j] * curvature[j];
+
+                let mut g_j = h_e * g_eta_exit[j];
                 if has_entry_interval {
-                    g_j -= h_s * x_s[j];
+                    g_j -= h_s * g_eta_entry[j];
                 }
                 grad[j] += w * g_j;
             }
 
             // Hessian piece from interval contribution:
-            //   exp(eta_exit) * x_exit x_exit^T - exp(eta_entry) * x_entry x_entry^T
+            // For f(beta)=exp(eta(beta)):
+            //   Hess[f] = f * (grad_eta grad_eta^T + Hess_eta)
+            // where Hess_eta is diagonal in this parameterization.
             for r in 0..p {
-                let xe_r = x_e[r];
-                let xs_r = x_s[r];
+                let ge_r = g_eta_exit[r];
+                let gs_r = g_eta_entry[r];
                 for c in 0..p {
-                    let mut h_rc = h_e * xe_r * x_e[c];
+                    let mut h_rc = h_e * ge_r * g_eta_exit[c];
+                    if r == c {
+                        h_rc += h_e * h_eta_exit_diag[r];
+                    }
                     if has_entry_interval {
-                        h_rc -= h_s * xs_r * x_s[c];
+                        h_rc -= h_s * gs_r * g_eta_entry[c];
+                        if r == c {
+                            h_rc -= h_s * h_eta_entry_diag[r];
+                        }
                     }
                     h[[r, c]] += w * h_rc;
                 }
@@ -394,25 +491,34 @@ impl WorkingModelSurvival {
                     )));
                 }
                 let inv_deriv = 1.0 / deriv;
-                let d_row = self.x_derivative.row(i);
                 nll += -w * (eta_exit[i] + deriv.ln());
 
                 // Event contribution:
                 //   - (eta_exit + log(s_i)), with s_i = d_i^T beta = derivative_raw[i].
                 //
                 // Gradient piece:
-                //   -x_exit - d_i / s_i (with smooth guarded s_i).
+                //   -d_eta_exit/d_beta - (d_s/d_beta) / s_i
+                let mut g_s = vec![0.0_f64; p];
+                let mut h_s_diag = vec![0.0_f64; p];
                 for j in 0..p {
-                    grad[j] += -w * (x_e[j] + inv_deriv * d_row[j]);
+                    g_s[j] = d_row[j] * jac[j];
+                    h_s_diag[j] = d_row[j] * curvature[j];
+                    grad[j] += -w * (g_eta_exit[j] + inv_deriv * g_s[j]);
                 }
 
-                // Exact Hessian from -log(s_i):
-                // d²/dβ²[-log(s_i)] = (d_i d_i^T) / s_i².
+                // Exact Hessian from:
+                //   -eta_exit(beta) - log(s_i(beta)).
+                // -eta_exit contributes -Hess(eta_exit), diagonal in this map.
+                // -log(s) contributes (grad_s grad_s^T)/s^2 - Hess(s)/s.
                 let log_s_second = inv_deriv * inv_deriv;
                 for r in 0..p {
-                    let dr = d_row[r];
                     for c in 0..p {
-                        h[[r, c]] += w * log_s_second * dr * d_row[c];
+                        let mut h_rc = w * log_s_second * g_s[r] * g_s[c];
+                        if r == c {
+                            h_rc += -w * h_eta_exit_diag[r];
+                            h_rc += -w * inv_deriv * h_s_diag[r];
+                        }
+                        h[[r, c]] += h_rc;
                     }
                 }
             }
@@ -448,6 +554,65 @@ impl WorkingModelSurvival {
             firth_hat_diag: None,
             ridge_used,
         })
+    }
+
+    fn laml_objective_from_state(
+        &self,
+        beta: &Array1<f64>,
+        state: &WorkingState,
+    ) -> Result<f64, EstimationError> {
+        let p = beta.len();
+        if state.hessian.nrows() != p || state.hessian.ncols() != p {
+            return Err(EstimationError::LayoutError(
+                "survival laml objective: Hessian/beta dimension mismatch".to_string(),
+            ));
+        }
+
+        // Robust logdet for H: Cholesky on SPD path, eigen fallback otherwise.
+        let logdet_h = if let Ok(chol) = state.hessian.clone().cholesky(Side::Lower) {
+            let l = chol.lower_triangular();
+            2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>()
+        } else {
+            let (eval, _) = state
+                .hessian
+                .eigh(Side::Lower)
+                .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+            let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+            let tol = (max_eval * 1e-12).max(1e-14);
+            eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum()
+        };
+
+        if self.penalties.blocks.is_empty() {
+            // With no penalty blocks, S=0 and log|S|_+ = 0 by convention.
+            return Ok(0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h);
+        }
+
+        // Build S(rho) and compute pseudo-logdet over positive eigenspace.
+        let mut s_total = Array2::<f64>::zeros((p, p));
+        for block in &self.penalties.blocks {
+            if block.lambda == 0.0 {
+                continue;
+            }
+            let r = block.range.clone();
+            let scale = block.lambda;
+            for (i_local, i) in r.clone().enumerate() {
+                for (j_local, j) in r.clone().enumerate() {
+                    s_total[[i, j]] += scale * block.matrix[[i_local, j_local]];
+                }
+            }
+        }
+        let (s_eval, _s_evec) = s_total
+            .eigh(Side::Lower)
+            .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+        let max_s_eval = s_eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let s_tol = (max_s_eval * 1e-12).max(1e-14);
+        let logdet_s = s_eval
+            .iter()
+            .filter(|&&ev| ev > s_tol)
+            .map(|&ev| ev.ln())
+            .sum::<f64>();
+
+        Ok(0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h - 0.5 * logdet_s)
     }
 
     /// Evaluate the survival outer objective and exact `rho`-gradient at a
@@ -510,31 +675,57 @@ impl WorkingModelSurvival {
     ) -> Result<(f64, Array1<f64>), EstimationError> {
         let p = beta.len();
         let k_count = self.penalties.blocks.len();
-        if state.hessian.nrows() != p || state.hessian.ncols() != p {
-            return Err(EstimationError::LayoutError(
-                "survival laml gradient: Hessian/beta dimension mismatch".to_string(),
-            ));
+        let objective = self.laml_objective_from_state(beta, state)?;
+
+        if self.structurally_monotonic {
+            if k_count == 0 {
+                return Ok((objective, Array1::zeros(0)));
+            }
+            // Structural monotonicity introduces nonlinearity in eta(beta), which
+            // changes third-derivative contractions. Use objective-consistent
+            // central differences in rho-space with full inner re-solves.
+            let fd_step = 1e-4_f64;
+            let mut grad = Array1::<f64>::zeros(k_count);
+            for k in 0..k_count {
+                let mut plus_model = self.clone();
+                let mut minus_model = self.clone();
+                plus_model.penalties.blocks[k].lambda *= fd_step.exp();
+                minus_model.penalties.blocks[k].lambda *= (-fd_step).exp();
+
+                let eval_mode_objective =
+                    |model: &WorkingModelSurvival| -> Result<f64, EstimationError> {
+                        let mut model_local = model.clone();
+                        let opts = crate::pirls::WorkingModelPirlsOptions {
+                            max_iterations: 200,
+                            convergence_tolerance: 1e-7,
+                            max_step_halving: 40,
+                            min_step_size: 1e-12,
+                            firth_bias_reduction: false,
+                            coefficient_lower_bounds: None,
+                            linear_constraints: model_local.monotonicity_linear_constraints(),
+                        };
+                        let out = crate::pirls::run_working_model_pirls(
+                            &mut model_local,
+                            crate::types::Coefficients::new(beta.clone()),
+                            &opts,
+                            |_info| {},
+                        )
+                        .map_err(|e| {
+                            EstimationError::InvalidInput(format!(
+                                "structural LAML finite-difference inner solve failed: {e}"
+                            ))
+                        })?;
+                        model_local.laml_objective_from_state(&out.beta.0, &out.state)
+                    };
+
+                let v_plus = eval_mode_objective(&plus_model)?;
+                let v_minus = eval_mode_objective(&minus_model)?;
+                grad[k] = (v_plus - v_minus) / (2.0 * fd_step);
+            }
+            return Ok((objective, grad));
         }
 
-        // Robust logdet for H: Cholesky on SPD path, eigen fallback otherwise.
-        let logdet_h = if let Ok(chol) = state.hessian.clone().cholesky(Side::Lower) {
-            let l = chol.lower_triangular();
-            2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>()
-        } else {
-            let (eval, _) = state
-                .hessian
-                .eigh(Side::Lower)
-                .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
-            let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-            let tol = (max_eval * 1e-12).max(1e-14);
-            eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum()
-        };
-
         if k_count == 0 {
-            // With no penalty blocks, S=0 and log|S|_+ = 0 by convention.
-            // Keep objective consistent with the documented form:
-            //   0.5*deviance + penalty_term + 0.5*log|H|.
-            let objective = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h;
             return Ok((objective, Array1::zeros(0)));
         }
 
@@ -607,14 +798,10 @@ impl WorkingModelSurvival {
             .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
         let max_s_eval = s_eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
         let s_tol = (max_s_eval * 1e-12).max(1e-14);
-        let mut logdet_s = 0.0_f64;
         let mut s_pinv = Array2::<f64>::zeros((p, p));
         for j in 0..p {
             let ev = s_eval[j];
             if ev > s_tol {
-                // Positive-eigenspace pseudo-determinant:
-                //   log|S|_+ = sum_{ev_j > tol} log(ev_j)
-                logdet_s += ev.ln();
                 let inv_ev = 1.0 / ev;
                 // Build S^+ = U_+ diag(1/ev_j) U_+^T in-place by rank-1 updates.
                 for r in 0..p {
@@ -625,11 +812,6 @@ impl WorkingModelSurvival {
                 }
             }
         }
-
-        // Use the same inner objective components reported by update_state:
-        //   0.5 * deviance + penalty_term.
-        // This keeps the outer value consistent with the solved inner mode.
-        let objective = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h - 0.5 * logdet_s;
 
         let mut grad = Array1::<f64>::zeros(k_count);
         for (k, block) in self.penalties.blocks.iter().enumerate() {
@@ -1132,6 +1314,177 @@ mod tests {
                 state.gradient[j]
             );
         }
+    }
+
+    #[test]
+    fn structural_monotonic_gradient_matches_objective_fd() {
+        let age_entry = array![1.0_f64, 1.3_f64, 1.8_f64];
+        let age_exit = array![1.6_f64, 2.1_f64, 2.7_f64];
+        let event_target = array![1u8, 0u8, 1u8];
+        let event_competing = array![0u8, 0u8, 0u8];
+        let sample_weight = array![1.0, 1.0, 1.0];
+
+        // Time block has 3 structural-monotone columns.
+        // Final column is a covariate, left unconstrained.
+        let x_entry = array![
+            [1.0, 0.2, 0.05, -0.7],
+            [1.0, 0.5, 0.20, 0.1],
+            [1.0, 0.9, 0.60, 1.2]
+        ];
+        let x_exit = array![
+            [1.0, 0.4, 0.16, -0.7],
+            [1.0, 0.8, 0.64, 0.1],
+            [1.0, 1.1, 1.21, 1.2]
+        ];
+        let x_derivative = array![
+            [0.0, 0.8, 0.64, 0.0],
+            [0.0, 0.7, 1.12, 0.0],
+            [0.0, 0.6, 1.32, 0.0]
+        ];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 1e-8,
+        };
+        let mut model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct structural survival model");
+        model
+            .set_structural_monotonicity(true, 3)
+            .expect("enable structural monotonicity");
+        assert!(model.monotonicity_linear_constraints().is_none());
+
+        let beta = array![-1.0, -0.3, 0.1, 0.2];
+        let state = model.update_state(&beta).expect("state at structural beta");
+        let eps = 1e-7;
+        for j in 0..beta.len() {
+            let mut plus = beta.clone();
+            let mut minus = beta.clone();
+            plus[j] += eps;
+            minus[j] -= eps;
+            let state_plus = model.update_state(&plus).expect("state at beta + eps");
+            let state_minus = model.update_state(&minus).expect("state at beta - eps");
+            let obj_plus = 0.5 * state_plus.deviance + state_plus.penalty_term;
+            let obj_minus = 0.5 * state_minus.deviance + state_minus.penalty_term;
+            let fd = (obj_plus - obj_minus) / (2.0 * eps);
+            assert!(
+                (state.gradient[j] - fd).abs() < 2e-5,
+                "structural objective/gradient mismatch at j={j}: grad={} fd={fd}",
+                state.gradient[j]
+            );
+        }
+    }
+
+    #[test]
+    fn structural_monotonic_laml_gradient_returns_finite_values() {
+        let age_entry = array![1.0_f64, 1.2_f64];
+        let age_exit = array![1.5_f64, 2.0_f64];
+        let event_target = array![1u8, 0u8];
+        let event_competing = array![0u8, 0u8];
+        let sample_weight = array![1.0, 1.0];
+        let x_entry = array![[1.0, 0.2, -0.5], [1.0, 0.4, 0.2]];
+        let x_exit = array![[1.0, 0.5, -0.5], [1.0, 0.8, 0.2]];
+        let x_derivative = array![[0.0, 0.9, 0.0], [0.0, 0.7, 0.0]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 1e-8,
+        };
+        let mut model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct structural survival model");
+        model
+            .set_structural_monotonicity(true, 2)
+            .expect("enable structural monotonicity");
+        // One simple penalty block to exercise rho-gradient path.
+        model.penalties = PenaltyBlocks::new(vec![PenaltyBlock {
+            matrix: array![[1.0]],
+            lambda: 0.7,
+            range: 1..2,
+        }]);
+        let beta = array![-1.0, -0.2, 0.1];
+        let state = model.update_state(&beta).expect("state at structural beta");
+        let (obj, grad) = model
+            .laml_objective_and_rho_gradient(&beta, &state)
+            .expect("laml gradient should work in structural mode");
+        assert!(obj.is_finite());
+        assert_eq!(grad.len(), 1);
+        assert!(grad[0].is_finite());
+    }
+
+    #[test]
+    fn structural_monotonic_exponentiates_first_time_column() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[0.0]];
+        let x_exit = array![[0.2]];
+        let x_derivative = array![[1.0]];
+
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 1e-8,
+        };
+        let mut model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct structural survival model");
+
+        let beta = array![-3.0];
+        assert!(
+            model.update_state(&beta).is_err(),
+            "without structural mapping, negative coefficient should violate derivative guard"
+        );
+
+        model
+            .set_structural_monotonicity(true, 1)
+            .expect("enable structural monotonicity");
+        let state = model
+            .update_state(&beta)
+            .expect("first structural time column should be exponentiated");
+        assert!(state.deviance.is_finite());
+        assert!(state.gradient[0].is_finite());
     }
 
     fn model_with_rho(base: &WorkingModelSurvival, rho: &Array1<f64>) -> WorkingModelSurvival {
