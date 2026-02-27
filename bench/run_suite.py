@@ -1693,7 +1693,7 @@ def _rust_fit_mapping(scenario_name):
         "geo_disease_matern": dict(
             family="binomial-logit",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="thinplate",
+            smooth_basis="matern",
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
         ),
@@ -1707,7 +1707,7 @@ def _rust_fit_mapping(scenario_name):
         "geo_disease_matern_basic": dict(
             family="binomial-logit",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="thinplate",
+            smooth_basis="matern",
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
         ),
@@ -1748,10 +1748,11 @@ def _rust_formula_for_scenario(scenario_name, ds):
         raise RuntimeError(
             f"Invalid knot count {knot_count} for scenario '{scenario_name}'; expected >= 0."
         )
-    dp_opt = ""
-    if "double_penalty" in cfg:
-        dp = "true" if bool(cfg["double_penalty"]) else "false"
-        dp_opt = f", double_penalty={dp}"
+    # Keep shrinkage policy explicit and aligned with mgcv `select`:
+    # - default to shrinkage on non-`_basic` scenarios
+    # - allow per-scenario override via cfg["double_penalty"].
+    use_double_penalty = bool(cfg.get("double_penalty", not scenario_name.endswith("_basic")))
+    dp_opt = f", double_penalty={'true' if use_double_penalty else 'false'}"
     smooth_cols = cfg.get("smooth_cols")
     if smooth_cols:
         for col in smooth_cols:
@@ -1778,10 +1779,6 @@ def _rust_formula_for_scenario(scenario_name, ds):
             terms.append(f"s({col}, type=ps, knots={knot_count})")
         elif basis in {"duchon", "matern"}:
             terms.append(f"s({col}, type={basis}, centers={knot_count}{dp_opt})")
-        elif "double_penalty" in cfg:
-            raise RuntimeError(
-                f"double_penalty is only supported with ps basis in Rust formula; got basis='{basis}' for '{scenario_name}'"
-            )
         else:
             raise RuntimeError(
                 f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
@@ -1807,10 +1804,18 @@ def _mgcv_formula_for_scenario(scenario_name, ds):
     elif basis in {"thinplate", "tps"}:
         bs_code = "tp"
     elif basis == "duchon":
+        # Keep Duchon settings explicit for reproducibility/fairness.
+        # Rust defaults to Duchon nullspace order=1 (linear trend retained), so
+        # we set mgcv's Duchon derivative order explicitly as m[1]=1.
+        # m[2]=0 keeps the standard weighting in 1D smooths used by this harness.
         bs_code = "ds"
     elif basis == "matern":
-        # mgcv has no direct Matern basis; nearest comparator used here.
-        bs_code = "ts"
+        # Use explicit stationary Matérn GP in mgcv:
+        #   m[1] = -4 -> Matérn with kappa = 2.5, stationary (no linear trend term)
+        #   m[2] = 1.0 -> fixed range on z-scored predictors
+        # This avoids hidden mgcv defaults and keeps comparison with Rust's
+        # explicit Matérn basis fair and reproducible.
+        bs_code = "gp"
     else:
         raise RuntimeError(
             f"Unsupported mgcv smooth basis '{basis}' for scenario '{scenario_name}'"
@@ -1820,12 +1825,30 @@ def _mgcv_formula_for_scenario(scenario_name, ds):
     if smooth_cols:
         for col in smooth_cols:
             k_val = knot_count + 4 if bs_code == "ps" else knot_count
-            terms.append(f"s({col}, bs='{bs_code}', k=min({k_val}, nrow(train_df)-1))")
+            if basis == "matern":
+                terms.append(
+                    f"s({col}, bs='gp', m=c(-4,1.0), k=min({k_val}, nrow(train_df)-1))"
+                )
+            elif basis == "duchon":
+                terms.append(
+                    f"s({col}, bs='ds', m=c(1,0), k=min({k_val}, nrow(train_df)-1))"
+                )
+            else:
+                terms.append(f"s({col}, bs='{bs_code}', k=min({k_val}, nrow(train_df)-1))")
     else:
         col = cfg.get("smooth_col")
         if col:
             k_val = knot_count + 4 if bs_code == "ps" else knot_count
-            terms.append(f"s({col}, bs='{bs_code}', k=min({k_val}, nrow(train_df)-1))")
+            if basis == "matern":
+                terms.append(
+                    f"s({col}, bs='gp', m=c(-4,1.0), k=min({k_val}, nrow(train_df)-1))"
+                )
+            elif basis == "duchon":
+                terms.append(
+                    f"s({col}, bs='ds', m=c(1,0), k=min({k_val}, nrow(train_df)-1))"
+                )
+            else:
+                terms.append(f"s({col}, bs='{bs_code}', k=min({k_val}, nrow(train_df)-1))")
     if not terms:
         raise RuntimeError(f"empty mgcv term list for scenario '{scenario_name}'")
     return f"{target} ~ " + " + ".join(terms)
@@ -2039,7 +2062,7 @@ def rust_cli_cv_args(scenario_name, ds):
         "geo_disease_matern": dict(
             family="binomial",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="thinplate",
+            smooth_basis="matern",
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
             double_penalty=True,
@@ -2056,7 +2079,7 @@ def rust_cli_cv_args(scenario_name, ds):
         "geo_disease_matern_basic": dict(
             family="binomial",
             smooth_cols=["pc1", "pc2", "pc3", "pc4"],
-            smooth_basis="thinplate",
+            smooth_basis="matern",
             linear_cols=[f"pc{i}" for i in range(5, 17)],
             knots=12,
             double_penalty=False,
@@ -2445,6 +2468,10 @@ def run_external_mgcv_cv(scenario):
     ds = dataset_for_scenario(scenario)
     folds = folds_for_dataset(ds)
     mgcv_formula = None
+    rust_cfg = _rust_fit_mapping(scenario["name"])
+    use_select = bool(
+        (rust_cfg or {}).get("double_penalty", not scenario["name"].endswith("_basic"))
+    )
     if ds["family"] != "survival":
         mgcv_formula = _mgcv_formula_for_scenario(scenario["name"], ds)
         if not mgcv_formula:
@@ -2458,7 +2485,12 @@ def run_external_mgcv_cv(scenario):
         out_path = td_path / "out.json"
         script_path = td_path / "run_mgcv_cv.R"
 
-        payload = {"dataset": ds, "scenario_name": scenario["name"], "mgcv_formula": mgcv_formula}
+        payload = {
+            "dataset": ds,
+            "scenario_name": scenario["name"],
+            "mgcv_formula": mgcv_formula,
+            "use_select": use_select,
+        }
         data_path.write_text(json.dumps(payload))
 
         script = r'''
@@ -2481,6 +2513,10 @@ scenario_name <- as.character(payload$scenario_name)
 mgcv_formula <- NULL
 if (!is.null(payload$mgcv_formula)) {
   mgcv_formula <- as.character(payload$mgcv_formula)
+}
+use_select <- TRUE
+if (!is.null(payload$use_select)) {
+  use_select <- isTRUE(payload$use_select)
 }
 
 train_idx <- scan(train_idx_path, what=integer(), quiet=TRUE) + 1L
@@ -2560,7 +2596,6 @@ if (is.null(mgcv_formula) || !nzchar(mgcv_formula)) {
 ftxt <- mgcv_formula
 
 t0 <- proc.time()[["elapsed"]]
-use_select <- !grepl("_basic$", scenario_name)
 fit <- gam(as.formula(ftxt), family=fam, data=train_df, method="REML", select=use_select)
 fit_sec <- proc.time()[["elapsed"]] - t0
 
@@ -2790,7 +2825,10 @@ def run_external_pygam_cv(scenario):
                 for j in range(3, x.shape[1]):
                     terms = terms + l(j)
                 model = LogisticGAM(terms)
-                model_spec = "LogisticGAM(s(0)+s(1)+s(2)+linear(3:15), n_splines=12)"
+                model_spec = (
+                    "LogisticGAM(s(0)+s(1)+s(2)+linear(3:15), n_splines=12) "
+                    "[pygam basis fallback=ps]"
+                )
             elif scenario["name"] in {"geo_disease_ps_per_pc", "geo_disease_ps_per_pc_basic"}:
                 terms = s(0, n_splines=10)
                 for j in range(1, x.shape[1]):
@@ -2816,7 +2854,8 @@ def run_external_pygam_cv(scenario):
                     linear_part = f"+linear(3:{linear_hi})" if linear_hi >= 3 else ""
                     model_spec = (
                         f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, "
-                        f"n_splines={k}, basis={geo_cfg['basis_code']})"
+                        f"n_splines={k}, requested_basis={geo_cfg['basis_code']}, "
+                        f"pygam_basis=ps)"
                     )
             elif _papuan_oce_scenario_cfg(scenario["name"]) is not None:
                 papuan_cfg = _papuan_oce_scenario_cfg(scenario["name"])
@@ -2837,7 +2876,8 @@ def run_external_pygam_cv(scenario):
                     linear_part = f"+linear(3:{linear_hi})" if linear_hi >= 3 else ""
                     model_spec = (
                         f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, "
-                        f"n_splines={k}, basis={papuan_cfg['basis_code']}) [papuan_oce]"
+                        f"n_splines={k}, requested_basis={papuan_cfg['basis_code']}, "
+                        f"pygam_basis=ps) [papuan_oce]"
                     )
             elif _geo_subpop16_scenario_cfg(scenario["name"]) is not None:
                 sub_cfg = _geo_subpop16_scenario_cfg(scenario["name"])
@@ -2855,7 +2895,8 @@ def run_external_pygam_cv(scenario):
                     model = LogisticGAM(terms)
                     model_spec = (
                         f"LogisticGAM(s(0)+s(1)+s(2)+linear(3:15), "
-                        f"n_splines={k}, basis={sub_cfg['basis_code']}) [subpop16]"
+                        f"n_splines={k}, requested_basis={sub_cfg['basis_code']}, "
+                        f"pygam_basis=ps) [subpop16]"
                     )
             elif _geo_latlon_scenario_cfg(scenario["name"]) is not None:
                 latlon_cfg = _geo_latlon_scenario_cfg(scenario["name"])
@@ -2873,7 +2914,8 @@ def run_external_pygam_cv(scenario):
                     model = LogisticGAM(terms)
                     model_spec = (
                         f"LogisticGAM(s(0)+s(1)+s(2)+linear(3:5), "
-                        f"n_splines={k}, basis={latlon_cfg['basis_code']}) [geo_latlon]"
+                        f"n_splines={k}, requested_basis={latlon_cfg['basis_code']}, "
+                        f"pygam_basis=ps) [geo_latlon]"
                     )
             elif scenario["name"] == "icu_survival_death":
                 model = LogisticGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))
@@ -2960,6 +3002,27 @@ def run_external_pygam_cv(scenario):
     }
 
 
+def _assert_basis_parity_for_scenario(s_cfg):
+    # Fairness guard: if Rust mapping requests a named spline family, mgcv must
+    # emit the equivalent basis for the same scenario.
+    ds = dataset_for_scenario(s_cfg)
+    scenario_name = s_cfg["name"]
+    rust_cfg = _rust_fit_mapping(scenario_name)
+    if rust_cfg is None:
+        return
+    basis = _canonical_smooth_basis(rust_cfg.get("smooth_basis", "ps"))
+    if basis not in {"duchon", "matern"}:
+        return
+
+    mgcv_formula = _mgcv_formula_for_scenario(scenario_name, ds)
+    expected = "bs='ds'" if basis == "duchon" else "bs='gp'"
+    if expected not in mgcv_formula:
+        raise SystemExit(
+            "basis parity check failed for "
+            f"{scenario_name}: rust basis='{basis}' but mgcv formula is '{mgcv_formula}'"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run GAM benchmark suite with leakage-safe 5-fold CV.")
     parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS)
@@ -2985,6 +3048,9 @@ def main():
             raise SystemExit(f"Unknown scenario name(s): {', '.join(missing)}")
         if not scenarios:
             raise SystemExit("Scenario filter matched zero scenarios.")
+
+    for s_cfg in scenarios:
+        _assert_basis_parity_for_scenario(s_cfg)
 
     results = []
     for s_cfg in scenarios:
