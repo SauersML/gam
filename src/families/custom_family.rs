@@ -1679,6 +1679,8 @@ pub fn fit_custom_family<F: CustomFamily>(
     }
 
     let warm_cache = std::sync::Mutex::new(None::<ConstrainedWarmStart>);
+    let lower = Array1::<f64>::from_elem(rho0.len(), -30.0);
+    let upper = Array1::<f64>::from_elem(rho0.len(), 30.0);
     let mut solver = Bfgs::new(rho0.clone(), |x| {
         let cached = warm_cache.lock().ok().and_then(|g| g.clone());
         match outer_objective_and_gradient(
@@ -1710,9 +1712,12 @@ pub fn fit_custom_family<F: CustomFamily>(
                 }
                 (obj, grad)
             }
-            Err(_) => (f64::INFINITY, Array1::<f64>::from_elem(x.len(), 1e6)),
+            // Avoid synthetic gradients: failed objective evaluations must not
+            // inject an arbitrary direction into BFGS.
+            Err(_) => (f64::INFINITY, Array1::<f64>::from_elem(x.len(), f64::NAN)),
         }
     })
+    .with_bounds(lower, upper, 1e-6)
     .with_tolerance(options.outer_tol)
     .with_max_iterations(options.outer_max_iter);
     let sol = solver
