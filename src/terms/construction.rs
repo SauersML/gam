@@ -636,12 +636,9 @@ pub struct ReparamResult {
     /// Truncated eigenvectors (p × m where m = p - structural_rank).
     ///
     /// Coordinate frame note:
-    /// - This matrix is stored in the ORIGINAL coefficient frame (pre-`Qs`),
-    ///   because it is sourced from `q_null`.
-    /// - Consumers performing trace/correction math with `rs_transformed`,
-    ///   `beta_transformed`, or transformed Hessians must first map this basis
-    ///   into the same frame, or use an equivalent projector already expressed
-    ///   in transformed coordinates.
+    /// - This matrix is stored in the TRANSFORMED coefficient frame (post-`Qs`),
+    ///   i.e. it is compatible with `rs_transformed`, `beta_transformed`, and
+    ///   transformed Hessians without additional coordinate mapping.
     ///
     /// These vectors span the structural null space used by positive-part
     /// log-determinant conventions.
@@ -1044,20 +1041,24 @@ pub fn stable_reparameterization_with_invariant(
             rs_transformed: vec![],
             rs_transposed: vec![],
             e_transformed: Array2::zeros((0, p)),
-            u_truncated: Array2::zeros((p, p)), // All modes truncated when no penalties
+            // All modes truncated when no penalties; already in transformed frame.
+            u_truncated: Array2::eye(p),
         });
     }
 
     if !invariant.has_nonzero {
+        let qs = invariant.split.compose_qs();
+        let u_truncated = qs.t().dot(&invariant.split.q_null);
         return Ok(ReparamResult {
             s_transformed: Array2::zeros((p, p)),
             log_det: 0.0,
             det1: Array1::zeros(m),
-            qs: invariant.split.compose_qs(),
+            qs,
             rs_transformed: rs_list.to_vec(),
             rs_transposed: rs_list.iter().map(transpose_owned).collect(),
             e_transformed: Array2::zeros((0, p)),
-            u_truncated: invariant.split.q_null.clone(), // All modes truncated when zero penalty
+            // Stored in transformed frame for downstream trace/correction math.
+            u_truncated, // All modes truncated when zero penalty
         });
     }
 
@@ -1180,9 +1181,17 @@ pub fn stable_reparameterization_with_invariant(
         )));
     }
 
-    // Truncated basis is the structural null-space basis (fixed Q_n) in the
-    // ORIGINAL coefficient frame (before transformed-basis operations).
-    let u_truncated_mat = q_null.clone();
+    // Truncated basis in transformed coordinates:
+    //   U_⊥^(t) = Qs^T U_⊥^(orig) = Qs^T Q_n.
+    let mut u_truncated_mat = Mat::<f64>::zeros(p, q_null.ncols());
+    matmul(
+        u_truncated_mat.as_mut(),
+        Accum::Replace,
+        qs.transpose(),
+        q_null.as_ref(),
+        1.0,
+        Par::Seq,
+    );
 
     // E rows correspond to sqrt(eigenvalue) * q_j^T over fixed penalized columns.
     let mut e_transformed_mat = Mat::<f64>::zeros(structural_rank, p);
@@ -1383,8 +1392,12 @@ pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinal
 
 #[cfg(test)]
 mod tests {
-    use super::{SubspaceLeakageMetrics, assess_subspace_leakage};
+    use super::{
+        SubspaceLeakageMetrics, assess_subspace_leakage, precompute_reparam_invariant,
+        stable_reparameterization_with_invariant,
+    };
     use faer::Mat;
+    use ndarray::{Array2, array};
 
     fn metrics_for(
         qs: &Mat<f64>,
@@ -1433,5 +1446,34 @@ mod tests {
 
         let m = metrics_for(&qs, &[r0], structural_rank, p);
         assert!(m.max_cross_gram_abs > 1e-3);
+    }
+
+    #[test]
+    fn u_truncated_is_transformed_frame_in_nonzero_case() {
+        let p = 3usize;
+        let rs_list = vec![array![[1.0, 0.0, 0.0]]];
+        let lambdas = vec![2.0];
+        let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
+        let rep = stable_reparameterization_with_invariant(&rs_list, &lambdas, p, &inv)
+            .expect("stable reparam");
+
+        let expected = rep.qs.t().dot(&inv.split.q_null);
+        let diff = &rep.u_truncated - &expected;
+        let max_abs = diff.iter().copied().map(f64::abs).fold(0.0, f64::max);
+        assert!(
+            max_abs <= 1e-10,
+            "u_truncated frame mismatch: max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn u_truncated_is_identity_when_no_penalties() {
+        let p = 4usize;
+        let rs_list: Vec<Array2<f64>> = Vec::new();
+        let lambdas: Vec<f64> = Vec::new();
+        let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
+        let rep = stable_reparameterization_with_invariant(&rs_list, &lambdas, p, &inv)
+            .expect("stable reparam");
+        assert_eq!(rep.u_truncated, Array2::<f64>::eye(p));
     }
 }

@@ -513,6 +513,13 @@ pub fn compute_component_fd(
 /// the gradient must include a correction term for the truncated-subspace
 /// H-weighted trace contribution. This diagnostic checks if the correction is adequate.
 ///
+/// Coordinate/path requirement:
+/// - `r_k`, `u_truncated`, and `h_inv_u_truncated` must all be represented in
+///   the same coefficient frame.
+/// - If any of these are mixed between original and transformed bases, the
+///   expected-vs-applied correction comparison here will show large systematic
+///   mismatch even when algebra is otherwise correct.
+///
 /// # Arguments
 /// * `r_k` - Penalty root matrix for penalty k (R_k where S_k = R_k' R_k)
 /// * `u_truncated` - Eigenvectors of the truncated (null) subspace

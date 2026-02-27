@@ -1,7 +1,7 @@
 use gam::{
-    CenterStrategy, FitOptions, LikelihoodFamily, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
-    fit_term_collection, predict_gam,
+    CenterStrategy, FitOptions, LikelihoodFamily, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, fit_term_collection,
+    predict_gam,
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;

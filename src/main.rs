@@ -10,8 +10,7 @@ use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy,
     DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu,
-    ThinPlateBasisSpec,
-    build_bspline_basis_1d, evaluate_bspline_derivative_scalar,
+    ThinPlateBasisSpec, build_bspline_basis_1d, evaluate_bspline_derivative_scalar,
 };
 use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, fit_gam,
@@ -32,8 +31,9 @@ use gam::matrix::DesignMatrix;
 use gam::probability::{inverse_link_array, normal_cdf_approx, standard_normal_quantile};
 use gam::smooth::{
     LinearTermSpec, MaternKappaOptimizationOptions, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec,
-    build_term_collection_design, fit_term_collection_with_matern_kappa_optimization,
+    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
+    TermCollectionSpec, build_term_collection_design,
+    fit_term_collection_with_matern_kappa_optimization,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale_probit::{
@@ -99,11 +99,15 @@ struct FitArgs {
     /// Number of internal knots for the probit link wiggle basis.
     #[arg(long = "link-wiggle-internal-knots", default_value_t = 7)]
     link_wiggle_internal_knots: usize,
-    /// Difference-penalty order for the probit link wiggle spline.
-    #[arg(long = "link-wiggle-penalty-order", default_value_t = 2)]
-    link_wiggle_penalty_order: usize,
+    /// Smoothness behavior for the probit link wiggle spline.
+    /// - `slope`: penalize first differences
+    /// - `curvature` (default): penalize second differences
+    /// - `curvature-change`: penalize third differences
+    /// Numeric aliases are also accepted for compatibility: `1|2|3`.
+    #[arg(long = "link-wiggle-penalty-order", value_enum, default_value_t = LinkWigglePenaltyMode::Curvature)]
+    link_wiggle_penalty_order: LinkWigglePenaltyMode,
     /// Add a ridge-style double-penalty to the probit link wiggle block.
-    #[arg(long = "link-wiggle-double-penalty", default_value_t = false)]
+    #[arg(long = "link-wiggle-double-penalty", default_value_t = true)]
     link_wiggle_double_penalty: bool,
     #[arg(long = "out")]
     out: Option<PathBuf>,
@@ -146,6 +150,10 @@ struct SurvivalArgs {
     /// Residual distribution used by probit-location-scale transformation survival mode.
     #[arg(long = "survival-distribution", default_value = "gaussian")]
     survival_distribution: String,
+    /// Optional anchor time for time-baseline identifiability in
+    /// survival-likelihood=probit-location-scale. If omitted, earliest entry time is used.
+    #[arg(long = "survival-time-anchor")]
+    survival_time_anchor: Option<f64>,
     /// Baseline target that penalties shrink toward in transformation mode.
     #[arg(long = "baseline-target", default_value = "linear")]
     baseline_target: String,
@@ -222,6 +230,26 @@ enum FamilyArg {
 enum CovarianceModeArg {
     Conditional,
     Corrected,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LinkWigglePenaltyMode {
+    #[value(alias = "1")]
+    Slope,
+    #[value(alias = "2")]
+    Curvature,
+    #[value(name = "curvature-change", alias = "3")]
+    CurvatureChange,
+}
+
+impl LinkWigglePenaltyMode {
+    fn order(self) -> usize {
+        match self {
+            Self::Slope => 1,
+            Self::Curvature => 2,
+            Self::CurvatureChange => 3,
+        }
+    }
 }
 
 const MODEL_VERSION: u32 = 2;
@@ -533,7 +561,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             let cfg = WiggleBlockConfig {
                 degree: args.link_wiggle_degree,
                 num_internal_knots: args.link_wiggle_internal_knots,
-                penalty_order: args.link_wiggle_penalty_order,
+                penalty_order: args.link_wiggle_penalty_order.order(),
                 double_penalty: args.link_wiggle_double_penalty,
             };
             let (wiggle_block, wiggle_knots) =
@@ -955,10 +983,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     sigma_min: model.survival_sigma_min.unwrap_or(0.05),
                     sigma_max: model.survival_sigma_max.unwrap_or(20.0),
                     distribution: parse_survival_distribution(
-                        model
-                            .survival_distribution
-                            .as_deref()
-                            .unwrap_or("gaussian"),
+                        model.survival_distribution.as_deref().unwrap_or("gaussian"),
                     )?,
                 },
                 &gam::survival_location_scale_probit::SurvivalLocationScaleProbitFitResult {
@@ -2082,6 +2107,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             distribution: survival_distribution,
             derivative_guard: 1e-8,
             derivative_softness: 1e-6,
+            time_anchor: args.survival_time_anchor,
             max_iter: 400,
             tol: 1e-6,
             time_block: TimeBlockInput {
@@ -2161,7 +2187,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 survival_beta_time: Some(fit.beta_time.to_vec()),
                 survival_beta_threshold: Some(fit.beta_threshold.to_vec()),
                 survival_beta_log_sigma: Some(fit.beta_log_sigma.to_vec()),
-                survival_distribution: Some(survival_distribution_name(survival_distribution).to_string()),
+                survival_distribution: Some(
+                    survival_distribution_name(survival_distribution).to_string(),
+                ),
                 training_headers: Some(ds.headers.clone()),
                 resolved_term_spec: Some(frozen_term_spec),
                 resolved_term_spec_noise: None,
@@ -2869,6 +2897,7 @@ fn freeze_term_collection_spec(
                     feature_cols: fitted_cols,
                     knots,
                     degrees,
+                    identifiability_transform,
                 },
             ) => {
                 if s.marginal_specs.len() != knots.len() || s.marginal_specs.len() != degrees.len()
@@ -2886,6 +2915,12 @@ fn freeze_term_collection_spec(
                     s.marginal_specs[i].degree = degrees[i];
                     s.marginal_specs[i].knot_spec = BSplineKnotSpec::Provided(knots[i].clone());
                 }
+                s.identifiability = match identifiability_transform {
+                    Some(z) => TensorBSplineIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => TensorBSplineIdentifiability::None,
+                };
             }
             _ => {
                 return Err(format!(
@@ -3069,6 +3104,9 @@ fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<()
                     .to_string(),
             );
         }
+        let _dist = parse_survival_distribution(
+            model.survival_distribution.as_deref().unwrap_or("gaussian"),
+        )?;
     }
     Ok(())
 }
@@ -3119,6 +3157,15 @@ fn validate_frozen_term_collection_spec(
                             st.name, dim
                         ));
                     }
+                }
+                if matches!(
+                    spec.identifiability,
+                    TensorBSplineIdentifiability::SumToZero
+                ) {
+                    return Err(format!(
+                        "{label} term '{}' is not frozen: tensor identifiability must be FrozenTransform or None",
+                        st.name
+                    ));
                 }
             }
         }
@@ -3672,6 +3719,7 @@ fn build_smooth_basis(
                 spec: TensorBSplineSpec {
                     marginal_specs: specs,
                     double_penalty: smooth_double_penalty,
+                    identifiability: parse_tensor_identifiability(options)?,
                 },
             })
         }
@@ -3855,6 +3903,24 @@ fn parse_matern_identifiability(
         }
         other => Err(format!(
             "invalid Matérn identifiability '{other}'; expected one of: none, sum_to_zero, linear"
+        )),
+    }
+}
+
+fn parse_tensor_identifiability(
+    options: &BTreeMap<String, String>,
+) -> Result<TensorBSplineIdentifiability, String> {
+    let Some(raw) = options.get("identifiability").map(String::as_str) else {
+        return Ok(TensorBSplineIdentifiability::default());
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(TensorBSplineIdentifiability::None),
+        "sum_to_zero" | "sum-to-zero" | "centered" => Ok(TensorBSplineIdentifiability::SumToZero),
+        "frozen" | "frozen_transform" | "frozen-transform" => Err(
+            "tensor identifiability 'frozen' is internal-only; use none or sum_to_zero".to_string(),
+        ),
+        other => Err(format!(
+            "invalid tensor identifiability '{other}'; expected one of: none, sum_to_zero"
         )),
     }
 }
