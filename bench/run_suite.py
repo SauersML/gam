@@ -1624,6 +1624,7 @@ def _rust_fit_mapping(scenario_name):
             linear_cols=["year", "h_rain", "w_rain", "h_temp"],
             smooth_basis="ps",
             knots=7,
+            double_penalty=True,
         ),
         "wine_temp_vs_year": dict(
             family="gaussian", smooth_col="year", linear_cols=[], smooth_basis="ps", knots=7
