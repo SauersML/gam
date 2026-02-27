@@ -1,6 +1,7 @@
 use gam::{
     FitOptions, InferenceCovarianceMode, LikelihoodFamily, MeanIntervalMethod,
-    PredictUncertaintyOptions, coefficient_uncertainty, fit_gam, predict_gam_with_uncertainty,
+    PredictUncertaintyOptions, coefficient_uncertainty, fit_gam, predict_gam_posterior_mean,
+    predict_gam_with_uncertainty,
 };
 use ndarray::{Array1, Array2};
 
@@ -34,6 +35,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![1],
+            linear_constraints: None,
         },
     )
     .expect("fit should succeed");
@@ -98,6 +100,7 @@ fn prediction_uncertainty_is_finite_and_well_shaped() {
             max_iter: 50,
             tol: 1e-6,
             nullspace_dims: vec![1],
+            linear_constraints: None,
         },
     )
     .expect("fit should succeed");
@@ -167,6 +170,7 @@ fn gaussian_prediction_intervals_include_observation_noise() {
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![1],
+            linear_constraints: None,
         },
     )
     .expect("fit should succeed");
@@ -197,4 +201,59 @@ fn gaussian_prediction_intervals_include_observation_noise() {
             .zip(obs_upper.iter())
             .all(|(&l, &u)| l.is_finite() && u.is_finite() && l <= u)
     );
+}
+
+#[test]
+fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
+    let n = 120usize;
+    let mut x = Array2::<f64>::zeros((n, 2));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let t = -3.0 + 6.0 * (i as f64) / (n as f64 - 1.0);
+        x[[i, 0]] = 1.0;
+        x[[i, 1]] = t;
+        y[i] = if t > 0.5 { 1.0 } else { 0.0 };
+    }
+    let weights = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let mut s = Array2::<f64>::zeros((2, 2));
+    s[[1, 1]] = 1e-2;
+
+    let fit = fit_gam(
+        x.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &[s],
+        LikelihoodFamily::BinomialLogit,
+        &FitOptions {
+            max_iter: 60,
+            tol: 1e-6,
+            nullspace_dims: vec![1],
+            linear_constraints: None,
+        },
+    )
+    .expect("fit should succeed");
+    let cov = fit
+        .beta_covariance
+        .as_ref()
+        .expect("covariance should be available");
+    let pred = predict_gam_posterior_mean(
+        x.view(),
+        fit.beta.view(),
+        offset.view(),
+        LikelihoodFamily::BinomialLogit,
+        cov.view(),
+    )
+    .expect("posterior mean prediction should succeed");
+
+    let eta_hi = pred.eta[n - 1];
+    let map_hi = 1.0 / (1.0 + (-eta_hi).exp());
+    let pm_hi = pred.mean[n - 1];
+    assert!(pm_hi < map_hi);
+
+    let eta_lo = pred.eta[0];
+    let map_lo = 1.0 / (1.0 + (-eta_lo).exp());
+    let pm_lo = pred.mean[0];
+    assert!(pm_lo > map_lo);
 }

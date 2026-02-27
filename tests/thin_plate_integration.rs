@@ -45,6 +45,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![0, 0],
+            linear_constraints: None,
         },
     )
     .expect("fit_gam with TPS should succeed");
@@ -117,6 +118,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
             // First penalty has TPS polynomial null space (d+1 => 3 in 2D),
             // second ridge penalty has none.
             nullspace_dims: vec![3, 0],
+            linear_constraints: None,
         },
     )
     .expect("fit_gam with TPS should succeed");

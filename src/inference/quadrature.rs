@@ -105,6 +105,12 @@ impl QuadratureContext {
     }
 }
 
+impl Default for QuadratureContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Gauss-Hermite quadrature rule: nodes and weights.
 struct GaussHermiteRule {
     /// Quadrature nodes (roots of Hermite polynomial)
@@ -490,7 +496,12 @@ where
 }
 
 #[inline]
-pub fn normal_expectation_1d_adaptive<F>(ctx: &QuadratureContext, eta: f64, se_eta: f64, f: F) -> f64
+pub fn normal_expectation_1d_adaptive<F>(
+    ctx: &QuadratureContext,
+    eta: f64,
+    se_eta: f64,
+    f: F,
+) -> f64
 where
     F: Fn(f64) -> f64,
 {
@@ -537,7 +548,7 @@ fn cholesky_with_jitter(cov: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
         let jitter = if retry == 0 {
             0.0
         } else {
-            1e-12 * 10f64.powi((retry - 1) as i32)
+            1e-12 * 10f64.powi(retry - 1)
         };
         if jitter > 0.0 {
             for i in 0..n {
@@ -655,11 +666,7 @@ pub fn normal_expectation_3d_adaptive<F>(
 where
     F: Fn(f64, f64, f64) -> f64,
 {
-    let max_sd = cov[0][0]
-        .max(cov[1][1])
-        .max(cov[2][2])
-        .max(0.0)
-        .sqrt();
+    let max_sd = cov[0][0].max(cov[1][1]).max(cov[2][2]).max(0.0).sqrt();
     // 3D tensor GHQ grows cubically; cap nodes per axis for throughput.
     let n = adaptive_point_count_from_sd(max_sd).min(15);
     let cov_vec = vec![
@@ -817,9 +824,9 @@ pub fn survival_posterior_mean_variance(
 /// 1) sigmoid(t) = 1/2 + 1/2 tanh(t/2)
 /// 2) tanh has a partial-fraction expansion over odd poles ±i(2n-1)π
 /// 3) Taking Gaussian expectations termwise yields rational expectations of the form
-///      E[ 1 / (Z - i a_n) ], Z~N(mu,sigma^2)
+///    E[ 1 / (Z - i a_n) ], Z~N(mu,sigma^2)
 /// 4) Those are exactly representable by the Faddeeva function:
-///      E[ 1 / (Z - i a) ] = i*sqrt(pi)/(sqrt(2)*sigma) * w((i a - mu)/(sqrt(2)*sigma))
+///    E[ 1 / (Z - i a) ] = i*sqrt(pi)/(sqrt(2)*sigma) * w((i a - mu)/(sqrt(2)*sigma))
 /// 5) Taking imaginary parts and summing odd a_n gives the stated series.
 ///
 /// Therefore this routine is mathematically exact up to numerical truncation and

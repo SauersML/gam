@@ -1518,6 +1518,33 @@ pub enum CenterStrategy {
 pub struct ThinPlateBasisSpec {
     pub center_strategy: CenterStrategy,
     pub double_penalty: bool,
+    #[serde(default)]
+    pub identifiability: SpatialIdentifiability,
+}
+
+/// Per-smooth identifiability policy for spatial (TPS / Duchon) bases.
+///
+/// For a raw local basis `B` and parametric design block `C`, the orthogonalized
+/// basis is `B_c = B Z` where columns of `Z` span `null((B^T C)^T)`. This enforces:
+///   `B_c^T C = 0`
+/// in the unweighted inner product, so spatial effects cannot absorb parametric
+/// intercept/linear directions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SpatialIdentifiability {
+    /// Keep unconstrained basis columns.
+    None,
+    /// Orthogonalize the smooth against `[intercept | explicit linear terms]`.
+    OrthogonalToParametric,
+    /// Freeze a fit-time transform `Z`; prediction uses `B_new * Z` unchanged.
+    FrozenTransform { transform: Array2<f64> },
+}
+
+impl Default for SpatialIdentifiability {
+    fn default() -> Self {
+        // "Magic" default for modular GAMs with explicit parametric block:
+        // keep spatial smooth orthogonal to intercept/linear terms.
+        Self::OrthogonalToParametric
+    }
 }
 
 /// Matérn basis configuration.
@@ -1575,6 +1602,8 @@ pub struct DuchonBasisSpec {
     pub nu: MaternNu,
     pub nullspace_order: DuchonNullspaceOrder,
     pub double_penalty: bool,
+    #[serde(default)]
+    pub identifiability: SpatialIdentifiability,
 }
 
 /// Metadata returned by generic basis builders.
@@ -1586,6 +1615,7 @@ pub enum BasisMetadata {
     },
     ThinPlate {
         centers: Array2<f64>,
+        identifiability_transform: Option<Array2<f64>>,
     },
     Matern {
         centers: Array2<f64>,
@@ -1599,6 +1629,7 @@ pub enum BasisMetadata {
         length_scale: f64,
         nu: MaternNu,
         nullspace_order: DuchonNullspaceOrder,
+        identifiability_transform: Option<Array2<f64>>,
     },
     TensorBSpline {
         feature_cols: Vec<usize>,
@@ -2161,7 +2192,10 @@ pub fn build_thin_plate_basis(
         design: tps.basis,
         penalties,
         nullspace_dims,
-        metadata: BasisMetadata::ThinPlate { centers },
+        metadata: BasisMetadata::ThinPlate {
+            centers,
+            identifiability_transform: None,
+        },
     })
 }
 
@@ -3220,6 +3254,7 @@ pub fn build_duchon_basis(
             length_scale: spec.length_scale,
             nu: spec.nu,
             nullspace_order: spec.nullspace_order,
+            identifiability_transform: None,
         },
     })
 }
@@ -3624,10 +3659,27 @@ pub fn apply_sum_to_zero_constraint(
 /// Reparameterizes a basis matrix so its columns are orthogonal (with optional weights)
 /// to a supplied constraint matrix.
 ///
-/// Given a basis `B` (n×k), a constraint matrix `Z` (n×q), and optional observation weights
-/// `w`, this function returns a new basis `B_c = B K` where the columns of `B_c` satisfy
-/// `(B_c)^T W Z = 0`. The transformation matrix `K` spans the nullspace of `B^T W Z`, so the
-/// constrained basis cannot express any function correlated with the provided constraints.
+/// Let:
+/// - `B` be the raw basis (`n x k`)
+/// - `C` be the constraint matrix (`n x q`)
+/// - `W` be diagonal weights (`n x n`), or identity when `weights=None`
+///
+/// We seek a transformed basis `B_c = B K` (`n x k_c`) such that:
+///   `B_c^T W C = 0`.
+///
+/// Expanding:
+///   `B_c^T W C = (B K)^T W C = K^T (B^T W C)`.
+///
+/// So it is enough to choose columns of `K` in `null((B^T W C)^T)`.
+/// This implementation computes:
+///   `M = B^T W C` (`k x q`)
+/// and extracts a basis for `null(M^T)` via SVD.
+///
+/// If `M^T = U Σ V^T`, then right singular vectors in `V` corresponding to near-zero
+/// singular values span `null(M^T)`. We stack those vectors as columns of `K`.
+///
+/// The result enforces orthogonality by construction while retaining the largest possible
+/// smooth subspace under the given constraints.
 pub fn apply_weighted_orthogonality_constraint(
     basis_matrix: ArrayView2<f64>,
     constraint_matrix: ArrayView2<f64>,
@@ -3649,6 +3701,7 @@ pub fn apply_weighted_orthogonality_constraint(
         return Ok((basis_matrix.to_owned(), Array2::eye(k)));
     }
 
+    // Form W*C by row scaling because W is diagonal.
     let mut weighted_constraints = constraint_matrix.to_owned();
     if let Some(w) = weights {
         if w.len() != n {
@@ -3662,6 +3715,8 @@ pub fn apply_weighted_orthogonality_constraint(
         }
     }
 
+    // M = B^T W C. Its transpose M^T has nullspace directions in coefficient space
+    // that produce basis columns orthogonal to C under the W-inner product.
     let constraint_cross = basis_matrix.t().dot(&weighted_constraints); // k×q
 
     let constraint_cross_t = constraint_cross.t().to_owned();
@@ -3675,6 +3730,8 @@ pub fn apply_weighted_orthogonality_constraint(
     };
     let v = vt.t().to_owned();
 
+    // Numerical rank threshold for M^T.
+    // rank = count(sigma_i > tol), nullity = k - rank.
     let max_sigma = singular_values
         .iter()
         .fold(0.0_f64, |max_val, &sigma| max_val.max(sigma));
@@ -3690,12 +3747,15 @@ pub fn apply_weighted_orthogonality_constraint(
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
 
+    // Keep right singular vectors corresponding to numerically zero singular values.
+    // transform = K in derivation above.
     let transform = v.slice(s![.., rank..]).to_owned();
 
     if transform.ncols() == 0 {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
 
+    // B_c = B K.
     let constrained_basis = basis_matrix.dot(&transform);
     Ok((constrained_basis, transform))
 }
@@ -4748,6 +4808,7 @@ mod tests {
         let spec = ThinPlateBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             double_penalty: true,
+            identifiability: SpatialIdentifiability::default(),
         };
         let result = build_thin_plate_basis(data.view(), &spec).unwrap();
         assert_eq!(result.penalties.len(), 1);
@@ -4770,6 +4831,7 @@ mod tests {
             ThinPlateBasisSpec {
                 center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
                 double_penalty: false,
+                identifiability: SpatialIdentifiability::default(),
             },
             ThinPlateBasisSpec {
                 center_strategy: CenterStrategy::KMeans {
@@ -4777,10 +4839,12 @@ mod tests {
                     max_iter: 5,
                 },
                 double_penalty: false,
+                identifiability: SpatialIdentifiability::default(),
             },
             ThinPlateBasisSpec {
                 center_strategy: CenterStrategy::UniformGrid { points_per_dim: 2 },
                 double_penalty: false,
+                identifiability: SpatialIdentifiability::default(),
             },
             ThinPlateBasisSpec {
                 center_strategy: CenterStrategy::UserProvided(array![
@@ -4790,6 +4854,7 @@ mod tests {
                     [1.0, 1.0]
                 ]),
                 double_penalty: false,
+                identifiability: SpatialIdentifiability::default(),
             },
         ];
         for spec in specs {

@@ -46,6 +46,7 @@ fn default_logit_opts() -> ExternalOptimOptions {
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![1],
+        linear_constraints: None,
         firth_bias_reduction: None,
     }
 }
