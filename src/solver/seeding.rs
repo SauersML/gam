@@ -53,6 +53,38 @@ fn rho_from_lambda(lambda: f64, bounds: (f64, f64)) -> f64 {
     clamp_to_bounds(lambda.max(1e-12).ln(), bounds)
 }
 
+fn halton(mut index: usize, base: usize) -> f64 {
+    let mut f = 1.0_f64;
+    let mut r = 0.0_f64;
+    while index > 0 {
+        f /= base as f64;
+        r += f * (index % base) as f64;
+        index /= base;
+    }
+    r
+}
+
+fn first_primes(n: usize) -> Vec<usize> {
+    let mut primes = Vec::with_capacity(n);
+    let mut x = 2usize;
+    while primes.len() < n {
+        let mut is_prime = true;
+        let mut d = 2usize;
+        while d * d <= x {
+            if x.is_multiple_of(d) {
+                is_prime = false;
+                break;
+            }
+            d += 1;
+        }
+        if is_prime {
+            primes.push(x);
+        }
+        x += 1;
+    }
+    primes
+}
+
 pub fn generate_rho_candidates(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
@@ -65,8 +97,8 @@ pub fn generate_rho_candidates(
     let max_seeds = config.max_seeds.max(1);
     let risk_shift = match config.risk_profile {
         SeedRiskProfile::Gaussian => 0.0,
-        SeedRiskProfile::GeneralizedLinear => 1.5,
-        SeedRiskProfile::Survival => 2.5,
+        SeedRiskProfile::GeneralizedLinear => 1.0,
+        SeedRiskProfile::Survival => 2.0,
     };
 
     if num_penalties == 0 {
@@ -90,6 +122,8 @@ pub fn generate_rho_candidates(
         .unwrap_or_else(|| Array1::<f64>::zeros(num_penalties))
         .mapv(|v| clamp_to_bounds(v + risk_shift, bounds));
     add_seed_dedup(&mut seeds, &mut seen, primary.clone());
+    // Always include neutral baseline independently of heuristic anchor.
+    add_seed_dedup(&mut seeds, &mut seen, Array1::zeros(num_penalties));
 
     // Backward-compatible scalar heuristic support: treat each value as a symmetric λ seed.
     if let Some(vals) = heuristic_lambdas
@@ -104,8 +138,8 @@ pub fn generate_rho_candidates(
     // Broad symmetric baselines around the center to guarantee global coverage.
     let baseline_centers: &[f64] = match config.risk_profile {
         SeedRiskProfile::Gaussian => &[0.0, -3.0, 3.0, -6.0, 6.0],
-        SeedRiskProfile::GeneralizedLinear => &[0.5, 2.0, 4.0, -1.0],
-        SeedRiskProfile::Survival => &[2.0, 4.0, 6.0, 0.0],
+        SeedRiskProfile::GeneralizedLinear => &[0.0, 2.0, 4.0, -2.0],
+        SeedRiskProfile::Survival => &[0.0, 2.0, 4.0, 6.0],
     };
     for &center in baseline_centers {
         add_seed_dedup(
@@ -207,6 +241,27 @@ pub fn generate_rho_candidates(
         add_seed_dedup(&mut seeds, &mut seen, swept);
     }
 
+    // Low-discrepancy exploratory seeds around the anchor for basin discovery.
+    // These are still deterministic and do not encode any solver-side bias.
+    let exploratory = max_seeds.saturating_sub(seeds.len()).min(8);
+    if exploratory > 0 {
+        let primes = first_primes(num_penalties.max(1));
+        let amp = match config.risk_profile {
+            SeedRiskProfile::Gaussian => 2.0,
+            SeedRiskProfile::GeneralizedLinear => 2.5,
+            SeedRiskProfile::Survival => 3.0,
+        };
+        for t in 0..exploratory {
+            let mut s = primary.clone();
+            for i in 0..num_penalties {
+                let u = halton(t + 1, primes[i]); // (0,1)
+                let centered = 2.0 * u - 1.0; // (-1,1)
+                s[i] = clamp_to_bounds(primary[i] + amp * centered, bounds);
+            }
+            add_seed_dedup(&mut seeds, &mut seen, s);
+        }
+    }
+
     if seeds.len() > max_seeds {
         seeds.truncate(max_seeds);
     }
@@ -264,5 +319,15 @@ mod tests {
             any_up && any_down
         });
         assert!(has_conflict);
+    }
+
+    #[test]
+    fn includes_neutral_zero_seed() {
+        let cfg = SeedConfig::default();
+        let seeds = generate_rho_candidates(5, None, &cfg);
+        let has_zero = seeds
+            .iter()
+            .any(|s| s.iter().all(|v| (*v - 0.0).abs() < 1e-12));
+        assert!(has_zero);
     }
 }
