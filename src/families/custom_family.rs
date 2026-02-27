@@ -1679,6 +1679,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     }
 
     let warm_cache = std::sync::Mutex::new(None::<ConstrainedWarmStart>);
+    let last_outer_error = std::sync::Mutex::new(None::<String>);
     let lower = Array1::<f64>::from_elem(rho0.len(), -30.0);
     let upper = Array1::<f64>::from_elem(rho0.len(), 30.0);
     let mut solver = Bfgs::new(rho0.clone(), |x| {
@@ -1710,11 +1711,19 @@ pub fn fit_custom_family<F: CustomFamily>(
                         *guard = None;
                     }
                 }
+                if let Ok(mut guard) = last_outer_error.lock() {
+                    *guard = None;
+                }
                 (obj, grad)
             }
             // Avoid synthetic gradients: failed objective evaluations must not
             // inject an arbitrary direction into BFGS.
-            Err(_) => (f64::INFINITY, Array1::<f64>::from_elem(x.len(), f64::NAN)),
+            Err(e) => {
+                if let Ok(mut guard) = last_outer_error.lock() {
+                    *guard = Some(e);
+                }
+                (f64::INFINITY, Array1::<f64>::from_elem(x.len(), f64::NAN))
+            }
         }
     })
     .with_bounds(lower, upper, 1e-6)
@@ -1723,10 +1732,62 @@ pub fn fit_custom_family<F: CustomFamily>(
     .with_accept_flat_midpoint_once(true)
     .with_jiggle_on_flats(true, 1e-3)
     .with_multi_direction_rescue(true)
+    .with_no_improve_stop(1e-8, 5)
+    .with_rng_seed(0xC0FFEE_u64)
     .with_max_iterations(options.outer_max_iter);
-    let sol = solver
-        .run()
-        .map_err(|e| format!("outer smoothing optimization failed: {e:?}"))?;
+    let last_eval_error = || {
+        last_outer_error
+            .lock()
+            .ok()
+            .and_then(|g| (*g).clone())
+            .map(|e| format!(" last objective error: {e}"))
+            .unwrap_or_default()
+    };
+    let sol = match solver.run() {
+        Ok(sol) => sol,
+        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
+            if last_solution.final_value.is_finite()
+                && last_solution.final_gradient_norm.is_finite()
+            {
+                log::warn!(
+                    "Outer smoothing line search failed; using best-so-far solution (iter={}, f={:.6e}, ||g||={:.3e}).",
+                    last_solution.iterations,
+                    last_solution.final_value,
+                    last_solution.final_gradient_norm
+                );
+                *last_solution
+            } else {
+                return Err(format!(
+                    "outer smoothing optimization failed: LineSearchFailed.{details}",
+                    details = last_eval_error()
+                ));
+            }
+        }
+        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
+            if last_solution.final_value.is_finite()
+                && last_solution.final_gradient_norm.is_finite()
+            {
+                log::warn!(
+                    "Outer smoothing hit max iterations; using best-so-far solution (iter={}, f={:.6e}, ||g||={:.3e}).",
+                    last_solution.iterations,
+                    last_solution.final_value,
+                    last_solution.final_gradient_norm
+                );
+                *last_solution
+            } else {
+                return Err(format!(
+                    "outer smoothing optimization failed: MaxIterationsReached.{details}",
+                    details = last_eval_error()
+                ));
+            }
+        }
+        Err(e) => {
+            return Err(format!(
+                "outer smoothing optimization failed: {e:?}.{details}",
+                details = last_eval_error()
+            ));
+        }
+    };
 
     let rho_star = sol.final_point;
     let per_block = split_log_lambdas(&rho_star, &penalty_counts)?;
@@ -1846,6 +1907,18 @@ mod tests {
                 a: array![[1.0]],
                 b: array![self.lower],
             }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct OneBlockAlwaysErrorFamily;
+
+    impl CustomFamily for OneBlockAlwaysErrorFamily {
+        fn evaluate(
+            &self,
+            _block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            Err("synthetic outer objective failure: block[0] evaluate()".to_string())
         }
     }
 
@@ -2030,6 +2103,32 @@ mod tests {
         assert!(
             (beta - 1.0).abs() < 1e-8,
             "expected constrained optimum at lower bound, got {beta}"
+        );
+    }
+
+    #[test]
+    fn outer_objective_failure_context_is_preserved() {
+        // One penalty forces the outer rho optimizer to run, which should now preserve
+        // the real evaluation error instead of returning an opaque line-search failure.
+        let spec = ParameterBlockSpec {
+            name: "err_block".to_string(),
+            design: DesignMatrix::Dense(array![[1.0], [1.0]]),
+            offset: array![0.0, 0.0],
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.0]),
+        };
+        let options = BlockwiseFitOptions {
+            outer_max_iter: 3,
+            ..BlockwiseFitOptions::default()
+        };
+        let err = match fit_custom_family(&OneBlockAlwaysErrorFamily, &[spec], &options) {
+            Ok(_) => panic!("fit should fail when family evaluate always errors"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("last objective error: synthetic outer objective failure: block[0] evaluate()"),
+            "expected preserved root-cause context in error, got: {err}"
         );
     }
 }

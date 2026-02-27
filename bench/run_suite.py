@@ -2375,6 +2375,10 @@ def run_rust_gamlss_scenario_cv(scenario):
                     "contender": "rust_gamlss",
                     "scenario_name": scenario_name,
                     "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
                     "error": (err.strip() or out.strip() or "rust gamlss fit failed"),
                 }
 
@@ -2394,6 +2398,10 @@ def run_rust_gamlss_scenario_cv(scenario):
                     "contender": "rust_gamlss",
                     "scenario_name": scenario_name,
                     "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
                     "error": (err.strip() or out.strip() or "rust gamlss predict failed"),
                 }
             pred_df = pd.read_csv(pred_path)
@@ -2402,6 +2410,10 @@ def run_rust_gamlss_scenario_cv(scenario):
                     "contender": "rust_gamlss",
                     "scenario_name": scenario_name,
                     "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
                     "error": "rust gamlss prediction output missing 'mean' column",
                 }
             pred = pred_df["mean"].to_numpy(dtype=float)
