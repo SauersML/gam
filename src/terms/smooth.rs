@@ -1,15 +1,17 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BasisBuildResult, BasisError, BasisMetadata,
-    DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec, ThinPlateBasisSpec,
-    apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis, build_matern_basis,
-    build_thin_plate_basis, create_bspline_basis_nd_with_knots, estimate_penalty_nullity,
+    DuchonBasisSpec, MaternBasisSpec, SpatialIdentifiability, ThinPlateBasisSpec,
+    apply_sum_to_zero_constraint, apply_weighted_orthogonality_constraint, build_bspline_basis_1d,
+    build_duchon_basis, build_matern_basis, build_thin_plate_basis,
+    create_bspline_basis_nd_with_knots, estimate_penalty_nullity,
 };
 use crate::construction::kronecker_product;
 use crate::estimate::{EstimationError, FitOptions, FitResult, fit_gam};
 use crate::types::LikelihoodFamily;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::f64;
 use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +92,9 @@ pub struct SmoothTerm {
     pub penalties_local: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
     pub metadata: BasisMetadata,
+    /// Optional term-local lower bounds for constrained coefficients.
+    /// `-inf` means unconstrained.
+    pub lower_bounds_local: Option<Array1<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +103,9 @@ pub struct SmoothDesign {
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
     pub terms: Vec<SmoothTerm>,
+    /// Optional smooth-block lower bounds in smooth coefficient coordinates.
+    /// Length equals `design.ncols()` when present.
+    pub coefficient_lower_bounds: Option<Array1<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +147,9 @@ pub struct TermCollectionDesign {
     pub design: Array2<f64>,
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
+    /// Optional global coefficient lower bounds for constrained fitting.
+    /// Length equals `design.ncols()` when present. Unconstrained entries are `-inf`.
+    pub coefficient_lower_bounds: Option<Array1<f64>>,
     pub intercept_range: Range<usize>,
     pub linear_ranges: Vec<(String, Range<usize>)>,
     pub random_effect_ranges: Vec<(String, Range<usize>)>,
@@ -238,6 +249,52 @@ fn second_cumulative_exp(values: &Array1<f64>, sign: f64) -> Array1<f64> {
         out[i] = run;
     }
     out
+}
+
+fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f64) -> Array2<f64> {
+    let mut t = Array2::<f64>::eye(dim);
+    for _ in 0..order {
+        let mut next = Array2::<f64>::zeros((dim, dim));
+        for i in 0..dim {
+            for j in 0..=i {
+                next[[i, j]] = 1.0;
+            }
+        }
+        t = t.dot(&next);
+    }
+    if sign < 0.0 {
+        t.mapv_inplace(|v| -v);
+    }
+    t
+}
+
+fn shape_order_and_sign(shape: ShapeConstraint) -> Option<(usize, f64)> {
+    match shape {
+        ShapeConstraint::None => None,
+        ShapeConstraint::MonotoneIncreasing => Some((1, 1.0)),
+        ShapeConstraint::MonotoneDecreasing => Some((1, -1.0)),
+        ShapeConstraint::Convex => Some((2, 1.0)),
+        ShapeConstraint::Concave => Some((2, -1.0)),
+    }
+}
+
+fn shape_lower_bounds_local(shape: ShapeConstraint, dim: usize) -> Option<Array1<f64>> {
+    let (order, _) = shape_order_and_sign(shape)?;
+    let mut lb = Array1::<f64>::from_elem(dim, f64::NEG_INFINITY);
+    for j in order..dim {
+        lb[j] = 0.0;
+    }
+    Some(lb)
+}
+
+fn shape_supports_basis(term: &SmoothTermSpec) -> bool {
+    if term.shape == ShapeConstraint::None {
+        return true;
+    }
+    matches!(
+        &term.basis,
+        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. }
+    )
 }
 
 fn build_tensor_bspline_basis(
@@ -505,10 +562,10 @@ pub fn build_smooth_design(
     let mut local_dims = Vec::<usize>::with_capacity(terms.len());
 
     for term in terms {
-        if term.shape != ShapeConstraint::None {
+        if !shape_supports_basis(term) {
             return Err(BasisError::InvalidInput(format!(
-                "ShapeConstraint::{:?} is not enforced in the current linear fit pipeline; use ShapeConstraint::None or a constrained/nonlinear solver",
-                term.shape
+                "ShapeConstraint::{:?} for term '{}' is currently supported only for BSpline1D/TensorBSpline bases",
+                term.shape, term.name
             )));
         }
         let built: BasisBuildResult = match &term.basis {
@@ -521,7 +578,13 @@ pub fn build_smooth_design(
                         data.ncols()
                     )));
                 }
-                build_bspline_basis_1d(data.column(*feature_col), spec)?
+                let mut spec_local = spec.clone();
+                if term.shape != ShapeConstraint::None {
+                    // Shape-constrained B-splines are anchored by construction.
+                    // Sum-to-zero side constraints conflict with monotonic/convex cones.
+                    spec_local.identifiability = BSplineIdentifiability::None;
+                }
+                build_bspline_basis_1d(data.column(*feature_col), &spec_local)?
             }
             SmoothBasisSpec::ThinPlate { feature_cols, spec } => {
                 let x = select_columns(data, feature_cols)?;
@@ -536,18 +599,40 @@ pub fn build_smooth_design(
                 build_duchon_basis(x.view(), spec)?
             }
             SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
-                build_tensor_bspline_basis(data, feature_cols, spec)?
+                let mut spec_local = spec.clone();
+                if term.shape != ShapeConstraint::None {
+                    spec_local.identifiability = TensorBSplineIdentifiability::None;
+                }
+                build_tensor_bspline_basis(data, feature_cols, &spec_local)?
             }
         };
 
         let p_local = built.design.ncols();
-        let design_t = built.design;
-        let penalties_t: Vec<Array2<f64>> = built.penalties;
+        let mut design_t = built.design;
+        let mut penalties_t: Vec<Array2<f64>> = built.penalties;
+        if let Some((order, sign)) = shape_order_and_sign(term.shape) {
+            let t = cumulative_sum_transform_matrix(p_local, order, sign);
+            design_t = design_t.dot(&t);
+            penalties_t = penalties_t
+                .into_iter()
+                .map(|s_local| {
+                    // Congruence transform preserves PSD:
+                    //   S_new = T^T S T.
+                    let tt_s = t.t().dot(&s_local);
+                    tt_s.dot(&t)
+                })
+                .collect();
+        }
+
+        let nullspaces_t = penalties_t
+            .iter()
+            .map(estimate_penalty_nullity)
+            .collect::<Result<Vec<_>, _>>()?;
 
         local_dims.push(p_local);
         local_designs.push(design_t);
         local_penalties.push(penalties_t);
-        local_nullspaces.push(built.nullspace_dims);
+        local_nullspaces.push(nullspaces_t);
         local_metadata.push(built.metadata);
     }
 
@@ -556,11 +641,14 @@ pub fn build_smooth_design(
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(terms.len());
     let mut penalties_global = Vec::<Array2<f64>>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
+    let mut coefficient_lower_bounds = Array1::<f64>::from_elem(total_p, f64::NEG_INFINITY);
+    let mut any_bounds = false;
 
     let mut col_start = 0usize;
     for (idx, term) in terms.iter().enumerate() {
         let p_local = local_dims[idx];
         let col_end = col_start + p_local;
+        let lb_local = shape_lower_bounds_local(term.shape, p_local);
 
         design
             .slice_mut(s![.., col_start..col_end])
@@ -585,7 +673,14 @@ pub fn build_smooth_design(
             penalties_local: local_penalties[idx].clone(),
             nullspace_dims: local_nullspaces[idx].clone(),
             metadata: local_metadata[idx].clone(),
+            lower_bounds_local: lb_local.clone(),
         });
+        if let Some(lb_local) = lb_local {
+            coefficient_lower_bounds
+                .slice_mut(s![col_start..col_end])
+                .assign(&lb_local);
+            any_bounds = true;
+        }
 
         col_start = col_end;
     }
@@ -595,6 +690,11 @@ pub fn build_smooth_design(
         penalties: penalties_global,
         nullspace_dims: nullspace_dims_global,
         terms: terms_out,
+        coefficient_lower_bounds: if any_bounds {
+            Some(coefficient_lower_bounds)
+        } else {
+            None
+        },
     })
 }
 
@@ -620,10 +720,12 @@ pub fn build_term_collection_design(
         }
     }
 
-    let linear_feature_cols: BTreeSet<usize> =
-        spec.linear_terms.iter().map(|t| t.feature_col).collect();
-    let smooth =
-        prune_spatial_polynomial_overlaps(smooth_raw, &spec.smooth_terms, &linear_feature_cols)?;
+    let smooth = apply_spatial_orthogonality_to_parametric(
+        smooth_raw,
+        data,
+        &spec.linear_terms,
+        &spec.smooth_terms,
+    )?;
 
     let p_intercept = 1usize;
     let p_lin = spec.linear_terms.len();
@@ -663,6 +765,8 @@ pub fn build_term_collection_design(
 
     let mut penalties = Vec::<Array2<f64>>::new();
     let mut nullspace_dims = Vec::<usize>::new();
+    let mut coefficient_lower_bounds = Array1::<f64>::from_elem(p_total, f64::NEG_INFINITY);
+    let mut any_bounds = false;
 
     for (j, linear) in spec.linear_terms.iter().enumerate() {
         if !linear.double_penalty {
@@ -693,10 +797,23 @@ pub fn build_term_collection_design(
         nullspace_dims.push(ns);
     }
 
+    if let Some(lb_smooth) = smooth.coefficient_lower_bounds.as_ref() {
+        let start = p_intercept + p_lin + p_rand;
+        coefficient_lower_bounds
+            .slice_mut(s![start..(start + p_smooth)])
+            .assign(lb_smooth);
+        any_bounds = true;
+    }
+
     Ok(TermCollectionDesign {
         design,
         penalties,
         nullspace_dims,
+        coefficient_lower_bounds: if any_bounds {
+            Some(coefficient_lower_bounds)
+        } else {
+            None
+        },
         intercept_range: 0..1,
         linear_ranges,
         random_effect_ranges,
@@ -705,11 +822,29 @@ pub fn build_term_collection_design(
     })
 }
 
-fn prune_spatial_polynomial_overlaps(
+fn apply_spatial_orthogonality_to_parametric(
     smooth: SmoothDesign,
+    data: ArrayView2<'_, f64>,
+    linear_terms: &[LinearTermSpec],
     smooth_specs: &[SmoothTermSpec],
-    linear_feature_cols: &BTreeSet<usize>,
 ) -> Result<SmoothDesign, BasisError> {
+    // Option 5 identifiability policy:
+    //
+    // Build the parametric block C = [1 | X_lin] once, then for each spatial smooth
+    // basis B enforce orthogonality to C in the unweighted inner product:
+    //   B_con^T C = 0.
+    //
+    // Reparameterization derivation:
+    //   M = B^T C.
+    //   If columns of Z span null(M^T), then
+    //      (B Z)^T C = Z^T (B^T C) = Z^T M = 0.
+    //
+    // So B_con = B Z has no component in the parametric column space, eliminating
+    // intercept/linear confounding without hand-picking polynomial columns.
+    //
+    // Penalties transform by congruence:
+    //   S_con = Z^T S Z.
+    // This preserves PSD and keeps curvature geometry consistent in constrained coords.
     if smooth_specs.len() != smooth.terms.len() {
         return Err(BasisError::DimensionMismatch(format!(
             "smooth spec count ({}) does not match built term count ({})",
@@ -718,10 +853,32 @@ fn prune_spatial_polynomial_overlaps(
         )));
     }
 
+    // Fast-path: if no spatial term participates in Option 5 (orthogonal or frozen),
+    // return the smooth bundle unchanged and skip all matrix work.
+    let any_spatial_transform = smooth_specs
+        .iter()
+        .any(|t| !matches!(spatial_identifiability_policy(t), Some(SpatialIdentifiability::None) | None));
+    if !any_spatial_transform {
+        return Ok(smooth);
+    }
+
     let n = smooth.design.nrows();
+    // Build C only when at least one term needs fresh orthogonalization.
+    let any_fresh_orth = smooth_specs.iter().any(|t| {
+        matches!(
+            spatial_identifiability_policy(t),
+            Some(SpatialIdentifiability::OrthogonalToParametric)
+        )
+    });
+    let c = if any_fresh_orth {
+        Some(build_parametric_constraint_block(data, linear_terms)?)
+    } else {
+        None
+    };
     let mut local_designs = Vec::<Array2<f64>>::with_capacity(smooth.terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(smooth.terms.len());
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(smooth.terms.len());
+    let mut local_metadata = Vec::<BasisMetadata>::with_capacity(smooth.terms.len());
     let mut local_dims = Vec::<usize>::with_capacity(smooth.terms.len());
 
     for (idx, term) in smooth.terms.iter().enumerate() {
@@ -730,23 +887,54 @@ fn prune_spatial_polynomial_overlaps(
             .design
             .slice(s![.., term.coeff_range.clone()])
             .to_owned();
-        let keep = spatial_keep_columns(term_spec, design_local.ncols(), linear_feature_cols);
+        let (design_constrained, z_opt) = maybe_spatial_identifiability_transform(
+            term_spec,
+            design_local.view(),
+            c.as_ref().map(|mat| mat.view()),
+        )?;
 
-        let design_pruned = design_local.select(Axis(1), &keep);
-        let mut penalties_pruned = Vec::<Array2<f64>>::with_capacity(term.penalties_local.len());
-        let mut nullspace_pruned = Vec::<usize>::with_capacity(term.penalties_local.len());
-        for s_local in &term.penalties_local {
-            let s_rows = s_local.select(Axis(0), &keep);
-            let s_pruned = s_rows.select(Axis(1), &keep);
-            let ns = estimate_penalty_nullity(&s_pruned)?;
-            penalties_pruned.push(s_pruned);
-            nullspace_pruned.push(ns);
+        // Mathematical acceptance criterion:
+        //   ||B_con^T C||_F / (||B_con||_F ||C||_F) <= tol.
+        if matches!(
+            spatial_identifiability_policy(term_spec),
+            Some(SpatialIdentifiability::OrthogonalToParametric)
+        ) {
+            let c_ref = c
+                .as_ref()
+                .expect("parametric constraint block must exist for orthogonal policy");
+            let rel = orthogonality_relative_residual(design_constrained.view(), c_ref.view());
+            let tol = 1e-8;
+            if rel > tol {
+                return Err(BasisError::InvalidInput(format!(
+                    "spatial orthogonality residual too large for term '{}': {:.3e} > {:.1e}",
+                    term.name, rel, tol
+                )));
+            }
         }
 
-        local_dims.push(design_pruned.ncols());
-        local_designs.push(design_pruned);
-        local_penalties.push(penalties_pruned);
-        local_nullspaces.push(nullspace_pruned);
+        let mut penalties_constrained =
+            Vec::<Array2<f64>>::with_capacity(term.penalties_local.len());
+        let mut nullspace_constrained = Vec::<usize>::with_capacity(term.penalties_local.len());
+        for s_local in &term.penalties_local {
+            let s_con = if let Some(z) = z_opt.as_ref() {
+                let zt_s = z.t().dot(s_local);
+                zt_s.dot(z)
+            } else {
+                s_local.clone()
+            };
+            let ns = estimate_penalty_nullity(&s_con)?;
+            penalties_constrained.push(s_con);
+            nullspace_constrained.push(ns);
+        }
+
+        local_dims.push(design_constrained.ncols());
+        local_designs.push(design_constrained);
+        local_penalties.push(penalties_constrained);
+        local_nullspaces.push(nullspace_constrained);
+        local_metadata.push(with_spatial_identifiability_transform(
+            &term.metadata,
+            z_opt.as_ref(),
+        ));
     }
 
     let total_p: usize = local_dims.iter().sum();
@@ -754,6 +942,8 @@ fn prune_spatial_polynomial_overlaps(
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(smooth.terms.len());
     let mut penalties_global = Vec::<Array2<f64>>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
+    let mut coefficient_lower_bounds = Array1::<f64>::from_elem(total_p, f64::NEG_INFINITY);
+    let mut any_bounds = false;
 
     let mut col_start = 0usize;
     for idx in 0..smooth.terms.len() {
@@ -781,8 +971,17 @@ fn prune_spatial_polynomial_overlaps(
             shape: smooth.terms[idx].shape,
             penalties_local: local_penalties[idx].clone(),
             nullspace_dims: local_nullspaces[idx].clone(),
-            metadata: smooth.terms[idx].metadata.clone(),
+            metadata: local_metadata[idx].clone(),
+            lower_bounds_local: smooth.terms[idx].lower_bounds_local.clone(),
         });
+        if let Some(lb_local) = smooth.terms[idx].lower_bounds_local.as_ref() {
+            if lb_local.len() == p_local {
+                coefficient_lower_bounds
+                    .slice_mut(s![col_start..col_end])
+                    .assign(lb_local);
+                any_bounds = true;
+            }
+        }
 
         col_start = col_end;
     }
@@ -792,54 +991,117 @@ fn prune_spatial_polynomial_overlaps(
         penalties: penalties_global,
         nullspace_dims: nullspace_dims_global,
         terms: terms_out,
+        coefficient_lower_bounds: if any_bounds {
+            Some(coefficient_lower_bounds)
+        } else {
+            None
+        },
     })
 }
 
-fn spatial_keep_columns(
-    term_spec: &SmoothTermSpec,
-    p_local: usize,
-    linear_feature_cols: &BTreeSet<usize>,
-) -> Vec<usize> {
-    let mut keep = vec![true; p_local];
-    match &term_spec.basis {
-        SmoothBasisSpec::ThinPlate { feature_cols, .. } => {
-            mark_spatial_poly_overlap_drops(&mut keep, feature_cols, linear_feature_cols);
+fn build_parametric_constraint_block(
+    data: ArrayView2<'_, f64>,
+    linear_terms: &[LinearTermSpec],
+) -> Result<Array2<f64>, BasisError> {
+    let n = data.nrows();
+    let p_data = data.ncols();
+    let mut c = Array2::<f64>::zeros((n, 1 + linear_terms.len()));
+    c.column_mut(0).fill(1.0);
+    for (j, linear) in linear_terms.iter().enumerate() {
+        if linear.feature_col >= p_data {
+            return Err(BasisError::DimensionMismatch(format!(
+                "linear term '{}' feature column {} out of bounds for {} columns",
+                linear.name, linear.feature_col, p_data
+            )));
         }
-        SmoothBasisSpec::Duchon {
-            feature_cols, spec, ..
-        } => {
-            if spec.nullspace_order == DuchonNullspaceOrder::Linear {
-                mark_spatial_poly_overlap_drops(&mut keep, feature_cols, linear_feature_cols);
-            }
-        }
-        _ => {}
+        c.column_mut(j + 1).assign(&data.column(linear.feature_col));
     }
-    keep.into_iter()
-        .enumerate()
-        .filter_map(|(j, kept)| kept.then_some(j))
-        .collect()
+    Ok(c)
 }
 
-fn mark_spatial_poly_overlap_drops(
-    keep: &mut [bool],
-    feature_cols: &[usize],
-    linear_feature_cols: &BTreeSet<usize>,
-) {
-    let p_local = keep.len();
-    let d = feature_cols.len();
-    let poly_cols = d + 1;
-    if p_local < poly_cols {
-        return;
-    }
-    let kernel_cols = p_local - poly_cols;
+fn maybe_spatial_identifiability_transform(
+    term_spec: &SmoothTermSpec,
+    design_local: ArrayView2<'_, f64>,
+    parametric_block: Option<ArrayView2<'_, f64>>,
+) -> Result<(Array2<f64>, Option<Array2<f64>>), BasisError> {
+    let maybe_policy = spatial_identifiability_policy(term_spec);
+    let Some(policy) = maybe_policy else {
+        return Ok((design_local.to_owned(), None));
+    };
 
-    // The full term collection always has a global intercept at column 0.
-    keep[kernel_cols] = false;
-
-    for (j, &feature_col) in feature_cols.iter().enumerate() {
-        if linear_feature_cols.contains(&feature_col) {
-            keep[kernel_cols + 1 + j] = false;
+    match policy {
+        SpatialIdentifiability::None => Ok((design_local.to_owned(), None)),
+        SpatialIdentifiability::OrthogonalToParametric => {
+            let c = parametric_block.ok_or_else(|| {
+                BasisError::InvalidInput(
+                    "missing parametric constraint block for OrthogonalToParametric policy"
+                        .to_string(),
+                )
+            })?;
+            let (b_c, z) = apply_weighted_orthogonality_constraint(
+                design_local,
+                c,
+                None, // fixed subspace: do not use iteration-varying PIRLS weights
+            )?;
+            Ok((b_c, Some(z)))
         }
+        SpatialIdentifiability::FrozenTransform { transform } => {
+            if design_local.ncols() != transform.nrows() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen spatial identifiability transform mismatch: design has {} columns but transform has {} rows",
+                    design_local.ncols(),
+                    transform.nrows()
+                )));
+            }
+            let z = transform.clone();
+            Ok((design_local.dot(&z), Some(z)))
+        }
+    }
+}
+
+fn spatial_identifiability_policy(term_spec: &SmoothTermSpec) -> Option<&SpatialIdentifiability> {
+    match &term_spec.basis {
+        SmoothBasisSpec::ThinPlate { spec, .. } => Some(&spec.identifiability),
+        SmoothBasisSpec::Duchon { spec, .. } => Some(&spec.identifiability),
+        _ => None,
+    }
+}
+
+fn orthogonality_relative_residual(
+    basis_matrix: ArrayView2<'_, f64>,
+    constraint_matrix: ArrayView2<'_, f64>,
+) -> f64 {
+    let cross = basis_matrix.t().dot(&constraint_matrix);
+    let num = cross.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let b_norm = basis_matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let c_norm = constraint_matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let denom = (b_norm * c_norm).max(1e-300);
+    num / denom
+}
+
+fn with_spatial_identifiability_transform(
+    metadata: &BasisMetadata,
+    transform: Option<&Array2<f64>>,
+) -> BasisMetadata {
+    match metadata {
+        BasisMetadata::ThinPlate { centers, .. } => BasisMetadata::ThinPlate {
+            centers: centers.clone(),
+            identifiability_transform: transform.cloned(),
+        },
+        BasisMetadata::Duchon {
+            centers,
+            length_scale,
+            nu,
+            nullspace_order,
+            ..
+        } => BasisMetadata::Duchon {
+            centers: centers.clone(),
+            length_scale: *length_scale,
+            nu: *nu,
+            nullspace_order: *nullspace_order,
+            identifiability_transform: transform.cloned(),
+        },
+        _ => metadata.clone(),
     }
 }
 
@@ -889,6 +1151,7 @@ fn fit_term_collection_for_spec(
             max_iter: options.max_iter,
             tol: options.tol,
             nullspace_dims: design.nullspace_dims.clone(),
+            coefficient_lower_bounds: design.coefficient_lower_bounds.clone(),
         },
     )?;
     Ok(FittedTermCollection { fit, design })
@@ -1352,7 +1615,8 @@ mod tests {
     use super::*;
     use crate::basis::{
         BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
-        DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu, ThinPlateBasisSpec,
+        DuchonNullspaceOrder, MaternBasisSpec, MaternIdentifiability, MaternNu,
+        SpatialIdentifiability, ThinPlateBasisSpec,
     };
     use crate::faer_ndarray::FaerSvd;
     use ndarray::array;
@@ -1418,6 +1682,7 @@ mod tests {
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -1457,6 +1722,7 @@ mod tests {
                 spec: ThinPlateBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 3 },
                     double_penalty: false,
+                    identifiability: SpatialIdentifiability::default(),
                 },
             },
             shape: ShapeConstraint::MonotoneIncreasing,
@@ -1465,9 +1731,41 @@ mod tests {
         let err = build_smooth_design(data.view(), &terms).expect_err("shape should be rejected");
         match err {
             BasisError::InvalidInput(msg) => {
-                assert!(msg.contains("not enforced"));
+                assert!(msg.contains("supported only for BSpline1D/TensorBSpline"));
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_smooth_design_accepts_monotone_bspline_with_bounds() {
+        let data = array![[0.0], [0.25], [0.5], [0.75], [1.0]];
+        let terms = vec![SmoothTermSpec {
+            name: "mono_bs".to_string(),
+            basis: SmoothBasisSpec::BSpline1D {
+                feature_col: 0,
+                spec: BSplineBasisSpec {
+                    degree: 3,
+                    penalty_order: 2,
+                    knot_spec: BSplineKnotSpec::Generate {
+                        data_range: (0.0, 1.0),
+                        num_internal_knots: 3,
+                    },
+                    double_penalty: false,
+                    identifiability: BSplineIdentifiability::default(),
+                },
+            },
+            shape: ShapeConstraint::MonotoneIncreasing,
+        }];
+        let sd = build_smooth_design(data.view(), &terms).expect("shape-constrained bspline");
+        let lb = sd
+            .coefficient_lower_bounds
+            .as_ref()
+            .expect("lower bounds should be generated");
+        assert_eq!(lb.len(), sd.design.ncols());
+        assert!(lb[0].is_infinite() && lb[0].is_sign_negative());
+        for j in 1..lb.len() {
+            assert_eq!(lb[j], 0.0);
         }
     }
 
@@ -1495,6 +1793,7 @@ mod tests {
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -1537,6 +1836,7 @@ mod tests {
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         double_penalty: false,
+                        identifiability: SpatialIdentifiability::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -1583,6 +1883,7 @@ mod tests {
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         double_penalty: false,
+                        identifiability: SpatialIdentifiability::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -1610,6 +1911,134 @@ mod tests {
                 "smooth column {col} unexpectedly duplicated linear term column"
             );
         }
+    }
+
+    #[test]
+    fn spatial_option5_is_orthogonal_to_parametric_block() {
+        let data = array![
+            [0.0, 0.1],
+            [0.2, 0.0],
+            [0.3, 0.4],
+            [0.5, 0.2],
+            [0.7, 0.9],
+            [1.0, 0.8],
+        ];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "lin_x0".to_string(),
+                feature_col: 0,
+                double_penalty: false,
+            }],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "tps_xy".to_string(),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![0, 1],
+                    spec: ThinPlateBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        double_penalty: false,
+                        identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).unwrap();
+        let n = data.nrows();
+        let mut c = Array2::<f64>::zeros((n, 2));
+        c.column_mut(0).fill(1.0);
+        c.column_mut(1).assign(&data.column(0));
+        let smooth_start = 1 + spec.linear_terms.len();
+        let b = design
+            .design
+            .slice(s![
+                ..,
+                smooth_start..(smooth_start + design.smooth.design.ncols())
+            ])
+            .to_owned();
+        let rel = orthogonality_relative_residual(b.view(), c.view());
+        assert!(
+            rel <= 1e-10,
+            "Option 5 orthogonality residual too large: {rel}"
+        );
+    }
+
+    #[test]
+    fn spatial_frozen_transform_rebuild_is_exact_on_training_rows() {
+        let data = array![
+            [0.0, 0.1],
+            [0.2, 0.0],
+            [0.3, 0.4],
+            [0.5, 0.2],
+            [0.7, 0.9],
+            [1.0, 0.8],
+        ];
+        let fit_spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "lin_x0".to_string(),
+                feature_col: 0,
+                double_penalty: false,
+            }],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "tps_xy".to_string(),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![0, 1],
+                    spec: ThinPlateBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        double_penalty: false,
+                        identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_design = build_term_collection_design(data.view(), &fit_spec).unwrap();
+        let term_meta = &fit_design.smooth.terms[0].metadata;
+        let (centers, z) = match term_meta {
+            BasisMetadata::ThinPlate {
+                centers,
+                identifiability_transform,
+            } => (
+                centers.clone(),
+                identifiability_transform
+                    .clone()
+                    .expect("fit-time Option 5 should store transform"),
+            ),
+            other => panic!("unexpected metadata variant: {other:?}"),
+        };
+
+        let frozen_spec = TermCollectionSpec {
+            linear_terms: fit_spec.linear_terms.clone(),
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "tps_xy".to_string(),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![0, 1],
+                    spec: ThinPlateBasisSpec {
+                        center_strategy: CenterStrategy::UserProvided(centers),
+                        double_penalty: false,
+                        identifiability: SpatialIdentifiability::FrozenTransform { transform: z },
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let frozen_design = build_term_collection_design(data.view(), &frozen_spec).unwrap();
+
+        let a = fit_design.smooth.design;
+        let b = frozen_design.smooth.design;
+        assert_eq!(a.dim(), b.dim());
+        let max_abs = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs <= 1e-12,
+            "frozen transform rebuild mismatch max_abs={max_abs}"
+        );
     }
 
     #[test]
@@ -1703,6 +2132,7 @@ mod tests {
                     nu: MaternNu::FiveHalves,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     double_penalty: true,
+                    identifiability: SpatialIdentifiability::default(),
                 },
             },
             shape: ShapeConstraint::None,
@@ -1870,6 +2300,7 @@ mod tests {
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![],
+            coefficient_lower_bounds: None,
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
