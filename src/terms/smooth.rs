@@ -1418,13 +1418,13 @@ fn apply_spatial_orthogonality_to_parametric(
                 linear_constraints_b.push(lin_local.b[r]);
             }
         }
-        if let Some(lb_local) = smooth.terms[idx].lower_bounds_local.as_ref() {
-            if lb_local.len() == p_local {
-                coefficient_lower_bounds
-                    .slice_mut(s![col_start..col_end])
-                    .assign(lb_local);
-                any_bounds = true;
-            }
+        if let Some(lb_local) = smooth.terms[idx].lower_bounds_local.as_ref()
+            && lb_local.len() == p_local
+        {
+            coefficient_lower_bounds
+                .slice_mut(s![col_start..col_end])
+                .assign(lb_local);
+            any_bounds = true;
         }
 
         col_start = col_end;

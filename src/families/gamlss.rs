@@ -62,13 +62,13 @@ impl ParameterBlockInput {
                 self.offset.len()
             ));
         }
-        if let Some(beta0) = &self.initial_beta {
-            if beta0.len() != p {
-                return Err(format!(
-                    "block '{name}' initial_beta length mismatch: got {}, expected {p}",
-                    beta0.len()
-                ));
-            }
+        if let Some(beta0) = &self.initial_beta
+            && beta0.len() != p
+        {
+            return Err(format!(
+                "block '{name}' initial_beta length mismatch: got {}, expected {p}",
+                beta0.len()
+            ));
         }
         for (k, s) in self.penalties.iter().enumerate() {
             let (r, c) = s.dim();
@@ -1145,10 +1145,10 @@ fn binomial_location_scale_core(
     if weights.len() != n || eta_t.len() != n || eta_ls.len() != n {
         return Err("binomial location-scale core size mismatch".to_string());
     }
-    if let Some(w) = eta_wiggle {
-        if w.len() != n {
-            return Err("binomial location-scale core wiggle size mismatch".to_string());
-        }
+    if let Some(w) = eta_wiggle
+        && w.len() != n
+    {
+        return Err("binomial location-scale core wiggle size mismatch".to_string());
     }
 
     let mut sigma = Array1::<f64>::zeros(n);

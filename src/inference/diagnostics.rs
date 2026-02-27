@@ -301,10 +301,10 @@ impl GradientDiagnosticReport {
     pub fn summary(&self) -> String {
         let mut lines = Vec::new();
 
-        if let Some(ref audit) = self.envelope_audit {
-            if audit.is_violated {
-                lines.push(format!("[DIAG] {}", audit));
-            }
+        if let Some(ref audit) = self.envelope_audit
+            && audit.is_violated
+        {
+            lines.push(format!("[DIAG] {}", audit));
         }
 
         for (k, components) in self.component_fd.iter().enumerate() {
@@ -321,10 +321,10 @@ impl GradientDiagnosticReport {
             }
         }
 
-        if let Some(ref ridge) = self.dual_ridge {
-            if ridge.has_mismatch {
-                lines.push(format!("[DIAG] {}", ridge));
-            }
+        if let Some(ref ridge) = self.dual_ridge
+            && ridge.has_mismatch
+        {
+            lines.push(format!("[DIAG] {}", ridge));
         }
 
         if lines.is_empty() {
