@@ -1,0 +1,9 @@
+error: survival constrained PIRLS failed: Parameter constraint violation: constrained PIRLS step solve failed at iteration 1 with damping λ=1.000e-6: Parameter constraint violation: linear-constrained Newton active-set failed to converge; max(Aβ-b violation)=3.918e-18 at row 819; KKT[primal=3.918e-18, dual=0.000e0, comp=5.122e-5, stat=1.126e-7, active=9/1337]
+[HEARTBEAT] command-exit rc=1 pid=16973 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=16974 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=16983 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=16992 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=17001 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=17010 samples=0 peak_proc_rss=0.00 GiB
+benchmark run failed:
+rust_gam / icu_survival_death: error: survival constrained PIRLS failed: Parameter constraint violation: constrained PIRLS step solve failed at iteration 1 with damping λ=1.000e-6: Parameter constraint violation: linear-constrained Newton active-set failed to converge; max(Aβ-b violation)=3.918e-18 at row 819; KKT[primal=3.918e-18, dual=0.000e0, comp=5.122e-5, stat=1.126e-7, active=9/1337]

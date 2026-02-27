@@ -1104,10 +1104,31 @@ where
     let candidate_seeds: Vec<(usize, Array1<f64>)> =
         seeds.into_iter().enumerate().collect();
 
+    // Screen seeds: evaluate cost at each seed point, sort by cost, and only
+    // run full BFGS on the best screening_budget candidates.
+    let screening_budget = options.seed_config.screening_budget.max(1);
+    let screened_seeds = if candidate_seeds.len() > screening_budget {
+        let mut scored: Vec<(usize, Array1<f64>, f64)> = candidate_seeds
+            .into_iter()
+            .map(|(idx, rho)| {
+                let cost = match eval_cost_grad_rho(context, &rho) {
+                    Ok((c, _)) => c,
+                    Err(_) => f64::INFINITY,
+                };
+                (idx, rho, cost)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(screening_budget);
+        scored.into_iter().map(|(i, r, _)| (i, r)).collect::<Vec<_>>()
+    } else {
+        candidate_seeds
+    };
+
     let mut best: Option<SmoothingBfgsResult> = None;
     let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
     let mut best_grad_norm = f64::INFINITY;
-    for (seed_idx, rho_seed) in candidate_seeds.iter() {
+    for (seed_idx, rho_seed) in screened_seeds.iter() {
         let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
         let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
         let mut last_eval: Option<(Array1<f64>, Array1<f64>)> = None;
@@ -1353,17 +1374,43 @@ where
         .map(|(idx, rho)| (format!("seed_{idx}"), rho))
         .collect();
 
-    let mut best_stationary: Option<OuterSolveResult> = None;
-    let mut best_nonstationary: Option<OuterSolveResult> = None;
-    let mut best_grad_norm = f64::INFINITY;
-    let mut candidate_failures: Vec<String> = Vec::new();
     if candidate_seeds.is_empty() {
         return Err(EstimationError::RemlOptimizationFailed(
             "no smoothing seeds produced for external optimization".to_string(),
         ));
     }
+
+    // Screen seeds: evaluate REML cost at each seed point (single cheap evaluation),
+    // sort by cost, and only run full BFGS on the best screening_budget candidates.
+    let screening_budget = seed_config.screening_budget.max(1);
+    let screened_seeds = if candidate_seeds.len() > screening_budget {
+        let mut scored: Vec<(String, Array1<f64>, f64)> = candidate_seeds
+            .into_iter()
+            .map(|(label, rho)| {
+                let cost = reml_state.compute_cost(&rho).unwrap_or(f64::INFINITY);
+                log::debug!("[Screen {label}] cost = {cost:.6e}");
+                (label, rho, cost)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(screening_budget);
+        log::debug!(
+            "[external] screened {} seeds down to {} (budget={})",
+            scored.len() + (screening_budget.max(scored.len()) - scored.len()),
+            scored.len(),
+            screening_budget,
+        );
+        scored.into_iter().map(|(l, r, _)| (l, r)).collect::<Vec<_>>()
+    } else {
+        candidate_seeds
+    };
+
+    let mut best_stationary: Option<OuterSolveResult> = None;
+    let mut best_nonstationary: Option<OuterSolveResult> = None;
+    let mut best_grad_norm = f64::INFINITY;
+    let mut candidate_failures: Vec<String> = Vec::new();
     let near_stationary_tol = (cfg.reml_convergence_tolerance.max(1e-12)) * 2.0;
-    for (label, initial_rho) in candidate_seeds {
+    for (label, initial_rho) in screened_seeds {
         let solution_result: Result<OuterSolveResult, EstimationError> =
             run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_rho).map(
                 |(bfgs_solution, grad_norm_rho, stationary)| OuterSolveResult {

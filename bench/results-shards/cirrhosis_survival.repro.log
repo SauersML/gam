@@ -1,0 +1,10 @@
+error: survival constrained PIRLS failed: Parameter constraint violation: survival monotonicity violated at row 0: d_eta/dt=0.000e0 <= tolerance=1.000e-8
+[HEARTBEAT] command-exit rc=1 pid=25499 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=25714 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=29849 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=34150 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=38362 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=43350 samples=0 peak_proc_rss=0.00 GiB
+benchmark run failed:
+rust_gam / cirrhosis_survival: error: survival constrained PIRLS failed: Parameter constraint violation: survival monotonicity violated at row 0: d_eta/dt=0.000e0 <= tolerance=1.000e-8
+exit_code=1

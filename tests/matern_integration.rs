@@ -86,9 +86,9 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
     )
     .expect("Matérn term-collection fit should succeed");
 
-    // With full-shrinkage single-block parameterization, Matérn double-penalty
-    // is represented as one effective smooth penalty block.
-    assert_eq!(fitted.fit.lambdas.len(), 1);
+    // With correct double-penalty, Matérn contributes two penalty blocks
+    // (kernel + nullspace ridge), each with its own lambda.
+    assert_eq!(fitted.fit.lambdas.len(), 2);
     assert!(fitted.fit.edf_total.is_finite());
 
     let pred = predict_gam(

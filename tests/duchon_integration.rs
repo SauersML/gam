@@ -87,9 +87,9 @@ fn duchon_fit_term_collection_gaussian_simulated_10d() {
     )
     .expect("Duchon term-collection fit should succeed");
 
-    // With full-shrinkage single-block parameterization, Duchon double-penalty
-    // is represented as one effective smooth penalty block.
-    assert_eq!(fitted.fit.lambdas.len(), 1);
+    // With correct double-penalty, Duchon contributes two penalty blocks
+    // (kernel bending + nullspace ridge), each with its own lambda.
+    assert_eq!(fitted.fit.lambdas.len(), 2);
     assert!(fitted.fit.edf_total.is_finite());
 
     let pred = predict_gam(
