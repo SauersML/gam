@@ -1001,7 +1001,7 @@ def _geo_disease_eas_scenario_cfg(name):
             "n_pcs": n_pcs,
         }
     return {
-        "smooth_basis": "bspline_per_pc",
+        "smooth_basis": "ps",
         "smooth_cols": [f"pc{i}" for i in range(1, n_pcs + 1)],
         "linear_cols": [],
         "knots": knots,
@@ -1021,7 +1021,7 @@ def _papuan_oce_scenario_cfg(name):
     n_pcs = 4 if is_four_pc else 16
     if basis_code == "psperpc":
         return {
-            "smooth_basis": "bspline_per_pc",
+            "smooth_basis": "ps",
             "smooth_cols": [f"pc{i}" for i in range(1, n_pcs + 1)],
             "linear_cols": [],
             "knots": knots,
@@ -1200,7 +1200,7 @@ def _geo_subpop16_scenario_cfg(name):
     knots = max(4, int(m.group(2)))
     if basis_code == "psperpc":
         return {
-            "smooth_basis": "bspline_per_pc",
+            "smooth_basis": "ps",
             "smooth_cols": [f"pc{i}" for i in range(1, 17)],
             "linear_cols": [],
             "knots": knots,
@@ -1228,7 +1228,7 @@ def _geo_latlon_scenario_cfg(name):
     if basis_code == "psperpc":
         return {
             "mode_code": mode_code,
-            "smooth_basis": "bspline_per_pc",
+            "smooth_basis": "ps",
             "smooth_cols": [f"pc{i}" for i in range(1, 7)],
             "linear_cols": [],
             "knots": knots,
@@ -1728,13 +1728,21 @@ def _rust_fit_mapping(scenario_name):
     }.get(scenario_name)
 
 
+def _canonical_smooth_basis(basis):
+    b = str(basis or "ps").strip().lower()
+    # Legacy alias used to mean one P-spline per feature; canonical basis is "ps".
+    if b == "bspline_per_pc":
+        return "ps"
+    return b
+
+
 def _rust_formula_for_scenario(scenario_name, ds):
     cfg = _rust_fit_mapping(scenario_name)
     if cfg is None:
         raise RuntimeError(f"No Rust formula mapping configured for scenario '{scenario_name}'")
     target = ds["target"]
     terms = [f"linear({c})" for c in cfg.get("linear_cols", [])]
-    basis = str(cfg.get("smooth_basis", "ps")).lower()
+    basis = _canonical_smooth_basis(cfg.get("smooth_basis", "ps"))
     knot_count = int(cfg.get("knots", 8))
     if knot_count < 0:
         raise RuntimeError(
@@ -1791,7 +1799,7 @@ def _mgcv_formula_for_scenario(scenario_name, ds):
         raise RuntimeError(f"No shared smooth mapping configured for scenario '{scenario_name}'")
     target = ds["target"]
     terms = [str(c) for c in cfg.get("linear_cols", [])]
-    basis = str(cfg.get("smooth_basis", "ps")).lower()
+    basis = _canonical_smooth_basis(cfg.get("smooth_basis", "ps"))
     knot_count = int(cfg.get("knots", 8))
 
     if basis in {"ps", "bspline", "p-spline"}:
@@ -2056,7 +2064,7 @@ def rust_cli_cv_args(scenario_name, ds):
         "geo_disease_ps_per_pc": dict(
             family="binomial",
             smooth_cols=[f"pc{i}" for i in range(1, 17)],
-            smooth_basis="bspline_per_pc",
+            smooth_basis="ps",
             linear_cols=[],
             knots=10,
             double_penalty=True,
@@ -2064,7 +2072,7 @@ def rust_cli_cv_args(scenario_name, ds):
         "geo_disease_ps_per_pc_basic": dict(
             family="binomial",
             smooth_cols=[f"pc{i}" for i in range(1, 17)],
-            smooth_basis="bspline_per_pc",
+            smooth_basis="ps",
             linear_cols=[],
             knots=10,
             double_penalty=False,
