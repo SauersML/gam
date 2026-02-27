@@ -1,0 +1,36 @@
+
+survival config | likelihood=transformation | time_basis=bspline | baseline_target=linear
+saved model: /Users/user/gam/bench/gam_bench_rust_cv_88euzsmz/model_0.json
+[HEARTBEAT] command-exit rc=0 pid=66161 samples=0 peak_proc_rss=0.00 GiB
+wrote predictions: /Users/user/gam/bench/gam_bench_rust_cv_88euzsmz/pred_0.csv (rows=56)
+[HEARTBEAT] command-exit rc=0 pid=66162 samples=0 peak_proc_rss=0.00 GiB
+
+survival config | likelihood=transformation | time_basis=bspline | baseline_target=linear
+saved model: /Users/user/gam/bench/gam_bench_rust_cv_88euzsmz/model_1.json
+[HEARTBEAT] command-exit rc=0 pid=66163 samples=0 peak_proc_rss=0.00 GiB
+wrote predictions: /Users/user/gam/bench/gam_bench_rust_cv_88euzsmz/pred_1.csv (rows=55)
+[HEARTBEAT] command-exit rc=0 pid=66164 samples=0 peak_proc_rss=0.00 GiB
+
+survival config | likelihood=transformation | time_basis=bspline | baseline_target=linear
+saved model: /Users/user/gam/bench/gam_bench_rust_cv_88euzsmz/model_2.json
+[HEARTBEAT] command-exit rc=0 pid=66165 samples=0 peak_proc_rss=0.00 GiB
+wrote predictions: /Users/user/gam/bench/gam_bench_rust_cv_88euzsmz/pred_2.csv (rows=55)
+[HEARTBEAT] command-exit rc=0 pid=66166 samples=0 peak_proc_rss=0.00 GiB
+
+survival config | likelihood=transformation | time_basis=bspline | baseline_target=linear
+saved model: /Users/user/gam/bench/gam_bench_rust_cv_88euzsmz/model_3.json
+[HEARTBEAT] command-exit rc=0 pid=66167 samples=0 peak_proc_rss=0.00 GiB
+wrote predictions: /Users/user/gam/bench/gam_bench_rust_cv_88euzsmz/pred_3.csv (rows=55)
+[HEARTBEAT] command-exit rc=0 pid=66168 samples=0 peak_proc_rss=0.00 GiB
+
+survival config | likelihood=transformation | time_basis=bspline | baseline_target=linear
+saved model: /Users/user/gam/bench/gam_bench_rust_cv_88euzsmz/model_4.json
+[HEARTBEAT] command-exit rc=0 pid=66169 samples=0 peak_proc_rss=0.00 GiB
+wrote predictions: /Users/user/gam/bench/gam_bench_rust_cv_88euzsmz/pred_4.csv (rows=55)
+[HEARTBEAT] command-exit rc=0 pid=66170 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=66171 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=66181 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=66190 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=66199 samples=0 peak_proc_rss=0.00 GiB
+[HEARTBEAT] command-exit rc=0 pid=66208 samples=0 peak_proc_rss=0.00 GiB
+Wrote bench/results-shards/cirrhosis_survival.rerun.json

@@ -2118,7 +2118,7 @@ fn nullspace_shrinkage_penalty(penalty: &Array2<f64>) -> Result<Array2<f64>, Bas
         .enumerate()
         .filter_map(|(i, &ev)| (ev.abs() <= tol).then_some(i))
         .collect();
-    let mut shrink = Array2::<f64>::eye(sym.nrows()) * 1e-6;
+    let mut shrink = Array2::<f64>::zeros((sym.nrows(), sym.ncols()));
     if !zero_idx.is_empty() {
         let z = evecs.select(Axis(1), &zero_idx);
         shrink += &fast_ab(&z, &z.t().to_owned());
@@ -2126,17 +2126,7 @@ fn nullspace_shrinkage_penalty(penalty: &Array2<f64>) -> Result<Array2<f64>, Bas
     Ok(shrink)
 }
 
-fn with_fixed_shrinkage(base: &Array2<f64>, shrink: &Array2<f64>) -> Array2<f64> {
-    let scale = base
-        .diag()
-        .iter()
-        .copied()
-        .map(f64::abs)
-        .fold(0.0_f64, f64::max)
-        .max(1.0)
-        * 1e-6;
-    base + &shrink.mapv(|v| v * scale)
-}
+
 
 fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {
     if n < 8 {
@@ -2178,16 +2168,12 @@ pub fn build_thin_plate_basis(
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let tps = create_thin_plate_spline_basis(data, centers.view())?;
-    let penalties = vec![if spec.double_penalty {
-        with_fixed_shrinkage(&tps.penalty_bending, &tps.penalty_ridge)
-    } else {
-        tps.penalty_bending.clone()
-    }];
-    let nullspace_dims = vec![if spec.double_penalty {
-        0
-    } else {
-        tps.num_polynomial_basis
-    }];
+    let mut penalties = vec![tps.penalty_bending.clone()];
+    let mut nullspace_dims = vec![tps.num_polynomial_basis];
+    if spec.double_penalty {
+        penalties.push(tps.penalty_ridge.clone());
+        nullspace_dims.push(0);
+    }
     Ok(BasisBuildResult {
         design: tps.basis,
         penalties,
@@ -3016,18 +3002,12 @@ pub fn build_matern_basis(
         (m.basis, m.penalty_kernel, None)
     };
     let penalty_ridge = nullspace_shrinkage_penalty(&penalty_kernel)?;
-    let penalties = vec![if spec.double_penalty {
-        with_fixed_shrinkage(&penalty_kernel, &penalty_ridge)
-    } else {
-        penalty_kernel.clone()
-    }];
-    let nullspace_dims = vec![if spec.double_penalty {
-        0
-    } else if spec.include_intercept {
-        1
-    } else {
-        0
-    }];
+    let mut penalties = vec![penalty_kernel.clone()];
+    let mut nullspace_dims = vec![if spec.include_intercept { 1 } else { 0 }];
+    if spec.double_penalty {
+        penalties.push(penalty_ridge.clone());
+        nullspace_dims.push(0);
+    }
     Ok(BasisBuildResult {
         design,
         penalties,
@@ -3235,16 +3215,12 @@ pub fn build_duchon_basis(
         spec.nu,
         spec.nullspace_order,
     )?;
-    let penalties = vec![if spec.double_penalty {
-        with_fixed_shrinkage(&d.penalty_kernel, &d.penalty_ridge)
-    } else {
-        d.penalty_kernel.clone()
-    }];
-    let nullspace_dims = vec![if spec.double_penalty {
-        0
-    } else {
-        d.num_polynomial_basis
-    }];
+    let mut penalties = vec![d.penalty_kernel.clone()];
+    let mut nullspace_dims = vec![d.num_polynomial_basis];
+    if spec.double_penalty {
+        penalties.push(d.penalty_ridge.clone());
+        nullspace_dims.push(0);
+    }
     Ok(BasisBuildResult {
         design: d.basis,
         penalties,
@@ -4811,8 +4787,8 @@ mod tests {
             identifiability: SpatialIdentifiability::default(),
         };
         let result = build_thin_plate_basis(data.view(), &spec).unwrap();
-        assert_eq!(result.penalties.len(), 1);
-        assert_eq!(result.nullspace_dims, vec![0]);
+        assert_eq!(result.penalties.len(), 2);
+        assert_eq!(result.nullspace_dims.len(), 2);
         assert_eq!(result.design.nrows(), data.nrows());
     }
 
@@ -4929,7 +4905,12 @@ mod tests {
         assert_eq!(result.penalties.len(), 2);
         // Default identifiability centers the smooth, removing one null-space
         // dimension from the raw second-difference penalty.
-        assert_eq!(result.nullspace_dims, vec![1, 0]);
+        // Second penalty is the nullspace projector (rank = nullity of first penalty);
+        // its own nullspace dimension is p - rank_of_projector.
+        let p_constrained = result.design.ncols();
+        assert_eq!(result.nullspace_dims[0], 1);
+        // The shrinkage penalty targets a small subspace; most dims are unpenalized.
+        assert!(result.nullspace_dims[1] >= p_constrained - 2);
         assert_eq!(result.design.nrows(), x.len());
     }
 

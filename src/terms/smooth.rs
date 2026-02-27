@@ -2248,10 +2248,10 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), data.nrows());
         assert_eq!(sd.terms.len(), 2);
-        // bspline double-penalty contributes two blocks; tps double-penalty is
-        // represented as one fully-shrunk block.
-        assert_eq!(sd.penalties.len(), 3);
-        assert_eq!(sd.nullspace_dims.len(), 3);
+        // bspline double-penalty contributes two blocks; tps double-penalty also
+        // contributes two blocks (bending + nullspace ridge).
+        assert_eq!(sd.penalties.len(), 4);
+        assert_eq!(sd.nullspace_dims.len(), 4);
         for s in &sd.penalties {
             assert_eq!(s.nrows(), sd.design.ncols());
             assert_eq!(s.ncols(), sd.design.ncols());
@@ -2452,8 +2452,8 @@ mod tests {
         assert!(design.design.ncols() >= 2);
         assert_eq!(design.linear_ranges.len(), 1);
         assert_eq!(design.random_effect_ranges.len(), 0);
-        assert_eq!(design.penalties.len(), 2); // linear ridge + 1 smooth penalty
-        assert_eq!(design.nullspace_dims.len(), 2);
+        assert_eq!(design.penalties.len(), 3); // linear ridge + 2 smooth penalties (bending + nullspace)
+        assert_eq!(design.nullspace_dims.len(), 3);
     }
 
     #[test]
@@ -2803,10 +2803,9 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        // Matérn double-penalty is represented as one fully-shrunk block.
-        assert_eq!(sd.penalties.len(), 1);
-        assert_eq!(sd.nullspace_dims.len(), 1);
-        assert_eq!(sd.nullspace_dims[0], 0);
+        // Matérn double-penalty contributes two blocks (kernel + nullspace ridge).
+        assert_eq!(sd.penalties.len(), 2);
+        assert_eq!(sd.nullspace_dims.len(), 2);
     }
 
     #[test]
@@ -2839,10 +2838,9 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        // Duchon double-penalty is represented as one fully-shrunk block.
-        assert_eq!(sd.penalties.len(), 1);
-        assert_eq!(sd.nullspace_dims.len(), 1);
-        assert_eq!(sd.nullspace_dims[0], 0);
+        // Duchon double-penalty contributes two blocks (kernel + nullspace ridge).
+        assert_eq!(sd.penalties.len(), 2);
+        assert_eq!(sd.nullspace_dims.len(), 2);
     }
 
     #[test]
