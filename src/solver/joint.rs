@@ -2781,6 +2781,9 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
         .with_tolerance(config.reml_tol)
         .with_max_iterations(config.max_reml_iter)
         .with_fp_tolerances(1e2, 1e2)
+        .with_accept_flat_midpoint_once(true)
+        .with_jiggle_on_flats(true, 1e-3)
+        .with_multi_direction_rescue(true)
         .with_no_improve_stop(1e-8, 5)
         .with_rng_seed(0xC0FFEE_u64);
 

@@ -1667,6 +1667,18 @@ fn solve_newton_direction_with_linear_constraints(
         d_total += &(d.mapv(|v| alpha * v));
         g_cur = gradient + &hessian.dot(&d_total);
 
+        // Interior solution: if no constraints are active and this step does
+        // not hit any inequality boundary, the constrained QP reduces to the
+        // unconstrained Newton subproblem and this iterate is the correct
+        // active-set endpoint for the current local model.
+        if active.is_empty() && entering.is_none() {
+            if let Some(hint) = active_hint {
+                hint.clear();
+            }
+            direction_out.assign(&d_total);
+            return Ok(());
+        }
+
         if let Some(idx) = entering
             && !is_active[idx]
         {
@@ -1677,10 +1689,34 @@ fn solve_newton_direction_with_linear_constraints(
 
     let (worst, row) = max_linear_constraint_violation(&x, constraints);
     let kkt = compute_constraint_kkt_diagnostics(&x, &g_cur, constraints);
-    // Degenerate active sets can cycle near machine precision despite being
-    // effectively feasible/stationary. Accept such directions and let the
-    // outer LM loop decide step quality via actual objective reduction.
-    if worst <= 1e-8 && kkt.dual_feasibility <= 1e-8 && kkt.stationarity <= 1e-6 {
+    let grad_inf = g_cur.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let stationarity_rel = kkt.stationarity / grad_inf.max(1.0);
+    let step_inf = d_total.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let hd_total = hessian.dot(&d_total);
+    let predicted_delta = gradient.dot(&d_total)
+        + 0.5
+            * d_total
+                .iter()
+                .zip(hd_total.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>();
+    // Degenerate active-set transitions can cycle near machine precision while
+    // the iterate is already KKT-feasible to numerical precision. In that
+    // regime, accept the direction and let the outer LM acceptance test decide
+    // whether objective reduction is sufficient.
+    //
+    // Complementarity uses multipliers reconstructed from an active-set normal
+    // equation solve (not the exact QP dual from the final iterate), so we
+    // enforce a modest tolerance here while keeping primal/dual feasibility
+    // strict.
+    let kkt_strong_ok =
+        (kkt.stationarity <= 2e-6 || stationarity_rel <= 2e-6) && kkt.complementarity <= 1e-3;
+    let model_descent_ok = predicted_delta <= -1e-10 * (1.0 + grad_inf * step_inf);
+    let near_null_step_ok = step_inf <= 1e-10;
+    if worst <= 1e-8
+        && kkt.dual_feasibility <= 1e-8
+        && (kkt_strong_ok || model_descent_ok || near_null_step_ok)
+    {
         if let Some(hint) = active_hint {
             hint.clear();
             hint.extend(active.iter().copied());

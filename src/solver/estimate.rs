@@ -271,6 +271,7 @@ struct RemlConfig {
     reml_convergence_tolerance: f64,
     reml_max_iterations: u64,
     firth_bias_reduction: bool,
+    objective_consistent_fd_gradient: bool,
 }
 
 impl RemlConfig {
@@ -287,6 +288,7 @@ impl RemlConfig {
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
+            objective_consistent_fd_gradient: false,
         }
     }
 
@@ -759,6 +761,9 @@ fn run_bfgs_for_candidate(
         .with_tolerance(config.reml_convergence_tolerance)
         .with_max_iterations(config.reml_max_iterations as usize)
         .with_fp_tolerances(1e2, 1e2)
+        .with_accept_flat_midpoint_once(true)
+        .with_jiggle_on_flats(true, 1e-3)
+        .with_multi_direction_rescue(true)
         .with_no_improve_stop(1e-8, 5)
         .with_rng_seed(0xC0FFEE_u64);
 
@@ -1120,6 +1125,9 @@ where
         .with_tolerance(options.tol)
         .with_max_iterations(options.max_iter)
         .with_fp_tolerances(1e2, 1e2)
+        .with_accept_flat_midpoint_once(true)
+        .with_jiggle_on_flats(true, 1e-3)
+        .with_multi_direction_rescue(true)
         .with_no_improve_stop(1e-8, 5)
         .with_rng_seed(0x5EED_u64.wrapping_add(*seed_idx as u64));
 
@@ -4776,6 +4784,13 @@ pub mod internal {
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+            if self.config.link_function() != LinkFunction::Identity
+                && (self.config.objective_consistent_fd_gradient || p.len() == 1)
+            {
+                // Fixed-choice gradient definition for this fit (no mid-flight swapping):
+                // use objective-consistent FD in the known sign-unstable 1D non-Gaussian path.
+                return compute_fd_gradient_internal(self, p, false, false);
+            }
             // Get the converged P-IRLS result for the current rho (`p`)
             let bundle = match self.obtain_eval_bundle(p) {
                 Ok(bundle) => bundle,

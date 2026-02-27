@@ -2612,7 +2612,8 @@ mod tests {
         for i in 0..n {
             for j in 0..p {
                 // Deterministic, non-collinear synthetic PCs.
-                data[[i, j]] = (i as f64) * 0.03 + (j as f64) * 0.11 + ((i * (j + 1)) as f64) * 1e-3;
+                data[[i, j]] =
+                    (i as f64) * 0.03 + (j as f64) * 0.11 + ((i * (j + 1)) as f64) * 1e-3;
             }
         }
 

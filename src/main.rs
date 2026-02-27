@@ -2852,8 +2852,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     beta0[1] = 1.0;
     let linear_constraints = model.monotonicity_linear_constraints();
     if let Some(lin) = linear_constraints.as_ref() {
-        project_beta_to_linear_constraints(&mut beta0, lin, 1e-10, 64)
-            .map_err(|e| format!("failed to initialize monotonicity-feasible survival beta: {e}"))?;
+        project_beta_to_linear_constraints(&mut beta0, lin, 1e-10, 64).map_err(|e| {
+            format!("failed to initialize monotonicity-feasible survival beta: {e}")
+        })?;
     }
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
