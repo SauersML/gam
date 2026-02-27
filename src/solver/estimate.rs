@@ -412,11 +412,12 @@ impl RidgePlanner {
             let mut proposal = base * multiplier;
             // Verify whether the proposal actually improves condition enough.
             // If not, escalate once more before returning.
-            if let Some(cond_next) = self.estimate_condition_with_ridge(matrix, proposal) {
-                if cond_next > cond * 0.9 && ratio > 1.0 {
-                    multiplier = (multiplier * 1.8).clamp(2.0, 10.0);
-                    proposal = base * multiplier;
-                }
+            if let Some(cond_next) = self.estimate_condition_with_ridge(matrix, proposal)
+                && cond_next > cond * 0.9
+                && ratio > 1.0
+            {
+                multiplier = (multiplier * 1.8).clamp(2.0, 10.0);
+                proposal = base * multiplier;
             }
             proposal.max(min_step)
         } else if self.ridge <= 0.0 {

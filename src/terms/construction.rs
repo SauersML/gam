@@ -129,10 +129,10 @@ impl PenaltyMatrix {
                             continue;
                         };
                         *entry_ij += weight * value;
-                        if i != j {
-                            if let Some(entry_ji) = dest.get_mut((j, i)) {
-                                *entry_ji += weight * value;
-                            }
+                        if i != j
+                            && let Some(entry_ji) = dest.get_mut((j, i))
+                        {
+                            *entry_ji += weight * value;
                         }
                     }
                 }

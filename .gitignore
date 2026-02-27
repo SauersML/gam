@@ -27,3 +27,9 @@ bench/scenarios.*.json
 scripts/__pycache__/
 scripts/latest_benchmark_summary.md
 *.png
+
+# macOS metadata
+.DS_Store
+
+# local benchmark plots
+bench/plots/

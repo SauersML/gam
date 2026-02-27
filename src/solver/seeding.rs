@@ -92,12 +92,12 @@ pub fn generate_rho_candidates(
     add_seed_dedup(&mut seeds, &mut seen, primary.clone());
 
     // Backward-compatible scalar heuristic support: treat each value as a symmetric λ seed.
-    if let Some(vals) = heuristic_lambdas {
-        if vals.len() != num_penalties {
-            for &lambda in vals {
-                let rho = rho_from_lambda(lambda, bounds);
-                add_seed_dedup(&mut seeds, &mut seen, Array1::from_elem(num_penalties, rho));
-            }
+    if let Some(vals) = heuristic_lambdas
+        && vals.len() != num_penalties
+    {
+        for &lambda in vals {
+            let rho = rho_from_lambda(lambda, bounds);
+            add_seed_dedup(&mut seeds, &mut seen, Array1::from_elem(num_penalties, rho));
         }
     }
 
