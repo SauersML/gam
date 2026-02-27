@@ -1668,10 +1668,16 @@ fn solve_newton_direction_with_linear_constraints(
                 return Ok(());
             }
             let mut remove_pos: Option<usize> = None;
-            let mut most_negative = -tol_dual;
-            for (pos, &lam) in lambda_w.iter().enumerate() {
-                if lam < most_negative {
-                    most_negative = lam;
+            // KKT solve returns multipliers for:
+            //   H d + A_w^T lambda_sys = -g_cur.
+            // Under our inequality convention A*beta >= b, the true multipliers are
+            // lambda_true = -lambda_sys, and dual feasibility requires lambda_true >= 0.
+            // Therefore release active rows with the most negative lambda_true.
+            let mut most_negative_true = -tol_dual;
+            for (pos, &lam_sys) in lambda_w.iter().enumerate() {
+                let lam_true = -lam_sys;
+                if lam_true < most_negative_true {
+                    most_negative_true = lam_true;
                     remove_pos = Some(pos);
                 }
             }
@@ -4189,7 +4195,7 @@ pub fn compute_final_penalized_hessian(
 mod tests {
     use super::{
         LinearInequalityConstraints, calculate_scale, compute_constraint_kkt_diagnostics,
-        default_beta_guess_external,
+        default_beta_guess_external, solve_newton_direction_with_linear_constraints,
     };
     use crate::probability::standard_normal_quantile;
     use crate::types::LinkFunction;
@@ -4288,6 +4294,38 @@ mod tests {
         assert!(diag.dual_feasibility <= 1e-12);
         assert!(diag.complementarity <= 1e-12);
         assert!(diag.stationarity <= 1e-10);
+    }
+
+    #[test]
+    fn linear_constraint_active_set_releases_positive_kkt_system_multiplier() {
+        // min_d g^T d + 0.5 d^T H d, subject to A(beta + d) >= b
+        // with beta fixed at the lower bound x >= 0 and an upper bound x <= 0.1.
+        // The first active-set KKT solve at x=0 yields d=0 and lambda_sys=+1
+        // for the lower-bound row, which must be released (lambda_true = -lambda_sys).
+        let hessian = array![[1.0]];
+        let gradient = array![-1.0];
+        let beta = array![0.0];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0], [-1.0]],
+            b: array![0.0, -0.1],
+        };
+        let mut direction = Array1::zeros(1);
+
+        solve_newton_direction_with_linear_constraints(
+            &hessian,
+            &gradient,
+            &beta,
+            &constraints,
+            &mut direction,
+            None,
+        )
+        .expect("constrained Newton direction should solve");
+
+        assert!(
+            (direction[0] - 0.1).abs() <= 1e-10,
+            "expected step to upper bound (0.1), got {}",
+            direction[0]
+        );
     }
 
     #[test]

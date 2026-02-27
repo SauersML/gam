@@ -408,13 +408,12 @@ fn weighted_normal_equations(
                     for b_ptr in a_ptr..end {
                         let b = col_idx[b_ptr];
                         let xb = vals[b_ptr];
-                        xtwx[[a, b]] += wi * xa * xb;
+                        let v = wi * xa * xb;
+                        xtwx[[a, b]] += v;
+                        if a != b {
+                            xtwx[[b, a]] += v;
+                        }
                     }
-                }
-            }
-            for a in 0..p {
-                for b in 0..a {
-                    xtwx[[a, b]] = xtwx[[b, a]];
                 }
             }
 
@@ -694,17 +693,23 @@ fn solve_quadratic_with_linear_constraints(
         for (r, &idx) in active.iter().enumerate() {
             a_w.row_mut(r).assign(&constraints.a.row(idx));
         }
-        let (direction, lambda) = solve_kkt_step(hessian, &gradient, &a_w)?;
+        let (direction, lambda_sys) = solve_kkt_step(hessian, &gradient, &a_w)?;
         let step_norm = direction.iter().map(|v| v * v).sum::<f64>().sqrt();
         if step_norm <= tol_step {
             if active.is_empty() {
                 return Ok((x, active));
             }
-            let mut most_positive = tol_dual;
+            // solve_kkt_step returns multipliers from:
+            //   H d + A_w^T lambda_sys = -gradient.
+            // For constraints A*x >= b, true multipliers satisfy
+            //   gradient + H d = A_w^T lambda_true, so lambda_true = -lambda_sys.
+            // Release active rows with lambda_true < 0.
+            let mut most_negative_true = -tol_dual;
             let mut remove_pos: Option<usize> = None;
-            for (pos, &lam) in lambda.iter().enumerate() {
-                if lam > most_positive {
-                    most_positive = lam;
+            for (pos, &lam_sys) in lambda_sys.iter().enumerate() {
+                let lam_true = -lam_sys;
+                if lam_true < most_negative_true {
+                    most_negative_true = lam_true;
                     remove_pos = Some(pos);
                 }
             }
@@ -2309,6 +2314,37 @@ mod tests {
             (beta - 1.0).abs() < 1e-8,
             "expected constrained optimum at lower bound, got {beta}"
         );
+    }
+
+    #[test]
+    fn quadratic_linear_constraints_release_positive_kkt_system_multiplier() {
+        // max ll with exact Newton equivalent to minimizing
+        // 0.5 * x^2 - rhs*x with rhs=1 under 0 <= x <= 0.1.
+        // At x=0, active-set KKT solve gives lambda_sys=+1 for the lower bound,
+        // which must be released (lambda_true = -lambda_sys).
+        let hessian = array![[1.0]];
+        let rhs = array![1.0];
+        let beta_start = array![0.0];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0], [-1.0]],
+            b: array![0.0, -0.1],
+        };
+
+        let (beta, active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("constrained quadratic solve should succeed");
+
+        assert!(
+            (beta[0] - 0.1).abs() <= 1e-10,
+            "expected constrained optimum at upper bound 0.1, got {}",
+            beta[0]
+        );
+        assert_eq!(active.len(), 1);
     }
 
     #[test]

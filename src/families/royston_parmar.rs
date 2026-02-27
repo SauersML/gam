@@ -115,14 +115,23 @@ fn warn_survival_lambda_optimization_health(
     result: &crate::estimate::SmoothingBfgsResult,
     options: &SurvivalLambdaOptimizerOptions,
 ) {
-    let lambdas = result.rho.mapv(f64::exp);
-    let finite_lambdas: Vec<f64> = lambdas.iter().copied().filter(|v| v.is_finite()).collect();
-    let min_lambda = finite_lambdas.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_lambda = finite_lambdas
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let finite_range_ok = min_lambda.is_finite() && max_lambda.is_finite();
+    // Single pass over rho: avoid allocating intermediate lambda arrays.
+    let mut min_lambda = f64::INFINITY;
+    let mut max_lambda = f64::NEG_INFINITY;
+    let mut saw_finite = false;
+    for &rho in &result.rho {
+        let lambda = rho.exp();
+        if lambda.is_finite() {
+            saw_finite = true;
+            if lambda < min_lambda {
+                min_lambda = lambda;
+            }
+            if lambda > max_lambda {
+                max_lambda = lambda;
+            }
+        }
+    }
+    let finite_range_ok = saw_finite;
 
     if !result.stationary {
         log::warn!(
