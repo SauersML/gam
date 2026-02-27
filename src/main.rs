@@ -2322,6 +2322,82 @@ fn build_survival_baseline_offsets(
     Ok((eta_entry, eta_exit, derivative_exit))
 }
 
+fn max_linear_constraint_violation(
+    beta: &Array1<f64>,
+    constraints: &gam::pirls::LinearInequalityConstraints,
+) -> (f64, usize) {
+    let mut worst = 0.0_f64;
+    let mut worst_row = 0usize;
+    for i in 0..constraints.a.nrows() {
+        let slack = constraints.a.row(i).dot(beta) - constraints.b[i];
+        let viol = (-slack).max(0.0);
+        if viol > worst {
+            worst = viol;
+            worst_row = i;
+        }
+    }
+    (worst, worst_row)
+}
+
+fn project_beta_to_linear_constraints(
+    beta: &mut Array1<f64>,
+    constraints: &gam::pirls::LinearInequalityConstraints,
+    feasibility_tol: f64,
+    max_passes: usize,
+) -> Result<(), String> {
+    if constraints.a.ncols() != beta.len() || constraints.a.nrows() != constraints.b.len() {
+        return Err(format!(
+            "linear constraint shape mismatch while projecting initial beta: A={}x{}, b={}, beta={}",
+            constraints.a.nrows(),
+            constraints.a.ncols(),
+            constraints.b.len(),
+            beta.len()
+        ));
+    }
+    if max_passes == 0 {
+        return Err("project_beta_to_linear_constraints requires max_passes > 0".to_string());
+    }
+
+    // Cyclic orthogonal projection onto half-spaces A_i * beta >= b_i.
+    // This is a standard feasibility method for convex linear inequalities and
+    // gives us a monotonicity-feasible PIRLS starting point without changing the
+    // fitted objective.
+    for _ in 0..max_passes {
+        let mut any_updated = false;
+        for i in 0..constraints.a.nrows() {
+            let ai = constraints.a.row(i);
+            let deficit = constraints.b[i] - ai.dot(beta);
+            if deficit <= feasibility_tol {
+                continue;
+            }
+            let norm2 = ai.dot(&ai);
+            if !norm2.is_finite() || norm2 <= 1e-20 {
+                return Err(format!(
+                    "cannot satisfy linear constraint row {i}: near-zero row norm with positive violation {:.3e}",
+                    deficit
+                ));
+            }
+            let alpha = deficit / norm2;
+            for j in 0..beta.len() {
+                beta[j] += alpha * ai[j];
+            }
+            any_updated = true;
+        }
+        let (worst, _) = max_linear_constraint_violation(beta, constraints);
+        if worst <= feasibility_tol {
+            return Ok(());
+        }
+        if !any_updated {
+            break;
+        }
+    }
+
+    let (worst, row) = max_linear_constraint_violation(beta, constraints);
+    Err(format!(
+        "failed to project initial beta to linear feasibility: max(Aβ-b violation)={worst:.3e} at row {row}"
+    ))
+}
+
 fn apply_saved_probit_wiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
     match (
         model.probit_wiggle_knots.as_ref(),
@@ -2774,6 +2850,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut beta0 = Array1::<f64>::zeros(p);
     beta0[0] = -3.0;
     beta0[1] = 1.0;
+    let linear_constraints = model.monotonicity_linear_constraints();
+    if let Some(lin) = linear_constraints.as_ref() {
+        project_beta_to_linear_constraints(&mut beta0, lin, 1e-10, 64)
+            .map_err(|e| format!("failed to initialize monotonicity-feasible survival beta: {e}"))?;
+    }
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
         convergence_tolerance: 1e-6,
@@ -2781,7 +2862,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         min_step_size: 1e-12,
         firth_bias_reduction: false,
         coefficient_lower_bounds: None,
-        linear_constraints: model.monotonicity_linear_constraints(),
+        linear_constraints,
     };
     let summary = gam::pirls::run_working_model_pirls(
         &mut model,

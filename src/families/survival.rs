@@ -169,16 +169,21 @@ pub struct WorkingModelSurvival {
 impl WorkingModelSurvival {
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
         let tol = self.monotonicity.tolerance.max(1e-12);
-        let n = self.x_derivative.nrows();
         let p = self.x_derivative.ncols();
-        if n == 0 || p == 0 {
+        if p == 0 {
             return None;
         }
-        let mut a = Array2::<f64>::zeros((n, p));
-        a.assign(&self.x_derivative);
-        let mut b = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            b[i] = tol - self.offset_derivative_exit[i];
+        let active_rows: Vec<usize> = (0..self.x_derivative.nrows())
+            .filter(|&i| self.sample_weight[i] > 0.0 && self.event_target[i] > 0)
+            .collect();
+        if active_rows.is_empty() {
+            return None;
+        }
+        let mut a = Array2::<f64>::zeros((active_rows.len(), p));
+        let mut b = Array1::<f64>::zeros(active_rows.len());
+        for (r, &i) in active_rows.iter().enumerate() {
+            a.row_mut(r).assign(&self.x_derivative.row(i));
+            b[r] = tol - self.offset_derivative_exit[i];
         }
         Some(LinearInequalityConstraints { a, b })
     }
@@ -322,6 +327,10 @@ impl WorkingModelSurvival {
         let mut h = Array2::<f64>::zeros((p, p));
 
         let derivative_guard = self.monotonicity.tolerance.max(1e-12);
+        // Match strict monotonicity intent while tolerating tiny solver/BLAS roundoff
+        // near the active boundary.
+        let derivative_guard_numerical =
+            (derivative_guard - (1e-10_f64).min(0.01 * derivative_guard)).max(1e-12);
         for i in 0..n {
             let w = self.sample_weight[i];
             if w <= 0.0 {
@@ -373,7 +382,7 @@ impl WorkingModelSurvival {
 
             if d > 0.0 {
                 let deriv = derivative_raw[i];
-                if deriv <= derivative_guard || !deriv.is_finite() {
+                if deriv <= derivative_guard_numerical || !deriv.is_finite() {
                     return Err(EstimationError::ParameterConstraintViolation(format!(
                         "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
                         i, deriv, derivative_guard
@@ -531,6 +540,7 @@ impl WorkingModelSurvival {
         let exp_entry = eta_entry.mapv(f64::exp);
         let exp_exit = eta_exit.mapv(f64::exp);
         let guard = self.monotonicity.tolerance.max(1e-12);
+        let guard_numerical = (guard - (1e-10_f64).min(0.01 * guard)).max(1e-12);
 
         // Leverage-like diagonals used by the third-derivative contraction:
         // q_i = x_i^T H^{-1} x_i, computed via solves against X^T blocks.
@@ -662,7 +672,7 @@ impl WorkingModelSurvival {
                 }
                 if self.event_target[i] > 0 {
                     let s_i = deriv_raw[i];
-                    if s_i <= guard || !s_i.is_finite() {
+                    if s_i <= guard_numerical || !s_i.is_finite() {
                         return Err(EstimationError::ParameterConstraintViolation(format!(
                             "survival monotonicity violated in LAML trace contraction at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
                             i, s_i, guard
