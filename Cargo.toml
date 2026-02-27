@@ -28,7 +28,7 @@ ndarray = { version = "0.17.1", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
 toml = "0.9.7"
-wolfe_bfgs = "0.2.2"
+wolfe_bfgs = { path = "../wolfe_bfgs" }
 log = "0.4.28"
 csv = "1.4.0"
 faer = "0.23.2"

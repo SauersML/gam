@@ -540,8 +540,8 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             let dlogphi1 = self.distribution.pdf_derivative(u1) / phi1;
             // d²(log phi)/du² = phi''(u)/phi(u) - (phi'(u)/phi(u))².
             // For Gaussian this equals -1.
-            let d2logphi1 = self.distribution.pdf_second_derivative(u1) / phi1
-                - dlogphi1 * dlogphi1;
+            let d2logphi1 =
+                self.distribution.pdf_second_derivative(u1) / phi1 - dlogphi1 * dlogphi1;
 
             // q derivatives (shared by threshold/log-sigma blocks)
             d1_q[i] = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));

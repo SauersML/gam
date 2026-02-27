@@ -10,7 +10,7 @@
 //! - g(·): Flexible 1D link correction with scale anchor (g(u) = u + B(u)θ)
 //!
 //! The algorithm:
-//! - Outer: BFGS over ρ = [log(λ_base), log(λ_link)]
+//! - Outer: Newton trust-region over ρ = [log(λ_base), log(λ_link)]
 //! - Inner: Alternating (g|β, β|g with g'(u)*X design)
 //! - LAML cost computed via logdet of joint Gauss-Newton Hessian
 
@@ -34,7 +34,7 @@ use crate::visualizer;
 use faer::Side;
 use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use wolfe_bfgs::BfgsSolution;
+use wolfe_bfgs::{BfgsSolution, NewtonTrustRegion};
 
 // NOTE on z standardization:
 // We standardize u = Xβ into z_raw = (u - min_u) / (max_u - min_u).
@@ -47,6 +47,18 @@ use wolfe_bfgs::BfgsSolution;
 /// This is a SOLVER detail, not an objective function modification.
 /// With spectral log-det (Wood 2011), the objective is smooth regardless of ridge.
 const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
+// FD audit policy for analytic gradient checks.
+// Keep the guardrail, but sample it periodically to avoid O(K * FD refinements)
+// blow-ups in high-dimensional smoothing problems.
+const JOINT_GRAD_AUDIT_CLAMP_FRAC: f64 = 0.20;
+const JOINT_GRAD_AUDIT_WARMUP_EVALS: usize = 5;
+const JOINT_GRAD_AUDIT_INTERVAL: usize = 20;
+
+#[inline]
+fn should_sample_joint_fd_audit(eval_num: usize) -> bool {
+    eval_num <= JOINT_GRAD_AUDIT_WARMUP_EVALS
+        || (JOINT_GRAD_AUDIT_INTERVAL > 0 && eval_num % JOINT_GRAD_AUDIT_INTERVAL == 0)
+}
 
 /// Ensure a matrix is positive definite by adding ridge if needed for solver stability.
 /// This is a SOLVER detail - the ridge is only for numerical stability in linear solves,
@@ -974,7 +986,7 @@ pub fn fit_joint_model_engine<'a>(
 }
 
 /// State for REML optimization of the joint model
-/// Wraps JointModelState and provides cost_and_grad for BFGS
+/// Wraps JointModelState and provides outer objective derivatives over ρ.
 pub struct JointCore<'a> {
     state: JointModelState<'a>,
     config: JointModelConfig,
@@ -2168,7 +2180,12 @@ impl<'a> JointRemlState<'a> {
         }
         let clamp_z_frac = clamp_z_count as f64 / n.max(1) as f64;
         let clamp_mu_frac = clamp_mu_count as f64 / n.max(1) as f64;
-        let audit_needed = !converged || clamp_z_frac > 0.05 || clamp_mu_frac > 0.05;
+        // Trigger the expensive FD audit only when clamping is substantial.
+        // Mild boundary contact is common in expressive link/spline fits and
+        // does not warrant a full gradient replacement on every outer step.
+        let audit_needed = !converged
+            || clamp_z_frac > JOINT_GRAD_AUDIT_CLAMP_FRAC
+            || clamp_mu_frac > JOINT_GRAD_AUDIT_CLAMP_FRAC;
         // Penalty det derivative for base penalties.
         let base_reparam = if let Some(invariant) = self.core.base_reparam_invariant.as_ref() {
             stable_reparameterization_with_invariant_engine(
@@ -2561,7 +2578,9 @@ impl<'a> JointRemlState<'a> {
         match self.compute_gradient_analytic(rho) {
             Ok((grad, audit_needed)) => {
                 const GRAD_FD_REL_TOL: f64 = 1e-2;
-                if audit_needed {
+                let eval_num = self.eval.eval_count;
+                let audit_slot = should_sample_joint_fd_audit(eval_num);
+                if audit_needed && audit_slot {
                     match self.compute_gradient_fd(rho) {
                         Ok(fd_grad) => {
                             let mut diff_norm = 0.0;
@@ -2583,6 +2602,12 @@ impl<'a> JointRemlState<'a> {
                             eprintln!("[JOINT][REML] FD audit failed: {err}");
                         }
                     }
+                } else if audit_needed && eval_num > JOINT_GRAD_AUDIT_WARMUP_EVALS {
+                    log::debug!(
+                        "[JOINT][REML] Skipping FD audit at eval {} (periodic audit every {} evals).",
+                        eval_num,
+                        JOINT_GRAD_AUDIT_INTERVAL
+                    );
                 }
                 Ok(grad)
             }
@@ -2611,7 +2636,7 @@ impl<'a> JointRemlState<'a> {
         self.compute_gradient_fd(rho)
     }
 
-    /// Combined cost and gradient for BFGS
+    /// Combined cost and gradient for outer optimization
     pub fn cost_and_grad(&mut self, rho: &Array1<f64>) -> (f64, Array1<f64>) {
         self.eval.eval_count += 1;
         let eval_num = self.eval.eval_count;
@@ -2636,6 +2661,44 @@ impl<'a> JointRemlState<'a> {
         let grad_norm = grad.dot(&grad).sqrt();
         visualizer::update(cost, grad_norm, "optimizing", eval_num as f64, "eval");
         (cost, grad)
+    }
+
+    fn compute_hessian_fd(&mut self, rho: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
+        let n_rho = rho.len();
+        let mut hess = Array2::<f64>::zeros((n_rho, n_rho));
+        if n_rho == 0 {
+            return Ok(hess);
+        }
+        for j in 0..n_rho {
+            let h = (1e-4 * (1.0 + rho[j].abs())).max(1e-6);
+            let mut rho_plus = rho.clone();
+            rho_plus[j] += h;
+            let mut rho_minus = rho.clone();
+            rho_minus[j] -= h;
+            let g_plus = self.compute_gradient(&rho_plus)?;
+            let g_minus = self.compute_gradient(&rho_minus)?;
+            if g_plus.len() != n_rho || g_minus.len() != n_rho {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "joint FD Hessian gradient length mismatch".to_string(),
+                ));
+            }
+            for i in 0..n_rho {
+                hess[[i, j]] = (g_plus[i] - g_minus[i]) / (2.0 * h);
+            }
+        }
+        for i in 0..n_rho {
+            for j in 0..i {
+                let v = 0.5 * (hess[[i, j]] + hess[[j, i]]);
+                hess[[i, j]] = v;
+                hess[[j, i]] = v;
+            }
+        }
+        if hess.iter().any(|v| !v.is_finite()) {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "non-finite values in joint FD Hessian".to_string(),
+            ));
+        }
+        Ok(hess)
     }
 
     /// Extract final result after optimization
@@ -2745,7 +2808,6 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
     // Bounded ρ optimization.
     const RHO_BOUND: f64 = 30.0;
 
-    use wolfe_bfgs::Bfgs;
     let mut candidate_plans: Vec<(String, Array1<f64>)> = if seed_candidates.is_empty() {
         vec![("fallback-symmetric".to_string(), Array1::zeros(n_base + 1))]
     } else {
@@ -2770,30 +2832,46 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
         snapshot.restore(&mut reml_state);
         let lower = Array1::<f64>::from_elem(rho.len(), -RHO_BOUND);
         let upper = Array1::<f64>::from_elem(rho.len(), RHO_BOUND);
-        let mut solver = Bfgs::new(rho, |rho| {
-            let (cost, grad_rho) = reml_state.cost_and_grad(rho);
-            if !cost.is_finite() || grad_rho.iter().any(|g| !g.is_finite()) {
-                return (f64::INFINITY, Array1::<f64>::from_elem(rho.len(), f64::NAN));
+        let mut solver = NewtonTrustRegion::new(rho, |rho| {
+            let cost = match reml_state.compute_cost(rho) {
+                Ok(v) => v,
+                Err(_) => f64::INFINITY,
+            };
+            let grad_rho = match reml_state.compute_gradient(rho) {
+                Ok(g) => g,
+                Err(_) => Array1::<f64>::from_elem(rho.len(), f64::NAN),
+            };
+            let hess_rho = match reml_state.compute_hessian_fd(rho) {
+                Ok(h) => h,
+                Err(_) => Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
+            };
+            if !cost.is_finite()
+                || grad_rho.iter().any(|g| !g.is_finite())
+                || hess_rho.iter().any(|v| !v.is_finite())
+            {
+                return (
+                    f64::INFINITY,
+                    Array1::<f64>::from_elem(rho.len(), f64::NAN),
+                    Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
+                );
             }
-            (cost, grad_rho)
+            (cost, grad_rho, hess_rho)
         })
         .with_bounds(lower, upper, 1e-6)
         .with_tolerance(config.reml_tol)
         .with_max_iterations(config.max_reml_iter)
-        .with_fp_tolerances(1e2, 1e2)
-        .with_accept_flat_midpoint_once(true)
-        .with_jiggle_on_flats(true, 1e-3)
-        .with_multi_direction_rescue(true)
-        .with_no_improve_stop(1e-8, 5)
-        .with_rng_seed(0xC0FFEE_u64);
+        .with_initial_trust_radius(1.0)
+        .with_max_trust_radius(1e6)
+        .with_acceptance_threshold(0.1);
 
         let solution = match solver.run() {
             Ok(solution) => solution,
-            Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-            Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
+            Err(wolfe_bfgs::NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
+                *last_solution
+            }
             Err(e) => {
                 last_error = Some(EstimationError::RemlOptimizationFailed(format!(
-                    "BFGS failed for joint model: {e:?}"
+                    "Newton trust-region failed for joint model: {e:?}"
                 )));
                 continue;
             }
@@ -3445,5 +3523,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_joint_fd_audit_sampling_schedule() {
+        // Warmup phase samples every eval.
+        for eval in 1..=JOINT_GRAD_AUDIT_WARMUP_EVALS {
+            assert!(should_sample_joint_fd_audit(eval));
+        }
+        // After warmup, only periodic checkpoints are sampled.
+        assert!(!should_sample_joint_fd_audit(
+            JOINT_GRAD_AUDIT_WARMUP_EVALS + 1
+        ));
+        assert!(!should_sample_joint_fd_audit(JOINT_GRAD_AUDIT_INTERVAL - 1));
+        assert!(should_sample_joint_fd_audit(JOINT_GRAD_AUDIT_INTERVAL));
+        assert!(should_sample_joint_fd_audit(JOINT_GRAD_AUDIT_INTERVAL * 2));
     }
 }

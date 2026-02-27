@@ -9,7 +9,7 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use ndarray::{Array1, Array2};
-use wolfe_bfgs::Bfgs;
+use wolfe_bfgs::NewtonTrustRegion;
 
 /// Optional known link metadata when a family uses a learnable wiggle correction.
 #[derive(Debug, Clone, Copy)]
@@ -1613,6 +1613,46 @@ fn compute_joint_hessian_from_objective<F: CustomFamily>(
     Ok(h)
 }
 
+fn fd_hessian_from_gradient<GradFn>(
+    rho: &Array1<f64>,
+    mut grad_fn: GradFn,
+) -> Result<Array2<f64>, String>
+where
+    GradFn: FnMut(&Array1<f64>) -> Result<Array1<f64>, String>,
+{
+    let k = rho.len();
+    let mut h = Array2::<f64>::zeros((k, k));
+    if k == 0 {
+        return Ok(h);
+    }
+    for j in 0..k {
+        let step = (1e-4 * (1.0 + rho[j].abs())).max(1e-6);
+        let mut rho_p = rho.clone();
+        rho_p[j] += step;
+        let mut rho_m = rho.clone();
+        rho_m[j] -= step;
+        let g_p = grad_fn(&rho_p)?;
+        let g_m = grad_fn(&rho_m)?;
+        if g_p.len() != k || g_m.len() != k {
+            return Err("outer FD Hessian gradient length mismatch".to_string());
+        }
+        for i in 0..k {
+            h[[i, j]] = (g_p[i] - g_m[i]) / (2.0 * step);
+        }
+    }
+    for i in 0..k {
+        for j in 0..i {
+            let v = 0.5 * (h[[i, j]] + h[[j, i]]);
+            h[[i, j]] = v;
+            h[[j, i]] = v;
+        }
+    }
+    if h.iter().any(|v| !v.is_finite()) {
+        return Err("outer FD Hessian produced non-finite values".to_string());
+    }
+    Ok(h)
+}
+
 fn compute_joint_covariance<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -1682,7 +1722,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     let last_outer_error = std::sync::Mutex::new(None::<String>);
     let lower = Array1::<f64>::from_elem(rho0.len(), -30.0);
     let upper = Array1::<f64>::from_elem(rho0.len(), 30.0);
-    let mut solver = Bfgs::new(rho0.clone(), |x| {
+    let mut solver = NewtonTrustRegion::new(rho0.clone(), |x| {
         let cached = warm_cache.lock().ok().and_then(|g| g.clone());
         match outer_objective_and_gradient(
             family,
@@ -1714,26 +1754,50 @@ pub fn fit_custom_family<F: CustomFamily>(
                 if let Ok(mut guard) = last_outer_error.lock() {
                     *guard = None;
                 }
-                (obj, grad)
+                let hess = match fd_hessian_from_gradient(x, |rho_fd| {
+                    outer_objective_and_gradient(
+                        family,
+                        specs,
+                        options,
+                        &penalty_counts,
+                        rho_fd,
+                        None,
+                    )
+                    .map(|(_, g, _)| g)
+                }) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        if let Ok(mut guard) = last_outer_error.lock() {
+                            *guard = Some(e);
+                        }
+                        return (
+                            f64::INFINITY,
+                            Array1::<f64>::from_elem(x.len(), f64::NAN),
+                            Array2::<f64>::from_elem((x.len(), x.len()), f64::NAN),
+                        );
+                    }
+                };
+                (obj, grad, hess)
             }
-            // Avoid synthetic gradients: failed objective evaluations must not
-            // inject an arbitrary direction into BFGS.
+            // Avoid synthetic derivatives: failed objective evaluations must not
+            // inject arbitrary direction/curvature into outer optimization.
             Err(e) => {
                 if let Ok(mut guard) = last_outer_error.lock() {
                     *guard = Some(e);
                 }
-                (f64::INFINITY, Array1::<f64>::from_elem(x.len(), f64::NAN))
+                (
+                    f64::INFINITY,
+                    Array1::<f64>::from_elem(x.len(), f64::NAN),
+                    Array2::<f64>::from_elem((x.len(), x.len()), f64::NAN),
+                )
             }
         }
     })
     .with_bounds(lower, upper, 1e-6)
     .with_tolerance(options.outer_tol)
-    .with_fp_tolerances(1e2, 1e2)
-    .with_accept_flat_midpoint_once(true)
-    .with_jiggle_on_flats(true, 1e-3)
-    .with_multi_direction_rescue(true)
-    .with_no_improve_stop(1e-8, 5)
-    .with_rng_seed(0xC0FFEE_u64)
+    .with_initial_trust_radius(1.0)
+    .with_max_trust_radius(1e6)
+    .with_acceptance_threshold(0.1)
     .with_max_iterations(options.outer_max_iter);
     let last_eval_error = || {
         last_outer_error
@@ -1745,25 +1809,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     };
     let sol = match solver.run() {
         Ok(sol) => sol,
-        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
-            if last_solution.final_value.is_finite()
-                && last_solution.final_gradient_norm.is_finite()
-            {
-                log::warn!(
-                    "Outer smoothing line search failed; using best-so-far solution (iter={}, f={:.6e}, ||g||={:.3e}).",
-                    last_solution.iterations,
-                    last_solution.final_value,
-                    last_solution.final_gradient_norm
-                );
-                *last_solution
-            } else {
-                return Err(format!(
-                    "outer smoothing optimization failed: LineSearchFailed.{details}",
-                    details = last_eval_error()
-                ));
-            }
-        }
-        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
+        Err(wolfe_bfgs::NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
             if last_solution.final_value.is_finite()
                 && last_solution.final_gradient_norm.is_finite()
             {
@@ -2127,7 +2173,9 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            err.contains("last objective error: synthetic outer objective failure: block[0] evaluate()"),
+            err.contains(
+                "last objective error: synthetic outer objective failure: block[0] evaluate()"
+            ),
             "expected preserved root-cause context in error, got: {err}"
         );
     }
