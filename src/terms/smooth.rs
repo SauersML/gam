@@ -1243,8 +1243,9 @@ fn apply_spatial_orthogonality_to_parametric(
 ) -> Result<SmoothDesign, BasisError> {
     // Option 5 identifiability policy:
     //
-    // Build the parametric block C = [1 | X_lin] once, then for each spatial smooth
-    // basis B enforce orthogonality to C in the unweighted inner product:
+    // Build a term-local parametric confounding block C_j = [1 | X_lin,overlap(j)],
+    // then for each spatial smooth basis B_j enforce orthogonality to C_j in the
+    // unweighted inner product:
     //   B_con^T C = 0.
     //
     // Reparameterization derivation:
@@ -1279,18 +1280,6 @@ fn apply_spatial_orthogonality_to_parametric(
     }
 
     let n = smooth.design.nrows();
-    // Build C only when at least one term needs fresh orthogonalization.
-    let any_fresh_orth = smooth_specs.iter().any(|t| {
-        matches!(
-            spatial_identifiability_policy(t),
-            Some(SpatialIdentifiability::OrthogonalToParametric)
-        )
-    });
-    let c = if any_fresh_orth {
-        Some(build_parametric_constraint_block(data, linear_terms)?)
-    } else {
-        None
-    };
     let mut local_designs = Vec::<Array2<f64>>::with_capacity(smooth.terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(smooth.terms.len());
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(smooth.terms.len());
@@ -1305,10 +1294,22 @@ fn apply_spatial_orthogonality_to_parametric(
             .design
             .slice(s![.., term.coeff_range.clone()])
             .to_owned();
+        let c_local = if matches!(
+            spatial_identifiability_policy(term_spec),
+            Some(SpatialIdentifiability::OrthogonalToParametric)
+        ) {
+            Some(build_parametric_constraint_block_for_term(
+                data,
+                linear_terms,
+                term_spec,
+            )?)
+        } else {
+            None
+        };
         let (design_constrained, z_opt) = maybe_spatial_identifiability_transform(
             term_spec,
             design_local.view(),
-            c.as_ref().map(|mat| mat.view()),
+            c_local.as_ref().map(|mat| mat.view()),
         )?;
 
         // Mathematical acceptance criterion:
@@ -1317,7 +1318,7 @@ fn apply_spatial_orthogonality_to_parametric(
             spatial_identifiability_policy(term_spec),
             Some(SpatialIdentifiability::OrthogonalToParametric)
         ) {
-            let c_ref = c
+            let c_ref = c_local
                 .as_ref()
                 .expect("parametric constraint block must exist for orthogonal policy");
             let rel = orthogonality_relative_residual(design_constrained.view(), c_ref.view());
@@ -1455,15 +1456,44 @@ fn apply_spatial_orthogonality_to_parametric(
     })
 }
 
-fn build_parametric_constraint_block(
+fn build_parametric_constraint_block_for_term(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
+    term_spec: &SmoothTermSpec,
 ) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
     let p_data = data.ncols();
-    let mut c = Array2::<f64>::zeros((n, 1 + linear_terms.len()));
+
+    let overlapping_linear_term_indices: Vec<usize> = match &term_spec.basis {
+        SmoothBasisSpec::ThinPlate { feature_cols, .. } => linear_terms
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, linear)| {
+                if feature_cols.contains(&linear.feature_col) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        SmoothBasisSpec::Duchon { feature_cols, .. } => linear_terms
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, linear)| {
+                if feature_cols.contains(&linear.feature_col) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    let mut c = Array2::<f64>::zeros((n, 1 + overlapping_linear_term_indices.len()));
     c.column_mut(0).fill(1.0);
-    for (j, linear) in linear_terms.iter().enumerate() {
+    for (j, &lin_idx) in overlapping_linear_term_indices.iter().enumerate() {
+        let linear = &linear_terms[lin_idx];
         if linear.feature_col >= p_data {
             return Err(BasisError::DimensionMismatch(format!(
                 "linear term '{}' feature column {} out of bounds for {} columns",
@@ -2571,6 +2601,63 @@ mod tests {
         assert!(
             rel <= 1e-10,
             "Option 5 orthogonality residual too large: {rel}"
+        );
+    }
+
+    #[test]
+    fn spatial_option5_does_not_overconstrain_on_nonoverlapping_linear_terms() {
+        let n = 40usize;
+        let p = 16usize;
+        let mut data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                // Deterministic, non-collinear synthetic PCs.
+                data[[i, j]] = (i as f64) * 0.03 + (j as f64) * 0.11 + ((i * (j + 1)) as f64) * 1e-3;
+            }
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: (5..16)
+                .map(|j| LinearTermSpec {
+                    name: format!("pc{j}"),
+                    feature_col: j,
+                    double_penalty: false,
+                })
+                .collect(),
+            random_effect_terms: vec![],
+            smooth_terms: vec![
+                SmoothTermSpec {
+                    name: "tps_pc1".to_string(),
+                    basis: SmoothBasisSpec::ThinPlate {
+                        feature_cols: vec![1],
+                        spec: ThinPlateBasisSpec {
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                            double_penalty: true,
+                            identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                        },
+                    },
+                    shape: ShapeConstraint::None,
+                },
+                SmoothTermSpec {
+                    name: "tps_pc2".to_string(),
+                    basis: SmoothBasisSpec::ThinPlate {
+                        feature_cols: vec![2],
+                        spec: ThinPlateBasisSpec {
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                            double_penalty: true,
+                            identifiability: SpatialIdentifiability::OrthogonalToParametric,
+                        },
+                    },
+                    shape: ShapeConstraint::None,
+                },
+            ],
+        };
+
+        let out = build_term_collection_design(data.view(), &spec);
+        assert!(
+            out.is_ok(),
+            "term-local Option 5 should not over-constrain non-overlapping smooth/linear terms: {:?}",
+            out.err()
         );
     }
 
