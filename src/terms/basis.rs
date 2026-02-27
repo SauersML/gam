@@ -2126,8 +2126,6 @@ fn nullspace_shrinkage_penalty(penalty: &Array2<f64>) -> Result<Array2<f64>, Bas
     Ok(shrink)
 }
 
-
-
 fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {
     if n < 8 {
         return 0;

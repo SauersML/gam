@@ -21,7 +21,7 @@
 //! each smooth term directly from the data.
 
 // External Crate for Optimization
-use wolfe_bfgs::{Bfgs, BfgsSolution};
+use wolfe_bfgs::{BfgsSolution, NewtonTrustRegion};
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -36,9 +36,7 @@ use crate::matrix::DesignMatrix;
 use crate::pirls::{self, PirlsResult};
 use crate::probability::{inverse_link_array, standard_normal_quantile};
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
-use crate::types::{
-    Coefficients, LinkFunction, LogSmoothingParamsView, RidgePassport,
-};
+use crate::types::{Coefficients, LinkFunction, LogSmoothingParamsView, RidgePassport};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, Zip, s};
@@ -735,52 +733,61 @@ pub(crate) fn compute_smoothing_correction(
     Some(v_corr_orig)
 }
 
-fn run_bfgs_for_candidate(
+fn run_newton_for_candidate(
     label: &str,
     reml_state: &RemlState<'_>,
     config: &RemlConfig,
     initial_rho: Array1<f64>,
 ) -> Result<(BfgsSolution, f64, bool), EstimationError> {
-    log::debug!("[Candidate {label}] Running BFGS optimization from queued seed");
+    log::debug!("[Candidate {label}] Running Newton trust-region optimization from queued seed");
     let lower = Array1::<f64>::from_elem(initial_rho.len(), -RHO_BOUND);
     let upper = Array1::<f64>::from_elem(initial_rho.len(), RHO_BOUND);
-    let mut solver = Bfgs::new(initial_rho, |rho| {
+    let mut solver = NewtonTrustRegion::new(initial_rho, |rho| {
         let cost = match reml_state.compute_cost(rho) {
             Ok(v) => v,
             Err(_) => f64::INFINITY,
         };
         if !cost.is_finite() {
-            return (f64::INFINITY, Array1::<f64>::from_elem(rho.len(), f64::NAN));
+            return (
+                f64::INFINITY,
+                Array1::<f64>::from_elem(rho.len(), f64::NAN),
+                Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
+            );
         }
-        match reml_state.compute_gradient(rho) {
-            Ok(grad) if grad.iter().all(|g| g.is_finite()) => (cost, grad),
-            _ => (f64::INFINITY, Array1::<f64>::from_elem(rho.len(), f64::NAN)),
+        let grad = match reml_state.compute_gradient(rho) {
+            Ok(grad) if grad.iter().all(|g| g.is_finite()) => grad,
+            _ => {
+                return (
+                    f64::INFINITY,
+                    Array1::<f64>::from_elem(rho.len(), f64::NAN),
+                    Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
+                );
+            }
+        };
+        match reml_state.compute_laml_hessian_exact(rho) {
+            Ok(h) if h.iter().all(|v| v.is_finite()) => (cost, grad, h),
+            _ => (
+                f64::INFINITY,
+                Array1::<f64>::from_elem(rho.len(), f64::NAN),
+                Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
+            ),
         }
     })
-        .with_bounds(lower, upper, 1e-6)
-        .with_tolerance(config.reml_convergence_tolerance)
-        .with_max_iterations(config.reml_max_iterations as usize)
-        .with_fp_tolerances(1e2, 1e2)
-        .with_accept_flat_midpoint_once(true)
-        .with_jiggle_on_flats(true, 1e-3)
-        .with_multi_direction_rescue(true)
-        .with_no_improve_stop(1e-8, 5)
-        .with_rng_seed(0xC0FFEE_u64);
+    .with_bounds(lower, upper, 1e-6)
+    .with_tolerance(config.reml_convergence_tolerance)
+    .with_max_iterations(config.reml_max_iterations as usize)
+    .with_initial_trust_radius(1.0)
+    .with_max_trust_radius(1e6)
+    .with_acceptance_threshold(0.1);
 
     let solution = match solver.run() {
         Ok(solution) => {
-            log::debug!("[Candidate {label}] BFGS converged successfully according to tolerance.");
+            log::debug!("[Candidate {label}] Newton trust-region converged successfully.");
             solution
         }
-        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
-            log::debug!(
-                "[Candidate {label}] Line search stopped early; using best-so-far parameters."
-            );
-            *last_solution
-        }
-        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
+        Err(wolfe_bfgs::NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
             log::warn!(
-                "[Candidate {label}] BFGS hit the iteration cap; using best-so-far parameters."
+                "[Candidate {label}] Newton trust-region hit the iteration cap; using best-so-far parameters."
             );
             log::debug!(
                 "[Candidate {label}] Last recorded gradient norm: {:.2e}",
@@ -790,7 +797,7 @@ fn run_bfgs_for_candidate(
         }
         Err(e) => {
             return Err(EstimationError::RemlOptimizationFailed(format!(
-                "Candidate {label} failed with a critical BFGS error: {e:?}"
+                "Candidate {label} failed with a critical Newton trust-region error: {e:?}"
             )));
         }
     };
@@ -805,7 +812,7 @@ fn run_bfgs_for_candidate(
     let grad_norm_rho = solution.final_gradient_norm;
     let is_stationary = grad_norm_rho <= config.reml_convergence_tolerance.max(1e-12);
     log::debug!(
-        "[Candidate {label}] BFGS final gradient norm {:.3e} (tol {:.3e}); stationary={}",
+        "[Candidate {label}] Newton final gradient norm {:.3e} (tol {:.3e}); stationary={}",
         grad_norm_rho,
         config.reml_convergence_tolerance,
         is_stationary
@@ -1055,6 +1062,52 @@ where
     Ok(grad)
 }
 
+fn finite_diff_hessian_from_gradient_external<C, Eval>(
+    context: &mut C,
+    rho: &Array1<f64>,
+    step: f64,
+    eval_cost_grad_rho: &mut Eval,
+) -> Result<Array2<f64>, EstimationError>
+where
+    Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError>,
+{
+    let k = rho.len();
+    let mut h = Array2::<f64>::zeros((k, k));
+    if k == 0 {
+        return Ok(h);
+    }
+    for j in 0..k {
+        let hj = (step * (1.0 + rho[j].abs())).max(1e-6);
+        let mut rho_p = rho.clone();
+        rho_p[j] += hj;
+        let mut rho_m = rho.clone();
+        rho_m[j] -= hj;
+        let g_p = eval_cost_grad_rho(context, &rho_p)?.1;
+        let g_m = eval_cost_grad_rho(context, &rho_m)?.1;
+        if g_p.len() != k || g_m.len() != k {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "outer FD Hessian gradient length mismatch".to_string(),
+            ));
+        }
+        for i in 0..k {
+            h[[i, j]] = (g_p[i] - g_m[i]) / (2.0 * hj);
+        }
+    }
+    for i in 0..k {
+        for j in 0..i {
+            let v = 0.5 * (h[[i, j]] + h[[j, i]]);
+            h[[i, j]] = v;
+            h[[j, i]] = v;
+        }
+    }
+    if h.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "outer FD Hessian produced non-finite values".to_string(),
+        ));
+    }
+    Ok(h)
+}
+
 fn approx_same_rho_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
     if a.len() != b.len() {
         return false;
@@ -1101,8 +1154,7 @@ where
             "no smoothing seeds produced".to_string(),
         ));
     }
-    let candidate_seeds: Vec<(usize, Array1<f64>)> =
-        seeds.into_iter().enumerate().collect();
+    let candidate_seeds: Vec<(usize, Array1<f64>)> = seeds.into_iter().enumerate().collect();
 
     // Screen seeds: evaluate cost at each seed point, sort by cost, and only
     // run full BFGS on the best screening_budget candidates.
@@ -1120,7 +1172,10 @@ where
             .collect();
         scored.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(screening_budget);
-        scored.into_iter().map(|(i, r, _)| (i, r)).collect::<Vec<_>>()
+        scored
+            .into_iter()
+            .map(|(i, r, _)| (i, r))
+            .collect::<Vec<_>>()
     } else {
         candidate_seeds
     };
@@ -1128,34 +1183,45 @@ where
     let mut best: Option<SmoothingBfgsResult> = None;
     let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
     let mut best_grad_norm = f64::INFINITY;
-    for (seed_idx, rho_seed) in screened_seeds.iter() {
+    for (_seed_idx, rho_seed) in screened_seeds.iter() {
         let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
         let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
         let mut last_eval: Option<(Array1<f64>, Array1<f64>)> = None;
-        let mut optimizer = Bfgs::new(rho_seed.clone(), |rho| {
+        let mut optimizer = NewtonTrustRegion::new(rho_seed.clone(), |rho| {
             let (cost, grad_rho) = match eval_cost_grad_rho(context, rho) {
                 Ok(v) => v,
-                // Do not fabricate search directions: if evaluation fails, hand
-                // back a non-finite sentinel so the line search can reject it.
-                Err(_) => (f64::INFINITY, Array1::<f64>::from_elem(rho.len(), f64::NAN)),
+                Err(_) => {
+                    return (
+                        f64::INFINITY,
+                        Array1::<f64>::from_elem(rho.len(), f64::NAN),
+                        Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
+                    );
+                }
+            };
+            let hess_rho = match finite_diff_hessian_from_gradient_external(
+                context,
+                rho,
+                options.finite_diff_step,
+                eval_cost_grad_rho,
+            ) {
+                Ok(h) => h,
+                Err(_) => Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
             };
             last_eval = Some((rho.clone(), grad_rho.clone()));
-            (cost, grad_rho)
+            (cost, grad_rho, hess_rho)
         })
         .with_bounds(lower, upper, 1e-6)
         .with_tolerance(options.tol)
         .with_max_iterations(options.max_iter)
-        .with_fp_tolerances(1e2, 1e2)
-        .with_accept_flat_midpoint_once(true)
-        .with_jiggle_on_flats(true, 1e-3)
-        .with_multi_direction_rescue(true)
-        .with_no_improve_stop(1e-8, 5)
-        .with_rng_seed(0x5EED_u64.wrapping_add(*seed_idx as u64));
+        .with_initial_trust_radius(1.0)
+        .with_max_trust_radius(1e6)
+        .with_acceptance_threshold(0.1);
 
         let solution = match optimizer.run() {
             Ok(sol) => sol,
-            Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-            Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
+            Err(wolfe_bfgs::NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
+                *last_solution
+            }
             Err(_) => continue,
         };
 
@@ -1194,7 +1260,7 @@ where
 
     best.ok_or_else(|| {
         EstimationError::RemlOptimizationFailed(
-            "all smoothing BFGS starts failed before producing a candidate".to_string(),
+            "all smoothing outer starts failed before producing a candidate".to_string(),
         )
     })
 }
@@ -1400,7 +1466,10 @@ where
             scored.len(),
             screening_budget,
         );
-        scored.into_iter().map(|(l, r, _)| (l, r)).collect::<Vec<_>>()
+        scored
+            .into_iter()
+            .map(|(l, r, _)| (l, r))
+            .collect::<Vec<_>>()
     } else {
         candidate_seeds
     };
@@ -1412,7 +1481,7 @@ where
     let near_stationary_tol = (cfg.reml_convergence_tolerance.max(1e-12)) * 2.0;
     for (label, initial_rho) in screened_seeds {
         let solution_result: Result<OuterSolveResult, EstimationError> =
-            run_bfgs_for_candidate(&label, &reml_state, &cfg, initial_rho).map(
+            run_newton_for_candidate(&label, &reml_state, &cfg, initial_rho).map(
                 |(bfgs_solution, grad_norm_rho, stationary)| OuterSolveResult {
                     final_rho: bfgs_solution.final_point,
                     final_value: bfgs_solution.final_value,
@@ -2337,6 +2406,19 @@ const FD_MIN_BASE_STEP: f64 = 1e-6;
 const FD_MAX_REFINEMENTS: usize = 4;
 const FD_RIDGE_REL_JITTER_THRESHOLD: f64 = 1e-3;
 const FD_RIDGE_ABS_JITTER_THRESHOLD: f64 = 1e-12;
+const GRAD_DIAG_FD_WARMUP_EVALS: u64 = 5;
+const GRAD_DIAG_FD_INTERVAL: u64 = 25;
+const GRAD_DIAG_SEVERE_KKT_NORM: f64 = 1e-2;
+const GRAD_DIAG_SEVERE_RIDGE_MISMATCH: f64 = 1e-6;
+const GRAD_DIAG_SEVERE_BLEED_ENERGY: f64 = 1e-2;
+const GRAD_DIAG_SEVERE_RIDGE_IMPACT: f64 = 1e-2;
+const GRAD_DIAG_SEVERE_PHANTOM_PENALTY: f64 = 1e-3;
+
+#[inline]
+fn should_sample_gradient_diag_fd(eval_idx: u64) -> bool {
+    eval_idx <= GRAD_DIAG_FD_WARMUP_EVALS
+        || (GRAD_DIAG_FD_INTERVAL > 0 && eval_idx % GRAD_DIAG_FD_INTERVAL == 0)
+}
 
 #[derive(Clone, Copy, Debug)]
 enum TraceBackend {
@@ -6697,8 +6779,25 @@ pub mod internal {
             }
 
             // === Strategy 2: Component-wise FD (only if we detected other issues) ===
-            // This is expensive, so only do it when other diagnostics flag problems
-            if report.has_issues() {
+            // This is expensive, so rate-limit it unless diagnostics are severe.
+            let eval_idx = (*self.cost_eval_count.read().unwrap()).max(1);
+            let severe_envelope = report.envelope_audit.as_ref().is_some_and(|a| {
+                a.kkt_residual_norm > GRAD_DIAG_SEVERE_KKT_NORM
+                    || (a.inner_ridge - a.outer_ridge).abs() > GRAD_DIAG_SEVERE_RIDGE_MISMATCH
+            });
+            let severe_bleed = report
+                .spectral_bleed
+                .iter()
+                .any(|b| b.has_bleed && b.truncated_energy.abs() > GRAD_DIAG_SEVERE_BLEED_ENERGY);
+            let severe_ridge = report.dual_ridge.as_ref().is_some_and(|r| {
+                r.has_mismatch
+                    && (r.ridge_impact.abs() > GRAD_DIAG_SEVERE_RIDGE_IMPACT
+                        || r.phantom_penalty.abs() > GRAD_DIAG_SEVERE_PHANTOM_PENALTY)
+            });
+            let periodic_sample = should_sample_gradient_diag_fd(eval_idx);
+            let run_component_fd = report.has_issues()
+                && (severe_envelope || severe_bleed || severe_ridge || periodic_sample);
+            if run_component_fd {
                 struct CacheToggleGuard<'a> {
                     flag: &'a AtomicBool,
                     prev: bool,
@@ -6738,6 +6837,12 @@ pub mod internal {
                     rel_errors[k] = (analytic_grad[k] - numeric_grad[k]).abs() / denom;
                 }
                 report.component_rel_errors = Some(rel_errors);
+            } else if report.has_issues() {
+                log::debug!(
+                    "[REML] skipping full FD gradient diagnostics at eval {} (sampled every {} evals unless severe).",
+                    eval_idx,
+                    GRAD_DIAG_FD_INTERVAL
+                );
             }
 
             // === Output Summary (single print, not in a loop) ===
@@ -7004,5 +7109,23 @@ pub mod internal {
 
             Ok((current_rho, Some(v_total)))
         }
+    }
+}
+
+#[cfg(test)]
+mod fd_policy_tests {
+    use super::*;
+
+    #[test]
+    fn test_gradient_diag_fd_sampling_schedule() {
+        for eval in 1..=GRAD_DIAG_FD_WARMUP_EVALS {
+            assert!(should_sample_gradient_diag_fd(eval));
+        }
+        assert!(!should_sample_gradient_diag_fd(
+            GRAD_DIAG_FD_WARMUP_EVALS + 1
+        ));
+        assert!(!should_sample_gradient_diag_fd(GRAD_DIAG_FD_INTERVAL - 1));
+        assert!(should_sample_gradient_diag_fd(GRAD_DIAG_FD_INTERVAL));
+        assert!(should_sample_gradient_diag_fd(GRAD_DIAG_FD_INTERVAL * 2));
     }
 }
