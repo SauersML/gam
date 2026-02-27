@@ -17,7 +17,7 @@
 use crate::basis::{
     BasisOptions, Dense, KnotSource, apply_linear_extension_from_first_derivative,
     baseline_lambda_seed, compute_geometric_constraint_transform, create_basis,
-    create_difference_penalty_matrix,
+    create_difference_penalty_matrix, penalty_greville_abscissae_for_knots,
 };
 use crate::construction::{
     EngineDims, ReparamInvariant, ReparamResult, compute_penalty_square_roots,
@@ -52,7 +52,7 @@ const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 // FD audit policy for analytic gradient checks.
 // Keep the guardrail, but sample it periodically to avoid O(K * FD refinements)
 // blow-ups in high-dimensional smoothing problems.
-const JOINT_GRAD_AUDIT_CLAMP_FRAC: f64 = 0.20;
+const JOINT_GRAD_AUDIT_CLAMP_FRAC: f64 = 0.90;
 const JOINT_GRAD_AUDIT_WARMUP_EVALS: usize = 5;
 const JOINT_GRAD_AUDIT_INTERVAL: usize = 20;
 
@@ -1274,7 +1274,6 @@ impl<'a> JointRemlState<'a> {
         match (&state.link, &state.covariate_se) {
             (LinkFunction::Logit, Some(se)) => {
                 const PROB_EPS: f64 = 1e-8;
-                const MIN_WEIGHT: f64 = 1e-12;
                 const MIN_DMU: f64 = 1e-6;
                 for i in 0..n {
                     let e = eta[i].clamp(-700.0, 700.0);
@@ -1288,7 +1287,7 @@ impl<'a> JointRemlState<'a> {
                     mu[i] = mu_c;
                     let var = (mu_c * (1.0 - mu_c)).max(PROB_EPS);
                     let dmu_sq = dmu_deta * dmu_deta;
-                    let w = (dmu_sq / var).max(MIN_WEIGHT);
+                    let w = dmu_sq / var;
                     weights[i] = state.weights[i] * w;
                     let denom = dmu_deta.abs().max(MIN_DMU);
                     residual[i] = weights[i] * (mu_c - state.y[i]) / denom;
@@ -2158,8 +2157,14 @@ impl<'a> JointRemlState<'a> {
 
         // Raw penalty for link block and its projection (constant for this rho).
         let s_raw = if p_link > 0 {
-            create_difference_penalty_matrix(n_raw, 2, None)
-                .unwrap_or_else(|_| Array2::zeros((n_raw, n_raw)))
+            let greville_for_penalty =
+                penalty_greville_abscissae_for_knots(knot_vector, state.degree).unwrap_or(None);
+            create_difference_penalty_matrix(
+                n_raw,
+                2,
+                greville_for_penalty.as_ref().map(|g| g.view()),
+            )
+            .unwrap_or_else(|_| Array2::zeros((n_raw, n_raw)))
         } else {
             Array2::zeros((0, 0))
         };

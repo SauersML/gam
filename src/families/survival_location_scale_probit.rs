@@ -6,6 +6,7 @@ use crate::faer_ndarray::FaerSvd;
 use crate::matrix::DesignMatrix;
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf_approx, normal_pdf};
+use crate::sigma_link::bounded_sigma_derivs_up_to_third;
 use ndarray::{Array1, Array2, s};
 
 const MIN_PROB: f64 = 1e-12;
@@ -429,26 +430,6 @@ fn dense_design(design: &DesignMatrix, name: &str) -> Result<Array2<f64>, String
     }
 }
 
-fn safe_sigma_from_eta(
-    eta: &Array1<f64>,
-    sigma_min: f64,
-    sigma_max: f64,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let span = (sigma_max - sigma_min).max(1e-12);
-    let mut sigma = Array1::<f64>::zeros(eta.len());
-    let mut ds = Array1::<f64>::zeros(eta.len());
-    let mut d2s = Array1::<f64>::zeros(eta.len());
-    for i in 0..eta.len() {
-        let z = eta[i].clamp(-40.0, 40.0);
-        let p = 1.0 / (1.0 + (-z).exp());
-        let d1 = p * (1.0 - p);
-        sigma[i] = sigma_min + span * p;
-        ds[i] = span * d1;
-        d2s[i] = span * d1 * (1.0 - 2.0 * p);
-    }
-    (sigma, ds, d2s)
-}
-
 fn xt_diag_x(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
     let n = x.nrows();
     let p = x.ncols();
@@ -488,7 +469,8 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
         let h1 = eta_time.slice(s![n..2 * n]).to_owned();
         let d_raw = eta_time.slice(s![2 * n..3 * n]).to_owned();
 
-        let (sigma, ds, d2s) = safe_sigma_from_eta(eta_ls, self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, _d3s) =
+            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
         let q = Array1::from_iter(
             eta_t
                 .iter()
@@ -638,7 +620,8 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
         let h1 = eta_time.slice(s![n..2 * n]).to_owned();
         let d_raw = eta_time.slice(s![2 * n..3 * n]).to_owned();
 
-        let (sigma, ds, d2s) = safe_sigma_from_eta(eta_ls, self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, d3s) =
+            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
         let q = Array1::from_iter(
             eta_t
                 .iter()
@@ -755,18 +738,6 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                         self.x_log_sigma.ncols()
                     ));
                 }
-                let span = (self.sigma_max - self.sigma_min).max(1e-12);
-                // sigma(eta) = sigma_min + span * p, p = logistic(eta)
-                // ds   = span * a,                 a = p(1-p)
-                // d2s  = span * a(1-2p)
-                // d3s  = span * (a(1-2p)^2 - 2a^2)
-                let d3s = Array1::from_iter(eta_ls.iter().map(|&z_raw| {
-                    let z = z_raw.clamp(-40.0, 40.0);
-                    let p = 1.0 / (1.0 + (-z).exp());
-                    let a = p * (1.0 - p);
-                    span * (a * (1.0 - 2.0 * p) * (1.0 - 2.0 * p) - 2.0 * a * a)
-                }));
-
                 let dq = Array1::from_iter(
                     eta_t
                         .iter()
@@ -1073,7 +1044,8 @@ pub fn predict_survival_location_scale_probit(
     let eta_ls = input
         .x_log_sigma
         .matrix_vector_multiply(&fit.beta_log_sigma);
-    let (sigma, _, _) = safe_sigma_from_eta(&eta_ls, input.sigma_min, input.sigma_max);
+    let (sigma, _, _, _) =
+        bounded_sigma_derivs_up_to_third(eta_ls.view(), input.sigma_min, input.sigma_max);
     let eta = Array1::from_iter(
         h.iter()
             .zip(eta_t.iter())

@@ -26,8 +26,7 @@ pub struct AloDiagnostics {
 
 #[inline]
 fn alo_eta_update_with_offset(eta_hat: f64, z: f64, offset: f64, aii: f64) -> f64 {
-    let denom_raw = 1.0 - aii;
-    let denom = if denom_raw <= 1e-12 { 1e-12 } else { denom_raw };
+    let denom = 1.0 - aii;
     // PIRLS solve is centered on offset:
     //   eta - offset = A (z - offset)
     let eta_centered = eta_hat - offset;
@@ -46,6 +45,12 @@ fn sandwich_var_eta(phi: f64, x_hinv_x: f64, es_norm2: f64, ridge: f64, s_norm2:
     // t'X'WXt = t'Ht - t'St - ridge*||t||^2
     //         = x_i't - ||E t||^2 - ridge*||t||^2.
     phi * (x_hinv_x - es_norm2 - ridge * s_norm2)
+}
+
+#[inline]
+fn variance_negative_tolerance(scale: f64) -> f64 {
+    // Tight relative tolerance for cancellation from x'H^{-1}x - ||E t||^2 - ridge||t||^2.
+    1e-12 * scale.abs().max(1.0)
 }
 
 fn compute_alo_diagnostics_from_pirls_impl(
@@ -208,6 +213,24 @@ fn compute_alo_diagnostics_from_pirls_impl(
                     var_sandwich
                 );
             }
+            if !var_bayes.is_finite() || !var_sandwich.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "ALO variance is not finite at row {obs}: bayes={var_bayes:.6e}, sandwich={var_sandwich:.6e}"
+                )));
+            }
+            let bayes_tol = variance_negative_tolerance(phi * x_hinv_x.abs());
+            if var_bayes < -bayes_tol {
+                return Err(EstimationError::InvalidInput(format!(
+                    "ALO Bayesian variance is materially negative at row {obs}: var={var_bayes:.6e}, tol={bayes_tol:.6e}"
+                )));
+            }
+            let sandwich_scale = phi * (x_hinv_x.abs() + es_norm2.abs() + (ridge * s_norm2).abs());
+            let sandwich_tol = variance_negative_tolerance(sandwich_scale);
+            if var_sandwich < -sandwich_tol {
+                return Err(EstimationError::InvalidInput(format!(
+                    "ALO sandwich variance is materially negative at row {obs}: var={var_sandwich:.6e}, tol={sandwich_tol:.6e}"
+                )));
+            }
             let se_bayes_i = var_bayes.max(0.0).sqrt();
             let se_sandwich_i = var_sandwich.max(0.0).sqrt();
             se_bayes[obs] = se_bayes_i;
@@ -238,14 +261,19 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let mut eta_tilde = Array1::<f64>::zeros(n);
     for i in 0..n {
         let denom_raw = 1.0 - aii[i];
-        let denom = if denom_raw <= 1e-12 {
-            log::warn!("[GAM ALO] 1 - a_ii <= eps at i={}, a_ii={:.6e}", i, aii[i]);
-            1e-12
-        } else {
-            denom_raw
-        };
+        if !denom_raw.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO denominator is not finite at row {i}: 1-a_ii={denom_raw}"
+            )));
+        }
+        if denom_raw <= 0.0 {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO denominator is non-positive at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}",
+                aii[i], denom_raw
+            )));
+        }
 
-        if denom <= 1e-4 {
+        if denom_raw <= 1e-4 {
             log::warn!(
                 "[GAM ALO] ALO 1-a_ii very small at i={}, a_ii={:.6e}",
                 i,
@@ -255,13 +283,11 @@ fn compute_alo_diagnostics_from_pirls_impl(
 
         eta_tilde[i] = alo_eta_update_with_offset(eta_hat[i], z[i], offset[i], aii[i]);
 
-        if !eta_tilde[i].is_finite() || eta_tilde[i].abs() > 1e6 {
-            log::warn!(
-                "[GAM ALO] ALO eta_tilde extreme value at i={}: {}, capping",
-                i,
+        if !eta_tilde[i].is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO eta_tilde is not finite at row {i}: eta_tilde={}",
                 eta_tilde[i]
-            );
-            eta_tilde[i] = eta_tilde[i].clamp(-1e6, 1e6);
+            )));
         }
     }
 

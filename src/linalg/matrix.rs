@@ -102,7 +102,7 @@ impl SparseDesignMatrix {
                     let start = col_ptr[col];
                     let end = col_ptr[col + 1];
                     for idx in start..end {
-                        out[[row_idx[idx], col]] = values[idx];
+                        out[[row_idx[idx], col]] += values[idx];
                     }
                 }
                 Arc::new(out)
@@ -261,7 +261,8 @@ impl From<&DesignMatrix> for DesignMatrix {
 
 #[cfg(test)]
 mod tests {
-    use super::{dense_matvec, dense_transpose_matvec};
+    use super::{DesignMatrix, dense_matvec, dense_transpose_matvec};
+    use faer::sparse::{SparseColMat, SymbolicSparseColMat};
     use ndarray::array;
 
     #[test]
@@ -283,6 +284,34 @@ mod tests {
         let got = dense_transpose_matvec(&x, &v);
         for i in 0..expected.len() {
             assert!((expected[i] - got[i]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn sparse_to_dense_accumulates_duplicate_entries() {
+        // Build a non-canonical CSC with duplicate row index in the same column.
+        // This can happen if a caller bypasses canonical constructors.
+        let symbolic = unsafe {
+            SymbolicSparseColMat::new_unchecked(
+                3,
+                2,
+                vec![0_usize, 2, 3],
+                None,
+                vec![1_usize, 1, 0],
+            )
+        };
+        let sparse = SparseColMat::new(symbolic, vec![2.0_f64, 3.5, -1.0]);
+        let design = DesignMatrix::from(sparse);
+        let dense = design.to_dense_arc();
+
+        assert!((dense[[1, 0]] - 5.5).abs() < 1e-12);
+        assert!((dense[[0, 1]] + 1.0).abs() < 1e-12);
+
+        let v = array![4.0, -2.0];
+        let y_sparse = design.matrix_vector_multiply(&v);
+        let y_dense = dense.dot(&v);
+        for i in 0..y_sparse.len() {
+            assert!((y_sparse[i] - y_dense[i]).abs() < 1e-12);
         }
     }
 }

@@ -2154,14 +2154,8 @@ mod tests {
             use_reml_objective: false,
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
-        let inner = inner_blockwise_fit(
-            &family,
-            &[spec],
-            &per_block_log_lambdas,
-            &options,
-            None,
-        )
-        .expect("inner blockwise fit should succeed");
+        let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
+            .expect("inner blockwise fit should succeed");
 
         let beta = inner.block_states[0].beta[0];
         assert!(

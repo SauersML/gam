@@ -3,7 +3,7 @@ use crate::basis::{
     BasisMetadata, DuchonBasisSpec, MaternBasisSpec, MaternIdentifiability, SpatialIdentifiability,
     ThinPlateBasisSpec, apply_sum_to_zero_constraint, apply_weighted_orthogonality_constraint,
     build_bspline_basis_1d, build_duchon_basis, build_matern_basis, build_thin_plate_basis,
-    create_bspline_basis_nd_with_knots, estimate_penalty_nullity,
+    estimate_penalty_nullity,
 };
 use crate::construction::kronecker_product;
 use crate::estimate::{EstimationError, FitOptions, FitResult, fit_gam};
@@ -627,6 +627,7 @@ fn build_tensor_bspline_basis(
     let mut marginal_degrees = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_num_basis = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
+    let mut marginal_designs = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
 
     // Reuse the robust 1D builder to ensure the same knot validation and
     // marginal difference-penalty construction as standalone smooth terms.
@@ -653,6 +654,7 @@ fn build_tensor_bspline_basis(
         marginal_knots.push(knots);
         marginal_degrees.push(marginal_spec.degree);
         marginal_num_basis.push(built.design.ncols());
+        marginal_designs.push(built.design);
         marginal_penalties.push(
             built
                 .penalties
@@ -671,11 +673,7 @@ fn build_tensor_bspline_basis(
         })?;
     }
 
-    let data_views: Vec<_> = feature_cols.iter().map(|&c| data.column(c)).collect();
-    let knot_views: Vec<_> = marginal_knots.iter().map(|k| k.view()).collect();
-    let (basis, _) =
-        create_bspline_basis_nd_with_knots(&data_views, &knot_views, &marginal_degrees)?;
-    let mut design = (*basis).clone();
+    let mut design = tensor_product_design_from_marginals(&marginal_designs)?;
 
     let total_cols = design.ncols();
     let mut penalties = Vec::<Array2<f64>>::with_capacity(
@@ -750,6 +748,47 @@ fn build_tensor_bspline_basis(
             identifiability_transform: z_opt,
         },
     })
+}
+
+fn tensor_product_design_from_marginals(
+    marginal_designs: &[Array2<f64>],
+) -> Result<Array2<f64>, BasisError> {
+    if marginal_designs.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "TensorBSpline requires at least one marginal basis".to_string(),
+        ));
+    }
+    let n = marginal_designs[0].nrows();
+    for (i, b) in marginal_designs.iter().enumerate().skip(1) {
+        if b.nrows() != n {
+            return Err(BasisError::DimensionMismatch(format!(
+                "tensor marginal row mismatch at dim {i}: expected {n}, got {}",
+                b.nrows()
+            )));
+        }
+    }
+    let total_cols = marginal_designs.iter().try_fold(1usize, |acc, b| {
+        acc.checked_mul(b.ncols())
+            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
+    })?;
+    let mut design = Array2::<f64>::zeros((n, total_cols));
+    for i in 0..n {
+        let mut row_vals = vec![1.0_f64];
+        for b in marginal_designs {
+            let q = b.ncols();
+            let mut next = vec![0.0_f64; row_vals.len() * q];
+            for (a_idx, &a_val) in row_vals.iter().enumerate() {
+                for col in 0..q {
+                    next[a_idx * q + col] = a_val * b[[i, col]];
+                }
+            }
+            row_vals = next;
+        }
+        for (j, &v) in row_vals.iter().enumerate() {
+            design[[i, j]] = v;
+        }
+    }
+    Ok(design)
 }
 
 fn build_random_effect_block(
@@ -2894,6 +2933,58 @@ mod tests {
         assert_eq!(sd.nullspace_dims.len(), 3);
         assert!(sd.penalties.iter().all(|s| s.nrows() == sd.design.ncols()));
         assert!(sd.penalties.iter().all(|s| s.ncols() == sd.design.ncols()));
+    }
+
+    #[test]
+    fn tensor_bspline_design_matches_extended_marginal_kronecker_product() {
+        let data = array![[-0.2, 0.1], [0.2, 0.4], [0.7, 0.8], [1.2, 1.1],];
+        let spec_x = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 3,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+        };
+        let spec_y = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 2,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+        };
+        let mx = build_bspline_basis_1d(data.column(0), &spec_x)
+            .unwrap()
+            .design;
+        let my = build_bspline_basis_1d(data.column(1), &spec_y)
+            .unwrap()
+            .design;
+        let expected = tensor_product_design_from_marginals(&[mx.clone(), my.clone()]).unwrap();
+
+        let term = SmoothTermSpec {
+            name: "te_xy".to_string(),
+            basis: SmoothBasisSpec::TensorBSpline {
+                feature_cols: vec![0, 1],
+                spec: TensorBSplineSpec {
+                    marginal_specs: vec![spec_x, spec_y],
+                    double_penalty: false,
+                    identifiability: TensorBSplineIdentifiability::None,
+                },
+            },
+            shape: ShapeConstraint::None,
+        };
+        let got = build_smooth_design(data.view(), &[term]).unwrap().design;
+        assert_eq!(got.dim(), expected.dim());
+        for i in 0..got.nrows() {
+            for j in 0..got.ncols() {
+                assert!((got[[i, j]] - expected[[i, j]]).abs() < 1e-10);
+            }
+        }
     }
 
     #[test]

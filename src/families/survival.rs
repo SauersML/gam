@@ -427,7 +427,10 @@ impl WorkingModelSurvival {
             h[[d, d]] += ridge_used;
         }
         total_grad += &beta.mapv(|v| ridge_used * v);
-        let ridge_penalty = ridge_used * beta.dot(beta);
+        // Keep scalar objective term consistent with:
+        //   grad += ridge * beta,  Hess += ridge * I
+        // which correspond to 0.5 * ridge * ||beta||^2.
+        let ridge_penalty = 0.5 * ridge_used * beta.dot(beta);
 
         let mut deviance = 2.0 * nll;
         if matches!(self.spec, SurvivalSpec::Crude) {
@@ -494,8 +497,9 @@ impl WorkingModelSurvival {
     /// - per penalty block `k`: `O(np + p^2 + nnz(S_k))`.
     ///
     /// Ridge note:
-    /// - `state.penalty_term` includes the tiny stabilization ridge used in the
-    ///   inner solve, so the objective value is consistent with the solved mode.
+    /// - `state.penalty_term` includes the tiny stabilization ridge as
+    ///   `0.5 * ridge * ||beta||^2`, so the objective value is consistent with
+    ///   the solved mode and with the reported gradient/Hessian.
     /// - this ridge is constant in `rho`, so it does not enter `A_k` nor
     ///   `tr(S^+ A_k)`.
     pub fn laml_objective_and_rho_gradient(
@@ -1012,6 +1016,120 @@ mod tests {
                 .zip(state_zero.gradient.iter())
                 .all(|(a, b)| (a - b).abs() < 1e-12)
         );
+    }
+
+    #[test]
+    fn survival_ridge_penalty_scalar_matches_gradient_hessian_scaling() {
+        let age_entry = array![1.0_f64, 2.0_f64];
+        let age_exit = array![2.0_f64, 3.5_f64];
+        let event_target = array![1u8, 0u8];
+        let event_competing = array![0u8, 0u8];
+        let sample_weight = array![1.0, 1.0];
+        let x_entry = array![[1.0, age_entry[0].ln()], [1.0, age_entry[1].ln()]];
+        let x_exit = array![[1.0, age_exit[0].ln()], [1.0, age_exit[1].ln()]];
+        let x_derivative = array![[0.0, 1.0 / age_exit[0]], [0.0, 1.0 / age_exit[1]]];
+        let penalties = PenaltyBlocks::new(vec![PenaltyBlock {
+            matrix: array![[2.0]],
+            lambda: 1.7,
+            range: 1..2,
+        }]);
+        let mono = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 1e-8,
+        };
+        let beta = array![-1.2, 0.4];
+
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties.clone(),
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct survival model");
+
+        let state = model.update_state(&beta).expect("survival state");
+        let expected_penalty = penalties.deviance(&beta) + 0.5 * state.ridge_used * beta.dot(&beta);
+        assert!(
+            (state.penalty_term - expected_penalty).abs() < 1e-12,
+            "penalty_term mismatch: state={} expected={}",
+            state.penalty_term,
+            expected_penalty
+        );
+    }
+
+    #[test]
+    fn survival_gradient_matches_objective_fd_with_ridge_scaling() {
+        let age_entry = array![1.0_f64, 2.0_f64, 3.0_f64];
+        let age_exit = array![2.0_f64, 3.5_f64, 4.0_f64];
+        let event_target = array![1u8, 0u8, 1u8];
+        let event_competing = array![0u8, 0u8, 0u8];
+        let sample_weight = array![1.0, 1.0, 1.0];
+        let x_entry = array![
+            [1.0, age_entry[0].ln()],
+            [1.0, age_entry[1].ln()],
+            [1.0, age_entry[2].ln()]
+        ];
+        let x_exit = array![
+            [1.0, age_exit[0].ln()],
+            [1.0, age_exit[1].ln()],
+            [1.0, age_exit[2].ln()]
+        ];
+        let x_derivative = array![
+            [0.0, 1.0 / age_exit[0]],
+            [0.0, 1.0 / age_exit[1]],
+            [0.0, 1.0 / age_exit[2]]
+        ];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 1e-8,
+        };
+        let beta = array![-1.0, 3.0];
+
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct survival model");
+
+        let state = model.update_state(&beta).expect("state at beta");
+        let eps = 1e-7;
+        for j in 0..beta.len() {
+            let mut plus = beta.clone();
+            let mut minus = beta.clone();
+            plus[j] += eps;
+            minus[j] -= eps;
+            let state_plus = model.update_state(&plus).expect("state at beta + eps");
+            let state_minus = model.update_state(&minus).expect("state at beta - eps");
+            let obj_plus = 0.5 * state_plus.deviance + state_plus.penalty_term;
+            let obj_minus = 0.5 * state_minus.deviance + state_minus.penalty_term;
+            let fd = (obj_plus - obj_minus) / (2.0 * eps);
+            assert!(
+                (state.gradient[j] - fd).abs() < 1e-5,
+                "objective/gradient mismatch at j={j}: grad={} fd={fd}",
+                state.gradient[j]
+            );
+        }
     }
 
     fn model_with_rho(base: &WorkingModelSurvival, rho: &Array1<f64>) -> WorkingModelSurvival {

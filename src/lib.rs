@@ -4,6 +4,7 @@
 pub mod families;
 pub mod inference;
 pub mod linalg;
+pub mod sigma_link;
 pub mod solver;
 pub mod terms;
 pub mod types;
