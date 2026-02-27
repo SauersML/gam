@@ -618,7 +618,9 @@ pub fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> 
 /// Result of the stable reparameterization algorithm from Wood (2011) Appendix B
 #[derive(Clone)]
 pub struct ReparamResult {
-    /// Transformed penalty matrix S
+    /// Penalty matrix in TRANSFORMED coefficient coordinates.
+    ///
+    /// This must be compatible with `beta_transformed` and `X_transformed = X * Qs`.
     pub s_transformed: Array2<f64>,
     /// Log-determinant of the penalty matrix (stable computation)
     pub log_det: f64,
@@ -630,8 +632,8 @@ pub struct ReparamResult {
     pub rs_transformed: Vec<Array2<f64>>,
     /// Cached transposes of rS (each is p x rank_k) to avoid repeated transposes in hot paths
     pub rs_transposed: Vec<Array2<f64>>,
-    /// Lambda-dependent penalty square root from s_transformed (rank x p matrix)
-    /// This is used for applying the actual penalty in the least squares solve
+    /// Lambda-dependent penalty square root in TRANSFORMED coordinates (rank x p matrix).
+    /// This is used for applying the actual penalty in the least squares solve.
     pub e_transformed: Array2<f64>,
     /// Truncated eigenvectors (p × m where m = p - structural_rank).
     ///
@@ -1193,14 +1195,14 @@ pub fn stable_reparameterization_with_invariant(
         Par::Seq,
     );
 
-    // E rows correspond to sqrt(eigenvalue) * q_j^T over fixed penalized columns.
+    // E is represented in TRANSFORMED coordinates (beta_t). In this frame,
+    // penalized directions are the first `structural_rank` coordinates, so E is
+    // a diagonal block with sqrt(eigenvalue) entries and zeros elsewhere.
     let mut e_transformed_mat = Mat::<f64>::zeros(structural_rank, p);
     for row_idx in 0..structural_rank {
         let safe_eigenval = range_eigs_sorted[row_idx].max(eigenvalue_floor);
         let sqrt_eigenval = safe_eigenval.sqrt();
-        for row in 0..p {
-            e_transformed_mat[(row_idx, row)] = q_pen[(row, row_idx)] * sqrt_eigenval;
-        }
+        e_transformed_mat[(row_idx, row_idx)] = sqrt_eigenval;
     }
 
     // Positive-part pseudo-logdet on fixed structural rank.
@@ -1212,35 +1214,53 @@ pub fn stable_reparameterization_with_invariant(
 
     let mut det1_vec = vec![0.0; lambdas.len()];
 
-    // Build S⁺ on fixed penalized subspace using Q_p and penalized eigenvalues.
+    // Build S⁺ in TRANSFORMED coordinates:
+    // diag(1/eig_i) on penalized coordinates, zero on null-space coordinates.
     let mut s_plus = Mat::<f64>::zeros(p, p);
     for (eig_idx, &eigenval) in range_eigs_sorted.iter().take(structural_rank).enumerate() {
         if eigenval > eigenvalue_floor {
-            let inv = 1.0 / eigenval;
-            for i in 0..p {
-                let vi = q_pen[(i, eig_idx)];
-                for j in 0..p {
-                    s_plus[(i, j)] += inv * vi * q_pen[(j, eig_idx)];
-                }
-            }
+            s_plus[(eig_idx, eig_idx)] = 1.0 / eigenval;
         }
     }
 
     for (k, lambda) in lambdas.iter().enumerate() {
-        let mut product = Mat::<f64>::zeros(p, p);
-        matmul(
-            product.as_mut(),
-            Accum::Replace,
-            s_plus.as_ref(),
-            s_k_transformed_cache[k].as_ref(),
-            1.0,
-            Par::Seq,
-        );
+        let s_k = &s_k_transformed_cache[k];
         let mut trace = 0.0_f64;
-        for i in 0..p {
-            trace += product[(i, i)];
+        for i in 0..structural_rank {
+            // Since S⁺ is diagonal in transformed coordinates, tr(S⁺ S_k)
+            // reduces to weighted diagonal entries on penalized coordinates.
+            trace += s_plus[(i, i)] * s_k[(i, i)];
         }
         det1_vec[k] = *lambda * trace;
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        // Algebraic guardrail: keep the optimized det1 path tied to the general
+        // definition det1_k = lambda_k * tr(S⁺ S_k).
+        let mut max_det1_mismatch = 0.0_f64;
+        for (k, lambda) in lambdas.iter().enumerate() {
+            let s_k = &s_k_transformed_cache[k];
+            let mut product = Mat::<f64>::zeros(p, p);
+            matmul(
+                product.as_mut(),
+                Accum::Replace,
+                s_plus.as_ref(),
+                s_k.as_ref(),
+                1.0,
+                Par::Seq,
+            );
+            let mut trace = 0.0_f64;
+            for i in 0..p {
+                trace += product[(i, i)];
+            }
+            let reference = *lambda * trace;
+            max_det1_mismatch = max_det1_mismatch.max((reference - det1_vec[k]).abs());
+        }
+        debug_assert!(
+            max_det1_mismatch <= 1e-9,
+            "det1 mismatch between optimized and reference formulas: max_abs={max_det1_mismatch:.3e}"
+        );
     }
 
     // Rebuild s_transformed from e_transformed to ensure rank consistency.
@@ -1262,6 +1282,25 @@ pub fn stable_reparameterization_with_invariant(
         1.0,
         Par::Seq,
     );
+
+    #[cfg(debug_assertions)]
+    {
+        // Structural check: transformed S must not leak into declared null coordinates.
+        let mut max_null_diag = 0.0_f64;
+        let mut max_null_offdiag = 0.0_f64;
+        for i in structural_rank..p {
+            max_null_diag = max_null_diag.max(s_truncated[(i, i)].abs());
+            for j in 0..p {
+                if i != j {
+                    max_null_offdiag = max_null_offdiag.max(s_truncated[(i, j)].abs());
+                }
+            }
+        }
+        debug_assert!(
+            max_null_diag <= 1e-10 && max_null_offdiag <= 1e-10,
+            "null-space leakage in transformed penalty: max_null_diag={max_null_diag:.3e}, max_null_offdiag={max_null_offdiag:.3e}"
+        );
+    }
 
     Ok(ReparamResult {
         s_transformed: mat_to_array(&s_truncated),
@@ -1475,5 +1514,72 @@ mod tests {
         let rep = stable_reparameterization_with_invariant(&rs_list, &lambdas, p, &inv)
             .expect("stable reparam");
         assert_eq!(rep.u_truncated, Array2::<f64>::eye(p));
+    }
+
+    #[test]
+    fn transformed_penalty_is_diagonal_in_transformed_frame() {
+        let p = 3usize;
+        let inv_sqrt2 = 2.0_f64.sqrt().recip();
+        // Penalize a rotated direction in original space so Qs is non-trivial.
+        let rs_list = vec![array![[inv_sqrt2, inv_sqrt2, 0.0]]];
+        let lambdas = vec![4.0];
+        let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
+        let rep = stable_reparameterization_with_invariant(&rs_list, &lambdas, p, &inv)
+            .expect("stable reparam");
+
+        assert_eq!(rep.e_transformed.nrows(), 1);
+        assert!(rep.e_transformed[[0, 0]].abs() > 0.0);
+        assert!(rep.e_transformed[[0, 1]].abs() <= 1e-12);
+        assert!(rep.e_transformed[[0, 2]].abs() <= 1e-12);
+        assert!((rep.det1[0] - 1.0).abs() <= 1e-10);
+
+        let s = rep.s_transformed;
+        let mut max_offdiag = 0.0_f64;
+        for i in 0..p {
+            for j in 0..p {
+                if i != j {
+                    max_offdiag = max_offdiag.max(s[[i, j]].abs());
+                }
+            }
+        }
+        assert!(
+            max_offdiag <= 1e-10,
+            "transformed penalty should be diagonal, max offdiag={max_offdiag}"
+        );
+        assert!(s[[1, 1]].abs() <= 1e-10);
+        assert!(s[[2, 2]].abs() <= 1e-10);
+    }
+
+    #[test]
+    fn det1_matches_rank_for_single_full_rank_penalty() {
+        let p = 2usize;
+        let inv_sqrt2 = 2.0_f64.sqrt().recip();
+        // Q^T for a 45-degree rotation.
+        let q_t = [[inv_sqrt2, inv_sqrt2], [-inv_sqrt2, inv_sqrt2]];
+        // R = diag(3, 1) * Q^T gives S = Q * diag(9, 1) * Q^T.
+        let rs = array![
+            [3.0 * q_t[0][0], 3.0 * q_t[0][1]],
+            [1.0 * q_t[1][0], 1.0 * q_t[1][1]]
+        ];
+        let rs_list = vec![rs];
+        let lambdas = vec![5.0];
+
+        let inv = precompute_reparam_invariant(&rs_list, p).expect("precompute invariant");
+        let rep = stable_reparameterization_with_invariant(&rs_list, &lambdas, p, &inv)
+            .expect("stable reparam");
+
+        assert_eq!(rep.e_transformed.nrows(), p);
+        let det1 = rep.det1[0];
+        assert!(
+            (det1 - p as f64).abs() <= 1e-9,
+            "expected det1={}, got {det1}",
+            p
+        );
+
+        let s = rep.s_transformed;
+        assert!(s[[0, 1]].abs() <= 1e-10);
+        assert!(s[[1, 0]].abs() <= 1e-10);
+        assert!(s[[0, 0]] > 0.0);
+        assert!(s[[1, 1]] > 0.0);
     }
 }
