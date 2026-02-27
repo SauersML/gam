@@ -9,7 +9,7 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use ndarray::{Array1, Array2};
-use wolfe_bfgs::NewtonTrustRegion;
+use wolfe_bfgs::{NewtonTrustRegion, ObjectiveEvalError, ObjectiveRequest, ObjectiveSample};
 
 /// Optional known link metadata when a family uses a learnable wiggle correction.
 #[derive(Debug, Clone, Copy)]
@@ -1256,6 +1256,34 @@ fn inner_blockwise_fit<F: CustomFamily>(
 ///
 /// Inner loop: cyclic blockwise penalized weighted regressions.
 /// Outer loop: joint optimization of all log-smoothing parameters.
+fn outer_objective_only<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    penalty_counts: &[usize],
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+) -> Result<(f64, ConstrainedWarmStart), String> {
+    let per_block = split_log_lambdas(rho, penalty_counts)?;
+    let inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    let reml_term = if options.use_reml_objective {
+        0.5 * (inner.block_logdet_h - inner.block_logdet_s)
+    } else {
+        0.0
+    };
+    let objective = -inner.log_likelihood + inner.penalty_value + reml_term;
+    let warm = ConstrainedWarmStart {
+        rho: rho.clone(),
+        block_beta: inner
+            .block_states
+            .iter()
+            .map(|st| st.beta.clone())
+            .collect(),
+        active_sets: inner.active_sets,
+    };
+    Ok((objective, warm))
+}
+
 fn outer_objective_and_gradient<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -1722,74 +1750,138 @@ pub fn fit_custom_family<F: CustomFamily>(
     let last_outer_error = std::sync::Mutex::new(None::<String>);
     let lower = Array1::<f64>::from_elem(rho0.len(), -30.0);
     let upper = Array1::<f64>::from_elem(rho0.len(), 30.0);
-    let mut solver = NewtonTrustRegion::new(rho0.clone(), |x| {
+    let mut full_cache: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
+    let mut solver = NewtonTrustRegion::new(rho0.clone(), |x, request| {
+        if let Some((rho_c, cost_c, grad_c, hess_c)) = &full_cache
+            && x.len() == rho_c.len()
+            && x.iter()
+                .zip(rho_c.iter())
+                .all(|(&a, &b)| (a - b).abs() <= 1e-12)
+        {
+            return Ok(match request {
+                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                ObjectiveRequest::CostAndGradient => {
+                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                }
+                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                    ObjectiveSample::cost_gradient_hessian(*cost_c, grad_c.clone(), hess_c.clone())
+                }
+            });
+        }
+
         let cached = warm_cache.lock().ok().and_then(|g| g.clone());
-        match outer_objective_and_gradient(
-            family,
-            specs,
-            options,
-            &penalty_counts,
-            x,
-            cached.as_ref(),
-        ) {
-            Ok((obj, grad, warm)) => {
-                if let Ok(mut guard) = warm_cache.lock() {
-                    // Keep only close-by rho seeds to avoid harmful warm starts.
-                    let seed_ok = cached
-                        .as_ref()
-                        .map(|c| {
-                            c.rho.len() == x.len()
-                                && c.rho
-                                    .iter()
-                                    .zip(x.iter())
-                                    .all(|(&a, &b)| (a - b).abs() <= 1.5)
-                        })
-                        .unwrap_or(true);
-                    if seed_ok {
-                        *guard = Some(warm);
-                    } else {
+        match request {
+            ObjectiveRequest::CostOnly => match outer_objective_only(
+                family,
+                specs,
+                options,
+                &penalty_counts,
+                x,
+                cached.as_ref(),
+            ) {
+                Ok((obj, warm)) => {
+                    if let Ok(mut guard) = warm_cache.lock() {
+                        let seed_ok = cached
+                            .as_ref()
+                            .map(|c| {
+                                c.rho.len() == x.len()
+                                    && c.rho
+                                        .iter()
+                                        .zip(x.iter())
+                                        .all(|(&a, &b)| (a - b).abs() <= 1.5)
+                            })
+                            .unwrap_or(true);
+                        if seed_ok {
+                            *guard = Some(warm);
+                        } else {
+                            *guard = None;
+                        }
+                    }
+                    if let Ok(mut guard) = last_outer_error.lock() {
                         *guard = None;
                     }
+                    Ok(ObjectiveSample::cost_only(obj))
                 }
-                if let Ok(mut guard) = last_outer_error.lock() {
-                    *guard = None;
+                Err(e) => {
+                    if let Ok(mut guard) = last_outer_error.lock() {
+                        *guard = Some(e);
+                    }
+                    Err(ObjectiveEvalError::recoverable(
+                        "custom-family outer cost evaluation failed",
+                    ))
                 }
-                let hess = match fd_hessian_from_gradient(x, |rho_fd| {
-                    outer_objective_and_gradient(
-                        family,
-                        specs,
-                        options,
-                        &penalty_counts,
-                        rho_fd,
-                        None,
-                    )
-                    .map(|(_, g, _)| g)
-                }) {
-                    Ok(h) => h,
+            },
+            ObjectiveRequest::CostAndGradient
+            | ObjectiveRequest::GradientAndHessian
+            | ObjectiveRequest::CostGradientHessian => {
+                match outer_objective_and_gradient(
+                    family,
+                    specs,
+                    options,
+                    &penalty_counts,
+                    x,
+                    cached.as_ref(),
+                ) {
+                    Ok((obj, grad, warm)) => {
+                        if let Ok(mut guard) = warm_cache.lock() {
+                            // Keep only close-by rho seeds to avoid harmful warm starts.
+                            let seed_ok = cached
+                                .as_ref()
+                                .map(|c| {
+                                    c.rho.len() == x.len()
+                                        && c.rho
+                                            .iter()
+                                            .zip(x.iter())
+                                            .all(|(&a, &b)| (a - b).abs() <= 1.5)
+                                })
+                                .unwrap_or(true);
+                            if seed_ok {
+                                *guard = Some(warm);
+                            } else {
+                                *guard = None;
+                            }
+                        }
+                        if let Ok(mut guard) = last_outer_error.lock() {
+                            *guard = None;
+                        }
+                        if matches!(request, ObjectiveRequest::CostAndGradient) {
+                            return Ok(ObjectiveSample::cost_and_gradient(obj, grad));
+                        }
+                        let hess = match fd_hessian_from_gradient(x, |rho_fd| {
+                            outer_objective_and_gradient(
+                                family,
+                                specs,
+                                options,
+                                &penalty_counts,
+                                rho_fd,
+                                None,
+                            )
+                            .map(|(_, g, _)| g)
+                        }) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                if let Ok(mut guard) = last_outer_error.lock() {
+                                    *guard = Some(e);
+                                }
+                                return Err(ObjectiveEvalError::recoverable(
+                                    "custom-family outer Hessian FD failed",
+                                ));
+                            }
+                        };
+                        full_cache = Some((x.clone(), obj, grad.clone(), hess.clone()));
+                        Ok(ObjectiveSample::cost_gradient_hessian(obj, grad, hess))
+                    }
+                    // Avoid synthetic derivatives: failed objective evaluations must not
+                    // inject arbitrary direction/curvature into outer optimization.
                     Err(e) => {
                         if let Ok(mut guard) = last_outer_error.lock() {
                             *guard = Some(e);
                         }
-                        return (
-                            f64::INFINITY,
-                            Array1::<f64>::from_elem(x.len(), f64::NAN),
-                            Array2::<f64>::from_elem((x.len(), x.len()), f64::NAN),
-                        );
+                        Err(ObjectiveEvalError::recoverable(
+                            "custom-family outer gradient evaluation failed",
+                        ))
                     }
-                };
-                (obj, grad, hess)
-            }
-            // Avoid synthetic derivatives: failed objective evaluations must not
-            // inject arbitrary direction/curvature into outer optimization.
-            Err(e) => {
-                if let Ok(mut guard) = last_outer_error.lock() {
-                    *guard = Some(e);
                 }
-                (
-                    f64::INFINITY,
-                    Array1::<f64>::from_elem(x.len(), f64::NAN),
-                    Array2::<f64>::from_elem((x.len(), x.len()), f64::NAN),
-                )
             }
         }
     })

@@ -34,7 +34,9 @@ use crate::visualizer;
 use faer::Side;
 use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use wolfe_bfgs::{BfgsSolution, NewtonTrustRegion};
+use wolfe_bfgs::{
+    BfgsSolution, NewtonTrustRegion, ObjectiveEvalError, ObjectiveRequest, ObjectiveSample,
+};
 
 // NOTE on z standardization:
 // We standardize u = Xβ into z_raw = (u - min_u) / (max_u - min_u).
@@ -2832,30 +2834,74 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
         snapshot.restore(&mut reml_state);
         let lower = Array1::<f64>::from_elem(rho.len(), -RHO_BOUND);
         let upper = Array1::<f64>::from_elem(rho.len(), RHO_BOUND);
-        let mut solver = NewtonTrustRegion::new(rho, |rho| {
+        let mut full_cache: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
+        let mut solver = NewtonTrustRegion::new(rho, |rho, request| {
+            if let Some((rho_c, cost_c, grad_c, hess_c)) = &full_cache
+                && rho.len() == rho_c.len()
+                && rho
+                    .iter()
+                    .zip(rho_c.iter())
+                    .all(|(&a, &b)| (a - b).abs() <= 1e-12)
+            {
+                return Ok(match request {
+                    ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                    ObjectiveRequest::CostAndGradient => {
+                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                    }
+                    ObjectiveRequest::GradientAndHessian
+                    | ObjectiveRequest::CostGradientHessian => {
+                        ObjectiveSample::cost_gradient_hessian(
+                            *cost_c,
+                            grad_c.clone(),
+                            hess_c.clone(),
+                        )
+                    }
+                });
+            }
+
             let cost = match reml_state.compute_cost(rho) {
                 Ok(v) => v,
                 Err(_) => f64::INFINITY,
             };
-            let grad_rho = match reml_state.compute_gradient(rho) {
-                Ok(g) => g,
-                Err(_) => Array1::<f64>::from_elem(rho.len(), f64::NAN),
-            };
-            let hess_rho = match reml_state.compute_hessian_fd(rho) {
-                Ok(h) => h,
-                Err(_) => Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
-            };
-            if !cost.is_finite()
-                || grad_rho.iter().any(|g| !g.is_finite())
-                || hess_rho.iter().any(|v| !v.is_finite())
-            {
-                return (
-                    f64::INFINITY,
-                    Array1::<f64>::from_elem(rho.len(), f64::NAN),
-                    Array2::<f64>::from_elem((rho.len(), rho.len()), f64::NAN),
-                );
+            if !cost.is_finite() {
+                return Err(ObjectiveEvalError::recoverable(
+                    "non-finite joint REML cost",
+                ));
             }
-            (cost, grad_rho, hess_rho)
+            match request {
+                ObjectiveRequest::CostOnly => Ok(ObjectiveSample::cost_only(cost)),
+                ObjectiveRequest::CostAndGradient => {
+                    let grad = match reml_state.compute_gradient(rho) {
+                        Ok(g) if g.iter().all(|v| v.is_finite()) => g,
+                        _ => {
+                            return Err(ObjectiveEvalError::recoverable(
+                                "non-finite joint REML gradient",
+                            ));
+                        }
+                    };
+                    Ok(ObjectiveSample::cost_and_gradient(cost, grad))
+                }
+                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                    let grad = match reml_state.compute_gradient(rho) {
+                        Ok(g) if g.iter().all(|v| v.is_finite()) => g,
+                        _ => {
+                            return Err(ObjectiveEvalError::recoverable(
+                                "non-finite joint REML gradient",
+                            ));
+                        }
+                    };
+                    let hess = match reml_state.compute_hessian_fd(rho) {
+                        Ok(h) if h.iter().all(|v| v.is_finite()) => h,
+                        _ => {
+                            return Err(ObjectiveEvalError::recoverable(
+                                "non-finite joint REML Hessian",
+                            ));
+                        }
+                    };
+                    full_cache = Some((rho.clone(), cost, grad.clone(), hess.clone()));
+                    Ok(ObjectiveSample::cost_gradient_hessian(cost, grad, hess))
+                }
+            }
         })
         .with_bounds(lower, upper, 1e-6)
         .with_tolerance(config.reml_tol)
