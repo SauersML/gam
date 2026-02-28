@@ -3,10 +3,13 @@ use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
-use rayon::prelude::ParallelSlice;
+use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -2738,12 +2741,17 @@ fn duchon_matern_block(
     Ok(c * r.powf(nu) * k_nu)
 }
 
+struct DuchonPartialFractionCoeffs {
+    a: Vec<f64>,
+    b: Vec<f64>,
+}
+
 #[inline(always)]
 fn duchon_partial_fraction_coeffs(
     p_order: usize,
     s_order: usize,
     kappa: f64,
-) -> (Vec<f64>, Vec<f64>) {
+) -> DuchonPartialFractionCoeffs {
     // 1/(ρ^{2p}(κ²+ρ²)^s) = Σ a_m/ρ^{2m} + Σ b_n/(κ²+ρ²)^n
     let mut a = vec![0.0_f64; p_order + 1]; // 1-based m
     let mut b = vec![0.0_f64; s_order + 1]; // 1-based n
@@ -2765,7 +2773,7 @@ fn duchon_partial_fraction_coeffs(
         };
         b[n] = sign * kappa.powf(expo) * comb;
     }
-    (a, b)
+    DuchonPartialFractionCoeffs { a, b }
 }
 
 fn duchon_matern_kernel_general_from_distance(
@@ -2774,6 +2782,7 @@ fn duchon_matern_kernel_general_from_distance(
     p_order: usize,
     s_order: usize,
     k_dim: usize,
+    coeffs: Option<&DuchonPartialFractionCoeffs>,
 ) -> Result<f64, BasisError> {
     if !r.is_finite() || r < 0.0 {
         return Err(BasisError::InvalidInput(
@@ -2797,15 +2806,21 @@ fn duchon_matern_kernel_general_from_distance(
         return Ok(0.0);
     }
 
-    let (a, b) = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let coeffs_local;
+    let coeffs_ref = if let Some(c) = coeffs {
+        c
+    } else {
+        coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+        &coeffs_local
+    };
     let mut val = 0.0_f64;
-    for (m, coeff) in a.iter().enumerate().skip(1) {
+    for (m, coeff) in coeffs_ref.a.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
             continue;
         }
         val += coeff * duchon_polyharmonic_block(r, m, k_dim);
     }
-    for (n, coeff) in b.iter().enumerate().skip(1) {
+    for (n, coeff) in coeffs_ref.b.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
             continue;
         }
@@ -3034,6 +3049,147 @@ fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MaternDistanceCacheKey {
+    data_rows: usize,
+    data_cols: usize,
+    data_ptr: usize,
+    data_stride0: isize,
+    data_stride1: isize,
+    centers_rows: usize,
+    centers_cols: usize,
+    centers_hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MaternDistanceCacheEntry {
+    data_center_r: Arc<Array2<f64>>,
+    center_center_r: Arc<Array2<f64>>,
+}
+
+#[derive(Default)]
+struct MaternDistanceCache {
+    map: HashMap<MaternDistanceCacheKey, MaternDistanceCacheEntry>,
+    order: Vec<MaternDistanceCacheKey>,
+}
+
+const MATERN_DISTANCE_CACHE_MAX_ENTRIES: usize = 12;
+const MATERN_DISTANCE_CACHE_MIN_PAIRS: usize = 2048;
+
+static MATERN_DISTANCE_CACHE: LazyLock<Mutex<MaternDistanceCache>> =
+    LazyLock::new(|| Mutex::new(MaternDistanceCache::default()));
+
+fn hash_array_view2(values: ArrayView2<'_, f64>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    values.nrows().hash(&mut hasher);
+    values.ncols().hash(&mut hasher);
+    for v in values {
+        v.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn compute_data_center_distances(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let n = data.nrows();
+    let d = data.ncols();
+    let k = centers.nrows();
+    let mut distances = Array2::<f64>::zeros((n, k));
+    let result: Result<(), BasisError> = distances
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                let mut dist2 = 0.0;
+                for c in 0..d {
+                    let delta = data[[i, c]] - centers[[j, c]];
+                    dist2 += delta * delta;
+                }
+                row[j] = dist2.sqrt();
+            }
+            Ok(())
+        });
+    result?;
+    Ok(distances)
+}
+
+fn compute_center_center_distances(centers: ArrayView2<'_, f64>) -> Array2<f64> {
+    let d = centers.ncols();
+    let k = centers.nrows();
+    let mut distances = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in i..k {
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = centers[[i, c]] - centers[[j, c]];
+                dist2 += delta * delta;
+            }
+            let r = dist2.sqrt();
+            distances[[i, j]] = r;
+            distances[[j, i]] = r;
+        }
+    }
+    distances
+}
+
+fn matern_distance_matrices(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+) -> Result<(Arc<Array2<f64>>, Arc<Array2<f64>>), BasisError> {
+    let n = data.nrows();
+    let k = centers.nrows();
+    if n.saturating_mul(k) < MATERN_DISTANCE_CACHE_MIN_PAIRS {
+        let dc = Arc::new(compute_data_center_distances(data, centers)?);
+        let cc = Arc::new(compute_center_center_distances(centers));
+        return Ok((dc, cc));
+    }
+
+    let key = MaternDistanceCacheKey {
+        data_rows: data.nrows(),
+        data_cols: data.ncols(),
+        data_ptr: data.as_ptr() as usize,
+        data_stride0: data.strides()[0],
+        data_stride1: data.strides()[1],
+        centers_rows: centers.nrows(),
+        centers_cols: centers.ncols(),
+        centers_hash: hash_array_view2(centers),
+    };
+
+    if let Ok(cache) = MATERN_DISTANCE_CACHE.lock()
+        && let Some(hit) = cache.map.get(&key)
+    {
+        return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
+    }
+
+    let computed_dc = Arc::new(compute_data_center_distances(data, centers)?);
+    let computed_cc = Arc::new(compute_center_center_distances(centers));
+
+    if let Ok(mut cache) = MATERN_DISTANCE_CACHE.lock() {
+        if let Some(hit) = cache.map.get(&key) {
+            return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
+        }
+        cache.map.insert(
+            key,
+            MaternDistanceCacheEntry {
+                data_center_r: computed_dc.clone(),
+                center_center_r: computed_cc.clone(),
+            },
+        );
+        cache.order.push(key);
+        while cache.map.len() > MATERN_DISTANCE_CACHE_MAX_ENTRIES {
+            if cache.order.is_empty() {
+                break;
+            }
+            let old_key = cache.order.remove(0);
+            cache.map.remove(&old_key);
+        }
+    }
+    Ok((computed_dc, computed_cc))
+}
+
 /// Creates a Matérn spline basis from data and centers.
 ///
 /// The design is `[K | 1]` when `include_intercept=true` and `[K]` otherwise, where:
@@ -3106,6 +3262,8 @@ pub fn create_matern_spline_basis(
     let poly_cols = if include_intercept { 1 } else { 0 };
     let total_cols = k + poly_cols;
 
+    let (data_center_r, center_center_r) = matern_distance_matrices(data, centers)?;
+
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
         .axis_iter_mut(Axis(0))
@@ -3113,12 +3271,7 @@ pub fn create_matern_spline_basis(
         .enumerate()
         .try_for_each(|(i, mut row)| {
             for j in 0..k {
-                let mut dist2 = 0.0;
-                for c in 0..d {
-                    let delta = data[[i, c]] - centers[[j, c]];
-                    dist2 += delta * delta;
-                }
-                row[j] = matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)?;
+                row[j] = matern_kernel_from_distance(data_center_r[[i, j]], length_scale, nu)?;
             }
             Ok(())
         });
@@ -3129,12 +3282,7 @@ pub fn create_matern_spline_basis(
     let mut center_kernel = Array2::<f64>::zeros((k, k));
     for i in 0..k {
         for j in i..k {
-            let mut dist2 = 0.0;
-            for c in 0..d {
-                let delta = centers[[i, c]] - centers[[j, c]];
-                dist2 += delta * delta;
-            }
-            let kij = matern_kernel_from_distance(dist2.sqrt(), length_scale, nu)?;
+            let kij = matern_kernel_from_distance(center_center_r[[i, j]], length_scale, nu)?;
             center_kernel[[i, j]] = kij;
             center_kernel[[j, i]] = kij;
         }
@@ -3313,6 +3461,15 @@ pub fn create_duchon_spline_basis(
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = duchon_s_from_nu(nu);
+    let coeffs = if p_order == 1 && s_order == 4 && d == 10 {
+        None
+    } else {
+        Some(duchon_partial_fraction_coeffs(
+            p_order,
+            s_order,
+            1.0 / length_scale.max(1e-300),
+        ))
+    };
 
     // Point-evaluation sufficiency check: 2p + 2s > k for a proper RKHS kernel.
     // For intrinsic constructions (p>0), borderline or subcritical settings may
@@ -3366,6 +3523,7 @@ pub fn create_duchon_spline_basis(
                     p_order,
                     s_order,
                     d,
+                    coeffs.as_ref(),
                 )?;
             }
             Ok(())
@@ -3386,6 +3544,7 @@ pub fn create_duchon_spline_basis(
                 p_order,
                 s_order,
                 d,
+                coeffs.as_ref(),
             )?;
             center_kernel[[i, j]] = kij;
             center_kernel[[j, i]] = kij;
@@ -3585,29 +3744,30 @@ pub fn select_thin_plate_knots(
     selected.push(seed_idx);
     chosen[seed_idx] = true;
 
-    for i in 0..n {
+    min_dist2.par_iter_mut().enumerate().for_each(|(i, slot)| {
         let mut d2 = 0.0;
         for c in 0..d {
             let delta = data[[i, c]] - data[[seed_idx, c]];
             d2 += delta * delta;
         }
-        min_dist2[i] = d2;
-    }
+        *slot = d2;
+    });
     min_dist2[seed_idx] = 0.0;
 
     while selected.len() < num_knots {
-        let mut best_idx = None;
-        let mut best_dist2 = f64::NEG_INFINITY;
-        for i in 0..n {
-            if chosen[i] {
-                continue;
-            }
-            let cand = min_dist2[i];
-            if cand > best_dist2 {
-                best_dist2 = cand;
-                best_idx = Some(i);
-            }
-        }
+        let best_idx = min_dist2
+            .par_iter()
+            .enumerate()
+            .filter(|(i, _)| !chosen[*i])
+            .map(|(i, &cand)| (i, cand))
+            .reduce_with(|a, b| {
+                if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
+                    b
+                } else {
+                    a
+                }
+            })
+            .map(|(i, _)| i);
         let next_idx = match best_idx {
             Some(i) => i,
             None => break,
@@ -3615,19 +3775,19 @@ pub fn select_thin_plate_knots(
         selected.push(next_idx);
         chosen[next_idx] = true;
 
-        for i in 0..n {
+        min_dist2.par_iter_mut().enumerate().for_each(|(i, slot)| {
             if chosen[i] {
-                continue;
+                return;
             }
             let mut d2 = 0.0;
             for c in 0..d {
                 let delta = data[[i, c]] - data[[next_idx, c]];
                 d2 += delta * delta;
             }
-            if d2 < min_dist2[i] {
-                min_dist2[i] = d2;
+            if d2 < *slot {
+                *slot = d2;
             }
-        }
+        });
     }
 
     let mut knots = Array2::<f64>::zeros((selected.len(), d));

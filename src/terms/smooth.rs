@@ -6,7 +6,9 @@ use crate::basis::{
     estimate_penalty_nullity,
 };
 use crate::construction::kronecker_product;
-use crate::estimate::{EstimationError, FitOptions, FitResult, fit_gam};
+use crate::estimate::{
+    EstimationError, FitOptions, FitResult, fit_gam_with_heuristic_lambdas,
+};
 use crate::pirls::LinearInequalityConstraints;
 use crate::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
@@ -1664,13 +1666,29 @@ fn fit_term_collection_for_spec(
     family: LikelihoodFamily,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
+    fit_term_collection_for_spec_with_heuristic_lambdas(
+        data, y, weights, offset, spec, None, family, options,
+    )
+}
+
+fn fit_term_collection_for_spec_with_heuristic_lambdas(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    heuristic_lambdas: Option<&[f64]>,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError> {
     let design = build_term_collection_design(data, spec)?;
-    let fit = fit_gam(
+    let fit = fit_gam_with_heuristic_lambdas(
         design.design.view(),
         y,
         weights,
         offset,
         &design.penalties,
+        heuristic_lambdas,
         family,
         &FitOptions {
             max_iter: options.max_iter,
@@ -2173,6 +2191,7 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
             let mut local_best_score = best_score;
             let mut local_best_fit: Option<FittedTermCollection> = None;
             let mut local_best_spec: Option<TermCollectionSpec> = None;
+            let mut lambda_hint = best.fit.lambdas.to_vec();
             let term_rel_tol = if double_penalty {
                 rel_tol
             } else {
@@ -2193,12 +2212,13 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
                 set_matern_length_scale(&mut cand_spec, term_idx, cand_ls)?;
                 // Full refit at candidate κ: rebuild design/penalties, then run
                 // standard REML/LAML outer optimization for λ on that basis.
-                let cand_fit = match fit_term_collection_for_spec(
+                let cand_fit = match fit_term_collection_for_spec_with_heuristic_lambdas(
                     data,
                     y.view(),
                     weights.view(),
                     offset.view(),
                     &cand_spec,
+                    Some(lambda_hint.as_slice()),
                     family,
                     options,
                 ) {
@@ -2213,6 +2233,7 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
                         continue;
                     }
                 };
+                lambda_hint = cand_fit.fit.lambdas.to_vec();
                 let cand_score = fit_score(&cand_fit.fit);
                 if cand_score + term_rel_tol * local_best_score.abs().max(1.0) < local_best_score {
                     local_best_score = cand_score;
@@ -3174,5 +3195,98 @@ mod tests {
             _ => panic!("expected Matérn term"),
         };
         assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
+
+        match &optimized.resolved_spec.smooth_terms[0].basis {
+            SmoothBasisSpec::Matern { spec, .. } => {
+                assert!(matches!(
+                    spec.center_strategy,
+                    CenterStrategy::UserProvided(_)
+                ));
+                assert!(matches!(
+                    spec.identifiability,
+                    MaternIdentifiability::FrozenTransform { .. }
+                ));
+            }
+            _ => panic!("expected Matérn term"),
+        }
+    }
+
+    #[test]
+    fn optimize_two_block_matern_kappa_freezes_matern_centers() {
+        let n = 40usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (i as f64 * 0.21).sin();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+        }
+
+        let matern_term = |name: &str, length_scale: f64| SmoothTermSpec {
+            name: name.to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    length_scale,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: true,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                },
+            },
+            shape: ShapeConstraint::None,
+        };
+
+        let mean_spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![matern_term("mean_matern", 0.8)],
+        };
+        let noise_spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![matern_term("noise_matern", 1.1)],
+        };
+
+        let solved = optimize_two_block_matern_kappa(
+            data.view(),
+            &mean_spec,
+            &noise_spec,
+            &MaternKappaOptimizationOptions {
+                enabled: true,
+                max_outer_iter: 1,
+                rel_tol: 1e-6,
+                log_step: std::f64::consts::LN_2,
+                min_length_scale: 1e-3,
+                max_length_scale: 1e3,
+            },
+            |mean_design, noise_design| {
+                Ok(
+                    mean_design.design.ncols() as f64
+                        + noise_design.design.ncols() as f64
+                        + mean_design.penalties.len() as f64
+                        + noise_design.penalties.len() as f64,
+                )
+            },
+            |score| *score,
+        )
+        .expect("two-block κ optimization should succeed");
+
+        for resolved in [&solved.resolved_mean_spec, &solved.resolved_noise_spec] {
+            match &resolved.smooth_terms[0].basis {
+                SmoothBasisSpec::Matern { spec, .. } => {
+                    assert!(matches!(
+                        spec.center_strategy,
+                        CenterStrategy::UserProvided(_)
+                    ));
+                    assert!(matches!(
+                        spec.identifiability,
+                        MaternIdentifiability::FrozenTransform { .. }
+                    ));
+                }
+                _ => panic!("expected Matérn term"),
+            }
+        }
     }
 }
