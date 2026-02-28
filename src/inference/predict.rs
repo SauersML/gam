@@ -1,6 +1,7 @@
 use crate::estimate::{EstimationError, FitResult};
 use crate::matrix::DesignMatrix;
 use crate::probability::{inverse_link_array, standard_normal_quantile};
+use crate::types::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 pub(crate) fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
@@ -152,6 +153,18 @@ pub struct CoefficientUncertaintyResult {
     pub covariance_mode_requested: InferenceCovarianceMode,
 }
 
+#[inline]
+fn family_link_for_integrated_expectation(
+    family: crate::types::LikelihoodFamily,
+) -> Option<LinkFunction> {
+    match family {
+        crate::types::LikelihoodFamily::BinomialLogit => Some(LinkFunction::Logit),
+        crate::types::LikelihoodFamily::BinomialProbit => Some(LinkFunction::Probit),
+        crate::types::LikelihoodFamily::BinomialCLogLog => Some(LinkFunction::CLogLog),
+        _ => None,
+    }
+}
+
 /// Generic engine prediction for external designs.
 /// This API is domain-agnostic: callers provide only design matrix, coefficients, offset, and family.
 pub fn predict_gam<X>(
@@ -244,24 +257,20 @@ where
     let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
     let quad_ctx = crate::quadrature::QuadratureContext::new();
 
-    let mean = match family {
-        crate::types::LikelihoodFamily::GaussianIdentity => eta.clone(),
-        crate::types::LikelihoodFamily::BinomialLogit => Array1::from_iter(
-            eta.iter()
-                .zip(eta_standard_error.iter())
-                .map(|(&e, &se)| crate::quadrature::logit_posterior_mean(&quad_ctx, e, se)),
-        ),
-        crate::types::LikelihoodFamily::BinomialProbit => Array1::from_iter(
-            eta.iter()
-                .zip(eta_standard_error.iter())
-                .map(|(&e, &se)| crate::quadrature::probit_posterior_mean(e, se)),
-        ),
-        crate::types::LikelihoodFamily::BinomialCLogLog => Array1::from_iter(
-            eta.iter()
-                .zip(eta_standard_error.iter())
-                .map(|(&e, &se)| crate::quadrature::cloglog_posterior_mean(&quad_ctx, e, se)),
-        ),
-        crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
+    let mean = match family_link_for_integrated_expectation(family) {
+        Some(link) => Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(
+            |(&e, &se)| {
+                crate::quadrature::integrated_inverse_link_mean_and_derivative(
+                    &quad_ctx, link, e, se,
+                )
+                .mean
+            },
+        )),
+        None => match family {
+            crate::types::LikelihoodFamily::GaussianIdentity => eta.clone(),
+            crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
+            _ => unreachable!(),
+        },
     };
 
     Ok(PredictPosteriorMeanResult {
@@ -570,4 +579,55 @@ pub fn coefficient_uncertainty_with_mode(
         corrected,
         covariance_mode_requested: covariance_mode,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{array, Array2};
+
+    #[test]
+    fn predict_posterior_mean_probit_matches_closed_form_reference() {
+        let x = array![[1.0], [1.0]];
+        let beta = array![0.7];
+        let offset = array![0.0, 0.0];
+        let covariance = Array2::from_diag(&array![0.25]);
+        let out = predict_gam_posterior_mean(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::BinomialProbit,
+            covariance.view(),
+        )
+        .expect("predict posterior mean");
+        let expected = crate::quadrature::probit_posterior_mean_with_deriv_exact(0.7, 0.5).mean;
+        assert!((out.mean[0] - expected).abs() <= 1e-12);
+        assert!((out.mean[1] - expected).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn predict_posterior_mean_logit_uses_integrated_dispatch() {
+        let x = array![[1.0], [1.0]];
+        let beta = array![0.4];
+        let offset = array![0.0, 0.0];
+        let covariance = Array2::from_diag(&array![0.16]);
+        let out = predict_gam_posterior_mean(
+            x,
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodFamily::BinomialLogit,
+            covariance.view(),
+        )
+        .expect("predict posterior mean");
+        let quad_ctx = crate::quadrature::QuadratureContext::new();
+        let expected = crate::quadrature::integrated_inverse_link_mean_and_derivative(
+            &quad_ctx,
+            LinkFunction::Logit,
+            0.4,
+            0.4,
+        )
+        .mean;
+        assert!((out.mean[0] - expected).abs() <= 1e-12);
+        assert!((out.mean[1] - expected).abs() <= 1e-12);
+    }
 }

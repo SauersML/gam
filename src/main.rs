@@ -1058,58 +1058,38 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     }
                 }
                 let eta_se = linear_predictor_se(grad.view(), &cov_mat);
-                let cov_hh = cov_mat.slice(s![0..p_time, 0..p_time]).to_owned();
-                let cov_tt = cov_mat
-                    .slice(s![p_time..p_time + p_t, p_time..p_time + p_t])
-                    .to_owned();
-                let cov_ll = cov_mat
-                    .slice(s![
-                        p_time + p_t..p_time + p_t + p_ls,
-                        p_time + p_t..p_time + p_t + p_ls
-                    ])
-                    .to_owned();
-                let cov_ht = cov_mat
-                    .slice(s![0..p_time, p_time..p_time + p_t])
-                    .to_owned();
-                let cov_hl = cov_mat
-                    .slice(s![0..p_time, p_time + p_t..p_time + p_t + p_ls])
-                    .to_owned();
-                let cov_tl = cov_mat
-                    .slice(s![p_time..p_time + p_t, p_time + p_t..p_time + p_t + p_ls])
-                    .to_owned();
-                let xh_hh = time_build.x_exit_time.dot(&cov_hh);
-                let xt_tt = cov_design.design.dot(&cov_tt);
-                let xl_ll = cov_design.design.dot(&cov_ll);
-                let xh_ht = time_build.x_exit_time.dot(&cov_ht);
-                let xh_hl = time_build.x_exit_time.dot(&cov_hl);
-                let xt_tl = cov_design.design.dot(&cov_tl);
-
-                let quad_ctx = gam::quadrature::QuadratureContext::new();
-                let mean = Array1::from_iter((0..n).map(|i| {
-                    let mu_h = time_build.x_exit_time.row(i).dot(&beta_time) + eta_offset_exit[i];
-                    let mu_t = cov_design.design.row(i).dot(&beta_threshold);
-                    let mu_ls = cov_design.design.row(i).dot(&beta_log_sigma);
-                    let var_h = time_build.x_exit_time.row(i).dot(&xh_hh.row(i)).max(0.0);
-                    let var_t = cov_design.design.row(i).dot(&xt_tt.row(i)).max(0.0);
-                    let var_ls = cov_design.design.row(i).dot(&xl_ll.row(i)).max(0.0);
-                    let cov_ht_i = cov_design.design.row(i).dot(&xh_ht.row(i));
-                    let cov_hl_i = cov_design.design.row(i).dot(&xh_hl.row(i));
-                    let cov_tl_i = cov_design.design.row(i).dot(&xt_tl.row(i));
-                    gam::quadrature::normal_expectation_3d_adaptive(
-                        &quad_ctx,
-                        [mu_h, mu_t, mu_ls],
-                        [
-                            [var_h, cov_ht_i, cov_hl_i],
-                            [cov_ht_i, var_t, cov_tl_i],
-                            [cov_hl_i, cov_tl_i, var_ls],
-                        ],
-                        |h, t, ls| {
-                            let sigma = sigma_from_eta_scalar(ls, sigma_min, sigma_max);
-                            let eta_loc = -h - t / sigma.max(1e-12);
-                            distribution.cdf(eta_loc).clamp(0.0, 1.0)
+                let posterior_pred =
+                    gam::survival_location_scale_probit::predict_survival_location_scale_probit_posterior_mean(
+                        &SurvivalLocationScaleProbitPredictInput {
+                            x_time_exit: time_build.x_exit_time.clone(),
+                            eta_time_offset_exit: eta_offset_exit.clone(),
+                            x_threshold: DesignMatrix::Dense(cov_design.design.clone()),
+                            x_log_sigma: DesignMatrix::Dense(cov_design.design.clone()),
+                            sigma_min,
+                            sigma_max,
+                            distribution,
                         },
+                        &gam::survival_location_scale_probit::SurvivalLocationScaleProbitFitResult {
+                            beta_time: beta_time.clone(),
+                            beta_threshold: beta_threshold.clone(),
+                            beta_log_sigma: beta_log_sigma.clone(),
+                            lambdas_time: Array1::zeros(0),
+                            lambdas_threshold: Array1::zeros(0),
+                            lambdas_log_sigma: Array1::zeros(0),
+                            log_likelihood: f64::NAN,
+                            penalized_objective: f64::NAN,
+                            iterations: 0,
+                            converged: true,
+                            covariance_conditional: Some(cov_mat.clone()),
+                        },
+                        &cov_mat,
                     )
-                }));
+                    .map_err(|e| {
+                        format!(
+                            "survival probit-location-scale posterior-mean predict failed: {e}"
+                        )
+                    })?;
+                let mean = posterior_pred.survival_prob;
                 (mean, Some(eta_se))
             } else {
                 (pred.survival_prob.clone(), None)

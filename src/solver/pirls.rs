@@ -427,23 +427,25 @@ impl WorkingLikelihood for LikelihoodFamily {
         integrated: Option<IntegratedWorkingInput<'_>>,
     ) -> Result<(), EstimationError> {
         match (self, integrated) {
-            (LikelihoodFamily::BinomialLogit, Some(integ)) => {
-                update_glm_vectors_integrated(
+            (
+                LikelihoodFamily::BinomialLogit
+                | LikelihoodFamily::BinomialProbit
+                | LikelihoodFamily::BinomialCLogLog,
+                Some(integ),
+            ) => {
+                update_glm_vectors_integrated_by_family(
                     integ.quad_ctx,
                     y,
                     eta,
                     integ.se,
+                    *self,
                     prior_weights,
                     mu,
                     weights,
                     z,
-                );
+                )?;
                 Ok(())
             }
-            (LikelihoodFamily::BinomialProbit, Some(_))
-            | (LikelihoodFamily::BinomialCLogLog, Some(_)) => Err(EstimationError::InvalidInput(
-                "Integrated updates are currently only implemented for BinomialLogit".to_string(),
-            )),
             (LikelihoodFamily::RoystonParmar, Some(_)) => Err(EstimationError::InvalidInput(
                 "RoystonParmar requires survival-specific integrated updates".to_string(),
             )),
@@ -3984,11 +3986,78 @@ pub fn update_glm_vectors_by_family(
 /// Uses the general IRLS formula (not canonical shortcut):
 ///   weight = prior × (dμ/dη)² / (μ(1-μ))  
 ///   z = η + (y - μ) / (dμ/dη)
+///
+/// Derivation of the integrated quantities:
+/// Let the uncertain latent predictor at row i be
+///   eta_tilde_i = eta_i + eps_i,   eps_i ~ N(0, se_i^2).
+/// Then the integrated mean used by PIRLS is
+///   mu_i = E[g^{-1}(eta_tilde_i)].
+/// Because the Gaussian family is a location family,
+///   dmu_i / deta_i
+///   = d/deta_i E[g^{-1}(eta_i + eps_i)]
+///   = E[(g^{-1})'(eta_i + eps_i)].
+/// That derivative is the exact object needed in the general GLM scoring update:
+///   W_i = prior_i * (dmu_i/deta_i)^2 / Var(Y_i | mu_i),
+///   z_i = eta_i + (y_i - mu_i) / (dmu_i/deta_i).
+/// So any future exact link-specific replacement only needs to preserve the
+/// contract
+///   (eta_i, se_i) -> (mu_i, dmu_i/deta_i),
+/// and the rest of the PIRLS machinery remains unchanged.
+///
+/// Why this matters for performance:
+/// This helper runs inside the inner PIRLS loop, so any per-row integration cost
+/// is multiplied by both the sample count and the number of IRLS iterations.
+/// GHQ is robust, but it means repeated evaluation of quadrature nodes in a hot
+/// path that can dominate calibrator or measurement-error fits.
+///
+/// Link-specific exact replacements:
+/// - Probit:
+///     E[Phi(eta)] = Phi(mu / sqrt(1 + sigma^2))
+///   exactly, with equally simple derivative. Integrated probit updates should
+///   never need GHQ once they are routed through a dedicated family dispatch.
+/// - Logit:
+///   logistic-normal moments admit exact convergent Faddeeva / erfcx series,
+///   which are the natural replacement for the GHQ calls below.
+/// - Cloglog:
+///   the mean is the complement of the lognormal Laplace transform and has
+///   exact non-GHQ representations (Gamma / erfc / asymptotic series), which
+///   is also relevant to survival transforms of the form exp(-exp(eta)).
+///
+/// Current status:
+/// this compatibility wrapper still defaults to the integrated logit path so
+/// existing callers keep the same behavior, but the actual family-aware
+/// integrated routing now lives in `update_glm_vectors_integrated_by_family`.
+/// That dispatcher is the canonical insertion point for exact or controlled
+/// link-specific replacements that eliminate quadrature from the PIRLS hot loop.
 pub fn update_glm_vectors_integrated(
     quad_ctx: &crate::quadrature::QuadratureContext,
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     se: ArrayView1<f64>,
+    prior_weights: ArrayView1<f64>,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+) {
+    let _ = update_glm_vectors_integrated_by_family(
+        quad_ctx,
+        y,
+        eta,
+        se,
+        LikelihoodFamily::BinomialLogit,
+        prior_weights,
+        mu,
+        weights,
+        z,
+    );
+}
+
+pub(crate) fn update_glm_vectors_integrated_for_link(
+    quad_ctx: &crate::quadrature::QuadratureContext,
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    se: ArrayView1<f64>,
+    link: LinkFunction,
     prior_weights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
@@ -4002,9 +4071,29 @@ pub fn update_glm_vectors_integrated(
         let e = eta[i].clamp(-700.0, 700.0);
         let se_i = se[i].max(0.0);
 
-        // Integrated probability and derivative via GHQ
-        let (mu_i, dmu_deta) =
-            crate::quadrature::logit_posterior_mean_with_deriv(quad_ctx, e, se_i);
+        // Integrated probability and derivative via the shared expectation
+        // engine. This may be:
+        // - exact closed form (probit),
+        // - exact/guarded special-function evaluation (logit),
+        // - controlled asymptotic approximation (small-sigma cloglog),
+        // - or GHQ fallback when no better path is active.
+        //
+        // This is the precise hotspot that link-specific exact integrated
+        // backends are meant to optimize. The calling contract already matches
+        // what any exact backend would need:
+        //   input  = (eta_i, se_i)
+        //   output = (E[g^{-1}(eta_i + eps)], d/deta E[g^{-1}(eta_i + eps)]).
+        //
+        // For example, in the logit case the derivative identity is
+        //   d/deta E[sigmoid(eta + eps)]
+        //   = E[sigmoid(eta + eps) * (1 - sigmoid(eta + eps))].
+        // The dispatcher below is responsible for picking the best available
+        // evaluation strategy while preserving this contract.
+        let integrated = crate::quadrature::integrated_inverse_link_mean_and_derivative(
+            quad_ctx, link, e, se_i,
+        );
+        let mu_i = integrated.mean;
+        let dmu_deta = integrated.dmean_dmu;
         let mu_clamped = mu_i.clamp(PROB_EPS, 1.0 - PROB_EPS);
         mu[i] = mu_clamped;
 
@@ -4027,6 +4116,26 @@ pub fn update_glm_vectors_integrated(
 /// Family-dispatched integrated GLM vector update helper.
 ///
 /// Currently only `BinomialLogit` supports integrated uncertainty updates.
+///
+/// This is the intended dispatch point for eliminating GHQ link-by-link:
+/// - `BinomialProbit` can use the exact Gaussian-probit convolution identity,
+/// - `BinomialLogit` can use the exact logistic-normal special-function series,
+/// - `BinomialCLogLog` can use the exact lognormal-Laplace / Gamma-based path.
+///
+/// The important architectural point is that each family-specific exact path
+/// only needs to provide:
+///   1. the integrated mean
+///        mu_i = E[g^{-1}(eta_i + eps_i)]
+///   2. the integrated derivative
+///        dmu_i / deta_i = E[(g^{-1})'(eta_i + eps_i)].
+/// Once those are available, the general IRLS weight and working-response
+/// formulas above remain unchanged. That makes this dispatch site the natural
+/// place to swap GHQ out for exact link-specific mathematics without touching
+/// the rest of the PIRLS update logic.
+///
+/// Keeping the dispatch here avoids contaminating the general PIRLS machinery
+/// with link-specific special-function code and lets each family choose the
+/// mathematically correct integration strategy.
 #[inline]
 pub fn update_glm_vectors_integrated_by_family(
     quad_ctx: &crate::quadrature::QuadratureContext,
@@ -4039,15 +4148,54 @@ pub fn update_glm_vectors_integrated_by_family(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
-    family.irls_update(
-        y,
-        eta,
-        prior_weights,
-        mu,
-        weights,
-        z,
-        Some(IntegratedWorkingInput { quad_ctx, se }),
-    )
+    match family {
+        LikelihoodFamily::BinomialLogit => {
+            update_glm_vectors_integrated_for_link(
+                quad_ctx,
+                y,
+                eta,
+                se,
+                LinkFunction::Logit,
+                prior_weights,
+                mu,
+                weights,
+                z,
+            );
+            Ok(())
+        }
+        LikelihoodFamily::BinomialProbit => {
+            update_glm_vectors_integrated_for_link(
+                quad_ctx,
+                y,
+                eta,
+                se,
+                LinkFunction::Probit,
+                prior_weights,
+                mu,
+                weights,
+                z,
+            );
+            Ok(())
+        }
+        LikelihoodFamily::BinomialCLogLog => {
+            update_glm_vectors_integrated_for_link(
+                quad_ctx,
+                y,
+                eta,
+                se,
+                LinkFunction::CLogLog,
+                prior_weights,
+                mu,
+                weights,
+                z,
+            );
+            Ok(())
+        }
+        _ => Err(EstimationError::InvalidInput(format!(
+            "Integrated updates are not supported for family {:?}",
+            family
+        ))),
+    }
 }
 
 /// Compute first/second eta derivatives of the PIRLS working curvature W(eta),

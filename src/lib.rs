@@ -41,6 +41,7 @@ pub use families::survival_location_scale_probit::{
     SurvivalLocationScaleProbitFitResult, SurvivalLocationScaleProbitPredictInput,
     SurvivalLocationScaleProbitPredictResult, SurvivalLocationScaleProbitSpec, TimeBlockInput,
     fit_survival_location_scale_probit, predict_survival_location_scale_probit,
+    predict_survival_location_scale_probit_posterior_mean,
 };
 pub use inference::alo::{
     AloDiagnostics, compute_alo_diagnostics, compute_alo_diagnostics_from_fit,

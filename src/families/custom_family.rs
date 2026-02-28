@@ -1836,8 +1836,19 @@ pub fn fit_custom_family<F: CustomFamily>(
     let rho_star = sol.final_point;
     let per_block = split_log_lambdas(&rho_star, &penalty_counts)?;
     let final_seed = warm_cache.lock().ok().and_then(|g| g.clone());
-    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, final_seed.as_ref())?;
-    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, final_seed.as_ref())
+        .map_err(|e| {
+            format!(
+                "outer smoothing optimization failed during final inner refit: {e}.{details}",
+                details = last_eval_error()
+            )
+        })?;
+    refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|e| {
+        format!(
+            "outer smoothing optimization failed during final eta refresh: {e}.{details}",
+            details = last_eval_error()
+        )
+    })?;
     let covariance_conditional =
         compute_joint_covariance(family, specs, &inner.block_states, &per_block, options).ok();
 
