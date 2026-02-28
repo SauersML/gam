@@ -1004,9 +1004,13 @@ pub struct JointEvalContext {
     cached_laml: Option<f64>,
     cached_rho: Array1<f64>,
     cached_edf: Option<f64>,
+    cached_edf_terms: Vec<(String, f64, f64)>,
     last_backfit_iterations: usize,
     last_converged: bool,
     eval_count: usize,
+    last_hessian_condition: Option<f64>,
+    last_outer_step_norm: Option<f64>,
+    last_eval_rho: Option<Array1<f64>>,
 }
 
 pub struct JointRemlState<'a> {
@@ -1028,8 +1032,12 @@ struct JointRemlSnapshot {
     cached_rho: Array1<f64>,
     cached_laml: Option<f64>,
     cached_edf: Option<f64>,
+    cached_edf_terms: Vec<(String, f64, f64)>,
     last_backfit_iterations: usize,
     last_converged: bool,
+    last_hessian_condition: Option<f64>,
+    last_outer_step_norm: Option<f64>,
+    last_eval_rho: Option<Array1<f64>>,
 }
 
 impl JointRemlSnapshot {
@@ -1049,8 +1057,12 @@ impl JointRemlSnapshot {
             cached_rho: reml.eval.cached_rho.clone(),
             cached_laml: reml.eval.cached_laml,
             cached_edf: reml.eval.cached_edf,
+            cached_edf_terms: reml.eval.cached_edf_terms.clone(),
             last_backfit_iterations: reml.eval.last_backfit_iterations,
             last_converged: reml.eval.last_converged,
+            last_hessian_condition: reml.eval.last_hessian_condition,
+            last_outer_step_norm: reml.eval.last_outer_step_norm,
+            last_eval_rho: reml.eval.last_eval_rho.clone(),
         }
     }
 
@@ -1069,8 +1081,12 @@ impl JointRemlSnapshot {
         reml.eval.cached_rho = self.cached_rho.clone();
         reml.eval.cached_laml = self.cached_laml;
         reml.eval.cached_edf = self.cached_edf;
+        reml.eval.cached_edf_terms = self.cached_edf_terms.clone();
         reml.eval.last_backfit_iterations = self.last_backfit_iterations;
         reml.eval.last_converged = self.last_converged;
+        reml.eval.last_hessian_condition = self.last_hessian_condition;
+        reml.eval.last_outer_step_norm = self.last_outer_step_norm;
+        reml.eval.last_eval_rho = self.last_eval_rho.clone();
     }
 }
 
@@ -1125,9 +1141,13 @@ impl<'a> JointRemlState<'a> {
                 cached_laml: None,
                 cached_rho: Array1::zeros(n_base + 1),
                 cached_edf: None,
+                cached_edf_terms: Vec::new(),
                 last_backfit_iterations: 0,
                 last_converged: false,
                 eval_count: 0,
+                last_hessian_condition: None,
+                last_outer_step_norm: None,
+                last_eval_rho: None,
             },
         }
     }
@@ -1944,6 +1964,17 @@ impl<'a> JointRemlState<'a> {
             })?;
         let h_max_eig = h_eigs.iter().cloned().fold(0.0_f64, f64::max);
         let h_tol = (h_max_eig * 1e-12).max(1e-100);
+        let mut h_min_pos = f64::INFINITY;
+        for &ev in &h_eigs {
+            if ev > h_tol {
+                h_min_pos = h_min_pos.min(ev);
+            }
+        }
+        if h_min_pos.is_finite() && h_min_pos > 0.0 {
+            self.eval.last_hessian_condition = Some((h_max_eig / h_min_pos).max(1.0));
+        } else {
+            self.eval.last_hessian_condition = None;
+        }
 
         // Check for severely ill-conditioned Hessian (too many negative eigenvalues)
         let n_positive = h_eigs.iter().filter(|&&ev| ev > h_tol).count();
@@ -2002,6 +2033,23 @@ impl<'a> JointRemlState<'a> {
             }
             diag_proj[i] = acc;
         }
+
+        // Block-level EDF split for live visualization: base predictor vs link wiggle.
+        let mut edf_base = 0.0_f64;
+        let mut edf_link = 0.0_f64;
+        for i in 0..n {
+            for j in 0..p_base {
+                edf_base += j_mat[[i, j]] * k_mat[[j, i]];
+            }
+            for j in 0..p_link {
+                let col = p_base + j;
+                edf_link += j_mat[[i, col]] * k_mat[[col, i]];
+            }
+        }
+        self.eval.cached_edf_terms = vec![
+            ("Base Predictor".to_string(), edf_base.max(0.0), p_base as f64),
+            ("Link Wiggle".to_string(), edf_link.max(0.0), p_link.max(1) as f64),
+        ];
 
         // Precompute H†_{theta,theta} for penalty sensitivity trace using pseudo-inverse
         let mut h_inv_theta = Array2::<f64>::zeros((p_link, p_link));
@@ -2644,16 +2692,27 @@ impl<'a> JointRemlState<'a> {
 
     /// Combined cost and gradient for outer optimization
     pub fn cost_and_grad(&mut self, rho: &Array1<f64>) -> (f64, Array1<f64>) {
+        self.eval.last_outer_step_norm = self.eval.last_eval_rho.as_ref().map(|prev| {
+            let mut sum = 0.0_f64;
+            for i in 0..rho.len().min(prev.len()) {
+                let d = rho[i] - prev[i];
+                sum += d * d;
+            }
+            sum.sqrt()
+        });
+        self.eval.last_eval_rho = Some(rho.clone());
         self.eval.eval_count += 1;
         let eval_num = self.eval.eval_count;
         let cost = match self.compute_cost(rho) {
             Ok(val) if val.is_finite() => val,
             Ok(_) => {
                 eprintln!("[JOINT][REML] Non-finite cost; returning large penalty.");
+                visualizer::push_diagnostic("warning: non-finite joint REML cost encountered");
                 return (f64::INFINITY, Array1::from_elem(rho.len(), f64::NAN));
             }
             Err(err) => {
                 eprintln!("[JOINT][REML] Cost evaluation failed: {err}");
+                visualizer::push_diagnostic(&format!("warning: cost evaluation failed: {err}"));
                 return (f64::INFINITY, Array1::from_elem(rho.len(), f64::NAN));
             }
         };
@@ -2661,11 +2720,35 @@ impl<'a> JointRemlState<'a> {
             Ok(grad) => grad,
             Err(err) => {
                 eprintln!("[JOINT][REML] Gradient evaluation failed: {err}");
+                visualizer::push_diagnostic(&format!("warning: gradient evaluation failed: {err}"));
                 Array1::from_elem(rho.len(), f64::NAN)
             }
         };
         let grad_norm = grad.dot(&grad).sqrt();
         visualizer::update(cost, grad_norm, "optimizing", eval_num as f64, "eval");
+        visualizer::set_edf_terms(&self.eval.cached_edf_terms);
+        visualizer::set_diagnostics(
+            self.eval.last_hessian_condition,
+            self.eval.last_outer_step_norm,
+            Some(self.core.state.ridge_used),
+        );
+        if !self.eval.last_converged {
+            visualizer::push_diagnostic(&format!(
+                "inner backfit not converged (iterations={})",
+                self.eval.last_backfit_iterations
+            ));
+        } else {
+            visualizer::push_diagnostic(&format!(
+                "inner backfit converged in {} iterations",
+                self.eval.last_backfit_iterations
+            ));
+        }
+        if self.core.state.ridge_used > 0.0 {
+            visualizer::push_diagnostic(&format!(
+                "stabilization ridge active: {:.3e}",
+                self.core.state.ridge_used
+            ));
+        }
         (cost, grad)
     }
 
@@ -2771,7 +2854,11 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
     config: &JointModelConfig,
     covariate_se: Option<Array1<f64>>,
 ) -> Result<JointModelResult, EstimationError> {
+    let _viz_guard = visualizer::init_guard(true);
     visualizer::set_stage("joint", "initializing");
+    if config.firth_bias_reduction && matches!(link, LinkFunction::Logit) {
+        visualizer::push_diagnostic("firth bias reduction enabled (separation protection)");
+    }
     let quad_ctx = QuadratureContext::new();
 
     // Create REML state

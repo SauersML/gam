@@ -22,6 +22,7 @@
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use self::reml::RemlState;
+use std::fmt;
 
 // Crate-level imports
 use crate::construction::{
@@ -565,6 +566,7 @@ pub struct ExternalOptimResult {
     pub beta_covariance_corrected: Option<Array2<f64>>,
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
+    pub reml_score: f64,
 }
 
 #[derive(Clone)]
@@ -945,6 +947,7 @@ where
         beta_standard_errors,
         beta_covariance_corrected,
         beta_standard_errors_corrected,
+        reml_score: outer_result.final_value,
     })
 }
 
@@ -989,6 +992,195 @@ pub struct FitResult {
     pub beta_covariance_corrected: Option<Array2<f64>>,
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
+    pub reml_score: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParametricTermSummary {
+    pub name: String,
+    pub estimate: f64,
+    pub std_error: Option<f64>,
+    pub z_value: Option<f64>,
+    pub p_value: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SmoothTermSummary {
+    pub name: String,
+    pub edf: f64,
+    pub ref_df: f64,
+    pub chi_sq: Option<f64>,
+    pub p_value: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelSummary {
+    pub family: String,
+    pub deviance_explained: Option<f64>,
+    pub reml_score: Option<f64>,
+    pub parametric_terms: Vec<ParametricTermSummary>,
+    pub smooth_terms: Vec<SmoothTermSummary>,
+}
+
+fn significance_stars(p: Option<f64>) -> &'static str {
+    match p {
+        Some(v) if v.is_finite() && v < 0.001 => "***",
+        Some(v) if v.is_finite() && v < 0.01 => "**",
+        Some(v) if v.is_finite() && v < 0.05 => "*",
+        Some(v) if v.is_finite() && v < 0.1 => ".",
+        _ => "",
+    }
+}
+
+fn format_p_value(p: Option<f64>) -> String {
+    let Some(v) = p else {
+        return "NA".to_string();
+    };
+    if !v.is_finite() {
+        return "NA".to_string();
+    }
+    if v < 2e-16 {
+        "< 2e-16".to_string()
+    } else if v < 1e-4 {
+        format!("{v:.2e}")
+    } else {
+        format!("{v:.4}")
+    }
+}
+
+impl fmt::Display for ModelSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let param_name_w = self
+            .parametric_terms
+            .iter()
+            .map(|t| t.name.len())
+            .max()
+            .unwrap_or(10)
+            .max("Term".len());
+        let smooth_name_w = self
+            .smooth_terms
+            .iter()
+            .map(|t| t.name.len())
+            .max()
+            .unwrap_or(10)
+            .max("Term".len());
+
+        writeln!(f, "Family: {}", self.family)?;
+        let dev_txt = self
+            .deviance_explained
+            .map(|d| format!("{:.1}%", (100.0 * d).clamp(-9999.0, 9999.0)))
+            .unwrap_or_else(|| "NA".to_string());
+        let reml_txt = self
+            .reml_score
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| "NA".to_string());
+        writeln!(
+            f,
+            "Deviance Explained: {dev_txt} | REML Score: {reml_txt}"
+        )?;
+        writeln!(f)?;
+
+        writeln!(f, "Parametric Terms:")?;
+        writeln!(
+            f,
+            "{:-<1$}",
+            "",
+            param_name_w + 59
+        )?;
+        writeln!(
+            f,
+            "{:<name_w$} {:>10} {:>12} {:>10} {:>19}",
+            "Term",
+            "Estimate",
+            "Standard Error",
+            "Z Statistic",
+            "Two-Sided P-Value",
+            name_w = param_name_w
+        )?;
+        writeln!(
+            f,
+            "{:-<1$}",
+            "",
+            param_name_w + 59
+        )?;
+        for term in &self.parametric_terms {
+            let estimate = format!("{:.4}", term.estimate);
+            let se = term
+                .std_error
+                .filter(|v| v.is_finite())
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "NA".to_string());
+            let z = term
+                .z_value
+                .filter(|v| v.is_finite())
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "NA".to_string());
+            let p = format_p_value(term.p_value);
+            let stars = significance_stars(term.p_value);
+            writeln!(
+                f,
+                "{:<name_w$} {:>10} {:>12} {:>10} {:>19} {}",
+                term.name,
+                estimate,
+                se,
+                z,
+                p,
+                stars,
+                name_w = param_name_w
+            )?;
+        }
+        writeln!(f)?;
+
+        writeln!(f, "Smooth Terms:")?;
+        writeln!(
+            f,
+            "{:-<1$}",
+            "",
+            smooth_name_w + 86
+        )?;
+        writeln!(
+            f,
+            "{:<name_w$} {:>26} {:>30} {:>12} {:>10}",
+            "Term",
+            "Effective Degrees of Freedom",
+            "Reference Degrees of Freedom",
+            "Chi-Square",
+            "P-Value",
+            name_w = smooth_name_w
+        )?;
+        writeln!(
+            f,
+            "{:-<1$}",
+            "",
+            smooth_name_w + 86
+        )?;
+        for term in &self.smooth_terms {
+            let chisq = term
+                .chi_sq
+                .filter(|v| v.is_finite())
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "NA".to_string());
+            let p = format_p_value(term.p_value);
+            let stars = significance_stars(term.p_value);
+            writeln!(
+                f,
+                "{:<name_w$} {:>26.2} {:>30.2} {:>12} {:>10} {}",
+                term.name,
+                term.edf,
+                term.ref_df,
+                chisq,
+                p,
+                stars,
+                name_w = smooth_name_w
+            )?;
+        }
+        writeln!(f)?;
+        write!(
+            f,
+            "Signif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1"
+        )?;
+        Ok(())
+    }
 }
 
 pub use crate::inference::predict::{
@@ -1126,6 +1318,7 @@ where
         beta_standard_errors: result.beta_standard_errors,
         beta_covariance_corrected: result.beta_covariance_corrected,
         beta_standard_errors_corrected: result.beta_standard_errors_corrected,
+        reml_score: result.reml_score,
     })
 }
 

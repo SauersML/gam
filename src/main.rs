@@ -14,7 +14,8 @@ use gam::basis::{
     build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
 };
 use gam::estimate::{
-    ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, fit_gam,
+    ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, ModelSummary,
+    ParametricTermSummary, SmoothTermSummary, fit_gam,
     optimize_external_design, predict_gam, predict_gam_posterior_mean,
 };
 use gam::gamlss::{
@@ -50,6 +51,7 @@ use gam::types::{LikelihoodFamily, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
+use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -347,6 +349,8 @@ struct SavedModel {
     beta: Vec<f64>,
     lambdas: Vec<f64>,
     scale: f64,
+    #[serde(default)]
+    reml_score: Option<f64>,
     covariance_conditional: Option<Vec<Vec<f64>>>,
     covariance_corrected: Option<Vec<Vec<f64>>>,
 }
@@ -784,6 +788,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     beta: joint.beta_base.to_vec(),
                     lambdas: joint.lambdas,
                     scale: 1.0,
+                    reml_score: None,
                     covariance_conditional: None,
                     covariance_corrected: None,
                 };
@@ -846,7 +851,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     let frozen_spec = freeze_term_collection_spec(&resolved_spec, &design)?;
 
-    print_fit_summary(&design, &fit, family);
+    print_fit_summary(&design, &fit, family, y.view(), weights.view());
 
     if let Some(out) = args.out {
         let model = SavedModel {
@@ -895,6 +900,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             beta: fit.beta.to_vec(),
             lambdas: fit.lambdas.to_vec(),
             scale: fit.scale,
+            reml_score: Some(fit.reml_score),
             covariance_conditional: fit.beta_covariance.as_ref().map(array2_to_nested_vec),
             covariance_corrected: fit
                 .beta_covariance_corrected
@@ -2998,6 +3004,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 beta: fit.beta_time.to_vec(),
                 lambdas,
                 scale: 1.0,
+                reml_score: None,
                 covariance_conditional: fit
                     .covariance_conditional
                     .as_ref()
@@ -3194,6 +3201,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             beta: beta.to_vec(),
             lambdas: penalty_blocks.iter().map(|b| b.lambda).collect(),
             scale: 1.0,
+            reml_score: None,
             covariance_conditional: cov.as_ref().map(array2_to_nested_vec),
             covariance_corrected: cov.as_ref().map(array2_to_nested_vec),
         };
@@ -3918,6 +3926,7 @@ fn build_location_scale_saved_model(
         beta,
         lambdas,
         scale: 1.0,
+        reml_score: None,
         covariance_conditional,
         covariance_corrected,
     }
@@ -5087,84 +5096,230 @@ fn load_joint_result(
     }))
 }
 
+fn pretty_family_name(f: LikelihoodFamily) -> &'static str {
+    match f {
+        LikelihoodFamily::GaussianIdentity => "Gaussian Identity",
+        LikelihoodFamily::BinomialLogit => "Binomial Logit",
+        LikelihoodFamily::BinomialProbit => "Binomial Probit",
+        LikelihoodFamily::BinomialCLogLog => "Binomial CLogLog",
+        LikelihoodFamily::RoystonParmar => "Royston Parmar",
+    }
+}
+
+fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
+    if !chi_sq.is_finite() || !df.is_finite() || chi_sq < 0.0 || df <= 0.0 {
+        return None;
+    }
+    let dist = ChiSquared::new(df.max(1e-8)).ok()?;
+    Some((1.0 - dist.cdf(chi_sq)).clamp(0.0, 1.0))
+}
+
+fn solve_symmetric_system(cov: &Array2<f64>, rhs: &FaerMat<f64>) -> Option<FaerMat<f64>> {
+    let cov_view = gam::faer_ndarray::FaerArrayView::new(cov);
+    if let Ok(f) = FaerLlt::new(cov_view.as_ref(), Side::Lower) {
+        return Some(f.solve(rhs.as_ref()));
+    }
+    if let Ok(f) = FaerLdlt::new(cov_view.as_ref(), Side::Lower) {
+        return Some(f.solve(rhs.as_ref()));
+    }
+    let f = FaerLblt::new(cov_view.as_ref(), Side::Lower);
+    Some(f.solve(rhs.as_ref()))
+}
+
+fn wald_quadratic_form(beta_block: ndarray::ArrayView1<'_, f64>, cov_block: &Array2<f64>) -> Option<f64> {
+    let k = beta_block.len();
+    if k == 0 || cov_block.nrows() != k || cov_block.ncols() != k {
+        return None;
+    }
+    let mut rhs = FaerMat::<f64>::zeros(k, 1);
+    for i in 0..k {
+        rhs[(i, 0)] = beta_block[i];
+    }
+
+    let mut ridge = 0.0_f64;
+    for _ in 0..5 {
+        let cov_eval = if ridge > 0.0 {
+            let mut reg = cov_block.clone();
+            for i in 0..k {
+                reg[[i, i]] += ridge;
+            }
+            reg
+        } else {
+            cov_block.clone()
+        };
+        if let Some(sol) = solve_symmetric_system(&cov_eval, &rhs) {
+            let mut q = 0.0_f64;
+            for i in 0..k {
+                q += beta_block[i] * sol[(i, 0)];
+            }
+            if q.is_finite() {
+                return Some(q.max(0.0));
+            }
+        }
+        ridge = if ridge == 0.0 { 1e-10 } else { ridge * 100.0 };
+    }
+    None
+}
+
+fn covariance_block(cov: &Array2<f64>, start: usize, end: usize) -> Option<Array2<f64>> {
+    if start >= end || end > cov.nrows() || end > cov.ncols() {
+        return None;
+    }
+    let k = end - start;
+    let mut out = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in 0..k {
+            out[[i, j]] = cov[[start + i, start + j]];
+        }
+    }
+    Some(out)
+}
+
+fn build_model_summary(
+    design: &gam::smooth::TermCollectionDesign,
+    fit: &FitResult,
+    family: LikelihoodFamily,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> ModelSummary {
+    let se = fit
+        .beta_standard_errors_corrected
+        .as_ref()
+        .or(fit.beta_standard_errors.as_ref());
+    let cov_for_wald = fit
+        .beta_covariance_corrected
+        .as_ref()
+        .or(fit.beta_covariance.as_ref());
+
+    let link = family_to_link(family);
+    let null_mu = match family {
+        LikelihoodFamily::GaussianIdentity => {
+            let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
+            let ybar = y
+                .iter()
+                .zip(weights.iter())
+                .map(|(&yy, &ww)| yy * ww)
+                .sum::<f64>()
+                / wsum;
+            Array1::from_elem(y.len(), ybar)
+        }
+        LikelihoodFamily::BinomialLogit
+        | LikelihoodFamily::BinomialProbit
+        | LikelihoodFamily::BinomialCLogLog => {
+            let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
+            let p = y
+                .iter()
+                .zip(weights.iter())
+                .map(|(&yy, &ww)| yy * ww)
+                .sum::<f64>()
+                / wsum;
+            Array1::from_elem(y.len(), p.clamp(1e-8, 1.0 - 1e-8))
+        }
+        LikelihoodFamily::RoystonParmar => Array1::from_elem(y.len(), 0.0),
+    };
+    let null_dev = gam::pirls::calculate_deviance(y, &null_mu, link, weights);
+    let deviance_explained = if null_dev.is_finite() && null_dev > 0.0 {
+        Some((1.0 - fit.artifacts.pirls.deviance / null_dev).clamp(-9.0, 1.0))
+    } else {
+        None
+    };
+
+    let mut parametric_terms = Vec::<ParametricTermSummary>::new();
+    let intercept_idx = design.intercept_range.start;
+    let intercept_beta = fit.beta.get(intercept_idx).copied().unwrap_or(0.0);
+    let intercept_se = se.and_then(|s| s.get(intercept_idx).copied());
+    let intercept_z = intercept_se.and_then(|s| (s > 0.0).then_some(intercept_beta / s));
+    let intercept_p = intercept_z.map(|z| 2.0 * (1.0 - normal_cdf_approx(z.abs()))).map(|p| p.clamp(0.0, 1.0));
+    parametric_terms.push(ParametricTermSummary {
+        name: "Intercept".to_string(),
+        estimate: intercept_beta,
+        std_error: intercept_se,
+        z_value: intercept_z,
+        p_value: intercept_p,
+    });
+    for (name, range) in &design.linear_ranges {
+        for idx in range.start..range.end {
+            let beta = fit.beta.get(idx).copied().unwrap_or(0.0);
+            let se_i = se.and_then(|s| s.get(idx).copied());
+            let z = se_i.and_then(|s| (s > 0.0).then_some(beta / s));
+            let p = z.map(|zz| 2.0 * (1.0 - normal_cdf_approx(zz.abs()))).map(|v| v.clamp(0.0, 1.0));
+            let label = if range.end - range.start > 1 {
+                format!("{name}[{}]", idx - range.start)
+            } else {
+                name.clone()
+            };
+            parametric_terms.push(ParametricTermSummary {
+                name: label,
+                estimate: beta,
+                std_error: se_i,
+                z_value: z,
+                p_value: p,
+            });
+        }
+    }
+
+    let mut smooth_terms = Vec::<SmoothTermSummary>::new();
+    let mut penalty_cursor = 0usize;
+    for (name, range) in &design.random_effect_ranges {
+        let edf = fit.edf_by_block.get(penalty_cursor).copied().unwrap_or(0.0);
+        penalty_cursor += 1;
+        let chi_sq_opt = cov_for_wald.and_then(|cov| {
+            let beta_block = fit.beta.slice(s![range.start..range.end]);
+            let cov_block = covariance_block(cov, range.start, range.end)?;
+            wald_quadratic_form(beta_block, &cov_block)
+        });
+        let ref_df = (range.end - range.start).max(1) as f64;
+        let p_value = chi_sq_opt.and_then(|x| chi_square_survival_approx(x, ref_df));
+        smooth_terms.push(SmoothTermSummary {
+            name: name.clone(),
+            edf,
+            ref_df,
+            chi_sq: chi_sq_opt,
+            p_value,
+        });
+    }
+    for term in &design.smooth.terms {
+        let k = term.penalties_local.len();
+        let edf = fit.edf_by_block[penalty_cursor..penalty_cursor + k]
+            .iter()
+            .sum::<f64>();
+        penalty_cursor += k;
+        let chi_sq_opt = cov_for_wald.and_then(|cov| {
+            let beta_block = fit
+                .beta
+                .slice(s![term.coeff_range.start..term.coeff_range.end]);
+            let cov_block = covariance_block(cov, term.coeff_range.start, term.coeff_range.end)?;
+            wald_quadratic_form(beta_block, &cov_block)
+        });
+        let ref_df = (term.coeff_range.end - term.coeff_range.start).max(1) as f64;
+        let p_value = chi_sq_opt.and_then(|x| chi_square_survival_approx(x, ref_df));
+        smooth_terms.push(SmoothTermSummary {
+            name: term.name.clone(),
+            edf,
+            ref_df,
+            chi_sq: chi_sq_opt,
+            p_value,
+        });
+    }
+
+    ModelSummary {
+        family: pretty_family_name(family).to_string(),
+        deviance_explained,
+        reml_score: Some(fit.reml_score),
+        parametric_terms,
+        smooth_terms,
+    }
+}
+
 fn print_fit_summary(
     design: &gam::smooth::TermCollectionDesign,
     fit: &gam::estimate::FitResult,
     family: LikelihoodFamily,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
 ) {
-    println!(
-        "model fit complete | family={} | iter={} | edf_total={:.4} | scale={:.6}",
-        family_to_string(family),
-        fit.iterations,
-        fit.edf_total,
-        fit.scale
-    );
-
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["Term", "Type", "Columns", "EDF", "Lambda"]);
-
-    table.add_row(Row::from(vec![
-        Cell::new("(Intercept)"),
-        Cell::new("Linear"),
-        Cell::new(1),
-        Cell::new("1.00"),
-        Cell::new("-"),
-    ]));
-
-    for (name, range) in &design.linear_ranges {
-        table.add_row(Row::from(vec![
-            Cell::new(name),
-            Cell::new("Linear"),
-            Cell::new(range.end - range.start),
-            Cell::new("1.00"),
-            Cell::new("-"),
-        ]));
-    }
-
-    let mut penalty_cursor = 0usize;
-    for (name, _range) in &design.random_effect_ranges {
-        let lam = fit
-            .lambdas
-            .get(penalty_cursor)
-            .copied()
-            .map(|v| format!("{v:.4e}"))
-            .unwrap_or_else(|| "-".to_string());
-        let edf = fit.edf_by_block.get(penalty_cursor).copied().unwrap_or(0.0);
-        penalty_cursor += 1;
-        table.add_row(Row::from(vec![
-            Cell::new(name),
-            Cell::new("Rand Effect"),
-            Cell::new("varies"),
-            Cell::new(format!("{edf:.2}")),
-            Cell::new(lam),
-        ]));
-    }
-
-    for term in &design.smooth.terms {
-        let k = term.penalties_local.len();
-        let lam_slice = fit.lambdas.slice(s![penalty_cursor..penalty_cursor + k]);
-        let edf_slice = &fit.edf_by_block[penalty_cursor..penalty_cursor + k];
-        let lam_text = lam_slice
-            .iter()
-            .map(|v| format!("{v:.3e}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let edf = edf_slice.iter().sum::<f64>();
-        penalty_cursor += k;
-
-        table.add_row(Row::from(vec![
-            Cell::new(&term.name),
-            Cell::new("Smooth"),
-            Cell::new(term.coeff_range.end - term.coeff_range.start),
-            Cell::new(format!("{edf:.2}")),
-            Cell::new(lam_text),
-        ]));
-    }
-
-    println!("{table}");
+    let summary = build_model_summary(design, fit, family, y, weights);
+    println!("{summary}");
 }
 
 fn array2_to_nested_vec(a: &Array2<f64>) -> Vec<Vec<f64>> {
@@ -5378,6 +5533,7 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
         beta_standard_errors: ext.beta_standard_errors,
         beta_covariance_corrected: ext.beta_covariance_corrected,
         beta_standard_errors_corrected: ext.beta_standard_errors_corrected,
+        reml_score: ext.reml_score,
     }
 }
 
@@ -5527,7 +5683,8 @@ fn write_survival_prediction_csv(
 #[cfg(test)]
 mod tests {
     use super::{
-        SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
+        LikelihoodFamily, SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
+        chi_square_survival_approx, pretty_family_name,
         parse_survival_time_basis_config, survival_probability_from_eta,
         write_survival_prediction_csv,
     };
@@ -5609,6 +5766,24 @@ mod tests {
         let c_surv_on_surv = cindex_uncensored_survival(&time, &surv);
         assert!(c_surv_on_neg_eta > 0.99);
         assert!(c_surv_on_surv > 0.99);
+    }
+
+    #[test]
+    fn chi_square_tail_probability_is_monotone_in_statistic() {
+        let p_small = chi_square_survival_approx(0.5, 4.0).expect("p_small");
+        let p_large = chi_square_survival_approx(12.0, 4.0).expect("p_large");
+        assert!(p_large < p_small);
+        assert!(p_small <= 1.0 && p_small >= 0.0);
+        assert!(p_large <= 1.0 && p_large >= 0.0);
+    }
+
+    #[test]
+    fn pretty_family_names_are_human_readable() {
+        assert_eq!(pretty_family_name(LikelihoodFamily::BinomialLogit), "Binomial Logit");
+        assert_eq!(
+            pretty_family_name(LikelihoodFamily::GaussianIdentity),
+            "Gaussian Identity"
+        );
     }
 
     #[test]

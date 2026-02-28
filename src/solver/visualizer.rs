@@ -3,7 +3,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
 use std::io::{self, IsTerminal, Stdout};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -51,15 +51,17 @@ pub struct OptimizationVisualizer {
     progress_label: String,
     progress_current: usize,
     progress_total: Option<usize>,
+    edf_terms: Vec<(String, f64, f64)>,
+    diagnostics_lines: Vec<String>,
+    diagnostics_condition: Option<f64>,
+    diagnostics_step_size: Option<f64>,
+    diagnostics_ridge: Option<f64>,
 }
 
 impl OptimizationVisualizer {
     fn new() -> io::Result<Self> {
         if !io::stdout().is_terminal() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "stdout is not a terminal",
-            ));
+            return Err(io::Error::other("stdout is not a terminal"));
         }
 
         enable_raw_mode()?;
@@ -78,14 +80,19 @@ impl OptimizationVisualizer {
             best_cost: f64::INFINITY,
             current_status: "Initializing...".to_string(),
             current_stage: "init".to_string(),
-            current_detail: "".to_string(),
-            current_eval_state: "".to_string(),
+            current_detail: String::new(),
+            current_eval_state: String::new(),
             current_cost: f64::NAN,
             current_grad: f64::NAN,
             last_draw: Instant::now(),
-            progress_label: "".to_string(),
+            progress_label: String::new(),
             progress_current: 0,
             progress_total: None,
+            edf_terms: Vec::new(),
+            diagnostics_lines: Vec::new(),
+            diagnostics_condition: None,
+            diagnostics_step_size: None,
+            diagnostics_ridge: None,
         })
     }
 
@@ -105,12 +112,21 @@ impl OptimizationVisualizer {
         let progress_label = self.progress_label.clone();
         let progress_current = self.progress_current;
         let progress_total = self.progress_total;
+        let edf_terms = self.edf_terms.clone();
+        let diagnostics_lines = self.diagnostics_lines.clone();
+        let diagnostics_condition = self.diagnostics_condition;
+        let diagnostics_step_size = self.diagnostics_step_size;
+        let diagnostics_ridge = self.diagnostics_ridge;
 
         self.terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
                 .split(f.area());
+            let top_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+                .split(chunks[0]);
 
             let (min_y, max_y) = if cost_accepted.is_empty() && cost_trial.is_empty() {
                 (0.0, 1.0)
@@ -145,10 +161,14 @@ impl OptimizationVisualizer {
             ];
 
             let chart = Chart::new(datasets)
-                .block(Block::default().title("Optimization Trajectory").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title("Objective (LAML/REML)")
+                        .borders(Borders::ALL),
+                )
                 .x_axis(
                     Axis::default()
-                        .title("Iterations")
+                        .title("Outer Iteration")
                         .bounds([0.0, iter.max(10.0)])
                         .labels(vec![
                             Line::from("0"),
@@ -157,88 +177,120 @@ impl OptimizationVisualizer {
                 )
                 .y_axis(
                     Axis::default()
-                        .title("Cost")
+                        .title("Objective Value")
                         .bounds([min_y - window * 0.1, max_y + window * 0.1])
                         .labels(vec![
                             Line::from(format!("{:.2}", min_y)),
                             Line::from(format!("{:.2}", max_y)),
                         ]),
                 );
-            f.render_widget(chart, chunks[0]);
+            f.render_widget(chart, top_chunks[0]);
 
-            let bottom_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .split(chunks[1]);
+            let mut model_lines = Vec::<String>::new();
+            model_lines.push(format!("Stage: {stage}"));
+            model_lines.push(format!("Detail: {detail}"));
+            model_lines.push(format!("Evaluation: {:.0} {eval_state}", iter));
+            model_lines.push(format!("Status: {status}"));
+            model_lines.push(format!("Best Objective: {:.6}", best));
+            model_lines.push(format!("Current Objective: {:.6}", current_cost));
+            model_lines.push(format!("Gradient Norm: {:.3e}", current_grad));
+            model_lines.push(format!("Elapsed Time: {elapsed}s"));
+            model_lines.push(String::new());
+            model_lines.push("Effective Degrees of Freedom by Term".to_string());
 
-            let left_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                .split(bottom_chunks[0]);
-
-            let info_text = format!(
-                "Stage: {}\nDetail: {}\nEval: {:.0} {}\nStatus: {}\nBest Cost: {:.6}\nCurrent Cost: {:.6}\nGrad Norm: {:.3e}\nElapsed: {}s\n\nPress Ctrl+C to abort",
-                stage,
-                detail,
-                iter,
-                eval_state,
-                status,
-                best,
-                current_cost,
-                current_grad,
-                elapsed
-            );
-            let info = Paragraph::new(info_text)
-                .block(Block::default().title("Statistics").borders(Borders::ALL))
-                .style(Style::default().fg(Color::White));
-            f.render_widget(info, left_chunks[0]);
-
-            if let Some(total) = progress_total {
-                let ratio = if total == 0 {
-                    0.0
-                } else {
-                    (progress_current as f64 / total as f64).clamp(0.0, 1.0)
-                };
-                let label = format!("{}: {}/{}", progress_label, progress_current, total);
-                let gauge = Gauge::default()
-                    .block(Block::default().title("Progress").borders(Borders::ALL))
-                    .gauge_style(Style::default().fg(Color::Green))
-                    .ratio(ratio)
-                    .label(label);
-                f.render_widget(gauge, left_chunks[1]);
+            if edf_terms.is_empty() {
+                model_lines.push("  (awaiting EDF updates...)".to_string());
             } else {
-                let label = if progress_label.is_empty() {
-                    "Progress: --".to_string()
-                } else {
-                    format!("Progress: {} ({})", progress_label, progress_current)
-                };
-                let progress = Paragraph::new(label)
-                    .block(Block::default().title("Progress").borders(Borders::ALL))
-                    .style(Style::default().fg(Color::DarkGray));
-                f.render_widget(progress, left_chunks[1]);
+                let name_w = edf_terms
+                    .iter()
+                    .map(|(name, _, _)| name.len())
+                    .max()
+                    .unwrap_or(8)
+                    .max(8);
+                for (name, edf, ref_df) in edf_terms {
+                    let ratio = if ref_df > 0.0 {
+                        (edf / ref_df).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let filled = (ratio * 20.0).round() as usize;
+                    let bar = format!(
+                        "{}{}",
+                        "█".repeat(filled),
+                        "·".repeat(20usize.saturating_sub(filled))
+                    );
+                    model_lines.push(format!(
+                        "{:<name_w$} {:>6.2} / {:>6.2}  {}",
+                        name,
+                        edf,
+                        ref_df,
+                        bar,
+                        name_w = name_w
+                    ));
+                }
             }
 
-            let max_g = grad_data
-                .iter()
-                .map(|(_, y)| *y)
-                .fold(0.0, f64::max);
-            let grad_sets = vec![Dataset::default()
-                .name("log10(|grad|)")
-                .marker(symbols::Marker::Dot)
-                .style(Style::default().fg(Color::Yellow))
-                .data(&grad_data)];
-            let grad_chart = Chart::new(grad_sets)
-                .block(Block::default().title("Convergence (log10 |grad|)").borders(Borders::ALL))
-                .x_axis(Axis::default().bounds([0.0, iter.max(10.0)]))
-                .y_axis(
-                    Axis::default()
-                        .bounds([max_g.min(0.0) - 0.5, max_g.max(0.0) + 0.5])
-                        .labels(vec![
-                            Line::from(format!("{:.1}", max_g.min(0.0))),
-                            Line::from(format!("{:.1}", max_g.max(0.0))),
-                        ]),
-                );
-            f.render_widget(grad_chart, bottom_chunks[1]);
+            if let Some(total) = progress_total {
+                model_lines.push(String::new());
+                model_lines.push(format!(
+                    "Progress: {} {}/{}",
+                    progress_label, progress_current, total
+                ));
+            } else if !progress_label.is_empty() {
+                model_lines.push(String::new());
+                model_lines.push(format!("Progress: {} ({})", progress_label, progress_current));
+            }
+
+            let model_panel = Paragraph::new(model_lines.join("\n"))
+                .block(
+                    Block::default()
+                        .title("Model Complexity")
+                        .borders(Borders::ALL),
+                )
+                .style(Style::default().fg(Color::White))
+                .wrap(Wrap { trim: true });
+            f.render_widget(model_panel, top_chunks[1]);
+
+            let mut diagnostics = Vec::<String>::new();
+            diagnostics.push(format!(
+                "Condition Number: {}",
+                diagnostics_condition
+                    .map(|v| format!("{v:.3e}"))
+                    .unwrap_or_else(|| "n/a".to_string())
+            ));
+            diagnostics.push(format!(
+                "Step Size (norm delta rho): {}",
+                diagnostics_step_size
+                    .map(|v| format!("{v:.3e}"))
+                    .unwrap_or_else(|| "n/a".to_string())
+            ));
+            diagnostics.push(format!(
+                "Stabilization Ridge: {}",
+                diagnostics_ridge
+                    .map(|v| format!("{v:.3e}"))
+                    .unwrap_or_else(|| "n/a".to_string())
+            ));
+            diagnostics.push(format!(
+                "Convergence Signal (log10|gradient|): {:.3}",
+                grad_data.last().map(|(_, y)| *y).unwrap_or(0.0)
+            ));
+            diagnostics.push(String::new());
+            diagnostics.push("Recent Diagnostics and Warnings:".to_string());
+            if diagnostics_lines.is_empty() {
+                diagnostics.push("  (no diagnostics yet)".to_string());
+            } else {
+                for line in diagnostics_lines {
+                    diagnostics.push(format!("  {line}"));
+                }
+            }
+            diagnostics.push(String::new());
+            diagnostics.push("Press Ctrl+C to abort".to_string());
+
+            let diagnostics_panel = Paragraph::new(diagnostics.join("\n"))
+                .block(Block::default().title("Diagnostics").borders(Borders::ALL))
+                .style(Style::default().fg(Color::White))
+                .wrap(Wrap { trim: true });
+            f.render_widget(diagnostics_panel, chunks[1]);
         })?;
         Ok(())
     }
@@ -310,6 +362,46 @@ pub fn set_progress(label: &str, current: usize, total: Option<usize>) {
         vis.progress_label = label.to_string();
         vis.progress_current = current;
         vis.progress_total = total;
+        if vis.last_draw.elapsed() >= Duration::from_millis(40) {
+            let _ = vis.draw();
+            vis.last_draw = Instant::now();
+        }
+    }
+}
+
+pub fn set_edf_terms(terms: &[(String, f64, f64)]) {
+    let mut guard = VISUALIZER.lock().unwrap();
+    if let Some(vis) = guard.as_mut() {
+        vis.edf_terms = terms.to_vec();
+        if vis.last_draw.elapsed() >= Duration::from_millis(40) {
+            let _ = vis.draw();
+            vis.last_draw = Instant::now();
+        }
+    }
+}
+
+pub fn set_diagnostics(condition_number: Option<f64>, step_size: Option<f64>, ridge: Option<f64>) {
+    let mut guard = VISUALIZER.lock().unwrap();
+    if let Some(vis) = guard.as_mut() {
+        vis.diagnostics_condition = condition_number;
+        vis.diagnostics_step_size = step_size;
+        vis.diagnostics_ridge = ridge;
+        if vis.last_draw.elapsed() >= Duration::from_millis(40) {
+            let _ = vis.draw();
+            vis.last_draw = Instant::now();
+        }
+    }
+}
+
+pub fn push_diagnostic(message: &str) {
+    let mut guard = VISUALIZER.lock().unwrap();
+    if let Some(vis) = guard.as_mut() {
+        vis.diagnostics_lines.push(message.to_string());
+        const MAX_LINES: usize = 10;
+        if vis.diagnostics_lines.len() > MAX_LINES {
+            let overflow = vis.diagnostics_lines.len() - MAX_LINES;
+            vis.diagnostics_lines.drain(0..overflow);
+        }
         if vis.last_draw.elapsed() >= Duration::from_millis(40) {
             let _ = vis.draw();
             vis.last_draw = Instant::now();
