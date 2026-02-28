@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover
 DEFAULT_WORKFLOW = "benchmark.yml"
 DEFAULT_OUT = Path("scripts/latest_benchmark_summary.md")
 DEFAULT_LOCAL_TZ = "America/Chicago"
+DEFAULT_RUN_SCAN_LIMIT = 20
 
 
 def run_cmd(args: list[str], *, capture: bool = True) -> subprocess.CompletedProcess:
@@ -52,13 +53,15 @@ def parse_owner_repo() -> tuple[str, str]:
     return owner, name
 
 
-def get_latest_workflow_run(owner: str, repo: str, workflow: str) -> dict[str, Any]:
-    path = f"/repos/{owner}/{repo}/actions/workflows/{workflow}/runs?per_page=1"
+def get_recent_workflow_runs(
+    owner: str, repo: str, workflow: str, *, limit: int = DEFAULT_RUN_SCAN_LIMIT
+) -> list[dict[str, Any]]:
+    path = f"/repos/{owner}/{repo}/actions/workflows/{workflow}/runs?per_page={limit}"
     payload = gh_api_json(path)
     runs = payload.get("workflow_runs", [])
     if not runs:
         raise RuntimeError(f"no runs found for workflow '{workflow}'")
-    return runs[0]
+    return list(runs)
 
 
 def list_artifacts(owner: str, repo: str, run_id: int) -> list[dict[str, Any]]:
@@ -213,16 +216,7 @@ def render_scenario_block(name: str, rows: list[dict[str, Any]], run_ts_utc: dat
     return "\n".join(out)
 
 
-def main() -> int:
-    owner, repo = parse_owner_repo()
-    run = get_latest_workflow_run(owner, repo, DEFAULT_WORKFLOW)
-    run_id = int(run["id"])
-
-    created_at = datetime.fromisoformat(str(run["created_at"]).replace("Z", "+00:00")).astimezone(timezone.utc)
-    run_url = run.get("html_url", "")
-    run_status = run.get("status", "")
-    run_conclusion = run.get("conclusion", "")
-
+def load_rows_from_run(owner: str, repo: str, run_id: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     artifacts = list_artifacts(owner, repo, run_id)
     shard_artifacts = [
         a
@@ -257,6 +251,38 @@ def main() -> int:
             except Exception:
                 continue
 
+    return rows, shard_artifacts
+
+
+def main() -> int:
+    owner, repo = parse_owner_repo()
+    selected_run: dict[str, Any] | None = None
+    rows: list[dict[str, Any]] = []
+    shard_artifacts: list[dict[str, Any]] = []
+    runs = get_recent_workflow_runs(owner, repo, DEFAULT_WORKFLOW, limit=DEFAULT_RUN_SCAN_LIMIT)
+    for run in runs:
+        run_id = int(run["id"])
+        candidate_rows, candidate_artifacts = load_rows_from_run(owner, repo, run_id)
+        if candidate_rows:
+            selected_run = run
+            rows = candidate_rows
+            shard_artifacts = candidate_artifacts
+            break
+
+    if selected_run is None:
+        selected_run = runs[0]
+        run_id = int(selected_run["id"])
+        rows, shard_artifacts = load_rows_from_run(owner, repo, run_id)
+    else:
+        run_id = int(selected_run["id"])
+
+    created_at = datetime.fromisoformat(str(selected_run["created_at"]).replace("Z", "+00:00")).astimezone(
+        timezone.utc
+    )
+    run_url = selected_run.get("html_url", "")
+    run_status = selected_run.get("status", "")
+    run_conclusion = selected_run.get("conclusion", "")
+
     by_scenario: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         sn = str(r.get("scenario_name", "")).strip()
@@ -264,7 +290,7 @@ def main() -> int:
             by_scenario[sn].append(r)
 
     md: list[str] = []
-    md.append("# Latest Benchmark Run (Partial)\n")
+    md.append("# Latest Benchmark Run With Data (Partial)\n")
     md.append(f"- Workflow: `{DEFAULT_WORKFLOW}`")
     md.append(f"- Run ID: `{run_id}`")
     md.append(f"- Status: `{run_status}`")
