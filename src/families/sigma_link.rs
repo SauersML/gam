@@ -116,7 +116,7 @@ mod tests {
 
         for file in files {
             // Skip this guard file because it intentionally contains these literals.
-            if file.ends_with("sigma_link.rs") {
+            if file.ends_with("families/sigma_link.rs") {
                 continue;
             }
             let Ok(content) = fs::read_to_string(&file) else {

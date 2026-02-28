@@ -193,6 +193,7 @@ TRUSTED_REFERENCE_JSON = {
         [],
         []
     ],
+    "offsets": [
         0.0,
         0.0,
         0.0,

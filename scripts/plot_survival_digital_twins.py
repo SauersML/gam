@@ -12,7 +12,6 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib import cm
 from matplotlib.colors import LinearSegmentedColormap
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -311,13 +310,6 @@ def _zscore_by_train(df: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.Data
         out[c] = (out[c] - mu) / sd
         stats[c] = (mu, sd)
     return out, stats
-
-
-def _apply_zscore(df: pd.DataFrame, stats: dict[str, tuple[float, float]]) -> pd.DataFrame:
-    out = df.copy()
-    for c, (mu, sd) in stats.items():
-        out[c] = (out[c] - mu) / sd
-    return out
 
 
 def _fit_survival_model(

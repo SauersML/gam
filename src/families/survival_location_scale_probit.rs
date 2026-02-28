@@ -6,7 +6,7 @@ use crate::faer_ndarray::FaerSvd;
 use crate::matrix::DesignMatrix;
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf_approx, normal_pdf};
-use crate::sigma_link::bounded_sigma_derivs_up_to_third;
+use crate::families::sigma_link::bounded_sigma_derivs_up_to_third;
 use ndarray::{Array1, Array2, s};
 
 const MIN_PROB: f64 = 1e-12;

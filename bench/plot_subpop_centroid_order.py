@@ -70,9 +70,9 @@ def best_order(d: np.ndarray) -> np.ndarray:
     for s in range(n):
         p0 = nearest_neighbor_path(d, s)
         p1 = two_opt_open(p0, d)
-        l = path_length(p1, d)
-        if l < best_len:
-            best_len = l
+        path_len = path_length(p1, d)
+        if path_len < best_len:
+            best_len = path_len
             best = p1
     assert best is not None
     return best
