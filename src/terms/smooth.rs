@@ -2183,7 +2183,7 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
     let n = data.nrows();
     if !(y.len() == n && weights.len() == n && offset.len() == n) {
         return Err(EstimationError::InvalidInput(format!(
-            "fit_term_collection_with_matern_kappa_optimization row mismatch: n={}, y={}, weights={}, offset={}",
+            "fit_term_collection_with_spatial_length_scale_optimization row mismatch: n={}, y={}, weights={}, offset={}",
             n,
             y.len(),
             weights.len(),
@@ -3207,7 +3207,7 @@ mod tests {
     }
 
     #[test]
-    fn matern_kappa_optimization_monotone_improves_or_keeps_score() {
+    fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern() {
         let n = 60usize;
         let d = 3usize;
         let mut data = Array2::<f64>::zeros((n, d));
@@ -3262,7 +3262,7 @@ mod tests {
         .expect("baseline fit should succeed");
         let baseline_score = fit_score(&baseline.fit);
 
-        let optimized = fit_term_collection_with_matern_kappa_optimization(
+        let optimized = fit_term_collection_with_spatial_length_scale_optimization(
             data.view(),
             y.clone(),
             weights.clone(),
@@ -3270,7 +3270,7 @@ mod tests {
             &spec,
             LikelihoodFamily::GaussianIdentity,
             &fit_opts,
-            &MaternKappaOptimizationOptions {
+            &SpatialLengthScaleOptimizationOptions {
                 enabled: true,
                 max_outer_iter: 2,
                 rel_tol: 1e-5,
@@ -3305,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn optimize_two_block_matern_kappa_freezes_matern_centers() {
+    fn optimize_two_block_spatial_length_scale_freezes_matern_centers() {
         let n = 40usize;
         let mut data = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
@@ -3342,11 +3342,11 @@ mod tests {
             smooth_terms: vec![matern_term("noise_matern", 1.1)],
         };
 
-        let solved = optimize_two_block_matern_kappa(
+        let solved = optimize_two_block_spatial_length_scale(
             data.view(),
             &mean_spec,
             &noise_spec,
-            &MaternKappaOptimizationOptions {
+            &SpatialLengthScaleOptimizationOptions {
                 enabled: true,
                 max_outer_iter: 1,
                 rel_tol: 1e-6,
@@ -3379,6 +3379,181 @@ mod tests {
                     ));
                 }
                 _ => panic!("expected Matérn term"),
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_duchon() {
+        let n = 60usize;
+        let d = 2usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (i as f64 * 0.17).sin();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+            y[i] = (3.0 * x0).cos() + 0.35 * x1;
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                        length_scale: 12.0,
+                        nu: MaternNu::FiveHalves,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            max_iter: 40,
+            tol: 1e-6,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+        };
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+
+        let baseline = fit_term_collection_for_spec(
+            data.view(),
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &fit_opts,
+        )
+        .expect("baseline fit should succeed");
+        let baseline_score = fit_score(&baseline.fit);
+
+        let optimized = fit_term_collection_with_spatial_length_scale_optimization(
+            data.view(),
+            y.clone(),
+            weights.clone(),
+            offset.clone(),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &fit_opts,
+            &SpatialLengthScaleOptimizationOptions {
+                enabled: true,
+                max_outer_iter: 2,
+                rel_tol: 1e-5,
+                log_step: std::f64::consts::LN_2,
+                min_length_scale: 1e-3,
+                max_length_scale: 1e3,
+            },
+        )
+        .expect("optimized fit should succeed");
+        let optimized_score = fit_score(&optimized.fit);
+        assert!(optimized_score <= baseline_score + 1e-10);
+
+        let ls = match &optimized.resolved_spec.smooth_terms[0].basis {
+            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale,
+            _ => panic!("expected Duchon term"),
+        };
+        assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
+
+        match &optimized.resolved_spec.smooth_terms[0].basis {
+            SmoothBasisSpec::Duchon { spec, .. } => {
+                assert!(matches!(
+                    spec.center_strategy,
+                    CenterStrategy::UserProvided(_)
+                ));
+                assert!(matches!(
+                    spec.identifiability,
+                    SpatialIdentifiability::FrozenTransform { .. }
+                ));
+            }
+            _ => panic!("expected Duchon term"),
+        }
+    }
+
+    #[test]
+    fn optimize_two_block_spatial_length_scale_freezes_duchon_centers() {
+        let n = 40usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (i as f64 * 0.19).cos();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+        }
+
+        let duchon_term = |name: &str, length_scale: f64| SmoothTermSpec {
+            name: name.to_string(),
+            basis: SmoothBasisSpec::Duchon {
+                feature_cols: vec![0, 1],
+                spec: DuchonBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    length_scale,
+                    nu: MaternNu::FiveHalves,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    double_penalty: true,
+                    identifiability: SpatialIdentifiability::default(),
+                },
+            },
+            shape: ShapeConstraint::None,
+        };
+
+        let mean_spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![duchon_term("mean_duchon", 0.8)],
+        };
+        let noise_spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![duchon_term("noise_duchon", 1.1)],
+        };
+
+        let solved = optimize_two_block_spatial_length_scale(
+            data.view(),
+            &mean_spec,
+            &noise_spec,
+            &SpatialLengthScaleOptimizationOptions {
+                enabled: true,
+                max_outer_iter: 1,
+                rel_tol: 1e-6,
+                log_step: std::f64::consts::LN_2,
+                min_length_scale: 1e-3,
+                max_length_scale: 1e3,
+            },
+            |mean_design, noise_design| {
+                Ok(
+                    mean_design.design.ncols() as f64
+                        + noise_design.design.ncols() as f64
+                        + mean_design.penalties.len() as f64
+                        + noise_design.penalties.len() as f64,
+                )
+            },
+            |score| *score,
+        )
+        .expect("two-block spatial length-scale optimization should succeed");
+
+        for resolved in [&solved.resolved_mean_spec, &solved.resolved_noise_spec] {
+            match &resolved.smooth_terms[0].basis {
+                SmoothBasisSpec::Duchon { spec, .. } => {
+                    assert!(matches!(
+                        spec.center_strategy,
+                        CenterStrategy::UserProvided(_)
+                    ));
+                    assert!(matches!(
+                        spec.identifiability,
+                        SpatialIdentifiability::FrozenTransform { .. }
+                    ));
+                }
+                _ => panic!("expected Duchon term"),
             }
         }
     }
