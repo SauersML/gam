@@ -21,7 +21,7 @@ use faer::Side;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, s};
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
@@ -956,13 +956,15 @@ pub fn fit_gaussian_location_scale_terms(
     let weights = spec.weights;
     let sigma_min = spec.sigma_min;
     let sigma_max = spec.sigma_max;
+    let mut mean_log_lambda_hint: Option<Array1<f64>> = None;
+    let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
     let solved = optimize_two_block_matern_kappa(
         data,
         &spec.mean_spec,
         &spec.log_sigma_spec,
         kappa_options,
         |mean_design, noise_design| {
-            fit_gaussian_location_scale(
+            let fit = fit_gaussian_location_scale(
                 GaussianLocationScaleSpec {
                     y: y.clone(),
                     weights: weights.clone(),
@@ -972,19 +974,30 @@ pub fn fit_gaussian_location_scale_terms(
                         design: DesignMatrix::Dense(mean_design.design.clone()),
                         offset: Array1::zeros(y.len()),
                         penalties: mean_design.penalties.clone(),
-                        initial_log_lambdas: None,
+                        initial_log_lambdas: mean_log_lambda_hint.clone(),
                         initial_beta: None,
                     },
                     log_sigma_block: ParameterBlockInput {
                         design: DesignMatrix::Dense(noise_design.design.clone()),
                         offset: Array1::zeros(y.len()),
                         penalties: noise_design.penalties.clone(),
-                        initial_log_lambdas: None,
+                        initial_log_lambdas: noise_log_lambda_hint.clone(),
                         initial_beta: None,
                     },
                 },
                 options,
-            )
+            )?;
+            let k_mean = mean_design.penalties.len();
+            let k_noise = noise_design.penalties.len();
+            if fit.log_lambdas.len() >= k_mean + k_noise {
+                mean_log_lambda_hint = Some(fit.log_lambdas.slice(s![0..k_mean]).to_owned());
+                noise_log_lambda_hint = Some(
+                    fit.log_lambdas
+                        .slice(s![k_mean..(k_mean + k_noise)])
+                        .to_owned(),
+                );
+            }
+            Ok(fit)
         },
         |fit| fit.penalized_objective,
     )?;
@@ -1007,13 +1020,15 @@ pub fn fit_binomial_location_scale_probit_terms(
     let weights = spec.weights;
     let sigma_min = spec.sigma_min;
     let sigma_max = spec.sigma_max;
+    let mut threshold_log_lambda_hint: Option<Array1<f64>> = None;
+    let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
     let solved = optimize_two_block_matern_kappa(
         data,
         &spec.threshold_spec,
         &spec.log_sigma_spec,
         kappa_options,
         |threshold_design, noise_design| {
-            fit_binomial_location_scale_probit(
+            let fit = fit_binomial_location_scale_probit(
                 BinomialLocationScaleProbitSpec {
                     y: y.clone(),
                     weights: weights.clone(),
@@ -1023,19 +1038,31 @@ pub fn fit_binomial_location_scale_probit_terms(
                         design: DesignMatrix::Dense(threshold_design.design.clone()),
                         offset: Array1::zeros(y.len()),
                         penalties: threshold_design.penalties.clone(),
-                        initial_log_lambdas: None,
+                        initial_log_lambdas: threshold_log_lambda_hint.clone(),
                         initial_beta: None,
                     },
                     log_sigma_block: ParameterBlockInput {
                         design: DesignMatrix::Dense(noise_design.design.clone()),
                         offset: Array1::zeros(y.len()),
                         penalties: noise_design.penalties.clone(),
-                        initial_log_lambdas: None,
+                        initial_log_lambdas: noise_log_lambda_hint.clone(),
                         initial_beta: None,
                     },
                 },
                 options,
-            )
+            )?;
+            let k_threshold = threshold_design.penalties.len();
+            let k_noise = noise_design.penalties.len();
+            if fit.log_lambdas.len() >= k_threshold + k_noise {
+                threshold_log_lambda_hint =
+                    Some(fit.log_lambdas.slice(s![0..k_threshold]).to_owned());
+                noise_log_lambda_hint = Some(
+                    fit.log_lambdas
+                        .slice(s![k_threshold..(k_threshold + k_noise)])
+                        .to_owned(),
+                );
+            }
+            Ok(fit)
         },
         |fit| fit.penalized_objective,
     )?;
@@ -1061,13 +1088,15 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms(
     let wiggle_knots = spec.wiggle_knots;
     let wiggle_degree = spec.wiggle_degree;
     let wiggle_block = spec.wiggle_block;
+    let mut threshold_log_lambda_hint: Option<Array1<f64>> = None;
+    let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
     let solved = optimize_two_block_matern_kappa(
         data,
         &spec.threshold_spec,
         &spec.log_sigma_spec,
         kappa_options,
         |threshold_design, noise_design| {
-            fit_binomial_location_scale_probit_wiggle(
+            let fit = fit_binomial_location_scale_probit_wiggle(
                 BinomialLocationScaleProbitWiggleSpec {
                     y: y.clone(),
                     weights: weights.clone(),
@@ -1079,20 +1108,32 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms(
                         design: DesignMatrix::Dense(threshold_design.design.clone()),
                         offset: Array1::zeros(y.len()),
                         penalties: threshold_design.penalties.clone(),
-                        initial_log_lambdas: None,
+                        initial_log_lambdas: threshold_log_lambda_hint.clone(),
                         initial_beta: None,
                     },
                     log_sigma_block: ParameterBlockInput {
                         design: DesignMatrix::Dense(noise_design.design.clone()),
                         offset: Array1::zeros(y.len()),
                         penalties: noise_design.penalties.clone(),
-                        initial_log_lambdas: None,
+                        initial_log_lambdas: noise_log_lambda_hint.clone(),
                         initial_beta: None,
                     },
                     wiggle_block: wiggle_block.clone(),
                 },
                 options,
-            )
+            )?;
+            let k_threshold = threshold_design.penalties.len();
+            let k_noise = noise_design.penalties.len();
+            if fit.log_lambdas.len() >= k_threshold + k_noise {
+                threshold_log_lambda_hint =
+                    Some(fit.log_lambdas.slice(s![0..k_threshold]).to_owned());
+                noise_log_lambda_hint = Some(
+                    fit.log_lambdas
+                        .slice(s![k_threshold..(k_threshold + k_noise)])
+                        .to_owned(),
+                );
+            }
+            Ok(fit)
         },
         |fit| fit.penalized_objective,
     )?;
