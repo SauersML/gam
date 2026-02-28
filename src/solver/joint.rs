@@ -1212,6 +1212,12 @@ impl<'a> JointRemlState<'a> {
         self.eval.cached_laml = Some(laml);
         self.eval.cached_rho = rho.clone();
         self.eval.cached_edf = edf;
+        if self.eval.cached_edf_terms.is_empty() {
+            if let Some(edf_total) = edf {
+                let p_total = (state.x_base.ncols() + state.beta_link.len()) as f64;
+                self.eval.cached_edf_terms = vec![("Total Model".to_string(), edf_total, p_total)];
+            }
+        }
         self.eval.last_backfit_iterations = iter_count;
         self.eval.last_converged = converged;
 
@@ -2725,13 +2731,15 @@ impl<'a> JointRemlState<'a> {
             }
         };
         let grad_norm = grad.dot(&grad).sqrt();
-        visualizer::update(cost, grad_norm, "optimizing", eval_num as f64, "eval");
+        // Push side-panel state before the chart update so the next rendered frame
+        // includes objective + EDF + diagnostics together.
         visualizer::set_edf_terms(&self.eval.cached_edf_terms);
         visualizer::set_diagnostics(
             self.eval.last_hessian_condition,
             self.eval.last_outer_step_norm,
             Some(self.core.state.ridge_used),
         );
+        visualizer::update(cost, grad_norm, "optimizing", eval_num as f64, "eval");
         if !self.eval.last_converged {
             visualizer::push_diagnostic(&format!(
                 "inner backfit not converged (iterations={})",

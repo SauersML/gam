@@ -119,13 +119,23 @@ impl OptimizationVisualizer {
         let diagnostics_ridge = self.diagnostics_ridge;
 
         self.terminal.draw(|f| {
+            let area = f.area();
+            let compact = area.height < 30 || area.width < 120;
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
-                .split(f.area());
+                .constraints(if compact {
+                    [Constraint::Percentage(68), Constraint::Percentage(32)]
+                } else {
+                    [Constraint::Percentage(72), Constraint::Percentage(28)]
+                })
+                .split(area);
             let top_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+                .constraints(if compact {
+                    [Constraint::Percentage(58), Constraint::Percentage(42)]
+                } else {
+                    [Constraint::Percentage(62), Constraint::Percentage(38)]
+                })
                 .split(chunks[0]);
 
             let (min_y, max_y) = if cost_accepted.is_empty() && cost_trial.is_empty() {
@@ -187,64 +197,65 @@ impl OptimizationVisualizer {
             f.render_widget(chart, top_chunks[0]);
 
             let mut model_lines = Vec::<String>::new();
-            model_lines.push(format!("Stage: {stage}"));
-            model_lines.push(format!("Detail: {detail}"));
-            model_lines.push(format!("Evaluation: {:.0} {eval_state}", iter));
-            model_lines.push(format!("Status: {status}"));
-            model_lines.push(format!("Best Objective: {:.6}", best));
-            model_lines.push(format!("Current Objective: {:.6}", current_cost));
-            model_lines.push(format!("Gradient Norm: {:.3e}", current_grad));
-            model_lines.push(format!("Elapsed Time: {elapsed}s"));
-            model_lines.push(String::new());
-            model_lines.push("Effective Degrees of Freedom by Term".to_string());
+            model_lines.push(if compact {
+                "Term complexity".to_string()
+            } else {
+                "Live Term Complexity".to_string()
+            });
+            if !compact {
+                model_lines.push(String::new());
+            }
 
             if edf_terms.is_empty() {
-                model_lines.push("  (awaiting EDF updates...)".to_string());
+                model_lines.push("  Waiting for effective degrees of freedom updates...".to_string());
             } else {
-                let name_w = edf_terms
+                let max_rows = top_chunks[1].height.saturating_sub(if compact { 3 } else { 4 }) as usize;
+                let mut shown_terms = edf_terms
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                shown_terms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                if shown_terms.len() > max_rows.saturating_sub(1) && max_rows > 1 {
+                    shown_terms.truncate(max_rows - 1);
+                    model_lines.push(format!("showing top {} terms by EDF", shown_terms.len()));
+                }
+                let name_w = shown_terms
                     .iter()
                     .map(|(name, _, _)| name.len())
                     .max()
                     .unwrap_or(8)
-                    .max(8);
-                for (name, edf, ref_df) in edf_terms {
+                    .min(if compact { 14 } else { 20 })
+                    .max(6);
+                for (name, edf, ref_df) in shown_terms {
                     let ratio = if ref_df > 0.0 {
                         (edf / ref_df).clamp(0.0, 1.0)
                     } else {
                         0.0
                     };
-                    let filled = (ratio * 20.0).round() as usize;
+                    let bar_width: usize = if compact { 12 } else { 20 };
+                    let filled = (ratio * bar_width as f64).round() as usize;
                     let bar = format!(
                         "{}{}",
                         "█".repeat(filled),
-                        "·".repeat(20usize.saturating_sub(filled))
+                        "·".repeat(bar_width.saturating_sub(filled))
                     );
+                    let display_name = if name.len() > name_w {
+                        let keep = name_w.saturating_sub(1);
+                        format!("{}…", &name[..keep])
+                    } else {
+                        name
+                    };
                     model_lines.push(format!(
-                        "{:<name_w$} {:>6.2} / {:>6.2}  {}",
-                        name,
-                        edf,
-                        ref_df,
-                        bar,
-                        name_w = name_w
+                        "{:<name_w$} effective {:>6.2} of {:>6.2} reference  {}",
+                        display_name, edf, ref_df, bar, name_w = name_w
                     ));
                 }
-            }
-
-            if let Some(total) = progress_total {
-                model_lines.push(String::new());
-                model_lines.push(format!(
-                    "Progress: {} {}/{}",
-                    progress_label, progress_current, total
-                ));
-            } else if !progress_label.is_empty() {
-                model_lines.push(String::new());
-                model_lines.push(format!("Progress: {} ({})", progress_label, progress_current));
             }
 
             let model_panel = Paragraph::new(model_lines.join("\n"))
                 .block(
                     Block::default()
-                        .title("Model Complexity")
+                        .title("Effective Degrees of Freedom")
                         .borders(Borders::ALL),
                 )
                 .style(Style::default().fg(Color::White))
@@ -252,6 +263,23 @@ impl OptimizationVisualizer {
             f.render_widget(model_panel, top_chunks[1]);
 
             let mut diagnostics = Vec::<String>::new();
+            diagnostics.push(format!("Stage: {stage}"));
+            diagnostics.push(format!("Detail: {detail}"));
+            diagnostics.push(format!("Evaluation: {:.0} {eval_state}", iter));
+            diagnostics.push(format!("Status: {status}"));
+            diagnostics.push(format!("Best Objective: {:.6}", best));
+            diagnostics.push(format!("Current Objective: {:.6}", current_cost));
+            diagnostics.push(format!("Gradient Norm: {:.3e}", current_grad));
+            diagnostics.push(format!("Elapsed Time: {elapsed}s"));
+            if let Some(total) = progress_total {
+                diagnostics.push(format!(
+                    "Progress: {} {}/{}",
+                    progress_label, progress_current, total
+                ));
+            } else if !progress_label.is_empty() {
+                diagnostics.push(format!("Progress: {} ({})", progress_label, progress_current));
+            }
+            diagnostics.push(String::new());
             diagnostics.push(format!(
                 "Condition Number: {}",
                 diagnostics_condition
@@ -271,19 +299,21 @@ impl OptimizationVisualizer {
                     .unwrap_or_else(|| "n/a".to_string())
             ));
             diagnostics.push(format!(
-                "Convergence Signal (log10|gradient|): {:.3}",
+                "Convergence signal (base 10 log of gradient norm): {:.3}",
                 grad_data.last().map(|(_, y)| *y).unwrap_or(0.0)
             ));
-            diagnostics.push(String::new());
             diagnostics.push("Recent Diagnostics and Warnings:".to_string());
+            let base_reserved = diagnostics.len() + 1; // + footer
+            let avail_rows = chunks[1].height.saturating_sub(2) as usize;
+            let max_diag_lines = avail_rows.saturating_sub(base_reserved).max(1);
             if diagnostics_lines.is_empty() {
                 diagnostics.push("  (no diagnostics yet)".to_string());
             } else {
-                for line in diagnostics_lines {
+                let start = diagnostics_lines.len().saturating_sub(max_diag_lines);
+                for line in diagnostics_lines.into_iter().skip(start) {
                     diagnostics.push(format!("  {line}"));
                 }
             }
-            diagnostics.push(String::new());
             diagnostics.push("Press Ctrl+C to abort".to_string());
 
             let diagnostics_panel = Paragraph::new(diagnostics.join("\n"))
@@ -373,7 +403,7 @@ pub fn set_edf_terms(terms: &[(String, f64, f64)]) {
     let mut guard = VISUALIZER.lock().unwrap();
     if let Some(vis) = guard.as_mut() {
         vis.edf_terms = terms.to_vec();
-        if vis.last_draw.elapsed() >= Duration::from_millis(40) {
+        if !terms.is_empty() || vis.last_draw.elapsed() >= Duration::from_millis(40) {
             let _ = vis.draw();
             vis.last_draw = Instant::now();
         }
@@ -411,7 +441,9 @@ pub fn push_diagnostic(message: &str) {
 
 pub fn teardown() {
     let mut guard = VISUALIZER.lock().unwrap();
-    if guard.take().is_some() {
+    if let Some(mut vis) = guard.take() {
+        // Force one final frame so short optimizations still show latest side panels.
+        let _ = vis.draw();
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
