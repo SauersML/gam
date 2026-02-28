@@ -323,13 +323,14 @@ def r2_score(y: np.ndarray, mu: np.ndarray) -> float:
 
 
 def _survival_risk_from_rust_pred(pred_df: pd.DataFrame) -> tuple[np.ndarray, str]:
-    # Canonical survival target across contenders: failure probability at horizon.
-    if "failure_prob" not in pred_df.columns:
-        raise RuntimeError(
-            "rust survival prediction output missing required 'failure_prob' column; "
-            "refit/predict with current CLI"
-        )
-    return pred_df["failure_prob"].to_numpy(dtype=float), "failure_prob"
+    # Canonical survival ranking: model-native risk score (higher => earlier failure).
+    for col in ("risk_score", "eta", "failure_prob"):
+        if col in pred_df.columns:
+            return pred_df[col].to_numpy(dtype=float), col
+    raise RuntimeError(
+        "rust survival prediction output missing required risk column; "
+        "expected one of: risk_score, eta, failure_prob"
+    )
 
 
 def _lifelines_cindex_from_risk(event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray) -> float:
@@ -338,9 +339,8 @@ def _lifelines_cindex_from_risk(event_times: np.ndarray, risk_score: np.ndarray,
 
 
 def _survival_eval_horizon(train_df: pd.DataFrame, time_col: str) -> float:
-    # Global policy for survival benchmarking: fold-specific fixed horizon from
-    # train data only. For time-invariant-risk models (e.g., Cox), this is
-    # mathematically neutral but keeps evaluation policy uniform.
+    # Fold-specific reference horizon from train data only, used only when a
+    # backend prediction API requires an explicit time input.
     horizon = float(np.median(train_df[time_col].to_numpy(dtype=float)))
     if (not np.isfinite(horizon)) or horizon <= 0.0:
         horizon = 1.0
@@ -1907,7 +1907,7 @@ def run_rust_scenario_cv(scenario):
                     )
                     fit_feature_cols = [c for c in ds["features"] if c != "bmi"] + bmi_spline_cols
                 train_df["__entry"] = 0.0
-                # Global survival metric policy: evaluate at fold-specific fixed horizon.
+                # Rust survival predict requires an explicit evaluation time.
                 horizon = _survival_eval_horizon(train_df, ds["time_col"])
                 test_pred_df = test_df.copy()
                 test_pred_df["__entry"] = 0.0
@@ -2066,7 +2066,7 @@ def run_rust_scenario_cv(scenario):
                         "predict_horizon_policy": "global train-fold median time",
                         "model_spec": (
                             "survival model via release binary "
-                            f"(c-index on failure probability from '{score_src}') [5-fold CV]"
+                            f"(c-index on risk score from '{score_src}') [5-fold CV]"
                         ),
                     }
                 )
@@ -2453,7 +2453,6 @@ data_path <- args[1]
 out_path <- args[2]
 train_idx_path <- args[3]
 test_idx_path <- args[4]
-horizon <- as.numeric(args[5])
 
 suppressPackageStartupMessages({
   library(mgcv)
@@ -2546,9 +2545,7 @@ if (family_name == "survival") {
   lp <- as.numeric(predict(fit, newdata=test_df, type="lp"))
   pred_sec <- proc.time()[["elapsed"]] - pred_t0
 
-  bh <- basehaz(fit, centered=FALSE)
-  H0 <- as.numeric(stats::approx(bh$time, bh$hazard, xout=horizon, method="linear", ties="ordered", rule=2)$y)
-  risk <- as.numeric(1.0 - exp(-H0 * exp(lp)))
+  risk <- as.numeric(lp)
   out <- list(
     status="ok",
     fit_sec=fit_sec,
@@ -2640,7 +2637,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             test_idx_path = td_path / f"test_idx_{fold_id}.txt"
             train_idx_path.write_text("\n".join(str(int(i)) for i in fold.train_idx) + "\n")
             test_idx_path.write_text("\n".join(str(int(i)) for i in fold.test_idx) + "\n")
-            horizon = _survival_eval_horizon(all_df.iloc[fold.train_idx].copy(), ds["time_col"]) if ds["family"] == "survival" else None
 
             code, out, err = run_cmd(
                 [
@@ -2650,7 +2646,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     str(out_path),
                     str(train_idx_path),
                     str(test_idx_path),
-                    str(float(horizon)) if horizon is not None else "0",
                 ],
                 cwd=ROOT,
             )
@@ -2680,8 +2675,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                         ),
                     }
                 fold_row["auc"] = _lifelines_cindex_from_risk(event_times, risk, events)
-                fold_row["predict_horizon"] = _survival_eval_horizon(train_df, ds["time_col"])
-                fold_row["predict_horizon_policy"] = "global train-fold median time"
                 fold_row.pop("risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
@@ -2963,14 +2956,28 @@ for (cn in feature_cols) {
 }
 
 t0 <- proc.time()[["elapsed"]]
-fit <- tryCatch(
-  gamboostLSS(
+fit <- tryCatch({
+  fit_full <- gamboostLSS(
     formula=list(mu=as.formula(mu_formula), sigma=as.formula(sigma_formula)),
     data=train_df,
     families=GaussianLSS(),
-    control=boost_control(mstop=200)
-  ),
-  error=function(e) e
+    control=boost_control(mstop=600)
+  )
+  aic_obj <- tryCatch(
+    AIC(fit_full, method="corrected"),
+    error=function(e) e
+  )
+  if (inherits(aic_obj, "error")) {
+    selected_mstop <- 200L
+  } else {
+    selected_mstop <- as.integer(mstop(aic_obj))
+    if (!is.finite(selected_mstop) || selected_mstop < 1) selected_mstop <- 200L
+  }
+  fit_final <- fit_full[selected_mstop]
+  attr(fit_final, "selected_mstop") <- selected_mstop
+  fit_final
+},
+error=function(e) e
 )
 fit_sec <- proc.time()[["elapsed"]] - t0
 
@@ -3014,7 +3021,14 @@ out <- list(
   rmse=rmse,
   mae=mae,
   r2=r2,
-  model_spec=paste0("gamboostLSS(GaussianLSS): ", mu_formula, " ; sigma ", sigma_formula)
+  model_spec=paste0(
+    "gamboostLSS(GaussianLSS; AIC-selected mstop=",
+    as.integer(attr(fit, "selected_mstop")),
+    "): ",
+    mu_formula,
+    " ; sigma ",
+    sigma_formula
+  )
 )
 write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
 '''
@@ -3352,11 +3366,12 @@ fit <- tryCatch(
     formula = bf(as.formula(mu_formula), sigma = as.formula(sigma_formula)),
     data = train_df,
     family = gaussian(),
-    chains = 2,
-    iter = 400,
-    warmup = 200,
-    cores = 1,
+    chains = 4,
+    iter = 2000,
+    warmup = 1000,
+    cores = min(4L, max(1L, parallel::detectCores(logical=FALSE))),
     seed = 123,
+    control = list(adapt_delta = 0.95, max_treedepth = 12),
     refresh = 0,
     silent = 2
   ),
@@ -3483,7 +3498,6 @@ data_path <- args[1]
 out_path <- args[2]
 train_idx_path <- args[3]
 test_idx_path <- args[4]
-horizon <- as.numeric(args[5])
 
 suppressPackageStartupMessages({
   library(mgcv)
@@ -3561,18 +3575,7 @@ fit_sec <- proc.time()[["elapsed"]] - t0
 pred_t0 <- proc.time()[["elapsed"]]
 lp_train <- as.numeric(predict(fit, newdata=train_df, type="link"))
 lp_test <- as.numeric(predict(fit, newdata=test_df, type="link"))
-base_fit <- coxph(
-  as.formula("Surv(time, event) ~ offset(lp)"),
-  data=data.frame(
-    time=train_df[[time_col]],
-    event=train_df[[event_col]],
-    lp=lp_train
-  ),
-  ties="breslow"
-)
-bh <- basehaz(base_fit, centered=FALSE)
-H0 <- as.numeric(stats::approx(bh$time, bh$hazard, xout=horizon, method="linear", ties="ordered", rule=2)$y)
-risk <- as.numeric(1.0 - exp(-H0 * exp(lp_test)))
+risk <- as.numeric(lp_test)
 pred_sec <- proc.time()[["elapsed"]] - pred_t0
 
 out <- list(
@@ -3599,7 +3602,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             test_idx_path = td_path / f"test_idx_{fold_id}.txt"
             train_idx_path.write_text("\n".join(str(int(i)) for i in fold.train_idx) + "\n")
             test_idx_path.write_text("\n".join(str(int(i)) for i in fold.test_idx) + "\n")
-            horizon = _survival_eval_horizon(all_df.iloc[fold.train_idx].copy(), ds["time_col"])
 
             code, out, err = run_cmd(
                 [
@@ -3609,7 +3611,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     str(out_path),
                     str(train_idx_path),
                     str(test_idx_path),
-                    str(float(horizon)),
                 ],
                 cwd=ROOT,
             )
@@ -3638,8 +3639,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     ),
                 }
             fold_row["auc"] = _lifelines_cindex_from_risk(event_times, risk, events)
-            fold_row["predict_horizon"] = _survival_eval_horizon(train_df, ds["time_col"])
-            fold_row["predict_horizon_policy"] = "global train-fold median time"
             fold_row.pop("risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
@@ -3675,7 +3674,6 @@ def run_external_pygam_cv(scenario):
             train_df = df.iloc[fold.train_idx].copy()
             test_df = df.iloc[fold.test_idx].copy()
             feature_cols = ds["features"]
-            horizon = _survival_eval_horizon(train_df, time_col)
             for col in feature_cols:
                 mu = float(train_df[col].mean())
                 sdv = float(train_df[col].std())
@@ -3702,11 +3700,7 @@ def run_external_pygam_cv(scenario):
             fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
             pred_start = datetime.now(timezone.utc)
-            surv_at_h = cph.predict_survival_function(
-                test_df[fit_feature_cols],
-                times=[horizon],
-            )
-            risk = (1.0 - surv_at_h.iloc[0].to_numpy(dtype=float).reshape(-1))
+            risk = cph.predict_partial_hazard(test_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
             pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
             event_times = test_df[time_col].to_numpy(dtype=float)
             events = test_df[event_col].to_numpy(dtype=float)
@@ -3717,8 +3711,6 @@ def run_external_pygam_cv(scenario):
                     "predict_sec": pred_sec,
                     "auc": cidx,
                     "n_test": int(len(fold.test_idx)),
-                    "predict_horizon": float(horizon),
-                    "predict_horizon_policy": "global train-fold median time",
                     "warning": (
                         f"lifelines convergence warning: {str(conv_warn[0].message)}"
                         if conv_warn
@@ -3726,10 +3718,10 @@ def run_external_pygam_cv(scenario):
                     ),
                     "model_spec": (
                         "CoxPHFitter(train-fold z-score; bmi 6-knot hinge spline; penalizer=1e-4; "
-                        "c-index on failure probability at global fold horizon)"
+                        "c-index on partial-hazard risk score)"
                         if scenario["name"] == "icu_survival_death"
                         else "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4; "
-                        "c-index on failure probability at global fold horizon)"
+                        "c-index on partial-hazard risk score)"
                     ),
                 }
             )
@@ -3968,7 +3960,6 @@ def run_external_sksurv_rsf_cv(scenario):
             event=train_df[event_col].to_numpy(dtype=float) > 0.5,
             time=train_df[time_col].to_numpy(dtype=float),
         )
-        horizon = _survival_eval_horizon(train_df, time_col)
 
         fit_start = datetime.now(timezone.utc)
         rsf = RandomSurvivalForest(
@@ -3983,14 +3974,7 @@ def run_external_sksurv_rsf_cv(scenario):
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
         pred_start = datetime.now(timezone.utc)
-        chf_fns = rsf.predict_cumulative_hazard_function(x_test, return_array=False)
-        risk = []
-        for fn in chf_fns:
-            ch_at_h = float(fn(horizon))
-            if not np.isfinite(ch_at_h) or ch_at_h < 0.0:
-                ch_at_h = 0.0
-            risk.append(float(1.0 - math.exp(-ch_at_h)))
-        risk = np.asarray(risk, dtype=float)
+        risk = rsf.predict(x_test).astype(float)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
 
         event_times = test_df[time_col].to_numpy(dtype=float)
@@ -4001,8 +3985,6 @@ def run_external_sksurv_rsf_cv(scenario):
                 "predict_sec": pred_sec,
                 "auc": _lifelines_cindex_from_risk(event_times, risk, events),
                 "n_test": int(len(fold.test_idx)),
-                "predict_horizon": float(horizon),
-                "predict_horizon_policy": "global train-fold median time",
                 "model_spec": (
                     "RandomSurvivalForest("
                     "n_estimators=300,min_samples_split=10,min_samples_leaf=5,max_features='sqrt')"
@@ -4053,7 +4035,6 @@ def run_external_sksurv_coxnet_cv(scenario):
             event=train_df[event_col].to_numpy(dtype=float) > 0.5,
             time=train_df[time_col].to_numpy(dtype=float),
         )
-        horizon = _survival_eval_horizon(train_df, time_col)
 
         fit_start = datetime.now(timezone.utc)
         model = CoxnetSurvivalAnalysis(
@@ -4076,8 +4057,6 @@ def run_external_sksurv_coxnet_cv(scenario):
                 "predict_sec": pred_sec,
                 "auc": _lifelines_cindex_from_risk(event_times, risk, events),
                 "n_test": int(len(fold.test_idx)),
-                "predict_horizon": float(horizon),
-                "predict_horizon_policy": "global train-fold median time",
                 "model_spec": "CoxnetSurvivalAnalysis(l1_ratio=0.5, alpha_min_ratio=0.01)",
             }
         )
@@ -4108,7 +4087,6 @@ def run_external_lifelines_coxph_enet_cv(scenario):
     for fold in folds:
         train_df = df.iloc[fold.train_idx].copy()
         test_df = df.iloc[fold.test_idx].copy()
-        horizon = _survival_eval_horizon(train_df, time_col)
         train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
         fit_feature_cols = feature_cols
         if scenario["name"] == "icu_survival_death" and "bmi" in feature_cols:
@@ -4130,11 +4108,7 @@ def run_external_lifelines_coxph_enet_cv(scenario):
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
         pred_start = datetime.now(timezone.utc)
-        surv_at_h = cph.predict_survival_function(
-            test_df[fit_feature_cols],
-            times=[horizon],
-        )
-        risk = (1.0 - surv_at_h.iloc[0].to_numpy(dtype=float).reshape(-1))
+        risk = cph.predict_partial_hazard(test_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
         event_times = test_df[time_col].to_numpy(dtype=float)
         events = test_df[event_col].to_numpy(dtype=float)
@@ -4144,8 +4118,6 @@ def run_external_lifelines_coxph_enet_cv(scenario):
                 "predict_sec": pred_sec,
                 "auc": _lifelines_cindex_from_risk(event_times, risk, events),
                 "n_test": int(len(fold.test_idx)),
-                "predict_horizon": float(horizon),
-                "predict_horizon_policy": "global train-fold median time",
                 "warning": (
                     f"lifelines convergence warning: {str(conv_warn[0].message)}"
                     if conv_warn
@@ -4195,7 +4167,6 @@ data_path <- args[1]
 out_path <- args[2]
 train_idx_path <- args[3]
 test_idx_path <- args[4]
-horizon <- as.numeric(args[5])
 
 suppressPackageStartupMessages({
   library(glmnet)
@@ -4243,18 +4214,7 @@ fit_sec <- proc.time()[["elapsed"]] - t0
 pred_t0 <- proc.time()[["elapsed"]]
 lp_train <- as.numeric(predict(cvfit, newx=x_train, s="lambda.min", type="link"))
 lp_test <- as.numeric(predict(cvfit, newx=x_test, s="lambda.min", type="link"))
-base_fit <- coxph(
-  as.formula("Surv(time, event) ~ offset(lp)"),
-  data=data.frame(
-    time=train_df[[time_col]],
-    event=train_df[[event_col]],
-    lp=lp_train
-  ),
-  ties="breslow"
-)
-bh <- basehaz(base_fit, centered=FALSE)
-H0 <- as.numeric(stats::approx(bh$time, bh$hazard, xout=horizon, method="linear", ties="ordered", rule=2)$y)
-risk <- as.numeric(1.0 - exp(-H0 * exp(lp_test)))
+risk <- as.numeric(lp_test)
 pred_sec <- proc.time()[["elapsed"]] - pred_t0
 
 out <- list(
@@ -4281,7 +4241,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             test_idx_path = td_path / f"test_idx_{fold_id}.txt"
             train_idx_path.write_text("\n".join(str(int(i)) for i in fold.train_idx) + "\n")
             test_idx_path.write_text("\n".join(str(int(i)) for i in fold.test_idx) + "\n")
-            horizon = _survival_eval_horizon(all_df.iloc[fold.train_idx].copy(), ds["time_col"])
 
             code, out, err = run_cmd(
                 [
@@ -4291,7 +4250,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     str(out_path),
                     str(train_idx_path),
                     str(test_idx_path),
-                    str(float(horizon)),
                 ],
                 cwd=ROOT,
             )
@@ -4320,8 +4278,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     ),
                 }
             fold_row["auc"] = _lifelines_cindex_from_risk(event_times, risk, events)
-            fold_row["predict_horizon"] = _survival_eval_horizon(train_df, ds["time_col"])
-            fold_row["predict_horizon_policy"] = "global train-fold median time"
             fold_row.pop("risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
@@ -4373,24 +4329,13 @@ def run_external_sksurv_gb_cv(scenario):
                 event=train_df[event_col].to_numpy(dtype=float) > 0.5,
                 time=train_df[time_col].to_numpy(dtype=float),
             )
-            horizon = _survival_eval_horizon(train_df, time_col)
 
             fit_start = datetime.now(timezone.utc)
             model.fit(x_train, y_train)
             fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
             pred_start = datetime.now(timezone.utc)
-            try:
-                chf_fns = model.predict_cumulative_hazard_function(x_test, return_array=False)
-                risk = []
-                for fn in chf_fns:
-                    ch_at_h = float(fn(horizon))
-                    if not np.isfinite(ch_at_h) or ch_at_h < 0.0:
-                        ch_at_h = 0.0
-                    risk.append(float(1.0 - math.exp(-ch_at_h)))
-                risk = np.asarray(risk, dtype=float)
-            except Exception:
-                risk = model.predict(x_test).astype(float)
+            risk = model.predict(x_test).astype(float)
             pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
 
             event_times = test_df[time_col].to_numpy(dtype=float)
@@ -4401,8 +4346,6 @@ def run_external_sksurv_gb_cv(scenario):
                     "predict_sec": pred_sec,
                     "auc": _lifelines_cindex_from_risk(event_times, risk, events),
                     "n_test": int(len(fold.test_idx)),
-                    "predict_horizon": float(horizon),
-                    "predict_horizon_policy": "global train-fold median time",
                     "model_spec": model_spec,
                 }
             )
@@ -4465,7 +4408,6 @@ def run_external_lifelines_aft_cv(scenario):
         for fold in folds:
             train_df = df.iloc[fold.train_idx].copy()
             test_df = df.iloc[fold.test_idx].copy()
-            horizon = _survival_eval_horizon(train_df, time_col)
             train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
 
             fit_start = datetime.now(timezone.utc)
@@ -4481,11 +4423,8 @@ def run_external_lifelines_aft_cv(scenario):
             fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
             pred_start = datetime.now(timezone.utc)
-            surv_at_h = fitter.predict_survival_function(
-                test_df[feature_cols],
-                times=[horizon],
-            )
-            risk = (1.0 - surv_at_h.iloc[0].to_numpy(dtype=float).reshape(-1))
+            pred_time = fitter.predict_expectation(test_df[feature_cols]).to_numpy(dtype=float).reshape(-1)
+            risk = -pred_time
             pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
             event_times = test_df[time_col].to_numpy(dtype=float)
             events = test_df[event_col].to_numpy(dtype=float)
@@ -4495,8 +4434,6 @@ def run_external_lifelines_aft_cv(scenario):
                     "predict_sec": pred_sec,
                     "auc": _lifelines_cindex_from_risk(event_times, risk, events),
                     "n_test": int(len(fold.test_idx)),
-                    "predict_horizon": float(horizon),
-                    "predict_horizon_policy": "global train-fold median time",
                     "warning": (
                         f"lifelines convergence warning: {str(conv_warn[0].message)}"
                         if conv_warn
@@ -4557,20 +4494,12 @@ def run_external_xgboost_aft_cv(scenario):
     for fold_id, fold in enumerate(folds):
         train_df = df.iloc[fold.train_idx].copy()
         test_df = df.iloc[fold.test_idx].copy()
-        horizon = _survival_eval_horizon(train_df, time_col)
         train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
 
         x_train = train_df[feature_cols].to_numpy(dtype=float)
         x_test = test_df[feature_cols].to_numpy(dtype=float)
         y_time = train_df[time_col].to_numpy(dtype=float)
         y_event = train_df[event_col].to_numpy(dtype=float) > 0.5
-
-        y_lower = y_time.copy()
-        y_upper = np.where(y_event, y_time, np.inf)
-
-        dtrain = xgb.DMatrix(x_train)
-        dtrain.set_float_info("label_lower_bound", y_lower)
-        dtrain.set_float_info("label_upper_bound", y_upper)
         dtest = xgb.DMatrix(x_test)
 
         params = {
@@ -4590,12 +4519,16 @@ def run_external_xgboost_aft_cv(scenario):
         }
 
         fit_start = datetime.now(timezone.utc)
+        dtrain = xgb.DMatrix(x_train)
+        dtrain.set_float_info("label_lower_bound", y_time.copy())
+        dtrain.set_float_info("label_upper_bound", np.where(y_event, y_time, np.inf))
         booster = xgb.train(
             params=params,
             dtrain=dtrain,
             num_boost_round=300,
             verbose_eval=False,
         )
+        selected_rounds = int(booster.num_boosted_rounds())
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
         pred_start = datetime.now(timezone.utc)
@@ -4611,11 +4544,9 @@ def run_external_xgboost_aft_cv(scenario):
                 "predict_sec": pred_sec,
                 "auc": _lifelines_cindex_from_risk(event_times, risk, events),
                 "n_test": int(len(fold.test_idx)),
-                "predict_horizon": float(horizon),
-                "predict_horizon_policy": "global train-fold median time",
                 "model_spec": (
                     "xgboost.train(objective='survival:aft',loss='normal',scale=1.0,"
-                    "nrounds=300,max_depth=3,eta=0.05)"
+                    f"max_depth=3,eta=0.05,selected_rounds={selected_rounds})"
                 ),
             }
         )
@@ -4653,6 +4584,14 @@ def _assert_basis_parity_for_scenario(s_cfg):
 
 
 def _should_run_pygam_for_scenario(s_cfg):
+    excluded = set(s_cfg.get("exclude_contenders", []))
+    if "python_pygam" in excluded:
+        return False
+    ds = dataset_for_scenario(s_cfg)
+    # pyGAM has no native censored-likelihood survival model support in this harness.
+    if ds["family"] == "survival":
+        return False
+
     rust_cfg = _rust_fit_mapping(s_cfg["name"])
     if rust_cfg is None:
         return True

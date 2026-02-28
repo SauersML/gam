@@ -1,13 +1,16 @@
 use crate::estimate::{EstimationError, RHO_BOUND};
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use ndarray::{Array1, Array2};
-use wolfe_bfgs::{NewtonTrustRegion, ObjectiveEvalError, ObjectiveRequest, ObjectiveSample};
+use wolfe_bfgs::{Bfgs, BfgsError};
 
 #[derive(Clone, Debug)]
 pub struct SmoothingBfgsOptions {
     pub max_iter: usize,
     pub tol: f64,
     pub finite_diff_step: f64,
+    /// Retained for API compatibility. The outer smoothing optimizer is always
+    /// gradient-only BFGS in this module, so this setting is ignored.
+    pub fd_hessian_max_dim: usize,
     pub seed_config: SeedConfig,
 }
 
@@ -17,6 +20,7 @@ impl Default for SmoothingBfgsOptions {
             max_iter: 200,
             tol: 1e-5,
             finite_diff_step: 1e-3,
+            fd_hessian_max_dim: usize::MAX,
             seed_config: SeedConfig {
                 risk_profile: SeedRiskProfile::GeneralizedLinear,
                 ..SeedConfig::default()
@@ -64,50 +68,21 @@ where
     Ok(grad)
 }
 
-fn finite_diff_hessian_from_gradient_external<C, Eval>(
-    context: &mut C,
-    rho: &Array1<f64>,
-    step: f64,
-    eval_cost_grad_rho: &mut Eval,
-) -> Result<Array2<f64>, EstimationError>
-where
-    Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError>,
-{
-    let k = rho.len();
-    let mut h = Array2::<f64>::zeros((k, k));
-    if k == 0 {
-        return Ok(h);
-    }
-    for j in 0..k {
-        let hj = (step * (1.0 + rho[j].abs())).max(1e-6);
-        let mut rho_p = rho.clone();
-        rho_p[j] += hj;
-        let mut rho_m = rho.clone();
-        rho_m[j] -= hj;
-        let g_p = eval_cost_grad_rho(context, &rho_p)?.1;
-        let g_m = eval_cost_grad_rho(context, &rho_m)?.1;
-        if g_p.len() != k || g_m.len() != k {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "outer FD Hessian gradient length mismatch".to_string(),
-            ));
-        }
-        for i in 0..k {
-            h[[i, j]] = (g_p[i] - g_m[i]) / (2.0 * hj);
+fn invalid_bfgs_sample(rho: &Array1<f64>) -> (f64, Array1<f64>) {
+    // `wolfe_bfgs::Bfgs` requires finite samples, so failed outer evaluations are
+    // turned into a large smooth barrier that pushes the iterate back toward the
+    // bounded interior instead of requesting Hessians or aborting the seed.
+    const COST_BARRIER: f64 = 1e50;
+    const GRAD_SCALE: f64 = 1e6;
+
+    let mut grad = rho.clone();
+    for g in grad.iter_mut() {
+        if !g.is_finite() || g.abs() < 1e-6 {
+            *g = 1.0;
         }
     }
-    for i in 0..k {
-        for j in 0..i {
-            let v = 0.5 * (h[[i, j]] + h[[j, i]]);
-            h[[i, j]] = v;
-            h[[j, i]] = v;
-        }
-    }
-    if h.iter().any(|v| !v.is_finite()) {
-        return Err(EstimationError::RemlOptimizationFailed(
-            "outer FD Hessian produced non-finite values".to_string(),
-        ));
-    }
-    Ok(h)
+    grad *= GRAD_SCALE;
+    (COST_BARRIER + 0.5 * rho.dot(rho), grad)
 }
 
 fn approx_same_rho_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
@@ -140,13 +115,13 @@ fn should_replace_smoothing_candidate(
     }
 }
 
-fn run_multistart_bfgs<C, Eval>(
+fn screened_seeds<C, Eval>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     context: &mut C,
     eval_cost_grad_rho: &mut Eval,
     options: &SmoothingBfgsOptions,
-) -> Result<SmoothingBfgsResult, EstimationError>
+) -> Result<Vec<(usize, Array1<f64>)>, EstimationError>
 where
     Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError>,
 {
@@ -182,136 +157,103 @@ where
         candidate_seeds
     };
 
+    Ok(screened_seeds)
+}
+
+fn run_single_seed_bfgs<C, Eval>(
+    context: &mut C,
+    rho_seed: &Array1<f64>,
+    eval_cost_grad_rho: &mut Eval,
+    options: &SmoothingBfgsOptions,
+) -> Option<SmoothingBfgsResult>
+where
+    Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError>,
+{
+    let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
+    let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
+    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
+    let mut optimizer = Bfgs::new(rho_seed.clone(), |rho| {
+        if let Some((rho_c, cost_c, grad_c)) = &last_eval
+            && approx_same_rho_point(rho, rho_c)
+        {
+            return (*cost_c, grad_c.clone());
+        }
+
+        let sample = match eval_cost_grad_rho(context, rho) {
+            Ok((cost, grad_rho)) if cost.is_finite() && grad_rho.iter().all(|v| v.is_finite()) => {
+                (cost, grad_rho)
+            }
+            _ => invalid_bfgs_sample(rho),
+        };
+        last_eval = Some((rho.clone(), sample.0, sample.1.clone()));
+        sample
+    })
+    .with_bounds(lower, upper, 1e-6)
+    .with_tolerance(options.tol)
+    .with_max_iterations(options.max_iter)
+    .with_no_improve_stop(1e-8, 8)
+    .with_flat_stall_exit(true, 4)
+    .with_curvature_slack_scale(2.0);
+
+    let solution = match optimizer.run() {
+        Ok(sol) => sol,
+        Err(BfgsError::MaxIterationsReached { last_solution })
+        | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+        Err(_) => return None,
+    };
+
+    let rho = solution.final_point.clone();
+    let mut grad_rho = match &last_eval {
+        Some((rho_cached, _cost_cached, grad_cached)) if approx_same_rho_point(&rho, rho_cached) => {
+            grad_cached.clone()
+        }
+        _ => match eval_cost_grad_rho(context, &rho) {
+            Ok((_, grad)) => grad,
+            Err(_) => Array1::<f64>::from_elem(rho.len(), f64::NAN),
+        },
+    };
+    for g in grad_rho.iter_mut() {
+        if !g.is_finite() {
+            *g = f64::NAN;
+        }
+    }
+    let grad_norm = grad_rho.dot(&grad_rho).sqrt();
+    Some(SmoothingBfgsResult {
+        rho,
+        final_value: solution.final_value,
+        iterations: solution.iterations,
+        final_grad_norm: grad_norm,
+        stationary: grad_norm <= options.tol.max(1e-6),
+    })
+}
+
+fn run_multistart_bfgs<C, Eval>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    context: &mut C,
+    eval_cost_grad_rho: &mut Eval,
+    options: &SmoothingBfgsOptions,
+) -> Result<SmoothingBfgsResult, EstimationError>
+where
+    Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError>,
+{
+    let screened_seeds = screened_seeds(
+        num_penalties,
+        heuristic_lambdas,
+        context,
+        eval_cost_grad_rho,
+        options,
+    )?;
     let mut best: Option<SmoothingBfgsResult> = None;
     let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
     let mut best_grad_norm = f64::INFINITY;
     for (_seed_idx, rho_seed) in screened_seeds.iter() {
-        let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
-        let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
-        let mut last_eval: Option<(Array1<f64>, Array1<f64>)> = None;
-        let mut full_cache: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
-        let mut cg_cache: Option<(Array1<f64>, f64, Array1<f64>)> = None;
-        let mut optimizer = NewtonTrustRegion::new(rho_seed.clone(), |rho, request| {
-            if let Some((rho_c, cost_c, grad_c, hess_c)) = &full_cache
-                && approx_same_rho_point(rho, rho_c)
-            {
-                return Ok(match request {
-                    ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
-                    ObjectiveRequest::CostAndGradient => {
-                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
-                    }
-                    ObjectiveRequest::GradientAndHessian
-                    | ObjectiveRequest::CostGradientHessian => {
-                        ObjectiveSample::cost_gradient_hessian(
-                            *cost_c,
-                            grad_c.clone(),
-                            hess_c.clone(),
-                        )
-                    }
-                });
-            }
-
-            let eval_cost_grad = |rho: &Array1<f64>,
-                                  context: &mut C,
-                                  eval_cost_grad_rho: &mut Eval|
-             -> Result<(f64, Array1<f64>), ObjectiveEvalError> {
-                let (cost, grad_rho) = eval_cost_grad_rho(context, rho)
-                    .map_err(|e| ObjectiveEvalError::recoverable(format!("{e}")))?;
-                if !cost.is_finite() || grad_rho.iter().any(|v| !v.is_finite()) {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "non-finite smoothing objective/gradient",
-                    ));
-                }
-                Ok((cost, grad_rho))
-            };
-            match request {
-                ObjectiveRequest::CostOnly => {
-                    let (cost, grad_rho) = eval_cost_grad(rho, context, eval_cost_grad_rho)?;
-                    last_eval = Some((rho.clone(), grad_rho.clone()));
-                    cg_cache = Some((rho.clone(), cost, grad_rho));
-                    Ok(ObjectiveSample::cost_only(cost))
-                }
-                ObjectiveRequest::CostAndGradient => {
-                    let (cost, grad_rho) = if let Some((rho_c, cost_c, grad_c)) = &cg_cache {
-                        if approx_same_rho_point(rho, rho_c) {
-                            (*cost_c, grad_c.clone())
-                        } else {
-                            eval_cost_grad(rho, context, eval_cost_grad_rho)?
-                        }
-                    } else {
-                        eval_cost_grad(rho, context, eval_cost_grad_rho)?
-                    };
-                    last_eval = Some((rho.clone(), grad_rho.clone()));
-                    cg_cache = Some((rho.clone(), cost, grad_rho.clone()));
-                    Ok(ObjectiveSample::cost_and_gradient(cost, grad_rho))
-                }
-                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
-                    let (cost, grad_rho) = if let Some((rho_c, cost_c, grad_c)) = &cg_cache {
-                        if approx_same_rho_point(rho, rho_c) {
-                            (*cost_c, grad_c.clone())
-                        } else {
-                            eval_cost_grad(rho, context, eval_cost_grad_rho)?
-                        }
-                    } else {
-                        eval_cost_grad(rho, context, eval_cost_grad_rho)?
-                    };
-                    last_eval = Some((rho.clone(), grad_rho.clone()));
-                    cg_cache = Some((rho.clone(), cost, grad_rho.clone()));
-                    let hess_rho = match finite_diff_hessian_from_gradient_external(
-                        context,
-                        rho,
-                        options.finite_diff_step,
-                        eval_cost_grad_rho,
-                    ) {
-                        Ok(h) => h,
-                        Err(e) => return Err(ObjectiveEvalError::recoverable(format!("{e}"))),
-                    };
-                    full_cache = Some((rho.clone(), cost, grad_rho.clone(), hess_rho.clone()));
-                    Ok(ObjectiveSample::cost_gradient_hessian(
-                        cost, grad_rho, hess_rho,
-                    ))
-                }
-            }
-        })
-        .with_bounds(lower, upper, 1e-6)
-        .with_tolerance(options.tol)
-        .with_max_iterations(options.max_iter)
-        .with_initial_trust_radius(1.0)
-        .with_max_trust_radius(1e6)
-        .with_acceptance_threshold(0.1);
-
-        let solution = match optimizer.run() {
-            Ok(sol) => sol,
-            Err(wolfe_bfgs::NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
-                *last_solution
-            }
-            Err(_) => continue,
+        let Some(candidate) =
+            run_single_seed_bfgs(context, rho_seed, eval_cost_grad_rho, options)
+        else {
+            continue;
         };
-
-        let rho = solution.final_point.clone();
-        let mut grad_rho = match &last_eval {
-            Some((rho_cached, grad_cached)) if approx_same_rho_point(&rho, rho_cached) => {
-                grad_cached.clone()
-            }
-            _ => match eval_cost_grad_rho(context, &rho) {
-                Ok((_, grad)) => grad,
-                Err(_) => Array1::<f64>::from_elem(rho.len(), f64::NAN),
-            },
-        };
-        for g in grad_rho.iter_mut() {
-            if !g.is_finite() {
-                *g = f64::NAN;
-            }
-        }
-        let grad_norm = grad_rho.dot(&grad_rho).sqrt();
-        let candidate = SmoothingBfgsResult {
-            rho,
-            final_value: solution.final_value,
-            iterations: solution.iterations,
-            final_grad_norm: grad_norm,
-            stationary: grad_norm <= options.tol.max(1e-6),
-        };
-
+        let grad_norm = candidate.final_grad_norm;
         if should_replace_smoothing_candidate(&best, &candidate) {
             best = Some(candidate);
         }
@@ -419,6 +361,45 @@ where
         num_penalties,
         heuristic_lambdas,
         &mut objective_with_gradient,
+        &mut eval_cost_grad_rho,
+        options,
+    )
+}
+
+/// Multi-start smoothing optimizer when the caller can also provide exact Hessians.
+///
+/// The current outer driver is gradient-only BFGS, so the Hessian output is
+/// accepted for API compatibility but not consumed by the optimizer.
+pub fn optimize_log_smoothing_with_multistart_with_gradient_and_hessian<F>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    mut objective_with_gradient_hessian: F,
+    options: &SmoothingBfgsOptions,
+) -> Result<SmoothingBfgsResult, EstimationError>
+where
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError>,
+{
+    if num_penalties == 0 {
+        let rho = Array1::<f64>::zeros(0);
+        let (value, grad, _) = objective_with_gradient_hessian(&rho)?;
+        let grad_norm = grad.dot(&grad).sqrt();
+        return Ok(SmoothingBfgsResult {
+            rho,
+            final_value: value,
+            iterations: 0,
+            final_grad_norm: grad_norm,
+            stationary: grad_norm <= options.tol.max(1e-6),
+        });
+    }
+
+    let mut eval_cost_grad_rho = |objective: &mut F, rho: &Array1<f64>| {
+        let (cost, grad, _) = objective(rho)?;
+        Ok((cost, grad))
+    };
+    run_multistart_bfgs(
+        num_penalties,
+        heuristic_lambdas,
+        &mut objective_with_gradient_hessian,
         &mut eval_cost_grad_rho,
         options,
     )

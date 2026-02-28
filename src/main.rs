@@ -36,10 +36,10 @@ use gam::families::sigma_link::{
     bounded_sigma_from_eta_scalar as sigma_from_eta_scalar,
 };
 use gam::smooth::{
-    LinearTermSpec, MaternKappaOptimizationOptions, RandomEffectTermSpec, ShapeConstraint,
+    LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
-    TermCollectionSpec, build_term_collection_design,
-    fit_term_collection_with_matern_kappa_optimization,
+    SpatialLengthScaleOptimizationOptions, TermCollectionSpec, build_term_collection_design,
+    fit_term_collection_with_spatial_length_scale_optimization,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale_probit::{
@@ -506,7 +506,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     log_sigma_spec: noise_spec.clone(),
                 },
                 &options,
-                &MaternKappaOptimizationOptions::default(),
+                &SpatialLengthScaleOptimizationOptions::default(),
             )
             .map_err(|e| format!("fit_gaussian_location_scale_terms failed: {e}"))?;
             let fit = solved.fit;
@@ -599,7 +599,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     wiggle_block: wiggle_block_for_fit.clone(),
                 },
                 &options,
-                &MaternKappaOptimizationOptions::default(),
+                &SpatialLengthScaleOptimizationOptions::default(),
             )
             .map_err(|e| format!("fit_binomial_location_scale_probit_wiggle_terms failed: {e}"))?;
             let fit = solved.fit;
@@ -632,7 +632,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     log_sigma_spec: noise_spec.clone(),
                 },
                 &options,
-                &MaternKappaOptimizationOptions::default(),
+                &SpatialLengthScaleOptimizationOptions::default(),
             )
             .map_err(|e| format!("fit_binomial_location_scale_probit_terms failed: {e}"))?;
             let fit = solved.fit;
@@ -830,7 +830,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     } else {
         let bootstrap_design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
-        let fitted = fit_term_collection_with_matern_kappa_optimization(
+        let fitted = fit_term_collection_with_spatial_length_scale_optimization(
             ds.values.view(),
             y.clone(),
             weights.clone(),
@@ -843,9 +843,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 nullspace_dims: vec![],
                 linear_constraints: bootstrap_design.linear_constraints.clone(),
             },
-            &MaternKappaOptimizationOptions::default(),
+            &SpatialLengthScaleOptimizationOptions::default(),
         )
-        .map_err(|e| format!("fit_term_collection (with Matérn κ optimization) failed: {e}"))?;
+        .map_err(|e| format!("fit_term_collection (with spatial κ optimization) failed: {e}"))?;
         (fitted.fit, fitted.design, fitted.resolved_spec)
     };
 

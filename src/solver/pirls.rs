@@ -26,6 +26,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, ShapeBuilder, s};
 use faer::linalg::cholesky::llt::factor::LltParams;
 use faer::{Auto, MatRef, Spec};
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 pub struct LltView<'a> {
     pub matrix: MatRef<'a, f64>,
@@ -73,6 +74,274 @@ fn matref_is_finite(mat: MatRef<'_, f64>) -> bool {
         }
     }
     true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PirlsLinearSolvePath {
+    DenseTransformed,
+    SparseNative,
+}
+
+#[derive(Clone, Debug)]
+pub struct SparsePirlsDecision {
+    pub path: PirlsLinearSolvePath,
+    pub reason: &'static str,
+    pub p: usize,
+    pub nnz_x: usize,
+    pub nnz_xtwx_symbolic: Option<usize>,
+    pub nnz_s_lambda: usize,
+    pub nnz_h_est: Option<usize>,
+    pub density_h_est: Option<f64>,
+}
+
+impl SparsePirlsDecision {
+    fn log_once(&self) {
+        let path = match self.path {
+            PirlsLinearSolvePath::DenseTransformed => "dense_transformed",
+            PirlsLinearSolvePath::SparseNative => "sparse_native",
+        };
+        log::info!(
+            "[pirls-path] path={} reason={} p={} nnz_x={} nnz_xtwx_symbolic={} nnz_s_lambda={} nnz_h_est={} density_h_est={}",
+            path,
+            self.reason,
+            self.p,
+            self.nnz_x,
+            self.nnz_xtwx_symbolic
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "na".to_string()),
+            self.nnz_s_lambda,
+            self.nnz_h_est
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "na".to_string()),
+            self.density_h_est
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "na".to_string()),
+        );
+    }
+}
+
+const SPARSE_NATIVE_MIN_P: usize = 256;
+const SPARSE_NATIVE_MAX_H_DENSITY: f64 = 0.10;
+
+#[derive(Clone, Debug)]
+struct SparsePenaltyPattern {
+    upper_triplets: Vec<(usize, usize, f64)>,
+    nnz_upper: usize,
+}
+
+impl SparsePenaltyPattern {
+    fn from_dense_upper(matrix: &Array2<f64>, tol: f64) -> Self {
+        let p = matrix.nrows().min(matrix.ncols());
+        let mut upper_triplets = Vec::new();
+        for col in 0..p {
+            for row in 0..=col {
+                let value = matrix[[row, col]];
+                if value.abs() > tol {
+                    upper_triplets.push((row, col, value));
+                }
+            }
+        }
+        let nnz_upper = upper_triplets.len();
+        Self {
+            upper_triplets,
+            nnz_upper,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SparsePenalizedSystemStats {
+    nnz_xtwx_symbolic: usize,
+    nnz_s_lambda_upper: usize,
+    nnz_h_upper: usize,
+    density_upper: f64,
+}
+
+// Phase 2 sparse-native PIRLS will reuse this cache for symbolic structure and
+// repeated numeric assembly of H = X'WX + S_lambda + ridge I.
+#[allow(dead_code)]
+struct SparsePenalizedSystemCache {
+    xtwx_cache: SparseXtWxCache,
+    penalty_pattern: SparsePenaltyPattern,
+    h_upper_symbolic: SymbolicSparseColMat<usize>,
+    h_upper_values: Vec<f64>,
+    h_upper_col_ptr: Vec<usize>,
+    h_upper_row_idx: Vec<usize>,
+    p: usize,
+}
+
+impl SparsePenalizedSystemCache {
+    fn new(
+        x: &SparseColMat<usize, f64>,
+        penalty_pattern: SparsePenaltyPattern,
+    ) -> Result<Self, EstimationError> {
+        let xtwx_cache = SparseXtWxCache::new(x)?;
+        let p = x.ncols();
+        let h_upper_symbolic = build_penalized_symbolic(
+            p,
+            xtwx_cache.xtwx_symbolic.col_ptr(),
+            xtwx_cache.xtwx_symbolic.row_idx(),
+            &penalty_pattern.upper_triplets,
+        )?;
+        let h_upper_values = vec![0.0; h_upper_symbolic.row_idx().len()];
+        Ok(Self {
+            xtwx_cache,
+            penalty_pattern,
+            h_upper_col_ptr: h_upper_symbolic.col_ptr().to_vec(),
+            h_upper_row_idx: h_upper_symbolic.row_idx().to_vec(),
+            h_upper_symbolic,
+            h_upper_values,
+            p,
+        })
+    }
+
+    fn matches(
+        &self,
+        x: &SparseColMat<usize, f64>,
+        penalty_pattern: &SparsePenaltyPattern,
+    ) -> bool {
+        self.xtwx_cache.matches(x)
+            && self.penalty_pattern.nnz_upper == penalty_pattern.nnz_upper
+            && self.penalty_pattern.upper_triplets == penalty_pattern.upper_triplets
+    }
+
+    fn stats(&self) -> SparsePenalizedSystemStats {
+        let upper_total = self.p.saturating_mul(self.p + 1) / 2;
+        SparsePenalizedSystemStats {
+            nnz_xtwx_symbolic: self.xtwx_cache.xtwx_symbolic.row_idx().len(),
+            nnz_s_lambda_upper: self.penalty_pattern.nnz_upper,
+            nnz_h_upper: self.h_upper_symbolic.row_idx().len(),
+            density_upper: if upper_total == 0 {
+                0.0
+            } else {
+                self.h_upper_symbolic.row_idx().len() as f64 / upper_total as f64
+            },
+        }
+    }
+
+    fn assemble_upper(
+        &mut self,
+        x: &SparseColMat<usize, f64>,
+        weights: &Array1<f64>,
+        ridge: f64,
+    ) -> Result<SparseColMat<usize, f64>, EstimationError> {
+        if weights.len() != self.xtwx_cache.nrows {
+            return Err(EstimationError::InvalidInput(format!(
+                "weights length {} does not match design rows {}",
+                weights.len(),
+                self.xtwx_cache.nrows
+            )));
+        }
+        self.xtwx_cache.compute_numeric(x, weights)?;
+        self.h_upper_values.fill(0.0);
+
+        let mut cursor = self.h_upper_col_ptr[..self.p].to_vec();
+
+        let xtwx_col_ptr = self.xtwx_cache.xtwx_symbolic.col_ptr();
+        let xtwx_row_idx = self.xtwx_cache.xtwx_symbolic.row_idx();
+        for col in 0..self.p {
+            let start = xtwx_col_ptr[col];
+            let end = xtwx_col_ptr[col + 1];
+            for idx in start..end {
+                let row = xtwx_row_idx[idx];
+                if row <= col {
+                    let cursor_idx = &mut cursor[col];
+                    while *cursor_idx < self.h_upper_col_ptr[col + 1]
+                        && self.h_upper_row_idx[*cursor_idx] < row
+                    {
+                        *cursor_idx += 1;
+                    }
+                    if *cursor_idx >= self.h_upper_col_ptr[col + 1]
+                        || self.h_upper_row_idx[*cursor_idx] != row
+                    {
+                        return Err(EstimationError::InvalidInput(
+                            "penalized symbolic pattern missing XtWX entry".to_string(),
+                        ));
+                    }
+                    self.h_upper_values[*cursor_idx] += self.xtwx_cache.xtwx_values[idx];
+                }
+            }
+        }
+
+        cursor.copy_from_slice(&self.h_upper_col_ptr[..self.p]);
+        for &(row, col, value) in &self.penalty_pattern.upper_triplets {
+            let cursor_idx = &mut cursor[col];
+            while *cursor_idx < self.h_upper_col_ptr[col + 1]
+                && self.h_upper_row_idx[*cursor_idx] < row
+            {
+                *cursor_idx += 1;
+            }
+            if *cursor_idx >= self.h_upper_col_ptr[col + 1]
+                || self.h_upper_row_idx[*cursor_idx] != row
+            {
+                return Err(EstimationError::InvalidInput(
+                    "penalized symbolic pattern missing penalty entry".to_string(),
+                ));
+            }
+            self.h_upper_values[*cursor_idx] += value;
+        }
+
+        if ridge > 0.0 {
+            cursor.copy_from_slice(&self.h_upper_col_ptr[..self.p]);
+            for col in 0..self.p {
+                let cursor_idx = &mut cursor[col];
+                while *cursor_idx < self.h_upper_col_ptr[col + 1]
+                    && self.h_upper_row_idx[*cursor_idx] < col
+                {
+                    *cursor_idx += 1;
+                }
+                if *cursor_idx >= self.h_upper_col_ptr[col + 1]
+                    || self.h_upper_row_idx[*cursor_idx] != col
+                {
+                    return Err(EstimationError::InvalidInput(
+                        "penalized symbolic pattern missing diagonal entry".to_string(),
+                    ));
+                }
+                self.h_upper_values[*cursor_idx] += ridge;
+            }
+        }
+
+        Ok(SparseColMat::new(
+            self.h_upper_symbolic.clone(),
+            self.h_upper_values.clone(),
+        ))
+    }
+}
+
+fn build_penalized_symbolic(
+    p: usize,
+    xtwx_col_ptr: &[usize],
+    xtwx_row_idx: &[usize],
+    penalty_triplets: &[(usize, usize, f64)],
+) -> Result<SymbolicSparseColMat<usize>, EstimationError> {
+    let mut cols: Vec<BTreeSet<usize>> = (0..p).map(|_| BTreeSet::new()).collect();
+    for col in 0..p {
+        cols[col].insert(col);
+        let start = xtwx_col_ptr[col];
+        let end = xtwx_col_ptr[col + 1];
+        for &row in &xtwx_row_idx[start..end] {
+            if row <= col {
+                cols[col].insert(row);
+            }
+        }
+    }
+    for &(row, col, _) in penalty_triplets {
+        if row > col || col >= p {
+            return Err(EstimationError::InvalidInput(
+                "penalty sparse pattern must be upper-triangular within bounds".to_string(),
+            ));
+        }
+        cols[col].insert(row);
+    }
+
+    let mut col_ptr = Vec::with_capacity(p + 1);
+    let mut row_idx = Vec::new();
+    col_ptr.push(0);
+    for rows in cols {
+        row_idx.extend(rows.into_iter());
+        col_ptr.push(row_idx.len());
+    }
+    Ok(unsafe { SymbolicSparseColMat::new_unchecked(p, p, col_ptr, None, row_idx) })
 }
 
 pub trait WorkingModel {
@@ -301,6 +570,8 @@ pub struct PirlsWorkspace {
     pub vec_buf_p: Array1<f64>,
     // Cached sparse XtWX workspace (symbolic + scratch)
     pub(crate) sparse_xtwx_cache: Option<SparseXtWxCache>,
+    // Cached sparse penalized-system workspace for sparse-native solve eligibility/assembly.
+    sparse_penalized_system_cache: Option<SparsePenalizedSystemCache>,
     // Factorization scratch (avoid per-iteration allocation)
     pub factorization_scratch: MemBuffer,
     // Permutation buffers for LDLT
@@ -333,6 +604,7 @@ impl PirlsWorkspace {
             delta_eta: Array1::zeros(n),
             vec_buf_p: Array1::zeros(p),
             sparse_xtwx_cache: None,
+            sparse_penalized_system_cache: None,
             // Keep scratch minimal at init; grow only if/when a factorization path
             // needs it.
             factorization_scratch: {
@@ -405,6 +677,50 @@ impl PirlsWorkspace {
             .as_mut()
             .ok_or_else(|| EstimationError::InvalidInput("missing sparse cache".to_string()))?;
         cache.compute_dense(&csc_view, weights)
+    }
+
+    fn sparse_penalized_system_stats(
+        &mut self,
+        x: &SparseColMat<usize, f64>,
+        s_lambda: &Array2<f64>,
+    ) -> Result<SparsePenalizedSystemStats, EstimationError> {
+        let penalty_pattern = SparsePenaltyPattern::from_dense_upper(s_lambda, 1e-12);
+        let rebuild = match self.sparse_penalized_system_cache.as_ref() {
+            Some(cache) => !cache.matches(x, &penalty_pattern),
+            None => true,
+        };
+        if rebuild {
+            self.sparse_penalized_system_cache =
+                Some(SparsePenalizedSystemCache::new(x, penalty_pattern)?);
+        }
+        let cache = self.sparse_penalized_system_cache.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput("missing sparse penalized cache".to_string())
+        })?;
+        Ok(cache.stats())
+    }
+
+    // Phase 2 hook: numeric sparse penalized-system assembly in original coordinates.
+    #[allow(dead_code)]
+    fn assemble_sparse_penalized_hessian(
+        &mut self,
+        x: &SparseColMat<usize, f64>,
+        weights: &Array1<f64>,
+        s_lambda: &Array2<f64>,
+        ridge: f64,
+    ) -> Result<SparseColMat<usize, f64>, EstimationError> {
+        let penalty_pattern = SparsePenaltyPattern::from_dense_upper(s_lambda, 1e-12);
+        let rebuild = match self.sparse_penalized_system_cache.as_ref() {
+            Some(cache) => !cache.matches(x, &penalty_pattern),
+            None => true,
+        };
+        if rebuild {
+            self.sparse_penalized_system_cache =
+                Some(SparsePenalizedSystemCache::new(x, penalty_pattern)?);
+        }
+        let cache = self.sparse_penalized_system_cache.as_mut().ok_or_else(|| {
+            EstimationError::InvalidInput("missing sparse penalized cache".to_string())
+        })?;
+        cache.assemble_upper(x, weights, ridge)
     }
 }
 
@@ -903,11 +1219,11 @@ impl SparseXtWxCache {
         self.x_col_ptr.as_slice() == sym.col_ptr() && self.x_row_idx.as_slice() == sym.row_idx()
     }
 
-    fn compute_dense(
+    fn compute_numeric(
         &mut self,
         x: &SparseColMat<usize, f64>,
         weights: &Array1<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
+    ) -> Result<(), EstimationError> {
         if weights.len() != self.nrows {
             return Err(EstimationError::InvalidInput(format!(
                 "weights length {} does not match design rows {}",
@@ -958,9 +1274,20 @@ impl SparseXtWxCache {
             &mut stack,
         );
 
+        Ok(())
+    }
+
+    fn compute_dense(
+        &mut self,
+        x: &SparseColMat<usize, f64>,
+        weights: &Array1<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        self.compute_numeric(x, weights)?;
+
         // Convert sparse XtWX directly into ndarray without materializing an
         // intermediate faer dense matrix.
         let mut out = Array2::<f64>::zeros((self.ncols, self.ncols));
+        let xtwx_symbolic = self.xtwx_symbolic.as_ref();
         let col_ptr = xtwx_symbolic.col_ptr();
         let row_idx = xtwx_symbolic.row_idx();
         for col in 0..self.ncols {
@@ -1206,6 +1533,115 @@ fn project_coefficients_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &A
             beta[i] = lb;
         }
     }
+}
+
+fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
+    let p = matrix.nrows().min(matrix.ncols());
+    let mut nnz = 0usize;
+    for col in 0..p {
+        for row in 0..=col {
+            if matrix[[row, col]].abs() > tol {
+                nnz += 1;
+            }
+        }
+    }
+    nnz
+}
+
+fn estimate_sparse_native_decision(
+    workspace: &mut PirlsWorkspace,
+    x_original: &DesignMatrix,
+    s_lambda: &Array2<f64>,
+    firth_bias_reduction: bool,
+    linear_constraints_original: Option<&LinearInequalityConstraints>,
+    qs_required: bool,
+) -> SparsePirlsDecision {
+    let p = x_original.ncols();
+    let nnz_s_lambda = count_dense_upper_nnz(s_lambda, 1e-12);
+    let dense_reject = |reason: &'static str, nnz_x: usize| SparsePirlsDecision {
+        path: PirlsLinearSolvePath::DenseTransformed,
+        reason,
+        p,
+        nnz_x,
+        nnz_xtwx_symbolic: None,
+        nnz_s_lambda,
+        nnz_h_est: None,
+        density_h_est: None,
+    };
+
+    if firth_bias_reduction {
+        return dense_reject("firth_active", 0);
+    }
+    if linear_constraints_original.is_some() {
+        return dense_reject("constraints_present", 0);
+    }
+    if qs_required {
+        return dense_reject("transformed_basis_required", 0);
+    }
+
+    let x_sparse = match x_original {
+        DesignMatrix::Sparse(sparse) => sparse,
+        DesignMatrix::Dense(matrix) => {
+            return dense_reject(
+                "design_not_sparse",
+                matrix.iter().filter(|v| v.abs() > 1e-12).count(),
+            );
+        }
+    };
+    let nnz_x = x_sparse.val().len();
+    if p < SPARSE_NATIVE_MIN_P {
+        return dense_reject("p_below_threshold", nnz_x);
+    }
+    match workspace.sparse_penalized_system_stats(x_sparse, s_lambda) {
+        Ok(stats) => {
+            let decision = SparsePirlsDecision {
+                path: PirlsLinearSolvePath::DenseTransformed,
+                reason: if stats.density_upper <= SPARSE_NATIVE_MAX_H_DENSITY {
+                    "sparse_native_not_enabled"
+                } else {
+                    "penalized_hessian_too_dense"
+                },
+                p,
+                nnz_x,
+                nnz_xtwx_symbolic: Some(stats.nnz_xtwx_symbolic),
+                nnz_s_lambda: stats.nnz_s_lambda_upper,
+                nnz_h_est: Some(stats.nnz_h_upper),
+                density_h_est: Some(stats.density_upper),
+            };
+            decision
+        }
+        Err(_) => dense_reject("sparse_stats_failed", nnz_x),
+    }
+}
+
+fn should_use_sparse_native_pirls(
+    workspace: &mut PirlsWorkspace,
+    x_original: &DesignMatrix,
+    s_lambda: &Array2<f64>,
+    firth_bias_reduction: bool,
+    linear_constraints_original: Option<&LinearInequalityConstraints>,
+    qs_required: bool,
+) -> SparsePirlsDecision {
+    estimate_sparse_native_decision(
+        workspace,
+        x_original,
+        s_lambda,
+        firth_bias_reduction,
+        linear_constraints_original,
+        qs_required,
+    )
+}
+
+// Phase 2 hook for targeted tests and the eventual sparse-native PIRLS solve path.
+#[allow(dead_code)]
+fn assemble_sparse_penalized_hessian(
+    workspace: &mut PirlsWorkspace,
+    x: &SparseColMat<usize, f64>,
+    weights: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    ridge: f64,
+) -> Result<SparseColMat<usize, f64>, EstimationError> {
+    workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge)
 }
 
 fn solve_subsystem_direction(
@@ -2488,6 +2924,15 @@ pub fn fit_model_for_fixed_rho<'a>(
     let eb_rows = eb.nrows();
     let e_rows = reparam_result.e_transformed.nrows();
     let mut workspace = PirlsWorkspace::new(x.nrows(), x.ncols(), eb_rows, e_rows);
+    let solver_decision = should_use_sparse_native_pirls(
+        &mut workspace,
+        &x_original,
+        &reparam_result.s_transformed,
+        config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
+        linear_constraints_original,
+        use_explicit || matches!(link_function, LinkFunction::Identity),
+    );
+    solver_decision.log_once();
 
     if matches!(link_function, LinkFunction::Identity) {
         let x_transformed_dense = x_transformed_dense
@@ -2928,7 +3373,16 @@ fn fit_model_for_fixed_rho_sparse_implicit(
     let x_original = DesignMatrix::from(x_sparse.clone());
     let eb_rows = eb.nrows();
     let e_rows = reparam_result.e_transformed.nrows();
-    let workspace = PirlsWorkspace::new(x_sparse.nrows(), x_sparse.ncols(), eb_rows, e_rows);
+    let mut workspace = PirlsWorkspace::new(x_sparse.nrows(), x_sparse.ncols(), eb_rows, e_rows);
+    let solver_decision = should_use_sparse_native_pirls(
+        &mut workspace,
+        &x_original,
+        &reparam_result.s_transformed,
+        false,
+        linear_constraints_original,
+        false,
+    );
+    solver_decision.log_once();
     let mut working_model = GamWorkingModel::new(
         None,
         x_original.clone(),
@@ -4194,12 +4648,15 @@ pub fn compute_final_penalized_hessian(
 #[cfg(test)]
 mod tests {
     use super::{
-        LinearInequalityConstraints, calculate_scale, compute_constraint_kkt_diagnostics,
-        default_beta_guess_external, solve_newton_direction_with_linear_constraints,
+        LinearInequalityConstraints, PirlsLinearSolvePath, PirlsWorkspace, calculate_scale,
+        compute_constraint_kkt_diagnostics, default_beta_guess_external,
+        should_use_sparse_native_pirls, solve_newton_direction_with_linear_constraints,
     };
+    use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
     use crate::types::LinkFunction;
-    use ndarray::{Array1, array};
+    use faer::sparse::{SparseColMat, Triplet};
+    use ndarray::{Array1, Array2, array};
 
     #[test]
     fn gaussian_scale_uses_offset_in_residuals() {
@@ -4355,5 +4812,75 @@ mod tests {
         assert!((beta[0] - expected).abs() < 1e-12);
         assert_eq!(beta[1], 0.0);
         assert_eq!(beta[2], 0.0);
+    }
+
+    #[test]
+    fn sparse_native_decision_rejects_dense_design() {
+        let x = DesignMatrix::Dense(array![[1.0, 0.0], [0.0, 1.0]]);
+        let s = array![[1.0, 0.0], [0.0, 1.0]];
+        let mut workspace = PirlsWorkspace::new(2, 2, 0, 0);
+        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, false, None, false);
+        assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
+        assert_eq!(decision.reason, "design_not_sparse");
+    }
+
+    #[test]
+    fn sparse_native_decision_collects_sparse_stats_for_large_sparse_design() {
+        let triplets: Vec<_> = (0..300).map(|i| Triplet::new(i, i, 1.0)).collect();
+        let x = SparseColMat::try_new_from_triplets(300, 300, &triplets)
+            .expect("sparse identity should build");
+        let x = DesignMatrix::from(x);
+        let s = Array2::from_diag(&Array1::ones(300));
+        let mut workspace = PirlsWorkspace::new(300, 300, 0, 0);
+        let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, false, None, false);
+        assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
+        assert_eq!(decision.reason, "sparse_native_not_enabled");
+        assert_eq!(decision.nnz_x, 300);
+        assert_eq!(decision.nnz_xtwx_symbolic, Some(300));
+        assert_eq!(decision.nnz_h_est, Some(300));
+        assert!(decision.density_h_est.expect("density") < 0.01);
+    }
+
+    #[test]
+    fn sparse_penalized_assembly_matches_dense_diagonal_case() {
+        let triplets = vec![
+            Triplet::new(0, 0, 1.0),
+            Triplet::new(1, 1, 2.0),
+            Triplet::new(2, 2, 3.0),
+        ];
+        let x = SparseColMat::try_new_from_triplets(3, 3, &triplets)
+            .expect("diagonal sparse matrix should build");
+        let weights = array![2.0, 3.0, 5.0];
+        let s_lambda = array![[4.0, 0.0, 0.0], [0.0, 6.0, 0.0], [0.0, 0.0, 8.0]];
+        let ridge = 1e-8;
+        let mut workspace = PirlsWorkspace::new(3, 3, 0, 0);
+        let assembled = super::assemble_sparse_penalized_hessian(
+            &mut workspace,
+            &x,
+            &weights,
+            &s_lambda,
+            ridge,
+        )
+        .expect("sparse penalized assembly should succeed");
+        let dense = DesignMatrix::from(x.clone()).to_dense();
+        let mut expected = dense.t().dot(&Array2::from_diag(&weights)).dot(&dense);
+        expected += &s_lambda;
+        for i in 0..3 {
+            expected[[i, i]] += ridge;
+        }
+        let actual = DesignMatrix::from(assembled).to_dense();
+        for i in 0..3 {
+            for j in 0..3 {
+                let target = if i <= j { expected[[i, j]] } else { 0.0 };
+                assert!(
+                    (actual[[i, j]] - target).abs() < 1e-10,
+                    "mismatch at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    actual[[i, j]],
+                    target
+                );
+            }
+        }
     }
 }

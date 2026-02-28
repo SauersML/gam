@@ -14,8 +14,8 @@ use crate::families::sigma_link::{
     bounded_sigma_and_deriv_from_eta_scalar, bounded_sigma_from_eta_scalar,
 };
 use crate::smooth::{
-    MaternKappaOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
-    optimize_two_block_matern_kappa,
+    SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
+    optimize_two_block_spatial_length_scale,
 };
 use crate::types::{LikelihoodFamily, LinkFunction};
 use faer::Mat as FaerMat;
@@ -952,7 +952,7 @@ pub fn fit_gaussian_location_scale_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: GaussianLocationScaleTermSpec,
     options: &BlockwiseFitOptions,
-    kappa_options: &MaternKappaOptimizationOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BlockwiseTermFitResult, String> {
     let y = spec.y;
     let weights = spec.weights;
@@ -960,7 +960,7 @@ pub fn fit_gaussian_location_scale_terms(
     let sigma_max = spec.sigma_max;
     let mut mean_log_lambda_hint: Option<Array1<f64>> = None;
     let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
-    let solved = optimize_two_block_matern_kappa(
+    let solved = optimize_two_block_spatial_length_scale(
         data,
         &spec.mean_spec,
         &spec.log_sigma_spec,
@@ -1016,7 +1016,7 @@ pub fn fit_binomial_location_scale_probit_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: BinomialLocationScaleProbitTermSpec,
     options: &BlockwiseFitOptions,
-    kappa_options: &MaternKappaOptimizationOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BlockwiseTermFitResult, String> {
     let y = spec.y;
     let weights = spec.weights;
@@ -1024,7 +1024,7 @@ pub fn fit_binomial_location_scale_probit_terms(
     let sigma_max = spec.sigma_max;
     let mut threshold_log_lambda_hint: Option<Array1<f64>> = None;
     let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
-    let solved = optimize_two_block_matern_kappa(
+    let solved = optimize_two_block_spatial_length_scale(
         data,
         &spec.threshold_spec,
         &spec.log_sigma_spec,
@@ -1081,7 +1081,7 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: BinomialLocationScaleProbitWiggleTermSpec,
     options: &BlockwiseFitOptions,
-    kappa_options: &MaternKappaOptimizationOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BlockwiseTermFitResult, String> {
     let y = spec.y;
     let weights = spec.weights;
@@ -1092,7 +1092,7 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms(
     let wiggle_block = spec.wiggle_block;
     let mut threshold_log_lambda_hint: Option<Array1<f64>> = None;
     let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
-    let solved = optimize_two_block_matern_kappa(
+    let solved = optimize_two_block_spatial_length_scale(
         data,
         &spec.threshold_spec,
         &spec.log_sigma_spec,
