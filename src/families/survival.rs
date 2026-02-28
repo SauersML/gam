@@ -632,31 +632,21 @@ impl WorkingModelSurvival {
     ///     - 0.5 * tr(S^+ A_k).
     ///
     /// For this Royston-Parmar survival likelihood, the hard part is the
-    /// `tr(H^{-1} dH/drho_k)` contraction. We evaluate it exactly without
-    /// building any 3-tensor:
-    ///   tr(H^{-1} dH/drho_k) = tr(H^{-1} A_k) + third_derivative_contraction.
+    /// `tr(H^{-1} dH/drho_k)` contraction. We evaluate it exactly as:
+    ///   tr(H^{-1} dH/drho_k)
+    ///     = tr(H^{-1} A_k) + tr(H^{-1} (dH_nll/d beta [u_k])),
+    /// where:
+    ///   u_k = d beta_hat / d rho_k = -H^{-1} A_k beta_hat
+    /// and `dH_nll/d beta [u_k]` is the exact directional derivative of the
+    /// (unpenalized) Hessian with respect to `beta` along `u_k`.
     ///
-    /// The contraction is reduced to vector operations with leverage-like
-    /// diagonals:
-    /// - `q1_i = x_exit_i^T H^{-1} x_exit_i`
-    /// - `q0_i = x_entry_i^T H^{-1} x_entry_i`
-    /// - `qd_i = d_i^T H^{-1} d_i`
+    /// This is exact in both linear and structural-monotonic parameterizations.
     ///
-    /// and `u_k = d beta_hat / d rho_k = -H^{-1} A_k beta_hat`.
-    ///
-    /// Then:
-    /// - `+ sum_i w_i * exp(eta_exit_i)  * (x_exit_i^T u_k) * q1_i`
-    /// - `- sum_i w_i * exp(eta_entry_i) * (x_entry_i^T u_k) * q0_i`
-    /// - `- 2 * sum_events w_i * (d_i^T u_k) * qd_i / (d_i^T beta_hat)^3`
-    ///
-    /// The last term is the exact contribution from differentiating
-    /// `delta_i * log(d_i^T beta)` through the Hessian.
-    ///
-    /// Fast exact trace-contraction implementation details:
+    /// Exact trace-contraction implementation details:
     /// - factorize `H` once,
     /// - compute `H^{-1}` actions by solves (`solve_vec` / `solve_mat`),
-    /// - compute leverages by solving `H Z = X^T` blocks,
-    /// - avoid explicit dense `H^{-1}` materialization.
+    /// - build directional Hessian derivative `dH_nll/d beta [u_k]` analytically,
+    /// - evaluate trace as `tr(H^{-1} B)` using `solve_mat(B)`.
     ///
     /// Complexity per outer evaluation (dense):
     /// - shared precompute: `O(np^2 + p^3)`,
@@ -676,54 +666,6 @@ impl WorkingModelSurvival {
         let p = beta.len();
         let k_count = self.penalties.blocks.len();
         let objective = self.laml_objective_from_state(beta, state)?;
-
-        if self.structurally_monotonic {
-            if k_count == 0 {
-                return Ok((objective, Array1::zeros(0)));
-            }
-            // Structural monotonicity introduces nonlinearity in eta(beta), which
-            // changes third-derivative contractions. Use objective-consistent
-            // central differences in rho-space with full inner re-solves.
-            let fd_step = 1e-4_f64;
-            let mut grad = Array1::<f64>::zeros(k_count);
-            for k in 0..k_count {
-                let mut plus_model = self.clone();
-                let mut minus_model = self.clone();
-                plus_model.penalties.blocks[k].lambda *= fd_step.exp();
-                minus_model.penalties.blocks[k].lambda *= (-fd_step).exp();
-
-                let eval_mode_objective =
-                    |model: &WorkingModelSurvival| -> Result<f64, EstimationError> {
-                        let mut model_local = model.clone();
-                        let opts = crate::pirls::WorkingModelPirlsOptions {
-                            max_iterations: 200,
-                            convergence_tolerance: 1e-7,
-                            max_step_halving: 40,
-                            min_step_size: 1e-12,
-                            firth_bias_reduction: false,
-                            coefficient_lower_bounds: None,
-                            linear_constraints: model_local.monotonicity_linear_constraints(),
-                        };
-                        let out = crate::pirls::run_working_model_pirls(
-                            &mut model_local,
-                            crate::types::Coefficients::new(beta.clone()),
-                            &opts,
-                            |_info| {},
-                        )
-                        .map_err(|e| {
-                            EstimationError::InvalidInput(format!(
-                                "structural LAML finite-difference inner solve failed: {e}"
-                            ))
-                        })?;
-                        model_local.laml_objective_from_state(&out.beta.0, &out.state)
-                    };
-
-                let v_plus = eval_mode_objective(&plus_model)?;
-                let v_minus = eval_mode_objective(&minus_model)?;
-                grad[k] = (v_plus - v_minus) / (2.0 * fd_step);
-            }
-            return Ok((objective, grad));
-        }
 
         if k_count == 0 {
             return Ok((objective, Array1::zeros(0)));
@@ -749,32 +691,23 @@ impl WorkingModelSurvival {
 
         // Keep outer gradient contractions consistent with the fitted inner state:
         // the working predictor includes target baseline offsets plus learned deviation.
-        let eta_entry = self.x_entry.dot(beta) + &self.offset_eta_entry;
-        let eta_exit = self.x_exit.dot(beta) + &self.offset_eta_exit;
-        let deriv_raw = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
+        let (theta, jac, curvature) = self.transformed_coefficients(beta)?;
+        let mut third = Array1::<f64>::zeros(p);
+        if self.structurally_monotonic {
+            let time_cols = self.structural_time_columns.min(p);
+            for j in 0..time_cols {
+                // For theta_j = exp(beta_j): first=second=third=exp(beta_j).
+                third[j] = theta[j];
+            }
+        }
+        let eta_entry = self.x_entry.dot(&theta) + &self.offset_eta_entry;
+        let eta_exit = self.x_exit.dot(&theta) + &self.offset_eta_exit;
+        let deriv_raw = self.x_derivative.dot(&theta) + &self.offset_derivative_exit;
         let exp_entry = eta_entry.mapv(f64::exp);
         let exp_exit = eta_exit.mapv(f64::exp);
         let guard = self.monotonicity.tolerance.max(1e-12);
         let guard_numerical = (guard - (1e-10_f64).min(0.01 * guard)).max(1e-12);
-
-        // Leverage-like diagonals used by the third-derivative contraction:
-        // q_i = x_i^T H^{-1} x_i, computed via solves against X^T blocks.
-        let z1 = solve_mat(&self.x_exit.t().to_owned());
-        let z0 = solve_mat(&self.x_entry.t().to_owned());
-        let zd = solve_mat(&self.x_derivative.t().to_owned());
         let n = self.x_exit.nrows();
-        let mut q1 = Array1::<f64>::zeros(n);
-        let mut q0 = Array1::<f64>::zeros(n);
-        let mut qd = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            q1[i] = self.x_exit.row(i).dot(&z1.column(i)).max(0.0);
-            q0[i] = if self.entry_at_origin[i] {
-                0.0
-            } else {
-                self.x_entry.row(i).dot(&z0.column(i)).max(0.0)
-            };
-            qd[i] = self.x_derivative.row(i).dot(&zd.column(i)).max(0.0);
-        }
 
         // Assemble S(rho) in the same scaling used by update_state.
         let mut s_total = Array2::<f64>::zeros((p, p));
@@ -828,9 +761,6 @@ impl WorkingModelSurvival {
             // Implicit inner derivative:
             // d beta_hat / d rho_k = -H^{-1} A_k beta_hat.
             let u_k = -solve_vec(&a_k_beta);
-            let s1k = self.x_exit.dot(&u_k);
-            let s0k = self.x_entry.dot(&u_k);
-            let sdk = self.x_derivative.dot(&u_k);
 
             // trace(H^{-1} A_k) on block support via solves against block unit vectors.
             // This is equivalent to Frobenius inner product <H^{-1}, A_k>, but
@@ -850,18 +780,75 @@ impl WorkingModelSurvival {
                 }
             }
 
-            // Tensor-free exact third-derivative contraction:
-            // + sum_i exp(eta_exit_i)  (x_exit_i^T u_k) q1_i
-            // - sum_i exp(eta_entry_i) (x_entry_i^T u_k) q0_i
-            // - 2 sum_events (d_i^T u_k) qd_i / (d_i^T beta)^3
-            // The last term is from differentiating delta_i * log(d_i^T beta).
-            let mut trace_third = 0.0_f64;
+            // Exact directional derivative B = dH_nll/d beta [u_k].
+            // dH/drho_k = A_k + B, so the non-penalty trace piece is tr(H^{-1} B).
+            let mut b_dir = Array2::<f64>::zeros((p, p));
+            let mut ge = vec![0.0_f64; p];
+            let mut gs = vec![0.0_f64; p];
+            let mut gsd = vec![0.0_f64; p];
+            let mut he = vec![0.0_f64; p];
+            let mut hs = vec![0.0_f64; p];
+            let mut hsd = vec![0.0_f64; p];
+            let mut te = vec![0.0_f64; p];
+            let mut ts = vec![0.0_f64; p];
+            let mut tsd = vec![0.0_f64; p];
             for i in 0..n {
                 let w_i = self.sample_weight[i];
-                trace_third += w_i * exp_exit[i] * s1k[i] * q1[i];
-                if !self.entry_at_origin[i] {
-                    trace_third -= w_i * exp_entry[i] * s0k[i] * q0[i];
+                if w_i <= 0.0 {
+                    continue;
                 }
+                let has_entry = !self.entry_at_origin[i];
+                let mut deta_e = 0.0_f64;
+                let mut deta_s = 0.0_f64;
+                let mut ds = 0.0_f64;
+                let x_e = self.x_exit.row(i);
+                let x_s = self.x_entry.row(i);
+                let d_row = self.x_derivative.row(i);
+                for j in 0..p {
+                    ge[j] = x_e[j] * jac[j];
+                    gs[j] = x_s[j] * jac[j];
+                    gsd[j] = d_row[j] * jac[j];
+                    he[j] = x_e[j] * curvature[j];
+                    hs[j] = x_s[j] * curvature[j];
+                    hsd[j] = d_row[j] * curvature[j];
+                    te[j] = x_e[j] * third[j];
+                    ts[j] = x_s[j] * third[j];
+                    tsd[j] = d_row[j] * third[j];
+                    deta_e += ge[j] * u_k[j];
+                    if has_entry {
+                        deta_s += gs[j] * u_k[j];
+                    }
+                    ds += gsd[j] * u_k[j];
+                }
+
+                // Interval part:
+                // d/dβ [ exp(eta) * (g g^T + diag(h)) ][u]
+                for r in 0..p {
+                    let dge_r = he[r] * u_k[r];
+                    let dgs_r = hs[r] * u_k[r];
+                    let dhe_r = te[r] * u_k[r];
+                    let dhs_r = ts[r] * u_k[r];
+                    for c in 0..p {
+                        let dge_c = he[c] * u_k[c];
+                        let dgs_c = hs[c] * u_k[c];
+                        let mut d_h_rc =
+                            exp_exit[i] * (deta_e * ge[r] * ge[c] + dge_r * ge[c] + ge[r] * dge_c);
+                        if r == c {
+                            d_h_rc += exp_exit[i] * (deta_e * he[r] + dhe_r);
+                        }
+                        if has_entry {
+                            d_h_rc -= exp_entry[i]
+                                * (deta_s * gs[r] * gs[c] + dgs_r * gs[c] + gs[r] * dgs_c);
+                            if r == c {
+                                d_h_rc -= exp_entry[i] * (deta_s * hs[r] + dhs_r);
+                            }
+                        }
+                        b_dir[[r, c]] += w_i * d_h_rc;
+                    }
+                }
+
+                // Event part:
+                // d/dβ [ gsd gsd^T / s^2 - diag(he) - diag(hsd / s) ][u]
                 if self.event_target[i] > 0 {
                     let s_i = deriv_raw[i];
                     if s_i <= guard_numerical || !s_i.is_finite() {
@@ -870,9 +857,29 @@ impl WorkingModelSurvival {
                             i, s_i, guard
                         )));
                     }
-                    trace_third -= 2.0 * w_i * sdk[i] * qd[i] / (s_i * s_i * s_i);
+                    let inv_s = 1.0 / s_i;
+                    let inv_s2 = inv_s * inv_s;
+                    let inv_s3 = inv_s2 * inv_s;
+                    for r in 0..p {
+                        let dgd_r = hsd[r] * u_k[r];
+                        let dte_r = te[r] * u_k[r];
+                        let dtsd_r = tsd[r] * u_k[r];
+                        for c in 0..p {
+                            let dgd_c = hsd[c] * u_k[c];
+                            let mut d_h_rc = (dgd_r * gsd[c] + gsd[r] * dgd_c) * inv_s2
+                                - 2.0 * gsd[r] * gsd[c] * ds * inv_s3;
+                            if r == c {
+                                d_h_rc += -dte_r;
+                                d_h_rc += -(dtsd_r * inv_s - hsd[r] * ds * inv_s2);
+                            }
+                            b_dir[[r, c]] += w_i * d_h_rc;
+                        }
+                    }
                 }
             }
+
+            let h_inv_b = solve_mat(&b_dir);
+            let trace_third = (0..p).map(|d| h_inv_b[[d, d]]).sum::<f64>();
             let t_k = trace_hinv_ak + trace_third;
 
             let mut p_k = 0.0_f64;
@@ -1712,6 +1719,101 @@ mod tests {
             assert!(
                 rel_err < 6e-1 || abs_err < 2.0,
                 "rho-grad mismatch at k={k}: analytic={:.6e} fd={:.6e} abs={:.3e} rel={:.3e}",
+                analytic[k],
+                fd[k],
+                abs_err,
+                rel_err
+            );
+        }
+    }
+
+    #[test]
+    fn laml_rho_gradient_matches_fd_in_event_heavy_third_derivative_regime() {
+        let n = 7usize;
+        let p = 3usize;
+
+        let age_entry = array![30.0, 34.0, 38.0, 42.0, 46.0, 50.0, 54.0];
+        let age_exit = array![33.0, 37.0, 41.0, 45.0, 49.0, 53.0, 57.0];
+        let event_target = Array1::from_elem(n, 1u8);
+        let event_competing = Array1::<u8>::zeros(n);
+        let sample_weight = Array1::ones(n);
+
+        let mut x_entry = Array2::<f64>::zeros((n, p));
+        let mut x_exit = Array2::<f64>::zeros((n, p));
+        let mut x_derivative = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let te = (age_entry[i] / 40.0) - 1.0;
+            let tx = (age_exit[i] / 40.0) - 1.0;
+            x_entry[[i, 0]] = 1.0;
+            x_entry[[i, 1]] = te;
+            x_entry[[i, 2]] = te * te;
+            x_exit[[i, 0]] = 1.0;
+            x_exit[[i, 1]] = tx;
+            x_exit[[i, 2]] = tx * tx;
+
+            // Positive derivative design to keep event log-derivative term active.
+            x_derivative[[i, 0]] = 0.0;
+            x_derivative[[i, 1]] = 0.02;
+            x_derivative[[i, 2]] = 0.0008 * age_exit[i];
+        }
+
+        let penalties = PenaltyBlocks::new(vec![
+            PenaltyBlock {
+                matrix: array![[1.0]],
+                lambda: 1.0,
+                range: 1..2,
+            },
+            PenaltyBlock {
+                matrix: array![[1.0]],
+                lambda: 1.0,
+                range: 2..3,
+            },
+        ]);
+        let mono = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 1e-8,
+        };
+        let base_model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct event-heavy survival model");
+
+        let rho = array![0.15f64, -0.25f64];
+        let beta0 = array![-2.2, 0.4, 0.1];
+        let (obj, analytic, beta_hat) = laml_objective_at_rho(&base_model, &rho, &beta0);
+        assert!(obj.is_finite());
+        assert!(analytic.iter().all(|v| v.is_finite()));
+
+        let eps = 5e-4;
+        let mut fd = Array1::<f64>::zeros(rho.len());
+        for k in 0..rho.len() {
+            let mut rho_plus = rho.clone();
+            rho_plus[k] += eps;
+            let mut rho_minus = rho.clone();
+            rho_minus[k] -= eps;
+            let (obj_plus, _, _) = laml_objective_at_rho(&base_model, &rho_plus, &beta_hat);
+            let (obj_minus, _, _) = laml_objective_at_rho(&base_model, &rho_minus, &beta_hat);
+            fd[k] = (obj_plus - obj_minus) / (2.0 * eps);
+        }
+
+        for k in 0..rho.len() {
+            let abs_err = (analytic[k] - fd[k]).abs();
+            let rel_err = abs_err / fd[k].abs().max(1e-6);
+            assert!(
+                rel_err < 5e-1 || abs_err < 1.0,
+                "event-heavy rho-grad mismatch at k={k}: analytic={:.6e} fd={:.6e} abs={:.3e} rel={:.3e}",
                 analytic[k],
                 fd[k],
                 abs_err,
