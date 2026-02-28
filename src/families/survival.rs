@@ -415,6 +415,13 @@ impl WorkingModelSurvival {
         // near the active boundary.
         let derivative_guard_numerical =
             (derivative_guard - (1e-10_f64).min(0.01 * derivative_guard)).max(1e-12);
+        // Reuse per-row work buffers to avoid hot-loop heap allocations.
+        let mut g_eta_exit = vec![0.0_f64; p];
+        let mut g_eta_entry = vec![0.0_f64; p];
+        let mut h_eta_exit_diag = vec![0.0_f64; p];
+        let mut h_eta_entry_diag = vec![0.0_f64; p];
+        let mut g_s = vec![0.0_f64; p];
+        let mut h_s_diag = vec![0.0_f64; p];
         for i in 0..n {
             let w = self.sample_weight[i];
             if w <= 0.0 {
@@ -443,10 +450,6 @@ impl WorkingModelSurvival {
             //   exp(eta_exit) - exp(eta_entry)
             // Gradient piece:
             //   exp(eta_exit) * d_eta_exit/d_beta - exp(eta_entry) * d_eta_entry/d_beta
-            let mut g_eta_exit = vec![0.0_f64; p];
-            let mut g_eta_entry = vec![0.0_f64; p];
-            let mut h_eta_exit_diag = vec![0.0_f64; p];
-            let mut h_eta_entry_diag = vec![0.0_f64; p];
             for j in 0..p {
                 g_eta_exit[j] = x_e[j] * jac[j];
                 g_eta_entry[j] = x_s[j] * jac[j];
@@ -498,8 +501,6 @@ impl WorkingModelSurvival {
                 //
                 // Gradient piece:
                 //   -d_eta_exit/d_beta - (d_s/d_beta) / s_i
-                let mut g_s = vec![0.0_f64; p];
-                let mut h_s_diag = vec![0.0_f64; p];
                 for j in 0..p {
                     g_s[j] = d_row[j] * jac[j];
                     h_s_diag[j] = d_row[j] * curvature[j];
@@ -688,6 +689,11 @@ impl WorkingModelSurvival {
             let solved = solve_mat(&rhs_mat);
             solved.column(0).to_owned()
         };
+        let mut eye = Array2::<f64>::zeros((p, p));
+        for d in 0..p {
+            eye[[d, d]] = 1.0;
+        }
+        let h_inv = solve_mat(&eye);
 
         // Keep outer gradient contractions consistent with the fitted inner state:
         // the working predictor includes target baseline offsets plus learned deviation.
@@ -708,6 +714,16 @@ impl WorkingModelSurvival {
         let guard = self.monotonicity.tolerance.max(1e-12);
         let guard_numerical = (guard - (1e-10_f64).min(0.01 * guard)).max(1e-12);
         let n = self.x_exit.nrows();
+        let mut b_dir = Array2::<f64>::zeros((p, p));
+        let mut ge = vec![0.0_f64; p];
+        let mut gs = vec![0.0_f64; p];
+        let mut gsd = vec![0.0_f64; p];
+        let mut he = vec![0.0_f64; p];
+        let mut hs = vec![0.0_f64; p];
+        let mut hsd = vec![0.0_f64; p];
+        let mut te = vec![0.0_f64; p];
+        let mut ts = vec![0.0_f64; p];
+        let mut tsd = vec![0.0_f64; p];
 
         // Assemble S(rho) in the same scaling used by update_state.
         let mut s_total = Array2::<f64>::zeros((p, p));
@@ -762,36 +778,17 @@ impl WorkingModelSurvival {
             // d beta_hat / d rho_k = -H^{-1} A_k beta_hat.
             let u_k = -solve_vec(&a_k_beta);
 
-            // trace(H^{-1} A_k) on block support via solves against block unit vectors.
-            // This is equivalent to Frobenius inner product <H^{-1}, A_k>, but
-            // computed from selected solved columns only.
-            let block_dim = r.len();
-            let mut block_basis = Array2::<f64>::zeros((p, block_dim));
-            for (j_local, j) in r.clone().enumerate() {
-                block_basis[[j, j_local]] = 1.0;
-            }
-            let solved_basis = solve_mat(&block_basis);
+            // trace(H^{-1} A_k) on block support from precomputed H^{-1}.
             let mut trace_hinv_ak = 0.0_f64;
             for (i_local, i) in r.clone().enumerate() {
-                for (j_local, _j) in r.clone().enumerate() {
-                    // solved_basis[i, j_local] = H^{-1}_{i, r[j_local]}.
-                    trace_hinv_ak +=
-                        solved_basis[[i, j_local]] * (lambda * block.matrix[[j_local, i_local]]);
+                for (j_local, j) in r.clone().enumerate() {
+                    trace_hinv_ak += h_inv[[i, j]] * (lambda * block.matrix[[j_local, i_local]]);
                 }
             }
 
             // Exact directional derivative B = dH_nll/d beta [u_k].
             // dH/drho_k = A_k + B, so the non-penalty trace piece is tr(H^{-1} B).
-            let mut b_dir = Array2::<f64>::zeros((p, p));
-            let mut ge = vec![0.0_f64; p];
-            let mut gs = vec![0.0_f64; p];
-            let mut gsd = vec![0.0_f64; p];
-            let mut he = vec![0.0_f64; p];
-            let mut hs = vec![0.0_f64; p];
-            let mut hsd = vec![0.0_f64; p];
-            let mut te = vec![0.0_f64; p];
-            let mut ts = vec![0.0_f64; p];
-            let mut tsd = vec![0.0_f64; p];
+            b_dir.fill(0.0);
             for i in 0..n {
                 let w_i = self.sample_weight[i];
                 if w_i <= 0.0 {
@@ -878,8 +875,12 @@ impl WorkingModelSurvival {
                 }
             }
 
-            let h_inv_b = solve_mat(&b_dir);
-            let trace_third = (0..p).map(|d| h_inv_b[[d, d]]).sum::<f64>();
+            let mut trace_third = 0.0_f64;
+            for r_idx in 0..p {
+                for c_idx in 0..p {
+                    trace_third += h_inv[[r_idx, c_idx]] * b_dir[[c_idx, r_idx]];
+                }
+            }
             let t_k = trace_hinv_ak + trace_third;
 
             let mut p_k = 0.0_f64;

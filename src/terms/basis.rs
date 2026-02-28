@@ -267,10 +267,20 @@ pub fn create_basis<O: BasisOutputFormat>(
     match options.basis_family {
         BasisFamily::BSpline => O::build_basis(data, degree, eval_kind, knot_vec),
         BasisFamily::MSpline => {
-            let dense = create_mspline_dense(data, knot_vec.view(), degree)?;
-            Ok((O::from_dense(dense)?, knot_vec))
+            if O::IS_SPARSE {
+                let sparse = create_mspline_sparse(data, knot_vec.view(), degree)?;
+                Ok((O::from_sparse(sparse)?, knot_vec))
+            } else {
+                let dense = create_mspline_dense(data, knot_vec.view(), degree)?;
+                Ok((O::from_dense(dense)?, knot_vec))
+            }
         }
         BasisFamily::ISpline => {
+            if O::IS_SPARSE {
+                return Err(BasisError::InvalidInput(
+                    "BasisFamily::ISpline does not support sparse output; use Dense".to_string(),
+                ));
+            }
             let dense = create_ispline_dense(data, knot_vec.view(), degree)?;
             Ok((O::from_dense(dense)?, knot_vec))
         }
@@ -341,6 +351,7 @@ pub fn apply_linear_extension_from_first_derivative(
 /// This is an implementation detail for the unified `create_basis` function.
 pub trait BasisOutputFormat {
     type Output;
+    const IS_SPARSE: bool;
 
     fn build_basis(
         data: ArrayView1<f64>,
@@ -350,10 +361,12 @@ pub trait BasisOutputFormat {
     ) -> Result<(Self::Output, Array1<f64>), BasisError>;
 
     fn from_dense(dense: Array2<f64>) -> Result<Self::Output, BasisError>;
+    fn from_sparse(sparse: SparseColMat<usize, f64>) -> Result<Self::Output, BasisError>;
 }
 
 impl BasisOutputFormat for Dense {
     type Output = Arc<Array2<f64>>;
+    const IS_SPARSE: bool = false;
 
     fn build_basis(
         data: ArrayView1<f64>,
@@ -393,10 +406,26 @@ impl BasisOutputFormat for Dense {
     fn from_dense(dense: Array2<f64>) -> Result<Self::Output, BasisError> {
         Ok(Arc::new(dense))
     }
+
+    fn from_sparse(sparse: SparseColMat<usize, f64>) -> Result<Self::Output, BasisError> {
+        let mut dense = Array2::<f64>::zeros((sparse.nrows(), sparse.ncols()));
+        let (symbolic, values) = sparse.parts();
+        let col_ptr = symbolic.col_ptr();
+        let row_idx = symbolic.row_idx();
+        for col in 0..sparse.ncols() {
+            let start = col_ptr[col];
+            let end = col_ptr[col + 1];
+            for idx in start..end {
+                dense[[row_idx[idx], col]] += values[idx];
+            }
+        }
+        Ok(Arc::new(dense))
+    }
 }
 
 impl BasisOutputFormat for Sparse {
     type Output = SparseColMat<usize, f64>;
+    const IS_SPARSE: bool = true;
 
     fn build_basis(
         data: ArrayView1<f64>,
@@ -424,6 +453,10 @@ impl BasisOutputFormat for Sparse {
         }
         SparseColMat::try_new_from_triplets(nrows, ncols, &triplets)
             .map_err(|e| BasisError::SparseCreation(format!("{e:?}")))
+    }
+
+    fn from_sparse(sparse: SparseColMat<usize, f64>) -> Result<Self::Output, BasisError> {
+        Ok(sparse)
     }
 }
 
@@ -4452,6 +4485,9 @@ pub(crate) mod internal {
 pub struct SplineScratch {
     inner: internal::BsplineScratch,
     local: Vec<f64>,
+    left_inner: internal::BsplineScratch,
+    left_local: Vec<f64>,
+    left_offsets: Vec<f64>,
 }
 
 impl SplineScratch {
@@ -4459,6 +4495,9 @@ impl SplineScratch {
         Self {
             inner: internal::BsplineScratch::new(degree),
             local: Vec::new(),
+            left_inner: internal::BsplineScratch::new(degree),
+            left_local: Vec::new(),
+            left_offsets: Vec::new(),
         }
     }
 }
@@ -4513,6 +4552,7 @@ pub fn evaluate_mspline_scalar(
     scratch: &mut SplineScratch,
 ) -> Result<(), BasisError> {
     validate_knots_for_degree(knot_vector, degree)?;
+    validate_mspline_normalization_spans(knot_vector, degree)?;
     let num_basis = knot_vector.len() - degree - 1;
     if out.len() != num_basis {
         return Err(BasisError::DimensionMismatch(format!(
@@ -4546,11 +4586,7 @@ pub fn evaluate_mspline_scalar(
             continue;
         }
         let span = knot_vector[i + degree + 1] - knot_vector[i];
-        out[i] = if span.abs() > 1e-12 {
-            b * (order / span)
-        } else {
-            0.0
-        };
+        out[i] = b * (order / span);
     }
     Ok(())
 }
@@ -4563,11 +4599,12 @@ pub fn evaluate_mspline_scalar(
 ///   `I_j(x) = sum_{m=j..end} B_m^{(degree+1)}(x)`.
 ///
 /// For clamped knot vectors, this yields monotone basis functions over the knot domain.
-pub fn evaluate_ispline_scalar(
+pub fn evaluate_ispline_scalar_with_scratch(
     x: f64,
     knot_vector: ArrayView1<f64>,
     degree: usize,
     out: &mut [f64],
+    scratch: &mut SplineScratch,
 ) -> Result<(), BasisError> {
     let bs_degree = degree
         .checked_add(1)
@@ -4585,24 +4622,67 @@ pub fn evaluate_ispline_scalar(
     // Domain for B_{., degree+1} is [t_{degree+1}, t_{num_basis}].
     let left = knot_vector[bs_degree];
     let right = knot_vector[num_basis];
-    if x <= left {
+    let support = bs_degree + 1;
+    if x < left {
         out.fill(0.0);
         return Ok(());
     }
     if x >= right {
-        out.fill(1.0);
+        if scratch.left_local.len() < support {
+            scratch.left_local.resize(support, 0.0);
+        }
+        if scratch.left_offsets.len() < num_basis {
+            scratch.left_offsets.resize(num_basis, 0.0);
+        }
+        scratch.left_offsets[..num_basis].fill(0.0);
+        let left_local = &mut scratch.left_local[..support];
+        left_local.fill(0.0);
+        scratch.left_inner.ensure_degree(bs_degree);
+        let left_start = internal::evaluate_splines_sparse_into(
+            left,
+            bs_degree,
+            knot_vector,
+            left_local,
+            &mut scratch.left_inner,
+        );
+        let left_offsets = &mut scratch.left_offsets[..num_basis];
+        let mut left_running = 0.0_f64;
+        for offset in (0..support).rev() {
+            let j = left_start + offset;
+            if j >= num_basis {
+                continue;
+            }
+            left_running += left_local[offset];
+            left_offsets[j] = left_running;
+        }
+        for j in 0..num_basis {
+            out[j] = 1.0 - left_offsets[j];
+            if out[j].abs() <= 1e-15 {
+                out[j] = 0.0;
+            }
+        }
         return Ok(());
     }
 
-    // I-splines are right-cumulative sums of local B-spline values.
+    // I-splines are right-cumulative sums of local B-spline values, then
+    // shifted by their left-boundary value so every basis is anchored at 0
+    // at the domain start.
     // For interior x, columns strictly left of the active block equal the
     // total active mass (partition of unity, numerically near 1).
     out.fill(0.0);
-    let support = bs_degree + 1;
-    let mut local = vec![0.0; support];
-    let mut scratch = internal::BsplineScratch::new(bs_degree);
-    let start =
-        internal::evaluate_splines_sparse_into(x, bs_degree, knot_vector, &mut local, &mut scratch);
+    if scratch.local.len() < support {
+        scratch.local.resize(support, 0.0);
+    }
+    scratch.local[..support].fill(0.0);
+    scratch.inner.ensure_degree(bs_degree);
+    let local = &mut scratch.local[..support];
+    let start = internal::evaluate_splines_sparse_into(
+        x,
+        bs_degree,
+        knot_vector,
+        local,
+        &mut scratch.inner,
+    );
 
     let total = local.iter().copied().sum::<f64>();
     let lead_end = start.min(num_basis);
@@ -4619,7 +4699,55 @@ pub fn evaluate_ispline_scalar(
         running += local[offset];
         out[j] = running;
     }
+
+    // Subtract left-boundary constants so I_j(left) = 0 exactly.
+    if scratch.left_local.len() < support {
+        scratch.left_local.resize(support, 0.0);
+    }
+    if scratch.left_offsets.len() < num_basis {
+        scratch.left_offsets.resize(num_basis, 0.0);
+    }
+    scratch.left_offsets[..num_basis].fill(0.0);
+    let left_local = &mut scratch.left_local[..support];
+    left_local.fill(0.0);
+    scratch.left_inner.ensure_degree(bs_degree);
+    let left_start = internal::evaluate_splines_sparse_into(
+        left,
+        bs_degree,
+        knot_vector,
+        left_local,
+        &mut scratch.left_inner,
+    );
+    let left_offsets = &mut scratch.left_offsets[..num_basis];
+    let mut left_running = 0.0_f64;
+    for offset in (0..support).rev() {
+        let j = left_start + offset;
+        if j >= num_basis {
+            continue;
+        }
+        left_running += left_local[offset];
+        left_offsets[j] = left_running;
+    }
+    for j in 0..num_basis {
+        out[j] -= left_offsets[j];
+        if out[j].abs() <= 1e-15 {
+            out[j] = 0.0;
+        }
+    }
     Ok(())
+}
+
+pub fn evaluate_ispline_scalar(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+) -> Result<(), BasisError> {
+    let bs_degree = degree
+        .checked_add(1)
+        .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
+    let mut scratch = SplineScratch::new(bs_degree);
+    evaluate_ispline_scalar_with_scratch(x, knot_vector, degree, out, &mut scratch)
 }
 
 /// Evaluates B-spline basis derivatives at a single scalar point `x` into a provided buffer.
@@ -4740,6 +4868,7 @@ fn create_mspline_dense(
     degree: usize,
 ) -> Result<Array2<f64>, BasisError> {
     validate_knots_for_degree(knot_vector, degree)?;
+    validate_mspline_normalization_spans(knot_vector, degree)?;
     let num_basis = knot_vector.len() - degree - 1;
     let mut out = Array2::<f64>::zeros((data.len(), num_basis));
     let mut scratch = internal::BsplineScratch::new(degree);
@@ -4751,11 +4880,7 @@ fn create_mspline_dense(
     let mut scales = vec![0.0; num_basis];
     for i in 0..num_basis {
         let span = knot_vector[i + degree + 1] - knot_vector[i];
-        scales[i] = if span.abs() > 1e-12 {
-            order / span
-        } else {
-            0.0
-        };
+        scales[i] = order / span;
     }
 
     for (row_i, &x) in data.iter().enumerate() {
@@ -4779,6 +4904,72 @@ fn create_mspline_dense(
     Ok(out)
 }
 
+fn create_mspline_sparse(
+    data: ArrayView1<f64>,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+) -> Result<SparseColMat<usize, f64>, BasisError> {
+    validate_knots_for_degree(knot_vector, degree)?;
+    validate_mspline_normalization_spans(knot_vector, degree)?;
+    let nrows = data.len();
+    let ncols = knot_vector.len() - degree - 1;
+    let mut scratch = internal::BsplineScratch::new(degree);
+    let support = degree + 1;
+    let mut local = vec![0.0; support];
+    let left = knot_vector[degree];
+    let right = knot_vector[ncols];
+    let order = (degree + 1) as f64;
+    let mut scales = vec![0.0; ncols];
+    for i in 0..ncols {
+        let span = knot_vector[i + degree + 1] - knot_vector[i];
+        scales[i] = order / span;
+    }
+
+    let mut triplets: Vec<Triplet<usize, usize, f64>> =
+        Vec::with_capacity(nrows.saturating_mul(support));
+    for (row_i, &x) in data.iter().enumerate() {
+        if x < left || x > right {
+            continue;
+        }
+        let start = internal::evaluate_splines_sparse_into(
+            x,
+            degree,
+            knot_vector,
+            &mut local,
+            &mut scratch,
+        );
+        for (offset, &b) in local.iter().enumerate() {
+            let col = start + offset;
+            if col >= ncols {
+                continue;
+            }
+            let v = b * scales[col];
+            if v.abs() > 0.0 {
+                triplets.push(Triplet::new(row_i, col, v));
+            }
+        }
+    }
+
+    SparseColMat::try_new_from_triplets(nrows, ncols, &triplets)
+        .map_err(|e| BasisError::SparseCreation(format!("{e:?}")))
+}
+
+fn validate_mspline_normalization_spans(
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+) -> Result<(), BasisError> {
+    let num_basis = knot_vector.len().saturating_sub(degree + 1);
+    for i in 0..num_basis {
+        let span = knot_vector[i + degree + 1] - knot_vector[i];
+        if span <= 1e-12 {
+            return Err(BasisError::InvalidInput(format!(
+                "invalid M-spline normalization span at i={i}: t[i+degree+1]-t[i]={span:.3e} must be > 0"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn create_ispline_dense(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -4796,13 +4987,34 @@ fn create_ispline_dense(
     let left = knot_vector[bs_degree];
     let right = knot_vector[num_basis];
 
+    // Left-boundary cumulative constants for anchoring I_j(left)=0.
+    let mut left_local = vec![0.0_f64; support];
+    let mut left_scratch = internal::BsplineScratch::new(bs_degree);
+    let left_start = internal::evaluate_splines_sparse_into(
+        left,
+        bs_degree,
+        knot_vector,
+        &mut left_local,
+        &mut left_scratch,
+    );
+    let mut left_offsets = vec![0.0_f64; num_basis];
+    let mut left_running = 0.0_f64;
+    for offset in (0..support).rev() {
+        let j = left_start + offset;
+        if j >= num_basis {
+            continue;
+        }
+        left_running += left_local[offset];
+        left_offsets[j] = left_running;
+    }
+
     for (row_i, &x) in data.iter().enumerate() {
-        if x <= left {
+        if x < left {
             continue;
         }
         if x >= right {
             for j in 0..num_basis {
-                out[[row_i, j]] = 1.0;
+                out[[row_i, j]] = 1.0 - left_offsets[j];
             }
             continue;
         }
@@ -4825,7 +5037,7 @@ fn create_ispline_dense(
                 continue;
             }
             running += local[offset];
-            out[[row_i, j]] = running;
+            out[[row_i, j]] = running - left_offsets[j];
         }
     }
     Ok(out)
@@ -5909,7 +6121,10 @@ mod tests {
         assert!(out.iter().all(|&v| v.abs() <= 1e-12));
 
         evaluate_ispline_scalar(10.0, knots.view(), degree, &mut out).expect("right boundary eval");
-        assert!(out.iter().all(|&v| (v - 1.0).abs() <= 1e-12));
+        assert!(out[0].abs() <= 1e-12);
+        for &v in out.iter().skip(1) {
+            assert!((v - 1.0).abs() <= 1e-12);
+        }
     }
 
     #[test]
@@ -5995,19 +6210,21 @@ mod tests {
         .expect("create ispline basis");
         let i_basis = i_basis.as_ref();
         assert!(i_basis.row(0).iter().all(|v| v.abs() <= 1e-12));
-        assert!(i_basis.row(2).iter().all(|v| (v - 1.0).abs() <= 1e-12));
+        assert!(i_basis[[2, 0]].abs() <= 1e-12);
+        for j in 1..i_basis.ncols() {
+            assert!((i_basis[[2, j]] - 1.0).abs() <= 1e-12);
+        }
         for &v in i_basis.row(1) {
             assert!((0.0..=1.0).contains(&v));
         }
     }
 
     #[test]
-    fn test_ispline_derivative_matches_mspline_finite_difference() {
+    fn test_ispline_derivative_matches_cumulative_bspline_derivative_finite_difference() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0, 3.0];
         let degree = 2usize;
-        let n_i = knots.len() - (degree + 1) - 1;
-        let n_m = knots.len() - degree - 1;
-        assert!(n_m >= n_i);
+        let bs_degree = degree + 1;
+        let n_i = knots.len() - bs_degree - 1;
 
         // Check at interior points away from knot boundaries for stable central differences.
         let xs = [0.35, 0.8, 1.4, 2.2];
@@ -6018,13 +6235,19 @@ mod tests {
             evaluate_ispline_scalar(x + h, knots.view(), degree, &mut i_plus).expect("I(x+h)");
             evaluate_ispline_scalar(x - h, knots.view(), degree, &mut i_minus).expect("I(x-h)");
 
-            let mut m = vec![0.0; n_m];
-            let mut scratch = SplineScratch::new(degree);
-            evaluate_mspline_scalar(x, knots.view(), degree, &mut m, &mut scratch).expect("M(x)");
+            let mut db = vec![0.0; n_i];
+            evaluate_bspline_derivative_scalar(x, knots.view(), bs_degree, &mut db)
+                .expect("B'(x)");
+            let mut d_i = vec![0.0; n_i];
+            let mut running = 0.0_f64;
+            for j in (0..n_i).rev() {
+                running += db[j];
+                d_i[j] = running;
+            }
 
             for j in 0..n_i {
                 let fd = (i_plus[j] - i_minus[j]) / (2.0 * h);
-                assert_abs_diff_eq!(fd, m[j], epsilon = 2e-5);
+                assert_abs_diff_eq!(fd, d_i[j], epsilon = 2e-5);
             }
         }
     }
@@ -6081,6 +6304,35 @@ mod tests {
                 assert_abs_diff_eq!(dense[[i, j]], sparse_dense[[i, j]], epsilon = 1e-12);
             }
         }
+    }
+
+    #[test]
+    fn test_mspline_rejects_zero_normalization_spans() {
+        // degree=2 with 4 repeated boundary knots makes t[3]-t[0]=0 for i=0.
+        let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let x = array![0.25, 0.5, 0.75];
+        let err = create_basis::<Dense>(
+            x.view(),
+            KnotSource::Provided(knots.view()),
+            2,
+            BasisOptions::m_spline(),
+        )
+        .expect_err("degenerate M-spline normalization spans should be rejected");
+        assert!(matches!(err, BasisError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_ispline_sparse_output_is_rejected() {
+        let knots = array![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0];
+        let x = array![0.2, 1.5, 2.8];
+        let err = create_basis::<Sparse>(
+            x.view(),
+            KnotSource::Provided(knots.view()),
+            1,
+            BasisOptions::i_spline(),
+        )
+        .expect_err("I-spline sparse output should be rejected");
+        assert!(matches!(err, BasisError::InvalidInput(_)));
     }
 
     #[test]

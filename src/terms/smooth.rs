@@ -1816,6 +1816,44 @@ fn get_matern_double_penalty(spec: &TermCollectionSpec, term_idx: usize) -> Opti
         })
 }
 
+fn freeze_matern_terms_from_design(
+    spec: &TermCollectionSpec,
+    design: &TermCollectionDesign,
+) -> Result<TermCollectionSpec, EstimationError> {
+    if spec.smooth_terms.len() != design.smooth.terms.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "cannot freeze Matérn terms: smooth spec count {} != fitted smooth term count {}",
+            spec.smooth_terms.len(),
+            design.smooth.terms.len()
+        )));
+    }
+
+    let mut frozen = spec.clone();
+    for (term, fitted) in frozen
+        .smooth_terms
+        .iter_mut()
+        .zip(design.smooth.terms.iter())
+    {
+        if let (
+            SmoothBasisSpec::Matern { spec: s, .. },
+            BasisMetadata::Matern {
+                centers,
+                identifiability_transform,
+                ..
+            },
+        ) = (&mut term.basis, &fitted.metadata)
+        {
+            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            if let Some(z) = identifiability_transform {
+                s.identifiability = MaternIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                };
+            }
+        }
+    }
+    Ok(frozen)
+}
+
 pub fn optimize_two_block_matern_kappa<FitOut, FitFn, ScoreFn>(
     data: ArrayView2<'_, f64>,
     mean_spec: &TermCollectionSpec,
@@ -1831,10 +1869,8 @@ where
     // For location-scale models, κ (Matérn length_scale) is block-specific.
     // We optimize κ for mean/noise blocks separately, while each candidate
     // evaluation re-runs fitting so λ/δ are re-optimized.
-    let mut best_mean_spec = mean_spec.clone();
-    let mut best_noise_spec = noise_spec.clone();
-    let mean_terms = matern_term_indices(&best_mean_spec);
-    let noise_terms = matern_term_indices(&best_noise_spec);
+    let mean_terms = matern_term_indices(mean_spec);
+    let noise_terms = matern_term_indices(noise_spec);
 
     let build_pair = |ms: &TermCollectionSpec,
                       ns: &TermCollectionSpec|
@@ -1846,8 +1882,15 @@ where
         Ok((d_mean, d_noise))
     };
 
-    let (mut best_mean_design, mut best_noise_design) =
-        build_pair(&best_mean_spec, &best_noise_spec)?;
+    let (mut best_mean_design, mut best_noise_design) = build_pair(mean_spec, noise_spec)?;
+    let mut best_mean_spec = freeze_matern_terms_from_design(mean_spec, &best_mean_design)
+        .map_err(|e| {
+            format!("failed to freeze Matérn mean centers during κ optimization bootstrap: {e}")
+        })?;
+    let mut best_noise_spec = freeze_matern_terms_from_design(noise_spec, &best_noise_design)
+        .map_err(|e| {
+            format!("failed to freeze Matérn noise centers during κ optimization bootstrap: {e}")
+        })?;
     let mut best_fit = fit_fn(&best_mean_design, &best_noise_design)?;
     let mut best_score = score_fn(&best_fit);
     if !best_score.is_finite() {
@@ -2085,6 +2128,7 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
         family,
         options,
     )?;
+    resolved_spec = freeze_matern_terms_from_design(&resolved_spec, &best.design)?;
     let mut best_score = fit_score(&best.fit);
     if !best_score.is_finite() {
         best_score = f64::INFINITY;
