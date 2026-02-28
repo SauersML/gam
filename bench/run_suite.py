@@ -12,6 +12,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from shutil import disk_usage
 from time import monotonic, perf_counter
 
 # Hard-force single-thread execution across Python/R/Rust/native math libs.
@@ -79,6 +80,24 @@ def _fmt_cpu_total_pct(cpu_pct):
     return f"{(cpu_val / float(ncpu)):.1f}"
 
 
+def _fmt_pct(numer, denom):
+    try:
+        if numer is None or denom in (None, 0):
+            return "n/a"
+        return f"{100.0 * float(numer) / float(denom):.1f}%"
+    except Exception:
+        return "n/a"
+
+
+def _mem_used_kib(meminfo):
+    total = meminfo.get("MemTotal")
+    avail = meminfo.get("MemAvailable")
+    if total is None or avail is None:
+        return None
+    used = int(total) - int(avail)
+    return max(used, 0)
+
+
 def _read_meminfo():
     out = {}
     try:
@@ -131,6 +150,14 @@ def _read_cgroup_memory_kib():
     return None, None
 
 
+def _read_disk_usage_kib(path):
+    try:
+        usage = disk_usage(path)
+    except Exception:
+        return None, None, None
+    return usage.total // 1024, usage.used // 1024, usage.free // 1024
+
+
 def _read_ps_snapshot(pid):
     try:
         proc = subprocess.run(
@@ -160,35 +187,77 @@ def _read_ps_snapshot(pid):
         return {}
 
 
+def _collect_heartbeat_snapshot(proc, cmd_preview, stats, start):
+    ps = _read_ps_snapshot(proc.pid)
+    rss_kib = ps.get("rss_kib")
+    if isinstance(rss_kib, int):
+        stats["peak_proc_rss_kib"] = max(stats.get("peak_proc_rss_kib", 0), rss_kib)
+    vsz_kib = ps.get("vsz_kib")
+    if isinstance(vsz_kib, int):
+        stats["peak_proc_vsz_kib"] = max(stats.get("peak_proc_vsz_kib", 0), vsz_kib)
+
+    proc_hwm_kib = _read_proc_status_kib(proc.pid, "VmHWM")
+    if isinstance(proc_hwm_kib, int):
+        stats["peak_proc_hwm_kib"] = max(stats.get("peak_proc_hwm_kib", 0), proc_hwm_kib)
+    py_rss_kib = _read_proc_status_kib(os.getpid(), "VmRSS")
+    py_hwm_kib = _read_proc_status_kib(os.getpid(), "VmHWM")
+    meminfo = _read_meminfo()
+    mem_total_kib = meminfo.get("MemTotal")
+    mem_avail_kib = meminfo.get("MemAvailable")
+    mem_used_kib = _mem_used_kib(meminfo)
+    cg_cur_kib, cg_max_kib = _read_cgroup_memory_kib()
+    bench_total_kib, bench_used_kib, bench_free_kib = _read_disk_usage_kib(BENCH_DIR)
+    tmp_total_kib, tmp_used_kib, tmp_free_kib = _read_disk_usage_kib(tempfile.gettempdir())
+    elapsed = monotonic() - start
+    load = os.getloadavg() if hasattr(os, "getloadavg") else (None, None, None)
+
+    stats["samples"] = stats.get("samples", 0) + 1
+    stats["last_proc_rss_kib"] = rss_kib
+    stats["last_proc_vsz_kib"] = vsz_kib
+    stats["last_proc_hwm_kib"] = proc_hwm_kib
+    stats["last_py_rss_kib"] = py_rss_kib
+    stats["last_py_hwm_kib"] = py_hwm_kib
+    stats["last_cgroup_cur_kib"] = cg_cur_kib
+    stats["last_cgroup_max_kib"] = cg_max_kib
+    stats["last_mem_total_kib"] = mem_total_kib
+    stats["last_mem_used_kib"] = mem_used_kib
+    stats["last_mem_avail_kib"] = mem_avail_kib
+    stats["last_bench_free_kib"] = bench_free_kib
+    stats["last_bench_total_kib"] = bench_total_kib
+    stats["last_tmp_free_kib"] = tmp_free_kib
+    stats["last_tmp_total_kib"] = tmp_total_kib
+
+    return (
+        f"[HEARTBEAT] elapsed={elapsed:8.1f}s cmd='{cmd_preview}' "
+        f"pid={proc.pid} p_cpu={_fmt_cpu_total_pct(ps.get('cpu_pct', 'n/a'))}% "
+        f"p_mem={ps.get('mem_pct', 'n/a')}% "
+        f"p_rss={_fmt_kib(rss_kib)} p_hwm={_fmt_kib(proc_hwm_kib)} "
+        f"p_vsz={_fmt_kib(vsz_kib)} py_rss={_fmt_kib(py_rss_kib)} "
+        f"py_hwm={_fmt_kib(py_hwm_kib)} "
+        f"sys_ram={_fmt_kib(mem_used_kib)}/{_fmt_kib(mem_total_kib)} "
+        f"sys_ram_pct={_fmt_pct(mem_used_kib, mem_total_kib)} "
+        f"sys_avail={_fmt_kib(meminfo.get('MemAvailable'))} "
+        f"swap_free={_fmt_kib(meminfo.get('SwapFree'))} "
+        f"cgroup={_fmt_kib(cg_cur_kib)}/{_fmt_kib(cg_max_kib)} "
+        f"cg_pct={_fmt_pct(cg_cur_kib, cg_max_kib)} "
+        f"bench_free={_fmt_kib(bench_free_kib)}/{_fmt_kib(bench_total_kib)} "
+        f"bench_used={_fmt_pct(bench_used_kib, bench_total_kib)} "
+        f"tmp_free={_fmt_kib(tmp_free_kib)}/{_fmt_kib(tmp_total_kib)} "
+        f"tmp_used={_fmt_pct(tmp_used_kib, tmp_total_kib)} "
+        f"load1={load[0] if load[0] is not None else 'n/a'}"
+    )
+
+
 def _heartbeat_loop(proc, cmd, stop_event, stats):
     cmd_preview = " ".join(str(x) for x in cmd[:5])
     if len(cmd) > 5:
         cmd_preview += " ..."
     start = monotonic()
+    print(_collect_heartbeat_snapshot(proc, cmd_preview, stats, start), file=sys.stderr, flush=True)
     while not stop_event.wait(HEARTBEAT_INTERVAL_SEC):
         if proc.poll() is not None:
             break
-        ps = _read_ps_snapshot(proc.pid)
-        rss_kib = ps.get("rss_kib")
-        if isinstance(rss_kib, int):
-            stats["peak_proc_rss_kib"] = max(stats.get("peak_proc_rss_kib", 0), rss_kib)
-        py_rss_kib = _read_proc_status_kib(os.getpid(), "VmRSS")
-        meminfo = _read_meminfo()
-        cg_cur_kib, cg_max_kib = _read_cgroup_memory_kib()
-        elapsed = monotonic() - start
-        load = os.getloadavg() if hasattr(os, "getloadavg") else (None, None, None)
-        line = (
-            f"[HEARTBEAT] elapsed={elapsed:8.1f}s cmd='{cmd_preview}' "
-            f"pid={proc.pid} p_cpu={_fmt_cpu_total_pct(ps.get('cpu_pct', 'n/a'))}% p_mem={ps.get('mem_pct', 'n/a')}% "
-            f"p_rss={_fmt_kib(rss_kib)} p_vsz={_fmt_kib(ps.get('vsz_kib'))} "
-            f"py_rss={_fmt_kib(py_rss_kib)} "
-            f"sys_avail={_fmt_kib(meminfo.get('MemAvailable'))} "
-            f"swap_free={_fmt_kib(meminfo.get('SwapFree'))} "
-            f"cgroup={_fmt_kib(cg_cur_kib)}/{_fmt_kib(cg_max_kib)} "
-            f"load1={load[0] if load[0] is not None else 'n/a'}"
-        )
-        print(line, file=sys.stderr, flush=True)
-        stats["samples"] = stats.get("samples", 0) + 1
+        print(_collect_heartbeat_snapshot(proc, cmd_preview, stats, start), file=sys.stderr, flush=True)
 
 
 def run_cmd(cmd, cwd=None):
@@ -207,7 +276,12 @@ def run_cmd(cmd, cwd=None):
     out_buf = []
     err_buf = []
     hb_stop = threading.Event()
-    hb_stats = {"peak_proc_rss_kib": 0, "samples": 0}
+    hb_stats = {
+        "peak_proc_rss_kib": 0,
+        "peak_proc_hwm_kib": 0,
+        "peak_proc_vsz_kib": 0,
+        "samples": 0,
+    }
 
     def _pump(stream, sink, buf):
         try:
@@ -232,7 +306,16 @@ def run_cmd(cmd, cwd=None):
     print(
         f"[HEARTBEAT] command-exit rc={rc} pid={proc.pid} "
         f"samples={hb_stats.get('samples', 0)} "
-        f"peak_proc_rss={_fmt_kib(hb_stats.get('peak_proc_rss_kib', 0))}",
+        f"peak_proc_rss={_fmt_kib(hb_stats.get('peak_proc_rss_kib', 0))} "
+        f"peak_proc_hwm={_fmt_kib(hb_stats.get('peak_proc_hwm_kib', 0))} "
+        f"peak_proc_vsz={_fmt_kib(hb_stats.get('peak_proc_vsz_kib', 0))} "
+        f"last_proc_rss={_fmt_kib(hb_stats.get('last_proc_rss_kib'))} "
+        f"last_py_rss={_fmt_kib(hb_stats.get('last_py_rss_kib'))} "
+        f"last_sys_ram={_fmt_kib(hb_stats.get('last_mem_used_kib'))}/{_fmt_kib(hb_stats.get('last_mem_total_kib'))} "
+        f"last_sys_ram_pct={_fmt_pct(hb_stats.get('last_mem_used_kib'), hb_stats.get('last_mem_total_kib'))} "
+        f"last_cgroup={_fmt_kib(hb_stats.get('last_cgroup_cur_kib'))}/{_fmt_kib(hb_stats.get('last_cgroup_max_kib'))} "
+        f"last_bench_free={_fmt_kib(hb_stats.get('last_bench_free_kib'))}/{_fmt_kib(hb_stats.get('last_bench_total_kib'))} "
+        f"last_tmp_free={_fmt_kib(hb_stats.get('last_tmp_free_kib'))}/{_fmt_kib(hb_stats.get('last_tmp_total_kib'))}",
         file=sys.stderr,
         flush=True,
     )
@@ -838,6 +921,13 @@ def _synthetic_binomial_dataset(n, p, seed):
     }
 
 
+_CANONICAL_SYNTHETIC_BINOMIAL_SCENARIOS = {
+    "small_dense": {"n": 1000, "p": 10, "seed": 7},
+    "medium": {"n": 50000, "p": 50, "seed": 11},
+    "pathological_ill_conditioned": {"n": 50000, "p": 80, "seed": 17},
+}
+
+
 def _synthetic_geo_disease_dataset(n=4000, seed=20260226):
     n = int(max(500, n))
     rng = np.random.default_rng(int(seed))
@@ -1396,7 +1486,12 @@ def _geo_subpop16_dataset(seed=20260330, prevalence_min=0.02, prevalence_max=0.4
 def dataset_for_scenario(s):
     name = s["name"]
     if name in {"small_dense", "medium", "pathological_ill_conditioned"}:
-        return _synthetic_binomial_dataset(s["n"], s["p"], s.get("seed", 42))
+        cfg = _CANONICAL_SYNTHETIC_BINOMIAL_SCENARIOS[name]
+        return _synthetic_binomial_dataset(
+            s.get("n", cfg["n"]),
+            s.get("p", cfg["p"]),
+            s.get("seed", cfg["seed"]),
+        )
     if name.startswith("geo_disease_eas3_"):
         return _synthetic_geo_disease_eas_dataset(s.get("n", 6000), s.get("seed", 20260301), n_pcs=3)
     if name.startswith("geo_disease_eas_"):
