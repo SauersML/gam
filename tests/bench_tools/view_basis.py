@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import tomli
+import tomllib as tomli
 
 # --- 1. Define Paths and Parameters ---
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -62,9 +62,16 @@ def evaluate_bspline_basis(x, knots, degree):
                 b[r] = saved + right[r + 1] * temp
                 saved = left[d - r] * temp
             b[d] = saved
-        
-             basis_matrix[i, 0 : len(b_valid)] = b_valid
-        else:
+
+        start = mu - degree
+        end = start + degree + 1
+        if start < 0:
+            b = b[-start:]
+            start = 0
+        if end > num_bases:
+            b = b[: num_bases - start]
+            end = num_bases
+        basis_matrix[i, start:end] = b
 
     return basis_matrix
 
@@ -95,17 +102,18 @@ def get_mgcv_basis_data():
     try:
         result = subprocess.run(["Rscript", "-e", r_script], check=True, text=True, cwd=SCRIPT_DIR, capture_output=True)
         print(f"  [INFO] R stdout: {result.stdout.strip()}")
-        if result.stderr: print(f"  [INFO] R stderr: {result.stderr.strip()}")
+        if result.stderr:
+            print(f"  [INFO] R stderr: {result.stderr.strip()}")
 
         x_axis = pd.read_csv(x_axis_file)['x'].values
         basis_matrix = pd.read_csv(basis_file).values
         coeffs = pd.read_csv(coeffs_file)['coeffs'].values
         
-        print(f"  [PRINT] mgcv: Loaded x-axis vector.")
+        print("  [PRINT] mgcv: Loaded x-axis vector.")
         print_array_summary("mgcv x_axis", x_axis)
-        print(f"  [PRINT] mgcv: Loaded constrained basis matrix.")
+        print("  [PRINT] mgcv: Loaded constrained basis matrix.")
         print_array_summary("mgcv basis_matrix", basis_matrix)
-        print(f"  [PRINT] mgcv: Loaded coefficients.")
+        print("  [PRINT] mgcv: Loaded coefficients.")
         print_array_summary("mgcv coeffs", coeffs)
         
         return {"x_axis": x_axis, "basis_matrix": basis_matrix, "coeffs": coeffs}
@@ -114,7 +122,8 @@ def get_mgcv_basis_data():
         sys.exit(1)
     finally:
         for f in [x_axis_file, basis_file, coeffs_file]:
-            if f.exists(): f.unlink()
+            if f.exists():
+                f.unlink()
 
 def get_gnomon_basis_data():
     """
@@ -126,6 +135,46 @@ def get_gnomon_basis_data():
     
     with open(RUST_MODEL_CONFIG_PATH, "rb") as f:
         toml_data = tomli.load(f)
+
+    def _find_key(obj, key):
+        if isinstance(obj, dict):
+            if key in obj:
+                return obj[key]
+            for value in obj.values():
+                found = _find_key(value, key)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for value in obj:
+                found = _find_key(value, key)
+                if found is not None:
+                    return found
+        return None
+
+    knots_data = _find_key(toml_data, "knot_vector") or _find_key(toml_data, "knots")
+    degree = _find_key(toml_data, "degree")
+    coeffs_data = _find_key(toml_data, "coefficients")
+    constraint_info = _find_key(toml_data, "transform")
+    x_range = _find_key(toml_data, "x_range")
+
+    if isinstance(knots_data, dict):
+        knots_data = knots_data.get("data", knots_data)
+    if isinstance(coeffs_data, dict):
+        coeffs_data = coeffs_data.get("data", coeffs_data)
+    if isinstance(constraint_info, dict) and "transform" in constraint_info:
+        constraint_info = constraint_info["transform"]
+
+    if knots_data is None or degree is None or coeffs_data is None or constraint_info is None:
+        print("\n--- FATAL ERROR: Could not locate required spline fields in model.toml. ---")
+        print("Required: knots, degree, coefficients, and constraint transform.")
+        sys.exit(1)
+
+    knots = np.asarray(knots_data, dtype=float)
+    degree = int(degree)
+    coeffs = np.asarray(coeffs_data, dtype=float)
+
+    if x_range is None:
+        x_range = [knots[degree], knots[-degree - 1]]
 
     print_array_summary("Knot Vector", knots)
     print(f"  [PRINT] gnomon: Loaded spline degree {degree}.")
@@ -140,24 +189,24 @@ def get_gnomon_basis_data():
 
     x_axis = np.linspace(x_range[0], x_range[1], N_POINTS_PLOT)
     raw_basis_matrix = evaluate_bspline_basis(x_axis, knots, degree)
-    print(f"  [PRINT] gnomon: Reconstructed FULL raw basis matrix.")
+    print("  [PRINT] gnomon: Reconstructed FULL raw basis matrix.")
     print_array_summary("raw_basis_matrix", raw_basis_matrix)
 
     raw_main_basis_functions = raw_basis_matrix[:, 1:]
-    print(f"  [INFO] gnomon: Sliced raw basis to get the non-constant bases for constraining.")
+    print("  [INFO] gnomon: Sliced raw basis to get the non-constant bases for constraining.")
     print_array_summary("raw_main_basis_functions", raw_main_basis_functions)
     
     if raw_main_basis_functions.shape[1] != z_transform.shape[0]:
-        print(f"\n--- FATAL ERROR: Dimension mismatch for constraint! ---")
+        print("\n--- FATAL ERROR: Dimension mismatch for constraint! ---")
         print(f"Raw main basis columns: {raw_main_basis_functions.shape[1]}, Z-transform rows: {z_transform.shape[0]}")
         sys.exit(1)
 
     constrained_basis_matrix = raw_main_basis_functions @ z_transform
-    print(f"  [PRINT] gnomon: Created FINAL constrained basis matrix.")
+    print("  [PRINT] gnomon: Created FINAL constrained basis matrix.")
     print_array_summary("constrained_basis_matrix", constrained_basis_matrix)
     
     if constrained_basis_matrix.shape[1] != len(coeffs):
-        print(f"\n--- FATAL ERROR: Final dimension mismatch! ---")
+        print("\n--- FATAL ERROR: Final dimension mismatch! ---")
         print(f"Final basis columns: {constrained_basis_matrix.shape[1]}, Coefficients length: {len(coeffs)}")
         sys.exit(1)
         
@@ -198,10 +247,10 @@ def create_comparison_plot(mgcv_data, gnomon_data):
     mgcv_weighted_centered = mgcv_weighted_uncentered - np.mean(mgcv_weighted_uncentered, axis=0)
 
     # --- Print Diagnostics ---
-    print(f"  [PRINT] mgcv: Calculated components.")
+    print("  [PRINT] mgcv: Calculated components.")
     print_array_summary("mgcv_weighted_centered", mgcv_weighted_centered)
     print_array_summary("mgcv_final_curve_centered", mgcv_final_curve_centered)
-    print(f"  [PRINT] gnomon: Calculated components.")
+    print("  [PRINT] gnomon: Calculated components.")
     print_array_summary("gnomon_weighted", gnomon_weighted)
     print_array_summary("gnomon_final_curve", gnomon_final_curve)
 
@@ -242,7 +291,8 @@ def main():
     """Main script to generate and display the basis function plots."""
     for f in [R_MODEL_PATH, RUST_MODEL_CONFIG_PATH]:
         if not f.is_file():
-            print(f"--- FATAL ERROR: Required file not found: '{f}' ---"); sys.exit(1)
+            print(f"--- FATAL ERROR: Required file not found: '{f}' ---")
+            sys.exit(1)
 
     mgcv_data = get_mgcv_basis_data()
     gnomon_data = get_gnomon_basis_data()

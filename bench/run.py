@@ -78,8 +78,9 @@ def main():
 
     print("-" * 78)
     for r in rows:
+        metric = r.get("auc")
         if metric is None:
-            metric = r.get("auc")
+            metric = r.get("c_index")
         print(
             f"{r.get('contender','-')} | "
             f"{r.get('scenario_name','-')} | "

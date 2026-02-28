@@ -10,7 +10,9 @@ use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::DesignMatrix;
 use crate::pirls::WorkingLikelihood as EngineWorkingLikelihood;
 use crate::probability::{normal_cdf_approx, normal_pdf};
-use crate::sigma_link::{bounded_sigma_and_deriv_from_eta_scalar, bounded_sigma_from_eta_scalar};
+use crate::families::sigma_link::{
+    bounded_sigma_and_deriv_from_eta_scalar, bounded_sigma_from_eta_scalar,
+};
 use crate::smooth::{
     MaternKappaOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
     optimize_two_block_matern_kappa,

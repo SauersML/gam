@@ -1586,4 +1586,5 @@ mod fd_policy_tests {
     }
 }
 
+#[path = "reml.rs"]
 pub(crate) mod reml;

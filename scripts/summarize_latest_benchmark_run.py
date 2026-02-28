@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
 import tempfile
 import zipfile
 from collections import defaultdict
@@ -89,10 +88,21 @@ def download_artifact_zip(owner: str, repo: str, artifact_id: int, out_zip: Path
 
 
 def rank_values(values: list[float], *, higher_is_better: bool) -> list[int]:
-    order = sorted(range(len(values)), key=lambda i: values[i], reverse=higher_is_better)
+    order = (
+        sorted(range(len(values)), key=lambda i: (-values[i], i))
+        if higher_is_better
+        else sorted(range(len(values)), key=lambda i: (values[i], i))
+    )
     ranks = [0] * len(values)
-    for r, i in enumerate(order, start=1):
-        ranks[i] = r
+    i = 0
+    while i < len(order):
+        j = i + 1
+        while j < len(order) and values[order[j]] == values[order[i]]:
+            j += 1
+        rank = i + 1
+        for idx in order[i:j]:
+            ranks[idx] = rank
+        i = j
     return ranks
 
 

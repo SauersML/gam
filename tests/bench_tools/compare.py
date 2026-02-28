@@ -4,10 +4,9 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.calibration import calibration_curve
+from scipy.stats import gaussian_kde
 from sklearn.linear_model import LogisticRegression
-import joblib
-from pygam import LogisticGAM, s, te
+from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
 
 # --- 1. Define Paths and Parameters ---
 
@@ -50,13 +49,19 @@ def safe_auc(y_true, y_prob):
     y, p = _prep(y_true, y_prob)
     if len(np.unique(y)) < 2:  # Check if we have both classes
         return np.nan
+    return roc_auc_score(y, p)
 
 def safe_brier(y_true, y_prob):
     y, p = _prep(y_true, y_prob)
+    if len(y) == 0:
+        return np.nan
+    return brier_score_loss(y, p)
 
 def safe_logloss(y_true, y_prob):
     """Safely calculates log loss (cross-entropy) with proper edge case handling."""
     y, p = _prep(y_true, y_prob)
+    if len(y) == 0:
+        return np.nan
     return log_loss(y, p)
 
 def tjurs_r2(y_true, y_prob):
@@ -79,23 +84,19 @@ def nagelkerkes_r2(y_true, y_prob):
     max_r2_cs = 1 - np.exp((2/n)*ll_null)
     return r2_cs / max_r2_cs if max_r2_cs > 0 else np.nan
 
-    y, p = _prep(y_true, y_prob)
-    bs_model = ((p - y)**2).mean()
-    bs_ref = ((y.mean() - y)**2).mean()  # Baseline model always predicting prevalence
-    return 1 - bs_model/bs_ref if bs_ref > 0 else np.nan
-
 def pr_auc(y_true, y_prob):
     """Calculates PR-AUC (Average Precision) with proper edge case handling."""
     y, p = _prep(y_true, y_prob)
     if (y==1).sum()==0:  # Need positive examples for PR-AUC
         return np.nan
+    return average_precision_score(y, p)
 
 def calibration_intercept_slope(y_true, y_prob):
     """Calculate calibration intercept and slope via logistic regression."""
     y, p = _prep(y_true, y_prob)
     logit_p = np.log(p/(1-p)).reshape(-1,1)  # logit transform
     try:
-        lr = LogisticRegression(penalty=None, solver='lbfgs', max_iter=1000).fit(logit_p, y)
+        lr = LogisticRegression(penalty='none', solver='lbfgs', max_iter=1000).fit(logit_p, y)
         slope = lr.coef_[0,0]
         intercept = lr.intercept_[0]
         return intercept, slope
@@ -300,30 +301,18 @@ def bootstrap_metric_ci(y_true, y_prob, metric_fn, n_boot=1000, alpha=0.05, rng=
 
 
 def wilson_ci(k, n, alpha=0.05):
-    
-    Parameters:
-    -----------
-    k : int
-        Number of successes
-    n : int
-        Number of trials
-    alpha : float
-        Alpha level for confidence interval (default: 0.05 for 95% CI)
-        
-    Returns:
-    --------
-    tuple: (lower_bound, upper_bound)
-    """
+    """Calculate Wilson score interval for a binomial proportion."""
     if n == 0:
         return (np.nan, np.nan)
-        
+
     from scipy.stats import norm
-    p = k/n
-    
+    z = norm.ppf(1 - alpha / 2)
+    p = k / n
+
     denom = 1 + z**2/n
     center = (p + z**2/(2*n)) / denom
     half_width = z * np.sqrt((p*(1-p) + z**2/(4*n))/n) / denom
-    
+
     return (center - half_width, center + half_width)
 
 
@@ -393,83 +382,6 @@ def compute_calibration_bins(y_true, y_prob, n_bins=20, strategy='quantile'):
     return pd.DataFrame(rows)
 
 
-def plot_reliability_diagram(y_true, y_prob, n_bins=20, strategy='quantile', title=None, ax=None):
-    """Plot a reliability diagram with proper bin mass visualization.
-    
-    Parameters:
-    -----------
-    y_true : array-like
-        True binary labels
-    y_prob : array-like
-        Predicted probabilities
-    n_bins : int
-        Number of bins
-    strategy : str
-        Binning strategy: 'uniform' (equal-width) or 'quantile' (equal-frequency)
-    title : str, optional
-        Plot title
-    ax : matplotlib.axes.Axes, optional
-        Axes to plot on
-        
-    Returns:
-    --------
-    tuple: (fig, ax, ax2) - Figure and both axes (calibration and bin mass)
-    """
-    # Compute calibration bins
-    bins_df = compute_calibration_bins(y_true, y_prob, n_bins=n_bins, strategy=strategy)
-    
-    # Calculate ECE using both standard and randomized methods
-    ece_std = expected_calibration_error(y_true, y_prob, n_bins=n_bins, strategy=strategy)
-    ece_rand = ece_randomized_quantile(y_true, y_prob, bin_counts=(10, 20, 40), repeats=20)
-    
-    # Create figure if not provided
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 8))
-    else:
-        fig = ax.figure
-        
-    # Perfect calibration reference line
-    ax.plot([0, 1], [0, 1], '--', color='gray', linewidth=1, label='Perfect calibration')
-    
-    # Plot calibration points with Wilson CIs
-    xs = bins_df['mean_pred'].values
-    ys = bins_df['obs_freq'].values
-    los = bins_df['lo_ci'].values
-    his = bins_df['hi_ci'].values
-    
-    ax.errorbar(xs, ys, yerr=[ys - los, his - ys], 
-                fmt='o', capsize=3, linewidth=1.5, 
-                color='#1f77b4', label='Bin accuracy with 95% CI')
-    
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.set_xlabel('Mean predicted probability (per bin)', fontsize=12)
-    ax.set_ylabel('Observed frequency with Wilson 95% CI', fontsize=12)
-    
-    # Title with ECE information
-    plot_title = title or 'Reliability diagram'
-    ax.set_title(f"{plot_title}\nECE={ece_std:.4f} | Randomized ECE={ece_rand['ece_mean']:.4f} ± {ece_rand['ece_std']:.4f}\n({strategy} bins, n={len(bins_df)} non-empty)")
-    
-    # Add bin mass visualization on twin axis
-    ax2 = ax.twinx()
-    bin_width = 0.8 * (bins_df['right_edge'] - bins_df['left_edge']).mean()
-    bin_centers = (bins_df['left_edge'] + bins_df['right_edge']) / 2
-    
-    ax2.bar(bin_centers, bins_df['bin_mass'], width=bin_width, alpha=0.15, 
-            color='#1f77b4', edgecolor='none', label='Bin mass')
-    
-    max_mass = bins_df['bin_mass'].max() if len(bins_df) > 0 else 0.1
-    ax2.set_ylim(0, max_mass * 1.6)  # Leave some headroom
-    ax2.set_ylabel('Bin mass (fraction of samples)', fontsize=12)
-    
-    # Legend for both axes
-    handles1, labels1 = ax.get_legend_handles_labels()
-    handles2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(handles1 + handles2, labels1 + labels2, loc='upper left')
-    
-    plt.tight_layout()
-    return fig, ax, ax2
-
 # --- 3. Analysis and Plotting Functions ---
 
 def run_r_inference(input_csv, output_csv):
@@ -481,7 +393,8 @@ def run_r_inference(input_csv, output_csv):
     try:
         subprocess.run(["Rscript", "-e", r_script], check=True, text=True, capture_output=True, cwd=SCRIPT_DIR)
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"\nERROR: R script failed. Is R installed? Error:\n{getattr(e, 'stderr', e)}"); sys.exit(1)
+        print(f"\nERROR: R script failed. Is R installed? Error:\n{getattr(e, 'stderr', e)}")
+        sys.exit(1)
 
 def run_rust_inference(input_csv, temp_tsv, output_csv):
     """Generic function to get predictions from the Rust/gnomon model."""
@@ -492,7 +405,8 @@ def run_rust_inference(input_csv, temp_tsv, output_csv):
         rust_output_path = PROJECT_ROOT / 'predictions.tsv'
         rust_output_path.unlink()
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"\nERROR: gnomon failed. Is it built? Error:\n{e}"); sys.exit(1)
+        print(f"\nERROR: gnomon failed. Is it built? Error:\n{e}")
+        sys.exit(1)
         
 def run_python_inference(input_csv, output_csv):
     """Generic function to get predictions from the Python/PyGAM model.
@@ -509,7 +423,6 @@ def run_python_inference(input_csv, output_csv):
         # Try to import required modules
         try:
             import joblib
-            from pygam import LogisticGAM
         except ImportError as e:
             print(f"INFO: Required PyGAM dependencies not available: {e}")
             print("PyGAM will be omitted from comparison. This is not an error.")
@@ -520,8 +433,7 @@ def run_python_inference(input_csv, output_csv):
         data = pd.read_csv(input_csv)
         X = data[['variable_one', 'variable_two']].values
         predictions = model.predict_proba(X)
-        
-        # Save predictions to CSV
+        pd.DataFrame({"pygam_prediction": predictions}).to_csv(output_csv, index=False)
         return True
         
     except Exception as e:
@@ -579,11 +491,6 @@ def print_performance_report(df, bootstrap_ci=True, n_boot=1000, seed=42):
                   f"LogLoss={l_est:.4f} [{l_lo:.4f}, {l_hi:.4f}]")
         else:
             print(f"  - {n:<20}: Brier={safe_brier(y_true, p):.4f} | LogLoss={safe_logloss(y_true, p):.4f}")
-
-    for n, p in models.items():
-        if bootstrap_ci:
-            print(f"  - {n:<20}: {est:.4f} [{lo:.4f}, {hi:.4f}]")
-        else:
 
     print("\n[Fit proxies: Nagelkerke R², Tjur R²] (higher is better)")
     for n, p in models.items():
@@ -885,11 +792,11 @@ def plot_calibrated_vs_uncalibrated(df):
         x_sorted, y_sorted, density_sorted = x[idx], y[idx], density[idx]
         scatter1 = ax1.scatter(x_sorted, y_sorted, c=density_sorted, cmap=calibrated_cmap,
                            s=30, marker='o', edgecolor='none', alpha=0.8, zorder=2,
-                           label=f'Calibrated Predictions')
+                           label='Calibrated Predictions')
     except Exception:
         # Fallback if KDE fails
         scatter1 = ax1.scatter(x, y, c=COLORS['rust'], s=30, marker='o', alpha=0.6,
-                           label=f'Calibrated Predictions')
+                           label='Calibrated Predictions')
     
     # Add reference line and styling
     ax1.plot([0, 1], [0, 1], '--', color=COLORS['perfect'], linewidth=2, label='Perfect Prediction', zorder=4)
@@ -919,11 +826,11 @@ def plot_calibrated_vs_uncalibrated(df):
         x_sorted, y_sorted, density_sorted = x[idx], y[idx], density[idx]
         scatter2 = ax2.scatter(x_sorted, y_sorted, c=density_sorted, cmap=uncalibrated_cmap,
                            s=30, marker='o', edgecolor='none', alpha=0.8, zorder=2,
-                           label=f'Uncalibrated Predictions')
+                           label='Uncalibrated Predictions')
     except Exception:
         # Fallback if KDE fails
         scatter2 = ax2.scatter(x, y, c=COLORS['uncalibrated'], s=30, marker='o', alpha=0.6,
-                           label=f'Uncalibrated Predictions')
+                           label='Uncalibrated Predictions')
     
     # Add reference line and styling
     ax2.plot([0, 1], [0, 1], '--', color=COLORS['perfect'], linewidth=2, label='Perfect Prediction', zorder=4)
@@ -945,16 +852,12 @@ def plot_calibrated_vs_uncalibrated(df):
 
 def plot_model_surfaces(test_df):
     """Generates model surface plots for all available models and empirical data."""
-    print("\n" + "#"*70); print("### PLOTTING MODEL SURFACES COMPARISON ###"); print("#"*70)
+    print("\n" + "#" * 70)
+    print("### PLOTTING MODEL SURFACES COMPARISON ###")
+    print("#" * 70)
     
     # Check if PyGAM is available (by looking for the file)
     has_pygam = PYGAM_MODEL_PATH.is_file()
-    if has_pygam:
-        try:
-            import joblib
-            from pygam import LogisticGAM
-        except ImportError:
-            has_pygam = False
     
     # Define consistent colors across all visualizations
     COLORS = {
@@ -997,6 +900,8 @@ def plot_model_surfaces(test_df):
 
     # C. Get predictions from the models over the generated grid
     grid_df = pd.DataFrame({'variable_one': v1_grid.flatten(), 'variable_two': v2_grid.flatten()})
+    grid_csv_path = SCRIPT_DIR / "temp_grid_data.csv"
+    grid_df.to_csv(grid_csv_path, index=False)
     grid_tsv_path = SCRIPT_DIR / 'temp_rust_grid_data.tsv'
     r_preds_path = SCRIPT_DIR / 'temp_r_surface_preds.csv'
     rust_preds_path = SCRIPT_DIR / 'temp_rust_surface_preds.csv'
@@ -1014,17 +919,8 @@ def plot_model_surfaces(test_df):
         
         if pygam_available and pygam_preds_path.is_file():
             pygam_preds = pd.read_csv(pygam_preds_path)['pygam_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
-            # Calculate differences between models, with Rust as the reference
-            rust_r_diff = np.abs(rust_preds - r_preds)
-            rust_pygam_diff = np.abs(rust_preds - pygam_preds)
-            max_diff = max(rust_r_diff.max(), rust_pygam_diff.max())
         else:
             has_pygam = False
-    
-    if not has_pygam:
-        # Just calculate difference between Rust and R
-        rust_r_diff = np.abs(rust_preds - r_preds)
-        max_diff = rust_r_diff.max()
     
     # D. Create plot layout based on available models
     print("\n--- Generating Model Surface Plots ---")
@@ -1101,15 +997,16 @@ def plot_model_surfaces(test_df):
     pygam_color_inv = '#0080ff'  # Inverted from orange to blue
     
     # Add decision boundaries with inverted colors
-    r_line = ax4.contour(v1_grid, v2_grid, r_preds, levels=[0.5], colors=r_color_inv, 
-                        linewidths=2.0, linestyles='-', alpha=0.9)
-    rust_line = ax4.contour(v1_grid, v2_grid, rust_preds, levels=[0.5], colors=rust_color_inv, 
-                          linewidths=2.0, linestyles='-', alpha=0.9)
+    ax4.contour(v1_grid, v2_grid, r_preds, levels=[0.5], colors=r_color_inv, linewidths=2.0, linestyles='-', alpha=0.9)
+    ax4.contour(
+        v1_grid, v2_grid, rust_preds, levels=[0.5], colors=rust_color_inv, linewidths=2.0, linestyles='-', alpha=0.9
+    )
     
     # Add PyGAM decision boundary if available
     if has_pygam:
-        pygam_line = ax4.contour(v1_grid, v2_grid, pygam_preds, levels=[0.5], colors=pygam_color_inv, 
-                               linewidths=2.0, linestyles='-', alpha=0.9)
+        ax4.contour(
+            v1_grid, v2_grid, pygam_preds, levels=[0.5], colors=pygam_color_inv, linewidths=2.0, linestyles='-', alpha=0.9
+        )
     
     # Create proxy artists for the legend with inverted colors
     from matplotlib.lines import Line2D
@@ -1187,7 +1084,7 @@ def plot_model_calibration_comparison(df):
             "Uncalibrated Rust": {'preds': df['uncalibrated_prediction'].values, 'color': COLORS['uncalibrated'], 'ax': axes[1, 1]},
         }
         # Create a new figure for the comparison plot
-        comp_fig, comp_ax = plt.subplots(1, 1, figsize=(10, 8))
+        _, comp_ax = plt.subplots(1, 1, figsize=(10, 8))
         comparison_ax = comp_ax
     elif has_pygam:
         # 2x2 grid with all 3 models
@@ -1250,7 +1147,7 @@ def plot_model_calibration_comparison(df):
         # Plot error bars with model color
         ax.errorbar(xs, ys, yerr=[ys - los, his - ys], 
                     fmt='o', capsize=3, linewidth=1.5, 
-                    color=color, label=f'Bin accuracy with 95% CI')
+                    color=color, label='Bin accuracy with 95% CI')
         
         # Add bin mass visualization
         ax2 = ax.twinx()

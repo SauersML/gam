@@ -41,6 +41,7 @@ def prepare_data_for_rust():
         'variable_two': 'PC1',        # Mapped to 'PC1' to be PENALIZED
         'outcome':      'phenotype'   # The response variable
     }
+    required_cols = ["PC1", "phenotype"]
 
     # Rename the columns
     data_renamed = data.rename(columns=column_mapping)
@@ -111,7 +112,7 @@ def main():
     
     run_subprocess(train_command)
     
-    print(f"\n--- Model training complete. ---")
+    print("\n--- Model training complete. ---")
 
 if __name__ == "__main__":
     main()

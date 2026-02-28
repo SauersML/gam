@@ -30,7 +30,7 @@ use gam::joint::{
 };
 use gam::matrix::DesignMatrix;
 use gam::probability::{inverse_link_array, normal_cdf_approx, standard_normal_quantile};
-use gam::sigma_link::{
+use gam::families::sigma_link::{
     bounded_sigma_and_deriv_from_eta as sigma_and_deriv_from_eta,
     bounded_sigma_from_eta_scalar as sigma_from_eta_scalar,
 };
@@ -473,7 +473,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if args.firth && effective_link != LinkFunction::Logit {
         return Err("--firth requires logit link".to_string());
     }
-
     if let Some(noise_formula_raw) = &args.predict_noise {
         let noise_formula = normalize_noise_formula(noise_formula_raw, &parsed.response);
         let parsed_noise = parse_formula(&noise_formula)?;

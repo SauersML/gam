@@ -30,7 +30,7 @@ def generate_data(n_samples, alpha, linear_mode=False, noise_mode=False):
     """
     # --- Stage 1: Calculate the perfect, "Clean" Signal and Probability ---
     if noise_mode:
-        print(f"--- Running in PURE NOISE mode ---")
+        print("--- Running in PURE NOISE mode ---")
         # In pure noise mode, the clean signal is flat zero.
         # This means the clean probability is exactly 0.5 everywhere.
         clean_logit = np.zeros(n_samples)
@@ -38,12 +38,12 @@ def generate_data(n_samples, alpha, linear_mode=False, noise_mode=False):
         var1 = np.random.uniform(-3, 3, n_samples)
         var2 = np.random.uniform(-1.5, 1.5, n_samples)
     elif linear_mode:
-        print(f"--- Running in LINEAR mode ---")
+        print("--- Running in LINEAR mode ---")
         var1 = np.random.uniform(-3, 3, n_samples)
         var2 = np.random.uniform(-1.5, 1.5, n_samples)
         clean_logit = var1  # var2 is intentionally omitted from the signal
     else: # Default non-linear mode
-        print(f"--- Running in NON-LINEAR mode (default) ---")
+        print("--- Running in NON-LINEAR mode (default) ---")
         var1 = np.random.uniform(0, 2 * np.pi, n_samples)
         var2 = np.random.uniform(-1.5, 1.5, n_samples)
         clean_logit = np.sin(var1) + var2
@@ -93,6 +93,7 @@ def create_binned_plots(df, alpha, linear_mode=False, noise_mode=False):
     df['v1_bin'] = pd.cut(df['variable_one'], bins=N_BINS)
     binned_empirical = df.groupby('v1_bin', observed=True)['outcome'].mean()
     binned_true = df.groupby('v1_bin', observed=True)['final_probability'].mean()
+    bin_centers_v1 = np.array([interval.mid for interval in binned_empirical.index])
     axes[0].plot(bin_centers_v1, binned_empirical.values, 'o-', label='Binned Empirical P(1)')
     axes[0].plot(bin_centers_v1, binned_true.values, 'r--', label='True Final Probability')
 
@@ -107,6 +108,7 @@ def create_binned_plots(df, alpha, linear_mode=False, noise_mode=False):
     df['v2_bin'] = pd.cut(df['variable_two'], bins=N_BINS)
     binned_empirical_v2 = df.groupby('v2_bin', observed=True)['outcome'].mean()
     binned_true_v2 = df.groupby('v2_bin', observed=True)['final_probability'].mean()
+    bin_centers_v2 = np.array([interval.mid for interval in binned_empirical_v2.index])
     axes[1].plot(bin_centers_v2, binned_empirical_v2.values, 'o-', label='Binned Empirical P(1)')
     axes[1].plot(bin_centers_v2, binned_true_v2.values, 'r--', label='True Final Probability')
 

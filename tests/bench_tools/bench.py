@@ -199,6 +199,7 @@ def prepare_training_tsv_from_df(df: pd.DataFrame, out_path: Path):
     if not required.issubset(df.columns):
         raise RuntimeError(f"Input DF missing required columns: {sorted(required - set(df.columns))}")
     df2 = df.rename(columns=mapping)
+    df2.to_csv(out_path, sep="\t", index=False)
 
 
 def _run_perf_record(app_cmd: list[str], perf_data: Path, env: dict) -> float:
@@ -459,6 +460,7 @@ def condensed_hot_paths(perf_data_path: Path) -> tuple[bool, str]:
 
         # Useful extras: subsequent non-duplicate frames with high global weight
         extras_added = 0
+        for j in range(start_extra, len(frames)):
             f = frames[j]
             if f in path:
                 continue

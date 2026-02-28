@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
+import subprocess
+import tempfile
+from pathlib import Path
 from sklearn.preprocessing import SplineTransformer
 from scipy.optimize import minimize
 
@@ -21,11 +25,6 @@ def tps_kernel(r):
     rr = r[mask]
     out[mask] = (rr**2) * np.log(rr)
     return out
-
-
-def matern52(r, ell):
-    a = np.sqrt(5.0) * r / max(ell, 1e-9)
-    return (1.0 + a + (a * a) / 3.0) * np.exp(-a)
 
 
 def pairwise_dist(a, b):
@@ -116,8 +115,8 @@ def fit_gaussian_reml(X, y, S_list, maxiter=120):
     rho = opt.x if np.all(np.isfinite(opt.x)) else x0
     lam = np.exp(rho)
     S = np.zeros((p, p))
-    for l, sk in zip(lam, S_list):
-        S += l * sk
+    for lam_i, sk in zip(lam, S_list):
+        S += lam_i * sk
     A = XtX + S + 1e-8 * np.eye(p)
     beta = np.linalg.solve(A, Xty)
     return beta, lam, opt
@@ -171,44 +170,98 @@ def build_tps_train_eval(train_xy, eval_xy, centers):
     return X_train, X_eval, [S1, S2]
 
 
-def build_matern_train_eval(train_xy, eval_xy, centers, ell=0.55):
-    K_train = matern52(pairwise_dist(train_xy, centers), ell)
-    K_cc = matern52(pairwise_dist(centers, centers), ell)
+def ensure_rust_bin():
+    root = Path(__file__).resolve().parents[1]
+    candidate = root / "target" / "release" / "gam"
+    if candidate.exists():
+        return candidate
+    subprocess.run(
+        ["cargo", "build", "--release", "--bin", "gam"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if not candidate.exists():
+        raise RuntimeError(f"missing Rust binary at {candidate}")
+    return candidate
 
-    X_train = np.c_[K_train, np.ones(len(train_xy))]
-    q = K_train.shape[1]
 
-    S1 = np.zeros((q + 1, q + 1))
-    S1[:q, :q] = K_cc
-    S2 = np.eye(q + 1)
+def write_xy_csv(path, xy, y=None):
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        if y is None:
+            w.writerow(["x", "y"])
+            for (xv, yv) in xy:
+                w.writerow([float(xv), float(yv)])
+        else:
+            w.writerow(["x", "y", "z"])
+            for (xv, yv), zv in zip(xy, y):
+                w.writerow([float(xv), float(yv), float(zv)])
 
-    K_eval = matern52(pairwise_dist(eval_xy, centers), ell)
-    X_eval = np.c_[K_eval, np.ones(len(eval_xy))]
-    return X_train, X_eval, [S1, S2]
+
+def read_mean_predictions(path):
+    out = []
+    with path.open("r", newline="") as f:
+        rdr = csv.DictReader(f)
+        if "mean" not in (rdr.fieldnames or []):
+            raise RuntimeError(f"prediction output missing 'mean' column: {path}")
+        for row in rdr:
+            out.append(float(row["mean"]))
+    return np.asarray(out, dtype=float)
 
 
-def build_duchon_train_eval(train_xy, eval_xy, centers, ell=0.55):
-    # Duchon-like p=1: Matérn radial block + linear null-space block.
-    K_train = matern52(pairwise_dist(train_xy, centers), ell)
-    K_cc = matern52(pairwise_dist(centers, centers), ell)
-    Pc = np.c_[np.ones(len(centers)), centers]
-    Z = nullspace_of_pt(Pc)
+def native_surface_predict(train_xy, z_obs, eval_xy, basis_type, centers=30, ell=0.55):
+    rust_bin = ensure_rust_bin()
+    root = Path(__file__).resolve().parents[1]
 
-    Kc_train = K_train @ Z
-    P_train = np.c_[np.ones(len(train_xy)), train_xy]
-    X_train = np.c_[Kc_train, P_train]
+    if basis_type == "matern":
+        smooth = (
+            f"s(x, y, type=matern, centers={int(centers)}, nu=5/2, "
+            f"length_scale={float(ell)}, double_penalty=true)"
+        )
+    elif basis_type == "duchon":
+        smooth = (
+            f"s(x, y, type=duchon, centers={int(centers)}, nu=1/2, order=1, "
+            f"length_scale={float(ell)}, double_penalty=true)"
+        )
+    else:
+        raise ValueError(f"unsupported basis_type: {basis_type}")
 
-    Omega_c = Z.T @ K_cc @ Z
-    q = Kc_train.shape[1]
-    pp = P_train.shape[1]
-    S1 = np.zeros((q + pp, q + pp))
-    S1[:q, :q] = Omega_c
-    S2 = np.eye(q + pp)
+    formula = f"z ~ {smooth}"
+    with tempfile.TemporaryDirectory(prefix="surface_native_", dir=str(root / "bench")) as td:
+        td_path = Path(td)
+        train_csv = td_path / "train.csv"
+        eval_csv = td_path / "eval.csv"
+        model_json = td_path / "model.json"
+        pred_csv = td_path / "pred.csv"
 
-    K_eval = matern52(pairwise_dist(eval_xy, centers), ell) @ Z
-    P_eval = np.c_[np.ones(len(eval_xy)), eval_xy]
-    X_eval = np.c_[K_eval, P_eval]
-    return X_train, X_eval, [S1, S2]
+        write_xy_csv(train_csv, train_xy, z_obs)
+        write_xy_csv(eval_csv, eval_xy)
+
+        fit_cmd = [
+            str(rust_bin),
+            "fit",
+            "--family",
+            "gaussian",
+            "--formula",
+            formula,
+            "--out",
+            str(model_json),
+            str(train_csv),
+        ]
+        subprocess.run(fit_cmd, cwd=root, check=True, capture_output=True, text=True)
+
+        pred_cmd = [
+            str(rust_bin),
+            "predict",
+            str(model_json),
+            str(eval_csv),
+            "--out",
+            str(pred_csv),
+        ]
+        subprocess.run(pred_cmd, cwd=root, check=True, capture_output=True, text=True)
+        return read_mean_predictions(pred_csv)
 
 
 def main():
@@ -240,13 +293,12 @@ def main():
     b_tps, _, _ = fit_gaussian_reml(Xtr_tps, z_obs, S_tps)
     zz_tps = (Xev_tps @ b_tps).reshape(xx.shape)
 
-    Xtr_mat, Xev_mat, S_mat = build_matern_train_eval(xy, grid_xy, centers, ell=0.55)
-    b_mat, _, _ = fit_gaussian_reml(Xtr_mat, z_obs, S_mat)
-    zz_mat = (Xev_mat @ b_mat).reshape(xx.shape)
-
-    Xtr_du, Xev_du, S_du = build_duchon_train_eval(xy, grid_xy, centers, ell=0.55)
-    b_du, _, _ = fit_gaussian_reml(Xtr_du, z_obs, S_du)
-    zz_du = (Xev_du @ b_du).reshape(xx.shape)
+    zz_mat = native_surface_predict(
+        xy, z_obs, grid_xy, basis_type="matern", centers=len(centers), ell=0.55
+    ).reshape(xx.shape)
+    zz_du = native_surface_predict(
+        xy, z_obs, grid_xy, basis_type="duchon", centers=len(centers), ell=0.55
+    ).reshape(xx.shape)
 
     vmin = min(np.min(zz_true), np.min(zz_bs), np.min(zz_tps), np.min(zz_mat), np.min(zz_du))
     vmax = max(np.max(zz_true), np.max(zz_bs), np.max(zz_tps), np.max(zz_mat), np.max(zz_du))
@@ -267,7 +319,7 @@ def main():
         "Tensor B-Spline (REML + double penalty)",
         "Thin Plate Spline (REML + double penalty)",
         "Matérn (REML + double penalty)",
-        "Duchon-like p=1 (REML + double penalty)",
+        "Duchon p=1 (native; double penalty)",
     ]
     fields = [zz_true, zz_bs, zz_tps, zz_mat, zz_du]
     shared_cmap = "viridis"
