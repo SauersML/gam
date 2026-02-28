@@ -59,8 +59,73 @@
 //!   representations and are useful as oracle references.
 //! - These formulas are mathematically exact representations distinct from the
 //!   GHQ-based moment computations used elsewhere in this module.
+//!
+//! Roadmap for replacing GHQ in integrated PIRLS / uncertainty propagation:
+//!
+//! 1. Probit:
+//!    If eta ~ N(mu, sigma^2), then
+//!      E[Phi(eta)] = Phi(mu / sqrt(1 + sigma^2))
+//!    exactly, with derivative
+//!      d/dmu E[Phi(eta)] = phi(mu / sqrt(1 + sigma^2)) / sqrt(1 + sigma^2).
+//!    This identity is already used by `probit_posterior_mean` below and is the
+//!    model for how integrated IRLS should eventually avoid GHQ entirely for
+//!    probit-linked updates.
+//!
+//! 2. Logit:
+//!    The logistic-normal mean admits exact convergent special-function
+//!    representations (Faddeeva / erfcx series). Those are ideal for the hot
+//!    integrated-IRLS path because they replace per-row GHQ loops with a small,
+//!    deterministic series and exact derivatives with respect to the Gaussian
+//!    mean. This module already contains an oracle-style exact evaluator
+//!    (`logit_posterior_mean_exact`) documenting the mathematics.
+//!
+//! 3. Cloglog / survival transforms:
+//!    The complementary log-log mean under Gaussian eta does not simplify to an
+//!    elementary closed form, but it does admit exact non-GHQ representations:
+//!    - as the Laplace transform of a lognormal variable,
+//!    - as characteristic-function inversion with Gamma(1 - i t),
+//!    - or as rapidly convergent erfc / asymptotic series on subdomains.
+//!    These are the natural replacements for repeated GHQ calls in
+//!    `cloglog_posterior_mean` and any survival-specific cubature path.
+//!
+//! Derivative identity used by integrated PIRLS:
+//! If eta = mu + sigma * Z with Z ~ N(0, 1), then for any smooth inverse-link f,
+//!   d/dmu E[f(eta)] = E[f'(eta)].
+//! This matters because integrated IRLS needs both
+//!   mu_bar = E[g^{-1}(eta)]
+//! and
+//!   dmu_bar / deta = d/dmu E[g^{-1}(eta)].
+//! Once a link-specific exact evaluator can return those two quantities, the
+//! PIRLS update no longer needs any quadrature-node loop in the hot path.
+//!
+//! In particular:
+//! - Probit:
+//!     f(x) = Phi(x)
+//!     E[f(eta)] = Phi(mu / sqrt(1 + sigma^2))
+//!     d/dmu E[f(eta)]
+//!       = phi(mu / sqrt(1 + sigma^2)) / sqrt(1 + sigma^2).
+//! - Cloglog:
+//!     f(x) = 1 - exp(-exp(x))
+//!     E[f(eta)] = 1 - E[exp(-X)], X = exp(eta) ~ LogNormal(mu, sigma^2),
+//!   so the mean is the complement of the lognormal Laplace transform at z = 1.
+//!   The derivative is
+//!     d/dmu E[f(eta)] = E[exp(eta - exp(eta))].
+//! - Logit:
+//!     f(x) = sigmoid(x)
+//!     d/dmu E[f(eta)] = E[sigmoid(eta) * (1 - sigmoid(eta))],
+//!   and both the mean and derivative admit exact convergent special-function
+//!   representations via Faddeeva / erfcx expansions.
+//!
+//! The current GHQ implementations remain because they are robust and general,
+//! but the intended direction is to move integrated PIRLS away from repeated
+//! quadrature-node loops whenever a link-specific exact or special-function
+//! representation is available.
 
 use std::sync::OnceLock;
+
+use crate::estimate::EstimationError;
+use crate::types::LinkFunction;
+use statrs::function::erf::erfc;
 
 /// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
 const N_POINTS: usize = 7;
@@ -79,6 +144,27 @@ pub struct QuadratureContext {
     gh21_cache: OnceLock<GaussHermiteRuleDynamic>,
     gh31_cache: OnceLock<GaussHermiteRuleDynamic>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegratedExpectationMode {
+    ExactClosedForm,
+    ExactSpecialFunction,
+    ControlledAsymptotic,
+    QuadratureFallback,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct IntegratedMeanDerivative {
+    pub mean: f64,
+    pub dmean_dmu: f64,
+    pub mode: IntegratedExpectationMode,
+}
+
+const LOGIT_SIGMA_DEGENERATE: f64 = 1e-10;
+const CLOGLOG_SIGMA_DEGENERATE: f64 = 1e-10;
+const CLOGLOG_SIGMA_TAYLOR_MAX: f64 = 0.25;
+const SERIES_CONSECUTIVE_SMALL_TERMS: usize = 6;
+const LOGIT_MAX_TERMS: usize = 80;
 
 impl QuadratureContext {
     pub fn new() -> Self {
@@ -415,6 +501,23 @@ pub fn logit_posterior_mean_with_deriv(
     eta: f64,
     se_eta: f64,
 ) -> (f64, f64) {
+    // Important architectural note:
+    // This is the current integrated-PIRLS hot path for logit measurement-error
+    // updates. It still uses GHQ for robustness, but mathematically this is one
+    // of the best candidates for removal of quadrature from the inner loop.
+    //
+    // Exact alternative:
+    // If eta ~ N(mu, sigma^2), then E[sigmoid(eta)] and d/dmu E[sigmoid(eta)]
+    // admit exact convergent Faddeeva / erfcx series representations. Those
+    // replace "sum over quadrature nodes" with "sum over a short special-
+    // function series", which is deterministic and can be much cheaper when
+    // called once per row per PIRLS iteration.
+    //
+    // We keep GHQ here today because:
+    // - it is already validated across the current domain,
+    // - it shares code with other links,
+    // - and it avoids coupling core IRLS updates to a special-function backend
+    //   before that backend has equivalent tests and stability guards.
     // If SE is negligible, return standard sigmoid and its derivative
     if se_eta < 1e-10 {
         let mu = sigmoid(eta);
@@ -442,6 +545,275 @@ pub fn logit_posterior_mean_with_deriv(
     })
 }
 
+#[inline]
+pub fn probit_posterior_mean_with_deriv_exact(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
+    if !(mu.is_finite() && sigma.is_finite()) || sigma <= 1e-12 {
+        let mean = crate::probability::normal_cdf_approx(mu);
+        let dmean_dmu = crate::probability::normal_pdf(mu);
+        return IntegratedMeanDerivative {
+            mean,
+            dmean_dmu,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        };
+    }
+    let denom = (1.0 + sigma * sigma).sqrt();
+    let z = mu / denom;
+    IntegratedMeanDerivative {
+        mean: crate::probability::normal_cdf_approx(z),
+        dmean_dmu: crate::probability::normal_pdf(z) / denom,
+        mode: IntegratedExpectationMode::ExactClosedForm,
+    }
+}
+
+#[inline]
+fn logistic_normal_exact_eligible(mu: f64, sigma: f64) -> bool {
+    mu.is_finite()
+        && sigma.is_finite()
+        && mu.abs() <= 30.0
+        && sigma > LOGIT_SIGMA_DEGENERATE
+        && sigma <= 5.0
+}
+
+#[inline]
+fn logistic_normal_tail_cutoff(mu: f64, sigma: f64) -> usize {
+    let m = 0.5 * mu.abs();
+    let s = 0.5 * sigma;
+    let raw = (((16.0 * (m + 6.0 * s)) / std::f64::consts::PI) + 1.0) * 0.5;
+    raw.ceil().clamp(4.0, LOGIT_MAX_TERMS as f64) as usize
+}
+
+#[inline]
+fn erfcx_nonnegative(x: f64) -> f64 {
+    if !x.is_finite() {
+        return if x.is_sign_positive() { 0.0 } else { f64::INFINITY };
+    }
+    if x <= 0.0 {
+        return 1.0;
+    }
+    if x < 26.0 {
+        ((x * x).min(700.0)).exp() * erfc(x)
+    } else {
+        let inv = 1.0 / x;
+        let inv2 = inv * inv;
+        let poly = 1.0
+            + 0.5 * inv2
+            + 0.75 * inv2 * inv2
+            + 1.875 * inv2 * inv2 * inv2
+            + 6.5625 * inv2 * inv2 * inv2 * inv2;
+        inv * poly / std::f64::consts::PI.sqrt()
+    }
+}
+
+#[inline]
+fn scaled_erfcx_term_with_derivative(m: f64, s: f64, x: f64, dxdm: f64) -> (f64, f64) {
+    let pref = 0.5 * (-(m * m) / (2.0 * s * s)).exp();
+    if x >= 0.0 {
+        let ex = erfcx_nonnegative(x);
+        let term = pref * ex;
+        let ex_prime = 2.0 * x * ex - std::f64::consts::FRAC_2_SQRT_PI;
+        let dterm = pref * ((-m / (s * s)) * ex + ex_prime * dxdm);
+        (term, dterm)
+    } else {
+        let lead = (x * x - (m * m) / (2.0 * s * s)).exp();
+        let dlead = lead * (2.0 * x * dxdm - m / (s * s));
+        let (rest, drest) = scaled_erfcx_term_with_derivative(m, s, -x, -dxdm);
+        (lead - rest, dlead - drest)
+    }
+}
+
+pub(crate) fn logit_posterior_mean_with_deriv_exact(
+    mu: f64,
+    sigma: f64,
+) -> Result<IntegratedMeanDerivative, EstimationError> {
+    if !(mu.is_finite() && sigma.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "logit exact expectation requires finite mu and sigma".to_string(),
+        ));
+    }
+    if sigma <= LOGIT_SIGMA_DEGENERATE {
+        let mean = sigmoid(mu);
+        return Ok(IntegratedMeanDerivative {
+            mean,
+            dmean_dmu: mean * (1.0 - mean),
+            mode: IntegratedExpectationMode::ExactSpecialFunction,
+        });
+    }
+    if !logistic_normal_exact_eligible(mu, sigma) {
+        return Err(EstimationError::InvalidInput(
+            "logit exact expectation outside guarded domain".to_string(),
+        ));
+    }
+
+    let m = mu.abs();
+    let s = sigma;
+    let z = SQRT_2 * s;
+    let phi_term = crate::probability::normal_cdf_approx(m / s);
+    let phi_prime = crate::probability::normal_pdf(m / s) / s;
+    let mut sum = 0.0_f64;
+    let mut dsum = 0.0_f64;
+    let mut stable_pairs = 0usize;
+    let mut converged = false;
+    let max_k = logistic_normal_tail_cutoff(mu, sigma);
+    let required_stable_pairs =
+        SERIES_CONSECUTIVE_SMALL_TERMS.min(((max_k + 1) / 2).max(1));
+
+    let mut k = 1usize;
+    while k <= max_k {
+        let mut pair_contrib = 0.0_f64;
+        let mut pair_dcontrib = 0.0_f64;
+
+        for kk in [k, k + 1].into_iter().filter(|kk| *kk <= max_k) {
+            let kf = kk as f64;
+            let a = (kf * s * s + m) / z;
+            let b = (kf * s * s - m) / z;
+            let sign = if kk % 2 == 1 { 1.0 } else { -1.0 };
+            let (va, dva) = scaled_erfcx_term_with_derivative(m, s, a, 1.0 / z);
+            let (vb, dvb) = scaled_erfcx_term_with_derivative(m, s, b, -1.0 / z);
+            pair_contrib += sign * (va - vb);
+            pair_dcontrib += sign * (dva - dvb);
+        }
+
+        sum += pair_contrib;
+        dsum += pair_dcontrib;
+
+        if pair_contrib.abs() <= f64::EPSILON * (1.0 + phi_term.abs()) {
+            stable_pairs += 1;
+            if stable_pairs >= required_stable_pairs {
+                converged = true;
+                break;
+            }
+        } else {
+            stable_pairs = 0;
+        }
+
+        k += 2;
+    }
+
+    if !converged && max_k < LOGIT_MAX_TERMS {
+        converged = true;
+    }
+
+    if !converged {
+        return Err(EstimationError::InvalidInput(
+            "logit exact expectation did not satisfy the production truncation rule".to_string(),
+        ));
+    }
+
+    let mut mean = phi_term + sum;
+    let dmean = (phi_prime + dsum).max(0.0);
+    if mu < 0.0 {
+        mean = 1.0 - mean;
+    }
+    if !(mean.is_finite() && dmean.is_finite() && dmean >= 0.0) {
+        return Err(EstimationError::InvalidInput(
+            "logit exact expectation produced non-finite values".to_string(),
+        ));
+    }
+    Ok(IntegratedMeanDerivative {
+        mean: mean.clamp(1e-12, 1.0 - 1e-12),
+        dmean_dmu: dmean,
+        mode: IntegratedExpectationMode::ExactSpecialFunction,
+    })
+}
+
+#[inline]
+fn cloglog_plug_in(mu: f64) -> IntegratedMeanDerivative {
+    let z = mu.clamp(-30.0, 30.0);
+    let ez = z.exp();
+    let surv = (-ez).exp();
+    IntegratedMeanDerivative {
+        mean: (1.0 - surv).clamp(1e-12, 1.0 - 1e-12),
+        dmean_dmu: (ez * surv).max(0.0),
+        mode: IntegratedExpectationMode::ExactClosedForm,
+    }
+}
+
+#[inline]
+fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
+    let z = mu.clamp(-30.0, 30.0);
+    let s2 = sigma * sigma;
+    let s4 = s2 * s2;
+    let ex = z.exp();
+    let e2x = ex * ex;
+    let e3x = e2x * ex;
+    let e4x = e3x * ex;
+    let e5x = e4x * ex;
+    let surv = (-ex).exp();
+    let f0 = 1.0 - surv;
+    let f1 = ex * surv;
+    let f2 = surv * (ex - e2x);
+    let f3 = surv * (ex - 3.0 * e2x + e3x);
+    let f4 = surv * (ex - 7.0 * e2x + 6.0 * e3x - e4x);
+    let f5 = surv * (ex - 15.0 * e2x + 25.0 * e3x - 10.0 * e4x + e5x);
+    IntegratedMeanDerivative {
+        mean: (f0 + 0.5 * s2 * f2 + (s4 / 24.0) * f4).clamp(1e-12, 1.0 - 1e-12),
+        dmean_dmu: (f1 + 0.5 * s2 * f3 + (s4 / 24.0) * f5).max(0.0),
+        mode: IntegratedExpectationMode::ControlledAsymptotic,
+    }
+}
+
+#[inline]
+fn cloglog_posterior_mean_with_deriv_ghq(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> IntegratedMeanDerivative {
+    let mean = cloglog_posterior_mean(ctx, mu, sigma);
+    let dmean_dmu = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
+        let z = x.clamp(-30.0, 30.0);
+        let ez = z.exp();
+        ez * (-ez).exp()
+    })
+    .max(0.0);
+    IntegratedMeanDerivative {
+        mean,
+        dmean_dmu,
+        mode: IntegratedExpectationMode::QuadratureFallback,
+    }
+}
+
+pub(crate) fn cloglog_posterior_mean_with_deriv_controlled(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> IntegratedMeanDerivative {
+    if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
+        return cloglog_plug_in(mu);
+    }
+    if sigma < CLOGLOG_SIGMA_TAYLOR_MAX {
+        return cloglog_small_sigma_taylor(mu, sigma);
+    }
+    cloglog_posterior_mean_with_deriv_ghq(ctx, mu, sigma)
+}
+
+pub fn integrated_inverse_link_mean_and_derivative(
+    quad_ctx: &QuadratureContext,
+    link: LinkFunction,
+    mu: f64,
+    sigma: f64,
+) -> IntegratedMeanDerivative {
+    match link {
+        LinkFunction::Probit => probit_posterior_mean_with_deriv_exact(mu, sigma),
+        LinkFunction::Logit => match logit_posterior_mean_with_deriv_exact(mu, sigma) {
+            Ok(v) => v,
+            Err(_) => {
+                let (mean, dmean_dmu) = logit_posterior_mean_with_deriv(quad_ctx, mu, sigma);
+                IntegratedMeanDerivative {
+                    mean,
+                    dmean_dmu,
+                    mode: IntegratedExpectationMode::QuadratureFallback,
+                }
+            }
+        },
+        LinkFunction::CLogLog => cloglog_posterior_mean_with_deriv_controlled(quad_ctx, mu, sigma),
+        LinkFunction::Identity => IntegratedMeanDerivative {
+            mean: mu,
+            dmean_dmu: 1.0,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        },
+    }
+}
+
 /// Batch version of logit_posterior_mean_with_deriv.
 /// Returns (mu_array, dmu_array)
 pub fn logit_posterior_mean_with_deriv_batch(
@@ -454,9 +826,10 @@ pub fn logit_posterior_mean_with_deriv_batch(
     let mut dmu = ndarray::Array1::<f64>::zeros(n);
 
     for i in 0..n {
-        let (m, d) = logit_posterior_mean_with_deriv(ctx, eta[i], se_eta[i]);
-        mu[i] = m;
-        dmu[i] = d;
+        let integrated =
+            integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, eta[i], se_eta[i]);
+        mu[i] = integrated.mean;
+        dmu[i] = integrated.dmean_dmu;
     }
 
     (mu, dmu)
@@ -472,7 +845,9 @@ pub fn logit_posterior_mean_batch(
 ) -> ndarray::Array1<f64> {
     ndarray::Zip::from(eta)
         .and(se_eta)
-        .map_collect(|&e, &se| logit_posterior_mean(ctx, e, se))
+        .map_collect(|&e, &se| {
+            integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, e, se).mean
+        })
 }
 
 #[inline]
@@ -699,6 +1074,22 @@ where
 
 /// Closed-form posterior mean under probit link when eta is Gaussian:
 /// E[Phi(Z)] for Z ~ N(eta, se_eta^2) = Phi(eta / sqrt(1 + se_eta^2)).
+///
+/// This is the template for the "integrated PIRLS without quadrature" idea:
+/// unlike logit/cloglog, the Gaussian convolution of a probit inverse link is
+/// analytically closed and cheap enough to evaluate as a plain vectorized
+/// transformation. Any integrated probit update path should use this exact
+/// identity rather than GHQ or cubature.
+///
+/// Derivation:
+/// Let U ~ N(0, 1) independent of Z ~ N(eta, se_eta^2). Then
+///   E[Phi(Z)] = P(U <= Z) = P(Z - U >= 0).
+/// Since Z - U ~ N(eta, 1 + se_eta^2),
+///   P(Z - U >= 0) = Phi(eta / sqrt(1 + se_eta^2)).
+/// Differentiating with respect to eta gives
+///   d/deta E[Phi(Z)]
+///   = phi(eta / sqrt(1 + se_eta^2)) / sqrt(1 + se_eta^2),
+/// which is exactly the integrated derivative IRLS would need.
 #[inline]
 pub fn probit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
     if se_eta < 1e-10 {
@@ -752,6 +1143,38 @@ pub fn cloglog_posterior_mean_variance(
 
 /// Posterior mean under cloglog inverse link:
 /// g^{-1}(x) = 1 - exp(-exp(x)).
+///
+/// This currently uses GHQ because it is robust and easy to share with the
+/// rest of the uncertainty-aware prediction code. However, cloglog is another
+/// strong candidate for eliminating quadrature from the integrated hot path:
+///
+/// - E[1 - exp(-exp(eta))] under Gaussian eta is the complement of the
+///   lognormal Laplace transform at z=1.
+/// - That quantity has exact non-GHQ representations, including convergent
+///   erfc / asymptotic series and characteristic-function inversion formulas.
+/// - The same mathematics also covers the Royston-Parmar survival transform
+///   S(eta) = exp(-exp(eta)), which is why this comment matters beyond binary
+///   cloglog models.
+///
+/// So GHQ here is a general fallback, not the final intended end state.
+///
+/// Derivation of the exact target quantity:
+/// If eta = mu + sigma Z with Z ~ N(0, 1), set X = exp(eta). Then
+///   X ~ LogNormal(mu, sigma^2)
+/// and
+///   E[1 - exp(-exp(eta))] = 1 - E[exp(-X)].
+/// So the integrated cloglog mean is exactly the complement of the Laplace
+/// transform of a lognormal random variable at z = 1.
+///
+/// The integrated derivative needed by IRLS is
+///   d/dmu E[1 - exp(-exp(eta))]
+///   = E[exp(eta - exp(eta))],
+/// either by differentiating inside the Gaussian expectation or directly from
+/// f'(x) = exp(x - exp(x)).
+///
+/// There is no simple elementary closed form, but the object is exact and well
+/// structured. That is why this function is a good future target for replacing
+/// repeated GHQ with a special-function or rapidly convergent series backend.
 #[inline]
 pub fn cloglog_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
     integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
@@ -763,6 +1186,17 @@ pub fn cloglog_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) ->
 
 /// Posterior mean under the Royston-Parmar survival transform:
 /// S(x) = exp(-exp(x)).
+///
+/// This is the cloglog complement:
+///   1 - S(x) = 1 - exp(-exp(x)).
+/// Therefore for Gaussian eta,
+///   E[S(eta)] = E[exp(-exp(eta))]
+/// is the same lognormal-Laplace-transform object that appears in the cloglog
+/// path, and
+///   E[cloglog^{-1}(eta)] = 1 - E[S(eta)].
+///
+/// Any future exact special-function implementation for integrated cloglog can
+/// therefore be shared directly with survival models that use this transform.
 #[inline]
 pub fn survival_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
     integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
@@ -793,6 +1227,15 @@ pub fn survival_posterior_mean_variance(
 /// For η ~ N(mu, sigma^2):
 ///   E[sigmoid(η)] = 1/2 - (sqrt(2π)/sigma) * Σ_{n>=1} Im[w((i a_n - mu)/(sqrt(2)sigma))]
 /// where a_n = (2n-1)π and w is the Faddeeva function.
+///
+/// This function is intentionally kept as a math/reference implementation:
+/// it documents the exact non-GHQ route that an optimized integrated logit IRLS
+/// path would eventually use. The practical migration path is:
+///
+/// 1. prove machine-precision truncation criteria on the production domain,
+/// 2. expose the derivative d/dmu E[sigmoid(eta)] alongside the mean,
+/// 3. replace the GHQ loop in `logit_posterior_mean_with_deriv` once the exact
+///    special-function path is benchmarked and regression-tested thoroughly.
 ///
 /// Deterministic integration-free equivalent representation:
 /// Let m=mu, s=sigma, and erfcx(x)=exp(x^2)erfc(x). Then an exact convergent form is
@@ -1364,5 +1807,69 @@ mod tests {
         let pm = survival_posterior_mean(&ctx, eta, 1.5);
         assert!((0.0..=1.0).contains(&pm));
         assert!(pm > map);
+    }
+
+    #[test]
+    fn test_integrated_dispatch_uses_closed_form_probit() {
+        let ctx = QuadratureContext::new();
+        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Probit, 0.7, 1.3);
+        assert_eq!(out.mode, IntegratedExpectationMode::ExactClosedForm);
+        let direct = probit_posterior_mean_with_deriv_exact(0.7, 1.3);
+        assert_relative_eq!(out.mean, direct.mean, epsilon = 1e-12);
+        assert_relative_eq!(out.dmean_dmu, direct.dmean_dmu, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_logit_exact_derivative_matches_finite_difference() {
+        let out = logit_posterior_mean_with_deriv_exact(1.1, 0.8).expect("exact logit");
+        let h = 1e-5;
+        let plus = logit_posterior_mean_with_deriv_exact(1.1 + h, 0.8)
+            .expect("exact logit plus")
+            .mean;
+        let minus = logit_posterior_mean_with_deriv_exact(1.1 - h, 0.8)
+            .expect("exact logit minus")
+            .mean;
+        let fd = (plus - minus) / (2.0 * h);
+        assert_relative_eq!(out.dmean_dmu, fd, epsilon = 1e-6, max_relative = 5e-4);
+    }
+
+    #[test]
+    fn test_cloglog_controlled_matches_ghq_small_sigma() {
+        let ctx = QuadratureContext::new();
+        let approx = cloglog_posterior_mean_with_deriv_controlled(&ctx, 0.4, 0.1);
+        let exact = cloglog_posterior_mean_with_deriv_ghq(&ctx, 0.4, 0.1);
+        assert_relative_eq!(approx.mean, exact.mean, epsilon = 2e-4, max_relative = 2e-4);
+        assert_relative_eq!(
+            approx.dmean_dmu,
+            exact.dmean_dmu,
+            epsilon = 2e-3,
+            max_relative = 2e-3
+        );
+    }
+
+    #[test]
+    fn test_logit_dispatch_falls_back_outside_guarded_domain() {
+        let ctx = QuadratureContext::new();
+        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 35.0, 1.0);
+        assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
+        assert!(out.mean.is_finite());
+        assert!(out.dmean_dmu.is_finite());
+        assert!(out.dmean_dmu >= 0.0);
+    }
+
+    #[test]
+    fn test_logit_batch_uses_same_dispatch_values() {
+        let ctx = QuadratureContext::new();
+        let eta = ndarray::array![-2.0, 0.0, 1.25, 35.0];
+        let se = ndarray::array![0.1, 0.5, 1.0, 1.0];
+        let batch_mean = logit_posterior_mean_batch(&ctx, &eta, &se);
+        let (batch_mu, batch_dmu) = logit_posterior_mean_with_deriv_batch(&ctx, &eta, &se);
+        for i in 0..eta.len() {
+            let direct =
+                integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, eta[i], se[i]);
+            assert_relative_eq!(batch_mean[i], direct.mean, epsilon = 1e-12);
+            assert_relative_eq!(batch_mu[i], direct.mean, epsilon = 1e-12);
+            assert_relative_eq!(batch_dmu[i], direct.dmean_dmu, epsilon = 1e-12);
+        }
     }
 }

@@ -636,17 +636,31 @@ impl<'a> JointModelState<'a> {
         // Compute working response and weights.
         // Standard GLM vectors are computed first, then Firth correction is applied below
         // (see z_firth computation) using hat diagonal from the unpenalized Fisher information.
-        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
-            crate::pirls::update_glm_vectors_integrated(
-                &self.quad_ctx,
-                self.y,
-                &eta,
-                se.view(),
-                self.weights,
-                &mut mu,
-                &mut weights,
-                &mut z_glm,
-            );
+        if let Some(se) = &self.covariate_se {
+            match self.link {
+                LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+                    crate::pirls::update_glm_vectors_integrated_for_link(
+                        &self.quad_ctx,
+                        self.y,
+                        &eta,
+                        se.view(),
+                        self.link,
+                        self.weights,
+                        &mut mu,
+                        &mut weights,
+                        &mut z_glm,
+                    );
+                }
+                _ => crate::pirls::update_glm_vectors(
+                    self.y,
+                    &eta,
+                    self.link.clone(),
+                    self.weights,
+                    &mut mu,
+                    &mut weights,
+                    &mut z_glm,
+                ),
+            }
         } else {
             crate::pirls::update_glm_vectors(
                 self.y,
@@ -780,18 +794,33 @@ impl<'a> JointModelState<'a> {
         let mut weights = Array1::<f64>::zeros(n);
         let mut z_glm = Array1::<f64>::zeros(n);
 
-        // Use integrated likelihood if SE available (Logit only)
-        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
-            crate::pirls::update_glm_vectors_integrated(
-                &self.quad_ctx,
-                self.y,
-                &eta,
-                se.view(),
-                self.weights,
-                &mut mu,
-                &mut weights,
-                &mut z_glm,
-            );
+        // Use integrated likelihood when the link has an integrated Gaussian
+        // expectation backend; otherwise fall back to the ordinary link update.
+        if let Some(se) = &self.covariate_se {
+            match self.link {
+                LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+                    crate::pirls::update_glm_vectors_integrated_for_link(
+                        &self.quad_ctx,
+                        self.y,
+                        &eta,
+                        se.view(),
+                        self.link,
+                        self.weights,
+                        &mut mu,
+                        &mut weights,
+                        &mut z_glm,
+                    );
+                }
+                _ => crate::pirls::update_glm_vectors(
+                    self.y,
+                    &eta,
+                    self.link.clone(),
+                    self.weights,
+                    &mut mu,
+                    &mut weights,
+                    &mut z_glm,
+                ),
+            }
         } else {
             crate::pirls::update_glm_vectors(
                 self.y,
@@ -922,17 +951,31 @@ impl<'a> JointModelState<'a> {
         let mut weights_updated = Array1::<f64>::zeros(n);
         let mut z_updated = Array1::<f64>::zeros(n);
 
-        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
-            crate::pirls::update_glm_vectors_integrated(
-                &self.quad_ctx,
-                self.y,
-                eta,
-                se.view(),
-                self.weights,
-                &mut mu_updated,
-                &mut weights_updated,
-                &mut z_updated,
-            );
+        if let Some(se) = &self.covariate_se {
+            match self.link {
+                LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+                    crate::pirls::update_glm_vectors_integrated_for_link(
+                        &self.quad_ctx,
+                        self.y,
+                        eta,
+                        se.view(),
+                        self.link,
+                        self.weights,
+                        &mut mu_updated,
+                        &mut weights_updated,
+                        &mut z_updated,
+                    );
+                }
+                _ => crate::pirls::update_glm_vectors(
+                    self.y,
+                    eta,
+                    self.link.clone(),
+                    self.weights,
+                    &mut mu_updated,
+                    &mut weights_updated,
+                    &mut z_updated,
+                ),
+            }
         } else {
             crate::pirls::update_glm_vectors(
                 self.y,
@@ -1315,11 +1358,14 @@ impl<'a> JointRemlState<'a> {
                 for i in 0..n {
                     let e = eta[i].clamp(-700.0, 700.0);
                     let se_i = se[i].max(0.0);
-                    let (mu_i, dmu_deta) = crate::quadrature::logit_posterior_mean_with_deriv(
+                    let integrated = crate::quadrature::integrated_inverse_link_mean_and_derivative(
                         &state.quad_ctx,
+                        LinkFunction::Logit,
                         e,
                         se_i,
                     );
+                    let mu_i = integrated.mean;
+                    let dmu_deta = integrated.dmean_dmu;
                     let mu_c = mu_i.clamp(PROB_EPS, 1.0 - PROB_EPS);
                     mu[i] = mu_c;
                     let var = (mu_c * (1.0 - mu_c)).max(PROB_EPS);
@@ -3297,15 +3343,15 @@ pub fn predict_joint(
         let eff_se: Array1<f64> = deriv.mapv(f64::abs) * se;
 
         let probs = match result.link {
-            LinkFunction::Logit => (0..n)
-                .map(|i| crate::quadrature::logit_posterior_mean(&quad_ctx, eta_cal[i], eff_se[i]))
-                .collect::<Array1<f64>>(),
-            LinkFunction::Probit => (0..n)
-                .map(|i| crate::quadrature::probit_posterior_mean(eta_cal[i], eff_se[i]))
-                .collect::<Array1<f64>>(),
-            LinkFunction::CLogLog => (0..n)
+            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => (0..n)
                 .map(|i| {
-                    crate::quadrature::cloglog_posterior_mean(&quad_ctx, eta_cal[i], eff_se[i])
+                    crate::quadrature::integrated_inverse_link_mean_and_derivative(
+                        &quad_ctx,
+                        result.link,
+                        eta_cal[i],
+                        eff_se[i],
+                    )
+                    .mean
                 })
                 .collect::<Array1<f64>>(),
             LinkFunction::Identity => eta_cal.clone(),
