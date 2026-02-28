@@ -1,5 +1,10 @@
 name: bench-setup
 description: Shared setup for benchmark jobs
+inputs:
+  install-runtime-deps:
+    description: "Install benchmark Python/R dependencies in the job environment"
+    required: false
+    default: "true"
 runs:
   using: composite
   steps:
@@ -21,7 +26,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-bench-pip-${{ hashFiles('bench/run_suite.py', '.github/actions/bench-setup/action.yml') }}
+        key: ${{ runner.os }}-bench-pip-${{ hashFiles('.github/actions/bench-setup/action.yml') }}
         restore-keys: |
           ${{ runner.os }}-bench-pip-
 
@@ -29,7 +34,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ${{ github.workspace }}/.r-lib
-        key: ${{ runner.os }}-bench-rlib-${{ hashFiles('bench/run_suite.py', '.github/actions/bench-setup/action.yml') }}
+        key: ${{ runner.os }}-bench-rlib-${{ hashFiles('.github/actions/bench-setup/action.yml') }}
         restore-keys: |
           ${{ runner.os }}-bench-rlib-
 
@@ -37,11 +42,12 @@ runs:
       uses: Swatinem/rust-cache@v2
 
     - name: Install benchmark runtime deps
+      if: ${{ inputs.install-runtime-deps == 'true' }}
       shell: bash
       run: |
         mkdir -p "${R_LIBS_USER}"
         python3 --version
         Rscript --version
         python3 -m pip install --upgrade pip setuptools wheel
-        python3 -m pip install numpy pandas pygam lifelines
-        Rscript -e 'install.packages(c("mgcv","jsonlite"), repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"))'
+        python3 -m pip install numpy pandas scikit-learn pygam lifelines scikit-survival xgboost
+        Rscript -e 'install.packages(c("mgcv","jsonlite","survival","glmnet","gamlss","gamlss.dist","gamboostLSS","mboost","bamlss","brms"), repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"))'

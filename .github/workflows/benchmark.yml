@@ -100,28 +100,21 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Shared benchmark setup (cached)
+        uses: ./.github/actions/bench-setup
         with:
-          python-version: "3.11"
-
-      - name: Set up R
-        uses: r-lib/actions/setup-r@v2
+          install-runtime-deps: "true"
 
       - name: Build shared runtime once
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p bench/runtime/pydeps bench/runtime/r-lib
+          if [ -d "${R_LIBS_USER}" ]; then
+            cp -a "${R_LIBS_USER}/." bench/runtime/r-lib/ || true
+          fi
           python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install --target bench/runtime/pydeps numpy pandas pygam lifelines
-          Rscript -e 'install.packages(c("mgcv","jsonlite"), repos="https://cloud.r-project.org", lib="bench/runtime/r-lib")'
+          python3 -m pip install --target bench/runtime/pydeps numpy pandas scikit-learn pygam lifelines scikit-survival xgboost
           cargo build --release --bin gam
           cp target/release/gam bench/runtime/gam
           chmod +x bench/runtime/gam
@@ -197,11 +190,25 @@ jobs:
           test -x "${BENCH_GAM_BIN}"
           echo "smoke-import python deps"
           python3 - <<'PY'
-          import numpy, pandas, pygam, lifelines
-          print("python deps ok")
+          import importlib.util
+          from pathlib import Path
+          import numpy, pandas, lifelines, sksurv, xgboost
+
+          scenario_name = "${{ matrix.scenario }}"
+          mod_path = Path("bench/run_suite.py").resolve()
+          spec = importlib.util.spec_from_file_location("run_suite_mod", mod_path)
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          needs_pygam = bool(mod._should_run_pygam_for_scenario({"name": scenario_name}))
+          if needs_pygam:
+            import pygam  # noqa: F401
+            print(f"python deps ok (scenario={scenario_name}, pygam=required)")
+          else:
+            print(f"python deps ok (scenario={scenario_name}, pygam=not-required)")
           PY
           echo "smoke-load R deps"
-          Rscript -e 'library(mgcv); library(jsonlite); cat("R deps ok\n")'
+          Rscript -e 'library(mgcv); library(jsonlite); library(survival); library(glmnet); library(gamlss); library(gamlss.dist); library(gamboostLSS); library(mboost); library(bamlss); library(brms); cat("R deps ok\n")'
           mkdir -p bench/results-shards
           echo "running benchmark shard..."
           python3 bench/run_suite.py \
