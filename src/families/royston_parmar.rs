@@ -227,6 +227,7 @@ where
         max_iter: options.max_iter,
         tol: options.tol,
         finite_diff_step: options.finite_diff_step,
+        fd_hessian_max_dim: usize::MAX,
         seed_config: options.seed_config,
     };
     let result = crate::estimate::optimize_log_smoothing_with_multistart_with_gradient(
@@ -288,6 +289,7 @@ where
         max_iter: options.max_iter,
         tol: options.tol,
         finite_diff_step: options.finite_diff_step,
+        fd_hessian_max_dim: usize::MAX,
         seed_config: options.seed_config,
     };
     let result = crate::estimate::optimize_log_smoothing_with_multistart(

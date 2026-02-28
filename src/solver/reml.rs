@@ -261,6 +261,7 @@
         cost_eval_count: RwLock<u64>,
         raw_cond_snapshot: RwLock<f64>,
         gaussian_cond_snapshot: RwLock<f64>,
+        last_gradient_used_stochastic_fallback: AtomicBool,
         workspace: Mutex<RemlWorkspace>,
         pub(super) warm_start_beta: RwLock<Option<Coefficients>>,
         warm_start_enabled: AtomicBool,
@@ -686,6 +687,7 @@
                 cost_eval_count: RwLock::new(0),
                 raw_cond_snapshot: RwLock::new(f64::NAN),
                 gaussian_cond_snapshot: RwLock::new(f64::NAN),
+                last_gradient_used_stochastic_fallback: AtomicBool::new(false),
                 workspace: Mutex::new(workspace),
                 warm_start_beta: RwLock::new(None),
                 warm_start_enabled: AtomicBool::new(true),
@@ -2114,6 +2116,8 @@
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
         pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+            self.last_gradient_used_stochastic_fallback
+                .store(false, Ordering::Relaxed);
             if self.uses_objective_consistent_fd_gradient(p) {
                 // Fixed-choice gradient definition for this fit (no mid-flight swapping):
                 // use objective-consistent FD in the known sign-unstable 1D non-Gaussian path.
@@ -2802,6 +2806,8 @@
             if self.should_use_stochastic_exact_gradient(bundle, &gradient_result) {
                 match self.compute_logit_stochastic_exact_gradient(p, bundle) {
                     Ok(stochastic_grad) => {
+                        self.last_gradient_used_stochastic_fallback
+                            .store(true, Ordering::Relaxed);
                         log::warn!(
                             "[REML] using stochastic exact log-marginal gradient fallback (posterior-sampled expectation)"
                         );
@@ -2817,6 +2823,11 @@
             }
 
             Ok(gradient_result)
+        }
+
+        pub fn last_gradient_used_stochastic_fallback(&self) -> bool {
+            self.last_gradient_used_stochastic_fallback
+                .load(Ordering::Relaxed)
         }
 
         fn should_use_stochastic_exact_gradient(

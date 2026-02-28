@@ -60,19 +60,31 @@
     },
     {
       "name": "icu_survival_death",
-      "dataset": "icu_survival_death"
+      "dataset": "icu_survival_death",
+      "exclude_contenders": [
+        "python_pygam"
+      ]
     },
     {
       "name": "icu_survival_los",
-      "dataset": "icu_survival_los"
+      "dataset": "icu_survival_los",
+      "exclude_contenders": [
+        "python_pygam"
+      ]
     },
     {
       "name": "heart_failure_survival",
-      "dataset": "heart_failure_clinical_records_dataset"
+      "dataset": "heart_failure_clinical_records_dataset",
+      "exclude_contenders": [
+        "python_pygam"
+      ]
     },
     {
       "name": "cirrhosis_survival",
-      "dataset": "cirrhosis"
+      "dataset": "cirrhosis",
+      "exclude_contenders": [
+        "python_pygam"
+      ]
     },
     {
       "name": "geo_disease_tp",
@@ -97,7 +109,10 @@
     {
       "name": "geo_disease_ps_per_pc",
       "n": 4000,
-      "seed": 20260226
+      "seed": 20260226,
+      "exclude_contenders": [
+        "python_pygam"
+      ]
     },
     {
       "name": "geo_disease_eas_tp_k6",
@@ -152,7 +167,10 @@
     {
       "name": "geo_disease_eas_psperpc_k12",
       "n": 6000,
-      "seed": 20260301
+      "seed": 20260301,
+      "exclude_contenders": [
+        "python_pygam"
+      ]
     },
     {
       "name": "geo_disease_eas_psperpc_k24",
@@ -237,7 +255,10 @@
     {
       "name": "papuan_oce_psperpc_k12",
       "n": 6000,
-      "seed": 20260315
+      "seed": 20260315,
+      "exclude_contenders": [
+        "python_pygam"
+      ]
     },
     {
       "name": "papuan_oce4_tp_k6",
@@ -435,7 +456,10 @@
       "name": "geo_latlon_superpopnoise_psperpc_k12",
       "seed": 20260401,
       "prevalence_min": 0.01,
-      "prevalence_max": 0.1
+      "prevalence_max": 0.1,
+      "exclude_contenders": [
+        "python_pygam"
+      ]
     },
     {
       "name": "geo_latlon_superpopnoise_psperpc_k24",
@@ -507,7 +531,10 @@
       "name": "geo_latlon_equatornoise_psperpc_k12",
       "seed": 20260401,
       "prevalence_min": 0.01,
-      "prevalence_max": 0.1
+      "prevalence_max": 0.1,
+      "exclude_contenders": [
+        "python_pygam"
+      ]
     },
     {
       "name": "geo_latlon_equatornoise_psperpc_k24",

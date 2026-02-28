@@ -10,7 +10,7 @@
 //! - g(·): Flexible 1D link correction with scale anchor (g(u) = u + B(u)θ)
 //!
 //! The algorithm:
-//! - Outer: Newton trust-region over ρ = [log(λ_base), log(λ_link)]
+//! - Outer: gradient-only BFGS over ρ = [log(λ_base), log(λ_link)]
 //! - Inner: Alternating (g|β, β|g with g'(u)*X design)
 //! - LAML cost computed via logdet of joint Gauss-Newton Hessian
 
@@ -34,9 +34,7 @@ use crate::visualizer;
 use faer::Side;
 use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use wolfe_bfgs::{
-    BfgsSolution, NewtonTrustRegion, ObjectiveEvalError, ObjectiveRequest, ObjectiveSample,
-};
+use wolfe_bfgs::{Bfgs, BfgsError, BfgsSolution};
 
 // NOTE on z standardization:
 // We standardize u = Xβ into z_raw = (u - min_u) / (max_u - min_u).
@@ -55,11 +53,24 @@ const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 const JOINT_GRAD_AUDIT_CLAMP_FRAC: f64 = 0.90;
 const JOINT_GRAD_AUDIT_WARMUP_EVALS: usize = 5;
 const JOINT_GRAD_AUDIT_INTERVAL: usize = 20;
+const OUTER_BFGS_COST_BARRIER: f64 = 1e50;
+const OUTER_BFGS_GRAD_SCALE: f64 = 1e6;
 
 #[inline]
 fn should_sample_joint_fd_audit(eval_num: usize) -> bool {
     eval_num <= JOINT_GRAD_AUDIT_WARMUP_EVALS
         || (JOINT_GRAD_AUDIT_INTERVAL > 0 && eval_num % JOINT_GRAD_AUDIT_INTERVAL == 0)
+}
+
+fn invalid_outer_bfgs_sample(rho: &Array1<f64>) -> (f64, Array1<f64>) {
+    let mut grad = rho.clone();
+    for g in grad.iter_mut() {
+        if !g.is_finite() || g.abs() < 1e-6 {
+            *g = 1.0;
+        }
+    }
+    grad *= OUTER_BFGS_GRAD_SCALE;
+    (OUTER_BFGS_COST_BARRIER + 0.5 * rho.dot(rho), grad)
 }
 
 /// Ensure a matrix is positive definite by adding ridge if needed for solver stability.
@@ -2760,44 +2771,6 @@ impl<'a> JointRemlState<'a> {
         (cost, grad)
     }
 
-    fn compute_hessian_fd(&mut self, rho: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
-        let n_rho = rho.len();
-        let mut hess = Array2::<f64>::zeros((n_rho, n_rho));
-        if n_rho == 0 {
-            return Ok(hess);
-        }
-        for j in 0..n_rho {
-            let h = (1e-4 * (1.0 + rho[j].abs())).max(1e-6);
-            let mut rho_plus = rho.clone();
-            rho_plus[j] += h;
-            let mut rho_minus = rho.clone();
-            rho_minus[j] -= h;
-            let g_plus = self.compute_gradient(&rho_plus)?;
-            let g_minus = self.compute_gradient(&rho_minus)?;
-            if g_plus.len() != n_rho || g_minus.len() != n_rho {
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "joint FD Hessian gradient length mismatch".to_string(),
-                ));
-            }
-            for i in 0..n_rho {
-                hess[[i, j]] = (g_plus[i] - g_minus[i]) / (2.0 * h);
-            }
-        }
-        for i in 0..n_rho {
-            for j in 0..i {
-                let v = 0.5 * (hess[[i, j]] + hess[[j, i]]);
-                hess[[i, j]] = v;
-                hess[[j, i]] = v;
-            }
-        }
-        if hess.iter().any(|v| !v.is_finite()) {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "non-finite values in joint FD Hessian".to_string(),
-            ));
-        }
-        Ok(hess)
-    }
-
     /// Extract final result after optimization
     pub fn into_result(self) -> JointModelResult {
         let cached_edf = self.eval.cached_edf;
@@ -2933,90 +2906,41 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
         snapshot.restore(&mut reml_state);
         let lower = Array1::<f64>::from_elem(rho.len(), -RHO_BOUND);
         let upper = Array1::<f64>::from_elem(rho.len(), RHO_BOUND);
-        let mut full_cache: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
-        let mut solver = NewtonTrustRegion::new(rho, |rho, request| {
-            if let Some((rho_c, cost_c, grad_c, hess_c)) = &full_cache
+        let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
+        let mut solver = Bfgs::new(rho, |rho| {
+            if let Some((rho_c, cost_c, grad_c)) = &last_eval
                 && rho.len() == rho_c.len()
                 && rho
                     .iter()
                     .zip(rho_c.iter())
                     .all(|(&a, &b)| (a - b).abs() <= 1e-12)
             {
-                return Ok(match request {
-                    ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
-                    ObjectiveRequest::CostAndGradient => {
-                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
-                    }
-                    ObjectiveRequest::GradientAndHessian
-                    | ObjectiveRequest::CostGradientHessian => {
-                        ObjectiveSample::cost_gradient_hessian(
-                            *cost_c,
-                            grad_c.clone(),
-                            hess_c.clone(),
-                        )
-                    }
-                });
+                return (*cost_c, grad_c.clone());
             }
 
-            let cost = match reml_state.compute_cost(rho) {
-                Ok(v) => v,
-                Err(_) => f64::INFINITY,
+            let sample = match (reml_state.compute_cost(rho), reml_state.compute_gradient(rho)) {
+                (Ok(cost), Ok(grad)) if cost.is_finite() && grad.iter().all(|v| v.is_finite()) => {
+                    (cost, grad)
+                }
+                _ => invalid_outer_bfgs_sample(rho),
             };
-            if !cost.is_finite() {
-                return Err(ObjectiveEvalError::recoverable(
-                    "non-finite joint REML cost",
-                ));
-            }
-            match request {
-                ObjectiveRequest::CostOnly => Ok(ObjectiveSample::cost_only(cost)),
-                ObjectiveRequest::CostAndGradient => {
-                    let grad = match reml_state.compute_gradient(rho) {
-                        Ok(g) if g.iter().all(|v| v.is_finite()) => g,
-                        _ => {
-                            return Err(ObjectiveEvalError::recoverable(
-                                "non-finite joint REML gradient",
-                            ));
-                        }
-                    };
-                    Ok(ObjectiveSample::cost_and_gradient(cost, grad))
-                }
-                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
-                    let grad = match reml_state.compute_gradient(rho) {
-                        Ok(g) if g.iter().all(|v| v.is_finite()) => g,
-                        _ => {
-                            return Err(ObjectiveEvalError::recoverable(
-                                "non-finite joint REML gradient",
-                            ));
-                        }
-                    };
-                    let hess = match reml_state.compute_hessian_fd(rho) {
-                        Ok(h) if h.iter().all(|v| v.is_finite()) => h,
-                        _ => {
-                            return Err(ObjectiveEvalError::recoverable(
-                                "non-finite joint REML Hessian",
-                            ));
-                        }
-                    };
-                    full_cache = Some((rho.clone(), cost, grad.clone(), hess.clone()));
-                    Ok(ObjectiveSample::cost_gradient_hessian(cost, grad, hess))
-                }
-            }
+            last_eval = Some((rho.clone(), sample.0, sample.1.clone()));
+            sample
         })
         .with_bounds(lower, upper, 1e-6)
         .with_tolerance(config.reml_tol)
         .with_max_iterations(config.max_reml_iter)
-        .with_initial_trust_radius(1.0)
-        .with_max_trust_radius(1e6)
-        .with_acceptance_threshold(0.1);
+        .with_no_improve_stop(1e-8, 8)
+        .with_flat_stall_exit(true, 4)
+        .with_curvature_slack_scale(2.0);
 
         let solution = match solver.run() {
             Ok(solution) => solution,
-            Err(wolfe_bfgs::NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
-                *last_solution
-            }
+            Err(BfgsError::MaxIterationsReached { last_solution })
+            | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
             Err(e) => {
                 last_error = Some(EstimationError::RemlOptimizationFailed(format!(
-                    "Newton trust-region failed for joint model: {e:?}"
+                    "BFGS failed for joint model: {e:?}"
                 )));
                 continue;
             }

@@ -9,7 +9,7 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use ndarray::{Array1, Array2};
-use wolfe_bfgs::{NewtonTrustRegion, ObjectiveEvalError, ObjectiveRequest, ObjectiveSample};
+use wolfe_bfgs::{Bfgs, BfgsError};
 
 /// Optional known link metadata when a family uses a learnable wiggle correction.
 #[derive(Debug, Clone, Copy)]
@@ -1289,33 +1289,19 @@ fn inner_blockwise_fit<F: CustomFamily>(
 /// Fit a custom multi-block family.
 ///
 /// Inner loop: cyclic blockwise penalized weighted regressions.
-/// Outer loop: joint optimization of all log-smoothing parameters.
-fn outer_objective_only<F: CustomFamily>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    penalty_counts: &[usize],
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-) -> Result<(f64, ConstrainedWarmStart), String> {
-    let per_block = split_log_lambdas(rho, penalty_counts)?;
-    let inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
-    let reml_term = if options.use_reml_objective {
-        0.5 * (inner.block_logdet_h - inner.block_logdet_s)
-    } else {
-        0.0
-    };
-    let objective = -inner.log_likelihood + inner.penalty_value + reml_term;
-    let warm = ConstrainedWarmStart {
-        rho: rho.clone(),
-        block_beta: inner
-            .block_states
-            .iter()
-            .map(|st| st.beta.clone())
-            .collect(),
-        active_sets: inner.active_sets,
-    };
-    Ok((objective, warm))
+/// Outer loop: joint gradient-only BFGS optimization of all log-smoothing parameters.
+fn invalid_outer_bfgs_sample(rho: &Array1<f64>) -> (f64, Array1<f64>) {
+    const COST_BARRIER: f64 = 1e50;
+    const GRAD_SCALE: f64 = 1e6;
+
+    let mut grad = rho.clone();
+    for g in grad.iter_mut() {
+        if !g.is_finite() || g.abs() < 1e-6 {
+            *g = 1.0;
+        }
+    }
+    grad *= GRAD_SCALE;
+    (COST_BARRIER + 0.5 * rho.dot(rho), grad)
 }
 
 fn outer_objective_and_gradient<F: CustomFamily>(
@@ -1675,46 +1661,6 @@ fn compute_joint_hessian_from_objective<F: CustomFamily>(
     Ok(h)
 }
 
-fn fd_hessian_from_gradient<GradFn>(
-    rho: &Array1<f64>,
-    mut grad_fn: GradFn,
-) -> Result<Array2<f64>, String>
-where
-    GradFn: FnMut(&Array1<f64>) -> Result<Array1<f64>, String>,
-{
-    let k = rho.len();
-    let mut h = Array2::<f64>::zeros((k, k));
-    if k == 0 {
-        return Ok(h);
-    }
-    for j in 0..k {
-        let step = (1e-4 * (1.0 + rho[j].abs())).max(1e-6);
-        let mut rho_p = rho.clone();
-        rho_p[j] += step;
-        let mut rho_m = rho.clone();
-        rho_m[j] -= step;
-        let g_p = grad_fn(&rho_p)?;
-        let g_m = grad_fn(&rho_m)?;
-        if g_p.len() != k || g_m.len() != k {
-            return Err("outer FD Hessian gradient length mismatch".to_string());
-        }
-        for i in 0..k {
-            h[[i, j]] = (g_p[i] - g_m[i]) / (2.0 * step);
-        }
-    }
-    for i in 0..k {
-        for j in 0..i {
-            let v = 0.5 * (h[[i, j]] + h[[j, i]]);
-            h[[i, j]] = v;
-            h[[j, i]] = v;
-        }
-    }
-    if h.iter().any(|v| !v.is_finite()) {
-        return Err("outer FD Hessian produced non-finite values".to_string());
-    }
-    Ok(h)
-}
-
 fn compute_joint_covariance<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -1784,146 +1730,71 @@ pub fn fit_custom_family<F: CustomFamily>(
     let last_outer_error = std::sync::Mutex::new(None::<String>);
     let lower = Array1::<f64>::from_elem(rho0.len(), -30.0);
     let upper = Array1::<f64>::from_elem(rho0.len(), 30.0);
-    let mut full_cache: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
-    let mut solver = NewtonTrustRegion::new(rho0.clone(), |x, request| {
-        if let Some((rho_c, cost_c, grad_c, hess_c)) = &full_cache
+    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
+    let mut solver = Bfgs::new(rho0.clone(), |x| {
+        if let Some((rho_c, cost_c, grad_c)) = &last_eval
             && x.len() == rho_c.len()
             && x.iter()
                 .zip(rho_c.iter())
                 .all(|(&a, &b)| (a - b).abs() <= 1e-12)
         {
-            return Ok(match request {
-                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
-                ObjectiveRequest::CostAndGradient => {
-                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
-                }
-                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
-                    ObjectiveSample::cost_gradient_hessian(*cost_c, grad_c.clone(), hess_c.clone())
-                }
-            });
+            return (*cost_c, grad_c.clone());
         }
 
         let cached = warm_cache.lock().ok().and_then(|g| g.clone());
-        match request {
-            ObjectiveRequest::CostOnly => match outer_objective_only(
-                family,
-                specs,
-                options,
-                &penalty_counts,
-                x,
-                cached.as_ref(),
-            ) {
-                Ok((obj, warm)) => {
-                    if let Ok(mut guard) = warm_cache.lock() {
-                        let seed_ok = cached
-                            .as_ref()
-                            .map(|c| {
-                                c.rho.len() == x.len()
-                                    && c.rho
-                                        .iter()
-                                        .zip(x.iter())
-                                        .all(|(&a, &b)| (a - b).abs() <= 1.5)
-                            })
-                            .unwrap_or(true);
-                        if seed_ok {
-                            *guard = Some(warm);
-                        } else {
-                            *guard = None;
-                        }
-                    }
-                    if let Ok(mut guard) = last_outer_error.lock() {
+        let sample = match outer_objective_and_gradient(
+            family,
+            specs,
+            options,
+            &penalty_counts,
+            x,
+            cached.as_ref(),
+        ) {
+            Ok((obj, grad, warm)) if obj.is_finite() && grad.iter().all(|v| v.is_finite()) => {
+                if let Ok(mut guard) = warm_cache.lock() {
+                    let seed_ok = cached
+                        .as_ref()
+                        .map(|c| {
+                            c.rho.len() == x.len()
+                                && c.rho
+                                    .iter()
+                                    .zip(x.iter())
+                                    .all(|(&a, &b)| (a - b).abs() <= 1.5)
+                        })
+                        .unwrap_or(true);
+                    if seed_ok {
+                        *guard = Some(warm);
+                    } else {
                         *guard = None;
                     }
-                    Ok(ObjectiveSample::cost_only(obj))
                 }
-                Err(e) => {
-                    if let Ok(mut guard) = last_outer_error.lock() {
-                        *guard = Some(e);
-                    }
-                    Err(ObjectiveEvalError::recoverable(
-                        "custom-family outer cost evaluation failed",
-                    ))
+                if let Ok(mut guard) = last_outer_error.lock() {
+                    *guard = None;
                 }
-            },
-            ObjectiveRequest::CostAndGradient
-            | ObjectiveRequest::GradientAndHessian
-            | ObjectiveRequest::CostGradientHessian => {
-                match outer_objective_and_gradient(
-                    family,
-                    specs,
-                    options,
-                    &penalty_counts,
-                    x,
-                    cached.as_ref(),
-                ) {
-                    Ok((obj, grad, warm)) => {
-                        if let Ok(mut guard) = warm_cache.lock() {
-                            // Keep only close-by rho seeds to avoid harmful warm starts.
-                            let seed_ok = cached
-                                .as_ref()
-                                .map(|c| {
-                                    c.rho.len() == x.len()
-                                        && c.rho
-                                            .iter()
-                                            .zip(x.iter())
-                                            .all(|(&a, &b)| (a - b).abs() <= 1.5)
-                                })
-                                .unwrap_or(true);
-                            if seed_ok {
-                                *guard = Some(warm);
-                            } else {
-                                *guard = None;
-                            }
-                        }
-                        if let Ok(mut guard) = last_outer_error.lock() {
-                            *guard = None;
-                        }
-                        if matches!(request, ObjectiveRequest::CostAndGradient) {
-                            return Ok(ObjectiveSample::cost_and_gradient(obj, grad));
-                        }
-                        let hess = match fd_hessian_from_gradient(x, |rho_fd| {
-                            outer_objective_and_gradient(
-                                family,
-                                specs,
-                                options,
-                                &penalty_counts,
-                                rho_fd,
-                                None,
-                            )
-                            .map(|(_, g, _)| g)
-                        }) {
-                            Ok(h) => h,
-                            Err(e) => {
-                                if let Ok(mut guard) = last_outer_error.lock() {
-                                    *guard = Some(e);
-                                }
-                                return Err(ObjectiveEvalError::recoverable(
-                                    "custom-family outer Hessian FD failed",
-                                ));
-                            }
-                        };
-                        full_cache = Some((x.clone(), obj, grad.clone(), hess.clone()));
-                        Ok(ObjectiveSample::cost_gradient_hessian(obj, grad, hess))
-                    }
-                    // Avoid synthetic derivatives: failed objective evaluations must not
-                    // inject arbitrary direction/curvature into outer optimization.
-                    Err(e) => {
-                        if let Ok(mut guard) = last_outer_error.lock() {
-                            *guard = Some(e);
-                        }
-                        Err(ObjectiveEvalError::recoverable(
-                            "custom-family outer gradient evaluation failed",
-                        ))
-                    }
-                }
+                (obj, grad)
             }
-        }
+            Ok((_obj, _grad, _warm)) => {
+                if let Ok(mut guard) = last_outer_error.lock() {
+                    *guard =
+                        Some("custom-family outer objective/gradient became non-finite".to_string());
+                }
+                invalid_outer_bfgs_sample(x)
+            }
+            Err(e) => {
+                if let Ok(mut guard) = last_outer_error.lock() {
+                    *guard = Some(e);
+                }
+                invalid_outer_bfgs_sample(x)
+            }
+        };
+        last_eval = Some((x.clone(), sample.0, sample.1.clone()));
+        sample
     })
     .with_bounds(lower, upper, 1e-6)
     .with_tolerance(options.outer_tol)
-    .with_initial_trust_radius(1.0)
-    .with_max_trust_radius(1e6)
-    .with_acceptance_threshold(0.1)
+    .with_no_improve_stop(1e-8, 8)
+    .with_flat_stall_exit(true, 4)
+    .with_curvature_slack_scale(2.0)
     .with_max_iterations(options.outer_max_iter);
     let last_eval_error = || {
         last_outer_error
@@ -1935,7 +1806,8 @@ pub fn fit_custom_family<F: CustomFamily>(
     };
     let sol = match solver.run() {
         Ok(sol) => sol,
-        Err(wolfe_bfgs::NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
+        Err(BfgsError::MaxIterationsReached { last_solution })
+        | Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
             if last_solution.final_value.is_finite()
                 && last_solution.final_gradient_norm.is_finite()
             {

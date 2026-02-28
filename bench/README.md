@@ -12,7 +12,7 @@ It measures:
 ## What it runs
 
 - Rust engine contender: `gam` via `src/bin/cli.rs`
-- External contenders: R `mgcv`, R `mgcv` `gaulss` (Gaussian location-scale), R `gamlss` (GAMLSS scenarios), R `gamboostLSS` (Gaussian location-scale boosting), R `bamlss` (Bayesian additive location-scale), R `brms` (Bayesian distributional regression), Python `pygam` (run by default)
+- External contenders: R `mgcv`, R `mgcv` `gaulss` (Gaussian location-scale), R `gamlss` (GAMLSS scenarios), R `gamboostLSS` (Gaussian location-scale boosting), R `bamlss` (Bayesian additive location-scale), R `brms` (Bayesian distributional regression), Python `pygam` (per-scenario; controlled by `exclude_contenders`)
 
 Canonical benchmark Python code lives in:
 - `/Users/user/gam/bench`
@@ -71,7 +71,8 @@ Dataset files live in:
 - `/Users/user/gam/benchmarks/datasets`
 
 `run_suite.py` executes:
-- all scenarios: `rust_gam`, `r_mgcv`, `python_pygam`
+- all scenarios: `rust_gam`, `r_mgcv`
+- eligible non-survival scenarios without `exclude_contenders: ["python_pygam"]`: `python_pygam`
 - gaussian scenarios: `r_mgcv_gaulss` (mean + scale via `mgcv::gaulss`), `r_gamboostlss` (mean + scale via `gamboostLSS::GaussianLSS`), `r_bamlss` (Bayesian distributional model with location-scale predictors), `r_brms` (Stan-backed Bayesian distributional model; typically slower)
 - GAMLSS scenarios (`geo_subpop16_*`, `geo_latlon_*`): `rust_gamlss`, `r_gamlss`
 - survival scenarios only: `r_survival_coxph`, `r_mgcv_coxph`, `python_sksurv_rsf`, `python_sksurv_coxnet`, `python_lifelines_coxph_enet`, `r_glmnet_cox`, `python_sksurv_gb_coxph`, `python_sksurv_componentwise_gb_coxph`, `python_lifelines_weibull_aft`, `python_lifelines_lognormal_aft`, and `python_xgboost_aft`

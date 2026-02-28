@@ -180,7 +180,7 @@ pub struct FittedTermCollectionWithSpec {
     pub resolved_spec: TermCollectionSpec,
 }
 
-pub struct TwoBlockMaternKappaOptimizationResult<FitOut> {
+pub struct TwoBlockSpatialLengthScaleOptimizationResult<FitOut> {
     pub resolved_mean_spec: TermCollectionSpec,
     pub resolved_noise_spec: TermCollectionSpec,
     pub mean_design: TermCollectionDesign,
@@ -188,11 +188,15 @@ pub struct TwoBlockMaternKappaOptimizationResult<FitOut> {
     pub fit: FitOut,
 }
 
+pub type TwoBlockMaternKappaOptimizationResult<FitOut> =
+    TwoBlockSpatialLengthScaleOptimizationResult<FitOut>;
+
 #[derive(Debug, Clone)]
-pub struct MaternKappaOptimizationOptions {
-    /// Enable outer-loop optimization over Matérn κ (= 1 / length_scale).
+pub struct SpatialLengthScaleOptimizationOptions {
+    /// Enable outer-loop optimization over spatial κ (= 1 / length_scale)
+    /// for supported radial-kernel smooths (currently Matérn and Duchon).
     pub enabled: bool,
-    /// Maximum number of coordinate-descent passes over Matérn terms.
+    /// Maximum number of coordinate-descent passes over supported spatial terms.
     pub max_outer_iter: usize,
     /// Relative improvement threshold for accepting a κ update.
     pub rel_tol: f64,
@@ -204,7 +208,9 @@ pub struct MaternKappaOptimizationOptions {
     pub max_length_scale: f64,
 }
 
-impl Default for MaternKappaOptimizationOptions {
+pub type MaternKappaOptimizationOptions = SpatialLengthScaleOptimizationOptions;
+
+impl Default for SpatialLengthScaleOptimizationOptions {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -223,6 +229,12 @@ struct RandomEffectBlock {
     name: String,
     design: Array2<f64>,
     kept_levels: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpatialLengthScaleKind {
+    Matern,
+    Duchon,
 }
 
 fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f64>, BasisError> {
@@ -1641,7 +1653,7 @@ pub fn fit_term_collection(
     family: LikelihoodFamily,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
-    let out = fit_term_collection_with_matern_kappa_optimization(
+    let out = fit_term_collection_with_spatial_length_scale_optimization(
         data,
         y,
         weights,
@@ -1649,7 +1661,7 @@ pub fn fit_term_collection(
         spec,
         family,
         options,
-        &MaternKappaOptimizationOptions::default(),
+        &SpatialLengthScaleOptimizationOptions::default(),
     )?;
     Ok(FittedTermCollection {
         fit: out.fit,
@@ -1770,12 +1782,12 @@ fn enforce_term_constraint_feasibility(
     Ok(())
 }
 
-fn matern_term_indices(spec: &TermCollectionSpec) -> Vec<usize> {
+fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Vec<usize> {
     spec.smooth_terms
         .iter()
         .enumerate()
         .filter_map(|(idx, term)| match term.basis {
-            SmoothBasisSpec::Matern { .. } => Some(idx),
+            SmoothBasisSpec::Matern { .. } | SmoothBasisSpec::Duchon { .. } => Some(idx),
             _ => None,
         })
         .collect()
@@ -1794,14 +1806,24 @@ fn fit_score(fit: &FitResult) -> f64 {
     }
 }
 
-fn set_matern_length_scale(
+fn spatial_length_scale_kind(spec: &TermCollectionSpec, term_idx: usize) -> Option<SpatialLengthScaleKind> {
+    spec.smooth_terms
+        .get(term_idx)
+        .and_then(|term| match &term.basis {
+            SmoothBasisSpec::Matern { .. } => Some(SpatialLengthScaleKind::Matern),
+            SmoothBasisSpec::Duchon { .. } => Some(SpatialLengthScaleKind::Duchon),
+            _ => None,
+        })
+}
+
+fn set_spatial_length_scale(
     spec: &mut TermCollectionSpec,
     term_idx: usize,
     length_scale: f64,
 ) -> Result<(), EstimationError> {
     let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
         return Err(EstimationError::InvalidInput(format!(
-            "matérn term index {term_idx} out of range"
+            "spatial length-scale term index {term_idx} out of range"
         )));
     };
     match &mut term.basis {
@@ -1809,38 +1831,44 @@ fn set_matern_length_scale(
             spec.length_scale = length_scale;
             Ok(())
         }
+        SmoothBasisSpec::Duchon { spec, .. } => {
+            spec.length_scale = length_scale;
+            Ok(())
+        }
         _ => Err(EstimationError::InvalidInput(format!(
-            "term '{}' is not Matérn",
+            "term '{}' does not expose a spatial length scale",
             term.name
         ))),
     }
 }
 
-fn get_matern_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> Option<f64> {
+fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> Option<f64> {
     spec.smooth_terms
         .get(term_idx)
         .and_then(|term| match &term.basis {
             SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
+            SmoothBasisSpec::Duchon { spec, .. } => Some(spec.length_scale),
             _ => None,
         })
 }
 
-fn get_matern_double_penalty(spec: &TermCollectionSpec, term_idx: usize) -> Option<bool> {
+fn get_spatial_double_penalty(spec: &TermCollectionSpec, term_idx: usize) -> Option<bool> {
     spec.smooth_terms
         .get(term_idx)
         .and_then(|term| match &term.basis {
             SmoothBasisSpec::Matern { spec, .. } => Some(spec.double_penalty),
+            SmoothBasisSpec::Duchon { spec, .. } => Some(spec.double_penalty),
             _ => None,
         })
 }
 
-fn freeze_matern_terms_from_design(
+fn freeze_spatial_length_scale_terms_from_design(
     spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
 ) -> Result<TermCollectionSpec, EstimationError> {
     if spec.smooth_terms.len() != design.smooth.terms.len() {
         return Err(EstimationError::InvalidInput(format!(
-            "cannot freeze Matérn terms: smooth spec count {} != fitted smooth term count {}",
+            "cannot freeze spatial length-scale terms: smooth spec count {} != fitted smooth term count {}",
             spec.smooth_terms.len(),
             design.smooth.terms.len()
         )));
@@ -1868,6 +1896,22 @@ fn freeze_matern_terms_from_design(
                 };
             }
         }
+        if let (
+            SmoothBasisSpec::Duchon { spec: s, .. },
+            BasisMetadata::Duchon {
+                centers,
+                identifiability_transform,
+                ..
+            },
+        ) = (&mut term.basis, &fitted.metadata)
+        {
+            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            if let Some(z) = identifiability_transform {
+                s.identifiability = SpatialIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                };
+            }
+        }
     }
     Ok(frozen)
 }
@@ -1876,19 +1920,41 @@ pub fn optimize_two_block_matern_kappa<FitOut, FitFn, ScoreFn>(
     data: ArrayView2<'_, f64>,
     mean_spec: &TermCollectionSpec,
     noise_spec: &TermCollectionSpec,
-    kappa_options: &MaternKappaOptimizationOptions,
-    mut fit_fn: FitFn,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    fit_fn: FitFn,
     score_fn: ScoreFn,
 ) -> Result<TwoBlockMaternKappaOptimizationResult<FitOut>, String>
 where
     FitFn: FnMut(&TermCollectionDesign, &TermCollectionDesign) -> Result<FitOut, String>,
     ScoreFn: Fn(&FitOut) -> f64,
 {
-    // For location-scale models, κ (Matérn length_scale) is block-specific.
+    optimize_two_block_spatial_length_scale(
+        data,
+        mean_spec,
+        noise_spec,
+        kappa_options,
+        fit_fn,
+        score_fn,
+    )
+}
+
+pub fn optimize_two_block_spatial_length_scale<FitOut, FitFn, ScoreFn>(
+    data: ArrayView2<'_, f64>,
+    mean_spec: &TermCollectionSpec,
+    noise_spec: &TermCollectionSpec,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    mut fit_fn: FitFn,
+    score_fn: ScoreFn,
+) -> Result<TwoBlockSpatialLengthScaleOptimizationResult<FitOut>, String>
+where
+    FitFn: FnMut(&TermCollectionDesign, &TermCollectionDesign) -> Result<FitOut, String>,
+    ScoreFn: Fn(&FitOut) -> f64,
+{
+    // For location-scale models, κ (= 1 / length_scale) is block-specific.
     // We optimize κ for mean/noise blocks separately, while each candidate
     // evaluation re-runs fitting so λ/δ are re-optimized.
-    let mean_terms = matern_term_indices(mean_spec);
-    let noise_terms = matern_term_indices(noise_spec);
+    let mean_terms = spatial_length_scale_term_indices(mean_spec);
+    let noise_terms = spatial_length_scale_term_indices(noise_spec);
 
     let build_pair = |ms: &TermCollectionSpec,
                       ns: &TermCollectionSpec|
@@ -1901,13 +1967,13 @@ where
     };
 
     let (mut best_mean_design, mut best_noise_design) = build_pair(mean_spec, noise_spec)?;
-    let mut best_mean_spec = freeze_matern_terms_from_design(mean_spec, &best_mean_design)
+    let mut best_mean_spec = freeze_spatial_length_scale_terms_from_design(mean_spec, &best_mean_design)
         .map_err(|e| {
-            format!("failed to freeze Matérn mean centers during κ optimization bootstrap: {e}")
+            format!("failed to freeze mean spatial basis centers during κ optimization bootstrap: {e}")
         })?;
-    let mut best_noise_spec = freeze_matern_terms_from_design(noise_spec, &best_noise_design)
+    let mut best_noise_spec = freeze_spatial_length_scale_terms_from_design(noise_spec, &best_noise_design)
         .map_err(|e| {
-            format!("failed to freeze Matérn noise centers during κ optimization bootstrap: {e}")
+            format!("failed to freeze noise spatial basis centers during κ optimization bootstrap: {e}")
         })?;
     let mut best_fit = fit_fn(&best_mean_design, &best_noise_design)?;
     let mut best_score = score_fn(&best_fit);
@@ -1916,7 +1982,7 @@ where
     }
 
     if !kappa_options.enabled || (mean_terms.is_empty() && noise_terms.is_empty()) {
-        return Ok(TwoBlockMaternKappaOptimizationResult {
+        return Ok(TwoBlockSpatialLengthScaleOptimizationResult {
             resolved_mean_spec: best_mean_spec,
             resolved_noise_spec: best_noise_spec,
             mean_design: best_mean_design,
@@ -1925,19 +1991,17 @@ where
         });
     }
     if kappa_options.max_outer_iter == 0 {
-        return Err("Matérn κ optimization requires max_outer_iter >= 1".to_string());
+        return Err("spatial κ optimization requires max_outer_iter >= 1".to_string());
     }
     if !(kappa_options.log_step.is_finite() && kappa_options.log_step > 0.0) {
-        return Err("Matérn κ optimization requires log_step > 0".to_string());
+        return Err("spatial κ optimization requires log_step > 0".to_string());
     }
     if !(kappa_options.min_length_scale.is_finite()
         && kappa_options.max_length_scale.is_finite()
         && kappa_options.min_length_scale > 0.0
         && kappa_options.max_length_scale >= kappa_options.min_length_scale)
     {
-        return Err(
-            "Matérn κ optimization requires valid positive length_scale bounds".to_string(),
-        );
+        return Err("spatial κ optimization requires valid positive length_scale bounds".to_string());
     }
 
     let rel_tol = kappa_options.rel_tol.max(0.0);
@@ -1957,14 +2021,16 @@ where
             } else {
                 &best_noise_spec
             };
-            let Some(current_ls) = get_matern_length_scale(spec_ref, *term_idx) else {
+            let Some(current_ls) = get_spatial_length_scale(spec_ref, *term_idx) else {
                 continue;
             };
             let current_ls = current_ls.clamp(
                 kappa_options.min_length_scale,
                 kappa_options.max_length_scale,
             );
-            let double_penalty = get_matern_double_penalty(spec_ref, *term_idx).unwrap_or(false);
+            let double_penalty = get_spatial_double_penalty(spec_ref, *term_idx).unwrap_or(false);
+            let basis_kind = spatial_length_scale_kind(spec_ref, *term_idx)
+                .unwrap_or(SpatialLengthScaleKind::Matern);
             let step = if double_penalty {
                 kappa_options.log_step
             } else {
@@ -2008,10 +2074,10 @@ where
                 let mut cand_mean_spec = best_mean_spec.clone();
                 let mut cand_noise_spec = best_noise_spec.clone();
                 if *is_mean_block {
-                    set_matern_length_scale(&mut cand_mean_spec, *term_idx, cand_ls)
+                    set_spatial_length_scale(&mut cand_mean_spec, *term_idx, cand_ls)
                         .map_err(|e| e.to_string())?;
                 } else {
-                    set_matern_length_scale(&mut cand_noise_spec, *term_idx, cand_ls)
+                    set_spatial_length_scale(&mut cand_noise_spec, *term_idx, cand_ls)
                         .map_err(|e| e.to_string())?;
                 }
                 let (cand_mean_design, cand_noise_design) =
@@ -2020,7 +2086,8 @@ where
                     Ok(v) => v,
                     Err(err) => {
                         log::warn!(
-                            "[location-scale][Matern-kappa] block={} term={} length_scale={:.6e} fit failed: {}",
+                            "[location-scale][{:?}-kappa] block={} term={} length_scale={:.6e} fit failed: {}",
+                            basis_kind,
                             if *is_mean_block { "mean" } else { "noise" },
                             term_idx,
                             cand_ls,
@@ -2067,7 +2134,7 @@ where
         }
     }
 
-    Ok(TwoBlockMaternKappaOptimizationResult {
+    Ok(TwoBlockSpatialLengthScaleOptimizationResult {
         resolved_mean_spec: best_mean_spec,
         resolved_noise_spec: best_noise_spec,
         mean_design: best_mean_design,
@@ -2084,13 +2151,35 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
     spec: &TermCollectionSpec,
     family: LikelihoodFamily,
     options: &FitOptions,
-    kappa_options: &MaternKappaOptimizationOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<FittedTermCollectionWithSpec, EstimationError> {
+    fit_term_collection_with_spatial_length_scale_optimization(
+        data,
+        y,
+        weights,
+        offset,
+        spec,
+        family,
+        options,
+        kappa_options,
+    )
+}
+
+pub fn fit_term_collection_with_spatial_length_scale_optimization(
+    data: ArrayView2<'_, f64>,
+    y: Array1<f64>,
+    weights: Array1<f64>,
+    offset: Array1<f64>,
+    spec: &TermCollectionSpec,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
     // κ (= 1/length_scale) changes kernel geometry nonlinearly.
     // That means both basis values B and penalty blocks S change, so each κ
     // proposal requires a full basis rebuild and a fresh lambda optimization.
     let mut resolved_spec = spec.clone();
-    let matern_terms = matern_term_indices(&resolved_spec);
+    let spatial_terms = spatial_length_scale_term_indices(&resolved_spec);
     let n = data.nrows();
     if !(y.len() == n && weights.len() == n && offset.len() == n) {
         return Err(EstimationError::InvalidInput(format!(
@@ -2101,7 +2190,7 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
             offset.len()
         )));
     }
-    if !kappa_options.enabled || matern_terms.is_empty() {
+    if !kappa_options.enabled || spatial_terms.is_empty() {
         let out = fit_term_collection_for_spec(
             data,
             y.view(),
@@ -2119,12 +2208,12 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
     }
     if kappa_options.max_outer_iter == 0 {
         return Err(EstimationError::InvalidInput(
-            "Matern kappa optimization requires max_outer_iter >= 1".to_string(),
+            "spatial kappa optimization requires max_outer_iter >= 1".to_string(),
         ));
     }
     if !(kappa_options.log_step.is_finite() && kappa_options.log_step > 0.0) {
         return Err(EstimationError::InvalidInput(
-            "Matern kappa optimization requires log_step > 0".to_string(),
+            "spatial kappa optimization requires log_step > 0".to_string(),
         ));
     }
     if !(kappa_options.min_length_scale.is_finite()
@@ -2133,7 +2222,7 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
         && kappa_options.max_length_scale >= kappa_options.min_length_scale)
     {
         return Err(EstimationError::InvalidInput(
-            "Matern kappa optimization requires valid positive length_scale bounds".to_string(),
+            "spatial kappa optimization requires valid positive length_scale bounds".to_string(),
         ));
     }
 
@@ -2146,7 +2235,7 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
         family,
         options,
     )?;
-    resolved_spec = freeze_matern_terms_from_design(&resolved_spec, &best.design)?;
+    resolved_spec = freeze_spatial_length_scale_terms_from_design(&resolved_spec, &best.design)?;
     let mut best_score = fit_score(&best.fit);
     if !best_score.is_finite() {
         best_score = f64::INFINITY;
@@ -2155,12 +2244,14 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
 
     for outer in 0..kappa_options.max_outer_iter {
         let mut any_improvement = false;
-        for &term_idx in &matern_terms {
-            let Some(current_ls) = get_matern_length_scale(&resolved_spec, term_idx) else {
+        for &term_idx in &spatial_terms {
+            let Some(current_ls) = get_spatial_length_scale(&resolved_spec, term_idx) else {
                 continue;
             };
             let double_penalty =
-                get_matern_double_penalty(&resolved_spec, term_idx).unwrap_or(false);
+                get_spatial_double_penalty(&resolved_spec, term_idx).unwrap_or(false);
+            let basis_kind = spatial_length_scale_kind(&resolved_spec, term_idx)
+                .unwrap_or(SpatialLengthScaleKind::Matern);
             let current_ls = current_ls.clamp(
                 kappa_options.min_length_scale,
                 kappa_options.max_length_scale,
@@ -2198,7 +2289,7 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
                 // Require a clearer gain when only one penalty knob is available.
                 rel_tol.max(5e-4)
             };
-            // Coordinate update on one Matérn term at a time in log(length_scale)
+            // Coordinate update on one spatial term at a time in log(length_scale)
             // to keep search stable under λ/κ partial confounding.
             for cand_log in candidates {
                 let cand_ls = cand_log.exp().clamp(
@@ -2209,7 +2300,7 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
                     continue;
                 }
                 let mut cand_spec = resolved_spec.clone();
-                set_matern_length_scale(&mut cand_spec, term_idx, cand_ls)?;
+                set_spatial_length_scale(&mut cand_spec, term_idx, cand_ls)?;
                 // Full refit at candidate κ: rebuild design/penalties, then run
                 // standard REML/LAML outer optimization for λ on that basis.
                 let cand_fit = match fit_term_collection_for_spec_with_heuristic_lambdas(
@@ -2225,7 +2316,8 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
                     Ok(v) => v,
                     Err(err) => {
                         log::warn!(
-                            "[Matern-kappa] term={} length_scale={:.6e} fit failed: {}",
+                            "[{:?}-kappa] term={} length_scale={:.6e} fit failed: {}",
+                            basis_kind,
                             term_idx,
                             cand_ls,
                             err
@@ -2247,9 +2339,10 @@ pub fn fit_term_collection_with_matern_kappa_optimization(
                 best_score = local_best_score;
                 resolved_spec = next_spec;
                 any_improvement = true;
-                if let Some(new_ls) = get_matern_length_scale(&resolved_spec, term_idx) {
+                if let Some(new_ls) = get_spatial_length_scale(&resolved_spec, term_idx) {
                     log::info!(
-                        "[Matern-kappa] outer={} term={} accepted length_scale={:.6e} (score={:.6e})",
+                        "[{:?}-kappa] outer={} term={} accepted length_scale={:.6e} (score={:.6e})",
+                        basis_kind,
                         outer + 1,
                         term_idx,
                         new_ls,

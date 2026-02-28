@@ -22,7 +22,9 @@
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use self::reml::RemlState;
+use std::cell::Cell;
 use std::fmt;
+use std::time::Instant;
 
 // Crate-level imports
 use crate::construction::{
@@ -693,6 +695,8 @@ where
         max_iter: opts.max_iter,
         tol: cfg.reml_convergence_tolerance,
         finite_diff_step: 1e-3,
+        // External REML path below provides exact Hessians directly.
+        fd_hessian_max_dim: 0,
         seed_config: SeedConfig {
         bounds: (-12.0, 12.0),
         max_seeds: if has_full_heuristic {
@@ -723,16 +727,40 @@ where
         },
         },
     };
-    let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient(
-        k,
-        heuristic_lambdas,
-        |rho: &Array1<f64>| {
-            let cost = reml_state.compute_cost(rho)?;
-            let grad = reml_state.compute_gradient(rho)?;
-            Ok((cost, grad))
-        },
-        &smoothing_options,
-    )?;
+    let outer_eval_idx = Cell::new(0usize);
+    let outer_result =
+        crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
+            k,
+            heuristic_lambdas,
+            |rho: &Array1<f64>| {
+                let eval_idx = outer_eval_idx.get() + 1;
+                outer_eval_idx.set(eval_idx);
+
+                let t_cost = Instant::now();
+                let cost = reml_state.compute_cost(rho)?;
+                let cost_sec = t_cost.elapsed().as_secs_f64();
+
+                let t_grad = Instant::now();
+                let grad = reml_state.compute_gradient(rho)?;
+                let grad_sec = t_grad.elapsed().as_secs_f64();
+                let used_stochastic = reml_state.last_gradient_used_stochastic_fallback();
+
+                let t_hess = Instant::now();
+                let hess = reml_state.compute_laml_hessian_exact(rho)?;
+                let hess_sec = t_hess.elapsed().as_secs_f64();
+
+                log::info!(
+                    "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3}, hess={:.3})",
+                    rho.len(),
+                    used_stochastic,
+                    cost_sec,
+                    grad_sec,
+                    hess_sec
+                );
+                Ok((cost, grad, Some(hess)))
+            },
+            &smoothing_options,
+        )?;
     let final_rho = outer_result.rho;
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, outer_result.iterations);
@@ -1235,10 +1263,12 @@ where
             .sum::<f64>();
         let weighted_total = weights.iter().map(|w| w.max(0.0)).sum::<f64>();
         let weighted_nonevents = (weighted_total - weighted_events).max(0.0);
-        let low_event_support = weighted_events.min(weighted_nonevents) < 20.0;
+        let minority_support = weighted_events.min(weighted_nonevents);
+        let start_with_firth =
+            should_enable_firth_from_class_support(minority_support, x.ncols());
 
-        // Start without Firth unless support is clearly too small.
-        ext_opts.firth_bias_reduction = Some(low_event_support);
+        // Start with Firth when class support is low relative to model complexity.
+        ext_opts.firth_bias_reduction = Some(start_with_firth);
         let first_try = optimize_external_design_with_heuristic_lambdas(
             y,
             weights,
@@ -1257,7 +1287,7 @@ where
                         | crate::pirls::PirlsStatus::Unstable
                 );
                 let extreme_eta = res.artifacts.pirls.max_abs_eta > 15.0;
-                if !low_event_support && (unstable_status || extreme_eta) {
+                if !start_with_firth && (unstable_status || extreme_eta) {
                     ext_opts.firth_bias_reduction = Some(true);
                     optimize_external_design_with_heuristic_lambdas(
                         y,
@@ -1273,7 +1303,7 @@ where
                 }
             }
             Err(err) => {
-                if low_event_support {
+                if start_with_firth {
                     return Err(err);
                 }
                 ext_opts.firth_bias_reduction = Some(true);
@@ -1354,11 +1384,20 @@ const GRAD_DIAG_SEVERE_RIDGE_MISMATCH: f64 = 1e-6;
 const GRAD_DIAG_SEVERE_BLEED_ENERGY: f64 = 1e-2;
 const GRAD_DIAG_SEVERE_RIDGE_IMPACT: f64 = 1e-2;
 const GRAD_DIAG_SEVERE_PHANTOM_PENALTY: f64 = 1e-3;
+const FIRTH_BASE_MINORITY_SUPPORT: f64 = 20.0;
+const FIRTH_MINORITY_PER_PARAMETER: f64 = 2.0;
 
 #[inline]
 fn should_sample_gradient_diag_fd(eval_idx: u64) -> bool {
     eval_idx <= GRAD_DIAG_FD_WARMUP_EVALS
         || (GRAD_DIAG_FD_INTERVAL > 0 && eval_idx % GRAD_DIAG_FD_INTERVAL == 0)
+}
+
+#[inline]
+fn should_enable_firth_from_class_support(minority_support: f64, n_features: usize) -> bool {
+    let complexity_threshold =
+        (FIRTH_MINORITY_PER_PARAMETER * n_features as f64).max(FIRTH_BASE_MINORITY_SUPPORT);
+    minority_support < complexity_threshold
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1776,6 +1815,20 @@ mod fd_policy_tests {
         assert!(!should_sample_gradient_diag_fd(GRAD_DIAG_FD_INTERVAL - 1));
         assert!(should_sample_gradient_diag_fd(GRAD_DIAG_FD_INTERVAL));
         assert!(should_sample_gradient_diag_fd(GRAD_DIAG_FD_INTERVAL * 2));
+    }
+
+    #[test]
+    fn test_firth_support_rule_respects_legacy_low_support_floor() {
+        assert!(should_enable_firth_from_class_support(19.99, 1));
+        assert!(!should_enable_firth_from_class_support(20.0, 1));
+    }
+
+    #[test]
+    fn test_firth_support_rule_scales_with_model_dimension() {
+        // High-dimensional setting: minority support that would pass the old
+        // <20 rule still triggers Firth because support per parameter is weak.
+        assert!(should_enable_firth_from_class_support(425.0, 225));
+        assert!(!should_enable_firth_from_class_support(460.0, 225));
     }
 }
 
