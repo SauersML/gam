@@ -9,9 +9,9 @@ pub mod solver;
 pub mod terms;
 pub mod types;
 
-pub use inference::{alo, diagnostics, generative, hmc, probability, quadrature};
-pub use linalg::{faer_ndarray, matrix};
-pub use solver::{estimate, joint, pirls, seeding, visualizer};
+pub use inference::{alo, diagnostics, generative, hmc, predict, probability, quadrature};
+pub use linalg::{faer_ndarray, matrix, utils};
+pub use solver::{estimate, joint, pirls, seeding, smoothing, visualizer};
 pub use terms::{basis, construction, hull, layout, smooth};
 
 pub use families::custom_family;
