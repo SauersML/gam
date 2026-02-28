@@ -235,7 +235,7 @@
         }
     }
 
-    pub(crate) struct RemlState<'a> {
+    pub(super) struct RemlState<'a> {
         y: ArrayView1<'a, f64>,
         x: DesignMatrix,
         weights: ArrayView1<'a, f64>,

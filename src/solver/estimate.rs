@@ -21,6 +21,7 @@
 //! each smooth term directly from the data.
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use self::reml::RemlState;
 
 // Crate-level imports
 use crate::construction::{
@@ -32,7 +33,7 @@ use crate::matrix::DesignMatrix;
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{Coefficients, LinkFunction, LogSmoothingParamsView, RidgePassport};
-use crate::utils::{KahanSum, RidgePlanner, add_ridge, matrix_inverse_with_regularization};
+use crate::linalg::utils::{KahanSum, RidgePlanner, add_ridge, matrix_inverse_with_regularization};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
@@ -253,8 +254,8 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
 ///   smoothing/heat operator `exp(0.5 * Delta_Sigma)` (equivalently Wick/Isserlis
 ///   contractions of high-order derivatives).
 /// - Those infinite-series corrections are not expanded in this routine.
-pub(crate) fn compute_smoothing_correction(
-    reml_state: &internal::RemlState<'_>,
+fn compute_smoothing_correction(
+    reml_state: &RemlState<'_>,
     final_rho: &Array1<f64>,
     final_fit: &pirls::PirlsResult,
 ) -> Option<Array2<f64>> {
@@ -671,7 +672,7 @@ where
     let w_o = w.to_owned();
     let x_o = x.clone();
     let offset_o = offset.to_owned();
-    let reml_state = internal::RemlState::new_with_offset(
+    let reml_state = RemlState::new_with_offset(
         y_o.view(),
         x_o.clone(),
         w_o.view(),
@@ -1188,7 +1189,7 @@ struct FdEval {
 }
 
 fn evaluate_fd_pair(
-    reml_state: &internal::RemlState,
+    reml_state: &RemlState,
     rho: &Array1<f64>,
     coord: usize,
     base_h: f64,
@@ -1277,7 +1278,7 @@ fn select_fd_derivative(d_small: f64, d_big: f64, same_sign: bool) -> f64 {
 }
 
 fn compute_fd_gradient_internal(
-    reml_state: &internal::RemlState,
+    reml_state: &RemlState,
     rho: &Array1<f64>,
     emit_logs: bool,
     allow_analytic_fallback: bool,
@@ -1451,7 +1452,7 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}] ridge_rel_span={:.3e}",
 }
 
 fn compute_fd_gradient(
-    reml_state: &internal::RemlState,
+    reml_state: &RemlState,
     rho: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
     compute_fd_gradient_internal(reml_state, rho, true, true)
@@ -1493,7 +1494,7 @@ where
     let x_o = x.clone();
     let offset_o = offset.to_owned();
 
-    let reml_state = internal::RemlState::new_with_offset(
+    let reml_state = RemlState::new_with_offset(
         y_o.view(),
         x_o,
         w_o.view(),
@@ -1549,7 +1550,7 @@ where
     let x_o = x.clone();
     let offset_o = offset.to_owned();
 
-    let reml_state = internal::RemlState::new_with_offset(
+    let reml_state = RemlState::new_with_offset(
         y_o.view(),
         x_o,
         w_o.view(),
@@ -1565,12 +1566,6 @@ where
     let cost = reml_state.compute_cost(rho)?;
     let ridge = reml_state.last_ridge_used().unwrap_or(0.0);
     Ok((cost, ridge))
-}
-
-/// Internal module for estimation logic.
-// Make internal module public for tests
-pub mod internal {
-    include!("reml.rs");
 }
 
 #[cfg(test)]
@@ -1590,3 +1585,5 @@ mod fd_policy_tests {
         assert!(should_sample_gradient_diag_fd(GRAD_DIAG_FD_INTERVAL * 2));
     }
 }
+
+pub(crate) mod reml;
