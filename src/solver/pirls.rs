@@ -150,15 +150,36 @@ impl SparsePenaltyPattern {
 }
 
 #[derive(Clone, Debug)]
-struct SparsePenalizedSystemStats {
-    nnz_xtwx_symbolic: usize,
-    nnz_s_lambda_upper: usize,
-    nnz_h_upper: usize,
-    density_upper: f64,
+pub(crate) struct SparsePenalizedSystemStats {
+    pub(crate) nnz_xtwx_symbolic: usize,
+    pub(crate) nnz_s_lambda_upper: usize,
+    pub(crate) nnz_h_upper: usize,
+    pub(crate) density_upper: f64,
 }
 
 // Phase 2 sparse-native PIRLS will reuse this cache for symbolic structure and
 // repeated numeric assembly of H = X'WX + S_lambda + ridge I.
+//
+// This is the natural insertion point for any future selected-inversion /
+// Takahashi trace backend. In original spline coefficient order, the assembled
+// penalized system can remain sparse/banded, so exact traces like
+// tr(H^{-1} S_k) can be computed from a sparse factorization without ever
+// materializing a dense inverse. That is not true after the REML
+// reparameterization rotates the problem into the dense Qs basis.
+//
+// Algebra:
+//   H = X'WX + sum_k lambda_k S_k + delta I
+// and the REML/LAML first-order trace terms have the form
+//   T_k = tr(H^{-1} S_k).
+// Since tr(AB) = sum_ij A_ij B_ji, for symmetric sparse S_k we only need
+// inverse entries on the support of S_k:
+//   T_k = sum_{(i,j) in nz(S_k), i>=j} (2 - 1{i=j}) (H^{-1})_{ij} (S_k)_{ij}.
+// Takahashi/selected inversion exploits exactly this fact. Given a sparse
+// Cholesky-type factorization H = LDL', it computes only those entries of
+// H^{-1} that lie on the filled graph of L, which contains the structural
+// nonzeros needed for spline penalties. For banded spline systems with
+// half-bandwidth b, the work scales like sum_j |N(j)|^2 = O(p b^2) instead of
+// dense O(p^3), where N(j) is the subdiagonal nonzero pattern of column j of L.
 #[allow(dead_code)]
 struct SparsePenalizedSystemCache {
     xtwx_cache: SparseXtWxCache,
@@ -679,7 +700,7 @@ impl PirlsWorkspace {
         cache.compute_dense(&csc_view, weights)
     }
 
-    fn sparse_penalized_system_stats(
+    pub(crate) fn sparse_penalized_system_stats(
         &mut self,
         x: &SparseColMat<usize, f64>,
         s_lambda: &Array2<f64>,
@@ -1635,6 +1656,16 @@ fn should_use_sparse_native_pirls(
 // Phase 2 hook for targeted tests and the eventual sparse-native PIRLS solve path.
 #[allow(dead_code)]
 fn assemble_sparse_penalized_hessian(
+    workspace: &mut PirlsWorkspace,
+    x: &SparseColMat<usize, f64>,
+    weights: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    ridge: f64,
+) -> Result<SparseColMat<usize, f64>, EstimationError> {
+    workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge)
+}
+
+pub(crate) fn sparse_reml_penalized_hessian(
     workspace: &mut PirlsWorkspace,
     x: &SparseColMat<usize, f64>,
     weights: &Array1<f64>,
@@ -4272,6 +4303,23 @@ pub fn solve_penalized_least_squares(
     );
 
     // 4. Form Penalized Hessian: H = X'WX + S
+    //
+    // Important for future sparse REML work: this identity is still the right
+    // mathematical target for selected inversion, but this function operates in
+    // the transformed Qs basis where both X'WX and S are dense Array2 values.
+    // Selected inversion only buys us something before this basis rotation, on
+    // the sparse/banded penalized system assembled in original coordinates.
+    //
+    // Why the basis matters:
+    //   X_t = X Qs,   beta_t = Qs' beta,   S_t = Qs' S Qs.
+    // Then
+    //   H_t = X_t' W X_t + S_t = Qs' (X'WX + S) Qs.
+    // This is algebraically equivalent to the original system, but the dense
+    // orthogonal matrix Qs mixes nearby spline coefficients into global linear
+    // combinations. A banded/block-sparse S and sparse X'WX in original
+    // coordinates therefore become dense in transformed coordinates. Exact dense
+    // traces are still correct here, but selected inversion loses its sparsity
+    // advantage because the required inverse pattern is no longer local.
     //
     // Hot-path note:
     // X'WX is symmetric by construction, and S is pre-built as symmetric.

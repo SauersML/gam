@@ -1,10 +1,127 @@
     use super::*;
+    use crate::linalg::sparse_exact::{
+        SparseExactFactor, SparsePenaltyBlock, SparseTraceWorkspace, build_sparse_penalty_blocks,
+        factorize_sparse_spd, leverages_from_factor, logdet_from_factor, solve_sparse_spd,
+        solve_sparse_spd_multi,
+        sparse_matvec_public, trace_hinv_sk,
+    };
+    use crate::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
     use faer::Side;
 
     enum FaerFactor {
         Llt(FaerLlt<f64>),
         Lblt(FaerLblt<f64>),
         Ldlt(FaerLdlt<f64>),
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::RemlState;
+        use crate::faer_ndarray::{fast_ab, fast_atb};
+        use ndarray::array;
+
+        #[test]
+        fn dense_projected_tk_matches_direct_wt_hk_w() {
+            let w_pos = array![
+                [1.0, 0.0],
+                [0.5, 1.0],
+                [0.0, 1.0],
+            ];
+            let x = array![
+                [1.0, 2.0, 0.0],
+                [0.0, 1.0, 1.0],
+                [2.0, 0.0, 1.0],
+            ];
+            let r_k = array![
+                [1.0, -1.0, 0.0],
+                [0.0, 1.0, -1.0],
+            ];
+            let lambda_k = 1.7;
+            let c_weighted_u_k = array![0.2, -0.1, 0.4];
+
+            let z_mat = fast_ab(&x, &w_pos);
+            let actual =
+                RemlState::dense_projected_tk(&z_mat, &w_pos, &r_k, lambda_k, &c_weighted_u_k);
+
+            let s_k = r_k.t().dot(&r_k);
+            let mut h_k = s_k.mapv(|v| lambda_k * v);
+            let mut x_weighted = x.clone();
+            for i in 0..x_weighted.nrows() {
+                for j in 0..x_weighted.ncols() {
+                    x_weighted[[i, j]] *= c_weighted_u_k[i];
+                }
+            }
+            h_k += &fast_atb(&x, &x_weighted);
+            let expected = w_pos.t().dot(&h_k).dot(&w_pos);
+
+            let diff = &actual - &expected;
+            let err = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
+            assert!(err < 1e-10, "projected T_k mismatch: {err}");
+        }
+
+        #[test]
+        fn dense_projected_trace_hinv_hkl_matches_direct_dense_trace() {
+            let w_pos = array![
+                [1.0, 0.0],
+                [0.5, 1.0],
+                [0.0, 1.0],
+            ];
+            let x = array![
+                [1.0, 2.0, 0.0],
+                [0.0, 1.0, 1.0],
+                [2.0, 0.0, 1.0],
+            ];
+            let r_k = array![
+                [1.0, -1.0, 0.0],
+                [0.0, 1.0, -1.0],
+            ];
+            let lambda_k = 0.9;
+            let diag_kl = array![0.25, -0.2, 0.1];
+
+            let z_mat = fast_ab(&x, &w_pos);
+            let actual = RemlState::dense_projected_trace_hinv_hkl(
+                &z_mat,
+                &w_pos,
+                Some(&r_k),
+                lambda_k,
+                &diag_kl,
+            );
+
+            let s_k = r_k.t().dot(&r_k);
+            let mut h_kl = s_k.mapv(|v| lambda_k * v);
+            let mut x_weighted = x.clone();
+            for i in 0..x_weighted.nrows() {
+                for j in 0..x_weighted.ncols() {
+                    x_weighted[[i, j]] *= diag_kl[i];
+                }
+            }
+            h_kl += &fast_atb(&x, &x_weighted);
+            let expected = RemlState::trace_product(&w_pos.dot(&w_pos.t()), &h_kl);
+
+            assert!((actual - expected).abs() < 1e-10);
+        }
+
+        #[test]
+        fn dense_projected_trace_quadratic_matches_direct_dense_trace() {
+            let t_k = array![
+                [2.0, 0.5],
+                [0.5, 1.0],
+            ];
+            let t_l = array![
+                [1.5, -0.25],
+                [-0.25, 0.75],
+            ];
+            let actual = RemlState::dense_projected_trace_quadratic(&t_k, &t_l);
+            let expected = RemlState::trace_product(&t_k, &t_l);
+            assert!((actual - expected).abs() < 1e-12);
+        }
+
+        #[test]
+        fn dense_projected_exact_cost_gate_behaves_as_expected() {
+            assert!(RemlState::dense_projected_exact_eligible(5_000, 100, 10));
+            assert!(!RemlState::dense_projected_exact_eligible(50_000, 1025, 10));
+            assert!(!RemlState::dense_projected_exact_eligible(200_000, 200, 20));
+        }
     }
 
     impl FaerFactor {
@@ -25,6 +142,32 @@
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum RemlGeometry {
+        DenseSpectral,
+        SparseExactSpd,
+    }
+
+    #[derive(Clone, Debug)]
+    struct SparseRemlDecision {
+        geometry: RemlGeometry,
+        reason: &'static str,
+        p: usize,
+        nnz_x: usize,
+        nnz_h_upper_est: Option<usize>,
+        density_h_upper_est: Option<f64>,
+    }
+
+    #[derive(Clone)]
+    struct SparseExactEvalData {
+        factor: Arc<SparseExactFactor>,
+        penalty_blocks: Arc<Vec<SparsePenaltyBlock>>,
+        logdet_h: f64,
+        logdet_s_pos: f64,
+        det1_values: Arc<Array1<f64>>,
+        trace_workspace: Arc<Mutex<SparseTraceWorkspace>>,
+    }
+
     /// Holds the state for the outer REML optimization and supplies cost and
     /// gradient evaluations to the `wolfe_bfgs` optimizer.
     ///
@@ -40,8 +183,9 @@
     struct EvalShared {
         key: Option<Vec<u64>>,
         pirls_result: Arc<PirlsResult>,
-        h_eff: Arc<Array2<f64>>,
         ridge_passport: RidgePassport,
+        geometry: RemlGeometry,
+        h_eff: Arc<Array2<f64>>,
         /// The exact H_total matrix used for LAML cost computation.
         /// For Firth: h_eff - h_phi. For non-Firth: h_eff.
         h_total: Arc<Array2<f64>>,
@@ -77,10 +221,36 @@
         /// We use identities:
         ///   H₊† v = W (Wᵀ v)
         ///   tr(H₊† S_k) = ||R_k W||_F², where S_k = R_kᵀ R_k.
+        ///
+        /// Architectural consequence: this representation is defined by a dense
+        /// eigendecomposition of the transformed Hessian. Because it is a
+        /// positive-part pseudoinverse on a dense rotated basis, it cannot be
+        /// replaced directly by sparse selected inversion / Takahashi equations.
+        /// Those methods apply to sparse SPD solves for H^{-1} in a sparsity-
+        /// preserving coordinate system, not to the truncated spectral inverse
+        /// used here.
+        ///
+        /// Derivation:
+        /// If H = U diag(mu) U' and U_+ contains only eigenvectors with
+        /// mu_i > tau, then the positive-part pseudoinverse is
+        ///   H_+^dagger = U_+ diag(1 / mu_i) U_+'.
+        /// Writing
+        ///   W := U_+ diag(1 / sqrt(mu_i))
+        /// gives
+        ///   H_+^dagger = W W'.
+        /// For any penalty root R_k with S_k = R_k' R_k,
+        ///   tr(H_+^dagger S_k)
+        /// = tr(W W' R_k' R_k)
+        /// = tr((R_k W)' (R_k W))
+        /// = ||R_k W||_F^2.
+        /// This is why the current code can evaluate the trace term from the
+        /// spectral factor alone, but it also means the computation is tied to a
+        /// dense eigenbasis rather than a sparse factorization.
         h_pos_factor_w: Arc<Array2<f64>>,
 
         /// Log determinant via truncation: Σᵢ log(λᵢ) for λᵢ > ε only.
         h_total_log_det: f64,
+        sparse_exact: Option<Arc<SparseExactEvalData>>,
     }
 
     impl EvalShared {
@@ -245,6 +415,7 @@
         pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
         balanced_penalty_root: Array2<f64>,
         reparam_invariant: ReparamInvariant,
+        sparse_penalty_blocks: Option<Arc<Vec<SparsePenaltyBlock>>>,
         p: usize,
         config: &'a RemlConfig,
         nullspace_dims: Vec<usize>,
@@ -662,6 +833,7 @@
 
             let balanced_penalty_root = create_balanced_penalty_root(&s_list, p)?;
             let reparam_invariant = precompute_reparam_invariant(&rs_list, p)?;
+            let sparse_penalty_blocks = build_sparse_penalty_blocks(&s_list, &rs_list)?.map(Arc::new);
 
             Ok(Self {
                 y,
@@ -672,6 +844,7 @@
                 rs_list,
                 balanced_penalty_root,
                 reparam_invariant,
+                sparse_penalty_blocks,
                 p,
                 config,
                 nullspace_dims,
@@ -718,93 +891,36 @@
             rho: &Array1<f64>,
             key: Option<Vec<u64>>,
         ) -> Result<EvalShared, EstimationError> {
-            let pirls_result = self.execute_pirls_if_needed(rho)?;
-            let (h_eff, ridge_passport) = self.effective_hessian(pirls_result.as_ref())?;
-
-            // Spectral consistency threshold for eigenvalue truncation.
-            //
-            // Root-cause fix:
-            // An absolute cutoff is scale-dependent and can misclassify near-null
-            // modes when ||H|| varies by orders of magnitude. Use a relative rule
-            // anchored to the dominant eigenvalue so pseudoinverse support and
-            // log|H|_+ are stable across problem scales.
-            const EIG_REL_THRESHOLD: f64 = 1e-10;
-            const EIG_ABS_FLOOR: f64 = 1e-14;
-
-            let dim = h_eff.nrows();
-
-            // Compute spectral quantities from the same curvature used by inner PIRLS.
-            // This path stays on H_eff for cost/gradient consistency.
-            let h_total = h_eff.clone();
-            let (eigvals, eigvecs) = h_total
-                .eigh(Side::Lower)
-                .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
-            let max_eig = eigvals.iter().copied().fold(0.0_f64, f64::max);
-            // Non-Gaussian outer gradients consume trace(H^{-1} H_k) terms that are
-            // sensitive to dropped low modes. Since PIRLS already stabilizes H with a
-            // structural ridge, keep the full stabilized spectrum for these families.
-            let eig_threshold = if self.config.link_function() == LinkFunction::Identity {
-                (max_eig * EIG_REL_THRESHOLD).max(EIG_ABS_FLOOR)
-            } else {
-                EIG_ABS_FLOOR
-            };
-
-            // Positive-part Hessian log-determinant convention:
-            //   log|H|_+ = Σ_{λ_i(H) > τ} log λ_i(H),
-            // where τ is a relative+absolute cutoff tied to spectrum scale.
-            //
-            // This avoids unstable rank flips from tiny signed eigenvalues and keeps
-            // logdet/traces/pseudoinverse operations on the same effective subspace.
-            let h_total_log_det: f64 = eigvals
-                .iter()
-                .filter(|&&v| v > eig_threshold)
-                .map(|&v| v.ln())
-                .sum();
-
-            if !h_total_log_det.is_finite() {
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                });
+            let decision = self.select_reml_geometry(rho);
+            match decision.geometry {
+                RemlGeometry::SparseExactSpd => match self.prepare_sparse_eval_bundle_with_key(rho, key.clone()) {
+                    Ok(bundle) => {
+                        log::info!(
+                            "[reml-geometry] sparse_exact_spd reason={} p={} nnz_x={} nnz_h_est={} density_h_est={}",
+                            decision.reason,
+                            decision.p,
+                            decision.nnz_x,
+                            decision
+                                .nnz_h_upper_est
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "na".to_string()),
+                            decision
+                                .density_h_upper_est
+                                .map(|v| format!("{v:.4}"))
+                                .unwrap_or_else(|| "na".to_string()),
+                        );
+                        Ok(bundle)
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "[reml-geometry] sparse_exact_spd failed ({}); falling back to dense spectral",
+                            err
+                        );
+                        self.prepare_dense_eval_bundle_with_key(rho, key)
+                    }
+                },
+                RemlGeometry::DenseSpectral => self.prepare_dense_eval_bundle_with_key(rho, key),
             }
-
-            // Build factor W for the Moore-Penrose pseudoinverse on the kept subspace:
-            //   H_+^† = U_+ diag(1/λ_+) U_+ᵀ = W Wᵀ,
-            //   W := U_+ diag(1/sqrt(λ_+)).
-            //
-            // Later trace terms use this representation directly, e.g.
-            //   tr(H_+^† S_k) = ||R_k W||_F^2
-            // without materializing H_+^† as a dense matrix.
-            let valid_indices: Vec<usize> = eigvals
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &v)| if v > eig_threshold { Some(i) } else { None })
-                .collect();
-
-            let valid_count = valid_indices.len();
-            let mut w = Array2::<f64>::zeros((dim, valid_count));
-
-            for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
-                let val = eigvals[eig_idx];
-                let scale = 1.0 / val.sqrt();
-                let u_col = eigvecs.column(eig_idx);
-
-                let mut w_col = w.column_mut(w_col_idx);
-                Zip::from(&mut w_col)
-                    .and(&u_col)
-                    .for_each(|w_elem, &u_elem| {
-                        *w_elem = u_elem * scale;
-                    });
-            }
-
-            Ok(EvalShared {
-                key,
-                pirls_result,
-                h_eff: Arc::new(h_eff),
-                ridge_passport,
-                h_total: Arc::new(h_total),
-                h_pos_factor_w: Arc::new(w),
-                h_total_log_det,
-            })
         }
 
         fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
@@ -817,6 +933,455 @@
             let bundle = self.prepare_eval_bundle_with_key(rho, key)?;
             *self.current_eval_bundle.write().unwrap() = Some(bundle.clone());
             Ok(bundle)
+        }
+
+        fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
+            pirls_result
+                .reparam_result
+                .qs
+                .dot(pirls_result.beta_transformed.as_ref())
+        }
+
+        fn compute_cost_sparse_exact(
+            &self,
+            rho: &Array1<f64>,
+            bundle: &EvalShared,
+        ) -> Result<f64, EstimationError> {
+            let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
+                EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
+            })?;
+            let pirls_result = bundle.pirls_result.as_ref();
+            let prior_cost = self.compute_soft_prior_cost(rho);
+            match self.config.link_function() {
+                LinkFunction::Identity => {
+                    let n = self.y.len() as f64;
+                    let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
+                    let rss = pirls_result.deviance;
+                    let penalty = pirls_result.stable_penalty_term;
+                    let dp = rss + penalty;
+                    let (dp_c, _) = smooth_floor_dp(dp);
+                    let phi = dp_c / (n - mp).max(LAML_RIDGE);
+                    let reml = dp_c / (2.0 * phi)
+                        + 0.5 * (sparse.logdet_h - sparse.logdet_s_pos)
+                        + ((n - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
+                    Ok(reml + prior_cost)
+                }
+                _ => {
+                    let mut penalised_ll =
+                        -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
+                    if self.config.firth_bias_reduction
+                        && matches!(self.config.link_function(), LinkFunction::Logit)
+                        && let Some(firth_log_det) = pirls_result.firth_log_det
+                    {
+                        penalised_ll += firth_log_det;
+                    }
+                    let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
+                    let phi = 1.0;
+                    let laml = penalised_ll + 0.5 * sparse.logdet_s_pos - 0.5 * sparse.logdet_h
+                        + (mp / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
+                    Ok(-laml + prior_cost)
+                }
+            }
+        }
+
+        fn compute_gradient_sparse_exact(
+            &self,
+            rho: &Array1<f64>,
+            bundle: &EvalShared,
+        ) -> Result<Array1<f64>, EstimationError> {
+            // Full sparse-exact first-order derivation on the ridged SPD surface.
+            //
+            // Definitions at the inner mode beta = beta_hat(rho):
+            //
+            //   lambda_k = exp(rho_k)
+            //   S(rho)   = sum_k lambda_k S_k
+            //   A_k      = dS/drho_k = lambda_k S_k
+            //   H        = X' W X + S(rho) + delta I
+            //
+            // For non-Gaussian families, write
+            //   c_i = -ell_i^{(3)}(eta_i),
+            // and define the implicit coefficient derivative
+            //   B_k = d beta_hat / drho_k = -H^{-1} A_k beta
+            // together with
+            //   z_k = X B_k.
+            //
+            // The Hessian derivative entering the logdet term is
+            //   H_k = A_k + X' diag(c ⊙ z_k) X.
+            //
+            // Therefore the exact sparse gradient is
+            //
+            // Gaussian / REML:
+            //   g_k = 0.5 * beta' A_k beta
+            //         + 0.5 * tr(H^{-1} A_k)
+            //         - 0.5 * d/drho_k log|S(rho)|_+
+            //
+            // Non-Gaussian / LAML:
+            //   g_k = 0.5 * beta' A_k beta
+            //         + 0.5 * tr(H^{-1} H_k)
+            //         - 0.5 * d/drho_k log|S(rho)|_+
+            //
+            // and with H_k expanded,
+            //
+            //   tr(H^{-1} H_k)
+            //     = tr(H^{-1} A_k)
+            //       + tr(H^{-1} X' diag(c ⊙ z_k) X)
+            //     = tr(H^{-1} A_k)
+            //       + (X H^{-1} X') : diag(c ⊙ z_k)
+            //     = tr(H^{-1} A_k)
+            //       + sum_i h_i * c_i * z_{k,i},
+            //
+            // where h_i = x_i' H^{-1} x_i are the exact sparse leverages.
+            //
+            // The code evaluates the same identity with the sign convention used
+            // by the existing REML implementation:
+            //   trace_third = (X' (c ⊙ h))' v_k,
+            //   v_k = H^{-1} (S_k beta),
+            // so that
+            //   lambda_k * (trace_s - trace_third)
+            // reproduces tr(H^{-1} H_k) on the current sparse SPD surface.
+            let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
+                EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
+            })?;
+            let pirls_result = bundle.pirls_result.as_ref();
+            let beta = self.sparse_exact_beta_original(pirls_result);
+            let lambdas = rho.mapv(f64::exp);
+            let det1_values = sparse.det1_values.as_ref();
+            let mut gradient = Array1::<f64>::zeros(rho.len());
+
+            match self.config.link_function() {
+                LinkFunction::Identity => {
+                    let n = self.y.len() as f64;
+                    let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
+                    let rss = pirls_result.deviance;
+                    let penalty = pirls_result.stable_penalty_term;
+                    let dp = rss + penalty;
+                    let (dp_c, dp_c_grad) = smooth_floor_dp(dp);
+                    let scale = dp_c / (n - mp).max(LAML_RIDGE);
+                    for block in sparse.penalty_blocks.iter() {
+                        let s_k_beta = sparse_matvec_public(&block.s_k_sparse, &beta);
+                        let beta_term = lambdas[block.term_index] * beta.dot(&s_k_beta);
+                        let trace_term = {
+                            let mut workspace = sparse.trace_workspace.lock().unwrap();
+                            trace_hinv_sk(&sparse.factor, &mut workspace, block)?
+                        };
+                        gradient[block.term_index] = dp_c_grad * (beta_term / (2.0 * scale))
+                            + 0.5 * lambdas[block.term_index] * trace_term
+                            - 0.5 * det1_values[block.term_index];
+                    }
+                }
+                _ => {
+                    let leverages = leverages_from_factor(&sparse.factor, self.x())?;
+                    let c_times_h = &pirls_result.solve_c_array * &leverages;
+                    let r_third = self.x().transpose_vector_multiply(&c_times_h);
+                    for block in sparse.penalty_blocks.iter() {
+                        let s_k_beta = sparse_matvec_public(&block.s_k_sparse, &beta);
+                        let beta_term = lambdas[block.term_index] * beta.dot(&s_k_beta);
+                        let v_k = solve_sparse_spd(&sparse.factor, &s_k_beta)?;
+                        let trace_s = {
+                            let mut workspace = sparse.trace_workspace.lock().unwrap();
+                            trace_hinv_sk(&sparse.factor, &mut workspace, block)?
+                        };
+                        let trace_third = r_third.dot(&v_k);
+                        gradient[block.term_index] = 0.5 * beta_term
+                            + 0.5 * lambdas[block.term_index] * (trace_s - trace_third)
+                            - 0.5 * det1_values[block.term_index];
+                    }
+                }
+            }
+
+            gradient += &self.compute_soft_prior_grad(rho);
+            Ok(gradient)
+        }
+
+        fn xt_diag_x_original(
+            &self,
+            diag: &Array1<f64>,
+            workspace: &mut PirlsWorkspace,
+        ) -> Result<Array2<f64>, EstimationError> {
+            // Matrix-free realization of X' diag(v) X.
+            //
+            // In the analytic sparse outer-Hessian formulas, both H_k and H_{k,l}
+            // contain curvature corrections of the form
+            //   X' diag(v) X
+            // with
+            //   v = c ⊙ z_k
+            // or
+            //   v = d ⊙ z_k ⊙ z_l + c ⊙ z_{k,l}.
+            //
+            // This helper translates that expression directly into Rust without
+            // ever materializing a dense n x n diagonal matrix. For dense designs
+            // we scale rows of X and form X' (diag(v) X); for sparse designs we
+            // reuse the existing sparse X' W X assembly machinery with `diag`
+            // playing the role of per-row weights.
+            match self.x() {
+                DesignMatrix::Dense(x_dense) => {
+                    let mut weighted = Array2::<f64>::zeros(x_dense.raw_dim());
+                    Ok(Self::xt_diag_x_dense_into(x_dense, diag, &mut weighted))
+                }
+                DesignMatrix::Sparse(x_sparse) => {
+                    let csr = x_sparse.to_csr_arc().ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "failed to build CSR cache for sparse exact Hessian".to_string(),
+                        )
+                    })?;
+                    workspace.compute_hessian_sparse_faer(csr.as_ref(), diag)
+                }
+            }
+        }
+
+        fn compute_laml_hessian_sparse_exact(
+            &self,
+            rho: &Array1<f64>,
+            bundle: &EvalShared,
+        ) -> Result<Array2<f64>, EstimationError> {
+            // Full sparse-exact second-order derivation on the ridged SPD surface.
+            //
+            // Notation at the exact inner mode beta = beta_hat(rho):
+            //
+            //   eta = X beta
+            //   W   = diag(w),   w_i = -ell_i''(eta_i)
+            //   c_i = -ell_i^{(3)}(eta_i)
+            //   d_i = -ell_i^{(4)}(eta_i)
+            //
+            //   H = X' W X + S(rho) + delta I,
+            //   A_k = dS/drho_k = lambda_k S_k,
+            //   A_{k,l} = d^2 S/(drho_k drho_l) = delta_{k,l} A_k.
+            //
+            // Inner stationarity gives
+            //   r(beta, rho) = grad_beta F(beta, rho) = 0.
+            // Differentiating once:
+            //   H B_k + A_k beta = 0
+            // so
+            //   B_k = d beta_hat / drho_k = -H^{-1} A_k beta,
+            //   z_k = X B_k.
+            //
+            // Differentiating the inner Hessian:
+            //   H_k = dH/drho_k = A_k + X' diag(c ⊙ z_k) X.
+            //
+            // Differentiating the stationarity equation again:
+            //   H_l B_k + H B_{k,l} + A_{k,l} beta + A_k B_l = 0
+            // so
+            //   B_{k,l} = -H^{-1}(H_l B_k + A_{k,l} beta + A_k B_l),
+            //   z_{k,l} = X B_{k,l}.
+            //
+            // Differentiating H_k:
+            //   H_{k,l}
+            //     = A_{k,l} + X' diag(d ⊙ z_k ⊙ z_l + c ⊙ z_{k,l}) X.
+            //
+            // The exact outer objective is
+            //   V(rho) = F(beta_hat(rho), rho)
+            //            + 0.5 log|H|
+            //            - 0.5 log|S(rho)|_+.
+            //
+            // By the envelope theorem,
+            //   g_k = dV/drho_k
+            //       = 0.5 beta' A_k beta
+            //         + 0.5 tr(H^{-1} H_k)
+            //         - 0.5 tr(S^+ A_k).
+            //
+            // Differentiating again yields the exact outer Hessian entry
+            //
+            //   H_outer[k,l]
+            //     = -beta' A_k H^{-1} A_l beta
+            //       + 0.5 delta_{k,l} beta' A_k beta
+            //       + 0.5 tr(H^{-1} H_{k,l})
+            //       - 0.5 tr(H^{-1} H_l H^{-1} H_k)
+            //       + 0.5 tr(S^+ A_k S^+ A_l)
+            //       - 0.5 delta_{k,l} tr(S^+ A_k)
+            //       + soft-prior Hessian.
+            //
+            // This branch keeps all solves/logdets/traces on the same sparse SPD
+            // geometry used by the sparse exact cost and gradient.
+            //
+            // In the current sparse-exact eligibility regime, penalties are
+            // block-separable by smooth term in original coordinates, so
+            //   log|S(rho)|_+ = const + sum_k rank(S_k) * rho_k
+            // on the penalized subspace. Therefore the penalty pseudo-logdet
+            // Hessian term P_{k,l} is exactly zero here; only the first
+            // derivative survives and is already handled in the gradient.
+            //
+            // Translation to code:
+            //
+            // 1. For each k, build A_k beta = lambda_k S_k beta and solve
+            //      B_k = -H^{-1} A_k beta.
+            //
+            // 2. Push B_k through X to get z_k = X B_k.
+            //
+            // 3. Build
+            //      H_k = A_k + X' diag(c ⊙ z_k) X
+            //    with `xt_diag_x_original`.
+            //
+            // 4. Solve dense right-hand sides
+            //      Y_k = H^{-1} H_k
+            //    once, so the quadratic trace term becomes
+            //      tr(H^{-1} H_l H^{-1} H_k) = tr(Y_l Y_k).
+            //
+            // 5. For each pair (k,l), build the exact right-hand side
+            //      H_l B_k + A_{k,l} beta + A_k B_l,
+            //    solve for B_{k,l}, and form z_{k,l} = X B_{k,l}.
+            //
+            // 6. Form the linear trace term from
+            //      H_{k,l} = A_{k,l} + X' diag(h_{k,l}) X,
+            //    where
+            //      h_{k,l} = d ⊙ z_k ⊙ z_l + c ⊙ z_{k,l}.
+            //
+            //    Using cyclicity of trace,
+            //      tr(H^{-1} X' diag(h) X)
+            //      = sum_i leverage_i * h_i,
+            //    where leverage_i = x_i' H^{-1} x_i.
+            //
+            // 7. Assemble the final symmetric K x K matrix from the quadratic
+            //    beta term, linear trace term, quadratic trace term, and the
+            //    soft-prior Hessian.
+            let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
+                EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
+            })?;
+            let pirls_result = bundle.pirls_result.as_ref();
+            let k_count = rho.len();
+            if k_count == 0 {
+                return Ok(Array2::zeros((0, 0)));
+            }
+
+            let p_dim = self.p;
+            let n_obs = self.y.len();
+            let matrix_slots = (k_count as u128)
+                .saturating_mul(p_dim as u128)
+                .saturating_mul(p_dim as u128)
+                .saturating_mul(8)
+                .saturating_mul(2);
+            const SPARSE_EXACT_OUTER_HESSIAN_MAX_BYTES: u128 = 512 * 1024 * 1024;
+            if matrix_slots > SPARSE_EXACT_OUTER_HESSIAN_MAX_BYTES {
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "sparse exact outer Hessian resource guard triggered (estimated dense work {} bytes)",
+                    matrix_slots
+                )));
+            }
+
+            let beta = self.sparse_exact_beta_original(pirls_result);
+            let lambdas = rho.mapv(f64::exp);
+            let c = &pirls_result.solve_c_array;
+            let d = &pirls_result.solve_d_array;
+            if c.len() != n_obs || d.len() != n_obs {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Sparse exact outer Hessian derivative arrays size mismatch: n={}, c.len()={}, d.len()={}",
+                    n_obs,
+                    c.len(),
+                    d.len()
+                )));
+            }
+
+            let leverages = leverages_from_factor(&sparse.factor, self.x())?;
+            let mut trace_hinv_sk_values = vec![0.0_f64; k_count];
+            let mut a_k_beta = Vec::with_capacity(k_count);
+            let mut b_k = Vec::with_capacity(k_count);
+            let mut z_k = Vec::with_capacity(k_count);
+            let mut s_diag = Vec::with_capacity(k_count);
+            let mut h_k_dense = Vec::with_capacity(k_count);
+            let mut q_diag = vec![0.0_f64; k_count];
+            let mut assembly_workspace = PirlsWorkspace::new(n_obs, p_dim, 0, 0);
+
+            for block in sparse.penalty_blocks.iter() {
+                let k = block.term_index;
+                // A_k beta = lambda_k S_k beta, then
+                //   B_k = -H^{-1} A_k beta,
+                //   z_k = X B_k.
+                let s_k_beta = sparse_matvec_public(&block.s_k_sparse, &beta);
+                let a_kb = s_k_beta.mapv(|v| lambdas[k] * v);
+                let b = solve_sparse_spd(&sparse.factor, &a_kb.mapv(|v| -v))?;
+                let z = self.x().matrix_vector_multiply(&b);
+
+                // H_k = A_k + X' diag(c ⊙ z_k) X.
+                let diag = &pirls_result.solve_c_array * &z;
+                let mut h_k = self.s_full_list[k].mapv(|v| lambdas[k] * v);
+                h_k += &self.xt_diag_x_original(&diag, &mut assembly_workspace)?;
+
+                // beta' A_k beta is reused on the diagonal quadratic term, while
+                // tr(H^{-1} A_k) is the delta_{k,l} piece inside tr(H^{-1} H_{k,l}).
+                q_diag[k] = beta.dot(&a_kb);
+                {
+                    let mut workspace = sparse.trace_workspace.lock().unwrap();
+                    trace_hinv_sk_values[k] =
+                        lambdas[k] * trace_hinv_sk(&sparse.factor, &mut workspace, block)?;
+                }
+                a_k_beta.push(a_kb);
+                b_k.push(b);
+                z_k.push(z);
+                s_diag.push(diag);
+                h_k_dense.push(h_k);
+            }
+
+            let mut y_k_dense = Vec::with_capacity(k_count);
+            for hk in &h_k_dense {
+                // Y_k = H^{-1} H_k. This feeds the quadratic trace term
+                //   tr(H^{-1} H_l H^{-1} H_k) = tr(Y_l Y_k).
+                y_k_dense.push(solve_sparse_spd_multi(&sparse.factor, hk)?);
+            }
+
+            let mut hess = Array2::<f64>::zeros((k_count, k_count));
+            for block_l in sparse.penalty_blocks.iter() {
+                let l = block_l.term_index;
+                for block_k in sparse.penalty_blocks.iter().take(l + 1) {
+                    let k = block_k.term_index;
+
+                    // Quadratic beta term:
+                    //   -beta' A_k H^{-1} A_l beta + 0.5 delta_{k,l} beta' A_k beta.
+                    // Since B_l = -H^{-1} A_l beta, this becomes
+                    //   beta' A_k B_l + 0.5 delta_{k,l} beta' A_k beta.
+                    let quad_beta = a_k_beta[k].dot(&b_k[l])
+                        + if k == l { 0.5 * q_diag[k] } else { 0.0 };
+
+                    // Build the right-hand side for
+                    //   B_{k,l} = -H^{-1}(H_l B_k + A_{k,l} beta + A_k B_l).
+                    //
+                    // Split H_l B_k into:
+                    //   A_l B_k
+                    //   + X' diag(c ⊙ z_l) X B_k
+                    //   = A_l B_k + X' ( (c ⊙ z_l) ⊙ z_k ).
+                    let h_l_b_k_pen = sparse_matvec_public(&block_l.s_k_sparse, &b_k[k])
+                        .mapv(|v| lambdas[l] * v);
+                    let h_l_b_k_ll = self
+                        .x()
+                        .transpose_vector_multiply(&((&s_diag[l]) * &z_k[k]));
+                    let a_k_b_l = sparse_matvec_public(&block_k.s_k_sparse, &b_k[l])
+                        .mapv(|v| lambdas[k] * v);
+                    let mut rhs_bkl = h_l_b_k_pen + &h_l_b_k_ll + &a_k_b_l;
+                    if k == l {
+                        rhs_bkl += &a_k_beta[k];
+                    }
+                    let b_kl = solve_sparse_spd(&sparse.factor, &rhs_bkl.mapv(|v| -v))?;
+                    let z_kl = self.x().matrix_vector_multiply(&b_kl);
+
+                    // H_{k,l} = A_{k,l} + X' diag(d ⊙ z_k ⊙ z_l + c ⊙ z_{k,l}) X.
+                    // The linear trace contribution is
+                    //   0.5 tr(H^{-1} H_{k,l})
+                    // = 0.5 delta_{k,l} tr(H^{-1} A_k)
+                    //   + 0.5 tr(H^{-1} X' diag(hkl_diag) X).
+                    //
+                    // We evaluate the second term by the cyclic identity
+                    //   tr(H^{-1} X' D X)
+                    // = tr(X H^{-1} X' D)
+                    // = sum_i leverage_i * D_ii,
+                    // where leverage_i = x_i' H^{-1} x_i.
+                    let hkl_diag = (d * &z_k[k] * &z_k[l]) + &(c * &z_kl);
+                    let lin_trace = if k == l {
+                        trace_hinv_sk_values[k]
+                    } else {
+                        0.0
+                    } + leverages.dot(&hkl_diag);
+
+                    // Quadratic trace term:
+                    //   tr(H^{-1} H_l H^{-1} H_k) = tr(Y_l Y_k),
+                    // with Y_k = H^{-1} H_k.
+                    let quad_trace = Self::trace_product(&y_k_dense[k], &y_k_dense[l]);
+
+                    let value = quad_beta + 0.5 * lin_trace - 0.5 * quad_trace;
+                    hess[[k, l]] = value;
+                    hess[[l, k]] = value;
+                }
+            }
+
+            self.add_soft_prior_hessian_in_place(rho, &mut hess);
+            Ok(hess)
         }
 
         pub(super) fn last_ridge_used(&self) -> Option<f64> {
@@ -1345,6 +1910,218 @@
             self.weights
         }
 
+        fn sparse_penalty_logdet_runtime(
+            &self,
+            rho: &Array1<f64>,
+            blocks: &[SparsePenaltyBlock],
+        ) -> (f64, Array1<f64>) {
+            let mut logdet = 0.0_f64;
+            let mut det1 = Array1::<f64>::zeros(rho.len());
+            for block in blocks {
+                let rank = block.positive_eigenvalues.len() as f64;
+                if block.term_index < det1.len() {
+                    det1[block.term_index] = rank;
+                }
+                logdet += rank * rho[block.term_index];
+                for &eig in block.positive_eigenvalues.iter() {
+                    logdet += eig.ln();
+                }
+            }
+            (logdet, det1)
+        }
+
+        fn select_reml_geometry(&self, rho: &Array1<f64>) -> SparseRemlDecision {
+            let p = self.p;
+            let has_dense_constraints =
+                self.linear_constraints.is_some() || self.coefficient_lower_bounds.is_some();
+            let x_sparse = match &self.x {
+                DesignMatrix::Sparse(sparse) => Some(sparse),
+                DesignMatrix::Dense(_) => None,
+            };
+            let nnz_x = x_sparse.map(|s| s.val().len()).unwrap_or(0);
+            let dense_backend = |reason: &'static str,
+                                 nnz_h_upper_est: Option<usize>,
+                                 density_h_upper_est: Option<f64>| SparseRemlDecision {
+                geometry: RemlGeometry::DenseSpectral,
+                reason,
+                p,
+                nnz_x,
+                nnz_h_upper_est,
+                density_h_upper_est,
+            };
+
+            if self.config.firth_bias_reduction {
+                return dense_backend("firth_active", None, None);
+            }
+            if p < 256 {
+                return dense_backend("p_below_threshold", None, None);
+            }
+            if has_dense_constraints {
+                return dense_backend("constraints_present", None, None);
+            }
+            let Some(x_sparse) = x_sparse else {
+                return dense_backend("design_not_sparse", None, None);
+            };
+            let Some(blocks) = self.sparse_penalty_blocks.as_ref() else {
+                return dense_backend("penalty_blocks_not_separable", None, None);
+            };
+
+            let lambdas = rho.mapv(f64::exp);
+            let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
+            for (k, s_k) in self.s_full_list.iter().enumerate() {
+                if k < lambdas.len() && lambdas[k] != 0.0 {
+                    s_lambda.scaled_add(lambdas[k], s_k);
+                }
+            }
+            let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
+            match workspace.sparse_penalized_system_stats(x_sparse, &s_lambda) {
+                Ok(stats) if stats.density_upper < 0.10 && !blocks.is_empty() => SparseRemlDecision {
+                    geometry: RemlGeometry::SparseExactSpd,
+                    reason: "sparse_exact_spd",
+                    p,
+                    nnz_x,
+                    nnz_h_upper_est: Some(stats.nnz_h_upper),
+                    density_h_upper_est: Some(stats.density_upper),
+                },
+                Ok(stats) => dense_backend(
+                    "penalized_hessian_too_dense",
+                    Some(stats.nnz_h_upper),
+                    Some(stats.density_upper),
+                ),
+                Err(_) => dense_backend("sparse_stats_failed", None, None),
+            }
+        }
+
+        fn prepare_dense_eval_bundle_with_key(
+            &self,
+            rho: &Array1<f64>,
+            key: Option<Vec<u64>>,
+        ) -> Result<EvalShared, EstimationError> {
+            let pirls_result = self.execute_pirls_if_needed(rho)?;
+            let (h_eff, ridge_passport) = self.effective_hessian(pirls_result.as_ref())?;
+
+            const EIG_REL_THRESHOLD: f64 = 1e-10;
+            const EIG_ABS_FLOOR: f64 = 1e-14;
+
+            let dim = h_eff.nrows();
+            let h_total = h_eff.clone();
+            let (eigvals, eigvecs) = h_total
+                .eigh(Side::Lower)
+                .map_err(|e| EstimationError::EigendecompositionFailed(e))?;
+            let max_eig = eigvals.iter().copied().fold(0.0_f64, f64::max);
+            let eig_threshold = if self.config.link_function() == LinkFunction::Identity {
+                (max_eig * EIG_REL_THRESHOLD).max(EIG_ABS_FLOOR)
+            } else {
+                EIG_ABS_FLOOR
+            };
+            let h_total_log_det: f64 = eigvals
+                .iter()
+                .filter(|&&v| v > eig_threshold)
+                .map(|&v| v.ln())
+                .sum();
+            if !h_total_log_det.is_finite() {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
+            }
+
+            let valid_indices: Vec<usize> = eigvals
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v > eig_threshold { Some(i) } else { None })
+                .collect();
+
+            let valid_count = valid_indices.len();
+            let mut w = Array2::<f64>::zeros((dim, valid_count));
+
+            for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
+                let val = eigvals[eig_idx];
+                let scale = 1.0 / val.sqrt();
+                let u_col = eigvecs.column(eig_idx);
+                let mut w_col = w.column_mut(w_col_idx);
+                Zip::from(&mut w_col)
+                    .and(&u_col)
+                    .for_each(|w_elem, &u_elem| *w_elem = u_elem * scale);
+            }
+
+            Ok(EvalShared {
+                key,
+                pirls_result,
+                ridge_passport,
+                geometry: RemlGeometry::DenseSpectral,
+                h_eff: Arc::new(h_eff),
+                h_total: Arc::new(h_total),
+                h_pos_factor_w: Arc::new(w),
+                h_total_log_det,
+                sparse_exact: None,
+            })
+        }
+
+        fn prepare_sparse_eval_bundle_with_key(
+            &self,
+            rho: &Array1<f64>,
+            key: Option<Vec<u64>>,
+        ) -> Result<EvalShared, EstimationError> {
+            let pirls_result = self.execute_pirls_if_needed(rho)?;
+            let ridge_passport = pirls_result.ridge_passport;
+            let x_sparse = match &self.x {
+                DesignMatrix::Sparse(s) => s,
+                DesignMatrix::Dense(_) => {
+                    return Err(EstimationError::InvalidInput(
+                        "sparse exact geometry requires sparse original design".to_string(),
+                    ));
+                }
+            };
+            let penalty_blocks = self
+                .sparse_penalty_blocks
+                .as_ref()
+                .ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "sparse exact geometry requires block-separable penalties".to_string(),
+                    )
+                })?
+                .clone();
+
+            let lambdas = rho.mapv(f64::exp);
+            let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
+            for (k, s_k) in self.s_full_list.iter().enumerate() {
+                if k < lambdas.len() && lambdas[k] != 0.0 {
+                    s_lambda.scaled_add(lambdas[k], s_k);
+                }
+            }
+            let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
+            let h_sparse = sparse_reml_penalized_hessian(
+                &mut workspace,
+                x_sparse,
+                &pirls_result.solve_weights,
+                &s_lambda,
+                ridge_passport.delta,
+            )?;
+            let factor = factorize_sparse_spd(&h_sparse)?;
+            let logdet_h = logdet_from_factor(&factor)?;
+            let (logdet_s_pos, det1_values) =
+                self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
+
+            Ok(EvalShared {
+                key,
+                pirls_result,
+                ridge_passport,
+                geometry: RemlGeometry::SparseExactSpd,
+                h_eff: Arc::new(Array2::zeros((0, 0))),
+                h_total: Arc::new(Array2::zeros((0, 0))),
+                h_pos_factor_w: Arc::new(Array2::zeros((0, 0))),
+                h_total_log_det: 0.0,
+                sparse_exact: Some(Arc::new(SparseExactEvalData {
+                    factor: Arc::new(factor),
+                    penalty_blocks,
+                    logdet_h,
+                    logdet_s_pos,
+                    det1_values: Arc::new(det1_values),
+                    trace_workspace: Arc::new(Mutex::new(SparseTraceWorkspace::default())),
+                })),
+            })
+        }
+
         #[allow(dead_code)]
         pub(super) fn offset(&self) -> ArrayView1<'_, f64> {
             self.offset.view()
@@ -1570,6 +2347,9 @@
                     return Err(e);
                 }
             };
+            if matches!(bundle.geometry, RemlGeometry::SparseExactSpd) {
+                return self.compute_cost_sparse_exact(p, &bundle);
+            }
             let pirls_result = bundle.pirls_result.as_ref();
             let ridge_used = bundle.ridge_passport.delta;
 
@@ -2209,6 +2989,9 @@
             p: &Array1<f64>,
             bundle: &EvalShared,
         ) -> Result<Array1<f64>, EstimationError> {
+            if matches!(bundle.geometry, RemlGeometry::SparseExactSpd) {
+                return self.compute_gradient_sparse_exact(p, bundle);
+            }
             // If there are no penalties (zero-length rho), the gradient in rho-space is empty.
             if p.is_empty() {
                 return Ok(Array1::zeros(0));
@@ -3058,10 +3841,103 @@
             acc.sum()
         }
 
+        fn dense_projected_exact_eligible(n_obs: usize, eff_rank: usize, k_count: usize) -> bool {
+            if eff_rank == 0 || eff_rank > 1024 {
+                return false;
+            }
+            let work_n_r2_k = (n_obs as u128)
+                .saturating_mul(eff_rank as u128)
+                .saturating_mul(eff_rank as u128)
+                .saturating_mul(k_count as u128);
+            let work_r2_k2 = (eff_rank as u128)
+                .saturating_mul(eff_rank as u128)
+                .saturating_mul(k_count as u128)
+                .saturating_mul(k_count as u128);
+            work_n_r2_k <= 1_000_000_000 && work_r2_k2 <= 100_000_000
+        }
+
+        fn dense_projected_tk(
+            z_mat: &Array2<f64>,
+            w_pos: &Array2<f64>,
+            r_k: &Array2<f64>,
+            lambda_k: f64,
+            c_weighted_u_k: &Array1<f64>,
+        ) -> Array2<f64> {
+            // T_k = W' H_k W
+            //     = lambda_k (R_k W)' (R_k W)
+            //       + Z' diag(c ⊙ u_k) Z,
+            // where Z = XW.
+            let rk_w = fast_ab(r_k, w_pos);
+            let mut t_k = fast_ata(&rk_w);
+            t_k.mapv_inplace(|v| v * lambda_k);
+
+            let mut z_weighted = z_mat.clone();
+            for i in 0..z_weighted.nrows() {
+                let weight = c_weighted_u_k[i];
+                for j in 0..z_weighted.ncols() {
+                    z_weighted[[i, j]] *= weight;
+                }
+            }
+            t_k += &fast_atb(z_mat, &z_weighted);
+            t_k
+        }
+
+        fn dense_projected_trace_hinv_hkl(
+            z_mat: &Array2<f64>,
+            w_pos: &Array2<f64>,
+            r_k: Option<&Array2<f64>>,
+            lambda_k: f64,
+            diag_kl: &Array1<f64>,
+        ) -> f64 {
+            // tr(H_+^dagger H_{k,l}) = tr(W' H_{k,l} W)
+            //                        = tr(T_{k,l}),
+            // where
+            //   T_{k,l} = delta_{k,l} lambda_k (R_k W)'(R_k W)
+            //             + Z' diag(diag_kl) Z.
+            let mut trace = 0.0_f64;
+            if let Some(r_k) = r_k {
+                let rk_w = fast_ab(r_k, w_pos);
+                let penalty_part = fast_ata(&rk_w);
+                trace += lambda_k * penalty_part.diag().sum();
+            }
+
+            for j in 0..z_mat.ncols() {
+                let mut quad = 0.0_f64;
+                for i in 0..z_mat.nrows() {
+                    let zij = z_mat[[i, j]];
+                    quad += diag_kl[i] * zij * zij;
+                }
+                trace += quad;
+            }
+            trace
+        }
+
+        fn dense_projected_trace_quadratic(t_k: &Array2<f64>, t_l: &Array2<f64>) -> f64 {
+            // tr(H_+^dagger H_k H_+^dagger H_l) = tr(T_k T_l)
+            Self::trace_product(t_k, t_l)
+        }
+
         fn select_trace_backend(n_obs: usize, p_dim: usize, k_count: usize) -> TraceBackend {
             // Workload-aware policy driven by (n, p, K):
             // - Exact for moderate total complexity.
             // - Hutchinson/Hutch++ as n·p·K and p²·K² costs grow.
+            //
+            // Note: this backend switch currently lives inside the dense
+            // transformed REML Hessian path below. Replacing the stochastic
+            // branch with selected inversion is only meaningful after the trace
+            // computation is moved onto a sparse/banded factorization of the
+            // original penalized system; it is not effective while "exact"
+            // still means forming dense Array2 contractions/inverses.
+            //
+            // The bottleneck term is the second-order logdet contribution
+            //   L_{k,l} = 0.5 [ -tr(H^{-1} H_l H^{-1} H_k) + tr(H^{-1} H_{kl}) ].
+            // In the current transformed-coordinate implementation, the "exact"
+            // backend forms dense solves/contractions to evaluate these traces,
+            // while Hutchinson/Hutch++ estimates them from probe identities
+            //   tr(A) = E[z' A z],   z_i in {+1,-1}.
+            // Selected inversion would change the cost model only if H and the
+            // derivative matrices are represented on a sparse pattern where the
+            // needed inverse entries remain local.
             //
             // Proxies:
             //   w_npk   ~ n*p*K   (X/Xᵀ + diagonal contractions)
@@ -3157,13 +4033,45 @@
             structural_rank: usize,
             ridge: f64,
         ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
-            // Section A.1/A.3 (penalty pseudo-logdet path):
-            //   det1[k] = ∂/∂ρ_k log|S(ρ)|_+ = tr(S_+^† A_k),
-            //   A_k = λ_k S_k, S_k = R_k^T R_k.
+            // Full derivation for the penalty pseudo-logdet terms in the outer
+            // gradient/Hessian:
             //
-            // This helper computes det1/det2 on a fixed-rank structural subspace to
-            // keep the objective differentiable w.r.t. ρ under the implemented
-            // positive-part convention (A+-fixed active subspace assumption).
+            //   P_k   = -0.5 * d/drho_k     log|S(rho)|_+
+            //   P_k,l = -0.5 * d²/(drho_k drho_l) log|S(rho)|_+.
+            //
+            // Write
+            //   S(rho) = sum_k lambda_k S_k,   lambda_k = exp(rho_k),
+            //   A_k    = dS/drho_k      = lambda_k S_k,
+            //   A_k,l  = d²S/(drho_k drho_l) = delta_{k,l} A_k.
+            //
+            // On a fixed positive-eigenspace / structural penalty subspace,
+            // the pseudodeterminant calculus matches ordinary determinant
+            // calculus with S^{-1} replaced by the inverse on that kept
+            // subspace:
+            //
+            //   d/drho_k log|S|_+ = tr(S_+^dagger A_k)
+            //
+            // and
+            //
+            //   d²/(drho_k drho_l) log|S|_+
+            //     = tr(S_+^dagger A_k,l)
+            //       - tr(S_+^dagger A_l S_+^dagger A_k).
+            //
+            // Since A_k = lambda_k S_k and A_k,l = delta_{k,l} A_k, we obtain
+            //
+            //   det1[k] = d/drho_k log|S|_+ = tr(S_+^dagger A_k)
+            //
+            // and
+            //
+            //   det2[k,l]
+            //     = d²/(drho_k drho_l) log|S|_+
+            //     = delta_{k,l} det1[k]
+            //       - lambda_k lambda_l tr(S_+^dagger S_k S_+^dagger S_l).
+            //
+            // This helper realizes exactly that formula on a fixed-rank
+            // reduced penalty space. The fixed-support assumption is the same
+            // one used elsewhere in the dense spectral path: the active penalty
+            // subspace is held constant while differentiating in rho.
             let k_count = lambdas.len();
             if rs_transformed.len() != k_count {
                 return Err(EstimationError::LayoutError(format!(
@@ -3263,6 +4171,16 @@
             let mut det2 = Array2::<f64>::zeros((k_count, k_count));
             for k in 0..k_count {
                 for l in 0..=k {
+                    // With
+                    //   a = S_r^{-1} S_{k,r},   b = S_r^{-1} S_{l,r},
+                    // we have
+                    //   tr_ab = tr(a b)
+                    //         = tr(S_+^dagger S_k S_+^dagger S_l)
+                    // on the kept structural subspace. Therefore
+                    //
+                    //   det2[k,l]
+                    //     = delta_{k,l} det1[k]
+                    //       - lambda_k lambda_l tr_ab.
                     let a = s_r_inv.dot(&s_k_reduced[k]);
                     let b = s_r_inv.dot(&s_k_reduced[l]);
                     let tr_ab = kahan_sum((0..rank).map(|i| {
@@ -3287,6 +4205,17 @@
             &self,
             rho: &Array1<f64>,
         ) -> Result<Array2<f64>, EstimationError> {
+            // Central finite-difference fallback on the already-active analytic
+            // gradient:
+            //
+            //   H_{i,j} ≈ (g_i(rho + h e_j) - g_i(rho - h e_j)) / (2 h).
+            //
+            // This is intentionally a fallback only. Unlike the exact implicit
+            // Hessian paths above, it requires repeated full outer gradient
+            // evaluations and therefore repeated inner PIRLS solves / factored
+            // curvature updates. The exact paths reduce that to back-
+            // substitutions and trace contractions against the already-built
+            // Hessian geometry.
             let k = rho.len();
             let mut h = Array2::<f64>::zeros((k, k));
             if k == 0 {
@@ -3333,6 +4262,23 @@
             &self,
             rho: &Array1<f64>,
         ) -> Result<Array2<f64>, EstimationError> {
+            // Fallback policy for the outer smoothing-parameter Hessian.
+            //
+            // The goal is to return the exact Hessian of the outer Laplace /
+            // REML objective whenever the corresponding geometry-specific exact
+            // path is available:
+            //
+            //   V(rho)
+            //     = L(beta_hat(rho), rho)
+            //       + 0.5 log|H(rho)|
+            //       - 0.5 log|S(rho)|_+.
+            //
+            // If the exact assembly fails because the required factorization,
+            // trace contractions, or active-subspace assumptions break down, we
+            // fall back to central finite differences of the active analytic
+            // gradient. The FD path is intentionally kept as a safety net for
+            // pathological data or unsupported geometries; it is not part of
+            // the intended hot path.
             if self.uses_objective_consistent_fd_gradient(rho) {
                 return self.compute_hessian_fd_from_active_gradient(rho);
             }
@@ -3352,32 +4298,108 @@
             &self,
             rho: &Array1<f64>,
         ) -> Result<Array2<f64>, EstimationError> {
-            // Exact non-Gaussian outer Hessian components (ρ-space):
+            let bundle = self.obtain_eval_bundle(rho)?;
+            if matches!(bundle.geometry, RemlGeometry::SparseExactSpd) {
+                return self.compute_laml_hessian_sparse_exact(rho, &bundle);
+            }
+            // Full derivation for the dense transformed exact outer Hessian.
             //
-            //   B_k   = ∂β̂/∂ρ_k = -H^{-1}(A_k β̂)
-            //   B_{kℓ}= ∂²β̂/(∂ρ_k∂ρ_ℓ) from
-            //          H B_{kℓ} = -(H_ℓ B_k + A_k B_ℓ + δ_{kℓ} A_k β̂)
+            // Definitions:
             //
-            //   H_k   = A_k + Xᵀ diag(c ⊙ u_k) X,        u_k   = X B_k
-            //   H_{kℓ}= δ_{kℓ}A_k + Xᵀ diag(d ⊙ u_k ⊙ u_ℓ + c ⊙ u_{kℓ}) X,
-            //           where u_{kℓ}=X B_{kℓ}
+            //   lambda_k = exp(rho_k)
+            //   S(rho)   = sum_k lambda_k S_k
+            //   A_k      = dS/drho_k      = lambda_k S_k
+            //   A_{k,l}  = d²S/(drho_k drho_l) = delta_{k,l} A_k
+            //
+            // The inner mode beta_hat(rho) is defined by the stationarity system
+            //
+            //   G(beta, rho) = grad_beta L(beta, rho) = 0
+            //
+            // with
+            //
+            //   L(beta, rho)
+            //     = -ell(beta) + 0.5 beta' S(rho) beta.
+            //
+            // Let
+            //
+            //   H = dG/dbeta = -ell_{beta,beta} + S(rho)
+            //
+            // denote the inner Hessian on the current geometry. In the dense
+            // transformed path this is the active transformed Hessian `h_total`.
+            //
+            // Implicit Function Theorem:
+            //
+            // Differentiating G(beta_hat(rho), rho) = 0 once gives
+            //
+            //   H B_k + A_k beta_hat = 0
+            //
+            // so
+            //
+            //   B_k = d beta_hat / drho_k = -H^{-1}(A_k beta_hat).
+            //
+            // Differentiating again gives
+            //
+            //   H_l B_k + H B_{k,l} + A_k B_l + A_{k,l} beta_hat = 0
+            //
+            // hence
+            //
+            //   B_{k,l}
+            //     = -H^{-1}(H_l B_k + A_k B_l + delta_{k,l} A_k beta_hat).
+            //
+            // Likelihood curvature derivatives:
+            //
+            // Write eta = X beta and let c, d be the per-observation third and
+            // fourth derivatives of the negative log-likelihood w.r.t. eta.
+            // Then, for u_k = X B_k and u_{k,l} = X B_{k,l},
+            //
+            //   H_k
+            //     = A_k + X' diag(c ⊙ u_k) X
+            //
+            // and
+            //
+            //   H_{k,l}
+            //     = delta_{k,l} A_k
+            //       + X' diag(d ⊙ u_k ⊙ u_l + c ⊙ u_{k,l}) X.
             //
             // Here `c` and `d` are the per-observation 3rd/4th eta-derivative arrays
             // prepared by PIRLS (`solve_c_array`, `solve_d_array`).
             //
-            // Full exact Hessian entry used below:
+            // Outer objective:
+            //
+            //   V(rho)
+            //     = L(beta_hat(rho), rho)
+            //       + 0.5 log|H(rho)|
+            //       - 0.5 log|S(rho)|_+.
+            //
+            // By the envelope theorem,
+            //
+            //   dV/drho_k
+            //     = 0.5 beta_hat' A_k beta_hat
+            //       + 0.5 tr(H^{-1} H_k)
+            //       - 0.5 tr(S_+^dagger A_k).
+            //
+            // Differentiating again yields the exact Hessian decomposition
             //
             //   ∂²V/(∂ρ_k∂ρ_ℓ) = Q_{kℓ} + L_{kℓ} + P_{kℓ}
             //
             // with
-            //   Q_{kℓ} = B_ℓᵀ A_k β̂ + 0.5 δ_{kℓ} β̂ᵀ A_k β̂
+            //   Q_{kℓ} = B_ℓ' A_k β_hat + 0.5 delta_{kℓ} beta_hat' A_k beta_hat
             //   L_{kℓ} = 0.5 [ -tr(H^{-1}H_ℓ H^{-1}H_k) + tr(H^{-1}H_{kℓ}) ]
             //   P_{kℓ} = -0.5 ∂² log|S|_+ /(∂ρ_k∂ρ_ℓ)
             //
             // Numerically, this function computes:
-            // - Q exactly from B_k solves,
-            // - P exactly from reduced-penalty logdet derivatives,
-            // - L either exactly or stochastically, depending on workload.
+            //
+            // 1. Solve for all first implicit derivatives B_k.
+            // 2. Form H_k from the penalty part plus the c ⊙ (X B_k) correction.
+            // 3. Solve for all second implicit derivatives B_{k,l}.
+            // 4. Form H_{k,l} from the penalty part plus the d/c contractions.
+            // 5. Assemble
+            //      Q_{k,l} = B_l' A_k beta_hat + 0.5 delta_{k,l} beta_hat' A_k beta_hat
+            // 6. Assemble
+            //      L_{k,l}
+            //        = 0.5 [ tr(H^{-1} H_{k,l}) - tr(H^{-1} H_l H^{-1} H_k) ]
+            // 7. Assemble P_{k,l} from the structural penalty pseudo-logdet
+            //    derivatives on the fixed active penalty subspace.
             //
             // The objective also includes the separable soft rho prior used by
             // compute_cost/compute_gradient; its exact diagonal Hessian is added
@@ -3389,7 +4411,6 @@
             //   tr(H^{-1}H_{kℓ}) estimated by probe bilinear forms.
             // Hutch++ augments this with a low-rank deflation subspace Q to reduce
             // variance before Hutchinson residual estimation.
-            let bundle = self.obtain_eval_bundle(rho)?;
             let pirls_result = bundle.pirls_result.as_ref();
             let reparam_result = &pirls_result.reparam_result;
 
@@ -3481,6 +4502,18 @@
             let mut rhs_bk = Array2::<f64>::zeros((p_dim, k_count));
             let mut q_diag = vec![0.0; k_count];
             for k in 0..k_count {
+                // Penalty-block algebra:
+                //   S_k = R_k' R_k,
+                //   A_k = lambda_k S_k,
+                //   A_k beta = lambda_k S_k beta.
+                //
+                // We store both:
+                // - a_k_mats[k] = A_k
+                // - a_k_beta[k] = A_k beta
+                //
+                // and stack the first-derivative IFT right-hand sides
+                //   H B_k = -A_k beta
+                // into rhs_bk so all B_k can be solved together.
                 let r_k = &rs_transformed[k];
                 let s_k = r_k.t().dot(r_k);
                 let r_beta = r_k.dot(beta);
@@ -3499,6 +4532,9 @@
             let mut h_k = Vec::with_capacity(k_count);
             let mut weighted_xtdx = Array2::<f64>::zeros(x_dense.raw_dim());
             for k in 0..k_count {
+                // u_k = X B_k is the eta-space sensitivity for rho_k.
+                // The first Hessian derivative is
+                //   H_k = A_k + X' diag(c ⊙ u_k) X.
                 let mut diag = Array1::<f64>::zeros(n);
                 for i in 0..n {
                     diag[i] = c[i] * u_mat[[i, k]];
@@ -3528,15 +4564,75 @@
             // - Exact: deterministic traces via explicit H^{-1} contractions.
             // - Hutchinson/Hutch++: Monte-Carlo trace estimators (unbiased/low-bias in
             //   expectation) trading tiny stochastic noise for major scaling gains.
+            let projected_exact_mode = exact_trace_mode
+                && free_basis_opt.is_none()
+                && bundle.h_pos_factor_w.nrows() == p_dim
+                && Self::dense_projected_exact_eligible(
+                    n,
+                    bundle.h_pos_factor_w.ncols(),
+                    k_count,
+                );
 
-            let h_inv = if exact_trace_mode {
+            let w_pos_projected = if projected_exact_mode {
+                Some(bundle.h_pos_factor_w.as_ref().clone())
+            } else {
+                None
+            };
+            let z_mat_projected = w_pos_projected
+                .as_ref()
+                .map(|w_pos| fast_ab(x_dense, w_pos));
+
+            let h_inv = if exact_trace_mode && !projected_exact_mode {
+                // Dense exact fallback used in the transformed-coordinate REML
+                // path. This is precisely the O(p^3) operation that a future
+                // sparse selected-inversion backend should eliminate, but only
+                // after traces are computed from a sparse SPD factorization in
+                // original coordinates.
+                //
+                // Here "exact" means:
+                //   H^{-1} = solve(H, I),
+                // followed by contractions such as
+                //   tr(H^{-1} H_{kl}) = sum_ij (H^{-1})_{ij} (H_{kl})_{ji}.
+                // A sparse selected-inversion replacement would avoid forming
+                // the full dense inverse by computing only inverse entries on
+                // the structural support actually touched by S_k, H_k, or H_{kl}.
+                // That is not exploitable in this branch because the transformed
+                // derivative matrices are themselves dense in general.
                 Some(solve_h(&Array2::<f64>::eye(p_dim)))
             } else {
                 None
             };
             let m_k: Option<Vec<Array2<f64>>> = h_inv
                 .as_ref()
-                .map(|hinv| h_k.iter().map(|hk| hinv.dot(hk)).collect());
+                .map(|hinv| {
+                    // M_k = H^{-1} H_k, so that the quadratic logdet trace term
+                    // becomes
+                    //   tr(H^{-1} H_l H^{-1} H_k) = tr(M_l M_k).
+                    h_k.iter().map(|hk| hinv.dot(hk)).collect()
+                });
+            let t_k_projected: Option<Vec<Array2<f64>>> = if projected_exact_mode {
+                let z_mat = z_mat_projected
+                    .as_ref()
+                    .expect("projected exact Z available");
+                let w_pos = w_pos_projected
+                    .as_ref()
+                    .expect("projected exact W available");
+                Some(
+                    (0..k_count)
+                        .map(|k| {
+                            Self::dense_projected_tk(
+                                z_mat,
+                                w_pos,
+                                &rs_transformed[k],
+                                lambdas[k],
+                                &s_cols[k],
+                            )
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
 
             let mut probe_z: Option<Array2<f64>> = None;
             let mut probe_u: Option<Array2<f64>> = None;
@@ -3581,10 +4677,22 @@
 
             let mut t1_mat = Array2::<f64>::zeros((k_count, k_count));
             if exact_trace_mode {
-                let mk = m_k.as_ref().expect("m_k present in exact mode");
-                for l in 0..k_count {
-                    for k in 0..k_count {
-                        t1_mat[[l, k]] = Self::trace_product(&mk[l], &mk[k]);
+                if projected_exact_mode {
+                    let tk = t_k_projected
+                        .as_ref()
+                        .expect("projected T_k present in projected exact mode");
+                    for l in 0..k_count {
+                        for k in 0..k_count {
+                            t1_mat[[l, k]] =
+                                Self::dense_projected_trace_quadratic(&tk[l], &tk[k]);
+                        }
+                    }
+                } else {
+                    let mk = m_k.as_ref().expect("m_k present in exact mode");
+                    for l in 0..k_count {
+                        for k in 0..k_count {
+                            t1_mat[[l, k]] = Self::trace_product(&mk[l], &mk[k]);
+                        }
                     }
                 }
             } else {
@@ -3674,6 +4782,12 @@
                 let mut rhs_kl_all = Array2::<f64>::zeros((p_dim, k_count));
                 for k in l..k_count {
                     let bk = b_mat.column(k).to_owned();
+                    // Second implicit derivative solve:
+                    //
+                    //   B_{k,l}
+                    //     = -H^{-1}(H_l B_k + A_k B_l + delta_{k,l} A_k beta).
+                    //
+                    // We form the stacked right-hand sides exactly in that form.
                     let mut rhs_kl = -h_k[l].dot(&bk);
                     rhs_kl -= &a_k_mats[k].dot(&bl);
                     if k == l {
@@ -3686,22 +4800,51 @@
 
                 let mut weighted_xtdx_kl = Array2::<f64>::zeros(x_dense.raw_dim());
                 for k in l..k_count {
+                    // H_{k,l} = delta_{k,l} A_k
+                    //          + X' diag(d ⊙ u_k ⊙ u_l + c ⊙ u_{k,l}) X.
                     let mut diag = Array1::<f64>::zeros(n);
                     for i in 0..n {
                         diag[i] = d[i] * u_mat[[i, k]] * u_mat[[i, l]] + c[i] * u_kl_all[[i, k]];
                     }
 
+                    // Quadratic beta contribution:
+                    //   Q_{k,l} = B_l' A_k beta + 0.5 delta_{k,l} beta' A_k beta.
                     let q = bl.dot(&a_k_beta[k]) + if k == l { 0.5 * q_diag[k] } else { 0.0 };
+
+                    // Quadratic logdet trace piece:
+                    //   t1 = tr(H^{-1} H_l H^{-1} H_k).
                     let t1 = t1_mat[[l, k]];
                     let t2 = if exact_trace_mode {
-                        let mut h_kl = if k == l {
-                            a_k_mats[k].clone()
+                        if projected_exact_mode {
+                            let z_mat = z_mat_projected
+                                .as_ref()
+                                .expect("projected exact Z available");
+                            let w_pos = w_pos_projected
+                                .as_ref()
+                                .expect("projected exact W available");
+                            Self::dense_projected_trace_hinv_hkl(
+                                z_mat,
+                                w_pos,
+                                if k == l {
+                                    Some(&rs_transformed[k])
+                                } else {
+                                    None
+                                },
+                                lambdas[k],
+                                &diag,
+                            )
                         } else {
-                            Array2::<f64>::zeros((p_dim, p_dim))
-                        };
-                        h_kl += &Self::xt_diag_x_dense_into(x_dense, &diag, &mut weighted_xtdx_kl);
-                        let h_inv_ref = h_inv.as_ref().expect("h_inv present in exact mode");
-                        Self::trace_product(h_inv_ref, &h_kl)
+                            // Linear logdet trace piece in exact mode:
+                            //   t2 = tr(H^{-1} H_{k,l}).
+                            let mut h_kl = if k == l {
+                                a_k_mats[k].clone()
+                            } else {
+                                Array2::<f64>::zeros((p_dim, p_dim))
+                            };
+                            h_kl += &Self::xt_diag_x_dense_into(x_dense, &diag, &mut weighted_xtdx_kl);
+                            let h_inv_ref = h_inv.as_ref().expect("h_inv present in exact mode");
+                            Self::trace_product(h_inv_ref, &h_kl)
+                        }
                     } else {
                         let mut t2_acc = 0.0_f64;
                         if let (Some(q), Some(uq), Some(xq), Some(xuq)) = (
@@ -3756,8 +4899,12 @@
                         }
                         t2_acc + res / (n_probe as f64)
                     };
+                    // L_{k,l} = 0.5 [ -t1 + t2 ]
                     let l_term = 0.5 * (-t1 + t2);
+                    // P_{k,l} = -0.5 * d²/drho_k drho_l log|S|_+.
                     let p_term = -0.5 * d2logs[[k, l]];
+                    // Final exact dense transformed Hessian entry:
+                    //   V_{k,l} = Q_{k,l} + L_{k,l} + P_{k,l}.
                     let val = q + l_term + p_term;
                     hess[[k, l]] = val;
                     hess[[l, k]] = val;
