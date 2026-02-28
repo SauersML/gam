@@ -2354,30 +2354,75 @@ fn build_survival_time_basis(
                 BasisOptions::i_spline(),
             )
             .map_err(|e| format!("failed to build ispline exit basis: {e}"))?;
-            let (m_exit_arc, _) = create_basis::<Dense>(
+            let (db_exit_arc, _) = create_basis::<Dense>(
                 log_exit.view(),
                 KnotSource::Provided(knot_vec.view()),
-                degree,
-                BasisOptions::m_spline(),
+                bspline_degree,
+                BasisOptions::first_derivative(),
             )
-            .map_err(|e| format!("failed to build mspline derivative basis: {e}"))?;
+            .map_err(|e| format!("failed to build ispline derivative basis: {e}"))?;
 
-            let x_entry_time = entry_arc.as_ref().clone();
-            let x_exit_time = exit_arc.as_ref().clone();
-            let m_exit = m_exit_arc.as_ref();
-            let p_time = x_exit_time.ncols();
-            if m_exit.ncols() < p_time {
+            let x_entry_time_full = entry_arc.as_ref();
+            let x_exit_time_full = exit_arc.as_ref();
+            let db_exit = db_exit_arc.as_ref();
+            let p_time_full = x_exit_time_full.ncols();
+            if p_time_full == 0 {
+                return Err("internal error: empty ispline time basis".to_string());
+            }
+            if db_exit.ncols() < p_time_full {
                 return Err(
-                    "internal error: m-spline derivative basis has fewer columns than i-spline basis"
+                    "internal error: ispline derivative basis has fewer columns than basis"
                         .to_string(),
                 );
             }
+
+            // Structural monotonicity should only exponentiate shape-varying time
+            // columns. Drop any constant columns from the I-spline block (for
+            // anchored I-splines this includes the leading intercept-like column).
+            let constant_tol = 1e-12_f64;
+            let mut keep_cols: Vec<usize> = Vec::new();
+            for j in 0..p_time_full {
+                let mut min_v = f64::INFINITY;
+                let mut max_v = f64::NEG_INFINITY;
+                for i in 0..n {
+                    let ve = x_exit_time_full[[i, j]];
+                    let vs = x_entry_time_full[[i, j]];
+                    min_v = min_v.min(ve.min(vs));
+                    max_v = max_v.max(ve.max(vs));
+                }
+                if (max_v - min_v) > constant_tol {
+                    keep_cols.push(j);
+                }
+            }
+            if keep_cols.is_empty() {
+                return Err(
+                    "internal error: ispline basis has no shape-varying time columns".to_string(),
+                );
+            }
+
+            let p_time = keep_cols.len();
+            let mut x_entry_time = Array2::<f64>::zeros((n, p_time));
+            let mut x_exit_time = Array2::<f64>::zeros((n, p_time));
+            for i in 0..n {
+                for (j_new, &j_old) in keep_cols.iter().enumerate() {
+                    x_entry_time[[i, j_new]] = x_entry_time_full[[i, j_old]];
+                    x_exit_time[[i, j_new]] = x_exit_time_full[[i, j_old]];
+                }
+            }
+
+            // For I_j(log t) = sum_{m=j..} B_m(log t), derivative in log-time is
+            // dI_j/dlogt = sum_{m=j..} dB_m/dlogt. Then apply dlogt/dt = 1/t.
             let mut x_derivative_time = Array2::<f64>::zeros((n, p_time));
             for i in 0..n {
-                // eta(log t); d eta / dt = (d eta / d log t) * (1 / t)
+                let mut running = 0.0_f64;
+                let mut d_i_log = vec![0.0_f64; p_time_full];
+                for j in (0..p_time_full).rev() {
+                    running += db_exit[[i, j]];
+                    d_i_log[j] = running;
+                }
                 let chain = 1.0 / age_exit[i].max(1e-9);
-                for j in 0..p_time {
-                    x_derivative_time[[i, j]] = m_exit[[i, j]] * chain;
+                for (j_new, &j_old) in keep_cols.iter().enumerate() {
+                    x_derivative_time[[i, j_new]] = d_i_log[j_old] * chain;
                 }
             }
 
@@ -2395,15 +2440,28 @@ fn build_survival_time_basis(
                 },
             )
             .map_err(|e| format!("failed to build ispline smoothing penalty: {e}"))?;
-            if penalty_basis.design.ncols() != p_time {
+            if penalty_basis.design.ncols() != p_time_full {
                 return Err("internal error: ispline penalty dimension mismatch".to_string());
+            }
+            let mut penalties = Vec::<Array2<f64>>::new();
+            for s in &penalty_basis.penalties {
+                if s.nrows() != p_time_full || s.ncols() != p_time_full {
+                    continue;
+                }
+                let mut trimmed = Array2::<f64>::zeros((p_time, p_time));
+                for (ri, &r_old) in keep_cols.iter().enumerate() {
+                    for (ci, &c_old) in keep_cols.iter().enumerate() {
+                        trimmed[[ri, ci]] = s[[r_old, c_old]];
+                    }
+                }
+                penalties.push(trimmed);
             }
 
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time,
                 x_exit_time,
                 x_derivative_time,
-                penalties: penalty_basis.penalties,
+                penalties,
                 basis_name: "ispline".to_string(),
                 degree: Some(degree),
                 knots: Some(knot_vec.to_vec()),
@@ -3348,6 +3406,9 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
                 x_derivative: x_derivative.view(),
+                eta_offset_entry: Some(eta_offset_entry.view()),
+                eta_offset_exit: Some(eta_offset_exit.view()),
+                derivative_offset_exit: Some(derivative_offset_exit.view()),
             },
             penalties,
             monotonicity,
@@ -5603,7 +5664,7 @@ mod tests {
     }
 
     #[test]
-    fn ispline_time_basis_derivative_uses_mspline_chain_rule() {
+    fn ispline_time_basis_derivative_uses_cumulative_bspline_chain_rule() {
         let age_entry = Array1::from_vec(vec![1.0, 1.5, 2.0, 2.5]);
         let age_exit = Array1::from_vec(vec![1.2, 1.9, 2.8, 3.1]);
         let knots = Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.8, 1.2, 1.6, 1.6, 1.6, 1.6]);
@@ -5621,22 +5682,92 @@ mod tests {
         .expect("build ispline time basis");
 
         let log_exit = age_exit.mapv(|t| t.max(1e-9).ln());
-        let (m_exit, _) = create_basis::<Dense>(
+        let bspline_degree = degree + 1;
+        let (db_exit, _) = create_basis::<Dense>(
+            log_exit.view(),
+            KnotSource::Provided(knots.view()),
+            bspline_degree,
+            BasisOptions::first_derivative(),
+        )
+        .expect("build bspline derivative for derivative check");
+        let db_exit = db_exit.as_ref();
+        let p_time = built.x_exit_time.ncols();
+        let log_entry = age_entry.mapv(|t| t.max(1e-9).ln());
+        let (entry_full, _) = create_basis::<Dense>(
+            log_entry.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::i_spline(),
+        )
+        .expect("build ispline entry basis for keep-cols");
+        let (exit_full, _) = create_basis::<Dense>(
             log_exit.view(),
             KnotSource::Provided(knots.view()),
             degree,
-            BasisOptions::m_spline(),
+            BasisOptions::i_spline(),
         )
-        .expect("build mspline for derivative check");
-        let m_exit = m_exit.as_ref();
-        let p_time = built.x_exit_time.ncols();
-        assert!(m_exit.ncols() >= p_time);
+        .expect("build ispline exit basis for keep-cols");
+        let entry_full = entry_full.as_ref();
+        let exit_full = exit_full.as_ref();
+
+        let mut keep_cols: Vec<usize> = Vec::new();
+        for j in 0..exit_full.ncols() {
+            let mut min_v = f64::INFINITY;
+            let mut max_v = f64::NEG_INFINITY;
+            for i in 0..entry_full.nrows() {
+                let ve = exit_full[[i, j]];
+                let vs = entry_full[[i, j]];
+                min_v = min_v.min(ve.min(vs));
+                max_v = max_v.max(ve.max(vs));
+            }
+            if (max_v - min_v) > 1e-12 {
+                keep_cols.push(j);
+            }
+        }
+        assert_eq!(p_time, keep_cols.len());
         for i in 0..age_exit.len() {
+            let mut running = 0.0_f64;
+            let mut d_i = vec![0.0_f64; db_exit.ncols()];
+            for j in (0..db_exit.ncols()).rev() {
+                running += db_exit[[i, j]];
+                d_i[j] = running;
+            }
             let chain = 1.0 / age_exit[i].max(1e-9);
             for j in 0..p_time {
-                let expected = m_exit[[i, j]] * chain;
+                let expected = d_i[keep_cols[j]] * chain;
                 assert!((built.x_derivative_time[[i, j]] - expected).abs() <= 1e-12);
             }
+        }
+    }
+
+    #[test]
+    fn ispline_time_basis_drops_constant_columns_before_structural_block() {
+        let age_entry = Array1::from_vec(vec![1.0, 1.5, 2.0, 2.5]);
+        let age_exit = Array1::from_vec(vec![1.2, 1.9, 2.8, 3.1]);
+        let knots = Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.8, 1.2, 1.6, 1.6, 1.6, 1.6]);
+        let degree = 2usize;
+
+        let built = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree,
+                knots: knots.clone(),
+                smooth_lambda: 1e-2,
+            },
+            None,
+        )
+        .expect("build ispline time basis");
+
+        // Returned structural block must contain only shape-varying columns.
+        for j in 0..built.x_exit_time.ncols() {
+            let mut min_v = f64::INFINITY;
+            let mut max_v = f64::NEG_INFINITY;
+            for i in 0..built.x_exit_time.nrows() {
+                min_v = min_v.min(built.x_entry_time[[i, j]].min(built.x_exit_time[[i, j]]));
+                max_v = max_v.max(built.x_entry_time[[i, j]].max(built.x_exit_time[[i, j]]));
+            }
+            assert!(max_v - min_v > 1e-12);
         }
     }
 }

@@ -901,6 +901,9 @@ mod tests {
             x_entry.view(),
             x_exit.view(),
             x_derivative.view(),
+            None,
+            None,
+            None,
             penalties,
             monotonicity,
             SurvivalSpec::Net,
@@ -945,6 +948,9 @@ mod tests {
             x_entry.view(),
             x_exit.view(),
             x_derivative.view(),
+            None,
+            None,
+            None,
             PenaltyBlocks::new(Vec::new()),
             monotonicity,
             SurvivalSpec::Net,
@@ -966,6 +972,9 @@ mod tests {
             x_entry.view(),
             x_exit.view(),
             x_derivative.view(),
+            None,
+            None,
+            None,
             PenaltyBlocks::new(Vec::new()),
             monotonicity,
             SurvivalSpec::Net,
@@ -986,6 +995,83 @@ mod tests {
         );
         assert!(grad_struct[0].is_finite());
         assert!(grad_linear[0].is_finite());
+    }
+
+    #[test]
+    fn survival_hmc_fallback_barrier_uses_derivative_offset() {
+        let age_entry = array![1.0];
+        let age_exit = array![2.0];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[1.0, 0.0]];
+        let x_exit = array![[1.0, 0.0]];
+        // Zero derivative design so derivative_offset_exit drives d_eta/dt.
+        let x_derivative = array![[0.0, 0.0]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let monotonicity = MonotonicityPenalty {
+            lambda: 0.0,
+            tolerance: 3.0,
+        };
+        let mode = array![0.0, 0.0];
+        let hessian = Array2::<f64>::eye(2);
+        let z = array![0.0, 0.0];
+
+        let posterior_no_offset = super::survival_hmc::SurvivalPosterior::new(
+            age_entry.view(),
+            age_exit.view(),
+            event_target.view(),
+            event_competing.view(),
+            sample_weight.view(),
+            x_entry.view(),
+            x_exit.view(),
+            x_derivative.view(),
+            None,
+            None,
+            Some(array![0.0].view()),
+            penalties.clone(),
+            monotonicity.clone(),
+            SurvivalSpec::Net,
+            false,
+            0,
+            mode.view(),
+            hessian.view(),
+        )
+        .expect("construct posterior without derivative offset");
+        let mut grad_no_offset = Array1::<f64>::zeros(2);
+        let logp_no_offset =
+            HamiltonianTarget::logp_and_grad(&posterior_no_offset, &z, &mut grad_no_offset);
+
+        let posterior_with_offset = super::survival_hmc::SurvivalPosterior::new(
+            age_entry.view(),
+            age_exit.view(),
+            event_target.view(),
+            event_competing.view(),
+            sample_weight.view(),
+            x_entry.view(),
+            x_exit.view(),
+            x_derivative.view(),
+            None,
+            None,
+            Some(array![2.0].view()),
+            penalties,
+            monotonicity,
+            SurvivalSpec::Net,
+            false,
+            0,
+            mode.view(),
+            hessian.view(),
+        )
+        .expect("construct posterior with derivative offset");
+        let mut grad_with_offset = Array1::<f64>::zeros(2);
+        let logp_with_offset =
+            HamiltonianTarget::logp_and_grad(&posterior_with_offset, &z, &mut grad_with_offset);
+
+        assert!(logp_no_offset.is_finite() && logp_with_offset.is_finite());
+        assert!(grad_no_offset.iter().all(|v| v.is_finite()));
+        assert!(grad_with_offset.iter().all(|v| v.is_finite()));
+        // Larger derivative offset means a weaker surrogate barrier penalty.
+        assert!(logp_with_offset > logp_no_offset);
     }
 }
 
@@ -1604,6 +1690,9 @@ pub struct SurvivalFlatInputs<'a> {
     pub x_entry: ArrayView2<'a, f64>,
     pub x_exit: ArrayView2<'a, f64>,
     pub x_derivative: ArrayView2<'a, f64>,
+    pub eta_offset_entry: Option<ArrayView1<'a, f64>>,
+    pub eta_offset_exit: Option<ArrayView1<'a, f64>>,
+    pub derivative_offset_exit: Option<ArrayView1<'a, f64>>,
 }
 
 /// Flattened numeric inputs for Royston-Parmar NUTS sampling.
@@ -1686,6 +1775,9 @@ pub fn run_nuts_sampling_flattened_family(
                 survival.flat.x_entry,
                 survival.flat.x_exit,
                 survival.flat.x_derivative,
+                survival.flat.eta_offset_entry,
+                survival.flat.eta_offset_exit,
+                survival.flat.derivative_offset_exit,
                 survival.penalties,
                 survival.monotonicity,
                 survival.spec,
@@ -1726,6 +1818,10 @@ mod survival_hmc {
         x_exit: Arc<Array2<f64>>,
         /// Exit derivative design matrix
         x_derivative: Arc<Array2<f64>>,
+        /// Optional baseline offsets carried through the survival predictor.
+        offset_eta_entry: Arc<Array1<f64>>,
+        offset_eta_exit: Arc<Array1<f64>>,
+        offset_derivative_exit: Arc<Array1<f64>>,
         /// Sample weights
         sample_weight: Arc<Array1<f64>>,
         /// Event indicators (1 = event, 0 = censored)
@@ -1801,7 +1897,12 @@ mod survival_hmc {
                     jac[j] = w;
                 }
             }
-            let d_eta_dt = self.data.x_derivative.dot(&theta);
+            // Keep fallback feasibility aligned with the exact monotonicity
+            // guard in WorkingModelSurvival::update_state:
+            //   d_eta_dt = X_derivative * theta + derivative_offset_exit.
+            // The offset shifts the barrier value but has zero beta-derivative.
+            let d_eta_dt =
+                self.data.x_derivative.dot(&theta) + self.data.offset_derivative_exit.as_ref();
             let tol = self.data.monotonicity.tolerance.max(1e-12);
 
             // Barrier settings: smooth enough for HMC geometry, steep enough to
@@ -1851,6 +1952,9 @@ mod survival_hmc {
             x_entry: ArrayView2<'_, f64>,
             x_exit: ArrayView2<'_, f64>,
             x_derivative: ArrayView2<'_, f64>,
+            offset_eta_entry: Option<ArrayView1<'_, f64>>,
+            offset_eta_exit: Option<ArrayView1<'_, f64>>,
+            offset_derivative_exit: Option<ArrayView1<'_, f64>>,
             penalties: PenaltyBlocks,
             monotonicity: MonotonicityPenalty,
             spec: SurvivalSpec,
@@ -1860,6 +1964,16 @@ mod survival_hmc {
             hessian: ArrayView2<f64>,
         ) -> Result<Self, String> {
             let dim = mode.len();
+            let n = age_entry.len();
+            let off_eta_entry = offset_eta_entry
+                .map(|v| v.to_owned())
+                .unwrap_or_else(|| Array1::zeros(n));
+            let off_eta_exit = offset_eta_exit
+                .map(|v| v.to_owned())
+                .unwrap_or_else(|| Array1::zeros(n));
+            let off_deriv_exit = offset_derivative_exit
+                .map(|v| v.to_owned())
+                .unwrap_or_else(|| Array1::zeros(n));
 
             // Compute whitening transform via Cholesky of Hessian
             let hessian_owned = hessian.to_owned();
@@ -1874,6 +1988,9 @@ mod survival_hmc {
                 x_entry: Arc::new(x_entry.to_owned()),
                 x_exit: Arc::new(x_exit.to_owned()),
                 x_derivative: Arc::new(x_derivative.to_owned()),
+                offset_eta_entry: Arc::new(off_eta_entry),
+                offset_eta_exit: Arc::new(off_eta_exit),
+                offset_derivative_exit: Arc::new(off_deriv_exit),
                 sample_weight: Arc::new(sample_weight.to_owned()),
                 event_target: Arc::new(event_target.to_owned()),
                 event_competing: Arc::new(event_competing.to_owned()),
@@ -1896,7 +2013,7 @@ mod survival_hmc {
             let beta = self.data.mode.as_ref() + &self.chol.dot(z);
 
             // Create a temporary working model to compute likelihood
-            let mut model = WorkingModelSurvival::from_engine_inputs(
+            let mut model = WorkingModelSurvival::from_engine_inputs_with_offsets(
                 SurvivalEngineInputs {
                     age_entry: self.data.age_entry.view(),
                     age_exit: self.data.age_exit.view(),
@@ -1907,6 +2024,11 @@ mod survival_hmc {
                     x_exit: self.data.x_exit.view(),
                     x_derivative: self.data.x_derivative.view(),
                 },
+                Some(crate::survival::SurvivalBaselineOffsets {
+                    eta_entry: self.data.offset_eta_entry.view(),
+                    eta_exit: self.data.offset_eta_exit.view(),
+                    derivative_exit: self.data.offset_derivative_exit.view(),
+                }),
                 self.data.penalties.as_ref().clone(),
                 self.data.monotonicity.as_ref().clone(),
                 self.data.spec,
@@ -1987,6 +2109,9 @@ mod survival_hmc {
         x_entry: ArrayView2<'_, f64>,
         x_exit: ArrayView2<'_, f64>,
         x_derivative: ArrayView2<'_, f64>,
+        eta_offset_entry: Option<ArrayView1<'_, f64>>,
+        eta_offset_exit: Option<ArrayView1<'_, f64>>,
+        derivative_offset_exit: Option<ArrayView1<'_, f64>>,
         penalties: PenaltyBlocks,
         monotonicity: MonotonicityPenalty,
         spec: SurvivalSpec,
@@ -2008,6 +2133,9 @@ mod survival_hmc {
             x_entry,
             x_exit,
             x_derivative,
+            eta_offset_entry,
+            eta_offset_exit,
+            derivative_offset_exit,
             penalties,
             monotonicity,
             spec,
