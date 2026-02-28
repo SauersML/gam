@@ -48,6 +48,7 @@ reqwest = { version = "0.12.8", features = ["blocking", "rustls-tls"] }
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 logtest = "2"
 serial_test = "3.2.0"
+statrs = "0.18.0"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
