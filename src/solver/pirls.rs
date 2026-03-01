@@ -4113,9 +4113,8 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
         //   = E[sigmoid(eta + eps) * (1 - sigmoid(eta + eps))].
         // The dispatcher below is responsible for picking the best available
         // evaluation strategy while preserving this contract.
-        let integrated = crate::quadrature::integrated_inverse_link_mean_and_derivative(
-            quad_ctx, link, e, se_i,
-        );
+        let integrated =
+            crate::quadrature::integrated_inverse_link_mean_and_derivative(quad_ctx, link, e, se_i);
         let mu_i = integrated.mean;
         let dmu_deta = integrated.dmean_dmu;
         let mu_clamped = mu_i.clamp(PROB_EPS, 1.0 - PROB_EPS);

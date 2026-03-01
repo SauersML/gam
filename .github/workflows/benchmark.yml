@@ -19,7 +19,10 @@ jobs:
     name: Prepare benchmark matrix
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+      parallel_matrix: ${{ steps.matrix.outputs.parallel_matrix }}
+      parallel_count: ${{ steps.matrix.outputs.parallel_count }}
+      serial_matrix: ${{ steps.matrix.outputs.serial_matrix }}
+      serial_count: ${{ steps.matrix.outputs.serial_count }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,6 +41,11 @@ jobs:
           import os
           import re
           from pathlib import Path
+
+          SERIAL_SCENARIOS = {
+              "icu_survival_death",
+              "cirrhosis_survival",
+          }
 
           def choose_single_knot(variants):
               # Prefer k12 when present for comparability across families.
@@ -79,17 +87,26 @@ jobs:
           include = [{"scenario": name} for name in selected]
           if not include:
               raise SystemExit("No benchmark scenarios found in bench/scenarios.json")
-          matrix = {"include": include}
+          serial_include = [row for row in include if row["scenario"] in SERIAL_SCENARIOS]
+          parallel_include = [row for row in include if row["scenario"] not in SERIAL_SCENARIOS]
+          parallel_matrix = {"include": parallel_include}
+          serial_matrix = {"include": serial_include}
           out = Path(os.environ["GITHUB_OUTPUT"])
           with out.open("a", encoding="utf-8") as fh:
-              fh.write(f"matrix={json.dumps(matrix)}\n")
+              fh.write(f"parallel_matrix={json.dumps(parallel_matrix)}\n")
+              fh.write(f"parallel_count={len(parallel_include)}\n")
+              fh.write(f"serial_matrix={json.dumps(serial_matrix)}\n")
+              fh.write(f"serial_count={len(serial_include)}\n")
           print(
               json.dumps(
                   {
                       "event": event_name,
                       "nightly_full_matrix": is_nightly,
                       "scenario_count": len(selected),
-                      "matrix": matrix,
+                      "parallel_count": len(parallel_include),
+                      "serial_count": len(serial_include),
+                      "parallel_matrix": parallel_matrix,
+                      "serial_matrix": serial_matrix,
                   }
               )
           )
@@ -134,12 +151,14 @@ jobs:
     needs:
       - prepare
       - bootstrap-runtime
+    if: ${{ needs.prepare.outputs.parallel_count != '0' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       max-parallel: 8
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.parallel_matrix) }}
     env:
+      BENCH_CI_PROFILE: ${{ github.event_name == 'schedule' && 'full' || 'lean' }}
       OMP_NUM_THREADS: "1"
       OPENBLAS_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
@@ -177,6 +196,109 @@ jobs:
           echo "Rscript: $(command -v Rscript)"
           Rscript --version
           echo "BENCH_GAM_BIN=${BENCH_GAM_BIN}"
+          echo "BENCH_CI_PROFILE=${BENCH_CI_PROFILE}"
+          echo "PYTHONPATH=${PYTHONPATH}"
+          echo "R_LIBS_USER=${R_LIBS_USER}"
+          echo "bench/runtime tree:"
+          ls -la bench/runtime || true
+          ls -la bench/runtime/pydeps | sed -n '1,40p' || true
+          ls -la bench/runtime/r-lib | sed -n '1,40p' || true
+          echo "gam binary before chmod:"
+          ls -l "${BENCH_GAM_BIN}" || true
+          file "${BENCH_GAM_BIN}" || true
+          chmod +x "${BENCH_GAM_BIN}" || true
+          echo "gam binary after chmod:"
+          ls -l "${BENCH_GAM_BIN}" || true
+          file "${BENCH_GAM_BIN}" || true
+          test -x "${BENCH_GAM_BIN}"
+          echo "smoke-import python deps"
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          import numpy, pandas, lifelines, sksurv, xgboost
+
+          scenario_name = "${{ matrix.scenario }}"
+          mod_path = Path("bench/run_suite.py").resolve()
+          spec = importlib.util.spec_from_file_location("run_suite_mod", mod_path)
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          needs_pygam = bool(mod._should_run_pygam_for_scenario({"name": scenario_name}))
+          if needs_pygam:
+            import pygam  # noqa: F401
+            print(f"python deps ok (scenario={scenario_name}, pygam=required)")
+          else:
+            print(f"python deps ok (scenario={scenario_name}, pygam=not-required)")
+          PY
+          echo "smoke-load R deps"
+          Rscript -e 'library(mgcv); library(jsonlite); library(survival); library(glmnet); library(gamlss); library(gamlss.dist); library(gamboostLSS); library(mboost); library(bamlss); library(brms); cat("R deps ok\n")'
+          mkdir -p bench/results-shards
+          echo "running benchmark shard..."
+          python3 bench/run_suite.py \
+            --scenarios bench/scenarios.json \
+            --scenario-name "${{ matrix.scenario }}" \
+            --out "bench/results-shards/${{ matrix.scenario }}.json"
+          echo "shard output:"
+          ls -l "bench/results-shards/${{ matrix.scenario }}.json"
+
+      - name: Upload shard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.scenario }}
+          path: bench/results-shards/${{ matrix.scenario }}.json
+          if-no-files-found: error
+
+  bench-shard-serial:
+    name: Bench ${{ matrix.scenario }} (serial)
+    needs:
+      - prepare
+      - bootstrap-runtime
+    if: ${{ needs.prepare.outputs.serial_count != '0' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.prepare.outputs.serial_matrix) }}
+    env:
+      BENCH_CI_PROFILE: ${{ github.event_name == 'schedule' && 'full' || 'lean' }}
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+
+      - name: Download shared runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-runtime
+          path: bench/runtime
+
+      - name: Run scenario shard
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/bench/runtime/pydeps
+          R_LIBS_USER: ${{ github.workspace }}/bench/runtime/r-lib
+          BENCH_GAM_BIN: ${{ github.workspace }}/bench/runtime/gam
+        run: |
+          set -euo pipefail
+          echo "== Benchmark shard diagnostics =="
+          echo "pwd: $(pwd)"
+          echo "scenario: ${{ matrix.scenario }}"
+          echo "python: $(command -v python3)"
+          python3 --version
+          echo "Rscript: $(command -v Rscript)"
+          Rscript --version
+          echo "BENCH_GAM_BIN=${BENCH_GAM_BIN}"
+          echo "BENCH_CI_PROFILE=${BENCH_CI_PROFILE}"
           echo "PYTHONPATH=${PYTHONPATH}"
           echo "R_LIBS_USER=${R_LIBS_USER}"
           echo "bench/runtime tree:"
@@ -230,7 +352,9 @@ jobs:
 
   aggregate:
     name: Aggregate benchmark results
-    needs: bench-shard
+    needs:
+      - bench-shard
+      - bench-shard-serial
     runs-on: ubuntu-latest
     steps:
       - name: Set up Python

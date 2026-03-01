@@ -1229,7 +1229,10 @@ fn cloglog_survival_pair_controlled(
     ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
-) -> ((f64, IntegratedExpectationMode), (f64, IntegratedExpectationMode)) {
+) -> (
+    (f64, IntegratedExpectationMode),
+    (f64, IntegratedExpectationMode),
+) {
     let shifted_mu = mu + sigma * sigma;
 
     // For the exact/control branches it is numerically cleaner if the mean
@@ -1249,7 +1252,10 @@ fn cloglog_survival_pair_controlled(
         )
     {
         return (
-            (base.clamp(0.0, 1.0), IntegratedExpectationMode::ExactSpecialFunction),
+            (
+                base.clamp(0.0, 1.0),
+                IntegratedExpectationMode::ExactSpecialFunction,
+            ),
             (
                 shifted.clamp(0.0, 1.0),
                 IntegratedExpectationMode::ExactSpecialFunction,
@@ -1265,7 +1271,10 @@ fn cloglog_survival_pair_controlled(
         )
     {
         return (
-            (base.clamp(0.0, 1.0), IntegratedExpectationMode::ExactSpecialFunction),
+            (
+                base.clamp(0.0, 1.0),
+                IntegratedExpectationMode::ExactSpecialFunction,
+            ),
             (
                 shifted.clamp(0.0, 1.0),
                 IntegratedExpectationMode::ExactSpecialFunction,
@@ -1278,7 +1287,10 @@ fn cloglog_survival_pair_controlled(
         cloglog_survival_gamma_reference(shifted_mu, sigma),
     ) {
         return (
-            (base.clamp(0.0, 1.0), IntegratedExpectationMode::ExactSpecialFunction),
+            (
+                base.clamp(0.0, 1.0),
+                IntegratedExpectationMode::ExactSpecialFunction,
+            ),
             (
                 shifted.clamp(0.0, 1.0),
                 IntegratedExpectationMode::ExactSpecialFunction,

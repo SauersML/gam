@@ -119,6 +119,29 @@ pub trait CustomFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(None)
     }
+
+    /// Optional exact joint coefficient-space Hessian across all blocks.
+    ///
+    /// Returns the unpenalized matrix `H = -∇² log L` in the flattened block order.
+    fn exact_newton_joint_hessian(
+        &self,
+        _block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
+
+    /// Optional exact directional derivative of the joint coefficient-space Hessian.
+    ///
+    /// Returns `Some(dH)` where `dH` is the directional derivative of the
+    /// unpenalized joint Hessian `H = -∇² log L` along the flattened
+    /// coefficient-space direction `d_beta_flat`.
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -952,6 +975,44 @@ fn blockwise_logdet_terms<F: CustomFamily>(
     options: &BlockwiseFitOptions,
 ) -> Result<(f64, f64), String> {
     refresh_all_block_etas(family, specs, states)?;
+    if let Some(h_joint) = family.exact_newton_joint_hessian(states)? {
+        let ranges = block_param_ranges(specs);
+        let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+        if h_joint.nrows() != total || h_joint.ncols() != total {
+            return Err(format!(
+                "joint exact-newton Hessian shape mismatch in logdet terms: got {}x{}, expected {}x{}",
+                h_joint.nrows(),
+                h_joint.ncols(),
+                total,
+                total
+            ));
+        }
+        let mut s_joint = Array2::<f64>::zeros((total, total));
+        let mut logdet_s_total = 0.0;
+        for (b, spec) in specs.iter().enumerate() {
+            let (start, end) = ranges[b];
+            let p = end - start;
+            let lambdas = block_log_lambdas[b].mapv(f64::exp);
+            let mut s_lambda = Array2::<f64>::zeros((p, p));
+            for (k, s) in spec.penalties.iter().enumerate() {
+                s_lambda.scaled_add(lambdas[k], s);
+            }
+            s_joint
+                .slice_mut(ndarray::s![start..end, start..end])
+                .assign(&s_lambda);
+            logdet_s_total += stable_logdet_with_ridge_policy(
+                &s_lambda,
+                options.ridge_floor,
+                options.ridge_policy,
+            )?;
+        }
+        let mut h = h_joint;
+        h += &s_joint;
+        let logdet_h_total =
+            stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?;
+        return Ok((logdet_h_total, logdet_s_total));
+    }
+
     let eval = family.evaluate(states)?;
     if eval.block_working_sets.len() != specs.len() {
         return Err(format!(
@@ -1324,6 +1385,127 @@ fn outer_objective_and_gradient<F: CustomFamily>(
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let eval = family.evaluate(&inner.block_states)?;
+    if let Some(h_joint_unpen) = family.exact_newton_joint_hessian(&inner.block_states)? {
+        let ranges = block_param_ranges(specs);
+        let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+        if h_joint_unpen.nrows() != total || h_joint_unpen.ncols() != total {
+            return Err(format!(
+                "joint exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
+                h_joint_unpen.nrows(),
+                h_joint_unpen.ncols(),
+                total,
+                total
+            ));
+        }
+        let beta_flat = flatten_state_betas(&inner.block_states, specs);
+        let mut s_joint = Array2::<f64>::zeros((total, total));
+        let mut s_pinv_joint = if options.use_reml_objective {
+            Some(Array2::<f64>::zeros((total, total)))
+        } else {
+            None
+        };
+        for (b, spec) in specs.iter().enumerate() {
+            let (start, end) = ranges[b];
+            let p = end - start;
+            let lambdas = per_block[b].mapv(f64::exp);
+            let mut s_lambda = Array2::<f64>::zeros((p, p));
+            for (k, s) in spec.penalties.iter().enumerate() {
+                s_lambda.scaled_add(lambdas[k], s);
+            }
+            s_joint
+                .slice_mut(ndarray::s![start..end, start..end])
+                .assign(&s_lambda);
+            if let Some(s_pinv) = s_pinv_joint.as_mut() {
+                let s_part = pinv_positive_part(
+                    &s_lambda,
+                    if options.ridge_policy.include_penalty_logdet {
+                        effective_solver_ridge(options.ridge_floor)
+                    } else {
+                        options.ridge_floor
+                    },
+                )?;
+                s_pinv
+                    .slice_mut(ndarray::s![start..end, start..end])
+                    .assign(&s_part);
+            }
+        }
+        let mut h_for_logdet = h_joint_unpen.clone();
+        h_for_logdet += &s_joint;
+        if options.ridge_policy.include_penalty_logdet {
+            let ridge = effective_solver_ridge(options.ridge_floor);
+            for d in 0..total {
+                h_for_logdet[[d, d]] += ridge;
+            }
+        }
+        let h_inv = inverse_spd_with_retry(
+            &h_for_logdet,
+            effective_solver_ridge(options.ridge_floor),
+            8,
+        )?;
+        let mut at = 0usize;
+        for b in 0..specs.len() {
+            let spec = &specs[b];
+            let (start, end) = ranges[b];
+            let beta_block = beta_flat.slice(ndarray::s![start..end]).to_owned();
+            let lambdas = per_block[b].mapv(f64::exp);
+            for (k, s_k) in spec.penalties.iter().enumerate() {
+                let mut a_k = Array2::<f64>::zeros((total, total));
+                let local = s_k.mapv(|v| lambdas[k] * v);
+                a_k.slice_mut(ndarray::s![start..end, start..end])
+                    .assign(&local);
+                let a_k_beta = a_k.dot(&beta_flat);
+                let g_pen = 0.5 * beta_block.dot(&local.dot(&beta_block));
+                let g = if options.use_reml_objective {
+                    let g_logh = 0.5 * trace_product(&h_inv, &a_k);
+                    let g_logs = 0.5
+                        * trace_product(
+                            s_pinv_joint
+                                .as_ref()
+                                .ok_or_else(|| "missing joint S^+ for REML gradient".to_string())?,
+                            &a_k,
+                        );
+                    let u_k = -h_inv.dot(&a_k_beta);
+                    let u_norm = u_k.dot(&u_k).sqrt();
+                    let g_hbeta = if u_norm <= 1e-14 {
+                        0.0
+                    } else if let Some(h_rho) = family
+                        .exact_newton_joint_hessian_directional_derivative(
+                            &inner.block_states,
+                            &u_k,
+                        )?
+                    {
+                        if h_rho.nrows() != total || h_rho.ncols() != total {
+                            return Err(format!(
+                                "joint exact-newton dH shape mismatch: got {}x{}, expected {}x{}",
+                                h_rho.nrows(),
+                                h_rho.ncols(),
+                                total,
+                                total
+                            ));
+                        }
+                        0.5 * trace_product(&h_inv, &h_rho)
+                    } else {
+                        0.0
+                    };
+                    g_pen + g_logh + g_hbeta - g_logs
+                } else {
+                    g_pen
+                };
+                grad[at + k] = g;
+            }
+            at += spec.penalties.len();
+        }
+        let warm = ConstrainedWarmStart {
+            rho: rho.clone(),
+            block_beta: inner
+                .block_states
+                .iter()
+                .map(|st| st.beta.clone())
+                .collect(),
+            active_sets: inner.active_sets,
+        };
+        return Ok((objective, grad, warm));
+    }
     let mut at = 0usize;
     for b in 0..specs.len() {
         let spec = &specs[b];
@@ -1668,7 +1850,33 @@ fn compute_joint_covariance<F: CustomFamily>(
     per_block_log_lambdas: &[Array1<f64>],
     options: &BlockwiseFitOptions,
 ) -> Result<Array2<f64>, String> {
-    let mut h = compute_joint_hessian_from_objective(family, specs, states, per_block_log_lambdas)?;
+    let mut h = if let Some(h_exact) = family.exact_newton_joint_hessian(states)? {
+        let ranges = block_param_ranges(specs);
+        let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+        if h_exact.nrows() != total || h_exact.ncols() != total {
+            return Err(format!(
+                "joint exact-newton Hessian shape mismatch in covariance: got {}x{}, expected {}x{}",
+                h_exact.nrows(),
+                h_exact.ncols(),
+                total,
+                total
+            ));
+        }
+        let mut h = h_exact;
+        for (b, spec) in specs.iter().enumerate() {
+            let (start, end) = ranges[b];
+            let lambdas = per_block_log_lambdas[b].mapv(f64::exp);
+            let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
+            for (k, s) in spec.penalties.iter().enumerate() {
+                s_lambda.scaled_add(lambdas[k], s);
+            }
+            h.slice_mut(ndarray::s![start..end, start..end])
+                .scaled_add(1.0, &s_lambda);
+        }
+        h
+    } else {
+        compute_joint_hessian_from_objective(family, specs, states, per_block_log_lambdas)?
+    };
     let p_total = h.nrows();
     for i in 0..p_total {
         for j in 0..i {
@@ -1775,8 +1983,9 @@ pub fn fit_custom_family<F: CustomFamily>(
             }
             Ok((_obj, _grad, _warm)) => {
                 if let Ok(mut guard) = last_outer_error.lock() {
-                    *guard =
-                        Some("custom-family outer objective/gradient became non-finite".to_string());
+                    *guard = Some(
+                        "custom-family outer objective/gradient became non-finite".to_string(),
+                    );
                 }
                 invalid_outer_bfgs_sample(x)
             }
@@ -1874,9 +2083,10 @@ pub fn fit_custom_family<F: CustomFamily>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::families::gamlss::BinomialLocationScaleProbitWiggleFamily;
     use crate::matrix::DesignMatrix;
     use faer::sparse::{SparseColMat, Triplet};
-    use ndarray::{Array1, array};
+    use ndarray::{Array1, Array2, array};
 
     #[derive(Clone)]
     struct OneBlockIdentityFamily;
@@ -1962,6 +2172,51 @@ mod tests {
                 a: array![[1.0]],
                 b: array![self.lower],
             }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PreferJointExactFamily;
+
+    impl CustomFamily for PreferJointExactFamily {
+        fn evaluate(
+            &self,
+            _block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                block_working_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient: array![0.0],
+                    hessian: array![[2.0]],
+                }],
+            })
+        }
+
+        fn exact_newton_hessian_directional_derivative(
+            &self,
+            _block_states: &[ParameterBlockState],
+            _block_idx: usize,
+            _d_beta: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            Err(
+                "blockwise exact-newton path should not be used when joint path is available"
+                    .to_string(),
+            )
+        }
+
+        fn exact_newton_joint_hessian(
+            &self,
+            _block_states: &[ParameterBlockState],
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(array![[2.0]]))
+        }
+
+        fn exact_newton_joint_hessian_directional_derivative(
+            &self,
+            _block_states: &[ParameterBlockState],
+            _d_beta_flat: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(array![[0.0]]))
         }
     }
 
@@ -2119,6 +2374,146 @@ mod tests {
             g_fd,
             rel
         );
+    }
+
+    #[test]
+    fn outer_gradient_prefers_joint_exact_path_when_available() {
+        let spec = ParameterBlockSpec {
+            name: "joint_exact".to_string(),
+            design: DesignMatrix::Dense(array![[1.0]]),
+            offset: array![0.0],
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.0]),
+        };
+        let options = BlockwiseFitOptions {
+            use_reml_objective: true,
+            ridge_floor: 1e-10,
+            ..BlockwiseFitOptions::default()
+        };
+        let penalty_counts = vec![1usize];
+        let rho = array![0.0];
+
+        let result = outer_objective_and_gradient(
+            &PreferJointExactFamily,
+            std::slice::from_ref(&spec),
+            &options,
+            &penalty_counts,
+            &rho,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "joint exact path should be preferred over blockwise fallback: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn outer_laml_gradient_matches_finite_difference_when_joint_exact_path_is_active() {
+        let n = 7usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold_design = DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0));
+        let log_sigma_design = DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0));
+        let threshold_spec = ParameterBlockSpec {
+            name: "threshold".to_string(),
+            design: threshold_design.clone(),
+            offset: Array1::zeros(n),
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.2]),
+        };
+        let log_sigma_spec = ParameterBlockSpec {
+            name: "log_sigma".to_string(),
+            design: log_sigma_design.clone(),
+            offset: Array1::zeros(n),
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![-0.2],
+            initial_beta: Some(array![-0.1]),
+        };
+        let q_seed = Array1::linspace(-1.4, 1.4, n);
+        let knots = crate::families::gamlss::initialize_wiggle_knots_from_seed(q_seed.view(), 3, 4)
+            .expect("knots");
+        let wiggle_block = crate::families::gamlss::build_wiggle_block_input_from_knots(
+            q_seed.view(),
+            &knots,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let wiggle_spec = ParameterBlockSpec {
+            name: "wiggle".to_string(),
+            design: wiggle_block.design.clone(),
+            offset: wiggle_block.offset.clone(),
+            penalties: wiggle_block.penalties.clone(),
+            initial_log_lambdas: array![0.1],
+            initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
+        };
+
+        let family = BinomialLocationScaleProbitWiggleFamily {
+            y,
+            weights,
+            sigma_min: 0.05,
+            sigma_max: 4.0,
+            threshold_design: Some(threshold_design),
+            log_sigma_design: Some(log_sigma_design),
+            wiggle_knots: knots,
+            wiggle_degree: 3,
+        };
+
+        let specs = vec![threshold_spec, log_sigma_spec, wiggle_spec];
+        let penalty_counts = vec![1usize, 1usize, 1usize];
+        let rho = array![0.05, -0.15, 0.1];
+        let options = BlockwiseFitOptions {
+            use_reml_objective: true,
+            ridge_floor: 1e-10,
+            outer_max_iter: 1,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let (f0, g0, _) =
+            outer_objective_and_gradient(&family, &specs, &options, &penalty_counts, &rho, None)
+                .expect("objective/gradient");
+        assert!(f0.is_finite());
+        assert_eq!(g0.len(), rho.len());
+
+        let h = 1e-5;
+        for k in 0..rho.len() {
+            let mut rho_p = rho.clone();
+            let mut rho_m = rho.clone();
+            rho_p[k] += h;
+            rho_m[k] -= h;
+            let (fp, _, _) = outer_objective_and_gradient(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho_p,
+                None,
+            )
+            .expect("objective+");
+            let (fm, _, _) = outer_objective_and_gradient(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho_m,
+                None,
+            )
+            .expect("objective-");
+            let g_fd = (fp - fm) / (2.0 * h);
+            let rel = (g0[k] - g_fd).abs() / g_fd.abs().max(1e-8);
+            assert!(
+                rel < 2e-2,
+                "outer LAML gradient mismatch at {}: analytic={} fd={} rel={}",
+                k,
+                g0[k],
+                g_fd,
+                rel
+            );
+        }
     }
 
     #[test]

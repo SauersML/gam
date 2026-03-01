@@ -204,7 +204,9 @@ where
 
     let rho = solution.final_point.clone();
     let mut grad_rho = match &last_eval {
-        Some((rho_cached, _cost_cached, grad_cached)) if approx_same_rho_point(&rho, rho_cached) => {
+        Some((rho_cached, _cost_cached, grad_cached))
+            if approx_same_rho_point(&rho, rho_cached) =>
+        {
             grad_cached.clone()
         }
         _ => match eval_cost_grad_rho(context, &rho) {
@@ -248,8 +250,7 @@ where
     let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
     let mut best_grad_norm = f64::INFINITY;
     for (_seed_idx, rho_seed) in screened_seeds.iter() {
-        let Some(candidate) =
-            run_single_seed_bfgs(context, rho_seed, eval_cost_grad_rho, options)
+        let Some(candidate) = run_single_seed_bfgs(context, rho_seed, eval_cost_grad_rho, options)
         else {
             continue;
         };
@@ -334,6 +335,22 @@ where
 /// - multi-start seed handling and stationarity ranking remain identical to the
 ///   FD-based optimizer, so behavior is comparable while much faster when exact
 ///   gradients are available.
+///
+/// Mathematical contract for callers:
+/// - `rho_j = log(lambda_j)` for each smoothing parameter.
+/// - The callback returns the scalar outer objective `V(rho)` and its exact
+///   gradient `g(rho) = dV/drho`.
+/// - BFGS then builds its own quasi-Newton inverse-Hessian approximation from
+///   successive `(rho, g)` pairs; it does not need the caller's exact Hessian.
+///
+/// In particular, when the outer objective is
+///   V(rho) = Phi(beta_hat(rho), rho)
+///          + 0.5 log|H(rho)|
+///          - 0.5 log|S(rho)|_+ ,
+/// with `beta_hat(rho)` defined by the inner stationarity equations, the caller
+/// should already have used the envelope theorem to eliminate explicit
+/// `d beta_hat / d rho` terms from the objective derivative and return the final
+/// exact `dV/drho` here.
 pub fn optimize_log_smoothing_with_multistart_with_gradient<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
@@ -370,6 +387,10 @@ where
 ///
 /// The current outer driver is gradient-only BFGS, so the Hessian output is
 /// accepted for API compatibility but not consumed by the optimizer.
+///
+/// This entry point exists so callers with a richer objective API do not need an
+/// adapter layer at the call site. It should not be used as a reason to evaluate
+/// expensive exact Hessians unless a future outer optimizer actually consumes them.
 pub fn optimize_log_smoothing_with_multistart_with_gradient_and_hessian<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,

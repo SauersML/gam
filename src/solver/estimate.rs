@@ -20,8 +20,8 @@
 //! This two-tiered structure allows the model to learn the appropriate complexity for
 //! each smooth term directly from the data.
 
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use self::reml::RemlState;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::Cell;
 use std::fmt;
 use std::time::Instant;
@@ -32,11 +32,11 @@ use crate::construction::{
     create_balanced_penalty_root, precompute_reparam_invariant,
 };
 use crate::inference::predict::se_from_covariance;
+use crate::linalg::utils::{KahanSum, RidgePlanner, add_ridge, matrix_inverse_with_regularization};
 use crate::matrix::DesignMatrix;
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{Coefficients, LinkFunction, LogSmoothingParamsView, RidgePassport};
-use crate::linalg::utils::{KahanSum, RidgePlanner, add_ridge, matrix_inverse_with_regularization};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
@@ -118,11 +118,7 @@ struct RemlConfig {
 }
 
 impl RemlConfig {
-    fn external(
-        link_function: LinkFunction,
-        reml_tol: f64,
-        firth_bias_reduction: bool,
-    ) -> Self {
+    fn external(link_function: LinkFunction, reml_tol: f64, firth_bias_reduction: bool) -> Self {
         Self {
             link_function,
             convergence_tolerance: reml_tol,
@@ -619,7 +615,6 @@ fn validate_full_size_penalties(
     Ok(())
 }
 
-
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
 /// Contract: likelihood dispatch is determined by `opts.family`.
 pub fn optimize_external_design<X>(
@@ -698,38 +693,38 @@ where
         // External REML path below provides exact Hessians directly.
         fd_hessian_max_dim: 0,
         seed_config: SeedConfig {
-        bounds: (-12.0, 12.0),
-        max_seeds: if has_full_heuristic {
-            if k <= 6 { 4 } else { 5 }
-        } else if k <= 4 {
-            8
-        } else if k <= 12 {
-            10
-        } else {
-            12
-        },
-        screening_budget: if has_full_heuristic {
-            if k <= 6 { 1 } else { 2 }
-        } else if k <= 6 {
-            2
-        } else {
-            3
-        },
-        screen_max_inner_iterations: if matches!(link, LinkFunction::Identity) {
-            3
-        } else {
-            5
-        },
-        risk_profile: if matches!(link, LinkFunction::Identity) {
-            SeedRiskProfile::Gaussian
-        } else {
-            SeedRiskProfile::GeneralizedLinear
-        },
+            bounds: (-12.0, 12.0),
+            max_seeds: if has_full_heuristic {
+                if k <= 6 { 4 } else { 5 }
+            } else if k <= 4 {
+                8
+            } else if k <= 12 {
+                10
+            } else {
+                12
+            },
+            screening_budget: if has_full_heuristic {
+                if k <= 6 { 1 } else { 2 }
+            } else if k <= 6 {
+                2
+            } else {
+                3
+            },
+            screen_max_inner_iterations: if matches!(link, LinkFunction::Identity) {
+                3
+            } else {
+                5
+            },
+            risk_profile: if matches!(link, LinkFunction::Identity) {
+                SeedRiskProfile::Gaussian
+            } else {
+                SeedRiskProfile::GeneralizedLinear
+            },
         },
     };
     let outer_eval_idx = Cell::new(0usize);
     let outer_result =
-        crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
+        crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient(
             k,
             heuristic_lambdas,
             |rho: &Array1<f64>| {
@@ -745,19 +740,31 @@ where
                 let grad_sec = t_grad.elapsed().as_secs_f64();
                 let used_stochastic = reml_state.last_gradient_used_stochastic_fallback();
 
-                let t_hess = Instant::now();
-                let hess = reml_state.compute_laml_hessian_exact(rho)?;
-                let hess_sec = t_hess.elapsed().as_secs_f64();
-
+                // Outer smoothing optimization is over rho = log(lambda).
+                //
+                // The scalar objective is the current REML/LAML surface
+                //   V(rho) = -ell(beta_hat(rho))
+                //          + 0.5 beta_hat(rho)' S(rho) beta_hat(rho)
+                //          + 0.5 log|H(rho)|
+                //          - 0.5 log|S(rho)|_+ .
+                //
+                // By the envelope theorem / stationarity of the inner mode,
+                // the BFGS callback only needs:
+                //   1) the value V(rho)
+                //   2) the exact outer gradient dV/drho
+                //
+                // The exact outer Hessian is *not* required on this path because
+                // wolfe_bfgs::Bfgs is a gradient-only optimizer. Computing the
+                // Hessian here would only evaluate a very expensive quantity and
+                // then discard it before the optimizer sees it.
                 log::info!(
-                    "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3}, hess={:.3})",
+                    "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3})",
                     rho.len(),
                     used_stochastic,
                     cost_sec,
                     grad_sec,
-                    hess_sec
                 );
-                Ok((cost, grad, Some(hess)))
+                Ok((cost, grad))
             },
             &smoothing_options,
         )?;
@@ -979,6 +986,254 @@ where
     })
 }
 
+#[allow(dead_code)]
+pub(crate) fn compute_external_directional_hyper_gradient<X>(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: X,
+    offset: ArrayView1<'_, f64>,
+    s_list: Vec<Array2<f64>>,
+    rho: &Array1<f64>,
+    x_psi: &Array2<f64>,
+    s_psi: &Array2<f64>,
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    opts: &ExternalOptimOptions,
+) -> Result<f64, EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    let x = x.into();
+    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
+            y.len(),
+            w.len(),
+            x.nrows(),
+            offset.len()
+        )));
+    }
+    let p = x.ncols();
+    validate_full_size_penalties(&s_list, p, "compute_external_directional_hyper_gradient")?;
+    if x_psi.nrows() != x.nrows() || x_psi.ncols() != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "X_psi must be {}x{}, got {}x{}",
+            x.nrows(),
+            p,
+            x_psi.nrows(),
+            x_psi.ncols()
+        )));
+    }
+    if s_psi.nrows() != p || s_psi.ncols() != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "S_psi must be {}x{}, got {}x{}",
+            p,
+            p,
+            s_psi.nrows(),
+            s_psi.ncols()
+        )));
+    }
+
+    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let cfg = RemlConfig::external(link, opts.tol, firth_active);
+    let y_o = y.to_owned();
+    let w_o = w.to_owned();
+    let x_o = x.clone();
+    let offset_o = offset.to_owned();
+    let reml_state = RemlState::new_with_offset(
+        y_o.view(),
+        x_o,
+        w_o.view(),
+        offset_o.view(),
+        s_list,
+        p,
+        &cfg,
+        Some(opts.nullspace_dims.clone()),
+        None,
+        opts.linear_constraints.clone(),
+    )?;
+    reml_state.set_warm_start_original_beta(warm_start_beta);
+    reml_state.compute_directional_hyper_gradient(rho, x_psi, s_psi)
+}
+
+pub(crate) fn compute_external_joint_hyper_gradient<X>(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: X,
+    offset: ArrayView1<'_, f64>,
+    s_list: Vec<Array2<f64>>,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    x_psi_list: &[Array2<f64>],
+    s_psi_list: &[Array2<f64>],
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    opts: &ExternalOptimOptions,
+) -> Result<Array1<f64>, EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    let x = x.into();
+    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
+            y.len(),
+            w.len(),
+            x.nrows(),
+            offset.len()
+        )));
+    }
+    if rho_dim > theta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho_dim {} exceeds theta dimension {}",
+            rho_dim,
+            theta.len()
+        )));
+    }
+    let p = x.ncols();
+    validate_full_size_penalties(&s_list, p, "compute_external_joint_hyper_gradient")?;
+    let psi_dim = theta.len() - rho_dim;
+    if x_psi_list.len() != psi_dim || s_psi_list.len() != psi_dim {
+        return Err(EstimationError::InvalidInput(format!(
+            "joint hyper-gradient derivative count mismatch: psi_dim={}, X_psi={}, S_psi={}",
+            psi_dim,
+            x_psi_list.len(),
+            s_psi_list.len()
+        )));
+    }
+    for (idx, x_psi) in x_psi_list.iter().enumerate() {
+        if x_psi.nrows() != x.nrows() || x_psi.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "X_psi[{idx}] must be {}x{}, got {}x{}",
+                x.nrows(),
+                p,
+                x_psi.nrows(),
+                x_psi.ncols()
+            )));
+        }
+    }
+    for (idx, s_psi) in s_psi_list.iter().enumerate() {
+        if s_psi.nrows() != p || s_psi.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "S_psi[{idx}] must be {}x{}, got {}x{}",
+                p,
+                p,
+                s_psi.nrows(),
+                s_psi.ncols()
+            )));
+        }
+    }
+
+    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let cfg = RemlConfig::external(link, opts.tol, firth_active);
+    let y_o = y.to_owned();
+    let w_o = w.to_owned();
+    let x_o = x.clone();
+    let offset_o = offset.to_owned();
+    let reml_state = RemlState::new_with_offset(
+        y_o.view(),
+        x_o,
+        w_o.view(),
+        offset_o.view(),
+        s_list,
+        p,
+        &cfg,
+        Some(opts.nullspace_dims.clone()),
+        None,
+        opts.linear_constraints.clone(),
+    )?;
+    reml_state.set_warm_start_original_beta(warm_start_beta);
+    reml_state.compute_joint_hyper_gradient(theta, rho_dim, x_psi_list, s_psi_list)
+}
+
+#[allow(dead_code)]
+pub(crate) fn compute_external_joint_hyper_cost_gradient<X>(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: X,
+    offset: ArrayView1<'_, f64>,
+    s_list: Vec<Array2<f64>>,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    x_psi_list: &[Array2<f64>],
+    s_psi_list: &[Array2<f64>],
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    opts: &ExternalOptimOptions,
+) -> Result<(f64, Array1<f64>), EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    let x = x.into();
+    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
+            y.len(),
+            w.len(),
+            x.nrows(),
+            offset.len()
+        )));
+    }
+    if rho_dim > theta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho_dim {} exceeds theta dimension {}",
+            rho_dim,
+            theta.len()
+        )));
+    }
+    let p = x.ncols();
+    validate_full_size_penalties(&s_list, p, "compute_external_joint_hyper_cost_gradient")?;
+    let psi_dim = theta.len() - rho_dim;
+    if x_psi_list.len() != psi_dim || s_psi_list.len() != psi_dim {
+        return Err(EstimationError::InvalidInput(format!(
+            "joint hyper-gradient derivative count mismatch: psi_dim={}, X_psi={}, S_psi={}",
+            psi_dim,
+            x_psi_list.len(),
+            s_psi_list.len()
+        )));
+    }
+    for (idx, x_psi) in x_psi_list.iter().enumerate() {
+        if x_psi.nrows() != x.nrows() || x_psi.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "X_psi[{idx}] must be {}x{}, got {}x{}",
+                x.nrows(),
+                p,
+                x_psi.nrows(),
+                x_psi.ncols()
+            )));
+        }
+    }
+    for (idx, s_psi) in s_psi_list.iter().enumerate() {
+        if s_psi.nrows() != p || s_psi.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "S_psi[{idx}] must be {}x{}, got {}x{}",
+                p,
+                p,
+                s_psi.nrows(),
+                s_psi.ncols()
+            )));
+        }
+    }
+
+    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let cfg = RemlConfig::external(link, opts.tol, firth_active);
+    let y_o = y.to_owned();
+    let w_o = w.to_owned();
+    let x_o = x.clone();
+    let offset_o = offset.to_owned();
+    let reml_state = RemlState::new_with_offset(
+        y_o.view(),
+        x_o,
+        w_o.view(),
+        offset_o.view(),
+        s_list,
+        p,
+        &cfg,
+        Some(opts.nullspace_dims.clone()),
+        None,
+        opts.linear_constraints.clone(),
+    )?;
+    reml_state.set_warm_start_original_beta(warm_start_beta);
+    reml_state.compute_joint_hyper_cost_gradient(theta, rho_dim, x_psi_list, s_psi_list)
+}
+
 #[derive(Clone)]
 pub struct FitOptions {
     pub max_iter: usize,
@@ -989,10 +1244,12 @@ pub struct FitOptions {
 
 /// Post-fit artifacts needed by downstream diagnostics/inference without
 /// re-running PIRLS.
+#[derive(Clone)]
 pub struct FitArtifacts {
     pub pirls: crate::pirls::PirlsResult,
 }
 
+#[derive(Clone)]
 pub struct FitResult {
     pub beta: Array1<f64>,
     pub lambdas: Array1<f64>,
@@ -1102,19 +1359,11 @@ impl fmt::Display for ModelSummary {
             .reml_score
             .map(|v| format!("{v:.4}"))
             .unwrap_or_else(|| "NA".to_string());
-        writeln!(
-            f,
-            "Deviance Explained: {dev_txt} | REML Score: {reml_txt}"
-        )?;
+        writeln!(f, "Deviance Explained: {dev_txt} | REML Score: {reml_txt}")?;
         writeln!(f)?;
 
         writeln!(f, "Parametric Terms:")?;
-        writeln!(
-            f,
-            "{:-<1$}",
-            "",
-            param_name_w + 59
-        )?;
+        writeln!(f, "{:-<1$}", "", param_name_w + 59)?;
         writeln!(
             f,
             "{:<name_w$} {:>10} {:>12} {:>10} {:>19}",
@@ -1125,12 +1374,7 @@ impl fmt::Display for ModelSummary {
             "Two-Sided P-Value",
             name_w = param_name_w
         )?;
-        writeln!(
-            f,
-            "{:-<1$}",
-            "",
-            param_name_w + 59
-        )?;
+        writeln!(f, "{:-<1$}", "", param_name_w + 59)?;
         for term in &self.parametric_terms {
             let estimate = format!("{:.4}", term.estimate);
             let se = term
@@ -1160,12 +1404,7 @@ impl fmt::Display for ModelSummary {
         writeln!(f)?;
 
         writeln!(f, "Smooth Terms:")?;
-        writeln!(
-            f,
-            "{:-<1$}",
-            "",
-            smooth_name_w + 86
-        )?;
+        writeln!(f, "{:-<1$}", "", smooth_name_w + 86)?;
         writeln!(
             f,
             "{:<name_w$} {:>26} {:>30} {:>12} {:>10}",
@@ -1176,12 +1415,7 @@ impl fmt::Display for ModelSummary {
             "P-Value",
             name_w = smooth_name_w
         )?;
-        writeln!(
-            f,
-            "{:-<1$}",
-            "",
-            smooth_name_w + 86
-        )?;
+        writeln!(f, "{:-<1$}", "", smooth_name_w + 86)?;
         for term in &self.smooth_terms {
             let chisq = term
                 .chi_sq
@@ -1213,16 +1447,14 @@ impl fmt::Display for ModelSummary {
 
 pub use crate::inference::predict::{
     CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
-    PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions,
-    PredictUncertaintyResult, coefficient_uncertainty, coefficient_uncertainty_with_mode,
-    predict_gam, predict_gam_posterior_mean, predict_gam_with_uncertainty,
+    PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
+    coefficient_uncertainty, coefficient_uncertainty_with_mode, predict_gam,
+    predict_gam_posterior_mean, predict_gam_with_uncertainty,
 };
 pub use crate::solver::smoothing::{
     SmoothingBfgsOptions, SmoothingBfgsResult, optimize_log_smoothing_with_multistart,
     optimize_log_smoothing_with_multistart_with_gradient,
 };
-
-
 
 /// Canonical engine entrypoint for external designs.
 /// Likelihood dispatch is determined exclusively by `family`.
@@ -1264,8 +1496,7 @@ where
         let weighted_total = weights.iter().map(|w| w.max(0.0)).sum::<f64>();
         let weighted_nonevents = (weighted_total - weighted_events).max(0.0);
         let minority_support = weighted_events.min(weighted_nonevents);
-        let start_with_firth =
-            should_enable_firth_from_class_support(minority_support, x.ncols());
+        let start_with_firth = should_enable_firth_from_class_support(minority_support, x.ncols());
 
         // Start with Firth when class support is low relative to model complexity.
         ext_opts.firth_bias_reduction = Some(start_with_firth);
@@ -1368,8 +1599,6 @@ where
 {
     fit_gam_with_heuristic_lambdas(x, y, weights, offset, s_list, None, family, opts)
 }
-
-
 
 /// Computes the gradient of the LAML cost function using the central finite-difference method.
 const FD_REL_GAP_THRESHOLD: f64 = 0.2;

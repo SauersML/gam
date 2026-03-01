@@ -6,7 +6,7 @@ pub use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use faer::linalg::svd::{self, ComputeSvdVectors};
-use faer::{Auto, Mat, MatMut, MatRef, Par, Side, Spec, get_global_parallelism};
+use faer::{Auto, Conj, Mat, MatMut, MatRef, Par, Side, Spec, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use std::marker::PhantomData;
 use thiserror::Error;
@@ -16,6 +16,7 @@ const SYMMETRY_REL_TOL: f64 = 1e-12;
 const SYMMETRY_ABS_TOL: f64 = 1e-12;
 const RECONSTRUCTION_REL_TOL: f64 = 1e-8;
 const RECONSTRUCTION_ABS_TOL: f64 = 1e-12;
+const RRQR_RANK_ALPHA: f64 = 100.0;
 
 #[derive(Debug, Error)]
 pub enum FaerLinalgError {
@@ -903,10 +904,62 @@ impl<S: Data<Elem = f64>> FaerQr for ArrayBase<S, Ix2> {
     }
 }
 
+/// Compute an orthonormal basis for `null(a^T)` using column-pivoted QR on `a`.
+///
+/// This is intended for tall/skinny matrices where `a ∈ R^{m×n}` with `m >= n`.
+/// If `A P^T = Q R`, then the trailing `m-rank(A)` columns of `Q` span
+/// `null(A^T)`.
+pub fn rrqr_nullspace_basis<S: Data<Elem = f64>>(
+    a: &ArrayBase<S, Ix2>,
+    rank_alpha: f64,
+) -> Result<(Array2<f64>, usize), FaerLinalgError> {
+    let faer_view = FaerArrayView::new(a);
+    let qr = faer_view.as_ref().col_piv_qr();
+    let r = qr.thin_R();
+    let diag_len = r.nrows().min(r.ncols());
+    let leading_diag = if diag_len > 0 { r[(0, 0)].abs() } else { 0.0 };
+    let tol = rank_alpha
+        * f64::EPSILON
+        * (a.nrows().max(a.ncols()).max(1) as f64)
+        * leading_diag.max(1.0);
+    let rank = (0..diag_len).filter(|&i| r[(i, i)].abs() > tol).count();
+    let z = if rank >= a.nrows() {
+        Array2::<f64>::zeros((a.nrows(), 0))
+    } else {
+        let nullity = a.nrows() - rank;
+        let mut selector = Mat::<f64>::zeros(a.nrows(), nullity);
+        for j in 0..nullity {
+            selector[(rank + j, j)] = 1.0;
+        }
+        let par = get_global_parallelism();
+        faer::linalg::householder::apply_block_householder_sequence_on_the_left_in_place_with_conj(
+            qr.Q_basis(),
+            qr.Q_coeff(),
+            Conj::No,
+            selector.as_mut(),
+            par,
+            MemStack::new(&mut MemBuffer::new(
+                faer::linalg::householder::apply_block_householder_sequence_on_the_left_in_place_scratch::<f64>(
+                    a.nrows(),
+                    qr.Q_coeff().nrows(),
+                    nullity,
+                ),
+            )),
+        );
+        mat_to_array(selector.as_ref())
+    };
+    Ok((z, rank))
+}
+
+#[inline]
+pub fn default_rrqr_rank_alpha() -> f64 {
+    RRQR_RANK_ALPHA
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
+    use ndarray::{array, s};
 
     fn inertia_from_eigs(a: &Array2<f64>, tol: f64) -> (usize, usize, usize) {
         let (evals, _) = a
@@ -984,5 +1037,40 @@ mod tests {
         let eps = 1e-14;
         let a = array![[2.0, 1.0 + eps], [1.0, 3.0]];
         assert!(ldlt_rook(&a).is_ok());
+    }
+
+    #[test]
+    fn rrqr_nullspace_basis_is_orthonormal_and_annihilates_transpose() {
+        let a = array![[1.0, 0.0], [1.0, 0.0], [0.0, 2.0], [0.0, 0.0],];
+        let (z, rank) =
+            rrqr_nullspace_basis(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");
+        assert_eq!(rank, 2);
+        assert_eq!(z.nrows(), 4);
+        assert_eq!(z.ncols(), 2);
+
+        let gram = z.t().dot(&z);
+        let ident = Array2::<f64>::eye(z.ncols());
+        let gram_err = (&gram - &ident)
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(gram_err < 1e-10, "Z is not orthonormal: {gram_err:e}");
+
+        let residual = a.t().dot(&z);
+        let resid_max = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(resid_max < 1e-10, "A^T Z residual too large: {resid_max:e}");
+    }
+
+    #[test]
+    fn rrqr_nullspace_basis_detects_zero_rank_matrix() {
+        let a = Array2::<f64>::zeros((5, 2));
+        let (z, rank) =
+            rrqr_nullspace_basis(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");
+        assert_eq!(rank, 0);
+        assert_eq!(z.dim(), (5, 5));
+        let ident = Array2::<f64>::eye(5);
+        let max_err = (&z.slice(s![.., ..5]).to_owned() - &ident)
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(max_err < 1e-10, "zero matrix should yield identity basis");
     }
 }

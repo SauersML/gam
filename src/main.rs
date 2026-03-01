@@ -11,12 +11,17 @@ use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions,
     CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource, MaternBasisSpec,
     MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
-    build_bspline_basis_1d, create_basis, evaluate_bspline_derivative_scalar,
+    build_bspline_basis_1d, compute_geometric_constraint_transform, create_basis,
+    evaluate_bspline_derivative_scalar,
 };
 use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, ModelSummary,
-    ParametricTermSummary, SmoothTermSummary, fit_gam,
-    optimize_external_design, predict_gam, predict_gam_posterior_mean,
+    ParametricTermSummary, SmoothTermSummary, fit_gam, optimize_external_design, predict_gam,
+    predict_gam_posterior_mean,
+};
+use gam::families::sigma_link::{
+    bounded_sigma_and_deriv_from_eta as sigma_and_deriv_from_eta,
+    bounded_sigma_from_eta_scalar as sigma_from_eta_scalar,
 };
 use gam::gamlss::{
     BinomialLocationScaleProbitTermSpec, BinomialLocationScaleProbitWiggleTermSpec,
@@ -31,14 +36,10 @@ use gam::joint::{
 };
 use gam::matrix::DesignMatrix;
 use gam::probability::{inverse_link_array, normal_cdf_approx, standard_normal_quantile};
-use gam::families::sigma_link::{
-    bounded_sigma_and_deriv_from_eta as sigma_and_deriv_from_eta,
-    bounded_sigma_from_eta_scalar as sigma_from_eta_scalar,
-};
 use gam::smooth::{
-    LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
-    SpatialLengthScaleOptimizationOptions, TermCollectionSpec, build_term_collection_design,
+    LinearTermSpec, RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
+    SpatialLengthScaleOptimizationOptions, TensorBSplineIdentifiability, TensorBSplineSpec,
+    TermCollectionSpec, build_term_collection_design,
     fit_term_collection_with_spatial_length_scale_optimization,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
@@ -2648,6 +2649,14 @@ fn saved_probit_wiggle_design(
     q0: &Array1<f64>,
     model: &SavedModel,
 ) -> Result<Option<Array2<f64>>, String> {
+    saved_probit_wiggle_basis(q0, model, BasisOptions::value())
+}
+
+fn saved_probit_wiggle_basis(
+    q0: &Array1<f64>,
+    model: &SavedModel,
+    basis_options: BasisOptions,
+) -> Result<Option<Array2<f64>>, String> {
     match (
         model.probit_wiggle_knots.as_ref(),
         model.probit_wiggle_degree,
@@ -2656,31 +2665,35 @@ fn saved_probit_wiggle_design(
         (None, None, None) => Ok(None),
         (Some(knots), Some(degree), Some(beta_wiggle)) => {
             let knot_arr = Array1::from_vec(knots.clone());
-            let block = build_wiggle_block_input_from_knots(
+            let (basis, _) = create_basis::<Dense>(
                 q0.view(),
-                &knot_arr,
+                KnotSource::Provided(knot_arr.view()),
                 degree,
-                2,
-                false,
+                basis_options,
             )
             .map_err(|e| format!("failed to evaluate saved probit wiggle basis: {e}"))?;
-            let x_wiggle = match block.design {
-                DesignMatrix::Dense(m) => m,
-                _ => {
-                    return Err(
-                        "saved probit wiggle basis design must be dense in current implementation"
-                            .to_string(),
-                    )
-                }
-            };
-            if beta_wiggle.len() != x_wiggle.ncols() {
+            let full = (*basis).clone();
+            if full.ncols() < 3 {
+                return Err("saved probit wiggle basis has fewer than three columns".to_string());
+            }
+            let (z, _s_constrained) = compute_geometric_constraint_transform(&knot_arr, degree, 2)
+                .map_err(|e| format!("failed to build saved probit wiggle constraint transform: {e}"))?;
+            if full.ncols() != z.nrows() {
+                return Err(format!(
+                    "saved probit wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
+                    full.ncols(),
+                    z.nrows()
+                ));
+            }
+            let constrained = full.dot(&z);
+            if beta_wiggle.len() != constrained.ncols() {
                 return Err(format!(
                     "saved probit wiggle dimension mismatch: beta_wiggle has {} coefficients but basis has {} columns",
                     beta_wiggle.len(),
-                    x_wiggle.ncols()
+                    constrained.ncols()
                 ));
             }
-            Ok(Some(x_wiggle))
+            Ok(Some(constrained))
         }
         _ => Err(
             "saved model has partial probit wiggle metadata; expected knots+degree+beta_wiggle together"
@@ -2733,19 +2746,16 @@ fn saved_probit_wiggle_derivative_q0(
     q0: &Array1<f64>,
     model: &SavedModel,
 ) -> Result<Array1<f64>, String> {
-    if model.probit_wiggle_knots.is_none() {
-        return Ok(Array1::ones(q0.len()));
+    match saved_probit_wiggle_basis(q0, model, BasisOptions::first_derivative())? {
+        Some(d_constrained) => {
+            let beta_wiggle = Array1::from_vec(model.beta_wiggle.clone().ok_or_else(|| {
+                "saved model is missing probit wiggle coefficients while derivative path requested"
+                    .to_string()
+            })?);
+            Ok((d_constrained.dot(&beta_wiggle) + 1.0).mapv(|v| v.clamp(-1e6, 1e6)))
+        }
+        None => Ok(Array1::ones(q0.len())),
     }
-    let eps = 1e-5;
-    let mut out = Array1::<f64>::ones(q0.len());
-    for i in 0..q0.len() {
-        let qp = Array1::from_vec(vec![q0[i] + eps]);
-        let qm = Array1::from_vec(vec![q0[i] - eps]);
-        let ep = apply_saved_probit_wiggle(&qp, model)?[0];
-        let em = apply_saved_probit_wiggle(&qm, model)?[0];
-        out[i] = ((ep - em) / (2.0 * eps)).max(-1e6).min(1e6);
-    }
-    Ok(out)
 }
 
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
@@ -5106,7 +5116,10 @@ fn solve_symmetric_system(cov: &Array2<f64>, rhs: &FaerMat<f64>) -> Option<FaerM
     Some(f.solve(rhs.as_ref()))
 }
 
-fn wald_quadratic_form(beta_block: ndarray::ArrayView1<'_, f64>, cov_block: &Array2<f64>) -> Option<f64> {
+fn wald_quadratic_form(
+    beta_block: ndarray::ArrayView1<'_, f64>,
+    cov_block: &Array2<f64>,
+) -> Option<f64> {
     let k = beta_block.len();
     if k == 0 || cov_block.nrows() != k || cov_block.ncols() != k {
         return None;
@@ -5209,7 +5222,9 @@ fn build_model_summary(
     let intercept_beta = fit.beta.get(intercept_idx).copied().unwrap_or(0.0);
     let intercept_se = se.and_then(|s| s.get(intercept_idx).copied());
     let intercept_z = intercept_se.and_then(|s| (s > 0.0).then_some(intercept_beta / s));
-    let intercept_p = intercept_z.map(|z| 2.0 * (1.0 - normal_cdf_approx(z.abs()))).map(|p| p.clamp(0.0, 1.0));
+    let intercept_p = intercept_z
+        .map(|z| 2.0 * (1.0 - normal_cdf_approx(z.abs())))
+        .map(|p| p.clamp(0.0, 1.0));
     parametric_terms.push(ParametricTermSummary {
         name: "Intercept".to_string(),
         estimate: intercept_beta,
@@ -5222,7 +5237,9 @@ fn build_model_summary(
             let beta = fit.beta.get(idx).copied().unwrap_or(0.0);
             let se_i = se.and_then(|s| s.get(idx).copied());
             let z = se_i.and_then(|s| (s > 0.0).then_some(beta / s));
-            let p = z.map(|zz| 2.0 * (1.0 - normal_cdf_approx(zz.abs()))).map(|v| v.clamp(0.0, 1.0));
+            let p = z
+                .map(|zz| 2.0 * (1.0 - normal_cdf_approx(zz.abs())))
+                .map(|v| v.clamp(0.0, 1.0));
             let label = if range.end - range.start > 1 {
                 format!("{name}[{}]", idx - range.start)
             } else {
@@ -5663,13 +5680,13 @@ fn write_survival_prediction_csv(
 #[cfg(test)]
 mod tests {
     use super::{
-        LikelihoodFamily, SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
-        chi_square_survival_approx, pretty_family_name,
-        parse_survival_time_basis_config, survival_probability_from_eta,
-        write_survival_prediction_csv,
+        LikelihoodFamily, MODEL_VERSION, SavedModel, SurvivalArgs, SurvivalTimeBasisConfig,
+        build_survival_time_basis, chi_square_survival_approx, parse_survival_time_basis_config,
+        pretty_family_name, saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design,
+        survival_probability_from_eta, write_survival_prediction_csv,
     };
     use gam::basis::{BasisOptions, Dense, KnotSource, create_basis};
-    use ndarray::{Array1, array};
+    use ndarray::{Array1, ArrayView1, array};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5759,7 +5776,10 @@ mod tests {
 
     #[test]
     fn pretty_family_names_are_human_readable() {
-        assert_eq!(pretty_family_name(LikelihoodFamily::BinomialLogit), "Binomial Logit");
+        assert_eq!(
+            pretty_family_name(LikelihoodFamily::BinomialLogit),
+            "Binomial Logit"
+        );
         assert_eq!(
             pretty_family_name(LikelihoodFamily::GaussianIdentity),
             "Gaussian Identity"
@@ -5922,6 +5942,101 @@ mod tests {
                 max_v = max_v.max(built.x_entry_time[[i, j]].max(built.x_exit_time[[i, j]]));
             }
             assert!(max_v - min_v > 1e-12);
+        }
+    }
+
+    #[test]
+    fn saved_probit_wiggle_derivative_matches_exact_constrained_basis_chain_rule() {
+        let q0 = array![-1.25, -0.2, 0.35, 1.4];
+        let knots = vec![-2.0, -2.0, -2.0, -2.0, -0.5, 0.5, 2.0, 2.0, 2.0, 2.0];
+        let design = create_basis::<Dense>(
+            q0.view(),
+            KnotSource::Provided(ArrayView1::from(&knots)),
+            3,
+            BasisOptions::value(),
+        )
+        .expect("build raw basis")
+        .0;
+        let constrained_cols = design.ncols().saturating_sub(2);
+        let beta_wiggle = (0..constrained_cols)
+            .map(|j| match j % 5 {
+                0 => 0.2,
+                1 => -0.15,
+                2 => 0.05,
+                3 => 0.1,
+                _ => -0.08,
+            })
+            .collect::<Vec<_>>();
+        let model = SavedModel {
+            version: MODEL_VERSION,
+            formula: "y ~ x".to_string(),
+            family: "binomial-location-scale-probit".to_string(),
+            link: Some("probit".to_string()),
+            formula_noise: None,
+            beta_noise: None,
+            sigma_min: None,
+            sigma_max: None,
+            joint_beta_link: None,
+            joint_knot_range: None,
+            joint_knot_vector: None,
+            joint_link_transform: None,
+            joint_degree: None,
+            joint_ridge_used: None,
+            probit_wiggle_knots: Some(knots),
+            probit_wiggle_degree: Some(3),
+            beta_wiggle: Some(beta_wiggle.clone()),
+            survival_entry: None,
+            survival_exit: None,
+            survival_event: None,
+            survival_spec: None,
+            survival_baseline_target: None,
+            survival_baseline_scale: None,
+            survival_baseline_shape: None,
+            survival_baseline_rate: None,
+            survival_time_basis: None,
+            survival_time_degree: None,
+            survival_time_knots: None,
+            survival_time_smooth_lambda: None,
+            survival_ridge_lambda: None,
+            survival_likelihood: None,
+            survival_sigma_min: None,
+            survival_sigma_max: None,
+            survival_beta_time: None,
+            survival_beta_threshold: None,
+            survival_beta_log_sigma: None,
+            survival_distribution: None,
+            training_headers: None,
+            resolved_term_spec: None,
+            resolved_term_spec_noise: None,
+            fit_max_iter: 10,
+            fit_tol: 1e-6,
+            beta: Vec::new(),
+            lambdas: Vec::new(),
+            scale: 1.0,
+            reml_score: None,
+            covariance_conditional: None,
+            covariance_corrected: None,
+        };
+
+        let exact = saved_probit_wiggle_derivative_q0(&q0, &model).expect("exact derivative");
+        let constrained_deriv = saved_probit_wiggle_design(&q0, &model)
+            .expect("design path should succeed")
+            .expect("wiggle design")
+            .ncols();
+        assert_eq!(constrained_deriv, beta_wiggle.len());
+
+        let d_basis =
+            super::saved_probit_wiggle_basis(&q0, &model, BasisOptions::first_derivative())
+                .expect("derivative basis")
+                .expect("wiggle derivative basis");
+        let expected = d_basis.dot(&Array1::from_vec(beta_wiggle)) + 1.0;
+        for i in 0..q0.len() {
+            assert!(
+                (exact[i] - expected[i]).abs() <= 1e-12,
+                "wiggle dq/dq0 mismatch at row {i}: got {}, expected {}",
+                exact[i],
+                expected[i]
+            );
         }
     }
 }

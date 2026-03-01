@@ -54,6 +54,19 @@ NON_BLOCKING_FAILURE_CONTENDERS = {
     "r_gamboostlss",
     "r_bamlss",
 }
+_BENCH_CI_PROFILE = os.environ.get("BENCH_CI_PROFILE", "full").strip().lower() or "full"
+_LEAN_PROFILE_EXCLUDED_CONTENDERS = {
+    # These contenders materially increase CI runtime and peak memory on
+    # GitHub-hosted runners. Keep them in the nightly/full profile.
+    "r_bamlss",
+    "r_brms",
+    "python_sksurv_rsf",
+    "python_sksurv_gb_coxph",
+    "python_sksurv_componentwise_gb_coxph",
+    "python_lifelines_weibull_aft",
+    "python_lifelines_lognormal_aft",
+    "python_xgboost_aft",
+}
 
 
 @dataclass(frozen=True)
@@ -4678,9 +4691,20 @@ def _assert_basis_parity_for_scenario(s_cfg):
         )
 
 
-def _should_run_pygam_for_scenario(s_cfg):
+def _extra_excluded_contenders_for_profile() -> set[str]:
+    if _BENCH_CI_PROFILE == "lean":
+        return set(_LEAN_PROFILE_EXCLUDED_CONTENDERS)
+    return set()
+
+
+def _is_contender_enabled(s_cfg, contender: str) -> bool:
     excluded = set(s_cfg.get("exclude_contenders", []))
-    if "python_pygam" in excluded:
+    excluded.update(_extra_excluded_contenders_for_profile())
+    return contender not in excluded
+
+
+def _should_run_pygam_for_scenario(s_cfg):
+    if not _is_contender_enabled(s_cfg, "python_pygam"):
         return False
     ds = dataset_for_scenario(s_cfg)
     # pyGAM has no native censored-likelihood survival model support in this harness.
@@ -4735,52 +4759,73 @@ def main():
         rust_gamlss_row = run_rust_gamlss_scenario_cv(s_cfg)
         if rust_gamlss_row is not None:
             results.append(rust_gamlss_row)
-        r_gamlss_row = run_external_r_gamlss_cv(s_cfg)
+        r_gamlss_row = run_external_r_gamlss_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_gamlss") else None
         if r_gamlss_row is not None:
             results.append(r_gamlss_row)
-        results.append(run_external_mgcv_cv(s_cfg))
-        mgcv_gaulss_row = run_external_mgcv_gaulss_cv(s_cfg)
+        if _is_contender_enabled(s_cfg, "r_mgcv"):
+            results.append(run_external_mgcv_cv(s_cfg))
+        mgcv_gaulss_row = run_external_mgcv_gaulss_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_mgcv_gaulss") else None
         if mgcv_gaulss_row is not None:
             results.append(mgcv_gaulss_row)
-        gamboostlss_row = run_external_r_gamboostlss_cv(s_cfg)
+        gamboostlss_row = (
+            run_external_r_gamboostlss_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_gamboostlss") else None
+        )
         if gamboostlss_row is not None:
             results.append(gamboostlss_row)
-        bamlss_row = run_external_r_bamlss_cv(s_cfg)
+        bamlss_row = run_external_r_bamlss_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_bamlss") else None
         if bamlss_row is not None:
             results.append(bamlss_row)
-        brms_row = run_external_r_brms_cv(s_cfg)
+        brms_row = run_external_r_brms_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_brms") else None
         if brms_row is not None:
             results.append(brms_row)
-        mgcv_surv_row = run_external_mgcv_survival_cv(s_cfg)
+        mgcv_surv_row = (
+            run_external_mgcv_survival_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_mgcv_coxph") else None
+        )
         if mgcv_surv_row is not None:
             results.append(mgcv_surv_row)
         if _should_run_pygam_for_scenario(s_cfg):
             results.append(run_external_pygam_cv(s_cfg))
-        sksurv_rsf_row = run_external_sksurv_rsf_cv(s_cfg)
+        sksurv_rsf_row = (
+            run_external_sksurv_rsf_cv(s_cfg) if _is_contender_enabled(s_cfg, "python_sksurv_rsf") else None
+        )
         if sksurv_rsf_row is not None:
             results.append(sksurv_rsf_row)
-        sksurv_coxnet_row = run_external_sksurv_coxnet_cv(s_cfg)
+        sksurv_coxnet_row = (
+            run_external_sksurv_coxnet_cv(s_cfg)
+            if _is_contender_enabled(s_cfg, "python_sksurv_coxnet")
+            else None
+        )
         if sksurv_coxnet_row is not None:
             results.append(sksurv_coxnet_row)
-        lifelines_enet_row = run_external_lifelines_coxph_enet_cv(s_cfg)
+        lifelines_enet_row = (
+            run_external_lifelines_coxph_enet_cv(s_cfg)
+            if _is_contender_enabled(s_cfg, "python_lifelines_coxph_enet")
+            else None
+        )
         if lifelines_enet_row is not None:
             results.append(lifelines_enet_row)
-        glmnet_cox_row = run_external_glmnet_cox_cv(s_cfg)
+        glmnet_cox_row = run_external_glmnet_cox_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_glmnet_cox") else None
         if glmnet_cox_row is not None:
             results.append(glmnet_cox_row)
-        sksurv_gb_rows = run_external_sksurv_gb_cv(s_cfg)
+        sksurv_gb_rows = (
+            run_external_sksurv_gb_cv(s_cfg) if _is_contender_enabled(s_cfg, "python_sksurv_gb_coxph") else None
+        )
         if sksurv_gb_rows is not None:
             if isinstance(sksurv_gb_rows, list):
                 results.extend(sksurv_gb_rows)
             else:
                 results.append(sksurv_gb_rows)
-        lifelines_aft_rows = run_external_lifelines_aft_cv(s_cfg)
+        lifelines_aft_rows = (
+            run_external_lifelines_aft_cv(s_cfg)
+            if _is_contender_enabled(s_cfg, "python_lifelines_weibull_aft")
+            else None
+        )
         if lifelines_aft_rows is not None:
             if isinstance(lifelines_aft_rows, list):
                 results.extend(lifelines_aft_rows)
             else:
                 results.append(lifelines_aft_rows)
-        xgb_aft_row = run_external_xgboost_aft_cv(s_cfg)
+        xgb_aft_row = run_external_xgboost_aft_cv(s_cfg) if _is_contender_enabled(s_cfg, "python_xgboost_aft") else None
         if xgb_aft_row is not None:
             results.append(xgb_aft_row)
 

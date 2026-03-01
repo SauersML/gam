@@ -207,14 +207,16 @@ impl OptimizationVisualizer {
             }
 
             if edf_terms.is_empty() {
-                model_lines.push("  Waiting for effective degrees of freedom updates...".to_string());
+                model_lines
+                    .push("  Waiting for effective degrees of freedom updates...".to_string());
             } else {
-                let max_rows = top_chunks[1].height.saturating_sub(if compact { 3 } else { 4 }) as usize;
-                let mut shown_terms = edf_terms
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                shown_terms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let max_rows = top_chunks[1]
+                    .height
+                    .saturating_sub(if compact { 3 } else { 4 })
+                    as usize;
+                let mut shown_terms = edf_terms.iter().cloned().collect::<Vec<_>>();
+                shown_terms
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 if shown_terms.len() > max_rows.saturating_sub(1) && max_rows > 1 {
                     shown_terms.truncate(max_rows - 1);
                     model_lines.push(format!("showing top {} terms by EDF", shown_terms.len()));
@@ -247,7 +249,11 @@ impl OptimizationVisualizer {
                     };
                     model_lines.push(format!(
                         "{:<name_w$} effective {:>6.2} of {:>6.2} reference  {}",
-                        display_name, edf, ref_df, bar, name_w = name_w
+                        display_name,
+                        edf,
+                        ref_df,
+                        bar,
+                        name_w = name_w
                     ));
                 }
             }
@@ -277,7 +283,10 @@ impl OptimizationVisualizer {
                     progress_label, progress_current, total
                 ));
             } else if !progress_label.is_empty() {
-                diagnostics.push(format!("Progress: {} ({})", progress_label, progress_current));
+                diagnostics.push(format!(
+                    "Progress: {} ({})",
+                    progress_label, progress_current
+                ));
             }
             diagnostics.push(String::new());
             diagnostics.push(format!(
