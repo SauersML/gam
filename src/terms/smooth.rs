@@ -131,6 +131,7 @@ pub struct SmoothDesign {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BoundedCoefficientPriorSpec {
     None,
+    Uniform,
     Beta { a: f64, b: f64 },
 }
 
@@ -1833,16 +1834,19 @@ fn bounded_latent_to_user(theta: f64, min: f64, max: f64) -> (f64, f64, f64) {
 }
 
 fn bounded_prior_terms(theta: f64, prior: &BoundedCoefficientPriorSpec) -> (f64, f64, f64) {
-    match prior {
-        BoundedCoefficientPriorSpec::None => (0.0, 0.0, 0.0),
-        BoundedCoefficientPriorSpec::Beta { a, b } => {
-            let z = stable_sigmoid(theta).clamp(1e-12, 1.0 - 1e-12);
-            let logp = *a * z.ln() + *b * (1.0 - z).ln();
-            let grad = *a - (*a + *b) * z;
-            let neg_hess = (*a + *b) * z * (1.0 - z);
-            (logp, grad, neg_hess)
-        }
-    }
+    let (a, b) = match prior {
+        // `None` means constrained MLE with no extra prior term on the bounded coefficient.
+        BoundedCoefficientPriorSpec::None => return (0.0, 0.0, 0.0),
+        // Uniform on the normalized user-scale coefficient z in (0, 1). In latent space this is
+        // exactly the Jacobian term for the logistic transform, up to an additive width constant.
+        BoundedCoefficientPriorSpec::Uniform => (1.0, 1.0),
+        BoundedCoefficientPriorSpec::Beta { a, b } => (*a, *b),
+    };
+    let z = stable_sigmoid(theta).clamp(1e-12, 1.0 - 1e-12);
+    let logp = a * z.ln() + b * (1.0 - z).ln();
+    let grad = a - (a + b) * z;
+    let neg_hess = (a + b) * z * (1.0 - z);
+    (logp, grad, neg_hess)
 }
 
 fn evaluate_standard_family_observations(
@@ -5041,5 +5045,29 @@ mod tests {
             estimate > 0.1,
             "bounded coefficient should move into the positive interior, got {estimate}"
         );
+    }
+
+    #[test]
+    fn bounded_uniform_prior_matches_beta_one_one_terms() {
+        let theta = 0.7;
+        let uniform = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Uniform);
+        let beta11 =
+            bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Beta { a: 1.0, b: 1.0 });
+        assert!((uniform.0 - beta11.0).abs() < 1e-12);
+        assert!((uniform.1 - beta11.1).abs() < 1e-12);
+        assert!((uniform.2 - beta11.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bounded_none_prior_has_no_extra_latent_objective_terms() {
+        let theta = 0.7;
+        let none = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::None);
+        assert_eq!(none, (0.0, 0.0, 0.0));
+
+        let uniform = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Uniform);
+        assert!(uniform.0.is_finite());
+        assert!(uniform.0 < 0.0);
+        assert!(uniform.1.abs() > 1e-6);
+        assert!(uniform.2 > 0.0);
     }
 }

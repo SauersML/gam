@@ -86,7 +86,7 @@ struct FitArgs {
         long = "formula",
         alias = "predict-mean",
         help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
-        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary unpenalized linear term\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform\n- bounded(x, ..., pull=\"center\"): bounded coefficient with symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ bounded(mu_hat, min=0, max=1) + matern(pc1, pc2, pc3)'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary unpenalized linear term\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ bounded(mu_hat, min=0, max=1) + matern(pc1, pc2, pc3)'\n- 'y ~ bounded(mu_hat, min=0, max=1, prior=\"uniform\") + z'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     formula: Option<String>,
     /// P(Y=1|S,x)=Phi((S-T(x))/sigma(x)).
@@ -4029,12 +4029,15 @@ fn validate_frozen_term_collection_spec(
                     linear.name
                 ));
             }
-            if let BoundedCoefficientPriorSpec::Beta { a, b } = prior {
-                if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
-                    return Err(format!(
-                        "{label} bounded term '{}' has invalid Beta prior ({a}, {b})",
-                        linear.name
-                    ));
+            match prior {
+                BoundedCoefficientPriorSpec::None | BoundedCoefficientPriorSpec::Uniform => {}
+                BoundedCoefficientPriorSpec::Beta { a, b } => {
+                    if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
+                        return Err(format!(
+                            "{label} bounded term '{}' has invalid Beta prior ({a}, {b})",
+                            linear.name
+                        ));
+                    }
                 }
             }
         }
@@ -4497,6 +4500,7 @@ fn parse_bounded_prior_spec(
     max: f64,
     raw: &str,
 ) -> Result<BoundedCoefficientPriorSpec, String> {
+    let prior_mode = options.get("prior").map(|s| s.to_ascii_lowercase());
     let pull = options.get("pull").map(|s| s.to_ascii_lowercase());
     let beta_a = parse_optional_f64_option(options, "beta_a", raw)?;
     let beta_b = parse_optional_f64_option(options, "beta_b", raw)?;
@@ -4505,6 +4509,21 @@ fn parse_bounded_prior_spec(
 
     let explicit_beta = beta_a.is_some() || beta_b.is_some();
     let target_mode = target.is_some() || strength.is_some();
+    if prior_mode.is_some() && pull.is_some() {
+        return Err(format!(
+            "bounded() cannot combine prior=... with pull=...: {raw}"
+        ));
+    }
+    if prior_mode.is_some() && explicit_beta {
+        return Err(format!(
+            "bounded() cannot combine prior=... with beta_a/beta_b: {raw}"
+        ));
+    }
+    if prior_mode.is_some() && target_mode {
+        return Err(format!(
+            "bounded() cannot combine prior=... with target/strength: {raw}"
+        ));
+    }
     if pull.is_some() && explicit_beta {
         return Err(format!(
             "bounded() cannot combine pull=... with beta_a/beta_b: {raw}"
@@ -4521,11 +4540,24 @@ fn parse_bounded_prior_spec(
         ));
     }
 
-    if let Some(pull_mode) = pull {
-        return match pull_mode.as_str() {
+    if let Some(prior_name) = prior_mode {
+        return match prior_name.as_str() {
+            "none" => Ok(BoundedCoefficientPriorSpec::None),
+            "uniform" => Ok(BoundedCoefficientPriorSpec::Uniform),
             "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
             _ => Err(format!(
-                "bounded() pull must currently be 'center', got '{}': {raw}",
+                "bounded() prior must currently be one of none|uniform|center, got '{}': {raw}",
+                prior_name
+            )),
+        };
+    }
+
+    if let Some(pull_mode) = pull {
+        return match pull_mode.as_str() {
+            "uniform" => Ok(BoundedCoefficientPriorSpec::Uniform),
+            "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
+            _ => Err(format!(
+                "bounded() pull must currently be 'uniform' or 'center', got '{}': {raw}",
                 pull_mode
             )),
         };
@@ -5467,7 +5499,8 @@ fn build_model_summary(
             LinearCoefficientGeometry::Unconstrained => name.clone(),
             LinearCoefficientGeometry::Bounded { min, max, prior } => {
                 let prior_txt = match prior {
-                    BoundedCoefficientPriorSpec::None => String::new(),
+                    BoundedCoefficientPriorSpec::None => ", no-prior".to_string(),
+                    BoundedCoefficientPriorSpec::Uniform => ", Uniform".to_string(),
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         format!(", Beta({a:.3},{b:.3})")
                     }
@@ -6031,6 +6064,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_bounded_linear_term_defaults_to_no_prior() {
+        let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1) + z").expect("formula");
+        assert_eq!(parsed.terms.len(), 2);
+        match &parsed.terms[0] {
+            ParsedTerm::BoundedLinear {
+                name,
+                min,
+                max,
+                prior,
+            } => {
+                assert_eq!(name, "mu_hat");
+                assert_eq!((*min, *max), (0.0, 1.0));
+                match prior {
+                    BoundedCoefficientPriorSpec::None => {}
+                    other => panic!("unexpected prior: {other:?}"),
+                }
+            }
+            other => panic!("expected bounded linear term, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_bounded_linear_term_with_center_pull() {
         let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, pull=\"center\") + z")
             .expect("formula");
@@ -6052,6 +6107,30 @@ mod tests {
                 }
             }
             other => panic!("expected bounded linear term, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bounded_linear_term_with_uniform_prior() {
+        let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=\"uniform\") + z")
+            .expect("formula");
+        assert_eq!(parsed.terms.len(), 2);
+        match &parsed.terms[0] {
+            ParsedTerm::BoundedLinear {
+                name,
+                min,
+                max,
+                prior,
+            } => {
+                assert_eq!(name, "mu_hat");
+                assert_eq!(*min, 0.0);
+                assert_eq!(*max, 1.0);
+                match prior {
+                    BoundedCoefficientPriorSpec::Uniform => {}
+                    other => panic!("unexpected prior: {other:?}"),
+                }
+            }
+            other => panic!("unexpected term: {other:?}"),
         }
     }
 
