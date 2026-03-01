@@ -621,7 +621,11 @@ fn logistic_normal_tail_cutoff(mu: f64, sigma: f64) -> usize {
 #[inline]
 fn erfcx_nonnegative(x: f64) -> f64 {
     if !x.is_finite() {
-        return if x.is_sign_positive() { 0.0 } else { f64::INFINITY };
+        return if x.is_sign_positive() {
+            0.0
+        } else {
+            f64::INFINITY
+        };
     }
     if x <= 0.0 {
         return 1.0;
@@ -788,24 +792,6 @@ fn logit_posterior_mean_with_deriv_exact_erfcx(
 }
 
 #[inline]
-fn cloglog_plug_in(mu: f64) -> IntegratedMeanDerivative {
-    // Degenerate Gaussian-uncertainty limit:
-    // if eta ~ N(mu, sigma^2) and sigma -> 0, then eta collapses to mu and
-    // the integrated cloglog mean/derivative reduce to the ordinary inverse
-    // link and its pointwise slope:
-    //   f(mu)   = 1 - exp(-exp(mu))
-    //   f'(mu)  = exp(mu - exp(mu)).
-    let z = mu.clamp(-30.0, 30.0);
-    let ez = z.exp();
-    let surv = (-ez).exp();
-    IntegratedMeanDerivative {
-        mean: (1.0 - surv).clamp(1e-12, 1.0 - 1e-12),
-        dmean_dmu: (ez * surv).max(0.0),
-        mode: IntegratedExpectationMode::ExactClosedForm,
-    }
-}
-
-#[inline]
 fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     // Small-variance heat-kernel expansion.
     //
@@ -863,6 +849,93 @@ fn cloglog_posterior_mean_with_deriv_ghq(
 }
 
 #[inline]
+fn survival_posterior_mean_ghq(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
+    integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
+        let z = x.clamp(-30.0, 30.0);
+        (-(z.exp())).exp()
+    })
+    .clamp(0.0, 1.0)
+}
+
+fn cloglog_survival_term_controlled(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> (f64, IntegratedExpectationMode) {
+    // Shared scalar evaluator for the lognormal-Laplace object
+    //
+    //   S(mu, sigma) = E[exp(-exp(eta))],  eta ~ N(mu, sigma^2),
+    //
+    // which is the common core of both:
+    //
+    //   cloglog mean   = 1 - S(mu, sigma)
+    //   survival mean  = S(mu, sigma).
+    //
+    // Routing here mirrors the production ladder used by the integrated
+    // cloglog derivative path:
+    // - plug-in when sigma is effectively zero
+    // - Taylor / heat-kernel at small sigma
+    // - Miles erfc-series in tail-dominated regimes
+    // - exact Gamma/Mellin-Barnes in the central large-sigma regime
+    // - GHQ only as the final numerical fallback
+    if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
+        let z = mu.clamp(-30.0, 30.0);
+        return (
+            (-(z.exp())).exp().clamp(0.0, 1.0),
+            IntegratedExpectationMode::ExactClosedForm,
+        );
+    }
+    if sigma < CLOGLOG_SIGMA_TAYLOR_MAX {
+        let mean = cloglog_small_sigma_taylor(mu, sigma).mean;
+        return (
+            (1.0 - mean).clamp(0.0, 1.0),
+            IntegratedExpectationMode::ControlledAsymptotic,
+        );
+    }
+    if (mu.abs() / sigma) >= 3.0 {
+        if let Ok(out) = cloglog_survival_miles(mu, sigma) {
+            return (
+                out.clamp(0.0, 1.0),
+                IntegratedExpectationMode::ExactSpecialFunction,
+            );
+        }
+    }
+    if let Ok(out) = cloglog_survival_gamma_reference(mu, sigma) {
+        return (
+            out.clamp(0.0, 1.0),
+            IntegratedExpectationMode::ExactSpecialFunction,
+        );
+    }
+    (
+        survival_posterior_mean_ghq(ctx, mu, sigma),
+        IntegratedExpectationMode::QuadratureFallback,
+    )
+}
+
+#[inline]
+fn cloglog_survival_second_moment_controlled(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> (f64, IntegratedExpectationMode) {
+    // If
+    //
+    //   S(mu, sigma) = E[exp(-exp(eta))],   eta ~ N(mu, sigma^2),
+    //
+    // then the survival second moment is
+    //
+    //   E[S(eta)^2]
+    //     = E[exp(-2 exp(eta))]
+    //     = L(2; mu, sigma)
+    //     = L(1; mu + ln 2, sigma)
+    //     = S(mu + ln 2, sigma).
+    //
+    // So the exact same routed scalar evaluator can be reused by shifting mu
+    // by ln 2 rather than introducing a second quadrature-specific code path.
+    cloglog_survival_term_controlled(ctx, mu + std::f64::consts::LN_2, sigma)
+}
+
+#[inline]
 fn log_half_erfc_stable(u: f64) -> f64 {
     // Stable log(0.5 * erfc(u)).
     //
@@ -878,64 +951,6 @@ fn log_half_erfc_stable(u: f64) -> f64 {
     } else {
         (0.5 * erfc(u)).ln()
     }
-}
-
-fn cloglog_posterior_mean_with_deriv_miles(
-    mu: f64,
-    sigma: f64,
-) -> Result<IntegratedMeanDerivative, EstimationError> {
-    // We rewrite integrated cloglog in terms of the lognormal Laplace transform
-    //
-    //   f(eta) = 1 - exp(-exp(eta)),
-    //   S(mu, sigma) = E[exp(-exp(eta))],      eta ~ N(mu, sigma^2),
-    //   mean(mu, sigma) = E[f(eta)] = 1 - S(mu, sigma).
-    //
-    // The PIRLS derivative is the location derivative of the same Gaussian
-    // expectation:
-    //
-    //   dmean/dmu
-    //     = E[d/deta (1 - exp(-exp(eta)))]
-    //     = E[exp(eta - exp(eta))].
-    //
-    // Instead of differentiating the Miles series term-by-term, we use the
-    // exact Gaussian tilting identity. For any measurable g with finite moment,
-    //
-    //   E[e^eta g(eta)]
-    //     = ∫ e^eta g(eta) phi_{mu,sigma}(eta) d eta
-    //     = exp(mu + sigma^2 / 2)
-    //       ∫ g(eta) phi_{mu+sigma^2,sigma}(eta) d eta
-    //     = exp(mu + sigma^2 / 2) E[g(eta')],
-    //
-    // where eta' ~ N(mu + sigma^2, sigma^2). Choosing
-    //
-    //   g(eta) = exp(-exp(eta))
-    //
-    // gives the exact identity used below:
-    //
-    //   dmean/dmu
-    //     = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma).
-    //
-    // So both outputs reduce to the same scalar survival evaluator:
-    //
-    //   mean       = 1 - S(mu, sigma)
-    //   dmean/dmu  = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma).
-    //
-    // This is mathematically cleaner and numerically safer than carrying a
-    // second differentiated approximation.
-    let survival = cloglog_survival_miles(mu, sigma)?;
-    let shifted_survival = cloglog_survival_miles(mu + sigma * sigma, sigma)?;
-    let mean = (1.0 - survival).clamp(1e-12, 1.0 - 1e-12);
-    let dmean = (mu + 0.5 * sigma * sigma).exp() * shifted_survival;
-    if !(mean.is_finite() && dmean.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "Miles cloglog backend produced non-finite values".to_string(),
-        ));
-    }
-    Ok(IntegratedMeanDerivative {
-        mean,
-        dmean_dmu: dmean.max(0.0),
-        mode: IntegratedExpectationMode::ExactSpecialFunction,
-    })
 }
 
 fn cloglog_survival_miles(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
@@ -977,7 +992,8 @@ fn cloglog_survival_miles(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
         for n in pair_start..(pair_start + 2).min(CLOGLOG_MILES_MAX_TERMS) {
             let nf = n as f64;
             let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
-            let base_log = nf * mu + 0.5 * sigma * sigma * nf * nf - statrs::function::gamma::ln_gamma(nf + 1.0);
+            let base_log = nf * mu + 0.5 * sigma * sigma * nf * nf
+                - statrs::function::gamma::ln_gamma(nf + 1.0);
             let u = (mu - alpha_ln + sigma * sigma * nf) / (SQRT_2 * sigma);
             let log_half_erfc = log_half_erfc_stable(u);
             let term = sign * (base_log + log_half_erfc).exp();
@@ -1266,36 +1282,86 @@ pub(crate) fn cloglog_posterior_mean_with_deriv_controlled(
     sigma: f64,
 ) -> IntegratedMeanDerivative {
     // Final production routing for integrated cloglog under Gaussian latent
-    // uncertainty:
-    // 1. sigma ~= 0      -> exact plug-in limit
-    // 2. small sigma     -> heat-kernel / Taylor approximation
-    // 3. tail-dominated  -> guarded Miles series
-    // 4. otherwise       -> exact Mellin-Barnes / Gamma inversion
-    // 5. final escape    -> GHQ fallback only on numerical failure
+    // uncertainty.
     //
-    // The large-sigma central regime uses the exact Gamma/Mellin-Barnes path.
-    // GHQ is retained only as a final safety fallback if the special-function
-    // backend produces a non-finite result.
+    // The target quantity is always
+    //
+    //   mean(mu, sigma)      = E[1 - exp(-exp(eta))]
+    //   dmean/dmu            = E[exp(eta - exp(eta))],
+    //   eta ~ N(mu, sigma^2).
+    //
+    // Different numerical regimes favor different exact or controlled
+    // representations of the same lognormal-Laplace object:
+    //
+    // 1. sigma ~= 0
+    //    The Gaussian collapses to a point mass, so the ordinary inverse link
+    //    and its pointwise derivative are exact.
+    //
+    // 2. small sigma
+    //    The heat-kernel / Taylor expansion is efficient and tracks the true
+    //    integrated mean and derivative to high accuracy without invoking any
+    //    special-function machinery.
+    //
+    // 3. tail-dominated large sigma
+    //    The Miles erfc-gated series is efficient because the erfc gate keeps
+    //    the alternating lognormal-moment series short and numerically tame.
+    //
+    // 4. central large sigma
+    //    The exact Mellin-Barnes / Gamma inversion is preferred, because the
+    //    Miles series is no longer the best-behaved production representation.
+    //
+    // 5. final escape
+    //    GHQ remains only as a numerical fallback if the chosen special-
+    //    function backend returns a non-finite or non-converged result.
+    //
+    // This layered routing is the real conclusion of the math work: not one
+    // magical universal formula, but one shared mathematical target with the
+    // best evaluator chosen for each regime.
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
-        return cloglog_plug_in(mu);
+        let z = mu.clamp(-30.0, 30.0);
+        let ez = z.exp();
+        let surv = (-ez).exp();
+        return IntegratedMeanDerivative {
+            mean: (1.0 - surv).clamp(1e-12, 1.0 - 1e-12),
+            dmean_dmu: (ez * surv).max(0.0),
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        };
     }
     if sigma < CLOGLOG_SIGMA_TAYLOR_MAX {
         return cloglog_small_sigma_taylor(mu, sigma);
     }
-    // Use the lognormal-Laplace Miles series only in tail-dominated regimes,
-    // where the erfc gate makes the alternating series both short and stable.
-    // For the central moderate/large-sigma regime, fall through to the exact
-    // Mellin-Barnes backend instead of GHQ.
-    let use_miles = (mu.abs() / sigma) >= 3.0;
-    if use_miles {
-        if let Ok(out) = cloglog_posterior_mean_with_deriv_miles(mu, sigma) {
-            return out;
-        }
+
+    let (survival, mode) = cloglog_survival_term_controlled(ctx, mu, sigma);
+    let (shifted_survival, shifted_mode) =
+        cloglog_survival_term_controlled(ctx, mu + sigma * sigma, sigma);
+    let mean = if survival > 0.5 {
+        // When S is close to 1, form 1 - S as -expm1(log S) to avoid losing
+        // low-order bits to cancellation.
+        -survival.ln().exp_m1()
+    } else {
+        1.0 - survival
     }
-    if let Ok(out) = cloglog_posterior_mean_with_deriv_gamma_reference(mu, sigma) {
-        return out;
+    .clamp(1e-12, 1.0 - 1e-12);
+    let dmean = (mu + 0.5 * sigma * sigma).exp() * shifted_survival;
+    let mode = if matches!(mode, IntegratedExpectationMode::QuadratureFallback)
+        || matches!(shifted_mode, IntegratedExpectationMode::QuadratureFallback)
+    {
+        IntegratedExpectationMode::QuadratureFallback
+    } else if matches!(mode, IntegratedExpectationMode::ControlledAsymptotic)
+        || matches!(
+            shifted_mode,
+            IntegratedExpectationMode::ControlledAsymptotic
+        )
+    {
+        IntegratedExpectationMode::ControlledAsymptotic
+    } else {
+        mode
+    };
+    IntegratedMeanDerivative {
+        mean,
+        dmean_dmu: dmean.max(0.0),
+        mode,
     }
-    cloglog_posterior_mean_with_deriv_ghq(ctx, mu, sigma)
 }
 
 pub fn integrated_inverse_link_mean_and_derivative(
@@ -1378,8 +1444,12 @@ pub fn logit_posterior_mean_with_deriv_batch(
     let mut dmu = ndarray::Array1::<f64>::zeros(n);
 
     for i in 0..n {
-        let integrated =
-            integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, eta[i], se_eta[i]);
+        let integrated = integrated_inverse_link_mean_and_derivative(
+            ctx,
+            LinkFunction::Logit,
+            eta[i],
+            se_eta[i],
+        );
         mu[i] = integrated.mean;
         dmu[i] = integrated.dmean_dmu;
     }
@@ -1395,11 +1465,9 @@ pub fn logit_posterior_mean_batch(
     eta: &ndarray::Array1<f64>,
     se_eta: &ndarray::Array1<f64>,
 ) -> ndarray::Array1<f64> {
-    ndarray::Zip::from(eta)
-        .and(se_eta)
-        .map_collect(|&e, &se| {
-            integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, e, se).mean
-        })
+    ndarray::Zip::from(eta).and(se_eta).map_collect(|&e, &se| {
+        integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, e, se).mean
+    })
 }
 
 #[inline]
@@ -1683,14 +1751,33 @@ pub fn cloglog_posterior_mean_variance(
     eta: f64,
     se_eta: f64,
 ) -> (f64, f64) {
-    let m1 = cloglog_posterior_mean(ctx, eta, se_eta);
-    let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let z = x.clamp(-30.0, 30.0);
-        let p = (1.0 - (-(z.exp())).exp()).clamp(1e-10, 1.0 - 1e-10);
-        p * p
-    })
-    .clamp(0.0, 1.0);
-    (m1, (m2 - m1 * m1).max(0.0))
+    // With p(eta) = 1 - S(eta), where S(eta) = exp(-exp(eta)),
+    //
+    //   E[p]   = 1 - E[S]
+    //   E[p^2] = E[(1 - S)^2] = 1 - 2 E[S] + E[S^2]
+    //
+    // and because
+    //
+    //   S(eta)^2 = exp(-2 exp(eta)) = L(2; mu, sigma) = L(1; mu + ln 2, sigma),
+    //
+    // the second moment is obtained by the same shared survival-term
+    // evaluator with the exact mu -> mu + ln 2 shift. The variance then
+    // collapses to
+    //
+    //   Var[p] = E[p^2] - E[p]^2 = E[S^2] - E[S]^2.
+    //
+    // So cloglog and survival actually share the same posterior variance under
+    // Gaussian uncertainty; they only differ in whether the reported mean is
+    // E[S] or 1 - E[S].
+    let (survival, _) = cloglog_survival_term_controlled(ctx, eta, se_eta);
+    let (survival_sq, _) = cloglog_survival_second_moment_controlled(ctx, eta, se_eta);
+    let mean = if survival > 0.5 {
+        (-survival.ln().exp_m1()).clamp(1e-10, 1.0 - 1e-10)
+    } else {
+        (1.0 - survival).clamp(1e-10, 1.0 - 1e-10)
+    };
+    let variance = (survival_sq - survival * survival).max(0.0);
+    (mean, variance)
 }
 
 /// Posterior mean under cloglog inverse link:
@@ -1729,11 +1816,12 @@ pub fn cloglog_posterior_mean_variance(
 /// repeated GHQ with a special-function or rapidly convergent series backend.
 #[inline]
 pub fn cloglog_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
-    integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let z = x.clamp(-30.0, 30.0);
-        1.0 - (-(z.exp())).exp()
-    })
-    .clamp(1e-10, 1.0 - 1e-10)
+    let (survival, _) = cloglog_survival_term_controlled(ctx, eta, se_eta);
+    if survival > 0.5 {
+        (-survival.ln().exp_m1()).clamp(1e-10, 1.0 - 1e-10)
+    } else {
+        (1.0 - survival).clamp(1e-10, 1.0 - 1e-10)
+    }
 }
 
 /// Posterior mean under the Royston-Parmar survival transform:
@@ -1751,11 +1839,9 @@ pub fn cloglog_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) ->
 /// therefore be shared directly with survival models that use this transform.
 #[inline]
 pub fn survival_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
-    integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let z = x.clamp(-30.0, 30.0);
-        (-(z.exp())).exp()
-    })
-    .clamp(0.0, 1.0)
+    cloglog_survival_term_controlled(ctx, eta, se_eta)
+        .0
+        .clamp(0.0, 1.0)
 }
 
 #[inline]
@@ -1764,14 +1850,9 @@ pub fn survival_posterior_mean_variance(
     eta: f64,
     se_eta: f64,
 ) -> (f64, f64) {
-    let m1 = survival_posterior_mean(ctx, eta, se_eta).clamp(0.0, 1.0);
-    let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let z = x.clamp(-30.0, 30.0);
-        let p = (-(z.exp())).exp().clamp(0.0, 1.0);
-        p * p
-    })
-    .clamp(0.0, 1.0);
-    (m1, (m2 - m1 * m1).max(0.0))
+    let (m1, _) = cloglog_survival_term_controlled(ctx, eta, se_eta);
+    let (m2, _) = cloglog_survival_second_moment_controlled(ctx, eta, se_eta);
+    (m1.clamp(0.0, 1.0), (m2 - m1 * m1).max(0.0))
 }
 
 /// Oracle-only exact logistic-normal mean using the Faddeeva-series representation.
@@ -2362,6 +2443,67 @@ mod tests {
     }
 
     #[test]
+    fn test_cloglog_and_survival_posterior_means_are_complements() {
+        let ctx = QuadratureContext::new();
+        let cases = [
+            (-3.0, 0.0),
+            (-0.2, 0.1),
+            (0.4, 0.8),
+            (2.0, 1.5),
+            (10.0, 0.3),
+        ];
+        for (eta, se) in cases {
+            let clog = cloglog_posterior_mean(&ctx, eta, se);
+            let surv = survival_posterior_mean(&ctx, eta, se);
+            assert_relative_eq!(clog + surv, 1.0, epsilon = 2e-10, max_relative = 2e-10);
+        }
+    }
+
+    #[test]
+    fn test_cloglog_and_survival_share_large_sigma_special_function_path() {
+        let ctx = QuadratureContext::new();
+        let eta = -0.2;
+        let se = 0.8;
+        let clog = cloglog_posterior_mean(&ctx, eta, se);
+        let surv = survival_posterior_mean(&ctx, eta, se);
+        let integrated =
+            integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, eta, se);
+        assert_eq!(
+            integrated.mode,
+            IntegratedExpectationMode::ExactSpecialFunction
+        );
+        assert_relative_eq!(clog, integrated.mean, epsilon = 1e-12, max_relative = 1e-12);
+        assert_relative_eq!(clog + surv, 1.0, epsilon = 1e-10, max_relative = 1e-10);
+    }
+
+    #[test]
+    fn test_cloglog_and_survival_posterior_variances_match() {
+        let ctx = QuadratureContext::new();
+        let cases = [(-3.0, 0.0), (-0.2, 0.1), (0.4, 0.8), (2.0, 1.5)];
+        for (eta, se) in cases {
+            let (_, clog_var) = cloglog_posterior_mean_variance(&ctx, eta, se);
+            let (_, surv_var) = survival_posterior_mean_variance(&ctx, eta, se);
+            assert_relative_eq!(clog_var, surv_var, epsilon = 1e-12, max_relative = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_survival_variance_uses_exact_second_moment_shift() {
+        let ctx = QuadratureContext::new();
+        let eta = -0.2;
+        let se = 0.8;
+        let (survival, _) = cloglog_survival_term_controlled(&ctx, eta, se);
+        let (survival_sq, _) = cloglog_survival_second_moment_controlled(&ctx, eta, se);
+        let (_, variance) = survival_posterior_mean_variance(&ctx, eta, se);
+        assert_relative_eq!(
+            variance,
+            (survival_sq - survival * survival).max(0.0),
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+    }
+
+    #[test]
     fn test_integrated_dispatch_uses_closed_form_probit() {
         let ctx = QuadratureContext::new();
         let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Probit, 0.7, 1.3);
@@ -2409,12 +2551,7 @@ mod tests {
             for &sigma in &sigmas {
                 let approx = cloglog_posterior_mean_with_deriv_controlled(&ctx, mu, sigma);
                 let ghq = cloglog_posterior_mean_with_deriv_ghq(&ctx, mu, sigma);
-                assert_relative_eq!(
-                    approx.mean,
-                    ghq.mean,
-                    epsilon = 2e-3,
-                    max_relative = 2e-3
-                );
+                assert_relative_eq!(approx.mean, ghq.mean, epsilon = 2e-3, max_relative = 2e-3);
                 assert_relative_eq!(
                     approx.dmean_dmu,
                     ghq.dmean_dmu,
@@ -2496,8 +2633,12 @@ mod tests {
         let batch_mean = logit_posterior_mean_batch(&ctx, &eta, &se);
         let (batch_mu, batch_dmu) = logit_posterior_mean_with_deriv_batch(&ctx, &eta, &se);
         for i in 0..eta.len() {
-            let direct =
-                integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, eta[i], se[i]);
+            let direct = integrated_inverse_link_mean_and_derivative(
+                &ctx,
+                LinkFunction::Logit,
+                eta[i],
+                se[i],
+            );
             assert_relative_eq!(batch_mean[i], direct.mean, epsilon = 1e-12);
             assert_relative_eq!(batch_mu[i], direct.mean, epsilon = 1e-12);
             assert_relative_eq!(batch_dmu[i], direct.dmean_dmu, epsilon = 1e-12);

@@ -3,9 +3,11 @@ use crate::custom_family::{
     ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
 use crate::faer_ndarray::FaerSvd;
+use crate::families::sigma_link::{
+    bounded_sigma_derivs_up_to_third, bounded_sigma_derivs_up_to_third_scalar,
+};
 use crate::matrix::DesignMatrix;
 use crate::pirls::LinearInequalityConstraints;
-use crate::families::sigma_link::{bounded_sigma_derivs_up_to_third, bounded_sigma_derivs_up_to_third_scalar};
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::LinkFunction;
 use ndarray::{Array1, Array2, s};
@@ -1302,9 +1304,21 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
             &quad_ctx,
             [mu_h[i], mu_t[i], mu_ls[i]],
             [
-                [var_h_row(i, input, &xh_hh), cov_ht_row(i, x_threshold_dense, &xh_ht), cov_hl_row(i, x_log_sigma_dense, &xh_hl)],
-                [cov_ht_row(i, x_threshold_dense, &xh_ht), var_t_row(i, x_threshold_dense, &xt_tt), cov_tl_row(i, x_log_sigma_dense, &xt_tl)],
-                [cov_hl_row(i, x_log_sigma_dense, &xh_hl), cov_tl_row(i, x_log_sigma_dense, &xt_tl), var_ls_row(i, x_log_sigma_dense, &xl_ll)],
+                [
+                    var_h_row(i, input, &xh_hh),
+                    cov_ht_row(i, x_threshold_dense, &xh_ht),
+                    cov_hl_row(i, x_log_sigma_dense, &xh_hl),
+                ],
+                [
+                    cov_ht_row(i, x_threshold_dense, &xh_ht),
+                    var_t_row(i, x_threshold_dense, &xt_tt),
+                    cov_tl_row(i, x_log_sigma_dense, &xt_tl),
+                ],
+                [
+                    cov_hl_row(i, x_log_sigma_dense, &xh_hl),
+                    cov_tl_row(i, x_log_sigma_dense, &xt_tl),
+                    var_ls_row(i, x_log_sigma_dense, &xl_ll),
+                ],
             ],
             |h, t, ls| {
                 let sigma =
@@ -1335,14 +1349,20 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
             return fallback_row(i);
         }
 
-        if var_ls <= 1e-12
-            && (cov_hl_i.abs() > 1e-10 || cov_tl_i.abs() > 1e-10)
-        {
+        if var_ls <= 1e-12 && (cov_hl_i.abs() > 1e-10 || cov_tl_i.abs() > 1e-10) {
             return fallback_row(i);
         }
 
-        let beta_h_ls = if var_ls > 1e-12 { cov_hl_i / var_ls } else { 0.0 };
-        let beta_t_ls = if var_ls > 1e-12 { cov_tl_i / var_ls } else { 0.0 };
+        let beta_h_ls = if var_ls > 1e-12 {
+            cov_hl_i / var_ls
+        } else {
+            0.0
+        };
+        let beta_t_ls = if var_ls > 1e-12 {
+            cov_tl_i / var_ls
+        } else {
+            0.0
+        };
         let var_h_cond = (var_h - beta_h_ls * cov_hl_i).max(0.0);
         let var_t_cond = (var_t - beta_t_ls * cov_tl_i).max(0.0);
         let cov_ht_cond = cov_ht_i - beta_h_ls * cov_tl_i;
@@ -1351,26 +1371,38 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
             return fallback_row(i);
         }
 
-        crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, mu_ls[i], var_ls.sqrt(), |ls| {
-            let sigma = bounded_sigma_derivs_up_to_third_scalar(ls, input.sigma_min, input.sigma_max)
-                .0
-                .max(1e-12);
-            let inv_sigma = 1.0 / sigma;
-            let delta_ls = ls - mu_ls[i];
-            let mu_h_cond = mu_h[i] + beta_h_ls * delta_ls;
-            let mu_t_cond = mu_t[i] + beta_t_ls * delta_ls;
-            let mu_loc = -mu_h_cond - mu_t_cond * inv_sigma;
-            let var_loc =
-                (var_h_cond + var_t_cond * inv_sigma * inv_sigma + 2.0 * cov_ht_cond * inv_sigma)
+        crate::quadrature::normal_expectation_1d_adaptive(
+            &quad_ctx,
+            mu_ls[i],
+            var_ls.sqrt(),
+            |ls| {
+                let sigma =
+                    bounded_sigma_derivs_up_to_third_scalar(ls, input.sigma_min, input.sigma_max)
+                        .0
+                        .max(1e-12);
+                let inv_sigma = 1.0 / sigma;
+                let delta_ls = ls - mu_ls[i];
+                let mu_h_cond = mu_h[i] + beta_h_ls * delta_ls;
+                let mu_t_cond = mu_t[i] + beta_t_ls * delta_ls;
+                let mu_loc = -mu_h_cond - mu_t_cond * inv_sigma;
+                let var_loc = (var_h_cond
+                    + var_t_cond * inv_sigma * inv_sigma
+                    + 2.0 * cov_ht_cond * inv_sigma)
                     .max(0.0);
-            crate::quadrature::integrated_inverse_link_mean_and_derivative(
-                &quad_ctx,
-                link,
-                mu_loc,
-                var_loc.sqrt(),
-            )
-            .mean
-        })
+                // This is the payoff of the conditional Gaussian reduction above:
+                // for a fixed ls, the inner latent quantity eta_loc is Gaussian, so
+                // we can hand its conditional mean and standard deviation straight
+                // to the shared integrated-expectation dispatcher instead of doing
+                // another nested quadrature over h and t.
+                crate::quadrature::integrated_inverse_link_mean_and_derivative(
+                    &quad_ctx,
+                    link,
+                    mu_loc,
+                    var_loc.sqrt(),
+                )
+                .mean
+            },
+        )
         .clamp(0.0, 1.0)
     }));
 
@@ -1735,8 +1767,9 @@ mod tests {
             [0.0, 0.0, 0.0, 0.0, 0.02, 0.005],
             [0.0, 0.0, 0.0, 0.0, 0.005, 0.02],
         ];
-        let reduced = predict_survival_location_scale_probit_posterior_mean(&input, &fit, &covariance)
-            .expect("reduced posterior mean");
+        let reduced =
+            predict_survival_location_scale_probit_posterior_mean(&input, &fit, &covariance)
+                .expect("reduced posterior mean");
 
         let mu_h = input.x_time_exit.row(0).dot(&fit.beta_time) + input.eta_time_offset_exit[0];
         let x_t = input.x_threshold.to_dense_arc();
@@ -1749,11 +1782,20 @@ mod tests {
         let cov_ht = covariance.slice(s![0..2, 2..4]).to_owned();
         let cov_hl = covariance.slice(s![0..2, 4..6]).to_owned();
         let cov_tl = covariance.slice(s![2..4, 4..6]).to_owned();
-        let var_h = input.x_time_exit.row(0).dot(&cov_hh.dot(&input.x_time_exit.row(0).to_owned()));
+        let var_h = input
+            .x_time_exit
+            .row(0)
+            .dot(&cov_hh.dot(&input.x_time_exit.row(0).to_owned()));
         let var_t = x_t.row(0).dot(&cov_tt.dot(&x_t.row(0).to_owned()));
         let var_ls = x_ls.row(0).dot(&cov_ll.dot(&x_ls.row(0).to_owned()));
-        let cov_ht_i = input.x_time_exit.row(0).dot(&cov_ht.dot(&x_t.row(0).to_owned()));
-        let cov_hl_i = input.x_time_exit.row(0).dot(&cov_hl.dot(&x_ls.row(0).to_owned()));
+        let cov_ht_i = input
+            .x_time_exit
+            .row(0)
+            .dot(&cov_ht.dot(&x_t.row(0).to_owned()));
+        let cov_hl_i = input
+            .x_time_exit
+            .row(0)
+            .dot(&cov_hl.dot(&x_ls.row(0).to_owned()));
         let cov_tl_i = x_t.row(0).dot(&cov_tl.dot(&x_ls.row(0).to_owned()));
         let quad_ctx = crate::quadrature::QuadratureContext::new();
         let ghq = crate::quadrature::normal_expectation_3d_adaptive(

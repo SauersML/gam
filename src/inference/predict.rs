@@ -276,14 +276,24 @@ where
     let quad_ctx = crate::quadrature::QuadratureContext::new();
 
     let mean = match family_link_for_integrated_expectation(family) {
-        Some(link) => Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(
-            |(&e, &se)| {
+        Some(link) => {
+            Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
+                // Prediction-time uncertainty propagation deliberately shares
+                // the same dispatcher as integrated PIRLS:
+                //
+                //   mean_i = E[g^{-1}(Eta_i)],
+                //   Eta_i  ~ N(e, se^2).
+                //
+                // That means every exact/controlled decision for a link is
+                // made once in quadrature.rs and reused here unchanged. This
+                // avoids silent drift where fitting and prediction would apply
+                // different Gaussian-uncertainty mathematics to the same link.
                 crate::quadrature::integrated_inverse_link_mean_and_derivative(
                     &quad_ctx, link, e, se,
                 )
                 .mean
-            },
-        )),
+            }))
+        }
         None => match family {
             crate::types::LikelihoodFamily::GaussianIdentity => eta.clone(),
             crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
@@ -602,7 +612,7 @@ pub fn coefficient_uncertainty_with_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array2};
+    use ndarray::{Array2, array};
 
     #[test]
     fn predict_posterior_mean_probit_matches_closed_form_reference() {
