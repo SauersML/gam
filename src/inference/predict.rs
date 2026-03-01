@@ -219,6 +219,24 @@ pub fn predict_gam_posterior_mean<X>(
 where
     X: Into<DesignMatrix>,
 {
+    // Posterior mean prediction under Gaussian coefficient uncertainty.
+    //
+    // For each row x_i we first propagate coefficient covariance to the linear
+    // predictor:
+    //
+    //   eta_i       = x_i^T beta
+    //   Var(eta_i)  = x_i^T Var(beta) x_i.
+    //
+    // For nonlinear links the desired prediction is not the plug-in
+    // g^{-1}(eta_i), but the Gaussian-uncertainty average
+    //
+    //   E[g^{-1}(Eta_i)],   Eta_i ~ N(eta_i, Var(eta_i)).
+    //
+    // The key design choice is that prediction uses the same integrated-
+    // expectation dispatcher as integrated PIRLS. That keeps fitting-time and
+    // prediction-time uncertainty propagation on the same mathematical object:
+    // if a link has an exact closed form or guarded special-function backend,
+    // both paths use it; if not, both paths fall back consistently.
     let x = x.into();
     if x.ncols() != beta.len() {
         return Err(EstimationError::InvalidInput(format!(
