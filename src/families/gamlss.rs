@@ -3,8 +3,9 @@ use crate::basis::{
     evaluate_bspline_third_derivative_scalar,
 };
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
-    KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
+    BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily,
+    CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, FamilyEvaluation, KnownLinkWiggle,
+    ParameterBlockSpec, ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::faer_ndarray::{fast_ata, fast_atv};
 use crate::families::sigma_link::{
@@ -17,7 +18,10 @@ use crate::pirls::WorkingLikelihood as EngineWorkingLikelihood;
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
-    optimize_two_block_spatial_length_scale,
+    TwoBlockExactJointHyperSetup, build_term_collection_design,
+    freeze_spatial_length_scale_terms_from_design, get_spatial_length_scale,
+    optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivative_info_list,
 };
 use crate::types::{LikelihoodFamily, LinkFunction};
 use faer::Mat as FaerMat;
@@ -294,6 +298,83 @@ fn initial_log_lambdas_or_zeros(block: &ParameterBlockInput) -> Result<Array1<f6
         ));
     }
     Ok(lambdas)
+}
+
+fn build_block_spatial_psi_derivatives(
+    data: ndarray::ArrayView2<'_, f64>,
+    resolved_spec: &TermCollectionSpec,
+    design: &TermCollectionDesign,
+) -> Result<Option<Vec<CustomFamilyBlockPsiDerivative>>, String> {
+    let spatial_terms = spatial_length_scale_term_indices(resolved_spec);
+    let Some(info_list) = try_build_spatial_log_kappa_derivative_info_list(
+        data,
+        resolved_spec,
+        design,
+        &spatial_terms,
+    )
+    .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        info_list
+            .into_iter()
+            .map(|info| CustomFamilyBlockPsiDerivative {
+                penalty_index: info.penalty_index,
+                x_psi: info.x_psi,
+                s_psi: info.s_psi,
+            })
+            .collect(),
+    ))
+}
+
+fn build_two_block_exact_joint_setup(
+    mean_spec: &TermCollectionSpec,
+    noise_spec: &TermCollectionSpec,
+    mean_penalties: usize,
+    noise_penalties: usize,
+    extra_rho0: &[f64],
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> TwoBlockExactJointHyperSetup {
+    let mean_terms = spatial_length_scale_term_indices(mean_spec);
+    let noise_terms = spatial_length_scale_term_indices(noise_spec);
+    let rho_dim = mean_penalties + noise_penalties + extra_rho0.len();
+    let psi_dim = mean_terms.len() + noise_terms.len();
+    let mut theta0 = Array1::<f64>::zeros(rho_dim + psi_dim);
+    let mut lower = Array1::<f64>::from_elem(rho_dim + psi_dim, -12.0);
+    let mut upper = Array1::<f64>::from_elem(rho_dim + psi_dim, 12.0);
+
+    for (i, &rho0) in extra_rho0.iter().enumerate() {
+        theta0[mean_penalties + noise_penalties + i] = rho0;
+    }
+    for (slot, &term_idx) in mean_terms.iter().enumerate() {
+        theta0[rho_dim + slot] = get_spatial_length_scale(mean_spec, term_idx)
+            .unwrap_or(kappa_options.min_length_scale)
+            .clamp(
+                kappa_options.min_length_scale,
+                kappa_options.max_length_scale,
+            )
+            .ln();
+    }
+    for (slot, &term_idx) in noise_terms.iter().enumerate() {
+        theta0[rho_dim + mean_terms.len() + slot] = get_spatial_length_scale(noise_spec, term_idx)
+            .unwrap_or(kappa_options.min_length_scale)
+            .clamp(
+                kappa_options.min_length_scale,
+                kappa_options.max_length_scale,
+            )
+            .ln();
+    }
+    for i in 0..psi_dim {
+        lower[rho_dim + i] = kappa_options.min_length_scale.ln();
+        upper[rho_dim + i] = kappa_options.max_length_scale.ln();
+    }
+
+    TwoBlockExactJointHyperSetup {
+        theta0,
+        lower,
+        upper,
+    }
 }
 
 fn solve_weighted_projection(
@@ -966,49 +1047,187 @@ pub fn fit_gaussian_location_scale_terms(
     let sigma_max = spec.sigma_max;
     let mut mean_log_lambda_hint: Option<Array1<f64>> = None;
     let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
-    let solved = optimize_two_block_spatial_length_scale(
-        data,
-        &spec.mean_spec,
-        &spec.log_sigma_spec,
-        kappa_options,
-        |mean_design, noise_design| {
-            let fit = fit_gaussian_location_scale(
-                GaussianLocationScaleSpec {
-                    y: y.clone(),
-                    weights: weights.clone(),
-                    sigma_min,
-                    sigma_max,
-                    mu_block: ParameterBlockInput {
-                        design: DesignMatrix::Dense(mean_design.design.clone()),
-                        offset: Array1::zeros(y.len()),
-                        penalties: mean_design.penalties.clone(),
-                        initial_log_lambdas: mean_log_lambda_hint.clone(),
-                        initial_beta: None,
+    let mut mean_beta_hint: Option<Array1<f64>> = None;
+    let mut noise_beta_hint: Option<Array1<f64>> = None;
+    let mean_boot_design =
+        build_term_collection_design(data, &spec.mean_spec).map_err(|e| e.to_string())?;
+    let noise_boot_design =
+        build_term_collection_design(data, &spec.log_sigma_spec).map_err(|e| e.to_string())?;
+    let mean_boot_spec =
+        freeze_spatial_length_scale_terms_from_design(&spec.mean_spec, &mean_boot_design)
+            .map_err(|e| e.to_string())?;
+    let noise_boot_spec =
+        freeze_spatial_length_scale_terms_from_design(&spec.log_sigma_spec, &noise_boot_design)
+            .map_err(|e| e.to_string())?;
+    let solved = if let (Some(_), Some(_)) = (
+        build_block_spatial_psi_derivatives(data, &mean_boot_spec, &mean_boot_design)?,
+        build_block_spatial_psi_derivatives(data, &noise_boot_spec, &noise_boot_design)?,
+    ) {
+        let joint_setup = build_two_block_exact_joint_setup(
+            &spec.mean_spec,
+            &spec.log_sigma_spec,
+            mean_boot_design.penalties.len(),
+            noise_boot_design.penalties.len(),
+            &[],
+            kappa_options,
+        );
+        let mut warm_state: Option<CustomFamilyWarmStart> = None;
+        let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
+        let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
+        optimize_two_block_spatial_length_scale_exact_joint(
+            data,
+            &spec.mean_spec,
+            &spec.log_sigma_spec,
+            kappa_options,
+            &joint_setup,
+            |theta, mean_spec_resolved, noise_spec_resolved, mean_design, noise_design| {
+                let k_mean = mean_design.penalties.len();
+                let k_noise = noise_design.penalties.len();
+                let mean_rho = theta.slice(s![0..k_mean]).to_owned();
+                let noise_rho = theta.slice(s![k_mean..(k_mean + k_noise)]).to_owned();
+                let fit = fit_gaussian_location_scale(
+                    GaussianLocationScaleSpec {
+                        y: y.clone(),
+                        weights: weights.clone(),
+                        sigma_min,
+                        sigma_max,
+                        mu_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(mean_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: mean_design.penalties.clone(),
+                            initial_log_lambdas: Some(mean_rho),
+                            initial_beta: mean_beta_hint_cell.borrow().clone(),
+                        },
+                        log_sigma_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(noise_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: noise_design.penalties.clone(),
+                            initial_log_lambdas: Some(noise_rho),
+                            initial_beta: noise_beta_hint_cell.borrow().clone(),
+                        },
                     },
-                    log_sigma_block: ParameterBlockInput {
-                        design: DesignMatrix::Dense(noise_design.design.clone()),
-                        offset: Array1::zeros(y.len()),
-                        penalties: noise_design.penalties.clone(),
-                        initial_log_lambdas: noise_log_lambda_hint.clone(),
-                        initial_beta: None,
-                    },
-                },
-                options,
-            )?;
-            let k_mean = mean_design.penalties.len();
-            let k_noise = noise_design.penalties.len();
-            if fit.log_lambdas.len() >= k_mean + k_noise {
+                    options,
+                )?;
                 mean_log_lambda_hint = Some(fit.log_lambdas.slice(s![0..k_mean]).to_owned());
                 noise_log_lambda_hint = Some(
                     fit.log_lambdas
                         .slice(s![k_mean..(k_mean + k_noise)])
                         .to_owned(),
                 );
-            }
-            Ok(fit)
-        },
-        |fit| fit.penalized_objective,
-    )?;
+                mean_beta_hint = Some(
+                    fit.block_states[GaussianLocationScaleFamily::BLOCK_MU]
+                        .beta
+                        .clone(),
+                );
+                noise_beta_hint = Some(
+                    fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
+                        .beta
+                        .clone(),
+                );
+                *mean_beta_hint_cell.borrow_mut() = mean_beta_hint.clone();
+                *noise_beta_hint_cell.borrow_mut() = noise_beta_hint.clone();
+                let _ = (mean_spec_resolved, noise_spec_resolved);
+                Ok(fit)
+            },
+            |theta, mean_spec_resolved, noise_spec_resolved, mean_design, noise_design| {
+                let mean_block = ParameterBlockSpec {
+                    name: "mu".to_string(),
+                    design: DesignMatrix::Dense(mean_design.design.clone()),
+                    offset: Array1::zeros(y.len()),
+                    penalties: mean_design.penalties.clone(),
+                    initial_log_lambdas: theta.slice(s![0..mean_design.penalties.len()]).to_owned(),
+                    initial_beta: mean_beta_hint_cell.borrow().clone(),
+                };
+                let noise_block = ParameterBlockSpec {
+                    name: "log_sigma".to_string(),
+                    design: DesignMatrix::Dense(noise_design.design.clone()),
+                    offset: Array1::zeros(y.len()),
+                    penalties: noise_design.penalties.clone(),
+                    initial_log_lambdas: theta
+                        .slice(s![mean_design.penalties.len()
+                            ..(mean_design.penalties.len() + noise_design.penalties.len())])
+                        .to_owned(),
+                    initial_beta: noise_beta_hint_cell.borrow().clone(),
+                };
+                let family = GaussianLocationScaleFamily {
+                    y: y.clone(),
+                    weights: weights.clone(),
+                    sigma_min,
+                    sigma_max,
+                };
+                let mean_derivs =
+                    build_block_spatial_psi_derivatives(data, mean_spec_resolved, mean_design)?
+                        .ok_or_else(|| "missing mean spatial psi derivatives".to_string())?;
+                let noise_derivs =
+                    build_block_spatial_psi_derivatives(data, noise_spec_resolved, noise_design)?
+                        .ok_or_else(|| "missing noise spatial psi derivatives".to_string())?;
+                let eval = evaluate_custom_family_joint_hyper(
+                    &family,
+                    &[mean_block, noise_block],
+                    options,
+                    theta,
+                    &[mean_derivs, noise_derivs],
+                    warm_state.as_ref(),
+                )?;
+                warm_state = Some(eval.warm_start);
+                Ok((eval.objective, eval.gradient))
+            },
+        )?
+    } else {
+        optimize_two_block_spatial_length_scale(
+            data,
+            &spec.mean_spec,
+            &spec.log_sigma_spec,
+            kappa_options,
+            |mean_design, noise_design| {
+                let fit = fit_gaussian_location_scale(
+                    GaussianLocationScaleSpec {
+                        y: y.clone(),
+                        weights: weights.clone(),
+                        sigma_min,
+                        sigma_max,
+                        mu_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(mean_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: mean_design.penalties.clone(),
+                            initial_log_lambdas: mean_log_lambda_hint.clone(),
+                            initial_beta: mean_beta_hint.clone(),
+                        },
+                        log_sigma_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(noise_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: noise_design.penalties.clone(),
+                            initial_log_lambdas: noise_log_lambda_hint.clone(),
+                            initial_beta: noise_beta_hint.clone(),
+                        },
+                    },
+                    options,
+                )?;
+                let k_mean = mean_design.penalties.len();
+                let k_noise = noise_design.penalties.len();
+                if fit.log_lambdas.len() >= k_mean + k_noise {
+                    mean_log_lambda_hint = Some(fit.log_lambdas.slice(s![0..k_mean]).to_owned());
+                    noise_log_lambda_hint = Some(
+                        fit.log_lambdas
+                            .slice(s![k_mean..(k_mean + k_noise)])
+                            .to_owned(),
+                    );
+                }
+                mean_beta_hint = Some(
+                    fit.block_states[GaussianLocationScaleFamily::BLOCK_MU]
+                        .beta
+                        .clone(),
+                );
+                noise_beta_hint = Some(
+                    fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
+                        .beta
+                        .clone(),
+                );
+                Ok(fit)
+            },
+            |fit| fit.penalized_objective,
+        )?
+    };
     Ok(BlockwiseTermFitResult {
         fit: solved.fit,
         mean_spec_resolved: solved.resolved_mean_spec,
@@ -1030,38 +1249,83 @@ pub fn fit_binomial_location_scale_probit_terms(
     let sigma_max = spec.sigma_max;
     let mut threshold_log_lambda_hint: Option<Array1<f64>> = None;
     let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
-    let solved = optimize_two_block_spatial_length_scale(
-        data,
-        &spec.threshold_spec,
-        &spec.log_sigma_spec,
-        kappa_options,
-        |threshold_design, noise_design| {
-            let fit = fit_binomial_location_scale_probit(
-                BinomialLocationScaleProbitSpec {
-                    y: y.clone(),
-                    weights: weights.clone(),
-                    sigma_min,
-                    sigma_max,
-                    threshold_block: ParameterBlockInput {
-                        design: DesignMatrix::Dense(threshold_design.design.clone()),
-                        offset: Array1::zeros(y.len()),
-                        penalties: threshold_design.penalties.clone(),
-                        initial_log_lambdas: threshold_log_lambda_hint.clone(),
-                        initial_beta: None,
+    let mut threshold_beta_hint: Option<Array1<f64>> = None;
+    let mut noise_beta_hint: Option<Array1<f64>> = None;
+    let threshold_boot_design =
+        build_term_collection_design(data, &spec.threshold_spec).map_err(|e| e.to_string())?;
+    let noise_boot_design =
+        build_term_collection_design(data, &spec.log_sigma_spec).map_err(|e| e.to_string())?;
+    let threshold_boot_spec =
+        freeze_spatial_length_scale_terms_from_design(&spec.threshold_spec, &threshold_boot_design)
+            .map_err(|e| e.to_string())?;
+    let noise_boot_spec =
+        freeze_spatial_length_scale_terms_from_design(&spec.log_sigma_spec, &noise_boot_design)
+            .map_err(|e| e.to_string())?;
+    // Exact joint spatial hyper-gradients are currently implemented for custom-family
+    // blocks with diagonal working sets. The wiggle family contributes an
+    // ExactNewton block, so keep this path on the stable fallback optimizer
+    // until a family-level psi derivative contract exists for ExactNewton blocks.
+    let exact_spatial_joint_supported = false;
+    let solved = if exact_spatial_joint_supported
+        && let (Some(_), Some(_)) = (
+            build_block_spatial_psi_derivatives(
+                data,
+                &threshold_boot_spec,
+                &threshold_boot_design,
+            )?,
+            build_block_spatial_psi_derivatives(data, &noise_boot_spec, &noise_boot_design)?,
+        ) {
+        let joint_setup = build_two_block_exact_joint_setup(
+            &spec.threshold_spec,
+            &spec.log_sigma_spec,
+            threshold_boot_design.penalties.len(),
+            noise_boot_design.penalties.len(),
+            &[],
+            kappa_options,
+        );
+        let mut warm_state: Option<CustomFamilyWarmStart> = None;
+        let threshold_beta_hint_cell = std::cell::RefCell::new(threshold_beta_hint.clone());
+        let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
+        optimize_two_block_spatial_length_scale_exact_joint(
+            data,
+            &spec.threshold_spec,
+            &spec.log_sigma_spec,
+            kappa_options,
+            &joint_setup,
+            |theta,
+             threshold_spec_resolved,
+             noise_spec_resolved,
+             threshold_design,
+             noise_design| {
+                let k_threshold = threshold_design.penalties.len();
+                let k_noise = noise_design.penalties.len();
+                let threshold_rho = theta.slice(s![0..k_threshold]).to_owned();
+                let noise_rho = theta
+                    .slice(s![k_threshold..(k_threshold + k_noise)])
+                    .to_owned();
+                let fit = fit_binomial_location_scale_probit(
+                    BinomialLocationScaleProbitSpec {
+                        y: y.clone(),
+                        weights: weights.clone(),
+                        sigma_min,
+                        sigma_max,
+                        threshold_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(threshold_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: threshold_design.penalties.clone(),
+                            initial_log_lambdas: Some(threshold_rho),
+                            initial_beta: threshold_beta_hint_cell.borrow().clone(),
+                        },
+                        log_sigma_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(noise_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: noise_design.penalties.clone(),
+                            initial_log_lambdas: Some(noise_rho),
+                            initial_beta: noise_beta_hint_cell.borrow().clone(),
+                        },
                     },
-                    log_sigma_block: ParameterBlockInput {
-                        design: DesignMatrix::Dense(noise_design.design.clone()),
-                        offset: Array1::zeros(y.len()),
-                        penalties: noise_design.penalties.clone(),
-                        initial_log_lambdas: noise_log_lambda_hint.clone(),
-                        initial_beta: None,
-                    },
-                },
-                options,
-            )?;
-            let k_threshold = threshold_design.penalties.len();
-            let k_noise = noise_design.penalties.len();
-            if fit.log_lambdas.len() >= k_threshold + k_noise {
+                    options,
+                )?;
                 threshold_log_lambda_hint =
                     Some(fit.log_lambdas.slice(s![0..k_threshold]).to_owned());
                 noise_log_lambda_hint = Some(
@@ -1069,11 +1333,131 @@ pub fn fit_binomial_location_scale_probit_terms(
                         .slice(s![k_threshold..(k_threshold + k_noise)])
                         .to_owned(),
                 );
-            }
-            Ok(fit)
-        },
-        |fit| fit.penalized_objective,
-    )?;
+                threshold_beta_hint = Some(
+                    fit.block_states[BinomialLocationScaleProbitFamily::BLOCK_T]
+                        .beta
+                        .clone(),
+                );
+                noise_beta_hint = Some(
+                    fit.block_states[BinomialLocationScaleProbitFamily::BLOCK_LOG_SIGMA]
+                        .beta
+                        .clone(),
+                );
+                *threshold_beta_hint_cell.borrow_mut() = threshold_beta_hint.clone();
+                *noise_beta_hint_cell.borrow_mut() = noise_beta_hint.clone();
+                let _ = (threshold_spec_resolved, noise_spec_resolved);
+                Ok(fit)
+            },
+            |theta,
+             threshold_spec_resolved,
+             noise_spec_resolved,
+             threshold_design,
+             noise_design| {
+                let threshold_block = ParameterBlockSpec {
+                    name: "threshold".to_string(),
+                    design: DesignMatrix::Dense(threshold_design.design.clone()),
+                    offset: Array1::zeros(y.len()),
+                    penalties: threshold_design.penalties.clone(),
+                    initial_log_lambdas: theta
+                        .slice(s![0..threshold_design.penalties.len()])
+                        .to_owned(),
+                    initial_beta: threshold_beta_hint_cell.borrow().clone(),
+                };
+                let noise_block = ParameterBlockSpec {
+                    name: "log_sigma".to_string(),
+                    design: DesignMatrix::Dense(noise_design.design.clone()),
+                    offset: Array1::zeros(y.len()),
+                    penalties: noise_design.penalties.clone(),
+                    initial_log_lambdas: theta
+                        .slice(s![threshold_design.penalties.len()
+                            ..(threshold_design.penalties.len()
+                                + noise_design.penalties.len())])
+                        .to_owned(),
+                    initial_beta: noise_beta_hint_cell.borrow().clone(),
+                };
+                let family = BinomialLocationScaleProbitFamily {
+                    y: y.clone(),
+                    weights: weights.clone(),
+                    sigma_min,
+                    sigma_max,
+                };
+                let threshold_derivs = build_block_spatial_psi_derivatives(
+                    data,
+                    threshold_spec_resolved,
+                    threshold_design,
+                )?
+                .ok_or_else(|| "missing threshold spatial psi derivatives".to_string())?;
+                let noise_derivs =
+                    build_block_spatial_psi_derivatives(data, noise_spec_resolved, noise_design)?
+                        .ok_or_else(|| "missing log_sigma spatial psi derivatives".to_string())?;
+                let eval = evaluate_custom_family_joint_hyper(
+                    &family,
+                    &[threshold_block, noise_block],
+                    options,
+                    theta,
+                    &[threshold_derivs, noise_derivs],
+                    warm_state.as_ref(),
+                )?;
+                warm_state = Some(eval.warm_start);
+                Ok((eval.objective, eval.gradient))
+            },
+        )?
+    } else {
+        optimize_two_block_spatial_length_scale(
+            data,
+            &spec.threshold_spec,
+            &spec.log_sigma_spec,
+            kappa_options,
+            |threshold_design, noise_design| {
+                let fit = fit_binomial_location_scale_probit(
+                    BinomialLocationScaleProbitSpec {
+                        y: y.clone(),
+                        weights: weights.clone(),
+                        sigma_min,
+                        sigma_max,
+                        threshold_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(threshold_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: threshold_design.penalties.clone(),
+                            initial_log_lambdas: threshold_log_lambda_hint.clone(),
+                            initial_beta: threshold_beta_hint.clone(),
+                        },
+                        log_sigma_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(noise_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: noise_design.penalties.clone(),
+                            initial_log_lambdas: noise_log_lambda_hint.clone(),
+                            initial_beta: noise_beta_hint.clone(),
+                        },
+                    },
+                    options,
+                )?;
+                let k_threshold = threshold_design.penalties.len();
+                let k_noise = noise_design.penalties.len();
+                if fit.log_lambdas.len() >= k_threshold + k_noise {
+                    threshold_log_lambda_hint =
+                        Some(fit.log_lambdas.slice(s![0..k_threshold]).to_owned());
+                    noise_log_lambda_hint = Some(
+                        fit.log_lambdas
+                            .slice(s![k_threshold..(k_threshold + k_noise)])
+                            .to_owned(),
+                    );
+                }
+                threshold_beta_hint = Some(
+                    fit.block_states[BinomialLocationScaleProbitFamily::BLOCK_T]
+                        .beta
+                        .clone(),
+                );
+                noise_beta_hint = Some(
+                    fit.block_states[BinomialLocationScaleProbitFamily::BLOCK_LOG_SIGMA]
+                        .beta
+                        .clone(),
+                );
+                Ok(fit)
+            },
+            |fit| fit.penalized_objective,
+        )?
+    };
     Ok(BlockwiseTermFitResult {
         fit: solved.fit,
         mean_spec_resolved: solved.resolved_mean_spec,
@@ -1098,41 +1482,89 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms(
     let wiggle_block = spec.wiggle_block;
     let mut threshold_log_lambda_hint: Option<Array1<f64>> = None;
     let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
-    let solved = optimize_two_block_spatial_length_scale(
-        data,
-        &spec.threshold_spec,
-        &spec.log_sigma_spec,
-        kappa_options,
-        |threshold_design, noise_design| {
-            let fit = fit_binomial_location_scale_probit_wiggle(
-                BinomialLocationScaleProbitWiggleSpec {
-                    y: y.clone(),
-                    weights: weights.clone(),
-                    sigma_min,
-                    sigma_max,
-                    wiggle_knots: wiggle_knots.clone(),
-                    wiggle_degree,
-                    threshold_block: ParameterBlockInput {
-                        design: DesignMatrix::Dense(threshold_design.design.clone()),
-                        offset: Array1::zeros(y.len()),
-                        penalties: threshold_design.penalties.clone(),
-                        initial_log_lambdas: threshold_log_lambda_hint.clone(),
-                        initial_beta: None,
+    let mut threshold_beta_hint: Option<Array1<f64>> = None;
+    let mut noise_beta_hint: Option<Array1<f64>> = None;
+    let threshold_boot_design =
+        build_term_collection_design(data, &spec.threshold_spec).map_err(|e| e.to_string())?;
+    let noise_boot_design =
+        build_term_collection_design(data, &spec.log_sigma_spec).map_err(|e| e.to_string())?;
+    let threshold_boot_spec =
+        freeze_spatial_length_scale_terms_from_design(&spec.threshold_spec, &threshold_boot_design)
+            .map_err(|e| e.to_string())?;
+    let noise_boot_spec =
+        freeze_spatial_length_scale_terms_from_design(&spec.log_sigma_spec, &noise_boot_design)
+            .map_err(|e| e.to_string())?;
+    let solved = if let (Some(_), Some(_)) = (
+        build_block_spatial_psi_derivatives(data, &threshold_boot_spec, &threshold_boot_design)?,
+        build_block_spatial_psi_derivatives(data, &noise_boot_spec, &noise_boot_design)?,
+    ) {
+        let wiggle_rho0 = initial_log_lambdas_or_zeros(&wiggle_block)?;
+        let joint_setup = build_two_block_exact_joint_setup(
+            &spec.threshold_spec,
+            &spec.log_sigma_spec,
+            threshold_boot_design.penalties.len(),
+            noise_boot_design.penalties.len(),
+            wiggle_rho0.as_slice().unwrap_or(&[]),
+            kappa_options,
+        );
+        let mut warm_state: Option<CustomFamilyWarmStart> = None;
+        let threshold_beta_hint_cell = std::cell::RefCell::new(threshold_beta_hint.clone());
+        let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
+        optimize_two_block_spatial_length_scale_exact_joint(
+            data,
+            &spec.threshold_spec,
+            &spec.log_sigma_spec,
+            kappa_options,
+            &joint_setup,
+            |theta,
+             threshold_spec_resolved,
+             noise_spec_resolved,
+             threshold_design,
+             noise_design| {
+                let k_threshold = threshold_design.penalties.len();
+                let k_noise = noise_design.penalties.len();
+                let k_wiggle = wiggle_block.penalties.len();
+                let threshold_rho = theta.slice(s![0..k_threshold]).to_owned();
+                let noise_rho = theta
+                    .slice(s![k_threshold..(k_threshold + k_noise)])
+                    .to_owned();
+                let wiggle_rho = theta
+                    .slice(s![
+                        (k_threshold + k_noise)..(k_threshold + k_noise + k_wiggle)
+                    ])
+                    .to_owned();
+                let fit = fit_binomial_location_scale_probit_wiggle(
+                    BinomialLocationScaleProbitWiggleSpec {
+                        y: y.clone(),
+                        weights: weights.clone(),
+                        sigma_min,
+                        sigma_max,
+                        wiggle_knots: wiggle_knots.clone(),
+                        wiggle_degree,
+                        threshold_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(threshold_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: threshold_design.penalties.clone(),
+                            initial_log_lambdas: Some(threshold_rho),
+                            initial_beta: threshold_beta_hint_cell.borrow().clone(),
+                        },
+                        log_sigma_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(noise_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: noise_design.penalties.clone(),
+                            initial_log_lambdas: Some(noise_rho),
+                            initial_beta: noise_beta_hint_cell.borrow().clone(),
+                        },
+                        wiggle_block: ParameterBlockInput {
+                            design: wiggle_block.design.clone(),
+                            offset: wiggle_block.offset.clone(),
+                            penalties: wiggle_block.penalties.clone(),
+                            initial_log_lambdas: Some(wiggle_rho),
+                            initial_beta: wiggle_block.initial_beta.clone(),
+                        },
                     },
-                    log_sigma_block: ParameterBlockInput {
-                        design: DesignMatrix::Dense(noise_design.design.clone()),
-                        offset: Array1::zeros(y.len()),
-                        penalties: noise_design.penalties.clone(),
-                        initial_log_lambdas: noise_log_lambda_hint.clone(),
-                        initial_beta: None,
-                    },
-                    wiggle_block: wiggle_block.clone(),
-                },
-                options,
-            )?;
-            let k_threshold = threshold_design.penalties.len();
-            let k_noise = noise_design.penalties.len();
-            if fit.log_lambdas.len() >= k_threshold + k_noise {
+                    options,
+                )?;
                 threshold_log_lambda_hint =
                     Some(fit.log_lambdas.slice(s![0..k_threshold]).to_owned());
                 noise_log_lambda_hint = Some(
@@ -1140,11 +1572,147 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms(
                         .slice(s![k_threshold..(k_threshold + k_noise)])
                         .to_owned(),
                 );
-            }
-            Ok(fit)
-        },
-        |fit| fit.penalized_objective,
-    )?;
+                threshold_beta_hint = Some(
+                    fit.block_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T]
+                        .beta
+                        .clone(),
+                );
+                noise_beta_hint = Some(
+                    fit.block_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_LOG_SIGMA]
+                        .beta
+                        .clone(),
+                );
+                *threshold_beta_hint_cell.borrow_mut() = threshold_beta_hint.clone();
+                *noise_beta_hint_cell.borrow_mut() = noise_beta_hint.clone();
+                let _ = (threshold_spec_resolved, noise_spec_resolved);
+                Ok(fit)
+            },
+            |theta,
+             threshold_spec_resolved,
+             noise_spec_resolved,
+             threshold_design,
+             noise_design| {
+                let k_threshold = threshold_design.penalties.len();
+                let k_noise = noise_design.penalties.len();
+                let threshold_block = ParameterBlockSpec {
+                    name: "threshold".to_string(),
+                    design: DesignMatrix::Dense(threshold_design.design.clone()),
+                    offset: Array1::zeros(y.len()),
+                    penalties: threshold_design.penalties.clone(),
+                    initial_log_lambdas: theta.slice(s![0..k_threshold]).to_owned(),
+                    initial_beta: threshold_beta_hint_cell.borrow().clone(),
+                };
+                let noise_block = ParameterBlockSpec {
+                    name: "log_sigma".to_string(),
+                    design: DesignMatrix::Dense(noise_design.design.clone()),
+                    offset: Array1::zeros(y.len()),
+                    penalties: noise_design.penalties.clone(),
+                    initial_log_lambdas: theta
+                        .slice(s![k_threshold..(k_threshold + k_noise)])
+                        .to_owned(),
+                    initial_beta: noise_beta_hint_cell.borrow().clone(),
+                };
+                let wiggle_block_spec = ParameterBlockSpec {
+                    name: "wiggle".to_string(),
+                    design: wiggle_block.design.clone(),
+                    offset: wiggle_block.offset.clone(),
+                    penalties: wiggle_block.penalties.clone(),
+                    initial_log_lambdas: theta
+                        .slice(s![(k_threshold + k_noise)
+                            ..(k_threshold + k_noise + wiggle_block.penalties.len())])
+                        .to_owned(),
+                    initial_beta: wiggle_block.initial_beta.clone(),
+                };
+                let family = BinomialLocationScaleProbitWiggleFamily {
+                    y: y.clone(),
+                    weights: weights.clone(),
+                    sigma_min,
+                    sigma_max,
+                    threshold_design: Some(DesignMatrix::Dense(threshold_design.design.clone())),
+                    log_sigma_design: Some(DesignMatrix::Dense(noise_design.design.clone())),
+                    wiggle_knots: wiggle_knots.clone(),
+                    wiggle_degree,
+                };
+                let threshold_derivs = build_block_spatial_psi_derivatives(
+                    data,
+                    threshold_spec_resolved,
+                    threshold_design,
+                )?
+                .ok_or_else(|| "missing threshold spatial psi derivatives".to_string())?;
+                let noise_derivs =
+                    build_block_spatial_psi_derivatives(data, noise_spec_resolved, noise_design)?
+                        .ok_or_else(|| "missing log_sigma spatial psi derivatives".to_string())?;
+                let eval = evaluate_custom_family_joint_hyper(
+                    &family,
+                    &[threshold_block, noise_block, wiggle_block_spec],
+                    options,
+                    theta,
+                    &[threshold_derivs, noise_derivs, Vec::new()],
+                    warm_state.as_ref(),
+                )?;
+                warm_state = Some(eval.warm_start);
+                Ok((eval.objective, eval.gradient))
+            },
+        )?
+    } else {
+        optimize_two_block_spatial_length_scale(
+            data,
+            &spec.threshold_spec,
+            &spec.log_sigma_spec,
+            kappa_options,
+            |threshold_design, noise_design| {
+                let fit = fit_binomial_location_scale_probit_wiggle(
+                    BinomialLocationScaleProbitWiggleSpec {
+                        y: y.clone(),
+                        weights: weights.clone(),
+                        sigma_min,
+                        sigma_max,
+                        wiggle_knots: wiggle_knots.clone(),
+                        wiggle_degree,
+                        threshold_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(threshold_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: threshold_design.penalties.clone(),
+                            initial_log_lambdas: threshold_log_lambda_hint.clone(),
+                            initial_beta: threshold_beta_hint.clone(),
+                        },
+                        log_sigma_block: ParameterBlockInput {
+                            design: DesignMatrix::Dense(noise_design.design.clone()),
+                            offset: Array1::zeros(y.len()),
+                            penalties: noise_design.penalties.clone(),
+                            initial_log_lambdas: noise_log_lambda_hint.clone(),
+                            initial_beta: noise_beta_hint.clone(),
+                        },
+                        wiggle_block: wiggle_block.clone(),
+                    },
+                    options,
+                )?;
+                let k_threshold = threshold_design.penalties.len();
+                let k_noise = noise_design.penalties.len();
+                if fit.log_lambdas.len() >= k_threshold + k_noise {
+                    threshold_log_lambda_hint =
+                        Some(fit.log_lambdas.slice(s![0..k_threshold]).to_owned());
+                    noise_log_lambda_hint = Some(
+                        fit.log_lambdas
+                            .slice(s![k_threshold..(k_threshold + k_noise)])
+                            .to_owned(),
+                    );
+                }
+                threshold_beta_hint = Some(
+                    fit.block_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T]
+                        .beta
+                        .clone(),
+                );
+                noise_beta_hint = Some(
+                    fit.block_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_LOG_SIGMA]
+                        .beta
+                        .clone(),
+                );
+                Ok(fit)
+            },
+            |fit| fit.penalized_objective,
+        )?
+    };
     Ok(BlockwiseTermFitResult {
         fit: solved.fit,
         mean_spec_resolved: solved.resolved_mean_spec,
@@ -2777,7 +3345,11 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::compute_greville_abscissae;
+    use crate::basis::{
+        CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu,
+        compute_greville_abscissae,
+    };
+    use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
 
     fn intercept_block(n: usize) -> ParameterBlockInput {
         ParameterBlockInput {
@@ -2847,6 +3419,159 @@ mod tests {
             .expect("binomial location-scale probit should fit");
         assert_eq!(fit.block_states.len(), 2);
         assert!(fit.log_likelihood.is_finite());
+    }
+
+    fn simple_matern_term_collection(
+        feature_cols: &[usize],
+        length_scale: f64,
+    ) -> TermCollectionSpec {
+        TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: vec![SmoothTermSpec {
+                name: "spatial".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: feature_cols.to_vec(),
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
+                        length_scale,
+                        nu: MaternNu::ThreeHalves,
+                        include_intercept: false,
+                        double_penalty: false,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        }
+    }
+
+    #[test]
+    fn gaussian_location_scale_terms_with_matern_spatial_blocks_fit_finitely() {
+        let n = 32usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
+        }
+        let y = Array1::from_iter((0..n).map(|i| {
+            let x0 = data[[i, 0]];
+            let x1 = data[[i, 1]];
+            0.5 * x0 - 0.25 * x1 + 0.1
+        }));
+        let weights = Array1::from_elem(n, 1.0);
+        let spec = GaussianLocationScaleTermSpec {
+            y,
+            weights,
+            sigma_min: 0.2,
+            sigma_max: 3.0,
+            mean_spec: simple_matern_term_collection(&[0, 1], 0.35),
+            log_sigma_spec: simple_matern_term_collection(&[0, 1], 0.6),
+        };
+        let fit = fit_gaussian_location_scale_terms(
+            data.view(),
+            spec,
+            &BlockwiseFitOptions::default(),
+            &SpatialLengthScaleOptimizationOptions {
+                enabled: true,
+                max_outer_iter: 4,
+                rel_tol: 1e-4,
+                log_step: std::f64::consts::LN_2,
+                min_length_scale: 0.1,
+                max_length_scale: 2.0,
+            },
+        )
+        .expect("gaussian location-scale spatial fit");
+        assert!(fit.fit.penalized_objective.is_finite());
+        assert_eq!(fit.fit.block_states.len(), 2);
+    }
+
+    #[test]
+    fn binomial_location_scale_probit_terms_with_matern_spatial_blocks_fit_finitely() {
+        let n = 36usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (3.0 * std::f64::consts::PI * t).cos();
+        }
+        let y = Array1::from_iter((0..n).map(|i| if i % 5 == 0 || i % 7 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let spec = BinomialLocationScaleProbitTermSpec {
+            y,
+            weights,
+            sigma_min: 0.25,
+            sigma_max: 3.5,
+            threshold_spec: simple_matern_term_collection(&[0, 1], 0.4),
+            log_sigma_spec: simple_matern_term_collection(&[0, 1], 0.75),
+        };
+        let fit = fit_binomial_location_scale_probit_terms(
+            data.view(),
+            spec,
+            &BlockwiseFitOptions::default(),
+            &SpatialLengthScaleOptimizationOptions {
+                enabled: true,
+                max_outer_iter: 4,
+                rel_tol: 1e-4,
+                log_step: std::f64::consts::LN_2,
+                min_length_scale: 0.1,
+                max_length_scale: 2.0,
+            },
+        )
+        .expect("binomial location-scale probit spatial fit");
+        assert!(fit.fit.penalized_objective.is_finite());
+        assert_eq!(fit.fit.block_states.len(), 2);
+    }
+
+    #[test]
+    fn binomial_location_scale_probit_wiggle_terms_with_matern_spatial_blocks_fit_finitely() {
+        let n = 30usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.5 * std::f64::consts::PI * t).sin();
+        }
+        let y = Array1::from_iter((0..n).map(|i| if i % 4 == 0 || i % 9 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let q_seed = Array1::linspace(-1.5, 1.5, n);
+        let (wiggle_block, knots) =
+            BinomialLocationScaleProbitWiggleFamily::build_wiggle_block_input(
+                q_seed.view(),
+                2,
+                4,
+                2,
+                false,
+            )
+            .expect("wiggle block");
+        let spec = BinomialLocationScaleProbitWiggleTermSpec {
+            y,
+            weights,
+            sigma_min: 0.25,
+            sigma_max: 3.5,
+            threshold_spec: simple_matern_term_collection(&[0, 1], 0.45),
+            log_sigma_spec: simple_matern_term_collection(&[0, 1], 0.8),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+            wiggle_block,
+        };
+        let fit = fit_binomial_location_scale_probit_wiggle_terms(
+            data.view(),
+            spec,
+            &BlockwiseFitOptions::default(),
+            &SpatialLengthScaleOptimizationOptions {
+                enabled: true,
+                max_outer_iter: 4,
+                rel_tol: 1e-4,
+                log_step: std::f64::consts::LN_2,
+                min_length_scale: 0.1,
+                max_length_scale: 2.0,
+            },
+        )
+        .expect("binomial location-scale probit wiggle spatial fit");
+        assert!(fit.fit.penalized_objective.is_finite());
+        assert_eq!(fit.fit.block_states.len(), 3);
     }
 
     #[test]
