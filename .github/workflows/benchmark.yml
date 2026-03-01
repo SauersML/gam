@@ -120,12 +120,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Restore shared runtime cache
+        id: runtime-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bench/runtime
+          key: ${{ runner.os }}-bench-runtime-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', '.github/actions/bench-setup/action.yml', '.github/workflows/benchmark.yml') }}
+
       - name: Shared benchmark setup (cached)
+        if: ${{ steps.runtime-cache.outputs.cache-hit != 'true' }}
         uses: ./.github/actions/bench-setup
         with:
           install-runtime-deps: "true"
 
       - name: Build shared runtime once
+        if: ${{ steps.runtime-cache.outputs.cache-hit != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -138,6 +147,13 @@ jobs:
           cargo build --release --bin gam
           cp target/release/gam bench/runtime/gam
           chmod +x bench/runtime/gam
+
+      - name: Save shared runtime cache
+        if: ${{ steps.runtime-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: bench/runtime
+          key: ${{ runner.os }}-bench-runtime-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', '.github/actions/bench-setup/action.yml', '.github/workflows/benchmark.yml') }}
 
       - name: Upload shared runtime artifact
         uses: actions/upload-artifact@v4
