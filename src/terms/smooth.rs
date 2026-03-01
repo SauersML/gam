@@ -2066,8 +2066,10 @@ fn try_build_spatial_term_log_kappa_derivative(
         design_derivative: local_x_psi,
         penalties_derivative: local_s_psi,
     } = match &term_spec.basis {
-        SmoothBasisSpec::Matern { spec, .. } => {
-            build_matern_basis_log_kappa_derivative(data, spec).map_err(EstimationError::from)?
+        SmoothBasisSpec::Matern { feature_cols, spec } => {
+            let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            build_matern_basis_log_kappa_derivative(x.view(), spec)
+                .map_err(EstimationError::from)?
         }
         _ => return Ok(None),
     };
@@ -4121,6 +4123,72 @@ mod tests {
                 _ => panic!("expected Matérn term"),
             }
         }
+    }
+
+    #[test]
+    fn exact_matern_log_kappa_derivative_uses_feature_columns_only() {
+        let n = 24usize;
+        let p = 17usize;
+        let mut data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let x = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = x;
+            for j in 1..p {
+                data[[i, j]] = ((i + j) as f64 * 0.13).sin();
+            }
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                        length_scale: 0.4,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec)
+            .expect("baseline Matérn design should build");
+        let frozen_spec = freeze_spatial_length_scale_terms_from_design(&spec, &design)
+            .expect("freezing Matérn centers from design should succeed");
+
+        match &frozen_spec.smooth_terms[0].basis {
+            SmoothBasisSpec::Matern { spec, .. } => match &spec.center_strategy {
+                CenterStrategy::UserProvided(centers) => {
+                    assert_eq!(centers.ncols(), 1, "frozen centers should stay term-local");
+                }
+                _ => panic!("expected frozen user-provided centers"),
+            },
+            _ => panic!("expected Matérn term"),
+        }
+
+        let derivative = try_build_spatial_term_log_kappa_derivative(
+            data.view(),
+            &frozen_spec,
+            &design,
+            0,
+        );
+        assert!(
+            derivative.is_ok(),
+            "exact Matérn log-kappa derivative should use only feature_cols; got {derivative:?}"
+        );
+        assert!(
+            derivative
+                .expect("derivative call should succeed")
+                .is_some(),
+            "Matérn term should expose an exact derivative"
+        );
     }
 
     #[test]
