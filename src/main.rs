@@ -37,10 +37,10 @@ use gam::joint::{
 use gam::matrix::DesignMatrix;
 use gam::probability::{inverse_link_array, normal_cdf_approx, standard_normal_quantile};
 use gam::smooth::{
-    LinearTermSpec, RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-    SpatialLengthScaleOptimizationOptions, TensorBSplineIdentifiability, TensorBSplineSpec,
-    TermCollectionSpec, build_term_collection_design,
-    fit_term_collection_with_spatial_length_scale_optimization,
+    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
+    TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
+    build_term_collection_design, fit_term_collection_with_spatial_length_scale_optimization,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale_probit::{
@@ -81,7 +81,13 @@ enum Command {
 #[derive(Args, Debug)]
 struct FitArgs {
     data: PathBuf,
-    #[arg(short = 'f', long = "formula", alias = "predict-mean")]
+    #[arg(
+        short = 'f',
+        long = "formula",
+        alias = "predict-mean",
+        help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary unpenalized linear term\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform\n- bounded(x, ..., pull=\"center\"): bounded coefficient with symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ bounded(mu_hat, min=0, max=1) + matern(pc1, pc2, pc3)'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
+    )]
     formula: Option<String>,
     /// P(Y=1|S,x)=Phi((S-T(x))/sigma(x)).
     #[arg(long = "predict-noise", alias = "predict-variance")]
@@ -367,6 +373,12 @@ enum ParsedTerm {
     Linear {
         name: String,
         explicit: bool,
+    },
+    BoundedLinear {
+        name: String,
+        min: f64,
+        max: f64,
+        prior: BoundedCoefficientPriorSpec,
     },
     RandomEffect {
         name: String,
@@ -690,6 +702,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
 
     let spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+    let has_bounded_terms = term_spec_has_bounded_terms(&spec);
+    if has_bounded_terms && args.firth {
+        return Err("--firth is not yet supported with bounded() coefficients".to_string());
+    }
     let initial_design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
     let initial_frozen_spec = freeze_term_collection_spec(&spec, &initial_design)?;
@@ -700,6 +716,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let offset = Array1::zeros(ds.values.nrows());
     if let Some(choice) = link_choice {
         if matches!(choice.mode, LinkMode::Flexible) {
+            if has_bounded_terms {
+                return Err(
+                    "--flexible-link is not yet supported with bounded() coefficients".to_string(),
+                );
+            }
             if !is_binomial_family(family) {
                 return Err("--flexible-link currently requires a binomial family/link".to_string());
             }
@@ -852,7 +873,14 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     let frozen_spec = freeze_term_collection_spec(&resolved_spec, &design)?;
 
-    print_fit_summary(&design, &fit, family, y.view(), weights.view());
+    print_fit_summary(
+        &design,
+        &resolved_spec,
+        &fit,
+        family,
+        y.view(),
+        weights.view(),
+    );
 
     if let Some(out) = args.out {
         let model = SavedModel {
@@ -1816,6 +1844,12 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         &col_map,
         "resolved_term_spec",
     )?;
+    if term_spec_has_bounded_terms(&spec) {
+        return Err(
+            "diagnose --alo is not yet supported for models with bounded() coefficients"
+                .to_string(),
+        );
+    }
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
 
@@ -3505,6 +3539,11 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         &col_map,
         "resolved_term_spec",
     )?;
+    if term_spec_has_bounded_terms(&spec) {
+        return Err(
+            "sample is not yet supported for models with bounded() coefficients".to_string(),
+        );
+    }
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build design: {e}"))?;
 
@@ -3968,10 +4007,38 @@ fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<()
     Ok(())
 }
 
+fn term_spec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
+    spec.linear_terms.iter().any(|term| {
+        matches!(
+            term.coefficient_geometry,
+            LinearCoefficientGeometry::Bounded { .. }
+        )
+    })
+}
+
 fn validate_frozen_term_collection_spec(
     spec: &TermCollectionSpec,
     label: &str,
 ) -> Result<(), String> {
+    for linear in &spec.linear_terms {
+        if let LinearCoefficientGeometry::Bounded { min, max, prior } = &linear.coefficient_geometry
+        {
+            if !min.is_finite() || !max.is_finite() || min >= max {
+                return Err(format!(
+                    "{label} bounded term '{}' has invalid bounds [{min}, {max}]",
+                    linear.name
+                ));
+            }
+            if let BoundedCoefficientPriorSpec::Beta { a, b } = prior {
+                if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
+                    return Err(format!(
+                        "{label} bounded term '{}' has invalid Beta prior ({a}, {b})",
+                        linear.name
+                    ));
+                }
+            }
+        }
+    }
     for st in &spec.smooth_terms {
         match &st.basis {
             SmoothBasisSpec::BSpline1D { spec, .. } => {
@@ -4246,6 +4313,27 @@ fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
 }
 
 fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
+    if let Some(inner) = parse_call(raw, "bounded") {
+        let (vars, options) = parse_call_args(inner)?;
+        if vars.len() != 1 {
+            return Err(format!("bounded() expects exactly one variable: {raw}"));
+        }
+        let min = parse_required_f64_option(&options, "min", raw)?;
+        let max = parse_required_f64_option(&options, "max", raw)?;
+        if !min.is_finite() || !max.is_finite() || min >= max {
+            return Err(format!(
+                "bounded() requires finite min < max, got min={min}, max={max}: {raw}"
+            ));
+        }
+        let prior = parse_bounded_prior_spec(&options, min, max, raw)?;
+        return Ok(ParsedTerm::BoundedLinear {
+            name: vars[0].clone(),
+            min,
+            max,
+            prior,
+        });
+    }
+
     if let Some(inner) = parse_call(raw, "group").or_else(|| parse_call(raw, "re")) {
         let vars = split_top_level(inner, ',')
             .into_iter()
@@ -4361,7 +4449,7 @@ fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
 
     if raw.contains('(') && raw.ends_with(')') {
         return Err(format!(
-            "unknown term function in '{raw}'. Supported: linear(), smooth(), thinplate(), tensor(), group(), matern(), duchon()"
+            "unknown term function in '{raw}'. Supported: bounded(), linear(), smooth(), thinplate(), tensor(), group(), matern(), duchon()"
         ));
     }
 
@@ -4369,6 +4457,111 @@ fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
         name: raw.to_string(),
         explicit: false,
     })
+}
+
+fn parse_required_f64_option(
+    options: &BTreeMap<String, String>,
+    key: &str,
+    raw: &str,
+) -> Result<f64, String> {
+    let value = options
+        .get(key)
+        .ok_or_else(|| format!("bounded() is missing required '{key}' argument: {raw}"))?;
+    value.parse::<f64>().map_err(|_| {
+        format!(
+            "bounded() argument '{key}' must be a finite number, got '{}': {raw}",
+            value
+        )
+    })
+}
+
+fn parse_optional_f64_option(
+    options: &BTreeMap<String, String>,
+    key: &str,
+    raw: &str,
+) -> Result<Option<f64>, String> {
+    match options.get(key) {
+        Some(value) => value.parse::<f64>().map(Some).map_err(|_| {
+            format!(
+                "bounded() argument '{key}' must be a finite number, got '{}': {raw}",
+                value
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
+fn parse_bounded_prior_spec(
+    options: &BTreeMap<String, String>,
+    min: f64,
+    max: f64,
+    raw: &str,
+) -> Result<BoundedCoefficientPriorSpec, String> {
+    let pull = options.get("pull").map(|s| s.to_ascii_lowercase());
+    let beta_a = parse_optional_f64_option(options, "beta_a", raw)?;
+    let beta_b = parse_optional_f64_option(options, "beta_b", raw)?;
+    let target = parse_optional_f64_option(options, "target", raw)?;
+    let strength = parse_optional_f64_option(options, "strength", raw)?;
+
+    let explicit_beta = beta_a.is_some() || beta_b.is_some();
+    let target_mode = target.is_some() || strength.is_some();
+    if pull.is_some() && explicit_beta {
+        return Err(format!(
+            "bounded() cannot combine pull=... with beta_a/beta_b: {raw}"
+        ));
+    }
+    if pull.is_some() && target_mode {
+        return Err(format!(
+            "bounded() cannot combine pull=... with target/strength: {raw}"
+        ));
+    }
+    if explicit_beta && target_mode {
+        return Err(format!(
+            "bounded() cannot combine beta_a/beta_b with target/strength: {raw}"
+        ));
+    }
+
+    if let Some(pull_mode) = pull {
+        return match pull_mode.as_str() {
+            "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
+            _ => Err(format!(
+                "bounded() pull must currently be 'center', got '{}': {raw}",
+                pull_mode
+            )),
+        };
+    }
+
+    if explicit_beta {
+        let a = beta_a.ok_or_else(|| format!("bounded() beta_a is required with beta_b: {raw}"))?;
+        let b = beta_b.ok_or_else(|| format!("bounded() beta_b is required with beta_a: {raw}"))?;
+        if !a.is_finite() || !b.is_finite() || a < 1.0 || b < 1.0 {
+            return Err(format!(
+                "bounded() beta_a and beta_b must be finite and >= 1: {raw}"
+            ));
+        }
+        return Ok(BoundedCoefficientPriorSpec::Beta { a, b });
+    }
+
+    if target_mode {
+        let target_value =
+            target.ok_or_else(|| format!("bounded() target is required with strength: {raw}"))?;
+        let strength_value =
+            strength.ok_or_else(|| format!("bounded() strength is required with target: {raw}"))?;
+        if !(min < target_value && target_value < max) {
+            return Err(format!(
+                "bounded() target must lie strictly inside ({min}, {max}): {raw}"
+            ));
+        }
+        if !strength_value.is_finite() || strength_value <= 0.0 {
+            return Err(format!("bounded() strength must be finite and > 0: {raw}"));
+        }
+        let z = (target_value - min) / (max - min);
+        let a = 1.0 + strength_value * z;
+        let b = 1.0 + strength_value * (1.0 - z);
+        return Ok(BoundedCoefficientPriorSpec::Beta { a, b });
+    }
+
+    Ok(BoundedCoefficientPriorSpec::None)
 }
 
 fn parse_call<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
@@ -4481,6 +4674,7 @@ fn build_term_spec(
                         name: name.clone(),
                         feature_col: col,
                         double_penalty: false,
+                        coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     });
                 } else {
                     match auto_kind {
@@ -4489,6 +4683,7 @@ fn build_term_spec(
                                 name: name.clone(),
                                 feature_col: col,
                                 double_penalty: false,
+                                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                             });
                         }
                         ColumnKind::Binary => {
@@ -4496,6 +4691,7 @@ fn build_term_spec(
                                 name: name.clone(),
                                 feature_col: col,
                                 double_penalty: false,
+                                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                             });
                         }
                         ColumnKind::Categorical => {
@@ -4508,6 +4704,33 @@ fn build_term_spec(
                         }
                     }
                 }
+            }
+            ParsedTerm::BoundedLinear {
+                name,
+                min,
+                max,
+                prior,
+            } => {
+                let col = resolve_col(col_map, name)?;
+                let auto_kind =
+                    ds.kinds.get(col).copied().ok_or_else(|| {
+                        format!("internal column-kind lookup failed for '{name}'")
+                    })?;
+                if !matches!(auto_kind, ColumnKind::Continuous | ColumnKind::Binary) {
+                    return Err(format!(
+                        "bounded() currently supports only numeric columns, got categorical '{name}'"
+                    ));
+                }
+                linear_terms.push(LinearTermSpec {
+                    name: name.clone(),
+                    feature_col: col,
+                    double_penalty: false,
+                    coefficient_geometry: LinearCoefficientGeometry::Bounded {
+                        min: *min,
+                        max: *max,
+                        prior: prior.clone(),
+                    },
+                });
             }
             ParsedTerm::RandomEffect { name } => {
                 let col = resolve_col(col_map, name)?;
@@ -5170,6 +5393,7 @@ fn covariance_block(cov: &Array2<f64>, start: usize, end: usize) -> Option<Array
 
 fn build_model_summary(
     design: &gam::smooth::TermCollectionDesign,
+    spec: &TermCollectionSpec,
     fit: &FitResult,
     family: LikelihoodFamily,
     y: ArrayView1<'_, f64>,
@@ -5233,6 +5457,24 @@ fn build_model_summary(
         p_value: intercept_p,
     });
     for (name, range) in &design.linear_ranges {
+        let geometry = spec
+            .linear_terms
+            .iter()
+            .find(|term| term.name == *name)
+            .map(|term| term.coefficient_geometry.clone())
+            .unwrap_or(LinearCoefficientGeometry::Unconstrained);
+        let geometry_label = match geometry {
+            LinearCoefficientGeometry::Unconstrained => name.clone(),
+            LinearCoefficientGeometry::Bounded { min, max, prior } => {
+                let prior_txt = match prior {
+                    BoundedCoefficientPriorSpec::None => String::new(),
+                    BoundedCoefficientPriorSpec::Beta { a, b } => {
+                        format!(", Beta({a:.3},{b:.3})")
+                    }
+                };
+                format!("{name} [bounded {min:.3}..{max:.3}{prior_txt}]")
+            }
+        };
         for idx in range.start..range.end {
             let beta = fit.beta.get(idx).copied().unwrap_or(0.0);
             let se_i = se.and_then(|s| s.get(idx).copied());
@@ -5241,9 +5483,9 @@ fn build_model_summary(
                 .map(|zz| 2.0 * (1.0 - normal_cdf_approx(zz.abs())))
                 .map(|v| v.clamp(0.0, 1.0));
             let label = if range.end - range.start > 1 {
-                format!("{name}[{}]", idx - range.start)
+                format!("{geometry_label}[{}]", idx - range.start)
             } else {
-                name.clone()
+                geometry_label.clone()
             };
             parametric_terms.push(ParametricTermSummary {
                 name: label,
@@ -5310,12 +5552,13 @@ fn build_model_summary(
 
 fn print_fit_summary(
     design: &gam::smooth::TermCollectionDesign,
+    spec: &TermCollectionSpec,
     fit: &gam::estimate::FitResult,
     family: LikelihoodFamily,
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
 ) {
-    let summary = build_model_summary(design, fit, family, y, weights);
+    let summary = build_model_summary(design, spec, fit, family, y, weights);
     println!("{summary}");
 }
 
@@ -5680,8 +5923,9 @@ fn write_survival_prediction_csv(
 #[cfg(test)]
 mod tests {
     use super::{
-        LikelihoodFamily, MODEL_VERSION, SavedModel, SurvivalArgs, SurvivalTimeBasisConfig,
-        build_survival_time_basis, chi_square_survival_approx, parse_survival_time_basis_config,
+        BoundedCoefficientPriorSpec, LikelihoodFamily, MODEL_VERSION, ParsedTerm, SavedModel,
+        SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
+        chi_square_survival_approx, parse_formula, parse_survival_time_basis_config,
         pretty_family_name, saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design,
         survival_probability_from_eta, write_survival_prediction_csv,
     };
@@ -5784,6 +6028,47 @@ mod tests {
             pretty_family_name(LikelihoodFamily::GaussianIdentity),
             "Gaussian Identity"
         );
+    }
+
+    #[test]
+    fn parse_bounded_linear_term_with_center_pull() {
+        let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, pull=\"center\") + z")
+            .expect("formula");
+        assert_eq!(parsed.terms.len(), 2);
+        match &parsed.terms[0] {
+            ParsedTerm::BoundedLinear {
+                name,
+                min,
+                max,
+                prior,
+            } => {
+                assert_eq!(name, "mu_hat");
+                assert_eq!((*min, *max), (0.0, 1.0));
+                match prior {
+                    BoundedCoefficientPriorSpec::Beta { a, b } => {
+                        assert_eq!((*a, *b), (2.0, 2.0));
+                    }
+                    other => panic!("unexpected prior: {other:?}"),
+                }
+            }
+            other => panic!("expected bounded linear term, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bounded_linear_target_strength_maps_to_beta_prior() {
+        let parsed = parse_formula("y ~ bounded(mu_hat, min=-1, max=1, target=0.5, strength=4)")
+            .expect("formula");
+        match &parsed.terms[0] {
+            ParsedTerm::BoundedLinear { prior, .. } => match prior {
+                BoundedCoefficientPriorSpec::Beta { a, b } => {
+                    assert!((*a - 4.0).abs() < 1e-12);
+                    assert!((*b - 2.0).abs() < 1e-12);
+                }
+                other => panic!("unexpected prior: {other:?}"),
+            },
+            other => panic!("expected bounded linear term, got {other:?}"),
+        }
     }
 
     #[test]

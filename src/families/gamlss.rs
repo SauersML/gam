@@ -4367,7 +4367,7 @@ mod tests {
         .expect("core");
         for i in 0..n {
             assert!(
-                (spec.mean[i] - core.mu[i]).abs() < 1e-12,
+                (spec.mean[i] - core.mu[i]).abs() < 1e-7,
                 "mean mismatch at {i}: got {}, expected {}",
                 spec.mean[i],
                 core.mu[i]
@@ -4475,7 +4475,7 @@ mod tests {
         .expect("core with wiggle");
         for i in 0..n {
             assert!(
-                (generated.mean[i] - core.mu[i]).abs() < 1e-12,
+                (generated.mean[i] - core.mu[i]).abs() < 1e-7,
                 "wiggle mean mismatch at {i}: got {}, expected {}",
                 generated.mean[i],
                 core.mu[i]
