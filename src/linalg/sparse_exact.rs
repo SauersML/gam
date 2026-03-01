@@ -1,10 +1,10 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
 use crate::matrix::DesignMatrix;
+use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
-use faer::Side;
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
@@ -43,7 +43,10 @@ impl SparseTraceWorkspace {
     }
 }
 
-pub fn dense_to_sparse(matrix: &Array2<f64>, tol: f64) -> Result<SparseColMat<usize, f64>, EstimationError> {
+pub fn dense_to_sparse(
+    matrix: &Array2<f64>,
+    tol: f64,
+) -> Result<SparseColMat<usize, f64>, EstimationError> {
     let nrows = matrix.nrows();
     let ncols = matrix.ncols();
     let mut triplets = Vec::new();
@@ -127,11 +130,12 @@ pub fn factorize_sparse_spd(
         }
     })?;
     let dense = sparse_to_dense_symmetric_upper(h);
-    let chol = dense.cholesky(Side::Lower).map_err(|_| {
-        EstimationError::HessianNotPositiveDefinite {
-            min_eigenvalue: f64::NAN,
-        }
-    })?;
+    let chol =
+        dense
+            .cholesky(Side::Lower)
+            .map_err(|_| EstimationError::HessianNotPositiveDefinite {
+                min_eigenvalue: f64::NAN,
+            })?;
     let logdet = 2.0 * chol.diag().mapv(f64::ln).sum();
     Ok(SparseExactFactor {
         factor,
@@ -217,7 +221,9 @@ pub fn leverages_from_factor(
         }
         DesignMatrix::Sparse(matrix) => {
             let csr = matrix.to_csr_arc().ok_or_else(|| {
-                EstimationError::InvalidInput("failed to build CSR cache for sparse design".to_string())
+                EstimationError::InvalidInput(
+                    "failed to build CSR cache for sparse design".to_string(),
+                )
             })?;
             let symbolic = csr.symbolic();
             let row_ptr = symbolic.row_ptr();
@@ -288,14 +294,12 @@ pub fn build_sparse_penalty_blocks(
         let r_k = &r_list[term_index];
         let s_k_sparse = dense_to_sparse(s_k, ZERO_TOL)?;
         let r_k_sparse = dense_to_sparse(r_k, ZERO_TOL)?;
-        let r_k_rows = Arc::new(
-            r_k_sparse
-                .as_ref()
-                .to_row_major()
-                .map_err(|_| EstimationError::InvalidInput("failed to convert penalty root to CSR".to_string()))?,
-        );
+        let r_k_rows = Arc::new(r_k_sparse.as_ref().to_row_major().map_err(|_| {
+            EstimationError::InvalidInput("failed to convert penalty root to CSR".to_string())
+        })?);
         let block_dense = if p_end > p_start {
-            s_k.slice(ndarray::s![p_start..p_end, p_start..p_end]).to_owned()
+            s_k.slice(ndarray::s![p_start..p_end, p_start..p_end])
+                .to_owned()
         } else {
             Array2::<f64>::zeros((0, 0))
         };
@@ -320,6 +324,9 @@ pub fn build_sparse_penalty_blocks(
     Ok(Some(blocks))
 }
 
-pub fn sparse_matvec_public(matrix: &SparseColMat<usize, f64>, vector: &Array1<f64>) -> Array1<f64> {
+pub fn sparse_matvec_public(
+    matrix: &SparseColMat<usize, f64>,
+    vector: &Array1<f64>,
+) -> Array1<f64> {
     sparse_matvec(matrix, vector)
 }

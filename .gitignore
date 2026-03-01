@@ -17,6 +17,8 @@ benchmarks/datasets/hgdp_1kg_pc_data.tsv
 bench/runtime/
 bench/results*.json
 bench/results-shards/*.json
+bench/results-shards/*.log
+bench/*_rust_fitted.csv
 bench/gam_bench_rust_cv_*/
 bench/gam_bench_*/
 bench/_profile*
@@ -34,3 +36,6 @@ scripts/latest_benchmark_summary.md
 
 # local benchmark plots
 bench/plots/
+
+# local scratch / profiling outputs
+tmp/

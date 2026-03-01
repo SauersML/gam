@@ -1,4 +1,7 @@
-use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd, fast_ab, fast_ata, fast_atb};
+use crate::faer_ndarray::{
+    FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
+    rrqr_nullspace_basis,
+};
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
@@ -73,9 +76,7 @@ pub enum BasisError {
     #[error("QR decomposition failed while applying constraints: {0}")]
     LinalgError(#[from] FaerLinalgError),
 
-    #[error(
-        "Failed to identify nullspace for sum-to-zero constraint; matrix is ill-conditioned or SVD returned no basis."
-    )]
+    #[error("Failed to identify a constraint nullspace basis; matrix is ill-conditioned.")]
     ConstraintNullspaceNotFound,
 
     #[error(
@@ -1876,6 +1877,12 @@ pub struct BasisBuildResult {
     pub metadata: BasisMetadata,
 }
 
+#[derive(Debug, Clone)]
+pub struct BasisPsiDerivativeResult {
+    pub design_derivative: Array2<f64>,
+    pub penalties_derivative: Vec<Array2<f64>>,
+}
+
 fn validate_center_count(num_centers: usize) -> Result<(), BasisError> {
     if num_centers == 0 {
         return Err(BasisError::InvalidInput(
@@ -2466,6 +2473,53 @@ fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Resul
 }
 
 #[inline(always)]
+fn matern_kernel_log_kappa_derivative_from_distance(
+    r: f64,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<f64, BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn kernel distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn length_scale must be finite and positive".to_string(),
+        ));
+    }
+
+    let x = r / length_scale;
+    let deriv = match nu {
+        MaternNu::Half => -x * (-x).exp(),
+        MaternNu::ThreeHalves => {
+            let a = 3.0_f64.sqrt() * x;
+            -(a * a) * (-a).exp()
+        }
+        MaternNu::FiveHalves => {
+            let a = 5.0_f64.sqrt() * x;
+            -((a * a) * (1.0 + a) / 3.0) * (-a).exp()
+        }
+        MaternNu::SevenHalves => {
+            let a = 7.0_f64.sqrt() * x;
+            let a2 = a * a;
+            let a3 = a2 * a;
+            let a4 = a2 * a2;
+            -((a2 / 5.0) + (a3 / 5.0) + (a4 / 15.0)) * (-a).exp()
+        }
+        MaternNu::NineHalves => {
+            let a = 9.0_f64.sqrt() * x;
+            let a2 = a * a;
+            let a3 = a2 * a;
+            let a4 = a2 * a2;
+            let a5 = a4 * a;
+            -((a2 / 7.0) + (a3 / 7.0) + (2.0 * a4 / 35.0) + (a5 / 105.0)) * (-a).exp()
+        }
+    };
+    Ok(deriv)
+}
+
+#[inline(always)]
 fn bessel_i0_manual(x: f64) -> f64 {
     // Manual Cephes-style approximation with two regions:
     //  - |x| < 3.75: polynomial in y=(x/3.75)^2
@@ -3050,7 +3104,7 @@ fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct MaternDistanceCacheKey {
+struct SpatialDistanceCacheKey {
     data_rows: usize,
     data_cols: usize,
     data_ptr: usize,
@@ -3062,22 +3116,41 @@ struct MaternDistanceCacheKey {
 }
 
 #[derive(Debug, Clone)]
-struct MaternDistanceCacheEntry {
+struct SpatialDistanceCacheEntry {
     data_center_r: Arc<Array2<f64>>,
     center_center_r: Arc<Array2<f64>>,
 }
 
 #[derive(Default)]
-struct MaternDistanceCache {
-    map: HashMap<MaternDistanceCacheKey, MaternDistanceCacheEntry>,
-    order: Vec<MaternDistanceCacheKey>,
+struct SpatialDistanceCache {
+    map: HashMap<SpatialDistanceCacheKey, SpatialDistanceCacheEntry>,
+    order: Vec<SpatialDistanceCacheKey>,
 }
 
-const MATERN_DISTANCE_CACHE_MAX_ENTRIES: usize = 12;
-const MATERN_DISTANCE_CACHE_MIN_PAIRS: usize = 2048;
+const SPATIAL_DISTANCE_CACHE_MAX_ENTRIES: usize = 12;
+const SPATIAL_DISTANCE_CACHE_MIN_PAIRS: usize = 2048;
 
-static MATERN_DISTANCE_CACHE: LazyLock<Mutex<MaternDistanceCache>> =
-    LazyLock::new(|| Mutex::new(MaternDistanceCache::default()));
+static SPATIAL_DISTANCE_CACHE: LazyLock<Mutex<SpatialDistanceCache>> =
+    LazyLock::new(|| Mutex::new(SpatialDistanceCache::default()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ConstraintNullspaceCacheKey {
+    centers_rows: usize,
+    centers_cols: usize,
+    centers_hash: u64,
+    order_code: u8,
+}
+
+#[derive(Default)]
+struct ConstraintNullspaceCache {
+    map: HashMap<ConstraintNullspaceCacheKey, Arc<Array2<f64>>>,
+    order: Vec<ConstraintNullspaceCacheKey>,
+}
+
+const CONSTRAINT_NULLSPACE_CACHE_MAX_ENTRIES: usize = 32;
+
+static CONSTRAINT_NULLSPACE_CACHE: LazyLock<Mutex<ConstraintNullspaceCache>> =
+    LazyLock::new(|| Mutex::new(ConstraintNullspaceCache::default()));
 
 fn hash_array_view2(values: ArrayView2<'_, f64>) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -3135,19 +3208,19 @@ fn compute_center_center_distances(centers: ArrayView2<'_, f64>) -> Array2<f64> 
     distances
 }
 
-fn matern_distance_matrices(
+fn spatial_distance_matrices(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(Arc<Array2<f64>>, Arc<Array2<f64>>), BasisError> {
     let n = data.nrows();
     let k = centers.nrows();
-    if n.saturating_mul(k) < MATERN_DISTANCE_CACHE_MIN_PAIRS {
+    if n.saturating_mul(k) < SPATIAL_DISTANCE_CACHE_MIN_PAIRS {
         let dc = Arc::new(compute_data_center_distances(data, centers)?);
         let cc = Arc::new(compute_center_center_distances(centers));
         return Ok((dc, cc));
     }
 
-    let key = MaternDistanceCacheKey {
+    let key = SpatialDistanceCacheKey {
         data_rows: data.nrows(),
         data_cols: data.ncols(),
         data_ptr: data.as_ptr() as usize,
@@ -3158,7 +3231,7 @@ fn matern_distance_matrices(
         centers_hash: hash_array_view2(centers),
     };
 
-    if let Ok(cache) = MATERN_DISTANCE_CACHE.lock()
+    if let Ok(cache) = SPATIAL_DISTANCE_CACHE.lock()
         && let Some(hit) = cache.map.get(&key)
     {
         return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
@@ -3167,19 +3240,19 @@ fn matern_distance_matrices(
     let computed_dc = Arc::new(compute_data_center_distances(data, centers)?);
     let computed_cc = Arc::new(compute_center_center_distances(centers));
 
-    if let Ok(mut cache) = MATERN_DISTANCE_CACHE.lock() {
+    if let Ok(mut cache) = SPATIAL_DISTANCE_CACHE.lock() {
         if let Some(hit) = cache.map.get(&key) {
             return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
         }
         cache.map.insert(
             key,
-            MaternDistanceCacheEntry {
+            SpatialDistanceCacheEntry {
                 data_center_r: computed_dc.clone(),
                 center_center_r: computed_cc.clone(),
             },
         );
         cache.order.push(key);
-        while cache.map.len() > MATERN_DISTANCE_CACHE_MAX_ENTRIES {
+        while cache.map.len() > SPATIAL_DISTANCE_CACHE_MAX_ENTRIES {
             if cache.order.is_empty() {
                 break;
             }
@@ -3188,6 +3261,51 @@ fn matern_distance_matrices(
         }
     }
     Ok((computed_dc, computed_cc))
+}
+
+fn constraint_nullspace_order_code(order: DuchonNullspaceOrder) -> u8 {
+    match order {
+        DuchonNullspaceOrder::Zero => 0,
+        DuchonNullspaceOrder::Linear => 1,
+    }
+}
+
+fn cached_kernel_constraint_nullspace(
+    centers: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+) -> Result<Array2<f64>, BasisError> {
+    let key = ConstraintNullspaceCacheKey {
+        centers_rows: centers.nrows(),
+        centers_cols: centers.ncols(),
+        centers_hash: hash_array_view2(centers),
+        order_code: constraint_nullspace_order_code(order),
+    };
+
+    if let Ok(cache) = CONSTRAINT_NULLSPACE_CACHE.lock()
+        && let Some(hit) = cache.map.get(&key)
+    {
+        return Ok((**hit).clone());
+    }
+
+    let p_k = polynomial_block_from_order(centers, order);
+    let z = Arc::new(kernel_constraint_nullspace_from_matrix(p_k.view())?);
+
+    if let Ok(mut cache) = CONSTRAINT_NULLSPACE_CACHE.lock() {
+        if let Some(hit) = cache.map.get(&key) {
+            return Ok((**hit).clone());
+        }
+        cache.map.insert(key, z.clone());
+        cache.order.push(key);
+        while cache.map.len() > CONSTRAINT_NULLSPACE_CACHE_MAX_ENTRIES {
+            if cache.order.is_empty() {
+                break;
+            }
+            let old_key = cache.order.remove(0);
+            cache.map.remove(&old_key);
+        }
+    }
+
+    Ok((*z).clone())
 }
 
 /// Creates a Matérn spline basis from data and centers.
@@ -3262,7 +3380,7 @@ pub fn create_matern_spline_basis(
     let poly_cols = if include_intercept { 1 } else { 0 };
     let total_cols = k + poly_cols;
 
-    let (data_center_r, center_center_r) = matern_distance_matrices(data, centers)?;
+    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers)?;
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
@@ -3398,6 +3516,117 @@ pub fn build_matern_basis(
     })
 }
 
+pub fn build_matern_basis_log_kappa_derivative(
+    data: ArrayView2<'_, f64>,
+    spec: &MaternBasisSpec,
+) -> Result<BasisPsiDerivativeResult, BasisError> {
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let k = centers.nrows();
+    let z_opt = match &spec.identifiability {
+        MaternIdentifiability::None => None,
+        MaternIdentifiability::CenterSumToZero => {
+            let q = Array2::<f64>::ones((k, 1));
+            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
+        }
+        MaternIdentifiability::CenterLinearOrthogonal => {
+            let q = polynomial_block_from_order(centers.view(), DuchonNullspaceOrder::Linear);
+            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
+        }
+        MaternIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != k {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen Matérn identifiability transform mismatch: centers={k}, transform rows={}",
+                    transform.nrows()
+                )));
+            }
+            Some(transform.clone())
+        }
+    };
+
+    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers.view())?;
+    let mut kernel_block_derivative = Array2::<f64>::zeros((data.nrows(), k));
+    let kernel_result: Result<(), BasisError> = kernel_block_derivative
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                row[j] = matern_kernel_log_kappa_derivative_from_distance(
+                    data_center_r[[i, j]],
+                    spec.length_scale,
+                    spec.nu,
+                )?;
+            }
+            Ok(())
+        });
+    kernel_result?;
+
+    let mut center_kernel_derivative = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in i..k {
+            let kij = matern_kernel_log_kappa_derivative_from_distance(
+                center_center_r[[i, j]],
+                spec.length_scale,
+                spec.nu,
+            )?;
+            center_kernel_derivative[[i, j]] = kij;
+            center_kernel_derivative[[j, i]] = kij;
+        }
+    }
+
+    let (design_derivative, penalty_kernel_derivative) = if let Some(z) = z_opt {
+        let kernel_constrained = fast_ab(&kernel_block_derivative, &z);
+        let omega_constrained = {
+            let zt_k = fast_atb(&z, &center_kernel_derivative);
+            fast_ab(&zt_k, &z)
+        };
+        let mut design = kernel_constrained;
+        if spec.include_intercept {
+            let n = design.nrows();
+            let p = design.ncols();
+            let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
+            design_with_intercept
+                .slice_mut(s![.., 0..p])
+                .assign(&design);
+            design = design_with_intercept;
+        }
+        let total_cols = design.ncols();
+        let mut penalty = Array2::<f64>::zeros((total_cols, total_cols));
+        let kernel_cols = omega_constrained.ncols();
+        penalty
+            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&omega_constrained);
+        (design, penalty)
+    } else {
+        let mut design = kernel_block_derivative;
+        if spec.include_intercept {
+            let n = design.nrows();
+            let p = design.ncols();
+            let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
+            design_with_intercept
+                .slice_mut(s![.., 0..p])
+                .assign(&design);
+            design = design_with_intercept;
+        }
+        let total_cols = design.ncols();
+        let mut penalty = Array2::<f64>::zeros((total_cols, total_cols));
+        penalty
+            .slice_mut(s![0..k, 0..k])
+            .assign(&center_kernel_derivative);
+        (design, penalty)
+    };
+
+    let mut penalties_derivative = vec![penalty_kernel_derivative];
+    if spec.double_penalty {
+        penalties_derivative.push(Array2::<f64>::zeros(penalties_derivative[0].raw_dim()));
+    }
+
+    Ok(BasisPsiDerivativeResult {
+        design_derivative,
+        penalties_derivative,
+    })
+}
+
 /// Creates a Duchon-like basis with spectral penalty
 ///   P(w) = ||w||^(2p) * (kappa^2 + ||w||^2)^s
 /// using:
@@ -3457,7 +3686,7 @@ pub fn create_duchon_spline_basis(
     // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
     // Reparameterizing alpha = Z gamma enforces conditional-PD constraints once
     // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.
-    let z = kernel_constraint_nullspace(centers, nullspace_order)?;
+    let z = cached_kernel_constraint_nullspace(centers, nullspace_order)?;
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = duchon_s_from_nu(nu);
@@ -3505,6 +3734,8 @@ pub fn create_duchon_spline_basis(
         }
     }
 
+    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers)?;
+
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
         .axis_iter_mut(Axis(0))
@@ -3512,13 +3743,8 @@ pub fn create_duchon_spline_basis(
         .enumerate()
         .try_for_each(|(i, mut row)| {
             for j in 0..k {
-                let mut dist2 = 0.0;
-                for c in 0..d {
-                    let delta = data[[i, c]] - centers[[j, c]];
-                    dist2 += delta * delta;
-                }
                 row[j] = duchon_matern_kernel_general_from_distance(
-                    dist2.sqrt(),
+                    data_center_r[[i, j]],
                     length_scale,
                     p_order,
                     s_order,
@@ -3533,13 +3759,8 @@ pub fn create_duchon_spline_basis(
     let mut center_kernel = Array2::<f64>::zeros((k, k));
     for i in 0..k {
         for j in i..k {
-            let mut dist2 = 0.0;
-            for c in 0..d {
-                let delta = centers[[i, c]] - centers[[j, c]];
-                dist2 += delta * delta;
-            }
             let kij = duchon_matern_kernel_general_from_distance(
-                dist2.sqrt(),
+                center_center_r[[i, j]],
                 length_scale,
                 p_order,
                 s_order,
@@ -3649,36 +3870,11 @@ fn kernel_constraint_nullspace_from_matrix(
     if q == 0 {
         return Ok(Array2::<f64>::eye(k));
     }
-    // Constraint system Q^T alpha = 0. The nullspace of Q^T gives feasible
-    // kernel coefficients that cannot represent constrained polynomial content.
-    let q_t = constraint_matrix.t().to_owned(); // q x k
-
-    let (_, singular_values, vt_opt) = q_t.svd(false, true).map_err(BasisError::LinalgError)?;
-    let vt = match vt_opt {
-        Some(vt) => vt,
-        None => return Err(BasisError::ConstraintNullspaceNotFound),
-    };
-    let v = vt.t().to_owned(); // k x k
-
-    let max_sigma = singular_values
-        .iter()
-        .fold(0.0_f64, |max_val, &sigma| max_val.max(sigma));
-    let tol = (k as f64) * 1e-12 * max_sigma.max(1.0);
-    let rank = singular_values.iter().filter(|&&sigma| sigma > tol).count();
-    let z = if rank >= k {
-        Array2::<f64>::zeros((k, 0))
-    } else {
-        v.slice(s![.., rank..]).to_owned()
-    };
+    // Constraint system Q^T alpha = 0. The trailing columns of the orthogonal
+    // factor in a column-pivoted QR of Q span null(Q^T).
+    let (z, _) = rrqr_nullspace_basis(&constraint_matrix, default_rrqr_rank_alpha())
+        .map_err(BasisError::LinalgError)?;
     Ok(z)
-}
-
-fn kernel_constraint_nullspace(
-    knots: ArrayView2<'_, f64>,
-    order: DuchonNullspaceOrder,
-) -> Result<Array2<f64>, BasisError> {
-    let p_k = polynomial_block_from_order(knots, order);
-    kernel_constraint_nullspace_from_matrix(p_k.view())
 }
 
 /// Deterministically selects thin-plate knots via farthest-point sampling.
@@ -3905,7 +4101,7 @@ pub fn create_thin_plate_spline_basis(
 
     // Enforce TPS side-constraint P(knots)^T α = 0 by projecting onto
     // the nullspace of P(knots)^T.
-    let z = kernel_constraint_nullspace(knots, DuchonNullspaceOrder::Linear)?;
+    let z = cached_kernel_constraint_nullspace(knots, DuchonNullspaceOrder::Linear)?;
     let kernel_constrained = fast_ab(&kernel_block, &z);
     let omega_constrained = {
         let zt_o = fast_atb(&z, &omega);
@@ -3985,27 +4181,12 @@ pub fn apply_sum_to_zero_constraint(
     };
     let c = basis_matrix.t().dot(&constraint_vector); // shape k
 
-    // Orthonormal basis for nullspace of c^T.
-    // Build a k×1 matrix and compute its SVD; the trailing columns of U after
-    // the numerical rank span the nullspace.
+    // Orthonormal basis for nullspace of c^T from a pivoted QR of the k×1
+    // constraint matrix.
     let mut c_mat = Array2::<f64>::zeros((k, 1));
     c_mat.column_mut(0).assign(&c);
-
-    use crate::faer_ndarray::FaerSvd;
-    let (u_opt, singular_values, _) = c_mat.svd(true, false).map_err(BasisError::LinalgError)?;
-    let u = match u_opt {
-        Some(u) => u,
-        None => return Err(BasisError::ConstraintNullspaceNotFound),
-    };
-    let max_sigma = singular_values
-        .iter()
-        .copied()
-        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    let tol = (k.max(1) as f64) * f64::EPSILON * max_sigma.max(1.0);
-    let rank = singular_values
-        .iter()
-        .filter(|&&sigma| sigma.abs() > tol)
-        .count();
+    let (z, rank) =
+        rrqr_nullspace_basis(&c_mat, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
     if rank >= k {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
@@ -4013,10 +4194,9 @@ pub fn apply_sum_to_zero_constraint(
         // Already orthogonal to the intercept constraint; keep full basis unchanged.
         return Ok((basis_matrix.to_owned(), Array2::eye(k)));
     }
-    let z = u.slice(s![.., rank..]).to_owned();
 
     // Constrained basis
-    let constrained = basis_matrix.dot(&z);
+    let constrained = fast_ab(&basis_matrix, &z);
     Ok((constrained, z))
 }
 
@@ -4037,10 +4217,7 @@ pub fn apply_sum_to_zero_constraint(
 /// So it is enough to choose columns of `K` in `null((B^T W C)^T)`.
 /// This implementation computes:
 ///   `M = B^T W C` (`k x q`)
-/// and extracts a basis for `null(M^T)` via SVD.
-///
-/// If `M^T = U Σ V^T`, then right singular vectors in `V` corresponding to near-zero
-/// singular values span `null(M^T)`. We stack those vectors as columns of `K`.
+/// and extracts a basis for `null(M^T)` via column-pivoted Householder QR.
 ///
 /// The result enforces orthogonality by construction while retaining the largest possible
 /// smooth subspace under the given constraints.
@@ -4083,44 +4260,18 @@ pub fn apply_weighted_orthogonality_constraint(
     // that produce basis columns orthogonal to C under the W-inner product.
     let constraint_cross = basis_matrix.t().dot(&weighted_constraints); // k×q
 
-    let constraint_cross_t = constraint_cross.t().to_owned();
-
-    let (_, singular_values, vt_opt) = constraint_cross_t
-        .svd(false, true)
+    let (transform, rank) = rrqr_nullspace_basis(&constraint_cross, default_rrqr_rank_alpha())
         .map_err(BasisError::LinalgError)?;
-    let vt = match vt_opt {
-        Some(vt) => vt,
-        None => return Err(BasisError::ConstraintNullspaceNotFound),
-    };
-    let v = vt.t().to_owned();
-
-    // Numerical rank threshold for M^T.
-    // rank = count(sigma_i > tol), nullity = k - rank.
-    let max_sigma = singular_values
-        .iter()
-        .fold(0.0_f64, |max_val, &sigma| max_val.max(sigma));
-    let tol = if max_sigma > 0.0 {
-        (k.max(q) as f64) * 1e-12 * max_sigma
-    } else {
-        1e-12
-    };
-    let rank = singular_values.iter().filter(|&&sigma| sigma > tol).count();
-
-    let total_cols = v.ncols();
-    if rank >= total_cols {
+    if rank >= k {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
-
-    // Keep right singular vectors corresponding to numerically zero singular values.
-    // transform = K in derivation above.
-    let transform = v.slice(s![.., rank..]).to_owned();
 
     if transform.ncols() == 0 {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
 
     // B_c = B K.
-    let constrained_basis = basis_matrix.dot(&transform);
+    let constrained_basis = fast_ab(&basis_matrix, &transform);
     Ok((constrained_basis, transform))
 }
 
@@ -4246,34 +4397,18 @@ pub fn compute_geometric_constraint_transform(
         c_geom[[1, j]] = (c_geom[[1, j]] - g_mean) / g_std;
     }
 
-    // 4. SVD to find nullspace of C_geom
-    // C_geom is 2×k, so we want right singular vectors corresponding to zero singular values
-    use crate::faer_ndarray::FaerSvd;
-    let (_, singular_values, vt_opt) = c_geom.svd(false, true).map_err(BasisError::LinalgError)?;
-    let vt = match vt_opt {
-        Some(vt) => vt,
-        None => return Err(BasisError::ConstraintNullspaceNotFound),
-    };
-
-    // 5. Identify nullspace columns (singular values ≈ 0)
-    let max_sigma = singular_values.iter().fold(0.0_f64, |a, &b| a.max(b));
-    let tol = (k as f64) * 1e-12 * max_sigma.max(1.0);
-    let rank = singular_values.iter().filter(|&&s| s > tol).count();
-
+    // 4. Column-pivoted QR on C_geom^T; the trailing Q columns span null(C_geom).
+    let (z, rank) = rrqr_nullspace_basis(&c_geom.t(), default_rrqr_rank_alpha())
+        .map_err(BasisError::LinalgError)?;
     if rank >= k {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
-
-    // 6. Z = columns of V corresponding to near-zero singular values
-    // V = Vt^T, and we want columns rank..k
-    let v = vt.t();
-    let z = v.slice(s![.., rank..]).to_owned();
 
     if z.ncols() == 0 {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
 
-    // 7. Build raw penalty and project: S_c = Z' S Z
+    // 5. Build raw penalty and project: S_c = Z' S Z
     let s_raw = create_difference_penalty_matrix(k, penalty_order, Some(g.view()))?;
     let s_constrained = {
         let zt_s = fast_atb(&z, &s_raw);
@@ -5207,6 +5342,10 @@ fn create_ispline_dense(
 ///
 /// Uses the derivative recursion:
 /// B''_{i,k}(x) = k * (B'_{i,k-1}(x)/(t_{i+k}-t_i) - B'_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}))
+///
+/// This returns derivatives in the raw spline basis. If a model uses an
+/// identifiability/constrained basis `BZ`, the caller must apply that same
+/// constraint transform in derivative space as `B''Z`.
 pub fn evaluate_bspline_second_derivative_scalar(
     x: f64,
     knot_vector: ArrayView1<f64>,
@@ -5308,6 +5447,134 @@ pub fn evaluate_bspline_second_derivative_scalar_into(
         };
         let term2 = if denom2.abs() > 1e-12 {
             k * deriv_lower[i + 1] / denom2
+        } else {
+            0.0
+        };
+        out[i] = term1 - term2;
+    }
+
+    Ok(())
+}
+
+/// Evaluates B-spline third derivatives at a single scalar point `x` into a provided buffer.
+///
+/// Uses the derivative recursion:
+/// B'''_{i,k}(x) = k * (B''_{i,k-1}(x)/(t_{i+k}-t_i) - B''_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}))
+///
+/// This returns derivatives in the raw spline basis. If a model uses an
+/// identifiability/constrained basis `BZ`, the caller must apply that same
+/// constraint transform in derivative space as `B'''Z`.
+pub fn evaluate_bspline_third_derivative_scalar(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+) -> Result<(), BasisError> {
+    if degree < 3 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    let num_second_lower = knot_vector
+        .len()
+        .saturating_sub((degree - 1).saturating_sub(1))
+        .saturating_sub(1);
+    let mut second_lower = vec![0.0; num_second_lower];
+    let mut deriv_lower = vec![0.0; knot_vector.len().saturating_sub(degree)];
+    let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
+    let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(3));
+    evaluate_bspline_third_derivative_scalar_into(
+        x,
+        knot_vector,
+        degree,
+        out,
+        &mut second_lower,
+        &mut deriv_lower,
+        &mut lower_basis,
+        &mut lower_scratch,
+    )
+}
+
+/// Zero-allocation version for third derivatives: pass pre-allocated buffers.
+/// - `second_lower`: length = knot_vector.len() - degree
+/// - `deriv_lower`: length = knot_vector.len() - degree
+/// - `lower_basis`: length = knot_vector.len() - (degree - 1)
+/// - `lower_scratch`: BsplineScratch for degree-3
+pub fn evaluate_bspline_third_derivative_scalar_into(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+    second_lower: &mut [f64],
+    deriv_lower: &mut [f64],
+    lower_basis: &mut [f64],
+    lower_scratch: &mut internal::BsplineScratch,
+) -> Result<(), BasisError> {
+    if degree < 3 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    let required_knots = degree + 2;
+    if knot_vector.len() < required_knots {
+        return Err(BasisError::InsufficientKnotsForDegree {
+            degree,
+            required: required_knots,
+            provided: knot_vector.len(),
+        });
+    }
+
+    let num_basis = knot_vector.len() - degree - 1;
+    if out.len() != num_basis {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Output buffer length {} does not match number of basis functions {}",
+            out.len(),
+            num_basis
+        )));
+    }
+
+    let expected_second_lower = knot_vector.len().saturating_sub(degree);
+    if second_lower.len() != expected_second_lower {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Lower-second-derivative buffer length {} does not match expected length {}",
+            second_lower.len(),
+            expected_second_lower
+        )));
+    }
+    let expected_deriv_lower = knot_vector.len().saturating_sub(degree);
+    if deriv_lower.len() != expected_deriv_lower {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Lower-derivative buffer length {} does not match expected length {}",
+            deriv_lower.len(),
+            expected_deriv_lower
+        )));
+    }
+    let expected_lower_basis = knot_vector.len().saturating_sub(degree - 1);
+    if lower_basis.len() != expected_lower_basis {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Lower-basis buffer length {} does not match expected length {}",
+            lower_basis.len(),
+            expected_lower_basis
+        )));
+    }
+
+    evaluate_bspline_second_derivative_scalar_into(
+        x,
+        knot_vector,
+        degree - 1,
+        second_lower,
+        deriv_lower,
+        lower_basis,
+        lower_scratch,
+    )?;
+
+    let k = degree as f64;
+    for i in 0..num_basis {
+        let denom1 = knot_vector[i + degree] - knot_vector[i];
+        let denom2 = knot_vector[i + degree + 1] - knot_vector[i + 1];
+        let term1 = if denom1.abs() > 1e-12 {
+            k * second_lower[i] / denom1
+        } else {
+            0.0
+        };
+        let term2 = if denom2.abs() > 1e-12 {
+            k * second_lower[i + 1] / denom2
         } else {
             0.0
         };
@@ -6396,8 +6663,7 @@ mod tests {
             evaluate_ispline_scalar(x - h, knots.view(), degree, &mut i_minus).expect("I(x-h)");
 
             let mut db = vec![0.0; n_i];
-            evaluate_bspline_derivative_scalar(x, knots.view(), bs_degree, &mut db)
-                .expect("B'(x)");
+            evaluate_bspline_derivative_scalar(x, knots.view(), bs_degree, &mut db).expect("B'(x)");
             let mut d_i = vec![0.0; n_i];
             let mut running = 0.0_f64;
             for j in (0..n_i).rev() {
@@ -6886,6 +7152,38 @@ mod tests {
     }
 
     #[test]
+    fn test_third_derivative_matches_finite_difference() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
+        let degree = 3;
+        let num_basis = knots.len() - degree - 1;
+        let mut d2_plus = vec![0.0; num_basis];
+        let mut d2_minus = vec![0.0; num_basis];
+        let mut d3 = vec![0.0; num_basis];
+
+        let x = 0.37;
+        let h = 1e-4;
+
+        evaluate_bspline_second_derivative_scalar(x + h, knots.view(), degree, &mut d2_plus)
+            .expect("second derivative +h");
+        evaluate_bspline_second_derivative_scalar(x - h, knots.view(), degree, &mut d2_minus)
+            .expect("second derivative -h");
+        evaluate_bspline_third_derivative_scalar(x, knots.view(), degree, &mut d3)
+            .expect("third derivative");
+
+        let tol = 5e-3;
+        for i in 0..num_basis {
+            let fd = (d2_plus[i] - d2_minus[i]) / (2.0 * h);
+            assert!(
+                (d3[i] - fd).abs() < tol,
+                "third derivative mismatch at {}: analytic={}, fd={}",
+                i,
+                d3[i],
+                fd
+            );
+        }
+    }
+
+    #[test]
     fn test_sparse_second_derivative_matches_scalar() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
         let degree = 3;
@@ -7225,6 +7523,56 @@ mod tests {
         // (k-1) constrained kernel cols + explicit intercept.
         assert_eq!(out.design.ncols(), centers.nrows());
         assert_eq!(out.nullspace_dims, vec![1]);
+    }
+
+    #[test]
+    fn test_matern_log_kappa_derivative_matches_fd() {
+        let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let spec = MaternBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: 0.9,
+            nu: MaternNu::FiveHalves,
+            include_intercept: false,
+            double_penalty: false,
+            identifiability: MaternIdentifiability::CenterSumToZero,
+        };
+        let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
+            .expect("analytic Matérn derivative should build");
+
+        let eps: f64 = 1e-6;
+        let kappa = 1.0 / spec.length_scale;
+        let ls_plus = 1.0 / (kappa * eps.exp());
+        let ls_minus = 1.0 / (kappa * (-eps).exp());
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = ls_plus;
+        spec_minus.length_scale = ls_minus;
+        let plus = build_matern_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_matern_basis(data.view(), &spec_minus).expect("minus build");
+
+        let fd_design = (&plus.design - &minus.design) / (2.0 * eps);
+        let fd_penalty = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
+
+        let design_err = (&deriv.design_derivative - &fd_design)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let penalty_err = (&deriv.penalties_derivative[0] - &fd_penalty)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+
+        assert!(
+            design_err < 1e-5,
+            "design derivative mismatch too large: {design_err}"
+        );
+        assert!(
+            penalty_err < 1e-5,
+            "penalty derivative mismatch too large: {penalty_err}"
+        );
     }
 
     #[test]
