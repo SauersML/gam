@@ -1358,6 +1358,11 @@ impl<'a> JointRemlState<'a> {
                 for i in 0..n {
                     let e = eta[i].clamp(-700.0, 700.0);
                     let se_i = se[i].max(0.0);
+                    // Joint-model integrated updates should use the same
+                    // Gaussian-uncertainty expectation engine as standalone
+                    // PIRLS and prediction. That keeps calibration / joint
+                    // inference on the same link-specific mathematics instead
+                    // of silently reverting to an older approximation path.
                     let integrated = crate::quadrature::integrated_inverse_link_mean_and_derivative(
                         &state.quad_ctx,
                         LinkFunction::Logit,
@@ -2110,8 +2115,16 @@ impl<'a> JointRemlState<'a> {
             }
         }
         self.eval.cached_edf_terms = vec![
-            ("Base Predictor".to_string(), edf_base.max(0.0), p_base as f64),
-            ("Link Wiggle".to_string(), edf_link.max(0.0), p_link.max(1) as f64),
+            (
+                "Base Predictor".to_string(),
+                edf_base.max(0.0),
+                p_base as f64,
+            ),
+            (
+                "Link Wiggle".to_string(),
+                edf_link.max(0.0),
+                p_link.max(1) as f64,
+            ),
         ];
 
         // Precompute H†_{theta,theta} for penalty sensitivity trace using pseudo-inverse
@@ -2964,7 +2977,10 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
                 return (*cost_c, grad_c.clone());
             }
 
-            let sample = match (reml_state.compute_cost(rho), reml_state.compute_gradient(rho)) {
+            let sample = match (
+                reml_state.compute_cost(rho),
+                reml_state.compute_gradient(rho),
+            ) {
                 (Ok(cost), Ok(grad)) if cost.is_finite() && grad.iter().all(|v| v.is_finite()) => {
                     (cost, grad)
                 }
