@@ -5473,13 +5473,10 @@ pub fn evaluate_bspline_third_derivative_scalar(
     if degree < 3 {
         return Err(BasisError::InvalidDegree(degree));
     }
-    let num_second_lower = knot_vector
-        .len()
-        .saturating_sub((degree - 1).saturating_sub(1))
-        .saturating_sub(1);
+    let num_second_lower = knot_vector.len().saturating_sub(degree);
     let mut second_lower = vec![0.0; num_second_lower];
-    let mut deriv_lower = vec![0.0; knot_vector.len().saturating_sub(degree)];
-    let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
+    let mut deriv_lower = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
+    let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 2)];
     let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(3));
     evaluate_bspline_third_derivative_scalar_into(
         x,
@@ -5495,8 +5492,8 @@ pub fn evaluate_bspline_third_derivative_scalar(
 
 /// Zero-allocation version for third derivatives: pass pre-allocated buffers.
 /// - `second_lower`: length = knot_vector.len() - degree
-/// - `deriv_lower`: length = knot_vector.len() - degree
-/// - `lower_basis`: length = knot_vector.len() - (degree - 1)
+/// - `deriv_lower`: length = knot_vector.len() - (degree - 1)
+/// - `lower_basis`: length = knot_vector.len() - (degree - 2)
 /// - `lower_scratch`: BsplineScratch for degree-3
 pub fn evaluate_bspline_third_derivative_scalar_into(
     x: f64,
@@ -5537,7 +5534,7 @@ pub fn evaluate_bspline_third_derivative_scalar_into(
             expected_second_lower
         )));
     }
-    let expected_deriv_lower = knot_vector.len().saturating_sub(degree);
+    let expected_deriv_lower = knot_vector.len().saturating_sub(degree - 1);
     if deriv_lower.len() != expected_deriv_lower {
         return Err(BasisError::InvalidKnotVector(format!(
             "Lower-derivative buffer length {} does not match expected length {}",
@@ -5545,7 +5542,7 @@ pub fn evaluate_bspline_third_derivative_scalar_into(
             expected_deriv_lower
         )));
     }
-    let expected_lower_basis = knot_vector.len().saturating_sub(degree - 1);
+    let expected_lower_basis = knot_vector.len().saturating_sub(degree - 2);
     if lower_basis.len() != expected_lower_basis {
         return Err(BasisError::InvalidKnotVector(format!(
             "Lower-basis buffer length {} does not match expected length {}",

@@ -6,13 +6,21 @@ use crate::basis::{
     build_duchon_basis, build_matern_basis, build_matern_basis_log_kappa_derivative,
     build_thin_plate_basis, estimate_penalty_nullity,
 };
+use crate::construction::ReparamResult;
 use crate::construction::kronecker_product;
+use crate::custom_family::{
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
+    ParameterBlockState, fit_custom_family,
+};
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitOptions, FitResult,
     compute_external_joint_hyper_cost_gradient, fit_gam_with_heuristic_lambdas,
 };
+use crate::faer_ndarray::fast_atv;
+use crate::matrix::DesignMatrix;
 use crate::pirls::LinearInequalityConstraints;
-use crate::types::LikelihoodFamily;
+use crate::probability::{normal_cdf_approx, normal_pdf};
+use crate::types::{LikelihoodFamily, RidgePassport, RidgePolicy};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -121,12 +129,38 @@ pub struct SmoothDesign {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BoundedCoefficientPriorSpec {
+    None,
+    Beta { a: f64, b: f64 },
+}
+
+impl Default for BoundedCoefficientPriorSpec {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum LinearCoefficientGeometry {
+    #[default]
+    Unconstrained,
+    Bounded {
+        min: f64,
+        max: f64,
+        #[serde(default)]
+        prior: BoundedCoefficientPriorSpec,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearTermSpec {
     pub name: String,
     pub feature_col: usize,
     /// Optional double-penalty ridge on this linear coefficient.
     /// If true, emits an identity penalty block for this 1D term.
     pub double_penalty: bool,
+    #[serde(default)]
+    pub coefficient_geometry: LinearCoefficientGeometry,
 }
 
 /// Random-effects term specification.
@@ -1706,6 +1740,18 @@ fn fit_term_collection_for_spec_with_heuristic_lambdas(
     family: LikelihoodFamily,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
+    if has_bounded_linear_terms(spec) {
+        return fit_bounded_term_collection_for_spec(
+            data,
+            y,
+            weights,
+            offset,
+            spec,
+            heuristic_lambdas,
+            family,
+            options,
+        );
+    }
     let design = build_term_collection_design(data, spec)?;
     let fit = fit_gam_with_heuristic_lambdas(
         design.design.view(),
@@ -1724,6 +1770,571 @@ fn fit_term_collection_for_spec_with_heuristic_lambdas(
     )?;
     enforce_term_constraint_feasibility(&design, &fit)?;
     Ok(FittedTermCollection { fit, design })
+}
+
+fn has_bounded_linear_terms(spec: &TermCollectionSpec) -> bool {
+    spec.linear_terms.iter().any(|term| {
+        matches!(
+            term.coefficient_geometry,
+            LinearCoefficientGeometry::Bounded { .. }
+        )
+    })
+}
+
+#[derive(Clone)]
+struct BoundedLinearTermMeta {
+    col_idx: usize,
+    min: f64,
+    max: f64,
+    prior: BoundedCoefficientPriorSpec,
+}
+
+#[derive(Clone)]
+struct BoundedLinearFamily {
+    family: LikelihoodFamily,
+    y: Array1<f64>,
+    weights: Array1<f64>,
+    design: Array2<f64>,
+    design_zeroed: Array2<f64>,
+    offset: Array1<f64>,
+    bounded_terms: Vec<BoundedLinearTermMeta>,
+}
+
+#[derive(Clone)]
+struct StandardFamilyObservationState {
+    eta: Array1<f64>,
+    mu: Array1<f64>,
+    score: Array1<f64>,
+    fisher_weight: Array1<f64>,
+    log_likelihood: f64,
+}
+
+fn bounded_logit(z: f64) -> f64 {
+    let zc = z.clamp(1e-12, 1.0 - 1e-12);
+    (zc / (1.0 - zc)).ln()
+}
+
+fn stable_sigmoid(theta: f64) -> f64 {
+    if theta >= 0.0 {
+        let exp_neg = (-theta).exp();
+        1.0 / (1.0 + exp_neg)
+    } else {
+        let exp_pos = theta.exp();
+        exp_pos / (1.0 + exp_pos)
+    }
+}
+
+fn bounded_latent_to_user(theta: f64, min: f64, max: f64) -> (f64, f64, f64) {
+    let z = stable_sigmoid(theta);
+    let width = max - min;
+    let beta = min + width * z;
+    let db_dtheta = width * z * (1.0 - z);
+    (beta, z, db_dtheta)
+}
+
+fn bounded_prior_terms(theta: f64, prior: &BoundedCoefficientPriorSpec) -> (f64, f64, f64) {
+    match prior {
+        BoundedCoefficientPriorSpec::None => (0.0, 0.0, 0.0),
+        BoundedCoefficientPriorSpec::Beta { a, b } => {
+            let z = stable_sigmoid(theta).clamp(1e-12, 1.0 - 1e-12);
+            let logp = *a * z.ln() + *b * (1.0 - z).ln();
+            let grad = *a - (*a + *b) * z;
+            let neg_hess = (*a + *b) * z * (1.0 - z);
+            (logp, grad, neg_hess)
+        }
+    }
+}
+
+fn evaluate_standard_family_observations(
+    family: LikelihoodFamily,
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    eta: &Array1<f64>,
+) -> Result<StandardFamilyObservationState, String> {
+    const PROB_EPS: f64 = 1e-10;
+    const MU_DERIV_EPS: f64 = 1e-12;
+    let n = y.len();
+    if weights.len() != n || eta.len() != n {
+        return Err("bounded family observation size mismatch".to_string());
+    }
+
+    let mut mu = Array1::<f64>::zeros(n);
+    let mut score = Array1::<f64>::zeros(n);
+    let mut fisher_weight = Array1::<f64>::zeros(n);
+    let mut log_likelihood = 0.0;
+
+    for i in 0..n {
+        let w = weights[i].max(0.0);
+        let yi = y[i];
+        let eta_i = eta[i];
+        match family {
+            LikelihoodFamily::GaussianIdentity => {
+                let resid = yi - eta_i;
+                mu[i] = eta_i;
+                score[i] = w * resid;
+                fisher_weight[i] = w.max(MU_DERIV_EPS);
+                log_likelihood += -0.5 * w * resid * resid;
+            }
+            LikelihoodFamily::BinomialLogit
+            | LikelihoodFamily::BinomialProbit
+            | LikelihoodFamily::BinomialCLogLog => {
+                let (mu_i_raw, dmu_deta_raw) = match family {
+                    LikelihoodFamily::BinomialLogit => {
+                        let mu_i = stable_sigmoid(eta_i);
+                        (mu_i, mu_i * (1.0 - mu_i))
+                    }
+                    LikelihoodFamily::BinomialProbit => {
+                        let mu_i = normal_cdf_approx(eta_i);
+                        (mu_i, normal_pdf(eta_i))
+                    }
+                    LikelihoodFamily::BinomialCLogLog => {
+                        let eta_c = eta_i.clamp(-30.0, 30.0);
+                        let exp_eta = eta_c.exp();
+                        let mu_i = 1.0 - (-exp_eta).exp();
+                        let dmu = (eta_c - exp_eta).exp();
+                        (mu_i, dmu)
+                    }
+                    _ => unreachable!(),
+                };
+                let mu_i = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);
+                let dmu_deta = dmu_deta_raw.max(MU_DERIV_EPS);
+                let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
+                mu[i] = mu_i;
+                score[i] = w * (yi - mu_i) * dmu_deta / var;
+                fisher_weight[i] = (w * dmu_deta * dmu_deta / var).max(MU_DERIV_EPS);
+                log_likelihood += w * (yi * mu_i.ln() + (1.0 - yi) * (1.0 - mu_i).ln());
+            }
+            LikelihoodFamily::RoystonParmar => {
+                return Err(
+                    "bounded linear terms are not supported for survival model fits".to_string(),
+                );
+            }
+        }
+    }
+
+    Ok(StandardFamilyObservationState {
+        eta: eta.clone(),
+        mu,
+        score,
+        fisher_weight,
+        log_likelihood,
+    })
+}
+
+impl BoundedLinearFamily {
+    fn user_beta_and_jacobian(&self, latent_beta: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
+        let mut beta_user = latent_beta.clone();
+        let mut jac_diag = Array1::<f64>::ones(latent_beta.len());
+        for term in &self.bounded_terms {
+            let (beta, _z, db_dtheta) =
+                bounded_latent_to_user(latent_beta[term.col_idx], term.min, term.max);
+            beta_user[term.col_idx] = beta;
+            jac_diag[term.col_idx] = db_dtheta;
+        }
+        (beta_user, jac_diag)
+    }
+
+    fn nonlinear_offset_from_latent(&self, latent_beta: &Array1<f64>) -> Array1<f64> {
+        let mut offset = self.offset.clone();
+        for term in &self.bounded_terms {
+            let (beta, _z, _db_dtheta) =
+                bounded_latent_to_user(latent_beta[term.col_idx], term.min, term.max);
+            offset += &(self.design.column(term.col_idx).to_owned() * beta);
+        }
+        offset
+    }
+
+    fn effective_design_for_latent(&self, jac_diag: &Array1<f64>) -> Array2<f64> {
+        let mut x_eff = self.design.clone();
+        for term in &self.bounded_terms {
+            let scaled = self.design.column(term.col_idx).to_owned() * jac_diag[term.col_idx];
+            x_eff.column_mut(term.col_idx).assign(&scaled);
+        }
+        x_eff
+    }
+
+    fn evaluation_from_latent(
+        &self,
+        latent_beta: &Array1<f64>,
+    ) -> Result<
+        (
+            StandardFamilyObservationState,
+            Array2<f64>,
+            Array1<f64>,
+            f64,
+        ),
+        String,
+    > {
+        let (_beta_user, jac_diag) = self.user_beta_and_jacobian(latent_beta);
+        let x_eff = self.effective_design_for_latent(&jac_diag);
+        let eta =
+            self.design_zeroed.dot(latent_beta) + self.nonlinear_offset_from_latent(latent_beta);
+        let obs = evaluate_standard_family_observations(self.family, &self.y, &self.weights, &eta)?;
+
+        let mut prior_grad = Array1::<f64>::zeros(latent_beta.len());
+        let mut prior_neg_hess = Array2::<f64>::zeros((latent_beta.len(), latent_beta.len()));
+        let mut prior_loglik = 0.0;
+        for term in &self.bounded_terms {
+            let (logp, grad, neg_hess) =
+                bounded_prior_terms(latent_beta[term.col_idx], &term.prior);
+            prior_loglik += logp;
+            prior_grad[term.col_idx] += grad;
+            prior_neg_hess[[term.col_idx, term.col_idx]] += neg_hess;
+        }
+
+        let mut hessian = xt_diag_x_dense(x_eff.view(), obs.fisher_weight.view())?;
+        hessian += &prior_neg_hess;
+        let mut gradient = fast_atv(&x_eff, &obs.score);
+        gradient += &prior_grad;
+
+        Ok((obs, hessian, gradient, prior_loglik))
+    }
+}
+
+impl CustomFamily for BoundedLinearFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        if block_states.len() != 1 {
+            return Err(format!(
+                "bounded linear family expects 1 block, got {}",
+                block_states.len()
+            ));
+        }
+        let latent_beta = &block_states[0].beta;
+        let (obs, hessian, gradient, prior_loglik) = self.evaluation_from_latent(latent_beta)?;
+        Ok(FamilyEvaluation {
+            log_likelihood: obs.log_likelihood + prior_loglik,
+            block_working_sets: vec![BlockWorkingSet::ExactNewton { gradient, hessian }],
+        })
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 1 {
+            return Err(format!(
+                "bounded linear family expects 1 block, got {}",
+                block_states.len()
+            ));
+        }
+        let (_obs, hessian, _gradient, _prior_loglik) =
+            self.evaluation_from_latent(&block_states[0].beta)?;
+        Ok(Some(hessian))
+    }
+
+    fn block_geometry(
+        &self,
+        block_states: &[ParameterBlockState],
+        spec: &ParameterBlockSpec,
+    ) -> Result<(DesignMatrix, Array1<f64>), String> {
+        if block_states.is_empty() {
+            return Ok((
+                DesignMatrix::Dense(self.design_zeroed.clone()),
+                self.offset.clone(),
+            ));
+        }
+        if block_states.len() != 1 {
+            return Err(format!(
+                "bounded linear family expects 1 block, got {}",
+                block_states.len()
+            ));
+        }
+        let offset = self.nonlinear_offset_from_latent(&block_states[0].beta);
+        let x = if spec.design.ncols() == self.design_zeroed.ncols() {
+            self.design_zeroed.clone()
+        } else {
+            return Err("bounded linear family design column mismatch".to_string());
+        };
+        Ok((DesignMatrix::Dense(x), offset))
+    }
+}
+
+fn xt_diag_x_dense(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+    if x.nrows() != w.len() {
+        return Err("xt_diag_x_dense row mismatch".to_string());
+    }
+    let n = x.nrows();
+    let p = x.ncols();
+    let mut out = Array2::<f64>::zeros((p, p));
+    for i in 0..n {
+        let wi = w[i];
+        if wi == 0.0 {
+            continue;
+        }
+        for a in 0..p {
+            let xa = x[[i, a]];
+            for b in a..p {
+                let v = wi * xa * x[[i, b]];
+                out[[a, b]] += v;
+                if a != b {
+                    out[[b, a]] += v;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn approx_bounded_edf_by_block(design: &TermCollectionDesign) -> Vec<f64> {
+    let smooth_penalty_count = design
+        .smooth
+        .terms
+        .iter()
+        .map(|term| term.penalties_local.len())
+        .sum::<usize>();
+    let linear_double_penalty_count = design
+        .penalties
+        .len()
+        .saturating_sub(design.random_effect_ranges.len() + smooth_penalty_count);
+    let mut out = vec![1.0; linear_double_penalty_count];
+    for (_name, range) in &design.random_effect_ranges {
+        out.push((range.end - range.start) as f64);
+    }
+    for term in &design.smooth.terms {
+        let coeffs = (term.coeff_range.end - term.coeff_range.start).max(1) as f64;
+        let k = term.penalties_local.len().max(1) as f64;
+        for _ in 0..term.penalties_local.len() {
+            out.push(coeffs / k);
+        }
+    }
+    out
+}
+
+fn identity_reparam_result(p: usize) -> ReparamResult {
+    ReparamResult {
+        s_transformed: Array2::zeros((p, p)),
+        log_det: 0.0,
+        det1: Array1::zeros(0),
+        qs: Array2::eye(p),
+        rs_transformed: Vec::new(),
+        rs_transposed: Vec::new(),
+        e_transformed: Array2::zeros((0, p)),
+        u_truncated: Array2::zeros((p, 0)),
+    }
+}
+
+fn bounded_pirls_result(
+    beta_user: &Array1<f64>,
+    eta_state: &StandardFamilyObservationState,
+    penalized_hessian: &Array2<f64>,
+    penalty_term: f64,
+    deviance: f64,
+    offset: &Array1<f64>,
+) -> crate::pirls::PirlsResult {
+    let mut working_response = eta_state.eta.clone();
+    for i in 0..working_response.len() {
+        let wi = eta_state.fisher_weight[i].max(1e-12);
+        working_response[i] += eta_state.score[i] / wi;
+    }
+    crate::pirls::PirlsResult {
+        beta_transformed: beta_user.clone().into(),
+        penalized_hessian_transformed: penalized_hessian.clone(),
+        stabilized_hessian_transformed: penalized_hessian.clone(),
+        ridge_passport: RidgePassport::scaled_identity(
+            0.0,
+            RidgePolicy::explicit_stabilization_pospart(),
+        ),
+        ridge_used: 0.0,
+        deviance,
+        edf: beta_user.len() as f64,
+        stable_penalty_term: penalty_term,
+        firth_log_det: None,
+        firth_hat_diag: None,
+        final_weights: eta_state.fisher_weight.clone(),
+        final_offset: offset.clone(),
+        final_eta: eta_state.eta.clone(),
+        final_mu: eta_state.mu.clone(),
+        solve_weights: eta_state.fisher_weight.clone(),
+        solve_working_response: working_response,
+        solve_mu: eta_state.mu.clone(),
+        solve_c_array: Array1::zeros(eta_state.eta.len()),
+        solve_d_array: Array1::zeros(eta_state.eta.len()),
+        status: crate::pirls::PirlsStatus::Converged,
+        iteration: 0,
+        max_abs_eta: eta_state
+            .eta
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .fold(0.0, f64::max),
+        last_gradient_norm: 0.0,
+        last_deviance_change: 0.0,
+        last_step_halving: 0,
+        constraint_kkt: None,
+        linear_constraints_transformed: None,
+        reparam_result: identity_reparam_result(beta_user.len()),
+        x_transformed: DesignMatrix::Dense(Array2::zeros((eta_state.eta.len(), beta_user.len()))),
+    }
+}
+
+fn fit_bounded_term_collection_for_spec(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    heuristic_lambdas: Option<&[f64]>,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError> {
+    let design = build_term_collection_design(data, spec)?;
+    if design.linear_constraints.is_some() {
+        return Err(EstimationError::InvalidInput(
+            "bounded() terms are not yet compatible with explicit linear constraints".to_string(),
+        ));
+    }
+    let mut bounded_terms = Vec::<BoundedLinearTermMeta>::new();
+    for (j, term) in spec.linear_terms.iter().enumerate() {
+        if term.double_penalty
+            && matches!(
+                term.coefficient_geometry,
+                LinearCoefficientGeometry::Bounded { .. }
+            )
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "bounded linear term '{}' cannot also use double_penalty",
+                term.name
+            )));
+        }
+        if let LinearCoefficientGeometry::Bounded { min, max, prior } =
+            term.coefficient_geometry.clone()
+        {
+            bounded_terms.push(BoundedLinearTermMeta {
+                col_idx: design.intercept_range.end + j,
+                min,
+                max,
+                prior,
+            });
+        }
+    }
+    if bounded_terms.is_empty() {
+        return Err(EstimationError::InvalidInput(
+            "internal bounded fit path called with no bounded terms".to_string(),
+        ));
+    }
+
+    let mut design_zeroed = design.design.clone();
+    let mut initial_beta = Array1::<f64>::zeros(design.design.ncols());
+    for term in &bounded_terms {
+        design_zeroed.column_mut(term.col_idx).fill(0.0);
+        initial_beta[term.col_idx] = bounded_logit(0.5);
+    }
+
+    let initial_log_lambdas = heuristic_lambdas
+        .map(|vals| Array1::from_vec(vals.to_vec()))
+        .unwrap_or_else(|| Array1::zeros(design.penalties.len()));
+    if initial_log_lambdas.len() != design.penalties.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "heuristic lambda length mismatch for bounded model: got {}, expected {}",
+            initial_log_lambdas.len(),
+            design.penalties.len()
+        )));
+    }
+
+    let family_adapter = BoundedLinearFamily {
+        family,
+        y: y.to_owned(),
+        weights: weights.to_owned(),
+        design: design.design.clone(),
+        design_zeroed: design_zeroed.clone(),
+        offset: offset.to_owned(),
+        bounded_terms: bounded_terms.clone(),
+    };
+    let block_spec = ParameterBlockSpec {
+        name: "eta".to_string(),
+        design: DesignMatrix::Dense(design_zeroed),
+        offset: offset.to_owned(),
+        penalties: design.penalties.clone(),
+        initial_log_lambdas,
+        initial_beta: Some(initial_beta),
+    };
+    let fit = fit_custom_family(
+        &family_adapter,
+        &[block_spec],
+        &BlockwiseFitOptions {
+            inner_max_cycles: options.max_iter,
+            inner_tol: options.tol,
+            outer_max_iter: options.max_iter,
+            outer_tol: options.tol,
+            ..BlockwiseFitOptions::default()
+        },
+    )
+    .map_err(EstimationError::InvalidInput)?;
+
+    let latent_beta = fit.block_states[0].beta.clone();
+    let (beta_user, jac_diag) = family_adapter.user_beta_and_jacobian(&latent_beta);
+    let latent_cov = fit.covariance_conditional.clone();
+    let beta_covariance = latent_cov.as_ref().map(|cov| {
+        let mut out = cov.clone();
+        for i in 0..out.nrows() {
+            for j in 0..out.ncols() {
+                out[[i, j]] *= jac_diag[i] * jac_diag[j];
+            }
+        }
+        out
+    });
+    let beta_standard_errors = beta_covariance
+        .as_ref()
+        .map(|cov| Array1::from_iter((0..cov.nrows()).map(|i| cov[[i, i]].max(0.0).sqrt())));
+
+    let (eta_state, h_data, _g, _prior_loglik) = family_adapter
+        .evaluation_from_latent(&latent_beta)
+        .map_err(EstimationError::InvalidInput)?;
+    let mut s_lambda = Array2::<f64>::zeros((design.design.ncols(), design.design.ncols()));
+    for (k, penalty) in design.penalties.iter().enumerate() {
+        s_lambda.scaled_add(fit.lambdas[k], penalty);
+    }
+    let mut penalized_hessian = h_data.clone();
+    penalized_hessian += &s_lambda;
+    let penalty_term = beta_user.dot(&s_lambda.dot(&beta_user));
+    let deviance = match family {
+        LikelihoodFamily::GaussianIdentity => y
+            .iter()
+            .zip(eta_state.mu.iter())
+            .zip(weights.iter())
+            .map(|((&yy, &mu), &w)| w.max(0.0) * (yy - mu) * (yy - mu))
+            .sum(),
+        _ => -2.0 * eta_state.log_likelihood,
+    };
+    let pirls = bounded_pirls_result(
+        &beta_user,
+        &eta_state,
+        &penalized_hessian,
+        penalty_term,
+        deviance,
+        &family_adapter.offset,
+    );
+
+    let edf_by_block = approx_bounded_edf_by_block(&design);
+    let edf_total = edf_by_block.iter().copied().sum();
+    Ok(FittedTermCollection {
+        fit: FitResult {
+            beta: beta_user,
+            lambdas: fit.lambdas,
+            scale: 1.0,
+            edf_by_block,
+            edf_total,
+            iterations: fit.outer_iterations,
+            final_grad_norm: 0.0,
+            pirls_status: if fit.converged {
+                crate::pirls::PirlsStatus::Converged
+            } else {
+                crate::pirls::PirlsStatus::MaxIterationsReached
+            },
+            smoothing_correction: None,
+            penalized_hessian,
+            working_weights: eta_state.fisher_weight.clone(),
+            working_response: pirls.solve_working_response.clone(),
+            reparam_qs: Array2::eye(design.design.ncols()),
+            artifacts: crate::estimate::FitArtifacts { pirls },
+            beta_covariance,
+            beta_standard_errors,
+            beta_covariance_corrected: None,
+            beta_standard_errors_corrected: None,
+            reml_score: fit.penalized_objective,
+        },
+        design,
+    })
 }
 
 fn enforce_term_constraint_feasibility(
@@ -3365,6 +3976,7 @@ mod tests {
                 name: "lin_x0".to_string(),
                 feature_col: 0,
                 double_penalty: true,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             }],
             random_effect_terms: vec![],
             smooth_terms: vec![SmoothTermSpec {
@@ -3455,6 +4067,7 @@ mod tests {
                 name: "lin_x0".to_string(),
                 feature_col: 0,
                 double_penalty: false,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             }],
             random_effect_terms: vec![],
             smooth_terms: vec![SmoothTermSpec {
@@ -3509,6 +4122,7 @@ mod tests {
                 name: "lin_x0".to_string(),
                 feature_col: 0,
                 double_penalty: false,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             }],
             random_effect_terms: vec![],
             smooth_terms: vec![SmoothTermSpec {
@@ -3564,6 +4178,7 @@ mod tests {
                     name: format!("pc{j}"),
                     feature_col: j,
                     double_penalty: false,
+                    coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 })
                 .collect(),
             random_effect_terms: vec![],
@@ -3618,6 +4233,7 @@ mod tests {
                 name: "lin_x0".to_string(),
                 feature_col: 0,
                 double_penalty: false,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             }],
             random_effect_terms: vec![],
             smooth_terms: vec![SmoothTermSpec {
@@ -4173,12 +4789,8 @@ mod tests {
             _ => panic!("expected Matérn term"),
         }
 
-        let derivative = try_build_spatial_term_log_kappa_derivative(
-            data.view(),
-            &frozen_spec,
-            &design,
-            0,
-        );
+        let derivative =
+            try_build_spatial_term_log_kappa_derivative(data.view(), &frozen_spec, &design, 0);
         assert!(
             derivative.is_ok(),
             "exact Matérn log-kappa derivative should use only feature_cols; got {derivative:?}"
@@ -4362,5 +4974,72 @@ mod tests {
                 _ => panic!("expected Duchon term"),
             }
         }
+    }
+
+    #[test]
+    fn bounded_linear_gaussian_fit_respects_interval() {
+        let n = 64usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x = -1.0 + 2.0 * (i as f64) / ((n - 1) as f64);
+            let z = (i as f64) / ((n - 1) as f64);
+            data[[i, 0]] = x;
+            data[[i, 1]] = z;
+            y[i] = 0.25 + 0.8 * x + 0.05 * z;
+        }
+        let spec = TermCollectionSpec {
+            linear_terms: vec![
+                LinearTermSpec {
+                    name: "x".to_string(),
+                    feature_col: 0,
+                    double_penalty: false,
+                    coefficient_geometry: LinearCoefficientGeometry::Bounded {
+                        min: 0.0,
+                        max: 0.5,
+                        prior: BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 },
+                    },
+                },
+                LinearTermSpec {
+                    name: "z".to_string(),
+                    feature_col: 1,
+                    double_penalty: false,
+                    coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                },
+            ],
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+        };
+
+        let fitted = fit_term_collection_with_spatial_length_scale_optimization(
+            data.view(),
+            y,
+            Array1::ones(n),
+            Array1::zeros(n),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &FitOptions {
+                max_iter: 40,
+                tol: 1e-6,
+                nullspace_dims: vec![],
+                linear_constraints: None,
+            },
+            &SpatialLengthScaleOptimizationOptions {
+                enabled: false,
+                ..SpatialLengthScaleOptimizationOptions::default()
+            },
+        )
+        .expect("bounded gaussian fit");
+
+        let bounded_idx = fitted.design.linear_ranges[0].1.start;
+        let estimate = fitted.fit.beta[bounded_idx];
+        assert!(
+            (0.0..=0.5).contains(&estimate),
+            "bounded coefficient escaped interval: {estimate}"
+        );
+        assert!(
+            estimate > 0.1,
+            "bounded coefficient should move into the positive interior, got {estimate}"
+        );
     }
 }
