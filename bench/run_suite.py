@@ -75,6 +75,34 @@ class Fold:
     test_idx: np.ndarray
 
 
+def _coerce_positive_survival_times(df: pd.DataFrame, time_col: str, dataset_name: str) -> pd.DataFrame:
+    time_vals = pd.to_numeric(df[time_col], errors="coerce")
+    non_positive = time_vals <= 0.0
+    if not bool(non_positive.any()):
+        return df
+    positive = time_vals[time_vals > 0.0]
+    if positive.empty:
+        raise RuntimeError(f"{dataset_name} has no strictly positive survival times")
+    # Use a small dataset-scaled floor so every contender sees the same valid target
+    # while minimally perturbing rows that represent effectively immediate events.
+    replacement = max(float(positive.min()) * 0.5, 1e-12)
+    adjusted = df.copy()
+    adjusted.loc[non_positive, time_col] = replacement
+    return adjusted
+
+
+def _coerce_positive_survival_dataset_inplace(ds: dict, dataset_name: str) -> dict:
+    if ds.get("family") != "survival":
+        return ds
+    time_col = ds["time_col"]
+    rows_df = pd.DataFrame(ds["rows"])
+    adjusted = _coerce_positive_survival_times(rows_df, time_col=time_col, dataset_name=dataset_name)
+    if adjusted is rows_df:
+        return ds
+    ds["rows"] = adjusted.to_dict(orient="records")
+    return ds
+
+
 def _fmt_kib(kib):
     if kib is None:
         return "n/a"
@@ -792,6 +820,7 @@ def _load_haberman_dataset():
 def _load_icu_survival_death_dataset():
     d = pd.read_csv(DATASET_DIR / "icu_survival_death.csv")
     d = d[["time", "age", "bmi", "hr_max", "sysbp_min", "event"]].dropna()
+    d = _coerce_positive_survival_times(d, time_col="time", dataset_name="icu_survival_death")
     rows = [
         {
             "time": float(t),
@@ -819,6 +848,7 @@ def _load_icu_survival_death_dataset():
 def _load_icu_survival_los_dataset():
     d = pd.read_csv(DATASET_DIR / "icu_survival_los.csv")
     d = d[["age", "bmi", "hr_max", "sysbp_min", "temp_apache", "time", "event"]].dropna()
+    d = _coerce_positive_survival_times(d, time_col="time", dataset_name="icu_survival_los")
     rows = [
         {
             "age": float(a),
@@ -1562,6 +1592,7 @@ def dataset_for_scenario(s):
 
 def folds_for_dataset(ds):
     if ds["family"] == "survival":
+        _coerce_positive_survival_dataset_inplace(ds, dataset_name=ds.get("name", "survival_dataset"))
         y = np.array([float(r[ds["event_col"]]) for r in ds["rows"]], dtype=float)
         stratified = True
     else:
@@ -4288,10 +4319,27 @@ time_col <- as.character(payload$dataset$time_col)
 event_col <- as.character(payload$dataset$event_col)
 feature_cols <- as.character(payload$dataset$features)
 
+coerce_positive_times <- function(x) {
+  vals <- as.numeric(x)
+  bad <- !is.finite(vals) | vals <= 0
+  if (!any(bad)) {
+    return(vals)
+  }
+  pos <- vals[is.finite(vals) & vals > 0]
+  if (!length(pos)) {
+    stop("No strictly positive survival times available for Cox glmnet")
+  }
+  replacement <- max(min(pos) * 0.5, 1e-12)
+  vals[bad] <- replacement
+  vals
+}
+
 train_idx <- scan(train_idx_path, what=integer(), quiet=TRUE) + 1L
 test_idx <- scan(test_idx_path, what=integer(), quiet=TRUE) + 1L
 train_df <- df[train_idx, , drop=FALSE]
 test_df <- df[test_idx, , drop=FALSE]
+train_df[[time_col]] <- coerce_positive_times(train_df[[time_col]])
+test_df[[time_col]] <- coerce_positive_times(test_df[[time_col]])
 
 for (cn in feature_cols) {
   mu <- mean(train_df[[cn]])
