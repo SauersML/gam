@@ -207,6 +207,24 @@ pub struct BlockwiseFitResult {
     pub converged: bool,
 }
 
+#[derive(Clone)]
+pub struct CustomFamilyBlockPsiDerivative {
+    pub penalty_index: usize,
+    pub x_psi: Array2<f64>,
+    pub s_psi: Array2<f64>,
+}
+
+#[derive(Clone)]
+pub struct CustomFamilyWarmStart {
+    inner: ConstrainedWarmStart,
+}
+
+pub struct CustomFamilyJointHyperResult {
+    pub objective: f64,
+    pub gradient: Array1<f64>,
+    pub warm_start: CustomFamilyWarmStart,
+}
+
 fn validate_block_specs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
     if specs.is_empty() {
         return Err("fit_custom_family requires at least one parameter block".to_string());
@@ -1680,6 +1698,223 @@ fn outer_objective_and_gradient<F: CustomFamily>(
         active_sets: inner.active_sets,
     };
     Ok((objective, grad, warm))
+}
+
+fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    per_block: &[Array1<f64>],
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    inner: &mut BlockwiseInnerResult,
+) -> Result<Array1<f64>, String> {
+    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    let eval = family.evaluate(&inner.block_states)?;
+    if eval.block_working_sets.len() != specs.len() {
+        return Err(format!(
+            "family returned {} block working sets, expected {}",
+            eval.block_working_sets.len(),
+            specs.len()
+        ));
+    }
+
+    let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
+    let mut grad = Array1::<f64>::zeros(psi_dim);
+    let ridge = effective_solver_ridge(options.ridge_floor);
+    let mut at = 0usize;
+
+    for (b, spec) in specs.iter().enumerate() {
+        let psi_terms = &derivative_blocks[b];
+        if psi_terms.is_empty() {
+            continue;
+        }
+
+        let p = spec.design.ncols();
+        let beta = &inner.block_states[b].beta;
+        let eta = &inner.block_states[b].eta;
+        let lambdas = per_block[b].mapv(f64::exp);
+        let mut s_lambda = Array2::<f64>::zeros((p, p));
+        for (k, s) in spec.penalties.iter().enumerate() {
+            s_lambda.scaled_add(lambdas[k], s);
+        }
+
+        let mut s_for_logdet = s_lambda.clone();
+        if options.ridge_policy.include_penalty_logdet {
+            for d in 0..p {
+                s_for_logdet[[d, d]] += ridge;
+            }
+        }
+        let s_pinv = if options.use_reml_objective {
+            Some(pinv_positive_part(&s_for_logdet, options.ridge_floor)?)
+        } else {
+            None
+        };
+
+        let work = &eval.block_working_sets[b];
+        let (x_dyn, _) = family.block_geometry(&inner.block_states, spec)?;
+        let x_dense = x_dyn.to_dense();
+
+        let (w, u, h_inv) = match work {
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => {
+                if working_response.len() != x_dyn.nrows() || working_weights.len() != x_dyn.nrows()
+                {
+                    return Err(format!(
+                        "family diagonal working-set size mismatch on block {b} ({})",
+                        spec.name
+                    ));
+                }
+                let w = working_weights.mapv(|wi| wi.max(options.min_weight));
+                let u = &w * &(working_response - eta);
+                let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
+                let mut h_for_logdet = xtwx;
+                h_for_logdet += &s_lambda;
+                if options.ridge_policy.include_penalty_logdet {
+                    for d in 0..p {
+                        h_for_logdet[[d, d]] += ridge;
+                    }
+                }
+                let h_inv = inverse_spd_with_retry(&h_for_logdet, ridge, 8)?;
+                (w, u, h_inv)
+            }
+            BlockWorkingSet::ExactNewton { .. } => {
+                return Err(format!(
+                    "analytic psi gradient is not implemented for exact-newton block {} ({})",
+                    b, spec.name
+                ));
+            }
+        };
+
+        let mut wx = x_dense.clone();
+        for i in 0..wx.nrows() {
+            let wi = w[i];
+            if wi != 1.0 {
+                let mut row = wx.row_mut(i);
+                row *= wi;
+            }
+        }
+
+        for deriv in psi_terms {
+            if deriv.penalty_index >= lambdas.len() {
+                return Err(format!(
+                    "psi derivative penalty index {} out of bounds for block {}",
+                    deriv.penalty_index, b
+                ));
+            }
+            if deriv.x_psi.nrows() != x_dense.nrows() || deriv.x_psi.ncols() != x_dense.ncols() {
+                return Err(format!(
+                    "X_psi shape mismatch on block {}: expected {}x{}, got {}x{}",
+                    b,
+                    x_dense.nrows(),
+                    x_dense.ncols(),
+                    deriv.x_psi.nrows(),
+                    deriv.x_psi.ncols()
+                ));
+            }
+            if deriv.s_psi.nrows() != p || deriv.s_psi.ncols() != p {
+                return Err(format!(
+                    "S_psi shape mismatch on block {}: expected {}x{}, got {}x{}",
+                    b,
+                    p,
+                    p,
+                    deriv.s_psi.nrows(),
+                    deriv.s_psi.ncols()
+                ));
+            }
+
+            let xpsi_beta = deriv.x_psi.dot(beta);
+            let s_psi_total = deriv.s_psi.mapv(|v| lambdas[deriv.penalty_index] * v);
+            let explicit = -u.dot(&xpsi_beta) + 0.5 * beta.dot(&s_psi_total.dot(beta));
+
+            let mut wx_psi = deriv.x_psi.clone();
+            for i in 0..wx_psi.nrows() {
+                let wi = w[i];
+                if wi != 1.0 {
+                    let mut row = wx_psi.row_mut(i);
+                    row *= wi;
+                }
+            }
+            let mut h_psi = deriv.x_psi.t().dot(&wx);
+            h_psi += &x_dense.t().dot(&wx_psi);
+            h_psi += &s_psi_total;
+            let trace_term = if options.use_reml_objective {
+                0.5 * trace_product(&h_inv, &h_psi)
+            } else {
+                0.0
+            };
+            let pseudo_det_term = if options.use_reml_objective {
+                -0.5 * trace_product(
+                    s_pinv
+                        .as_ref()
+                        .ok_or_else(|| "missing S^+ for psi gradient".to_string())?,
+                    &s_psi_total,
+                )
+            } else {
+                0.0
+            };
+            grad[at] = explicit + trace_term + pseudo_det_term;
+            at += 1;
+        }
+    }
+
+    Ok(grad)
+}
+
+pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    theta: &Array1<f64>,
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    warm_start: Option<&CustomFamilyWarmStart>,
+) -> Result<CustomFamilyJointHyperResult, String> {
+    if derivative_blocks.len() != specs.len() {
+        return Err(format!(
+            "joint hyper derivative block count mismatch: got {}, expected {}",
+            derivative_blocks.len(),
+            specs.len()
+        ));
+    }
+
+    let penalty_counts = validate_block_specs(specs)?;
+    let rho_dim = penalty_counts.iter().sum::<usize>();
+    let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
+    if theta.len() != rho_dim + psi_dim {
+        return Err(format!(
+            "joint hyper theta dimension mismatch: got {}, expected {} (rho={} psi={})",
+            theta.len(),
+            rho_dim + psi_dim,
+            rho_dim,
+            psi_dim
+        ));
+    }
+
+    let rho = theta.slice(ndarray::s![..rho_dim]).to_owned();
+    let warm_inner = warm_start.map(|w| &w.inner);
+    let (objective, rho_grad, fitted_warm) =
+        outer_objective_and_gradient(family, specs, options, &penalty_counts, &rho, warm_inner)?;
+    let per_block = split_log_lambdas(&rho, &penalty_counts)?;
+    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, Some(&fitted_warm))?;
+    let psi_grad = compute_custom_family_block_psi_gradients(
+        family,
+        specs,
+        options,
+        &per_block,
+        derivative_blocks,
+        &mut inner,
+    )?;
+
+    let mut gradient = Array1::<f64>::zeros(theta.len());
+    gradient.slice_mut(ndarray::s![..rho_dim]).assign(&rho_grad);
+    gradient.slice_mut(ndarray::s![rho_dim..]).assign(&psi_grad);
+
+    Ok(CustomFamilyJointHyperResult {
+        objective,
+        gradient,
+        warm_start: CustomFamilyWarmStart { inner: fitted_warm },
+    })
 }
 
 fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {

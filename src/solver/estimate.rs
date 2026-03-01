@@ -1055,6 +1055,7 @@ where
     reml_state.compute_directional_hyper_gradient(rho, x_psi, s_psi)
 }
 
+#[allow(dead_code)]
 pub(crate) fn compute_external_joint_hyper_gradient<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
