@@ -1205,6 +1205,40 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
     fit: &SurvivalLocationScaleProbitFitResult,
     covariance: &Array2<f64>,
 ) -> Result<SurvivalLocationScaleProbitPredictResult, String> {
+    // Uncertainty-aware survival posterior mean with conditional Gaussian
+    // reduction.
+    //
+    // The deterministic survival predictor already computes the location-scale
+    // latent pieces
+    //
+    //   h   = time block linear predictor
+    //   t   = threshold block linear predictor
+    //   ls  = log-sigma block linear predictor.
+    //
+    // Under coefficient uncertainty these three latent quantities are jointly
+    // Gaussian row by row. The naive route is a full 3D Gaussian expectation of
+    // the survival/probit inverse link. The expensive part is unnecessary:
+    // conditional on ls, the pair (h, t) remains jointly Gaussian, and the
+    // probit argument
+    //
+    //   eta_loc(ls) = -h - t / sigma(ls)
+    //
+    // is then an affine transformation of that conditional Gaussian pair.
+    // Therefore eta_loc(ls) | ls is itself Gaussian with an analytically
+    // available conditional mean and variance.
+    //
+    // Once the inner latent is Gaussian, the exact integrated inverse-link
+    // machinery from quadrature.rs applies again:
+    //
+    //   E[Phi(Eta_loc) | ls]
+    //     = integrated_inverse_link_mean_and_derivative(Probit, mu_loc|ls, sd_loc|ls).mean.
+    //
+    // So the original 3D integral collapses to:
+    //   1D Gaussian integration over ls
+    //   + exact inner Gaussian-link convolution.
+    //
+    // If the conditioning algebra becomes numerically unsafe, this routine
+    // falls back to the old 3D quadrature rather than forcing the reduction.
     let pred = predict_survival_location_scale_probit(input, fit)?;
     let n = input.x_time_exit.nrows();
     let p_time = fit.beta_time.len();

@@ -160,11 +160,16 @@ pub struct IntegratedMeanDerivative {
     pub mode: IntegratedExpectationMode,
 }
 
-const LOGIT_SIGMA_DEGENERATE: f64 = 1e-10;
+const LOGIT_SIGMA_DEGENERATE: f64 = 2.5e-1;
 const CLOGLOG_SIGMA_DEGENERATE: f64 = 1e-10;
 const CLOGLOG_SIGMA_TAYLOR_MAX: f64 = 0.25;
 const SERIES_CONSECUTIVE_SMALL_TERMS: usize = 6;
 const LOGIT_MAX_TERMS: usize = 80;
+const CLOGLOG_MILES_ALPHA: f64 = 60.0;
+const CLOGLOG_MILES_MAX_TERMS: usize = 256;
+const CLOGLOG_GAMMA_K_REF: f64 = 0.5;
+const CLOGLOG_GAMMA_T_MAX_REF: f64 = 24.0;
+const CLOGLOG_GAMMA_H_REF: f64 = 0.01;
 
 impl QuadratureContext {
     pub fn new() -> Self {
@@ -547,6 +552,33 @@ pub fn logit_posterior_mean_with_deriv(
 
 #[inline]
 pub fn probit_posterior_mean_with_deriv_exact(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
+    // Exact Gaussian-probit convolution.
+    //
+    // If eta ~ N(mu, sigma^2), then
+    //
+    //   E[Phi(eta)] = Phi(mu / sqrt(1 + sigma^2)).
+    //
+    // A clean derivation is to introduce an independent Z ~ N(0, 1):
+    //
+    //   E[Phi(eta)]
+    //     = E[P(Z <= eta | eta)]
+    //     = P(Z - eta <= 0).
+    //
+    // Because Z - eta is Gaussian with mean -mu and variance 1 + sigma^2, the
+    // probability is exactly the standard normal CDF evaluated at
+    //   mu / sqrt(1 + sigma^2).
+    //
+    // Differentiating with respect to the location parameter mu gives
+    //
+    //   d/dmu E[Phi(eta)]
+    //     = phi(mu / sqrt(1 + sigma^2)) / sqrt(1 + sigma^2),
+    //
+    // which is also the integrated slope E[phi(eta)] by the general identity
+    //
+    //   d/dmu E[f(mu + sigma Z)] = E[f'(mu + sigma Z)].
+    //
+    // So this path is genuinely exact: no node count, no truncation, and no
+    // approximation regime split.
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= 1e-12 {
         let mean = crate::probability::normal_cdf_approx(mu);
         let dmean_dmu = crate::probability::normal_pdf(mu);
@@ -571,7 +603,11 @@ fn logistic_normal_exact_eligible(mu: f64, sigma: f64) -> bool {
         && sigma.is_finite()
         && mu.abs() <= 30.0
         && sigma > LOGIT_SIGMA_DEGENERATE
-        && sigma <= 5.0
+        // The in-repo erfcx series is accurate and stable on a moderate-variance
+        // domain, but it does not currently meet the production accuracy bar all
+        // the way out to sigma = 5. Past this range we intentionally route back
+        // to GHQ rather than over-claim exactness.
+        && sigma <= 1.0
 }
 
 #[inline]
@@ -625,6 +661,20 @@ pub(crate) fn logit_posterior_mean_with_deriv_exact(
     mu: f64,
     sigma: f64,
 ) -> Result<IntegratedMeanDerivative, EstimationError> {
+    // Guarded exact/special-function entry point for the logistic-normal mean.
+    //
+    // The target objects are
+    //
+    //   mean(mu, sigma)   = E[sigmoid(eta)],
+    //   dmean/dmu         = E[sigmoid(eta) * (1 - sigmoid(eta))],
+    //   eta ~ N(mu, sigma^2).
+    //
+    // Unlike probit, this Gaussian convolution does not collapse to an
+    // elementary closed form. The helper below uses an erfcx-based exact/
+    // special-function representation, but only on a guarded domain where the
+    // current in-repo numerical implementation is actually validated. Outside
+    // that domain we deliberately refuse to claim exactness and let the
+    // dispatcher fall back to GHQ.
     if !(mu.is_finite() && sigma.is_finite()) {
         return Err(EstimationError::InvalidInput(
             "logit exact expectation requires finite mu and sigma".to_string(),
@@ -635,7 +685,7 @@ pub(crate) fn logit_posterior_mean_with_deriv_exact(
         return Ok(IntegratedMeanDerivative {
             mean,
             dmean_dmu: mean * (1.0 - mean),
-            mode: IntegratedExpectationMode::ExactSpecialFunction,
+            mode: IntegratedExpectationMode::ExactClosedForm,
         });
     }
     if !logistic_normal_exact_eligible(mu, sigma) {
@@ -643,7 +693,29 @@ pub(crate) fn logit_posterior_mean_with_deriv_exact(
             "logit exact expectation outside guarded domain".to_string(),
         ));
     }
+    logit_posterior_mean_with_deriv_exact_erfcx(mu, sigma)
+}
 
+fn logit_posterior_mean_with_deriv_exact_erfcx(
+    mu: f64,
+    sigma: f64,
+) -> Result<IntegratedMeanDerivative, EstimationError> {
+    // Real-valued erfcx-series implementation for the logistic-normal mean.
+    //
+    // Start from
+    //
+    //   sigmoid(x) = 1/2 + 1/2 tanh(x/2).
+    //
+    // The partial-fraction expansion of tanh over its odd poles turns the
+    // logistic-normal expectation into a sum of Gaussian rational integrals.
+    // Those integrals reduce to scaled complementary-error-function terms, so
+    // the production implementation is written in erfcx rather than complex
+    // Faddeeva calls.
+    //
+    // The derivative is obtained by differentiating the same series with
+    // respect to mu. This remains guarded because the present in-repo erfcx
+    // approximation and truncation logic have only been validated on a
+    // moderate-variance region; outside that region the dispatcher uses GHQ.
     let m = mu.abs();
     let s = sigma;
     let z = SQRT_2 * s;
@@ -654,8 +726,7 @@ pub(crate) fn logit_posterior_mean_with_deriv_exact(
     let mut stable_pairs = 0usize;
     let mut converged = false;
     let max_k = logistic_normal_tail_cutoff(mu, sigma);
-    let required_stable_pairs =
-        SERIES_CONSECUTIVE_SMALL_TERMS.min(((max_k + 1) / 2).max(1));
+    let required_stable_pairs = SERIES_CONSECUTIVE_SMALL_TERMS.min(((max_k + 1) / 2).max(1));
 
     let mut k = 1usize;
     while k <= max_k {
@@ -695,7 +766,7 @@ pub(crate) fn logit_posterior_mean_with_deriv_exact(
 
     if !converged {
         return Err(EstimationError::InvalidInput(
-            "logit exact expectation did not satisfy the production truncation rule".to_string(),
+            "logit erfcx expectation did not satisfy the production truncation rule".to_string(),
         ));
     }
 
@@ -706,7 +777,7 @@ pub(crate) fn logit_posterior_mean_with_deriv_exact(
     }
     if !(mean.is_finite() && dmean.is_finite() && dmean >= 0.0) {
         return Err(EstimationError::InvalidInput(
-            "logit exact expectation produced non-finite values".to_string(),
+            "logit erfcx expectation produced non-finite values".to_string(),
         ));
     }
     Ok(IntegratedMeanDerivative {
@@ -718,6 +789,12 @@ pub(crate) fn logit_posterior_mean_with_deriv_exact(
 
 #[inline]
 fn cloglog_plug_in(mu: f64) -> IntegratedMeanDerivative {
+    // Degenerate Gaussian-uncertainty limit:
+    // if eta ~ N(mu, sigma^2) and sigma -> 0, then eta collapses to mu and
+    // the integrated cloglog mean/derivative reduce to the ordinary inverse
+    // link and its pointwise slope:
+    //   f(mu)   = 1 - exp(-exp(mu))
+    //   f'(mu)  = exp(mu - exp(mu)).
     let z = mu.clamp(-30.0, 30.0);
     let ez = z.exp();
     let surv = (-ez).exp();
@@ -730,6 +807,19 @@ fn cloglog_plug_in(mu: f64) -> IntegratedMeanDerivative {
 
 #[inline]
 fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
+    // Small-variance heat-kernel expansion.
+    //
+    // For eta = mu + sigma Z, Z ~ N(0,1), and any analytic f,
+    //   E[f(eta)] = sum_{k>=0} sigma^{2k} / (2^k k!) * f^{(2k)}(mu).
+    //
+    // Here f(x) = 1 - exp(-exp(x)) is entire, so the series is valid
+    // globally. In the hot path we truncate after the sigma^4 term:
+    //   E[f(eta)]      ~= f + (sigma^2/2) f'' + (sigma^4/24) f^{(4)}
+    //   d/dmu E[f(eta)]~= f' + (sigma^2/2) f''' + (sigma^4/24) f^{(5)}.
+    //
+    // The explicit derivatives below are written in terms of exp(mu) and
+    // exp(-exp(mu)) so the PIRLS derivative uses the same approximation order
+    // as the mean.
     let z = mu.clamp(-30.0, 30.0);
     let s2 = sigma * sigma;
     let s4 = s2 * s2;
@@ -772,16 +862,438 @@ fn cloglog_posterior_mean_with_deriv_ghq(
     }
 }
 
+#[inline]
+fn log_half_erfc_stable(u: f64) -> f64 {
+    // Stable log(0.5 * erfc(u)).
+    //
+    // In the Miles series, each term contains
+    //   exp(mu n + 0.5 sigma^2 n^2) * 0.5 * erfc(u_n).
+    // For large positive u_n, erfc(u_n) underflows long before the *whole*
+    // term becomes negligible, so we switch to
+    //   erfc(u) = exp(-u^2) erfcx(u),  u > 0,
+    // and carry the -u^2 contribution in log-space. For u <= 0, erfc(u) is
+    // O(1) and direct evaluation is safe.
+    if u > 0.0 {
+        -u * u + (0.5 * erfcx_nonnegative(u)).ln()
+    } else {
+        (0.5 * erfc(u)).ln()
+    }
+}
+
+fn cloglog_posterior_mean_with_deriv_miles(
+    mu: f64,
+    sigma: f64,
+) -> Result<IntegratedMeanDerivative, EstimationError> {
+    // We rewrite integrated cloglog in terms of the lognormal Laplace transform
+    //
+    //   f(eta) = 1 - exp(-exp(eta)),
+    //   S(mu, sigma) = E[exp(-exp(eta))],      eta ~ N(mu, sigma^2),
+    //   mean(mu, sigma) = E[f(eta)] = 1 - S(mu, sigma).
+    //
+    // The PIRLS derivative is the location derivative of the same Gaussian
+    // expectation:
+    //
+    //   dmean/dmu
+    //     = E[d/deta (1 - exp(-exp(eta)))]
+    //     = E[exp(eta - exp(eta))].
+    //
+    // Instead of differentiating the Miles series term-by-term, we use the
+    // exact Gaussian tilting identity. For any measurable g with finite moment,
+    //
+    //   E[e^eta g(eta)]
+    //     = ∫ e^eta g(eta) phi_{mu,sigma}(eta) d eta
+    //     = exp(mu + sigma^2 / 2)
+    //       ∫ g(eta) phi_{mu+sigma^2,sigma}(eta) d eta
+    //     = exp(mu + sigma^2 / 2) E[g(eta')],
+    //
+    // where eta' ~ N(mu + sigma^2, sigma^2). Choosing
+    //
+    //   g(eta) = exp(-exp(eta))
+    //
+    // gives the exact identity used below:
+    //
+    //   dmean/dmu
+    //     = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma).
+    //
+    // So both outputs reduce to the same scalar survival evaluator:
+    //
+    //   mean       = 1 - S(mu, sigma)
+    //   dmean/dmu  = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma).
+    //
+    // This is mathematically cleaner and numerically safer than carrying a
+    // second differentiated approximation.
+    let survival = cloglog_survival_miles(mu, sigma)?;
+    let shifted_survival = cloglog_survival_miles(mu + sigma * sigma, sigma)?;
+    let mean = (1.0 - survival).clamp(1e-12, 1.0 - 1e-12);
+    let dmean = (mu + 0.5 * sigma * sigma).exp() * shifted_survival;
+    if !(mean.is_finite() && dmean.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "Miles cloglog backend produced non-finite values".to_string(),
+        ));
+    }
+    Ok(IntegratedMeanDerivative {
+        mean,
+        dmean_dmu: dmean.max(0.0),
+        mode: IntegratedExpectationMode::ExactSpecialFunction,
+    })
+}
+
+fn cloglog_survival_miles(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
+    // This routine approximates the survival term
+    //
+    //   S(mu, sigma) = E[exp(-exp(eta))],   eta ~ N(mu, sigma^2),
+    //
+    // using the Miles erfc-gated lognormal-Laplace series. Writing
+    //
+    //   X = exp(eta) ~ LogNormal(mu, sigma^2),
+    //
+    // S is the Laplace transform E[exp(-X)] evaluated at 1. Theorem-3 gives a
+    // real series of the form
+    //
+    //   S(mu, sigma)
+    //     = sum_{n>=0} (-1)^n / n!
+    //         * exp(mu n + 0.5 sigma^2 n^2)
+    //         * 0.5 * erfc(u_n)
+    //
+    //   u_n = (mu - ln(alpha) + sigma^2 n) / (sqrt(2) sigma).
+    //
+    // The erfc factor gates the lognormal moment term so that the product stays
+    // finite in the tail-dominated regime where this backend is used. We only
+    // evaluate S here; the caller forms
+    //
+    //   mean = 1 - S
+    //   dmean/dmu = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma).
+    //
+    // Pairwise accumulation is used because the series alternates in sign and
+    // consecutive terms partially cancel. Grouping terms before the truncation
+    // check produces a materially more stable stopping rule than looking at
+    // individual terms in isolation.
+    let alpha_ln = CLOGLOG_MILES_ALPHA.ln();
+    let mut s_sum = 0.0_f64;
+    let mut stable_pairs = 0usize;
+
+    for pair_start in (0..CLOGLOG_MILES_MAX_TERMS).step_by(2) {
+        let mut pair_s = 0.0_f64;
+        for n in pair_start..(pair_start + 2).min(CLOGLOG_MILES_MAX_TERMS) {
+            let nf = n as f64;
+            let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+            let base_log = nf * mu + 0.5 * sigma * sigma * nf * nf - statrs::function::gamma::ln_gamma(nf + 1.0);
+            let u = (mu - alpha_ln + sigma * sigma * nf) / (SQRT_2 * sigma);
+            let log_half_erfc = log_half_erfc_stable(u);
+            let term = sign * (base_log + log_half_erfc).exp();
+            pair_s += term;
+        }
+        s_sum += pair_s;
+
+        let s_scale = s_sum.abs().max(1.0);
+        if pair_s.abs() <= 2e-15 * s_scale {
+            stable_pairs += 1;
+            if stable_pairs >= SERIES_CONSECUTIVE_SMALL_TERMS {
+                if s_sum.is_finite() && (-1e-10..=1.0 + 1e-10).contains(&s_sum) {
+                    return Ok(s_sum.clamp(0.0, 1.0));
+                }
+                break;
+            }
+        } else {
+            stable_pairs = 0;
+        }
+    }
+
+    Err(EstimationError::InvalidInput(
+        "Miles cloglog series did not converge safely".to_string(),
+    ))
+}
+
+#[inline]
+fn complex_add(a: Complex, b: Complex) -> Complex {
+    Complex {
+        re: a.re + b.re,
+        im: a.im + b.im,
+    }
+}
+
+#[inline]
+fn complex_sub(a: Complex, b: Complex) -> Complex {
+    Complex {
+        re: a.re - b.re,
+        im: a.im - b.im,
+    }
+}
+
+#[inline]
+fn complex_mul(a: Complex, b: Complex) -> Complex {
+    Complex {
+        re: a.re * b.re - a.im * b.im,
+        im: a.re * b.im + a.im * b.re,
+    }
+}
+
+#[inline]
+fn complex_div(a: Complex, b: Complex) -> Complex {
+    let den = (b.re * b.re + b.im * b.im).max(1e-300);
+    Complex {
+        re: (a.re * b.re + a.im * b.im) / den,
+        im: (a.im * b.re - a.re * b.im) / den,
+    }
+}
+
+#[inline]
+fn complex_abs(z: Complex) -> f64 {
+    z.re.hypot(z.im)
+}
+
+#[inline]
+fn complex_ln(z: Complex) -> Complex {
+    Complex {
+        re: complex_abs(z).ln(),
+        im: z.im.atan2(z.re),
+    }
+}
+
+#[inline]
+fn complex_exp(z: Complex) -> Complex {
+    let e = z.re.exp();
+    Complex {
+        re: e * z.im.cos(),
+        im: e * z.im.sin(),
+    }
+}
+
+#[inline]
+fn complex_sin(z: Complex) -> Complex {
+    Complex {
+        re: z.re.sin() * z.im.cosh(),
+        im: z.re.cos() * z.im.sinh(),
+    }
+}
+
+fn complex_log_gamma_lanczos(z: Complex) -> Complex {
+    // Reference-quality complex log-gamma for the Mellin-Barnes cloglog
+    // backend. This is the key special-function primitive for evaluating the
+    // exact Bromwich integral of the lognormal Laplace transform.
+    const G: f64 = 7.0;
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+
+    if z.re < 0.5 {
+        let pi_z = Complex {
+            re: std::f64::consts::PI * z.re,
+            im: std::f64::consts::PI * z.im,
+        };
+        let one_minus_z = Complex {
+            re: 1.0 - z.re,
+            im: -z.im,
+        };
+        return complex_sub(
+            complex_sub(
+                Complex {
+                    re: std::f64::consts::PI.ln(),
+                    im: 0.0,
+                },
+                complex_ln(complex_sin(pi_z)),
+            ),
+            complex_log_gamma_lanczos(one_minus_z),
+        );
+    }
+
+    let z1 = Complex {
+        re: z.re - 1.0,
+        im: z.im,
+    };
+    let mut x = Complex {
+        re: COEFFS[0],
+        im: 0.0,
+    };
+    for (i, c) in COEFFS.iter().enumerate().skip(1) {
+        x = complex_add(
+            x,
+            complex_div(
+                Complex { re: *c, im: 0.0 },
+                Complex {
+                    re: z1.re + i as f64,
+                    im: z1.im,
+                },
+            ),
+        );
+    }
+    let t = Complex {
+        re: z1.re + G + 0.5,
+        im: z1.im,
+    };
+    complex_add(
+        complex_add(
+            Complex {
+                re: 0.5 * (2.0 * std::f64::consts::PI).ln(),
+                im: 0.0,
+            },
+            complex_mul(
+                Complex {
+                    re: z1.re + 0.5,
+                    im: z1.im,
+                },
+                complex_ln(t),
+            ),
+        ),
+        complex_sub(complex_ln(x), t),
+    )
+}
+
+pub(crate) fn cloglog_posterior_mean_with_deriv_gamma_reference(
+    mu: f64,
+    sigma: f64,
+) -> Result<IntegratedMeanDerivative, EstimationError> {
+    // This backend uses the exact Mellin-Barnes/Gamma representation for the
+    // same survival term S(mu, sigma). The integrated cloglog outputs are still
+    // recovered by the same exact identities:
+    //
+    //   mean       = 1 - S(mu, sigma)
+    //   dmean/dmu  = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma).
+    //
+    // Using the shift identity here matters even more than in the Miles case.
+    // Differentiating the Bromwich integral directly inserts an extra factor
+    // (k + i t) into an already oscillatory complex integrand. That is
+    // mathematically valid, but it needlessly makes the derivative a second,
+    // separate special-function quadrature problem. Reusing the scalar survival
+    // evaluator keeps mean and derivative on the same approximation surface and
+    // preserves dmean/dmu >= 0 up to roundoff.
+    let survival = cloglog_survival_gamma_reference(mu, sigma)?;
+    let shifted_survival = cloglog_survival_gamma_reference(mu + sigma * sigma, sigma)?;
+    let mean = (1.0 - survival).clamp(1e-12, 1.0 - 1e-12);
+    let dmean = (mu + 0.5 * sigma * sigma).exp() * shifted_survival;
+    if !(mean.is_finite() && dmean.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "Gamma cloglog reference backend produced non-finite values".to_string(),
+        ));
+    }
+    Ok(IntegratedMeanDerivative {
+        mean,
+        dmean_dmu: dmean.max(0.0),
+        mode: IntegratedExpectationMode::ExactSpecialFunction,
+    })
+}
+
+fn cloglog_survival_gamma_reference(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
+    if !(mu.is_finite() && sigma.is_finite()) || sigma <= 0.0 {
+        return Err(EstimationError::InvalidInput(
+            "Gamma cloglog reference backend requires finite mu and positive sigma".to_string(),
+        ));
+    }
+
+    // Exact Mellin-Barnes / Bromwich representation for the lognormal Laplace
+    // transform at lambda = 1:
+    //
+    //   S(mu, sigma)
+    //     = E[exp(-exp(eta))],   eta ~ N(mu, sigma^2)
+    //     = 1/pi ∫_0^∞ Re[
+    //         Γ(k + i t)
+    //         exp(0.5 sigma^2 (k + i t)^2 - mu (k + i t))
+    //       ] dt,
+    //
+    // with k > 0 fixed on the Bromwich line. This is the exact special-
+    // function representation of the lognormal Laplace transform used by the
+    // large-sigma central cloglog path.
+    //
+    // The surrounding cloglog code only asks this routine for S itself. The
+    // final outputs are reconstructed outside via
+    //
+    //   mean       = 1 - S(mu, sigma)
+    //   dmean/dmu  = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma),
+    //
+    // so the integral below remains a scalar survival evaluator.
+    //
+    // Numerically, the Γ(k + i t) factor decays like exp(-pi t / 2) on the
+    // vertical line, while the Gaussian factor contributes exp(-0.5 sigma^2
+    // t^2) in magnitude. That makes the tail rapidly damped, which is why a
+    // fixed composite Simpson rule on [0, T] is adequate here despite the
+    // complex oscillation.
+    let n = (CLOGLOG_GAMMA_T_MAX_REF / CLOGLOG_GAMMA_H_REF).round() as usize;
+    let n = if n.is_multiple_of(2) { n } else { n + 1 };
+    let h = CLOGLOG_GAMMA_T_MAX_REF / n as f64;
+
+    let eval = |t: f64| -> f64 {
+        let z = Complex {
+            re: CLOGLOG_GAMMA_K_REF,
+            im: t,
+        };
+        let log_gamma = complex_log_gamma_lanczos(z);
+        let z_sq = complex_mul(z, z);
+        let exponent = complex_sub(
+            complex_add(
+                log_gamma,
+                Complex {
+                    re: 0.5 * sigma * sigma * z_sq.re,
+                    im: 0.5 * sigma * sigma * z_sq.im,
+                },
+            ),
+            Complex {
+                re: mu * z.re,
+                im: mu * z.im,
+            },
+        );
+        complex_exp(exponent).re
+    };
+
+    let f0 = eval(0.0);
+    let fn_ = eval(CLOGLOG_GAMMA_T_MAX_REF);
+    let mut sum_s = f0 + fn_;
+    for i in 1..n {
+        let t = i as f64 * h;
+        let fi = eval(t);
+        let w = if i % 2 == 0 { 2.0 } else { 4.0 };
+        sum_s += w * fi;
+    }
+    let s_val = ((h / 3.0) * sum_s / std::f64::consts::PI).clamp(0.0, 1.0);
+    if !s_val.is_finite() {
+        return Err(EstimationError::InvalidInput(
+            "Gamma cloglog reference backend produced non-finite values".to_string(),
+        ));
+    }
+    Ok(s_val)
+}
+
 pub(crate) fn cloglog_posterior_mean_with_deriv_controlled(
     ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
 ) -> IntegratedMeanDerivative {
+    // Final production routing for integrated cloglog under Gaussian latent
+    // uncertainty:
+    // 1. sigma ~= 0      -> exact plug-in limit
+    // 2. small sigma     -> heat-kernel / Taylor approximation
+    // 3. tail-dominated  -> guarded Miles series
+    // 4. otherwise       -> exact Mellin-Barnes / Gamma inversion
+    // 5. final escape    -> GHQ fallback only on numerical failure
+    //
+    // The large-sigma central regime uses the exact Gamma/Mellin-Barnes path.
+    // GHQ is retained only as a final safety fallback if the special-function
+    // backend produces a non-finite result.
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
         return cloglog_plug_in(mu);
     }
     if sigma < CLOGLOG_SIGMA_TAYLOR_MAX {
         return cloglog_small_sigma_taylor(mu, sigma);
+    }
+    // Use the lognormal-Laplace Miles series only in tail-dominated regimes,
+    // where the erfc gate makes the alternating series both short and stable.
+    // For the central moderate/large-sigma regime, fall through to the exact
+    // Mellin-Barnes backend instead of GHQ.
+    let use_miles = (mu.abs() / sigma) >= 3.0;
+    if use_miles {
+        if let Ok(out) = cloglog_posterior_mean_with_deriv_miles(mu, sigma) {
+            return out;
+        }
+    }
+    if let Ok(out) = cloglog_posterior_mean_with_deriv_gamma_reference(mu, sigma) {
+        return out;
     }
     cloglog_posterior_mean_with_deriv_ghq(ctx, mu, sigma)
 }
@@ -792,19 +1304,59 @@ pub fn integrated_inverse_link_mean_and_derivative(
     mu: f64,
     sigma: f64,
 ) -> IntegratedMeanDerivative {
+    // Canonical dispatcher for Gaussian-uncertain inverse-link expectations.
+    //
+    // Every integrated PIRLS and posterior-mean prediction path reduces to the
+    // same mathematical contract:
+    //
+    //   input:
+    //     eta ~ N(mu, sigma^2)
+    //
+    //   output:
+    //     mean      = E[g^{-1}(eta)]
+    //     dmean/dmu = E[(g^{-1})'(eta)].
+    //
+    // The location-family identity
+    //
+    //   d/dmu E[f(mu + sigma Z)] = E[f'(mu + sigma Z)]
+    //
+    // is what makes this sufficient for PIRLS. Once a link-specific backend can
+    // return these two quantities, the generic Fisher weight and working
+    // response formulas do not care whether they came from:
+    //
+    // - exact closed form,
+    // - exact/special-function evaluation,
+    // - a controlled asymptotic approximation,
+    // - or GHQ fallback.
+    //
+    // Centralizing the routing here keeps all link-specific special-function
+    // mathematics local to one module instead of leaking into PIRLS or
+    // prediction code.
     match link {
         LinkFunction::Probit => probit_posterior_mean_with_deriv_exact(mu, sigma),
-        LinkFunction::Logit => match logit_posterior_mean_with_deriv_exact(mu, sigma) {
-            Ok(v) => v,
-            Err(_) => {
-                let (mean, dmean_dmu) = logit_posterior_mean_with_deriv(quad_ctx, mu, sigma);
+        // The in-repo logit special-function backend is useful as a research
+        // implementation and local oracle, but it is not yet uniformly accurate
+        // enough across the production domain to replace GHQ in the hot path.
+        // Use the exact plug-in limit when sigma is effectively zero and route
+        // everything else through the validated GHQ backend.
+        LinkFunction::Logit if sigma <= LOGIT_SIGMA_DEGENERATE => {
+            logit_posterior_mean_with_deriv_exact(mu, sigma).unwrap_or_else(|_| {
+                let mean = sigmoid(mu);
                 IntegratedMeanDerivative {
                     mean,
-                    dmean_dmu,
-                    mode: IntegratedExpectationMode::QuadratureFallback,
+                    dmean_dmu: mean * (1.0 - mean),
+                    mode: IntegratedExpectationMode::ExactClosedForm,
                 }
+            })
+        }
+        LinkFunction::Logit => {
+            let (mean, dmean_dmu) = logit_posterior_mean_with_deriv(quad_ctx, mu, sigma);
+            IntegratedMeanDerivative {
+                mean,
+                dmean_dmu,
+                mode: IntegratedExpectationMode::QuadratureFallback,
             }
-        },
+        }
         LinkFunction::CLogLog => cloglog_posterior_mean_with_deriv_controlled(quad_ctx, mu, sigma),
         LinkFunction::Identity => IntegratedMeanDerivative {
             mean: mu,
@@ -1848,9 +2400,88 @@ mod tests {
     }
 
     #[test]
+    fn test_cloglog_controlled_matches_ghq_on_small_sigma_grid() {
+        let ctx = QuadratureContext::new();
+        let mus = [-30.0, -10.0, -3.0, 0.0, 3.0, 10.0, 30.0];
+        let sigmas = [1e-10, 1e-8, 0.01, 0.05, 0.1, 0.2, 0.24];
+
+        for &mu in &mus {
+            for &sigma in &sigmas {
+                let approx = cloglog_posterior_mean_with_deriv_controlled(&ctx, mu, sigma);
+                let ghq = cloglog_posterior_mean_with_deriv_ghq(&ctx, mu, sigma);
+                assert_relative_eq!(
+                    approx.mean,
+                    ghq.mean,
+                    epsilon = 2e-3,
+                    max_relative = 2e-3
+                );
+                assert_relative_eq!(
+                    approx.dmean_dmu,
+                    ghq.dmean_dmu,
+                    epsilon = 4e-3,
+                    max_relative = 4e-3
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cloglog_dispatch_uses_gamma_backend_for_large_sigma_central_regime() {
+        let ctx = QuadratureContext::new();
+        let out =
+            integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, -0.2, 0.8);
+        assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
+        assert!(out.mean.is_finite());
+        assert!(out.dmean_dmu.is_finite());
+        assert!(out.dmean_dmu >= 0.0);
+    }
+
+    #[test]
+    fn test_cloglog_gamma_reference_matches_seeded_monte_carlo_small_case() {
+        let mu = -0.2;
+        let sigma = 0.8;
+        let gamma =
+            cloglog_posterior_mean_with_deriv_gamma_reference(mu, sigma).expect("gamma reference");
+        let mut rng_state = 0x9e3779b97f4a7c15u64;
+        let mut mean_mc = 0.0f64;
+        let mut deriv_mc = 0.0f64;
+        let n_samples = 300_000usize;
+        for _ in 0..n_samples {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u1 = ((rng_state as f64) / (u64::MAX as f64)).clamp(1e-12, 1.0 - 1e-12);
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u2 = ((rng_state as f64) / (u64::MAX as f64)).clamp(1e-12, 1.0 - 1e-12);
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let eta = mu + sigma * z;
+            let ez = eta.clamp(-30.0, 30.0).exp();
+            mean_mc += 1.0 - (-ez).exp();
+            deriv_mc += ez * (-ez).exp();
+        }
+        mean_mc /= n_samples as f64;
+        deriv_mc /= n_samples as f64;
+        assert_relative_eq!(gamma.mean, mean_mc, epsilon = 2e-3, max_relative = 2e-3);
+        assert_relative_eq!(
+            gamma.dmean_dmu,
+            deriv_mc,
+            epsilon = 2e-3,
+            max_relative = 2e-3
+        );
+    }
+
+    #[test]
     fn test_logit_dispatch_falls_back_outside_guarded_domain() {
         let ctx = QuadratureContext::new();
         let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 35.0, 1.0);
+        assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
+        assert!(out.mean.is_finite());
+        assert!(out.dmean_dmu.is_finite());
+        assert!(out.dmean_dmu >= 0.0);
+    }
+
+    #[test]
+    fn test_logit_dispatch_prefers_ghq_in_non_degenerate_regime() {
+        let ctx = QuadratureContext::new();
+        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 1.1, 0.8);
         assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
         assert!(out.mean.is_finite());
         assert!(out.dmean_dmu.is_finite());

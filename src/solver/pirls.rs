@@ -4066,6 +4066,30 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
     const MIN_D_FOR_Z: f64 = 1e-6;
     const PROB_EPS: f64 = 1e-8;
 
+    // Integrated PIRLS hot loop.
+    //
+    // For each row we assume the uncertain linear predictor has the form
+    //
+    //   eta_i + eps_i,   eps_i ~ N(0, se_i^2),
+    //
+    // and ask the link-specific expectation engine for
+    //
+    //   mu_i        = E[g^{-1}(eta_i + eps_i)]
+    //   dmu_i/deta  = E[(g^{-1})'(eta_i + eps_i)].
+    //
+    // The second identity is justified by the location-family rule
+    //
+    //   d/deta E[f(eta + eps)] = E[f'(eta + eps)],
+    //
+    // so the derivative returned by the dispatcher is exactly the integrated
+    // Jacobian needed by PIRLS. Once those two numbers are available, the
+    // standard generalized IRLS formulas still apply without modification:
+    //
+    //   W_i = prior_i * (dmu_i/deta_i)^2 / Var(Y_i | mu_i)
+    //   z_i = eta_i + (y_i - mu_i) / (dmu_i/deta_i).
+    //
+    // This is why exact integrated mathematics can be swapped in link by link
+    // without touching the rest of the PIRLS linear algebra.
     let n = eta.len();
     for i in 0..n {
         let e = eta[i].clamp(-700.0, 700.0);
@@ -4115,12 +4139,11 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
 
 /// Family-dispatched integrated GLM vector update helper.
 ///
-/// Currently only `BinomialLogit` supports integrated uncertainty updates.
-///
 /// This is the intended dispatch point for eliminating GHQ link-by-link:
-/// - `BinomialProbit` can use the exact Gaussian-probit convolution identity,
-/// - `BinomialLogit` can use the exact logistic-normal special-function series,
-/// - `BinomialCLogLog` can use the exact lognormal-Laplace / Gamma-based path.
+/// - `BinomialProbit` uses the exact Gaussian-probit convolution identity,
+/// - `BinomialLogit` uses the best validated exact/special-function path and
+///   otherwise falls back,
+/// - `BinomialCLogLog` uses the plug-in / Taylor / Miles / Gamma ladder.
 ///
 /// The important architectural point is that each family-specific exact path
 /// only needs to provide:
