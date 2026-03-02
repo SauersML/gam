@@ -98,6 +98,248 @@ where
     acc.sum()
 }
 
+#[derive(Clone, Debug)]
+struct ParametricColumnConditioning {
+    intercept_idx: Option<usize>,
+    columns: Vec<(usize, f64, f64)>,
+}
+
+impl ParametricColumnConditioning {
+    fn infer_from_penalties(x: &DesignMatrix, s_list: &[Array2<f64>]) -> Self {
+        const SCALE_EPS: f64 = 1e-12;
+        let dense = x.to_dense_arc();
+        let p = dense.ncols();
+        let mut penalized = vec![false; p];
+        for s in s_list {
+            for j in 0..p.min(s.ncols()) {
+                let mut active = false;
+                for i in 0..s.nrows() {
+                    if s[[i, j]] != 0.0 || s[[j, i]] != 0.0 {
+                        active = true;
+                        break;
+                    }
+                }
+                if active {
+                    penalized[j] = true;
+                }
+            }
+        }
+
+        let mut intercept_idx = None;
+        let mut columns = Vec::new();
+        for j in 0..p {
+            if penalized[j] {
+                continue;
+            }
+            let col = dense.column(j);
+            let n = col.len();
+            if n == 0 {
+                continue;
+            }
+            let first = col[0];
+            let is_constant = col.iter().all(|&v| (v - first).abs() <= 1e-12);
+            if is_constant {
+                if (first - 1.0).abs() <= 1e-12 && intercept_idx.is_none() {
+                    intercept_idx = Some(j);
+                }
+                continue;
+            }
+            let mean = col.iter().copied().sum::<f64>() / n as f64;
+            let var = col
+                .iter()
+                .map(|&v| {
+                    let d = v - mean;
+                    d * d
+                })
+                .sum::<f64>()
+                / n as f64;
+            if !var.is_finite() || var <= SCALE_EPS * SCALE_EPS {
+                continue;
+            }
+            columns.push((j, mean, var.sqrt()));
+        }
+        if intercept_idx.is_none() {
+            for (_, mean, _) in &mut columns {
+                *mean = 0.0;
+            }
+        }
+        Self {
+            intercept_idx,
+            columns,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        !self.columns.is_empty()
+    }
+
+    fn apply_to_design(&self, x: &DesignMatrix) -> DesignMatrix {
+        if !self.is_active() {
+            return x.clone();
+        }
+        let mut dense = x.to_dense();
+        for &(j, mean, scale) in &self.columns {
+            {
+                let mut col = dense.column_mut(j);
+                col -= mean;
+            }
+            dense.column_mut(j).mapv_inplace(|v| v / scale);
+        }
+        DesignMatrix::Dense(dense)
+    }
+
+    fn transform_constraint_matrix_to_internal(&self, a_original: &Array2<f64>) -> Array2<f64> {
+        let mut out = a_original.clone();
+        for &(j, mean, scale) in &self.columns {
+            let intercept_col = self.intercept_idx.map(|idx| out.column(idx).to_owned());
+            let mut target = out.column_mut(j);
+            if mean != 0.0
+                && let Some(intercept_col) = intercept_col
+            {
+                target += &(intercept_col * mean);
+            }
+            if scale != 1.0 {
+                target.mapv_inplace(|v| v * scale);
+            }
+        }
+        out
+    }
+
+    fn transform_linear_constraints_to_internal(
+        &self,
+        constraints: Option<crate::pirls::LinearInequalityConstraints>,
+    ) -> Option<crate::pirls::LinearInequalityConstraints> {
+        constraints.map(|constraints| crate::pirls::LinearInequalityConstraints {
+            a: self.transform_constraint_matrix_to_internal(&constraints.a),
+            b: constraints.b,
+        })
+    }
+
+    fn backtransform_beta(&self, beta_internal: &Array1<f64>) -> Array1<f64> {
+        let mut beta = beta_internal.clone();
+        for &(j, mean, scale) in &self.columns {
+            if let Some(intercept_idx) = self.intercept_idx {
+                beta[intercept_idx] -= beta_internal[j] * mean / scale;
+            }
+            beta[j] = beta_internal[j] / scale;
+        }
+        beta
+    }
+
+    fn transform_matrix_columns_with_a(&self, mat: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat.clone();
+        for &(j, mean, scale) in &self.columns {
+            let intercept_col = self.intercept_idx.map(|idx| out.column(idx).to_owned());
+            let mut target = out.column_mut(j);
+            if mean != 0.0
+                && let Some(intercept_col) = intercept_col
+            {
+                target -= &(intercept_col * mean);
+            }
+            if scale != 1.0 {
+                target.mapv_inplace(|v| v / scale);
+            }
+        }
+        out
+    }
+
+    fn transform_matrix_rows_with_a_transpose(&self, mat: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat.clone();
+        for &(j, mean, scale) in &self.columns {
+            let intercept_row = self.intercept_idx.map(|idx| out.row(idx).to_owned());
+            let mut target = out.row_mut(j);
+            if mean != 0.0
+                && let Some(intercept_row) = intercept_row
+            {
+                target -= &(intercept_row * mean);
+            }
+            if scale != 1.0 {
+                target.mapv_inplace(|v| v / scale);
+            }
+        }
+        out
+    }
+
+    fn transform_matrix_columns_with_b(&self, mat: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat.clone();
+        for &(j, mean, scale) in &self.columns {
+            let intercept_col = self.intercept_idx.map(|idx| out.column(idx).to_owned());
+            let mut target = out.column_mut(j);
+            if mean != 0.0
+                && let Some(intercept_col) = intercept_col
+            {
+                target += &(intercept_col * mean);
+            }
+            if scale != 1.0 {
+                target.mapv_inplace(|v| v * scale);
+            }
+        }
+        out
+    }
+
+    fn transform_matrix_rows_with_b_transpose(&self, mat: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat.clone();
+        for &(j, mean, scale) in &self.columns {
+            let intercept_row = self.intercept_idx.map(|idx| out.row(idx).to_owned());
+            let mut target = out.row_mut(j);
+            if mean != 0.0
+                && let Some(intercept_row) = intercept_row
+            {
+                target += &(intercept_row * mean);
+            }
+            if scale != 1.0 {
+                target.mapv_inplace(|v| v * scale);
+            }
+        }
+        out
+    }
+
+    fn backtransform_covariance(&self, cov_internal: &Array2<f64>) -> Array2<f64> {
+        let right = self.transform_matrix_columns_with_a(cov_internal);
+        self.transform_matrix_rows_with_a_transpose(&right)
+    }
+
+    fn backtransform_penalized_hessian(&self, h_internal: &Array2<f64>) -> Array2<f64> {
+        let right = self.transform_matrix_columns_with_b(h_internal);
+        self.transform_matrix_rows_with_b_transpose(&right)
+    }
+
+    fn backtransform_external_result(
+        &self,
+        mut result: ExternalOptimResult,
+        keep_internal_pirls: bool,
+    ) -> ExternalOptimResult {
+        if !self.is_active() {
+            return result;
+        }
+        result.beta = self.backtransform_beta(&result.beta);
+        result.penalized_hessian = self.backtransform_penalized_hessian(&result.penalized_hessian);
+        result.beta_covariance = result
+            .beta_covariance
+            .take()
+            .map(|cov| self.backtransform_covariance(&cov));
+        result.beta_standard_errors = result.beta_covariance.as_ref().map(se_from_covariance);
+        result.beta_covariance_corrected = result
+            .beta_covariance_corrected
+            .take()
+            .map(|cov| self.backtransform_covariance(&cov));
+        result.beta_standard_errors_corrected = result
+            .beta_covariance_corrected
+            .as_ref()
+            .map(se_from_covariance);
+        result.smoothing_correction = result
+            .smoothing_correction
+            .take()
+            .map(|cov| self.backtransform_covariance(&cov));
+        result.reparam_qs = None;
+        result.constraint_kkt = None;
+        if !keep_internal_pirls {
+            result.artifacts = FitArtifacts { pirls: None };
+        }
+        result
+    }
+}
+
 fn map_hessian_to_original_basis(
     pirls: &crate::pirls::PirlsResult,
 ) -> Result<Array2<f64>, EstimationError> {
@@ -546,11 +788,15 @@ pub struct ExternalOptimResult {
     pub iterations: usize,
     pub final_grad_norm: f64,
     pub pirls_status: crate::pirls::PirlsStatus,
+    pub deviance: f64,
+    pub stable_penalty_term: f64,
+    pub max_abs_eta: f64,
+    pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
     pub smoothing_correction: Option<Array2<f64>>,
     pub penalized_hessian: Array2<f64>,
     pub working_weights: Array1<f64>,
     pub working_response: Array1<f64>,
-    pub reparam_qs: Array2<f64>,
+    pub reparam_qs: Option<Array2<f64>>,
     pub artifacts: FitArtifacts,
     /// Conditional posterior covariance under fixed smoothing parameters:
     /// Var(β | λ) ≈ (X'WX + S)^(-1)
@@ -660,6 +906,10 @@ where
 
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "optimize_external_design")?;
+    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_list);
+    let x_fit = conditioning.apply_to_design(&x);
+    let fit_linear_constraints =
+        conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
     let k = s_list.len();
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let cfg = RemlConfig::external(link, opts.tol, firth_active);
@@ -670,10 +920,11 @@ where
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let x_o = x.clone();
+    let x_fit_o = x_fit.clone();
     let offset_o = offset.to_owned();
     let reml_state = RemlState::new_with_offset(
         y_o.view(),
-        x_o.clone(),
+        x_fit_o.clone(),
         w_o.view(),
         offset_o.view(),
         s_list,
@@ -681,7 +932,7 @@ where
         &cfg,
         Some(opts.nullspace_dims.clone()),
         None,
-        opts.linear_constraints.clone(),
+        fit_linear_constraints.clone(),
     )?;
     let has_full_heuristic = heuristic_lambdas
         .map(|vals| vals.len() == k && k > 0)
@@ -773,7 +1024,7 @@ where
     let iters = std::cmp::max(1, outer_result.iterations);
     let (pirls_res, _) = pirls::fit_model_for_fixed_rho_matrix(
         LogSmoothingParamsView::new(final_rho.view()),
-        &x_o,
+        &x_fit_o,
         offset_o.view(),
         y_o.view(),
         w_o.view(),
@@ -784,15 +1035,16 @@ where
         &cfg.as_pirls_config(),
         None,
         None,
-        opts.linear_constraints.as_ref(),
+        fit_linear_constraints.as_ref(),
         None, // No SE for base external optimization
     )?;
 
     // Map beta back to original basis
-    let beta_orig = pirls_res
+    let beta_orig_internal = pirls_res
         .reparam_result
         .qs
         .dot(pirls_res.beta_transformed.as_ref());
+    let beta_orig = conditioning.backtransform_beta(&beta_orig_internal);
 
     // Weighted residual sum of squares for Gaussian models
     let n = y_o.len() as f64;
@@ -959,12 +1211,12 @@ where
     let beta_standard_errors_corrected = beta_covariance_corrected.as_ref().map(se_from_covariance);
     let working_weights = pirls_res.solve_weights.clone();
     let working_response = pirls_res.solve_working_response.clone();
-    let reparam_qs = pirls_res.reparam_result.qs.clone();
+    let reparam_qs = Some(pirls_res.reparam_result.qs.clone());
 
     let pirls_status = pirls_res.status;
 
-    Ok(ExternalOptimResult {
-        beta: beta_orig,
+    let result = ExternalOptimResult {
+        beta: beta_orig_internal,
         lambdas: lambdas.to_owned(),
         scale,
         edf_by_block,
@@ -972,18 +1224,25 @@ where
         iterations: iters,
         final_grad_norm,
         pirls_status,
+        deviance: pirls_res.deviance,
+        stable_penalty_term: pirls_res.stable_penalty_term,
+        max_abs_eta: pirls_res.max_abs_eta,
+        constraint_kkt: pirls_res.constraint_kkt.clone(),
         smoothing_correction,
         penalized_hessian,
         working_weights,
         working_response,
         reparam_qs,
-        artifacts: FitArtifacts { pirls: pirls_res },
+        artifacts: FitArtifacts {
+            pirls: Some(pirls_res),
+        },
         beta_covariance,
         beta_standard_errors,
         beta_covariance_corrected,
         beta_standard_errors_corrected,
         reml_score: outer_result.final_value,
-    })
+    };
+    Ok(conditioning.backtransform_external_result(result, true))
 }
 
 #[allow(dead_code)]
@@ -1247,7 +1506,7 @@ pub struct FitOptions {
 /// re-running PIRLS.
 #[derive(Clone)]
 pub struct FitArtifacts {
-    pub pirls: crate::pirls::PirlsResult,
+    pub pirls: Option<crate::pirls::PirlsResult>,
 }
 
 #[derive(Clone)]
@@ -1260,11 +1519,15 @@ pub struct FitResult {
     pub iterations: usize,
     pub final_grad_norm: f64,
     pub pirls_status: crate::pirls::PirlsStatus,
+    pub deviance: f64,
+    pub stable_penalty_term: f64,
+    pub max_abs_eta: f64,
+    pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
     pub smoothing_correction: Option<Array2<f64>>,
     pub penalized_hessian: Array2<f64>,
     pub working_weights: Array1<f64>,
     pub working_response: Array1<f64>,
-    pub reparam_qs: Array2<f64>,
+    pub reparam_qs: Option<Array2<f64>>,
     pub artifacts: FitArtifacts,
     /// Conditional posterior covariance under fixed smoothing parameters:
     /// Var(β | λ) ≈ (X'WX + S)^(-1)
@@ -1518,7 +1781,7 @@ where
                     crate::pirls::PirlsStatus::MaxIterationsReached
                         | crate::pirls::PirlsStatus::Unstable
                 );
-                let extreme_eta = res.artifacts.pirls.max_abs_eta > 15.0;
+                let extreme_eta = res.max_abs_eta > 15.0;
                 if !start_with_firth && (unstable_status || extreme_eta) {
                     ext_opts.firth_bias_reduction = Some(true);
                     optimize_external_design_with_heuristic_lambdas(
@@ -1570,6 +1833,10 @@ where
         iterations: result.iterations,
         final_grad_norm: result.final_grad_norm,
         pirls_status: result.pirls_status,
+        deviance: result.deviance,
+        stable_penalty_term: result.stable_penalty_term,
+        max_abs_eta: result.max_abs_eta,
+        constraint_kkt: result.constraint_kkt,
         smoothing_correction: result.smoothing_correction,
         penalized_hessian: result.penalized_hessian,
         working_weights: result.working_weights,

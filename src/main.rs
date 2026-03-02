@@ -86,7 +86,7 @@ struct FitArgs {
         long = "formula",
         alias = "predict-mean",
         help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
-        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary unpenalized linear term\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ bounded(mu_hat, min=0, max=1) + matern(pc1, pc2, pc3)'\n- 'y ~ bounded(mu_hat, min=0, max=1, prior=\"uniform\") + z'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary unpenalized linear term\n- linear(x, min=..., max=...): linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- unpenalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     formula: Option<String>,
     /// P(Y=1|S,x)=Phi((S-T(x))/sigma(x)).
@@ -373,6 +373,8 @@ enum ParsedTerm {
     Linear {
         name: String,
         explicit: bool,
+        coefficient_min: Option<f64>,
+        coefficient_max: Option<f64>,
     },
     BoundedLinear {
         name: String,
@@ -4021,6 +4023,30 @@ fn validate_frozen_term_collection_spec(
     label: &str,
 ) -> Result<(), String> {
     for linear in &spec.linear_terms {
+        if let (Some(min), Some(max)) = (linear.coefficient_min, linear.coefficient_max)
+            && (!min.is_finite() || !max.is_finite() || min > max)
+        {
+            return Err(format!(
+                "{label} linear term '{}' has invalid coefficient constraint [{min}, {max}]",
+                linear.name
+            ));
+        }
+        if let Some(min) = linear.coefficient_min
+            && !min.is_finite()
+        {
+            return Err(format!(
+                "{label} linear term '{}' has non-finite coefficient minimum {min}",
+                linear.name
+            ));
+        }
+        if let Some(max) = linear.coefficient_max
+            && !max.is_finite()
+        {
+            return Err(format!(
+                "{label} linear term '{}' has non-finite coefficient maximum {max}",
+                linear.name
+            ));
+        }
         if let LinearCoefficientGeometry::Bounded { min, max, prior } = &linear.coefficient_geometry
         {
             if !min.is_finite() || !max.is_finite() || min >= max {
@@ -4316,6 +4342,68 @@ fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
 }
 
 fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
+    if let Some(inner) = parse_call(raw, "constrain")
+        .or_else(|| parse_call(raw, "constraint"))
+        .or_else(|| parse_call(raw, "box"))
+    {
+        let (vars, options) = parse_call_args(inner)?;
+        if vars.len() != 1 {
+            return Err(format!(
+                "constrain()/constraint()/box() expects exactly one variable: {raw}"
+            ));
+        }
+        let (coefficient_min, coefficient_max) = parse_linear_constraint_bounds(&options, raw)?;
+        if coefficient_min.is_none() && coefficient_max.is_none() {
+            return Err(format!(
+                "constrain()/constraint()/box() requires at least one of min/lower/max/upper: {raw}"
+            ));
+        }
+        return Ok(ParsedTerm::Linear {
+            name: vars[0].clone(),
+            explicit: true,
+            coefficient_min,
+            coefficient_max,
+        });
+    }
+
+    if let Some(inner) =
+        parse_call(raw, "nonnegative").or_else(|| parse_call(raw, "nonnegative_coef"))
+    {
+        let vars = split_top_level(inner, ',')
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        if vars.len() != 1 {
+            return Err(format!("nonnegative() expects exactly one variable: {raw}"));
+        }
+        return Ok(ParsedTerm::Linear {
+            name: vars[0].clone(),
+            explicit: true,
+            coefficient_min: Some(0.0),
+            coefficient_max: None,
+        });
+    }
+
+    if let Some(inner) =
+        parse_call(raw, "nonpositive").or_else(|| parse_call(raw, "nonpositive_coef"))
+    {
+        let vars = split_top_level(inner, ',')
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        if vars.len() != 1 {
+            return Err(format!("nonpositive() expects exactly one variable: {raw}"));
+        }
+        return Ok(ParsedTerm::Linear {
+            name: vars[0].clone(),
+            explicit: true,
+            coefficient_min: None,
+            coefficient_max: Some(0.0),
+        });
+    }
+
     if let Some(inner) = parse_call(raw, "bounded") {
         let (vars, options) = parse_call_args(inner)?;
         if vars.len() != 1 {
@@ -4436,30 +4524,47 @@ fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
     }
 
     if let Some(inner) = parse_call(raw, "linear") {
-        let vars = split_top_level(inner, ',')
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
+        let (vars, options) = parse_call_args(inner)?;
         if vars.len() != 1 {
             return Err(format!("linear() expects exactly one variable: {raw}"));
         }
+        let (coefficient_min, coefficient_max) = parse_linear_constraint_bounds(&options, raw)?;
         return Ok(ParsedTerm::Linear {
             name: vars[0].clone(),
             explicit: true,
+            coefficient_min,
+            coefficient_max,
         });
     }
 
     if raw.contains('(') && raw.ends_with(')') {
         return Err(format!(
-            "unknown term function in '{raw}'. Supported: bounded(), linear(), smooth(), thinplate(), tensor(), group(), matern(), duchon()"
+            "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), thinplate(), tensor(), group(), matern(), duchon()"
         ));
     }
 
     Ok(ParsedTerm::Linear {
         name: raw.to_string(),
         explicit: false,
+        coefficient_min: None,
+        coefficient_max: None,
     })
+}
+
+fn parse_linear_constraint_bounds(
+    options: &BTreeMap<String, String>,
+    raw: &str,
+) -> Result<(Option<f64>, Option<f64>), String> {
+    let min = parse_optional_f64_option_alias(options, &["min", "lower"], raw, "linear")?;
+    let max = parse_optional_f64_option_alias(options, &["max", "upper"], raw, "linear")?;
+    if let (Some(min), Some(max)) = (min, max)
+        && (!min.is_finite() || !max.is_finite() || min > max)
+    {
+        return Err(format!(
+            "linear coefficient constraints require finite min <= max, got min={min}, max={max}: {raw}"
+        ));
+    }
+    Ok((min, max))
 }
 
 fn parse_required_f64_option(
@@ -4492,6 +4597,34 @@ fn parse_optional_f64_option(
         }),
         None => Ok(None),
     }
+}
+
+fn parse_optional_f64_option_alias(
+    options: &BTreeMap<String, String>,
+    keys: &[&str],
+    raw: &str,
+    fn_label: &str,
+) -> Result<Option<f64>, String> {
+    let mut found: Option<(&str, f64)> = None;
+    for key in keys {
+        if let Some(value) = options.get(*key) {
+            let parsed = value.parse::<f64>().map_err(|_| {
+                format!(
+                    "{fn_label}() argument '{key}' must be a finite number, got '{}': {raw}",
+                    value
+                )
+            })?;
+            if found.is_some() {
+                return Err(format!(
+                    "{fn_label}() cannot specify both '{}' and '{}': {raw}",
+                    found.expect("present").0,
+                    key
+                ));
+            }
+            found = Some((key, parsed));
+        }
+    }
+    Ok(found.map(|(_, v)| v))
 }
 
 fn parse_bounded_prior_spec(
@@ -4543,10 +4676,12 @@ fn parse_bounded_prior_spec(
     if let Some(prior_name) = prior_mode {
         return match prior_name.as_str() {
             "none" => Ok(BoundedCoefficientPriorSpec::None),
-            "uniform" => Ok(BoundedCoefficientPriorSpec::Uniform),
+            "uniform" | "log-jacobian" | "log_jacobian" | "jacobian" => {
+                Ok(BoundedCoefficientPriorSpec::Uniform)
+            }
             "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
             _ => Err(format!(
-                "bounded() prior must currently be one of none|uniform|center, got '{}': {raw}",
+                "bounded() prior must currently be one of none|uniform|log-jacobian|center, got '{}': {raw}",
                 prior_name
             )),
         };
@@ -4554,10 +4689,12 @@ fn parse_bounded_prior_spec(
 
     if let Some(pull_mode) = pull {
         return match pull_mode.as_str() {
-            "uniform" => Ok(BoundedCoefficientPriorSpec::Uniform),
+            "uniform" | "log-jacobian" | "log_jacobian" | "jacobian" => {
+                Ok(BoundedCoefficientPriorSpec::Uniform)
+            }
             "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
             _ => Err(format!(
-                "bounded() pull must currently be 'uniform' or 'center', got '{}': {raw}",
+                "bounded() pull must currently be 'uniform'/'log-jacobian' or 'center', got '{}': {raw}",
                 pull_mode
             )),
         };
@@ -4695,7 +4832,12 @@ fn build_term_spec(
 
     for t in terms {
         match t {
-            ParsedTerm::Linear { name, explicit } => {
+            ParsedTerm::Linear {
+                name,
+                explicit,
+                coefficient_min,
+                coefficient_max,
+            } => {
                 let col = resolve_col(col_map, name)?;
                 let auto_kind =
                     ds.kinds.get(col).copied().ok_or_else(|| {
@@ -4707,6 +4849,8 @@ fn build_term_spec(
                         feature_col: col,
                         double_penalty: false,
                         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                        coefficient_min: *coefficient_min,
+                        coefficient_max: *coefficient_max,
                     });
                 } else {
                     match auto_kind {
@@ -4716,6 +4860,8 @@ fn build_term_spec(
                                 feature_col: col,
                                 double_penalty: false,
                                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                                coefficient_min: *coefficient_min,
+                                coefficient_max: *coefficient_max,
                             });
                         }
                         ColumnKind::Binary => {
@@ -4724,9 +4870,16 @@ fn build_term_spec(
                                 feature_col: col,
                                 double_penalty: false,
                                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                                coefficient_min: *coefficient_min,
+                                coefficient_max: *coefficient_max,
                             });
                         }
                         ColumnKind::Categorical => {
+                            if coefficient_min.is_some() || coefficient_max.is_some() {
+                                return Err(format!(
+                                    "coefficient constraints are not supported for categorical auto-random-effect term '{name}'; use group({name}) or an unconstrained numeric term"
+                                ));
+                            }
                             random_terms.push(RandomEffectTermSpec {
                                 name: name.clone(),
                                 feature_col: col,
@@ -4762,6 +4915,8 @@ fn build_term_spec(
                         max: *max,
                         prior: prior.clone(),
                     },
+                    coefficient_min: None,
+                    coefficient_max: None,
                 });
             }
             ParsedTerm::RandomEffect { name } => {
@@ -5468,7 +5623,7 @@ fn build_model_summary(
     };
     let null_dev = gam::pirls::calculate_deviance(y, &null_mu, link, weights);
     let deviance_explained = if null_dev.is_finite() && null_dev > 0.0 {
-        Some((1.0 - fit.artifacts.pirls.deviance / null_dev).clamp(-9.0, 1.0))
+        Some((1.0 - fit.deviance / null_dev).clamp(-9.0, 1.0))
     } else {
         None
     };
@@ -5489,24 +5644,41 @@ fn build_model_summary(
         p_value: intercept_p,
     });
     for (name, range) in &design.linear_ranges {
-        let geometry = spec
-            .linear_terms
-            .iter()
-            .find(|term| term.name == *name)
-            .map(|term| term.coefficient_geometry.clone())
-            .unwrap_or(LinearCoefficientGeometry::Unconstrained);
-        let geometry_label = match geometry {
-            LinearCoefficientGeometry::Unconstrained => name.clone(),
-            LinearCoefficientGeometry::Bounded { min, max, prior } => {
+        let linear_meta = spec.linear_terms.iter().find(|term| term.name == *name);
+        let geometry_label = match linear_meta {
+            Some(LinearTermSpec {
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                coefficient_min,
+                coefficient_max,
+                ..
+            }) => match (coefficient_min, coefficient_max) {
+                (Some(lb), Some(ub)) => format!("{name} [coef in [{lb:.3}, {ub:.3}]]"),
+                (Some(lb), None) => format!("{name} [coef >= {lb:.3}]"),
+                (None, Some(ub)) => format!("{name} [coef <= {ub:.3}]"),
+                (None, None) => name.clone(),
+            },
+            Some(LinearTermSpec {
+                coefficient_geometry: LinearCoefficientGeometry::Bounded { min, max, prior },
+                coefficient_min,
+                coefficient_max,
+                ..
+            }) => {
                 let prior_txt = match prior {
                     BoundedCoefficientPriorSpec::None => ", no-prior".to_string(),
-                    BoundedCoefficientPriorSpec::Uniform => ", Uniform".to_string(),
+                    BoundedCoefficientPriorSpec::Uniform => ", Uniform(log-Jacobian)".to_string(),
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         format!(", Beta({a:.3},{b:.3})")
                     }
                 };
-                format!("{name} [bounded {min:.3}..{max:.3}{prior_txt}]")
+                let constraint_txt = match (coefficient_min, coefficient_max) {
+                    (Some(lb), Some(ub)) => format!(", coef in [{lb:.3}, {ub:.3}]"),
+                    (Some(lb), None) => format!(", coef >= {lb:.3}"),
+                    (None, Some(ub)) => format!(", coef <= {ub:.3}"),
+                    (None, None) => String::new(),
+                };
+                format!("{name} [bounded {min:.3}..{max:.3}{prior_txt}{constraint_txt}]")
             }
+            None => name.clone(),
         };
         for idx in range.start..range.end {
             let beta = fit.beta.get(idx).copied().unwrap_or(0.0);
@@ -5796,6 +5968,10 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
         iterations: ext.iterations,
         final_grad_norm: ext.final_grad_norm,
         pirls_status: ext.pirls_status,
+        deviance: ext.deviance,
+        stable_penalty_term: ext.stable_penalty_term,
+        max_abs_eta: ext.max_abs_eta,
+        constraint_kkt: ext.constraint_kkt,
         smoothing_correction: ext.smoothing_correction,
         penalized_hessian: ext.penalized_hessian,
         working_weights: ext.working_weights,
@@ -6147,6 +6323,40 @@ mod tests {
                 other => panic!("unexpected prior: {other:?}"),
             },
             other => panic!("expected bounded linear term, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_linear_term_with_box_constraints() {
+        let parsed =
+            parse_formula("y ~ linear(mu_hat, min=0, max=1) + nonpositive(z)").expect("formula");
+        assert_eq!(parsed.terms.len(), 2);
+        match &parsed.terms[0] {
+            ParsedTerm::Linear {
+                name,
+                explicit,
+                coefficient_min,
+                coefficient_max,
+            } => {
+                assert_eq!(name, "mu_hat");
+                assert!(*explicit);
+                assert_eq!(*coefficient_min, Some(0.0));
+                assert_eq!(*coefficient_max, Some(1.0));
+            }
+            other => panic!("expected constrained linear term, got {other:?}"),
+        }
+        match &parsed.terms[1] {
+            ParsedTerm::Linear {
+                name,
+                coefficient_min,
+                coefficient_max,
+                ..
+            } => {
+                assert_eq!(name, "z");
+                assert_eq!(*coefficient_min, None);
+                assert_eq!(*coefficient_max, Some(0.0));
+            }
+            other => panic!("expected nonpositive linear term, got {other:?}"),
         }
     }
 

@@ -394,7 +394,13 @@ pub fn compute_alo_diagnostics_from_fit(
     y: ArrayView1<f64>,
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(&fit.artifacts.pirls, y, link)
+    let pirls = fit.artifacts.pirls.as_ref().ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "ALO diagnostics require a PIRLS-backed fit; this fit does not expose PIRLS geometry"
+                .to_string(),
+        )
+    })?;
+    compute_alo_diagnostics_from_pirls_impl(pirls, y, link)
 }
 
 /// Compute ALO diagnostics from a fitted GAM result (primary API).
