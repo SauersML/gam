@@ -1,7 +1,7 @@
 use super::*;
 
 impl<'a> RemlState<'a> {
-    fn validate_joint_hyper_inputs(
+    pub(super) fn validate_joint_hyper_inputs(
         &self,
         theta: &Array1<f64>,
         rho_dim: usize,
@@ -25,7 +25,7 @@ impl<'a> RemlState<'a> {
         Ok(psi_dim)
     }
 
-    fn build_joint_perturbed_state(
+    pub(super) fn build_joint_perturbed_state(
         &self,
         psi: &Array1<f64>,
         hyper_dirs: &[DirectionalHyperParam],
@@ -96,7 +96,7 @@ impl<'a> RemlState<'a> {
         )
     }
 
-    fn compute_multi_psi_gradient_with_bundle(
+    pub(super) fn compute_multi_psi_gradient_with_bundle(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -171,7 +171,7 @@ impl<'a> RemlState<'a> {
         Ok((cost, out))
     }
 
-    fn compute_mixed_rho_tau_block(
+    pub(super) fn compute_mixed_rho_tau_block(
         &self,
         rho: &Array1<f64>,
         psi: &Array1<f64>,
@@ -209,7 +209,7 @@ impl<'a> RemlState<'a> {
         Ok(mixed)
     }
 
-    fn compute_mixed_rho_tau_column_analytic_with_bundle(
+    pub(super) fn compute_mixed_rho_tau_column_analytic_with_bundle(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -553,7 +553,7 @@ impl<'a> RemlState<'a> {
         Ok(out)
     }
 
-    fn compute_tau_tau_block(
+    pub(super) fn compute_tau_tau_block(
         &self,
         rho: &Array1<f64>,
         psi: &Array1<f64>,
@@ -1011,7 +1011,7 @@ impl<'a> RemlState<'a> {
         self.compute_directional_hyper_gradient_with_bundle(rho, &bundle, hyper_dir)
     }
 
-    fn compute_directional_hyper_gradient_with_bundle(
+    pub(super) fn compute_directional_hyper_gradient_with_bundle(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
