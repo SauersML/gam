@@ -7,6 +7,7 @@ use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{Array1, Array2};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const ZERO_TOL: f64 = 1e-12;
@@ -68,6 +69,33 @@ pub fn dense_to_sparse(
     }
     SparseColMat::try_new_from_triplets(nrows, ncols, &triplets).map_err(|_| {
         EstimationError::InvalidInput("failed to convert dense matrix to sparse CSC".to_string())
+    })
+}
+
+/// Convert a dense symmetric matrix to sparse CSC storing only the upper triangle.
+///
+/// This encoding is required by sparse SPD routines in this module that interpret
+/// entries as symmetric-upper storage and mirror off-diagonals when reconstructing
+/// dense diagnostics.
+pub fn dense_to_sparse_symmetric_upper(
+    matrix: &Array2<f64>,
+    tol: f64,
+) -> Result<SparseColMat<usize, f64>, EstimationError> {
+    let nrows = matrix.nrows();
+    let ncols = matrix.ncols();
+    let mut triplets = Vec::new();
+    for row in 0..nrows {
+        for col in row..ncols {
+            let value = matrix[[row, col]];
+            if value.abs() > tol {
+                triplets.push(Triplet::new(row, col, value));
+            }
+        }
+    }
+    SparseColMat::try_new_from_triplets(nrows, ncols, &triplets).map_err(|_| {
+        EstimationError::InvalidInput(
+            "failed to convert dense symmetric matrix to sparse upper-triangle CSC".to_string(),
+        )
     })
 }
 
@@ -154,12 +182,22 @@ fn sparse_row_quadratic_form(
 pub fn factorize_sparse_spd(
     h: &SparseColMat<usize, f64>,
 ) -> Result<SparseExactFactor, EstimationError> {
-    let factor = h.as_ref().sp_cholesky(Side::Upper).map_err(|_| {
+    // Canonicalize to symmetric-upper storage before factorization.
+    //
+    // Math contract:
+    // - If callers pass upper-only storage, values are preserved.
+    // - If callers pass full symmetric storage, paired (i,j)/(j,i) entries are averaged.
+    // - If callers pass lower-only storage, it is mirrored into upper.
+    //
+    // This prevents off-diagonal double counting in paths that interpret input as
+    // symmetric-upper and makes the sparse factor path robust to caller encoding.
+    let h_upper = canonicalize_sparse_symmetric_upper(h, ZERO_TOL)?;
+    let factor = h_upper.as_ref().sp_cholesky(Side::Upper).map_err(|_| {
         EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         }
     })?;
-    let dense = sparse_to_dense_symmetric_upper_public(h);
+    let dense = sparse_to_dense_symmetric_upper_public(&h_upper);
     let chol =
         dense
             .cholesky(Side::Lower)
@@ -169,8 +207,95 @@ pub fn factorize_sparse_spd(
     let logdet = 2.0 * chol.diag().mapv(f64::ln).sum();
     Ok(SparseExactFactor {
         factor,
-        n: h.ncols(),
+        n: h_upper.ncols(),
         logdet,
+    })
+}
+
+fn canonicalize_sparse_symmetric_upper(
+    matrix: &SparseColMat<usize, f64>,
+    tol: f64,
+) -> Result<SparseColMat<usize, f64>, EstimationError> {
+    if matrix.nrows() != matrix.ncols() {
+        return Err(EstimationError::InvalidInput(format!(
+            "sparse SPD factorization requires square matrix, got {}x{}",
+            matrix.nrows(),
+            matrix.ncols()
+        )));
+    }
+
+    #[derive(Default, Clone, Copy)]
+    struct PairAccum {
+        upper_sum: f64,
+        upper_count: usize,
+        lower_sum: f64,
+        lower_count: usize,
+    }
+
+    let mut accum: BTreeMap<(usize, usize), PairAccum> = BTreeMap::new();
+    let (symbolic, values) = matrix.parts();
+    let col_ptr = symbolic.col_ptr();
+    let row_idx = symbolic.row_idx();
+
+    for col in 0..matrix.ncols() {
+        let start = col_ptr[col];
+        let end = col_ptr[col + 1];
+        for idx in start..end {
+            let row = row_idx[idx];
+            let value = values[idx];
+            let (r, c, is_upper) = if row <= col {
+                (row, col, true)
+            } else {
+                (col, row, false)
+            };
+            let slot = accum.entry((r, c)).or_default();
+            if is_upper {
+                slot.upper_sum += value;
+                slot.upper_count += 1;
+            } else {
+                slot.lower_sum += value;
+                slot.lower_count += 1;
+            }
+        }
+    }
+
+    let mut triplets = Vec::<Triplet<usize, usize, f64>>::new();
+    for ((row, col), slot) in accum {
+        let value = if row == col {
+            let count = slot.upper_count + slot.lower_count;
+            if count == 0 {
+                0.0
+            } else {
+                (slot.upper_sum + slot.lower_sum) / (count as f64)
+            }
+        } else {
+            let upper_avg = if slot.upper_count > 0 {
+                Some(slot.upper_sum / (slot.upper_count as f64))
+            } else {
+                None
+            };
+            let lower_avg = if slot.lower_count > 0 {
+                Some(slot.lower_sum / (slot.lower_count as f64))
+            } else {
+                None
+            };
+            match (upper_avg, lower_avg) {
+                (Some(u), Some(l)) => 0.5 * (u + l),
+                (Some(u), None) => u,
+                (None, Some(l)) => l,
+                (None, None) => 0.0,
+            }
+        };
+
+        if value.abs() > tol {
+            triplets.push(Triplet::new(row, col, value));
+        }
+    }
+
+    SparseColMat::try_new_from_triplets(matrix.nrows(), matrix.ncols(), &triplets).map_err(|_| {
+        EstimationError::InvalidInput(
+            "failed to canonicalize sparse matrix to symmetric-upper CSC".to_string(),
+        )
     })
 }
 

@@ -35,6 +35,13 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Python deps for preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip setuptools wheel
+          python3 -m pip install numpy pandas scikit-learn pygam lifelines
+
       - name: Preflight scenario schemas
         shell: bash
         run: |
