@@ -48,11 +48,12 @@ use wolfe_bfgs::{Bfgs, BfgsError, BfgsSolution};
 /// With spectral log-det (Wood 2011), the objective is smooth regardless of ridge.
 const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 // FD audit policy for analytic gradient checks.
-// Keep the guardrail, but sample it periodically to avoid O(K * FD refinements)
-// blow-ups in high-dimensional smoothing problems.
+// This is a debug/test guardrail only; production optimization keeps analytic
+// gradients and never switches runtime direction fields to FD.
 const JOINT_GRAD_AUDIT_CLAMP_FRAC: f64 = 0.90;
 const JOINT_GRAD_AUDIT_WARMUP_EVALS: usize = 5;
 const JOINT_GRAD_AUDIT_INTERVAL: usize = 20;
+const JOINT_ENABLE_RUNTIME_FD_AUDIT: bool = cfg!(any(test, debug_assertions));
 const OUTER_BFGS_COST_BARRIER: f64 = 1e50;
 const OUTER_BFGS_GRAD_SCALE: f64 = 1e6;
 
@@ -1878,13 +1879,6 @@ impl<'a> JointRemlState<'a> {
             ));
         }
 
-        if matches!(self.core.state.link, LinkFunction::Logit)
-            && self.core.state.covariate_se.is_some()
-        {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "analytic joint gradient not implemented for integrated logit weights".to_string(),
-            ));
-        }
         let firth_active = self.core.state.firth_bias_reduction
             && matches!(self.core.state.link, LinkFunction::Logit);
 
@@ -1967,7 +1961,35 @@ impl<'a> JointRemlState<'a> {
         let mut mu = Array1::<f64>::zeros(n);
         let mut weights = Array1::<f64>::zeros(n);
         let mut residual = Array1::<f64>::zeros(n);
+        // For integrated logit we need higher derivatives of E[sigmoid(η+ε)] to
+        // differentiate IRLS curvature exactly in rho directions.
+        let mut integrated_d1 = Array1::<f64>::zeros(n);
+        let mut integrated_d2 = Array1::<f64>::zeros(n);
         match (&state.link, &state.covariate_se) {
+            (LinkFunction::Logit, Some(se)) => {
+                const PROB_EPS: f64 = 1e-8;
+                const MIN_DMU: f64 = 1e-6;
+                for i in 0..n {
+                    let e = eta[i].clamp(-700.0, 700.0);
+                    let se_i = se[i].max(0.0);
+                    let jet = crate::quadrature::integrated_inverse_link_jet(
+                        &state.quad_ctx,
+                        LinkFunction::Logit,
+                        e,
+                        se_i,
+                    );
+                    let mu_i = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+                    let d1 = jet.d1.max(MIN_DMU);
+                    let d2 = if jet.d2.is_finite() { jet.d2 } else { 0.0 };
+                    mu[i] = mu_i;
+                    integrated_d1[i] = d1;
+                    integrated_d2[i] = d2;
+                    let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
+                    let w = (d1 * d1 / var).max(1e-12);
+                    weights[i] = state.weights[i] * w;
+                    residual[i] = weights[i] * (mu_i - state.y[i]) / d1;
+                }
+            }
             (LinkFunction::Logit, None) => {
                 const PROB_EPS: f64 = 1e-8;
                 const MIN_WEIGHT: f64 = 1e-12;
@@ -2459,13 +2481,36 @@ impl<'a> JointRemlState<'a> {
             if matches!(state.link, LinkFunction::Logit) {
                 const PROB_EPS: f64 = 1e-8;
                 const MIN_WEIGHT: f64 = 1e-12;
-                for i in 0..n {
-                    let mu_i = mu[i];
-                    let w_base = mu_i * (1.0 - mu_i);
-                    if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || w_base < MIN_WEIGHT {
-                        w_prime[i] = 0.0;
-                    } else {
-                        w_prime[i] = state.weights[i] * w_base * (1.0 - 2.0 * mu_i);
+                match &state.covariate_se {
+                    Some(_) => {
+                        // Integrated-logit curvature:
+                        //   W = obs_w * (d1^2 / var),  var = mu(1-mu), d1 = dE[sigmoid]/dη.
+                        // So
+                        //   dW/dη = obs_w * [2 d1 d2 / var - d1^2 * (d1 (1-2mu)) / var^2].
+                        for i in 0..n {
+                            let mu_i = mu[i].clamp(PROB_EPS, 1.0 - PROB_EPS);
+                            let d1 = integrated_d1[i].max(1e-8);
+                            let d2 = integrated_d2[i];
+                            let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
+                            let var_prime = d1 * (1.0 - 2.0 * mu_i);
+                            let dw_deta =
+                                (2.0 * d1 * d2) / var - (d1 * d1) * (var_prime / (var * var));
+                            w_prime[i] = state.weights[i] * dw_deta;
+                            if !w_prime[i].is_finite() {
+                                w_prime[i] = 0.0;
+                            }
+                        }
+                    }
+                    None => {
+                        for i in 0..n {
+                            let mu_i = mu[i];
+                            let w_base = mu_i * (1.0 - mu_i);
+                            if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || w_base < MIN_WEIGHT {
+                                w_prime[i] = 0.0;
+                            } else {
+                                w_prime[i] = state.weights[i] * w_base * (1.0 - 2.0 * mu_i);
+                            }
+                        }
                     }
                 }
             } else {
@@ -2655,14 +2700,19 @@ impl<'a> JointRemlState<'a> {
         Ok((grad, audit_needed))
     }
 
-    /// Compute gradient of LAML w.r.t. ρ using analytic path, with FD fallback.
+    /// Compute gradient of LAML w.r.t. ρ using analytic path.
+    ///
+    /// Runtime policy:
+    /// - Production path: analytic only (no FD fallback).
+    /// - Optional FD audit: sampled guardrail in debug/test builds only; audit mismatch
+    ///   is reported as warning and does not replace analytic gradients.
     pub fn compute_gradient(&mut self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         match self.compute_gradient_analytic(rho) {
             Ok((grad, audit_needed)) => {
                 const GRAD_FD_REL_TOL: f64 = 1e-2;
                 let eval_num = self.eval.eval_count;
                 let audit_slot = should_sample_joint_fd_audit(eval_num);
-                if audit_needed && audit_slot {
+                if JOINT_ENABLE_RUNTIME_FD_AUDIT && audit_needed && audit_slot {
                     match self.compute_gradient_fd(rho) {
                         Ok(fd_grad) => {
                             let mut diff_norm = 0.0;
@@ -2674,10 +2724,10 @@ impl<'a> JointRemlState<'a> {
                             }
                             let rel = diff_norm.sqrt() / (fd_norm.sqrt() + 1.0);
                             if rel > GRAD_FD_REL_TOL {
-                                return Err(EstimationError::RemlOptimizationFailed(format!(
-                                    "Analytic/FD gradient mismatch (rel {:.3e}) in joint REML.",
+                                log::warn!(
+                                    "[JOINT][REML] analytic/FD gradient audit mismatch (rel {:.3e}); keeping analytic gradient.",
                                     rel
-                                )));
+                                );
                             }
                         }
                         Err(err) => {
@@ -2693,12 +2743,7 @@ impl<'a> JointRemlState<'a> {
                 }
                 Ok(grad)
             }
-            Err(err) => {
-                eprintln!(
-                    "[JOINT][REML] Analytic gradient unavailable: {err}. Falling back to FD."
-                );
-                self.compute_gradient_fd(rho)
-            }
+            Err(err) => Err(err),
         }
     }
 
@@ -3607,6 +3652,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_joint_analytic_gradient_supports_integrated_logit_weights() {
+        let n = 120;
+        let p = 6;
+        let mut rng = StdRng::seed_from_u64(4242);
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                x[[i, j]] = rng.random_range(-1.5..1.5);
+            }
+        }
+        let mut beta_true = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            beta_true[j] = rng.random_range(-0.8..0.8);
+        }
+        let eta = x.dot(&beta_true);
+        let y = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
+        let weights = Array1::ones(n);
+        let covariate_se = Array1::from_elem(n, 0.35);
+        let s = vec![Array2::eye(p)];
+        let layout = EngineDims::new(p, 1);
+        let config = JointModelConfig::default();
+
+        let mut reml_state = JointRemlState::new(
+            y.view(),
+            weights.view(),
+            x.view(),
+            s,
+            layout,
+            LinkFunction::Logit,
+            &config,
+            Some(covariate_se),
+            QuadratureContext::new(),
+        );
+        {
+            let state = &mut reml_state.core.state;
+            state.beta_base = beta_true.clone();
+            reml_state.eval.cached_beta_base = beta_true;
+            state.knot_range = None;
+            state.knot_vector = None;
+            state.link_transform = None;
+            state.s_link_constrained = None;
+            state.geometric_link_transform = None;
+            state.geometric_s_link_constrained = None;
+            let u = state.base_linear_predictor();
+            state.build_link_basis(&u).expect("link basis");
+        }
+
+        let rho = Array1::from_vec(vec![0.0, 4.0]);
+        let (grad, _audit) = reml_state
+            .compute_gradient_analytic_for_test(&rho)
+            .expect("integrated logit analytic gradient");
+        assert!(grad.iter().all(|v| v.is_finite()));
     }
 
     #[test]

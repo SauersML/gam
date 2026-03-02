@@ -4609,26 +4609,113 @@ impl<'a> RemlState<'a> {
         } else {
             &h_eff_eval
         };
-        let h_pos_w_for_solve = if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == p_dim
-        {
-            bundle.h_pos_factor_w.as_ref().clone()
+        // Smart solve backend:
+        // 1) Prefer objective-consistent positive-subspace solve H_+^dagger = W W^T.
+        // 2) Fall back to stabilized direct factor solve only when active-subspace diagnostics
+        //    are unstable or H_+ factor construction fails in current coordinates.
+        let prefer_h_pos = !bundle.active_subspace_unstable;
+        let h_pos_w_for_solve = if prefer_h_pos {
+            if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == p_dim {
+                Some(bundle.h_pos_factor_w.as_ref().clone())
+            } else {
+                match Self::positive_part_factor_w(h_solve_eval) {
+                    Ok(w) => Some(w),
+                    Err(err) => {
+                        log::warn!(
+                            "Mixed rho-tau analytic solve using stabilized direct fallback (failed H_+ projector build: {}).",
+                            err
+                        );
+                        None
+                    }
+                }
+            }
         } else {
-            Self::positive_part_factor_w(h_solve_eval)?
+            log::warn!(
+                "Mixed rho-tau analytic solve using stabilized direct fallback (active subspace unstable)."
+            );
+            None
         };
-        let h_pos_w_for_solve_t = h_pos_w_for_solve.t().to_owned();
+        let h_pos_w_for_solve_t = h_pos_w_for_solve.as_ref().map(|w| w.t().to_owned());
+        let h_factor = if h_pos_w_for_solve.is_none() {
+            Some(self.factorize_faer(h_solve_eval))
+        } else {
+            None
+        };
         let solve_h_vec = |rhs: &Array1<f64>| -> Array1<f64> {
-            let tmp = h_pos_w_for_solve_t.dot(rhs);
-            h_pos_w_for_solve.dot(&tmp)
+            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            {
+                let tmp = w_t.dot(rhs);
+                return w.dot(&tmp);
+            }
+            let mut rhs_mat = Array2::<f64>::zeros((rhs.len(), 1));
+            rhs_mat.column_mut(0).assign(rhs);
+            let mut rhs_view = array2_to_mat_mut(&mut rhs_mat);
+            if let Some(f) = h_factor.as_ref() {
+                f.solve_in_place(rhs_view.as_mut());
+            }
+            rhs_mat.column(0).to_owned()
+        };
+        let solve_h_mat = |rhs: &Array2<f64>| -> Array2<f64> {
+            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            {
+                let wt_rhs = fast_ab(w_t, rhs);
+                return fast_ab(w, &wt_rhs);
+            }
+            let mut out = rhs.clone();
+            let mut out_view = array2_to_mat_mut(&mut out);
+            if let Some(f) = h_factor.as_ref() {
+                f.solve_in_place(out_view.as_mut());
+            }
+            out
         };
         let trace_hdag = |a: &Array2<f64>| -> f64 {
-            let wt_a = fast_ab(&h_pos_w_for_solve_t, a);
-            let g = fast_ab(&wt_a, &h_pos_w_for_solve);
-            g.diag().sum()
+            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            {
+                let wt_a = fast_ab(w_t, a);
+                let g = fast_ab(&wt_a, w);
+                g.diag().sum()
+            } else {
+                let solved = solve_h_mat(a);
+                solved.diag().sum()
+            }
         };
+        // Matrix-free trace contraction for D²(H_phi)[u,v]:
+        //   tr(H_+^dagger D²H_phi[u,v]) = tr(W^T (D²H_phi[u,v] W))
+        // when the positive-subspace solve projector W is available.
+        // Falls back to dense assembly only when W is unavailable.
+        let trace_hdag_firth_second = |op: &FirthDenseOperator,
+                                       u_dir: &FirthDirection,
+                                       v_dir: &FirthDirection|
+         -> f64 {
+            Self::trace_hdag_operator_apply(
+                p_dim,
+                h_pos_w_for_solve.as_ref(),
+                h_pos_w_for_solve_t.as_ref(),
+                |a| solve_h_mat(a),
+                |basis| Self::firth_hphi_second_direction_apply(op, u_dir, v_dir, basis),
+            )
+        };
+        let trace_hdag_firth_first =
+            |op: &FirthDenseOperator, u_dir: &FirthDirection| -> f64 {
+                Self::trace_hdag_operator_apply(
+                    p_dim,
+                    h_pos_w_for_solve.as_ref(),
+                    h_pos_w_for_solve_t.as_ref(),
+                    |a| solve_h_mat(a),
+                    |basis| Self::firth_hphi_direction_apply(op, u_dir, basis),
+                )
+            };
         let trace_hdag_b_hdag_c = |b: &Array2<f64>, c_mat: &Array2<f64>| -> f64 {
-            let gb = fast_ab(&fast_ab(&h_pos_w_for_solve_t, b), &h_pos_w_for_solve);
-            let gc = fast_ab(&fast_ab(&h_pos_w_for_solve_t, c_mat), &h_pos_w_for_solve);
-            Self::trace_product(&gb, &gc)
+            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            {
+                let gb = fast_ab(&fast_ab(w_t, b), w);
+                let gc = fast_ab(&fast_ab(w_t, c_mat), w);
+                Self::trace_product(&gb, &gc)
+            } else {
+                let left = solve_h_mat(b);
+                let right = solve_h_mat(c_mat);
+                Self::trace_product(&left, &right)
+            }
         };
 
         let lambdas = rho.mapv(f64::exp);
@@ -4777,16 +4864,18 @@ impl<'a> RemlState<'a> {
             h_k_tau += &x_tau_t.t().dot(&Self::row_scale(&x_eval, &diag_q));
             h_k_tau += &x_eval.t().dot(&Self::row_scale(&x_tau_t, &diag_q));
             h_k_tau += &Self::xt_diag_x_dense_into(&x_eval, &diag_q_tau, &mut weighted);
+            let mut d1_trace_correction = 0.0_f64;
+            let mut d2_trace_correction = 0.0_f64;
             if let (Some(op), Some(dirs)) = (firth_op.as_ref(), firth_dirs.as_ref()) {
                 let dir_ktau = Self::firth_direction(op, &b_k_tau);
                 let dir_tau = Self::firth_direction(op, &beta_tau);
-                h_k_tau -= &Self::firth_hphi_direction(op, &dir_ktau);
-                h_k_tau -= &Self::firth_hphi_second_direction(op, &dirs[k], &dir_tau);
+                d1_trace_correction = trace_hdag_firth_first(op, &dir_ktau);
+                d2_trace_correction = trace_hdag_firth_second(op, &dirs[k], &dir_tau);
             }
 
             let q_mixed =
                 beta_eval.dot(&a_k.dot(&beta_tau)) + 0.5 * beta_eval.dot(&a_k_tau.dot(&beta_eval));
-            let t_linear = trace_hdag(&h_k_tau);
+            let t_linear = trace_hdag(&h_k_tau) - d1_trace_correction - d2_trace_correction;
             let t_quad = trace_hdag_b_hdag_c(&h_tau, &h_k[k]);
             let p_mixed = -0.5
                 * (Self::trace_product(&s_dag, &a_k_tau)
@@ -4856,30 +4945,127 @@ impl<'a> RemlState<'a> {
         // Single-inverse doctrine for analytic tau-tau:
         // use the same positive-subspace generalized inverse used by log|H|_+.
         // This keeps all IFT solves and trace contractions on one objective-consistent surface.
-        let h_pos_w_for_solve = if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == p_dim
-        {
-            bundle.h_pos_factor_w.as_ref().clone()
+        let prefer_h_pos = !bundle.active_subspace_unstable;
+        let h_pos_w_for_solve = if prefer_h_pos {
+            if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == p_dim {
+                Some(bundle.h_pos_factor_w.as_ref().clone())
+            } else {
+                match Self::positive_part_factor_w(h_solve_eval) {
+                    Ok(w) => Some(w),
+                    Err(err) => {
+                        log::warn!(
+                            "Tau-tau analytic solve using stabilized direct fallback (failed H_+ projector build: {}).",
+                            err
+                        );
+                        None
+                    }
+                }
+            }
         } else {
-            Self::positive_part_factor_w(h_solve_eval)?
+            log::warn!(
+                "Tau-tau analytic solve using stabilized direct fallback (active subspace unstable)."
+            );
+            None
         };
-        let h_pos_w_for_solve_t = h_pos_w_for_solve.t().to_owned();
+        let h_pos_w_for_solve_t = h_pos_w_for_solve.as_ref().map(|w| w.t().to_owned());
+        let h_factor = if h_pos_w_for_solve.is_none() {
+            Some(pert_state.factorize_faer(h_solve_eval))
+        } else {
+            None
+        };
         let solve_h_vec = |rhs: &Array1<f64>| -> Array1<f64> {
-            let tmp = h_pos_w_for_solve_t.dot(rhs);
-            h_pos_w_for_solve.dot(&tmp)
+            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            {
+                let tmp = w_t.dot(rhs);
+                return w.dot(&tmp);
+            }
+            let mut rhs_mat = Array2::<f64>::zeros((rhs.len(), 1));
+            rhs_mat.column_mut(0).assign(rhs);
+            let mut rhs_view = array2_to_mat_mut(&mut rhs_mat);
+            if let Some(f) = h_factor.as_ref() {
+                f.solve_in_place(rhs_view.as_mut());
+            }
+            rhs_mat.column(0).to_owned()
         };
         let solve_h_mat = |rhs: &Array2<f64>| -> Array2<f64> {
-            let wt_rhs = fast_ab(&h_pos_w_for_solve_t, rhs);
-            fast_ab(&h_pos_w_for_solve, &wt_rhs)
+            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            {
+                let wt_rhs = fast_ab(w_t, rhs);
+                return fast_ab(w, &wt_rhs);
+            }
+            let mut out = rhs.clone();
+            let mut out_view = array2_to_mat_mut(&mut out);
+            if let Some(f) = h_factor.as_ref() {
+                f.solve_in_place(out_view.as_mut());
+            }
+            out
         };
         let trace_hdag = |a: &Array2<f64>| -> f64 {
-            let wt_a = fast_ab(&h_pos_w_for_solve_t, a);
-            let g = fast_ab(&wt_a, &h_pos_w_for_solve);
-            g.diag().sum()
+            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            {
+                let wt_a = fast_ab(w_t, a);
+                let g = fast_ab(&wt_a, w);
+                g.diag().sum()
+            } else {
+                let mut solved = a.clone();
+                let mut solved_view = array2_to_mat_mut(&mut solved);
+                if let Some(f) = h_factor.as_ref() {
+                    f.solve_in_place(solved_view.as_mut());
+                }
+                solved.diag().sum()
+            }
         };
+        // Matrix-free D²(H_phi) trace contraction, identical to mixed block:
+        // use tr(W^T (D²H_phi[u,v] W)) on the active positive solve subspace.
+        let trace_hdag_firth_second = |op: &FirthDenseOperator,
+                                       u_dir: &FirthDirection,
+                                       v_dir: &FirthDirection|
+         -> f64 {
+            Self::trace_hdag_operator_apply(
+                p_dim,
+                h_pos_w_for_solve.as_ref(),
+                h_pos_w_for_solve_t.as_ref(),
+                |a| solve_h_mat(a),
+                |basis| Self::firth_hphi_second_direction_apply(op, u_dir, v_dir, basis),
+            )
+        };
+        let trace_hdag_firth_first =
+            |op: &FirthDenseOperator, u_dir: &FirthDirection| -> f64 {
+                Self::trace_hdag_operator_apply(
+                    p_dim,
+                    h_pos_w_for_solve.as_ref(),
+                    h_pos_w_for_solve_t.as_ref(),
+                    |a| solve_h_mat(a),
+                    |basis| Self::firth_hphi_direction_apply(op, u_dir, basis),
+                )
+            };
+        let trace_hdag_firth_tau_partial =
+            |op: &FirthDenseOperator, x_tau: &Array2<f64>, kernel: &FirthTauPartialKernel| -> f64 {
+                Self::trace_hdag_operator_apply(
+                    p_dim,
+                    h_pos_w_for_solve.as_ref(),
+                    h_pos_w_for_solve_t.as_ref(),
+                    |a| solve_h_mat(a),
+                    |basis| Self::firth_hphi_tau_partial_apply(op, x_tau, kernel, basis),
+                )
+            };
         let trace_hdag_b_hdag_c = |b: &Array2<f64>, c_mat: &Array2<f64>| -> f64 {
-            let gb = fast_ab(&fast_ab(&h_pos_w_for_solve_t, b), &h_pos_w_for_solve);
-            let gc = fast_ab(&fast_ab(&h_pos_w_for_solve_t, c_mat), &h_pos_w_for_solve);
-            Self::trace_product(&gb, &gc)
+            if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
+            {
+                let gb = fast_ab(&fast_ab(w_t, b), w);
+                let gc = fast_ab(&fast_ab(w_t, c_mat), w);
+                Self::trace_product(&gb, &gc)
+            } else {
+                let mut left = b.clone();
+                let mut right = c_mat.clone();
+                let mut left_view = array2_to_mat_mut(&mut left);
+                let mut right_view = array2_to_mat_mut(&mut right);
+                if let Some(f) = h_factor.as_ref() {
+                    f.solve_in_place(left_view.as_mut());
+                    f.solve_in_place(right_view.as_mut());
+                }
+                Self::trace_product(&left, &right)
+            }
         };
 
         // Build first directional solves for all tau directions.
@@ -5049,20 +5235,32 @@ impl<'a> RemlState<'a> {
                 h_ij += &x_eval.t().dot(&Self::row_scale(&x_tau_t[j], &diag_i));
                 h_ij += &Self::xt_diag_x_dense_into(&x_eval, &diag_ij, &mut weighted);
 
+                let mut d1_trace_correction = 0.0_f64;
+                let mut d2_trace_correction = 0.0_f64;
+                let mut dtau_trace_correction = 0.0_f64;
                 if let (Some(op), Some(dirs)) = (firth_op.as_ref(), firth_tau_dirs.as_ref()) {
                     let dir_ij = Self::firth_direction(op, &beta_ij);
-                    h_ij -= &Self::firth_hphi_direction(op, &dir_ij);
-                    h_ij -= &Self::firth_hphi_second_direction(op, &dirs[i], &dirs[j]);
+                    d1_trace_correction = trace_hdag_firth_first(op, &dir_ij);
+                    d2_trace_correction = trace_hdag_firth_second(op, &dirs[i], &dirs[j]);
                     if x_tau_t[i].iter().any(|v| *v != 0.0) {
-                        h_ij -= &Self::firth_hphi_tau_partial(op, &x_tau_t[i], &beta_tau[j]);
+                        let k_i_jtau =
+                            Self::firth_hphi_tau_partial_prepare(op, &x_tau_t[i], &beta_tau[j]);
+                        dtau_trace_correction +=
+                            trace_hdag_firth_tau_partial(op, &x_tau_t[i], &k_i_jtau);
                     }
                     if x_tau_t[j].iter().any(|v| *v != 0.0) {
-                        h_ij -= &Self::firth_hphi_tau_partial(op, &x_tau_t[j], &beta_tau[i]);
+                        let k_j_itau =
+                            Self::firth_hphi_tau_partial_prepare(op, &x_tau_t[j], &beta_tau[i]);
+                        dtau_trace_correction +=
+                            trace_hdag_firth_tau_partial(op, &x_tau_t[j], &k_j_itau);
                     }
                 }
 
                 let q = beta_eval.dot(&a_tau[i].dot(&beta_tau[j]));
-                let l = 0.5 * (trace_hdag(&h_ij) - trace_hdag_b_hdag_c(&h_tau[j], &h_tau[i]));
+                let l = 0.5
+                    * (trace_hdag(&h_ij) - d1_trace_correction - d2_trace_correction
+                        - dtau_trace_correction
+                        - trace_hdag_b_hdag_c(&h_tau[j], &h_tau[i]));
                 let p_term = 0.5 * Self::trace_product(&sdag_a[j], &sdag_a[i]);
                 let val = q + l + p_term;
                 h_tt[[i, j]] = val;
@@ -6420,6 +6618,40 @@ impl<'a> RemlState<'a> {
         }))
     }
 
+    fn trace_hdag_operator_apply<S, A>(
+        p_dim: usize,
+        h_pos_w: Option<&Array2<f64>>,
+        h_pos_w_t: Option<&Array2<f64>>,
+        mut solve_h_mat: S,
+        mut apply_to_block: A,
+    ) -> f64
+    where
+        S: FnMut(&Array2<f64>) -> Array2<f64>,
+        A: FnMut(&Array2<f64>) -> Array2<f64>,
+    {
+        if let (Some(w), Some(w_t)) = (h_pos_w, h_pos_w_t) {
+            let a_w = apply_to_block(w);
+            return Self::trace_product(w_t, &a_w);
+        }
+        const BLOCK: usize = 32;
+        let mut acc = 0.0_f64;
+        let mut start = 0usize;
+        while start < p_dim {
+            let width = (p_dim - start).min(BLOCK);
+            let mut basis = Array2::<f64>::zeros((p_dim, width));
+            for j in 0..width {
+                basis[[start + j, j]] = 1.0;
+            }
+            let a_block = apply_to_block(&basis);
+            let solved = solve_h_mat(&a_block);
+            for j in 0..width {
+                acc += solved[[start + j, j]];
+            }
+            start += width;
+        }
+        acc
+    }
+
     fn bilinear_form(
         mat: &Array2<f64>,
         left: ndarray::ArrayView1<'_, f64>,
@@ -6832,24 +7064,6 @@ impl<'a> RemlState<'a> {
         //   Bᵀ P B      via apply_hadamard_gram_to_matrix(Z, K_r, K_r, B)
         //   Bᵀ P_u B    via apply_hadamard_gram_to_matrix(Z, K_r, A_u, B), then *(-2)
         // where P = M⊙M and P_u = -2(M⊙N_u), but M/N_u are never formed explicitly.
-        for i in 0..out.nrows() {
-            for j in 0..i {
-                let avg = 0.5 * (out[[i, j]] + out[[j, i]]);
-                out[[i, j]] = avg;
-                out[[j, i]] = avg;
-            }
-        }
-        out
-    }
-
-    fn firth_hphi_second_direction(
-        op: &FirthDenseOperator,
-        u: &FirthDirection,
-        v: &FirthDirection,
-    ) -> Array2<f64> {
-        let p = op.x_dense.ncols();
-        let eye = Array2::<f64>::eye(p);
-        let mut out = Self::firth_hphi_second_direction_apply(op, u, v, &eye);
         for i in 0..out.nrows() {
             for j in 0..i {
                 let avg = 0.5 * (out[[i, j]] + out[[j, i]]);
@@ -8659,6 +8873,7 @@ impl<'a> RemlState<'a> {
                             Array2::<f64>::zeros((p_dim, p_dim))
                         };
                         h_kl += &Self::xt_diag_x_dense_into(x_dense, &diag, &mut weighted_xtdx_kl);
+                        let mut d2_trace_correction = 0.0_f64;
                         if let (Some(op), Some(dirs)) = (firth_op.as_ref(), firth_dirs.as_ref()) {
                             let b_kl = b_kl_all.column(k).to_owned();
                             let dir_kl = Self::firth_direction(op, &b_kl);
@@ -8671,7 +8886,42 @@ impl<'a> RemlState<'a> {
                             //   H_kl = δ_kl A_k + D²(X'WX)[B_k,B_l] + D(X'WX)[B_kl]
                             //          - D²(H_φ)[B_k,B_l] - D(H_φ)[B_kl].
                             h_kl -= &Self::firth_hphi_direction(op, &dir_kl);
-                            h_kl -= &Self::firth_hphi_second_direction(op, &dirs[k], &dirs[l]);
+                            if spectral_exact_mode {
+                                let w_pos = w_pos_spectral
+                                    .as_ref()
+                                    .expect("spectral W present in spectral exact mode");
+                                let w_pos_t = w_pos_spectral_t
+                                    .as_ref()
+                                    .expect("spectral W^T present in spectral exact mode");
+                                let d2_aw =
+                                    Self::firth_hphi_second_direction_apply(op, &dirs[k], &dirs[l], w_pos);
+                                d2_trace_correction = Self::trace_product(w_pos_t, &d2_aw);
+                            } else {
+                                // Exact dense-solve fallback for tr(H^{-1} D²H_phi[B_k,B_l])
+                                // without materializing the full p×p D²H_phi matrix.
+                                const BLOCK: usize = 32;
+                                let mut acc = 0.0_f64;
+                                let mut start = 0usize;
+                                while start < p_dim {
+                                    let width = (p_dim - start).min(BLOCK);
+                                    let mut basis = Array2::<f64>::zeros((p_dim, width));
+                                    for j in 0..width {
+                                        basis[[start + j, j]] = 1.0;
+                                    }
+                                    let d2_block = Self::firth_hphi_second_direction_apply(
+                                        op,
+                                        &dirs[k],
+                                        &dirs[l],
+                                        &basis,
+                                    );
+                                    let solved_block = solve_h(&d2_block);
+                                    for j in 0..width {
+                                        acc += solved_block[[start + j, j]];
+                                    }
+                                    start += width;
+                                }
+                                d2_trace_correction = acc;
+                            }
                         }
                         if spectral_exact_mode {
                             let w_pos = w_pos_spectral
@@ -8683,7 +8933,7 @@ impl<'a> RemlState<'a> {
                             let wt_hkl = fast_ab(w_pos_t, &h_kl);
                             let g_kl = fast_ab(&wt_hkl, w_pos);
                             // t2 = tr(H_+^dagger H_kl) = tr(W^T H_kl W).
-                            g_kl.diag().sum()
+                            g_kl.diag().sum() - d2_trace_correction
                         } else {
                             // Dense exact fallback without explicit inverse:
                             //   tr(H^{-1} H_kl) = tr(solve(H, H_kl)).
@@ -8766,6 +9016,13 @@ impl<'a> RemlState<'a> {
         }
         self.add_soft_prior_hessian_in_place(rho, &mut hess);
         Ok(hess)
+    }
+
+    pub(super) fn compute_laml_hessian_analytic_fallback_standalone(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        self.compute_laml_hessian_analytic_fallback(rho, None)
     }
 
     pub(super) fn compute_smoothing_correction_auto(
