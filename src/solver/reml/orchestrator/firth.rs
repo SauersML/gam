@@ -478,7 +478,10 @@ impl<'a> RemlState<'a> {
         0.5 * (diag_term - (term1 + term2 + term3))
     }
 
-    pub(super) fn firth_hphi_direction(op: &FirthDenseOperator, dir: &FirthDirection) -> Array2<f64> {
+    pub(super) fn firth_hphi_direction(
+        op: &FirthDenseOperator,
+        dir: &FirthDirection,
+    ) -> Array2<f64> {
         let p = op.x_dense.ncols();
         let eye = Array2::<f64>::eye(p);
         let mut out = Self::firth_hphi_direction_apply(op, dir, &eye);
@@ -668,7 +671,11 @@ impl<'a> RemlState<'a> {
         out
     }
 
-    pub(super) fn rowwise_bilinear(a: &Array2<f64>, m: &Array2<f64>, b: &Array2<f64>) -> Array1<f64> {
+    pub(super) fn rowwise_bilinear(
+        a: &Array2<f64>,
+        m: &Array2<f64>,
+        b: &Array2<f64>,
+    ) -> Array1<f64> {
         // Returns vector with entries a_iᵀ M b_i for each row i.
         debug_assert_eq!(a.nrows(), b.nrows());
         debug_assert_eq!(a.ncols(), m.nrows());
@@ -884,7 +891,10 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(super) fn firth_apply_pbar_to_matrix(op: &FirthDenseOperator, mat: &Array2<f64>) -> Array2<f64> {
+    pub(super) fn firth_apply_pbar_to_matrix(
+        op: &FirthDenseOperator,
+        mat: &Array2<f64>,
+    ) -> Array2<f64> {
         // Applies P̄ = (X_r K_r X_rᵀ)⊙(X_r K_r X_rᵀ) to each column of mat.
         Self::apply_hadamard_gram_to_matrix(&op.z_reduced, &op.k_reduced, &op.k_reduced, mat)
     }
@@ -1177,5 +1187,4 @@ impl<'a> RemlState<'a> {
         }
         out
     }
-
 }

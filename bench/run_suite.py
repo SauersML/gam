@@ -689,7 +689,7 @@ def _load_wine_dataset():
             "w_rain": float(wr),
             "h_temp": float(ht),
             "s_temp": float(st),
-            "y": float(p),
+            "price": float(p),
         }
         for y, hr, wr, ht, st, p in zip(
             d["year"], d["h_rain"], d["w_rain"], d["h_temp"], d["s_temp"], d["price"]
@@ -699,31 +699,31 @@ def _load_wine_dataset():
         "family": "gaussian",
         "rows": rows,
         "features": ["year", "h_rain", "w_rain", "h_temp", "s_temp"],
-        "target": "y",
+        "target": "price",
     }
 
 
 def _load_wine_temp_vs_year_dataset():
     d = pd.read_csv(DATASET_DIR / "wine.csv")
     d = d[["year", "s_temp"]].dropna()
-    rows = [{"year": float(y), "y": float(t)} for y, t in zip(d["year"], d["s_temp"])]
+    rows = [{"year": float(y), "s_temp": float(t)} for y, t in zip(d["year"], d["s_temp"])]
     return {
         "family": "gaussian",
         "rows": rows,
         "features": ["year"],
-        "target": "y",
+        "target": "s_temp",
     }
 
 
 def _load_wine_price_vs_temp_dataset():
     d = pd.read_csv(DATASET_DIR / "wine.csv")
     d = d[["s_temp", "price"]].replace({"NA": np.nan}).dropna()
-    rows = [{"temp": float(t), "y": float(p)} for t, p in zip(d["s_temp"], d["price"])]
+    rows = [{"temp": float(t), "price": float(p)} for t, p in zip(d["s_temp"], d["price"])]
     return {
         "family": "gaussian",
         "rows": rows,
         "features": ["temp"],
-        "target": "y",
+        "target": "price",
     }
 
 
@@ -1665,7 +1665,63 @@ def _geo_subpop16_dataset(seed=20260330, prevalence_min=0.02, prevalence_max=0.4
     }
 
 
-def dataset_for_scenario(s):
+def _validate_dataset_schema(ds, scenario_name):
+    if not isinstance(ds, dict):
+        raise RuntimeError(f"{scenario_name}: dataset loader must return a dict")
+    if "family" not in ds:
+        raise RuntimeError(f"{scenario_name}: dataset missing 'family'")
+    if "rows" not in ds:
+        raise RuntimeError(f"{scenario_name}: dataset missing 'rows'")
+    if "features" not in ds:
+        raise RuntimeError(f"{scenario_name}: dataset missing 'features'")
+
+    rows = ds["rows"]
+    features = ds["features"]
+    family = ds["family"]
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"{scenario_name}: dataset rows must be a non-empty list")
+    if not isinstance(features, list):
+        raise RuntimeError(f"{scenario_name}: dataset features must be a list")
+    if not all(isinstance(c, str) and c for c in features):
+        raise RuntimeError(f"{scenario_name}: dataset features must be non-empty strings")
+
+    if family == "survival":
+        for key in ("time_col", "event_col"):
+            if key not in ds or not isinstance(ds[key], str) or not ds[key]:
+                raise RuntimeError(f"{scenario_name}: survival dataset missing valid '{key}'")
+        required_cols = set(features) | {ds["time_col"], ds["event_col"]}
+    else:
+        target = ds.get("target")
+        if not isinstance(target, str) or not target:
+            raise RuntimeError(f"{scenario_name}: non-survival dataset missing valid 'target'")
+        required_cols = set(features) | {target}
+
+    first = rows[0]
+    if not isinstance(first, dict):
+        raise RuntimeError(f"{scenario_name}: dataset rows must be dictionaries")
+    missing = [c for c in required_cols if c not in first]
+    if missing:
+        raise RuntimeError(f"{scenario_name}: first row missing required columns: {sorted(missing)}")
+
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"{scenario_name}: row {i} is not a dictionary")
+        row_missing = [c for c in required_cols if c not in row]
+        if row_missing:
+            raise RuntimeError(f"{scenario_name}: row {i} missing required columns: {sorted(row_missing)}")
+
+    if family == "survival":
+        numeric_cols = features + [ds["time_col"], ds["event_col"]]
+    else:
+        numeric_cols = features + [ds["target"]]
+    for col in numeric_cols:
+        try:
+            np.array([float(r[col]) for r in rows], dtype=float)
+        except Exception as e:
+            raise RuntimeError(f"{scenario_name}: column '{col}' is not fully numeric/coercible: {e}") from e
+
+
+def _dataset_for_scenario_unvalidated(s):
     name = s["name"]
     if name in {"small_dense", "medium", "pathological_ill_conditioned"}:
         cfg = _CANONICAL_SYNTHETIC_BINOMIAL_SCENARIOS[name]
@@ -1727,6 +1783,12 @@ def dataset_for_scenario(s):
     if name == "cirrhosis_survival":
         return _load_cirrhosis_survival_dataset()
     raise RuntimeError(f"No scenario-specific dataset loader configured for '{name}'")
+
+
+def dataset_for_scenario(s):
+    ds = _dataset_for_scenario_unvalidated(s)
+    _validate_dataset_schema(ds, scenario_name=s["name"])
+    return ds
 
 
 def folds_for_dataset(ds):
@@ -2801,6 +2863,10 @@ suppressPackageStartupMessages({
 
 payload <- fromJSON(data_path, simplifyVector = TRUE)
 df <- as.data.frame(payload$dataset$rows)
+target_name <- as.character(payload$dataset$target)
+if (!nzchar(target_name) || !(target_name %in% colnames(df))) {
+  stop(sprintf("invalid or missing dataset target column: %s", target_name))
+}
 family_name <- as.character(payload$dataset$family)
 scenario_name <- as.character(payload$scenario_name)
 mgcv_formula <- NULL
@@ -2818,8 +2884,10 @@ test_idx <- scan(test_idx_path, what=integer(), quiet=TRUE) + 1L
 train_df <- df[train_idx, , drop=FALSE]
 test_df <- df[test_idx, , drop=FALSE]
 y_test <- NULL
+y_train <- NULL
 if (family_name != "survival") {
-  y_all <- as.numeric(df[[payload$dataset$target]])
+  y_all <- as.numeric(df[[target_name]])
+  y_train <- y_all[train_idx]
   y_test <- y_all[test_idx]
 }
 
@@ -2957,7 +3025,7 @@ if (family_name == "binomial") {
   )
 } else {
   p_train <- as.numeric(predict(fit, newdata=train_df, type="response"))
-  sigma_hat <- sqrt(mean((as.numeric(train_df[[target_name]]) - p_train)^2))
+  sigma_hat <- sqrt(mean((y_train - p_train)^2))
   sigma_hat <- max(sigma_hat, 1e-12)
   rmse <- sqrt(mean((y_test - p)^2))
   mae <- mean(abs(y_test - p))

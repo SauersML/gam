@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
   schedule:
     - cron: "0 4 * * *"
@@ -31,6 +34,30 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Preflight scenario schemas
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import importlib.util
+          from pathlib import Path
+
+          mod_path = Path("bench/run_suite.py").resolve()
+          spec = importlib.util.spec_from_file_location("run_suite_mod", mod_path)
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          cfg = json.loads(Path("bench/scenarios.json").read_text())
+          scenarios = cfg.get("scenarios", [])
+          if not scenarios:
+              raise SystemExit("No benchmark scenarios found in bench/scenarios.json")
+
+          for s in scenarios:
+              mod.dataset_for_scenario(s)
+          print(f"validated {len(scenarios)} scenario dataset schemas")
+          PY
 
       - name: Build scenario matrix
         id: matrix

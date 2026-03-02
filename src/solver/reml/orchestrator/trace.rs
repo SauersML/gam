@@ -1,7 +1,11 @@
 use super::*;
 
 impl<'a> RemlState<'a> {
-    pub(super) fn dense_projected_exact_eligible(n_obs: usize, eff_rank: usize, k_count: usize) -> bool {
+    pub(super) fn dense_projected_exact_eligible(
+        n_obs: usize,
+        eff_rank: usize,
+        k_count: usize,
+    ) -> bool {
         if eff_rank == 0 || eff_rank > 1024 {
             return false;
         }
@@ -183,5 +187,4 @@ impl<'a> RemlState<'a> {
             q.slice(ndarray::s![.., 0..kept]).to_owned()
         }
     }
-
 }
