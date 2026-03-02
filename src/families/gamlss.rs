@@ -163,13 +163,18 @@ pub fn initialize_wiggle_knots_from_seed(
     degree: usize,
     num_internal_knots: usize,
 ) -> Result<Array1<f64>, String> {
-    let seed_min = seed.iter().copied().fold(f64::INFINITY, f64::min);
+    const MIN_WIGGLE_SEED_SPAN: f64 = 1e-8;
+    const DEFAULT_WIGGLE_HALF_RANGE: f64 = 3.0;
+
+    let mut seed_min = seed.iter().copied().fold(f64::INFINITY, f64::min);
     let mut seed_max = seed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if !seed_min.is_finite() || !seed_max.is_finite() {
         return Err("non-finite seed for wiggle knot initialization".to_string());
     }
-    if (seed_max - seed_min).abs() < 1e-12 {
-        seed_max = seed_min + 1e-6;
+    if (seed_max - seed_min).abs() < MIN_WIGGLE_SEED_SPAN {
+        let center = 0.5 * (seed_min + seed_max);
+        seed_min = center - DEFAULT_WIGGLE_HALF_RANGE;
+        seed_max = center + DEFAULT_WIGGLE_HALF_RANGE;
     }
     let (_, knots) = create_basis::<Dense>(
         seed,
@@ -270,7 +275,16 @@ fn evaluate_single_block_glm(
     let mut z = Array1::<f64>::zeros(n);
     let mut w = Array1::<f64>::zeros(n);
     family
-        .irls_update(y.view(), eta, weights.view(), &mut mu, &mut w, &mut z, None)
+        .irls_update(
+            y.view(),
+            eta,
+            weights.view(),
+            &mut mu,
+            &mut w,
+            &mut z,
+            None,
+            None,
+        )
         .map_err(|e| e.to_string())?;
     let ll = family
         .log_likelihood(y.view(), eta, &mu, weights.view())
@@ -990,25 +1004,31 @@ pub fn fit_binomial_location_scale_probit_wiggle(
         wiggle_block,
     } = spec;
 
-    match try_binomial_alpha_beta_warm_start(
-        &y,
-        &weights,
-        sigma_min,
-        sigma_max,
-        &threshold_block,
-        &log_sigma_block,
-        options,
-    ) {
-        Ok((beta_t0, beta_ls0, beta_warm)) => {
-            threshold_block.initial_beta = Some(beta_t0);
-            log_sigma_block.initial_beta = Some(beta_ls0);
-            emit_binomial_alpha_beta_warnings("warm-start-wiggle", &beta_warm, &y, &weights);
-        }
-        Err(err) => {
-            log::warn!(
-                "[GAMLSS][fit_binomial_location_scale_probit_wiggle] alpha/beta warm start failed, falling back to direct initialization: {}",
-                err
-            );
+    if threshold_block.initial_beta.is_none() || log_sigma_block.initial_beta.is_none() {
+        match try_binomial_alpha_beta_warm_start(
+            &y,
+            &weights,
+            sigma_min,
+            sigma_max,
+            &threshold_block,
+            &log_sigma_block,
+            options,
+        ) {
+            Ok((beta_t0, beta_ls0, beta_warm)) => {
+                if threshold_block.initial_beta.is_none() {
+                    threshold_block.initial_beta = Some(beta_t0);
+                }
+                if log_sigma_block.initial_beta.is_none() {
+                    log_sigma_block.initial_beta = Some(beta_ls0);
+                }
+                emit_binomial_alpha_beta_warnings("warm-start-wiggle", &beta_warm, &y, &weights);
+            }
+            Err(err) => {
+                log::warn!(
+                    "[GAMLSS][fit_binomial_location_scale_probit_wiggle] alpha/beta warm start failed, falling back to direct initialization: {}",
+                    err
+                );
+            }
         }
     }
 
@@ -4280,6 +4300,24 @@ mod tests {
             c1.abs() < 1e-9,
             "linear mode leaked through wiggle constraint: {}",
             c1
+        );
+    }
+
+    #[test]
+    fn degenerate_wiggle_seed_uses_broad_fallback_domain() {
+        let q_seed = Array1::zeros(9);
+        let degree = 3usize;
+        let knots = initialize_wiggle_knots_from_seed(q_seed.view(), degree, 5)
+            .expect("initialize degenerate wiggle knots");
+        let domain_min = knots[degree];
+        let domain_max = knots[knots.len() - degree - 1];
+        assert!(
+            domain_min <= -2.9,
+            "unexpected left fallback boundary: {domain_min}"
+        );
+        assert!(
+            domain_max >= 2.9,
+            "unexpected right fallback boundary: {domain_max}"
         );
     }
 

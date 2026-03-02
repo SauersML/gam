@@ -549,6 +549,7 @@ impl WorkingModelSurvival {
             eta: LinearPredictor::new(eta_exit),
             gradient: total_grad,
             hessian: h,
+            sparse_hessian: None,
             deviance,
             penalty_term: penalty_dev + ridge_penalty,
             firth_log_det: None,

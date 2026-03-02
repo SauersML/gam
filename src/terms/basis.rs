@@ -95,6 +95,16 @@ pub enum BasisError {
     #[error("Dimension mismatch: {0}")]
     DimensionMismatch(String),
 
+    #[error(
+        "Indefinite penalty matrix in {context}: minimum eigenvalue {min_eigenvalue:.3e} is below tolerance {tolerance:.3e}. {guidance}"
+    )]
+    IndefinitePenalty {
+        context: String,
+        min_eigenvalue: f64,
+        tolerance: f64,
+        guidance: String,
+    },
+
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 }
@@ -1814,7 +1824,7 @@ impl Default for MaternIdentifiability {
     }
 }
 
-/// Duchon null-space order. `0` matches fully-penalized Matérn-like behavior,
+/// Duchon null-space order. `0` removes the explicit polynomial block,
 /// `1` keeps `[1, x_1, ..., x_d]` unpenalized by the primary curvature penalty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DuchonNullspaceOrder {
@@ -1822,13 +1832,16 @@ pub enum DuchonNullspaceOrder {
     Linear,
 }
 
-/// Duchon-like basis configuration using a Matérn high-frequency backbone and
-/// explicit low-frequency null-space control.
+/// Duchon-like basis configuration with explicit low-frequency null-space
+/// control and explicit spectral power.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuchonBasisSpec {
     pub center_strategy: CenterStrategy,
     pub length_scale: f64,
-    pub nu: MaternNu,
+    /// Integer spectral power `s` in
+    ///   P(w) = ||w||^(2p) * (kappa^2 + ||w||^2)^s
+    /// where `p` is determined by `nullspace_order`.
+    pub power: usize,
     pub nullspace_order: DuchonNullspaceOrder,
     pub double_penalty: bool,
     #[serde(default)]
@@ -1856,7 +1869,7 @@ pub enum BasisMetadata {
     Duchon {
         centers: Array2<f64>,
         length_scale: f64,
-        nu: MaternNu,
+        power: usize,
         nullspace_order: DuchonNullspaceOrder,
         identifiability_transform: Option<Array2<f64>>,
     },
@@ -1874,7 +1887,49 @@ pub struct BasisBuildResult {
     pub design: Array2<f64>,
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
+    pub penalty_info: Vec<PenaltyInfo>,
     pub metadata: BasisMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PenaltySource {
+    Primary,
+    DoublePenaltyNullspace,
+    TensorMarginal { dim: usize },
+    TensorGlobalRidge,
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PenaltyDropReason {
+    ZeroMatrix,
+    NumericalRankZero,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PenaltyInfo {
+    pub source: PenaltySource,
+    pub original_index: usize,
+    pub active: bool,
+    pub effective_rank: usize,
+    pub dropped_reason: Option<PenaltyDropReason>,
+    pub nullspace_dim_hint: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PenaltyCandidate {
+    pub matrix: Array2<f64>,
+    pub nullspace_dim_hint: usize,
+    pub source: PenaltySource,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanonicalPenaltyBlock {
+    pub sym_penalty: Array2<f64>,
+    pub rank: usize,
+    pub nullity: usize,
+    pub tol: f64,
+    pub is_zero: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2212,32 +2267,52 @@ pub fn build_bspline_basis_1d(
         spec.penalty_order,
         greville_for_penalty.as_ref().map(|g| g.view()),
     )?;
-    let mut penalties_raw = vec![s_bend_raw.clone()];
+    let mut penalties_raw = vec![PenaltyCandidate {
+        matrix: s_bend_raw.clone(),
+        nullspace_dim_hint: 0,
+        source: PenaltySource::Primary,
+    }];
     if spec.double_penalty {
-        penalties_raw.push(nullspace_shrinkage_penalty(&s_bend_raw)?);
+        penalties_raw.push(PenaltyCandidate {
+            matrix: build_nullspace_shrinkage_penalty(&s_bend_raw)?
+                .map(|shrink| shrink.sym_penalty)
+                .unwrap_or_else(|| Array2::<f64>::zeros(s_bend_raw.raw_dim())),
+            nullspace_dim_hint: 0,
+            source: PenaltySource::DoublePenaltyNullspace,
+        });
     }
 
+    let penalties_raw_mats: Vec<Array2<f64>> = penalties_raw
+        .iter()
+        .map(|candidate| candidate.matrix.clone())
+        .collect();
     let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
         design_raw,
-        penalties_raw,
+        penalties_raw_mats,
         &knots,
         spec.degree,
         &spec.identifiability,
     )?;
-    let nullspace_dims = penalties
-        .iter()
-        .map(estimate_penalty_nullity)
+    let transformed_candidates = penalties
+        .into_iter()
+        .zip(penalties_raw.into_iter())
+        .map(
+            |(matrix, candidate)| -> Result<PenaltyCandidate, BasisError> {
+                Ok(PenaltyCandidate {
+                    nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                    matrix,
+                    source: candidate.source,
+                })
+            },
+        )
         .collect::<Result<Vec<_>, _>>()?;
-
-    if penalties.len() != nullspace_dims.len() {
-        return Err(BasisError::InvalidInput(
-            "penalty/nullspace dimension mismatch after identifiability transform".to_string(),
-        ));
-    }
+    let (penalties, nullspace_dims, penalty_info) =
+        filter_active_penalty_candidates(transformed_candidates)?;
     Ok(BasisBuildResult {
         design,
         penalties,
         nullspace_dims,
+        penalty_info,
         metadata: BasisMetadata::BSpline1D {
             knots,
             identifiability_transform,
@@ -2309,6 +2384,20 @@ pub(crate) fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, B
         return Ok(0);
     }
 
+    let (sym, evals, _) = spectral_summary(penalty)?;
+    let tol = spectral_tolerance(&sym, &evals);
+    Ok(evals.iter().filter(|&&ev| ev.abs() <= tol).count())
+}
+
+#[derive(Debug, Clone)]
+struct PsdSpectralSummary {
+    min_eigenvalue: f64,
+    max_abs_eigenvalue: f64,
+    tolerance: f64,
+    effective_rank: usize,
+}
+
+fn symmetrize_penalty(penalty: &Array2<f64>) -> Array2<f64> {
     let mut sym = penalty.clone();
     for i in 0..sym.nrows() {
         for j in 0..i {
@@ -2317,53 +2406,186 @@ pub(crate) fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, B
             sym[[j, i]] = v;
         }
     }
+    sym
+}
 
-    let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
-    let max_ev = evals
+fn spectral_tolerance(sym: &Array2<f64>, evals: &Array1<f64>) -> f64 {
+    let max_abs_ev = evals
         .iter()
         .copied()
         .fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    let tol = (sym.nrows().max(1) as f64) * 1e-10 * max_ev.max(1.0);
-    Ok(evals.iter().filter(|&&ev| ev.abs() <= tol).count())
+    (sym.nrows().max(1) as f64) * 1e-10 * max_abs_ev.max(1.0)
 }
 
-fn nullspace_shrinkage_penalty(penalty: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+fn spectral_summary(
+    penalty: &Array2<f64>,
+) -> Result<(Array2<f64>, Array1<f64>, Array2<f64>), BasisError> {
+    let sym = symmetrize_penalty(penalty);
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+    Ok((sym, evals, evecs))
+}
+
+fn validate_psd_penalty(
+    penalty: &Array2<f64>,
+    context: &str,
+    guidance: &str,
+) -> Result<PsdSpectralSummary, BasisError> {
+    if penalty.nrows() != penalty.ncols() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "{context}: penalty matrix must be square for PSD validation"
+        )));
+    }
+    if penalty.nrows() == 0 {
+        return Ok(PsdSpectralSummary {
+            min_eigenvalue: 0.0,
+            max_abs_eigenvalue: 0.0,
+            tolerance: 1e-10,
+            effective_rank: 0,
+        });
+    }
+
+    let (sym, evals, _) = spectral_summary(penalty)?;
+    let tolerance = spectral_tolerance(&sym, &evals);
+    let min_eigenvalue = evals.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_abs_eigenvalue = evals
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let effective_rank = evals.iter().filter(|&&ev| ev > tolerance).count();
+
+    if min_eigenvalue < -tolerance {
+        return Err(BasisError::IndefinitePenalty {
+            context: context.to_string(),
+            min_eigenvalue,
+            tolerance,
+            guidance: guidance.to_string(),
+        });
+    }
+
+    Ok(PsdSpectralSummary {
+        min_eigenvalue,
+        max_abs_eigenvalue,
+        tolerance,
+        effective_rank,
+    })
+}
+
+pub fn analyze_penalty_block(penalty: &Array2<f64>) -> Result<CanonicalPenaltyBlock, BasisError> {
+    if penalty.nrows() != penalty.ncols() {
+        return Err(BasisError::DimensionMismatch(
+            "penalty matrix must be square when analyzing penalty".to_string(),
+        ));
+    }
+    if penalty.nrows() == 0 {
+        return Ok(CanonicalPenaltyBlock {
+            sym_penalty: Array2::<f64>::zeros((0, 0)),
+            rank: 0,
+            nullity: 0,
+            tol: 1e-10,
+            is_zero: true,
+        });
+    }
+
+    let (sym, evals, _) = spectral_summary(penalty)?;
+    let tol = spectral_tolerance(&sym, &evals);
+    let rank = evals.iter().filter(|&&ev| ev > tol).count();
+    let nullity = sym.nrows().saturating_sub(rank);
+    let max_abs_eigenvalue = evals
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    Ok(CanonicalPenaltyBlock {
+        sym_penalty: sym,
+        rank,
+        nullity,
+        tol,
+        is_zero: max_abs_eigenvalue <= tol,
+    })
+}
+
+pub fn filter_active_penalty_candidates(
+    candidates: Vec<PenaltyCandidate>,
+) -> Result<(Vec<Array2<f64>>, Vec<usize>, Vec<PenaltyInfo>), BasisError> {
+    let mut penalties = Vec::with_capacity(candidates.len());
+    let mut nullspace_dims = Vec::with_capacity(candidates.len());
+    let mut penalty_info = Vec::with_capacity(candidates.len());
+
+    for (original_index, candidate) in candidates.into_iter().enumerate() {
+        let analysis = analyze_penalty_block(&candidate.matrix)?;
+        let dropped_reason = if analysis.rank == 0 {
+            Some(if analysis.is_zero {
+                PenaltyDropReason::ZeroMatrix
+            } else {
+                PenaltyDropReason::NumericalRankZero
+            })
+        } else {
+            None
+        };
+        let active = dropped_reason.is_none();
+        if active {
+            log::debug!(
+                "Retained penalty block source={:?} original_index={} rank={} nullspace_dim_hint={}",
+                candidate.source,
+                original_index,
+                analysis.rank,
+                candidate.nullspace_dim_hint
+            );
+            penalties.push(analysis.sym_penalty);
+            nullspace_dims.push(analysis.nullity);
+        } else {
+            log::debug!(
+                "Dropped inactive penalty block source={:?} original_index={} reason={:?}",
+                candidate.source,
+                original_index,
+                dropped_reason
+            );
+        }
+        penalty_info.push(PenaltyInfo {
+            source: candidate.source,
+            original_index,
+            active,
+            effective_rank: analysis.rank,
+            dropped_reason,
+            nullspace_dim_hint: candidate.nullspace_dim_hint,
+        });
+    }
+
+    Ok((penalties, nullspace_dims, penalty_info))
+}
+
+/// Build the double-penalty ridge from the structural null space of a PSD penalty.
+fn build_nullspace_shrinkage_penalty(
+    penalty: &Array2<f64>,
+) -> Result<Option<CanonicalPenaltyBlock>, BasisError> {
     if penalty.nrows() != penalty.ncols() {
         return Err(BasisError::DimensionMismatch(
             "penalty matrix must be square when building nullspace shrinkage penalty".to_string(),
         ));
     }
     if penalty.nrows() == 0 {
-        return Ok(Array2::<f64>::zeros((0, 0)));
+        return Ok(None);
     }
 
-    let mut sym = penalty.clone();
-    for i in 0..sym.nrows() {
-        for j in 0..i {
-            let v = 0.5 * (sym[[i, j]] + sym[[j, i]]);
-            sym[[i, j]] = v;
-            sym[[j, i]] = v;
-        }
-    }
-
-    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
-    let max_ev = evals
-        .iter()
-        .copied()
-        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    let tol = (sym.nrows().max(1) as f64) * 1e-10 * max_ev.max(1.0);
+    let (sym, evals, evecs) = spectral_summary(penalty)?;
+    let tol = spectral_tolerance(&sym, &evals);
 
     let zero_idx: Vec<usize> = evals
         .iter()
         .enumerate()
         .filter_map(|(i, &ev)| (ev.abs() <= tol).then_some(i))
         .collect();
-    let mut shrink = Array2::<f64>::zeros((sym.nrows(), sym.ncols()));
-    if !zero_idx.is_empty() {
-        let z = evecs.select(Axis(1), &zero_idx);
-        shrink += &fast_ab(&z, &z.t().to_owned());
+    if zero_idx.is_empty() {
+        return Ok(None);
     }
-    Ok(shrink)
+    let z = evecs.select(Axis(1), &zero_idx);
+    let shrink = fast_ab(&z, &z.t().to_owned());
+    Ok(Some(CanonicalPenaltyBlock {
+        sym_penalty: shrink,
+        rank: zero_idx.len(),
+        nullity: 0,
+        tol,
+        is_zero: false,
+    }))
 }
 
 fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {
@@ -2406,16 +2628,24 @@ pub fn build_thin_plate_basis(
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let tps = create_thin_plate_spline_basis(data, centers.view())?;
-    let mut penalties = vec![tps.penalty_bending.clone()];
-    let mut nullspace_dims = vec![tps.num_polynomial_basis];
+    let mut candidates = vec![PenaltyCandidate {
+        matrix: tps.penalty_bending.clone(),
+        nullspace_dim_hint: tps.num_polynomial_basis,
+        source: PenaltySource::Primary,
+    }];
     if spec.double_penalty {
-        penalties.push(tps.penalty_ridge.clone());
-        nullspace_dims.push(0);
+        candidates.push(PenaltyCandidate {
+            matrix: tps.penalty_ridge.clone(),
+            nullspace_dim_hint: 0,
+            source: PenaltySource::DoublePenaltyNullspace,
+        });
     }
+    let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design: tps.basis,
         penalties,
         nullspace_dims,
+        penalty_info,
         metadata: BasisMetadata::ThinPlate {
             centers,
             identifiability_transform: None,
@@ -2526,7 +2756,7 @@ fn bessel_i0_manual(x: f64) -> f64 {
     //  - otherwise : asymptotic exp(|x|)/sqrt(|x|) times polynomial in y=3.75/|x|
     //
     // This avoids external dependencies and is numerically stable for the
-    // argument ranges used by Duchon-Matern K0/K1 evaluation.
+    // argument ranges used by Duchon K0/K1 evaluation.
     let ax = x.abs();
     if ax < 3.75 {
         let y = (x / 3.75) * (x / 3.75);
@@ -2633,20 +2863,6 @@ fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usize {
     match order {
         DuchonNullspaceOrder::Zero => 0,
         DuchonNullspaceOrder::Linear => 1,
-    }
-}
-
-#[inline(always)]
-fn duchon_s_from_nu(nu: MaternNu) -> usize {
-    // Map half-integer nu values to integer s in the spectral factor
-    // (kappa^2 + |w|^2)^s. This preserves a compact API while enabling the
-    // general integer (p,s,k) construction.
-    match nu {
-        MaternNu::Half => 1,
-        MaternNu::ThreeHalves => 2,
-        MaternNu::FiveHalves => 3,
-        MaternNu::SevenHalves => 4,
-        MaternNu::NineHalves => 5,
     }
 }
 
@@ -2809,6 +3025,14 @@ fn duchon_partial_fraction_coeffs(
     // 1/(ρ^{2p}(κ²+ρ²)^s) = Σ a_m/ρ^{2m} + Σ b_n/(κ²+ρ²)^n
     let mut a = vec![0.0_f64; p_order + 1]; // 1-based m
     let mut b = vec![0.0_f64; s_order + 1]; // 1-based n
+    if s_order == 0 {
+        if p_order > 0 {
+            // Pure intrinsic polyharmonic case: no Matérn tail remains, so the
+            // spectrum is exactly 1 / ρ^(2p).
+            a[p_order] = 1.0;
+        }
+        return DuchonPartialFractionCoeffs { a, b };
+    }
     for m in 1..=p_order {
         let sign = if (p_order - m) % 2 == 0 { 1.0 } else { -1.0 };
         let expo = -2.0 * (s_order + p_order - m) as f64;
@@ -2840,12 +3064,12 @@ fn duchon_matern_kernel_general_from_distance(
 ) -> Result<f64, BasisError> {
     if !r.is_finite() || r < 0.0 {
         return Err(BasisError::InvalidInput(
-            "Duchon-Matern kernel distance must be finite and non-negative".to_string(),
+            "Duchon kernel distance must be finite and non-negative".to_string(),
         ));
     }
     if !length_scale.is_finite() || length_scale <= 0.0 {
         return Err(BasisError::InvalidInput(
-            "Duchon-Matern length_scale must be finite and positive".to_string(),
+            "Duchon length_scale must be finite and positive".to_string(),
         ));
     }
     let kappa = 1.0 / length_scale;
@@ -3026,12 +3250,12 @@ fn duchon_matern_kernel_p1_s4_k10_from_distance(
 ) -> Result<f64, BasisError> {
     if !r.is_finite() || r < 0.0 {
         return Err(BasisError::InvalidInput(
-            "Duchon-Matern kernel distance must be finite and non-negative".to_string(),
+            "Duchon kernel distance must be finite and non-negative".to_string(),
         ));
     }
     if !length_scale.is_finite() || length_scale <= 0.0 {
         return Err(BasisError::InvalidInput(
-            "Duchon-Matern length_scale must be finite and positive".to_string(),
+            "Duchon length_scale must be finite and positive".to_string(),
         ));
     }
     if r == 0.0 {
@@ -3420,7 +3644,9 @@ pub fn create_matern_spline_basis(
     penalty_kernel
         .slice_mut(s![0..k, 0..k])
         .assign(&center_kernel);
-    let penalty_ridge = nullspace_shrinkage_penalty(&penalty_kernel)?;
+    let penalty_ridge = build_nullspace_shrinkage_penalty(&penalty_kernel)?
+        .map(|block| block.sym_penalty)
+        .unwrap_or_else(|| Array2::<f64>::zeros((total_cols, total_cols)));
 
     Ok(MaternSplineBasis {
         basis,
@@ -3495,17 +3721,26 @@ pub fn build_matern_basis(
     } else {
         (m.basis, m.penalty_kernel, None)
     };
-    let penalty_ridge = nullspace_shrinkage_penalty(&penalty_kernel)?;
-    let mut penalties = vec![penalty_kernel.clone()];
-    let mut nullspace_dims = vec![if spec.include_intercept { 1 } else { 0 }];
+    let mut candidates = vec![PenaltyCandidate {
+        matrix: penalty_kernel.clone(),
+        nullspace_dim_hint: if spec.include_intercept { 1 } else { 0 },
+        source: PenaltySource::Primary,
+    }];
     if spec.double_penalty {
-        penalties.push(penalty_ridge.clone());
-        nullspace_dims.push(0);
+        candidates.push(PenaltyCandidate {
+            matrix: build_nullspace_shrinkage_penalty(&penalty_kernel)?
+                .map(|penalty_ridge| penalty_ridge.sym_penalty)
+                .unwrap_or_else(|| Array2::<f64>::zeros(penalty_kernel.raw_dim())),
+            nullspace_dim_hint: 0,
+            source: PenaltySource::DoublePenaltyNullspace,
+        });
     }
+    let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         penalties,
         nullspace_dims,
+        penalty_info,
         metadata: BasisMetadata::Matern {
             centers,
             length_scale: spec.length_scale,
@@ -3561,21 +3796,30 @@ pub fn build_matern_basis_log_kappa_derivative(
         });
     kernel_result?;
 
+    let mut center_kernel = Array2::<f64>::zeros((k, k));
     let mut center_kernel_derivative = Array2::<f64>::zeros((k, k));
     for i in 0..k {
         for j in i..k {
-            let kij = matern_kernel_log_kappa_derivative_from_distance(
+            let kij =
+                matern_kernel_from_distance(center_center_r[[i, j]], spec.length_scale, spec.nu)?;
+            let dkij = matern_kernel_log_kappa_derivative_from_distance(
                 center_center_r[[i, j]],
                 spec.length_scale,
                 spec.nu,
             )?;
-            center_kernel_derivative[[i, j]] = kij;
-            center_kernel_derivative[[j, i]] = kij;
+            center_kernel[[i, j]] = kij;
+            center_kernel[[j, i]] = kij;
+            center_kernel_derivative[[i, j]] = dkij;
+            center_kernel_derivative[[j, i]] = dkij;
         }
     }
 
-    let (design_derivative, penalty_kernel_derivative) = if let Some(z) = z_opt {
+    let (design_derivative, penalty_kernel, penalty_kernel_derivative) = if let Some(z) = z_opt {
         let kernel_constrained = fast_ab(&kernel_block_derivative, &z);
+        let omega = {
+            let zt_k = fast_atb(&z, &center_kernel);
+            fast_ab(&zt_k, &z)
+        };
         let omega_constrained = {
             let zt_k = fast_atb(&z, &center_kernel_derivative);
             fast_ab(&zt_k, &z)
@@ -3592,11 +3836,15 @@ pub fn build_matern_basis_log_kappa_derivative(
         }
         let total_cols = design.ncols();
         let mut penalty = Array2::<f64>::zeros((total_cols, total_cols));
+        let mut penalty_derivative = Array2::<f64>::zeros((total_cols, total_cols));
         let kernel_cols = omega_constrained.ncols();
         penalty
             .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&omega);
+        penalty_derivative
+            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
             .assign(&omega_constrained);
-        (design, penalty)
+        (design, penalty, penalty_derivative)
     } else {
         let mut design = kernel_block_derivative;
         if spec.include_intercept {
@@ -3610,14 +3858,16 @@ pub fn build_matern_basis_log_kappa_derivative(
         }
         let total_cols = design.ncols();
         let mut penalty = Array2::<f64>::zeros((total_cols, total_cols));
-        penalty
+        let mut penalty_derivative = Array2::<f64>::zeros((total_cols, total_cols));
+        penalty.slice_mut(s![0..k, 0..k]).assign(&center_kernel);
+        penalty_derivative
             .slice_mut(s![0..k, 0..k])
             .assign(&center_kernel_derivative);
-        (design, penalty)
+        (design, penalty, penalty_derivative)
     };
 
     let mut penalties_derivative = vec![penalty_kernel_derivative];
-    if spec.double_penalty {
+    if spec.double_penalty && build_nullspace_shrinkage_penalty(&penalty_kernel)?.is_some() {
         penalties_derivative.push(Array2::<f64>::zeros(penalties_derivative[0].raw_dim()));
     }
 
@@ -3639,12 +3889,7 @@ pub fn build_matern_basis_log_kappa_derivative(
 /// - `p` is determined by `nullspace_order`:
 ///   - `Zero`   -> p = 0
 ///   - `Linear` -> p = 1
-/// - `s` is determined by `nu`:
-///   - `Half`         -> s = 1
-///   - `ThreeHalves`  -> s = 2
-///   - `FiveHalves`   -> s = 3
-///   - `SevenHalves`  -> s = 4
-///   - `NineHalves`   -> s = 5
+/// - `s` is determined directly by `power`
 ///
 /// For the historical primary case `(p=1, s=4, k=10)` we retain the exact
 /// specialized branch (series + closed-form + asymptotic) for speed and
@@ -3653,7 +3898,7 @@ pub fn create_duchon_spline_basis(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
-    nu: MaternNu,
+    power: usize,
     nullspace_order: DuchonNullspaceOrder,
 ) -> Result<DuchonSplineBasis, BasisError> {
     let n = data.nrows();
@@ -3689,7 +3934,7 @@ pub fn create_duchon_spline_basis(
     let z = cached_kernel_constraint_nullspace(centers, nullspace_order)?;
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
-    let s_order = duchon_s_from_nu(nu);
+    let s_order = power;
     let coeffs = if p_order == 1 && s_order == 4 && d == 10 {
         None
     } else {
@@ -3724,7 +3969,7 @@ pub fn create_duchon_spline_basis(
         let kappa_hi = 1e2 / r_min;
         if kappa < kappa_lo || kappa > kappa_hi {
             log::warn!(
-                "Duchon-Matern κ={} is outside recommended range [{}, {}] derived from centers (r_min={}, r_max={}); numerical conditioning may degrade",
+                "Duchon κ={} is outside recommended range [{}, {}] derived from centers (r_min={}, r_max={}); numerical conditioning may degrade",
                 kappa,
                 kappa_lo,
                 kappa_hi,
@@ -3797,7 +4042,9 @@ pub fn create_duchon_spline_basis(
     penalty_kernel
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&omega_constrained);
-    let penalty_ridge = nullspace_shrinkage_penalty(&penalty_kernel)?;
+    let penalty_ridge = build_nullspace_shrinkage_penalty(&penalty_kernel)?
+        .map(|block| block.sym_penalty)
+        .unwrap_or_else(|| Array2::<f64>::zeros((total_cols, total_cols)));
 
     Ok(DuchonSplineBasis {
         basis,
@@ -3820,23 +4067,31 @@ pub fn build_duchon_basis(
         data,
         centers.view(),
         spec.length_scale,
-        spec.nu,
+        spec.power,
         spec.nullspace_order,
     )?;
-    let mut penalties = vec![d.penalty_kernel.clone()];
-    let mut nullspace_dims = vec![d.num_polynomial_basis];
+    let mut candidates = vec![PenaltyCandidate {
+        matrix: d.penalty_kernel.clone(),
+        nullspace_dim_hint: d.num_polynomial_basis,
+        source: PenaltySource::Primary,
+    }];
     if spec.double_penalty {
-        penalties.push(d.penalty_ridge.clone());
-        nullspace_dims.push(0);
+        candidates.push(PenaltyCandidate {
+            matrix: d.penalty_ridge.clone(),
+            nullspace_dim_hint: 0,
+            source: PenaltySource::DoublePenaltyNullspace,
+        });
     }
+    let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design: d.basis,
         penalties,
         nullspace_dims,
+        penalty_info,
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
-            nu: spec.nu,
+            power: spec.power,
             nullspace_order: spec.nullspace_order,
             identifiability_transform: None,
         },
@@ -4004,12 +4259,16 @@ fn thin_plate_kernel_m2_from_dist2(dist2: f64, dimension: usize) -> Result<f64, 
         return Ok(0.0);
     }
     match dimension {
-        // m = 2 => 2m-d = 3 (odd): r^3 = (r^2) * r
+        // For the m=2 thin-plate spline, the radial kernel is the biharmonic
+        // fundamental solution modulo low-order polynomials:
+        //   d=1:  r^3
+        //   d=2:  r^2 log(r)
+        //   d=3: -r
+        // The d=3 sign is essential for conditional positive definiteness
+        // after projecting out the polynomial side constraints.
         1 => Ok(dist2 * dist2.sqrt()),
-        // m = 2 => 2m-d = 2 (even): r^2 log(r) = 0.5 * r^2 * log(r^2)
         2 => Ok(0.5 * dist2 * dist2.ln()),
-        // m = 2 => 2m-d = 1 (odd): r = sqrt(r^2)
-        3 => Ok(dist2.sqrt()),
+        3 => Ok(-dist2.sqrt()),
         _ => Err(BasisError::InvalidInput(format!(
             "thin-plate spline (m=2) currently supports dimensions 1..=3, got {dimension}"
         ))),
@@ -4107,6 +4366,14 @@ pub fn create_thin_plate_spline_basis(
         let zt_o = fast_atb(&z, &omega);
         fast_ab(&zt_o, &z)
     };
+    let omega_psd = validate_psd_penalty(
+        &omega_constrained,
+        &format!("thin_plate bending penalty (dimension={d})"),
+        "thin-plate kernel and side-constraint assembly must yield a PSD penalty on the constrained subspace",
+    )?;
+    debug_assert!(omega_psd.min_eigenvalue >= -omega_psd.tolerance);
+    debug_assert!(omega_psd.max_abs_eigenvalue.is_finite());
+    debug_assert!(omega_psd.effective_rank <= omega_constrained.nrows());
 
     let kernel_cols = kernel_constrained.ncols();
     let total_cols = kernel_cols + poly_cols;
@@ -4120,7 +4387,9 @@ pub fn create_thin_plate_spline_basis(
     penalty_bending
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&omega_constrained);
-    let penalty_ridge = nullspace_shrinkage_penalty(&penalty_bending)?;
+    let penalty_ridge = build_nullspace_shrinkage_penalty(&penalty_bending)?
+        .map(|block| block.sym_penalty)
+        .unwrap_or_else(|| Array2::<f64>::zeros((total_cols, total_cols)));
 
     Ok(ThinPlateSplineBasis {
         basis,
@@ -5679,6 +5948,25 @@ mod tests {
     }
 
     #[test]
+    fn test_thin_plate_kernel_m2_matches_dimension_specific_forms() {
+        let dist2 = 4.0;
+        assert_abs_diff_eq!(thin_plate_kernel_m2_from_dist2(dist2, 1).unwrap(), 8.0);
+        assert_abs_diff_eq!(
+            thin_plate_kernel_m2_from_dist2(dist2, 2).unwrap(),
+            0.5 * dist2 * dist2.ln(),
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(thin_plate_kernel_m2_from_dist2(dist2, 3).unwrap(), -2.0);
+        assert_abs_diff_eq!(thin_plate_kernel_m2_from_dist2(0.0, 3).unwrap(), 0.0);
+        match thin_plate_kernel_m2_from_dist2(dist2, 4) {
+            Err(BasisError::InvalidInput(msg)) => {
+                assert!(msg.contains("supports dimensions 1..=3"));
+            }
+            other => panic!("expected invalid dimension error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_thin_plate_basis_shapes_and_penalty_blocks() {
         let data = array![[0.0, 0.0], [0.5, 0.2], [1.0, 1.0]];
         let knots = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
@@ -5829,6 +6117,82 @@ mod tests {
             }
             other => panic!("Expected InvalidInput for unsupported TPS dimension, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_validate_psd_penalty_rejects_materially_indefinite_matrix() {
+        let bad = array![[1.0, 0.0], [0.0, -0.25]];
+        match validate_psd_penalty(
+            &bad,
+            "thin_plate bending penalty (dimension=3)",
+            "thin-plate kernel and side-constraint assembly must yield a PSD penalty on the constrained subspace",
+        ) {
+            Err(BasisError::IndefinitePenalty {
+                context,
+                min_eigenvalue,
+                tolerance,
+                guidance,
+            }) => {
+                assert!(context.contains("thin_plate"));
+                assert!(min_eigenvalue < -tolerance);
+                assert!(guidance.contains("PSD penalty"));
+            }
+            other => panic!("expected indefinite penalty error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_thin_plate_3d_bending_penalty_is_psd_with_positive_rank() {
+        let knots = array![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.2, 0.7, 0.4]
+        ];
+        let tps = create_thin_plate_spline_basis(knots.view(), knots.view()).unwrap();
+        assert_eq!(tps.dimension, 3);
+        assert!(tps.num_kernel_basis > 0);
+        assert!(tps.penalty_bending.iter().all(|v| v.is_finite()));
+
+        let kernel_penalty = tps
+            .penalty_bending
+            .slice(s![0..tps.num_kernel_basis, 0..tps.num_kernel_basis])
+            .to_owned();
+        let summary = validate_psd_penalty(
+            &kernel_penalty,
+            "thin_plate bending penalty (dimension=3)",
+            "thin-plate kernel and side-constraint assembly must yield a PSD penalty on the constrained subspace",
+        )
+        .unwrap();
+        assert!(summary.min_eigenvalue >= -summary.tolerance);
+        assert!(summary.max_abs_eigenvalue > 0.0);
+        assert!(summary.effective_rank > 0);
+    }
+
+    #[test]
+    fn test_thin_plate_3d_regression_configuration_stays_psd() {
+        let knots = array![
+            [0.12573022, -0.13210486, 0.64042265],
+            [0.10490012, -0.53566937, 0.36159505],
+            [1.30400005, 0.94708096, -0.70373524],
+            [-1.26542147, -0.62327446, 0.04132598],
+            [-2.32503077, -0.21879166, -1.24591095]
+        ];
+        let tps = create_thin_plate_spline_basis(knots.view(), knots.view()).unwrap();
+        let kernel_penalty = tps
+            .penalty_bending
+            .slice(s![0..tps.num_kernel_basis, 0..tps.num_kernel_basis])
+            .to_owned();
+        let summary = validate_psd_penalty(
+            &kernel_penalty,
+            "thin_plate bending penalty (dimension=3)",
+            "thin-plate kernel and side-constraint assembly must yield a PSD penalty on the constrained subspace",
+        )
+        .unwrap();
+        assert!(summary.min_eigenvalue >= -summary.tolerance);
+        assert!(summary.effective_rank > 0);
     }
 
     #[test]
@@ -7350,10 +7714,10 @@ mod tests {
             data.view(),
             centers.view(),
             1.0,
-            MaternNu::Half,
+            4,
             DuchonNullspaceOrder::Linear,
         )
-        .expect("primary Duchon-Matern case should build");
+        .expect("primary Duchon case should build");
         assert_eq!(out.dimension, d);
         assert_eq!(out.basis.nrows(), n);
         assert_eq!(out.penalty_kernel.nrows(), out.penalty_kernel.ncols());
@@ -7367,7 +7731,7 @@ mod tests {
             data.view(),
             centers.view(),
             1.0,
-            MaternNu::Half,
+            1,
             DuchonNullspaceOrder::Linear,
         )
         .expect("general integer (p,s,k) Duchon kernel should build");
@@ -7457,7 +7821,7 @@ mod tests {
             data.view(),
             centers.view(),
             0.9,
-            MaternNu::NineHalves,         // s=5
+            5,
             DuchonNullspaceOrder::Linear, // p=1
         )
         .expect("general Duchon basis should build");
@@ -7520,6 +7884,53 @@ mod tests {
         // (k-1) constrained kernel cols + explicit intercept.
         assert_eq!(out.design.ncols(), centers.nrows());
         assert_eq!(out.nullspace_dims, vec![1]);
+    }
+
+    #[test]
+    fn test_matern_double_penalty_drops_inactive_nullspace_block_without_intercept() {
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.7]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let spec = MaternBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: 1.1,
+            nu: MaternNu::ThreeHalves,
+            include_intercept: false,
+            double_penalty: true,
+            identifiability: MaternIdentifiability::CenterSumToZero,
+        };
+        let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
+        assert_eq!(out.penalties.len(), 1);
+        assert_eq!(out.nullspace_dims, vec![0]);
+        assert_eq!(out.penalty_info.len(), 2);
+        assert!(out.penalty_info[0].active);
+        assert!(!out.penalty_info[1].active);
+        assert_eq!(
+            out.penalty_info[1].dropped_reason,
+            Some(PenaltyDropReason::ZeroMatrix)
+        );
+    }
+
+    #[test]
+    fn test_matern_double_penalty_keeps_intercept_shrinkage_block() {
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.7]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let spec = MaternBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: 1.1,
+            nu: MaternNu::ThreeHalves,
+            include_intercept: true,
+            double_penalty: true,
+            identifiability: MaternIdentifiability::CenterSumToZero,
+        };
+        let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
+        assert_eq!(out.penalties.len(), 2);
+        // Intercept is kept as the model nullspace and the double-penalty block
+        // retains its active shrinkage rank under current Matérn basis handling.
+        assert_eq!(out.nullspace_dims[0], 1);
+        assert!(out.nullspace_dims[1] > 0);
+        assert_eq!(out.penalty_info.len(), 2);
+        assert!(out.penalty_info.iter().all(|info| info.active));
+        assert_eq!(out.penalty_info[1].effective_rank, 1);
     }
 
     #[test]
@@ -7586,11 +7997,57 @@ mod tests {
             data.view(),
             centers.view(),
             1.2,
-            MaternNu::SevenHalves,      // s=4
+            4,
             DuchonNullspaceOrder::Zero, // p=0
         )
         .expect("p=0 Duchon case should build");
         assert_eq!(out.num_polynomial_basis, 0);
+        assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_duchon_general_p1_s0_case_builds() {
+        let data = array![
+            [0.0, 0.1, 0.2],
+            [0.2, 0.0, 0.1],
+            [0.4, 0.2, 0.3],
+            [0.6, 0.4, 0.5],
+            [0.8, 0.5, 0.7]
+        ];
+        let centers = data.slice(s![0..4, ..]).to_owned();
+        let out = create_duchon_spline_basis(
+            data.view(),
+            centers.view(),
+            1.0,
+            0,
+            DuchonNullspaceOrder::Linear,
+        )
+        .expect("p=1, s=0 Duchon case should build");
+        assert_eq!(out.num_polynomial_basis, data.ncols() + 1);
+        assert!(out.basis.iter().all(|v| v.is_finite()));
+        assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_duchon_general_p0_s0_case_builds() {
+        let data = array![
+            [0.0, 0.1, 0.2],
+            [0.2, 0.0, 0.1],
+            [0.4, 0.2, 0.3],
+            [0.6, 0.4, 0.5],
+            [0.8, 0.5, 0.7]
+        ];
+        let centers = data.slice(s![0..4, ..]).to_owned();
+        let out = create_duchon_spline_basis(
+            data.view(),
+            centers.view(),
+            1.0,
+            0,
+            DuchonNullspaceOrder::Zero,
+        )
+        .expect("p=0, s=0 Duchon case should build");
+        assert_eq!(out.num_polynomial_basis, 0);
+        assert!(out.basis.iter().all(|v| v.is_finite()));
         assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
     }
 }

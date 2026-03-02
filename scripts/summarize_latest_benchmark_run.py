@@ -128,14 +128,22 @@ def scenario_metric_spec(family: str) -> list[tuple[str, str, bool]]:
     fam = str(family or "").lower()
     if fam == "binomial":
         return [
-            ("AUC (↑ better)", "auc", True),
-            ("Brier (↓ better)", "brier", False),
             ("LogLoss (↓ better)", "logloss", False),
+            ("Brier (↓ better)", "brier", False),
+            ("NagelkerkeR2 (↑ better)", "nagelkerke_r2", True),
+            ("AUC (↑ better)", "auc", True),
         ]
     if fam == "survival":
-        return [("C-index (↑ better)", "auc", True)]
+        return [
+            ("LogLoss (↓ better)", "logloss", False),
+            ("Brier (↓ better)", "brier", False),
+            ("NagelkerkeR2 (↑ better)", "nagelkerke_r2", True),
+            ("C-index (↑ better)", "auc", True),
+        ]
     if fam == "gaussian":
         return [
+            ("MSE (↓ better)", "mse", False),
+            ("LogLoss (↓ better)", "logloss", False),
             ("RMSE (↓ better)", "rmse", False),
             ("MAE (↓ better)", "mae", False),
             ("R2 (↑ better)", "r2", True),

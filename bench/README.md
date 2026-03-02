@@ -5,8 +5,14 @@ This folder is the engine-level benchmark harness for `gam`.
 It measures:
 - Fit time
 - Predict time
-- AUC / Brier (binomial tasks)
-- RMSE / R² (gaussian tasks)
+- Proper scoring rules first:
+  - Binomial: LogLoss, Brier, Nagelkerke R²
+  - Survival: held-out partial LogLoss, partial Brier, partial-likelihood Nagelkerke R²
+  - Gaussian: MSE, Gaussian LogLoss
+- Secondary diagnostics:
+  - Binomial: AUC
+  - Survival: C-index
+  - Gaussian: RMSE / R²
 - EDF (from fitted engine result)
 
 ## What it runs

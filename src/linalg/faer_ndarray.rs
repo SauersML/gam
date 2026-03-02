@@ -859,11 +859,23 @@ impl FaerCholeskyFactor {
         rhs
     }
 
-    pub fn solve_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        let mut rhs = rhs.to_owned();
-        let mut rhs_view = array2_to_mat_mut(&mut rhs);
+    pub fn solve_mat_into<S: Data<Elem = f64>>(
+        &self,
+        rhs: &ArrayBase<S, Ix2>,
+        out: &mut Array2<f64>,
+    ) {
+        if out.dim() != rhs.dim() {
+            *out = Array2::<f64>::zeros(rhs.dim());
+        }
+        out.assign(rhs);
+        let mut rhs_view = array2_to_mat_mut(out);
         self.factor.solve_in_place(rhs_view.as_mut());
-        rhs
+    }
+
+    pub fn solve_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros(rhs.dim());
+        self.solve_mat_into(rhs, &mut out);
+        out
     }
 
     pub fn diag(&self) -> Array1<f64> {

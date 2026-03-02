@@ -87,6 +87,9 @@ def main():
             f"{r.get('status','-')} | "
             f"{fmt(metric)} | "
             f"{fmt(r.get('brier'))} | "
+            f"{fmt(r.get('logloss'))} | "
+            f"{fmt(r.get('nagelkerke_r2'))} | "
+            f"{fmt(r.get('mse'))} | "
             f"{fmt(r.get('rmse'))} | "
             f"{fmt(r.get('r2'))}"
         )

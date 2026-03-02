@@ -63,7 +63,7 @@ pub fn dense_to_sparse(
     })
 }
 
-fn sparse_to_dense_symmetric_upper(matrix: &SparseColMat<usize, f64>) -> Array2<f64> {
+pub fn sparse_to_dense_symmetric_upper_public(matrix: &SparseColMat<usize, f64>) -> Array2<f64> {
     let mut dense = Array2::<f64>::zeros((matrix.nrows(), matrix.ncols()));
     let (symbolic, values) = matrix.parts();
     let col_ptr = symbolic.col_ptr();
@@ -100,6 +100,28 @@ fn sparse_matvec(matrix: &SparseColMat<usize, f64>, vector: &Array1<f64>) -> Arr
     out
 }
 
+pub fn sparse_symmetric_upper_matvec_public(
+    matrix: &SparseColMat<usize, f64>,
+    vector: &Array1<f64>,
+) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(matrix.nrows());
+    let (symbolic, values) = matrix.parts();
+    let col_ptr = symbolic.col_ptr();
+    let row_idx = symbolic.row_idx();
+    for col in 0..matrix.ncols() {
+        let x_col = vector[col];
+        for idx in col_ptr[col]..col_ptr[col + 1] {
+            let row = row_idx[idx];
+            let value = values[idx];
+            out[row] += value * x_col;
+            if row != col {
+                out[col] += value * vector[row];
+            }
+        }
+    }
+    out
+}
+
 fn sparse_row_quadratic_form(
     factor: &SparseExactFactor,
     workspace: &mut SparseTraceWorkspace,
@@ -129,7 +151,7 @@ pub fn factorize_sparse_spd(
             condition_number: f64::INFINITY,
         }
     })?;
-    let dense = sparse_to_dense_symmetric_upper(h);
+    let dense = sparse_to_dense_symmetric_upper_public(h);
     let chol =
         dense
             .cholesky(Side::Lower)
