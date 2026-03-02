@@ -39,3 +39,10 @@ bench/plots/
 
 # local scratch / profiling outputs
 tmp/
+
+# Lean/Lake build artifacts
+.lake/
+*.olean
+*.olean.trace
+*.ilean
+*.c
