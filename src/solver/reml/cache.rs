@@ -11,7 +11,11 @@ pub(super) fn sanitized_rho_key(rho: &Array1<f64>) -> Option<Vec<u64>> {
         if v.is_nan() {
             return None;
         }
-        key.push(if v == 0.0 { 0.0f64.to_bits() } else { v.to_bits() });
+        key.push(if v == 0.0 {
+            0.0f64.to_bits()
+        } else {
+            v.to_bits()
+        });
     }
     Some(key)
 }
