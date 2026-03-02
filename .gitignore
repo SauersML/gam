@@ -39,6 +39,7 @@ bench/plots/
 
 # local scratch / profiling outputs
 tmp/
+diff.txt
 
 # Lean/Lake build artifacts
 .lake/
