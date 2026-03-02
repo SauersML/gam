@@ -127,10 +127,6 @@ theorem bspline_nonneg (t : ℕ → ℝ) (h_sorted : ∀ i j, i ≤ j → t i �
             exact lt_of_le_of_ne (sub_nonneg.mpr h_le) (ne_comm.mp h_denom)
           exact mul_nonneg (div_nonneg h_num_nn (le_of_lt h_denom_pos)) (ih (i + 1))
 
-/-- **Partition of Unity**: B-spline basis functions sum to 1 within the valid domain.
-    This is critical for the B-splines in basis.rs to produce valid probability adjustments.
-    For n basis functions of degree p with knot vector t, when t[p] ≤ x < t[n], we have
-
 end BSplineFoundations
 
 end Gam.Terms.Basis

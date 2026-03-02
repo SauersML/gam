@@ -1,10 +1,4 @@
-import Mathlib.Tactic
-import Mathlib.Data.Matrix.Basic
-import Mathlib.LinearAlgebra.Matrix.ToLin
-import Mathlib.LinearAlgebra.Matrix.Determinant.Basic
-import Mathlib.Analysis.Calculus.Deriv.Basic
-import Mathlib.Analysis.Calculus.Deriv.Mul
-import Mathlib.Analysis.Calculus.Deriv.Comp
+import Mathlib
 
 namespace Gam.Solver.Reml
 

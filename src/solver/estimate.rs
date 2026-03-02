@@ -567,36 +567,25 @@ fn compute_smoothing_correction(
     }
 
     // Step 2: Build V_rho by inverting the LAML Hessian in rho-space.
-    // Prefer the exact analytic Hessian; fallback to finite differences.
+    // Prefer exact Hessian; if unavailable, use deterministic analytic fallback
+    // from the same objective surface (no runtime FD Hessian path).
     let mut hessian_rho = match reml_state.compute_laml_hessian_consistent(final_rho) {
         Ok(h) => h,
         Err(err) => {
             log::warn!(
-                "LAML Hessian unavailable ({}); falling back to FD Hessian for smoothing correction.",
+                "LAML Hessian unavailable ({}); using analytic fallback Hessian for smoothing correction.",
                 err
             );
-            let h_step = 1e-4;
-            let mut hessian_fd = Array2::<f64>::zeros((n_rho, n_rho));
-            for k in 0..n_rho {
-                let mut rho_plus = final_rho.clone();
-                rho_plus[k] += h_step;
-                let mut rho_minus = final_rho.clone();
-                rho_minus[k] -= h_step;
-
-                let grad_plus = match reml_state.compute_gradient(&rho_plus) {
-                    Ok(g) => g,
-                    Err(_) => continue,
-                };
-                let grad_minus = match reml_state.compute_gradient(&rho_minus) {
-                    Ok(g) => g,
-                    Err(_) => continue,
-                };
-
-                for j in 0..n_rho {
-                    hessian_fd[[k, j]] = (grad_plus[j] - grad_minus[j]) / (2.0 * h_step);
+            match reml_state.compute_laml_hessian_analytic_fallback_standalone(final_rho) {
+                Ok(h) => h,
+                Err(fallback_err) => {
+                    log::warn!(
+                        "Analytic fallback Hessian unavailable ({}); skipping smoothing correction.",
+                        fallback_err
+                    );
+                    return None;
                 }
             }
-            hessian_fd
         }
     };
 

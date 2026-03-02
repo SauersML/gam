@@ -1,7 +1,4 @@
-import Mathlib.Tactic
-import Mathlib.Data.Matrix.Basic
-import Mathlib.LinearAlgebra.Matrix.Basic
-import Mathlib.LinearAlgebra.Matrix.ToLin
+import Mathlib
 
 namespace Gam.Solver.Estimate
 

@@ -1,8 +1,4 @@
-import Mathlib.Tactic
-import Mathlib.Data.Matrix.Basic
-import Mathlib.LinearAlgebra.Matrix.Basic
-import Mathlib.LinearAlgebra.Matrix.NonsingularInverse
-import Mathlib.LinearAlgebra.Matrix.ToLin
+import Mathlib
 
 namespace Gam.Linalg.Matrix
 
