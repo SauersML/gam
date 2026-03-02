@@ -307,7 +307,6 @@ impl ParametricColumnConditioning {
     fn backtransform_external_result(
         &self,
         mut result: ExternalOptimResult,
-        keep_internal_pirls: bool,
     ) -> ExternalOptimResult {
         if !self.is_active() {
             return result;
@@ -333,9 +332,7 @@ impl ParametricColumnConditioning {
             .map(|cov| self.backtransform_covariance(&cov));
         result.reparam_qs = None;
         result.constraint_kkt = None;
-        if !keep_internal_pirls {
-            result.artifacts = FitArtifacts { pirls: None };
-        }
+        result.artifacts = FitArtifacts { pirls: None };
         result
     }
 }
@@ -1242,7 +1239,7 @@ where
         beta_standard_errors_corrected,
         reml_score: outer_result.final_value,
     };
-    Ok(conditioning.backtransform_external_result(result, true))
+    Ok(conditioning.backtransform_external_result(result))
 }
 
 #[allow(dead_code)]

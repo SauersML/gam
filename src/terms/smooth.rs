@@ -356,12 +356,6 @@ impl LinearFitConditioning {
         }
     }
 
-    fn is_active(&self) -> bool {
-        self.columns
-            .iter()
-            .any(|col| col.mean != 0.0 || (col.scale - 1.0).abs() > 1e-12)
-    }
-
     fn apply_to_design(&self, design: &Array2<f64>) -> Array2<f64> {
         let mut out = design.clone();
         for col in &self.columns {
@@ -446,21 +440,6 @@ impl LinearFitConditioning {
             .collect()
     }
 
-    fn transform_constraint_matrix_to_internal(&self, a_original: &Array2<f64>) -> Array2<f64> {
-        self.transform_matrix_columns_with_b(a_original)
-    }
-
-    fn transform_linear_constraints_to_internal(
-        &self,
-        constraints: Option<&LinearInequalityConstraints>,
-    ) -> Option<LinearInequalityConstraints> {
-        let constraints = constraints?;
-        Some(LinearInequalityConstraints {
-            a: self.transform_constraint_matrix_to_internal(&constraints.a),
-            b: constraints.b.clone(),
-        })
-    }
-
     fn backtransform_beta(&self, beta_internal: &Array1<f64>) -> Array1<f64> {
         let mut beta = beta_internal.clone();
         let intercept = self.intercept_idx;
@@ -489,36 +468,6 @@ impl LinearFitConditioning {
         }
     }
 
-    fn backtransform_fit_result(&self, mut fit: FitResult) -> FitResult {
-        if !self.is_active() {
-            return fit;
-        }
-        fit.beta = self.backtransform_beta(&fit.beta);
-        fit.penalized_hessian =
-            self.transform_penalized_hessian_to_original(&fit.penalized_hessian);
-        fit.beta_covariance = fit
-            .beta_covariance
-            .take()
-            .map(|cov| self.backtransform_covariance(&cov));
-        fit.beta_standard_errors = fit
-            .beta_covariance
-            .as_ref()
-            .map(|cov| Array1::from_iter((0..cov.nrows()).map(|i| cov[[i, i]].max(0.0).sqrt())));
-        fit.beta_covariance_corrected = fit
-            .beta_covariance_corrected
-            .take()
-            .map(|cov| self.backtransform_covariance(&cov));
-        fit.beta_standard_errors_corrected = fit
-            .beta_covariance_corrected
-            .as_ref()
-            .map(|cov| Array1::from_iter((0..cov.nrows()).map(|i| cov[[i, i]].max(0.0).sqrt())));
-        fit.smoothing_correction = fit
-            .smoothing_correction
-            .take()
-            .map(|cov| self.backtransform_covariance(&cov));
-        fit.reparam_qs = None;
-        fit
-    }
 }
 
 fn cumulative_exp(values: &Array1<f64>, sign: f64) -> Array1<f64> {
@@ -1482,8 +1431,10 @@ pub fn build_term_collection_design(
     for (j, linear) in spec.linear_terms.iter().enumerate() {
         let col = p_intercept + j;
         if let Some(lb) = linear.coefficient_min {
-            coefficient_lower_bounds[col] = lb;
-            any_bounds = true;
+            let mut row = Array1::<f64>::zeros(p_total);
+            row[col] = 1.0;
+            linear_constraint_rows.push(row);
+            linear_constraint_b.push(lb);
         }
         if let Some(ub) = linear.coefficient_max {
             let mut row = Array1::<f64>::zeros(p_total);
@@ -1996,35 +1947,21 @@ fn fit_term_collection_for_spec_with_heuristic_lambdas(
         );
     }
     let design = build_term_collection_design(data, spec)?;
-    let conditioning_cols: Vec<usize> = spec
-        .linear_terms
-        .iter()
-        .enumerate()
-        .filter_map(|(j, linear)| {
-            (!linear.double_penalty).then_some(design.intercept_range.end + j)
-        })
-        .collect();
-    let conditioning = LinearFitConditioning::from_columns(&design, &conditioning_cols);
-    let fit_design = conditioning.apply_to_design(&design.design);
-    let fit_penalties = conditioning.transform_penalties_to_internal(&design.penalties);
-    let fit_linear_constraints =
-        conditioning.transform_linear_constraints_to_internal(design.linear_constraints.as_ref());
     let fit = fit_gam_with_heuristic_lambdas(
-        fit_design.view(),
+        design.design.view(),
         y,
         weights,
         offset,
-        &fit_penalties,
+        &design.penalties,
         heuristic_lambdas,
         family,
         &FitOptions {
             max_iter: options.max_iter,
             tol: options.tol,
             nullspace_dims: design.nullspace_dims.clone(),
-            linear_constraints: fit_linear_constraints,
+            linear_constraints: design.linear_constraints.clone(),
         },
     )?;
-    let fit = conditioning.backtransform_fit_result(fit);
     enforce_term_constraint_feasibility(&design, &fit)?;
     Ok(FittedTermCollection { fit, design })
 }
