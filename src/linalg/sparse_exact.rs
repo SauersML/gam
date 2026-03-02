@@ -1,6 +1,7 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
 use crate::matrix::DesignMatrix;
+use crate::solver::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
 use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
@@ -31,6 +32,13 @@ pub struct SparsePenaltyBlock {
     pub s_k_sparse: SparseColMat<usize, f64>,
     pub r_k_sparse: SparseColMat<usize, f64>,
     r_k_rows: Arc<SparseRowMat<usize, f64>>,
+}
+
+#[derive(Clone)]
+pub struct SparsePenalizedSystem {
+    pub h_sparse: SparseColMat<usize, f64>,
+    pub factor: SparseExactFactor,
+    pub logdet_h: f64,
 }
 
 impl SparseTraceWorkspace {
@@ -269,6 +277,23 @@ pub fn leverages_from_factor(
 
 pub fn logdet_from_factor(factor: &SparseExactFactor) -> Result<f64, EstimationError> {
     Ok(factor.logdet)
+}
+
+pub fn assemble_and_factor_sparse_penalized_system(
+    workspace: &mut PirlsWorkspace,
+    x: &SparseColMat<usize, f64>,
+    weights: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    ridge: f64,
+) -> Result<SparsePenalizedSystem, EstimationError> {
+    let h_sparse = sparse_reml_penalized_hessian(workspace, x, weights, s_lambda, ridge)?;
+    let factor = factorize_sparse_spd(&h_sparse)?;
+    let logdet_h = logdet_from_factor(&factor)?;
+    Ok(SparsePenalizedSystem {
+        h_sparse,
+        factor,
+        logdet_h,
+    })
 }
 
 pub fn build_sparse_penalty_blocks(

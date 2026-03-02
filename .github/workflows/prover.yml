@@ -1,0 +1,163 @@
+name: Lean Prover CI
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  push:
+    branches: ["main"]
+    paths:
+      - 'src/**/*.lean'
+      - 'scripts/lean-check-all.sh'
+      - 'lakefile.lean'
+      - 'lean-toolchain'
+      - 'lake-manifest.json'
+      - '.github/workflows/prover.yml'
+  pull_request:
+    branches: ["main"]
+    paths:
+      - 'src/**/*.lean'
+      - 'scripts/lean-check-all.sh'
+      - 'lakefile.lean'
+      - 'lean-toolchain'
+      - 'lake-manifest.json'
+      - '.github/workflows/prover.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install elan
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Lean toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: ${{ runner.os }}-elan-${{ hashFiles('lean-toolchain') }}
+
+      - name: Cache Lake artifacts
+        uses: actions/cache@v4
+        with:
+          path: .lake
+          key: ${{ runner.os }}-lake-v1-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}
+          restore-keys: |
+            ${{ runner.os }}-lake-v1-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}-
+            ${{ runner.os }}-lake-v1-${{ hashFiles('lean-toolchain') }}-
+
+      - name: Restore locked manifest
+        run: |
+          if [ -f lake-manifest.json ]; then
+            git restore lake-manifest.json || true
+          fi
+
+      - name: Run Lean checks
+        run: |
+          chmod +x scripts/lean-check-all.sh
+          ./scripts/lean-check-all.sh
+
+  auto-close-failed-lean-pr:
+    runs-on: ubuntu-latest
+    needs: prove
+    if: always() && github.event_name == 'pull_request'
+    steps:
+      - name: Close PR if Lean checks fail on Lean-related changes
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.info('No pull request context; skipping.');
+              return;
+            }
+
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              }
+            );
+
+            const touchesLean = files.some((file) =>
+              file.filename.endsWith('.lean') ||
+              file.filename === 'lakefile.lean' ||
+              file.filename === 'lean-toolchain' ||
+              file.filename === 'lake-manifest.json' ||
+              file.filename === 'scripts/lean-check-all.sh' ||
+              file.filename === '.github/workflows/prover.yml'
+            );
+
+            const commits = await github.paginate(
+              github.rest.pulls.listCommits,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100,
+              }
+            );
+            const hasJulesCommit = commits.some((c) => {
+              const name = (c.commit && c.commit.author && c.commit.author.name) || '';
+              return name.toLowerCase().includes('jules');
+            });
+
+            const branchName = pr.head.ref;
+            const julesApiBranchPattern = /^fix-(lean|proofs|build).*?-\d+$/;
+            const julesScriptBranchPattern = /^jules-improvement-\d{8}-\d{6}$/;
+            const hasJulesBranch = julesApiBranchPattern.test(branchName) || julesScriptBranchPattern.test(branchName);
+            const isJulesPR = hasJulesCommit || hasJulesBranch;
+
+            const proverFailed = '${{ needs.prove.result }}' === 'failure';
+
+            const shouldClose =
+              (touchesLean && proverFailed) ||
+              (isJulesPR && proverFailed);
+
+            if (!shouldClose) {
+              core.info('No auto-close conditions met; skipping.');
+              return;
+            }
+
+            const body = [
+              '## ❌ Lean Prover CI Failed',
+              '',
+              'This PR was auto-closed due to one or more Lean rules:',
+              `- Touches Lean-related files and prover failed: ${touchesLean && proverFailed ? 'yes' : 'no'}`,
+              `- Jules PR and prover failed: ${isJulesPR && proverFailed ? 'yes' : 'no'}`,
+              '',
+              `Branch: \`${branchName}\``,
+              `Jules PR detected: ${isJulesPR ? 'yes' : 'no'} (branch pattern: ${hasJulesBranch}, commit author: ${hasJulesCommit})`,
+              '',
+              'Please fix and reopen when ready.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body,
+            });
+
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              state: 'closed',
+            });
+
+            core.setFailed('Lean Prover CI failed for Lean-related PR changes.');

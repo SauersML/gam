@@ -1,12 +1,14 @@
 use super::*;
+use super::cache::AtomicFlagGuard;
+use super::strategy::{GeometryBackendKind, HessianEvalStrategyKind, HessianStrategyDecision};
 use crate::linalg::sparse_exact::{
-    SparseExactFactor, SparsePenaltyBlock, SparseTraceWorkspace, build_sparse_penalty_blocks,
-    factorize_sparse_spd, leverages_from_factor, logdet_from_factor, solve_sparse_spd,
-    solve_sparse_spd_multi, sparse_matvec_public, trace_hinv_sk,
+    SparseExactFactor, SparsePenaltyBlock, SparseTraceWorkspace,
+    assemble_and_factor_sparse_penalized_system, build_sparse_penalty_blocks,
+    leverages_from_factor, solve_sparse_spd, solve_sparse_spd_multi, sparse_matvec_public,
+    trace_hinv_sk,
 };
 use crate::pirls::{
     DirectionalWorkingCurvature, PirlsWorkspace, directional_working_curvature_callback,
-    sparse_reml_penalized_hessian,
 };
 use faer::Side;
 
@@ -938,6 +940,10 @@ enum RemlGeometry {
     SparseExactSpd,
 }
 
+trait PenalizedGeometry {
+    fn backend_kind(&self) -> GeometryBackendKind;
+}
+
 #[derive(Clone)]
 pub(crate) struct DirectionalHyperParam {
     pub x_tau_original: Array2<f64>,
@@ -1135,6 +1141,15 @@ impl EvalShared {
     }
 }
 
+impl PenalizedGeometry for EvalShared {
+    fn backend_kind(&self) -> GeometryBackendKind {
+        match self.geometry {
+            RemlGeometry::DenseSpectral => GeometryBackendKind::DenseSpectral,
+            RemlGeometry::SparseExactSpd => GeometryBackendKind::SparseExactSpd,
+        }
+    }
+}
+
 struct RemlWorkspace {
     lambda_values: Array1<f64>,
     cost_gradient: Array1<f64>,
@@ -1264,14 +1279,93 @@ impl PirlsLruCache {
     }
 }
 
-pub(super) struct RemlState<'a> {
+/// Centralized cache/memoization owner for REML evaluations.
+///
+/// This keeps cache-key identity, bundle reuse, and invalidation policy out of
+/// the math kernels so objective/derivative routines can stay algebra-focused.
+struct EvalCacheManager {
+    pirls_cache: RwLock<PirlsLruCache>,
+    faer_factor_cache: RwLock<HashMap<Vec<u64>, Arc<FaerFactor>>>,
+    current_eval_bundle: RwLock<Option<EvalShared>>,
+    pirls_cache_enabled: AtomicBool,
+}
+
+impl EvalCacheManager {
+    fn new() -> Self {
+        Self {
+            pirls_cache: RwLock::new(PirlsLruCache::new(MAX_PIRLS_CACHE_ENTRIES)),
+            faer_factor_cache: RwLock::new(HashMap::new()),
+            current_eval_bundle: RwLock::new(None),
+            pirls_cache_enabled: AtomicBool::new(true),
+        }
+    }
+
+    /// Creates a sanitized cache key from rho values.
+    /// Returns None if any component is NaN, in which case caching is skipped.
+    /// Maps -0.0 to 0.0 to ensure key stability.
+    fn sanitized_rho_key(rho: &Array1<f64>) -> Option<Vec<u64>> {
+        super::cache::sanitized_rho_key(rho)
+    }
+
+    fn cached_eval_bundle(&self, key: &Option<Vec<u64>>) -> Option<EvalShared> {
+        self.current_eval_bundle
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|bundle| bundle.matches(key))
+            .cloned()
+    }
+
+    fn store_eval_bundle(&self, bundle: EvalShared) {
+        *self.current_eval_bundle.write().unwrap() = Some(bundle);
+    }
+
+    fn invalidate_eval_bundle(&self) {
+        self.current_eval_bundle.write().unwrap().take();
+    }
+
+    fn clear_eval_and_factor_caches(&self) {
+        self.invalidate_eval_bundle();
+        self.faer_factor_cache.write().unwrap().clear();
+    }
+}
+
+/// Reusable scratch/runtime memory that should not be part of mathematical
+/// state invariants.
+struct RemlArena {
+    workspace: Mutex<RemlWorkspace>,
+    cost_last: RwLock<Option<CostAgg>>,
+    cost_repeat: RwLock<u64>,
+    cost_last_emit: RwLock<u64>,
+    cost_eval_count: RwLock<u64>,
+    raw_cond_snapshot: RwLock<f64>,
+    gaussian_cond_snapshot: RwLock<f64>,
+    last_gradient_used_stochastic_fallback: AtomicBool,
+}
+
+impl RemlArena {
+    fn new(workspace: RemlWorkspace) -> Self {
+        Self {
+            workspace: Mutex::new(workspace),
+            cost_last: RwLock::new(None),
+            cost_repeat: RwLock::new(0),
+            cost_last_emit: RwLock::new(0),
+            cost_eval_count: RwLock::new(0),
+            raw_cond_snapshot: RwLock::new(f64::NAN),
+            gaussian_cond_snapshot: RwLock::new(f64::NAN),
+            last_gradient_used_stochastic_fallback: AtomicBool::new(false),
+        }
+    }
+}
+
+pub(crate) struct RemlState<'a> {
     y: ArrayView1<'a, f64>,
     x: DesignMatrix,
     weights: ArrayView1<'a, f64>,
     offset: Array1<f64>,
     // Original penalty matrices S_k (p × p), ρ-independent basis
     s_full_list: Vec<Array2<f64>>,
-    pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
+    pub(crate) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
     balanced_penalty_root: Array2<f64>,
     reparam_invariant: ReparamInvariant,
     sparse_penalty_blocks: Option<Arc<Vec<SparsePenaltyBlock>>>,
@@ -1281,19 +1375,9 @@ pub(super) struct RemlState<'a> {
     coefficient_lower_bounds: Option<Array1<f64>>,
     linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
 
-    cache: RwLock<PirlsLruCache>,
-    faer_factor_cache: RwLock<HashMap<Vec<u64>, Arc<FaerFactor>>>,
-    pirls_cache_enabled: AtomicBool,
-    current_eval_bundle: RwLock<Option<EvalShared>>,
-    cost_last: RwLock<Option<CostAgg>>,
-    cost_repeat: RwLock<u64>,
-    cost_last_emit: RwLock<u64>,
-    cost_eval_count: RwLock<u64>,
-    raw_cond_snapshot: RwLock<f64>,
-    gaussian_cond_snapshot: RwLock<f64>,
-    last_gradient_used_stochastic_fallback: AtomicBool,
-    workspace: Mutex<RemlWorkspace>,
-    pub(super) warm_start_beta: RwLock<Option<Coefficients>>,
+    cache_manager: EvalCacheManager,
+    arena: RemlArena,
+    pub(crate) warm_start_beta: RwLock<Option<Coefficients>>,
     warm_start_enabled: AtomicBool,
 }
 
@@ -1588,10 +1672,10 @@ impl<'a> RemlState<'a> {
         let raw_q = quantize_value(raw_cond, 5e-3, 1e-6);
         let key = CostKey::new(&rho_q, &smooth_q, stab_q, raw_q);
 
-        let mut last_opt = self.cost_last.write().unwrap();
-        let mut repeat = self.cost_repeat.write().unwrap();
-        let mut last_emit = self.cost_last_emit.write().unwrap();
-        let eval_idx = *self.cost_eval_count.read().unwrap();
+        let mut last_opt = self.arena.cost_last.write().unwrap();
+        let mut repeat = self.arena.cost_repeat.write().unwrap();
+        let mut last_emit = self.arena.cost_last_emit.write().unwrap();
+        let eval_idx = *self.arena.cost_eval_count.read().unwrap();
 
         if let Some(last) = last_opt.as_mut() {
             if last.key.approx_eq(&key) {
@@ -1626,13 +1710,13 @@ impl<'a> RemlState<'a> {
 
     #[allow(dead_code)]
     pub fn reset_optimizer_tracking(&self) {
-        self.current_eval_bundle.write().unwrap().take();
-        self.cost_last.write().unwrap().take();
-        *self.cost_repeat.write().unwrap() = 0;
-        *self.cost_last_emit.write().unwrap() = 0;
-        *self.cost_eval_count.write().unwrap() = 0;
-        *self.raw_cond_snapshot.write().unwrap() = f64::NAN;
-        *self.gaussian_cond_snapshot.write().unwrap() = f64::NAN;
+        self.cache_manager.clear_eval_and_factor_caches();
+        self.arena.cost_last.write().unwrap().take();
+        *self.arena.cost_repeat.write().unwrap() = 0;
+        *self.arena.cost_last_emit.write().unwrap() = 0;
+        *self.arena.cost_eval_count.write().unwrap() = 0;
+        *self.arena.raw_cond_snapshot.write().unwrap() = f64::NAN;
+        *self.arena.gaussian_cond_snapshot.write().unwrap() = f64::NAN;
     }
 
     /// Compute soft prior cost without needing workspace
@@ -1719,7 +1803,7 @@ impl<'a> RemlState<'a> {
     }
 
     #[allow(dead_code)]
-    pub(super) fn new<X>(
+    pub(crate) fn new<X>(
         y: ArrayView1<'a, f64>,
         x: X,
         weights: ArrayView1<'a, f64>,
@@ -1748,7 +1832,7 @@ impl<'a> RemlState<'a> {
         )
     }
 
-    pub(super) fn new_with_offset<X>(
+    pub(crate) fn new_with_offset<X>(
         y: ArrayView1<'a, f64>,
         x: X,
         weights: ArrayView1<'a, f64>,
@@ -1804,18 +1888,8 @@ impl<'a> RemlState<'a> {
             nullspace_dims,
             coefficient_lower_bounds,
             linear_constraints,
-            cache: RwLock::new(PirlsLruCache::new(MAX_PIRLS_CACHE_ENTRIES)),
-            faer_factor_cache: RwLock::new(HashMap::new()),
-            pirls_cache_enabled: AtomicBool::new(true),
-            current_eval_bundle: RwLock::new(None),
-            cost_last: RwLock::new(None),
-            cost_repeat: RwLock::new(0),
-            cost_last_emit: RwLock::new(0),
-            cost_eval_count: RwLock::new(0),
-            raw_cond_snapshot: RwLock::new(f64::NAN),
-            gaussian_cond_snapshot: RwLock::new(f64::NAN),
-            last_gradient_used_stochastic_fallback: AtomicBool::new(false),
-            workspace: Mutex::new(workspace),
+            cache_manager: EvalCacheManager::new(),
+            arena: RemlArena::new(workspace),
             warm_start_beta: RwLock::new(None),
             warm_start_enabled: AtomicBool::new(true),
         })
@@ -1825,19 +1899,7 @@ impl<'a> RemlState<'a> {
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure consistency in caching.
     fn rho_key_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
-        let mut key = Vec::with_capacity(rho.len());
-        for &v in rho.iter() {
-            if v.is_nan() {
-                return None; // Don't cache NaN values
-            }
-            if v == 0.0 {
-                // This handles both +0.0 and -0.0
-                key.push(0.0f64.to_bits());
-            } else {
-                key.push(v.to_bits());
-            }
-        }
-        Some(key)
+        EvalCacheManager::sanitized_rho_key(rho)
     }
 
     fn prepare_eval_bundle_with_key(
@@ -1881,17 +1943,15 @@ impl<'a> RemlState<'a> {
 
     fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
         let key = self.rho_key_sanitized(rho);
-        if let Some(existing) = self.current_eval_bundle.read().unwrap().as_ref()
-            && existing.matches(&key)
-        {
+        if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
             return Ok(existing.clone());
         }
         let bundle = self.prepare_eval_bundle_with_key(rho, key)?;
-        *self.current_eval_bundle.write().unwrap() = Some(bundle.clone());
+        self.cache_manager.store_eval_bundle(bundle.clone());
         Ok(bundle)
     }
 
-    pub(super) fn objective_inner_hessian(
+    pub(crate) fn objective_inner_hessian(
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
@@ -2749,8 +2809,9 @@ impl<'a> RemlState<'a> {
         Ok(hess)
     }
 
-    pub(super) fn last_ridge_used(&self) -> Option<f64> {
-        self.current_eval_bundle
+    pub(crate) fn last_ridge_used(&self) -> Option<f64> {
+        self.cache_manager
+            .current_eval_bundle
             .read()
             .unwrap()
             .as_ref()
@@ -3107,7 +3168,7 @@ impl<'a> RemlState<'a> {
     #[allow(dead_code)]
     pub fn clear_warm_start(&self) {
         self.warm_start_beta.write().unwrap().take();
-        self.current_eval_bundle.write().unwrap().take();
+        self.cache_manager.invalidate_eval_bundle();
     }
 
     /// Returns the per-penalty square-root matrices in the transformed coefficient basis
@@ -3164,14 +3225,19 @@ impl<'a> RemlState<'a> {
         // hits across repeated EDF/gradient evaluations for the same smoothing parameters.
         let key_opt = self.rho_key_sanitized(rho);
         if let Some(key) = &key_opt
-            && let Some(f) = self.faer_factor_cache.read().unwrap().get(key)
+            && let Some(f) = self
+                .cache_manager
+                .faer_factor_cache
+                .read()
+                .unwrap()
+                .get(key)
         {
             return Arc::clone(f);
         }
         let fact = Arc::new(self.factorize_faer(h));
 
         if let Some(key) = key_opt {
-            let mut cache = self.faer_factor_cache.write().unwrap();
+            let mut cache = self.cache_manager.faer_factor_cache.write().unwrap();
             if cache.len() > 64 {
                 cache.clear();
             }
@@ -3183,25 +3249,25 @@ impl<'a> RemlState<'a> {
     const MIN_DMU_DETA: f64 = 1e-6;
 
     // Accessor methods for private fields
-    pub(super) fn x(&self) -> &DesignMatrix {
+    pub(crate) fn x(&self) -> &DesignMatrix {
         &self.x
     }
 
     #[allow(dead_code)]
-    pub(super) fn y(&self) -> ArrayView1<'a, f64> {
+    pub(crate) fn y(&self) -> ArrayView1<'a, f64> {
         self.y
     }
 
     #[allow(dead_code)]
-    pub(super) fn rs_list_ref(&self) -> &Vec<Array2<f64>> {
+    pub(crate) fn rs_list_ref(&self) -> &Vec<Array2<f64>> {
         &self.rs_list
     }
 
-    pub(super) fn balanced_penalty_root(&self) -> &Array2<f64> {
+    pub(crate) fn balanced_penalty_root(&self) -> &Array2<f64> {
         &self.balanced_penalty_root
     }
 
-    pub(super) fn weights(&self) -> ArrayView1<'a, f64> {
+    pub(crate) fn weights(&self) -> ArrayView1<'a, f64> {
         self.weights
     }
 
@@ -3223,6 +3289,54 @@ impl<'a> RemlState<'a> {
             }
         }
         (logdet, det1)
+    }
+
+    fn geometry_backend_kind(bundle: &EvalShared) -> GeometryBackendKind {
+        bundle.backend_kind()
+    }
+
+    fn select_hessian_strategy_policy(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+    ) -> HessianStrategyDecision {
+        if self.uses_objective_consistent_fd_gradient(rho) {
+            return HessianStrategyDecision {
+                strategy: HessianEvalStrategyKind::DiagnosticNumeric,
+                reason: "objective_consistent_numeric_gradient",
+            };
+        }
+        if bundle.active_subspace_unstable {
+            return HessianStrategyDecision {
+                strategy: HessianEvalStrategyKind::AnalyticFallback,
+                reason: "active_subspace_unstable",
+            };
+        }
+        HessianStrategyDecision {
+            strategy: HessianEvalStrategyKind::SpectralExact,
+            reason: "exact_preferred",
+        }
+    }
+
+    fn compute_laml_hessian_by_strategy(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        decision: HessianStrategyDecision,
+    ) -> Result<Array2<f64>, EstimationError> {
+        match decision.strategy {
+            HessianEvalStrategyKind::SpectralExact => self.compute_laml_hessian_exact(rho),
+            HessianEvalStrategyKind::AnalyticFallback => {
+                self.compute_laml_hessian_analytic_fallback(rho, Some(bundle))
+            }
+            HessianEvalStrategyKind::DiagnosticNumeric => {
+                log::warn!(
+                    "Using diagnostic numeric Hessian strategy routing (reason={}); dispatching to deterministic analytic fallback.",
+                    decision.reason
+                );
+                self.compute_laml_hessian_analytic_fallback(rho, Some(bundle))
+            }
+        }
     }
 
     fn select_reml_geometry(&self, rho: &Array1<f64>) -> SparseRemlDecision {
@@ -3476,15 +3590,13 @@ impl<'a> RemlState<'a> {
             }
         }
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
-        let h_sparse = sparse_reml_penalized_hessian(
+        let sparse_system = assemble_and_factor_sparse_penalized_system(
             &mut workspace,
             x_sparse,
             &pirls_result.solve_weights,
             &s_lambda,
             ridge_passport.delta,
         )?;
-        let factor = factorize_sparse_spd(&h_sparse)?;
-        let logdet_h = logdet_from_factor(&factor)?;
         let (logdet_s_pos, det1_values) =
             self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
         let firth_dense_operator = if self.config.firth_bias_reduction
@@ -3511,9 +3623,9 @@ impl<'a> RemlState<'a> {
             active_subspace_rel_gap: None,
             active_subspace_unstable: false,
             sparse_exact: Some(Arc::new(SparseExactEvalData {
-                factor: Arc::new(factor),
+                factor: Arc::new(sparse_system.factor),
                 penalty_blocks,
-                logdet_h,
+                logdet_h: sparse_system.logdet_h,
                 logdet_s_pos,
                 det1_values: Arc::new(det1_values),
                 trace_workspace: Arc::new(Mutex::new(SparseTraceWorkspace::default())),
@@ -3523,7 +3635,7 @@ impl<'a> RemlState<'a> {
     }
 
     #[allow(dead_code)]
-    pub(super) fn offset(&self) -> ArrayView1<'_, f64> {
+    pub(crate) fn offset(&self) -> ArrayView1<'_, f64> {
         self.offset.view()
     }
 
@@ -3532,12 +3644,15 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<Arc<PirlsResult>, EstimationError> {
-        let use_cache = self.pirls_cache_enabled.load(Ordering::Relaxed);
+        let use_cache = self
+            .cache_manager
+            .pirls_cache_enabled
+            .load(Ordering::Relaxed);
         // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
         let key_opt = self.rho_key_sanitized(rho);
         if use_cache
             && let Some(key) = &key_opt
-            && let Some(cached) = self.cache.write().unwrap().get(key)
+            && let Some(cached) = self.cache_manager.pirls_cache.write().unwrap().get(key)
         {
             if self.warm_start_enabled.load(Ordering::Relaxed) {
                 self.update_warm_start_from(cached.as_ref());
@@ -3589,7 +3704,8 @@ impl<'a> RemlState<'a> {
                 self.update_warm_start_from(pirls_result.as_ref());
                 // This is a successful fit. Cache only if key is valid (not NaN).
                 if use_cache && let Some(key) = key_opt {
-                    self.cache
+                    self.cache_manager
+                        .pirls_cache
                         .write()
                         .unwrap()
                         .insert(key, Arc::clone(&pirls_result));
@@ -3681,14 +3797,14 @@ impl<'a> RemlState<'a> {
     /// These conventions are mirrored in gradient code via corresponding trace terms.
     pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
         let cost_call_idx = {
-            let mut calls = self.cost_eval_count.write().unwrap();
+            let mut calls = self.arena.cost_eval_count.write().unwrap();
             *calls += 1;
             *calls
         };
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
-                self.current_eval_bundle.write().unwrap().take();
+                self.cache_manager.invalidate_eval_bundle();
                 // Inner linear algebra says "too singular" — treat as barrier.
                 log::warn!(
                     "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
@@ -3719,7 +3835,7 @@ impl<'a> RemlState<'a> {
                 return Ok(f64::INFINITY);
             }
             Err(e) => {
-                self.current_eval_bundle.write().unwrap().take();
+                self.cache_manager.invalidate_eval_bundle();
                 // Other errors still bubble up
                 // Provide bounds diagnostics here too
                 let at_lower: Vec<usize> = p
@@ -3747,7 +3863,7 @@ impl<'a> RemlState<'a> {
                 return Err(e);
             }
         };
-        if matches!(bundle.geometry, RemlGeometry::SparseExactSpd) {
+        if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
             return self.compute_cost_sparse_exact(p, &bundle);
         }
         let pirls_result = bundle.pirls_result.as_ref();
@@ -3859,9 +3975,9 @@ impl<'a> RemlState<'a> {
                             }
                         })
                         .unwrap_or(f64::NAN);
-                    *self.gaussian_cond_snapshot.write().unwrap() = cond;
+                    *self.arena.gaussian_cond_snapshot.write().unwrap() = cond;
                 }
-                let condition_number = *self.gaussian_cond_snapshot.read().unwrap();
+                let condition_number = *self.arena.gaussian_cond_snapshot.read().unwrap();
                 if condition_number.is_finite() {
                     if condition_number > MAX_CONDITION_NUMBER {
                         log::warn!(
@@ -4067,10 +4183,10 @@ impl<'a> RemlState<'a> {
                             max / min.max(1e-12)
                         })
                         .unwrap_or(f64::NAN);
-                    *self.raw_cond_snapshot.write().unwrap() = raw;
+                    *self.arena.raw_cond_snapshot.write().unwrap() = raw;
                     raw
                 } else {
-                    *self.raw_cond_snapshot.read().unwrap()
+                    *self.arena.raw_cond_snapshot.read().unwrap()
                 };
                 if want_hot_diag {
                     self.log_gam_cost(
@@ -4296,17 +4412,18 @@ impl<'a> RemlState<'a> {
     //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
     //     direct quadratic pieces are exact negatives, which is what the algebra requires.
     pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-        self.last_gradient_used_stochastic_fallback
+        self.arena
+            .last_gradient_used_stochastic_fallback
             .store(false, Ordering::Relaxed);
         // Get the converged P-IRLS result for the current rho (`p`)
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err @ EstimationError::ModelIsIllConditioned { .. }) => {
-                self.current_eval_bundle.write().unwrap().take();
+                self.cache_manager.invalidate_eval_bundle();
                 return Err(err);
             }
             Err(e) => {
-                self.current_eval_bundle.write().unwrap().take();
+                self.cache_manager.invalidate_eval_bundle();
                 return Err(e);
             }
         };
@@ -4683,28 +4800,25 @@ impl<'a> RemlState<'a> {
         //   tr(H_+^dagger D²H_phi[u,v]) = tr(W^T (D²H_phi[u,v] W))
         // when the positive-subspace solve projector W is available.
         // Falls back to dense assembly only when W is unavailable.
-        let trace_hdag_firth_second = |op: &FirthDenseOperator,
-                                       u_dir: &FirthDirection,
-                                       v_dir: &FirthDirection|
-         -> f64 {
-            Self::trace_hdag_operator_apply(
-                p_dim,
-                h_pos_w_for_solve.as_ref(),
-                h_pos_w_for_solve_t.as_ref(),
-                |a| solve_h_mat(a),
-                |basis| Self::firth_hphi_second_direction_apply(op, u_dir, v_dir, basis),
-            )
-        };
-        let trace_hdag_firth_first =
-            |op: &FirthDenseOperator, u_dir: &FirthDirection| -> f64 {
+        let trace_hdag_firth_second =
+            |op: &FirthDenseOperator, u_dir: &FirthDirection, v_dir: &FirthDirection| -> f64 {
                 Self::trace_hdag_operator_apply(
                     p_dim,
                     h_pos_w_for_solve.as_ref(),
                     h_pos_w_for_solve_t.as_ref(),
                     |a| solve_h_mat(a),
-                    |basis| Self::firth_hphi_direction_apply(op, u_dir, basis),
+                    |basis| Self::firth_hphi_second_direction_apply(op, u_dir, v_dir, basis),
                 )
             };
+        let trace_hdag_firth_first = |op: &FirthDenseOperator, u_dir: &FirthDirection| -> f64 {
+            Self::trace_hdag_operator_apply(
+                p_dim,
+                h_pos_w_for_solve.as_ref(),
+                h_pos_w_for_solve_t.as_ref(),
+                |a| solve_h_mat(a),
+                |basis| Self::firth_hphi_direction_apply(op, u_dir, basis),
+            )
+        };
         let trace_hdag_b_hdag_c = |b: &Array2<f64>, c_mat: &Array2<f64>| -> f64 {
             if let (Some(w), Some(w_t)) = (h_pos_w_for_solve.as_ref(), h_pos_w_for_solve_t.as_ref())
             {
@@ -5017,28 +5131,25 @@ impl<'a> RemlState<'a> {
         };
         // Matrix-free D²(H_phi) trace contraction, identical to mixed block:
         // use tr(W^T (D²H_phi[u,v] W)) on the active positive solve subspace.
-        let trace_hdag_firth_second = |op: &FirthDenseOperator,
-                                       u_dir: &FirthDirection,
-                                       v_dir: &FirthDirection|
-         -> f64 {
-            Self::trace_hdag_operator_apply(
-                p_dim,
-                h_pos_w_for_solve.as_ref(),
-                h_pos_w_for_solve_t.as_ref(),
-                |a| solve_h_mat(a),
-                |basis| Self::firth_hphi_second_direction_apply(op, u_dir, v_dir, basis),
-            )
-        };
-        let trace_hdag_firth_first =
-            |op: &FirthDenseOperator, u_dir: &FirthDirection| -> f64 {
+        let trace_hdag_firth_second =
+            |op: &FirthDenseOperator, u_dir: &FirthDirection, v_dir: &FirthDirection| -> f64 {
                 Self::trace_hdag_operator_apply(
                     p_dim,
                     h_pos_w_for_solve.as_ref(),
                     h_pos_w_for_solve_t.as_ref(),
                     |a| solve_h_mat(a),
-                    |basis| Self::firth_hphi_direction_apply(op, u_dir, basis),
+                    |basis| Self::firth_hphi_second_direction_apply(op, u_dir, v_dir, basis),
                 )
             };
+        let trace_hdag_firth_first = |op: &FirthDenseOperator, u_dir: &FirthDirection| -> f64 {
+            Self::trace_hdag_operator_apply(
+                p_dim,
+                h_pos_w_for_solve.as_ref(),
+                h_pos_w_for_solve_t.as_ref(),
+                |a| solve_h_mat(a),
+                |basis| Self::firth_hphi_direction_apply(op, u_dir, basis),
+            )
+        };
         let trace_hdag_firth_tau_partial =
             |op: &FirthDenseOperator, x_tau: &Array2<f64>, kernel: &FirthTauPartialKernel| -> f64 {
                 Self::trace_hdag_operator_apply(
@@ -5258,7 +5369,9 @@ impl<'a> RemlState<'a> {
 
                 let q = beta_eval.dot(&a_tau[i].dot(&beta_tau[j]));
                 let l = 0.5
-                    * (trace_hdag(&h_ij) - d1_trace_correction - d2_trace_correction
+                    * (trace_hdag(&h_ij)
+                        - d1_trace_correction
+                        - d2_trace_correction
                         - dtau_trace_correction
                         - trace_hdag_b_hdag_c(&h_tau[j], &h_tau[i]));
                 let p_term = 0.5 * Self::trace_product(&sdag_a[j], &sdag_a[i]);
@@ -5380,7 +5493,7 @@ impl<'a> RemlState<'a> {
                 rho.len()
             )));
         }
-        if matches!(bundle.geometry, RemlGeometry::SparseExactSpd) {
+        if Self::geometry_backend_kind(bundle) == GeometryBackendKind::SparseExactSpd {
             return self.compute_directional_hyper_gradient_sparse_exact(rho, bundle, hyper_dir);
         }
         let firth_logit_active = self.config.firth_bias_reduction
@@ -5814,7 +5927,7 @@ impl<'a> RemlState<'a> {
         p: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<Array1<f64>, EstimationError> {
-        if matches!(bundle.geometry, RemlGeometry::SparseExactSpd) {
+        if Self::geometry_backend_kind(bundle) == GeometryBackendKind::SparseExactSpd {
             return self.compute_gradient_sparse_exact(p, bundle);
         }
         // If there are no penalties (zero-length rho), the gradient in rho-space is empty.
@@ -5896,7 +6009,7 @@ impl<'a> RemlState<'a> {
 
         let includes_prior = false;
         let (gradient_result, gradient_snapshot, applied_truncation_corrections) = {
-            let mut workspace_ref = self.workspace.lock().unwrap();
+            let mut workspace_ref = self.arena.workspace.lock().unwrap();
             let workspace = &mut *workspace_ref;
             let len = p.len();
             workspace.reset_for_eval(len);
@@ -6209,82 +6322,81 @@ impl<'a> RemlState<'a> {
                         s_k_beta_mat.column_mut(k).assign(&s_k_beta);
                     }
 
-                        // Keep outer gradient on the same Hessian surface as PIRLS.
-                        // The outer loop uses H_eff consistently (no H_phi subtraction).
+                    // Keep outer gradient on the same Hessian surface as PIRLS.
+                    // The outer loop uses H_eff consistently (no H_phi subtraction).
 
-                        // P-IRLS already folded any stabilization ridge into h_eff.
+                    // P-IRLS already folded any stabilization ridge into h_eff.
 
-                        // TRACE TERM COMPUTATION (exact non-Gaussian/logit dH term):
-                        //   tr(H_+^\dagger H_k), with
-                        //   H_k = S_k - X^T diag(c ⊙ (X v_k)) X,  v_k = H_+^\dagger (S_k beta).
-                        //
-                        // We evaluate this without explicit third-derivative tensors:
-                        //   tr(H_+^\dagger S_k) = ||R_k W||_F^2
-                        //   tr(H_+^\dagger X^T diag(t_k) X) = Σ_i t_k[i] * h_i,
-                        // where t_k = c ⊙ (X v_k), h_i = x_i^T H_+^\dagger x_i, and H_+^\dagger = W W^T.
-                        //
-                        // This is the matrix-free realization of the exact identity:
-                        //   tr(H^{-1}H_k) = tr(H^{-1}A_k) + tr(H^{-1}D(-∇²ℓ)[B_k]),
-                        // with B_k = -H^{-1}(A_kβ̂).
-                        //
-                        //   D(-∇²ℓ)[B_k] = Xᵀ diag(d ⊙ (X B_k)) X,
-                        // where d_i = -∂³ℓ_i/∂η_i³. Here `c_vec` stores this per-observation
-                        // third derivative quantity in the stabilized logit path.
-                        let w_pos = &h_pos_factor_w_eval;
-                        let n_obs = pirls_result.solve_mu.len();
+                    // TRACE TERM COMPUTATION (exact non-Gaussian/logit dH term):
+                    //   tr(H_+^\dagger H_k), with
+                    //   H_k = S_k - X^T diag(c ⊙ (X v_k)) X,  v_k = H_+^\dagger (S_k beta).
+                    //
+                    // We evaluate this without explicit third-derivative tensors:
+                    //   tr(H_+^\dagger S_k) = ||R_k W||_F^2
+                    //   tr(H_+^\dagger X^T diag(t_k) X) = Σ_i t_k[i] * h_i,
+                    // where t_k = c ⊙ (X v_k), h_i = x_i^T H_+^\dagger x_i, and H_+^\dagger = W W^T.
+                    //
+                    // This is the matrix-free realization of the exact identity:
+                    //   tr(H^{-1}H_k) = tr(H^{-1}A_k) + tr(H^{-1}D(-∇²ℓ)[B_k]),
+                    // with B_k = -H^{-1}(A_kβ̂).
+                    //
+                    //   D(-∇²ℓ)[B_k] = Xᵀ diag(d ⊙ (X B_k)) X,
+                    // where d_i = -∂³ℓ_i/∂η_i³. Here `c_vec` stores this per-observation
+                    // third derivative quantity in the stabilized logit path.
+                    let w_pos = &h_pos_factor_w_eval;
+                    let n_obs = pirls_result.solve_mu.len();
 
-                        // c_i = dW_ii/dη_i for H = Xᵀ W X + S.
-                        // In smooth regimes this matches the required third-derivative object
-                        // in dH/dρ. In clamped/floored regimes c_i may behave like a subgradient
-                        // proxy rather than a classical derivative; see pirls.rs comments.
-                        let c_vec = &w_prime;
+                    // c_i = dW_ii/dη_i for H = Xᵀ W X + S.
+                    // In smooth regimes this matches the required third-derivative object
+                    // in dH/dρ. In clamped/floored regimes c_i may behave like a subgradient
+                    // proxy rather than a classical derivative; see pirls.rs comments.
+                    let c_vec = &w_prime;
 
-                        // h_i = x_i^T H_+^\dagger x_i = ||(XW)_{i,*}||^2.
-                        let mut leverage_h_pos = Array1::<f64>::zeros(n_obs);
-                        if w_pos.ncols() > 0 {
-                            match &x_transformed_eval {
-                                DesignMatrix::Dense(x_dense) => {
-                                    let xw = x_dense.dot(w_pos);
-                                    for i in 0..xw.nrows() {
-                                        leverage_h_pos[i] = xw.row(i).iter().map(|v| v * v).sum();
-                                    }
+                    // h_i = x_i^T H_+^\dagger x_i = ||(XW)_{i,*}||^2.
+                    let mut leverage_h_pos = Array1::<f64>::zeros(n_obs);
+                    if w_pos.ncols() > 0 {
+                        match &x_transformed_eval {
+                            DesignMatrix::Dense(x_dense) => {
+                                let xw = x_dense.dot(w_pos);
+                                for i in 0..xw.nrows() {
+                                    leverage_h_pos[i] = xw.row(i).iter().map(|v| v * v).sum();
                                 }
-                                DesignMatrix::Sparse(_) => {
-                                    for col in 0..w_pos.ncols() {
-                                        let w_col = w_pos.column(col).to_owned();
-                                        let xw_col =
-                                            x_transformed_eval.matrix_vector_multiply(&w_col);
-                                        Zip::from(&mut leverage_h_pos)
-                                            .and(&xw_col)
-                                            .for_each(|h, &v| *h += v * v);
-                                    }
+                            }
+                            DesignMatrix::Sparse(_) => {
+                                for col in 0..w_pos.ncols() {
+                                    let w_col = w_pos.column(col).to_owned();
+                                    let xw_col = x_transformed_eval.matrix_vector_multiply(&w_col);
+                                    Zip::from(&mut leverage_h_pos)
+                                        .and(&xw_col)
+                                        .for_each(|h, &v| *h += v * v);
                                 }
                             }
                         }
+                    }
 
-                        // Precompute r = X^T (c ⊙ h) once:
-                        //   trace_third_k = (c ⊙ h)^T (X v_k) = r^T v_k.
-                        // This removes the per-k O(np) multiply X*v_k from the hot loop.
-                        // Section C.1 step (4): r := X^T (w' ⊙ h).
-                        let c_times_h = c_vec * &leverage_h_pos;
-                        let r_third = x_transformed_eval.transpose_vector_multiply(&c_times_h);
+                    // Precompute r = X^T (c ⊙ h) once:
+                    //   trace_third_k = (c ⊙ h)^T (X v_k) = r^T v_k.
+                    // This removes the per-k O(np) multiply X*v_k from the hot loop.
+                    // Section C.1 step (4): r := X^T (w' ⊙ h).
+                    let c_times_h = c_vec * &leverage_h_pos;
+                    let r_third = x_transformed_eval.transpose_vector_multiply(&c_times_h);
 
-                        // Batch all v_k = H_+^† (S_k beta) into one BLAS-3 path:
-                        //   V = W (W^T [S_1 beta, ..., S_K beta]).
-                        let v_all = if w_pos.ncols() > 0 && k_count > 0 {
-                            let wt_sk_beta_all = w_pos.t().dot(&s_k_beta_mat);
-                            w_pos.dot(&wt_sk_beta_all)
-                        } else {
-                            Array2::<f64>::zeros((beta_ref.len(), k_count))
-                        };
+                    // Batch all v_k = H_+^† (S_k beta) into one BLAS-3 path:
+                    //   V = W (W^T [S_1 beta, ..., S_K beta]).
+                    let v_all = if w_pos.ncols() > 0 && k_count > 0 {
+                        let wt_sk_beta_all = w_pos.t().dot(&s_k_beta_mat);
+                        w_pos.dot(&wt_sk_beta_all)
+                    } else {
+                        Array2::<f64>::zeros((beta_ref.len(), k_count))
+                    };
 
-                        let trace_mode = std::env::var("GAM_DIAG_TRACE_THIRD_MODE")
-                            .unwrap_or_else(|_| "minus".to_string());
-                        let trace_mode_code = match trace_mode.as_str() {
-                            "plus" => 1u8,
-                            "zero" => 2u8,
-                            _ => 0u8,
-                        };
+                    let trace_mode = std::env::var("GAM_DIAG_TRACE_THIRD_MODE")
+                        .unwrap_or_else(|_| "minus".to_string());
+                    let trace_mode_code = match trace_mode.as_str() {
+                        "plus" => 1u8,
+                        "zero" => 2u8,
+                        _ => 0u8,
+                    };
                     {
                         let mut grad_view = workspace.cost_gradient_view(len);
                         for k_idx in 0..k_count {
@@ -6292,25 +6404,24 @@ impl<'a> RemlState<'a> {
                             if r_k.ncols() == 0 || w_pos.ncols() == 0 {
                                 let log_det_h_grad_term = 0.0;
                                 let log_det_s_grad_term = 0.5 * det1_values[k_idx];
-                                grad_view[k_idx] = 0.5 * beta_terms[k_idx]
-                                    + log_det_h_grad_term
+                                grad_view[k_idx] = 0.5 * beta_terms[k_idx] + log_det_h_grad_term
                                     - log_det_s_grad_term;
                                 continue;
                             }
 
-                                // First piece:
-                                //   tr(H_+^† S_k) = ||R_k W||_F^2, with H_+^† = W W^T.
+                            // First piece:
+                            //   tr(H_+^† S_k) = ||R_k W||_F^2, with H_+^† = W W^T.
                             let rkw = r_k.dot(w_pos);
                             let trace_h_inv_s_k: f64 = rkw.iter().map(|v| v * v).sum();
 
-                                // Exact third-derivative contraction:
-                                //   tr(H_+^† X^T diag(c ⊙ X v_k) X) = r^T v_k.
+                            // Exact third-derivative contraction:
+                            //   tr(H_+^† X^T diag(c ⊙ X v_k) X) = r^T v_k.
                             let v_k = v_all.column(k_idx);
                             let trace_third = r_third.dot(&v_k);
 
-                                // Diagnostic switch for term-by-term identification of
-                                // analytic-vs-FD disagreement. Production behavior is "minus",
-                                // matching the smooth-theory formula tr(H^{-1}A_k) - tr(H^{-1}Xᵀdiag(c⊙Xv_k)X).
+                            // Diagnostic switch for term-by-term identification of
+                            // analytic-vs-FD disagreement. Production behavior is "minus",
+                            // matching the smooth-theory formula tr(H^{-1}A_k) - tr(H^{-1}Xᵀdiag(c⊙Xv_k)X).
                             let trace_term = match trace_mode_code {
                                 1 => trace_h_inv_s_k + trace_third,
                                 2 => trace_h_inv_s_k,
@@ -6320,11 +6431,11 @@ impl<'a> RemlState<'a> {
                             let corrected_log_det_h = log_det_h_grad_term;
                             let log_det_s_grad_term = 0.5 * det1_values[k_idx];
 
-                                // Exact LAML gradient assembly for the implemented objective:
-                                //   g_k = 0.5 * β̂ᵀ A_k β̂ - 0.5 * tr(S^+ A_k) + 0.5 * tr(H^{-1} H_k)
-                                // where A_k = ∂S/∂ρ_k = λ_k S_k and H_k is the total derivative.
-                            grad_view[k_idx] = 0.5 * beta_terms[k_idx] + corrected_log_det_h
-                                - log_det_s_grad_term;
+                            // Exact LAML gradient assembly for the implemented objective:
+                            //   g_k = 0.5 * β̂ᵀ A_k β̂ - 0.5 * tr(S^+ A_k) + 0.5 * tr(H^{-1} H_k)
+                            // where A_k = ∂S/∂ρ_k = λ_k S_k and H_k is the total derivative.
+                            grad_view[k_idx] =
+                                0.5 * beta_terms[k_idx] + corrected_log_det_h - log_det_s_grad_term;
                         }
                     }
                 }
@@ -6375,7 +6486,8 @@ impl<'a> RemlState<'a> {
         if self.should_use_stochastic_exact_gradient(bundle, &gradient_result) {
             match self.compute_logit_stochastic_exact_gradient(p, bundle) {
                 Ok(stochastic_grad) => {
-                    self.last_gradient_used_stochastic_fallback
+                    self.arena
+                        .last_gradient_used_stochastic_fallback
                         .store(true, Ordering::Relaxed);
                     log::warn!(
                         "[REML] using stochastic exact log-marginal gradient fallback (posterior-sampled expectation)"
@@ -6395,7 +6507,8 @@ impl<'a> RemlState<'a> {
     }
 
     pub fn last_gradient_used_stochastic_fallback(&self) -> bool {
-        self.last_gradient_used_stochastic_fallback
+        self.arena
+            .last_gradient_used_stochastic_fallback
             .load(Ordering::Relaxed)
     }
 
@@ -8183,31 +8296,32 @@ impl<'a> RemlState<'a> {
         Ok(h)
     }
 
-    pub(super) fn compute_laml_hessian_consistent(
+    pub(crate) fn compute_laml_hessian_consistent(
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
-        // Smart fallback policy (analytic only, no runtime FD):
-        // 1) prefer full exact Hessian,
-        // 2) if active H_+ boundary is unstable, use deterministic analytic
-        //    fallback that excludes unstable log|H|_+ curvature block,
-        // 3) if exact assembly errors, use the same analytic fallback.
+        // Strategy-policy routing:
+        // - policy decides spectral exact vs analytic fallback vs diagnostic numeric,
+        // - math kernels remain strategy-local.
         let bundle = self.obtain_eval_bundle(rho)?;
-        if self.uses_objective_consistent_fd_gradient(rho) {
-            log::warn!(
-                "Exact LAML Hessian downgraded to analytic fallback because active gradient path uses objective-consistent numeric gradient."
-            );
-            return self.compute_laml_hessian_analytic_fallback(rho, Some(&bundle));
+        let decision = self.select_hessian_strategy_policy(rho, &bundle);
+        if decision.strategy != HessianEvalStrategyKind::SpectralExact {
+            if decision.reason == "active_subspace_unstable" {
+                let rel_gap = bundle.active_subspace_rel_gap.unwrap_or(f64::NAN);
+                log::warn!(
+                    "Exact LAML Hessian downgraded via policy (reason={}, rel_gap={:.3e}).",
+                    decision.reason,
+                    rel_gap
+                );
+            } else {
+                log::warn!(
+                    "Exact LAML Hessian downgraded via policy (reason={}).",
+                    decision.reason
+                );
+            }
+            return self.compute_laml_hessian_by_strategy(rho, &bundle, decision);
         }
-        if bundle.active_subspace_unstable {
-            let rel_gap = bundle.active_subspace_rel_gap.unwrap_or(f64::NAN);
-            log::warn!(
-                "Exact LAML Hessian downgraded to analytic fallback: unstable H_+ active subspace (rel_gap={:.3e}).",
-                rel_gap
-            );
-            return self.compute_laml_hessian_analytic_fallback(rho, Some(&bundle));
-        }
-        match self.compute_laml_hessian_exact(rho) {
+        match self.compute_laml_hessian_by_strategy(rho, &bundle, decision) {
             Ok(h) => Ok(h),
             Err(err) => {
                 log::warn!(
@@ -8219,12 +8333,12 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(super) fn compute_laml_hessian_exact(
+    pub(crate) fn compute_laml_hessian_exact(
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        if matches!(bundle.geometry, RemlGeometry::SparseExactSpd) {
+        if Self::geometry_backend_kind(&bundle) == GeometryBackendKind::SparseExactSpd {
             return self.compute_laml_hessian_sparse_exact(rho, &bundle);
         }
         // Full derivation for the dense transformed exact outer Hessian.
@@ -8893,8 +9007,9 @@ impl<'a> RemlState<'a> {
                                 let w_pos_t = w_pos_spectral_t
                                     .as_ref()
                                     .expect("spectral W^T present in spectral exact mode");
-                                let d2_aw =
-                                    Self::firth_hphi_second_direction_apply(op, &dirs[k], &dirs[l], w_pos);
+                                let d2_aw = Self::firth_hphi_second_direction_apply(
+                                    op, &dirs[k], &dirs[l], w_pos,
+                                );
                                 d2_trace_correction = Self::trace_product(w_pos_t, &d2_aw);
                             } else {
                                 // Exact dense-solve fallback for tr(H^{-1} D²H_phi[B_k,B_l])
@@ -8909,10 +9024,7 @@ impl<'a> RemlState<'a> {
                                         basis[[start + j, j]] = 1.0;
                                     }
                                     let d2_block = Self::firth_hphi_second_direction_apply(
-                                        op,
-                                        &dirs[k],
-                                        &dirs[l],
-                                        &basis,
+                                        op, &dirs[k], &dirs[l], &basis,
                                     );
                                     let solved_block = solve_h(&d2_block);
                                     for j in 0..width {
@@ -9018,14 +9130,14 @@ impl<'a> RemlState<'a> {
         Ok(hess)
     }
 
-    pub(super) fn compute_laml_hessian_analytic_fallback_standalone(
+    pub(crate) fn compute_laml_hessian_analytic_fallback_standalone(
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         self.compute_laml_hessian_analytic_fallback(rho, None)
     }
 
-    pub(super) fn compute_smoothing_correction_auto(
+    pub(crate) fn compute_smoothing_correction_auto(
         &self,
         final_rho: &Array1<f64>,
         final_fit: &PirlsResult,
@@ -9172,25 +9284,10 @@ impl<'a> RemlState<'a> {
         // points in parallel. Cache lookups/inserts use an exclusive lock in
         // execute_pirls_if_needed(), so leaving cache enabled serializes this
         // block under contention.
-        struct FlagRestoreGuard<'a> {
-            flag: &'a AtomicBool,
-            prev: bool,
-        }
-        impl Drop for FlagRestoreGuard<'_> {
-            fn drop(&mut self) {
-                self.flag.store(self.prev, Ordering::SeqCst);
-            }
-        }
-        let prev_cache = self.pirls_cache_enabled.swap(false, Ordering::SeqCst);
-        let _cache_guard = FlagRestoreGuard {
-            flag: &self.pirls_cache_enabled,
-            prev: prev_cache,
-        };
-        let prev_warm_start = self.warm_start_enabled.swap(false, Ordering::SeqCst);
-        let _warm_start_guard = FlagRestoreGuard {
-            flag: &self.warm_start_enabled,
-            prev: prev_warm_start,
-        };
+        let _cache_guard =
+            AtomicFlagGuard::swap(&self.cache_manager.pirls_cache_enabled, false, Ordering::SeqCst);
+        let _warm_start_guard =
+            AtomicFlagGuard::swap(&self.warm_start_enabled, false, Ordering::SeqCst);
         let point_results: Vec<Option<(Array2<f64>, Array1<f64>)>> = (0..sigma_points.len())
             .into_par_iter()
             .map(|idx| {
@@ -9359,7 +9456,7 @@ impl<'a> RemlState<'a> {
 
         // === Strategy 2: Component-wise FD (only if we detected other issues) ===
         // This is expensive, so rate-limit it unless diagnostics are severe.
-        let eval_idx = (*self.cost_eval_count.read().unwrap()).max(1);
+        let eval_idx = (*self.arena.cost_eval_count.read().unwrap()).max(1);
         let severe_envelope = report.envelope_audit.as_ref().is_some_and(|a| {
             a.kkt_residual_norm > GRAD_DIAG_SEVERE_KKT_NORM
                 || (a.inner_ridge - a.outer_ridge).abs() > GRAD_DIAG_SEVERE_RIDGE_MISMATCH
@@ -9377,20 +9474,11 @@ impl<'a> RemlState<'a> {
         let run_component_fd = report.has_issues()
             && (severe_envelope || severe_bleed || severe_ridge || periodic_sample);
         if run_component_fd {
-            struct CacheToggleGuard<'a> {
-                flag: &'a AtomicBool,
-                prev: bool,
-            }
-            impl Drop for CacheToggleGuard<'_> {
-                fn drop(&mut self) {
-                    self.flag.store(self.prev, Ordering::Relaxed);
-                }
-            }
-            let prev_cache = self.pirls_cache_enabled.swap(false, Ordering::Relaxed);
-            let _cache_guard = CacheToggleGuard {
-                flag: &self.pirls_cache_enabled,
-                prev: prev_cache,
-            };
+            let _cache_guard = AtomicFlagGuard::swap(
+                &self.cache_manager.pirls_cache_enabled,
+                false,
+                Ordering::Relaxed,
+            );
 
             let h = config.fd_step_size;
             let mut numeric_grad = Array1::<f64>::zeros(rho.len());
@@ -9451,7 +9539,7 @@ impl<'a> RemlState<'a> {
     // Returns (perturbed_rho, optional_corrected_covariance_in_transformed_basis)
     // The covariance is V'_beta_trans
     #[allow(dead_code)]
-    pub(super) fn perform_boundary_perturbation_correction(
+    pub(crate) fn perform_boundary_perturbation_correction(
         &self,
         initial_rho: &Array1<f64>,
     ) -> Result<(Array1<f64>, Option<Array2<f64>>), EstimationError> {

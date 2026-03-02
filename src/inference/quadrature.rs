@@ -173,7 +173,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::estimate::EstimationError;
-use crate::types::LinkFunction;
+use crate::types::{LikelihoodFamily, LinkFunction};
 use statrs::function::erf::erfc;
 
 /// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
@@ -220,6 +220,31 @@ pub struct IntegratedInverseLinkJet {
     pub d2: f64,
     pub d3: f64,
     pub mode: IntegratedExpectationMode,
+}
+
+/// Typed integrated moments/derivative jet used by solver integration paths.
+///
+/// `variance` is the observation-model variance at the integrated mean for the
+/// associated family (for binomial links: `mean * (1 - mean)`).
+#[derive(Clone, Copy, Debug)]
+pub struct IntegratedMomentsJet {
+    pub mean: f64,
+    pub variance: f64,
+    pub d1: f64,
+    pub d2: f64,
+    pub d3: f64,
+    pub mode: IntegratedExpectationMode,
+}
+
+/// Inference-layer contract used by solver code: request integrated moments
+/// for a family under Gaussian uncertainty in the linear predictor.
+pub trait IntegratedMomentsProvider {
+    fn evaluate_family_moments(
+        &self,
+        family: LikelihoodFamily,
+        eta: f64,
+        se_eta: f64,
+    ) -> Result<IntegratedMomentsJet, EstimationError>;
 }
 
 const LOGIT_SIGMA_DEGENERATE: f64 = 2.5e-1;
@@ -1942,6 +1967,84 @@ pub fn integrated_inverse_link_jet(
             d3: 0.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         },
+    }
+}
+
+/// Family-level integration dispatcher for Gaussian-uncertain linear predictors.
+///
+/// This is the solver-facing boundary: callers request integrated moments/jet by
+/// family, while all link-specific quadrature/special-function routing stays in
+/// the quadrature domain.
+#[inline]
+pub fn integrated_family_moments_jet(
+    quad_ctx: &QuadratureContext,
+    family: LikelihoodFamily,
+    eta: f64,
+    se_eta: f64,
+) -> Result<IntegratedMomentsJet, EstimationError> {
+    const PROB_EPS: f64 = 1e-12;
+    let e = eta.clamp(-700.0, 700.0);
+    let se = se_eta.max(0.0);
+    match family {
+        LikelihoodFamily::BinomialLogit => {
+            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Logit, e, se);
+            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
+        LikelihoodFamily::BinomialProbit => {
+            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Probit, e, se);
+            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
+        LikelihoodFamily::BinomialCLogLog => {
+            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::CLogLog, e, se);
+            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
+        LikelihoodFamily::GaussianIdentity => Ok(IntegratedMomentsJet {
+            mean: e,
+            variance: 1.0,
+            d1: 1.0,
+            d2: 0.0,
+            d3: 0.0,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        }),
+        LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
+            "Integrated moments dispatcher does not support Royston-Parmar family".to_string(),
+        )),
+    }
+}
+
+impl IntegratedMomentsProvider for QuadratureContext {
+    #[inline]
+    fn evaluate_family_moments(
+        &self,
+        family: LikelihoodFamily,
+        eta: f64,
+        se_eta: f64,
+    ) -> Result<IntegratedMomentsJet, EstimationError> {
+        integrated_family_moments_jet(self, family, eta, se_eta)
     }
 }
 
