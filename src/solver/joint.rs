@@ -26,10 +26,9 @@ use crate::construction::{
 };
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
-use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::quadrature::QuadratureContext;
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
-use crate::types::LinkFunction;
+use crate::types::{LikelihoodFamily, LinkFunction};
 use crate::visualizer;
 use faer::Side;
 use ndarray::s;
@@ -56,6 +55,16 @@ const JOINT_GRAD_AUDIT_INTERVAL: usize = 20;
 const JOINT_ENABLE_RUNTIME_FD_AUDIT: bool = cfg!(any(test, debug_assertions));
 const OUTER_BFGS_COST_BARRIER: f64 = 1e50;
 const OUTER_BFGS_GRAD_SCALE: f64 = 1e6;
+
+#[inline]
+fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<LikelihoodFamily> {
+    match link {
+        LinkFunction::Logit => Some(LikelihoodFamily::BinomialLogit),
+        LinkFunction::Probit => Some(LikelihoodFamily::BinomialProbit),
+        LinkFunction::CLogLog => Some(LikelihoodFamily::BinomialCLogLog),
+        LinkFunction::Identity => None,
+    }
+}
 
 #[inline]
 fn should_sample_joint_fd_audit(eval_num: usize) -> bool {
@@ -628,22 +637,21 @@ impl<'a> JointModelState<'a> {
         let mut weights = Array1::<f64>::zeros(n);
         let mut z_glm = Array1::<f64>::zeros(n);
         if let Some(se) = &self.covariate_se {
-            match self.link {
-                LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
-                    crate::pirls::update_glm_vectors_integrated_for_link(
-                        &self.quad_ctx,
-                        self.y,
-                        &eta,
-                        se.view(),
-                        self.link,
-                        self.weights,
-                        &mut mu,
-                        &mut weights,
-                        &mut z_glm,
-                        None,
-                    );
-                }
-                _ => crate::pirls::update_glm_vectors(
+            if let Some(family) = integrated_binomial_family_from_link(self.link) {
+                let _ = crate::pirls::update_glm_vectors_integrated_by_family(
+                    &self.quad_ctx,
+                    self.y,
+                    &eta,
+                    se.view(),
+                    family,
+                    self.weights,
+                    &mut mu,
+                    &mut weights,
+                    &mut z_glm,
+                    None,
+                );
+            } else {
+                crate::pirls::update_glm_vectors(
                     self.y,
                     &eta,
                     self.link.clone(),
@@ -652,7 +660,7 @@ impl<'a> JointModelState<'a> {
                     &mut weights,
                     &mut z_glm,
                     None,
-                ),
+                );
             }
         } else {
             crate::pirls::update_glm_vectors(
@@ -1432,87 +1440,38 @@ impl<'a> JointRemlState<'a> {
         let mut mu = Array1::<f64>::zeros(n);
         let mut weights = Array1::<f64>::zeros(n);
         let mut residual = Array1::<f64>::zeros(n);
-        match (&state.link, &state.covariate_se) {
-            (LinkFunction::Logit, Some(se)) => {
-                const PROB_EPS: f64 = 1e-8;
-                const MIN_DMU: f64 = 1e-6;
-                for i in 0..n {
-                    let e = eta[i].clamp(-700.0, 700.0);
-                    let se_i = se[i].max(0.0);
-                    // Joint-model integrated updates should use the same
-                    // Gaussian-uncertainty expectation engine as standalone
-                    // PIRLS and prediction. That keeps calibration / joint
-                    // inference on the same link-specific mathematics instead
-                    // of silently reverting to an older approximation path.
-                    let integrated = crate::quadrature::integrated_inverse_link_mean_and_derivative(
-                        &state.quad_ctx,
-                        LinkFunction::Logit,
-                        e,
-                        se_i,
-                    );
-                    let mu_i = integrated.mean;
-                    let dmu_deta = integrated.dmean_dmu;
-                    let mu_c = mu_i.clamp(PROB_EPS, 1.0 - PROB_EPS);
-                    mu[i] = mu_c;
-                    let var = (mu_c * (1.0 - mu_c)).max(PROB_EPS);
-                    let dmu_sq = dmu_deta * dmu_deta;
-                    let w = dmu_sq / var;
-                    weights[i] = state.weights[i] * w;
-                    let denom = dmu_deta.abs().max(MIN_DMU);
-                    residual[i] = weights[i] * (mu_c - state.y[i]) / denom;
-                }
-            }
-            (LinkFunction::Logit, None) => {
-                const PROB_EPS: f64 = 1e-8;
-                const MIN_WEIGHT: f64 = 1e-12;
-                const MIN_DMU: f64 = 1e-6;
-                for i in 0..n {
-                    let e = eta[i].clamp(-700.0, 700.0);
-                    let mu_i = (1.0 / (1.0 + (-e).exp())).clamp(PROB_EPS, 1.0 - PROB_EPS);
-                    mu[i] = mu_i;
-                    let dmu = (mu_i * (1.0 - mu_i)).max(MIN_WEIGHT);
-                    weights[i] = state.weights[i] * dmu;
-                    let denom = dmu.max(MIN_DMU);
-                    residual[i] = weights[i] * (mu_i - state.y[i]) / denom;
-                }
-            }
-            (LinkFunction::Identity, _) => {
+        match state.link {
+            LinkFunction::Identity => {
                 for i in 0..n {
                     mu[i] = eta[i];
                     weights[i] = state.weights[i];
                     residual[i] = weights[i] * (mu[i] - state.y[i]);
                 }
             }
-            (LinkFunction::Probit, _) => {
-                const PROB_EPS: f64 = 1e-8;
+            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
                 const MIN_WEIGHT: f64 = 1e-12;
                 const MIN_DMU: f64 = 1e-6;
+                let family = match state.link {
+                    LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
+                    LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
+                    LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+                    LinkFunction::Identity => unreachable!("identity handled above"),
+                };
                 for i in 0..n {
-                    let e = eta[i].clamp(-30.0, 30.0);
-                    let mu_i = normal_cdf_approx(e).clamp(PROB_EPS, 1.0 - PROB_EPS);
-                    mu[i] = mu_i;
-                    let dmu = normal_pdf(e).max(MIN_DMU);
-                    let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
-                    let w = ((dmu * dmu) / var).max(MIN_WEIGHT);
+                    let se_i = state.covariate_se.as_ref().map_or(0.0, |se| se[i]);
+                    let moments =
+                        crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
+                            &state.quad_ctx,
+                            family,
+                            eta[i],
+                            se_i,
+                        )
+                        .expect("binomial family moments must be available");
+                    let dmu = moments.d1.abs().max(MIN_DMU);
+                    mu[i] = moments.mean;
+                    let w = ((dmu * dmu) / moments.variance.max(1e-12)).max(MIN_WEIGHT);
                     weights[i] = state.weights[i] * w;
-                    residual[i] = weights[i] * (mu_i - state.y[i]) / dmu;
-                }
-            }
-            (LinkFunction::CLogLog, _) => {
-                const PROB_EPS: f64 = 1e-8;
-                const MIN_WEIGHT: f64 = 1e-12;
-                const MIN_DMU: f64 = 1e-6;
-                for i in 0..n {
-                    let e = eta[i].clamp(-30.0, 30.0);
-                    let exp_eta = e.exp();
-                    let surv = (-exp_eta).exp();
-                    let mu_i = (1.0 - surv).clamp(PROB_EPS, 1.0 - PROB_EPS);
-                    mu[i] = mu_i;
-                    let dmu = (exp_eta * surv).max(MIN_DMU);
-                    let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
-                    let w = ((dmu * dmu) / var).max(MIN_WEIGHT);
-                    weights[i] = state.weights[i] * w;
-                    residual[i] = weights[i] * (mu_i - state.y[i]) / dmu;
+                    residual[i] = weights[i] * (mu[i] - state.y[i]) / dmu;
                 }
             }
         }
@@ -1965,56 +1924,45 @@ impl<'a> JointRemlState<'a> {
         // differentiate IRLS curvature exactly in rho directions.
         let mut integrated_d1 = Array1::<f64>::zeros(n);
         let mut integrated_d2 = Array1::<f64>::zeros(n);
-        match (&state.link, &state.covariate_se) {
-            (LinkFunction::Logit, Some(se)) => {
-                const PROB_EPS: f64 = 1e-8;
-                const MIN_DMU: f64 = 1e-6;
-                for i in 0..n {
-                    let e = eta[i].clamp(-700.0, 700.0);
-                    let se_i = se[i].max(0.0);
-                    let jet = crate::quadrature::integrated_inverse_link_jet(
-                        &state.quad_ctx,
-                        LinkFunction::Logit,
-                        e,
-                        se_i,
-                    );
-                    let mu_i = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
-                    let d1 = jet.d1.max(MIN_DMU);
-                    let d2 = if jet.d2.is_finite() { jet.d2 } else { 0.0 };
-                    mu[i] = mu_i;
-                    integrated_d1[i] = d1;
-                    integrated_d2[i] = d2;
-                    let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
-                    let w = (d1 * d1 / var).max(1e-12);
-                    weights[i] = state.weights[i] * w;
-                    residual[i] = weights[i] * (mu_i - state.y[i]) / d1;
-                }
-            }
-            (LinkFunction::Logit, None) => {
-                const PROB_EPS: f64 = 1e-8;
-                const MIN_WEIGHT: f64 = 1e-12;
-                const MIN_DMU: f64 = 1e-6;
-                for i in 0..n {
-                    let e = eta[i].clamp(-700.0, 700.0);
-                    let mu_i = (1.0 / (1.0 + (-e).exp())).clamp(PROB_EPS, 1.0 - PROB_EPS);
-                    mu[i] = mu_i;
-                    let w = (mu_i * (1.0 - mu_i)).max(MIN_WEIGHT);
-                    weights[i] = state.weights[i] * w;
-                    let denom = w.max(MIN_DMU);
-                    residual[i] = weights[i] * (mu_i - state.y[i]) / denom;
-                }
-            }
-            (LinkFunction::Identity, _) => {
+        match state.link {
+            LinkFunction::Identity => {
                 for i in 0..n {
                     mu[i] = eta[i];
                     weights[i] = state.weights[i];
                     residual[i] = weights[i] * (mu[i] - state.y[i]);
                 }
             }
-            _ => {
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "analytic joint gradient unsupported for this link".to_string(),
-                ));
+            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+                const MIN_WEIGHT: f64 = 1e-12;
+                const MIN_DMU: f64 = 1e-6;
+                let family = match state.link {
+                    LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
+                    LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
+                    LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+                    LinkFunction::Identity => unreachable!("identity handled above"),
+                };
+                for i in 0..n {
+                    let se_i = state.covariate_se.as_ref().map_or(0.0, |se| se[i]);
+                    let moments =
+                        crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
+                            &state.quad_ctx,
+                            family,
+                            eta[i],
+                            se_i,
+                        )?;
+                    let d1 = moments.d1.abs().max(MIN_DMU);
+                    let d2 = if moments.d2.is_finite() {
+                        moments.d2
+                    } else {
+                        0.0
+                    };
+                    mu[i] = moments.mean;
+                    integrated_d1[i] = d1;
+                    integrated_d2[i] = d2;
+                    let w = (d1 * d1 / moments.variance.max(1e-12)).max(MIN_WEIGHT);
+                    weights[i] = state.weights[i] * w;
+                    residual[i] = weights[i] * (mu[i] - state.y[i]) / d1;
+                }
             }
         }
 
@@ -3356,31 +3304,34 @@ pub fn predict_joint(
         // Effective SE = |g'(η)| × SE_base
         let eff_se: Array1<f64> = deriv.mapv(f64::abs) * se;
 
-        let probs = match result.link {
-            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => (0..n)
+        let probs = if let Some(family) = integrated_binomial_family_from_link(result.link) {
+            (0..n)
                 .map(|i| {
-                    crate::quadrature::integrated_inverse_link_mean_and_derivative(
-                        &quad_ctx,
-                        result.link,
-                        eta_cal[i],
-                        eff_se[i],
+                    crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
+                        &quad_ctx, family, eta_cal[i], eff_se[i],
                     )
-                    .mean
+                    .map(|m| m.mean)
+                    .unwrap_or(f64::NAN)
                 })
-                .collect::<Array1<f64>>(),
-            LinkFunction::Identity => eta_cal.clone(),
+                .collect::<Array1<f64>>()
+        } else {
+            eta_cal.clone()
         };
 
         (probs, Some(eff_se))
     } else {
-        let probs = match result.link {
-            LinkFunction::Logit => eta_cal.mapv(|e| 1.0 / (1.0 + (-e).exp())),
-            LinkFunction::Probit => eta_cal.mapv(normal_cdf_approx),
-            LinkFunction::CLogLog => eta_cal.mapv(|e| {
-                let e = e.clamp(-30.0, 30.0);
-                1.0 - (-(e.exp())).exp()
-            }),
-            LinkFunction::Identity => eta_cal.clone(),
+        let probs = if let Some(family) = integrated_binomial_family_from_link(result.link) {
+            (0..n)
+                .map(|i| {
+                    crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
+                        &quad_ctx, family, eta_cal[i], 0.0,
+                    )
+                    .map(|m| m.mean)
+                    .unwrap_or(f64::NAN)
+                })
+                .collect::<Array1<f64>>()
+        } else {
+            eta_cal.clone()
         };
         (probs, None)
     };

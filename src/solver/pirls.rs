@@ -4558,39 +4558,27 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) {
-    let n = eta.len();
-    let zero_on_nonsmooth = matches!(link, LinkFunction::Logit) && logit_clamp_zero_enabled();
-    let mut derivatives = derivatives;
-    for i in 0..n {
-        let e = eta[i].clamp(-700.0, 700.0);
-        let se_i = se[i].max(0.0);
-        let jet = crate::quadrature::integrated_inverse_link_jet(quad_ctx, link, e, se_i);
-        let local_jet = InverseLinkJet {
-            mu: jet.mean,
-            d1: jet.d1,
-            d2: jet.d2,
-            d3: jet.d3,
-        };
-        let geom = bernoulli_geometry_from_jet(
-            eta[i],
-            e,
-            y[i],
-            prior_weights[i],
-            local_jet,
-            false,
-            zero_on_nonsmooth,
-        );
-        mu[i] = geom.mu;
-        weights[i] = geom.weight;
-        z[i] = geom.z;
-        if let Some(derivs) = derivatives.as_mut() {
-            derivs.c[i] = geom.c;
-            derivs.d[i] = geom.d;
-            derivs.dmu_deta[i] = local_jet.d1;
-            derivs.d2mu_deta2[i] = local_jet.d2;
-            derivs.d3mu_deta3[i] = local_jet.d3;
+    let family = match link {
+        LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
+        LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
+        LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+        LinkFunction::Identity => {
+            update_glm_vectors(y, eta, link, prior_weights, mu, weights, z, derivatives);
+            return;
         }
-    }
+    };
+    let _ = update_glm_vectors_integrated_by_family(
+        quad_ctx,
+        y,
+        eta,
+        se,
+        family,
+        prior_weights,
+        mu,
+        weights,
+        z,
+        derivatives,
+    );
 }
 
 /// Family-dispatched integrated GLM vector update helper.
@@ -4628,57 +4616,53 @@ pub fn update_glm_vectors_integrated_by_family(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
-    match family {
-        LikelihoodFamily::BinomialLogit => {
-            update_glm_vectors_integrated_for_link(
-                quad_ctx,
-                y,
-                eta,
-                se,
-                LinkFunction::Logit,
-                prior_weights,
-                mu,
-                weights,
-                z,
-                derivatives,
-            );
-            Ok(())
-        }
-        LikelihoodFamily::BinomialProbit => {
-            update_glm_vectors_integrated_for_link(
-                quad_ctx,
-                y,
-                eta,
-                se,
-                LinkFunction::Probit,
-                prior_weights,
-                mu,
-                weights,
-                z,
-                derivatives,
-            );
-            Ok(())
-        }
-        LikelihoodFamily::BinomialCLogLog => {
-            update_glm_vectors_integrated_for_link(
-                quad_ctx,
-                y,
-                eta,
-                se,
-                LinkFunction::CLogLog,
-                prior_weights,
-                mu,
-                weights,
-                z,
-                derivatives,
-            );
-            Ok(())
-        }
-        _ => Err(EstimationError::InvalidInput(format!(
+    if !matches!(
+        family,
+        LikelihoodFamily::BinomialLogit
+            | LikelihoodFamily::BinomialProbit
+            | LikelihoodFamily::BinomialCLogLog
+    ) {
+        return Err(EstimationError::InvalidInput(format!(
             "Integrated updates are not supported for family {:?}",
             family
-        ))),
+        )));
     }
+    let n = eta.len();
+    let zero_on_nonsmooth =
+        matches!(family, LikelihoodFamily::BinomialLogit) && logit_clamp_zero_enabled();
+    let mut derivatives = derivatives;
+    for i in 0..n {
+        let moments = crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
+            quad_ctx, family, eta[i], se[i],
+        )?;
+        let local_jet = InverseLinkJet {
+            mu: moments.mean,
+            d1: moments.d1,
+            d2: moments.d2,
+            d3: moments.d3,
+        };
+        let e = eta[i].clamp(-700.0, 700.0);
+        let geom = bernoulli_geometry_from_jet(
+            eta[i],
+            e,
+            y[i],
+            prior_weights[i],
+            local_jet,
+            false,
+            zero_on_nonsmooth,
+        );
+        mu[i] = geom.mu;
+        weights[i] = geom.weight;
+        z[i] = geom.z;
+        if let Some(derivs) = derivatives.as_mut() {
+            derivs.c[i] = geom.c;
+            derivs.d[i] = geom.d;
+            derivs.dmu_deta[i] = local_jet.d1;
+            derivs.d2mu_deta2[i] = local_jet.d2;
+            derivs.d3mu_deta3[i] = local_jet.d3;
+        }
+    }
+    Ok(())
 }
 
 /// Compute first/second eta derivatives of the PIRLS working curvature W(eta),

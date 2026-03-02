@@ -2469,5 +2469,5 @@ mod fd_policy_tests {
     }
 }
 
-#[path = "reml.rs"]
+#[path = "reml/mod.rs"]
 pub(crate) mod reml;
