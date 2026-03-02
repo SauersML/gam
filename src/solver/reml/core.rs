@@ -1,6 +1,6 @@
-use super::*;
 use super::cache::AtomicFlagGuard;
 use super::strategy::{GeometryBackendKind, HessianEvalStrategyKind, HessianStrategyDecision};
+use super::*;
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, SparseTraceWorkspace,
     assemble_and_factor_sparse_penalized_system, build_sparse_penalty_blocks,
@@ -9284,8 +9284,11 @@ impl<'a> RemlState<'a> {
         // points in parallel. Cache lookups/inserts use an exclusive lock in
         // execute_pirls_if_needed(), so leaving cache enabled serializes this
         // block under contention.
-        let _cache_guard =
-            AtomicFlagGuard::swap(&self.cache_manager.pirls_cache_enabled, false, Ordering::SeqCst);
+        let _cache_guard = AtomicFlagGuard::swap(
+            &self.cache_manager.pirls_cache_enabled,
+            false,
+            Ordering::SeqCst,
+        );
         let _warm_start_guard =
             AtomicFlagGuard::swap(&self.warm_start_enabled, false, Ordering::SeqCst);
         let point_results: Vec<Option<(Array2<f64>, Array1<f64>)>> = (0..sigma_points.len())

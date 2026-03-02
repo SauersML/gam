@@ -348,7 +348,7 @@ fn map_hessian_to_original_basis(
 }
 
 #[derive(Clone, Copy)]
-struct RemlConfig {
+pub(crate) struct RemlConfig {
     link_function: LinkFunction,
     convergence_tolerance: f64,
     max_iterations: usize,
