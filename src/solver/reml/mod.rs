@@ -1,7 +1,7 @@
 use super::*;
 
 mod cache;
-mod core;
+mod orchestrator;
 mod strategy;
 
-pub(crate) use core::{DirectionalHyperParam, RemlState};
+pub(crate) use orchestrator::{DirectionalHyperParam, RemlState};
