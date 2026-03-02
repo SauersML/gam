@@ -507,12 +507,18 @@ fn solve_block_weighted_system(
 
         if let Ok(ch) = FaerLlt::new(h.as_ref(), Side::Lower) {
             ch.solve_in_place(rhs_mat.as_mut());
-            for i in 0..p {
-                rhs[i] = rhs_mat[(i, 0)];
-            }
-            if rhs.iter().all(|v| v.is_finite()) {
-                return Ok(rhs);
-            }
+        } else if let Ok(ld) = FaerLdlt::new(h.as_ref(), Side::Lower) {
+            ld.solve_in_place(rhs_mat.as_mut());
+        } else {
+            let lb = FaerLblt::new(h.as_ref(), Side::Lower);
+            lb.solve_in_place(rhs_mat.as_mut());
+        }
+
+        for i in 0..p {
+            rhs[i] = rhs_mat[(i, 0)];
+        }
+        if rhs.iter().all(|v| v.is_finite()) {
+            return Ok(rhs);
         }
 
         if !ridge_policy.include_laplace_hessian {
@@ -2804,6 +2810,28 @@ mod tests {
                 beta_sparse[j]
             );
         }
+    }
+
+    #[test]
+    fn block_solve_falls_back_when_llt_rejects_indefinite_system() {
+        let x_dense = array![[1.0, 0.0], [0.0, 0.0]];
+        let y_star = array![2.0, 0.0];
+        let w = array![1.0, 1.0];
+        let s_lambda = array![[0.0, 0.0], [0.0, -1e-12]];
+
+        let beta = solve_block_weighted_system(
+            &DesignMatrix::Dense(x_dense),
+            &y_star,
+            &w,
+            &s_lambda,
+            1e-12,
+            RidgePolicy::explicit_stabilization_pospart(),
+        )
+        .expect("fallback solve should succeed");
+
+        assert!(beta.iter().all(|v| v.is_finite()));
+        assert!((beta[0] - 2.0).abs() < 1e-10, "unexpected solved coefficient");
+        assert!(beta[1].abs() < 1e-8, "null-space coefficient should stay near zero");
     }
 
     #[test]
