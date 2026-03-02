@@ -417,8 +417,147 @@ def log_loss_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> float:
     return float(-np.mean(y * np.log(p_clipped) + (1.0 - y) * np.log(1.0 - p_clipped)))
 
 
+def nagelkerke_r2_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> float | None:
+    y_arr = np.asarray(y, dtype=float).reshape(-1)
+    p_arr = np.clip(np.asarray(p, dtype=float).reshape(-1), eps, 1.0 - eps)
+    if y_arr.shape != p_arr.shape or y_arr.size == 0:
+        return None
+    p_mean = float(np.mean(y_arr))
+    if not np.isfinite(p_mean) or p_mean <= 0.0 or p_mean >= 1.0:
+        return None
+    ll_null = float(np.sum(y_arr * math.log(p_mean) + (1.0 - y_arr) * math.log(1.0 - p_mean)))
+    ll_model = float(np.sum(y_arr * np.log(p_arr) + (1.0 - y_arr) * np.log(1.0 - p_arr)))
+    n = int(y_arr.size)
+    r2_cs = 1.0 - math.exp((2.0 / n) * (ll_null - ll_model))
+    max_r2_cs = 1.0 - math.exp((2.0 / n) * ll_null)
+    if max_r2_cs <= 0.0:
+        return None
+    return float(r2_cs / max_r2_cs)
+
+
+def _survival_partial_loglik_stats(
+    event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray, eps: float = 1e-12
+) -> tuple[float | None, int]:
+    times = np.asarray(event_times, dtype=float).reshape(-1)
+    eta = np.asarray(risk_score, dtype=float).reshape(-1)
+    obs = (np.asarray(events, dtype=float).reshape(-1) > 0.5).astype(float)
+    if times.shape != eta.shape or times.shape != obs.shape or times.size == 0:
+        return None, 0
+
+    event_mask = obs > 0.5
+    if int(np.sum(event_mask)) == 0:
+        return None, 0
+
+    unique_event_times = np.unique(times[event_mask])
+    total = 0.0
+    n_events = 0
+    for t in unique_event_times:
+        d = (times == t) & event_mask
+        m = int(np.sum(d))
+        if m == 0:
+            continue
+        risk_set = times >= t
+        risk_eta = eta[risk_set]
+        if risk_eta.size == 0:
+            continue
+        max_eta = float(np.max(risk_eta))
+        log_denom = max_eta + math.log(float(np.sum(np.exp(risk_eta - max_eta))) + eps)
+        total += float(np.sum(eta[d])) - float(m) * log_denom
+        n_events += m
+
+    if n_events == 0:
+        return None, 0
+    return float(total), n_events
+
+
+def survival_partial_log_loss(
+    event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray, eps: float = 1e-12
+) -> float | None:
+    total, n_events = _survival_partial_loglik_stats(event_times, risk_score, events, eps=eps)
+    if total is None or n_events == 0:
+        return None
+    return float(-total / n_events)
+
+
+def survival_partial_nagelkerke_r2(
+    event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray, eps: float = 1e-12
+) -> float | None:
+    ll_model, n_events = _survival_partial_loglik_stats(event_times, risk_score, events, eps=eps)
+    if ll_model is None or n_events == 0:
+        return None
+    ll_null, _ = _survival_partial_loglik_stats(
+        event_times,
+        np.zeros_like(np.asarray(risk_score, dtype=float).reshape(-1)),
+        events,
+        eps=eps,
+    )
+    if ll_null is None:
+        return None
+    r2_cs = 1.0 - math.exp((2.0 / n_events) * (ll_null - ll_model))
+    max_r2_cs = 1.0 - math.exp((2.0 / n_events) * ll_null)
+    if max_r2_cs <= 0.0:
+        return None
+    return float(r2_cs / max_r2_cs)
+
+
+def survival_partial_brier_score(
+    event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray, eps: float = 1e-12
+) -> float | None:
+    times = np.asarray(event_times, dtype=float).reshape(-1)
+    eta = np.asarray(risk_score, dtype=float).reshape(-1)
+    obs = (np.asarray(events, dtype=float).reshape(-1) > 0.5).astype(float)
+    if times.shape != eta.shape or times.shape != obs.shape or times.size == 0:
+        return None
+
+    event_mask = obs > 0.5
+    if int(np.sum(event_mask)) == 0:
+        return None
+
+    unique_event_times = np.unique(times[event_mask])
+    total = 0.0
+    denom = 0
+    for t in unique_event_times:
+        d = (times == t) & event_mask
+        m = int(np.sum(d))
+        if m == 0:
+            continue
+        risk_set = times >= t
+        risk_eta = eta[risk_set]
+        if risk_eta.size == 0:
+            continue
+        max_eta = float(np.max(risk_eta))
+        weights = np.exp(risk_eta - max_eta)
+        probs = weights / max(float(np.sum(weights)), eps)
+        target = np.zeros_like(probs, dtype=float)
+        target[d[risk_set]] = 1.0 / m
+        score = float(np.sum((probs - target) ** 2))
+        total += float(m) * score
+        denom += m
+
+    if denom == 0:
+        return None
+    return float(total / denom)
+
+
 def rmse_score(y: np.ndarray, mu: np.ndarray) -> float:
     return math.sqrt(float(np.mean((y - mu) ** 2)))
+
+
+def mse_score(y: np.ndarray, mu: np.ndarray) -> float:
+    return float(np.mean((y - mu) ** 2))
+
+
+def gaussian_log_loss_score(y: np.ndarray, mu: np.ndarray, sigma: np.ndarray | float, eps: float = 1e-12) -> float:
+    y_arr = np.asarray(y, dtype=float).reshape(-1)
+    mu_arr = np.asarray(mu, dtype=float).reshape(-1)
+    sigma_arr = np.asarray(sigma, dtype=float)
+    if sigma_arr.ndim == 0:
+        sigma_use = np.full_like(y_arr, float(sigma_arr), dtype=float)
+    else:
+        sigma_use = sigma_arr.reshape(-1)
+    sigma_use = np.maximum(sigma_use, eps)
+    var = sigma_use**2
+    return float(np.mean(0.5 * np.log(2.0 * math.pi * var) + ((y_arr - mu_arr) ** 2) / (2.0 * var)))
 
 
 def mae_score(y: np.ndarray, mu: np.ndarray) -> float:
@@ -1621,6 +1760,11 @@ def aggregate_cv_rows(cv_rows, family):
     predict_sec = float(sum(float(r["predict_sec"]) for r in cv_rows))
 
     def wavg(key):
+        if key == "mse":
+            valid_rmse = [(r.get("rmse"), int(r["n_test"])) for r in cv_rows if r.get("rmse") is not None]
+            if valid_rmse:
+                denom = max(sum(w for _, w in valid_rmse), 1)
+                return float(sum((float(v) ** 2) * w for v, w in valid_rmse) / denom)
         valid = [(r.get(key), int(r["n_test"])) for r in cv_rows if r.get(key) is not None]
         if not valid:
             return None
@@ -1634,6 +1778,8 @@ def aggregate_cv_rows(cv_rows, family):
             "auc": wavg("auc"),
             "brier": wavg("brier"),
             "logloss": wavg("logloss"),
+            "nagelkerke_r2": wavg("nagelkerke_r2"),
+            "mse": None,
             "rmse": None,
             "mae": None,
             "r2": None,
@@ -1643,9 +1789,11 @@ def aggregate_cv_rows(cv_rows, family):
             "fit_sec": fit_sec,
             "predict_sec": predict_sec,
             "auc": wavg("auc"),  # concordance index
-            "brier": None,
-            "logloss": None,
+            "brier": wavg("brier"),
+            "logloss": wavg("logloss"),
             "c_index": wavg("auc"),
+            "nagelkerke_r2": wavg("nagelkerke_r2"),
+            "mse": None,
             "rmse": None,
             "mae": None,
             "r2": None,
@@ -1655,7 +1803,9 @@ def aggregate_cv_rows(cv_rows, family):
         "predict_sec": predict_sec,
         "auc": None,
         "brier": None,
-        "logloss": None,
+        "logloss": wavg("logloss"),
+        "nagelkerke_r2": None,
+        "mse": wavg("mse"),
         "rmse": wavg("rmse"),
         "mae": wavg("mae"),
         "r2": wavg("r2"),
@@ -1844,7 +1994,9 @@ def _rust_formula_for_scenario(scenario_name, ds):
             elif basis in {"thinplate", "tps"}:
                 terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
             elif basis == "duchon":
-                terms.append(f"s({col}, type=duchon, centers={knot_count}{dp_opt})")
+                terms.append(
+                    f"s({col}, type=duchon, centers={knot_count}, order=0, power=1{dp_opt})"
+                )
             elif basis == "matern":
                 terms.append(f"s({col}, type=matern, centers={knot_count}{dp_opt})")
             else:
@@ -1861,7 +2013,12 @@ def _rust_formula_for_scenario(scenario_name, ds):
         elif basis in {"ps", "bspline", "p-spline"}:
             terms.append(f"s({col}, type=ps, knots={knot_count})")
         elif basis in {"duchon", "matern"}:
-            terms.append(f"s({col}, type={basis}, centers={knot_count}{dp_opt})")
+            if basis == "duchon":
+                terms.append(
+                    f"s({col}, type=duchon, centers={knot_count}, order=0, power=1{dp_opt})"
+                )
+            else:
+                terms.append(f"s({col}, type={basis}, centers={knot_count}{dp_opt})")
         else:
             raise RuntimeError(
                 f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
@@ -1887,10 +2044,7 @@ def _mgcv_formula_for_scenario(scenario_name, ds):
     elif basis in {"thinplate", "tps"}:
         bs_code = "tp"
     elif basis == "duchon":
-        # Keep Duchon settings explicit for reproducibility/fairness.
-        # Rust defaults to Duchon nullspace order=1 (linear trend retained), so
-        # we set mgcv's Duchon derivative order explicitly as m[1]=1.
-        # m[2]=0 keeps the standard weighting in 1D smooths used by this harness.
+        # Keep Duchon settings explicit in the external contender formula.
         bs_code = "ds"
     elif basis == "matern":
         # Use explicit stationary Matérn GP in mgcv:
@@ -2030,6 +2184,7 @@ def run_rust_scenario_cv(scenario):
             test_path = td_path / f"test_{fold_id}.csv"
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
+            train_pred_path = td_path / f"pred_train_{fold_id}.csv"
 
             if ds["family"] == "survival":
                 fit_feature_cols = list(ds["features"])
@@ -2165,16 +2320,46 @@ def run_rust_scenario_cv(scenario):
                         "auc": auc_score(y_test, pred),
                         "brier": brier_score(y_test, pred),
                         "logloss": log_loss_score(y_test, pred),
+                        "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": "gam fit/predict via release binary [5-fold CV]",
                     }
                 )
             elif ds["family"] == "gaussian":
                 y_test = test_df[ds["target"]].to_numpy(dtype=float)
+                train_pred_cmd = [
+                    str(rust_bin),
+                    "predict",
+                    str(model_path),
+                    str(train_path),
+                    "--out",
+                    str(train_pred_path),
+                ]
+                code, out, err = run_cmd(train_pred_cmd, cwd=ROOT)
+                if code != 0:
+                    return {
+                        "contender": "rust_gam",
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "error": (err.strip() or out.strip() or "rust train-predict failed"),
+                    }
+                train_pred_df = pd.read_csv(train_pred_path)
+                if "mean" not in train_pred_df.columns:
+                    return {
+                        "contender": "rust_gam",
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "error": "rust train prediction output missing 'mean' column",
+                    }
+                y_train = train_df[ds["target"]].to_numpy(dtype=float)
+                pred_train = train_pred_df["mean"].to_numpy(dtype=float)
+                sigma_hat = max(rmse_score(y_train, pred_train), 1e-12)
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
                         "predict_sec": float(pred_sec),
+                        "logloss": gaussian_log_loss_score(y_test, pred, sigma_hat),
+                        "mse": mse_score(y_test, pred),
                         "rmse": rmse_score(y_test, pred),
                         "mae": mae_score(y_test, pred),
                         "r2": r2_score(y_test, pred),
@@ -2200,6 +2385,9 @@ def run_rust_scenario_cv(scenario):
                         "fit_sec": float(fit_sec),
                         "predict_sec": float(pred_sec),
                         "auc": cidx,
+                        "brier": survival_partial_brier_score(event_times, risk_score, events),
+                        "logloss": survival_partial_log_loss(event_times, risk_score, events),
+                        "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk_score, events),
                         "n_test": int(len(fold.test_idx)),
                         "predict_horizon": float(horizon),
                         "predict_horizon_policy": "global train-fold median time",
@@ -2330,6 +2518,7 @@ def run_rust_gamlss_scenario_cv(scenario):
                     "auc": auc_score(y_test, pred),
                     "brier": brier_score(y_test, pred),
                     "logloss": log_loss_score(y_test, pred),
+                    "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
                     "n_test": int(len(fold.test_idx)),
                     "model_spec": "gamlss binomial-probit location-scale via release binary [5-fold CV]",
                 }
@@ -2487,6 +2676,17 @@ if (n_pos == 0 || n_neg == 0) {
 
 brier <- mean((y_test - p)^2)
 logloss <- mean(-(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe)))
+p_mean <- mean(y_test)
+if (is.finite(p_mean) && p_mean > 0 && p_mean < 1) {
+  ll_null <- sum(y_test * log(p_mean) + (1 - y_test) * log(1 - p_mean))
+  ll_model <- sum(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe))
+  n_obs <- length(y_test)
+  r2_cs <- 1 - exp((2 / n_obs) * (ll_null - ll_model))
+  max_r2_cs <- 1 - exp((2 / n_obs) * ll_null)
+  nagelkerke_r2 <- if (max_r2_cs > 0) r2_cs / max_r2_cs else NULL
+} else {
+  nagelkerke_r2 <- NULL
+}
 out <- list(
   status="ok",
   fit_sec=fit_sec,
@@ -2494,6 +2694,7 @@ out <- list(
   auc=auc,
   brier=brier,
   logloss=logloss,
+  nagelkerke_r2=nagelkerke_r2,
   rmse=NULL,
   mae=NULL,
   r2=NULL,
@@ -2730,6 +2931,17 @@ if (family_name == "binomial") {
   brier <- mean((y_test - p)^2)
   p_safe <- pmin(pmax(p, 1e-12), 1 - 1e-12)
   logloss <- mean(-(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe)))
+  p_mean <- mean(y_test)
+  if (is.finite(p_mean) && p_mean > 0 && p_mean < 1) {
+    ll_null <- sum(y_test * log(p_mean) + (1 - y_test) * log(1 - p_mean))
+    ll_model <- sum(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe))
+    n_obs <- length(y_test)
+    r2_cs <- 1 - exp((2 / n_obs) * (ll_null - ll_model))
+    max_r2_cs <- 1 - exp((2 / n_obs) * ll_null)
+    nagelkerke_r2 <- if (max_r2_cs > 0) r2_cs / max_r2_cs else NULL
+  } else {
+    nagelkerke_r2 <- NULL
+  }
   out <- list(
     status="ok",
     fit_sec=fit_sec,
@@ -2737,12 +2949,16 @@ if (family_name == "binomial") {
     auc=auc,
     brier=brier,
     logloss=logloss,
+    nagelkerke_r2=nagelkerke_r2,
     rmse=NULL,
     mae=NULL,
     r2=NULL,
     model_spec=ftxt
   )
 } else {
+  p_train <- as.numeric(predict(fit, newdata=train_df, type="response"))
+  sigma_hat <- sqrt(mean((as.numeric(train_df[[target_name]]) - p_train)^2))
+  sigma_hat <- max(sigma_hat, 1e-12)
   rmse <- sqrt(mean((y_test - p)^2))
   mae <- mean(abs(y_test - p))
   sst <- sum((y_test - mean(y_test))^2)
@@ -2751,13 +2967,14 @@ if (family_name == "binomial") {
   } else {
     r2 <- 1.0 - sum((y_test - p)^2) / sst
   }
+  logloss <- mean(0.5 * log(2 * pi * sigma_hat^2) + ((y_test - p)^2) / (2 * sigma_hat^2))
   out <- list(
     status="ok",
     fit_sec=fit_sec,
     predict_sec=pred_sec,
     auc=NULL,
     brier=NULL,
-    logloss=NULL,
+    logloss=logloss,
     rmse=rmse,
     mae=mae,
     r2=r2,
@@ -2814,6 +3031,9 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                         ),
                     }
                 fold_row["auc"] = _lifelines_cindex_from_risk(event_times, risk, events)
+                fold_row["brier"] = survival_partial_brier_score(event_times, risk, events)
+                fold_row["logloss"] = survival_partial_log_loss(event_times, risk, events)
+                fold_row["nagelkerke_r2"] = survival_partial_nagelkerke_r2(event_times, risk, events)
                 fold_row.pop("risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
@@ -2932,10 +3152,19 @@ if (ncol(pred) < 1) {
   quit(save="no")
 }
 p <- as.numeric(pred[,1])
+if (ncol(pred) >= 2) {
+  sigma_hat <- pmax(as.numeric(pred[,2]), 1e-12)
+} else {
+  pred_train <- as.matrix(predict(fit, newdata=train_df, type="response"))
+  mu_train <- as.numeric(pred_train[,1])
+  sigma_fallback <- sqrt(mean((as.numeric(train_df[[target_name]]) - mu_train)^2))
+  sigma_hat <- rep(max(sigma_fallback, 1e-12), length(y_test))
+}
 rmse <- sqrt(mean((y_test - p)^2))
 mae <- mean(abs(y_test - p))
 sst <- sum((y_test - mean(y_test))^2)
 r2 <- if (sst <= 0) 0.0 else 1.0 - sum((y_test - p)^2) / sst
+logloss <- mean(0.5 * log(2 * pi * sigma_hat^2) + ((y_test - p)^2) / (2 * sigma_hat^2))
 
 out <- list(
   status="ok",
@@ -2943,7 +3172,7 @@ out <- list(
   predict_sec=pred_sec,
   auc=NULL,
   brier=NULL,
-  logloss=NULL,
+  logloss=logloss,
   rmse=rmse,
   mae=mae,
   r2=r2,
@@ -3144,11 +3373,38 @@ if (inherits(p, "error")) {
   write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
   quit(save="no")
 }
+sigma_pred <- tryCatch(
+  as.numeric(predict(fit, newdata=test_df, parameter="sigma", type="response")),
+  error=function(e) e
+)
+if (inherits(sigma_pred, "error")) {
+  sigma_pred <- tryCatch(
+    as.numeric(predict(fit, newdata=test_df, which="sigma", type="response")),
+    error=function(e) e
+  )
+}
+if (inherits(sigma_pred, "error")) {
+  p_train <- tryCatch(
+    as.numeric(predict(fit, newdata=train_df, parameter="mu", type="response")),
+    error=function(e) e
+  )
+  if (inherits(p_train, "error")) {
+    p_train <- tryCatch(
+      as.numeric(predict(fit, newdata=train_df, which="mu", type="response")),
+      error=function(e) e
+    )
+  }
+  sigma_hat <- max(sqrt(mean((as.numeric(train_df[[target_name]]) - as.numeric(p_train))^2)), 1e-12)
+  sigma_pred <- rep(sigma_hat, length(y_test))
+} else {
+  sigma_pred <- pmax(as.numeric(sigma_pred), 1e-12)
+}
 
 rmse <- sqrt(mean((y_test - p)^2))
 mae <- mean(abs(y_test - p))
 sst <- sum((y_test - mean(y_test))^2)
 r2 <- if (sst <= 0) 0.0 else 1.0 - sum((y_test - p)^2) / sst
+logloss <- mean(0.5 * log(2 * pi * sigma_pred^2) + ((y_test - p)^2) / (2 * sigma_pred^2))
 
 out <- list(
   status="ok",
@@ -3156,7 +3412,7 @@ out <- list(
   predict_sec=pred_sec,
   auc=NULL,
   brier=NULL,
-  logloss=NULL,
+  logloss=logloss,
   rmse=rmse,
   mae=mae,
   r2=r2,
@@ -3364,11 +3620,52 @@ if (inherits(p, "error")) {
   write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
   quit(save="no")
 }
+sigma_attempt <- function(data_arg) {
+  s <- tryCatch(
+    as.numeric(predict(fit, newdata=data_arg, model="sigma", type="response")),
+    error=function(e) e
+  )
+  if (!inherits(s, "error")) return(s)
+  s <- tryCatch(
+    as.numeric(predict(fit, newdata=data_arg, parameter="sigma", type="response")),
+    error=function(e) e
+  )
+  if (!inherits(s, "error")) return(s)
+  s <- tryCatch(
+    as.numeric(fitted(fit, model="sigma", newdata=data_arg)),
+    error=function(e) e
+  )
+  s
+}
+sigma_pred <- sigma_attempt(test_df)
+if (inherits(sigma_pred, "error")) {
+  p_train <- tryCatch(
+    as.numeric(predict(fit, newdata=train_df, model="mu", type="response")),
+    error=function(e) e
+  )
+  if (inherits(p_train, "error")) {
+    p_train <- tryCatch(
+      as.numeric(predict(fit, newdata=train_df, parameter="mu", type="response")),
+      error=function(e) e
+    )
+  }
+  if (inherits(p_train, "error")) {
+    p_train <- tryCatch(
+      as.numeric(fitted(fit, model="mu", newdata=train_df)),
+      error=function(e) e
+    )
+  }
+  sigma_hat <- max(sqrt(mean((as.numeric(train_df[[target_name]]) - as.numeric(p_train))^2)), 1e-12)
+  sigma_pred <- rep(sigma_hat, length(y_test))
+} else {
+  sigma_pred <- pmax(as.numeric(sigma_pred), 1e-12)
+}
 
 rmse <- sqrt(mean((y_test - p)^2))
 mae <- mean(abs(y_test - p))
 sst <- sum((y_test - mean(y_test))^2)
 r2 <- if (sst <= 0) 0.0 else 1.0 - sum((y_test - p)^2) / sst
+logloss <- mean(0.5 * log(2 * pi * sigma_pred^2) + ((y_test - p)^2) / (2 * sigma_pred^2))
 
 out <- list(
   status="ok",
@@ -3376,7 +3673,7 @@ out <- list(
   predict_sec=pred_sec,
   auc=NULL,
   brier=NULL,
-  logloss=NULL,
+  logloss=logloss,
   rmse=rmse,
   mae=mae,
   r2=r2,
@@ -3536,11 +3833,23 @@ if (inherits(p, "error")) {
   write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
   quit(save="no")
 }
+sigma_pred <- tryCatch(
+  as.numeric(fitted(fit, dpar="sigma", newdata=test_df, summary=TRUE)[, "Estimate"]),
+  error=function(e) e
+)
+if (inherits(sigma_pred, "error")) {
+  p_train <- as.numeric(fitted(fit, newdata=train_df, summary=TRUE)[, "Estimate"])
+  sigma_hat <- max(sqrt(mean((as.numeric(train_df[[target_name]]) - p_train)^2)), 1e-12)
+  sigma_pred <- rep(sigma_hat, length(y_test))
+} else {
+  sigma_pred <- pmax(as.numeric(sigma_pred), 1e-12)
+}
 
 rmse <- sqrt(mean((y_test - p)^2))
 mae <- mean(abs(y_test - p))
 sst <- sum((y_test - mean(y_test))^2)
 r2 <- if (sst <= 0) 0.0 else 1.0 - sum((y_test - p)^2) / sst
+logloss <- mean(0.5 * log(2 * pi * sigma_pred^2) + ((y_test - p)^2) / (2 * sigma_pred^2))
 
 out <- list(
   status="ok",
@@ -3548,7 +3857,7 @@ out <- list(
   predict_sec=pred_sec,
   auc=NULL,
   brier=NULL,
-  logloss=NULL,
+  logloss=logloss,
   rmse=rmse,
   mae=mae,
   r2=r2,
@@ -3778,6 +4087,9 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     ),
                 }
             fold_row["auc"] = _lifelines_cindex_from_risk(event_times, risk, events)
+            fold_row["brier"] = survival_partial_brier_score(event_times, risk, events)
+            fold_row["logloss"] = survival_partial_log_loss(event_times, risk, events)
+            fold_row["nagelkerke_r2"] = survival_partial_nagelkerke_r2(event_times, risk, events)
             fold_row.pop("risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
@@ -3849,6 +4161,9 @@ def run_external_pygam_cv(scenario):
                     "fit_sec": fit_sec,
                     "predict_sec": pred_sec,
                     "auc": cidx,
+                    "brier": survival_partial_brier_score(event_times, risk, events),
+                    "logloss": survival_partial_log_loss(event_times, risk, events),
+                    "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
                     "n_test": int(len(fold.test_idx)),
                     "warning": (
                         f"lifelines convergence warning: {str(conv_warn[0].message)}"
@@ -4010,6 +4325,7 @@ def run_external_pygam_cv(scenario):
                     "auc": auc_score(y_test, pred),
                     "brier": brier_score(y_test, pred),
                     "logloss": log_loss_score(y_test, pred),
+                    "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
                     "n_test": int(len(fold.test_idx)),
                     "model_spec": model_spec,
                 }
@@ -4040,11 +4356,15 @@ def run_external_pygam_cv(scenario):
         pred_start = datetime.now(timezone.utc)
         pred = model.predict(x_test).astype(float)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
+        pred_train = model.predict(x_train).astype(float)
+        sigma_hat = max(rmse_score(y_train, pred_train), 1e-12)
 
         cv_rows.append(
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
+                "logloss": gaussian_log_loss_score(y_test, pred, sigma_hat),
+                "mse": mse_score(y_test, pred),
                 "rmse": rmse_score(y_test, pred),
                 "mae": mae_score(y_test, pred),
                 "r2": r2_score(y_test, pred),
@@ -4123,6 +4443,9 @@ def run_external_sksurv_rsf_cv(scenario):
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
                 "auc": _lifelines_cindex_from_risk(event_times, risk, events),
+                "brier": survival_partial_brier_score(event_times, risk, events),
+                "logloss": survival_partial_log_loss(event_times, risk, events),
+                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": (
                     "RandomSurvivalForest("
@@ -4195,6 +4518,9 @@ def run_external_sksurv_coxnet_cv(scenario):
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
                 "auc": _lifelines_cindex_from_risk(event_times, risk, events),
+                "brier": survival_partial_brier_score(event_times, risk, events),
+                "logloss": survival_partial_log_loss(event_times, risk, events),
+                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": "CoxnetSurvivalAnalysis(l1_ratio=0.5, alpha_min_ratio=0.01)",
             }
@@ -4256,6 +4582,9 @@ def run_external_lifelines_coxph_enet_cv(scenario):
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
                 "auc": _lifelines_cindex_from_risk(event_times, risk, events),
+                "brier": survival_partial_brier_score(event_times, risk, events),
+                "logloss": survival_partial_log_loss(event_times, risk, events),
+                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
                 "n_test": int(len(fold.test_idx)),
                 "warning": (
                     f"lifelines convergence warning: {str(conv_warn[0].message)}"
@@ -4434,6 +4763,9 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     ),
                 }
             fold_row["auc"] = _lifelines_cindex_from_risk(event_times, risk, events)
+            fold_row["brier"] = survival_partial_brier_score(event_times, risk, events)
+            fold_row["logloss"] = survival_partial_log_loss(event_times, risk, events)
+            fold_row["nagelkerke_r2"] = survival_partial_nagelkerke_r2(event_times, risk, events)
             fold_row.pop("risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
@@ -4501,6 +4833,9 @@ def run_external_sksurv_gb_cv(scenario):
                     "fit_sec": fit_sec,
                     "predict_sec": pred_sec,
                     "auc": _lifelines_cindex_from_risk(event_times, risk, events),
+                    "brier": survival_partial_brier_score(event_times, risk, events),
+                    "logloss": survival_partial_log_loss(event_times, risk, events),
+                    "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
                     "n_test": int(len(fold.test_idx)),
                     "model_spec": model_spec,
                 }
@@ -4589,6 +4924,9 @@ def run_external_lifelines_aft_cv(scenario):
                     "fit_sec": fit_sec,
                     "predict_sec": pred_sec,
                     "auc": _lifelines_cindex_from_risk(event_times, risk, events),
+                    "brier": survival_partial_brier_score(event_times, risk, events),
+                    "logloss": survival_partial_log_loss(event_times, risk, events),
+                    "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
                     "n_test": int(len(fold.test_idx)),
                     "warning": (
                         f"lifelines convergence warning: {str(conv_warn[0].message)}"
@@ -4699,6 +5037,9 @@ def run_external_xgboost_aft_cv(scenario):
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
                 "auc": _lifelines_cindex_from_risk(event_times, risk, events),
+                "brier": survival_partial_brier_score(event_times, risk, events),
+                "logloss": survival_partial_log_loss(event_times, risk, events),
+                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": (
                     "xgboost.train(objective='survival:aft',loss='normal',scale=1.0,"

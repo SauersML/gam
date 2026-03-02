@@ -222,7 +222,7 @@ def native_surface_predict(train_xy, z_obs, eval_xy, basis_type, centers=30, ell
         )
     elif basis_type == "duchon":
         smooth = (
-            f"s(x, y, type=duchon, centers={int(centers)}, nu=1/2, order=1, "
+            f"s(x, y, type=duchon, centers={int(centers)}, power=1, order=1, "
             f"length_scale={float(ell)}, double_penalty=true)"
         )
     else:

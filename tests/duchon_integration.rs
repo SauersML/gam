@@ -1,5 +1,5 @@
 use gam::{
-    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, FitOptions, LikelihoodFamily, MaternNu,
+    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, FitOptions, LikelihoodFamily,
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, fit_term_collection,
     predict_gam,
 };
@@ -43,8 +43,7 @@ fn simulate_duchon_regression(n: usize, d: usize) -> (Array2<f64>, Array1<f64>, 
     (x, y, y_true)
 }
 
-#[test]
-fn duchon_fit_term_collection_gaussian_simulated_10d() {
+fn fit_duchon_simulated_10d(power: usize, nullspace_order: DuchonNullspaceOrder) {
     let n = 900usize;
     let d = 10usize;
     let (x, y, y_true) = simulate_duchon_regression(n, d);
@@ -59,8 +58,8 @@ fn duchon_fit_term_collection_gaussian_simulated_10d() {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 36 },
                     length_scale: 0.9,
-                    nu: MaternNu::FiveHalves,
-                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    power,
+                    nullspace_order,
                     double_penalty: true,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                 },
@@ -119,4 +118,14 @@ fn duchon_fit_term_collection_gaussian_simulated_10d() {
         mse_model < 0.45 * mse_baseline,
         "Duchon integration fit is too inaccurate: mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e}"
     );
+}
+
+#[test]
+fn duchon_fit_term_collection_gaussian_simulated_10d_default_like_config() {
+    fit_duchon_simulated_10d(1, DuchonNullspaceOrder::Zero);
+}
+
+#[test]
+fn duchon_fit_term_collection_gaussian_simulated_10d_p1_s0() {
+    fit_duchon_simulated_10d(0, DuchonNullspaceOrder::Linear);
 }

@@ -1,10 +1,11 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
     BasisMetadata, BasisPsiDerivativeResult, DuchonBasisSpec, MaternBasisSpec,
-    MaternIdentifiability, SpatialIdentifiability, ThinPlateBasisSpec,
-    apply_sum_to_zero_constraint, apply_weighted_orthogonality_constraint, build_bspline_basis_1d,
-    build_duchon_basis, build_matern_basis, build_matern_basis_log_kappa_derivative,
-    build_thin_plate_basis, estimate_penalty_nullity,
+    MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
+    ThinPlateBasisSpec, apply_sum_to_zero_constraint, apply_weighted_orthogonality_constraint,
+    build_bspline_basis_1d, build_duchon_basis, build_matern_basis,
+    build_matern_basis_log_kappa_derivative, build_thin_plate_basis, estimate_penalty_nullity,
+    filter_active_penalty_candidates,
 };
 use crate::construction::kronecker_product;
 use crate::custom_family::{
@@ -14,6 +15,7 @@ use crate::custom_family::{
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitOptions, FitResult,
     compute_external_joint_hyper_cost_gradient, fit_gam_with_heuristic_lambdas,
+    reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
 use crate::matrix::DesignMatrix;
@@ -104,6 +106,7 @@ pub struct SmoothTerm {
     pub shape: ShapeConstraint,
     pub penalties_local: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
+    pub penalty_info_local: Vec<PenaltyInfo>,
     pub metadata: BasisMetadata,
     /// Optional term-local lower bounds for constrained coefficients.
     /// `-inf` means unconstrained.
@@ -113,11 +116,26 @@ pub struct SmoothTerm {
     pub linear_constraints_local: Option<LinearInequalityConstraints>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PenaltyBlockInfo {
+    pub global_index: usize,
+    pub term_name: Option<String>,
+    pub penalty: PenaltyInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DroppedPenaltyBlockInfo {
+    pub term_name: Option<String>,
+    pub penalty: PenaltyInfo,
+}
+
 #[derive(Debug, Clone)]
 pub struct SmoothDesign {
     pub design: Array2<f64>,
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
+    pub penalty_info: Vec<PenaltyBlockInfo>,
+    pub dropped_penalty_info: Vec<DroppedPenaltyBlockInfo>,
     pub terms: Vec<SmoothTerm>,
     /// Optional smooth-block lower bounds in smooth coefficient coordinates.
     /// Length equals `design.ncols()` when present.
@@ -197,6 +215,8 @@ pub struct TermCollectionDesign {
     pub design: Array2<f64>,
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
+    pub penalty_info: Vec<PenaltyBlockInfo>,
+    pub dropped_penalty_info: Vec<DroppedPenaltyBlockInfo>,
     /// Optional global coefficient lower bounds for constrained fitting.
     /// Length equals `design.ncols()` when present. Unconstrained entries are `-inf`.
     pub coefficient_lower_bounds: Option<Array1<f64>>,
@@ -221,6 +241,17 @@ pub struct FittedTermCollectionWithSpec {
     pub fit: FitResult,
     pub design: TermCollectionDesign,
     pub resolved_spec: TermCollectionSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FittedPenaltyBlockReport {
+    pub global_index: usize,
+    pub term_name: Option<String>,
+    pub source: PenaltySource,
+    pub effective_rank: usize,
+    pub nullspace_dim: usize,
+    pub lambda: Option<f64>,
+    pub edf: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -467,7 +498,6 @@ impl LinearFitConditioning {
             (min, max)
         }
     }
-
 }
 
 fn cumulative_exp(values: &Array1<f64>, sign: f64) -> Array1<f64> {
@@ -669,7 +699,7 @@ fn build_shape_constraint_design_1d(
             BasisMetadata::Duchon {
                 centers,
                 length_scale,
-                nu,
+                power,
                 nullspace_order,
                 ..
             },
@@ -677,7 +707,7 @@ fn build_shape_constraint_design_1d(
             let eval_spec = DuchonBasisSpec {
                 center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
                 length_scale: *length_scale,
-                nu: *nu,
+                power: *power,
                 nullspace_order: *nullspace_order,
                 double_penalty: false,
                 identifiability: spec.identifiability.clone(),
@@ -906,7 +936,7 @@ fn build_tensor_bspline_basis(
     let mut design = tensor_product_design_from_marginals(&marginal_designs)?;
 
     let total_cols = design.ncols();
-    let mut penalties = Vec::<Array2<f64>>::with_capacity(
+    let mut candidates = Vec::<PenaltyCandidate>::with_capacity(
         marginal_penalties.len() + if spec.double_penalty { 1 } else { 0 },
     );
 
@@ -921,11 +951,19 @@ fn build_tensor_bspline_basis(
             s_dim = kronecker_product(&s_dim, &factor);
         }
 
-        penalties.push(s_dim);
+        candidates.push(PenaltyCandidate {
+            matrix: s_dim,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::TensorMarginal { dim },
+        });
     }
 
     if spec.double_penalty {
-        penalties.push(Array2::<f64>::eye(total_cols));
+        candidates.push(PenaltyCandidate {
+            matrix: Array2::<f64>::eye(total_cols),
+            nullspace_dim_hint: 0,
+            source: PenaltySource::TensorGlobalRidge,
+        });
     }
 
     let z_opt = match &spec.identifiability {
@@ -953,24 +991,37 @@ fn build_tensor_bspline_basis(
 
     if let Some(z) = z_opt.as_ref() {
         design = design.dot(z);
-        penalties = penalties
+        candidates = candidates
             .into_iter()
-            .map(|s| {
-                let zt_s = z.t().dot(&s);
-                zt_s.dot(z)
+            .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
+                let zt_s = z.t().dot(&candidate.matrix);
+                let matrix = zt_s.dot(z);
+                Ok(PenaltyCandidate {
+                    nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                    matrix,
+                    source: candidate.source,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
+    } else {
+        candidates = candidates
+            .into_iter()
+            .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
+                Ok(PenaltyCandidate {
+                    nullspace_dim_hint: estimate_penalty_nullity(&candidate.matrix)?,
+                    ..candidate
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
     }
 
-    let nullspace_dims = penalties
-        .iter()
-        .map(estimate_penalty_nullity)
-        .collect::<Result<Vec<_>, _>>()?;
+    let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
 
     Ok(BasisBuildResult {
         design,
         penalties,
         nullspace_dims,
+        penalty_info,
         metadata: BasisMetadata::TensorBSpline {
             feature_cols: feature_cols.to_vec(),
             knots: marginal_knots,
@@ -1127,6 +1178,8 @@ pub fn build_smooth_design(
     let mut local_designs = Vec::<Array2<f64>>::with_capacity(terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(terms.len());
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(terms.len());
+    let mut local_penalty_info = Vec::<Vec<PenaltyInfo>>::with_capacity(terms.len());
+    let mut local_pre_dropped_penalty_info = Vec::<Vec<PenaltyInfo>>::with_capacity(terms.len());
     let mut local_metadata = Vec::<BasisMetadata>::with_capacity(terms.len());
     let mut local_dims = Vec::<usize>::with_capacity(terms.len());
     let mut local_linear_constraints =
@@ -1217,6 +1270,18 @@ pub fn build_smooth_design(
         let metadata = built.metadata.clone();
         let mut design_t = built.design;
         let mut penalties_t: Vec<Array2<f64>> = built.penalties;
+        let mut penalty_sources_t = built
+            .penalty_info
+            .iter()
+            .filter(|info| info.active)
+            .map(|info| info.source.clone())
+            .collect::<Vec<_>>();
+        let pre_dropped_penalty_info_t = built
+            .penalty_info
+            .iter()
+            .filter(|info| !info.active)
+            .cloned()
+            .collect::<Vec<_>>();
         let use_box_reparam =
             term.shape != ShapeConstraint::None && shape_uses_box_reparameterization(&term.basis);
         if let Some((order, sign)) = shape_order_and_sign(term.shape)
@@ -1234,6 +1299,27 @@ pub fn build_smooth_design(
                 })
                 .collect();
         }
+        if penalties_t.len() != penalty_sources_t.len() {
+            return Err(BasisError::InvalidInput(format!(
+                "internal penalty metadata mismatch for term '{}': active penalties={}, active sources={}",
+                term.name,
+                penalties_t.len(),
+                penalty_sources_t.len()
+            )));
+        }
+        let penalty_candidates = penalties_t
+            .into_iter()
+            .zip(penalty_sources_t.drain(..))
+            .map(|(matrix, source)| -> Result<PenaltyCandidate, BasisError> {
+                Ok(PenaltyCandidate {
+                    nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                    matrix,
+                    source,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (penalties_t, nullspaces_t, penalty_info_t) =
+            filter_active_penalty_candidates(penalty_candidates)?;
         let linear_constraints_local = if term.shape != ShapeConstraint::None && !use_box_reparam {
             let axis = shape_axis_col.ok_or_else(|| {
                 BasisError::InvalidInput(format!(
@@ -1252,15 +1338,12 @@ pub fn build_smooth_design(
             None
         };
 
-        let nullspaces_t = penalties_t
-            .iter()
-            .map(estimate_penalty_nullity)
-            .collect::<Result<Vec<_>, _>>()?;
-
         local_dims.push(p_local);
         local_designs.push(design_t);
         local_penalties.push(penalties_t);
         local_nullspaces.push(nullspaces_t);
+        local_penalty_info.push(penalty_info_t);
+        local_pre_dropped_penalty_info.push(pre_dropped_penalty_info_t);
         local_metadata.push(metadata);
         local_linear_constraints.push(linear_constraints_local);
         local_box_reparam.push(use_box_reparam);
@@ -1271,6 +1354,8 @@ pub fn build_smooth_design(
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(terms.len());
     let mut penalties_global = Vec::<Array2<f64>>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
+    let mut penalty_info_global = Vec::<PenaltyBlockInfo>::new();
+    let mut dropped_penalty_info_global = Vec::<DroppedPenaltyBlockInfo>::new();
     let mut coefficient_lower_bounds = Array1::<f64>::from_elem(total_p, f64::NEG_INFINITY);
     let mut any_bounds = false;
     let mut linear_constraints_rows: Vec<Array1<f64>> = Vec::new();
@@ -1290,16 +1375,49 @@ pub fn build_smooth_design(
             .slice_mut(s![.., col_start..col_end])
             .assign(&local_designs[idx]);
 
-        for (s_local, &ns) in local_penalties[idx]
+        let active_infos = local_penalty_info[idx]
+            .iter()
+            .filter(|info| info.active)
+            .collect::<Vec<_>>();
+        if active_infos.len() != local_penalties[idx].len() {
+            return Err(BasisError::InvalidInput(format!(
+                "internal penalty info mismatch for term '{}': active_infos={}, penalties={}",
+                term.name,
+                active_infos.len(),
+                local_penalties[idx].len()
+            )));
+        }
+        for ((s_local, &ns), info) in local_penalties[idx]
             .iter()
             .zip(local_nullspaces[idx].iter())
+            .zip(active_infos.into_iter())
         {
+            let global_index = penalties_global.len();
             let mut s_global = Array2::<f64>::zeros((total_p, total_p));
             s_global
                 .slice_mut(s![col_start..col_end, col_start..col_end])
                 .assign(s_local);
             penalties_global.push(s_global);
             nullspace_dims_global.push(ns);
+            let mut penalty = info.clone();
+            penalty.nullspace_dim_hint = ns;
+            penalty_info_global.push(PenaltyBlockInfo {
+                global_index,
+                term_name: Some(term.name.clone()),
+                penalty,
+            });
+        }
+        for info in local_penalty_info[idx].iter().filter(|info| !info.active) {
+            dropped_penalty_info_global.push(DroppedPenaltyBlockInfo {
+                term_name: Some(term.name.clone()),
+                penalty: info.clone(),
+            });
+        }
+        for info in &local_pre_dropped_penalty_info[idx] {
+            dropped_penalty_info_global.push(DroppedPenaltyBlockInfo {
+                term_name: Some(term.name.clone()),
+                penalty: info.clone(),
+            });
         }
 
         terms_out.push(SmoothTerm {
@@ -1308,6 +1426,7 @@ pub fn build_smooth_design(
             shape: term.shape,
             penalties_local: local_penalties[idx].clone(),
             nullspace_dims: local_nullspaces[idx].clone(),
+            penalty_info_local: local_penalty_info[idx].clone(),
             metadata: local_metadata[idx].clone(),
             lower_bounds_local: lb_local.clone(),
             linear_constraints_local: local_linear_constraints[idx].clone(),
@@ -1331,10 +1450,23 @@ pub fn build_smooth_design(
         col_start = col_end;
     }
 
+    debug_assert_eq!(
+        penalties_global.len(),
+        nullspace_dims_global.len(),
+        "global smooth penalty/nullspace bookkeeping diverged"
+    );
+    debug_assert_eq!(
+        penalties_global.len(),
+        penalty_info_global.len(),
+        "global smooth penalty metadata bookkeeping diverged"
+    );
+
     Ok(SmoothDesign {
         design,
         penalties: penalties_global,
         nullspace_dims: nullspace_dims_global,
+        penalty_info: penalty_info_global,
+        dropped_penalty_info: dropped_penalty_info_global,
         terms: terms_out,
         coefficient_lower_bounds: if any_bounds {
             Some(coefficient_lower_bounds)
@@ -1423,6 +1555,8 @@ pub fn build_term_collection_design(
 
     let mut penalties = Vec::<Array2<f64>>::new();
     let mut nullspace_dims = Vec::<usize>::new();
+    let mut penalty_info = Vec::<PenaltyBlockInfo>::new();
+    let mut dropped_penalty_info = Vec::<DroppedPenaltyBlockInfo>::new();
     let mut coefficient_lower_bounds = Array1::<f64>::from_elem(p_total, f64::NEG_INFINITY);
     let mut any_bounds = false;
     let mut linear_constraint_rows = Vec::<Array1<f64>>::new();
@@ -1447,27 +1581,88 @@ pub fn build_term_collection_design(
         }
         let mut s = Array2::<f64>::zeros((p_total, p_total));
         s[[col, col]] = 1.0;
+        let global_index = penalties.len();
         penalties.push(s);
         nullspace_dims.push(0);
+        penalty_info.push(PenaltyBlockInfo {
+            global_index,
+            term_name: Some(linear.name.clone()),
+            penalty: PenaltyInfo {
+                source: PenaltySource::Other(format!("LinearDoublePenalty({})", linear.name)),
+                original_index: j,
+                active: true,
+                effective_rank: 1,
+                dropped_reason: None,
+                nullspace_dim_hint: 0,
+            },
+        });
     }
 
-    for (_name, range) in &random_effect_ranges {
+    for (re_idx, (name, range)) in random_effect_ranges.iter().enumerate() {
+        if range.is_empty() {
+            continue;
+        }
         let mut s = Array2::<f64>::zeros((p_total, p_total));
         for j in range.clone() {
             s[[j, j]] = 1.0;
         }
+        let global_index = penalties.len();
         penalties.push(s);
         nullspace_dims.push(0);
+        penalty_info.push(PenaltyBlockInfo {
+            global_index,
+            term_name: Some(name.clone()),
+            penalty: PenaltyInfo {
+                source: PenaltySource::Other(format!("RandomEffectRidge({name})")),
+                original_index: re_idx,
+                active: true,
+                effective_rank: range.len(),
+                dropped_reason: None,
+                nullspace_dim_hint: 0,
+            },
+        });
     }
 
-    for (s_local, &ns) in smooth.penalties.iter().zip(smooth.nullspace_dims.iter()) {
+    if smooth.penalty_info.len() != smooth.penalties.len() {
+        return Err(BasisError::InvalidInput(format!(
+            "smooth penalty metadata mismatch: penalties={}, metadata={}",
+            smooth.penalties.len(),
+            smooth.penalty_info.len()
+        )));
+    }
+    for ((s_local, &ns), local_info) in smooth
+        .penalties
+        .iter()
+        .zip(smooth.nullspace_dims.iter())
+        .zip(smooth.penalty_info.iter())
+    {
         let mut s = Array2::<f64>::zeros((p_total, p_total));
         let start = p_intercept + p_lin + p_rand;
         s.slice_mut(s![start..(start + p_smooth), start..(start + p_smooth)])
             .assign(s_local);
+        let global_index = penalties.len();
         penalties.push(s);
         nullspace_dims.push(ns);
+        let mut penalty = local_info.penalty.clone();
+        penalty.nullspace_dim_hint = ns;
+        penalty_info.push(PenaltyBlockInfo {
+            global_index,
+            term_name: local_info.term_name.clone(),
+            penalty,
+        });
     }
+    dropped_penalty_info.extend(smooth.dropped_penalty_info.iter().cloned());
+
+    debug_assert_eq!(
+        penalties.len(),
+        nullspace_dims.len(),
+        "term-collection penalty/nullspace bookkeeping diverged"
+    );
+    debug_assert_eq!(
+        penalties.len(),
+        penalty_info.len(),
+        "term-collection penalty metadata bookkeeping diverged"
+    );
 
     if let Some(lb_smooth) = smooth.coefficient_lower_bounds.as_ref() {
         let start = p_intercept + p_lin + p_rand;
@@ -1515,6 +1710,8 @@ pub fn build_term_collection_design(
         design,
         penalties,
         nullspace_dims,
+        penalty_info,
+        dropped_penalty_info,
         coefficient_lower_bounds: if any_bounds {
             Some(coefficient_lower_bounds)
         } else {
@@ -1527,6 +1724,29 @@ pub fn build_term_collection_design(
         random_effect_levels,
         smooth,
     })
+}
+
+pub fn fitted_penalty_block_report(
+    design: &TermCollectionDesign,
+    fit: &FitResult,
+) -> Vec<FittedPenaltyBlockReport> {
+    design
+        .penalty_info
+        .iter()
+        .map(|info| FittedPenaltyBlockReport {
+            global_index: info.global_index,
+            term_name: info.term_name.clone(),
+            source: info.penalty.source.clone(),
+            effective_rank: info.penalty.effective_rank,
+            nullspace_dim: info.penalty.nullspace_dim_hint,
+            lambda: fit.lambdas.get(info.global_index).copied(),
+            edf: fit.edf_by_block.get(info.global_index).copied(),
+        })
+        .collect()
+}
+
+pub fn dropped_penalty_block_report(design: &TermCollectionDesign) -> Vec<DroppedPenaltyBlockInfo> {
+    design.dropped_penalty_info.clone()
 }
 
 fn apply_spatial_orthogonality_to_parametric(
@@ -1577,6 +1797,7 @@ fn apply_spatial_orthogonality_to_parametric(
     let mut local_designs = Vec::<Array2<f64>>::with_capacity(smooth.terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(smooth.terms.len());
     let mut local_nullspaces = Vec::<Vec<usize>>::with_capacity(smooth.terms.len());
+    let mut local_penalty_info = Vec::<Vec<PenaltyInfo>>::with_capacity(smooth.terms.len());
     let mut local_metadata = Vec::<BasisMetadata>::with_capacity(smooth.terms.len());
     let mut local_dims = Vec::<usize>::with_capacity(smooth.terms.len());
     let mut local_linear_constraints =
@@ -1627,7 +1848,20 @@ fn apply_spatial_orthogonality_to_parametric(
 
         let mut penalties_constrained =
             Vec::<Array2<f64>>::with_capacity(term.penalties_local.len());
-        let mut nullspace_constrained = Vec::<usize>::with_capacity(term.penalties_local.len());
+        let active_sources = term
+            .penalty_info_local
+            .iter()
+            .filter(|info| info.active)
+            .map(|info| info.source.clone())
+            .collect::<Vec<_>>();
+        if active_sources.len() != term.penalties_local.len() {
+            return Err(BasisError::InvalidInput(format!(
+                "internal penalty metadata mismatch for term '{}': active_sources={}, penalties={}",
+                term.name,
+                active_sources.len(),
+                term.penalties_local.len()
+            )));
+        }
         for s_local in &term.penalties_local {
             let s_con = if let Some(z) = z_opt.as_ref() {
                 let zt_s = z.t().dot(s_local);
@@ -1635,10 +1869,21 @@ fn apply_spatial_orthogonality_to_parametric(
             } else {
                 s_local.clone()
             };
-            let ns = estimate_penalty_nullity(&s_con)?;
             penalties_constrained.push(s_con);
-            nullspace_constrained.push(ns);
         }
+        let penalty_candidates = penalties_constrained
+            .into_iter()
+            .zip(active_sources.into_iter())
+            .map(|(matrix, source)| -> Result<PenaltyCandidate, BasisError> {
+                Ok(PenaltyCandidate {
+                    nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                    matrix,
+                    source,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (penalties_constrained, nullspace_constrained, penalty_info_constrained) =
+            filter_active_penalty_candidates(penalty_candidates)?;
         let linear_constraints_constrained =
             if let Some(lin_local) = term.linear_constraints_local.as_ref() {
                 if let Some(z) = z_opt.as_ref() {
@@ -1657,6 +1902,7 @@ fn apply_spatial_orthogonality_to_parametric(
         local_designs.push(design_constrained);
         local_penalties.push(penalties_constrained);
         local_nullspaces.push(nullspace_constrained);
+        local_penalty_info.push(penalty_info_constrained);
         local_linear_constraints.push(linear_constraints_constrained);
         local_metadata.push(with_spatial_identifiability_transform(
             &term.metadata,
@@ -1669,6 +1915,8 @@ fn apply_spatial_orthogonality_to_parametric(
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(smooth.terms.len());
     let mut penalties_global = Vec::<Array2<f64>>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
+    let mut penalty_info_global = Vec::<PenaltyBlockInfo>::new();
+    let mut dropped_penalty_info_global = smooth.dropped_penalty_info.clone();
     let mut coefficient_lower_bounds = Array1::<f64>::from_elem(total_p, f64::NEG_INFINITY);
     let mut any_bounds = false;
     let mut linear_constraints_rows: Vec<Array1<f64>> = Vec::new();
@@ -1682,16 +1930,43 @@ fn apply_spatial_orthogonality_to_parametric(
             .slice_mut(s![.., col_start..col_end])
             .assign(&local_designs[idx]);
 
-        for (s_local, &ns) in local_penalties[idx]
+        let active_infos = local_penalty_info[idx]
+            .iter()
+            .filter(|info| info.active)
+            .collect::<Vec<_>>();
+        if active_infos.len() != local_penalties[idx].len() {
+            return Err(BasisError::InvalidInput(format!(
+                "internal penalty info mismatch for term '{}': active_infos={}, penalties={}",
+                smooth.terms[idx].name,
+                active_infos.len(),
+                local_penalties[idx].len()
+            )));
+        }
+        for ((s_local, &ns), info) in local_penalties[idx]
             .iter()
             .zip(local_nullspaces[idx].iter())
+            .zip(active_infos.into_iter())
         {
+            let global_index = penalties_global.len();
             let mut s_global = Array2::<f64>::zeros((total_p, total_p));
             s_global
                 .slice_mut(s![col_start..col_end, col_start..col_end])
                 .assign(s_local);
             penalties_global.push(s_global);
             nullspace_dims_global.push(ns);
+            let mut penalty = info.clone();
+            penalty.nullspace_dim_hint = ns;
+            penalty_info_global.push(PenaltyBlockInfo {
+                global_index,
+                term_name: Some(smooth.terms[idx].name.clone()),
+                penalty,
+            });
+        }
+        for info in local_penalty_info[idx].iter().filter(|info| !info.active) {
+            dropped_penalty_info_global.push(DroppedPenaltyBlockInfo {
+                term_name: Some(smooth.terms[idx].name.clone()),
+                penalty: info.clone(),
+            });
         }
 
         terms_out.push(SmoothTerm {
@@ -1700,6 +1975,7 @@ fn apply_spatial_orthogonality_to_parametric(
             shape: smooth.terms[idx].shape,
             penalties_local: local_penalties[idx].clone(),
             nullspace_dims: local_nullspaces[idx].clone(),
+            penalty_info_local: local_penalty_info[idx].clone(),
             metadata: local_metadata[idx].clone(),
             lower_bounds_local: smooth.terms[idx].lower_bounds_local.clone(),
             linear_constraints_local: local_linear_constraints[idx].clone(),
@@ -1725,10 +2001,23 @@ fn apply_spatial_orthogonality_to_parametric(
         col_start = col_end;
     }
 
+    debug_assert_eq!(
+        penalties_global.len(),
+        nullspace_dims_global.len(),
+        "spatially reparameterized smooth penalty/nullspace bookkeeping diverged"
+    );
+    debug_assert_eq!(
+        penalties_global.len(),
+        penalty_info_global.len(),
+        "spatially reparameterized smooth penalty metadata bookkeeping diverged"
+    );
+
     Ok(SmoothDesign {
         design,
         penalties: penalties_global,
         nullspace_dims: nullspace_dims_global,
+        penalty_info: penalty_info_global,
+        dropped_penalty_info: dropped_penalty_info_global,
         terms: terms_out,
         coefficient_lower_bounds: if any_bounds {
             Some(coefficient_lower_bounds)
@@ -1871,13 +2160,13 @@ fn with_spatial_identifiability_transform(
         BasisMetadata::Duchon {
             centers,
             length_scale,
-            nu,
+            power,
             nullspace_order,
             ..
         } => BasisMetadata::Duchon {
             centers: centers.clone(),
             length_scale: *length_scale,
-            nu: *nu,
+            power: *power,
             nullspace_order: *nullspace_order,
             identifiability_transform: transform.cloned(),
         },
@@ -2832,6 +3121,7 @@ fn approx_same_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
     true
 }
 
+#[allow(dead_code)]
 fn theta_distance_sq(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
     if a.len() != b.len() {
         return f64::INFINITY;
@@ -2845,6 +3135,7 @@ fn theta_distance_sq(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct SingleBlockHyperEval {
     theta: Array1<f64>,
     cost: f64,
@@ -2852,11 +3143,13 @@ struct SingleBlockHyperEval {
     fit: FittedTermCollection,
 }
 
+#[allow(dead_code)]
 struct SingleBlockSpatialHyperState {
     evals: Vec<SingleBlockHyperEval>,
     max_evals: usize,
 }
 
+#[allow(dead_code)]
 impl SingleBlockSpatialHyperState {
     fn new(max_evals: usize) -> Self {
         Self {
@@ -2988,12 +3281,19 @@ fn smooth_term_penalty_index(
     if term_idx >= design.smooth.terms.len() || term_idx >= spec.smooth_terms.len() {
         return None;
     }
+    if design.smooth.terms[term_idx].penalties_local.is_empty() {
+        return None;
+    }
     let linear_penalties = spec
         .linear_terms
         .iter()
         .filter(|t| t.double_penalty)
         .count();
-    let random_penalties = spec.random_effect_terms.len();
+    let random_penalties = design
+        .random_effect_ranges
+        .iter()
+        .filter(|(_, range)| !range.is_empty())
+        .count();
     let smooth_offset = linear_penalties + random_penalties;
     let local_offset = design
         .smooth
@@ -3100,12 +3400,12 @@ fn try_build_spatial_term_log_kappa_derivative(
     Ok(Some((x_psi, s_psi)))
 }
 
-fn try_build_spatial_log_kappa_derivative_list(
+fn try_build_spatial_log_kappa_hyper_dirs(
     data: ArrayView2<'_, f64>,
     resolved_spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
     spatial_terms: &[usize],
-) -> Result<Option<(Vec<Array2<f64>>, Vec<Array2<f64>>)>, EstimationError> {
+) -> Result<Option<Vec<DirectionalHyperParam>>, EstimationError> {
     let Some(info_list) = try_build_spatial_log_kappa_derivative_info_list(
         data,
         resolved_spec,
@@ -3115,13 +3415,14 @@ fn try_build_spatial_log_kappa_derivative_list(
     else {
         return Ok(None);
     };
-    let mut x_psi_list = Vec::with_capacity(info_list.len());
-    let mut s_psi_list = Vec::with_capacity(info_list.len());
+    let mut hyper_dirs = Vec::with_capacity(info_list.len());
     for info in info_list {
-        x_psi_list.push(info.x_psi);
-        s_psi_list.push(info.s_psi);
+        hyper_dirs.push(DirectionalHyperParam {
+            x_tau_original: info.x_psi,
+            s_tau_original: info.s_psi,
+        });
     }
-    Ok(Some((x_psi_list, s_psi_list)))
+    Ok(Some(hyper_dirs))
 }
 
 fn try_exact_joint_spatial_hyper_cost_gradient(
@@ -3147,11 +3448,12 @@ fn try_exact_joint_spatial_hyper_cost_gradient(
     else {
         return Ok(None);
     };
-    let mut x_psi_list = Vec::with_capacity(info_list.len());
-    let mut s_psi_list = Vec::with_capacity(info_list.len());
+    let mut hyper_dirs = Vec::with_capacity(info_list.len());
     for info in info_list {
-        x_psi_list.push(info.x_psi);
-        s_psi_list.push(info.s_psi.mapv(|v| theta[info.penalty_index].exp() * v));
+        hyper_dirs.push(DirectionalHyperParam {
+            x_tau_original: info.x_psi,
+            s_tau_original: info.s_psi.mapv(|v| theta[info.penalty_index].exp() * v),
+        });
     }
     let external_opts = external_opts_for_design(family, &design, options);
     let joint = compute_external_joint_hyper_cost_gradient(
@@ -3162,12 +3464,141 @@ fn try_exact_joint_spatial_hyper_cost_gradient(
         design.penalties.clone(),
         theta,
         rho_dim,
-        &x_psi_list,
-        &s_psi_list,
+        &hyper_dirs,
         Some(warm_start_fit.fit.beta.view()),
         &external_opts,
     )?;
     Ok(Some(joint))
+}
+
+fn try_exact_joint_spatial_length_scale_optimization(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolved_spec: &TermCollectionSpec,
+    best: &FittedTermCollection,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    spatial_terms: &[usize],
+) -> Result<Option<FittedTermCollectionWithSpec>, EstimationError> {
+    if spatial_terms.is_empty() {
+        return Ok(None);
+    }
+    if matches!(family, LikelihoodFamily::BinomialLogit) {
+        return Err(EstimationError::InvalidInput(
+            "exact joint spatial κ optimization is unavailable for binomial logit because this path requires exact ψ hyper-gradients and Firth-logit directional ψ derivatives are not implemented"
+                .to_string(),
+        ));
+    }
+    if try_build_spatial_log_kappa_hyper_dirs(data, resolved_spec, &best.design, spatial_terms)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+
+    const JOINT_RHO_BOUND: f64 = 12.0;
+    let rho_dim = best.fit.lambdas.len();
+    let psi_dim = spatial_terms.len();
+    let mut theta0 = Array1::<f64>::zeros(rho_dim + psi_dim);
+    theta0
+        .slice_mut(s![..rho_dim])
+        .assign(&best.fit.lambdas.mapv(f64::ln));
+    for (slot, &term_idx) in spatial_terms.iter().enumerate() {
+        theta0[rho_dim + slot] = get_spatial_length_scale(resolved_spec, term_idx)
+            .unwrap_or(kappa_options.min_length_scale)
+            .clamp(
+                kappa_options.min_length_scale,
+                kappa_options.max_length_scale,
+            )
+            .ln();
+    }
+
+    let mut lower = Array1::<f64>::from_elem(rho_dim + psi_dim, -JOINT_RHO_BOUND);
+    let mut upper = Array1::<f64>::from_elem(rho_dim + psi_dim, JOINT_RHO_BOUND);
+    for i in 0..psi_dim {
+        lower[rho_dim + i] = kappa_options.min_length_scale.ln();
+        upper[rho_dim + i] = kappa_options.max_length_scale.ln();
+    }
+
+    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
+    let warm_start_fit: FittedTermCollection = (*best).clone();
+    let mut optimizer = Bfgs::new(theta0.clone(), |theta| {
+        if let Some((theta_c, cost_c, grad_c)) = &last_eval
+            && approx_same_point(theta, theta_c)
+        {
+            return (*cost_c, grad_c.clone());
+        }
+
+        let psi_theta = theta.slice(s![rho_dim..]).to_owned();
+        match apply_spatial_log_length_scales(resolved_spec, spatial_terms, &psi_theta) {
+            Ok(spec_c) => match try_exact_joint_spatial_hyper_cost_gradient(
+                data,
+                y,
+                weights,
+                offset,
+                theta,
+                rho_dim,
+                &spec_c,
+                &warm_start_fit,
+                family,
+                options,
+                spatial_terms,
+            ) {
+                Ok(Some((cost, grad))) => {
+                    last_eval = Some((theta.clone(), cost, grad.clone()));
+                    (cost, grad)
+                }
+                _ => (
+                    1e50 + 0.5 * theta.dot(theta),
+                    Array1::from_elem(theta.len(), 1e6),
+                ),
+            },
+            Err(_) => (
+                1e50 + 0.5 * theta.dot(theta),
+                Array1::from_elem(theta.len(), 1e6),
+            ),
+        }
+    })
+    .with_bounds(lower, upper, 1e-6)
+    .with_tolerance(kappa_options.rel_tol.max(1e-6))
+    .with_max_iterations(kappa_options.max_outer_iter.max(1))
+    .with_no_improve_stop(1e-8, 8)
+    .with_flat_stall_exit(true, 4)
+    .with_curvature_slack_scale(2.0);
+
+    let solution = match optimizer.run() {
+        Ok(sol) => sol,
+        Err(BfgsError::MaxIterationsReached { last_solution })
+        | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+        Err(err) => {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "exact joint spatial length-scale optimization failed: {err:?}"
+            )));
+        }
+    };
+
+    let theta_star = solution.final_point;
+    let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
+    let psi_star = theta_star.slice(s![rho_dim..]).to_owned();
+    let resolved_spec = apply_spatial_log_length_scales(resolved_spec, spatial_terms, &psi_star)?;
+    let best = fit_term_collection_for_spec_with_heuristic_lambdas(
+        data,
+        y,
+        weights,
+        offset,
+        &resolved_spec,
+        rho_star.as_slice(),
+        family,
+        options,
+    )?;
+
+    Ok(Some(FittedTermCollectionWithSpec {
+        fit: best.fit,
+        design: best.design,
+        resolved_spec,
+    }))
 }
 
 fn central_diff_gradient<F>(
@@ -3790,28 +4221,16 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
     // κ (= 1/length_scale) changes kernel geometry nonlinearly.
     // That means both basis values B and penalty blocks S change, so each κ
-    // proposal requires a full basis rebuild and a fresh lambda optimization.
+    // proposals rebuild the spatial basis.
     //
-    // This is the key reason the current implementation does *not* treat κ like
-    // rho = log(lambda):
-    // - varying rho keeps the design X fixed and only changes the penalty weights,
-    // - varying κ changes the basis itself, so both X(κ) and S(κ) move.
+    // When exact derivative information is available for the rebuilt basis and
+    // penalty, κ is promoted to a first-class outer hyperparameter beside
+    // rho = log(lambda). In that mode this routine runs a joint outer solve in
+    // theta = [rho, psi], where psi are the spatial log-length-scales, using the
+    // exact directional hyper-gradient path in `reml.rs`.
     //
-    // A fully joint outer optimization in (rho, kappa) would therefore need the
-    // exact hyperparameter derivatives of the rebuilt design and penalty:
-    //   X_kappa = dX/dkappa,
-    //   S_kappa = dS/dkappa,
-    // together with the implicit mode derivative
-    //   beta_kappa = H^{-1} (ell_{beta,kappa} - S_kappa beta_hat),
-    // and then the total outer derivative
-    //   dV/dkappa = -ell_kappa
-    //             + 0.5 beta_hat' S_kappa beta_hat
-    //             + 0.5 tr(H^{-1} H_kappa)
-    //             - 0.5 tr(S^+ S_kappa).
-    //
-    // The present routine deliberately avoids that machinery and instead uses a
-    // small coordinate search in log(length_scale), evaluating each candidate by
-    // rebuilding the basis and rerunning the ordinary lambda fit.
+    // If a spatial basis does not expose exact log-kappa derivatives, we fall
+    // back to the older coordinate-search strategy in log(length_scale).
     let mut resolved_spec = spec.clone();
     let spatial_terms = spatial_length_scale_term_indices(&resolved_spec);
     let n = data.nrows();
@@ -3860,7 +4279,7 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
         ));
     }
 
-    let mut best = fit_term_collection_for_spec(
+    let best = fit_term_collection_for_spec(
         data,
         y.view(),
         weights.view(),
@@ -3875,229 +4294,23 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
         log::debug!("[spatial-kappa] initial profiled score is non-finite");
     }
     if !spatial_terms.is_empty() {
-        if try_build_spatial_log_kappa_derivative_list(
+        if let Some(exact_joint) = try_exact_joint_spatial_length_scale_optimization(
             data,
+            y.view(),
+            weights.view(),
+            offset.view(),
             &resolved_spec,
-            &best.design,
+            &best,
+            family,
+            options,
+            kappa_options,
             &spatial_terms,
-        )?
-        .is_some()
-        {
-            const JOINT_RHO_BOUND: f64 = 12.0;
-            let rho_dim = best.fit.lambdas.len();
-            let psi_dim = spatial_terms.len();
-            let mut theta0 = Array1::<f64>::zeros(rho_dim + psi_dim);
-            theta0
-                .slice_mut(s![..rho_dim])
-                .assign(&best.fit.lambdas.mapv(f64::ln));
-            for (slot, &term_idx) in spatial_terms.iter().enumerate() {
-                theta0[rho_dim + slot] = get_spatial_length_scale(&resolved_spec, term_idx)
-                    .unwrap_or(kappa_options.min_length_scale)
-                    .clamp(
-                        kappa_options.min_length_scale,
-                        kappa_options.max_length_scale,
-                    )
-                    .ln();
-            }
-
-            let mut lower = Array1::<f64>::from_elem(rho_dim + psi_dim, -JOINT_RHO_BOUND);
-            let mut upper = Array1::<f64>::from_elem(rho_dim + psi_dim, JOINT_RHO_BOUND);
-            for i in 0..psi_dim {
-                lower[rho_dim + i] = kappa_options.min_length_scale.ln();
-                upper[rho_dim + i] = kappa_options.max_length_scale.ln();
-            }
-
-            let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
-            let warm_start_fit = best.clone();
-            let mut optimizer = Bfgs::new(theta0.clone(), |theta| {
-                if let Some((theta_c, cost_c, grad_c)) = &last_eval
-                    && approx_same_point(theta, theta_c)
-                {
-                    return (*cost_c, grad_c.clone());
-                }
-
-                let psi_theta = theta.slice(s![rho_dim..]).to_owned();
-                let sample = match apply_spatial_log_length_scales(
-                    &resolved_spec,
-                    &spatial_terms,
-                    &psi_theta,
-                ) {
-                    Ok(spec_c) => match try_exact_joint_spatial_hyper_cost_gradient(
-                        data,
-                        y.view(),
-                        weights.view(),
-                        offset.view(),
-                        theta,
-                        rho_dim,
-                        &spec_c,
-                        &warm_start_fit,
-                        family,
-                        options,
-                        &spatial_terms,
-                    ) {
-                        Ok(Some((cost, grad))) => {
-                            last_eval = Some((theta.clone(), cost, grad.clone()));
-                            (cost, grad)
-                        }
-                        _ => (
-                            1e50 + 0.5 * theta.dot(theta),
-                            Array1::from_elem(theta.len(), 1e6),
-                        ),
-                    },
-                    Err(_) => (
-                        1e50 + 0.5 * theta.dot(theta),
-                        Array1::from_elem(theta.len(), 1e6),
-                    ),
-                };
-                sample
-            })
-            .with_bounds(lower, upper, 1e-6)
-            .with_tolerance(kappa_options.rel_tol.max(1e-6))
-            .with_max_iterations(kappa_options.max_outer_iter.max(1))
-            .with_no_improve_stop(1e-8, 8)
-            .with_flat_stall_exit(true, 4)
-            .with_curvature_slack_scale(2.0);
-
-            let solution = match optimizer.run() {
-                Ok(sol) => sol,
-                Err(BfgsError::MaxIterationsReached { last_solution })
-                | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-                Err(err) => {
-                    return Err(EstimationError::RemlOptimizationFailed(format!(
-                        "spatial length-scale optimization failed: {err:?}"
-                    )));
-                }
-            };
-
-            let theta_star = solution.final_point;
-            let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
-            let psi_star = theta_star.slice(s![rho_dim..]).to_owned();
-            let spec_c =
-                apply_spatial_log_length_scales(&resolved_spec, &spatial_terms, &psi_star)?;
-            let fit_c = fit_term_collection_for_spec_with_heuristic_lambdas(
-                data,
-                y.view(),
-                weights.view(),
-                offset.view(),
-                &spec_c,
-                rho_star.as_slice(),
-                family,
-                options,
-            )?;
-            resolved_spec = spec_c;
-            best = fit_c;
+        )? {
+            return Ok(exact_joint);
         } else {
-            let mut theta0 = Array1::<f64>::zeros(spatial_terms.len());
-            let lower =
-                Array1::<f64>::from_elem(spatial_terms.len(), kappa_options.min_length_scale.ln());
-            let upper =
-                Array1::<f64>::from_elem(spatial_terms.len(), kappa_options.max_length_scale.ln());
-            let lower_eval = lower.clone();
-            let upper_eval = upper.clone();
-            for (slot, &term_idx) in spatial_terms.iter().enumerate() {
-                theta0[slot] = get_spatial_length_scale(&resolved_spec, term_idx)
-                    .unwrap_or(kappa_options.min_length_scale)
-                    .clamp(
-                        kappa_options.min_length_scale,
-                        kappa_options.max_length_scale,
-                    )
-                    .ln();
-            }
-
-            let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
-            let mut hyper_state =
-                SingleBlockSpatialHyperState::new(kappa_options.max_outer_iter.max(8) * 4);
-
-            let mut eval_value = |theta: &Array1<f64>| -> Result<
-                (f64, TermCollectionSpec, FittedTermCollection),
-                EstimationError,
-            > {
-                if let Some(cached) = hyper_state.get(theta) {
-                    return Ok((cached.cost, cached.spec, cached.fit));
-                }
-                let cand_spec =
-                    apply_spatial_log_length_scales(&resolved_spec, &spatial_terms, theta)?;
-                let lambda_seed = hyper_state
-                    .nearest_lambda_seed(theta)
-                    .or(best.fit.lambdas.as_slice());
-                let cand_fit = fit_term_collection_for_spec_with_heuristic_lambdas(
-                    data,
-                    y.view(),
-                    weights.view(),
-                    offset.view(),
-                    &cand_spec,
-                    lambda_seed,
-                    family,
-                    options,
-                )?;
-                let cand_score = fit_score(&cand_fit.fit);
-                let eval = SingleBlockHyperEval {
-                    theta: theta.clone(),
-                    cost: if cand_score.is_finite() {
-                        cand_score
-                    } else {
-                        f64::INFINITY
-                    },
-                    spec: cand_spec,
-                    fit: cand_fit,
-                };
-                hyper_state.remember(eval.clone());
-                Ok((eval.cost, eval.spec, eval.fit))
-            };
-
-            let mut optimizer = Bfgs::new(theta0.clone(), |theta| {
-                if let Some((theta_c, cost_c, grad_c)) = &last_eval
-                    && approx_same_point(theta, theta_c)
-                {
-                    return (*cost_c, grad_c.clone());
-                }
-
-                let sample = match eval_value(theta) {
-                    Ok((cost, _spec_c, _fit_c)) => {
-                        let mut objective_only =
-                            |probe: &Array1<f64>| -> Result<f64, EstimationError> {
-                                let (value, _, _) = eval_value(probe)?;
-                                Ok(value)
-                            };
-                        let grad = central_diff_gradient(
-                            theta,
-                            &lower_eval,
-                            &upper_eval,
-                            &mut objective_only,
-                        )
-                        .unwrap_or_else(|_| Array1::from_elem(theta.len(), 1e6));
-                        last_eval = Some((theta.clone(), cost, grad.clone()));
-                        (cost, grad)
-                    }
-                    Err(_) => (
-                        1e50 + 0.5 * theta.dot(theta),
-                        Array1::from_elem(theta.len(), 1e6),
-                    ),
-                };
-                sample
-            })
-            .with_bounds(lower, upper, 1e-6)
-            .with_tolerance(kappa_options.rel_tol.max(1e-6))
-            .with_max_iterations(kappa_options.max_outer_iter.max(1))
-            .with_no_improve_stop(1e-8, 8)
-            .with_flat_stall_exit(true, 4)
-            .with_curvature_slack_scale(2.0);
-
-            let solution = match optimizer.run() {
-                Ok(sol) => sol,
-                Err(BfgsError::MaxIterationsReached { last_solution })
-                | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-                Err(err) => {
-                    return Err(EstimationError::RemlOptimizationFailed(format!(
-                        "spatial length-scale optimization failed: {err:?}"
-                    )));
-                }
-            };
-
-            let theta_star = solution.final_point;
-            let (_cost, spec_c, fit_c) = eval_value(&theta_star)?;
-            resolved_spec = spec_c;
-            best = fit_c;
+            return Err(EstimationError::InvalidInput(
+                "spatial κ optimization now requires exact log-κ derivative paths (X_τ, S_τ) for all active spatial terms".to_string(),
+            ));
         }
     }
 
@@ -4300,7 +4513,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: 0.9,
-                    nu: MaternNu::FiveHalves,
+                    power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
@@ -4760,9 +4973,10 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        // Matérn double-penalty contributes two blocks (kernel + nullspace ridge).
-        assert_eq!(sd.penalties.len(), 2);
-        assert_eq!(sd.nullspace_dims.len(), 2);
+        // No-intercept Matérn is strictly penalized after the center constraint, so the
+        // requested nullspace shrinkage block is dropped as inactive.
+        assert_eq!(sd.penalties.len(), 1);
+        assert_eq!(sd.nullspace_dims.len(), 1);
     }
 
     #[test]
@@ -4783,7 +4997,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                     length_scale: 0.9,
-                    nu: MaternNu::FiveHalves,
+                    power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     double_penalty: true,
                     identifiability: SpatialIdentifiability::default(),
@@ -4967,7 +5181,7 @@ mod tests {
     }
 
     #[test]
-    fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern() {
+    fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern_two_feature() {
         let n = 60usize;
         let d = 3usize;
         let mut data = Array2::<f64>::zeros((n, d));
@@ -5204,7 +5418,7 @@ mod tests {
     }
 
     #[test]
-    fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_duchon() {
+    fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern() {
         let n = 60usize;
         let d = 2usize;
         let mut data = Array2::<f64>::zeros((n, d));
@@ -5221,16 +5435,16 @@ mod tests {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![SmoothTermSpec {
-                name: "duchon".to_string(),
-                basis: SmoothBasisSpec::Duchon {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
-                    spec: DuchonBasisSpec {
+                    spec: MaternBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                         length_scale: 12.0,
                         nu: MaternNu::FiveHalves,
-                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        include_intercept: false,
                         double_penalty: true,
-                        identifiability: SpatialIdentifiability::default(),
+                        identifiability: MaternIdentifiability::CenterSumToZero,
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -5279,23 +5493,23 @@ mod tests {
         assert!(optimized_score <= baseline_score + 1e-10);
 
         let ls = match &optimized.resolved_spec.smooth_terms[0].basis {
-            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale,
-            _ => panic!("expected Duchon term"),
+            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
+            _ => panic!("expected Matérn term"),
         };
         assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
 
         match &optimized.resolved_spec.smooth_terms[0].basis {
-            SmoothBasisSpec::Duchon { spec, .. } => {
+            SmoothBasisSpec::Matern { spec, .. } => {
                 assert!(matches!(
                     spec.center_strategy,
                     CenterStrategy::UserProvided(_)
                 ));
                 assert!(matches!(
                     spec.identifiability,
-                    SpatialIdentifiability::FrozenTransform { .. }
+                    MaternIdentifiability::FrozenTransform { .. }
                 ));
             }
-            _ => panic!("expected Duchon term"),
+            _ => panic!("expected Matérn term"),
         }
     }
 
@@ -5317,7 +5531,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale,
-                    nu: MaternNu::FiveHalves,
+                    power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     double_penalty: true,
                     identifiability: SpatialIdentifiability::default(),

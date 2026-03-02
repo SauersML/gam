@@ -7,6 +7,8 @@ PIRLS/REML optimization, joint models, diagnostics/ALO, and HMC.
 
 High-level smooth term support includes:
 - Isotropic radial smooths (`ThinPlate`, `Matern`, `Duchon`) for same-scale feature spaces.
+  Matérn uses explicit `nu` smoothness, while Duchon uses explicit `nullspace_order`
+  and integer `power` parameters.
 - Tensor-product smooths (`TensorBSpline`) for mixed-scale axes (e.g., space x time).
 - Random effects via categorical dummy blocks with identity (ridge) penalties.
 - Bounded parametric coefficients via `bounded(x, min=..., max=...)`, with explicit optional priors on the bounded user-scale coefficient.

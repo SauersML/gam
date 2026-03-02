@@ -213,6 +213,15 @@ pub struct IntegratedMeanDerivative {
     pub mode: IntegratedExpectationMode,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct IntegratedInverseLinkJet {
+    pub mean: f64,
+    pub d1: f64,
+    pub d2: f64,
+    pub d3: f64,
+    pub mode: IntegratedExpectationMode,
+}
+
 const LOGIT_SIGMA_DEGENERATE: f64 = 2.5e-1;
 const CLOGLOG_SIGMA_DEGENERATE: f64 = 1e-10;
 const CLOGLOG_SIGMA_TAYLOR_MAX: f64 = 0.25;
@@ -757,24 +766,8 @@ pub fn logit_posterior_mean_with_deriv(
         return (mu, dmu);
     }
 
-    let n = adaptive_point_count_from_sd(se_eta.abs());
-    with_gh_nodes_weights(ctx, n, |nodes, weights| {
-        let scale = std::f64::consts::SQRT_2 * se_eta;
-        let norm = 1.0 / std::f64::consts::PI.sqrt();
-        let mut sum_mu = 0.0;
-        let mut sum_dmu = 0.0;
-        for i in 0..n {
-            let eta_i = eta + scale * nodes[i];
-            let prob_i = sigmoid(eta_i);
-            let deriv_i = prob_i * (1.0 - prob_i);
-            sum_mu += weights[i] * prob_i;
-            sum_dmu += weights[i] * deriv_i;
-        }
-        let mu = (sum_mu * norm).clamp(1e-10, 1.0 - 1e-10);
-        // dmu can be arbitrarily close to 0 in the tails; do not floor it.
-        let dmu = (sum_dmu * norm).max(0.0);
-        (mu, dmu)
-    })
+    let jet = integrated_inverse_link_jet(ctx, LinkFunction::Logit, eta, se_eta);
+    (jet.mean, jet.d1)
 }
 
 #[inline]
@@ -1931,6 +1924,27 @@ pub fn integrated_inverse_link_mean_and_derivative(
     }
 }
 
+#[inline]
+pub fn integrated_inverse_link_jet(
+    quad_ctx: &QuadratureContext,
+    link: LinkFunction,
+    mu: f64,
+    sigma: f64,
+) -> IntegratedInverseLinkJet {
+    match link {
+        LinkFunction::Probit => integrated_probit_jet(mu, sigma),
+        LinkFunction::Logit => integrated_logit_jet_ghq(quad_ctx, mu, sigma),
+        LinkFunction::CLogLog => integrated_cloglog_jet_ghq(quad_ctx, mu, sigma),
+        LinkFunction::Identity => IntegratedInverseLinkJet {
+            mean: mu,
+            d1: 1.0,
+            d2: 0.0,
+            d3: 0.0,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        },
+    }
+}
+
 /// Batch version of logit_posterior_mean_with_deriv.
 /// Returns (mu_array, dmu_array)
 pub fn logit_posterior_mean_with_deriv_batch(
@@ -1986,6 +2000,125 @@ where
         }
         sum / std::f64::consts::PI.sqrt()
     })
+}
+
+#[inline]
+fn integrate_normal_ghq_adaptive_jet4<F>(
+    ctx: &QuadratureContext,
+    eta: f64,
+    se_eta: f64,
+    f: F,
+) -> (f64, f64, f64, f64)
+where
+    F: Fn(f64) -> (f64, f64, f64, f64),
+{
+    if se_eta < 1e-10 {
+        return f(eta);
+    }
+    let n = adaptive_point_count_from_sd(se_eta.abs());
+    with_gh_nodes_weights(ctx, n, |nodes, weights| {
+        let scale = SQRT_2 * se_eta;
+        let norm = 1.0 / std::f64::consts::PI.sqrt();
+        let mut s0 = 0.0;
+        let mut s1 = 0.0;
+        let mut s2 = 0.0;
+        let mut s3 = 0.0;
+        for i in 0..n {
+            let (v0, v1, v2, v3) = f(eta + scale * nodes[i]);
+            let w = weights[i];
+            s0 += w * v0;
+            s1 += w * v1;
+            s2 += w * v2;
+            s3 += w * v3;
+        }
+        (s0 * norm, s1 * norm, s2 * norm, s3 * norm)
+    })
+}
+
+#[inline]
+fn integrated_probit_jet(mu: f64, sigma: f64) -> IntegratedInverseLinkJet {
+    if sigma <= 1e-10 {
+        let z = mu.clamp(-30.0, 30.0);
+        let pdf = crate::probability::normal_pdf(z);
+        return IntegratedInverseLinkJet {
+            mean: crate::probability::normal_cdf_approx(z),
+            d1: pdf,
+            d2: -z * pdf,
+            d3: (z * z - 1.0) * pdf,
+            mode: IntegratedExpectationMode::ExactClosedForm,
+        };
+    }
+    let s = (1.0 + sigma * sigma).sqrt();
+    let z = mu / s;
+    let pdf = crate::probability::normal_pdf(z);
+    IntegratedInverseLinkJet {
+        mean: crate::probability::normal_cdf_approx(z),
+        d1: pdf / s,
+        d2: -z * pdf / (s * s),
+        d3: (z * z - 1.0) * pdf / (s * s * s),
+        mode: IntegratedExpectationMode::ExactClosedForm,
+    }
+}
+
+#[inline]
+fn logit_point_jet(x: f64) -> (f64, f64, f64, f64) {
+    let p = sigmoid(x);
+    let d1 = p * (1.0 - p);
+    let d2 = d1 * (1.0 - 2.0 * p);
+    let d3 = d1 * (1.0 - 6.0 * d1);
+    (p, d1, d2, d3)
+}
+
+#[inline]
+fn cloglog_point_jet(x: f64) -> (f64, f64, f64, f64) {
+    let z = x.clamp(-30.0, 30.0);
+    let t = z.exp();
+    let s = (-t).exp();
+    let mean = 1.0 - s;
+    let d1 = t * s;
+    let d2 = d1 * (1.0 - t);
+    let d3 = d1 * (1.0 - 3.0 * t + t * t);
+    (mean, d1, d2, d3)
+}
+
+#[inline]
+fn integrated_logit_jet_ghq(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> IntegratedInverseLinkJet {
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive_jet4(ctx, mu, sigma, logit_point_jet);
+    IntegratedInverseLinkJet {
+        mean: mean.clamp(1e-10, 1.0 - 1e-10),
+        d1: d1.max(0.0),
+        d2,
+        d3,
+        mode: if sigma <= 1e-10 {
+            IntegratedExpectationMode::ExactClosedForm
+        } else {
+            IntegratedExpectationMode::QuadratureFallback
+        },
+    }
+}
+
+#[inline]
+fn integrated_cloglog_jet_ghq(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> IntegratedInverseLinkJet {
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive_jet4(ctx, mu, sigma, cloglog_point_jet);
+    IntegratedInverseLinkJet {
+        mean: mean.clamp(1e-12, 1.0 - 1e-12),
+        d1: d1.max(0.0),
+        d2,
+        d3,
+        mode: if sigma <= 1e-10 {
+            IntegratedExpectationMode::ExactClosedForm
+        } else {
+            IntegratedExpectationMode::QuadratureFallback
+        },
+    }
 }
 
 #[inline]
@@ -3041,6 +3174,59 @@ mod tests {
         let direct = probit_posterior_mean_with_deriv_exact(0.7, 1.3);
         assert_relative_eq!(out.mean, direct.mean, epsilon = 1e-12);
         assert_relative_eq!(out.dmean_dmu, direct.dmean_dmu, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_integrated_probit_jet_matches_closed_form_derivatives() {
+        let ctx = QuadratureContext::new();
+        let mu = 0.7;
+        let sigma = 1.3;
+        let out = integrated_inverse_link_jet(&ctx, LinkFunction::Probit, mu, sigma);
+        let s = (1.0 + sigma * sigma).sqrt();
+        let z = mu / s;
+        let pdf = crate::probability::normal_pdf(z);
+        assert_relative_eq!(
+            out.mean,
+            crate::probability::normal_cdf_approx(z),
+            epsilon = 1e-12
+        );
+        assert_relative_eq!(out.d1, pdf / s, epsilon = 1e-12);
+        assert_relative_eq!(out.d2, -z * pdf / (s * s), epsilon = 1e-12);
+        assert_relative_eq!(out.d3, (z * z - 1.0) * pdf / (s * s * s), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_integrated_logit_jet_matches_central_differences() {
+        let ctx = QuadratureContext::new();
+        let mu = 1.1;
+        let sigma = 0.8;
+        let h = 1e-4;
+        let out = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu, sigma);
+        let plus = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu + h, sigma);
+        let minus = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu - h, sigma);
+        let d1_fd = (plus.mean - minus.mean) / (2.0 * h);
+        let d2_fd = (plus.d1 - minus.d1) / (2.0 * h);
+        let d3_fd = (plus.d2 - minus.d2) / (2.0 * h);
+        assert_relative_eq!(out.d1, d1_fd, epsilon = 2e-5, max_relative = 2e-4);
+        assert_relative_eq!(out.d2, d2_fd, epsilon = 4e-5, max_relative = 6e-4);
+        assert_relative_eq!(out.d3, d3_fd, epsilon = 8e-5, max_relative = 2e-3);
+    }
+
+    #[test]
+    fn test_integrated_cloglog_jet_matches_central_differences() {
+        let ctx = QuadratureContext::new();
+        let mu = 0.4;
+        let sigma = 0.6;
+        let h = 1e-4;
+        let out = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu, sigma);
+        let plus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu + h, sigma);
+        let minus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu - h, sigma);
+        let d1_fd = (plus.mean - minus.mean) / (2.0 * h);
+        let d2_fd = (plus.d1 - minus.d1) / (2.0 * h);
+        let d3_fd = (plus.d2 - minus.d2) / (2.0 * h);
+        assert_relative_eq!(out.d1, d1_fd, epsilon = 2e-5, max_relative = 3e-4);
+        assert_relative_eq!(out.d2, d2_fd, epsilon = 4e-5, max_relative = 8e-4);
+        assert_relative_eq!(out.d3, d3_fd, epsilon = 8e-5, max_relative = 2e-3);
     }
 
     #[test]

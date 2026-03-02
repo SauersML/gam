@@ -2830,8 +2830,14 @@ mod tests {
         .expect("fallback solve should succeed");
 
         assert!(beta.iter().all(|v| v.is_finite()));
-        assert!((beta[0] - 2.0).abs() < 1e-10, "unexpected solved coefficient");
-        assert!(beta[1].abs() < 1e-8, "null-space coefficient should stay near zero");
+        assert!(
+            (beta[0] - 2.0).abs() < 1e-10,
+            "unexpected solved coefficient"
+        );
+        assert!(
+            beta[1].abs() < 1e-8,
+            "null-space coefficient should stay near zero"
+        );
     }
 
     #[test]

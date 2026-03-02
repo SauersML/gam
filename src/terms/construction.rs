@@ -1,3 +1,4 @@
+use crate::basis::analyze_penalty_block;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd, fast_atv};
 use faer::linalg::matmul::matmul;
@@ -271,6 +272,9 @@ fn penalty_from_root_faer(root: &Mat<f64>) -> Mat<f64> {
 }
 
 fn clamp_eigenvalues_for_stability(eigenvalues: &mut [f64], context: &str) {
+    // Upstream basis builders are expected to construct PSD penalties.
+    // This clamp is a downstream numerical cleanup step for machine-scale
+    // spectral noise, not a semantic repair for materially indefinite inputs.
     let scale = eigenvalues
         .iter()
         .filter(|v| v.is_finite())
@@ -726,22 +730,19 @@ pub fn compute_penalty_square_roots(
 
     for s in s_list {
         let p = s.nrows();
+        let analysis = analyze_penalty_block(s).map_err(|err| {
+            EstimationError::InvalidInput(format!("penalty canonicalization failed: {err}"))
+        })?;
+        debug_assert!(
+            analysis.rank > 0 || s.iter().all(|v| v.abs() <= analysis.tol),
+            "inactive penalty block reached square-root construction"
+        );
 
         // Use eigendecomposition for symmetric positive semi-definite matrices
-        let (eigenvalues, eigenvectors) = robust_eigh(s, Side::Lower, "penalty matrix")?;
-
-        // Count positive eigenvalues to determine rank
-        // Find the maximum eigenvalue to create a relative tolerance
-        let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-
-        // Define a relative tolerance. Use an absolute fallback for zero matrices.
-        let tolerance = if max_eig > 0.0 {
-            max_eig * 1e-12
-        } else {
-            1e-12
-        };
-
-        let rank_k: usize = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
+        let (eigenvalues, eigenvectors) =
+            robust_eigh(&analysis.sym_penalty, Side::Lower, "penalty matrix")?;
+        let tolerance = analysis.tol;
+        let rank_k = analysis.rank;
 
         if rank_k == 0 {
             // Zero penalty matrix - return 0 x p matrix (STANDARDIZED: rank x p)

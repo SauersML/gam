@@ -1,4 +1,5 @@
 use gam::basis::create_thin_plate_spline_basis_with_knot_count;
+use gam::construction::compute_penalty_square_roots;
 use gam::{FitOptions, LikelihoodFamily, fit_gam, predict_gam};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -158,5 +159,108 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
     assert!(
         mse_test < 0.12,
         "TPS simulated integration test is too inaccurate: mse_test={mse_test:.6e}"
+    );
+}
+
+#[test]
+fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
+    let n_train = 600usize;
+    let n_test = 250usize;
+    let mut rng = StdRng::seed_from_u64(20260301);
+    let noise = Normal::new(0.0, 0.08).expect("normal params must be valid");
+
+    let mut x_train = Array2::<f64>::zeros((n_train, 3));
+    let mut y_train = Array1::<f64>::zeros(n_train);
+    let mut y_train_true = Array1::<f64>::zeros(n_train);
+
+    for i in 0..n_train {
+        let x1 = rng.random_range(-1.0..1.0);
+        let x2 = rng.random_range(-1.0..1.0);
+        let x3 = rng.random_range(-1.0..1.0);
+        x_train[[i, 0]] = x1;
+        x_train[[i, 1]] = x2;
+        x_train[[i, 2]] = x3;
+
+        let r2 = (x1 - 0.3).powi(2) + (x2 + 0.2).powi(2) + (x3 - 0.1).powi(2);
+        let f = 0.9 * (-r2 / (2.0 * 0.45 * 0.45)).exp() + 0.35 * (std::f64::consts::PI * x1).sin()
+            - 0.25 * x2 * x3
+            + 0.15 * x3;
+        y_train_true[i] = f;
+        y_train[i] = f + noise.sample(&mut rng);
+    }
+
+    let (tps_train, knots) =
+        create_thin_plate_spline_basis_with_knot_count(x_train.view(), 36).expect("3D TPS basis");
+    let s_list = tps_train.penalty_matrices();
+    let rs_list = compute_penalty_square_roots(&s_list).expect("3D TPS penalty roots");
+    assert!(
+        !rs_list[0].is_empty() && rs_list[0].nrows() > 0,
+        "3D TPS bending penalty root should have positive rank"
+    );
+    let root_reconstructed = rs_list[0].t().dot(&rs_list[0]);
+    let reconstruction_max_abs = (&root_reconstructed - &s_list[0])
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    assert!(
+        reconstruction_max_abs < 1e-8,
+        "3D TPS bending root reconstruction mismatch: max_abs={reconstruction_max_abs:.3e}"
+    );
+
+    let weights = Array1::ones(n_train);
+    let offset = Array1::zeros(n_train);
+    let fit = fit_gam(
+        tps_train.basis.view(),
+        y_train.view(),
+        weights.view(),
+        offset.view(),
+        &s_list,
+        LikelihoodFamily::GaussianIdentity,
+        &FitOptions {
+            max_iter: 80,
+            tol: 1e-6,
+            nullspace_dims: vec![4, 0],
+            linear_constraints: None,
+        },
+    )
+    .expect("fit_gam with 3D TPS should succeed");
+
+    assert_eq!(fit.lambdas.len(), 2);
+    assert!(fit.edf_total.is_finite());
+    assert!(fit.edf_total > 1.0);
+
+    let mut x_test = Array2::<f64>::zeros((n_test, 3));
+    let mut y_test_true = Array1::<f64>::zeros(n_test);
+    for i in 0..n_test {
+        let x1 = rng.random_range(-1.0..1.0);
+        let x2 = rng.random_range(-1.0..1.0);
+        let x3 = rng.random_range(-1.0..1.0);
+        x_test[[i, 0]] = x1;
+        x_test[[i, 1]] = x2;
+        x_test[[i, 2]] = x3;
+
+        let r2 = (x1 - 0.3).powi(2) + (x2 + 0.2).powi(2) + (x3 - 0.1).powi(2);
+        y_test_true[i] = 0.9 * (-r2 / (2.0 * 0.45 * 0.45)).exp()
+            + 0.35 * (std::f64::consts::PI * x1).sin()
+            - 0.25 * x2 * x3
+            + 0.15 * x3;
+    }
+
+    let tps_test = gam::basis::create_thin_plate_spline_basis(x_test.view(), knots.view())
+        .expect("3D test basis");
+    let pred = predict_gam(
+        tps_test.basis.view(),
+        fit.beta.view(),
+        Array1::zeros(n_test).view(),
+        LikelihoodFamily::GaussianIdentity,
+    )
+    .expect("3D predict_gam should succeed");
+
+    let mse_test = (&pred.mean - &y_test_true)
+        .mapv(|v| v * v)
+        .mean()
+        .unwrap_or(f64::INFINITY);
+    assert!(
+        mse_test < 0.09,
+        "3D TPS simulated integration test is too inaccurate: mse_test={mse_test:.6e}"
     );
 }

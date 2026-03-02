@@ -24,10 +24,10 @@ use gam::families::sigma_link::{
     bounded_sigma_from_eta_scalar as sigma_from_eta_scalar,
 };
 use gam::gamlss::{
-    BinomialLocationScaleProbitTermSpec, BinomialLocationScaleProbitWiggleTermSpec,
-    GaussianLocationScaleTermSpec, WiggleBlockConfig, build_wiggle_block_input_from_knots,
-    build_wiggle_block_input_from_seed, fit_binomial_location_scale_probit_terms,
-    fit_binomial_location_scale_probit_wiggle_terms, fit_gaussian_location_scale_terms,
+    BinomialLocationScaleProbitTermSpec, GaussianLocationScaleTermSpec, WiggleBlockConfig,
+    build_wiggle_block_input_from_knots, build_wiggle_block_input_from_seed,
+    fit_binomial_location_scale_probit_terms, fit_binomial_location_scale_probit_wiggle,
+    fit_gaussian_location_scale_terms,
 };
 use gam::generative::{generative_spec_from_predict, sample_observation_replicates};
 use gam::hmc::{FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family};
@@ -86,7 +86,7 @@ struct FitArgs {
         long = "formula",
         alias = "predict-mean",
         help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
-        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary unpenalized linear term\n- linear(x, min=..., max=...): linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- unpenalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary unpenalized linear term\n- linear(x, min=..., max=...): linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- unpenalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, order=1, power=0)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     formula: Option<String>,
     /// P(Y=1|S,x)=Phi((S-T(x))/sigma(x)).
@@ -573,7 +573,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
         let sigma_min = 0.05;
         let sigma_max = 20.0;
-        let q_seed = Array1::<f64>::zeros(y.len());
         let options = gam::BlockwiseFitOptions::default();
         let (resolved_mean_spec, resolved_noise_spec, mean_design, noise_design, fit, wiggle_meta): (
             TermCollectionSpec,
@@ -595,43 +594,85 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 penalty_order: args.link_wiggle_penalty_order.order(),
                 double_penalty: args.link_wiggle_double_penalty,
             };
+            let (pilot, q_seed) = estimate_probit_wiggle_seed_from_pilot(
+                ds.values.view(),
+                &y,
+                &mean_spec,
+                &noise_spec,
+                sigma_min,
+                sigma_max,
+                &options,
+            )?;
+            let threshold_penalty_count = pilot.mean_design.penalties.len();
+            let noise_penalty_count = pilot.noise_design.penalties.len();
+            let threshold_log_lambdas = slice_log_lambda_block(
+                &pilot.fit.log_lambdas,
+                0,
+                threshold_penalty_count,
+                "threshold",
+            )?;
+            let noise_log_lambdas = slice_log_lambda_block(
+                &pilot.fit.log_lambdas,
+                threshold_penalty_count,
+                noise_penalty_count,
+                "log_sigma",
+            )?;
             let (wiggle_block, wiggle_knots) =
                 build_wiggle_block_input_from_seed(q_seed.view(), &cfg)
                     .map_err(|e| format!("failed to build link wiggle block: {e}"))?;
-            let wiggle_block_for_fit = wiggle_block.clone();
-            let wiggle_knots_for_fit = wiggle_knots.clone();
-            let solved = fit_binomial_location_scale_probit_wiggle_terms(
-                ds.values.view(),
-                BinomialLocationScaleProbitWiggleTermSpec {
+            let frozen_mean_spec =
+                freeze_term_collection_spec(&pilot.mean_spec_resolved, &pilot.mean_design)?;
+            let frozen_noise_spec =
+                freeze_term_collection_spec(&pilot.noise_spec_resolved, &pilot.noise_design)?;
+            let fit = fit_binomial_location_scale_probit_wiggle(
+                gam::BinomialLocationScaleProbitWiggleSpec {
                     y: y.clone(),
                     weights: Array1::ones(y.len()),
                     sigma_min,
                     sigma_max,
-                    threshold_spec: mean_spec.clone(),
-                    log_sigma_spec: noise_spec.clone(),
-                    wiggle_knots: wiggle_knots_for_fit.clone(),
+                    wiggle_knots: wiggle_knots.clone(),
                     wiggle_degree: cfg.degree,
-                    wiggle_block: wiggle_block_for_fit.clone(),
+                    threshold_block: gam::ParameterBlockInput {
+                        design: DesignMatrix::Dense(pilot.mean_design.design.clone()),
+                        offset: Array1::zeros(y.len()),
+                        penalties: pilot.mean_design.penalties.clone(),
+                        initial_log_lambdas: Some(threshold_log_lambdas),
+                        initial_beta: pilot.fit.block_states.first().map(|b| b.beta.clone()),
+                    },
+                    log_sigma_block: gam::ParameterBlockInput {
+                        design: DesignMatrix::Dense(pilot.noise_design.design.clone()),
+                        offset: Array1::zeros(y.len()),
+                        penalties: pilot.noise_design.penalties.clone(),
+                        initial_log_lambdas: Some(noise_log_lambdas),
+                        initial_beta: pilot.fit.block_states.get(1).map(|b| b.beta.clone()),
+                    },
+                    wiggle_block,
                 },
                 &options,
-                &SpatialLengthScaleOptimizationOptions::default(),
             )
-            .map_err(|e| format!("fit_binomial_location_scale_probit_wiggle_terms failed: {e}"))?;
-            let fit = solved.fit;
-            let resolved_mean_spec = solved.mean_spec_resolved;
-            let resolved_noise_spec = solved.noise_spec_resolved;
-            let mean_design = solved.mean_design;
-            let noise_design = solved.noise_design;
+            .map_err(|e| format!("fit_binomial_location_scale_probit_wiggle failed: {e}"))?;
+            let final_q0 = compute_probit_q0_from_fit(&fit, sigma_min, sigma_max)?;
+            let domain = summarize_wiggle_domain(final_q0.view(), wiggle_knots.view(), cfg.degree)?;
+            if domain.outside_count > 0 {
+                eprintln!(
+                    "warning: {} of {} probit wiggle q values ({:.1}%) fell outside the knot domain [{:.3}, {:.3}] after fitting",
+                    domain.outside_count,
+                    final_q0.len(),
+                    100.0 * domain.outside_fraction,
+                    domain.domain_min,
+                    domain.domain_max
+                );
+            }
             let beta_wiggle = fit
                 .block_states
                 .get(2)
                 .map(|b| b.beta.to_vec())
                 .unwrap_or_default();
             (
-                resolved_mean_spec,
-                resolved_noise_spec,
-                mean_design,
-                noise_design,
+                frozen_mean_spec,
+                frozen_noise_spec,
+                pilot.mean_design,
+                pilot.noise_design,
                 fit,
                 Some((wiggle_knots, cfg.degree, beta_wiggle)),
             )
@@ -3767,14 +3808,14 @@ fn freeze_term_collection_spec(
                 BasisMetadata::Duchon {
                     centers,
                     length_scale,
-                    nu,
+                    power,
                     nullspace_order,
                     identifiability_transform,
                 },
             ) => {
                 s.center_strategy = CenterStrategy::UserProvided(centers.clone());
                 s.length_scale = *length_scale;
-                s.nu = *nu;
+                s.power = *power;
                 s.nullspace_order = *nullspace_order;
                 s.identifiability = match identifiability_transform {
                     Some(z) => SpatialIdentifiability::FrozenTransform {
@@ -3832,6 +3873,127 @@ fn freeze_term_collection_spec(
     }
 
     Ok(frozen)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WiggleDomainDiagnostics {
+    domain_min: f64,
+    domain_max: f64,
+    outside_count: usize,
+    outside_fraction: f64,
+}
+
+fn compute_probit_q0_from_eta(
+    eta_t: ArrayView1<'_, f64>,
+    eta_ls: ArrayView1<'_, f64>,
+    sigma_min: f64,
+    sigma_max: f64,
+) -> Result<Array1<f64>, String> {
+    if eta_t.len() != eta_ls.len() {
+        return Err(format!(
+            "probit q0 eta length mismatch: threshold={} log_sigma={}",
+            eta_t.len(),
+            eta_ls.len()
+        ));
+    }
+    let mut q0 = Array1::<f64>::zeros(eta_t.len());
+    for i in 0..q0.len() {
+        let sigma = sigma_from_eta_scalar(eta_ls[i], sigma_min, sigma_max).max(1e-12);
+        q0[i] = -eta_t[i] / sigma;
+    }
+    Ok(q0)
+}
+
+fn compute_probit_q0_from_fit(
+    fit: &gam::BlockwiseFitResult,
+    sigma_min: f64,
+    sigma_max: f64,
+) -> Result<Array1<f64>, String> {
+    let eta_t = fit
+        .block_states
+        .first()
+        .ok_or_else(|| "pilot fit is missing threshold block".to_string())?
+        .eta
+        .view();
+    let eta_ls = fit
+        .block_states
+        .get(1)
+        .ok_or_else(|| "pilot fit is missing log-sigma block".to_string())?
+        .eta
+        .view();
+    compute_probit_q0_from_eta(eta_t, eta_ls, sigma_min, sigma_max)
+}
+
+fn summarize_wiggle_domain(
+    q0: ArrayView1<'_, f64>,
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+) -> Result<WiggleDomainDiagnostics, String> {
+    if knots.len() < degree + 2 {
+        return Err(format!(
+            "wiggle knot vector too short for degree {}: {}",
+            degree,
+            knots.len()
+        ));
+    }
+    let domain_min = knots[degree];
+    let domain_max = knots[knots.len() - degree - 1];
+    let outside_count = q0
+        .iter()
+        .filter(|&&v| v < domain_min || v > domain_max)
+        .count();
+    let outside_fraction = outside_count as f64 / q0.len().max(1) as f64;
+    Ok(WiggleDomainDiagnostics {
+        domain_min,
+        domain_max,
+        outside_count,
+        outside_fraction,
+    })
+}
+
+fn estimate_probit_wiggle_seed_from_pilot(
+    data: ndarray::ArrayView2<'_, f64>,
+    y: &Array1<f64>,
+    mean_spec: &TermCollectionSpec,
+    noise_spec: &TermCollectionSpec,
+    sigma_min: f64,
+    sigma_max: f64,
+    options: &gam::BlockwiseFitOptions,
+) -> Result<(gam::BlockwiseTermFitResult, Array1<f64>), String> {
+    let pilot = fit_binomial_location_scale_probit_terms(
+        data,
+        BinomialLocationScaleProbitTermSpec {
+            y: y.clone(),
+            weights: Array1::ones(y.len()),
+            sigma_min,
+            sigma_max,
+            threshold_spec: mean_spec.clone(),
+            log_sigma_spec: noise_spec.clone(),
+        },
+        options,
+        &SpatialLengthScaleOptimizationOptions::default(),
+    )
+    .map_err(|e| format!("pilot fit_binomial_location_scale_probit_terms failed: {e}"))?;
+    let q0_seed = compute_probit_q0_from_fit(&pilot.fit, sigma_min, sigma_max)?;
+    Ok((pilot, q0_seed))
+}
+
+fn slice_log_lambda_block(
+    log_lambdas: &Array1<f64>,
+    start: usize,
+    len: usize,
+    block_name: &str,
+) -> Result<Array1<f64>, String> {
+    let end = start + len;
+    if end > log_lambdas.len() {
+        return Err(format!(
+            "log lambda slice for block '{block_name}' is out of bounds: {}..{} with total {}",
+            start,
+            end,
+            log_lambdas.len()
+        ));
+    }
+    Ok(log_lambdas.slice(s![start..end]).to_owned())
 }
 
 fn remap_term_collection_spec_columns(
@@ -5078,6 +5240,8 @@ fn build_smooth_basis(
                 "centers",
                 heuristic_centers(ds.values.nrows()),
             )?;
+            let power = parse_duchon_power(options)?;
+            let nullspace_order = parse_duchon_order(options)?;
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
@@ -5085,11 +5249,8 @@ fn build_smooth_basis(
                         num_centers: centers,
                     },
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
-                    nu: parse_matern_nu(options.get("nu").map(String::as_str).unwrap_or("1/2"))?,
-                    nullspace_order: match option_usize(options, "order").unwrap_or(0) {
-                        0 => DuchonNullspaceOrder::Zero,
-                        _ => DuchonNullspaceOrder::Linear,
-                    },
+                    power,
+                    nullspace_order,
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                 },
@@ -5262,6 +5423,42 @@ fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
         "7/2" | "3.5" => Ok(MaternNu::SevenHalves),
         "9/2" | "4.5" => Ok(MaternNu::NineHalves),
         _ => Err(format!("unsupported Matern nu '{raw}'")),
+    }
+}
+
+fn parse_duchon_power(options: &BTreeMap<String, String>) -> Result<usize, String> {
+    if let Some(raw_nu) = options.get("nu") {
+        return Err(format!(
+            "Duchon smooths use power=<integer>, not nu='{}'. Use power=0, power=1, etc.",
+            raw_nu
+        ));
+    }
+    match options.get("power") {
+        Some(raw) => raw.parse::<usize>().map_err(|_| {
+            format!(
+                "invalid Duchon power '{}'; expected a non-negative integer such as power=0 or power=1",
+                raw
+            )
+        }),
+        None => Ok(1),
+    }
+}
+
+fn parse_duchon_order(options: &BTreeMap<String, String>) -> Result<DuchonNullspaceOrder, String> {
+    match options.get("order") {
+        None => Ok(DuchonNullspaceOrder::Zero),
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(0) => Ok(DuchonNullspaceOrder::Zero),
+            Ok(1) => Ok(DuchonNullspaceOrder::Linear),
+            Ok(other) => Err(format!(
+                "invalid Duchon order '{}'; supported values are order=0 and order=1",
+                other
+            )),
+            Err(_) => Err(format!(
+                "invalid Duchon order '{}'; expected an integer such as order=0 or order=1",
+                raw
+            )),
+        },
     }
 }
 
@@ -6134,12 +6331,14 @@ mod tests {
     use super::{
         BoundedCoefficientPriorSpec, LikelihoodFamily, MODEL_VERSION, ParsedTerm, SavedModel,
         SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
-        chi_square_survival_approx, parse_formula, parse_survival_time_basis_config,
-        pretty_family_name, saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design,
+        chi_square_survival_approx, compute_probit_q0_from_eta, parse_duchon_order,
+        parse_duchon_power, parse_formula, parse_survival_time_basis_config, pretty_family_name,
+        saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design, summarize_wiggle_domain,
         survival_probability_from_eta, write_survival_prediction_csv,
     };
-    use gam::basis::{BasisOptions, Dense, KnotSource, create_basis};
+    use gam::basis::{BasisOptions, Dense, DuchonNullspaceOrder, KnotSource, create_basis};
     use ndarray::{Array1, ArrayView1, array};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6357,6 +6556,82 @@ mod tests {
                 assert_eq!(*coefficient_max, Some(0.0));
             }
             other => panic!("expected nonpositive linear term, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_duchon_power_prefers_explicit_power() {
+        let mut options = BTreeMap::new();
+        options.insert("power".to_string(), "0".to_string());
+        assert_eq!(parse_duchon_power(&options).expect("power should parse"), 0);
+    }
+
+    #[test]
+    fn parse_duchon_power_rejects_malformed_value() {
+        let mut options = BTreeMap::new();
+        options.insert("power".to_string(), "oops".to_string());
+        let err = parse_duchon_power(&options).expect_err("malformed power should fail");
+        assert!(err.contains("invalid Duchon power"));
+    }
+
+    #[test]
+    fn parse_duchon_power_rejects_duchon_nu_alias() {
+        let mut options = BTreeMap::new();
+        options.insert("nu".to_string(), "5/2".to_string());
+        let err = parse_duchon_power(&options).expect_err("duchon nu alias should fail");
+        assert!(err.contains("Duchon smooths use power=<integer>"));
+    }
+
+    #[test]
+    fn parse_duchon_power_rejects_conflicting_power_and_nu() {
+        let mut options = BTreeMap::new();
+        options.insert("power".to_string(), "0".to_string());
+        options.insert("nu".to_string(), "5/2".to_string());
+        let err = parse_duchon_power(&options).expect_err("conflict should fail");
+        assert!(err.contains("Duchon smooths use power=<integer>"));
+    }
+
+    #[test]
+    fn parse_duchon_order_accepts_supported_values() {
+        let options = BTreeMap::new();
+        assert_eq!(
+            parse_duchon_order(&options).expect("default Duchon order"),
+            DuchonNullspaceOrder::Zero
+        );
+
+        let mut linear = BTreeMap::new();
+        linear.insert("order".to_string(), "1".to_string());
+        assert_eq!(
+            parse_duchon_order(&linear).expect("linear Duchon order"),
+            DuchonNullspaceOrder::Linear
+        );
+    }
+
+    #[test]
+    fn parse_duchon_order_rejects_unsupported_or_malformed_values() {
+        let mut unsupported = BTreeMap::new();
+        unsupported.insert("order".to_string(), "2".to_string());
+        let unsupported_err =
+            parse_duchon_order(&unsupported).expect_err("unsupported Duchon order should fail");
+        assert!(unsupported_err.contains("supported values are order=0 and order=1"));
+
+        let mut malformed = BTreeMap::new();
+        malformed.insert("order".to_string(), "linear".to_string());
+        let malformed_err =
+            parse_duchon_order(&malformed).expect_err("malformed Duchon order should fail");
+        assert!(malformed_err.contains("invalid Duchon order"));
+    }
+
+    #[test]
+    fn parse_formula_retains_explicit_duchon_power_and_order_options() {
+        let parsed = parse_formula("y ~ s(pc1, type=duchon, centers=12, power=0, order=1)")
+            .expect("formula");
+        match &parsed.terms[0] {
+            ParsedTerm::Smooth { options, .. } => {
+                assert_eq!(options.get("power").map(String::as_str), Some("0"));
+                assert_eq!(options.get("order").map(String::as_str), Some("1"));
+            }
+            other => panic!("expected smooth term, got {other:?}"),
         }
     }
 
@@ -6612,5 +6887,30 @@ mod tests {
                 expected[i]
             );
         }
+    }
+
+    #[test]
+    fn probit_q0_helper_matches_manual_threshold_over_sigma() {
+        let eta_t = array![0.8, -0.4, 1.2];
+        let eta_ls = array![-1.0, 0.0, 1.5];
+        let q0 = compute_probit_q0_from_eta(eta_t.view(), eta_ls.view(), 0.05, 20.0)
+            .expect("compute probit q0");
+        for i in 0..q0.len() {
+            let sigma = super::sigma_from_eta_scalar(eta_ls[i], 0.05, 20.0).max(1e-12);
+            let expected = -eta_t[i] / sigma;
+            assert!((q0[i] - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn wiggle_domain_summary_counts_out_of_range_q0() {
+        let q0 = array![-2.5, -0.5, 0.0, 1.0, 2.5];
+        let knots = array![-1.0, -1.0, -1.0, -0.25, 0.25, 1.0, 1.0, 1.0];
+        let summary =
+            summarize_wiggle_domain(q0.view(), knots.view(), 2).expect("summarize wiggle domain");
+        assert_eq!(summary.domain_min, -1.0);
+        assert_eq!(summary.domain_max, 1.0);
+        assert_eq!(summary.outside_count, 2);
+        assert!((summary.outside_fraction - 0.4).abs() < 1e-12);
     }
 }

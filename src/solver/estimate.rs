@@ -20,7 +20,8 @@
 //! This two-tiered structure allows the model to learn the appropriate complexity for
 //! each smooth term directly from the data.
 
-use self::reml::RemlState;
+use self::reml::{DirectionalHyperParam, RemlState};
+use crate::basis::analyze_penalty_block;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::Cell;
 use std::fmt;
@@ -518,11 +519,22 @@ fn compute_smoothing_correction(
     //   S_k β̂ = R_kᵀ(R_k β̂),
     // so each Jacobian column is one linear solve with H.
 
-    // Get the effective Hessian from the fit - use stabilized version for consistency
-    let h_trans = &final_fit.stabilized_hessian_transformed;
+    // Use the same objective-consistent inner Hessian surface used by REML:
+    // - non-Firth: H = X'WX + S (+ stabilization if present)
+    // - Firth logit: H_total = H - d²Phi/dβ²
+    // Fallback to PIRLS stabilized Hessian only if bundle recovery fails.
+    //
+    // Conclusion:
+    //   J[:,k] = dβ̂/dρ_k must use the Jacobian of the actual stationarity
+    //   system G*(β,ρ)=0, i.e. H_total for Firth-adjusted fits. Using only
+    //   X'WX+S here would be inconsistent with the fitted objective and would
+    //   misstate smoothing-parameter uncertainty propagation.
+    let h_trans = reml_state
+        .objective_inner_hessian(final_rho)
+        .unwrap_or_else(|_| final_fit.stabilized_hessian_transformed.clone());
 
     // Factor the Hessian for solving
-    let h_chol = match h_trans.clone().cholesky(Side::Lower) {
+    let h_chol = match h_trans.cholesky(Side::Lower) {
         Ok(c) => c,
         Err(_) => {
             log::warn!("Cholesky decomposition failed for smoothing correction; skipping.");
@@ -842,6 +854,26 @@ fn resolve_external_family(
     }
 }
 
+#[inline]
+fn ensure_exact_directional_hyper_supported(
+    link: LinkFunction,
+    firth_active: bool,
+    has_design_drift: bool,
+    context: &str,
+) -> Result<(), EstimationError> {
+    // Kept as a central compatibility hook for API-level validation.
+    //
+    // Current status:
+    // - Dense exact path supports Firth-logit directional hyper-gradients for
+    //   both penalty-only and design-moving directions.
+    // - Sparse exact path still rejects Firth-logit directional gradients.
+    //
+    // We intentionally do not block here so callers can use the dense path.
+    // Sparse limitations are reported at execution sites in `reml.rs`.
+    let _ = (link, firth_active, has_design_drift, context);
+    Ok(())
+}
+
 fn validate_full_size_penalties(
     s_list: &[Array2<f64>],
     p: usize,
@@ -856,6 +888,46 @@ fn validate_full_size_penalties(
         }
     }
     Ok(())
+}
+
+fn canonicalize_active_penalties(
+    s_list: Vec<Array2<f64>>,
+    nullspace_dims: &[usize],
+    context: &str,
+) -> Result<(Vec<Array2<f64>>, Vec<usize>), EstimationError> {
+    if s_list.len() != nullspace_dims.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "{context}: nullspace_dims length mismatch: penalties={}, nullspace_dims={}",
+            s_list.len(),
+            nullspace_dims.len()
+        )));
+    }
+
+    let mut active_penalties = Vec::with_capacity(s_list.len());
+    let mut active_nullspace_dims = Vec::with_capacity(s_list.len());
+    for (idx, s) in s_list.into_iter().enumerate() {
+        let analysis = analyze_penalty_block(&s).map_err(|err| {
+            EstimationError::InvalidInput(format!(
+                "{context}: penalty canonicalization failed at index {idx}: {err}"
+            ))
+        })?;
+        if analysis.rank == 0 {
+            log::debug!(
+                "Dropped inactive external penalty block idx={} reason={}",
+                idx,
+                if analysis.is_zero {
+                    "ZeroMatrix"
+                } else {
+                    "NumericalRankZero"
+                }
+            );
+            continue;
+        }
+        active_penalties.push(analysis.sym_penalty);
+        active_nullspace_dims.push(analysis.nullity);
+    }
+
+    Ok((active_penalties, active_nullspace_dims))
 }
 
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
@@ -903,11 +975,19 @@ where
 
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "optimize_external_design")?;
+    let (s_list, active_nullspace_dims) =
+        canonicalize_active_penalties(s_list, &opts.nullspace_dims, "optimize_external_design")?;
     let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_list);
     let x_fit = conditioning.apply_to_design(&x);
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
     let k = s_list.len();
+    if active_nullspace_dims.len() != k {
+        return Err(EstimationError::InvalidInput(format!(
+            "nullspace_dims length mismatch: expected {k} entries for active penalties, got {}",
+            active_nullspace_dims.len()
+        )));
+    }
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let cfg = RemlConfig::external(link, opts.tol, firth_active);
 
@@ -927,7 +1007,7 @@ where
         s_list,
         p,
         &cfg,
-        Some(opts.nullspace_dims.clone()),
+        Some(active_nullspace_dims),
         None,
         fit_linear_constraints.clone(),
     )?;
@@ -1250,8 +1330,7 @@ pub(crate) fn compute_external_directional_hyper_gradient<X>(
     offset: ArrayView1<'_, f64>,
     s_list: Vec<Array2<f64>>,
     rho: &Array1<f64>,
-    x_psi: &Array2<f64>,
-    s_psi: &Array2<f64>,
+    hyper_dir: &DirectionalHyperParam,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     opts: &ExternalOptimOptions,
 ) -> Result<f64, EstimationError>
@@ -1270,26 +1349,45 @@ where
     }
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "compute_external_directional_hyper_gradient")?;
-    if x_psi.nrows() != x.nrows() || x_psi.ncols() != p {
+    let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
+        s_list,
+        &opts.nullspace_dims,
+        "compute_external_directional_hyper_gradient",
+    )?;
+    if rho.len() != active_nullspace_dims.len() {
         return Err(EstimationError::InvalidInput(format!(
-            "X_psi must be {}x{}, got {}x{}",
-            x.nrows(),
-            p,
-            x_psi.nrows(),
-            x_psi.ncols()
+            "rho dimension mismatch: rho_dim={}, active_penalties={}",
+            rho.len(),
+            active_nullspace_dims.len()
         )));
     }
-    if s_psi.nrows() != p || s_psi.ncols() != p {
+    if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
         return Err(EstimationError::InvalidInput(format!(
-            "S_psi must be {}x{}, got {}x{}",
+            "X_tau must be {}x{}, got {}x{}",
+            x.nrows(),
+            p,
+            hyper_dir.x_tau_original.nrows(),
+            hyper_dir.x_tau_original.ncols()
+        )));
+    }
+    if hyper_dir.s_tau_original.nrows() != p || hyper_dir.s_tau_original.ncols() != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "S_tau must be {}x{}, got {}x{}",
             p,
             p,
-            s_psi.nrows(),
-            s_psi.ncols()
+            hyper_dir.s_tau_original.nrows(),
+            hyper_dir.s_tau_original.ncols()
         )));
     }
 
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let has_design_drift = hyper_dir.x_tau_original.iter().any(|v| v.abs() > 1e-14);
+    ensure_exact_directional_hyper_supported(
+        link,
+        firth_active,
+        has_design_drift,
+        "compute_external_directional_hyper_gradient",
+    )?;
     let cfg = RemlConfig::external(link, opts.tol, firth_active);
     let y_o = y.to_owned();
     let w_o = w.to_owned();
@@ -1303,12 +1401,12 @@ where
         s_list,
         p,
         &cfg,
-        Some(opts.nullspace_dims.clone()),
+        Some(active_nullspace_dims),
         None,
         opts.linear_constraints.clone(),
     )?;
     reml_state.set_warm_start_original_beta(warm_start_beta);
-    reml_state.compute_directional_hyper_gradient(rho, x_psi, s_psi)
+    reml_state.compute_directional_hyper_gradient(rho, hyper_dir)
 }
 
 #[allow(dead_code)]
@@ -1320,8 +1418,7 @@ pub(crate) fn compute_external_joint_hyper_gradient<X>(
     s_list: Vec<Array2<f64>>,
     theta: &Array1<f64>,
     rho_dim: usize,
-    x_psi_list: &[Array2<f64>],
-    s_psi_list: &[Array2<f64>],
+    hyper_dirs: &[DirectionalHyperParam],
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     opts: &ExternalOptimOptions,
 ) -> Result<Array1<f64>, EstimationError>
@@ -1347,39 +1444,57 @@ where
     }
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "compute_external_joint_hyper_gradient")?;
-    let psi_dim = theta.len() - rho_dim;
-    if x_psi_list.len() != psi_dim || s_psi_list.len() != psi_dim {
+    let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
+        s_list,
+        &opts.nullspace_dims,
+        "compute_external_joint_hyper_gradient",
+    )?;
+    if rho_dim != active_nullspace_dims.len() {
         return Err(EstimationError::InvalidInput(format!(
-            "joint hyper-gradient derivative count mismatch: psi_dim={}, X_psi={}, S_psi={}",
-            psi_dim,
-            x_psi_list.len(),
-            s_psi_list.len()
+            "rho_dim mismatch: rho_dim={}, active_penalties={}",
+            rho_dim,
+            active_nullspace_dims.len()
         )));
     }
-    for (idx, x_psi) in x_psi_list.iter().enumerate() {
-        if x_psi.nrows() != x.nrows() || x_psi.ncols() != p {
+    let psi_dim = theta.len() - rho_dim;
+    if hyper_dirs.len() != psi_dim {
+        return Err(EstimationError::InvalidInput(format!(
+            "joint hyper-gradient derivative count mismatch: psi_dim={}, hyper_dirs={}",
+            psi_dim,
+            hyper_dirs.len()
+        )));
+    }
+    for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
+        if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
             return Err(EstimationError::InvalidInput(format!(
-                "X_psi[{idx}] must be {}x{}, got {}x{}",
+                "X_tau[{idx}] must be {}x{}, got {}x{}",
                 x.nrows(),
                 p,
-                x_psi.nrows(),
-                x_psi.ncols()
+                hyper_dir.x_tau_original.nrows(),
+                hyper_dir.x_tau_original.ncols()
             )));
         }
-    }
-    for (idx, s_psi) in s_psi_list.iter().enumerate() {
-        if s_psi.nrows() != p || s_psi.ncols() != p {
+        if hyper_dir.s_tau_original.nrows() != p || hyper_dir.s_tau_original.ncols() != p {
             return Err(EstimationError::InvalidInput(format!(
-                "S_psi[{idx}] must be {}x{}, got {}x{}",
+                "S_tau[{idx}] must be {}x{}, got {}x{}",
                 p,
                 p,
-                s_psi.nrows(),
-                s_psi.ncols()
+                hyper_dir.s_tau_original.nrows(),
+                hyper_dir.s_tau_original.ncols()
             )));
         }
     }
 
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let has_design_drift = hyper_dirs
+        .iter()
+        .any(|dir| dir.x_tau_original.iter().any(|v| v.abs() > 1e-14));
+    ensure_exact_directional_hyper_supported(
+        link,
+        firth_active,
+        has_design_drift,
+        "compute_external_joint_hyper_gradient",
+    )?;
     let cfg = RemlConfig::external(link, opts.tol, firth_active);
     let y_o = y.to_owned();
     let w_o = w.to_owned();
@@ -1393,12 +1508,12 @@ where
         s_list,
         p,
         &cfg,
-        Some(opts.nullspace_dims.clone()),
+        Some(active_nullspace_dims),
         None,
         opts.linear_constraints.clone(),
     )?;
     reml_state.set_warm_start_original_beta(warm_start_beta);
-    reml_state.compute_joint_hyper_gradient(theta, rho_dim, x_psi_list, s_psi_list)
+    reml_state.compute_joint_hyper_gradient(theta, rho_dim, hyper_dirs)
 }
 
 #[allow(dead_code)]
@@ -1410,8 +1525,7 @@ pub(crate) fn compute_external_joint_hyper_cost_gradient<X>(
     s_list: Vec<Array2<f64>>,
     theta: &Array1<f64>,
     rho_dim: usize,
-    x_psi_list: &[Array2<f64>],
-    s_psi_list: &[Array2<f64>],
+    hyper_dirs: &[DirectionalHyperParam],
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     opts: &ExternalOptimOptions,
 ) -> Result<(f64, Array1<f64>), EstimationError>
@@ -1437,39 +1551,57 @@ where
     }
     let p = x.ncols();
     validate_full_size_penalties(&s_list, p, "compute_external_joint_hyper_cost_gradient")?;
-    let psi_dim = theta.len() - rho_dim;
-    if x_psi_list.len() != psi_dim || s_psi_list.len() != psi_dim {
+    let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
+        s_list,
+        &opts.nullspace_dims,
+        "compute_external_joint_hyper_cost_gradient",
+    )?;
+    if rho_dim != active_nullspace_dims.len() {
         return Err(EstimationError::InvalidInput(format!(
-            "joint hyper-gradient derivative count mismatch: psi_dim={}, X_psi={}, S_psi={}",
-            psi_dim,
-            x_psi_list.len(),
-            s_psi_list.len()
+            "rho_dim mismatch: rho_dim={}, active_penalties={}",
+            rho_dim,
+            active_nullspace_dims.len()
         )));
     }
-    for (idx, x_psi) in x_psi_list.iter().enumerate() {
-        if x_psi.nrows() != x.nrows() || x_psi.ncols() != p {
+    let psi_dim = theta.len() - rho_dim;
+    if hyper_dirs.len() != psi_dim {
+        return Err(EstimationError::InvalidInput(format!(
+            "joint hyper-gradient derivative count mismatch: psi_dim={}, hyper_dirs={}",
+            psi_dim,
+            hyper_dirs.len()
+        )));
+    }
+    for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
+        if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
             return Err(EstimationError::InvalidInput(format!(
-                "X_psi[{idx}] must be {}x{}, got {}x{}",
+                "X_tau[{idx}] must be {}x{}, got {}x{}",
                 x.nrows(),
                 p,
-                x_psi.nrows(),
-                x_psi.ncols()
+                hyper_dir.x_tau_original.nrows(),
+                hyper_dir.x_tau_original.ncols()
             )));
         }
-    }
-    for (idx, s_psi) in s_psi_list.iter().enumerate() {
-        if s_psi.nrows() != p || s_psi.ncols() != p {
+        if hyper_dir.s_tau_original.nrows() != p || hyper_dir.s_tau_original.ncols() != p {
             return Err(EstimationError::InvalidInput(format!(
-                "S_psi[{idx}] must be {}x{}, got {}x{}",
+                "S_tau[{idx}] must be {}x{}, got {}x{}",
                 p,
                 p,
-                s_psi.nrows(),
-                s_psi.ncols()
+                hyper_dir.s_tau_original.nrows(),
+                hyper_dir.s_tau_original.ncols()
             )));
         }
     }
 
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let has_design_drift = hyper_dirs
+        .iter()
+        .any(|dir| dir.x_tau_original.iter().any(|v| v.abs() > 1e-14));
+    ensure_exact_directional_hyper_supported(
+        link,
+        firth_active,
+        has_design_drift,
+        "compute_external_joint_hyper_cost_gradient",
+    )?;
     let cfg = RemlConfig::external(link, opts.tol, firth_active);
     let y_o = y.to_owned();
     let w_o = w.to_owned();
@@ -1483,12 +1615,12 @@ where
         s_list,
         p,
         &cfg,
-        Some(opts.nullspace_dims.clone()),
+        Some(active_nullspace_dims),
         None,
         opts.linear_constraints.clone(),
     )?;
     reml_state.set_warm_start_original_beta(warm_start_beta);
-    reml_state.compute_joint_hyper_cost_gradient(theta, rho_dim, x_psi_list, s_psi_list)
+    reml_state.compute_joint_hyper_cost_gradient(theta, rho_dim, hyper_dirs)
 }
 
 #[derive(Clone)]
@@ -2210,11 +2342,22 @@ where
 
     let p = x.ncols();
     validate_full_size_penalties(s_list, p, "evaluate_external_gradients")?;
+    let (s_vec, active_nullspace_dims) = canonicalize_active_penalties(
+        s_list.to_vec(),
+        &opts.nullspace_dims,
+        "evaluate_external_gradients",
+    )?;
+    if rho.len() != active_nullspace_dims.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho dimension mismatch: rho_dim={}, active_penalties={}",
+            rho.len(),
+            active_nullspace_dims.len()
+        )));
+    }
 
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let cfg = RemlConfig::external(link, opts.tol, firth_active);
 
-    let s_vec: Vec<Array2<f64>> = s_list.to_vec();
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let x_o = x.clone();
@@ -2228,7 +2371,7 @@ where
         s_vec,
         p,
         &cfg,
-        Some(opts.nullspace_dims.clone()),
+        Some(active_nullspace_dims),
         None,
         opts.linear_constraints.clone(),
     )?;
@@ -2266,11 +2409,22 @@ where
 
     let p = x.ncols();
     validate_full_size_penalties(s_list, p, "evaluate_external_cost_and_ridge")?;
+    let (s_vec, active_nullspace_dims) = canonicalize_active_penalties(
+        s_list.to_vec(),
+        &opts.nullspace_dims,
+        "evaluate_external_cost_and_ridge",
+    )?;
+    if rho.len() != active_nullspace_dims.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho dimension mismatch: rho_dim={}, active_penalties={}",
+            rho.len(),
+            active_nullspace_dims.len()
+        )));
+    }
 
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let cfg = RemlConfig::external(link, opts.tol, firth_active);
 
-    let s_vec: Vec<Array2<f64>> = s_list.to_vec();
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let x_o = x.clone();
@@ -2284,7 +2438,7 @@ where
         s_vec,
         p,
         &cfg,
-        Some(opts.nullspace_dims.clone()),
+        Some(active_nullspace_dims),
         None,
         opts.linear_constraints.clone(),
     )?;
