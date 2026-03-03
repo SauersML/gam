@@ -1040,7 +1040,7 @@ where
     };
     let outer_eval_idx = AtomicUsize::new(0usize);
     let outer_result =
-        crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_parallel(
+        crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
             k,
             heuristic_lambdas,
             |rho: &Array1<f64>| {
@@ -1054,6 +1054,17 @@ where
                 let grad = reml_state.compute_gradient(rho)?;
                 let grad_sec = t_grad.elapsed().as_secs_f64();
                 let used_stochastic = reml_state.last_gradient_used_stochastic_fallback();
+                let t_hess = Instant::now();
+                let hess = match reml_state.compute_laml_hessian_consistent(rho) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        log::warn!(
+                            "[outer-eval {eval_idx}] Hessian unavailable at rho (fallback to gradient-only sample): {e}"
+                        );
+                        None
+                    }
+                };
+                let hess_sec = t_hess.elapsed().as_secs_f64();
 
                 // Outer smoothing optimization is over rho = log(lambda).
                 //
@@ -1064,22 +1075,24 @@ where
                 //          - 0.5 log|S(rho)|_+ .
                 //
                 // By the envelope theorem / stationarity of the inner mode,
-                // the BFGS callback only needs:
+                // the outer callback supplies:
                 //   1) the value V(rho)
                 //   2) the exact outer gradient dV/drho
+                //   3) the exact outer Hessian d²V/drho² when available.
                 //
-                // The exact outer Hessian is *not* required on this path because
-                // wolfe_bfgs::Bfgs is a gradient-only optimizer. Computing the
-                // Hessian here would only evaluate a very expensive quantity and
-                // then discard it before the optimizer sees it.
+                // `optimize_log_smoothing_with_multistart_with_gradient_and_hessian`
+                // consumes (3) through `wolfe_bfgs::NewtonTrustRegion`; missing or
+                // rejected Hessians are handled by solver-side BFGS fallback.
                 log::info!(
-                    "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3})",
+                    "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} hessian={} time_sec(cost={:.3}, grad={:.3}, hess={:.3})",
                     rho.len(),
                     used_stochastic,
+                    hess.is_some(),
                     cost_sec,
                     grad_sec,
+                    hess_sec,
                 );
-                Ok((cost, grad))
+                Ok((cost, grad, hess))
             },
             &smoothing_options,
         )?;
@@ -1749,6 +1762,162 @@ where
     )?;
     reml_state.set_warm_start_original_beta(warm_start_beta);
     reml_state.compute_joint_hyper_cost_gradient(theta, rho_dim, hyper_dirs)
+}
+
+#[allow(dead_code)]
+pub(crate) fn compute_external_joint_hyper_cost_gradient_hessian<X>(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: X,
+    offset: ArrayView1<'_, f64>,
+    s_list: Vec<Array2<f64>>,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    hyper_dirs: &[DirectionalHyperParam],
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    opts: &ExternalOptimOptions,
+) -> Result<(f64, Array1<f64>, Array2<f64>), EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    let x = x.into();
+    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
+            y.len(),
+            w.len(),
+            x.nrows(),
+            offset.len()
+        )));
+    }
+    if rho_dim > theta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho_dim {} exceeds theta dimension {}",
+            rho_dim,
+            theta.len()
+        )));
+    }
+    let p = x.ncols();
+    validate_full_size_penalties(&s_list, p, "compute_external_joint_hyper_cost_gradient_hessian")?;
+    let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
+        s_list,
+        &opts.nullspace_dims,
+        "compute_external_joint_hyper_cost_gradient_hessian",
+    )?;
+    if rho_dim != active_nullspace_dims.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho_dim mismatch: rho_dim={}, active_penalties={}",
+            rho_dim,
+            active_nullspace_dims.len()
+        )));
+    }
+    let psi_dim = theta.len() - rho_dim;
+    if hyper_dirs.len() != psi_dim {
+        return Err(EstimationError::InvalidInput(format!(
+            "joint hyper-gradient derivative count mismatch: psi_dim={}, hyper_dirs={}",
+            psi_dim,
+            hyper_dirs.len()
+        )));
+    }
+    for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
+        if let Some(k) = hyper_dir.penalty_index
+            && k >= s_list.len()
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "penalty_index for dir {idx} out of bounds: {} >= {}",
+                k,
+                s_list.len()
+            )));
+        }
+        if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "X_tau[{idx}] must be {}x{}, got {}x{}",
+                x.nrows(),
+                p,
+                hyper_dir.x_tau_original.nrows(),
+                hyper_dir.x_tau_original.ncols()
+            )));
+        }
+        if hyper_dir.s_tau_original.nrows() != p || hyper_dir.s_tau_original.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "S_tau[{idx}] must be {}x{}, got {}x{}",
+                p,
+                p,
+                hyper_dir.s_tau_original.nrows(),
+                hyper_dir.s_tau_original.ncols()
+            )));
+        }
+        if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
+            if x2.len() != psi_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "X_tau_tau[{idx}] length mismatch: expected {}, got {}",
+                    psi_dim,
+                    x2.len()
+                )));
+            }
+            for (j, x_ij) in x2.iter().enumerate() {
+                if x_ij.nrows() != x.nrows() || x_ij.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "X_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
+                        x.nrows(),
+                        p,
+                        x_ij.nrows(),
+                        x_ij.ncols()
+                    )));
+                }
+            }
+        }
+        if let Some(s2) = hyper_dir.s_tau_tau_original.as_ref() {
+            if s2.len() != psi_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "S_tau_tau[{idx}] length mismatch: expected {}, got {}",
+                    psi_dim,
+                    s2.len()
+                )));
+            }
+            for (j, s_ij) in s2.iter().enumerate() {
+                if s_ij.nrows() != p || s_ij.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "S_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
+                        p,
+                        p,
+                        s_ij.nrows(),
+                        s_ij.ncols()
+                    )));
+                }
+            }
+        }
+    }
+
+    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let has_design_drift = hyper_dirs
+        .iter()
+        .any(|dir| dir.x_tau_original.iter().any(|v| v.abs() > 1e-14));
+    ensure_exact_directional_hyper_supported(
+        link,
+        firth_active,
+        has_design_drift,
+        "compute_external_joint_hyper_cost_gradient_hessian",
+    )?;
+    let cfg = RemlConfig::external(link, opts.tol, firth_active);
+    let y_o = y.to_owned();
+    let w_o = w.to_owned();
+    let x_o = x.clone();
+    let offset_o = offset.to_owned();
+    let reml_state = RemlState::new_with_offset(
+        y_o.view(),
+        x_o,
+        w_o.view(),
+        offset_o.view(),
+        s_list,
+        p,
+        &cfg,
+        Some(active_nullspace_dims),
+        None,
+        opts.linear_constraints.clone(),
+    )?;
+    reml_state.set_warm_start_original_beta(warm_start_beta);
+    reml_state.compute_joint_hyper_cost_gradient_hessian(theta, rho_dim, hyper_dirs)
 }
 
 #[derive(Clone)]
