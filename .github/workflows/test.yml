@@ -11,12 +11,59 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  fmt:
-    name: Rustfmt
+  prepare:
+    name: Prepare source bundle
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Bundle source workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git -czf "${RUNNER_TEMP}/ci-source.tar.gz" -C "${GITHUB_WORKSPACE}" .
+
+      - name: Upload source workspace artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-source
+          path: ${{ runner.temp }}/ci-source.tar.gz
+          if-no-files-found: error
+
+  fmt:
+    name: Rustfmt
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download source workspace
+        id: source-download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-source
+          path: ${{ runner.temp }}/ci-source
+
+      - name: Restore source workspace
+        id: source-restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${RUNNER_TEMP}/ci-source/ci-source.tar.gz"
+          if [ -f "${src}" ]; then
+            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
+            echo "restored=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "restored=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Fallback checkout
+        if: ${{ steps.source-restore.outputs.restored != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -31,10 +78,35 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Download source workspace
+        id: source-download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-source
+          path: ${{ runner.temp }}/ci-source
+
+      - name: Restore source workspace
+        id: source-restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${RUNNER_TEMP}/ci-source/ci-source.tar.gz"
+          if [ -f "${src}" ]; then
+            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
+            echo "restored=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "restored=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Fallback checkout
+        if: ${{ steps.source-restore.outputs.restored != 'true' }}
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -49,10 +121,35 @@ jobs:
 
   test:
     name: Test
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Download source workspace
+        id: source-download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-source
+          path: ${{ runner.temp }}/ci-source
+
+      - name: Restore source workspace
+        id: source-restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${RUNNER_TEMP}/ci-source/ci-source.tar.gz"
+          if [ -f "${src}" ]; then
+            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
+            echo "restored=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "restored=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Fallback checkout
+        if: ${{ steps.source-restore.outputs.restored != 'true' }}
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
