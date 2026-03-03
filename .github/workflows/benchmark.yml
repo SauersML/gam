@@ -177,7 +177,7 @@ jobs:
             cp -a "${R_LIBS_USER}/." bench/runtime/r-lib/ || true
           fi
           python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install --target bench/runtime/pydeps numpy pandas scikit-learn pygam lifelines scikit-survival xgboost
+          python3 -m pip install --target bench/runtime/pydeps numpy pandas scikit-learn pygam lifelines scikit-survival xgboost matplotlib
           cargo build --release --bin gam
           cp target/release/gam bench/runtime/gam
           chmod +x bench/runtime/gam
@@ -295,7 +295,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bench-${{ matrix.scenario }}
-          path: bench/results-shards/${{ matrix.scenario }}.json
+          path: |
+            bench/results-shards/${{ matrix.scenario }}.json
+            bench/results-shards/figures/${{ matrix.scenario }}.png
           if-no-files-found: error
 
   bench-shard-serial:
@@ -397,7 +399,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bench-${{ matrix.scenario }}
-          path: bench/results-shards/${{ matrix.scenario }}.json
+          path: |
+            bench/results-shards/${{ matrix.scenario }}.json
+            bench/results-shards/figures/${{ matrix.scenario }}.png
           if-no-files-found: error
 
   aggregate:
@@ -582,3 +586,22 @@ jobs:
           name: benchmark-results-nightly
           path: bench/results.nightly.json
           if-no-files-found: error
+
+      - name: Checkout for figure generation
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: bench
+
+      - name: Generate merged figures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet matplotlib numpy pandas
+          python3 bench/generate_figures.py bench/results.nightly.json bench/figures bench/figures.zip
+
+      - name: Upload benchmark figures
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-figures
+          path: bench/figures.zip
+          if-no-files-found: warn
