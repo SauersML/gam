@@ -15,19 +15,32 @@ from pathlib import Path
 from shutil import disk_usage
 from time import monotonic, perf_counter
 
-# Hard-force single-thread execution across Python/R/Rust/native math libs.
-_SERIAL_ENV_OVERRIDES = {
-    "OMP_NUM_THREADS": "1",
-    "OPENBLAS_NUM_THREADS": "1",
-    "MKL_NUM_THREADS": "1",
-    "VECLIB_MAXIMUM_THREADS": "1",
-    "NUMEXPR_NUM_THREADS": "1",
-    "BLIS_NUM_THREADS": "1",
-    "RAYON_NUM_THREADS": "1",
-    "CARGO_BUILD_JOBS": "1",
-    "OMP_DYNAMIC": "FALSE",
-    "MKL_DYNAMIC": "FALSE",
-}
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Optional strict serial mode for reproducibility/fairness studies.
+# Default is parallel-friendly so the Rust contender can use Rayon threads.
+_FORCE_SERIAL = _env_flag("BENCH_FORCE_SERIAL", default=False)
+_SERIAL_ENV_OVERRIDES = (
+    {
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "BLIS_NUM_THREADS": "1",
+        "RAYON_NUM_THREADS": "1",
+        "CARGO_BUILD_JOBS": "1",
+        "OMP_DYNAMIC": "FALSE",
+        "MKL_DYNAMIC": "FALSE",
+    }
+    if _FORCE_SERIAL
+    else {}
+)
 for _k, _v in _SERIAL_ENV_OVERRIDES.items():
     os.environ[_k] = _v
 
@@ -51,6 +64,9 @@ HGDP_1KG_PC_TSV = DATASET_DIR / "hgdp_1kg_pc_data.tsv"
 NON_BLOCKING_FAILURE_CONTENDERS = {
     # These external stacks are kept in the benchmark output for visibility,
     # but occasional fit/predict failures should not fail the whole CI shard.
+    "r_gamlss",
+    "rust_gamlss",
+    "rust_gamlss_survival",
     "r_gamboostlss",
     "r_bamlss",
 }
@@ -2473,11 +2489,13 @@ def run_rust_scenario_cv(scenario):
 
 def run_rust_gamlss_scenario_cv(scenario):
     scenario_name = scenario["name"]
-    if _geo_subpop16_scenario_cfg(scenario_name) is None and _geo_latlon_scenario_cfg(scenario_name) is None:
+    # Run for any scenario with a valid formula mapping (not just geo scenarios).
+    if _rust_fit_mapping(scenario_name) is None:
         return None
 
     ds = dataset_for_scenario(scenario)
-    if ds["family"] != "binomial":
+    family = ds["family"]
+    if family not in ("binomial", "gaussian"):
         return None
     folds = folds_for_dataset(ds)
 
@@ -2493,6 +2511,7 @@ def run_rust_gamlss_scenario_cv(scenario):
 
     _, mean_formula = _rust_formula_for_scenario(scenario_name, ds)
     noise_formula = "y ~ " + " + ".join(f"linear({c})" for c in ds["features"])
+    cli_family = "binomial-probit" if family == "binomial" else "gaussian"
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
 
@@ -2501,10 +2520,13 @@ def run_rust_gamlss_scenario_cv(scenario):
         for fold_id, fold in enumerate(folds):
             train_df = base_df.iloc[fold.train_idx].copy()
             test_df = base_df.iloc[fold.test_idx].copy()
+            # Z-score features (matches the main rust_gam contender).
+            train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
             train_path = td_path / f"train_{fold_id}.csv"
             test_path = td_path / f"test_{fold_id}.csv"
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
+            train_pred_path = td_path / f"pred_train_{fold_id}.csv"
 
             train_df.to_csv(train_path, index=False)
             test_df.to_csv(test_path, index=False)
@@ -2513,7 +2535,7 @@ def run_rust_gamlss_scenario_cv(scenario):
                 str(rust_bin),
                 "fit",
                 "--family",
-                "binomial-probit",
+                cli_family,
                 "--formula",
                 mean_formula,
                 "--predict-noise",
@@ -2573,22 +2595,209 @@ def run_rust_gamlss_scenario_cv(scenario):
                 }
             pred = pred_df["mean"].to_numpy(dtype=float)
             y_test = test_df[ds["target"]].to_numpy(dtype=float)
+
+            if family == "binomial":
+                cv_rows.append(
+                    {
+                        "fit_sec": float(fit_sec),
+                        "predict_sec": float(pred_sec),
+                        "auc": auc_score(y_test, pred),
+                        "brier": brier_score(y_test, pred),
+                        "logloss": log_loss_score(y_test, pred),
+                        "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
+                        "n_test": int(len(fold.test_idx)),
+                        "model_spec": "gamlss binomial-probit location-scale via release binary [5-fold CV]",
+                    }
+                )
+            else:
+                # Gaussian GAMLSS: get per-obs sigma from the noise block if available,
+                # otherwise fall back to train-RMSE as sigma estimate.
+                if "sigma" in pred_df.columns:
+                    sigma_hat = pred_df["sigma"].to_numpy(dtype=float)
+                    sigma_hat = np.clip(sigma_hat, 1e-12, None)
+                else:
+                    # Predict on training data to get sigma estimate.
+                    train_pred_cmd = [
+                        str(rust_bin), "predict",
+                        str(model_path), str(train_path),
+                        "--out", str(train_pred_path),
+                    ]
+                    code2, _, _ = run_cmd(train_pred_cmd, cwd=ROOT)
+                    if code2 == 0 and train_pred_path.is_file():
+                        train_pred_df = pd.read_csv(train_pred_path)
+                        if "mean" in train_pred_df.columns:
+                            y_train = train_df[ds["target"]].to_numpy(dtype=float)
+                            pred_train = train_pred_df["mean"].to_numpy(dtype=float)
+                            sigma_hat = max(rmse_score(y_train, pred_train), 1e-12)
+                        else:
+                            sigma_hat = 1.0
+                    else:
+                        sigma_hat = 1.0
+                cv_rows.append(
+                    {
+                        "fit_sec": float(fit_sec),
+                        "predict_sec": float(pred_sec),
+                        "logloss": gaussian_log_loss_score(y_test, pred, sigma_hat),
+                        "mse": mse_score(y_test, pred),
+                        "rmse": rmse_score(y_test, pred),
+                        "mae": mae_score(y_test, pred),
+                        "r2": r2_score(y_test, pred),
+                        "n_test": int(len(fold.test_idx)),
+                        "model_spec": "gamlss gaussian location-scale via release binary [5-fold CV]",
+                    }
+                )
+
+    metrics = aggregate_cv_rows(cv_rows, family)
+    return {
+        "contender": "rust_gamlss",
+        "family": family,
+        "scenario_name": scenario_name,
+        "status": "ok",
+        **metrics,
+        "model_spec": cv_rows[0]["model_spec"],
+    }
+
+
+def run_rust_gamlss_survival_cv(scenario):
+    """Run the Rust binary with --survival-likelihood probit-location-scale for survival scenarios."""
+    scenario_name = scenario["name"]
+    ds = dataset_for_scenario(scenario)
+    if ds["family"] != "survival":
+        return None
+    folds = folds_for_dataset(ds)
+
+    try:
+        rust_bin = _ensure_rust_binary()
+    except Exception as e:
+        return {
+            "contender": "rust_gamlss_survival",
+            "scenario_name": scenario_name,
+            "status": "failed",
+            "error": str(e),
+        }
+
+    base_df = pd.DataFrame(ds["rows"])
+    cv_rows = []
+
+    with tempfile.TemporaryDirectory(prefix="gam_bench_rust_gamlss_surv_cv_", dir=str(BENCH_DIR)) as td:
+        td_path = Path(td)
+        for fold_id, fold in enumerate(folds):
+            train_df = base_df.iloc[fold.train_idx].copy()
+            test_df = base_df.iloc[fold.test_idx].copy()
+            test_eval_df = test_df.copy()
+            train_path = td_path / f"train_{fold_id}.csv"
+            test_path = td_path / f"test_{fold_id}.csv"
+            model_path = td_path / f"model_{fold_id}.json"
+            pred_path = td_path / f"pred_{fold_id}.csv"
+
+            # Z-score features.
+            fit_feature_cols = list(ds["features"])
+            for col in ds["features"]:
+                mu = float(train_df[col].mean())
+                sdv = float(train_df[col].std())
+                if (not np.isfinite(sdv)) or sdv < 1e-8:
+                    sdv = 1.0
+                train_df[col] = (train_df[col] - mu) / sdv
+                test_df[col] = (test_df[col] - mu) / sdv
+            if scenario_name == "icu_survival_death" and "bmi" in ds["features"]:
+                train_df, test_df, bmi_spline_cols = _augment_bmi_spline_linear_hinges(
+                    train_df, test_df, n_knots=6
+                )
+                fit_feature_cols = [c for c in ds["features"] if c != "bmi"] + bmi_spline_cols
+            train_df["__entry"] = 0.0
+            horizon = _survival_eval_horizon(train_df, ds["time_col"])
+            test_pred_df = test_df.copy()
+            test_pred_df["__entry"] = 0.0
+            test_pred_df[ds["time_col"]] = horizon
+            train_df.to_csv(train_path, index=False)
+            test_pred_df.to_csv(test_path, index=False)
+
+            formula = _rust_survival_formula_for_scenario(scenario_name, feature_cols=fit_feature_cols)
+            fit_cfg = _rust_survival_fit_options_for_scenario(scenario_name)
+
+            fit_cmd = [
+                str(rust_bin),
+                "survival",
+                str(train_path),
+                "--entry", "__entry",
+                "--exit", ds["time_col"],
+                "--event", ds["event_col"],
+                "--formula", formula,
+                "--ridge-lambda", str(fit_cfg["ridge_lambda"]),
+                "--time-basis", fit_cfg["time_basis"],
+                "--survival-likelihood", "probit-location-scale",
+                "--out", str(model_path),
+            ]
+            if fit_cfg["time_basis"] == "bspline":
+                fit_cmd.extend([
+                    "--time-degree", str(int(fit_cfg["time_degree"])),
+                    "--time-num-internal-knots", str(int(fit_cfg["time_num_internal_knots"])),
+                    "--time-smooth-lambda", str(float(fit_cfg["time_smooth_lambda"])),
+                ])
+
+            t0 = perf_counter()
+            code, out, err = run_cmd(fit_cmd, cwd=ROOT)
+            fit_sec = perf_counter() - t0
+            if code != 0:
+                return {
+                    "contender": "rust_gamlss_survival",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "error": (err.strip() or out.strip() or "rust gamlss survival fit failed"),
+                }
+
+            pred_cmd = [
+                str(rust_bin), "predict",
+                str(model_path), str(test_path),
+                "--out", str(pred_path),
+            ]
+            t1 = perf_counter()
+            code, out, err = run_cmd(pred_cmd, cwd=ROOT)
+            pred_sec = perf_counter() - t1
+            if code != 0:
+                return {
+                    "contender": "rust_gamlss_survival",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "error": (err.strip() or out.strip() or "rust gamlss survival predict failed"),
+                }
+            pred_df = pd.read_csv(pred_path)
+
+            event_times = test_eval_df[ds["time_col"]].to_numpy(dtype=float)
+            events = test_eval_df[ds["event_col"]].to_numpy(dtype=float)
+            try:
+                risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
+            except RuntimeError as e:
+                return {
+                    "contender": "rust_gamlss_survival",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "error": str(e),
+                }
+            cidx = _lifelines_cindex_from_risk(event_times, risk_score, events)
             cv_rows.append(
                 {
                     "fit_sec": float(fit_sec),
                     "predict_sec": float(pred_sec),
-                    "auc": auc_score(y_test, pred),
-                    "brier": brier_score(y_test, pred),
-                    "logloss": log_loss_score(y_test, pred),
-                    "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
+                    "auc": cidx,
+                    "brier": survival_partial_brier_score(event_times, risk_score, events),
+                    "logloss": survival_partial_log_loss(event_times, risk_score, events),
+                    "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk_score, events),
                     "n_test": int(len(fold.test_idx)),
-                    "model_spec": "gamlss binomial-probit location-scale via release binary [5-fold CV]",
+                    "predict_horizon": float(horizon),
+                    "predict_horizon_policy": "global train-fold median time",
+                    "model_spec": (
+                        "survival probit-location-scale via release binary "
+                        f"(c-index on risk score from '{score_src}') [5-fold CV]"
+                    ),
                 }
             )
 
     metrics = aggregate_cv_rows(cv_rows, ds["family"])
     return {
-        "contender": "rust_gamlss",
+        "contender": "rust_gamlss_survival",
         "family": ds["family"],
         "scenario_name": scenario_name,
         "status": "ok",
@@ -2598,14 +2807,14 @@ def run_rust_gamlss_scenario_cv(scenario):
 
 
 def _is_gamlss_benchmark_scenario(scenario_name: str) -> bool:
-    return _geo_subpop16_scenario_cfg(scenario_name) is not None or _geo_latlon_scenario_cfg(scenario_name) is not None
+    return _rust_fit_mapping(scenario_name) is not None
 
 
 def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
     cfg = _rust_fit_mapping(scenario_name)
     if cfg is None:
         return None
-    if ds["family"] != "binomial":
+    if ds["family"] not in ("binomial", "gaussian"):
         return None
 
     terms = [str(c) for c in cfg.get("linear_cols", [])]
@@ -2630,7 +2839,8 @@ def run_external_r_gamlss_cv(scenario):
         return None
 
     ds = dataset_for_scenario(scenario)
-    if ds["family"] != "binomial":
+    family = ds["family"]
+    if family not in ("binomial", "gaussian"):
         return None
     folds = folds_for_dataset(ds)
 
@@ -2668,6 +2878,7 @@ payload <- fromJSON(data_path, simplifyVector = TRUE)
 df <- as.data.frame(payload$dataset$rows)
 target_name <- as.character(payload$dataset$target)
 mu_formula <- as.character(payload$mu_formula)
+family_name <- as.character(payload$dataset$family)
 
 train_idx <- scan(train_idx_path, what=integer(), quiet=TRUE) + 1L
 test_idx <- scan(test_idx_path, what=integer(), quiet=TRUE) + 1L
@@ -2685,12 +2896,21 @@ for (cn in feature_cols) {
   test_df[[cn]] <- (test_df[[cn]] - mu) / sdv
 }
 
+# Choose gamlss family based on dataset family.
+if (family_name == "gaussian") {
+  gamlss_family <- NO()
+  sigma_formula <- as.formula(paste("~", paste(feature_cols, collapse=" + ")))
+} else {
+  gamlss_family <- BI()
+  sigma_formula <- ~1
+}
+
 t0 <- proc.time()[["elapsed"]]
 fit <- tryCatch(
   gamlss(
     as.formula(mu_formula),
-    sigma.formula = ~1,
-    family = BI,
+    sigma.formula = sigma_formula,
+    family = gamlss_family,
     data = train_df,
     control = gamlss.control(n.cyc=200, trace=FALSE)
   ),
@@ -2723,45 +2943,71 @@ if (inherits(p, "error")) {
   quit(save="no")
 }
 
-p_safe <- pmin(pmax(p, 1e-12), 1 - 1e-12)
-ord <- order(p)
-yy <- y_test[ord]
-n_pos <- sum(yy > 0.5)
-n_neg <- sum(yy <= 0.5)
-if (n_pos == 0 || n_neg == 0) {
-  auc <- 0.5
+if (family_name == "gaussian") {
+  # Gaussian metrics with per-obs sigma from the sigma sub-model.
+  sigma_hat <- tryCatch(
+    pmax(as.numeric(predict(fit, newdata=test_df, what="sigma", type="response")), 1e-12),
+    error = function(e) rep(max(sqrt(mean((y_test - p)^2)), 1e-12), length(y_test))
+  )
+  rmse <- sqrt(mean((y_test - p)^2))
+  mae <- mean(abs(y_test - p))
+  sst <- sum((y_test - mean(y_test))^2)
+  r2 <- if (sst <= 0) 0.0 else 1.0 - sum((y_test - p)^2) / sst
+  logloss <- mean(0.5 * log(2 * pi * sigma_hat^2) + ((y_test - p)^2) / (2 * sigma_hat^2))
+  out <- list(
+    status="ok",
+    fit_sec=fit_sec,
+    predict_sec=pred_sec,
+    auc=NULL,
+    brier=NULL,
+    logloss=logloss,
+    nagelkerke_r2=NULL,
+    rmse=rmse,
+    mae=mae,
+    r2=r2,
+    model_spec=paste0("gamlss(NO; sigma.formula=", deparse(sigma_formula), "): ", mu_formula)
+  )
 } else {
-  ranks <- seq_along(yy)
-  rank_sum_pos <- sum(ranks[yy > 0.5])
-  auc <- (rank_sum_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+  # Binomial metrics (original behavior).
+  p_safe <- pmin(pmax(p, 1e-12), 1 - 1e-12)
+  ord <- order(p)
+  yy <- y_test[ord]
+  n_pos <- sum(yy > 0.5)
+  n_neg <- sum(yy <= 0.5)
+  if (n_pos == 0 || n_neg == 0) {
+    auc <- 0.5
+  } else {
+    ranks <- seq_along(yy)
+    rank_sum_pos <- sum(ranks[yy > 0.5])
+    auc <- (rank_sum_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+  }
+  brier <- mean((y_test - p)^2)
+  logloss <- mean(-(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe)))
+  p_mean <- mean(y_test)
+  if (is.finite(p_mean) && p_mean > 0 && p_mean < 1) {
+    ll_null <- sum(y_test * log(p_mean) + (1 - y_test) * log(1 - p_mean))
+    ll_model <- sum(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe))
+    n_obs <- length(y_test)
+    r2_cs <- 1 - exp((2 / n_obs) * (ll_null - ll_model))
+    max_r2_cs <- 1 - exp((2 / n_obs) * ll_null)
+    nagelkerke_r2 <- if (max_r2_cs > 0) r2_cs / max_r2_cs else NULL
+  } else {
+    nagelkerke_r2 <- NULL
+  }
+  out <- list(
+    status="ok",
+    fit_sec=fit_sec,
+    predict_sec=pred_sec,
+    auc=auc,
+    brier=brier,
+    logloss=logloss,
+    nagelkerke_r2=nagelkerke_r2,
+    rmse=NULL,
+    mae=NULL,
+    r2=NULL,
+    model_spec=paste0("gamlss(BI; sigma.formula=~1): ", mu_formula)
+  )
 }
-
-brier <- mean((y_test - p)^2)
-logloss <- mean(-(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe)))
-p_mean <- mean(y_test)
-if (is.finite(p_mean) && p_mean > 0 && p_mean < 1) {
-  ll_null <- sum(y_test * log(p_mean) + (1 - y_test) * log(1 - p_mean))
-  ll_model <- sum(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe))
-  n_obs <- length(y_test)
-  r2_cs <- 1 - exp((2 / n_obs) * (ll_null - ll_model))
-  max_r2_cs <- 1 - exp((2 / n_obs) * ll_null)
-  nagelkerke_r2 <- if (max_r2_cs > 0) r2_cs / max_r2_cs else NULL
-} else {
-  nagelkerke_r2 <- NULL
-}
-out <- list(
-  status="ok",
-  fit_sec=fit_sec,
-  predict_sec=pred_sec,
-  auc=auc,
-  brier=brier,
-  logloss=logloss,
-  nagelkerke_r2=nagelkerke_r2,
-  rmse=NULL,
-  mae=NULL,
-  r2=NULL,
-  model_spec=paste0("gamlss(BI; sigma.formula=~1): ", mu_formula)
-)
 write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
 '''
         script_path.write_text(script)
@@ -2810,10 +3056,10 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
+    metrics = aggregate_cv_rows(cv_rows, family)
     return {
         "contender": "r_gamlss",
-        "family": ds["family"],
+        "family": family,
         "scenario_name": scenario_name,
         "status": "ok",
         **metrics,
@@ -2864,10 +3110,12 @@ suppressPackageStartupMessages({
 payload <- fromJSON(data_path, simplifyVector = TRUE)
 df <- as.data.frame(payload$dataset$rows)
 target_name <- as.character(payload$dataset$target)
-if (!nzchar(target_name) || !(target_name %in% colnames(df))) {
-  stop(sprintf("invalid or missing dataset target column: %s", target_name))
-}
 family_name <- as.character(payload$dataset$family)
+if (family_name != "survival") {
+  if (!nzchar(target_name) || !(target_name %in% colnames(df))) {
+    stop(sprintf("invalid or missing dataset target column: %s", target_name))
+  }
+}
 scenario_name <- as.character(payload$scenario_name)
 mgcv_formula <- NULL
 if (!is.null(payload$mgcv_formula)) {
@@ -5216,6 +5464,9 @@ def main():
         rust_gamlss_row = run_rust_gamlss_scenario_cv(s_cfg)
         if rust_gamlss_row is not None:
             results.append(rust_gamlss_row)
+        rust_gamlss_surv_row = run_rust_gamlss_survival_cv(s_cfg) if _is_contender_enabled(s_cfg, "rust_gamlss_survival") else None
+        if rust_gamlss_surv_row is not None:
+            results.append(rust_gamlss_surv_row)
         r_gamlss_row = run_external_r_gamlss_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_gamlss") else None
         if r_gamlss_row is not None:
             results.append(r_gamlss_row)
@@ -5329,6 +5580,258 @@ def main():
     }
     args.out.write_text(json.dumps(payload, indent=2))
     print(f"Wrote {args.out}")
+
+    # Generate per-scenario comparison figures and bundle into a .zip.
+    fig_dir = args.out.parent / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    generate_scenario_figures(results, fig_dir)
+    zip_path = args.out.parent / "figures.zip"
+    zip_figure_dir(fig_dir, zip_path)
+    print(f"Wrote {zip_path}")
+
+
+# ---------------------------------------------------------------------------
+# Per-scenario comparison figures
+# ---------------------------------------------------------------------------
+
+def _metric_display_config(family: str):
+    """Return (metric_key, display_label, higher_is_better) tuples for a family."""
+    if family == "binomial":
+        return [
+            ("auc", "AUC", True),
+            ("logloss", "Log-Loss", False),
+            ("brier", "Brier Score", False),
+            ("nagelkerke_r2", "Nagelkerke R²", True),
+        ]
+    if family == "survival":
+        return [
+            ("auc", "C-Index", True),
+            ("logloss", "Partial Log-Loss", False),
+            ("brier", "Partial Brier", False),
+            ("nagelkerke_r2", "Nagelkerke R²", True),
+        ]
+    # gaussian
+    return [
+        ("rmse", "RMSE", False),
+        ("r2", "R²", True),
+        ("logloss", "Gaussian Log-Loss", False),
+        ("mae", "MAE", False),
+    ]
+
+
+def _short_contender_label(name: str) -> str:
+    return (
+        name.replace("python_", "py·")
+        .replace("r_mgcv_", "mgcv·")
+        .replace("r_", "R·")
+        .replace("rust_", "rust·")
+        .replace("_", " ")
+    )
+
+
+def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
+    """Create one beautiful comparison PNG per scenario."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import MaxNLocator
+    except ImportError:
+        print("WARNING: matplotlib not available — skipping figure generation.")
+        return []
+
+    # Group results by scenario.
+    from collections import defaultdict
+    by_scenario: dict[str, list[dict]] = defaultdict(list)
+    for r in results:
+        if r.get("status") == "ok":
+            by_scenario[r["scenario_name"]].append(r)
+
+    # ---- Theme ----
+    bg_dark = "#0d1117"
+    bg_card = "#161b22"
+    text_color = "#c9d1d9"
+    grid_color = "#21262d"
+    accent_colors = [
+        "#58a6ff", "#3fb950", "#d29922", "#f85149",
+        "#bc8cff", "#79c0ff", "#56d364", "#e3b341",
+        "#ff7b72", "#d2a8ff", "#a5d6ff", "#7ee787",
+        "#f2cc60", "#ffa198", "#cabffd", "#b1bac4",
+    ]
+
+    paths = []
+    for scenario_name, rows in sorted(by_scenario.items()):
+        if not rows:
+            continue
+        family = rows[0].get("family", "gaussian")
+        metrics_cfg = _metric_display_config(family)
+        # Filter to metrics that have at least one non-None value.
+        active_metrics = []
+        for key, label, hib in metrics_cfg:
+            vals = [r.get(key) for r in rows if r.get(key) is not None]
+            if vals:
+                active_metrics.append((key, label, hib))
+        if not active_metrics:
+            continue
+
+        n_metrics = len(active_metrics)
+        contenders = [r["contender"] for r in rows]
+        n_contenders = len(contenders)
+
+        fig_height = max(3.2, 1.2 + 0.42 * n_contenders) * (n_metrics + 1)
+        fig, axes = plt.subplots(
+            n_metrics + 1, 1,
+            figsize=(10, min(fig_height, 28)),
+            facecolor=bg_dark,
+            gridspec_kw={"hspace": 0.45},
+        )
+        if n_metrics + 1 == 1:
+            axes = [axes]
+
+        for ax in axes:
+            ax.set_facecolor(bg_card)
+            ax.tick_params(colors=text_color, which="both")
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["bottom"].set_color(grid_color)
+            ax.spines["left"].set_color(grid_color)
+            ax.xaxis.label.set_color(text_color)
+            ax.yaxis.label.set_color(text_color)
+            ax.title.set_color(text_color)
+
+        short_labels = [_short_contender_label(c) for c in contenders]
+        y_pos = list(range(n_contenders))
+        colors = [accent_colors[i % len(accent_colors)] for i in range(n_contenders)]
+
+        for idx, (key, label, higher_is_better) in enumerate(active_metrics):
+            ax = axes[idx]
+            vals = []
+            for r in rows:
+                v = r.get(key)
+                vals.append(float(v) if v is not None else 0.0)
+
+            bars = ax.barh(
+                y_pos, vals, height=0.62,
+                color=colors, edgecolor="none", alpha=0.88,
+                zorder=3,
+            )
+            # Highlight the best value.
+            valid_vals = [v for v in vals if v != 0.0]
+            if valid_vals:
+                if higher_is_better:
+                    best_val = max(valid_vals)
+                else:
+                    best_val = min(valid_vals)
+                for i, (bar, v) in enumerate(zip(bars, vals)):
+                    if abs(v - best_val) < 1e-12 and v != 0.0:
+                        bar.set_edgecolor("#f0f6fc")
+                        bar.set_linewidth(1.8)
+                        bar.set_alpha(1.0)
+
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(short_labels, fontsize=8.5)
+            ax.invert_yaxis()
+            ax.set_xlabel(label, fontsize=9.5, fontweight="bold")
+            direction_hint = "↑ higher is better" if higher_is_better else "↓ lower is better"
+            ax.set_title(f"{label}  ({direction_hint})", fontsize=10, loc="left", pad=8)
+            ax.grid(axis="x", color=grid_color, linewidth=0.5, zorder=0)
+
+            # Value labels on bars.
+            for bar, v in zip(bars, vals):
+                if v == 0.0:
+                    continue
+                if abs(v) < 0.01:
+                    fmt = f"{v:.4f}"
+                elif abs(v) < 1.0:
+                    fmt = f"{v:.4f}"
+                elif abs(v) < 100:
+                    fmt = f"{v:.3f}"
+                else:
+                    fmt = f"{v:.1f}"
+                ax.text(
+                    bar.get_width() + ax.get_xlim()[1] * 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    fmt, va="center", ha="left",
+                    fontsize=7.5, color=text_color, alpha=0.85,
+                )
+
+        # Timing subplot: fit + predict seconds.
+        ax_time = axes[-1]
+        fit_times = [float(r.get("fit_sec", 0)) for r in rows]
+        pred_times = [float(r.get("predict_sec", 0)) for r in rows]
+        bars_fit = ax_time.barh(
+            y_pos, fit_times, height=0.42, label="Fit",
+            color="#58a6ff", alpha=0.8, zorder=3,
+        )
+        bars_pred = ax_time.barh(
+            [y + 0.42 for y in y_pos], pred_times, height=0.42, label="Predict",
+            color="#3fb950", alpha=0.8, zorder=3,
+        )
+        ax_time.set_yticks([y + 0.21 for y in y_pos])
+        ax_time.set_yticklabels(short_labels, fontsize=8.5)
+        ax_time.invert_yaxis()
+        ax_time.set_xlabel("Time (seconds)", fontsize=9.5, fontweight="bold")
+        ax_time.set_title("Fit + Predict Time  (↓ lower is better)", fontsize=10, loc="left", pad=8)
+        ax_time.grid(axis="x", color=grid_color, linewidth=0.5, zorder=0)
+        legend = ax_time.legend(
+            loc="lower right", fontsize=8,
+            facecolor=bg_card, edgecolor=grid_color,
+            labelcolor=text_color,
+        )
+
+        for bar, v in zip(bars_fit, fit_times):
+            if v > 0:
+                ax_time.text(
+                    bar.get_width() + ax_time.get_xlim()[1] * 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{v:.2f}s", va="center", ha="left",
+                    fontsize=7, color=text_color, alpha=0.75,
+                )
+        for bar, v in zip(bars_pred, pred_times):
+            if v > 0:
+                ax_time.text(
+                    bar.get_width() + ax_time.get_xlim()[1] * 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{v:.2f}s", va="center", ha="left",
+                    fontsize=7, color=text_color, alpha=0.75,
+                )
+
+        # Suptitle.
+        fig.suptitle(
+            f"Benchmark: {scenario_name}",
+            fontsize=14, fontweight="bold",
+            color="#f0f6fc", y=0.995,
+        )
+        fig.text(
+            0.5, 0.002,
+            f"family={family}  •  5-fold CV  •  {n_contenders} contenders",
+            ha="center", fontsize=8, color=text_color, alpha=0.6,
+        )
+
+        out_path = out_dir / f"{scenario_name}.png"
+        fig.savefig(
+            out_path, dpi=180,
+            facecolor=bg_dark, edgecolor="none",
+            bbox_inches="tight", pad_inches=0.4,
+        )
+        plt.close(fig)
+        paths.append(out_path)
+
+    print(f"Generated {len(paths)} scenario figure(s) in {out_dir}/")
+    return paths
+
+
+def zip_figure_dir(fig_dir: Path, zip_path: Path) -> None:
+    """Bundle all PNGs in fig_dir into a single .zip for GHA artifact download."""
+    import zipfile
+    pngs = sorted(fig_dir.glob("*.png"))
+    if not pngs:
+        print("No figures to zip.")
+        return
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in pngs:
+            zf.write(p, arcname=p.name)
+    print(f"Zipped {len(pngs)} figure(s) -> {zip_path}")
 
 
 if __name__ == "__main__":

@@ -72,6 +72,22 @@ fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
 }
 
 #[inline]
+fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
+    // Prefer a work-based policy over per-dimension thresholds.
+    // Tall/skinny products (e.g. N x p with large N, modest p) should still
+    // parallelize when total work is high.
+    const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
+    const PAR_MIN_LONG_DIM: usize = 256;
+    let flop_scale = m.saturating_mul(n).saturating_mul(k);
+    let long_dim = m.max(n).max(k);
+    if flop_scale >= PAR_MIN_FLOP_SCALE && long_dim >= PAR_MIN_LONG_DIM {
+        get_global_parallelism()
+    } else {
+        Par::Seq
+    }
+}
+
+#[inline]
 pub fn array2_to_mat_mut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
     let (rows, cols) = array.dim();
     let strides = array.strides();
@@ -131,11 +147,7 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     let a_t = a_ref.transpose();
 
     // dst = A^T * A
-    let par = if n < 128 || p < 128 {
-        Par::Seq
-    } else {
-        get_global_parallelism()
-    };
+    let par = matmul_parallelism(p, p, n);
     matmul(result.as_mut(), Accum::Replace, a_t, a_ref, 1.0, par);
 
     // Convert back to ndarray
@@ -163,11 +175,7 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
     let a_view = FaerArrayView::new(a);
     let a_ref = a_view.as_ref();
     let a_t = a_ref.transpose();
-    let par = if n < 128 || p < 128 {
-        Par::Seq
-    } else {
-        get_global_parallelism()
-    };
+    let par = matmul_parallelism(p, p, n);
     matmul(out_view.as_mut(), Accum::Replace, a_t, a_ref, 1.0, par);
 }
 
@@ -199,11 +207,7 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let b_ref = b_view.as_ref();
 
     // dst = A^T * B
-    let par = if n_a < 128 || p < 128 || q < 128 {
-        Par::Seq
-    } else {
-        get_global_parallelism()
-    };
+    let par = matmul_parallelism(p, q, n_a);
     matmul(
         result.as_mut(),
         Accum::Replace,
@@ -242,11 +246,7 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let a_ref = a_view.as_ref();
     let b_ref = b_view.as_ref();
 
-    let par = if n < 128 || p < 128 || q < 128 {
-        Par::Seq
-    } else {
-        get_global_parallelism()
-    };
+    let par = matmul_parallelism(n, q, p);
     matmul(result.as_mut(), Accum::Replace, a_ref, b_ref, 1.0, par);
 
     mat_to_array(result.as_ref())
@@ -278,11 +278,7 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
     let v_view = FaerColView::new(v);
     let a_ref = a_view.as_ref();
     let v_ref = v_view.as_ref();
-    let par = if n < 128 || p < 128 {
-        Par::Seq
-    } else {
-        get_global_parallelism()
-    };
+    let par = matmul_parallelism(p, 1, n);
     matmul(
         out_view.as_mut(),
         Accum::Replace,
@@ -319,11 +315,7 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let v_ref = v_view.as_ref();
 
     // dst = A^T * v (treating v as n×1 matrix)
-    let par = if n < 128 || p < 128 {
-        Par::Seq
-    } else {
-        get_global_parallelism()
-    };
+    let par = matmul_parallelism(p, 1, n);
     matmul(
         result.as_mut(),
         Accum::Replace,
