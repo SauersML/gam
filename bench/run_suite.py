@@ -22,9 +22,22 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw.strip())
+    except Exception:
+        return int(default)
+
+
 # Optional strict serial mode for reproducibility/fairness studies.
 # Default is parallel-friendly so the Rust contender can use Rayon threads.
 _FORCE_SERIAL = _env_flag("BENCH_FORCE_SERIAL", default=False)
+_RAYON_THREADS = _env_int("BENCH_RAYON_THREADS", 0)
+_BLAS_THREADS = _env_int("BENCH_BLAS_THREADS", 0)
+_CMD_TIMEOUT_SEC = _env_int("BENCH_CMD_TIMEOUT_SEC", 0)
 _SERIAL_ENV_OVERRIDES = (
     {
         "OMP_NUM_THREADS": "1",
@@ -41,6 +54,18 @@ _SERIAL_ENV_OVERRIDES = (
     if _FORCE_SERIAL
     else {}
 )
+if not _FORCE_SERIAL:
+    # Explicit thread controls for performance runs.
+    # 0 or unset means "leave tool defaults unchanged".
+    if _RAYON_THREADS > 0:
+        _SERIAL_ENV_OVERRIDES["RAYON_NUM_THREADS"] = str(_RAYON_THREADS)
+    if _BLAS_THREADS > 0:
+        _SERIAL_ENV_OVERRIDES["OMP_NUM_THREADS"] = str(_BLAS_THREADS)
+        _SERIAL_ENV_OVERRIDES["OPENBLAS_NUM_THREADS"] = str(_BLAS_THREADS)
+        _SERIAL_ENV_OVERRIDES["MKL_NUM_THREADS"] = str(_BLAS_THREADS)
+        _SERIAL_ENV_OVERRIDES["VECLIB_MAXIMUM_THREADS"] = str(_BLAS_THREADS)
+        _SERIAL_ENV_OVERRIDES["NUMEXPR_NUM_THREADS"] = str(_BLAS_THREADS)
+        _SERIAL_ENV_OVERRIDES["BLIS_NUM_THREADS"] = str(_BLAS_THREADS)
 for _k, _v in _SERIAL_ENV_OVERRIDES.items():
     os.environ[_k] = _v
 
@@ -355,11 +380,32 @@ def run_cmd(cmd, cwd=None):
     t_out.start()
     t_err.start()
     t_hb.start()
-    rc = proc.wait()
+    timed_out = False
+    try:
+        if _CMD_TIMEOUT_SEC > 0:
+            rc = proc.wait(timeout=float(_CMD_TIMEOUT_SEC))
+        else:
+            rc = proc.wait()
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            proc.terminate()
+            proc.wait(timeout=10.0)
+        except Exception:
+            proc.kill()
+            proc.wait()
+        rc = 124
     hb_stop.set()
     t_out.join()
     t_err.join()
     t_hb.join(timeout=1.0)
+    if timed_out:
+        timeout_msg = (
+            f"[HEARTBEAT] command-timeout rc=124 timeout_sec={_CMD_TIMEOUT_SEC} "
+            f"pid={proc.pid} cmd='{(' '.join(str(x) for x in cmd[:5]) + (' ...' if len(cmd) > 5 else ''))}'\n"
+        )
+        err_buf.append(timeout_msg)
+        print(timeout_msg, file=sys.stderr, flush=True)
     print(
         f"[HEARTBEAT] command-exit rc={rc} pid={proc.pid} "
         f"samples={hb_stats.get('samples', 0)} "
@@ -5439,6 +5485,15 @@ def main():
         help="Run only the named scenario(s). Can be passed multiple times.",
     )
     args = parser.parse_args()
+    print(
+        "bench runtime config | "
+        f"force_serial={_FORCE_SERIAL} "
+        f"rayon_threads={_RAYON_THREADS if _RAYON_THREADS > 0 else 'auto'} "
+        f"blas_threads={_BLAS_THREADS if _BLAS_THREADS > 0 else 'auto'} "
+        f"cmd_timeout_sec={_CMD_TIMEOUT_SEC if _CMD_TIMEOUT_SEC > 0 else 'none'}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     cfg = json.loads(args.scenarios.read_text())
     scenarios = cfg.get("scenarios", [])

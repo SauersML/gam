@@ -23,7 +23,6 @@
 use self::reml::{DirectionalHyperParam, RemlState};
 use crate::basis::analyze_penalty_block;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use std::cell::Cell;
 use std::fmt;
 use std::time::Instant;
 
@@ -384,7 +383,7 @@ impl RemlConfig {
 }
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 
@@ -1039,14 +1038,13 @@ where
             },
         },
     };
-    let outer_eval_idx = Cell::new(0usize);
+    let outer_eval_idx = AtomicUsize::new(0usize);
     let outer_result =
-        crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient(
+        crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_parallel(
             k,
             heuristic_lambdas,
             |rho: &Array1<f64>| {
-                let eval_idx = outer_eval_idx.get() + 1;
-                outer_eval_idx.set(eval_idx);
+                let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
 
                 let t_cost = Instant::now();
                 let cost = reml_state.compute_cost(rho)?;
@@ -1835,6 +1833,7 @@ pub use crate::inference::predict::{
 };
 pub use crate::solver::smoothing::{
     SmoothingBfgsOptions, SmoothingBfgsResult, optimize_log_smoothing_with_multistart,
+    optimize_log_smoothing_with_multistart_parallel_fd,
     optimize_log_smoothing_with_multistart_with_gradient,
 };
 

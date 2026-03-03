@@ -390,6 +390,14 @@ impl<'a> RemlState<'a> {
     }
 
     pub(super) fn firth_direction(op: &FirthDenseOperator, u: &Array1<f64>) -> FirthDirection {
+        let deta = op.x_dense.dot(u);
+        Self::firth_direction_from_deta(op, deta)
+    }
+
+    pub(super) fn firth_direction_from_deta(
+        op: &FirthDenseOperator,
+        deta: Array1<f64>,
+    ) -> FirthDirection {
         // Directional building blocks for u:
         //   δη_u = X u
         //   I_u  = Xᵀ diag(w' ⊙ δη_u) X
@@ -403,7 +411,6 @@ impl<'a> RemlState<'a> {
         // K is represented by K_r = I_r^{-1} in reduced coordinates, so
         //   A_u = K_r G_u K_r
         // is exact for logit with finite eta (w_i > 0) and fixed rank(X).
-        let deta = op.x_dense.dot(u);
         // s_u is the diagonal weight for D I[u]:
         //   D I[u] = Xᵀ diag(s_u) X,  s_u = w' ⊙ (X u).
         let s_u = &op.w1 * &deta;

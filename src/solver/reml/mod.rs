@@ -1789,18 +1789,22 @@ impl<'a> RemlState<'a> {
             );
 
             let h = config.fd_step_size;
-            let mut numeric_grad = Array1::<f64>::zeros(rho.len());
+            let numeric_vals: Vec<f64> = (0..rho.len())
+                .into_par_iter()
+                .map(|k| {
+                    let mut rho_plus = rho.clone();
+                    rho_plus[k] += h;
+                    let mut rho_minus = rho.clone();
+                    rho_minus[k] -= h;
 
-            for k in 0..rho.len() {
-                let mut rho_plus = rho.clone();
-                rho_plus[k] += h;
-                let mut rho_minus = rho.clone();
-                rho_minus[k] -= h;
-
-                let fp = self.compute_cost(&rho_plus).unwrap_or(f64::INFINITY);
-                let fm = self.compute_cost(&rho_minus).unwrap_or(f64::INFINITY);
-                numeric_grad[k] = (fp - fm) / (2.0 * h);
-            }
+                    let (fp, fm) = rayon::join(
+                        || self.compute_cost(&rho_plus).unwrap_or(f64::INFINITY),
+                        || self.compute_cost(&rho_minus).unwrap_or(f64::INFINITY),
+                    );
+                    (fp - fm) / (2.0 * h)
+                })
+                .collect();
+            let numeric_grad = Array1::from_vec(numeric_vals);
 
             report.analytic_gradient = Some(analytic_grad.clone());
             report.numeric_gradient = Some(numeric_grad.clone());

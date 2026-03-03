@@ -34,6 +34,15 @@ python3 bench/run_suite.py
 Output:
 - `benchmarks/results.json`
 
+## Runtime knobs
+
+`bench/run_suite.py` supports the following environment variables:
+
+- `BENCH_FORCE_SERIAL=1`: force single-thread execution (`RAYON_NUM_THREADS=1`, BLAS threads `=1`).
+- `BENCH_RAYON_THREADS=<n>`: explicit Rayon thread count for Rust contender.
+- `BENCH_BLAS_THREADS=<n>`: explicit BLAS/OpenMP thread count for external stacks.
+- `BENCH_CMD_TIMEOUT_SEC=<sec>`: per-command timeout; timed-out commands return rc `124`.
+
 ## Scenario config
 
 Edit:

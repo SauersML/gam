@@ -589,8 +589,10 @@ impl<'a> RemlState<'a> {
         let firth_dirs = firth_op.as_ref().map(|op| {
             (0..k_count)
                 .map(|k| {
-                    let b_k = b_mat.column(k).to_owned();
-                    Self::firth_direction(op, &b_k)
+                    // Reuse already-batched eta sensitivities u_k = X B_k
+                    // from `u_mat` to avoid redundant X.dot(B_k) work.
+                    let deta_k = u_mat.column(k).to_owned();
+                    Self::firth_direction_from_deta(op, deta_k)
                 })
                 .collect::<Vec<_>>()
         });
@@ -879,6 +881,8 @@ impl<'a> RemlState<'a> {
         )?;
 
         let mut hess = Array2::<f64>::zeros((k_count, k_count));
+        let dense_exact_inner_solve_mode =
+            exact_trace_mode && !projected_exact_mode && !spectral_exact_mode;
         for l in 0..k_count {
             let bl = b_mat.column(l).to_owned();
             let mut rhs_kl_all = Array2::<f64>::zeros((p_dim, k_count));
@@ -899,9 +903,7 @@ impl<'a> RemlState<'a> {
             }
             let b_kl_all = solve_h(&rhs_kl_all);
             let u_kl_all = fast_ab(x_dense, &b_kl_all);
-
-            let mut weighted_xtdx_kl = Array2::<f64>::zeros(x_dense.raw_dim());
-            for k in l..k_count {
+            let compute_entry = |k: usize| -> f64 {
                 // H_{k,l} = delta_{k,l} A_k
                 //          + X' diag(d ⊙ u_k ⊙ u_l + c ⊙ u_{k,l}) X.
                 let mut diag = Array1::<f64>::zeros(n);
@@ -943,19 +945,18 @@ impl<'a> RemlState<'a> {
                         } else {
                             Array2::<f64>::zeros((p_dim, p_dim))
                         };
+                        let mut weighted_xtdx_kl = Array2::<f64>::zeros(x_dense.raw_dim());
                         h_kl += &Self::xt_diag_x_dense_into(x_dense, &diag, &mut weighted_xtdx_kl);
                         let mut d2_trace_correction = 0.0_f64;
                         if let (Some(op), Some(dirs)) = (firth_op.as_ref(), firth_dirs.as_ref()) {
-                            let b_kl = b_kl_all.column(k).to_owned();
-                            let dir_kl = Self::firth_direction(op, &b_kl);
+                            // Reuse already-batched eta sensitivities u_{k,l} = X B_{k,l}
+                            // from `u_kl_all` to avoid redundant X.dot(B_{k,l}) work.
+                            let deta_kl = u_kl_all.column(k).to_owned();
+                            let dir_kl = Self::firth_direction_from_deta(op, deta_kl);
                             // Firth second-order correction:
                             //   H_{k,l} <- H_{k,l}
                             //             - D H_φ[B_{k,l}]
                             //             - D² H_φ[B_k,B_l].
-                            // This is the exact second-order chain rule term for
-                            // H_total,kl under beta_hat(rho):
-                            //   H_kl = δ_kl A_k + D²(X'WX)[B_k,B_l] + D(X'WX)[B_kl]
-                            //          - D²(H_φ)[B_k,B_l] - D(H_φ)[B_kl].
                             h_kl -= &Self::firth_hphi_direction(op, &dir_kl);
                             if spectral_exact_mode {
                                 let w_pos = w_pos_spectral
@@ -1070,7 +1071,18 @@ impl<'a> RemlState<'a> {
                 let p_term = -0.5 * d2logs[[k, l]];
                 // Final exact dense transformed Hessian entry:
                 //   V_{k,l} = Q_{k,l} + L_{k,l} + P_{k,l}.
-                //
+                q + l_term + p_term
+            };
+
+            let row_entries: Vec<(usize, f64)> = if dense_exact_inner_solve_mode {
+                (l..k_count).map(|k| (k, compute_entry(k))).collect()
+            } else {
+                (l..k_count)
+                    .into_par_iter()
+                    .map(|k| (k, compute_entry(k)))
+                    .collect()
+            };
+            for (k, val) in row_entries {
                 // Conclusion for the Firth path:
                 // - `q` uses the same implicit derivatives B_k/B_kl as non-Firth,
                 //   but those derivatives were solved on H_total = X'WX + S - H_phi.
@@ -1078,7 +1090,6 @@ impl<'a> RemlState<'a> {
                 //   -D(H_phi)[B_k], -D(H_phi)[B_kl], and -D²(H_phi)[B_k,B_l].
                 // Therefore `val` is objective-consistent with the Firth-adjusted
                 // inner stationarity equation on smooth active-subspace regions.
-                let val = q + l_term + p_term;
                 hess[[k, l]] = val;
                 hess[[l, k]] = val;
             }
@@ -1775,13 +1786,20 @@ impl<'a> RemlState<'a> {
                     let beta_ref = beta_transformed;
                     let mut beta_terms = Array1::<f64>::zeros(k_count);
                     let mut s_k_beta_mat = Array2::<f64>::zeros((beta_ref.len(), k_count));
-                    for k in 0..k_count {
-                        let r_k = &rs_transformed[k];
-                        let r_beta = r_k.dot(beta_ref);
-                        let s_k_beta = r_k.t().dot(&r_beta);
-                        // q_k = β̂^T A_k β̂ = λ_k β̂^T S_k β̂,
-                        // with S_k β̂ assembled as R_k^T (R_k β̂).
-                        beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
+                    let s_k_stats: Vec<(f64, Array1<f64>)> = (0..k_count)
+                        .into_par_iter()
+                        .map(|k| {
+                            let r_k = &rs_transformed[k];
+                            let r_beta = r_k.dot(beta_ref);
+                            let s_k_beta = r_k.t().dot(&r_beta);
+                            // q_k = β̂^T A_k β̂ = λ_k β̂^T S_k β̂,
+                            // with S_k β̂ assembled as R_k^T (R_k β̂).
+                            let beta_term = lambdas[k] * beta_ref.dot(&s_k_beta);
+                            (beta_term, s_k_beta)
+                        })
+                        .collect();
+                    for (k, (beta_term, s_k_beta)) in s_k_stats.into_iter().enumerate() {
+                        beta_terms[k] = beta_term;
                         s_k_beta_mat.column_mut(k).assign(&s_k_beta);
                     }
 
@@ -1860,16 +1878,15 @@ impl<'a> RemlState<'a> {
                         "zero" => 2u8,
                         _ => 0u8,
                     };
-                    {
-                        let mut grad_view = workspace.cost_gradient_view(len);
-                        for k_idx in 0..k_count {
+                    let grad_terms: Vec<f64> = (0..k_count)
+                        .into_par_iter()
+                        .map(|k_idx| {
                             let r_k = &rs_transformed[k_idx];
                             if r_k.ncols() == 0 || w_pos.ncols() == 0 {
                                 let log_det_h_grad_term = 0.0;
                                 let log_det_s_grad_term = 0.5 * det1_values[k_idx];
-                                grad_view[k_idx] = 0.5 * beta_terms[k_idx] + log_det_h_grad_term
+                                return 0.5 * beta_terms[k_idx] + log_det_h_grad_term
                                     - log_det_s_grad_term;
-                                continue;
                             }
 
                             // First piece:
@@ -1897,8 +1914,13 @@ impl<'a> RemlState<'a> {
                             // Exact LAML gradient assembly for the implemented objective:
                             //   g_k = 0.5 * β̂ᵀ A_k β̂ - 0.5 * tr(S^+ A_k) + 0.5 * tr(H^{-1} H_k)
                             // where A_k = ∂S/∂ρ_k = λ_k S_k and H_k is the total derivative.
-                            grad_view[k_idx] =
-                                0.5 * beta_terms[k_idx] + corrected_log_det_h - log_det_s_grad_term;
+                            0.5 * beta_terms[k_idx] + corrected_log_det_h - log_det_s_grad_term
+                        })
+                        .collect();
+                    {
+                        let mut grad_view = workspace.cost_gradient_view(len);
+                        for (k_idx, &gk) in grad_terms.iter().enumerate() {
+                            grad_view[k_idx] = gk;
                         }
                     }
                 }

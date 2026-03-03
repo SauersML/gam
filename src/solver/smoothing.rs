@@ -1,6 +1,7 @@
 use crate::estimate::{EstimationError, RHO_BOUND};
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use ndarray::{Array1, Array2};
+use rayon::prelude::*;
 use wolfe_bfgs::{Bfgs, BfgsError};
 
 #[derive(Clone, Debug)]
@@ -68,6 +69,30 @@ where
     Ok(grad)
 }
 
+fn finite_diff_gradient_external_parallel<F>(
+    rho: &Array1<f64>,
+    step: f64,
+    objective: &F,
+) -> Result<Array1<f64>, EstimationError>
+where
+    F: Fn(&Array1<f64>) -> Result<f64, EstimationError> + Sync,
+{
+    let grad_vals: Result<Vec<f64>, EstimationError> = (0..rho.len())
+        .into_par_iter()
+        .map(|i| {
+            let mut rp = rho.clone();
+            rp[i] += step;
+            let mut rm = rho.clone();
+            rm[i] -= step;
+            let (fp_res, fm_res) = rayon::join(|| objective(&rp), || objective(&rm));
+            let fp = fp_res?;
+            let fm = fm_res?;
+            Ok((fp - fm) / (2.0 * step))
+        })
+        .collect();
+    Ok(Array1::from_vec(grad_vals?))
+}
+
 fn invalid_bfgs_sample(rho: &Array1<f64>) -> (f64, Array1<f64>) {
     // `wolfe_bfgs::Bfgs` requires finite samples, so failed outer evaluations are
     // turned into a large smooth barrier that pushes the iterate back toward the
@@ -112,6 +137,17 @@ fn should_replace_smoothing_candidate(
                 candidate.final_grad_norm < current.final_grad_norm
             }
         }
+    }
+}
+
+#[inline]
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let v = raw.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => default,
     }
 }
 
@@ -271,6 +307,147 @@ where
     })
 }
 
+fn screened_seeds_parallel<EvalCost>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    eval_cost_rho: &EvalCost,
+    options: &SmoothingBfgsOptions,
+) -> Result<Vec<(usize, Array1<f64>)>, EstimationError>
+where
+    EvalCost: Fn(&Array1<f64>) -> Result<f64, EstimationError> + Sync,
+{
+    let seeds = generate_rho_candidates(num_penalties, heuristic_lambdas, &options.seed_config);
+    if seeds.is_empty() {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "no smoothing seeds produced".to_string(),
+        ));
+    }
+    let candidate_seeds: Vec<(usize, Array1<f64>)> = seeds.into_iter().enumerate().collect();
+    let screening_budget = options.seed_config.screening_budget.max(1);
+    if candidate_seeds.len() <= screening_budget {
+        return Ok(candidate_seeds);
+    }
+    let mut scored: Vec<(usize, Array1<f64>, f64)> = candidate_seeds
+        .into_par_iter()
+        .map(|(idx, rho)| {
+            let cost = eval_cost_rho(&rho).unwrap_or(f64::INFINITY);
+            (idx, rho, cost)
+        })
+        .collect();
+    scored.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(screening_budget);
+    Ok(scored.into_iter().map(|(i, r, _)| (i, r)).collect())
+}
+
+fn run_single_seed_bfgs_parallel<Eval>(
+    rho_seed: &Array1<f64>,
+    eval_cost_grad_rho: &Eval,
+    options: &SmoothingBfgsOptions,
+) -> Option<SmoothingBfgsResult>
+where
+    Eval: Fn(&Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError> + Sync,
+{
+    let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
+    let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
+    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
+    let mut optimizer = Bfgs::new(rho_seed.clone(), |rho| {
+        if let Some((rho_c, cost_c, grad_c)) = &last_eval
+            && approx_same_rho_point(rho, rho_c)
+        {
+            return (*cost_c, grad_c.clone());
+        }
+
+        let sample = match eval_cost_grad_rho(rho) {
+            Ok((cost, grad_rho)) if cost.is_finite() && grad_rho.iter().all(|v| v.is_finite()) => {
+                (cost, grad_rho)
+            }
+            _ => invalid_bfgs_sample(rho),
+        };
+        last_eval = Some((rho.clone(), sample.0, sample.1.clone()));
+        sample
+    })
+    .with_bounds(lower, upper, 1e-6)
+    .with_tolerance(options.tol)
+    .with_max_iterations(options.max_iter)
+    .with_no_improve_stop(1e-8, 8)
+    .with_flat_stall_exit(true, 4)
+    .with_curvature_slack_scale(2.0);
+
+    let solution = match optimizer.run() {
+        Ok(sol) => sol,
+        Err(BfgsError::MaxIterationsReached { last_solution })
+        | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+        Err(_) => return None,
+    };
+
+    let rho = solution.final_point.clone();
+    let mut grad_rho = match &last_eval {
+        Some((rho_cached, _cost_cached, grad_cached))
+            if approx_same_rho_point(&rho, rho_cached) =>
+        {
+            grad_cached.clone()
+        }
+        _ => match eval_cost_grad_rho(&rho) {
+            Ok((_, grad)) => grad,
+            Err(_) => Array1::<f64>::from_elem(rho.len(), f64::NAN),
+        },
+    };
+    for g in grad_rho.iter_mut() {
+        if !g.is_finite() {
+            *g = f64::NAN;
+        }
+    }
+    let grad_norm = grad_rho.dot(&grad_rho).sqrt();
+    Some(SmoothingBfgsResult {
+        rho,
+        final_value: solution.final_value,
+        iterations: solution.iterations,
+        final_grad_norm: grad_norm,
+        stationary: grad_norm <= options.tol.max(1e-6),
+    })
+}
+
+fn run_multistart_bfgs_parallel<Eval>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    eval_cost_grad_rho: &Eval,
+    options: &SmoothingBfgsOptions,
+) -> Result<SmoothingBfgsResult, EstimationError>
+where
+    Eval: Fn(&Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError> + Sync,
+{
+    let screened_seeds = screened_seeds_parallel(
+        num_penalties,
+        heuristic_lambdas,
+        &|rho: &Array1<f64>| eval_cost_grad_rho(rho).map(|(c, _)| c),
+        options,
+    )?;
+    let mut candidates: Vec<(usize, SmoothingBfgsResult)> = screened_seeds
+        .into_par_iter()
+        .filter_map(|(seed_idx, rho_seed)| {
+            let res = run_single_seed_bfgs_parallel(&rho_seed, eval_cost_grad_rho, options)?;
+            Some((seed_idx, res))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "all smoothing outer starts failed before producing a candidate".to_string(),
+        ));
+    }
+    candidates.sort_by_key(|(seed_idx, _)| *seed_idx);
+    let mut best: Option<SmoothingBfgsResult> = None;
+    for (_, candidate) in candidates {
+        if should_replace_smoothing_candidate(&best, &candidate) {
+            best = Some(candidate);
+        }
+    }
+    best.ok_or_else(|| {
+        EstimationError::RemlOptimizationFailed(
+            "all smoothing outer starts failed before producing a candidate".to_string(),
+        )
+    })
+}
+
 /// Generic multi-start BFGS smoothing optimizer over log-smoothing parameters (`rho`).
 ///
 /// This is intended for likelihoods whose outer objective is exposed as a scalar
@@ -383,6 +560,91 @@ where
     )
 }
 
+/// Parallelized multi-start exact-gradient optimizer.
+///
+/// This variant runs seed screening and candidate BFGS probes concurrently.
+/// It requires a thread-safe objective callback.
+pub fn optimize_log_smoothing_with_multistart_with_gradient_parallel<F>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    objective_with_gradient: F,
+    options: &SmoothingBfgsOptions,
+) -> Result<SmoothingBfgsResult, EstimationError>
+where
+    F: Fn(&Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError> + Sync,
+{
+    if num_penalties == 0 {
+        let rho = Array1::<f64>::zeros(0);
+        let (value, grad) = objective_with_gradient(&rho)?;
+        let grad_norm = grad.dot(&grad).sqrt();
+        return Ok(SmoothingBfgsResult {
+            rho,
+            final_value: value,
+            iterations: 0,
+            final_grad_norm: grad_norm,
+            stationary: grad_norm <= options.tol.max(1e-6),
+        });
+    }
+    if !env_flag("GAM_SMOOTHING_PARALLEL_CANDIDATES", true) {
+        return optimize_log_smoothing_with_multistart_with_gradient(
+            num_penalties,
+            heuristic_lambdas,
+            |rho| objective_with_gradient(rho),
+            options,
+        );
+    }
+    run_multistart_bfgs_parallel(
+        num_penalties,
+        heuristic_lambdas,
+        &objective_with_gradient,
+        options,
+    )
+}
+
+/// Parallelized multi-start finite-difference optimizer.
+///
+/// This variant runs seed screening and candidate BFGS probes concurrently and
+/// computes each coordinate's central-difference gradient in parallel.
+pub fn optimize_log_smoothing_with_multistart_parallel_fd<F>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    objective: F,
+    options: &SmoothingBfgsOptions,
+) -> Result<SmoothingBfgsResult, EstimationError>
+where
+    F: Fn(&Array1<f64>) -> Result<f64, EstimationError> + Sync,
+{
+    if num_penalties == 0 {
+        let rho = Array1::<f64>::zeros(0);
+        return Ok(SmoothingBfgsResult {
+            rho,
+            final_value: objective(&Array1::<f64>::zeros(0))?,
+            iterations: 0,
+            final_grad_norm: 0.0,
+            stationary: true,
+        });
+    }
+    if !env_flag("GAM_SMOOTHING_PARALLEL_CANDIDATES", true) {
+        return optimize_log_smoothing_with_multistart(
+            num_penalties,
+            heuristic_lambdas,
+            |rho| objective(rho),
+            options,
+        );
+    }
+    run_multistart_bfgs_parallel(
+        num_penalties,
+        heuristic_lambdas,
+        &|rho: &Array1<f64>| {
+            let cost = objective(rho)?;
+            let grad_rho =
+                finite_diff_gradient_external_parallel(rho, options.finite_diff_step, &objective)?;
+            Ok((cost, grad_rho))
+        },
+        options,
+    )
+}
+
 /// Multi-start smoothing optimizer when the caller can also provide exact Hessians.
 ///
 /// The current outer driver is gradient-only BFGS, so the Hessian output is
@@ -424,4 +686,97 @@ where
         &mut eval_cost_grad_rho,
         options,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn convex_value(rho: &Array1<f64>) -> f64 {
+        let target = [0.7, -1.1, 0.3];
+        let weight = [1.0, 2.0, 0.5];
+        rho.iter()
+            .enumerate()
+            .map(|(i, &r)| 0.5 * weight[i] * (r - target[i]).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn exact_gradient_parallel_matches_sequential() {
+        let mut options = SmoothingBfgsOptions {
+            tol: 1e-8,
+            max_iter: 120,
+            ..SmoothingBfgsOptions::default()
+        };
+        options.seed_config.screening_budget = 4;
+        let heur = [1.0, 1.0, 1.0];
+
+        let seq = optimize_log_smoothing_with_multistart_with_gradient(
+            3,
+            Some(&heur),
+            |rho: &Array1<f64>| {
+                let mut g = Array1::<f64>::zeros(rho.len());
+                g[0] = rho[0] - 0.7;
+                g[1] = 2.0 * (rho[1] + 1.1);
+                g[2] = 0.5 * (rho[2] - 0.3);
+                Ok((convex_value(rho), g))
+            },
+            &options,
+        )
+        .expect("sequential exact-gradient optimization should succeed");
+
+        let par = optimize_log_smoothing_with_multistart_with_gradient_parallel(
+            3,
+            Some(&heur),
+            |rho: &Array1<f64>| {
+                let mut g = Array1::<f64>::zeros(rho.len());
+                g[0] = rho[0] - 0.7;
+                g[1] = 2.0 * (rho[1] + 1.1);
+                g[2] = 0.5 * (rho[2] - 0.3);
+                Ok((convex_value(rho), g))
+            },
+            &options,
+        )
+        .expect("parallel exact-gradient optimization should succeed");
+
+        assert!((seq.final_value - par.final_value).abs() < 1e-9);
+        assert_eq!(seq.rho.len(), par.rho.len());
+        for i in 0..seq.rho.len() {
+            assert!((seq.rho[i] - par.rho[i]).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn finite_difference_parallel_matches_sequential() {
+        let mut options = SmoothingBfgsOptions {
+            tol: 1e-7,
+            max_iter: 120,
+            finite_diff_step: 1e-5,
+            ..SmoothingBfgsOptions::default()
+        };
+        options.seed_config.screening_budget = 4;
+        let heur = [1.0, 1.0, 1.0];
+
+        let seq = optimize_log_smoothing_with_multistart(
+            3,
+            Some(&heur),
+            |rho: &Array1<f64>| Ok(convex_value(rho)),
+            &options,
+        )
+        .expect("sequential FD optimization should succeed");
+
+        let par = optimize_log_smoothing_with_multistart_parallel_fd(
+            3,
+            Some(&heur),
+            |rho: &Array1<f64>| Ok(convex_value(rho)),
+            &options,
+        )
+        .expect("parallel FD optimization should succeed");
+
+        assert!((seq.final_value - par.final_value).abs() < 1e-8);
+        assert_eq!(seq.rho.len(), par.rho.len());
+        for i in 0..seq.rho.len() {
+            assert!((seq.rho[i] - par.rho[i]).abs() < 1e-5);
+        }
+    }
 }

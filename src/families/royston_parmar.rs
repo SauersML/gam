@@ -3,6 +3,7 @@ use crate::survival::{
     SurvivalSpec, WorkingModelSurvival,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Flattened engine inputs for Royston-Parmar likelihood evaluation.
 pub struct RoystonParmarInputs<'a> {
@@ -257,27 +258,31 @@ pub fn optimize_survival_lambdas_with_multistart_fd<F>(
     options: &SurvivalLambdaOptimizerOptions,
 ) -> Result<SurvivalLambdaOptimizerResult, crate::estimate::EstimationError>
 where
-    F: Fn(&Array1<f64>) -> Result<f64, crate::estimate::EstimationError>,
+    F: Fn(&Array1<f64>) -> Result<f64, crate::estimate::EstimationError> + Sync,
 {
-    let mut eval_count = 0usize;
-    let mut warned_rho_extreme = false;
-    let mut warned_nonfinite_value = false;
+    let eval_count = AtomicUsize::new(0usize);
+    let warned_rho_extreme = AtomicBool::new(false);
+    let warned_nonfinite_value = AtomicBool::new(false);
     let wrapped_objective = |rho: &Array1<f64>| {
-        eval_count += 1;
-        if !warned_rho_extreme && rho.iter().any(|r| r.abs() > 12.0) {
-            warned_rho_extreme = true;
+        let eval_idx = eval_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if !warned_rho_extreme.load(Ordering::Relaxed)
+            && rho.iter().any(|r| r.abs() > 12.0)
+            && !warned_rho_extreme.swap(true, Ordering::Relaxed)
+        {
             log::warn!(
                 "[survival lambda opt/fd] exploring extreme rho region at eval {} (max|rho|={:.3e})",
-                eval_count,
+                eval_idx,
                 rho.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
             );
         }
         let value = objective(rho)?;
-        if !warned_nonfinite_value && !value.is_finite() {
-            warned_nonfinite_value = true;
+        if !warned_nonfinite_value.load(Ordering::Relaxed)
+            && !value.is_finite()
+            && !warned_nonfinite_value.swap(true, Ordering::Relaxed)
+        {
             log::warn!(
                 "[survival lambda opt/fd] non-finite objective value at eval {}",
-                eval_count
+                eval_idx
             );
         }
         Ok(value)
@@ -292,7 +297,7 @@ where
         fd_hessian_max_dim: usize::MAX,
         seed_config: options.seed_config,
     };
-    let result = crate::estimate::optimize_log_smoothing_with_multistart(
+    let result = crate::estimate::optimize_log_smoothing_with_multistart_parallel_fd(
         num_penalties,
         heuristic_lambdas,
         wrapped_objective,
