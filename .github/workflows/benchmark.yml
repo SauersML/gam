@@ -209,9 +209,9 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.parallel_matrix) }}
     env:
       BENCH_CI_PROFILE: ${{ github.event_name == 'schedule' && 'full' || 'lean' }}
-      OMP_NUM_THREADS: "1"
-      OPENBLAS_NUM_THREADS: "1"
-      MKL_NUM_THREADS: "1"
+      BENCH_RAYON_THREADS: "4"
+      BENCH_BLAS_THREADS: "1"
+      BENCH_CMD_TIMEOUT_SEC: "10800"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -247,6 +247,9 @@ jobs:
           Rscript --version
           echo "BENCH_GAM_BIN=${BENCH_GAM_BIN}"
           echo "BENCH_CI_PROFILE=${BENCH_CI_PROFILE}"
+          echo "BENCH_RAYON_THREADS=${BENCH_RAYON_THREADS}"
+          echo "BENCH_BLAS_THREADS=${BENCH_BLAS_THREADS}"
+          echo "BENCH_CMD_TIMEOUT_SEC=${BENCH_CMD_TIMEOUT_SEC}"
           echo "PYTHONPATH=${PYTHONPATH}"
           echo "R_LIBS_USER=${R_LIBS_USER}"
           echo "bench/runtime tree:"
@@ -313,9 +316,9 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.serial_matrix) }}
     env:
       BENCH_CI_PROFILE: ${{ github.event_name == 'schedule' && 'full' || 'lean' }}
-      OMP_NUM_THREADS: "1"
-      OPENBLAS_NUM_THREADS: "1"
-      MKL_NUM_THREADS: "1"
+      BENCH_RAYON_THREADS: "4"
+      BENCH_BLAS_THREADS: "1"
+      BENCH_CMD_TIMEOUT_SEC: "10800"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -351,6 +354,9 @@ jobs:
           Rscript --version
           echo "BENCH_GAM_BIN=${BENCH_GAM_BIN}"
           echo "BENCH_CI_PROFILE=${BENCH_CI_PROFILE}"
+          echo "BENCH_RAYON_THREADS=${BENCH_RAYON_THREADS}"
+          echo "BENCH_BLAS_THREADS=${BENCH_BLAS_THREADS}"
+          echo "BENCH_CMD_TIMEOUT_SEC=${BENCH_CMD_TIMEOUT_SEC}"
           echo "PYTHONPATH=${PYTHONPATH}"
           echo "R_LIBS_USER=${R_LIBS_USER}"
           echo "bench/runtime tree:"
