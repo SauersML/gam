@@ -29,6 +29,7 @@ bench/diagf_*/
 bench/scenarios.*.json
 scripts/__pycache__/
 scripts/latest_benchmark_summary.md
+scripts/scripts/latest_benchmark_summary.md
 *.png
 
 # macOS metadata

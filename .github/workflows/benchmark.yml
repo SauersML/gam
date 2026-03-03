@@ -146,13 +146,50 @@ jobs:
           )
           PY
 
+      - name: Bundle source workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git -czf "${RUNNER_TEMP}/benchmark-source.tar.gz" -C "${GITHUB_WORKSPACE}" .
+
+      - name: Upload source workspace artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-source
+          path: ${{ runner.temp }}/benchmark-source.tar.gz
+          if-no-files-found: error
+
   bootstrap-runtime:
     name: Bootstrap benchmark runtime
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Download source workspace
+        id: source-download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-source
+          path: ${{ runner.temp }}/benchmark-source
+
+      - name: Restore source workspace
+        id: source-restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${RUNNER_TEMP}/benchmark-source/benchmark-source.tar.gz"
+          if [ -f "${src}" ]; then
+            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
+            echo "restored=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "restored=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Fallback checkout
+        if: ${{ steps.source-restore.outputs.restored != 'true' }}
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Restore shared runtime cache
         id: runtime-cache
@@ -213,8 +250,32 @@ jobs:
       BENCH_BLAS_THREADS: "1"
       BENCH_CMD_TIMEOUT_SEC: "10800"
     steps:
-      - name: Checkout
+      - name: Download source workspace
+        id: source-download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-source
+          path: ${{ runner.temp }}/benchmark-source
+
+      - name: Restore source workspace
+        id: source-restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${RUNNER_TEMP}/benchmark-source/benchmark-source.tar.gz"
+          if [ -f "${src}" ]; then
+            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
+            echo "restored=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "restored=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Fallback checkout
+        if: ${{ steps.source-restore.outputs.restored != 'true' }}
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -320,8 +381,32 @@ jobs:
       BENCH_BLAS_THREADS: "1"
       BENCH_CMD_TIMEOUT_SEC: "10800"
     steps:
-      - name: Checkout
+      - name: Download source workspace
+        id: source-download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-source
+          path: ${{ runner.temp }}/benchmark-source
+
+      - name: Restore source workspace
+        id: source-restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${RUNNER_TEMP}/benchmark-source/benchmark-source.tar.gz"
+          if [ -f "${src}" ]; then
+            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
+            echo "restored=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "restored=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Fallback checkout
+        if: ${{ steps.source-restore.outputs.restored != 'true' }}
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -421,6 +506,34 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Download source workspace
+        id: source-download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-source
+          path: ${{ runner.temp }}/benchmark-source
+
+      - name: Restore source workspace
+        id: source-restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${RUNNER_TEMP}/benchmark-source/benchmark-source.tar.gz"
+          if [ -f "${src}" ]; then
+            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
+            echo "restored=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "restored=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Fallback checkout for figure generation
+        if: ${{ steps.source-restore.outputs.restored != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: bench
 
       - name: Download all shard artifacts
         uses: actions/download-artifact@v4
@@ -592,11 +705,6 @@ jobs:
           name: benchmark-results-nightly
           path: bench/results.nightly.json
           if-no-files-found: error
-
-      - name: Checkout for figure generation
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: bench
 
       - name: Generate merged figures
         shell: bash

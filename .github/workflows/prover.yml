@@ -28,13 +28,60 @@ permissions:
   pull-requests: write
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Bundle source workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git -czf "${RUNNER_TEMP}/prover-source.tar.gz" -C "${GITHUB_WORKSPACE}" .
+
+      - name: Upload source workspace artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prover-source
+          path: ${{ runner.temp }}/prover-source.tar.gz
+          if-no-files-found: error
+
   prove:
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - name: Check out repository
+      - name: Download source workspace
+        id: source-download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: prover-source
+          path: ${{ runner.temp }}/prover-source
+
+      - name: Restore source workspace
+        id: source-restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${RUNNER_TEMP}/prover-source/prover-source.tar.gz"
+          if [ -f "${src}" ]; then
+            tar -xzf "${src}" -C "${GITHUB_WORKSPACE}"
+            echo "restored=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "restored=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Fallback checkout
+        if: ${{ steps.source-restore.outputs.restored != 'true' }}
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Install elan
         run: |
