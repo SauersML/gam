@@ -182,8 +182,11 @@ mod tests {
         let x_tau = Array2::<f64>::zeros(x.raw_dim());
         let s_tau = array![[0.0, 0.0, 0.0], [0.0, 0.25, 0.04], [0.0, 0.04, 0.15],];
         let hyper = DirectionalHyperParam {
+            penalty_index: None,
             x_tau_original: x_tau.clone(),
             s_tau_original: s_tau.clone(),
+            x_tau_tau_original: None,
+            s_tau_tau_original: None,
         };
         let rho = array![0.0];
 
@@ -509,8 +512,11 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
         let hyper = DirectionalHyperParam {
+            penalty_index: None,
             x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
             s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.03], [0.0, 0.03, 0.12],],
+            x_tau_tau_original: None,
+            s_tau_tau_original: None,
         };
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
@@ -539,8 +545,11 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
         let hyper = DirectionalHyperParam {
+            penalty_index: None,
             x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 1e-3),
             s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
+            x_tau_tau_original: None,
+            s_tau_tau_original: None,
         };
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
@@ -569,8 +578,11 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
         let hyper = DirectionalHyperParam {
+            penalty_index: None,
             x_tau_original: Array2::from_elem((x_dense.nrows(), x_dense.ncols()), 1e-3),
             s_tau_original: Array2::<f64>::zeros((x_dense.ncols(), x_dense.ncols())),
+            x_tau_tau_original: None,
+            s_tau_tau_original: None,
         };
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
@@ -650,12 +662,18 @@ mod tests {
         let theta = array![0.0, 0.0, 0.0];
         let hyper_dirs = vec![
             DirectionalHyperParam {
+                penalty_index: None,
                 x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
                 s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
+                x_tau_tau_original: None,
+                s_tau_tau_original: None,
             },
             DirectionalHyperParam {
+                penalty_index: None,
                 x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
                 s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                x_tau_tau_original: None,
+                s_tau_tau_original: None,
             },
         ];
 
@@ -703,14 +721,31 @@ mod tests {
         state.clear_warm_start();
         let rho = array![0.0];
         let psi = array![0.0, 0.0];
+        let mut x_second_0 = vec![Array2::<f64>::zeros((x.nrows(), x.ncols())); 2];
+        let mut s_second_0 = vec![Array2::<f64>::zeros((x.ncols(), x.ncols())); 2];
+        let mut x_second_1 = vec![Array2::<f64>::zeros((x.nrows(), x.ncols())); 2];
+        let mut s_second_1 = vec![Array2::<f64>::zeros((x.ncols(), x.ncols())); 2];
+        x_second_0[0] = Array2::from_elem((x.nrows(), x.ncols()), 5e-5);
+        s_second_0[0] = array![[0.0, 0.0, 0.0], [0.0, 0.06, 0.01], [0.0, 0.01, 0.04],];
+        // Provide cross second derivative from only one side to exercise fallback.
+        x_second_0[1] = Array2::from_elem((x.nrows(), x.ncols()), -2e-5);
+        s_second_0[1] = array![[0.0, 0.0, 0.0], [0.0, 0.03, -0.005], [0.0, -0.005, 0.02],];
+        x_second_1[1] = Array2::from_elem((x.nrows(), x.ncols()), 4e-5);
+        s_second_1[1] = array![[0.0, 0.0, 0.0], [0.0, 0.02, 0.004], [0.0, 0.004, 0.03],];
         let hyper_dirs = vec![
             DirectionalHyperParam {
+                penalty_index: None,
                 x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
                 s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
+                x_tau_tau_original: Some(x_second_0),
+                s_tau_tau_original: Some(s_second_0),
             },
             DirectionalHyperParam {
+                penalty_index: None,
                 x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
                 s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                x_tau_tau_original: Some(x_second_1),
+                s_tau_tau_original: Some(s_second_1),
             },
         ];
 
@@ -788,12 +823,18 @@ mod tests {
         let psi = array![0.0, 0.0];
         let hyper_dirs = vec![
             DirectionalHyperParam {
+                penalty_index: None,
                 x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
                 s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
+                x_tau_tau_original: None,
+                s_tau_tau_original: None,
             },
             DirectionalHyperParam {
+                penalty_index: None,
                 x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
                 s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                x_tau_tau_original: None,
+                s_tau_tau_original: None,
             },
         ];
 
@@ -874,8 +915,11 @@ mod tests {
             s0[[j, j]] = 0.5 + (j as f64) / (p as f64);
         }
         let hyper = DirectionalHyperParam {
+            penalty_index: None,
             x_tau_original: Array2::from_elem((n, p), 5e-5),
             s_tau_original: Array2::<f64>::zeros((p, p)),
+            x_tau_tau_original: None,
+            s_tau_tau_original: None,
         };
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
@@ -958,8 +1002,16 @@ trait PenalizedGeometry {
 
 #[derive(Clone)]
 pub(crate) struct DirectionalHyperParam {
+    // If set, derivatives are with respect to this penalty block S_k(psi), unscaled by lambda_k.
+    // If None, derivatives are interpreted as already assembled total-penalty derivatives.
+    pub penalty_index: Option<usize>,
     pub x_tau_original: Array2<f64>,
     pub s_tau_original: Array2<f64>,
+    // Optional pairwise second hyper-derivatives against all tau directions.
+    // If provided, each vector must have length psi_dim and hold X_{tau_i,tau_j}
+    // / S_{tau_i,tau_j} in original coordinates.
+    pub x_tau_tau_original: Option<Vec<Array2<f64>>>,
+    pub s_tau_tau_original: Option<Vec<Array2<f64>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1047,6 +1099,13 @@ struct FirthTauPartialKernel {
     //   dot(K_r) = -K_r dot(I_r) K_r
     // where dot(I_r) includes explicit X_tau and weight drift at beta-fixed.
     dot_k_reduced: Array2<f64>,
+}
+
+#[derive(Clone)]
+struct FirthTauExactKernel {
+    g_phi_tau: Array1<f64>,
+    phi_tau_partial: f64,
+    tau_kernel: Option<FirthTauPartialKernel>,
 }
 
 /// Holds the state for the outer REML optimization and supplies cost and
@@ -1556,7 +1615,7 @@ impl CostAgg {
 // Formatting utilities moved to crate::diagnostics
 impl<'a> RemlState<'a> {
     // -------------------------------------------------------------------------
-    // Firth / Jeffreys outer-Hessian derivation map (implementation guide)
+    // Firth / Jeffreys outer-derivative derivation map (implementation guide)
     // -------------------------------------------------------------------------
     //
     // Research-to-production assumptions used in this file:
@@ -1575,6 +1634,32 @@ impl<'a> RemlState<'a> {
     //   d log|M|_+ = tr(M_+^dagger dM),
     //   d^2 log|M|_+[U,V] = tr(M_+^dagger d^2M[U,V]) - tr(M_+^dagger U M_+^dagger V).
     // These identities are the basis for all exact outer derivatives here.
+    //
+    // n-th order log|M|_+ (fixed active subspace, exact):
+    //   D^n log|M|_+[τ_1,...,τ_n]
+    //   = Σ_{π∈Part([n])} (-1)^{|π|-1} (|π|-1)!
+    //       tr( Π_{B∈π} ( M_+^dagger M_B ) ),
+    //   M_B := D^{|B|}M[τ_i : i∈B].
+    // This is the multivariate partition/Faà di Bruno form used for all orders.
+    //
+    // Explicit low-order closed forms (same fixed-active-subspace regime):
+    //   D^3 log|M|_+[u,v,w]
+    //   = tr(M_+^† M_uvw)
+    //     - tr(M_+^† M_uv M_+^† M_w)
+    //     - tr(M_+^† M_uw M_+^† M_v)
+    //     - tr(M_+^† M_vw M_+^† M_u)
+    //     + 2 tr(M_+^† M_u M_+^† M_v M_+^† M_w)
+    //     + 2 tr(M_+^† M_u M_+^† M_w M_+^† M_v).
+    //
+    //   D^4 log|M|_+[u,v,w,z]
+    //   = tr(M_+^† M_uvwz)
+    //     - sum_(3,1) tr(M_+^† M_(...) M_+^† M_(.))
+    //     - sum_(2,2) tr(M_+^† M_(..) M_+^† M_(..))
+    //     + 2 sum_(2,1,1) tr(M_+^† M_(..) M_+^† M_(.) M_+^† M_(.))
+    //     - 6 sum_(1,1,1,1) tr(M_+^† M_(.) M_+^† M_(.) M_+^† M_(.) M_+^† M_(.)),
+    //   where the sums run over all block splits/orderings induced by set
+    //   partitions of {u,v,w,z}. The n-th partition formula above generates all
+    //   coefficients/signs automatically.
     //
     // Assumptions (smooth regime used by all "exact" formulas below):
     // 1) X may be rank-deficient, but rank(X) is locally constant.
@@ -1653,9 +1738,62 @@ impl<'a> RemlState<'a> {
     // Outside the fixed-active-subspace regime (eigenvalue crossings),
     // second derivatives of log|.|_+ are non-smooth.
     //
+    // Higher-order extension (all orders, exact in same smooth regime):
+    //   V(θ) = f(θ) + 0.5 log|H(β̂(θ),θ)|_+ - 0.5 log|S(θ)|_+ + prior(θ),
+    //   f(θ) = L*(β̂(θ),θ).
+    //
+    // 1) Implicit derivatives of β̂:
+    //      G(β̂(θ),θ)=0, H=G_β.
+    //      For m>=1 and multi-index I=(τ_1,...,τ_m):
+    //        H β̂_I = -R_I,
+    //      where R_I is the partition-sum of mixed derivatives of G with all
+    //      lower-order β̂_J (|J|<m) substituted (standard implicit Faà di Bruno).
+    //
+    //    Closed form (set-partition implicit Faà di Bruno):
+    //      Let Q(θ):=G(β̂(θ),θ) ≡ 0 and I={1,...,m}.
+    //      Then
+    //        0 = D^mQ[τ_I]
+    //          = Σ_{π∈Part(I)} D^{|π|}G[ ζ_{B_1},...,ζ_{B_|π|} ],
+    //      with blocks B∈π and
+    //        ζ_B :=
+    //          (β̂_B, τ_b)  if |B|=1,  B={b},
+    //          (β̂_B, 0)    if |B|>=2.
+    //
+    //      For m>=2, isolating π={I} gives
+    //        H β̂_I = - Σ_{π∈Part(I), π≠{I}}
+    //                    D^{|π|}G[ ζ_{B_1},...,ζ_{B_|π|} ].
+    //      (m=1 reduces to Hβ̂_{τ} = -G_τ.)
+    //
+    //      This is the closed-form non-recursive characterization; practical
+    //      code still evaluates it recursively by increasing order.
+    //
+    // 2) Total derivatives of H(β̂(θ),θ):
+    //      D^m[H(β̂(θ),θ)][I]
+    //      = Σ_{π∈Part([m])} D_β^{|π|}D_θ^{m-|π|}H[β̂_{B_1},...,β̂_{B_|π|}; θ-rest].
+    //
+    // 3) n-th derivative of profiled fit f:
+    //      D^m f[I] uses the same partition composition with L*;
+    //      terms containing D_βL*=G vanish at stationarity (envelope pruning).
+    //
+    // 4) n-th derivative of V:
+    //      D^mV = D^mf + 0.5 D^m log|H(β̂(θ),θ)|_+ - 0.5 D^m log|S(θ)|_+ + D^m prior.
+    //
+    // Firth tensor closed forms used by these all-order identities:
+    //   Phi(beta) = 0.5 log|I(beta)|_+, I = X'WX.
+    //   For directions alpha,gamma:
+    //     Phi_alpha = 0.5 tr(I_+^† I_alpha),
+    //     Phi_alpha,gamma
+    //       = 0.5[ tr(I_+^† I_alpha,gamma)
+    //              - tr(I_+^† I_alpha I_+^† I_gamma) ].
+    //   Hence:
+    //     (g_phi)_tau = Phi_beta,tau,
+    //     (H_phi)_tau|beta = Phi_beta,beta,tau,
+    //   and D(H_phi)[beta_tau] = Phi_beta,beta,beta[beta_tau].
+    //
     // Conclusion:
-    //   Every Firth-specific second-order contribution required by the exact
-    //   outer Hessian enters through -D(H_phi)[·] and -D²(H_phi)[·,·] terms.
+    //   Every Firth-specific contribution at any order enters via derivatives
+    //   of Phi(beta)=0.5log|I(beta)|_+, i.e. through G and H derivative tensors
+    //   and their implicit β̂-coupled recursions above.
     // -------------------------------------------------------------------------
 
     #[allow(dead_code)]

@@ -1938,6 +1938,12 @@ pub struct BasisPsiDerivativeResult {
     pub penalties_derivative: Vec<Array2<f64>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BasisPsiSecondDerivativeResult {
+    pub design_second_derivative: Array2<f64>,
+    pub penalties_second_derivative: Vec<Array2<f64>>,
+}
+
 fn validate_center_count(num_centers: usize) -> Result<(), BasisError> {
     if num_centers == 0 {
         return Err(BasisError::InvalidInput(
@@ -2747,6 +2753,51 @@ fn matern_kernel_log_kappa_derivative_from_distance(
         }
     };
     Ok(deriv)
+}
+
+#[inline(always)]
+fn matern_kernel_log_kappa_second_derivative_from_distance(
+    r: f64,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<f64, BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn kernel distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn length_scale must be finite and positive".to_string(),
+        ));
+    }
+
+    let x = r / length_scale;
+    let second = match nu {
+        MaternNu::Half => x * (x - 1.0) * (-x).exp(),
+        MaternNu::ThreeHalves => {
+            let a = 3.0_f64.sqrt() * x;
+            (a * a * (a - 2.0)) * (-a).exp()
+        }
+        MaternNu::FiveHalves => {
+            let a = 5.0_f64.sqrt() * x;
+            (a * a * (a * a - 2.0 * a - 2.0) / 3.0) * (-a).exp()
+        }
+        MaternNu::SevenHalves => {
+            let a = 7.0_f64.sqrt() * x;
+            let a2 = a * a;
+            let a3 = a2 * a;
+            (a2 * (a3 - a2 - 6.0 * a - 6.0) / 15.0) * (-a).exp()
+        }
+        MaternNu::NineHalves => {
+            let a = 9.0_f64.sqrt() * x;
+            let a2 = a * a;
+            let a3 = a2 * a;
+            let a4 = a2 * a2;
+            (a2 * (a4 + a3 - 18.0 * a2 - 30.0 * a - 30.0) / 105.0) * (-a).exp()
+        }
+    };
+    Ok(second)
 }
 
 #[inline(always)]
@@ -3874,6 +3925,119 @@ pub fn build_matern_basis_log_kappa_derivative(
     Ok(BasisPsiDerivativeResult {
         design_derivative,
         penalties_derivative,
+    })
+}
+
+pub fn build_matern_basis_log_kappa_second_derivative(
+    data: ArrayView2<'_, f64>,
+    spec: &MaternBasisSpec,
+) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let k = centers.nrows();
+    let z_opt = match &spec.identifiability {
+        MaternIdentifiability::None => None,
+        MaternIdentifiability::CenterSumToZero => {
+            let q = Array2::<f64>::ones((k, 1));
+            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
+        }
+        MaternIdentifiability::CenterLinearOrthogonal => {
+            let q = polynomial_block_from_order(centers.view(), DuchonNullspaceOrder::Linear);
+            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
+        }
+        MaternIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != k {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen Matérn identifiability transform mismatch: centers={k}, transform rows={}",
+                    transform.nrows()
+                )));
+            }
+            Some(transform.clone())
+        }
+    };
+
+    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers.view())?;
+    let mut kernel_block_second = Array2::<f64>::zeros((data.nrows(), k));
+    let kernel_result: Result<(), BasisError> = kernel_block_second
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                row[j] = matern_kernel_log_kappa_second_derivative_from_distance(
+                    data_center_r[[i, j]],
+                    spec.length_scale,
+                    spec.nu,
+                )?;
+            }
+            Ok(())
+        });
+    kernel_result?;
+
+    let mut center_kernel_second = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in i..k {
+            let d2kij = matern_kernel_log_kappa_second_derivative_from_distance(
+                center_center_r[[i, j]],
+                spec.length_scale,
+                spec.nu,
+            )?;
+            center_kernel_second[[i, j]] = d2kij;
+            center_kernel_second[[j, i]] = d2kij;
+        }
+    }
+
+    let (design_second_derivative, penalty_kernel_second) = if let Some(z) = z_opt {
+        let kernel_constrained = fast_ab(&kernel_block_second, &z);
+        let omega_constrained = {
+            let zt_k = fast_atb(&z, &center_kernel_second);
+            fast_ab(&zt_k, &z)
+        };
+        let mut design = kernel_constrained;
+        if spec.include_intercept {
+            let n = design.nrows();
+            let p = design.ncols();
+            let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
+            design_with_intercept
+                .slice_mut(s![.., 0..p])
+                .assign(&design);
+            design = design_with_intercept;
+        }
+        let total_cols = design.ncols();
+        let mut penalty_second = Array2::<f64>::zeros((total_cols, total_cols));
+        let kernel_cols = omega_constrained.ncols();
+        penalty_second
+            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&omega_constrained);
+        (design, penalty_second)
+    } else {
+        let mut design = kernel_block_second;
+        if spec.include_intercept {
+            let n = design.nrows();
+            let p = design.ncols();
+            let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
+            design_with_intercept
+                .slice_mut(s![.., 0..p])
+                .assign(&design);
+            design = design_with_intercept;
+        }
+        let total_cols = design.ncols();
+        let mut penalty_second = Array2::<f64>::zeros((total_cols, total_cols));
+        penalty_second
+            .slice_mut(s![0..k, 0..k])
+            .assign(&center_kernel_second);
+        (design, penalty_second)
+    };
+
+    let mut penalties_second_derivative = vec![penalty_kernel_second];
+    if spec.double_penalty {
+        penalties_second_derivative.push(Array2::<f64>::zeros(
+            penalties_second_derivative[0].raw_dim(),
+        ));
+    }
+
+    Ok(BasisPsiSecondDerivativeResult {
+        design_second_derivative,
+        penalties_second_derivative,
     })
 }
 

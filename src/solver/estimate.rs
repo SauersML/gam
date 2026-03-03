@@ -1366,6 +1366,49 @@ where
             hyper_dir.s_tau_original.ncols()
         )));
     }
+    if let Some(k) = hyper_dir.penalty_index
+        && k >= s_list.len()
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "penalty_index {} out of bounds for {} penalties",
+            k,
+            s_list.len()
+        )));
+    }
+    if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
+        if x2.len() != 1 {
+            return Err(EstimationError::InvalidInput(format!(
+                "X_tau_tau length for directional derivative must be 1, got {}",
+                x2.len()
+            )));
+        }
+        if x2[0].nrows() != x.nrows() || x2[0].ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "X_tau_tau[0] must be {}x{}, got {}x{}",
+                x.nrows(),
+                p,
+                x2[0].nrows(),
+                x2[0].ncols()
+            )));
+        }
+    }
+    if let Some(s2) = hyper_dir.s_tau_tau_original.as_ref() {
+        if s2.len() != 1 {
+            return Err(EstimationError::InvalidInput(format!(
+                "S_tau_tau length for directional derivative must be 1, got {}",
+                s2.len()
+            )));
+        }
+        if s2[0].nrows() != p || s2[0].ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "S_tau_tau[0] must be {}x{}, got {}x{}",
+                p,
+                p,
+                s2[0].nrows(),
+                s2[0].ncols()
+            )));
+        }
+    }
 
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let has_design_drift = hyper_dir.x_tau_original.iter().any(|v| v.abs() > 1e-14);
@@ -1452,6 +1495,15 @@ where
         )));
     }
     for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
+        if let Some(k) = hyper_dir.penalty_index
+            && k >= s_list.len()
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "penalty_index for dir {idx} out of bounds: {} >= {}",
+                k,
+                s_list.len()
+            )));
+        }
         if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
             return Err(EstimationError::InvalidInput(format!(
                 "X_tau[{idx}] must be {}x{}, got {}x{}",
@@ -1469,6 +1521,46 @@ where
                 hyper_dir.s_tau_original.nrows(),
                 hyper_dir.s_tau_original.ncols()
             )));
+        }
+        if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
+            if x2.len() != psi_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "X_tau_tau[{idx}] length mismatch: expected {}, got {}",
+                    psi_dim,
+                    x2.len()
+                )));
+            }
+            for (j, x_ij) in x2.iter().enumerate() {
+                if x_ij.nrows() != x.nrows() || x_ij.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "X_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
+                        x.nrows(),
+                        p,
+                        x_ij.nrows(),
+                        x_ij.ncols()
+                    )));
+                }
+            }
+        }
+        if let Some(s2) = hyper_dir.s_tau_tau_original.as_ref() {
+            if s2.len() != psi_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "S_tau_tau[{idx}] length mismatch: expected {}, got {}",
+                    psi_dim,
+                    s2.len()
+                )));
+            }
+            for (j, s_ij) in s2.iter().enumerate() {
+                if s_ij.nrows() != p || s_ij.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "S_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
+                        p,
+                        p,
+                        s_ij.nrows(),
+                        s_ij.ncols()
+                    )));
+                }
+            }
         }
     }
 
@@ -1559,6 +1651,15 @@ where
         )));
     }
     for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
+        if let Some(k) = hyper_dir.penalty_index
+            && k >= s_list.len()
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "penalty_index for dir {idx} out of bounds: {} >= {}",
+                k,
+                s_list.len()
+            )));
+        }
         if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
             return Err(EstimationError::InvalidInput(format!(
                 "X_tau[{idx}] must be {}x{}, got {}x{}",
@@ -1576,6 +1677,46 @@ where
                 hyper_dir.s_tau_original.nrows(),
                 hyper_dir.s_tau_original.ncols()
             )));
+        }
+        if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
+            if x2.len() != psi_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "X_tau_tau[{idx}] length mismatch: expected {}, got {}",
+                    psi_dim,
+                    x2.len()
+                )));
+            }
+            for (j, x_ij) in x2.iter().enumerate() {
+                if x_ij.nrows() != x.nrows() || x_ij.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "X_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
+                        x.nrows(),
+                        p,
+                        x_ij.nrows(),
+                        x_ij.ncols()
+                    )));
+                }
+            }
+        }
+        if let Some(s2) = hyper_dir.s_tau_tau_original.as_ref() {
+            if s2.len() != psi_dim {
+                return Err(EstimationError::InvalidInput(format!(
+                    "S_tau_tau[{idx}] length mismatch: expected {}, got {}",
+                    psi_dim,
+                    s2.len()
+                )));
+            }
+            for (j, s_ij) in s2.iter().enumerate() {
+                if s_ij.nrows() != p || s_ij.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "S_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
+                        p,
+                        p,
+                        s_ij.nrows(),
+                        s_ij.ncols()
+                    )));
+                }
+            }
         }
     }
 

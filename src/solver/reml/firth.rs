@@ -751,31 +751,58 @@ impl<'a> RemlState<'a> {
         (dot_i, dot_h)
     }
 
-    pub(super) fn firth_partial_score_and_fit_tau(
+    pub(super) fn firth_exact_tau_kernel(
         op: &FirthDenseOperator,
         x_tau: &Array2<f64>,
         beta: &Array1<f64>,
-    ) -> (Array1<f64>, f64) {
-        // Exact partial design derivative at fixed beta:
-        //   (g_phi)_tau = 0.5 X_tau' (w' ⊙ h)
-        //               + 0.5 X'((w'' ⊙ (X_tau beta)) ⊙ h + w' ⊙ h_tau|beta),
-        //   Phi_tau|beta = -0.5 tr(F^+ F_tau|beta), F^+=Q K_r Q'.
+        include_hphi_tau_kernel: bool,
+    ) -> FirthTauExactKernel {
+        // Shared exact tau-partial bundle used by both dense and sparse paths:
+        //   (g_phi)_tau | beta-fixed,
+        //   Phi_tau | beta-fixed,
+        // and optional H_{phi,tau}|beta kernel for later matrix-free applies.
+        //
+        // Closed forms (reduced Fisher, fixed active subspace):
+        //   Phi = -0.5 log|I_r|, I_r = X_r' W X_r, K_r = I_r^{-1}
+        //   Phi_tau|beta = -0.5 tr(K_r I_{r,tau}).
+        //
+        //   (g_phi)_tau = Phi_beta,tau
+        //               = 0.5 X_tau' (w1 .* h)
+        //                 + 0.5 X'((w2 .* eta_tau) .* h + w1 .* h_tau),
+        //   where
+        //     h_i = x_{r,i}' K_r x_{r,i},
+        //     h_tau = 2*diag(X_{r,tau} K_r X_r') + diag(X_r K_{r,tau} X_r'),
+        //     K_{r,tau} = -K_r I_{r,tau} K_r.
+        //
+        // These are the literal trace/hat closed forms for Phi_tau and Phi_beta,tau.
         let deta_partial = x_tau.dot(beta);
         let (dot_i_partial, dot_h_partial) = Self::firth_dot_i_and_h(op, x_tau, &deta_partial);
 
-        // (g_phi)_tau | beta-fixed:
-        //   0.5 X_tau' (w' ⊙ h)
-        // + 0.5 X'((w'' ⊙ (X_tau beta)) ⊙ h + w' ⊙ h_tau|beta).
         let first = 0.5 * x_tau.t().dot(&(&op.w1 * &op.h_diag));
         let second_vec = &(&(&op.w2 * &deta_partial) * &op.h_diag) + &(&op.w1 * &dot_h_partial);
         let second = 0.5 * op.x_dense.t().dot(&second_vec);
         let g_phi_tau = first + second;
-        // Phi_tau | beta-fixed:
-        //   Phi = -0.5 log|I_r|  =>  Phi_tau = -0.5 tr(K_r I_{r,tau}).
         let phi_tau_partial = -0.5 * Self::trace_product(&op.k_reduced, &dot_i_partial);
-        (g_phi_tau, phi_tau_partial)
+
+        let tau_kernel = if include_hphi_tau_kernel {
+            Some(Self::firth_hphi_tau_partial_prepare_from_partials(
+                op,
+                x_tau,
+                &deta_partial,
+                dot_h_partial,
+                dot_i_partial,
+            ))
+        } else {
+            None
+        };
+        FirthTauExactKernel {
+            g_phi_tau,
+            phi_tau_partial,
+            tau_kernel,
+        }
     }
 
+    #[allow(dead_code)]
     pub(super) fn firth_hphi_tau_partial(
         op: &FirthDenseOperator,
         x_tau: &Array2<f64>,
@@ -830,6 +857,7 @@ impl<'a> RemlState<'a> {
         out
     }
 
+    #[allow(dead_code)]
     pub(super) fn firth_reduced_condition_number(k_reduced: &Array2<f64>) -> Option<f64> {
         if k_reduced.nrows() == 0 || k_reduced.ncols() == 0 {
             return None;
@@ -857,38 +885,27 @@ impl<'a> RemlState<'a> {
         beta: &Array1<f64>,
     ) -> FirthTauPartialKernel {
         let deta_partial = x_tau.dot(beta);
-        let (_dot_i_partial, dot_h_partial) = Self::firth_dot_i_and_h(op, x_tau, &deta_partial);
-        let dot_w1 = &op.w2 * &deta_partial;
-        let dot_w2 = &op.w3 * &deta_partial;
+        let (dot_i_partial, dot_h_partial) = Self::firth_dot_i_and_h(op, x_tau, &deta_partial);
+        Self::firth_hphi_tau_partial_prepare_from_partials(
+            op,
+            x_tau,
+            &deta_partial,
+            dot_h_partial,
+            dot_i_partial,
+        )
+    }
 
+    fn firth_hphi_tau_partial_prepare_from_partials(
+        op: &FirthDenseOperator,
+        x_tau: &Array2<f64>,
+        deta_partial: &Array1<f64>,
+        dot_h_partial: Array1<f64>,
+        dot_i_partial: Array2<f64>,
+    ) -> FirthTauPartialKernel {
+        let dot_w1 = &op.w2 * deta_partial;
+        let dot_w2 = &op.w3 * deta_partial;
         let x_tau_reduced = fast_ab(x_tau, &op.q_basis);
-        let dot_i_partial = {
-            let n = op.x_reduced.nrows();
-            let mut wx_reduced = op.x_reduced.clone();
-            let mut wx_tau_reduced = x_tau_reduced.clone();
-            for i in 0..n {
-                let wi = op.w[i];
-                for j in 0..wx_reduced.ncols() {
-                    wx_reduced[[i, j]] *= wi;
-                }
-                for j in 0..wx_tau_reduced.ncols() {
-                    wx_tau_reduced[[i, j]] *= wi;
-                }
-            }
-            let dw = &op.w1 * &deta_partial;
-            let mut dwx_reduced = op.x_reduced.clone();
-            for i in 0..n {
-                let dwi = dw[i];
-                for j in 0..dwx_reduced.ncols() {
-                    dwx_reduced[[i, j]] *= dwi;
-                }
-            }
-            fast_ab(&x_tau_reduced.t().to_owned(), &wx_reduced)
-                + fast_ab(&op.x_reduced.t().to_owned(), &wx_tau_reduced)
-                + fast_ab(&op.x_reduced.t().to_owned(), &dwx_reduced)
-        };
         let dot_k = -op.k_reduced.dot(&dot_i_partial).dot(&op.k_reduced);
-
         FirthTauPartialKernel {
             dot_w1,
             dot_w2,
@@ -960,6 +977,20 @@ impl<'a> RemlState<'a> {
         }
         // Matrix-free block apply of H_phi,tau|beta:
         //   H_phi,tau|beta(V) = 0.5 [ X_tau' r(V) + X' r_tau(V) ].
+        //
+        // Tensor identity behind this apply:
+        //   H_phi,tau|beta = Phi_beta,beta,tau
+        // and for test vectors b1,b2 (matrix columns V are batched b2's):
+        //   Phi_beta,beta,tau[b1,b2]
+        //   = 0.5[
+        //       tr(I^{-1} I_{b1,b2,tau})
+        //       - tr(I^{-1} I_{b1,b2} I^{-1} I_tau)
+        //       - tr(I^{-1} I_{b1,tau} I^{-1} I_{b2})
+        //       - tr(I^{-1} I_{b2,tau} I^{-1} I_{b1})
+        //       + 2 tr(I^{-1} I_{b1} I^{-1} I_{b2} I^{-1} I_tau)
+        //     ].
+        // This routine evaluates that form in reduced coordinates without forming
+        // dense 3rd-order tensors explicitly.
         let eta_v = op.x_dense.dot(rhs);
         let eta_v_tau = x_tau.dot(rhs);
         let q_v = &eta_v * &op.w1.view().insert_axis(Axis(1));
@@ -1058,6 +1089,7 @@ impl<'a> RemlState<'a> {
         out
     }
 
+    #[allow(dead_code)]
     pub(super) fn firth_hphi_tau_partial_trace_expansion(
         op: &FirthDenseOperator,
         x_tau: &Array2<f64>,
