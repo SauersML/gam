@@ -1,11 +1,12 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
-    BasisMetadata, BasisPsiDerivativeResult, DuchonBasisSpec, MaternBasisSpec,
-    MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
-    ThinPlateBasisSpec, apply_sum_to_zero_constraint, apply_weighted_orthogonality_constraint,
-    build_bspline_basis_1d, build_duchon_basis, build_matern_basis,
-    build_matern_basis_log_kappa_derivative, build_thin_plate_basis, estimate_penalty_nullity,
-    filter_active_penalty_candidates,
+    BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, DuchonBasisSpec,
+    MaternBasisSpec, MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource,
+    SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
+    apply_weighted_orthogonality_constraint, build_bspline_basis_1d, build_duchon_basis,
+    build_matern_basis, build_matern_basis_log_kappa_derivative,
+    build_matern_basis_log_kappa_second_derivative, build_thin_plate_basis,
+    estimate_penalty_nullity, filter_active_penalty_candidates,
 };
 use crate::construction::kronecker_product;
 use crate::custom_family::{
@@ -287,6 +288,8 @@ pub(crate) struct SpatialPsiDerivative {
     pub penalty_index: usize,
     pub x_psi: Array2<f64>,
     pub s_psi: Array2<f64>,
+    pub x_psi_psi: Array2<f64>,
+    pub s_psi_psi: Array2<f64>,
 }
 
 pub type TwoBlockMaternKappaOptimizationResult<FitOut> =
@@ -3311,7 +3314,7 @@ fn try_build_spatial_term_log_kappa_derivative_info(
     design: &TermCollectionDesign,
     term_idx: usize,
 ) -> Result<Option<SpatialPsiDerivative>, EstimationError> {
-    let Some((x_psi, s_psi)) =
+    let Some((x_psi, s_psi, x_psi_psi, s_psi_psi)) =
         try_build_spatial_term_log_kappa_derivative(data, resolved_spec, design, term_idx)?
     else {
         return Ok(None);
@@ -3323,6 +3326,8 @@ fn try_build_spatial_term_log_kappa_derivative_info(
         penalty_index,
         x_psi,
         s_psi,
+        x_psi_psi,
+        s_psi_psi,
     }))
 }
 
@@ -3353,7 +3358,7 @@ fn try_build_spatial_term_log_kappa_derivative(
     resolved_spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
     term_idx: usize,
-) -> Result<Option<(Array2<f64>, Array2<f64>)>, EstimationError> {
+) -> Result<Option<(Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>)>, EstimationError> {
     let smooth_term = match design.smooth.terms.get(term_idx) {
         Some(term) => term,
         None => return Ok(None),
@@ -3374,11 +3379,28 @@ fn try_build_spatial_term_log_kappa_derivative(
         }
         _ => return Ok(None),
     };
+    let BasisPsiSecondDerivativeResult {
+        design_second_derivative: local_x_psi_psi,
+        penalties_second_derivative: local_s_psi_psi,
+    } = match &term_spec.basis {
+        SmoothBasisSpec::Matern { feature_cols, spec } => {
+            let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            build_matern_basis_log_kappa_second_derivative(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
+        _ => return Ok(None),
+    };
 
     if local_x_psi.ncols() != smooth_term.coeff_range.len() {
         return Ok(None);
     }
+    if local_x_psi_psi.ncols() != smooth_term.coeff_range.len() {
+        return Ok(None);
+    }
     if local_s_psi.is_empty() || local_s_psi[0].nrows() != smooth_term.coeff_range.len() {
+        return Ok(None);
+    }
+    if local_s_psi_psi.is_empty() || local_s_psi_psi[0].nrows() != smooth_term.coeff_range.len() {
         return Ok(None);
     }
 
@@ -3391,13 +3413,21 @@ fn try_build_spatial_term_log_kappa_derivative(
     x_psi
         .slice_mut(s![.., global_range.clone()])
         .assign(&local_x_psi);
+    let mut x_psi_psi = Array2::<f64>::zeros((design.design.nrows(), p_total));
+    x_psi_psi
+        .slice_mut(s![.., global_range.clone()])
+        .assign(&local_x_psi_psi);
 
     let mut s_psi = Array2::<f64>::zeros((p_total, p_total));
     s_psi
         .slice_mut(s![global_range.clone(), global_range.clone()])
         .assign(&local_s_psi[0]);
+    let mut s_psi_psi = Array2::<f64>::zeros((p_total, p_total));
+    s_psi_psi
+        .slice_mut(s![global_range.clone(), global_range.clone()])
+        .assign(&local_s_psi_psi[0]);
 
-    Ok(Some((x_psi, s_psi)))
+    Ok(Some((x_psi, s_psi, x_psi_psi, s_psi_psi)))
 }
 
 fn try_build_spatial_log_kappa_hyper_dirs(
@@ -3416,10 +3446,18 @@ fn try_build_spatial_log_kappa_hyper_dirs(
         return Ok(None);
     };
     let mut hyper_dirs = Vec::with_capacity(info_list.len());
-    for info in info_list {
+    let psi_dim = info_list.len();
+    for (i, info) in info_list.into_iter().enumerate() {
+        let mut x_second = vec![Array2::<f64>::zeros(info.x_psi.raw_dim()); psi_dim];
+        let mut s_second = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); psi_dim];
+        x_second[i] = info.x_psi_psi.clone();
+        s_second[i] = info.s_psi_psi.clone();
         hyper_dirs.push(DirectionalHyperParam {
+            penalty_index: Some(info.penalty_index),
             x_tau_original: info.x_psi,
             s_tau_original: info.s_psi,
+            x_tau_tau_original: Some(x_second),
+            s_tau_tau_original: Some(s_second),
         });
     }
     Ok(Some(hyper_dirs))
@@ -3449,10 +3487,18 @@ fn try_exact_joint_spatial_hyper_cost_gradient(
         return Ok(None);
     };
     let mut hyper_dirs = Vec::with_capacity(info_list.len());
-    for info in info_list {
+    let psi_dim = info_list.len();
+    for (i, info) in info_list.into_iter().enumerate() {
+        let mut x_second = vec![Array2::<f64>::zeros(info.x_psi.raw_dim()); psi_dim];
+        let mut s_second = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); psi_dim];
+        x_second[i] = info.x_psi_psi.clone();
+        s_second[i] = info.s_psi_psi.clone();
         hyper_dirs.push(DirectionalHyperParam {
+            penalty_index: Some(info.penalty_index),
             x_tau_original: info.x_psi,
-            s_tau_original: info.s_psi.mapv(|v| theta[info.penalty_index].exp() * v),
+            s_tau_original: info.s_psi,
+            x_tau_tau_original: Some(x_second),
+            s_tau_tau_original: Some(s_second),
         });
     }
     let external_opts = external_opts_for_design(family, &design, options);
@@ -3485,12 +3531,6 @@ fn try_exact_joint_spatial_length_scale_optimization(
 ) -> Result<Option<FittedTermCollectionWithSpec>, EstimationError> {
     if spatial_terms.is_empty() {
         return Ok(None);
-    }
-    if matches!(family, LikelihoodFamily::BinomialLogit) {
-        return Err(EstimationError::InvalidInput(
-            "exact joint spatial κ optimization is unavailable for binomial logit because this path requires exact ψ hyper-gradients and Firth-logit directional ψ derivatives are not implemented"
-                .to_string(),
-        ));
     }
     if try_build_spatial_log_kappa_hyper_dirs(data, resolved_spec, &best.design, spatial_terms)?
         .is_none()
@@ -5511,6 +5551,77 @@ mod tests {
             }
             _ => panic!("expected Matérn term"),
         }
+    }
+
+    #[test]
+    fn spatial_length_scale_optimization_supports_binomial_logit_matern() {
+        let n = 80usize;
+        let d = 2usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (i as f64 * 0.19).cos();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+            let eta = -0.8 + 2.0 * x0 - 1.1 * x1;
+            let mu = 1.0 / (1.0 + (-eta).exp());
+            y[i] = if mu > 0.5 { 1.0 } else { 0.0 };
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
+                        length_scale: 1.8,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            max_iter: 60,
+            tol: 1e-6,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+        };
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+
+        let optimized = fit_term_collection_with_spatial_length_scale_optimization(
+            data.view(),
+            y,
+            weights,
+            offset,
+            &spec,
+            LikelihoodFamily::BinomialLogit,
+            &fit_opts,
+            &SpatialLengthScaleOptimizationOptions {
+                enabled: true,
+                max_outer_iter: 2,
+                rel_tol: 1e-5,
+                log_step: std::f64::consts::LN_2,
+                min_length_scale: 1e-3,
+                max_length_scale: 1e3,
+            },
+        )
+        .expect("binomial-logit Matérn spatial κ optimization should succeed");
+
+        let ls = match &optimized.resolved_spec.smooth_terms[0].basis {
+            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
+            _ => panic!("expected Matérn term"),
+        };
+        assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
+        assert!(optimized.fit.beta.iter().all(|v| v.is_finite()));
     }
 
     #[test]

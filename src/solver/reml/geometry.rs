@@ -313,7 +313,7 @@ impl<'a> RemlState<'a> {
 
     pub(super) fn compute_directional_hyper_gradient_sparse_exact(
         &self,
-        _rho: &Array1<f64>,
+        rho: &Array1<f64>,
         bundle: &EvalShared,
         hyper_dir: &DirectionalHyperParam,
     ) -> Result<f64, EstimationError> {
@@ -349,10 +349,22 @@ impl<'a> RemlState<'a> {
             * &(&pirls_result.solve_working_response - &pirls_result.final_eta);
 
         let x_tau_beta = hyper_dir.x_tau_original.dot(&beta);
+        let s_tau_total = if let Some(k) = hyper_dir.penalty_index {
+            if k >= rho.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "penalty_index {} out of bounds for rho dimension {}",
+                    k,
+                    rho.len()
+                )));
+            }
+            hyper_dir.s_tau_original.mapv(|v| rho[k].exp() * v)
+        } else {
+            hyper_dir.s_tau_original.clone()
+        };
         let weighted_x_tau_beta = &pirls_result.solve_weights * &x_tau_beta;
         let mut g_psi = hyper_dir.x_tau_original.t().dot(&u)
             - self.x().transpose_vector_multiply(&weighted_x_tau_beta)
-            - hyper_dir.s_tau_original.dot(&beta);
+            - s_tau_total.dot(&beta);
 
         let mut fit_firth_partial = 0.0_f64;
         let mut firth_op_opt: Option<FirthDenseOperator> = None;
@@ -364,15 +376,18 @@ impl<'a> RemlState<'a> {
                 let x_dense_arc = self.x().to_dense_arc();
                 Self::build_firth_dense_operator(x_dense_arc.as_ref(), &pirls_result.final_eta)?
             };
-            let (g_phi_tau, phi_tau_partial) =
-                Self::firth_partial_score_and_fit_tau(&op, &hyper_dir.x_tau_original, &beta);
-            g_psi -= &g_phi_tau;
-            fit_firth_partial = phi_tau_partial;
-            if hyper_dir.x_tau_original.iter().any(|v| *v != 0.0) {
-                hphi_tau_kernel_opt = Some(Self::firth_hphi_tau_partial_prepare(
-                    &op,
-                    &hyper_dir.x_tau_original,
-                    &beta,
+            let need_tau_kernel = hyper_dir.x_tau_original.iter().any(|v| *v != 0.0);
+            let tau_bundle = Self::firth_exact_tau_kernel(
+                &op,
+                &hyper_dir.x_tau_original,
+                &beta,
+                need_tau_kernel,
+            );
+            g_psi -= &tau_bundle.g_phi_tau;
+            fit_firth_partial = tau_bundle.phi_tau_partial;
+            if need_tau_kernel {
+                hphi_tau_kernel_opt = Some(tau_bundle.tau_kernel.expect(
+                    "exact sparse assembly requires tau kernel when design drift is active",
                 ));
             }
             firth_op_opt = Some(op);
@@ -381,14 +396,13 @@ impl<'a> RemlState<'a> {
         let beta_tau = solve_sparse_spd(&sparse.factor, &g_psi)?;
         let eta_tau = &x_tau_beta + &self.x().matrix_vector_multiply(&beta_tau);
 
-        let fit_block = -u.dot(&x_tau_beta)
-            + 0.5 * beta.dot(&hyper_dir.s_tau_original.dot(&beta))
-            + fit_firth_partial;
+        let fit_block =
+            -u.dot(&x_tau_beta) + 0.5 * beta.dot(&s_tau_total.dot(&beta)) + fit_firth_partial;
 
         let trace_s_tau = self.trace_hinv_operator_sparse_exact(
             &sparse.factor,
             p,
-            |basis_block: &Array2<f64>| Ok(hyper_dir.s_tau_original.dot(basis_block)),
+            |basis_block: &Array2<f64>| Ok(s_tau_total.dot(basis_block)),
         )?;
         let cross = self.sparse_exact_weighted_cross_trace_xtau(
             &sparse.factor,
@@ -414,7 +428,7 @@ impl<'a> RemlState<'a> {
                 }
                 let pseudo_det_trace = self.fixed_subspace_penalty_trace(
                     &pirls_result.reparam_result.e_transformed,
-                    &hyper_dir.s_tau_original,
+                    &s_tau_total,
                     pirls_result.ridge_passport,
                 )?;
                 let dp_tau = 2.0 * fit_block;
@@ -468,7 +482,7 @@ impl<'a> RemlState<'a> {
                 }
                 let pseudo_det_trace = self.fixed_subspace_penalty_trace(
                     &pirls_result.reparam_result.e_transformed,
-                    &hyper_dir.s_tau_original,
+                    &s_tau_total,
                     pirls_result.ridge_passport,
                 )?;
                 Ok(fit_block + 0.5 * trace_h - 0.5 * pseudo_det_trace)
