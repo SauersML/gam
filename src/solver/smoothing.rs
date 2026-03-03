@@ -2,15 +2,18 @@ use crate::estimate::{EstimationError, RHO_BOUND};
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
-use wolfe_bfgs::{Bfgs, BfgsError};
+use wolfe_bfgs::{
+    Bfgs, BfgsError, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError,
+    ObjectiveRequest, ObjectiveSample,
+};
 
 #[derive(Clone, Debug)]
 pub struct SmoothingBfgsOptions {
     pub max_iter: usize,
     pub tol: f64,
     pub finite_diff_step: f64,
-    /// Retained for API compatibility. The outer smoothing optimizer is always
-    /// gradient-only BFGS in this module, so this setting is ignored.
+    /// Retained for API compatibility.
+    /// This setting is only used by finite-difference fallback paths.
     pub fd_hessian_max_dim: usize,
     pub seed_config: SeedConfig,
 }
@@ -287,6 +290,155 @@ where
     let mut best_grad_norm = f64::INFINITY;
     for (_seed_idx, rho_seed) in screened_seeds.iter() {
         let Some(candidate) = run_single_seed_bfgs(context, rho_seed, eval_cost_grad_rho, options)
+        else {
+            continue;
+        };
+        let grad_norm = candidate.final_grad_norm;
+        if should_replace_smoothing_candidate(&best, &candidate) {
+            best = Some(candidate);
+        }
+        best_grad_norm = best_grad_norm.min(grad_norm);
+        if best.as_ref().is_some_and(|s| s.stationary) && best_grad_norm <= near_stationary_tol {
+            break;
+        }
+    }
+
+    best.ok_or_else(|| {
+        EstimationError::RemlOptimizationFailed(
+            "all smoothing outer starts failed before producing a candidate".to_string(),
+        )
+    })
+}
+
+fn run_single_seed_newton<C, Eval>(
+    context: &mut C,
+    rho_seed: &Array1<f64>,
+    eval_cost_grad_hess_rho: &mut Eval,
+    options: &SmoothingBfgsOptions,
+) -> Option<SmoothingBfgsResult>
+where
+    Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError>,
+{
+    let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
+    let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
+    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
+    let mut optimizer = NewtonTrustRegion::new(rho_seed.clone(), |rho, request| {
+        if let Some((rho_c, cost_c, grad_c, hess_c)) = &last_eval
+            && approx_same_rho_point(rho, rho_c)
+        {
+            return Ok(match request {
+                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                ObjectiveRequest::CostAndGradient => {
+                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                }
+                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                    if let Some(h) = hess_c {
+                        ObjectiveSample::cost_gradient_hessian(*cost_c, grad_c.clone(), h.clone())
+                    } else {
+                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                    }
+                }
+            });
+        }
+
+        let (cost, grad, hess) = eval_cost_grad_hess_rho(context, rho).map_err(|e| {
+            ObjectiveEvalError::recoverable(format!("outer objective evaluation failed: {e}"))
+        })?;
+        if !cost.is_finite() || grad.iter().any(|v| !v.is_finite()) {
+            return Err(ObjectiveEvalError::recoverable(
+                "outer objective returned non-finite cost/gradient",
+            ));
+        }
+        if let Some(ref h) = hess
+            && (h.nrows() != rho.len()
+                || h.ncols() != rho.len()
+                || h.iter().any(|v| !v.is_finite()))
+        {
+            return Err(ObjectiveEvalError::recoverable(
+                "outer objective returned invalid Hessian",
+            ));
+        }
+
+        last_eval = Some((rho.clone(), cost, grad.clone(), hess.clone()));
+        Ok(match request {
+            ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
+            ObjectiveRequest::CostAndGradient => ObjectiveSample::cost_and_gradient(cost, grad),
+            ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                if let Some(h) = hess {
+                    ObjectiveSample::cost_gradient_hessian(cost, grad, h)
+                } else {
+                    ObjectiveSample::cost_and_gradient(cost, grad)
+                }
+            }
+        })
+    })
+    .with_bounds(lower, upper, 1e-6)
+    .with_tolerance(options.tol)
+    .with_max_iterations(options.max_iter)
+    .with_bfgs_fallback(true)
+    .with_fallback_history(12);
+
+    let solution = match optimizer.run() {
+        Ok(sol) => sol,
+        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
+        Err(_) => return None,
+    };
+
+    let rho = solution.final_point.clone();
+    let mut grad_rho = match &last_eval {
+        Some((rho_cached, _cost_cached, grad_cached, _h_cached))
+            if approx_same_rho_point(&rho, rho_cached) =>
+        {
+            grad_cached.clone()
+        }
+        _ => match eval_cost_grad_hess_rho(context, &rho) {
+            Ok((_, grad, _)) => grad,
+            Err(_) => Array1::<f64>::from_elem(rho.len(), f64::NAN),
+        },
+    };
+    for g in grad_rho.iter_mut() {
+        if !g.is_finite() {
+            *g = f64::NAN;
+        }
+    }
+    let grad_norm = grad_rho.dot(&grad_rho).sqrt();
+    Some(SmoothingBfgsResult {
+        rho,
+        final_value: solution.final_value,
+        iterations: solution.iterations,
+        final_grad_norm: grad_norm,
+        stationary: grad_norm <= options.tol.max(1e-6),
+    })
+}
+
+fn run_multistart_newton<C, Eval>(
+    num_penalties: usize,
+    heuristic_lambdas: Option<&[f64]>,
+    context: &mut C,
+    eval_cost_grad_hess_rho: &mut Eval,
+    options: &SmoothingBfgsOptions,
+) -> Result<SmoothingBfgsResult, EstimationError>
+where
+    Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError>,
+{
+    let mut eval_cost_grad_rho =
+        |ctx: &mut C, rho: &Array1<f64>| -> Result<(f64, Array1<f64>), EstimationError> {
+            let (cost, grad, _) = eval_cost_grad_hess_rho(ctx, rho)?;
+            Ok((cost, grad))
+        };
+    let screened_seeds = screened_seeds(
+        num_penalties,
+        heuristic_lambdas,
+        context,
+        &mut eval_cost_grad_rho,
+        options,
+    )?;
+    let mut best: Option<SmoothingBfgsResult> = None;
+    let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
+    let mut best_grad_norm = f64::INFINITY;
+    for (_seed_idx, rho_seed) in screened_seeds.iter() {
+        let Some(candidate) =
+            run_single_seed_newton(context, rho_seed, eval_cost_grad_hess_rho, options)
         else {
             continue;
         };
@@ -647,12 +799,9 @@ where
 
 /// Multi-start smoothing optimizer when the caller can also provide exact Hessians.
 ///
-/// The current outer driver is gradient-only BFGS, so the Hessian output is
-/// accepted for API compatibility but not consumed by the optimizer.
-///
-/// This entry point exists so callers with a richer objective API do not need an
-/// adapter layer at the call site. It should not be used as a reason to evaluate
-/// expensive exact Hessians unless a future outer optimizer actually consumes them.
+/// This path uses `wolfe_bfgs::NewtonTrustRegion` and feeds Hessians directly via
+/// `ObjectiveSample::cost_gradient_hessian`. If a sample omits a Hessian, the solver
+/// falls back to internal BFGS updates for robustness.
 pub fn optimize_log_smoothing_with_multistart_with_gradient_and_hessian<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
@@ -675,15 +824,12 @@ where
         });
     }
 
-    let mut eval_cost_grad_rho = |objective: &mut F, rho: &Array1<f64>| {
-        let (cost, grad, _) = objective(rho)?;
-        Ok((cost, grad))
-    };
-    run_multistart_bfgs(
+    let mut eval_cost_grad_hess_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
+    run_multistart_newton(
         num_penalties,
         heuristic_lambdas,
         &mut objective_with_gradient_hessian,
-        &mut eval_cost_grad_rho,
+        &mut eval_cost_grad_hess_rho,
         options,
     )
 }

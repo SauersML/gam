@@ -15,7 +15,8 @@ use crate::custom_family::{
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitOptions, FitResult,
-    compute_external_joint_hyper_cost_gradient, fit_gam_with_heuristic_lambdas,
+    compute_external_joint_hyper_cost_gradient, compute_external_joint_hyper_cost_gradient_hessian,
+    fit_gam_with_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
@@ -28,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::f64;
 use std::ops::Range;
-use wolfe_bfgs::{Bfgs, BfgsError};
+use wolfe_bfgs::{
+    Bfgs, BfgsError, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveRequest, ObjectiveSample,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeConstraint {
@@ -3463,6 +3466,7 @@ fn try_build_spatial_log_kappa_hyper_dirs(
     Ok(Some(hyper_dirs))
 }
 
+#[allow(dead_code)]
 fn try_exact_joint_spatial_hyper_cost_gradient(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -3503,6 +3507,60 @@ fn try_exact_joint_spatial_hyper_cost_gradient(
     }
     let external_opts = external_opts_for_design(family, &design, options);
     let joint = compute_external_joint_hyper_cost_gradient(
+        y,
+        weights,
+        design.design.view(),
+        offset,
+        design.penalties.clone(),
+        theta,
+        rho_dim,
+        &hyper_dirs,
+        Some(warm_start_fit.fit.beta.view()),
+        &external_opts,
+    )?;
+    Ok(Some(joint))
+}
+
+fn try_exact_joint_spatial_hyper_cost_gradient_hessian(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    resolved_spec: &TermCollectionSpec,
+    warm_start_fit: &FittedTermCollection,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+    spatial_terms: &[usize],
+) -> Result<Option<(f64, Array1<f64>, Array2<f64>)>, EstimationError> {
+    let design = build_term_collection_design(data, resolved_spec)?;
+    let Some(info_list) = try_build_spatial_log_kappa_derivative_info_list(
+        data,
+        resolved_spec,
+        &design,
+        spatial_terms,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut hyper_dirs = Vec::with_capacity(info_list.len());
+    let psi_dim = info_list.len();
+    for (i, info) in info_list.into_iter().enumerate() {
+        let mut x_second = vec![Array2::<f64>::zeros(info.x_psi.raw_dim()); psi_dim];
+        let mut s_second = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); psi_dim];
+        x_second[i] = info.x_psi_psi.clone();
+        s_second[i] = info.s_psi_psi.clone();
+        hyper_dirs.push(DirectionalHyperParam {
+            penalty_index: Some(info.penalty_index),
+            x_tau_original: info.x_psi,
+            s_tau_original: info.s_psi,
+            x_tau_tau_original: Some(x_second),
+            s_tau_tau_original: Some(s_second),
+        });
+    }
+    let external_opts = external_opts_for_design(family, &design, options);
+    let joint = compute_external_joint_hyper_cost_gradient_hessian(
         y,
         weights,
         design.design.view(),
@@ -3562,18 +3620,27 @@ fn try_exact_joint_spatial_length_scale_optimization(
         upper[rho_dim + i] = kappa_options.max_length_scale.ln();
     }
 
-    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
+    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
     let warm_start_fit: FittedTermCollection = (*best).clone();
-    let mut optimizer = Bfgs::new(theta0.clone(), |theta| {
-        if let Some((theta_c, cost_c, grad_c)) = &last_eval
+    let mut optimizer = NewtonTrustRegion::new(theta0.clone(), |theta, request| {
+        if let Some((theta_c, cost_c, grad_c, h_c)) = &last_eval
             && approx_same_point(theta, theta_c)
         {
-            return (*cost_c, grad_c.clone());
+            return Ok(match request {
+                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                ObjectiveRequest::CostAndGradient => {
+                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                }
+                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                    ObjectiveSample::cost_gradient_hessian(*cost_c, grad_c.clone(), h_c.clone())
+                }
+            });
         }
 
         let psi_theta = theta.slice(s![rho_dim..]).to_owned();
-        match apply_spatial_log_length_scales(resolved_spec, spatial_terms, &psi_theta) {
-            Ok(spec_c) => match try_exact_joint_spatial_hyper_cost_gradient(
+        let sample = match apply_spatial_log_length_scales(resolved_spec, spatial_terms, &psi_theta)
+        {
+            Ok(spec_c) => match try_exact_joint_spatial_hyper_cost_gradient_hessian(
                 data,
                 y,
                 weights,
@@ -3586,32 +3653,37 @@ fn try_exact_joint_spatial_length_scale_optimization(
                 options,
                 spatial_terms,
             ) {
-                Ok(Some((cost, grad))) => {
-                    last_eval = Some((theta.clone(), cost, grad.clone()));
-                    (cost, grad)
+                Ok(Some((cost, grad, hess)))
+                    if cost.is_finite()
+                        && grad.iter().all(|v| v.is_finite())
+                        && hess.nrows() == theta.len()
+                        && hess.ncols() == theta.len()
+                        && hess.iter().all(|v| v.is_finite()) =>
+                {
+                    last_eval = Some((theta.clone(), cost, grad.clone(), hess.clone()));
+                    ObjectiveSample::cost_gradient_hessian(cost, grad, hess)
                 }
-                _ => (
+                _ => ObjectiveSample::cost_and_gradient(
                     1e50 + 0.5 * theta.dot(theta),
                     Array1::from_elem(theta.len(), 1e6),
                 ),
             },
-            Err(_) => (
+            Err(_) => ObjectiveSample::cost_and_gradient(
                 1e50 + 0.5 * theta.dot(theta),
                 Array1::from_elem(theta.len(), 1e6),
             ),
-        }
+        };
+        Ok(sample)
     })
     .with_bounds(lower, upper, 1e-6)
     .with_tolerance(kappa_options.rel_tol.max(1e-6))
     .with_max_iterations(kappa_options.max_outer_iter.max(1))
-    .with_no_improve_stop(1e-8, 8)
-    .with_flat_stall_exit(true, 4)
-    .with_curvature_slack_scale(2.0);
+    .with_bfgs_fallback(true)
+    .with_fallback_history(12);
 
     let solution = match optimizer.run() {
         Ok(sol) => sol,
-        Err(BfgsError::MaxIterationsReached { last_solution })
-        | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
         Err(err) => {
             return Err(EstimationError::RemlOptimizationFailed(format!(
                 "exact joint spatial length-scale optimization failed: {err:?}"
