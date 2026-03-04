@@ -36,7 +36,7 @@ use gam::joint::{
 };
 use gam::matrix::DesignMatrix;
 use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_from_spec};
-use gam::probability::{inverse_link_array, normal_cdf_approx, standard_normal_quantile};
+use gam::probability::{normal_cdf_approx, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
@@ -1887,8 +1887,24 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             } else {
                 let eta_lower = &pred.eta - &eff.mapv(|v| z * v);
                 let eta_upper = &pred.eta + &eff.mapv(|v| z * v);
-                mean_lo = Some(inverse_link_array(family, eta_lower.view()));
-                mean_hi = Some(inverse_link_array(family, eta_upper.view()));
+                mean_lo = Some(
+                    try_inverse_link_array(
+                        family,
+                        eta_lower.view(),
+                        saved_mixture.as_ref(),
+                        saved_sas,
+                    )
+                    .map_err(|e| format!("inverse-link lower bound failed: {e}"))?,
+                );
+                mean_hi = Some(
+                    try_inverse_link_array(
+                        family,
+                        eta_upper.view(),
+                        saved_mixture.as_ref(),
+                        saved_sas,
+                    )
+                    .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
+                );
             }
         }
         write_prediction_csv(
@@ -1921,7 +1937,6 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         })?;
         let mut eta = design.design.dot(&beta);
         eta += &offset;
-        let mean = eta.mapv(|e| mixture_inverse_link_jet(state, e).mu);
         let se = if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
             let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
             if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
@@ -1937,13 +1952,27 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         } else {
             None
         };
+        let mean = if args.mode == PredictModeArg::PosteriorMean {
+            let se_ref = se.as_ref().ok_or_else(|| {
+                "internal error: eta SE unavailable for posterior-mean prediction".to_string()
+            })?;
+            let quad_ctx = gam::quadrature::QuadratureContext::new();
+            Array1::from_iter(
+                eta.iter().zip(se_ref.iter()).map(|(&e, &s)| {
+                    gam::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, s, |x| {
+                        mixture_inverse_link_jet(state, x).mu
+                    })
+                }),
+            )
+        } else {
+            eta.mapv(|e| mixture_inverse_link_jet(state, e).mu)
+        };
         (eta, mean, se)
     } else if family == LikelihoodFamily::BinomialSas {
         let epsilon = model.sas_epsilon.unwrap_or(0.0);
         let log_delta = model.sas_log_delta.unwrap_or(0.0);
         let mut eta = design.design.dot(&beta);
         eta += &offset;
-        let mean = eta.mapv(|e| sas_inverse_link_jet(e, epsilon, log_delta).mu);
         let se = if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
             let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
             if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
@@ -1958,6 +1987,21 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             Some(linear_predictor_se(design.design.view(), &cov_mat))
         } else {
             None
+        };
+        let mean = if args.mode == PredictModeArg::PosteriorMean {
+            let se_ref = se.as_ref().ok_or_else(|| {
+                "internal error: eta SE unavailable for posterior-mean prediction".to_string()
+            })?;
+            let quad_ctx = gam::quadrature::QuadratureContext::new();
+            Array1::from_iter(
+                eta.iter().zip(se_ref.iter()).map(|(&e, &s)| {
+                    gam::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, s, |x| {
+                        sas_inverse_link_jet(x, epsilon, log_delta).mu
+                    })
+                }),
+            )
+        } else {
+            eta.mapv(|e| sas_inverse_link_jet(e, epsilon, log_delta).mu)
         };
         (eta, mean, se)
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
@@ -2025,8 +2069,14 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         } else {
             let eta_lower = &eta - &se.mapv(|v| z * v);
             let eta_upper = &eta + &se.mapv(|v| z * v);
-            mean_lo = Some(inverse_link_array(family, eta_lower.view()));
-            mean_hi = Some(inverse_link_array(family, eta_upper.view()));
+            mean_lo = Some(
+                try_inverse_link_array(family, eta_lower.view(), saved_mixture.as_ref(), saved_sas)
+                    .map_err(|e| format!("inverse-link lower bound failed: {e}"))?,
+            );
+            mean_hi = Some(
+                try_inverse_link_array(family, eta_upper.view(), saved_mixture.as_ref(), saved_sas)
+                    .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
+            );
         }
     }
 

@@ -1,4 +1,5 @@
 use crate::types::LikelihoodFamily;
+use crate::types::MixtureLinkState;
 use ndarray::{Array1, ArrayView1};
 
 /// Standard normal PDF φ(x).
@@ -79,30 +80,43 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
 
 /// Inverse-link transform per likelihood family.
 #[inline]
-pub fn inverse_link_array(family: LikelihoodFamily, eta: ArrayView1<'_, f64>) -> Array1<f64> {
+pub fn try_inverse_link_array(
+    family: LikelihoodFamily,
+    eta: ArrayView1<'_, f64>,
+    mixture_state: Option<&MixtureLinkState>,
+    sas_params: Option<(f64, f64)>,
+) -> Result<Array1<f64>, String> {
     match family {
-        LikelihoodFamily::GaussianIdentity => eta.to_owned(),
-        LikelihoodFamily::BinomialLogit => eta.mapv(|v| {
+        LikelihoodFamily::GaussianIdentity => Ok(eta.to_owned()),
+        LikelihoodFamily::BinomialLogit => Ok(eta.mapv(|v| {
             let z = v.clamp(-30.0, 30.0);
             1.0 / (1.0 + (-z).exp())
-        }),
-        LikelihoodFamily::BinomialProbit => eta.mapv(normal_cdf_approx),
-        LikelihoodFamily::BinomialCLogLog => eta.mapv(|v| {
+        })),
+        LikelihoodFamily::BinomialProbit => Ok(eta.mapv(normal_cdf_approx)),
+        LikelihoodFamily::BinomialCLogLog => Ok(eta.mapv(|v| {
             let z = v.clamp(-30.0, 30.0);
             1.0 - (-(z.exp())).exp()
-        }),
+        })),
         LikelihoodFamily::BinomialSas => {
-            panic!(
-                "inverse_link_array(BinomialSas) requires SAS link parameters; \
-                 use SAS-state-aware prediction helpers"
-            )
+            let (epsilon, log_delta) = sas_params.ok_or_else(|| {
+                "inverse-link for BinomialSas requires sas_params=(epsilon,log_delta)".to_string()
+            })?;
+            Ok(eta.mapv(|e| crate::mixture_link::sas_inverse_link_jet(e, epsilon, log_delta).mu))
         }
         LikelihoodFamily::BinomialMixture => {
-            panic!(
-                "inverse_link_array(BinomialMixture) requires mixture link state; \
-                 use mixture-state-aware prediction helpers"
-            )
+            let state = mixture_state.ok_or_else(|| {
+                "inverse-link for BinomialMixture requires mixture_state".to_string()
+            })?;
+            Ok(eta.mapv(|e| crate::mixture_link::mixture_inverse_link_jet(state, e).mu))
         }
-        LikelihoodFamily::RoystonParmar => eta.to_owned(),
+        LikelihoodFamily::RoystonParmar => Ok(eta.to_owned()),
     }
+}
+
+/// Inverse-link transform per likelihood family.
+///
+/// For SAS/mixture families, use `try_inverse_link_array` with explicit link state.
+#[inline]
+pub fn inverse_link_array(family: LikelihoodFamily, eta: ArrayView1<'_, f64>) -> Array1<f64> {
+    try_inverse_link_array(family, eta, None, None).unwrap_or_else(|msg| panic!("{msg}"))
 }

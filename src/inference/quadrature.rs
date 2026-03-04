@@ -2024,18 +2024,9 @@ pub fn integrated_family_moments_jet(
                 mode: jet.mode,
             })
         }
-        LikelihoodFamily::BinomialSas => {
-            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Sas, e, se);
-            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
-            Ok(IntegratedMomentsJet {
-                mean,
-                variance: (mean * (1.0 - mean)).max(PROB_EPS),
-                d1: jet.d1,
-                d2: jet.d2,
-                d3: jet.d3,
-                mode: jet.mode,
-            })
-        }
+        LikelihoodFamily::BinomialSas => Err(EstimationError::InvalidInput(
+            "Integrated moments dispatcher for BinomialSas requires SAS link parameters and is not supported in this state-less API".to_string(),
+        )),
         LikelihoodFamily::GaussianIdentity => Ok(IntegratedMomentsJet {
             mean: e,
             variance: 1.0,

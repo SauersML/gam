@@ -2419,18 +2419,18 @@ fn evaluate_standard_family_observations(
                     LikelihoodFamily::BinomialSas => {
                         let (epsilon, log_delta) = sas_link_state
                             .map(|s| (s.epsilon, s.log_delta))
-                            .unwrap_or((0.0, 0.0));
+                            .ok_or_else(|| {
+                                "BinomialSas observations require SAS link state".to_string()
+                            })?;
                         let jet = sas_inverse_link_jet(eta_i, epsilon, log_delta);
                         (jet.mu, jet.d1)
                     }
                     LikelihoodFamily::BinomialMixture => {
-                        if let Some(state) = mixture_link_state {
-                            let jet = mixture_inverse_link_jet(state, eta_i);
-                            (jet.mu, jet.d1)
-                        } else {
-                            let mu_i = stable_sigmoid(eta_i);
-                            (mu_i, mu_i * (1.0 - mu_i))
-                        }
+                        let state = mixture_link_state.ok_or_else(|| {
+                            "BinomialMixture observations require mixture link state".to_string()
+                        })?;
+                        let jet = mixture_inverse_link_jet(state, eta_i);
+                        (jet.mu, jet.d1)
                     }
                     _ => unreachable!(),
                 };
@@ -2457,19 +2457,18 @@ fn evaluate_standard_family_observations(
                     LikelihoodFamily::BinomialSas => {
                         let (epsilon, log_delta) = sas_link_state
                             .map(|s| (s.epsilon, s.log_delta))
-                            .unwrap_or((0.0, 0.0));
+                            .ok_or_else(|| {
+                                "BinomialSas observations require SAS link state".to_string()
+                            })?;
                         let jet = sas_inverse_link_jet(eta_i, epsilon, log_delta);
                         (jet.d2, jet.d3)
                     }
                     LikelihoodFamily::BinomialMixture => {
-                        if let Some(state) = mixture_link_state {
-                            let jet = mixture_inverse_link_jet(state, eta_i);
-                            (jet.d2, jet.d3)
-                        } else {
-                            let d2 = dmu_deta * (1.0 - 2.0 * mu_i);
-                            let d3 = dmu_deta * (1.0 - 6.0 * mu_i + 6.0 * mu_i * mu_i);
-                            (d2, d3)
-                        }
+                        let state = mixture_link_state.ok_or_else(|| {
+                            "BinomialMixture observations require mixture link state".to_string()
+                        })?;
+                        let jet = mixture_inverse_link_jet(state, eta_i);
+                        (jet.d2, jet.d3)
                     }
                     _ => unreachable!(),
                 };
