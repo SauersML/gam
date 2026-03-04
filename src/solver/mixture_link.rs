@@ -361,12 +361,17 @@ pub fn mixture_inverse_link_jet_with_rho_partials_into(
         mixed.d1 += w * jet_i.d1;
         mixed.d2 += w * jet_i.d2;
         mixed.d3 += w * jet_i.d3;
+        // Cache the first K-1 component jets directly in the output buffer so
+        // we don't recompute them in the partial loop.
+        if i < m {
+            out[i] = jet_i;
+        }
     }
     mixed.mu = clamp_prob(mixed.mu);
     mixed.d1 = mixed.d1.max(1e-12);
     for j in 0..m {
         let pi_j = state.pi[j];
-        let cj = component_inverse_link_jet(state.components[j], eta);
+        let cj = out[j];
         out[j] = InverseLinkJet {
             mu: pi_j * (cj.mu - mixed.mu),
             d1: pi_j * (cj.d1 - mixed.d1),

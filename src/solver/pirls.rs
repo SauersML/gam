@@ -4634,8 +4634,9 @@ fn standard_inverse_link_jet(
             }
         }
         LinkFunction::Sas => {
-            // Fall back to probit-like default SAS state when no explicit state is provided.
-            sas_inverse_link_jet(eta, 0.0, 0.0)
+            panic!(
+                "LinkFunction::Sas requires explicit SasLinkState; state-less SAS fallback is unsupported"
+            )
         }
         LinkFunction::Identity => MixtureInverseLinkJet {
             mu: eta,
