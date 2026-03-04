@@ -26,6 +26,7 @@ use crate::construction::{
 };
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
+use crate::probability::normal_cdf_approx;
 use crate::quadrature::QuadratureContext;
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use crate::types::{LikelihoodFamily, LinkFunction};
@@ -67,6 +68,25 @@ fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<Likelihood
         // correct integrated moments, so do not dispatch state-less SAS here.
         LinkFunction::Sas => None,
         LinkFunction::Identity => None,
+    }
+}
+
+#[inline]
+fn joint_point_inverse_link(link: LinkFunction, eta: f64) -> f64 {
+    match link {
+        LinkFunction::Identity => eta,
+        LinkFunction::Logit => {
+            let e = eta.clamp(-700.0, 700.0);
+            1.0 / (1.0 + (-e).exp())
+        }
+        LinkFunction::Probit => normal_cdf_approx(eta.clamp(-30.0, 30.0)),
+        LinkFunction::CLogLog => {
+            let e = eta.clamp(-30.0, 30.0);
+            1.0 - (-e.exp()).exp()
+        }
+        // Joint state-less pipeline does not support SAS; this sentinel keeps
+        // failure explicit if an incompatible model reaches prediction.
+        LinkFunction::Sas => f64::NAN,
     }
 }
 
@@ -3403,11 +3423,11 @@ pub fn predict_joint(
                         &quad_ctx, family, eta_cal[i], eff_se[i],
                     )
                     .map(|m| m.mean)
-                    .unwrap_or(f64::NAN)
+                    .unwrap_or_else(|_| joint_point_inverse_link(result.link, eta_cal[i]))
                 })
                 .collect::<Array1<f64>>()
         } else {
-            eta_cal.clone()
+            eta_cal.mapv(|e| joint_point_inverse_link(result.link, e))
         };
 
         (probs, Some(eff_se))
@@ -3419,11 +3439,11 @@ pub fn predict_joint(
                         &quad_ctx, family, eta_cal[i], 0.0,
                     )
                     .map(|m| m.mean)
-                    .unwrap_or(f64::NAN)
+                    .unwrap_or_else(|_| joint_point_inverse_link(result.link, eta_cal[i]))
                 })
                 .collect::<Array1<f64>>()
         } else {
-            eta_cal.clone()
+            eta_cal.mapv(|e| joint_point_inverse_link(result.link, e))
         };
         (probs, None)
     };
