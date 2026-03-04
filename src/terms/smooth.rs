@@ -21,10 +21,9 @@ use crate::estimate::{
 use crate::faer_ndarray::fast_atv;
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    mixture_inverse_link_jet, sas_inverse_link_jet, state_from_sas_spec, state_from_spec,
+    inverse_link_jet_for_family, state_from_sas_spec, state_from_spec,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::{LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
@@ -2400,78 +2399,18 @@ fn evaluate_standard_family_observations(
             | LikelihoodFamily::BinomialCLogLog
             | LikelihoodFamily::BinomialSas
             | LikelihoodFamily::BinomialMixture => {
-                let (mu_i_raw, dmu_deta_raw) = match family {
-                    LikelihoodFamily::BinomialLogit => {
-                        let mu_i = stable_sigmoid(eta_i);
-                        (mu_i, mu_i * (1.0 - mu_i))
-                    }
-                    LikelihoodFamily::BinomialProbit => {
-                        let mu_i = normal_cdf_approx(eta_i);
-                        (mu_i, normal_pdf(eta_i))
-                    }
-                    LikelihoodFamily::BinomialCLogLog => {
-                        let eta_c = eta_i.clamp(-30.0, 30.0);
-                        let exp_eta = eta_c.exp();
-                        let mu_i = 1.0 - (-exp_eta).exp();
-                        let dmu = (eta_c - exp_eta).exp();
-                        (mu_i, dmu)
-                    }
-                    LikelihoodFamily::BinomialSas => {
-                        let (epsilon, log_delta) = sas_link_state
-                            .map(|s| (s.epsilon, s.log_delta))
-                            .ok_or_else(|| {
-                                "BinomialSas observations require SAS link state".to_string()
-                            })?;
-                        let jet = sas_inverse_link_jet(eta_i, epsilon, log_delta);
-                        (jet.mu, jet.d1)
-                    }
-                    LikelihoodFamily::BinomialMixture => {
-                        let state = mixture_link_state.ok_or_else(|| {
-                            "BinomialMixture observations require mixture link state".to_string()
-                        })?;
-                        let jet = mixture_inverse_link_jet(state, eta_i);
-                        (jet.mu, jet.d1)
-                    }
-                    _ => unreachable!(),
-                };
+                let jet = inverse_link_jet_for_family(
+                    family,
+                    eta_i,
+                    mixture_link_state,
+                    sas_link_state,
+                )?;
+                let mu_i_raw = jet.mu;
+                let dmu_deta_raw = jet.d1;
                 let mu_i = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);
                 let dmu_deta = dmu_deta_raw.max(MU_DERIV_EPS);
-                let (d2mu_deta2, d3mu_deta3) = match family {
-                    LikelihoodFamily::BinomialLogit => {
-                        let d2 = dmu_deta * (1.0 - 2.0 * mu_i);
-                        let d3 = dmu_deta * (1.0 - 6.0 * mu_i + 6.0 * mu_i * mu_i);
-                        (d2, d3)
-                    }
-                    LikelihoodFamily::BinomialProbit => {
-                        let d2 = -eta_i * dmu_deta;
-                        let d3 = (eta_i * eta_i - 1.0) * dmu_deta;
-                        (d2, d3)
-                    }
-                    LikelihoodFamily::BinomialCLogLog => {
-                        let eta_c = eta_i.clamp(-30.0, 30.0);
-                        let t = eta_c.exp();
-                        let d2 = dmu_deta * (1.0 - t);
-                        let d3 = dmu_deta * (1.0 - 3.0 * t + t * t);
-                        (d2, d3)
-                    }
-                    LikelihoodFamily::BinomialSas => {
-                        let (epsilon, log_delta) = sas_link_state
-                            .map(|s| (s.epsilon, s.log_delta))
-                            .ok_or_else(|| {
-                                "BinomialSas observations require SAS link state".to_string()
-                            })?;
-                        let jet = sas_inverse_link_jet(eta_i, epsilon, log_delta);
-                        (jet.d2, jet.d3)
-                    }
-                    LikelihoodFamily::BinomialMixture => {
-                        let state = mixture_link_state.ok_or_else(|| {
-                            "BinomialMixture observations require mixture link state".to_string()
-                        })?;
-                        let jet = mixture_inverse_link_jet(state, eta_i);
-                        (jet.d2, jet.d3)
-                    }
-                    _ => unreachable!(),
-                };
+                let d2mu_deta2 = jet.d2;
+                let d3mu_deta3 = jet.d3;
                 let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
                 let l_mu = (yi - mu_i) / var;
                 let l_mumu = -(yi / (mu_i * mu_i)) - ((1.0 - yi) / ((1.0 - mu_i) * (1.0 - mu_i)));

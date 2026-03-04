@@ -36,8 +36,9 @@ use gam::joint::{
 };
 use gam::matrix::DesignMatrix;
 use gam::mixture_link::{
-    InverseLinkJet, mixture_inverse_link_jet, mixture_inverse_link_jet_with_rho_partials_into,
-    sas_inverse_link_jet, sas_inverse_link_jet_with_param_partials, state_from_spec,
+    InverseLinkJet, inverse_link_jet_for_family, mixture_inverse_link_jet,
+    mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet,
+    sas_inverse_link_jet_with_param_partials, state_from_spec,
 };
 use gam::probability::{normal_cdf_approx, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
@@ -6518,11 +6519,22 @@ fn response_sd_from_eta_for_family(
                 v
             }
             LikelihoodFamily::BinomialSas => {
-                let (epsilon, log_delta) = sas_params.unwrap_or((0.0, 0.0));
-                let dmu_deta = sas_inverse_link_jet(eta[i], epsilon, log_delta).d1.abs();
+                let sas_state_i = sas_params.map(|(epsilon, log_delta)| gam::types::SasLinkState {
+                    epsilon,
+                    log_delta,
+                    delta: log_delta.exp(),
+                });
+                let dmu_deta = inverse_link_jet_for_family(
+                    LikelihoodFamily::BinomialSas,
+                    eta[i],
+                    None,
+                    sas_state_i.as_ref(),
+                )
+                .map(|j| j.d1.abs())
+                .unwrap_or(0.0);
                 let se = eta_se[i].max(0.0);
                 let mut var = (dmu_deta * se).powi(2);
-                if let Some(cov_theta) = sas_param_covariance
+                if let (Some((epsilon, log_delta)), Some(cov_theta)) = (sas_params, sas_param_covariance)
                     && cov_theta.nrows() == 2
                     && cov_theta.ncols() == 2
                 {
@@ -6537,9 +6549,14 @@ fn response_sd_from_eta_for_family(
                 var
             }
             LikelihoodFamily::BinomialMixture => {
-                let dmu_deta = mixture_state
-                    .map(|s| mixture_inverse_link_jet(s, eta[i]).d1.abs())
-                    .unwrap_or(0.0);
+                let dmu_deta = inverse_link_jet_for_family(
+                    LikelihoodFamily::BinomialMixture,
+                    eta[i],
+                    mixture_state,
+                    None,
+                )
+                .map(|j| j.d1.abs())
+                .unwrap_or(0.0);
                 let se = eta_se[i].max(0.0);
                 let mut var = (dmu_deta * se).powi(2);
                 if let (Some(state), Some(cov_theta)) = (mixture_state, mixture_param_covariance) {

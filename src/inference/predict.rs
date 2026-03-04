@@ -1,8 +1,9 @@
 use crate::estimate::{EstimationError, FitResult};
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    InverseLinkJet, mixture_inverse_link_jet, mixture_inverse_link_jet_with_rho_partials_into,
-    sas_inverse_link_jet, sas_inverse_link_jet_with_param_partials, state_from_spec,
+    InverseLinkJet, inverse_link_jet_for_family, mixture_inverse_link_jet,
+    mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet,
+    sas_inverse_link_jet_with_param_partials, state_from_spec,
 };
 use crate::probability::{standard_normal_quantile, try_inverse_link_array};
 use crate::types::LinkFunction;
@@ -621,36 +622,19 @@ where
         })
         .unwrap_or_default();
     for i in 0..eta.len() {
-        let dmu_deta = match family {
-            crate::types::LikelihoodFamily::GaussianIdentity => 1.0,
-            crate::types::LikelihoodFamily::BinomialLogit => {
-                let mu = mean[i];
-                mu * (1.0 - mu)
-            }
-            crate::types::LikelihoodFamily::BinomialProbit => {
-                crate::probability::normal_pdf(eta[i])
-            }
-            crate::types::LikelihoodFamily::BinomialCLogLog => {
-                let z = eta[i].clamp(-30.0, 30.0);
-                let exp_eta = z.exp();
-                let surv = (-exp_eta).exp();
-                exp_eta * surv
-            }
-            crate::types::LikelihoodFamily::BinomialSas => {
-                let (epsilon, log_delta) = sas_params.unwrap_or((0.0, 0.0));
-                sas_inverse_link_jet(eta[i], epsilon, log_delta).d1
-            }
-            crate::types::LikelihoodFamily::BinomialMixture => {
-                let state = mixture_state.as_ref().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "BinomialMixture uncertainty requires fitted mixture link state"
-                            .to_string(),
-                    )
-                })?;
-                mixture_inverse_link_jet(state, eta[i]).d1
-            }
-            crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
-        };
+        let sas_state_i = sas_params.map(|(epsilon, log_delta)| crate::types::SasLinkState {
+            epsilon,
+            log_delta,
+            delta: log_delta.exp(),
+        });
+        let dmu_deta = inverse_link_jet_for_family(
+            family,
+            eta[i],
+            mixture_state.as_ref(),
+            sas_state_i.as_ref(),
+        )
+        .map_err(EstimationError::InvalidInput)?
+        .d1;
         let mut mean_var = dmu_deta * dmu_deta * eta_var[i];
         if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
             && let Some(cov_theta) = fit.sas_param_covariance.as_ref()
