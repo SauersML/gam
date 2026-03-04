@@ -1,6 +1,9 @@
 use crate::estimate::{EstimationError, FitResult};
 use crate::matrix::DesignMatrix;
-use crate::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_from_spec};
+use crate::mixture_link::{
+    InverseLinkJet, mixture_inverse_link_jet, mixture_inverse_link_jet_with_rho_partials_into,
+    sas_inverse_link_jet, sas_inverse_link_jet_with_param_partials, state_from_spec,
+};
 use crate::probability::{standard_normal_quantile, try_inverse_link_array};
 use crate::types::LinkFunction;
 use crate::types::MixtureLinkSpec;
@@ -46,6 +49,20 @@ fn fit_mixture_link_state(
     state_from_spec(&spec).map(Some).map_err(|e| {
         EstimationError::InvalidInput(format!("invalid fitted mixture link state: {e}"))
     })
+}
+
+#[inline]
+fn quadratic_form(cov: &Array2<f64>, grad: &[f64]) -> f64 {
+    if cov.nrows() != grad.len() || cov.ncols() != grad.len() {
+        return 0.0;
+    }
+    let mut acc = 0.0_f64;
+    for i in 0..grad.len() {
+        for j in 0..grad.len() {
+            acc += grad[i] * cov[[i, j]] * grad[j];
+        }
+    }
+    acc.max(0.0)
 }
 
 fn linear_predictor_variance(x: &DesignMatrix, cov: &Array2<f64>) -> Array1<f64> {
@@ -588,6 +605,21 @@ where
     //   Var(μ) = I(2) - I(1)^2.
     // These identities characterize the exact cloglog moments under Gaussian η uncertainty.
     let mut mean_standard_error = Array1::<f64>::zeros(eta.len());
+    let mut mix_partials = fit
+        .mixture_link_rho
+        .as_ref()
+        .map(|rho| {
+            vec![
+                InverseLinkJet {
+                    mu: 0.0,
+                    d1: 0.0,
+                    d2: 0.0,
+                    d3: 0.0,
+                };
+                rho.len()
+            ]
+        })
+        .unwrap_or_default();
     for i in 0..eta.len() {
         let dmu_deta = match family {
             crate::types::LikelihoodFamily::GaussianIdentity => 1.0,
@@ -619,7 +651,39 @@ where
             }
             crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
         };
-        mean_standard_error[i] = (dmu_deta.abs() * eta_standard_error[i]).max(0.0);
+        let mut mean_var = dmu_deta * dmu_deta * eta_var[i];
+        if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
+            && let Some(cov_theta) = fit.sas_param_covariance.as_ref()
+        {
+            let (epsilon, log_delta) = sas_params.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "BinomialSas uncertainty requires fitted sas_epsilon/sas_log_delta".to_string(),
+                )
+            })?;
+            let jets = sas_inverse_link_jet_with_param_partials(eta[i], epsilon, log_delta);
+            let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
+            mean_var += quadratic_form(cov_theta, &g);
+        }
+        if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
+            && let Some(cov_theta) = fit.mixture_link_param_covariance.as_ref()
+            && let Some(state) = mixture_state.as_ref()
+        {
+            if mix_partials.len() != state.rho.len() {
+                mix_partials = vec![
+                    InverseLinkJet {
+                        mu: 0.0,
+                        d1: 0.0,
+                        d2: 0.0,
+                        d3: 0.0,
+                    };
+                    state.rho.len()
+                ];
+            }
+            let _ = mixture_inverse_link_jet_with_rho_partials_into(state, eta[i], &mut mix_partials);
+            let g = mix_partials.iter().map(|p| p.mu).collect::<Vec<_>>();
+            mean_var += quadratic_form(cov_theta, &g);
+        }
+        mean_standard_error[i] = mean_var.max(0.0).sqrt();
     }
 
     let (mut mean_lower, mut mean_upper) = match options.mean_interval_method {

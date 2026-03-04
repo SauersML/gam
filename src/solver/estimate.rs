@@ -824,9 +824,13 @@ pub struct ExternalOptimResult {
     pub mixture_link_components: Option<Vec<LinkComponent>>,
     pub mixture_link_rho: Option<Array1<f64>>,
     pub mixture_link_weights: Option<Array1<f64>>,
+    /// Approximate covariance of mixture free logits (K-1 x K-1), when optimized.
+    pub mixture_link_param_covariance: Option<Array2<f64>>,
     pub sas_epsilon: Option<f64>,
     pub sas_log_delta: Option<f64>,
     pub sas_delta: Option<f64>,
+    /// Approximate covariance of SAS params (epsilon, log_delta), shape 2x2.
+    pub sas_param_covariance: Option<Array2<f64>>,
 }
 
 #[derive(Clone)]
@@ -1119,7 +1123,14 @@ where
     } else {
         0.0
     };
-    let (final_rho, final_mixture_state, final_sas_state, outer_result) = if mixture_dim > 0
+    let (
+        final_rho,
+        final_mixture_state,
+        final_sas_state,
+        final_mixture_param_covariance,
+        final_sas_param_covariance,
+        outer_result,
+    ) = if mixture_dim > 0
         && sas_dim > 0
     {
         return Err(EstimationError::InvalidInput(
@@ -1168,6 +1179,8 @@ where
             outer_result.rho.clone(),
             cfg.mixture_link_state.clone(),
             cfg.sas_link_state,
+            None,
+            None,
             outer_result,
         )
     } else {
@@ -1466,7 +1479,104 @@ where
         } else {
             cfg.sas_link_state
         };
-        (final_rho, final_mix_state, final_sas_state, outer_result)
+        let aux_param_covariance = if aux_dim_outer > 0 {
+            let mut theta_aux = Array1::<f64>::zeros(aux_dim_outer);
+            if use_mixture {
+                theta_aux.assign(&outer_result.rho.slice(s![k..(k + mixture_dim)]));
+            } else if use_sas {
+                theta_aux[0] = outer_result.rho[k];
+                theta_aux[1] = outer_result.rho[k + 1];
+            }
+            let mut evaluate_aux_cost = |aux: &Array1<f64>| -> Result<f64, EstimationError> {
+                if use_mixture {
+                    let spec_eval = MixtureLinkSpec {
+                        components: mix_spec.components.clone(),
+                        initial_rho: aux.clone(),
+                    };
+                    let mix_state = state_from_spec(&spec_eval).map_err(|e| {
+                        EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
+                    })?;
+                    reml_eval.set_link_states(Some(mix_state), None);
+                } else if use_sas {
+                    let sas_state = state_from_sas_spec(SasLinkSpec {
+                        initial_epsilon: aux[0],
+                        initial_log_delta: aux[1],
+                    })
+                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?;
+                    reml_eval.set_link_states(None, Some(sas_state));
+                }
+                let mut cost = reml_eval.compute_cost(&final_rho)?;
+                if use_sas && sas_ridge_weight > 0.0 {
+                    let log_delta = aux[1];
+                    cost += 0.5 * sas_ridge_weight * log_delta * log_delta;
+                }
+                Ok(cost)
+            };
+            let f0 = evaluate_aux_cost(&theta_aux)?;
+            let d = aux_dim_outer;
+            let mut h_aux = Array2::<f64>::zeros((d, d));
+            for i in 0..d {
+                let hi = 1e-3 * (1.0 + theta_aux[i].abs());
+                let mut tp = theta_aux.clone();
+                let mut tm = theta_aux.clone();
+                tp[i] += hi;
+                tm[i] -= hi;
+                let fp = evaluate_aux_cost(&tp)?;
+                let fm = evaluate_aux_cost(&tm)?;
+                h_aux[[i, i]] = (fp - 2.0 * f0 + fm) / (hi * hi);
+                for j in (i + 1)..d {
+                    let hj = 1e-3 * (1.0 + theta_aux[j].abs());
+                    let mut tpp = theta_aux.clone();
+                    let mut tpm = theta_aux.clone();
+                    let mut tmp = theta_aux.clone();
+                    let mut tmm = theta_aux.clone();
+                    tpp[i] += hi;
+                    tpp[j] += hj;
+                    tpm[i] += hi;
+                    tpm[j] -= hj;
+                    tmp[i] -= hi;
+                    tmp[j] += hj;
+                    tmm[i] -= hi;
+                    tmm[j] -= hj;
+                    let fpp = evaluate_aux_cost(&tpp)?;
+                    let fpm = evaluate_aux_cost(&tpm)?;
+                    let fmp = evaluate_aux_cost(&tmp)?;
+                    let fmm = evaluate_aux_cost(&tmm)?;
+                    let hij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+                    h_aux[[i, j]] = hij;
+                    h_aux[[j, i]] = hij;
+                }
+            }
+            let max_diag = h_aux
+                .diag()
+                .iter()
+                .copied()
+                .map(f64::abs)
+                .fold(1.0_f64, f64::max);
+            for i in 0..d {
+                if !h_aux[[i, i]].is_finite() || h_aux[[i, i]] <= 0.0 {
+                    h_aux[[i, i]] = max_diag;
+                }
+            }
+            matrix_inverse_with_regularization(&h_aux, "link parameter covariance")
+        } else {
+            None
+        };
+        let (mix_cov, sas_cov) = if use_mixture {
+            (aux_param_covariance, None)
+        } else if use_sas {
+            (None, aux_param_covariance)
+        } else {
+            (None, None)
+        };
+        (
+            final_rho,
+            final_mix_state,
+            final_sas_state,
+            mix_cov,
+            sas_cov,
+            outer_result,
+        )
     };
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, outer_result.iterations);
@@ -1698,9 +1808,11 @@ where
         mixture_link_components: final_mixture_state.as_ref().map(|s| s.components.clone()),
         mixture_link_rho: final_mixture_state.as_ref().map(|s| s.rho.clone()),
         mixture_link_weights: final_mixture_state.as_ref().map(|s| s.pi.clone()),
+        mixture_link_param_covariance: final_mixture_param_covariance,
         sas_epsilon: final_sas_state.map(|s| s.epsilon),
         sas_log_delta: final_sas_state.map(|s| s.log_delta),
         sas_delta: final_sas_state.map(|s| s.delta),
+        sas_param_covariance: final_sas_param_covariance,
     };
     Ok(conditioning.backtransform_external_result(result))
 }
@@ -2362,9 +2474,13 @@ pub struct FitResult {
     pub mixture_link_components: Option<Vec<LinkComponent>>,
     pub mixture_link_rho: Option<Array1<f64>>,
     pub mixture_link_weights: Option<Array1<f64>>,
+    /// Approximate covariance of mixture free logits (K-1 x K-1), when optimized.
+    pub mixture_link_param_covariance: Option<Array2<f64>>,
     pub sas_epsilon: Option<f64>,
     pub sas_log_delta: Option<f64>,
     pub sas_delta: Option<f64>,
+    /// Approximate covariance of SAS params (epsilon, log_delta), shape 2x2.
+    pub sas_param_covariance: Option<Array2<f64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2738,9 +2854,11 @@ where
         mixture_link_components: result.mixture_link_components,
         mixture_link_rho: result.mixture_link_rho,
         mixture_link_weights: result.mixture_link_weights,
+        mixture_link_param_covariance: result.mixture_link_param_covariance,
         sas_epsilon: result.sas_epsilon,
         sas_log_delta: result.sas_log_delta,
         sas_delta: result.sas_delta,
+        sas_param_covariance: result.sas_param_covariance,
     })
 }
 
