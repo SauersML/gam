@@ -973,6 +973,23 @@ pub fn optimize_external_design_with_heuristic_lambdas<X>(
 where
     X: Into<DesignMatrix>,
 {
+    if matches!(opts.family, crate::types::LikelihoodFamily::BinomialMixture)
+        && opts.mixture_link.is_none()
+    {
+        return Err(EstimationError::InvalidInput(
+            "BinomialMixture requires mixture_link specification".to_string(),
+        ));
+    }
+    let effective_sas_link = if matches!(opts.family, crate::types::LikelihoodFamily::BinomialSas)
+        && opts.sas_link.is_none()
+    {
+        Some(SasLinkSpec {
+            initial_epsilon: 0.0,
+            initial_log_delta: 0.0,
+        })
+    } else {
+        opts.sas_link
+    };
     let x = x.into();
     if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
         return Err(EstimationError::InvalidInput(format!(
@@ -1014,7 +1031,7 @@ where
                 EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
             })?);
     }
-    if let Some(spec) = opts.sas_link {
+    if let Some(spec) = effective_sas_link {
         cfg.sas_link_state = Some(
             state_from_sas_spec(spec)
                 .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
@@ -1088,7 +1105,7 @@ where
         None
     };
     let sas_opt_spec = if opts.optimize_sas {
-        opts.sas_link
+        effective_sas_link
     } else {
         None
     };
@@ -1192,6 +1209,7 @@ where
         };
         let mut smoothing_options_mix = smoothing_options.clone();
         smoothing_options_mix.fd_hessian_max_dim = 0;
+        let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
         let mut reml_eval = RemlState::new_with_offset_shared(
             y_o.view(),
             x_fit_o.clone(),
@@ -1222,7 +1240,7 @@ where
                     d2: 0.0,
                     d3: 0.0,
                 };
-                aux_dim
+                aux_dim_outer
             ]
         } else {
             Vec::new()
@@ -2518,7 +2536,7 @@ pub use crate::inference::predict::{
     CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
     coefficient_uncertainty, coefficient_uncertainty_with_mode, predict_gam,
-    predict_gam_posterior_mean, predict_gam_with_uncertainty,
+    predict_gam_posterior_mean, predict_gam_posterior_mean_with_fit, predict_gam_with_uncertainty,
 };
 pub use crate::solver::smoothing::{
     SmoothingBfgsOptions, SmoothingBfgsResult, optimize_log_smoothing_with_multistart,
@@ -2542,6 +2560,23 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
+    if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
+        && opts.mixture_link.is_none()
+    {
+        return Err(EstimationError::InvalidInput(
+            "BinomialMixture requires mixture_link specification".to_string(),
+        ));
+    }
+    let effective_sas_link = if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
+        && opts.sas_link.is_none()
+    {
+        Some(SasLinkSpec {
+            initial_epsilon: 0.0,
+            initial_log_delta: 0.0,
+        })
+    } else {
+        opts.sas_link
+    };
     if opts.mixture_link.is_some() && opts.sas_link.is_some() {
         return Err(EstimationError::InvalidInput(
             "mixture_link and sas_link cannot both be set".to_string(),
@@ -2561,7 +2596,7 @@ where
                 ));
             }
         }
-    } else if opts.sas_link.is_some() {
+    } else if effective_sas_link.is_some() {
         match family {
             crate::types::LikelihoodFamily::BinomialLogit
             | crate::types::LikelihoodFamily::BinomialProbit
@@ -2591,7 +2626,7 @@ where
         family: resolved_family,
         mixture_link: opts.mixture_link.clone(),
         optimize_mixture: opts.optimize_mixture,
-        sas_link: opts.sas_link,
+        sas_link: effective_sas_link,
         optimize_sas: opts.optimize_sas,
         max_iter: opts.max_iter,
         tol: opts.tol,
