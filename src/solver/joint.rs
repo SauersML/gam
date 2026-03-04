@@ -159,7 +159,7 @@ pub struct JointModelState<'a> {
     /// Number of constrained basis functions
     n_constrained_basis: usize,
     /// Optional per-observation SE for integrated (GHQ) likelihood.
-    /// When present, uses update_glm_vectors_integrated for uncertainty-aware fitting.
+    /// When present, uses integrated family-dispatched working updates.
     covariate_se: Option<Array1<f64>>,
     quad_ctx: QuadratureContext,
     /// Enable Firth bias reduction for separation protection

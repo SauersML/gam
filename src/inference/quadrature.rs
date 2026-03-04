@@ -471,7 +471,7 @@ fn cloglog_should_prefer_cc(mu: f64, sigma: f64, tol: f64) -> bool {
     // broad or numerically awkward cases continue to use the exact
     // Mellin-Barnes/Gamma representation.
     match cloglog_cc_required_nodes(mu, sigma, tol) {
-        Ok(n) => n <= CLOGLOG_CC_NODE_CAP && n <= CLOGLOG_CC_PREFER_THRESHOLD,
+        Ok(n) => n <= CLOGLOG_CC_PREFER_THRESHOLD,
         Err(_) => false,
     }
 }
@@ -3240,13 +3240,9 @@ mod tests {
         let se = 0.8;
         let clog = cloglog_posterior_mean(&ctx, eta, se);
         let surv = survival_posterior_mean(&ctx, eta, se);
-        let integrated = integrated_inverse_link_mean_and_derivative(
-            &ctx,
-            LinkFunction::CLogLog,
-            eta,
-            se,
-        )
-        .expect("cloglog integrated inverse-link moments should evaluate");
+        let integrated =
+            integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, eta, se)
+                .expect("cloglog integrated inverse-link moments should evaluate");
         assert_eq!(
             integrated.mode,
             IntegratedExpectationMode::ExactSpecialFunction
@@ -3417,8 +3413,9 @@ mod tests {
     #[test]
     fn test_cloglog_dispatch_uses_gamma_backend_for_large_sigma_central_regime() {
         let ctx = QuadratureContext::new();
-        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, -0.2, 0.8)
-            .expect("cloglog integrated inverse-link moments should evaluate");
+        let out =
+            integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, -0.2, 0.8)
+                .expect("cloglog integrated inverse-link moments should evaluate");
         assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
         assert!(out.mean.is_finite());
         assert!(out.dmean_dmu.is_finite());
@@ -3517,9 +3514,8 @@ mod tests {
             .expect_err("state-less SAS moments should error");
         assert!(format!("{sas}").contains("requires SAS link parameters"));
 
-        let mix =
-            integrated_family_moments_jet(&ctx, LikelihoodFamily::BinomialMixture, 0.2, 0.5)
-                .expect_err("state-less mixture moments should error");
+        let mix = integrated_family_moments_jet(&ctx, LikelihoodFamily::BinomialMixture, 0.2, 0.5)
+            .expect_err("state-less mixture moments should error");
         assert!(format!("{mix}").contains("does not support binomial mixture"));
     }
 }

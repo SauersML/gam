@@ -41,7 +41,7 @@ use crate::mixture_link::{
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
-    Coefficients, LinkComponent, LinkFunction, InverseLink, LogSmoothingParamsView, RidgePassport,
+    Coefficients, InverseLink, LinkComponent, LinkFunction, LogSmoothingParamsView, RidgePassport,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -63,9 +63,9 @@ use crate::diagnostics::{
     should_emit_h_min_eig_diag,
 };
 
-// Note: deflate_weights_by_se was removed. We now use integrated (GHQ) likelihood
-// instead of weight deflation. See update_glm_vectors_integrated in pirls.rs.
-// The SE is passed through to PIRLS which properly integrates over uncertainty
+// Note: deflate_weights_by_se was removed. We now use integrated (GHQ)
+// family-dispatched likelihood updates in PIRLS instead of weight deflation.
+// The SE is passed through to PIRLS which integrates over uncertainty
 // in the likelihood, rather than using ad-hoc weight adjustment.
 
 fn faer_frob_inner(a: faer::MatRef<'_, f64>, b: faer::MatRef<'_, f64>) -> f64 {
@@ -1024,10 +1024,9 @@ where
         ));
     }
     if let Some(spec) = opts.mixture_link.as_ref() {
-        cfg.link_kind = InverseLink::Mixture(
-            state_from_spec(spec)
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?,
-        );
+        cfg.link_kind = InverseLink::Mixture(state_from_spec(spec).map_err(|e| {
+            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+        })?);
     }
     if let Some(spec) = effective_sas_link {
         cfg.link_kind = InverseLink::Sas(
@@ -1124,9 +1123,7 @@ where
         final_mixture_param_covariance,
         final_sas_param_covariance,
         outer_result,
-    ) = if mixture_dim > 0
-        && sas_dim > 0
-    {
+    ) = if mixture_dim > 0 && sas_dim > 0 {
         return Err(EstimationError::InvalidInput(
             "simultaneous mixture and SAS optimization is not supported".to_string(),
         ));
@@ -1462,7 +1459,9 @@ where
                     components: mix_spec.components.clone(),
                     initial_rho: final_mix_rho,
                 })
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?,
+                .map_err(|e| {
+                    EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+                })?,
             )
         } else {
             None
@@ -3407,10 +3406,9 @@ where
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
     if let Some(spec) = opts.mixture_link.as_ref() {
-        cfg.link_kind = InverseLink::Mixture(
-            state_from_spec(spec)
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?,
-        );
+        cfg.link_kind = InverseLink::Mixture(state_from_spec(spec).map_err(|e| {
+            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+        })?);
     }
     if let Some(spec) = opts.sas_link {
         cfg.link_kind = InverseLink::Sas(
@@ -3422,7 +3420,7 @@ where
     let w_o = w.to_owned();
     let x_o = x.clone();
     let offset_o = offset.to_owned();
-    let reml_state = RemlState::new_with_offset(
+    let mut reml_state = RemlState::new_with_offset(
         y_o.view(),
         x_o,
         w_o.view(),
@@ -3538,8 +3536,11 @@ where
                 let mix_state = mix_state_eval.as_ref().ok_or_else(|| {
                     EstimationError::InvalidInput("missing blended inverse-link state".to_string())
                 })?;
-                let jet =
-                    mixture_inverse_link_jet_with_rho_partials_into(mix_state, eta[i], &mut mix_partials);
+                let jet = mixture_inverse_link_jet_with_rho_partials_into(
+                    mix_state,
+                    eta[i],
+                    &mut mix_partials,
+                );
                 let mu = jet.mu.clamp(EPS, 1.0 - EPS);
                 let d1 = jet.d1;
                 let d2 = jet.d2;
@@ -3567,7 +3568,8 @@ where
                 let sas = sas_state_eval.ok_or_else(|| {
                     EstimationError::InvalidInput("missing SAS link state".to_string())
                 })?;
-                let jets = sas_inverse_link_jet_with_param_partials(eta[i], sas.epsilon, sas.log_delta);
+                let jets =
+                    sas_inverse_link_jet_with_param_partials(eta[i], sas.epsilon, sas.log_delta);
                 let mu = jets.jet.mu.clamp(EPS, 1.0 - EPS);
                 let d1 = jets.jet.d1;
                 let d2 = jets.jet.d2;

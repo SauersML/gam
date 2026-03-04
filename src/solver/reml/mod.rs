@@ -219,7 +219,8 @@ mod tests {
             state.weights,
             &pr.solve_weights,
             &eta_dot,
-        )?;
+        )
+        .expect("directional working curvature should evaluate for logit");
         let mut wx = x.clone();
         let mut wx_tau = x_tau.clone();
         for i in 0..x.nrows() {

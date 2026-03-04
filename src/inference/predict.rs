@@ -1,13 +1,12 @@
 use crate::estimate::{EstimationError, FitResult};
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    InverseLinkJet, mixture_inverse_link_jet,
-    mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet,
-    sas_inverse_link_jet_with_param_partials, state_from_spec,
+    InverseLinkJet, mixture_inverse_link_jet, mixture_inverse_link_jet_with_rho_partials_into,
+    sas_inverse_link_jet, sas_inverse_link_jet_with_param_partials, state_from_spec,
 };
 use crate::probability::{standard_normal_quantile, try_inverse_link_array};
-use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use crate::types::MixtureLinkSpec;
+use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 pub(crate) fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
@@ -29,8 +28,7 @@ fn apply_family_inverse_link(
             "prediction uncertainty for RoystonParmar is not available in predict_gam".to_string(),
         ));
     }
-    try_inverse_link_array(family, eta.view(), link_kind)
-        .map_err(EstimationError::InvalidInput)
+    try_inverse_link_array(family, eta.view(), link_kind).map_err(EstimationError::InvalidInput)
 }
 
 fn fit_mixture_link_state(
@@ -317,23 +315,27 @@ where
 
     let mean = match family_link_for_integrated_expectation(family) {
         Some(link) => {
-            Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
-                // Prediction-time uncertainty propagation deliberately shares
-                // the same dispatcher as integrated PIRLS:
-                //
-                //   mean_i = E[g^{-1}(Eta_i)],
-                //   Eta_i  ~ N(e, se^2).
-                //
-                // That means every exact/controlled decision for a link is
-                // made once in quadrature.rs and reused here unchanged. This
-                // avoids silent drift where fitting and prediction would apply
-                // different Gaussian-uncertainty mathematics to the same link.
-                crate::quadrature::integrated_inverse_link_mean_and_derivative(
-                    &quad_ctx, link, e, se,
-                )
-                .map_err(|e| EstimationError::InvalidInput(format!("{e}")))?
-                .mean
-            }))
+            let means: Result<Vec<f64>, EstimationError> = eta
+                .iter()
+                .zip(eta_standard_error.iter())
+                .map(|(&e, &se)| {
+                    // Prediction-time uncertainty propagation deliberately shares
+                    // the same dispatcher as integrated PIRLS:
+                    //
+                    //   mean_i = E[g^{-1}(Eta_i)],
+                    //   Eta_i  ~ N(e, se^2).
+                    //
+                    // That means every exact/controlled decision for a link is
+                    // made once in quadrature.rs and reused here unchanged. This
+                    // avoids silent drift where fitting and prediction would apply
+                    // different Gaussian-uncertainty mathematics to the same link.
+                    crate::quadrature::integrated_inverse_link_mean_and_derivative(
+                        &quad_ctx, link, e, se,
+                    )
+                    .map(|v| v.mean)
+                })
+                .collect();
+            Array1::from_vec(means?)
         }
         None => match family {
             crate::types::LikelihoodFamily::GaussianIdentity => eta.clone(),
@@ -638,30 +640,42 @@ where
         let mut mean_var = match family {
             crate::types::LikelihoodFamily::GaussianIdentity => eta_var[i].max(0.0),
             crate::types::LikelihoodFamily::BinomialLogit => {
-                let (_, v) = crate::quadrature::logit_posterior_mean_variance(&quad_ctx, eta[i], se_i);
+                let (_, v) =
+                    crate::quadrature::logit_posterior_mean_variance(&quad_ctx, eta[i], se_i);
                 v.max(0.0)
             }
             crate::types::LikelihoodFamily::BinomialProbit => {
-                let (_, v) = crate::quadrature::probit_posterior_mean_variance(&quad_ctx, eta[i], se_i);
+                let (_, v) =
+                    crate::quadrature::probit_posterior_mean_variance(&quad_ctx, eta[i], se_i);
                 v.max(0.0)
             }
             crate::types::LikelihoodFamily::BinomialCLogLog => {
-                let (_, v) = crate::quadrature::cloglog_posterior_mean_variance(&quad_ctx, eta[i], se_i);
+                let (_, v) =
+                    crate::quadrature::cloglog_posterior_mean_variance(&quad_ctx, eta[i], se_i);
                 v.max(0.0)
             }
             crate::types::LikelihoodFamily::BinomialSas => {
                 let (epsilon, log_delta) = sas_params.ok_or_else(|| {
                     EstimationError::InvalidInput(
-                        "BinomialSas uncertainty requires fitted sas_epsilon/sas_log_delta".to_string(),
+                        "BinomialSas uncertainty requires fitted sas_epsilon/sas_log_delta"
+                            .to_string(),
                     )
                 })?;
-                let m1 = crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, eta[i], se_i, |x| {
-                    sas_inverse_link_jet(x, epsilon, log_delta).mu
-                });
-                let m2 = crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, eta[i], se_i, |x| {
-                    let p = sas_inverse_link_jet(x, epsilon, log_delta).mu;
-                    p * p
-                });
+                let m1 = crate::quadrature::normal_expectation_1d_adaptive(
+                    &quad_ctx,
+                    eta[i],
+                    se_i,
+                    |x| sas_inverse_link_jet(x, epsilon, log_delta).mu,
+                );
+                let m2 = crate::quadrature::normal_expectation_1d_adaptive(
+                    &quad_ctx,
+                    eta[i],
+                    se_i,
+                    |x| {
+                        let p = sas_inverse_link_jet(x, epsilon, log_delta).mu;
+                        p * p
+                    },
+                );
                 (m2 - m1 * m1).max(0.0)
             }
             crate::types::LikelihoodFamily::BinomialMixture => {
@@ -671,13 +685,21 @@ where
                             .to_string(),
                     )
                 })?;
-                let m1 = crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, eta[i], se_i, |x| {
-                    mixture_inverse_link_jet(state, x).mu
-                });
-                let m2 = crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, eta[i], se_i, |x| {
-                    let p = mixture_inverse_link_jet(state, x).mu;
-                    p * p
-                });
+                let m1 = crate::quadrature::normal_expectation_1d_adaptive(
+                    &quad_ctx,
+                    eta[i],
+                    se_i,
+                    |x| mixture_inverse_link_jet(state, x).mu,
+                );
+                let m2 = crate::quadrature::normal_expectation_1d_adaptive(
+                    &quad_ctx,
+                    eta[i],
+                    se_i,
+                    |x| {
+                        let p = mixture_inverse_link_jet(state, x).mu;
+                        p * p
+                    },
+                );
                 (m2 - m1 * m1).max(0.0)
             }
             crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
@@ -709,7 +731,8 @@ where
                     state.rho.len()
                 ];
             }
-            let _ = mixture_inverse_link_jet_with_rho_partials_into(state, eta[i], &mut mix_partials);
+            let _ =
+                mixture_inverse_link_jet_with_rho_partials_into(state, eta[i], &mut mix_partials);
             let g = mix_partials.iter().map(|p| p.mu).collect::<Vec<_>>();
             mean_var += quadratic_form(cov_theta, &g);
         }
