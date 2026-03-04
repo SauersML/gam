@@ -22,6 +22,7 @@ pub struct SparseExactFactor {
 #[derive(Clone, Default)]
 pub struct SparseTraceWorkspace {
     rhs: Vec<f64>,
+    selected_block_inv_cache: BTreeMap<(usize, usize), Array2<f64>>,
 }
 
 #[derive(Clone)]
@@ -30,7 +31,10 @@ pub struct SparsePenaltyBlock {
     pub p_start: usize,
     pub p_end: usize,
     pub positive_eigenvalues: Arc<Vec<f64>>,
+    pub block_support_strict: bool,
     pub s_k_sparse: SparseColMat<usize, f64>,
+    pub s_k_block_dense: Arc<Array2<f64>>,
+    pub s_k_block_upper_entries: Arc<Vec<(usize, usize, f64)>>,
     pub r_k_sparse: SparseColMat<usize, f64>,
     r_k_rows: Arc<SparseRowMat<usize, f64>>,
 }
@@ -50,6 +54,41 @@ impl SparseTraceWorkspace {
         self.rhs.fill(0.0);
         &mut self.rhs
     }
+
+    pub(crate) fn selected_block_inverse(
+        &mut self,
+        factor: &SparseExactFactor,
+        p_start: usize,
+        p_end: usize,
+    ) -> Result<&Array2<f64>, EstimationError> {
+        if p_end <= p_start || p_end > factor.n {
+            return Err(EstimationError::InvalidInput(format!(
+                "invalid selected-inverse block [{p_start},{p_end}) for dimension {}",
+                factor.n
+            )));
+        }
+        let key = (p_start, p_end);
+        if !self.selected_block_inv_cache.contains_key(&key) {
+            let block_dim = p_end - p_start;
+            let mut rhs = Array2::<f64>::zeros((factor.n, block_dim));
+            for j in 0..block_dim {
+                rhs[[p_start + j, j]] = 1.0;
+            }
+            let solved = solve_sparse_spd_multi(factor, &rhs)?;
+            let block = solved.slice(ndarray::s![p_start..p_end, ..]).to_owned();
+            self.selected_block_inv_cache.insert(key, block);
+        }
+        self.selected_block_inv_cache.get(&key).ok_or_else(|| {
+            EstimationError::InvalidInput("selected inverse block cache lookup failed".to_string())
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SparseOperatorBlockSupport {
+    pub p_start: usize,
+    pub p_end: usize,
+    pub strict: bool,
 }
 
 pub fn dense_to_sparse(
@@ -334,6 +373,37 @@ pub fn trace_hinv_sk(
     workspace: &mut SparseTraceWorkspace,
     penalty: &SparsePenaltyBlock,
 ) -> Result<f64, EstimationError> {
+    // Selected-inversion style path:
+    // For block-local spline penalties S_k (and their roots R_k), we only need
+    // H^{-1} entries on that block support. We compute and cache
+    // H^{-1}[p_start:p_end, p_start:p_end] exactly by solving for identity columns
+    // in that block once, then reuse across all row quadratics in tr(R_k H^{-1} R_k^T).
+    if penalty.block_support_strict && penalty.p_end > penalty.p_start {
+        let p_start = penalty.p_start;
+        let p_end = penalty.p_end;
+        let h_block = workspace.selected_block_inverse(factor, p_start, p_end)?;
+        let s_block = penalty.s_k_block_dense.as_ref();
+        if h_block.raw_dim() != s_block.raw_dim() {
+            return Err(EstimationError::InvalidInput(format!(
+                "selected block inverse and penalty block dimension mismatch: H={}x{}, S={}x{}",
+                h_block.nrows(),
+                h_block.ncols(),
+                s_block.nrows(),
+                s_block.ncols()
+            )));
+        }
+        let mut total = 0.0_f64;
+        for &(i, j, value) in penalty.s_k_block_upper_entries.iter() {
+            if i == j {
+                total += h_block[[i, j]] * value;
+            } else {
+                // H^{-1} and S are symmetric on this SPD branch.
+                total += 2.0 * h_block[[i, j]] * value;
+            }
+        }
+        return Ok(total);
+    }
+
     let symbolic = penalty.r_k_rows.symbolic();
     let row_ptr = symbolic.row_ptr();
     let col_idx = symbolic.col_idx();
@@ -356,21 +426,27 @@ pub fn leverages_from_factor(
     factor: &SparseExactFactor,
     x: &DesignMatrix,
 ) -> Result<Array1<f64>, EstimationError> {
-    let mut workspace = SparseTraceWorkspace::default();
+    const LEVERAGE_BATCH: usize = 32;
     match x {
         DesignMatrix::Dense(matrix) => {
             let mut out = Array1::<f64>::zeros(matrix.nrows());
-            for row in 0..matrix.nrows() {
-                let mut idx = Vec::new();
-                let mut val = Vec::new();
-                for col in 0..matrix.ncols() {
-                    let x_ij = matrix[[row, col]];
-                    if x_ij.abs() > ZERO_TOL {
-                        idx.push(col);
-                        val.push(x_ij);
-                    }
+            let p = matrix.ncols();
+            let n = matrix.nrows();
+            let mut start = 0usize;
+            while start < n {
+                let end = (start + LEVERAGE_BATCH).min(n);
+                let cols = end - start;
+                let mut rhs = Array2::<f64>::zeros((p, cols));
+                for local_col in 0..cols {
+                    let row = start + local_col;
+                    rhs.column_mut(local_col).assign(&matrix.row(row).t());
                 }
-                out[row] = sparse_row_quadratic_form(factor, &mut workspace, &idx, &val)?;
+                let solved = solve_sparse_spd_multi(factor, &rhs)?;
+                for local_col in 0..cols {
+                    let row = start + local_col;
+                    out[row] = matrix.row(row).dot(&solved.column(local_col));
+                }
+                start = end;
             }
             Ok(out)
         }
@@ -385,15 +461,33 @@ pub fn leverages_from_factor(
             let col_idx = symbolic.col_idx();
             let values = csr.val();
             let mut out = Array1::<f64>::zeros(csr.nrows());
-            for row in 0..csr.nrows() {
-                let start = row_ptr[row];
-                let end = row_ptr[row + 1];
-                out[row] = sparse_row_quadratic_form(
-                    factor,
-                    &mut workspace,
-                    &col_idx[start..end],
-                    &values[start..end],
-                )?;
+            let p = csr.ncols();
+            let n = csr.nrows();
+            let mut start_row = 0usize;
+            while start_row < n {
+                let end_row = (start_row + LEVERAGE_BATCH).min(n);
+                let cols = end_row - start_row;
+                let mut rhs = Array2::<f64>::zeros((p, cols));
+                for local_col in 0..cols {
+                    let row = start_row + local_col;
+                    let r0 = row_ptr[row];
+                    let r1 = row_ptr[row + 1];
+                    for idx in r0..r1 {
+                        rhs[[col_idx[idx], local_col]] = values[idx];
+                    }
+                }
+                let solved = solve_sparse_spd_multi(factor, &rhs)?;
+                for local_col in 0..cols {
+                    let row = start_row + local_col;
+                    let r0 = row_ptr[row];
+                    let r1 = row_ptr[row + 1];
+                    let mut quad = 0.0_f64;
+                    for idx in r0..r1 {
+                        quad += values[idx] * solved[[col_idx[idx], local_col]];
+                    }
+                    out[row] = quad;
+                }
+                start_row = end_row;
             }
             Ok(out)
         }
@@ -464,6 +558,39 @@ pub fn build_sparse_penalty_blocks(
     for (term_index, p_start, p_end) in ranges {
         let s_k = &s_list[term_index];
         let r_k = &r_list[term_index];
+        let block_support_strict = if p_end > p_start {
+            let mut ok = true;
+            for row in 0..s_k.nrows() {
+                for col in 0..s_k.ncols() {
+                    if s_k[[row, col]].abs() > ZERO_TOL
+                        && (row < p_start || row >= p_end || col < p_start || col >= p_end)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            ok
+        } else {
+            true
+        };
+        let s_k_block_dense = if p_end > p_start {
+            s_k.slice(ndarray::s![p_start..p_end, p_start..p_end]).to_owned()
+        } else {
+            Array2::<f64>::zeros((0, 0))
+        };
+        let mut s_k_block_upper_entries = Vec::<(usize, usize, f64)>::new();
+        for col in 0..s_k_block_dense.ncols() {
+            for row in 0..=col {
+                let value = s_k_block_dense[[row, col]];
+                if value.abs() > ZERO_TOL {
+                    s_k_block_upper_entries.push((row, col, value));
+                }
+            }
+        }
         let s_k_sparse = dense_to_sparse(s_k, ZERO_TOL)?;
         let r_k_sparse = dense_to_sparse(r_k, ZERO_TOL)?;
         let r_k_rows = Arc::new(r_k_sparse.as_ref().to_row_major().map_err(|_| {
@@ -488,7 +615,10 @@ pub fn build_sparse_penalty_blocks(
             p_start,
             p_end,
             positive_eigenvalues: Arc::new(positive_eigenvalues),
+            block_support_strict,
             s_k_sparse,
+            s_k_block_dense: Arc::new(s_k_block_dense),
+            s_k_block_upper_entries: Arc::new(s_k_block_upper_entries),
             r_k_sparse,
             r_k_rows,
         });
@@ -501,4 +631,78 @@ pub fn sparse_matvec_public(
     vector: &Array1<f64>,
 ) -> Array1<f64> {
     sparse_matvec(matrix, vector)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn approx_eq(a: f64, b: f64, tol: f64) {
+        assert!(
+            (a - b).abs() <= tol,
+            "values differ: left={a:.12e}, right={b:.12e}, |diff|={:.12e}, tol={tol:.12e}",
+            (a - b).abs()
+        );
+    }
+
+    #[test]
+    fn trace_hinv_sk_fast_path_matches_fallback() {
+        let h = array![
+            [4.0, 0.2, 0.0, 0.0],
+            [0.2, 3.0, 0.1, 0.0],
+            [0.0, 0.1, 2.5, 0.3],
+            [0.0, 0.0, 0.3, 2.0]
+        ];
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&h_sparse).unwrap();
+
+        // Penalty support is the middle 2x2 block.
+        let mut s = Array2::<f64>::zeros((4, 4));
+        s[[1, 1]] = 2.0;
+        s[[2, 2]] = 3.0;
+        let mut r = Array2::<f64>::zeros((4, 4));
+        r[[1, 1]] = 2.0_f64.sqrt();
+        r[[2, 2]] = 3.0_f64.sqrt();
+
+        let blocks = build_sparse_penalty_blocks(&[s], &[r])
+            .unwrap()
+            .expect("single local block expected");
+        let base = blocks[0].clone();
+
+        let mut strict_block = base.clone();
+        strict_block.block_support_strict = true;
+        let mut fallback_block = base.clone();
+        fallback_block.block_support_strict = false;
+
+        let mut ws = SparseTraceWorkspace::default();
+        let fast = trace_hinv_sk(&factor, &mut ws, &strict_block).unwrap();
+        let fallback = trace_hinv_sk(&factor, &mut ws, &fallback_block).unwrap();
+        approx_eq(fast, fallback, 1e-10);
+    }
+
+    #[test]
+    fn selected_block_inverse_cache_reused_for_same_block() {
+        let h = array![[3.0, 0.1, 0.0], [0.1, 2.0, 0.2], [0.0, 0.2, 1.5]];
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+        let factor = factorize_sparse_spd(&h_sparse).unwrap();
+        let mut ws = SparseTraceWorkspace::default();
+
+        let first = ws
+            .selected_block_inverse(&factor, 1, 3)
+            .unwrap()
+            .clone();
+        assert_eq!(ws.selected_block_inv_cache.len(), 1);
+        let second = ws
+            .selected_block_inverse(&factor, 1, 3)
+            .unwrap()
+            .clone();
+        assert_eq!(ws.selected_block_inv_cache.len(), 1);
+        assert_eq!(first.raw_dim(), second.raw_dim());
+        for i in 0..first.nrows() {
+            for j in 0..first.ncols() {
+                approx_eq(first[[i, j]], second[[i, j]], 0.0);
+            }
+        }
+    }
 }
