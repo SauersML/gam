@@ -1766,7 +1766,7 @@ pub fn run_nuts_sampling_flattened_family(
                 .to_string(),
         ),
         (LikelihoodFamily::BinomialMixture, FamilyNutsInputs::Glm(_)) => Err(
-            "BinomialMixture NUTS is not implemented yet; use fit_gam/predict_gam for mixture-link models"
+            "BinomialMixture NUTS is not implemented yet; use fit_gam/predict_gam for blended inverse-link models"
                 .to_string(),
         ),
         (LikelihoodFamily::BinomialSas, FamilyNutsInputs::Glm(_)) => Err(

@@ -105,7 +105,7 @@ struct FitArgs {
     family: FamilyArg,
     #[arg(long = "link")]
     link: Option<String>,
-    /// Optional comma-separated initial free logits for mixture links (length K-1).
+    /// Optional comma-separated initial free logits for blended inverse links (length K-1).
     #[arg(long = "mixture-rho")]
     mixture_rho: Option<String>,
     /// Optional initial SAS params as `epsilon,log_delta` (used with `--link sas`).
@@ -519,13 +519,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             })
         } else {
             if args.mixture_rho.is_some() {
-                return Err("--mixture-rho requires --link mixture(...)".to_string());
+                return Err("--mixture-rho requires --link blended(...)".to_string());
             }
             None
         }
     } else {
         if args.mixture_rho.is_some() {
-            return Err("--mixture-rho requires --link mixture(...)".to_string());
+            return Err("--mixture-rho requires --link blended(...)".to_string());
         }
         None
     };
@@ -1971,7 +1971,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     );
     let (eta, mean, se_opt) = if family == LikelihoodFamily::BinomialMixture {
         let state = saved_mixture.as_ref().ok_or_else(|| {
-            "saved binomial-mixture model is missing mixture link state".to_string()
+            "saved binomial-blended-inverse-link model is missing blended-link state".to_string()
         })?;
         let mut eta = design.design.dot(&beta);
         eta += &offset;
@@ -5858,10 +5858,25 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
         }));
     };
     let t = v.trim().to_ascii_lowercase();
+    if let Some(inner) = t.strip_prefix("blended(").and_then(|s| s.strip_suffix(')')) {
+        if flexible_flag {
+            return Err(
+                "--flexible-link cannot be combined with --link blended(...); blended inverse links are not flexible-link mode"
+                    .to_string(),
+            );
+        }
+        let components = parse_link_component_list(inner)?;
+        return Ok(Some(LinkChoice {
+            mode: LinkMode::Strict,
+            link: LinkFunction::Logit,
+            mixture_components: Some(components),
+        }));
+    }
+    // Backward-compatible alias for older CLI usage.
     if let Some(inner) = t.strip_prefix("mixture(").and_then(|s| s.strip_suffix(')')) {
         if flexible_flag {
             return Err(
-                "--flexible-link cannot be combined with --link mixture(...); mixture links are not flexible-link mode"
+                "--flexible-link cannot be combined with --link blended(...); blended inverse links are not flexible-link mode"
                     .to_string(),
             );
         }
@@ -5904,7 +5919,7 @@ fn parse_link_component(v: &str) -> Result<LinkComponent, String> {
         "loglog" => Ok(LinkComponent::LogLog),
         "cauchit" => Ok(LinkComponent::Cauchit),
         other => Err(format!(
-            "unsupported mixture link component '{other}'; use probit|logit|cloglog|loglog|cauchit"
+            "unsupported blended-link component '{other}'; use probit|logit|cloglog|loglog|cauchit"
         )),
     }
 }
@@ -5918,12 +5933,12 @@ fn parse_link_component_list(v: &str) -> Result<Vec<LinkComponent>, String> {
         }
         let comp = parse_link_component(trimmed)?;
         if out.contains(&comp) {
-            return Err("mixture(...) cannot contain duplicate components".to_string());
+            return Err("blended(...) cannot contain duplicate components".to_string());
         }
         out.push(comp);
     }
     if out.len() < 2 {
-        return Err("mixture(...) requires at least two components".to_string());
+        return Err("blended(...) requires at least two components".to_string());
     }
     Ok(out)
 }
@@ -5955,7 +5970,7 @@ fn saved_mixture_link_spec(model: &SavedModel) -> Result<Option<MixtureLinkSpec>
         components.push(parse_link_component(name)?);
     }
     if components.len() < 2 {
-        return Err("saved mixture link has fewer than 2 components".to_string());
+        return Err("saved blended-link spec has fewer than 2 components".to_string());
     }
     let expected = components.len() - 1;
     let rho_vec = model
@@ -5964,7 +5979,7 @@ fn saved_mixture_link_spec(model: &SavedModel) -> Result<Option<MixtureLinkSpec>
         .unwrap_or_else(|| vec![0.0; expected]);
     if rho_vec.len() != expected {
         return Err(format!(
-            "saved mixture link rho length mismatch: expected {expected}, got {}",
+            "saved blended-link rho length mismatch: expected {expected}, got {}",
             rho_vec.len()
         ));
     }
@@ -5986,18 +6001,18 @@ fn saved_sas_params(model: &SavedModel) -> Option<(f64, f64)> {
 }
 
 fn saved_mixture_state(model: &SavedModel) -> Result<Option<gam::types::MixtureLinkState>, String> {
-    if model.family != "binomial-mixture" {
+    if model.family != "binomial-blended-inverse-link" && model.family != "binomial-mixture" {
         return Ok(None);
     }
     let Some(spec) = saved_mixture_link_spec(model)? else {
         return Err(
-            "saved binomial-mixture model is missing mixture_link_components/mixture_link_rho"
+            "saved binomial-blended-inverse-link model is missing mixture_link_components/mixture_link_rho"
                 .to_string(),
         );
     };
     state_from_spec(&spec)
         .map(Some)
-        .map_err(|e| format!("invalid saved mixture link state: {e}"))
+        .map_err(|e| format!("invalid saved blended-link state: {e}"))
 }
 
 fn parse_link_name(v: &str) -> Result<LinkFunction, String> {
@@ -6008,7 +6023,7 @@ fn parse_link_name(v: &str) -> Result<LinkFunction, String> {
         "cloglog" => Ok(LinkFunction::CLogLog),
         "sas" => Ok(LinkFunction::Sas),
         other => Err(format!(
-            "unsupported --link '{other}'; use identity|logit|probit|cloglog|sas or flexible(...)"
+            "unsupported --link '{other}'; use identity|logit|probit|cloglog|sas|blended(...) or flexible(...)"
         )),
     }
 }
@@ -6036,7 +6051,7 @@ fn link_choice_to_string(choice: &LinkChoice) -> String {
             })
             .collect::<Vec<_>>()
             .join(",");
-        return format!("mixture({names})");
+        return format!("blended({names})");
     }
     match choice.mode {
         LinkMode::Strict => link_name(choice.link).to_string(),
@@ -6059,7 +6074,7 @@ fn family_to_string(f: LikelihoodFamily) -> &'static str {
         LikelihoodFamily::BinomialProbit => "binomial-probit",
         LikelihoodFamily::BinomialCLogLog => "binomial-cloglog",
         LikelihoodFamily::BinomialSas => "binomial-sas",
-        LikelihoodFamily::BinomialMixture => "binomial-mixture",
+        LikelihoodFamily::BinomialMixture => "binomial-blended-inverse-link",
         LikelihoodFamily::RoystonParmar => "royston-parmar",
     }
 }
@@ -6071,7 +6086,9 @@ fn family_from_string(v: &str) -> Result<LikelihoodFamily, String> {
         "binomial-probit" => Ok(LikelihoodFamily::BinomialProbit),
         "binomial-cloglog" => Ok(LikelihoodFamily::BinomialCLogLog),
         "binomial-sas" => Ok(LikelihoodFamily::BinomialSas),
-        "binomial-mixture" => Ok(LikelihoodFamily::BinomialMixture),
+        "binomial-blended-inverse-link" | "binomial-mixture" => {
+            Ok(LikelihoodFamily::BinomialMixture)
+        }
         "royston-parmar" => Ok(LikelihoodFamily::RoystonParmar),
         _ => Err(format!("unsupported saved family '{v}'")),
     }
@@ -6161,7 +6178,7 @@ fn pretty_family_name(f: LikelihoodFamily) -> &'static str {
         LikelihoodFamily::BinomialProbit => "Binomial Probit",
         LikelihoodFamily::BinomialCLogLog => "Binomial CLogLog",
         LikelihoodFamily::BinomialSas => "Binomial SAS",
-        LikelihoodFamily::BinomialMixture => "Binomial Mixture",
+        LikelihoodFamily::BinomialMixture => "Binomial Blended Inverse-Link",
         LikelihoodFamily::RoystonParmar => "Royston Parmar",
     }
 }
