@@ -91,11 +91,18 @@ pub fn inverse_link_array(family: LikelihoodFamily, eta: ArrayView1<'_, f64>) ->
             let z = v.clamp(-30.0, 30.0);
             1.0 - (-(z.exp())).exp()
         }),
-        LikelihoodFamily::BinomialSas => eta.mapv(normal_cdf_approx),
-        LikelihoodFamily::BinomialMixture => eta.mapv(|v| {
-            let z = v.clamp(-30.0, 30.0);
-            1.0 / (1.0 + (-z).exp())
-        }),
+        LikelihoodFamily::BinomialSas => {
+            panic!(
+                "inverse_link_array(BinomialSas) requires SAS link parameters; \
+                 use SAS-state-aware prediction helpers"
+            )
+        }
+        LikelihoodFamily::BinomialMixture => {
+            panic!(
+                "inverse_link_array(BinomialMixture) requires mixture link state; \
+                 use mixture-state-aware prediction helpers"
+            )
+        }
         LikelihoodFamily::RoystonParmar => eta.to_owned(),
     }
 }
