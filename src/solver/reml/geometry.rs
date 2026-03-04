@@ -774,6 +774,12 @@ impl<'a> RemlState<'a> {
 
         let beta = self.sparse_exact_beta_original(pirls_result);
         let lambdas = rho.mapv(f64::exp);
+        // `c`/`d` are not decorative diagnostics: they are the per-observation
+        // higher-order likelihood carriers reused by exact outer derivatives.
+        // Here they parameterize:
+        //   H_k   = A_k + X' diag(c ⊙ z_k) X
+        //   H_k,l = A_k,l + X' diag(d ⊙ z_k ⊙ z_l + c ⊙ z_k,l) X
+        // so they are exactly the information corresponding to -ℓ''' / -ℓ''''.
         let c = &pirls_result.solve_c_array;
         let d = &pirls_result.solve_d_array;
         if c.len() != n_obs || d.len() != n_obs {

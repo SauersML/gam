@@ -21,8 +21,8 @@ pub struct SparseExactFactor {
 
 #[derive(Clone, Default)]
 pub struct SparseTraceWorkspace {
-    rhs: Vec<f64>,
     selected_block_inv_cache: BTreeMap<(usize, usize), Array2<f64>>,
+    selected_support_inv_cache: BTreeMap<Vec<usize>, Array2<f64>>,
 }
 
 #[derive(Clone)]
@@ -47,14 +47,6 @@ pub struct SparsePenalizedSystem {
 }
 
 impl SparseTraceWorkspace {
-    fn rhs_slice(&mut self, len: usize) -> &mut [f64] {
-        if self.rhs.len() != len {
-            self.rhs.resize(len, 0.0);
-        }
-        self.rhs.fill(0.0);
-        &mut self.rhs
-    }
-
     pub(crate) fn selected_block_inverse(
         &mut self,
         factor: &SparseExactFactor,
@@ -80,6 +72,53 @@ impl SparseTraceWorkspace {
         }
         self.selected_block_inv_cache.get(&key).ok_or_else(|| {
             EstimationError::InvalidInput("selected inverse block cache lookup failed".to_string())
+        })
+    }
+
+    fn canonical_support(
+        support: &[usize],
+        n: usize,
+    ) -> Result<Vec<usize>, EstimationError> {
+        let mut key = support.to_vec();
+        key.sort_unstable();
+        key.dedup();
+        if let Some(&bad) = key.iter().find(|&&idx| idx >= n) {
+            return Err(EstimationError::InvalidInput(format!(
+                "selected-inverse support index {bad} out of bounds for dimension {n}"
+            )));
+        }
+        Ok(key)
+    }
+
+    pub(crate) fn selected_support_inverse(
+        &mut self,
+        factor: &SparseExactFactor,
+        support: &[usize],
+    ) -> Result<&Array2<f64>, EstimationError> {
+        let key = Self::canonical_support(support, factor.n)?;
+        if key.is_empty() {
+            self.selected_support_inv_cache
+                .entry(key.clone())
+                .or_insert_with(|| Array2::<f64>::zeros((0, 0)));
+        } else if !self.selected_support_inv_cache.contains_key(&key) {
+            let m = key.len();
+            let mut rhs = Array2::<f64>::zeros((factor.n, m));
+            for (j, &idx) in key.iter().enumerate() {
+                rhs[[idx, j]] = 1.0;
+            }
+            let solved = solve_sparse_spd_multi(factor, &rhs)?;
+            let mut sub = Array2::<f64>::zeros((m, m));
+            for (i_local, &i_global) in key.iter().enumerate() {
+                for j_local in 0..m {
+                    sub[[i_local, j_local]] = solved[[i_global, j_local]];
+                }
+            }
+            self.selected_support_inv_cache.insert(key.clone(), sub);
+        }
+        self.selected_support_inv_cache.get(&key).ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "selected inverse support cache lookup failed".to_string(),
+            )
         })
     }
 }
@@ -197,23 +236,37 @@ pub fn sparse_symmetric_upper_matvec_public(
     out
 }
 
-fn sparse_row_quadratic_form(
-    factor: &SparseExactFactor,
-    workspace: &mut SparseTraceWorkspace,
+fn sparse_row_quadratic_form_from_selected_inverse(
     row_idx: &[usize],
     row_val: &[f64],
+    support_pos: &BTreeMap<usize, usize>,
+    h_support: &Array2<f64>,
 ) -> Result<f64, EstimationError> {
-    let rhs = workspace.rhs_slice(factor.n);
-    for (idx, &value) in row_idx.iter().zip(row_val.iter()) {
-        rhs[*idx] = value;
+    if row_idx.len() != row_val.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "row quadratic form support/value length mismatch: idx={}, val={}",
+            row_idx.len(),
+            row_val.len()
+        )));
     }
-    let rhs_arr =
-        Array2::from_shape_vec((factor.n, 1), rhs.to_vec()).expect("rhs vector should reshape");
-    let rhs_view = FaerArrayView::new(&rhs_arr);
-    let solved = factor.factor.solve(rhs_view.as_ref());
     let mut quad = 0.0_f64;
-    for (&idx, &value) in row_idx.iter().zip(row_val.iter()) {
-        quad += value * solved[(idx, 0)];
+    for (a, &ia) in row_idx.iter().enumerate() {
+        let pa = support_pos.get(&ia).ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "row support index {} missing from selected-inverse support map",
+                ia
+            ))
+        })?;
+        let va = row_val[a];
+        for (b, &ib) in row_idx.iter().enumerate() {
+            let pb = support_pos.get(&ib).ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "row support index {} missing from selected-inverse support map",
+                    ib
+                ))
+            })?;
+            quad += va * h_support[[*pa, *pb]] * row_val[b];
+        }
     }
     Ok(quad)
 }
@@ -408,15 +461,28 @@ pub fn trace_hinv_sk(
     let row_ptr = symbolic.row_ptr();
     let col_idx = symbolic.col_idx();
     let values = penalty.r_k_rows.val();
+
+    // Takahashi-style selected support route (exact): build H^{-1}_{J,J} once
+    // for J = union(support(R_k)), then evaluate all row quadratics using only
+    // selected inverse entries.
+    let mut support = col_idx.to_vec();
+    support.sort_unstable();
+    support.dedup();
+    let h_support = workspace.selected_support_inverse(factor, &support)?;
+    let mut support_pos = BTreeMap::<usize, usize>::new();
+    for (pos, &idx) in support.iter().enumerate() {
+        support_pos.insert(idx, pos);
+    }
+
     let mut total = 0.0_f64;
     for row in 0..penalty.r_k_rows.nrows() {
         let start = row_ptr[row];
         let end = row_ptr[row + 1];
-        total += sparse_row_quadratic_form(
-            factor,
-            workspace,
+        total += sparse_row_quadratic_form_from_selected_inverse(
             &col_idx[start..end],
             &values[start..end],
+            &support_pos,
+            h_support,
         )?;
     }
     Ok(total)
@@ -456,38 +522,27 @@ pub fn leverages_from_factor(
                     "failed to build CSR cache for sparse design".to_string(),
                 )
             })?;
+            let mut workspace = SparseTraceWorkspace::default();
             let symbolic = csr.symbolic();
             let row_ptr = symbolic.row_ptr();
             let col_idx = symbolic.col_idx();
             let values = csr.val();
             let mut out = Array1::<f64>::zeros(csr.nrows());
-            let p = csr.ncols();
             let n = csr.nrows();
-            let mut start_row = 0usize;
-            while start_row < n {
-                let end_row = (start_row + LEVERAGE_BATCH).min(n);
-                let cols = end_row - start_row;
-                let mut rhs = Array2::<f64>::zeros((p, cols));
-                for local_col in 0..cols {
-                    let row = start_row + local_col;
-                    let r0 = row_ptr[row];
-                    let r1 = row_ptr[row + 1];
-                    for idx in r0..r1 {
-                        rhs[[col_idx[idx], local_col]] = values[idx];
+            for row in 0..n {
+                let r0 = row_ptr[row];
+                let r1 = row_ptr[row + 1];
+                let idx = &col_idx[r0..r1];
+                let val = &values[r0..r1];
+                let h_row = workspace.selected_support_inverse(factor, idx)?;
+                let mut quad = 0.0_f64;
+                for i in 0..idx.len() {
+                    let vi = val[i];
+                    for j in 0..idx.len() {
+                        quad += vi * h_row[[i, j]] * val[j];
                     }
                 }
-                let solved = solve_sparse_spd_multi(factor, &rhs)?;
-                for local_col in 0..cols {
-                    let row = start_row + local_col;
-                    let r0 = row_ptr[row];
-                    let r1 = row_ptr[row + 1];
-                    let mut quad = 0.0_f64;
-                    for idx in r0..r1 {
-                        quad += values[idx] * solved[[col_idx[idx], local_col]];
-                    }
-                    out[row] = quad;
-                }
-                start_row = end_row;
+                out[row] = quad;
             }
             Ok(out)
         }
