@@ -6,7 +6,7 @@ use crate::mixture_link::{
     sas_inverse_link_jet_with_param_partials, state_from_spec,
 };
 use crate::probability::{standard_normal_quantile, try_inverse_link_array};
-use crate::types::LinkFunction;
+use crate::types::{LinkFunction, LinkKind, SasLinkState};
 use crate::types::MixtureLinkSpec;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -22,15 +22,14 @@ pub(crate) fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
 fn apply_family_inverse_link(
     eta: &Array1<f64>,
     family: crate::types::LikelihoodFamily,
-    mixture_state: Option<&crate::types::MixtureLinkState>,
-    sas_params: Option<(f64, f64)>,
+    link_kind: Option<&LinkKind>,
 ) -> Result<Array1<f64>, EstimationError> {
     if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
         return Err(EstimationError::InvalidInput(
             "prediction uncertainty for RoystonParmar is not available in predict_gam".to_string(),
         ));
     }
-    try_inverse_link_array(family, eta.view(), mixture_state, sas_params)
+    try_inverse_link_array(family, eta.view(), link_kind)
         .map_err(EstimationError::InvalidInput)
 }
 
@@ -241,7 +240,7 @@ where
     let mut eta = x.matrix_vector_multiply(&beta.to_owned());
     eta += &offset;
 
-    let mean = apply_family_inverse_link(&eta, family, None, None)?;
+    let mean = apply_family_inverse_link(&eta, family, None)?;
 
     Ok(PredictResult { eta, mean })
 }
@@ -579,7 +578,18 @@ where
     eta += &offset;
     let mixture_state = fit_mixture_link_state(fit)?;
     let sas_params = fit.sas_epsilon.zip(fit.sas_log_delta);
-    let mean = apply_family_inverse_link(&eta, family, mixture_state.as_ref(), sas_params)?;
+    let link_kind = if let Some(state) = mixture_state.clone() {
+        Some(LinkKind::Mixture(state))
+    } else {
+        sas_params.map(|(epsilon, log_delta)| {
+            LinkKind::Sas(SasLinkState {
+                epsilon,
+                log_delta,
+                delta: log_delta.exp(),
+            })
+        })
+    };
+    let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;
 
     let eta_var = linear_predictor_variance(&x, cov);
     let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
@@ -676,8 +686,8 @@ where
             &mean + &mean_standard_error.mapv(|s| z * s),
         ),
         MeanIntervalMethod::TransformEta => (
-            apply_family_inverse_link(&eta_lower, family, mixture_state.as_ref(), sas_params)?,
-            apply_family_inverse_link(&eta_upper, family, mixture_state.as_ref(), sas_params)?,
+            apply_family_inverse_link(&eta_lower, family, link_kind.as_ref())?,
+            apply_family_inverse_link(&eta_upper, family, link_kind.as_ref())?,
         ),
     };
 

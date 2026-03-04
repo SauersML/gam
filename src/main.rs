@@ -1134,6 +1134,17 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     validate_saved_model_for_inference_stability(&model)?;
     let saved_mixture = saved_mixture_state(&model)?;
     let saved_sas = saved_sas_params(&model);
+    let saved_link_kind = if let Some(state) = saved_mixture.clone() {
+        Some(gam::types::LinkKind::Mixture(state))
+    } else {
+        saved_sas.map(|(epsilon, log_delta)| {
+            gam::types::LinkKind::Sas(gam::types::SasLinkState {
+                epsilon,
+                log_delta,
+                delta: log_delta.exp(),
+            })
+        })
+    };
     let saved_mixture_param_cov = model
         .mixture_link_param_covariance
         .as_ref()
@@ -1920,8 +1931,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     try_inverse_link_array(
                         family,
                         eta_lower.view(),
-                        saved_mixture.as_ref(),
-                        saved_sas,
+                        saved_link_kind.as_ref(),
                     )
                     .map_err(|e| format!("inverse-link lower bound failed: {e}"))?,
                 );
@@ -1929,8 +1939,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     try_inverse_link_array(
                         family,
                         eta_upper.view(),
-                        saved_mixture.as_ref(),
-                        saved_sas,
+                        saved_link_kind.as_ref(),
                     )
                     .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
                 );
@@ -2097,11 +2106,11 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             let eta_lower = &eta - &se.mapv(|v| z * v);
             let eta_upper = &eta + &se.mapv(|v| z * v);
             mean_lo = Some(
-                try_inverse_link_array(family, eta_lower.view(), saved_mixture.as_ref(), saved_sas)
+                try_inverse_link_array(family, eta_lower.view(), saved_link_kind.as_ref())
                     .map_err(|e| format!("inverse-link lower bound failed: {e}"))?,
             );
             mean_hi = Some(
-                try_inverse_link_array(family, eta_upper.view(), saved_mixture.as_ref(), saved_sas)
+                try_inverse_link_array(family, eta_upper.view(), saved_link_kind.as_ref())
                     .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
             );
         }
