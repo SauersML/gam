@@ -650,6 +650,8 @@ impl<'a> JointModelState<'a> {
                     &mut weights,
                     &mut z_glm,
                     None,
+                    None,
+                    None,
                 ) {
                     log::warn!("joint integrated working-vector update failed: {}", e);
                 }
@@ -1025,6 +1027,8 @@ impl<'a> JointModelState<'a> {
                         &mut mu_updated,
                         &mut weights_updated,
                         &mut z_updated,
+                        None,
+                        None,
                         None,
                     ) {
                         log::warn!(
