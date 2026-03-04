@@ -7,9 +7,7 @@ use crate::linalg::sparse_exact::{
     leverages_from_factor, solve_sparse_spd, solve_sparse_spd_multi, sparse_matvec_public,
     trace_hinv_sk,
 };
-use crate::pirls::{
-    DirectionalWorkingCurvature, PirlsWorkspace, directional_working_curvature_callback,
-};
+use crate::pirls::{DirectionalWorkingCurvature, PirlsWorkspace};
 use crate::types::SasLinkState;
 use faer::Side;
 

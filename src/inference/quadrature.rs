@@ -173,7 +173,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::estimate::EstimationError;
-use crate::types::{LikelihoodFamily, LinkFunction};
+use crate::mixture_link::sas_inverse_link_jet;
+use crate::types::{LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkState};
 use statrs::function::erf::erfc;
 
 /// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
@@ -1977,6 +1978,62 @@ pub fn integrated_inverse_link_jet(
     }
 }
 
+#[inline]
+fn sas_point_jet(x: f64, epsilon: f64, log_delta: f64) -> (f64, f64, f64, f64) {
+    let jet = sas_inverse_link_jet(x, epsilon, log_delta);
+    (jet.mu, jet.d1, jet.d2, jet.d3)
+}
+
+#[inline]
+fn integrated_sas_jet_ghq(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+    sas_state: &SasLinkState,
+) -> IntegratedInverseLinkJet {
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive_jet4(ctx, mu, sigma, |x| {
+        sas_point_jet(x, sas_state.epsilon, sas_state.log_delta)
+    });
+    IntegratedInverseLinkJet {
+        mean: mean.clamp(1e-12, 1.0 - 1e-12),
+        d1: d1.max(0.0),
+        d2,
+        d3,
+        mode: if sigma <= 1e-10 {
+            IntegratedExpectationMode::ExactClosedForm
+        } else {
+            IntegratedExpectationMode::QuadratureFallback
+        },
+    }
+}
+
+/// State-aware inverse-link jet integration for Gaussian-uncertain predictors.
+#[inline]
+pub fn integrated_inverse_link_jet_with_state(
+    quad_ctx: &QuadratureContext,
+    link: LinkFunction,
+    mu: f64,
+    sigma: f64,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
+) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    if mixture_link_state.is_some() {
+        return Err(EstimationError::InvalidInput(
+            "integrated mixture-link moments are not yet supported".to_string(),
+        ));
+    }
+    if matches!(link, LinkFunction::Sas) {
+        let sas = sas_link_state.ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "state-less integrated SAS jet is unsupported; explicit SasLinkState is required"
+                    .to_string(),
+            )
+        })?;
+        return Ok(integrated_sas_jet_ghq(quad_ctx, mu, sigma, sas));
+    }
+    integrated_inverse_link_jet(quad_ctx, link, mu, sigma)
+}
+
 /// Family-level integration dispatcher for Gaussian-uncertain linear predictors.
 ///
 /// This is the solver-facing boundary: callers request integrated moments/jet by
@@ -1988,6 +2045,20 @@ pub fn integrated_family_moments_jet(
     family: LikelihoodFamily,
     eta: f64,
     se_eta: f64,
+) -> Result<IntegratedMomentsJet, EstimationError> {
+    integrated_family_moments_jet_with_state(quad_ctx, family, eta, se_eta, None, None)
+}
+
+/// State-aware family-level integration dispatcher for Gaussian-uncertain
+/// linear predictors.
+#[inline]
+pub fn integrated_family_moments_jet_with_state(
+    quad_ctx: &QuadratureContext,
+    family: LikelihoodFamily,
+    eta: f64,
+    se_eta: f64,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
 ) -> Result<IntegratedMomentsJet, EstimationError> {
     const PROB_EPS: f64 = 1e-12;
     let e = eta.clamp(-700.0, 700.0);
@@ -2029,9 +2100,25 @@ pub fn integrated_family_moments_jet(
                 mode: jet.mode,
             })
         }
-        LikelihoodFamily::BinomialSas => Err(EstimationError::InvalidInput(
-            "Integrated moments dispatcher for BinomialSas requires SAS link parameters and is not supported in this state-less API".to_string(),
-        )),
+        LikelihoodFamily::BinomialSas => {
+            let jet = integrated_inverse_link_jet_with_state(
+                quad_ctx,
+                LinkFunction::Sas,
+                e,
+                se,
+                mixture_link_state,
+                sas_link_state,
+            )?;
+            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
         LikelihoodFamily::GaussianIdentity => Ok(IntegratedMomentsJet {
             mean: e,
             variance: 1.0,
@@ -3512,10 +3599,34 @@ mod tests {
         let ctx = QuadratureContext::new();
         let sas = integrated_family_moments_jet(&ctx, LikelihoodFamily::BinomialSas, 0.2, 0.5)
             .expect_err("state-less SAS moments should error");
-        assert!(format!("{sas}").contains("requires SAS link parameters"));
+        assert!(format!("{sas}").contains("SasLinkState"));
 
         let mix = integrated_family_moments_jet(&ctx, LikelihoodFamily::BinomialMixture, 0.2, 0.5)
             .expect_err("state-less mixture moments should error");
         assert!(format!("{mix}").contains("does not support binomial mixture"));
+    }
+
+    #[test]
+    fn integrated_family_moments_supports_stateful_sas() {
+        let ctx = QuadratureContext::new();
+        let sas = SasLinkState {
+            epsilon: 0.3,
+            log_delta: -0.2,
+            delta: (-0.2f64).exp(),
+        };
+        let out = integrated_family_moments_jet_with_state(
+            &ctx,
+            LikelihoodFamily::BinomialSas,
+            0.2,
+            0.5,
+            None,
+            Some(&sas),
+        )
+        .expect("stateful SAS integrated moments should evaluate");
+        assert!(out.mean.is_finite());
+        assert!(out.d1.is_finite());
+        assert!(out.d2.is_finite());
+        assert!(out.d3.is_finite());
+        assert!(out.mean > 0.0 && out.mean < 1.0);
     }
 }

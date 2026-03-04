@@ -1400,7 +1400,9 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
                     mu_loc,
                     var_loc.sqrt(),
                 )
-                .expect("integrated inverse-link moments should evaluate for supported survival links")
+                .expect(
+                    "integrated inverse-link moments should evaluate for supported survival links",
+                )
                 .mean
             },
         )
