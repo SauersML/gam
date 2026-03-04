@@ -5167,6 +5167,17 @@ fn directional_working_curvature_identity(
     DirectionalWorkingCurvature::Diagonal(Array1::<f64>::zeros(eta.len()))
 }
 
+fn directional_working_curvature_sas_state_required(
+    _eta: &Array1<f64>,
+    _prior_weights: ArrayView1<'_, f64>,
+    _solve_weights: &Array1<f64>,
+    _eta_direction: &Array1<f64>,
+) -> DirectionalWorkingCurvature {
+    panic!(
+        "Directional SAS curvature requires explicit SasLinkState; state-less LinkFunction::Sas callback is unsupported"
+    )
+}
+
 /// Returns the family-level directional curvature callback for `W_τ = T[η̇]`.
 ///
 /// This is the main dispatch surface higher layers should use when assembling
@@ -5178,7 +5189,7 @@ pub fn directional_working_curvature_callback(
         LinkFunction::Logit => directional_working_curvature_logit,
         LinkFunction::Probit => directional_working_curvature_probit,
         LinkFunction::CLogLog => directional_working_curvature_cloglog,
-        LinkFunction::Sas => directional_working_curvature_probit,
+        LinkFunction::Sas => directional_working_curvature_sas_state_required,
         LinkFunction::Identity => directional_working_curvature_identity,
     }
 }
