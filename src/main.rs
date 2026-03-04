@@ -1117,6 +1117,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     let model: SavedModel =
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
     validate_saved_model_for_inference_stability(&model)?;
+    let saved_mixture = saved_mixture_state(&model)?;
     let saved_sas = saved_sas_params(&model);
 
     let ds = load_dataset(&args.new_data)?;
@@ -1447,6 +1448,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 eta.view(),
                 se.view(),
                 None,
+                None,
             );
             let (lo, hi) =
                 response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
@@ -1774,6 +1776,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 eta.view(),
                 se_base.view(),
                 None,
+                None,
             );
             let (lo, hi) = response_interval_from_mean_sd(
                 mean.view(),
@@ -1865,8 +1868,13 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 .ok_or_else(|| "internal error: joint effective_se missing".to_string())?;
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
             if nonlinear {
-                let response_sd =
-                    response_sd_from_eta_for_family(family, pred.eta.view(), eff.view(), saved_sas);
+                let response_sd = response_sd_from_eta_for_family(
+                    family,
+                    pred.eta.view(),
+                    eff.view(),
+                    saved_mixture.as_ref(),
+                    saved_sas,
+                );
                 let (lo, hi) = response_interval_from_mean_sd(
                     pred.probabilities.view(),
                     response_sd.view(),
@@ -1908,15 +1916,12 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             | LikelihoodFamily::BinomialMixture
     );
     let (eta, mean, se_opt) = if family == LikelihoodFamily::BinomialMixture {
-        let spec = saved_mixture_link_spec(&model)?.ok_or_else(|| {
-            "saved binomial-mixture model is missing mixture_link_components/mixture_link_rho"
-                .to_string()
+        let state = saved_mixture.as_ref().ok_or_else(|| {
+            "saved binomial-mixture model is missing mixture link state".to_string()
         })?;
-        let state =
-            state_from_spec(&spec).map_err(|e| format!("invalid saved mixture link state: {e}"))?;
         let mut eta = design.design.dot(&beta);
         eta += &offset;
-        let mean = eta.mapv(|e| mixture_inverse_link_jet(&state, e).mu);
+        let mean = eta.mapv(|e| mixture_inverse_link_jet(state, e).mu);
         let se = if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
             let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
             if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
@@ -2001,8 +2006,13 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
         eta_se = Some(se.clone());
         if nonlinear {
-            let response_sd =
-                response_sd_from_eta_for_family(family, eta.view(), se.view(), saved_sas);
+            let response_sd = response_sd_from_eta_for_family(
+                family,
+                eta.view(),
+                se.view(),
+                saved_mixture.as_ref(),
+                saved_sas,
+            );
             let (lo, hi) = response_interval_from_mean_sd(
                 mean.view(),
                 response_sd.view(),
@@ -5881,6 +5891,21 @@ fn saved_sas_params(model: &SavedModel) -> Option<(f64, f64)> {
     }
 }
 
+fn saved_mixture_state(model: &SavedModel) -> Result<Option<gam::types::MixtureLinkState>, String> {
+    if model.family != "binomial-mixture" {
+        return Ok(None);
+    }
+    let Some(spec) = saved_mixture_link_spec(model)? else {
+        return Err(
+            "saved binomial-mixture model is missing mixture_link_components/mixture_link_rho"
+                .to_string(),
+        );
+    };
+    state_from_spec(&spec)
+        .map(Some)
+        .map_err(|e| format!("invalid saved mixture link state: {e}"))
+}
+
 fn parse_link_name(v: &str) -> Result<LinkFunction, String> {
     match v.trim() {
         "identity" => Ok(LinkFunction::Identity),
@@ -6385,6 +6410,7 @@ fn response_sd_from_eta_for_family(
     family: LikelihoodFamily,
     eta: ArrayView1<'_, f64>,
     eta_se: ArrayView1<'_, f64>,
+    mixture_state: Option<&gam::types::MixtureLinkState>,
     sas_params: Option<(f64, f64)>,
 ) -> Array1<f64> {
     let quad_ctx = gam::quadrature::QuadratureContext::new();
@@ -6412,9 +6438,11 @@ fn response_sd_from_eta_for_family(
                 (dmu_deta * se).powi(2)
             }
             LikelihoodFamily::BinomialMixture => {
-                let (_, v) =
-                    gam::quadrature::logit_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
-                v
+                let dmu_deta = mixture_state
+                    .map(|s| mixture_inverse_link_jet(s, eta[i]).d1.abs())
+                    .unwrap_or(0.0);
+                let se = eta_se[i].max(0.0);
+                (dmu_deta * se).powi(2)
             }
             LikelihoodFamily::RoystonParmar => {
                 let (_, v) =

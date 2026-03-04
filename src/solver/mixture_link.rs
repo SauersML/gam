@@ -294,14 +294,14 @@ pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLi
     let u_raw = delta * a - epsilon;
     let u = u_raw.clamp(-SAS_U_CLAMP, SAS_U_CLAMP);
     let u_active = if (u - u_raw).abs() < 1e-15 { 1.0 } else { 0.0 };
-    let z = u.sinh();
+    let s = u.sinh();
+    let c = u.cosh();
+    let z = s;
     let phi = normal_pdf(z);
     let q = (1.0 + e * e).sqrt();
     let u1 = u_active * delta / q;
     let u2 = u_active * (-delta * e / (q * q * q));
     let u3 = u_active * (delta * (2.0 * e * e - 1.0) / (q * q * q * q * q));
-    let s = u.sinh();
-    let c = u.cosh();
     let z1 = c * u1;
     let z2 = s * u1 * u1 + c * u2;
     let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
@@ -335,15 +335,15 @@ pub fn sas_inverse_link_jet_with_param_partials(
     let u_raw = delta * a - epsilon;
     let u = u_raw.clamp(-SAS_U_CLAMP, SAS_U_CLAMP);
     let u_active = if (u - u_raw).abs() < 1e-15 { 1.0 } else { 0.0 };
-    let z = u.sinh();
+    let s = u.sinh();
+    let c = u.cosh();
+    let z = s;
     let phi = normal_pdf(z);
 
     let q = (1.0 + e * e).sqrt();
     let u1 = u_active * delta / q;
     let u2 = u_active * (-delta * e / (q * q * q));
     let u3 = u_active * (delta * (2.0 * e * e - 1.0) / (q * q * q * q * q));
-    let s = u.sinh();
-    let c = u.cosh();
     let z1 = c * u1;
     let z2 = s * u1 * u1 + c * u2;
     let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
