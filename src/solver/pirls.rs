@@ -16,8 +16,8 @@ use crate::mixture_link::{
 use crate::probability::{normal_cdf_approx, normal_pdf, standard_normal_quantile};
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
-    LikelihoodFamily, LinkFunction, MixtureLinkSpec, MixtureLinkState, RidgePassport, RidgePolicy,
-    SasLinkSpec, SasLinkState,
+    LikelihoodFamily, LinkFunction, LinkKind, MixtureLinkSpec, MixtureLinkState, RidgePassport,
+    RidgePolicy, SasLinkSpec, SasLinkState,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
@@ -3472,7 +3472,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
     })?;
 
-    let link_function = config.link_function;
+    let link_function = config.link_function();
 
     use crate::construction::{
         EngineDims, create_balanced_penalty_root, stable_reparameterization_engine,
@@ -3658,8 +3658,8 @@ pub fn fit_model_for_fixed_rho<'a>(
                 link_function,
                 &final_eta,
                 prior_weights_owned.view(),
-                config.mixture_link_state.as_ref(),
-                config.sas_link_state.as_ref(),
+                config.link_kind.mixture_state(),
+                config.link_kind.sas_state(),
             );
         let pirls_result = PirlsResult {
             beta_transformed,
@@ -3716,10 +3716,10 @@ pub fn fit_model_for_fixed_rho<'a>(
         reparam_result.e_transformed.clone(),
         workspace,
         link_function,
-        config.mixture_link_state.clone(),
-        config.sas_link_state,
+        config.link_kind.mixture_state().cloned(),
+        config.link_kind.sas_state().copied(),
         config.firth_bias_reduction
-            && config.mixture_link_state.is_none()
+            && config.link_kind.mixture_state().is_none()
             && matches!(link_function, LinkFunction::Logit),
         if use_explicit {
             None
@@ -3744,8 +3744,8 @@ pub fn fit_model_for_fixed_rho<'a>(
                 link_function,
                 y,
                 prior_weights,
-                config.mixture_link_state.as_ref(),
-                config.sas_link_state.as_ref(),
+                config.link_kind.mixture_state(),
+                config.link_kind.sas_state(),
             ))
         });
     if let Some(lb) = coefficient_lower_bounds {
@@ -3940,7 +3940,7 @@ pub fn fit_model_for_fixed_rho_matrix(
         ),
         DesignMatrix::Sparse(x_sparse)
             if matches!(
-                config.link_function,
+                config.link_function(),
                 LinkFunction::Identity | LinkFunction::Logit | LinkFunction::Probit
             ) && !config.firth_bias_reduction =>
         {
@@ -4005,7 +4005,7 @@ fn fit_model_for_fixed_rho_sparse_implicit(
     let lambdas_slice = lambdas.as_slice_memory_order().ok_or_else(|| {
         EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
     })?;
-    let link_function = config.link_function;
+    let link_function = config.link_function();
     use crate::construction::{
         EngineDims, create_balanced_penalty_root, stable_reparameterization_engine,
         stable_reparameterization_with_invariant_engine,
@@ -4079,8 +4079,8 @@ fn fit_model_for_fixed_rho_sparse_implicit(
         reparam_result.e_transformed.clone(),
         workspace,
         link_function,
-        config.mixture_link_state.clone(),
-        config.sas_link_state,
+        config.link_kind.mixture_state().cloned(),
+        config.link_kind.sas_state().copied(),
         false,
         None,
         quad_ctx,
@@ -4097,8 +4097,8 @@ fn fit_model_for_fixed_rho_sparse_implicit(
                 link_function,
                 y,
                 prior_weights,
-                config.mixture_link_state.as_ref(),
-                config.sas_link_state.as_ref(),
+                config.link_kind.mixture_state(),
+                config.link_kind.sas_state(),
             ))
         });
     if let Some(lb) = coefficient_lower_bounds {
@@ -4226,12 +4226,17 @@ pub struct RunPirlsOptions {
 
 #[derive(Clone)]
 pub struct PirlsConfig {
-    pub link_function: LinkFunction,
-    pub mixture_link_state: Option<MixtureLinkState>,
-    pub sas_link_state: Option<SasLinkState>,
+    pub link_kind: LinkKind,
     pub max_iterations: usize,
     pub convergence_tolerance: f64,
     pub firth_bias_reduction: bool,
+}
+
+impl PirlsConfig {
+    #[inline]
+    pub fn link_function(&self) -> LinkFunction {
+        self.link_kind.link_function()
+    }
 }
 
 fn resolve_pirls_family(
@@ -4291,10 +4296,15 @@ pub fn run_pirls<'a>(
             rs_original.len()
         )));
     }
+    let link_kind = if let Some(state) = mixture_link_state {
+        LinkKind::Mixture(state)
+    } else if let Some(state) = sas_link_state {
+        LinkKind::Sas(state)
+    } else {
+        LinkKind::Standard(link)
+    };
     let cfg = PirlsConfig {
-        link_function: link,
-        mixture_link_state,
-        sas_link_state,
+        link_kind,
         max_iterations: opts.max_iter,
         convergence_tolerance: opts.tol,
         firth_bias_reduction: firth_active,
@@ -5709,7 +5719,7 @@ mod tests {
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
-    use crate::types::{Coefficients, LinkFunction, LogSmoothingParamsView};
+    use crate::types::{Coefficients, LinkFunction, LinkKind, LogSmoothingParamsView};
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
@@ -6023,9 +6033,7 @@ mod tests {
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
         let rs = vec![array![[1.0]]];
         let config = PirlsConfig {
-            link_function: LinkFunction::Logit,
-            mixture_link_state: None,
-            sas_link_state: None,
+            link_kind: LinkKind::Standard(LinkFunction::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
