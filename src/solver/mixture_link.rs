@@ -6,6 +6,7 @@ const PROB_EPS: f64 = 1e-8;
 const ETA_CLAMP_GENERAL: f64 = 30.0;
 const ETA_CLAMP_LOGIT: f64 = 700.0;
 const SAS_U_CLAMP: f64 = 50.0;
+const SAS_LOG_DELTA_BOUND: f64 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InverseLinkJet {
@@ -39,13 +40,63 @@ pub fn state_from_sas_spec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
     if !spec.initial_epsilon.is_finite() || !spec.initial_log_delta.is_finite() {
         return Err("SAS link parameters must be finite".to_string());
     }
-    let log_delta = spec.initial_log_delta.clamp(-12.0, 12.0);
-    let delta = log_delta.exp();
+    let log_delta = spec.initial_log_delta;
+    let delta = sas_delta_from_raw_log_delta(log_delta);
     Ok(SasLinkState {
         epsilon: spec.initial_epsilon,
         log_delta,
         delta,
     })
+}
+
+#[inline]
+fn tanh_bound(value: f64, bound: f64) -> f64 {
+    let b = bound.max(f64::EPSILON);
+    b * (value / b).tanh()
+}
+
+#[inline]
+fn tanh_bound_d1(value: f64, bound: f64) -> f64 {
+    let b = bound.max(f64::EPSILON);
+    let t = (value / b).tanh();
+    1.0 - t * t
+}
+
+#[inline]
+fn tanh_bound_d2(value: f64, bound: f64) -> f64 {
+    let b = bound.max(f64::EPSILON);
+    let t = (value / b).tanh();
+    let s = 1.0 - t * t;
+    -2.0 * t * s / b
+}
+
+#[inline]
+fn tanh_bound_d3(value: f64, bound: f64) -> f64 {
+    let b = bound.max(f64::EPSILON);
+    let t = (value / b).tanh();
+    let s = 1.0 - t * t;
+    -2.0 * s * (1.0 - 3.0 * t * t) / (b * b)
+}
+
+#[inline]
+fn tanh_bound_d4(value: f64, bound: f64) -> f64 {
+    let b = bound.max(f64::EPSILON);
+    let t = (value / b).tanh();
+    let s = 1.0 - t * t;
+    8.0 * t * s * (2.0 - 3.0 * t * t) / (b * b * b)
+}
+
+#[inline]
+fn sas_effective_log_delta(raw_log_delta: f64) -> (f64, f64) {
+    let ld_eff = tanh_bound(raw_log_delta, SAS_LOG_DELTA_BOUND);
+    let dld_eff_draw = tanh_bound_d1(raw_log_delta, SAS_LOG_DELTA_BOUND);
+    (ld_eff, dld_eff_draw)
+}
+
+#[inline]
+fn sas_delta_from_raw_log_delta(raw_log_delta: f64) -> f64 {
+    let (ld_eff, _) = sas_effective_log_delta(raw_log_delta);
+    ld_eff.exp()
 }
 
 pub fn validate_mixture_spec(spec: &MixtureLinkSpec) -> Result<(), String> {
@@ -289,19 +340,23 @@ pub fn mixture_inverse_link_jet_with_rho_partials_into(
 pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLinkJet {
     let e = if eta.is_finite() { eta } else { 0.0 };
     let a = e.asinh();
-    let ld = log_delta.clamp(-12.0, 12.0);
-    let delta = ld.exp();
+    let delta = sas_delta_from_raw_log_delta(log_delta);
     let u_raw = delta * a - epsilon;
-    let u = u_raw.clamp(-SAS_U_CLAMP, SAS_U_CLAMP);
-    let u_active = if (u - u_raw).abs() < 1e-15 { 1.0 } else { 0.0 };
+    let u = tanh_bound(u_raw, SAS_U_CLAMP);
+    let g1 = tanh_bound_d1(u_raw, SAS_U_CLAMP);
+    let g2 = tanh_bound_d2(u_raw, SAS_U_CLAMP);
+    let g3 = tanh_bound_d3(u_raw, SAS_U_CLAMP);
     let s = u.sinh();
     let c = u.cosh();
     let z = s;
     let phi = normal_pdf(z);
     let q = (1.0 + e * e).sqrt();
-    let u1 = u_active * delta / q;
-    let u2 = u_active * (-delta * e / (q * q * q));
-    let u3 = u_active * (delta * (2.0 * e * e - 1.0) / (q * q * q * q * q));
+    let r1 = delta / q;
+    let r2 = -delta * e / (q * q * q);
+    let r3 = delta * (2.0 * e * e - 1.0) / (q * q * q * q * q);
+    let u1 = g1 * r1;
+    let u2 = g2 * r1 * r1 + g1 * r2;
+    let u3 = g3 * r1 * r1 * r1 + 3.0 * g2 * r1 * r2 + g1 * r3;
     let z1 = c * u1;
     let z2 = s * u1 * u1 + c * u2;
     let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
@@ -324,26 +379,30 @@ pub fn sas_inverse_link_jet_with_param_partials(
 ) -> SasJetWithParamPartials {
     let e = if eta.is_finite() { eta } else { 0.0 };
     let a = e.asinh();
-    let ld_raw = log_delta;
-    let ld = ld_raw.clamp(-12.0, 12.0);
-    let ld_active = if (ld - ld_raw).abs() < 1e-15 {
-        1.0
-    } else {
-        0.0
-    };
-    let delta = ld.exp();
+    let (ld_eff, dld_eff_draw) = sas_effective_log_delta(log_delta);
+    let delta = ld_eff.exp();
+    let ddelta_draw = delta * dld_eff_draw;
     let u_raw = delta * a - epsilon;
-    let u = u_raw.clamp(-SAS_U_CLAMP, SAS_U_CLAMP);
-    let u_active = if (u - u_raw).abs() < 1e-15 { 1.0 } else { 0.0 };
+    let u = tanh_bound(u_raw, SAS_U_CLAMP);
+    let g1 = tanh_bound_d1(u_raw, SAS_U_CLAMP);
+    let g2 = tanh_bound_d2(u_raw, SAS_U_CLAMP);
+    let g3 = tanh_bound_d3(u_raw, SAS_U_CLAMP);
+    let g4 = tanh_bound_d4(u_raw, SAS_U_CLAMP);
     let s = u.sinh();
     let c = u.cosh();
     let z = s;
     let phi = normal_pdf(z);
 
     let q = (1.0 + e * e).sqrt();
-    let u1 = u_active * delta / q;
-    let u2 = u_active * (-delta * e / (q * q * q));
-    let u3 = u_active * (delta * (2.0 * e * e - 1.0) / (q * q * q * q * q));
+    let a1 = 1.0 / q;
+    let a2 = -e / (q * q * q);
+    let a3 = (2.0 * e * e - 1.0) / (q * q * q * q * q);
+    let r1 = delta * a1;
+    let r2 = delta * a2;
+    let r3 = delta * a3;
+    let u1 = g1 * r1;
+    let u2 = g2 * r1 * r1 + g1 * r2;
+    let u3 = g3 * r1 * r1 * r1 + 3.0 * g2 * r1 * r2 + g1 * r3;
     let z1 = c * u1;
     let z2 = s * u1 * u1 + c * u2;
     let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
@@ -390,11 +449,43 @@ pub fn sas_inverse_link_jet_with_param_partials(
         }
     };
 
-    // epsilon partials: delta fixed, u_eps = -1.
-    let djet_depsilon = param_partials(-u_active, 0.0, 0.0, 0.0);
-    // log-delta partials: only active when unclamped.
-    let u_ld = ld_active * u_active * delta * a;
-    let djet_dlog_delta = param_partials(u_ld, ld_active * u1, ld_active * u2, ld_active * u3);
+    // epsilon partials (raw_u_t = -1).
+    let rt_eps = -1.0;
+    let r1t_eps = 0.0;
+    let r2t_eps = 0.0;
+    let r3t_eps = 0.0;
+    let u_eps = g1 * rt_eps;
+    let u1_eps = g2 * rt_eps * r1 + g1 * r1t_eps;
+    let u2_eps = g3 * rt_eps * r1 * r1
+        + 2.0 * g2 * r1 * r1t_eps
+        + g2 * rt_eps * r2
+        + g1 * r2t_eps;
+    let u3_eps = g4 * rt_eps * r1 * r1 * r1
+        + 3.0 * g3 * r1 * r1 * r1t_eps
+        + 3.0 * g3 * rt_eps * r1 * r2
+        + 3.0 * g2 * (r1t_eps * r2 + r1 * r2t_eps)
+        + g2 * rt_eps * r3
+        + g1 * r3t_eps;
+    let djet_depsilon = param_partials(u_eps, u1_eps, u2_eps, u3_eps);
+
+    // raw log-delta partials (through smooth bounded effective log-delta).
+    let rt_ld = ddelta_draw * a;
+    let r1t_ld = ddelta_draw * a1;
+    let r2t_ld = ddelta_draw * a2;
+    let r3t_ld = ddelta_draw * a3;
+    let u_ld = g1 * rt_ld;
+    let u1_ld = g2 * rt_ld * r1 + g1 * r1t_ld;
+    let u2_ld = g3 * rt_ld * r1 * r1
+        + 2.0 * g2 * r1 * r1t_ld
+        + g2 * rt_ld * r2
+        + g1 * r2t_ld;
+    let u3_ld = g4 * rt_ld * r1 * r1 * r1
+        + 3.0 * g3 * r1 * r1 * r1t_ld
+        + 3.0 * g3 * rt_ld * r1 * r2
+        + 3.0 * g2 * (r1t_ld * r2 + r1 * r2t_ld)
+        + g2 * rt_ld * r3
+        + g1 * r3t_ld;
+    let djet_dlog_delta = param_partials(u_ld, u1_ld, u2_ld, u3_ld);
 
     SasJetWithParamPartials {
         jet: base,
@@ -536,34 +627,19 @@ mod tests {
     }
 
     #[test]
-    fn sas_param_partials_zero_when_u_clamped() {
-        // Pick a setup where u = delta*asinh(eta) - epsilon saturates at +SAS_U_CLAMP.
+    fn sas_param_partials_remain_finite_in_extreme_region() {
         let eta = 10.0;
         let epsilon = -60.0;
-        let log_delta = 8.0;
-        let j = sas_inverse_link_jet_with_param_partials(eta, epsilon, log_delta);
-        // With u clamp active, all eta-derivatives and param partials are masked to stable zeros.
-        assert!(j.djet_depsilon.mu.abs() < 1e-10);
-        assert!(j.djet_depsilon.d1.abs() < 1e-10);
-        assert!(j.djet_depsilon.d2.abs() < 1e-10);
-        assert!(j.djet_depsilon.d3.abs() < 1e-10);
-        assert!(j.djet_dlog_delta.mu.abs() < 1e-10);
-        assert!(j.djet_dlog_delta.d1.abs() < 1e-10);
-        assert!(j.djet_dlog_delta.d2.abs() < 1e-10);
-        assert!(j.djet_dlog_delta.d3.abs() < 1e-10);
-    }
-
-    #[test]
-    fn sas_log_delta_partials_zero_when_log_delta_clamped() {
-        // log_delta clamps to +12 internally; derivative wrt log_delta is masked.
-        let eta = 0.7;
-        let epsilon = 0.2;
         let log_delta = 40.0;
         let j = sas_inverse_link_jet_with_param_partials(eta, epsilon, log_delta);
-        assert!(j.djet_dlog_delta.mu.abs() < 1e-10);
-        assert!(j.djet_dlog_delta.d1.abs() < 1e-10);
-        assert!(j.djet_dlog_delta.d2.abs() < 1e-10);
-        assert!(j.djet_dlog_delta.d3.abs() < 1e-10);
+        assert!(j.djet_depsilon.mu.is_finite());
+        assert!(j.djet_depsilon.d1.is_finite());
+        assert!(j.djet_depsilon.d2.is_finite());
+        assert!(j.djet_depsilon.d3.is_finite());
+        assert!(j.djet_dlog_delta.mu.is_finite());
+        assert!(j.djet_dlog_delta.d1.is_finite());
+        assert!(j.djet_dlog_delta.d2.is_finite());
+        assert!(j.djet_dlog_delta.d3.is_finite());
     }
 
     #[test]
