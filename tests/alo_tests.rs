@@ -45,6 +45,8 @@ fn fit_unpenalized(
     let offset = Array1::<f64>::zeros(x.nrows());
     let rs_original: Vec<Array2<f64>> = Vec::new();
     let cfg = PirlsConfig {
+        mixture_link_state: None,
+        sas_link_state: None,
         link_function: link,
         max_iterations: 100,
         convergence_tolerance: 1e-10,

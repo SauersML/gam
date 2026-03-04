@@ -62,6 +62,7 @@ fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<Likelihood
         LinkFunction::Logit => Some(LikelihoodFamily::BinomialLogit),
         LinkFunction::Probit => Some(LikelihoodFamily::BinomialProbit),
         LinkFunction::CLogLog => Some(LikelihoodFamily::BinomialCLogLog),
+        LinkFunction::Sas => Some(LikelihoodFamily::BinomialSas),
         LinkFunction::Identity => None,
     }
 }
@@ -660,6 +661,8 @@ impl<'a> JointModelState<'a> {
                     &mut weights,
                     &mut z_glm,
                     None,
+                    None,
+                    None,
                 );
             }
         } else {
@@ -671,6 +674,8 @@ impl<'a> JointModelState<'a> {
                 &mut mu,
                 &mut weights,
                 &mut z_glm,
+                None,
+                None,
                 None,
             );
         }
@@ -1003,7 +1008,10 @@ impl<'a> JointModelState<'a> {
 
         if let Some(se) = &self.covariate_se {
             match self.link {
-                LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+                LinkFunction::Logit
+                | LinkFunction::Probit
+                | LinkFunction::CLogLog
+                | LinkFunction::Sas => {
                     crate::pirls::update_glm_vectors_integrated_for_link(
                         &self.quad_ctx,
                         self.y,
@@ -1026,6 +1034,8 @@ impl<'a> JointModelState<'a> {
                     &mut weights_updated,
                     &mut z_updated,
                     None,
+                    None,
+                    None,
                 ),
             }
         } else {
@@ -1037,6 +1047,8 @@ impl<'a> JointModelState<'a> {
                 &mut mu_updated,
                 &mut weights_updated,
                 &mut z_updated,
+                None,
+                None,
                 None,
             );
         }
@@ -1448,13 +1460,17 @@ impl<'a> JointRemlState<'a> {
                     residual[i] = weights[i] * (mu[i] - state.y[i]);
                 }
             }
-            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+            LinkFunction::Logit
+            | LinkFunction::Probit
+            | LinkFunction::CLogLog
+            | LinkFunction::Sas => {
                 const MIN_WEIGHT: f64 = 1e-12;
                 const MIN_DMU: f64 = 1e-6;
                 let family = match state.link {
                     LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
                     LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
                     LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+                    LinkFunction::Sas => LikelihoodFamily::BinomialSas,
                     LinkFunction::Identity => unreachable!("identity handled above"),
                 };
                 for i in 0..n {
@@ -1638,7 +1654,10 @@ impl<'a> JointRemlState<'a> {
         }
 
         let laml = match state.link {
-            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+            LinkFunction::Logit
+            | LinkFunction::Probit
+            | LinkFunction::CLogLog
+            | LinkFunction::Sas => {
                 let penalised_ll = -0.5 * deviance - 0.5 * penalty_term;
                 let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_a
                     + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
@@ -1932,13 +1951,17 @@ impl<'a> JointRemlState<'a> {
                     residual[i] = weights[i] * (mu[i] - state.y[i]);
                 }
             }
-            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+            LinkFunction::Logit
+            | LinkFunction::Probit
+            | LinkFunction::CLogLog
+            | LinkFunction::Sas => {
                 const MIN_WEIGHT: f64 = 1e-12;
                 const MIN_DMU: f64 = 1e-6;
                 let family = match state.link {
                     LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
                     LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
                     LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+                    LinkFunction::Sas => LikelihoodFamily::BinomialSas,
                     LinkFunction::Identity => unreachable!("identity handled above"),
                 };
                 for i in 0..n {
@@ -2800,6 +2823,8 @@ impl<'a> JointRemlState<'a> {
             &mut mu,
             &mut weights,
             &mut z,
+            None,
+            None,
             None,
         );
         let deviance = state.compute_deviance(&mu);

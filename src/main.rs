@@ -35,6 +35,7 @@ use gam::joint::{
     JointLinkGeometry, JointModelConfig, JointModelResult, fit_joint_model_engine, predict_joint,
 };
 use gam::matrix::DesignMatrix;
+use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_from_spec};
 use gam::probability::{inverse_link_array, normal_cdf_approx, standard_normal_quantile};
 use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
@@ -48,7 +49,7 @@ use gam::survival_location_scale_probit::{
     SurvivalLocationScaleProbitPredictInput, SurvivalLocationScaleProbitSpec, TimeBlockInput,
     fit_survival_location_scale_probit, predict_survival_location_scale_probit,
 };
-use gam::types::{LikelihoodFamily, LinkFunction};
+use gam::types::{LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,15 @@ struct FitArgs {
     family: FamilyArg,
     #[arg(long = "link")]
     link: Option<String>,
+    /// Optional comma-separated initial free logits for mixture links (length K-1).
+    #[arg(long = "mixture-rho")]
+    mixture_rho: Option<String>,
+    /// Optional initial SAS params as `epsilon,log_delta` (used with `--link sas`).
+    #[arg(long = "sas-init")]
+    sas_init: Option<String>,
+    /// Optimize SAS params in the outer loop when SAS link is active.
+    #[arg(long = "optimize-sas", default_value_t = true)]
+    optimize_sas: bool,
     #[arg(long = "flexible-link", default_value_t = false)]
     flexible_link: bool,
     #[arg(long = "firth", default_value_t = false)]
@@ -280,6 +290,20 @@ struct SavedModel {
     family: String,
     link: Option<String>,
     #[serde(default)]
+    mixture_link_components: Option<Vec<String>>,
+    #[serde(default)]
+    mixture_link_rho: Option<Vec<f64>>,
+    #[serde(default)]
+    mixture_link_weights: Option<Vec<f64>>,
+    #[serde(default)]
+    sas_epsilon: Option<f64>,
+    #[serde(default)]
+    sas_log_delta: Option<f64>,
+    #[serde(default)]
+    sas_delta: Option<f64>,
+    #[serde(default)]
+    wiggle_base_link: Option<String>,
+    #[serde(default)]
     formula_noise: Option<String>,
     #[serde(default)]
     beta_noise: Option<Vec<f64>>,
@@ -405,10 +429,11 @@ enum LinkMode {
     Flexible,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct LinkChoice {
     mode: LinkMode,
     link: LinkFunction,
+    mixture_components: Option<Vec<LinkComponent>>,
 }
 
 const FAMILY_GAUSSIAN_LOCATION_SCALE: &str = "gaussian-location-scale";
@@ -465,8 +490,73 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let y = ds.values.column(y_col).to_owned();
 
     let link_choice = parse_link_choice(args.link.as_deref(), args.flexible_link)?;
-    let mut family = resolve_family(args.family, link_choice, y.view())?;
+    let mixture_link_spec = if let Some(choice) = link_choice.as_ref() {
+        if let Some(components) = choice.mixture_components.as_ref() {
+            let expected = components.len().saturating_sub(1);
+            let initial_rho = if let Some(raw) = args.mixture_rho.as_deref() {
+                let vals = parse_comma_f64(raw, "--mixture-rho")?;
+                if vals.len() != expected {
+                    return Err(format!(
+                        "--mixture-rho length mismatch: expected {expected}, got {}",
+                        vals.len()
+                    ));
+                }
+                Array1::from_vec(vals)
+            } else {
+                Array1::zeros(expected)
+            };
+            Some(MixtureLinkSpec {
+                components: components.clone(),
+                initial_rho,
+            })
+        } else {
+            if args.mixture_rho.is_some() {
+                return Err("--mixture-rho requires --link mixture(...)".to_string());
+            }
+            None
+        }
+    } else {
+        if args.mixture_rho.is_some() {
+            return Err("--mixture-rho requires --link mixture(...)".to_string());
+        }
+        None
+    };
+    let sas_link_spec = if let Some(choice) = link_choice.as_ref() {
+        if choice.link == LinkFunction::Sas && choice.mixture_components.is_none() {
+            if let Some(raw) = args.sas_init.as_deref() {
+                let vals = parse_comma_f64(raw, "--sas-init")?;
+                if vals.len() != 2 {
+                    return Err(format!(
+                        "--sas-init expects two values: epsilon,log_delta (got {})",
+                        vals.len()
+                    ));
+                }
+                Some(SasLinkSpec {
+                    initial_epsilon: vals[0],
+                    initial_log_delta: vals[1],
+                })
+            } else {
+                Some(SasLinkSpec {
+                    initial_epsilon: 0.0,
+                    initial_log_delta: 0.0,
+                })
+            }
+        } else {
+            if args.sas_init.is_some() {
+                return Err("--sas-init requires --link sas".to_string());
+            }
+            None
+        }
+    } else {
+        if args.sas_init.is_some() {
+            return Err("--sas-init requires --link sas".to_string());
+        }
+        None
+    };
+
+    let mut family = resolve_family(args.family, link_choice.clone(), y.view())?;
     let effective_link = link_choice
+        .as_ref()
         .map(|c| c.link)
         .unwrap_or_else(|| family_to_link(family));
 
@@ -489,7 +579,11 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if args.firth && effective_link != LinkFunction::Logit {
+    if args.firth
+        && (effective_link != LinkFunction::Logit
+            || mixture_link_spec.is_some()
+            || sas_link_spec.is_some())
+    {
         return Err("--firth requires logit link".to_string());
     }
     if let Some(noise_formula_raw) = &args.predict_noise {
@@ -543,7 +637,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 let model = build_location_scale_saved_model(
                     formula_text.clone(),
                     FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
-                    link_choice.map(link_choice_to_string),
+                    link_choice.as_ref().map(link_choice_to_string),
                     noise_formula.clone(),
                     ds.headers.clone(),
                     frozen_mean_spec.clone(),
@@ -757,7 +851,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let fit_tol = 1e-6f64;
     let weights = Array1::ones(ds.values.nrows());
     let offset = Array1::zeros(ds.values.nrows());
-    if let Some(choice) = link_choice {
+    if let Some(choice) = link_choice.as_ref() {
         if matches!(choice.mode, LinkMode::Flexible) {
             if has_bounded_terms {
                 return Err(
@@ -812,6 +906,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     formula: formula_text,
                     family: family_to_string(family).to_string(),
                     link: Some(link_choice_to_string(choice)),
+                    mixture_link_components: None,
+                    mixture_link_rho: None,
+                    mixture_link_weights: None,
+                    sas_epsilon: None,
+                    sas_log_delta: None,
+                    sas_delta: None,
+                    wiggle_base_link: None,
                     formula_noise: None,
                     beta_noise: None,
                     sigma_min: None,
@@ -883,6 +984,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             design.penalties.clone(),
             &ExternalOptimOptions {
                 family,
+                mixture_link: None,
+                optimize_mixture: true,
+                sas_link: None,
+                optimize_sas: false,
                 max_iter: fit_max_iter,
                 tol: fit_tol,
                 nullspace_dims: design.nullspace_dims.clone(),
@@ -903,6 +1008,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             &spec,
             family,
             &FitOptions {
+                mixture_link: mixture_link_spec.clone(),
+                optimize_mixture: true,
+                sas_link: sas_link_spec,
+                optimize_sas: args.optimize_sas && sas_link_spec.is_some(),
                 max_iter: fit_max_iter,
                 tol: fit_tol,
                 nullspace_dims: vec![],
@@ -930,7 +1039,24 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             version: MODEL_VERSION,
             formula: formula_text,
             family: family_to_string(family).to_string(),
-            link: link_choice.map(link_choice_to_string),
+            link: link_choice.as_ref().map(link_choice_to_string),
+            mixture_link_components: fit.mixture_link_components.as_ref().map(|v| {
+                v.iter()
+                    .map(|c| match c {
+                        LinkComponent::Probit => "probit".to_string(),
+                        LinkComponent::Logit => "logit".to_string(),
+                        LinkComponent::CLogLog => "cloglog".to_string(),
+                        LinkComponent::LogLog => "loglog".to_string(),
+                        LinkComponent::Cauchit => "cauchit".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+            }),
+            mixture_link_rho: fit.mixture_link_rho.as_ref().map(|v| v.to_vec()),
+            mixture_link_weights: fit.mixture_link_weights.as_ref().map(|v| v.to_vec()),
+            sas_epsilon: fit.sas_epsilon,
+            sas_log_delta: fit.sas_log_delta,
+            sas_delta: fit.sas_delta,
+            wiggle_base_link: Some(link_name(effective_link).to_string()),
             formula_noise: None,
             beta_noise: None,
             sigma_min: None,
@@ -1775,8 +1901,58 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         LikelihoodFamily::BinomialLogit
             | LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialMixture
     );
-    let (eta, mean, se_opt) = if nonlinear && args.mode == PredictModeArg::PosteriorMean {
+    let (eta, mean, se_opt) = if family == LikelihoodFamily::BinomialMixture {
+        let spec = saved_mixture_link_spec(&model)?.ok_or_else(|| {
+            "saved binomial-mixture model is missing mixture_link_components/mixture_link_rho"
+                .to_string()
+        })?;
+        let state = state_from_spec(&spec)
+            .map_err(|e| format!("invalid saved mixture link state: {e}"))?;
+        let mut eta = design.design.dot(&beta);
+        eta += &offset;
+        let mean = eta.mapv(|e| mixture_inverse_link_jet(&state, e).mu);
+        let se = if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
+            let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+            if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
+                return Err(format!(
+                    "covariance shape mismatch: got {}x{}, expected {}x{}",
+                    cov_mat.nrows(),
+                    cov_mat.ncols(),
+                    beta.len(),
+                    beta.len()
+                ));
+            }
+            Some(linear_predictor_se(design.design.view(), &cov_mat))
+        } else {
+            None
+        };
+        (eta, mean, se)
+    } else if family == LikelihoodFamily::BinomialSas {
+        let epsilon = model.sas_epsilon.unwrap_or(0.0);
+        let log_delta = model.sas_log_delta.unwrap_or(0.0);
+        let mut eta = design.design.dot(&beta);
+        eta += &offset;
+        let mean = eta.mapv(|e| sas_inverse_link_jet(e, epsilon, log_delta).mu);
+        let se = if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
+            let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+            if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
+                return Err(format!(
+                    "covariance shape mismatch: got {}x{}, expected {}x{}",
+                    cov_mat.nrows(),
+                    cov_mat.ncols(),
+                    beta.len(),
+                    beta.len()
+                ));
+            }
+            Some(linear_predictor_se(design.design.view(), &cov_mat))
+        } else {
+            None
+        };
+        (eta, mean, se)
+    } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
         let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
         let pm = predict_gam_posterior_mean(
             design.design.view(),
@@ -1909,6 +2085,10 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         &design.penalties,
         family,
         &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: model.fit_max_iter,
             tol: model.fit_tol,
             nullspace_dims: design.nullspace_dims.clone(),
@@ -3024,6 +3204,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 formula,
                 family: family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
                 link: None,
+                mixture_link_components: None,
+                mixture_link_rho: None,
+                mixture_link_weights: None,
+                sas_epsilon: None,
+                sas_log_delta: None,
+                sas_delta: None,
+                wiggle_base_link: None,
                 formula_noise: None,
                 beta_noise: None,
                 sigma_min: None,
@@ -3225,6 +3412,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             formula,
             family: family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
             link: None,
+            mixture_link_components: None,
+            mixture_link_rho: None,
+            mixture_link_weights: None,
+            sas_epsilon: None,
+            sas_log_delta: None,
+            sas_delta: None,
+            wiggle_base_link: None,
             formula_noise: None,
             beta_noise: None,
             sigma_min: None,
@@ -3517,6 +3711,10 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
             &design.penalties,
             family,
             &FitOptions {
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: None,
+                optimize_sas: false,
                 max_iter: model.fit_max_iter,
                 tol: model.fit_tol,
                 nullspace_dims: design.nullspace_dims.clone(),
@@ -4078,6 +4276,13 @@ fn build_location_scale_saved_model(
         formula,
         family,
         link,
+        mixture_link_components: None,
+        mixture_link_rho: None,
+        mixture_link_weights: None,
+        sas_epsilon: None,
+        sas_log_delta: None,
+        sas_delta: None,
+        wiggle_base_link: None,
         formula_noise: Some(noise_formula),
         beta_noise,
         sigma_min: Some(sigma_min),
@@ -5486,12 +5691,17 @@ fn resolve_family(
     y: ArrayView1<'_, f64>,
 ) -> Result<LikelihoodFamily, String> {
     let explicit_family = family_from_arg(arg);
-    if let Some(choice) = link_choice {
-        let from_link = match choice.link {
-            LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
-            LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
-            LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
-            LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+    if let Some(choice) = link_choice.as_ref() {
+        let from_link = if choice.mixture_components.is_some() {
+            LikelihoodFamily::BinomialMixture
+        } else {
+            match choice.link {
+                LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
+                LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
+                LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
+                LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+                LinkFunction::Sas => LikelihoodFamily::BinomialSas,
+            }
         };
         if let Some(explicit) = explicit_family {
             if explicit != from_link {
@@ -5538,9 +5748,25 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
         return Ok(Some(LinkChoice {
             mode: LinkMode::Flexible,
             link: LinkFunction::Logit,
+            mixture_components: None,
         }));
     };
     let t = v.trim().to_ascii_lowercase();
+    if let Some(inner) = t
+        .strip_prefix("mixture(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let components = parse_link_component_list(inner)?;
+        return Ok(Some(LinkChoice {
+            mode: if flexible_flag {
+                LinkMode::Flexible
+            } else {
+                LinkMode::Strict
+            },
+            link: LinkFunction::Logit,
+            mixture_components: Some(components),
+        }));
+    }
     if let Some(inner) = t
         .strip_prefix("flexible(")
         .and_then(|s| s.strip_suffix(')'))
@@ -5549,6 +5775,7 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
         return Ok(Some(LinkChoice {
             mode: LinkMode::Flexible,
             link,
+            mixture_components: None,
         }));
     }
 
@@ -5560,6 +5787,85 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
             LinkMode::Strict
         },
         link,
+        mixture_components: None,
+    }))
+}
+
+fn parse_link_component(v: &str) -> Result<LinkComponent, String> {
+    match v.trim() {
+        "logit" => Ok(LinkComponent::Logit),
+        "probit" => Ok(LinkComponent::Probit),
+        "cloglog" => Ok(LinkComponent::CLogLog),
+        "loglog" => Ok(LinkComponent::LogLog),
+        "cauchit" => Ok(LinkComponent::Cauchit),
+        other => Err(format!(
+            "unsupported mixture link component '{other}'; use probit|logit|cloglog|loglog|cauchit"
+        )),
+    }
+}
+
+fn parse_link_component_list(v: &str) -> Result<Vec<LinkComponent>, String> {
+    let mut out = Vec::new();
+    for part in v.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let comp = parse_link_component(trimmed)?;
+        if out.contains(&comp) {
+            return Err("mixture(...) cannot contain duplicate components".to_string());
+        }
+        out.push(comp);
+    }
+    if out.len() < 2 {
+        return Err("mixture(...) requires at least two components".to_string());
+    }
+    Ok(out)
+}
+
+fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
+    let mut out = Vec::new();
+    for part in v.split(',') {
+        let t = part.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let parsed = t
+            .parse::<f64>()
+            .map_err(|_| format!("{label} contains non-numeric value '{t}'"))?;
+        if !parsed.is_finite() {
+            return Err(format!("{label} contains non-finite value '{t}'"));
+        }
+        out.push(parsed);
+    }
+    Ok(out)
+}
+
+fn saved_mixture_link_spec(model: &SavedModel) -> Result<Option<MixtureLinkSpec>, String> {
+    let Some(components_raw) = model.mixture_link_components.as_ref() else {
+        return Ok(None);
+    };
+    let mut components = Vec::with_capacity(components_raw.len());
+    for name in components_raw {
+        components.push(parse_link_component(name)?);
+    }
+    if components.len() < 2 {
+        return Err("saved mixture link has fewer than 2 components".to_string());
+    }
+    let expected = components.len() - 1;
+    let rho_vec = model
+        .mixture_link_rho
+        .clone()
+        .unwrap_or_else(|| vec![0.0; expected]);
+    if rho_vec.len() != expected {
+        return Err(format!(
+            "saved mixture link rho length mismatch: expected {expected}, got {}",
+            rho_vec.len()
+        ));
+    }
+    Ok(Some(MixtureLinkSpec {
+        components,
+        initial_rho: Array1::from_vec(rho_vec),
     }))
 }
 
@@ -5569,8 +5875,9 @@ fn parse_link_name(v: &str) -> Result<LinkFunction, String> {
         "logit" => Ok(LinkFunction::Logit),
         "probit" => Ok(LinkFunction::Probit),
         "cloglog" => Ok(LinkFunction::CLogLog),
+        "sas" => Ok(LinkFunction::Sas),
         other => Err(format!(
-            "unsupported --link '{other}'; use identity|logit|probit|cloglog or flexible(...)"
+            "unsupported --link '{other}'; use identity|logit|probit|cloglog|sas or flexible(...)"
         )),
     }
 }
@@ -5581,10 +5888,25 @@ fn link_name(link: LinkFunction) -> &'static str {
         LinkFunction::Logit => "logit",
         LinkFunction::Probit => "probit",
         LinkFunction::CLogLog => "cloglog",
+        LinkFunction::Sas => "sas",
     }
 }
 
-fn link_choice_to_string(choice: LinkChoice) -> String {
+fn link_choice_to_string(choice: &LinkChoice) -> String {
+    if let Some(components) = choice.mixture_components.as_ref() {
+        let names = components
+            .iter()
+            .map(|c| match c {
+                LinkComponent::Logit => "logit",
+                LinkComponent::Probit => "probit",
+                LinkComponent::CLogLog => "cloglog",
+                LinkComponent::LogLog => "loglog",
+                LinkComponent::Cauchit => "cauchit",
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        return format!("mixture({names})");
+    }
     match choice.mode {
         LinkMode::Strict => link_name(choice.link).to_string(),
         LinkMode::Flexible => format!("flexible({})", link_name(choice.link)),
@@ -5605,6 +5927,8 @@ fn family_to_string(f: LikelihoodFamily) -> &'static str {
         LikelihoodFamily::BinomialLogit => "binomial-logit",
         LikelihoodFamily::BinomialProbit => "binomial-probit",
         LikelihoodFamily::BinomialCLogLog => "binomial-cloglog",
+        LikelihoodFamily::BinomialSas => "binomial-sas",
+        LikelihoodFamily::BinomialMixture => "binomial-mixture",
         LikelihoodFamily::RoystonParmar => "royston-parmar",
     }
 }
@@ -5615,6 +5939,8 @@ fn family_from_string(v: &str) -> Result<LikelihoodFamily, String> {
         "binomial-logit" => Ok(LikelihoodFamily::BinomialLogit),
         "binomial-probit" => Ok(LikelihoodFamily::BinomialProbit),
         "binomial-cloglog" => Ok(LikelihoodFamily::BinomialCLogLog),
+        "binomial-sas" => Ok(LikelihoodFamily::BinomialSas),
+        "binomial-mixture" => Ok(LikelihoodFamily::BinomialMixture),
         "royston-parmar" => Ok(LikelihoodFamily::RoystonParmar),
         _ => Err(format!("unsupported saved family '{v}'")),
     }
@@ -5626,6 +5952,8 @@ fn family_to_link(f: LikelihoodFamily) -> LinkFunction {
         LikelihoodFamily::BinomialLogit => LinkFunction::Logit,
         LikelihoodFamily::BinomialProbit => LinkFunction::Probit,
         LikelihoodFamily::BinomialCLogLog => LinkFunction::CLogLog,
+        LikelihoodFamily::BinomialSas => LinkFunction::Sas,
+        LikelihoodFamily::BinomialMixture => LinkFunction::Logit,
         LikelihoodFamily::RoystonParmar => LinkFunction::Identity,
     }
 }
@@ -5636,6 +5964,8 @@ fn is_binomial_family(f: LikelihoodFamily) -> bool {
         LikelihoodFamily::BinomialLogit
             | LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialMixture
     )
 }
 
@@ -5699,6 +6029,8 @@ fn pretty_family_name(f: LikelihoodFamily) -> &'static str {
         LikelihoodFamily::BinomialLogit => "Binomial Logit",
         LikelihoodFamily::BinomialProbit => "Binomial Probit",
         LikelihoodFamily::BinomialCLogLog => "Binomial CLogLog",
+        LikelihoodFamily::BinomialSas => "Binomial SAS",
+        LikelihoodFamily::BinomialMixture => "Binomial Mixture",
         LikelihoodFamily::RoystonParmar => "Royston Parmar",
     }
 }
@@ -5806,7 +6138,9 @@ fn build_model_summary(
         }
         LikelihoodFamily::BinomialLogit
         | LikelihoodFamily::BinomialProbit
-        | LikelihoodFamily::BinomialCLogLog => {
+        | LikelihoodFamily::BinomialCLogLog
+        | LikelihoodFamily::BinomialSas
+        | LikelihoodFamily::BinomialMixture => {
             let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
             let p = y
                 .iter()
@@ -6058,6 +6392,16 @@ fn response_sd_from_eta_for_family(
                     gam::quadrature::cloglog_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
                 v
             }
+            LikelihoodFamily::BinomialSas => {
+                let (_, v) =
+                    gam::quadrature::probit_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
+                v
+            }
+            LikelihoodFamily::BinomialMixture => {
+                let (_, v) =
+                    gam::quadrature::logit_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
+                v
+            }
             LikelihoodFamily::RoystonParmar => {
                 let (_, v) =
                     gam::quadrature::survival_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
@@ -6180,6 +6524,12 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
         beta_covariance_corrected: ext.beta_covariance_corrected,
         beta_standard_errors_corrected: ext.beta_standard_errors_corrected,
         reml_score: ext.reml_score,
+        mixture_link_components: ext.mixture_link_components,
+        mixture_link_rho: ext.mixture_link_rho,
+        mixture_link_weights: ext.mixture_link_weights,
+        sas_epsilon: ext.sas_epsilon,
+        sas_log_delta: ext.sas_log_delta,
+        sas_delta: ext.sas_delta,
     }
 }
 
@@ -6821,6 +7171,13 @@ mod tests {
             formula: "y ~ x".to_string(),
             family: "binomial-location-scale-probit".to_string(),
             link: Some("probit".to_string()),
+            mixture_link_components: None,
+            mixture_link_rho: None,
+            mixture_link_weights: None,
+            sas_epsilon: None,
+            sas_log_delta: None,
+            sas_delta: None,
+            wiggle_base_link: None,
             formula_noise: None,
             beta_noise: None,
             sigma_min: None,

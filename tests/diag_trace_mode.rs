@@ -52,6 +52,10 @@ fn make_problem(
 #[test]
 fn compare_trace_third_modes_against_fd() {
     let opts = ExternalOptimOptions {
+        mixture_link: None,
+        optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
         max_iter: 80,
         tol: 1e-6,
