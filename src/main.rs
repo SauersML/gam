@@ -6523,19 +6523,13 @@ fn response_sd_from_eta_for_family(
             LikelihoodFamily::BinomialSas => {
                 let se = eta_se[i].max(0.0);
                 let mut var = if let Some((epsilon, log_delta)) = sas_params {
-                    let m1 = gam::quadrature::normal_expectation_1d_adaptive(
-                        &quad_ctx,
-                        eta[i],
-                        se,
-                        |x| sas_inverse_link_jet(x, epsilon, log_delta).mu,
-                    );
-                    let m2 = gam::quadrature::normal_expectation_1d_adaptive(
+                    let (m1, m2) = gam::quadrature::normal_expectation_1d_adaptive_pair(
                         &quad_ctx,
                         eta[i],
                         se,
                         |x| {
                             let p = sas_inverse_link_jet(x, epsilon, log_delta).mu;
-                            p * p
+                            (p, p * p)
                         },
                     );
                     (m2 - m1 * m1).max(0.0)
@@ -6559,19 +6553,13 @@ fn response_sd_from_eta_for_family(
             LikelihoodFamily::BinomialMixture => {
                 let se = eta_se[i].max(0.0);
                 let mut var = if let Some(state) = mixture_state {
-                    let m1 = gam::quadrature::normal_expectation_1d_adaptive(
-                        &quad_ctx,
-                        eta[i],
-                        se,
-                        |x| mixture_inverse_link_jet(state, x).mu,
-                    );
-                    let m2 = gam::quadrature::normal_expectation_1d_adaptive(
+                    let (m1, m2) = gam::quadrature::normal_expectation_1d_adaptive_pair(
                         &quad_ctx,
                         eta[i],
                         se,
                         |x| {
                             let p = mixture_inverse_link_jet(state, x).mu;
-                            p * p
+                            (p, p * p)
                         },
                     );
                     (m2 - m1 * m1).max(0.0)

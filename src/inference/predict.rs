@@ -663,19 +663,13 @@ where
                             .to_string(),
                     )
                 })?;
-                let m1 = crate::quadrature::normal_expectation_1d_adaptive(
-                    &quad_ctx,
-                    eta[i],
-                    se_i,
-                    |x| sas_inverse_link_jet(x, epsilon, log_delta).mu,
-                );
-                let m2 = crate::quadrature::normal_expectation_1d_adaptive(
+                let (m1, m2) = crate::quadrature::normal_expectation_1d_adaptive_pair(
                     &quad_ctx,
                     eta[i],
                     se_i,
                     |x| {
                         let p = sas_inverse_link_jet(x, epsilon, log_delta).mu;
-                        p * p
+                        (p, p * p)
                     },
                 );
                 (m2 - m1 * m1).max(0.0)
@@ -687,19 +681,13 @@ where
                             .to_string(),
                     )
                 })?;
-                let m1 = crate::quadrature::normal_expectation_1d_adaptive(
-                    &quad_ctx,
-                    eta[i],
-                    se_i,
-                    |x| mixture_inverse_link_jet(state, x).mu,
-                );
-                let m2 = crate::quadrature::normal_expectation_1d_adaptive(
+                let (m1, m2) = crate::quadrature::normal_expectation_1d_adaptive_pair(
                     &quad_ctx,
                     eta[i],
                     se_i,
                     |x| {
                         let p = mixture_inverse_link_jet(state, x).mu;
-                        p * p
+                        (p, p * p)
                     },
                 );
                 (m2 - m1 * m1).max(0.0)
