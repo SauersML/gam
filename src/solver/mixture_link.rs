@@ -186,7 +186,7 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
             let d2 = d1 * (1.0 - 2.0 * mu);
             let d3 = d1 * (1.0 - 6.0 * d1);
             InverseLinkJet {
-                mu: clamp_prob(mu),
+                mu,
                 d1,
                 d2,
                 d3,
@@ -196,7 +196,7 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
             let e = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
             let d1 = normal_pdf(e);
             InverseLinkJet {
-                mu: clamp_prob(normal_cdf_approx(e)),
+                mu: normal_cdf_approx(e),
                 d1,
                 d2: -e * d1,
                 d3: (e * e - 1.0) * d1,
@@ -208,7 +208,7 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
             let s = (-t).exp();
             let d1 = t * s;
             InverseLinkJet {
-                mu: clamp_prob(1.0 - s),
+                mu: 1.0 - s,
                 d1,
                 d2: d1 * (1.0 - t),
                 d3: d1 * (1.0 - 3.0 * t + t * t),
@@ -222,7 +222,7 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
             let d2 = d1 * (r - 1.0);
             let d3 = d1 * (r * r - 3.0 * r + 1.0);
             InverseLinkJet {
-                mu: clamp_prob(mu),
+                mu,
                 d1,
                 d2,
                 d3,
@@ -235,7 +235,7 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
             let d2 = -2.0 * e / (std::f64::consts::PI * den * den);
             let d3 = (6.0 * e * e - 2.0) / (std::f64::consts::PI * den * den * den);
             InverseLinkJet {
-                mu: clamp_prob(0.5 + e.atan() / std::f64::consts::PI),
+                mu: 0.5 + e.atan() / std::f64::consts::PI,
                 d1,
                 d2,
                 d3,
@@ -300,8 +300,8 @@ pub fn mixture_inverse_link_jet(state: &MixtureLinkState, eta: f64) -> InverseLi
         d3 += w * jet.d3;
     }
     InverseLinkJet {
-        mu: clamp_prob(mu),
-        d1: d1.max(1e-12),
+        mu,
+        d1,
         d2,
         d3,
     }
@@ -367,8 +367,6 @@ pub fn mixture_inverse_link_jet_with_rho_partials_into(
             out[i] = jet_i;
         }
     }
-    mixed.mu = clamp_prob(mixed.mu);
-    mixed.d1 = mixed.d1.max(1e-12);
     for j in 0..m {
         let pi_j = state.pi[j];
         let cj = out[j];
