@@ -2647,6 +2647,8 @@ fn default_beta_guess_external(
     link_function: LinkFunction,
     y: ArrayView1<f64>,
     prior_weights: ArrayView1<f64>,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
 ) -> Array1<f64> {
     let mut beta = Array1::<f64>::zeros(p);
     let intercept_col = 0usize;
@@ -2671,10 +2673,27 @@ fn default_beta_guess_external(
                         })
                     }
                     LinkFunction::CLogLog => (-(1.0 - prevalence).ln()).ln(),
-                    LinkFunction::Sas => standard_normal_quantile(prevalence)
-                        .unwrap_or_else(|_| (prevalence / (1.0 - prevalence)).ln()),
+                    LinkFunction::Sas => solve_intercept_for_prevalence(
+                        link_function,
+                        prevalence,
+                        mixture_link_state,
+                        sas_link_state,
+                    )
+                    .unwrap_or_else(|| {
+                        standard_normal_quantile(prevalence)
+                            .unwrap_or_else(|_| (prevalence / (1.0 - prevalence)).ln())
+                    }),
                     LinkFunction::Identity => unreachable!(),
                 };
+                if mixture_link_state.is_some() {
+                    beta[intercept_col] = solve_intercept_for_prevalence(
+                        link_function,
+                        prevalence,
+                        mixture_link_state,
+                        sas_link_state,
+                    )
+                    .unwrap_or(beta[intercept_col]);
+                }
             }
         }
         LinkFunction::Identity => {
@@ -2690,6 +2709,94 @@ fn default_beta_guess_external(
         }
     }
     beta
+}
+
+fn solve_intercept_for_prevalence(
+    link_function: LinkFunction,
+    prevalence: f64,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
+) -> Option<f64> {
+    #[inline]
+    fn f_eta(
+        link_function: LinkFunction,
+        eta: f64,
+        prevalence: f64,
+        mixture_link_state: Option<&MixtureLinkState>,
+        sas_link_state: Option<&SasLinkState>,
+    ) -> f64 {
+        standard_inverse_link_jet(link_function, eta, mixture_link_state, sas_link_state).mu
+            - prevalence
+    }
+
+    let mut lo = -40.0;
+    let mut hi = 40.0;
+    let mut f_lo = f_eta(
+        link_function,
+        lo,
+        prevalence,
+        mixture_link_state,
+        sas_link_state,
+    );
+    let mut f_hi = f_eta(
+        link_function,
+        hi,
+        prevalence,
+        mixture_link_state,
+        sas_link_state,
+    );
+    if !(f_lo.is_finite() && f_hi.is_finite()) {
+        return None;
+    }
+    for _ in 0..8 {
+        if f_lo <= 0.0 && f_hi >= 0.0 {
+            break;
+        }
+        lo *= 2.0;
+        hi *= 2.0;
+        f_lo = f_eta(
+            link_function,
+            lo,
+            prevalence,
+            mixture_link_state,
+            sas_link_state,
+        );
+        f_hi = f_eta(
+            link_function,
+            hi,
+            prevalence,
+            mixture_link_state,
+            sas_link_state,
+        );
+        if !(f_lo.is_finite() && f_hi.is_finite()) {
+            return None;
+        }
+    }
+    if f_lo > 0.0 {
+        return Some(lo);
+    }
+    if f_hi < 0.0 {
+        return Some(hi);
+    }
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        let f_mid = f_eta(
+            link_function,
+            mid,
+            prevalence,
+            mixture_link_state,
+            sas_link_state,
+        );
+        if !f_mid.is_finite() {
+            return None;
+        }
+        if f_mid > 0.0 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(0.5 * (lo + hi))
 }
 
 pub fn run_working_model_pirls<M, F>(
@@ -3637,6 +3744,8 @@ pub fn fit_model_for_fixed_rho<'a>(
                 link_function,
                 y,
                 prior_weights,
+                config.mixture_link_state.as_ref(),
+                config.sas_link_state.as_ref(),
             ))
         });
     if let Some(lb) = coefficient_lower_bounds {
@@ -3988,6 +4097,8 @@ fn fit_model_for_fixed_rho_sparse_implicit(
                 link_function,
                 y,
                 prior_weights,
+                config.mixture_link_state.as_ref(),
+                config.sas_link_state.as_ref(),
             ))
         });
     if let Some(lb) = coefficient_lower_bounds {
@@ -5734,7 +5845,7 @@ mod tests {
     fn default_beta_guess_logit_uses_log_odds_prevalence() {
         let y = array![0.0, 1.0, 1.0, 1.0];
         let w = Array1::ones(4);
-        let beta = default_beta_guess_external(3, LinkFunction::Logit, y.view(), w.view());
+        let beta = default_beta_guess_external(3, LinkFunction::Logit, y.view(), w.view(), None, None);
         let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
         let prevalence = prevalence.max(1e-6_f64).min(1.0_f64 - 1e-6_f64);
         let expected = (prevalence / (1.0 - prevalence)).ln();
@@ -5747,7 +5858,8 @@ mod tests {
     fn default_beta_guess_probit_uses_standard_normal_quantile() {
         let y = array![0.0, 1.0, 1.0, 1.0];
         let w = Array1::ones(4);
-        let beta = default_beta_guess_external(3, LinkFunction::Probit, y.view(), w.view());
+        let beta =
+            default_beta_guess_external(3, LinkFunction::Probit, y.view(), w.view(), None, None);
         let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
         let prevalence = prevalence.max(1e-6_f64).min(1.0_f64 - 1e-6_f64);
         let log_odds = (prevalence / (1.0 - prevalence)).ln();
