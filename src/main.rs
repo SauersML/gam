@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_FULL};
-use csv::{ReaderBuilder, StringRecord, WriterBuilder};
+use csv::WriterBuilder;
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
@@ -31,11 +31,19 @@ use gam::gamlss::{
 };
 use gam::generative::{generative_spec_from_predict, sample_observation_replicates};
 use gam::hmc::{FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family};
+use gam::inference::data::{
+    EncodedDataset as Dataset, UnseenCategoryPolicy, load_csv_with_inferred_schema,
+    load_csv_with_schema,
+};
+use gam::inference::model::{
+    ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
+    ModelKind, PredictModelClass,
+};
 use gam::joint::{
     JointLinkGeometry, JointModelConfig, JointModelResult, fit_joint_model_engine, predict_joint,
 };
 use gam::matrix::DesignMatrix;
-use gam::mixture_link::state_from_spec;
+use gam::mixture_link::{inverse_link_jet_for_inverse_link, state_from_sas_spec, state_from_spec};
 use gam::probability::{normal_cdf_approx, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
@@ -49,10 +57,11 @@ use gam::survival_location_scale_probit::{
     SurvivalLocationScaleProbitPredictInput, SurvivalLocationScaleProbitSpec, TimeBlockInput,
     fit_survival_location_scale_probit, predict_survival_location_scale_probit,
 };
-use gam::types::{LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec};
+use gam::types::{
+    InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec,
+};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
-use serde::{Deserialize, Serialize};
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -71,8 +80,8 @@ struct Cli {
 enum Command {
     #[command(alias = "train")]
     Fit(FitArgs),
+    Report(ReportArgs),
     Predict(PredictArgs),
-    Survival(SurvivalArgs),
     Diagnose(DiagnoseArgs),
     Sample(SampleArgs),
     #[command(alias = "simulate")]
@@ -82,6 +91,11 @@ enum Command {
 #[derive(Args, Debug)]
 struct FitArgs {
     data: PathBuf,
+    #[arg(
+        value_name = "FORMULA",
+        help = "Optional positional formula, e.g. 'y ~ s(x)' or 'Surv(entry, exit, event) ~ s(age) + treatment'"
+    )]
+    formula_positional: Option<String>,
     #[arg(
         short = 'f',
         long = "formula",
@@ -242,6 +256,13 @@ struct GenerateArgs {
     out: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+struct ReportArgs {
+    model: PathBuf,
+    data: Option<PathBuf>,
+    out: Option<PathBuf>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum FamilyArg {
     Auto,
@@ -249,6 +270,7 @@ enum FamilyArg {
     BinomialLogit,
     BinomialProbit,
     BinomialCloglog,
+    RoystonParmar,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -282,113 +304,6 @@ impl LinkWigglePenaltyMode {
 }
 
 const MODEL_VERSION: u32 = 2;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct SavedModel {
-    version: u32,
-    formula: String,
-    family: String,
-    link: Option<String>,
-    #[serde(default)]
-    mixture_link_components: Option<Vec<String>>,
-    #[serde(default)]
-    mixture_link_rho: Option<Vec<f64>>,
-    #[serde(default)]
-    mixture_link_weights: Option<Vec<f64>>,
-    #[serde(default)]
-    mixture_link_param_covariance: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
-    sas_epsilon: Option<f64>,
-    #[serde(default)]
-    sas_log_delta: Option<f64>,
-    #[serde(default)]
-    sas_delta: Option<f64>,
-    #[serde(default)]
-    sas_param_covariance: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
-    wiggle_base_link: Option<String>,
-    #[serde(default)]
-    formula_noise: Option<String>,
-    #[serde(default)]
-    beta_noise: Option<Vec<f64>>,
-    #[serde(default)]
-    sigma_min: Option<f64>,
-    #[serde(default)]
-    sigma_max: Option<f64>,
-    #[serde(default)]
-    joint_beta_link: Option<Vec<f64>>,
-    #[serde(default)]
-    joint_knot_range: Option<(f64, f64)>,
-    #[serde(default)]
-    joint_knot_vector: Option<Vec<f64>>,
-    #[serde(default)]
-    joint_link_transform: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
-    joint_degree: Option<usize>,
-    #[serde(default)]
-    joint_ridge_used: Option<f64>,
-    #[serde(default)]
-    probit_wiggle_knots: Option<Vec<f64>>,
-    #[serde(default)]
-    probit_wiggle_degree: Option<usize>,
-    #[serde(default)]
-    beta_wiggle: Option<Vec<f64>>,
-    #[serde(default)]
-    survival_entry: Option<String>,
-    #[serde(default)]
-    survival_exit: Option<String>,
-    #[serde(default)]
-    survival_event: Option<String>,
-    #[serde(default)]
-    survival_spec: Option<String>,
-    #[serde(default)]
-    survival_baseline_target: Option<String>,
-    #[serde(default)]
-    survival_baseline_scale: Option<f64>,
-    #[serde(default)]
-    survival_baseline_shape: Option<f64>,
-    #[serde(default)]
-    survival_baseline_rate: Option<f64>,
-    #[serde(default)]
-    survival_time_basis: Option<String>,
-    #[serde(default)]
-    survival_time_degree: Option<usize>,
-    #[serde(default)]
-    survival_time_knots: Option<Vec<f64>>,
-    #[serde(default)]
-    survival_time_smooth_lambda: Option<f64>,
-    #[serde(default)]
-    survival_ridge_lambda: Option<f64>,
-    #[serde(default)]
-    survival_likelihood: Option<String>,
-    #[serde(default)]
-    survival_sigma_min: Option<f64>,
-    #[serde(default)]
-    survival_sigma_max: Option<f64>,
-    #[serde(default)]
-    survival_beta_time: Option<Vec<f64>>,
-    #[serde(default)]
-    survival_beta_threshold: Option<Vec<f64>>,
-    #[serde(default)]
-    survival_beta_log_sigma: Option<Vec<f64>>,
-    #[serde(default)]
-    survival_distribution: Option<String>,
-    #[serde(default)]
-    training_headers: Option<Vec<String>>,
-    #[serde(default)]
-    resolved_term_spec: Option<TermCollectionSpec>,
-    #[serde(default)]
-    resolved_term_spec_noise: Option<TermCollectionSpec>,
-    fit_max_iter: usize,
-    fit_tol: f64,
-    beta: Vec<f64>,
-    lambdas: Vec<f64>,
-    scale: f64,
-    #[serde(default)]
-    reml_score: Option<f64>,
-    covariance_conditional: Option<Vec<Vec<f64>>>,
-    covariance_corrected: Option<Vec<Vec<f64>>>,
-}
 
 #[derive(Clone, Debug)]
 struct ParsedFormula {
@@ -441,21 +356,7 @@ struct LinkChoice {
 }
 
 const FAMILY_GAUSSIAN_LOCATION_SCALE: &str = "gaussian-location-scale";
-const FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT: &str = "binomial-location-scale-probit";
-
-#[derive(Clone, Debug)]
-struct Dataset {
-    headers: Vec<String>,
-    values: Array2<f64>,
-    kinds: Vec<ColumnKind>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ColumnKind {
-    Continuous,
-    Binary,
-    Categorical,
-}
+const FAMILY_BINOMIAL_LOCATION_SCALE: &str = "binomial-location-scale";
 
 fn main() {
     if let Err(e) = run() {
@@ -468,8 +369,8 @@ fn run() -> Result<(), String> {
     let cli = Cli::parse();
     match cli.command {
         Command::Fit(args) => run_fit(args),
+        Command::Report(args) => run_report(args),
         Command::Predict(args) => run_predict(args),
-        Command::Survival(args) => run_survival(args),
         Command::Diagnose(args) => run_diagnose(args),
         Command::Sample(args) => run_sample(args),
         Command::Generate(args) => run_generate(args),
@@ -479,6 +380,52 @@ fn run() -> Result<(), String> {
 fn run_fit(args: FitArgs) -> Result<(), String> {
     let formula_text = choose_formula(&args)?;
     let parsed = parse_formula(&formula_text)?;
+    if let Some((entry, exit, event)) = parse_surv_response(&parsed.response)? {
+        if !matches!(args.family, FamilyArg::Auto | FamilyArg::RoystonParmar) {
+            return Err("--family with Surv(...) must be auto or royston-parmar".to_string());
+        }
+        if args.predict_noise.is_some()
+            || args.link.is_some()
+            || args.mixture_rho.is_some()
+            || args.sas_init.is_some()
+            || args.flexible_link
+            || args.firth
+            || args.learn_link_wiggle
+        {
+            return Err(
+                "Surv(...) formulas use survival fitting mode; remove binomial/location-scale/link-specific flags".to_string(),
+            );
+        }
+        let rhs = formula_rhs_text(&formula_text)?;
+        let surv_args = SurvivalArgs {
+            data: args.data.clone(),
+            entry,
+            exit,
+            event,
+            formula: rhs,
+            spec: "net".to_string(),
+            survival_likelihood: "transformation".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            out: args.out.clone(),
+        };
+        return run_survival(surv_args);
+    }
+    if args.family == FamilyArg::RoystonParmar {
+        return Err(
+            "--family royston-parmar requires Surv(entry, exit, event) on the formula LHS"
+                .to_string(),
+        );
+    }
     let ds = load_dataset(&args.data)?;
 
     let col_map: HashMap<String, usize> = ds
@@ -515,13 +462,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             })
         } else {
             if args.mixture_rho.is_some() {
-                return Err("--mixture-rho requires --link blended(...)".to_string());
+                return Err("--mixture-rho requires --link blended(...)/mixture(...)".to_string());
             }
             None
         }
     } else {
         if args.mixture_rho.is_some() {
-            return Err("--mixture-rho requires --link blended(...)".to_string());
+            return Err("--mixture-rho requires --link blended(...)/mixture(...)".to_string());
         }
         None
     };
@@ -559,6 +506,20 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     };
 
     let mut family = resolve_family(args.family, link_choice.clone(), y.view())?;
+    let mut inference_notes: Vec<String> = Vec::new();
+    if args.family == FamilyArg::Auto && link_choice.is_none() {
+        if is_binary_response(y.view()) {
+            inference_notes.push(format!(
+                "Inferred binomial-logit family for response '{}' because all values are binary {{0,1}}. Override with --family or --link.",
+                parsed.response
+            ));
+        } else {
+            inference_notes.push(format!(
+                "Inferred gaussian-identity family for response '{}' because values are not strictly binary. Override with --family or --link.",
+                parsed.response
+            ));
+        }
+    }
     let effective_link = link_choice
         .as_ref()
         .map(|c| c.link)
@@ -579,7 +540,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
     if args.learn_link_wiggle && args.predict_noise.is_none() {
         return Err(
-            "--learn-link-wiggle currently requires --predict-noise with binomial-probit location-scale fitting"
+            "--learn-link-wiggle currently requires --predict-noise with binomial location-scale fitting"
                 .to_string(),
         );
     }
@@ -593,13 +554,14 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if let Some(noise_formula_raw) = &args.predict_noise {
         let noise_formula = normalize_noise_formula(noise_formula_raw, &parsed.response);
         let parsed_noise = parse_formula(&noise_formula)?;
-        let noise_spec = build_term_spec(&parsed_noise.terms, &ds, &col_map)?;
-        let mean_spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+        let noise_spec = build_term_spec(&parsed_noise.terms, &ds, &col_map, &mut inference_notes)?;
+        let mean_spec = build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
+        print_inference_summary(&inference_notes);
 
         if family == LikelihoodFamily::GaussianIdentity {
             if args.learn_link_wiggle {
                 return Err(
-                    "--learn-link-wiggle is currently supported only for binomial-probit location-scale fitting"
+                    "--learn-link-wiggle is currently supported only for binomial location-scale fitting"
                         .to_string(),
                 );
             }
@@ -637,37 +599,67 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             );
 
             if let Some(out) = args.out {
-                let cov_flat = fit.covariance_conditional.as_ref();
+                let beta_mean = fit
+                    .block_states
+                    .first()
+                    .map(|b| b.beta.clone())
+                    .unwrap_or_else(|| Array1::zeros(0));
+                let fit_result = core_saved_fit_result(
+                    beta_mean,
+                    fit.lambdas.clone(),
+                    1.0,
+                    fit.covariance_conditional.clone(),
+                    fit.covariance_conditional.clone(),
+                    f64::NAN,
+                );
                 let model = build_location_scale_saved_model(
                     formula_text.clone(),
                     FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
                     link_choice.as_ref().map(link_choice_to_string),
+                    ds.schema.clone(),
                     noise_formula.clone(),
                     ds.headers.clone(),
                     frozen_mean_spec.clone(),
                     frozen_noise_spec.clone(),
-                    fit.block_states
-                        .first()
-                        .map(|b| b.beta.to_vec())
-                        .unwrap_or_default(),
+                    fit_result,
                     fit.block_states.get(1).map(|b| b.beta.to_vec()),
                     sigma_min,
                     sigma_max,
-                    fit.lambdas.to_vec(),
-                    cov_flat.map(array2_to_nested_vec),
-                    cov_flat.map(array2_to_nested_vec),
                 );
                 write_model_json(&out, &model)?;
             }
             return Ok(());
         }
 
-        if family != LikelihoodFamily::BinomialProbit {
+        if !is_binomial_family(family) {
             return Err(
-                "--predict-noise currently supports Gaussian and Binomial-Probit families; use --family binomial-probit (or --link probit) for binary outcomes"
-                    .to_string(),
+                "--predict-noise currently supports Gaussian and binomial families".to_string(),
             );
         }
+
+        let location_scale_link_kind = match family {
+            LikelihoodFamily::BinomialMixture => {
+                let spec = mixture_link_spec
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "binomial blended-inverse-link location-scale fitting requires --link blended(...)"
+                            .to_string()
+                    })?
+                    .clone();
+                let state = state_from_spec(&spec)
+                    .map_err(|e| format!("invalid blended link configuration: {e}"))?;
+                InverseLink::Mixture(state)
+            }
+            LikelihoodFamily::BinomialSas => {
+                let spec = *sas_link_spec.as_ref().ok_or_else(|| {
+                    "binomial SAS location-scale fitting requires --link sas".to_string()
+                })?;
+                let state = state_from_sas_spec(spec)
+                    .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
+                InverseLink::Sas(state)
+            }
+            _ => InverseLink::Standard(effective_link),
+        };
 
         let sigma_min = 0.05;
         let sigma_max = 20.0;
@@ -697,6 +689,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 &y,
                 &mean_spec,
                 &noise_spec,
+                location_scale_link_kind.clone(),
                 sigma_min,
                 sigma_max,
                 &options,
@@ -726,6 +719,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 gam::BinomialLocationScaleProbitWiggleSpec {
                     y: y.clone(),
                     weights: Array1::ones(y.len()),
+                    link_kind: location_scale_link_kind.clone(),
                     sigma_min,
                     sigma_max,
                     wiggle_knots: wiggle_knots.clone(),
@@ -780,6 +774,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 BinomialLocationScaleProbitTermSpec {
                     y: y.clone(),
                     weights: Array1::ones(y.len()),
+                    link_kind: location_scale_link_kind.clone(),
                     sigma_min,
                     sigma_max,
                     threshold_spec: mean_spec.clone(),
@@ -808,30 +803,59 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
         println!(
             "model fit complete | family={} | outer_iter={} | converged={}",
-            FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT, fit.outer_iterations, fit.converged
+            FAMILY_BINOMIAL_LOCATION_SCALE, fit.outer_iterations, fit.converged
         );
 
         if let Some(out) = args.out {
-            let cov_flat = fit.covariance_conditional.as_ref();
+            let beta_threshold = fit
+                .block_states
+                .first()
+                .map(|b| b.beta.clone())
+                .unwrap_or_else(|| Array1::zeros(0));
+            let fit_result = core_saved_fit_result(
+                beta_threshold,
+                fit.lambdas.clone(),
+                1.0,
+                fit.covariance_conditional.clone(),
+                fit.covariance_conditional.clone(),
+                f64::NAN,
+            );
             let mut model = build_location_scale_saved_model(
                 formula_text,
-                FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT.to_string(),
-                Some("probit".to_string()),
+                FAMILY_BINOMIAL_LOCATION_SCALE.to_string(),
+                Some(inverse_link_to_saved_string(&location_scale_link_kind)),
+                ds.schema.clone(),
                 noise_formula,
                 ds.headers.clone(),
                 frozen_mean_spec,
                 frozen_noise_spec,
-                fit.block_states
-                    .first()
-                    .map(|b| b.beta.to_vec())
-                    .unwrap_or_default(),
+                fit_result,
                 fit.block_states.get(1).map(|b| b.beta.to_vec()),
                 sigma_min,
                 sigma_max,
-                fit.lambdas.to_vec(),
-                cov_flat.map(array2_to_nested_vec),
-                cov_flat.map(array2_to_nested_vec),
             );
+            match &location_scale_link_kind {
+                InverseLink::Sas(state) => {
+                    model.family_state = FittedFamily::LocationScale {
+                        likelihood: LikelihoodFamily::BinomialSas,
+                        base_link: Some(InverseLink::Sas(*state)),
+                    };
+                }
+                InverseLink::Mixture(state) => {
+                    model.family_state = FittedFamily::LocationScale {
+                        likelihood: LikelihoodFamily::BinomialMixture,
+                        base_link: Some(InverseLink::Mixture(state.clone())),
+                    };
+                }
+                InverseLink::Standard(link_fn) => {
+                    model.family_state = FittedFamily::LocationScale {
+                        likelihood: inverse_link_to_binomial_family(&InverseLink::Standard(
+                            *link_fn,
+                        )),
+                        base_link: Some(InverseLink::Standard(*link_fn)),
+                    };
+                }
+            }
             if let Some((knots, degree, beta_wiggle)) = wiggle_meta {
                 model.probit_wiggle_knots = Some(knots.to_vec());
                 model.probit_wiggle_degree = Some(degree);
@@ -842,7 +866,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    let spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+    let spec = build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
+    print_inference_summary(&inference_notes);
     let has_bounded_terms = term_spec_has_bounded_terms(&spec);
     if has_bounded_terms && args.firth {
         return Err("--firth is not yet supported with bounded() coefficients".to_string());
@@ -905,20 +930,28 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             );
 
             if let Some(out) = args.out {
-                let model = SavedModel {
+                let fit_result = core_saved_fit_result(
+                    joint.beta_base.clone(),
+                    Array1::from_vec(joint.lambdas.clone()),
+                    1.0,
+                    None,
+                    None,
+                    f64::NAN,
+                );
+                let model = SavedModel::from_payload(FittedModelPayload {
                     version: MODEL_VERSION,
                     formula: formula_text,
+                    model_kind: ModelKind::FlexibleLink,
+                    family_state: FittedFamily::FlexibleLink {
+                        likelihood: family,
+                        link: choice.link,
+                    },
                     family: family_to_string(family).to_string(),
+                    fit_result: Some(fit_result),
+                    data_schema: Some(ds.schema.clone()),
                     link: Some(link_choice_to_string(choice)),
-                    mixture_link_components: None,
-                    mixture_link_rho: None,
-                    mixture_link_weights: None,
                     mixture_link_param_covariance: None,
-                    sas_epsilon: None,
-                    sas_log_delta: None,
-                    sas_delta: None,
                     sas_param_covariance: None,
-                    wiggle_base_link: None,
                     formula_noise: None,
                     beta_noise: None,
                     sigma_min: None,
@@ -955,15 +988,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     training_headers: Some(ds.headers.clone()),
                     resolved_term_spec: Some(initial_frozen_spec.clone()),
                     resolved_term_spec_noise: None,
-                    fit_max_iter,
-                    fit_tol,
-                    beta: joint.beta_base.to_vec(),
-                    lambdas: joint.lambdas,
-                    scale: 1.0,
-                    reml_score: None,
-                    covariance_conditional: None,
-                    covariance_corrected: None,
-                };
+                });
                 write_model_json(&out, &model)?;
             }
             return Ok(());
@@ -1041,33 +1066,25 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     );
 
     if let Some(out) = args.out {
-        let model = SavedModel {
+        let model = SavedModel::from_payload(FittedModelPayload {
             version: MODEL_VERSION,
             formula: formula_text,
+            model_kind: ModelKind::Standard,
+            family_state: FittedFamily::Standard {
+                likelihood: family,
+                link: Some(effective_link),
+                mixture_state: saved_mixture_state_from_fit(&fit),
+                sas_state: saved_sas_state_from_fit(&fit),
+            },
             family: family_to_string(family).to_string(),
+            fit_result: Some(fit.clone()),
+            data_schema: Some(ds.schema.clone()),
             link: link_choice.as_ref().map(link_choice_to_string),
-            mixture_link_components: fit.mixture_link_components.as_ref().map(|v| {
-                v.iter()
-                    .map(|c| match c {
-                        LinkComponent::Probit => "probit".to_string(),
-                        LinkComponent::Logit => "logit".to_string(),
-                        LinkComponent::CLogLog => "cloglog".to_string(),
-                        LinkComponent::LogLog => "loglog".to_string(),
-                        LinkComponent::Cauchit => "cauchit".to_string(),
-                    })
-                    .collect::<Vec<_>>()
-            }),
-            mixture_link_rho: fit.mixture_link_rho.as_ref().map(|v| v.to_vec()),
-            mixture_link_weights: fit.mixture_link_weights.as_ref().map(|v| v.to_vec()),
             mixture_link_param_covariance: fit
                 .mixture_link_param_covariance
                 .as_ref()
                 .map(array2_to_nested_vec),
-            sas_epsilon: fit.sas_epsilon,
-            sas_log_delta: fit.sas_log_delta,
-            sas_delta: fit.sas_delta,
             sas_param_covariance: fit.sas_param_covariance.as_ref().map(array2_to_nested_vec),
-            wiggle_base_link: Some(link_name(effective_link).to_string()),
             formula_noise: None,
             beta_noise: None,
             sigma_min: None,
@@ -1104,18 +1121,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             training_headers: Some(ds.headers.clone()),
             resolved_term_spec: Some(frozen_spec),
             resolved_term_spec_noise: None,
-            fit_max_iter,
-            fit_tol,
-            beta: fit.beta.to_vec(),
-            lambdas: fit.lambdas.to_vec(),
-            scale: fit.scale,
-            reml_score: Some(fit.reml_score),
-            covariance_conditional: fit.beta_covariance.as_ref().map(array2_to_nested_vec),
-            covariance_corrected: fit
-                .beta_covariance_corrected
-                .as_ref()
-                .map(array2_to_nested_vec),
-        };
+        });
         write_model_json(&out, &model)?;
     }
 
@@ -1128,21 +1134,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     let model: SavedModel =
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
     validate_saved_model_for_inference_stability(&model)?;
-    let saved_mixture = saved_mixture_state(&model)?;
-    let saved_sas = saved_sas_params(&model);
-    let saved_link_kind = if let Some(state) = saved_mixture.clone() {
-        Some(gam::types::InverseLink::Mixture(state))
-    } else {
-        saved_sas.map(|(epsilon, log_delta)| {
-            gam::types::InverseLink::Sas(
-                gam::mixture_link::state_from_sas_spec(gam::types::SasLinkSpec {
-                    initial_epsilon: epsilon,
-                    initial_log_delta: log_delta,
-                })
-                .expect("saved SAS parameters should reconstruct valid SAS link state"),
-            )
-        })
-    };
+    let saved_mixture = model.saved_mixture_state()?;
+    let saved_sas = model.saved_sas_state()?;
+    let saved_link_kind = model.resolved_inverse_link()?;
     let saved_mixture_param_cov = parse_optional_covariance(
         model.mixture_link_param_covariance.as_ref(),
         "mixture_link_param_covariance",
@@ -1150,7 +1144,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     let saved_sas_param_cov =
         parse_optional_covariance(model.sas_param_covariance.as_ref(), "sas_param_covariance")?;
 
-    let ds = load_dataset(&args.new_data)?;
+    let schema = required_saved_schema(&model)?;
+    let ds = load_dataset_with_schema(&args.new_data, schema)?;
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -1158,7 +1153,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         .map(|(i, h)| (h.clone(), i))
         .collect();
     let training_headers = model.training_headers.as_ref();
-    if model.family == family_to_string(LikelihoodFamily::RoystonParmar) {
+    if matches!(model.predict_model_class(), PredictModelClass::Survival) {
         let entry_name = model
             .survival_entry
             .as_ref()
@@ -1413,7 +1408,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 x_exit[[i, p_time + j]] = cov_design.design[[i, j]];
             }
         }
-        let beta = Array1::from_vec(model.beta.clone());
+        let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
+        let beta = fit_saved.beta.clone();
         if beta.len() != p {
             return Err(format!(
                 "survival model/design mismatch: beta has {} coefficients but design has {} columns",
@@ -1502,7 +1498,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         );
         return Ok(());
     }
-    if model.family == FAMILY_GAUSSIAN_LOCATION_SCALE {
+    if matches!(
+        model.predict_model_class(),
+        PredictModelClass::GaussianLocationScale
+    ) {
         let spec_mu = resolve_term_spec_for_prediction(
             &model.resolved_term_spec,
             training_headers,
@@ -1511,7 +1510,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         )?;
         let design_mu = build_term_collection_design(ds.values.view(), &spec_mu)
             .map_err(|e| format!("failed to build mean prediction design: {e}"))?;
-        let beta_mu = Array1::from_vec(model.beta.clone());
+        let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
+        let beta_mu = fit_saved.beta.clone();
         if beta_mu.len() != design_mu.design.ncols() {
             return Err(format!(
                 "mean model/design mismatch: beta has {} coefficients but design has {} columns",
@@ -1572,7 +1572,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         );
         return Ok(());
     }
-    if model.family == FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT {
+    if model.is_binomial_location_scale_model() {
         let spec_t = resolve_term_spec_for_prediction(
             &model.resolved_term_spec,
             training_headers,
@@ -1581,7 +1581,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         )?;
         let design_t = build_term_collection_design(ds.values.view(), &spec_t)
             .map_err(|e| format!("failed to build threshold prediction design: {e}"))?;
-        let beta_t = Array1::from_vec(model.beta.clone());
+        let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
+        let beta_t = fit_saved.beta.clone();
         if beta_t.len() != design_t.design.ncols() {
             return Err(format!(
                 "threshold model/design mismatch: beta has {} coefficients but design has {} columns",
@@ -1589,9 +1590,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 design_t.design.ncols()
             ));
         }
-        let _noise_formula = model.formula_noise.as_ref().ok_or_else(|| {
-            "binomial-location-scale-probit model is missing formula_noise".to_string()
-        })?;
+        let _noise_formula = model
+            .formula_noise
+            .as_ref()
+            .ok_or_else(|| "binomial-location-scale model is missing formula_noise".to_string())?;
         let spec_noise = resolve_term_spec_for_prediction(
             &model.resolved_term_spec_noise,
             training_headers,
@@ -1600,9 +1602,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         )?;
         let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
             .map_err(|e| format!("failed to build noise prediction design: {e}"))?;
-        let beta_noise = Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
-            "binomial-location-scale-probit model is missing beta_noise".to_string()
-        })?);
+        let beta_noise =
+            Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
+                "binomial-location-scale model is missing beta_noise".to_string()
+            })?);
         if beta_noise.len() != design_noise.design.ncols() {
             return Err(format!(
                 "noise model/design mismatch: beta has {} coefficients but design has {} columns",
@@ -1612,6 +1615,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         }
         let eta_t = design_t.design.dot(&beta_t);
         let eta_noise = design_noise.design.dot(&beta_noise);
+        let saved_loc_link = saved_link_kind.as_ref().ok_or_else(|| {
+            "binomial-location-scale model is missing link state/metadata".to_string()
+        })?;
         let sigma_min = model.sigma_min.unwrap_or(0.05);
         let sigma_max = model.sigma_max.unwrap_or(20.0);
         let (sigma, dsigma) = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max);
@@ -1632,7 +1638,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
             if cov_mat.nrows() != p_total || cov_mat.ncols() != p_total {
                 return Err(format!(
-                    "covariance shape mismatch for binomial-location-scale-probit: got {}x{}, expected {}x{}",
+                    "covariance shape mismatch for binomial-location-scale: got {}x{}, expected {}x{}",
                     cov_mat.nrows(),
                     cov_mat.ncols(),
                     p_total,
@@ -1660,7 +1666,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         } else {
             None
         };
-        let mean = if args.mode == PredictModeArg::PosteriorMean {
+        let use_probit_integrated =
+            matches!(saved_loc_link, InverseLink::Standard(LinkFunction::Probit));
+        let mean = if args.mode == PredictModeArg::PosteriorMean && use_probit_integrated {
             if p_w == 0 {
                 let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
                 let cov_tt = cov_mat.slice(s![0..p_t, 0..p_t]).to_owned();
@@ -1713,7 +1721,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 let xd_l_covlw = design_noise.design.dot(&cov_lw);
                 let quad_ctx = gam::quadrature::QuadratureContext::new();
                 let beta_w = Array1::from_vec(model.beta_wiggle.clone().ok_or_else(|| {
-                    "binomial-location-scale-probit wiggle model is missing beta_wiggle".to_string()
+                    "binomial-location-scale wiggle model is missing beta_wiggle".to_string()
                 })?);
                 if beta_w.len() != p_w {
                     return Err(format!(
@@ -1790,7 +1798,12 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 out
             }
         } else {
-            eta.mapv(normal_cdf_approx)
+            try_inverse_link_array(
+                inverse_link_to_binomial_family(saved_loc_link),
+                eta.view(),
+                Some(saved_loc_link),
+            )
+            .map_err(|e| format!("location-scale inverse-link prediction failed: {e}"))?
         };
         let mut mean_lo = None;
         let mut mean_hi = None;
@@ -1804,13 +1817,13 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 "internal error: uncertainty requested but eta SE missing".to_string()
             })?;
             let response_sd = response_sd_from_eta_for_family(
-                LikelihoodFamily::BinomialProbit,
+                inverse_link_to_binomial_family(saved_loc_link),
                 eta.view(),
                 se_base.view(),
-                None,
-                None,
-                None,
-                None,
+                saved_mixture.as_ref(),
+                saved_sas.as_ref(),
+                saved_mixture_param_cov.as_ref(),
+                saved_sas_param_cov.as_ref(),
             )?;
             let (lo, hi) = response_interval_from_mean_sd(
                 mean.view(),
@@ -1848,7 +1861,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build prediction design: {e}"))?;
 
-    let beta = Array1::from_vec(model.beta.clone());
+    let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
+    let beta = fit_saved.beta.clone();
     if beta.len() != design.design.ncols() {
         return Err(format!(
             "model/design mismatch: model beta has {} coefficients but new-data design has {} columns",
@@ -1858,9 +1872,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     }
 
     let offset = Array1::zeros(design.design.nrows());
-    let family = family_from_string(&model.family)?;
+    let family = model.likelihood();
     if let Some(joint) = load_joint_result(&model, family)? {
-        let beta_base = Array1::from_vec(model.beta.clone());
+        let beta_base = fit_saved.beta.clone();
         if beta_base.len() != design.design.ncols() {
             return Err(format!(
                 "joint model/design mismatch: beta has {} coefficients but design has {} columns",
@@ -1907,7 +1921,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     pred.eta.view(),
                     eff.view(),
                     saved_mixture.as_ref(),
-                    saved_sas,
+                    saved_sas.as_ref(),
                     saved_mixture_param_cov.as_ref(),
                     saved_sas_param_cov.as_ref(),
                 )?;
@@ -2016,7 +2030,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 eta.view(),
                 se.view(),
                 saved_mixture.as_ref(),
-                saved_sas,
+                saved_sas.as_ref(),
                 saved_mixture_param_cov.as_ref(),
                 saved_sas_param_cov.as_ref(),
             )?;
@@ -2074,7 +2088,8 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
     validate_saved_model_for_inference_stability(&model)?;
     let parsed = parse_formula(&model.formula)?;
-    let ds = load_dataset(&args.data)?;
+    let schema = required_saved_schema(&model)?;
+    let ds = load_dataset_with_schema(&args.data, schema)?;
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -2102,7 +2117,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
 
-    let family = family_from_string(&model.family)?;
+    let family = model.likelihood();
     let link = family_to_link(family);
     let weights = Array1::ones(ds.values.nrows());
     let offset = Array1::zeros(ds.values.nrows());
@@ -2119,8 +2134,8 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
-            max_iter: model.fit_max_iter,
-            tol: model.fit_tol,
+            max_iter: 80,
+            tol: 1e-6,
             nullspace_dims: design.nullspace_dims.clone(),
             linear_constraints: design.linear_constraints.clone(),
         },
@@ -3123,7 +3138,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
     let formula = format!("__survival__ ~ {}", args.formula);
     let parsed = parse_formula(&formula)?;
-    let term_spec = build_term_spec(&parsed.terms, &ds, &col_map)?;
+    let mut inference_notes = Vec::new();
+    let term_spec = build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
     let cov_design = build_term_collection_design(ds.values.view(), &term_spec)
         .map_err(|e| format!("failed to build survival term collection design: {e}"))?;
     let frozen_term_spec = freeze_term_collection_spec(&term_spec, &cov_design)?;
@@ -3229,20 +3245,33 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let mut lambdas = fit.lambdas_time.to_vec();
             lambdas.extend(fit.lambdas_threshold.iter().copied());
             lambdas.extend(fit.lambdas_log_sigma.iter().copied());
-            let model_out = SavedModel {
+            let fit_result = core_saved_fit_result(
+                fit.beta_time.clone(),
+                Array1::from_vec(lambdas.clone()),
+                1.0,
+                fit.covariance_conditional.clone(),
+                fit.covariance_conditional.clone(),
+                f64::NAN,
+            );
+            let model_out = SavedModel::from_payload(FittedModelPayload {
                 version: MODEL_VERSION,
                 formula,
+                model_kind: ModelKind::Survival,
+                family_state: FittedFamily::Survival {
+                    likelihood: LikelihoodFamily::RoystonParmar,
+                    survival_likelihood: Some(
+                        survival_likelihood_mode_name(likelihood_mode).to_string(),
+                    ),
+                    survival_distribution: Some(
+                        survival_distribution_name(survival_distribution).to_string(),
+                    ),
+                },
                 family: family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+                fit_result: Some(fit_result),
+                data_schema: Some(ds.schema.clone()),
                 link: None,
-                mixture_link_components: None,
-                mixture_link_rho: None,
-                mixture_link_weights: None,
                 mixture_link_param_covariance: None,
-                sas_epsilon: None,
-                sas_log_delta: None,
-                sas_delta: None,
                 sas_param_covariance: None,
-                wiggle_base_link: None,
                 formula_noise: None,
                 beta_noise: None,
                 sigma_min: None,
@@ -3285,21 +3314,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 training_headers: Some(ds.headers.clone()),
                 resolved_term_spec: Some(frozen_term_spec),
                 resolved_term_spec_noise: None,
-                fit_max_iter: 400,
-                fit_tol: 1e-6,
-                beta: fit.beta_time.to_vec(),
-                lambdas,
-                scale: 1.0,
-                reml_score: None,
-                covariance_conditional: fit
-                    .covariance_conditional
-                    .as_ref()
-                    .map(array2_to_nested_vec),
-                covariance_corrected: fit
-                    .covariance_conditional
-                    .as_ref()
-                    .map(array2_to_nested_vec),
-            };
+            });
             write_model_json(&out, &model_out)?;
         }
         return Ok(());
@@ -3439,20 +3454,31 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 None
             }
         };
-        let model_out = SavedModel {
+        let fit_result = core_saved_fit_result(
+            beta.clone(),
+            Array1::from_iter(penalty_blocks.iter().map(|b| b.lambda)),
+            1.0,
+            cov.clone(),
+            cov.clone(),
+            f64::NAN,
+        );
+        let model_out = SavedModel::from_payload(FittedModelPayload {
             version: MODEL_VERSION,
             formula,
+            model_kind: ModelKind::Survival,
+            family_state: FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some(
+                    survival_likelihood_mode_name(likelihood_mode).to_string(),
+                ),
+                survival_distribution: None,
+            },
             family: family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+            fit_result: Some(fit_result),
+            data_schema: Some(ds.schema.clone()),
             link: None,
-            mixture_link_components: None,
-            mixture_link_rho: None,
-            mixture_link_weights: None,
             mixture_link_param_covariance: None,
-            sas_epsilon: None,
-            sas_log_delta: None,
-            sas_delta: None,
             sas_param_covariance: None,
-            wiggle_base_link: None,
             formula_noise: None,
             beta_noise: None,
             sigma_min: None,
@@ -3491,15 +3517,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             training_headers: Some(ds.headers.clone()),
             resolved_term_spec: Some(frozen_term_spec),
             resolved_term_spec_noise: None,
-            fit_max_iter: 400,
-            fit_tol: 1e-6,
-            beta: beta.to_vec(),
-            lambdas: penalty_blocks.iter().map(|b| b.lambda).collect(),
-            scale: 1.0,
-            reml_score: None,
-            covariance_conditional: cov.as_ref().map(array2_to_nested_vec),
-            covariance_corrected: cov.as_ref().map(array2_to_nested_vec),
-        };
+        });
         write_model_json(&out, &model_out)?;
     }
     Ok(())
@@ -3512,9 +3530,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
     validate_saved_model_for_inference_stability(&model)?;
 
-    if model.family == FAMILY_GAUSSIAN_LOCATION_SCALE
-        || model.family == FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT
-    {
+    if model.is_location_scale_model() {
         return Err(
             "sample for location-scale models is not available yet; sample the mean-only model instead"
                 .to_string(),
@@ -3522,7 +3538,8 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     }
 
     let parsed = parse_formula(&model.formula)?;
-    let ds = load_dataset(&args.data)?;
+    let schema = required_saved_schema(&model)?;
+    let ds = load_dataset_with_schema(&args.data, schema)?;
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -3530,7 +3547,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         .map(|(i, h)| (h.clone(), i))
         .collect();
     let training_headers = model.training_headers.as_ref();
-    let family = family_from_string(&model.family)?;
+    let family = model.likelihood();
     let cfg = NutsConfig {
         n_samples: args.samples,
         n_warmup: args.warmup,
@@ -3646,8 +3663,9 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
                 range: ridge_range_start..p,
             });
         }
+        let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
         for (idx, block) in penalty_blocks.iter_mut().enumerate() {
-            if let Some(&lam) = model.lambdas.get(idx) {
+            if let Some(&lam) = fit_saved.lambdas.get(idx) {
                 block.lambda = lam;
             }
         }
@@ -3694,7 +3712,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
                 .set_structural_monotonicity(true, p_time)
                 .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
         }
-        let beta0 = Array1::from_vec(model.beta.clone());
+        let beta0 = fit_saved.beta.clone();
         let state = model_surv
             .update_state(&beta0)
             .map_err(|e| format!("failed to evaluate survival state: {e}"))?;
@@ -3749,8 +3767,8 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
                 optimize_mixture: false,
                 sas_link: None,
                 optimize_sas: false,
-                max_iter: model.fit_max_iter,
-                tol: model.fit_tol,
+                max_iter: 80,
+                tol: 1e-6,
                 nullspace_dims: design.nullspace_dims.clone(),
                 linear_constraints: design.linear_constraints.clone(),
             },
@@ -3793,14 +3811,15 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
     validate_saved_model_for_inference_stability(&model)?;
 
-    if model.family == family_to_string(LikelihoodFamily::RoystonParmar) {
+    if matches!(model.model_kind, ModelKind::Survival) {
         return Err(
             "generate is not available for survival models in this command; use survival-specific simulation APIs"
                 .to_string(),
         );
     }
 
-    let ds = load_dataset(&args.data)?;
+    let schema = required_saved_schema(&model)?;
+    let ds = load_dataset_with_schema(&args.data, schema)?;
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -3821,9 +3840,13 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     }
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build design: {e}"))?;
+    let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
 
-    let spec = if model.family == FAMILY_GAUSSIAN_LOCATION_SCALE {
-        let beta_mu = Array1::from_vec(model.beta.clone());
+    let spec = if matches!(
+        model.predict_model_class(),
+        PredictModelClass::GaussianLocationScale
+    ) {
+        let beta_mu = fit_saved.beta.clone();
         let _noise_formula = model
             .formula_noise
             .as_ref()
@@ -3853,11 +3876,15 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
             mean,
             noise: gam::generative::NoiseModel::Gaussian { sigma },
         }
-    } else if model.family == FAMILY_BINOMIAL_LOCATION_SCALE_PROBIT {
-        let beta_t = Array1::from_vec(model.beta.clone());
-        let _noise_formula = model.formula_noise.as_ref().ok_or_else(|| {
-            "binomial-location-scale-probit model is missing formula_noise".to_string()
+    } else if model.is_binomial_location_scale_model() {
+        let saved_link_kind = model.resolved_inverse_link()?.ok_or_else(|| {
+            "saved binomial-location-scale model is missing link state".to_string()
         })?;
+        let beta_t = fit_saved.beta.clone();
+        let _noise_formula = model
+            .formula_noise
+            .as_ref()
+            .ok_or_else(|| "binomial-location-scale model is missing formula_noise".to_string())?;
         let spec_noise = resolve_term_spec_for_prediction(
             &model.resolved_term_spec_noise,
             training_headers,
@@ -3866,9 +3893,10 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         )?;
         let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
             .map_err(|e| format!("failed to build noise design: {e}"))?;
-        let beta_noise = Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
-            "binomial-location-scale-probit model is missing beta_noise".to_string()
-        })?);
+        let beta_noise =
+            Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
+                "binomial-location-scale model is missing beta_noise".to_string()
+            })?);
         if beta_t.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols()
         {
             return Err("location-scale model/design dimension mismatch".to_string());
@@ -3884,14 +3912,23 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                 .zip(sigma.iter())
                 .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
         );
-        let mean = apply_saved_probit_wiggle(&q0, &model)?
-            .mapv(|v| normal_cdf_approx(v.clamp(-30.0, 30.0)));
+        let eta = apply_saved_probit_wiggle(&q0, &model)?;
+        let mean = Array1::from_iter(
+            eta.iter()
+                .copied()
+                .map(|v| {
+                    inverse_link_jet_for_inverse_link(&saved_link_kind, v)
+                        .map(|jet| jet.mu.clamp(1e-10, 1.0 - 1e-10))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("location-scale inverse-link prediction failed: {e}"))?,
+        );
         gam::generative::GenerativeSpec {
             mean,
             noise: gam::generative::NoiseModel::Bernoulli,
         }
     } else {
-        let family = family_from_string(&model.family)?;
+        let family = model.likelihood();
         if let Some(joint) = load_joint_result(&model, family)? {
             if !is_binomial_family(family) {
                 return Err(
@@ -3899,7 +3936,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            let beta_base = Array1::from_vec(model.beta.clone());
+            let beta_base = fit_saved.beta.clone();
             if beta_base.len() != design.design.ncols() {
                 return Err(format!(
                     "joint model/design mismatch: beta has {} coefficients but design has {} columns",
@@ -3914,7 +3951,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
                 noise: gam::generative::NoiseModel::Bernoulli,
             }
         } else {
-            let beta = Array1::from_vec(model.beta.clone());
+            let beta = fit_saved.beta.clone();
             if beta.len() != design.design.ncols() {
                 return Err(format!(
                     "model/design mismatch: model beta has {} coefficients but design has {} columns",
@@ -3925,7 +3962,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
             let offset = Array1::zeros(design.design.nrows());
             let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
                 .map_err(|e| format!("predict_gam failed: {e}"))?;
-            generative_spec_from_predict(pred, family, Some(model.scale))
+            generative_spec_from_predict(pred, family, Some(fit_saved.scale))
                 .map_err(|e| format!("failed to build generative spec: {e}"))?
         }
     };
@@ -3945,17 +3982,358 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn run_report(args: ReportArgs) -> Result<(), String> {
+    let payload = fs::read_to_string(&args.model)
+        .map_err(|e| format!("failed to read model '{}': {e}", args.model.display()))?;
+    let model: SavedModel =
+        serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
+    validate_saved_model_for_inference_stability(&model)?;
+    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+
+    let out = args.out.unwrap_or_else(|| {
+        let stem = args
+            .model
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model");
+        PathBuf::from(format!("{stem}.report.html"))
+    });
+
+    let mut summary_rows = Vec::<String>::new();
+    summary_rows.push(format!(
+        "<tr><th>Family</th><td>{}</td></tr>",
+        html_escape(&pretty_family_name(model.likelihood()))
+    ));
+    summary_rows.push(format!(
+        "<tr><th>Model kind</th><td>{:?}</td></tr>",
+        model.predict_model_class()
+    ));
+    summary_rows.push(format!(
+        "<tr><th>Deviance</th><td>{:.6e}</td></tr>",
+        fit.deviance
+    ));
+    summary_rows.push(format!(
+        "<tr><th>REML/LAML</th><td>{:.6e}</td></tr>",
+        fit.reml_score
+    ));
+    summary_rows.push(format!(
+        "<tr><th>Iterations</th><td>{}</td></tr>",
+        fit.iterations
+    ));
+    summary_rows.push(format!(
+        "<tr><th>EDF total</th><td>{:.4}</td></tr>",
+        fit.edf_total
+    ));
+
+    let beta_se = fit
+        .beta_standard_errors_corrected
+        .as_ref()
+        .or(fit.beta_standard_errors.as_ref());
+    let mut coef_rows = Vec::<String>::new();
+    for (i, b) in fit.beta.iter().copied().enumerate() {
+        let se = beta_se.and_then(|s| s.get(i).copied());
+        coef_rows.push(format!(
+            "<tr><td>{}</td><td>{:.6e}</td><td>{}</td></tr>",
+            i,
+            b,
+            se.map(|v| format!("{v:.6e}"))
+                .unwrap_or_else(|| "NA".to_string())
+        ));
+    }
+
+    let mut edf_rows = Vec::<String>::new();
+    for (i, edf) in fit.edf_by_block.iter().copied().enumerate() {
+        edf_rows.push(format!("<tr><td>{}</td><td>{:.6}</td></tr>", i, edf));
+    }
+
+    let mut plot_scripts = Vec::<String>::new();
+    let mut diag_notes = Vec::<String>::new();
+    let mut alo_rows = String::new();
+
+    if let Some(data_path) = args.data.as_ref() {
+        let schema = required_saved_schema(&model)?;
+        let ds = load_dataset_with_schema(data_path, schema)?;
+        let col_map: HashMap<String, usize> = ds
+            .headers
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.clone(), i))
+            .collect();
+        let training_headers = model.training_headers.as_ref();
+        let parsed = parse_formula(&model.formula)?;
+        if let Some(y_col) = col_map.get(&parsed.response).copied() {
+            if matches!(
+                model.predict_model_class(),
+                PredictModelClass::Standard | PredictModelClass::BinomialLocationScale
+            ) {
+                let spec = resolve_term_spec_for_prediction(
+                    &model.resolved_term_spec,
+                    training_headers,
+                    &col_map,
+                    "resolved_term_spec",
+                )?;
+                let design = build_term_collection_design(ds.values.view(), &spec)
+                    .map_err(|e| format!("failed to build design for report diagnostics: {e}"))?;
+
+                let family = model.likelihood();
+                let offset = Array1::<f64>::zeros(ds.values.nrows());
+                let pred =
+                    predict_gam(design.design.view(), fit.beta.view(), offset.view(), family)
+                        .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
+                let y = ds.values.column(y_col).to_owned();
+                let residuals = &y - &pred.mean;
+                let mut residuals_sorted = residuals.to_vec();
+                residuals_sorted
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let n = residuals_sorted.len().max(1);
+                let theo = (0..n)
+                    .map(|i| standard_normal_quantile((i as f64 + 0.5) / n as f64))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                plot_scripts.push(format!(
+                    "Plotly.newPlot('qq_plot',[{{x:{},y:{},mode:'markers',name:'QQ'}}],{{title:'Residual QQ Plot',xaxis:{{title:'Normal quantile'}},yaxis:{{title:'Residual'}}}});",
+                    serde_json::to_string(&theo).map_err(|e| e.to_string())?,
+                    serde_json::to_string(&residuals_sorted).map_err(|e| e.to_string())?,
+                ));
+
+                plot_scripts.push(format!(
+                    "Plotly.newPlot('fit_plot',[{{x:{},y:{},mode:'markers',name:'Observed'}},{{x:{},y:{},mode:'markers',name:'Predicted'}}],{{title:'Observed vs Predicted',xaxis:{{title:'Row'}},yaxis:{{title:'Value'}}}});",
+                    serde_json::to_string(&(0..y.len()).collect::<Vec<_>>()).map_err(|e| e.to_string())?,
+                    serde_json::to_string(&y.to_vec()).map_err(|e| e.to_string())?,
+                    serde_json::to_string(&(0..pred.mean.len()).collect::<Vec<_>>()).map_err(|e| e.to_string())?,
+                    serde_json::to_string(&pred.mean.to_vec()).map_err(|e| e.to_string())?,
+                ));
+
+                if is_binary_response(y.view()) {
+                    let mut bins: Vec<(usize, f64, f64)> = (0..10).map(|b| (b, 0.0, 0.0)).collect();
+                    let mut counts = [0usize; 10];
+                    for i in 0..y.len() {
+                        let p = pred.mean[i].clamp(0.0, 1.0);
+                        let b = ((p * 10.0).floor() as usize).min(9);
+                        bins[b].1 += p;
+                        bins[b].2 += y[i];
+                        counts[b] += 1;
+                    }
+                    let mut x = Vec::<f64>::new();
+                    let mut y_obs = Vec::<f64>::new();
+                    for b in 0..10 {
+                        if counts[b] == 0 {
+                            continue;
+                        }
+                        x.push(bins[b].1 / counts[b] as f64);
+                        y_obs.push((bins[b].2 / counts[b] as f64).clamp(0.0, 1.0));
+                    }
+                    plot_scripts.push(format!(
+                        "Plotly.newPlot('cal_plot',[{{x:{},y:{},mode:'markers+lines',name:'Calibration'}},{{x:[0,1],y:[0,1],mode:'lines',name:'Ideal'}}],{{title:'Calibration (deciles)',xaxis:{{title:'Mean predicted'}},yaxis:{{title:'Observed rate'}}}});",
+                        serde_json::to_string(&x).map_err(|e| e.to_string())?,
+                        serde_json::to_string(&y_obs).map_err(|e| e.to_string())?,
+                    ));
+                }
+
+                if let Ok(link) = model
+                    .resolved_inverse_link()?
+                    .map(|lk| lk.link_function())
+                    .ok_or_else(|| "missing link".to_string())
+                {
+                    match compute_alo_diagnostics_from_fit(&fit, y.view(), link) {
+                        Ok(alo) => {
+                            for i in 0..alo.leverage.len() {
+                                alo_rows.push_str(&format!(
+                                    "<tr><td>{}</td><td>{:.6e}</td><td>{:.6e}</td><td>{:.6e}</td></tr>",
+                                    i, alo.leverage[i], alo.eta_tilde[i], alo.se_sandwich[i]
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            diag_notes.push(format!("ALO diagnostics unavailable: {e}"));
+                        }
+                    }
+                }
+
+                for st in &spec.smooth_terms {
+                    if let Some(col) = smooth_term_primary_column(st)
+                        && col < ds.values.ncols()
+                    {
+                        let x = ds.values.column(col).to_owned();
+                        if let Some(design_term) =
+                            design.smooth.terms.iter().find(|t| t.name == st.name)
+                        {
+                            let contrib = design
+                                .design
+                                .slice(s![.., design_term.coeff_range.clone()])
+                                .dot(&fit.beta.slice(s![design_term.coeff_range.clone()]));
+                            let mut pairs = x
+                                .iter()
+                                .copied()
+                                .zip(contrib.iter().copied())
+                                .collect::<Vec<_>>();
+                            pairs.sort_by(|a, b| {
+                                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let xs = pairs.iter().map(|p| p.0).collect::<Vec<_>>();
+                            let ys = pairs.iter().map(|p| p.1).collect::<Vec<_>>();
+                            let div_id = format!("smooth_{}", html_id(&st.name));
+                            plot_scripts.push(format!(
+                                "Plotly.newPlot('{}',[{{x:{},y:{},mode:'lines',name:'{}'}}],{{title:'Smooth term: {}',xaxis:{{title:'x'}},yaxis:{{title:'Contribution'}}}});",
+                                div_id,
+                                serde_json::to_string(&xs).map_err(|e| e.to_string())?,
+                                serde_json::to_string(&ys).map_err(|e| e.to_string())?,
+                                js_escape(&st.name),
+                                js_escape(&st.name)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        diag_notes.push("No data provided: residual QQ, calibration, and ALO sections are omitted. Pass training/new data as second positional argument.".to_string());
+    }
+
+    let smooth_divs = if let Some(spec) = model.resolved_term_spec.as_ref() {
+        spec.smooth_terms
+            .iter()
+            .map(|st| {
+                format!(
+                    "<h3>{}</h3><div id=\"smooth_{}\" class=\"plot\"></div>",
+                    html_escape(&st.name),
+                    html_id(&st.name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+
+    let html = format!(
+        r#"<!doctype html>
+<html><head>
+<meta charset="utf-8"/>
+<title>GAM Report</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin: 24px; }}
+h1,h2,h3 {{ margin: 0 0 10px 0; }}
+table {{ border-collapse: collapse; width: 100%; margin-bottom: 16px; }}
+th, td {{ border: 1px solid #ddd; padding: 6px 8px; font-size: 13px; text-align: left; }}
+th {{ background: #f6f8fa; }}
+.grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+.plot {{ width: 100%; height: 320px; border: 1px solid #eee; }}
+.notes {{ background:#fffbe6; border:1px solid #ffe58f; padding:10px; margin-bottom:12px; }}
+</style></head>
+<body>
+<h1>GAM Report</h1>
+<p><b>Model:</b> {model_path}</p>
+{notes}
+<h2>Model Summary</h2>
+<table>{summary_rows}</table>
+<h2>Coefficient Table</h2>
+<table><tr><th>Index</th><th>Estimate</th><th>Std. Error</th></tr>{coef_rows}</table>
+<h2>EDF by Penalty Block</h2>
+<table><tr><th>Block</th><th>EDF</th></tr>{edf_rows}</table>
+<h2>Diagnostics</h2>
+<div class="grid">
+  <div id="qq_plot" class="plot"></div>
+  <div id="fit_plot" class="plot"></div>
+  <div id="cal_plot" class="plot"></div>
+</div>
+<h2>ALO Leverage Table</h2>
+<table><tr><th>Row</th><th>Leverage</th><th>eta_tilde</th><th>SE sandwich</th></tr>{alo_rows}</table>
+<h2>Smooth Term Plots</h2>
+{smooth_divs}
+<script>{scripts}</script>
+</body></html>"#,
+        model_path = html_escape(&args.model.display().to_string()),
+        notes = if diag_notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<div class=\"notes\">{}</div>",
+                diag_notes
+                    .iter()
+                    .map(|n| html_escape(n))
+                    .collect::<Vec<_>>()
+                    .join("<br/>")
+            )
+        },
+        summary_rows = summary_rows.join(""),
+        coef_rows = coef_rows.join(""),
+        edf_rows = edf_rows.join(""),
+        alo_rows = if alo_rows.is_empty() {
+            "<tr><td colspan=\"4\">Unavailable</td></tr>".to_string()
+        } else {
+            alo_rows
+        },
+        smooth_divs = smooth_divs,
+        scripts = plot_scripts.join("\n"),
+    );
+
+    fs::write(&out, html)
+        .map_err(|e| format!("failed to write report '{}': {e}", out.display()))?;
+    println!("wrote report: {}", out.display());
+    Ok(())
+}
+
 fn choose_formula(args: &FitArgs) -> Result<String, String> {
+    if args.formula.is_some() && args.formula_positional.is_some() {
+        return Err("specify only one formula source: positional FORMULA or --formula".to_string());
+    }
     if let Some(v) = &args.formula {
+        return Ok(v.clone());
+    }
+    if let Some(v) = &args.formula_positional {
         return Ok(v.clone());
     }
     if let (Some(target), Some(features)) = (&args.target, &args.features) {
         return compose_formula_from_target_features(target, features);
     }
     Err(
-        "one of --formula (alias: --predict-mean) OR (--target and --features) is required"
-            .to_string(),
+        "one of positional FORMULA, --formula (alias: --predict-mean), or (--target and --features) is required".to_string(),
     )
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn js_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn html_id(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
+    match &term.basis {
+        SmoothBasisSpec::BSpline1D { feature_col, .. } => Some(*feature_col),
+        SmoothBasisSpec::ThinPlate { feature_cols, .. }
+        | SmoothBasisSpec::Matern { feature_cols, .. }
+        | SmoothBasisSpec::Duchon { feature_cols, .. }
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
+            if feature_cols.len() == 1 {
+                Some(feature_cols[0])
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn freeze_term_collection_spec(
@@ -4188,6 +4566,7 @@ fn estimate_probit_wiggle_seed_from_pilot(
     y: &Array1<f64>,
     mean_spec: &TermCollectionSpec,
     noise_spec: &TermCollectionSpec,
+    link_kind: InverseLink,
     sigma_min: f64,
     sigma_max: f64,
     options: &gam::BlockwiseFitOptions,
@@ -4197,6 +4576,7 @@ fn estimate_probit_wiggle_seed_from_pilot(
         BinomialLocationScaleProbitTermSpec {
             y: y.clone(),
             weights: Array1::ones(y.len()),
+            link_kind,
             sigma_min,
             sigma_max,
             threshold_spec: mean_spec.clone(),
@@ -4293,32 +4673,34 @@ fn build_location_scale_saved_model(
     formula: String,
     family: String,
     link: Option<String>,
+    data_schema: DataSchema,
     noise_formula: String,
     training_headers: Vec<String>,
     resolved_term_spec: TermCollectionSpec,
     resolved_term_spec_noise: TermCollectionSpec,
-    beta: Vec<f64>,
+    fit_result: FitResult,
     beta_noise: Option<Vec<f64>>,
     sigma_min: f64,
     sigma_max: f64,
-    lambdas: Vec<f64>,
-    covariance_conditional: Option<Vec<Vec<f64>>>,
-    covariance_corrected: Option<Vec<Vec<f64>>>,
 ) -> SavedModel {
-    SavedModel {
+    SavedModel::from_payload(FittedModelPayload {
         version: MODEL_VERSION,
         formula,
+        model_kind: ModelKind::LocationScale,
+        family_state: FittedFamily::LocationScale {
+            likelihood: if family == FAMILY_GAUSSIAN_LOCATION_SCALE {
+                LikelihoodFamily::GaussianIdentity
+            } else {
+                LikelihoodFamily::BinomialProbit
+            },
+            base_link: None,
+        },
         family,
+        fit_result: Some(fit_result),
+        data_schema: Some(data_schema),
         link,
-        mixture_link_components: None,
-        mixture_link_rho: None,
-        mixture_link_weights: None,
         mixture_link_param_covariance: None,
-        sas_epsilon: None,
-        sas_log_delta: None,
-        sas_delta: None,
         sas_param_covariance: None,
-        wiggle_base_link: None,
         formula_noise: Some(noise_formula),
         beta_noise,
         sigma_min: Some(sigma_min),
@@ -4355,18 +4737,81 @@ fn build_location_scale_saved_model(
         training_headers: Some(training_headers),
         resolved_term_spec: Some(resolved_term_spec),
         resolved_term_spec_noise: Some(resolved_term_spec_noise),
-        fit_max_iter: 80,
-        fit_tol: 1e-6,
+    })
+}
+
+fn core_saved_fit_result(
+    beta: Array1<f64>,
+    lambdas: Array1<f64>,
+    scale: f64,
+    beta_covariance: Option<Array2<f64>>,
+    beta_covariance_corrected: Option<Array2<f64>>,
+    reml_score: f64,
+) -> FitResult {
+    let p = beta.len();
+    FitResult {
         beta,
         lambdas,
-        scale: 1.0,
-        reml_score: None,
-        covariance_conditional,
-        covariance_corrected,
+        scale,
+        edf_by_block: Vec::new(),
+        edf_total: 0.0,
+        iterations: 0,
+        final_grad_norm: f64::NAN,
+        pirls_status: gam::pirls::PirlsStatus::Converged,
+        deviance: f64::NAN,
+        stable_penalty_term: 0.0,
+        max_abs_eta: 0.0,
+        constraint_kkt: None,
+        smoothing_correction: None,
+        penalized_hessian: Array2::<f64>::zeros((p, p)),
+        working_weights: Array1::<f64>::zeros(0),
+        working_response: Array1::<f64>::zeros(0),
+        reparam_qs: None,
+        artifacts: gam::estimate::FitArtifacts { pirls: None },
+        beta_covariance,
+        beta_standard_errors: None,
+        beta_covariance_corrected,
+        beta_standard_errors_corrected: None,
+        reml_score,
+        mixture_link_components: None,
+        mixture_link_rho: None,
+        mixture_link_weights: None,
+        mixture_link_param_covariance: None,
+        sas_epsilon: None,
+        sas_log_delta: None,
+        sas_delta: None,
+        sas_param_covariance: None,
     }
 }
 
+fn saved_mixture_state_from_fit(fit: &FitResult) -> Option<gam::types::MixtureLinkState> {
+    let components = fit.mixture_link_components.clone()?;
+    let rho = fit.mixture_link_rho.clone()?;
+    let pi = fit.mixture_link_weights.clone()?;
+    Some(gam::types::MixtureLinkState {
+        components,
+        rho,
+        pi,
+    })
+}
+
+fn saved_sas_state_from_fit(fit: &FitResult) -> Option<gam::types::SasLinkState> {
+    Some(gam::types::SasLinkState {
+        epsilon: fit.sas_epsilon?,
+        log_delta: fit.sas_log_delta?,
+        delta: fit.sas_delta?,
+    })
+}
+
 fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<(), String> {
+    if model.fit_result.is_none() {
+        return Err(
+            "model is missing canonical fit_result payload; refit with current CLI".to_string(),
+        );
+    }
+    if model.data_schema.is_none() {
+        return Err("model is missing data_schema; refit with current CLI".to_string());
+    }
     if model.training_headers.is_none() {
         return Err(
             "model is missing training_headers; refit with the current CLI to guarantee stable feature mapping at prediction time"
@@ -4389,37 +4834,37 @@ fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<()
         validate_frozen_term_collection_spec(spec_noise, "resolved_term_spec_noise")?;
     }
 
-    if model.family == family_to_string(LikelihoodFamily::BinomialSas) {
-        if model.sas_epsilon.is_none() || model.sas_log_delta.is_none() {
-            return Err(
-                "saved binomial-sas model is missing sas_epsilon/sas_log_delta; refit or resave with current CLI"
-                    .to_string(),
-            );
+    if matches!(
+        model.family_state,
+        FittedFamily::Standard {
+            likelihood: LikelihoodFamily::BinomialSas,
+            ..
         }
+    ) || matches!(
+        model.family_state,
+        FittedFamily::LocationScale {
+            likelihood: LikelihoodFamily::BinomialSas,
+            ..
+        }
+    ) {
+        model.saved_sas_state()?;
     }
-    if model.family == family_to_string(LikelihoodFamily::BinomialMixture) {
-        let components = model.mixture_link_components.as_ref().ok_or_else(|| {
-            "saved binomial-blended-inverse-link model is missing mixture_link_components"
-                .to_string()
-        })?;
-        if components.len() < 2 {
-            return Err(
-                "saved binomial-blended-inverse-link model must have at least 2 components"
-                    .to_string(),
-            );
+    if matches!(
+        model.family_state,
+        FittedFamily::Standard {
+            likelihood: LikelihoodFamily::BinomialMixture,
+            ..
         }
-        let rho = model.mixture_link_rho.as_ref().ok_or_else(|| {
-            "saved binomial-blended-inverse-link model is missing mixture_link_rho".to_string()
-        })?;
-        let expected = components.len() - 1;
-        if rho.len() != expected {
-            return Err(format!(
-                "saved binomial-blended-inverse-link model has rho length mismatch: expected {expected}, got {}",
-                rho.len()
-            ));
+    ) || matches!(
+        model.family_state,
+        FittedFamily::LocationScale {
+            likelihood: LikelihoodFamily::BinomialMixture,
+            ..
         }
+    ) {
+        model.saved_mixture_state()?;
     }
-    if model.family == family_to_string(LikelihoodFamily::RoystonParmar)
+    if model.is_survival_model()
         && parse_survival_likelihood_mode(
             model
                 .survival_likelihood
@@ -4441,6 +4886,13 @@ fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<()
         )?;
     }
     Ok(())
+}
+
+fn required_saved_schema(model: &SavedModel) -> Result<&DataSchema, String> {
+    model
+        .data_schema
+        .as_ref()
+        .ok_or_else(|| "model is missing data_schema; refit with current CLI".to_string())
 }
 
 fn term_spec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
@@ -4598,12 +5050,47 @@ fn write_model_json(path: &Path, model: &SavedModel) -> Result<(), String> {
     Ok(())
 }
 
+fn formula_rhs_text(formula: &str) -> Result<String, String> {
+    let parsed = gam::parse_formula_dsl(formula)?;
+    if parsed.rhs_terms.is_empty() {
+        return Err("formula right-hand side cannot be empty".to_string());
+    }
+    Ok(parsed.rhs_terms.join(" + "))
+}
+
+fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>, String> {
+    let trimmed = lhs.trim();
+    let call = match gam::parse_function_call(trimmed) {
+        Ok(call) => call,
+        Err(_) => return Ok(None),
+    };
+    if !call.name.eq_ignore_ascii_case("surv") {
+        return Ok(None);
+    }
+    let vars = call
+        .args
+        .iter()
+        .filter_map(|arg| match arg {
+            gam::CallArgSpec::Positional(v) => Some(v.trim().to_string()),
+            gam::CallArgSpec::Named { .. } => None,
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    if vars.len() != 3 {
+        return Err(format!(
+            "Surv(...) expects exactly three columns: Surv(entry, exit, event); got {}",
+            vars.len()
+        ));
+    }
+    Ok(Some((vars[0].clone(), vars[1].clone(), vars[2].clone())))
+}
+
 fn compose_formula_from_target_features(target: &str, features: &str) -> Result<String, String> {
     let t = target.trim();
     if t.is_empty() {
         return Err("--target cannot be empty".to_string());
     }
-    let terms = split_top_level(features, ',')
+    let terms = split_top_level_checked(features, ',', "--features")?
         .into_iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -4622,137 +5109,32 @@ fn normalize_noise_formula(noise: &str, response: &str) -> String {
     }
 }
 
+fn print_inference_summary(notes: &[String]) {
+    if notes.is_empty() {
+        return;
+    }
+    eprintln!("Auto-discovery summary:");
+    for note in notes {
+        eprintln!("  - {}", note);
+    }
+}
+
 fn load_dataset(path: &Path) -> Result<Dataset, String> {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if ext != "csv" {
-        return Err(format!(
-            "only CSV is currently supported by this CLI entrypoint; got '{}'",
-            path.display()
-        ));
-    }
+    load_csv_with_inferred_schema(path)
+}
 
-    let mut rdr = ReaderBuilder::new()
-        .has_headers(true)
-        .from_path(path)
-        .map_err(|e| format!("failed to open csv '{}': {e}", path.display()))?;
-
-    let headers = rdr
-        .headers()
-        .map_err(|e| format!("failed to read csv headers: {e}"))?
-        .iter()
-        .map(|s| s.trim().to_string())
-        .collect::<Vec<_>>();
-
-    if headers.is_empty() {
-        return Err("csv has no headers".to_string());
-    }
-
-    let mut records = Vec::<StringRecord>::new();
-    for rec in rdr.records() {
-        let record = rec.map_err(|e| format!("failed reading csv row: {e}"))?;
-        if record.len() != headers.len() {
-            return Err(format!(
-                "csv row width mismatch: got {} fields, expected {}",
-                record.len(),
-                headers.len()
-            ));
-        }
-        records.push(record);
-    }
-
-    if records.is_empty() {
-        return Err("csv has no rows".to_string());
-    }
-
-    let n = records.len();
-    let p = headers.len();
-    let mut out = Array2::<f64>::zeros((n, p));
-    let mut kinds = vec![ColumnKind::Continuous; p];
-    let mut cats: Vec<HashMap<String, usize>> = (0..p).map(|_| HashMap::new()).collect();
-    let mut numeric_vals: Vec<Vec<f64>> = (0..p).map(|_| Vec::with_capacity(n)).collect();
-
-    for (i, rec) in records.iter().enumerate() {
-        for j in 0..p {
-            let raw = rec
-                .get(j)
-                .ok_or_else(|| format!("missing field at row {}, col {}", i + 1, j + 1))?
-                .trim();
-            if raw.is_empty() {
-                return Err(format!(
-                    "empty field at row {}, column '{}'",
-                    i + 1,
-                    headers[j]
-                ));
-            }
-
-            let val = if let Ok(v) = raw.parse::<f64>() {
-                numeric_vals[j].push(v);
-                v
-            } else {
-                kinds[j] = ColumnKind::Categorical;
-                let m = &mut cats[j];
-                let next = m.len();
-                let idx = *m.entry(raw.to_string()).or_insert(next);
-                idx as f64
-            };
-
-            if !val.is_finite() {
-                return Err(format!(
-                    "non-finite value at row {}, column '{}'",
-                    i + 1,
-                    headers[j]
-                ));
-            }
-            out[[i, j]] = val;
-        }
-    }
-
-    for j in 0..p {
-        if kinds[j] == ColumnKind::Categorical {
-            continue;
-        }
-        let vals = &numeric_vals[j];
-        if !vals.is_empty()
-            && vals
-                .iter()
-                .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
-        {
-            kinds[j] = ColumnKind::Binary;
-        } else {
-            kinds[j] = ColumnKind::Continuous;
-        }
-    }
-
-    Ok(Dataset {
-        headers,
-        values: out,
-        kinds,
-    })
+fn load_dataset_with_schema(path: &Path, schema: &DataSchema) -> Result<Dataset, String> {
+    load_csv_with_schema(path, schema, UnseenCategoryPolicy::Error)
 }
 
 fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
-    let parts: Vec<&str> = formula.splitn(2, '~').collect();
-    if parts.len() != 2 {
-        return Err(format!(
-            "invalid formula '{}': expected 'y ~ terms'",
-            formula
-        ));
-    }
-    let lhs = parts[0].trim();
-    let rhs = parts[1].trim();
+    let parsed_dsl = gam::parse_formula_dsl(formula)?;
+    let lhs = parsed_dsl.response_expr.trim();
     if lhs.is_empty() {
         return Err("formula response (left-hand side) cannot be empty".to_string());
     }
-    if rhs.is_empty() {
-        return Err("formula right-hand side cannot be empty".to_string());
-    }
-
     let mut terms = Vec::<ParsedTerm>::new();
-    for raw in split_top_level(rhs, '+') {
+    for raw in parsed_dsl.rhs_terms {
         let t = raw.trim();
         if t.is_empty() || t == "1" {
             continue;
@@ -4776,209 +5158,184 @@ fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
 }
 
 fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
-    if let Some(inner) = parse_call(raw, "constrain")
-        .or_else(|| parse_call(raw, "constraint"))
-        .or_else(|| parse_call(raw, "box"))
-    {
-        let (vars, options) = parse_call_args(inner)?;
-        if vars.len() != 1 {
-            return Err(format!(
-                "constrain()/constraint()/box() expects exactly one variable: {raw}"
-            ));
+    fn split_call_args(call: &gam::FunctionCallSpec) -> (Vec<String>, BTreeMap<String, String>) {
+        let mut vars = Vec::<String>::new();
+        let mut options = BTreeMap::<String, String>::new();
+        for arg in &call.args {
+            match arg {
+                gam::CallArgSpec::Positional(v) => vars.push(v.trim().to_string()),
+                gam::CallArgSpec::Named { key, value } => {
+                    options.insert(key.to_ascii_lowercase(), strip_quotes(value).to_string());
+                }
+            }
         }
-        let (coefficient_min, coefficient_max) = parse_linear_constraint_bounds(&options, raw)?;
-        if coefficient_min.is_none() && coefficient_max.is_none() {
-            return Err(format!(
-                "constrain()/constraint()/box() requires at least one of min/lower/max/upper: {raw}"
-            ));
-        }
-        return Ok(ParsedTerm::Linear {
-            name: vars[0].clone(),
-            explicit: true,
-            coefficient_min,
-            coefficient_max,
-        });
+        (vars, options)
     }
 
-    if let Some(inner) =
-        parse_call(raw, "nonnegative").or_else(|| parse_call(raw, "nonnegative_coef"))
-    {
-        let vars = split_top_level(inner, ',')
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-        if vars.len() != 1 {
-            return Err(format!("nonnegative() expects exactly one variable: {raw}"));
+    let call = gam::parse_function_call(raw).ok();
+    if let Some(call) = call {
+        let name = call.name.to_ascii_lowercase();
+        let (vars, mut options) = split_call_args(&call);
+        match name.as_str() {
+            "constrain" | "constraint" | "box" => {
+                if vars.len() != 1 {
+                    return Err(format!(
+                        "constrain()/constraint()/box() expects exactly one variable: {raw}"
+                    ));
+                }
+                let (coefficient_min, coefficient_max) =
+                    parse_linear_constraint_bounds(&options, raw)?;
+                if coefficient_min.is_none() && coefficient_max.is_none() {
+                    return Err(format!(
+                        "constrain()/constraint()/box() requires at least one of min/lower/max/upper: {raw}"
+                    ));
+                }
+                return Ok(ParsedTerm::Linear {
+                    name: vars[0].clone(),
+                    explicit: true,
+                    coefficient_min,
+                    coefficient_max,
+                });
+            }
+            "nonnegative" | "nonnegative_coef" => {
+                if vars.len() != 1 {
+                    return Err(format!("nonnegative() expects exactly one variable: {raw}"));
+                }
+                return Ok(ParsedTerm::Linear {
+                    name: vars[0].clone(),
+                    explicit: true,
+                    coefficient_min: Some(0.0),
+                    coefficient_max: None,
+                });
+            }
+            "nonpositive" | "nonpositive_coef" => {
+                if vars.len() != 1 {
+                    return Err(format!("nonpositive() expects exactly one variable: {raw}"));
+                }
+                return Ok(ParsedTerm::Linear {
+                    name: vars[0].clone(),
+                    explicit: true,
+                    coefficient_min: None,
+                    coefficient_max: Some(0.0),
+                });
+            }
+            "bounded" => {
+                if vars.len() != 1 {
+                    return Err(format!("bounded() expects exactly one variable: {raw}"));
+                }
+                let min = parse_required_f64_option(&options, "min", raw)?;
+                let max = parse_required_f64_option(&options, "max", raw)?;
+                if !min.is_finite() || !max.is_finite() || min >= max {
+                    return Err(format!(
+                        "bounded() requires finite min < max, got min={min}, max={max}: {raw}"
+                    ));
+                }
+                let prior = parse_bounded_prior_spec(&options, min, max, raw)?;
+                return Ok(ParsedTerm::BoundedLinear {
+                    name: vars[0].clone(),
+                    min,
+                    max,
+                    prior,
+                });
+            }
+            "group" | "re" => {
+                if vars.len() != 1 {
+                    return Err(format!(
+                        "group()/re() expects exactly one variable, got '{}': {raw}",
+                        vars.join(",")
+                    ));
+                }
+                return Ok(ParsedTerm::RandomEffect {
+                    name: vars[0].clone(),
+                });
+            }
+            "tensor" | "interaction" | "te" => {
+                if vars.len() < 2 {
+                    return Err(format!(
+                        "tensor()/interaction()/te() requires at least two variables: {raw}"
+                    ));
+                }
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::Te,
+                    options,
+                });
+            }
+            "thinplate" | "thin_plate" | "tps" => {
+                if vars.len() < 2 {
+                    return Err(format!(
+                        "thinplate()/thin_plate()/tps() requires at least two variables: {raw}"
+                    ));
+                }
+                options.insert("type".to_string(), "tps".to_string());
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
+            "smooth" | "s" => {
+                if vars.is_empty() {
+                    return Err(format!(
+                        "smooth()/s() requires at least one variable: {raw}"
+                    ));
+                }
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
+            "matern" => {
+                if vars.is_empty() {
+                    return Err(format!("matern() requires at least one variable: {raw}"));
+                }
+                options.insert("type".to_string(), "matern".to_string());
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
+            "duchon" => {
+                if vars.is_empty() {
+                    return Err(format!("duchon() requires at least one variable: {raw}"));
+                }
+                options.insert("type".to_string(), "duchon".to_string());
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
+            "linear" => {
+                if vars.len() != 1 {
+                    return Err(format!("linear() expects exactly one variable: {raw}"));
+                }
+                let (coefficient_min, coefficient_max) =
+                    parse_linear_constraint_bounds(&options, raw)?;
+                return Ok(ParsedTerm::Linear {
+                    name: vars[0].clone(),
+                    explicit: true,
+                    coefficient_min,
+                    coefficient_max,
+                });
+            }
+            _ => {
+                return Err(format!(
+                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), thinplate(), tensor(), group(), matern(), duchon()"
+                ));
+            }
         }
-        return Ok(ParsedTerm::Linear {
-            name: vars[0].clone(),
-            explicit: true,
-            coefficient_min: Some(0.0),
-            coefficient_max: None,
-        });
-    }
-
-    if let Some(inner) =
-        parse_call(raw, "nonpositive").or_else(|| parse_call(raw, "nonpositive_coef"))
-    {
-        let vars = split_top_level(inner, ',')
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-        if vars.len() != 1 {
-            return Err(format!("nonpositive() expects exactly one variable: {raw}"));
-        }
-        return Ok(ParsedTerm::Linear {
-            name: vars[0].clone(),
-            explicit: true,
-            coefficient_min: None,
-            coefficient_max: Some(0.0),
-        });
-    }
-
-    if let Some(inner) = parse_call(raw, "bounded") {
-        let (vars, options) = parse_call_args(inner)?;
-        if vars.len() != 1 {
-            return Err(format!("bounded() expects exactly one variable: {raw}"));
-        }
-        let min = parse_required_f64_option(&options, "min", raw)?;
-        let max = parse_required_f64_option(&options, "max", raw)?;
-        if !min.is_finite() || !max.is_finite() || min >= max {
-            return Err(format!(
-                "bounded() requires finite min < max, got min={min}, max={max}: {raw}"
-            ));
-        }
-        let prior = parse_bounded_prior_spec(&options, min, max, raw)?;
-        return Ok(ParsedTerm::BoundedLinear {
-            name: vars[0].clone(),
-            min,
-            max,
-            prior,
-        });
-    }
-
-    if let Some(inner) = parse_call(raw, "group").or_else(|| parse_call(raw, "re")) {
-        let vars = split_top_level(inner, ',')
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-        if vars.len() != 1 {
-            return Err(format!(
-                "group()/re() expects exactly one variable, got '{}': {raw}",
-                vars.join(",")
-            ));
-        }
-        return Ok(ParsedTerm::RandomEffect {
-            name: vars[0].clone(),
-        });
-    }
-
-    if let Some(inner) = parse_call(raw, "tensor")
-        .or_else(|| parse_call(raw, "interaction"))
-        .or_else(|| parse_call(raw, "te"))
-    {
-        let (vars, options) = parse_call_args(inner)?;
-        if vars.len() < 2 {
-            return Err(format!(
-                "tensor()/interaction()/te() requires at least two variables: {raw}"
-            ));
-        }
-        return Ok(ParsedTerm::Smooth {
-            label: raw.to_string(),
-            vars,
-            kind: SmoothKind::Te,
-            options,
-        });
-    }
-
-    if let Some(inner) = parse_call(raw, "thinplate")
-        .or_else(|| parse_call(raw, "thin_plate"))
-        .or_else(|| parse_call(raw, "tps"))
-    {
-        let (vars, options) = parse_call_args(inner)?;
-        if vars.len() < 2 {
-            return Err(format!(
-                "thinplate()/thin_plate()/tps() requires at least two variables: {raw}"
-            ));
-        }
-        let mut options = options;
-        options.insert("type".to_string(), "tps".to_string());
-        return Ok(ParsedTerm::Smooth {
-            label: raw.to_string(),
-            vars,
-            kind: SmoothKind::S,
-            options,
-        });
-    }
-
-    if let Some(inner) = parse_call(raw, "smooth").or_else(|| parse_call(raw, "s")) {
-        let (vars, options) = parse_call_args(inner)?;
-        if vars.is_empty() {
-            return Err(format!(
-                "smooth()/s() requires at least one variable: {raw}"
-            ));
-        }
-        return Ok(ParsedTerm::Smooth {
-            label: raw.to_string(),
-            vars,
-            kind: SmoothKind::S,
-            options,
-        });
-    }
-
-    if let Some(inner) = parse_call(raw, "matern") {
-        let (vars, mut options) = parse_call_args(inner)?;
-        if vars.is_empty() {
-            return Err(format!("matern() requires at least one variable: {raw}"));
-        }
-        options.insert("type".to_string(), "matern".to_string());
-        return Ok(ParsedTerm::Smooth {
-            label: raw.to_string(),
-            vars,
-            kind: SmoothKind::S,
-            options,
-        });
-    }
-
-    if let Some(inner) = parse_call(raw, "duchon") {
-        let (vars, mut options) = parse_call_args(inner)?;
-        if vars.is_empty() {
-            return Err(format!("duchon() requires at least one variable: {raw}"));
-        }
-        options.insert("type".to_string(), "duchon".to_string());
-        return Ok(ParsedTerm::Smooth {
-            label: raw.to_string(),
-            vars,
-            kind: SmoothKind::S,
-            options,
-        });
-    }
-
-    if let Some(inner) = parse_call(raw, "linear") {
-        let (vars, options) = parse_call_args(inner)?;
-        if vars.len() != 1 {
-            return Err(format!("linear() expects exactly one variable: {raw}"));
-        }
-        let (coefficient_min, coefficient_max) = parse_linear_constraint_bounds(&options, raw)?;
-        return Ok(ParsedTerm::Linear {
-            name: vars[0].clone(),
-            explicit: true,
-            coefficient_min,
-            coefficient_max,
-        });
-    }
-
-    if raw.contains('(') && raw.ends_with(')') {
-        return Err(format!(
-            "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), thinplate(), tensor(), group(), matern(), duchon()"
-        ));
     }
 
     Ok(ParsedTerm::Linear {
-        name: raw.to_string(),
+        name: raw.trim().to_string(),
         explicit: false,
         coefficient_min: None,
         coefficient_max: None,
@@ -5167,41 +5524,7 @@ fn parse_bounded_prior_spec(
     Ok(BoundedCoefficientPriorSpec::None)
 }
 
-fn parse_call<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
-    let prefix = format!("{name}(");
-    if raw.starts_with(&prefix) && raw.ends_with(')') {
-        Some(&raw[prefix.len()..raw.len() - 1])
-    } else {
-        None
-    }
-}
-
-fn parse_call_args(raw: &str) -> Result<(Vec<String>, BTreeMap<String, String>), String> {
-    let mut vars = Vec::<String>::new();
-    let mut options = BTreeMap::<String, String>::new();
-
-    for piece in split_top_level(raw, ',') {
-        let p = piece.trim();
-        if p.is_empty() {
-            continue;
-        }
-        if let Some(eq_idx) = p.find('=') {
-            let k = p[..eq_idx].trim().to_ascii_lowercase();
-            let mut v = p[eq_idx + 1..].trim().to_string();
-            v = strip_quotes(&v).to_string();
-            if k.is_empty() {
-                return Err(format!("invalid named argument in '{raw}'"));
-            }
-            options.insert(k, v);
-        } else {
-            vars.push(p.to_string());
-        }
-    }
-
-    Ok((vars, options))
-}
-
-fn split_top_level(input: &str, delim: char) -> Vec<String> {
+fn split_top_level_checked(input: &str, delim: char, context: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::<String>::new();
     let mut cur = String::new();
     let mut depth = 0isize;
@@ -5226,6 +5549,9 @@ fn split_top_level(input: &str, delim: char) -> Vec<String> {
                 cur.push(ch);
             }
             ')' => {
+                if depth == 0 {
+                    return Err(format!("unmatched ')' while parsing {context}: '{input}'"));
+                }
                 depth -= 1;
                 cur.push(ch);
             }
@@ -5241,7 +5567,17 @@ fn split_top_level(input: &str, delim: char) -> Vec<String> {
         out.push(cur.trim().to_string());
     }
 
-    out
+    if quote.is_some() {
+        return Err(format!(
+            "unterminated quote while parsing {context}: '{input}'"
+        ));
+    }
+    if depth != 0 {
+        return Err(format!(
+            "unbalanced parentheses while parsing {context}: '{input}'"
+        ));
+    }
+    Ok(out)
 }
 
 fn strip_quotes(v: &str) -> &str {
@@ -5259,6 +5595,7 @@ fn build_term_spec(
     terms: &[ParsedTerm],
     ds: &Dataset,
     col_map: &HashMap<String, usize>,
+    inference_notes: &mut Vec<String>,
 ) -> Result<TermCollectionSpec, String> {
     let mut linear_terms = Vec::<LinearTermSpec>::new();
     let mut random_terms = Vec::<RandomEffectTermSpec>::new();
@@ -5274,7 +5611,7 @@ fn build_term_spec(
             } => {
                 let col = resolve_col(col_map, name)?;
                 let auto_kind =
-                    ds.kinds.get(col).copied().ok_or_else(|| {
+                    ds.column_kinds.get(col).copied().ok_or_else(|| {
                         format!("internal column-kind lookup failed for '{name}'")
                     })?;
                 if *explicit {
@@ -5288,7 +5625,7 @@ fn build_term_spec(
                     });
                 } else {
                     match auto_kind {
-                        ColumnKind::Continuous => {
+                        ColumnKindTag::Continuous => {
                             linear_terms.push(LinearTermSpec {
                                 name: name.clone(),
                                 feature_col: col,
@@ -5298,7 +5635,7 @@ fn build_term_spec(
                                 coefficient_max: *coefficient_max,
                             });
                         }
-                        ColumnKind::Binary => {
+                        ColumnKindTag::Binary => {
                             linear_terms.push(LinearTermSpec {
                                 name: name.clone(),
                                 feature_col: col,
@@ -5308,7 +5645,7 @@ fn build_term_spec(
                                 coefficient_max: *coefficient_max,
                             });
                         }
-                        ColumnKind::Categorical => {
+                        ColumnKindTag::Categorical => {
                             if coefficient_min.is_some() || coefficient_max.is_some() {
                                 return Err(format!(
                                     "coefficient constraints are not supported for categorical auto-random-effect term '{name}'; use group({name}) or an unconstrained numeric term"
@@ -5332,10 +5669,10 @@ fn build_term_spec(
             } => {
                 let col = resolve_col(col_map, name)?;
                 let auto_kind =
-                    ds.kinds.get(col).copied().ok_or_else(|| {
+                    ds.column_kinds.get(col).copied().ok_or_else(|| {
                         format!("internal column-kind lookup failed for '{name}'")
                     })?;
-                if !matches!(auto_kind, ColumnKind::Continuous | ColumnKind::Binary) {
+                if !matches!(auto_kind, ColumnKindTag::Continuous | ColumnKindTag::Binary) {
                     return Err(format!(
                         "bounded() currently supports only numeric columns, got categorical '{name}'"
                     ));
@@ -5372,7 +5709,7 @@ fn build_term_spec(
                     .iter()
                     .map(|v| resolve_col(col_map, v))
                     .collect::<Result<Vec<_>, _>>()?;
-                let basis = build_smooth_basis(*kind, vars, &cols, options, ds)?;
+                let basis = build_smooth_basis(*kind, vars, &cols, options, ds, inference_notes)?;
                 smooth_terms.push(SmoothTermSpec {
                     name: label.clone(),
                     basis,
@@ -5395,6 +5732,7 @@ fn build_smooth_basis(
     cols: &[usize],
     options: &BTreeMap<String, String>,
     ds: &Dataset,
+    inference_notes: &mut Vec<String>,
 ) -> Result<SmoothBasisSpec, String> {
     let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
     let type_opt = options
@@ -5415,8 +5753,19 @@ fn build_smooth_basis(
                 ));
             }
             let degree = 3usize;
-            let n_knots =
-                parse_ps_internal_knots(options, degree, heuristic_knots(ds.values.nrows()))?;
+            let default_internal = cols
+                .iter()
+                .map(|&c| heuristic_knots_for_column(ds.values.column(c)))
+                .max()
+                .unwrap_or_else(|| heuristic_knots(ds.values.nrows()));
+            let (n_knots, inferred) = parse_ps_internal_knots(options, degree, default_internal)?;
+            if inferred {
+                inference_notes.push(format!(
+                    "Automatically set {} internal knots per margin for tensor smooth '{}' (max unique/4 rule across margins, clamped to [4,20]). Override with knots=... or k=....",
+                    n_knots,
+                    vars.join(",")
+                ));
+            }
             let specs = cols
                 .iter()
                 .map(|&c| {
@@ -5452,8 +5801,17 @@ fn build_smooth_basis(
             let c = cols[0];
             let (min_v, max_v) = col_minmax(ds.values.column(c))?;
             let degree = option_usize(options, "degree").unwrap_or(3);
-            let n_knots =
-                parse_ps_internal_knots(options, degree, heuristic_knots(ds.values.nrows()))?;
+            let default_internal = heuristic_knots_for_column(ds.values.column(c));
+            let (n_knots, inferred) = parse_ps_internal_knots(options, degree, default_internal)?;
+            if inferred {
+                let unique = unique_count_column(ds.values.column(c));
+                inference_notes.push(format!(
+                    "Automatically set {} internal knots for smooth '{}' from {} unique values (rule: clamp(unique/4, 4..20)). Override with knots=... or k=....",
+                    n_knots,
+                    vars.join(","),
+                    unique
+                ));
+            }
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
@@ -5556,7 +5914,7 @@ fn parse_ps_internal_knots(
     options: &BTreeMap<String, String>,
     degree: usize,
     default_internal_knots: usize,
-) -> Result<usize, String> {
+) -> Result<(usize, bool), String> {
     let knots_internal = option_usize(options, "knots");
     let basis_dim = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
     if knots_internal.is_some() && basis_dim.is_some() {
@@ -5573,9 +5931,12 @@ fn parse_ps_internal_knots(
                 k, degree, min_k
             ));
         }
-        Ok(k - min_k)
+        Ok((k - min_k, false))
     } else {
-        Ok(knots_internal.unwrap_or(default_internal_knots))
+        Ok((
+            knots_internal.unwrap_or(default_internal_knots),
+            knots_internal.is_none(),
+        ))
     }
 }
 
@@ -5683,6 +6044,21 @@ fn heuristic_knots(n: usize) -> usize {
     ((n as f64).sqrt() as usize).clamp(6, 30)
 }
 
+fn unique_count_column(col: ArrayView1<'_, f64>) -> usize {
+    use std::collections::HashSet;
+    let mut set = HashSet::<u64>::with_capacity(col.len());
+    for &v in col {
+        let norm = if v == 0.0 { 0.0 } else { v };
+        set.insert(norm.to_bits());
+    }
+    set.len().max(1)
+}
+
+fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
+    let unique = unique_count_column(col);
+    (unique / 4).clamp(4, 20)
+}
+
 fn heuristic_centers(n: usize) -> usize {
     ((n as f64).sqrt() as usize).clamp(8, 48)
 }
@@ -5787,6 +6163,7 @@ fn resolve_family(
         FamilyArg::BinomialLogit => LikelihoodFamily::BinomialLogit,
         FamilyArg::BinomialProbit => LikelihoodFamily::BinomialProbit,
         FamilyArg::BinomialCloglog => LikelihoodFamily::BinomialCLogLog,
+        FamilyArg::RoystonParmar => LikelihoodFamily::RoystonParmar,
         FamilyArg::Auto => {
             if is_binary_response(y) {
                 LikelihoodFamily::BinomialLogit
@@ -5804,6 +6181,7 @@ fn family_from_arg(arg: FamilyArg) -> Option<LikelihoodFamily> {
         FamilyArg::BinomialLogit => Some(LikelihoodFamily::BinomialLogit),
         FamilyArg::BinomialProbit => Some(LikelihoodFamily::BinomialProbit),
         FamilyArg::BinomialCloglog => Some(LikelihoodFamily::BinomialCLogLog),
+        FamilyArg::RoystonParmar => Some(LikelihoodFamily::RoystonParmar),
     }
 }
 
@@ -5819,11 +6197,15 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
         }));
     };
     let t = v.trim().to_ascii_lowercase();
-    if let Some(inner) = t.strip_prefix("blended(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = t
+        .strip_prefix("blended(")
+        .and_then(|s| s.strip_suffix(')'))
+        .or_else(|| t.strip_prefix("mixture(").and_then(|s| s.strip_suffix(')')))
+    {
         if flexible_flag {
             return Err(
-                "--flexible-link cannot be combined with --link blended(...); blended inverse links are not flexible-link mode"
-                    .to_string(),
+                    "--flexible-link cannot be combined with --link blended(...)/mixture(...); blended inverse links are not flexible-link mode"
+                        .to_string(),
             );
         }
         let components = parse_link_component_list(inner)?;
@@ -5907,57 +6289,6 @@ fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
     Ok(out)
 }
 
-fn saved_mixture_link_spec(model: &SavedModel) -> Result<Option<MixtureLinkSpec>, String> {
-    let Some(components_raw) = model.mixture_link_components.as_ref() else {
-        return Ok(None);
-    };
-    let mut components = Vec::with_capacity(components_raw.len());
-    for name in components_raw {
-        components.push(parse_link_component(name)?);
-    }
-    if components.len() < 2 {
-        return Err("saved blended-link spec has fewer than 2 components".to_string());
-    }
-    let expected = components.len() - 1;
-    let rho_vec = model.mixture_link_rho.clone().ok_or_else(|| {
-        "saved blended-link spec is missing mixture_link_rho; cannot reconstruct link state"
-            .to_string()
-    })?;
-    if rho_vec.len() != expected {
-        return Err(format!(
-            "saved blended-link rho length mismatch: expected {expected}, got {}",
-            rho_vec.len()
-        ));
-    }
-    Ok(Some(MixtureLinkSpec {
-        components,
-        initial_rho: Array1::from_vec(rho_vec),
-    }))
-}
-
-fn saved_sas_params(model: &SavedModel) -> Option<(f64, f64)> {
-    if model.family == "binomial-sas" || matches!(model.link.as_deref(), Some("sas")) {
-        model.sas_epsilon.zip(model.sas_log_delta)
-    } else {
-        None
-    }
-}
-
-fn saved_mixture_state(model: &SavedModel) -> Result<Option<gam::types::MixtureLinkState>, String> {
-    if model.family != "binomial-blended-inverse-link" {
-        return Ok(None);
-    }
-    let Some(spec) = saved_mixture_link_spec(model)? else {
-        return Err(
-            "saved binomial-blended-inverse-link model is missing mixture_link_components/mixture_link_rho"
-                .to_string(),
-        );
-    };
-    state_from_spec(&spec)
-        .map(Some)
-        .map_err(|e| format!("invalid saved blended-link state: {e}"))
-}
-
 fn parse_link_name(v: &str) -> Result<LinkFunction, String> {
     match v.trim() {
         "identity" => Ok(LinkFunction::Identity),
@@ -5966,7 +6297,7 @@ fn parse_link_name(v: &str) -> Result<LinkFunction, String> {
         "cloglog" => Ok(LinkFunction::CLogLog),
         "sas" => Ok(LinkFunction::Sas),
         other => Err(format!(
-            "unsupported --link '{other}'; use identity|logit|probit|cloglog|sas|blended(...) or flexible(...)"
+            "unsupported --link '{other}'; use identity|logit|probit|cloglog|sas|blended(...)/mixture(...) or flexible(...)"
         )),
     }
 }
@@ -6002,6 +6333,41 @@ fn link_choice_to_string(choice: &LinkChoice) -> String {
     }
 }
 
+fn inverse_link_to_saved_string(link: &InverseLink) -> String {
+    match link {
+        InverseLink::Standard(link_fn) => link_name(*link_fn).to_string(),
+        InverseLink::Sas(_) => "sas".to_string(),
+        InverseLink::Mixture(state) => {
+            let names = state
+                .components
+                .iter()
+                .map(|c| match c {
+                    LinkComponent::Logit => "logit",
+                    LinkComponent::Probit => "probit",
+                    LinkComponent::CLogLog => "cloglog",
+                    LinkComponent::LogLog => "loglog",
+                    LinkComponent::Cauchit => "cauchit",
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("blended({names})")
+        }
+    }
+}
+
+fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
+    match link {
+        InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
+        InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
+        InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
+        InverseLink::Standard(LinkFunction::Sas) | InverseLink::Sas(_) => {
+            LikelihoodFamily::BinomialSas
+        }
+        InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+        InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,
+    }
+}
+
 fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     if y.is_empty() {
         return false;
@@ -6019,19 +6385,6 @@ fn family_to_string(f: LikelihoodFamily) -> &'static str {
         LikelihoodFamily::BinomialSas => "binomial-sas",
         LikelihoodFamily::BinomialMixture => "binomial-blended-inverse-link",
         LikelihoodFamily::RoystonParmar => "royston-parmar",
-    }
-}
-
-fn family_from_string(v: &str) -> Result<LikelihoodFamily, String> {
-    match v {
-        "gaussian" => Ok(LikelihoodFamily::GaussianIdentity),
-        "binomial-logit" => Ok(LikelihoodFamily::BinomialLogit),
-        "binomial-probit" => Ok(LikelihoodFamily::BinomialProbit),
-        "binomial-cloglog" => Ok(LikelihoodFamily::BinomialCLogLog),
-        "binomial-sas" => Ok(LikelihoodFamily::BinomialSas),
-        "binomial-blended-inverse-link" => Ok(LikelihoodFamily::BinomialMixture),
-        "royston-parmar" => Ok(LikelihoodFamily::RoystonParmar),
-        _ => Err(format!("unsupported saved family '{v}'")),
     }
 }
 
@@ -6094,10 +6447,11 @@ fn load_joint_result(
     for i in 0..p_link {
         s_link[[i, i]] = 1.0;
     }
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     Ok(Some(JointModelResult {
-        beta_base: Array1::from_vec(model.beta.clone()),
+        beta_base: fit_saved.beta.clone(),
         beta_link,
-        lambdas: model.lambdas.clone(),
+        lambdas: fit_saved.lambdas.to_vec(),
         deviance: 0.0,
         edf: 0.0,
         backfit_iterations: 0,
@@ -6440,18 +6794,21 @@ fn covariance_from_model(
     model: &SavedModel,
     mode: CovarianceModeArg,
 ) -> Result<Array2<f64>, String> {
+    let fit = model.fit_result.as_ref().ok_or_else(|| {
+        "model is missing canonical fit_result payload; refit with current CLI".to_string()
+    })?;
     let cov = match mode {
-        CovarianceModeArg::Corrected => model
-            .covariance_corrected
+        CovarianceModeArg::Corrected => fit
+            .beta_covariance_corrected
             .as_ref()
-            .or(model.covariance_conditional.as_ref()),
-        CovarianceModeArg::Conditional => model.covariance_conditional.as_ref(),
+            .or(fit.beta_covariance.as_ref()),
+        CovarianceModeArg::Conditional => fit.beta_covariance.as_ref(),
     }
     .ok_or_else(|| {
         "nonlinear posterior-mean prediction requires covariance; refit model with current CLI"
             .to_string()
     })?;
-    nested_vec_to_array2(cov)
+    Ok(cov.clone())
 }
 
 fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::InferenceCovarianceMode {
@@ -6464,63 +6821,8 @@ fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::InferenceCov
 }
 
 fn fit_result_from_saved_model_for_prediction(model: &SavedModel) -> Result<FitResult, String> {
-    let p = model.beta.len();
-    let beta_covariance = model
-        .covariance_conditional
-        .as_ref()
-        .map(|v| nested_vec_to_array2(v))
-        .transpose()?;
-    let beta_covariance_corrected = model
-        .covariance_corrected
-        .as_ref()
-        .map(|v| nested_vec_to_array2(v))
-        .transpose()?;
-    let mixture_spec = saved_mixture_link_spec(model)?;
-    let mixture_link_components = mixture_spec.as_ref().map(|s| s.components.clone());
-    let mixture_link_rho = mixture_spec.map(|s| s.initial_rho);
-    let mixture_link_weights = model.mixture_link_weights.clone().map(Array1::from_vec);
-    let mixture_link_param_covariance = model
-        .mixture_link_param_covariance
-        .as_ref()
-        .map(|v| nested_vec_to_array2(v))
-        .transpose()?;
-    let sas_param_covariance = model
-        .sas_param_covariance
-        .as_ref()
-        .map(|v| nested_vec_to_array2(v))
-        .transpose()?;
-    Ok(FitResult {
-        beta: Array1::from_vec(model.beta.clone()),
-        lambdas: Array1::from_vec(model.lambdas.clone()),
-        scale: model.scale,
-        edf_by_block: Vec::new(),
-        edf_total: 0.0,
-        iterations: model.fit_max_iter,
-        final_grad_norm: f64::NAN,
-        pirls_status: gam::pirls::PirlsStatus::Converged,
-        deviance: f64::NAN,
-        stable_penalty_term: 0.0,
-        max_abs_eta: 0.0,
-        constraint_kkt: None,
-        smoothing_correction: None,
-        penalized_hessian: Array2::<f64>::zeros((p, p)),
-        working_weights: Array1::<f64>::zeros(0),
-        working_response: Array1::<f64>::zeros(0),
-        reparam_qs: None,
-        artifacts: gam::estimate::FitArtifacts { pirls: None },
-        beta_covariance,
-        beta_standard_errors: None,
-        beta_covariance_corrected,
-        beta_standard_errors_corrected: None,
-        reml_score: model.reml_score.unwrap_or(f64::NAN),
-        mixture_link_components,
-        mixture_link_rho,
-        mixture_link_weights,
-        mixture_link_param_covariance,
-        sas_epsilon: model.sas_epsilon,
-        sas_log_delta: model.sas_log_delta,
-        sas_delta: model.sas_delta,
-        sas_param_covariance,
+    model.fit_result.clone().ok_or_else(|| {
+        "model is missing canonical fit_result payload; refit with current CLI".to_string()
     })
 }
 
@@ -6541,7 +6843,7 @@ fn response_sd_from_eta_for_family(
     eta: ArrayView1<'_, f64>,
     eta_se: ArrayView1<'_, f64>,
     mixture_state: Option<&gam::types::MixtureLinkState>,
-    sas_params: Option<(f64, f64)>,
+    sas_params: Option<&gam::types::SasLinkState>,
     mixture_param_covariance: Option<&Array2<f64>>,
     sas_param_covariance: Option<&Array2<f64>>,
 ) -> Result<Array1<f64>, String> {
@@ -6858,14 +7160,20 @@ fn write_survival_prediction_csv(
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCoefficientPriorSpec, LikelihoodFamily, MODEL_VERSION, ParsedTerm, SavedModel,
-        SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
+        BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, LikelihoodFamily, MODEL_VERSION,
+        ParsedTerm, SavedModel, SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
         chi_square_survival_approx, compute_probit_q0_from_eta, parse_duchon_order,
-        parse_duchon_power, parse_formula, parse_survival_time_basis_config, pretty_family_name,
-        saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design, summarize_wiggle_domain,
-        survival_probability_from_eta, write_survival_prediction_csv,
+        parse_duchon_power, parse_formula, parse_surv_response, parse_survival_time_basis_config,
+        pretty_family_name, saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design,
+        summarize_wiggle_domain, survival_probability_from_eta, write_survival_prediction_csv,
     };
+    use csv::StringRecord;
     use gam::basis::{BasisOptions, Dense, DuchonNullspaceOrder, KnotSource, create_basis};
+    use gam::inference::data::{UnseenCategoryPolicy, encode_records_with_schema};
+    use gam::inference::model::FittedModelPayload;
+    use gam::inference::model::SchemaColumn;
+    use gam::types::{InverseLink, LinkFunction};
+    use gam::{FittedFamily, ModelKind};
     use ndarray::{Array1, ArrayView1, array};
     use std::collections::BTreeMap;
     use std::fs;
@@ -7345,20 +7653,20 @@ mod tests {
                 _ => -0.08,
             })
             .collect::<Vec<_>>();
-        let model = SavedModel {
+        let model = SavedModel::from_payload(FittedModelPayload {
             version: MODEL_VERSION,
             formula: "y ~ x".to_string(),
+            model_kind: ModelKind::LocationScale,
+            family_state: FittedFamily::LocationScale {
+                likelihood: LikelihoodFamily::BinomialProbit,
+                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+            },
             family: "binomial-location-scale-probit".to_string(),
+            fit_result: None,
+            data_schema: None,
             link: Some("probit".to_string()),
-            mixture_link_components: None,
-            mixture_link_rho: None,
-            mixture_link_weights: None,
             mixture_link_param_covariance: None,
-            sas_epsilon: None,
-            sas_log_delta: None,
-            sas_delta: None,
             sas_param_covariance: None,
-            wiggle_base_link: None,
             formula_noise: None,
             beta_noise: None,
             sigma_min: None,
@@ -7395,15 +7703,7 @@ mod tests {
             training_headers: None,
             resolved_term_spec: None,
             resolved_term_spec_noise: None,
-            fit_max_iter: 10,
-            fit_tol: 1e-6,
-            beta: Vec::new(),
-            lambdas: Vec::new(),
-            scale: 1.0,
-            reml_score: None,
-            covariance_conditional: None,
-            covariance_corrected: None,
-        };
+        });
 
         let exact = saved_probit_wiggle_derivative_q0(&q0, &model).expect("exact derivative");
         let constrained_deriv = saved_probit_wiggle_design(&q0, &model)
@@ -7425,6 +7725,83 @@ mod tests {
                 expected[i]
             );
         }
+    }
+
+    #[test]
+    fn parse_formula_allows_nested_expression_arguments_in_smooth_calls() {
+        let parsed = parse_formula("y ~ s(log(x + 1), type=duchon, centers=12, power=0, order=1)")
+            .expect("formula");
+        let ParsedTerm::Smooth { vars, options, .. } = &parsed.terms[0] else {
+            panic!("expected smooth term");
+        };
+        assert_eq!(vars, &vec!["log(x + 1)".to_string()]);
+        assert_eq!(options.get("type").map(String::as_str), Some("duchon"));
+        assert_eq!(options.get("power").map(String::as_str), Some("0"));
+        assert_eq!(options.get("order").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn parse_formula_reports_unbalanced_parentheses() {
+        let err = parse_formula("y ~ s(x, k=10").expect_err("expected parse failure");
+        assert!(err.contains("unbalanced parentheses"));
+    }
+
+    #[test]
+    fn parse_surv_response_extracts_entry_exit_event_columns() {
+        let surv =
+            parse_surv_response("Surv(entry_time, exit_time, event)").expect("parse Surv lhs");
+        assert_eq!(
+            surv,
+            Some((
+                "entry_time".to_string(),
+                "exit_time".to_string(),
+                "event".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_surv_response_rejects_wrong_arity() {
+        let err = parse_surv_response("Surv(entry_time, exit_time)")
+            .expect_err("invalid Surv arity should fail");
+        assert!(err.contains("expects exactly three columns"));
+    }
+
+    #[test]
+    fn data_schema_encodes_categorical_levels_deterministically() {
+        let schema = DataSchema {
+            columns: vec![SchemaColumn {
+                name: "group".to_string(),
+                kind: ColumnKindTag::Categorical,
+                levels: vec!["ControlGroup".to_string(), "Treatment".to_string()],
+            }],
+        };
+        let headers = vec!["group".to_string()];
+        let records = vec![
+            StringRecord::from(vec!["ControlGroup"]),
+            StringRecord::from(vec!["Treatment"]),
+        ];
+        let ds = encode_records_with_schema(headers, records, &schema, UnseenCategoryPolicy::Error)
+            .expect("dataset");
+        assert_eq!(ds.values[[0, 0]], 0.0);
+        assert_eq!(ds.values[[1, 0]], 1.0);
+    }
+
+    #[test]
+    fn data_schema_rejects_unseen_categorical_levels() {
+        let schema = DataSchema {
+            columns: vec![SchemaColumn {
+                name: "group".to_string(),
+                kind: ColumnKindTag::Categorical,
+                levels: vec!["ControlGroup".to_string(), "Treatment".to_string()],
+            }],
+        };
+        let headers = vec!["group".to_string()];
+        let records = vec![StringRecord::from(vec!["NewGroup"])];
+        let err =
+            encode_records_with_schema(headers, records, &schema, UnseenCategoryPolicy::Error)
+                .expect_err("should fail");
+        assert!(err.contains("unseen level"));
     }
 
     #[test]
@@ -7450,5 +7827,14 @@ mod tests {
         assert_eq!(summary.domain_max, 1.0);
         assert_eq!(summary.outside_count, 2);
         assert!((summary.outside_fraction - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn heuristic_knots_for_column_uses_unique_value_rule() {
+        let col = array![0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(super::unique_count_column(col.view()), 6);
+        assert_eq!(super::heuristic_knots_for_column(col.view()), 4);
+        let bigger = Array1::from_iter((0..200).map(|v| v as f64));
+        assert_eq!(super::heuristic_knots_for_column(bigger.view()), 20);
     }
 }

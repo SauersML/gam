@@ -281,11 +281,11 @@ fn stateful_inverse_link_requires_state_for_sas_and_mixture() {
     let eta = Array1::from_vec(vec![-0.7, 0.0, 1.2]);
     let sas_err = try_inverse_link_array(LikelihoodFamily::BinomialSas, eta.view(), None)
         .expect_err("SAS inverse-link should require explicit sas_params");
-    assert!(sas_err.contains("requires SAS link state"));
+    assert!(sas_err.to_string().contains("requires SAS link state"));
 
     let mix_err = try_inverse_link_array(LikelihoodFamily::BinomialMixture, eta.view(), None)
         .expect_err("Mixture inverse-link should require explicit mixture_state");
-    assert!(mix_err.contains("requires mixture link state"));
+    assert!(mix_err.to_string().contains("requires mixture link state"));
 }
 
 #[test]

@@ -2698,6 +2698,7 @@ mod tests {
             weights,
             sigma_min: 0.05,
             sigma_max: 4.0,
+            link_kind: crate::types::InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             wiggle_knots: knots,

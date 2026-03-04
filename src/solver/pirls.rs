@@ -35,6 +35,7 @@ use log;
 use ndarray::{
     Array1, Array2, ArrayBase, ArrayView1, ArrayView2, Data, Ix1, Ix2, ShapeBuilder, Zip, s,
 };
+use serde::{Deserialize, Serialize};
 
 use faer::linalg::cholesky::llt::factor::LltParams;
 use faer::{Auto, MatRef, Spec};
@@ -983,7 +984,7 @@ pub struct WorkingModelIterationInfo {
 ///
 /// Constraints are represented as `A * beta >= b` in the same coefficient
 /// coordinate system as the returned `beta`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConstraintKktDiagnostics {
     /// Number of inequality rows.
     pub n_constraints: usize,
@@ -3141,7 +3142,7 @@ fn record_penalized_deviance(value: f64) {
 }
 
 /// The status of the P-IRLS convergence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PirlsStatus {
     /// Converged successfully within tolerance.
     Converged,
