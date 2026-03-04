@@ -1,5 +1,7 @@
 use crate::probability::{normal_cdf_approx, normal_pdf};
-use crate::types::{LinkComponent, MixtureLinkSpec, MixtureLinkState, SasLinkSpec, SasLinkState};
+use crate::types::{
+    LikelihoodFamily, LinkComponent, MixtureLinkSpec, MixtureLinkState, SasLinkSpec, SasLinkState,
+};
 use ndarray::Array1;
 
 const PROB_EPS: f64 = 1e-8;
@@ -239,6 +241,46 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
                 d3,
             }
         }
+    }
+}
+
+/// Central family-aware inverse-link jet dispatch.
+///
+/// For `BinomialSas` and `BinomialMixture`, required state must be provided.
+pub fn inverse_link_jet_for_family(
+    family: LikelihoodFamily,
+    eta: f64,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
+) -> Result<InverseLinkJet, String> {
+    match family {
+        LikelihoodFamily::GaussianIdentity => Ok(InverseLinkJet {
+            mu: eta,
+            d1: 1.0,
+            d2: 0.0,
+            d3: 0.0,
+        }),
+        LikelihoodFamily::BinomialLogit => Ok(component_inverse_link_jet(LinkComponent::Logit, eta)),
+        LikelihoodFamily::BinomialProbit => {
+            Ok(component_inverse_link_jet(LinkComponent::Probit, eta))
+        }
+        LikelihoodFamily::BinomialCLogLog => {
+            Ok(component_inverse_link_jet(LinkComponent::CLogLog, eta))
+        }
+        LikelihoodFamily::BinomialSas => {
+            let sas = sas_link_state
+                .ok_or_else(|| "BinomialSas inverse-link requires SAS link state".to_string())?;
+            Ok(sas_inverse_link_jet(eta, sas.epsilon, sas.log_delta))
+        }
+        LikelihoodFamily::BinomialMixture => {
+            let state = mixture_link_state.ok_or_else(|| {
+                "BinomialMixture inverse-link requires mixture link state".to_string()
+            })?;
+            Ok(mixture_inverse_link_jet(state, eta))
+        }
+        LikelihoodFamily::RoystonParmar => Err(
+            "RoystonParmar inverse-link jet is not defined in mixture-link dispatcher".to_string(),
+        ),
     }
 }
 
