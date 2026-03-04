@@ -2,7 +2,7 @@ use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, fast_ab, fast_ata, fast_atv,
+    array2_to_mat_mut, fast_ab, fast_atv,
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, sparse_symmetric_upper_matvec_public,
@@ -676,6 +676,8 @@ pub struct PirlsWorkspace {
     pub factorization_matrix: Array2<f64>,
     // Buffer for sparse matrix scaling (avoid per-iteration allocation)
     pub weighted_x_values: Vec<f64>,
+    // Dense chunk buffer for streaming X'WX assembly on very large n.
+    pub weighted_x_chunk: Array2<f64>,
 }
 
 impl PirlsWorkspace {
@@ -715,7 +717,80 @@ impl PirlsWorkspace {
             perm_inv: vec![0; p],
             factorization_matrix: Array2::zeros((0, 0)),
             weighted_x_values: Vec::new(),
+            weighted_x_chunk: Array2::zeros((0, 0).f()),
         }
+    }
+
+    #[inline]
+    fn dense_xtwx_chunk_rows(p: usize) -> usize {
+        const MIN_ROWS: usize = 512;
+        const MAX_ROWS: usize = 2048;
+        const TARGET_BYTES: usize = 2 * 1024 * 1024;
+        let bytes_per_row = p.max(1) * std::mem::size_of::<f64>();
+        (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS)
+    }
+
+    fn add_dense_xtwx_streaming_from_sqrt<S>(
+        &mut self,
+        x: &ArrayBase<S, Ix2>,
+        out: &mut Array2<f64>,
+        par: Par,
+    ) where
+        S: Data<Elem = f64>,
+    {
+        let n = x.nrows();
+        let p = x.ncols();
+        if n == 0 || p == 0 {
+            return;
+        }
+        debug_assert_eq!(
+            self.sqrt_w.len(),
+            n,
+            "sqrt_w length must match row count for streamed XtWX"
+        );
+        let chunk_rows = Self::dense_xtwx_chunk_rows(p).min(n);
+        if self.weighted_x_chunk.ncols() != p || self.weighted_x_chunk.nrows() != chunk_rows {
+            self.weighted_x_chunk = Array2::zeros((chunk_rows, p).f());
+        }
+
+        let mut out_view = array2_to_mat_mut(out);
+        for start in (0..n).step_by(chunk_rows) {
+            let rows = (n - start).min(chunk_rows);
+            {
+                let mut chunk = self.weighted_x_chunk.slice_mut(s![0..rows, ..]);
+                for local_row in 0..rows {
+                    let src_row = start + local_row;
+                    let sqrt_w = self.sqrt_w[src_row];
+                    for col in 0..p {
+                        chunk[[local_row, col]] = x[[src_row, col]] * sqrt_w;
+                    }
+                }
+            }
+            let chunk_rows_view = self.weighted_x_chunk.slice(s![0..rows, ..]);
+            let chunk_view = FaerArrayView::new(&chunk_rows_view);
+            matmul(
+                out_view.as_mut(),
+                Accum::Add,
+                chunk_view.as_ref().transpose(),
+                chunk_view.as_ref(),
+                1.0,
+                par,
+            );
+        }
+    }
+
+    fn add_dense_xtwx_streaming<S, W>(
+        &mut self,
+        x: &ArrayBase<S, Ix2>,
+        weights: &ArrayBase<W, Ix1>,
+        out: &mut Array2<f64>,
+        par: Par,
+    ) where
+        S: Data<Elem = f64>,
+        W: Data<Elem = f64>,
+    {
+        self.fill_sqrt_weights(weights);
+        self.add_dense_xtwx_streaming_from_sqrt(x, out, par);
     }
 
     fn sparse_xtwx(
@@ -749,22 +824,6 @@ impl PirlsWorkspace {
         Zip::from(&mut self.sqrt_w)
             .and(weights)
             .for_each(|sqrt_w, &w| *sqrt_w = w.max(0.0).sqrt());
-    }
-
-    #[inline]
-    fn fill_weighted_design<S>(&mut self, x: &ArrayBase<S, Ix2>)
-    where
-        S: Data<Elem = f64>,
-    {
-        if self.wx.dim() != x.dim() {
-            self.wx = Array2::zeros(x.dim().f());
-        }
-        for (mut dst_col, src_col) in self.wx.columns_mut().into_iter().zip(x.columns()) {
-            Zip::from(&mut dst_col)
-                .and(&src_col)
-                .and(&self.sqrt_w)
-                .for_each(|dst, &src, &sqrt_w| *dst = src * sqrt_w);
-        }
     }
 
     pub fn compute_hessian_sparse_faer(
@@ -1091,24 +1150,14 @@ impl<'a> GamWorkingModel<'a> {
         if let Some(x_transformed) = &self.x_transformed {
             return Ok(match x_transformed {
                 DesignMatrix::Dense(matrix) => {
-                    self.workspace.fill_sqrt_weights(weights);
-                    self.workspace.fill_weighted_design(matrix);
                     let mut xtwx = self.s_transformed.clone();
-                    let wx_view = FaerArrayView::new(&self.workspace.wx);
-                    let mut xtwx_view = array2_to_mat_mut(&mut xtwx);
                     let par = if matrix.ncols() <= 64 {
                         Par::Seq
                     } else {
                         get_global_parallelism()
                     };
-                    matmul(
-                        xtwx_view.as_mut(),
-                        Accum::Add,
-                        wx_view.as_ref().transpose(),
-                        wx_view.as_ref(),
-                        1.0,
-                        par,
-                    );
+                    self.workspace
+                        .add_dense_xtwx_streaming(matrix, weights, &mut xtwx, par);
                     xtwx
                 }
                 DesignMatrix::Sparse(matrix) => {
@@ -1133,24 +1182,14 @@ impl<'a> GamWorkingModel<'a> {
                 })?
             }
             DesignMatrix::Dense(x_dense) => {
-                self.workspace.fill_sqrt_weights(weights);
-                self.workspace.fill_weighted_design(x_dense);
-                let wx_view = FaerArrayView::new(&self.workspace.wx);
                 let mut xtwx = Array2::zeros((x_dense.ncols(), x_dense.ncols()));
-                let mut xtwx_view = array2_to_mat_mut(&mut xtwx);
                 let par = if x_dense.ncols() <= 64 {
                     Par::Seq
                 } else {
                     get_global_parallelism()
                 };
-                matmul(
-                    xtwx_view.as_mut(),
-                    Accum::Add,
-                    wx_view.as_ref().transpose(),
-                    wx_view.as_ref(),
-                    1.0,
-                    par,
-                );
+                self.workspace
+                    .add_dense_xtwx_streaming(x_dense, weights, &mut xtwx, par);
                 xtwx
             }
         };
@@ -1580,10 +1619,8 @@ fn compute_firth_hat_and_half_logdet(
     let p = x_design.ncols();
 
     workspace.fill_sqrt_weights(&weights);
-    workspace.fill_weighted_design(&x_design);
-
-    let xtwx_transformed = fast_ata(&workspace.wx);
-    let mut stabilized = xtwx_transformed.clone();
+    let mut stabilized = Array2::<f64>::zeros((p, p).f());
+    workspace.add_dense_xtwx_streaming_from_sqrt(&x_design, &mut stabilized, get_global_parallelism());
     if let Some(s) = s_transformed {
         for i in 0..p {
             for j in 0..p {
@@ -1623,20 +1660,21 @@ fn compute_firth_hat_and_half_logdet(
 
             for local_col in 0..cols_this {
                 let obs = col_start + local_col;
+                let sqrt_w = workspace.sqrt_w[obs];
                 for k in 0..p {
-                    workspace.scaled_matrix[[k, local_col]] = workspace.wx[[obs, k]];
+                    workspace.scaled_matrix[[k, local_col]] = x_design[[obs, k]] * sqrt_w;
                 }
             }
 
             chol.solve_mat_into(&workspace.scaled_matrix, &mut workspace.final_aug_matrix);
 
             for local_col in 0..cols_this {
-                let obs = col_start + local_col;
                 let mut acc = 0.0;
                 for k in 0..p {
-                    acc += workspace.final_aug_matrix[[k, local_col]] * workspace.wx[[obs, k]];
+                    acc += workspace.final_aug_matrix[[k, local_col]]
+                        * workspace.scaled_matrix[[k, local_col]];
                 }
-                hat_diag[obs] = acc;
+                hat_diag[col_start + local_col] = acc;
             }
         }
     }
@@ -2955,9 +2993,15 @@ pub struct PirlsResult {
     pub solve_d3mu_deta3: Array1<f64>,
     /// First eta-derivative of the diagonal working curvature W(eta):
     /// c_i := dW_i/deta_i at the accepted PIRLS solution.
+    ///
+    /// This carries 3rd-order likelihood information used in exact dH/dρ
+    /// terms for outer LAML derivatives.
     pub solve_c_array: Array1<f64>,
     /// Second eta-derivative of the diagonal working curvature W(eta):
     /// d_i := d²W_i/deta_i² at the accepted PIRLS solution.
+    ///
+    /// This carries 4th-order likelihood information used in exact d²H/dρ²
+    /// terms for the outer LAML Hessian.
     pub solve_d_array: Array1<f64>,
 
     // Keep all other fields as they are
@@ -4672,7 +4716,11 @@ pub fn update_glm_vectors_integrated_by_family(
 /// - In the smooth interior (no clamps/floors active), `c[i]` and `d[i]` are
 ///   classical derivatives of the diagonal PIRLS curvature W_i(eta):
 ///     c_i = dW_i/dη_i,  d_i = d²W_i/dη_i².
-/// - These feed outer LAML derivatives through dH/dρ terms.
+/// - For canonical GLM families, these are the per-observation carriers of
+///   higher likelihood derivatives (`-ℓ'''(η_i)` and `-ℓ''''(η_i)`) expressed
+///   through the working-curvature map W(η).
+/// - They are load-bearing in exact outer derivatives:
+///   `c` enters dH/dρ (outer gradient), and `d` enters d²H/dρ² (outer Hessian).
 /// - When clamps/floors activate (e.g. η saturation, μ near {0,1}, tiny weights),
 ///   the update map is piecewise and no longer C². Setting c_i=d_i=0 is a
 ///   practical subgradient-like choice to avoid unstable explosive derivatives.
@@ -4938,40 +4986,33 @@ pub fn solve_penalized_least_squares(
     // Dimensions
     let p_dim = x_transformed.ncols();
 
-    // 1. Prepare Weighted Design and Response
-    // Uses pre-allocated workspace buffers
+    // 1. Prepare weighted buffers
     workspace.fill_sqrt_weights(&weights);
-    workspace.fill_weighted_design(&x_transformed); // wx = X .* sqrt_w
 
+    // wz := w .* (z - offset)  (used for X'Wz)
     workspace.wz.assign(&z);
     workspace.wz -= &offset;
-    workspace.wz *= &workspace.sqrt_w; // wz = (z - offset) .* sqrt_w
+    workspace.wz *= &weights;
 
-    // 2. Form X'WX
-    let wx_view = FaerArrayView::new(&workspace.wx);
+    // 2. Form X'WX by streaming dense row chunks.
     let mut penalized_hessian = s_transformed.clone();
-    {
-        let mut xtwx_view = array2_to_mat_mut(&mut penalized_hessian);
-        matmul(
-            xtwx_view.as_mut(),
-            Accum::Add,
-            wx_view.as_ref().transpose(),
-            wx_view.as_ref(),
-            1.0,
-            get_global_parallelism(),
-        );
-    }
+    workspace.add_dense_xtwx_streaming_from_sqrt(
+        &x_transformed,
+        &mut penalized_hessian,
+        get_global_parallelism(),
+    );
 
     // 3. Form X'Wz
     if workspace.vec_buf_p.len() != p_dim {
         workspace.vec_buf_p = Array1::zeros(p_dim);
     }
+    let x_view = FaerArrayView::new(&x_transformed);
     let wz_view = FaerColView::new(&workspace.wz);
     let mut xtwz_view = array1_to_col_mat_mut(&mut workspace.vec_buf_p);
     matmul(
         xtwz_view.as_mut(),
         Accum::Replace,
-        wx_view.as_ref().transpose(),
+        x_view.as_ref().transpose(),
         wz_view.as_ref(),
         1.0,
         get_global_parallelism(),

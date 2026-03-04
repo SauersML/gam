@@ -1035,9 +1035,10 @@ impl<'a> RemlState<'a> {
             && let Some(key) = &key_opt
             && let Some(cached) = self.cache_manager.pirls_cache.write().unwrap().get(key)
         {
-            if self.warm_start_enabled.load(Ordering::Relaxed) {
-                self.update_warm_start_from(cached.as_ref());
-            }
+            // Do not overwrite the current warm start from cache hits.
+            // Line search / multi-eval outer loops revisit older rho keys and
+            // replacing a recent nearby beta with an older cached mode can
+            // materially slow subsequent PIRLS convergence.
             return Ok(cached);
         }
 
@@ -1070,9 +1071,10 @@ impl<'a> RemlState<'a> {
 
         if let Err(e) = &pirls_result {
             println!("[GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
-            if self.warm_start_enabled.load(Ordering::Relaxed) {
-                self.warm_start_beta.write().unwrap().take();
-            }
+            // Keep the previous successful warm start even when a trial point
+            // fails. Outer line search commonly probes unstable candidates and
+            // then returns to nearby feasible rho values where the prior warm
+            // beta remains the best initializer.
         }
 
         let (pirls_result, _) = pirls_result?; // Propagate error if it occurred
@@ -1094,9 +1096,6 @@ impl<'a> RemlState<'a> {
                 Ok(pirls_result)
             }
             pirls::PirlsStatus::Unstable => {
-                if self.warm_start_enabled.load(Ordering::Relaxed) {
-                    self.warm_start_beta.write().unwrap().take();
-                }
                 // The fit was unstable. This is where we throw our specific, user-friendly error.
                 // Pass the diagnostic info into the error
                 Err(EstimationError::PerfectSeparationDetected {
@@ -1105,9 +1104,6 @@ impl<'a> RemlState<'a> {
                 })
             }
             pirls::PirlsStatus::MaxIterationsReached => {
-                if self.warm_start_enabled.load(Ordering::Relaxed) {
-                    self.warm_start_beta.write().unwrap().take();
-                }
                 if pirls_result.last_gradient_norm > 1.0 {
                     // The fit timed out and gradient is large.
                     log::error!(
@@ -1125,6 +1121,7 @@ impl<'a> RemlState<'a> {
                         "P-IRLS reached max iterations but gradient norm {:.3e} is acceptable.",
                         pirls_result.last_gradient_norm
                     );
+                    self.update_warm_start_from(pirls_result.as_ref());
                     Ok(pirls_result)
                 }
             }
