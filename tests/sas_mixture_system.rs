@@ -114,7 +114,10 @@ fn sas_fit_recovery_and_calibration_system() {
     let brier = brier_score(&pred.mean, &y);
     assert!(brier < 0.22, "SAS Brier too high: {brier:.4}");
     let calib_gap = (pred.mean.mean().unwrap_or(0.0) - y.mean().unwrap_or(0.0)).abs();
-    assert!(calib_gap < 0.04, "SAS prevalence calibration gap too large: {calib_gap:.4}");
+    assert!(
+        calib_gap < 0.04,
+        "SAS prevalence calibration gap too large: {calib_gap:.4}"
+    );
 }
 
 #[test]
@@ -383,8 +386,14 @@ fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
     };
     let fd_eps = (profile_sas(eps_hat + h, ld_hat) - profile_sas(eps_hat - h, ld_hat)) / (2.0 * h);
     let fd_ld = (profile_sas(eps_hat, ld_hat + h) - profile_sas(eps_hat, ld_hat - h)) / (2.0 * h);
-    assert!(fd_eps.abs() < 0.25, "SAS profile FD gradient epsilon too large: {fd_eps:.4}");
-    assert!(fd_ld.abs() < 0.25, "SAS profile FD gradient log_delta too large: {fd_ld:.4}");
+    assert!(
+        fd_eps.abs() < 0.25,
+        "SAS profile FD gradient epsilon too large: {fd_eps:.4}"
+    );
+    assert!(
+        fd_ld.abs() < 0.25,
+        "SAS profile FD gradient log_delta too large: {fd_ld:.4}"
+    );
 
     // Mixture profile stationarity
     let true_mix_spec = MixtureLinkSpec {

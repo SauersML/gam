@@ -1,6 +1,6 @@
+use crate::mixture_link::inverse_link_jet_for_family;
 use crate::types::{InverseLink, LikelihoodFamily};
 use ndarray::{Array1, ArrayView1};
-use crate::mixture_link::inverse_link_jet_for_family;
 
 /// Standard normal PDF φ(x).
 #[inline]
@@ -111,9 +111,8 @@ mod tests {
             .expect_err("SAS without params should error");
         assert!(sas_err.contains("requires SAS link state"));
 
-        let mix_err =
-            try_inverse_link_array(LikelihoodFamily::BinomialMixture, eta.view(), None)
-                .expect_err("mixture without state should error");
+        let mix_err = try_inverse_link_array(LikelihoodFamily::BinomialMixture, eta.view(), None)
+            .expect_err("mixture without state should error");
         assert!(mix_err.contains("requires mixture link state"));
     }
 

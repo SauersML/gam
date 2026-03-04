@@ -36,9 +36,8 @@ use gam::joint::{
 };
 use gam::matrix::DesignMatrix;
 use gam::mixture_link::{
-    InverseLinkJet, mixture_inverse_link_jet,
-    mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet,
-    sas_inverse_link_jet_with_param_partials, state_from_spec,
+    InverseLinkJet, mixture_inverse_link_jet, mixture_inverse_link_jet_with_rho_partials_into,
+    sas_inverse_link_jet, sas_inverse_link_jet_with_param_partials, state_from_spec,
 };
 use gam::probability::{normal_cdf_approx, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
@@ -1928,20 +1927,12 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 let eta_lower = &pred.eta - &eff.mapv(|v| z * v);
                 let eta_upper = &pred.eta + &eff.mapv(|v| z * v);
                 mean_lo = Some(
-                    try_inverse_link_array(
-                        family,
-                        eta_lower.view(),
-                        saved_link_kind.as_ref(),
-                    )
-                    .map_err(|e| format!("inverse-link lower bound failed: {e}"))?,
+                    try_inverse_link_array(family, eta_lower.view(), saved_link_kind.as_ref())
+                        .map_err(|e| format!("inverse-link lower bound failed: {e}"))?,
                 );
                 mean_hi = Some(
-                    try_inverse_link_array(
-                        family,
-                        eta_upper.view(),
-                        saved_link_kind.as_ref(),
-                    )
-                    .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
+                    try_inverse_link_array(family, eta_upper.view(), saved_link_kind.as_ref())
+                        .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
                 );
             }
         }
@@ -6549,12 +6540,12 @@ fn response_sd_from_eta_for_family(
                 } else {
                     0.0
                 };
-                if let (Some((epsilon, log_delta)), Some(cov_theta)) = (sas_params, sas_param_covariance)
+                if let (Some((epsilon, log_delta)), Some(cov_theta)) =
+                    (sas_params, sas_param_covariance)
                     && cov_theta.nrows() == 2
                     && cov_theta.ncols() == 2
                 {
-                    let jets =
-                        sas_inverse_link_jet_with_param_partials(eta[i], epsilon, log_delta);
+                    let jets = sas_inverse_link_jet_with_param_partials(eta[i], epsilon, log_delta);
                     let g0 = jets.djet_depsilon.mu;
                     let g1 = jets.djet_dlog_delta.mu;
                     var += g0 * g0 * cov_theta[[0, 0]]
