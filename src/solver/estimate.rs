@@ -3345,6 +3345,279 @@ where
     Ok((cost, ridge))
 }
 
+/// Evaluate external theta-space outer cost and analytic gradient for
+/// `theta = [rho_penalties, rho_blended? | epsilon,log_delta?]`.
+///
+/// This mirrors the exact first-order objective surface used by the outer
+/// optimizer when blended inverse-link or SAS parameters are optimized.
+pub fn evaluate_external_theta_cost_gradient<X>(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: X,
+    offset: ArrayView1<'_, f64>,
+    s_list: Vec<Array2<f64>>,
+    theta: &Array1<f64>,
+    opts: &ExternalOptimOptions,
+) -> Result<(f64, Array1<f64>), EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    let x = x.into();
+    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
+            y.len(),
+            w.len(),
+            x.nrows(),
+            offset.len()
+        )));
+    }
+    let p = x.ncols();
+    validate_full_size_penalties(&s_list, p, "evaluate_external_theta_cost_gradient")?;
+    let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
+        s_list,
+        &opts.nullspace_dims,
+        "evaluate_external_theta_cost_gradient",
+    )?;
+    let k = active_nullspace_dims.len();
+    let use_mixture = opts.mixture_link.is_some();
+    let use_sas = opts.sas_link.is_some();
+    if use_mixture && use_sas {
+        return Err(EstimationError::InvalidInput(
+            "mixture_link and sas_link are mutually exclusive for this evaluator".to_string(),
+        ));
+    }
+    let aux_dim = if use_mixture {
+        opts.mixture_link
+            .as_ref()
+            .map(|s| s.initial_rho.len())
+            .unwrap_or(0)
+    } else if use_sas {
+        2
+    } else {
+        0
+    };
+    if theta.len() != k + aux_dim {
+        return Err(EstimationError::InvalidInput(format!(
+            "theta length mismatch: expected {}, got {}",
+            k + aux_dim,
+            theta.len()
+        )));
+    }
+    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
+    if let Some(spec) = opts.mixture_link.as_ref() {
+        cfg.link_kind = LinkKind::Mixture(
+            state_from_spec(spec)
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?,
+        );
+    }
+    if let Some(spec) = opts.sas_link {
+        cfg.link_kind = LinkKind::Sas(
+            state_from_sas_spec(spec)
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
+        );
+    }
+    let y_o = y.to_owned();
+    let w_o = w.to_owned();
+    let x_o = x.clone();
+    let offset_o = offset.to_owned();
+    let reml_state = RemlState::new_with_offset(
+        y_o.view(),
+        x_o,
+        w_o.view(),
+        offset_o.view(),
+        s_list,
+        p,
+        &cfg,
+        Some(active_nullspace_dims),
+        None,
+        opts.linear_constraints.clone(),
+    )?;
+    let rho = theta.slice(s![..k]).to_owned();
+    let mut mix_state_eval: Option<crate::types::MixtureLinkState> = None;
+    let mut sas_state_eval: Option<crate::types::SasLinkState> = None;
+    if use_mixture {
+        let mix_spec = opts.mixture_link.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput("missing blended inverse-link specification".to_string())
+        })?;
+        let mix_rho = theta.slice(s![k..(k + aux_dim)]).to_owned();
+        let mix_state = state_from_spec(&MixtureLinkSpec {
+            components: mix_spec.components.clone(),
+            initial_rho: mix_rho,
+        })
+        .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?;
+        reml_state.set_link_states(Some(mix_state.clone()), None);
+        mix_state_eval = Some(mix_state);
+    } else if use_sas {
+        let sas_state = state_from_sas_spec(SasLinkSpec {
+            initial_epsilon: theta[k],
+            initial_log_delta: theta[k + 1],
+        })
+        .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?;
+        reml_state.set_link_states(None, Some(sas_state));
+        sas_state_eval = Some(sas_state);
+    }
+
+    let mut cost = reml_state.compute_cost(&rho)?;
+    let mut grad = Array1::<f64>::zeros(theta.len());
+    grad.slice_mut(s![..k])
+        .assign(&reml_state.compute_gradient(&rho)?);
+
+    if aux_dim == 0 {
+        return Ok((cost, grad));
+    }
+    if firth_active {
+        return Err(EstimationError::InvalidInput(
+            "theta-space link-parameter gradients are incompatible with Firth-adjusted outer gradients"
+                .to_string(),
+        ));
+    }
+
+    let sas_ridge = if use_sas {
+        sas_log_delta_ridge_weight()
+    } else {
+        0.0
+    };
+    if use_sas && sas_ridge > 0.0 {
+        let log_delta = theta[k + 1];
+        cost += 0.5 * sas_ridge * log_delta * log_delta;
+    }
+
+    let (pirls_mix, h_pos_w) = reml_state.pirls_result_and_hpos_for_rho(&rho)?;
+    let eta = &pirls_mix.final_eta;
+    let x_t = &pirls_mix.x_transformed;
+    let n_obs = eta.len();
+    let p_eff = x_t.ncols();
+    const EPS: f64 = 1e-8;
+
+    let mut leverage = Array1::<f64>::zeros(n_obs);
+    if h_pos_w.ncols() > 0 {
+        match x_t {
+            DesignMatrix::Dense(x_dense) => {
+                let xw = x_dense.dot(h_pos_w.as_ref());
+                for i in 0..xw.nrows() {
+                    leverage[i] = xw.row(i).iter().map(|v| v * v).sum();
+                }
+            }
+            DesignMatrix::Sparse(_) => {
+                for col in 0..h_pos_w.ncols() {
+                    let w_col = h_pos_w.column(col).to_owned();
+                    let xw_col = x_t.matrix_vector_multiply(&w_col);
+                    Zip::from(&mut leverage)
+                        .and(&xw_col)
+                        .for_each(|h, &v| *h += v * v);
+                }
+            }
+        }
+    }
+
+    let mut ll3 = Array1::<f64>::zeros(n_obs);
+    let mut du_j = Array1::<f64>::zeros(n_obs);
+    let mut dw_explicit_j = Array1::<f64>::zeros(n_obs);
+    let mut mix_partials = if use_mixture {
+        vec![
+            crate::mixture_link::InverseLinkJet {
+                mu: 0.0,
+                d1: 0.0,
+                d2: 0.0,
+                d3: 0.0,
+            };
+            aux_dim
+        ]
+    } else {
+        Vec::new()
+    };
+
+    for j in 0..aux_dim {
+        let mut direct_ll_j = 0.0_f64;
+        du_j.fill(0.0);
+        dw_explicit_j.fill(0.0);
+        for i in 0..n_obs {
+            if use_mixture {
+                let mix_state = mix_state_eval.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput("missing blended inverse-link state".to_string())
+                })?;
+                let jet =
+                    mixture_inverse_link_jet_with_rho_partials_into(mix_state, eta[i], &mut mix_partials);
+                let mu = jet.mu.clamp(EPS, 1.0 - EPS);
+                let d1 = jet.d1;
+                let d2 = jet.d2;
+                let d3 = jet.d3;
+                let yi = y_o[i];
+                let wi = w_o[i].max(0.0);
+                let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+                let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
+                let a3 = wi
+                    * (2.0 * yi / (mu * mu * mu)
+                        - 2.0 * (1.0 - yi) / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
+                if j == 0 {
+                    ll3[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+                }
+                let dj = mix_partials[j];
+                let dmu = dj.mu;
+                let dd1 = dj.d1;
+                let dd2 = dj.d2;
+                direct_ll_j += a1 * dmu;
+                du_j[i] = a2 * dmu * d1 + a1 * dd1;
+                let dell2_explicit =
+                    a3 * dmu * d1 * d1 + 2.0 * a2 * d1 * dd1 + a2 * dmu * d2 + a1 * dd2;
+                dw_explicit_j[i] = -dell2_explicit;
+            } else {
+                let sas = sas_state_eval.ok_or_else(|| {
+                    EstimationError::InvalidInput("missing SAS link state".to_string())
+                })?;
+                let jets = sas_inverse_link_jet_with_param_partials(eta[i], sas.epsilon, sas.log_delta);
+                let mu = jets.jet.mu.clamp(EPS, 1.0 - EPS);
+                let d1 = jets.jet.d1;
+                let d2 = jets.jet.d2;
+                let d3 = jets.jet.d3;
+                let yi = y_o[i];
+                let wi = w_o[i].max(0.0);
+                let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+                let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
+                let a3 = wi
+                    * (2.0 * yi / (mu * mu * mu)
+                        - 2.0 * (1.0 - yi) / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
+                if j == 0 {
+                    ll3[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+                }
+                let dj = if j == 0 {
+                    jets.djet_depsilon
+                } else {
+                    jets.djet_dlog_delta
+                };
+                let dmu = dj.mu;
+                let dd1 = dj.d1;
+                let dd2 = dj.d2;
+                direct_ll_j += a1 * dmu;
+                du_j[i] = a2 * dmu * d1 + a1 * dd1;
+                let dell2_explicit =
+                    a3 * dmu * d1 * d1 + 2.0 * a2 * d1 * dd1 + a2 * dmu * d2 + a1 * dd2;
+                dw_explicit_j[i] = -dell2_explicit;
+            }
+        }
+        let rhs_j = x_t.transpose_vector_multiply(&du_j);
+        let dbeta_j = if h_pos_w.ncols() > 0 {
+            let wt_rhs = h_pos_w.t().dot(&rhs_j);
+            h_pos_w.as_ref().dot(&wt_rhs)
+        } else {
+            Array1::<f64>::zeros(p_eff)
+        };
+        let eta_dot_j = x_t.matrix_vector_multiply(&dbeta_j);
+        let mut trace_term = 0.0_f64;
+        for i in 0..n_obs {
+            let dw_total = dw_explicit_j[i] - ll3[i] * eta_dot_j[i];
+            trace_term += leverage[i] * dw_total;
+        }
+        grad[k + j] = -direct_ll_j + 0.5 * trace_term;
+    }
+    if use_sas && sas_ridge > 0.0 {
+        grad[k + 1] += sas_ridge * theta[k + 1];
+    }
+    Ok((cost, grad))
+}
+
 #[cfg(test)]
 mod fd_policy_tests {
     use super::*;
