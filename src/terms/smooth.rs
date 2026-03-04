@@ -20,9 +20,12 @@ use crate::estimate::{
 };
 use crate::faer_ndarray::fast_atv;
 use crate::matrix::DesignMatrix;
+use crate::mixture_link::{
+    mixture_inverse_link_jet, sas_inverse_link_jet, state_from_sas_spec, state_from_spec,
+};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf_approx, normal_pdf};
-use crate::types::LikelihoodFamily;
+use crate::types::{LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -2284,6 +2287,8 @@ struct BoundedLinearTermMeta {
 #[derive(Clone)]
 struct BoundedLinearFamily {
     family: LikelihoodFamily,
+    mixture_link_state: Option<MixtureLinkState>,
+    sas_link_state: Option<SasLinkState>,
     y: Array1<f64>,
     weights: Array1<f64>,
     design: Array2<f64>,
@@ -2356,6 +2361,8 @@ fn bounded_prior_terms(theta: f64, prior: &BoundedCoefficientPriorSpec) -> (f64,
 
 fn evaluate_standard_family_observations(
     family: LikelihoodFamily,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
     y: &Array1<f64>,
     weights: &Array1<f64>,
     eta: &Array1<f64>,
@@ -2410,12 +2417,20 @@ fn evaluate_standard_family_observations(
                         (mu_i, dmu)
                     }
                     LikelihoodFamily::BinomialSas => {
-                        let mu_i = normal_cdf_approx(eta_i);
-                        (mu_i, normal_pdf(eta_i))
+                        let (epsilon, log_delta) = sas_link_state
+                            .map(|s| (s.epsilon, s.log_delta))
+                            .unwrap_or((0.0, 0.0));
+                        let jet = sas_inverse_link_jet(eta_i, epsilon, log_delta);
+                        (jet.mu, jet.d1)
                     }
                     LikelihoodFamily::BinomialMixture => {
-                        let mu_i = stable_sigmoid(eta_i);
-                        (mu_i, mu_i * (1.0 - mu_i))
+                        if let Some(state) = mixture_link_state {
+                            let jet = mixture_inverse_link_jet(state, eta_i);
+                            (jet.mu, jet.d1)
+                        } else {
+                            let mu_i = stable_sigmoid(eta_i);
+                            (mu_i, mu_i * (1.0 - mu_i))
+                        }
                     }
                     _ => unreachable!(),
                 };
@@ -2440,14 +2455,21 @@ fn evaluate_standard_family_observations(
                         (d2, d3)
                     }
                     LikelihoodFamily::BinomialSas => {
-                        let d2 = -eta_i * dmu_deta;
-                        let d3 = (eta_i * eta_i - 1.0) * dmu_deta;
-                        (d2, d3)
+                        let (epsilon, log_delta) = sas_link_state
+                            .map(|s| (s.epsilon, s.log_delta))
+                            .unwrap_or((0.0, 0.0));
+                        let jet = sas_inverse_link_jet(eta_i, epsilon, log_delta);
+                        (jet.d2, jet.d3)
                     }
                     LikelihoodFamily::BinomialMixture => {
-                        let d2 = dmu_deta * (1.0 - 2.0 * mu_i);
-                        let d3 = dmu_deta * (1.0 - 6.0 * mu_i + 6.0 * mu_i * mu_i);
-                        (d2, d3)
+                        if let Some(state) = mixture_link_state {
+                            let jet = mixture_inverse_link_jet(state, eta_i);
+                            (jet.d2, jet.d3)
+                        } else {
+                            let d2 = dmu_deta * (1.0 - 2.0 * mu_i);
+                            let d3 = dmu_deta * (1.0 - 6.0 * mu_i + 6.0 * mu_i * mu_i);
+                            (d2, d3)
+                        }
                     }
                     _ => unreachable!(),
                 };
@@ -2561,7 +2583,14 @@ impl BoundedLinearFamily {
         let x_eff = self.effective_design_for_latent(&jac_diag);
         let eta =
             self.design_zeroed.dot(latent_beta) + self.nonlinear_offset_from_latent(latent_beta);
-        let obs = evaluate_standard_family_observations(self.family, &self.y, &self.weights, &eta)?;
+        let obs = evaluate_standard_family_observations(
+            self.family,
+            self.mixture_link_state.as_ref(),
+            self.sas_link_state.as_ref(),
+            &self.y,
+            &self.weights,
+            &eta,
+        )?;
 
         let mut prior_grad = Array1::<f64>::zeros(latent_beta.len());
         let mut prior_neg_hess = Array2::<f64>::zeros((latent_beta.len(), latent_beta.len()));
@@ -2924,6 +2953,18 @@ fn fit_bounded_term_collection_for_spec(
 
     let family_adapter = BoundedLinearFamily {
         family,
+        mixture_link_state: options
+            .mixture_link
+            .clone()
+            .as_ref()
+            .map(state_from_spec)
+            .transpose()
+            .map_err(EstimationError::InvalidInput)?,
+        sas_link_state: options
+            .sas_link
+            .map(state_from_sas_spec)
+            .transpose()
+            .map_err(EstimationError::InvalidInput)?,
         y: y.to_owned(),
         weights: weights.to_owned(),
         design: fit_design.clone(),
@@ -5982,6 +6023,8 @@ mod tests {
         let weights = Array1::ones(y.len());
         let family = BoundedLinearFamily {
             family: LikelihoodFamily::GaussianIdentity,
+            mixture_link_state: None,
+            sas_link_state: None,
             y: y.clone(),
             weights: weights.clone(),
             design: x.clone(),

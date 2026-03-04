@@ -73,6 +73,27 @@ impl<'a> RemlState<'a> {
         *self.arena.gaussian_cond_snapshot.write().unwrap() = f64::NAN;
     }
 
+    fn invalidate_link_dependent_state(&self) {
+        self.cache_manager.clear_eval_and_factor_caches();
+        self.cache_manager.pirls_cache.write().unwrap().clear();
+        self.warm_start_beta.write().unwrap().take();
+    }
+
+    pub(crate) fn set_link_states(
+        &mut self,
+        mixture_link_state: Option<crate::types::MixtureLinkState>,
+        sas_link_state: Option<SasLinkState>,
+    ) {
+        let changed = self.runtime_mixture_link_state != mixture_link_state
+            || self.runtime_sas_link_state != sas_link_state;
+        if !changed {
+            return;
+        }
+        self.runtime_mixture_link_state = mixture_link_state;
+        self.runtime_sas_link_state = sas_link_state;
+        self.invalidate_link_dependent_state();
+    }
+
     /// Compute soft prior cost without needing workspace
     pub(super) fn compute_soft_prior_cost(&self, rho: &Array1<f64>) -> f64 {
         let len = rho.len();
@@ -272,6 +293,8 @@ impl<'a> RemlState<'a> {
             sparse_penalty_blocks,
             p,
             config,
+            runtime_mixture_link_state: config.mixture_link_state.clone(),
+            runtime_sas_link_state: config.sas_link_state,
             nullspace_dims,
             coefficient_lower_bounds,
             linear_constraints,
@@ -1091,6 +1114,9 @@ impl<'a> RemlState<'a> {
             } else {
                 None
             };
+            let mut pirls_config = self.config.as_pirls_config();
+            pirls_config.mixture_link_state = self.runtime_mixture_link_state.clone();
+            pirls_config.sas_link_state = self.runtime_sas_link_state;
             pirls::fit_model_for_fixed_rho_matrix(
                 LogSmoothingParamsView::new(rho.view()),
                 &self.x,
@@ -1101,7 +1127,7 @@ impl<'a> RemlState<'a> {
                 Some(&self.balanced_penalty_root),
                 Some(&self.reparam_invariant),
                 self.p,
-                &self.config.as_pirls_config(),
+                &pirls_config,
                 warm_start_ref,
                 self.coefficient_lower_bounds.as_ref(),
                 self.linear_constraints.as_ref(),

@@ -1348,6 +1348,11 @@ impl PirlsLruCache {
         self.order.push_back(key.clone());
         self.map.insert(key, value);
     }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
 }
 
 /// Centralized cache/memoization owner for REML evaluations.
@@ -1442,6 +1447,8 @@ pub(crate) struct RemlState<'a> {
     sparse_penalty_blocks: Option<Arc<Vec<SparsePenaltyBlock>>>,
     p: usize,
     config: &'a RemlConfig,
+    runtime_mixture_link_state: Option<crate::types::MixtureLinkState>,
+    runtime_sas_link_state: Option<SasLinkState>,
     nullspace_dims: Vec<usize>,
     coefficient_lower_bounds: Option<Array1<f64>>,
     linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
