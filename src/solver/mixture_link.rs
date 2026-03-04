@@ -392,10 +392,14 @@ pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLi
     let c = u.cosh();
     let z = s;
     let phi = normal_pdf(z);
-    let q = (1.0 + e * e).sqrt();
-    let r1 = delta / q;
-    let r2 = -delta * e / (q * q * q);
-    let r3 = delta * (2.0 * e * e - 1.0) / (q * q * q * q * q);
+    let q = e.hypot(1.0);
+    let inv_q = 1.0 / q;
+    let inv_q2 = inv_q * inv_q;
+    let inv_q3 = inv_q2 * inv_q;
+    let inv_q5 = inv_q3 * inv_q2;
+    let r1 = delta * inv_q;
+    let r2 = -delta * e * inv_q3;
+    let r3 = delta * (2.0 * e * e - 1.0) * inv_q5;
     let u1 = g1 * r1;
     let u2 = g2 * r1 * r1 + g1 * r2;
     let u3 = g3 * r1 * r1 * r1 + 3.0 * g2 * r1 * r2 + g1 * r3;
@@ -435,10 +439,14 @@ pub fn sas_inverse_link_jet_with_param_partials(
     let z = s;
     let phi = normal_pdf(z);
 
-    let q = (1.0 + e * e).sqrt();
-    let a1 = 1.0 / q;
-    let a2 = -e / (q * q * q);
-    let a3 = (2.0 * e * e - 1.0) / (q * q * q * q * q);
+    let q = e.hypot(1.0);
+    let inv_q = 1.0 / q;
+    let inv_q2 = inv_q * inv_q;
+    let inv_q3 = inv_q2 * inv_q;
+    let inv_q5 = inv_q3 * inv_q2;
+    let a1 = inv_q;
+    let a2 = -e * inv_q3;
+    let a3 = (2.0 * e * e - 1.0) * inv_q5;
     let r1 = delta * a1;
     let r2 = delta * a2;
     let r3 = delta * a3;
