@@ -489,6 +489,8 @@ impl WorkingLikelihood for LikelihoodFamily {
                     weights,
                     z,
                     derivatives,
+                    None,
+                    None,
                 )?;
                 Ok(())
             }
@@ -1313,29 +1315,47 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 }),
             )?;
         } else if let Some(sas_state) = self.sas_link_state.as_ref() {
-            if integrated.is_some() {
-                return Err(EstimationError::InvalidInput(
-                    "integrated binomial updates are not yet supported for SAS links".to_string(),
-                ));
+            if let Some(integ) = integrated {
+                update_glm_vectors_integrated_by_family(
+                    integ.quad_ctx,
+                    self.y,
+                    &self.workspace.eta_buf,
+                    integ.se,
+                    LikelihoodFamily::BinomialSas,
+                    self.prior_weights,
+                    &mut self.last_mu,
+                    &mut self.last_weights,
+                    &mut self.last_z,
+                    Some(WorkingDerivativeBuffersMut {
+                        c: &mut self.last_c,
+                        d: &mut self.last_d,
+                        dmu_deta: &mut self.last_dmu_deta,
+                        d2mu_deta2: &mut self.last_d2mu_deta2,
+                        d3mu_deta3: &mut self.last_d3mu_deta3,
+                    }),
+                    None,
+                    Some(sas_state),
+                )?;
+            } else {
+                update_glm_vectors(
+                    self.y,
+                    &self.workspace.eta_buf,
+                    LinkFunction::Sas,
+                    self.prior_weights,
+                    &mut self.last_mu,
+                    &mut self.last_weights,
+                    &mut self.last_z,
+                    None,
+                    Some(sas_state),
+                    Some(WorkingDerivativeBuffersMut {
+                        c: &mut self.last_c,
+                        d: &mut self.last_d,
+                        dmu_deta: &mut self.last_dmu_deta,
+                        d2mu_deta2: &mut self.last_d2mu_deta2,
+                        d3mu_deta3: &mut self.last_d3mu_deta3,
+                    }),
+                )?;
             }
-            update_glm_vectors(
-                self.y,
-                &self.workspace.eta_buf,
-                LinkFunction::Sas,
-                self.prior_weights,
-                &mut self.last_mu,
-                &mut self.last_weights,
-                &mut self.last_z,
-                None,
-                Some(sas_state),
-                Some(WorkingDerivativeBuffersMut {
-                    c: &mut self.last_c,
-                    d: &mut self.last_d,
-                    dmu_deta: &mut self.last_dmu_deta,
-                    d2mu_deta2: &mut self.last_d2mu_deta2,
-                    d3mu_deta3: &mut self.last_d3mu_deta3,
-                }),
-            )?;
         } else {
             self.likelihood.irls_update(
                 self.y,
@@ -4807,6 +4827,8 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
 ) -> Result<(), EstimationError> {
     let family = match link {
         LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
@@ -4840,6 +4862,8 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
         weights,
         z,
         derivatives,
+        mixture_link_state,
+        sas_link_state,
     )
 }
 
@@ -4877,12 +4901,15 @@ pub fn update_glm_vectors_integrated_by_family(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
 ) -> Result<(), EstimationError> {
     if !matches!(
         family,
         LikelihoodFamily::BinomialLogit
             | LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialSas
     ) {
         return Err(EstimationError::InvalidInput(format!(
             "Integrated updates are not supported for family {:?}",
@@ -4894,8 +4921,13 @@ pub fn update_glm_vectors_integrated_by_family(
         matches!(family, LikelihoodFamily::BinomialLogit) && logit_clamp_zero_enabled();
     let mut derivatives = derivatives;
     for i in 0..n {
-        let moments = crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
-            quad_ctx, family, eta[i], se[i],
+        let moments = crate::quadrature::integrated_family_moments_jet_with_state(
+            quad_ctx,
+            family,
+            eta[i],
+            se[i],
+            mixture_link_state,
+            sas_link_state,
         )?;
         let local_jet = MixtureInverseLinkJet {
             mu: moments.mean,
@@ -5030,9 +5062,16 @@ fn directional_working_curvature_diagonal_builtin(
     prior_weights: ArrayView1<'_, f64>,
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    let (c, _, _, _, _) =
-        compute_working_weight_derivatives_from_eta(link, eta, prior_weights, None, None)?;
+    let (c, _, _, _, _) = compute_working_weight_derivatives_from_eta(
+        link,
+        eta,
+        prior_weights,
+        mixture_link_state,
+        sas_link_state,
+    )?;
     let mut w_direction = &c * eta_direction;
     for i in 0..w_direction.len() {
         if solve_weights[i] <= 0.0 || !w_direction[i].is_finite() {
@@ -5054,6 +5093,8 @@ fn directional_working_curvature_logit(
         prior_weights,
         solve_weights,
         eta_direction,
+        None,
+        None,
     )
 }
 
@@ -5069,6 +5110,8 @@ fn directional_working_curvature_probit(
         prior_weights,
         solve_weights,
         eta_direction,
+        None,
+        None,
     )
 }
 
@@ -5084,6 +5127,8 @@ fn directional_working_curvature_cloglog(
         prior_weights,
         solve_weights,
         eta_direction,
+        None,
+        None,
     )
 }
 
@@ -5145,6 +5190,49 @@ pub fn directional_working_curvature_from_eta(
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
     let callback = directional_working_curvature_callback(link);
     callback(eta, prior_weights, solve_weights, eta_direction)
+}
+
+/// State-aware directional derivative of PIRLS working curvature.
+///
+/// Unlike `directional_working_curvature_from_eta`, this path evaluates
+/// curvature using the active parameterized inverse-link state (mixture/SAS)
+/// when present. This keeps REML directional derivatives consistent with the
+/// inner working model surface.
+pub fn directional_working_curvature_from_eta_with_state(
+    link: LinkFunction,
+    eta: &Array1<f64>,
+    prior_weights: ArrayView1<'_, f64>,
+    solve_weights: &Array1<f64>,
+    eta_direction: &Array1<f64>,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
+) -> Result<DirectionalWorkingCurvature, EstimationError> {
+    let eval_link = if mixture_link_state.is_some() {
+        // Mixture dispatch hangs off LinkFunction::Logit + explicit state.
+        LinkFunction::Logit
+    } else if sas_link_state.is_some() || matches!(link, LinkFunction::Sas) {
+        // SAS requires explicit state; when present, use SAS curvature surface.
+        LinkFunction::Sas
+    } else {
+        link
+    };
+
+    match eval_link {
+        LinkFunction::Identity => {
+            directional_working_curvature_identity(eta, prior_weights, solve_weights, eta_direction)
+        }
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
+            directional_working_curvature_diagonal_builtin(
+                eval_link,
+                eta,
+                prior_weights,
+                solve_weights,
+                eta_direction,
+                mixture_link_state,
+                sas_link_state,
+            )
+        }
+    }
 }
 
 #[inline]
@@ -5929,6 +6017,8 @@ mod tests {
                 d2mu_deta2: &mut d2,
                 d3mu_deta3: &mut d3,
             }),
+            None,
+            None,
         )
         .expect("integrated link update");
 

@@ -727,12 +727,14 @@ impl<'a> RemlState<'a> {
         let beta_tau = solve_h_vec(&g_tau);
         let eta_tau = &x_tau_beta + &x_eval.dot(&beta_tau);
 
-        let w_tau_callback = directional_working_curvature_callback(self.config.link_function());
-        let w_tau = match w_tau_callback(
+        let w_tau = match crate::pirls::directional_working_curvature_from_eta_with_state(
+            self.config.link_function(),
             &pirls_result.final_eta,
             self.weights,
             &pirls_result.solve_weights,
             &eta_tau,
+            self.runtime_mixture_link_state.as_ref(),
+            self.runtime_sas_link_state.as_ref(),
         )? {
             DirectionalWorkingCurvature::Diagonal(diag) => diag,
         };
@@ -1163,13 +1165,14 @@ impl<'a> RemlState<'a> {
             beta_tau[j] = solve_h_vec(&g_tau);
             eta_tau[j] = &x_tau_beta[j] + &x_eval.dot(&beta_tau[j]);
 
-            let w_tau_callback =
-                directional_working_curvature_callback(pert_state.config.link_function());
-            let w_tau_j = match w_tau_callback(
+            let w_tau_j = match crate::pirls::directional_working_curvature_from_eta_with_state(
+                pert_state.config.link_function(),
                 &pirls_result.final_eta,
                 pert_state.weights,
                 &pirls_result.solve_weights,
                 &eta_tau[j],
+                pert_state.runtime_mixture_link_state.as_ref(),
+                pert_state.runtime_sas_link_state.as_ref(),
             )? {
                 DirectionalWorkingCurvature::Diagonal(diag) => diag,
             };
@@ -1789,13 +1792,14 @@ impl<'a> RemlState<'a> {
                 Ok(profiled_fit_term + trace_term + pseudo_det_term)
             }
             _ => {
-                let w_tau_callback =
-                    directional_working_curvature_callback(self.config.link_function());
-                let w_direction = w_tau_callback(
+                let w_direction = crate::pirls::directional_working_curvature_from_eta_with_state(
+                    self.config.link_function(),
                     &pirls_result.final_eta,
                     self.weights,
                     &pirls_result.solve_weights,
                     &eta_psi,
+                    self.runtime_mixture_link_state.as_ref(),
+                    self.runtime_sas_link_state.as_ref(),
                 )?;
                 let mut x_wpsi = x_dense.clone();
                 match &w_direction {
