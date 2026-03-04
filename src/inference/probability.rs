@@ -1,5 +1,6 @@
 use crate::types::{LikelihoodFamily, LinkKind};
 use ndarray::{Array1, ArrayView1};
+use crate::mixture_link::inverse_link_jet_for_family;
 
 /// Standard normal PDF φ(x).
 #[inline]
@@ -84,33 +85,16 @@ pub fn try_inverse_link_array(
     eta: ArrayView1<'_, f64>,
     link_kind: Option<&LinkKind>,
 ) -> Result<Array1<f64>, String> {
-    match family {
-        LikelihoodFamily::GaussianIdentity => Ok(eta.to_owned()),
-        LikelihoodFamily::BinomialLogit => Ok(eta.mapv(|v| {
-            let z = v.clamp(-30.0, 30.0);
-            1.0 / (1.0 + (-z).exp())
-        })),
-        LikelihoodFamily::BinomialProbit => Ok(eta.mapv(normal_cdf_approx)),
-        LikelihoodFamily::BinomialCLogLog => Ok(eta.mapv(|v| {
-            let z = v.clamp(-30.0, 30.0);
-            1.0 - (-(z.exp())).exp()
-        })),
-        LikelihoodFamily::BinomialSas => {
-            let sas = link_kind
-                .and_then(|k| k.sas_state())
-                .ok_or_else(|| "inverse-link for BinomialSas requires LinkKind::Sas".to_string())?;
-            Ok(eta.mapv(|e| {
-                crate::mixture_link::sas_inverse_link_jet(e, sas.epsilon, sas.log_delta).mu
-            }))
-        }
-        LikelihoodFamily::BinomialMixture => {
-            let state = link_kind
-                .and_then(|k| k.mixture_state())
-                .ok_or_else(|| "inverse-link for BinomialMixture requires LinkKind::Mixture".to_string())?;
-            Ok(eta.mapv(|e| crate::mixture_link::mixture_inverse_link_jet(state, e).mu))
-        }
-        LikelihoodFamily::RoystonParmar => Ok(eta.to_owned()),
+    if matches!(family, LikelihoodFamily::RoystonParmar) {
+        return Ok(eta.to_owned());
     }
+    let mixture_state = link_kind.and_then(|k| k.mixture_state());
+    let sas_state = link_kind.and_then(|k| k.sas_state());
+    let mut out = Array1::<f64>::zeros(eta.len());
+    for i in 0..eta.len() {
+        out[i] = inverse_link_jet_for_family(family, eta[i], mixture_state, sas_state)?.mu;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

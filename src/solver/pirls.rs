@@ -10,10 +10,10 @@ use crate::linalg::sparse_exact::{
 };
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    InverseLinkJet as MixtureInverseLinkJet, mixture_inverse_link_jet, sas_inverse_link_jet,
+    InverseLinkJet as MixtureInverseLinkJet, inverse_link_jet_for_link_function,
     state_from_sas_spec, state_from_spec,
 };
-use crate::probability::{normal_cdf_approx, normal_pdf, standard_normal_quantile};
+use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
     LikelihoodFamily, LinkFunction, LinkKind, MixtureLinkSpec, MixtureLinkState, RidgePassport,
@@ -4596,55 +4596,8 @@ fn standard_inverse_link_jet(
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
 ) -> MixtureInverseLinkJet {
-    if let Some(state) = mixture_link_state {
-        return mixture_inverse_link_jet(state, eta);
-    }
-    if let Some(state) = sas_link_state {
-        return sas_inverse_link_jet(eta, state.epsilon, state.log_delta);
-    }
-    match link {
-        LinkFunction::Logit => {
-            let e = eta.clamp(-700.0, 700.0);
-            let mu = 1.0 / (1.0 + (-e).exp());
-            let d1 = mu * (1.0 - mu);
-            let d2 = d1 * (1.0 - 2.0 * mu);
-            let d3 = d1 * (1.0 - 6.0 * d1);
-            MixtureInverseLinkJet { mu, d1, d2, d3 }
-        }
-        LinkFunction::Probit => {
-            let e = eta.clamp(-30.0, 30.0);
-            let d1 = normal_pdf(e);
-            MixtureInverseLinkJet {
-                mu: normal_cdf_approx(e),
-                d1,
-                d2: -e * d1,
-                d3: (e * e - 1.0) * d1,
-            }
-        }
-        LinkFunction::CLogLog => {
-            let e = eta.clamp(-30.0, 30.0);
-            let t = e.exp();
-            let s = (-t).exp();
-            let d1 = t * s;
-            MixtureInverseLinkJet {
-                mu: 1.0 - s,
-                d1,
-                d2: d1 * (1.0 - t),
-                d3: d1 * (1.0 - 3.0 * t + t * t),
-            }
-        }
-        LinkFunction::Sas => {
-            panic!(
-                "LinkFunction::Sas requires explicit SasLinkState; state-less SAS fallback is unsupported"
-            )
-        }
-        LinkFunction::Identity => MixtureInverseLinkJet {
-            mu: eta,
-            d1: 1.0,
-            d2: 0.0,
-            d3: 0.0,
-        },
-    }
+    inverse_link_jet_for_link_function(link, eta, mixture_link_state, sas_link_state)
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 #[inline]
