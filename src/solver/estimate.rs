@@ -1204,18 +1204,29 @@ where
             None,
             fit_linear_constraints.clone(),
         )?;
+        let mut rho_buf = Array1::<f64>::zeros(k);
+        let mut mix_rho_buf = if use_mixture {
+            Some(Array1::<f64>::zeros(mixture_dim))
+        } else {
+            None
+        };
         let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
             theta_dim,
             heuristic_theta_ref,
             |theta: &Array1<f64>| {
                 let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
-                let rho = theta.slice(s![..k]).to_owned();
+                rho_buf.assign(&theta.slice(s![..k]));
                 let mut cfg_eval = cfg.clone();
                 if use_mixture {
-                    let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
+                    let mix_rho_arr = mix_rho_buf.as_mut().ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "missing reusable mixture rho buffer".to_string(),
+                        )
+                    })?;
+                    mix_rho_arr.assign(&theta.slice(s![k..(k + mixture_dim)]));
                     let spec_eval = MixtureLinkSpec {
                         components: mix_spec.components.clone(),
-                        initial_rho: mix_rho,
+                        initial_rho: mix_rho_arr.clone(),
                     };
                     cfg_eval.mixture_link_state = Some(state_from_spec(&spec_eval).map_err(|e| {
                         EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
@@ -1235,7 +1246,7 @@ where
                 reml_eval
                     .set_link_states(cfg_eval.mixture_link_state.clone(), cfg_eval.sas_link_state);
                 let t_cost = Instant::now();
-                let mut cost = reml_eval.compute_cost(&rho)?;
+                let mut cost = reml_eval.compute_cost(&rho_buf)?;
                 let sas_ridge = if use_sas { sas_ridge_weight } else { 0.0 };
                 if use_sas && sas_ridge > 0.0 {
                     let log_delta = theta[k + 1];
@@ -1245,9 +1256,9 @@ where
 
                 let t_grad = Instant::now();
                 let mut grad = Array1::<f64>::zeros(theta_dim);
-                let grad_rho = reml_eval.compute_gradient(&rho)?;
+                let grad_rho = reml_eval.compute_gradient(&rho_buf)?;
                 grad.slice_mut(s![..k]).assign(&grad_rho);
-                let (pirls_mix, h_pos_w) = reml_eval.pirls_result_and_hpos_for_rho(&rho)?;
+                let (pirls_mix, h_pos_w) = reml_eval.pirls_result_and_hpos_for_rho(&rho_buf)?;
                 if cfg_eval.firth_bias_reduction {
                     return Err(EstimationError::InvalidInput(
                         "mixture link optimization is incompatible with Firth-adjusted outer gradients"
