@@ -1435,7 +1435,7 @@ pub(crate) struct RemlState<'a> {
     weights: ArrayView1<'a, f64>,
     offset: Array1<f64>,
     // Original penalty matrices S_k (p × p), ρ-independent basis
-    s_full_list: Vec<Array2<f64>>,
+    s_full_list: Arc<Vec<Array2<f64>>>,
     pub(crate) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
     balanced_penalty_root: Array2<f64>,
     reparam_invariant: ReparamInvariant,

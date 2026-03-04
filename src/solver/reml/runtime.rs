@@ -176,12 +176,12 @@ impl<'a> RemlState<'a> {
         X: Into<DesignMatrix>,
     {
         let zero_offset = Array1::<f64>::zeros(y.len());
-        Self::new_with_offset(
+        Self::new_with_offset_shared(
             y,
             x,
             weights,
             zero_offset.view(),
-            s_list,
+            Arc::new(s_list),
             p,
             config,
             nullspace_dims,
@@ -196,6 +196,35 @@ impl<'a> RemlState<'a> {
         weights: ArrayView1<'a, f64>,
         offset: ArrayView1<'_, f64>,
         s_list: Vec<Array2<f64>>,
+        p: usize,
+        config: &'a RemlConfig,
+        nullspace_dims: Option<Vec<usize>>,
+        coefficient_lower_bounds: Option<Array1<f64>>,
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+    ) -> Result<Self, EstimationError>
+    where
+        X: Into<DesignMatrix>,
+    {
+        Self::new_with_offset_shared(
+            y,
+            x,
+            weights,
+            offset,
+            Arc::new(s_list),
+            p,
+            config,
+            nullspace_dims,
+            coefficient_lower_bounds,
+            linear_constraints,
+        )
+    }
+
+    pub(crate) fn new_with_offset_shared<X>(
+        y: ArrayView1<'a, f64>,
+        x: X,
+        weights: ArrayView1<'a, f64>,
+        offset: ArrayView1<'_, f64>,
+        s_list: Arc<Vec<Array2<f64>>>,
         p: usize,
         config: &'a RemlConfig,
         nullspace_dims: Option<Vec<usize>>,

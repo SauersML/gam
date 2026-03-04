@@ -317,7 +317,10 @@ fn run_single_seed_newton<C, Eval>(
     options: &SmoothingBfgsOptions,
 ) -> Option<SmoothingBfgsResult>
 where
-    Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError>,
+    Eval: FnMut(
+        &mut C,
+        &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError>,
 {
     let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
     let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
@@ -419,7 +422,10 @@ fn run_multistart_newton<C, Eval>(
     options: &SmoothingBfgsOptions,
 ) -> Result<SmoothingBfgsResult, EstimationError>
 where
-    Eval: FnMut(&mut C, &Array1<f64>) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError>,
+    Eval: FnMut(
+        &mut C,
+        &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError>,
 {
     let mut eval_cost_grad_rho =
         |ctx: &mut C, rho: &Array1<f64>| -> Result<(f64, Array1<f64>), EstimationError> {

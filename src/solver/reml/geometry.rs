@@ -514,13 +514,15 @@ impl<'a> RemlState<'a> {
         let fit_block =
             -u.dot(&x_tau_beta) + 0.5 * beta.dot(&s_tau_total.dot(&beta)) + fit_firth_partial;
 
-        let block_support =
-            hyper_dir
-                .penalty_index
-                .and_then(|k| Self::sparse_operator_support_for_term(sparse, k));
-        let trace_s_tau = self.trace_hinv_operator_sparse_dispatch(sparse, p, block_support, |basis_block: &Array2<f64>| Ok(
-            s_tau_total.dot(basis_block)
-        ))?;
+        let block_support = hyper_dir
+            .penalty_index
+            .and_then(|k| Self::sparse_operator_support_for_term(sparse, k));
+        let trace_s_tau = self.trace_hinv_operator_sparse_dispatch(
+            sparse,
+            p,
+            block_support,
+            |basis_block: &Array2<f64>| Ok(s_tau_total.dot(basis_block)),
+        )?;
         let cross = self.sparse_exact_weighted_cross_trace_xtau(
             &sparse.factor,
             &hyper_dir.x_tau_original,
@@ -945,8 +947,7 @@ impl<'a> RemlState<'a> {
                             None,
                             |basis_block| {
                                 let mut out = if k == l {
-                                    let block_k =
-                                        blocks_by_term[k].expect("sparse block exists");
+                                    let block_k = blocks_by_term[k].expect("sparse block exists");
                                     let mut akb =
                                         Array2::<f64>::zeros((p_dim, basis_block.ncols()));
                                     for col in 0..basis_block.ncols() {

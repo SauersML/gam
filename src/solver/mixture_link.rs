@@ -96,7 +96,9 @@ pub fn softmax_last_fixed_zero(rho: &Array1<f64>) -> Array1<f64> {
 
 /// Returns softmax weights and Jacobian wrt free logits (last logit fixed at zero).
 /// Jacobian shape is (K, K-1): d pi_k / d rho_j.
-pub fn softmax_with_jacobian_last_fixed_zero(rho: &Array1<f64>) -> (Array1<f64>, ndarray::Array2<f64>) {
+pub fn softmax_with_jacobian_last_fixed_zero(
+    rho: &Array1<f64>,
+) -> (Array1<f64>, ndarray::Array2<f64>) {
     let pi = softmax_last_fixed_zero(rho);
     let k = pi.len();
     let m = k.saturating_sub(1);
@@ -328,7 +330,11 @@ pub fn sas_inverse_link_jet_with_param_partials(
     let a = e.asinh();
     let ld_raw = log_delta;
     let ld = ld_raw.clamp(-12.0, 12.0);
-    let ld_active = if (ld - ld_raw).abs() < 1e-15 { 1.0 } else { 0.0 };
+    let ld_active = if (ld - ld_raw).abs() < 1e-15 {
+        1.0
+    } else {
+        0.0
+    };
     let delta = ld.exp();
     let u_raw = delta * a - epsilon;
     let u = u_raw.clamp(-SAS_U_CLAMP, SAS_U_CLAMP);
@@ -375,8 +381,7 @@ pub fn sas_inverse_link_jet_with_param_partials(
         let d2_t = phi_t * k2 + phi * k2_t;
 
         let k3 = z3 - 3.0 * z * z1 * z2 + (z * z - 1.0) * z1 * z1 * z1;
-        let k3_t = z3_t
-            - 3.0 * (z_t * z1 * z2 + z * z1_t * z2 + z * z1 * z2_t)
+        let k3_t = z3_t - 3.0 * (z_t * z1 * z2 + z * z1_t * z2 + z * z1 * z2_t)
             + 2.0 * z * z_t * z1 * z1 * z1
             + (z * z - 1.0) * 3.0 * z1 * z1 * z1_t;
         let d3_t = phi_t * k3 + phi * k3_t;

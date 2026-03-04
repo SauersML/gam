@@ -1,5 +1,6 @@
 use crate::estimate::{EstimationError, FitResult};
 use crate::matrix::DesignMatrix;
+use crate::mixture_link::sas_inverse_link_jet;
 use crate::probability::{inverse_link_array, standard_normal_quantile};
 use crate::types::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -16,11 +17,16 @@ pub(crate) fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
 fn apply_family_inverse_link(
     eta: &Array1<f64>,
     family: crate::types::LikelihoodFamily,
+    sas_params: Option<(f64, f64)>,
 ) -> Result<Array1<f64>, EstimationError> {
     if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
         return Err(EstimationError::InvalidInput(
             "prediction uncertainty for RoystonParmar is not available in predict_gam".to_string(),
         ));
+    }
+    if matches!(family, crate::types::LikelihoodFamily::BinomialSas) {
+        let (epsilon, log_delta) = sas_params.unwrap_or((0.0, 0.0));
+        return Ok(eta.mapv(|e| sas_inverse_link_jet(e, epsilon, log_delta).mu));
     }
     Ok(inverse_link_array(family, eta.view()))
 }
@@ -200,7 +206,7 @@ where
     let mut eta = x.matrix_vector_multiply(&beta.to_owned());
     eta += &offset;
 
-    let mean = apply_family_inverse_link(&eta, family)?;
+    let mean = apply_family_inverse_link(&eta, family, None)?;
 
     Ok(PredictResult { eta, mean })
 }
@@ -432,7 +438,8 @@ where
 
     let mut eta = x.matrix_vector_multiply(&beta.to_owned());
     eta += &offset;
-    let mean = apply_family_inverse_link(&eta, family)?;
+    let sas_params = fit.sas_epsilon.zip(fit.sas_log_delta);
+    let mean = apply_family_inverse_link(&eta, family, sas_params)?;
 
     let eta_var = linear_predictor_variance(&x, cov);
     let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
@@ -476,7 +483,8 @@ where
                 exp_eta * surv
             }
             crate::types::LikelihoodFamily::BinomialSas => {
-                crate::probability::normal_pdf(eta[i])
+                let (epsilon, log_delta) = sas_params.unwrap_or((0.0, 0.0));
+                sas_inverse_link_jet(eta[i], epsilon, log_delta).d1
             }
             crate::types::LikelihoodFamily::BinomialMixture => {
                 let mu = mean[i];
@@ -493,8 +501,8 @@ where
             &mean + &mean_standard_error.mapv(|s| z * s),
         ),
         MeanIntervalMethod::TransformEta => (
-            apply_family_inverse_link(&eta_lower, family)?,
-            apply_family_inverse_link(&eta_upper, family)?,
+            apply_family_inverse_link(&eta_lower, family, sas_params)?,
+            apply_family_inverse_link(&eta_upper, family, sas_params)?,
         ),
     };
 
