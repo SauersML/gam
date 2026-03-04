@@ -47,8 +47,8 @@ fn analytic_gradient_matches_cost_trend() {
     let opts = ExternalOptimOptions {
         mixture_link: None,
         optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
+        sas_link: None,
+        optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,
@@ -129,8 +129,8 @@ fn hypothesis_analytic_gradient_matches_cost_trend() {
     let opts = ExternalOptimOptions {
         mixture_link: None,
         optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
+        sas_link: None,
+        optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,

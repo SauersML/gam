@@ -80,10 +80,9 @@ fn compute_alo_diagnostics_from_pirls_impl(
     let xt = x_dense.t();
 
     let phi = match link {
-        LinkFunction::Logit
-        | LinkFunction::Probit
-        | LinkFunction::CLogLog
-        | LinkFunction::Sas => 1.0,
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
+            1.0
+        }
         LinkFunction::Identity => {
             let mut rss = 0.0;
             for i in 0..n {

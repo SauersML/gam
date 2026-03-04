@@ -16,8 +16,7 @@ use crate::custom_family::{
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitOptions, FitResult,
     compute_external_joint_hyper_cost_gradient, compute_external_joint_hyper_cost_gradient_hessian,
-    fit_gam_with_heuristic_lambdas,
-    reml::DirectionalHyperParam,
+    fit_gam_with_heuristic_lambdas, reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
 use crate::matrix::DesignMatrix;

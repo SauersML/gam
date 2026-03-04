@@ -34,11 +34,11 @@ use crate::construction::{
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{KahanSum, RidgePlanner, add_ridge, matrix_inverse_with_regularization};
 use crate::matrix::DesignMatrix;
-use crate::pirls::{self, PirlsResult};
 use crate::mixture_link::{
     mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet_with_param_partials,
     state_from_sas_spec, state_from_spec,
 };
+use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
     Coefficients, LinkComponent, LinkFunction, LogSmoothingParamsView, RidgePassport,
@@ -1009,10 +1009,10 @@ where
         ));
     }
     if let Some(spec) = opts.mixture_link.as_ref() {
-        cfg.mixture_link_state = Some(
-            state_from_spec(spec)
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid mixture link: {e}")))?,
-        );
+        cfg.mixture_link_state =
+            Some(state_from_spec(spec).map_err(|e| {
+                EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
+            })?);
     }
     if let Some(spec) = opts.sas_link {
         cfg.sas_link_state = Some(
@@ -1029,13 +1029,13 @@ where
     let x_o = x.clone();
     let x_fit_o = x_fit.clone();
     let offset_o = offset.to_owned();
-    let s_list_for_outer = s_list.clone();
-    let reml_state = RemlState::new_with_offset(
+    let s_list_shared = Arc::new(s_list);
+    let reml_state = RemlState::new_with_offset_shared(
         y_o.view(),
         x_fit_o.clone(),
         w_o.view(),
         offset_o.view(),
-        s_list,
+        Arc::clone(&s_list_shared),
         p,
         &cfg,
         Some(active_nullspace_dims.clone()),
@@ -1087,7 +1087,11 @@ where
     } else {
         None
     };
-    let sas_opt_spec = if opts.optimize_sas { opts.sas_link } else { None };
+    let sas_opt_spec = if opts.optimize_sas {
+        opts.sas_link
+    } else {
+        None
+    };
     let mixture_dim = mixture_opt_spec
         .as_ref()
         .map(|s| s.initial_rho.len())
@@ -1098,12 +1102,13 @@ where
     } else {
         0.0
     };
-    let (final_rho, final_mixture_state, final_sas_state, outer_result) =
-        if mixture_dim > 0 && sas_dim > 0 {
-            return Err(EstimationError::InvalidInput(
-                "simultaneous mixture and SAS optimization is not supported".to_string(),
-            ));
-        } else if mixture_dim == 0 && sas_dim == 0 {
+    let (final_rho, final_mixture_state, final_sas_state, outer_result) = if mixture_dim > 0
+        && sas_dim > 0
+    {
+        return Err(EstimationError::InvalidInput(
+            "simultaneous mixture and SAS optimization is not supported".to_string(),
+        ));
+    } else if mixture_dim == 0 && sas_dim == 0 {
         let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
             k,
             heuristic_lambdas,
@@ -1215,12 +1220,12 @@ where
                         .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
                     );
                 }
-                let reml_eval = RemlState::new_with_offset(
+                let reml_eval = RemlState::new_with_offset_shared(
                     y_o.view(),
                     x_fit_o.clone(),
                     w_o.view(),
                     offset_o.view(),
-                    s_list_for_outer.clone(),
+                    Arc::clone(&s_list_shared),
                     p,
                     &cfg_eval,
                     Some(active_nullspace_dims.clone()),
@@ -1661,9 +1666,7 @@ where
         beta_covariance_corrected,
         beta_standard_errors_corrected,
         reml_score: outer_result.final_value,
-        mixture_link_components: final_mixture_state
-            .as_ref()
-            .map(|s| s.components.clone()),
+        mixture_link_components: final_mixture_state.as_ref().map(|s| s.components.clone()),
         mixture_link_rho: final_mixture_state.as_ref().map(|s| s.rho.clone()),
         mixture_link_weights: final_mixture_state.as_ref().map(|s| s.pi.clone()),
         sas_epsilon: final_sas_state.map(|s| s.epsilon),
@@ -2149,7 +2152,11 @@ where
         )));
     }
     let p = x.ncols();
-    validate_full_size_penalties(&s_list, p, "compute_external_joint_hyper_cost_gradient_hessian")?;
+    validate_full_size_penalties(
+        &s_list,
+        p,
+        "compute_external_joint_hyper_cost_gradient_hessian",
+    )?;
     let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
         s_list,
         &opts.nullspace_dims,
@@ -2540,7 +2547,7 @@ where
             _ => {
                 return Err(EstimationError::InvalidInput(
                     "mixture_link is only supported for binomial families".to_string(),
-                ))
+                ));
             }
         }
     } else if opts.sas_link.is_some() {
@@ -2554,13 +2561,16 @@ where
             _ => {
                 return Err(EstimationError::InvalidInput(
                     "sas_link is only supported for binomial families".to_string(),
-                ))
+                ));
             }
         }
     } else {
         family
     };
-    if matches!(resolved_family, crate::types::LikelihoodFamily::RoystonParmar) {
+    if matches!(
+        resolved_family,
+        crate::types::LikelihoodFamily::RoystonParmar
+    ) {
         return Err(EstimationError::InvalidInput(
             "fit_gam external design path does not support RoystonParmar; use survival training APIs".to_string(),
         ));
@@ -2579,7 +2589,10 @@ where
         firth_bias_reduction: None,
     };
 
-    let result = if matches!(resolved_family, crate::types::LikelihoodFamily::BinomialLogit) {
+    let result = if matches!(
+        resolved_family,
+        crate::types::LikelihoodFamily::BinomialLogit
+    ) {
         let weighted_events = y
             .iter()
             .zip(weights.iter())

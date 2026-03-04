@@ -1117,6 +1117,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     let model: SavedModel =
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
     validate_saved_model_for_inference_stability(&model)?;
+    let saved_sas = saved_sas_params(&model);
 
     let ds = load_dataset(&args.new_data)?;
     let col_map: HashMap<String, usize> = ds
@@ -1445,6 +1446,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 LikelihoodFamily::RoystonParmar,
                 eta.view(),
                 se.view(),
+                None,
             );
             let (lo, hi) =
                 response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
@@ -1771,6 +1773,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 LikelihoodFamily::BinomialProbit,
                 eta.view(),
                 se_base.view(),
+                None,
             );
             let (lo, hi) = response_interval_from_mean_sd(
                 mean.view(),
@@ -1863,7 +1866,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
             if nonlinear {
                 let response_sd =
-                    response_sd_from_eta_for_family(family, pred.eta.view(), eff.view());
+                    response_sd_from_eta_for_family(family, pred.eta.view(), eff.view(), saved_sas);
                 let (lo, hi) = response_interval_from_mean_sd(
                     pred.probabilities.view(),
                     response_sd.view(),
@@ -1909,8 +1912,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             "saved binomial-mixture model is missing mixture_link_components/mixture_link_rho"
                 .to_string()
         })?;
-        let state = state_from_spec(&spec)
-            .map_err(|e| format!("invalid saved mixture link state: {e}"))?;
+        let state =
+            state_from_spec(&spec).map_err(|e| format!("invalid saved mixture link state: {e}"))?;
         let mut eta = design.design.dot(&beta);
         eta += &offset;
         let mean = eta.mapv(|e| mixture_inverse_link_jet(&state, e).mu);
@@ -1998,7 +2001,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
         eta_se = Some(se.clone());
         if nonlinear {
-            let response_sd = response_sd_from_eta_for_family(family, eta.view(), se.view());
+            let response_sd =
+                response_sd_from_eta_for_family(family, eta.view(), se.view(), saved_sas);
             let (lo, hi) = response_interval_from_mean_sd(
                 mean.view(),
                 response_sd.view(),
@@ -5752,10 +5756,7 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
         }));
     };
     let t = v.trim().to_ascii_lowercase();
-    if let Some(inner) = t
-        .strip_prefix("mixture(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
+    if let Some(inner) = t.strip_prefix("mixture(").and_then(|s| s.strip_suffix(')')) {
         let components = parse_link_component_list(inner)?;
         return Ok(Some(LinkChoice {
             mode: if flexible_flag {
@@ -5867,6 +5868,17 @@ fn saved_mixture_link_spec(model: &SavedModel) -> Result<Option<MixtureLinkSpec>
         components,
         initial_rho: Array1::from_vec(rho_vec),
     }))
+}
+
+fn saved_sas_params(model: &SavedModel) -> Option<(f64, f64)> {
+    if model.family == "binomial-sas" || matches!(model.link.as_deref(), Some("sas")) {
+        Some((
+            model.sas_epsilon.unwrap_or(0.0),
+            model.sas_log_delta.unwrap_or(0.0),
+        ))
+    } else {
+        None
+    }
 }
 
 fn parse_link_name(v: &str) -> Result<LinkFunction, String> {
@@ -6373,6 +6385,7 @@ fn response_sd_from_eta_for_family(
     family: LikelihoodFamily,
     eta: ArrayView1<'_, f64>,
     eta_se: ArrayView1<'_, f64>,
+    sas_params: Option<(f64, f64)>,
 ) -> Array1<f64> {
     let quad_ctx = gam::quadrature::QuadratureContext::new();
     Array1::from_iter((0..eta.len()).map(|i| {
@@ -6393,9 +6406,10 @@ fn response_sd_from_eta_for_family(
                 v
             }
             LikelihoodFamily::BinomialSas => {
-                let (_, v) =
-                    gam::quadrature::probit_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
-                v
+                let (epsilon, log_delta) = sas_params.unwrap_or((0.0, 0.0));
+                let dmu_deta = sas_inverse_link_jet(eta[i], epsilon, log_delta).d1.abs();
+                let se = eta_se[i].max(0.0);
+                (dmu_deta * se).powi(2)
             }
             LikelihoodFamily::BinomialMixture => {
                 let (_, v) =

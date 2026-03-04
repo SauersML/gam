@@ -610,12 +610,9 @@ impl WorkingLikelihood for LikelihoodFamily {
                 LinkFunction::CLogLog,
                 prior_weights,
             )),
-            LikelihoodFamily::BinomialSas => Ok(calculate_deviance(
-                y,
-                mu,
-                LinkFunction::Sas,
-                prior_weights,
-            )),
+            LikelihoodFamily::BinomialSas => {
+                Ok(calculate_deviance(y, mu, LinkFunction::Sas, prior_weights))
+            }
             LikelihoodFamily::BinomialMixture => Ok(calculate_deviance(
                 y,
                 mu,
@@ -1726,7 +1723,11 @@ fn compute_firth_hat_and_half_logdet(
 
     workspace.fill_sqrt_weights(&weights);
     let mut stabilized = Array2::<f64>::zeros((p, p).f());
-    workspace.add_dense_xtwx_streaming_from_sqrt(&x_design, &mut stabilized, get_global_parallelism());
+    workspace.add_dense_xtwx_streaming_from_sqrt(
+        &x_design,
+        &mut stabilized,
+        get_global_parallelism(),
+    );
     if let Some(s) = s_transformed {
         for i in 0..p {
             for j in 0..p {
@@ -2670,11 +2671,8 @@ fn default_beta_guess_external(
                         })
                     }
                     LinkFunction::CLogLog => (-(1.0 - prevalence).ln()).ln(),
-                    LinkFunction::Sas => {
-                        standard_normal_quantile(prevalence).unwrap_or_else(|_| {
-                            (prevalence / (1.0 - prevalence)).ln()
-                        })
-                    }
+                    LinkFunction::Sas => standard_normal_quantile(prevalence)
+                        .unwrap_or_else(|_| (prevalence / (1.0 - prevalence)).ln()),
                     LinkFunction::Identity => unreachable!(),
                 };
             }
@@ -4163,20 +4161,18 @@ pub fn run_pirls<'a>(
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let (link, firth_active) = resolve_pirls_family(opts.family, opts.firth_bias_reduction)?;
     let mixture_link_state = match &opts.mixture_link_spec {
-        Some(spec) => Some(
-            state_from_spec(spec).map_err(|e| {
-                EstimationError::InvalidInput(format!("invalid mixture link spec: {e}"))
-            })?,
-        ),
+        Some(spec) => Some(state_from_spec(spec).map_err(|e| {
+            EstimationError::InvalidInput(format!("invalid mixture link spec: {e}"))
+        })?),
         None => None,
     };
-    let sas_link_state = match opts.sas_link_spec {
-        Some(spec) => Some(
-            state_from_sas_spec(spec)
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link spec: {e}")))?,
-        ),
-        None => None,
-    };
+    let sas_link_state =
+        match opts.sas_link_spec {
+            Some(spec) => Some(state_from_sas_spec(spec).map_err(|e| {
+                EstimationError::InvalidInput(format!("invalid SAS link spec: {e}"))
+            })?),
+            None => None,
+        };
     if k != rs_original.len() {
         return Err(EstimationError::InvalidInput(format!(
             "run_pirls: k={} does not match number of penalty roots {}",

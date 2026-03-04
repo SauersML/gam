@@ -214,7 +214,7 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
-        let mut s_mod = self.s_full_list.clone();
+        let mut s_mod = self.s_full_list.as_ref().clone();
         for (j, dir) in hyper_dirs.iter().enumerate() {
             let amp = psi[j];
             if amp == 0.0 {
