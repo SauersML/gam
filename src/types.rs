@@ -14,7 +14,7 @@ pub enum LinkFunction {
     Identity,
 }
 
-/// Supported inverse-link components for convex mixture links.
+/// Supported inverse-link components for convex blended inverse links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkComponent {
     Probit,
@@ -24,7 +24,7 @@ pub enum LinkComponent {
     Cauchit,
 }
 
-/// User-facing configuration for a mixture inverse link.
+/// User-facing configuration for a blended inverse link.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MixtureLinkSpec {
     pub components: Vec<LinkComponent>,
@@ -32,7 +32,7 @@ pub struct MixtureLinkSpec {
     pub initial_rho: Array1<f64>,
 }
 
-/// Runtime mixture state with precomputed softmax weights.
+/// Runtime blended-link state with precomputed softmax weights.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MixtureLinkState {
     pub components: Vec<LinkComponent>,

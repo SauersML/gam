@@ -1026,7 +1026,7 @@ where
     if let Some(spec) = opts.mixture_link.as_ref() {
         cfg.link_kind = LinkKind::Mixture(
             state_from_spec(spec)
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid mixture link: {e}")))?,
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?,
         );
     }
     if let Some(spec) = effective_sas_link {
@@ -1272,7 +1272,7 @@ where
                     };
                     cfg_eval.link_kind = LinkKind::Mixture(
                         state_from_spec(&spec_eval).map_err(|e| {
-                            EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
+                            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
                         })?,
                     );
                 }
@@ -1308,7 +1308,7 @@ where
                 let (pirls_mix, h_pos_w) = reml_eval.pirls_result_and_hpos_for_rho(&rho_buf)?;
                 if cfg_eval.firth_bias_reduction {
                     return Err(EstimationError::InvalidInput(
-                        "mixture link optimization is incompatible with Firth-adjusted outer gradients"
+                        "blended inverse-link optimization is incompatible with Firth-adjusted outer gradients"
                             .to_string(),
                     ));
                 }
@@ -1462,7 +1462,7 @@ where
                     components: mix_spec.components.clone(),
                     initial_rho: final_mix_rho,
                 })
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid mixture link: {e}")))?,
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?,
             )
         } else {
             None
@@ -1493,7 +1493,7 @@ where
                         initial_rho: aux.clone(),
                     };
                     let mix_state = state_from_spec(&spec_eval).map_err(|e| {
-                        EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
+                        EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
                     })?;
                     reml_eval.set_link_states(Some(mix_state), None);
                 } else if use_sas {
