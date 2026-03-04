@@ -507,7 +507,7 @@ impl WorkingLikelihood for LikelihoodFamily {
                     None,
                     None,
                     derivatives,
-                );
+                )?;
                 Ok(())
             }
             (LikelihoodFamily::BinomialProbit, None) => {
@@ -522,7 +522,7 @@ impl WorkingLikelihood for LikelihoodFamily {
                     None,
                     None,
                     derivatives,
-                );
+                )?;
                 Ok(())
             }
             (LikelihoodFamily::BinomialCLogLog, None) => {
@@ -537,7 +537,7 @@ impl WorkingLikelihood for LikelihoodFamily {
                     None,
                     None,
                     derivatives,
-                );
+                )?;
                 Ok(())
             }
             (LikelihoodFamily::BinomialSas, None) => {
@@ -552,7 +552,7 @@ impl WorkingLikelihood for LikelihoodFamily {
                     None,
                     None,
                     derivatives,
-                );
+                )?;
                 Ok(())
             }
             (LikelihoodFamily::BinomialMixture, _) => Err(EstimationError::InvalidInput(
@@ -570,7 +570,7 @@ impl WorkingLikelihood for LikelihoodFamily {
                     None,
                     None,
                     None,
-                );
+                )?;
                 Ok(())
             }
             (LikelihoodFamily::RoystonParmar, None) => Err(EstimationError::InvalidInput(
@@ -1311,7 +1311,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     d2mu_deta2: &mut self.last_d2mu_deta2,
                     d3mu_deta3: &mut self.last_d3mu_deta3,
                 }),
-            );
+            )?;
         } else if let Some(sas_state) = self.sas_link_state.as_ref() {
             if integrated.is_some() {
                 return Err(EstimationError::InvalidInput(
@@ -1335,7 +1335,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     d2mu_deta2: &mut self.last_d2mu_deta2,
                     d3mu_deta3: &mut self.last_d3mu_deta3,
                 }),
-            );
+            )?;
         } else {
             self.likelihood.irls_update(
                 self.y,
@@ -2725,8 +2725,9 @@ fn solve_intercept_for_prevalence(
         mixture_link_state: Option<&MixtureLinkState>,
         sas_link_state: Option<&SasLinkState>,
     ) -> f64 {
-        standard_inverse_link_jet(link_function, eta, mixture_link_state, sas_link_state).mu
-            - prevalence
+        standard_inverse_link_jet(link_function, eta, mixture_link_state, sas_link_state)
+            .map(|jet| jet.mu - prevalence)
+            .unwrap_or(f64::NAN)
     }
 
     let mut lo = -40.0;
@@ -3660,7 +3661,7 @@ pub fn fit_model_for_fixed_rho<'a>(
                 prior_weights_owned.view(),
                 config.link_kind.mixture_state(),
                 config.link_kind.sas_state(),
-            );
+            )?;
         let pirls_result = PirlsResult {
             beta_transformed,
             penalized_hessian_transformed: penalized_hessian,
@@ -4595,9 +4596,9 @@ fn standard_inverse_link_jet(
     eta: f64,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
-) -> MixtureInverseLinkJet {
+) -> Result<MixtureInverseLinkJet, EstimationError> {
     inverse_link_jet_for_link_function(link, eta, mixture_link_state, sas_link_state)
-        .unwrap_or_else(|e| panic!("{e}"))
+        .map_err(EstimationError::InvalidInput)
 }
 
 #[inline]
@@ -4686,7 +4687,7 @@ pub fn update_glm_vectors(
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
-) {
+) -> Result<(), EstimationError> {
     let n = eta.len();
     match link {
         LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
@@ -4702,7 +4703,7 @@ pub fn update_glm_vectors(
                     LinkFunction::Identity => eta[i],
                 };
                 let jet =
-                    standard_inverse_link_jet(link, eta_used, mixture_link_state, sas_link_state);
+                    standard_inverse_link_jet(link, eta_used, mixture_link_state, sas_link_state)?;
                 let geom = bernoulli_geometry_from_jet(
                     eta[i],
                     eta_used,
@@ -4723,9 +4724,11 @@ pub fn update_glm_vectors(
                     derivs.d3mu_deta3[i] = jet.d3;
                 }
             }
+            Ok(())
         }
         LinkFunction::Identity => {
             write_identity_working_state(y, eta, prior_weights, mu, weights, z, derivatives);
+            Ok(())
         }
     }
 }
@@ -4808,8 +4811,8 @@ pub fn update_glm_vectors_integrated(
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
-) {
-    let _ = update_glm_vectors_integrated_by_family(
+) -> Result<(), EstimationError> {
+    update_glm_vectors_integrated_by_family(
         quad_ctx,
         y,
         eta,
@@ -4820,7 +4823,7 @@ pub fn update_glm_vectors_integrated(
         weights,
         z,
         None,
-    );
+    )
 }
 
 pub(crate) fn update_glm_vectors_integrated_for_link(
@@ -4852,7 +4855,7 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
                 None,
                 None,
                 derivatives,
-            );
+            )?;
             return Ok(());
         }
     };
@@ -4977,13 +4980,16 @@ fn compute_working_weight_derivatives_from_eta(
     prior_weights: ArrayView1<f64>,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
-) -> (
+) -> Result<
+    (
     Array1<f64>,
     Array1<f64>,
     Array1<f64>,
     Array1<f64>,
     Array1<f64>,
-) {
+    ),
+    EstimationError,
+> {
     let n = eta.len();
     let mut c = Array1::<f64>::zeros(n);
     let mut d = Array1::<f64>::zeros(n);
@@ -5006,7 +5012,7 @@ fn compute_working_weight_derivatives_from_eta(
                     LinkFunction::Identity => eta[i],
                 };
                 let jet =
-                    standard_inverse_link_jet(link, eta_used, mixture_link_state, sas_link_state);
+                    standard_inverse_link_jet(link, eta_used, mixture_link_state, sas_link_state)?;
                 let geom = bernoulli_geometry_from_jet(
                     eta[i],
                     eta_used,
@@ -5024,7 +5030,7 @@ fn compute_working_weight_derivatives_from_eta(
             }
         }
     }
-    (c, d, dmu_deta, d2mu_deta2, d3mu_deta3)
+    Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3))
 }
 
 #[derive(Clone)]
@@ -5045,7 +5051,7 @@ pub type DirectionalWorkingCurvatureCallback = fn(
     prior_weights: ArrayView1<'_, f64>,
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
-) -> DirectionalWorkingCurvature;
+) -> Result<DirectionalWorkingCurvature, EstimationError>;
 
 fn directional_working_curvature_diagonal_builtin(
     link: LinkFunction,
@@ -5053,16 +5059,16 @@ fn directional_working_curvature_diagonal_builtin(
     prior_weights: ArrayView1<'_, f64>,
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
-) -> DirectionalWorkingCurvature {
+) -> Result<DirectionalWorkingCurvature, EstimationError> {
     let (c, _, _, _, _) =
-        compute_working_weight_derivatives_from_eta(link, eta, prior_weights, None, None);
+        compute_working_weight_derivatives_from_eta(link, eta, prior_weights, None, None)?;
     let mut w_direction = &c * eta_direction;
     for i in 0..w_direction.len() {
         if solve_weights[i] <= 0.0 || !w_direction[i].is_finite() {
             w_direction[i] = 0.0;
         }
     }
-    DirectionalWorkingCurvature::Diagonal(w_direction)
+    Ok(DirectionalWorkingCurvature::Diagonal(w_direction))
 }
 
 fn directional_working_curvature_logit(
@@ -5070,7 +5076,7 @@ fn directional_working_curvature_logit(
     prior_weights: ArrayView1<'_, f64>,
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
-) -> DirectionalWorkingCurvature {
+) -> Result<DirectionalWorkingCurvature, EstimationError> {
     directional_working_curvature_diagonal_builtin(
         LinkFunction::Logit,
         eta,
@@ -5085,7 +5091,7 @@ fn directional_working_curvature_probit(
     prior_weights: ArrayView1<'_, f64>,
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
-) -> DirectionalWorkingCurvature {
+) -> Result<DirectionalWorkingCurvature, EstimationError> {
     directional_working_curvature_diagonal_builtin(
         LinkFunction::Probit,
         eta,
@@ -5100,7 +5106,7 @@ fn directional_working_curvature_cloglog(
     prior_weights: ArrayView1<'_, f64>,
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
-) -> DirectionalWorkingCurvature {
+) -> Result<DirectionalWorkingCurvature, EstimationError> {
     directional_working_curvature_diagonal_builtin(
         LinkFunction::CLogLog,
         eta,
@@ -5115,9 +5121,11 @@ fn directional_working_curvature_identity(
     _prior_weights: ArrayView1<'_, f64>,
     _solve_weights: &Array1<f64>,
     _eta_direction: &Array1<f64>,
-) -> DirectionalWorkingCurvature {
+) -> Result<DirectionalWorkingCurvature, EstimationError> {
     // Gaussian identity has constant W in η, so W_τ = 0.
-    DirectionalWorkingCurvature::Diagonal(Array1::<f64>::zeros(eta.len()))
+    Ok(DirectionalWorkingCurvature::Diagonal(Array1::<f64>::zeros(
+        eta.len(),
+    )))
 }
 
 fn directional_working_curvature_sas_state_required(
@@ -5125,10 +5133,10 @@ fn directional_working_curvature_sas_state_required(
     _prior_weights: ArrayView1<'_, f64>,
     _solve_weights: &Array1<f64>,
     _eta_direction: &Array1<f64>,
-) -> DirectionalWorkingCurvature {
-    panic!(
-        "Directional SAS curvature requires explicit SasLinkState; state-less LinkFunction::Sas callback is unsupported"
-    )
+) -> Result<DirectionalWorkingCurvature, EstimationError> {
+    Err(EstimationError::InvalidInput(
+        "Directional SAS curvature requires explicit SasLinkState; state-less LinkFunction::Sas callback is unsupported".to_string(),
+    ))
 }
 
 /// Returns the family-level directional curvature callback for `W_τ = T[η̇]`.
@@ -5163,7 +5171,7 @@ pub fn directional_working_curvature_from_eta(
     prior_weights: ArrayView1<'_, f64>,
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
-) -> DirectionalWorkingCurvature {
+) -> Result<DirectionalWorkingCurvature, EstimationError> {
     let callback = directional_working_curvature_callback(link);
     callback(eta, prior_weights, solve_weights, eta_direction)
 }
@@ -5957,7 +5965,8 @@ mod tests {
             LinkFunction::Logit,
             eta[0].clamp(-700.0, 700.0),
             se[0],
-        );
+        )
+        .expect("logit integrated inverse-link jet should evaluate");
         let expected = bernoulli_geometry_from_jet(
             eta[0],
             eta[0].clamp(-700.0, 700.0),
@@ -6029,7 +6038,8 @@ mod tests {
                 LinkFunction::Logit,
                 fit.final_eta[i].clamp(-700.0, 700.0),
                 covariate_se[i],
-            );
+            )
+            .expect("logit integrated inverse-link jet should evaluate");
             let expected = bernoulli_geometry_from_jet(
                 fit.final_eta[i],
                 fit.final_eta[i].clamp(-700.0, 700.0),

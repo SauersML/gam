@@ -639,7 +639,7 @@ impl<'a> JointModelState<'a> {
         let mut z_glm = Array1::<f64>::zeros(n);
         if let Some(se) = &self.covariate_se {
             if let Some(family) = integrated_binomial_family_from_link(self.link) {
-                let _ = crate::pirls::update_glm_vectors_integrated_by_family(
+                if let Err(e) = crate::pirls::update_glm_vectors_integrated_by_family(
                     &self.quad_ctx,
                     self.y,
                     &eta,
@@ -650,9 +650,11 @@ impl<'a> JointModelState<'a> {
                     &mut weights,
                     &mut z_glm,
                     None,
-                );
+                ) {
+                    log::warn!("joint integrated working-vector update failed: {}", e);
+                }
             } else {
-                crate::pirls::update_glm_vectors(
+                if let Err(e) = crate::pirls::update_glm_vectors(
                     self.y,
                     &eta,
                     self.link.clone(),
@@ -663,10 +665,12 @@ impl<'a> JointModelState<'a> {
                     None,
                     None,
                     None,
-                );
+                ) {
+                    log::warn!("joint working-vector update failed: {}", e);
+                }
             }
         } else {
-            crate::pirls::update_glm_vectors(
+            if let Err(e) = crate::pirls::update_glm_vectors(
                 self.y,
                 &eta,
                 self.link.clone(),
@@ -677,7 +681,9 @@ impl<'a> JointModelState<'a> {
                 None,
                 None,
                 None,
-            );
+            ) {
+                log::warn!("joint working-vector update failed: {}", e);
+            }
         }
         (eta, mu, weights, z_glm)
     }
@@ -1026,7 +1032,7 @@ impl<'a> JointModelState<'a> {
                             self.link,
                             e
                         );
-                        crate::pirls::update_glm_vectors(
+                        if let Err(e2) = crate::pirls::update_glm_vectors(
                             self.y,
                             eta,
                             self.link,
@@ -1037,24 +1043,30 @@ impl<'a> JointModelState<'a> {
                             None,
                             None,
                             None,
-                        );
+                        ) {
+                            log::warn!("joint non-integrated fallback update failed: {}", e2);
+                        }
                     }
                 }
-                _ => crate::pirls::update_glm_vectors(
-                    self.y,
-                    eta,
-                    self.link.clone(),
-                    self.weights,
-                    &mut mu_updated,
-                    &mut weights_updated,
-                    &mut z_updated,
-                    None,
-                    None,
-                    None,
-                ),
+                _ => {
+                    if let Err(e) = crate::pirls::update_glm_vectors(
+                        self.y,
+                        eta,
+                        self.link.clone(),
+                        self.weights,
+                        &mut mu_updated,
+                        &mut weights_updated,
+                        &mut z_updated,
+                        None,
+                        None,
+                        None,
+                    ) {
+                        log::warn!("joint working-vector update failed: {}", e);
+                    }
+                }
             }
         } else {
-            crate::pirls::update_glm_vectors(
+            if let Err(e) = crate::pirls::update_glm_vectors(
                 self.y,
                 eta,
                 self.link.clone(),
@@ -1065,7 +1077,9 @@ impl<'a> JointModelState<'a> {
                 None,
                 None,
                 None,
-            );
+            ) {
+                log::warn!("joint working-vector update failed: {}", e);
+            }
         }
         self.compute_deviance(&mu_updated)
     }
@@ -2830,7 +2844,7 @@ impl<'a> JointRemlState<'a> {
         let mut mu = Array1::<f64>::zeros(state.n_obs());
         let mut weights = Array1::<f64>::zeros(state.n_obs());
         let mut z = Array1::<f64>::zeros(state.n_obs());
-        crate::pirls::update_glm_vectors(
+        if let Err(e) = crate::pirls::update_glm_vectors(
             state.y,
             &eta,
             state.link.clone(),
@@ -2841,7 +2855,9 @@ impl<'a> JointRemlState<'a> {
             None,
             None,
             None,
-        );
+        ) {
+            log::warn!("joint final working-vector update failed: {}", e);
+        }
         let deviance = state.compute_deviance(&mu);
         JointModelResult {
             beta_base: state.beta_base,

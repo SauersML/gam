@@ -331,6 +331,7 @@ where
                 crate::quadrature::integrated_inverse_link_mean_and_derivative(
                     &quad_ctx, link, e, se,
                 )
+                .map_err(|e| EstimationError::InvalidInput(format!("{e}")))?
                 .mean
             }))
         }
@@ -891,6 +892,7 @@ mod tests {
             0.4,
             0.4,
         )
+        .expect("logit integrated inverse-link moments should evaluate")
         .mean;
         assert!((out.mean[0] - expected).abs() <= 1e-12);
         assert!((out.mean[1] - expected).abs() <= 1e-12);
