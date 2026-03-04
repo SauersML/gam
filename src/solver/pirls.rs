@@ -9,9 +9,16 @@ use crate::linalg::sparse_exact::{
     sparse_to_dense_symmetric_upper_public,
 };
 use crate::matrix::DesignMatrix;
+use crate::mixture_link::{
+    InverseLinkJet as MixtureInverseLinkJet, mixture_inverse_link_jet, sas_inverse_link_jet,
+    state_from_sas_spec, state_from_spec,
+};
 use crate::probability::{normal_cdf_approx, normal_pdf, standard_normal_quantile};
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
-use crate::types::{LikelihoodFamily, LinkFunction, RidgePassport, RidgePolicy};
+use crate::types::{
+    LikelihoodFamily, LinkFunction, MixtureLinkSpec, MixtureLinkState, RidgePassport, RidgePolicy,
+    SasLinkSpec, SasLinkState,
+};
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
@@ -33,6 +40,10 @@ use faer::linalg::cholesky::llt::factor::LltParams;
 use faer::{Auto, MatRef, Spec};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+
+// Backward-compatible alias used by internal tests/helpers.
+#[cfg(test)]
+type InverseLinkJet = MixtureInverseLinkJet;
 
 pub struct LltView<'a> {
     pub matrix: MatRef<'a, f64>,
@@ -399,15 +410,6 @@ pub struct WorkingDerivativeBuffersMut<'a> {
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
-struct InverseLinkJet {
-    mu: f64,
-    d1: f64,
-    d2: f64,
-    d3: f64,
-}
-
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
 struct WorkingBernoulliGeometry {
     mu: f64,
     weight: f64,
@@ -472,7 +474,8 @@ impl WorkingLikelihood for LikelihoodFamily {
             (
                 LikelihoodFamily::BinomialLogit
                 | LikelihoodFamily::BinomialProbit
-                | LikelihoodFamily::BinomialCLogLog,
+                | LikelihoodFamily::BinomialCLogLog
+                | LikelihoodFamily::BinomialSas,
                 Some(integ),
             ) => {
                 update_glm_vectors_integrated_by_family(
@@ -501,6 +504,8 @@ impl WorkingLikelihood for LikelihoodFamily {
                     mu,
                     weights,
                     z,
+                    None,
+                    None,
                     derivatives,
                 );
                 Ok(())
@@ -514,6 +519,8 @@ impl WorkingLikelihood for LikelihoodFamily {
                     mu,
                     weights,
                     z,
+                    None,
+                    None,
                     derivatives,
                 );
                 Ok(())
@@ -527,10 +534,30 @@ impl WorkingLikelihood for LikelihoodFamily {
                     mu,
                     weights,
                     z,
+                    None,
+                    None,
                     derivatives,
                 );
                 Ok(())
             }
+            (LikelihoodFamily::BinomialSas, None) => {
+                update_glm_vectors(
+                    y,
+                    eta,
+                    LinkFunction::Sas,
+                    prior_weights,
+                    mu,
+                    weights,
+                    z,
+                    None,
+                    None,
+                    derivatives,
+                );
+                Ok(())
+            }
+            (LikelihoodFamily::BinomialMixture, _) => Err(EstimationError::InvalidInput(
+                "BinomialMixture updates are handled by the PIRLS working model path".to_string(),
+            )),
             (LikelihoodFamily::GaussianIdentity, _) => {
                 update_glm_vectors(
                     y,
@@ -540,6 +567,8 @@ impl WorkingLikelihood for LikelihoodFamily {
                     mu,
                     weights,
                     z,
+                    None,
+                    None,
                     None,
                 );
                 Ok(())
@@ -581,6 +610,18 @@ impl WorkingLikelihood for LikelihoodFamily {
                 LinkFunction::CLogLog,
                 prior_weights,
             )),
+            LikelihoodFamily::BinomialSas => Ok(calculate_deviance(
+                y,
+                mu,
+                LinkFunction::Sas,
+                prior_weights,
+            )),
+            LikelihoodFamily::BinomialMixture => Ok(calculate_deviance(
+                y,
+                mu,
+                LinkFunction::Logit,
+                prior_weights,
+            )),
             LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar deviance is survival-specific and not computed via GLM helper"
                     .to_string(),
@@ -609,7 +650,9 @@ impl WorkingLikelihood for LikelihoodFamily {
             }
             LikelihoodFamily::BinomialLogit
             | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog => {
+            | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialMixture => {
                 let ll = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
                     0.0,
                     |acc, &yi, &mui, &wi| {
@@ -996,6 +1039,8 @@ struct GamWorkingModel<'a> {
     e_transformed: Array2<f64>,
     workspace: PirlsWorkspace,
     likelihood: LikelihoodFamily,
+    mixture_link_state: Option<MixtureLinkState>,
+    sas_link_state: Option<SasLinkState>,
     firth_bias_reduction: bool,
     firth_log_det: Option<f64>,
     last_mu: Array1<f64>,
@@ -1046,6 +1091,8 @@ impl<'a> GamWorkingModel<'a> {
         e_transformed: Array2<f64>,
         workspace: PirlsWorkspace,
         link: LinkFunction,
+        mixture_link_state: Option<MixtureLinkState>,
+        sas_link_state: Option<SasLinkState>,
         firth_bias_reduction: bool,
         qs: Option<Array2<f64>>,
         quad_ctx: crate::quadrature::QuadratureContext,
@@ -1059,7 +1106,13 @@ impl<'a> GamWorkingModel<'a> {
             .as_ref()
             .and_then(|matrix| matrix.to_csr_cache());
         let x_original_csr = x_original.to_csr_cache();
-        let likelihood = likelihood_from_link(link);
+        let likelihood = if mixture_link_state.is_some() {
+            LikelihoodFamily::BinomialMixture
+        } else if sas_link_state.is_some() || matches!(link, LinkFunction::Sas) {
+            LikelihoodFamily::BinomialSas
+        } else {
+            likelihood_from_link(link)
+        };
         GamWorkingModel {
             x_transformed,
             x_original,
@@ -1071,6 +1124,8 @@ impl<'a> GamWorkingModel<'a> {
             e_transformed,
             workspace,
             likelihood,
+            mixture_link_state,
+            sas_link_state,
             firth_bias_reduction,
             firth_log_det: None,
             last_mu: Array1::zeros(n),
@@ -1235,22 +1290,73 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             quad_ctx: &self.quad_ctx,
             se: se.view(),
         });
-        self.likelihood.irls_update(
-            self.y,
-            &self.workspace.eta_buf,
-            self.prior_weights,
-            &mut self.last_mu,
-            &mut self.last_weights,
-            &mut self.last_z,
-            integrated,
-            Some(WorkingDerivativeBuffersMut {
-                c: &mut self.last_c,
-                d: &mut self.last_d,
-                dmu_deta: &mut self.last_dmu_deta,
-                d2mu_deta2: &mut self.last_d2mu_deta2,
-                d3mu_deta3: &mut self.last_d3mu_deta3,
-            }),
-        )?;
+        if let Some(mixture_state) = self.mixture_link_state.as_ref() {
+            if integrated.is_some() {
+                return Err(EstimationError::InvalidInput(
+                    "integrated binomial updates are not yet supported for mixture links"
+                        .to_string(),
+                ));
+            }
+            update_glm_vectors(
+                self.y,
+                &self.workspace.eta_buf,
+                LinkFunction::Logit,
+                self.prior_weights,
+                &mut self.last_mu,
+                &mut self.last_weights,
+                &mut self.last_z,
+                Some(mixture_state),
+                None,
+                Some(WorkingDerivativeBuffersMut {
+                    c: &mut self.last_c,
+                    d: &mut self.last_d,
+                    dmu_deta: &mut self.last_dmu_deta,
+                    d2mu_deta2: &mut self.last_d2mu_deta2,
+                    d3mu_deta3: &mut self.last_d3mu_deta3,
+                }),
+            );
+        } else if let Some(sas_state) = self.sas_link_state.as_ref() {
+            if integrated.is_some() {
+                return Err(EstimationError::InvalidInput(
+                    "integrated binomial updates are not yet supported for SAS links".to_string(),
+                ));
+            }
+            update_glm_vectors(
+                self.y,
+                &self.workspace.eta_buf,
+                LinkFunction::Sas,
+                self.prior_weights,
+                &mut self.last_mu,
+                &mut self.last_weights,
+                &mut self.last_z,
+                None,
+                Some(sas_state),
+                Some(WorkingDerivativeBuffersMut {
+                    c: &mut self.last_c,
+                    d: &mut self.last_d,
+                    dmu_deta: &mut self.last_dmu_deta,
+                    d2mu_deta2: &mut self.last_d2mu_deta2,
+                    d3mu_deta3: &mut self.last_d3mu_deta3,
+                }),
+            );
+        } else {
+            self.likelihood.irls_update(
+                self.y,
+                &self.workspace.eta_buf,
+                self.prior_weights,
+                &mut self.last_mu,
+                &mut self.last_weights,
+                &mut self.last_z,
+                integrated,
+                Some(WorkingDerivativeBuffersMut {
+                    c: &mut self.last_c,
+                    d: &mut self.last_d,
+                    dmu_deta: &mut self.last_dmu_deta,
+                    d2mu_deta2: &mut self.last_d2mu_deta2,
+                    d3mu_deta3: &mut self.last_d3mu_deta3,
+                }),
+            )?;
+        }
         let weights = self.last_weights.clone();
         let mu = self.last_mu.clone();
         let mut firth_hat_diag: Option<Array1<f64>> = None;
@@ -2544,7 +2650,7 @@ fn default_beta_guess_external(
     let mut beta = Array1::<f64>::zeros(p);
     let intercept_col = 0usize;
     match link_function {
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
             let mut weighted_sum = 0.0;
             let mut total_weight = 0.0;
             for (&yi, &wi) in y.iter().zip(prior_weights.iter()) {
@@ -2564,6 +2670,11 @@ fn default_beta_guess_external(
                         })
                     }
                     LinkFunction::CLogLog => (-(1.0 - prevalence).ln()).ln(),
+                    LinkFunction::Sas => {
+                        standard_normal_quantile(prevalence).unwrap_or_else(|_| {
+                            (prevalence / (1.0 - prevalence)).ln()
+                        })
+                    }
                     LinkFunction::Identity => unreachable!(),
                 };
             }
@@ -3442,6 +3553,8 @@ pub fn fit_model_for_fixed_rho<'a>(
                 link_function,
                 &final_eta,
                 prior_weights_owned.view(),
+                config.mixture_link_state.as_ref(),
+                config.sas_link_state.as_ref(),
             );
         let pirls_result = PirlsResult {
             beta_transformed,
@@ -3498,7 +3611,11 @@ pub fn fit_model_for_fixed_rho<'a>(
         reparam_result.e_transformed.clone(),
         workspace,
         link_function,
-        config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
+        config.mixture_link_state.clone(),
+        config.sas_link_state,
+        config.firth_bias_reduction
+            && config.mixture_link_state.is_none()
+            && matches!(link_function, LinkFunction::Logit),
         if use_explicit {
             None
         } else {
@@ -3855,6 +3972,8 @@ fn fit_model_for_fixed_rho_sparse_implicit(
         reparam_result.e_transformed.clone(),
         workspace,
         link_function,
+        config.mixture_link_state.clone(),
+        config.sas_link_state,
         false,
         None,
         quad_ctx,
@@ -3989,14 +4108,18 @@ fn fit_model_for_fixed_rho_sparse_implicit(
 #[derive(Clone)]
 pub struct RunPirlsOptions {
     pub family: LikelihoodFamily,
+    pub mixture_link_spec: Option<MixtureLinkSpec>,
+    pub sas_link_spec: Option<SasLinkSpec>,
     pub max_iter: usize,
     pub tol: f64,
     pub firth_bias_reduction: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PirlsConfig {
     pub link_function: LinkFunction,
+    pub mixture_link_state: Option<MixtureLinkState>,
+    pub sas_link_state: Option<SasLinkState>,
     pub max_iterations: usize,
     pub convergence_tolerance: f64,
     pub firth_bias_reduction: bool,
@@ -4011,6 +4134,8 @@ fn resolve_pirls_family(
         LikelihoodFamily::BinomialLogit => Ok((LinkFunction::Logit, firth_bias_reduction)),
         LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
         LikelihoodFamily::BinomialCLogLog => Ok((LinkFunction::CLogLog, false)),
+        LikelihoodFamily::BinomialSas => Ok((LinkFunction::Sas, false)),
+        LikelihoodFamily::BinomialMixture => Ok((LinkFunction::Logit, false)),
         LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "run_pirls does not support RoystonParmar; use survival-specific working models"
                 .to_string(),
@@ -4037,6 +4162,21 @@ pub fn run_pirls<'a>(
     covariate_se: Option<&Array1<f64>>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let (link, firth_active) = resolve_pirls_family(opts.family, opts.firth_bias_reduction)?;
+    let mixture_link_state = match &opts.mixture_link_spec {
+        Some(spec) => Some(
+            state_from_spec(spec).map_err(|e| {
+                EstimationError::InvalidInput(format!("invalid mixture link spec: {e}"))
+            })?,
+        ),
+        None => None,
+    };
+    let sas_link_state = match opts.sas_link_spec {
+        Some(spec) => Some(
+            state_from_sas_spec(spec)
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link spec: {e}")))?,
+        ),
+        None => None,
+    };
     if k != rs_original.len() {
         return Err(EstimationError::InvalidInput(format!(
             "run_pirls: k={} does not match number of penalty roots {}",
@@ -4046,6 +4186,8 @@ pub fn run_pirls<'a>(
     }
     let cfg = PirlsConfig {
         link_function: link,
+        mixture_link_state,
+        sas_link_state,
         max_iterations: opts.max_iter,
         convergence_tolerance: opts.tol,
         firth_bias_reduction: firth_active,
@@ -4331,7 +4473,18 @@ fn logit_clamp_zero_enabled() -> bool {
 }
 
 #[inline]
-fn standard_inverse_link_jet(link: LinkFunction, eta: f64) -> InverseLinkJet {
+fn standard_inverse_link_jet(
+    link: LinkFunction,
+    eta: f64,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
+) -> MixtureInverseLinkJet {
+    if let Some(state) = mixture_link_state {
+        return mixture_inverse_link_jet(state, eta);
+    }
+    if let Some(state) = sas_link_state {
+        return sas_inverse_link_jet(eta, state.epsilon, state.log_delta);
+    }
     match link {
         LinkFunction::Logit => {
             let e = eta.clamp(-700.0, 700.0);
@@ -4339,12 +4492,12 @@ fn standard_inverse_link_jet(link: LinkFunction, eta: f64) -> InverseLinkJet {
             let d1 = mu * (1.0 - mu);
             let d2 = d1 * (1.0 - 2.0 * mu);
             let d3 = d1 * (1.0 - 6.0 * d1);
-            InverseLinkJet { mu, d1, d2, d3 }
+            MixtureInverseLinkJet { mu, d1, d2, d3 }
         }
         LinkFunction::Probit => {
             let e = eta.clamp(-30.0, 30.0);
             let d1 = normal_pdf(e);
-            InverseLinkJet {
+            MixtureInverseLinkJet {
                 mu: normal_cdf_approx(e),
                 d1,
                 d2: -e * d1,
@@ -4356,14 +4509,18 @@ fn standard_inverse_link_jet(link: LinkFunction, eta: f64) -> InverseLinkJet {
             let t = e.exp();
             let s = (-t).exp();
             let d1 = t * s;
-            InverseLinkJet {
+            MixtureInverseLinkJet {
                 mu: 1.0 - s,
                 d1,
                 d2: d1 * (1.0 - t),
                 d3: d1 * (1.0 - 3.0 * t + t * t),
             }
         }
-        LinkFunction::Identity => InverseLinkJet {
+        LinkFunction::Sas => {
+            // Fall back to probit-like default SAS state when no explicit state is provided.
+            sas_inverse_link_jet(eta, 0.0, 0.0)
+        }
+        LinkFunction::Identity => MixtureInverseLinkJet {
             mu: eta,
             d1: 1.0,
             d2: 0.0,
@@ -4378,7 +4535,7 @@ fn bernoulli_geometry_from_jet(
     eta_used: f64,
     y: f64,
     prior_weight: f64,
-    jet: InverseLinkJet,
+    jet: MixtureInverseLinkJet,
     apply_weight_floor: bool,
     zero_on_nonsmooth: bool,
 ) -> WorkingBernoulliGeometry {
@@ -4455,21 +4612,26 @@ pub fn update_glm_vectors(
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) {
     let n = eta.len();
     match link {
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
             let zero_on_nonsmooth =
                 matches!(link, LinkFunction::Logit) && logit_clamp_zero_enabled();
             let mut derivatives = derivatives;
             for i in 0..n {
                 let eta_used = match link {
                     LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
-                    LinkFunction::Probit | LinkFunction::CLogLog => eta[i].clamp(-30.0, 30.0),
+                    LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
+                        eta[i].clamp(-30.0, 30.0)
+                    }
                     LinkFunction::Identity => eta[i],
                 };
-                let jet = standard_inverse_link_jet(link, eta[i]);
+                let jet =
+                    standard_inverse_link_jet(link, eta[i], mixture_link_state, sas_link_state);
                 let geom = bernoulli_geometry_from_jet(
                     eta[i],
                     eta_used,
@@ -4606,8 +4768,20 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
         LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
         LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
         LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+        LinkFunction::Sas => LikelihoodFamily::BinomialSas,
         LinkFunction::Identity => {
-            update_glm_vectors(y, eta, link, prior_weights, mu, weights, z, derivatives);
+            update_glm_vectors(
+                y,
+                eta,
+                link,
+                prior_weights,
+                mu,
+                weights,
+                z,
+                None,
+                None,
+                derivatives,
+            );
             return;
         }
     };
@@ -4679,7 +4853,7 @@ pub fn update_glm_vectors_integrated_by_family(
         let moments = crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
             quad_ctx, family, eta[i], se[i],
         )?;
-        let local_jet = InverseLinkJet {
+        let local_jet = MixtureInverseLinkJet {
             mu: moments.mean,
             d1: moments.d1,
             d2: moments.d2,
@@ -4730,6 +4904,8 @@ fn compute_working_weight_derivatives_from_eta(
     link: LinkFunction,
     eta: &Array1<f64>,
     prior_weights: ArrayView1<f64>,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
 ) -> (
     Array1<f64>,
     Array1<f64>,
@@ -4747,16 +4923,19 @@ fn compute_working_weight_derivatives_from_eta(
         LinkFunction::Identity => {
             dmu_deta.fill(1.0);
         }
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
             let zero_on_nonsmooth =
                 matches!(link, LinkFunction::Logit) && logit_clamp_zero_enabled();
             for i in 0..n {
                 let eta_used = match link {
                     LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
-                    LinkFunction::Probit | LinkFunction::CLogLog => eta[i].clamp(-30.0, 30.0),
+                    LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
+                        eta[i].clamp(-30.0, 30.0)
+                    }
                     LinkFunction::Identity => eta[i],
                 };
-                let jet = standard_inverse_link_jet(link, eta[i]);
+                let jet =
+                    standard_inverse_link_jet(link, eta[i], mixture_link_state, sas_link_state);
                 let geom = bernoulli_geometry_from_jet(
                     eta[i],
                     eta_used,
@@ -4804,7 +4983,8 @@ fn directional_working_curvature_diagonal_builtin(
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> DirectionalWorkingCurvature {
-    let (c, _, _, _, _) = compute_working_weight_derivatives_from_eta(link, eta, prior_weights);
+    let (c, _, _, _, _) =
+        compute_working_weight_derivatives_from_eta(link, eta, prior_weights, None, None);
     let mut w_direction = &c * eta_direction;
     for i in 0..w_direction.len() {
         if solve_weights[i] <= 0.0 || !w_direction[i].is_finite() {
@@ -4880,6 +5060,7 @@ pub fn directional_working_curvature_callback(
         LinkFunction::Logit => directional_working_curvature_logit,
         LinkFunction::Probit => directional_working_curvature_probit,
         LinkFunction::CLogLog => directional_working_curvature_cloglog,
+        LinkFunction::Sas => directional_working_curvature_probit,
         LinkFunction::Identity => directional_working_curvature_identity,
     }
 }
@@ -4911,6 +5092,7 @@ fn likelihood_from_link(link: LinkFunction) -> LikelihoodFamily {
         LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
         LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
         LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+        LinkFunction::Sas => LikelihoodFamily::BinomialSas,
         LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
     }
 }
@@ -4924,7 +5106,7 @@ pub fn calculate_deviance(
 ) -> f64 {
     const EPS: f64 = 1e-8; // Increased from 1e-9 for better numerical stability
     match link {
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
             let total_residual = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
                 0.0,
                 |acc, &yi, &mui, &wi| {
@@ -5313,7 +5495,7 @@ fn calculate_scale(
     link_function: LinkFunction,
 ) -> f64 {
     match link_function {
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
             // For binomial models (logistic regression), scale is fixed at 1.0
             // This follows mgcv's convention in gam.fit3.R
             1.0
@@ -5733,6 +5915,8 @@ mod tests {
         let rs = vec![array![[1.0]]];
         let config = PirlsConfig {
             link_function: LinkFunction::Logit,
+            mixture_link_state: None,
+            sas_link_state: None,
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,

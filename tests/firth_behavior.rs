@@ -40,6 +40,8 @@ fn fit_beta_norm(
     firth: bool,
 ) -> f64 {
     let cfg = PirlsConfig {
+        mixture_link_state: None,
+        sas_link_state: None,
         link_function: LinkFunction::Logit,
         max_iterations: 500,
         convergence_tolerance: 1e-10,
@@ -78,6 +80,8 @@ fn proxy_cost_with_pirls(
     firth: bool,
 ) -> f64 {
     let cfg = PirlsConfig {
+        mixture_link_state: None,
+        sas_link_state: None,
         link_function: LinkFunction::Logit,
         max_iterations: 500,
         convergence_tolerance: 1e-10,
@@ -112,6 +116,10 @@ fn firth_fd_step_size_sensitivity() {
     let (x, y, w, s_list) = make_problem(31);
     let offset = Array1::<f64>::zeros(y.len());
     let opts = ExternalOptimOptions {
+        mixture_link: None,
+        optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,

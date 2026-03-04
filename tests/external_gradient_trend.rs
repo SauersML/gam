@@ -45,6 +45,10 @@ fn analytic_gradient_matches_cost_trend() {
     let (x, y, w, s_list) = make_binary_external_problem(31);
     let offset = Array1::<f64>::zeros(y.len());
     let opts = ExternalOptimOptions {
+        mixture_link: None,
+        optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,
@@ -123,6 +127,10 @@ fn hypothesis_analytic_gradient_matches_cost_trend() {
     let (x, y, w, s_list) = make_binary_external_problem(31);
     let offset = Array1::<f64>::zeros(y.len());
     let opts = ExternalOptimOptions {
+        mixture_link: None,
+        optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,

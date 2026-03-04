@@ -91,6 +91,11 @@ pub fn inverse_link_array(family: LikelihoodFamily, eta: ArrayView1<'_, f64>) ->
             let z = v.clamp(-30.0, 30.0);
             1.0 - (-(z.exp())).exp()
         }),
+        LikelihoodFamily::BinomialSas => eta.mapv(normal_cdf_approx),
+        LikelihoodFamily::BinomialMixture => eta.mapv(|v| {
+            let z = v.clamp(-30.0, 30.0);
+            1.0 / (1.0 + (-z).exp())
+        }),
         LikelihoodFamily::RoystonParmar => eta.to_owned(),
     }
 }

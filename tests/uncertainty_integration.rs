@@ -32,6 +32,10 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
         &[s],
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -97,6 +101,10 @@ fn prediction_uncertainty_is_finite_and_well_shaped() {
         &[s],
         LikelihoodFamily::BinomialLogit,
         &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 50,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -167,6 +175,10 @@ fn gaussian_prediction_intervals_include_observation_noise() {
         &[s],
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -227,6 +239,10 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
         &[s],
         LikelihoodFamily::BinomialLogit,
         &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![1],

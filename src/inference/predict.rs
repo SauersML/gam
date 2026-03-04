@@ -475,6 +475,13 @@ where
                 let surv = (-exp_eta).exp();
                 exp_eta * surv
             }
+            crate::types::LikelihoodFamily::BinomialSas => {
+                crate::probability::normal_pdf(eta[i])
+            }
+            crate::types::LikelihoodFamily::BinomialMixture => {
+                let mu = mean[i];
+                mu * (1.0 - mu)
+            }
             crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
         };
         mean_standard_error[i] = (dmu_deta.abs() * eta_standard_error[i]).max(0.0);
@@ -496,6 +503,7 @@ where
         crate::types::LikelihoodFamily::BinomialLogit
             | crate::types::LikelihoodFamily::BinomialProbit
             | crate::types::LikelihoodFamily::BinomialCLogLog
+            | crate::types::LikelihoodFamily::BinomialSas
     ) {
         mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
         mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));

@@ -2251,6 +2251,10 @@ fn fit_term_collection_for_spec_with_heuristic_lambdas(
         heuristic_lambdas,
         family,
         &FitOptions {
+            mixture_link: options.mixture_link.clone(),
+            optimize_mixture: options.optimize_mixture,
+            sas_link: options.sas_link,
+            optimize_sas: options.optimize_sas,
             max_iter: options.max_iter,
             tol: options.tol,
             nullspace_dims: design.nullspace_dims.clone(),
@@ -2387,7 +2391,9 @@ fn evaluate_standard_family_observations(
             }
             LikelihoodFamily::BinomialLogit
             | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog => {
+            | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialMixture => {
                 let (mu_i_raw, dmu_deta_raw) = match family {
                     LikelihoodFamily::BinomialLogit => {
                         let mu_i = stable_sigmoid(eta_i);
@@ -2403,6 +2409,14 @@ fn evaluate_standard_family_observations(
                         let mu_i = 1.0 - (-exp_eta).exp();
                         let dmu = (eta_c - exp_eta).exp();
                         (mu_i, dmu)
+                    }
+                    LikelihoodFamily::BinomialSas => {
+                        let mu_i = normal_cdf_approx(eta_i);
+                        (mu_i, normal_pdf(eta_i))
+                    }
+                    LikelihoodFamily::BinomialMixture => {
+                        let mu_i = stable_sigmoid(eta_i);
+                        (mu_i, mu_i * (1.0 - mu_i))
                     }
                     _ => unreachable!(),
                 };
@@ -2424,6 +2438,16 @@ fn evaluate_standard_family_observations(
                         let t = eta_c.exp();
                         let d2 = dmu_deta * (1.0 - t);
                         let d3 = dmu_deta * (1.0 - 3.0 * t + t * t);
+                        (d2, d3)
+                    }
+                    LikelihoodFamily::BinomialSas => {
+                        let d2 = -eta_i * dmu_deta;
+                        let d3 = (eta_i * eta_i - 1.0) * dmu_deta;
+                        (d2, d3)
+                    }
+                    LikelihoodFamily::BinomialMixture => {
+                        let d2 = dmu_deta * (1.0 - 2.0 * mu_i);
+                        let d3 = dmu_deta * (1.0 - 6.0 * mu_i + 6.0 * mu_i * mu_i);
                         (d2, d3)
                     }
                     _ => unreachable!(),
@@ -3018,6 +3042,12 @@ fn fit_bounded_term_collection_for_spec(
             beta_covariance_corrected: None,
             beta_standard_errors_corrected: None,
             reml_score: fit.penalized_objective,
+            mixture_link_components: None,
+            mixture_link_rho: None,
+            mixture_link_weights: None,
+            sas_epsilon: None,
+            sas_log_delta: None,
+            sas_delta: None,
         },
         design,
     })
@@ -3271,6 +3301,10 @@ fn external_opts_for_design(
 ) -> ExternalOptimOptions {
     ExternalOptimOptions {
         family,
+        mixture_link: options.mixture_link.clone(),
+        optimize_mixture: options.optimize_mixture,
+        sas_link: options.sas_link,
+        optimize_sas: options.optimize_sas,
         max_iter: options.max_iter,
         tol: options.tol,
         nullspace_dims: design.nullspace_dims.clone(),
@@ -5346,6 +5380,10 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![],
@@ -5581,6 +5619,10 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![],
@@ -5679,6 +5721,10 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![],
@@ -5838,6 +5884,10 @@ mod tests {
             &spec,
             LikelihoodFamily::GaussianIdentity,
             &FitOptions {
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: None,
+                optimize_sas: false,
                 max_iter: 40,
                 tol: 1e-6,
                 nullspace_dims: vec![],

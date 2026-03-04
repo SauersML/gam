@@ -42,6 +42,10 @@ fn make_binary_external_problem(
 
 fn default_logit_opts() -> ExternalOptimOptions {
     ExternalOptimOptions {
+        mixture_link: None,
+        optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,

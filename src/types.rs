@@ -10,7 +10,51 @@ pub enum LinkFunction {
     Logit,
     Probit,
     CLogLog,
+    Sas,
     Identity,
+}
+
+/// Supported inverse-link components for convex mixture links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkComponent {
+    Probit,
+    Logit,
+    CLogLog,
+    LogLog,
+    Cauchit,
+}
+
+/// User-facing configuration for a mixture inverse link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MixtureLinkSpec {
+    pub components: Vec<LinkComponent>,
+    /// Free logits for components [0..K-2]. The final component logit is fixed at 0.
+    pub initial_rho: Array1<f64>,
+}
+
+/// Runtime mixture state with precomputed softmax weights.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MixtureLinkState {
+    pub components: Vec<LinkComponent>,
+    /// Free logits for components [0..K-2]. The final component logit is fixed at 0.
+    pub rho: Array1<f64>,
+    /// Softmax-normalized component weights (length K).
+    pub pi: Array1<f64>,
+}
+
+/// User-facing configuration for the continuous sinh-arcsinh inverse link.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SasLinkSpec {
+    pub initial_epsilon: f64,
+    pub initial_log_delta: f64,
+}
+
+/// Runtime SAS link state with cached positive tail parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SasLinkState {
+    pub epsilon: f64,
+    pub log_delta: f64,
+    pub delta: f64,
 }
 
 /// Engine-level likelihood selector used by generic solver entrypoints.
@@ -20,6 +64,8 @@ pub enum LikelihoodFamily {
     BinomialLogit,
     BinomialProbit,
     BinomialCLogLog,
+    BinomialSas,
+    BinomialMixture,
     RoystonParmar,
 }
 
