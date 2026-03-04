@@ -1137,11 +1137,13 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         Some(gam::types::InverseLink::Mixture(state))
     } else {
         saved_sas.map(|(epsilon, log_delta)| {
-            gam::types::InverseLink::Sas(gam::types::SasLinkState {
-                epsilon,
-                log_delta,
-                delta: log_delta.exp(),
-            })
+            gam::types::InverseLink::Sas(
+                gam::mixture_link::state_from_sas_spec(gam::types::SasLinkSpec {
+                    initial_epsilon: epsilon,
+                    initial_log_delta: log_delta,
+                })
+                .expect("saved SAS parameters should reconstruct valid SAS link state"),
+            )
         })
     };
     let saved_mixture_param_cov = model
