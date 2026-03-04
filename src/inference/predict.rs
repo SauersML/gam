@@ -1,7 +1,7 @@
 use crate::estimate::{EstimationError, FitResult};
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    InverseLinkJet, inverse_link_jet_for_family, mixture_inverse_link_jet,
+    InverseLinkJet, mixture_inverse_link_jet,
     mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet,
     sas_inverse_link_jet_with_param_partials, state_from_spec,
 };
@@ -598,6 +598,7 @@ where
         .map_err(EstimationError::InvalidInput)?;
     let eta_lower = &eta - &eta_standard_error.mapv(|s| z * s);
     let eta_upper = &eta + &eta_standard_error.mapv(|s| z * s);
+    let quad_ctx = crate::quadrature::QuadratureContext::new();
 
     // Derivative of inverse link g^{-1}(η) used for delta-method:
     //   Var(μ_i) ≈ [d g^{-1}(η_i)/dη]^2 Var(η_i).
@@ -632,20 +633,54 @@ where
         })
         .unwrap_or_default();
     for i in 0..eta.len() {
-        let sas_state_i = sas_params.map(|(epsilon, log_delta)| crate::types::SasLinkState {
-            epsilon,
-            log_delta,
-            delta: log_delta.exp(),
-        });
-        let dmu_deta = inverse_link_jet_for_family(
-            family,
-            eta[i],
-            mixture_state.as_ref(),
-            sas_state_i.as_ref(),
-        )
-        .map_err(EstimationError::InvalidInput)?
-        .d1;
-        let mut mean_var = dmu_deta * dmu_deta * eta_var[i];
+        let se_i = eta_var[i].max(0.0).sqrt();
+        let mut mean_var = match family {
+            crate::types::LikelihoodFamily::GaussianIdentity => eta_var[i].max(0.0),
+            crate::types::LikelihoodFamily::BinomialLogit => {
+                let (_, v) = crate::quadrature::logit_posterior_mean_variance(&quad_ctx, eta[i], se_i);
+                v.max(0.0)
+            }
+            crate::types::LikelihoodFamily::BinomialProbit => {
+                let (_, v) = crate::quadrature::probit_posterior_mean_variance(&quad_ctx, eta[i], se_i);
+                v.max(0.0)
+            }
+            crate::types::LikelihoodFamily::BinomialCLogLog => {
+                let (_, v) = crate::quadrature::cloglog_posterior_mean_variance(&quad_ctx, eta[i], se_i);
+                v.max(0.0)
+            }
+            crate::types::LikelihoodFamily::BinomialSas => {
+                let (epsilon, log_delta) = sas_params.ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "BinomialSas uncertainty requires fitted sas_epsilon/sas_log_delta".to_string(),
+                    )
+                })?;
+                let m1 = crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, eta[i], se_i, |x| {
+                    sas_inverse_link_jet(x, epsilon, log_delta).mu
+                });
+                let m2 = crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, eta[i], se_i, |x| {
+                    let p = sas_inverse_link_jet(x, epsilon, log_delta).mu;
+                    p * p
+                });
+                (m2 - m1 * m1).max(0.0)
+            }
+            crate::types::LikelihoodFamily::BinomialMixture => {
+                let state = mixture_state.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "BinomialMixture uncertainty requires fitted mixture link state"
+                            .to_string(),
+                    )
+                })?;
+                let m1 = crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, eta[i], se_i, |x| {
+                    mixture_inverse_link_jet(state, x).mu
+                });
+                let m2 = crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, eta[i], se_i, |x| {
+                    let p = mixture_inverse_link_jet(state, x).mu;
+                    p * p
+                });
+                (m2 - m1 * m1).max(0.0)
+            }
+            crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
+        };
         if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
             && let Some(cov_theta) = fit.sas_param_covariance.as_ref()
         {
