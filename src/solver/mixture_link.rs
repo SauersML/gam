@@ -180,12 +180,7 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
             let d1 = mu * (1.0 - mu);
             let d2 = d1 * (1.0 - 2.0 * mu);
             let d3 = d1 * (1.0 - 6.0 * d1);
-            InverseLinkJet {
-                mu,
-                d1,
-                d2,
-                d3,
-            }
+            InverseLinkJet { mu, d1, d2, d3 }
         }
         LinkComponent::Probit => {
             let e = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
@@ -216,12 +211,7 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
             let d1 = mu * r;
             let d2 = d1 * (r - 1.0);
             let d3 = d1 * (r * r - 3.0 * r + 1.0);
-            InverseLinkJet {
-                mu,
-                d1,
-                d2,
-                d3,
-            }
+            InverseLinkJet { mu, d1, d2, d3 }
         }
         LinkComponent::Cauchit => {
             let e = eta;
@@ -242,23 +232,20 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
 /// Central family-aware inverse-link jet dispatch.
 ///
 /// For `BinomialSas` and `BinomialMixture`, required state must be provided.
-pub fn inverse_link_jet_for_inverse_link(link: &InverseLink, eta: f64) -> Result<InverseLinkJet, String> {
+pub fn inverse_link_jet_for_inverse_link(
+    link: &InverseLink,
+    eta: f64,
+) -> Result<InverseLinkJet, String> {
     match link {
         InverseLink::Standard(link_fn) => {
             inverse_link_jet_for_link_function(*link_fn, eta, None, None)
         }
-        InverseLink::Sas(state) => inverse_link_jet_for_link_function(
-            LinkFunction::Sas,
-            eta,
-            None,
-            Some(state),
-        ),
-        InverseLink::Mixture(state) => inverse_link_jet_for_link_function(
-            LinkFunction::Logit,
-            eta,
-            Some(state),
-            None,
-        ),
+        InverseLink::Sas(state) => {
+            inverse_link_jet_for_link_function(LinkFunction::Sas, eta, None, Some(state))
+        }
+        InverseLink::Mixture(state) => {
+            inverse_link_jet_for_link_function(LinkFunction::Logit, eta, Some(state), None)
+        }
     }
 }
 
@@ -321,15 +308,13 @@ pub fn inverse_link_jet_for_family(
             mixture_link_state,
             sas_link_state,
         ),
-        LikelihoodFamily::BinomialSas => {
-            inverse_link_jet_for_link_function(
-                LinkFunction::Sas,
-                eta,
-                mixture_link_state,
-                sas_link_state,
-            )
-            .map_err(|_| "BinomialSas inverse-link requires SAS link state".to_string())
-        }
+        LikelihoodFamily::BinomialSas => inverse_link_jet_for_link_function(
+            LinkFunction::Sas,
+            eta,
+            mixture_link_state,
+            sas_link_state,
+        )
+        .map_err(|_| "BinomialSas inverse-link requires SAS link state".to_string()),
         LikelihoodFamily::BinomialMixture => {
             let state = mixture_link_state.ok_or_else(|| {
                 "BinomialMixture inverse-link requires mixture link state".to_string()
@@ -362,12 +347,7 @@ pub fn mixture_inverse_link_jet(state: &MixtureLinkState, eta: f64) -> InverseLi
         d2 += w * jet.d2;
         d3 += w * jet.d3;
     }
-    InverseLinkJet {
-        mu,
-        d1,
-        d2,
-        d3,
-    }
+    InverseLinkJet { mu, d1, d2, d3 }
 }
 
 /// Computes mixture jet and exact partial derivatives wrt free softmax logits.
@@ -476,12 +456,7 @@ pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLi
     let d1 = phi * z1;
     let d2 = phi * (z2 - z * z1 * z1);
     let d3 = phi * (z3 - 3.0 * z * z1 * z2 + (z * z - 1.0) * z1 * z1 * z1);
-    InverseLinkJet {
-        mu,
-        d1,
-        d2,
-        d3,
-    }
+    InverseLinkJet { mu, d1, d2, d3 }
 }
 
 pub fn sas_inverse_link_jet_with_param_partials(
@@ -572,10 +547,7 @@ pub fn sas_inverse_link_jet_with_param_partials(
     let r3t_eps = 0.0;
     let u_eps = g1 * rt_eps;
     let u1_eps = g2 * rt_eps * r1 + g1 * r1t_eps;
-    let u2_eps = g3 * rt_eps * r1 * r1
-        + 2.0 * g2 * r1 * r1t_eps
-        + g2 * rt_eps * r2
-        + g1 * r2t_eps;
+    let u2_eps = g3 * rt_eps * r1 * r1 + 2.0 * g2 * r1 * r1t_eps + g2 * rt_eps * r2 + g1 * r2t_eps;
     let u3_eps = g4 * rt_eps * r1 * r1 * r1
         + 3.0 * g3 * r1 * r1 * r1t_eps
         + 3.0 * g3 * rt_eps * r1 * r2
@@ -591,10 +563,7 @@ pub fn sas_inverse_link_jet_with_param_partials(
     let r3t_ld = ddelta_draw * a3;
     let u_ld = g1 * rt_ld;
     let u1_ld = g2 * rt_ld * r1 + g1 * r1t_ld;
-    let u2_ld = g3 * rt_ld * r1 * r1
-        + 2.0 * g2 * r1 * r1t_ld
-        + g2 * rt_ld * r2
-        + g1 * r2t_ld;
+    let u2_ld = g3 * rt_ld * r1 * r1 + 2.0 * g2 * r1 * r1t_ld + g2 * rt_ld * r2 + g1 * r2t_ld;
     let u3_ld = g4 * rt_ld * r1 * r1 * r1
         + 3.0 * g3 * r1 * r1 * r1t_ld
         + 3.0 * g3 * rt_ld * r1 * r2
@@ -777,9 +746,13 @@ mod tests {
 
     #[test]
     fn family_dispatch_requires_state_for_sas_and_mixture() {
-        let sas_err =
-            inverse_link_jet_for_family(crate::types::LikelihoodFamily::BinomialSas, 0.1, None, None)
-                .expect_err("SAS without state should error");
+        let sas_err = inverse_link_jet_for_family(
+            crate::types::LikelihoodFamily::BinomialSas,
+            0.1,
+            None,
+            None,
+        )
+        .expect_err("SAS without state should error");
         assert!(sas_err.contains("requires SAS link state"));
 
         let mix_err = inverse_link_jet_for_family(

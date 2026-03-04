@@ -1,7 +1,7 @@
 use gam::construction::compute_penalty_square_roots;
 use gam::estimate::{ExternalOptimOptions, evaluate_external_cost_and_ridge};
 use gam::pirls::{PirlsConfig, fit_model_for_fixed_rho};
-use gam::types::{LikelihoodFamily, LinkFunction, InverseLink, LogSmoothingParamsView};
+use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, LogSmoothingParamsView};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

@@ -2,7 +2,7 @@ use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_pirls;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetric_with_fallback, fast_ata};
 use gam::pirls::{self, PirlsConfig};
-use gam::types::{LinkFunction, InverseLink, LogSmoothingParamsView};
+use gam::types::{InverseLink, LinkFunction, LogSmoothingParamsView};
 use ndarray::{Array1, Array2, Axis};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
