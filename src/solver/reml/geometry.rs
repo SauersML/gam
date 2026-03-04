@@ -561,7 +561,7 @@ impl<'a> RemlState<'a> {
                     self.weights,
                     &pirls_result.solve_weights,
                     &eta_tau,
-                );
+                )?;
                 let leverages = leverages_from_factor(&sparse.factor, self.x())?;
                 match w_tau {
                     DirectionalWorkingCurvature::Diagonal(diag) => {

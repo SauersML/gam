@@ -791,7 +791,8 @@ pub fn logit_posterior_mean_with_deriv(
         return (mu, dmu);
     }
 
-    let jet = integrated_inverse_link_jet(ctx, LinkFunction::Logit, eta, se_eta);
+    let jet = integrated_inverse_link_jet(ctx, LinkFunction::Logit, eta, se_eta)
+        .expect("logit integrated inverse-link jet should evaluate");
     (jet.mean, jet.d1)
 }
 
@@ -1886,7 +1887,7 @@ pub fn integrated_inverse_link_mean_and_derivative(
     link: LinkFunction,
     mu: f64,
     sigma: f64,
-) -> IntegratedMeanDerivative {
+) -> Result<IntegratedMeanDerivative, EstimationError> {
     // Canonical dispatcher for Gaussian-uncertain inverse-link expectations.
     //
     // Every integrated PIRLS and posterior-mean prediction path reduces to the
@@ -1916,41 +1917,39 @@ pub fn integrated_inverse_link_mean_and_derivative(
     // mathematics local to one module instead of leaking into PIRLS or
     // prediction code.
     match link {
-        LinkFunction::Probit => probit_posterior_mean_with_deriv_exact(mu, sigma),
+        LinkFunction::Probit => Ok(probit_posterior_mean_with_deriv_exact(mu, sigma)),
         // The in-repo logit special-function backend is useful as a research
         // implementation and local oracle, but it is not yet uniformly accurate
         // enough across the production domain to replace GHQ in the hot path.
         // Use the exact plug-in limit when sigma is effectively zero and route
         // everything else through the validated GHQ backend.
         LinkFunction::Logit if sigma <= LOGIT_SIGMA_DEGENERATE => {
-            logit_posterior_mean_with_deriv_exact(mu, sigma).unwrap_or_else(|_| {
+            Ok(logit_posterior_mean_with_deriv_exact(mu, sigma).unwrap_or_else(|_| {
                 let mean = sigmoid(mu);
                 IntegratedMeanDerivative {
                     mean,
                     dmean_dmu: mean * (1.0 - mean),
                     mode: IntegratedExpectationMode::ExactClosedForm,
                 }
-            })
+            }))
         }
         LinkFunction::Logit => {
             let (mean, dmean_dmu) = logit_posterior_mean_with_deriv(quad_ctx, mu, sigma);
-            IntegratedMeanDerivative {
+            Ok(IntegratedMeanDerivative {
                 mean,
                 dmean_dmu,
                 mode: IntegratedExpectationMode::QuadratureFallback,
-            }
+            })
         }
-        LinkFunction::CLogLog => cloglog_posterior_mean_with_deriv_controlled(quad_ctx, mu, sigma),
-        LinkFunction::Sas => {
-            panic!(
-                "state-less integrated SAS moments are unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)"
-            )
-        }
-        LinkFunction::Identity => IntegratedMeanDerivative {
+        LinkFunction::CLogLog => Ok(cloglog_posterior_mean_with_deriv_controlled(quad_ctx, mu, sigma)),
+        LinkFunction::Sas => Err(EstimationError::InvalidInput(
+            "state-less integrated SAS moments are unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
+        )),
+        LinkFunction::Identity => Ok(IntegratedMeanDerivative {
             mean: mu,
             dmean_dmu: 1.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
-        },
+        }),
     }
 }
 
@@ -1960,23 +1959,21 @@ pub fn integrated_inverse_link_jet(
     link: LinkFunction,
     mu: f64,
     sigma: f64,
-) -> IntegratedInverseLinkJet {
+) -> Result<IntegratedInverseLinkJet, EstimationError> {
     match link {
-        LinkFunction::Probit => integrated_probit_jet(mu, sigma),
-        LinkFunction::Logit => integrated_logit_jet_ghq(quad_ctx, mu, sigma),
-        LinkFunction::CLogLog => integrated_cloglog_jet_ghq(quad_ctx, mu, sigma),
-        LinkFunction::Sas => {
-            panic!(
-                "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)"
-            )
-        }
-        LinkFunction::Identity => IntegratedInverseLinkJet {
+        LinkFunction::Probit => Ok(integrated_probit_jet(mu, sigma)),
+        LinkFunction::Logit => Ok(integrated_logit_jet_ghq(quad_ctx, mu, sigma)),
+        LinkFunction::CLogLog => Ok(integrated_cloglog_jet_ghq(quad_ctx, mu, sigma)),
+        LinkFunction::Sas => Err(EstimationError::InvalidInput(
+            "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
+        )),
+        LinkFunction::Identity => Ok(IntegratedInverseLinkJet {
             mean: mu,
             d1: 1.0,
             d2: 0.0,
             d3: 0.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
-        },
+        }),
     }
 }
 
@@ -1997,7 +1994,7 @@ pub fn integrated_family_moments_jet(
     let se = se_eta.max(0.0);
     match family {
         LikelihoodFamily::BinomialLogit => {
-            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Logit, e, se);
+            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Logit, e, se)?;
             let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
             Ok(IntegratedMomentsJet {
                 mean,
@@ -2009,7 +2006,7 @@ pub fn integrated_family_moments_jet(
             })
         }
         LikelihoodFamily::BinomialProbit => {
-            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Probit, e, se);
+            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Probit, e, se)?;
             let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
             Ok(IntegratedMomentsJet {
                 mean,
@@ -2021,7 +2018,7 @@ pub fn integrated_family_moments_jet(
             })
         }
         LikelihoodFamily::BinomialCLogLog => {
-            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::CLogLog, e, se);
+            let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::CLogLog, e, se)?;
             let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
             Ok(IntegratedMomentsJet {
                 mean,
@@ -2081,7 +2078,12 @@ pub fn logit_posterior_mean_with_deriv_batch(
             LinkFunction::Logit,
             eta[i],
             se_eta[i],
-        );
+        )
+        .unwrap_or_else(|_| IntegratedMeanDerivative {
+            mean: sigmoid(eta[i]),
+            dmean_dmu: sigmoid(eta[i]) * (1.0 - sigmoid(eta[i])),
+            mode: IntegratedExpectationMode::QuadratureFallback,
+        });
         mu[i] = integrated.mean;
         dmu[i] = integrated.dmean_dmu;
     }
@@ -2098,7 +2100,9 @@ pub fn logit_posterior_mean_batch(
     se_eta: &ndarray::Array1<f64>,
 ) -> ndarray::Array1<f64> {
     ndarray::Zip::from(eta).and(se_eta).map_collect(|&e, &se| {
-        integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, e, se).mean
+        integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, e, se)
+            .map(|v| v.mean)
+            .unwrap_or_else(|_| sigmoid(e))
     })
 }
 
@@ -3236,8 +3240,13 @@ mod tests {
         let se = 0.8;
         let clog = cloglog_posterior_mean(&ctx, eta, se);
         let surv = survival_posterior_mean(&ctx, eta, se);
-        let integrated =
-            integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, eta, se);
+        let integrated = integrated_inverse_link_mean_and_derivative(
+            &ctx,
+            LinkFunction::CLogLog,
+            eta,
+            se,
+        )
+        .expect("cloglog integrated inverse-link moments should evaluate");
         assert_eq!(
             integrated.mode,
             IntegratedExpectationMode::ExactSpecialFunction
@@ -3288,7 +3297,8 @@ mod tests {
     #[test]
     fn test_integrated_dispatch_uses_closed_form_probit() {
         let ctx = QuadratureContext::new();
-        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Probit, 0.7, 1.3);
+        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Probit, 0.7, 1.3)
+            .expect("probit integrated inverse-link moments should evaluate");
         assert_eq!(out.mode, IntegratedExpectationMode::ExactClosedForm);
         let direct = probit_posterior_mean_with_deriv_exact(0.7, 1.3);
         assert_relative_eq!(out.mean, direct.mean, epsilon = 1e-12);
@@ -3300,7 +3310,8 @@ mod tests {
         let ctx = QuadratureContext::new();
         let mu = 0.7;
         let sigma = 1.3;
-        let out = integrated_inverse_link_jet(&ctx, LinkFunction::Probit, mu, sigma);
+        let out = integrated_inverse_link_jet(&ctx, LinkFunction::Probit, mu, sigma)
+            .expect("probit integrated inverse-link jet should evaluate");
         let s = (1.0 + sigma * sigma).sqrt();
         let z = mu / s;
         let pdf = crate::probability::normal_pdf(z);
@@ -3320,9 +3331,12 @@ mod tests {
         let mu = 1.1;
         let sigma = 0.8;
         let h = 1e-4;
-        let out = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu, sigma);
-        let plus = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu + h, sigma);
-        let minus = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu - h, sigma);
+        let out = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu, sigma)
+            .expect("logit integrated inverse-link jet should evaluate");
+        let plus = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu + h, sigma)
+            .expect("logit integrated inverse-link jet should evaluate");
+        let minus = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu - h, sigma)
+            .expect("logit integrated inverse-link jet should evaluate");
         let d1_fd = (plus.mean - minus.mean) / (2.0 * h);
         let d2_fd = (plus.d1 - minus.d1) / (2.0 * h);
         let d3_fd = (plus.d2 - minus.d2) / (2.0 * h);
@@ -3337,9 +3351,12 @@ mod tests {
         let mu = 0.4;
         let sigma = 0.6;
         let h = 1e-4;
-        let out = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu, sigma);
-        let plus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu + h, sigma);
-        let minus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu - h, sigma);
+        let out = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu, sigma)
+            .expect("cloglog integrated inverse-link jet should evaluate");
+        let plus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu + h, sigma)
+            .expect("cloglog integrated inverse-link jet should evaluate");
+        let minus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu - h, sigma)
+            .expect("cloglog integrated inverse-link jet should evaluate");
         let d1_fd = (plus.mean - minus.mean) / (2.0 * h);
         let d2_fd = (plus.d1 - minus.d1) / (2.0 * h);
         let d3_fd = (plus.d2 - minus.d2) / (2.0 * h);
@@ -3400,8 +3417,8 @@ mod tests {
     #[test]
     fn test_cloglog_dispatch_uses_gamma_backend_for_large_sigma_central_regime() {
         let ctx = QuadratureContext::new();
-        let out =
-            integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, -0.2, 0.8);
+        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, -0.2, 0.8)
+            .expect("cloglog integrated inverse-link moments should evaluate");
         assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
         assert!(out.mean.is_finite());
         assert!(out.dmean_dmu.is_finite());
@@ -3453,7 +3470,8 @@ mod tests {
     #[test]
     fn test_logit_dispatch_falls_back_outside_guarded_domain() {
         let ctx = QuadratureContext::new();
-        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 35.0, 1.0);
+        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 35.0, 1.0)
+            .expect("logit integrated inverse-link moments should evaluate");
         assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
         assert!(out.mean.is_finite());
         assert!(out.dmean_dmu.is_finite());
@@ -3463,7 +3481,8 @@ mod tests {
     #[test]
     fn test_logit_dispatch_prefers_ghq_in_non_degenerate_regime() {
         let ctx = QuadratureContext::new();
-        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 1.1, 0.8);
+        let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 1.1, 0.8)
+            .expect("logit integrated inverse-link moments should evaluate");
         assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
         assert!(out.mean.is_finite());
         assert!(out.dmean_dmu.is_finite());
@@ -3483,7 +3502,8 @@ mod tests {
                 LinkFunction::Logit,
                 eta[i],
                 se[i],
-            );
+            )
+            .expect("logit integrated inverse-link moments should evaluate");
             assert_relative_eq!(batch_mean[i], direct.mean, epsilon = 1e-12);
             assert_relative_eq!(batch_mu[i], direct.mean, epsilon = 1e-12);
             assert_relative_eq!(batch_dmu[i], direct.dmean_dmu, epsilon = 1e-12);

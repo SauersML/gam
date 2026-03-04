@@ -1400,6 +1400,11 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
                     mu_loc,
                     var_loc.sqrt(),
                 )
+                .unwrap_or_else(|_| crate::quadrature::IntegratedMeanDerivative {
+                    mean: crate::probability::normal_cdf_approx(mu_loc),
+                    dmean_dmu: crate::probability::normal_pdf(mu_loc),
+                    mode: crate::quadrature::IntegratedExpectationMode::QuadratureFallback,
+                })
                 .mean
             },
         )

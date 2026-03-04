@@ -219,7 +219,7 @@ mod tests {
             state.weights,
             &pr.solve_weights,
             &eta_dot,
-        );
+        )?;
         let mut wx = x.clone();
         let mut wx_tau = x_tau.clone();
         for i in 0..x.nrows() {
