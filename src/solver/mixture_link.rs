@@ -1,7 +1,7 @@
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::{
-    LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState, SasLinkSpec,
-    SasLinkState,
+    InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
+    SasLinkSpec, SasLinkState,
 };
 use ndarray::Array1;
 
@@ -242,6 +242,26 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
 /// Central family-aware inverse-link jet dispatch.
 ///
 /// For `BinomialSas` and `BinomialMixture`, required state must be provided.
+pub fn inverse_link_jet_for_inverse_link(link: &InverseLink, eta: f64) -> Result<InverseLinkJet, String> {
+    match link {
+        InverseLink::Standard(link_fn) => {
+            inverse_link_jet_for_link_function(*link_fn, eta, None, None)
+        }
+        InverseLink::Sas(state) => inverse_link_jet_for_link_function(
+            LinkFunction::Sas,
+            eta,
+            None,
+            Some(state),
+        ),
+        InverseLink::Mixture(state) => inverse_link_jet_for_link_function(
+            LinkFunction::Logit,
+            eta,
+            Some(state),
+            None,
+        ),
+    }
+}
+
 pub fn inverse_link_jet_for_link_function(
     link: LinkFunction,
     eta: f64,

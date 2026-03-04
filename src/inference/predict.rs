@@ -6,7 +6,7 @@ use crate::mixture_link::{
     sas_inverse_link_jet_with_param_partials, state_from_spec,
 };
 use crate::probability::{standard_normal_quantile, try_inverse_link_array};
-use crate::types::{LinkFunction, LinkKind, SasLinkState};
+use crate::types::{InverseLink, LinkFunction, SasLinkState};
 use crate::types::MixtureLinkSpec;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -22,7 +22,7 @@ pub(crate) fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
 fn apply_family_inverse_link(
     eta: &Array1<f64>,
     family: crate::types::LikelihoodFamily,
-    link_kind: Option<&LinkKind>,
+    link_kind: Option<&InverseLink>,
 ) -> Result<Array1<f64>, EstimationError> {
     if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
         return Err(EstimationError::InvalidInput(
@@ -579,10 +579,10 @@ where
     let mixture_state = fit_mixture_link_state(fit)?;
     let sas_params = fit.sas_epsilon.zip(fit.sas_log_delta);
     let link_kind = if let Some(state) = mixture_state.clone() {
-        Some(LinkKind::Mixture(state))
+        Some(InverseLink::Mixture(state))
     } else {
         sas_params.map(|(epsilon, log_delta)| {
-            LinkKind::Sas(SasLinkState {
+            InverseLink::Sas(SasLinkState {
                 epsilon,
                 log_delta,
                 delta: log_delta.exp(),
