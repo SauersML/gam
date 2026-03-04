@@ -35,10 +35,7 @@ use gam::joint::{
     JointLinkGeometry, JointModelConfig, JointModelResult, fit_joint_model_engine, predict_joint,
 };
 use gam::matrix::DesignMatrix;
-use gam::mixture_link::{
-    InverseLinkJet, mixture_inverse_link_jet, mixture_inverse_link_jet_with_rho_partials_into,
-    sas_inverse_link_jet, sas_inverse_link_jet_with_param_partials, state_from_spec,
-};
+use gam::mixture_link::state_from_spec;
 use gam::probability::{normal_cdf_approx, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
@@ -1484,7 +1481,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 None,
                 None,
                 None,
-            );
+            )?;
             let (lo, hi) =
                 response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
             mean_lo = Some(lo);
@@ -1814,7 +1811,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 None,
                 None,
                 None,
-            );
+            )?;
             let (lo, hi) = response_interval_from_mean_sd(
                 mean.view(),
                 response_sd.view(),
@@ -1913,7 +1910,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     saved_sas,
                     saved_mixture_param_cov.as_ref(),
                     saved_sas_param_cov.as_ref(),
-                );
+                )?;
                 let (lo, hi) = response_interval_from_mean_sd(
                     pred.probabilities.view(),
                     response_sd.view(),
@@ -2022,7 +2019,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 saved_sas,
                 saved_mixture_param_cov.as_ref(),
                 saved_sas_param_cov.as_ref(),
-            );
+            )?;
             let (lo, hi) = response_interval_from_mean_sd(
                 mean.view(),
                 response_sd.view(),
@@ -6547,9 +6544,19 @@ fn response_sd_from_eta_for_family(
     sas_params: Option<(f64, f64)>,
     mixture_param_covariance: Option<&Array2<f64>>,
     sas_param_covariance: Option<&Array2<f64>>,
-) -> Array1<f64> {
+) -> Result<Array1<f64>, String> {
+    if matches!(
+        family,
+        LikelihoodFamily::BinomialSas | LikelihoodFamily::BinomialMixture
+    ) {
+        return Err(
+            "SAS/mixture response uncertainty must be computed via library prediction APIs"
+                .to_string(),
+        );
+    }
+    let _ = (mixture_state, sas_params, mixture_param_covariance, sas_param_covariance);
     let quad_ctx = gam::quadrature::QuadratureContext::new();
-    Array1::from_iter((0..eta.len()).map(|i| {
+    Ok(Array1::from_iter((0..eta.len()).map(|i| {
         let var = match family {
             LikelihoodFamily::BinomialLogit => {
                 let (_, v) =
@@ -6566,80 +6573,7 @@ fn response_sd_from_eta_for_family(
                     gam::quadrature::cloglog_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
                 v
             }
-            LikelihoodFamily::BinomialSas => {
-                let se = eta_se[i].max(0.0);
-                let mut var = if let Some((epsilon, log_delta)) = sas_params {
-                    let (m1, m2) = gam::quadrature::normal_expectation_1d_adaptive_pair(
-                        &quad_ctx,
-                        eta[i],
-                        se,
-                        |x| {
-                            let p = sas_inverse_link_jet(x, epsilon, log_delta).mu;
-                            (p, p * p)
-                        },
-                    );
-                    (m2 - m1 * m1).max(0.0)
-                } else {
-                    0.0
-                };
-                if let (Some((epsilon, log_delta)), Some(cov_theta)) =
-                    (sas_params, sas_param_covariance)
-                    && cov_theta.nrows() == 2
-                    && cov_theta.ncols() == 2
-                {
-                    let jets = sas_inverse_link_jet_with_param_partials(eta[i], epsilon, log_delta);
-                    let g0 = jets.djet_depsilon.mu;
-                    let g1 = jets.djet_dlog_delta.mu;
-                    var += g0 * g0 * cov_theta[[0, 0]]
-                        + 2.0 * g0 * g1 * cov_theta[[0, 1]]
-                        + g1 * g1 * cov_theta[[1, 1]];
-                }
-                var
-            }
-            LikelihoodFamily::BinomialMixture => {
-                let se = eta_se[i].max(0.0);
-                let mut var = if let Some(state) = mixture_state {
-                    let (m1, m2) = gam::quadrature::normal_expectation_1d_adaptive_pair(
-                        &quad_ctx,
-                        eta[i],
-                        se,
-                        |x| {
-                            let p = mixture_inverse_link_jet(state, x).mu;
-                            (p, p * p)
-                        },
-                    );
-                    (m2 - m1 * m1).max(0.0)
-                } else {
-                    0.0
-                };
-                if let (Some(state), Some(cov_theta)) = (mixture_state, mixture_param_covariance) {
-                    let m = state.rho.len();
-                    if cov_theta.nrows() == m && cov_theta.ncols() == m {
-                        let mut partials = vec![
-                            InverseLinkJet {
-                                mu: 0.0,
-                                d1: 0.0,
-                                d2: 0.0,
-                                d3: 0.0,
-                            };
-                            m
-                        ];
-                        let _ = mixture_inverse_link_jet_with_rho_partials_into(
-                            state,
-                            eta[i],
-                            &mut partials,
-                        );
-                        let mut link_var = 0.0_f64;
-                        for a in 0..m {
-                            for b in 0..m {
-                                link_var += partials[a].mu * cov_theta[[a, b]] * partials[b].mu;
-                            }
-                        }
-                        var += link_var.max(0.0);
-                    }
-                }
-                var
-            }
+            LikelihoodFamily::BinomialSas | LikelihoodFamily::BinomialMixture => unreachable!(),
             LikelihoodFamily::RoystonParmar => {
                 let (_, v) =
                     gam::quadrature::survival_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
@@ -6648,7 +6582,7 @@ fn response_sd_from_eta_for_family(
             LikelihoodFamily::GaussianIdentity => 0.0,
         };
         var.max(0.0).sqrt()
-    }))
+    })))
 }
 
 fn response_interval_from_mean_sd(
