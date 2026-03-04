@@ -1,5 +1,4 @@
-use crate::types::LikelihoodFamily;
-use crate::types::MixtureLinkState;
+use crate::types::{LikelihoodFamily, LinkKind};
 use ndarray::{Array1, ArrayView1};
 
 /// Standard normal PDF φ(x).
@@ -83,8 +82,7 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
 pub fn try_inverse_link_array(
     family: LikelihoodFamily,
     eta: ArrayView1<'_, f64>,
-    mixture_state: Option<&MixtureLinkState>,
-    sas_params: Option<(f64, f64)>,
+    link_kind: Option<&LinkKind>,
 ) -> Result<Array1<f64>, String> {
     match family {
         LikelihoodFamily::GaussianIdentity => Ok(eta.to_owned()),
@@ -98,27 +96,21 @@ pub fn try_inverse_link_array(
             1.0 - (-(z.exp())).exp()
         })),
         LikelihoodFamily::BinomialSas => {
-            let (epsilon, log_delta) = sas_params.ok_or_else(|| {
-                "inverse-link for BinomialSas requires sas_params=(epsilon,log_delta)".to_string()
-            })?;
-            Ok(eta.mapv(|e| crate::mixture_link::sas_inverse_link_jet(e, epsilon, log_delta).mu))
+            let sas = link_kind
+                .and_then(|k| k.sas_state())
+                .ok_or_else(|| "inverse-link for BinomialSas requires LinkKind::Sas".to_string())?;
+            Ok(eta.mapv(|e| {
+                crate::mixture_link::sas_inverse_link_jet(e, sas.epsilon, sas.log_delta).mu
+            }))
         }
         LikelihoodFamily::BinomialMixture => {
-            let state = mixture_state.ok_or_else(|| {
-                "inverse-link for BinomialMixture requires mixture_state".to_string()
-            })?;
+            let state = link_kind
+                .and_then(|k| k.mixture_state())
+                .ok_or_else(|| "inverse-link for BinomialMixture requires LinkKind::Mixture".to_string())?;
             Ok(eta.mapv(|e| crate::mixture_link::mixture_inverse_link_jet(state, e).mu))
         }
         LikelihoodFamily::RoystonParmar => Ok(eta.to_owned()),
     }
-}
-
-/// Inverse-link transform per likelihood family.
-///
-/// For SAS/mixture families, use `try_inverse_link_array` with explicit link state.
-#[inline]
-pub fn inverse_link_array(family: LikelihoodFamily, eta: ArrayView1<'_, f64>) -> Array1<f64> {
-    try_inverse_link_array(family, eta, None, None).unwrap_or_else(|msg| panic!("{msg}"))
 }
 
 #[cfg(test)]
@@ -131,14 +123,14 @@ mod tests {
     #[test]
     fn sas_and_mixture_require_explicit_state() {
         let eta = array![0.1, -0.2, 0.3];
-        let sas_err = try_inverse_link_array(LikelihoodFamily::BinomialSas, eta.view(), None, None)
+        let sas_err = try_inverse_link_array(LikelihoodFamily::BinomialSas, eta.view(), None)
             .expect_err("SAS without params should error");
-        assert!(sas_err.contains("requires sas_params"));
+        assert!(sas_err.contains("requires LinkKind::Sas"));
 
         let mix_err =
-            try_inverse_link_array(LikelihoodFamily::BinomialMixture, eta.view(), None, None)
+            try_inverse_link_array(LikelihoodFamily::BinomialMixture, eta.view(), None)
                 .expect_err("mixture without state should error");
-        assert!(mix_err.contains("requires mixture_state"));
+        assert!(mix_err.contains("requires LinkKind::Mixture"));
     }
 
     #[test]
@@ -147,8 +139,11 @@ mod tests {
         let sas = try_inverse_link_array(
             LikelihoodFamily::BinomialSas,
             eta.view(),
-            None,
-            Some((0.2, -0.1)),
+            Some(&LinkKind::Sas(crate::types::SasLinkState {
+                epsilon: 0.2,
+                log_delta: -0.1,
+                delta: (-0.1f64).exp(),
+            })),
         )
         .expect("SAS with params");
         assert_eq!(sas.len(), eta.len());
@@ -162,8 +157,7 @@ mod tests {
         let mix = try_inverse_link_array(
             LikelihoodFamily::BinomialMixture,
             eta.view(),
-            Some(&state),
-            None,
+            Some(&LinkKind::Mixture(state.clone())),
         )
         .expect("mixture with state");
         assert_eq!(mix.len(), eta.len());
