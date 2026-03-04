@@ -41,7 +41,7 @@ use crate::mixture_link::{
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
-    Coefficients, LinkComponent, LinkFunction, LinkKind, LogSmoothingParamsView, RidgePassport,
+    Coefficients, LinkComponent, LinkFunction, InverseLink, LogSmoothingParamsView, RidgePassport,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -355,7 +355,7 @@ fn map_hessian_to_original_basis(
 
 #[derive(Clone)]
 pub(crate) struct RemlConfig {
-    link_kind: LinkKind,
+    link_kind: InverseLink,
     convergence_tolerance: f64,
     max_iterations: usize,
     reml_convergence_tolerance: f64,
@@ -366,7 +366,7 @@ pub(crate) struct RemlConfig {
 impl RemlConfig {
     fn external(link_function: LinkFunction, reml_tol: f64, firth_bias_reduction: bool) -> Self {
         Self {
-            link_kind: LinkKind::Standard(link_function),
+            link_kind: InverseLink::Standard(link_function),
             convergence_tolerance: reml_tol,
             max_iterations: 500,
             reml_convergence_tolerance: reml_tol,
@@ -1024,13 +1024,13 @@ where
         ));
     }
     if let Some(spec) = opts.mixture_link.as_ref() {
-        cfg.link_kind = LinkKind::Mixture(
+        cfg.link_kind = InverseLink::Mixture(
             state_from_spec(spec)
                 .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?,
         );
     }
     if let Some(spec) = effective_sas_link {
-        cfg.link_kind = LinkKind::Sas(
+        cfg.link_kind = InverseLink::Sas(
             state_from_sas_spec(spec)
                 .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
         );
@@ -1270,7 +1270,7 @@ where
                         components: mix_spec.components.clone(),
                         initial_rho: mix_rho_arr.clone(),
                     };
-                    cfg_eval.link_kind = LinkKind::Mixture(
+                    cfg_eval.link_kind = InverseLink::Mixture(
                         state_from_spec(&spec_eval).map_err(|e| {
                             EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
                         })?,
@@ -1279,7 +1279,7 @@ where
                 if use_sas {
                     let epsilon = theta[k];
                     let log_delta = theta[k + 1];
-                    cfg_eval.link_kind = LinkKind::Sas(
+                    cfg_eval.link_kind = InverseLink::Sas(
                         state_from_sas_spec(SasLinkSpec {
                             initial_epsilon: epsilon,
                             initial_log_delta: log_delta,
@@ -1591,9 +1591,9 @@ where
         p,
         &pirls::PirlsConfig {
             link_kind: if let Some(state) = final_mixture_state.clone() {
-                LinkKind::Mixture(state)
+                InverseLink::Mixture(state)
             } else if let Some(state) = final_sas_state {
-                LinkKind::Sas(state)
+                InverseLink::Sas(state)
             } else {
                 cfg.link_kind.clone()
             },
@@ -3407,13 +3407,13 @@ where
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
     if let Some(spec) = opts.mixture_link.as_ref() {
-        cfg.link_kind = LinkKind::Mixture(
+        cfg.link_kind = InverseLink::Mixture(
             state_from_spec(spec)
                 .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?,
         );
     }
     if let Some(spec) = opts.sas_link {
-        cfg.link_kind = LinkKind::Sas(
+        cfg.link_kind = InverseLink::Sas(
             state_from_sas_spec(spec)
                 .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
         );

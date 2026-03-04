@@ -1,7 +1,7 @@
 use gam::construction::compute_penalty_square_roots;
 use gam::estimate::{ExternalOptimOptions, evaluate_external_cost_and_ridge};
 use gam::pirls::{PirlsConfig, fit_model_for_fixed_rho};
-use gam::types::{LikelihoodFamily, LinkFunction, LinkKind, LogSmoothingParamsView};
+use gam::types::{LikelihoodFamily, LinkFunction, InverseLink, LogSmoothingParamsView};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -40,7 +40,7 @@ fn fit_beta_norm(
     firth: bool,
 ) -> f64 {
     let cfg = PirlsConfig {
-        link_kind: LinkKind::Standard(LinkFunction::Logit),
+        link_kind: InverseLink::Standard(LinkFunction::Logit),
         max_iterations: 500,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: firth,
@@ -78,7 +78,7 @@ fn proxy_cost_with_pirls(
     firth: bool,
 ) -> f64 {
     let cfg = PirlsConfig {
-        link_kind: LinkKind::Standard(LinkFunction::Logit),
+        link_kind: InverseLink::Standard(LinkFunction::Logit),
         max_iterations: 500,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: firth,

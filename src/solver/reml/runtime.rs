@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::{LinkKind, SasLinkState};
+use crate::types::{InverseLink, SasLinkState};
 
 impl<'a> RemlState<'a> {
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
@@ -1114,11 +1114,11 @@ impl<'a> RemlState<'a> {
             };
             let mut pirls_config = self.config.as_pirls_config();
             pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
-                LinkKind::Mixture(state)
+                InverseLink::Mixture(state)
             } else if let Some(state) = self.runtime_sas_link_state {
-                LinkKind::Sas(state)
+                InverseLink::Sas(state)
             } else {
-                LinkKind::Standard(self.config.link_function())
+                InverseLink::Standard(self.config.link_function())
             };
             pirls::fit_model_for_fixed_rho_matrix(
                 LogSmoothingParamsView::new(rho.view()),

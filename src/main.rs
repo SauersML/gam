@@ -1135,10 +1135,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     let saved_mixture = saved_mixture_state(&model)?;
     let saved_sas = saved_sas_params(&model);
     let saved_link_kind = if let Some(state) = saved_mixture.clone() {
-        Some(gam::types::LinkKind::Mixture(state))
+        Some(gam::types::InverseLink::Mixture(state))
     } else {
         saved_sas.map(|(epsilon, log_delta)| {
-            gam::types::LinkKind::Sas(gam::types::SasLinkState {
+            gam::types::InverseLink::Sas(gam::types::SasLinkState {
                 epsilon,
                 log_delta,
                 delta: log_delta.exp(),
@@ -5872,21 +5872,6 @@ fn parse_link_choice(raw: Option<&str>, flexible_flag: bool) -> Result<Option<Li
             mixture_components: Some(components),
         }));
     }
-    // Backward-compatible alias for older CLI usage.
-    if let Some(inner) = t.strip_prefix("mixture(").and_then(|s| s.strip_suffix(')')) {
-        if flexible_flag {
-            return Err(
-                "--flexible-link cannot be combined with --link blended(...); blended inverse links are not flexible-link mode"
-                    .to_string(),
-            );
-        }
-        let components = parse_link_component_list(inner)?;
-        return Ok(Some(LinkChoice {
-            mode: LinkMode::Strict,
-            link: LinkFunction::Logit,
-            mixture_components: Some(components),
-        }));
-    }
     if let Some(inner) = t
         .strip_prefix("flexible(")
         .and_then(|s| s.strip_suffix(')'))
@@ -6001,7 +5986,7 @@ fn saved_sas_params(model: &SavedModel) -> Option<(f64, f64)> {
 }
 
 fn saved_mixture_state(model: &SavedModel) -> Result<Option<gam::types::MixtureLinkState>, String> {
-    if model.family != "binomial-blended-inverse-link" && model.family != "binomial-mixture" {
+    if model.family != "binomial-blended-inverse-link" {
         return Ok(None);
     }
     let Some(spec) = saved_mixture_link_spec(model)? else {
@@ -6086,9 +6071,7 @@ fn family_from_string(v: &str) -> Result<LikelihoodFamily, String> {
         "binomial-probit" => Ok(LikelihoodFamily::BinomialProbit),
         "binomial-cloglog" => Ok(LikelihoodFamily::BinomialCLogLog),
         "binomial-sas" => Ok(LikelihoodFamily::BinomialSas),
-        "binomial-blended-inverse-link" | "binomial-mixture" => {
-            Ok(LikelihoodFamily::BinomialMixture)
-        }
+        "binomial-blended-inverse-link" => Ok(LikelihoodFamily::BinomialMixture),
         "royston-parmar" => Ok(LikelihoodFamily::RoystonParmar),
         _ => Err(format!("unsupported saved family '{v}'")),
     }
