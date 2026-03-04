@@ -85,6 +85,10 @@ CV_SPLITS = 5
 CV_SEED = 42
 _RUST_BIN_PATH: Path | None = None
 HEARTBEAT_INTERVAL_SEC = 15.0
+# For short-lived commands, poll more frequently at startup so heartbeat
+# diagnostics capture meaningful process stats before exit.
+HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
+HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 HGDP_1KG_PC_TSV = DATASET_DIR / "hgdp_1kg_pc_data.tsv"
 NON_BLOCKING_FAILURE_CONTENDERS = {
     # These external stacks are kept in the benchmark output for visibility,
@@ -255,14 +259,22 @@ def _read_ps_snapshot(pid):
         parts = line.split(None, 7)
         if len(parts) < 8:
             return {}
+        stat = parts[6]
+        rss_kib = int(parts[3]) if parts[3].isdigit() else None
+        vsz_kib = int(parts[4]) if parts[4].isdigit() else None
+        # `ps` can report zombie tasks with zero RSS/VSZ; that is not a useful
+        # memory sample for diagnostics, so report as missing.
+        if stat.startswith("Z"):
+            rss_kib = None
+            vsz_kib = None
         return {
             "pid": parts[0],
             "cpu_pct": parts[1],
             "mem_pct": parts[2],
-            "rss_kib": int(parts[3]) if parts[3].isdigit() else None,
-            "vsz_kib": int(parts[4]) if parts[4].isdigit() else None,
+            "rss_kib": rss_kib,
+            "vsz_kib": vsz_kib,
             "etimes": parts[5],
-            "stat": parts[6],
+            "stat": stat,
             "comm": parts[7],
         }
     except Exception:
@@ -336,7 +348,15 @@ def _heartbeat_loop(proc, cmd, stop_event, stats):
         cmd_preview += " ..."
     start = monotonic()
     print(_collect_heartbeat_snapshot(proc, cmd_preview, stats, start), file=sys.stderr, flush=True)
-    while not stop_event.wait(HEARTBEAT_INTERVAL_SEC):
+    while True:
+        elapsed = monotonic() - start
+        wait_sec = (
+            HEARTBEAT_INITIAL_INTERVAL_SEC
+            if elapsed < HEARTBEAT_INITIAL_WINDOW_SEC
+            else HEARTBEAT_INTERVAL_SEC
+        )
+        if stop_event.wait(wait_sec):
+            break
         if proc.poll() is not None:
             break
         print(_collect_heartbeat_snapshot(proc, cmd_preview, stats, start), file=sys.stderr, flush=True)
@@ -479,6 +499,16 @@ def log_loss_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> float:
     return float(-np.mean(y * np.log(p_clipped) + (1.0 - y) * np.log(1.0 - p_clipped)))
 
 
+def exp_saturated(x: float) -> float:
+    """Numerically stable exp that saturates instead of raising OverflowError."""
+    # Approximate IEEE-754 f64 exponent bounds.
+    if x >= 709.0:
+        return float("inf")
+    if x <= -745.0:
+        return 0.0
+    return math.exp(x)
+
+
 def nagelkerke_r2_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> float | None:
     y_arr = np.asarray(y, dtype=float).reshape(-1)
     p_arr = np.clip(np.asarray(p, dtype=float).reshape(-1), eps, 1.0 - eps)
@@ -490,9 +520,9 @@ def nagelkerke_r2_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> flo
     ll_null = float(np.sum(y_arr * math.log(p_mean) + (1.0 - y_arr) * math.log(1.0 - p_mean)))
     ll_model = float(np.sum(y_arr * np.log(p_arr) + (1.0 - y_arr) * np.log(1.0 - p_arr)))
     n = int(y_arr.size)
-    r2_cs = 1.0 - math.exp((2.0 / n) * (ll_null - ll_model))
-    max_r2_cs = 1.0 - math.exp((2.0 / n) * ll_null)
-    if max_r2_cs <= 0.0:
+    r2_cs = 1.0 - exp_saturated((2.0 / n) * (ll_null - ll_model))
+    max_r2_cs = 1.0 - exp_saturated((2.0 / n) * ll_null)
+    if not np.isfinite(r2_cs) or not np.isfinite(max_r2_cs) or max_r2_cs <= 0.0:
         return None
     return float(r2_cs / max_r2_cs)
 
@@ -555,9 +585,9 @@ def survival_partial_nagelkerke_r2(
     )
     if ll_null is None:
         return None
-    r2_cs = 1.0 - math.exp((2.0 / n_events) * (ll_null - ll_model))
-    max_r2_cs = 1.0 - math.exp((2.0 / n_events) * ll_null)
-    if max_r2_cs <= 0.0:
+    r2_cs = 1.0 - exp_saturated((2.0 / n_events) * (ll_null - ll_model))
+    max_r2_cs = 1.0 - exp_saturated((2.0 / n_events) * ll_null)
+    if not np.isfinite(r2_cs) or not np.isfinite(max_r2_cs) or max_r2_cs <= 0.0:
         return None
     return float(r2_cs / max_r2_cs)
 
