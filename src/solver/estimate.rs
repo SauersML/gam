@@ -41,9 +41,9 @@ use crate::mixture_link::{
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
-    Coefficients, LinkComponent, LinkFunction, LogSmoothingParamsView, RidgePassport,
+    Coefficients, LinkComponent, LinkFunction, LinkKind, LogSmoothingParamsView, RidgePassport,
 };
-use crate::types::{MixtureLinkSpec, SasLinkSpec, SasLinkState};
+use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
@@ -355,9 +355,7 @@ fn map_hessian_to_original_basis(
 
 #[derive(Clone)]
 pub(crate) struct RemlConfig {
-    link_function: LinkFunction,
-    mixture_link_state: Option<crate::types::MixtureLinkState>,
-    sas_link_state: Option<SasLinkState>,
+    link_kind: LinkKind,
     convergence_tolerance: f64,
     max_iterations: usize,
     reml_convergence_tolerance: f64,
@@ -368,9 +366,7 @@ pub(crate) struct RemlConfig {
 impl RemlConfig {
     fn external(link_function: LinkFunction, reml_tol: f64, firth_bias_reduction: bool) -> Self {
         Self {
-            link_function,
-            mixture_link_state: None,
-            sas_link_state: None,
+            link_kind: LinkKind::Standard(link_function),
             convergence_tolerance: reml_tol,
             max_iterations: 500,
             reml_convergence_tolerance: reml_tol,
@@ -380,14 +376,12 @@ impl RemlConfig {
     }
 
     fn link_function(&self) -> LinkFunction {
-        self.link_function
+        self.link_kind.link_function()
     }
 
     fn as_pirls_config(&self) -> pirls::PirlsConfig {
         pirls::PirlsConfig {
-            link_function: self.link_function,
-            mixture_link_state: self.mixture_link_state.clone(),
-            sas_link_state: self.sas_link_state,
+            link_kind: self.link_kind.clone(),
             max_iterations: self.max_iterations,
             convergence_tolerance: self.convergence_tolerance,
             firth_bias_reduction: self.firth_bias_reduction,
@@ -1030,13 +1024,13 @@ where
         ));
     }
     if let Some(spec) = opts.mixture_link.as_ref() {
-        cfg.mixture_link_state =
-            Some(state_from_spec(spec).map_err(|e| {
-                EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
-            })?);
+        cfg.link_kind = LinkKind::Mixture(
+            state_from_spec(spec)
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid mixture link: {e}")))?,
+        );
     }
     if let Some(spec) = effective_sas_link {
-        cfg.sas_link_state = Some(
+        cfg.link_kind = LinkKind::Sas(
             state_from_sas_spec(spec)
                 .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
         );
@@ -1177,8 +1171,8 @@ where
         )?;
         (
             outer_result.rho.clone(),
-            cfg.mixture_link_state.clone(),
-            cfg.sas_link_state,
+            cfg.link_kind.mixture_state().cloned(),
+            cfg.link_kind.sas_state().copied(),
             None,
             None,
             outer_result,
@@ -1276,14 +1270,16 @@ where
                         components: mix_spec.components.clone(),
                         initial_rho: mix_rho_arr.clone(),
                     };
-                    cfg_eval.mixture_link_state = Some(state_from_spec(&spec_eval).map_err(|e| {
-                        EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
-                    })?);
+                    cfg_eval.link_kind = LinkKind::Mixture(
+                        state_from_spec(&spec_eval).map_err(|e| {
+                            EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
+                        })?,
+                    );
                 }
                 if use_sas {
                     let epsilon = theta[k];
                     let log_delta = theta[k + 1];
-                    cfg_eval.sas_link_state = Some(
+                    cfg_eval.link_kind = LinkKind::Sas(
                         state_from_sas_spec(SasLinkSpec {
                             initial_epsilon: epsilon,
                             initial_log_delta: log_delta,
@@ -1292,7 +1288,10 @@ where
                     );
                 }
                 reml_eval
-                    .set_link_states(cfg_eval.mixture_link_state.clone(), cfg_eval.sas_link_state);
+                    .set_link_states(
+                        cfg_eval.link_kind.mixture_state().cloned(),
+                        cfg_eval.link_kind.sas_state().copied(),
+                    );
                 let t_cost = Instant::now();
                 let mut cost = reml_eval.compute_cost(&rho_buf)?;
                 let sas_ridge = if use_sas { sas_ridge_weight } else { 0.0 };
@@ -1347,7 +1346,7 @@ where
                     dw_explicit_j_buf.fill(0.0);
                     for i in 0..n_obs {
                         if use_mixture {
-                            let mix_state = cfg_eval.mixture_link_state.as_ref().ok_or_else(|| {
+                            let mix_state = cfg_eval.link_kind.mixture_state().ok_or_else(|| {
                                 EstimationError::InvalidInput("missing mixture state".to_string())
                             })?;
                             let jet = mixture_inverse_link_jet_with_rho_partials_into(
@@ -1383,7 +1382,7 @@ where
                                 + a1 * dd2;
                             dw_explicit_j_buf[i] = -dell2_explicit;
                         } else {
-                            let sas = cfg_eval.sas_link_state.ok_or_else(|| {
+                            let sas = cfg_eval.link_kind.sas_state().copied().ok_or_else(|| {
                                 EstimationError::InvalidInput("missing SAS state".to_string())
                             })?;
                             let jets = sas_inverse_link_jet_with_param_partials(
@@ -1477,7 +1476,7 @@ where
                 .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
             )
         } else {
-            cfg.sas_link_state
+            cfg.link_kind.sas_state().copied()
         };
         let aux_param_covariance = if aux_dim_outer > 0 {
             let mut theta_aux = Array1::<f64>::zeros(aux_dim_outer);
@@ -1591,8 +1590,13 @@ where
         None,
         p,
         &pirls::PirlsConfig {
-            mixture_link_state: final_mixture_state.clone(),
-            sas_link_state: final_sas_state,
+            link_kind: if let Some(state) = final_mixture_state.clone() {
+                LinkKind::Mixture(state)
+            } else if let Some(state) = final_sas_state {
+                LinkKind::Sas(state)
+            } else {
+                cfg.link_kind.clone()
+            },
             ..cfg.as_pirls_config()
         },
         None,

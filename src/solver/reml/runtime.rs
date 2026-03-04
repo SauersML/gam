@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::{LinkKind, SasLinkState};
 
 impl<'a> RemlState<'a> {
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
@@ -293,8 +294,8 @@ impl<'a> RemlState<'a> {
             sparse_penalty_blocks,
             p,
             config,
-            runtime_mixture_link_state: config.mixture_link_state.clone(),
-            runtime_sas_link_state: config.sas_link_state,
+            runtime_mixture_link_state: config.link_kind.mixture_state().cloned(),
+            runtime_sas_link_state: config.link_kind.sas_state().copied(),
             nullspace_dims,
             coefficient_lower_bounds,
             linear_constraints,
@@ -1112,8 +1113,13 @@ impl<'a> RemlState<'a> {
                 None
             };
             let mut pirls_config = self.config.as_pirls_config();
-            pirls_config.mixture_link_state = self.runtime_mixture_link_state.clone();
-            pirls_config.sas_link_state = self.runtime_sas_link_state;
+            pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
+                LinkKind::Mixture(state)
+            } else if let Some(state) = self.runtime_sas_link_state {
+                LinkKind::Sas(state)
+            } else {
+                LinkKind::Standard(self.config.link_function())
+            };
             pirls::fit_model_for_fixed_rho_matrix(
                 LogSmoothingParamsView::new(rho.view()),
                 &self.x,

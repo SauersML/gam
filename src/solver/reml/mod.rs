@@ -10,6 +10,7 @@ use crate::linalg::sparse_exact::{
 use crate::pirls::{
     DirectionalWorkingCurvature, PirlsWorkspace, directional_working_curvature_callback,
 };
+use crate::types::SasLinkState;
 use faer::Side;
 
 mod cache;

@@ -57,6 +57,41 @@ pub struct SasLinkState {
     pub delta: f64,
 }
 
+/// Unified binomial link selector with optional state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LinkKind {
+    Standard(LinkFunction),
+    Sas(SasLinkState),
+    Mixture(MixtureLinkState),
+}
+
+impl LinkKind {
+    #[inline]
+    pub fn link_function(&self) -> LinkFunction {
+        match self {
+            Self::Standard(link) => *link,
+            Self::Sas(_) => LinkFunction::Sas,
+            Self::Mixture(_) => LinkFunction::Logit,
+        }
+    }
+
+    #[inline]
+    pub fn mixture_state(&self) -> Option<&MixtureLinkState> {
+        match self {
+            Self::Mixture(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn sas_state(&self) -> Option<&SasLinkState> {
+        match self {
+            Self::Sas(state) => Some(state),
+            _ => None,
+        }
+    }
+}
+
 /// Engine-level likelihood selector used by generic solver entrypoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LikelihoodFamily {
