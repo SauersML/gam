@@ -4419,11 +4419,29 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
             &spatial_terms,
         )? {
             return Ok(exact_joint);
-        } else {
-            return Err(EstimationError::InvalidInput(
-                "spatial κ optimization now requires exact log-κ derivative paths (X_τ, S_τ) for all active spatial terms".to_string(),
-            ));
         }
+        // Fallback path for spatial bases that do not expose exact log-kappa
+        // derivatives (e.g. Duchon/TPS variants without analytic X_tau/S_tau).
+        // Refit on the frozen spec so penalty block structure is consistent with
+        // the stabilized spatial design representation.
+        log::debug!(
+            "[spatial-kappa] exact joint path unavailable for one or more spatial terms; \
+             using frozen-spec profiled fit fallback"
+        );
+        let fallback = fit_term_collection_for_spec(
+            data,
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &resolved_spec,
+            family,
+            options,
+        )?;
+        return Ok(FittedTermCollectionWithSpec {
+            fit: fallback.fit,
+            design: fallback.design,
+            resolved_spec,
+        });
     }
 
     Ok(FittedTermCollectionWithSpec {

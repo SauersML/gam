@@ -1,6 +1,84 @@
 use super::*;
+use crate::linalg::sparse_exact::SparseOperatorBlockSupport;
 
 impl<'a> RemlState<'a> {
+    fn operator_block_is_local(
+        direction_block: &Array2<f64>,
+        p_start: usize,
+        p_end: usize,
+        tol: f64,
+    ) -> bool {
+        let p = direction_block.nrows();
+        let cols = direction_block.ncols();
+        for col in 0..cols {
+            for row in 0..p_start {
+                if direction_block[[row, col]].abs() > tol {
+                    return false;
+                }
+            }
+            for row in p_end..p {
+                if direction_block[[row, col]].abs() > tol {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn trace_from_selected_block(
+        h_block: &Array2<f64>,
+        direction_block: &Array2<f64>,
+        p_start: usize,
+    ) -> f64 {
+        let block_dim = h_block.ncols();
+        let mut trace = 0.0_f64;
+        for col in 0..block_dim {
+            for i in 0..block_dim {
+                trace += h_block[[col, i]] * direction_block[[p_start + i, col]];
+            }
+        }
+        trace
+    }
+
+    fn sparse_operator_support_for_term(
+        sparse: &SparseExactEvalData,
+        term_index: usize,
+    ) -> Option<SparseOperatorBlockSupport> {
+        sparse
+            .penalty_blocks
+            .iter()
+            .find(|block| block.term_index == term_index)
+            .map(|block| SparseOperatorBlockSupport {
+                p_start: block.p_start,
+                p_end: block.p_end,
+                strict: block.block_support_strict,
+            })
+    }
+
+    fn trace_hinv_operator_sparse_dispatch<F>(
+        &self,
+        sparse: &SparseExactEvalData,
+        p: usize,
+        support: Option<SparseOperatorBlockSupport>,
+        apply_direction: F,
+    ) -> Result<f64, EstimationError>
+    where
+        F: FnMut(&Array2<f64>) -> Result<Array2<f64>, EstimationError>,
+    {
+        if let Some(sup) = support {
+            let mut workspace = sparse.trace_workspace.lock().unwrap();
+            self.trace_hinv_operator_sparse_exact(
+                &sparse.factor,
+                p,
+                Some(&mut workspace),
+                Some(sup),
+                apply_direction,
+            )
+        } else {
+            self.trace_hinv_operator_sparse_exact(&sparse.factor, p, None, None, apply_direction)
+        }
+    }
+
     pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
         match pirls_result.coordinate_frame {
             pirls::PirlsCoordinateFrame::OriginalSparseNative => {
@@ -173,9 +251,10 @@ impl<'a> RemlState<'a> {
                         h_k += &self.xt_diag_x_original(&diag, &mut assembly_workspace)?;
                         let dir_k = Self::firth_direction(op, &b_k);
                         h_k -= &Self::firth_hphi_direction(op, &dir_k);
-                        let trace_hk = self.trace_hinv_operator_sparse_exact(
-                            &sparse.factor,
+                        let trace_hk = self.trace_hinv_operator_sparse_dispatch(
+                            sparse,
                             p_dim,
+                            None,
                             |basis_block: &Array2<f64>| Ok(h_k.dot(basis_block)),
                         )?;
                         let beta_term = beta.dot(&a_kb);
@@ -210,6 +289,8 @@ impl<'a> RemlState<'a> {
         &self,
         factor: &SparseExactFactor,
         p: usize,
+        mut workspace: Option<&mut SparseTraceWorkspace>,
+        support: Option<SparseOperatorBlockSupport>,
         mut apply_direction: F,
     ) -> Result<f64, EstimationError>
     where
@@ -217,6 +298,40 @@ impl<'a> RemlState<'a> {
     {
         if p == 0 {
             return Ok(0.0);
+        }
+        if let (Some(ws), Some(block)) = (workspace.as_deref_mut(), support) {
+            if block.strict && block.p_end > block.p_start && block.p_end <= p {
+                let block_dim = block.p_end - block.p_start;
+                let mut basis_block = Array2::<f64>::zeros((p, block_dim));
+                for local_col in 0..block_dim {
+                    basis_block[[block.p_start + local_col, local_col]] = 1.0;
+                }
+                let direction_block = apply_direction(&basis_block)?;
+                if direction_block.nrows() != p || direction_block.ncols() != block_dim {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "trace_hinv_operator_sparse_exact apply returned {}x{} for basis block {}x{}",
+                        direction_block.nrows(),
+                        direction_block.ncols(),
+                        p,
+                        block_dim
+                    )));
+                }
+
+                const SUPPORT_TOL: f64 = 1e-12;
+                if Self::operator_block_is_local(
+                    &direction_block,
+                    block.p_start,
+                    block.p_end,
+                    SUPPORT_TOL,
+                ) {
+                    let h_block = ws.selected_block_inverse(factor, block.p_start, block.p_end)?;
+                    return Ok(Self::trace_from_selected_block(
+                        h_block,
+                        &direction_block,
+                        block.p_start,
+                    ));
+                }
+            }
         }
         let chunk = 32usize;
         let mut trace = 0.0_f64;
@@ -399,11 +514,13 @@ impl<'a> RemlState<'a> {
         let fit_block =
             -u.dot(&x_tau_beta) + 0.5 * beta.dot(&s_tau_total.dot(&beta)) + fit_firth_partial;
 
-        let trace_s_tau = self.trace_hinv_operator_sparse_exact(
-            &sparse.factor,
-            p,
-            |basis_block: &Array2<f64>| Ok(s_tau_total.dot(basis_block)),
-        )?;
+        let block_support =
+            hyper_dir
+                .penalty_index
+                .and_then(|k| Self::sparse_operator_support_for_term(sparse, k));
+        let trace_s_tau = self.trace_hinv_operator_sparse_dispatch(sparse, p, block_support, |basis_block: &Array2<f64>| Ok(
+            s_tau_total.dot(basis_block)
+        ))?;
         let cross = self.sparse_exact_weighted_cross_trace_xtau(
             &sparse.factor,
             &hyper_dir.x_tau_original,
@@ -465,9 +582,10 @@ impl<'a> RemlState<'a> {
                     let p_dim = self.p;
                     let tau_kernel = hphi_tau_kernel_opt.clone();
                     let tau_x = &hyper_dir.x_tau_original;
-                    let tr_firth = self.trace_hinv_operator_sparse_exact(
-                        &sparse.factor,
+                    let tr_firth = self.trace_hinv_operator_sparse_dispatch(
+                        sparse,
                         p_dim,
+                        None,
                         |basis_block: &Array2<f64>| {
                             Ok(Self::firth_hphi_trace_apply_combined(
                                 op,
@@ -761,101 +879,128 @@ impl<'a> RemlState<'a> {
                 Ok(out)
             };
 
-        let mut hess = Array2::<f64>::zeros((k_count, k_count));
-        for block_l in sparse.penalty_blocks.iter() {
-            let l = block_l.term_index;
-            for block_k in sparse.penalty_blocks.iter().take(l + 1) {
-                let k = block_k.term_index;
-
-                // Quadratic beta term:
-                //   -beta' A_k H^{-1} A_l beta + 0.5 delta_{k,l} beta' A_k beta.
-                // Since B_l = -H^{-1} A_l beta, this becomes
-                //   beta' A_k B_l + 0.5 delta_{k,l} beta' A_k beta.
-                let quad_beta =
-                    a_k_beta[k].dot(&b_k[l]) + if k == l { 0.5 * q_diag[k] } else { 0.0 };
-
-                // Build the right-hand side for
-                //   B_{k,l} = -H^{-1}(H_l B_k + A_{k,l} beta + A_k B_l).
-                //
-                // Split H_l B_k into:
-                //   A_l B_k
-                //   + X' diag(c ⊙ z_l) X B_k
-                //   = A_l B_k + X' ( (c ⊙ z_l) ⊙ z_k ).
-                let mut rhs_col = Array2::<f64>::zeros((p_dim, 1));
-                rhs_col.column_mut(0).assign(&b_k[k]);
-                let h_l_b_k = apply_hk_block(l, &rhs_col)?.column(0).to_owned();
-                let a_k_b_l =
-                    sparse_matvec_public(&block_k.s_k_sparse, &b_k[l]).mapv(|v| lambdas[k] * v);
-                let mut rhs_bkl = h_l_b_k + &a_k_b_l;
-                if k == l {
-                    rhs_bkl += &a_k_beta[k];
-                }
-                let b_kl = solve_sparse_spd(&sparse.factor, &rhs_bkl.mapv(|v| -v))?;
-                let z_kl = self.x().matrix_vector_multiply(&b_kl);
-
-                // H_{k,l} = A_{k,l} + X' diag(d ⊙ z_k ⊙ z_l + c ⊙ z_{k,l}) X.
-                // The linear trace contribution is
-                //   0.5 tr(H^{-1} H_{k,l})
-                // = 0.5 delta_{k,l} tr(H^{-1} A_k)
-                //   + 0.5 tr(H^{-1} X' diag(hkl_diag) X).
-                //
-                // We evaluate the second term by the cyclic identity
-                //   tr(H^{-1} X' D X)
-                // = tr(X H^{-1} X' D)
-                // = sum_i leverage_i * D_ii,
-                // where leverage_i = x_i' H^{-1} x_i.
-                let hkl_diag = (d * &z_k[k] * &z_k[l]) + &(c * &z_kl);
-                let lin_trace = if let (Some(op), Some(dirs)) =
-                    (firth_op.as_ref(), firth_dirs.as_ref())
-                {
-                    let dir_kl = Self::firth_direction(op, &b_kl);
-                    self.trace_hinv_operator_sparse_exact(&sparse.factor, p_dim, |basis_block| {
-                        let mut out = if k == l {
-                            let block_k = blocks_by_term[k].expect("sparse block exists");
-                            let mut akb = Array2::<f64>::zeros((p_dim, basis_block.ncols()));
-                            for col in 0..basis_block.ncols() {
-                                let v = basis_block.column(col).to_owned();
-                                let col_out = sparse_matvec_public(&block_k.s_k_sparse, &v)
-                                    .mapv(|vv| lambdas[k] * vv);
-                                akb.column_mut(col).assign(&col_out);
-                            }
-                            akb
-                        } else {
-                            Array2::<f64>::zeros((p_dim, basis_block.ncols()))
-                        };
-                        // Matrix-free X' diag(hkl_diag) X * basis_block
-                        for col in 0..basis_block.ncols() {
-                            let v = basis_block.column(col).to_owned();
-                            let xv = self.x().matrix_vector_multiply(&v);
-                            let wxv = &xv * &hkl_diag;
-                            let col_out = self.x().transpose_vector_multiply(&wxv);
-                            out.column_mut(col).scaled_add(1.0, &col_out);
-                        }
-                        out -= &Self::firth_hphi_direction_apply(op, &dir_kl, basis_block);
-                        out -= &Self::firth_hphi_second_direction_apply(
-                            op,
-                            &dirs[k],
-                            &dirs[l],
-                            basis_block,
-                        );
-                        Ok(out)
-                    })?
-                } else {
-                    (if k == l { trace_hinv_sk_values[k] } else { 0.0 }) + leverages.dot(&hkl_diag)
-                };
-
-                // Quadratic trace term:
-                //   tr(H^{-1} H_l H^{-1} H_k)
-                // evaluated fully matrix-free as
-                //   tr(H^{-1}(H_l(H^{-1}(H_k E)))) on identity block E.
-                let quad_trace =
-                    self.trace_hinv_operator_sparse_exact(&sparse.factor, p_dim, |basis_block| {
-                        let hk_basis = apply_hk_block(k, basis_block)?;
-                        let y = solve_sparse_spd_multi(&sparse.factor, &hk_basis)?;
-                        apply_hk_block(l, &y)
+        let per_l: Vec<Result<Vec<(usize, usize, f64)>, EstimationError>> = (0..k_count)
+            .into_par_iter()
+            .map(|l| {
+                let mut local = Vec::<(usize, usize, f64)>::with_capacity(l + 1);
+                for k in 0..=l {
+                    let block_k = blocks_by_term[k].ok_or_else(|| {
+                        EstimationError::InvalidInput(format!(
+                            "missing sparse penalty block for term index {}",
+                            k
+                        ))
                     })?;
 
-                let value = quad_beta + 0.5 * lin_trace - 0.5 * quad_trace;
+                    // Quadratic beta term:
+                    //   -beta' A_k H^{-1} A_l beta + 0.5 delta_{k,l} beta' A_k beta.
+                    // Since B_l = -H^{-1} A_l beta, this becomes
+                    //   beta' A_k B_l + 0.5 delta_{k,l} beta' A_k beta.
+                    let quad_beta =
+                        a_k_beta[k].dot(&b_k[l]) + if k == l { 0.5 * q_diag[k] } else { 0.0 };
+
+                    // Build the right-hand side for
+                    //   B_{k,l} = -H^{-1}(H_l B_k + A_{k,l} beta + A_k B_l).
+                    //
+                    // Split H_l B_k into:
+                    //   A_l B_k
+                    //   + X' diag(c ⊙ z_l) X B_k
+                    //   = A_l B_k + X' ( (c ⊙ z_l) ⊙ z_k ).
+                    let mut rhs_col = Array2::<f64>::zeros((p_dim, 1));
+                    rhs_col.column_mut(0).assign(&b_k[k]);
+                    let h_l_b_k = apply_hk_block(l, &rhs_col)?.column(0).to_owned();
+                    let a_k_b_l =
+                        sparse_matvec_public(&block_k.s_k_sparse, &b_k[l]).mapv(|v| lambdas[k] * v);
+                    let mut rhs_bkl = h_l_b_k + &a_k_b_l;
+                    if k == l {
+                        rhs_bkl += &a_k_beta[k];
+                    }
+                    let b_kl = solve_sparse_spd(&sparse.factor, &rhs_bkl.mapv(|v| -v))?;
+                    let z_kl = self.x().matrix_vector_multiply(&b_kl);
+
+                    // H_{k,l} = A_{k,l} + X' diag(d ⊙ z_k ⊙ z_l + c ⊙ z_{k,l}) X.
+                    // The linear trace contribution is
+                    //   0.5 tr(H^{-1} H_{k,l})
+                    // = 0.5 delta_{k,l} tr(H^{-1} A_k)
+                    //   + 0.5 tr(H^{-1} X' diag(hkl_diag) X).
+                    //
+                    // We evaluate the second term by the cyclic identity
+                    //   tr(H^{-1} X' D X)
+                    // = tr(X H^{-1} X' D)
+                    // = sum_i leverage_i * D_ii,
+                    // where leverage_i = x_i' H^{-1} x_i.
+                    let hkl_diag = (d * &z_k[k] * &z_k[l]) + &(c * &z_kl);
+                    let lin_trace = if let (Some(op), Some(dirs)) =
+                        (firth_op.as_ref(), firth_dirs.as_ref())
+                    {
+                        let dir_kl = Self::firth_direction(op, &b_kl);
+                        self.trace_hinv_operator_sparse_dispatch(
+                            sparse,
+                            p_dim,
+                            None,
+                            |basis_block| {
+                                let mut out = if k == l {
+                                    let block_k =
+                                        blocks_by_term[k].expect("sparse block exists");
+                                    let mut akb =
+                                        Array2::<f64>::zeros((p_dim, basis_block.ncols()));
+                                    for col in 0..basis_block.ncols() {
+                                        let v = basis_block.column(col).to_owned();
+                                        let col_out = sparse_matvec_public(&block_k.s_k_sparse, &v)
+                                            .mapv(|vv| lambdas[k] * vv);
+                                        akb.column_mut(col).assign(&col_out);
+                                    }
+                                    akb
+                                } else {
+                                    Array2::<f64>::zeros((p_dim, basis_block.ncols()))
+                                };
+                                // Matrix-free X' diag(hkl_diag) X * basis_block
+                                for col in 0..basis_block.ncols() {
+                                    let v = basis_block.column(col).to_owned();
+                                    let xv = self.x().matrix_vector_multiply(&v);
+                                    let wxv = &xv * &hkl_diag;
+                                    let col_out = self.x().transpose_vector_multiply(&wxv);
+                                    out.column_mut(col).scaled_add(1.0, &col_out);
+                                }
+                                out -= &Self::firth_hphi_direction_apply(op, &dir_kl, basis_block);
+                                out -= &Self::firth_hphi_second_direction_apply(
+                                    op,
+                                    &dirs[k],
+                                    &dirs[l],
+                                    basis_block,
+                                );
+                                Ok(out)
+                            },
+                        )?
+                    } else {
+                        (if k == l { trace_hinv_sk_values[k] } else { 0.0 })
+                            + leverages.dot(&hkl_diag)
+                    };
+
+                    // Quadratic trace term:
+                    //   tr(H^{-1} H_l H^{-1} H_k)
+                    // evaluated fully matrix-free as
+                    //   tr(H^{-1}(H_l(H^{-1}(H_k E)))) on identity block E.
+                    let quad_trace = self.trace_hinv_operator_sparse_dispatch(
+                        sparse,
+                        p_dim,
+                        None,
+                        |basis_block| {
+                            let hk_basis = apply_hk_block(k, basis_block)?;
+                            let y = solve_sparse_spd_multi(&sparse.factor, &hk_basis)?;
+                            apply_hk_block(l, &y)
+                        },
+                    )?;
+
+                    let value = quad_beta + 0.5 * lin_trace - 0.5 * quad_trace;
+                    local.push((k, l, value));
+                }
+                Ok(local)
+            })
+            .collect();
+
+        let mut hess = Array2::<f64>::zeros((k_count, k_count));
+        for local_res in per_l {
+            for (k, l, value) in local_res? {
                 hess[[k, l]] = value;
                 hess[[l, k]] = value;
             }
