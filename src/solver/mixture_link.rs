@@ -1,3 +1,4 @@
+use crate::estimate::EstimationError;
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
@@ -241,7 +242,7 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
 pub fn inverse_link_jet_for_inverse_link(
     link: &InverseLink,
     eta: f64,
-) -> Result<InverseLinkJet, String> {
+) -> Result<InverseLinkJet, EstimationError> {
     match link {
         InverseLink::Standard(link_fn) => {
             inverse_link_jet_for_link_function(*link_fn, eta, None, None)
@@ -260,7 +261,7 @@ pub fn inverse_link_jet_for_link_function(
     eta: f64,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
-) -> Result<InverseLinkJet, String> {
+) -> Result<InverseLinkJet, EstimationError> {
     if let Some(state) = mixture_link_state {
         return Ok(mixture_inverse_link_jet(state, eta));
     }
@@ -277,9 +278,9 @@ pub fn inverse_link_jet_for_link_function(
             d2: 0.0,
             d3: 0.0,
         }),
-        LinkFunction::Sas => {
-            Err("LinkFunction::Sas inverse-link requires explicit SAS link state".to_string())
-        }
+        LinkFunction::Sas => Err(EstimationError::InvalidInput(
+            "LinkFunction::Sas inverse-link requires explicit SAS link state".to_string(),
+        )),
     }
 }
 
@@ -288,7 +289,7 @@ pub fn inverse_link_jet_for_family(
     eta: f64,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
-) -> Result<InverseLinkJet, String> {
+) -> Result<InverseLinkJet, EstimationError> {
     match family {
         LikelihoodFamily::GaussianIdentity => inverse_link_jet_for_link_function(
             LinkFunction::Identity,
@@ -320,10 +321,16 @@ pub fn inverse_link_jet_for_family(
             mixture_link_state,
             sas_link_state,
         )
-        .map_err(|_| "BinomialSas inverse-link requires SAS link state".to_string()),
+        .map_err(|_| {
+            EstimationError::InvalidInput(
+                "BinomialSas inverse-link requires SAS link state".to_string(),
+            )
+        }),
         LikelihoodFamily::BinomialMixture => {
             let state = mixture_link_state.ok_or_else(|| {
-                "BinomialMixture inverse-link requires mixture link state".to_string()
+                EstimationError::InvalidInput(
+                    "BinomialMixture inverse-link requires mixture link state".to_string(),
+                )
             })?;
             inverse_link_jet_for_link_function(
                 LinkFunction::Logit,
@@ -332,9 +339,9 @@ pub fn inverse_link_jet_for_family(
                 sas_link_state,
             )
         }
-        LikelihoodFamily::RoystonParmar => Err(
+        LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "RoystonParmar inverse-link jet is not defined in mixture-link dispatcher".to_string(),
-        ),
+        )),
     }
 }
 
@@ -760,7 +767,7 @@ mod tests {
             None,
         )
         .expect_err("SAS without state should error");
-        assert!(sas_err.contains("requires SAS link state"));
+        assert!(sas_err.to_string().contains("requires SAS link state"));
 
         let mix_err = inverse_link_jet_for_family(
             crate::types::LikelihoodFamily::BinomialMixture,
@@ -769,6 +776,6 @@ mod tests {
             None,
         )
         .expect_err("mixture without state should error");
-        assert!(mix_err.contains("requires mixture link state"));
+        assert!(mix_err.to_string().contains("requires mixture link state"));
     }
 }

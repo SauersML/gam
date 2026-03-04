@@ -17,8 +17,7 @@ use gam::basis::{
 use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, ModelSummary,
     ParametricTermSummary, SmoothTermSummary, fit_gam, optimize_external_design, predict_gam,
-    predict_gam_posterior_mean, predict_gam_posterior_mean_with_fit,
-    predict_gam_with_uncertainty,
+    predict_gam_posterior_mean_with_fit, predict_gam_with_uncertainty,
 };
 use gam::families::sigma_link::{
     bounded_sigma_and_deriv_from_eta as sigma_and_deriv_from_eta,
@@ -1961,112 +1960,51 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             | LikelihoodFamily::BinomialSas
             | LikelihoodFamily::BinomialMixture
     );
-    let (eta, mean, se_opt) = if family == LikelihoodFamily::BinomialMixture {
-        let state = saved_mixture.as_ref().ok_or_else(|| {
-            "saved binomial-blended-inverse-link model is missing blended-link state".to_string()
-        })?;
-        let mut eta = design.design.dot(&beta);
-        eta += &offset;
-        let se = if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
-            let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
-            if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
-                return Err(format!(
-                    "covariance shape mismatch: got {}x{}, expected {}x{}",
-                    cov_mat.nrows(),
-                    cov_mat.ncols(),
-                    beta.len(),
-                    beta.len()
-                ));
-            }
-            Some(linear_predictor_se(design.design.view(), &cov_mat))
-        } else {
-            None
+    let fit_for_predict = fit_result_from_saved_model_for_prediction(&model)?;
+    let (eta, mean, se_opt, mut mean_lo, mut mean_hi) = if args.uncertainty {
+        let options = gam::estimate::PredictUncertaintyOptions {
+            confidence_level: args.level,
+            covariance_mode: infer_covariance_mode(args.covariance_mode),
+            mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
+            include_observation_interval: false,
         };
-        let mean = if args.mode == PredictModeArg::PosteriorMean {
-            let se_ref = se.as_ref().ok_or_else(|| {
-                "internal error: eta SE unavailable for posterior-mean prediction".to_string()
-            })?;
-            let quad_ctx = gam::quadrature::QuadratureContext::new();
-            Array1::from_iter(eta.iter().zip(se_ref.iter()).map(|(&e, &s)| {
-                gam::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, s, |x| {
-                    mixture_inverse_link_jet(state, x).mu
-                })
-            }))
-        } else {
-            eta.mapv(|e| mixture_inverse_link_jet(state, e).mu)
-        };
-        (eta, mean, se)
-    } else if family == LikelihoodFamily::BinomialSas {
-        let epsilon = model.sas_epsilon.unwrap_or(0.0);
-        let log_delta = model.sas_log_delta.unwrap_or(0.0);
-        let mut eta = design.design.dot(&beta);
-        eta += &offset;
-        let se = if args.uncertainty || args.mode == PredictModeArg::PosteriorMean {
-            let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
-            if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
-                return Err(format!(
-                    "covariance shape mismatch: got {}x{}, expected {}x{}",
-                    cov_mat.nrows(),
-                    cov_mat.ncols(),
-                    beta.len(),
-                    beta.len()
-                ));
-            }
-            Some(linear_predictor_se(design.design.view(), &cov_mat))
-        } else {
-            None
-        };
-        let mean = if args.mode == PredictModeArg::PosteriorMean {
-            let se_ref = se.as_ref().ok_or_else(|| {
-                "internal error: eta SE unavailable for posterior-mean prediction".to_string()
-            })?;
-            let quad_ctx = gam::quadrature::QuadratureContext::new();
-            Array1::from_iter(eta.iter().zip(se_ref.iter()).map(|(&e, &s)| {
-                gam::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, s, |x| {
-                    sas_inverse_link_jet(x, epsilon, log_delta).mu
-                })
-            }))
-        } else {
-            eta.mapv(|e| sas_inverse_link_jet(e, epsilon, log_delta).mu)
-        };
-        (eta, mean, se)
+        let pred = predict_gam_with_uncertainty(
+            design.design.view(),
+            beta.view(),
+            offset.view(),
+            family,
+            &fit_for_predict,
+            &options,
+        )
+        .map_err(|e| format!("predict_gam_with_uncertainty failed: {e}"))?;
+        (
+            pred.eta,
+            pred.mean,
+            Some(pred.eta_standard_error),
+            Some(pred.mean_lower),
+            Some(pred.mean_upper),
+        )
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
         let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
-        let pm = predict_gam_posterior_mean(
+        let pm = predict_gam_posterior_mean_with_fit(
             design.design.view(),
             beta.view(),
             offset.view(),
             family,
             cov_mat.view(),
+            &fit_for_predict,
         )
-        .map_err(|e| format!("predict_gam_posterior_mean failed: {e}"))?;
-        (pm.eta, pm.mean, Some(pm.eta_standard_error))
+        .map_err(|e| format!("predict_gam_posterior_mean_with_fit failed: {e}"))?;
+        (pm.eta, pm.mean, Some(pm.eta_standard_error), None, None)
     } else {
         let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
             .map_err(|e| format!("predict_gam failed: {e}"))?;
-        let se = if args.uncertainty {
-            let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
-            if cov_mat.nrows() != beta.len() || cov_mat.ncols() != beta.len() {
-                return Err(format!(
-                    "covariance shape mismatch: got {}x{}, expected {}x{}",
-                    cov_mat.nrows(),
-                    cov_mat.ncols(),
-                    beta.len(),
-                    beta.len()
-                ));
-            }
-            Some(linear_predictor_se(design.design.view(), &cov_mat))
-        } else {
-            None
-        };
-        (pred.eta, pred.mean, se)
+        (pred.eta, pred.mean, None, None, None)
     };
 
     let mut eta_se = None;
-    let mut mean_lo = None;
-    let mut mean_hi = None;
 
-    if args.uncertainty {
+    if args.uncertainty && mean_lo.is_none() {
         if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
             return Err(format!("--level must be in (0,1), got {}", args.level));
         }
@@ -2106,6 +2044,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
             );
         }
+    }
+    if args.uncertainty {
+        eta_se = se_opt.clone();
     }
 
     write_prediction_csv(
@@ -6514,6 +6455,76 @@ fn covariance_from_model(
             .to_string()
     })?;
     nested_vec_to_array2(cov)
+}
+
+fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::InferenceCovarianceMode {
+    match mode {
+        CovarianceModeArg::Conditional => gam::estimate::InferenceCovarianceMode::Conditional,
+        CovarianceModeArg::Corrected => {
+            gam::estimate::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred
+        }
+    }
+}
+
+fn fit_result_from_saved_model_for_prediction(model: &SavedModel) -> Result<FitResult, String> {
+    let p = model.beta.len();
+    let beta_covariance = model
+        .covariance_conditional
+        .as_ref()
+        .map(|v| nested_vec_to_array2(v))
+        .transpose()?;
+    let beta_covariance_corrected = model
+        .covariance_corrected
+        .as_ref()
+        .map(|v| nested_vec_to_array2(v))
+        .transpose()?;
+    let mixture_spec = saved_mixture_link_spec(model)?;
+    let mixture_link_components = mixture_spec.as_ref().map(|s| s.components.clone());
+    let mixture_link_rho = mixture_spec.map(|s| s.initial_rho);
+    let mixture_link_weights = model.mixture_link_weights.clone().map(Array1::from_vec);
+    let mixture_link_param_covariance = model
+        .mixture_link_param_covariance
+        .as_ref()
+        .map(|v| nested_vec_to_array2(v))
+        .transpose()?;
+    let sas_param_covariance = model
+        .sas_param_covariance
+        .as_ref()
+        .map(|v| nested_vec_to_array2(v))
+        .transpose()?;
+    Ok(FitResult {
+        beta: Array1::from_vec(model.beta.clone()),
+        lambdas: Array1::from_vec(model.lambdas.clone()),
+        scale: model.scale,
+        edf_by_block: Vec::new(),
+        edf_total: 0.0,
+        iterations: model.fit_max_iter,
+        final_grad_norm: f64::NAN,
+        pirls_status: gam::pirls::PirlsStatus::Converged,
+        deviance: f64::NAN,
+        stable_penalty_term: 0.0,
+        max_abs_eta: 0.0,
+        constraint_kkt: None,
+        smoothing_correction: None,
+        penalized_hessian: Array2::<f64>::zeros((p, p)),
+        working_weights: Array1::<f64>::zeros(0),
+        working_response: Array1::<f64>::zeros(0),
+        reparam_qs: None,
+        artifacts: gam::estimate::FitArtifacts { pirls: None },
+        beta_covariance,
+        beta_standard_errors: None,
+        beta_covariance_corrected,
+        beta_standard_errors_corrected: None,
+        reml_score: model.reml_score.unwrap_or(f64::NAN),
+        mixture_link_components,
+        mixture_link_rho,
+        mixture_link_weights,
+        mixture_link_param_covariance,
+        sas_epsilon: model.sas_epsilon,
+        sas_log_delta: model.sas_log_delta,
+        sas_delta: model.sas_delta,
+        sas_param_covariance,
+    })
 }
 
 fn survival_posterior_mean_from_eta(
