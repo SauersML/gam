@@ -16,7 +16,7 @@ use crate::mixture_link::{
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
-    LikelihoodFamily, LinkFunction, InverseLink, MixtureLinkSpec, MixtureLinkState, RidgePassport,
+    InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec, MixtureLinkState, RidgePassport,
     RidgePolicy, SasLinkSpec, SasLinkState,
 };
 use dyn_stack::{MemBuffer, MemStack};
@@ -1053,7 +1053,7 @@ struct GamWorkingModel<'a> {
     x_original_csr: Option<SparseRowMat<usize, f64>>,
     qs: Option<Array2<f64>>,
     /// Optional per-observation SE for integrated (GHQ) likelihood.
-    /// When present, uses update_glm_vectors_integrated for uncertainty-aware fitting.
+    /// When present, uses integrated family-dispatched working updates.
     covariate_se: Option<Array1<f64>>,
     quad_ctx: crate::quadrature::QuadratureContext,
 }
@@ -4796,36 +4796,6 @@ pub fn update_glm_vectors_by_family(
 ///   exact non-GHQ representations (Gamma / erfc / asymptotic series), which
 ///   is also relevant to survival transforms of the form exp(-exp(eta)).
 ///
-/// Current status:
-/// this compatibility wrapper still defaults to the integrated logit path so
-/// existing callers keep the same behavior, but the actual family-aware
-/// integrated routing now lives in `update_glm_vectors_integrated_by_family`.
-/// That dispatcher is the canonical insertion point for exact or controlled
-/// link-specific replacements that eliminate quadrature from the PIRLS hot loop.
-pub fn update_glm_vectors_integrated(
-    quad_ctx: &crate::quadrature::QuadratureContext,
-    y: ArrayView1<f64>,
-    eta: &Array1<f64>,
-    se: ArrayView1<f64>,
-    prior_weights: ArrayView1<f64>,
-    mu: &mut Array1<f64>,
-    weights: &mut Array1<f64>,
-    z: &mut Array1<f64>,
-) -> Result<(), EstimationError> {
-    update_glm_vectors_integrated_by_family(
-        quad_ctx,
-        y,
-        eta,
-        se,
-        LikelihoodFamily::BinomialLogit,
-        prior_weights,
-        mu,
-        weights,
-        z,
-        None,
-    )
-}
-
 pub(crate) fn update_glm_vectors_integrated_for_link(
     quad_ctx: &crate::quadrature::QuadratureContext,
     y: ArrayView1<f64>,
@@ -4982,11 +4952,11 @@ fn compute_working_weight_derivatives_from_eta(
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<
     (
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
+        Array1<f64>,
+        Array1<f64>,
+        Array1<f64>,
+        Array1<f64>,
+        Array1<f64>,
     ),
     EstimationError,
 > {
@@ -5046,12 +5016,13 @@ pub enum DirectionalWorkingCurvature {
 /// The callback implements the operator action
 ///   W_τ = T[eta_direction]
 /// for a specific likelihood/link family.
-pub type DirectionalWorkingCurvatureCallback = fn(
-    eta: &Array1<f64>,
-    prior_weights: ArrayView1<'_, f64>,
-    solve_weights: &Array1<f64>,
-    eta_direction: &Array1<f64>,
-) -> Result<DirectionalWorkingCurvature, EstimationError>;
+pub type DirectionalWorkingCurvatureCallback =
+    fn(
+        eta: &Array1<f64>,
+        prior_weights: ArrayView1<'_, f64>,
+        solve_weights: &Array1<f64>,
+        eta_direction: &Array1<f64>,
+    ) -> Result<DirectionalWorkingCurvature, EstimationError>;
 
 fn directional_working_curvature_diagonal_builtin(
     link: LinkFunction,
@@ -5692,7 +5663,7 @@ mod tests {
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
-    use crate::types::{Coefficients, LinkFunction, InverseLink, LogSmoothingParamsView};
+    use crate::types::{Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView};
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
@@ -5828,7 +5799,8 @@ mod tests {
     fn default_beta_guess_logit_uses_log_odds_prevalence() {
         let y = array![0.0, 1.0, 1.0, 1.0];
         let w = Array1::ones(4);
-        let beta = default_beta_guess_external(3, LinkFunction::Logit, y.view(), w.view(), None, None);
+        let beta =
+            default_beta_guess_external(3, LinkFunction::Logit, y.view(), w.view(), None, None);
         let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
         let prevalence = prevalence.max(1e-6_f64).min(1.0_f64 - 1e-6_f64);
         let expected = (prevalence / (1.0 - prevalence)).ln();

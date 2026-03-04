@@ -3,7 +3,7 @@ use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_fr
 use gam::types::{LikelihoodFamily, LinkComponent, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 fn build_tiny_design(n: usize) -> Array2<f64> {
     let mut x = Array2::<f64>::zeros((n, 3));
