@@ -1,6 +1,7 @@
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::{
-    LikelihoodFamily, LinkComponent, MixtureLinkSpec, MixtureLinkState, SasLinkSpec, SasLinkState,
+    LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState, SasLinkSpec,
+    SasLinkState,
 };
 use ndarray::Array1;
 
@@ -241,6 +242,34 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
 /// Central family-aware inverse-link jet dispatch.
 ///
 /// For `BinomialSas` and `BinomialMixture`, required state must be provided.
+pub fn inverse_link_jet_for_link_function(
+    link: LinkFunction,
+    eta: f64,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
+) -> Result<InverseLinkJet, String> {
+    if let Some(state) = mixture_link_state {
+        return Ok(mixture_inverse_link_jet(state, eta));
+    }
+    if let Some(sas) = sas_link_state {
+        return Ok(sas_inverse_link_jet(eta, sas.epsilon, sas.log_delta));
+    }
+    match link {
+        LinkFunction::Logit => Ok(component_inverse_link_jet(LinkComponent::Logit, eta)),
+        LinkFunction::Probit => Ok(component_inverse_link_jet(LinkComponent::Probit, eta)),
+        LinkFunction::CLogLog => Ok(component_inverse_link_jet(LinkComponent::CLogLog, eta)),
+        LinkFunction::Identity => Ok(InverseLinkJet {
+            mu: eta,
+            d1: 1.0,
+            d2: 0.0,
+            d3: 0.0,
+        }),
+        LinkFunction::Sas => {
+            Err("LinkFunction::Sas inverse-link requires explicit SAS link state".to_string())
+        }
+    }
+}
+
 pub fn inverse_link_jet_for_family(
     family: LikelihoodFamily,
     eta: f64,
@@ -248,29 +277,49 @@ pub fn inverse_link_jet_for_family(
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<InverseLinkJet, String> {
     match family {
-        LikelihoodFamily::GaussianIdentity => Ok(InverseLinkJet {
-            mu: eta,
-            d1: 1.0,
-            d2: 0.0,
-            d3: 0.0,
-        }),
-        LikelihoodFamily::BinomialLogit => Ok(component_inverse_link_jet(LinkComponent::Logit, eta)),
-        LikelihoodFamily::BinomialProbit => {
-            Ok(component_inverse_link_jet(LinkComponent::Probit, eta))
-        }
-        LikelihoodFamily::BinomialCLogLog => {
-            Ok(component_inverse_link_jet(LinkComponent::CLogLog, eta))
-        }
+        LikelihoodFamily::GaussianIdentity => inverse_link_jet_for_link_function(
+            LinkFunction::Identity,
+            eta,
+            mixture_link_state,
+            sas_link_state,
+        ),
+        LikelihoodFamily::BinomialLogit => inverse_link_jet_for_link_function(
+            LinkFunction::Logit,
+            eta,
+            mixture_link_state,
+            sas_link_state,
+        ),
+        LikelihoodFamily::BinomialProbit => inverse_link_jet_for_link_function(
+            LinkFunction::Probit,
+            eta,
+            mixture_link_state,
+            sas_link_state,
+        ),
+        LikelihoodFamily::BinomialCLogLog => inverse_link_jet_for_link_function(
+            LinkFunction::CLogLog,
+            eta,
+            mixture_link_state,
+            sas_link_state,
+        ),
         LikelihoodFamily::BinomialSas => {
-            let sas = sas_link_state
-                .ok_or_else(|| "BinomialSas inverse-link requires SAS link state".to_string())?;
-            Ok(sas_inverse_link_jet(eta, sas.epsilon, sas.log_delta))
+            inverse_link_jet_for_link_function(
+                LinkFunction::Sas,
+                eta,
+                mixture_link_state,
+                sas_link_state,
+            )
+            .map_err(|_| "BinomialSas inverse-link requires SAS link state".to_string())
         }
         LikelihoodFamily::BinomialMixture => {
             let state = mixture_link_state.ok_or_else(|| {
                 "BinomialMixture inverse-link requires mixture link state".to_string()
             })?;
-            Ok(mixture_inverse_link_jet(state, eta))
+            inverse_link_jet_for_link_function(
+                LinkFunction::Logit,
+                eta,
+                Some(state),
+                sas_link_state,
+            )
         }
         LikelihoodFamily::RoystonParmar => Err(
             "RoystonParmar inverse-link jet is not defined in mixture-link dispatcher".to_string(),
