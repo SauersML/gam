@@ -3489,4 +3489,17 @@ mod tests {
             assert_relative_eq!(batch_dmu[i], direct.dmean_dmu, epsilon = 1e-12);
         }
     }
+
+    #[test]
+    fn integrated_family_moments_rejects_state_less_sas_and_mixture() {
+        let ctx = QuadratureContext::new();
+        let sas = integrated_family_moments_jet(&ctx, LikelihoodFamily::BinomialSas, 0.2, 0.5)
+            .expect_err("state-less SAS moments should error");
+        assert!(format!("{sas}").contains("requires SAS link parameters"));
+
+        let mix =
+            integrated_family_moments_jet(&ctx, LikelihoodFamily::BinomialMixture, 0.2, 0.5)
+                .expect_err("state-less mixture moments should error");
+        assert!(format!("{mix}").contains("does not support binomial mixture"));
+    }
 }

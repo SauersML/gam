@@ -700,4 +700,21 @@ mod tests {
         assert!((j0.d2 - d2_fd).abs() < 2e-4);
         assert!((j0.d3 - d3_fd).abs() < 1e-3);
     }
+
+    #[test]
+    fn family_dispatch_requires_state_for_sas_and_mixture() {
+        let sas_err =
+            inverse_link_jet_for_family(crate::types::LikelihoodFamily::BinomialSas, 0.1, None, None)
+                .expect_err("SAS without state should error");
+        assert!(sas_err.contains("requires SAS link state"));
+
+        let mix_err = inverse_link_jet_for_family(
+            crate::types::LikelihoodFamily::BinomialMixture,
+            0.1,
+            None,
+            None,
+        )
+        .expect_err("mixture without state should error");
+        assert!(mix_err.contains("requires mixture link state"));
+    }
 }
