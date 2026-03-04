@@ -343,6 +343,98 @@ where
     })
 }
 
+/// Nonlinear posterior-mean prediction with link-state support for SAS/mixture families.
+///
+/// This mirrors `predict_gam_posterior_mean`, but also uses `fit` metadata for
+/// link families that require extra state (`BinomialSas`, `BinomialMixture`).
+pub fn predict_gam_posterior_mean_with_fit<X>(
+    x: X,
+    beta: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    family: crate::types::LikelihoodFamily,
+    covariance: ArrayView2<'_, f64>,
+    fit: &FitResult,
+) -> Result<PredictPosteriorMeanResult, EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    let x = x.into();
+    if x.ncols() != beta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "predict_gam_posterior_mean_with_fit dimension mismatch: X has {} columns but beta has length {}",
+            x.ncols(),
+            beta.len()
+        )));
+    }
+    if x.nrows() != offset.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "predict_gam_posterior_mean_with_fit dimension mismatch: X has {} rows but offset has length {}",
+            x.nrows(),
+            offset.len()
+        )));
+    }
+    if covariance.nrows() != beta.len() || covariance.ncols() != beta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "predict_gam_posterior_mean_with_fit covariance dimension mismatch: expected {}x{}, got {}x{}",
+            beta.len(),
+            beta.len(),
+            covariance.nrows(),
+            covariance.ncols()
+        )));
+    }
+    if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
+        return Err(EstimationError::InvalidInput(
+            "predict_gam_posterior_mean_with_fit does not support RoystonParmar; use survival prediction APIs"
+                .to_string(),
+        ));
+    }
+
+    let mut eta = x.matrix_vector_multiply(&beta.to_owned());
+    eta += &offset;
+    let eta_var = linear_predictor_variance(&x, &covariance.to_owned());
+    let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
+    let quad_ctx = crate::quadrature::QuadratureContext::new();
+
+    let mean = match family {
+        crate::types::LikelihoodFamily::BinomialSas => {
+            let (epsilon, log_delta) = fit.sas_epsilon.zip(fit.sas_log_delta).ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "predict_gam_posterior_mean_with_fit for BinomialSas requires fitted sas_epsilon/sas_log_delta"
+                        .to_string(),
+                )
+            })?;
+            Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
+                crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, se, |x| {
+                    sas_inverse_link_jet(x, epsilon, log_delta).mu
+                })
+            }))
+        }
+        crate::types::LikelihoodFamily::BinomialMixture => {
+            let state = fit_mixture_link_state(fit)?.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "predict_gam_posterior_mean_with_fit for BinomialMixture requires fitted mixture_link_components/mixture_link_rho"
+                        .to_string(),
+                )
+            })?;
+            Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
+                crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, se, |x| {
+                    mixture_inverse_link_jet(&state, x).mu
+                })
+            }))
+        }
+        _ => {
+            // Reuse existing integrated-dispatch implementation for standard links.
+            return predict_gam_posterior_mean(x, beta, offset, family, covariance);
+        }
+    };
+
+    Ok(PredictPosteriorMeanResult {
+        eta,
+        eta_standard_error,
+        mean,
+    })
+}
+
 /// Prediction with coefficient uncertainty propagation.
 ///
 /// The linear predictor variance uses:
