@@ -4759,7 +4759,7 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
-) {
+) -> Result<(), EstimationError> {
     let family = match link {
         LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
         LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
@@ -4778,10 +4778,10 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
                 None,
                 derivatives,
             );
-            return;
+            return Ok(());
         }
     };
-    let _ = update_glm_vectors_integrated_by_family(
+    update_glm_vectors_integrated_by_family(
         quad_ctx,
         y,
         eta,
@@ -4792,7 +4792,7 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
         weights,
         z,
         derivatives,
-    );
+    )
 }
 
 /// Family-dispatched integrated GLM vector update helper.
@@ -5862,7 +5862,8 @@ mod tests {
                 d2mu_deta2: &mut d2,
                 d3mu_deta3: &mut d3,
             }),
-        );
+        )
+        .expect("integrated link update");
 
         let jet = crate::quadrature::integrated_inverse_link_jet(
             &ctx,

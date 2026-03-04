@@ -1008,11 +1008,8 @@ impl<'a> JointModelState<'a> {
 
         if let Some(se) = &self.covariate_se {
             match self.link {
-                LinkFunction::Logit
-                | LinkFunction::Probit
-                | LinkFunction::CLogLog
-                | LinkFunction::Sas => {
-                    crate::pirls::update_glm_vectors_integrated_for_link(
+                LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+                    if let Err(e) = crate::pirls::update_glm_vectors_integrated_for_link(
                         &self.quad_ctx,
                         self.y,
                         eta,
@@ -1023,7 +1020,25 @@ impl<'a> JointModelState<'a> {
                         &mut weights_updated,
                         &mut z_updated,
                         None,
-                    );
+                    ) {
+                        log::warn!(
+                            "joint integrated update failed for {:?}; falling back to non-integrated update: {}",
+                            self.link,
+                            e
+                        );
+                        crate::pirls::update_glm_vectors(
+                            self.y,
+                            eta,
+                            self.link,
+                            self.weights,
+                            &mut mu_updated,
+                            &mut weights_updated,
+                            &mut z_updated,
+                            None,
+                            None,
+                            None,
+                        );
+                    }
                 }
                 _ => crate::pirls::update_glm_vectors(
                     self.y,

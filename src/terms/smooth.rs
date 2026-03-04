@@ -3084,9 +3084,11 @@ fn fit_bounded_term_collection_for_spec(
             mixture_link_components: None,
             mixture_link_rho: None,
             mixture_link_weights: None,
+            mixture_link_param_covariance: None,
             sas_epsilon: None,
             sas_log_delta: None,
             sas_delta: None,
+            sas_param_covariance: None,
         },
         design,
     })
