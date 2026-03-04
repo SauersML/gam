@@ -16,14 +16,13 @@ use crate::custom_family::{
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitOptions, FitResult,
     compute_external_joint_hyper_cost_gradient, compute_external_joint_hyper_cost_gradient_hessian,
-    fit_gam_with_heuristic_lambdas,
-    reml::DirectionalHyperParam,
+    fit_gam_with_heuristic_lambdas, reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
 use crate::matrix::DesignMatrix;
+use crate::mixture_link::{inverse_link_jet_for_family, state_from_sas_spec, state_from_spec};
 use crate::pirls::LinearInequalityConstraints;
-use crate::probability::{normal_cdf_approx, normal_pdf};
-use crate::types::LikelihoodFamily;
+use crate::types::{LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -2251,6 +2250,10 @@ fn fit_term_collection_for_spec_with_heuristic_lambdas(
         heuristic_lambdas,
         family,
         &FitOptions {
+            mixture_link: options.mixture_link.clone(),
+            optimize_mixture: options.optimize_mixture,
+            sas_link: options.sas_link,
+            optimize_sas: options.optimize_sas,
             max_iter: options.max_iter,
             tol: options.tol,
             nullspace_dims: design.nullspace_dims.clone(),
@@ -2281,6 +2284,8 @@ struct BoundedLinearTermMeta {
 #[derive(Clone)]
 struct BoundedLinearFamily {
     family: LikelihoodFamily,
+    mixture_link_state: Option<MixtureLinkState>,
+    sas_link_state: Option<SasLinkState>,
     y: Array1<f64>,
     weights: Array1<f64>,
     design: Array2<f64>,
@@ -2353,6 +2358,8 @@ fn bounded_prior_terms(theta: f64, prior: &BoundedCoefficientPriorSpec) -> (f64,
 
 fn evaluate_standard_family_observations(
     family: LikelihoodFamily,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
     y: &Array1<f64>,
     weights: &Array1<f64>,
     eta: &Array1<f64>,
@@ -2387,47 +2394,17 @@ fn evaluate_standard_family_observations(
             }
             LikelihoodFamily::BinomialLogit
             | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog => {
-                let (mu_i_raw, dmu_deta_raw) = match family {
-                    LikelihoodFamily::BinomialLogit => {
-                        let mu_i = stable_sigmoid(eta_i);
-                        (mu_i, mu_i * (1.0 - mu_i))
-                    }
-                    LikelihoodFamily::BinomialProbit => {
-                        let mu_i = normal_cdf_approx(eta_i);
-                        (mu_i, normal_pdf(eta_i))
-                    }
-                    LikelihoodFamily::BinomialCLogLog => {
-                        let eta_c = eta_i.clamp(-30.0, 30.0);
-                        let exp_eta = eta_c.exp();
-                        let mu_i = 1.0 - (-exp_eta).exp();
-                        let dmu = (eta_c - exp_eta).exp();
-                        (mu_i, dmu)
-                    }
-                    _ => unreachable!(),
-                };
+            | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialMixture => {
+                let jet =
+                    inverse_link_jet_for_family(family, eta_i, mixture_link_state, sas_link_state)?;
+                let mu_i_raw = jet.mu;
+                let dmu_deta_raw = jet.d1;
                 let mu_i = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);
                 let dmu_deta = dmu_deta_raw.max(MU_DERIV_EPS);
-                let (d2mu_deta2, d3mu_deta3) = match family {
-                    LikelihoodFamily::BinomialLogit => {
-                        let d2 = dmu_deta * (1.0 - 2.0 * mu_i);
-                        let d3 = dmu_deta * (1.0 - 6.0 * mu_i + 6.0 * mu_i * mu_i);
-                        (d2, d3)
-                    }
-                    LikelihoodFamily::BinomialProbit => {
-                        let d2 = -eta_i * dmu_deta;
-                        let d3 = (eta_i * eta_i - 1.0) * dmu_deta;
-                        (d2, d3)
-                    }
-                    LikelihoodFamily::BinomialCLogLog => {
-                        let eta_c = eta_i.clamp(-30.0, 30.0);
-                        let t = eta_c.exp();
-                        let d2 = dmu_deta * (1.0 - t);
-                        let d3 = dmu_deta * (1.0 - 3.0 * t + t * t);
-                        (d2, d3)
-                    }
-                    _ => unreachable!(),
-                };
+                let d2mu_deta2 = jet.d2;
+                let d3mu_deta3 = jet.d3;
                 let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);
                 let l_mu = (yi - mu_i) / var;
                 let l_mumu = -(yi / (mu_i * mu_i)) - ((1.0 - yi) / ((1.0 - mu_i) * (1.0 - mu_i)));
@@ -2538,7 +2515,14 @@ impl BoundedLinearFamily {
         let x_eff = self.effective_design_for_latent(&jac_diag);
         let eta =
             self.design_zeroed.dot(latent_beta) + self.nonlinear_offset_from_latent(latent_beta);
-        let obs = evaluate_standard_family_observations(self.family, &self.y, &self.weights, &eta)?;
+        let obs = evaluate_standard_family_observations(
+            self.family,
+            self.mixture_link_state.as_ref(),
+            self.sas_link_state.as_ref(),
+            &self.y,
+            &self.weights,
+            &eta,
+        )?;
 
         let mut prior_grad = Array1::<f64>::zeros(latent_beta.len());
         let mut prior_neg_hess = Array2::<f64>::zeros((latent_beta.len(), latent_beta.len()));
@@ -2901,6 +2885,18 @@ fn fit_bounded_term_collection_for_spec(
 
     let family_adapter = BoundedLinearFamily {
         family,
+        mixture_link_state: options
+            .mixture_link
+            .clone()
+            .as_ref()
+            .map(state_from_spec)
+            .transpose()
+            .map_err(EstimationError::InvalidInput)?,
+        sas_link_state: options
+            .sas_link
+            .map(state_from_sas_spec)
+            .transpose()
+            .map_err(EstimationError::InvalidInput)?,
         y: y.to_owned(),
         weights: weights.to_owned(),
         design: fit_design.clone(),
@@ -3018,6 +3014,14 @@ fn fit_bounded_term_collection_for_spec(
             beta_covariance_corrected: None,
             beta_standard_errors_corrected: None,
             reml_score: fit.penalized_objective,
+            mixture_link_components: None,
+            mixture_link_rho: None,
+            mixture_link_weights: None,
+            mixture_link_param_covariance: None,
+            sas_epsilon: None,
+            sas_log_delta: None,
+            sas_delta: None,
+            sas_param_covariance: None,
         },
         design,
     })
@@ -3271,6 +3275,10 @@ fn external_opts_for_design(
 ) -> ExternalOptimOptions {
     ExternalOptimOptions {
         family,
+        mixture_link: options.mixture_link.clone(),
+        optimize_mixture: options.optimize_mixture,
+        sas_link: options.sas_link,
+        optimize_sas: options.optimize_sas,
         max_iter: options.max_iter,
         tol: options.tol,
         nullspace_dims: design.nullspace_dims.clone(),
@@ -5346,6 +5354,10 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![],
@@ -5581,6 +5593,10 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![],
@@ -5679,6 +5695,10 @@ mod tests {
             }],
         };
         let fit_opts = FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![],
@@ -5838,6 +5858,10 @@ mod tests {
             &spec,
             LikelihoodFamily::GaussianIdentity,
             &FitOptions {
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: None,
+                optimize_sas: false,
                 max_iter: 40,
                 tol: 1e-6,
                 nullspace_dims: vec![],
@@ -5933,6 +5957,8 @@ mod tests {
         let weights = Array1::ones(y.len());
         let family = BoundedLinearFamily {
             family: LikelihoodFamily::GaussianIdentity,
+            mixture_link_state: None,
+            sas_link_state: None,
             y: y.clone(),
             weights: weights.clone(),
             design: x.clone(),

@@ -10,7 +10,7 @@ pub mod types;
 
 pub use inference::{alo, diagnostics, generative, hmc, predict, probability, quadrature};
 pub use linalg::{faer_ndarray, matrix, utils};
-pub use solver::{estimate, joint, pirls, seeding, smoothing, visualizer};
+pub use solver::{estimate, joint, mixture_link, pirls, seeding, smoothing, visualizer};
 pub use terms::{basis, construction, hull, layout, smooth};
 
 pub use families::custom_family;
@@ -57,7 +57,7 @@ pub use solver::estimate::{
     MeanIntervalMethod, PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions,
     PredictUncertaintyResult, coefficient_uncertainty, coefficient_uncertainty_with_mode, fit_gam,
     optimize_external_design, predict_gam, predict_gam_posterior_mean,
-    predict_gam_with_uncertainty,
+    predict_gam_posterior_mean_with_fit, predict_gam_with_uncertainty,
 };
 pub use terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,

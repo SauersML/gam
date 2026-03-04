@@ -62,6 +62,7 @@ fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<Likelihood
         LinkFunction::Logit => Some(LikelihoodFamily::BinomialLogit),
         LinkFunction::Probit => Some(LikelihoodFamily::BinomialProbit),
         LinkFunction::CLogLog => Some(LikelihoodFamily::BinomialCLogLog),
+        LinkFunction::Sas => Some(LikelihoodFamily::BinomialSas),
         LinkFunction::Identity => None,
     }
 }
@@ -158,7 +159,7 @@ pub struct JointModelState<'a> {
     /// Number of constrained basis functions
     n_constrained_basis: usize,
     /// Optional per-observation SE for integrated (GHQ) likelihood.
-    /// When present, uses update_glm_vectors_integrated for uncertainty-aware fitting.
+    /// When present, uses integrated family-dispatched working updates.
     covariate_se: Option<Array1<f64>>,
     quad_ctx: QuadratureContext,
     /// Enable Firth bias reduction for separation protection
@@ -638,7 +639,7 @@ impl<'a> JointModelState<'a> {
         let mut z_glm = Array1::<f64>::zeros(n);
         if let Some(se) = &self.covariate_se {
             if let Some(family) = integrated_binomial_family_from_link(self.link) {
-                let _ = crate::pirls::update_glm_vectors_integrated_by_family(
+                if let Err(e) = crate::pirls::update_glm_vectors_integrated_by_family(
                     &self.quad_ctx,
                     self.y,
                     &eta,
@@ -649,9 +650,11 @@ impl<'a> JointModelState<'a> {
                     &mut weights,
                     &mut z_glm,
                     None,
-                );
+                ) {
+                    log::warn!("joint integrated working-vector update failed: {}", e);
+                }
             } else {
-                crate::pirls::update_glm_vectors(
+                if let Err(e) = crate::pirls::update_glm_vectors(
                     self.y,
                     &eta,
                     self.link.clone(),
@@ -660,10 +663,14 @@ impl<'a> JointModelState<'a> {
                     &mut weights,
                     &mut z_glm,
                     None,
-                );
+                    None,
+                    None,
+                ) {
+                    log::warn!("joint working-vector update failed: {}", e);
+                }
             }
         } else {
-            crate::pirls::update_glm_vectors(
+            if let Err(e) = crate::pirls::update_glm_vectors(
                 self.y,
                 &eta,
                 self.link.clone(),
@@ -672,7 +679,11 @@ impl<'a> JointModelState<'a> {
                 &mut weights,
                 &mut z_glm,
                 None,
-            );
+                None,
+                None,
+            ) {
+                log::warn!("joint working-vector update failed: {}", e);
+            }
         }
         (eta, mu, weights, z_glm)
     }
@@ -1004,7 +1015,7 @@ impl<'a> JointModelState<'a> {
         if let Some(se) = &self.covariate_se {
             match self.link {
                 LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
-                    crate::pirls::update_glm_vectors_integrated_for_link(
+                    if let Err(e) = crate::pirls::update_glm_vectors_integrated_for_link(
                         &self.quad_ctx,
                         self.y,
                         eta,
@@ -1015,21 +1026,47 @@ impl<'a> JointModelState<'a> {
                         &mut weights_updated,
                         &mut z_updated,
                         None,
-                    );
+                    ) {
+                        log::warn!(
+                            "joint integrated update failed for {:?}; falling back to non-integrated update: {}",
+                            self.link,
+                            e
+                        );
+                        if let Err(e2) = crate::pirls::update_glm_vectors(
+                            self.y,
+                            eta,
+                            self.link,
+                            self.weights,
+                            &mut mu_updated,
+                            &mut weights_updated,
+                            &mut z_updated,
+                            None,
+                            None,
+                            None,
+                        ) {
+                            log::warn!("joint non-integrated fallback update failed: {}", e2);
+                        }
+                    }
                 }
-                _ => crate::pirls::update_glm_vectors(
-                    self.y,
-                    eta,
-                    self.link.clone(),
-                    self.weights,
-                    &mut mu_updated,
-                    &mut weights_updated,
-                    &mut z_updated,
-                    None,
-                ),
+                _ => {
+                    if let Err(e) = crate::pirls::update_glm_vectors(
+                        self.y,
+                        eta,
+                        self.link.clone(),
+                        self.weights,
+                        &mut mu_updated,
+                        &mut weights_updated,
+                        &mut z_updated,
+                        None,
+                        None,
+                        None,
+                    ) {
+                        log::warn!("joint working-vector update failed: {}", e);
+                    }
+                }
             }
         } else {
-            crate::pirls::update_glm_vectors(
+            if let Err(e) = crate::pirls::update_glm_vectors(
                 self.y,
                 eta,
                 self.link.clone(),
@@ -1038,7 +1075,11 @@ impl<'a> JointModelState<'a> {
                 &mut weights_updated,
                 &mut z_updated,
                 None,
-            );
+                None,
+                None,
+            ) {
+                log::warn!("joint working-vector update failed: {}", e);
+            }
         }
         self.compute_deviance(&mu_updated)
     }
@@ -1448,13 +1489,17 @@ impl<'a> JointRemlState<'a> {
                     residual[i] = weights[i] * (mu[i] - state.y[i]);
                 }
             }
-            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+            LinkFunction::Logit
+            | LinkFunction::Probit
+            | LinkFunction::CLogLog
+            | LinkFunction::Sas => {
                 const MIN_WEIGHT: f64 = 1e-12;
                 const MIN_DMU: f64 = 1e-6;
                 let family = match state.link {
                     LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
                     LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
                     LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+                    LinkFunction::Sas => LikelihoodFamily::BinomialSas,
                     LinkFunction::Identity => unreachable!("identity handled above"),
                 };
                 for i in 0..n {
@@ -1638,7 +1683,10 @@ impl<'a> JointRemlState<'a> {
         }
 
         let laml = match state.link {
-            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+            LinkFunction::Logit
+            | LinkFunction::Probit
+            | LinkFunction::CLogLog
+            | LinkFunction::Sas => {
                 let penalised_ll = -0.5 * deviance - 0.5 * penalty_term;
                 let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_a
                     + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
@@ -1932,13 +1980,17 @@ impl<'a> JointRemlState<'a> {
                     residual[i] = weights[i] * (mu[i] - state.y[i]);
                 }
             }
-            LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+            LinkFunction::Logit
+            | LinkFunction::Probit
+            | LinkFunction::CLogLog
+            | LinkFunction::Sas => {
                 const MIN_WEIGHT: f64 = 1e-12;
                 const MIN_DMU: f64 = 1e-6;
                 let family = match state.link {
                     LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
                     LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
                     LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
+                    LinkFunction::Sas => LikelihoodFamily::BinomialSas,
                     LinkFunction::Identity => unreachable!("identity handled above"),
                 };
                 for i in 0..n {
@@ -2792,7 +2844,7 @@ impl<'a> JointRemlState<'a> {
         let mut mu = Array1::<f64>::zeros(state.n_obs());
         let mut weights = Array1::<f64>::zeros(state.n_obs());
         let mut z = Array1::<f64>::zeros(state.n_obs());
-        crate::pirls::update_glm_vectors(
+        if let Err(e) = crate::pirls::update_glm_vectors(
             state.y,
             &eta,
             state.link.clone(),
@@ -2801,7 +2853,11 @@ impl<'a> JointRemlState<'a> {
             &mut weights,
             &mut z,
             None,
-        );
+            None,
+            None,
+        ) {
+            log::warn!("joint final working-vector update failed: {}", e);
+        }
         let deviance = state.compute_deviance(&mu);
         JointModelResult {
             beta_base: state.beta_base,

@@ -1,4 +1,5 @@
-use crate::types::LikelihoodFamily;
+use crate::mixture_link::inverse_link_jet_for_family;
+use crate::types::{InverseLink, LikelihoodFamily};
 use ndarray::{Array1, ArrayView1};
 
 /// Standard normal PDF φ(x).
@@ -79,18 +80,70 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
 
 /// Inverse-link transform per likelihood family.
 #[inline]
-pub fn inverse_link_array(family: LikelihoodFamily, eta: ArrayView1<'_, f64>) -> Array1<f64> {
-    match family {
-        LikelihoodFamily::GaussianIdentity => eta.to_owned(),
-        LikelihoodFamily::BinomialLogit => eta.mapv(|v| {
-            let z = v.clamp(-30.0, 30.0);
-            1.0 / (1.0 + (-z).exp())
-        }),
-        LikelihoodFamily::BinomialProbit => eta.mapv(normal_cdf_approx),
-        LikelihoodFamily::BinomialCLogLog => eta.mapv(|v| {
-            let z = v.clamp(-30.0, 30.0);
-            1.0 - (-(z.exp())).exp()
-        }),
-        LikelihoodFamily::RoystonParmar => eta.to_owned(),
+pub fn try_inverse_link_array(
+    family: LikelihoodFamily,
+    eta: ArrayView1<'_, f64>,
+    link_kind: Option<&InverseLink>,
+) -> Result<Array1<f64>, String> {
+    if matches!(family, LikelihoodFamily::RoystonParmar) {
+        return Ok(eta.to_owned());
+    }
+    let mixture_state = link_kind.and_then(|k| k.mixture_state());
+    let sas_state = link_kind.and_then(|k| k.sas_state());
+    let mut out = Array1::<f64>::zeros(eta.len());
+    for i in 0..eta.len() {
+        out[i] = inverse_link_jet_for_family(family, eta[i], mixture_state, sas_state)?.mu;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mixture_link::state_from_spec;
+    use crate::types::{LinkComponent, MixtureLinkSpec};
+    use ndarray::array;
+
+    #[test]
+    fn sas_and_mixture_require_explicit_state() {
+        let eta = array![0.1, -0.2, 0.3];
+        let sas_err = try_inverse_link_array(LikelihoodFamily::BinomialSas, eta.view(), None)
+            .expect_err("SAS without params should error");
+        assert!(sas_err.contains("requires SAS link state"));
+
+        let mix_err = try_inverse_link_array(LikelihoodFamily::BinomialMixture, eta.view(), None)
+            .expect_err("mixture without state should error");
+        assert!(mix_err.contains("requires mixture link state"));
+    }
+
+    #[test]
+    fn sas_and_mixture_stateful_inverse_link_evaluates() {
+        let eta = array![0.1, -0.2, 0.3];
+        let sas = try_inverse_link_array(
+            LikelihoodFamily::BinomialSas,
+            eta.view(),
+            Some(&InverseLink::Sas(crate::types::SasLinkState {
+                epsilon: 0.2,
+                log_delta: -0.1,
+                delta: (-0.1f64).exp(),
+            })),
+        )
+        .expect("SAS with params");
+        assert_eq!(sas.len(), eta.len());
+        assert!(sas.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
+
+        let spec = MixtureLinkSpec {
+            components: vec![LinkComponent::Probit, LinkComponent::CLogLog],
+            initial_rho: array![0.3],
+        };
+        let state = state_from_spec(&spec).expect("mixture state");
+        let mix = try_inverse_link_array(
+            LikelihoodFamily::BinomialMixture,
+            eta.view(),
+            Some(&InverseLink::Mixture(state.clone())),
+        )
+        .expect("mixture with state");
+        assert_eq!(mix.len(), eta.len());
+        assert!(mix.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
     }
 }

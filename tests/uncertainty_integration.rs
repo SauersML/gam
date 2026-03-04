@@ -1,3 +1,5 @@
+use gam::probability::try_inverse_link_array;
+use gam::types::LinkComponent;
 use gam::{
     FitOptions, InferenceCovarianceMode, LikelihoodFamily, MeanIntervalMethod,
     PredictUncertaintyOptions, coefficient_uncertainty, fit_gam, predict_gam_posterior_mean,
@@ -32,6 +34,10 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
         &[s],
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -97,6 +103,10 @@ fn prediction_uncertainty_is_finite_and_well_shaped() {
         &[s],
         LikelihoodFamily::BinomialLogit,
         &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 50,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -167,6 +177,10 @@ fn gaussian_prediction_intervals_include_observation_noise() {
         &[s],
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -227,6 +241,10 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
         &[s],
         LikelihoodFamily::BinomialLogit,
         &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -256,4 +274,86 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
     let map_lo = 1.0 / (1.0 + (-eta_lo).exp());
     let pm_lo = pred.mean[0];
     assert!(pm_lo > map_lo);
+}
+
+#[test]
+fn stateful_inverse_link_requires_state_for_sas_and_mixture() {
+    let eta = Array1::from_vec(vec![-0.7, 0.0, 1.2]);
+    let sas_err = try_inverse_link_array(LikelihoodFamily::BinomialSas, eta.view(), None)
+        .expect_err("SAS inverse-link should require explicit sas_params");
+    assert!(sas_err.contains("requires SAS link state"));
+
+    let mix_err = try_inverse_link_array(LikelihoodFamily::BinomialMixture, eta.view(), None)
+        .expect_err("Mixture inverse-link should require explicit mixture_state");
+    assert!(mix_err.contains("requires mixture link state"));
+}
+
+#[test]
+fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
+    let n = 100usize;
+    let mut x = Array2::<f64>::zeros((n, 2));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let t = -3.0 + 6.0 * (i as f64) / (n as f64 - 1.0);
+        x[[i, 0]] = 1.0;
+        x[[i, 1]] = t;
+        let p = 1.0 / (1.0 + (0.3 - 0.9 * t).exp());
+        y[i] = p.clamp(0.02, 0.98);
+    }
+
+    let weights = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let mut s = Array2::<f64>::zeros((2, 2));
+    s[[1, 1]] = 1e-2;
+
+    let fit_base = fit_gam(
+        x.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &[s],
+        LikelihoodFamily::BinomialLogit,
+        &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            max_iter: 80,
+            tol: 1e-6,
+            nullspace_dims: vec![1],
+            linear_constraints: None,
+        },
+    )
+    .expect("base fit should succeed");
+
+    let mut fit = fit_base.clone();
+    fit.mixture_link_components = Some(vec![
+        LinkComponent::Probit,
+        LinkComponent::Logit,
+        LinkComponent::CLogLog,
+    ]);
+    fit.mixture_link_rho = Some(Array1::from_vec(vec![0.4, -0.2]));
+    fit.mixture_link_weights = None;
+
+    let pred = predict_gam_with_uncertainty(
+        x.view(),
+        fit.beta.view(),
+        offset.view(),
+        LikelihoodFamily::BinomialMixture,
+        &fit,
+        &PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+            mean_interval_method: MeanIntervalMethod::Delta,
+            include_observation_interval: false,
+        },
+    )
+    .expect("mixture uncertainty prediction should succeed");
+
+    assert!(
+        pred.mean_lower
+            .iter()
+            .zip(pred.mean_upper.iter())
+            .all(|(&l, &u)| l.is_finite() && u.is_finite() && l <= u && l >= 0.0 && u <= 1.0)
+    );
 }
