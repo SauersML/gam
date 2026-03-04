@@ -1,8 +1,9 @@
 use crate::estimate::{EstimationError, FitResult};
 use crate::matrix::DesignMatrix;
-use crate::mixture_link::sas_inverse_link_jet;
+use crate::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_from_spec};
 use crate::probability::{inverse_link_array, standard_normal_quantile};
 use crate::types::LinkFunction;
+use crate::types::MixtureLinkSpec;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 pub(crate) fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
@@ -17,6 +18,7 @@ pub(crate) fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
 fn apply_family_inverse_link(
     eta: &Array1<f64>,
     family: crate::types::LikelihoodFamily,
+    mixture_state: Option<&crate::types::MixtureLinkState>,
     sas_params: Option<(f64, f64)>,
 ) -> Result<Array1<f64>, EstimationError> {
     if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
@@ -24,11 +26,37 @@ fn apply_family_inverse_link(
             "prediction uncertainty for RoystonParmar is not available in predict_gam".to_string(),
         ));
     }
+    if matches!(family, crate::types::LikelihoodFamily::BinomialMixture) {
+        let Some(state) = mixture_state else {
+            return Err(EstimationError::InvalidInput(
+                "BinomialMixture prediction requires mixture link state".to_string(),
+            ));
+        };
+        return Ok(eta.mapv(|e| mixture_inverse_link_jet(state, e).mu));
+    }
     if matches!(family, crate::types::LikelihoodFamily::BinomialSas) {
         let (epsilon, log_delta) = sas_params.unwrap_or((0.0, 0.0));
         return Ok(eta.mapv(|e| sas_inverse_link_jet(e, epsilon, log_delta).mu));
     }
     Ok(inverse_link_array(family, eta.view()))
+}
+
+fn fit_mixture_link_state(
+    fit: &FitResult,
+) -> Result<Option<crate::types::MixtureLinkState>, EstimationError> {
+    let (Some(components), Some(rho)) = (
+        fit.mixture_link_components.as_ref(),
+        fit.mixture_link_rho.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let spec = MixtureLinkSpec {
+        components: components.clone(),
+        initial_rho: rho.clone(),
+    };
+    state_from_spec(&spec).map(Some).map_err(|e| {
+        EstimationError::InvalidInput(format!("invalid fitted mixture link state: {e}"))
+    })
 }
 
 fn linear_predictor_variance(x: &DesignMatrix, cov: &Array2<f64>) -> Array1<f64> {
@@ -206,7 +234,7 @@ where
     let mut eta = x.matrix_vector_multiply(&beta.to_owned());
     eta += &offset;
 
-    let mean = apply_family_inverse_link(&eta, family, None)?;
+    let mean = apply_family_inverse_link(&eta, family, None, None)?;
 
     Ok(PredictResult { eta, mean })
 }
@@ -450,8 +478,9 @@ where
 
     let mut eta = x.matrix_vector_multiply(&beta.to_owned());
     eta += &offset;
+    let mixture_state = fit_mixture_link_state(fit)?;
     let sas_params = fit.sas_epsilon.zip(fit.sas_log_delta);
-    let mean = apply_family_inverse_link(&eta, family, sas_params)?;
+    let mean = apply_family_inverse_link(&eta, family, mixture_state.as_ref(), sas_params)?;
 
     let eta_var = linear_predictor_variance(&x, cov);
     let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
@@ -499,8 +528,13 @@ where
                 sas_inverse_link_jet(eta[i], epsilon, log_delta).d1
             }
             crate::types::LikelihoodFamily::BinomialMixture => {
-                let mu = mean[i];
-                mu * (1.0 - mu)
+                let state = mixture_state.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "BinomialMixture uncertainty requires fitted mixture link state"
+                            .to_string(),
+                    )
+                })?;
+                mixture_inverse_link_jet(state, eta[i]).d1
             }
             crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
         };
@@ -513,8 +547,8 @@ where
             &mean + &mean_standard_error.mapv(|s| z * s),
         ),
         MeanIntervalMethod::TransformEta => (
-            apply_family_inverse_link(&eta_lower, family, sas_params)?,
-            apply_family_inverse_link(&eta_upper, family, sas_params)?,
+            apply_family_inverse_link(&eta_lower, family, mixture_state.as_ref(), sas_params)?,
+            apply_family_inverse_link(&eta_upper, family, mixture_state.as_ref(), sas_params)?,
         ),
     };
 
@@ -524,6 +558,7 @@ where
             | crate::types::LikelihoodFamily::BinomialProbit
             | crate::types::LikelihoodFamily::BinomialCLogLog
             | crate::types::LikelihoodFamily::BinomialSas
+            | crate::types::LikelihoodFamily::BinomialMixture
     ) {
         mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
         mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));

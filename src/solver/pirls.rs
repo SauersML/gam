@@ -4627,7 +4627,7 @@ pub fn update_glm_vectors(
                     LinkFunction::Identity => eta[i],
                 };
                 let jet =
-                    standard_inverse_link_jet(link, eta[i], mixture_link_state, sas_link_state);
+                    standard_inverse_link_jet(link, eta_used, mixture_link_state, sas_link_state);
                 let geom = bernoulli_geometry_from_jet(
                     eta[i],
                     eta_used,
@@ -4931,7 +4931,7 @@ fn compute_working_weight_derivatives_from_eta(
                     LinkFunction::Identity => eta[i],
                 };
                 let jet =
-                    standard_inverse_link_jet(link, eta[i], mixture_link_state, sas_link_state);
+                    standard_inverse_link_jet(link, eta_used, mixture_link_state, sas_link_state);
                 let geom = bernoulli_geometry_from_jet(
                     eta[i],
                     eta_used,
