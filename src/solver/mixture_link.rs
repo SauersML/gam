@@ -4,7 +4,6 @@ use crate::types::{
 };
 use ndarray::Array1;
 
-const PROB_EPS: f64 = 1e-8;
 const ETA_CLAMP_GENERAL: f64 = 30.0;
 const ETA_CLAMP_LOGIT: f64 = 700.0;
 const SAS_U_CLAMP: f64 = 50.0;
@@ -31,11 +30,6 @@ pub struct SasJetWithParamPartials {
     pub jet: InverseLinkJet,
     pub djet_depsilon: InverseLinkJet,
     pub djet_dlog_delta: InverseLinkJet,
-}
-
-#[inline]
-fn clamp_prob(p: f64) -> f64 {
-    p.clamp(PROB_EPS, 1.0 - PROB_EPS)
 }
 
 pub fn state_from_sas_spec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
@@ -414,8 +408,8 @@ pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLi
     let d2 = phi * (z2 - z * z1 * z1);
     let d3 = phi * (z3 - 3.0 * z * z1 * z2 + (z * z - 1.0) * z1 * z1 * z1);
     InverseLinkJet {
-        mu: clamp_prob(mu),
-        d1: d1.max(1e-12),
+        mu,
+        d1,
         d2,
         d3,
     }
@@ -461,8 +455,8 @@ pub fn sas_inverse_link_jet_with_param_partials(
     let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
 
     let base = InverseLinkJet {
-        mu: clamp_prob(normal_cdf_approx(z)),
-        d1: (phi * z1).max(1e-12),
+        mu: normal_cdf_approx(z),
+        d1: phi * z1,
         d2: phi * (z2 - z * z1 * z1),
         d3: phi * (z3 - 3.0 * z * z1 * z2 + (z * z - 1.0) * z1 * z1 * z1),
     };
