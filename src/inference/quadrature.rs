@@ -1941,7 +1941,11 @@ pub fn integrated_inverse_link_mean_and_derivative(
             }
         }
         LinkFunction::CLogLog => cloglog_posterior_mean_with_deriv_controlled(quad_ctx, mu, sigma),
-        LinkFunction::Sas => probit_posterior_mean_with_deriv_exact(mu, sigma),
+        LinkFunction::Sas => {
+            panic!(
+                "state-less integrated SAS moments are unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)"
+            )
+        }
         LinkFunction::Identity => IntegratedMeanDerivative {
             mean: mu,
             dmean_dmu: 1.0,
@@ -1961,7 +1965,11 @@ pub fn integrated_inverse_link_jet(
         LinkFunction::Probit => integrated_probit_jet(mu, sigma),
         LinkFunction::Logit => integrated_logit_jet_ghq(quad_ctx, mu, sigma),
         LinkFunction::CLogLog => integrated_cloglog_jet_ghq(quad_ctx, mu, sigma),
-        LinkFunction::Sas => integrated_probit_jet(mu, sigma),
+        LinkFunction::Sas => {
+            panic!(
+                "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)"
+            )
+        }
         LinkFunction::Identity => IntegratedInverseLinkJet {
             mean: mu,
             d1: 1.0,
