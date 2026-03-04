@@ -53,7 +53,11 @@ pub struct SasLinkSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SasLinkState {
     pub epsilon: f64,
+    /// Raw optimization parameter.
     pub log_delta: f64,
+    /// Effective tail parameter delta used in evaluation.
+    /// With current bounded parameterization:
+    /// delta = exp(B * tanh(log_delta / B)), B = SAS_LOG_DELTA_BOUND.
     pub delta: f64,
 }
 
