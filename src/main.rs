@@ -6554,7 +6554,12 @@ fn response_sd_from_eta_for_family(
                 .to_string(),
         );
     }
-    let _ = (mixture_state, sas_params, mixture_param_covariance, sas_param_covariance);
+    let _ = (
+        mixture_state,
+        sas_params,
+        mixture_param_covariance,
+        sas_param_covariance,
+    );
     let quad_ctx = gam::quadrature::QuadratureContext::new();
     Ok(Array1::from_iter((0..eta.len()).map(|i| {
         let var = match family {
