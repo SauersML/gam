@@ -130,6 +130,10 @@ fn laml_gradient_external_logit(y: &Array1<f64>, x: &Array2<f64>, rho: f64) -> f
     let offset = Array1::zeros(y.len());
     let s_list = vec![Array2::eye(2)];
     let opts = ExternalOptimOptions {
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
         max_iter: 60,
         tol: 1e-8,
@@ -388,6 +392,10 @@ fn test_external_gradient_adapter_isolated_matches_fd_direction() {
     }
 
     let opts = ExternalOptimOptions {
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
         max_iter: 120,
         tol: 1e-10,

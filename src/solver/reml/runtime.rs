@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::{InverseLink, SasLinkState};
 
 impl<'a> RemlState<'a> {
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
@@ -71,6 +72,27 @@ impl<'a> RemlState<'a> {
         *self.arena.cost_eval_count.write().unwrap() = 0;
         *self.arena.raw_cond_snapshot.write().unwrap() = f64::NAN;
         *self.arena.gaussian_cond_snapshot.write().unwrap() = f64::NAN;
+    }
+
+    fn invalidate_link_dependent_state(&self) {
+        self.cache_manager.clear_eval_and_factor_caches();
+        self.cache_manager.pirls_cache.write().unwrap().clear();
+        self.warm_start_beta.write().unwrap().take();
+    }
+
+    pub(crate) fn set_link_states(
+        &mut self,
+        mixture_link_state: Option<crate::types::MixtureLinkState>,
+        sas_link_state: Option<SasLinkState>,
+    ) {
+        let changed = self.runtime_mixture_link_state != mixture_link_state
+            || self.runtime_sas_link_state != sas_link_state;
+        if !changed {
+            return;
+        }
+        self.runtime_mixture_link_state = mixture_link_state;
+        self.runtime_sas_link_state = sas_link_state;
+        self.invalidate_link_dependent_state();
     }
 
     /// Compute soft prior cost without needing workspace
@@ -176,12 +198,12 @@ impl<'a> RemlState<'a> {
         X: Into<DesignMatrix>,
     {
         let zero_offset = Array1::<f64>::zeros(y.len());
-        Self::new_with_offset(
+        Self::new_with_offset_shared(
             y,
             x,
             weights,
             zero_offset.view(),
-            s_list,
+            Arc::new(s_list),
             p,
             config,
             nullspace_dims,
@@ -196,6 +218,35 @@ impl<'a> RemlState<'a> {
         weights: ArrayView1<'a, f64>,
         offset: ArrayView1<'_, f64>,
         s_list: Vec<Array2<f64>>,
+        p: usize,
+        config: &'a RemlConfig,
+        nullspace_dims: Option<Vec<usize>>,
+        coefficient_lower_bounds: Option<Array1<f64>>,
+        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+    ) -> Result<Self, EstimationError>
+    where
+        X: Into<DesignMatrix>,
+    {
+        Self::new_with_offset_shared(
+            y,
+            x,
+            weights,
+            offset,
+            Arc::new(s_list),
+            p,
+            config,
+            nullspace_dims,
+            coefficient_lower_bounds,
+            linear_constraints,
+        )
+    }
+
+    pub(crate) fn new_with_offset_shared<X>(
+        y: ArrayView1<'a, f64>,
+        x: X,
+        weights: ArrayView1<'a, f64>,
+        offset: ArrayView1<'_, f64>,
+        s_list: Arc<Vec<Array2<f64>>>,
         p: usize,
         config: &'a RemlConfig,
         nullspace_dims: Option<Vec<usize>>,
@@ -243,6 +294,8 @@ impl<'a> RemlState<'a> {
             sparse_penalty_blocks,
             p,
             config,
+            runtime_mixture_link_state: config.link_kind.mixture_state().cloned(),
+            runtime_sas_link_state: config.link_kind.sas_state().copied(),
             nullspace_dims,
             coefficient_lower_bounds,
             linear_constraints,
@@ -318,6 +371,14 @@ impl<'a> RemlState<'a> {
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
         Ok(bundle.h_total.as_ref().clone())
+    }
+
+    pub(crate) fn pirls_result_and_hpos_for_rho(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<(Arc<crate::pirls::PirlsResult>, Arc<Array2<f64>>), EstimationError> {
+        let bundle = self.obtain_eval_bundle(rho)?;
+        Ok((bundle.pirls_result.clone(), bundle.h_pos_factor_w.clone()))
     }
 
     pub(super) fn edf_from_h_and_e(
@@ -1051,6 +1112,14 @@ impl<'a> RemlState<'a> {
             } else {
                 None
             };
+            let mut pirls_config = self.config.as_pirls_config();
+            pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
+                InverseLink::Mixture(state)
+            } else if let Some(state) = self.runtime_sas_link_state {
+                InverseLink::Sas(state)
+            } else {
+                InverseLink::Standard(self.config.link_function())
+            };
             pirls::fit_model_for_fixed_rho_matrix(
                 LogSmoothingParamsView::new(rho.view()),
                 &self.x,
@@ -1061,7 +1130,7 @@ impl<'a> RemlState<'a> {
                 Some(&self.balanced_penalty_root),
                 Some(&self.reparam_invariant),
                 self.p,
-                &self.config.as_pirls_config(),
+                &pirls_config,
                 warm_start_ref,
                 self.coefficient_lower_bounds.as_ref(),
                 self.linear_constraints.as_ref(),

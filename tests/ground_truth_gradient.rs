@@ -148,6 +148,10 @@ fn test_laml_gradient_nonfirth_well_conditioned() {
     let offset = Array1::<f64>::zeros(n);
     let s_list = one_penalty(p);
     let opts = ExternalOptimOptions {
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
         family: LikelihoodFamily::GaussianIdentity,
         max_iter: 200,
         tol: 1e-10,
@@ -206,6 +210,10 @@ fn test_laml_gradient_logit_with_firth_well_conditioned() {
     let offset = Array1::<f64>::zeros(n);
     let s_list = one_penalty(p);
     let opts = ExternalOptimOptions {
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
         max_iter: 200,
         tol: 1e-10,
@@ -262,6 +270,10 @@ fn stress_test_firth_gradient_vs_conditioning() {
         let offset = Array1::<f64>::zeros(n);
         let s_list = one_penalty(p);
         let opts = ExternalOptimOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             family: LikelihoodFamily::BinomialLogit,
             max_iter: 150,
             tol: 1e-8,

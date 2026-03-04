@@ -214,7 +214,7 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
-        let mut s_mod = self.s_full_list.clone();
+        let mut s_mod = self.s_full_list.as_ref().clone();
         for (j, dir) in hyper_dirs.iter().enumerate() {
             let amp = psi[j];
             if amp == 0.0 {
@@ -733,7 +733,7 @@ impl<'a> RemlState<'a> {
             self.weights,
             &pirls_result.solve_weights,
             &eta_tau,
-        ) {
+        )? {
             DirectionalWorkingCurvature::Diagonal(diag) => diag,
         };
 
@@ -1170,7 +1170,7 @@ impl<'a> RemlState<'a> {
                 pert_state.weights,
                 &pirls_result.solve_weights,
                 &eta_tau[j],
-            ) {
+            )? {
                 DirectionalWorkingCurvature::Diagonal(diag) => diag,
             };
             let mut h_j = x_tau_t[j].t().dot(&Self::row_scale(&x_eval, w_diag));
@@ -1796,7 +1796,7 @@ impl<'a> RemlState<'a> {
                     self.weights,
                     &pirls_result.solve_weights,
                     &eta_psi,
-                );
+                )?;
                 let mut x_wpsi = x_dense.clone();
                 match &w_direction {
                     // Directional curvature derivative:

@@ -83,6 +83,10 @@ fn fit_duchon_simulated_10d(
         &spec,
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![],

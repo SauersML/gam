@@ -34,9 +34,16 @@ use crate::construction::{
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{KahanSum, RidgePlanner, add_ridge, matrix_inverse_with_regularization};
 use crate::matrix::DesignMatrix;
+use crate::mixture_link::{
+    mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet_with_param_partials,
+    state_from_sas_spec, state_from_spec,
+};
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
-use crate::types::{Coefficients, LinkFunction, LogSmoothingParamsView, RidgePassport};
+use crate::types::{
+    Coefficients, InverseLink, LinkComponent, LinkFunction, LogSmoothingParamsView, RidgePassport,
+};
+use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
@@ -56,9 +63,9 @@ use crate::diagnostics::{
     should_emit_h_min_eig_diag,
 };
 
-// Note: deflate_weights_by_se was removed. We now use integrated (GHQ) likelihood
-// instead of weight deflation. See update_glm_vectors_integrated in pirls.rs.
-// The SE is passed through to PIRLS which properly integrates over uncertainty
+// Note: deflate_weights_by_se was removed. We now use integrated (GHQ)
+// family-dispatched likelihood updates in PIRLS instead of weight deflation.
+// The SE is passed through to PIRLS which integrates over uncertainty
 // in the likelihood, rather than using ad-hoc weight adjustment.
 
 fn faer_frob_inner(a: faer::MatRef<'_, f64>, b: faer::MatRef<'_, f64>) -> f64 {
@@ -346,9 +353,9 @@ fn map_hessian_to_original_basis(
     Ok(tmp.dot(&qs.t()))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct RemlConfig {
-    link_function: LinkFunction,
+    link_kind: InverseLink,
     convergence_tolerance: f64,
     max_iterations: usize,
     reml_convergence_tolerance: f64,
@@ -359,7 +366,7 @@ pub(crate) struct RemlConfig {
 impl RemlConfig {
     fn external(link_function: LinkFunction, reml_tol: f64, firth_bias_reduction: bool) -> Self {
         Self {
-            link_function,
+            link_kind: InverseLink::Standard(link_function),
             convergence_tolerance: reml_tol,
             max_iterations: 500,
             reml_convergence_tolerance: reml_tol,
@@ -369,12 +376,12 @@ impl RemlConfig {
     }
 
     fn link_function(&self) -> LinkFunction {
-        self.link_function
+        self.link_kind.link_function()
     }
 
     fn as_pirls_config(&self) -> pirls::PirlsConfig {
         pirls::PirlsConfig {
-            link_function: self.link_function,
+            link_kind: self.link_kind.clone(),
             max_iterations: self.max_iterations,
             convergence_tolerance: self.convergence_tolerance,
             firth_bias_reduction: self.firth_bias_reduction,
@@ -808,11 +815,25 @@ pub struct ExternalOptimResult {
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
     pub reml_score: f64,
+    pub mixture_link_components: Option<Vec<LinkComponent>>,
+    pub mixture_link_rho: Option<Array1<f64>>,
+    pub mixture_link_weights: Option<Array1<f64>>,
+    /// Approximate covariance of mixture free logits (K-1 x K-1), when optimized.
+    pub mixture_link_param_covariance: Option<Array2<f64>>,
+    pub sas_epsilon: Option<f64>,
+    pub sas_log_delta: Option<f64>,
+    pub sas_delta: Option<f64>,
+    /// Approximate covariance of SAS params (epsilon, log_delta), shape 2x2.
+    pub sas_param_covariance: Option<Array2<f64>>,
 }
 
 #[derive(Clone)]
 pub struct ExternalOptimOptions {
     pub family: crate::types::LikelihoodFamily,
+    pub mixture_link: Option<MixtureLinkSpec>,
+    pub optimize_mixture: bool,
+    pub sas_link: Option<SasLinkSpec>,
+    pub optimize_sas: bool,
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
@@ -835,6 +856,8 @@ fn resolve_external_family(
         }
         crate::types::LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
         crate::types::LikelihoodFamily::BinomialCLogLog => Ok((LinkFunction::CLogLog, false)),
+        crate::types::LikelihoodFamily::BinomialSas => Ok((LinkFunction::Sas, false)),
+        crate::types::LikelihoodFamily::BinomialMixture => Ok((LinkFunction::Logit, false)),
         crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
                 .to_string(),
@@ -948,6 +971,23 @@ pub fn optimize_external_design_with_heuristic_lambdas<X>(
 where
     X: Into<DesignMatrix>,
 {
+    if matches!(opts.family, crate::types::LikelihoodFamily::BinomialMixture)
+        && opts.mixture_link.is_none()
+    {
+        return Err(EstimationError::InvalidInput(
+            "BinomialMixture requires mixture_link specification".to_string(),
+        ));
+    }
+    let effective_sas_link = if matches!(opts.family, crate::types::LikelihoodFamily::BinomialSas)
+        && opts.sas_link.is_none()
+    {
+        Some(SasLinkSpec {
+            initial_epsilon: 0.0,
+            initial_log_delta: 0.0,
+        })
+    } else {
+        opts.sas_link
+    };
     let x = x.into();
     if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
         return Err(EstimationError::InvalidInput(format!(
@@ -977,7 +1017,23 @@ where
         )));
     }
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
-    let cfg = RemlConfig::external(link, opts.tol, firth_active);
+    let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
+    if opts.mixture_link.is_some() && opts.sas_link.is_some() {
+        return Err(EstimationError::InvalidInput(
+            "mixture_link and sas_link are mutually exclusive for this fit".to_string(),
+        ));
+    }
+    if let Some(spec) = opts.mixture_link.as_ref() {
+        cfg.link_kind = InverseLink::Mixture(state_from_spec(spec).map_err(|e| {
+            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+        })?);
+    }
+    if let Some(spec) = effective_sas_link {
+        cfg.link_kind = InverseLink::Sas(
+            state_from_sas_spec(spec)
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
+        );
+    }
 
     let rs_list = compute_penalty_square_roots(&s_list)?;
 
@@ -987,15 +1043,16 @@ where
     let x_o = x.clone();
     let x_fit_o = x_fit.clone();
     let offset_o = offset.to_owned();
-    let reml_state = RemlState::new_with_offset(
+    let s_list_shared = Arc::new(s_list);
+    let reml_state = RemlState::new_with_offset_shared(
         y_o.view(),
         x_fit_o.clone(),
         w_o.view(),
         offset_o.view(),
-        s_list,
+        Arc::clone(&s_list_shared),
         p,
         &cfg,
-        Some(active_nullspace_dims),
+        Some(active_nullspace_dims.clone()),
         None,
         fit_linear_constraints.clone(),
     )?;
@@ -1039,8 +1096,39 @@ where
         },
     };
     let outer_eval_idx = AtomicUsize::new(0usize);
-    let outer_result =
-        crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
+    let mixture_opt_spec = if opts.optimize_mixture {
+        opts.mixture_link.clone()
+    } else {
+        None
+    };
+    let sas_opt_spec = if opts.optimize_sas {
+        effective_sas_link
+    } else {
+        None
+    };
+    let mixture_dim = mixture_opt_spec
+        .as_ref()
+        .map(|s| s.initial_rho.len())
+        .unwrap_or(0);
+    let sas_dim = if sas_opt_spec.is_some() { 2 } else { 0 };
+    let sas_ridge_weight = if sas_dim > 0 {
+        sas_log_delta_ridge_weight()
+    } else {
+        0.0
+    };
+    let (
+        final_rho,
+        final_mixture_state,
+        final_sas_state,
+        final_mixture_param_covariance,
+        final_sas_param_covariance,
+        outer_result,
+    ) = if mixture_dim > 0 && sas_dim > 0 {
+        return Err(EstimationError::InvalidInput(
+            "simultaneous mixture and SAS optimization is not supported".to_string(),
+        ));
+    } else if mixture_dim == 0 && sas_dim == 0 {
+        let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
             k,
             heuristic_lambdas,
             |rho: &Array1<f64>| {
@@ -1065,24 +1153,6 @@ where
                     }
                 };
                 let hess_sec = t_hess.elapsed().as_secs_f64();
-
-                // Outer smoothing optimization is over rho = log(lambda).
-                //
-                // The scalar objective is the current REML/LAML surface
-                //   V(rho) = -ell(beta_hat(rho))
-                //          + 0.5 beta_hat(rho)' S(rho) beta_hat(rho)
-                //          + 0.5 log|H(rho)|
-                //          - 0.5 log|S(rho)|_+ .
-                //
-                // By the envelope theorem / stationarity of the inner mode,
-                // the outer callback supplies:
-                //   1) the value V(rho)
-                //   2) the exact outer gradient dV/drho
-                //   3) the exact outer Hessian d²V/drho² when available.
-                //
-                // `optimize_log_smoothing_with_multistart_with_gradient_and_hessian`
-                // consumes (3) through `wolfe_bfgs::NewtonTrustRegion`; missing or
-                // rejected Hessians are handled by solver-side BFGS fallback.
                 log::info!(
                     "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} hessian={} time_sec(cost={:.3}, grad={:.3}, hess={:.3})",
                     rho.len(),
@@ -1096,7 +1166,416 @@ where
             },
             &smoothing_options,
         )?;
-    let final_rho = outer_result.rho;
+        (
+            outer_result.rho.clone(),
+            cfg.link_kind.mixture_state().cloned(),
+            cfg.link_kind.sas_state().copied(),
+            None,
+            None,
+            outer_result,
+        )
+    } else {
+        let use_mixture = mixture_dim > 0;
+        let use_sas = sas_dim > 0;
+        let theta_dim = k + mixture_dim + sas_dim;
+        let sas_spec = sas_opt_spec;
+        let mix_spec = mixture_opt_spec
+            .clone()
+            .or_else(|| {
+                if use_mixture {
+                    None
+                } else {
+                    Some(MixtureLinkSpec {
+                        components: Vec::new(),
+                        initial_rho: Array1::zeros(0),
+                    })
+                }
+            })
+            .ok_or_else(|| EstimationError::InvalidInput("missing mixture spec".to_string()))?;
+        let mut heuristic_theta = Vec::new();
+        if let Some(hvals) = heuristic_lambdas {
+            if hvals.len() == k {
+                heuristic_theta.extend_from_slice(hvals);
+                if use_mixture {
+                    heuristic_theta
+                        .extend_from_slice(mix_spec.initial_rho.as_slice().unwrap_or(&[]));
+                }
+                if let Some(spec) = sas_spec {
+                    heuristic_theta.push(spec.initial_epsilon);
+                    heuristic_theta.push(spec.initial_log_delta);
+                }
+            }
+        }
+        let heuristic_theta_ref = if heuristic_theta.len() == theta_dim {
+            Some(heuristic_theta.as_slice())
+        } else {
+            None
+        };
+        let mut smoothing_options_mix = smoothing_options.clone();
+        smoothing_options_mix.fd_hessian_max_dim = 0;
+        let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
+        let mut reml_eval = RemlState::new_with_offset_shared(
+            y_o.view(),
+            x_fit_o.clone(),
+            w_o.view(),
+            offset_o.view(),
+            Arc::clone(&s_list_shared),
+            p,
+            &cfg,
+            Some(active_nullspace_dims.clone()),
+            None,
+            fit_linear_constraints.clone(),
+        )?;
+        let mut rho_buf = Array1::<f64>::zeros(k);
+        let mut mix_rho_buf = if use_mixture {
+            Some(Array1::<f64>::zeros(mixture_dim))
+        } else {
+            None
+        };
+        let mut ll3_buf = Array1::<f64>::zeros(y_o.len());
+        let mut leverage_buf = Array1::<f64>::zeros(y_o.len());
+        let mut du_j_buf = Array1::<f64>::zeros(y_o.len());
+        let mut dw_explicit_j_buf = Array1::<f64>::zeros(y_o.len());
+        let mut mix_partials_buf_reuse = if use_mixture {
+            vec![
+                crate::mixture_link::InverseLinkJet {
+                    mu: 0.0,
+                    d1: 0.0,
+                    d2: 0.0,
+                    d3: 0.0,
+                };
+                aux_dim_outer
+            ]
+        } else {
+            Vec::new()
+        };
+        let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
+            theta_dim,
+            heuristic_theta_ref,
+            |theta: &Array1<f64>| {
+                let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
+                rho_buf.assign(&theta.slice(s![..k]));
+                let mut cfg_eval = cfg.clone();
+                if use_mixture {
+                    let mix_rho_arr = mix_rho_buf.as_mut().ok_or_else(|| {
+                        EstimationError::InvalidInput(
+                            "missing reusable mixture rho buffer".to_string(),
+                        )
+                    })?;
+                    mix_rho_arr.assign(&theta.slice(s![k..(k + mixture_dim)]));
+                    let spec_eval = MixtureLinkSpec {
+                        components: mix_spec.components.clone(),
+                        initial_rho: mix_rho_arr.clone(),
+                    };
+                    cfg_eval.link_kind = InverseLink::Mixture(
+                        state_from_spec(&spec_eval).map_err(|e| {
+                            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+                        })?,
+                    );
+                }
+                if use_sas {
+                    let epsilon = theta[k];
+                    let log_delta = theta[k + 1];
+                    cfg_eval.link_kind = InverseLink::Sas(
+                        state_from_sas_spec(SasLinkSpec {
+                            initial_epsilon: epsilon,
+                            initial_log_delta: log_delta,
+                        })
+                        .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
+                    );
+                }
+                reml_eval
+                    .set_link_states(
+                        cfg_eval.link_kind.mixture_state().cloned(),
+                        cfg_eval.link_kind.sas_state().copied(),
+                    );
+                let t_cost = Instant::now();
+                let mut cost = reml_eval.compute_cost(&rho_buf)?;
+                let sas_ridge = if use_sas { sas_ridge_weight } else { 0.0 };
+                if use_sas && sas_ridge > 0.0 {
+                    let log_delta = theta[k + 1];
+                    cost += 0.5 * sas_ridge * log_delta * log_delta;
+                }
+                let cost_sec = t_cost.elapsed().as_secs_f64();
+
+                let t_grad = Instant::now();
+                let mut grad = Array1::<f64>::zeros(theta_dim);
+                let grad_rho = reml_eval.compute_gradient(&rho_buf)?;
+                grad.slice_mut(s![..k]).assign(&grad_rho);
+                let (pirls_mix, h_pos_w) = reml_eval.pirls_result_and_hpos_for_rho(&rho_buf)?;
+                if cfg_eval.firth_bias_reduction {
+                    return Err(EstimationError::InvalidInput(
+                        "blended inverse-link optimization is incompatible with Firth-adjusted outer gradients"
+                            .to_string(),
+                    ));
+                }
+                let eta = &pirls_mix.final_eta;
+                let x_t = &pirls_mix.x_transformed;
+                let n_obs = eta.len();
+                let p_eff = x_t.ncols();
+                let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
+                debug_assert_eq!(n_obs, ll3_buf.len());
+                ll3_buf.fill(0.0);
+                const EPS: f64 = 1e-8;
+                leverage_buf.fill(0.0);
+                if h_pos_w.ncols() > 0 {
+                    match x_t {
+                        DesignMatrix::Dense(x_dense) => {
+                            let xw = x_dense.dot(h_pos_w.as_ref());
+                            for i in 0..xw.nrows() {
+                                leverage_buf[i] = xw.row(i).iter().map(|v| v * v).sum();
+                            }
+                        }
+                        DesignMatrix::Sparse(_) => {
+                            for col in 0..h_pos_w.ncols() {
+                                let w_col = h_pos_w.column(col).to_owned();
+                                let xw_col = x_t.matrix_vector_multiply(&w_col);
+                                Zip::from(&mut leverage_buf)
+                                    .and(&xw_col)
+                                    .for_each(|h, &v| *h += v * v);
+                            }
+                        }
+                    }
+                }
+                for j in 0..aux_dim {
+                    let mut direct_ll_j = 0.0_f64;
+                    du_j_buf.fill(0.0);
+                    dw_explicit_j_buf.fill(0.0);
+                    for i in 0..n_obs {
+                        if use_mixture {
+                            let mix_state = cfg_eval.link_kind.mixture_state().ok_or_else(|| {
+                                EstimationError::InvalidInput("missing mixture state".to_string())
+                            })?;
+                            let jet = mixture_inverse_link_jet_with_rho_partials_into(
+                                mix_state,
+                                eta[i],
+                                &mut mix_partials_buf_reuse,
+                            );
+                            let mu = jet.mu.clamp(EPS, 1.0 - EPS);
+                            let d1 = jet.d1;
+                            let d2 = jet.d2;
+                            let d3 = jet.d3;
+                            let yi = y_o[i];
+                            let wi = w_o[i].max(0.0);
+                            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+                            let a2 =
+                                wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
+                            let a3 = wi
+                                * (2.0 * yi / (mu * mu * mu)
+                                    - 2.0 * (1.0 - yi)
+                                        / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
+                            if j == 0 {
+                                ll3_buf[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+                            }
+                            let dj = mix_partials_buf_reuse[j];
+                            let dmu = dj.mu;
+                            let dd1 = dj.d1;
+                            let dd2 = dj.d2;
+                            direct_ll_j += a1 * dmu;
+                            du_j_buf[i] = a2 * dmu * d1 + a1 * dd1;
+                            let dell2_explicit = a3 * dmu * d1 * d1
+                                + 2.0 * a2 * d1 * dd1
+                                + a2 * dmu * d2
+                                + a1 * dd2;
+                            dw_explicit_j_buf[i] = -dell2_explicit;
+                        } else {
+                            let sas = cfg_eval.link_kind.sas_state().copied().ok_or_else(|| {
+                                EstimationError::InvalidInput("missing SAS state".to_string())
+                            })?;
+                            let jets = sas_inverse_link_jet_with_param_partials(
+                                eta[i],
+                                sas.epsilon,
+                                sas.log_delta,
+                            );
+                            let mu = jets.jet.mu.clamp(EPS, 1.0 - EPS);
+                            let d1 = jets.jet.d1;
+                            let d2 = jets.jet.d2;
+                            let d3 = jets.jet.d3;
+                            let yi = y_o[i];
+                            let wi = w_o[i].max(0.0);
+                            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+                            let a2 =
+                                wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
+                            let a3 = wi
+                                * (2.0 * yi / (mu * mu * mu)
+                                    - 2.0 * (1.0 - yi)
+                                        / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
+                            if j == 0 {
+                                ll3_buf[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+                            }
+                            let dj = if j == 0 {
+                                jets.djet_depsilon
+                            } else {
+                                jets.djet_dlog_delta
+                            };
+                            let dmu = dj.mu;
+                            let dd1 = dj.d1;
+                            let dd2 = dj.d2;
+                            direct_ll_j += a1 * dmu;
+                            du_j_buf[i] = a2 * dmu * d1 + a1 * dd1;
+                            let dell2_explicit = a3 * dmu * d1 * d1
+                                + 2.0 * a2 * d1 * dd1
+                                + a2 * dmu * d2
+                                + a1 * dd2;
+                            dw_explicit_j_buf[i] = -dell2_explicit;
+                        }
+                    }
+                    let rhs_j = x_t.transpose_vector_multiply(&du_j_buf);
+                    let dbeta_j = if h_pos_w.ncols() > 0 {
+                        let wt_rhs = h_pos_w.t().dot(&rhs_j);
+                        h_pos_w.as_ref().dot(&wt_rhs)
+                    } else {
+                        Array1::<f64>::zeros(p_eff)
+                    };
+                    let eta_dot_j = x_t.matrix_vector_multiply(&dbeta_j);
+                    let mut trace_term = 0.0_f64;
+                    for i in 0..n_obs {
+                        let dw_total = dw_explicit_j_buf[i] - ll3_buf[i] * eta_dot_j[i];
+                        trace_term += leverage_buf[i] * dw_total;
+                    }
+                    grad[k + j] = -direct_ll_j + 0.5 * trace_term;
+                }
+                if use_sas && sas_ridge > 0.0 {
+                    let log_delta = theta[k + 1];
+                    grad[k + 1] += sas_ridge * log_delta;
+                }
+                let grad_sec = t_grad.elapsed().as_secs_f64();
+                log::info!(
+                    "[outer-eval {eval_idx}] theta_dim={} aux_dim={} hessian=false time_sec(cost={:.3}, grad={:.3})",
+                    theta_dim,
+                    aux_dim,
+                    cost_sec,
+                    grad_sec
+                );
+                Ok((cost, grad, None))
+            },
+            &smoothing_options_mix,
+        )?;
+        let final_rho = outer_result.rho.slice(s![..k]).to_owned();
+        let final_mix_state = if use_mixture {
+            let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
+            Some(
+                state_from_spec(&MixtureLinkSpec {
+                    components: mix_spec.components.clone(),
+                    initial_rho: final_mix_rho,
+                })
+                .map_err(|e| {
+                    EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+                })?,
+            )
+        } else {
+            None
+        };
+        let final_sas_state = if use_sas {
+            Some(
+                state_from_sas_spec(SasLinkSpec {
+                    initial_epsilon: outer_result.rho[k],
+                    initial_log_delta: outer_result.rho[k + 1],
+                })
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
+            )
+        } else {
+            cfg.link_kind.sas_state().copied()
+        };
+        let aux_param_covariance = if aux_dim_outer > 0 {
+            let mut theta_aux = Array1::<f64>::zeros(aux_dim_outer);
+            if use_mixture {
+                theta_aux.assign(&outer_result.rho.slice(s![k..(k + mixture_dim)]));
+            } else if use_sas {
+                theta_aux[0] = outer_result.rho[k];
+                theta_aux[1] = outer_result.rho[k + 1];
+            }
+            let mut evaluate_aux_cost = |aux: &Array1<f64>| -> Result<f64, EstimationError> {
+                if use_mixture {
+                    let spec_eval = MixtureLinkSpec {
+                        components: mix_spec.components.clone(),
+                        initial_rho: aux.clone(),
+                    };
+                    let mix_state = state_from_spec(&spec_eval).map_err(|e| {
+                        EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+                    })?;
+                    reml_eval.set_link_states(Some(mix_state), None);
+                } else if use_sas {
+                    let sas_state = state_from_sas_spec(SasLinkSpec {
+                        initial_epsilon: aux[0],
+                        initial_log_delta: aux[1],
+                    })
+                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?;
+                    reml_eval.set_link_states(None, Some(sas_state));
+                }
+                let mut cost = reml_eval.compute_cost(&final_rho)?;
+                if use_sas && sas_ridge_weight > 0.0 {
+                    let log_delta = aux[1];
+                    cost += 0.5 * sas_ridge_weight * log_delta * log_delta;
+                }
+                Ok(cost)
+            };
+            let f0 = evaluate_aux_cost(&theta_aux)?;
+            let d = aux_dim_outer;
+            let mut h_aux = Array2::<f64>::zeros((d, d));
+            for i in 0..d {
+                let hi = 1e-3 * (1.0 + theta_aux[i].abs());
+                let mut tp = theta_aux.clone();
+                let mut tm = theta_aux.clone();
+                tp[i] += hi;
+                tm[i] -= hi;
+                let fp = evaluate_aux_cost(&tp)?;
+                let fm = evaluate_aux_cost(&tm)?;
+                h_aux[[i, i]] = (fp - 2.0 * f0 + fm) / (hi * hi);
+                for j in (i + 1)..d {
+                    let hj = 1e-3 * (1.0 + theta_aux[j].abs());
+                    let mut tpp = theta_aux.clone();
+                    let mut tpm = theta_aux.clone();
+                    let mut tmp = theta_aux.clone();
+                    let mut tmm = theta_aux.clone();
+                    tpp[i] += hi;
+                    tpp[j] += hj;
+                    tpm[i] += hi;
+                    tpm[j] -= hj;
+                    tmp[i] -= hi;
+                    tmp[j] += hj;
+                    tmm[i] -= hi;
+                    tmm[j] -= hj;
+                    let fpp = evaluate_aux_cost(&tpp)?;
+                    let fpm = evaluate_aux_cost(&tpm)?;
+                    let fmp = evaluate_aux_cost(&tmp)?;
+                    let fmm = evaluate_aux_cost(&tmm)?;
+                    let hij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+                    h_aux[[i, j]] = hij;
+                    h_aux[[j, i]] = hij;
+                }
+            }
+            let max_diag = h_aux
+                .diag()
+                .iter()
+                .copied()
+                .map(f64::abs)
+                .fold(1.0_f64, f64::max);
+            for i in 0..d {
+                if !h_aux[[i, i]].is_finite() || h_aux[[i, i]] <= 0.0 {
+                    h_aux[[i, i]] = max_diag;
+                }
+            }
+            matrix_inverse_with_regularization(&h_aux, "link parameter covariance")
+        } else {
+            None
+        };
+        let (mix_cov, sas_cov) = if use_mixture {
+            (aux_param_covariance, None)
+        } else if use_sas {
+            (None, aux_param_covariance)
+        } else {
+            (None, None)
+        };
+        (
+            final_rho,
+            final_mix_state,
+            final_sas_state,
+            mix_cov,
+            sas_cov,
+            outer_result,
+        )
+    };
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, outer_result.iterations);
     let (pirls_res, _) = pirls::fit_model_for_fixed_rho_matrix(
@@ -1109,7 +1588,16 @@ where
         Some(reml_state.balanced_penalty_root()),
         None,
         p,
-        &cfg.as_pirls_config(),
+        &pirls::PirlsConfig {
+            link_kind: if let Some(state) = final_mixture_state.clone() {
+                InverseLink::Mixture(state)
+            } else if let Some(state) = final_sas_state {
+                InverseLink::Sas(state)
+            } else {
+                cfg.link_kind.clone()
+            },
+            ..cfg.as_pirls_config()
+        },
         None,
         None,
         fit_linear_constraints.as_ref(),
@@ -1234,7 +1722,9 @@ where
             let denom = (n - edf_total).max(1.0);
             weighted_rss / denom
         }
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => 1.0,
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
+            1.0
+        }
     };
 
     // Compute gradient norm at final rho for reporting
@@ -1318,6 +1808,14 @@ where
         beta_covariance_corrected,
         beta_standard_errors_corrected,
         reml_score: outer_result.final_value,
+        mixture_link_components: final_mixture_state.as_ref().map(|s| s.components.clone()),
+        mixture_link_rho: final_mixture_state.as_ref().map(|s| s.rho.clone()),
+        mixture_link_weights: final_mixture_state.as_ref().map(|s| s.pi.clone()),
+        mixture_link_param_covariance: final_mixture_param_covariance,
+        sas_epsilon: final_sas_state.map(|s| s.epsilon),
+        sas_log_delta: final_sas_state.map(|s| s.log_delta),
+        sas_delta: final_sas_state.map(|s| s.delta),
+        sas_param_covariance: final_sas_param_covariance,
     };
     Ok(conditioning.backtransform_external_result(result))
 }
@@ -1798,7 +2296,11 @@ where
         )));
     }
     let p = x.ncols();
-    validate_full_size_penalties(&s_list, p, "compute_external_joint_hyper_cost_gradient_hessian")?;
+    validate_full_size_penalties(
+        &s_list,
+        p,
+        "compute_external_joint_hyper_cost_gradient_hessian",
+    )?;
     let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
         s_list,
         &opts.nullspace_dims,
@@ -1922,6 +2424,10 @@ where
 
 #[derive(Clone)]
 pub struct FitOptions {
+    pub mixture_link: Option<MixtureLinkSpec>,
+    pub optimize_mixture: bool,
+    pub sas_link: Option<SasLinkSpec>,
+    pub optimize_sas: bool,
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
@@ -1968,6 +2474,16 @@ pub struct FitResult {
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
     pub reml_score: f64,
+    pub mixture_link_components: Option<Vec<LinkComponent>>,
+    pub mixture_link_rho: Option<Array1<f64>>,
+    pub mixture_link_weights: Option<Array1<f64>>,
+    /// Approximate covariance of mixture free logits (K-1 x K-1), when optimized.
+    pub mixture_link_param_covariance: Option<Array2<f64>>,
+    pub sas_epsilon: Option<f64>,
+    pub sas_log_delta: Option<f64>,
+    pub sas_delta: Option<f64>,
+    /// Approximate covariance of SAS params (epsilon, log_delta), shape 2x2.
+    pub sas_param_covariance: Option<Array2<f64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2139,7 +2655,7 @@ pub use crate::inference::predict::{
     CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
     coefficient_uncertainty, coefficient_uncertainty_with_mode, predict_gam,
-    predict_gam_posterior_mean, predict_gam_with_uncertainty,
+    predict_gam_posterior_mean, predict_gam_posterior_mean_with_fit, predict_gam_with_uncertainty,
 };
 pub use crate::solver::smoothing::{
     SmoothingBfgsOptions, SmoothingBfgsResult, optimize_log_smoothing_with_multistart,
@@ -2163,14 +2679,74 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
+    if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
+        && opts.mixture_link.is_none()
+    {
+        return Err(EstimationError::InvalidInput(
+            "BinomialMixture requires mixture_link specification".to_string(),
+        ));
+    }
+    let effective_sas_link = if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
+        && opts.sas_link.is_none()
+    {
+        Some(SasLinkSpec {
+            initial_epsilon: 0.0,
+            initial_log_delta: 0.0,
+        })
+    } else {
+        opts.sas_link
+    };
+    if opts.mixture_link.is_some() && opts.sas_link.is_some() {
+        return Err(EstimationError::InvalidInput(
+            "mixture_link and sas_link cannot both be set".to_string(),
+        ));
+    }
+    let resolved_family = if opts.mixture_link.is_some() {
+        match family {
+            crate::types::LikelihoodFamily::BinomialLogit
+            | crate::types::LikelihoodFamily::BinomialProbit
+            | crate::types::LikelihoodFamily::BinomialCLogLog
+            | crate::types::LikelihoodFamily::BinomialMixture => {
+                crate::types::LikelihoodFamily::BinomialMixture
+            }
+            _ => {
+                return Err(EstimationError::InvalidInput(
+                    "mixture_link is only supported for binomial families".to_string(),
+                ));
+            }
+        }
+    } else if effective_sas_link.is_some() {
+        match family {
+            crate::types::LikelihoodFamily::BinomialLogit
+            | crate::types::LikelihoodFamily::BinomialProbit
+            | crate::types::LikelihoodFamily::BinomialCLogLog
+            | crate::types::LikelihoodFamily::BinomialSas => {
+                crate::types::LikelihoodFamily::BinomialSas
+            }
+            _ => {
+                return Err(EstimationError::InvalidInput(
+                    "sas_link is only supported for binomial families".to_string(),
+                ));
+            }
+        }
+    } else {
+        family
+    };
+    if matches!(
+        resolved_family,
+        crate::types::LikelihoodFamily::RoystonParmar
+    ) {
         return Err(EstimationError::InvalidInput(
             "fit_gam external design path does not support RoystonParmar; use survival training APIs".to_string(),
         ));
     }
     validate_full_size_penalties(s_list, x.ncols(), "fit_gam")?;
     let mut ext_opts = ExternalOptimOptions {
-        family,
+        family: resolved_family,
+        mixture_link: opts.mixture_link.clone(),
+        optimize_mixture: opts.optimize_mixture,
+        sas_link: effective_sas_link,
+        optimize_sas: opts.optimize_sas,
         max_iter: opts.max_iter,
         tol: opts.tol,
         nullspace_dims: opts.nullspace_dims.clone(),
@@ -2178,7 +2754,10 @@ where
         firth_bias_reduction: None,
     };
 
-    let result = if matches!(family, crate::types::LikelihoodFamily::BinomialLogit) {
+    let result = if matches!(
+        resolved_family,
+        crate::types::LikelihoodFamily::BinomialLogit
+    ) {
         let weighted_events = y
             .iter()
             .zip(weights.iter())
@@ -2275,6 +2854,14 @@ where
         beta_covariance_corrected: result.beta_covariance_corrected,
         beta_standard_errors_corrected: result.beta_standard_errors_corrected,
         reml_score: result.reml_score,
+        mixture_link_components: result.mixture_link_components,
+        mixture_link_rho: result.mixture_link_rho,
+        mixture_link_weights: result.mixture_link_weights,
+        mixture_link_param_covariance: result.mixture_link_param_covariance,
+        sas_epsilon: result.sas_epsilon,
+        sas_log_delta: result.sas_log_delta,
+        sas_delta: result.sas_delta,
+        sas_param_covariance: result.sas_param_covariance,
     })
 }
 
@@ -2310,6 +2897,17 @@ const GRAD_DIAG_SEVERE_RIDGE_IMPACT: f64 = 1e-2;
 const GRAD_DIAG_SEVERE_PHANTOM_PENALTY: f64 = 1e-3;
 const FIRTH_BASE_MINORITY_SUPPORT: f64 = 20.0;
 const FIRTH_MINORITY_PER_PARAMETER: f64 = 2.0;
+
+#[inline]
+fn sas_log_delta_ridge_weight() -> f64 {
+    // Optional weak stabilization for SAS tail parameter.
+    // Kept off by default to preserve baseline objective semantics.
+    std::env::var("GAM_SAS_LOGDELTA_RIDGE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0)
+}
 
 #[inline]
 fn should_sample_gradient_diag_fd(eval_idx: u64) -> bool {
@@ -2744,6 +3342,282 @@ where
     let cost = reml_state.compute_cost(rho)?;
     let ridge = reml_state.last_ridge_used().unwrap_or(0.0);
     Ok((cost, ridge))
+}
+
+/// Evaluate external theta-space outer cost and analytic gradient for
+/// `theta = [rho_penalties, rho_blended? | epsilon,log_delta?]`.
+///
+/// This mirrors the exact first-order objective surface used by the outer
+/// optimizer when blended inverse-link or SAS parameters are optimized.
+pub fn evaluate_external_theta_cost_gradient<X>(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: X,
+    offset: ArrayView1<'_, f64>,
+    s_list: Vec<Array2<f64>>,
+    theta: &Array1<f64>,
+    opts: &ExternalOptimOptions,
+) -> Result<(f64, Array1<f64>), EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    let x = x.into();
+    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
+            y.len(),
+            w.len(),
+            x.nrows(),
+            offset.len()
+        )));
+    }
+    let p = x.ncols();
+    validate_full_size_penalties(&s_list, p, "evaluate_external_theta_cost_gradient")?;
+    let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
+        s_list,
+        &opts.nullspace_dims,
+        "evaluate_external_theta_cost_gradient",
+    )?;
+    let k = active_nullspace_dims.len();
+    let use_mixture = opts.mixture_link.is_some();
+    let use_sas = opts.sas_link.is_some();
+    if use_mixture && use_sas {
+        return Err(EstimationError::InvalidInput(
+            "mixture_link and sas_link are mutually exclusive for this evaluator".to_string(),
+        ));
+    }
+    let aux_dim = if use_mixture {
+        opts.mixture_link
+            .as_ref()
+            .map(|s| s.initial_rho.len())
+            .unwrap_or(0)
+    } else if use_sas {
+        2
+    } else {
+        0
+    };
+    if theta.len() != k + aux_dim {
+        return Err(EstimationError::InvalidInput(format!(
+            "theta length mismatch: expected {}, got {}",
+            k + aux_dim,
+            theta.len()
+        )));
+    }
+    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
+    if let Some(spec) = opts.mixture_link.as_ref() {
+        cfg.link_kind = InverseLink::Mixture(state_from_spec(spec).map_err(|e| {
+            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+        })?);
+    }
+    if let Some(spec) = opts.sas_link {
+        cfg.link_kind = InverseLink::Sas(
+            state_from_sas_spec(spec)
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
+        );
+    }
+    let y_o = y.to_owned();
+    let w_o = w.to_owned();
+    let x_o = x.clone();
+    let offset_o = offset.to_owned();
+    let mut reml_state = RemlState::new_with_offset(
+        y_o.view(),
+        x_o,
+        w_o.view(),
+        offset_o.view(),
+        s_list,
+        p,
+        &cfg,
+        Some(active_nullspace_dims),
+        None,
+        opts.linear_constraints.clone(),
+    )?;
+    let rho = theta.slice(s![..k]).to_owned();
+    let mut mix_state_eval: Option<crate::types::MixtureLinkState> = None;
+    let mut sas_state_eval: Option<crate::types::SasLinkState> = None;
+    if use_mixture {
+        let mix_spec = opts.mixture_link.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput("missing blended inverse-link specification".to_string())
+        })?;
+        let mix_rho = theta.slice(s![k..(k + aux_dim)]).to_owned();
+        let mix_state = state_from_spec(&MixtureLinkSpec {
+            components: mix_spec.components.clone(),
+            initial_rho: mix_rho,
+        })
+        .map_err(|e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")))?;
+        reml_state.set_link_states(Some(mix_state.clone()), None);
+        mix_state_eval = Some(mix_state);
+    } else if use_sas {
+        let sas_state = state_from_sas_spec(SasLinkSpec {
+            initial_epsilon: theta[k],
+            initial_log_delta: theta[k + 1],
+        })
+        .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?;
+        reml_state.set_link_states(None, Some(sas_state));
+        sas_state_eval = Some(sas_state);
+    }
+
+    let mut cost = reml_state.compute_cost(&rho)?;
+    let mut grad = Array1::<f64>::zeros(theta.len());
+    grad.slice_mut(s![..k])
+        .assign(&reml_state.compute_gradient(&rho)?);
+
+    if aux_dim == 0 {
+        return Ok((cost, grad));
+    }
+    if firth_active {
+        return Err(EstimationError::InvalidInput(
+            "theta-space link-parameter gradients are incompatible with Firth-adjusted outer gradients"
+                .to_string(),
+        ));
+    }
+
+    let sas_ridge = if use_sas {
+        sas_log_delta_ridge_weight()
+    } else {
+        0.0
+    };
+    if use_sas && sas_ridge > 0.0 {
+        let log_delta = theta[k + 1];
+        cost += 0.5 * sas_ridge * log_delta * log_delta;
+    }
+
+    let (pirls_mix, h_pos_w) = reml_state.pirls_result_and_hpos_for_rho(&rho)?;
+    let eta = &pirls_mix.final_eta;
+    let x_t = &pirls_mix.x_transformed;
+    let n_obs = eta.len();
+    let p_eff = x_t.ncols();
+    const EPS: f64 = 1e-8;
+
+    let mut leverage = Array1::<f64>::zeros(n_obs);
+    if h_pos_w.ncols() > 0 {
+        match x_t {
+            DesignMatrix::Dense(x_dense) => {
+                let xw = x_dense.dot(h_pos_w.as_ref());
+                for i in 0..xw.nrows() {
+                    leverage[i] = xw.row(i).iter().map(|v| v * v).sum();
+                }
+            }
+            DesignMatrix::Sparse(_) => {
+                for col in 0..h_pos_w.ncols() {
+                    let w_col = h_pos_w.column(col).to_owned();
+                    let xw_col = x_t.matrix_vector_multiply(&w_col);
+                    Zip::from(&mut leverage)
+                        .and(&xw_col)
+                        .for_each(|h, &v| *h += v * v);
+                }
+            }
+        }
+    }
+
+    let mut ll3 = Array1::<f64>::zeros(n_obs);
+    let mut du_j = Array1::<f64>::zeros(n_obs);
+    let mut dw_explicit_j = Array1::<f64>::zeros(n_obs);
+    let mut mix_partials = if use_mixture {
+        vec![
+            crate::mixture_link::InverseLinkJet {
+                mu: 0.0,
+                d1: 0.0,
+                d2: 0.0,
+                d3: 0.0,
+            };
+            aux_dim
+        ]
+    } else {
+        Vec::new()
+    };
+
+    for j in 0..aux_dim {
+        let mut direct_ll_j = 0.0_f64;
+        du_j.fill(0.0);
+        dw_explicit_j.fill(0.0);
+        for i in 0..n_obs {
+            if use_mixture {
+                let mix_state = mix_state_eval.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput("missing blended inverse-link state".to_string())
+                })?;
+                let jet = mixture_inverse_link_jet_with_rho_partials_into(
+                    mix_state,
+                    eta[i],
+                    &mut mix_partials,
+                );
+                let mu = jet.mu.clamp(EPS, 1.0 - EPS);
+                let d1 = jet.d1;
+                let d2 = jet.d2;
+                let d3 = jet.d3;
+                let yi = y_o[i];
+                let wi = w_o[i].max(0.0);
+                let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+                let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
+                let a3 = wi
+                    * (2.0 * yi / (mu * mu * mu)
+                        - 2.0 * (1.0 - yi) / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
+                if j == 0 {
+                    ll3[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+                }
+                let dj = mix_partials[j];
+                let dmu = dj.mu;
+                let dd1 = dj.d1;
+                let dd2 = dj.d2;
+                direct_ll_j += a1 * dmu;
+                du_j[i] = a2 * dmu * d1 + a1 * dd1;
+                let dell2_explicit =
+                    a3 * dmu * d1 * d1 + 2.0 * a2 * d1 * dd1 + a2 * dmu * d2 + a1 * dd2;
+                dw_explicit_j[i] = -dell2_explicit;
+            } else {
+                let sas = sas_state_eval.ok_or_else(|| {
+                    EstimationError::InvalidInput("missing SAS link state".to_string())
+                })?;
+                let jets =
+                    sas_inverse_link_jet_with_param_partials(eta[i], sas.epsilon, sas.log_delta);
+                let mu = jets.jet.mu.clamp(EPS, 1.0 - EPS);
+                let d1 = jets.jet.d1;
+                let d2 = jets.jet.d2;
+                let d3 = jets.jet.d3;
+                let yi = y_o[i];
+                let wi = w_o[i].max(0.0);
+                let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+                let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
+                let a3 = wi
+                    * (2.0 * yi / (mu * mu * mu)
+                        - 2.0 * (1.0 - yi) / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
+                if j == 0 {
+                    ll3[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+                }
+                let dj = if j == 0 {
+                    jets.djet_depsilon
+                } else {
+                    jets.djet_dlog_delta
+                };
+                let dmu = dj.mu;
+                let dd1 = dj.d1;
+                let dd2 = dj.d2;
+                direct_ll_j += a1 * dmu;
+                du_j[i] = a2 * dmu * d1 + a1 * dd1;
+                let dell2_explicit =
+                    a3 * dmu * d1 * d1 + 2.0 * a2 * d1 * dd1 + a2 * dmu * d2 + a1 * dd2;
+                dw_explicit_j[i] = -dell2_explicit;
+            }
+        }
+        let rhs_j = x_t.transpose_vector_multiply(&du_j);
+        let dbeta_j = if h_pos_w.ncols() > 0 {
+            let wt_rhs = h_pos_w.t().dot(&rhs_j);
+            h_pos_w.as_ref().dot(&wt_rhs)
+        } else {
+            Array1::<f64>::zeros(p_eff)
+        };
+        let eta_dot_j = x_t.matrix_vector_multiply(&dbeta_j);
+        let mut trace_term = 0.0_f64;
+        for i in 0..n_obs {
+            let dw_total = dw_explicit_j[i] - ll3[i] * eta_dot_j[i];
+            trace_term += leverage[i] * dw_total;
+        }
+        grad[k + j] = -direct_ll_j + 0.5 * trace_term;
+    }
+    if use_sas && sas_ridge > 0.0 {
+        grad[k + 1] += sas_ridge * theta[k + 1];
+    }
+    Ok((cost, grad))
 }
 
 #[cfg(test)]

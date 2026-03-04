@@ -75,10 +75,7 @@ impl SparseTraceWorkspace {
         })
     }
 
-    fn canonical_support(
-        support: &[usize],
-        n: usize,
-    ) -> Result<Vec<usize>, EstimationError> {
+    fn canonical_support(support: &[usize], n: usize) -> Result<Vec<usize>, EstimationError> {
         let mut key = support.to_vec();
         key.sort_unstable();
         key.dedup();
@@ -633,7 +630,8 @@ pub fn build_sparse_penalty_blocks(
             true
         };
         let s_k_block_dense = if p_end > p_start {
-            s_k.slice(ndarray::s![p_start..p_end, p_start..p_end]).to_owned()
+            s_k.slice(ndarray::s![p_start..p_end, p_start..p_end])
+                .to_owned()
         } else {
             Array2::<f64>::zeros((0, 0))
         };
@@ -743,15 +741,9 @@ mod tests {
         let factor = factorize_sparse_spd(&h_sparse).unwrap();
         let mut ws = SparseTraceWorkspace::default();
 
-        let first = ws
-            .selected_block_inverse(&factor, 1, 3)
-            .unwrap()
-            .clone();
+        let first = ws.selected_block_inverse(&factor, 1, 3).unwrap().clone();
         assert_eq!(ws.selected_block_inv_cache.len(), 1);
-        let second = ws
-            .selected_block_inverse(&factor, 1, 3)
-            .unwrap()
-            .clone();
+        let second = ws.selected_block_inverse(&factor, 1, 3).unwrap().clone();
         assert_eq!(ws.selected_block_inv_cache.len(), 1);
         assert_eq!(first.raw_dim(), second.raw_dim());
         for i in 0..first.nrows() {

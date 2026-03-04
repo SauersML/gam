@@ -10,6 +10,7 @@ use crate::linalg::sparse_exact::{
 use crate::pirls::{
     DirectionalWorkingCurvature, PirlsWorkspace, directional_working_curvature_callback,
 };
+use crate::types::SasLinkState;
 use faer::Side;
 
 mod cache;
@@ -218,7 +219,8 @@ mod tests {
             state.weights,
             &pr.solve_weights,
             &eta_dot,
-        );
+        )
+        .expect("directional working curvature should evaluate for logit");
         let mut wx = x.clone();
         let mut wx_tau = x_tau.clone();
         for i in 0..x.nrows() {
@@ -1348,6 +1350,11 @@ impl PirlsLruCache {
         self.order.push_back(key.clone());
         self.map.insert(key, value);
     }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
 }
 
 /// Centralized cache/memoization owner for REML evaluations.
@@ -1435,13 +1442,15 @@ pub(crate) struct RemlState<'a> {
     weights: ArrayView1<'a, f64>,
     offset: Array1<f64>,
     // Original penalty matrices S_k (p × p), ρ-independent basis
-    s_full_list: Vec<Array2<f64>>,
+    s_full_list: Arc<Vec<Array2<f64>>>,
     pub(crate) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
     balanced_penalty_root: Array2<f64>,
     reparam_invariant: ReparamInvariant,
     sparse_penalty_blocks: Option<Arc<Vec<SparsePenaltyBlock>>>,
     p: usize,
     config: &'a RemlConfig,
+    runtime_mixture_link_state: Option<crate::types::MixtureLinkState>,
+    runtime_sas_link_state: Option<SasLinkState>,
     nullspace_dims: Vec<usize>,
     coefficient_lower_bounds: Option<Array1<f64>>,
     linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,

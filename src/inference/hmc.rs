@@ -1765,6 +1765,14 @@ pub fn run_nuts_sampling_flattened_family(
             "BinomialCLogLog NUTS is not implemented yet; use fit_gam/predict_gam for cloglog models"
                 .to_string(),
         ),
+        (LikelihoodFamily::BinomialMixture, FamilyNutsInputs::Glm(_)) => Err(
+            "BinomialMixture NUTS is not implemented yet; use fit_gam/predict_gam for blended inverse-link models"
+                .to_string(),
+        ),
+        (LikelihoodFamily::BinomialSas, FamilyNutsInputs::Glm(_)) => Err(
+            "BinomialSas NUTS is not implemented yet; use fit_gam/predict_gam for SAS-link models"
+                .to_string(),
+        ),
         (LikelihoodFamily::RoystonParmar, FamilyNutsInputs::Survival(survival)) => {
             survival_hmc::run_survival_nuts_sampling(
                 survival.flat.age_entry,

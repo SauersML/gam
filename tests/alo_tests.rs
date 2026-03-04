@@ -2,7 +2,7 @@ use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_pirls;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetric_with_fallback, fast_ata};
 use gam::pirls::{self, PirlsConfig};
-use gam::types::{LinkFunction, LogSmoothingParamsView};
+use gam::types::{InverseLink, LinkFunction, LogSmoothingParamsView};
 use ndarray::{Array1, Array2, Axis};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -45,7 +45,7 @@ fn fit_unpenalized(
     let offset = Array1::<f64>::zeros(x.nrows());
     let rs_original: Vec<Array2<f64>> = Vec::new();
     let cfg = PirlsConfig {
-        link_function: link,
+        link_kind: InverseLink::Standard(link),
         max_iterations: 100,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: matches!(link, LinkFunction::Logit),
