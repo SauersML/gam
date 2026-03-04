@@ -629,7 +629,7 @@ impl<'a> JointModelState<'a> {
         &mut self,
         u: &Array1<f64>,
         b_wiggle: &Array2<f64>,
-    ) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let n = self.n_obs();
         let eta = self.compute_eta_full(u, b_wiggle);
         self.last_eta = Some(eta.clone());
@@ -653,10 +653,31 @@ impl<'a> JointModelState<'a> {
                     None,
                     None,
                 ) {
-                    log::warn!("joint integrated working-vector update failed: {}", e);
+                    log::warn!(
+                        "joint integrated working-vector update failed (falling back to non-integrated): {}",
+                        e
+                    );
+                    crate::pirls::update_glm_vectors(
+                        self.y,
+                        &eta,
+                        self.link.clone(),
+                        self.weights,
+                        &mut mu,
+                        &mut weights,
+                        &mut z_glm,
+                        None,
+                        None,
+                        None,
+                    )
+                    .map_err(|e2| {
+                        EstimationError::InvalidInput(format!(
+                            "joint working-vector update failed for {:?}: integrated error: {}; non-integrated fallback error: {}",
+                            self.link, e, e2
+                        ))
+                    })?;
                 }
             } else {
-                if let Err(e) = crate::pirls::update_glm_vectors(
+                crate::pirls::update_glm_vectors(
                     self.y,
                     &eta,
                     self.link.clone(),
@@ -667,12 +688,10 @@ impl<'a> JointModelState<'a> {
                     None,
                     None,
                     None,
-                ) {
-                    log::warn!("joint working-vector update failed: {}", e);
-                }
+                )?;
             }
         } else {
-            if let Err(e) = crate::pirls::update_glm_vectors(
+            crate::pirls::update_glm_vectors(
                 self.y,
                 &eta,
                 self.link.clone(),
@@ -683,11 +702,9 @@ impl<'a> JointModelState<'a> {
                 None,
                 None,
                 None,
-            ) {
-                log::warn!("joint working-vector update failed: {}", e);
-            }
+            )?;
         }
-        (eta, mu, weights, z_glm)
+        Ok((eta, mu, weights, z_glm))
     }
 
     /// Solve penalized weighted least squares: (X'WX + λS + δI)β = X'Wz
@@ -857,7 +874,7 @@ impl<'a> JointModelState<'a> {
         lambda_base: &Array1<f64>,
         lambda_link: f64,
     ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
-        let (_, mu, weights, z_glm) = self.compute_joint_working_vectors(u, b_wiggle);
+        let (_, mu, weights, z_glm) = self.compute_joint_working_vectors(u, b_wiggle)?;
         if !(self.firth_bias_reduction && matches!(self.link, LinkFunction::Logit)) {
             return Ok((weights, z_glm));
         }

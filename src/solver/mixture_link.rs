@@ -33,17 +33,23 @@ pub struct SasJetWithParamPartials {
     pub djet_dlog_delta: InverseLinkJet,
 }
 
-pub fn state_from_sas_spec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
-    if !spec.initial_epsilon.is_finite() || !spec.initial_log_delta.is_finite() {
-        return Err("SAS link parameters must be finite".to_string());
+impl SasLinkState {
+    /// Construct SAS state from raw optimizer parameters using the same bounded
+    /// transform used everywhere in fitting/evaluation.
+    pub fn new(raw_epsilon: f64, raw_log_delta: f64) -> Result<Self, String> {
+        if !raw_epsilon.is_finite() || !raw_log_delta.is_finite() {
+            return Err("SAS link parameters must be finite".to_string());
+        }
+        Ok(Self {
+            epsilon: raw_epsilon,
+            log_delta: raw_log_delta,
+            delta: sas_delta_from_raw_log_delta(raw_log_delta),
+        })
     }
-    let log_delta = spec.initial_log_delta;
-    let delta = sas_delta_from_raw_log_delta(log_delta);
-    Ok(SasLinkState {
-        epsilon: spec.initial_epsilon,
-        log_delta,
-        delta,
-    })
+}
+
+pub fn state_from_sas_spec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
+    SasLinkState::new(spec.initial_epsilon, spec.initial_log_delta)
 }
 
 #[inline]
