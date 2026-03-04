@@ -57,15 +57,15 @@ pub struct SasLinkState {
     pub delta: f64,
 }
 
-/// Unified binomial link selector with optional state.
+/// Parameterized inverse-link selector used where mu/derivatives are evaluated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum LinkKind {
+pub enum InverseLink {
     Standard(LinkFunction),
     Sas(SasLinkState),
     Mixture(MixtureLinkState),
 }
 
-impl LinkKind {
+impl InverseLink {
     #[inline]
     pub fn link_function(&self) -> LinkFunction {
         match self {
@@ -91,6 +91,9 @@ impl LinkKind {
         }
     }
 }
+
+/// Backward-compatible alias; new code should prefer `InverseLink`.
+pub type LinkKind = InverseLink;
 
 /// Engine-level likelihood selector used by generic solver entrypoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
