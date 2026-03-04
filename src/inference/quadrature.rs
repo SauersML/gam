@@ -2344,6 +2344,35 @@ where
     integrate_normal_ghq_adaptive(ctx, eta, se_eta, f)
 }
 
+#[inline]
+pub fn normal_expectation_1d_adaptive_pair<F>(
+    ctx: &QuadratureContext,
+    eta: f64,
+    se_eta: f64,
+    f: F,
+) -> (f64, f64)
+where
+    F: Fn(f64) -> (f64, f64),
+{
+    if se_eta < 1e-10 {
+        return f(eta);
+    }
+    let n = adaptive_point_count_from_sd(se_eta.abs());
+    with_gh_nodes_weights(ctx, n, |nodes, weights| {
+        let scale = SQRT_2 * se_eta;
+        let norm = 1.0 / std::f64::consts::PI.sqrt();
+        let mut s0 = 0.0;
+        let mut s1 = 0.0;
+        for i in 0..n {
+            let (v0, v1) = f(eta + scale * nodes[i]);
+            let w = weights[i];
+            s0 += w * v0;
+            s1 += w * v1;
+        }
+        (s0 * norm, s1 * norm)
+    })
+}
+
 fn adaptive_point_count_from_sd(max_sd: f64) -> usize {
     // Use a more aggressive schedule for nonlinear tail-sensitive transforms.
     // 7 points stays for very well-identified rows, 15/21 kick in earlier for
@@ -3609,11 +3638,11 @@ mod tests {
     #[test]
     fn integrated_family_moments_supports_stateful_sas() {
         let ctx = QuadratureContext::new();
-        let sas = SasLinkState {
-            epsilon: 0.3,
-            log_delta: -0.2,
-            delta: (-0.2f64).exp(),
-        };
+        let sas = crate::mixture_link::state_from_sas_spec(crate::types::SasLinkSpec {
+            initial_epsilon: 0.3,
+            initial_log_delta: -0.2,
+        })
+        .expect("sas state should reconstruct from raw parameters");
         let out = integrated_family_moments_jet_with_state(
             &ctx,
             LikelihoodFamily::BinomialSas,
