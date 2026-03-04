@@ -1,3 +1,4 @@
+use crate::estimate::EstimationError;
 use crate::mixture_link::inverse_link_jet_for_family;
 use crate::types::{InverseLink, LikelihoodFamily};
 use ndarray::{Array1, ArrayView1};
@@ -84,7 +85,7 @@ pub fn try_inverse_link_array(
     family: LikelihoodFamily,
     eta: ArrayView1<'_, f64>,
     link_kind: Option<&InverseLink>,
-) -> Result<Array1<f64>, String> {
+) -> Result<Array1<f64>, EstimationError> {
     if matches!(family, LikelihoodFamily::RoystonParmar) {
         return Ok(eta.to_owned());
     }
@@ -109,11 +110,11 @@ mod tests {
         let eta = array![0.1, -0.2, 0.3];
         let sas_err = try_inverse_link_array(LikelihoodFamily::BinomialSas, eta.view(), None)
             .expect_err("SAS without params should error");
-        assert!(sas_err.contains("requires SAS link state"));
+        assert!(sas_err.to_string().contains("requires SAS link state"));
 
         let mix_err = try_inverse_link_array(LikelihoodFamily::BinomialMixture, eta.view(), None)
             .expect_err("mixture without state should error");
-        assert!(mix_err.contains("requires mixture link state"));
+        assert!(mix_err.to_string().contains("requires mixture link state"));
     }
 
     #[test]

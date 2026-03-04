@@ -4618,7 +4618,6 @@ fn standard_inverse_link_jet(
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<MixtureInverseLinkJet, EstimationError> {
     inverse_link_jet_for_link_function(link, eta, mixture_link_state, sas_link_state)
-        .map_err(EstimationError::InvalidInput)
 }
 
 #[inline]
@@ -5043,19 +5042,6 @@ pub enum DirectionalWorkingCurvature {
     Diagonal(Array1<f64>),
 }
 
-/// Function signature for family-level directional working-curvature callbacks.
-///
-/// The callback implements the operator action
-///   W_τ = T[eta_direction]
-/// for a specific likelihood/link family.
-pub type DirectionalWorkingCurvatureCallback =
-    fn(
-        eta: &Array1<f64>,
-        prior_weights: ArrayView1<'_, f64>,
-        solve_weights: &Array1<f64>,
-        eta_direction: &Array1<f64>,
-    ) -> Result<DirectionalWorkingCurvature, EstimationError>;
-
 fn directional_working_curvature_diagonal_builtin(
     link: LinkFunction,
     eta: &Array1<f64>,
@@ -5144,33 +5130,6 @@ fn directional_working_curvature_identity(
     )))
 }
 
-fn directional_working_curvature_sas_state_required(
-    _eta: &Array1<f64>,
-    _prior_weights: ArrayView1<'_, f64>,
-    _solve_weights: &Array1<f64>,
-    _eta_direction: &Array1<f64>,
-) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    Err(EstimationError::InvalidInput(
-        "Directional SAS curvature requires explicit SasLinkState; state-less LinkFunction::Sas callback is unsupported".to_string(),
-    ))
-}
-
-/// Returns the family-level directional curvature callback for `W_τ = T[η̇]`.
-///
-/// This is the main dispatch surface higher layers should use when assembling
-/// exact directional Hessian drifts.
-pub fn directional_working_curvature_callback(
-    link: LinkFunction,
-) -> DirectionalWorkingCurvatureCallback {
-    match link {
-        LinkFunction::Logit => directional_working_curvature_logit,
-        LinkFunction::Probit => directional_working_curvature_probit,
-        LinkFunction::CLogLog => directional_working_curvature_cloglog,
-        LinkFunction::Sas => directional_working_curvature_sas_state_required,
-        LinkFunction::Identity => directional_working_curvature_identity,
-    }
-}
-
 /// Family-dispatched directional derivative of the PIRLS working curvature.
 ///
 /// This is the built-in GLM dispatch point for the abstract operator
@@ -5188,8 +5147,24 @@ pub fn directional_working_curvature_from_eta(
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    let callback = directional_working_curvature_callback(link);
-    callback(eta, prior_weights, solve_weights, eta_direction)
+    match link {
+        LinkFunction::Logit => {
+            directional_working_curvature_logit(eta, prior_weights, solve_weights, eta_direction)
+        }
+        LinkFunction::Probit => {
+            directional_working_curvature_probit(eta, prior_weights, solve_weights, eta_direction)
+        }
+        LinkFunction::CLogLog => {
+            directional_working_curvature_cloglog(eta, prior_weights, solve_weights, eta_direction)
+        }
+        LinkFunction::Identity => {
+            directional_working_curvature_identity(eta, prior_weights, solve_weights, eta_direction)
+        }
+        LinkFunction::Sas => Err(EstimationError::InvalidInput(
+            "state-less directional SAS curvature is unsupported; use directional_working_curvature_from_eta_with_state with SasLinkState"
+                .to_string(),
+        )),
+    }
 }
 
 /// State-aware directional derivative of PIRLS working curvature.

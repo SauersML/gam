@@ -62,7 +62,10 @@ fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<Likelihood
         LinkFunction::Logit => Some(LikelihoodFamily::BinomialLogit),
         LinkFunction::Probit => Some(LikelihoodFamily::BinomialProbit),
         LinkFunction::CLogLog => Some(LikelihoodFamily::BinomialCLogLog),
-        LinkFunction::Sas => Some(LikelihoodFamily::BinomialSas),
+        // Joint model currently carries only state-less LinkFunction.
+        // SAS requires explicit (epsilon, log_delta) state for mathematically
+        // correct integrated moments, so do not dispatch state-less SAS here.
+        LinkFunction::Sas => None,
         LinkFunction::Identity => None,
     }
 }
@@ -1146,6 +1149,12 @@ pub fn fit_joint_model_engine<'a>(
     geometry: JointLinkGeometry,
     mut config: JointModelConfig,
 ) -> Result<JointModelResult, EstimationError> {
+    if matches!(link, LinkFunction::Sas) {
+        return Err(EstimationError::InvalidSpecification(
+            "joint model engine does not support state-less SAS links; use binomial SAS fit paths that carry explicit SasLinkState"
+                .to_string(),
+        ));
+    }
     if geometry.degree != 3 {
         return Err(EstimationError::InvalidSpecification(
             "joint engine currently supports cubic link splines only (degree=3)".to_string(),
@@ -2917,6 +2926,12 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
     config: &JointModelConfig,
     covariate_se: Option<Array1<f64>>,
 ) -> Result<JointModelResult, EstimationError> {
+    if matches!(link, LinkFunction::Sas) {
+        return Err(EstimationError::InvalidSpecification(
+            "joint REML path does not support state-less SAS links; explicit SasLinkState plumbing is required"
+                .to_string(),
+        ));
+    }
     let _viz_guard = visualizer::init_guard(true);
     visualizer::set_stage("joint", "initializing");
     if config.firth_bias_reduction && matches!(link, LinkFunction::Logit) {

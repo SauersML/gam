@@ -2398,7 +2398,8 @@ fn evaluate_standard_family_observations(
             | LikelihoodFamily::BinomialSas
             | LikelihoodFamily::BinomialMixture => {
                 let jet =
-                    inverse_link_jet_for_family(family, eta_i, mixture_link_state, sas_link_state)?;
+                    inverse_link_jet_for_family(family, eta_i, mixture_link_state, sas_link_state)
+                        .map_err(|e| e.to_string())?;
                 let mu_i_raw = jet.mu;
                 let dmu_deta_raw = jet.d1;
                 let mu_i = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);

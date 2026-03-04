@@ -28,7 +28,7 @@ fn apply_family_inverse_link(
             "prediction uncertainty for RoystonParmar is not available in predict_gam".to_string(),
         ));
     }
-    try_inverse_link_array(family, eta.view(), link_kind).map_err(EstimationError::InvalidInput)
+    try_inverse_link_array(family, eta.view(), link_kind)
 }
 
 fn fit_mixture_link_state(
@@ -50,9 +50,14 @@ fn fit_mixture_link_state(
 }
 
 #[inline]
-fn quadratic_form(cov: &Array2<f64>, grad: &[f64]) -> f64 {
+fn quadratic_form(cov: &Array2<f64>, grad: &[f64]) -> Result<f64, EstimationError> {
     if cov.nrows() != grad.len() || cov.ncols() != grad.len() {
-        return 0.0;
+        return Err(EstimationError::InvalidInput(format!(
+            "covariance/gradient dimension mismatch: covariance is {}x{}, gradient length is {}",
+            cov.nrows(),
+            cov.ncols(),
+            grad.len()
+        )));
     }
     let mut acc = 0.0_f64;
     for i in 0..grad.len() {
@@ -60,14 +65,22 @@ fn quadratic_form(cov: &Array2<f64>, grad: &[f64]) -> f64 {
             acc += grad[i] * cov[[i, j]] * grad[j];
         }
     }
-    acc.max(0.0)
+    Ok(acc.max(0.0))
 }
 
 #[inline]
-fn quadratic_form_from_jet_mu(cov: &Array2<f64>, partials: &[InverseLinkJet]) -> f64 {
+fn quadratic_form_from_jet_mu(
+    cov: &Array2<f64>,
+    partials: &[InverseLinkJet],
+) -> Result<f64, EstimationError> {
     let m = partials.len();
     if cov.nrows() != m || cov.ncols() != m {
-        return 0.0;
+        return Err(EstimationError::InvalidInput(format!(
+            "covariance/mixture-gradient dimension mismatch: covariance is {}x{}, mixture gradient length is {}",
+            cov.nrows(),
+            cov.ncols(),
+            m
+        )));
     }
     let mut acc = 0.0_f64;
     for i in 0..m {
@@ -76,7 +89,7 @@ fn quadratic_form_from_jet_mu(cov: &Array2<f64>, partials: &[InverseLinkJet]) ->
             acc += gi * cov[[i, j]] * partials[j].mu;
         }
     }
-    acc.max(0.0)
+    Ok(acc.max(0.0))
 }
 
 fn linear_predictor_variance(x: &DesignMatrix, cov: &Array2<f64>) -> Array1<f64> {
@@ -720,7 +733,7 @@ where
             })?;
             let jets = sas_inverse_link_jet_with_param_partials(eta[i], epsilon, log_delta);
             let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
-            mean_var += quadratic_form(cov_theta, &g);
+            mean_var += quadratic_form(cov_theta, &g)?;
         }
         if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
             && let Some(cov_theta) = fit.mixture_link_param_covariance.as_ref()
@@ -739,7 +752,7 @@ where
             }
             let _ =
                 mixture_inverse_link_jet_with_rho_partials_into(state, eta[i], &mut mix_partials);
-            mean_var += quadratic_form_from_jet_mu(cov_theta, &mix_partials);
+            mean_var += quadratic_form_from_jet_mu(cov_theta, &mix_partials)?;
         }
         mean_standard_error[i] = mean_var.max(0.0).sqrt();
     }
