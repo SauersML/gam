@@ -120,3 +120,53 @@ pub fn try_inverse_link_array(
 pub fn inverse_link_array(family: LikelihoodFamily, eta: ArrayView1<'_, f64>) -> Array1<f64> {
     try_inverse_link_array(family, eta, None, None).unwrap_or_else(|msg| panic!("{msg}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mixture_link::state_from_spec;
+    use crate::types::{LinkComponent, MixtureLinkSpec};
+    use ndarray::array;
+
+    #[test]
+    fn sas_and_mixture_require_explicit_state() {
+        let eta = array![0.1, -0.2, 0.3];
+        let sas_err = try_inverse_link_array(LikelihoodFamily::BinomialSas, eta.view(), None, None)
+            .expect_err("SAS without params should error");
+        assert!(sas_err.contains("requires sas_params"));
+
+        let mix_err =
+            try_inverse_link_array(LikelihoodFamily::BinomialMixture, eta.view(), None, None)
+                .expect_err("mixture without state should error");
+        assert!(mix_err.contains("requires mixture_state"));
+    }
+
+    #[test]
+    fn sas_and_mixture_stateful_inverse_link_evaluates() {
+        let eta = array![0.1, -0.2, 0.3];
+        let sas = try_inverse_link_array(
+            LikelihoodFamily::BinomialSas,
+            eta.view(),
+            None,
+            Some((0.2, -0.1)),
+        )
+        .expect("SAS with params");
+        assert_eq!(sas.len(), eta.len());
+        assert!(sas.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
+
+        let spec = MixtureLinkSpec {
+            components: vec![LinkComponent::Probit, LinkComponent::CLogLog],
+            initial_rho: array![0.3],
+        };
+        let state = state_from_spec(&spec).expect("mixture state");
+        let mix = try_inverse_link_array(
+            LikelihoodFamily::BinomialMixture,
+            eta.view(),
+            Some(&state),
+            None,
+        )
+        .expect("mixture with state");
+        assert_eq!(mix.len(), eta.len());
+        assert!(mix.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
+    }
+}
