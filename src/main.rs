@@ -17,7 +17,8 @@ use gam::basis::{
 use gam::estimate::{
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, ModelSummary,
     ParametricTermSummary, SmoothTermSummary, fit_gam, optimize_external_design, predict_gam,
-    predict_gam_posterior_mean,
+    predict_gam_posterior_mean, predict_gam_posterior_mean_with_fit,
+    predict_gam_with_uncertainty,
 };
 use gam::families::sigma_link::{
     bounded_sigma_and_deriv_from_eta as sigma_and_deriv_from_eta,
@@ -1146,14 +1147,12 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             )
         })
     };
-    let saved_mixture_param_cov = model
-        .mixture_link_param_covariance
-        .as_ref()
-        .and_then(|rows| nested_vec_to_array2(rows).ok());
-    let saved_sas_param_cov = model
-        .sas_param_covariance
-        .as_ref()
-        .and_then(|rows| nested_vec_to_array2(rows).ok());
+    let saved_mixture_param_cov = parse_optional_covariance(
+        model.mixture_link_param_covariance.as_ref(),
+        "mixture_link_param_covariance",
+    )?;
+    let saved_sas_param_cov =
+        parse_optional_covariance(model.sas_param_covariance.as_ref(), "sas_param_covariance")?;
 
     let ds = load_dataset(&args.new_data)?;
     let col_map: HashMap<String, usize> = ds
@@ -4451,6 +4450,37 @@ fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<()
     if let Some(spec_noise) = model.resolved_term_spec_noise.as_ref() {
         validate_frozen_term_collection_spec(spec_noise, "resolved_term_spec_noise")?;
     }
+
+    if model.family == family_to_string(LikelihoodFamily::BinomialSas) {
+        if model.sas_epsilon.is_none() || model.sas_log_delta.is_none() {
+            return Err(
+                "saved binomial-sas model is missing sas_epsilon/sas_log_delta; refit or resave with current CLI"
+                    .to_string(),
+            );
+        }
+    }
+    if model.family == family_to_string(LikelihoodFamily::BinomialMixture) {
+        let components = model.mixture_link_components.as_ref().ok_or_else(|| {
+            "saved binomial-blended-inverse-link model is missing mixture_link_components"
+                .to_string()
+        })?;
+        if components.len() < 2 {
+            return Err(
+                "saved binomial-blended-inverse-link model must have at least 2 components"
+                    .to_string(),
+            );
+        }
+        let rho = model.mixture_link_rho.as_ref().ok_or_else(|| {
+            "saved binomial-blended-inverse-link model is missing mixture_link_rho".to_string()
+        })?;
+        let expected = components.len() - 1;
+        if rho.len() != expected {
+            return Err(format!(
+                "saved binomial-blended-inverse-link model has rho length mismatch: expected {expected}, got {}",
+                rho.len()
+            ));
+        }
+    }
     if model.family == family_to_string(LikelihoodFamily::RoystonParmar)
         && parse_survival_likelihood_mode(
             model
@@ -5951,10 +5981,10 @@ fn saved_mixture_link_spec(model: &SavedModel) -> Result<Option<MixtureLinkSpec>
         return Err("saved blended-link spec has fewer than 2 components".to_string());
     }
     let expected = components.len() - 1;
-    let rho_vec = model
-        .mixture_link_rho
-        .clone()
-        .unwrap_or_else(|| vec![0.0; expected]);
+    let rho_vec = model.mixture_link_rho.clone().ok_or_else(|| {
+        "saved blended-link spec is missing mixture_link_rho; cannot reconstruct link state"
+            .to_string()
+    })?;
     if rho_vec.len() != expected {
         return Err(format!(
             "saved blended-link rho length mismatch: expected {expected}, got {}",
@@ -5969,10 +5999,7 @@ fn saved_mixture_link_spec(model: &SavedModel) -> Result<Option<MixtureLinkSpec>
 
 fn saved_sas_params(model: &SavedModel) -> Option<(f64, f64)> {
     if model.family == "binomial-sas" || matches!(model.link.as_deref(), Some("sas")) {
-        Some((
-            model.sas_epsilon.unwrap_or(0.0),
-            model.sas_log_delta.unwrap_or(0.0),
-        ))
+        model.sas_epsilon.zip(model.sas_log_delta)
     } else {
         None
     }
@@ -6451,6 +6478,14 @@ fn nested_vec_to_array2(rows: &[Vec<f64>]) -> Result<Array2<f64>, String> {
         .collect::<Vec<_>>();
     Array2::from_shape_vec((n, p), flat)
         .map_err(|e| format!("failed to build covariance matrix: {e}"))
+}
+
+fn parse_optional_covariance(
+    rows: Option<&Vec<Vec<f64>>>,
+    label: &str,
+) -> Result<Option<Array2<f64>>, String> {
+    rows.map(|mat| nested_vec_to_array2(mat).map_err(|e| format!("invalid {label}: {e}")))
+        .transpose()
 }
 
 fn linear_predictor_se(x: ndarray::ArrayView2<'_, f64>, cov: &Array2<f64>) -> Array1<f64> {
