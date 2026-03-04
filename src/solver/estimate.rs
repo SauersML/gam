@@ -1210,6 +1210,23 @@ where
         } else {
             None
         };
+        let mut ll3_buf = Array1::<f64>::zeros(y_o.len());
+        let mut leverage_buf = Array1::<f64>::zeros(y_o.len());
+        let mut du_j_buf = Array1::<f64>::zeros(y_o.len());
+        let mut dw_explicit_j_buf = Array1::<f64>::zeros(y_o.len());
+        let mut mix_partials_buf_reuse = if use_mixture {
+            vec![
+                crate::mixture_link::InverseLinkJet {
+                    mu: 0.0,
+                    d1: 0.0,
+                    d2: 0.0,
+                    d3: 0.0,
+                };
+                aux_dim
+            ]
+        } else {
+            Vec::new()
+        };
         let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
             theta_dim,
             heuristic_theta_ref,
@@ -1270,35 +1287,23 @@ where
                 let n_obs = eta.len();
                 let p_eff = x_t.ncols();
                 let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
-                let mut ll3 = Array1::<f64>::zeros(n_obs);
-                let mut mix_partials_buf = if use_mixture {
-                    vec![
-                        crate::mixture_link::InverseLinkJet {
-                            mu: 0.0,
-                            d1: 0.0,
-                            d2: 0.0,
-                            d3: 0.0,
-                        };
-                        aux_dim
-                    ]
-                } else {
-                    Vec::new()
-                };
+                debug_assert_eq!(n_obs, ll3_buf.len());
+                ll3_buf.fill(0.0);
                 const EPS: f64 = 1e-8;
-                let mut leverage = Array1::<f64>::zeros(n_obs);
+                leverage_buf.fill(0.0);
                 if h_pos_w.ncols() > 0 {
                     match x_t {
                         DesignMatrix::Dense(x_dense) => {
-                            let xw = x_dense.dot(&h_pos_w);
+                            let xw = x_dense.dot(h_pos_w.as_ref());
                             for i in 0..xw.nrows() {
-                                leverage[i] = xw.row(i).iter().map(|v| v * v).sum();
+                                leverage_buf[i] = xw.row(i).iter().map(|v| v * v).sum();
                             }
                         }
                         DesignMatrix::Sparse(_) => {
                             for col in 0..h_pos_w.ncols() {
                                 let w_col = h_pos_w.column(col).to_owned();
                                 let xw_col = x_t.matrix_vector_multiply(&w_col);
-                                Zip::from(&mut leverage)
+                                Zip::from(&mut leverage_buf)
                                     .and(&xw_col)
                                     .for_each(|h, &v| *h += v * v);
                             }
@@ -1307,8 +1312,8 @@ where
                 }
                 for j in 0..aux_dim {
                     let mut direct_ll_j = 0.0_f64;
-                    let mut du_j = Array1::<f64>::zeros(n_obs);
-                    let mut dw_explicit_j = Array1::<f64>::zeros(n_obs);
+                    du_j_buf.fill(0.0);
+                    dw_explicit_j_buf.fill(0.0);
                     for i in 0..n_obs {
                         if use_mixture {
                             let mix_state = cfg_eval.mixture_link_state.as_ref().ok_or_else(|| {
@@ -1317,7 +1322,7 @@ where
                             let jet = mixture_inverse_link_jet_with_rho_partials_into(
                                 mix_state,
                                 eta[i],
-                                &mut mix_partials_buf,
+                                &mut mix_partials_buf_reuse,
                             );
                             let mu = jet.mu.clamp(EPS, 1.0 - EPS);
                             let d1 = jet.d1;
@@ -1333,19 +1338,19 @@ where
                                     - 2.0 * (1.0 - yi)
                                         / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
                             if j == 0 {
-                                ll3[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+                                ll3_buf[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
                             }
-                            let dj = mix_partials_buf[j];
+                            let dj = mix_partials_buf_reuse[j];
                             let dmu = dj.mu;
                             let dd1 = dj.d1;
                             let dd2 = dj.d2;
                             direct_ll_j += a1 * dmu;
-                            du_j[i] = a2 * dmu * d1 + a1 * dd1;
+                            du_j_buf[i] = a2 * dmu * d1 + a1 * dd1;
                             let dell2_explicit = a3 * dmu * d1 * d1
                                 + 2.0 * a2 * d1 * dd1
                                 + a2 * dmu * d2
                                 + a1 * dd2;
-                            dw_explicit_j[i] = -dell2_explicit;
+                            dw_explicit_j_buf[i] = -dell2_explicit;
                         } else {
                             let sas = cfg_eval.sas_link_state.ok_or_else(|| {
                                 EstimationError::InvalidInput("missing SAS state".to_string())
@@ -1369,7 +1374,7 @@ where
                                     - 2.0 * (1.0 - yi)
                                         / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
                             if j == 0 {
-                                ll3[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+                                ll3_buf[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
                             }
                             let dj = if j == 0 {
                                 jets.djet_depsilon
@@ -1380,28 +1385,28 @@ where
                             let dd1 = dj.d1;
                             let dd2 = dj.d2;
                             direct_ll_j += a1 * dmu;
-                            du_j[i] = a2 * dmu * d1 + a1 * dd1;
+                            du_j_buf[i] = a2 * dmu * d1 + a1 * dd1;
                             let dell2_explicit = a3 * dmu * d1 * d1
                                 + 2.0 * a2 * d1 * dd1
                                 + a2 * dmu * d2
                                 + a1 * dd2;
-                            dw_explicit_j[i] = -dell2_explicit;
+                            dw_explicit_j_buf[i] = -dell2_explicit;
                         }
                     }
-                    let rhs_j = x_t.transpose_vector_multiply(&du_j);
+                    let rhs_j = x_t.transpose_vector_multiply(&du_j_buf);
                     let dbeta_j = if h_pos_w.ncols() > 0 {
                         let wt_rhs = h_pos_w.t().dot(&rhs_j);
-                        h_pos_w.dot(&wt_rhs)
+                        h_pos_w.as_ref().dot(&wt_rhs)
                     } else {
                         Array1::<f64>::zeros(p_eff)
                     };
                     let eta_dot_j = x_t.matrix_vector_multiply(&dbeta_j);
                     let mut trace_term = 0.0_f64;
                     for i in 0..n_obs {
-                        let dw_total = dw_explicit_j[i] - ll3[i] * eta_dot_j[i];
-                        trace_term += leverage[i] * dw_total;
+                        let dw_total = dw_explicit_j_buf[i] - ll3_buf[i] * eta_dot_j[i];
+                        trace_term += leverage_buf[i] * dw_total;
                     }
-                    grad[k + j] = direct_ll_j - 0.5 * trace_term;
+                    grad[k + j] = -direct_ll_j + 0.5 * trace_term;
                 }
                 if use_sas && sas_ridge > 0.0 {
                     let log_delta = theta[k + 1];

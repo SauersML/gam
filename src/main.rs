@@ -1957,13 +1957,11 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 "internal error: eta SE unavailable for posterior-mean prediction".to_string()
             })?;
             let quad_ctx = gam::quadrature::QuadratureContext::new();
-            Array1::from_iter(
-                eta.iter().zip(se_ref.iter()).map(|(&e, &s)| {
-                    gam::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, s, |x| {
-                        mixture_inverse_link_jet(state, x).mu
-                    })
-                }),
-            )
+            Array1::from_iter(eta.iter().zip(se_ref.iter()).map(|(&e, &s)| {
+                gam::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, s, |x| {
+                    mixture_inverse_link_jet(state, x).mu
+                })
+            }))
         } else {
             eta.mapv(|e| mixture_inverse_link_jet(state, e).mu)
         };
@@ -1993,13 +1991,11 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 "internal error: eta SE unavailable for posterior-mean prediction".to_string()
             })?;
             let quad_ctx = gam::quadrature::QuadratureContext::new();
-            Array1::from_iter(
-                eta.iter().zip(se_ref.iter()).map(|(&e, &s)| {
-                    gam::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, s, |x| {
-                        sas_inverse_link_jet(x, epsilon, log_delta).mu
-                    })
-                }),
-            )
+            Array1::from_iter(eta.iter().zip(se_ref.iter()).map(|(&e, &s)| {
+                gam::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, s, |x| {
+                    sas_inverse_link_jet(x, epsilon, log_delta).mu
+                })
+            }))
         } else {
             eta.mapv(|e| sas_inverse_link_jet(e, epsilon, log_delta).mu)
         };
