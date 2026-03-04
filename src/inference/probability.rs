@@ -100,8 +100,8 @@ pub fn try_inverse_link_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mixture_link::state_from_spec;
-    use crate::types::{LinkComponent, MixtureLinkSpec};
+    use crate::mixture_link::{state_from_sas_spec, state_from_spec};
+    use crate::types::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
     use ndarray::array;
 
     #[test]
@@ -122,11 +122,13 @@ mod tests {
         let sas = try_inverse_link_array(
             LikelihoodFamily::BinomialSas,
             eta.view(),
-            Some(&InverseLink::Sas(crate::types::SasLinkState {
-                epsilon: 0.2,
-                log_delta: -0.1,
-                delta: (-0.1f64).exp(),
-            })),
+            Some(&InverseLink::Sas(
+                state_from_sas_spec(SasLinkSpec {
+                    initial_epsilon: 0.2,
+                    initial_log_delta: -0.1,
+                })
+                .expect("sas state"),
+            )),
         )
         .expect("SAS with params");
         assert_eq!(sas.len(), eta.len());

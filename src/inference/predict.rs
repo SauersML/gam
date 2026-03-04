@@ -6,7 +6,7 @@ use crate::mixture_link::{
 };
 use crate::probability::{standard_normal_quantile, try_inverse_link_array};
 use crate::types::MixtureLinkSpec;
-use crate::types::{InverseLink, LinkFunction, SasLinkState};
+use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 pub(crate) fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
@@ -585,11 +585,13 @@ where
         Some(InverseLink::Mixture(state))
     } else {
         sas_params.map(|(epsilon, log_delta)| {
-            InverseLink::Sas(SasLinkState {
-                epsilon,
-                log_delta,
-                delta: log_delta.exp(),
-            })
+            InverseLink::Sas(
+                crate::mixture_link::state_from_sas_spec(crate::types::SasLinkSpec {
+                    initial_epsilon: epsilon,
+                    initial_log_delta: log_delta,
+                })
+                .expect("fit SAS parameters should always reconstruct valid SAS link state"),
+            )
         })
     };
     let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;

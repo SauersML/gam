@@ -424,7 +424,8 @@ pub fn mixture_inverse_link_jet_with_rho_partials_into(
 }
 
 /// SAS inverse-link jet for:
-///   mu(eta) = Phi(sinh(delta * asinh(eta) - epsilon)), delta = exp(log_delta).
+///   mu(eta) = Phi(sinh(delta * asinh(eta) - epsilon)),
+///   delta = exp(B * tanh(log_delta / B)), B = SAS_LOG_DELTA_BOUND.
 pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLinkJet {
     let e = if eta.is_finite() { eta } else { 0.0 };
     let a = e.asinh();
