@@ -8,7 +8,7 @@ pub mod solver;
 pub mod terms;
 pub mod types;
 
-pub use inference::{alo, diagnostics, generative, hmc, predict, probability, quadrature};
+pub use inference::{alo, data, diagnostics, generative, hmc, predict, probability, quadrature};
 pub use linalg::{faer_ndarray, matrix, utils};
 pub use solver::{estimate, joint, mixture_link, pirls, seeding, smoothing, visualizer};
 pub use terms::{basis, construction, hull, layout, smooth};
@@ -47,10 +47,20 @@ pub use inference::alo::{
     AloDiagnostics, compute_alo_diagnostics, compute_alo_diagnostics_from_fit,
     compute_alo_diagnostics_from_pirls,
 };
+pub use inference::data::{
+    EncodedDataset, UnseenCategoryPolicy, encode_records_with_inferred_schema,
+    encode_records_with_schema, load_csv_with_inferred_schema, load_csv_with_schema,
+};
+pub use inference::formula_dsl::{
+    CallArgSpec, FormulaDslParse, FunctionCallSpec, parse_formula_dsl, parse_function_call,
+};
 pub use inference::generative::{
     CustomFamilyGenerative, GenerativeSpec, NoiseModel, custom_generative_spec,
     generative_spec_from_gam, generative_spec_from_predict, sample_observation_replicates,
     sample_observations,
+};
+pub use inference::model::{
+    ColumnKindTag, DataSchema, FittedFamily, FittedModel, ModelKind, SchemaColumn,
 };
 pub use solver::estimate::{
     CoefficientUncertaintyResult, FitArtifacts, FitOptions, FitResult, InferenceCovarianceMode,

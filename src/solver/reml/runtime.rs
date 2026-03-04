@@ -1173,11 +1173,17 @@ impl<'a> RemlState<'a> {
                 })
             }
             pirls::PirlsStatus::MaxIterationsReached => {
-                if pirls_result.last_gradient_norm > 1.0 {
-                    // The fit timed out and gradient is large.
+                // Envelope-theorem outer gradients require the inner solve to be near
+                // stationarity; a loose max-iter acceptance threshold (e.g. 1.0) causes
+                // persistent KKT/envelope diagnostic failures and inaccurate hyper-gradients.
+                let acceptable_kkt = (self.config.convergence_tolerance * 10.0).max(1e-4);
+                if pirls_result.last_gradient_norm > acceptable_kkt {
+                    // The fit timed out and gradient is still too large for reliable outer
+                    // derivatives, so fail fast and let the caller backtrack.
                     log::error!(
-                        "P-IRLS failed convergence check: gradient norm {} > 1.0 (iter {})",
+                        "P-IRLS failed convergence check: gradient norm {:.3e} > {:.3e} (iter {})",
                         pirls_result.last_gradient_norm,
+                        acceptable_kkt,
                         pirls_result.iteration
                     );
                     Err(EstimationError::PirlsDidNotConverge {
@@ -1185,10 +1191,11 @@ impl<'a> RemlState<'a> {
                         last_change: pirls_result.last_gradient_norm,
                     })
                 } else {
-                    // Gradient is acceptable, treat as converged but with warning if needed
+                    // Near-stationary despite max iterations; treat as usable.
                     log::warn!(
-                        "P-IRLS reached max iterations but gradient norm {:.3e} is acceptable.",
-                        pirls_result.last_gradient_norm
+                        "P-IRLS reached max iterations but gradient norm {:.3e} <= {:.3e}; accepting near-stationary fit.",
+                        pirls_result.last_gradient_norm,
+                        acceptable_kkt
                     );
                     self.update_warm_start_from(pirls_result.as_ref());
                     Ok(pirls_result)

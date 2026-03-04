@@ -2310,7 +2310,7 @@ def _ensure_rust_binary():
     return _RUST_BIN_PATH
 
 
-def run_rust_scenario_cv(scenario):
+def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial_link: str | None = None):
     scenario_name = scenario["name"]
     ds = dataset_for_scenario(scenario)
     folds = folds_for_dataset(ds)
@@ -2319,7 +2319,7 @@ def run_rust_scenario_cv(scenario):
         rust_bin = _ensure_rust_binary()
     except Exception as e:
         return {
-            "contender": "rust_gam",
+            "contender": contender_name,
             "scenario_name": scenario_name,
             "status": "failed",
             "error": str(e),
@@ -2399,17 +2399,32 @@ def run_rust_scenario_cv(scenario):
                 train_df.to_csv(train_path, index=False)
                 test_df.to_csv(test_path, index=False)
                 family, formula = _rust_formula_for_scenario(scenario_name, ds)
-                fit_cmd = [
-                    str(rust_bin),
-                    "fit",
-                    "--family",
-                    family,
-                    "--formula",
-                    formula,
-                    "--out",
-                    str(model_path),
-                    str(train_path),
-                ]
+                if ds["family"] == "binomial" and binomial_link:
+                    fit_cmd = [
+                        str(rust_bin),
+                        "fit",
+                        "--family",
+                        "auto",
+                        "--link",
+                        str(binomial_link),
+                        "--formula",
+                        formula,
+                        "--out",
+                        str(model_path),
+                        str(train_path),
+                    ]
+                else:
+                    fit_cmd = [
+                        str(rust_bin),
+                        "fit",
+                        "--family",
+                        family,
+                        "--formula",
+                        formula,
+                        "--out",
+                        str(model_path),
+                        str(train_path),
+                    ]
 
             def _looks_like_missing_csv(msg: str) -> bool:
                 m = (msg or "").lower()
@@ -2428,7 +2443,7 @@ def run_rust_scenario_cv(scenario):
             fit_sec = perf_counter() - t0
             if code != 0:
                 return {
-                    "contender": "rust_gam",
+                    "contender": contender_name,
                     "scenario_name": scenario_name,
                     "status": "failed",
                     "error": (err.strip() or out.strip() or "rust fit failed"),
@@ -2450,7 +2465,7 @@ def run_rust_scenario_cv(scenario):
             pred_sec = perf_counter() - t1
             if code != 0:
                 return {
-                    "contender": "rust_gam",
+                    "contender": contender_name,
                     "scenario_name": scenario_name,
                     "status": "failed",
                     "error": (err.strip() or out.strip() or "rust predict failed"),
@@ -2458,7 +2473,7 @@ def run_rust_scenario_cv(scenario):
             pred_df = pd.read_csv(pred_path)
             if "mean" not in pred_df.columns:
                 return {
-                    "contender": "rust_gam",
+                    "contender": contender_name,
                     "scenario_name": scenario_name,
                     "status": "failed",
                     "error": "rust prediction output missing 'mean' column",
@@ -2476,7 +2491,11 @@ def run_rust_scenario_cv(scenario):
                         "logloss": log_loss_score(y_test, pred),
                         "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": "gam fit/predict via release binary [5-fold CV]",
+                        "model_spec": (
+                            "gam fit/predict via release binary [5-fold CV]"
+                            if not binomial_link
+                            else f"gam fit/predict via release binary (link={binomial_link}) [5-fold CV]"
+                        ),
                     }
                 )
             elif ds["family"] == "gaussian":
@@ -2492,7 +2511,7 @@ def run_rust_scenario_cv(scenario):
                 code, out, err = run_cmd(train_pred_cmd, cwd=ROOT)
                 if code != 0:
                     return {
-                        "contender": "rust_gam",
+                        "contender": contender_name,
                         "scenario_name": scenario_name,
                         "status": "failed",
                         "error": (err.strip() or out.strip() or "rust train-predict failed"),
@@ -2500,7 +2519,7 @@ def run_rust_scenario_cv(scenario):
                 train_pred_df = pd.read_csv(train_pred_path)
                 if "mean" not in train_pred_df.columns:
                     return {
-                        "contender": "rust_gam",
+                        "contender": contender_name,
                         "scenario_name": scenario_name,
                         "status": "failed",
                         "error": "rust train prediction output missing 'mean' column",
@@ -2528,7 +2547,7 @@ def run_rust_scenario_cv(scenario):
                     risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
                 except RuntimeError as e:
                     return {
-                        "contender": "rust_gam",
+                        "contender": contender_name,
                         "scenario_name": scenario_name,
                         "status": "failed",
                         "error": str(e),
@@ -2554,7 +2573,7 @@ def run_rust_scenario_cv(scenario):
 
     metrics = aggregate_cv_rows(cv_rows, ds["family"])
     return {
-        "contender": "rust_gam",
+        "contender": contender_name,
         "family": ds["family"],
         "scenario_name": scenario_name,
         "status": "ok",
@@ -2563,7 +2582,25 @@ def run_rust_scenario_cv(scenario):
     }
 
 
-def run_rust_gamlss_scenario_cv(scenario):
+def run_rust_sas_scenario_cv(scenario):
+    ds = dataset_for_scenario(scenario)
+    if ds.get("family") != "binomial":
+        return None
+    return run_rust_scenario_cv(
+        scenario,
+        contender_name="rust_gam_sas",
+        binomial_link="sas",
+    )
+
+
+def _run_rust_gamlss_scenario_cv_variant(
+    scenario,
+    *,
+    contender_name: str,
+    binomial_cli_family: str,
+    binomial_model_spec_label: str,
+    binomial_extra_fit_args: list[str] | None = None,
+):
     scenario_name = scenario["name"]
     # Run for any scenario with a valid formula mapping (not just geo scenarios).
     if _rust_fit_mapping(scenario_name) is None:
@@ -2579,7 +2616,7 @@ def run_rust_gamlss_scenario_cv(scenario):
         rust_bin = _ensure_rust_binary()
     except Exception as e:
         return {
-            "contender": "rust_gamlss",
+            "contender": contender_name,
             "scenario_name": scenario_name,
             "status": "failed",
             "error": str(e),
@@ -2587,7 +2624,8 @@ def run_rust_gamlss_scenario_cv(scenario):
 
     _, mean_formula = _rust_formula_for_scenario(scenario_name, ds)
     noise_formula = "y ~ " + " + ".join(f"linear({c})" for c in ds["features"])
-    cli_family = "binomial-probit" if family == "binomial" else "gaussian"
+    cli_family = binomial_cli_family if family == "binomial" else "gaussian"
+    binom_extra = list(binomial_extra_fit_args or [])
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
 
@@ -2620,12 +2658,14 @@ def run_rust_gamlss_scenario_cv(scenario):
                 str(model_path),
                 str(train_path),
             ]
+            if family == "binomial" and binom_extra:
+                fit_cmd.extend(binom_extra)
             t0 = perf_counter()
             code, out, err = run_cmd(fit_cmd, cwd=ROOT)
             fit_sec = perf_counter() - t0
             if code != 0:
                 return {
-                    "contender": "rust_gamlss",
+                    "contender": contender_name,
                     "scenario_name": scenario_name,
                     "status": "failed",
                     "fold_id": int(fold_id),
@@ -2648,7 +2688,7 @@ def run_rust_gamlss_scenario_cv(scenario):
             pred_sec = perf_counter() - t1
             if code != 0:
                 return {
-                    "contender": "rust_gamlss",
+                    "contender": contender_name,
                     "scenario_name": scenario_name,
                     "status": "failed",
                     "fold_id": int(fold_id),
@@ -2660,7 +2700,7 @@ def run_rust_gamlss_scenario_cv(scenario):
             pred_df = pd.read_csv(pred_path)
             if "mean" not in pred_df.columns:
                 return {
-                    "contender": "rust_gamlss",
+                    "contender": contender_name,
                     "scenario_name": scenario_name,
                     "status": "failed",
                     "fold_id": int(fold_id),
@@ -2682,7 +2722,7 @@ def run_rust_gamlss_scenario_cv(scenario):
                         "logloss": log_loss_score(y_test, pred),
                         "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": "gamlss binomial-probit location-scale via release binary [5-fold CV]",
+                        "model_spec": f"{binomial_model_spec_label} [5-fold CV]",
                     }
                 )
             else:
@@ -2725,13 +2765,22 @@ def run_rust_gamlss_scenario_cv(scenario):
 
     metrics = aggregate_cv_rows(cv_rows, family)
     return {
-        "contender": "rust_gamlss",
+        "contender": contender_name,
         "family": family,
         "scenario_name": scenario_name,
         "status": "ok",
         **metrics,
         "model_spec": cv_rows[0]["model_spec"],
     }
+
+
+def run_rust_gamlss_scenario_cv(scenario):
+    return _run_rust_gamlss_scenario_cv_variant(
+        scenario,
+        contender_name="rust_gamlss",
+        binomial_cli_family="binomial-probit",
+        binomial_model_spec_label="gamlss binomial-probit location-scale via release binary",
+    )
 
 
 def run_rust_gamlss_survival_cv(scenario):
@@ -5546,6 +5595,9 @@ def main():
     for s_cfg in scenarios:
         # Invariant: Rust GAM must run for every scenario, including survival.
         results.append(run_rust_scenario_cv(s_cfg))
+        rust_sas_row = run_rust_sas_scenario_cv(s_cfg) if _is_contender_enabled(s_cfg, "rust_gam_sas") else None
+        if rust_sas_row is not None:
+            results.append(rust_sas_row)
         rust_gamlss_row = run_rust_gamlss_scenario_cv(s_cfg)
         if rust_gamlss_row is not None:
             results.append(rust_gamlss_row)

@@ -1,7 +1,10 @@
 pub mod alo;
+pub mod data;
 pub mod diagnostics;
+pub mod formula_dsl;
 pub mod generative;
 pub mod hmc;
+pub mod model;
 pub mod predict;
 pub mod probability;
 pub mod quadrature;

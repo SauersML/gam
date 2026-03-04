@@ -62,6 +62,7 @@ use crate::diagnostics::{
     approx_f64, format_compact_series, format_cond, format_range, quantize_value, quantize_vec,
     should_emit_h_min_eig_diag,
 };
+use serde::{Deserialize, Serialize};
 
 // Note: deflate_weights_by_se was removed. We now use integrated (GHQ)
 // family-dispatched likelihood updates in PIRLS instead of weight deflation.
@@ -2443,12 +2444,13 @@ pub struct FitOptions {
 
 /// Post-fit artifacts needed by downstream diagnostics/inference without
 /// re-running PIRLS.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FitArtifacts {
+    #[serde(default, skip_serializing, skip_deserializing)]
     pub pirls: Option<crate::pirls::PirlsResult>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FitResult {
     pub beta: Array1<f64>,
     pub lambdas: Array1<f64>,

@@ -14,6 +14,7 @@ use crate::families::sigma_link::{
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::DesignMatrix;
+use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::pirls::WorkingLikelihood as EngineWorkingLikelihood;
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::smooth::{
@@ -23,20 +24,18 @@ use crate::smooth::{
     optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivative_info_list,
 };
-use crate::types::{LikelihoodFamily, LinkFunction};
+use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use ndarray::{Array1, Array2, ArrayView1, s};
-use statrs::function::erf::erfc;
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
 const BETA_RANGE_WARN_THRESHOLD: f64 = 1.10;
 const BINOMIAL_EFFECTIVE_N_WARN_THRESHOLD: f64 = 25.0;
-const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
 
 /// Generic block input for high-level built-in family APIs.
 #[derive(Clone)]
@@ -750,6 +749,7 @@ pub struct GammaLogSpec {
 pub struct BinomialLocationScaleProbitSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
+    pub link_kind: InverseLink,
     pub sigma_min: f64,
     pub sigma_max: f64,
     pub threshold_block: ParameterBlockInput,
@@ -760,6 +760,7 @@ pub struct BinomialLocationScaleProbitSpec {
 pub struct BinomialLocationScaleProbitWiggleSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
+    pub link_kind: InverseLink,
     pub sigma_min: f64,
     pub sigma_max: f64,
     pub wiggle_knots: Array1<f64>,
@@ -783,6 +784,7 @@ pub struct GaussianLocationScaleTermSpec {
 pub struct BinomialLocationScaleProbitTermSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
+    pub link_kind: InverseLink,
     pub sigma_min: f64,
     pub sigma_max: f64,
     pub threshold_spec: TermCollectionSpec,
@@ -793,6 +795,7 @@ pub struct BinomialLocationScaleProbitTermSpec {
 pub struct BinomialLocationScaleProbitWiggleTermSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
+    pub link_kind: InverseLink,
     pub sigma_min: f64,
     pub sigma_max: f64,
     pub threshold_spec: TermCollectionSpec,
@@ -916,37 +919,41 @@ pub fn fit_binomial_location_scale_probit(
     let BinomialLocationScaleProbitSpec {
         y,
         weights,
+        link_kind,
         sigma_min,
         sigma_max,
         mut threshold_block,
         mut log_sigma_block,
     } = spec;
 
-    match try_binomial_alpha_beta_warm_start(
-        &y,
-        &weights,
-        sigma_min,
-        sigma_max,
-        &threshold_block,
-        &log_sigma_block,
-        options,
-    ) {
-        Ok((beta_t0, beta_ls0, beta_warm)) => {
-            threshold_block.initial_beta = Some(beta_t0);
-            log_sigma_block.initial_beta = Some(beta_ls0);
-            emit_binomial_alpha_beta_warnings("warm-start", &beta_warm, &y, &weights);
-        }
-        Err(err) => {
-            log::warn!(
-                "[GAMLSS][fit_binomial_location_scale_probit] alpha/beta warm start failed, falling back to direct initialization: {}",
-                err
-            );
+    if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+        match try_binomial_alpha_beta_warm_start(
+            &y,
+            &weights,
+            sigma_min,
+            sigma_max,
+            &threshold_block,
+            &log_sigma_block,
+            options,
+        ) {
+            Ok((beta_t0, beta_ls0, beta_warm)) => {
+                threshold_block.initial_beta = Some(beta_t0);
+                log_sigma_block.initial_beta = Some(beta_ls0);
+                emit_binomial_alpha_beta_warnings("warm-start", &beta_warm, &y, &weights);
+            }
+            Err(err) => {
+                log::warn!(
+                    "[GAMLSS][fit_binomial_location_scale_probit] alpha/beta warm start failed, falling back to direct initialization: {}",
+                    err
+                );
+            }
         }
     }
 
     let family = BinomialLocationScaleProbitFamily {
         y: y.clone(),
         weights: weights.clone(),
+        link_kind: link_kind.clone(),
         sigma_min,
         sigma_max,
     };
@@ -995,6 +1002,7 @@ pub fn fit_binomial_location_scale_probit_wiggle(
     let BinomialLocationScaleProbitWiggleSpec {
         y,
         weights,
+        link_kind,
         sigma_min,
         sigma_max,
         wiggle_knots,
@@ -1004,7 +1012,9 @@ pub fn fit_binomial_location_scale_probit_wiggle(
         wiggle_block,
     } = spec;
 
-    if threshold_block.initial_beta.is_none() || log_sigma_block.initial_beta.is_none() {
+    if (threshold_block.initial_beta.is_none() || log_sigma_block.initial_beta.is_none())
+        && matches!(link_kind, InverseLink::Standard(LinkFunction::Probit))
+    {
         match try_binomial_alpha_beta_warm_start(
             &y,
             &weights,
@@ -1035,6 +1045,7 @@ pub fn fit_binomial_location_scale_probit_wiggle(
     let family = BinomialLocationScaleProbitWiggleFamily {
         y: y.clone(),
         weights: weights.clone(),
+        link_kind: link_kind.clone(),
         sigma_min,
         sigma_max,
         threshold_design: Some(threshold_block.design.clone()),
@@ -1265,6 +1276,7 @@ pub fn fit_binomial_location_scale_probit_terms(
 ) -> Result<BlockwiseTermFitResult, String> {
     let y = spec.y;
     let weights = spec.weights;
+    let link_kind = spec.link_kind;
     let sigma_min = spec.sigma_min;
     let sigma_max = spec.sigma_max;
     let mut threshold_log_lambda_hint: Option<Array1<f64>> = None;
@@ -1327,6 +1339,7 @@ pub fn fit_binomial_location_scale_probit_terms(
                     BinomialLocationScaleProbitSpec {
                         y: y.clone(),
                         weights: weights.clone(),
+                        link_kind: link_kind.clone(),
                         sigma_min,
                         sigma_max,
                         threshold_block: ParameterBlockInput {
@@ -1398,6 +1411,7 @@ pub fn fit_binomial_location_scale_probit_terms(
                 let family = BinomialLocationScaleProbitFamily {
                     y: y.clone(),
                     weights: weights.clone(),
+                    link_kind: link_kind.clone(),
                     sigma_min,
                     sigma_max,
                 };
@@ -1433,6 +1447,7 @@ pub fn fit_binomial_location_scale_probit_terms(
                     BinomialLocationScaleProbitSpec {
                         y: y.clone(),
                         weights: weights.clone(),
+                        link_kind: link_kind.clone(),
                         sigma_min,
                         sigma_max,
                         threshold_block: ParameterBlockInput {
@@ -1495,6 +1510,7 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms(
 ) -> Result<BlockwiseTermFitResult, String> {
     let y = spec.y;
     let weights = spec.weights;
+    let link_kind = spec.link_kind;
     let sigma_min = spec.sigma_min;
     let sigma_max = spec.sigma_max;
     let wiggle_knots = spec.wiggle_knots;
@@ -1557,6 +1573,7 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms(
                     BinomialLocationScaleProbitWiggleSpec {
                         y: y.clone(),
                         weights: weights.clone(),
+                        link_kind: link_kind.clone(),
                         sigma_min,
                         sigma_max,
                         wiggle_knots: wiggle_knots.clone(),
@@ -1646,6 +1663,7 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms(
                 let family = BinomialLocationScaleProbitWiggleFamily {
                     y: y.clone(),
                     weights: weights.clone(),
+                    link_kind: link_kind.clone(),
                     sigma_min,
                     sigma_max,
                     threshold_design: Some(DesignMatrix::Dense(threshold_design.design.clone())),
@@ -1685,6 +1703,7 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms(
                     BinomialLocationScaleProbitWiggleSpec {
                         y: y.clone(),
                         weights: weights.clone(),
+                        link_kind: link_kind.clone(),
                         sigma_min,
                         sigma_max,
                         wiggle_knots: wiggle_knots.clone(),
@@ -1759,73 +1778,24 @@ fn signed_with_floor(v: f64, floor: f64) -> f64 {
 }
 
 #[inline]
-fn erfcx_nonnegative(x: f64) -> f64 {
-    if !x.is_finite() {
-        return if x.is_sign_positive() {
-            0.0
-        } else {
-            f64::INFINITY
-        };
-    }
-    if x <= 0.0 {
-        return 1.0;
-    }
-    if x < 26.0 {
-        ((x * x).min(700.0)).exp() * erfc(x)
-    } else {
-        let inv = 1.0 / x;
-        let inv2 = inv * inv;
-        let poly = 1.0
-            + 0.5 * inv2
-            + 0.75 * inv2 * inv2
-            + 1.875 * inv2 * inv2 * inv2
-            + 6.5625 * inv2 * inv2 * inv2 * inv2;
-        inv * poly / std::f64::consts::PI.sqrt()
-    }
-}
-
-#[inline]
-fn normal_cdf_stable(x: f64) -> f64 {
-    (0.5 * erfc(-x / std::f64::consts::SQRT_2)).clamp(MIN_PROB, 1.0 - MIN_PROB)
-}
-
-#[inline]
-fn inverse_mills_left(q: f64) -> f64 {
-    if q < 0.0 {
-        SQRT_2_OVER_PI / erfcx_nonnegative(-q / std::f64::consts::SQRT_2)
-    } else {
-        normal_pdf(q) / normal_cdf_stable(q)
-    }
-}
-
-#[inline]
-fn inverse_mills_right(q: f64) -> f64 {
-    inverse_mills_left(-q)
-}
-
-#[inline]
-fn probit_score_curvature(q: f64, y: f64, weight: f64) -> (f64, f64, f64) {
-    let p = normal_cdf_stable(q);
-    let lambda_left = inverse_mills_left(q);
-    let lambda_right = inverse_mills_right(q);
-    let score = weight * (y * lambda_left - (1.0 - y) * lambda_right);
-    let curvature = weight
-        * (y * (-q * lambda_left - lambda_left * lambda_left)
-            + (1.0 - y) * (q * lambda_right - lambda_right * lambda_right));
-    (p, score, curvature)
-}
-
-#[inline]
-fn probit_third_derivative(q: f64, y: f64, weight: f64) -> f64 {
-    let lambda_left = inverse_mills_left(q);
-    let lambda_right = inverse_mills_right(q);
-    weight
-        * (y * (lambda_left * (q * q - 1.0)
-            + 3.0 * q * lambda_left * lambda_left
-            + 2.0 * lambda_left * lambda_left * lambda_left)
-            + (1.0 - y)
-                * (lambda_right * (1.0 - q * q) + 3.0 * q * lambda_right * lambda_right
-                    - 2.0 * lambda_right * lambda_right * lambda_right))
+fn binomial_score_curvature_third_from_jet(
+    y: f64,
+    weight: f64,
+    mu: f64,
+    d1: f64,
+    d2: f64,
+    d3: f64,
+) -> (f64, f64, f64) {
+    let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
+    let one_minus = (1.0 - m).max(MIN_PROB);
+    let a1 = y / m - (1.0 - y) / one_minus;
+    let a2 = -y / (m * m) - (1.0 - y) / (one_minus * one_minus);
+    let a3 = 2.0 * y / (m * m * m) - 2.0 * (1.0 - y) / (one_minus * one_minus * one_minus);
+    let score = weight * a1 * d1;
+    let ll_second = weight * (a2 * d1 * d1 + a1 * d2);
+    let curvature = -ll_second;
+    let third = weight * (a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3);
+    (score, curvature, third)
 }
 
 fn xt_diag_x_design(design: &DesignMatrix, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
@@ -1923,6 +1893,8 @@ struct BinomialLocationScaleCore {
     q0: Array1<f64>,
     mu: Array1<f64>,
     dmu_dq: Array1<f64>,
+    d2mu_dq2: Array1<f64>,
+    d3mu_dq3: Array1<f64>,
     log_likelihood: f64,
 }
 
@@ -1932,6 +1904,7 @@ fn binomial_location_scale_core(
     eta_t: &Array1<f64>,
     eta_ls: &Array1<f64>,
     eta_wiggle: Option<&Array1<f64>>,
+    link_kind: &InverseLink,
     sigma_min: f64,
     sigma_max: f64,
 ) -> Result<BinomialLocationScaleCore, String> {
@@ -1950,6 +1923,8 @@ fn binomial_location_scale_core(
     let mut q0 = Array1::<f64>::zeros(n);
     let mut mu = Array1::<f64>::zeros(n);
     let mut dmu_dq = Array1::<f64>::zeros(n);
+    let mut d2mu_dq2 = Array1::<f64>::zeros(n);
+    let mut d3mu_dq3 = Array1::<f64>::zeros(n);
     let mut ll = 0.0;
 
     for i in 0..n {
@@ -1959,8 +1934,12 @@ fn binomial_location_scale_core(
         dsigma_deta[i] = dsigma_deta_i;
         q0[i] = -eta_t[i] / sigma[i].max(1e-12);
         let q = q0[i] + eta_wiggle.map_or(0.0, |w| w[i]);
-        mu[i] = normal_cdf_stable(q);
-        dmu_dq[i] = normal_pdf(q).max(MIN_DERIV);
+        let jet = inverse_link_jet_for_inverse_link(link_kind, q)
+            .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
+        mu[i] = jet.mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
+        dmu_dq[i] = jet.d1.max(MIN_DERIV);
+        d2mu_dq2[i] = jet.d2;
+        d3mu_dq3[i] = jet.d3;
         ll += weights[i] * (y[i] * mu[i].ln() + (1.0 - y[i]) * (1.0 - mu[i]).ln());
     }
 
@@ -1970,6 +1949,8 @@ fn binomial_location_scale_core(
         q0,
         mu,
         dmu_dq,
+        d2mu_dq2,
+        d3mu_dq3,
         log_likelihood: ll,
     })
 }
@@ -1994,8 +1975,14 @@ fn binomial_location_scale_working_sets(
         let mut h_q_psd = Array1::<f64>::zeros(n);
 
         for i in 0..n {
-            let q = core.q0[i] + eta_wiggle.map_or(0.0, |w| w[i]);
-            let (_, score_q, curvature_q) = probit_score_curvature(q, y[i], weights[i]);
+            let (score_q, curvature_q, _third_q) = binomial_score_curvature_third_from_jet(
+                y[i],
+                weights[i],
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+            );
             let a_i = dq_dq0.map_or(1.0, |v| v[i]);
             let c_i = geom.d2q_dq02[i];
             let s = core.sigma[i].max(1e-12);
@@ -2015,7 +2002,7 @@ fn binomial_location_scale_working_sets(
             h_eta_ls[i] = -(curvature_q * dq_ls * dq_ls + score_q * d2q_ls);
 
             grad_q[i] = score_q;
-            h_q_psd[i] = -curvature_q;
+            h_q_psd[i] = curvature_q.max(0.0);
         }
 
         let grad_t = geom.threshold_design.transpose_vector_multiply(&grad_eta_t);
@@ -2497,6 +2484,7 @@ pub struct BinomialLocationScaleProbitFamily {
     pub weights: Array1<f64>,
     pub sigma_min: f64,
     pub sigma_max: f64,
+    pub link_kind: InverseLink,
 }
 
 impl BinomialLocationScaleProbitFamily {
@@ -2541,6 +2529,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             eta_t,
             eta_ls,
             None,
+            &self.link_kind,
             self.sigma_min,
             self.sigma_max,
         )?;
@@ -2583,7 +2572,9 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitFamily {
             let sigma =
                 bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
             let q = -eta_t[i] / sigma;
-            mean[i] = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
+            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
+                .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
+            mean[i] = jet.mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
         }
         Ok(GenerativeSpec {
             mean,
@@ -2604,6 +2595,7 @@ pub struct BinomialLocationScaleProbitWiggleFamily {
     pub weights: Array1<f64>,
     pub sigma_min: f64,
     pub sigma_max: f64,
+    pub link_kind: InverseLink,
     pub threshold_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
     pub wiggle_knots: Array1<f64>,
@@ -2833,6 +2825,7 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             eta_t,
             eta_ls,
             Some(eta_w),
+            &self.link_kind,
             self.sigma_min,
             self.sigma_max,
         )?;
@@ -2909,6 +2902,7 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             eta_t,
             eta_ls,
             Some(eta_w),
+            &self.link_kind,
             self.sigma_min,
             self.sigma_max,
         )?;
@@ -2932,10 +2926,14 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
                 let d_eta = threshold_design.matrix_vector_multiply(d_beta);
                 let mut d_h_eta = Array1::<f64>::zeros(n);
                 for i in 0..n {
-                    let q = core.q0[i] + eta_w[i];
-                    let (_, score_q, curvature_q) =
-                        probit_score_curvature(q, self.y[i], self.weights[i]);
-                    let third_q = probit_third_derivative(q, self.y[i], self.weights[i]);
+                    let (score_q, curvature_q, third_q) = binomial_score_curvature_third_from_jet(
+                        self.y[i],
+                        self.weights[i],
+                        core.mu[i],
+                        core.dmu_dq[i],
+                        core.d2mu_dq2[i],
+                        core.d3mu_dq3[i],
+                    );
                     let s = sigma[i].max(1e-12);
                     let q1 = -dq_dq0[i] / s;
                     let q2 = d2q_dq02[i] / (s * s);
@@ -2957,10 +2955,14 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
                 let d_eta = log_sigma_design.matrix_vector_multiply(d_beta);
                 let mut d_h_eta = Array1::<f64>::zeros(n);
                 for i in 0..n {
-                    let q = core.q0[i] + eta_w[i];
-                    let (_, score_q, curvature_q) =
-                        probit_score_curvature(q, self.y[i], self.weights[i]);
-                    let third_q = probit_third_derivative(q, self.y[i], self.weights[i]);
+                    let (score_q, curvature_q, third_q) = binomial_score_curvature_third_from_jet(
+                        self.y[i],
+                        self.weights[i],
+                        core.mu[i],
+                        core.dmu_dq[i],
+                        core.d2mu_dq2[i],
+                        core.d3mu_dq3[i],
+                    );
                     let s = sigma[i].max(1e-12);
                     let q0_1 = -core.q0[i] * ds[i] / s;
                     let q0_2 = eta_t[i] * (d2s[i] / (s * s) - 2.0 * ds[i] * ds[i] / (s * s * s));
@@ -2989,8 +2991,14 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
                 let d_eta = wiggle_design.dot(d_beta);
                 let mut d_h_q = Array1::<f64>::zeros(n);
                 for i in 0..n {
-                    let q = core.q0[i] + eta_w[i];
-                    let third_q = probit_third_derivative(q, self.y[i], self.weights[i]);
+                    let (_, _, third_q) = binomial_score_curvature_third_from_jet(
+                        self.y[i],
+                        self.weights[i],
+                        core.mu[i],
+                        core.dmu_dq[i],
+                        core.d2mu_dq2[i],
+                        core.d3mu_dq3[i],
+                    );
                     d_h_q[i] = -third_q * d_eta[i];
                 }
                 Ok(Some(xt_diag_x_dense(&wiggle_design, &d_h_q)?))
@@ -3025,6 +3033,7 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             eta_t,
             eta_ls,
             Some(eta_w),
+            &self.link_kind,
             self.sigma_min,
             self.sigma_max,
         )?;
@@ -3046,8 +3055,14 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let mut h = Array2::<f64>::zeros((total, total));
 
         for i in 0..n {
-            let q = core.q0[i] + eta_w[i];
-            let (_, score_q, curvature_q) = probit_score_curvature(q, self.y[i], self.weights[i]);
+            let (score_q, curvature_q, _third_q) = binomial_score_curvature_third_from_jet(
+                self.y[i],
+                self.weights[i],
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+            );
             let s = sigma[i].max(1e-12);
             let q0_t = -1.0 / s;
             let q0_ls = -core.q0[i] * ds[i] / s;
@@ -3135,6 +3150,7 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             eta_t,
             eta_ls,
             Some(eta_w),
+            &self.link_kind,
             self.sigma_min,
             self.sigma_max,
         )?;
@@ -3167,9 +3183,14 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
 
         let mut d_h = Array2::<f64>::zeros((total, total));
         for i in 0..n {
-            let q = core.q0[i] + eta_w[i];
-            let (_, score_q, curvature_q) = probit_score_curvature(q, self.y[i], self.weights[i]);
-            let third_q = probit_third_derivative(q, self.y[i], self.weights[i]);
+            let (score_q, curvature_q, third_q) = binomial_score_curvature_third_from_jet(
+                self.y[i],
+                self.weights[i],
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+            );
             let s = sigma[i].max(1e-12);
             let q0_t = -1.0 / s;
             let q0_ls = -core.q0[i] * ds[i] / s;
@@ -3286,7 +3307,7 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
 
     fn known_link_wiggle(&self) -> Option<KnownLinkWiggle> {
         Some(KnownLinkWiggle {
-            base_link: LinkFunction::Probit,
+            base_link: self.link_kind.link_function(),
             wiggle_block: Some(Self::BLOCK_WIGGLE),
         })
     }
@@ -3353,7 +3374,9 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {
             let sigma =
                 bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
             let q0 = -eta_t[i] / sigma;
-            mean[i] = normal_cdf_approx(q0 + eta_w[i]).clamp(MIN_PROB, 1.0 - MIN_PROB);
+            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q0 + eta_w[i])
+                .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
+            mean[i] = jet.mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
         }
         Ok(GenerativeSpec {
             mean,
@@ -3429,6 +3452,7 @@ mod tests {
         let spec = BinomialLocationScaleProbitSpec {
             y,
             weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
             sigma_min: 0.3,
             sigma_max: 3.0,
             threshold_block: intercept_block(n),
@@ -3437,6 +3461,32 @@ mod tests {
 
         let fit = fit_binomial_location_scale_probit(spec, &BlockwiseFitOptions::default())
             .expect("binomial location-scale probit should fit");
+        assert_eq!(fit.block_states.len(), 2);
+        assert!(fit.log_likelihood.is_finite());
+    }
+
+    #[test]
+    fn fit_binomial_location_scale_sas_runs() {
+        let n = 28usize;
+        let y = Array1::from_vec((0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect());
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let sas = crate::mixture_link::state_from_sas_spec(crate::types::SasLinkSpec {
+            initial_epsilon: 0.15,
+            initial_log_delta: -0.05,
+        })
+        .expect("sas state");
+        let spec = BinomialLocationScaleProbitSpec {
+            y,
+            weights,
+            link_kind: InverseLink::Sas(sas),
+            sigma_min: 0.3,
+            sigma_max: 3.0,
+            threshold_block: intercept_block(n),
+            log_sigma_block: intercept_block(n),
+        };
+
+        let fit = fit_binomial_location_scale_probit(spec, &BlockwiseFitOptions::default())
+            .expect("binomial location-scale sas should fit");
         assert_eq!(fit.block_states.len(), 2);
         assert!(fit.log_likelihood.is_finite());
     }
@@ -3521,6 +3571,7 @@ mod tests {
         let spec = BinomialLocationScaleProbitTermSpec {
             y,
             weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
             sigma_min: 0.25,
             sigma_max: 3.5,
             threshold_spec: simple_matern_term_collection(&[0, 1], 0.4),
@@ -3568,6 +3619,7 @@ mod tests {
         let spec = BinomialLocationScaleProbitWiggleTermSpec {
             y,
             weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
             sigma_min: 0.25,
             sigma_max: 3.5,
             threshold_spec: simple_matern_term_collection(&[0, 1], 0.45),
@@ -3617,6 +3669,7 @@ mod tests {
             weights: weights.clone(),
             sigma_min: 0.05,
             sigma_max: 20.0,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: None,
             log_sigma_design: None,
             wiggle_knots: knots,
@@ -3629,6 +3682,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
+            &family.link_kind,
             family.sigma_min,
             family.sigma_max,
         )
@@ -3645,6 +3699,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             Some(&eta_w),
+            &family.link_kind,
             family.sigma_min,
             family.sigma_max,
         )
@@ -3730,6 +3785,7 @@ mod tests {
             weights: weights.clone(),
             sigma_min: 0.05,
             sigma_max: 5.0,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
             wiggle_knots: knots,
@@ -3744,6 +3800,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
+            &family.link_kind,
             family.sigma_min,
             family.sigma_max,
         )
@@ -3825,6 +3882,7 @@ mod tests {
             weights: weights.clone(),
             sigma_min: 0.05,
             sigma_max: 4.0,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -3841,6 +3899,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
+            &family.link_kind,
             family.sigma_min,
             family.sigma_max,
         )
@@ -3901,6 +3960,7 @@ mod tests {
                 &plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T].eta,
                 &plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_LOG_SIGMA].eta,
                 None,
+                &family.link_kind,
                 family.sigma_min,
                 family.sigma_max,
             )
@@ -3953,6 +4013,7 @@ mod tests {
             weights: weights.clone(),
             sigma_min: 0.05,
             sigma_max: 4.0,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -3969,6 +4030,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
+            &family.link_kind,
             family.sigma_min,
             family.sigma_max,
         )
@@ -4041,6 +4103,7 @@ mod tests {
             &plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T].eta,
             &plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_LOG_SIGMA].eta,
             None,
+            &family.link_kind,
             family.sigma_min,
             family.sigma_max,
         )
@@ -4093,6 +4156,7 @@ mod tests {
             weights: weights.clone(),
             sigma_min: 0.05,
             sigma_max: 4.0,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
             wiggle_knots: knots,
@@ -4111,6 +4175,7 @@ mod tests {
                 &eta_t,
                 &eta_ls,
                 None,
+                &family.link_kind,
                 family.sigma_min,
                 family.sigma_max,
             )
@@ -4381,6 +4446,7 @@ mod tests {
             weights: weights.clone(),
             sigma_min: 0.05,
             sigma_max: 10.0,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
         };
         let states = vec![
             ParameterBlockState {
@@ -4399,6 +4465,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
+            &family.link_kind,
             family.sigma_min,
             family.sigma_max,
         )
@@ -4437,6 +4504,7 @@ mod tests {
             weights: weights.clone(),
             sigma_min: 0.1,
             sigma_max: 8.0,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: None,
             log_sigma_design: None,
             wiggle_knots: knots,
@@ -4449,6 +4517,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
+            &family.link_kind,
             family.sigma_min,
             family.sigma_max,
         )
@@ -4507,6 +4576,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             Some(&eta_w),
+            &family.link_kind,
             family.sigma_min,
             family.sigma_max,
         )

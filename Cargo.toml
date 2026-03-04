@@ -49,6 +49,8 @@ zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 logtest = "2"
 serial_test = "3.2.0"
 statrs = "0.18.0"
+pest = "2.8.3"
+pest_derive = "2.8.3"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
