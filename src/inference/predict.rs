@@ -302,8 +302,20 @@ where
         }
         None => match family {
             crate::types::LikelihoodFamily::GaussianIdentity => eta.clone(),
+            crate::types::LikelihoodFamily::BinomialSas => {
+                return Err(EstimationError::InvalidInput(
+                    "predict_gam_posterior_mean for BinomialSas requires SAS link parameters; use predict_gam_with_uncertainty with a FitResult or CLI prediction path".to_string(),
+                ));
+            }
+            crate::types::LikelihoodFamily::BinomialMixture => {
+                return Err(EstimationError::InvalidInput(
+                    "predict_gam_posterior_mean for BinomialMixture requires mixture link state; use predict_gam_with_uncertainty with a FitResult or CLI prediction path".to_string(),
+                ));
+            }
             crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
-            _ => unreachable!(),
+            crate::types::LikelihoodFamily::BinomialLogit
+            | crate::types::LikelihoodFamily::BinomialProbit
+            | crate::types::LikelihoodFamily::BinomialCLogLog => unreachable!(),
         },
     };
 

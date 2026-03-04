@@ -1192,6 +1192,18 @@ where
         };
         let mut smoothing_options_mix = smoothing_options.clone();
         smoothing_options_mix.fd_hessian_max_dim = 0;
+        let mut reml_eval = RemlState::new_with_offset_shared(
+            y_o.view(),
+            x_fit_o.clone(),
+            w_o.view(),
+            offset_o.view(),
+            Arc::clone(&s_list_shared),
+            p,
+            &cfg,
+            Some(active_nullspace_dims.clone()),
+            None,
+            fit_linear_constraints.clone(),
+        )?;
         let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
             theta_dim,
             heuristic_theta_ref,
@@ -1220,18 +1232,8 @@ where
                         .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
                     );
                 }
-                let reml_eval = RemlState::new_with_offset_shared(
-                    y_o.view(),
-                    x_fit_o.clone(),
-                    w_o.view(),
-                    offset_o.view(),
-                    Arc::clone(&s_list_shared),
-                    p,
-                    &cfg_eval,
-                    Some(active_nullspace_dims.clone()),
-                    None,
-                    fit_linear_constraints.clone(),
-                )?;
+                reml_eval
+                    .set_link_states(cfg_eval.mixture_link_state.clone(), cfg_eval.sas_link_state);
                 let t_cost = Instant::now();
                 let mut cost = reml_eval.compute_cost(&rho)?;
                 let sas_ridge = if use_sas { sas_ridge_weight } else { 0.0 };
