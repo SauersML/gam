@@ -1,7 +1,7 @@
 use crate::estimate::{EstimationError, FitResult};
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_from_spec};
-use crate::probability::{inverse_link_array, standard_normal_quantile};
+use crate::probability::{standard_normal_quantile, try_inverse_link_array};
 use crate::types::LinkFunction;
 use crate::types::MixtureLinkSpec;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -26,19 +26,8 @@ fn apply_family_inverse_link(
             "prediction uncertainty for RoystonParmar is not available in predict_gam".to_string(),
         ));
     }
-    if matches!(family, crate::types::LikelihoodFamily::BinomialMixture) {
-        let Some(state) = mixture_state else {
-            return Err(EstimationError::InvalidInput(
-                "BinomialMixture prediction requires mixture link state".to_string(),
-            ));
-        };
-        return Ok(eta.mapv(|e| mixture_inverse_link_jet(state, e).mu));
-    }
-    if matches!(family, crate::types::LikelihoodFamily::BinomialSas) {
-        let (epsilon, log_delta) = sas_params.unwrap_or((0.0, 0.0));
-        return Ok(eta.mapv(|e| sas_inverse_link_jet(e, epsilon, log_delta).mu));
-    }
-    Ok(inverse_link_array(family, eta.view()))
+    try_inverse_link_array(family, eta.view(), mixture_state, sas_params)
+        .map_err(EstimationError::InvalidInput)
 }
 
 fn fit_mixture_link_state(
