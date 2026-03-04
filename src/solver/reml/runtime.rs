@@ -375,12 +375,9 @@ impl<'a> RemlState<'a> {
     pub(crate) fn pirls_result_and_hpos_for_rho(
         &self,
         rho: &Array1<f64>,
-    ) -> Result<(crate::pirls::PirlsResult, Array2<f64>), EstimationError> {
+    ) -> Result<(Arc<crate::pirls::PirlsResult>, Arc<Array2<f64>>), EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        Ok((
-            bundle.pirls_result.as_ref().clone(),
-            bundle.h_pos_factor_w.as_ref().clone(),
-        ))
+        Ok((bundle.pirls_result.clone(), bundle.h_pos_factor_w.clone()))
     }
 
     pub(super) fn edf_from_h_and_e(
