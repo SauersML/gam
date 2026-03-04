@@ -92,9 +92,6 @@ impl InverseLink {
     }
 }
 
-/// Backward-compatible alias; new code should prefer `InverseLink`.
-pub type LinkKind = InverseLink;
-
 /// Engine-level likelihood selector used by generic solver entrypoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LikelihoodFamily {

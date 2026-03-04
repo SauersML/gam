@@ -16,7 +16,7 @@ use crate::mixture_link::{
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
-    LikelihoodFamily, LinkFunction, LinkKind, MixtureLinkSpec, MixtureLinkState, RidgePassport,
+    LikelihoodFamily, LinkFunction, InverseLink, MixtureLinkSpec, MixtureLinkState, RidgePassport,
     RidgePolicy, SasLinkSpec, SasLinkState,
 };
 use dyn_stack::{MemBuffer, MemStack};
@@ -41,7 +41,7 @@ use faer::{Auto, MatRef, Spec};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
-// Backward-compatible alias used by internal tests/helpers.
+// Local alias used by internal tests/helpers.
 #[cfg(test)]
 type InverseLinkJet = MixtureInverseLinkJet;
 
@@ -4226,7 +4226,7 @@ pub struct RunPirlsOptions {
 
 #[derive(Clone)]
 pub struct PirlsConfig {
-    pub link_kind: LinkKind,
+    pub link_kind: InverseLink,
     pub max_iterations: usize,
     pub convergence_tolerance: f64,
     pub firth_bias_reduction: bool,
@@ -4297,11 +4297,11 @@ pub fn run_pirls<'a>(
         )));
     }
     let link_kind = if let Some(state) = mixture_link_state {
-        LinkKind::Mixture(state)
+        InverseLink::Mixture(state)
     } else if let Some(state) = sas_link_state {
-        LinkKind::Sas(state)
+        InverseLink::Sas(state)
     } else {
-        LinkKind::Standard(link)
+        InverseLink::Standard(link)
     };
     let cfg = PirlsConfig {
         link_kind,
@@ -5684,7 +5684,7 @@ mod tests {
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
-    use crate::types::{Coefficients, LinkFunction, LinkKind, LogSmoothingParamsView};
+    use crate::types::{Coefficients, LinkFunction, InverseLink, LogSmoothingParamsView};
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
@@ -5998,7 +5998,7 @@ mod tests {
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
         let rs = vec![array![[1.0]]];
         let config = PirlsConfig {
-            link_kind: LinkKind::Standard(LinkFunction::Logit),
+            link_kind: InverseLink::Standard(LinkFunction::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
