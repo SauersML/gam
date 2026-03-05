@@ -1513,15 +1513,24 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                     let mut d_j_k = a_k.clone();
                     if u_norm > 1e-14 {
                         // Exact-by-default: use analytic joint directional derivative when
-                        // available; only fall back to finite differences if analytic is
-                        // unavailable for this family/state.
-                        let h_rho = if let Some(h) = family
-                            .exact_newton_joint_hessian_directional_derivative(
-                                &inner.block_states,
-                                &u_k,
-                            )?
-                        {
-                            h
+                        // available and numerically sane; fall back to finite differences
+                        // only when analytic output is unavailable or invalid.
+                        let analytic_h = family.exact_newton_joint_hessian_directional_derivative(
+                            &inner.block_states,
+                            &u_k,
+                        )?;
+                        let h_rho = if let Some(h) = analytic_h {
+                            if h.iter().all(|v| v.is_finite()) {
+                                h
+                            } else {
+                                finite_difference_joint_hessian_directional_derivative(
+                                    family,
+                                    specs,
+                                    &inner.block_states,
+                                    &u_k,
+                                    1e-5,
+                                )?
+                            }
                         } else {
                             finite_difference_joint_hessian_directional_derivative(
                                 family,
