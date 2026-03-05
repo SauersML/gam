@@ -1017,3 +1017,147 @@ impl<'a> RemlState<'a> {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{Array1, Array2, array};
+
+    fn logistic_weight(eta: f64) -> f64 {
+        let e = eta.clamp(-700.0, 700.0);
+        let mu = if e >= 0.0 {
+            1.0 / (1.0 + (-e).exp())
+        } else {
+            let ex = e.exp();
+            ex / (1.0 + ex)
+        };
+        mu * (1.0 - mu)
+    }
+
+    fn d1_fd(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {
+        (f(x + h) - f(x - h)) / (2.0 * h)
+    }
+
+    fn d2_fd(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {
+        (f(x + h) - 2.0 * f(x) + f(x - h)) / (h * h)
+    }
+
+    #[test]
+    fn firth_logistic_weight_derivatives_match_finite_difference() {
+        let x = array![
+            [1.0, -1.1, 0.2],
+            [1.0, -0.5, -0.6],
+            [1.0, 0.0, 0.3],
+            [1.0, 0.8, -0.4],
+            [1.0, 1.2, 0.7],
+        ];
+        let beta = array![0.15, -0.6, 0.35];
+        let eta = x.dot(&beta);
+        let op = RemlState::build_firth_dense_operator(&x, &eta).expect("firth operator");
+
+        let h12 = 2e-5;
+        let h34 = 1e-3;
+        let w = |z: f64| logistic_weight(z);
+        let w2 = |z: f64| d2_fd(w, z, h12);
+        let w3 = |z: f64| d1_fd(w2, z, h34);
+
+        for i in 0..eta.len() {
+            let z = eta[i];
+            let e = z.clamp(-700.0, 700.0);
+            let mu = if e >= 0.0 {
+                1.0 / (1.0 + (-e).exp())
+            } else {
+                let ex = e.exp();
+                ex / (1.0 + ex)
+            };
+            let t = 1.0 - 2.0 * mu;
+            let w_fd = w(z);
+            let w1_fd = d1_fd(w, z, h12);
+            let w2_fd = d2_fd(w, z, h12);
+            let w3_fd = d1_fd(w2, z, h34);
+            let w4_expected = w_fd * t * t * t * t - 22.0 * w_fd * w_fd * t * t + 16.0 * w_fd * w_fd * w_fd;
+
+            assert!((op.w[i] - w_fd).abs() < 1e-12);
+            assert_eq!(op.w1[i].signum(), w1_fd.signum());
+            assert_eq!(op.w2[i].signum(), w2_fd.signum());
+            assert_eq!(op.w3[i].signum(), w3_fd.signum());
+            assert_eq!(op.w4[i].signum(), w4_expected.signum());
+            assert!((op.w1[i] - w1_fd).abs() < 2e-7);
+            assert!((op.w2[i] - w2_fd).abs() < 2e-5);
+            assert!((op.w3[i] - w3_fd).abs() < 4e-4);
+            assert!((op.w4[i] - w4_expected).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn firth_mixed_second_direction_apply_is_symmetric_in_direction_order() {
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.6, -0.3],
+            [1.0, -0.1, 0.5],
+            [1.0, 0.3, -0.7],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, -0.4],
+        ];
+        let beta = array![0.1, -0.25, 0.2];
+        let eta = x.dot(&beta);
+        let op = RemlState::build_firth_dense_operator(&x, &eta).expect("firth operator");
+
+        let u = array![0.3, -0.2, 0.4];
+        let v = array![-0.5, 0.1, 0.25];
+        let du = RemlState::firth_direction(&op, &u);
+        let dv = RemlState::firth_direction(&op, &v);
+
+        let eye = Array2::<f64>::eye(x.ncols());
+        let uv = RemlState::firth_hphi_second_direction_apply(&op, &du, &dv, &eye);
+        let vu = RemlState::firth_hphi_second_direction_apply(&op, &dv, &du, &eye);
+
+        for i in 0..uv.nrows() {
+            for j in 0..uv.ncols() {
+                let a = uv[[i, j]];
+                let b = vu[[i, j]];
+                assert_eq!(
+                    a.signum(),
+                    b.signum(),
+                    "mixed direction sign mismatch at ({i},{j}): uv={a} vu={b}"
+                );
+                assert!(
+                    (a - b).abs() < 2e-7,
+                    "mixed direction mismatch at ({i},{j}): uv={a} vu={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn firth_direction_matrix_form_matches_apply_identity_form() {
+        let x = array![
+            [1.0, -1.1, 0.2],
+            [1.0, -0.6, -0.3],
+            [1.0, -0.1, 0.5],
+            [1.0, 0.3, -0.7],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, -0.4],
+        ];
+        let beta = array![0.08, -0.22, 0.27];
+        let eta = x.dot(&beta);
+        let op = RemlState::build_firth_dense_operator(&x, &eta).expect("firth operator");
+        let u = Array1::from_vec(vec![0.25, -0.4, 0.35]);
+        let dir = RemlState::firth_direction(&op, &u);
+
+        let p = x.ncols();
+        let eye = Array2::<f64>::eye(p);
+        let mut via_apply = RemlState::firth_hphi_direction_apply(&op, &dir, &eye);
+        for i in 0..p {
+            for j in 0..i {
+                let sym = 0.5 * (via_apply[[i, j]] + via_apply[[j, i]]);
+                via_apply[[i, j]] = sym;
+                via_apply[[j, i]] = sym;
+            }
+        }
+        let direct = RemlState::firth_hphi_direction(&op, &dir);
+        let diff = &direct - &via_apply;
+        let err = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(err < 1e-10, "direction/apply mismatch: {err:e}");
+    }
+}

@@ -112,6 +112,51 @@ pub enum LikelihoodFamily {
     RoystonParmar,
 }
 
+/// GLM-compatible likelihood families (survival families excluded by type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GlmLikelihoodFamily {
+    GaussianIdentity,
+    BinomialLogit,
+    BinomialProbit,
+    BinomialCLogLog,
+    BinomialSas,
+    BinomialBetaLogistic,
+    BinomialMixture,
+}
+
+impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {
+    type Error = &'static str;
+
+    fn try_from(value: LikelihoodFamily) -> Result<Self, Self::Error> {
+        match value {
+            LikelihoodFamily::GaussianIdentity => Ok(Self::GaussianIdentity),
+            LikelihoodFamily::BinomialLogit => Ok(Self::BinomialLogit),
+            LikelihoodFamily::BinomialProbit => Ok(Self::BinomialProbit),
+            LikelihoodFamily::BinomialCLogLog => Ok(Self::BinomialCLogLog),
+            LikelihoodFamily::BinomialSas => Ok(Self::BinomialSas),
+            LikelihoodFamily::BinomialBetaLogistic => Ok(Self::BinomialBetaLogistic),
+            LikelihoodFamily::BinomialMixture => Ok(Self::BinomialMixture),
+            LikelihoodFamily::RoystonParmar => {
+                Err("RoystonParmar is survival-specific and not a GLM likelihood")
+            }
+        }
+    }
+}
+
+impl From<GlmLikelihoodFamily> for LikelihoodFamily {
+    fn from(value: GlmLikelihoodFamily) -> Self {
+        match value {
+            GlmLikelihoodFamily::GaussianIdentity => Self::GaussianIdentity,
+            GlmLikelihoodFamily::BinomialLogit => Self::BinomialLogit,
+            GlmLikelihoodFamily::BinomialProbit => Self::BinomialProbit,
+            GlmLikelihoodFamily::BinomialCLogLog => Self::BinomialCLogLog,
+            GlmLikelihoodFamily::BinomialSas => Self::BinomialSas,
+            GlmLikelihoodFamily::BinomialBetaLogistic => Self::BinomialBetaLogistic,
+            GlmLikelihoodFamily::BinomialMixture => Self::BinomialMixture,
+        }
+    }
+}
+
 /// How ridge-adjusted determinants should be evaluated for outer criteria.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RidgeDeterminantMode {

@@ -2,7 +2,7 @@ use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, fast_ab, fast_atv,
+    array2_to_mat_mut, factorize_symmetric_with_fallback, fast_ab, fast_atv,
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, sparse_symmetric_upper_matvec_public,
@@ -16,14 +16,12 @@ use crate::mixture_link::{
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
-    InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec, MixtureLinkState, RidgePassport,
-    RidgePolicy, SasLinkSpec, SasLinkState,
+    GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkSpec,
+    MixtureLinkState, RidgePassport, RidgePolicy, SasLinkSpec, SasLinkState,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
-use faer::linalg::solvers::{
-    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
-};
+use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use faer::sparse::linalg::matmul::{
     SparseMatMulInfo, sparse_sparse_matmul_numeric, sparse_sparse_matmul_numeric_scratch,
     sparse_sparse_matmul_symbolic,
@@ -456,7 +454,7 @@ pub trait WorkingLikelihood {
     ) -> Result<f64, EstimationError>;
 }
 
-impl WorkingLikelihood for LikelihoodFamily {
+impl WorkingLikelihood for GlmLikelihoodFamily {
     fn irls_update(
         &self,
         y: ArrayView1<f64>,
@@ -470,11 +468,11 @@ impl WorkingLikelihood for LikelihoodFamily {
     ) -> Result<(), EstimationError> {
         match (self, integrated) {
             (
-                LikelihoodFamily::BinomialLogit
-                | LikelihoodFamily::BinomialProbit
-                | LikelihoodFamily::BinomialCLogLog
-                | LikelihoodFamily::BinomialSas
-                | LikelihoodFamily::BinomialBetaLogistic,
+                GlmLikelihoodFamily::BinomialLogit
+                | GlmLikelihoodFamily::BinomialProbit
+                | GlmLikelihoodFamily::BinomialCLogLog
+                | GlmLikelihoodFamily::BinomialSas
+                | GlmLikelihoodFamily::BinomialBetaLogistic,
                 Some(integ),
             ) => {
                 update_glm_vectors_integrated_by_family(
@@ -493,10 +491,7 @@ impl WorkingLikelihood for LikelihoodFamily {
                 )?;
                 Ok(())
             }
-            (LikelihoodFamily::RoystonParmar, Some(_)) => Err(EstimationError::InvalidInput(
-                "RoystonParmar requires survival-specific integrated updates".to_string(),
-            )),
-            (LikelihoodFamily::BinomialLogit, None) => {
+            (GlmLikelihoodFamily::BinomialLogit, None) => {
                 update_glm_vectors(
                     y,
                     eta,
@@ -511,7 +506,7 @@ impl WorkingLikelihood for LikelihoodFamily {
                 )?;
                 Ok(())
             }
-            (LikelihoodFamily::BinomialProbit, None) => {
+            (GlmLikelihoodFamily::BinomialProbit, None) => {
                 update_glm_vectors(
                     y,
                     eta,
@@ -526,7 +521,7 @@ impl WorkingLikelihood for LikelihoodFamily {
                 )?;
                 Ok(())
             }
-            (LikelihoodFamily::BinomialCLogLog, None) => {
+            (GlmLikelihoodFamily::BinomialCLogLog, None) => {
                 update_glm_vectors(
                     y,
                     eta,
@@ -541,7 +536,7 @@ impl WorkingLikelihood for LikelihoodFamily {
                 )?;
                 Ok(())
             }
-            (LikelihoodFamily::BinomialSas, None) => {
+            (GlmLikelihoodFamily::BinomialSas, None) => {
                 update_glm_vectors(
                     y,
                     eta,
@@ -556,7 +551,7 @@ impl WorkingLikelihood for LikelihoodFamily {
                 )?;
                 Ok(())
             }
-            (LikelihoodFamily::BinomialBetaLogistic, None) => {
+            (GlmLikelihoodFamily::BinomialBetaLogistic, None) => {
                 update_glm_vectors(
                     y,
                     eta,
@@ -571,10 +566,10 @@ impl WorkingLikelihood for LikelihoodFamily {
                 )?;
                 Ok(())
             }
-            (LikelihoodFamily::BinomialMixture, _) => Err(EstimationError::InvalidInput(
+            (GlmLikelihoodFamily::BinomialMixture, _) => Err(EstimationError::InvalidInput(
                 "BinomialMixture updates are handled by the PIRLS working model path".to_string(),
             )),
-            (LikelihoodFamily::GaussianIdentity, _) => {
+            (GlmLikelihoodFamily::GaussianIdentity, _) => {
                 update_glm_vectors(
                     y,
                     eta,
@@ -589,9 +584,6 @@ impl WorkingLikelihood for LikelihoodFamily {
                 )?;
                 Ok(())
             }
-            (LikelihoodFamily::RoystonParmar, None) => Err(EstimationError::InvalidInput(
-                "RoystonParmar requires survival-specific working model updates".to_string(),
-            )),
         }
     }
 
@@ -602,48 +594,44 @@ impl WorkingLikelihood for LikelihoodFamily {
         prior_weights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
         match self {
-            LikelihoodFamily::GaussianIdentity => Ok(calculate_deviance(
+            GlmLikelihoodFamily::GaussianIdentity => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::Identity,
                 prior_weights,
             )),
-            LikelihoodFamily::BinomialLogit => Ok(calculate_deviance(
+            GlmLikelihoodFamily::BinomialLogit => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::Logit,
                 prior_weights,
             )),
-            LikelihoodFamily::BinomialProbit => Ok(calculate_deviance(
+            GlmLikelihoodFamily::BinomialProbit => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::Probit,
                 prior_weights,
             )),
-            LikelihoodFamily::BinomialCLogLog => Ok(calculate_deviance(
+            GlmLikelihoodFamily::BinomialCLogLog => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::CLogLog,
                 prior_weights,
             )),
-            LikelihoodFamily::BinomialSas => {
+            GlmLikelihoodFamily::BinomialSas => {
                 Ok(calculate_deviance(y, mu, LinkFunction::Sas, prior_weights))
             }
-            LikelihoodFamily::BinomialBetaLogistic => Ok(calculate_deviance(
+            GlmLikelihoodFamily::BinomialBetaLogistic => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::BetaLogistic,
                 prior_weights,
             )),
-            LikelihoodFamily::BinomialMixture => Ok(calculate_deviance(
+            GlmLikelihoodFamily::BinomialMixture => Ok(calculate_deviance(
                 y,
                 mu,
                 LinkFunction::Logit,
                 prior_weights,
-            )),
-            LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-                "RoystonParmar deviance is survival-specific and not computed via GLM helper"
-                    .to_string(),
             )),
         }
     }
@@ -657,7 +645,7 @@ impl WorkingLikelihood for LikelihoodFamily {
     ) -> Result<f64, EstimationError> {
         const EPS: f64 = 1e-8;
         match self {
-            LikelihoodFamily::GaussianIdentity => {
+            GlmLikelihoodFamily::GaussianIdentity => {
                 let ll = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
                     0.0,
                     |acc, &yi, &mui, &wi| {
@@ -667,12 +655,12 @@ impl WorkingLikelihood for LikelihoodFamily {
                 );
                 Ok(ll)
             }
-            LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog
-            | LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture => {
+            GlmLikelihoodFamily::BinomialLogit
+            | GlmLikelihoodFamily::BinomialProbit
+            | GlmLikelihoodFamily::BinomialCLogLog
+            | GlmLikelihoodFamily::BinomialSas
+            | GlmLikelihoodFamily::BinomialBetaLogistic
+            | GlmLikelihoodFamily::BinomialMixture => {
                 let ll = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
                     0.0,
                     |acc, &yi, &mui, &wi| {
@@ -682,9 +670,6 @@ impl WorkingLikelihood for LikelihoodFamily {
                 );
                 Ok(ll)
             }
-            LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-                "RoystonParmar log-likelihood is survival-specific".to_string(),
-            )),
         }
     }
 }
@@ -1067,7 +1052,7 @@ struct GamWorkingModel<'a> {
     s_transformed: Array2<f64>,
     e_transformed: Array2<f64>,
     workspace: PirlsWorkspace,
-    likelihood: LikelihoodFamily,
+    likelihood: GlmLikelihoodFamily,
     link_kind: InverseLink,
     firth_bias_reduction: bool,
     firth_log_det: Option<f64>,
@@ -1149,9 +1134,9 @@ impl<'a> GamWorkingModel<'a> {
         };
         let likelihood = match &link_kind {
             InverseLink::Standard(link) => likelihood_from_link(*link),
-            InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
-            InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
-            InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+            InverseLink::Sas(_) => GlmLikelihoodFamily::BinomialSas,
+            InverseLink::BetaLogistic(_) => GlmLikelihoodFamily::BinomialBetaLogistic,
+            InverseLink::Mixture(_) => GlmLikelihoodFamily::BinomialMixture,
         };
         GamWorkingModel {
             x_original,
@@ -1947,42 +1932,18 @@ fn solve_newton_direction_dense(
     }
 
     let h_view = FaerArrayView::new(hessian);
-    direction_out.assign(gradient);
-    if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-        let mut rhs_view = array1_to_col_mat_mut(direction_out);
-        ch.solve_in_place(rhs_view.as_mut());
-        direction_out.mapv_inplace(|v| -v);
-        if array1_is_finite(direction_out) {
-            return Ok(());
-        }
-    }
-
-    let mut ldlt_err = FaerLinalgError::FactorizationFailed;
-    match FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-        Ok(ld) => {
-            direction_out.assign(gradient);
-            let mut rhs_view = array1_to_col_mat_mut(direction_out);
-            ld.solve_in_place(rhs_view.as_mut());
-            direction_out.mapv_inplace(|v| -v);
-            if array1_is_finite(direction_out) {
-                return Ok(());
-            }
-        }
-        Err(err) => {
-            ldlt_err = FaerLinalgError::Ldlt(err);
-        }
-    }
-
-    let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
+    let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower)
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
     direction_out.assign(gradient);
     let mut rhs_view = array1_to_col_mat_mut(direction_out);
-    lb.solve_in_place(rhs_view.as_mut());
+    factor.solve_in_place(rhs_view.as_mut());
     direction_out.mapv_inplace(|v| -v);
     if array1_is_finite(direction_out) {
         return Ok(());
     }
-
-    Err(EstimationError::LinearSystemSolveFailed(ldlt_err))
+    Err(EstimationError::LinearSystemSolveFailed(
+        FaerLinalgError::FactorizationFailed,
+    ))
 }
 
 fn project_coefficients_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &Array1<f64>) {
@@ -2181,27 +2142,12 @@ fn solve_subsystem_direction(
     }
     out.assign(g_sub);
     let h_view = FaerArrayView::new(h_sub);
-    if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-        let mut rhs = array1_to_col_mat_mut(out);
-        ch.solve_in_place(rhs.as_mut());
-        out.mapv_inplace(|v| -v);
-        if array1_is_finite(out) {
-            return Ok(());
-        }
-    }
-    if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-        out.assign(g_sub);
-        let mut rhs = array1_to_col_mat_mut(out);
-        ld.solve_in_place(rhs.as_mut());
-        out.mapv_inplace(|v| -v);
-        if array1_is_finite(out) {
-            return Ok(());
-        }
-    }
+    let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower).map_err(|_| {
+        EstimationError::InvalidInput("bounded Newton subsystem factorization failed".to_string())
+    })?;
     out.assign(g_sub);
-    let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
     let mut rhs = array1_to_col_mat_mut(out);
-    lb.solve_in_place(rhs.as_mut());
+    factor.solve_in_place(rhs.as_mut());
     out.mapv_inplace(|v| -v);
     if array1_is_finite(out) {
         return Ok(());
@@ -2221,25 +2167,13 @@ fn solve_symmetric_system(
     }
     out.assign(rhs);
     let matrix_view = FaerArrayView::new(matrix);
-    if let Ok(ch) = FaerLlt::new(matrix_view.as_ref(), Side::Lower) {
-        let mut rhs_view = array1_to_col_mat_mut(out);
-        ch.solve_in_place(rhs_view.as_mut());
-        if array1_is_finite(out) {
-            return Ok(());
-        }
-    }
-    if let Ok(ld) = FaerLdlt::new(matrix_view.as_ref(), Side::Lower) {
-        out.assign(rhs);
-        let mut rhs_view = array1_to_col_mat_mut(out);
-        ld.solve_in_place(rhs_view.as_mut());
-        if array1_is_finite(out) {
-            return Ok(());
-        }
-    }
+    let factor =
+        factorize_symmetric_with_fallback(matrix_view.as_ref(), Side::Lower).map_err(|_| {
+            EstimationError::InvalidInput("symmetric system factorization failed".to_string())
+        })?;
     out.assign(rhs);
-    let lb = FaerLblt::new(matrix_view.as_ref(), Side::Lower);
     let mut rhs_view = array1_to_col_mat_mut(out);
-    lb.solve_in_place(rhs_view.as_mut());
+    factor.solve_in_place(rhs_view.as_mut());
     if array1_is_finite(out) {
         return Ok(());
     }
@@ -4896,7 +4830,7 @@ pub fn update_glm_vectors(
 pub fn update_glm_vectors_by_family(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
-    family: LikelihoodFamily,
+    family: GlmLikelihoodFamily,
     prior_weights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
@@ -4969,11 +4903,11 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<(), EstimationError> {
     let family = match link {
-        LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
-        LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
-        LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
-        LinkFunction::Sas => LikelihoodFamily::BinomialSas,
-        LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
+        LinkFunction::Logit => GlmLikelihoodFamily::BinomialLogit,
+        LinkFunction::Probit => GlmLikelihoodFamily::BinomialProbit,
+        LinkFunction::CLogLog => GlmLikelihoodFamily::BinomialCLogLog,
+        LinkFunction::Sas => GlmLikelihoodFamily::BinomialSas,
+        LinkFunction::BetaLogistic => GlmLikelihoodFamily::BinomialBetaLogistic,
         LinkFunction::Identity => {
             update_glm_vectors(
                 y,
@@ -5034,7 +4968,7 @@ pub fn update_glm_vectors_integrated_by_family(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     se: ArrayView1<f64>,
-    family: LikelihoodFamily,
+    family: GlmLikelihoodFamily,
     prior_weights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
@@ -5045,10 +4979,10 @@ pub fn update_glm_vectors_integrated_by_family(
 ) -> Result<(), EstimationError> {
     if !matches!(
         family,
-        LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog
-            | LikelihoodFamily::BinomialSas
+        GlmLikelihoodFamily::BinomialLogit
+            | GlmLikelihoodFamily::BinomialProbit
+            | GlmLikelihoodFamily::BinomialCLogLog
+            | GlmLikelihoodFamily::BinomialSas
     ) {
         return Err(EstimationError::InvalidInput(format!(
             "Integrated updates are not supported for family {:?}",
@@ -5057,12 +4991,12 @@ pub fn update_glm_vectors_integrated_by_family(
     }
     let n = eta.len();
     let zero_on_nonsmooth =
-        matches!(family, LikelihoodFamily::BinomialLogit) && logit_clamp_zero_enabled();
+        matches!(family, GlmLikelihoodFamily::BinomialLogit) && logit_clamp_zero_enabled();
     let mut derivatives = derivatives;
     for i in 0..n {
         let moments = crate::quadrature::integrated_family_moments_jet_with_state(
             quad_ctx,
-            family,
+            family.into(),
             eta[i],
             se[i],
             mixture_link_state,
@@ -5367,14 +5301,14 @@ pub fn directional_working_curvature_from_eta_with_state(
 }
 
 #[inline]
-fn likelihood_from_link(link: LinkFunction) -> LikelihoodFamily {
+fn likelihood_from_link(link: LinkFunction) -> GlmLikelihoodFamily {
     match link {
-        LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
-        LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
-        LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
-        LinkFunction::Sas => LikelihoodFamily::BinomialSas,
-        LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
-        LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
+        LinkFunction::Logit => GlmLikelihoodFamily::BinomialLogit,
+        LinkFunction::Probit => GlmLikelihoodFamily::BinomialProbit,
+        LinkFunction::CLogLog => GlmLikelihoodFamily::BinomialCLogLog,
+        LinkFunction::Sas => GlmLikelihoodFamily::BinomialSas,
+        LinkFunction::BetaLogistic => GlmLikelihoodFamily::BinomialBetaLogistic,
+        LinkFunction::Identity => GlmLikelihoodFamily::GaussianIdentity,
     }
 }
 
@@ -5551,45 +5485,23 @@ pub fn solve_penalized_least_squares(
     // Track detected numerical rank and the actual stabilization used.
     let ridge_used = nugget;
 
-    // 6. Solve using LDLT (Robust for indefinite/near-singular), with LBLT fallback.
+    // 6. Solve using centralized LLT/LDLT/LBLT fallback factorization.
     let h_reg_view = FaerArrayView::new(&regularized_hessian);
 
-    // Use LDLT factorization
-    let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower);
     if workspace.rhs_full.len() != p_dim {
         workspace.rhs_full = Array1::zeros(p_dim);
     }
     workspace.rhs_full.assign(rhs_vec);
-    let (beta_vec, detected_rank) = if let Ok(factor) = ldlt {
-        let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
-        factor.solve_in_place(rhs_view.as_mut());
-        if array1_is_finite(&workspace.rhs_full) {
-            (workspace.rhs_full.clone(), p_dim)
-        } else {
-            let lblt = FaerLblt::new(h_reg_view.as_ref(), Side::Lower);
-            workspace.rhs_full.assign(rhs_vec);
-            let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
-            lblt.solve_in_place(rhs_view.as_mut());
-            if array1_is_finite(&workspace.rhs_full) {
-                (workspace.rhs_full.clone(), p_dim)
-            } else {
-                return Err(EstimationError::LinearSystemSolveFailed(
-                    FaerLinalgError::FactorizationFailed,
-                ));
-            }
-        }
-    } else {
-        let lblt = FaerLblt::new(h_reg_view.as_ref(), Side::Lower);
-        let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
-        lblt.solve_in_place(rhs_view.as_mut());
-        if array1_is_finite(&workspace.rhs_full) {
-            (workspace.rhs_full.clone(), p_dim)
-        } else {
-            return Err(EstimationError::LinearSystemSolveFailed(
-                FaerLinalgError::FactorizationFailed,
-            ));
-        }
-    };
+    let factor = factorize_symmetric_with_fallback(h_reg_view.as_ref(), Side::Lower)
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
+    let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
+    factor.solve_in_place(rhs_view.as_mut());
+    if !array1_is_finite(&workspace.rhs_full) {
+        return Err(EstimationError::LinearSystemSolveFailed(
+            FaerLinalgError::FactorizationFailed,
+        ));
+    }
+    let (beta_vec, detected_rank) = (workspace.rhs_full.clone(), p_dim);
 
     // 7. Calculate EDF and Scale
     // Re-use `regularized_hessian` for EDF to consistency.
@@ -5629,42 +5541,12 @@ fn calculate_edf(
     let h_view = FaerArrayView::new(penalized_hessian);
     let rhs_arr = e_transformed.t().to_owned();
     let rhs_view = FaerArrayView::new(&rhs_arr);
-
-    // Try LLᵀ first
-    if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-        let sol = ch.solve(rhs_view.as_ref());
-        if !matref_is_finite(sol.as_ref()) {
-            // Retry with more permissive factorizations.
-        } else {
-            let mut tr = 0.0;
-            for j in 0..r {
-                for i in 0..p {
-                    tr += sol[(i, j)] * e_transformed[(j, i)];
-                }
-            }
-            return Ok((p as f64 - tr).clamp(mp, p as f64));
+    let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower).map_err(|_| {
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
         }
-    }
-
-    // Try LDLᵀ (semi-definite)
-    if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-        let sol = ld.solve(rhs_view.as_ref());
-        if !matref_is_finite(sol.as_ref()) {
-            // Retry with LBLT.
-        } else {
-            let mut tr = 0.0;
-            for j in 0..r {
-                for i in 0..p {
-                    tr += sol[(i, j)] * e_transformed[(j, i)];
-                }
-            }
-            return Ok((p as f64 - tr).clamp(mp, p as f64));
-        }
-    }
-
-    // Last resort: symmetric indefinite LBLᵀ (Bunch–Kaufman)
-    let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
-    let sol = lb.solve(rhs_view.as_ref());
+    })?;
+    let sol = factor.solve(rhs_view.as_ref());
     if sol.nrows() == p && sol.ncols() == r && matref_is_finite(sol.as_ref()) {
         let mut tr = 0.0;
         for j in 0..r {
@@ -5701,53 +5583,14 @@ fn calculate_edf_with_workspace(
         }
     }
 
-    // Try LLᵀ first
-    if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-        let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
-        ch.solve_in_place(rhs_view.as_mut());
-        if array2_is_finite(&workspace.final_aug_matrix) {
-            let mut tr = 0.0;
-            for j in 0..r {
-                for i in 0..p {
-                    tr += workspace.final_aug_matrix[(i, j)] * e_transformed[(j, i)];
-                }
-            }
-            return Ok((p as f64 - tr).clamp(mp, p as f64));
+    let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower).map_err(|_| {
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
         }
-    }
-
-    // Try LDLᵀ (semi-definite)
-    if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-        workspace.final_aug_matrix.fill(0.0);
-        for j in 0..r {
-            for i in 0..p {
-                workspace.final_aug_matrix[[i, j]] = e_transformed[[j, i]];
-            }
-        }
-        let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
-        ld.solve_in_place(rhs_view.as_mut());
-        if array2_is_finite(&workspace.final_aug_matrix) {
-            let mut tr = 0.0;
-            for j in 0..r {
-                for i in 0..p {
-                    tr += workspace.final_aug_matrix[(i, j)] * e_transformed[(j, i)];
-                }
-            }
-            return Ok((p as f64 - tr).clamp(mp, p as f64));
-        }
-    }
-
-    // Last resort: symmetric indefinite LBLᵀ (Bunch–Kaufman)
-    let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
-    workspace.final_aug_matrix.fill(0.0);
-    for j in 0..r {
-        for i in 0..p {
-            workspace.final_aug_matrix[[i, j]] = e_transformed[[j, i]];
-        }
-    }
+    })?;
     {
         let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
-        lb.solve_in_place(rhs_view.as_mut());
+        factor.solve_in_place(rhs_view.as_mut());
     }
     if workspace.final_aug_matrix.nrows() == p
         && workspace.final_aug_matrix.ncols() == r

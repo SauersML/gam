@@ -1,5 +1,46 @@
 use super::*;
 
+struct JointHyperThetaBlocks<'a> {
+    theta: &'a Array1<f64>,
+    rho_dim: usize,
+}
+
+impl<'a> JointHyperThetaBlocks<'a> {
+    fn new(theta: &'a Array1<f64>, rho_dim: usize) -> Self {
+        Self { theta, rho_dim }
+    }
+
+    fn rho_owned(&self) -> Array1<f64> {
+        self.theta.slice(s![..self.rho_dim]).to_owned()
+    }
+
+    fn psi_owned(&self) -> Array1<f64> {
+        self.theta.slice(s![self.rho_dim..]).to_owned()
+    }
+
+    fn assemble_gradient(
+        &self,
+        rho_grad: &Array1<f64>,
+        psi_grad: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if rho_grad.len() != self.rho_dim
+            || psi_grad.len() != self.theta.len().saturating_sub(self.rho_dim)
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "joint hyper gradient split mismatch: rho_grad={}, psi_grad={}, rho_dim={}, theta_dim={}",
+                rho_grad.len(),
+                psi_grad.len(),
+                self.rho_dim,
+                self.theta.len()
+            )));
+        }
+        let mut out = Array1::<f64>::zeros(self.theta.len());
+        out.slice_mut(s![..self.rho_dim]).assign(rho_grad);
+        out.slice_mut(s![self.rho_dim..]).assign(psi_grad);
+        Ok(out)
+    }
+}
+
 impl<'a> RemlState<'a> {
     fn penalty_first_total(
         &self,
@@ -359,8 +400,9 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<(f64, Array1<f64>), EstimationError> {
         let psi_dim = self.validate_joint_hyper_inputs(theta, rho_dim, hyper_dirs)?;
-        let rho = theta.slice(s![..rho_dim]).to_owned();
-        let psi = theta.slice(s![rho_dim..]).to_owned();
+        let blocks = JointHyperThetaBlocks::new(theta, rho_dim);
+        let rho = blocks.rho_owned();
+        let psi = blocks.psi_owned();
         let eff_dirs = Self::relinearized_hyper_dirs(hyper_dirs, &psi);
         let (cost, rho_grad, psi_grad) = if psi_dim > 0 {
             let pert_state = self.build_joint_perturbed_state(&psi, hyper_dirs)?;
@@ -378,9 +420,7 @@ impl<'a> RemlState<'a> {
                 Array1::<f64>::zeros(0),
             )
         };
-        let mut out = Array1::<f64>::zeros(theta.len());
-        out.slice_mut(s![..rho_dim]).assign(&rho_grad);
-        out.slice_mut(s![rho_dim..]).assign(&psi_grad);
+        let out = blocks.assemble_gradient(&rho_grad, &psi_grad)?;
         Ok((cost, out))
     }
 
@@ -1368,8 +1408,9 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<Array2<f64>, EstimationError> {
         let psi_dim = self.validate_joint_hyper_inputs(theta, rho_dim, hyper_dirs)?;
-        let rho = theta.slice(s![..rho_dim]).to_owned();
-        let psi = theta.slice(s![rho_dim..]).to_owned();
+        let blocks = JointHyperThetaBlocks::new(theta, rho_dim);
+        let rho = blocks.rho_owned();
+        let psi = blocks.psi_owned();
         let eff_dirs = Self::relinearized_hyper_dirs(hyper_dirs, &psi);
         let (h_rr, h_rtau, h_tt) = if psi_dim > 0 {
             let pert_state = self.build_joint_perturbed_state(&psi, hyper_dirs)?;

@@ -57,6 +57,11 @@ package = "general-mcmc"
 version = "0.8.0"
 default-features = false
 
+[dev-dependencies]
+num-dual = "0.13.4"
+autodiff = "0.7.0"
+ad_trait = "0.2.2"
+
 [[bin]]
 name = "gam"
 path = "src/main.rs"

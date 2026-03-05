@@ -11,11 +11,16 @@ on:
   schedule:
     - cron: "0 4 * * *"
 
+concurrency:
+  group: benchmark-suite-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_NO_PYTHON_VERSION_WARNING: "1"
   R_LIBS_USER: ${{ github.workspace }}/.r-lib
+  BENCH_RUNTIME_CACHE_VERSION: v2
 
 jobs:
   prepare:
@@ -220,8 +225,12 @@ jobs:
         id: runtime-cache
         uses: actions/cache/restore@v4
         with:
-          path: bench/runtime
-          key: ${{ runner.os }}-bench-runtime-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', '.github/actions/bench-setup/action.yml', '.github/workflows/benchmark.yml') }}
+          path: |
+            bench/runtime/pydeps
+            bench/runtime/r-lib
+          key: ${{ runner.os }}-bench-runtime-${{ env.BENCH_RUNTIME_CACHE_VERSION }}-${{ hashFiles('.github/actions/bench-setup/action.yml', '.github/workflows/benchmark.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-bench-runtime-${{ env.BENCH_RUNTIME_CACHE_VERSION }}-
 
       - name: Shared benchmark setup (cached)
         if: ${{ steps.runtime-cache.outputs.cache-hit != 'true' }}
@@ -229,17 +238,25 @@ jobs:
         with:
           install-runtime-deps: "true"
 
-      - name: Build shared runtime once
-        if: ${{ steps.runtime-cache.outputs.cache-hit != 'true' }}
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build shared runtime
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p bench/runtime/pydeps bench/runtime/r-lib
-          if [ -d "${R_LIBS_USER}" ]; then
-            cp -a "${R_LIBS_USER}/." bench/runtime/r-lib/ || true
+          mkdir -p bench/runtime
+          if [ "${{ steps.runtime-cache.outputs.cache-hit }}" != "true" ]; then
+            mkdir -p bench/runtime/pydeps bench/runtime/r-lib
+            if [ -d "${R_LIBS_USER}" ]; then
+              cp -a "${R_LIBS_USER}/." bench/runtime/r-lib/ || true
+            fi
+            python3 -m pip install --upgrade pip setuptools wheel
+            python3 -m pip install --target bench/runtime/pydeps numpy pandas scikit-learn pygam lifelines scikit-survival xgboost matplotlib
           fi
-          python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install --target bench/runtime/pydeps numpy pandas scikit-learn pygam lifelines scikit-survival xgboost matplotlib
           cargo build --release --bin gam
           cp target/release/gam bench/runtime/gam
           chmod +x bench/runtime/gam
@@ -248,8 +265,10 @@ jobs:
         if: ${{ steps.runtime-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
-          path: bench/runtime
-          key: ${{ runner.os }}-bench-runtime-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**', '.github/actions/bench-setup/action.yml', '.github/workflows/benchmark.yml') }}
+          path: |
+            bench/runtime/pydeps
+            bench/runtime/r-lib
+          key: ${{ steps.runtime-cache.outputs.cache-primary-key }}
 
       - name: Upload shared runtime artifact
         uses: actions/upload-artifact@v4
