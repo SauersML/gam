@@ -662,256 +662,22 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         return Err("--firth requires logit link".to_string());
     }
     if let Some(noise_formula_raw) = &args.predict_noise {
-        let noise_formula = normalize_noise_formula(noise_formula_raw, &parsed.response);
-        let parsed_noise = parse_formula(&noise_formula)?;
-        if parsed_noise.link_wiggle.is_some() {
-            return Err(
-                "linkwiggle(...) is only supported in the mean formula, not --predict-noise"
-                    .to_string(),
-            );
-        }
-        let noise_spec = build_term_spec(&parsed_noise.terms, &ds, &col_map, &mut inference_notes)?;
-        let mean_spec = build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
-        if !args.no_summary {
-            print_inference_summary(&inference_notes);
-        }
-
-        if family == LikelihoodFamily::GaussianIdentity {
-            if learn_link_wiggle {
-                return Err(
-                    "link wiggle is currently supported only for binomial location-scale fitting"
-                        .to_string(),
-                );
-            }
-            let sd = sample_std(y.view()).max(1e-6);
-            let sigma_min = (sd * 1e-3).max(1e-6);
-            let sigma_max = (sd * 1e3).max(sigma_min * 10.0);
-
-            let options = blockwise_options_from_fit_args(&args)?;
-            let solved = fit_gaussian_location_scale_terms(
-                ds.values.view(),
-                GaussianLocationScaleTermSpec {
-                    y: y.clone(),
-                    weights: Array1::ones(y.len()),
-                    sigma_min,
-                    sigma_max,
-                    mean_spec: mean_spec.clone(),
-                    log_sigma_spec: noise_spec.clone(),
-                },
-                &options,
-                &SpatialLengthScaleOptimizationOptions::default(),
-            )
-            .map_err(|e| format!("fit_gaussian_location_scale_terms failed: {e}"))?;
-            let fit = solved.fit;
-            let resolved_mean_spec = solved.mean_spec_resolved;
-            let resolved_noise_spec = solved.noise_spec_resolved;
-            let mean_design = solved.mean_design;
-            let noise_design = solved.noise_design;
-            let frozen_mean_spec = freeze_term_collection_spec(&resolved_mean_spec, &mean_design)?;
-            let frozen_noise_spec =
-                freeze_term_collection_spec(&resolved_noise_spec, &noise_design)?;
-
-            if !args.no_summary {
-                println!(
-                    "model fit complete | family={} | outer_iter={} | converged={}",
-                    FAMILY_GAUSSIAN_LOCATION_SCALE, fit.outer_iterations, fit.converged
-                );
-            }
-
-            if let Some(out) = args.out {
-                let beta_mean = fit
-                    .block_states
-                    .first()
-                    .map(|b| b.beta.clone())
-                    .unwrap_or_else(|| Array1::zeros(0));
-                let fit_result = core_saved_fit_result(
-                    beta_mean,
-                    fit.lambdas.clone(),
-                    1.0,
-                    fit.covariance_conditional.clone(),
-                    fit.covariance_conditional.clone(),
-                    SavedFitSummary::from_blockwise_fit(&fit)?,
-                );
-                let model = build_location_scale_saved_model(
-                    formula_text.clone(),
-                    FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
-                    link_choice.as_ref().map(link_choice_to_string),
-                    ds.schema.clone(),
-                    noise_formula.clone(),
-                    ds.headers.clone(),
-                    frozen_mean_spec.clone(),
-                    frozen_noise_spec.clone(),
-                    fit_result,
-                    fit.block_states.get(1).map(|b| b.beta.to_vec()),
-                    sigma_min,
-                    sigma_max,
-                );
-                write_model_json(&out, &model)?;
-            }
-            return Ok(());
-        }
-
-        if !is_binomial_family(family) {
-            return Err(
-                "--predict-noise currently supports Gaussian and binomial families".to_string(),
-            );
-        }
-
-        let location_scale_link_kind = match family {
-            LikelihoodFamily::BinomialMixture => {
-                let spec = mixture_link_spec
-                    .as_ref()
-                    .ok_or_else(|| {
-                        "binomial blended-inverse-link location-scale fitting requires link(type=blended(...))"
-                            .to_string()
-                    })?
-                    .clone();
-                let state = state_from_spec(&spec)
-                    .map_err(|e| format!("invalid blended link configuration: {e}"))?;
-                InverseLink::Mixture(state)
-            }
-            LikelihoodFamily::BinomialSas => {
-                let spec = *sas_link_spec.as_ref().ok_or_else(|| {
-                    "binomial SAS location-scale fitting requires link(type=sas)".to_string()
-                })?;
-                let state = state_from_sas_spec(spec)
-                    .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
-                InverseLink::Sas(state)
-            }
-            LikelihoodFamily::BinomialBetaLogistic => {
-                let spec = *sas_link_spec.as_ref().ok_or_else(|| {
-                    "binomial beta-logistic location-scale fitting requires link(type=beta-logistic)"
-                        .to_string()
-                })?;
-                let state = state_from_beta_logistic_spec(spec)
-                    .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
-                InverseLink::BetaLogistic(state)
-            }
-            _ => InverseLink::Standard(effective_link),
-        };
-
-        let sigma_min = 0.05;
-        let sigma_max = 20.0;
-        let options = blockwise_options_from_fit_args(&args)?;
-        let solved = fit_binomial_location_scale_probit_terms_workflow(
-            ds.values.view(),
-            BinomialLocationScaleProbitTermSpec {
-                y: y.clone(),
-                weights: Array1::ones(y.len()),
-                link_kind: location_scale_link_kind.clone(),
-                sigma_min,
-                sigma_max,
-                threshold_spec: mean_spec.clone(),
-                log_sigma_spec: noise_spec.clone(),
-            },
-            formula_link_wiggle
-                .clone()
-                .map(|cfg| BinomialLocationScaleWiggleWorkflowConfig {
-                    degree: cfg.degree,
-                    num_internal_knots: cfg.num_internal_knots,
-                    penalty_orders: cfg.penalty_orders,
-                    double_penalty: cfg.double_penalty,
-                }),
-            &options,
-            &SpatialLengthScaleOptimizationOptions::default(),
-        )?;
-        if let (Some(knots), Some(degree)) = (solved.wiggle_knots.as_ref(), solved.wiggle_degree) {
-            let final_q0 = compute_probit_q0_from_fit(&solved.fit.fit, sigma_min, sigma_max)?;
-            let domain = summarize_wiggle_domain(final_q0.view(), knots.view(), degree)?;
-            if domain.outside_count > 0 {
-                eprintln!(
-                    "warning: {} of {} probit wiggle q values ({:.1}%) fell outside the knot domain [{:.3}, {:.3}] after fitting",
-                    domain.outside_count,
-                    final_q0.len(),
-                    100.0 * domain.outside_fraction,
-                    domain.domain_min,
-                    domain.domain_max
-                );
-            }
-        }
-        let wiggle_meta = match (solved.wiggle_knots, solved.wiggle_degree, solved.beta_wiggle) {
-            (Some(knots), Some(degree), Some(beta_wiggle)) => Some((knots, degree, beta_wiggle)),
-            _ => None,
-        };
-        let resolved_mean_spec = solved.fit.mean_spec_resolved;
-        let resolved_noise_spec = solved.fit.noise_spec_resolved;
-        let mean_design = solved.fit.mean_design;
-        let noise_design = solved.fit.noise_design;
-        let fit = solved.fit.fit;
-        let frozen_mean_spec = freeze_term_collection_spec(&resolved_mean_spec, &mean_design)?;
-        let frozen_noise_spec = freeze_term_collection_spec(&resolved_noise_spec, &noise_design)?;
-
-        if !args.no_summary {
-            println!(
-                "model fit complete | family={} | outer_iter={} | converged={}",
-                FAMILY_BINOMIAL_LOCATION_SCALE, fit.outer_iterations, fit.converged
-            );
-        }
-
-        if let Some(out) = args.out {
-            let beta_threshold = fit
-                .block_states
-                .first()
-                .map(|b| b.beta.clone())
-                .unwrap_or_else(|| Array1::zeros(0));
-            let fit_result = core_saved_fit_result(
-                beta_threshold,
-                fit.lambdas.clone(),
-                1.0,
-                fit.covariance_conditional.clone(),
-                fit.covariance_conditional.clone(),
-                SavedFitSummary::from_blockwise_fit(&fit)?,
-            );
-            let mut model = build_location_scale_saved_model(
-                formula_text,
-                FAMILY_BINOMIAL_LOCATION_SCALE.to_string(),
-                Some(inverse_link_to_saved_string(&location_scale_link_kind)),
-                ds.schema.clone(),
-                noise_formula,
-                ds.headers.clone(),
-                frozen_mean_spec,
-                frozen_noise_spec,
-                fit_result,
-                fit.block_states.get(1).map(|b| b.beta.to_vec()),
-                sigma_min,
-                sigma_max,
-            );
-            match &location_scale_link_kind {
-                InverseLink::Sas(state) => {
-                    model.family_state = FittedFamily::LocationScale {
-                        likelihood: LikelihoodFamily::BinomialSas,
-                        base_link: Some(InverseLink::Sas(*state)),
-                    };
-                }
-                InverseLink::BetaLogistic(state) => {
-                    model.family_state = FittedFamily::LocationScale {
-                        likelihood: LikelihoodFamily::BinomialBetaLogistic,
-                        base_link: Some(InverseLink::BetaLogistic(*state)),
-                    };
-                }
-                InverseLink::Mixture(state) => {
-                    model.family_state = FittedFamily::LocationScale {
-                        likelihood: LikelihoodFamily::BinomialMixture,
-                        base_link: Some(InverseLink::Mixture(state.clone())),
-                    };
-                }
-                InverseLink::Standard(link_fn) => {
-                    model.family_state = FittedFamily::LocationScale {
-                        likelihood: inverse_link_to_binomial_family(&InverseLink::Standard(
-                            *link_fn,
-                        )),
-                        base_link: Some(InverseLink::Standard(*link_fn)),
-                    };
-                }
-            }
-            if let Some((knots, degree, beta_wiggle)) = wiggle_meta {
-                model.probit_wiggle_knots = Some(knots.to_vec());
-                model.probit_wiggle_degree = Some(degree);
-                model.beta_wiggle = Some(beta_wiggle);
-            }
-            write_model_json(&out, &model)?;
-        }
-        return Ok(());
+        return run_fit_with_predict_noise(
+            &args,
+            &ds,
+            &col_map,
+            &parsed,
+            &y,
+            family,
+            effective_link,
+            link_choice.as_ref(),
+            mixture_link_spec.as_ref(),
+            sas_link_spec.as_ref(),
+            formula_link_wiggle.as_ref(),
+            &mut inference_notes,
+            noise_formula_raw,
+            &formula_text,
+        );
     }
 
     let spec = build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
@@ -1171,6 +937,251 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         write_payload_json(&out, payload)?;
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_fit_with_predict_noise(
+    args: &FitArgs,
+    ds: &Dataset,
+    col_map: &HashMap<String, usize>,
+    parsed: &ParsedFormula,
+    y: &Array1<f64>,
+    family: LikelihoodFamily,
+    effective_link: LinkFunction,
+    link_choice: Option<&LinkChoice>,
+    mixture_link_spec: Option<&MixtureLinkSpec>,
+    sas_link_spec: Option<&SasLinkSpec>,
+    formula_link_wiggle: Option<&LinkWiggleFormulaSpec>,
+    inference_notes: &mut Vec<String>,
+    noise_formula_raw: &str,
+    formula_text: &str,
+) -> Result<(), String> {
+    let noise_formula = normalize_noise_formula(noise_formula_raw, &parsed.response);
+    let parsed_noise = parse_formula(&noise_formula)?;
+    if parsed_noise.link_wiggle.is_some() {
+        return Err("linkwiggle(...) is only supported in the mean formula, not --predict-noise".to_string());
+    }
+    let noise_spec = build_term_spec(&parsed_noise.terms, ds, col_map, inference_notes)?;
+    let mean_spec = build_term_spec(&parsed.terms, ds, col_map, inference_notes)?;
+    if !args.no_summary {
+        print_inference_summary(inference_notes);
+    }
+
+    if family == LikelihoodFamily::GaussianIdentity {
+        if formula_link_wiggle.is_some() {
+            return Err(
+                "link wiggle is currently supported only for binomial location-scale fitting"
+                    .to_string(),
+            );
+        }
+        let sd = sample_std(y.view()).max(1e-6);
+        let sigma_min = (sd * 1e-3).max(1e-6);
+        let sigma_max = (sd * 1e3).max(sigma_min * 10.0);
+        let options = blockwise_options_from_fit_args(args)?;
+        let solved = fit_gaussian_location_scale_terms(
+            ds.values.view(),
+            GaussianLocationScaleTermSpec {
+                y: y.clone(),
+                weights: Array1::ones(y.len()),
+                sigma_min,
+                sigma_max,
+                mean_spec: mean_spec.clone(),
+                log_sigma_spec: noise_spec.clone(),
+            },
+            &options,
+            &SpatialLengthScaleOptimizationOptions::default(),
+        )
+        .map_err(|e| format!("fit_gaussian_location_scale_terms failed: {e}"))?;
+        let fit = solved.fit;
+        let frozen_mean_spec = freeze_term_collection_spec(&solved.mean_spec_resolved, &solved.mean_design)?;
+        let frozen_noise_spec =
+            freeze_term_collection_spec(&solved.noise_spec_resolved, &solved.noise_design)?;
+        if !args.no_summary {
+            println!(
+                "model fit complete | family={} | outer_iter={} | converged={}",
+                FAMILY_GAUSSIAN_LOCATION_SCALE, fit.outer_iterations, fit.converged
+            );
+        }
+        if let Some(out) = args.out.as_ref() {
+            let beta_mean = fit
+                .block_states
+                .first()
+                .map(|b| b.beta.clone())
+                .unwrap_or_else(|| Array1::zeros(0));
+            let fit_result = core_saved_fit_result(
+                beta_mean,
+                fit.lambdas.clone(),
+                1.0,
+                fit.covariance_conditional.clone(),
+                fit.covariance_conditional.clone(),
+                SavedFitSummary::from_blockwise_fit(&fit)?,
+            );
+            let model = build_location_scale_saved_model(
+                formula_text.to_string(),
+                FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
+                link_choice.map(link_choice_to_string),
+                ds.schema.clone(),
+                noise_formula.clone(),
+                ds.headers.clone(),
+                frozen_mean_spec,
+                frozen_noise_spec,
+                fit_result,
+                fit.block_states.get(1).map(|b| b.beta.to_vec()),
+                sigma_min,
+                sigma_max,
+            );
+            write_model_json(out, &model)?;
+        }
+        return Ok(());
+    }
+
+    if !is_binomial_family(family) {
+        return Err("--predict-noise currently supports Gaussian and binomial families".to_string());
+    }
+    let location_scale_link_kind = match family {
+        LikelihoodFamily::BinomialMixture => {
+            let spec = mixture_link_spec
+                .ok_or_else(|| {
+                    "binomial blended-inverse-link location-scale fitting requires link(type=blended(...))"
+                        .to_string()
+                })?
+                .clone();
+            let state =
+                state_from_spec(&spec).map_err(|e| format!("invalid blended link configuration: {e}"))?;
+            InverseLink::Mixture(state)
+        }
+        LikelihoodFamily::BinomialSas => {
+            let spec = *sas_link_spec
+                .ok_or_else(|| "binomial SAS location-scale fitting requires link(type=sas)".to_string())?;
+            let state = state_from_sas_spec(spec).map_err(|e| format!("invalid SAS link configuration: {e}"))?;
+            InverseLink::Sas(state)
+        }
+        LikelihoodFamily::BinomialBetaLogistic => {
+            let spec = *sas_link_spec.ok_or_else(|| {
+                "binomial beta-logistic location-scale fitting requires link(type=beta-logistic)"
+                    .to_string()
+            })?;
+            let state = state_from_beta_logistic_spec(spec)
+                .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
+            InverseLink::BetaLogistic(state)
+        }
+        _ => InverseLink::Standard(effective_link),
+    };
+
+    let sigma_min = 0.05;
+    let sigma_max = 20.0;
+    let options = blockwise_options_from_fit_args(args)?;
+    let solved = fit_binomial_location_scale_probit_terms_workflow(
+        ds.values.view(),
+        BinomialLocationScaleProbitTermSpec {
+            y: y.clone(),
+            weights: Array1::ones(y.len()),
+            link_kind: location_scale_link_kind.clone(),
+            sigma_min,
+            sigma_max,
+            threshold_spec: mean_spec.clone(),
+            log_sigma_spec: noise_spec.clone(),
+        },
+        formula_link_wiggle
+            .cloned()
+            .map(|cfg| BinomialLocationScaleWiggleWorkflowConfig {
+                degree: cfg.degree,
+                num_internal_knots: cfg.num_internal_knots,
+                penalty_orders: cfg.penalty_orders,
+                double_penalty: cfg.double_penalty,
+            }),
+        &options,
+        &SpatialLengthScaleOptimizationOptions::default(),
+    )?;
+    if let (Some(knots), Some(degree)) = (solved.wiggle_knots.as_ref(), solved.wiggle_degree) {
+        let final_q0 = compute_probit_q0_from_fit(&solved.fit.fit, sigma_min, sigma_max)?;
+        let domain = summarize_wiggle_domain(final_q0.view(), knots.view(), degree)?;
+        if domain.outside_count > 0 {
+            eprintln!(
+                "warning: {} of {} probit wiggle q values ({:.1}%) fell outside the knot domain [{:.3}, {:.3}] after fitting",
+                domain.outside_count,
+                final_q0.len(),
+                100.0 * domain.outside_fraction,
+                domain.domain_min,
+                domain.domain_max
+            );
+        }
+    }
+    let wiggle_meta = match (solved.wiggle_knots, solved.wiggle_degree, solved.beta_wiggle) {
+        (Some(knots), Some(degree), Some(beta_wiggle)) => Some((knots, degree, beta_wiggle)),
+        _ => None,
+    };
+    let fit = solved.fit.fit;
+    let frozen_mean_spec = freeze_term_collection_spec(&solved.fit.mean_spec_resolved, &solved.fit.mean_design)?;
+    let frozen_noise_spec = freeze_term_collection_spec(&solved.fit.noise_spec_resolved, &solved.fit.noise_design)?;
+    if !args.no_summary {
+        println!(
+            "model fit complete | family={} | outer_iter={} | converged={}",
+            FAMILY_BINOMIAL_LOCATION_SCALE, fit.outer_iterations, fit.converged
+        );
+    }
+    if let Some(out) = args.out.as_ref() {
+        let beta_threshold = fit
+            .block_states
+            .first()
+            .map(|b| b.beta.clone())
+            .unwrap_or_else(|| Array1::zeros(0));
+        let fit_result = core_saved_fit_result(
+            beta_threshold,
+            fit.lambdas.clone(),
+            1.0,
+            fit.covariance_conditional.clone(),
+            fit.covariance_conditional.clone(),
+            SavedFitSummary::from_blockwise_fit(&fit)?,
+        );
+        let mut model = build_location_scale_saved_model(
+            formula_text.to_string(),
+            FAMILY_BINOMIAL_LOCATION_SCALE.to_string(),
+            Some(inverse_link_to_saved_string(&location_scale_link_kind)),
+            ds.schema.clone(),
+            noise_formula,
+            ds.headers.clone(),
+            frozen_mean_spec,
+            frozen_noise_spec,
+            fit_result,
+            fit.block_states.get(1).map(|b| b.beta.to_vec()),
+            sigma_min,
+            sigma_max,
+        );
+        match &location_scale_link_kind {
+            InverseLink::Sas(state) => {
+                model.family_state = FittedFamily::LocationScale {
+                    likelihood: LikelihoodFamily::BinomialSas,
+                    base_link: Some(InverseLink::Sas(*state)),
+                };
+            }
+            InverseLink::BetaLogistic(state) => {
+                model.family_state = FittedFamily::LocationScale {
+                    likelihood: LikelihoodFamily::BinomialBetaLogistic,
+                    base_link: Some(InverseLink::BetaLogistic(*state)),
+                };
+            }
+            InverseLink::Mixture(state) => {
+                model.family_state = FittedFamily::LocationScale {
+                    likelihood: LikelihoodFamily::BinomialMixture,
+                    base_link: Some(InverseLink::Mixture(state.clone())),
+                };
+            }
+            InverseLink::Standard(link_fn) => {
+                model.family_state = FittedFamily::LocationScale {
+                    likelihood: inverse_link_to_binomial_family(&InverseLink::Standard(*link_fn)),
+                    base_link: Some(InverseLink::Standard(*link_fn)),
+                };
+            }
+        }
+        if let Some((knots, degree, beta_wiggle)) = wiggle_meta {
+            model.probit_wiggle_knots = Some(knots.to_vec());
+            model.probit_wiggle_degree = Some(degree);
+            model.beta_wiggle = Some(beta_wiggle);
+        }
+        write_model_json(out, &model)?;
+    }
     Ok(())
 }
 
