@@ -548,14 +548,13 @@ impl<'a> RemlState<'a> {
                 Ok(dp_tau / (2.0 * phi) + 0.5 * trace_h - 0.5 * pseudo_det_trace)
             }
             _ => {
+                let runtime_link = self.runtime_inverse_link();
                 let w_tau = crate::pirls::directional_working_curvature_from_eta_with_state(
-                    self.config.link_function(),
+                    &runtime_link,
                     &pirls_result.final_eta,
                     self.weights,
                     &pirls_result.solve_weights,
                     &eta_tau,
-                    self.runtime_mixture_link_state.as_ref(),
-                    self.runtime_sas_link_state.as_ref(),
                 )?;
                 let leverages = leverages_from_factor(&sparse.factor, self.x())?;
                 match w_tau {

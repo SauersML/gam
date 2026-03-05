@@ -2634,8 +2634,17 @@ pub fn build_thin_plate_basis(
     data: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    build_thin_plate_basis_with_workspace(data, spec, &mut workspace)
+}
+
+pub fn build_thin_plate_basis_with_workspace(
+    data: ArrayView2<'_, f64>,
+    spec: &ThinPlateBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let tps = create_thin_plate_spline_basis(data, centers.view())?;
+    let tps = create_thin_plate_spline_basis_with_workspace(data, centers.view(), workspace)?;
     let mut candidates = vec![PenaltyCandidate {
         matrix: tps.penalty_bending.clone(),
         nullspace_dim_hint: tps.num_polynomial_basis,
@@ -3340,11 +3349,29 @@ pub fn build_duchon_collocation_operator_matrices(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    build_duchon_collocation_operator_matrices_with_workspace(
+        centers,
+        collocation_weights,
+        length_scale,
+        power,
+        nullspace_order,
+        &mut workspace,
+    )
+}
+
+pub fn build_duchon_collocation_operator_matrices_with_workspace(
+    centers: ArrayView2<'_, f64>,
+    collocation_weights: Option<ArrayView1<'_, f64>>,
+    length_scale: f64,
+    power: usize,
+    nullspace_order: DuchonNullspaceOrder,
+    workspace: &mut BasisWorkspace,
+) -> Result<CollocationOperatorMatrices, BasisError> {
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-    let mut cache_ctx = BasisCacheContext::default();
-    let z = kernel_constraint_nullspace(centers, nullspace_order, &mut cache_ctx)?;
+    let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let (d0_raw, d1_raw, d2_raw) =
         build_collocation_operators_from_radial(centers, centers, collocation_weights, |r| {
             duchon_kernel_radial_triplet(
@@ -4245,6 +4272,21 @@ struct BasisCacheContext {
     constraint_nullspace: ConstraintNullspaceCache,
 }
 
+/// Explicit per-run workspace for basis/spatial cache reuse.
+///
+/// Pass one workspace through repeated basis builds to avoid global mutable state
+/// and to keep caching scoped to a caller-controlled lifecycle.
+#[derive(Default)]
+pub struct BasisWorkspace {
+    cache: BasisCacheContext,
+}
+
+impl BasisWorkspace {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 fn hash_array_view2(values: ArrayView2<'_, f64>) -> u64 {
     let mut hasher = DefaultHasher::new();
     values.nrows().hash(&mut hasher);
@@ -4479,6 +4521,25 @@ pub fn create_matern_spline_basis(
     nu: MaternNu,
     include_intercept: bool,
 ) -> Result<MaternSplineBasis, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    create_matern_spline_basis_with_workspace(
+        data,
+        centers,
+        length_scale,
+        nu,
+        include_intercept,
+        &mut workspace,
+    )
+}
+
+pub fn create_matern_spline_basis_with_workspace(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    include_intercept: bool,
+    workspace: &mut BasisWorkspace,
+) -> Result<MaternSplineBasis, BasisError> {
     let n = data.nrows();
     let d = data.ncols();
     let k = centers.nrows();
@@ -4532,9 +4593,8 @@ pub fn create_matern_spline_basis(
     let poly_cols = if include_intercept { 1 } else { 0 };
     let total_cols = k + poly_cols;
 
-    let mut cache_ctx = BasisCacheContext::default();
     let (data_center_r, center_center_r) =
-        spatial_distance_matrices(data, centers, &mut cache_ctx)?;
+        spatial_distance_matrices(data, centers, &mut workspace.cache)?;
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
@@ -4593,12 +4653,28 @@ pub fn build_matern_basis(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    build_matern_basis_with_workspace(data, spec, &mut workspace)
+}
+
+pub fn build_matern_basis_with_workspace(
+    data: ArrayView2<'_, f64>,
+    spec: &MaternBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
 
     // Build an unconstrained kernel block first, then apply center-based
     // coefficient constraints in a deterministic way.
-    let m = create_matern_spline_basis(data, centers.view(), spec.length_scale, spec.nu, false)?;
+    let m = create_matern_spline_basis_with_workspace(
+        data,
+        centers.view(),
+        spec.length_scale,
+        spec.nu,
+        false,
+        workspace,
+    )?;
     let (design, identifiability_transform) = if let Some(ref z) = z_opt {
         let kernel_raw = m.basis.slice(s![.., 0..m.num_kernel_basis]).to_owned();
         let kernel_constrained = fast_ab(&kernel_raw, &z);
@@ -5056,11 +5132,11 @@ fn build_matern_design_psi_derivatives(
     nu: MaternNu,
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
+    workspace: &mut BasisWorkspace,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let n = data.nrows();
     let k = centers.nrows();
-    let mut cache_ctx = BasisCacheContext::default();
-    let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut cache_ctx)?;
+    let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut workspace.cache)?;
     let mut kernel_psi = Array2::<f64>::zeros((n, k));
     let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
     for i in 0..n {
@@ -5092,6 +5168,15 @@ pub fn build_matern_basis_log_kappa_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    build_matern_basis_log_kappa_derivative_with_workspace(data, spec, &mut workspace)
+}
+
+pub fn build_matern_basis_log_kappa_derivative_with_workspace(
+    data: ArrayView2<'_, f64>,
+    spec: &MaternBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisPsiDerivativeResult, BasisError> {
     // Analytic psi derivative assembly for the Matérn basis block:
     // - design derivative X_psi from closed-form Matérn value derivatives,
     // - penalty derivatives S_psi from operator-collocation derivatives.
@@ -5100,7 +5185,7 @@ pub fn build_matern_basis_log_kappa_derivative(
     // list order matches the active penalty order seen by REML.
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
-    let base = build_matern_basis(data, spec)?;
+    let base = build_matern_basis_with_workspace(data, spec, workspace)?;
     let (design_derivative, _) = build_matern_design_psi_derivatives(
         data,
         centers.view(),
@@ -5108,6 +5193,7 @@ pub fn build_matern_basis_log_kappa_derivative(
         spec.nu,
         spec.include_intercept,
         z_opt.as_ref(),
+        workspace,
     )?;
     let (all_penalty_deriv, _) = build_matern_operator_penalty_psi_derivatives(
         centers.view(),
@@ -5139,11 +5225,20 @@ pub fn build_matern_basis_log_kappa_second_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    build_matern_basis_log_kappa_second_derivative_with_workspace(data, spec, &mut workspace)
+}
+
+pub fn build_matern_basis_log_kappa_second_derivative_with_workspace(
+    data: ArrayView2<'_, f64>,
+    spec: &MaternBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
     // Analytic psi second-derivative assembly, matching the first-derivative
     // mapping logic and constrained normalized penalty geometry.
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
-    let base = build_matern_basis(data, spec)?;
+    let base = build_matern_basis_with_workspace(data, spec, workspace)?;
     let (_, design_second_derivative) = build_matern_design_psi_derivatives(
         data,
         centers.view(),
@@ -5151,6 +5246,7 @@ pub fn build_matern_basis_log_kappa_second_derivative(
         spec.nu,
         spec.include_intercept,
         z_opt.as_ref(),
+        workspace,
     )?;
     let (_, all_penalty_second_deriv) = build_matern_operator_penalty_psi_derivatives(
         centers.view(),
@@ -5202,6 +5298,25 @@ pub fn create_duchon_spline_basis(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
 ) -> Result<DuchonSplineBasis, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    create_duchon_spline_basis_with_workspace(
+        data,
+        centers,
+        length_scale,
+        power,
+        nullspace_order,
+        &mut workspace,
+    )
+}
+
+pub fn create_duchon_spline_basis_with_workspace(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    power: usize,
+    nullspace_order: DuchonNullspaceOrder,
+    workspace: &mut BasisWorkspace,
+) -> Result<DuchonSplineBasis, BasisError> {
     let n = data.nrows();
     let d = data.ncols();
     let k = centers.nrows();
@@ -5232,8 +5347,7 @@ pub fn create_duchon_spline_basis(
     // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
     // Reparameterizing alpha = Z gamma enforces conditional-PD constraints once
     // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.
-    let mut cache_ctx = BasisCacheContext::default();
-    let z = kernel_constraint_nullspace(centers, nullspace_order, &mut cache_ctx)?;
+    let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
@@ -5282,7 +5396,7 @@ pub fn create_duchon_spline_basis(
     }
 
     let (data_center_r, center_center_r) =
-        spatial_distance_matrices(data, centers, &mut cache_ctx)?;
+        spatial_distance_matrices(data, centers, &mut workspace.cache)?;
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
@@ -5365,13 +5479,23 @@ pub fn build_duchon_basis(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    build_duchon_basis_with_workspace(data, spec, &mut workspace)
+}
+
+pub fn build_duchon_basis_with_workspace(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let d = create_duchon_spline_basis(
+    let d = create_duchon_spline_basis_with_workspace(
         data,
         centers.view(),
         spec.length_scale,
         spec.power,
         spec.nullspace_order,
+        workspace,
     )?;
     let candidates = build_duchon_operator_penalty_candidates(
         centers.view(),
@@ -5592,6 +5716,15 @@ pub fn create_thin_plate_spline_basis(
     data: ArrayView2<f64>,
     knots: ArrayView2<f64>,
 ) -> Result<ThinPlateSplineBasis, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    create_thin_plate_spline_basis_with_workspace(data, knots, &mut workspace)
+}
+
+pub fn create_thin_plate_spline_basis_with_workspace(
+    data: ArrayView2<f64>,
+    knots: ArrayView2<f64>,
+    workspace: &mut BasisWorkspace,
+) -> Result<ThinPlateSplineBasis, BasisError> {
     let n = data.nrows();
     let k = knots.nrows();
     let d = data.ncols();
@@ -5662,8 +5795,7 @@ pub fn create_thin_plate_spline_basis(
 
     // Enforce TPS side-constraint P(knots)^T α = 0 by projecting onto
     // the nullspace of P(knots)^T.
-    let mut cache_ctx = BasisCacheContext::default();
-    let z = kernel_constraint_nullspace(knots, DuchonNullspaceOrder::Linear, &mut cache_ctx)?;
+    let z = kernel_constraint_nullspace(knots, DuchonNullspaceOrder::Linear, &mut workspace.cache)?;
     let kernel_constrained = fast_ab(&kernel_block, &z);
     let omega_constrained = {
         let zt_o = fast_atb(&z, &omega);
@@ -5709,8 +5841,17 @@ pub fn create_thin_plate_spline_basis_with_knot_count(
     data: ArrayView2<f64>,
     num_knots: usize,
 ) -> Result<(ThinPlateSplineBasis, Array2<f64>), BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    create_thin_plate_spline_basis_with_knot_count_and_workspace(data, num_knots, &mut workspace)
+}
+
+pub fn create_thin_plate_spline_basis_with_knot_count_and_workspace(
+    data: ArrayView2<f64>,
+    num_knots: usize,
+    workspace: &mut BasisWorkspace,
+) -> Result<(ThinPlateSplineBasis, Array2<f64>), BasisError> {
     let knots = select_thin_plate_knots(data, num_knots)?;
-    let basis = create_thin_plate_spline_basis(data, knots.view())?;
+    let basis = create_thin_plate_spline_basis_with_workspace(data, knots.view(), workspace)?;
     Ok((basis, knots))
 }
 

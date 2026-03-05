@@ -2,12 +2,13 @@ use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, factorize_symmetric_with_fallback, fast_ab, fast_atv,
+    array2_to_mat_mut, fast_ab, fast_atv,
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, sparse_symmetric_upper_matvec_public,
     sparse_to_dense_symmetric_upper_public,
 };
+use crate::linalg::utils::StableSolver;
 use crate::matrix::{DesignMatrix, LinearOperator};
 use crate::mixture_link::{
     InverseLinkJet as MixtureInverseLinkJet, inverse_link_jet_for_link_function,
@@ -495,13 +496,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 update_glm_vectors(
                     y,
                     eta,
-                    LinkFunction::Logit,
+                    &InverseLink::Standard(LinkFunction::Logit),
                     prior_weights,
                     mu,
                     weights,
                     z,
-                    None,
-                    None,
                     derivatives,
                 )?;
                 Ok(())
@@ -510,13 +509,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 update_glm_vectors(
                     y,
                     eta,
-                    LinkFunction::Probit,
+                    &InverseLink::Standard(LinkFunction::Probit),
                     prior_weights,
                     mu,
                     weights,
                     z,
-                    None,
-                    None,
                     derivatives,
                 )?;
                 Ok(())
@@ -525,13 +522,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 update_glm_vectors(
                     y,
                     eta,
-                    LinkFunction::CLogLog,
+                    &InverseLink::Standard(LinkFunction::CLogLog),
                     prior_weights,
                     mu,
                     weights,
                     z,
-                    None,
-                    None,
                     derivatives,
                 )?;
                 Ok(())
@@ -540,13 +535,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 update_glm_vectors(
                     y,
                     eta,
-                    LinkFunction::Sas,
+                    &InverseLink::Standard(LinkFunction::Sas),
                     prior_weights,
                     mu,
                     weights,
                     z,
-                    None,
-                    None,
                     derivatives,
                 )?;
                 Ok(())
@@ -555,13 +548,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 update_glm_vectors(
                     y,
                     eta,
-                    LinkFunction::BetaLogistic,
+                    &InverseLink::Standard(LinkFunction::BetaLogistic),
                     prior_weights,
                     mu,
                     weights,
                     z,
-                    None,
-                    None,
                     derivatives,
                 )?;
                 Ok(())
@@ -573,13 +564,11 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 update_glm_vectors(
                     y,
                     eta,
-                    LinkFunction::Identity,
+                    &InverseLink::Standard(LinkFunction::Identity),
                     prior_weights,
                     mu,
                     weights,
                     z,
-                    None,
-                    None,
                     None,
                 )?;
                 Ok(())
@@ -694,14 +683,6 @@ impl FirthDiagnostics {
             Self::Active { log_det, .. } => Some(*log_det),
         }
     }
-
-    #[inline]
-    pub fn hat_diag(&self) -> Option<&Array1<f64>> {
-        match self {
-            Self::Inactive => None,
-            Self::Active { hat_diag, .. } => Some(hat_diag),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -725,11 +706,6 @@ impl WorkingState {
     #[inline]
     pub fn firth_log_det(&self) -> Option<f64> {
         self.firth.log_det()
-    }
-
-    #[inline]
-    pub fn firth_hat_diag(&self) -> Option<&Array1<f64>> {
-        self.firth.hat_diag()
     }
 }
 
@@ -1299,7 +1275,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             se: se.view(),
         });
         match &self.link_kind {
-            InverseLink::Mixture(mixture_state) => {
+            InverseLink::Mixture(_) => {
                 if integrated.is_some() {
                     return Err(EstimationError::InvalidInput(
                         "integrated binomial updates are not yet supported for mixture links"
@@ -1309,13 +1285,11 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 update_glm_vectors(
                     self.y,
                     &self.workspace.eta_buf,
-                    LinkFunction::Logit,
+                    &self.link_kind,
                     self.prior_weights,
                     &mut self.last_mu,
                     &mut self.last_weights,
                     &mut self.last_z,
-                    Some(mixture_state),
-                    None,
                     Some(WorkingDerivativeBuffersMut {
                         c: &mut self.last_c,
                         d: &mut self.last_d,
@@ -1325,7 +1299,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     }),
                 )?;
             }
-            InverseLink::Sas(sas_state) | InverseLink::BetaLogistic(sas_state) => {
+            InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => {
                 if let Some(integ) = integrated {
                     update_glm_vectors_integrated_by_family(
                         integ.quad_ctx,
@@ -1345,23 +1319,17 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             d3mu_deta3: &mut self.last_d3mu_deta3,
                         }),
                         None,
-                        Some(sas_state),
+                        self.link_kind.sas_state(),
                     )?;
                 } else {
                     update_glm_vectors(
                         self.y,
                         &self.workspace.eta_buf,
-                        if matches!(&self.link_kind, InverseLink::BetaLogistic(_)) {
-                            LinkFunction::BetaLogistic
-                        } else {
-                            LinkFunction::Sas
-                        },
+                        &self.link_kind,
                         self.prior_weights,
                         &mut self.last_mu,
                         &mut self.last_weights,
                         &mut self.last_z,
-                        None,
-                        Some(sas_state),
                         Some(WorkingDerivativeBuffersMut {
                             c: &mut self.last_c,
                             d: &mut self.last_d,
@@ -1888,8 +1856,8 @@ fn solve_newton_direction_dense(
         *direction_out = Array1::zeros(gradient.len());
     }
 
-    let h_view = FaerArrayView::new(hessian);
-    let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower)
+    let factor = StableSolver::new("pirls newton direction")
+        .factorize(hessian)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     direction_out.assign(gradient);
     let mut rhs_view = array1_to_col_mat_mut(direction_out);
@@ -2098,10 +2066,13 @@ fn solve_subsystem_direction(
         *out = Array1::zeros(g_sub.len());
     }
     out.assign(g_sub);
-    let h_view = FaerArrayView::new(h_sub);
-    let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower).map_err(|_| {
-        EstimationError::InvalidInput("bounded Newton subsystem factorization failed".to_string())
-    })?;
+    let factor = StableSolver::new("pirls bounded subsystem")
+        .factorize(h_sub)
+        .map_err(|_| {
+            EstimationError::InvalidInput(
+                "bounded Newton subsystem factorization failed".to_string(),
+            )
+        })?;
     out.assign(g_sub);
     let mut rhs = array1_to_col_mat_mut(out);
     factor.solve_in_place(rhs.as_mut());
@@ -2123,9 +2094,9 @@ fn solve_symmetric_system(
         *out = Array1::zeros(rhs.len());
     }
     out.assign(rhs);
-    let matrix_view = FaerArrayView::new(matrix);
-    let factor =
-        factorize_symmetric_with_fallback(matrix_view.as_ref(), Side::Lower).map_err(|_| {
+    let factor = StableSolver::new("pirls symmetric system")
+        .factorize(matrix)
+        .map_err(|_| {
             EstimationError::InvalidInput("symmetric system factorization failed".to_string())
         })?;
     out.assign(rhs);
@@ -2735,7 +2706,17 @@ fn solve_intercept_for_prevalence(
         mixture_link_state: Option<&MixtureLinkState>,
         sas_link_state: Option<&SasLinkState>,
     ) -> f64 {
-        standard_inverse_link_jet(link_function, eta, mixture_link_state, sas_link_state)
+        let inverse_link = if let Some(state) = mixture_link_state {
+            InverseLink::Mixture(state.clone())
+        } else if let Some(state) = sas_link_state {
+            match link_function {
+                LinkFunction::BetaLogistic => InverseLink::BetaLogistic(*state),
+                _ => InverseLink::Sas(*state),
+            }
+        } else {
+            InverseLink::Standard(link_function)
+        };
+        standard_inverse_link_jet(&inverse_link, eta)
             .map(|jet| jet.mu - prevalence)
             .unwrap_or(f64::NAN)
     }
@@ -3279,11 +3260,6 @@ impl PirlsResult {
     pub fn firth_log_det(&self) -> Option<f64> {
         self.firth.log_det()
     }
-
-    #[inline]
-    pub fn firth_hat_diag(&self) -> Option<&Array1<f64>> {
-        self.firth.hat_diag()
-    }
 }
 
 fn assemble_pirls_result(
@@ -3695,11 +3671,9 @@ pub fn fit_model_for_fixed_rho<'a>(
 
         let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
             compute_working_weight_derivatives_from_eta(
-                link_function,
+                &config.link_kind,
                 &final_eta,
                 prior_weights_owned.view(),
-                config.link_kind.mixture_state(),
-                config.link_kind.sas_state(),
             )?;
         let pirls_result = PirlsResult {
             beta_transformed,
@@ -4626,12 +4600,15 @@ fn logit_clamp_zero_enabled() -> bool {
 
 #[inline]
 fn standard_inverse_link_jet(
-    link: LinkFunction,
+    inverse_link: &InverseLink,
     eta: f64,
-    mixture_link_state: Option<&MixtureLinkState>,
-    sas_link_state: Option<&SasLinkState>,
 ) -> Result<MixtureInverseLinkJet, EstimationError> {
-    inverse_link_jet_for_link_function(link, eta, mixture_link_state, sas_link_state)
+    inverse_link_jet_for_link_function(
+        inverse_link.link_function(),
+        eta,
+        inverse_link.mixture_state(),
+        inverse_link.sas_state(),
+    )
 }
 
 #[inline]
@@ -4712,16 +4689,15 @@ fn write_identity_working_state(
 pub fn update_glm_vectors(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
-    link: LinkFunction,
+    inverse_link: &InverseLink,
     prior_weights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
-    mixture_link_state: Option<&MixtureLinkState>,
-    sas_link_state: Option<&SasLinkState>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
     let n = eta.len();
+    let link = inverse_link.link_function();
     match link {
         LinkFunction::Logit
         | LinkFunction::Probit
@@ -4740,8 +4716,7 @@ pub fn update_glm_vectors(
                     | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
                     LinkFunction::Identity => eta[i],
                 };
-                let jet =
-                    standard_inverse_link_jet(link, eta_used, mixture_link_state, sas_link_state)?;
+                let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
                 let geom = bernoulli_geometry_from_jet(
                     eta[i],
                     eta_used,
@@ -4839,15 +4814,14 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     se: ArrayView1<f64>,
-    link: LinkFunction,
+    inverse_link: &InverseLink,
     prior_weights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
-    mixture_link_state: Option<&MixtureLinkState>,
-    sas_link_state: Option<&SasLinkState>,
 ) -> Result<(), EstimationError> {
+    let link = inverse_link.link_function();
     let family = match link {
         LinkFunction::Logit => GlmLikelihoodFamily::BinomialLogit,
         LinkFunction::Probit => GlmLikelihoodFamily::BinomialProbit,
@@ -4858,13 +4832,11 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
             update_glm_vectors(
                 y,
                 eta,
-                link,
+                inverse_link,
                 prior_weights,
                 mu,
                 weights,
                 z,
-                None,
-                None,
                 derivatives,
             )?;
             return Ok(());
@@ -4881,8 +4853,8 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
         weights,
         z,
         derivatives,
-        mixture_link_state,
-        sas_link_state,
+        inverse_link.mixture_state(),
+        inverse_link.sas_state(),
     )
 }
 
@@ -4996,11 +4968,9 @@ pub fn update_glm_vectors_integrated_by_family(
 ///   In that regime analytic and central-FD gradients can diverge because FD may
 ///   straddle a kink.
 fn compute_working_weight_derivatives_from_eta(
-    link: LinkFunction,
+    inverse_link: &InverseLink,
     eta: &Array1<f64>,
     prior_weights: ArrayView1<f64>,
-    mixture_link_state: Option<&MixtureLinkState>,
-    sas_link_state: Option<&SasLinkState>,
 ) -> Result<
     (
         Array1<f64>,
@@ -5012,6 +4982,7 @@ fn compute_working_weight_derivatives_from_eta(
     EstimationError,
 > {
     let n = eta.len();
+    let link = inverse_link.link_function();
     let mut c = Array1::<f64>::zeros(n);
     let mut d = Array1::<f64>::zeros(n);
     let mut dmu_deta = Array1::<f64>::zeros(n);
@@ -5037,8 +5008,7 @@ fn compute_working_weight_derivatives_from_eta(
                     | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
                     LinkFunction::Identity => eta[i],
                 };
-                let jet =
-                    standard_inverse_link_jet(link, eta_used, mixture_link_state, sas_link_state)?;
+                let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
                 let geom = bernoulli_geometry_from_jet(
                     eta[i],
                     eta_used,
@@ -5068,21 +5038,14 @@ pub enum DirectionalWorkingCurvature {
 }
 
 fn directional_working_curvature_diagonal_builtin(
-    link: LinkFunction,
+    inverse_link: &InverseLink,
     eta: &Array1<f64>,
     prior_weights: ArrayView1<'_, f64>,
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
-    mixture_link_state: Option<&MixtureLinkState>,
-    sas_link_state: Option<&SasLinkState>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    let (c, _, _, _, _) = compute_working_weight_derivatives_from_eta(
-        link,
-        eta,
-        prior_weights,
-        mixture_link_state,
-        sas_link_state,
-    )?;
+    let (c, _, _, _, _) =
+        compute_working_weight_derivatives_from_eta(inverse_link, eta, prior_weights)?;
     let mut w_direction = &c * eta_direction;
     for i in 0..w_direction.len() {
         if solve_weights[i] <= 0.0 || !w_direction[i].is_finite() {
@@ -5099,13 +5062,11 @@ fn directional_working_curvature_logit(
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
     directional_working_curvature_diagonal_builtin(
-        LinkFunction::Logit,
+        &InverseLink::Standard(LinkFunction::Logit),
         eta,
         prior_weights,
         solve_weights,
         eta_direction,
-        None,
-        None,
     )
 }
 
@@ -5116,13 +5077,11 @@ fn directional_working_curvature_probit(
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
     directional_working_curvature_diagonal_builtin(
-        LinkFunction::Probit,
+        &InverseLink::Standard(LinkFunction::Probit),
         eta,
         prior_weights,
         solve_weights,
         eta_direction,
-        None,
-        None,
     )
 }
 
@@ -5133,13 +5092,11 @@ fn directional_working_curvature_cloglog(
     eta_direction: &Array1<f64>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
     directional_working_curvature_diagonal_builtin(
-        LinkFunction::CLogLog,
+        &InverseLink::Standard(LinkFunction::CLogLog),
         eta,
         prior_weights,
         solve_weights,
         eta_direction,
-        None,
-        None,
     )
 }
 
@@ -5202,31 +5159,13 @@ pub fn directional_working_curvature_from_eta(
 /// when present. This keeps REML directional derivatives consistent with the
 /// inner working model surface.
 pub fn directional_working_curvature_from_eta_with_state(
-    link: LinkFunction,
+    inverse_link: &InverseLink,
     eta: &Array1<f64>,
     prior_weights: ArrayView1<'_, f64>,
     solve_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
-    mixture_link_state: Option<&MixtureLinkState>,
-    sas_link_state: Option<&SasLinkState>,
 ) -> Result<DirectionalWorkingCurvature, EstimationError> {
-    let eval_link = if mixture_link_state.is_some() {
-        // Mixture dispatch hangs off LinkFunction::Logit + explicit state.
-        LinkFunction::Logit
-    } else if sas_link_state.is_some()
-        || matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic)
-    {
-        // Stateful parameterized links require explicit state.
-        if matches!(link, LinkFunction::BetaLogistic) {
-            LinkFunction::BetaLogistic
-        } else {
-            LinkFunction::Sas
-        }
-    } else {
-        link
-    };
-
-    match eval_link {
+    match inverse_link.link_function() {
         LinkFunction::Identity => {
             directional_working_curvature_identity(eta, prior_weights, solve_weights, eta_direction)
         }
@@ -5235,13 +5174,11 @@ pub fn directional_working_curvature_from_eta_with_state(
         | LinkFunction::CLogLog
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => directional_working_curvature_diagonal_builtin(
-            eval_link,
+            inverse_link,
             eta,
             prior_weights,
             solve_weights,
             eta_direction,
-            mixture_link_state,
-            sas_link_state,
         ),
     }
 }
@@ -5432,13 +5369,12 @@ pub fn solve_penalized_least_squares(
     let ridge_used = nugget;
 
     // 6. Solve using centralized LLT/LDLT/LBLT fallback factorization.
-    let h_reg_view = FaerArrayView::new(&regularized_hessian);
-
     if workspace.rhs_full.len() != p_dim {
         workspace.rhs_full = Array1::zeros(p_dim);
     }
     workspace.rhs_full.assign(rhs_vec);
-    let factor = factorize_symmetric_with_fallback(h_reg_view.as_ref(), Side::Lower)
+    let factor = StableSolver::new("pirls stable pls")
+        .factorize(&regularized_hessian)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     let mut rhs_view = array1_to_col_mat_mut(&mut workspace.rhs_full);
     factor.solve_in_place(rhs_view.as_mut());
@@ -5484,14 +5420,13 @@ fn calculate_edf(
     if r == 0 {
         return Ok(p as f64);
     }
-    let h_view = FaerArrayView::new(penalized_hessian);
     let rhs_arr = e_transformed.t().to_owned();
     let rhs_view = FaerArrayView::new(&rhs_arr);
-    let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
+    let factor = StableSolver::new("pirls edf")
+        .factorize(penalized_hessian)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
-        }
-    })?;
+        })?;
     let sol = factor.solve(rhs_view.as_ref());
     if sol.nrows() == p && sol.ncols() == r && matref_is_finite(sol.as_ref()) {
         return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
@@ -5515,7 +5450,6 @@ fn calculate_edf_with_workspace(
     if r == 0 {
         return Ok(p as f64);
     }
-    let h_view = FaerArrayView::new(penalized_hessian);
     if workspace.final_aug_matrix.nrows() != p || workspace.final_aug_matrix.ncols() != r {
         workspace.final_aug_matrix = Array2::zeros((p, r));
     }
@@ -5525,11 +5459,11 @@ fn calculate_edf_with_workspace(
         }
     }
 
-    let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
+    let factor = StableSolver::new("pirls edf workspace")
+        .factorize(penalized_hessian)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
-        }
-    })?;
+        })?;
     {
         let mut rhs_view = array2_to_mat_mut(&mut workspace.final_aug_matrix);
         factor.solve_in_place(rhs_view.as_mut());
@@ -5946,7 +5880,7 @@ mod tests {
             y.view(),
             &eta,
             se.view(),
-            LinkFunction::Logit,
+            &InverseLink::Standard(LinkFunction::Logit),
             prior.view(),
             &mut mu,
             &mut weights,
@@ -5958,8 +5892,6 @@ mod tests {
                 d2mu_deta2: &mut d2,
                 d3mu_deta3: &mut d3,
             }),
-            None,
-            None,
         )
         .expect("integrated link update");
 

@@ -1,5 +1,7 @@
 use super::*;
-use crate::types::{InverseLink, SasLinkState};
+use crate::faer_ndarray::FaerLblt;
+use crate::linalg::utils::StableSolver;
+use crate::types::{InverseLink, LinkFunction, SasLinkState};
 
 impl<'a> RemlState<'a> {
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
@@ -82,6 +84,20 @@ impl<'a> RemlState<'a> {
         self.runtime_mixture_link_state = mixture_link_state;
         self.runtime_sas_link_state = sas_link_state;
         self.invalidate_link_dependent_state();
+    }
+
+    pub(super) fn runtime_inverse_link(&self) -> InverseLink {
+        if let Some(state) = self.runtime_mixture_link_state.clone() {
+            InverseLink::Mixture(state)
+        } else if let Some(state) = self.runtime_sas_link_state {
+            if matches!(self.config.link_function(), LinkFunction::BetaLogistic) {
+                InverseLink::BetaLogistic(state)
+            } else {
+                InverseLink::Sas(state)
+            }
+        } else {
+            self.config.link_kind.clone()
+        }
     }
 
     /// Compute soft prior cost without needing workspace
@@ -364,16 +380,21 @@ impl<'a> RemlState<'a> {
         // Prefer an un-ridged factorization when the stabilized Hessian is already PD.
         // Only fall back to the RidgePlanner path if direct factorization fails.
         let rho_like = lambdas.mapv(|lam| lam.ln());
-        let factor = {
-            let h_view = FaerArrayView::new(h_eff);
-            if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-                Arc::new(FaerFactor::Llt(f))
-            } else if let Ok(f) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-                Arc::new(FaerFactor::Ldlt(f))
-            } else {
-                self.get_faer_factor(&rho_like, h_eff)
-            }
-        };
+        let stable_solver = StableSolver::new("reml edf hessian");
+        let factor = stable_solver
+            .factorize(h_eff)
+            .map(|f| {
+                Arc::new(match f {
+                    crate::faer_ndarray::FaerSymmetricFactor::Llt(inner) => FaerFactor::Llt(inner),
+                    crate::faer_ndarray::FaerSymmetricFactor::Ldlt(inner) => {
+                        FaerFactor::Ldlt(inner)
+                    }
+                    crate::faer_ndarray::FaerSymmetricFactor::Lblt(inner) => {
+                        FaerFactor::Lblt(inner)
+                    }
+                })
+            })
+            .unwrap_or_else(|_| self.get_faer_factor(&rho_like, h_eff));
 
         // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
         // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly.
@@ -694,29 +715,25 @@ impl<'a> RemlState<'a> {
     /// # Returns
     pub(super) fn factorize_faer(&self, h: &Array2<f64>) -> FaerFactor {
         let mut planner = RidgePlanner::new(h);
+        let stable_solver = StableSolver::new("reml hessian");
         loop {
             let ridge = planner.ridge();
-            if ridge > 0.0 {
-                let regularized = add_ridge(h, ridge);
+            let regularized = add_ridge(h, ridge);
+            if let Ok(factor) = stable_solver.factorize(&regularized) {
+                return match factor {
+                    crate::faer_ndarray::FaerSymmetricFactor::Llt(inner) => FaerFactor::Llt(inner),
+                    crate::faer_ndarray::FaerSymmetricFactor::Ldlt(inner) => {
+                        FaerFactor::Ldlt(inner)
+                    }
+                    crate::faer_ndarray::FaerSymmetricFactor::Lblt(inner) => {
+                        FaerFactor::Lblt(inner)
+                    }
+                };
+            }
+            if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
                 let view = FaerArrayView::new(&regularized);
-                if let Ok(f) = FaerLlt::new(view.as_ref(), Side::Lower) {
-                    return FaerFactor::Llt(f);
-                }
-                if let Ok(f) = FaerLdlt::new(view.as_ref(), Side::Lower) {
-                    return FaerFactor::Ldlt(f);
-                }
-                if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
-                    let f = FaerLblt::new(view.as_ref(), Side::Lower);
-                    return FaerFactor::Lblt(f);
-                }
-            } else {
-                let h_view = FaerArrayView::new(h);
-                if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-                    return FaerFactor::Llt(f);
-                }
-                if let Ok(f) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-                    return FaerFactor::Ldlt(f);
-                }
+                let f = FaerLblt::new(view.as_ref(), Side::Lower);
+                return FaerFactor::Lblt(f);
             }
             planner.bump_with_matrix(h);
         }

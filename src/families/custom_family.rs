@@ -1,13 +1,12 @@
 use crate::faer_ndarray::FaerCholesky;
 use crate::faer_ndarray::{FaerArrayView, FaerEigh};
+use crate::linalg::utils::StableSolver;
 use crate::matrix::DesignMatrix;
 use crate::pirls::LinearInequalityConstraints;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
-use faer::linalg::solvers::{
-    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
-};
+use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2};
 use thiserror::Error;
 use wolfe_bfgs::{
@@ -468,7 +467,6 @@ fn solve_block_weighted_system(
     ridge_policy: RidgePolicy,
 ) -> Result<Array1<f64>, String> {
     let n = x.nrows();
-    let p = x.ncols();
     if y_star.len() != n || w.len() != n {
         return Err("weighted-system dimension mismatch".to_string());
     }
@@ -481,47 +479,12 @@ fn solve_block_weighted_system(
         0.0
     };
 
-    for retry in 0..8 {
-        let ridge = if base_ridge > 0.0 {
-            base_ridge * 10f64.powi(retry)
-        } else {
-            0.0
-        };
-
-        let mut xtwx = xtwx_base.clone();
-        xtwx += s_lambda;
-        for d in 0..p {
-            xtwx[[d, d]] += ridge;
-        }
-
-        let h = crate::faer_ndarray::FaerArrayView::new(&xtwx);
-        let mut rhs = xtwy.clone();
-        let mut rhs_mat = FaerMat::zeros(p, 1);
-        for i in 0..p {
-            rhs_mat[(i, 0)] = rhs[i];
-        }
-
-        if let Ok(ch) = FaerLlt::new(h.as_ref(), Side::Lower) {
-            ch.solve_in_place(rhs_mat.as_mut());
-        } else if let Ok(ld) = FaerLdlt::new(h.as_ref(), Side::Lower) {
-            ld.solve_in_place(rhs_mat.as_mut());
-        } else {
-            let lb = FaerLblt::new(h.as_ref(), Side::Lower);
-            lb.solve_in_place(rhs_mat.as_mut());
-        }
-
-        for i in 0..p {
-            rhs[i] = rhs_mat[(i, 0)];
-        }
-        if rhs.iter().all(|v| v.is_finite()) {
-            return Ok(rhs);
-        }
-
-        if !ridge_policy.include_laplace_hessian {
-            break;
-        }
-    }
-    Err("block solve failed after ridge retries".to_string())
+    let mut xtwx = xtwx_base.clone();
+    xtwx += s_lambda;
+    let solver = StableSolver::new("custom-family weighted block solve");
+    solver
+        .solve_vector_with_ridge_retries(&xtwx, &xtwy, base_ridge)
+        .ok_or_else(|| "block solve failed after ridge retries".to_string())
 }
 
 fn solve_spd_system_with_policy(
@@ -539,41 +502,10 @@ fn solve_spd_system_with_policy(
     } else {
         0.0
     };
-    for retry in 0..8 {
-        let ridge = if base_ridge > 0.0 {
-            base_ridge * 10f64.powi(retry)
-        } else {
-            0.0
-        };
-        let mut a = lhs.clone();
-        for d in 0..p {
-            a[[d, d]] += ridge;
-        }
-        let h = crate::faer_ndarray::FaerArrayView::new(&a);
-        let mut rhs_mat = FaerMat::zeros(p, 1);
-        for i in 0..p {
-            rhs_mat[(i, 0)] = rhs[i];
-        }
-        if let Ok(ch) = FaerLlt::new(h.as_ref(), Side::Lower) {
-            ch.solve_in_place(rhs_mat.as_mut());
-        } else if let Ok(ld) = FaerLdlt::new(h.as_ref(), Side::Lower) {
-            ld.solve_in_place(rhs_mat.as_mut());
-        } else {
-            let lb = FaerLblt::new(h.as_ref(), Side::Lower);
-            lb.solve_in_place(rhs_mat.as_mut());
-        }
-        let mut out = Array1::<f64>::zeros(p);
-        for i in 0..p {
-            out[i] = rhs_mat[(i, 0)];
-        }
-        if out.iter().all(|v| v.is_finite()) {
-            return Ok(out);
-        }
-        if !ridge_policy.include_laplace_hessian {
-            break;
-        }
-    }
-    Err("exact-newton block solve failed after ridge retries".to_string())
+    let solver = StableSolver::new("custom-family SPD block solve");
+    solver
+        .solve_vector_with_ridge_retries(lhs, rhs, base_ridge)
+        .ok_or_else(|| "exact-newton block solve failed after ridge retries".to_string())
 }
 
 struct BlockUpdateContext<'a> {
@@ -800,24 +732,13 @@ fn solve_kkt_step(
     }
     let m = active_a.nrows();
     if m == 0 {
-        let p = gradient.len();
-        let h_view = FaerArrayView::new(hessian);
-        let mut rhs_mat = FaerMat::zeros(p, 1);
-        for i in 0..p {
-            rhs_mat[(i, 0)] = -gradient[i];
-        }
-        if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-            ch.solve_in_place(rhs_mat.as_mut());
-        } else if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-            ld.solve_in_place(rhs_mat.as_mut());
-        } else {
-            let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
-            lb.solve_in_place(rhs_mat.as_mut());
-        }
-        let mut direction = Array1::<f64>::zeros(p);
-        for i in 0..p {
-            direction[i] = rhs_mat[(i, 0)];
-        }
+        let rhs = gradient.mapv(|v| -v);
+        let solver = StableSolver::new("custom-family unconstrained kkt step");
+        let direction = solver
+            .solve_vector_with_ridge_retries(hessian, &rhs, 0.0)
+            .ok_or_else(|| {
+                "constrained unconstrained-step solve produced non-finite values".to_string()
+            })?;
         if !direction.iter().all(|v| v.is_finite()) {
             return Err(
                 "constrained unconstrained-step solve produced non-finite values".to_string(),
@@ -1118,36 +1039,10 @@ fn inverse_spd_with_retry(
     base_ridge: f64,
     max_retry: usize,
 ) -> Result<Array2<f64>, String> {
-    let p = matrix.nrows();
-    for retry in 0..max_retry {
-        let ridge = if base_ridge > 0.0 {
-            base_ridge * 10f64.powi(retry as i32)
-        } else {
-            0.0
-        };
-        let mut h = matrix.clone();
-        for d in 0..p {
-            h[[d, d]] += ridge;
-        }
-        let h_view = FaerArrayView::new(&h);
-        if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-            let mut i_mat = FaerMat::zeros(p, p);
-            for d in 0..p {
-                i_mat[(d, d)] = 1.0;
-            }
-            ch.solve_in_place(i_mat.as_mut());
-            let mut inv = Array2::<f64>::zeros((p, p));
-            for i in 0..p {
-                for j in 0..p {
-                    inv[[i, j]] = i_mat[(i, j)];
-                }
-            }
-            if inv.iter().all(|v| v.is_finite()) {
-                return Ok(inv);
-            }
-        }
-    }
-    Err("failed to invert SPD system after ridge retries".to_string())
+    let solver = StableSolver::new("custom-family inverse spd");
+    solver
+        .inverse_with_ridge_retries(matrix, base_ridge, max_retry)
+        .ok_or_else(|| "failed to invert SPD system after ridge retries".to_string())
 }
 
 fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {

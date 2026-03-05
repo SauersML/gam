@@ -1,11 +1,12 @@
 use crate::estimate::EstimationError;
 use crate::estimate::FitResult;
-use crate::faer_ndarray::{FaerArrayView, factorize_symmetric_with_fallback};
+use crate::faer_ndarray::FaerArrayView;
+use crate::linalg::utils::StableSolver;
 use crate::pirls;
 use crate::types::LinkFunction;
 use faer::Mat as FaerMat;
 use faer::linalg::matmul::matmul;
-use faer::{Accum, Par, Side};
+use faer::{Accum, Par};
 use ndarray::{Array1, Array2, ArrayView1, s};
 use std::cmp::Ordering;
 
@@ -69,13 +70,11 @@ fn compute_alo_diagnostics_from_pirls_impl(
     // ad-hoc ridge term in diagnostics.
     let k = base.stabilized_hessian_transformed.clone();
     let p = k.nrows();
-    let k_view = FaerArrayView::new(&k);
-
-    let factor = factorize_symmetric_with_fallback(k_view.as_ref(), Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
+    let factor = StableSolver::new("alo stabilized hessian")
+        .factorize(&k)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
-        }
-    })?;
+        })?;
 
     let xt = x_dense.t();
 

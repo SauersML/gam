@@ -3,10 +3,11 @@ use crate::faer_ndarray::{
     FaerArrayView, FaerLinalgError, array2_to_mat_mut, factorize_symmetric_with_fallback,
 };
 use faer::Side;
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
+const MAX_SOLVE_RETRIES: usize = 8;
 
 #[derive(Default, Clone, Copy)]
 pub(crate) struct KahanSum {
@@ -31,54 +32,147 @@ pub(crate) fn matrix_inverse_with_regularization(
     matrix: &Array2<f64>,
     label: &str,
 ) -> Option<Array2<f64>> {
-    let p = matrix.nrows();
-    if p == 0 || matrix.ncols() != p {
-        return None;
+    StableSolver::new(label).inverse_with_regularization(matrix)
+}
+
+pub(crate) struct StableSolver<'a> {
+    label: &'a str,
+}
+
+impl<'a> StableSolver<'a> {
+    pub(crate) fn new(label: &'a str) -> Self {
+        Self { label }
     }
 
-    let mut planner = RidgePlanner::new(matrix);
-    let factor = loop {
-        let ridge = planner.ridge();
-        let h_eff = if ridge > 0.0 {
-            add_ridge(matrix, ridge)
-        } else {
-            matrix.clone()
-        };
-        let h_view = FaerArrayView::new(&h_eff);
-        if let Ok(factor) = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower) {
-            break factor;
-        }
-        if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
-            log::warn!(
-                "Falling back to LDLT pivoted inverse for {} after ridge {:.3e}",
-                label,
-                ridge
-            );
-            let h_view = FaerArrayView::new(&h_eff);
-            let fallback = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower)
-                .map_err(|_| FaerLinalgError::FactorizationFailed);
-            if let Ok(factor) = fallback {
-                break factor;
-            }
-            log::warn!("Failed to factorize {} for covariance", label);
+    pub(crate) fn factorize(
+        &self,
+        matrix: &Array2<f64>,
+    ) -> Result<crate::faer_ndarray::FaerSymmetricFactor, FaerLinalgError> {
+        let view = FaerArrayView::new(matrix);
+        factorize_symmetric_with_fallback(view.as_ref(), Side::Lower)
+    }
+
+    pub(crate) fn inverse_with_regularization(&self, matrix: &Array2<f64>) -> Option<Array2<f64>> {
+        let p = matrix.nrows();
+        if p == 0 || matrix.ncols() != p {
             return None;
         }
-        planner.bump_with_matrix(matrix);
-    };
 
-    let mut inv = Array2::<f64>::eye(p);
-    let mut inv_view = array2_to_mat_mut(&mut inv);
-    factor.solve_in_place(inv_view.as_mut());
+        let mut planner = RidgePlanner::new(matrix);
+        let (factor, _ridge, regularized) = self.factorize_with_ridge_plan(matrix, &mut planner)?;
+        let mut inv = Array2::<f64>::eye(p);
+        let mut inv_view = array2_to_mat_mut(&mut inv);
+        factor.solve_in_place(inv_view.as_mut());
 
-    // Numerical solves can leave tiny asymmetry; enforce symmetry explicitly.
-    for i in 0..p {
-        for j in (i + 1)..p {
-            let avg = 0.5 * (inv[[i, j]] + inv[[j, i]]);
-            inv[[i, j]] = avg;
-            inv[[j, i]] = avg;
+        if !inv.iter().all(|v| v.is_finite()) {
+            log::warn!("Non-finite inverse produced for {}", self.label);
+            return None;
+        }
+
+        // Numerical solves can leave tiny asymmetry; enforce symmetry explicitly.
+        for i in 0..p {
+            for j in (i + 1)..p {
+                let avg = 0.5 * (inv[[i, j]] + inv[[j, i]]);
+                inv[[i, j]] = avg;
+                inv[[j, i]] = avg;
+            }
+        }
+        debug_assert_eq!(regularized.nrows(), p);
+        Some(inv)
+    }
+
+    pub(crate) fn solve_vector_with_ridge_retries(
+        &self,
+        matrix: &Array2<f64>,
+        rhs: &Array1<f64>,
+        base_ridge: f64,
+    ) -> Option<Array1<f64>> {
+        let p = matrix.nrows();
+        if matrix.ncols() != p || rhs.len() != p {
+            return None;
+        }
+
+        for retry in 0..MAX_SOLVE_RETRIES {
+            let ridge = if base_ridge > 0.0 {
+                base_ridge * 10f64.powi(retry as i32)
+            } else {
+                0.0
+            };
+            let h = add_ridge(matrix, ridge);
+            let factor = match self.factorize(&h) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mut out = rhs.clone();
+            let mut out_mat = crate::faer_ndarray::array1_to_col_mat_mut(&mut out);
+            factor.solve_in_place(out_mat.as_mut());
+            if out.iter().all(|v| v.is_finite()) {
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn inverse_with_ridge_retries(
+        &self,
+        matrix: &Array2<f64>,
+        base_ridge: f64,
+        max_retry: usize,
+    ) -> Option<Array2<f64>> {
+        let p = matrix.nrows();
+        if p == 0 || matrix.ncols() != p {
+            return None;
+        }
+        for retry in 0..max_retry {
+            let ridge = if base_ridge > 0.0 {
+                base_ridge * 10f64.powi(retry as i32)
+            } else {
+                0.0
+            };
+            let h = add_ridge(matrix, ridge);
+            let factor = match self.factorize(&h) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mut inv = Array2::<f64>::eye(p);
+            let mut inv_view = array2_to_mat_mut(&mut inv);
+            factor.solve_in_place(inv_view.as_mut());
+            if inv.iter().all(|v| v.is_finite()) {
+                for i in 0..p {
+                    for j in (i + 1)..p {
+                        let avg = 0.5 * (inv[[i, j]] + inv[[j, i]]);
+                        inv[[i, j]] = avg;
+                        inv[[j, i]] = avg;
+                    }
+                }
+                return Some(inv);
+            }
+        }
+        None
+    }
+
+    fn factorize_with_ridge_plan(
+        &self,
+        matrix: &Array2<f64>,
+        planner: &mut RidgePlanner,
+    ) -> Option<(crate::faer_ndarray::FaerSymmetricFactor, f64, Array2<f64>)> {
+        loop {
+            let ridge = planner.ridge();
+            let h_eff = add_ridge(matrix, ridge);
+            if let Ok(factor) = self.factorize(&h_eff) {
+                return Some((factor, ridge, h_eff));
+            }
+            if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
+                log::warn!(
+                    "Failed to factorize {} after ridge {:.3e}",
+                    self.label,
+                    ridge
+                );
+                return None;
+            }
+            planner.bump_with_matrix(matrix);
         }
     }
-    Some(inv)
 }
 
 pub(crate) fn max_abs_diag(matrix: &Array2<f64>) -> f64 {

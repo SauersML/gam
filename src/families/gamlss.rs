@@ -14,6 +14,7 @@ use crate::families::sigma_link::{
     bounded_sigma_derivs_up_to_third, bounded_sigma_from_eta_scalar,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
+use crate::linalg::utils::StableSolver;
 use crate::matrix::{DesignMatrix, LinearOperator};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::pirls::WorkingLikelihood as EngineWorkingLikelihood;
@@ -26,11 +27,6 @@ use crate::smooth::{
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivative_info_list,
 };
 use crate::types::{GlmLikelihoodFamily, InverseLink, LinkFunction};
-use faer::Mat as FaerMat;
-use faer::Side;
-use faer::linalg::solvers::{
-    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
-};
 use ndarray::{Array1, Array2, ArrayView1, s};
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
@@ -559,25 +555,10 @@ fn solve_weighted_projection(
         xtwx[[a, a]] += ridge_floor.max(1e-12);
     }
 
-    let h = crate::faer_ndarray::FaerArrayView::new(&xtwx);
-    let mut rhs_mat = FaerMat::zeros(p, 1);
-    for i in 0..p {
-        rhs_mat[(i, 0)] = xtwy[i];
-    }
-
-    if let Ok(ch) = FaerLlt::new(h.as_ref(), Side::Lower) {
-        ch.solve_in_place(rhs_mat.as_mut());
-    } else if let Ok(ld) = FaerLdlt::new(h.as_ref(), Side::Lower) {
-        ld.solve_in_place(rhs_mat.as_mut());
-    } else {
-        let lb = FaerLblt::new(h.as_ref(), Side::Lower);
-        lb.solve_in_place(rhs_mat.as_mut());
-    }
-
-    let mut beta = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        beta[i] = rhs_mat[(i, 0)];
-    }
+    let solver = StableSolver::new("gamlss weighted projection");
+    let beta = solver
+        .solve_vector_with_ridge_retries(&xtwx, &xtwy, 0.0)
+        .ok_or_else(|| "solve_weighted_projection produced non-finite coefficients".to_string())?;
     if beta.iter().any(|v| !v.is_finite()) {
         return Err("solve_weighted_projection produced non-finite coefficients".to_string());
     }
