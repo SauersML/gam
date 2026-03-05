@@ -204,7 +204,6 @@ pub(crate) struct SparsePenalizedSystemStats {
 // nonzeros needed for spline penalties. For banded spline systems with
 // half-bandwidth b, the work scales like sum_j |N(j)|^2 = O(p b^2) instead of
 // dense O(p^3), where N(j) is the subdiagonal nonzero pattern of column j of L.
-#[allow(dead_code)]
 struct SparsePenalizedSystemCache {
     xtwx_cache: SparseXtWxCache,
     penalty_pattern: SparsePenaltyPattern,
@@ -400,7 +399,6 @@ pub struct IntegratedWorkingInput<'a> {
     pub se: ArrayView1<'a, f64>,
 }
 
-#[allow(dead_code)]
 pub struct WorkingDerivativeBuffersMut<'a> {
     c: &'a mut Array1<f64>,
     d: &'a mut Array1<f64>,
@@ -410,7 +408,6 @@ pub struct WorkingDerivativeBuffersMut<'a> {
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 struct WorkingBernoulliGeometry {
     mu: f64,
     weight: f64,
@@ -949,7 +946,6 @@ impl PirlsWorkspace {
     }
 
     // Phase 2 hook: numeric sparse penalized-system assembly in original coordinates.
-    #[allow(dead_code)]
     fn assemble_sparse_penalized_hessian(
         &mut self,
         x: &SparseColMat<usize, f64>,
@@ -1084,7 +1080,6 @@ struct GamWorkingModel<'a> {
     quad_ctx: crate::quadrature::QuadratureContext,
 }
 
-#[allow(dead_code)]
 struct GamModelFinalState {
     x_transformed: Option<DesignMatrix>,
     x_active: DesignMatrix,
@@ -2040,7 +2035,7 @@ fn should_use_sparse_native_pirls(
 }
 
 // Phase 2 hook for targeted tests and the eventual sparse-native PIRLS solve path.
-#[allow(dead_code)]
+#[cfg(test)]
 fn assemble_sparse_penalized_hessian(
     workspace: &mut PirlsWorkspace,
     x: &SparseColMat<usize, f64>,

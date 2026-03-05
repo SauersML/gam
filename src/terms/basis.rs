@@ -2733,7 +2733,6 @@ fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Resul
 }
 
 #[inline(always)]
-#[allow(dead_code)]
 fn matern_kernel_log_kappa_derivative_from_distance(
     r: f64,
     length_scale: f64,
@@ -2781,7 +2780,6 @@ fn matern_kernel_log_kappa_derivative_from_distance(
 }
 
 #[inline(always)]
-#[allow(dead_code)]
 fn matern_kernel_log_kappa_second_derivative_from_distance(
     r: f64,
     length_scale: f64,
@@ -2826,8 +2824,8 @@ fn matern_kernel_log_kappa_second_derivative_from_distance(
     Ok(second)
 }
 
+#[cfg(test)]
 #[inline(always)]
-#[allow(dead_code)]
 fn matern_poly_terms(nu: MaternNu, a: f64) -> (f64, f64, f64) {
     match nu {
         MaternNu::Half => (1.0, 0.0, 0.0),
@@ -2853,8 +2851,8 @@ fn matern_poly_terms(nu: MaternNu, a: f64) -> (f64, f64, f64) {
     }
 }
 
+#[cfg(test)]
 #[inline(always)]
-#[allow(dead_code)]
 fn matern_kernel_radial_triplet(
     r: f64,
     length_scale: f64,

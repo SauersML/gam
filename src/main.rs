@@ -915,12 +915,14 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         let options = blockwise_options_from_fit_args(&args)?;
         let strategy: Box<dyn BinomialLocationScaleStrategy> = if learn_link_wiggle {
             Box::new(WiggleBinomialLocationScaleStrategy {
-                cfg: formula_link_wiggle.clone().unwrap_or(LinkWiggleFormulaSpec {
-                    degree: 3,
-                    num_internal_knots: 7,
-                    penalty_orders: vec![1, 2, 3],
-                    double_penalty: true,
-                }),
+                cfg: formula_link_wiggle
+                    .clone()
+                    .unwrap_or(LinkWiggleFormulaSpec {
+                        degree: 3,
+                        num_internal_knots: 7,
+                        penalty_orders: vec![1, 2, 3],
+                        double_penalty: true,
+                    }),
             })
         } else {
             Box::new(PlainBinomialLocationScaleStrategy)
