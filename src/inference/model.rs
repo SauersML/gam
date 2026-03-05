@@ -1,4 +1,4 @@
-use crate::estimate::FitResult;
+use crate::estimate::{FitResult, FittedLinkParameters};
 use crate::mixture_link::{state_from_beta_logistic_spec, state_from_sas_spec};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, BoundedCoefficientPriorSpec, LinearCoefficientGeometry,
@@ -611,29 +611,30 @@ impl FittedModel {
                     v.iter().copied(),
                 )?;
             }
-            if let Some(v) = fit.mixture_link_rho.as_ref() {
-                validate_all_finite("fit_result.mixture_link_rho", v.iter().copied())?;
-            }
-            if let Some(v) = fit.mixture_link_weights.as_ref() {
-                validate_all_finite("fit_result.mixture_link_weights", v.iter().copied())?;
-            }
-            if let Some(v) = fit.mixture_link_param_covariance.as_ref() {
-                validate_all_finite(
-                    "fit_result.mixture_link_param_covariance",
-                    v.iter().copied(),
-                )?;
-            }
-            if let Some(v) = fit.sas_param_covariance.as_ref() {
-                validate_all_finite("fit_result.sas_param_covariance", v.iter().copied())?;
-            }
-            if let Some(v) = fit.sas_epsilon {
-                ensure_finite_scalar("fit_result.sas_epsilon", v)?;
-            }
-            if let Some(v) = fit.sas_log_delta {
-                ensure_finite_scalar("fit_result.sas_log_delta", v)?;
-            }
-            if let Some(v) = fit.sas_delta {
-                ensure_finite_scalar("fit_result.sas_delta", v)?;
+            match &fit.fitted_link_parameters {
+                FittedLinkParameters::Standard => {}
+                FittedLinkParameters::Mixture { state, covariance } => {
+                    validate_all_finite("fit_result.mixture_link_rho", state.rho.iter().copied())?;
+                    validate_all_finite(
+                        "fit_result.mixture_link_weights",
+                        state.pi.iter().copied(),
+                    )?;
+                    if let Some(v) = covariance.as_ref() {
+                        validate_all_finite(
+                            "fit_result.mixture_link_param_covariance",
+                            v.iter().copied(),
+                        )?;
+                    }
+                }
+                FittedLinkParameters::Sas { state, covariance }
+                | FittedLinkParameters::BetaLogistic { state, covariance } => {
+                    ensure_finite_scalar("fit_result.sas_epsilon", state.epsilon)?;
+                    ensure_finite_scalar("fit_result.sas_log_delta", state.log_delta)?;
+                    ensure_finite_scalar("fit_result.sas_delta", state.delta)?;
+                    if let Some(v) = covariance.as_ref() {
+                        validate_all_finite("fit_result.sas_param_covariance", v.iter().copied())?;
+                    }
+                }
             }
         }
 

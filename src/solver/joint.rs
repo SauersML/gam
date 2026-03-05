@@ -29,7 +29,7 @@ use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
 use crate::probability::normal_cdf_approx;
 use crate::quadrature::QuadratureContext;
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
-use crate::types::{GlmLikelihoodFamily, LikelihoodFamily, LinkFunction};
+use crate::types::{GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction};
 use crate::visualizer;
 use faer::Side;
 use ndarray::s;
@@ -741,13 +741,11 @@ impl<'a> JointModelState<'a> {
                     crate::pirls::update_glm_vectors(
                         self.y,
                         &eta,
-                        self.link.clone(),
+                        &InverseLink::Standard(self.link),
                         self.weights,
                         &mut mu,
                         &mut weights,
                         &mut z_glm,
-                        None,
-                        None,
                         None,
                     )
                     .map_err(|e2| {
@@ -761,13 +759,11 @@ impl<'a> JointModelState<'a> {
                 crate::pirls::update_glm_vectors(
                     self.y,
                     &eta,
-                    self.link.clone(),
+                    &InverseLink::Standard(self.link),
                     self.weights,
                     &mut mu,
                     &mut weights,
                     &mut z_glm,
-                    None,
-                    None,
                     None,
                 )?;
             }
@@ -775,13 +771,11 @@ impl<'a> JointModelState<'a> {
             crate::pirls::update_glm_vectors(
                 self.y,
                 &eta,
-                self.link.clone(),
+                &InverseLink::Standard(self.link),
                 self.weights,
                 &mut mu,
                 &mut weights,
                 &mut z_glm,
-                None,
-                None,
                 None,
             )?;
         }
@@ -1115,13 +1109,11 @@ impl<'a> JointModelState<'a> {
                         self.y,
                         eta,
                         se.view(),
-                        self.link,
+                        &InverseLink::Standard(self.link),
                         self.weights,
                         &mut mu_updated,
                         &mut weights_updated,
                         &mut z_updated,
-                        None,
-                        None,
                         None,
                     ) {
                         log::warn!(
@@ -1132,13 +1124,11 @@ impl<'a> JointModelState<'a> {
                         if let Err(e2) = crate::pirls::update_glm_vectors(
                             self.y,
                             eta,
-                            self.link,
+                            &InverseLink::Standard(self.link),
                             self.weights,
                             &mut mu_updated,
                             &mut weights_updated,
                             &mut z_updated,
-                            None,
-                            None,
                             None,
                         ) {
                             log::warn!("joint non-integrated fallback update failed: {}", e2);
@@ -1149,13 +1139,11 @@ impl<'a> JointModelState<'a> {
                     if let Err(e) = crate::pirls::update_glm_vectors(
                         self.y,
                         eta,
-                        self.link.clone(),
+                        &InverseLink::Standard(self.link),
                         self.weights,
                         &mut mu_updated,
                         &mut weights_updated,
                         &mut z_updated,
-                        None,
-                        None,
                         None,
                     ) {
                         log::warn!("joint working-vector update failed: {}", e);
@@ -1166,13 +1154,11 @@ impl<'a> JointModelState<'a> {
             if let Err(e) = crate::pirls::update_glm_vectors(
                 self.y,
                 eta,
-                self.link.clone(),
+                &InverseLink::Standard(self.link),
                 self.weights,
                 &mut mu_updated,
                 &mut weights_updated,
                 &mut z_updated,
-                None,
-                None,
                 None,
             ) {
                 log::warn!("joint working-vector update failed: {}", e);
@@ -2932,13 +2918,11 @@ impl<'a> JointRemlState<'a> {
         if let Err(e) = crate::pirls::update_glm_vectors(
             state.y,
             &eta,
-            state.link.clone(),
+            &InverseLink::Standard(state.link),
             state.weights,
             &mut mu,
             &mut weights,
             &mut z,
-            None,
-            None,
             None,
         ) {
             log::warn!("joint final working-vector update failed: {}", e);

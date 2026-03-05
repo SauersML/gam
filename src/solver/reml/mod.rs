@@ -1,6 +1,7 @@
 use self::cache::AtomicFlagGuard;
 use self::strategy::{GeometryBackendKind, HessianEvalStrategyKind, HessianStrategyDecision};
 use super::*;
+use crate::faer_ndarray::{FaerLblt, FaerLdlt, FaerLlt};
 use crate::linalg::sparse_exact::{
     SparseExactFactor, SparsePenaltyBlock, SparseTraceWorkspace,
     assemble_and_factor_sparse_penalized_system, build_sparse_penalty_blocks,
@@ -9,7 +10,9 @@ use crate::linalg::sparse_exact::{
 };
 use crate::pirls::{DirectionalWorkingCurvature, PirlsWorkspace};
 use crate::types::SasLinkState;
+use faer::Mat as FaerMat;
 use faer::Side;
+use faer::linalg::solvers::Solve as FaerSolve;
 
 mod cache;
 mod eval;

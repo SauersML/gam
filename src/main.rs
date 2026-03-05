@@ -13,9 +13,9 @@ use gam::basis::{
 };
 use gam::estimate::{
     AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, EstimationError,
-    ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, ModelSummary,
-    ParametricTermSummary, SmoothTermSummary, compute_continuous_smoothness_order, fit_gam,
-    optimize_external_design, predict_gam, predict_gam_posterior_mean_with_fit,
+    ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, FittedLinkParameters,
+    ModelSummary, ParametricTermSummary, SmoothTermSummary, compute_continuous_smoothness_order,
+    fit_gam, optimize_external_design, predict_gam, predict_gam_posterior_mean_with_fit,
     predict_gam_with_uncertainty,
 };
 use gam::families::family_meta::{
@@ -927,11 +927,17 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         payload.fit_result = Some(fit.clone());
         payload.data_schema = Some(ds.schema.clone());
         payload.link = link_choice.as_ref().map(link_choice_to_string);
-        payload.mixture_link_param_covariance = fit
-            .mixture_link_param_covariance
-            .as_ref()
-            .map(array2_to_nested_vec);
-        payload.sas_param_covariance = fit.sas_param_covariance.as_ref().map(array2_to_nested_vec);
+        match &fit.fitted_link_parameters {
+            FittedLinkParameters::Mixture { covariance, .. } => {
+                payload.mixture_link_param_covariance =
+                    covariance.as_ref().map(array2_to_nested_vec);
+            }
+            FittedLinkParameters::Sas { covariance, .. }
+            | FittedLinkParameters::BetaLogistic { covariance, .. } => {
+                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
+            }
+            FittedLinkParameters::Standard => {}
+        }
         payload.training_headers = Some(ds.headers.clone());
         payload.resolved_term_spec = Some(frozen_spec);
         payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
@@ -5137,14 +5143,7 @@ fn core_saved_fit_result(
         beta_covariance_corrected,
         beta_standard_errors_corrected: None,
         reml_score: summary.reml_score,
-        mixture_link_components: None,
-        mixture_link_rho: None,
-        mixture_link_weights: None,
-        mixture_link_param_covariance: None,
-        sas_epsilon: None,
-        sas_log_delta: None,
-        sas_delta: None,
-        sas_param_covariance: None,
+        fitted_link_parameters: FittedLinkParameters::Standard,
     }
 }
 
@@ -5273,22 +5272,18 @@ where
 }
 
 fn saved_mixture_state_from_fit(fit: &FitResult) -> Option<gam::types::MixtureLinkState> {
-    let components = fit.mixture_link_components.clone()?;
-    let rho = fit.mixture_link_rho.clone()?;
-    let pi = fit.mixture_link_weights.clone()?;
-    Some(gam::types::MixtureLinkState {
-        components,
-        rho,
-        pi,
-    })
+    match &fit.fitted_link_parameters {
+        FittedLinkParameters::Mixture { state, .. } => Some(state.clone()),
+        _ => None,
+    }
 }
 
 fn saved_sas_state_from_fit(fit: &FitResult) -> Option<gam::types::SasLinkState> {
-    Some(gam::types::SasLinkState {
-        epsilon: fit.sas_epsilon?,
-        log_delta: fit.sas_log_delta?,
-        delta: fit.sas_delta?,
-    })
+    match &fit.fitted_link_parameters {
+        FittedLinkParameters::Sas { state, .. }
+        | FittedLinkParameters::BetaLogistic { state, .. } => Some(state.clone()),
+        _ => None,
+    }
 }
 
 fn term_spec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
@@ -7032,21 +7027,26 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
 fn apply_inverse_link_state_to_fit_result(fit_result: &mut FitResult, inverse_link: &InverseLink) {
     match inverse_link {
         InverseLink::Sas(state) => {
-            fit_result.sas_epsilon = Some(state.epsilon);
-            fit_result.sas_log_delta = Some(state.log_delta);
-            fit_result.sas_delta = Some(state.delta);
+            fit_result.fitted_link_parameters = FittedLinkParameters::Sas {
+                state: state.clone(),
+                covariance: None,
+            };
         }
         InverseLink::BetaLogistic(state) => {
-            fit_result.sas_epsilon = Some(state.epsilon);
-            fit_result.sas_log_delta = Some(state.log_delta);
-            fit_result.sas_delta = Some(state.delta);
+            fit_result.fitted_link_parameters = FittedLinkParameters::BetaLogistic {
+                state: state.clone(),
+                covariance: None,
+            };
         }
         InverseLink::Mixture(state) => {
-            fit_result.mixture_link_components = Some(state.components.clone());
-            fit_result.mixture_link_rho = Some(state.rho.clone());
-            fit_result.mixture_link_weights = Some(state.pi.clone());
+            fit_result.fitted_link_parameters = FittedLinkParameters::Mixture {
+                state: state.clone(),
+                covariance: None,
+            };
         }
-        InverseLink::Standard(_) => {}
+        InverseLink::Standard(_) => {
+            fit_result.fitted_link_parameters = FittedLinkParameters::Standard;
+        }
     }
 }
 
@@ -7086,9 +7086,15 @@ fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<Invers
         return Ok(residual_distribution_inverse_link(dist));
     };
     if let Some(components) = choice.mixture_components {
-        let rho = fit.mixture_link_rho.clone().ok_or_else(|| {
-            "saved survival blended-link model missing mixture_link_rho".to_string()
-        })?;
+        let rho = match &fit.fitted_link_parameters {
+            FittedLinkParameters::Mixture { state, .. } => state.rho.clone(),
+            _ => {
+                return Err(
+                    "saved survival blended-link model missing fitted mixture link parameters"
+                        .to_string(),
+                );
+            }
+        };
         return state_from_spec(&MixtureLinkSpec {
             components,
             initial_rho: rho,
@@ -7098,12 +7104,14 @@ fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<Invers
     }
     match choice.link {
         LinkFunction::Sas => {
-            let epsilon = fit
-                .sas_epsilon
-                .ok_or_else(|| "saved survival SAS model missing sas_epsilon".to_string())?;
-            let log_delta = fit
-                .sas_log_delta
-                .ok_or_else(|| "saved survival SAS model missing sas_log_delta".to_string())?;
+            let (epsilon, log_delta) = match &fit.fitted_link_parameters {
+                FittedLinkParameters::Sas { state, .. } => (state.epsilon, state.log_delta),
+                _ => {
+                    return Err(
+                        "saved survival SAS model missing fitted SAS link parameters".to_string(),
+                    );
+                }
+            };
             state_from_sas_spec(SasLinkSpec {
                 initial_epsilon: epsilon,
                 initial_log_delta: log_delta,
@@ -7112,12 +7120,17 @@ fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<Invers
             .map_err(|e| format!("invalid saved survival SAS state: {e}"))
         }
         LinkFunction::BetaLogistic => {
-            let epsilon = fit.sas_epsilon.ok_or_else(|| {
-                "saved survival beta-logistic model missing sas_epsilon".to_string()
-            })?;
-            let delta = fit.sas_log_delta.ok_or_else(|| {
-                "saved survival beta-logistic model missing sas_log_delta".to_string()
-            })?;
+            let (epsilon, delta) = match &fit.fitted_link_parameters {
+                FittedLinkParameters::BetaLogistic { state, .. } => {
+                    (state.epsilon, state.log_delta)
+                }
+                _ => {
+                    return Err(
+                        "saved survival beta-logistic model missing fitted beta-logistic link parameters"
+                            .to_string(),
+                    )
+                }
+            };
             state_from_beta_logistic_spec(SasLinkSpec {
                 initial_epsilon: epsilon,
                 initial_log_delta: delta,
@@ -7750,14 +7763,7 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
         beta_covariance_corrected: ext.beta_covariance_corrected,
         beta_standard_errors_corrected: ext.beta_standard_errors_corrected,
         reml_score: ext.reml_score,
-        mixture_link_components: ext.mixture_link_components,
-        mixture_link_rho: ext.mixture_link_rho,
-        mixture_link_weights: ext.mixture_link_weights,
-        mixture_link_param_covariance: ext.mixture_link_param_covariance,
-        sas_epsilon: ext.sas_epsilon,
-        sas_log_delta: ext.sas_log_delta,
-        sas_delta: ext.sas_delta,
-        sas_param_covariance: ext.sas_param_covariance,
+        fitted_link_parameters: ext.fitted_link_parameters,
     }
 }
 

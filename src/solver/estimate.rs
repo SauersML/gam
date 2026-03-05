@@ -32,7 +32,9 @@ use crate::construction::{
     create_balanced_penalty_root, precompute_reparam_invariant,
 };
 use crate::inference::predict::se_from_covariance;
-use crate::linalg::utils::{KahanSum, RidgePlanner, add_ridge, matrix_inverse_with_regularization};
+use crate::linalg::utils::{
+    KahanSum, RidgePlanner, StableSolver, add_ridge, matrix_inverse_with_regularization,
+};
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
     beta_logistic_inverse_link_jet_with_param_partials,
@@ -42,8 +44,8 @@ use crate::mixture_link::{
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
-    Coefficients, InverseLink, LinkComponent, LinkFunction, LogSmoothingParamsView,
-    MixtureLinkState, RidgePassport, SasLinkState,
+    Coefficients, InverseLink, LinkFunction, LogSmoothingParamsView, MixtureLinkState,
+    RidgePassport, SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -53,11 +55,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis, Zip, s};
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array2_to_mat_mut, fast_ab, fast_ata,
     fast_atb,
-};
-use faer::Mat as FaerMat;
-use faer::Side;
-use faer::linalg::solvers::{
-    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 
 use crate::diagnostics::{
@@ -508,7 +505,6 @@ fn compute_smoothing_correction(
     final_fit: &pirls::PirlsResult,
 ) -> Option<Array2<f64>> {
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
-    use faer::Side;
 
     let n_rho = final_rho.len();
     if n_rho == 0 {
@@ -543,7 +539,7 @@ fn compute_smoothing_correction(
         .unwrap_or_else(|_| final_fit.stabilized_hessian_transformed.clone());
 
     // Factor the Hessian for solving
-    let h_chol = match h_trans.cholesky(Side::Lower) {
+    let h_chol = match h_trans.cholesky(faer::Side::Lower) {
         Ok(c) => c,
         Err(_) => {
             log::warn!("Cholesky decomposition failed for smoothing correction; skipping.");
@@ -620,7 +616,7 @@ fn compute_smoothing_correction(
         hessian_rho[[i, i]] += ridge;
     }
 
-    let v_rho = match hessian_rho.cholesky(Side::Lower) {
+    let v_rho = match hessian_rho.cholesky(faer::Side::Lower) {
         Ok(chol) => {
             let mut eye = Array2::<f64>::eye(n_rho);
             for col in 0..n_rho {
@@ -661,7 +657,7 @@ fn compute_smoothing_correction(
 
     // Ensure positive semi-definiteness by clamping negative eigenvalues
     // (can happen due to numerical noise)
-    match v_corr_orig.clone().eigh(Side::Lower) {
+    match v_corr_orig.clone().eigh(faer::Side::Lower) {
         Ok((eigenvalues, eigenvectors)) => {
             let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
             if min_eig < -1e-10 {
@@ -818,16 +814,7 @@ pub struct ExternalOptimResult {
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
     pub reml_score: f64,
-    pub mixture_link_components: Option<Vec<LinkComponent>>,
-    pub mixture_link_rho: Option<Array1<f64>>,
-    pub mixture_link_weights: Option<Array1<f64>>,
-    /// Approximate covariance of mixture free logits (K-1 x K-1), when optimized.
-    pub mixture_link_param_covariance: Option<Array2<f64>>,
-    pub sas_epsilon: Option<f64>,
-    pub sas_log_delta: Option<f64>,
-    pub sas_delta: Option<f64>,
-    /// Approximate covariance of SAS params (epsilon, log_delta), shape 2x2.
-    pub sas_param_covariance: Option<Array2<f64>>,
+    pub fitted_link_parameters: FittedLinkParameters,
 }
 
 #[derive(Clone)]
@@ -1767,67 +1754,34 @@ where
     // EDF by block using stabilized H and penalty roots in transformed basis
     let lambdas = final_rho.mapv(f64::exp);
     let h = &pirls_res.stabilized_hessian_transformed;
-    let h_view = FaerArrayView::new(h);
-    enum Fact {
-        Llt(FaerLlt<f64>),
-        Ldlt(FaerLdlt<f64>),
-        Lblt(FaerLblt<f64>),
-    }
-    impl Fact {
-        fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
-            match self {
-                Fact::Llt(f) => f.solve(rhs),
-                Fact::Ldlt(f) => f.solve(rhs),
-                Fact::Lblt(f) => f.solve(rhs),
-            }
-        }
-    }
+    let stable_solver = StableSolver::new("edf stabilized hessian");
     let mut planner = RidgePlanner::new(h);
     let cond_display = planner
         .cond_estimate()
         .map(|c| format!("{c:.2e}"))
         .unwrap_or_else(|| "unavailable".to_string());
-    let fact = loop {
+    let factor = loop {
         let ridge = planner.ridge();
-        if ridge > 0.0 {
-            let regularized = add_ridge(h, ridge);
-            let view = FaerArrayView::new(&regularized);
-            if let Ok(ch) = FaerLlt::new(view.as_ref(), Side::Lower) {
+        let candidate = add_ridge(h, ridge);
+        if let Ok(f) = stable_solver.factorize(&candidate) {
+            if ridge > 0.0 {
                 log::warn!(
-                    "LLᵀ succeeded after adding ridge {:.3e} (cond ≈ {})",
+                    "Stabilized Hessian factorized with ridge {:.3e} (cond ≈ {})",
                     ridge,
                     cond_display
                 );
-                break Fact::Llt(ch);
             }
-            if let Ok(ld) = FaerLdlt::new(view.as_ref(), Side::Lower) {
-                log::warn!(
-                    "LLᵀ failed; LDLᵀ succeeded with ridge {:.3e} (cond ≈ {})",
-                    ridge,
-                    cond_display
-                );
-                break Fact::Ldlt(ld);
-            }
-            if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
-                log::warn!(
-                    "LLᵀ/LDLᵀ failed even after ridge {:.3e}; falling back to LBLᵀ (cond ≈ {})",
-                    ridge,
-                    cond_display
-                );
-                let f = FaerLblt::new(view.as_ref(), Side::Lower);
-                break Fact::Lblt(f);
-            }
-        } else {
-            if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-                break Fact::Llt(ch);
-            }
-            if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-                log::warn!(
-                    "LLᵀ failed for Hessian (cond ≈ {}); using LDLᵀ without ridge",
-                    cond_display
-                );
-                break Fact::Ldlt(ld);
-            }
+            break f;
+        }
+        if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
+            log::warn!(
+                "Hessian factorization failed after ridge {:.3e} (cond ≈ {})",
+                ridge,
+                cond_display
+            );
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
         }
         planner.bump_with_matrix(h);
     };
@@ -1835,7 +1789,7 @@ where
     for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
         let ekt_arr = rs.t().to_owned();
         let ekt_view = FaerArrayView::new(&ekt_arr);
-        let x_sol = fact.solve(ekt_view.as_ref());
+        let x_sol = factor.solve(ekt_view.as_ref());
         let frob = faer_frob_inner(x_sol.as_ref(), ekt_view.as_ref());
         traces[kk] = lambdas[kk] * frob;
     }
@@ -1946,14 +1900,28 @@ where
         beta_covariance_corrected,
         beta_standard_errors_corrected,
         reml_score: outer_result.final_value,
-        mixture_link_components: final_mixture_state.as_ref().map(|s| s.components.clone()),
-        mixture_link_rho: final_mixture_state.as_ref().map(|s| s.rho.clone()),
-        mixture_link_weights: final_mixture_state.as_ref().map(|s| s.pi.clone()),
-        mixture_link_param_covariance: final_mixture_param_covariance,
-        sas_epsilon: final_sas_state.map(|s| s.epsilon),
-        sas_log_delta: final_sas_state.map(|s| s.log_delta),
-        sas_delta: final_sas_state.map(|s| s.delta),
-        sas_param_covariance: final_sas_param_covariance,
+        fitted_link_parameters: if let Some(state) = final_mixture_state {
+            FittedLinkParameters::Mixture {
+                state,
+                covariance: final_mixture_param_covariance,
+            }
+        } else if let Some(state) = final_sas_state {
+            match opts.family {
+                crate::types::LikelihoodFamily::BinomialSas => FittedLinkParameters::Sas {
+                    state,
+                    covariance: final_sas_param_covariance,
+                },
+                crate::types::LikelihoodFamily::BinomialBetaLogistic => {
+                    FittedLinkParameters::BetaLogistic {
+                        state,
+                        covariance: final_sas_param_covariance,
+                    }
+                }
+                _ => FittedLinkParameters::Standard,
+            }
+        } else {
+            FittedLinkParameters::Standard
+        },
     };
     Ok(conditioning.backtransform_external_result(result))
 }
@@ -2217,16 +2185,24 @@ pub struct FitResult {
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
     pub reml_score: f64,
-    pub mixture_link_components: Option<Vec<LinkComponent>>,
-    pub mixture_link_rho: Option<Array1<f64>>,
-    pub mixture_link_weights: Option<Array1<f64>>,
-    /// Approximate covariance of mixture free logits (K-1 x K-1), when optimized.
-    pub mixture_link_param_covariance: Option<Array2<f64>>,
-    pub sas_epsilon: Option<f64>,
-    pub sas_log_delta: Option<f64>,
-    pub sas_delta: Option<f64>,
-    /// Approximate covariance of SAS params (epsilon, log_delta), shape 2x2.
-    pub sas_param_covariance: Option<Array2<f64>>,
+    pub fitted_link_parameters: FittedLinkParameters,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum FittedLinkParameters {
+    Standard,
+    Sas {
+        state: SasLinkState,
+        covariance: Option<Array2<f64>>,
+    },
+    BetaLogistic {
+        state: SasLinkState,
+        covariance: Option<Array2<f64>>,
+    },
+    Mixture {
+        state: MixtureLinkState,
+        covariance: Option<Array2<f64>>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2251,53 +2227,6 @@ impl FitResult {
         &self,
         family: crate::types::LikelihoodFamily,
     ) -> Result<FittedLinkState, EstimationError> {
-        let require_sas_state = |label: &str| -> Result<SasLinkState, EstimationError> {
-            let (epsilon, log_delta) =
-                self.sas_epsilon.zip(self.sas_log_delta).ok_or_else(|| {
-                    EstimationError::InvalidInput(format!(
-                        "{label} requires fitted sas_epsilon/sas_log_delta"
-                    ))
-                })?;
-            state_from_sas_spec(SasLinkSpec {
-                initial_epsilon: epsilon,
-                initial_log_delta: log_delta,
-            })
-            .map_err(|e| EstimationError::InvalidInput(format!("invalid fitted SAS state: {e}")))
-        };
-        let require_beta_logistic_state = |label: &str| -> Result<SasLinkState, EstimationError> {
-            let (epsilon, log_delta) =
-                self.sas_epsilon.zip(self.sas_log_delta).ok_or_else(|| {
-                    EstimationError::InvalidInput(format!(
-                        "{label} requires fitted sas_epsilon/sas_log_delta"
-                    ))
-                })?;
-            state_from_beta_logistic_spec(SasLinkSpec {
-                initial_epsilon: epsilon,
-                initial_log_delta: log_delta,
-            })
-            .map_err(|e| {
-                EstimationError::InvalidInput(format!("invalid fitted Beta-Logistic state: {e}"))
-            })
-        };
-        let require_mixture_state = |label: &str| -> Result<MixtureLinkState, EstimationError> {
-            let (components, rho) = (
-                self.mixture_link_components.as_ref(),
-                self.mixture_link_rho.as_ref(),
-            );
-            let (Some(components), Some(rho)) = (components, rho) else {
-                return Err(EstimationError::InvalidInput(format!(
-                    "{label} requires fitted mixture_link_components/mixture_link_rho"
-                )));
-            };
-            state_from_spec(&MixtureLinkSpec {
-                components: components.clone(),
-                initial_rho: rho.clone(),
-            })
-            .map_err(|e| {
-                EstimationError::InvalidInput(format!("invalid fitted mixture link state: {e}"))
-            })
-        };
-
         match family {
             crate::types::LikelihoodFamily::GaussianIdentity => {
                 Ok(FittedLinkState::Standard(LinkFunction::Identity))
@@ -2311,20 +2240,40 @@ impl FitResult {
             crate::types::LikelihoodFamily::BinomialCLogLog => {
                 Ok(FittedLinkState::Standard(LinkFunction::CLogLog))
             }
-            crate::types::LikelihoodFamily::BinomialSas => Ok(FittedLinkState::Sas {
-                state: require_sas_state("BinomialSas")?,
-                covariance: self.sas_param_covariance.clone(),
-            }),
+            crate::types::LikelihoodFamily::BinomialSas => match &self.fitted_link_parameters {
+                FittedLinkParameters::Sas { state, covariance } => Ok(FittedLinkState::Sas {
+                    state: state.clone(),
+                    covariance: covariance.clone(),
+                }),
+                _ => Err(EstimationError::InvalidInput(
+                    "BinomialSas requires fitted SAS link parameters".to_string(),
+                )),
+            },
             crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-                Ok(FittedLinkState::BetaLogistic {
-                    state: require_beta_logistic_state("BinomialBetaLogistic")?,
-                    covariance: self.sas_param_covariance.clone(),
-                })
+                match &self.fitted_link_parameters {
+                    FittedLinkParameters::BetaLogistic { state, covariance } => {
+                        Ok(FittedLinkState::BetaLogistic {
+                            state: state.clone(),
+                            covariance: covariance.clone(),
+                        })
+                    }
+                    _ => Err(EstimationError::InvalidInput(
+                        "BinomialBetaLogistic requires fitted beta-logistic link parameters"
+                            .to_string(),
+                    )),
+                }
             }
-            crate::types::LikelihoodFamily::BinomialMixture => Ok(FittedLinkState::Mixture {
-                state: require_mixture_state("BinomialMixture")?,
-                covariance: self.mixture_link_param_covariance.clone(),
-            }),
+            crate::types::LikelihoodFamily::BinomialMixture => match &self.fitted_link_parameters {
+                FittedLinkParameters::Mixture { state, covariance } => {
+                    Ok(FittedLinkState::Mixture {
+                        state: state.clone(),
+                        covariance: covariance.clone(),
+                    })
+                }
+                _ => Err(EstimationError::InvalidInput(
+                    "BinomialMixture requires fitted mixture link parameters".to_string(),
+                )),
+            },
             crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "fitted_link_state is not defined for RoystonParmar".to_string(),
             )),
@@ -3112,14 +3061,7 @@ where
         beta_covariance_corrected: result.beta_covariance_corrected,
         beta_standard_errors_corrected: result.beta_standard_errors_corrected,
         reml_score: result.reml_score,
-        mixture_link_components: result.mixture_link_components,
-        mixture_link_rho: result.mixture_link_rho,
-        mixture_link_weights: result.mixture_link_weights,
-        mixture_link_param_covariance: result.mixture_link_param_covariance,
-        sas_epsilon: result.sas_epsilon,
-        sas_log_delta: result.sas_log_delta,
-        sas_delta: result.sas_delta,
-        sas_param_covariance: result.sas_param_covariance,
+        fitted_link_parameters: result.fitted_link_parameters,
     })
 }
 

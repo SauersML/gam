@@ -1,7 +1,6 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, factorize_symmetric_with_fallback,
-};
+use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
+use crate::linalg::utils::StableSolver;
 use crate::pirls::{LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState};
 use crate::types::{Coefficients, LinearPredictor};
 use faer::Side;
@@ -552,8 +551,7 @@ impl WorkingModelSurvival {
             sparse_hessian: None,
             deviance,
             penalty_term: penalty_dev + ridge_penalty,
-            firth_log_det: None,
-            firth_hat_diag: None,
+            firth: crate::pirls::FirthDiagnostics::Inactive,
             ridge_used,
         })
     }
@@ -676,8 +674,8 @@ impl WorkingModelSurvival {
         // Reuse one symmetric factorization for all H^{-1} applications.
         // This is the core speed-up: exact contractions via solves, no dense
         // inverse assembly.
-        let h_view = FaerArrayView::new(&state.hessian);
-        let factor = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower)
+        let factor = StableSolver::new("survival hessian")
+            .factorize(&state.hessian)
             .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
 
         let solve_mat = |rhs: &Array2<f64>| -> Array2<f64> {

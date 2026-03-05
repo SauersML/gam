@@ -32,20 +32,6 @@ fn apply_family_inverse_link(
     try_inverse_link_array(family, eta.view(), link_kind)
 }
 
-fn fit_mixture_link_state(
-    fit: &FitResult,
-) -> Result<Option<crate::types::MixtureLinkState>, EstimationError> {
-    if fit.mixture_link_components.is_none() || fit.mixture_link_rho.is_none() {
-        return Ok(None);
-    }
-    match fit.fitted_link_state(crate::types::LikelihoodFamily::BinomialMixture)? {
-        FittedLinkState::Mixture { state, .. } => Ok(Some(state)),
-        _ => Err(EstimationError::InvalidInput(
-            "internal mismatch: expected mixture fitted link state".to_string(),
-        )),
-    }
-}
-
 #[inline]
 fn quadratic_form(cov: &Array2<f64>, grad: &[f64]) -> Result<f64, EstimationError> {
     if cov.nrows() != grad.len() || cov.ncols() != grad.len() {
@@ -445,12 +431,16 @@ where
             }))
         }
         crate::types::LikelihoodFamily::BinomialMixture => {
-            let state = fit_mixture_link_state(fit)?.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "predict_gam_posterior_mean_with_fit for BinomialMixture requires fitted mixture_link_components/mixture_link_rho"
-                        .to_string(),
-                )
-            })?;
+            let state = match fit
+                .fitted_link_state(crate::types::LikelihoodFamily::BinomialMixture)?
+            {
+                FittedLinkState::Mixture { state, .. } => state,
+                _ => {
+                    return Err(EstimationError::InvalidInput(
+                        "internal mismatch: expected BinomialMixture fitted link state".to_string(),
+                    ));
+                }
+            };
             Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
                 crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, se, |x| {
                     mixture_inverse_link_jet(&state, x).mu
@@ -604,11 +594,13 @@ where
         | Some(FittedLinkState::BetaLogistic { state, .. }) => Some(*state),
         _ => None,
     };
-    let link_kind = match fitted_link_state {
-        Some(FittedLinkState::Standard(link)) => Some(InverseLink::Standard(link)),
-        Some(FittedLinkState::Sas { state, .. }) => Some(InverseLink::Sas(state)),
-        Some(FittedLinkState::BetaLogistic { state, .. }) => Some(InverseLink::BetaLogistic(state)),
-        Some(FittedLinkState::Mixture { state, .. }) => Some(InverseLink::Mixture(state)),
+    let link_kind = match fitted_link_state.as_ref() {
+        Some(FittedLinkState::Standard(link)) => Some(InverseLink::Standard(*link)),
+        Some(FittedLinkState::Sas { state, .. }) => Some(InverseLink::Sas(*state)),
+        Some(FittedLinkState::BetaLogistic { state, .. }) => {
+            Some(InverseLink::BetaLogistic(*state))
+        }
+        Some(FittedLinkState::Mixture { state, .. }) => Some(InverseLink::Mixture(state.clone())),
         None => None,
     };
     let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;
@@ -639,10 +631,9 @@ where
     //   Var(μ) = I(2) - I(1)^2.
     // These identities characterize the exact cloglog moments under Gaussian η uncertainty.
     let mut mean_standard_error = Array1::<f64>::zeros(eta.len());
-    let mut mix_partials = fit
-        .mixture_link_rho
+    let mut mix_partials = mixture_state
         .as_ref()
-        .map(|rho| {
+        .map(|state| {
             vec![
                 InverseLinkJet {
                     mu: 0.0,
@@ -650,7 +641,7 @@ where
                     d2: 0.0,
                     d3: 0.0,
                 };
-                rho.len()
+                state.rho.len()
             ]
         })
         .unwrap_or_default();
@@ -729,7 +720,10 @@ where
             crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
         };
         if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
-            && let Some(cov_theta) = fit.sas_param_covariance.as_ref()
+            && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
+                FittedLinkState::Sas { covariance, .. } => covariance.as_ref(),
+                _ => None,
+            })
         {
             let sas = sas_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
@@ -741,7 +735,10 @@ where
             mean_var += quadratic_form(cov_theta, &g)?;
         }
         if matches!(family, crate::types::LikelihoodFamily::BinomialBetaLogistic)
-            && let Some(cov_theta) = fit.sas_param_covariance.as_ref()
+            && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
+                FittedLinkState::BetaLogistic { covariance, .. } => covariance.as_ref(),
+                _ => None,
+            })
         {
             let sas = sas_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
@@ -757,7 +754,10 @@ where
             mean_var += quadratic_form(cov_theta, &g)?;
         }
         if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
-            && let Some(cov_theta) = fit.mixture_link_param_covariance.as_ref()
+            && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
+                FittedLinkState::Mixture { covariance, .. } => covariance.as_ref(),
+                _ => None,
+            })
             && let Some(state) = mixture_state.as_ref()
         {
             if mix_partials.len() != state.rho.len() {
