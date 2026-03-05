@@ -26,10 +26,10 @@ use gam::families::sigma_link::{
     bounded_sigma_from_eta_scalar as sigma_from_eta_scalar,
 };
 use gam::gamlss::{
-    BinomialLocationScaleProbitTermSpec, GaussianLocationScaleTermSpec, WiggleBlockConfig,
+    BinomialLocationScaleProbitTermSpec, BinomialLocationScaleWiggleWorkflowConfig,
+    GaussianLocationScaleTermSpec, WiggleBlockConfig,
     build_wiggle_block_input_from_knots, build_wiggle_block_input_from_seed,
-    fit_binomial_location_scale_probit_terms, fit_binomial_location_scale_probit_wiggle_terms_auto,
-    fit_gaussian_location_scale_terms,
+    fit_binomial_location_scale_probit_terms_workflow, fit_gaussian_location_scale_terms,
 };
 use gam::generative::{generative_spec_from_predict, sample_observation_replicates};
 use gam::hmc::{FamilyNutsInputs, GlmFlatInputs, NutsConfig, run_nuts_sampling_flattened_family};
@@ -447,127 +447,6 @@ fn blockwise_options_from_fit_args(args: &FitArgs) -> Result<gam::BlockwiseFitOp
     Ok(options)
 }
 
-struct BinomialLocationScaleSolveOutcome {
-    resolved_mean_spec: TermCollectionSpec,
-    resolved_noise_spec: TermCollectionSpec,
-    mean_design: gam::smooth::TermCollectionDesign,
-    noise_design: gam::smooth::TermCollectionDesign,
-    fit: gam::BlockwiseFitResult,
-    wiggle_meta: Option<(Array1<f64>, usize, Vec<f64>)>,
-}
-
-trait BinomialLocationScaleStrategy {
-    fn fit(
-        &self,
-        data: ndarray::ArrayView2<'_, f64>,
-        y: &Array1<f64>,
-        mean_spec: &TermCollectionSpec,
-        noise_spec: &TermCollectionSpec,
-        link_kind: InverseLink,
-        sigma_min: f64,
-        sigma_max: f64,
-        options: &gam::BlockwiseFitOptions,
-    ) -> Result<BinomialLocationScaleSolveOutcome, String>;
-}
-
-struct PlainBinomialLocationScaleStrategy;
-
-impl BinomialLocationScaleStrategy for PlainBinomialLocationScaleStrategy {
-    fn fit(
-        &self,
-        data: ndarray::ArrayView2<'_, f64>,
-        y: &Array1<f64>,
-        mean_spec: &TermCollectionSpec,
-        noise_spec: &TermCollectionSpec,
-        link_kind: InverseLink,
-        sigma_min: f64,
-        sigma_max: f64,
-        options: &gam::BlockwiseFitOptions,
-    ) -> Result<BinomialLocationScaleSolveOutcome, String> {
-        let solved = fit_binomial_location_scale_probit_terms(
-            data,
-            BinomialLocationScaleProbitTermSpec {
-                y: y.clone(),
-                weights: Array1::ones(y.len()),
-                link_kind,
-                sigma_min,
-                sigma_max,
-                threshold_spec: mean_spec.clone(),
-                log_sigma_spec: noise_spec.clone(),
-            },
-            options,
-            &SpatialLengthScaleOptimizationOptions::default(),
-        )
-        .map_err(|e| format!("fit_binomial_location_scale_probit_terms failed: {e}"))?;
-        Ok(BinomialLocationScaleSolveOutcome {
-            resolved_mean_spec: solved.mean_spec_resolved,
-            resolved_noise_spec: solved.noise_spec_resolved,
-            mean_design: solved.mean_design,
-            noise_design: solved.noise_design,
-            fit: solved.fit,
-            wiggle_meta: None,
-        })
-    }
-}
-
-struct WiggleBinomialLocationScaleStrategy {
-    cfg: LinkWiggleFormulaSpec,
-}
-
-impl BinomialLocationScaleStrategy for WiggleBinomialLocationScaleStrategy {
-    fn fit(
-        &self,
-        data: ndarray::ArrayView2<'_, f64>,
-        y: &Array1<f64>,
-        mean_spec: &TermCollectionSpec,
-        noise_spec: &TermCollectionSpec,
-        link_kind: InverseLink,
-        sigma_min: f64,
-        sigma_max: f64,
-        options: &gam::BlockwiseFitOptions,
-    ) -> Result<BinomialLocationScaleSolveOutcome, String> {
-        let block_cfg = WiggleBlockConfig {
-            degree: self.cfg.degree,
-            num_internal_knots: self.cfg.num_internal_knots,
-            penalty_order: 2,
-            double_penalty: self.cfg.double_penalty,
-        };
-        let solved = fit_binomial_location_scale_probit_wiggle_terms_auto(
-            data,
-            BinomialLocationScaleProbitTermSpec {
-                y: y.clone(),
-                weights: Array1::ones(y.len()),
-                link_kind,
-                sigma_min,
-                sigma_max,
-                threshold_spec: mean_spec.clone(),
-                log_sigma_spec: noise_spec.clone(),
-            },
-            block_cfg,
-            &self.cfg.penalty_orders,
-            options,
-            &SpatialLengthScaleOptimizationOptions::default(),
-        )
-        .map_err(|e| format!("fit_binomial_location_scale_probit_wiggle_terms_auto failed: {e}"))?;
-
-        let fit = solved.fit.fit;
-        let beta_wiggle = fit
-            .block_states
-            .get(2)
-            .map(|b| b.beta.to_vec())
-            .unwrap_or_default();
-
-        Ok(BinomialLocationScaleSolveOutcome {
-            resolved_mean_spec: solved.fit.mean_spec_resolved,
-            resolved_noise_spec: solved.fit.noise_spec_resolved,
-            mean_design: solved.fit.mean_design,
-            noise_design: solved.fit.noise_design,
-            fit,
-            wiggle_meta: Some((solved.wiggle_knots, solved.wiggle_degree, beta_wiggle)),
-        })
-    }
-}
-
 fn run_fit(args: FitArgs) -> Result<(), String> {
     let formula_text = choose_formula(&args)?;
     let parsed = parse_formula(&formula_text)?;
@@ -913,34 +792,31 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         let sigma_min = 0.05;
         let sigma_max = 20.0;
         let options = blockwise_options_from_fit_args(&args)?;
-        let strategy: Box<dyn BinomialLocationScaleStrategy> = if learn_link_wiggle {
-            Box::new(WiggleBinomialLocationScaleStrategy {
-                cfg: formula_link_wiggle
-                    .clone()
-                    .unwrap_or(LinkWiggleFormulaSpec {
-                        degree: 3,
-                        num_internal_knots: 7,
-                        penalty_orders: vec![1, 2, 3],
-                        double_penalty: true,
-                    }),
-            })
-        } else {
-            Box::new(PlainBinomialLocationScaleStrategy)
-        };
-        let solved = strategy.fit(
+        let solved = fit_binomial_location_scale_probit_terms_workflow(
             ds.values.view(),
-            &y,
-            &mean_spec,
-            &noise_spec,
-            location_scale_link_kind.clone(),
-            sigma_min,
-            sigma_max,
+            BinomialLocationScaleProbitTermSpec {
+                y: y.clone(),
+                weights: Array1::ones(y.len()),
+                link_kind: location_scale_link_kind.clone(),
+                sigma_min,
+                sigma_max,
+                threshold_spec: mean_spec.clone(),
+                log_sigma_spec: noise_spec.clone(),
+            },
+            formula_link_wiggle
+                .clone()
+                .map(|cfg| BinomialLocationScaleWiggleWorkflowConfig {
+                    degree: cfg.degree,
+                    num_internal_knots: cfg.num_internal_knots,
+                    penalty_orders: cfg.penalty_orders,
+                    double_penalty: cfg.double_penalty,
+                }),
             &options,
+            &SpatialLengthScaleOptimizationOptions::default(),
         )?;
-        let wiggle_meta = solved.wiggle_meta;
-        if let Some((knots, degree, _)) = wiggle_meta.as_ref() {
-            let final_q0 = compute_probit_q0_from_fit(&solved.fit, sigma_min, sigma_max)?;
-            let domain = summarize_wiggle_domain(final_q0.view(), knots.view(), *degree)?;
+        if let (Some(knots), Some(degree)) = (solved.wiggle_knots.as_ref(), solved.wiggle_degree) {
+            let final_q0 = compute_probit_q0_from_fit(&solved.fit.fit, sigma_min, sigma_max)?;
+            let domain = summarize_wiggle_domain(final_q0.view(), knots.view(), degree)?;
             if domain.outside_count > 0 {
                 eprintln!(
                     "warning: {} of {} probit wiggle q values ({:.1}%) fell outside the knot domain [{:.3}, {:.3}] after fitting",
@@ -952,11 +828,15 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 );
             }
         }
-        let resolved_mean_spec = solved.resolved_mean_spec;
-        let resolved_noise_spec = solved.resolved_noise_spec;
-        let mean_design = solved.mean_design;
-        let noise_design = solved.noise_design;
-        let fit = solved.fit;
+        let wiggle_meta = match (solved.wiggle_knots, solved.wiggle_degree, solved.beta_wiggle) {
+            (Some(knots), Some(degree), Some(beta_wiggle)) => Some((knots, degree, beta_wiggle)),
+            _ => None,
+        };
+        let resolved_mean_spec = solved.fit.mean_spec_resolved;
+        let resolved_noise_spec = solved.fit.noise_spec_resolved;
+        let mean_design = solved.fit.mean_design;
+        let noise_design = solved.fit.noise_design;
+        let fit = solved.fit.fit;
         let frozen_mean_spec = freeze_term_collection_spec(&resolved_mean_spec, &mean_design)?;
         let frozen_noise_spec = freeze_term_collection_spec(&resolved_noise_spec, &noise_design)?;
 
