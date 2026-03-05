@@ -778,6 +778,21 @@ pub struct BlockwiseTermWiggleFitResult {
     pub wiggle_degree: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct BinomialLocationScaleWiggleWorkflowConfig {
+    pub degree: usize,
+    pub num_internal_knots: usize,
+    pub penalty_orders: Vec<usize>,
+    pub double_penalty: bool,
+}
+
+pub struct BinomialLocationScaleWorkflowResult {
+    pub fit: BlockwiseTermFitResult,
+    pub wiggle_knots: Option<Array1<f64>>,
+    pub wiggle_degree: Option<usize>,
+    pub beta_wiggle: Option<Vec<f64>>,
+}
+
 fn slice_log_lambda_block(
     log_lambdas: &Array1<f64>,
     start: usize,
@@ -1789,6 +1804,57 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms_auto(
         wiggle_knots,
         wiggle_degree: wiggle_cfg.degree,
     })
+}
+
+pub fn fit_binomial_location_scale_probit_terms_workflow(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: BinomialLocationScaleProbitTermSpec,
+    wiggle: Option<BinomialLocationScaleWiggleWorkflowConfig>,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<BinomialLocationScaleWorkflowResult, String> {
+    if let Some(wiggle_cfg) = wiggle {
+        let solved = fit_binomial_location_scale_probit_wiggle_terms_auto(
+            data,
+            spec,
+            WiggleBlockConfig {
+                degree: wiggle_cfg.degree,
+                num_internal_knots: wiggle_cfg.num_internal_knots,
+                penalty_order: 2,
+                double_penalty: wiggle_cfg.double_penalty,
+            },
+            &wiggle_cfg.penalty_orders,
+            options,
+            kappa_options,
+        )?;
+        let fit = solved.fit.fit;
+        let beta_wiggle = fit.block_states.get(2).map(|b| b.beta.to_vec());
+        Ok(BinomialLocationScaleWorkflowResult {
+            fit: BlockwiseTermFitResult {
+                fit,
+                mean_spec_resolved: solved.fit.mean_spec_resolved,
+                noise_spec_resolved: solved.fit.noise_spec_resolved,
+                mean_design: solved.fit.mean_design,
+                noise_design: solved.fit.noise_design,
+            },
+            wiggle_knots: Some(solved.wiggle_knots),
+            wiggle_degree: Some(solved.wiggle_degree),
+            beta_wiggle,
+        })
+    } else {
+        let solved = fit_binomial_location_scale_probit_terms(
+            data,
+            spec,
+            options,
+            kappa_options,
+        )?;
+        Ok(BinomialLocationScaleWorkflowResult {
+            fit: solved,
+            wiggle_knots: None,
+            wiggle_degree: None,
+            beta_wiggle: None,
+        })
+    }
 }
 /// Link identifiers for distribution parameters in multi-parameter GAMLSS families.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
