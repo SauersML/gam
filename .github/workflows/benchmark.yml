@@ -66,6 +66,31 @@ jobs:
           print(f"validated {len(scenarios)} scenario dataset schemas")
           PY
 
+      - name: Preflight geo_subpop16 simulation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import importlib.util
+          from pathlib import Path
+
+          mod_path = Path("bench/run_suite.py").resolve()
+          spec = importlib.util.spec_from_file_location("run_suite_mod", mod_path)
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          cfg = json.loads(Path("bench/scenarios.json").read_text())
+          scenarios = cfg.get("scenarios", [])
+          geo_subpop = [s for s in scenarios if str(s.get("name", "")).startswith("geo_subpop16_")]
+          if not geo_subpop:
+              raise SystemExit("No geo_subpop16 scenarios found in bench/scenarios.json")
+
+          for s in geo_subpop:
+              mod.dataset_for_scenario(s)
+          print(f"validated geo_subpop16 simulation for {len(geo_subpop)} scenarios")
+          PY
+
       - name: Build scenario matrix
         id: matrix
         shell: bash
