@@ -2544,6 +2544,22 @@ def _rust_survival_formula_for_scenario(scenario_name, feature_cols=None):
     raise RuntimeError(f"No Rust survival formula configured for scenario '{scenario_name}'")
 
 
+def _append_formula_link_term(formula: str, link_name: str | None) -> str:
+    if not link_name:
+        return formula
+    # Avoid duplicating explicit link(...) terms if callers already injected one.
+    if re.search(r"(?<![A-Za-z0-9_])link\s*\(", formula):
+        return formula
+    if "~" not in formula:
+        raise RuntimeError(f"cannot append link term to malformed formula: {formula!r}")
+    lhs, rhs = formula.split("~", 1)
+    rhs = rhs.strip()
+    link_term = f"link(type={str(link_name).strip()})"
+    if not rhs:
+        return f"{lhs.strip()} ~ {link_term}"
+    return f"{lhs.strip()} ~ {rhs} + {link_term}"
+
+
 def _is_matern_rust_scenario(s_cfg) -> bool:
     cfg = _rust_fit_mapping(s_cfg["name"])
     if cfg is None:
@@ -2916,13 +2932,12 @@ def run_rust_scenario_cv(
                     cfg_override=rust_cfg_override,
                 )
                 if ds["family"] == "binomial" and binomial_link:
+                    formula = _append_formula_link_term(formula, binomial_link)
                     fit_cmd = [
                         str(rust_bin),
                         "fit",
                         "--family",
                         "auto",
-                        "--link",
-                        str(binomial_link),
                         "--formula",
                         formula,
                         "--out",

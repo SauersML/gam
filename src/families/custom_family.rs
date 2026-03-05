@@ -1,5 +1,5 @@
 use crate::faer_ndarray::FaerCholesky;
-use crate::faer_ndarray::{FaerArrayView, FaerEigh, fast_ata, fast_atv};
+use crate::faer_ndarray::{FaerArrayView, FaerEigh};
 use crate::matrix::DesignMatrix;
 use crate::pirls::LinearInequalityConstraints;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
@@ -401,7 +401,6 @@ fn weighted_normal_equations(
     y_star: Option<&Array1<f64>>,
 ) -> Result<(Array2<f64>, Option<Array1<f64>>), String> {
     let n = x.nrows();
-    let p = x.ncols();
     if w.len() != n {
         return Err("weighted normal-equation dimension mismatch".to_string());
     }
@@ -411,72 +410,13 @@ fn weighted_normal_equations(
         return Err("weighted RHS dimension mismatch".to_string());
     }
 
-    match x {
-        DesignMatrix::Dense(xd) => {
-            // Dense path: Xw = diag(sqrt(w)) X, XtWX = Xw'Xw, XtWy = Xw'(sqrt(w) y*)
-            let mut xw = xd.clone();
-            for i in 0..n {
-                let sw = w[i].max(0.0).sqrt();
-                if sw != 1.0 {
-                    let mut row = xw.row_mut(i);
-                    row *= sw;
-                }
-            }
-            let xtwx = fast_ata(&xw);
-            let xtwy = y_star.map(|y| {
-                let mut y_w = y.clone();
-                for i in 0..n {
-                    y_w[i] *= w[i].max(0.0).sqrt();
-                }
-                fast_atv(&xw, &y_w)
-            });
-            Ok((xtwx, xtwy))
-        }
-        DesignMatrix::Sparse(xs) => {
-            // Sparse path using CSR row iteration; cost is O(sum_i nnz_i^2).
-            let csr = xs
-                .as_ref()
-                .to_row_major()
-                .map_err(|_| "failed to obtain CSR view for sparse block design".to_string())?;
-            let sym = csr.symbolic();
-            let row_ptr = sym.row_ptr();
-            let col_idx = sym.col_idx();
-            let vals = csr.val();
-
-            let mut xtwx = Array2::<f64>::zeros((p, p));
-            let mut xtwy = y_star.map(|_| Array1::<f64>::zeros(p));
-
-            for i in 0..n {
-                let wi = w[i].max(0.0);
-                if wi == 0.0 {
-                    continue;
-                }
-                let start = row_ptr[i];
-                let end = row_ptr[i + 1];
-
-                for a_ptr in start..end {
-                    let a = col_idx[a_ptr];
-                    let xa = vals[a_ptr];
-
-                    if let (Some(y), Some(ref mut rhs)) = (y_star, xtwy.as_mut()) {
-                        rhs[a] += wi * xa * y[i];
-                    }
-
-                    for b_ptr in a_ptr..end {
-                        let b = col_idx[b_ptr];
-                        let xb = vals[b_ptr];
-                        let v = wi * xa * xb;
-                        xtwx[[a, b]] += v;
-                        if a != b {
-                            xtwx[[b, a]] += v;
-                        }
-                    }
-                }
-            }
-
-            Ok((xtwx, xtwy))
-        }
-    }
+    let xtwx = x.compute_xtwx(w)?;
+    let xtwy = if let Some(y) = y_star {
+        Some(x.compute_xtwy(w, y)?)
+    } else {
+        None
+    };
+    Ok((xtwx, xtwy))
 }
 
 fn solve_block_weighted_system(
@@ -594,6 +534,219 @@ fn solve_spd_system_with_policy(
         }
     }
     Err("exact-newton block solve failed after ridge retries".to_string())
+}
+
+struct BlockUpdateContext<'a> {
+    family: &'a dyn CustomFamily,
+    states: &'a [ParameterBlockState],
+    spec: &'a ParameterBlockSpec,
+    block_idx: usize,
+    s_lambda: &'a Array2<f64>,
+    options: &'a BlockwiseFitOptions,
+    linear_constraints: Option<&'a LinearInequalityConstraints>,
+    cached_active_set: Option<&'a [usize]>,
+}
+
+struct BlockUpdateResult {
+    beta_new_raw: Array1<f64>,
+    active_set: Option<Vec<usize>>,
+}
+
+trait ParameterBlockUpdater {
+    fn compute_update_step(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+    ) -> Result<BlockUpdateResult, String>;
+}
+
+struct DiagonalBlockUpdater<'a> {
+    working_response: &'a Array1<f64>,
+    working_weights: &'a Array1<f64>,
+}
+
+impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
+    fn compute_update_step(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+    ) -> Result<BlockUpdateResult, String> {
+        let p = ctx.spec.design.ncols();
+        if self.working_response.len() != ctx.spec.design.nrows()
+            || self.working_weights.len() != ctx.spec.design.nrows()
+        {
+            return Err(format!(
+                "family diagonal working-set size mismatch on block {} ({})",
+                ctx.block_idx, ctx.spec.name
+            ));
+        }
+
+        let (x_dyn, off_dyn) = ctx.family.block_geometry(ctx.states, ctx.spec)?;
+        if x_dyn.nrows() != ctx.spec.design.nrows() {
+            return Err(format!(
+                "block {} dynamic design row mismatch: got {}, expected {}",
+                ctx.block_idx,
+                x_dyn.nrows(),
+                ctx.spec.design.nrows()
+            ));
+        }
+        if x_dyn.ncols() != p {
+            return Err(format!(
+                "block {} dynamic design col mismatch: got {}, expected {p}",
+                ctx.block_idx,
+                x_dyn.ncols()
+            ));
+        }
+        if off_dyn.len() != ctx.spec.design.nrows() {
+            return Err(format!(
+                "block {} dynamic offset length mismatch: got {}, expected {}",
+                ctx.block_idx,
+                off_dyn.len(),
+                ctx.spec.design.nrows()
+            ));
+        }
+
+        let mut y_star = self.working_response.clone();
+        y_star -= &off_dyn;
+        let w_clamped = self
+            .working_weights
+            .mapv(|wi| wi.max(ctx.options.min_weight));
+
+        if let Some(constraints) = ctx.linear_constraints {
+            check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(
+                |e| {
+                    format!(
+                        "block {} ({}) constrained diagonal solve: {e}",
+                        ctx.block_idx, ctx.spec.name
+                    )
+                },
+            )?;
+            let (mut lhs, rhs_opt) = weighted_normal_equations(&x_dyn, &w_clamped, Some(&y_star))?;
+            let rhs = rhs_opt
+                .ok_or_else(|| "missing weighted RHS in constrained diagonal solve".to_string())?;
+            lhs += ctx.s_lambda;
+            let (beta_constrained, active_set) = solve_quadratic_with_linear_constraints(
+                &lhs,
+                &rhs,
+                &ctx.states[ctx.block_idx].beta,
+                constraints,
+                ctx.cached_active_set,
+            )
+            .map_err(|e| {
+                format!(
+                    "block {} ({}) constrained diagonal solve failed: {e}",
+                    ctx.block_idx, ctx.spec.name
+                )
+            })?;
+            Ok(BlockUpdateResult {
+                beta_new_raw: beta_constrained,
+                active_set: Some(active_set),
+            })
+        } else {
+            let beta = solve_block_weighted_system(
+                &x_dyn,
+                &y_star,
+                &w_clamped,
+                ctx.s_lambda,
+                ctx.options.ridge_floor,
+                ctx.options.ridge_policy,
+            )?;
+            Ok(BlockUpdateResult {
+                beta_new_raw: beta,
+                active_set: None,
+            })
+        }
+    }
+}
+
+struct ExactNewtonBlockUpdater<'a> {
+    gradient: &'a Array1<f64>,
+    hessian: &'a Array2<f64>,
+}
+
+impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
+    fn compute_update_step(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+    ) -> Result<BlockUpdateResult, String> {
+        let p = ctx.spec.design.ncols();
+        if self.gradient.len() != p {
+            return Err(format!(
+                "block {} exact-newton gradient length mismatch: got {}, expected {p}",
+                ctx.block_idx,
+                self.gradient.len()
+            ));
+        }
+        if self.hessian.nrows() != p || self.hessian.ncols() != p {
+            return Err(format!(
+                "block {} exact-newton Hessian shape mismatch: got {}x{}, expected {}x{}",
+                ctx.block_idx,
+                self.hessian.nrows(),
+                self.hessian.ncols(),
+                p,
+                p
+            ));
+        }
+
+        let mut lhs = self.hessian.clone();
+        lhs += ctx.s_lambda;
+        let mut rhs = self.hessian.dot(&ctx.states[ctx.block_idx].beta);
+        rhs += self.gradient;
+
+        if let Some(constraints) = ctx.linear_constraints {
+            check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(
+                |e| {
+                    format!(
+                        "block {} ({}) constrained exact-newton solve: {e}",
+                        ctx.block_idx, ctx.spec.name
+                    )
+                },
+            )?;
+            let (beta_constrained, active_set) = solve_quadratic_with_linear_constraints(
+                &lhs,
+                &rhs,
+                &ctx.states[ctx.block_idx].beta,
+                constraints,
+                ctx.cached_active_set,
+            )
+            .map_err(|e| {
+                format!(
+                    "block {} ({}) constrained exact-newton solve failed: {e}",
+                    ctx.block_idx, ctx.spec.name
+                )
+            })?;
+            Ok(BlockUpdateResult {
+                beta_new_raw: beta_constrained,
+                active_set: Some(active_set),
+            })
+        } else {
+            let beta = solve_spd_system_with_policy(
+                &lhs,
+                &rhs,
+                ctx.options.ridge_floor,
+                ctx.options.ridge_policy,
+            )?;
+            Ok(BlockUpdateResult {
+                beta_new_raw: beta,
+                active_set: None,
+            })
+        }
+    }
+}
+
+impl BlockWorkingSet {
+    fn updater(&self) -> Box<dyn ParameterBlockUpdater + '_> {
+        match self {
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => Box::new(DiagonalBlockUpdater {
+                working_response,
+                working_weights,
+            }),
+            BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                Box::new(ExactNewtonBlockUpdater { gradient, hessian })
+            }
+        }
+    }
 }
 
 fn solve_kkt_step(
@@ -1140,148 +1293,23 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
             let spec = &specs[b];
             let work = &eval.block_working_sets[b];
-            let p = spec.design.ncols();
             let linear_constraints = family.block_linear_constraints(&states, b, spec)?;
             let s_lambda = &s_lambdas[b];
-
-            let beta_new_raw = match work {
-                BlockWorkingSet::Diagonal {
-                    working_response,
-                    working_weights,
-                } => {
-                    if working_response.len() != spec.design.nrows()
-                        || working_weights.len() != spec.design.nrows()
-                    {
-                        return Err(format!(
-                            "family diagonal working-set size mismatch on block {b} ({})",
-                            spec.name
-                        ));
-                    }
-
-                    let (x_dyn, off_dyn) = family.block_geometry(&states, spec)?;
-                    if x_dyn.nrows() != spec.design.nrows() {
-                        return Err(format!(
-                            "block {b} dynamic design row mismatch: got {}, expected {}",
-                            x_dyn.nrows(),
-                            spec.design.nrows()
-                        ));
-                    }
-                    if x_dyn.ncols() != p {
-                        return Err(format!(
-                            "block {b} dynamic design col mismatch: got {}, expected {p}",
-                            x_dyn.ncols()
-                        ));
-                    }
-                    if off_dyn.len() != spec.design.nrows() {
-                        return Err(format!(
-                            "block {b} dynamic offset length mismatch: got {}, expected {}",
-                            off_dyn.len(),
-                            spec.design.nrows()
-                        ));
-                    }
-
-                    let mut y_star = working_response.clone();
-                    y_star -= &off_dyn;
-                    let w_clamped = working_weights.mapv(|wi| wi.max(options.min_weight));
-                    if let Some(constraints) = linear_constraints.as_ref() {
-                        check_linear_feasibility(&states[b].beta, constraints, 1e-8).map_err(
-                            |e| {
-                                format!("block {b} ({}) constrained diagonal solve: {e}", spec.name)
-                            },
-                        )?;
-                        let (mut lhs, rhs_opt) =
-                            weighted_normal_equations(&x_dyn, &w_clamped, Some(&y_star))?;
-                        let rhs = rhs_opt.ok_or_else(|| {
-                            "missing weighted RHS in constrained diagonal solve".to_string()
-                        })?;
-                        lhs += s_lambda;
-                        let (beta_constrained, active_set) =
-                            solve_quadratic_with_linear_constraints(
-                                &lhs,
-                                &rhs,
-                                &states[b].beta,
-                                constraints,
-                                cached_active_sets[b].as_deref(),
-                            )
-                            .map_err(|e| {
-                                format!(
-                                    "block {b} ({}) constrained diagonal solve failed: {e}",
-                                    spec.name
-                                )
-                            })?;
-                        cached_active_sets[b] = Some(active_set);
-                        beta_constrained
-                    } else {
-                        solve_block_weighted_system(
-                            &x_dyn,
-                            &y_star,
-                            &w_clamped,
-                            s_lambda,
-                            options.ridge_floor,
-                            options.ridge_policy,
-                        )?
-                    }
-                }
-                BlockWorkingSet::ExactNewton { gradient, hessian } => {
-                    if gradient.len() != p {
-                        return Err(format!(
-                            "block {b} exact-newton gradient length mismatch: got {}, expected {p}",
-                            gradient.len()
-                        ));
-                    }
-                    if hessian.nrows() != p || hessian.ncols() != p {
-                        return Err(format!(
-                            "block {b} exact-newton Hessian shape mismatch: got {}x{}, expected {}x{}",
-                            hessian.nrows(),
-                            hessian.ncols(),
-                            p,
-                            p
-                        ));
-                    }
-                    let mut lhs = hessian.clone();
-                    lhs += s_lambda;
-                    // Newton system in coefficient space:
-                    //   β_new = β_old - (H+S)^{-1}(-g + Sβ_old)
-                    // Rearranged to a single linear solve:
-                    //   (H+S) β_new = H β_old + g
-                    // where H = -∇² log L and g = ∇ log L.
-                    let mut rhs = hessian.dot(&states[b].beta);
-                    rhs += gradient;
-                    if let Some(constraints) = linear_constraints.as_ref() {
-                        check_linear_feasibility(&states[b].beta, constraints, 1e-8).map_err(
-                            |e| {
-                                format!(
-                                    "block {b} ({}) constrained exact-newton solve: {e}",
-                                    spec.name
-                                )
-                            },
-                        )?;
-                        let (beta_constrained, active_set) =
-                            solve_quadratic_with_linear_constraints(
-                                &lhs,
-                                &rhs,
-                                &states[b].beta,
-                                constraints,
-                                cached_active_sets[b].as_deref(),
-                            )
-                            .map_err(|e| {
-                                format!(
-                                    "block {b} ({}) constrained exact-newton solve failed: {e}",
-                                    spec.name
-                                )
-                            })?;
-                        cached_active_sets[b] = Some(active_set);
-                        beta_constrained
-                    } else {
-                        solve_spd_system_with_policy(
-                            &lhs,
-                            &rhs,
-                            options.ridge_floor,
-                            options.ridge_policy,
-                        )?
-                    }
-                }
-            };
+            let updater = work.updater();
+            let update = updater.compute_update_step(&BlockUpdateContext {
+                family,
+                states: &states,
+                spec,
+                block_idx: b,
+                s_lambda,
+                options,
+                linear_constraints: linear_constraints.as_ref(),
+                cached_active_set: cached_active_sets[b].as_deref(),
+            })?;
+            if let Some(active_set) = update.active_set {
+                cached_active_sets[b] = Some(active_set);
+            }
+            let beta_new_raw = update.beta_new_raw;
             let beta_new = family.post_update_beta(beta_new_raw)?;
             let beta_old = states[b].beta.clone();
             let delta = &beta_new - &beta_old;

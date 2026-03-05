@@ -16,9 +16,8 @@ use crate::custom_family::{
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitOptions, FitResult,
-    compute_external_joint_hyper_cost_gradient, compute_external_joint_hyper_cost_gradient_hessian,
-    fit_gam_with_heuristic_lambdas, fit_gam_with_heuristic_lambdas_and_warm_start,
-    reml::DirectionalHyperParam,
+    compute_external_joint_hyper_cost_gradient_hessian, fit_gam_with_heuristic_lambdas,
+    fit_gam_with_heuristic_lambdas_and_warm_start, reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::fast_atv;
 use crate::matrix::DesignMatrix;
@@ -3731,77 +3730,6 @@ fn approx_same_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
     true
 }
 
-#[allow(dead_code)]
-fn theta_distance_sq(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
-    if a.len() != b.len() {
-        return f64::INFINITY;
-    }
-    let mut acc = 0.0_f64;
-    for i in 0..a.len() {
-        let d = a[i] - b[i];
-        acc += d * d;
-    }
-    acc
-}
-
-#[derive(Clone)]
-#[allow(dead_code)]
-struct SingleBlockHyperEval {
-    theta: Array1<f64>,
-    cost: f64,
-    spec: TermCollectionSpec,
-    fit: FittedTermCollection,
-}
-
-#[allow(dead_code)]
-struct SingleBlockSpatialHyperState {
-    evals: Vec<SingleBlockHyperEval>,
-    max_evals: usize,
-}
-
-#[allow(dead_code)]
-impl SingleBlockSpatialHyperState {
-    fn new(max_evals: usize) -> Self {
-        Self {
-            evals: Vec::new(),
-            max_evals: max_evals.max(1),
-        }
-    }
-
-    fn get(&self, theta: &Array1<f64>) -> Option<SingleBlockHyperEval> {
-        self.evals
-            .iter()
-            .find(|entry| approx_same_point(&entry.theta, theta))
-            .cloned()
-    }
-
-    fn nearest_lambda_seed<'a>(&'a self, theta: &Array1<f64>) -> Option<&'a [f64]> {
-        self.evals
-            .iter()
-            .min_by(|a, b| {
-                theta_distance_sq(&a.theta, theta)
-                    .partial_cmp(&theta_distance_sq(&b.theta, theta))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .and_then(|entry| entry.fit.fit.lambdas.as_slice())
-    }
-
-    fn remember(&mut self, eval: SingleBlockHyperEval) {
-        if let Some(idx) = self
-            .evals
-            .iter()
-            .position(|entry| approx_same_point(&entry.theta, &eval.theta))
-        {
-            self.evals[idx] = eval;
-            return;
-        }
-        self.evals.push(eval);
-        if self.evals.len() > self.max_evals {
-            self.evals.remove(0);
-        }
-    }
-}
-
 #[derive(Clone)]
 struct TwoBlockHyperEval<FitOut: Clone> {
     theta: Array1<f64>,
@@ -4144,77 +4072,6 @@ fn try_build_spatial_log_kappa_hyper_dirs(
         });
     }
     Ok(Some(hyper_dirs))
-}
-
-#[allow(dead_code)]
-fn try_exact_joint_spatial_hyper_cost_gradient(
-    data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    resolved_spec: &TermCollectionSpec,
-    warm_start_fit: &FittedTermCollection,
-    family: LikelihoodFamily,
-    options: &FitOptions,
-    spatial_terms: &[usize],
-) -> Result<Option<(f64, Array1<f64>)>, EstimationError> {
-    let design = build_term_collection_design(data, resolved_spec)?;
-    let Some(info_list) = try_build_spatial_log_kappa_derivative_info_list(
-        data,
-        resolved_spec,
-        &design,
-        spatial_terms,
-    )?
-    else {
-        return Ok(None);
-    };
-    let mut hyper_dirs = Vec::with_capacity(info_list.len());
-    let psi_dim = info_list.len();
-    for (i, info) in info_list.into_iter().enumerate() {
-        let mut x_second = vec![Array2::<f64>::zeros(info.x_psi.raw_dim()); psi_dim];
-        let mut s_second = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); psi_dim];
-        x_second[i] = info.x_psi_psi.clone();
-        s_second[i] = info.s_psi_psi.clone();
-        let s_components = info
-            .penalty_indices
-            .iter()
-            .copied()
-            .zip(info.s_psi_components.iter().cloned())
-            .collect::<Vec<_>>();
-        let s2_components = info
-            .penalty_indices
-            .iter()
-            .copied()
-            .zip(info.s_psi_psi_components.iter().cloned())
-            .collect::<Vec<_>>();
-        let mut s_second_components = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
-        s_second_components[i] = s2_components;
-        hyper_dirs.push(DirectionalHyperParam {
-            penalty_index: None,
-            x_tau_original: info.x_psi,
-            s_tau_original: info.s_psi,
-            s_tau_original_components: Some(s_components),
-            x_tau_tau_original: Some(x_second),
-            s_tau_tau_original: Some(s_second),
-            s_tau_tau_original_components: Some(s_second_components),
-        });
-    }
-    let external_opts = external_opts_for_design(family, &design, options);
-    let joint = compute_external_joint_hyper_cost_gradient(
-        y,
-        weights,
-        design.design.view(),
-        offset,
-        design.penalties.clone(),
-        theta,
-        rho_dim,
-        &hyper_dirs,
-        Some(warm_start_fit.fit.beta.view()),
-        &external_opts,
-    )?;
-    Ok(Some(joint))
 }
 
 fn try_exact_joint_spatial_hyper_cost_gradient_hessian(
@@ -6808,7 +6665,8 @@ mod tests {
             dimension: 2,
         };
         let beta = array![1.0, 1.0];
-        let out = compute_spatial_adaptive_weights_for_beta(&beta, &[cache], 1e-6, 1e-6, 1e-12, 1e12);
+        let out =
+            compute_spatial_adaptive_weights_for_beta(&beta, &[cache], 1e-6, 1e-6, 1e-12, 1e12);
         assert_eq!(out.len(), 1);
         for k in 0..out[0].grad_weight.len() {
             let pg = out[0].grad_weight[k] * out[0].inv_grad_weight[k];
@@ -6841,7 +6699,14 @@ mod tests {
             1e-12,
             1e12,
         );
-        let large = compute_spatial_adaptive_weights_for_beta(&beta_large, &[cache], 1e-8, 1e-8, 1e-12, 1e12);
+        let large = compute_spatial_adaptive_weights_for_beta(
+            &beta_large,
+            &[cache],
+            1e-8,
+            1e-8,
+            1e-12,
+            1e12,
+        );
         assert!(small[0].grad_weight[0] > large[0].grad_weight[0]);
         assert!(small[0].lap_weight[0] > large[0].lap_weight[0]);
         assert!(small[0].inv_grad_weight[0] < large[0].inv_grad_weight[0]);

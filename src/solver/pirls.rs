@@ -1230,53 +1230,48 @@ impl<'a> GamWorkingModel<'a> {
         qs.t().dot(&xtv)
     }
 
-    fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
-        if let Some(x_transformed) = &self.x_transformed {
-            return Ok(match x_transformed {
-                DesignMatrix::Dense(matrix) => {
-                    let mut xtwx = self.s_transformed.clone();
-                    let par = if matrix.ncols() <= 64 {
-                        Par::Seq
-                    } else {
-                        get_global_parallelism()
-                    };
-                    self.workspace
-                        .add_dense_xtwx_streaming(matrix, weights, &mut xtwx, par);
-                    xtwx
-                }
-                DesignMatrix::Sparse(matrix) => {
-                    let xtwx = self.workspace.sparse_xtwx(matrix, weights).or_else(|_| {
-                        let csr = self.x_csr.as_ref().ok_or_else(|| {
-                            EstimationError::InvalidInput("missing CSR cache".to_string())
-                        })?;
-                        self.workspace.compute_hessian_sparse_faer(csr, weights)
-                    })?;
-                    xtwx + &self.s_transformed
-                }
-            });
-        }
-
-        let xtwx = match &self.x_original {
+    fn compute_xtwx_for_design(
+        &mut self,
+        design: &DesignMatrix,
+        weights: &Array1<f64>,
+        csr_fallback: Option<&SparseRowMat<usize, f64>>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        match design {
             DesignMatrix::Sparse(matrix) => {
                 self.workspace.sparse_xtwx(matrix, weights).or_else(|_| {
-                    let csr = self.x_original_csr.as_ref().ok_or_else(|| {
-                        EstimationError::InvalidInput("missing CSR cache".to_string())
-                    })?;
-                    self.workspace.compute_hessian_sparse_faer(csr, weights)
-                })?
+                    if let Some(csr) = csr_fallback {
+                        self.workspace.compute_hessian_sparse_faer(csr, weights)
+                    } else {
+                        design
+                            .compute_xtwx(weights)
+                            .map_err(EstimationError::InvalidInput)
+                    }
+                })
             }
-            DesignMatrix::Dense(x_dense) => {
-                let mut xtwx = Array2::zeros((x_dense.ncols(), x_dense.ncols()));
-                let par = if x_dense.ncols() <= 64 {
+            DesignMatrix::Dense(matrix) => {
+                let mut xtwx = Array2::zeros((matrix.ncols(), matrix.ncols()));
+                let par = if matrix.ncols() <= 64 {
                     Par::Seq
                 } else {
                     get_global_parallelism()
                 };
                 self.workspace
-                    .add_dense_xtwx_streaming(x_dense, weights, &mut xtwx, par);
-                xtwx
+                    .add_dense_xtwx_streaming(matrix, weights, &mut xtwx, par);
+                Ok(xtwx)
             }
-        };
+        }
+    }
+
+    fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
+        if let Some(x_transformed) = self.x_transformed.clone() {
+            let x_csr = self.x_csr.clone();
+            let xtwx = self.compute_xtwx_for_design(&x_transformed, weights, x_csr.as_ref())?;
+            return Ok(xtwx + &self.s_transformed);
+        }
+
+        let x_original = self.x_original.clone();
+        let x_original_csr = self.x_original_csr.clone();
+        let xtwx = self.compute_xtwx_for_design(&x_original, weights, x_original_csr.as_ref())?;
 
         let qs = self.qs.as_ref().expect("qs required for implicit design");
         let tmp = crate::faer_ndarray::fast_atb(qs, &xtwx);

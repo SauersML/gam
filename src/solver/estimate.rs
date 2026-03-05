@@ -1368,6 +1368,10 @@ where
                 if use_sas && sas_ridge > 0.0 {
                     let log_delta = theta[k + 1];
                     cost += 0.5 * sas_ridge * log_delta * log_delta;
+                    if !use_beta_logistic {
+                        let (barrier_cost, _) = sas_log_delta_edge_barrier_cost_grad(log_delta);
+                        cost += barrier_cost;
+                    }
                 }
                 let cost_sec = t_cost.elapsed().as_secs_f64();
 
@@ -1525,6 +1529,10 @@ where
                 if use_sas && sas_ridge > 0.0 {
                     let log_delta = theta[k + 1];
                     grad[k + 1] += sas_ridge * log_delta;
+                    if !use_beta_logistic {
+                        let (_, barrier_grad) = sas_log_delta_edge_barrier_cost_grad(log_delta);
+                        grad[k + 1] += barrier_grad;
+                    }
                 }
                 let grad_sec = t_grad.elapsed().as_secs_f64();
                 log::info!(
@@ -1628,6 +1636,8 @@ where
                 if use_sas && !use_beta_logistic && sas_ridge_weight > 0.0 {
                     let log_delta = aux[1];
                     cost += 0.5 * sas_ridge_weight * log_delta * log_delta;
+                    let (barrier_cost, _) = sas_log_delta_edge_barrier_cost_grad(log_delta);
+                    cost += barrier_cost;
                 }
                 Ok(cost)
             };
@@ -1947,138 +1957,7 @@ where
     Ok(conditioning.backtransform_external_result(result))
 }
 
-#[allow(dead_code)]
-pub(crate) fn compute_external_directional_hyper_gradient<X>(
-    y: ArrayView1<'_, f64>,
-    w: ArrayView1<'_, f64>,
-    x: X,
-    offset: ArrayView1<'_, f64>,
-    s_list: Vec<Array2<f64>>,
-    rho: &Array1<f64>,
-    hyper_dir: &DirectionalHyperParam,
-    warm_start_beta: Option<ArrayView1<'_, f64>>,
-    opts: &ExternalOptimOptions,
-) -> Result<f64, EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
-    }
-    let p = x.ncols();
-    validate_full_size_penalties(&s_list, p, "compute_external_directional_hyper_gradient")?;
-    let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
-        s_list,
-        &opts.nullspace_dims,
-        "compute_external_directional_hyper_gradient",
-    )?;
-    if rho.len() != active_nullspace_dims.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "rho dimension mismatch: rho_dim={}, active_penalties={}",
-            rho.len(),
-            active_nullspace_dims.len()
-        )));
-    }
-    if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
-        return Err(EstimationError::InvalidInput(format!(
-            "X_tau must be {}x{}, got {}x{}",
-            x.nrows(),
-            p,
-            hyper_dir.x_tau_original.nrows(),
-            hyper_dir.x_tau_original.ncols()
-        )));
-    }
-    if hyper_dir.s_tau_original.nrows() != p || hyper_dir.s_tau_original.ncols() != p {
-        return Err(EstimationError::InvalidInput(format!(
-            "S_tau must be {}x{}, got {}x{}",
-            p,
-            p,
-            hyper_dir.s_tau_original.nrows(),
-            hyper_dir.s_tau_original.ncols()
-        )));
-    }
-    if let Some(k) = hyper_dir.penalty_index
-        && k >= s_list.len()
-    {
-        return Err(EstimationError::InvalidInput(format!(
-            "penalty_index {} out of bounds for {} penalties",
-            k,
-            s_list.len()
-        )));
-    }
-    if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
-        if x2.len() != 1 {
-            return Err(EstimationError::InvalidInput(format!(
-                "X_tau_tau length for directional derivative must be 1, got {}",
-                x2.len()
-            )));
-        }
-        if x2[0].nrows() != x.nrows() || x2[0].ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "X_tau_tau[0] must be {}x{}, got {}x{}",
-                x.nrows(),
-                p,
-                x2[0].nrows(),
-                x2[0].ncols()
-            )));
-        }
-    }
-    if let Some(s2) = hyper_dir.s_tau_tau_original.as_ref() {
-        if s2.len() != 1 {
-            return Err(EstimationError::InvalidInput(format!(
-                "S_tau_tau length for directional derivative must be 1, got {}",
-                s2.len()
-            )));
-        }
-        if s2[0].nrows() != p || s2[0].ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "S_tau_tau[0] must be {}x{}, got {}x{}",
-                p,
-                p,
-                s2[0].nrows(),
-                s2[0].ncols()
-            )));
-        }
-    }
-
-    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
-    let has_design_drift = hyper_dir.x_tau_original.iter().any(|v| v.abs() > 1e-14);
-    ensure_exact_directional_hyper_supported(
-        link,
-        firth_active,
-        has_design_drift,
-        "compute_external_directional_hyper_gradient",
-    )?;
-    let cfg = RemlConfig::external(link, opts.tol, firth_active);
-    let y_o = y.to_owned();
-    let w_o = w.to_owned();
-    let x_o = x.clone();
-    let offset_o = offset.to_owned();
-    let reml_state = RemlState::new_with_offset(
-        y_o.view(),
-        x_o,
-        w_o.view(),
-        offset_o.view(),
-        s_list,
-        p,
-        &cfg,
-        Some(active_nullspace_dims),
-        None,
-        opts.linear_constraints.clone(),
-    )?;
-    reml_state.set_warm_start_original_beta(warm_start_beta);
-    reml_state.compute_directional_hyper_gradient(rho, hyper_dir)
-}
-
-#[allow(dead_code)]
-pub(crate) fn compute_external_joint_hyper_gradient<X>(
+fn validate_and_build_reml_state<X, T, F>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,
@@ -2089,9 +1968,12 @@ pub(crate) fn compute_external_joint_hyper_gradient<X>(
     hyper_dirs: &[DirectionalHyperParam],
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     opts: &ExternalOptimOptions,
-) -> Result<Array1<f64>, EstimationError>
+    context: &str,
+    eval: F,
+) -> Result<T, EstimationError>
 where
     X: Into<DesignMatrix>,
+    F: for<'a> FnOnce(&RemlState<'a>) -> Result<T, EstimationError>,
 {
     let x = x.into();
     if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
@@ -2111,12 +1993,9 @@ where
         )));
     }
     let p = x.ncols();
-    validate_full_size_penalties(&s_list, p, "compute_external_joint_hyper_gradient")?;
-    let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
-        s_list,
-        &opts.nullspace_dims,
-        "compute_external_joint_hyper_gradient",
-    )?;
+    validate_full_size_penalties(&s_list, p, context)?;
+    let (s_list, active_nullspace_dims) =
+        canonicalize_active_penalties(s_list, &opts.nullspace_dims, context)?;
     if rho_dim != active_nullspace_dims.len() {
         return Err(EstimationError::InvalidInput(format!(
             "rho_dim mismatch: rho_dim={}, active_penalties={}",
@@ -2206,20 +2085,14 @@ where
     let has_design_drift = hyper_dirs
         .iter()
         .any(|dir| dir.x_tau_original.iter().any(|v| v.abs() > 1e-14));
-    ensure_exact_directional_hyper_supported(
-        link,
-        firth_active,
-        has_design_drift,
-        "compute_external_joint_hyper_gradient",
-    )?;
+    ensure_exact_directional_hyper_supported(link, firth_active, has_design_drift, context)?;
     let cfg = RemlConfig::external(link, opts.tol, firth_active);
     let y_o = y.to_owned();
     let w_o = w.to_owned();
-    let x_o = x.clone();
     let offset_o = offset.to_owned();
     let reml_state = RemlState::new_with_offset(
         y_o.view(),
-        x_o,
+        x,
         w_o.view(),
         offset_o.view(),
         s_list,
@@ -2230,166 +2103,9 @@ where
         opts.linear_constraints.clone(),
     )?;
     reml_state.set_warm_start_original_beta(warm_start_beta);
-    reml_state.compute_joint_hyper_gradient(theta, rho_dim, hyper_dirs)
+    eval(&reml_state)
 }
 
-#[allow(dead_code)]
-pub(crate) fn compute_external_joint_hyper_cost_gradient<X>(
-    y: ArrayView1<'_, f64>,
-    w: ArrayView1<'_, f64>,
-    x: X,
-    offset: ArrayView1<'_, f64>,
-    s_list: Vec<Array2<f64>>,
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    hyper_dirs: &[DirectionalHyperParam],
-    warm_start_beta: Option<ArrayView1<'_, f64>>,
-    opts: &ExternalOptimOptions,
-) -> Result<(f64, Array1<f64>), EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
-    }
-    if rho_dim > theta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "rho_dim {} exceeds theta dimension {}",
-            rho_dim,
-            theta.len()
-        )));
-    }
-    let p = x.ncols();
-    validate_full_size_penalties(&s_list, p, "compute_external_joint_hyper_cost_gradient")?;
-    let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
-        s_list,
-        &opts.nullspace_dims,
-        "compute_external_joint_hyper_cost_gradient",
-    )?;
-    if rho_dim != active_nullspace_dims.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "rho_dim mismatch: rho_dim={}, active_penalties={}",
-            rho_dim,
-            active_nullspace_dims.len()
-        )));
-    }
-    let psi_dim = theta.len() - rho_dim;
-    if hyper_dirs.len() != psi_dim {
-        return Err(EstimationError::InvalidInput(format!(
-            "joint hyper-gradient derivative count mismatch: psi_dim={}, hyper_dirs={}",
-            psi_dim,
-            hyper_dirs.len()
-        )));
-    }
-    for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
-        if let Some(k) = hyper_dir.penalty_index
-            && k >= s_list.len()
-        {
-            return Err(EstimationError::InvalidInput(format!(
-                "penalty_index for dir {idx} out of bounds: {} >= {}",
-                k,
-                s_list.len()
-            )));
-        }
-        if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "X_tau[{idx}] must be {}x{}, got {}x{}",
-                x.nrows(),
-                p,
-                hyper_dir.x_tau_original.nrows(),
-                hyper_dir.x_tau_original.ncols()
-            )));
-        }
-        if hyper_dir.s_tau_original.nrows() != p || hyper_dir.s_tau_original.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "S_tau[{idx}] must be {}x{}, got {}x{}",
-                p,
-                p,
-                hyper_dir.s_tau_original.nrows(),
-                hyper_dir.s_tau_original.ncols()
-            )));
-        }
-        if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
-            if x2.len() != psi_dim {
-                return Err(EstimationError::InvalidInput(format!(
-                    "X_tau_tau[{idx}] length mismatch: expected {}, got {}",
-                    psi_dim,
-                    x2.len()
-                )));
-            }
-            for (j, x_ij) in x2.iter().enumerate() {
-                if x_ij.nrows() != x.nrows() || x_ij.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "X_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
-                        x.nrows(),
-                        p,
-                        x_ij.nrows(),
-                        x_ij.ncols()
-                    )));
-                }
-            }
-        }
-        if let Some(s2) = hyper_dir.s_tau_tau_original.as_ref() {
-            if s2.len() != psi_dim {
-                return Err(EstimationError::InvalidInput(format!(
-                    "S_tau_tau[{idx}] length mismatch: expected {}, got {}",
-                    psi_dim,
-                    s2.len()
-                )));
-            }
-            for (j, s_ij) in s2.iter().enumerate() {
-                if s_ij.nrows() != p || s_ij.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "S_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
-                        p,
-                        p,
-                        s_ij.nrows(),
-                        s_ij.ncols()
-                    )));
-                }
-            }
-        }
-    }
-
-    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
-    let has_design_drift = hyper_dirs
-        .iter()
-        .any(|dir| dir.x_tau_original.iter().any(|v| v.abs() > 1e-14));
-    ensure_exact_directional_hyper_supported(
-        link,
-        firth_active,
-        has_design_drift,
-        "compute_external_joint_hyper_cost_gradient",
-    )?;
-    let cfg = RemlConfig::external(link, opts.tol, firth_active);
-    let y_o = y.to_owned();
-    let w_o = w.to_owned();
-    let x_o = x.clone();
-    let offset_o = offset.to_owned();
-    let reml_state = RemlState::new_with_offset(
-        y_o.view(),
-        x_o,
-        w_o.view(),
-        offset_o.view(),
-        s_list,
-        p,
-        &cfg,
-        Some(active_nullspace_dims),
-        None,
-        opts.linear_constraints.clone(),
-    )?;
-    reml_state.set_warm_start_original_beta(warm_start_beta);
-    reml_state.compute_joint_hyper_cost_gradient(theta, rho_dim, hyper_dirs)
-}
-
-#[allow(dead_code)]
 pub(crate) fn compute_external_joint_hyper_cost_gradient_hessian<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
@@ -2405,148 +2121,22 @@ pub(crate) fn compute_external_joint_hyper_cost_gradient_hessian<X>(
 where
     X: Into<DesignMatrix>,
 {
-    let x = x.into();
-    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
-            y.len(),
-            w.len(),
-            x.nrows(),
-            offset.len()
-        )));
-    }
-    if rho_dim > theta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "rho_dim {} exceeds theta dimension {}",
-            rho_dim,
-            theta.len()
-        )));
-    }
-    let p = x.ncols();
-    validate_full_size_penalties(
-        &s_list,
-        p,
-        "compute_external_joint_hyper_cost_gradient_hessian",
-    )?;
-    let (s_list, active_nullspace_dims) = canonicalize_active_penalties(
+    validate_and_build_reml_state(
+        y,
+        w,
+        x,
+        offset,
         s_list,
-        &opts.nullspace_dims,
+        theta,
+        rho_dim,
+        hyper_dirs,
+        warm_start_beta,
+        opts,
         "compute_external_joint_hyper_cost_gradient_hessian",
-    )?;
-    if rho_dim != active_nullspace_dims.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "rho_dim mismatch: rho_dim={}, active_penalties={}",
-            rho_dim,
-            active_nullspace_dims.len()
-        )));
-    }
-    let psi_dim = theta.len() - rho_dim;
-    if hyper_dirs.len() != psi_dim {
-        return Err(EstimationError::InvalidInput(format!(
-            "joint hyper-gradient derivative count mismatch: psi_dim={}, hyper_dirs={}",
-            psi_dim,
-            hyper_dirs.len()
-        )));
-    }
-    for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
-        if let Some(k) = hyper_dir.penalty_index
-            && k >= s_list.len()
-        {
-            return Err(EstimationError::InvalidInput(format!(
-                "penalty_index for dir {idx} out of bounds: {} >= {}",
-                k,
-                s_list.len()
-            )));
-        }
-        if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "X_tau[{idx}] must be {}x{}, got {}x{}",
-                x.nrows(),
-                p,
-                hyper_dir.x_tau_original.nrows(),
-                hyper_dir.x_tau_original.ncols()
-            )));
-        }
-        if hyper_dir.s_tau_original.nrows() != p || hyper_dir.s_tau_original.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "S_tau[{idx}] must be {}x{}, got {}x{}",
-                p,
-                p,
-                hyper_dir.s_tau_original.nrows(),
-                hyper_dir.s_tau_original.ncols()
-            )));
-        }
-        if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
-            if x2.len() != psi_dim {
-                return Err(EstimationError::InvalidInput(format!(
-                    "X_tau_tau[{idx}] length mismatch: expected {}, got {}",
-                    psi_dim,
-                    x2.len()
-                )));
-            }
-            for (j, x_ij) in x2.iter().enumerate() {
-                if x_ij.nrows() != x.nrows() || x_ij.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "X_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
-                        x.nrows(),
-                        p,
-                        x_ij.nrows(),
-                        x_ij.ncols()
-                    )));
-                }
-            }
-        }
-        if let Some(s2) = hyper_dir.s_tau_tau_original.as_ref() {
-            if s2.len() != psi_dim {
-                return Err(EstimationError::InvalidInput(format!(
-                    "S_tau_tau[{idx}] length mismatch: expected {}, got {}",
-                    psi_dim,
-                    s2.len()
-                )));
-            }
-            for (j, s_ij) in s2.iter().enumerate() {
-                if s_ij.nrows() != p || s_ij.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "S_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
-                        p,
-                        p,
-                        s_ij.nrows(),
-                        s_ij.ncols()
-                    )));
-                }
-            }
-        }
-    }
-
-    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
-    let has_design_drift = hyper_dirs
-        .iter()
-        .any(|dir| dir.x_tau_original.iter().any(|v| v.abs() > 1e-14));
-    ensure_exact_directional_hyper_supported(
-        link,
-        firth_active,
-        has_design_drift,
-        "compute_external_joint_hyper_cost_gradient_hessian",
-    )?;
-    let cfg = RemlConfig::external(link, opts.tol, firth_active);
-    let y_o = y.to_owned();
-    let w_o = w.to_owned();
-    let x_o = x.clone();
-    let offset_o = offset.to_owned();
-    let reml_state = RemlState::new_with_offset(
-        y_o.view(),
-        x_o,
-        w_o.view(),
-        offset_o.view(),
-        s_list,
-        p,
-        &cfg,
-        Some(active_nullspace_dims),
-        None,
-        opts.linear_constraints.clone(),
-    )?;
-    reml_state.set_warm_start_original_beta(warm_start_beta);
-    reml_state.compute_joint_hyper_cost_gradient_hessian(theta, rho_dim, hyper_dirs)
+        |reml_state| {
+            reml_state.compute_joint_hyper_cost_gradient_hessian(theta, rho_dim, hyper_dirs)
+        },
+    )
 }
 
 #[derive(Clone)]
@@ -3470,6 +3060,34 @@ fn sas_log_delta_ridge_weight() -> f64 {
 }
 
 #[inline]
+fn sas_log_delta_edge_barrier_weight() -> f64 {
+    // Keep SAS raw log-delta away from tanh-saturation edges where
+    // link sensitivities collapse and outer gradients become uninformative.
+    1e-2
+}
+
+#[inline]
+fn sas_log_delta_bound() -> f64 {
+    // Must match mixture_link::SAS_LOG_DELTA_BOUND.
+    12.0
+}
+
+#[inline]
+fn sas_log_delta_edge_barrier_cost_grad(raw_log_delta: f64) -> (f64, f64) {
+    let w = sas_log_delta_edge_barrier_weight();
+    if w <= 0.0 || !raw_log_delta.is_finite() {
+        return (0.0, 0.0);
+    }
+    let b = sas_log_delta_bound().max(f64::EPSILON);
+    let t = (raw_log_delta / b).tanh();
+    let one_minus_t2 = (1.0 - t * t).max(1e-12);
+    let cost = -w * one_minus_t2.ln();
+    // d/draw[-w log(1-t^2)] = (2w/B) * t.
+    let grad = (2.0 * w / b) * t;
+    (cost, grad)
+}
+
+#[inline]
 fn sas_epsilon_bound() -> f64 {
     // Fixed smooth bound on raw SAS epsilon during outer optimization.
     8.0
@@ -4082,6 +3700,10 @@ where
     if use_sas && sas_ridge > 0.0 {
         let log_delta = theta[k + 1];
         cost += 0.5 * sas_ridge * log_delta * log_delta;
+        if !use_beta_logistic {
+            let (barrier_cost, _) = sas_log_delta_edge_barrier_cost_grad(log_delta);
+            cost += barrier_cost;
+        }
     }
 
     let (pirls_mix, h_pos_w) = reml_state.pirls_result_and_hpos_for_rho(&rho)?;
@@ -4235,6 +3857,10 @@ where
     }
     if use_sas && sas_ridge > 0.0 {
         grad[k + 1] += sas_ridge * theta[k + 1];
+        if !use_beta_logistic {
+            let (_, barrier_grad) = sas_log_delta_edge_barrier_cost_grad(theta[k + 1]);
+            grad[k + 1] += barrier_grad;
+        }
     }
     Ok((cost, grad))
 }

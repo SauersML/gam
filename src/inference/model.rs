@@ -9,9 +9,9 @@ use crate::types::{
     InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkSpec, SasLinkState,
 };
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::fs;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataSchema {
@@ -455,8 +455,8 @@ impl FittedModel {
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
         let payload = fs::read_to_string(path)
             .map_err(|e| format!("failed to read model '{}': {e}", path.display()))?;
-        let model: Self =
-            serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
+        let model: Self = serde_json::from_str(&payload)
+            .map_err(|e| format!("failed to parse model json: {e}"))?;
         model.validate_for_persistence()?;
         model.validate_numeric_finiteness()?;
         Ok(model)
@@ -465,8 +465,8 @@ impl FittedModel {
     pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
         self.validate_for_persistence()?;
         self.validate_numeric_finiteness()?;
-        let payload =
-            serde_json::to_string_pretty(self).map_err(|e| format!("failed to serialize model: {e}"))?;
+        let payload = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("failed to serialize model: {e}"))?;
         fs::write(path, payload)
             .map_err(|e| format!("failed to write model '{}': {e}", path.display()))?;
         Ok(())
@@ -584,7 +584,10 @@ impl FittedModel {
             validate_all_finite("fit_result.beta", fit.beta.iter().copied())?;
             validate_all_finite("fit_result.lambdas", fit.lambdas.iter().copied())?;
             validate_all_finite("fit_result.edf_by_block", fit.edf_by_block.iter().copied())?;
-            validate_all_finite("fit_result.working_weights", fit.working_weights.iter().copied())?;
+            validate_all_finite(
+                "fit_result.working_weights",
+                fit.working_weights.iter().copied(),
+            )?;
             validate_all_finite(
                 "fit_result.working_response",
                 fit.working_response.iter().copied(),
@@ -603,7 +606,10 @@ impl FittedModel {
                 validate_all_finite("fit_result.beta_standard_errors", v.iter().copied())?;
             }
             if let Some(v) = fit.beta_standard_errors_corrected.as_ref() {
-                validate_all_finite("fit_result.beta_standard_errors_corrected", v.iter().copied())?;
+                validate_all_finite(
+                    "fit_result.beta_standard_errors_corrected",
+                    v.iter().copied(),
+                )?;
             }
             if let Some(v) = fit.mixture_link_rho.as_ref() {
                 validate_all_finite("fit_result.mixture_link_rho", v.iter().copied())?;
@@ -612,7 +618,10 @@ impl FittedModel {
                 validate_all_finite("fit_result.mixture_link_weights", v.iter().copied())?;
             }
             if let Some(v) = fit.mixture_link_param_covariance.as_ref() {
-                validate_all_finite("fit_result.mixture_link_param_covariance", v.iter().copied())?;
+                validate_all_finite(
+                    "fit_result.mixture_link_param_covariance",
+                    v.iter().copied(),
+                )?;
             }
             if let Some(v) = fit.sas_param_covariance.as_ref() {
                 validate_all_finite("fit_result.sas_param_covariance", v.iter().copied())?;
@@ -634,7 +643,10 @@ impl FittedModel {
             ("survival_baseline_scale", self.survival_baseline_scale),
             ("survival_baseline_shape", self.survival_baseline_shape),
             ("survival_baseline_rate", self.survival_baseline_rate),
-            ("survival_time_smooth_lambda", self.survival_time_smooth_lambda),
+            (
+                "survival_time_smooth_lambda",
+                self.survival_time_smooth_lambda,
+            ),
             ("survival_ridge_lambda", self.survival_ridge_lambda),
             ("survival_sigma_min", self.survival_sigma_min),
             ("survival_sigma_max", self.survival_sigma_max),
@@ -701,7 +713,10 @@ where
     Ok(())
 }
 
-fn validate_frozen_term_collection_spec(spec: &TermCollectionSpec, label: &str) -> Result<(), String> {
+fn validate_frozen_term_collection_spec(
+    spec: &TermCollectionSpec,
+    label: &str,
+) -> Result<(), String> {
     for linear in &spec.linear_terms {
         if let (Some(min), Some(max)) = (linear.coefficient_min, linear.coefficient_max)
             && (!min.is_finite() || !max.is_finite() || min > max)
@@ -765,7 +780,10 @@ fn validate_frozen_term_collection_spec(spec: &TermCollectionSpec, label: &str) 
                         st.name
                     ));
                 }
-                if matches!(spec.identifiability, SpatialIdentifiability::OrthogonalToParametric) {
+                if matches!(
+                    spec.identifiability,
+                    SpatialIdentifiability::OrthogonalToParametric
+                ) {
                     return Err(format!(
                         "{label} term '{}' is not frozen: ThinPlate identifiability must be FrozenTransform or None",
                         st.name
@@ -787,7 +805,10 @@ fn validate_frozen_term_collection_spec(spec: &TermCollectionSpec, label: &str) 
                         st.name
                     ));
                 }
-                if matches!(spec.identifiability, SpatialIdentifiability::OrthogonalToParametric) {
+                if matches!(
+                    spec.identifiability,
+                    SpatialIdentifiability::OrthogonalToParametric
+                ) {
                     return Err(format!(
                         "{label} term '{}' is not frozen: Duchon identifiability must be FrozenTransform or None",
                         st.name
@@ -803,7 +824,10 @@ fn validate_frozen_term_collection_spec(spec: &TermCollectionSpec, label: &str) 
                         ));
                     }
                 }
-                if matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero) {
+                if matches!(
+                    spec.identifiability,
+                    TensorBSplineIdentifiability::SumToZero
+                ) {
                     return Err(format!(
                         "{label} term '{}' is not frozen: tensor identifiability must be FrozenTransform or None",
                         st.name

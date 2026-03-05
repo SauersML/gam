@@ -649,17 +649,22 @@ impl<'a> RemlState<'a> {
         let left_v = &b_v_t * &(&op.w2 * &v.deta).view().insert_axis(Axis(0));
         let left_b = &b_base_t * &op.w1.view().insert_axis(Axis(0));
 
-        let j1 = fast_ab(&left_uv, &p_b_rhs);
-        let j2 = fast_ab(&left_b, &p_buv_rhs);
-        let j3 = fast_ab(&left_u, &p_bv_rhs);
-        let j4 = fast_ab(&left_v, &p_bu_rhs);
-        let j5 = fast_ab(&left_u, &p_v_b_rhs);
-        let j6 = fast_ab(&left_b, &p_v_bu_rhs);
-        let j7 = fast_ab(&left_v, &p_u_b_rhs);
-        let j8 = fast_ab(&left_b, &p_u_bv_rhs);
-        let j9 = fast_ab(&left_b, &p_uv_rhs);
         // Nine-term expansion of D²J₂[u,v] with J₂ = Bᵀ P B.
-        let d2_j2 = j1 + j2 + j3 + j4 + j5 + j6 + j7 + j8 + j9;
+        let d2_terms = [
+            fast_ab(&left_uv, &p_b_rhs),
+            fast_ab(&left_b, &p_buv_rhs),
+            fast_ab(&left_u, &p_bv_rhs),
+            fast_ab(&left_v, &p_bu_rhs),
+            fast_ab(&left_u, &p_v_b_rhs),
+            fast_ab(&left_b, &p_v_bu_rhs),
+            fast_ab(&left_v, &p_u_b_rhs),
+            fast_ab(&left_b, &p_u_bv_rhs),
+            fast_ab(&left_b, &p_uv_rhs),
+        ];
+        let mut d2_j2 = Array2::<f64>::zeros((p, rhs.ncols()));
+        for term in d2_terms {
+            d2_j2 += &term;
+        }
 
         0.5 * (diag_term - d2_j2)
     }

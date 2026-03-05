@@ -141,19 +141,217 @@ pub enum DesignMatrix {
     Sparse(SparseDesignMatrix),
 }
 
-impl DesignMatrix {
-    pub fn nrows(&self) -> usize {
+pub trait LinearOperator {
+    fn nrows(&self) -> usize;
+    fn ncols(&self) -> usize;
+    fn matvec(&self, vector: &Array1<f64>) -> Array1<f64>;
+    fn matvec_trans(&self, vector: &Array1<f64>) -> Array1<f64>;
+    fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String>;
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String>;
+}
+
+impl LinearOperator for DesignMatrix {
+    fn nrows(&self) -> usize {
         match self {
             Self::Dense(matrix) => matrix.nrows(),
             Self::Sparse(matrix) => matrix.nrows(),
         }
     }
 
-    pub fn ncols(&self) -> usize {
+    fn ncols(&self) -> usize {
         match self {
             Self::Dense(matrix) => matrix.ncols(),
             Self::Sparse(matrix) => matrix.ncols(),
         }
+    }
+
+    fn matvec(&self, vector: &Array1<f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(matrix) => dense_matvec(matrix, vector),
+            Self::Sparse(matrix) => {
+                let mut output = Array1::<f64>::zeros(matrix.nrows());
+                let (symbolic, values) = matrix.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..matrix.ncols() {
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    let x = vector[col];
+                    for idx in start..end {
+                        let row = row_idx[idx];
+                        output[row] += values[idx] * x;
+                    }
+                }
+                output
+            }
+        }
+    }
+
+    fn matvec_trans(&self, vector: &Array1<f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(matrix) => dense_transpose_matvec(matrix, vector),
+            Self::Sparse(matrix) => {
+                let mut output = Array1::<f64>::zeros(matrix.ncols());
+                let (symbolic, values) = matrix.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..matrix.ncols() {
+                    let mut acc = 0.0;
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    for idx in start..end {
+                        let row = row_idx[idx];
+                        acc += values[idx] * vector[row];
+                    }
+                    output[col] = acc;
+                }
+                output
+            }
+        }
+    }
+
+    fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "compute_xtwx dimension mismatch: weights length {} != nrows {}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        let p = self.ncols();
+        let mut xtwx = Array2::<f64>::zeros((p, p));
+        match self {
+            Self::Dense(x) => {
+                for i in 0..x.nrows() {
+                    let wi = weights[i].max(0.0);
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    for a in 0..p {
+                        let xa = x[[i, a]];
+                        for b in a..p {
+                            let v = wi * xa * x[[i, b]];
+                            xtwx[[a, b]] += v;
+                            if a != b {
+                                xtwx[[b, a]] += v;
+                            }
+                        }
+                    }
+                }
+            }
+            Self::Sparse(xs) => {
+                let csr = xs
+                    .as_ref()
+                    .to_row_major()
+                    .map_err(|_| "failed to obtain CSR view in compute_xtwx".to_string())?;
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for i in 0..self.nrows() {
+                    let wi = weights[i].max(0.0);
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    let start = row_ptr[i];
+                    let end = row_ptr[i + 1];
+                    for a_ptr in start..end {
+                        let a = col_idx[a_ptr];
+                        let xa = vals[a_ptr];
+                        for b_ptr in a_ptr..end {
+                            let b = col_idx[b_ptr];
+                            let xb = vals[b_ptr];
+                            let v = wi * xa * xb;
+                            xtwx[[a, b]] += v;
+                            if a != b {
+                                xtwx[[b, a]] += v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(xtwx)
+    }
+
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.nrows() || y.len() != self.nrows() {
+            return Err(format!(
+                "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
+                weights.len(),
+                y.len(),
+                self.nrows()
+            ));
+        }
+        let mut wy = y.clone();
+        for i in 0..wy.len() {
+            wy[i] *= weights[i].max(0.0);
+        }
+        Ok(self.matvec_trans(&wy))
+    }
+
+    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        if middle.nrows() != self.ncols() || middle.ncols() != self.ncols() {
+            return Err(format!(
+                "quadratic_form_diag dimension mismatch: matrix is {}x{}, expected {}x{}",
+                middle.nrows(),
+                middle.ncols(),
+                self.ncols(),
+                self.ncols()
+            ));
+        }
+
+        let mut out = Array1::<f64>::zeros(self.nrows());
+        match self {
+            Self::Dense(xd) => {
+                let xc = xd.dot(middle);
+                for i in 0..xd.nrows() {
+                    out[i] = xd.row(i).dot(&xc.row(i)).max(0.0);
+                }
+            }
+            Self::Sparse(xs) => {
+                if let Ok(csr) = xs.as_ref().to_row_major() {
+                    let sym = csr.symbolic();
+                    let row_ptr = sym.row_ptr();
+                    let col_idx = sym.col_idx();
+                    let vals = csr.val();
+                    for i in 0..xs.nrows() {
+                        let start = row_ptr[i];
+                        let end = row_ptr[i + 1];
+                        let mut acc = 0.0_f64;
+                        for a in start..end {
+                            let j = col_idx[a];
+                            let xij = vals[a];
+                            for b in start..end {
+                                let k = col_idx[b];
+                                let xik = vals[b];
+                                acc += xij * middle[[j, k]] * xik;
+                            }
+                        }
+                        out[i] = acc.max(0.0);
+                    }
+                } else {
+                    let dense_arc = self.to_dense_arc();
+                    let dense = dense_arc.as_ref();
+                    let xc = dense.dot(middle);
+                    for i in 0..dense.nrows() {
+                        out[i] = dense.row(i).dot(&xc.row(i)).max(0.0);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl DesignMatrix {
+    pub fn nrows(&self) -> usize {
+        <Self as LinearOperator>::nrows(self)
+    }
+
+    pub fn ncols(&self) -> usize {
+        <Self as LinearOperator>::ncols(self)
     }
 
     pub fn to_dense(&self) -> Array2<f64> {
@@ -178,48 +376,27 @@ impl DesignMatrix {
     }
 
     pub fn matrix_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        match self {
-            Self::Dense(matrix) => dense_matvec(matrix, vector),
-            Self::Sparse(matrix) => {
-                let mut output = Array1::<f64>::zeros(matrix.nrows());
-                let (symbolic, values) = matrix.parts();
-                let col_ptr = symbolic.col_ptr();
-                let row_idx = symbolic.row_idx();
-                for col in 0..matrix.ncols() {
-                    let start = col_ptr[col];
-                    let end = col_ptr[col + 1];
-                    let x = vector[col];
-                    for idx in start..end {
-                        let row = row_idx[idx];
-                        output[row] += values[idx] * x;
-                    }
-                }
-                output
-            }
-        }
+        <Self as LinearOperator>::matvec(self, vector)
     }
 
     pub fn transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        match self {
-            Self::Dense(matrix) => dense_transpose_matvec(matrix, vector),
-            Self::Sparse(matrix) => {
-                let mut output = Array1::<f64>::zeros(matrix.ncols());
-                let (symbolic, values) = matrix.parts();
-                let col_ptr = symbolic.col_ptr();
-                let row_idx = symbolic.row_idx();
-                for col in 0..matrix.ncols() {
-                    let mut acc = 0.0;
-                    let start = col_ptr[col];
-                    let end = col_ptr[col + 1];
-                    for idx in start..end {
-                        let row = row_idx[idx];
-                        acc += values[idx] * vector[row];
-                    }
-                    output[col] = acc;
-                }
-                output
-            }
-        }
+        <Self as LinearOperator>::matvec_trans(self, vector)
+    }
+
+    pub fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        <Self as LinearOperator>::compute_xtwx(self, weights)
+    }
+
+    pub fn compute_xtwy(
+        &self,
+        weights: &Array1<f64>,
+        y: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        <Self as LinearOperator>::compute_xtwy(self, weights, y)
+    }
+
+    pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+        <Self as LinearOperator>::quadratic_form_diag(self, middle)
     }
 }
 
