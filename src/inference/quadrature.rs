@@ -170,6 +170,7 @@
 //! universal formula dominates everywhere.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::{Mutex, OnceLock};
 
 use crate::estimate::EstimationError;
@@ -2010,7 +2011,7 @@ fn integrated_sas_jet_ghq(
     sigma: f64,
     sas_state: &SasLinkState,
 ) -> IntegratedInverseLinkJet {
-    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive_jet4(ctx, mu, sigma, |x| {
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
         sas_point_jet(x, sas_state.epsilon, sas_state.log_delta)
     });
     IntegratedInverseLinkJet {
@@ -2033,7 +2034,7 @@ fn integrated_beta_logistic_jet_ghq(
     sigma: f64,
     beta_state: &SasLinkState,
 ) -> IntegratedInverseLinkJet {
-    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive_jet4(ctx, mu, sigma, |x| {
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
         beta_logistic_point_jet(x, beta_state.log_delta, beta_state.epsilon)
     });
     IntegratedInverseLinkJet {
@@ -2263,27 +2264,6 @@ pub fn logit_posterior_mean_batch(
     })
 }
 
-#[inline]
-fn integrate_normal_ghq_adaptive<F>(ctx: &QuadratureContext, eta: f64, se_eta: f64, f: F) -> f64
-where
-    F: Fn(f64) -> f64,
-{
-    integrate_normal_ghq_adaptive_value(ctx, eta, se_eta, f)
-}
-
-#[inline]
-fn integrate_normal_ghq_adaptive_jet4<F>(
-    ctx: &QuadratureContext,
-    eta: f64,
-    se_eta: f64,
-    f: F,
-) -> (f64, f64, f64, f64)
-where
-    F: Fn(f64) -> (f64, f64, f64, f64),
-{
-    integrate_normal_ghq_adaptive_value(ctx, eta, se_eta, f)
-}
-
 trait GhqValue: Sized {
     fn zero() -> Self;
     fn add_weighted(&mut self, weight: f64, value: Self);
@@ -2351,12 +2331,7 @@ impl GhqValue for (f64, f64, f64, f64) {
 }
 
 #[inline]
-fn integrate_normal_ghq_adaptive_value<F, R>(
-    ctx: &QuadratureContext,
-    eta: f64,
-    se_eta: f64,
-    f: F,
-) -> R
+fn integrate_normal_ghq_adaptive<F, R>(ctx: &QuadratureContext, eta: f64, se_eta: f64, f: F) -> R
 where
     F: Fn(f64) -> R,
     R: GhqValue,
@@ -2427,7 +2402,7 @@ fn integrated_logit_jet_ghq(
     mu: f64,
     sigma: f64,
 ) -> IntegratedInverseLinkJet {
-    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive_jet4(ctx, mu, sigma, logit_point_jet);
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, logit_point_jet);
     IntegratedInverseLinkJet {
         mean: mean.clamp(1e-10, 1.0 - 1e-10),
         d1: d1.max(0.0),
@@ -2447,7 +2422,7 @@ fn integrated_cloglog_jet_ghq(
     mu: f64,
     sigma: f64,
 ) -> IntegratedInverseLinkJet {
-    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive_jet4(ctx, mu, sigma, cloglog_point_jet);
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, cloglog_point_jet);
     IntegratedInverseLinkJet {
         mean: mean.clamp(1e-12, 1.0 - 1e-12),
         d1: d1.max(0.0),
@@ -2484,7 +2459,7 @@ pub fn normal_expectation_1d_adaptive_pair<F>(
 where
     F: Fn(f64) -> (f64, f64),
 {
-    integrate_normal_ghq_adaptive_value(ctx, eta, se_eta, f)
+    integrate_normal_ghq_adaptive(ctx, eta, se_eta, f)
 }
 
 fn adaptive_point_count_from_sd(max_sd: f64) -> usize {
@@ -2580,70 +2555,7 @@ fn adaptive_point_count_with_cap(max_sd: f64, max_n: usize) -> usize {
 }
 
 #[inline]
-fn ghq_nd_integrate<const D: usize, F, R>(
-    ctx: &QuadratureContext,
-    mu: [f64; D],
-    cov: [[f64; D]; D],
-    max_n: usize,
-    f: F,
-) -> Option<R>
-where
-    F: Fn([f64; D]) -> R,
-    R: GhqValue,
-{
-    let mut max_var = 0.0_f64;
-    for (i, row) in cov.iter().enumerate() {
-        max_var = max_var.max(row[i]).max(0.0);
-    }
-    let n = adaptive_point_count_with_cap(max_var.sqrt(), max_n);
-
-    let mut cov_vec = array_cov_to_vec(&cov);
-    for (i, row) in cov_vec.iter_mut().enumerate() {
-        row[i] = row[i].max(0.0);
-    }
-    let l = cholesky_with_jitter(&cov_vec)?;
-    let norm = 1.0 / std::f64::consts::PI.powf(0.5 * D as f64);
-
-    Some(with_gh_nodes_weights(ctx, n, |nodes, weights| {
-        let mut acc = R::zero();
-        let mut idx = [0usize; D];
-        loop {
-            let mut z = [0.0_f64; D];
-            let mut weight = 1.0_f64;
-            for d in 0..D {
-                z[d] = SQRT_2 * nodes[idx[d]];
-                weight *= weights[idx[d]];
-            }
-
-            let mut x = mu;
-            for row in 0..D {
-                let mut dot = 0.0_f64;
-                for (col, zc) in z.iter().enumerate().take(row + 1) {
-                    dot += l[row][col] * *zc;
-                }
-                x[row] += dot;
-            }
-            acc.add_weighted(weight, f(x));
-
-            let mut carry = true;
-            for d in (0..D).rev() {
-                idx[d] += 1;
-                if idx[d] < n {
-                    carry = false;
-                    break;
-                }
-                idx[d] = 0;
-            }
-            if carry {
-                break;
-            }
-        }
-        acc.scale(norm)
-    }))
-}
-
-#[inline]
-fn ghq_nd_integrate_result<const D: usize, F, R, E>(
+fn ghq_nd_integrate_try<const D: usize, F, R, E>(
     ctx: &QuadratureContext,
     mu: [f64; D],
     cov: [[f64; D]; D],
@@ -2708,6 +2620,73 @@ where
     })
 }
 
+#[inline]
+fn ghq_nd_integrate<const D: usize, F, R>(
+    ctx: &QuadratureContext,
+    mu: [f64; D],
+    cov: [[f64; D]; D],
+    max_n: usize,
+    f: F,
+) -> Option<R>
+where
+    F: Fn([f64; D]) -> R,
+    R: GhqValue,
+{
+    match ghq_nd_integrate_try::<D, _, R, Infallible>(ctx, mu, cov, max_n, |x| Ok(f(x))) {
+        Ok(v) => v,
+        Err(e) => match e {},
+    }
+}
+
+#[inline]
+fn ghq_nd_integrate_result<const D: usize, F, R, E>(
+    ctx: &QuadratureContext,
+    mu: [f64; D],
+    cov: [[f64; D]; D],
+    max_n: usize,
+    f: F,
+) -> Result<Option<R>, E>
+where
+    F: Fn([f64; D]) -> Result<R, E>,
+    R: GhqValue,
+{
+    ghq_nd_integrate_try::<D, _, R, E>(ctx, mu, cov, max_n, f)
+}
+
+/// Adaptive N-dimensional GHQ expectation for correlated Gaussian latents.
+pub fn normal_expectation_nd_adaptive<const D: usize, F>(
+    ctx: &QuadratureContext,
+    mu: [f64; D],
+    cov: [[f64; D]; D],
+    max_n: usize,
+    f: F,
+) -> f64
+where
+    F: Fn([f64; D]) -> f64,
+{
+    match ghq_nd_integrate::<D, _, f64>(ctx, mu, cov, max_n, &f) {
+        Some(v) => v,
+        None => f(mu),
+    }
+}
+
+/// Fallible adaptive N-dimensional GHQ expectation for correlated Gaussian latents.
+pub fn normal_expectation_nd_adaptive_result<const D: usize, F, E>(
+    ctx: &QuadratureContext,
+    mu: [f64; D],
+    cov: [[f64; D]; D],
+    max_n: usize,
+    f: F,
+) -> Result<f64, E>
+where
+    F: Fn([f64; D]) -> Result<f64, E>,
+{
+    match ghq_nd_integrate_result::<D, _, f64, E>(ctx, mu, cov, max_n, &f)? {
+        Some(v) => Ok(v),
+        None => f(mu),
+    }
+}
+
 /// Adaptive 2D GHQ expectation for correlated Gaussian latents.
 pub fn normal_expectation_2d_adaptive<F>(
     ctx: &QuadratureContext,
@@ -2718,8 +2697,7 @@ pub fn normal_expectation_2d_adaptive<F>(
 where
     F: Fn(f64, f64) -> f64,
 {
-    ghq_nd_integrate::<2, _, f64>(ctx, mu, cov, 21, |x| f(x[0], x[1]))
-        .unwrap_or_else(|| f(mu[0], mu[1]))
+    normal_expectation_nd_adaptive::<2, _>(ctx, mu, cov, 21, |x| f(x[0], x[1]))
 }
 
 /// Adaptive 2D GHQ expectation for correlated Gaussian latents with a fallible integrand.
@@ -2732,10 +2710,7 @@ pub fn normal_expectation_2d_adaptive_result<F, E>(
 where
     F: Fn(f64, f64) -> Result<f64, E>,
 {
-    match ghq_nd_integrate_result::<2, _, f64, E>(ctx, mu, cov, 21, |x| f(x[0], x[1]))? {
-        Some(v) => Ok(v),
-        None => f(mu[0], mu[1]),
-    }
+    normal_expectation_nd_adaptive_result::<2, _, E>(ctx, mu, cov, 21, |x| f(x[0], x[1]))
 }
 
 /// Adaptive 3D GHQ expectation for correlated Gaussian latents.
@@ -2749,8 +2724,7 @@ where
     F: Fn(f64, f64, f64) -> f64,
 {
     // 3D tensor GHQ grows cubically; cap nodes per axis for throughput.
-    ghq_nd_integrate::<3, _, f64>(ctx, mu, cov, 15, |x| f(x[0], x[1], x[2]))
-        .unwrap_or_else(|| f(mu[0], mu[1], mu[2]))
+    normal_expectation_nd_adaptive::<3, _>(ctx, mu, cov, 15, |x| f(x[0], x[1], x[2]))
 }
 
 /// Closed-form posterior mean under probit link when eta is Gaussian:
