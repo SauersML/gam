@@ -1139,6 +1139,83 @@ mod tests {
     }
 
     #[test]
+    fn all_component_eta_jets_match_fd() {
+        let components = [
+            LinkComponent::Logit,
+            LinkComponent::Probit,
+            LinkComponent::CLogLog,
+            LinkComponent::LogLog,
+            LinkComponent::Cauchit,
+        ];
+        let points = [-3.0, -1.1, -0.2, 0.0, 0.7, 1.8, 3.2];
+        let h = 1e-5;
+        for c in components {
+            for &eta in &points {
+                let j0 = component_inverse_link_jet(c, eta);
+                let jp = component_inverse_link_jet(c, eta + h);
+                let jm = component_inverse_link_jet(c, eta - h);
+                let d1_fd = (jp.mu - jm.mu) / (2.0 * h);
+                let d2_fd = (jp.d1 - jm.d1) / (2.0 * h);
+                let d3_fd = (jp.d2 - jm.d2) / (2.0 * h);
+                let d1_tol = if matches!(c, LinkComponent::CLogLog | LinkComponent::LogLog) {
+                    2e-4
+                } else {
+                    8e-5
+                };
+                let d2_tol = if matches!(c, LinkComponent::CLogLog | LinkComponent::LogLog) {
+                    7e-4
+                } else {
+                    2e-4
+                };
+                let d3_tol = if matches!(c, LinkComponent::CLogLog | LinkComponent::LogLog) {
+                    2e-3
+                } else {
+                    7e-4
+                };
+                if j0.d1.abs() > 1e-10 && d1_fd.abs() > 1e-10 {
+                    assert_eq!(
+                        j0.d1.signum(),
+                        d1_fd.signum(),
+                        "d1 sign mismatch for {c:?} eta={eta}"
+                    );
+                }
+                if j0.d2.abs() > 1e-10 && d2_fd.abs() > 1e-10 {
+                    assert_eq!(
+                        j0.d2.signum(),
+                        d2_fd.signum(),
+                        "d2 sign mismatch for {c:?} eta={eta}"
+                    );
+                }
+                if j0.d3.abs() > 1e-10 && d3_fd.abs() > 1e-10 {
+                    assert_eq!(
+                        j0.d3.signum(),
+                        d3_fd.signum(),
+                        "d3 sign mismatch for {c:?} eta={eta}"
+                    );
+                }
+                assert!(
+                    (j0.d1 - d1_fd).abs() < d1_tol,
+                    "d1 mismatch for {c:?} eta={eta}: analytic={} fd={}",
+                    j0.d1,
+                    d1_fd
+                );
+                assert!(
+                    (j0.d2 - d2_fd).abs() < d2_tol,
+                    "d2 mismatch for {c:?} eta={eta}: analytic={} fd={}",
+                    j0.d2,
+                    d2_fd
+                );
+                assert!(
+                    (j0.d3 - d3_fd).abs() < d3_tol,
+                    "d3 mismatch for {c:?} eta={eta}: analytic={} fd={}",
+                    j0.d3,
+                    d3_fd
+                );
+            }
+        }
+    }
+
+    #[test]
     fn sas_center_matches_probit_at_delta1_epsilon0() {
         let etas = [-3.0, -1.2, -0.3, 0.0, 0.4, 1.7, 3.0];
         for eta in etas {
@@ -1163,5 +1240,48 @@ mod tests {
                 "d3 mismatch at eta={eta}"
             );
         }
+    }
+
+    #[test]
+    fn beta_logistic_param_partials_match_fd() {
+        let eta = -0.41;
+        let delta = 0.23;
+        let epsilon = -0.17;
+        let out = beta_logistic_inverse_link_jet_with_param_partials(eta, delta, epsilon);
+        let h = 1e-6;
+
+        let dp = beta_logistic_inverse_link_jet(eta, delta + h, epsilon);
+        let dm = beta_logistic_inverse_link_jet(eta, delta - h, epsilon);
+        let fd_delta = InverseLinkJet {
+            mu: (dp.mu - dm.mu) / (2.0 * h),
+            d1: (dp.d1 - dm.d1) / (2.0 * h),
+            d2: (dp.d2 - dm.d2) / (2.0 * h),
+            d3: (dp.d3 - dm.d3) / (2.0 * h),
+        };
+        assert_eq!(out.djet_dlog_delta.mu.signum(), fd_delta.mu.signum());
+        assert_eq!(out.djet_dlog_delta.d1.signum(), fd_delta.d1.signum());
+        assert_eq!(out.djet_dlog_delta.d2.signum(), fd_delta.d2.signum());
+        assert_eq!(out.djet_dlog_delta.d3.signum(), fd_delta.d3.signum());
+        assert!((out.djet_dlog_delta.mu - fd_delta.mu).abs() < 8e-5);
+        assert!((out.djet_dlog_delta.d1 - fd_delta.d1).abs() < 8e-5);
+        assert!((out.djet_dlog_delta.d2 - fd_delta.d2).abs() < 2e-4);
+        assert!((out.djet_dlog_delta.d3 - fd_delta.d3).abs() < 7e-4);
+
+        let ep = beta_logistic_inverse_link_jet(eta, delta, epsilon + h);
+        let em = beta_logistic_inverse_link_jet(eta, delta, epsilon - h);
+        let fd_epsilon = InverseLinkJet {
+            mu: (ep.mu - em.mu) / (2.0 * h),
+            d1: (ep.d1 - em.d1) / (2.0 * h),
+            d2: (ep.d2 - em.d2) / (2.0 * h),
+            d3: (ep.d3 - em.d3) / (2.0 * h),
+        };
+        assert_eq!(out.djet_depsilon.mu.signum(), fd_epsilon.mu.signum());
+        assert_eq!(out.djet_depsilon.d1.signum(), fd_epsilon.d1.signum());
+        assert_eq!(out.djet_depsilon.d2.signum(), fd_epsilon.d2.signum());
+        assert_eq!(out.djet_depsilon.d3.signum(), fd_epsilon.d3.signum());
+        assert!((out.djet_depsilon.mu - fd_epsilon.mu).abs() < 8e-5);
+        assert!((out.djet_depsilon.d1 - fd_epsilon.d1).abs() < 8e-5);
+        assert!((out.djet_depsilon.d2 - fd_epsilon.d2).abs() < 2e-4);
+        assert!((out.djet_depsilon.d3 - fd_epsilon.d3).abs() < 7e-4);
     }
 }

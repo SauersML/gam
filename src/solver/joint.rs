@@ -29,7 +29,7 @@ use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
 use crate::probability::normal_cdf_approx;
 use crate::quadrature::QuadratureContext;
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
-use crate::types::{LikelihoodFamily, LinkFunction};
+use crate::types::{GlmLikelihoodFamily, LikelihoodFamily, LinkFunction};
 use crate::visualizer;
 use faer::Side;
 use ndarray::s;
@@ -59,11 +59,11 @@ const JOINT_GRAD_AUDIT_INTERVAL: usize = 20;
 const JOINT_ENABLE_RUNTIME_FD_AUDIT: bool = cfg!(any(test, debug_assertions));
 
 #[inline]
-fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<LikelihoodFamily> {
+fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<GlmLikelihoodFamily> {
     match link {
-        LinkFunction::Logit => Some(LikelihoodFamily::BinomialLogit),
-        LinkFunction::Probit => Some(LikelihoodFamily::BinomialProbit),
-        LinkFunction::CLogLog => Some(LikelihoodFamily::BinomialCLogLog),
+        LinkFunction::Logit => Some(GlmLikelihoodFamily::BinomialLogit),
+        LinkFunction::Probit => Some(GlmLikelihoodFamily::BinomialProbit),
+        LinkFunction::CLogLog => Some(GlmLikelihoodFamily::BinomialCLogLog),
         // Joint model currently carries only state-less LinkFunction.
         // SAS requires explicit (epsilon, log_delta) state for mathematically
         // correct integrated moments, so do not dispatch state-less SAS here.
@@ -95,6 +95,73 @@ fn joint_point_inverse_link(link: LinkFunction, eta: f64) -> f64 {
 fn should_sample_joint_fd_audit(eval_num: usize) -> bool {
     eval_num <= JOINT_GRAD_AUDIT_WARMUP_EVALS
         || (JOINT_GRAD_AUDIT_INTERVAL > 0 && eval_num % JOINT_GRAD_AUDIT_INTERVAL == 0)
+}
+
+#[derive(Clone, Copy)]
+struct JointPenaltyLayout {
+    n_base: usize,
+}
+
+impl JointPenaltyLayout {
+    fn for_state(state: &JointModelState<'_>) -> Self {
+        Self {
+            n_base: state.s_base.len(),
+        }
+    }
+
+    fn total_penalties(self) -> usize {
+        self.n_base + 1
+    }
+
+    fn validate_rho(self, rho: &Array1<f64>) -> Result<(), EstimationError> {
+        let expected = self.total_penalties();
+        if rho.len() != expected {
+            return Err(EstimationError::LayoutError(format!(
+                "rho length does not match joint penalty count: got {}, expected {}",
+                rho.len(),
+                expected
+            )));
+        }
+        Ok(())
+    }
+
+    fn lambdas(self, rho: &Array1<f64>) -> (Array1<f64>, f64) {
+        let lambda_base = rho.slice(s![..self.n_base]).mapv(f64::exp);
+        let lambda_link = rho[self.n_base].exp();
+        (lambda_base, lambda_link)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct JointCoefLayout {
+    p_base: usize,
+    p_link: usize,
+}
+
+impl JointCoefLayout {
+    fn new(p_base: usize, p_link: usize) -> Self {
+        Self { p_base, p_link }
+    }
+
+    fn p_total(self) -> usize {
+        self.p_base + self.p_link
+    }
+
+    fn split(self, flat: &Array1<f64>) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+        if flat.len() != self.p_total() {
+            return Err(EstimationError::LayoutError(format!(
+                "joint coefficient split length mismatch: got {}, expected {} (base {} + link {})",
+                flat.len(),
+                self.p_total(),
+                self.p_base,
+                self.p_link
+            )));
+        }
+        Ok((
+            flat.slice(s![..self.p_base]).to_owned(),
+            flat.slice(s![self.p_base..]).to_owned(),
+        ))
+    }
 }
 
 /// Ensure a matrix is positive definite by adding ridge if needed for solver stability.
@@ -591,7 +658,8 @@ impl<'a> JointModelState<'a> {
         p_link: usize,
     ) -> Array2<f64> {
         let p_base = self.x_base.ncols();
-        let p_total = p_base + p_link;
+        let coef_layout = JointCoefLayout::new(p_base, p_link);
+        let p_total = coef_layout.p_total();
         let mut penalty = Array2::<f64>::zeros((p_total, p_total));
         let base_penalty = self.build_base_penalty(lambda_base);
         if p_base > 0 {
@@ -624,7 +692,8 @@ impl<'a> JointModelState<'a> {
         let n = self.n_obs();
         let p_base = self.x_base.ncols();
         let p_link = b_wiggle.ncols();
-        let mut j_mat = Array2::<f64>::zeros((n, p_base + p_link));
+        let coef_layout = JointCoefLayout::new(p_base, p_link);
+        let mut j_mat = Array2::<f64>::zeros((n, coef_layout.p_total()));
         for i in 0..n {
             let gp = g_prime[i];
             for j in 0..p_base {
@@ -1355,7 +1424,8 @@ impl<'a> JointRemlState<'a> {
     /// LAML = deviance + log|H_pen| - log|S_λ| (+ prior on ρ)
     pub fn compute_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
         let state = &mut self.core.state;
-        let n_base = state.s_base.len();
+        let penalty_layout = JointPenaltyLayout::for_state(state);
+        penalty_layout.validate_rho(rho)?;
 
         // Set ρ and warm-start from cached coefficients
         state.set_rho(rho.clone());
@@ -1363,11 +1433,7 @@ impl<'a> JointRemlState<'a> {
         state.beta_link = self.eval.cached_beta_link.clone();
 
         // Run inner alternating to convergence
-        let mut lambda_base = Array1::<f64>::zeros(n_base);
-        for i in 0..n_base {
-            lambda_base[i] = rho.get(i).map(|r| r.exp()).unwrap_or(1.0);
-        }
-        let lambda_link = rho.get(n_base).map(|r| r.exp()).unwrap_or(1.0);
+        let (lambda_base, lambda_link) = penalty_layout.lambdas(rho);
 
         let mut prev_deviance = f64::INFINITY;
         let mut iter_count = 0;
@@ -1574,7 +1640,8 @@ impl<'a> JointRemlState<'a> {
         // so cross-block terms are explicit and retained (not dropped).
         let p_base = state.x_base.ncols();
         let p_link = b_wiggle.ncols();
-        let p_total = p_base + p_link;
+        let coef_layout = JointCoefLayout::new(p_base, p_link);
+        let p_total = coef_layout.p_total();
 
         let (g_prime, _, _) = compute_link_derivative_terms_from_state(state, &u);
         let j_mat = state.build_joint_jacobian(&b_wiggle, &g_prime);
@@ -1770,7 +1837,8 @@ impl<'a> JointRemlState<'a> {
         let n = state.n_obs();
         let p_base = state.x_base.ncols();
         let p_link = b_wiggle.ncols();
-        let p_total = p_base + p_link;
+        let coef_layout = JointCoefLayout::new(p_base, p_link);
+        let p_total = coef_layout.p_total();
         if p_total == 0 {
             return Some(0.0);
         }
@@ -1919,22 +1987,15 @@ impl<'a> JointRemlState<'a> {
         &mut self,
         rho: &Array1<f64>,
     ) -> Result<(Array1<f64>, bool), EstimationError> {
-        let n_base = self.core.state.s_base.len();
+        let penalty_layout = JointPenaltyLayout::for_state(&self.core.state);
 
-        if rho.len() != n_base + 1 {
-            return Err(EstimationError::LayoutError(
-                "rho length does not match joint penalty count".to_string(),
-            ));
-        }
+        penalty_layout.validate_rho(rho)?;
 
         let firth_active = self.core.state.firth_bias_reduction
             && matches!(self.core.state.link, LinkFunction::Logit);
 
-        let mut lambda_base = Array1::<f64>::zeros(n_base);
-        for i in 0..n_base {
-            lambda_base[i] = rho.get(i).map(|r| r.exp()).unwrap_or(1.0);
-        }
-        let lambda_link = rho.get(n_base).map(|r| r.exp()).unwrap_or(1.0);
+        let n_base = penalty_layout.n_base;
+        let (lambda_base, lambda_link) = penalty_layout.lambdas(rho);
         let cache_hit = self.cached_cost_matches_rho(rho);
         let mut converged = self.eval.last_converged;
 
@@ -2063,7 +2124,8 @@ impl<'a> JointRemlState<'a> {
 
         let p_base = state.x_base.ncols();
         let p_link = b_wiggle.ncols();
-        let p_total = p_base + p_link;
+        let coef_layout = JointCoefLayout::new(p_base, p_link);
+        let p_total = coef_layout.p_total();
 
         let (g_prime, g_second, b_prime_u) = compute_link_derivative_terms_from_state(&state, &u);
 
@@ -2450,6 +2512,7 @@ impl<'a> JointRemlState<'a> {
         let mut dot_j_theta = Array2::<f64>::zeros((n, p_link));
         let mut dot_j_beta = Array2::<f64>::zeros((n, p_base));
         let mut dot_j = Array2::<f64>::zeros((n, p_total));
+        let coef_layout = JointCoefLayout::new(p_base, p_link);
 
         for k in 0..rho.len() {
             let is_link = k == n_base;
@@ -2494,8 +2557,7 @@ impl<'a> JointRemlState<'a> {
                     }
                 }
             }
-            let delta_beta = delta.slice(s![..p_base]).to_owned();
-            let delta_theta = delta.slice(s![p_base..]).to_owned();
+            let (delta_beta, delta_theta) = coef_layout.split(&delta)?;
 
             dot_u.assign(
                 &fast_ab(
@@ -3428,7 +3490,10 @@ pub fn predict_joint(
             (0..n)
                 .map(|i| {
                     crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
-                        &quad_ctx, family, eta_cal[i], eff_se[i],
+                        &quad_ctx,
+                        family.into(),
+                        eta_cal[i],
+                        eff_se[i],
                     )
                     .map(|m| m.mean)
                     .unwrap_or_else(|_| joint_point_inverse_link(result.link, eta_cal[i]))
@@ -3444,7 +3509,10 @@ pub fn predict_joint(
             (0..n)
                 .map(|i| {
                     crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
-                        &quad_ctx, family, eta_cal[i], 0.0,
+                        &quad_ctx,
+                        family.into(),
+                        eta_cal[i],
+                        0.0,
                     )
                     .map(|m| m.mean)
                     .unwrap_or_else(|_| joint_point_inverse_link(result.link, eta_cal[i]))
@@ -3860,7 +3928,8 @@ mod tests {
             bw[[i, 0]] = 0.7 * xw[[i, 0]] + 0.2 * xw[[i, 1]];
             bw[[i, 1]] = -0.2 * xw[[i, 0]] + 0.9 * xw[[i, 1]];
         }
-        let mut weighted_joint_design = Array2::<f64>::zeros((n, p_base + p_link));
+        let coef_layout = JointCoefLayout::new(p_base, p_link);
+        let mut weighted_joint_design = Array2::<f64>::zeros((n, coef_layout.p_total()));
         weighted_joint_design
             .slice_mut(s![.., ..p_base])
             .assign(&xw);
@@ -3868,7 +3937,7 @@ mod tests {
             .slice_mut(s![.., p_base..])
             .assign(&bw);
 
-        let mut penalty = Array2::<f64>::zeros((p_base + p_link, p_base + p_link));
+        let mut penalty = Array2::<f64>::zeros((coef_layout.p_total(), coef_layout.p_total()));
         penalty[[0, 0]] = 1.0;
         penalty[[1, 1]] = 2.0;
         penalty[[2, 2]] = 3.0;

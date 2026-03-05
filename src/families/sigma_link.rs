@@ -232,4 +232,54 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn bounded_sigma_fourth_derivative_matches_finite_difference() {
+        let sigma_min = 0.05;
+        let sigma_max = 20.0;
+        let h = 2e-3;
+        let points = [-6.0, -3.0, -1.1, 0.0, 0.6, 1.9, 5.5];
+
+        let d3_at = |x: f64| bounded_sigma_derivs_up_to_third_scalar(x, sigma_min, sigma_max).3;
+        for &eta in &points {
+            let (_, d1_4, d2_4, d3_4, d4_4) =
+                bounded_sigma_derivs_up_to_fourth_scalar(eta, sigma_min, sigma_max);
+            let (_, d1_3, d2_3, d3_3) =
+                bounded_sigma_derivs_up_to_third_scalar(eta, sigma_min, sigma_max);
+            assert!((d1_4 - d1_3).abs() < 1e-12);
+            assert!((d2_4 - d2_3).abs() < 1e-12);
+            assert!((d3_4 - d3_3).abs() < 1e-12);
+
+            let d4_fd = (d3_at(eta + h) - d3_at(eta - h)) / (2.0 * h);
+            if d4_4.abs() > 1e-9 && d4_fd.abs() > 1e-9 {
+                assert_eq!(
+                    d4_4.signum(),
+                    d4_fd.signum(),
+                    "d4 sign mismatch at eta={eta}: got {d4_4}, fd {d4_fd}"
+                );
+            }
+            assert!(
+                (d4_4 - d4_fd).abs() < 2e-4,
+                "d4 mismatch at eta={eta}: got {d4_4}, fd {d4_fd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_sigma_vectorized_up_to_fourth_matches_scalar() {
+        let sigma_min = 0.2;
+        let sigma_max = 7.3;
+        let eta = Array1::from_vec(vec![-4.2, -1.4, -0.2, 0.4, 1.9, 3.1]);
+        let (s, d1, d2, d3, d4) =
+            bounded_sigma_derivs_up_to_fourth(eta.view(), sigma_min, sigma_max);
+        for i in 0..eta.len() {
+            let (ss, d1s, d2s, d3s, d4s) =
+                bounded_sigma_derivs_up_to_fourth_scalar(eta[i], sigma_min, sigma_max);
+            assert!((s[i] - ss).abs() < 1e-12);
+            assert!((d1[i] - d1s).abs() < 1e-12);
+            assert!((d2[i] - d2s).abs() < 1e-12);
+            assert!((d3[i] - d3s).abs() < 1e-12);
+            assert!((d4[i] - d4s).abs() < 1e-12);
+        }
+    }
 }

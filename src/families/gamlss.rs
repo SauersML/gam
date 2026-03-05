@@ -25,7 +25,7 @@ use crate::smooth::{
     optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivative_info_list,
 };
-use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};
+use crate::types::{GlmLikelihoodFamily, InverseLink, LinkFunction};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
@@ -37,6 +37,144 @@ const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
 const BETA_RANGE_WARN_THRESHOLD: f64 = 1.10;
 const BINOMIAL_EFFECTIVE_N_WARN_THRESHOLD: f64 = 25.0;
+
+#[derive(Clone, Copy)]
+struct GamlssLambdaLayout {
+    k_mean: usize,
+    k_noise: usize,
+    k_wiggle: usize,
+}
+
+impl GamlssLambdaLayout {
+    fn two_block(k_mean: usize, k_noise: usize) -> Self {
+        Self {
+            k_mean,
+            k_noise,
+            k_wiggle: 0,
+        }
+    }
+
+    fn with_wiggle(k_mean: usize, k_noise: usize, k_wiggle: usize) -> Self {
+        Self {
+            k_mean,
+            k_noise,
+            k_wiggle,
+        }
+    }
+
+    fn total(self) -> usize {
+        self.k_mean + self.k_noise + self.k_wiggle
+    }
+
+    fn mean_end(self) -> usize {
+        self.k_mean
+    }
+
+    fn noise_start(self) -> usize {
+        self.k_mean
+    }
+
+    fn noise_end(self) -> usize {
+        self.k_mean + self.k_noise
+    }
+
+    fn wiggle_start(self) -> usize {
+        self.k_mean + self.k_noise
+    }
+
+    fn wiggle_end(self) -> usize {
+        self.k_mean + self.k_noise + self.k_wiggle
+    }
+
+    fn has_wiggle(self) -> bool {
+        self.k_wiggle > 0
+    }
+
+    fn validate_theta_len(self, theta_len: usize, context: &str) -> Result<(), String> {
+        let needed = self.total();
+        if theta_len < needed {
+            return Err(format!(
+                "{context} theta too short: got {}, need at least {}",
+                theta_len, needed
+            ));
+        }
+        Ok(())
+    }
+
+    fn mean_from(self, theta: &Array1<f64>) -> Array1<f64> {
+        theta.slice(s![0..self.mean_end()]).to_owned()
+    }
+
+    fn noise_from(self, theta: &Array1<f64>) -> Array1<f64> {
+        theta
+            .slice(s![self.noise_start()..self.noise_end()])
+            .to_owned()
+    }
+
+    fn wiggle_from(self, theta: &Array1<f64>) -> Array1<f64> {
+        theta
+            .slice(s![self.wiggle_start()..self.wiggle_end()])
+            .to_owned()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GamlssBetaLayout {
+    pt: usize,
+    pls: usize,
+    pw: usize,
+}
+
+impl GamlssBetaLayout {
+    fn two_block(pt: usize, pls: usize) -> Self {
+        Self { pt, pls, pw: 0 }
+    }
+
+    fn with_wiggle(pt: usize, pls: usize, pw: usize) -> Self {
+        Self { pt, pls, pw }
+    }
+
+    fn total(self) -> usize {
+        self.pt + self.pls + self.pw
+    }
+
+    fn split_two(
+        self,
+        flat: &Array1<f64>,
+        context: &str,
+    ) -> Result<(Array1<f64>, Array1<f64>), String> {
+        if flat.len() != self.total() {
+            return Err(format!(
+                "{context} length mismatch: got {}, expected {}",
+                flat.len(),
+                self.total()
+            ));
+        }
+        Ok((
+            flat.slice(s![0..self.pt]).to_owned(),
+            flat.slice(s![self.pt..self.pt + self.pls]).to_owned(),
+        ))
+    }
+
+    fn split_three(
+        self,
+        flat: &Array1<f64>,
+        context: &str,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+        if flat.len() != self.total() {
+            return Err(format!(
+                "{context} length mismatch: got {}, expected {}",
+                flat.len(),
+                self.total()
+            ));
+        }
+        Ok((
+            flat.slice(s![0..self.pt]).to_owned(),
+            flat.slice(s![self.pt..self.pt + self.pls]).to_owned(),
+            flat.slice(s![self.pt + self.pls..self.total()]).to_owned(),
+        ))
+    }
+}
 
 /// Generic block input for high-level built-in family APIs.
 #[derive(Clone)]
@@ -262,7 +400,7 @@ fn validate_block_rows(name: &str, n: usize, block: &ParameterBlockInput) -> Res
 /// Shared single-block GLM evaluation adapter backed by the engine-level
 /// `WorkingLikelihood` implementation used by PIRLS.
 fn evaluate_single_block_glm(
-    family: LikelihoodFamily,
+    family: GlmLikelihoodFamily,
     y: &Array1<f64>,
     weights: &Array1<f64>,
     eta: &Array1<f64>,
@@ -1130,23 +1268,27 @@ fn compose_theta_from_hints(
     noise_log_lambda_hint: &Option<Array1<f64>>,
     extra_rho0: &Array1<f64>,
 ) -> Array1<f64> {
-    let k_mean = mean_design.penalties.len();
-    let k_noise = noise_design.penalties.len();
-    let k_extra = extra_rho0.len();
-    let mut theta = Array1::<f64>::zeros(k_mean + k_noise + k_extra);
+    let layout = GamlssLambdaLayout::with_wiggle(
+        mean_design.penalties.len(),
+        noise_design.penalties.len(),
+        extra_rho0.len(),
+    );
+    let mut theta = Array1::<f64>::zeros(layout.total());
     if let Some(v) = mean_log_lambda_hint
-        && v.len() == k_mean
+        && v.len() == layout.k_mean
     {
-        theta.slice_mut(s![0..k_mean]).assign(v);
+        theta.slice_mut(s![0..layout.mean_end()]).assign(v);
     }
     if let Some(v) = noise_log_lambda_hint
-        && v.len() == k_noise
+        && v.len() == layout.k_noise
     {
-        theta.slice_mut(s![k_mean..(k_mean + k_noise)]).assign(v);
-    }
-    if k_extra > 0 {
         theta
-            .slice_mut(s![(k_mean + k_noise)..(k_mean + k_noise + k_extra)])
+            .slice_mut(s![layout.noise_start()..layout.noise_end()])
+            .assign(v);
+    }
+    if layout.has_wiggle() {
+        theta
+            .slice_mut(s![layout.wiggle_start()..layout.wiggle_end()])
             .assign(extra_rho0);
     }
     theta
@@ -1214,15 +1356,13 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     let family = builder.build_family(mean_design, noise_design);
                     fit_custom_family(&family, &blocks, options)?
                 };
-                let k_mean = mean_design.penalties.len();
-                let k_noise = noise_design.penalties.len();
-                if fit.log_lambdas.len() >= k_mean + k_noise {
-                    mean_log_lambda_hint = Some(fit.log_lambdas.slice(s![0..k_mean]).to_owned());
-                    noise_log_lambda_hint = Some(
-                        fit.log_lambdas
-                            .slice(s![k_mean..(k_mean + k_noise)])
-                            .to_owned(),
-                    );
+                let layout = GamlssLambdaLayout::two_block(
+                    mean_design.penalties.len(),
+                    noise_design.penalties.len(),
+                );
+                if fit.log_lambdas.len() >= layout.total() {
+                    mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
+                    noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
                 }
                 let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
                 mean_beta_hint = Some(mean_beta);
@@ -1288,15 +1428,13 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 )?;
                 let family = builder.build_family(mean_design, noise_design);
                 let fit = fit_custom_family(&family, &blocks, options)?;
-                let k_mean = mean_design.penalties.len();
-                let k_noise = noise_design.penalties.len();
-                if fit.log_lambdas.len() >= k_mean + k_noise {
-                    mean_log_lambda_hint = Some(fit.log_lambdas.slice(s![0..k_mean]).to_owned());
-                    noise_log_lambda_hint = Some(
-                        fit.log_lambdas
-                            .slice(s![k_mean..(k_mean + k_noise)])
-                            .to_owned(),
-                    );
+                let layout = GamlssLambdaLayout::two_block(
+                    mean_design.penalties.len(),
+                    noise_design.penalties.len(),
+                );
+                if fit.log_lambdas.len() >= layout.total() {
+                    mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
+                    noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
                 }
                 let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
                 mean_beta_hint = Some(mean_beta);
@@ -1344,22 +1482,18 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         mean_beta_hint: Option<Array1<f64>>,
         noise_beta_hint: Option<Array1<f64>>,
     ) -> Result<Vec<ParameterBlockSpec>, String> {
-        let k_mean = mean_design.penalties.len();
-        let k_noise = noise_design.penalties.len();
-        if theta.len() < k_mean + k_noise {
-            return Err(format!(
-                "gaussian location-scale theta too short: got {}, need at least {}",
-                theta.len(),
-                k_mean + k_noise
-            ));
-        }
+        let layout = GamlssLambdaLayout::two_block(
+            mean_design.penalties.len(),
+            noise_design.penalties.len(),
+        );
+        layout.validate_theta_len(theta.len(), "gaussian location-scale")?;
         Ok(vec![
             ParameterBlockSpec {
                 name: "mu".to_string(),
                 design: DesignMatrix::Dense(mean_design.design.clone()),
                 offset: Array1::zeros(self.y.len()),
                 penalties: mean_design.penalties.clone(),
-                initial_log_lambdas: theta.slice(s![0..k_mean]).to_owned(),
+                initial_log_lambdas: layout.mean_from(theta),
                 initial_beta: mean_beta_hint,
             },
             ParameterBlockSpec {
@@ -1367,7 +1501,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
                 design: DesignMatrix::Dense(noise_design.design.clone()),
                 offset: Array1::zeros(self.y.len()),
                 penalties: noise_design.penalties.clone(),
-                initial_log_lambdas: theta.slice(s![k_mean..(k_mean + k_noise)]).to_owned(),
+                initial_log_lambdas: layout.noise_from(theta),
                 initial_beta: noise_beta_hint,
             },
         ])
@@ -1441,22 +1575,18 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitTermBuilder {
         mean_beta_hint: Option<Array1<f64>>,
         noise_beta_hint: Option<Array1<f64>>,
     ) -> Result<Vec<ParameterBlockSpec>, String> {
-        let k_mean = mean_design.penalties.len();
-        let k_noise = noise_design.penalties.len();
-        if theta.len() < k_mean + k_noise {
-            return Err(format!(
-                "binomial location-scale theta too short: got {}, need at least {}",
-                theta.len(),
-                k_mean + k_noise
-            ));
-        }
+        let layout = GamlssLambdaLayout::two_block(
+            mean_design.penalties.len(),
+            noise_design.penalties.len(),
+        );
+        layout.validate_theta_len(theta.len(), "binomial location-scale")?;
         Ok(vec![
             ParameterBlockSpec {
                 name: "threshold".to_string(),
                 design: DesignMatrix::Dense(mean_design.design.clone()),
                 offset: Array1::zeros(self.y.len()),
                 penalties: mean_design.penalties.clone(),
-                initial_log_lambdas: theta.slice(s![0..k_mean]).to_owned(),
+                initial_log_lambdas: layout.mean_from(theta),
                 initial_beta: mean_beta_hint,
             },
             ParameterBlockSpec {
@@ -1464,7 +1594,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitTermBuilder {
                 design: DesignMatrix::Dense(noise_design.design.clone()),
                 offset: Array1::zeros(self.y.len()),
                 penalties: noise_design.penalties.clone(),
-                initial_log_lambdas: theta.slice(s![k_mean..(k_mean + k_noise)]).to_owned(),
+                initial_log_lambdas: layout.noise_from(theta),
                 initial_beta: noise_beta_hint,
             },
         ])
@@ -1542,23 +1672,19 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitWiggleTermBuilder
         mean_beta_hint: Option<Array1<f64>>,
         noise_beta_hint: Option<Array1<f64>>,
     ) -> Result<Vec<ParameterBlockSpec>, String> {
-        let k_mean = mean_design.penalties.len();
-        let k_noise = noise_design.penalties.len();
-        let k_wiggle = self.wiggle_block.penalties.len();
-        if theta.len() < k_mean + k_noise + k_wiggle {
-            return Err(format!(
-                "wiggle location-scale theta too short: got {}, need at least {}",
-                theta.len(),
-                k_mean + k_noise + k_wiggle
-            ));
-        }
+        let layout = GamlssLambdaLayout::with_wiggle(
+            mean_design.penalties.len(),
+            noise_design.penalties.len(),
+            self.wiggle_block.penalties.len(),
+        );
+        layout.validate_theta_len(theta.len(), "wiggle location-scale")?;
         Ok(vec![
             ParameterBlockSpec {
                 name: "threshold".to_string(),
                 design: DesignMatrix::Dense(mean_design.design.clone()),
                 offset: Array1::zeros(self.y.len()),
                 penalties: mean_design.penalties.clone(),
-                initial_log_lambdas: theta.slice(s![0..k_mean]).to_owned(),
+                initial_log_lambdas: layout.mean_from(theta),
                 initial_beta: mean_beta_hint,
             },
             ParameterBlockSpec {
@@ -1566,7 +1692,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitWiggleTermBuilder
                 design: DesignMatrix::Dense(noise_design.design.clone()),
                 offset: Array1::zeros(self.y.len()),
                 penalties: noise_design.penalties.clone(),
-                initial_log_lambdas: theta.slice(s![k_mean..(k_mean + k_noise)]).to_owned(),
+                initial_log_lambdas: layout.noise_from(theta),
                 initial_beta: noise_beta_hint,
             },
             ParameterBlockSpec {
@@ -1574,9 +1700,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitWiggleTermBuilder
                 design: self.wiggle_block.design.clone(),
                 offset: self.wiggle_block.offset.clone(),
                 penalties: self.wiggle_block.penalties.clone(),
-                initial_log_lambdas: theta
-                    .slice(s![(k_mean + k_noise)..(k_mean + k_noise + k_wiggle)])
-                    .to_owned(),
+                initial_log_lambdas: layout.wiggle_from(theta),
                 initial_beta: self.wiggle_block.initial_beta.clone(),
             },
         ])
@@ -2981,7 +3105,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let (x_t, x_ls) = self.dense_block_designs()?;
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
-        let total = pt + pls;
+        let beta_layout = GamlssBetaLayout::two_block(pt, pls);
+        let total = beta_layout.total();
         if d_beta_flat.len() != total {
             return Err(format!(
                 "Gaussian joint d_beta length mismatch: got {}, expected {}",
@@ -2989,8 +3114,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 total
             ));
         }
-        let u_t = d_beta_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_flat.slice(s![pt..]).to_owned();
+        let (u_t, u_ls) = beta_layout.split_two(d_beta_flat, "Gaussian joint d_beta")?;
         let d_eta_t = x_t.dot(&u_t);
         let d_eta_ls = x_ls.dot(&u_ls);
         let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
@@ -3056,7 +3180,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let (x_t, x_ls) = self.dense_block_designs()?;
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
-        let total = pt + pls;
+        let beta_layout = GamlssBetaLayout::two_block(pt, pls);
+        let total = beta_layout.total();
         if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
             return Err(format!(
                 "Gaussian joint second-direction length mismatch: got ({}, {}), expected ({}, {})",
@@ -3066,10 +3191,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 total
             ));
         }
-        let u_t = d_beta_u_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_u_flat.slice(s![pt..]).to_owned();
-        let v_t = d_beta_v_flat.slice(s![0..pt]).to_owned();
-        let v_ls = d_beta_v_flat.slice(s![pt..]).to_owned();
+        let (u_t, u_ls) = beta_layout.split_two(d_beta_u_flat, "Gaussian joint d_beta_u")?;
+        let (v_t, v_ls) = beta_layout.split_two(d_beta_v_flat, "Gaussian joint d_beta_v")?;
         let d_eta_t_u = x_t.dot(&u_t);
         let d_eta_ls_u = x_ls.dot(&u_ls);
         let d_eta_t_v = x_t.dot(&v_t);
@@ -3179,7 +3302,12 @@ impl CustomFamily for BinomialLogitFamily {
         if eta.len() != n || self.weights.len() != n {
             return Err("BinomialLogitFamily input size mismatch".to_string());
         }
-        evaluate_single_block_glm(LikelihoodFamily::BinomialLogit, &self.y, &self.weights, eta)
+        evaluate_single_block_glm(
+            GlmLikelihoodFamily::BinomialLogit,
+            &self.y,
+            &self.weights,
+            eta,
+        )
     }
 }
 
@@ -3864,7 +3992,8 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let (x_t, x_ls) = self.dense_block_designs()?;
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
-        let total = pt + pls;
+        let beta_layout = GamlssBetaLayout::two_block(pt, pls);
+        let total = beta_layout.total();
         if d_beta_flat.len() != total {
             return Err(format!(
                 "joint d_beta length mismatch: got {}, expected {}",
@@ -3872,8 +4001,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
                 total
             ));
         }
-        let u_t = d_beta_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_flat.slice(s![pt..]).to_owned();
+        let (u_t, u_ls) = beta_layout.split_two(d_beta_flat, "binomial joint d_beta")?;
         let d_eta_t = x_t.dot(&u_t);
         let d_eta_ls = x_ls.dot(&u_ls);
 
@@ -4043,7 +4171,8 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let (x_t, x_ls) = self.dense_block_designs()?;
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
-        let total = pt + pls;
+        let beta_layout = GamlssBetaLayout::two_block(pt, pls);
+        let total = beta_layout.total();
         if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
             return Err(format!(
                 "joint second-direction lengths mismatch: got u={} v={}, expected {}",
@@ -4052,10 +4181,8 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
                 total
             ));
         }
-        let u_t = d_beta_u_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_u_flat.slice(s![pt..]).to_owned();
-        let v_t = d_beta_v_flat.slice(s![0..pt]).to_owned();
-        let v_ls = d_beta_v_flat.slice(s![pt..]).to_owned();
+        let (u_t, u_ls) = beta_layout.split_two(d_beta_u_flat, "binomial joint d_beta_u")?;
+        let (v_t, v_ls) = beta_layout.split_two(d_beta_v_flat, "binomial joint d_beta_v")?;
         let d_eta_t_u = x_t.dot(&u_t);
         let d_eta_ls_u = x_ls.dot(&u_ls);
         let d_eta_t_v = x_t.dot(&v_t);
@@ -4973,7 +5100,8 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         )?;
         let b0 = self.wiggle_design(core0.q0.view())?;
         let pw = b0.ncols();
-        let total = pt + pls + pw;
+        let beta_layout = GamlssBetaLayout::with_wiggle(pt, pls, pw);
+        let total = beta_layout.total();
         if d_beta_flat.len() != total {
             return Err(format!(
                 "joint d_beta length mismatch: got {}, expected {}",
@@ -4981,9 +5109,7 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
                 total
             ));
         }
-        let u_t = d_beta_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_flat.slice(s![pt..pt + pls]).to_owned();
-        let u_w = d_beta_flat.slice(s![pt + pls..]).to_owned();
+        let (u_t, u_ls, u_w) = beta_layout.split_three(d_beta_flat, "wiggle joint d_beta")?;
         let d_eta_t = x_t.dot(&u_t);
         let d_eta_ls = x_ls.dot(&u_ls);
 
@@ -5203,7 +5329,8 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let d3q = self.wiggle_d3q_dq03(core0.q0.view(), beta_w0.view())?;
         let d4q = self.wiggle_d4q_dq04(core0.q0.view(), beta_w0.view())?;
         let pw = b0.ncols();
-        let total = pt + pls + pw;
+        let beta_layout = GamlssBetaLayout::with_wiggle(pt, pls, pw);
+        let total = beta_layout.total();
         if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
             return Err(format!(
                 "joint second-direction lengths mismatch: got u={} v={}, expected {}",
@@ -5225,12 +5352,8 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             ));
         }
 
-        let u_t = d_beta_u_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_u_flat.slice(s![pt..pt + pls]).to_owned();
-        let u_w = d_beta_u_flat.slice(s![pt + pls..]).to_owned();
-        let v_t = d_beta_v_flat.slice(s![0..pt]).to_owned();
-        let v_ls = d_beta_v_flat.slice(s![pt..pt + pls]).to_owned();
-        let v_w = d_beta_v_flat.slice(s![pt + pls..]).to_owned();
+        let (u_t, u_ls, u_w) = beta_layout.split_three(d_beta_u_flat, "wiggle joint d_beta_u")?;
+        let (v_t, v_ls, v_w) = beta_layout.split_three(d_beta_v_flat, "wiggle joint d_beta_v")?;
         let d_eta_t_u = x_t.dot(&u_t);
         let d_eta_ls_u = x_ls.dot(&u_ls);
         let d_eta_t_v = x_t.dot(&v_t);
@@ -6257,28 +6380,28 @@ mod tests {
 
         let eps = 1e-6;
         let mut plus_states = states.clone();
-        plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T].beta =
-            &plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T].beta
-                + &(eps
-                    * direction
-                        .slice(s![0..plus_states
-                            [BinomialLocationScaleProbitWiggleFamily::BLOCK_T]
-                            .beta
-                            .len()])
-                        .to_owned());
-        let ls_start = plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T]
-            .beta
-            .len();
-        let ls_end = ls_start
-            + plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_LOG_SIGMA]
+        let beta_layout = GamlssBetaLayout::with_wiggle(
+            plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T]
                 .beta
-                .len();
+                .len(),
+            plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_LOG_SIGMA]
+                .beta
+                .len(),
+            plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_WIGGLE]
+                .beta
+                .len(),
+        );
+        let (dir_t, dir_ls, dir_w) = beta_layout
+            .split_three(&direction, "wiggle test direction split")
+            .expect("split wiggle test direction");
+        plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T].beta =
+            &plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T].beta + &(eps * dir_t);
         plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_LOG_SIGMA].beta =
             &plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_LOG_SIGMA].beta
-                + &(eps * direction.slice(s![ls_start..ls_end]).to_owned());
+                + &(eps * dir_ls);
         plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_WIGGLE].beta =
             &plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_WIGGLE].beta
-                + &(eps * direction.slice(s![ls_end..]).to_owned());
+                + &(eps * dir_w);
         plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T].eta = threshold_design
             .matrix_vector_multiply(
                 &plus_states[BinomialLocationScaleProbitWiggleFamily::BLOCK_T].beta,
@@ -6421,9 +6544,10 @@ mod tests {
             .expect("expected joint exact d2H");
 
         let eps = 1e-6;
-        let step_t = direction_v.slice(s![0..pt]).to_owned();
-        let step_ls = direction_v.slice(s![pt..pt + pls]).to_owned();
-        let step_w = direction_v.slice(s![pt + pls..]).to_owned();
+        let beta_layout = GamlssBetaLayout::with_wiggle(pt, pls, pw);
+        let (step_t, step_ls, step_w) = beta_layout
+            .split_three(&direction_v, "wiggle d2H test direction_v")
+            .expect("split wiggle test direction");
 
         let states_plus = rebuild_states(
             &(&beta_t + &(eps * &step_t)),

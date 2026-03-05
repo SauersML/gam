@@ -3,9 +3,6 @@ use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_FULL};
 use csv::WriterBuilder;
 use faer::Mat as FaerMat;
 use faer::Side;
-use faer::linalg::solvers::{
-    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
-};
 use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions,
@@ -20,6 +17,9 @@ use gam::estimate::{
     ParametricTermSummary, SmoothTermSummary, compute_continuous_smoothness_order, fit_gam,
     optimize_external_design, predict_gam, predict_gam_posterior_mean_with_fit,
     predict_gam_with_uncertainty,
+};
+use gam::families::family_meta::{
+    family_to_link, family_to_string, is_binomial_family, pretty_family_name,
 };
 use gam::families::sigma_link::{
     bounded_sigma_and_deriv_from_eta as sigma_and_deriv_from_eta,
@@ -7137,44 +7137,6 @@ fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
         .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
 }
 
-fn family_to_string(f: LikelihoodFamily) -> &'static str {
-    match f {
-        LikelihoodFamily::GaussianIdentity => "gaussian",
-        LikelihoodFamily::BinomialLogit => "binomial-logit",
-        LikelihoodFamily::BinomialProbit => "binomial-probit",
-        LikelihoodFamily::BinomialCLogLog => "binomial-cloglog",
-        LikelihoodFamily::BinomialSas => "binomial-sas",
-        LikelihoodFamily::BinomialBetaLogistic => "binomial-beta-logistic",
-        LikelihoodFamily::BinomialMixture => "binomial-blended-inverse-link",
-        LikelihoodFamily::RoystonParmar => "royston-parmar",
-    }
-}
-
-fn family_to_link(f: LikelihoodFamily) -> LinkFunction {
-    match f {
-        LikelihoodFamily::GaussianIdentity => LinkFunction::Identity,
-        LikelihoodFamily::BinomialLogit => LinkFunction::Logit,
-        LikelihoodFamily::BinomialProbit => LinkFunction::Probit,
-        LikelihoodFamily::BinomialCLogLog => LinkFunction::CLogLog,
-        LikelihoodFamily::BinomialSas => LinkFunction::Sas,
-        LikelihoodFamily::BinomialBetaLogistic => LinkFunction::BetaLogistic,
-        LikelihoodFamily::BinomialMixture => LinkFunction::Logit,
-        LikelihoodFamily::RoystonParmar => LinkFunction::Identity,
-    }
-}
-
-fn is_binomial_family(f: LikelihoodFamily) -> bool {
-    matches!(
-        f,
-        LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog
-            | LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture
-    )
-}
-
 fn load_joint_result(
     model: &SavedModel,
     family: LikelihoodFamily,
@@ -7230,19 +7192,6 @@ fn load_joint_result(
     }))
 }
 
-fn pretty_family_name(f: LikelihoodFamily) -> &'static str {
-    match f {
-        LikelihoodFamily::GaussianIdentity => "Gaussian Identity",
-        LikelihoodFamily::BinomialLogit => "Binomial Logit",
-        LikelihoodFamily::BinomialProbit => "Binomial Probit",
-        LikelihoodFamily::BinomialCLogLog => "Binomial CLogLog",
-        LikelihoodFamily::BinomialSas => "Binomial SAS",
-        LikelihoodFamily::BinomialBetaLogistic => "Binomial Beta-Logistic",
-        LikelihoodFamily::BinomialMixture => "Binomial Blended Inverse-Link",
-        LikelihoodFamily::RoystonParmar => "Royston Parmar",
-    }
-}
-
 fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
     if !chi_sq.is_finite() || !df.is_finite() || chi_sq < 0.0 || df <= 0.0 {
         return None;
@@ -7253,14 +7202,10 @@ fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
 
 fn solve_symmetric_system(cov: &Array2<f64>, rhs: &FaerMat<f64>) -> Option<FaerMat<f64>> {
     let cov_view = gam::faer_ndarray::FaerArrayView::new(cov);
-    if let Ok(f) = FaerLlt::new(cov_view.as_ref(), Side::Lower) {
-        return Some(f.solve(rhs.as_ref()));
-    }
-    if let Ok(f) = FaerLdlt::new(cov_view.as_ref(), Side::Lower) {
-        return Some(f.solve(rhs.as_ref()));
-    }
-    let f = FaerLblt::new(cov_view.as_ref(), Side::Lower);
-    Some(f.solve(rhs.as_ref()))
+    let factor =
+        gam::faer_ndarray::factorize_symmetric_with_fallback(cov_view.as_ref(), Side::Lower)
+            .ok()?;
+    Some(factor.solve(rhs.as_ref()))
 }
 
 fn wald_quadratic_form(
@@ -7733,14 +7678,9 @@ fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, String> {
     for i in 0..n {
         rhs[(i, i)] = 1.0;
     }
-    if let Ok(ch) = FaerLlt::new(h.as_ref(), Side::Lower) {
-        ch.solve_in_place(rhs.as_mut());
-    } else if let Ok(ld) = FaerLdlt::new(h.as_ref(), Side::Lower) {
-        ld.solve_in_place(rhs.as_mut());
-    } else {
-        let lb = FaerLblt::new(h.as_ref(), Side::Lower);
-        lb.solve_in_place(rhs.as_mut());
-    }
+    let factor = gam::faer_ndarray::factorize_symmetric_with_fallback(h.as_ref(), Side::Lower)
+        .map_err(|_| "failed to factorize matrix for inversion".to_string())?;
+    factor.solve_in_place(rhs.as_mut());
     let mut out = Array2::<f64>::zeros((n, n));
     for i in 0..n {
         for j in 0..n {

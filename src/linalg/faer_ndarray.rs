@@ -9,6 +9,7 @@ use faer::linalg::svd::{self, ComputeSvdVectors};
 use faer::{Auto, Conj, Mat, MatMut, MatRef, Par, Side, Spec, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use thiserror::Error;
 
 const BK_BLOCK_TOL: f64 = 1e-12;
@@ -35,6 +36,7 @@ pub enum FaerLinalgError {
 pub enum FaerSymmetricFactor {
     Llt(FaerLlt<f64>),
     Ldlt(FaerLdlt<f64>),
+    Lblt(FaerLblt<f64>),
 }
 
 impl FaerSymmetricFactor {
@@ -43,11 +45,21 @@ impl FaerSymmetricFactor {
         match self {
             FaerSymmetricFactor::Llt(f) => f.solve(rhs),
             FaerSymmetricFactor::Ldlt(f) => f.solve(rhs),
+            FaerSymmetricFactor::Lblt(f) => f.solve(rhs),
+        }
+    }
+
+    #[inline]
+    pub fn solve_in_place(&self, rhs: MatMut<'_, f64>) {
+        match self {
+            FaerSymmetricFactor::Llt(f) => f.solve_in_place(rhs),
+            FaerSymmetricFactor::Ldlt(f) => f.solve_in_place(rhs),
+            FaerSymmetricFactor::Lblt(f) => f.solve_in_place(rhs),
         }
     }
 }
 
-/// Factorize a symmetric system with an LLT first attempt and LDLT fallback.
+/// Factorize a symmetric system with LLT -> LDLT -> LBLT fallback.
 #[inline]
 pub fn factorize_symmetric_with_fallback(
     matrix: MatRef<'_, f64>,
@@ -56,8 +68,13 @@ pub fn factorize_symmetric_with_fallback(
     if let Ok(llt) = FaerLlt::new(matrix, side) {
         return Ok(FaerSymmetricFactor::Llt(llt));
     }
-    let ldlt = FaerLdlt::new(matrix, side).map_err(FaerLinalgError::Ldlt)?;
-    Ok(FaerSymmetricFactor::Ldlt(ldlt))
+    let ldlt_err = match FaerLdlt::new(matrix, side) {
+        Ok(ldlt) => return Ok(FaerSymmetricFactor::Ldlt(ldlt)),
+        Err(err) => err,
+    };
+    let lblt = catch_unwind(AssertUnwindSafe(|| FaerLblt::new(matrix, side)))
+        .map_err(|_| FaerLinalgError::Ldlt(ldlt_err))?;
+    Ok(FaerSymmetricFactor::Lblt(lblt))
 }
 
 #[inline]

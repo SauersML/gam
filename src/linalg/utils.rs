@@ -1,6 +1,6 @@
 use crate::construction::calculate_condition_number;
 use crate::faer_ndarray::{
-    FaerArrayView, FaerLblt, FaerLdlt, FaerLlt, FaerSolve, array2_to_mat_mut,
+    FaerArrayView, FaerLinalgError, array2_to_mat_mut, factorize_symmetric_with_fallback,
 };
 use faer::Side;
 use ndarray::Array2;
@@ -36,21 +36,6 @@ pub(crate) fn matrix_inverse_with_regularization(
         return None;
     }
 
-    enum Fact {
-        Llt(FaerLlt<f64>),
-        Ldlt(FaerLdlt<f64>),
-        Lblt(FaerLblt<f64>),
-    }
-    impl Fact {
-        fn solve_in_place(&self, rhs: faer::MatMut<'_, f64>) {
-            match self {
-                Fact::Llt(f) => f.solve_in_place(rhs),
-                Fact::Ldlt(f) => f.solve_in_place(rhs),
-                Fact::Lblt(f) => f.solve_in_place(rhs),
-            }
-        }
-    }
-
     let mut planner = RidgePlanner::new(matrix);
     let factor = loop {
         let ridge = planner.ridge();
@@ -60,11 +45,8 @@ pub(crate) fn matrix_inverse_with_regularization(
             matrix.clone()
         };
         let h_view = FaerArrayView::new(&h_eff);
-        if let Ok(chol) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-            break Fact::Llt(chol);
-        }
-        if let Ok(ldlt) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-            break Fact::Ldlt(ldlt);
+        if let Ok(factor) = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower) {
+            break factor;
         }
         if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
             log::warn!(
@@ -72,11 +54,11 @@ pub(crate) fn matrix_inverse_with_regularization(
                 label,
                 ridge
             );
-            if let Ok(h_lblt) = std::panic::catch_unwind({
-                let h_view = FaerArrayView::new(&h_eff);
-                move || FaerLblt::new(h_view.as_ref(), Side::Lower)
-            }) {
-                break Fact::Lblt(h_lblt);
+            let h_view = FaerArrayView::new(&h_eff);
+            let fallback = factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower)
+                .map_err(|_| FaerLinalgError::FactorizationFailed);
+            if let Ok(factor) = fallback {
+                break factor;
             }
             log::warn!("Failed to factorize {} for covariance", label);
             return None;

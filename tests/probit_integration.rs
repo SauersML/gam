@@ -1,6 +1,6 @@
 use gam::pirls::update_glm_vectors_by_family;
 use gam::probability::normal_cdf_approx;
-use gam::{FitOptions, LikelihoodFamily, fit_gam, predict_gam};
+use gam::{FitOptions, GlmLikelihoodFamily, LikelihoodFamily, fit_gam, predict_gam};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -88,7 +88,7 @@ fn probit_working_vectors_are_finite_for_extreme_eta() {
     update_glm_vectors_by_family(
         y.view(),
         &eta,
-        LikelihoodFamily::BinomialProbit,
+        GlmLikelihoodFamily::BinomialProbit,
         w.view(),
         &mut mu,
         &mut weights,
@@ -172,7 +172,7 @@ fn cloglog_working_vectors_are_finite_for_extreme_eta() {
     update_glm_vectors_by_family(
         y.view(),
         &eta,
-        LikelihoodFamily::BinomialCLogLog,
+        GlmLikelihoodFamily::BinomialCLogLog,
         w.view(),
         &mut mu,
         &mut weights,
