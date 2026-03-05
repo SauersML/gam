@@ -65,7 +65,8 @@ use gam::survival_location_scale_probit::{
     residual_distribution_inverse_link,
 };
 use gam::types::{
-    InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec,
+    InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec,
+    MixtureLinkState, SasLinkSpec, SasLinkState,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rand::{SeedableRng, rngs::StdRng};
@@ -1849,16 +1850,42 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         return Ok(());
     }
 
+    run_predict_standard_or_flexible(
+        &args,
+        &model,
+        ds.values.view(),
+        &col_map,
+        training_headers,
+        saved_link_kind.as_ref(),
+        saved_mixture.as_ref(),
+        saved_sas.as_ref(),
+        saved_mixture_param_cov.as_ref(),
+        saved_sas_param_cov.as_ref(),
+    )
+}
+
+fn run_predict_standard_or_flexible(
+    args: &PredictArgs,
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    saved_link_kind: Option<&InverseLink>,
+    saved_mixture: Option<&MixtureLinkState>,
+    saved_sas: Option<&SasLinkState>,
+    saved_mixture_param_cov: Option<&Array2<f64>>,
+    saved_sas_param_cov: Option<&Array2<f64>>,
+) -> Result<(), String> {
     let spec = resolve_term_spec_for_prediction(
         &model.resolved_term_spec,
         training_headers,
-        &col_map,
+        col_map,
         "resolved_term_spec",
     )?;
-    let design = build_term_collection_design(ds.values.view(), &spec)
+    let design = build_term_collection_design(data, &spec)
         .map_err(|e| format!("failed to build prediction design: {e}"))?;
 
-    let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     let beta = fit_saved.beta.clone();
     if beta.len() != design.design.ncols() {
         return Err(format!(
@@ -1870,7 +1897,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
 
     let offset = Array1::zeros(design.design.nrows());
     let family = model.likelihood();
-    if let Some(joint) = load_joint_result(&model, family)? {
+    if let Some(joint) = load_joint_result(model, family)? {
         let beta_base = fit_saved.beta.clone();
         if beta_base.len() != design.design.ncols() {
             return Err(format!(
@@ -1883,7 +1910,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         let nonlinear = !matches!(family, LikelihoodFamily::GaussianIdentity);
         let mut se_base = None;
         if (nonlinear && args.mode == PredictModeArg::PosteriorMean) || args.uncertainty {
-            let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+            let cov_mat = covariance_from_model(model, args.covariance_mode)?;
             if cov_mat.nrows() != beta_base.len() || cov_mat.ncols() != beta_base.len() {
                 return Err(format!(
                     "covariance shape mismatch: got {}x{}, expected {}x{}",
@@ -1917,10 +1944,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     family,
                     pred.eta.view(),
                     eff.view(),
-                    saved_mixture.as_ref(),
-                    saved_sas.as_ref(),
-                    saved_mixture_param_cov.as_ref(),
-                    saved_sas_param_cov.as_ref(),
+                    saved_mixture,
+                    saved_sas,
+                    saved_mixture_param_cov,
+                    saved_sas_param_cov,
                 )?;
                 let (lo, hi) = response_interval_from_mean_sd(
                     pred.probabilities.view(),
@@ -1935,11 +1962,11 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 let eta_lower = &pred.eta - &eff.mapv(|v| z * v);
                 let eta_upper = &pred.eta + &eff.mapv(|v| z * v);
                 mean_lo = Some(
-                    try_inverse_link_array(family, eta_lower.view(), saved_link_kind.as_ref())
+                    try_inverse_link_array(family, eta_lower.view(), saved_link_kind)
                         .map_err(|e| format!("inverse-link lower bound failed: {e}"))?,
                 );
                 mean_hi = Some(
-                    try_inverse_link_array(family, eta_upper.view(), saved_link_kind.as_ref())
+                    try_inverse_link_array(family, eta_upper.view(), saved_link_kind)
                         .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
                 );
             }
@@ -1969,7 +1996,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture
     );
-    let fit_for_predict = fit_result_from_saved_model_for_prediction(&model)?;
+    let fit_for_predict = fit_result_from_saved_model_for_prediction(model)?;
     let (eta, mean, se_opt, mut mean_lo, mut mean_hi) = if args.uncertainty {
         let options = gam::estimate::PredictUncertaintyOptions {
             confidence_level: args.level,
@@ -1994,7 +2021,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             Some(pred.mean_upper),
         )
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
-        let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+        let cov_mat = covariance_from_model(model, args.covariance_mode)?;
         let pm = predict_gam_posterior_mean_with_fit(
             design.design.view(),
             beta.view(),
@@ -2017,9 +2044,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
             return Err(format!("--level must be in (0,1), got {}", args.level));
         }
-        let se = se_opt.as_ref().ok_or_else(|| {
-            "internal error: eta SE unavailable for uncertainty interval".to_string()
-        })?;
+        let se = se_opt
+            .as_ref()
+            .ok_or_else(|| "internal error: eta SE unavailable for uncertainty interval".to_string())?;
         let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
         eta_se = Some(se.clone());
         if nonlinear {
@@ -2027,10 +2054,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 family,
                 eta.view(),
                 se.view(),
-                saved_mixture.as_ref(),
-                saved_sas.as_ref(),
-                saved_mixture_param_cov.as_ref(),
-                saved_sas_param_cov.as_ref(),
+                saved_mixture,
+                saved_sas,
+                saved_mixture_param_cov,
+                saved_sas_param_cov,
             )?;
             let (lo, hi) = response_interval_from_mean_sd(
                 mean.view(),
@@ -2045,11 +2072,11 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             let eta_lower = &eta - &se.mapv(|v| z * v);
             let eta_upper = &eta + &se.mapv(|v| z * v);
             mean_lo = Some(
-                try_inverse_link_array(family, eta_lower.view(), saved_link_kind.as_ref())
+                try_inverse_link_array(family, eta_lower.view(), saved_link_kind)
                     .map_err(|e| format!("inverse-link lower bound failed: {e}"))?,
             );
             mean_hi = Some(
-                try_inverse_link_array(family, eta_upper.view(), saved_link_kind.as_ref())
+                try_inverse_link_array(family, eta_upper.view(), saved_link_kind)
                     .map_err(|e| format!("inverse-link upper bound failed: {e}"))?,
             );
         }
