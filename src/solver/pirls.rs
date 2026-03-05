@@ -675,6 +675,36 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
 }
 
 #[derive(Debug, Clone)]
+pub enum FirthDiagnostics {
+    Inactive,
+    Active { log_det: f64, hat_diag: Array1<f64> },
+}
+
+impl Default for FirthDiagnostics {
+    fn default() -> Self {
+        Self::Inactive
+    }
+}
+
+impl FirthDiagnostics {
+    #[inline]
+    pub fn log_det(&self) -> Option<f64> {
+        match self {
+            Self::Inactive => None,
+            Self::Active { log_det, .. } => Some(*log_det),
+        }
+    }
+
+    #[inline]
+    pub fn hat_diag(&self) -> Option<&Array1<f64>> {
+        match self {
+            Self::Inactive => None,
+            Self::Active { hat_diag, .. } => Some(hat_diag),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkingState {
     pub eta: LinearPredictor,
     pub gradient: Array1<f64>,
@@ -682,14 +712,25 @@ pub struct WorkingState {
     pub sparse_hessian: Option<SparseColMat<usize, f64>>,
     pub deviance: f64,
     pub penalty_term: f64,
-    pub firth_log_det: Option<f64>,
-    pub firth_hat_diag: Option<Array1<f64>>,
+    pub firth: FirthDiagnostics,
     // Ridge added to ensure positive definiteness of the penalized Hessian.
     // `penalty_term` stores the full quadratic form contribution
     // ridge * ||beta||^2. The optimization objective uses
     // 0.5 * (deviance + penalty_term), so this corresponds to
     // 0.5 * ridge * ||beta||^2 on the log-likelihood scale.
     pub ridge_used: f64,
+}
+
+impl WorkingState {
+    #[inline]
+    pub fn firth_log_det(&self) -> Option<f64> {
+        self.firth.log_det()
+    }
+
+    #[inline]
+    pub fn firth_hat_diag(&self) -> Option<&Array1<f64>> {
+        self.firth.hat_diag()
+    }
 }
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
@@ -1021,7 +1062,6 @@ struct GamWorkingModel<'a> {
     likelihood: GlmLikelihoodFamily,
     link_kind: InverseLink,
     firth_bias_reduction: bool,
-    firth_log_det: Option<f64>,
     last_mu: Array1<f64>,
     last_weights: Array1<f64>,
     last_z: Array1<f64>,
@@ -1051,7 +1091,6 @@ struct GamModelFinalState {
     final_dmu_deta: Array1<f64>,
     final_d2mu_deta2: Array1<f64>,
     final_d3mu_deta3: Array1<f64>,
-    firth_log_det: Option<f64>,
     penalty_term: f64,
 }
 
@@ -1116,7 +1155,6 @@ impl<'a> GamWorkingModel<'a> {
             likelihood,
             link_kind,
             firth_bias_reduction,
-            firth_log_det: None,
             last_mu: Array1::zeros(n),
             last_weights: Array1::zeros(n),
             last_z: Array1::zeros(n),
@@ -1165,7 +1203,6 @@ impl<'a> GamWorkingModel<'a> {
             final_dmu_deta: self.last_dmu_deta,
             final_d2mu_deta2: self.last_d2mu_deta2,
             final_d3mu_deta3: self.last_d3mu_deta3,
-            firth_log_det: self.firth_log_det,
             penalty_term: self.last_penalty_term,
         }
     }
@@ -1356,7 +1393,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         }
         let weights = self.last_weights.clone();
         let mu = self.last_mu.clone();
-        let mut firth_hat_diag: Option<Array1<f64>> = None;
+        let mut firth = FirthDiagnostics::Inactive;
         if self.firth_bias_reduction {
             // IMPORTANT: Firth bias reduction must be computed in the *same basis*
             // as the inner objective being optimized by PIRLS.
@@ -1376,30 +1413,34 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             // when PIRLS is operating directly in the original basis.
             let (hat_diag, half_log_det) = match &self.coordinate_design {
                 WorkingCoordinateDesign::TransformedExplicit {
-                    x_transformed: DesignMatrix::Sparse(_),
-                    x_csr: Some(csr),
-                } => compute_firth_hat_and_half_logdet_sparse(
-                    csr,
-                    weights.view(),
-                    &mut self.workspace,
-                    Some(&self.s_transformed),
-                )?,
-                WorkingCoordinateDesign::TransformedExplicit {
-                    x_transformed: DesignMatrix::Dense(x_dense),
-                    ..
-                } => compute_firth_hat_and_half_logdet(
-                    x_dense.view(),
-                    weights.view(),
-                    &mut self.workspace,
-                    Some(&self.s_transformed),
-                )?,
-                WorkingCoordinateDesign::TransformedExplicit {
-                    x_transformed: DesignMatrix::Sparse(_),
-                    x_csr: None,
+                    x_transformed,
+                    x_csr,
                 } => {
-                    return Err(EstimationError::InvalidInput(
-                        "missing CSR cache for sparse transformed design".to_string(),
-                    ));
+                    if x_transformed.as_sparse().is_some() {
+                        let csr = x_csr.as_ref().ok_or_else(|| {
+                            EstimationError::InvalidInput(
+                                "missing CSR cache for sparse transformed design".to_string(),
+                            )
+                        })?;
+                        compute_firth_hat_and_half_logdet_sparse(
+                            csr,
+                            weights.view(),
+                            &mut self.workspace,
+                            Some(&self.s_transformed),
+                        )?
+                    } else {
+                        let x_dense = x_transformed.as_dense().ok_or_else(|| {
+                            EstimationError::InvalidInput(
+                                "failed to access dense transformed design".to_string(),
+                            )
+                        })?;
+                        compute_firth_hat_and_half_logdet(
+                            x_dense.view(),
+                            weights.view(),
+                            &mut self.workspace,
+                            Some(&self.s_transformed),
+                        )?
+                    }
                 }
                 WorkingCoordinateDesign::OriginalSparseNative
                 | WorkingCoordinateDesign::TransformedImplicit { .. } => {
@@ -1426,16 +1467,16 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     }
                 }
             };
-            self.firth_log_det = Some(half_log_det);
-            firth_hat_diag = Some(hat_diag.clone());
+            firth = FirthDiagnostics::Active {
+                log_det: half_log_det,
+                hat_diag: hat_diag.clone(),
+            };
             for i in 0..self.last_z.len() {
                 let wi = weights[i];
                 if wi > 0.0 {
                     self.last_z[i] += hat_diag[i] * (0.5 - mu[i]) / wi;
                 }
             }
-        } else {
-            self.firth_log_det = None;
         }
 
         let z = &self.last_z;
@@ -1497,8 +1538,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             sparse_hessian,
             deviance,
             penalty_term,
-            firth_log_det: self.firth_log_det,
-            firth_hat_diag,
+            firth,
             ridge_used,
         })
     }
@@ -2802,7 +2842,7 @@ where
     let penalized_objective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
         if options.firth_bias_reduction {
-            if let Some(firth_log_det) = state.firth_log_det {
+            if let Some(firth_log_det) = state.firth_log_det() {
                 // Firth adds +0.5 log|I| to log-likelihood, so deviance is reduced by 2*log_det.
                 value -= 2.0 * firth_log_det;
             }
@@ -3184,11 +3224,8 @@ pub struct PirlsResult {
     // penalized deviance matches the stabilized Hessian.
     pub stable_penalty_term: f64,
 
-    /// Optional Jeffreys prior log-determinant contribution (½ log |H|) when
-    /// Firth bias reduction is active.
-    pub firth_log_det: Option<f64>,
-    /// Optional hat diagonal from the Fisher information (Firth).
-    pub firth_hat_diag: Option<Array1<f64>>,
+    /// Firth diagnostics in the converged PIRLS state.
+    pub firth: FirthDiagnostics,
 
     // The final IRLS weights at convergence
     pub final_weights: Array1<f64>,
@@ -3237,6 +3274,18 @@ pub struct PirlsResult {
     pub coordinate_frame: PirlsCoordinateFrame,
 }
 
+impl PirlsResult {
+    #[inline]
+    pub fn firth_log_det(&self) -> Option<f64> {
+        self.firth.log_det()
+    }
+
+    #[inline]
+    pub fn firth_hat_diag(&self) -> Option<&Array1<f64>> {
+        self.firth.hat_diag()
+    }
+}
+
 fn assemble_pirls_result(
     working_summary: &WorkingModelPirlsResult,
     offset: ArrayView1<'_, f64>,
@@ -3244,7 +3293,6 @@ fn assemble_pirls_result(
     stabilized_hessian_transformed: Array2<f64>,
     edf: f64,
     penalty_term: f64,
-    firth_log_det: Option<f64>,
     final_mu: &Array1<f64>,
     final_weights: &Array1<f64>,
     final_z: &Array1<f64>,
@@ -3273,8 +3321,7 @@ fn assemble_pirls_result(
         deviance: working_summary.state.deviance,
         edf,
         stable_penalty_term: penalty_term,
-        firth_log_det,
-        firth_hat_diag: working_summary.state.firth_hat_diag.clone(),
+        firth: working_summary.state.firth.clone(),
         final_weights: final_weights.clone(),
         final_offset: offset.to_owned(),
         final_eta: final_eta_arr,
@@ -3527,11 +3574,9 @@ pub fn fit_model_for_fixed_rho<'a>(
         .map(|matrix| maybe_sparse_design(matrix));
 
     let x_original = if use_explicit {
-        DesignMatrix::Dense(x.to_owned())
-    } else if let Some(sparse) = x_original_sparse {
-        sparse
+        DesignMatrix::from(x.to_owned())
     } else {
-        DesignMatrix::Dense(x.to_owned())
+        x_original_sparse.unwrap_or_else(|| DesignMatrix::from(x.to_owned()))
     };
 
     let eb_rows = eb.nrows();
@@ -3547,7 +3592,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     );
     solver_decision.log_once();
     if matches!(solver_decision.path, PirlsLinearSolvePath::SparseNative)
-        && let DesignMatrix::Sparse(x_sparse) = &x_original
+        && let Some(x_sparse) = x_original.as_sparse()
     {
         return fit_model_for_fixed_rho_sparse_implicit(
             rho,
@@ -3629,8 +3674,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             sparse_hessian: None,
             deviance,
             penalty_term,
-            firth_log_det: None,
-            firth_hat_diag: None,
+            firth: FirthDiagnostics::Inactive,
             ridge_used,
         };
 
@@ -3669,8 +3713,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             deviance,
             edf,
             stable_penalty_term: penalty_term,
-            firth_log_det: None,
-            firth_hat_diag: None,
+            firth: FirthDiagnostics::Inactive,
             final_weights: prior_weights_owned.clone(),
             final_offset: offset.to_owned(),
             final_eta: final_eta.clone(),
@@ -3796,7 +3839,6 @@ pub fn fit_model_for_fixed_rho<'a>(
         final_dmu_deta,
         final_d2mu_deta2,
         final_d3mu_deta3,
-        firth_log_det,
         penalty_term,
         ..
     } = final_state;
@@ -3877,7 +3919,6 @@ pub fn fit_model_for_fixed_rho<'a>(
         stabilized_hessian_transformed,
         edf,
         penalty_term,
-        firth_log_det,
         &final_mu,
         &final_weights,
         &final_z,
@@ -4139,7 +4180,6 @@ fn fit_model_for_fixed_rho_sparse_implicit(
         final_dmu_deta,
         final_d2mu_deta2,
         final_d3mu_deta3,
-        firth_log_det,
         penalty_term,
         ..
     } = final_state;
@@ -4189,7 +4229,6 @@ fn fit_model_for_fixed_rho_sparse_implicit(
         stabilized_hessian_transformed,
         edf,
         penalty_term,
-        firth_log_det,
         &final_mu,
         &final_weights,
         &final_z,
@@ -4332,15 +4371,10 @@ pub fn run_pirls<'a>(
 
 fn maybe_sparse_design(x: &Array2<f64>) -> DesignMatrix {
     if let Some(sparse) = sparse_from_dense_view(x.view()) {
-        return sparse;
+        sparse
+    } else {
+        DesignMatrix::from(x.clone())
     }
-    let nrows = x.nrows();
-    let ncols = x.ncols();
-    if nrows == 0 || ncols == 0 {
-        return DesignMatrix::Dense(x.clone());
-    }
-
-    DesignMatrix::Dense(x.clone())
 }
 
 #[inline]
