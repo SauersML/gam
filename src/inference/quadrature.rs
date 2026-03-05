@@ -653,7 +653,6 @@ fn symmetric_tridiagonal_eigen(
     (*diag, z)
 }
 
-#[allow(dead_code)]
 fn symmetric_tridiagonal_eigen_dynamic(
     diag: &mut [f64],
     off_diag: &mut [f64],

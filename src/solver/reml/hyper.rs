@@ -352,37 +352,6 @@ impl<'a> RemlState<'a> {
         Ok(psi_grad)
     }
 
-    pub(crate) fn compute_joint_hyper_gradient(
-        &self,
-        theta: &Array1<f64>,
-        rho_dim: usize,
-        hyper_dirs: &[DirectionalHyperParam],
-    ) -> Result<Array1<f64>, EstimationError> {
-        let psi_dim = self.validate_joint_hyper_inputs(theta, rho_dim, hyper_dirs)?;
-        let rho = theta.slice(s![..rho_dim]).to_owned();
-        let psi = theta.slice(s![rho_dim..]).to_owned();
-        let eff_dirs = Self::relinearized_hyper_dirs(hyper_dirs, &psi);
-        let (rho_grad, psi_grad) = if psi_dim > 0 {
-            let pert_state = self.build_joint_perturbed_state(&psi, hyper_dirs)?;
-            let bundle = pert_state.obtain_eval_bundle(&rho)?;
-            (
-                pert_state.compute_gradient_with_bundle(&rho, &bundle)?,
-                pert_state.compute_multi_psi_gradient_with_bundle(&rho, &bundle, &eff_dirs)?,
-            )
-        } else {
-            let bundle = self.obtain_eval_bundle(&rho)?;
-            (
-                self.compute_gradient_with_bundle(&rho, &bundle)?,
-                Array1::<f64>::zeros(0),
-            )
-        };
-        let mut out = Array1::<f64>::zeros(theta.len());
-        out.slice_mut(s![..rho_dim]).assign(&rho_grad);
-        out.slice_mut(s![rho_dim..]).assign(&psi_grad);
-        Ok(out)
-    }
-
-    #[allow(dead_code)]
     pub(crate) fn compute_joint_hyper_cost_gradient(
         &self,
         theta: &Array1<f64>,
@@ -1392,7 +1361,6 @@ impl<'a> RemlState<'a> {
         Ok(h_tt)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn compute_joint_hyper_hessian(
         &self,
         theta: &Array1<f64>,
@@ -1439,7 +1407,6 @@ impl<'a> RemlState<'a> {
         Ok(h)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn compute_joint_hyper_cost_gradient_hessian(
         &self,
         theta: &Array1<f64>,
@@ -1449,16 +1416,6 @@ impl<'a> RemlState<'a> {
         let (cost, grad) = self.compute_joint_hyper_cost_gradient(theta, rho_dim, hyper_dirs)?;
         let hess = self.compute_joint_hyper_hessian(theta, rho_dim, hyper_dirs)?;
         Ok((cost, grad, hess))
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn compute_directional_hyper_gradient(
-        &self,
-        rho: &Array1<f64>,
-        hyper_dir: &DirectionalHyperParam,
-    ) -> Result<f64, EstimationError> {
-        let bundle = self.obtain_eval_bundle(rho)?;
-        self.compute_directional_hyper_gradient_with_bundle(rho, &bundle, hyper_dir)
     }
 
     pub(super) fn compute_directional_hyper_gradient_with_bundle(

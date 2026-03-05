@@ -1654,9 +1654,7 @@ pub fn predict_survival_location_scale_probit_with_uncertainty(
             p_total
         ));
     }
-    if p_w > 0
-        && (fit.beta_link_wiggle.is_none() || input.x_link_wiggle.is_none())
-    {
+    if p_w > 0 && (fit.beta_link_wiggle.is_none() || input.x_link_wiggle.is_none()) {
         return Err(
             "predict_survival_location_scale_probit_with_uncertainty: wiggle covariance provided but wiggle design/beta is partial"
                 .to_string(),
@@ -1685,8 +1683,12 @@ pub fn predict_survival_location_scale_probit_with_uncertainty(
         }
     }
 
-    let eta_t = input.x_threshold.matrix_vector_multiply(&fit.beta_threshold);
-    let eta_ls = input.x_log_sigma.matrix_vector_multiply(&fit.beta_log_sigma);
+    let eta_t = input
+        .x_threshold
+        .matrix_vector_multiply(&fit.beta_threshold);
+    let eta_ls = input
+        .x_log_sigma
+        .matrix_vector_multiply(&fit.beta_log_sigma);
     let (sigma, ds, _, _) =
         bounded_sigma_derivs_up_to_third(eta_ls.view(), input.sigma_min, input.sigma_max);
 

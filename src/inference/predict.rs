@@ -95,49 +95,13 @@ fn quadratic_form_from_jet_mu(
     Ok(acc.max(0.0))
 }
 
-fn linear_predictor_variance(x: &DesignMatrix, cov: &Array2<f64>) -> Array1<f64> {
-    match x {
-        DesignMatrix::Dense(xd) => {
-            let xc = xd.dot(cov);
-            let mut out = Array1::<f64>::zeros(xd.nrows());
-            for i in 0..xd.nrows() {
-                out[i] = xd.row(i).dot(&xc.row(i)).max(0.0);
-            }
-            out
-        }
-        DesignMatrix::Sparse(xs) => {
-            let mut out = Array1::<f64>::zeros(xs.nrows());
-            if let Ok(csr) = xs.as_ref().to_row_major() {
-                let sym = csr.symbolic();
-                let row_ptr = sym.row_ptr();
-                let col_idx = sym.col_idx();
-                let vals = csr.val();
-                for i in 0..xs.nrows() {
-                    let start = row_ptr[i];
-                    let end = row_ptr[i + 1];
-                    let mut acc = 0.0_f64;
-                    for a in start..end {
-                        let j = col_idx[a];
-                        let xij = vals[a];
-                        for b in start..end {
-                            let k = col_idx[b];
-                            let xik = vals[b];
-                            acc += xij * cov[[j, k]] * xik;
-                        }
-                    }
-                    out[i] = acc.max(0.0);
-                }
-            } else {
-                let dense_arc = x.to_dense_arc();
-                let dense = dense_arc.as_ref();
-                let xc = dense.dot(cov);
-                for i in 0..dense.nrows() {
-                    out[i] = dense.row(i).dot(&xc.row(i)).max(0.0);
-                }
-            }
-            out
-        }
-    }
+fn linear_predictor_variance(
+    x: &DesignMatrix,
+    cov: &Array2<f64>,
+) -> Result<Array1<f64>, EstimationError> {
+    x.quadratic_form_diag(cov).map_err(|e| {
+        EstimationError::InvalidInput(format!("failed to compute linear predictor variance: {e}"))
+    })
 }
 
 pub struct PredictResult {
@@ -341,7 +305,7 @@ where
     let mut eta = x.matrix_vector_multiply(&beta.to_owned());
     eta += &offset;
 
-    let eta_var = linear_predictor_variance(&x, &covariance.to_owned());
+    let eta_var = linear_predictor_variance(&x, &covariance.to_owned())?;
     let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
     let quad_ctx = crate::quadrature::QuadratureContext::new();
 
@@ -448,7 +412,7 @@ where
 
     let mut eta = x.matrix_vector_multiply(&beta.to_owned());
     eta += &offset;
-    let eta_var = linear_predictor_variance(&x, &covariance.to_owned());
+    let eta_var = linear_predictor_variance(&x, &covariance.to_owned())?;
     let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
     let quad_ctx = crate::quadrature::QuadratureContext::new();
 
@@ -653,7 +617,7 @@ where
     };
     let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;
 
-    let eta_var = linear_predictor_variance(&x, cov);
+    let eta_var = linear_predictor_variance(&x, cov)?;
     let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
 
     let z = standard_normal_quantile(0.5 + 0.5 * options.confidence_level)
