@@ -939,8 +939,7 @@ impl BasisStorage for SparseStorage {
                         || (BasisEvalScratch::new(degree), vec![0.0; support]),
                         |(scratch, values), (chunk_idx, chunk)| {
                             let base_row = chunk_idx * CHUNK_SIZE;
-                            let mut local =
-                                Vec::with_capacity(chunk.len().saturating_mul(support));
+                            let mut local = Vec::with_capacity(chunk.len().saturating_mul(support));
                             for (i, &x) in chunk.iter().enumerate() {
                                 let row_i = base_row + i;
                                 evaluate_bspline_row_entries(
@@ -4534,7 +4533,8 @@ pub fn create_matern_spline_basis(
     let total_cols = k + poly_cols;
 
     let mut cache_ctx = BasisCacheContext::default();
-    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers, &mut cache_ctx)?;
+    let (data_center_r, center_center_r) =
+        spatial_distance_matrices(data, centers, &mut cache_ctx)?;
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
@@ -5281,7 +5281,8 @@ pub fn create_duchon_spline_basis(
         }
     }
 
-    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers, &mut cache_ctx)?;
+    let (data_center_r, center_center_r) =
+        spatial_distance_matrices(data, centers, &mut cache_ctx)?;
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block

@@ -1205,7 +1205,9 @@ impl<'a> GamWorkingModel<'a> {
         design: &DesignMatrix,
         weights: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
-        design.diag_xt_w_x(weights).map_err(EstimationError::InvalidInput)
+        design
+            .diag_xt_w_x(weights)
+            .map_err(EstimationError::InvalidInput)
     }
 
     fn penalized_hessian(&self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
@@ -1918,7 +1920,10 @@ fn estimate_sparse_native_decision(
         sparse
     } else {
         let dense = x_original.to_dense_arc();
-        return dense_reject("design_not_sparse", dense.iter().filter(|v| v.abs() > 1e-12).count());
+        return dense_reject(
+            "design_not_sparse",
+            dense.iter().filter(|v| v.abs() > 1e-12).count(),
+        );
     };
     let nnz_x = x_sparse.val().len();
     if p < SPARSE_NATIVE_MIN_P {

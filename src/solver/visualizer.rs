@@ -5,22 +5,11 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
 use std::io::{self, IsTerminal, Stdout};
-use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-static VISUALIZER: LazyLock<Mutex<Option<OptimizationVisualizer>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-pub struct VisualizerGuard {
-    active: bool,
-}
-
-impl Drop for VisualizerGuard {
-    fn drop(&mut self) {
-        if self.active {
-            teardown();
-        }
-    }
+#[derive(Default)]
+pub struct VisualizerSession {
+    visualizer: Option<OptimizationVisualizer>,
 }
 
 pub struct OptimizationVisualizer {
