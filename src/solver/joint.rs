@@ -3035,7 +3035,10 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
                 });
             }
 
-            let (cost, grad) = match (reml_state.compute_cost(rho), reml_state.compute_gradient(rho)) {
+            let (cost, grad) = match (
+                reml_state.compute_cost(rho),
+                reml_state.compute_gradient(rho),
+            ) {
                 (Ok(cost), Ok(grad)) if cost.is_finite() && grad.iter().all(|v| v.is_finite()) => {
                     (cost, grad)
                 }

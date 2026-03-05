@@ -1,14 +1,12 @@
-use crate::estimate::{EstimationError, FitResult};
+use crate::estimate::{EstimationError, FitResult, FittedLinkState};
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jet,
     beta_logistic_inverse_link_jet_with_param_partials, mixture_inverse_link_jet,
     mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet,
-    sas_inverse_link_jet_with_param_partials, state_from_beta_logistic_spec, state_from_sas_spec,
-    state_from_spec,
+    sas_inverse_link_jet_with_param_partials,
 };
 use crate::probability::{standard_normal_quantile, try_inverse_link_array};
-use crate::types::MixtureLinkSpec;
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -37,19 +35,15 @@ fn apply_family_inverse_link(
 fn fit_mixture_link_state(
     fit: &FitResult,
 ) -> Result<Option<crate::types::MixtureLinkState>, EstimationError> {
-    let (Some(components), Some(rho)) = (
-        fit.mixture_link_components.as_ref(),
-        fit.mixture_link_rho.as_ref(),
-    ) else {
+    if fit.mixture_link_components.is_none() || fit.mixture_link_rho.is_none() {
         return Ok(None);
-    };
-    let spec = MixtureLinkSpec {
-        components: components.clone(),
-        initial_rho: rho.clone(),
-    };
-    state_from_spec(&spec).map(Some).map_err(|e| {
-        EstimationError::InvalidInput(format!("invalid fitted mixture link state: {e}"))
-    })
+    }
+    match fit.fitted_link_state(crate::types::LikelihoodFamily::BinomialMixture)? {
+        FittedLinkState::Mixture { state, .. } => Ok(Some(state)),
+        _ => Err(EstimationError::InvalidInput(
+            "internal mismatch: expected mixture fitted link state".to_string(),
+        )),
+    }
 }
 
 #[inline]
@@ -418,28 +412,35 @@ where
 
     let mean = match family {
         crate::types::LikelihoodFamily::BinomialSas => {
-            let (epsilon, log_delta) = fit.sas_epsilon.zip(fit.sas_log_delta).ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "predict_gam_posterior_mean_with_fit for BinomialSas requires fitted sas_epsilon/sas_log_delta"
-                        .to_string(),
-                )
-            })?;
+            let state = match fit.fitted_link_state(crate::types::LikelihoodFamily::BinomialSas)? {
+                FittedLinkState::Sas { state, .. } => state,
+                _ => {
+                    return Err(EstimationError::InvalidInput(
+                        "internal mismatch: expected BinomialSas fitted link state".to_string(),
+                    ));
+                }
+            };
             Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
                 crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, se, |x| {
-                    sas_inverse_link_jet(x, epsilon, log_delta).mu
+                    sas_inverse_link_jet(x, state.epsilon, state.log_delta).mu
                 })
             }))
         }
         crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-            let (epsilon, delta) = fit.sas_epsilon.zip(fit.sas_log_delta).ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "predict_gam_posterior_mean_with_fit for BinomialBetaLogistic requires fitted parameters"
-                        .to_string(),
-                )
-            })?;
+            let state = match fit
+                .fitted_link_state(crate::types::LikelihoodFamily::BinomialBetaLogistic)?
+            {
+                FittedLinkState::BetaLogistic { state, .. } => state,
+                _ => {
+                    return Err(EstimationError::InvalidInput(
+                        "internal mismatch: expected BinomialBetaLogistic fitted link state"
+                            .to_string(),
+                    ));
+                }
+            };
             Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
                 crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, se, |x| {
-                    beta_logistic_inverse_link_jet(x, delta, epsilon).mu
+                    beta_logistic_inverse_link_jet(x, state.log_delta, state.epsilon).mu
                 })
             }))
         }
@@ -593,27 +594,22 @@ where
 
     let mut eta = x.matrix_vector_multiply(&beta.to_owned());
     eta += &offset;
-    let mixture_state = fit_mixture_link_state(fit)?;
-    let sas_params = fit.sas_epsilon.zip(fit.sas_log_delta);
-    let link_kind = if let Some(state) = mixture_state.clone() {
-        Some(InverseLink::Mixture(state))
-    } else {
-        sas_params.map(|(epsilon, log_delta)| match family {
-            crate::types::LikelihoodFamily::BinomialBetaLogistic => InverseLink::BetaLogistic(
-                state_from_beta_logistic_spec(crate::types::SasLinkSpec {
-                    initial_epsilon: epsilon,
-                    initial_log_delta: log_delta,
-                })
-                .expect("fit beta-logistic parameters should always reconstruct valid link state"),
-            ),
-            _ => InverseLink::Sas(
-                state_from_sas_spec(crate::types::SasLinkSpec {
-                    initial_epsilon: epsilon,
-                    initial_log_delta: log_delta,
-                })
-                .expect("fit SAS parameters should always reconstruct valid SAS link state"),
-            ),
-        })
+    let fitted_link_state = fit.fitted_link_state(family).ok();
+    let mixture_state = match fitted_link_state.as_ref() {
+        Some(FittedLinkState::Mixture { state, .. }) => Some(state.clone()),
+        _ => None,
+    };
+    let sas_state = match fitted_link_state.as_ref() {
+        Some(FittedLinkState::Sas { state, .. })
+        | Some(FittedLinkState::BetaLogistic { state, .. }) => Some(*state),
+        _ => None,
+    };
+    let link_kind = match fitted_link_state {
+        Some(FittedLinkState::Standard(link)) => Some(InverseLink::Standard(link)),
+        Some(FittedLinkState::Sas { state, .. }) => Some(InverseLink::Sas(state)),
+        Some(FittedLinkState::BetaLogistic { state, .. }) => Some(InverseLink::BetaLogistic(state)),
+        Some(FittedLinkState::Mixture { state, .. }) => Some(InverseLink::Mixture(state)),
+        None => None,
     };
     let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;
 
@@ -678,7 +674,7 @@ where
                 v.max(0.0)
             }
             crate::types::LikelihoodFamily::BinomialSas => {
-                let (epsilon, log_delta) = sas_params.ok_or_else(|| {
+                let sas = sas_state.ok_or_else(|| {
                     EstimationError::InvalidInput(
                         "BinomialSas uncertainty requires fitted sas_epsilon/sas_log_delta"
                             .to_string(),
@@ -689,14 +685,14 @@ where
                     eta[i],
                     se_i,
                     |x| {
-                        let p = sas_inverse_link_jet(x, epsilon, log_delta).mu;
+                        let p = sas_inverse_link_jet(x, sas.epsilon, sas.log_delta).mu;
                         (p, p * p)
                     },
                 );
                 (m2 - m1 * m1).max(0.0)
             }
             crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-                let (epsilon, delta) = sas_params.ok_or_else(|| {
+                let sas = sas_state.ok_or_else(|| {
                     EstimationError::InvalidInput(
                         "BinomialBetaLogistic uncertainty requires fitted parameters".to_string(),
                     )
@@ -706,7 +702,7 @@ where
                     eta[i],
                     se_i,
                     |x| {
-                        let p = beta_logistic_inverse_link_jet(x, delta, epsilon).mu;
+                        let p = beta_logistic_inverse_link_jet(x, sas.log_delta, sas.epsilon).mu;
                         (p, p * p)
                     },
                 );
@@ -735,24 +731,28 @@ where
         if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
             && let Some(cov_theta) = fit.sas_param_covariance.as_ref()
         {
-            let (epsilon, log_delta) = sas_params.ok_or_else(|| {
+            let sas = sas_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "BinomialSas uncertainty requires fitted sas_epsilon/sas_log_delta".to_string(),
                 )
             })?;
-            let jets = sas_inverse_link_jet_with_param_partials(eta[i], epsilon, log_delta);
+            let jets = sas_inverse_link_jet_with_param_partials(eta[i], sas.epsilon, sas.log_delta);
             let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
             mean_var += quadratic_form(cov_theta, &g)?;
         }
         if matches!(family, crate::types::LikelihoodFamily::BinomialBetaLogistic)
             && let Some(cov_theta) = fit.sas_param_covariance.as_ref()
         {
-            let (epsilon, delta) = sas_params.ok_or_else(|| {
+            let sas = sas_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "BinomialBetaLogistic uncertainty requires fitted parameters".to_string(),
                 )
             })?;
-            let jets = beta_logistic_inverse_link_jet_with_param_partials(eta[i], delta, epsilon);
+            let jets = beta_logistic_inverse_link_jet_with_param_partials(
+                eta[i],
+                sas.log_delta,
+                sas.epsilon,
+            );
             let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
             mean_var += quadratic_form(cov_theta, &g)?;
         }

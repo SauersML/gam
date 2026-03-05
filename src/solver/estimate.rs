@@ -42,7 +42,8 @@ use crate::mixture_link::{
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::types::{
-    Coefficients, InverseLink, LinkComponent, LinkFunction, LogSmoothingParamsView, RidgePassport,
+    Coefficients, InverseLink, LinkComponent, LinkFunction, LogSmoothingParamsView,
+    MixtureLinkState, RidgePassport, SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -2226,6 +2227,109 @@ pub struct FitResult {
     pub sas_delta: Option<f64>,
     /// Approximate covariance of SAS params (epsilon, log_delta), shape 2x2.
     pub sas_param_covariance: Option<Array2<f64>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum FittedLinkState {
+    Standard(LinkFunction),
+    Sas {
+        state: SasLinkState,
+        covariance: Option<Array2<f64>>,
+    },
+    BetaLogistic {
+        state: SasLinkState,
+        covariance: Option<Array2<f64>>,
+    },
+    Mixture {
+        state: MixtureLinkState,
+        covariance: Option<Array2<f64>>,
+    },
+}
+
+impl FitResult {
+    pub fn fitted_link_state(
+        &self,
+        family: crate::types::LikelihoodFamily,
+    ) -> Result<FittedLinkState, EstimationError> {
+        let require_sas_state = |label: &str| -> Result<SasLinkState, EstimationError> {
+            let (epsilon, log_delta) =
+                self.sas_epsilon.zip(self.sas_log_delta).ok_or_else(|| {
+                    EstimationError::InvalidInput(format!(
+                        "{label} requires fitted sas_epsilon/sas_log_delta"
+                    ))
+                })?;
+            state_from_sas_spec(SasLinkSpec {
+                initial_epsilon: epsilon,
+                initial_log_delta: log_delta,
+            })
+            .map_err(|e| EstimationError::InvalidInput(format!("invalid fitted SAS state: {e}")))
+        };
+        let require_beta_logistic_state = |label: &str| -> Result<SasLinkState, EstimationError> {
+            let (epsilon, log_delta) =
+                self.sas_epsilon.zip(self.sas_log_delta).ok_or_else(|| {
+                    EstimationError::InvalidInput(format!(
+                        "{label} requires fitted sas_epsilon/sas_log_delta"
+                    ))
+                })?;
+            state_from_beta_logistic_spec(SasLinkSpec {
+                initial_epsilon: epsilon,
+                initial_log_delta: log_delta,
+            })
+            .map_err(|e| {
+                EstimationError::InvalidInput(format!("invalid fitted Beta-Logistic state: {e}"))
+            })
+        };
+        let require_mixture_state = |label: &str| -> Result<MixtureLinkState, EstimationError> {
+            let (components, rho) = (
+                self.mixture_link_components.as_ref(),
+                self.mixture_link_rho.as_ref(),
+            );
+            let (Some(components), Some(rho)) = (components, rho) else {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{label} requires fitted mixture_link_components/mixture_link_rho"
+                )));
+            };
+            state_from_spec(&MixtureLinkSpec {
+                components: components.clone(),
+                initial_rho: rho.clone(),
+            })
+            .map_err(|e| {
+                EstimationError::InvalidInput(format!("invalid fitted mixture link state: {e}"))
+            })
+        };
+
+        match family {
+            crate::types::LikelihoodFamily::GaussianIdentity => {
+                Ok(FittedLinkState::Standard(LinkFunction::Identity))
+            }
+            crate::types::LikelihoodFamily::BinomialLogit => {
+                Ok(FittedLinkState::Standard(LinkFunction::Logit))
+            }
+            crate::types::LikelihoodFamily::BinomialProbit => {
+                Ok(FittedLinkState::Standard(LinkFunction::Probit))
+            }
+            crate::types::LikelihoodFamily::BinomialCLogLog => {
+                Ok(FittedLinkState::Standard(LinkFunction::CLogLog))
+            }
+            crate::types::LikelihoodFamily::BinomialSas => Ok(FittedLinkState::Sas {
+                state: require_sas_state("BinomialSas")?,
+                covariance: self.sas_param_covariance.clone(),
+            }),
+            crate::types::LikelihoodFamily::BinomialBetaLogistic => {
+                Ok(FittedLinkState::BetaLogistic {
+                    state: require_beta_logistic_state("BinomialBetaLogistic")?,
+                    covariance: self.sas_param_covariance.clone(),
+                })
+            }
+            crate::types::LikelihoodFamily::BinomialMixture => Ok(FittedLinkState::Mixture {
+                state: require_mixture_state("BinomialMixture")?,
+                covariance: self.mixture_link_param_covariance.clone(),
+            }),
+            crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
+                "fitted_link_state is not defined for RoystonParmar".to_string(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

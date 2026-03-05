@@ -1702,22 +1702,19 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
                             j_kl += &a_terms[k];
                         }
                         let tr_second = trace_product(&h_inv, &j_kl);
-                        let tr_p = 0.5
-                            * trace_jinv_a_jinv_b(
-                                s_pinv_joint
-                                    .as_ref()
-                                    .ok_or_else(|| "missing joint S^+ for REML Hessian".to_string())?,
+                        let tr_p =
+                            0.5 * trace_jinv_a_jinv_b(
+                                s_pinv_joint.as_ref().ok_or_else(|| {
+                                    "missing joint S^+ for REML Hessian".to_string()
+                                })?,
                                 &a_terms[l],
                                 &a_terms[k],
-                            )
-                            - 0.5
+                            ) - 0.5
                                 * delta_kl
                                 * trace_product(
-                                    s_pinv_joint
-                                        .as_ref()
-                                        .ok_or_else(|| {
-                                            "missing joint S^+ for REML Hessian".to_string()
-                                        })?,
+                                    s_pinv_joint.as_ref().ok_or_else(|| {
+                                        "missing joint S^+ for REML Hessian".to_string()
+                                    })?,
                                     &a_terms[k],
                                 );
                         v_kl += 0.5 * (-tr_prod + tr_second) + tr_p;
@@ -1819,7 +1816,7 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
             let a_k = s_k.mapv(|v| lambdas[k] * v);
             let a_k_beta = a_k.dot(beta);
             let g_pen = 0.5 * beta.dot(&a_k_beta);
-                let g = if options.use_reml_objective {
+            let g = if options.use_reml_objective {
                 // Here H is per-block penalized likelihood curvature:
                 //   H = -∇^2_{beta_b} ell + S_lambda.
                 // For each smoothing coordinate in this block:
@@ -1949,8 +1946,15 @@ fn outer_objective_and_gradient<F: CustomFamily>(
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
 ) -> Result<(f64, Array1<f64>, ConstrainedWarmStart), String> {
-    let (obj, grad, _hess, warm) =
-        outer_objective_gradient_hessian(family, specs, options, penalty_counts, rho, warm_start, false)?;
+    let (obj, grad, _hess, warm) = outer_objective_gradient_hessian(
+        family,
+        specs,
+        options,
+        penalty_counts,
+        rho,
+        warm_start,
+        false,
+    )?;
     Ok((obj, grad, warm))
 }
 
@@ -3306,7 +3310,10 @@ mod tests {
         for i in 0..h0.nrows() {
             for j in 0..i {
                 let asym = (h0[[i, j]] - h0[[j, i]]).abs();
-                assert!(asym < 1e-8, "outer Hessian not symmetric at ({i},{j}): {asym}");
+                assert!(
+                    asym < 1e-8,
+                    "outer Hessian not symmetric at ({i},{j}): {asym}"
+                );
             }
         }
         let _ = g0;

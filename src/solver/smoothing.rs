@@ -3,8 +3,8 @@ use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 use wolfe_bfgs::{
-    Arc as ArcOptimizer, ArcError, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, ObjectiveRequest,
-    ObjectiveSample,
+    Arc as ArcOptimizer, ArcError, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError,
+    ObjectiveRequest, ObjectiveSample,
 };
 
 #[derive(Clone, Debug)]
@@ -604,7 +604,8 @@ where
     let mut candidates: Vec<(usize, SmoothingBfgsResult)> = screened_seeds
         .into_par_iter()
         .filter_map(|(seed_idx, rho_seed)| {
-            let res = run_single_seed_trust_region_parallel(&rho_seed, eval_cost_grad_rho, options)?;
+            let res =
+                run_single_seed_trust_region_parallel(&rho_seed, eval_cost_grad_rho, options)?;
             Some((seed_idx, res))
         })
         .collect();
