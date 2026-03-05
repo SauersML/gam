@@ -2362,38 +2362,23 @@ def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial
                 test_pred_df[ds["time_col"]] = horizon
                 train_df.to_csv(train_path, index=False)
                 test_pred_df.to_csv(test_path, index=False)
-                formula = _rust_survival_formula_for_scenario(scenario_name, feature_cols=fit_feature_cols)
-                fit_cfg = _rust_survival_fit_options_for_scenario(scenario_name)
+                rhs_formula = _rust_survival_formula_for_scenario(
+                    scenario_name, feature_cols=fit_feature_cols
+                )
+                fit_formula = (
+                    f"Surv(__entry, {ds['time_col']}, {ds['event_col']}) ~ {rhs_formula}"
+                )
                 fit_cmd = [
                     str(rust_bin),
-                    "survival",
-                    str(train_path),
-                    "--entry",
-                    "__entry",
-                    "--exit",
-                    ds["time_col"],
-                    "--event",
-                    ds["event_col"],
+                    "fit",
+                    "--family",
+                    "royston-parmar",
                     "--formula",
-                    formula,
-                    "--ridge-lambda",
-                    str(fit_cfg["ridge_lambda"]),
-                    "--time-basis",
-                    fit_cfg["time_basis"],
+                    fit_formula,
                     "--out",
                     str(model_path),
+                    str(train_path),
                 ]
-                if fit_cfg["time_basis"] == "bspline":
-                    fit_cmd.extend(
-                        [
-                            "--time-degree",
-                            str(int(fit_cfg["time_degree"])),
-                            "--time-num-internal-knots",
-                            str(int(fit_cfg["time_num_internal_knots"])),
-                            "--time-smooth-lambda",
-                            str(float(fit_cfg["time_smooth_lambda"])),
-                        ]
-                    )
             else:
                 train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
                 train_df.to_csv(train_path, index=False)
@@ -2837,28 +2822,24 @@ def run_rust_gamlss_survival_cv(scenario):
             train_df.to_csv(train_path, index=False)
             test_pred_df.to_csv(test_path, index=False)
 
-            formula = _rust_survival_formula_for_scenario(scenario_name, feature_cols=fit_feature_cols)
-            fit_cfg = _rust_survival_fit_options_for_scenario(scenario_name)
+            rhs_formula = _rust_survival_formula_for_scenario(
+                scenario_name, feature_cols=fit_feature_cols
+            )
+            fit_formula = (
+                f"Surv(__entry, {ds['time_col']}, {ds['event_col']}) ~ {rhs_formula}"
+            )
 
             fit_cmd = [
                 str(rust_bin),
-                "survival",
+                "fit",
+                "--family",
+                "royston-parmar",
+                "--formula",
+                fit_formula,
+                "--out",
+                str(model_path),
                 str(train_path),
-                "--entry", "__entry",
-                "--exit", ds["time_col"],
-                "--event", ds["event_col"],
-                "--formula", formula,
-                "--ridge-lambda", str(fit_cfg["ridge_lambda"]),
-                "--time-basis", fit_cfg["time_basis"],
-                "--survival-likelihood", "probit-location-scale",
-                "--out", str(model_path),
             ]
-            if fit_cfg["time_basis"] == "bspline":
-                fit_cmd.extend([
-                    "--time-degree", str(int(fit_cfg["time_degree"])),
-                    "--time-num-internal-knots", str(int(fit_cfg["time_num_internal_knots"])),
-                    "--time-smooth-lambda", str(float(fit_cfg["time_smooth_lambda"])),
-                ])
 
             t0 = perf_counter()
             code, out, err = run_cmd(fit_cmd, cwd=ROOT)

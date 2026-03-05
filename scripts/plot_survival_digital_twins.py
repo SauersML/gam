@@ -315,105 +315,32 @@ def _zscore_by_train(df: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.Data
 def _fit_survival_model(
     rust_bin: Path,
     ds: SurvivalDataset,
-    train_df: pd.DataFrame,
+    train_df: Path,
     model_path: Path,
     likelihood: str,
 ) -> None:
+    fit_formula = f"Surv(__entry, {ds.time_col}, {ds.event_col}) ~ {ds.formula}"
+    fit_args = [
+        str(rust_bin),
+        "fit",
+        "--family",
+        "royston-parmar",
+        "--formula",
+        fit_formula,
+        "--out",
+        str(model_path),
+        str(train_df),
+    ]
+
     if likelihood == "transformation":
-        args = [
-            str(rust_bin),
-            "survival",
-            str(train_df),
-            "--entry",
-            "__entry",
-            "--exit",
-            ds.time_col,
-            "--event",
-            ds.event_col,
-            "--formula",
-            ds.formula,
-            "--survival-likelihood",
-            "transformation",
-            "--baseline-target",
-            "linear",
-            "--time-basis",
-            ds.fit_opts["time_basis"],
-            "--ridge-lambda",
-            ds.fit_opts["ridge_lambda"],
-            "--out",
-            str(model_path),
-        ]
-        if ds.fit_opts["time_basis"] == "bspline":
-            args.extend(
-                [
-                    "--time-degree",
-                    ds.fit_opts["time_degree"],
-                    "--time-num-internal-knots",
-                    ds.fit_opts["time_num_internal_knots"],
-                    "--time-smooth-lambda",
-                    ds.fit_opts["time_smooth_lambda"],
-                ]
-            )
-        _run_cmd(args, cwd=ROOT)
+        _run_cmd(fit_args, cwd=ROOT)
         return
 
     if likelihood != "probit-location-scale":
         raise RuntimeError(f"unsupported likelihood mode: {likelihood}")
-
-    tried: list[str] = []
-    attempts: list[dict[str, str]] = []
-    attempts.append(dict(ds.fit_opts))
-    if ds.fit_opts.get("time_basis") != "linear":
-        attempts.append({"time_basis": "linear", "ridge_lambda": ds.fit_opts.get("ridge_lambda", "1e-4")})
-    attempts.append({"time_basis": "linear", "ridge_lambda": "1e-4"})
-    attempts.append({"time_basis": "linear", "ridge_lambda": "1e-3"})
-
-    for opt in attempts:
-        args = [
-            str(rust_bin),
-            "survival",
-            str(train_df),
-            "--entry",
-            "__entry",
-            "--exit",
-            ds.time_col,
-            "--event",
-            ds.event_col,
-            "--formula",
-            ds.formula,
-            "--survival-likelihood",
-            "probit-location-scale",
-            "--survival-distribution",
-            "gaussian",
-            "--baseline-target",
-            "linear",
-            "--time-basis",
-            opt["time_basis"],
-            "--ridge-lambda",
-            opt["ridge_lambda"],
-            "--out",
-            str(model_path),
-        ]
-        if opt["time_basis"] == "bspline":
-            args.extend(
-                [
-                    "--time-degree",
-                    opt.get("time_degree", "3"),
-                    "--time-num-internal-knots",
-                    opt.get("time_num_internal_knots", "8"),
-                    "--time-smooth-lambda",
-                    opt.get("time_smooth_lambda", "1e-2"),
-                ]
-            )
-        try:
-            _run_cmd(args, cwd=ROOT)
-            return
-        except RuntimeError as e:
-            tried.append(f"time_basis={opt['time_basis']}, ridge={opt['ridge_lambda']}: {e}")
-
-    raise RuntimeError(
-        "all probit-location-scale survival fit attempts failed:\n" + "\n".join(tried)
-    )
+    # The dedicated `gam survival` subcommand was removed; fitting via
+    # `gam fit` + `Surv(...)` currently routes through transformation survival.
+    _run_cmd(fit_args, cwd=ROOT)
 
 
 def _predict_survival_curve(

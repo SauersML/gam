@@ -4749,6 +4749,9 @@ fn core_saved_fit_result(
     reml_score: f64,
 ) -> FitResult {
     let p = beta.len();
+    // JSON encodes non-finite floats (NaN/inf) as null, which then fails
+    // deserialization for required f64 fields during predict/report/sample.
+    let reml_score = if reml_score.is_finite() { reml_score } else { 0.0 };
     FitResult {
         beta,
         lambdas,
@@ -4756,9 +4759,9 @@ fn core_saved_fit_result(
         edf_by_block: Vec::new(),
         edf_total: 0.0,
         iterations: 0,
-        final_grad_norm: f64::NAN,
+        final_grad_norm: 0.0,
         pirls_status: gam::pirls::PirlsStatus::Converged,
-        deviance: f64::NAN,
+        deviance: 0.0,
         stable_penalty_term: 0.0,
         max_abs_eta: 0.0,
         constraint_kkt: None,
@@ -7162,10 +7165,11 @@ mod tests {
     use super::{
         BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, LikelihoodFamily, MODEL_VERSION,
         ParsedTerm, SavedModel, SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
-        chi_square_survival_approx, compute_probit_q0_from_eta, parse_duchon_order,
-        parse_duchon_power, parse_formula, parse_surv_response, parse_survival_time_basis_config,
-        pretty_family_name, saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design,
-        summarize_wiggle_domain, survival_probability_from_eta, write_survival_prediction_csv,
+        chi_square_survival_approx, compute_probit_q0_from_eta, core_saved_fit_result,
+        parse_duchon_order, parse_duchon_power, parse_formula, parse_surv_response,
+        parse_survival_time_basis_config, pretty_family_name, saved_probit_wiggle_derivative_q0,
+        saved_probit_wiggle_design, summarize_wiggle_domain, survival_probability_from_eta,
+        write_survival_prediction_csv,
     };
     use csv::StringRecord;
     use gam::basis::{BasisOptions, Dense, DuchonNullspaceOrder, KnotSource, create_basis};
@@ -7273,6 +7277,24 @@ mod tests {
             pretty_family_name(LikelihoodFamily::GaussianIdentity),
             "Gaussian Identity"
         );
+    }
+
+    #[test]
+    fn core_saved_fit_result_json_roundtrips_with_non_finite_input() {
+        let fit = core_saved_fit_result(
+            Array1::from_vec(vec![0.1, -0.2]),
+            Array1::from_vec(vec![1e-3]),
+            1.0,
+            None,
+            None,
+            f64::NAN,
+        );
+        let payload = serde_json::to_string(&fit).expect("serialize fit result");
+        let parsed: gam::estimate::FitResult =
+            serde_json::from_str(&payload).expect("deserialize fit result");
+        assert_eq!(parsed.final_grad_norm, 0.0);
+        assert_eq!(parsed.deviance, 0.0);
+        assert_eq!(parsed.reml_score, 0.0);
     }
 
     #[test]
