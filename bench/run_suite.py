@@ -1731,17 +1731,41 @@ def _geo_subpop16_dataset(seed=20260330, prevalence_min=0.02, prevalence_max=0.4
     if d.empty:
         raise RuntimeError("hgdp_1kg_pc_data.tsv has no complete rows for Subpopulation + PC1..PC16")
 
-    centroids = d.groupby("Subpopulation", dropna=False)[pc_cols].mean(numeric_only=True).reset_index()
-    if len(centroids) < 2:
-        raise RuntimeError("need at least two subpopulations for centroid ordering")
-    x = centroids[pc_cols].to_numpy(dtype=float)
-    order_idx = _best_1d_order(_pairwise_dist(x))
-    ordered_subpops = centroids.iloc[order_idx]["Subpopulation"].astype(str).tolist()
+    subpops = sorted(d["Subpopulation"].unique().tolist())
+    if len(subpops) < 2:
+        raise RuntimeError("need at least two subpopulations for prevalence simulation")
 
-    base_prev = np.linspace(float(prevalence_min), float(prevalence_max), len(ordered_subpops))
-    prevalence_map = dict(zip(ordered_subpops, base_prev))
-    d["baseline_prevalence"] = d["Subpopulation"].map(prevalence_map).astype(float)
-    d["y"] = (rng.random(len(d)) < d["baseline_prevalence"].to_numpy(dtype=float)).astype(float)
+    # No broad trend: each subpopulation gets an independent mean prevalence.
+    prevalence_map = {
+        sp: float(rng.uniform(float(prevalence_min), float(prevalence_max))) for sp in subpops
+    }
+    base_prev = d["Subpopulation"].map(prevalence_map).to_numpy(dtype=float)
+    base_prev = np.clip(base_prev, 1e-5, 1.0 - 1e-5)
+    base_eta = np.log(base_prev / (1.0 - base_prev))
+
+    # One noise model per subpopulation; each row inherits its subpopulation's model.
+    noise_types = ["gaussian", "laplace", "student_t"]
+    subpop_noise_kind = {sp: str(rng.choice(noise_types)) for sp in subpops}
+    subpop_noise_scale = {sp: float(rng.uniform(0.25, 0.85)) for sp in subpops}
+    noise_kind = d["Subpopulation"].map(subpop_noise_kind).astype(str).to_numpy()
+    noise_scale = d["Subpopulation"].map(subpop_noise_scale).to_numpy(dtype=float)
+
+    noise = np.zeros(len(d), dtype=float)
+    for kind in noise_types:
+        idx = np.where(noise_kind == kind)[0]
+        if idx.size == 0:
+            continue
+        s = noise_scale[idx]
+        if kind == "gaussian":
+            noise[idx] = rng.normal(0.0, s)
+        elif kind == "laplace":
+            noise[idx] = rng.laplace(0.0, s)
+        else:
+            noise[idx] = rng.standard_t(df=4, size=idx.size) * s
+
+    eta = base_eta + noise
+    p = 1.0 / (1.0 + np.exp(-eta))
+    d["y"] = (rng.random(len(d)) < p).astype(float)
 
     rows = []
     for _, row in d.iterrows():
