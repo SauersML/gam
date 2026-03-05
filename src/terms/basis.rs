@@ -2898,25 +2898,12 @@ fn matern_kernel_radial_triplet_with_safe_ratio(
         ));
     }
 
-    // Full derivation used by collocation operators
-    // ----------------------------------------------
-    // Half-integer Matérn kernels admit polynomial-exponential form:
-    //   phi(r) = P_nu(a) * exp(-a),  a = s r,  s = sqrt(2 nu) / length_scale.
-    //
-    // Differentiate in a and chain (da/dr = s, constant):
-    //   phi'(r)  = s   exp(-a) * (P' - P),
-    //   phi''(r) = s^2 exp(-a) * (P'' - 2P' + P).
-    //
-    // For Laplacian we need a stable phi'(r)/r term:
-    //   Delta phi = phi'' + (d-1) * phi'(r)/r.
-    //
-    // We therefore use algebraically-cancelled closed forms for phi'(r)/r:
-    // - nu >= 3/2: finite limit at r -> 0.
-    // - nu  = 1/2: phi'(r)/r ~ -kappa/r diverges, so we evaluate at a tiny
-    //   positive radius floor to avoid NaN/Inf in dense operator assembly.
-    //
-    // This keeps D1, D2 finite and deterministic while preserving analytic
-    // derivatives away from the singular point.
+    // Full derivation used by collocation operators:
+    //   phi(r) = P_nu(a) exp(-a), a=sr, s=sqrt(2nu)/length_scale.
+    // For nu>=3/2 we use closed-form phi'(r)/r polynomials with finite r->0 limit.
+    // For nu=1/2:
+    //   phi'(r)/r = -kappa exp(-kappa r)/r,
+    // which is genuinely singular at r=0 and must not be regularized here.
     // Closed forms used below (a = s r, E = exp(-a)):
     // nu=1/2:
     //   phi'    = -s E
@@ -2941,13 +2928,17 @@ fn matern_kernel_radial_triplet_with_safe_ratio(
     let (phi, phi_r, phi_rr, phi_r_over_r) = match nu {
         MaternNu::Half => {
             let s = 1.0 / length_scale;
-            let r_eval = r.max(1e-8 * length_scale.max(1e-8));
-            let a_eval = s * r_eval;
-            let e_eval = (-a_eval).exp();
-            let phi = if r > 0.0 { (-s * r).exp() } else { 1.0 };
-            let phi_r = -s * e_eval;
-            let phi_rr = s * s * e_eval;
-            let ratio = -s * e_eval / r_eval;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = e;
+            let phi_r = -s * e;
+            let phi_rr = s * s * e;
+            if r == 0.0 {
+                return Err(BasisError::InvalidInput(
+                    "Matérn nu=1/2 has singular phi'(r)/r at r=0".to_string(),
+                ));
+            }
+            let ratio = phi_r / r;
             (phi, phi_r, phi_rr, ratio)
         }
         MaternNu::ThreeHalves => {
@@ -3257,6 +3248,7 @@ fn operator_penalty_candidates_from_collocation(
 
 pub fn build_matern_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
+    collocation_weights: Option<ArrayView1<'_, f64>>,
     length_scale: f64,
     nu: MaternNu,
     include_intercept: bool,
@@ -3268,11 +3260,32 @@ pub fn build_matern_collocation_operator_matrices(
     // - exact Laplacian identity: Δphi = phi'' + (d-1) phi'/r.
     let p = centers.nrows();
     let d = centers.ncols();
+    let row_scales = if let Some(w) = collocation_weights {
+        if w.len() != p {
+            return Err(BasisError::DimensionMismatch(format!(
+                "collocation weight length mismatch: got {}, expected {p}",
+                w.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(p);
+        for &wk in w {
+            if !wk.is_finite() || wk < 0.0 {
+                return Err(BasisError::InvalidInput(format!(
+                    "collocation weights must be finite and non-negative; got {wk}"
+                )));
+            }
+            out.push(wk.sqrt());
+        }
+        out
+    } else {
+        vec![1.0; p]
+    };
     let mut d0_raw = Array2::<f64>::zeros((p, p));
     let mut d1_raw = Array2::<f64>::zeros((p * d, p));
     let mut d2_raw = Array2::<f64>::zeros((p, p));
     const R_EPS: f64 = 1e-12;
     for k in 0..p {
+        let scale_k = row_scales[k];
         for j in 0..p {
             let mut dist2 = 0.0;
             for c in 0..d {
@@ -3280,13 +3293,25 @@ pub fn build_matern_collocation_operator_matrices(
                 dist2 += delta * delta;
             }
             let r = dist2.sqrt();
+            if matches!(nu, MaternNu::Half) && r <= R_EPS && d > 1 {
+                return Err(BasisError::InvalidInput(
+                    "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers".to_string(),
+                ));
+            }
             let (phi, _phi_r, phi_rr, phi_r_over_r) =
-                matern_kernel_radial_triplet_with_safe_ratio(r, length_scale, nu)?;
-            d0_raw[[k, j]] = phi;
+                if matches!(nu, MaternNu::Half) && r <= R_EPS && d == 1 {
+                    // In 1D: Delta phi = phi'' and the singular phi'/r term is absent.
+                    let s = 1.0 / length_scale;
+                    let e = 1.0;
+                    (e, -s * e, s * s * e, 0.0)
+                } else {
+                    matern_kernel_radial_triplet_with_safe_ratio(r, length_scale, nu)?
+                };
+            d0_raw[[k, j]] = scale_k * phi;
             if r > R_EPS {
                 for c in 0..d {
                     let delta = centers[[k, c]] - centers[[j, c]];
-                    d1_raw[[k * d + c, j]] = phi_r_over_r * delta;
+                    d1_raw[[k * d + c, j]] = scale_k * phi_r_over_r * delta;
                 }
             } else {
                 // Symmetry at center-center coincidence.
@@ -3294,7 +3319,7 @@ pub fn build_matern_collocation_operator_matrices(
                     d1_raw[[k * d + c, j]] = 0.0;
                 }
             }
-            d2_raw[[k, j]] = phi_rr + ((d as f64 - 1.0) * phi_r_over_r);
+            d2_raw[[k, j]] = scale_k * (phi_rr + ((d as f64 - 1.0) * phi_r_over_r));
             if !d0_raw[[k, j]].is_finite() || !d2_raw[[k, j]].is_finite() {
                 return Err(BasisError::InvalidInput(format!(
                     "non-finite Matérn collocation operator entry at row={k}, col={j}, r={r}, nu={nu:?}"
@@ -3335,6 +3360,7 @@ pub fn build_matern_collocation_operator_matrices(
 
 pub fn build_duchon_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
+    collocation_weights: Option<ArrayView1<'_, f64>>,
     length_scale: f64,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
@@ -3344,7 +3370,7 @@ pub fn build_duchon_collocation_operator_matrices(
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     let z = cached_kernel_constraint_nullspace(centers, nullspace_order)?;
     let (d0_raw, d1_raw, d2_raw) =
-        build_collocation_operators_from_radial(centers, centers, None, |r| {
+        build_collocation_operators_from_radial(centers, centers, collocation_weights, |r| {
             duchon_kernel_radial_triplet(
                 r,
                 length_scale,
@@ -4435,6 +4461,7 @@ fn build_matern_operator_penalty_candidates(
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let ops = build_matern_collocation_operator_matrices(
         centers,
+        None,
         length_scale,
         nu,
         include_intercept,
@@ -4451,8 +4478,13 @@ fn build_duchon_operator_penalty_candidates(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
-    let ops =
-        build_duchon_collocation_operator_matrices(centers, length_scale, power, nullspace_order)?;
+    let ops = build_duchon_collocation_operator_matrices(
+        centers,
+        None,
+        length_scale,
+        power,
+        nullspace_order,
+    )?;
     Ok(operator_penalty_candidates_from_collocation(
         &ops.d0, &ops.d1, &ops.d2,
     ))
@@ -4641,39 +4673,502 @@ pub fn build_matern_basis(
     })
 }
 
+#[inline(always)]
+fn eval_poly_with_derivatives(coeffs: &[f64], a: f64) -> (f64, f64, f64) {
+    let mut p = 0.0;
+    let mut p1 = 0.0;
+    let mut p2 = 0.0;
+    for (i, &c) in coeffs.iter().enumerate() {
+        p += c * a.powi(i as i32);
+        if i >= 1 {
+            p1 += (i as f64) * c * a.powi((i - 1) as i32);
+        }
+        if i >= 2 {
+            p2 += (i as f64) * ((i - 1) as f64) * c * a.powi((i - 2) as i32);
+        }
+    }
+    (p, p1, p2)
+}
+
+#[inline(always)]
+fn matern_value_psi_triplet(
+    r: f64,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<(f64, f64, f64), BasisError> {
+    // Exact value + hyper-derivatives for psi = log(kappa)
+    // ----------------------------------------------------
+    // Half-integer Matérn kernels are represented as:
+    //   phi(r) = p(a) * exp(-a),
+    //   a = s r,   s = sqrt(2 nu) * kappa,   kappa = 1/length_scale.
+    //
+    // Differentiating with respect to a:
+    //   d/da [p(a)e^{-a}]       = (p' - p)e^{-a}
+    //   d^2/da^2 [p(a)e^{-a}]   = (p'' - 2p' + p)e^{-a}.
+    //
+    // We need derivatives w.r.t. psi=log(kappa), not r:
+    //   da/dpsi = a,
+    // therefore
+    //   phi_psi      = a * (dphi/da)
+    //   phi_psi_psi  = a*(dphi/da) + a^2*(d^2phi/da^2).
+    //
+    // This path is fully analytic and avoids FD in the hyper-derivative chain.
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn kernel distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn length_scale must be finite and positive".to_string(),
+        ));
+    }
+
+    let kappa = 1.0 / length_scale;
+    let (s, p): (f64, &[f64]) = match nu {
+        MaternNu::Half => (kappa, &[1.0]),
+        MaternNu::ThreeHalves => (3.0_f64.sqrt() * kappa, &[1.0, 1.0]),
+        MaternNu::FiveHalves => (5.0_f64.sqrt() * kappa, &[1.0, 1.0, 1.0 / 3.0]),
+        MaternNu::SevenHalves => (7.0_f64.sqrt() * kappa, &[1.0, 1.0, 2.0 / 5.0, 1.0 / 15.0]),
+        MaternNu::NineHalves => (
+            9.0_f64.sqrt() * kappa,
+            &[1.0, 1.0, 3.0 / 7.0, 2.0 / 21.0, 1.0 / 105.0],
+        ),
+    };
+    let a = s * r;
+    let e = (-a).exp();
+    let (p0, p1, p2) = eval_poly_with_derivatives(p, a);
+    let value = e * p0;
+    // Chain through psi=log(kappa): da/dpsi = a.
+    let value_psi = e * a * (p1 - p0);
+    let value_psi_psi = e * (a * (p1 - p0) + a * a * (p2 - 2.0 * p1 + p0));
+    Ok((value, value_psi, value_psi_psi))
+}
+
+#[inline(always)]
+fn exp_poly_scaled_s2_psi_triplet(s: f64, a: f64, coeffs: &[f64], scalar: f64) -> (f64, f64, f64) {
+    // Helper for operator terms of the form:
+    //   y(psi) = scalar * s(psi)^2 * exp(-a) * P(a),
+    // where
+    //   a = s r,  ds/dpsi = s,  da/dpsi = a.
+    //
+    // Product/chain expansion gives:
+    //   y'  = scalar*s^2*e^{-a} [2P + a(P' - P)]
+    //   y'' = scalar*s^2*e^{-a} [4P + 5a(P' - P) + a^2(P'' - 2P' + P)].
+    //
+    // Used for:
+    // - phi''(r) pieces
+    // - phi'(r)/r closed forms for nu>=3/2
+    // under psi-derivatives.
+    let e = (-a).exp();
+    let (p0, p1, p2) = eval_poly_with_derivatives(coeffs, a);
+    let d = p1 - p0;
+    let y = scalar * s * s * e * p0;
+    let y_psi = scalar * s * s * e * (2.0 * p0 + a * d);
+    let y_psi_psi = scalar * s * s * e * (4.0 * p0 + 5.0 * a * d + a * a * (p2 - 2.0 * p1 + p0));
+    (y, y_psi, y_psi_psi)
+}
+
+#[inline(always)]
+fn matern_operator_psi_triplet(
+    r: f64,
+    length_scale: f64,
+    nu: MaternNu,
+    dimension: usize,
+) -> Result<
+    (
+        f64, // phi
+        f64, // phi_psi
+        f64, // phi_psi_psi
+        f64, // phi_r_over_r
+        f64, // (phi_r_over_r)_psi
+        f64, // (phi_r_over_r)_psi_psi
+        f64, // lap
+        f64, // lap_psi
+        f64, // lap_psi_psi
+    ),
+    BasisError,
+> {
+    // Operator-level analytic identities used by Thread-1 penalties:
+    //   D0 uses phi,
+    //   D1 uses phi'(r)/r,
+    //   D2 uses Laplacian:
+    //       Delta phi = phi''(r) + (d-1) * phi'(r)/r.
+    //
+    // For each half-integer nu, we use closed forms:
+    //   phi''(r)      = s^2 * e^{-a} * R_nu(a),
+    //   phi'(r)/r     = -s^2 * e^{-a} * Q_nu(a),  (nu>=3/2),
+    // where Q_nu, R_nu are low-degree polynomials.
+    //
+    // Then psi-derivatives are obtained exactly through
+    // exp_poly_scaled_s2_psi_triplet, avoiding finite differences.
+    let (phi, phi_psi, phi_psi_psi) = matern_value_psi_triplet(r, length_scale, nu)?;
+    let kappa = 1.0 / length_scale;
+    let d = dimension as f64;
+    let (s, q, rr): (f64, &[f64], &[f64]) = match nu {
+        MaternNu::Half => (kappa, &[1.0], &[1.0]),
+        MaternNu::ThreeHalves => (3.0_f64.sqrt() * kappa, &[1.0], &[-1.0, 1.0]),
+        MaternNu::FiveHalves => (5.0_f64.sqrt() * kappa, &[1.0, 1.0], &[-1.0, -1.0, 1.0]),
+        MaternNu::SevenHalves => (
+            7.0_f64.sqrt() * kappa,
+            &[3.0, 3.0, 1.0],
+            &[-3.0, -3.0, 0.0, 1.0],
+        ),
+        MaternNu::NineHalves => (
+            9.0_f64.sqrt() * kappa,
+            &[15.0, 15.0, 6.0, 1.0],
+            &[-15.0, -15.0, -3.0, 2.0, 1.0],
+        ),
+    };
+    let a = s * r;
+    let (phi_rr, phi_rr_psi, phi_rr_psi_psi) = exp_poly_scaled_s2_psi_triplet(s, a, rr, 1.0);
+
+    // nu=1/2 has singular phi'(r)/r ~ -kappa/r as r->0.
+    // We keep the implementation exact:
+    // - if dimension>1 and r=0, Laplacian is undefined => return error,
+    // - if dimension=1 and r=0, Laplacian uses only phi'' so ratio is set to 0
+    //   because it is multiplied by (d-1)=0.
+    let (ratio, ratio_psi, ratio_psi_psi) = if matches!(nu, MaternNu::Half) {
+        if r == 0.0 {
+            if dimension > 1 {
+                return Err(BasisError::InvalidInput(
+                    "Matérn nu=1/2 has singular phi'(r)/r at r=0 for d>1".to_string(),
+                ));
+            }
+            (0.0, 0.0, 0.0)
+        } else {
+            let e_eff = (-a).exp();
+            let g = -(s / r) * e_eff;
+            let g_psi = -(s / r) * e_eff * (1.0 - a);
+            let g_psi_psi = -(s / r) * e_eff * (1.0 - 3.0 * a + a * a);
+            (g, g_psi, g_psi_psi)
+        }
+    } else {
+        exp_poly_scaled_s2_psi_triplet(s, a, q, -1.0)
+    };
+
+    let lap = phi_rr + (d - 1.0) * ratio;
+    let lap_psi = phi_rr_psi + (d - 1.0) * ratio_psi;
+    let lap_psi_psi = phi_rr_psi_psi + (d - 1.0) * ratio_psi_psi;
+
+    if !phi.is_finite()
+        || !phi_psi.is_finite()
+        || !phi_psi_psi.is_finite()
+        || !ratio.is_finite()
+        || !ratio_psi.is_finite()
+        || !ratio_psi_psi.is_finite()
+        || !lap.is_finite()
+        || !lap_psi.is_finite()
+        || !lap_psi_psi.is_finite()
+    {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite Matérn psi-derivative operator values at r={r}, length_scale={length_scale}, nu={nu:?}"
+        )));
+    }
+    Ok((
+        phi,
+        phi_psi,
+        phi_psi_psi,
+        ratio,
+        ratio_psi,
+        ratio_psi_psi,
+        lap,
+        lap_psi,
+        lap_psi_psi,
+    ))
+}
+
+fn gram_and_psi_derivatives_from_operator(
+    d: &Array2<f64>,
+    d_psi: &Array2<f64>,
+    d_psi_psi: &Array2<f64>,
+) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
+    // Raw Gram derivatives from operator-collocation matrix D(psi):
+    //   S_raw(psi) = D(psi)^T D(psi)
+    //   S_raw'     = D'^T D + D^T D'
+    //   S_raw''    = D''^T D + 2 D'^T D' + D^T D''.
+    //
+    // These are exactly the product-rule formulas requested in the math spec.
+    let s_raw = symmetrize(&fast_ata(d));
+    let s_raw_psi = symmetrize(&(d_psi.t().dot(d) + d.t().dot(d_psi)));
+    let s_raw_psi_psi =
+        symmetrize(&(d_psi_psi.t().dot(d) + d.t().dot(d_psi_psi) + 2.0 * d_psi.t().dot(d_psi)));
+    (s_raw, s_raw_psi, s_raw_psi_psi)
+}
+
+#[inline(always)]
+fn trace_of_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    a.t().dot(b).diag().sum()
+}
+
+fn normalize_penalty_with_psi_derivatives(
+    s: &Array2<f64>,
+    s_psi: &Array2<f64>,
+    s_psi_psi: &Array2<f64>,
+) -> (Array2<f64>, Array2<f64>, Array2<f64>, f64) {
+    // Exact constrained-space Frobenius normalization derivatives:
+    //
+    // Let S = S_con(psi), c = ||S||_F = sqrt(tr(S^T S)).
+    // Define:
+    //   a = tr(S^T S'),
+    //   b = tr((S')^T S') + tr(S^T S'').
+    //
+    // Then:
+    //   c'  = a/c,
+    //   c'' = b/c - a^2/c^3.
+    //
+    // For normalized S~ = S/c:
+    //   S~'  = S'/c - (c'/c^2) S
+    //   S~'' = S''/c - 2(c'/c^2)S' + (2(c')^2/c^3 - c''/c^2)S.
+    //
+    // This keeps hyper-derivative scaling coherent with the constrained REML
+    // objective and matches the user-provided trace-only derivation.
+    let fro2 = trace_of_product(s, s);
+    let c = fro2.sqrt();
+    if !c.is_finite() || c <= 1e-12 {
+        return (
+            s.clone(),
+            Array2::<f64>::zeros(s.raw_dim()),
+            Array2::<f64>::zeros(s.raw_dim()),
+            1.0,
+        );
+    }
+
+    let a = trace_of_product(s, s_psi);
+    let b = trace_of_product(s_psi, s_psi) + trace_of_product(s, s_psi_psi);
+    let c_psi = a / c;
+    let c_psi_psi = b / c - (a * a) / (c * c * c);
+
+    let s_tilde = s.mapv(|v| v / c);
+    let s_tilde_psi = s_psi.mapv(|v| v / c) - s.mapv(|v| (c_psi / (c * c)) * v);
+    let s_tilde_psi_psi = s_psi_psi.mapv(|v| v / c) - s_psi.mapv(|v| 2.0 * c_psi / (c * c) * v)
+        + s.mapv(|v| ((2.0 * c_psi * c_psi) / (c * c * c) - c_psi_psi / (c * c)) * v);
+
+    (s_tilde, s_tilde_psi, s_tilde_psi_psi, c)
+}
+
+fn build_matern_operator_penalty_psi_derivatives(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    include_intercept: bool,
+    z_opt: Option<&Array2<f64>>,
+) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
+    // Full operator-to-penalty derivative pipeline in constrained coordinates:
+    //
+    // 1. Build D0, D1, D2 and their psi-derivatives from analytic radial forms.
+    // 2. Apply identifiability transform Z at operator level:
+    //      D_con = D Z, D_con' = D' Z, D_con'' = D'' Z
+    //    (valid because Z is psi-independent).
+    // 3. Build raw Gram derivatives per operator block:
+    //      S_raw = D_con^T D_con, etc.
+    // 4. Normalize each block by constrained Frobenius norm and propagate
+    //    derivatives with exact quotient rules.
+    //
+    // Returned vectors correspond to [S0, S1, S2] derivatives after
+    // constrained-space normalization.
+    let p = centers.nrows();
+    let d = centers.ncols();
+    let mut d0_raw = Array2::<f64>::zeros((p, p));
+    let mut d1_raw = Array2::<f64>::zeros((p * d, p));
+    let mut d2_raw = Array2::<f64>::zeros((p, p));
+    let mut d0_raw_psi = Array2::<f64>::zeros((p, p));
+    let mut d1_raw_psi = Array2::<f64>::zeros((p * d, p));
+    let mut d2_raw_psi = Array2::<f64>::zeros((p, p));
+    let mut d0_raw_psi_psi = Array2::<f64>::zeros((p, p));
+    let mut d1_raw_psi_psi = Array2::<f64>::zeros((p * d, p));
+    let mut d2_raw_psi_psi = Array2::<f64>::zeros((p, p));
+
+    for k in 0..p {
+        for j in 0..p {
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = centers[[k, c]] - centers[[j, c]];
+                dist2 += delta * delta;
+            }
+            let r = dist2.sqrt();
+            let (
+                phi,
+                phi_psi,
+                phi_psi_psi,
+                ratio,
+                ratio_psi,
+                ratio_psi_psi,
+                lap,
+                lap_psi,
+                lap_psi_psi,
+            ) = matern_operator_psi_triplet(r, length_scale, nu, d)?;
+            d0_raw[[k, j]] = phi;
+            d0_raw_psi[[k, j]] = phi_psi;
+            d0_raw_psi_psi[[k, j]] = phi_psi_psi;
+            d2_raw[[k, j]] = lap;
+            d2_raw_psi[[k, j]] = lap_psi;
+            d2_raw_psi_psi[[k, j]] = lap_psi_psi;
+            for axis in 0..d {
+                let delta = centers[[k, axis]] - centers[[j, axis]];
+                let row = k * d + axis;
+                d1_raw[[row, j]] = ratio * delta;
+                d1_raw_psi[[row, j]] = ratio_psi * delta;
+                d1_raw_psi_psi[[row, j]] = ratio_psi_psi * delta;
+            }
+        }
+    }
+
+    let project = |mat: Array2<f64>| {
+        if let Some(z) = z_opt {
+            fast_ab(&mat, z)
+        } else {
+            mat
+        }
+    };
+    // With psi-independent Z this is algebraically exact:
+    //   S_con = Z^T (D^T D) Z = (DZ)^T (DZ),
+    // and identically for S_con', S_con'' using D'Z, D''Z.
+    // So we can project operators first, then build Gram derivatives.
+    let d0_kernel = project(d0_raw);
+    let d0_kernel_psi = project(d0_raw_psi);
+    let d0_kernel_psi_psi = project(d0_raw_psi_psi);
+    let d1_kernel = project(d1_raw);
+    let d1_kernel_psi = project(d1_raw_psi);
+    let d1_kernel_psi_psi = project(d1_raw_psi_psi);
+    let d2_kernel = project(d2_raw);
+    let d2_kernel_psi = project(d2_raw_psi);
+    let d2_kernel_psi_psi = project(d2_raw_psi_psi);
+
+    let kernel_cols = d0_kernel.ncols();
+    let total_cols = kernel_cols + usize::from(include_intercept);
+    let mut d0 = Array2::<f64>::zeros((p, total_cols));
+    let mut d1 = Array2::<f64>::zeros((p * d, total_cols));
+    let mut d2 = Array2::<f64>::zeros((p, total_cols));
+    let mut d0_psi = Array2::<f64>::zeros((p, total_cols));
+    let mut d1_psi = Array2::<f64>::zeros((p * d, total_cols));
+    let mut d2_psi = Array2::<f64>::zeros((p, total_cols));
+    let mut d0_psi_psi = Array2::<f64>::zeros((p, total_cols));
+    let mut d1_psi_psi = Array2::<f64>::zeros((p * d, total_cols));
+    let mut d2_psi_psi = Array2::<f64>::zeros((p, total_cols));
+    d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel);
+    d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
+    d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
+    d0_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d0_kernel_psi);
+    d1_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d1_kernel_psi);
+    d2_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d2_kernel_psi);
+    d0_psi_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d0_kernel_psi_psi);
+    d1_psi_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d1_kernel_psi_psi);
+    d2_psi_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d2_kernel_psi_psi);
+    if include_intercept {
+        d0.column_mut(kernel_cols).fill(1.0);
+    }
+
+    let (s0, s0_psi, s0_psi_psi) =
+        gram_and_psi_derivatives_from_operator(&d0, &d0_psi, &d0_psi_psi);
+    let (s1, s1_psi, s1_psi_psi) =
+        gram_and_psi_derivatives_from_operator(&d1, &d1_psi, &d1_psi_psi);
+    let (s2, s2_psi, s2_psi_psi) =
+        gram_and_psi_derivatives_from_operator(&d2, &d2_psi, &d2_psi_psi);
+
+    let (_s0_norm, s0_norm_psi, s0_norm_psi_psi, _c0) =
+        normalize_penalty_with_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
+    let (_s1_norm, s1_norm_psi, s1_norm_psi_psi, _c1) =
+        normalize_penalty_with_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
+    let (_s2_norm, s2_norm_psi, s2_norm_psi_psi, _c2) =
+        normalize_penalty_with_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
+
+    Ok((
+        vec![s0_norm_psi, s1_norm_psi, s2_norm_psi],
+        vec![s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi],
+    ))
+}
+
+fn build_matern_design_psi_derivatives(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    include_intercept: bool,
+    z_opt: Option<&Array2<f64>>,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let n = data.nrows();
+    let k = centers.nrows();
+    let (data_center_r, _) = spatial_distance_matrices(data, centers)?;
+    let mut kernel_psi = Array2::<f64>::zeros((n, k));
+    let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
+    for i in 0..n {
+        for j in 0..k {
+            let r = data_center_r[[i, j]];
+            kernel_psi[[i, j]] =
+                matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
+            kernel_psi_psi[[i, j]] =
+                matern_kernel_log_kappa_second_derivative_from_distance(r, length_scale, nu)?;
+        }
+    }
+    let (kernel_psi, kernel_psi_psi) = if let Some(z) = z_opt {
+        (fast_ab(&kernel_psi, z), fast_ab(&kernel_psi_psi, z))
+    } else {
+        (kernel_psi, kernel_psi_psi)
+    };
+    let cols = kernel_psi.ncols();
+    let total_cols = cols + usize::from(include_intercept);
+    let mut out_psi = Array2::<f64>::zeros((n, total_cols));
+    let mut out_psi_psi = Array2::<f64>::zeros((n, total_cols));
+    out_psi.slice_mut(s![.., 0..cols]).assign(&kernel_psi);
+    out_psi_psi
+        .slice_mut(s![.., 0..cols])
+        .assign(&kernel_psi_psi);
+    Ok((out_psi, out_psi_psi))
+}
+
 pub fn build_matern_basis_log_kappa_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
-    const EPS: f64 = 1e-6;
-    let kappa = 1.0 / spec.length_scale;
-    let ls_plus = 1.0 / (kappa * EPS.exp());
-    let ls_minus = 1.0 / (kappa * (-EPS).exp());
-    let mut spec_plus = spec.clone();
-    let mut spec_minus = spec.clone();
-    spec_plus.length_scale = ls_plus;
-    spec_minus.length_scale = ls_minus;
-
-    let plus = build_matern_basis(data, &spec_plus)?;
-    let minus = build_matern_basis(data, &spec_minus)?;
-    if plus.design.raw_dim() != minus.design.raw_dim() {
-        return Err(BasisError::DimensionMismatch(
-            "Matérn log-kappa derivative finite-difference design shape mismatch".to_string(),
-        ));
-    }
-    if plus.penalties.len() != minus.penalties.len() {
-        return Err(BasisError::DimensionMismatch(
-            "Matérn log-kappa derivative finite-difference penalty count mismatch".to_string(),
-        ));
-    }
-
-    let design_derivative = (&plus.design - &minus.design) / (2.0 * EPS);
-    let penalties_derivative = plus
-        .penalties
+    // Analytic psi derivative assembly for the Matérn basis block:
+    // - design derivative X_psi from closed-form Matérn value derivatives,
+    // - penalty derivatives S_psi from operator-collocation derivatives.
+    //
+    // Penalty routing uses source tags (mass/tension/stiffness) so the returned
+    // list order matches the active penalty order seen by REML.
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
+    let base = build_matern_basis(data, spec)?;
+    let (design_derivative, _) = build_matern_design_psi_derivatives(
+        data,
+        centers.view(),
+        spec.length_scale,
+        spec.nu,
+        spec.include_intercept,
+        z_opt.as_ref(),
+    )?;
+    let (all_penalty_deriv, _) = build_matern_operator_penalty_psi_derivatives(
+        centers.view(),
+        spec.length_scale,
+        spec.nu,
+        spec.include_intercept,
+        z_opt.as_ref(),
+    )?;
+    let penalties_derivative = base
+        .penalty_info
         .iter()
-        .zip(minus.penalties.iter())
-        .map(|(p_plus, p_minus)| (p_plus - p_minus) / (2.0 * EPS))
-        .collect();
+        .map(|info| match info.source {
+            PenaltySource::OperatorMass => Ok(all_penalty_deriv[0].clone()),
+            PenaltySource::OperatorTension => Ok(all_penalty_deriv[1].clone()),
+            PenaltySource::OperatorStiffness => Ok(all_penalty_deriv[2].clone()),
+            _ => Err(BasisError::InvalidInput(
+                "Matérn log-kappa derivative expected operator penalties only".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(BasisPsiDerivativeResult {
         design_derivative,
@@ -4685,43 +5180,38 @@ pub fn build_matern_basis_log_kappa_second_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    const EPS: f64 = 1e-6;
-    let kappa = 1.0 / spec.length_scale;
-    let ls_plus = 1.0 / (kappa * EPS.exp());
-    let ls_minus = 1.0 / (kappa * (-EPS).exp());
-    let mut spec_plus = spec.clone();
-    let mut spec_minus = spec.clone();
-    spec_plus.length_scale = ls_plus;
-    spec_minus.length_scale = ls_minus;
-
-    let plus = build_matern_basis(data, &spec_plus)?;
+    // Analytic psi second-derivative assembly, matching the first-derivative
+    // mapping logic and constrained normalized penalty geometry.
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
     let base = build_matern_basis(data, spec)?;
-    let minus = build_matern_basis(data, &spec_minus)?;
-    if plus.design.raw_dim() != base.design.raw_dim()
-        || base.design.raw_dim() != minus.design.raw_dim()
-    {
-        return Err(BasisError::DimensionMismatch(
-            "Matérn log-kappa second derivative finite-difference design shape mismatch"
-                .to_string(),
-        ));
-    }
-    if plus.penalties.len() != base.penalties.len() || base.penalties.len() != minus.penalties.len()
-    {
-        return Err(BasisError::DimensionMismatch(
-            "Matérn log-kappa second derivative finite-difference penalty count mismatch"
-                .to_string(),
-        ));
-    }
-
-    let design_second_derivative =
-        (&plus.design - &(base.design.clone() * 2.0) + &minus.design) / (EPS * EPS);
-    let penalties_second_derivative = plus
-        .penalties
+    let (_, design_second_derivative) = build_matern_design_psi_derivatives(
+        data,
+        centers.view(),
+        spec.length_scale,
+        spec.nu,
+        spec.include_intercept,
+        z_opt.as_ref(),
+    )?;
+    let (_, all_penalty_second_deriv) = build_matern_operator_penalty_psi_derivatives(
+        centers.view(),
+        spec.length_scale,
+        spec.nu,
+        spec.include_intercept,
+        z_opt.as_ref(),
+    )?;
+    let penalties_second_derivative = base
+        .penalty_info
         .iter()
-        .zip(base.penalties.iter())
-        .zip(minus.penalties.iter())
-        .map(|((p_plus, p_base), p_minus)| (p_plus - &(p_base * 2.0) + p_minus) / (EPS * EPS))
-        .collect();
+        .map(|info| match info.source {
+            PenaltySource::OperatorMass => Ok(all_penalty_second_deriv[0].clone()),
+            PenaltySource::OperatorTension => Ok(all_penalty_second_deriv[1].clone()),
+            PenaltySource::OperatorStiffness => Ok(all_penalty_second_deriv[2].clone()),
+            _ => Err(BasisError::InvalidInput(
+                "Matérn log-kappa second derivative expected operator penalties only".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(BasisPsiSecondDerivativeResult {
         design_second_derivative,
@@ -8851,6 +9341,86 @@ mod tests {
     }
 
     #[test]
+    fn test_gram_and_psi_derivatives_from_operator_matches_fd() {
+        // Build D(psi) = D0 + psi D1 + 0.5 psi^2 D2 with nontrivial shape.
+        let d0 = array![[0.9, -0.2, 0.3], [0.4, 0.8, -0.6], [0.1, 0.7, 0.5], [-0.3, 0.2, 0.4]];
+        let d1 = array![
+            [0.2, -0.1, 0.05],
+            [0.3, 0.07, -0.2],
+            [-0.15, 0.06, 0.1],
+            [0.04, -0.09, 0.12]
+        ];
+        let d2 = array![
+            [0.08, -0.02, 0.01],
+            [0.03, 0.04, -0.05],
+            [0.02, -0.01, 0.06],
+            [-0.07, 0.03, 0.02]
+        ];
+
+        let psi0 = 0.35;
+        let d = &d0 + &(d1.mapv(|v| psi0 * v)) + &(d2.mapv(|v| 0.5 * psi0 * psi0 * v));
+        let d_psi = &d1 + &(d2.mapv(|v| psi0 * v));
+        let d_psi_psi = d2.clone();
+
+        let (s, s_psi, s_psi_psi) = gram_and_psi_derivatives_from_operator(&d, &d_psi, &d_psi_psi);
+
+        let h = 1e-6;
+        let eval_s = |psi: f64| {
+            let d_eval = &d0 + &(d1.mapv(|v| psi * v)) + &(d2.mapv(|v| 0.5 * psi * psi * v));
+            symmetrize(&fast_ata(&d_eval))
+        };
+        let s_plus = eval_s(psi0 + h);
+        let s_minus = eval_s(psi0 - h);
+        let s_fd = (&s_plus - &s_minus) / (2.0 * h);
+        let s2_fd = (&s_plus - &(s.mapv(|v| 2.0 * v)) + &s_minus) / (h * h);
+
+        let err1 = (&s_psi - &s_fd).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let err2 = (&s_psi_psi - &s2_fd).iter().map(|v| v * v).sum::<f64>().sqrt();
+
+        assert!(err1 < 2e-6, "S' mismatch too large: {err1}");
+        assert!(err2 < 5e-4, "S'' mismatch too large: {err2}");
+    }
+
+    #[test]
+    fn test_normalize_penalty_with_psi_derivatives_matches_fd() {
+        // Build S(psi) = S0 + psi S1 + 0.5 psi^2 S2 and validate exact
+        // normalization derivatives against finite differences of S/||S||_F.
+        let s0 = array![[2.0, 0.3, -0.2], [0.3, 1.7, 0.4], [-0.2, 0.4, 1.4]];
+        let s1 = array![[0.2, -0.05, 0.1], [-0.05, 0.12, 0.03], [0.1, 0.03, -0.08]];
+        let s2 = array![[0.04, 0.02, -0.01], [0.02, -0.03, 0.015], [-0.01, 0.015, 0.02]];
+
+        let psi0 = -0.4;
+        let s = &s0 + &(s1.mapv(|v| psi0 * v)) + &(s2.mapv(|v| 0.5 * psi0 * psi0 * v));
+        let s_psi = &s1 + &(s2.mapv(|v| psi0 * v));
+        let s_psi_psi = s2.clone();
+
+        let (_sn, sn_psi, sn_psi_psi, _c) =
+            normalize_penalty_with_psi_derivatives(&s, &s_psi, &s_psi_psi);
+
+        let h = 1e-6;
+        let eval_snorm = |psi: f64| {
+            let s_eval = &s0 + &(s1.mapv(|v| psi * v)) + &(s2.mapv(|v| 0.5 * psi * psi * v));
+            let c = trace_of_product(&s_eval, &s_eval).sqrt();
+            s_eval.mapv(|v| v / c)
+        };
+        let sn = eval_snorm(psi0);
+        let sn_plus = eval_snorm(psi0 + h);
+        let sn_minus = eval_snorm(psi0 - h);
+        let sn_fd = (&sn_plus - &sn_minus) / (2.0 * h);
+        let sn2_fd = (&sn_plus - &(sn.mapv(|v| 2.0 * v)) + &sn_minus) / (h * h);
+
+        let err1 = (&sn_psi - &sn_fd).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let err2 = (&sn_psi_psi - &sn2_fd)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+
+        assert!(err1 < 2e-6, "normalized S' mismatch too large: {err1}");
+        assert!(err2 < 5e-4, "normalized S'' mismatch too large: {err2}");
+    }
+
+    #[test]
     fn test_duchon_general_p0_case_builds() {
         let data = array![
             [0.0, 0.1, 0.2, 0.3],
@@ -9080,6 +9650,7 @@ mod tests {
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let m_ops = build_matern_collocation_operator_matrices(
             centers.view(),
+            None,
             0.8,
             MaternNu::FiveHalves,
             false,
@@ -9091,6 +9662,7 @@ mod tests {
 
         let d_ops = build_duchon_collocation_operator_matrices(
             centers.view(),
+            None,
             0.8,
             3,
             DuchonNullspaceOrder::Linear,
@@ -9098,5 +9670,37 @@ mod tests {
         .expect("duchon ops");
         assert!(d_ops.d1.iter().all(|v| v.is_finite()));
         assert!(d_ops.d2.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_matern_collocation_weights_scale_rows_by_sqrt_weight() {
+        let centers = array![[0.0, 0.0], [1.0, 0.0]];
+        let unit = build_matern_collocation_operator_matrices(
+            centers.view(),
+            None,
+            0.9,
+            MaternNu::FiveHalves,
+            false,
+            None,
+        )
+        .expect("unit weights");
+        let weights = array![4.0, 1.0];
+        let weighted = build_matern_collocation_operator_matrices(
+            centers.view(),
+            Some(weights.view()),
+            0.9,
+            MaternNu::FiveHalves,
+            false,
+            None,
+        )
+        .expect("weighted");
+        // First collocation row should scale by sqrt(4)=2.
+        for j in 0..unit.d0.ncols() {
+            assert!((weighted.d0[[0, j]] - 2.0 * unit.d0[[0, j]]).abs() < 1e-12);
+        }
+        // Second row has weight 1 -> unchanged.
+        for j in 0..unit.d0.ncols() {
+            assert!((weighted.d0[[1, j]] - unit.d0[[1, j]]).abs() < 1e-12);
+        }
     }
 }

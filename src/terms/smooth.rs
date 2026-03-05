@@ -22,7 +22,9 @@ use crate::estimate::{
 };
 use crate::faer_ndarray::fast_atv;
 use crate::matrix::DesignMatrix;
-use crate::mixture_link::{inverse_link_jet_for_family, state_from_sas_spec, state_from_spec};
+use crate::mixture_link::{
+    inverse_link_jet_for_family, state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
+};
 use crate::pirls::LinearInequalityConstraints;
 use crate::types::{LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
@@ -886,6 +888,19 @@ fn merge_linear_constraints_global(
     }
 }
 
+fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
+    // Constrained-space normalization:
+    //   c = ||S_con||_F,  S_tilde = S_con / c.
+    // This is the only normalization coherent with a REML objective that is
+    // evaluated entirely in constrained coordinates.
+    let c = matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if c.is_finite() && c > 0.0 {
+        (matrix.mapv(|v| v / c), c)
+    } else {
+        (matrix.clone(), 1.0)
+    }
+}
+
 fn build_tensor_bspline_basis(
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
@@ -1027,11 +1042,12 @@ fn build_tensor_bspline_basis(
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
                 let zt_s = z.t().dot(&candidate.matrix);
                 let matrix = zt_s.dot(z);
+                let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 Ok(PenaltyCandidate {
                     nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
                     matrix,
                     source: candidate.source,
-                    normalization_scale: candidate.normalization_scale,
+                    normalization_scale: candidate.normalization_scale * c_new,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1302,11 +1318,11 @@ pub fn build_smooth_design(
         let metadata = built.metadata.clone();
         let mut design_t = built.design;
         let mut penalties_t: Vec<Array2<f64>> = built.penalties;
-        let mut penalty_sources_t = built
+        let active_penalty_info_t = built
             .penalty_info
             .iter()
             .filter(|info| info.active)
-            .map(|info| info.source.clone())
+            .cloned()
             .collect::<Vec<_>>();
         let pre_dropped_penalty_info_t = built
             .penalty_info
@@ -1331,23 +1347,24 @@ pub fn build_smooth_design(
                 })
                 .collect();
         }
-        if penalties_t.len() != penalty_sources_t.len() {
+        if penalties_t.len() != active_penalty_info_t.len() {
             return Err(BasisError::InvalidInput(format!(
-                "internal penalty metadata mismatch for term '{}': active penalties={}, active sources={}",
+                "internal penalty metadata mismatch for term '{}': active penalties={}, active infos={}",
                 term.name,
                 penalties_t.len(),
-                penalty_sources_t.len()
+                active_penalty_info_t.len()
             )));
         }
         let penalty_candidates = penalties_t
             .into_iter()
-            .zip(penalty_sources_t.drain(..))
-            .map(|(matrix, source)| -> Result<PenaltyCandidate, BasisError> {
+            .zip(active_penalty_info_t.into_iter())
+            .map(|(matrix, info)| -> Result<PenaltyCandidate, BasisError> {
+                let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 Ok(PenaltyCandidate {
                     nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
                     matrix,
-                    source,
-                    normalization_scale: 1.0,
+                    source: info.source,
+                    normalization_scale: info.normalization_scale * c_new,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1884,17 +1901,17 @@ fn apply_spatial_orthogonality_to_parametric(
 
         let mut penalties_constrained =
             Vec::<Array2<f64>>::with_capacity(term.penalties_local.len());
-        let active_sources = term
+        let active_penalty_info = term
             .penalty_info_local
             .iter()
             .filter(|info| info.active)
-            .map(|info| info.source.clone())
+            .cloned()
             .collect::<Vec<_>>();
-        if active_sources.len() != term.penalties_local.len() {
+        if active_penalty_info.len() != term.penalties_local.len() {
             return Err(BasisError::InvalidInput(format!(
-                "internal penalty metadata mismatch for term '{}': active_sources={}, penalties={}",
+                "internal penalty metadata mismatch for term '{}': active_infos={}, penalties={}",
                 term.name,
-                active_sources.len(),
+                active_penalty_info.len(),
                 term.penalties_local.len()
             )));
         }
@@ -1909,13 +1926,14 @@ fn apply_spatial_orthogonality_to_parametric(
         }
         let penalty_candidates = penalties_constrained
             .into_iter()
-            .zip(active_sources.into_iter())
-            .map(|(matrix, source)| -> Result<PenaltyCandidate, BasisError> {
+            .zip(active_penalty_info.into_iter())
+            .map(|(matrix, info)| -> Result<PenaltyCandidate, BasisError> {
+                let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 Ok(PenaltyCandidate {
                     nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
                     matrix,
-                    source,
-                    normalization_scale: 1.0,
+                    source: info.source,
+                    normalization_scale: info.normalization_scale * c_new,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2571,6 +2589,7 @@ fn extract_spatial_operator_runtime_caches(
             ) => {
                 let ops = build_matern_collocation_operator_matrices(
                     centers.view(),
+                    None,
                     *length_scale,
                     *nu,
                     *include_intercept,
@@ -2597,6 +2616,7 @@ fn extract_spatial_operator_runtime_caches(
             ) => {
                 let mut ops = build_duchon_collocation_operator_matrices(
                     centers.view(),
+                    None,
                     *length_scale,
                     *power,
                     *nullspace_order,
@@ -2966,6 +2986,7 @@ fn evaluate_standard_family_observations(
             | LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog
             | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture => {
                 let jet =
                     inverse_link_jet_for_family(family, eta_i, mixture_link_state, sas_link_state)
@@ -3465,7 +3486,13 @@ fn fit_bounded_term_collection_for_spec(
             .map_err(EstimationError::InvalidInput)?,
         sas_link_state: options
             .sas_link
-            .map(state_from_sas_spec)
+            .map(|spec| {
+                if matches!(family, LikelihoodFamily::BinomialBetaLogistic) {
+                    state_from_beta_logistic_spec(spec)
+                } else {
+                    state_from_sas_spec(spec)
+                }
+            })
             .transpose()
             .map_err(EstimationError::InvalidInput)?,
         y: y.to_owned(),
