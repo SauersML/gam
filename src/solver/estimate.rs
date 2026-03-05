@@ -972,6 +972,31 @@ pub fn optimize_external_design_with_heuristic_lambdas<X>(
 where
     X: Into<DesignMatrix>,
 {
+    optimize_external_design_with_heuristic_lambdas_and_warm_start(
+        y,
+        w,
+        x,
+        offset,
+        s_list,
+        heuristic_lambdas,
+        None,
+        opts,
+    )
+}
+
+fn optimize_external_design_with_heuristic_lambdas_and_warm_start<X>(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: X,
+    offset: ArrayView1<'_, f64>,
+    s_list: Vec<Array2<f64>>,
+    heuristic_lambdas: Option<&[f64]>,
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    opts: &ExternalOptimOptions,
+) -> Result<ExternalOptimResult, EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
     if matches!(opts.family, crate::types::LikelihoodFamily::BinomialMixture)
         && opts.mixture_link.is_none()
     {
@@ -1057,6 +1082,8 @@ where
         None,
         fit_linear_constraints.clone(),
     )?;
+    reml_state.set_warm_start_original_beta(warm_start_beta);
+
     let has_full_heuristic = heuristic_lambdas
         .map(|vals| vals.len() == k && k > 0)
         .unwrap_or(false);
@@ -1280,7 +1307,7 @@ where
                     );
                 }
                 if use_sas {
-                    let epsilon = theta[k];
+                    let (epsilon, _) = sas_effective_epsilon(theta[k]);
                     let log_delta = theta[k + 1];
                     cfg_eval.link_kind = InverseLink::Sas(
                         state_from_sas_spec(SasLinkSpec {
@@ -1443,6 +1470,10 @@ where
                     }
                     grad[k + j] = -direct_ll_buf[j] + 0.5 * trace_term;
                 }
+                if use_sas {
+                    let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
+                    grad[k] *= d_eps_d_raw;
+                }
                 if use_sas && sas_ridge > 0.0 {
                     let log_delta = theta[k + 1];
                     grad[k + 1] += sas_ridge * log_delta;
@@ -1475,9 +1506,10 @@ where
             None
         };
         let final_sas_state = if use_sas {
+            let (epsilon_eff, _) = sas_effective_epsilon(outer_result.rho[k]);
             Some(
                 state_from_sas_spec(SasLinkSpec {
-                    initial_epsilon: outer_result.rho[k],
+                    initial_epsilon: epsilon_eff,
                     initial_log_delta: outer_result.rho[k + 1],
                 })
                 .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
@@ -1504,8 +1536,9 @@ where
                     })?;
                     reml_eval.set_link_states(Some(mix_state), None);
                 } else if use_sas {
+                    let (epsilon_eff, _) = sas_effective_epsilon(aux[0]);
                     let sas_state = state_from_sas_spec(SasLinkSpec {
-                        initial_epsilon: aux[0],
+                        initial_epsilon: epsilon_eff,
                         initial_log_delta: aux[1],
                     })
                     .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?;
@@ -2440,6 +2473,30 @@ pub struct FitOptions {
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
     pub linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+    pub adaptive_regularization: Option<AdaptiveRegularizationOptions>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdaptiveRegularizationOptions {
+    pub enabled: bool,
+    pub max_mm_iter: usize,
+    pub beta_rel_tol: f64,
+    pub min_epsilon: f64,
+    pub weight_floor: f64,
+    pub weight_ceiling: f64,
+}
+
+impl Default for AdaptiveRegularizationOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_mm_iter: 10,
+            beta_rel_tol: 1e-3,
+            min_epsilon: 1e-8,
+            weight_floor: 1e-8,
+            weight_ceiling: 1e8,
+        }
+    }
 }
 
 /// Post-fit artifacts needed by downstream diagnostics/inference without
@@ -2511,6 +2568,25 @@ pub struct SmoothTermSummary {
     pub ref_df: f64,
     pub chi_sq: Option<f64>,
     pub p_value: Option<f64>,
+    pub continuous_order: Option<ContinuousSmoothnessOrder>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContinuousSmoothnessOrderStatus {
+    Ok,
+    NonMaternRegime,
+    UndefinedZeroLambda,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContinuousSmoothnessOrder {
+    pub lambda0: f64,
+    pub lambda1: f64,
+    pub lambda2: f64,
+    pub r_ratio: Option<f64>,
+    pub nu: Option<f64>,
+    pub kappa2: Option<f64>,
+    pub status: ContinuousSmoothnessOrderStatus,
 }
 
 #[derive(Clone, Debug)]
@@ -2520,6 +2596,83 @@ pub struct ModelSummary {
     pub reml_score: Option<f64>,
     pub parametric_terms: Vec<ParametricTermSummary>,
     pub smooth_terms: Vec<SmoothTermSummary>,
+}
+
+pub fn compute_continuous_smoothness_order(
+    lambda_tilde: [f64; 3],
+    normalization_scale: [f64; 3],
+    eps: f64,
+) -> ContinuousSmoothnessOrder {
+    let mut lambda = [f64::NAN; 3];
+    for k in 0..3 {
+        let c = normalization_scale[k];
+        if !c.is_finite() || c <= 0.0 {
+            return ContinuousSmoothnessOrder {
+                lambda0: f64::NAN,
+                lambda1: f64::NAN,
+                lambda2: f64::NAN,
+                r_ratio: None,
+                nu: None,
+                kappa2: None,
+                status: ContinuousSmoothnessOrderStatus::UndefinedZeroLambda,
+            };
+        }
+        lambda[k] = lambda_tilde[k] / c;
+    }
+    let [lambda0, lambda1, lambda2] = lambda;
+    if !lambda0.is_finite()
+        || !lambda1.is_finite()
+        || !lambda2.is_finite()
+        || lambda0 <= eps
+        || lambda2 <= eps
+    {
+        return ContinuousSmoothnessOrder {
+            lambda0,
+            lambda1,
+            lambda2,
+            r_ratio: None,
+            nu: None,
+            kappa2: None,
+            status: ContinuousSmoothnessOrderStatus::UndefinedZeroLambda,
+        };
+    }
+
+    let r_ratio = (lambda1 * lambda1) / (lambda0 * lambda2);
+    if !r_ratio.is_finite() || r_ratio <= 4.0 {
+        return ContinuousSmoothnessOrder {
+            lambda0,
+            lambda1,
+            lambda2,
+            r_ratio: r_ratio.is_finite().then_some(r_ratio),
+            nu: None,
+            kappa2: None,
+            status: ContinuousSmoothnessOrderStatus::NonMaternRegime,
+        };
+    }
+
+    let nu = r_ratio / (r_ratio - 4.0);
+    let kappa2 = ((nu - 1.0) / 2.0) * (lambda1 / lambda2);
+    if !nu.is_finite() || !kappa2.is_finite() {
+        return ContinuousSmoothnessOrder {
+            lambda0,
+            lambda1,
+            lambda2,
+            r_ratio: Some(r_ratio),
+            nu: None,
+            kappa2: None,
+            status: ContinuousSmoothnessOrderStatus::UndefinedZeroLambda,
+        };
+    }
+
+    ContinuousSmoothnessOrder {
+        lambda0,
+        lambda1,
+        lambda2,
+        r_ratio: Some(r_ratio),
+        nu: Some(nu),
+        kappa2: Some(kappa2),
+        status: ContinuousSmoothnessOrderStatus::Ok,
+    }
 }
 
 fn significance_stars(p: Option<f64>) -> &'static str {
@@ -2652,6 +2805,62 @@ impl fmt::Display for ModelSummary {
             )?;
         }
         writeln!(f)?;
+        let order_terms = self
+            .smooth_terms
+            .iter()
+            .filter_map(|t| t.continuous_order.as_ref().map(|o| (&t.name, o)))
+            .collect::<Vec<_>>();
+        if !order_terms.is_empty() {
+            writeln!(f, "Continuous Smoothness Order (Thread 2):")?;
+            writeln!(
+                f,
+                "{:<name_w$} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>20}",
+                "Term",
+                "lambda0",
+                "lambda1",
+                "lambda2",
+                "R",
+                "nu",
+                "kappa^2",
+                "status",
+                name_w = smooth_name_w
+            )?;
+            for (name, o) in order_terms {
+                let r_txt = o
+                    .r_ratio
+                    .filter(|v| v.is_finite())
+                    .map(|v| format!("{v:.4}"))
+                    .unwrap_or_else(|| "NA".to_string());
+                let nu_txt =
+                    o.nu.filter(|v| v.is_finite())
+                        .map(|v| format!("{v:.4}"))
+                        .unwrap_or_else(|| "NA".to_string());
+                let kappa_txt = o
+                    .kappa2
+                    .filter(|v| v.is_finite())
+                    .map(|v| format!("{v:.4}"))
+                    .unwrap_or_else(|| "NA".to_string());
+                let status_txt = match o.status {
+                    ContinuousSmoothnessOrderStatus::Ok => "Ok",
+                    ContinuousSmoothnessOrderStatus::NonMaternRegime => "NonMaternRegime",
+                    ContinuousSmoothnessOrderStatus::UndefinedZeroLambda => "UndefinedZeroLambda",
+                };
+                writeln!(
+                    f,
+                    "{:<name_w$} {:>10.3e} {:>10.3e} {:>10.3e} {:>10} {:>10} {:>10} {:>20}",
+                    name,
+                    o.lambda0,
+                    o.lambda1,
+                    o.lambda2,
+                    r_txt,
+                    nu_txt,
+                    kappa_txt,
+                    status_txt,
+                    name_w = smooth_name_w
+                )?;
+            }
+            writeln!(f)?;
+        }
         write!(
             f,
             "Signif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1"
@@ -2681,6 +2890,33 @@ pub fn fit_gam_with_heuristic_lambdas<X>(
     offset: ArrayView1<'_, f64>,
     s_list: &[Array2<f64>],
     heuristic_lambdas: Option<&[f64]>,
+    family: crate::types::LikelihoodFamily,
+    opts: &FitOptions,
+) -> Result<FitResult, EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    fit_gam_with_heuristic_lambdas_and_warm_start(
+        x,
+        y,
+        weights,
+        offset,
+        s_list,
+        heuristic_lambdas,
+        None,
+        family,
+        opts,
+    )
+}
+
+pub(crate) fn fit_gam_with_heuristic_lambdas_and_warm_start<X>(
+    x: X,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    s_list: &[Array2<f64>],
+    heuristic_lambdas: Option<&[f64]>,
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
     family: crate::types::LikelihoodFamily,
     opts: &FitOptions,
 ) -> Result<FitResult, EstimationError>
@@ -2779,13 +3015,14 @@ where
 
         // Start with Firth when class support is low relative to model complexity.
         ext_opts.firth_bias_reduction = Some(start_with_firth);
-        let first_try = optimize_external_design_with_heuristic_lambdas(
+        let first_try = optimize_external_design_with_heuristic_lambdas_and_warm_start(
             y,
             weights,
             &x,
             offset,
             s_list.to_vec(),
             heuristic_lambdas,
+            warm_start_beta,
             &ext_opts,
         );
 
@@ -2799,13 +3036,14 @@ where
                 let extreme_eta = res.max_abs_eta > 15.0;
                 if !start_with_firth && (unstable_status || extreme_eta) {
                     ext_opts.firth_bias_reduction = Some(true);
-                    optimize_external_design_with_heuristic_lambdas(
+                    optimize_external_design_with_heuristic_lambdas_and_warm_start(
                         y,
                         weights,
                         &x,
                         offset,
                         s_list.to_vec(),
                         heuristic_lambdas,
+                        warm_start_beta,
                         &ext_opts,
                     )?
                 } else {
@@ -2817,25 +3055,27 @@ where
                     return Err(err);
                 }
                 ext_opts.firth_bias_reduction = Some(true);
-                optimize_external_design_with_heuristic_lambdas(
+                optimize_external_design_with_heuristic_lambdas_and_warm_start(
                     y,
                     weights,
                     &x,
                     offset,
                     s_list.to_vec(),
                     heuristic_lambdas,
+                    warm_start_beta,
                     &ext_opts,
                 )?
             }
         }
     } else {
-        optimize_external_design_with_heuristic_lambdas(
+        optimize_external_design_with_heuristic_lambdas_and_warm_start(
             y,
             weights,
             &x,
             offset,
             s_list.to_vec(),
             heuristic_lambdas,
+            warm_start_beta,
             &ext_opts,
         )?
     };
@@ -2909,13 +3149,24 @@ const FIRTH_MINORITY_PER_PARAMETER: f64 = 2.0;
 
 #[inline]
 fn sas_log_delta_ridge_weight() -> f64 {
-    // Optional weak stabilization for SAS tail parameter.
-    // Kept off by default to preserve baseline objective semantics.
-    std::env::var("GAM_SAS_LOGDELTA_RIDGE")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(0.0)
+    // Weak fixed stabilization for the SAS tail parameter to avoid
+    // boundary/flat-region pathologies in outer optimization.
+    1e-4
+}
+
+#[inline]
+fn sas_epsilon_bound() -> f64 {
+    // Fixed smooth bound on raw SAS epsilon during outer optimization.
+    8.0
+}
+
+#[inline]
+fn sas_effective_epsilon(raw_epsilon: f64) -> (f64, f64) {
+    let bound = sas_epsilon_bound().max(f64::EPSILON);
+    let t = (raw_epsilon / bound).tanh();
+    let epsilon = bound * t;
+    let d_epsilon_d_raw = 1.0 - t * t;
+    (epsilon, d_epsilon_d_raw)
 }
 
 #[inline]
@@ -3457,8 +3708,9 @@ where
         reml_state.set_link_states(Some(mix_state.clone()), None);
         mix_state_eval = Some(mix_state);
     } else if use_sas {
+        let (epsilon_eff, _) = sas_effective_epsilon(theta[k]);
         let sas_state = state_from_sas_spec(SasLinkSpec {
-            initial_epsilon: theta[k],
+            initial_epsilon: epsilon_eff,
             initial_log_delta: theta[k + 1],
         })
         .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?;
@@ -3626,6 +3878,10 @@ where
             trace_term += leverage[i] * dw_total;
         }
         grad[k + j] = -direct_ll[j] + 0.5 * trace_term;
+    }
+    if use_sas {
+        let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
+        grad[k] *= d_eps_d_raw;
     }
     if use_sas && sas_ridge > 0.0 {
         grad[k + 1] += sas_ridge * theta[k + 1];

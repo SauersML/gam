@@ -214,6 +214,7 @@ pub struct SurvivalLocationScaleProbitFitResult {
     pub log_likelihood: f64,
     pub penalized_objective: f64,
     pub iterations: usize,
+    pub final_grad_norm: f64,
     pub converged: bool,
     pub covariance_conditional: Option<Array2<f64>>,
 }
@@ -1158,6 +1159,7 @@ pub fn fit_survival_location_scale_probit(
         log_likelihood: fit.log_likelihood,
         penalized_objective: fit.penalized_objective,
         iterations: fit.inner_cycles,
+        final_grad_norm: fit.outer_final_gradient_norm,
         converged: fit.converged,
         covariance_conditional,
     })
@@ -1743,6 +1745,7 @@ mod tests {
             log_likelihood: 0.0,
             penalized_objective: 0.0,
             iterations: 0,
+            final_grad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
         };
@@ -1777,6 +1780,7 @@ mod tests {
             log_likelihood: 0.0,
             penalized_objective: 0.0,
             iterations: 0,
+            final_grad_norm: 0.0,
             converged: true,
             covariance_conditional: None,
         };

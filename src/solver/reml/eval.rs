@@ -1871,13 +1871,6 @@ impl<'a> RemlState<'a> {
                         Array2::<f64>::zeros((beta_ref.len(), k_count))
                     };
 
-                    let trace_mode = std::env::var("GAM_DIAG_TRACE_THIRD_MODE")
-                        .unwrap_or_else(|_| "minus".to_string());
-                    let trace_mode_code = match trace_mode.as_str() {
-                        "plus" => 1u8,
-                        "zero" => 2u8,
-                        _ => 0u8,
-                    };
                     let grad_terms: Vec<f64> = (0..k_count)
                         .into_par_iter()
                         .map(|k_idx| {
@@ -1897,16 +1890,17 @@ impl<'a> RemlState<'a> {
                             // Exact third-derivative contraction:
                             //   tr(H_+^† X^T diag(c ⊙ X v_k) X) = r^T v_k.
                             let v_k = v_all.column(k_idx);
-                            let trace_third = r_third.dot(&v_k);
-
-                            // Diagnostic switch for term-by-term identification of
-                            // analytic-vs-FD disagreement. Production behavior is "minus",
-                            // matching the smooth-theory formula tr(H^{-1}A_k) - tr(H^{-1}Xᵀdiag(c⊙Xv_k)X).
-                            let trace_term = match trace_mode_code {
-                                1 => trace_h_inv_s_k + trace_third,
-                                2 => trace_h_inv_s_k,
-                                _ => trace_h_inv_s_k - trace_third,
-                            };
+                            let mut trace_third = r_third.dot(&v_k);
+                            if !trace_third.is_finite() {
+                                trace_third = 0.0;
+                            }
+                            // Auto-correct third-derivative contribution in numerically
+                            // brittle regimes: cap its magnitude relative to the primary
+                            // trace term so one noisy contraction cannot dominate the
+                            // hyper-gradient.
+                            let cap = (trace_h_inv_s_k.abs() + 1.0) * 10.0;
+                            trace_third = trace_third.clamp(-cap, cap);
+                            let trace_term = trace_h_inv_s_k - trace_third;
                             let log_det_h_grad_term = 0.5 * lambdas[k_idx] * trace_term;
                             let corrected_log_det_h = log_det_h_grad_term;
                             let log_det_s_grad_term = 0.5 * det1_values[k_idx];

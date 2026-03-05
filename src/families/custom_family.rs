@@ -203,6 +203,7 @@ pub struct BlockwiseFitResult {
     pub covariance_conditional: Option<Array2<f64>>,
     pub penalized_objective: f64,
     pub outer_iterations: usize,
+    pub outer_final_gradient_norm: f64,
     pub inner_cycles: usize,
     pub converged: bool,
 }
@@ -2170,6 +2171,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             covariance_conditional,
             penalized_objective: -inner.log_likelihood + inner.penalty_value + reml_term,
             outer_iterations: 0,
+            outer_final_gradient_norm: 0.0,
             inner_cycles: inner.cycles,
             converged: inner.converged,
         });
@@ -2316,6 +2318,7 @@ pub fn fit_custom_family<F: CustomFamily>(
             -inner.log_likelihood + inner.penalty_value
         },
         outer_iterations: sol.iterations,
+        outer_final_gradient_norm: sol.final_gradient_norm,
         inner_cycles: inner.cycles,
         converged: inner.converged,
     })

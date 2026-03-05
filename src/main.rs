@@ -15,8 +15,9 @@ use gam::basis::{
     evaluate_bspline_derivative_scalar,
 };
 use gam::estimate::{
-    ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, ModelSummary,
-    ParametricTermSummary, SmoothTermSummary, fit_gam, optimize_external_design, predict_gam,
+    ContinuousSmoothnessOrderStatus, EstimationError, ExternalOptimOptions, ExternalOptimResult,
+    FitOptions, FitResult, ModelSummary, ParametricTermSummary, SmoothTermSummary,
+    compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
     predict_gam_posterior_mean_with_fit, predict_gam_with_uncertainty,
 };
 use gam::families::sigma_link::{
@@ -610,7 +611,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     1.0,
                     fit.covariance_conditional.clone(),
                     fit.covariance_conditional.clone(),
-                    f64::NAN,
+                    SavedFitSummary::from_blockwise_fit(&fit)?,
                 );
                 let model = build_location_scale_saved_model(
                     formula_text.clone(),
@@ -818,7 +819,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 1.0,
                 fit.covariance_conditional.clone(),
                 fit.covariance_conditional.clone(),
-                f64::NAN,
+                SavedFitSummary::from_blockwise_fit(&fit)?,
             );
             let mut model = build_location_scale_saved_model(
                 formula_text,
@@ -936,7 +937,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     1.0,
                     None,
                     None,
-                    f64::NAN,
+                    SavedFitSummary::from_joint_result(&joint)?,
                 );
                 let model = SavedModel::from_payload(FittedModelPayload {
                     version: MODEL_VERSION,
@@ -1031,26 +1032,59 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     } else {
         let bootstrap_design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
-        let fitted = fit_term_collection_with_spatial_length_scale_optimization(
+        let base_fit_options = FitOptions {
+            mixture_link: mixture_link_spec.clone(),
+            optimize_mixture: true,
+            sas_link: sas_link_spec,
+            optimize_sas: args.optimize_sas && sas_link_spec.is_some(),
+            max_iter: fit_max_iter,
+            tol: fit_tol,
+            nullspace_dims: vec![],
+            linear_constraints: bootstrap_design.linear_constraints.clone(),
+        };
+        let fitted = match fit_term_collection_with_spatial_length_scale_optimization(
             ds.values.view(),
             y.clone(),
             weights.clone(),
             offset.clone(),
             &spec,
             family,
-            &FitOptions {
-                mixture_link: mixture_link_spec.clone(),
-                optimize_mixture: true,
-                sas_link: sas_link_spec,
-                optimize_sas: args.optimize_sas && sas_link_spec.is_some(),
-                max_iter: fit_max_iter,
-                tol: fit_tol,
-                nullspace_dims: vec![],
-                linear_constraints: bootstrap_design.linear_constraints.clone(),
-            },
+            &base_fit_options,
             &SpatialLengthScaleOptimizationOptions::default(),
-        )
-        .map_err(|e| format!("fit_term_collection (with spatial κ optimization) failed: {e}"))?;
+        ) {
+            Ok(fitted) => fitted,
+            Err(first_err) => {
+                // SAS-link outer auxiliary optimization can occasionally stall on
+                // boundary-heavy datasets. Retry once with fixed SAS params.
+                if base_fit_options.optimize_sas
+                    && base_fit_options.sas_link.is_some()
+                    && matches!(first_err, EstimationError::PirlsDidNotConverge { .. })
+                {
+                    eprintln!(
+                        "[fit] SAS outer optimization failed to converge; retrying with --optimize-sas disabled"
+                    );
+                    let mut retry_options = base_fit_options.clone();
+                    retry_options.optimize_sas = false;
+                    fit_term_collection_with_spatial_length_scale_optimization(
+                        ds.values.view(),
+                        y.clone(),
+                        weights.clone(),
+                        offset.clone(),
+                        &spec,
+                        family,
+                        &retry_options,
+                        &SpatialLengthScaleOptimizationOptions::default(),
+                    )
+                    .map_err(|retry_err| {
+                        format!(
+                            "fit_term_collection failed (SAS optimize->fixed retry also failed): initial={first_err}; retry={retry_err}"
+                        )
+                    })?
+                } else {
+                    return Err(format!("fit_term_collection failed: {first_err}"));
+                }
+            }
+        };
         (fitted.fit, fitted.design, fitted.resolved_spec)
     };
 
@@ -1245,9 +1279,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                     lambdas_time: Array1::zeros(0),
                     lambdas_threshold: Array1::zeros(0),
                     lambdas_log_sigma: Array1::zeros(0),
-                    log_likelihood: f64::NAN,
-                    penalized_objective: f64::NAN,
+                    log_likelihood: 0.0,
+                    penalized_objective: 0.0,
                     iterations: 0,
+                    final_grad_norm: 0.0,
                     converged: true,
                     covariance_conditional: None,
                 },
@@ -1301,9 +1336,10 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                             lambdas_time: Array1::zeros(0),
                             lambdas_threshold: Array1::zeros(0),
                             lambdas_log_sigma: Array1::zeros(0),
-                            log_likelihood: f64::NAN,
-                            penalized_objective: f64::NAN,
+                            log_likelihood: 0.0,
+                            penalized_objective: 0.0,
                             iterations: 0,
+                            final_grad_norm: 0.0,
                             converged: true,
                             covariance_conditional: Some(cov_mat.clone()),
                         },
@@ -3251,7 +3287,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 1.0,
                 fit.covariance_conditional.clone(),
                 fit.covariance_conditional.clone(),
-                f64::NAN,
+                SavedFitSummary::from_survival_location_scale_fit(&fit)?,
             );
             let model_out = SavedModel::from_payload(FittedModelPayload {
                 version: MODEL_VERSION,
@@ -3460,7 +3496,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             1.0,
             cov.clone(),
             cov.clone(),
-            f64::NAN,
+            SavedFitSummary::from_survival_working_summary(&summary, &state)?,
         );
         let model_out = SavedModel::from_payload(FittedModelPayload {
             version: MODEL_VERSION,
@@ -4049,6 +4085,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     let mut plot_scripts = Vec::<String>::new();
     let mut diag_notes = Vec::<String>::new();
     let mut alo_rows = String::new();
+    let mut continuous_rows = String::new();
 
     if let Some(data_path) = args.data.as_ref() {
         let schema = required_saved_schema(&model)?;
@@ -4081,6 +4118,52 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     predict_gam(design.design.view(), fit.beta.view(), offset.view(), family)
                         .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
                 let y = ds.values.column(y_col).to_owned();
+                let report_weights = Array1::<f64>::ones(ds.values.nrows());
+                let summary = build_model_summary(
+                    &design,
+                    &spec,
+                    &fit,
+                    family,
+                    y.view(),
+                    report_weights.view(),
+                );
+                for st in &summary.smooth_terms {
+                    if let Some(ord) = st.continuous_order.as_ref() {
+                        let status = match ord.status {
+                            ContinuousSmoothnessOrderStatus::Ok => "Ok",
+                            ContinuousSmoothnessOrderStatus::NonMaternRegime => "NonMaternRegime",
+                            ContinuousSmoothnessOrderStatus::UndefinedZeroLambda => {
+                                "UndefinedZeroLambda"
+                            }
+                        };
+                        let r_txt = ord
+                            .r_ratio
+                            .filter(|v| v.is_finite())
+                            .map(|v| format!("{v:.6e}"))
+                            .unwrap_or_else(|| "NA".to_string());
+                        let nu_txt = ord
+                            .nu
+                            .filter(|v| v.is_finite())
+                            .map(|v| format!("{v:.6e}"))
+                            .unwrap_or_else(|| "NA".to_string());
+                        let kappa_txt = ord
+                            .kappa2
+                            .filter(|v| v.is_finite())
+                            .map(|v| format!("{v:.6e}"))
+                            .unwrap_or_else(|| "NA".to_string());
+                        continuous_rows.push_str(&format!(
+                            "<tr><td>{}</td><td>{:.6e}</td><td>{:.6e}</td><td>{:.6e}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                            html_escape(&st.name),
+                            ord.lambda0,
+                            ord.lambda1,
+                            ord.lambda2,
+                            r_txt,
+                            nu_txt,
+                            kappa_txt,
+                            status
+                        ));
+                    }
+                }
                 let residuals = &y - &pred.mean;
                 let mut residuals_sorted = residuals.to_vec();
                 residuals_sorted
@@ -4230,9 +4313,11 @@ th {{ background: #f6f8fa; }}
 <table>{summary_rows}</table>
 <h2>Coefficient Table</h2>
 <table><tr><th>Index</th><th>Estimate</th><th>Std. Error</th></tr>{coef_rows}</table>
-<h2>EDF by Penalty Block</h2>
-<table><tr><th>Block</th><th>EDF</th></tr>{edf_rows}</table>
-<h2>Diagnostics</h2>
+	<h2>EDF by Penalty Block</h2>
+	<table><tr><th>Block</th><th>EDF</th></tr>{edf_rows}</table>
+	<h2>Continuous Smoothness Order (Thread 2)</h2>
+	<table><tr><th>Term</th><th>lambda0</th><th>lambda1</th><th>lambda2</th><th>R</th><th>nu</th><th>kappa^2</th><th>Status</th></tr>{continuous_rows}</table>
+	<h2>Diagnostics</h2>
 <div class="grid">
   <div id="qq_plot" class="plot"></div>
   <div id="fit_plot" class="plot"></div>
@@ -4260,6 +4345,11 @@ th {{ background: #f6f8fa; }}
         summary_rows = summary_rows.join(""),
         coef_rows = coef_rows.join(""),
         edf_rows = edf_rows.join(""),
+        continuous_rows = if continuous_rows.is_empty() {
+            "<tr><td colspan=\"8\">Unavailable (requires smooth terms with exactly 3 active penalties and report data input)</td></tr>".to_string()
+        } else {
+            continuous_rows
+        },
         alo_rows = if alo_rows.is_empty() {
             "<tr><td colspan=\"4\">Unavailable</td></tr>".to_string()
         } else {
@@ -4746,24 +4836,40 @@ fn core_saved_fit_result(
     scale: f64,
     beta_covariance: Option<Array2<f64>>,
     beta_covariance_corrected: Option<Array2<f64>>,
-    reml_score: f64,
+    summary: SavedFitSummary,
 ) -> FitResult {
     let p = beta.len();
-    // JSON encodes non-finite floats (NaN/inf) as null, which then fails
-    // deserialization for required f64 fields during predict/report/sample.
-    let reml_score = if reml_score.is_finite() { reml_score } else { 0.0 };
+    // Saved models are part of the stable inference contract. Reject non-finite
+    // values at construction time so JSON cannot silently encode them as null.
+    let summary = summary
+        .validated()
+        .expect("core_saved_fit_result called with non-finite summary metrics");
+    validate_all_finite("fit_result.beta", beta.iter().copied())
+        .expect("core_saved_fit_result called with non-finite beta");
+    validate_all_finite("fit_result.lambdas", lambdas.iter().copied())
+        .expect("core_saved_fit_result called with non-finite lambdas");
+    ensure_finite_scalar("fit_result.scale", scale)
+        .expect("core_saved_fit_result called with non-finite scale");
+    if let Some(cov) = beta_covariance.as_ref() {
+        validate_all_finite("fit_result.beta_covariance", cov.iter().copied())
+            .expect("core_saved_fit_result called with non-finite beta_covariance");
+    }
+    if let Some(cov) = beta_covariance_corrected.as_ref() {
+        validate_all_finite("fit_result.beta_covariance_corrected", cov.iter().copied())
+            .expect("core_saved_fit_result called with non-finite beta_covariance_corrected");
+    }
     FitResult {
         beta,
         lambdas,
         scale,
         edf_by_block: Vec::new(),
         edf_total: 0.0,
-        iterations: 0,
-        final_grad_norm: 0.0,
-        pirls_status: gam::pirls::PirlsStatus::Converged,
-        deviance: 0.0,
-        stable_penalty_term: 0.0,
-        max_abs_eta: 0.0,
+        iterations: summary.iterations,
+        final_grad_norm: summary.final_grad_norm,
+        pirls_status: summary.pirls_status,
+        deviance: summary.deviance,
+        stable_penalty_term: summary.stable_penalty_term,
+        max_abs_eta: summary.max_abs_eta,
         constraint_kkt: None,
         smoothing_correction: None,
         penalized_hessian: Array2::<f64>::zeros((p, p)),
@@ -4775,7 +4881,7 @@ fn core_saved_fit_result(
         beta_standard_errors: None,
         beta_covariance_corrected,
         beta_standard_errors_corrected: None,
-        reml_score,
+        reml_score: summary.reml_score,
         mixture_link_components: None,
         mixture_link_rho: None,
         mixture_link_weights: None,
@@ -4785,6 +4891,130 @@ fn core_saved_fit_result(
         sas_delta: None,
         sas_param_covariance: None,
     }
+}
+
+#[derive(Clone, Copy)]
+struct SavedFitSummary {
+    iterations: usize,
+    final_grad_norm: f64,
+    pirls_status: gam::pirls::PirlsStatus,
+    deviance: f64,
+    stable_penalty_term: f64,
+    max_abs_eta: f64,
+    reml_score: f64,
+}
+
+impl SavedFitSummary {
+    fn validated(self) -> Result<Self, String> {
+        ensure_finite_scalar("fit_result.final_grad_norm", self.final_grad_norm)?;
+        ensure_finite_scalar("fit_result.deviance", self.deviance)?;
+        ensure_finite_scalar("fit_result.stable_penalty_term", self.stable_penalty_term)?;
+        ensure_finite_scalar("fit_result.max_abs_eta", self.max_abs_eta)?;
+        ensure_finite_scalar("fit_result.reml_score", self.reml_score)?;
+        Ok(self)
+    }
+
+    fn from_blockwise_fit(fit: &gam::BlockwiseFitResult) -> Result<Self, String> {
+        let deviance = -2.0 * fit.log_likelihood;
+        let stable_penalty_term = 2.0 * fit.penalized_objective - deviance;
+        let max_abs_eta = fit
+            .block_states
+            .iter()
+            .flat_map(|b| b.eta.iter())
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        Self {
+            iterations: fit.outer_iterations,
+            final_grad_norm: fit.outer_final_gradient_norm,
+            pirls_status: if fit.converged {
+                gam::pirls::PirlsStatus::Converged
+            } else {
+                gam::pirls::PirlsStatus::StalledAtValidMinimum
+            },
+            deviance,
+            stable_penalty_term,
+            max_abs_eta,
+            reml_score: fit.penalized_objective,
+        }
+        .validated()
+    }
+
+    fn from_joint_result(joint: &JointModelResult) -> Result<Self, String> {
+        // Joint flexible-link currently does not expose a terminal gradient norm.
+        // Treat a converged run as stationary and a non-converged run as non-stationary.
+        let final_grad_norm = if joint.converged { 0.0 } else { 1.0 };
+        Self {
+            iterations: joint.backfit_iterations,
+            final_grad_norm,
+            pirls_status: if joint.converged {
+                gam::pirls::PirlsStatus::Converged
+            } else {
+                gam::pirls::PirlsStatus::StalledAtValidMinimum
+            },
+            deviance: joint.deviance,
+            stable_penalty_term: 0.0,
+            max_abs_eta: 0.0,
+            reml_score: joint.deviance,
+        }
+        .validated()
+    }
+
+    fn from_survival_location_scale_fit(
+        fit: &gam::survival_location_scale_probit::SurvivalLocationScaleProbitFitResult,
+    ) -> Result<Self, String> {
+        let deviance = -2.0 * fit.log_likelihood;
+        let stable_penalty_term = 2.0 * fit.penalized_objective - deviance;
+        Self {
+            iterations: fit.iterations,
+            final_grad_norm: fit.final_grad_norm,
+            pirls_status: if fit.converged {
+                gam::pirls::PirlsStatus::Converged
+            } else {
+                gam::pirls::PirlsStatus::StalledAtValidMinimum
+            },
+            deviance,
+            stable_penalty_term,
+            max_abs_eta: 0.0,
+            reml_score: fit.penalized_objective,
+        }
+        .validated()
+    }
+
+    fn from_survival_working_summary(
+        summary: &gam::pirls::WorkingModelPirlsResult,
+        state: &gam::pirls::WorkingState,
+    ) -> Result<Self, String> {
+        let reml_score = 0.5 * (state.deviance + state.penalty_term);
+        Self {
+            iterations: summary.iterations,
+            final_grad_norm: summary.last_gradient_norm,
+            pirls_status: summary.status,
+            deviance: state.deviance,
+            stable_penalty_term: state.penalty_term,
+            max_abs_eta: summary.max_abs_eta,
+            reml_score,
+        }
+        .validated()
+    }
+}
+
+fn ensure_finite_scalar(name: &str, value: f64) -> Result<(), String> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(format!("{name} must be finite, got {value}"))
+    }
+}
+
+fn validate_all_finite<I>(label: &str, values: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = f64>,
+{
+    for (idx, v) in values.into_iter().enumerate() {
+        if !v.is_finite() {
+            return Err(format!("{label}[{idx}] must be finite, got {v}"));
+        }
+    }
+    Ok(())
 }
 
 fn saved_mixture_state_from_fit(fit: &FitResult) -> Option<gam::types::MixtureLinkState> {
@@ -5045,11 +5275,142 @@ fn validate_frozen_term_collection_spec(
 
 fn write_model_json(path: &Path, model: &SavedModel) -> Result<(), String> {
     validate_saved_model_for_inference_stability(model)?;
+    validate_saved_model_numeric_finiteness(model)?;
     let payload = serde_json::to_string_pretty(model)
         .map_err(|e| format!("failed to serialize model: {e}"))?;
     fs::write(path, payload)
         .map_err(|e| format!("failed to write model '{}': {e}", path.display()))?;
     println!("saved model: {}", path.display());
+    Ok(())
+}
+
+fn validate_saved_model_numeric_finiteness(model: &SavedModel) -> Result<(), String> {
+    if let Some(fit) = model.fit_result.as_ref() {
+        ensure_finite_scalar("fit_result.scale", fit.scale)?;
+        ensure_finite_scalar("fit_result.final_grad_norm", fit.final_grad_norm)?;
+        ensure_finite_scalar("fit_result.deviance", fit.deviance)?;
+        ensure_finite_scalar("fit_result.stable_penalty_term", fit.stable_penalty_term)?;
+        ensure_finite_scalar("fit_result.max_abs_eta", fit.max_abs_eta)?;
+        ensure_finite_scalar("fit_result.reml_score", fit.reml_score)?;
+        ensure_finite_scalar("fit_result.edf_total", fit.edf_total)?;
+        validate_all_finite("fit_result.beta", fit.beta.iter().copied())?;
+        validate_all_finite("fit_result.lambdas", fit.lambdas.iter().copied())?;
+        validate_all_finite("fit_result.edf_by_block", fit.edf_by_block.iter().copied())?;
+        validate_all_finite(
+            "fit_result.working_weights",
+            fit.working_weights.iter().copied(),
+        )?;
+        validate_all_finite(
+            "fit_result.working_response",
+            fit.working_response.iter().copied(),
+        )?;
+        validate_all_finite(
+            "fit_result.penalized_hessian",
+            fit.penalized_hessian.iter().copied(),
+        )?;
+        if let Some(v) = fit.beta_covariance.as_ref() {
+            validate_all_finite("fit_result.beta_covariance", v.iter().copied())?;
+        }
+        if let Some(v) = fit.beta_covariance_corrected.as_ref() {
+            validate_all_finite("fit_result.beta_covariance_corrected", v.iter().copied())?;
+        }
+        if let Some(v) = fit.beta_standard_errors.as_ref() {
+            validate_all_finite("fit_result.beta_standard_errors", v.iter().copied())?;
+        }
+        if let Some(v) = fit.beta_standard_errors_corrected.as_ref() {
+            validate_all_finite("fit_result.beta_standard_errors_corrected", v.iter().copied())?;
+        }
+        if let Some(v) = fit.mixture_link_rho.as_ref() {
+            validate_all_finite("fit_result.mixture_link_rho", v.iter().copied())?;
+        }
+        if let Some(v) = fit.mixture_link_weights.as_ref() {
+            validate_all_finite("fit_result.mixture_link_weights", v.iter().copied())?;
+        }
+        if let Some(v) = fit.mixture_link_param_covariance.as_ref() {
+            validate_all_finite(
+                "fit_result.mixture_link_param_covariance",
+                v.iter().copied(),
+            )?;
+        }
+        if let Some(v) = fit.sas_param_covariance.as_ref() {
+            validate_all_finite("fit_result.sas_param_covariance", v.iter().copied())?;
+        }
+        if let Some(v) = fit.sas_epsilon {
+            ensure_finite_scalar("fit_result.sas_epsilon", v)?;
+        }
+        if let Some(v) = fit.sas_log_delta {
+            ensure_finite_scalar("fit_result.sas_log_delta", v)?;
+        }
+        if let Some(v) = fit.sas_delta {
+            ensure_finite_scalar("fit_result.sas_delta", v)?;
+        }
+    }
+
+    if let Some(v) = model.sigma_min {
+        ensure_finite_scalar("sigma_min", v)?;
+    }
+    if let Some(v) = model.sigma_max {
+        ensure_finite_scalar("sigma_max", v)?;
+    }
+    if let Some(v) = model.survival_baseline_scale {
+        ensure_finite_scalar("survival_baseline_scale", v)?;
+    }
+    if let Some(v) = model.survival_baseline_shape {
+        ensure_finite_scalar("survival_baseline_shape", v)?;
+    }
+    if let Some(v) = model.survival_baseline_rate {
+        ensure_finite_scalar("survival_baseline_rate", v)?;
+    }
+    if let Some(v) = model.survival_time_smooth_lambda {
+        ensure_finite_scalar("survival_time_smooth_lambda", v)?;
+    }
+    if let Some(v) = model.survival_ridge_lambda {
+        ensure_finite_scalar("survival_ridge_lambda", v)?;
+    }
+    if let Some(v) = model.survival_sigma_min {
+        ensure_finite_scalar("survival_sigma_min", v)?;
+    }
+    if let Some(v) = model.survival_sigma_max {
+        ensure_finite_scalar("survival_sigma_max", v)?;
+    }
+
+    if let Some(v) = model.beta_noise.as_ref() {
+        validate_all_finite("beta_noise", v.iter().copied())?;
+    }
+    if let Some(v) = model.joint_beta_link.as_ref() {
+        validate_all_finite("joint_beta_link", v.iter().copied())?;
+    }
+    if let Some(v) = model.joint_knot_vector.as_ref() {
+        validate_all_finite("joint_knot_vector", v.iter().copied())?;
+    }
+    if let Some((a, b)) = model.joint_knot_range {
+        ensure_finite_scalar("joint_knot_range.0", a)?;
+        ensure_finite_scalar("joint_knot_range.1", b)?;
+    }
+    if let Some(v) = model.joint_ridge_used {
+        ensure_finite_scalar("joint_ridge_used", v)?;
+    }
+    if let Some(v) = model.beta_wiggle.as_ref() {
+        validate_all_finite("beta_wiggle", v.iter().copied())?;
+    }
+    if let Some(v) = model.survival_beta_time.as_ref() {
+        validate_all_finite("survival_beta_time", v.iter().copied())?;
+    }
+    if let Some(v) = model.survival_beta_threshold.as_ref() {
+        validate_all_finite("survival_beta_threshold", v.iter().copied())?;
+    }
+    if let Some(v) = model.survival_beta_log_sigma.as_ref() {
+        validate_all_finite("survival_beta_log_sigma", v.iter().copied())?;
+    }
+    if let Some(v) = model.mixture_link_param_covariance.as_ref() {
+        validate_all_finite(
+            "mixture_link_param_covariance",
+            v.iter().flatten().copied(),
+        )?;
+    }
+    if let Some(v) = model.sas_param_covariance.as_ref() {
+        validate_all_finite("sas_param_covariance", v.iter().flatten().copied())?;
+    }
     Ok(())
 }
 
@@ -6561,6 +6922,7 @@ fn build_model_summary(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
 ) -> ModelSummary {
+    const CONTINUOUS_ORDER_EPS: f64 = 1e-12;
     let se = fit
         .beta_standard_errors_corrected
         .as_ref()
@@ -6697,10 +7059,12 @@ fn build_model_summary(
             ref_df,
             chi_sq: chi_sq_opt,
             p_value,
+            continuous_order: None,
         });
     }
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
+        let term_penalty_start = penalty_cursor;
         let edf = fit.edf_by_block[penalty_cursor..penalty_cursor + k]
             .iter()
             .sum::<f64>();
@@ -6714,12 +7078,41 @@ fn build_model_summary(
         });
         let ref_df = (term.coeff_range.end - term.coeff_range.start).max(1) as f64;
         let p_value = chi_sq_opt.and_then(|x| chi_square_survival_approx(x, ref_df));
+        let continuous_order = if k == 3
+            && term_penalty_start + 2 < fit.lambdas.len()
+            && term_penalty_start + 2 < design.penalty_info.len()
+        {
+            let lambda_tilde = [
+                fit.lambdas[term_penalty_start],
+                fit.lambdas[term_penalty_start + 1],
+                fit.lambdas[term_penalty_start + 2],
+            ];
+            let scales = [
+                design.penalty_info[term_penalty_start]
+                    .penalty
+                    .normalization_scale,
+                design.penalty_info[term_penalty_start + 1]
+                    .penalty
+                    .normalization_scale,
+                design.penalty_info[term_penalty_start + 2]
+                    .penalty
+                    .normalization_scale,
+            ];
+            Some(compute_continuous_smoothness_order(
+                lambda_tilde,
+                scales,
+                CONTINUOUS_ORDER_EPS,
+            ))
+        } else {
+            None
+        };
         smooth_terms.push(SmoothTermSummary {
             name: term.name.clone(),
             edf,
             ref_df,
             chi_sq: chi_sq_opt,
             p_value,
+            continuous_order,
         });
     }
 
@@ -7280,21 +7673,29 @@ mod tests {
     }
 
     #[test]
-    fn core_saved_fit_result_json_roundtrips_with_non_finite_input() {
+    fn core_saved_fit_result_json_roundtrips_with_finite_summary() {
         let fit = core_saved_fit_result(
             Array1::from_vec(vec![0.1, -0.2]),
             Array1::from_vec(vec![1e-3]),
             1.0,
             None,
             None,
-            f64::NAN,
+            SavedFitSummary {
+                iterations: 3,
+                final_grad_norm: 0.25,
+                pirls_status: gam::pirls::PirlsStatus::Converged,
+                deviance: 1.5,
+                stable_penalty_term: 0.4,
+                max_abs_eta: 2.0,
+                reml_score: 0.95,
+            },
         );
         let payload = serde_json::to_string(&fit).expect("serialize fit result");
         let parsed: gam::estimate::FitResult =
             serde_json::from_str(&payload).expect("deserialize fit result");
-        assert_eq!(parsed.final_grad_norm, 0.0);
-        assert_eq!(parsed.deviance, 0.0);
-        assert_eq!(parsed.reml_score, 0.0);
+        assert_eq!(parsed.final_grad_norm, 0.25);
+        assert_eq!(parsed.deviance, 1.5);
+        assert_eq!(parsed.reml_score, 0.95);
     }
 
     #[test]
