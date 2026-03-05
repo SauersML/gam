@@ -309,10 +309,13 @@ pub struct TwoBlockExactJointHyperSetup {
 #[derive(Debug, Clone)]
 pub(crate) struct SpatialPsiDerivative {
     pub penalty_index: usize,
+    pub penalty_indices: Vec<usize>,
     pub x_psi: Array2<f64>,
     pub s_psi: Array2<f64>,
+    pub s_psi_components: Vec<Array2<f64>>,
     pub x_psi_psi: Array2<f64>,
     pub s_psi_psi: Array2<f64>,
+    pub s_psi_psi_components: Vec<Array2<f64>>,
 }
 
 pub type TwoBlockMaternKappaOptimizationResult<FitOut> =
@@ -3894,14 +3897,24 @@ fn try_build_spatial_term_log_kappa_derivative_info(
     design: &TermCollectionDesign,
     term_idx: usize,
 ) -> Result<Option<SpatialPsiDerivative>, EstimationError> {
-    let Some((x_psi, s_psi, x_psi_psi, s_psi_psi)) =
+    let Some((x_psi, s_psi, x_psi_psi, s_psi_psi, s_psi_components, s_psi_psi_components)) =
         try_build_spatial_term_log_kappa_derivative(data, resolved_spec, design, term_idx)?
     else {
         return Ok(None);
     };
-    let Some(penalty_index) = smooth_term_penalty_index(resolved_spec, design, term_idx) else {
+    let Some(penalty_start) = smooth_term_penalty_index(resolved_spec, design, term_idx) else {
         return Ok(None);
     };
+    if s_psi_components.is_empty() || s_psi_psi_components.is_empty() {
+        return Ok(None);
+    }
+    if s_psi_components.len() != s_psi_psi_components.len() {
+        return Ok(None);
+    }
+    let penalty_indices = (0..s_psi_components.len())
+        .map(|j| penalty_start + j)
+        .collect::<Vec<_>>();
+    let penalty_index = penalty_indices[0];
     let s_psi0 = s_psi;
     let s_psi_psi0 = s_psi_psi;
     if s_psi0.nrows() == 0 || s_psi_psi0.nrows() == 0 {
@@ -3909,10 +3922,13 @@ fn try_build_spatial_term_log_kappa_derivative_info(
     }
     Ok(Some(SpatialPsiDerivative {
         penalty_index,
+        penalty_indices,
         x_psi,
         s_psi: s_psi0,
+        s_psi_components,
         x_psi_psi,
         s_psi_psi: s_psi_psi0,
+        s_psi_psi_components,
     }))
 }
 
@@ -3943,7 +3959,17 @@ fn try_build_spatial_term_log_kappa_derivative(
     resolved_spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
     term_idx: usize,
-) -> Result<Option<(Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>)>, EstimationError> {
+) -> Result<
+    Option<(
+        Array2<f64>,
+        Array2<f64>,
+        Array2<f64>,
+        Array2<f64>,
+        Vec<Array2<f64>>,
+        Vec<Array2<f64>>,
+    )>,
+    EstimationError,
+> {
     let smooth_term = match design.smooth.terms.get(term_idx) {
         Some(term) => term,
         None => return Ok(None),
@@ -4010,16 +4036,37 @@ fn try_build_spatial_term_log_kappa_derivative(
         .slice_mut(s![.., global_range.clone()])
         .assign(&local_x_psi_psi);
 
-    let mut s_psi = Array2::<f64>::zeros((p_total, p_total));
-    s_psi
-        .slice_mut(s![global_range.clone(), global_range.clone()])
-        .assign(&local_s_psi[0]);
-    let mut s_psi_psi = Array2::<f64>::zeros((p_total, p_total));
-    s_psi_psi
-        .slice_mut(s![global_range.clone(), global_range.clone()])
-        .assign(&local_s_psi_psi[0]);
+    let mut s_psi_components = Vec::<Array2<f64>>::with_capacity(local_s_psi.len());
+    let mut s_psi_psi_components = Vec::<Array2<f64>>::with_capacity(local_s_psi_psi.len());
+    for s_loc in &local_s_psi {
+        let mut s_glob = Array2::<f64>::zeros((p_total, p_total));
+        s_glob
+            .slice_mut(s![global_range.clone(), global_range.clone()])
+            .assign(s_loc);
+        s_psi_components.push(s_glob);
+    }
+    for s2_loc in &local_s_psi_psi {
+        let mut s2_glob = Array2::<f64>::zeros((p_total, p_total));
+        s2_glob
+            .slice_mut(s![global_range.clone(), global_range.clone()])
+            .assign(s2_loc);
+        s_psi_psi_components.push(s2_glob);
+    }
+    let s_psi = s_psi_components
+        .iter()
+        .fold(Array2::<f64>::zeros((p_total, p_total)), |acc, m| acc + m);
+    let s_psi_psi = s_psi_psi_components
+        .iter()
+        .fold(Array2::<f64>::zeros((p_total, p_total)), |acc, m| acc + m);
 
-    Ok(Some((x_psi, s_psi, x_psi_psi, s_psi_psi)))
+    Ok(Some((
+        x_psi,
+        s_psi,
+        x_psi_psi,
+        s_psi_psi,
+        s_psi_components,
+        s_psi_psi_components,
+    )))
 }
 
 fn try_build_spatial_log_kappa_hyper_dirs(
@@ -4044,12 +4091,28 @@ fn try_build_spatial_log_kappa_hyper_dirs(
         let mut s_second = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); psi_dim];
         x_second[i] = info.x_psi_psi.clone();
         s_second[i] = info.s_psi_psi.clone();
+        let s_components = info
+            .penalty_indices
+            .iter()
+            .copied()
+            .zip(info.s_psi_components.iter().cloned())
+            .collect::<Vec<_>>();
+        let s2_components = info
+            .penalty_indices
+            .iter()
+            .copied()
+            .zip(info.s_psi_psi_components.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut s_second_components = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+        s_second_components[i] = s2_components;
         hyper_dirs.push(DirectionalHyperParam {
-            penalty_index: Some(info.penalty_index),
+            penalty_index: None,
             x_tau_original: info.x_psi,
             s_tau_original: info.s_psi,
+            s_tau_original_components: Some(s_components),
             x_tau_tau_original: Some(x_second),
             s_tau_tau_original: Some(s_second),
+            s_tau_tau_original_components: Some(s_second_components),
         });
     }
     Ok(Some(hyper_dirs))
@@ -4086,12 +4149,28 @@ fn try_exact_joint_spatial_hyper_cost_gradient(
         let mut s_second = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); psi_dim];
         x_second[i] = info.x_psi_psi.clone();
         s_second[i] = info.s_psi_psi.clone();
+        let s_components = info
+            .penalty_indices
+            .iter()
+            .copied()
+            .zip(info.s_psi_components.iter().cloned())
+            .collect::<Vec<_>>();
+        let s2_components = info
+            .penalty_indices
+            .iter()
+            .copied()
+            .zip(info.s_psi_psi_components.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut s_second_components = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+        s_second_components[i] = s2_components;
         hyper_dirs.push(DirectionalHyperParam {
-            penalty_index: Some(info.penalty_index),
+            penalty_index: None,
             x_tau_original: info.x_psi,
             s_tau_original: info.s_psi,
+            s_tau_original_components: Some(s_components),
             x_tau_tau_original: Some(x_second),
             s_tau_tau_original: Some(s_second),
+            s_tau_tau_original_components: Some(s_second_components),
         });
     }
     let external_opts = external_opts_for_design(family, &design, options);
@@ -4140,12 +4219,28 @@ fn try_exact_joint_spatial_hyper_cost_gradient_hessian(
         let mut s_second = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); psi_dim];
         x_second[i] = info.x_psi_psi.clone();
         s_second[i] = info.s_psi_psi.clone();
+        let s_components = info
+            .penalty_indices
+            .iter()
+            .copied()
+            .zip(info.s_psi_components.iter().cloned())
+            .collect::<Vec<_>>();
+        let s2_components = info
+            .penalty_indices
+            .iter()
+            .copied()
+            .zip(info.s_psi_psi_components.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut s_second_components = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+        s_second_components[i] = s2_components;
         hyper_dirs.push(DirectionalHyperParam {
-            penalty_index: Some(info.penalty_index),
+            penalty_index: None,
             x_tau_original: info.x_psi,
             s_tau_original: info.s_psi,
+            s_tau_original_components: Some(s_components),
             x_tau_tau_original: Some(x_second),
             s_tau_tau_original: Some(s_second),
+            s_tau_tau_original_components: Some(s_second_components),
         });
     }
     let external_opts = external_opts_for_design(family, &design, options);

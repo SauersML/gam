@@ -4136,6 +4136,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                             ContinuousSmoothnessOrderStatus::Ok => "Ok",
                             ContinuousSmoothnessOrderStatus::NonMaternRegime => "NonMaternRegime",
                             ContinuousSmoothnessOrderStatus::FirstOrderLimit => "FirstOrderLimit",
+                            ContinuousSmoothnessOrderStatus::IntrinsicLimit => "IntrinsicLimit",
                             ContinuousSmoothnessOrderStatus::UndefinedZeroLambda => {
                                 "UndefinedZeroLambda"
                             }
@@ -7086,21 +7087,26 @@ fn build_model_summary(
             && term_penalty_start + 2 < fit.lambdas.len()
             && term_penalty_start + 2 < design.penalty_info.len()
         {
+            // Unscaling identity for physical lambdas:
+            //   S_tilde_k = S_k / c_k, and
+            //   lambda_tilde_k * S_tilde_k = (lambda_tilde_k / c_k) * S_k.
+            // Therefore physical lambda used by Thread-2 diagnostics is
+            //   lambda_k = lambda_tilde_k / c_k.
+            // If legacy metadata is missing/corrupt, fallback c_k=1 preserves
+            // backward-compatible behavior.
+            let scale_or_one = |idx: usize| {
+                let c = design.penalty_info[idx].penalty.normalization_scale;
+                if c.is_finite() && c > 0.0 { c } else { 1.0 }
+            };
             let lambda_tilde = [
                 fit.lambdas[term_penalty_start],
                 fit.lambdas[term_penalty_start + 1],
                 fit.lambdas[term_penalty_start + 2],
             ];
             let scales = [
-                design.penalty_info[term_penalty_start]
-                    .penalty
-                    .normalization_scale,
-                design.penalty_info[term_penalty_start + 1]
-                    .penalty
-                    .normalization_scale,
-                design.penalty_info[term_penalty_start + 2]
-                    .penalty
-                    .normalization_scale,
+                scale_or_one(term_penalty_start),
+                scale_or_one(term_penalty_start + 1),
+                scale_or_one(term_penalty_start + 2),
             ];
             Some(compute_continuous_smoothness_order(
                 lambda_tilde,

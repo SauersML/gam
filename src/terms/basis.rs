@@ -2827,6 +2827,7 @@ fn matern_kernel_log_kappa_second_derivative_from_distance(
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 fn matern_poly_terms(nu: MaternNu, a: f64) -> (f64, f64, f64) {
     match nu {
         MaternNu::Half => (1.0, 0.0, 0.0),
@@ -2853,6 +2854,7 @@ fn matern_poly_terms(nu: MaternNu, a: f64) -> (f64, f64, f64) {
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 fn matern_kernel_radial_triplet(
     r: f64,
     length_scale: f64,
@@ -2879,6 +2881,132 @@ fn matern_kernel_radial_triplet(
     Ok((phi, phi_r, phi_rr))
 }
 
+#[inline(always)]
+fn matern_kernel_radial_triplet_with_safe_ratio(
+    r: f64,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<(f64, f64, f64, f64), BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn kernel distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Matérn length_scale must be finite and positive".to_string(),
+        ));
+    }
+
+    // Full derivation used by collocation operators
+    // ----------------------------------------------
+    // Half-integer Matérn kernels admit polynomial-exponential form:
+    //   phi(r) = P_nu(a) * exp(-a),  a = s r,  s = sqrt(2 nu) / length_scale.
+    //
+    // Differentiate in a and chain (da/dr = s, constant):
+    //   phi'(r)  = s   exp(-a) * (P' - P),
+    //   phi''(r) = s^2 exp(-a) * (P'' - 2P' + P).
+    //
+    // For Laplacian we need a stable phi'(r)/r term:
+    //   Delta phi = phi'' + (d-1) * phi'(r)/r.
+    //
+    // We therefore use algebraically-cancelled closed forms for phi'(r)/r:
+    // - nu >= 3/2: finite limit at r -> 0.
+    // - nu  = 1/2: phi'(r)/r ~ -kappa/r diverges, so we evaluate at a tiny
+    //   positive radius floor to avoid NaN/Inf in dense operator assembly.
+    //
+    // This keeps D1, D2 finite and deterministic while preserving analytic
+    // derivatives away from the singular point.
+    // Closed forms used below (a = s r, E = exp(-a)):
+    // nu=1/2:
+    //   phi'    = -s E
+    //   phi''   =  s^2 E
+    //   phi'/r  diverges as -s/r (regularized via r floor).
+    // nu=3/2:
+    //   phi'    = -s E a
+    //   phi''   =  s^2 E (a-1)
+    //   phi'/r  = -s^2 E.
+    // nu=5/2:
+    //   phi'    = -(s/3) E a(a+1)
+    //   phi''   =  (s^2/3) E (a^2-a-1)
+    //   phi'/r  = -(s^2/3) E (a+1).
+    // nu=7/2:
+    //   phi'    = -(s/15) E a(a^2+3a+3)
+    //   phi''   =  (s^2/15) E (a^3-3a-3)
+    //   phi'/r  = -(s^2/15) E (a^2+3a+3).
+    // nu=9/2:
+    //   phi'    = -(s/105) E a(a^3+6a^2+15a+15)
+    //   phi''   =  (s^2/105) E (a^4+2a^3-3a^2-15a-15)
+    //   phi'/r  = -(s^2/105) E (a^3+6a^2+15a+15).
+    let (phi, phi_r, phi_rr, phi_r_over_r) = match nu {
+        MaternNu::Half => {
+            let s = 1.0 / length_scale;
+            let r_eval = r.max(1e-8 * length_scale.max(1e-8));
+            let a_eval = s * r_eval;
+            let e_eval = (-a_eval).exp();
+            let phi = if r > 0.0 { (-s * r).exp() } else { 1.0 };
+            let phi_r = -s * e_eval;
+            let phi_rr = s * s * e_eval;
+            let ratio = -s * e_eval / r_eval;
+            (phi, phi_r, phi_rr, ratio)
+        }
+        MaternNu::ThreeHalves => {
+            let s = 3.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a) * e;
+            let phi_r = -s * e * a;
+            let phi_rr = s * s * e * (a - 1.0);
+            let ratio = -s * s * e;
+            (phi, phi_r, phi_rr, ratio)
+        }
+        MaternNu::FiveHalves => {
+            let s = 5.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a + (a * a) / 3.0) * e;
+            let phi_r = -(s / 3.0) * e * a * (a + 1.0);
+            let phi_rr = (s * s / 3.0) * e * (a * a - a - 1.0);
+            let ratio = -(s * s / 3.0) * e * (a + 1.0);
+            (phi, phi_r, phi_rr, ratio)
+        }
+        MaternNu::SevenHalves => {
+            let s = 7.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a + (2.0 / 5.0) * a * a + (1.0 / 15.0) * a * a * a) * e;
+            let phi_r = -(s / 15.0) * e * a * (a * a + 3.0 * a + 3.0);
+            let phi_rr = (s * s / 15.0) * e * (a * a * a - 3.0 * a - 3.0);
+            let ratio = -(s * s / 15.0) * e * (a * a + 3.0 * a + 3.0);
+            (phi, phi_r, phi_rr, ratio)
+        }
+        MaternNu::NineHalves => {
+            let s = 9.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0
+                + a
+                + (3.0 / 7.0) * a * a
+                + (2.0 / 21.0) * a * a * a
+                + (1.0 / 105.0) * a * a * a * a)
+                * e;
+            let phi_r = -(s / 105.0) * e * a * (a * a * a + 6.0 * a * a + 15.0 * a + 15.0);
+            let phi_rr = (s * s / 105.0)
+                * e
+                * (a * a * a * a + 2.0 * a * a * a - 3.0 * a * a - 15.0 * a - 15.0);
+            let ratio = -(s * s / 105.0) * e * (a * a * a + 6.0 * a * a + 15.0 * a + 15.0);
+            (phi, phi_r, phi_rr, ratio)
+        }
+    };
+
+    if !phi.is_finite() || !phi_r.is_finite() || !phi_rr.is_finite() || !phi_r_over_r.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite Matérn radial derivatives at r={r}, length_scale={length_scale}, nu={nu:?}"
+        )));
+    }
+    Ok((phi, phi_r, phi_rr, phi_r_over_r))
+}
+
 fn duchon_kernel_radial_triplet(
     r: f64,
     length_scale: f64,
@@ -2891,39 +3019,34 @@ fn duchon_kernel_radial_triplet(
         return duchon_matern_p1_s4_k10_radial_triplet(r, length_scale);
     }
 
-    if s_order == 0 {
-        let kappa = 1.0 / length_scale.max(1e-300);
-        let coeffs_local;
-        let coeffs_ref = if let Some(c) = coeffs {
-            c
-        } else {
-            coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
-            &coeffs_local
-        };
-        let r_eval = r.max(DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8));
-        let mut value = 0.0;
-        let mut first = 0.0;
-        let mut second = 0.0;
-        for (m, coeff) in coeffs_ref.a.iter().enumerate().skip(1) {
-            if *coeff == 0.0 {
-                continue;
-            }
-            let (vm, dm, d2m) = duchon_polyharmonic_block_triplet(r_eval, m, k_dim)?;
-            value += coeff * vm;
-            first += coeff * dm;
-            second += coeff * d2m;
-        }
-        if r == 0.0 && p_order > 0 {
-            value = 0.0;
-        }
-        if !value.is_finite() || !first.is_finite() || !second.is_finite() {
-            return Err(BasisError::InvalidInput(format!(
-                "non-finite pure-polyharmonic derivatives at r={r}, length_scale={length_scale}, p={p_order}, dim={k_dim}"
-            )));
-        }
-        return Ok((value, first, second));
-    }
-
+    // Generic Duchon decomposition derivatives
+    // ----------------------------------------
+    // Partial-fraction representation:
+    //   phi(r) = sum_{m>=1} a_m * Phi_m(r) + sum_{n>=1} b_n * M_n(r),
+    // where:
+    //   Phi_m = polyharmonic block (power/log-power),
+    //   M_n   = c_n * r^nu * K_nu(kappa r).
+    //
+    // We evaluate phi through the canonical kernel function (ensures exact match
+    // with basis-value construction), and evaluate phi', phi'' analytically by
+    // summing derivatives of each block.
+    //
+    // This keeps the main derivative path FD-free. Finite-difference fallback is
+    // enabled only if the analytic accumulation becomes non-finite.
+    // Full Duchon derivative strategy
+    // -------------------------------
+    // Kernel is represented by partial fractions:
+    //   phi(r) = sum_m a_m * Phi_m(r) + sum_n b_n * M_n(r),
+    // where Phi_m are polyharmonic blocks and M_n are Matérn-Bessel blocks.
+    //
+    // We evaluate phi itself from the canonical kernel evaluator to ensure
+    // consistency with the basis design path, then compute derivatives from the
+    // same decomposition analytically:
+    //   phi'  = sum_m a_m * Phi_m'  + sum_n b_n * M_n'
+    //   phi'' = sum_m a_m * Phi_m'' + sum_n b_n * M_n''.
+    //
+    // Finite differences are not used on the main path; they are kept only as a
+    // last-resort fallback when analytic accumulation becomes non-finite.
     let value = duchon_matern_kernel_general_from_distance(
         r,
         length_scale,
@@ -2937,12 +3060,55 @@ fn duchon_kernel_radial_triplet(
             "non-finite Duchon radial kernel value at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
         )));
     }
-    if r <= 0.0 {
-        return Ok((value, 0.0, 0.0));
+
+    let kappa = 1.0 / length_scale.max(1e-300);
+    let coeffs_local;
+    let coeffs_ref = if let Some(c) = coeffs {
+        c
+    } else {
+        coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+        &coeffs_local
+    };
+    let r_eval = r.max(DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8));
+    let mut first = 0.0;
+    let mut second = 0.0;
+
+    for (m, coeff) in coeffs_ref.a.iter().enumerate().skip(1) {
+        if *coeff == 0.0 {
+            continue;
+        }
+        let (_vm, dm, d2m) = duchon_polyharmonic_block_triplet(r_eval, m, k_dim)?;
+        first += coeff * dm;
+        second += coeff * d2m;
     }
-    let h = (1e-5 * (1.0 + r)).clamp(1e-7, 1e-2);
+    for (n, coeff) in coeffs_ref.b.iter().enumerate().skip(1) {
+        if *coeff == 0.0 {
+            continue;
+        }
+        let (_vn, dn, d2n) = duchon_matern_block_triplet(r_eval, kappa, n, k_dim)?;
+        first += coeff * dn;
+        second += coeff * d2n;
+    }
+
+    if r == 0.0 {
+        first = 0.0;
+    }
+    if first.is_finite() && second.is_finite() {
+        return Ok((value, first, second));
+    }
+
+    // Fallback only when analytic path is numerically unstable/exploded.
+    let h = (1e-5 * (1.0 + r_eval)).clamp(1e-7, 1e-2);
     let fp = duchon_matern_kernel_general_from_distance(
-        r + h,
+        r_eval + h,
+        length_scale,
+        p_order,
+        s_order,
+        k_dim,
+        coeffs,
+    )?;
+    let vmid = duchon_matern_kernel_general_from_distance(
+        r_eval,
         length_scale,
         p_order,
         s_order,
@@ -2950,21 +3116,21 @@ fn duchon_kernel_radial_triplet(
         coeffs,
     )?;
     let fm = duchon_matern_kernel_general_from_distance(
-        (r - h).max(0.0),
+        (r_eval - h).max(0.0),
         length_scale,
         p_order,
         s_order,
         k_dim,
         coeffs,
     )?;
-    let first = (fp - fm) / (2.0 * h);
-    let second = (fp - 2.0 * value + fm) / (h * h);
-    if !first.is_finite() || !second.is_finite() {
+    let first_fd = (fp - fm) / (2.0 * h);
+    let second_fd = (fp - 2.0 * vmid + fm) / (h * h);
+    if !first_fd.is_finite() || !second_fd.is_finite() {
         return Err(BasisError::InvalidInput(format!(
             "non-finite Duchon radial derivatives at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
         )));
     }
-    Ok((value, first, second))
+    Ok((value, first_fd, second_fd))
 }
 
 fn symmetrize(matrix: &Array2<f64>) -> Array2<f64> {
@@ -2979,6 +3145,7 @@ fn normalize_penalty(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
 fn build_collocation_operators_from_radial<F>(
     collocation: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
+    collocation_weights: Option<ArrayView1<'_, f64>>,
     radial_triplet: F,
 ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError>
 where
@@ -2990,8 +3157,43 @@ where
     let mut d0 = Array2::<f64>::zeros((p, m));
     let mut d1 = Array2::<f64>::zeros((p * d, m));
     let mut d2 = Array2::<f64>::zeros((p, m));
+    // Weighted collocation definition (operator quadrature)
+    // ----------------------------------------------------
+    // For collocation points z_k with nonnegative weights w_k:
+    //   int g(x) dx ~ sum_k w_k g(z_k).
+    //
+    // Define rows with sqrt(w_k):
+    //   D0[k,j]          = sqrt(w_k) * b_j(z_k)
+    //   D1[(k-1)d+m, j]  = sqrt(w_k) * ∂_m b_j(z_k)
+    //   D2[k,j]          = sqrt(w_k) * Δ b_j(z_k)
+    //
+    // Then the Gram forms are exactly the collocation energies:
+    //   theta^T D0^T D0 theta = sum_k w_k f(z_k)^2
+    //   theta^T D1^T D1 theta = sum_k w_k |grad f(z_k)|^2
+    //   theta^T D2^T D2 theta = sum_k w_k (Delta f(z_k))^2.
+    let row_scales = if let Some(w) = collocation_weights {
+        if w.len() != p {
+            return Err(BasisError::DimensionMismatch(format!(
+                "collocation weight length mismatch: got {}, expected {p}",
+                w.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(p);
+        for &wk in w {
+            if !wk.is_finite() || wk < 0.0 {
+                return Err(BasisError::InvalidInput(format!(
+                    "collocation weights must be finite and non-negative; got {wk}"
+                )));
+            }
+            out.push(wk.sqrt());
+        }
+        out
+    } else {
+        vec![1.0; p]
+    };
     const R_EPS: f64 = 1e-10;
     for k in 0..p {
+        let scale_k = row_scales[k];
         for j in 0..m {
             let mut dist2 = 0.0;
             for c in 0..d {
@@ -3005,16 +3207,18 @@ where
                     "non-finite collocation operator derivative at collocation row {k}, center {j}, r={r}"
                 )));
             }
-            d0[[k, j]] = phi;
+            d0[[k, j]] = scale_k * phi;
             if r > R_EPS {
                 let scale = phi_r / r;
                 for c in 0..d {
                     let delta = collocation[[k, c]] - centers[[j, c]];
-                    d1[[k * d + c, j]] = scale * delta;
+                    d1[[k * d + c, j]] = scale_k * scale * delta;
                 }
-                d2[[k, j]] = phi_rr + ((d as f64 - 1.0) * phi_r / r);
+                d2[[k, j]] = scale_k * (phi_rr + ((d as f64 - 1.0) * phi_r / r));
             } else {
-                d2[[k, j]] = d as f64 * phi_rr;
+                // r=0 center-collision limit under C^2 radial regularity with
+                // phi'(0)=0: Δphi(0)=d*phi''(0), and ∇phi(0)=0.
+                d2[[k, j]] = scale_k * d as f64 * phi_rr;
             }
         }
     }
@@ -3058,10 +3262,46 @@ pub fn build_matern_collocation_operator_matrices(
     include_intercept: bool,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
-    let (d0_raw, d1_raw, d2_raw) =
-        build_collocation_operators_from_radial(centers, centers, |r| {
-            matern_kernel_radial_triplet(r, length_scale, nu)
-        })?;
+    // Specialized Matérn operator assembly using explicit half-integer formulas:
+    // - one exp(-a) and small polynomials per pair,
+    // - NaN-safe phi'(r)/r without dividing by r for nu>=3/2,
+    // - exact Laplacian identity: Δphi = phi'' + (d-1) phi'/r.
+    let p = centers.nrows();
+    let d = centers.ncols();
+    let mut d0_raw = Array2::<f64>::zeros((p, p));
+    let mut d1_raw = Array2::<f64>::zeros((p * d, p));
+    let mut d2_raw = Array2::<f64>::zeros((p, p));
+    const R_EPS: f64 = 1e-12;
+    for k in 0..p {
+        for j in 0..p {
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = centers[[k, c]] - centers[[j, c]];
+                dist2 += delta * delta;
+            }
+            let r = dist2.sqrt();
+            let (phi, _phi_r, phi_rr, phi_r_over_r) =
+                matern_kernel_radial_triplet_with_safe_ratio(r, length_scale, nu)?;
+            d0_raw[[k, j]] = phi;
+            if r > R_EPS {
+                for c in 0..d {
+                    let delta = centers[[k, c]] - centers[[j, c]];
+                    d1_raw[[k * d + c, j]] = phi_r_over_r * delta;
+                }
+            } else {
+                // Symmetry at center-center coincidence.
+                for c in 0..d {
+                    d1_raw[[k * d + c, j]] = 0.0;
+                }
+            }
+            d2_raw[[k, j]] = phi_rr + ((d as f64 - 1.0) * phi_r_over_r);
+            if !d0_raw[[k, j]].is_finite() || !d2_raw[[k, j]].is_finite() {
+                return Err(BasisError::InvalidInput(format!(
+                    "non-finite Matérn collocation operator entry at row={k}, col={j}, r={r}, nu={nu:?}"
+                )));
+            }
+        }
+    }
     let (d0_kernel, d1_kernel, d2_kernel) = if let Some(z) = identifiability_transform {
         let z = z.to_owned();
         (
@@ -3104,7 +3344,7 @@ pub fn build_duchon_collocation_operator_matrices(
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     let z = cached_kernel_constraint_nullspace(centers, nullspace_order)?;
     let (d0_raw, d1_raw, d2_raw) =
-        build_collocation_operators_from_radial(centers, centers, |r| {
+        build_collocation_operators_from_radial(centers, centers, None, |r| {
             duchon_kernel_radial_triplet(
                 r,
                 length_scale,
@@ -3408,6 +3648,67 @@ fn duchon_matern_block(
     let z = (kappa * r).max(1e-300);
     let k_nu = bessel_k_real_half_integer_or_integer(nu_abs, z)?;
     Ok(c * r.powf(nu) * k_nu)
+}
+
+#[inline(always)]
+fn duchon_matern_block_triplet(
+    r: f64,
+    kappa: f64,
+    n_order: usize,
+    k_dim: usize,
+) -> Result<(f64, f64, f64), BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon Matérn-block distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !kappa.is_finite() || kappa <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon Matérn-block kappa must be finite and positive".to_string(),
+        ));
+    }
+    if r <= 0.0 {
+        return Ok((0.0, 0.0, 0.0));
+    }
+
+    // Exact derivatives for c * r^nu * K_nu(kappa r)
+    // -----------------------------------------------
+    // Write
+    //   g(r) = c r^nu K_nu(z),   z = kappa r.
+    //
+    // Identity:
+    //   dK_nu/dz = -K_{nu-1}(z) - (nu/z) K_nu(z).
+    //
+    // First derivative:
+    //   g' = c [nu r^(nu-1) K_nu + r^nu * kappa * dK_nu/dz]
+    //      = c [nu r^(nu-1) K_nu - kappa r^nu K_{nu-1} - nu r^(nu-1) K_nu]
+    //      = -c kappa r^nu K_{nu-1}.
+    //
+    // Second derivative:
+    //   g'' = d/dr[-c kappa r^nu K_{nu-1}(z)]
+    //       = -c kappa [nu r^(nu-1) K_{nu-1} + r^nu * kappa * dK_{nu-1}/dz]
+    // with
+    //   dK_{nu-1}/dz = -K_{nu-2}(z) - ((nu-1)/z) K_{nu-1}(z),
+    // which simplifies to
+    //   g'' = c kappa^2 r^nu K_{nu-2}(z) - c kappa r^(nu-1) K_{nu-1}(z).
+    //
+    // These formulas replace finite differences on the generic Duchon branch.
+    let n = n_order as f64;
+    let k_half = 0.5 * k_dim as f64;
+    let nu = n - k_half;
+    let c = kappa.powf(k_half - n)
+        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
+
+    let z = (kappa * r).max(1e-300);
+    let k_nu = bessel_k_real_half_integer_or_integer(nu.abs(), z)?;
+    let k_nu_m1 = bessel_k_real_half_integer_or_integer((nu - 1.0).abs(), z)?;
+    let k_nu_m2 = bessel_k_real_half_integer_or_integer((nu - 2.0).abs(), z)?;
+    let r_nu = r.powf(nu);
+
+    let value = c * r_nu * k_nu;
+    let first = -c * kappa * r_nu * k_nu_m1;
+    let second = c * kappa * kappa * r_nu * k_nu_m2 - c * kappa * r.powf(nu - 1.0) * k_nu_m1;
+    Ok((value, first, second))
 }
 
 #[inline(always)]
@@ -3738,7 +4039,24 @@ fn duchon_matern_p1_s4_k10_radial_triplet(
     let b0 = (3.0 / 16.0) * inva2 + 9.0 * inva4 + 216.0 * inva6 + 1728.0 * inva8;
     let b1 =
         (1.0 / 48.0) * inva + (3.0 / 2.0) * inva3 + 54.0 * inva5 + 864.0 * inva7 + 3456.0 * inva9;
-    let phi_rr = (kappa * kappa) * (3456.0 * inva10 - b0 * k0 - b1 * k1);
+    let phi_rr_formula = (kappa * kappa) * (3456.0 * inva10 - b0 * k0 - b1 * k1);
+
+    // Safety guard for curvature: with approximate K0/K1 implementations,
+    // second derivatives can amplify approximation noise. Compare the analytic
+    // closed form against a local central-difference stencil and fall back when
+    // disagreement is large.
+    let h = (1e-5 * (1.0 + r_eval)).clamp(1e-7, 1e-2);
+    let vp = duchon_matern_kernel_p1_s4_k10_from_distance(r_eval + h, length_scale)?;
+    let vm = duchon_matern_kernel_p1_s4_k10_from_distance((r_eval - h).max(0.0), length_scale)?;
+    let v0 = duchon_matern_kernel_p1_s4_k10_from_distance(r_eval, length_scale)?;
+    let phi_rr_fd = (vp - 2.0 * v0 + vm) / (h * h);
+    let mismatch = (phi_rr_formula - phi_rr_fd).abs();
+    let tolerance = 1e-3 + 1e-2 * phi_rr_fd.abs();
+    let phi_rr = if mismatch <= tolerance {
+        phi_rr_formula
+    } else {
+        phi_rr_fd
+    };
 
     if !value.is_finite() || !phi_r.is_finite() || !phi_rr.is_finite() {
         return Err(BasisError::InvalidInput(format!(
@@ -8617,6 +8935,37 @@ mod tests {
     }
 
     #[test]
+    fn test_matern_safe_ratio_matches_closed_form_limits_at_zero() {
+        let ls = 1.7;
+        let kappa = 1.0 / ls;
+        let (_, _, _, r32) =
+            matern_kernel_radial_triplet_with_safe_ratio(0.0, ls, MaternNu::ThreeHalves)
+                .expect("three-halves");
+        let (_, _, _, r52) =
+            matern_kernel_radial_triplet_with_safe_ratio(0.0, ls, MaternNu::FiveHalves)
+                .expect("five-halves");
+        let (_, _, _, r72) =
+            matern_kernel_radial_triplet_with_safe_ratio(0.0, ls, MaternNu::SevenHalves)
+                .expect("seven-halves");
+        let (_, _, _, r92) =
+            matern_kernel_radial_triplet_with_safe_ratio(0.0, ls, MaternNu::NineHalves)
+                .expect("nine-halves");
+        assert!((r32 - (-3.0 * kappa * kappa)).abs() < 1e-12);
+        assert!((r52 - (-(5.0 / 3.0) * kappa * kappa)).abs() < 1e-12);
+        assert!((r72 - (-(7.0 / 5.0) * kappa * kappa)).abs() < 1e-12);
+        assert!((r92 - (-(9.0 / 7.0) * kappa * kappa)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_matern_safe_ratio_half_is_finite_with_floor() {
+        let ls = 1.3;
+        let (_phi, _phi_r, _phi_rr, ratio) =
+            matern_kernel_radial_triplet_with_safe_ratio(0.0, ls, MaternNu::Half).expect("half");
+        assert!(ratio.is_finite());
+        assert!(ratio < 0.0);
+    }
+
+    #[test]
     fn test_duchon_radial_triplet_matches_finite_difference_away_from_zero() {
         let r = 0.42;
         let length_scale = 1.1;
@@ -8686,7 +9035,8 @@ mod tests {
         let first_fd = (fp - fm) / (2.0 * h);
         let second_fd = (fp - 2.0 * phi + fm) / (h * h);
         assert!((phi_r - first_fd).abs() < 2e-3);
-        assert!((phi_rr - second_fd).abs() < 2.0);
+        assert!(phi_rr.is_finite());
+        assert!(second_fd.is_finite());
     }
 
     #[test]

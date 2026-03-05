@@ -2576,6 +2576,7 @@ pub enum ContinuousSmoothnessOrderStatus {
     Ok,
     NonMaternRegime,
     FirstOrderLimit,
+    IntrinsicLimit,
     UndefinedZeroLambda,
 }
 
@@ -2597,6 +2598,38 @@ pub struct ModelSummary {
     pub reml_score: Option<f64>,
     pub parametric_terms: Vec<ParametricTermSummary>,
     pub smooth_terms: Vec<SmoothTermSummary>,
+}
+
+/// Convert optimizer-scale lambdas into physical lambdas for raw operator penalties.
+///
+/// Derivation:
+///   We optimize with normalized penalties
+///     sum_k lambda_tilde_k * S_tilde_k
+///   where
+///     S_tilde_k = (1 / c_k) * S_k.
+///
+///   Define physical lambdas by requiring operator equality:
+///     sum_k lambda_k * S_k  ==  sum_k lambda_tilde_k * S_tilde_k
+///                           ==  sum_k lambda_tilde_k * (1/c_k) * S_k
+///                           ==  sum_k (lambda_tilde_k / c_k) * S_k.
+///
+///   Therefore, coefficient matching gives:
+///     lambda_k = lambda_tilde_k / c_k.
+///
+/// This helper performs exactly that mapping and validates positivity/finite values.
+fn unscale_to_physical_lambdas(
+    lambda_tilde: [f64; 3],
+    normalization_scale: [f64; 3],
+) -> Option<[f64; 3]> {
+    let mut out = [f64::NAN; 3];
+    for k in 0..3 {
+        let c = normalization_scale[k];
+        if !(c.is_finite() && c > 0.0) {
+            return None;
+        }
+        out[k] = lambda_tilde[k] / c;
+    }
+    Some(out)
 }
 
 // Thread 2: Continuous smoothness/order diagnostic from three operator penalties.
@@ -2663,6 +2696,11 @@ pub struct ModelSummary {
 // -------------------------------
 // - If lambda0 or lambda2 is non-finite or <= eps, the 3-term inversion is unstable;
 //   report UndefinedZeroLambda and do not divide by those terms.
+// - Intrinsic limit (lambda0 -> 0+, with finite lambda1/lambda2):
+//     R = lambda1^2/(lambda0*lambda2) -> +inf
+//     nu = R/(R-2) -> 1+
+//     kappa^2 = lambda1/((R-2)lambda2) -> 0+.
+//   We expose this explicitly as IntrinsicLimit with nu≈1 and kappa^2≈0.
 // - If R <= 2 (+eps), nu = R/(R-2) is undefined or numerically unstable; keep
 //   nu/kappa2 unset.
 //
@@ -2670,30 +2708,56 @@ pub struct ModelSummary {
 // - Ok:                R >= 4 and valid finite nu/kappa2.
 // - NonMaternRegime:   R < 4; if additionally R > 2, we still report effective
 //                      nu/kappa2 as diagnostics, but mark non-Matérn status.
+// - IntrinsicLimit:    lambda0 is negligible; report nu≈1, kappa^2≈0.
 // - UndefinedZeroLambda: invalid scaling/lambda inputs or unstable inversion.
 pub fn compute_continuous_smoothness_order(
     lambda_tilde: [f64; 3],
     normalization_scale: [f64; 3],
     eps: f64,
 ) -> ContinuousSmoothnessOrder {
-    let mut lambda = [f64::NAN; 3];
-    for k in 0..3 {
-        let c = normalization_scale[k];
-        if !c.is_finite() || c <= 0.0 {
+    let Some(lambda) = unscale_to_physical_lambdas(lambda_tilde, normalization_scale) else {
+        return ContinuousSmoothnessOrder {
+            lambda0: f64::NAN,
+            lambda1: f64::NAN,
+            lambda2: f64::NAN,
+            r_ratio: None,
+            nu: None,
+            kappa2: None,
+            status: ContinuousSmoothnessOrderStatus::UndefinedZeroLambda,
+        };
+    };
+    let [lambda0, lambda1, lambda2] = lambda;
+    if !lambda0.is_finite() || !lambda1.is_finite() || !lambda2.is_finite() {
+        return ContinuousSmoothnessOrder {
+            lambda0,
+            lambda1,
+            lambda2,
+            r_ratio: None,
+            nu: None,
+            kappa2: None,
+            status: ContinuousSmoothnessOrderStatus::UndefinedZeroLambda,
+        };
+    }
+    // Scale-aware degeneracy floor.
+    // Using only an absolute epsilon can misclassify limits when lambdas are
+    // globally tiny or globally huge, so we threshold relative to the largest
+    // physical lambda magnitude in this term.
+    let lambda_scale = lambda0.abs().max(lambda1.abs()).max(lambda2.abs()).max(1.0);
+    let lambda_floor = eps * lambda_scale;
+
+    // Intrinsic limit: mass term vanishes (kappa^2 -> 0).
+    if lambda0 <= lambda_floor {
+        if lambda1 > lambda_floor && lambda2 > lambda_floor {
             return ContinuousSmoothnessOrder {
-                lambda0: f64::NAN,
-                lambda1: f64::NAN,
-                lambda2: f64::NAN,
+                lambda0,
+                lambda1,
+                lambda2,
                 r_ratio: None,
-                nu: None,
-                kappa2: None,
-                status: ContinuousSmoothnessOrderStatus::UndefinedZeroLambda,
+                nu: Some(1.0),
+                kappa2: Some(0.0),
+                status: ContinuousSmoothnessOrderStatus::IntrinsicLimit,
             };
         }
-        lambda[k] = lambda_tilde[k] / c;
-    }
-    let [lambda0, lambda1, lambda2] = lambda;
-    if !lambda0.is_finite() || !lambda1.is_finite() || !lambda2.is_finite() || lambda0 <= eps {
         return ContinuousSmoothnessOrder {
             lambda0,
             lambda1,
@@ -2706,8 +2770,8 @@ pub fn compute_continuous_smoothness_order(
     }
     // First-order fallback when stiffness collapses:
     //   lambda2 ~ 0 => use lambda0/lambda1 = kappa^2 with nu ≈ 1.
-    if lambda2 <= eps {
-        if lambda1 > eps && lambda1.is_finite() {
+    if lambda2 <= lambda_floor {
+        if lambda1 > lambda_floor && lambda1.is_finite() {
             return ContinuousSmoothnessOrder {
                 lambda0,
                 lambda1,
@@ -2746,11 +2810,17 @@ pub fn compute_continuous_smoothness_order(
     //   R = lambda1^2 / (lambda0*lambda2) = 2*nu/(nu-1)
     //   nu = R/(R-2), and kappa^2 = lambda1 / ((R-2)*lambda2).
     //
-    // Non-Matérn regime is flagged by R < 4 (quadratic discriminant < 0),
+    // Discriminant of spectral quadratic P(t)=lambda0+lambda1*t+lambda2*t^2:
+    //   Delta_P = lambda1^2 - 4*lambda0*lambda2 = lambda0*lambda2*(R-4).
+    // Non-Matérn regime is flagged by Delta_P < 0 (equiv. R < 4),
     // but nu/kappa2 are still reported when R > 2 as effective diagnostics.
-    let status = if r_ratio < 4.0 {
+    let discriminant = lambda1 * lambda1 - 4.0 * lambda0 * lambda2;
+    let disc_tol = eps * lambda_scale * lambda_scale;
+    let status = if discriminant < -disc_tol {
         ContinuousSmoothnessOrderStatus::NonMaternRegime
     } else {
+        // Includes exact boundary R=4 (perfect-square case) and numerically
+        // indistinguishable near-boundary points.
         ContinuousSmoothnessOrderStatus::Ok
     };
     if r_ratio <= 2.0 + eps {
@@ -2765,7 +2835,23 @@ pub fn compute_continuous_smoothness_order(
         };
     }
     let nu = r_ratio / (r_ratio - 2.0);
+    // Closed-form extraction required by Thread 2 (Section 3):
+    //
+    //   R = lambda1^2 / (lambda0*lambda2) = 2*nu/(nu-1)
+    //   => nu = R/(R-2).
+    //
+    //   lambda1/lambda2 = 2*kappa^2/(nu-1)
+    //   => kappa^2 = ((nu-1)/2)*(lambda1/lambda2)
+    //             = lambda1 / ((R-2)*lambda2).
+    //
+    // We use this exact closed form as the reported kappa^2.
     let kappa2 = lambda1 / ((r_ratio - 2.0) * lambda2);
+    // Optional algebraic consistency check (not used to alter output):
+    // from lambda0/lambda2 = 2*kappa^4/(nu*(nu-1)),
+    // kappa^2_alt = sqrt((lambda0/lambda2)*nu*(nu-1)/2).
+    let _kappa2_alt = ((lambda0 / lambda2) * nu * (nu - 1.0) / 2.0)
+        .max(0.0)
+        .sqrt();
     if !nu.is_finite() || !kappa2.is_finite() {
         return ContinuousSmoothnessOrder {
             lambda0,
@@ -2977,6 +3063,7 @@ impl fmt::Display for ModelSummary {
                     ContinuousSmoothnessOrderStatus::Ok => "Ok",
                     ContinuousSmoothnessOrderStatus::NonMaternRegime => "NonMaternRegime",
                     ContinuousSmoothnessOrderStatus::FirstOrderLimit => "FirstOrderLimit",
+                    ContinuousSmoothnessOrderStatus::IntrinsicLimit => "IntrinsicLimit",
                     ContinuousSmoothnessOrderStatus::UndefinedZeroLambda => "UndefinedZeroLambda",
                 };
                 writeln!(
@@ -4072,6 +4159,25 @@ mod continuous_order_tests {
     }
 
     #[test]
+    fn continuous_order_unscales_lambdas_exactly_by_ck() {
+        let out = compute_continuous_smoothness_order([6.0, 15.0, 9.0], [3.0, 5.0, 9.0], 1e-12);
+        // Physical lambdas must satisfy lambda_k = lambda_tilde_k / c_k.
+        assert!((out.lambda0 - 2.0).abs() < 1e-12);
+        assert!((out.lambda1 - 3.0).abs() < 1e-12);
+        assert!((out.lambda2 - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn continuous_order_invalid_ck_is_guarded() {
+        let out = compute_continuous_smoothness_order([1.0, 1.0, 1.0], [1.0, 0.0, 1.0], 1e-12);
+        assert_eq!(
+            out.status,
+            ContinuousSmoothnessOrderStatus::UndefinedZeroLambda
+        );
+        assert!(out.r_ratio.is_none());
+    }
+
+    #[test]
     fn continuous_order_is_invariant_to_penalty_normalization_reversal() {
         let base = compute_continuous_smoothness_order([2.0, 10.0, 3.0], [1.0, 1.0, 1.0], 1e-12);
         let scaled = compute_continuous_smoothness_order(
@@ -4105,12 +4211,17 @@ mod continuous_order_tests {
     }
 
     #[test]
+    fn continuous_order_boundary_r_equals_four_is_matern_square_case() {
+        let out = compute_continuous_smoothness_order([1.0, 2.0, 1.0], [1.0, 1.0, 1.0], 1e-12);
+        assert_eq!(out.status, ContinuousSmoothnessOrderStatus::Ok);
+        let nu = out.nu.expect("nu");
+        assert!((nu - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn continuous_order_guards_zero_or_near_zero_lambda() {
         let out = compute_continuous_smoothness_order([0.0, 1.0, 1.0], [1.0, 1.0, 1.0], 1e-12);
-        assert_eq!(
-            out.status,
-            ContinuousSmoothnessOrderStatus::UndefinedZeroLambda
-        );
+        assert_eq!(out.status, ContinuousSmoothnessOrderStatus::IntrinsicLimit);
         assert!(out.r_ratio.is_none());
     }
 
@@ -4121,6 +4232,14 @@ mod continuous_order_tests {
         assert_eq!(out.nu, Some(1.0));
         let k2 = out.kappa2.expect("kappa2");
         assert!((k2 - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn continuous_order_intrinsic_limit_when_lambda0_collapses() {
+        let out = compute_continuous_smoothness_order([1e-20, 4.0, 2.0], [1.0, 1.0, 1.0], 1e-12);
+        assert_eq!(out.status, ContinuousSmoothnessOrderStatus::IntrinsicLimit);
+        assert_eq!(out.nu, Some(1.0));
+        assert_eq!(out.kappa2, Some(0.0));
     }
 
     #[test]

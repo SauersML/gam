@@ -7,6 +7,15 @@ impl<'a> RemlState<'a> {
         dir: &DirectionalHyperParam,
         s_tau_t: &Array2<f64>,
     ) -> Array2<f64> {
+        if let Some(parts) = dir.s_tau_original_components.as_ref() {
+            let mut total = Array2::<f64>::zeros(s_tau_t.raw_dim());
+            for (k, mat) in parts {
+                if *k < rho.len() {
+                    total.scaled_add(rho[*k].exp(), mat);
+                }
+            }
+            return total;
+        }
         if let Some(k) = dir.penalty_index {
             if k < rho.len() {
                 return s_tau_t.mapv(|v| rho[k].exp() * v);
@@ -25,6 +34,19 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
         s_tau_tau_t: &[Vec<Array2<f64>>],
     ) -> Array2<f64> {
+        if let Some(parts_ij) = hyper_dirs
+            .get(i)
+            .and_then(|d| d.s_tau_tau_original_components.as_ref())
+            .and_then(|v| v.get(j))
+        {
+            let mut total = Array2::<f64>::zeros(s_tau_tau_t[i][j].raw_dim());
+            for (k, mat) in parts_ij {
+                if *k < rho.len() {
+                    total.scaled_add(rho[*k].exp(), mat);
+                }
+            }
+            return total;
+        }
         if let Some(k) = hyper_dirs[i].penalty_index {
             if hyper_dirs[j].penalty_index == Some(k) && k < rho.len() {
                 return s_tau_tau_t[i][j].mapv(|v| rho[k].exp() * v);
@@ -69,8 +91,10 @@ impl<'a> RemlState<'a> {
                 penalty_index: hyper_dirs[j].penalty_index,
                 x_tau_original: x_j,
                 s_tau_original: s_j,
+                s_tau_original_components: hyper_dirs[j].s_tau_original_components.clone(),
                 x_tau_tau_original: hyper_dirs[j].x_tau_tau_original.clone(),
                 s_tau_tau_original: hyper_dirs[j].s_tau_tau_original.clone(),
+                s_tau_tau_original_components: hyper_dirs[j].s_tau_tau_original_components.clone(),
             });
         }
         out

@@ -213,6 +213,7 @@ pub struct CustomFamilyBlockPsiDerivative {
     pub penalty_index: usize,
     pub x_psi: Array2<f64>,
     pub s_psi: Array2<f64>,
+    pub s_psi_components: Option<Vec<(usize, Array2<f64>)>>,
 }
 
 #[derive(Clone)]
@@ -1804,12 +1805,6 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
         }
 
         for deriv in psi_terms {
-            if deriv.penalty_index >= lambdas.len() {
-                return Err(format!(
-                    "psi derivative penalty index {} out of bounds for block {}",
-                    deriv.penalty_index, b
-                ));
-            }
             if deriv.x_psi.nrows() != x_dense.nrows() || deriv.x_psi.ncols() != x_dense.ncols() {
                 return Err(format!(
                     "X_psi shape mismatch on block {}: expected {}x{}, got {}x{}",
@@ -1832,7 +1827,27 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
             }
 
             let xpsi_beta = deriv.x_psi.dot(beta);
-            let s_psi_total = deriv.s_psi.mapv(|v| lambdas[deriv.penalty_index] * v);
+            let s_psi_total = if let Some(parts) = deriv.s_psi_components.as_ref() {
+                let mut total = Array2::<f64>::zeros(deriv.s_psi.raw_dim());
+                for (k, s_part) in parts {
+                    if *k >= lambdas.len() {
+                        return Err(format!(
+                            "psi derivative component penalty index {} out of bounds for block {}",
+                            k, b
+                        ));
+                    }
+                    total.scaled_add(lambdas[*k], s_part);
+                }
+                total
+            } else {
+                if deriv.penalty_index >= lambdas.len() {
+                    return Err(format!(
+                        "psi derivative penalty index {} out of bounds for block {}",
+                        deriv.penalty_index, b
+                    ));
+                }
+                deriv.s_psi.mapv(|v| lambdas[deriv.penalty_index] * v)
+            };
             let explicit = -u.dot(&xpsi_beta) + 0.5 * beta.dot(&s_psi_total.dot(beta));
 
             let mut wx_psi = deriv.x_psi.clone();
