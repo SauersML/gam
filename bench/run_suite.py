@@ -3450,11 +3450,6 @@ def run_rust_gamlss_scenario_cv(
         contender_name="rust_gamlss",
         binomial_cli_family="binomial-probit",
         binomial_model_spec_label="gamlss binomial-probit location-scale via release binary",
-        binomial_extra_fit_args=[
-            "--gamlss-outer-max-iter", "1",
-            "--gamlss-inner-max-cycles", "1",
-            "--gamlss-outer-tol", "1e-2",
-        ],
         ds=ds,
         folds=folds,
         shared_fold_artifacts=shared_fold_artifacts,

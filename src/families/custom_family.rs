@@ -1512,34 +1512,21 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                     //   0.5 * tr(J^{-1}(A_k + deltaH[u_k])) - 0.5 * tr(S^+ A_k).
                     let mut d_j_k = a_k.clone();
                     if u_norm > 1e-14 {
-                        // Exact-by-default: use analytic joint directional derivative when
-                        // available and numerically sane; fall back to finite differences
-                        // only when analytic output is unavailable or invalid.
-                        let analytic_h = family.exact_newton_joint_hessian_directional_derivative(
-                            &inner.block_states,
-                            &u_k,
-                        )?;
-                        let h_rho = if let Some(h) = analytic_h {
-                            if h.iter().all(|v| v.is_finite()) {
-                                h
-                            } else {
-                                finite_difference_joint_hessian_directional_derivative(
-                                    family,
-                                    specs,
-                                    &inner.block_states,
-                                    &u_k,
-                                    1e-5,
-                                )?
-                            }
-                        } else {
-                            finite_difference_joint_hessian_directional_derivative(
-                                family,
-                                specs,
+                        // Joint exact-newton path requires analytic dH[u] from the family.
+                        let h_rho = family
+                            .exact_newton_joint_hessian_directional_derivative(
                                 &inner.block_states,
                                 &u_k,
-                                1e-5,
                             )?
-                        };
+                            .ok_or_else(|| {
+                                "joint exact-newton dH unavailable for analytic outer gradient"
+                                    .to_string()
+                            })?;
+                        if !h_rho.iter().all(|v| v.is_finite()) {
+                            return Err(
+                                "joint exact-newton dH contains non-finite values".to_string()
+                            );
+                        }
                         if h_rho.nrows() != total || h_rho.ncols() != total {
                             return Err(format!(
                                 "joint exact-newton dH shape mismatch: got {}x{}, expected {}x{}",
@@ -2046,68 +2033,6 @@ fn set_states_from_flat_beta(
             .assign(&beta_flat.slice(ndarray::s![start..end]).to_owned());
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-fn finite_difference_joint_hessian_directional_derivative<F: CustomFamily>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    states: &[ParameterBlockState],
-    d_beta_flat: &Array1<f64>,
-    step_scale: f64,
-) -> Result<Array2<f64>, String> {
-    let total = specs.iter().map(|s| s.design.ncols()).sum::<usize>();
-    if d_beta_flat.len() != total {
-        return Err(format!(
-            "joint d_beta length mismatch in FD dH: got {}, expected {}",
-            d_beta_flat.len(),
-            total
-        ));
-    }
-    let dir_norm = d_beta_flat.dot(d_beta_flat).sqrt();
-    if dir_norm <= 1e-14 {
-        return Ok(Array2::<f64>::zeros((total, total)));
-    }
-
-    let beta0 = flatten_state_betas(states, specs);
-    let beta_norm = beta0.dot(&beta0).sqrt();
-    let eps = (step_scale.max(1e-7)) * (1.0 + beta_norm) / (1.0 + dir_norm);
-
-    let mut b_plus = beta0.clone();
-    b_plus += &d_beta_flat.mapv(|v| eps * v);
-    let mut s_plus = states.to_vec();
-    set_states_from_flat_beta(&mut s_plus, specs, &b_plus)?;
-    refresh_all_block_etas(family, specs, &mut s_plus)?;
-    let h_plus = family
-        .exact_newton_joint_hessian(&s_plus)?
-        .ok_or_else(|| "joint Hessian unavailable at +epsilon state for FD dH fallback".to_string())?;
-
-    let mut b_minus = beta0.clone();
-    b_minus -= &d_beta_flat.mapv(|v| eps * v);
-    let mut s_minus = states.to_vec();
-    set_states_from_flat_beta(&mut s_minus, specs, &b_minus)?;
-    refresh_all_block_etas(family, specs, &mut s_minus)?;
-    let h_minus = family
-        .exact_newton_joint_hessian(&s_minus)?
-        .ok_or_else(|| "joint Hessian unavailable at -epsilon state for FD dH fallback".to_string())?;
-
-    if h_plus.nrows() != total
-        || h_plus.ncols() != total
-        || h_minus.nrows() != total
-        || h_minus.ncols() != total
-    {
-        return Err(format!(
-            "joint Hessian shape mismatch in FD dH fallback: +={}x{}, -={}x{}, expected {}x{}",
-            h_plus.nrows(),
-            h_plus.ncols(),
-            h_minus.nrows(),
-            h_minus.ncols(),
-            total,
-            total
-        ));
-    }
-
-    Ok((h_plus - h_minus) / (2.0 * eps))
 }
 
 fn penalized_objective_at_beta<F: CustomFamily>(

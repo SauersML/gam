@@ -125,12 +125,6 @@ struct FitArgs {
     flexible_link: bool,
     #[arg(long = "firth", default_value_t = false)]
     firth: bool,
-    /// Optional override for GAMLSS outer smoothing iterations.
-    #[arg(long = "gamlss-outer-max-iter")]
-    gamlss_outer_max_iter: Option<usize>,
-    /// Optional override for GAMLSS inner blockwise cycles per outer evaluation.
-    #[arg(long = "gamlss-inner-max-cycles")]
-    gamlss_inner_max_cycles: Option<usize>,
     /// Optional override for GAMLSS outer gradient tolerance.
     #[arg(long = "gamlss-outer-tol")]
     gamlss_outer_tol: Option<f64>,
@@ -218,17 +212,12 @@ struct SurvivalArgs {
     exit: String,
     event: String,
     formula: String,
-    spec: String,
     survival_likelihood: String,
     survival_distribution: String,
     link: Option<String>,
     mixture_rho: Option<String>,
     sas_init: Option<String>,
     beta_logistic_init: Option<String>,
-    learn_link_wiggle: bool,
-    link_wiggle_degree: usize,
-    link_wiggle_internal_knots: usize,
-    link_wiggle_double_penalty: bool,
     survival_time_anchor: Option<f64>,
     baseline_target: String,
     baseline_scale: Option<f64>,
@@ -414,18 +403,6 @@ fn run() -> Result<(), String> {
 fn blockwise_options_from_fit_args(args: &FitArgs) -> Result<gam::BlockwiseFitOptions, String> {
     let mut options = gam::BlockwiseFitOptions::default();
     options.compute_covariance = !args.skip_covariance;
-    if let Some(v) = args.gamlss_outer_max_iter {
-        if v == 0 {
-            return Err("--gamlss-outer-max-iter must be >= 1".to_string());
-        }
-        options.outer_max_iter = v;
-    }
-    if let Some(v) = args.gamlss_inner_max_cycles {
-        if v == 0 {
-            return Err("--gamlss-inner-max-cycles must be >= 1".to_string());
-        }
-        options.inner_max_cycles = v;
-    }
     if let Some(v) = args.gamlss_outer_tol {
         if !v.is_finite() || v <= 0.0 {
             return Err("--gamlss-outer-tol must be finite and > 0".to_string());
@@ -469,10 +446,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             exit,
             event,
             formula: rhs,
-            spec: formula_surv
-                .as_ref()
-                .and_then(|s| s.spec.clone())
-                .unwrap_or_else(|| "net".to_string()),
             survival_likelihood: args.survival_likelihood.clone(),
             survival_distribution: formula_surv
                 .as_ref()
@@ -482,10 +455,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             mixture_rho: effective_mixture_rho.clone(),
             sas_init: effective_sas_init.clone(),
             beta_logistic_init: effective_beta_logistic_init.clone(),
-            learn_link_wiggle: parsed.link_wiggle.is_some(),
-            link_wiggle_degree: 3,
-            link_wiggle_internal_knots: 7,
-            link_wiggle_double_penalty: true,
             survival_time_anchor: args.survival_time_anchor,
             baseline_target: args.baseline_target.clone(),
             baseline_scale: args.baseline_scale,
@@ -1105,58 +1074,28 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     None,
                     SavedFitSummary::from_joint_result(&joint)?,
                 );
-                let model = SavedModel::from_payload(FittedModelPayload {
-                    version: MODEL_VERSION,
-                    formula: formula_text,
-                    model_kind: ModelKind::FlexibleLink,
-                    family_state: FittedFamily::FlexibleLink {
+                let mut payload = FittedModelPayload::new(
+                    MODEL_VERSION,
+                    formula_text,
+                    ModelKind::FlexibleLink,
+                    FittedFamily::FlexibleLink {
                         likelihood: family,
                         link: choice.link,
                     },
-                    family: family_to_string(family).to_string(),
-                    fit_result: Some(fit_result),
-                    data_schema: Some(ds.schema.clone()),
-                    link: Some(link_choice_to_string(choice)),
-                    mixture_link_param_covariance: None,
-                    sas_param_covariance: None,
-                    formula_noise: None,
-                    beta_noise: None,
-                    sigma_min: None,
-                    sigma_max: None,
-                    joint_beta_link: Some(joint.beta_link.to_vec()),
-                    joint_knot_range: Some(joint.knot_range),
-                    joint_knot_vector: Some(joint.knot_vector.to_vec()),
-                    joint_link_transform: Some(array2_to_nested_vec(&joint.link_transform)),
-                    joint_degree: Some(joint.degree),
-                    joint_ridge_used: Some(joint.ridge_used),
-                    probit_wiggle_knots: None,
-                    probit_wiggle_degree: None,
-                    beta_wiggle: None,
-                    survival_entry: None,
-                    survival_exit: None,
-                    survival_event: None,
-                    survival_spec: None,
-                    survival_baseline_target: None,
-                    survival_baseline_scale: None,
-                    survival_baseline_shape: None,
-                    survival_baseline_rate: None,
-                    survival_time_basis: None,
-                    survival_time_degree: None,
-                    survival_time_knots: None,
-                    survival_time_smooth_lambda: None,
-                    survival_ridge_lambda: None,
-                    survival_likelihood: None,
-                    survival_sigma_min: None,
-                    survival_sigma_max: None,
-                    survival_beta_time: None,
-                    survival_beta_threshold: None,
-                    survival_beta_log_sigma: None,
-                    survival_distribution: None,
-                    training_headers: Some(ds.headers.clone()),
-                    resolved_term_spec: Some(initial_frozen_spec.clone()),
-                    resolved_term_spec_noise: None,
-                    adaptive_regularization_diagnostics: None,
-                });
+                    family_to_string(family).to_string(),
+                );
+                payload.fit_result = Some(fit_result);
+                payload.data_schema = Some(ds.schema.clone());
+                payload.link = Some(link_choice_to_string(choice));
+                payload.joint_beta_link = Some(joint.beta_link.to_vec());
+                payload.joint_knot_range = Some(joint.knot_range);
+                payload.joint_knot_vector = Some(joint.knot_vector.to_vec());
+                payload.joint_link_transform = Some(array2_to_nested_vec(&joint.link_transform));
+                payload.joint_degree = Some(joint.degree);
+                payload.joint_ridge_used = Some(joint.ridge_used);
+                payload.training_headers = Some(ds.headers.clone());
+                payload.resolved_term_spec = Some(initial_frozen_spec.clone());
+                let model = SavedModel::from_payload(payload);
                 write_model_json(&out, &model)?;
             }
             return Ok(());
@@ -1289,63 +1228,30 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
 
     if let Some(out) = args.out {
-        let model = SavedModel::from_payload(FittedModelPayload {
-            version: MODEL_VERSION,
-            formula: formula_text,
-            model_kind: ModelKind::Standard,
-            family_state: FittedFamily::Standard {
+        let mut payload = FittedModelPayload::new(
+            MODEL_VERSION,
+            formula_text,
+            ModelKind::Standard,
+            FittedFamily::Standard {
                 likelihood: family,
                 link: Some(effective_link),
                 mixture_state: saved_mixture_state_from_fit(&fit),
                 sas_state: saved_sas_state_from_fit(&fit),
             },
-            family: family_to_string(family).to_string(),
-            fit_result: Some(fit.clone()),
-            data_schema: Some(ds.schema.clone()),
-            link: link_choice.as_ref().map(link_choice_to_string),
-            mixture_link_param_covariance: fit
-                .mixture_link_param_covariance
-                .as_ref()
-                .map(array2_to_nested_vec),
-            sas_param_covariance: fit.sas_param_covariance.as_ref().map(array2_to_nested_vec),
-            formula_noise: None,
-            beta_noise: None,
-            sigma_min: None,
-            sigma_max: None,
-            joint_beta_link: None,
-            joint_knot_range: None,
-            joint_knot_vector: None,
-            joint_link_transform: None,
-            joint_degree: None,
-            joint_ridge_used: None,
-            probit_wiggle_knots: None,
-            probit_wiggle_degree: None,
-            beta_wiggle: None,
-            survival_entry: None,
-            survival_exit: None,
-            survival_event: None,
-            survival_spec: None,
-            survival_baseline_target: None,
-            survival_baseline_scale: None,
-            survival_baseline_shape: None,
-            survival_baseline_rate: None,
-            survival_time_basis: None,
-            survival_time_degree: None,
-            survival_time_knots: None,
-            survival_time_smooth_lambda: None,
-            survival_ridge_lambda: None,
-            survival_likelihood: None,
-            survival_sigma_min: None,
-            survival_sigma_max: None,
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
-            survival_distribution: None,
-            training_headers: Some(ds.headers.clone()),
-            resolved_term_spec: Some(frozen_spec),
-            resolved_term_spec_noise: None,
-            adaptive_regularization_diagnostics,
-        });
+            family_to_string(family).to_string(),
+        );
+        payload.fit_result = Some(fit.clone());
+        payload.data_schema = Some(ds.schema.clone());
+        payload.link = link_choice.as_ref().map(link_choice_to_string);
+        payload.mixture_link_param_covariance = fit
+            .mixture_link_param_covariance
+            .as_ref()
+            .map(array2_to_nested_vec);
+        payload.sas_param_covariance = fit.sas_param_covariance.as_ref().map(array2_to_nested_vec);
+        payload.training_headers = Some(ds.headers.clone());
+        payload.resolved_term_spec = Some(frozen_spec);
+        payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
+        let model = SavedModel::from_payload(payload);
         write_model_json(&out, &model)?;
     }
 
@@ -1353,11 +1259,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 }
 
 fn run_predict(args: PredictArgs) -> Result<(), String> {
-    let payload = fs::read_to_string(&args.model)
-        .map_err(|e| format!("failed to read model '{}': {e}", args.model.display()))?;
-    let model: SavedModel =
-        serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
-    validate_saved_model_for_inference_stability(&model)?;
+    let model = SavedModel::load_from_path(&args.model)?;
     let saved_mixture = model.saved_mixture_state()?;
     let saved_sas = model
         .saved_sas_state()?
@@ -1370,7 +1272,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     let saved_sas_param_cov =
         parse_optional_covariance(model.sas_param_covariance.as_ref(), "sas_param_covariance")?;
 
-    let schema = required_saved_schema(&model)?;
+    let schema = model.require_data_schema()?;
     let ds = load_dataset_with_schema(&args.new_data, schema)?;
     let col_map: HashMap<String, usize> = ds
         .headers
@@ -2260,13 +2162,9 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         return Err("only --alo is currently implemented for diagnose".to_string());
     }
 
-    let payload = fs::read_to_string(&args.model)
-        .map_err(|e| format!("failed to read model '{}': {e}", args.model.display()))?;
-    let model: SavedModel =
-        serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
-    validate_saved_model_for_inference_stability(&model)?;
+    let model = SavedModel::load_from_path(&args.model)?;
     let parsed = parse_formula(&model.formula)?;
-    let schema = required_saved_schema(&model)?;
+    let schema = model.require_data_schema()?;
     let ds = load_dataset_with_schema(&args.data, schema)?;
     let col_map: HashMap<String, usize> = ds
         .headers
@@ -3939,11 +3837,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 }
 
 fn run_sample(args: SampleArgs) -> Result<(), String> {
-    let payload = fs::read_to_string(&args.model)
-        .map_err(|e| format!("failed to read model '{}': {e}", args.model.display()))?;
-    let model: SavedModel =
-        serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
-    validate_saved_model_for_inference_stability(&model)?;
+    let model = SavedModel::load_from_path(&args.model)?;
 
     if model.is_location_scale_model() {
         return Err(
@@ -3953,7 +3847,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     }
 
     let parsed = parse_formula(&model.formula)?;
-    let schema = required_saved_schema(&model)?;
+    let schema = model.require_data_schema()?;
     let ds = load_dataset_with_schema(&args.data, schema)?;
     let col_map: HashMap<String, usize> = ds
         .headers
@@ -4221,11 +4115,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
 }
 
 fn run_generate(args: GenerateArgs) -> Result<(), String> {
-    let payload = fs::read_to_string(&args.model)
-        .map_err(|e| format!("failed to read model '{}': {e}", args.model.display()))?;
-    let model: SavedModel =
-        serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
-    validate_saved_model_for_inference_stability(&model)?;
+    let model = SavedModel::load_from_path(&args.model)?;
 
     if matches!(model.model_kind, ModelKind::Survival) {
         return Err(
@@ -4234,7 +4124,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         );
     }
 
-    let schema = required_saved_schema(&model)?;
+    let schema = model.require_data_schema()?;
     let ds = load_dataset_with_schema(&args.data, schema)?;
     let col_map: HashMap<String, usize> = ds
         .headers
@@ -4399,11 +4289,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
 }
 
 fn run_report(args: ReportArgs) -> Result<(), String> {
-    let payload = fs::read_to_string(&args.model)
-        .map_err(|e| format!("failed to read model '{}': {e}", args.model.display()))?;
-    let model: SavedModel =
-        serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
-    validate_saved_model_for_inference_stability(&model)?;
+    let model = SavedModel::load_from_path(&args.model)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
 
     let out = args.out.unwrap_or_else(|| {
@@ -4468,7 +4354,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     let mut continuous_rows = String::new();
 
     if let Some(data_path) = args.data.as_ref() {
-        let schema = required_saved_schema(&model)?;
+        let schema = model.require_data_schema()?;
         let ds = load_dataset_with_schema(data_path, schema)?;
         let col_map: HashMap<String, usize> = ds
             .headers
@@ -5419,111 +5305,6 @@ fn saved_sas_state_from_fit(fit: &FitResult) -> Option<gam::types::SasLinkState>
     })
 }
 
-fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<(), String> {
-    if model.fit_result.is_none() {
-        return Err(
-            "model is missing canonical fit_result payload; refit with current CLI".to_string(),
-        );
-    }
-    if model.data_schema.is_none() {
-        return Err("model is missing data_schema; refit with current CLI".to_string());
-    }
-    if model.training_headers.is_none() {
-        return Err(
-            "model is missing training_headers; refit with the current CLI to guarantee stable feature mapping at prediction time"
-                .to_string(),
-        );
-    }
-    let spec = model.resolved_term_spec.as_ref().ok_or_else(|| {
-        "model is missing resolved_term_spec; refit with the current CLI to guarantee train/predict design consistency"
-            .to_string()
-    })?;
-    validate_frozen_term_collection_spec(spec, "resolved_term_spec")?;
-
-    if model.formula_noise.is_some() && model.resolved_term_spec_noise.is_none() {
-        return Err(
-            "model defines formula_noise but is missing resolved_term_spec_noise; refit with the current CLI"
-                .to_string(),
-        );
-    }
-    if let Some(spec_noise) = model.resolved_term_spec_noise.as_ref() {
-        validate_frozen_term_collection_spec(spec_noise, "resolved_term_spec_noise")?;
-    }
-
-    if matches!(
-        model.family_state,
-        FittedFamily::Standard {
-            likelihood: LikelihoodFamily::BinomialSas,
-            ..
-        }
-    ) || matches!(
-        model.family_state,
-        FittedFamily::LocationScale {
-            likelihood: LikelihoodFamily::BinomialSas,
-            ..
-        }
-    ) {
-        model.saved_sas_state()?;
-    }
-    if matches!(
-        model.family_state,
-        FittedFamily::Standard {
-            likelihood: LikelihoodFamily::BinomialBetaLogistic,
-            ..
-        }
-    ) || matches!(
-        model.family_state,
-        FittedFamily::LocationScale {
-            likelihood: LikelihoodFamily::BinomialBetaLogistic,
-            ..
-        }
-    ) {
-        model.saved_beta_logistic_state()?;
-    }
-    if matches!(
-        model.family_state,
-        FittedFamily::Standard {
-            likelihood: LikelihoodFamily::BinomialMixture,
-            ..
-        }
-    ) || matches!(
-        model.family_state,
-        FittedFamily::LocationScale {
-            likelihood: LikelihoodFamily::BinomialMixture,
-            ..
-        }
-    ) {
-        model.saved_mixture_state()?;
-    }
-    if model.is_survival_model()
-        && parse_survival_likelihood_mode(
-            model
-                .survival_likelihood
-                .as_deref()
-                .unwrap_or("transformation"),
-        )? == SurvivalLikelihoodMode::ProbitLocationScale
-    {
-        if model.survival_beta_time.is_none()
-            || model.survival_beta_threshold.is_none()
-            || model.survival_beta_log_sigma.is_none()
-        {
-            return Err(
-                "saved probit-location-scale survival model is missing block coefficients; refit with current CLI"
-                    .to_string(),
-            );
-        }
-        let _link = resolve_survival_inverse_link_from_saved(model)?;
-    }
-    Ok(())
-}
-
-fn required_saved_schema(model: &SavedModel) -> Result<&DataSchema, String> {
-    model
-        .data_schema
-        .as_ref()
-        .ok_or_else(|| "model is missing data_schema; refit with current CLI".to_string())
-}
-
 fn term_spec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
     spec.linear_terms.iter().any(|term| {
         matches!(
@@ -5670,143 +5451,8 @@ fn validate_frozen_term_collection_spec(
 }
 
 fn write_model_json(path: &Path, model: &SavedModel) -> Result<(), String> {
-    validate_saved_model_for_inference_stability(model)?;
-    validate_saved_model_numeric_finiteness(model)?;
-    let payload = serde_json::to_string_pretty(model)
-        .map_err(|e| format!("failed to serialize model: {e}"))?;
-    fs::write(path, payload)
-        .map_err(|e| format!("failed to write model '{}': {e}", path.display()))?;
+    model.save_to_path(path)?;
     println!("saved model: {}", path.display());
-    Ok(())
-}
-
-fn validate_saved_model_numeric_finiteness(model: &SavedModel) -> Result<(), String> {
-    if let Some(fit) = model.fit_result.as_ref() {
-        ensure_finite_scalar("fit_result.scale", fit.scale)?;
-        ensure_finite_scalar("fit_result.final_grad_norm", fit.final_grad_norm)?;
-        ensure_finite_scalar("fit_result.deviance", fit.deviance)?;
-        ensure_finite_scalar("fit_result.stable_penalty_term", fit.stable_penalty_term)?;
-        ensure_finite_scalar("fit_result.max_abs_eta", fit.max_abs_eta)?;
-        ensure_finite_scalar("fit_result.reml_score", fit.reml_score)?;
-        ensure_finite_scalar("fit_result.edf_total", fit.edf_total)?;
-        validate_all_finite("fit_result.beta", fit.beta.iter().copied())?;
-        validate_all_finite("fit_result.lambdas", fit.lambdas.iter().copied())?;
-        validate_all_finite("fit_result.edf_by_block", fit.edf_by_block.iter().copied())?;
-        validate_all_finite(
-            "fit_result.working_weights",
-            fit.working_weights.iter().copied(),
-        )?;
-        validate_all_finite(
-            "fit_result.working_response",
-            fit.working_response.iter().copied(),
-        )?;
-        validate_all_finite(
-            "fit_result.penalized_hessian",
-            fit.penalized_hessian.iter().copied(),
-        )?;
-        if let Some(v) = fit.beta_covariance.as_ref() {
-            validate_all_finite("fit_result.beta_covariance", v.iter().copied())?;
-        }
-        if let Some(v) = fit.beta_covariance_corrected.as_ref() {
-            validate_all_finite("fit_result.beta_covariance_corrected", v.iter().copied())?;
-        }
-        if let Some(v) = fit.beta_standard_errors.as_ref() {
-            validate_all_finite("fit_result.beta_standard_errors", v.iter().copied())?;
-        }
-        if let Some(v) = fit.beta_standard_errors_corrected.as_ref() {
-            validate_all_finite(
-                "fit_result.beta_standard_errors_corrected",
-                v.iter().copied(),
-            )?;
-        }
-        if let Some(v) = fit.mixture_link_rho.as_ref() {
-            validate_all_finite("fit_result.mixture_link_rho", v.iter().copied())?;
-        }
-        if let Some(v) = fit.mixture_link_weights.as_ref() {
-            validate_all_finite("fit_result.mixture_link_weights", v.iter().copied())?;
-        }
-        if let Some(v) = fit.mixture_link_param_covariance.as_ref() {
-            validate_all_finite(
-                "fit_result.mixture_link_param_covariance",
-                v.iter().copied(),
-            )?;
-        }
-        if let Some(v) = fit.sas_param_covariance.as_ref() {
-            validate_all_finite("fit_result.sas_param_covariance", v.iter().copied())?;
-        }
-        if let Some(v) = fit.sas_epsilon {
-            ensure_finite_scalar("fit_result.sas_epsilon", v)?;
-        }
-        if let Some(v) = fit.sas_log_delta {
-            ensure_finite_scalar("fit_result.sas_log_delta", v)?;
-        }
-        if let Some(v) = fit.sas_delta {
-            ensure_finite_scalar("fit_result.sas_delta", v)?;
-        }
-    }
-
-    if let Some(v) = model.sigma_min {
-        ensure_finite_scalar("sigma_min", v)?;
-    }
-    if let Some(v) = model.sigma_max {
-        ensure_finite_scalar("sigma_max", v)?;
-    }
-    if let Some(v) = model.survival_baseline_scale {
-        ensure_finite_scalar("survival_baseline_scale", v)?;
-    }
-    if let Some(v) = model.survival_baseline_shape {
-        ensure_finite_scalar("survival_baseline_shape", v)?;
-    }
-    if let Some(v) = model.survival_baseline_rate {
-        ensure_finite_scalar("survival_baseline_rate", v)?;
-    }
-    if let Some(v) = model.survival_time_smooth_lambda {
-        ensure_finite_scalar("survival_time_smooth_lambda", v)?;
-    }
-    if let Some(v) = model.survival_ridge_lambda {
-        ensure_finite_scalar("survival_ridge_lambda", v)?;
-    }
-    if let Some(v) = model.survival_sigma_min {
-        ensure_finite_scalar("survival_sigma_min", v)?;
-    }
-    if let Some(v) = model.survival_sigma_max {
-        ensure_finite_scalar("survival_sigma_max", v)?;
-    }
-
-    if let Some(v) = model.beta_noise.as_ref() {
-        validate_all_finite("beta_noise", v.iter().copied())?;
-    }
-    if let Some(v) = model.joint_beta_link.as_ref() {
-        validate_all_finite("joint_beta_link", v.iter().copied())?;
-    }
-    if let Some(v) = model.joint_knot_vector.as_ref() {
-        validate_all_finite("joint_knot_vector", v.iter().copied())?;
-    }
-    if let Some((a, b)) = model.joint_knot_range {
-        ensure_finite_scalar("joint_knot_range.0", a)?;
-        ensure_finite_scalar("joint_knot_range.1", b)?;
-    }
-    if let Some(v) = model.joint_ridge_used {
-        ensure_finite_scalar("joint_ridge_used", v)?;
-    }
-    if let Some(v) = model.beta_wiggle.as_ref() {
-        validate_all_finite("beta_wiggle", v.iter().copied())?;
-    }
-    if let Some(v) = model.survival_beta_time.as_ref() {
-        validate_all_finite("survival_beta_time", v.iter().copied())?;
-    }
-    if let Some(v) = model.survival_beta_threshold.as_ref() {
-        validate_all_finite("survival_beta_threshold", v.iter().copied())?;
-    }
-    if let Some(v) = model.survival_beta_log_sigma.as_ref() {
-        validate_all_finite("survival_beta_log_sigma", v.iter().copied())?;
-    }
-    if let Some(v) = model.mixture_link_param_covariance.as_ref() {
-        validate_all_finite("mixture_link_param_covariance", v.iter().flatten().copied())?;
-    }
-    if let Some(v) = model.sas_param_covariance.as_ref() {
-        validate_all_finite("sas_param_covariance", v.iter().flatten().copied())?;
-    }
     Ok(())
 }
 
@@ -6101,7 +5747,7 @@ fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "linkwiggle" | "link_wiggle" => {
+            "linkwiggle" => {
                 if !vars.is_empty() {
                     return Err(format!(
                         "linkwiggle() takes named options only; positional args are not supported: {raw}"
@@ -6117,10 +5763,10 @@ fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 }
                 return Ok(ParsedTerm::LinkConfig { options });
             }
-            "survmodel" | "survival" => {
+            "survmodel" => {
                 if !vars.is_empty() {
                     return Err(format!(
-                        "survmodel()/survival() takes named options only; positional args are not supported: {raw}"
+                        "survmodel() takes named options only; positional args are not supported: {raw}"
                     ));
                 }
                 return Ok(ParsedTerm::SurvivalConfig { options });
@@ -6273,9 +5919,7 @@ fn parse_link_wiggle_formula_spec(
     if degree < 1 {
         return Err(format!("linkwiggle() requires degree >= 1: {raw}"));
     }
-    let num_internal_knots = option_usize(options, "internal_knots")
-        .or_else(|| option_usize(options, "knots"))
-        .unwrap_or(7);
+    let num_internal_knots = option_usize(options, "internal_knots").unwrap_or(7);
     if num_internal_knots == 0 {
         return Err(format!("linkwiggle() requires internal_knots > 0: {raw}"));
     }
@@ -6317,20 +5961,15 @@ fn parse_link_formula_spec(
 ) -> Result<LinkFormulaSpec, String> {
     let link = options
         .get("type")
-        .or_else(|| options.get("link"))
         .map(|s| s.trim().to_string())
         .ok_or_else(|| format!("link() requires type=<link-name>: {raw}"))?;
     if link.is_empty() {
         return Err(format!("link() requires a non-empty type: {raw}"));
     }
     let mixture_rho = options.get("rho").map(|s| s.trim().to_string());
-    let sas_init = options
-        .get("sas_init")
-        .or_else(|| options.get("sas"))
-        .map(|s| s.trim().to_string());
+    let sas_init = options.get("sas_init").map(|s| s.trim().to_string());
     let beta_logistic_init = options
         .get("beta_logistic_init")
-        .or_else(|| options.get("beta"))
         .map(|s| s.trim().to_string());
     Ok(LinkFormulaSpec {
         link,
@@ -6351,10 +5990,7 @@ fn parse_survival_formula_spec(
     }
     Ok(SurvivalFormulaSpec {
         spec: options.get("spec").map(|s| s.trim().to_string()),
-        survival_distribution: options
-            .get("distribution")
-            .or_else(|| options.get("survival_distribution"))
-            .map(|s| s.trim().to_string()),
+        survival_distribution: options.get("distribution").map(|s| s.trim().to_string()),
     })
 }
 
@@ -8824,17 +8460,12 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
-            spec: "net".to_string(),
             survival_likelihood: "transformation".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: None,
             mixture_rho: None,
             sas_init: None,
             beta_logistic_init: None,
-            learn_link_wiggle: false,
-            link_wiggle_degree: 3,
-            link_wiggle_internal_knots: 7,
-            link_wiggle_double_penalty: true,
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),
             baseline_scale: None,
@@ -8858,17 +8489,12 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
-            spec: "net".to_string(),
             survival_likelihood: "probit-location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("logit".to_string()),
             mixture_rho: None,
             sas_init: None,
             beta_logistic_init: None,
-            learn_link_wiggle: false,
-            link_wiggle_degree: 3,
-            link_wiggle_internal_knots: 7,
-            link_wiggle_double_penalty: true,
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),
             baseline_scale: None,
@@ -8976,17 +8602,12 @@ mod tests {
             exit: "exit".to_string(),
             event: "event".to_string(),
             formula: "1".to_string(),
-            spec: "net".to_string(),
             survival_likelihood: "probit-location-scale".to_string(),
             survival_distribution: "gaussian".to_string(),
             link: Some("loglog".to_string()),
             mixture_rho: None,
             sas_init: None,
             beta_logistic_init: None,
-            learn_link_wiggle: false,
-            link_wiggle_degree: 3,
-            link_wiggle_internal_knots: 7,
-            link_wiggle_double_penalty: true,
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),
             baseline_scale: None,
