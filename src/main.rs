@@ -1041,6 +1041,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             tol: fit_tol,
             nullspace_dims: vec![],
             linear_constraints: bootstrap_design.linear_constraints.clone(),
+            adaptive_regularization: None,
         };
         let fitted = match fit_term_collection_with_spatial_length_scale_optimization(
             ds.values.view(),
@@ -2174,6 +2175,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             tol: 1e-6,
             nullspace_dims: design.nullspace_dims.clone(),
             linear_constraints: design.linear_constraints.clone(),
+            adaptive_regularization: None,
         },
     )
     .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
@@ -3438,8 +3440,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         |_info| {},
     )
     .map_err(|e| format!("survival constrained PIRLS failed: {e}"))?;
-    let beta = summary.beta.0;
-    let state = summary.state;
+    let beta = summary.beta.0.clone();
+    let state = summary.state.clone();
     match summary.status {
         gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum => {}
         other => {
@@ -3807,6 +3809,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
                 tol: 1e-6,
                 nullspace_dims: design.nullspace_dims.clone(),
                 linear_constraints: design.linear_constraints.clone(),
+                adaptive_regularization: None,
             },
         )
         .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
@@ -4132,6 +4135,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                         let status = match ord.status {
                             ContinuousSmoothnessOrderStatus::Ok => "Ok",
                             ContinuousSmoothnessOrderStatus::NonMaternRegime => "NonMaternRegime",
+                            ContinuousSmoothnessOrderStatus::FirstOrderLimit => "FirstOrderLimit",
                             ContinuousSmoothnessOrderStatus::UndefinedZeroLambda => {
                                 "UndefinedZeroLambda"
                             }
@@ -5318,7 +5322,10 @@ fn validate_saved_model_numeric_finiteness(model: &SavedModel) -> Result<(), Str
             validate_all_finite("fit_result.beta_standard_errors", v.iter().copied())?;
         }
         if let Some(v) = fit.beta_standard_errors_corrected.as_ref() {
-            validate_all_finite("fit_result.beta_standard_errors_corrected", v.iter().copied())?;
+            validate_all_finite(
+                "fit_result.beta_standard_errors_corrected",
+                v.iter().copied(),
+            )?;
         }
         if let Some(v) = fit.mixture_link_rho.as_ref() {
             validate_all_finite("fit_result.mixture_link_rho", v.iter().copied())?;
@@ -5403,10 +5410,7 @@ fn validate_saved_model_numeric_finiteness(model: &SavedModel) -> Result<(), Str
         validate_all_finite("survival_beta_log_sigma", v.iter().copied())?;
     }
     if let Some(v) = model.mixture_link_param_covariance.as_ref() {
-        validate_all_finite(
-            "mixture_link_param_covariance",
-            v.iter().flatten().copied(),
-        )?;
+        validate_all_finite("mixture_link_param_covariance", v.iter().flatten().copied())?;
     }
     if let Some(v) = model.sas_param_covariance.as_ref() {
         validate_all_finite("sas_param_covariance", v.iter().flatten().copied())?;
@@ -7557,12 +7561,12 @@ fn write_survival_prediction_csv(
 mod tests {
     use super::{
         BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, LikelihoodFamily, MODEL_VERSION,
-        ParsedTerm, SavedModel, SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
-        chi_square_survival_approx, compute_probit_q0_from_eta, core_saved_fit_result,
-        parse_duchon_order, parse_duchon_power, parse_formula, parse_surv_response,
-        parse_survival_time_basis_config, pretty_family_name, saved_probit_wiggle_derivative_q0,
-        saved_probit_wiggle_design, summarize_wiggle_domain, survival_probability_from_eta,
-        write_survival_prediction_csv,
+        ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs, SurvivalTimeBasisConfig,
+        build_survival_time_basis, chi_square_survival_approx, compute_probit_q0_from_eta,
+        core_saved_fit_result, parse_duchon_order, parse_duchon_power, parse_formula,
+        parse_surv_response, parse_survival_time_basis_config, pretty_family_name,
+        saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design, summarize_wiggle_domain,
+        survival_probability_from_eta, write_survival_prediction_csv,
     };
     use csv::StringRecord;
     use gam::basis::{BasisOptions, Dense, DuchonNullspaceOrder, KnotSource, create_basis};

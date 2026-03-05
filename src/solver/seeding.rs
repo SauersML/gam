@@ -53,6 +53,131 @@ fn rho_from_lambda(lambda: f64, bounds: (f64, f64)) -> f64 {
     clamp_to_bounds(lambda.max(1e-12).ln(), bounds)
 }
 
+fn safe_ln_pos(x: f64) -> Option<f64> {
+    if x.is_finite() && x > 0.0 {
+        Some(x.ln())
+    } else {
+        None
+    }
+}
+
+fn spde_rho_triplet_from_log_tau_log_kappa_nu(
+    log_tau: f64,
+    log_kappa: f64,
+    nu: f64,
+    bounds: (f64, f64),
+) -> Option<Array1<f64>> {
+    if !(nu.is_finite() && nu > 1.0) {
+        return None;
+    }
+    let log_c0 = 0.0;
+    let log_c1 = safe_ln_pos(nu)?;
+    let log_c2 = safe_ln_pos(0.5 * nu * (nu - 1.0))?;
+    let rho0 = clamp_to_bounds(log_tau + log_c0 + 2.0 * nu * log_kappa, bounds);
+    let rho1 = clamp_to_bounds(log_tau + log_c1 + 2.0 * (nu - 1.0) * log_kappa, bounds);
+    let rho2 = clamp_to_bounds(log_tau + log_c2 + 2.0 * (nu - 2.0) * log_kappa, bounds);
+    Some(Array1::from_vec(vec![rho0, rho1, rho2]))
+}
+
+fn add_spde_manifold_seeds(
+    seeds: &mut Vec<Array1<f64>>,
+    seen: &mut HashSet<Vec<u64>>,
+    bounds: (f64, f64),
+    heuristic_lambdas: Option<&[f64]>,
+    primary: &Array1<f64>,
+) {
+    if primary.len() != 3 {
+        return;
+    }
+    // Broad default manifold grid in (log_tau, log_kappa, nu).
+    let tau_anchors = [primary[2], 0.0, -2.0, 2.0];
+    let log_kappa_grid = [-2.0, -1.0, 0.0, 1.0, 2.0];
+    let nu_grid = [1.25, 1.5, 2.0, 2.5, 3.0, 4.0];
+    for &tau in &tau_anchors {
+        for &lk in &log_kappa_grid {
+            for &nu in &nu_grid {
+                if let Some(seed) = spde_rho_triplet_from_log_tau_log_kappa_nu(tau, lk, nu, bounds)
+                {
+                    add_seed_dedup(seeds, seen, seed);
+                }
+            }
+        }
+    }
+
+    // Data-informed anchor: invert heuristic lambdas to (nu, kappa^2, tau) when feasible.
+    if let Some(vals) = heuristic_lambdas
+        && vals.len() == 3
+    {
+        let l0 = vals[0];
+        let l1 = vals[1];
+        let l2 = vals[2];
+        if l0.is_finite() && l1.is_finite() && l2.is_finite() && l0 > 1e-12 && l2 > 1e-12 {
+            let r = (l1 * l1) / (l0 * l2);
+            if r > 2.0 {
+                let nu = r / (r - 2.0);
+                let kappa2 = l1 / ((r - 2.0) * l2);
+                if nu.is_finite() && nu > 1.0 && kappa2.is_finite() && kappa2 > 0.0 {
+                    let log_kappa = 0.5 * kappa2.ln();
+                    let c2 = 0.5 * nu * (nu - 1.0);
+                    if c2.is_finite() && c2 > 0.0 {
+                        let log_tau = (l2 / (c2 * kappa2.powf(nu - 2.0))).max(1e-12).ln();
+                        let local_nu = [nu, (nu - 0.3).max(1.05), nu + 0.3];
+                        let local_tau = [log_tau, log_tau - 1.0, log_tau + 1.0];
+                        let local_kappa = [log_kappa, log_kappa - 0.5, log_kappa + 0.5];
+                        for &t in &local_tau {
+                            for &lk in &local_kappa {
+                                for &n in &local_nu {
+                                    if let Some(seed) =
+                                        spde_rho_triplet_from_log_tau_log_kappa_nu(t, lk, n, bounds)
+                                    {
+                                        add_seed_dedup(seeds, seen, seed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn add_first_order_fallback_seeds(
+    seeds: &mut Vec<Array1<f64>>,
+    seen: &mut HashSet<Vec<u64>>,
+    bounds: (f64, f64),
+    heuristic_lambdas: Option<&[f64]>,
+) {
+    // Degenerate λ2 -> 0 fallback (first-order mass+tension):
+    // λ0 = τ κ^2, λ1 = τ, λ2 ≈ 0.
+    let rho2_floor = bounds.0;
+    let default_log_kappa = [-2.0, -1.0, 0.0, 1.0];
+    let default_log_tau = [0.0, -2.0, 2.0];
+    for &t in &default_log_tau {
+        for &lk in &default_log_kappa {
+            let rho0 = clamp_to_bounds(t + 2.0 * lk, bounds);
+            let rho1 = clamp_to_bounds(t, bounds);
+            add_seed_dedup(seeds, seen, Array1::from_vec(vec![rho0, rho1, rho2_floor]));
+        }
+    }
+    if let Some(vals) = heuristic_lambdas
+        && vals.len() == 3
+        && vals[0].is_finite()
+        && vals[1].is_finite()
+        && vals[0] > 1e-12
+        && vals[1] > 1e-12
+    {
+        let kappa2 = vals[0] / vals[1];
+        if kappa2.is_finite() && kappa2 > 0.0 {
+            let lk = 0.5 * kappa2.ln();
+            let t = vals[1].ln();
+            let rho0 = clamp_to_bounds(t + 2.0 * lk, bounds);
+            let rho1 = clamp_to_bounds(t, bounds);
+            add_seed_dedup(seeds, seen, Array1::from_vec(vec![rho0, rho1, rho2_floor]));
+        }
+    }
+}
+
 fn add_nu2_reverse_manifold_seeds(
     seeds: &mut Vec<Array1<f64>>,
     seen: &mut HashSet<Vec<u64>>,
@@ -149,9 +274,14 @@ pub fn generate_rho_candidates(
     // Always include neutral baseline independently of heuristic anchor.
     add_seed_dedup(&mut seeds, &mut seen, Array1::zeros(num_penalties));
     // For exactly three penalties (mass/tension/stiffness), inject
-    // physically coherent nu=2 manifold seeds in rho-space.
+    // physically coherent manifold seeds in rho-space:
+    // - general SPDE manifold over (log_tau, log_kappa, nu),
+    // - backward-compatible nu=2 reverse-map seeds,
+    // - first-order fallback seeds (lambda2 near lower bound).
     if num_penalties == 3 {
+        add_spde_manifold_seeds(&mut seeds, &mut seen, bounds, heuristic_lambdas, &primary);
         add_nu2_reverse_manifold_seeds(&mut seeds, &mut seen, bounds, &primary);
+        add_first_order_fallback_seeds(&mut seeds, &mut seen, bounds, heuristic_lambdas);
     }
 
     // Backward-compatible scalar heuristic support: treat each value as a symmetric λ seed.
@@ -369,5 +499,31 @@ mod tests {
             .iter()
             .any(|s| s.len() == 3 && ((2.0 * s[1] - s[0] - s[2]) - ln4).abs() < 1e-8);
         assert!(has_nu2_manifold_seed);
+    }
+
+    #[test]
+    fn three_penalty_seeds_include_general_spde_manifold_points() {
+        let cfg = SeedConfig::default();
+        let heur = [2.0, 10.0, 3.0];
+        let seeds = generate_rho_candidates(3, Some(&heur), &cfg);
+        let has_non_nu2 = seeds.iter().any(|s| {
+            // For nu=2, 2*rho1-rho0-rho2 = ln(4).
+            // General nu manifold should include points away from ln(4).
+            s.len() == 3 && ((2.0 * s[1] - s[0] - s[2]) - 4.0_f64.ln()).abs() > 1e-3
+        });
+        assert!(has_non_nu2);
+    }
+
+    #[test]
+    fn three_penalty_seeds_include_first_order_fallback_with_rho2_floor() {
+        let cfg = SeedConfig {
+            bounds: (-12.0, 12.0),
+            ..SeedConfig::default()
+        };
+        let seeds = generate_rho_candidates(3, None, &cfg);
+        let has_floor = seeds
+            .iter()
+            .any(|s| s.len() == 3 && (s[2] - (-12.0)).abs() < 1e-12);
+        assert!(has_floor);
     }
 }

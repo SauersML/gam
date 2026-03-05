@@ -40,6 +40,7 @@ fn base_fit_options() -> FitOptions {
         tol: 1e-6,
         nullspace_dims: vec![1],
         linear_constraints: None,
+        adaptive_regularization: None,
     }
 }
 

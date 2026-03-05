@@ -4,11 +4,10 @@ use crate::basis::{
     MaternBasisSpec, MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource,
     SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
     apply_weighted_orthogonality_constraint, build_bspline_basis_1d, build_duchon_basis,
-    build_duchon_collocation_operator_matrices,
-    build_matern_basis, build_matern_basis_log_kappa_derivative,
-    build_matern_collocation_operator_matrices,
-    build_matern_basis_log_kappa_second_derivative, build_thin_plate_basis,
-    estimate_penalty_nullity, filter_active_penalty_candidates,
+    build_duchon_collocation_operator_matrices, build_matern_basis,
+    build_matern_basis_log_kappa_derivative, build_matern_basis_log_kappa_second_derivative,
+    build_matern_collocation_operator_matrices, build_thin_plate_basis, estimate_penalty_nullity,
+    filter_active_penalty_candidates,
 };
 use crate::construction::kronecker_product;
 use crate::custom_family::{
@@ -2385,8 +2384,6 @@ struct SpatialOperatorRuntimeCache {
     coeff_global_range: Range<usize>,
     tension_penalty_global_idx: usize,
     stiffness_penalty_global_idx: usize,
-    tension_normalization_scale: f64,
-    stiffness_normalization_scale: f64,
     d1: Array2<f64>,
     d2: Array2<f64>,
     collocation_points: Array2<f64>,
@@ -2395,28 +2392,135 @@ struct SpatialOperatorRuntimeCache {
 
 #[derive(Clone)]
 struct SpatialAdaptiveWeights {
+    grad_weight: Array1<f64>,
+    lap_weight: Array1<f64>,
     inv_grad_weight: Array1<f64>,
     inv_lap_weight: Array1<f64>,
 }
 
-fn median_owned(values: &mut [f64], fallback: f64) -> f64 {
-    if values.is_empty() {
-        return fallback;
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = values.len();
-    if n % 2 == 1 {
-        values[n / 2]
+fn collocation_magnitudes_for_beta(
+    beta_local: ArrayView1<'_, f64>,
+    cache: &SpatialOperatorRuntimeCache,
+) -> (Array1<f64>, Array1<f64>) {
+    let grad_rows = cache.d1.dot(&beta_local);
+    let lap = cache.d2.dot(&beta_local);
+    let p = cache.collocation_points.nrows();
+    debug_assert_eq!(grad_rows.len(), p * cache.dimension);
+    debug_assert_eq!(lap.len(), p);
+
+    let mut g = Array1::<f64>::zeros(p);
+    let mut c = Array1::<f64>::zeros(p);
+    if let Some(grad_slice) = grad_rows.as_slice() {
+        // Exact block interpretation with (k,axis) stacking:
+        //   V = D1_con * beta in R^{P*d},
+        //   grad block for point k is V[k*d .. (k+1)*d].
+        let chunks = grad_slice.chunks_exact(cache.dimension);
+        debug_assert_eq!(chunks.remainder().len(), 0);
+        for (k, grad_block) in chunks.enumerate() {
+            let g2 = grad_block.iter().map(|v| v * v).sum::<f64>();
+            g[k] = g2.sqrt();
+            c[k] = lap[k].abs();
+        }
     } else {
-        0.5 * (values[n / 2 - 1] + values[n / 2])
+        for k in 0..p {
+            let mut g2 = 0.0_f64;
+            for axis in 0..cache.dimension {
+                let v = grad_rows[k * cache.dimension + axis];
+                g2 += v * v;
+            }
+            g[k] = g2.sqrt();
+            c[k] = lap[k].abs();
+        }
     }
+    (g, c)
+}
+
+fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
+    matrix.iter().map(|v| v * v).sum::<f64>().sqrt()
+}
+
+fn quantile_from_sorted(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let qq = q.clamp(0.0, 1.0);
+    let pos = qq * (sorted.len().saturating_sub(1) as f64);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        let t = pos - lo as f64;
+        sorted[lo] * (1.0 - t) + sorted[hi] * t
+    }
+}
+
+fn robust_epsilon_from_samples(values: &[f64], min_epsilon_cfg: f64) -> f64 {
+    if values.is_empty() {
+        return min_epsilon_cfg.max(1e-12);
+    }
+    let mut clean = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .collect::<Vec<_>>();
+    if clean.is_empty() {
+        return min_epsilon_cfg.max(1e-12);
+    }
+    clean.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n = clean.len();
+    let median = quantile_from_sorted(&clean, 0.5);
+    let q75 = quantile_from_sorted(&clean, 0.75);
+    let q95 = quantile_from_sorted(&clean, 0.95);
+
+    let mut abs_dev = clean
+        .iter()
+        .map(|v| (v - median).abs())
+        .filter(|v| v.is_finite())
+        .collect::<Vec<_>>();
+    abs_dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mad = 1.4826 * quantile_from_sorted(&abs_dev, 0.5);
+
+    // Charbonnier/MM requires eps bounded away from zero:
+    //   u(t0) = 1 / (2*sqrt(t0^2 + eps^2)) ~ 1/(2*eps) near t0=0.
+    // Use robust pilot scale:
+    //   s = max(median(z), 1.4826*MAD(z), Q75(z)).
+    // If s is tiny (<= delta), fallback to:
+    //   s <- max(Q95(z), RMS(z)).
+    // If still tiny, fallback to absolute floor s_min.
+    // Then eps = kappa * s.
+    // Primary robust scale: s = max(median, 1.4826*MAD, Q75).
+    let mut scale = median.max(mad).max(q75);
+
+    // Safety threshold delta and absolute floor s_min.
+    let delta = (f64::EPSILON.sqrt() * q95.max(1.0))
+        .max(min_epsilon_cfg)
+        .max(1e-12);
+    let s_min = min_epsilon_cfg.max(1e-12);
+
+    // If robust scale is tiny, use high-quantile / RMS fallback.
+    if scale <= delta {
+        let rms = (clean.iter().map(|v| v * v).sum::<f64>() / n as f64).sqrt();
+        scale = q95.max(rms);
+    }
+    if scale <= delta {
+        scale = s_min;
+    }
+
+    // Epsilon is a fraction of robust scale.
+    let kappa = 1e-2_f64;
+    (kappa * scale).max(s_min)
 }
 
 fn extract_spatial_operator_runtime_caches(
     spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
 ) -> Result<Vec<SpatialOperatorRuntimeCache>, EstimationError> {
-    let smooth_start = design.design.ncols().saturating_sub(design.smooth.design.ncols());
+    let smooth_start = design
+        .design
+        .ncols()
+        .saturating_sub(design.smooth.design.ncols());
     let mut out = Vec::<SpatialOperatorRuntimeCache>::new();
     for (term_idx, (term_spec, term_fit)) in spec
         .smooth_terms
@@ -2447,20 +2551,11 @@ fn extract_spatial_operator_runtime_caches(
         };
         let tension_global_idx = global_base_idx + tension_local;
         let stiffness_global_idx = global_base_idx + stiffness_local;
-        let tension_scale = design
-            .penalty_info
-            .get(tension_global_idx)
-            .map(|p| p.penalty.normalization_scale)
-            .unwrap_or(1.0)
-            .max(1e-12);
-        let stiffness_scale = design
-            .penalty_info
-            .get(stiffness_global_idx)
-            .map(|p| p.penalty.normalization_scale)
-            .unwrap_or(1.0)
-            .max(1e-12);
 
-        let (feature_cols, d1, d2, collocation_points, dim) = match (&term_spec.basis, &term_fit.metadata) {
+        let (feature_cols, d1, d2, collocation_points, dim) = match (
+            &term_spec.basis,
+            &term_fit.metadata,
+        ) {
             (
                 SmoothBasisSpec::Matern { feature_cols, .. },
                 BasisMetadata::Matern {
@@ -2493,15 +2588,28 @@ fn extract_spatial_operator_runtime_caches(
                     length_scale,
                     power,
                     nullspace_order,
+                    identifiability_transform,
                     ..
                 },
             ) => {
-                let ops = build_duchon_collocation_operator_matrices(
+                let mut ops = build_duchon_collocation_operator_matrices(
                     centers.view(),
                     *length_scale,
                     *power,
                     *nullspace_order,
                 )?;
+                if let Some(z) = identifiability_transform {
+                    if ops.d1.ncols() != z.nrows() || ops.d2.ncols() != z.nrows() {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "Duchon collocation transform mismatch for term '{}': D1/D2 cols={}, transform rows={}",
+                            term_fit.name,
+                            ops.d1.ncols(),
+                            z.nrows()
+                        )));
+                    }
+                    ops.d1 = ops.d1.dot(z);
+                    ops.d2 = ops.d2.dot(z);
+                }
                 (
                     feature_cols.clone(),
                     ops.d1,
@@ -2530,8 +2638,6 @@ fn extract_spatial_operator_runtime_caches(
             coeff_global_range,
             tension_penalty_global_idx: tension_global_idx,
             stiffness_penalty_global_idx: stiffness_global_idx,
-            tension_normalization_scale: tension_scale,
-            stiffness_normalization_scale: stiffness_scale,
             d1,
             d2,
             collocation_points,
@@ -2549,28 +2655,44 @@ fn compute_spatial_adaptive_weights_for_beta(
     weight_floor: f64,
     weight_ceiling: f64,
 ) -> Vec<SpatialAdaptiveWeights> {
+    // Charbonnier/MM derivation (per collocation scalar t):
+    //   psi(t; eps) = sqrt(t^2 + eps^2) - eps
+    // and for reference t0 the tangent majorizer in t^2 gives:
+    //   psi(t) <= u(t0) * t^2 + const(t0),
+    //   u(t0) = 1 / (2*sqrt(t0^2 + eps^2)).
+    //
+    // We apply this to:
+    //   t = g_k = ||nabla f(z_k)||_2  (gradient magnitude),
+    //   t = c_k = |Delta f(z_k)|      (laplacian magnitude),
+    // both computed from beta^(t-1).
+    //
+    // These u values define the quadratic surrogate penalties:
+    //   K1 = D1_con^T W_g D1_con,  W_g = diag(u_g) \otimes I_d  (k,axis order)
+    //   K2 = D2_con^T W_c D2_con,  W_c = diag(u_c).
+    //
+    // We clamp u directly, then derive inv_u=1/u for diagnostics and row scaling.
     caches
         .iter()
         .map(|cache| {
-            let beta_local = beta.slice(s![cache.coeff_global_range.clone()]).to_owned();
-            let grad_rows = cache.d1.dot(&beta_local);
-            let lap = cache.d2.dot(&beta_local);
-            let p = cache.collocation_points.nrows();
-            let mut inv_g = Array1::<f64>::zeros(p);
-            let mut inv_c = Array1::<f64>::zeros(p);
-            for k in 0..p {
-                let mut g2 = 0.0_f64;
-                for axis in 0..cache.dimension {
-                    let v = grad_rows[k * cache.dimension + axis];
-                    g2 += v * v;
-                }
-                let cabs = lap[k].abs();
-                inv_g[k] = (g2 + epsilon_g * epsilon_g).sqrt();
-                inv_c[k] = (cabs * cabs + epsilon_c * epsilon_c).sqrt();
+            let beta_local = beta.slice(s![cache.coeff_global_range.clone()]);
+            let (g, c) = collocation_magnitudes_for_beta(beta_local, cache);
+            let mut u_g = Array1::<f64>::zeros(g.len());
+            let mut u_c = Array1::<f64>::zeros(c.len());
+            let mut inv_g = Array1::<f64>::zeros(g.len());
+            let mut inv_c = Array1::<f64>::zeros(c.len());
+            for k in 0..g.len() {
+                // MM majorizer weight for Charbonnier:
+                //   u(t0) = 1 / (2*sqrt(t0^2 + eps^2)).
+                let ug = 0.5 / (g[k] * g[k] + epsilon_g * epsilon_g).sqrt();
+                let uc = 0.5 / (c[k] * c[k] + epsilon_c * epsilon_c).sqrt();
+                u_g[k] = ug.clamp(weight_floor, weight_ceiling);
+                u_c[k] = uc.clamp(weight_floor, weight_ceiling);
+                inv_g[k] = 1.0 / u_g[k];
+                inv_c[k] = 1.0 / u_c[k];
             }
-            inv_g.mapv_inplace(|v| v.clamp(weight_floor, weight_ceiling));
-            inv_c.mapv_inplace(|v| v.clamp(weight_floor, weight_ceiling));
             SpatialAdaptiveWeights {
+                grad_weight: u_g,
+                lap_weight: u_c,
                 inv_grad_weight: inv_g,
                 inv_lap_weight: inv_c,
             }
@@ -2586,33 +2708,39 @@ fn compute_initial_epsilons(
     let mut g_vals = Vec::<f64>::new();
     let mut c_vals = Vec::<f64>::new();
     for cache in caches {
-        let beta_local = beta.slice(s![cache.coeff_global_range.clone()]).to_owned();
-        let grad_rows = cache.d1.dot(&beta_local);
-        let lap = cache.d2.dot(&beta_local);
-        let p = cache.collocation_points.nrows();
-        for k in 0..p {
-            let mut g2 = 0.0_f64;
-            for axis in 0..cache.dimension {
-                let v = grad_rows[k * cache.dimension + axis];
-                g2 += v * v;
-            }
-            g_vals.push(g2.sqrt());
-            c_vals.push(lap[k].abs());
-        }
+        let beta_local = beta.slice(s![cache.coeff_global_range.clone()]);
+        let (g, c) = collocation_magnitudes_for_beta(beta_local, cache);
+        g_vals.extend(g.iter().copied());
+        c_vals.extend(c.iter().copied());
     }
-    let eps_g = median_owned(&mut g_vals, min_epsilon).max(min_epsilon);
-    let eps_c = median_owned(&mut c_vals, min_epsilon).max(min_epsilon);
+    // Robust epsilon initialization from pilot magnitudes:
+    //   s = max(median(z), 1.4826*MAD(z), Q75(z)),
+    //   if s is tiny then fallback to max(Q95(z), RMS(z)),
+    //   if still tiny then use absolute floor min_epsilon.
+    // Epsilon is then kappa * s.
+    let eps_g = robust_epsilon_from_samples(&g_vals, min_epsilon);
+    let eps_c = robust_epsilon_from_samples(&c_vals, min_epsilon);
     (eps_g, eps_c)
 }
 
 fn weighted_operator_gram_from_d1(
     d1: &Array2<f64>,
-    inv_weight: &Array1<f64>,
+    weight: &Array1<f64>,
     dimension: usize,
 ) -> Array2<f64> {
     let mut weighted = d1.clone();
-    for k in 0..inv_weight.len() {
-        let w = (1.0 / inv_weight[k]).sqrt();
+    for k in 0..weight.len() {
+        // Kronecker/stacking derivation:
+        // D1 rows are stacked as (k, axis), i.e. axis-major inside each point block.
+        // For this storage, the correct gradient weight matrix is:
+        //   W_g = diag(u_g) \otimes I_d,
+        // which repeats u_g[k] across all d axes at collocation point k.
+        //
+        // Instead of forming W_g explicitly, compute W_g^(1/2) D1:
+        // each row in block k is multiplied by sqrt(u_g[k]).
+        //
+        // Then K1 = (W_g^(1/2) D1)^T (W_g^(1/2) D1) = D1^T W_g D1.
+        let w = weight[k].sqrt();
         for axis in 0..dimension {
             let row = k * dimension + axis;
             weighted.row_mut(row).mapv_inplace(|v| v * w);
@@ -2622,10 +2750,13 @@ fn weighted_operator_gram_from_d1(
     (&gram + &gram.t().to_owned()) * 0.5
 }
 
-fn weighted_operator_gram_from_d2(d2: &Array2<f64>, inv_weight: &Array1<f64>) -> Array2<f64> {
+fn weighted_operator_gram_from_d2(d2: &Array2<f64>, weight: &Array1<f64>) -> Array2<f64> {
     let mut weighted = d2.clone();
-    for k in 0..inv_weight.len() {
-        let w = (1.0 / inv_weight[k]).sqrt();
+    for k in 0..weight.len() {
+        // Laplacian block is already one row per collocation point:
+        //   c_k = |Delta f(z_k)|, u_k = 1/sqrt(c_k^2 + eps_c^2), K2 = D2^T diag(u) D2.
+        // Scale each row by sqrt(u_k).
+        let w = weight[k].sqrt();
         weighted.row_mut(k).mapv_inplace(|v| v * w);
     }
     let gram = weighted.t().dot(&weighted);
@@ -2637,10 +2768,29 @@ fn apply_spatial_adaptive_penalties(
     caches: &[SpatialOperatorRuntimeCache],
     weights: &[SpatialAdaptiveWeights],
 ) {
+    // MM surrogate assembly summary:
+    //   For fixed weights u^(t), penalties are quadratic:
+    //     K1^(t) = D1_con^T W_g^(t) D1_con
+    //     K2^(t) = D2_con^T W_c^(t) D2_con
+    //   with W_g^(t) = diag(u_g^(t)) \otimes I_d for (k,axis) row layout.
+    //
+    // Re-normalization conclusion:
+    //   K1^(t), K2^(t) change with u^(t), so their Frobenius magnitudes drift.
+    //   If normalization scales were stale, each hyper-gradient component would
+    //   be implicitly rescaled by a different iteration-dependent factor, rotating
+    //   the gradient direction in multi-lambda space.
+    //
+    // Therefore at every MM step we set:
+    //   c_i^(t) = ||K_i^(t)||_F,   S_i^(t) = K_i^(t) / c_i^(t),
+    // and pass S_i^(t) (plus current c_i metadata) into the REML layer.
     let p_total = design.design.ncols();
     for (cache, w) in caches.iter().zip(weights.iter()) {
-        let s1 = weighted_operator_gram_from_d1(&cache.d1, &w.inv_grad_weight, cache.dimension)
-            .mapv(|v| v / cache.tension_normalization_scale);
+        let s1_raw = weighted_operator_gram_from_d1(&cache.d1, &w.grad_weight, cache.dimension);
+        // Re-normalize every MM step because S1 changes with u^(t).
+        // Keeping this scaling current avoids mismatch between the objective being
+        // optimized and the gradients evaluated by the hyper-optimizer.
+        let c1 = frobenius_norm(&s1_raw).max(1e-12);
+        let s1 = s1_raw.mapv(|v| v / c1);
         let mut s1_global = Array2::<f64>::zeros((p_total, p_total));
         s1_global
             .slice_mut(s![
@@ -2649,9 +2799,16 @@ fn apply_spatial_adaptive_penalties(
             ])
             .assign(&s1);
         design.penalties[cache.tension_penalty_global_idx] = s1_global;
+        if let Some(info) = design
+            .penalty_info
+            .get_mut(cache.tension_penalty_global_idx)
+        {
+            info.penalty.normalization_scale = c1;
+        }
 
-        let s2 = weighted_operator_gram_from_d2(&cache.d2, &w.inv_lap_weight)
-            .mapv(|v| v / cache.stiffness_normalization_scale);
+        let s2_raw = weighted_operator_gram_from_d2(&cache.d2, &w.lap_weight);
+        let c2 = frobenius_norm(&s2_raw).max(1e-12);
+        let s2 = s2_raw.mapv(|v| v / c2);
         let mut s2_global = Array2::<f64>::zeros((p_total, p_total));
         s2_global
             .slice_mut(s![
@@ -2660,6 +2817,12 @@ fn apply_spatial_adaptive_penalties(
             ])
             .assign(&s2);
         design.penalties[cache.stiffness_penalty_global_idx] = s2_global;
+        if let Some(info) = design
+            .penalty_info
+            .get_mut(cache.stiffness_penalty_global_idx)
+        {
+            info.penalty.normalization_scale = c2;
+        }
     }
 }
 
@@ -5533,10 +5696,8 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        // No-intercept Matérn is strictly penalized after the center constraint, so the
-        // requested nullspace shrinkage block is dropped as inactive.
-        assert_eq!(sd.penalties.len(), 1);
-        assert_eq!(sd.nullspace_dims.len(), 1);
+        assert_eq!(sd.penalties.len(), 3);
+        assert_eq!(sd.nullspace_dims.len(), 3);
     }
 
     #[test]
@@ -5569,9 +5730,8 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        // Duchon double-penalty contributes two blocks (kernel + nullspace ridge).
-        assert_eq!(sd.penalties.len(), 2);
-        assert_eq!(sd.nullspace_dims.len(), 2);
+        assert_eq!(sd.penalties.len(), 3);
+        assert_eq!(sd.nullspace_dims.len(), 3);
     }
 
     #[test]
@@ -6441,5 +6601,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn adaptive_initial_epsilons_use_mean_fallback_when_median_is_tiny() {
+        let cache = SpatialOperatorRuntimeCache {
+            term_name: "matern".to_string(),
+            feature_cols: vec![0, 1],
+            coeff_global_range: 0..2,
+            tension_penalty_global_idx: 0,
+            stiffness_penalty_global_idx: 1,
+            d1: array![[1e-10, 0.0], [0.0, 1e-10], [2e-10, 0.0], [0.0, 2e-10]],
+            d2: array![[3e-10, 0.0], [4e-10, 0.0]],
+            collocation_points: array![[0.0, 0.0], [1.0, 1.0]],
+            dimension: 2,
+        };
+        let beta = array![1.0, 1.0];
+        let (eps_g, eps_c) = compute_initial_epsilons(&beta, &[cache], 1e-8);
+        assert!(eps_g >= 1e-8);
+        assert!(eps_c >= 1e-8);
+    }
+
+    #[test]
+    fn adaptive_weighted_operator_grams_are_symmetric_and_psd() {
+        let d1 = array![
+            [1.0, 0.0, 2.0],
+            [0.5, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [1.5, 0.0, 0.5],
+        ];
+        let d2 = array![[1.0, 0.0, 1.0], [0.0, 1.0, 2.0]];
+        let weight = array![2.0, 3.0];
+        let s1 = weighted_operator_gram_from_d1(&d1, &weight, 2);
+        let s2 = weighted_operator_gram_from_d2(&d2, &weight);
+        for i in 0..s1.nrows() {
+            for j in 0..s1.ncols() {
+                assert!((s1[[i, j]] - s1[[j, i]]).abs() < 1e-10);
+                assert!((s2[[i, j]] - s2[[j, i]]).abs() < 1e-10);
+            }
+        }
+        let v = array![0.2, -0.3, 0.5];
+        let q1 = v.dot(&s1.dot(&v));
+        let q2 = v.dot(&s2.dot(&v));
+        assert!(q1 >= -1e-10);
+        assert!(q2 >= -1e-10);
+    }
+
+    #[test]
+    fn adaptive_weight_clamp_is_applied_in_u_space() {
+        let cache = SpatialOperatorRuntimeCache {
+            term_name: "matern".to_string(),
+            feature_cols: vec![0, 1],
+            coeff_global_range: 0..2,
+            tension_penalty_global_idx: 0,
+            stiffness_penalty_global_idx: 1,
+            d1: array![[0.0, 0.0], [0.0, 0.0]],
+            d2: array![[0.0, 0.0]],
+            collocation_points: array![[0.0, 0.0]],
+            dimension: 2,
+        };
+        let beta = array![0.0, 0.0];
+        let out = compute_spatial_adaptive_weights_for_beta(&beta, &[cache], 1e-8, 1e-8, 1e-8, 1e2);
+        assert_eq!(out.len(), 1);
+        // Raw u would be 1/eps = 1e8, so clamp to 1e2.
+        assert!((out[0].grad_weight[0] - 1e2).abs() < 1e-12);
+        assert!((out[0].lap_weight[0] - 1e2).abs() < 1e-12);
+        // Diagnostics are 1/u.
+        assert!((out[0].inv_grad_weight[0] - 1e-2).abs() < 1e-12);
+        assert!((out[0].inv_lap_weight[0] - 1e-2).abs() < 1e-12);
     }
 }

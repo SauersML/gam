@@ -51,6 +51,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
             tol: 1e-6,
             nullspace_dims: vec![0, 0],
             linear_constraints: None,
+            adaptive_regularization: None,
         },
     )
     .expect("fit_gam with TPS should succeed");
@@ -128,6 +129,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
             // second ridge penalty has none.
             nullspace_dims: vec![3, 0],
             linear_constraints: None,
+            adaptive_regularization: None,
         },
     )
     .expect("fit_gam with TPS should succeed");
@@ -232,6 +234,7 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
             tol: 1e-6,
             nullspace_dims: vec![4, 0],
             linear_constraints: None,
+            adaptive_regularization: None,
         },
     )
     .expect("fit_gam with 3D TPS should succeed");

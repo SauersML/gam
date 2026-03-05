@@ -2733,6 +2733,7 @@ fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Resul
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 fn matern_kernel_log_kappa_derivative_from_distance(
     r: f64,
     length_scale: f64,
@@ -2780,6 +2781,7 @@ fn matern_kernel_log_kappa_derivative_from_distance(
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 fn matern_kernel_log_kappa_second_derivative_from_distance(
     r: f64,
     length_scale: f64,
@@ -2869,6 +2871,11 @@ fn matern_kernel_radial_triplet(
     let exp_a = (-a).exp();
     let phi_r = q * (p1 - p) * exp_a;
     let phi_rr = q * q * (p2 - 2.0 * p1 + p) * exp_a;
+    if !phi.is_finite() || !phi_r.is_finite() || !phi_rr.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite Matérn radial derivatives at r={r}, length_scale={length_scale}, nu={nu:?}"
+        )));
+    }
     Ok((phi, phi_r, phi_rr))
 }
 
@@ -2880,7 +2887,56 @@ fn duchon_kernel_radial_triplet(
     k_dim: usize,
     coeffs: Option<&DuchonPartialFractionCoeffs>,
 ) -> Result<(f64, f64, f64), BasisError> {
-    let value = duchon_matern_kernel_general_from_distance(r, length_scale, p_order, s_order, k_dim, coeffs)?;
+    if p_order == 1 && s_order == 4 && k_dim == 10 {
+        return duchon_matern_p1_s4_k10_radial_triplet(r, length_scale);
+    }
+
+    if s_order == 0 {
+        let kappa = 1.0 / length_scale.max(1e-300);
+        let coeffs_local;
+        let coeffs_ref = if let Some(c) = coeffs {
+            c
+        } else {
+            coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+            &coeffs_local
+        };
+        let r_eval = r.max(DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8));
+        let mut value = 0.0;
+        let mut first = 0.0;
+        let mut second = 0.0;
+        for (m, coeff) in coeffs_ref.a.iter().enumerate().skip(1) {
+            if *coeff == 0.0 {
+                continue;
+            }
+            let (vm, dm, d2m) = duchon_polyharmonic_block_triplet(r_eval, m, k_dim)?;
+            value += coeff * vm;
+            first += coeff * dm;
+            second += coeff * d2m;
+        }
+        if r == 0.0 && p_order > 0 {
+            value = 0.0;
+        }
+        if !value.is_finite() || !first.is_finite() || !second.is_finite() {
+            return Err(BasisError::InvalidInput(format!(
+                "non-finite pure-polyharmonic derivatives at r={r}, length_scale={length_scale}, p={p_order}, dim={k_dim}"
+            )));
+        }
+        return Ok((value, first, second));
+    }
+
+    let value = duchon_matern_kernel_general_from_distance(
+        r,
+        length_scale,
+        p_order,
+        s_order,
+        k_dim,
+        coeffs,
+    )?;
+    if !value.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite Duchon radial kernel value at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
+        )));
+    }
     if r <= 0.0 {
         return Ok((value, 0.0, 0.0));
     }
@@ -2903,6 +2959,11 @@ fn duchon_kernel_radial_triplet(
     )?;
     let first = (fp - fm) / (2.0 * h);
     let second = (fp - 2.0 * value + fm) / (h * h);
+    if !first.is_finite() || !second.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite Duchon radial derivatives at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
+        )));
+    }
     Ok((value, first, second))
 }
 
@@ -2939,6 +3000,11 @@ where
             }
             let r = dist2.sqrt();
             let (phi, phi_r, phi_rr) = radial_triplet(r)?;
+            if !phi.is_finite() || !phi_r.is_finite() || !phi_rr.is_finite() {
+                return Err(BasisError::InvalidInput(format!(
+                    "non-finite collocation operator derivative at collocation row {k}, center {j}, r={r}"
+                )));
+            }
             d0[[k, j]] = phi;
             if r > R_EPS {
                 let scale = phi_r / r;
@@ -2998,7 +3064,11 @@ pub fn build_matern_collocation_operator_matrices(
         })?;
     let (d0_kernel, d1_kernel, d2_kernel) = if let Some(z) = identifiability_transform {
         let z = z.to_owned();
-        (fast_ab(&d0_raw, &z), fast_ab(&d1_raw, &z), fast_ab(&d2_raw, &z))
+        (
+            fast_ab(&d0_raw, &z),
+            fast_ab(&d1_raw, &z),
+            fast_ab(&d2_raw, &z),
+        )
     } else {
         (d0_raw, d1_raw, d2_raw)
     };
@@ -3185,6 +3255,7 @@ fn bessel_k1_stable(x: f64) -> f64 {
 
 const DUCHON_SERIES_Z_CUTOFF: f64 = 1.0;
 const DUCHON_ASYMPTOTIC_Z_CUTOFF: f64 = 35.0;
+const DUCHON_DERIVATIVE_R_FLOOR_REL: f64 = 1e-5;
 
 #[inline(always)]
 fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usize {
@@ -3337,6 +3408,62 @@ fn duchon_matern_block(
     let z = (kappa * r).max(1e-300);
     let k_nu = bessel_k_real_half_integer_or_integer(nu_abs, z)?;
     Ok(c * r.powf(nu) * k_nu)
+}
+
+#[inline(always)]
+fn duchon_polyharmonic_block_triplet(
+    r: f64,
+    m: usize,
+    k_dim: usize,
+) -> Result<(f64, f64, f64), BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "polyharmonic distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if r <= 0.0 {
+        // Intrinsic diagonal convention for generalized kernels.
+        return Ok((0.0, 0.0, 0.0));
+    }
+
+    // Exact radial derivatives for polyharmonic blocks.
+    //
+    // Let alpha = 2m - d.
+    // Case A: phi(r) = c * r^alpha
+    //   phi'(r)  = c * alpha * r^(alpha-1)
+    //   phi''(r) = c * alpha * (alpha-1) * r^(alpha-2)
+    //
+    // Case B: phi(r) = c * r^alpha * log(r)
+    //   phi'(r)  = c * [alpha * r^(alpha-1) * log(r) + r^(alpha-1)]
+    //   phi''(r) = c * [alpha*(alpha-1) * r^(alpha-2) * log(r)
+    //                   + (2*alpha-1) * r^(alpha-2)].
+    let k_half = 0.5 * k_dim as f64;
+    let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
+    let r_safe = r.max(1e-300);
+    let r_alpha = r_safe.powf(alpha);
+    let r_alpha_m1 = r_safe.powf(alpha - 1.0);
+    let r_alpha_m2 = r_safe.powf(alpha - 2.0);
+    let log_r = r_safe.ln();
+
+    if k_dim % 2 == 0 && m >= (k_dim / 2) {
+        let c = ((-1.0_f64).powi(m as i32))
+            / (2.0_f64.powi((2 * m - 1) as i32)
+                * std::f64::consts::PI.powf(k_half)
+                * gamma_lanczos(m as f64)
+                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+        let value = c * r_alpha * log_r;
+        let first = c * (alpha * r_alpha_m1 * log_r + r_alpha_m1);
+        let second =
+            c * (alpha * (alpha - 1.0) * r_alpha_m2 * log_r + (2.0 * alpha - 1.0) * r_alpha_m2);
+        return Ok((value, first, second));
+    }
+
+    let c = gamma_lanczos(k_half - m as f64)
+        / (4.0_f64.powi(m as i32) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m as f64));
+    let value = c * r_alpha;
+    let first = c * alpha * r_alpha_m1;
+    let second = c * alpha * (alpha - 1.0) * r_alpha_m2;
+    Ok((value, first, second))
 }
 
 struct DuchonPartialFractionCoeffs {
@@ -3525,6 +3652,100 @@ fn duchon_matern_p1_s4_k10_small_a_series(a: f64) -> f64 {
         + a4 * (l / 36_864.0 + 19.0 / 442_368.0)
         + a6 * (l / 1_548_288.0 + 5.0 / 4_064_256.0)
         + a8 * (l / 113_246_208.0 + 103.0 / 5_435_817_984.0)
+}
+
+#[inline(always)]
+fn duchon_matern_p1_s4_k10_phi_prime_over_r_small_r(r: f64, kappa: f64) -> f64 {
+    // For p=1,s=4,k=10:
+    //   phi'(r)/r =
+    //      -1/(384 r^2)
+    //      -(kappa^2/960) log(kappa r)
+    //      +(kappa^2/960)(log 2 - gamma)
+    //      +(kappa^2/1600)
+    //      + O((kappa r)^2 log r),  r -> 0+.
+    //
+    // We evaluate this asymptotic directly in the small-r regime to avoid
+    // cancellation in raw Bessel/power combinations.
+    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+    let rr = r.max(1e-300);
+    let k2 = kappa * kappa;
+    -1.0 / (384.0 * rr * rr) - (k2 / 960.0) * (kappa * rr).ln()
+        + (k2 / 960.0) * (2.0_f64.ln() - EULER_GAMMA)
+        + (k2 / 1600.0)
+}
+
+#[inline(always)]
+fn duchon_matern_p1_s4_k10_radial_triplet(
+    r: f64,
+    length_scale: f64,
+) -> Result<(f64, f64, f64), BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon kernel distance must be finite and non-negative".to_string(),
+        ));
+    }
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon length_scale must be finite and positive".to_string(),
+        ));
+    }
+
+    // In this branch phi'(r)/r has a non-integrable 1/r^2 singularity as r->0.
+    // Keep collocation operators finite with a local radius floor.
+    let r_floor = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
+    let r_eval = r.max(r_floor);
+    let kappa = 1.0 / length_scale;
+    let a = kappa * r_eval;
+    let value = duchon_matern_kernel_p1_s4_k10_from_distance(r, length_scale)?;
+
+    if a < DUCHON_SERIES_Z_CUTOFF {
+        let ratio = duchon_matern_p1_s4_k10_phi_prime_over_r_small_r(r_eval, kappa);
+        let phi_r = ratio * r_eval;
+        // Using phi'' = ratio + r * d/dr(ratio) with the same asymptotic truncation.
+        let k2 = kappa * kappa;
+        let phi_rr = 1.0 / (384.0 * r_eval * r_eval) - (k2 / 960.0) * (kappa * r_eval).ln()
+            + (k2 / 960.0) * (2.0_f64.ln() - 0.577_215_664_901_532_9)
+            - k2 / 2400.0;
+        return Ok((value, phi_r, phi_rr));
+    }
+
+    // Exact derivative formulas in terms of K0(a), K1(a), with a = kappa r:
+    //
+    // phi'(r) = kappa * [ -384/a^9 + A0(a) K0(a) + A1(a) K1(a) ],
+    // A0(a) = 1/(48a) + 1/a^3 + 24/a^5 + 192/a^7,
+    // A1(a) = 1/(6a^2) + 6/a^4 + 96/a^6 + 384/a^8.
+    //
+    // phi''(r) = kappa^2 * [ 3456/a^10 - B0(a) K0(a) - B1(a) K1(a) ],
+    // B0(a) = 3/(16a^2) + 9/a^4 + 216/a^6 + 1728/a^8,
+    // B1(a) = 1/(48a) + 3/(2a^3) + 54/a^5 + 864/a^7 + 3456/a^9.
+    let k0 = bessel_k0_stable(a);
+    let k1 = bessel_k1_stable(a);
+    let inva = 1.0 / a;
+    let inva2 = inva * inva;
+    let inva3 = inva2 * inva;
+    let inva4 = inva2 * inva2;
+    let inva5 = inva4 * inva;
+    let inva6 = inva3 * inva3;
+    let inva7 = inva6 * inva;
+    let inva8 = inva4 * inva4;
+    let inva9 = inva8 * inva;
+    let inva10 = inva5 * inva5;
+
+    let a0 = (1.0 / 48.0) * inva + inva3 + 24.0 * inva5 + 192.0 * inva7;
+    let a1 = (1.0 / 6.0) * inva2 + 6.0 * inva4 + 96.0 * inva6 + 384.0 * inva8;
+    let phi_r = kappa * (-384.0 * inva9 + a0 * k0 + a1 * k1);
+
+    let b0 = (3.0 / 16.0) * inva2 + 9.0 * inva4 + 216.0 * inva6 + 1728.0 * inva8;
+    let b1 =
+        (1.0 / 48.0) * inva + (3.0 / 2.0) * inva3 + 54.0 * inva5 + 864.0 * inva7 + 3456.0 * inva9;
+    let phi_rr = (kappa * kappa) * (3456.0 * inva10 - b0 * k0 - b1 * k1);
+
+    if !value.is_finite() || !phi_r.is_finite() || !phi_rr.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite closed-form Duchon derivatives at r={r}, length_scale={length_scale}"
+        )));
+    }
+    Ok((value, phi_r, phi_rr))
 }
 
 #[inline(always)]
@@ -3912,7 +4133,8 @@ fn build_duchon_operator_penalty_candidates(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
-    let ops = build_duchon_collocation_operator_matrices(centers, length_scale, power, nullspace_order)?;
+    let ops =
+        build_duchon_collocation_operator_matrices(centers, length_scale, power, nullspace_order)?;
     Ok(operator_penalty_candidates_from_collocation(
         &ops.d0, &ops.d1, &ops.d2,
     ))
@@ -4105,121 +4327,35 @@ pub fn build_matern_basis_log_kappa_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let k = centers.nrows();
-    let z_opt = match &spec.identifiability {
-        MaternIdentifiability::None => None,
-        MaternIdentifiability::CenterSumToZero => {
-            let q = Array2::<f64>::ones((k, 1));
-            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
-        }
-        MaternIdentifiability::CenterLinearOrthogonal => {
-            let q = polynomial_block_from_order(centers.view(), DuchonNullspaceOrder::Linear);
-            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
-        }
-        MaternIdentifiability::FrozenTransform { transform } => {
-            if transform.nrows() != k {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "frozen Matérn identifiability transform mismatch: centers={k}, transform rows={}",
-                    transform.nrows()
-                )));
-            }
-            Some(transform.clone())
-        }
-    };
+    const EPS: f64 = 1e-6;
+    let kappa = 1.0 / spec.length_scale;
+    let ls_plus = 1.0 / (kappa * EPS.exp());
+    let ls_minus = 1.0 / (kappa * (-EPS).exp());
+    let mut spec_plus = spec.clone();
+    let mut spec_minus = spec.clone();
+    spec_plus.length_scale = ls_plus;
+    spec_minus.length_scale = ls_minus;
 
-    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers.view())?;
-    let mut kernel_block_derivative = Array2::<f64>::zeros((data.nrows(), k));
-    let kernel_result: Result<(), BasisError> = kernel_block_derivative
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .try_for_each(|(i, mut row)| {
-            for j in 0..k {
-                row[j] = matern_kernel_log_kappa_derivative_from_distance(
-                    data_center_r[[i, j]],
-                    spec.length_scale,
-                    spec.nu,
-                )?;
-            }
-            Ok(())
-        });
-    kernel_result?;
-
-    let mut center_kernel = Array2::<f64>::zeros((k, k));
-    let mut center_kernel_derivative = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let kij =
-                matern_kernel_from_distance(center_center_r[[i, j]], spec.length_scale, spec.nu)?;
-            let dkij = matern_kernel_log_kappa_derivative_from_distance(
-                center_center_r[[i, j]],
-                spec.length_scale,
-                spec.nu,
-            )?;
-            center_kernel[[i, j]] = kij;
-            center_kernel[[j, i]] = kij;
-            center_kernel_derivative[[i, j]] = dkij;
-            center_kernel_derivative[[j, i]] = dkij;
-        }
+    let plus = build_matern_basis(data, &spec_plus)?;
+    let minus = build_matern_basis(data, &spec_minus)?;
+    if plus.design.raw_dim() != minus.design.raw_dim() {
+        return Err(BasisError::DimensionMismatch(
+            "Matérn log-kappa derivative finite-difference design shape mismatch".to_string(),
+        ));
+    }
+    if plus.penalties.len() != minus.penalties.len() {
+        return Err(BasisError::DimensionMismatch(
+            "Matérn log-kappa derivative finite-difference penalty count mismatch".to_string(),
+        ));
     }
 
-    let (design_derivative, penalty_kernel, penalty_kernel_derivative) = if let Some(z) = z_opt {
-        let kernel_constrained = fast_ab(&kernel_block_derivative, &z);
-        let omega = {
-            let zt_k = fast_atb(&z, &center_kernel);
-            fast_ab(&zt_k, &z)
-        };
-        let omega_constrained = {
-            let zt_k = fast_atb(&z, &center_kernel_derivative);
-            fast_ab(&zt_k, &z)
-        };
-        let mut design = kernel_constrained;
-        if spec.include_intercept {
-            let n = design.nrows();
-            let p = design.ncols();
-            let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
-            design_with_intercept
-                .slice_mut(s![.., 0..p])
-                .assign(&design);
-            design = design_with_intercept;
-        }
-        let total_cols = design.ncols();
-        let mut penalty = Array2::<f64>::zeros((total_cols, total_cols));
-        let mut penalty_derivative = Array2::<f64>::zeros((total_cols, total_cols));
-        let kernel_cols = omega_constrained.ncols();
-        penalty
-            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-            .assign(&omega);
-        penalty_derivative
-            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-            .assign(&omega_constrained);
-        (design, penalty, penalty_derivative)
-    } else {
-        let mut design = kernel_block_derivative;
-        if spec.include_intercept {
-            let n = design.nrows();
-            let p = design.ncols();
-            let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
-            design_with_intercept
-                .slice_mut(s![.., 0..p])
-                .assign(&design);
-            design = design_with_intercept;
-        }
-        let total_cols = design.ncols();
-        let mut penalty = Array2::<f64>::zeros((total_cols, total_cols));
-        let mut penalty_derivative = Array2::<f64>::zeros((total_cols, total_cols));
-        penalty.slice_mut(s![0..k, 0..k]).assign(&center_kernel);
-        penalty_derivative
-            .slice_mut(s![0..k, 0..k])
-            .assign(&center_kernel_derivative);
-        (design, penalty, penalty_derivative)
-    };
-
-    let mut penalties_derivative = vec![penalty_kernel_derivative];
-    if spec.double_penalty && build_nullspace_shrinkage_penalty(&penalty_kernel)?.is_some() {
-        penalties_derivative.push(Array2::<f64>::zeros(penalties_derivative[0].raw_dim()));
-    }
+    let design_derivative = (&plus.design - &minus.design) / (2.0 * EPS);
+    let penalties_derivative = plus
+        .penalties
+        .iter()
+        .zip(minus.penalties.iter())
+        .map(|(p_plus, p_minus)| (p_plus - p_minus) / (2.0 * EPS))
+        .collect();
 
     Ok(BasisPsiDerivativeResult {
         design_derivative,
@@ -4231,108 +4367,43 @@ pub fn build_matern_basis_log_kappa_second_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let k = centers.nrows();
-    let z_opt = match &spec.identifiability {
-        MaternIdentifiability::None => None,
-        MaternIdentifiability::CenterSumToZero => {
-            let q = Array2::<f64>::ones((k, 1));
-            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
-        }
-        MaternIdentifiability::CenterLinearOrthogonal => {
-            let q = polynomial_block_from_order(centers.view(), DuchonNullspaceOrder::Linear);
-            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
-        }
-        MaternIdentifiability::FrozenTransform { transform } => {
-            if transform.nrows() != k {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "frozen Matérn identifiability transform mismatch: centers={k}, transform rows={}",
-                    transform.nrows()
-                )));
-            }
-            Some(transform.clone())
-        }
-    };
+    const EPS: f64 = 1e-6;
+    let kappa = 1.0 / spec.length_scale;
+    let ls_plus = 1.0 / (kappa * EPS.exp());
+    let ls_minus = 1.0 / (kappa * (-EPS).exp());
+    let mut spec_plus = spec.clone();
+    let mut spec_minus = spec.clone();
+    spec_plus.length_scale = ls_plus;
+    spec_minus.length_scale = ls_minus;
 
-    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers.view())?;
-    let mut kernel_block_second = Array2::<f64>::zeros((data.nrows(), k));
-    let kernel_result: Result<(), BasisError> = kernel_block_second
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .try_for_each(|(i, mut row)| {
-            for j in 0..k {
-                row[j] = matern_kernel_log_kappa_second_derivative_from_distance(
-                    data_center_r[[i, j]],
-                    spec.length_scale,
-                    spec.nu,
-                )?;
-            }
-            Ok(())
-        });
-    kernel_result?;
-
-    let mut center_kernel_second = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let d2kij = matern_kernel_log_kappa_second_derivative_from_distance(
-                center_center_r[[i, j]],
-                spec.length_scale,
-                spec.nu,
-            )?;
-            center_kernel_second[[i, j]] = d2kij;
-            center_kernel_second[[j, i]] = d2kij;
-        }
-    }
-
-    let (design_second_derivative, penalty_kernel_second) = if let Some(z) = z_opt {
-        let kernel_constrained = fast_ab(&kernel_block_second, &z);
-        let omega_constrained = {
-            let zt_k = fast_atb(&z, &center_kernel_second);
-            fast_ab(&zt_k, &z)
-        };
-        let mut design = kernel_constrained;
-        if spec.include_intercept {
-            let n = design.nrows();
-            let p = design.ncols();
-            let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
-            design_with_intercept
-                .slice_mut(s![.., 0..p])
-                .assign(&design);
-            design = design_with_intercept;
-        }
-        let total_cols = design.ncols();
-        let mut penalty_second = Array2::<f64>::zeros((total_cols, total_cols));
-        let kernel_cols = omega_constrained.ncols();
-        penalty_second
-            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-            .assign(&omega_constrained);
-        (design, penalty_second)
-    } else {
-        let mut design = kernel_block_second;
-        if spec.include_intercept {
-            let n = design.nrows();
-            let p = design.ncols();
-            let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
-            design_with_intercept
-                .slice_mut(s![.., 0..p])
-                .assign(&design);
-            design = design_with_intercept;
-        }
-        let total_cols = design.ncols();
-        let mut penalty_second = Array2::<f64>::zeros((total_cols, total_cols));
-        penalty_second
-            .slice_mut(s![0..k, 0..k])
-            .assign(&center_kernel_second);
-        (design, penalty_second)
-    };
-
-    let mut penalties_second_derivative = vec![penalty_kernel_second];
-    if spec.double_penalty {
-        penalties_second_derivative.push(Array2::<f64>::zeros(
-            penalties_second_derivative[0].raw_dim(),
+    let plus = build_matern_basis(data, &spec_plus)?;
+    let base = build_matern_basis(data, spec)?;
+    let minus = build_matern_basis(data, &spec_minus)?;
+    if plus.design.raw_dim() != base.design.raw_dim()
+        || base.design.raw_dim() != minus.design.raw_dim()
+    {
+        return Err(BasisError::DimensionMismatch(
+            "Matérn log-kappa second derivative finite-difference design shape mismatch"
+                .to_string(),
         ));
     }
+    if plus.penalties.len() != base.penalties.len() || base.penalties.len() != minus.penalties.len()
+    {
+        return Err(BasisError::DimensionMismatch(
+            "Matérn log-kappa second derivative finite-difference penalty count mismatch"
+                .to_string(),
+        ));
+    }
+
+    let design_second_derivative =
+        (&plus.design - &(base.design.clone() * 2.0) + &minus.design) / (EPS * EPS);
+    let penalties_second_derivative = plus
+        .penalties
+        .iter()
+        .zip(base.penalties.iter())
+        .zip(minus.penalties.iter())
+        .map(|((p_plus, p_base), p_minus)| (p_plus - &(p_base * 2.0) + p_minus) / (EPS * EPS))
+        .collect();
 
     Ok(BasisPsiSecondDerivativeResult {
         design_second_derivative,
@@ -8345,7 +8416,8 @@ mod tests {
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         // (k-1) constrained kernel cols + explicit intercept.
         assert_eq!(out.design.ncols(), centers.nrows());
-        assert_eq!(out.nullspace_dims, vec![1]);
+        assert_eq!(out.penalties.len(), 3);
+        assert_eq!(out.nullspace_dims.len(), 3);
     }
 
     #[test]
@@ -8361,15 +8433,22 @@ mod tests {
             identifiability: MaternIdentifiability::CenterSumToZero,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
-        assert_eq!(out.penalties.len(), 1);
-        assert_eq!(out.nullspace_dims, vec![0]);
-        assert_eq!(out.penalty_info.len(), 2);
-        assert!(out.penalty_info[0].active);
-        assert!(!out.penalty_info[1].active);
-        assert_eq!(
-            out.penalty_info[1].dropped_reason,
-            Some(PenaltyDropReason::ZeroMatrix)
-        );
+        assert_eq!(out.penalties.len(), 3);
+        assert_eq!(out.nullspace_dims.len(), 3);
+        assert_eq!(out.penalty_info.len(), 3);
+        assert!(out.penalty_info.iter().all(|info| info.active));
+        assert!(matches!(
+            out.penalty_info[0].source,
+            PenaltySource::OperatorMass
+        ));
+        assert!(matches!(
+            out.penalty_info[1].source,
+            PenaltySource::OperatorTension
+        ));
+        assert!(matches!(
+            out.penalty_info[2].source,
+            PenaltySource::OperatorStiffness
+        ));
     }
 
     #[test]
@@ -8385,14 +8464,22 @@ mod tests {
             identifiability: MaternIdentifiability::CenterSumToZero,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
-        assert_eq!(out.penalties.len(), 2);
-        // Intercept is kept as the model nullspace and the double-penalty block
-        // retains its active shrinkage rank under current Matérn basis handling.
-        assert_eq!(out.nullspace_dims[0], 1);
-        assert!(out.nullspace_dims[1] > 0);
-        assert_eq!(out.penalty_info.len(), 2);
+        assert_eq!(out.penalties.len(), 3);
+        assert_eq!(out.nullspace_dims.len(), 3);
+        assert_eq!(out.penalty_info.len(), 3);
         assert!(out.penalty_info.iter().all(|info| info.active));
-        assert_eq!(out.penalty_info[1].effective_rank, 1);
+        assert!(matches!(
+            out.penalty_info[0].source,
+            PenaltySource::OperatorMass
+        ));
+        assert!(matches!(
+            out.penalty_info[1].source,
+            PenaltySource::OperatorTension
+        ));
+        assert!(matches!(
+            out.penalty_info[2].source,
+            PenaltySource::OperatorStiffness
+        ));
     }
 
     #[test]
@@ -8511,5 +8598,155 @@ mod tests {
         assert_eq!(out.num_polynomial_basis, 0);
         assert!(out.basis.iter().all(|v| v.is_finite()));
         assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_matern_radial_triplet_matches_finite_difference() {
+        let r = 0.37;
+        let length_scale = 0.9;
+        let nu = MaternNu::FiveHalves;
+        let (phi, phi_r, phi_rr) =
+            matern_kernel_radial_triplet(r, length_scale, nu).expect("triplet");
+        let h = 1e-6;
+        let fp = matern_kernel_from_distance(r + h, length_scale, nu).expect("fp");
+        let fm = matern_kernel_from_distance((r - h).max(0.0), length_scale, nu).expect("fm");
+        let first_fd = (fp - fm) / (2.0 * h);
+        let second_fd = (fp - 2.0 * phi + fm) / (h * h);
+        assert!((phi_r - first_fd).abs() < 5e-5);
+        assert!((phi_rr - second_fd).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_duchon_radial_triplet_matches_finite_difference_away_from_zero() {
+        let r = 0.42;
+        let length_scale = 1.1;
+        let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
+        let s_order = 3usize;
+        let dim = 4usize;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let (phi, phi_r, phi_rr) =
+            duchon_kernel_radial_triplet(r, length_scale, p_order, s_order, dim, Some(&coeffs))
+                .expect("triplet");
+        let h = 1e-5;
+        let fp = duchon_matern_kernel_general_from_distance(
+            r + h,
+            length_scale,
+            p_order,
+            s_order,
+            dim,
+            Some(&coeffs),
+        )
+        .expect("fp");
+        let fm = duchon_matern_kernel_general_from_distance(
+            r - h,
+            length_scale,
+            p_order,
+            s_order,
+            dim,
+            Some(&coeffs),
+        )
+        .expect("fm");
+        let first_fd = (fp - fm) / (2.0 * h);
+        let second_fd = (fp - 2.0 * phi + fm) / (h * h);
+        assert!((phi_r - first_fd).abs() < 1e-3);
+        assert!((phi_rr - second_fd).abs() < 1e-1);
+    }
+
+    #[test]
+    fn test_duchon_radial_triplet_closed_form_branch_matches_finite_difference() {
+        // p=1,s=4,k=10 uses the exact K0/K1 branch with analytic derivatives.
+        let r = 2.0;
+        let length_scale = 1.0;
+        let p_order = 1usize;
+        let s_order = 4usize;
+        let dim = 10usize;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let (phi, phi_r, phi_rr) =
+            duchon_kernel_radial_triplet(r, length_scale, p_order, s_order, dim, Some(&coeffs))
+                .expect("triplet");
+        let h = 1e-5;
+        let fp = duchon_matern_kernel_general_from_distance(
+            r + h,
+            length_scale,
+            p_order,
+            s_order,
+            dim,
+            Some(&coeffs),
+        )
+        .expect("fp");
+        let fm = duchon_matern_kernel_general_from_distance(
+            r - h,
+            length_scale,
+            p_order,
+            s_order,
+            dim,
+            Some(&coeffs),
+        )
+        .expect("fm");
+        let first_fd = (fp - fm) / (2.0 * h);
+        let second_fd = (fp - 2.0 * phi + fm) / (h * h);
+        assert!((phi_r - first_fd).abs() < 2e-3);
+        assert!((phi_rr - second_fd).abs() < 2.0);
+    }
+
+    #[test]
+    fn test_duchon_radial_triplet_pure_polyharmonic_matches_finite_difference() {
+        let r = 0.73;
+        let length_scale = 1.0;
+        let p_order = 1usize;
+        let s_order = 0usize;
+        let dim = 3usize;
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let (phi, phi_r, phi_rr) =
+            duchon_kernel_radial_triplet(r, length_scale, p_order, s_order, dim, Some(&coeffs))
+                .expect("triplet");
+        let h = 1e-6;
+        let fp = duchon_matern_kernel_general_from_distance(
+            r + h,
+            length_scale,
+            p_order,
+            s_order,
+            dim,
+            Some(&coeffs),
+        )
+        .expect("fp");
+        let fm = duchon_matern_kernel_general_from_distance(
+            r - h,
+            length_scale,
+            p_order,
+            s_order,
+            dim,
+            Some(&coeffs),
+        )
+        .expect("fm");
+        let first_fd = (fp - fm) / (2.0 * h);
+        let second_fd = (fp - 2.0 * phi + fm) / (h * h);
+        assert!((phi_r - first_fd).abs() < 1e-6);
+        assert!((phi_rr - second_fd).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_collocation_derivatives_are_finite_at_r_zero() {
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let m_ops = build_matern_collocation_operator_matrices(
+            centers.view(),
+            0.8,
+            MaternNu::FiveHalves,
+            false,
+            None,
+        )
+        .expect("matern ops");
+        assert!(m_ops.d1.iter().all(|v| v.is_finite()));
+        assert!(m_ops.d2.iter().all(|v| v.is_finite()));
+
+        let d_ops = build_duchon_collocation_operator_matrices(
+            centers.view(),
+            0.8,
+            3,
+            DuchonNullspaceOrder::Linear,
+        )
+        .expect("duchon ops");
+        assert!(d_ops.d1.iter().all(|v| v.is_finite()));
+        assert!(d_ops.d2.iter().all(|v| v.is_finite()));
     }
 }

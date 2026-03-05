@@ -86,6 +86,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
             tol: 1e-6,
             nullspace_dims: vec![],
             linear_constraints: None,
+            adaptive_regularization: None,
         },
     )
     .expect("Matérn term-collection fit should succeed");
