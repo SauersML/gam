@@ -120,7 +120,7 @@ impl<'a> RemlState<'a> {
                     -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
                 if self.config.firth_bias_reduction
                     && matches!(self.config.link_function(), LinkFunction::Logit)
-                    && let Some(firth_log_det) = pirls_result.firth_log_det
+                    && let Some(firth_log_det) = pirls_result.firth_log_det()
                 {
                     penalised_ll += firth_log_det;
                 }
@@ -384,14 +384,8 @@ impl<'a> RemlState<'a> {
         let mut total = 0.0_f64;
         let batch = 32usize;
 
-        let x_dense_opt = match self.x() {
-            DesignMatrix::Dense(x) => Some(x),
-            DesignMatrix::Sparse(_) => None,
-        };
-        let x_csr_opt = match self.x() {
-            DesignMatrix::Sparse(x) => x.to_csr_arc(),
-            DesignMatrix::Dense(_) => None,
-        };
+        let x_dense_opt = self.x().as_dense();
+        let x_csr_opt = self.x().as_sparse().and_then(|x| x.to_csr_arc());
 
         let mut start = 0usize;
         while start < n {
@@ -631,19 +625,21 @@ impl<'a> RemlState<'a> {
         // we scale rows of X and form X' (diag(v) X); for sparse designs we
         // reuse the existing sparse X' W X assembly machinery with `diag`
         // playing the role of per-row weights.
-        match self.x() {
-            DesignMatrix::Dense(x_dense) => {
-                let mut weighted = Array2::<f64>::zeros(x_dense.raw_dim());
-                Ok(Self::xt_diag_x_dense_into(x_dense, diag, &mut weighted))
-            }
-            DesignMatrix::Sparse(x_sparse) => {
-                let csr = x_sparse.to_csr_arc().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "failed to build CSR cache for sparse exact Hessian".to_string(),
-                    )
-                })?;
-                workspace.compute_hessian_sparse_faer(csr.as_ref(), diag)
-            }
+        if let Some(x_sparse) = self.x().as_sparse() {
+            let csr = x_sparse.to_csr_arc().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "failed to build CSR cache for sparse exact Hessian".to_string(),
+                )
+            })?;
+            workspace.compute_hessian_sparse_faer(csr.as_ref(), diag)
+        } else {
+            let x_dense = self.x().as_dense().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "failed to access dense design for exact Hessian".to_string(),
+                )
+            })?;
+            let mut weighted = Array2::<f64>::zeros(x_dense.raw_dim());
+            Ok(Self::xt_diag_x_dense_into(x_dense, diag, &mut weighted))
         }
     }
 
@@ -1081,10 +1077,7 @@ impl<'a> RemlState<'a> {
         let p = self.p;
         let has_dense_constraints =
             self.linear_constraints.is_some() || self.coefficient_lower_bounds.is_some();
-        let x_sparse = match &self.x {
-            DesignMatrix::Sparse(sparse) => Some(sparse),
-            DesignMatrix::Dense(_) => None,
-        };
+        let x_sparse = self.x.as_sparse();
         let nnz_x = x_sparse.map(|s| s.val().len()).unwrap_or(0);
         let dense_backend =
             |reason: &'static str,

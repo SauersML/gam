@@ -954,14 +954,11 @@ impl<'a> RemlState<'a> {
             ));
         }
         let ridge_passport = pirls_result.ridge_passport;
-        let x_sparse = match &self.x {
-            DesignMatrix::Sparse(s) => s,
-            DesignMatrix::Dense(_) => {
-                return Err(EstimationError::InvalidInput(
-                    "sparse exact geometry requires sparse original design".to_string(),
-                ));
-            }
-        };
+        let x_sparse = self.x().as_sparse().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "sparse exact geometry requires sparse original design".to_string(),
+            )
+        })?;
         let penalty_blocks = self
             .sparse_penalty_blocks
             .as_ref()
@@ -1493,7 +1490,7 @@ impl<'a> RemlState<'a> {
                 if self.config.firth_bias_reduction
                     && matches!(self.config.link_function(), LinkFunction::Logit)
                 {
-                    if let Some(firth_log_det) = pirls_result.firth_log_det {
+                    if let Some(firth_log_det) = pirls_result.firth_log_det() {
                         penalised_ll += firth_log_det; // Jeffreys prior contribution
                     }
                 }
@@ -1569,7 +1566,7 @@ impl<'a> RemlState<'a> {
 
                 // Raw-condition diagnostics are rate-limited in this loop.
                 // We only refresh occasionally, and keep the last snapshot otherwise.
-                let raw_cond = if matches!(self.x(), DesignMatrix::Dense(_)) && want_hot_diag {
+                let raw_cond = if self.x().as_sparse().is_none() && want_hot_diag {
                     let x_orig_arc = self.x().to_dense_arc();
                     let x_orig = x_orig_arc.as_ref();
                     let w_orig = self.weights();

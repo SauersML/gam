@@ -426,6 +426,13 @@ impl DesignMatrix {
         }
     }
 
+    pub fn as_dense(&self) -> Option<&Array2<f64>> {
+        match self {
+            Self::Dense(matrix) => Some(matrix),
+            Self::Sparse(_) => None,
+        }
+    }
+
     pub fn matrix_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
         <Self as LinearOperator>::apply(self, vector)
     }

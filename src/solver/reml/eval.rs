@@ -1940,22 +1940,12 @@ impl<'a> RemlState<'a> {
                     // h_i = x_i^T H_+^\dagger x_i = ||(XW)_{i,*}||^2.
                     let mut leverage_h_pos = Array1::<f64>::zeros(n_obs);
                     if w_pos.ncols() > 0 {
-                        match &x_transformed_eval {
-                            DesignMatrix::Dense(x_dense) => {
-                                let xw = x_dense.dot(w_pos);
-                                for i in 0..xw.nrows() {
-                                    leverage_h_pos[i] = xw.row(i).iter().map(|v| v * v).sum();
-                                }
-                            }
-                            DesignMatrix::Sparse(_) => {
-                                for col in 0..w_pos.ncols() {
-                                    let w_col = w_pos.column(col).to_owned();
-                                    let xw_col = x_transformed_eval.matrix_vector_multiply(&w_col);
-                                    Zip::from(&mut leverage_h_pos)
-                                        .and(&xw_col)
-                                        .for_each(|h, &v| *h += v * v);
-                                }
-                            }
+                        for col in 0..w_pos.ncols() {
+                            let w_col = w_pos.column(col).to_owned();
+                            let xw_col = x_transformed_eval.matrix_vector_multiply(&w_col);
+                            Zip::from(&mut leverage_h_pos)
+                                .and(&xw_col)
+                                .for_each(|h, &v| *h += v * v);
                         }
                     }
 
