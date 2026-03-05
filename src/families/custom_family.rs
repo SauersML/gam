@@ -169,6 +169,8 @@ pub struct BlockwiseFitOptions {
     ///   -loglik + penalty + 0.5(log|H| - log|S|_+)
     /// where H is blockwise working curvature and S is blockwise penalty.
     pub use_reml_objective: bool,
+    /// If false, skip post-fit joint covariance assembly.
+    pub compute_covariance: bool,
 }
 
 impl Default for BlockwiseFitOptions {
@@ -182,6 +184,7 @@ impl Default for BlockwiseFitOptions {
             ridge_floor: 1e-12,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_reml_objective: true,
+            compute_covariance: true,
         }
     }
 }
@@ -1431,19 +1434,38 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                     .assign(&s_part);
             }
         }
-        let mut h_for_logdet = h_joint_unpen.clone();
-        h_for_logdet += &s_joint;
+        // Coupled implicit system:
+        //   g(beta,rho) = -∇_beta ell + P(rho) beta = 0
+        //   J(beta,rho) = ∂g/∂beta = H(beta) + P(rho)
+        //   d beta / d rho_k = -J^{-1} (∂P/∂rho_k beta)
+        //
+        // Here `h_joint_unpen` is H(beta) and `s_joint` is P(rho), so
+        // `j_joint = h_joint_unpen + s_joint` is the fully coupled curvature.
+        let mut j_joint = h_joint_unpen.clone();
+        j_joint += &s_joint;
+
+        // Log-determinant traces may follow a ridge-augmented surface depending
+        // on ridge policy, but coupled beta sensitivities below are always solved
+        // against the full joint system J.
+        let mut j_for_traces = j_joint.clone();
         if options.ridge_policy.include_penalty_logdet {
             let ridge = effective_solver_ridge(options.ridge_floor);
             for d in 0..total {
-                h_for_logdet[[d, d]] += ridge;
+                j_for_traces[[d, d]] += ridge;
             }
         }
-        let h_inv = inverse_spd_with_retry(
-            &h_for_logdet,
+        let h_inv = match inverse_spd_with_retry(
+            &j_for_traces,
             effective_solver_ridge(options.ridge_floor),
             8,
-        )?;
+        ) {
+            Ok(inv) => inv,
+            Err(_) => {
+                // Joint exact geometry can be mildly indefinite away from the inner mode.
+                // Fall back to a positive-part pseudoinverse to keep outer gradients defined.
+                pinv_positive_part(&j_for_traces, options.ridge_floor)?
+            }
+        };
         let mut at = 0usize;
         for b in 0..specs.len() {
             let spec = &specs[b];
@@ -1458,7 +1480,6 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                 let a_k_beta = a_k.dot(&beta_flat);
                 let g_pen = 0.5 * beta_block.dot(&local.dot(&beta_block));
                 let g = if options.use_reml_objective {
-                    let g_logh = 0.5 * trace_product(&h_inv, &a_k);
                     let g_logs = 0.5
                         * trace_product(
                             s_pinv_joint
@@ -1466,16 +1487,50 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                                 .ok_or_else(|| "missing joint S^+ for REML gradient".to_string())?,
                             &a_k,
                         );
-                    let u_k = -h_inv.dot(&a_k_beta);
+                    let rhs_k = -&a_k_beta;
+                    let u_k = solve_spd_system_with_policy(
+                        &j_joint,
+                        &rhs_k,
+                        options.ridge_floor,
+                        options.ridge_policy,
+                    )
+                    .unwrap_or_else(|_| {
+                        pinv_positive_part(&j_joint, options.ridge_floor)
+                            .map(|j_pinv| j_pinv.dot(&rhs_k))
+                            .unwrap_or_else(|_| -h_inv.dot(&a_k_beta))
+                    });
                     let u_norm = u_k.dot(&u_k).sqrt();
-                    let g_hbeta = if u_norm <= 1e-14 {
-                        0.0
-                    } else if let Some(h_rho) = family
-                        .exact_newton_joint_hessian_directional_derivative(
-                            &inner.block_states,
-                            &u_k,
-                        )?
-                    {
+                    // Coupled outer gradient identity:
+                    //   d/d rho_k log|J| = tr(J^{-1} dJ/d rho_k),
+                    //   dJ/d rho_k = A_k + deltaH[u_k],
+                    // with:
+                    //   A_k = dP/d rho_k  (here `a_k`)
+                    //   u_k = d beta / d rho_k = -J^{-1}(A_k beta)
+                    //   deltaH[u_k] from family joint directional derivative.
+                    //
+                    // Therefore REML/LAML contribution is
+                    //   0.5 * tr(J^{-1}(A_k + deltaH[u_k])) - 0.5 * tr(S^+ A_k).
+                    let mut d_j_k = a_k.clone();
+                    if u_norm > 1e-14 {
+                        // Exact-by-default: use analytic joint directional derivative when
+                        // available; only fall back to finite differences if analytic is
+                        // unavailable for this family/state.
+                        let h_rho = if let Some(h) = family
+                            .exact_newton_joint_hessian_directional_derivative(
+                                &inner.block_states,
+                                &u_k,
+                            )?
+                        {
+                            h
+                        } else {
+                            finite_difference_joint_hessian_directional_derivative(
+                                family,
+                                specs,
+                                &inner.block_states,
+                                &u_k,
+                                1e-5,
+                            )?
+                        };
                         if h_rho.nrows() != total || h_rho.ncols() != total {
                             return Err(format!(
                                 "joint exact-newton dH shape mismatch: got {}x{}, expected {}x{}",
@@ -1485,11 +1540,10 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                                 total
                             ));
                         }
-                        0.5 * trace_product(&h_inv, &h_rho)
-                    } else {
-                        0.0
-                    };
-                    g_pen + g_logh + g_hbeta - g_logs
+                        d_j_k += &h_rho;
+                    }
+                    let g_logj = 0.5 * trace_product(&h_inv, &d_j_k);
+                    g_pen + g_logj - g_logs
                 } else {
                     g_pen
                 };
@@ -1985,6 +2039,68 @@ fn set_states_from_flat_beta(
     Ok(())
 }
 
+#[allow(dead_code)]
+fn finite_difference_joint_hessian_directional_derivative<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    d_beta_flat: &Array1<f64>,
+    step_scale: f64,
+) -> Result<Array2<f64>, String> {
+    let total = specs.iter().map(|s| s.design.ncols()).sum::<usize>();
+    if d_beta_flat.len() != total {
+        return Err(format!(
+            "joint d_beta length mismatch in FD dH: got {}, expected {}",
+            d_beta_flat.len(),
+            total
+        ));
+    }
+    let dir_norm = d_beta_flat.dot(d_beta_flat).sqrt();
+    if dir_norm <= 1e-14 {
+        return Ok(Array2::<f64>::zeros((total, total)));
+    }
+
+    let beta0 = flatten_state_betas(states, specs);
+    let beta_norm = beta0.dot(&beta0).sqrt();
+    let eps = (step_scale.max(1e-7)) * (1.0 + beta_norm) / (1.0 + dir_norm);
+
+    let mut b_plus = beta0.clone();
+    b_plus += &d_beta_flat.mapv(|v| eps * v);
+    let mut s_plus = states.to_vec();
+    set_states_from_flat_beta(&mut s_plus, specs, &b_plus)?;
+    refresh_all_block_etas(family, specs, &mut s_plus)?;
+    let h_plus = family
+        .exact_newton_joint_hessian(&s_plus)?
+        .ok_or_else(|| "joint Hessian unavailable at +epsilon state for FD dH fallback".to_string())?;
+
+    let mut b_minus = beta0.clone();
+    b_minus -= &d_beta_flat.mapv(|v| eps * v);
+    let mut s_minus = states.to_vec();
+    set_states_from_flat_beta(&mut s_minus, specs, &b_minus)?;
+    refresh_all_block_etas(family, specs, &mut s_minus)?;
+    let h_minus = family
+        .exact_newton_joint_hessian(&s_minus)?
+        .ok_or_else(|| "joint Hessian unavailable at -epsilon state for FD dH fallback".to_string())?;
+
+    if h_plus.nrows() != total
+        || h_plus.ncols() != total
+        || h_minus.nrows() != total
+        || h_minus.ncols() != total
+    {
+        return Err(format!(
+            "joint Hessian shape mismatch in FD dH fallback: +={}x{}, -={}x{}, expected {}x{}",
+            h_plus.nrows(),
+            h_plus.ncols(),
+            h_minus.nrows(),
+            h_minus.ncols(),
+            total,
+            total
+        ));
+    }
+
+    Ok((h_plus - h_minus) / (2.0 * eps))
+}
+
 fn penalized_objective_at_beta<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -2164,14 +2280,18 @@ pub fn fit_custom_family<F: CustomFamily>(
             None,
         )?;
         refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-        let covariance_conditional = compute_joint_covariance(
-            family,
-            specs,
-            &inner.block_states,
-            &vec![Array1::zeros(0); specs.len()],
-            options,
-        )
-        .ok();
+        let covariance_conditional = if options.compute_covariance {
+            compute_joint_covariance(
+                family,
+                specs,
+                &inner.block_states,
+                &vec![Array1::zeros(0); specs.len()],
+                options,
+            )
+            .ok()
+        } else {
+            None
+        };
         let reml_term = if options.use_reml_objective {
             0.5 * (inner.block_logdet_h - inner.block_logdet_s)
         } else {
@@ -2315,8 +2435,11 @@ pub fn fit_custom_family<F: CustomFamily>(
             details = last_eval_error()
         )
     })?;
-    let covariance_conditional =
-        compute_joint_covariance(family, specs, &inner.block_states, &per_block, options).ok();
+    let covariance_conditional = if options.compute_covariance {
+        compute_joint_covariance(family, specs, &inner.block_states, &per_block, options).ok()
+    } else {
+        None
+    };
 
     Ok(BlockwiseFitResult {
         block_states: inner.block_states,
@@ -2520,6 +2643,7 @@ mod tests {
             ridge_floor: 1e-4,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_reml_objective: false,
+            compute_covariance: false,
         };
 
         let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
@@ -2555,6 +2679,7 @@ mod tests {
             ridge_floor: 0.0,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_reml_objective: false,
+            compute_covariance: false,
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
         let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
@@ -2804,6 +2929,8 @@ mod tests {
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
             sigma_min: 0.05,
             sigma_max: 4.0,
+            threshold_design: Some(threshold_spec.design.clone()),
+            log_sigma_design: Some(log_sigma_spec.design.clone()),
         };
         let specs = vec![threshold_spec, log_sigma_spec];
         let penalty_counts = vec![1usize, 1usize];
@@ -2848,7 +2975,7 @@ mod tests {
             let g_fd = (fp - fm) / (2.0 * h);
             let rel = (g0[k] - g_fd).abs() / g_fd.abs().max(1e-8);
             assert!(
-                rel < 5e-1,
+                rel < 2e-2,
                 "outer diagonal LAML gradient mismatch at {}: analytic={} fd={} rel={}",
                 k,
                 g0[k],

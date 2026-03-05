@@ -199,6 +199,14 @@ pub struct SurvivalLocationScaleProbitPredictResult {
     pub survival_prob: Array1<f64>,
 }
 
+#[derive(Clone)]
+pub struct SurvivalLocationScaleProbitPredictUncertaintyResult {
+    pub eta: Array1<f64>,
+    pub survival_prob: Array1<f64>,
+    pub eta_standard_error: Array1<f64>,
+    pub response_standard_error: Option<Array1<f64>>,
+}
+
 struct SurvivalLocationScaleProbitFamily {
     n: usize,
     y: Array1<f64>,
@@ -207,6 +215,7 @@ struct SurvivalLocationScaleProbitFamily {
     sigma_max: f64,
     inverse_link: InverseLink,
     derivative_guard: f64,
+    derivative_softness: f64,
     x_time_entry: Array2<f64>,
     x_time_exit: Array2<f64>,
     x_time_deriv: Array2<f64>,
@@ -676,14 +685,22 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             let (log_phi1, dlogphi1, d2logphi1) =
                 Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1);
             let g = d_raw[i];
-            if !g.is_finite() || g <= self.derivative_guard.max(1e-12) {
+            let guard = self.derivative_guard;
+            let soft = self.derivative_softness.max(0.0);
+            let g_safe = (g + soft).max(1e-12);
+            if !g.is_finite() {
+                return Err(format!(
+                    "survival probit-location-scale non-finite d_eta/dt at row {i}: {g}"
+                ));
+            }
+            if guard > 0.0 && g <= guard {
                 return Err(format!(
                     "survival probit-location-scale monotonicity violated at row {i}: d_eta/dt={g:.3e} <= guard={:.3e}",
-                    self.derivative_guard.max(1e-12)
+                    guard
                 ));
             }
 
-            ll += w * (d * (log_phi1 + g.ln()) + (1.0 - d) * s1.ln() - s0.ln());
+            ll += w * (d * (log_phi1 + g_safe.ln()) + (1.0 - d) * s1.ln() - s0.ln());
 
             // q derivatives (shared by threshold/log-sigma blocks).
             // Chain rule map:
@@ -697,11 +714,11 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             // which is why the row-wise second-derivative terms carry a leading minus.
             grad_time_eta_h0[i] = -w * r0;
             grad_time_eta_h1[i] = -w * (d * dlogphi1 + (1.0 - d) * (-r1));
-            grad_time_eta_d[i] = w * d / g;
+            grad_time_eta_d[i] = w * d / g_safe;
 
             h_time_h0[i] = -w * dr0;
             h_time_h1[i] = -w * (d * d2logphi1 + (1.0 - d) * (-dr1));
-            h_time_d[i] = w * d / (g * g);
+            h_time_d[i] = w * d / (g_safe * g_safe);
         }
 
         // Block 0: exact beta-space gradient/Hessian
@@ -872,13 +889,21 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
             d_h_h0[i] = w * ddr0;
             d_h_h1[i] = -w * (1.0 - d) * ddr1;
             let g = d_raw[i];
-            if !g.is_finite() || g <= self.derivative_guard.max(1e-12) {
+            let guard = self.derivative_guard;
+            let soft = self.derivative_softness.max(0.0);
+            let g_safe = (g + soft).max(1e-12);
+            if !g.is_finite() {
                 return Err(format!(
-                    "survival probit-location-scale monotonicity violated in Hessian directional derivative at row {i}: d_eta/dt={g:.3e} <= guard={:.3e}",
-                    self.derivative_guard.max(1e-12)
+                    "survival probit-location-scale non-finite d_eta/dt in Hessian directional derivative at row {i}: {g}"
                 ));
             }
-            d_h_d[i] = -2.0 * w * d / (g * g * g);
+            if guard > 0.0 && g <= guard {
+                return Err(format!(
+                    "survival probit-location-scale monotonicity violated in Hessian directional derivative at row {i}: d_eta/dt={g:.3e} <= guard={:.3e}",
+                    guard
+                ));
+            }
+            d_h_d[i] = -2.0 * w * d / (g_safe * g_safe * g_safe);
         }
 
         match block_idx {
@@ -1002,13 +1027,13 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                 self.offset_time_deriv.len()
             ));
         }
-        if n == 0 || p == 0 {
+        if n == 0 || p == 0 || self.derivative_guard <= 0.0 {
             return Ok(None);
         }
         let mut a = Array2::<f64>::zeros((n, p));
         a.assign(&self.x_time_deriv);
         let mut b = Array1::<f64>::zeros(n);
-        let guard = self.derivative_guard.max(1e-12);
+        let guard = self.derivative_guard;
         for i in 0..n {
             b[i] = guard - self.offset_time_deriv[i];
         }
@@ -1155,6 +1180,7 @@ pub fn fit_survival_location_scale_probit(
         sigma_max: spec.sigma_max,
         inverse_link: spec.inverse_link,
         derivative_guard: spec.derivative_guard,
+        derivative_softness: spec.derivative_softness,
         x_time_entry: time_prepared.design_entry,
         x_time_exit: time_prepared.design_exit,
         x_time_deriv: time_prepared.design_derivative_exit,
@@ -1602,6 +1628,129 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
     Ok(SurvivalLocationScaleProbitPredictResult {
         eta: pred.eta,
         survival_prob,
+    })
+}
+
+pub fn predict_survival_location_scale_probit_with_uncertainty(
+    input: &SurvivalLocationScaleProbitPredictInput,
+    fit: &SurvivalLocationScaleProbitFitResult,
+    covariance: &Array2<f64>,
+    posterior_mean: bool,
+    include_response_sd: bool,
+) -> Result<SurvivalLocationScaleProbitPredictUncertaintyResult, String> {
+    let base = predict_survival_location_scale_probit(input, fit)?;
+    let n = input.x_time_exit.nrows();
+    let p_time = fit.beta_time.len();
+    let p_t = fit.beta_threshold.len();
+    let p_ls = fit.beta_log_sigma.len();
+    let p_w = fit.beta_link_wiggle.as_ref().map_or(0, |b| b.len());
+    let p_total = p_time + p_t + p_ls + p_w;
+    if covariance.nrows() != p_total || covariance.ncols() != p_total {
+        return Err(format!(
+            "predict_survival_location_scale_probit_with_uncertainty: covariance shape mismatch: got {}x{}, expected {}x{}",
+            covariance.nrows(),
+            covariance.ncols(),
+            p_total,
+            p_total
+        ));
+    }
+    if p_w > 0
+        && (fit.beta_link_wiggle.is_none() || input.x_link_wiggle.is_none())
+    {
+        return Err(
+            "predict_survival_location_scale_probit_with_uncertainty: wiggle covariance provided but wiggle design/beta is partial"
+                .to_string(),
+        );
+    }
+
+    let x_threshold_dense_arc = input.x_threshold.to_dense_arc();
+    let x_log_sigma_dense_arc = input.x_log_sigma.to_dense_arc();
+    let x_threshold_dense = x_threshold_dense_arc.as_ref();
+    let x_log_sigma_dense = x_log_sigma_dense_arc.as_ref();
+    let x_link_wiggle_dense_arc = input.x_link_wiggle.as_ref().map(|x| x.to_dense_arc());
+    let x_link_wiggle_dense = x_link_wiggle_dense_arc.as_ref().map(|x| x.as_ref());
+
+    if x_threshold_dense.nrows() != n || x_log_sigma_dense.nrows() != n {
+        return Err(
+            "predict_survival_location_scale_probit_with_uncertainty: row mismatch across dense design views"
+                .to_string(),
+        );
+    }
+    if let Some(xw) = x_link_wiggle_dense {
+        if xw.nrows() != n {
+            return Err(
+                "predict_survival_location_scale_probit_with_uncertainty: x_link_wiggle row mismatch"
+                    .to_string(),
+            );
+        }
+    }
+
+    let eta_t = input.x_threshold.matrix_vector_multiply(&fit.beta_threshold);
+    let eta_ls = input.x_log_sigma.matrix_vector_multiply(&fit.beta_log_sigma);
+    let (sigma, ds, _, _) =
+        bounded_sigma_derivs_up_to_third(eta_ls.view(), input.sigma_min, input.sigma_max);
+
+    let mut eta_var = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut g = Array1::<f64>::zeros(p_total);
+        for j in 0..p_time {
+            g[j] = -input.x_time_exit[[i, j]];
+        }
+        let inv_sigma = 1.0 / sigma[i].max(1e-12);
+        for j in 0..p_t {
+            g[p_time + j] = -x_threshold_dense[[i, j]] * inv_sigma;
+        }
+        let coeff_ls = eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
+        for j in 0..p_ls {
+            g[p_time + p_t + j] = coeff_ls * x_log_sigma_dense[[i, j]];
+        }
+        if let Some(xw) = x_link_wiggle_dense {
+            for j in 0..p_w {
+                g[p_time + p_t + p_ls + j] = xw[[i, j]];
+            }
+        }
+
+        let mut acc = 0.0_f64;
+        for a in 0..p_total {
+            for b in 0..p_total {
+                acc += g[a] * covariance[[a, b]] * g[b];
+            }
+        }
+        eta_var[i] = acc.max(0.0);
+    }
+    let eta_se = eta_var.mapv(f64::sqrt);
+
+    let survival_prob = if posterior_mean {
+        predict_survival_location_scale_probit_posterior_mean(input, fit, covariance)?.survival_prob
+    } else {
+        base.survival_prob.clone()
+    };
+
+    let response_standard_error = if include_response_sd {
+        let quad_ctx = crate::quadrature::QuadratureContext::new();
+        Some(Array1::from_iter((0..n).map(|i| {
+            let m2 = crate::quadrature::normal_expectation_1d_adaptive(
+                &quad_ctx,
+                base.eta[i],
+                eta_se[i],
+                |x| {
+                    let p = inverse_link_jet_for_inverse_link(&input.inverse_link, x)
+                        .map(|j| j.mu.clamp(0.0, 1.0))
+                        .unwrap_or_else(|_| normal_cdf_approx(x).clamp(0.0, 1.0));
+                    p * p
+                },
+            );
+            (m2 - survival_prob[i] * survival_prob[i]).max(0.0).sqrt()
+        })))
+    } else {
+        None
+    };
+
+    Ok(SurvivalLocationScaleProbitPredictUncertaintyResult {
+        eta: base.eta,
+        survival_prob,
+        eta_standard_error: eta_se,
+        response_standard_error,
     })
 }
 
