@@ -244,11 +244,10 @@ def native_surface_predict(train_xy, z_obs, eval_xy, basis_type, centers=30, ell
             "fit",
             "--family",
             "gaussian",
-            "--formula",
-            formula,
             "--out",
             str(model_json),
             str(train_csv),
+            formula,
         ]
         subprocess.run(fit_cmd, cwd=root, check=True, capture_output=True, text=True)
 

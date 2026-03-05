@@ -325,11 +325,10 @@ def _fit_survival_model(
         "fit",
         "--family",
         "royston-parmar",
-        "--formula",
-        fit_formula,
         "--out",
         str(model_path),
         str(train_df),
+        fit_formula,
     ]
 
     if likelihood == "transformation":

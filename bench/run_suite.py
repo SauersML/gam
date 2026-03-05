@@ -2900,11 +2900,8 @@ def run_rust_scenario_cv(
                 fit_cmd = [
                     str(rust_bin),
                     "fit",
-                    "--formula",
-                    fit_formula,
                     "--out",
                     str(model_path),
-                    str(train_path),
                 ]
             else:
                 if shared_artifact is not None:
@@ -2926,26 +2923,21 @@ def run_rust_scenario_cv(
                     fit_cmd = [
                         str(rust_bin),
                         "fit",
-                        "--formula",
-                        formula,
                         "--out",
                         str(model_path),
-                        str(train_path),
                     ]
                 else:
                     fit_cmd = [
                         str(rust_bin),
                         "fit",
-                        "--formula",
-                        formula,
                         "--out",
                         str(model_path),
-                        str(train_path),
                     ]
 
             if rust_fit_extra_args:
                 fit_cmd.extend([str(x) for x in rust_fit_extra_args])
             fit_cmd.extend(["--no-summary"])
+            fit_cmd.extend([str(train_path), fit_formula if ds["family"] == "survival" else formula])
 
             def _looks_like_missing_csv(msg: str) -> bool:
                 m = (msg or "").lower()
@@ -3335,17 +3327,15 @@ def _run_rust_gamlss_scenario_cv_variant(
             fit_cmd = [
                 str(rust_bin),
                 "fit",
-                "--formula",
-                mean_formula,
                 "--predict-noise",
                 noise_formula,
                 "--out",
                 str(model_path),
-                str(train_path),
             ]
             if family == "binomial" and binom_extra:
                 fit_cmd.extend(binom_extra)
             fit_cmd.extend(["--no-summary"])
+            fit_cmd.extend([str(train_path), mean_formula])
             t0 = perf_counter()
             code, out, err = run_cmd(fit_cmd, cwd=ROOT)
             fit_sec = perf_counter() - t0
@@ -3567,13 +3557,11 @@ def run_rust_gamlss_survival_cv(
             fit_cmd = [
                 str(rust_bin),
                 "fit",
-                "--formula",
-                fit_formula,
                 "--out",
                 str(model_path),
-                str(train_path),
             ]
             fit_cmd.extend(["--no-summary"])
+            fit_cmd.extend([str(train_path), fit_formula])
 
             t0 = perf_counter()
             code, out, err = run_cmd(fit_cmd, cwd=ROOT)
