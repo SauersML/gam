@@ -63,17 +63,6 @@ impl<'a> RemlState<'a> {
         *repeat = 0;
     }
 
-    #[allow(dead_code)]
-    pub fn reset_optimizer_tracking(&self) {
-        self.cache_manager.clear_eval_and_factor_caches();
-        self.arena.cost_last.write().unwrap().take();
-        *self.arena.cost_repeat.write().unwrap() = 0;
-        *self.arena.cost_last_emit.write().unwrap() = 0;
-        *self.arena.cost_eval_count.write().unwrap() = 0;
-        *self.arena.raw_cond_snapshot.write().unwrap() = f64::NAN;
-        *self.arena.gaussian_cond_snapshot.write().unwrap() = f64::NAN;
-    }
-
     fn invalidate_link_dependent_state(&self) {
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
@@ -180,36 +169,6 @@ impl<'a> RemlState<'a> {
         Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn new<X>(
-        y: ArrayView1<'a, f64>,
-        x: X,
-        weights: ArrayView1<'a, f64>,
-        s_list: Vec<Array2<f64>>,
-        p: usize,
-        config: &'a RemlConfig,
-        nullspace_dims: Option<Vec<usize>>,
-        coefficient_lower_bounds: Option<Array1<f64>>,
-        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
-    ) -> Result<Self, EstimationError>
-    where
-        X: Into<DesignMatrix>,
-    {
-        let zero_offset = Array1::<f64>::zeros(y.len());
-        Self::new_with_offset_shared(
-            y,
-            x,
-            weights,
-            zero_offset.view(),
-            Arc::new(s_list),
-            p,
-            config,
-            nullspace_dims,
-            coefficient_lower_bounds,
-            linear_constraints,
-        )
     }
 
     pub(crate) fn new_with_offset<X>(
@@ -720,7 +679,6 @@ impl<'a> RemlState<'a> {
     /// Clear warm-start state. Used in tests to ensure consistent starting points
     /// when comparing different gradient computation paths.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub fn clear_warm_start(&self) {
         self.warm_start_beta.write().unwrap().take();
         self.cache_manager.invalidate_eval_bundle();
@@ -806,16 +764,6 @@ impl<'a> RemlState<'a> {
     // Accessor methods for private fields
     pub(crate) fn x(&self) -> &DesignMatrix {
         &self.x
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn y(&self) -> ArrayView1<'a, f64> {
-        self.y
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn rs_list_ref(&self) -> &Vec<Array2<f64>> {
-        &self.rs_list
     }
 
     pub(crate) fn balanced_penalty_root(&self) -> &Array2<f64> {
@@ -1074,11 +1022,6 @@ impl<'a> RemlState<'a> {
             })),
             firth_dense_operator,
         })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn offset(&self) -> ArrayView1<'_, f64> {
-        self.offset.view()
     }
 
     /// Runs the inner P-IRLS loop, caching the result.

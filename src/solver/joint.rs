@@ -199,7 +199,6 @@ pub struct JointModelState<'a> {
     ridge_link_used: f64,
 }
 
-#[allow(dead_code)]
 struct JointFirthAdjustment {
     hat_diag: Array1<f64>,
     half_log_det: f64,
@@ -1301,7 +1300,6 @@ impl<'a> JointRemlState<'a> {
                 .all(|(a, b)| a == b)
     }
 
-    #[allow(dead_code)]
     /// Create new REML state
     pub(crate) fn new(
         y: ArrayView1<'a, f64>,
