@@ -541,6 +541,107 @@
       "seed": 20260401,
       "prevalence_min": 0.01,
       "prevalence_max": 0.1
+    },
+    {
+      "name": "thread2_fractional_spde_nu18",
+      "n": 512,
+      "seed": 20260501,
+      "true_nu": 1.8,
+      "true_kappa2": 0.7,
+      "exclude_contenders": [
+        "rust_gam_sas",
+        "rust_gamlss",
+        "rust_gamlss_survival",
+        "r_gamlss",
+        "r_mgcv",
+        "r_mgcv_gaulss",
+        "r_gamboostlss",
+        "r_bamlss",
+        "r_brms",
+        "r_mgcv_coxph",
+        "python_pygam",
+        "python_sksurv_rsf",
+        "python_sksurv_coxnet",
+        "python_lifelines_coxph_enet",
+        "r_glmnet_cox",
+        "python_sksurv_gb_coxph",
+        "python_lifelines_weibull_aft",
+        "python_xgboost_aft"
+      ]
+    },
+    {
+      "name": "thread2_boundary_rough",
+      "n": 512,
+      "seed": 20260502,
+      "exclude_contenders": [
+        "rust_gam_sas",
+        "rust_gamlss",
+        "rust_gamlss_survival",
+        "r_gamlss",
+        "r_mgcv",
+        "r_mgcv_gaulss",
+        "r_gamboostlss",
+        "r_bamlss",
+        "r_brms",
+        "r_mgcv_coxph",
+        "python_pygam",
+        "python_sksurv_rsf",
+        "python_sksurv_coxnet",
+        "python_lifelines_coxph_enet",
+        "r_glmnet_cox",
+        "python_sksurv_gb_coxph",
+        "python_lifelines_weibull_aft",
+        "python_xgboost_aft"
+      ]
+    },
+    {
+      "name": "thread2_boundary_smooth",
+      "n": 512,
+      "seed": 20260503,
+      "exclude_contenders": [
+        "rust_gam_sas",
+        "rust_gamlss",
+        "rust_gamlss_survival",
+        "r_gamlss",
+        "r_mgcv",
+        "r_mgcv_gaulss",
+        "r_gamboostlss",
+        "r_bamlss",
+        "r_brms",
+        "r_mgcv_coxph",
+        "python_pygam",
+        "python_sksurv_rsf",
+        "python_sksurv_coxnet",
+        "python_lifelines_coxph_enet",
+        "r_glmnet_cox",
+        "python_sksurv_gb_coxph",
+        "python_lifelines_weibull_aft",
+        "python_xgboost_aft"
+      ]
+    },
+    {
+      "name": "thread3_admixture_cliff",
+      "n": 6000,
+      "seed": 20260601,
+      "exclude_contenders": [
+        "rust_gam_sas",
+        "rust_gamlss",
+        "rust_gamlss_survival",
+        "r_gamlss",
+        "r_mgcv_gaulss",
+        "r_gamboostlss",
+        "r_bamlss",
+        "r_brms",
+        "r_mgcv_coxph",
+        "python_pygam",
+        "python_sksurv_rsf",
+        "python_sksurv_coxnet",
+        "python_lifelines_coxph_enet",
+        "r_glmnet_cox",
+        "python_sksurv_gb_coxph",
+        "python_lifelines_weibull_aft",
+        "python_xgboost_aft"
+      ]
     }
   ]
 }

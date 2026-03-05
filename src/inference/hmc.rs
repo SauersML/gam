@@ -1773,6 +1773,10 @@ pub fn run_nuts_sampling_flattened_family(
             "BinomialSas NUTS is not implemented yet; use fit_gam/predict_gam for SAS-link models"
                 .to_string(),
         ),
+        (LikelihoodFamily::BinomialBetaLogistic, FamilyNutsInputs::Glm(_)) => Err(
+            "BinomialBetaLogistic NUTS is not implemented yet; use fit_gam/predict_gam for beta-logistic-link models"
+                .to_string(),
+        ),
         (LikelihoodFamily::RoystonParmar, FamilyNutsInputs::Survival(survival)) => {
             survival_hmc::run_survival_nuts_sampling(
                 survival.flat.age_entry,

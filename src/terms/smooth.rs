@@ -23,7 +23,8 @@ use crate::estimate::{
 use crate::faer_ndarray::fast_atv;
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    inverse_link_jet_for_family, state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
+    inverse_link_jet_for_family, state_from_beta_logistic_spec, state_from_sas_spec,
+    state_from_spec,
 };
 use crate::pirls::LinearInequalityConstraints;
 use crate::types::{LikelihoodFamily, MixtureLinkState, SasLinkState};

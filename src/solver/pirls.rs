@@ -11,7 +11,7 @@ use crate::linalg::sparse_exact::{
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
     InverseLinkJet as MixtureInverseLinkJet, inverse_link_jet_for_link_function,
-    state_from_sas_spec, state_from_spec,
+    state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
 };
 use crate::probability::standard_normal_quantile;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
@@ -476,7 +476,8 @@ impl WorkingLikelihood for LikelihoodFamily {
                 LikelihoodFamily::BinomialLogit
                 | LikelihoodFamily::BinomialProbit
                 | LikelihoodFamily::BinomialCLogLog
-                | LikelihoodFamily::BinomialSas,
+                | LikelihoodFamily::BinomialSas
+                | LikelihoodFamily::BinomialBetaLogistic,
                 Some(integ),
             ) => {
                 update_glm_vectors_integrated_by_family(
@@ -558,6 +559,21 @@ impl WorkingLikelihood for LikelihoodFamily {
                 )?;
                 Ok(())
             }
+            (LikelihoodFamily::BinomialBetaLogistic, None) => {
+                update_glm_vectors(
+                    y,
+                    eta,
+                    LinkFunction::BetaLogistic,
+                    prior_weights,
+                    mu,
+                    weights,
+                    z,
+                    None,
+                    None,
+                    derivatives,
+                )?;
+                Ok(())
+            }
             (LikelihoodFamily::BinomialMixture, _) => Err(EstimationError::InvalidInput(
                 "BinomialMixture updates are handled by the PIRLS working model path".to_string(),
             )),
@@ -616,6 +632,12 @@ impl WorkingLikelihood for LikelihoodFamily {
             LikelihoodFamily::BinomialSas => {
                 Ok(calculate_deviance(y, mu, LinkFunction::Sas, prior_weights))
             }
+            LikelihoodFamily::BinomialBetaLogistic => Ok(calculate_deviance(
+                y,
+                mu,
+                LinkFunction::BetaLogistic,
+                prior_weights,
+            )),
             LikelihoodFamily::BinomialMixture => Ok(calculate_deviance(
                 y,
                 mu,
@@ -652,6 +674,7 @@ impl WorkingLikelihood for LikelihoodFamily {
             | LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog
             | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture => {
                 let ll = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
                     0.0,
@@ -1108,8 +1131,14 @@ impl<'a> GamWorkingModel<'a> {
         let x_original_csr = x_original.to_csr_cache();
         let likelihood = if mixture_link_state.is_some() {
             LikelihoodFamily::BinomialMixture
-        } else if sas_link_state.is_some() || matches!(link, LinkFunction::Sas) {
-            LikelihoodFamily::BinomialSas
+        } else if sas_link_state.is_some()
+            || matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic)
+        {
+            if matches!(link, LinkFunction::BetaLogistic) {
+                LikelihoodFamily::BinomialBetaLogistic
+            } else {
+                LikelihoodFamily::BinomialSas
+            }
         } else {
             likelihood_from_link(link)
         };
@@ -1322,7 +1351,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     self.y,
                     &self.workspace.eta_buf,
                     integ.se,
-                    LikelihoodFamily::BinomialSas,
+                    self.likelihood,
                     self.prior_weights,
                     &mut self.last_mu,
                     &mut self.last_weights,
@@ -1341,7 +1370,11 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 update_glm_vectors(
                     self.y,
                     &self.workspace.eta_buf,
-                    LinkFunction::Sas,
+                    if matches!(self.likelihood, LikelihoodFamily::BinomialBetaLogistic) {
+                        LinkFunction::BetaLogistic
+                    } else {
+                        LinkFunction::Sas
+                    },
                     self.prior_weights,
                     &mut self.last_mu,
                     &mut self.last_weights,
@@ -2674,7 +2707,11 @@ fn default_beta_guess_external(
     let mut beta = Array1::<f64>::zeros(p);
     let intercept_col = 0usize;
     match link_function {
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
+        LinkFunction::Logit
+        | LinkFunction::Probit
+        | LinkFunction::CLogLog
+        | LinkFunction::Sas
+        | LinkFunction::BetaLogistic => {
             let mut weighted_sum = 0.0;
             let mut total_weight = 0.0;
             for (&yi, &wi) in y.iter().zip(prior_weights.iter()) {
@@ -2695,6 +2732,16 @@ fn default_beta_guess_external(
                     }
                     LinkFunction::CLogLog => (-(1.0 - prevalence).ln()).ln(),
                     LinkFunction::Sas => solve_intercept_for_prevalence(
+                        link_function,
+                        prevalence,
+                        mixture_link_state,
+                        sas_link_state,
+                    )
+                    .unwrap_or_else(|| {
+                        standard_normal_quantile(prevalence)
+                            .unwrap_or_else(|_| (prevalence / (1.0 - prevalence)).ln())
+                    }),
+                    LinkFunction::BetaLogistic => solve_intercept_for_prevalence(
                         link_function,
                         prevalence,
                         mixture_link_state,
@@ -3051,9 +3098,11 @@ where
                         // Reject Step
                         let state_grad_norm = state.gradient.dot(&state.gradient).sqrt();
                         let near_stationary_tol = options.convergence_tolerance.max(1e-6) * 50.0;
-                        let reduction_noise_floor =
-                            (current_penalized.abs().max(candidate_penalized.abs()).max(1.0))
-                                * 1e-12;
+                        let reduction_noise_floor = (current_penalized
+                            .abs()
+                            .max(candidate_penalized.abs())
+                            .max(1.0))
+                            * 1e-12;
 
                         // Near stationarity, objective deltas can collapse into floating-point
                         // noise and LM gain-ratio logic may reject every candidate indefinitely.
@@ -3067,12 +3116,8 @@ where
                             last_deviance_change = 0.0;
                             last_step_size = 0.0;
                             last_step_halving = attempts;
-                            max_abs_eta = state
-                                .eta
-                                .iter()
-                                .copied()
-                                .map(f64::abs)
-                                .fold(0.0, f64::max);
+                            max_abs_eta =
+                                state.eta.iter().copied().map(f64::abs).fold(0.0, f64::max);
                             final_state = Some(state.clone());
                             status = PirlsStatus::StalledAtValidMinimum;
                             break 'pirls_loop;
@@ -3084,8 +3129,7 @@ where
                                 last_gradient_norm = state_grad_norm;
                                 // Only accept "stalled but valid" when we are near stationarity.
                                 // Otherwise report MaxIterationsReached so callers can fail fast.
-                                if state_grad_norm <= near_stationary_tol
-                                {
+                                if state_grad_norm <= near_stationary_tol {
                                     status = PirlsStatus::StalledAtValidMinimum;
                                 } else {
                                     status = PirlsStatus::MaxIterationsReached;
@@ -4299,6 +4343,7 @@ fn resolve_pirls_family(
         LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
         LikelihoodFamily::BinomialCLogLog => Ok((LinkFunction::CLogLog, false)),
         LikelihoodFamily::BinomialSas => Ok((LinkFunction::Sas, false)),
+        LikelihoodFamily::BinomialBetaLogistic => Ok((LinkFunction::BetaLogistic, false)),
         LikelihoodFamily::BinomialMixture => Ok((LinkFunction::Logit, false)),
         LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "run_pirls does not support RoystonParmar; use survival-specific working models"
@@ -4332,13 +4377,17 @@ pub fn run_pirls<'a>(
         })?),
         None => None,
     };
-    let sas_link_state =
-        match opts.sas_link_spec {
-            Some(spec) => Some(state_from_sas_spec(spec).map_err(|e| {
-                EstimationError::InvalidInput(format!("invalid SAS link spec: {e}"))
-            })?),
-            None => None,
-        };
+    let sas_link_state = match opts.sas_link_spec {
+        Some(spec) => Some(if matches!(link, LinkFunction::BetaLogistic) {
+            state_from_beta_logistic_spec(spec).map_err(|e| {
+                EstimationError::InvalidInput(format!("invalid Beta-Logistic link spec: {e}"))
+            })?
+        } else {
+            state_from_sas_spec(spec)
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link spec: {e}")))?
+        }),
+        None => None,
+    };
     if k != rs_original.len() {
         return Err(EstimationError::InvalidInput(format!(
             "run_pirls: k={} does not match number of penalty roots {}",
@@ -4349,7 +4398,11 @@ pub fn run_pirls<'a>(
     let link_kind = if let Some(state) = mixture_link_state {
         InverseLink::Mixture(state)
     } else if let Some(state) = sas_link_state {
-        InverseLink::Sas(state)
+        if matches!(link, LinkFunction::BetaLogistic) {
+            InverseLink::BetaLogistic(state)
+        } else {
+            InverseLink::Sas(state)
+        }
     } else {
         InverseLink::Standard(link)
     };
@@ -4741,16 +4794,21 @@ pub fn update_glm_vectors(
 ) -> Result<(), EstimationError> {
     let n = eta.len();
     match link {
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
+        LinkFunction::Logit
+        | LinkFunction::Probit
+        | LinkFunction::CLogLog
+        | LinkFunction::Sas
+        | LinkFunction::BetaLogistic => {
             let zero_on_nonsmooth =
                 matches!(link, LinkFunction::Logit) && logit_clamp_zero_enabled();
             let mut derivatives = derivatives;
             for i in 0..n {
                 let eta_used = match link {
                     LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
-                    LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
-                        eta[i].clamp(-30.0, 30.0)
-                    }
+                    LinkFunction::Probit
+                    | LinkFunction::CLogLog
+                    | LinkFunction::Sas
+                    | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
                     LinkFunction::Identity => eta[i],
                 };
                 let jet =
@@ -4866,6 +4924,7 @@ pub(crate) fn update_glm_vectors_integrated_for_link(
         LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
         LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
         LinkFunction::Sas => LikelihoodFamily::BinomialSas,
+        LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
         LinkFunction::Identity => {
             update_glm_vectors(
                 y,
@@ -5033,15 +5092,20 @@ fn compute_working_weight_derivatives_from_eta(
         LinkFunction::Identity => {
             dmu_deta.fill(1.0);
         }
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
+        LinkFunction::Logit
+        | LinkFunction::Probit
+        | LinkFunction::CLogLog
+        | LinkFunction::Sas
+        | LinkFunction::BetaLogistic => {
             let zero_on_nonsmooth =
                 matches!(link, LinkFunction::Logit) && logit_clamp_zero_enabled();
             for i in 0..n {
                 let eta_used = match link {
                     LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
-                    LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
-                        eta[i].clamp(-30.0, 30.0)
-                    }
+                    LinkFunction::Probit
+                    | LinkFunction::CLogLog
+                    | LinkFunction::Sas
+                    | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
                     LinkFunction::Identity => eta[i],
                 };
                 let jet =
@@ -5196,6 +5260,9 @@ pub fn directional_working_curvature_from_eta(
             "state-less directional SAS curvature is unsupported; use directional_working_curvature_from_eta_with_state with SasLinkState"
                 .to_string(),
         )),
+        LinkFunction::BetaLogistic => Err(EstimationError::InvalidInput(
+            "state-less directional Beta-Logistic curvature is unsupported; use state-aware curvature dispatch with explicit link state".to_string(),
+        )),
     }
 }
 
@@ -5217,9 +5284,15 @@ pub fn directional_working_curvature_from_eta_with_state(
     let eval_link = if mixture_link_state.is_some() {
         // Mixture dispatch hangs off LinkFunction::Logit + explicit state.
         LinkFunction::Logit
-    } else if sas_link_state.is_some() || matches!(link, LinkFunction::Sas) {
-        // SAS requires explicit state; when present, use SAS curvature surface.
-        LinkFunction::Sas
+    } else if sas_link_state.is_some()
+        || matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic)
+    {
+        // Stateful parameterized links require explicit state.
+        if matches!(link, LinkFunction::BetaLogistic) {
+            LinkFunction::BetaLogistic
+        } else {
+            LinkFunction::Sas
+        }
     } else {
         link
     };
@@ -5228,17 +5301,19 @@ pub fn directional_working_curvature_from_eta_with_state(
         LinkFunction::Identity => {
             directional_working_curvature_identity(eta, prior_weights, solve_weights, eta_direction)
         }
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
-            directional_working_curvature_diagonal_builtin(
-                eval_link,
-                eta,
-                prior_weights,
-                solve_weights,
-                eta_direction,
-                mixture_link_state,
-                sas_link_state,
-            )
-        }
+        LinkFunction::Logit
+        | LinkFunction::Probit
+        | LinkFunction::CLogLog
+        | LinkFunction::Sas
+        | LinkFunction::BetaLogistic => directional_working_curvature_diagonal_builtin(
+            eval_link,
+            eta,
+            prior_weights,
+            solve_weights,
+            eta_direction,
+            mixture_link_state,
+            sas_link_state,
+        ),
     }
 }
 
@@ -5249,6 +5324,7 @@ fn likelihood_from_link(link: LinkFunction) -> LikelihoodFamily {
         LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
         LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
         LinkFunction::Sas => LikelihoodFamily::BinomialSas,
+        LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
         LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
     }
 }
@@ -5262,7 +5338,11 @@ pub fn calculate_deviance(
 ) -> f64 {
     const EPS: f64 = 1e-8; // Increased from 1e-9 for better numerical stability
     match link {
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
+        LinkFunction::Logit
+        | LinkFunction::Probit
+        | LinkFunction::CLogLog
+        | LinkFunction::Sas
+        | LinkFunction::BetaLogistic => {
             let total_residual = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
                 0.0,
                 |acc, &yi, &mui, &wi| {
@@ -5651,7 +5731,11 @@ fn calculate_scale(
     link_function: LinkFunction,
 ) -> f64 {
     match link_function {
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
+        LinkFunction::Logit
+        | LinkFunction::Probit
+        | LinkFunction::CLogLog
+        | LinkFunction::Sas
+        | LinkFunction::BetaLogistic => {
             // For binomial models (logistic regression), scale is fixed at 1.0
             // This follows mgcv's convention in gam.fit3.R
             1.0

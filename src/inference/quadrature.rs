@@ -173,7 +173,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::estimate::EstimationError;
-use crate::mixture_link::sas_inverse_link_jet;
+use crate::mixture_link::{beta_logistic_inverse_link_jet, sas_inverse_link_jet};
 use crate::types::{LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkState};
 use statrs::function::erf::erfc;
 
@@ -1946,6 +1946,9 @@ pub fn integrated_inverse_link_mean_and_derivative(
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS moments are unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
         )),
+        LinkFunction::BetaLogistic => Err(EstimationError::InvalidInput(
+            "state-less integrated Beta-Logistic moments are unsupported; use link-aware prediction APIs with explicit (delta, epsilon)".to_string(),
+        )),
         LinkFunction::Identity => Ok(IntegratedMeanDerivative {
             mean: mu,
             dmean_dmu: 1.0,
@@ -1968,6 +1971,9 @@ pub fn integrated_inverse_link_jet(
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS jet is unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
         )),
+        LinkFunction::BetaLogistic => Err(EstimationError::InvalidInput(
+            "state-less integrated Beta-Logistic jet is unsupported; use link-aware prediction APIs with explicit (delta, epsilon)".to_string(),
+        )),
         LinkFunction::Identity => Ok(IntegratedInverseLinkJet {
             mean: mu,
             d1: 1.0,
@@ -1985,6 +1991,12 @@ fn sas_point_jet(x: f64, epsilon: f64, log_delta: f64) -> (f64, f64, f64, f64) {
 }
 
 #[inline]
+fn beta_logistic_point_jet(x: f64, delta: f64, epsilon: f64) -> (f64, f64, f64, f64) {
+    let jet = beta_logistic_inverse_link_jet(x, delta, epsilon);
+    (jet.mu, jet.d1, jet.d2, jet.d3)
+}
+
+#[inline]
 fn integrated_sas_jet_ghq(
     ctx: &QuadratureContext,
     mu: f64,
@@ -1993,6 +2005,29 @@ fn integrated_sas_jet_ghq(
 ) -> IntegratedInverseLinkJet {
     let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive_jet4(ctx, mu, sigma, |x| {
         sas_point_jet(x, sas_state.epsilon, sas_state.log_delta)
+    });
+    IntegratedInverseLinkJet {
+        mean: mean.clamp(1e-12, 1.0 - 1e-12),
+        d1: d1.max(0.0),
+        d2,
+        d3,
+        mode: if sigma <= 1e-10 {
+            IntegratedExpectationMode::ExactClosedForm
+        } else {
+            IntegratedExpectationMode::QuadratureFallback
+        },
+    }
+}
+
+#[inline]
+fn integrated_beta_logistic_jet_ghq(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+    beta_state: &SasLinkState,
+) -> IntegratedInverseLinkJet {
+    let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive_jet4(ctx, mu, sigma, |x| {
+        beta_logistic_point_jet(x, beta_state.log_delta, beta_state.epsilon)
     });
     IntegratedInverseLinkJet {
         mean: mean.clamp(1e-12, 1.0 - 1e-12),
@@ -2030,6 +2065,15 @@ pub fn integrated_inverse_link_jet_with_state(
             )
         })?;
         return Ok(integrated_sas_jet_ghq(quad_ctx, mu, sigma, sas));
+    }
+    if matches!(link, LinkFunction::BetaLogistic) {
+        let state = sas_link_state.ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "state-less integrated Beta-Logistic jet is unsupported; explicit link state is required"
+                    .to_string(),
+            )
+        })?;
+        return Ok(integrated_beta_logistic_jet_ghq(quad_ctx, mu, sigma, state));
     }
     integrated_inverse_link_jet(quad_ctx, link, mu, sigma)
 }
@@ -2104,6 +2148,25 @@ pub fn integrated_family_moments_jet_with_state(
             let jet = integrated_inverse_link_jet_with_state(
                 quad_ctx,
                 LinkFunction::Sas,
+                e,
+                se,
+                mixture_link_state,
+                sas_link_state,
+            )?;
+            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
+        LikelihoodFamily::BinomialBetaLogistic => {
+            let jet = integrated_inverse_link_jet_with_state(
+                quad_ctx,
+                LinkFunction::BetaLogistic,
                 e,
                 se,
                 mixture_link_state,
