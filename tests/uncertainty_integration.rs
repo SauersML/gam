@@ -41,6 +41,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![1],
+            adaptive_regularization: None,
             linear_constraints: None,
         },
     )
@@ -110,6 +111,7 @@ fn prediction_uncertainty_is_finite_and_well_shaped() {
             max_iter: 50,
             tol: 1e-6,
             nullspace_dims: vec![1],
+            adaptive_regularization: None,
             linear_constraints: None,
         },
     )
@@ -184,6 +186,7 @@ fn gaussian_prediction_intervals_include_observation_noise() {
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![1],
+            adaptive_regularization: None,
             linear_constraints: None,
         },
     )
@@ -248,6 +251,7 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![1],
+            adaptive_regularization: None,
             linear_constraints: None,
         },
     )
@@ -321,6 +325,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
             max_iter: 80,
             tol: 1e-6,
             nullspace_dims: vec![1],
+            adaptive_regularization: None,
             linear_constraints: None,
         },
     )
