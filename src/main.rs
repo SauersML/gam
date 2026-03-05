@@ -15,10 +15,11 @@ use gam::basis::{
     evaluate_bspline_derivative_scalar,
 };
 use gam::estimate::{
-    ContinuousSmoothnessOrderStatus, EstimationError, ExternalOptimOptions, ExternalOptimResult,
-    FitOptions, FitResult, ModelSummary, ParametricTermSummary, SmoothTermSummary,
-    compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
-    predict_gam_posterior_mean_with_fit, predict_gam_with_uncertainty,
+    AdaptiveRegularizationOptions, ContinuousSmoothnessOrderStatus, EstimationError,
+    ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult, ModelSummary,
+    ParametricTermSummary, SmoothTermSummary, compute_continuous_smoothness_order, fit_gam,
+    optimize_external_design, predict_gam, predict_gam_posterior_mean_with_fit,
+    predict_gam_with_uncertainty,
 };
 use gam::families::sigma_link::{
     bounded_sigma_and_deriv_from_eta as sigma_and_deriv_from_eta,
@@ -44,7 +45,10 @@ use gam::joint::{
     JointLinkGeometry, JointModelConfig, JointModelResult, fit_joint_model_engine, predict_joint,
 };
 use gam::matrix::DesignMatrix;
-use gam::mixture_link::{inverse_link_jet_for_inverse_link, state_from_sas_spec, state_from_spec};
+use gam::mixture_link::{
+    inverse_link_jet_for_inverse_link, state_from_beta_logistic_spec, state_from_sas_spec,
+    state_from_spec,
+};
 use gam::probability::{normal_cdf_approx, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
@@ -52,11 +56,13 @@ use gam::smooth::{
     TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
     build_term_collection_design, fit_term_collection_with_spatial_length_scale_optimization,
 };
+use gam::smoothing::{SmoothingBfgsOptions, optimize_log_smoothing_with_multistart};
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_location_scale_probit::{
-    CovariateBlockInput, ResidualDistribution, ResidualDistributionOps,
+    CovariateBlockInput, LinkWiggleBlockInput, ResidualDistribution,
     SurvivalLocationScaleProbitPredictInput, SurvivalLocationScaleProbitSpec, TimeBlockInput,
     fit_survival_location_scale_probit, predict_survival_location_scale_probit,
+    residual_distribution_inverse_link,
 };
 use gam::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec,
@@ -125,6 +131,12 @@ struct FitArgs {
     /// Optimize SAS params in the outer loop when SAS link is active.
     #[arg(long = "optimize-sas", default_value_t = true)]
     optimize_sas: bool,
+    /// Optional initial Beta-Logistic params as `epsilon,delta` (used with `--link beta-logistic`).
+    #[arg(long = "beta-logistic-init")]
+    beta_logistic_init: Option<String>,
+    /// Optimize Beta-Logistic params in the outer loop when Beta-Logistic link is active.
+    #[arg(long = "optimize-beta-logistic", default_value_t = true)]
+    optimize_beta_logistic: bool,
     #[arg(long = "flexible-link", default_value_t = false)]
     flexible_link: bool,
     #[arg(long = "firth", default_value_t = false)]
@@ -147,6 +159,75 @@ struct FitArgs {
     /// Add a ridge-style double-penalty to the probit link wiggle block.
     #[arg(long = "link-wiggle-double-penalty", default_value_t = true)]
     link_wiggle_double_penalty: bool,
+    /// Optional override for GAMLSS outer smoothing iterations.
+    #[arg(long = "gamlss-outer-max-iter")]
+    gamlss_outer_max_iter: Option<usize>,
+    /// Optional override for GAMLSS inner blockwise cycles per outer evaluation.
+    #[arg(long = "gamlss-inner-max-cycles")]
+    gamlss_inner_max_cycles: Option<usize>,
+    /// Optional override for GAMLSS outer gradient tolerance.
+    #[arg(long = "gamlss-outer-tol")]
+    gamlss_outer_tol: Option<f64>,
+    /// Survival target for Surv(...) formulas: `net` or `crude`.
+    #[arg(long = "spec", default_value = "net")]
+    spec: String,
+    /// Survival likelihood mode for Surv(...) formulas.
+    #[arg(long = "survival-likelihood", default_value = "transformation")]
+    survival_likelihood: String,
+    /// Residual distribution for probit-location-scale survival mode.
+    #[arg(long = "survival-distribution", default_value = "gaussian")]
+    survival_distribution: String,
+    /// Optimize free blended-link logits in survival probit-location-scale mode.
+    #[arg(long = "optimize-mixture", default_value_t = true)]
+    optimize_mixture: bool,
+    /// Optional anchor time for survival probit-location-scale mode.
+    #[arg(long = "survival-time-anchor")]
+    survival_time_anchor: Option<f64>,
+    /// Baseline target for transformation survival mode.
+    #[arg(long = "baseline-target", default_value = "linear")]
+    baseline_target: String,
+    /// Weibull baseline scale (>0) when baseline-target=weibull.
+    #[arg(long = "baseline-scale")]
+    baseline_scale: Option<f64>,
+    /// Baseline shape parameter (Weibull/Gompertz as applicable).
+    #[arg(long = "baseline-shape")]
+    baseline_shape: Option<f64>,
+    /// Gompertz baseline rate when baseline-target=gompertz.
+    #[arg(long = "baseline-rate")]
+    baseline_rate: Option<f64>,
+    /// Time basis for survival mode (`linear`, `ispline`, ...).
+    #[arg(long = "time-basis", default_value = "linear")]
+    time_basis: String,
+    /// Degree for survival time basis.
+    #[arg(long = "time-degree", default_value_t = 3)]
+    time_degree: usize,
+    /// Number of internal knots for non-linear survival time bases.
+    #[arg(long = "time-num-internal-knots", default_value_t = 8)]
+    time_num_internal_knots: usize,
+    /// Initial smoothing lambda for survival time basis penalty.
+    #[arg(long = "time-smooth-lambda", default_value_t = 1e-2)]
+    time_smooth_lambda: f64,
+    /// Ridge regularization for survival solver.
+    #[arg(long = "ridge-lambda", default_value_t = 1e-6)]
+    ridge_lambda: f64,
+    /// Enable MM-based spatial adaptive regularization for compatible smooth terms.
+    #[arg(long = "adaptive-regularization", default_value_t = false)]
+    adaptive_regularization: bool,
+    /// Max MM outer iterations when adaptive regularization is enabled.
+    #[arg(long = "adaptive-max-mm-iter", default_value_t = 10)]
+    adaptive_max_mm_iter: usize,
+    /// Relative beta-change tolerance for adaptive MM convergence.
+    #[arg(long = "adaptive-beta-rel-tol", default_value_t = 1e-3)]
+    adaptive_beta_rel_tol: f64,
+    /// Stabilizer epsilon floor for adaptive weights.
+    #[arg(long = "adaptive-min-epsilon", default_value_t = 1e-8)]
+    adaptive_min_epsilon: f64,
+    /// Lower clamp for adaptive weights.
+    #[arg(long = "adaptive-weight-floor", default_value_t = 1e-8)]
+    adaptive_weight_floor: f64,
+    /// Upper clamp for adaptive weights.
+    #[arg(long = "adaptive-weight-ceiling", default_value_t = 1e8)]
+    adaptive_weight_ceiling: f64,
     #[arg(long = "out")]
     out: Option<PathBuf>,
 }
@@ -190,6 +271,36 @@ struct SurvivalArgs {
     /// Residual distribution used by probit-location-scale transformation survival mode.
     #[arg(long = "survival-distribution", default_value = "gaussian")]
     survival_distribution: String,
+    /// Optional inverse link override for probit-location-scale survival mode.
+    #[arg(long = "link")]
+    link: Option<String>,
+    /// Optional comma-separated initial free logits for blended inverse links (length K-1).
+    #[arg(long = "mixture-rho")]
+    mixture_rho: Option<String>,
+    /// Optional initial SAS params as `epsilon,log_delta` (used with `link=sas`).
+    #[arg(long = "sas-init")]
+    sas_init: Option<String>,
+    /// Optional initial Beta-Logistic params as `epsilon,delta` (used with `link=beta-logistic`).
+    #[arg(long = "beta-logistic-init")]
+    beta_logistic_init: Option<String>,
+    /// Optimize free blended-link logits (`--mixture-rho`) in survival probit-location-scale mode.
+    #[arg(long = "optimize-mixture", default_value_t = true)]
+    optimize_mixture: bool,
+    /// Enable learnable monotone wiggle on latent q for survival probit-location-scale.
+    #[arg(long = "learn-link-wiggle", default_value_t = false)]
+    learn_link_wiggle: bool,
+    /// B-spline degree for survival link wiggle basis.
+    #[arg(long = "link-wiggle-degree", default_value_t = 3)]
+    link_wiggle_degree: usize,
+    /// Number of internal knots for survival link wiggle basis.
+    #[arg(long = "link-wiggle-internal-knots", default_value_t = 7)]
+    link_wiggle_internal_knots: usize,
+    /// Smoothness order for survival link wiggle spline.
+    #[arg(long = "link-wiggle-penalty-order", value_enum, default_value_t = LinkWigglePenaltyMode::Curvature)]
+    link_wiggle_penalty_order: LinkWigglePenaltyMode,
+    /// Add ridge-style double penalty to survival link wiggle block.
+    #[arg(long = "link-wiggle-double-penalty", default_value_t = true)]
+    link_wiggle_double_penalty: bool,
     /// Optional anchor time for time-baseline identifiability in
     /// survival-likelihood=probit-location-scale. If omitted, earliest entry time is used.
     #[arg(long = "survival-time-anchor")]
@@ -378,6 +489,29 @@ fn run() -> Result<(), String> {
     }
 }
 
+fn blockwise_options_from_fit_args(args: &FitArgs) -> Result<gam::BlockwiseFitOptions, String> {
+    let mut options = gam::BlockwiseFitOptions::default();
+    if let Some(v) = args.gamlss_outer_max_iter {
+        if v == 0 {
+            return Err("--gamlss-outer-max-iter must be >= 1".to_string());
+        }
+        options.outer_max_iter = v;
+    }
+    if let Some(v) = args.gamlss_inner_max_cycles {
+        if v == 0 {
+            return Err("--gamlss-inner-max-cycles must be >= 1".to_string());
+        }
+        options.inner_max_cycles = v;
+    }
+    if let Some(v) = args.gamlss_outer_tol {
+        if !v.is_finite() || v <= 0.0 {
+            return Err("--gamlss-outer-tol must be finite and > 0".to_string());
+        }
+        options.outer_tol = v;
+    }
+    Ok(options)
+}
+
 fn run_fit(args: FitArgs) -> Result<(), String> {
     let formula_text = choose_formula(&args)?;
     let parsed = parse_formula(&formula_text)?;
@@ -385,16 +519,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         if !matches!(args.family, FamilyArg::Auto | FamilyArg::RoystonParmar) {
             return Err("--family with Surv(...) must be auto or royston-parmar".to_string());
         }
-        if args.predict_noise.is_some()
-            || args.link.is_some()
-            || args.mixture_rho.is_some()
-            || args.sas_init.is_some()
-            || args.flexible_link
-            || args.firth
-            || args.learn_link_wiggle
-        {
+        if args.predict_noise.is_some() || args.flexible_link || args.firth {
             return Err(
-                "Surv(...) formulas use survival fitting mode; remove binomial/location-scale/link-specific flags".to_string(),
+                "Surv(...) formulas use survival fitting mode; remove binomial/location-scale-only flags (--predict-noise, --flexible-link, --firth)"
+                    .to_string(),
             );
         }
         let rhs = formula_rhs_text(&formula_text)?;
@@ -404,19 +532,29 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             exit,
             event,
             formula: rhs,
-            spec: "net".to_string(),
-            survival_likelihood: "transformation".to_string(),
-            survival_distribution: "gaussian".to_string(),
-            survival_time_anchor: None,
-            baseline_target: "linear".to_string(),
-            baseline_scale: None,
-            baseline_shape: None,
-            baseline_rate: None,
-            time_basis: "linear".to_string(),
-            time_degree: 3,
-            time_num_internal_knots: 8,
-            time_smooth_lambda: 1e-2,
-            ridge_lambda: 1e-6,
+            spec: args.spec.clone(),
+            survival_likelihood: args.survival_likelihood.clone(),
+            survival_distribution: args.survival_distribution.clone(),
+            link: args.link.clone(),
+            mixture_rho: args.mixture_rho.clone(),
+            sas_init: args.sas_init.clone(),
+            beta_logistic_init: args.beta_logistic_init.clone(),
+            optimize_mixture: args.optimize_mixture,
+            learn_link_wiggle: args.learn_link_wiggle,
+            link_wiggle_degree: args.link_wiggle_degree,
+            link_wiggle_internal_knots: args.link_wiggle_internal_knots,
+            link_wiggle_penalty_order: args.link_wiggle_penalty_order,
+            link_wiggle_double_penalty: args.link_wiggle_double_penalty,
+            survival_time_anchor: args.survival_time_anchor,
+            baseline_target: args.baseline_target.clone(),
+            baseline_scale: args.baseline_scale,
+            baseline_shape: args.baseline_shape,
+            baseline_rate: args.baseline_rate,
+            time_basis: args.time_basis.clone(),
+            time_degree: args.time_degree,
+            time_num_internal_knots: args.time_num_internal_knots,
+            time_smooth_lambda: args.time_smooth_lambda,
+            ridge_lambda: args.ridge_lambda,
             out: args.out.clone(),
         };
         return run_survival(surv_args);
@@ -474,7 +612,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         None
     };
     let sas_link_spec = if let Some(choice) = link_choice.as_ref() {
-        if choice.link == LinkFunction::Sas && choice.mixture_components.is_none() {
+        if choice.mixture_components.is_none() && choice.link == LinkFunction::Sas {
+            if args.beta_logistic_init.is_some() {
+                return Err("--beta-logistic-init requires --link beta-logistic".to_string());
+            }
             if let Some(raw) = args.sas_init.as_deref() {
                 let vals = parse_comma_f64(raw, "--sas-init")?;
                 if vals.len() != 2 {
@@ -493,15 +634,43 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     initial_log_delta: 0.0,
                 })
             }
+        } else if choice.mixture_components.is_none() && choice.link == LinkFunction::BetaLogistic {
+            if args.sas_init.is_some() {
+                return Err("--sas-init requires --link sas".to_string());
+            }
+            if let Some(raw) = args.beta_logistic_init.as_deref() {
+                let vals = parse_comma_f64(raw, "--beta-logistic-init")?;
+                if vals.len() != 2 {
+                    return Err(format!(
+                        "--beta-logistic-init expects two values: epsilon,delta (got {})",
+                        vals.len()
+                    ));
+                }
+                Some(SasLinkSpec {
+                    initial_epsilon: vals[0],
+                    initial_log_delta: vals[1],
+                })
+            } else {
+                Some(SasLinkSpec {
+                    initial_epsilon: 0.0,
+                    initial_log_delta: 0.0,
+                })
+            }
         } else {
             if args.sas_init.is_some() {
                 return Err("--sas-init requires --link sas".to_string());
+            }
+            if args.beta_logistic_init.is_some() {
+                return Err("--beta-logistic-init requires --link beta-logistic".to_string());
             }
             None
         }
     } else {
         if args.sas_init.is_some() {
             return Err("--sas-init requires --link sas".to_string());
+        }
+        if args.beta_logistic_init.is_some() {
+            return Err("--beta-logistic-init requires --link beta-logistic".to_string());
         }
         None
     };
@@ -658,6 +827,15 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 let state = state_from_sas_spec(spec)
                     .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
                 InverseLink::Sas(state)
+            }
+            LikelihoodFamily::BinomialBetaLogistic => {
+                let spec = *sas_link_spec.as_ref().ok_or_else(|| {
+                    "binomial beta-logistic location-scale fitting requires --link beta-logistic"
+                        .to_string()
+                })?;
+                let state = state_from_beta_logistic_spec(spec)
+                    .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
+                InverseLink::BetaLogistic(state)
             }
             _ => InverseLink::Standard(effective_link),
         };
@@ -842,6 +1020,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                         base_link: Some(InverseLink::Sas(*state)),
                     };
                 }
+                InverseLink::BetaLogistic(state) => {
+                    model.family_state = FittedFamily::LocationScale {
+                        likelihood: LikelihoodFamily::BinomialBetaLogistic,
+                        base_link: Some(InverseLink::BetaLogistic(*state)),
+                    };
+                }
                 InverseLink::Mixture(state) => {
                     model.family_state = FittedFamily::LocationScale {
                         likelihood: LikelihoodFamily::BinomialMixture,
@@ -879,6 +1063,28 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     let fit_max_iter = 80usize;
     let fit_tol = 1e-6f64;
+    if args.adaptive_regularization {
+        if args.adaptive_max_mm_iter == 0 {
+            return Err("--adaptive-max-mm-iter must be >= 1".to_string());
+        }
+        if !(args.adaptive_beta_rel_tol.is_finite() && args.adaptive_beta_rel_tol > 0.0) {
+            return Err("--adaptive-beta-rel-tol must be finite and > 0".to_string());
+        }
+        if !(args.adaptive_min_epsilon.is_finite() && args.adaptive_min_epsilon > 0.0) {
+            return Err("--adaptive-min-epsilon must be finite and > 0".to_string());
+        }
+        if !(args.adaptive_weight_floor.is_finite() && args.adaptive_weight_floor > 0.0) {
+            return Err("--adaptive-weight-floor must be finite and > 0".to_string());
+        }
+        if !(args.adaptive_weight_ceiling.is_finite()
+            && args.adaptive_weight_ceiling >= args.adaptive_weight_floor)
+        {
+            return Err(
+                "--adaptive-weight-ceiling must be finite and >= --adaptive-weight-floor"
+                    .to_string(),
+            );
+        }
+    }
     let weights = Array1::ones(ds.values.nrows());
     let offset = Array1::zeros(ds.values.nrows());
     if let Some(choice) = link_choice.as_ref() {
@@ -989,16 +1195,18 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     training_headers: Some(ds.headers.clone()),
                     resolved_term_spec: Some(initial_frozen_spec.clone()),
                     resolved_term_spec_noise: None,
+                    adaptive_regularization_diagnostics: None,
                 });
                 write_model_json(&out, &model)?;
             }
             return Ok(());
         }
     }
-    let (fit, design, resolved_spec): (
+    let (fit, design, resolved_spec, adaptive_regularization_diagnostics): (
         FitResult,
         gam::smooth::TermCollectionDesign,
         TermCollectionSpec,
+        Option<gam::smooth::AdaptiveRegularizationDiagnostics>,
     ) = if args.firth {
         let design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
@@ -1028,20 +1236,37 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             },
         )
         .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;
-        (fit_result_from_external(ext), design, spec.clone())
+        (fit_result_from_external(ext), design, spec.clone(), None)
     } else {
         let bootstrap_design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
+        let adaptive_opts = if args.adaptive_regularization {
+            Some(AdaptiveRegularizationOptions {
+                enabled: true,
+                max_mm_iter: args.adaptive_max_mm_iter,
+                beta_rel_tol: args.adaptive_beta_rel_tol,
+                min_epsilon: args.adaptive_min_epsilon,
+                weight_floor: args.adaptive_weight_floor,
+                weight_ceiling: args.adaptive_weight_ceiling,
+            })
+        } else {
+            None
+        };
         let base_fit_options = FitOptions {
             mixture_link: mixture_link_spec.clone(),
             optimize_mixture: true,
             sas_link: sas_link_spec,
-            optimize_sas: args.optimize_sas && sas_link_spec.is_some(),
+            optimize_sas: sas_link_spec.is_some()
+                && match effective_link {
+                    LinkFunction::Sas => args.optimize_sas,
+                    LinkFunction::BetaLogistic => args.optimize_beta_logistic,
+                    _ => false,
+                },
             max_iter: fit_max_iter,
             tol: fit_tol,
             nullspace_dims: vec![],
             linear_constraints: bootstrap_design.linear_constraints.clone(),
-            adaptive_regularization: None,
+            adaptive_regularization: adaptive_opts,
         };
         let fitted = match fit_term_collection_with_spatial_length_scale_optimization(
             ds.values.view(),
@@ -1086,7 +1311,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 }
             }
         };
-        (fitted.fit, fitted.design, fitted.resolved_spec)
+        (
+            fitted.fit,
+            fitted.design,
+            fitted.resolved_spec,
+            fitted.adaptive_diagnostics,
+        )
     };
 
     let frozen_spec = freeze_term_collection_spec(&resolved_spec, &design)?;
@@ -1156,6 +1386,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             training_headers: Some(ds.headers.clone()),
             resolved_term_spec: Some(frozen_spec),
             resolved_term_spec_noise: None,
+            adaptive_regularization_diagnostics,
         });
         write_model_json(&out, &model)?;
     }
@@ -1170,7 +1401,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         serde_json::from_str(&payload).map_err(|e| format!("failed to parse model json: {e}"))?;
     validate_saved_model_for_inference_stability(&model)?;
     let saved_mixture = model.saved_mixture_state()?;
-    let saved_sas = model.saved_sas_state()?;
+    let saved_sas = model
+        .saved_sas_state()?
+        .or(model.saved_beta_logistic_state()?);
     let saved_link_kind = model.resolved_inverse_link()?;
     let saved_mixture_param_cov = parse_optional_covariance(
         model.mixture_link_param_covariance.as_ref(),
@@ -1253,9 +1486,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 let (eta0, _) = evaluate_survival_baseline(age_exit[i], &baseline_cfg)?;
                 eta_offset_exit[i] = eta0;
             }
-            let distribution = parse_survival_distribution(
-                model.survival_distribution.as_deref().unwrap_or("gaussian"),
-            )?;
+            let survival_inverse_link = resolve_survival_inverse_link_from_saved(&model)?;
             let sigma_min = model.survival_sigma_min.unwrap_or(0.05);
             let sigma_max = model.survival_sigma_max.unwrap_or(20.0);
             let eta_t = DesignMatrix::Dense(cov_design.design.clone())
@@ -1263,23 +1494,41 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             let eta_ls = DesignMatrix::Dense(cov_design.design.clone())
                 .matrix_vector_multiply(&beta_log_sigma);
             let (sigma, ds) = sigma_and_deriv_from_eta(eta_ls.view(), sigma_min, sigma_max);
+            let beta_link_wiggle = model
+                .beta_wiggle
+                .as_ref()
+                .map(|v| Array1::from_vec(v.clone()));
+            let x_link_wiggle = if beta_link_wiggle.is_some() {
+                let q0 = Array1::from_iter(
+                    eta_t
+                        .iter()
+                        .zip(sigma.iter())
+                        .map(|(&t, &s)| -t / s.max(1e-12)),
+                );
+                saved_probit_wiggle_design(&q0, &model)?.map(DesignMatrix::Dense)
+            } else {
+                None
+            };
             let pred = predict_survival_location_scale_probit(
                 &SurvivalLocationScaleProbitPredictInput {
                     x_time_exit: time_build.x_exit_time.clone(),
                     eta_time_offset_exit: eta_offset_exit.clone(),
                     x_threshold: DesignMatrix::Dense(cov_design.design.clone()),
                     x_log_sigma: DesignMatrix::Dense(cov_design.design.clone()),
+                    x_link_wiggle: x_link_wiggle.clone(),
                     sigma_min,
                     sigma_max,
-                    distribution,
+                    inverse_link: survival_inverse_link.clone(),
                 },
                 &gam::survival_location_scale_probit::SurvivalLocationScaleProbitFitResult {
                     beta_time: beta_time.clone(),
                     beta_threshold: beta_threshold.clone(),
                     beta_log_sigma: beta_log_sigma.clone(),
+                    beta_link_wiggle: beta_link_wiggle.clone(),
                     lambdas_time: Array1::zeros(0),
                     lambdas_threshold: Array1::zeros(0),
                     lambdas_log_sigma: Array1::zeros(0),
+                    lambdas_link_wiggle: None,
                     log_likelihood: 0.0,
                     penalized_objective: 0.0,
                     iterations: 0,
@@ -1290,53 +1539,59 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             )
             .map_err(|e| format!("survival probit-location-scale predict failed: {e}"))?;
             let (mean, eta_se_default) = if args.mode == PredictModeArg::PosteriorMean {
-                let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
-                let p_time = beta_time.len();
-                let p_t = beta_threshold.len();
-                let p_ls = beta_log_sigma.len();
-                let p_total = p_time + p_t + p_ls;
-                if cov_mat.nrows() != p_total || cov_mat.ncols() != p_total {
-                    return Err(format!(
-                        "covariance shape mismatch for probit-location-scale survival: got {}x{}, expected {}x{}",
-                        cov_mat.nrows(),
-                        cov_mat.ncols(),
-                        p_total,
-                        p_total
-                    ));
-                }
-                let mut grad = Array2::<f64>::zeros((n, p_total));
-                for i in 0..n {
-                    for j in 0..p_time {
-                        grad[[i, j]] = -time_build.x_exit_time[[i, j]];
+                if beta_link_wiggle.is_some() {
+                    (pred.survival_prob.clone(), None)
+                } else {
+                    let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
+                    let p_time = beta_time.len();
+                    let p_t = beta_threshold.len();
+                    let p_ls = beta_log_sigma.len();
+                    let p_total = p_time + p_t + p_ls;
+                    if cov_mat.nrows() != p_total || cov_mat.ncols() != p_total {
+                        return Err(format!(
+                            "covariance shape mismatch for probit-location-scale survival: got {}x{}, expected {}x{}",
+                            cov_mat.nrows(),
+                            cov_mat.ncols(),
+                            p_total,
+                            p_total
+                        ));
                     }
-                    let inv_sigma = 1.0 / sigma[i].max(1e-12);
-                    for j in 0..p_t {
-                        grad[[i, p_time + j]] = -cov_design.design[[i, j]] * inv_sigma;
+                    let mut grad = Array2::<f64>::zeros((n, p_total));
+                    for i in 0..n {
+                        for j in 0..p_time {
+                            grad[[i, j]] = -time_build.x_exit_time[[i, j]];
+                        }
+                        let inv_sigma = 1.0 / sigma[i].max(1e-12);
+                        for j in 0..p_t {
+                            grad[[i, p_time + j]] = -cov_design.design[[i, j]] * inv_sigma;
+                        }
+                        let coeff_ls = eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
+                        for j in 0..p_ls {
+                            grad[[i, p_time + p_t + j]] = coeff_ls * cov_design.design[[i, j]];
+                        }
                     }
-                    let coeff_ls = eta_t[i] * ds[i] / sigma[i].powi(2).max(1e-12);
-                    for j in 0..p_ls {
-                        grad[[i, p_time + p_t + j]] = coeff_ls * cov_design.design[[i, j]];
-                    }
-                }
-                let eta_se = linear_predictor_se(grad.view(), &cov_mat);
-                let posterior_pred =
+                    let eta_se = linear_predictor_se(grad.view(), &cov_mat);
+                    let posterior_pred =
                     gam::survival_location_scale_probit::predict_survival_location_scale_probit_posterior_mean(
                         &SurvivalLocationScaleProbitPredictInput {
                             x_time_exit: time_build.x_exit_time.clone(),
                             eta_time_offset_exit: eta_offset_exit.clone(),
                             x_threshold: DesignMatrix::Dense(cov_design.design.clone()),
                             x_log_sigma: DesignMatrix::Dense(cov_design.design.clone()),
+                            x_link_wiggle: x_link_wiggle.clone(),
                             sigma_min,
                             sigma_max,
-                            distribution,
+                            inverse_link: survival_inverse_link.clone(),
                         },
                         &gam::survival_location_scale_probit::SurvivalLocationScaleProbitFitResult {
                             beta_time: beta_time.clone(),
                             beta_threshold: beta_threshold.clone(),
                             beta_log_sigma: beta_log_sigma.clone(),
+                            beta_link_wiggle: beta_link_wiggle.clone(),
                             lambdas_time: Array1::zeros(0),
                             lambdas_threshold: Array1::zeros(0),
                             lambdas_log_sigma: Array1::zeros(0),
+                            lambdas_link_wiggle: None,
                             log_likelihood: 0.0,
                             penalized_objective: 0.0,
                             iterations: 0,
@@ -1351,8 +1606,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                             "survival probit-location-scale posterior-mean predict failed: {e}"
                         )
                     })?;
-                let mean = posterior_pred.survival_prob;
-                (mean, Some(eta_se))
+                    let mean = posterior_pred.survival_prob;
+                    (mean, Some(eta_se))
+                }
             } else {
                 (pred.survival_prob.clone(), None)
             };
@@ -1362,6 +1618,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                 }
                 let eta_se = if let Some(se) = eta_se_default.as_ref() {
                     se.clone()
+                } else if beta_link_wiggle.is_some() {
+                    Array1::zeros(n)
                 } else {
                     let cov_mat = covariance_from_model(&model, args.covariance_mode)?;
                     let p_time = beta_time.len();
@@ -1401,7 +1659,9 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
                         pred.eta[i],
                         eta_se[i],
                         |x| {
-                            let p = distribution.cdf(x).clamp(0.0, 1.0);
+                            let p = inverse_link_jet_for_inverse_link(&survival_inverse_link, x)
+                                .map(|j| j.mu.clamp(0.0, 1.0))
+                                .unwrap_or_else(|_| normal_cdf_approx(x).clamp(0.0, 1.0));
                             p * p
                         },
                     );
@@ -2006,6 +2266,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
             | LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog
             | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture
     );
     let fit_for_predict = fit_result_from_saved_model_for_prediction(&model)?;
@@ -2361,14 +2622,6 @@ fn parse_survival_distribution(raw: &str) -> Result<ResidualDistribution, String
         other => Err(format!(
             "unsupported --survival-distribution '{other}'; use gaussian|gumbel|logistic"
         )),
-    }
-}
-
-fn survival_distribution_name(dist: ResidualDistribution) -> &'static str {
-    match dist {
-        ResidualDistribution::Gaussian => "gaussian",
-        ResidualDistribution::Gumbel => "gumbel",
-        ResidualDistribution::Logistic => "logistic",
     }
 }
 
@@ -3128,7 +3381,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         other => return Err(format!("unsupported --spec '{other}'; use net|crude")),
     };
     let likelihood_mode = parse_survival_likelihood_mode(&args.survival_likelihood)?;
-    let survival_distribution = parse_survival_distribution(&args.survival_distribution)?;
+    let _survival_distribution = parse_survival_distribution(&args.survival_distribution)?;
+    let survival_inverse_link = parse_survival_inverse_link(&args)?;
     if likelihood_mode == SurvivalLikelihoodMode::Weibull {
         if !args.baseline_target.eq_ignore_ascii_case("linear")
             || args.baseline_scale.is_some()
@@ -3234,47 +3488,152 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let lambda0 = time_build.smooth_lambda.unwrap_or(1e-2).max(1e-12).ln();
             time_initial_log_lambdas = Some(Array1::from_elem(time_build.penalties.len(), lambda0));
         }
-        let probit_spec = SurvivalLocationScaleProbitSpec {
-            age_entry: age_entry.clone(),
-            age_exit: age_exit.clone(),
-            event_target: event_target.mapv(f64::from),
-            weights: weights.clone(),
-            sigma_min: 0.05,
-            sigma_max: 20.0,
-            distribution: survival_distribution,
-            derivative_guard: 1e-8,
-            derivative_softness: 1e-6,
-            time_anchor: args.survival_time_anchor,
-            max_iter: 400,
-            tol: 1e-6,
-            time_block: TimeBlockInput {
-                design_entry: time_build.x_entry_time.clone(),
-                design_exit: time_build.x_exit_time.clone(),
-                design_derivative_exit: time_build.x_derivative_time.clone(),
-                offset_entry: eta_offset_entry.clone(),
-                offset_exit: eta_offset_exit.clone(),
-                derivative_offset_exit: derivative_offset_exit.clone(),
-                penalties: time_build.penalties.clone(),
-                initial_log_lambdas: time_initial_log_lambdas,
-                initial_beta: None,
-            },
-            threshold_block: CovariateBlockInput {
-                design: DesignMatrix::Dense(cov_design.design.clone()),
-                offset: Array1::zeros(n),
-                penalties: Vec::new(),
-                initial_log_lambdas: None,
-                initial_beta: None,
-            },
-            log_sigma_block: CovariateBlockInput {
-                design: DesignMatrix::Dense(cov_design.design.clone()),
-                offset: Array1::zeros(n),
-                penalties: Vec::new(),
-                initial_log_lambdas: None,
-                initial_beta: None,
-            },
+        let build_spec = |inverse_link: InverseLink,
+                          link_wiggle_block: Option<LinkWiggleBlockInput>|
+         -> SurvivalLocationScaleProbitSpec {
+            SurvivalLocationScaleProbitSpec {
+                age_entry: age_entry.clone(),
+                age_exit: age_exit.clone(),
+                event_target: event_target.mapv(f64::from),
+                weights: weights.clone(),
+                sigma_min: 0.05,
+                sigma_max: 20.0,
+                inverse_link,
+                derivative_guard: 1e-8,
+                derivative_softness: 1e-6,
+                time_anchor: args.survival_time_anchor,
+                max_iter: 400,
+                tol: 1e-6,
+                time_block: TimeBlockInput {
+                    design_entry: time_build.x_entry_time.clone(),
+                    design_exit: time_build.x_exit_time.clone(),
+                    design_derivative_exit: time_build.x_derivative_time.clone(),
+                    offset_entry: eta_offset_entry.clone(),
+                    offset_exit: eta_offset_exit.clone(),
+                    derivative_offset_exit: derivative_offset_exit.clone(),
+                    penalties: time_build.penalties.clone(),
+                    initial_log_lambdas: time_initial_log_lambdas.clone(),
+                    initial_beta: None,
+                },
+                threshold_block: CovariateBlockInput {
+                    design: DesignMatrix::Dense(cov_design.design.clone()),
+                    offset: Array1::zeros(n),
+                    penalties: Vec::new(),
+                    initial_log_lambdas: None,
+                    initial_beta: None,
+                },
+                log_sigma_block: CovariateBlockInput {
+                    design: DesignMatrix::Dense(cov_design.design.clone()),
+                    offset: Array1::zeros(n),
+                    penalties: Vec::new(),
+                    initial_log_lambdas: None,
+                    initial_beta: None,
+                },
+                link_wiggle_block,
+            }
         };
-        let fit = fit_survival_location_scale_probit(probit_spec)
-            .map_err(|e| format!("survival probit-location-scale fit failed: {e}"))?;
+
+        let mut fitted_inverse_link = survival_inverse_link.clone();
+        if args.optimize_mixture
+            && let InverseLink::Mixture(state0) = &survival_inverse_link
+            && state0.rho.len() > 0
+        {
+            let components = state0.components.clone();
+            let mut objective = |rho: &Array1<f64>| -> Result<f64, EstimationError> {
+                let state = state_from_spec(&MixtureLinkSpec {
+                    components: components.clone(),
+                    initial_rho: rho.clone(),
+                })
+                .map_err(EstimationError::InvalidInput)?;
+                let fit = fit_survival_location_scale_probit(build_spec(
+                    InverseLink::Mixture(state),
+                    None,
+                ))
+                .map_err(EstimationError::InvalidInput)?;
+                Ok(fit.penalized_objective)
+            };
+            let mut opt = SmoothingBfgsOptions {
+                max_iter: 30,
+                tol: 1e-4,
+                finite_diff_step: 1e-3,
+                ..SmoothingBfgsOptions::default()
+            };
+            // Survival objective is expensive and noisy; lighter multi-start is enough.
+            opt.seed_config.max_seeds = 8;
+            opt.seed_config.screening_budget = 3;
+            opt.seed_config.risk_profile = gam::seeding::SeedRiskProfile::Survival;
+            match optimize_log_smoothing_with_multistart(
+                state0.rho.len(),
+                None,
+                &mut objective,
+                &opt,
+            ) {
+                Ok(opt_res) => {
+                    if let Ok(opt_state) = state_from_spec(&MixtureLinkSpec {
+                        components: components.clone(),
+                        initial_rho: opt_res.rho.clone(),
+                    }) {
+                        eprintln!(
+                            "[survival link opt] optimized mixture rho: dim={} iters={} stationary={} final_obj={:.6e}",
+                            opt_res.rho.len(),
+                            opt_res.iterations,
+                            opt_res.stationary,
+                            opt_res.final_value
+                        );
+                        fitted_inverse_link = InverseLink::Mixture(opt_state);
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[survival link opt] mixture rho optimization failed; using initial rho: {err}"
+                    );
+                }
+            }
+        }
+        let mut wiggle_knots: Option<Array1<f64>> = None;
+        let fit = if args.learn_link_wiggle {
+            if args.link_wiggle_degree < 1 {
+                return Err("--link-wiggle-degree must be >= 1".to_string());
+            }
+            if args.link_wiggle_internal_knots == 0 {
+                return Err("--link-wiggle-internal-knots must be > 0".to_string());
+            }
+            let pilot =
+                fit_survival_location_scale_probit(build_spec(fitted_inverse_link.clone(), None))
+                    .map_err(|e| format!("survival probit-location-scale pilot fit failed: {e}"))?;
+            let eta_t = cov_design.design.dot(&pilot.beta_threshold);
+            let eta_ls = cov_design.design.dot(&pilot.beta_log_sigma);
+            let (sigma, _ds) = sigma_and_deriv_from_eta(eta_ls.view(), 0.05, 20.0);
+            let q_seed = Array1::from_iter(
+                eta_t
+                    .iter()
+                    .zip(sigma.iter())
+                    .map(|(&t, &s)| -t / s.max(1e-12)),
+            );
+            let cfg = WiggleBlockConfig {
+                degree: args.link_wiggle_degree,
+                num_internal_knots: args.link_wiggle_internal_knots,
+                penalty_order: args.link_wiggle_penalty_order.order(),
+                double_penalty: args.link_wiggle_double_penalty,
+            };
+            let (wiggle_block, knots) = build_wiggle_block_input_from_seed(q_seed.view(), &cfg)
+                .map_err(|e| format!("failed to build survival link wiggle block: {e}"))?;
+            wiggle_knots = Some(knots);
+            let wiggle_input = LinkWiggleBlockInput {
+                design: wiggle_block.design,
+                penalties: wiggle_block.penalties,
+                initial_log_lambdas: wiggle_block.initial_log_lambdas,
+                initial_beta: wiggle_block.initial_beta,
+            };
+            fit_survival_location_scale_probit(build_spec(
+                fitted_inverse_link.clone(),
+                Some(wiggle_input),
+            ))
+            .map_err(|e| format!("survival probit-location-scale wiggle fit failed: {e}"))?
+        } else {
+            fit_survival_location_scale_probit(build_spec(fitted_inverse_link.clone(), None))
+                .map_err(|e| format!("survival probit-location-scale fit failed: {e}"))?
+        };
         println!(
             "survival probit-location-scale fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
             fit.converged, fit.iterations, fit.log_likelihood, fit.penalized_objective
@@ -3283,7 +3642,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let mut lambdas = fit.lambdas_time.to_vec();
             lambdas.extend(fit.lambdas_threshold.iter().copied());
             lambdas.extend(fit.lambdas_log_sigma.iter().copied());
-            let fit_result = core_saved_fit_result(
+            if let Some(lw) = fit.lambdas_link_wiggle.as_ref() {
+                lambdas.extend(lw.iter().copied());
+            }
+            let mut fit_result = core_saved_fit_result(
                 fit.beta_time.clone(),
                 Array1::from_vec(lambdas.clone()),
                 1.0,
@@ -3291,6 +3653,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 fit.covariance_conditional.clone(),
                 SavedFitSummary::from_survival_location_scale_fit(&fit)?,
             );
+            apply_inverse_link_state_to_fit_result(&mut fit_result, &fitted_inverse_link);
             let model_out = SavedModel::from_payload(FittedModelPayload {
                 version: MODEL_VERSION,
                 formula,
@@ -3300,14 +3663,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_likelihood: Some(
                         survival_likelihood_mode_name(likelihood_mode).to_string(),
                     ),
-                    survival_distribution: Some(
-                        survival_distribution_name(survival_distribution).to_string(),
-                    ),
+                    survival_distribution: Some(inverse_link_to_saved_string(&fitted_inverse_link)),
                 },
                 family: family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
                 fit_result: Some(fit_result),
                 data_schema: Some(ds.schema.clone()),
-                link: None,
+                link: Some(inverse_link_to_saved_string(&fitted_inverse_link)),
                 mixture_link_param_covariance: None,
                 sas_param_covariance: None,
                 formula_noise: None,
@@ -3320,9 +3681,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 joint_link_transform: None,
                 joint_degree: None,
                 joint_ridge_used: None,
-                probit_wiggle_knots: None,
-                probit_wiggle_degree: None,
-                beta_wiggle: None,
+                probit_wiggle_degree: wiggle_knots.as_ref().map(|_| args.link_wiggle_degree),
+                beta_wiggle: fit.beta_link_wiggle.as_ref().map(|b| b.to_vec()),
+                probit_wiggle_knots: wiggle_knots.as_ref().map(|k| k.to_vec()),
                 survival_entry: Some(args.entry),
                 survival_exit: Some(args.exit),
                 survival_event: Some(args.event),
@@ -3346,12 +3707,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 survival_beta_time: Some(fit.beta_time.to_vec()),
                 survival_beta_threshold: Some(fit.beta_threshold.to_vec()),
                 survival_beta_log_sigma: Some(fit.beta_log_sigma.to_vec()),
-                survival_distribution: Some(
-                    survival_distribution_name(survival_distribution).to_string(),
-                ),
+                survival_distribution: Some(inverse_link_to_saved_string(&fitted_inverse_link)),
                 training_headers: Some(ds.headers.clone()),
                 resolved_term_spec: Some(frozen_term_spec),
                 resolved_term_spec_noise: None,
+                adaptive_regularization_diagnostics: None,
             });
             write_model_json(&out, &model_out)?;
         }
@@ -3555,6 +3915,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             training_headers: Some(ds.headers.clone()),
             resolved_term_spec: Some(frozen_term_spec),
             resolved_term_spec_noise: None,
+            adaptive_regularization_diagnostics: None,
         });
         write_model_json(&out, &model_out)?;
     }
@@ -4832,6 +5193,7 @@ fn build_location_scale_saved_model(
         training_headers: Some(training_headers),
         resolved_term_spec: Some(resolved_term_spec),
         resolved_term_spec_noise: Some(resolved_term_spec_noise),
+        adaptive_regularization_diagnostics: None,
     })
 }
 
@@ -5090,6 +5452,21 @@ fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<()
     if matches!(
         model.family_state,
         FittedFamily::Standard {
+            likelihood: LikelihoodFamily::BinomialBetaLogistic,
+            ..
+        }
+    ) || matches!(
+        model.family_state,
+        FittedFamily::LocationScale {
+            likelihood: LikelihoodFamily::BinomialBetaLogistic,
+            ..
+        }
+    ) {
+        model.saved_beta_logistic_state()?;
+    }
+    if matches!(
+        model.family_state,
+        FittedFamily::Standard {
             likelihood: LikelihoodFamily::BinomialMixture,
             ..
         }
@@ -5119,9 +5496,7 @@ fn validate_saved_model_for_inference_stability(model: &SavedModel) -> Result<()
                     .to_string(),
             );
         }
-        let _dist = parse_survival_distribution(
-            model.survival_distribution.as_deref().unwrap_or("gaussian"),
-        )?;
+        let _link = resolve_survival_inverse_link_from_saved(model)?;
     }
     Ok(())
 }
@@ -6513,6 +6888,7 @@ fn resolve_family(
                 LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
                 LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
                 LinkFunction::Sas => LikelihoodFamily::BinomialSas,
+                LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
             }
         };
         if let Some(explicit) = explicit_family {
@@ -6665,8 +7041,9 @@ fn parse_link_name(v: &str) -> Result<LinkFunction, String> {
         "probit" => Ok(LinkFunction::Probit),
         "cloglog" => Ok(LinkFunction::CLogLog),
         "sas" => Ok(LinkFunction::Sas),
+        "beta-logistic" => Ok(LinkFunction::BetaLogistic),
         other => Err(format!(
-            "unsupported --link '{other}'; use identity|logit|probit|cloglog|sas|blended(...)/mixture(...) or flexible(...)"
+            "unsupported --link '{other}'; use identity|logit|probit|cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
         )),
     }
 }
@@ -6678,6 +7055,7 @@ fn link_name(link: LinkFunction) -> &'static str {
         LinkFunction::Probit => "probit",
         LinkFunction::CLogLog => "cloglog",
         LinkFunction::Sas => "sas",
+        LinkFunction::BetaLogistic => "beta-logistic",
     }
 }
 
@@ -6706,6 +7084,7 @@ fn inverse_link_to_saved_string(link: &InverseLink) -> String {
     match link {
         InverseLink::Standard(link_fn) => link_name(*link_fn).to_string(),
         InverseLink::Sas(_) => "sas".to_string(),
+        InverseLink::BetaLogistic(_) => "beta-logistic".to_string(),
         InverseLink::Mixture(state) => {
             let names = state
                 .components
@@ -6732,8 +7111,263 @@ fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
         InverseLink::Standard(LinkFunction::Sas) | InverseLink::Sas(_) => {
             LikelihoodFamily::BinomialSas
         }
+        InverseLink::Standard(LinkFunction::BetaLogistic) | InverseLink::BetaLogistic(_) => {
+            LikelihoodFamily::BinomialBetaLogistic
+        }
         InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
         InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,
+    }
+}
+
+fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, String> {
+    if let Some(raw) = args.link.as_deref() {
+        let name = raw.trim().to_ascii_lowercase();
+        if name == "loglog" || name == "cauchit" {
+            if args.sas_init.is_some() || args.beta_logistic_init.is_some() {
+                return Err(
+                    "survival --link loglog/cauchit does not accept --sas-init/--beta-logistic-init"
+                        .to_string(),
+                );
+            }
+            if let Some(rho_raw) = args.mixture_rho.as_deref() {
+                let vals = parse_comma_f64(rho_raw, "--mixture-rho")?;
+                if !vals.is_empty() {
+                    return Err(
+                        "--mixture-rho expects zero values for single-component survival links"
+                            .to_string(),
+                    );
+                }
+            }
+            let component = if name == "loglog" {
+                LinkComponent::LogLog
+            } else {
+                LinkComponent::Cauchit
+            };
+            let state = state_from_spec(&MixtureLinkSpec {
+                components: vec![component],
+                initial_rho: Array1::zeros(0),
+            })
+            .map_err(|e| format!("invalid survival {name} link state: {e}"))?;
+            return Ok(InverseLink::Mixture(state));
+        }
+    }
+    let choice = parse_link_choice(args.link.as_deref(), false)?;
+    if let Some(choice) = choice {
+        if !matches!(choice.mode, LinkMode::Strict) {
+            return Err("survival link does not support flexible(...)".to_string());
+        }
+        if let Some(components) = choice.mixture_components {
+            if args.sas_init.is_some() || args.beta_logistic_init.is_some() {
+                return Err(
+                    "survival blended(...) link does not accept --sas-init/--beta-logistic-init"
+                        .to_string(),
+                );
+            }
+            let expected = components.len().saturating_sub(1);
+            let initial_rho = if let Some(raw) = args.mixture_rho.as_deref() {
+                let vals = parse_comma_f64(raw, "--mixture-rho")?;
+                if vals.len() != expected {
+                    return Err(format!(
+                        "--mixture-rho expects {expected} values for blended({})",
+                        components
+                            .iter()
+                            .map(|c| match c {
+                                LinkComponent::Probit => "probit",
+                                LinkComponent::Logit => "logit",
+                                LinkComponent::CLogLog => "cloglog",
+                                LinkComponent::LogLog => "loglog",
+                                LinkComponent::Cauchit => "cauchit",
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                }
+                Array1::from_vec(vals)
+            } else {
+                Array1::zeros(expected)
+            };
+            return state_from_spec(&MixtureLinkSpec {
+                components,
+                initial_rho,
+            })
+            .map(InverseLink::Mixture)
+            .map_err(|e| format!("invalid survival blended link state: {e}"));
+        }
+
+        if args.mixture_rho.is_some() {
+            return Err(
+                "--mixture-rho requires survival --link blended(...)/mixture(...)".to_string(),
+            );
+        }
+        match choice.link {
+            LinkFunction::Sas => {
+                if args.beta_logistic_init.is_some() {
+                    return Err("--beta-logistic-init requires --link beta-logistic".to_string());
+                }
+                let (epsilon, log_delta) = if let Some(raw) = args.sas_init.as_deref() {
+                    let vals = parse_comma_f64(raw, "--sas-init")?;
+                    if vals.len() != 2 {
+                        return Err(format!(
+                            "--sas-init expects two values: epsilon,log_delta (got {})",
+                            vals.len()
+                        ));
+                    }
+                    (vals[0], vals[1])
+                } else {
+                    (0.0, 0.0)
+                };
+                state_from_sas_spec(SasLinkSpec {
+                    initial_epsilon: epsilon,
+                    initial_log_delta: log_delta,
+                })
+                .map(InverseLink::Sas)
+                .map_err(|e| format!("invalid survival SAS link state: {e}"))
+            }
+            LinkFunction::BetaLogistic => {
+                if args.sas_init.is_some() {
+                    return Err("--sas-init requires --link sas".to_string());
+                }
+                let (epsilon, delta) = if let Some(raw) = args.beta_logistic_init.as_deref() {
+                    let vals = parse_comma_f64(raw, "--beta-logistic-init")?;
+                    if vals.len() != 2 {
+                        return Err(format!(
+                            "--beta-logistic-init expects two values: epsilon,delta (got {})",
+                            vals.len()
+                        ));
+                    }
+                    (vals[0], vals[1])
+                } else {
+                    (0.0, 0.0)
+                };
+                state_from_beta_logistic_spec(SasLinkSpec {
+                    initial_epsilon: epsilon,
+                    initial_log_delta: delta,
+                })
+                .map(InverseLink::BetaLogistic)
+                .map_err(|e| format!("invalid survival Beta-Logistic link state: {e}"))
+            }
+            other => {
+                if args.sas_init.is_some() {
+                    return Err("--sas-init requires --link sas".to_string());
+                }
+                if args.beta_logistic_init.is_some() {
+                    return Err("--beta-logistic-init requires --link beta-logistic".to_string());
+                }
+                Ok(InverseLink::Standard(other))
+            }
+        }
+    } else {
+        if args.mixture_rho.is_some() {
+            return Err("--mixture-rho requires --link blended(...)/mixture(...)".to_string());
+        }
+        if args.sas_init.is_some() {
+            return Err("--sas-init requires --link sas".to_string());
+        }
+        if args.beta_logistic_init.is_some() {
+            return Err("--beta-logistic-init requires --link beta-logistic".to_string());
+        }
+        let dist = parse_survival_distribution(&args.survival_distribution)?;
+        Ok(residual_distribution_inverse_link(dist))
+    }
+}
+
+fn apply_inverse_link_state_to_fit_result(fit_result: &mut FitResult, inverse_link: &InverseLink) {
+    match inverse_link {
+        InverseLink::Sas(state) => {
+            fit_result.sas_epsilon = Some(state.epsilon);
+            fit_result.sas_log_delta = Some(state.log_delta);
+            fit_result.sas_delta = Some(state.delta);
+        }
+        InverseLink::BetaLogistic(state) => {
+            fit_result.sas_epsilon = Some(state.epsilon);
+            fit_result.sas_log_delta = Some(state.log_delta);
+            fit_result.sas_delta = Some(state.delta);
+        }
+        InverseLink::Mixture(state) => {
+            fit_result.mixture_link_components = Some(state.components.clone());
+            fit_result.mixture_link_rho = Some(state.rho.clone());
+            fit_result.mixture_link_weights = Some(state.pi.clone());
+        }
+        InverseLink::Standard(_) => {}
+    }
+}
+
+fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<InverseLink, String> {
+    let raw = model
+        .link
+        .as_deref()
+        .or(model.survival_distribution.as_deref())
+        .unwrap_or("probit");
+    let name = raw.trim().to_ascii_lowercase();
+    if name == "loglog" || name == "cauchit" {
+        let component = if name == "loglog" {
+            LinkComponent::LogLog
+        } else {
+            LinkComponent::Cauchit
+        };
+        return state_from_spec(&MixtureLinkSpec {
+            components: vec![component],
+            initial_rho: Array1::zeros(0),
+        })
+        .map(InverseLink::Mixture)
+        .map_err(|e| format!("invalid saved survival {name} link state: {e}"));
+    }
+    let choice = match parse_link_choice(Some(raw), false) {
+        Ok(v) => v,
+        Err(_) => {
+            let dist = parse_survival_distribution(raw)?;
+            return Ok(residual_distribution_inverse_link(dist));
+        }
+    };
+    let fit = model
+        .fit_result
+        .as_ref()
+        .ok_or_else(|| "saved survival model is missing fit_result".to_string())?;
+    let Some(choice) = choice else {
+        let dist = parse_survival_distribution(raw)?;
+        return Ok(residual_distribution_inverse_link(dist));
+    };
+    if let Some(components) = choice.mixture_components {
+        let rho = fit.mixture_link_rho.clone().ok_or_else(|| {
+            "saved survival blended-link model missing mixture_link_rho".to_string()
+        })?;
+        return state_from_spec(&MixtureLinkSpec {
+            components,
+            initial_rho: rho,
+        })
+        .map(InverseLink::Mixture)
+        .map_err(|e| format!("invalid saved survival blended link state: {e}"));
+    }
+    match choice.link {
+        LinkFunction::Sas => {
+            let epsilon = fit
+                .sas_epsilon
+                .ok_or_else(|| "saved survival SAS model missing sas_epsilon".to_string())?;
+            let log_delta = fit
+                .sas_log_delta
+                .ok_or_else(|| "saved survival SAS model missing sas_log_delta".to_string())?;
+            state_from_sas_spec(SasLinkSpec {
+                initial_epsilon: epsilon,
+                initial_log_delta: log_delta,
+            })
+            .map(InverseLink::Sas)
+            .map_err(|e| format!("invalid saved survival SAS state: {e}"))
+        }
+        LinkFunction::BetaLogistic => {
+            let epsilon = fit.sas_epsilon.ok_or_else(|| {
+                "saved survival beta-logistic model missing sas_epsilon".to_string()
+            })?;
+            let delta = fit.sas_log_delta.ok_or_else(|| {
+                "saved survival beta-logistic model missing sas_log_delta".to_string()
+            })?;
+            state_from_beta_logistic_spec(SasLinkSpec {
+                initial_epsilon: epsilon,
+                initial_log_delta: delta,
+            })
+            .map(InverseLink::BetaLogistic)
+            .map_err(|e| format!("invalid saved survival beta-logistic state: {e}"))
+        }
+        other => Ok(InverseLink::Standard(other)),
     }
 }
 
@@ -6752,6 +7386,7 @@ fn family_to_string(f: LikelihoodFamily) -> &'static str {
         LikelihoodFamily::BinomialProbit => "binomial-probit",
         LikelihoodFamily::BinomialCLogLog => "binomial-cloglog",
         LikelihoodFamily::BinomialSas => "binomial-sas",
+        LikelihoodFamily::BinomialBetaLogistic => "binomial-beta-logistic",
         LikelihoodFamily::BinomialMixture => "binomial-blended-inverse-link",
         LikelihoodFamily::RoystonParmar => "royston-parmar",
     }
@@ -6764,6 +7399,7 @@ fn family_to_link(f: LikelihoodFamily) -> LinkFunction {
         LikelihoodFamily::BinomialProbit => LinkFunction::Probit,
         LikelihoodFamily::BinomialCLogLog => LinkFunction::CLogLog,
         LikelihoodFamily::BinomialSas => LinkFunction::Sas,
+        LikelihoodFamily::BinomialBetaLogistic => LinkFunction::BetaLogistic,
         LikelihoodFamily::BinomialMixture => LinkFunction::Logit,
         LikelihoodFamily::RoystonParmar => LinkFunction::Identity,
     }
@@ -6776,6 +7412,7 @@ fn is_binomial_family(f: LikelihoodFamily) -> bool {
             | LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog
             | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture
     )
 }
@@ -6842,6 +7479,7 @@ fn pretty_family_name(f: LikelihoodFamily) -> &'static str {
         LikelihoodFamily::BinomialProbit => "Binomial Probit",
         LikelihoodFamily::BinomialCLogLog => "Binomial CLogLog",
         LikelihoodFamily::BinomialSas => "Binomial SAS",
+        LikelihoodFamily::BinomialBetaLogistic => "Binomial Beta-Logistic",
         LikelihoodFamily::BinomialMixture => "Binomial Blended Inverse-Link",
         LikelihoodFamily::RoystonParmar => "Royston Parmar",
     }
@@ -6953,6 +7591,7 @@ fn build_model_summary(
         | LikelihoodFamily::BinomialProbit
         | LikelihoodFamily::BinomialCLogLog
         | LikelihoodFamily::BinomialSas
+        | LikelihoodFamily::BinomialBetaLogistic
         | LikelihoodFamily::BinomialMixture => {
             let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
             let p = y
@@ -7255,10 +7894,12 @@ fn response_sd_from_eta_for_family(
 ) -> Result<Array1<f64>, String> {
     if matches!(
         family,
-        LikelihoodFamily::BinomialSas | LikelihoodFamily::BinomialMixture
+        LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
+            | LikelihoodFamily::BinomialMixture
     ) {
         return Err(
-            "SAS/mixture response uncertainty must be computed via library prediction APIs"
+            "stateful link response uncertainty must be computed via library prediction APIs"
                 .to_string(),
         );
     }
@@ -7286,7 +7927,9 @@ fn response_sd_from_eta_for_family(
                     gam::quadrature::cloglog_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
                 v
             }
-            LikelihoodFamily::BinomialSas | LikelihoodFamily::BinomialMixture => unreachable!(),
+            LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
+            | LikelihoodFamily::BinomialMixture => unreachable!(),
             LikelihoodFamily::RoystonParmar => {
                 let (_, v) =
                     gam::quadrature::survival_posterior_mean_variance(&quad_ctx, eta[i], eta_se[i]);
@@ -7566,11 +8209,12 @@ fn write_survival_prediction_csv(
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, LikelihoodFamily, MODEL_VERSION,
-        ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs, SurvivalTimeBasisConfig,
-        build_survival_time_basis, chi_square_survival_approx, compute_probit_q0_from_eta,
-        core_saved_fit_result, parse_duchon_order, parse_duchon_power, parse_formula,
-        parse_surv_response, parse_survival_time_basis_config, pretty_family_name,
+        BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, LikelihoodFamily,
+        LinkWigglePenaltyMode, MODEL_VERSION, ParsedTerm, SavedFitSummary, SavedModel,
+        SurvivalArgs, SurvivalTimeBasisConfig, build_survival_time_basis,
+        chi_square_survival_approx, compute_probit_q0_from_eta, core_saved_fit_result,
+        parse_duchon_order, parse_duchon_power, parse_formula, parse_surv_response,
+        parse_survival_inverse_link, parse_survival_time_basis_config, pretty_family_name,
         saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design, summarize_wiggle_domain,
         survival_probability_from_eta, write_survival_prediction_csv,
     };
@@ -7579,7 +8223,7 @@ mod tests {
     use gam::inference::data::{UnseenCategoryPolicy, encode_records_with_schema};
     use gam::inference::model::FittedModelPayload;
     use gam::inference::model::SchemaColumn;
-    use gam::types::{InverseLink, LinkFunction};
+    use gam::types::{InverseLink, LinkComponent, LinkFunction};
     use gam::{FittedFamily, ModelKind};
     use ndarray::{Array1, ArrayView1, array};
     use std::collections::BTreeMap;
@@ -7940,6 +8584,16 @@ mod tests {
             spec: "net".to_string(),
             survival_likelihood: "transformation".to_string(),
             survival_distribution: "gaussian".to_string(),
+            link: None,
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            optimize_mixture: true,
+            learn_link_wiggle: false,
+            link_wiggle_degree: 3,
+            link_wiggle_internal_knots: 7,
+            link_wiggle_penalty_order: LinkWigglePenaltyMode::Curvature,
+            link_wiggle_double_penalty: true,
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),
             baseline_scale: None,
@@ -7954,6 +8608,61 @@ mod tests {
         };
         let cfg = parse_survival_time_basis_config(&args).expect("parse ispline time basis");
         assert!(matches!(cfg, SurvivalTimeBasisConfig::ISpline { .. }));
+    }
+
+    #[test]
+    fn parse_survival_inverse_link_supports_loglog_and_cauchit() {
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            spec: "net".to_string(),
+            survival_likelihood: "probit-location-scale".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: Some("loglog".to_string()),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            optimize_mixture: true,
+            learn_link_wiggle: false,
+            link_wiggle_degree: 3,
+            link_wiggle_internal_knots: 7,
+            link_wiggle_penalty_order: LinkWigglePenaltyMode::Curvature,
+            link_wiggle_double_penalty: true,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            time_basis: "linear".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            out: None,
+        };
+        let link = parse_survival_inverse_link(&args).expect("loglog survival link");
+        match link {
+            InverseLink::Mixture(state) => {
+                assert_eq!(state.components, vec![LinkComponent::LogLog]);
+                assert_eq!(state.rho.len(), 0);
+                assert_eq!(state.pi.len(), 1);
+            }
+            _ => panic!("expected mixture-backed loglog survival link"),
+        }
+
+        args.link = Some("cauchit".to_string());
+        let link = parse_survival_inverse_link(&args).expect("cauchit survival link");
+        match link {
+            InverseLink::Mixture(state) => {
+                assert_eq!(state.components, vec![LinkComponent::Cauchit]);
+                assert_eq!(state.rho.len(), 0);
+                assert_eq!(state.pi.len(), 1);
+            }
+            _ => panic!("expected mixture-backed cauchit survival link"),
+        }
     }
 
     #[test]
@@ -8136,6 +8845,7 @@ mod tests {
             training_headers: None,
             resolved_term_spec: None,
             resolved_term_spec_noise: None,
+            adaptive_regularization_diagnostics: None,
         });
 
         let exact = saved_probit_wiggle_derivative_q0(&q0, &model).expect("exact derivative");

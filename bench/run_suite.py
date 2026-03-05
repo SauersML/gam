@@ -120,6 +120,15 @@ class Fold:
     test_idx: np.ndarray
 
 
+@dataclass(frozen=True)
+class SharedFoldArtifact:
+    fold_id: int
+    train_scaled_csv: Path
+    test_scaled_csv: Path
+    train_idx_path: Path
+    test_idx_path: Path
+
+
 def _coerce_positive_survival_times(df: pd.DataFrame, time_col: str, dataset_name: str) -> pd.DataFrame:
     time_vals = pd.to_numeric(df[time_col], errors="coerce")
     non_positive = time_vals <= 0.0
@@ -1249,6 +1258,142 @@ def _synthetic_geo_disease_dataset(n=4000, seed=20260226):
     }
 
 
+def _sample_fractional_spde_1d_field(n: int, *, rng: np.random.Generator, nu: float, kappa2: float) -> np.ndarray:
+    n = int(max(32, n))
+    # Frequency-domain SPDE approximation in 1D:
+    #   S(omega) ∝ (kappa^2 + omega^2)^(-(nu + 1/2))
+    # This yields a stationary fractional field with controllable smoothness.
+    freqs = 2.0 * math.pi * np.fft.rfftfreq(n, d=1.0 / n)
+    spec = (max(float(kappa2), 1e-9) + freqs * freqs) ** (-(float(nu) + 0.5))
+    spec = np.clip(spec, 1e-18, None)
+    coeff = np.zeros(freqs.shape[0], dtype=np.complex128)
+    coeff[0] = rng.normal(0.0, math.sqrt(spec[0]))
+    for j in range(1, coeff.shape[0]):
+        s = math.sqrt(spec[j] * 0.5)
+        coeff[j] = rng.normal(0.0, s) + 1j * rng.normal(0.0, s)
+    field = np.fft.irfft(coeff, n=n).astype(float)
+    field = field - float(np.mean(field))
+    sd = float(np.std(field))
+    if (not np.isfinite(sd)) or sd < 1e-12:
+        return np.zeros(n, dtype=float)
+    return field / sd
+
+
+def _synthetic_thread2_continuous_order_dataset(
+    *,
+    mode: str,
+    n: int = 512,
+    seed: int = 20260501,
+    true_nu: float | None = None,
+    true_kappa2: float | None = None,
+) -> dict:
+    n = int(max(128, n))
+    rng = np.random.default_rng(int(seed))
+    x = np.linspace(-1.0, 1.0, n, dtype=float)
+    if mode == "fractional":
+        nu = float(true_nu if true_nu is not None else 1.8)
+        k2 = float(true_kappa2 if true_kappa2 is not None else 0.7)
+        latent = _sample_fractional_spde_1d_field(n, rng=rng, nu=nu, kappa2=k2)
+        y = latent + rng.normal(0.0, 0.20, size=n)
+        expected = ["Ok", "NonMaternRegime"]
+    elif mode == "rough":
+        # Brownian-like path to stress non-Matern / first-order boundary logic.
+        steps = rng.normal(0.0, 1.0, size=n)
+        latent = np.cumsum(steps)
+        latent = (latent - float(np.mean(latent))) / max(float(np.std(latent)), 1e-12)
+        y = latent + rng.normal(0.0, 0.30, size=n)
+        nu = None
+        k2 = None
+        expected = ["NonMaternRegime", "FirstOrderLimit", "IntrinsicLimit"]
+    elif mode == "smooth":
+        latent = 1.4 * np.sin(2.0 * math.pi * (x + 0.1)) + 0.8 * np.cos(0.5 * math.pi * (x - 0.2))
+        latent = (latent - float(np.mean(latent))) / max(float(np.std(latent)), 1e-12)
+        y = latent + rng.normal(0.0, 0.03, size=n)
+        nu = None
+        k2 = None
+        expected = ["Ok", "IntrinsicLimit"]
+    else:
+        raise RuntimeError(f"unsupported thread2 synthetic mode '{mode}'")
+
+    rows = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x, y)]
+    out = {
+        "family": "gaussian",
+        "rows": rows,
+        "features": ["x"],
+        "target": "y",
+        "thread2_expected_statuses": expected,
+    }
+    if true_nu is not None:
+        out["thread2_true_nu"] = float(true_nu)
+    if true_kappa2 is not None:
+        out["thread2_true_kappa2"] = float(true_kappa2)
+    return out
+
+
+def _synthetic_thread3_admixture_cliff_dataset(n=6000, seed=20260601):
+    n = int(max(1500, n))
+    rng = np.random.default_rng(int(seed))
+
+    # Correlated ancestry-like latent coordinates.
+    cov = np.array(
+        [
+            [1.00, 0.52, -0.18, 0.10],
+            [0.52, 1.00, 0.22, -0.15],
+            [-0.18, 0.22, 1.00, 0.35],
+            [0.10, -0.15, 0.35, 1.00],
+        ],
+        dtype=float,
+    )
+    core = rng.multivariate_normal(mean=np.zeros(4), cov=cov, size=n)
+    pc1, pc2, pc3, pc4 = core[:, 0], core[:, 1], core[:, 2], core[:, 3]
+
+    # Narrow boundary in admixture-space: almost flat away from the interface.
+    coeffs = np.array([1.0, 0.35, -0.20, 0.10], dtype=float)
+    z = coeffs[0] * pc1 + coeffs[1] * pc2 + coeffs[2] * pc3 + coeffs[3] * pc4
+    cliff_jump = 3.8
+    cliff_sharpness = 16.0
+    eta = -1.15 + cliff_jump * np.tanh(cliff_sharpness * z) + rng.normal(0.0, 0.15, size=n)
+    pr = 1.0 / (1.0 + np.exp(-eta))
+    y = (rng.random(n) < pr).astype(float)
+
+    # Add nuisance PCs to match the geo disease benchmark layout.
+    nuisance = np.zeros((n, 12), dtype=float)
+    for j in range(12):
+        a = 0.45 - 0.02 * j
+        b = ((-1.0) ** j) * (0.18 + 0.01 * j)
+        c = 0.12 + 0.02 * (j % 4)
+        sd = 0.18 + 0.02 * j
+        nuisance[:, j] = a * pc1 + b * pc2 + c * pc4 + rng.normal(0.0, sd, size=n)
+
+    rows = []
+    for i in range(n):
+        row = {
+            "pc1": float(pc1[i]),
+            "pc2": float(pc2[i]),
+            "pc3": float(pc3[i]),
+            "pc4": float(pc4[i]),
+        }
+        for j in range(12):
+            row[f"pc{j + 5}"] = float(nuisance[i, j])
+        row["y"] = float(y[i])
+        rows.append(row)
+
+    return {
+        "family": "binomial",
+        "rows": rows,
+        "features": [f"pc{i}" for i in range(1, 17)],
+        "target": "y",
+        "thread3_cliff_coefficients": {
+            "pc1": float(coeffs[0]),
+            "pc2": float(coeffs[1]),
+            "pc3": float(coeffs[2]),
+            "pc4": float(coeffs[3]),
+        },
+        "thread3_cliff_jump": float(cliff_jump),
+        "thread3_cliff_sharpness": float(cliff_sharpness),
+    }
+
+
 def _synthetic_geo_disease_eas_dataset(n=6000, seed=20260301, n_pcs=16):
     n = int(max(1000, n))
     n_pcs = int(max(3, n_pcs))
@@ -1870,6 +2015,31 @@ def _dataset_for_scenario_unvalidated(s):
         )
     if name.startswith("geo_disease_"):
         return _synthetic_geo_disease_dataset(s.get("n", 4000), s.get("seed", 20260226))
+    if name == "thread2_fractional_spde_nu18":
+        return _synthetic_thread2_continuous_order_dataset(
+            mode="fractional",
+            n=s.get("n", 512),
+            seed=s.get("seed", 20260501),
+            true_nu=s.get("true_nu", 1.8),
+            true_kappa2=s.get("true_kappa2", 0.7),
+        )
+    if name == "thread2_boundary_rough":
+        return _synthetic_thread2_continuous_order_dataset(
+            mode="rough",
+            n=s.get("n", 512),
+            seed=s.get("seed", 20260502),
+        )
+    if name == "thread2_boundary_smooth":
+        return _synthetic_thread2_continuous_order_dataset(
+            mode="smooth",
+            n=s.get("n", 512),
+            seed=s.get("seed", 20260503),
+        )
+    if name == "thread3_admixture_cliff":
+        return _synthetic_thread3_admixture_cliff_dataset(
+            n=s.get("n", 6000),
+            seed=s.get("seed", 20260601),
+        )
     if name == "lidar_semipar":
         return _load_lidar_dataset()
     if name == "bone_gamair":
@@ -1931,6 +2101,41 @@ def folds_for_dataset(ds):
     if not np.all(seen == 1):
         raise RuntimeError("invalid CV split: each row must appear exactly once in test sets")
     return folds
+
+
+def build_shared_fold_artifacts(
+    ds: dict,
+    folds: list[Fold],
+    root_dir: Path,
+) -> list[SharedFoldArtifact]:
+    root_dir.mkdir(parents=True, exist_ok=True)
+    base_df = pd.DataFrame(ds["rows"])
+    feature_cols = list(ds.get("features", []))
+    artifacts: list[SharedFoldArtifact] = []
+    for fold_id, fold in enumerate(folds):
+        train_idx_path = root_dir / f"train_idx_{fold_id}.txt"
+        test_idx_path = root_dir / f"test_idx_{fold_id}.txt"
+        train_idx_path.write_text("\n".join(str(int(i)) for i in fold.train_idx) + "\n")
+        test_idx_path.write_text("\n".join(str(int(i)) for i in fold.test_idx) + "\n")
+
+        train_df = base_df.iloc[fold.train_idx].copy()
+        test_df = base_df.iloc[fold.test_idx].copy()
+        if feature_cols:
+            train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
+        train_csv = root_dir / f"train_scaled_{fold_id}.csv"
+        test_csv = root_dir / f"test_scaled_{fold_id}.csv"
+        train_df.to_csv(train_csv, index=False)
+        test_df.to_csv(test_csv, index=False)
+        artifacts.append(
+            SharedFoldArtifact(
+                fold_id=fold_id,
+                train_scaled_csv=train_csv,
+                test_scaled_csv=test_csv,
+                train_idx_path=train_idx_path,
+                test_idx_path=test_idx_path,
+            )
+        )
+    return artifacts
 
 
 def aggregate_cv_rows(cv_rows, family):
@@ -2138,7 +2343,50 @@ def _rust_fit_mapping(scenario_name):
             linear_cols=[],
             knots=10,
         ),
+        "thread2_fractional_spde_nu18": dict(
+            family="gaussian",
+            smooth_col="x",
+            linear_cols=[],
+            smooth_basis="matern",
+            knots=24,
+            double_penalty=True,
+        ),
+        "thread2_boundary_rough": dict(
+            family="gaussian",
+            smooth_col="x",
+            linear_cols=[],
+            smooth_basis="matern",
+            knots=24,
+            double_penalty=True,
+        ),
+        "thread2_boundary_smooth": dict(
+            family="gaussian",
+            smooth_col="x",
+            linear_cols=[],
+            smooth_basis="matern",
+            knots=24,
+            double_penalty=True,
+        ),
+        "thread3_admixture_cliff": dict(
+            family="binomial-logit",
+            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_basis="matern",
+            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            knots=16,
+            double_penalty=True,
+        ),
     }.get(scenario_name)
+
+
+def _effective_rust_fit_mapping(scenario_name: str, override: dict | None = None):
+    cfg = _rust_fit_mapping(scenario_name)
+    if cfg is None:
+        return None
+    if not override:
+        return dict(cfg)
+    merged = dict(cfg)
+    merged.update(override)
+    return merged
 
 
 def _canonical_smooth_basis(basis):
@@ -2149,8 +2397,8 @@ def _canonical_smooth_basis(basis):
     return b
 
 
-def _rust_formula_for_scenario(scenario_name, ds):
-    cfg = _rust_fit_mapping(scenario_name)
+def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None = None):
+    cfg = _effective_rust_fit_mapping(scenario_name, cfg_override)
     if cfg is None:
         raise RuntimeError(f"No Rust formula mapping configured for scenario '{scenario_name}'")
     target = ds["target"]
@@ -2295,6 +2543,230 @@ def _rust_survival_formula_for_scenario(scenario_name, feature_cols=None):
         return "linear(age) + linear(bmi) + linear(hr_max) + linear(sysbp_min) + linear(temp_apache)"
     raise RuntimeError(f"No Rust survival formula configured for scenario '{scenario_name}'")
 
+
+def _is_matern_rust_scenario(s_cfg) -> bool:
+    cfg = _rust_fit_mapping(s_cfg["name"])
+    if cfg is None:
+        return False
+    return _canonical_smooth_basis(cfg.get("smooth_basis", "ps")) == "matern"
+
+
+def _make_far_ood_frame(
+    train_df: pd.DataFrame,
+    *,
+    ds: dict,
+    smooth_cols: list[str],
+    linear_cols: list[str],
+    n_points: int = 64,
+) -> pd.DataFrame:
+    cols = list(ds["features"])
+    if not cols:
+        return pd.DataFrame()
+    n = max(int(n_points), 8)
+    rows = []
+    for i in range(n):
+        row = {}
+        bitmask = i
+        for j, c in enumerate(cols):
+            vals = train_df[c].to_numpy(dtype=float)
+            vmin = float(np.min(vals))
+            vmax = float(np.max(vals))
+            span = max(vmax - vmin, 1e-6)
+            far = max(4.0 * span, 6.0)
+            if c in smooth_cols:
+                go_high = ((bitmask >> (j % 16)) & 1) == 1
+                row[c] = (vmax + far) if go_high else (vmin - far)
+            elif c in linear_cols:
+                row[c] = float(np.mean(vals))
+            else:
+                row[c] = float(np.mean(vals))
+        if ds["family"] == "binomial":
+            row[ds["target"]] = 0.0
+        elif ds["family"] == "gaussian":
+            row[ds["target"]] = 0.0
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _compute_continuous_order_from_lambdas(
+    lambda_tilde: list[float] | tuple[float, ...] | np.ndarray,
+    normalization_scale: list[float] | tuple[float, ...] | np.ndarray | None = None,
+    eps: float = 1e-12,
+) -> dict:
+    if len(lambda_tilde) < 3:
+        return {
+            "status": "UndefinedZeroLambda",
+            "lambda0": float("nan"),
+            "lambda1": float("nan"),
+            "lambda2": float("nan"),
+            "r_ratio": None,
+            "nu": None,
+            "kappa2": None,
+        }
+    lt = [float(lambda_tilde[0]), float(lambda_tilde[1]), float(lambda_tilde[2])]
+    scales = [1.0, 1.0, 1.0] if normalization_scale is None else [float(normalization_scale[i]) for i in range(3)]
+    if any((not np.isfinite(c)) or c <= 0.0 for c in scales):
+        return {
+            "status": "UndefinedZeroLambda",
+            "lambda0": float("nan"),
+            "lambda1": float("nan"),
+            "lambda2": float("nan"),
+            "r_ratio": None,
+            "nu": None,
+            "kappa2": None,
+        }
+    lam = [lt[i] / scales[i] for i in range(3)]
+    l0, l1, l2 = lam
+    if any(not np.isfinite(v) for v in lam):
+        return {"status": "UndefinedZeroLambda", "lambda0": l0, "lambda1": l1, "lambda2": l2, "r_ratio": None, "nu": None, "kappa2": None}
+    l_scale = max(abs(l0), abs(l1), abs(l2), 1.0)
+    l_floor = eps * l_scale
+    if l0 <= l_floor:
+        if l1 > l_floor and l2 > l_floor:
+            return {"status": "IntrinsicLimit", "lambda0": l0, "lambda1": l1, "lambda2": l2, "r_ratio": None, "nu": 1.0, "kappa2": 0.0}
+        return {"status": "UndefinedZeroLambda", "lambda0": l0, "lambda1": l1, "lambda2": l2, "r_ratio": None, "nu": None, "kappa2": None}
+    if l2 <= l_floor:
+        if l1 > l_floor and np.isfinite(l1):
+            return {"status": "FirstOrderLimit", "lambda0": l0, "lambda1": l1, "lambda2": l2, "r_ratio": None, "nu": 1.0, "kappa2": l0 / l1}
+        return {"status": "UndefinedZeroLambda", "lambda0": l0, "lambda1": l1, "lambda2": l2, "r_ratio": None, "nu": None, "kappa2": None}
+    r_ratio = (l1 * l1) / (l0 * l2)
+    if not np.isfinite(r_ratio):
+        return {"status": "UndefinedZeroLambda", "lambda0": l0, "lambda1": l1, "lambda2": l2, "r_ratio": None, "nu": None, "kappa2": None}
+    disc = l1 * l1 - 4.0 * l0 * l2
+    disc_tol = eps * l_scale * l_scale
+    status = "NonMaternRegime" if disc < -disc_tol else "Ok"
+    if r_ratio <= 2.0 + eps:
+        return {"status": status, "lambda0": l0, "lambda1": l1, "lambda2": l2, "r_ratio": r_ratio, "nu": None, "kappa2": None}
+    nu = r_ratio / (r_ratio - 2.0)
+    kappa2 = l1 / ((r_ratio - 2.0) * l2)
+    if (not np.isfinite(nu)) or (not np.isfinite(kappa2)):
+        return {"status": "UndefinedZeroLambda", "lambda0": l0, "lambda1": l1, "lambda2": l2, "r_ratio": r_ratio, "nu": None, "kappa2": None}
+    return {"status": status, "lambda0": l0, "lambda1": l1, "lambda2": l2, "r_ratio": r_ratio, "nu": float(nu), "kappa2": float(kappa2)}
+
+
+def _rank_corr(a: np.ndarray, b: np.ndarray) -> float | None:
+    x = np.asarray(a, dtype=float).reshape(-1)
+    y = np.asarray(b, dtype=float).reshape(-1)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if int(np.sum(mask)) < 3:
+        return None
+    x = x[mask]
+    y = y[mask]
+    xr = pd.Series(x).rank(method="average").to_numpy(dtype=float)
+    yr = pd.Series(y).rank(method="average").to_numpy(dtype=float)
+    sx = float(np.std(xr))
+    sy = float(np.std(yr))
+    if sx < 1e-12 or sy < 1e-12:
+        return None
+    corr = float(np.corrcoef(xr, yr)[0, 1])
+    if not np.isfinite(corr):
+        return None
+    return corr
+
+
+def _thread3_cliff_gradient_magnitude(
+    collocation_points: np.ndarray, *, feature_cols: list[int], ds: dict
+) -> np.ndarray | None:
+    coeff_map = ds.get("thread3_cliff_coefficients")
+    if not isinstance(coeff_map, dict):
+        return None
+    if collocation_points.ndim != 2 or collocation_points.shape[0] == 0:
+        return None
+    if collocation_points.shape[1] != len(feature_cols):
+        return None
+    coeff_vec = np.array(
+        [float(coeff_map.get(ds["features"][int(c)], 0.0)) for c in feature_cols],
+        dtype=float,
+    )
+    coeff_norm = float(np.linalg.norm(coeff_vec))
+    if coeff_norm < 1e-12:
+        return None
+    jump = float(ds.get("thread3_cliff_jump", 0.0))
+    sharpness = float(ds.get("thread3_cliff_sharpness", 1.0))
+    z = collocation_points.dot(coeff_vec)
+    az = np.clip(np.abs(sharpness * z), 0.0, 50.0)
+    sech2 = 1.0 / (np.cosh(az) ** 2)
+    deta_dz_abs = abs(jump * sharpness) * sech2
+    return deta_dz_abs * coeff_norm
+
+
+def _extract_thread3_adaptive_fold_metrics(model_payload: dict | None, ds: dict) -> dict:
+    if not isinstance(model_payload, dict):
+        return {}
+    diag = model_payload.get("adaptive_regularization_diagnostics")
+    if not isinstance(diag, dict):
+        return {}
+    out: dict[str, float | int | bool] = {}
+    mm_iter = diag.get("mm_iterations")
+    if isinstance(mm_iter, (int, float)):
+        out["mm_iterations"] = int(mm_iter)
+    converged = diag.get("converged")
+    if isinstance(converged, bool):
+        out["adaptive_converged"] = converged
+
+    maps = diag.get("maps")
+    if not isinstance(maps, list):
+        return out
+
+    def _json_ndarray(value):
+        if isinstance(value, dict) and isinstance(value.get("data"), list):
+            arr = np.asarray(value.get("data"), dtype=float)
+            dim = value.get("dim")
+            if isinstance(dim, list) and dim:
+                try:
+                    shape = tuple(int(d) for d in dim)
+                    if int(np.prod(shape, dtype=np.int64)) == int(arr.size):
+                        return arr.reshape(shape)
+                except Exception:
+                    pass
+            return arr
+        return np.asarray(value, dtype=float)
+
+    corr_rows = []
+    for m in maps:
+        if not isinstance(m, dict):
+            continue
+        try:
+            feature_cols = [int(x) for x in (m.get("feature_cols") or [])]
+            points = _json_ndarray(m.get("collocation_points"))
+            inv_g = _json_ndarray(m.get("inv_grad_weight")).reshape(-1)
+            inv_c = _json_ndarray(m.get("inv_lap_weight")).reshape(-1)
+        except Exception:
+            continue
+        if points.ndim != 2 or points.shape[0] == 0:
+            continue
+        if points.shape[0] != inv_g.shape[0] or points.shape[0] != inv_c.shape[0]:
+            continue
+        grad_mag = _thread3_cliff_gradient_magnitude(points, feature_cols=feature_cols, ds=ds)
+        if grad_mag is None or grad_mag.shape[0] != points.shape[0]:
+            continue
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sens_g = np.where(inv_g > 0.0, 1.0 / inv_g, np.nan)
+            sens_c = np.where(inv_c > 0.0, 1.0 / inv_c, np.nan)
+        corr_rows.append(
+            {
+                "n": int(points.shape[0]),
+                "corr_g": _rank_corr(sens_g, grad_mag),
+                "corr_c": _rank_corr(sens_c, grad_mag),
+            }
+        )
+
+    if corr_rows:
+        denom = max(sum(int(r["n"]) for r in corr_rows), 1)
+        valid_g = [(float(r["corr_g"]), int(r["n"])) for r in corr_rows if r["corr_g"] is not None]
+        valid_c = [(float(r["corr_c"]), int(r["n"])) for r in corr_rows if r["corr_c"] is not None]
+        if valid_g:
+            out["thread3_weight_grad_corr"] = float(
+                sum(v * w for v, w in valid_g) / max(sum(w for _, w in valid_g), 1)
+            )
+        if valid_c:
+            out["thread3_weight_curvature_corr"] = float(
+                sum(v * w for v, w in valid_c) / max(sum(w for _, w in valid_c), 1)
+            )
+        out["thread3_collocation_points"] = int(denom)
+    return out
+
+
 def _rust_survival_fit_options_for_scenario(scenario_name):
     # Keep defaults close to CLI behavior and only enable a flexible time basis
     # where it provides clear discrimination gains.
@@ -2334,10 +2806,25 @@ def _ensure_rust_binary():
     return _RUST_BIN_PATH
 
 
-def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial_link: str | None = None):
+def run_rust_scenario_cv(
+    scenario,
+    *,
+    contender_name: str = "rust_gam",
+    binomial_link: str | None = None,
+    ds: dict | None = None,
+    folds: list[Fold] | None = None,
+    shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
+    rust_cfg_override: dict | None = None,
+    eval_ood: bool = False,
+    collect_continuous_order: bool = False,
+    collect_adaptive_diagnostics: bool = False,
+    rust_fit_extra_args: list[str] | None = None,
+):
     scenario_name = scenario["name"]
-    ds = dataset_for_scenario(scenario)
-    folds = folds_for_dataset(ds)
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
+    if folds is None:
+        folds = folds_for_dataset(ds)
 
     try:
         rust_bin = _ensure_rust_binary()
@@ -2351,6 +2838,12 @@ def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial
 
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
+    ood_rows = []
+    continuous_rows = []
+    adaptive_rows = []
+    rust_cfg = _effective_rust_fit_mapping(scenario_name, rust_cfg_override) or {}
+    smooth_cols = list(rust_cfg.get("smooth_cols") or ([rust_cfg["smooth_col"]] if "smooth_col" in rust_cfg else []))
+    linear_cols = list(rust_cfg.get("linear_cols", []))
     # Use a workspace-local temp root to reduce /tmp lifecycle flakiness in CI.
     with tempfile.TemporaryDirectory(prefix="gam_bench_rust_cv_", dir=str(BENCH_DIR)) as td:
         td_path = Path(td)
@@ -2358,13 +2851,17 @@ def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial
             train_df = base_df.iloc[fold.train_idx].copy()
             test_df = base_df.iloc[fold.test_idx].copy()
             test_eval_df = test_df.copy()
-            train_path = td_path / f"train_{fold_id}.csv"
-            test_path = td_path / f"test_{fold_id}.csv"
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
-            train_pred_path = td_path / f"pred_train_{fold_id}.csv"
+            shared_artifact = (
+                shared_fold_artifacts[fold_id]
+                if shared_fold_artifacts is not None and fold_id < len(shared_fold_artifacts)
+                else None
+            )
 
             if ds["family"] == "survival":
+                train_path = td_path / f"train_{fold_id}.csv"
+                test_path = td_path / f"test_{fold_id}.csv"
                 fit_feature_cols = list(ds["features"])
                 for col in ds["features"]:
                     mu = float(train_df[col].mean())
@@ -2404,10 +2901,20 @@ def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial
                     str(train_path),
                 ]
             else:
-                train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
-                train_df.to_csv(train_path, index=False)
-                test_df.to_csv(test_path, index=False)
-                family, formula = _rust_formula_for_scenario(scenario_name, ds)
+                if shared_artifact is not None:
+                    train_path = shared_artifact.train_scaled_csv
+                    test_path = shared_artifact.test_scaled_csv
+                else:
+                    train_path = td_path / f"train_{fold_id}.csv"
+                    test_path = td_path / f"test_{fold_id}.csv"
+                    train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
+                    train_df.to_csv(train_path, index=False)
+                    test_df.to_csv(test_path, index=False)
+                family, formula = _rust_formula_for_scenario(
+                    scenario_name,
+                    ds,
+                    cfg_override=rust_cfg_override,
+                )
                 if ds["family"] == "binomial" and binomial_link:
                     fit_cmd = [
                         str(rust_bin),
@@ -2435,13 +2942,17 @@ def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial
                         str(train_path),
                     ]
 
+            if rust_fit_extra_args:
+                fit_cmd.extend([str(x) for x in rust_fit_extra_args])
+
             def _looks_like_missing_csv(msg: str) -> bool:
                 m = (msg or "").lower()
                 return ("failed to open csv" in m) and ("no such file or directory" in m)
 
             def _ensure_fold_csvs():
-                train_df.to_csv(train_path, index=False)
-                test_df.to_csv(test_path, index=False)
+                if ds["family"] == "survival":
+                    train_df.to_csv(train_path, index=False)
+                    test_df.to_csv(test_path, index=False)
 
             t0 = perf_counter()
             code, out, err = run_cmd(fit_cmd, cwd=ROOT)
@@ -2457,6 +2968,24 @@ def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial
                     "status": "failed",
                     "error": (err.strip() or out.strip() or "rust fit failed"),
                 }
+            model_payload = None
+            try:
+                model_payload = json.loads(model_path.read_text())
+                if isinstance(model_payload, dict) and "payload" in model_payload:
+                    model_payload = model_payload.get("payload", {})
+            except Exception:
+                model_payload = None
+            if collect_continuous_order and model_payload is not None:
+                lambdas = model_payload.get("fit_result", {}).get("lambdas", [])
+                if isinstance(lambdas, list) and len(lambdas) >= 3:
+                    co = _compute_continuous_order_from_lambdas(lambdas[:3], normalization_scale=[1.0, 1.0, 1.0], eps=1e-12)
+                    co["n_test"] = int(len(fold.test_idx))
+                    continuous_rows.append(co)
+            if collect_adaptive_diagnostics:
+                adaptive_row = _extract_thread3_adaptive_fold_metrics(model_payload, ds)
+                if adaptive_row:
+                    adaptive_row["n_test"] = int(len(fold.test_idx))
+                    adaptive_rows.append(adaptive_row)
 
             pred_cmd = [
                 str(rust_bin),
@@ -2507,35 +3036,53 @@ def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial
                         ),
                     }
                 )
+                if eval_ood and smooth_cols:
+                    ood_df = _make_far_ood_frame(
+                        train_df,
+                        ds=ds,
+                        smooth_cols=smooth_cols,
+                        linear_cols=linear_cols,
+                        n_points=max(32, int(len(fold.test_idx))),
+                    )
+                    if not ood_df.empty:
+                        ood_path = td_path / f"ood_{fold_id}.csv"
+                        ood_pred_path = td_path / f"ood_pred_{fold_id}.csv"
+                        ood_df.to_csv(ood_path, index=False)
+                        ood_pred_cmd = [
+                            str(rust_bin),
+                            "predict",
+                            str(model_path),
+                            str(ood_path),
+                            "--out",
+                            str(ood_pred_path),
+                        ]
+                        code, out, err = run_cmd(ood_pred_cmd, cwd=ROOT)
+                        if code == 0 and ood_pred_path.is_file():
+                            ood_pred_df = pd.read_csv(ood_pred_path)
+                            if "mean" in ood_pred_df.columns:
+                                p_ood = np.clip(ood_pred_df["mean"].to_numpy(dtype=float), 1e-9, 1 - 1e-9)
+                                baseline = float(np.clip(np.mean(y_test), 1e-9, 1 - 1e-9))
+                                ood_rows.append(
+                                    {
+                                        "n_test": int(len(fold.test_idx)),
+                                        "ood_abs_dev_from_baseline": float(np.mean(np.abs(p_ood - baseline))),
+                                        "ood_max_abs_dev_from_baseline": float(np.max(np.abs(p_ood - baseline))),
+                                        "ood_mean_abs_logit": float(np.mean(np.abs(np.log(p_ood / (1.0 - p_ood))))),
+                                    }
+                                )
             elif ds["family"] == "gaussian":
                 y_test = test_df[ds["target"]].to_numpy(dtype=float)
-                train_pred_cmd = [
-                    str(rust_bin),
-                    "predict",
-                    str(model_path),
-                    str(train_path),
-                    "--out",
-                    str(train_pred_path),
-                ]
-                code, out, err = run_cmd(train_pred_cmd, cwd=ROOT)
-                if code != 0:
-                    return {
-                        "contender": contender_name,
-                        "scenario_name": scenario_name,
-                        "status": "failed",
-                        "error": (err.strip() or out.strip() or "rust train-predict failed"),
-                    }
-                train_pred_df = pd.read_csv(train_pred_path)
-                if "mean" not in train_pred_df.columns:
-                    return {
-                        "contender": contender_name,
-                        "scenario_name": scenario_name,
-                        "status": "failed",
-                        "error": "rust train prediction output missing 'mean' column",
-                    }
-                y_train = train_df[ds["target"]].to_numpy(dtype=float)
-                pred_train = train_pred_df["mean"].to_numpy(dtype=float)
-                sigma_hat = max(rmse_score(y_train, pred_train), 1e-12)
+                sigma_hat = 1.0
+                try:
+                    if model_payload is None:
+                        model_payload = json.loads(model_path.read_text())
+                        if isinstance(model_payload, dict) and "payload" in model_payload:
+                            model_payload = model_payload.get("payload", {})
+                    sigma_hat = float(model_payload.get("fit_result", {}).get("scale", 1.0))
+                except Exception:
+                    sigma_hat = 1.0
+                if (not np.isfinite(sigma_hat)) or sigma_hat <= 0.0:
+                    sigma_hat = 1.0
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
@@ -2581,6 +3128,89 @@ def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial
                 )
 
     metrics = aggregate_cv_rows(cv_rows, ds["family"])
+    if ood_rows:
+        denom = max(sum(int(r["n_test"]) for r in ood_rows), 1)
+        metrics["ood_abs_dev_from_baseline"] = float(
+            sum(float(r["ood_abs_dev_from_baseline"]) * int(r["n_test"]) for r in ood_rows) / denom
+        )
+        metrics["ood_max_abs_dev_from_baseline"] = float(
+            sum(float(r["ood_max_abs_dev_from_baseline"]) * int(r["n_test"]) for r in ood_rows) / denom
+        )
+        metrics["ood_mean_abs_logit"] = float(
+            sum(float(r["ood_mean_abs_logit"]) * int(r["n_test"]) for r in ood_rows) / denom
+        )
+    if continuous_rows:
+        status_counts: dict[str, int] = {}
+        for r in continuous_rows:
+            s = str(r.get("status", "UndefinedZeroLambda"))
+            status_counts[s] = int(status_counts.get(s, 0) + 1)
+        denom = max(sum(int(r["n_test"]) for r in continuous_rows), 1)
+        valid_nu = [(float(r["nu"]), int(r["n_test"])) for r in continuous_rows if r.get("nu") is not None]
+        valid_k2 = [(float(r["kappa2"]), int(r["n_test"])) for r in continuous_rows if r.get("kappa2") is not None]
+        metrics["continuous_order_status_counts"] = status_counts
+        metrics["continuous_order_status_mode"] = max(status_counts, key=status_counts.get)
+        metrics["continuous_order_nu"] = (
+            float(sum(v * w for v, w in valid_nu) / max(sum(w for _, w in valid_nu), 1))
+            if valid_nu
+            else None
+        )
+        metrics["continuous_order_kappa2"] = (
+            float(sum(v * w for v, w in valid_k2) / max(sum(w for _, w in valid_k2), 1))
+            if valid_k2
+            else None
+        )
+        true_nu = ds.get("thread2_true_nu")
+        if true_nu is not None and metrics["continuous_order_nu"] is not None:
+            metrics["continuous_order_nu_abs_error"] = float(
+                abs(float(metrics["continuous_order_nu"]) - float(true_nu))
+            )
+        expected = ds.get("thread2_expected_statuses")
+        if isinstance(expected, list) and expected:
+            mode = str(metrics["continuous_order_status_mode"])
+            metrics["continuous_order_boundary_ok"] = bool(mode in {str(x) for x in expected})
+            metrics["continuous_order_expected_statuses"] = [str(x) for x in expected]
+    if adaptive_rows:
+        mm_vals = [(int(r["mm_iterations"]), int(r["n_test"])) for r in adaptive_rows if "mm_iterations" in r]
+        if mm_vals:
+            metrics["mm_iterations"] = float(
+                sum(v * w for v, w in mm_vals) / max(sum(w for _, w in mm_vals), 1)
+            )
+        conv_vals = [
+            (1.0 if bool(r.get("adaptive_converged")) else 0.0, int(r["n_test"]))
+            for r in adaptive_rows
+            if "adaptive_converged" in r
+        ]
+        if conv_vals:
+            metrics["adaptive_converged_rate"] = float(
+                sum(v * w for v, w in conv_vals) / max(sum(w for _, w in conv_vals), 1)
+            )
+        grad_corr = [
+            (float(r["thread3_weight_grad_corr"]), int(r["n_test"]))
+            for r in adaptive_rows
+            if "thread3_weight_grad_corr" in r
+        ]
+        curv_corr = [
+            (float(r["thread3_weight_curvature_corr"]), int(r["n_test"]))
+            for r in adaptive_rows
+            if "thread3_weight_curvature_corr" in r
+        ]
+        if grad_corr:
+            metrics["thread3_weight_grad_corr"] = float(
+                sum(v * w for v, w in grad_corr) / max(sum(w for _, w in grad_corr), 1)
+            )
+        if curv_corr:
+            metrics["thread3_weight_curvature_corr"] = float(
+                sum(v * w for v, w in curv_corr) / max(sum(w for _, w in curv_corr), 1)
+            )
+        colloc_rows = [
+            (int(r["thread3_collocation_points"]), int(r["n_test"]))
+            for r in adaptive_rows
+            if "thread3_collocation_points" in r
+        ]
+        if colloc_rows:
+            metrics["thread3_collocation_points"] = float(
+                sum(v * w for v, w in colloc_rows) / max(sum(w for _, w in colloc_rows), 1)
+            )
     return {
         "contender": contender_name,
         "family": ds["family"],
@@ -2591,14 +3221,24 @@ def run_rust_scenario_cv(scenario, *, contender_name: str = "rust_gam", binomial
     }
 
 
-def run_rust_sas_scenario_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_rust_sas_scenario_cv(
+    scenario,
+    *,
+    ds: dict | None = None,
+    folds: list[Fold] | None = None,
+    shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
+):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds.get("family") != "binomial":
         return None
     return run_rust_scenario_cv(
         scenario,
         contender_name="rust_gam_sas",
         binomial_link="sas",
+        ds=ds,
+        folds=folds,
+        shared_fold_artifacts=shared_fold_artifacts,
     )
 
 
@@ -2609,17 +3249,22 @@ def _run_rust_gamlss_scenario_cv_variant(
     binomial_cli_family: str,
     binomial_model_spec_label: str,
     binomial_extra_fit_args: list[str] | None = None,
+    ds: dict | None = None,
+    folds: list[Fold] | None = None,
+    shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
 ):
     scenario_name = scenario["name"]
     # Run for any scenario with a valid formula mapping (not just geo scenarios).
     if _rust_fit_mapping(scenario_name) is None:
         return None
 
-    ds = dataset_for_scenario(scenario)
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     family = ds["family"]
     if family not in ("binomial", "gaussian"):
         return None
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
 
     try:
         rust_bin = _ensure_rust_binary()
@@ -2643,16 +3288,24 @@ def _run_rust_gamlss_scenario_cv_variant(
         for fold_id, fold in enumerate(folds):
             train_df = base_df.iloc[fold.train_idx].copy()
             test_df = base_df.iloc[fold.test_idx].copy()
-            # Z-score features (matches the main rust_gam contender).
-            train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
-            train_path = td_path / f"train_{fold_id}.csv"
-            test_path = td_path / f"test_{fold_id}.csv"
+            shared_artifact = (
+                shared_fold_artifacts[fold_id]
+                if shared_fold_artifacts is not None and fold_id < len(shared_fold_artifacts)
+                else None
+            )
+            if shared_artifact is not None:
+                train_path = shared_artifact.train_scaled_csv
+                test_path = shared_artifact.test_scaled_csv
+            else:
+                # Z-score features (matches the main rust_gam contender).
+                train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
+                train_path = td_path / f"train_{fold_id}.csv"
+                test_path = td_path / f"test_{fold_id}.csv"
+                train_df.to_csv(train_path, index=False)
+                test_df.to_csv(test_path, index=False)
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
             train_pred_path = td_path / f"pred_train_{fold_id}.csv"
-
-            train_df.to_csv(train_path, index=False)
-            test_df.to_csv(test_path, index=False)
 
             fit_cmd = [
                 str(rust_bin),
@@ -2783,22 +3436,38 @@ def _run_rust_gamlss_scenario_cv_variant(
     }
 
 
-def run_rust_gamlss_scenario_cv(scenario):
+def run_rust_gamlss_scenario_cv(
+    scenario,
+    *,
+    ds: dict | None = None,
+    folds: list[Fold] | None = None,
+    shared_fold_artifacts: list[SharedFoldArtifact] | None = None,
+):
     return _run_rust_gamlss_scenario_cv_variant(
         scenario,
         contender_name="rust_gamlss",
         binomial_cli_family="binomial-probit",
         binomial_model_spec_label="gamlss binomial-probit location-scale via release binary",
+        ds=ds,
+        folds=folds,
+        shared_fold_artifacts=shared_fold_artifacts,
     )
 
 
-def run_rust_gamlss_survival_cv(scenario):
+def run_rust_gamlss_survival_cv(
+    scenario,
+    *,
+    ds: dict | None = None,
+    folds: list[Fold] | None = None,
+):
     """Run the Rust binary with --survival-likelihood probit-location-scale for survival scenarios."""
     scenario_name = scenario["name"]
-    ds = dataset_for_scenario(scenario)
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
 
     try:
         rust_bin = _ensure_rust_binary()
@@ -2963,16 +3632,18 @@ def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
     return f"{ds['target']} ~ " + " + ".join(terms)
 
 
-def run_external_r_gamlss_cv(scenario):
+def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
     scenario_name = scenario["name"]
     if not _is_gamlss_benchmark_scenario(scenario_name):
         return None
 
-    ds = dataset_for_scenario(scenario)
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     family = ds["family"]
     if family not in ("binomial", "gaussian"):
         return None
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
 
     mu_formula = _gamlss_mu_formula_for_scenario(scenario_name, ds)
     if not mu_formula:
@@ -3197,9 +3868,11 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     }
 
 
-def run_external_mgcv_cv(scenario):
-    ds = dataset_for_scenario(scenario)
-    folds = folds_for_dataset(ds)
+def run_external_mgcv_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     contender_name = "r_survival_coxph" if ds["family"] == "survival" else "r_mgcv"
     mgcv_formula = None
     rust_cfg = _rust_fit_mapping(scenario["name"])
@@ -3495,11 +4168,13 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     }
 
 
-def run_external_mgcv_gaulss_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_mgcv_gaulss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
         return None
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     mu_formula = _mgcv_formula_for_scenario(scenario["name"], ds)
     rust_cfg = _rust_fit_mapping(scenario["name"])
     use_select = bool((rust_cfg or {}).get("double_penalty", True))
@@ -3710,12 +4385,14 @@ def _gamboostlss_formulas_for_scenario(scenario_name: str, ds):
     return mu_formula, sigma_formula
 
 
-def run_external_r_gamboostlss_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_r_gamboostlss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
         return None
     scenario_name = scenario["name"]
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     mu_formula, sigma_formula = _gamboostlss_formulas_for_scenario(scenario_name, ds)
     if not mu_formula:
         return None
@@ -3941,12 +4618,14 @@ def _bamlss_formulas_for_scenario(scenario_name: str, ds):
     return mu_formula, sigma_formula
 
 
-def run_external_r_bamlss_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_r_bamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
         return None
     scenario_name = scenario["name"]
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     mu_formula, sigma_formula = _bamlss_formulas_for_scenario(scenario_name, ds)
     if not mu_formula:
         return None
@@ -4184,12 +4863,14 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     }
 
 
-def run_external_r_brms_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_r_brms_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "gaussian":
         return None
     scenario_name = scenario["name"]
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     mu_formula, sigma_formula = _bamlss_formulas_for_scenario(scenario_name, ds)
     if not mu_formula:
         return None
@@ -4368,11 +5049,13 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     }
 
 
-def run_external_mgcv_survival_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_mgcv_survival_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
 
     with tempfile.TemporaryDirectory(prefix="gam_bench_mgcv_surv_cv_") as td:
         td_path = Path(td)
@@ -4551,9 +5234,11 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     }
 
 
-def run_external_pygam_cv(scenario):
-    ds = dataset_for_scenario(scenario)
-    folds = folds_for_dataset(ds)
+def run_external_pygam_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     df = pd.DataFrame(ds["rows"])
     x = df[ds["features"]].to_numpy(dtype=float) if ds["features"] else np.empty((len(df), 0))
     y = df[ds["target"]].to_numpy(dtype=float) if ds.get("target") else None
@@ -4834,8 +5519,9 @@ def run_external_pygam_cv(scenario):
     }
 
 
-def run_external_sksurv_rsf_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
     try:
@@ -4849,7 +5535,8 @@ def run_external_sksurv_rsf_cv(scenario):
             "error": f"scikit-survival import failed: {e}",
         }
 
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     df = pd.DataFrame(ds["rows"])
     feature_cols = ds["features"]
     time_col = ds["time_col"]
@@ -4911,8 +5598,9 @@ def run_external_sksurv_rsf_cv(scenario):
     }
 
 
-def run_external_sksurv_coxnet_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_sksurv_coxnet_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
     try:
@@ -4926,7 +5614,8 @@ def run_external_sksurv_coxnet_cv(scenario):
             "error": f"scikit-survival import failed: {e}",
         }
 
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     df = pd.DataFrame(ds["rows"])
     feature_cols = ds["features"]
     time_col = ds["time_col"]
@@ -4983,12 +5672,14 @@ def run_external_sksurv_coxnet_cv(scenario):
     }
 
 
-def run_external_lifelines_coxph_enet_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
 
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     df = pd.DataFrame(ds["rows"])
     feature_cols = ds["features"]
     time_col = ds["time_col"]
@@ -5057,11 +5748,13 @@ def run_external_lifelines_coxph_enet_cv(scenario):
     }
 
 
-def run_external_glmnet_cox_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_glmnet_cox_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
 
     with tempfile.TemporaryDirectory(prefix="gam_bench_glmnet_cox_cv_") as td:
         td_path = Path(td)
@@ -5227,8 +5920,9 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     }
 
 
-def run_external_sksurv_gb_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
     try:
@@ -5245,173 +5939,218 @@ def run_external_sksurv_gb_cv(scenario):
             "error": f"scikit-survival import failed: {e}",
         }
 
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     df = pd.DataFrame(ds["rows"])
     feature_cols = ds["features"]
     time_col = ds["time_col"]
     event_col = ds["event_col"]
 
-    def _run_one(model, contender_name, model_spec):
-        cv_rows = []
-        for fold in folds:
-            train_df = df.iloc[fold.train_idx].copy()
-            test_df = df.iloc[fold.test_idx].copy()
-            train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
-            x_train = train_df[feature_cols].to_numpy(dtype=float)
-            x_test = test_df[feature_cols].to_numpy(dtype=float)
-            y_train = Surv.from_arrays(
-                event=train_df[event_col].to_numpy(dtype=float) > 0.5,
-                time=train_df[time_col].to_numpy(dtype=float),
-            )
+    gb_rows = []
+    cgb_rows = []
+    gb_spec = "GradientBoostingSurvivalAnalysis(loss='coxph', n_estimators=300, lr=0.05, max_depth=3)"
+    cgb_spec = "ComponentwiseGradientBoostingSurvivalAnalysis(loss='coxph', n_estimators=500, lr=0.05)"
+    for fold in folds:
+        train_df = df.iloc[fold.train_idx].copy()
+        test_df = df.iloc[fold.test_idx].copy()
+        train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
+        x_train = train_df[feature_cols].to_numpy(dtype=float)
+        x_test = test_df[feature_cols].to_numpy(dtype=float)
+        y_train = Surv.from_arrays(
+            event=train_df[event_col].to_numpy(dtype=float) > 0.5,
+            time=train_df[time_col].to_numpy(dtype=float),
+        )
+        event_times = test_df[time_col].to_numpy(dtype=float)
+        events = test_df[event_col].to_numpy(dtype=float)
 
-            fit_start = datetime.now(timezone.utc)
-            model.fit(x_train, y_train)
-            fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
+        gb_model = GradientBoostingSurvivalAnalysis(
+            loss="coxph",
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=3,
+            random_state=CV_SEED,
+        )
+        fit_start = datetime.now(timezone.utc)
+        gb_model.fit(x_train, y_train)
+        fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
+        pred_start = datetime.now(timezone.utc)
+        gb_risk = gb_model.predict(x_test).astype(float)
+        pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
+        gb_rows.append(
+            {
+                "fit_sec": fit_sec,
+                "predict_sec": pred_sec,
+                "auc": _lifelines_cindex_from_risk(event_times, gb_risk, events),
+                "brier": survival_partial_brier_score(event_times, gb_risk, events),
+                "logloss": survival_partial_log_loss(event_times, gb_risk, events),
+                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, gb_risk, events),
+                "n_test": int(len(fold.test_idx)),
+                "model_spec": gb_spec,
+            }
+        )
 
-            pred_start = datetime.now(timezone.utc)
-            risk = model.predict(x_test).astype(float)
-            pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
+        cgb_model = ComponentwiseGradientBoostingSurvivalAnalysis(
+            loss="coxph",
+            n_estimators=500,
+            learning_rate=0.05,
+            random_state=CV_SEED,
+        )
+        fit_start = datetime.now(timezone.utc)
+        cgb_model.fit(x_train, y_train)
+        fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
+        pred_start = datetime.now(timezone.utc)
+        cgb_risk = cgb_model.predict(x_test).astype(float)
+        pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
+        cgb_rows.append(
+            {
+                "fit_sec": fit_sec,
+                "predict_sec": pred_sec,
+                "auc": _lifelines_cindex_from_risk(event_times, cgb_risk, events),
+                "brier": survival_partial_brier_score(event_times, cgb_risk, events),
+                "logloss": survival_partial_log_loss(event_times, cgb_risk, events),
+                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, cgb_risk, events),
+                "n_test": int(len(fold.test_idx)),
+                "model_spec": cgb_spec,
+            }
+        )
 
-            event_times = test_df[time_col].to_numpy(dtype=float)
-            events = test_df[event_col].to_numpy(dtype=float)
-            cv_rows.append(
-                {
-                    "fit_sec": fit_sec,
-                    "predict_sec": pred_sec,
-                    "auc": _lifelines_cindex_from_risk(event_times, risk, events),
-                    "brier": survival_partial_brier_score(event_times, risk, events),
-                    "logloss": survival_partial_log_loss(event_times, risk, events),
-                    "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
-                    "n_test": int(len(fold.test_idx)),
-                    "model_spec": model_spec,
-                }
-            )
-
-        metrics = aggregate_cv_rows(cv_rows, ds["family"])
-        return {
-            "contender": contender_name,
+    gb_metrics = aggregate_cv_rows(gb_rows, ds["family"])
+    cgb_metrics = aggregate_cv_rows(cgb_rows, ds["family"])
+    return [
+        {
+            "contender": "python_sksurv_gb_coxph",
             "family": ds["family"],
             "scenario_name": scenario["name"],
             "status": "ok",
-            **metrics,
-            "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-        }
-
-    gb_model = GradientBoostingSurvivalAnalysis(
-        loss="coxph",
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=3,
-        random_state=CV_SEED,
-    )
-    gb_row = _run_one(
-        model=gb_model,
-        contender_name="python_sksurv_gb_coxph",
-        model_spec="GradientBoostingSurvivalAnalysis(loss='coxph', n_estimators=300, lr=0.05, max_depth=3)",
-    )
-    if gb_row.get("status") != "ok":
-        return gb_row
-
-    cgb_model = ComponentwiseGradientBoostingSurvivalAnalysis(
-        loss="coxph",
-        n_estimators=500,
-        learning_rate=0.05,
-        random_state=CV_SEED,
-    )
-    cgb_row = _run_one(
-        model=cgb_model,
-        contender_name="python_sksurv_componentwise_gb_coxph",
-        model_spec="ComponentwiseGradientBoostingSurvivalAnalysis(loss='coxph', n_estimators=500, lr=0.05)",
-    )
-    if cgb_row.get("status") != "ok":
-        return cgb_row
-
-    return [gb_row, cgb_row]
+            **gb_metrics,
+            "model_spec": f"{gb_rows[0]['model_spec']} [5-fold CV]",
+        },
+        {
+            "contender": "python_sksurv_componentwise_gb_coxph",
+            "family": ds["family"],
+            "scenario_name": scenario["name"],
+            "status": "ok",
+            **cgb_metrics,
+            "model_spec": f"{cgb_rows[0]['model_spec']} [5-fold CV]",
+        },
+    ]
 
 
-def run_external_lifelines_aft_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
 
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     df = pd.DataFrame(ds["rows"])
     feature_cols = ds["features"]
     time_col = ds["time_col"]
     event_col = ds["event_col"]
 
-    def _run_one(fitter_cls, contender_name, model_spec_base):
-        cv_rows = []
-        for fold in folds:
-            train_df = df.iloc[fold.train_idx].copy()
-            test_df = df.iloc[fold.test_idx].copy()
-            train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
+    weibull_rows = []
+    lognormal_rows = []
+    weibull_spec = "WeibullAFTFitter(train-fold z-score; penalizer=1e-3; l1_ratio=0.2)"
+    lognormal_spec = "LogNormalAFTFitter(train-fold z-score; penalizer=1e-3; l1_ratio=0.2)"
+    for fold in folds:
+        train_df = df.iloc[fold.train_idx].copy()
+        test_df = df.iloc[fold.test_idx].copy()
+        train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
+        event_times = test_df[time_col].to_numpy(dtype=float)
+        events = test_df[event_col].to_numpy(dtype=float)
 
-            fit_start = datetime.now(timezone.utc)
-            fitter = fitter_cls(penalizer=1e-3, l1_ratio=0.2)
-            with warnings.catch_warnings(record=True) as wlist:
-                warnings.simplefilter("always")
-                fitter.fit(
-                    train_df[[*feature_cols, time_col, event_col]],
-                    duration_col=time_col,
-                    event_col=event_col,
-                )
-            conv_warn = [w for w in wlist if issubclass(w.category, ConvergenceWarning)]
-            fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
-
-            pred_start = datetime.now(timezone.utc)
-            pred_time = fitter.predict_expectation(test_df[feature_cols]).to_numpy(dtype=float).reshape(-1)
-            risk = -pred_time
-            pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
-            event_times = test_df[time_col].to_numpy(dtype=float)
-            events = test_df[event_col].to_numpy(dtype=float)
-            cv_rows.append(
-                {
-                    "fit_sec": fit_sec,
-                    "predict_sec": pred_sec,
-                    "auc": _lifelines_cindex_from_risk(event_times, risk, events),
-                    "brier": survival_partial_brier_score(event_times, risk, events),
-                    "logloss": survival_partial_log_loss(event_times, risk, events),
-                    "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
-                    "n_test": int(len(fold.test_idx)),
-                    "warning": (
-                        f"lifelines convergence warning: {str(conv_warn[0].message)}"
-                        if conv_warn
-                        else None
-                    ),
-                    "model_spec": model_spec_base,
-                }
+        weibull = WeibullAFTFitter(penalizer=1e-3, l1_ratio=0.2)
+        fit_start = datetime.now(timezone.utc)
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            weibull.fit(
+                train_df[[*feature_cols, time_col, event_col]],
+                duration_col=time_col,
+                event_col=event_col,
             )
+        conv_warn = [w for w in wlist if issubclass(w.category, ConvergenceWarning)]
+        fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
+        pred_start = datetime.now(timezone.utc)
+        pred_time = weibull.predict_expectation(test_df[feature_cols]).to_numpy(dtype=float).reshape(-1)
+        risk = -pred_time
+        pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
+        weibull_rows.append(
+            {
+                "fit_sec": fit_sec,
+                "predict_sec": pred_sec,
+                "auc": _lifelines_cindex_from_risk(event_times, risk, events),
+                "brier": survival_partial_brier_score(event_times, risk, events),
+                "logloss": survival_partial_log_loss(event_times, risk, events),
+                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
+                "n_test": int(len(fold.test_idx)),
+                "warning": (
+                    f"lifelines convergence warning: {str(conv_warn[0].message)}"
+                    if conv_warn
+                    else None
+                ),
+                "model_spec": weibull_spec,
+            }
+        )
 
-        metrics = aggregate_cv_rows(cv_rows, ds["family"])
-        return {
-            "contender": contender_name,
+        lognormal = LogNormalAFTFitter(penalizer=1e-3, l1_ratio=0.2)
+        fit_start = datetime.now(timezone.utc)
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            lognormal.fit(
+                train_df[[*feature_cols, time_col, event_col]],
+                duration_col=time_col,
+                event_col=event_col,
+            )
+        conv_warn = [w for w in wlist if issubclass(w.category, ConvergenceWarning)]
+        fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
+        pred_start = datetime.now(timezone.utc)
+        pred_time = lognormal.predict_expectation(test_df[feature_cols]).to_numpy(dtype=float).reshape(-1)
+        risk = -pred_time
+        pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
+        lognormal_rows.append(
+            {
+                "fit_sec": fit_sec,
+                "predict_sec": pred_sec,
+                "auc": _lifelines_cindex_from_risk(event_times, risk, events),
+                "brier": survival_partial_brier_score(event_times, risk, events),
+                "logloss": survival_partial_log_loss(event_times, risk, events),
+                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
+                "n_test": int(len(fold.test_idx)),
+                "warning": (
+                    f"lifelines convergence warning: {str(conv_warn[0].message)}"
+                    if conv_warn
+                    else None
+                ),
+                "model_spec": lognormal_spec,
+            }
+        )
+
+    weibull_metrics = aggregate_cv_rows(weibull_rows, ds["family"])
+    lognormal_metrics = aggregate_cv_rows(lognormal_rows, ds["family"])
+    return [
+        {
+            "contender": "python_lifelines_weibull_aft",
             "family": ds["family"],
             "scenario_name": scenario["name"],
             "status": "ok",
-            **metrics,
-            "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-        }
-
-    weibull_row = _run_one(
-        fitter_cls=WeibullAFTFitter,
-        contender_name="python_lifelines_weibull_aft",
-        model_spec_base="WeibullAFTFitter(train-fold z-score; penalizer=1e-3; l1_ratio=0.2)",
-    )
-    if weibull_row.get("status") != "ok":
-        return weibull_row
-    lognormal_row = _run_one(
-        fitter_cls=LogNormalAFTFitter,
-        contender_name="python_lifelines_lognormal_aft",
-        model_spec_base="LogNormalAFTFitter(train-fold z-score; penalizer=1e-3; l1_ratio=0.2)",
-    )
-    if lognormal_row.get("status") != "ok":
-        return lognormal_row
-    return [weibull_row, lognormal_row]
+            **weibull_metrics,
+            "model_spec": f"{weibull_rows[0]['model_spec']} [5-fold CV]",
+        },
+        {
+            "contender": "python_lifelines_lognormal_aft",
+            "family": ds["family"],
+            "scenario_name": scenario["name"],
+            "status": "ok",
+            **lognormal_metrics,
+            "model_spec": f"{lognormal_rows[0]['model_spec']} [5-fold CV]",
+        },
+    ]
 
 
-def run_external_xgboost_aft_cv(scenario):
-    ds = dataset_for_scenario(scenario)
+def run_external_xgboost_aft_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
+    if ds is None:
+        ds = dataset_for_scenario(scenario)
     if ds["family"] != "survival":
         return None
     try:
@@ -5424,7 +6163,8 @@ def run_external_xgboost_aft_cv(scenario):
             "error": f"xgboost import failed: {e}",
         }
 
-    folds = folds_for_dataset(ds)
+    if folds is None:
+        folds = folds_for_dataset(ds)
     df = pd.DataFrame(ds["rows"])
     feature_cols = ds["features"]
     time_col = ds["time_col"]
@@ -5505,10 +6245,11 @@ def run_external_xgboost_aft_cv(scenario):
     }
 
 
-def _assert_basis_parity_for_scenario(s_cfg):
+def _assert_basis_parity_for_scenario(s_cfg, *, ds: dict | None = None):
     # Fairness guard: if Rust mapping requests a named spline family, mgcv must
     # emit the equivalent basis for the same scenario.
-    ds = dataset_for_scenario(s_cfg)
+    if ds is None:
+        ds = dataset_for_scenario(s_cfg)
     scenario_name = s_cfg["name"]
     rust_cfg = _rust_fit_mapping(scenario_name)
     if rust_cfg is None:
@@ -5538,10 +6279,11 @@ def _is_contender_enabled(s_cfg, contender: str) -> bool:
     return contender not in excluded
 
 
-def _should_run_pygam_for_scenario(s_cfg):
+def _should_run_pygam_for_scenario(s_cfg, *, ds: dict | None = None):
     if not _is_contender_enabled(s_cfg, "python_pygam"):
         return False
-    ds = dataset_for_scenario(s_cfg)
+    if ds is None:
+        ds = dataset_for_scenario(s_cfg)
     # pyGAM has no native censored-likelihood survival model support in this harness.
     if ds["family"] == "survival":
         return False
@@ -5593,91 +6335,220 @@ def main():
         if not scenarios:
             raise SystemExit("Scenario filter matched zero scenarios.")
 
-    for s_cfg in scenarios:
-        _assert_basis_parity_for_scenario(s_cfg)
-
     results = []
     for s_cfg in scenarios:
-        # Invariant: Rust GAM must run for every scenario, including survival.
-        results.append(run_rust_scenario_cv(s_cfg))
-        rust_sas_row = run_rust_sas_scenario_cv(s_cfg) if _is_contender_enabled(s_cfg, "rust_gam_sas") else None
-        if rust_sas_row is not None:
-            results.append(rust_sas_row)
-        rust_gamlss_row = run_rust_gamlss_scenario_cv(s_cfg)
-        if rust_gamlss_row is not None:
-            results.append(rust_gamlss_row)
-        rust_gamlss_surv_row = run_rust_gamlss_survival_cv(s_cfg) if _is_contender_enabled(s_cfg, "rust_gamlss_survival") else None
-        if rust_gamlss_surv_row is not None:
-            results.append(rust_gamlss_surv_row)
-        r_gamlss_row = run_external_r_gamlss_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_gamlss") else None
-        if r_gamlss_row is not None:
-            results.append(r_gamlss_row)
-        if _is_contender_enabled(s_cfg, "r_mgcv"):
-            results.append(run_external_mgcv_cv(s_cfg))
-        mgcv_gaulss_row = run_external_mgcv_gaulss_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_mgcv_gaulss") else None
-        if mgcv_gaulss_row is not None:
-            results.append(mgcv_gaulss_row)
-        gamboostlss_row = (
-            run_external_r_gamboostlss_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_gamboostlss") else None
-        )
-        if gamboostlss_row is not None:
-            results.append(gamboostlss_row)
-        bamlss_row = run_external_r_bamlss_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_bamlss") else None
-        if bamlss_row is not None:
-            results.append(bamlss_row)
-        brms_row = run_external_r_brms_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_brms") else None
-        if brms_row is not None:
-            results.append(brms_row)
-        mgcv_surv_row = (
-            run_external_mgcv_survival_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_mgcv_coxph") else None
-        )
-        if mgcv_surv_row is not None:
-            results.append(mgcv_surv_row)
-        if _should_run_pygam_for_scenario(s_cfg):
-            results.append(run_external_pygam_cv(s_cfg))
-        sksurv_rsf_row = (
-            run_external_sksurv_rsf_cv(s_cfg) if _is_contender_enabled(s_cfg, "python_sksurv_rsf") else None
-        )
-        if sksurv_rsf_row is not None:
-            results.append(sksurv_rsf_row)
-        sksurv_coxnet_row = (
-            run_external_sksurv_coxnet_cv(s_cfg)
-            if _is_contender_enabled(s_cfg, "python_sksurv_coxnet")
-            else None
-        )
-        if sksurv_coxnet_row is not None:
-            results.append(sksurv_coxnet_row)
-        lifelines_enet_row = (
-            run_external_lifelines_coxph_enet_cv(s_cfg)
-            if _is_contender_enabled(s_cfg, "python_lifelines_coxph_enet")
-            else None
-        )
-        if lifelines_enet_row is not None:
-            results.append(lifelines_enet_row)
-        glmnet_cox_row = run_external_glmnet_cox_cv(s_cfg) if _is_contender_enabled(s_cfg, "r_glmnet_cox") else None
-        if glmnet_cox_row is not None:
-            results.append(glmnet_cox_row)
-        sksurv_gb_rows = (
-            run_external_sksurv_gb_cv(s_cfg) if _is_contender_enabled(s_cfg, "python_sksurv_gb_coxph") else None
-        )
-        if sksurv_gb_rows is not None:
-            if isinstance(sksurv_gb_rows, list):
-                results.extend(sksurv_gb_rows)
-            else:
-                results.append(sksurv_gb_rows)
-        lifelines_aft_rows = (
-            run_external_lifelines_aft_cv(s_cfg)
-            if _is_contender_enabled(s_cfg, "python_lifelines_weibull_aft")
-            else None
-        )
-        if lifelines_aft_rows is not None:
-            if isinstance(lifelines_aft_rows, list):
-                results.extend(lifelines_aft_rows)
-            else:
-                results.append(lifelines_aft_rows)
-        xgb_aft_row = run_external_xgboost_aft_cv(s_cfg) if _is_contender_enabled(s_cfg, "python_xgboost_aft") else None
-        if xgb_aft_row is not None:
-            results.append(xgb_aft_row)
+        ds = dataset_for_scenario(s_cfg)
+        folds = folds_for_dataset(ds)
+        _assert_basis_parity_for_scenario(s_cfg, ds=ds)
+        with tempfile.TemporaryDirectory(prefix="gam_bench_shared_folds_", dir=str(BENCH_DIR)) as shared_td:
+            shared_fold_artifacts = build_shared_fold_artifacts(ds, folds, Path(shared_td))
+            # Invariant: Rust GAM must run for every scenario, including survival.
+            results.append(
+                run_rust_scenario_cv(
+                    s_cfg,
+                    ds=ds,
+                    folds=folds,
+                    shared_fold_artifacts=shared_fold_artifacts,
+                )
+            )
+            if _is_matern_rust_scenario(s_cfg):
+                results.append(
+                    run_rust_scenario_cv(
+                        s_cfg,
+                        contender_name="rust_matern_decomposed",
+                        ds=ds,
+                        folds=folds,
+                        shared_fold_artifacts=shared_fold_artifacts,
+                        rust_cfg_override={"double_penalty": True},
+                        eval_ood=True,
+                    )
+                )
+                results.append(
+                    run_rust_scenario_cv(
+                        s_cfg,
+                        contender_name="rust_matern_standard",
+                        ds=ds,
+                        folds=folds,
+                        shared_fold_artifacts=shared_fold_artifacts,
+                        rust_cfg_override={"double_penalty": False},
+                        eval_ood=True,
+                    )
+                )
+            if str(s_cfg.get("name", "")).startswith("thread2_"):
+                results.append(
+                    run_rust_scenario_cv(
+                        s_cfg,
+                        contender_name="rust_thread2_order_probe",
+                        ds=ds,
+                        folds=folds,
+                        shared_fold_artifacts=shared_fold_artifacts,
+                        rust_cfg_override={"double_penalty": True},
+                        collect_continuous_order=True,
+                    )
+                )
+            if str(s_cfg.get("name", "")) == "thread3_admixture_cliff":
+                results.append(
+                    run_rust_scenario_cv(
+                        s_cfg,
+                        contender_name="rust_thread3_standard_reml",
+                        ds=ds,
+                        folds=folds,
+                        shared_fold_artifacts=shared_fold_artifacts,
+                        rust_cfg_override={"double_penalty": True},
+                    )
+                )
+                results.append(
+                    run_rust_scenario_cv(
+                        s_cfg,
+                        contender_name="rust_thread3_adaptive_reml",
+                        ds=ds,
+                        folds=folds,
+                        shared_fold_artifacts=shared_fold_artifacts,
+                        rust_cfg_override={"double_penalty": True},
+                        collect_adaptive_diagnostics=True,
+                        rust_fit_extra_args=[
+                            "--adaptive-regularization",
+                            "--adaptive-max-mm-iter",
+                            "8",
+                            "--adaptive-beta-rel-tol",
+                            "1e-3",
+                            "--adaptive-min-epsilon",
+                            "1e-8",
+                            "--adaptive-weight-floor",
+                            "1e-8",
+                            "--adaptive-weight-ceiling",
+                            "1e8",
+                        ],
+                    )
+                )
+            rust_sas_row = (
+                run_rust_sas_scenario_cv(
+                    s_cfg,
+                    ds=ds,
+                    folds=folds,
+                    shared_fold_artifacts=shared_fold_artifacts,
+                )
+                if _is_contender_enabled(s_cfg, "rust_gam_sas")
+                else None
+            )
+            if rust_sas_row is not None:
+                results.append(rust_sas_row)
+            rust_gamlss_row = run_rust_gamlss_scenario_cv(
+                s_cfg,
+                ds=ds,
+                folds=folds,
+                shared_fold_artifacts=shared_fold_artifacts,
+            )
+            if rust_gamlss_row is not None:
+                results.append(rust_gamlss_row)
+            rust_gamlss_surv_row = (
+                run_rust_gamlss_survival_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "rust_gamlss_survival")
+                else None
+            )
+            if rust_gamlss_surv_row is not None:
+                results.append(rust_gamlss_surv_row)
+            r_gamlss_row = (
+                run_external_r_gamlss_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "r_gamlss")
+                else None
+            )
+            if r_gamlss_row is not None:
+                results.append(r_gamlss_row)
+            if _is_contender_enabled(s_cfg, "r_mgcv"):
+                results.append(run_external_mgcv_cv(s_cfg, ds=ds, folds=folds))
+            mgcv_gaulss_row = (
+                run_external_mgcv_gaulss_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "r_mgcv_gaulss")
+                else None
+            )
+            if mgcv_gaulss_row is not None:
+                results.append(mgcv_gaulss_row)
+            gamboostlss_row = (
+                run_external_r_gamboostlss_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "r_gamboostlss")
+                else None
+            )
+            if gamboostlss_row is not None:
+                results.append(gamboostlss_row)
+            bamlss_row = (
+                run_external_r_bamlss_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "r_bamlss")
+                else None
+            )
+            if bamlss_row is not None:
+                results.append(bamlss_row)
+            brms_row = (
+                run_external_r_brms_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "r_brms")
+                else None
+            )
+            if brms_row is not None:
+                results.append(brms_row)
+            mgcv_surv_row = (
+                run_external_mgcv_survival_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "r_mgcv_coxph")
+                else None
+            )
+            if mgcv_surv_row is not None:
+                results.append(mgcv_surv_row)
+            if _should_run_pygam_for_scenario(s_cfg, ds=ds):
+                results.append(run_external_pygam_cv(s_cfg, ds=ds, folds=folds))
+            sksurv_rsf_row = (
+                run_external_sksurv_rsf_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "python_sksurv_rsf")
+                else None
+            )
+            if sksurv_rsf_row is not None:
+                results.append(sksurv_rsf_row)
+            sksurv_coxnet_row = (
+                run_external_sksurv_coxnet_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "python_sksurv_coxnet")
+                else None
+            )
+            if sksurv_coxnet_row is not None:
+                results.append(sksurv_coxnet_row)
+            lifelines_enet_row = (
+                run_external_lifelines_coxph_enet_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "python_lifelines_coxph_enet")
+                else None
+            )
+            if lifelines_enet_row is not None:
+                results.append(lifelines_enet_row)
+            glmnet_cox_row = (
+                run_external_glmnet_cox_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "r_glmnet_cox")
+                else None
+            )
+            if glmnet_cox_row is not None:
+                results.append(glmnet_cox_row)
+            sksurv_gb_rows = (
+                run_external_sksurv_gb_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "python_sksurv_gb_coxph")
+                else None
+            )
+            if sksurv_gb_rows is not None:
+                if isinstance(sksurv_gb_rows, list):
+                    results.extend(sksurv_gb_rows)
+                else:
+                    results.append(sksurv_gb_rows)
+            lifelines_aft_rows = (
+                run_external_lifelines_aft_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "python_lifelines_weibull_aft")
+                else None
+            )
+            if lifelines_aft_rows is not None:
+                if isinstance(lifelines_aft_rows, list):
+                    results.extend(lifelines_aft_rows)
+                else:
+                    results.append(lifelines_aft_rows)
+            xgb_aft_row = (
+                run_external_xgboost_aft_cv(s_cfg, ds=ds, folds=folds)
+                if _is_contender_enabled(s_cfg, "python_xgboost_aft")
+                else None
+            )
+            if xgb_aft_row is not None:
+                results.append(xgb_aft_row)
 
     for s_cfg in scenarios:
         s_name = s_cfg["name"]

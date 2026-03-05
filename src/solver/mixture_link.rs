@@ -5,11 +5,14 @@ use crate::types::{
     SasLinkSpec, SasLinkState,
 };
 use ndarray::Array1;
+use statrs::function::beta::{beta_reg, ln_beta};
+use statrs::function::gamma::digamma;
 
 const ETA_CLAMP_GENERAL: f64 = 30.0;
 const ETA_CLAMP_LOGIT: f64 = 700.0;
 const SAS_U_CLAMP: f64 = 50.0;
 const SAS_LOG_DELTA_BOUND: f64 = 12.0;
+const BETA_LOGISTIC_U_EPS: f64 = 1e-12;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InverseLinkJet {
@@ -34,6 +37,40 @@ pub struct SasJetWithParamPartials {
     pub djet_dlog_delta: InverseLinkJet,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkParamPartials {
+    Mixture(MixtureJetWithRhoPartials),
+    Sas(SasJetWithParamPartials),
+}
+
+/// Trait-based inverse-link kernel interface.
+///
+/// Implementors provide pointwise inverse-link derivatives wrt `eta`:
+/// `F(eta), F'(eta), F''(eta), F'''(eta)`.
+/// Optionally they may expose parameter partials used by outer-loop optimization.
+pub trait InverseLinkKernel {
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError>;
+
+    fn param_partials(&self, _eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProbitLinkKernel;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogitLinkKernel;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CLogLogLinkKernel;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogLogLinkKernel;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CauchitLinkKernel;
+
 impl SasLinkState {
     /// Construct SAS state from raw optimizer parameters using the same bounded
     /// transform used everywhere in fitting/evaluation.
@@ -51,6 +88,18 @@ impl SasLinkState {
 
 pub fn state_from_sas_spec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
     SasLinkState::new(spec.initial_epsilon, spec.initial_log_delta)
+}
+
+pub fn state_from_beta_logistic_spec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
+    if !spec.initial_epsilon.is_finite() || !spec.initial_log_delta.is_finite() {
+        return Err("Beta-Logistic link parameters must be finite".to_string());
+    }
+    let delta_raw = spec.initial_log_delta;
+    Ok(SasLinkState {
+        epsilon: spec.initial_epsilon,
+        log_delta: delta_raw,
+        delta: delta_raw.exp(),
+    })
 }
 
 #[inline]
@@ -104,8 +153,8 @@ fn sas_delta_from_raw_log_delta(raw_log_delta: f64) -> f64 {
 }
 
 pub fn validate_mixture_spec(spec: &MixtureLinkSpec) -> Result<(), String> {
-    if spec.components.len() < 2 {
-        return Err("mixture link requires at least 2 components".to_string());
+    if spec.components.is_empty() {
+        return Err("mixture link requires at least 1 component".to_string());
     }
     if spec.initial_rho.len() + 1 != spec.components.len() {
         return Err(format!(
@@ -236,6 +285,145 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
     }
 }
 
+impl InverseLinkKernel for ProbitLinkKernel {
+    #[inline]
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        Ok(component_inverse_link_jet(LinkComponent::Probit, eta))
+    }
+}
+
+impl InverseLinkKernel for LogitLinkKernel {
+    #[inline]
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        Ok(component_inverse_link_jet(LinkComponent::Logit, eta))
+    }
+}
+
+impl InverseLinkKernel for CLogLogLinkKernel {
+    #[inline]
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        Ok(component_inverse_link_jet(LinkComponent::CLogLog, eta))
+    }
+}
+
+impl InverseLinkKernel for LogLogLinkKernel {
+    #[inline]
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        Ok(component_inverse_link_jet(LinkComponent::LogLog, eta))
+    }
+}
+
+impl InverseLinkKernel for CauchitLinkKernel {
+    #[inline]
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        Ok(component_inverse_link_jet(LinkComponent::Cauchit, eta))
+    }
+}
+
+impl InverseLinkKernel for LinkComponent {
+    #[inline]
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        Ok(component_inverse_link_jet(*self, eta))
+    }
+}
+
+impl InverseLinkKernel for LinkFunction {
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        match self {
+            LinkFunction::Logit => LogitLinkKernel.jet(eta),
+            LinkFunction::Probit => ProbitLinkKernel.jet(eta),
+            LinkFunction::CLogLog => CLogLogLinkKernel.jet(eta),
+            LinkFunction::Identity => Ok(InverseLinkJet {
+                mu: eta,
+                d1: 1.0,
+                d2: 0.0,
+                d3: 0.0,
+            }),
+            LinkFunction::Sas => Err(EstimationError::InvalidInput(
+                "LinkFunction::Sas inverse-link requires explicit SAS link state".to_string(),
+            )),
+            LinkFunction::BetaLogistic => Err(EstimationError::InvalidInput(
+                "LinkFunction::BetaLogistic inverse-link requires explicit Beta-Logistic link state"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+impl InverseLinkKernel for SasLinkState {
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        Ok(sas_inverse_link_jet(eta, self.epsilon, self.log_delta))
+    }
+
+    fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
+        Ok(Some(LinkParamPartials::Sas(
+            sas_inverse_link_jet_with_param_partials(eta, self.epsilon, self.log_delta),
+        )))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BetaLogisticKernel {
+    pub delta: f64,
+    pub epsilon: f64,
+}
+
+impl InverseLinkKernel for BetaLogisticKernel {
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        Ok(beta_logistic_inverse_link_jet(
+            eta,
+            self.delta,
+            self.epsilon,
+        ))
+    }
+
+    fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
+        Ok(Some(LinkParamPartials::Sas(
+            beta_logistic_inverse_link_jet_with_param_partials(eta, self.delta, self.epsilon),
+        )))
+    }
+}
+
+impl InverseLinkKernel for MixtureLinkState {
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        Ok(mixture_inverse_link_jet(self, eta))
+    }
+
+    fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
+        Ok(Some(LinkParamPartials::Mixture(
+            mixture_inverse_link_jet_with_rho_partials(self, eta),
+        )))
+    }
+}
+
+impl InverseLinkKernel for InverseLink {
+    fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
+        match self {
+            InverseLink::Standard(link_fn) => link_fn.jet(eta),
+            InverseLink::Sas(state) => state.jet(eta),
+            InverseLink::BetaLogistic(state) => BetaLogisticKernel {
+                delta: state.log_delta,
+                epsilon: state.epsilon,
+            }
+            .jet(eta),
+            InverseLink::Mixture(state) => state.jet(eta),
+        }
+    }
+
+    fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
+        match self {
+            InverseLink::Standard(_) => Ok(None),
+            InverseLink::Sas(state) => state.param_partials(eta),
+            InverseLink::BetaLogistic(state) => BetaLogisticKernel {
+                delta: state.log_delta,
+                epsilon: state.epsilon,
+            }
+            .param_partials(eta),
+            InverseLink::Mixture(state) => state.param_partials(eta),
+        }
+    }
+}
+
 /// Central family-aware inverse-link jet dispatch.
 ///
 /// For `BinomialSas` and `BinomialMixture`, required state must be provided.
@@ -243,17 +431,15 @@ pub fn inverse_link_jet_for_inverse_link(
     link: &InverseLink,
     eta: f64,
 ) -> Result<InverseLinkJet, EstimationError> {
-    match link {
-        InverseLink::Standard(link_fn) => {
-            inverse_link_jet_for_link_function(*link_fn, eta, None, None)
-        }
-        InverseLink::Sas(state) => {
-            inverse_link_jet_for_link_function(LinkFunction::Sas, eta, None, Some(state))
-        }
-        InverseLink::Mixture(state) => {
-            inverse_link_jet_for_link_function(LinkFunction::Logit, eta, Some(state), None)
-        }
-    }
+    link.jet(eta)
+}
+
+#[inline]
+pub fn inverse_link_param_partials_for_inverse_link(
+    link: &InverseLink,
+    eta: f64,
+) -> Result<Option<LinkParamPartials>, EstimationError> {
+    link.param_partials(eta)
 }
 
 pub fn inverse_link_jet_for_link_function(
@@ -263,25 +449,19 @@ pub fn inverse_link_jet_for_link_function(
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<InverseLinkJet, EstimationError> {
     if let Some(state) = mixture_link_state {
-        return Ok(mixture_inverse_link_jet(state, eta));
+        return state.jet(eta);
     }
     if let Some(sas) = sas_link_state {
-        return Ok(sas_inverse_link_jet(eta, sas.epsilon, sas.log_delta));
+        return match link {
+            LinkFunction::BetaLogistic => BetaLogisticKernel {
+                delta: sas.log_delta,
+                epsilon: sas.epsilon,
+            }
+            .jet(eta),
+            _ => sas.jet(eta),
+        };
     }
-    match link {
-        LinkFunction::Logit => Ok(component_inverse_link_jet(LinkComponent::Logit, eta)),
-        LinkFunction::Probit => Ok(component_inverse_link_jet(LinkComponent::Probit, eta)),
-        LinkFunction::CLogLog => Ok(component_inverse_link_jet(LinkComponent::CLogLog, eta)),
-        LinkFunction::Identity => Ok(InverseLinkJet {
-            mu: eta,
-            d1: 1.0,
-            d2: 0.0,
-            d3: 0.0,
-        }),
-        LinkFunction::Sas => Err(EstimationError::InvalidInput(
-            "LinkFunction::Sas inverse-link requires explicit SAS link state".to_string(),
-        )),
-    }
+    link.jet(eta)
 }
 
 pub fn inverse_link_jet_for_family(
@@ -324,6 +504,17 @@ pub fn inverse_link_jet_for_family(
         .map_err(|_| {
             EstimationError::InvalidInput(
                 "BinomialSas inverse-link requires SAS link state".to_string(),
+            )
+        }),
+        LikelihoodFamily::BinomialBetaLogistic => inverse_link_jet_for_link_function(
+            LinkFunction::BetaLogistic,
+            eta,
+            mixture_link_state,
+            sas_link_state,
+        )
+        .map_err(|_| {
+            EstimationError::InvalidInput(
+                "BinomialBetaLogistic inverse-link requires Beta-Logistic link state".to_string(),
             )
         }),
         LikelihoodFamily::BinomialMixture => {
@@ -434,6 +625,96 @@ pub fn mixture_inverse_link_jet_with_rho_partials_into(
         };
     }
     mixed
+}
+
+#[inline]
+fn logistic_u_with_derivatives(eta: f64) -> (f64, f64) {
+    let e = eta.clamp(-ETA_CLAMP_LOGIT, ETA_CLAMP_LOGIT);
+    let u = if e >= 0.0 {
+        let z = (-e).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = e.exp();
+        z / (1.0 + z)
+    };
+    let u = u.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
+    let du = u * (1.0 - u);
+    (u, du)
+}
+
+/// Beta-Logistic inverse-link jet for:
+///   u = logistic(eta)
+///   a = exp(delta - epsilon), b = exp(delta + epsilon)
+///   mu = I_u(a, b)
+pub fn beta_logistic_inverse_link_jet(eta: f64, delta: f64, epsilon: f64) -> InverseLinkJet {
+    let (u, du) = logistic_u_with_derivatives(eta);
+    let a = (delta - epsilon).exp();
+    let b = (delta + epsilon).exp();
+    let mu = beta_reg(a, b, u).clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
+    let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
+    let d1 = log_d1.exp();
+    let t = a * (1.0 - u) - b * u;
+    let d2 = d1 * t;
+    let d3 = d1 * (t * t - (a + b) * du);
+    InverseLinkJet { mu, d1, d2, d3 }
+}
+
+pub fn beta_logistic_inverse_link_jet_with_param_partials(
+    eta: f64,
+    delta: f64,
+    epsilon: f64,
+) -> SasJetWithParamPartials {
+    let (u, du) = logistic_u_with_derivatives(eta);
+    let a = (delta - epsilon).exp();
+    let b = (delta + epsilon).exp();
+    let mu = beta_reg(a, b, u).clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
+    let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
+    let d1 = log_d1.exp();
+    let t = a * (1.0 - u) - b * u;
+    let d2 = d1 * t;
+    let k = t * t - (a + b) * du;
+    let d3 = d1 * k;
+    let jet = InverseLinkJet { mu, d1, d2, d3 };
+
+    let psi_a = digamma(a);
+    let psi_b = digamma(b);
+    let psi_ab = digamma(a + b);
+    let la = u.ln() - psi_a + psi_ab;
+    let lb = (1.0 - u).ln() - psi_b + psi_ab;
+
+    let partials_for = |a_p: f64, b_p: f64, dmu: f64| -> InverseLinkJet {
+        let logd1_p = a_p * la + b_p * lb;
+        let d1_p = d1 * logd1_p;
+        let t_p = a_p * (1.0 - u) - b_p * u;
+        let d2_p = d1_p * t + d1 * t_p;
+        let k_p = 2.0 * t * t_p - (a_p + b_p) * du;
+        let d3_p = d1_p * k + d1 * k_p;
+        InverseLinkJet {
+            mu: dmu,
+            d1: d1_p,
+            d2: d2_p,
+            d3: d3_p,
+        }
+    };
+
+    let mu_only = |d: f64, e: f64| -> f64 {
+        let aa = (d - e).exp();
+        let bb = (d + e).exp();
+        beta_reg(aa, bb, u).clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS)
+    };
+    let h_delta = 1e-6 * (1.0 + delta.abs());
+    let h_epsilon = 1e-6 * (1.0 + epsilon.abs());
+    let dmu_ddelta =
+        (mu_only(delta + h_delta, epsilon) - mu_only(delta - h_delta, epsilon)) / (2.0 * h_delta);
+    let dmu_depsilon = (mu_only(delta, epsilon + h_epsilon) - mu_only(delta, epsilon - h_epsilon))
+        / (2.0 * h_epsilon);
+    let djet_ddelta = partials_for(a, b, dmu_ddelta);
+    let djet_depsilon = partials_for(-a, b, dmu_depsilon);
+    SasJetWithParamPartials {
+        jet,
+        djet_depsilon,
+        djet_dlog_delta: djet_ddelta,
+    }
 }
 
 /// SAS inverse-link jet for:
@@ -777,5 +1058,85 @@ mod tests {
         )
         .expect_err("mixture without state should error");
         assert!(mix_err.to_string().contains("requires mixture link state"));
+    }
+
+    #[test]
+    fn beta_logistic_reduces_to_logit_at_delta0_epsilon0() {
+        let eta = 0.42;
+        let j_bl = beta_logistic_inverse_link_jet(eta, 0.0, 0.0);
+        let j_logit = component_inverse_link_jet(LinkComponent::Logit, eta);
+        assert!((j_bl.mu - j_logit.mu).abs() < 1e-10);
+        assert!((j_bl.d1 - j_logit.d1).abs() < 1e-10);
+        assert!((j_bl.d2 - j_logit.d2).abs() < 1e-10);
+        assert!((j_bl.d3 - j_logit.d3).abs() < 1e-10);
+    }
+
+    #[test]
+    fn beta_logistic_eta_jets_match_fd() {
+        let eta = -0.31;
+        let delta = 0.27;
+        let epsilon = -0.19;
+        let h = 1e-5;
+        let j0 = beta_logistic_inverse_link_jet(eta, delta, epsilon);
+        let jp = beta_logistic_inverse_link_jet(eta + h, delta, epsilon);
+        let jm = beta_logistic_inverse_link_jet(eta - h, delta, epsilon);
+        let d1_fd = (jp.mu - jm.mu) / (2.0 * h);
+        let d2_fd = (jp.d1 - jm.d1) / (2.0 * h);
+        let d3_fd = (jp.d2 - jm.d2) / (2.0 * h);
+        assert!((j0.d1 - d1_fd).abs() < 5e-5);
+        assert!((j0.d2 - d2_fd).abs() < 5e-5);
+        assert!((j0.d3 - d3_fd).abs() < 2e-4);
+    }
+
+    #[test]
+    fn standard_kernel_structs_match_component_jets() {
+        let eta = 0.73;
+        assert_eq!(
+            ProbitLinkKernel.jet(eta).expect("probit"),
+            component_inverse_link_jet(LinkComponent::Probit, eta)
+        );
+        assert_eq!(
+            LogitLinkKernel.jet(eta).expect("logit"),
+            component_inverse_link_jet(LinkComponent::Logit, eta)
+        );
+        assert_eq!(
+            CLogLogLinkKernel.jet(eta).expect("cloglog"),
+            component_inverse_link_jet(LinkComponent::CLogLog, eta)
+        );
+        assert_eq!(
+            LogLogLinkKernel.jet(eta).expect("loglog"),
+            component_inverse_link_jet(LinkComponent::LogLog, eta)
+        );
+        assert_eq!(
+            CauchitLinkKernel.jet(eta).expect("cauchit"),
+            component_inverse_link_jet(LinkComponent::Cauchit, eta)
+        );
+    }
+
+    #[test]
+    fn sas_center_matches_probit_at_delta1_epsilon0() {
+        let etas = [-3.0, -1.2, -0.3, 0.0, 0.4, 1.7, 3.0];
+        for eta in etas {
+            let sas = sas_inverse_link_jet(eta, 0.0, 0.0);
+            let probit = ProbitLinkKernel.jet(eta).expect("probit");
+            // SAS implementation uses a smooth bounded latent (`tanh_bound`) for
+            // numerical robustness, so the probit center is approximate in practice.
+            assert!(
+                (sas.mu - probit.mu).abs() < 6e-4,
+                "mu mismatch at eta={eta}"
+            );
+            assert!(
+                (sas.d1 - probit.d1).abs() < 6e-4,
+                "d1 mismatch at eta={eta}"
+            );
+            assert!(
+                (sas.d2 - probit.d2).abs() < 2e-3,
+                "d2 mismatch at eta={eta}"
+            );
+            assert!(
+                (sas.d3 - probit.d3).abs() < 4e-3,
+                "d3 mismatch at eta={eta}"
+            );
+        }
     }
 }

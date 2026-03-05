@@ -66,7 +66,7 @@ fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<Likelihood
         // Joint model currently carries only state-less LinkFunction.
         // SAS requires explicit (epsilon, log_delta) state for mathematically
         // correct integrated moments, so do not dispatch state-less SAS here.
-        LinkFunction::Sas => None,
+        LinkFunction::Sas | LinkFunction::BetaLogistic => None,
         LinkFunction::Identity => None,
     }
 }
@@ -86,7 +86,7 @@ fn joint_point_inverse_link(link: LinkFunction, eta: f64) -> f64 {
         }
         // Joint state-less pipeline does not support SAS; this sentinel keeps
         // failure explicit if an incompatible model reaches prediction.
-        LinkFunction::Sas => f64::NAN,
+        LinkFunction::Sas | LinkFunction::BetaLogistic => f64::NAN,
     }
 }
 
@@ -1169,9 +1169,9 @@ pub fn fit_joint_model_engine<'a>(
     geometry: JointLinkGeometry,
     mut config: JointModelConfig,
 ) -> Result<JointModelResult, EstimationError> {
-    if matches!(link, LinkFunction::Sas) {
+    if matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic) {
         return Err(EstimationError::InvalidSpecification(
-            "joint model engine does not support state-less SAS links; use binomial SAS fit paths that carry explicit SasLinkState"
+            "joint model engine does not support state-less SAS/Beta-Logistic links; use binomial stateful link fit paths"
                 .to_string(),
         ));
     }
@@ -1542,7 +1542,8 @@ impl<'a> JointRemlState<'a> {
             LinkFunction::Logit
             | LinkFunction::Probit
             | LinkFunction::CLogLog
-            | LinkFunction::Sas => {
+            | LinkFunction::Sas
+            | LinkFunction::BetaLogistic => {
                 const MIN_WEIGHT: f64 = 1e-12;
                 const MIN_DMU: f64 = 1e-6;
                 let family = match state.link {
@@ -1550,6 +1551,7 @@ impl<'a> JointRemlState<'a> {
                     LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
                     LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
                     LinkFunction::Sas => LikelihoodFamily::BinomialSas,
+                    LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
                     LinkFunction::Identity => unreachable!("identity handled above"),
                 };
                 for i in 0..n {
@@ -1736,7 +1738,8 @@ impl<'a> JointRemlState<'a> {
             LinkFunction::Logit
             | LinkFunction::Probit
             | LinkFunction::CLogLog
-            | LinkFunction::Sas => {
+            | LinkFunction::Sas
+            | LinkFunction::BetaLogistic => {
                 let penalised_ll = -0.5 * deviance - 0.5 * penalty_term;
                 let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_a
                     + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
@@ -2033,7 +2036,8 @@ impl<'a> JointRemlState<'a> {
             LinkFunction::Logit
             | LinkFunction::Probit
             | LinkFunction::CLogLog
-            | LinkFunction::Sas => {
+            | LinkFunction::Sas
+            | LinkFunction::BetaLogistic => {
                 const MIN_WEIGHT: f64 = 1e-12;
                 const MIN_DMU: f64 = 1e-6;
                 let family = match state.link {
@@ -2041,6 +2045,7 @@ impl<'a> JointRemlState<'a> {
                     LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
                     LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
                     LinkFunction::Sas => LikelihoodFamily::BinomialSas,
+                    LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
                     LinkFunction::Identity => unreachable!("identity handled above"),
                 };
                 for i in 0..n {
@@ -2946,9 +2951,9 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
     config: &JointModelConfig,
     covariate_se: Option<Array1<f64>>,
 ) -> Result<JointModelResult, EstimationError> {
-    if matches!(link, LinkFunction::Sas) {
+    if matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic) {
         return Err(EstimationError::InvalidSpecification(
-            "joint REML path does not support state-less SAS links; explicit SasLinkState plumbing is required"
+            "joint REML path does not support state-less SAS/Beta-Logistic links; explicit state plumbing is required"
                 .to_string(),
         ));
     }

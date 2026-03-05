@@ -1116,7 +1116,11 @@ impl<'a> RemlState<'a> {
             pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
                 InverseLink::Mixture(state)
             } else if let Some(state) = self.runtime_sas_link_state {
-                InverseLink::Sas(state)
+                if matches!(self.config.link_function(), LinkFunction::BetaLogistic) {
+                    InverseLink::BetaLogistic(state)
+                } else {
+                    InverseLink::Sas(state)
+                }
             } else {
                 InverseLink::Standard(self.config.link_function())
             };

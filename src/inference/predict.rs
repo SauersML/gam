@@ -1,8 +1,11 @@
 use crate::estimate::{EstimationError, FitResult};
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    InverseLinkJet, mixture_inverse_link_jet, mixture_inverse_link_jet_with_rho_partials_into,
-    sas_inverse_link_jet, sas_inverse_link_jet_with_param_partials, state_from_spec,
+    InverseLinkJet, beta_logistic_inverse_link_jet,
+    beta_logistic_inverse_link_jet_with_param_partials, mixture_inverse_link_jet,
+    mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet,
+    sas_inverse_link_jet_with_param_partials, state_from_beta_logistic_spec, state_from_sas_spec,
+    state_from_spec,
 };
 use crate::probability::{standard_normal_quantile, try_inverse_link_array};
 use crate::types::MixtureLinkSpec;
@@ -373,6 +376,11 @@ where
                     "predict_gam_posterior_mean for BinomialSas requires SAS link parameters; use predict_gam_with_uncertainty with a FitResult or CLI prediction path".to_string(),
                 ));
             }
+            crate::types::LikelihoodFamily::BinomialBetaLogistic => {
+                return Err(EstimationError::InvalidInput(
+                    "predict_gam_posterior_mean for BinomialBetaLogistic requires fitted link parameters; use predict_gam_with_uncertainty with a FitResult or CLI prediction path".to_string(),
+                ));
+            }
             crate::types::LikelihoodFamily::BinomialMixture => {
                 return Err(EstimationError::InvalidInput(
                     "predict_gam_posterior_mean for BinomialMixture requires mixture link state; use predict_gam_with_uncertainty with a FitResult or CLI prediction path".to_string(),
@@ -455,6 +463,19 @@ where
             Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
                 crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, se, |x| {
                     sas_inverse_link_jet(x, epsilon, log_delta).mu
+                })
+            }))
+        }
+        crate::types::LikelihoodFamily::BinomialBetaLogistic => {
+            let (epsilon, delta) = fit.sas_epsilon.zip(fit.sas_log_delta).ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "predict_gam_posterior_mean_with_fit for BinomialBetaLogistic requires fitted parameters"
+                        .to_string(),
+                )
+            })?;
+            Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
+                crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, se, |x| {
+                    beta_logistic_inverse_link_jet(x, delta, epsilon).mu
                 })
             }))
         }
@@ -613,14 +634,21 @@ where
     let link_kind = if let Some(state) = mixture_state.clone() {
         Some(InverseLink::Mixture(state))
     } else {
-        sas_params.map(|(epsilon, log_delta)| {
-            InverseLink::Sas(
-                crate::mixture_link::state_from_sas_spec(crate::types::SasLinkSpec {
+        sas_params.map(|(epsilon, log_delta)| match family {
+            crate::types::LikelihoodFamily::BinomialBetaLogistic => InverseLink::BetaLogistic(
+                state_from_beta_logistic_spec(crate::types::SasLinkSpec {
+                    initial_epsilon: epsilon,
+                    initial_log_delta: log_delta,
+                })
+                .expect("fit beta-logistic parameters should always reconstruct valid link state"),
+            ),
+            _ => InverseLink::Sas(
+                state_from_sas_spec(crate::types::SasLinkSpec {
                     initial_epsilon: epsilon,
                     initial_log_delta: log_delta,
                 })
                 .expect("fit SAS parameters should always reconstruct valid SAS link state"),
-            )
+            ),
         })
     };
     let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;
@@ -703,6 +731,23 @@ where
                 );
                 (m2 - m1 * m1).max(0.0)
             }
+            crate::types::LikelihoodFamily::BinomialBetaLogistic => {
+                let (epsilon, delta) = sas_params.ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "BinomialBetaLogistic uncertainty requires fitted parameters".to_string(),
+                    )
+                })?;
+                let (m1, m2) = crate::quadrature::normal_expectation_1d_adaptive_pair(
+                    &quad_ctx,
+                    eta[i],
+                    se_i,
+                    |x| {
+                        let p = beta_logistic_inverse_link_jet(x, delta, epsilon).mu;
+                        (p, p * p)
+                    },
+                );
+                (m2 - m1 * m1).max(0.0)
+            }
             crate::types::LikelihoodFamily::BinomialMixture => {
                 let state = mixture_state.as_ref().ok_or_else(|| {
                     EstimationError::InvalidInput(
@@ -732,6 +777,18 @@ where
                 )
             })?;
             let jets = sas_inverse_link_jet_with_param_partials(eta[i], epsilon, log_delta);
+            let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
+            mean_var += quadratic_form(cov_theta, &g)?;
+        }
+        if matches!(family, crate::types::LikelihoodFamily::BinomialBetaLogistic)
+            && let Some(cov_theta) = fit.sas_param_covariance.as_ref()
+        {
+            let (epsilon, delta) = sas_params.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "BinomialBetaLogistic uncertainty requires fitted parameters".to_string(),
+                )
+            })?;
+            let jets = beta_logistic_inverse_link_jet_with_param_partials(eta[i], delta, epsilon);
             let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
             mean_var += quadratic_form(cov_theta, &g)?;
         }
@@ -774,6 +831,7 @@ where
             | crate::types::LikelihoodFamily::BinomialProbit
             | crate::types::LikelihoodFamily::BinomialCLogLog
             | crate::types::LikelihoodFamily::BinomialSas
+            | crate::types::LikelihoodFamily::BinomialBetaLogistic
             | crate::types::LikelihoodFamily::BinomialMixture
     ) {
         mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));

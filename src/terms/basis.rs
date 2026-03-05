@@ -4645,18 +4645,58 @@ pub fn build_matern_basis(
     } else {
         (m.basis, None)
     };
-    let candidates = build_matern_operator_penalty_candidates(
-        centers.view(),
-        spec.length_scale,
-        spec.nu,
-        spec.include_intercept,
-        z_opt.as_ref(),
-    )?;
-    if spec.double_penalty {
-        log::debug!(
-            "Matérn double_penalty requested but ignored because S0 mass penalty already shrinks the nullspace"
-        );
-    }
+    let candidates = if spec.double_penalty {
+        // Thread-1 operator decomposition mode:
+        // expose separate (mass, tension, stiffness) energies to REML.
+        build_matern_operator_penalty_candidates(
+            centers.view(),
+            spec.length_scale,
+            spec.nu,
+            spec.include_intercept,
+            z_opt.as_ref(),
+        )?
+    } else {
+        // Legacy Matérn mode for ablations:
+        // retain the classical kernel quadratic form (+ nullspace ridge when needed).
+        let (kernel_penalty, ridge_penalty) = if let Some(ref z) = z_opt {
+            let k = m.num_kernel_basis;
+            let kernel_raw = m.penalty_kernel.slice(s![0..k, 0..k]).to_owned();
+            let kernel_tmp = fast_ab(&kernel_raw, z);
+            let kernel_c = fast_atb(z, &kernel_tmp);
+
+            let ridge_raw = m.penalty_ridge.slice(s![0..k, 0..k]).to_owned();
+            let ridge_tmp = fast_ab(&ridge_raw, z);
+            let ridge_c = fast_atb(z, &ridge_tmp);
+
+            if spec.include_intercept {
+                let p = kernel_c.nrows();
+                let mut kernel_aug = Array2::<f64>::zeros((p + 1, p + 1));
+                kernel_aug.slice_mut(s![0..p, 0..p]).assign(&kernel_c);
+                let mut ridge_aug = Array2::<f64>::zeros((p + 1, p + 1));
+                ridge_aug.slice_mut(s![0..p, 0..p]).assign(&ridge_c);
+                (kernel_aug, ridge_aug)
+            } else {
+                (kernel_c, ridge_c)
+            }
+        } else {
+            (m.penalty_kernel.clone(), m.penalty_ridge.clone())
+        };
+        let mut out = vec![PenaltyCandidate {
+            matrix: kernel_penalty.clone(),
+            nullspace_dim_hint: estimate_penalty_nullity(&kernel_penalty)?,
+            source: PenaltySource::Primary,
+            normalization_scale: 1.0,
+        }];
+        if !ridge_penalty.is_empty() {
+            out.push(PenaltyCandidate {
+                matrix: ridge_penalty.clone(),
+                nullspace_dim_hint: estimate_penalty_nullity(&ridge_penalty)?,
+                source: PenaltySource::DoublePenaltyNullspace,
+                normalization_scale: 1.0,
+            });
+        }
+        out
+    };
     let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -9343,7 +9383,12 @@ mod tests {
     #[test]
     fn test_gram_and_psi_derivatives_from_operator_matches_fd() {
         // Build D(psi) = D0 + psi D1 + 0.5 psi^2 D2 with nontrivial shape.
-        let d0 = array![[0.9, -0.2, 0.3], [0.4, 0.8, -0.6], [0.1, 0.7, 0.5], [-0.3, 0.2, 0.4]];
+        let d0 = array![
+            [0.9, -0.2, 0.3],
+            [0.4, 0.8, -0.6],
+            [0.1, 0.7, 0.5],
+            [-0.3, 0.2, 0.4]
+        ];
         let d1 = array![
             [0.2, -0.1, 0.05],
             [0.3, 0.07, -0.2],
@@ -9375,7 +9420,11 @@ mod tests {
         let s2_fd = (&s_plus - &(s.mapv(|v| 2.0 * v)) + &s_minus) / (h * h);
 
         let err1 = (&s_psi - &s_fd).iter().map(|v| v * v).sum::<f64>().sqrt();
-        let err2 = (&s_psi_psi - &s2_fd).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let err2 = (&s_psi_psi - &s2_fd)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
 
         assert!(err1 < 2e-6, "S' mismatch too large: {err1}");
         assert!(err2 < 5e-4, "S'' mismatch too large: {err2}");
@@ -9387,7 +9436,11 @@ mod tests {
         // normalization derivatives against finite differences of S/||S||_F.
         let s0 = array![[2.0, 0.3, -0.2], [0.3, 1.7, 0.4], [-0.2, 0.4, 1.4]];
         let s1 = array![[0.2, -0.05, 0.1], [-0.05, 0.12, 0.03], [0.1, 0.03, -0.08]];
-        let s2 = array![[0.04, 0.02, -0.01], [0.02, -0.03, 0.015], [-0.01, 0.015, 0.02]];
+        let s2 = array![
+            [0.04, 0.02, -0.01],
+            [0.02, -0.03, 0.015],
+            [-0.01, 0.015, 0.02]
+        ];
 
         let psi0 = -0.4;
         let s = &s0 + &(s1.mapv(|v| psi0 * v)) + &(s2.mapv(|v| 0.5 * psi0 * psi0 * v));

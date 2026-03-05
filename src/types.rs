@@ -11,6 +11,7 @@ pub enum LinkFunction {
     Probit,
     CLogLog,
     Sas,
+    BetaLogistic,
     Identity,
 }
 
@@ -66,6 +67,7 @@ pub struct SasLinkState {
 pub enum InverseLink {
     Standard(LinkFunction),
     Sas(SasLinkState),
+    BetaLogistic(SasLinkState),
     Mixture(MixtureLinkState),
 }
 
@@ -75,6 +77,7 @@ impl InverseLink {
         match self {
             Self::Standard(link) => *link,
             Self::Sas(_) => LinkFunction::Sas,
+            Self::BetaLogistic(_) => LinkFunction::BetaLogistic,
             Self::Mixture(_) => LinkFunction::Logit,
         }
     }
@@ -90,7 +93,7 @@ impl InverseLink {
     #[inline]
     pub fn sas_state(&self) -> Option<&SasLinkState> {
         match self {
-            Self::Sas(state) => Some(state),
+            Self::Sas(state) | Self::BetaLogistic(state) => Some(state),
             _ => None,
         }
     }
@@ -104,6 +107,7 @@ pub enum LikelihoodFamily {
     BinomialProbit,
     BinomialCLogLog,
     BinomialSas,
+    BinomialBetaLogistic,
     BinomialMixture,
     RoystonParmar,
 }

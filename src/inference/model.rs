@@ -1,6 +1,6 @@
 use crate::estimate::FitResult;
-use crate::mixture_link::state_from_sas_spec;
-use crate::smooth::TermCollectionSpec;
+use crate::mixture_link::{state_from_beta_logistic_spec, state_from_sas_spec};
+use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::types::{
     InverseLink, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkSpec, SasLinkState,
 };
@@ -116,6 +116,8 @@ pub struct FittedModelPayload {
     pub resolved_term_spec: Option<TermCollectionSpec>,
     #[serde(default)]
     pub resolved_term_spec_noise: Option<TermCollectionSpec>,
+    #[serde(default)]
+    pub adaptive_regularization_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -303,6 +305,39 @@ impl FittedModel {
         .map_err(|e| format!("invalid saved SAS link state: {e}"))
     }
 
+    pub fn saved_beta_logistic_state(&self) -> Result<Option<SasLinkState>, String> {
+        let payload = self.payload();
+        let raw = match &payload.family_state {
+            FittedFamily::Standard {
+                likelihood: LikelihoodFamily::BinomialBetaLogistic,
+                sas_state,
+                ..
+            } => (*sas_state).ok_or_else(|| {
+                "binomial-beta-logistic model is missing state in family_state.sas_state"
+                    .to_string()
+            })?,
+            FittedFamily::LocationScale {
+                likelihood: LikelihoodFamily::BinomialBetaLogistic,
+                base_link,
+            } => match base_link {
+                Some(InverseLink::BetaLogistic(state)) => *state,
+                _ => {
+                    return Err(
+                        "binomial-beta-logistic location-scale model is missing beta-logistic base_link state"
+                            .to_string(),
+                    );
+                }
+            },
+            _ => return Ok(None),
+        };
+        state_from_beta_logistic_spec(SasLinkSpec {
+            initial_epsilon: raw.epsilon,
+            initial_log_delta: raw.log_delta,
+        })
+        .map(Some)
+        .map_err(|e| format!("invalid saved Beta-Logistic link state: {e}"))
+    }
+
     pub fn saved_mixture_state(&self) -> Result<Option<MixtureLinkState>, String> {
         let payload = self.payload();
         match &payload.family_state {
@@ -334,6 +369,8 @@ impl FittedModel {
     pub fn resolved_inverse_link(&self) -> Result<Option<InverseLink>, String> {
         let stateful = if let Some(state) = self.saved_mixture_state()? {
             Some(InverseLink::Mixture(state))
+        } else if let Some(state) = self.saved_beta_logistic_state()? {
+            Some(InverseLink::BetaLogistic(state))
         } else {
             self.saved_sas_state()?.map(InverseLink::Sas)
         };

@@ -35,8 +35,9 @@ use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{KahanSum, RidgePlanner, add_ridge, matrix_inverse_with_regularization};
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
+    beta_logistic_inverse_link_jet_with_param_partials,
     mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet_with_param_partials,
-    state_from_sas_spec, state_from_spec,
+    state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
 };
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
@@ -858,6 +859,9 @@ fn resolve_external_family(
         crate::types::LikelihoodFamily::BinomialProbit => Ok((LinkFunction::Probit, false)),
         crate::types::LikelihoodFamily::BinomialCLogLog => Ok((LinkFunction::CLogLog, false)),
         crate::types::LikelihoodFamily::BinomialSas => Ok((LinkFunction::Sas, false)),
+        crate::types::LikelihoodFamily::BinomialBetaLogistic => {
+            Ok((LinkFunction::BetaLogistic, false))
+        }
         crate::types::LikelihoodFamily::BinomialMixture => Ok((LinkFunction::Logit, false)),
         crate::types::LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
@@ -1004,8 +1008,11 @@ where
             "BinomialMixture requires mixture_link specification".to_string(),
         ));
     }
-    let effective_sas_link = if matches!(opts.family, crate::types::LikelihoodFamily::BinomialSas)
-        && opts.sas_link.is_none()
+    let effective_sas_link = if matches!(
+        opts.family,
+        crate::types::LikelihoodFamily::BinomialSas
+            | crate::types::LikelihoodFamily::BinomialBetaLogistic
+    ) && opts.sas_link.is_none()
     {
         Some(SasLinkSpec {
             initial_epsilon: 0.0,
@@ -1055,10 +1062,17 @@ where
         })?);
     }
     if let Some(spec) = effective_sas_link {
-        cfg.link_kind = InverseLink::Sas(
-            state_from_sas_spec(spec)
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
-        );
+        cfg.link_kind = match link {
+            LinkFunction::BetaLogistic => {
+                InverseLink::BetaLogistic(state_from_beta_logistic_spec(spec).map_err(|e| {
+                    EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
+                })?)
+            }
+            _ => InverseLink::Sas(
+                state_from_sas_spec(spec)
+                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
+            ),
+        };
     }
 
     let rs_list = compute_penalty_square_roots(&s_list)?;
@@ -1205,6 +1219,7 @@ where
     } else {
         let use_mixture = mixture_dim > 0;
         let use_sas = sas_dim > 0;
+        let use_beta_logistic = use_sas && matches!(link, LinkFunction::BetaLogistic);
         let theta_dim = k + mixture_dim + sas_dim;
         let sas_spec = sas_opt_spec;
         let mix_spec = mixture_opt_spec
@@ -1307,15 +1322,36 @@ where
                     );
                 }
                 if use_sas {
-                    let (epsilon, _) = sas_effective_epsilon(theta[k]);
-                    let log_delta = theta[k + 1];
-                    cfg_eval.link_kind = InverseLink::Sas(
-                        state_from_sas_spec(SasLinkSpec {
-                            initial_epsilon: epsilon,
-                            initial_log_delta: log_delta,
-                        })
-                        .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
-                    );
+                    let epsilon = if use_beta_logistic {
+                        theta[k]
+                    } else {
+                        let (v, _) = sas_effective_epsilon(theta[k]);
+                        v
+                    };
+                    let delta_like = theta[k + 1];
+                    cfg_eval.link_kind = if use_beta_logistic {
+                        InverseLink::BetaLogistic(
+                            state_from_beta_logistic_spec(SasLinkSpec {
+                                initial_epsilon: epsilon,
+                                initial_log_delta: delta_like,
+                            })
+                            .map_err(|e| {
+                                EstimationError::InvalidInput(format!(
+                                    "invalid Beta-Logistic link: {e}"
+                                ))
+                            })?,
+                        )
+                    } else {
+                        InverseLink::Sas(
+                            state_from_sas_spec(SasLinkSpec {
+                                initial_epsilon: epsilon,
+                                initial_log_delta: delta_like,
+                            })
+                            .map_err(|e| {
+                                EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
+                            })?,
+                        )
+                    };
                 }
                 reml_eval
                     .set_link_states(
@@ -1324,7 +1360,11 @@ where
                     );
                 let t_cost = Instant::now();
                 let mut cost = reml_eval.compute_cost(&rho_buf)?;
-                let sas_ridge = if use_sas { sas_ridge_weight } else { 0.0 };
+                let sas_ridge = if use_sas && !use_beta_logistic {
+                    sas_ridge_weight
+                } else {
+                    0.0
+                };
                 if use_sas && sas_ridge > 0.0 {
                     let log_delta = theta[k + 1];
                     cost += 0.5 * sas_ridge * log_delta * log_delta;
@@ -1414,14 +1454,22 @@ where
                     }
                 } else {
                     let sas = cfg_eval.link_kind.sas_state().copied().ok_or_else(|| {
-                        EstimationError::InvalidInput("missing SAS state".to_string())
+                        EstimationError::InvalidInput("missing parameterized link state".to_string())
                     })?;
                     for i in 0..n_obs {
-                        let jets = sas_inverse_link_jet_with_param_partials(
-                            eta[i],
-                            sas.epsilon,
-                            sas.log_delta,
-                        );
+                        let jets = if use_beta_logistic {
+                            beta_logistic_inverse_link_jet_with_param_partials(
+                                eta[i],
+                                sas.log_delta,
+                                sas.epsilon,
+                            )
+                        } else {
+                            sas_inverse_link_jet_with_param_partials(
+                                eta[i],
+                                sas.epsilon,
+                                sas.log_delta,
+                            )
+                        };
                         let mu = jets.jet.mu.clamp(EPS, 1.0 - EPS);
                         let d1 = jets.jet.d1;
                         let d2 = jets.jet.d2;
@@ -1470,7 +1518,7 @@ where
                     }
                     grad[k + j] = -direct_ll_buf[j] + 0.5 * trace_term;
                 }
-                if use_sas {
+                if use_sas && !use_beta_logistic {
                     let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
                     grad[k] *= d_eps_d_raw;
                 }
@@ -1506,14 +1554,27 @@ where
             None
         };
         let final_sas_state = if use_sas {
-            let (epsilon_eff, _) = sas_effective_epsilon(outer_result.rho[k]);
-            Some(
+            let epsilon_eff = if use_beta_logistic {
+                outer_result.rho[k]
+            } else {
+                let (v, _) = sas_effective_epsilon(outer_result.rho[k]);
+                v
+            };
+            Some(if use_beta_logistic {
+                state_from_beta_logistic_spec(SasLinkSpec {
+                    initial_epsilon: epsilon_eff,
+                    initial_log_delta: outer_result.rho[k + 1],
+                })
+                .map_err(|e| {
+                    EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
+                })?
+            } else {
                 state_from_sas_spec(SasLinkSpec {
                     initial_epsilon: epsilon_eff,
                     initial_log_delta: outer_result.rho[k + 1],
                 })
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
-            )
+                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?
+            })
         } else {
             cfg.link_kind.sas_state().copied()
         };
@@ -1536,16 +1597,35 @@ where
                     })?;
                     reml_eval.set_link_states(Some(mix_state), None);
                 } else if use_sas {
-                    let (epsilon_eff, _) = sas_effective_epsilon(aux[0]);
-                    let sas_state = state_from_sas_spec(SasLinkSpec {
-                        initial_epsilon: epsilon_eff,
-                        initial_log_delta: aux[1],
-                    })
-                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?;
+                    let epsilon_eff = if use_beta_logistic {
+                        aux[0]
+                    } else {
+                        let (v, _) = sas_effective_epsilon(aux[0]);
+                        v
+                    };
+                    let sas_state = if use_beta_logistic {
+                        state_from_beta_logistic_spec(SasLinkSpec {
+                            initial_epsilon: epsilon_eff,
+                            initial_log_delta: aux[1],
+                        })
+                        .map_err(|e| {
+                            EstimationError::InvalidInput(format!(
+                                "invalid Beta-Logistic link: {e}"
+                            ))
+                        })?
+                    } else {
+                        state_from_sas_spec(SasLinkSpec {
+                            initial_epsilon: epsilon_eff,
+                            initial_log_delta: aux[1],
+                        })
+                        .map_err(|e| {
+                            EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
+                        })?
+                    };
                     reml_eval.set_link_states(None, Some(sas_state));
                 }
                 let mut cost = reml_eval.compute_cost(&final_rho)?;
-                if use_sas && sas_ridge_weight > 0.0 {
+                if use_sas && !use_beta_logistic && sas_ridge_weight > 0.0 {
                     let log_delta = aux[1];
                     cost += 0.5 * sas_ridge_weight * log_delta * log_delta;
                 }
@@ -1633,7 +1713,11 @@ where
             link_kind: if let Some(state) = final_mixture_state.clone() {
                 InverseLink::Mixture(state)
             } else if let Some(state) = final_sas_state {
-                InverseLink::Sas(state)
+                if matches!(link, LinkFunction::BetaLogistic) {
+                    InverseLink::BetaLogistic(state)
+                } else {
+                    InverseLink::Sas(state)
+                }
             } else {
                 cfg.link_kind.clone()
             },
@@ -1763,9 +1847,11 @@ where
             let denom = (n - edf_total).max(1.0);
             weighted_rss / denom
         }
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog | LinkFunction::Sas => {
-            1.0
-        }
+        LinkFunction::Logit
+        | LinkFunction::Probit
+        | LinkFunction::CLogLog
+        | LinkFunction::Sas
+        | LinkFunction::BetaLogistic => 1.0,
     };
 
     // Compute gradient norm at final rho for reporting
@@ -3152,8 +3238,11 @@ where
             "BinomialMixture requires mixture_link specification".to_string(),
         ));
     }
-    let effective_sas_link = if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
-        && opts.sas_link.is_none()
+    let effective_sas_link = if matches!(
+        family,
+        crate::types::LikelihoodFamily::BinomialSas
+            | crate::types::LikelihoodFamily::BinomialBetaLogistic
+    ) && opts.sas_link.is_none()
     {
         Some(SasLinkSpec {
             initial_epsilon: 0.0,
@@ -3186,8 +3275,13 @@ where
             crate::types::LikelihoodFamily::BinomialLogit
             | crate::types::LikelihoodFamily::BinomialProbit
             | crate::types::LikelihoodFamily::BinomialCLogLog
-            | crate::types::LikelihoodFamily::BinomialSas => {
-                crate::types::LikelihoodFamily::BinomialSas
+            | crate::types::LikelihoodFamily::BinomialSas
+            | crate::types::LikelihoodFamily::BinomialBetaLogistic => {
+                if matches!(family, crate::types::LikelihoodFamily::BinomialBetaLogistic) {
+                    crate::types::LikelihoodFamily::BinomialBetaLogistic
+                } else {
+                    crate::types::LikelihoodFamily::BinomialSas
+                }
             }
             _ => {
                 return Err(EstimationError::InvalidInput(
@@ -3862,6 +3956,11 @@ where
     let k = active_nullspace_dims.len();
     let use_mixture = opts.mixture_link.is_some();
     let use_sas = opts.sas_link.is_some();
+    let use_beta_logistic = use_sas
+        && matches!(
+            opts.family,
+            crate::types::LikelihoodFamily::BinomialBetaLogistic
+        );
     if use_mixture && use_sas {
         return Err(EstimationError::InvalidInput(
             "mixture_link and sas_link are mutually exclusive for this evaluator".to_string(),
@@ -3892,10 +3991,16 @@ where
         })?);
     }
     if let Some(spec) = opts.sas_link {
-        cfg.link_kind = InverseLink::Sas(
-            state_from_sas_spec(spec)
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
-        );
+        cfg.link_kind = if use_beta_logistic {
+            InverseLink::BetaLogistic(state_from_beta_logistic_spec(spec).map_err(|e| {
+                EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
+            })?)
+        } else {
+            InverseLink::Sas(
+                state_from_sas_spec(spec)
+                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
+            )
+        };
     }
     let y_o = y.to_owned();
     let w_o = w.to_owned();
@@ -3929,12 +4034,27 @@ where
         reml_state.set_link_states(Some(mix_state.clone()), None);
         mix_state_eval = Some(mix_state);
     } else if use_sas {
-        let (epsilon_eff, _) = sas_effective_epsilon(theta[k]);
-        let sas_state = state_from_sas_spec(SasLinkSpec {
-            initial_epsilon: epsilon_eff,
-            initial_log_delta: theta[k + 1],
-        })
-        .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?;
+        let epsilon_eff = if use_beta_logistic {
+            theta[k]
+        } else {
+            let (v, _) = sas_effective_epsilon(theta[k]);
+            v
+        };
+        let sas_state = if use_beta_logistic {
+            state_from_beta_logistic_spec(SasLinkSpec {
+                initial_epsilon: epsilon_eff,
+                initial_log_delta: theta[k + 1],
+            })
+            .map_err(|e| {
+                EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
+            })?
+        } else {
+            state_from_sas_spec(SasLinkSpec {
+                initial_epsilon: epsilon_eff,
+                initial_log_delta: theta[k + 1],
+            })
+            .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?
+        };
         reml_state.set_link_states(None, Some(sas_state));
         sas_state_eval = Some(sas_state);
     }
@@ -3954,7 +4074,7 @@ where
         ));
     }
 
-    let sas_ridge = if use_sas {
+    let sas_ridge = if use_sas && !use_beta_logistic {
         sas_log_delta_ridge_weight()
     } else {
         0.0
@@ -4051,10 +4171,19 @@ where
             }
         }
     } else {
-        let sas = sas_state_eval
-            .ok_or_else(|| EstimationError::InvalidInput("missing SAS link state".to_string()))?;
+        let sas = sas_state_eval.ok_or_else(|| {
+            EstimationError::InvalidInput("missing parameterized link state".to_string())
+        })?;
         for i in 0..n_obs {
-            let jets = sas_inverse_link_jet_with_param_partials(eta[i], sas.epsilon, sas.log_delta);
+            let jets = if use_beta_logistic {
+                beta_logistic_inverse_link_jet_with_param_partials(
+                    eta[i],
+                    sas.log_delta,
+                    sas.epsilon,
+                )
+            } else {
+                sas_inverse_link_jet_with_param_partials(eta[i], sas.epsilon, sas.log_delta)
+            };
             let mu = jets.jet.mu.clamp(EPS, 1.0 - EPS);
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
@@ -4100,7 +4229,7 @@ where
         }
         grad[k + j] = -direct_ll[j] + 0.5 * trace_term;
     }
-    if use_sas {
+    if use_sas && !use_beta_logistic {
         let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
         grad[k] *= d_eps_d_raw;
     }

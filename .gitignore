@@ -19,9 +19,11 @@ bench/results*.json
 bench/results-shards/*.json
 bench/results-shards/*.log
 bench/*_rust_fitted.csv
+bench/**/*_rust_fitted.csv
 bench/gam_bench_rust_cv_*/
 bench/gam_bench_*/
 bench/_profile*
+bench/**/_profile*
 bench/artifacts/
 bench/tmp_debug/
 bench/ab_*/
