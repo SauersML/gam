@@ -2555,6 +2555,125 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             block_working_sets: vec![t_ws, ls_ws],
         })
     }
+
+    fn diagonal_working_weights_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        d_eta: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        // Full directional derivative used by the diagonal H_beta term in
+        //   H = X' diag(w) X + S
+        // so that
+        //   H_beta[d_beta] = X' diag(dw) X.
+        //
+        // For this family (no wiggle block), each diagonal working weight is
+        //   w = weights_i * (dmu/deta_block)^2 / var(mu)
+        // with
+        //   q  = -eta_t / sigma(eta_ls),
+        //   mu = link^{-1}(q),
+        //   var = mu(1-mu),
+        //   dmu/deta_block = (dmu/dq) * chain.
+        //
+        // Define
+        //   g(q) = (dmu/dq)^2 / var(mu),
+        //   w    = weights_i * g(q) * chain^2.
+        //
+        // Directional derivative along d_eta (block-local predictor direction):
+        //   dw = weights_i * d[ g(q) * chain^2 ]
+        //      = weights_i * ( dg * chain^2 + g * d(chain^2) )
+        //      = weights_i * ( (dg/dq * dq) * chain^2 + 2*g*chain*dchain ).
+        //
+        // Here
+        //   dq = chain * d_eta_i.
+        //
+        // We compute dg/dq from log-derivative algebra:
+        //   log g = 2 log(dmu/dq) - log(var),
+        //   d/dq log g = 2*(d2mu/dq2)/(dmu/dq) - (dvar/dq)/var,
+        //   dvar/dq = (dmu/dq)*(1 - 2*mu),
+        // hence
+        //   dg/dq = g * [ 2*(d2mu/dq2)/(dmu/dq) - (dvar/dq)/var ].
+        //
+        // Block-specific chain terms:
+        // - Threshold block (eta_t):
+        //     chain = dq/deta_t = -1/sigma,
+        //     dchain = 0 (chain does not depend on eta_t).
+        // - Log-sigma block (eta_ls):
+        //     q0 = -eta_t/sigma,
+        //     chain = dq/deta_ls = -q0 * dsigma/deta_ls / sigma,
+        //     dchain = (dchain/deta_ls) * d_eta_i,
+        //     dchain/deta_ls
+        //       = eta_t * [ d2sigma/deta_ls2 / sigma^2
+        //                  - 2*(dsigma/deta_ls)^2 / sigma^3 ].
+        //
+        // If the unclamped working weight is at/below MIN_WEIGHT, this code
+        // returns dw=0 to match the active branch of the clamped definition.
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleProbitFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        if d_eta.len() != n {
+            return Err(format!(
+                "BinomialLocationScaleProbitFamily directional eta length mismatch: got {}, expected {n}",
+                d_eta.len()
+            ));
+        }
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleProbitFamily input size mismatch".to_string());
+        }
+
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+            self.sigma_min,
+            self.sigma_max,
+        )?;
+        let (_, dsigma_deta, d2sigma_deta2, _) =
+            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+
+        let mut dw = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let s = core.sigma[i].max(1e-12);
+            let mu = core.mu[i];
+            let dmu = core.dmu_dq[i];
+            let d2mu = core.d2mu_dq2[i];
+            let var = (mu * (1.0 - mu)).max(MIN_PROB);
+            let dvar_dq = dmu * (1.0 - 2.0 * mu);
+            let g = dmu * dmu / var;
+            let dg_dq = g * (2.0 * d2mu / dmu - dvar_dq / var);
+            let dir = d_eta[i];
+
+            let (chain, dchain) = match block_idx {
+                Self::BLOCK_T => (-1.0 / s, 0.0),
+                Self::BLOCK_LOG_SIGMA => {
+                    let chain_i = -core.q0[i] * core.dsigma_deta[i] / s;
+                    let dchain_deta = eta_t[i]
+                        * (d2sigma_deta2[i] / (s * s) - 2.0 * dsigma_deta[i].powi(2) / (s * s * s));
+                    (chain_i, dchain_deta * dir)
+                }
+                _ => return Ok(None),
+            };
+
+            let raw_w = self.weights[i] * g * chain * chain;
+            if raw_w <= MIN_WEIGHT {
+                dw[i] = 0.0;
+                continue;
+            }
+
+            let dq = chain * dir;
+            dw[i] = self.weights[i] * (dg_dq * dq * chain * chain + 2.0 * g * chain * dchain);
+        }
+        Ok(Some(dw))
+    }
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleProbitFamily {
