@@ -9,7 +9,10 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use ndarray::{Array1, Array2};
-use wolfe_bfgs::{Bfgs, BfgsError};
+use wolfe_bfgs::{
+    NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, ObjectiveRequest,
+    ObjectiveSample,
+};
 
 /// Optional known link metadata when a family uses a learnable wiggle correction.
 #[derive(Debug, Clone, Copy)]
@@ -143,6 +146,21 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// Optional exact second directional derivative of the joint Hessian.
+    ///
+    /// Returns `Some(d2H)` where `d2H` is:
+    ///   D²H[u, v] = d/dε d/dδ H(beta + εu + δv) |_{ε=δ=0}
+    /// for flattened coefficient-space directions `u = d_beta_u_flat`,
+    /// `v = d_beta_v_flat`.
+    fn exact_newton_joint_hessian_second_directional_derivative(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _d_beta_u_flat: &Array1<f64>,
+        _d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
+
     /// Optional exact directional derivative of diagonal working weights along
     /// a predictor-space direction `d_eta` for `BlockWorkingSet::Diagonal`.
     fn diagonal_working_weights_directional_derivative(
@@ -238,6 +256,7 @@ pub struct CustomFamilyWarmStart {
 pub struct CustomFamilyJointHyperResult {
     pub objective: f64,
     pub gradient: Array1<f64>,
+    pub outer_hessian: Option<Array2<f64>>,
     pub warm_start: CustomFamilyWarmStart,
 }
 
@@ -1055,6 +1074,13 @@ fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     t
 }
 
+fn trace_jinv_a_jinv_b(j_inv: &Array2<f64>, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    // tr(J^{-1} A J^{-1} B) computed without forming explicit Kronecker products.
+    let tmp = j_inv.dot(a);
+    let tmp = tmp.dot(j_inv);
+    trace_product(&tmp, b)
+}
+
 fn leverage_quadratic_forms(x: &DesignMatrix, h_inv: &Array2<f64>) -> Array1<f64> {
     let x_dense_arc = x.to_dense_arc();
     let x_dense = x_dense_arc.as_ref();
@@ -1383,31 +1409,32 @@ fn inner_blockwise_fit<F: CustomFamily>(
 /// Fit a custom multi-block family.
 ///
 /// Inner loop: cyclic blockwise penalized weighted regressions.
-/// Outer loop: joint gradient-only BFGS optimization of all log-smoothing parameters.
-fn invalid_outer_bfgs_sample(rho: &Array1<f64>) -> (f64, Array1<f64>) {
-    const COST_BARRIER: f64 = 1e50;
-    const GRAD_SCALE: f64 = 1e6;
+/// Outer loop: trust-region optimization of all log-smoothing parameters using
+/// exact cost/gradient samples.
 
-    let mut grad = rho.clone();
-    for g in grad.iter_mut() {
-        if !g.is_finite() || g.abs() < 1e-6 {
-            *g = 1.0;
-        }
-    }
-    grad *= GRAD_SCALE;
-    (COST_BARRIER + 0.5 * rho.dot(rho), grad)
-}
-
-fn outer_objective_and_gradient<F: CustomFamily>(
+fn outer_objective_gradient_hessian<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     penalty_counts: &[usize],
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
-) -> Result<(f64, Array1<f64>, ConstrainedWarmStart), String> {
+    need_hessian: bool,
+) -> Result<(f64, Array1<f64>, Option<Array2<f64>>, ConstrainedWarmStart), String> {
     let per_block = split_log_lambdas(rho, penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    // Outer objective at fixed rho:
+    //   V(rho) = -ell(beta^) + 0.5 * beta^T P(rho) beta^
+    //            + 0.5 * log|J(beta^,rho)| - 0.5 * log|P(rho)|_+,
+    // where beta^ solves g(beta,rho)=0 with
+    //   g(beta,rho) = -∇_beta ell(beta) + P(rho) beta,
+    //   J(beta,rho) = H(beta) + P(rho),  H(beta) = -∇^2_beta ell(beta).
+    //
+    // The exact outer gradient used below is:
+    //   V_k = 0.5*beta^T A_k beta^
+    //       + 0.5*tr(J^{-1}(A_k + D H[u_k]))
+    //       - 0.5*tr(P_+^{-1} A_k),
+    // with A_k=dP/drho_k and u_k=d beta^/drho_k.
     let reml_term = if options.use_reml_objective {
         0.5 * (inner.block_logdet_h - inner.block_logdet_s)
     } else {
@@ -1415,6 +1442,7 @@ fn outer_objective_and_gradient<F: CustomFamily>(
     };
     let objective = -inner.log_likelihood + inner.penalty_value + reml_term;
     let mut grad = Array1::<f64>::zeros(rho.len());
+    let mut outer_hessian: Option<Array2<f64>> = None;
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let eval = family.evaluate(&inner.block_states)?;
@@ -1462,13 +1490,16 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                     .assign(&s_part);
             }
         }
-        // Coupled implicit system:
-        //   g(beta,rho) = -∇_beta ell + P(rho) beta = 0
-        //   J(beta,rho) = ∂g/∂beta = H(beta) + P(rho)
-        //   d beta / d rho_k = -J^{-1} (∂P/∂rho_k beta)
+        // Inner stationarity for the coupled blocks is:
+        //   g(beta,rho) = -∇_beta ell(beta) + P(rho) beta = 0.
+        // Differentiating w.r.t. rho_k gives the exact sensitivity system:
+        //   J * u_k = -(dP/drho_k) beta,  with u_k = d beta / d rho_k.
+        // We use A_k := dP/drho_k and J = H(beta) + P(rho), where
+        // H(beta) = -∇^2_beta ell(beta) is the full joint likelihood curvature.
         //
         // Here `h_joint_unpen` is H(beta) and `s_joint` is P(rho), so
-        // `j_joint = h_joint_unpen + s_joint` is the fully coupled curvature.
+        // `j_joint = h_joint_unpen + s_joint` is the coupled Jacobian/Hessian used
+        // in both sensitivity solves and log|J| trace terms.
         let mut j_joint = h_joint_unpen.clone();
         j_joint += &s_joint;
 
@@ -1495,6 +1526,10 @@ fn outer_objective_and_gradient<F: CustomFamily>(
             }
         };
         let mut at = 0usize;
+        let mut a_terms: Vec<Array2<f64>> = Vec::new();
+        let mut a_beta_terms: Vec<Array1<f64>> = Vec::new();
+        let mut u_terms: Vec<Array1<f64>> = Vec::new();
+        let mut j_terms: Vec<Array2<f64>> = Vec::new();
         for b in 0..specs.len() {
             let spec = &specs[b];
             let (start, end) = ranges[b];
@@ -1506,17 +1541,14 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                 a_k.slice_mut(ndarray::s![start..end, start..end])
                     .assign(&local);
                 let a_k_beta = a_k.dot(&beta_flat);
+                // Penalty-quadratic derivative:
+                //   d/drho_k [0.5 * beta^T P beta] = 0.5 * beta^T A_k beta
+                // at the inner mode (envelope theorem), with A_k = dP/drho_k.
                 let g_pen = 0.5 * beta_block.dot(&local.dot(&beta_block));
-                let g = if options.use_reml_objective {
-                    let g_logs = 0.5
-                        * trace_product(
-                            s_pinv_joint
-                                .as_ref()
-                                .ok_or_else(|| "missing joint S^+ for REML gradient".to_string())?,
-                            &a_k,
-                        );
+                let keep_second_order = need_hessian || options.use_reml_objective;
+                let u_k = if keep_second_order {
                     let rhs_k = -&a_k_beta;
-                    let u_k = solve_spd_system_with_policy(
+                    solve_spd_system_with_policy(
                         &j_joint,
                         &rhs_k,
                         options.ridge_floor,
@@ -1526,21 +1558,41 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                         pinv_positive_part(&j_joint, options.ridge_floor)
                             .map(|j_pinv| j_pinv.dot(&rhs_k))
                             .unwrap_or_else(|_| -h_inv.dot(&a_k_beta))
-                    });
+                    })
+                } else {
+                    Array1::<f64>::zeros(total)
+                };
+                let g = if options.use_reml_objective {
+                    let g_logs = 0.5
+                        * trace_product(
+                            s_pinv_joint
+                                .as_ref()
+                                .ok_or_else(|| "missing joint S^+ for REML gradient".to_string())?,
+                            &a_k,
+                        );
                     let u_norm = u_k.dot(&u_k).sqrt();
-                    // Coupled outer gradient identity:
-                    //   d/d rho_k log|J| = tr(J^{-1} dJ/d rho_k),
-                    //   dJ/d rho_k = A_k + deltaH[u_k],
-                    // with:
-                    //   A_k = dP/d rho_k  (here `a_k`)
-                    //   u_k = d beta / d rho_k = -J^{-1}(A_k beta)
-                    //   deltaH[u_k] from family joint directional derivative.
+                    // Exact log-determinant derivative structure:
+                    //   d/drho_k log|J| = tr(J^{-1} J_k),
+                    //   J_k = A_k + D H[u_k],
+                    // where A_k = dP/drho_k and u_k solves J u_k = -A_k beta.
                     //
-                    // Therefore REML/LAML contribution is
-                    //   0.5 * tr(J^{-1}(A_k + deltaH[u_k])) - 0.5 * tr(S^+ A_k).
+                    // This keeps full cross-block coupling because u_k is solved against
+                    // the joint J, not per-block diagonals. The REML/LAML contribution used
+                    // below is:
+                    //   0.5 * tr(J^{-1}(A_k + D H[u_k])) - 0.5 * tr(S^+ A_k).
+                    //
+                    // Exact outer Hessian uses the same coupled quantities:
+                    //   V_{k,l} = beta^T S_k u_l
+                    //           + 0.5 * ( -tr(J^{-1}J_l J^{-1}J_k) + tr(J^{-1}J_{k,l}) )
+                    //           + 0.5 * tr(P^+ S_l P^+ S_k),
+                    // with:
+                    //   J_{k,l} = D H[u_{k,l}] + D^2 H[u_l, u_k],
+                    //   J u_{k,l} = -(J_l u_k + S_k u_l).
+                    // When requested, this routine now evaluates these terms directly.
                     let mut d_j_k = a_k.clone();
                     if u_norm > 1e-14 {
-                        // Joint exact-newton path requires analytic dH[u] from the family.
+                        // D H[u_k] is the directional derivative of the joint likelihood
+                        // Hessian wrt beta along u_k = d beta / d rho_k.
                         let h_rho = family
                             .exact_newton_joint_hessian_directional_derivative(
                                 &inner.block_states,
@@ -1567,13 +1619,119 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                         d_j_k += &h_rho;
                     }
                     let g_logj = 0.5 * trace_product(&h_inv, &d_j_k);
+                    if need_hessian {
+                        a_terms.push(a_k.clone());
+                        a_beta_terms.push(a_k_beta.clone());
+                        u_terms.push(u_k.clone());
+                        j_terms.push(d_j_k);
+                    }
                     g_pen + g_logj - g_logs
                 } else {
+                    if need_hessian {
+                        a_terms.push(a_k.clone());
+                        a_beta_terms.push(a_k_beta.clone());
+                        u_terms.push(u_k.clone());
+                    }
                     g_pen
                 };
                 grad[at + k] = g;
             }
             at += spec.penalties.len();
+        }
+        if need_hessian {
+            let mut hess = Array2::<f64>::zeros((rho.len(), rho.len()));
+            let mut hess_available = true;
+            for k in 0..rho.len() {
+                for l in k..rho.len() {
+                    // Outer Hessian entry (rho = log lambda coordinates):
+                    //   V_{k,l} =
+                    //     beta^T A_k u_l + 0.5*delta_{k,l}*beta^T A_k beta
+                    //   + 0.5*( -tr(J^{-1}J_l J^{-1}J_k) + tr(J^{-1}J_{k,l}) )
+                    //   + 0.5*tr(P^+ A_l P^+ A_k) - 0.5*delta_{k,l}*tr(P^+ A_k),
+                    // where A_k = dP/drho_k = lambda_k S_k and
+                    // delta_{k,l} A_k appears because dA_k/drho_l = delta_{k,l} A_k.
+                    let delta_kl = if k == l { 1.0 } else { 0.0 };
+                    let mut v_kl = a_beta_terms[k].dot(&u_terms[l])
+                        + 0.5 * delta_kl * beta_flat.dot(&a_beta_terms[k]);
+                    if options.use_reml_objective {
+                        let tr_prod = trace_jinv_a_jinv_b(&h_inv, &j_terms[l], &j_terms[k]);
+                        // Second-order sensitivity:
+                        //   J u_{k,l} = -(J_l u_k + A_k u_l + delta_{k,l} A_k beta).
+                        let rhs_kl = -(a_terms[k].dot(&u_terms[l])
+                            + j_terms[l].dot(&u_terms[k])
+                            + delta_kl * a_beta_terms[k].clone());
+                        let u_kl = solve_spd_system_with_policy(
+                            &j_joint,
+                            &rhs_kl,
+                            options.ridge_floor,
+                            options.ridge_policy,
+                        )
+                        .unwrap_or_else(|_| {
+                            pinv_positive_part(&j_joint, options.ridge_floor)
+                                .map(|j_pinv| j_pinv.dot(&rhs_kl))
+                                .unwrap_or_else(|_| h_inv.dot(&rhs_kl))
+                        });
+                        let dh_u_kl = match family
+                            .exact_newton_joint_hessian_directional_derivative(
+                                &inner.block_states,
+                                &u_kl,
+                            )? {
+                            Some(v) => v,
+                            None => {
+                                hess_available = false;
+                                break;
+                            }
+                        };
+                        let d2h_ul_uk = match family
+                            .exact_newton_joint_hessian_second_directional_derivative(
+                                &inner.block_states,
+                                &u_terms[l],
+                                &u_terms[k],
+                            )? {
+                            Some(v) => v,
+                            None => {
+                                hess_available = false;
+                                break;
+                            }
+                        };
+                        // J_{k,l} chain rule with log-lambda correction:
+                        //   J_{k,l} = dH[u_{k,l}] + d^2H[u_l,u_k] + delta_{k,l} A_k.
+                        let mut j_kl = dh_u_kl;
+                        j_kl += &d2h_ul_uk;
+                        if delta_kl > 0.0 {
+                            j_kl += &a_terms[k];
+                        }
+                        let tr_second = trace_product(&h_inv, &j_kl);
+                        let tr_p = 0.5
+                            * trace_jinv_a_jinv_b(
+                                s_pinv_joint
+                                    .as_ref()
+                                    .ok_or_else(|| "missing joint S^+ for REML Hessian".to_string())?,
+                                &a_terms[l],
+                                &a_terms[k],
+                            )
+                            - 0.5
+                                * delta_kl
+                                * trace_product(
+                                    s_pinv_joint
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            "missing joint S^+ for REML Hessian".to_string()
+                                        })?,
+                                    &a_terms[k],
+                                );
+                        v_kl += 0.5 * (-tr_prod + tr_second) + tr_p;
+                    }
+                    hess[[k, l]] = v_kl;
+                    hess[[l, k]] = v_kl;
+                }
+                if !hess_available {
+                    break;
+                }
+            }
+            if hess_available {
+                outer_hessian = Some(hess);
+            }
         }
         let warm = ConstrainedWarmStart {
             rho: rho.clone(),
@@ -1584,7 +1742,7 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                 .collect(),
             active_sets: inner.active_sets,
         };
-        return Ok((objective, grad, warm));
+        return Ok((objective, grad, outer_hessian, warm));
     }
     let mut at = 0usize;
     for b in 0..specs.len() {
@@ -1661,7 +1819,22 @@ fn outer_objective_and_gradient<F: CustomFamily>(
             let a_k = s_k.mapv(|v| lambdas[k] * v);
             let a_k_beta = a_k.dot(beta);
             let g_pen = 0.5 * beta.dot(&a_k_beta);
-            let g = if options.use_reml_objective {
+                let g = if options.use_reml_objective {
+                // Here H is per-block penalized likelihood curvature:
+                //   H = -∇^2_{beta_b} ell + S_lambda.
+                // For each smoothing coordinate in this block:
+                //   d/drho_k [0.5 log|H|] = 0.5 tr(H^{-1}(A_k + D H[u_k])),
+                //   d/drho_k [0.5 log|S|_+] = 0.5 tr(S_+^{-1} A_k).
+                //
+                // The code computes:
+                //   g_logh  = 0.5 tr(H^{-1} A_k),
+                //   g_hbeta = 0.5 tr(H^{-1} D H[u_k]),
+                //   g_logs  = 0.5 tr(S_+^{-1} A_k),
+                // then combines them with g_pen.
+                //
+                // For exact second derivatives wrt rho in this block, the same pattern as
+                // the joint branch applies:
+                //   H_{k,l} contribution needs D H[u_{k,l}] and D^2 H[u_l, u_k].
                 let g_logh = 0.5 * trace_product(&h_inv, &a_k);
                 let g_logs = 0.5
                     * trace_product(
@@ -1670,39 +1843,15 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                             .ok_or_else(|| "missing S^+ for REML gradient".to_string())?,
                         &a_k,
                     );
-                // Exact hyper-gradient correction for the implicit beta-path.
-                //
-                // Derivation:
-                //   Objective contains 0.5*log|H(beta_hat(rho), rho)|.
-                //   d/drho_k [0.5*log|H|] = 0.5*tr(H^{-1} * dH/drho_k).
-                //
-                // Split dH/drho_k into explicit and implicit parts:
-                //   dH/drho_k = A_k + H_beta[u_k],
+                // Exact derivative of the log|H| term:
+                //   0.5 * tr(H^{-1} * dH/drho_k),
+                // with
+                //   dH/drho_k = A_k + D H[u_k],
                 //   A_k = dS/drho_k = lambda_k * S_k,
-                //   u_k = dbeta_hat/drho_k.
+                //   H u_k = -A_k beta.
                 //
-                // At the inner mode, stationarity r(beta,rho)=0 with
-                //   r = grad_beta ell - S beta
-                // gives the linearized system
-                //   H u_k = -A_k beta
-                // under the sign convention used here, hence
-                //   u_k = -H^{-1} A_k beta.
-                //
-                // The explicit trace term
-                //   0.5*tr(H^{-1} A_k)
-                // is `g_logh` above. The missing implicit term is
-                //   g_hbeta = 0.5*tr(H^{-1} H_beta[u_k]).
-                //
-                // We evaluate H_beta[u_k] analytically by block type:
-                // - ExactNewton: family can return dH directly along u_k.
-                // - Diagonal (H = X' diag(w) X + S):
-                //     H_beta[u_k] = X' diag(dw) X, with dw = D_beta w [u_k].
-                //   Therefore
-                //     tr(H^{-1} X' diag(dw) X)
-                //       = sum_i dw_i * (x_i' H^{-1} x_i),
-                //   where x_i is row i of X. We precompute
-                //     q_i = x_i' H^{-1} x_i
-                //   (`leverages`) and contract as 0.5 * dot(q, dw).
+                // `g_logh` is the explicit part 0.5*tr(H^{-1} A_k), and `g_hbeta` below
+                // is the implicit beta-path part 0.5*tr(H^{-1} D H[u_k]).
                 let u_k = -h_inv.dot(&a_k_beta);
                 let u_norm = u_k.dot(&u_k).sqrt();
                 let g_hbeta = if u_norm <= 1e-14 {
@@ -1732,6 +1881,12 @@ fn outer_objective_and_gradient<F: CustomFamily>(
                             }
                         }
                         BlockWorkingSet::Diagonal { .. } => {
+                            // For diagonal working sets:
+                            //   H = X' diag(w) X + S
+                            //   D H[u_k] = X' diag(dw) X,  dw = D_beta w [u_k].
+                            // Then
+                            //   tr(H^{-1} D H[u_k]) = sum_i q_i * dw_i,
+                            // where q_i = x_i' H^{-1} x_i (precomputed leverages).
                             let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
                                 format!(
                                     "missing dynamic design for block {b} diagonal H_rho trace term"
@@ -1782,7 +1937,21 @@ fn outer_objective_and_gradient<F: CustomFamily>(
             .collect(),
         active_sets: inner.active_sets,
     };
-    Ok((objective, grad, warm))
+    Ok((objective, grad, outer_hessian, warm))
+}
+
+#[cfg(test)]
+fn outer_objective_and_gradient<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    penalty_counts: &[usize],
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+) -> Result<(f64, Array1<f64>, ConstrainedWarmStart), String> {
+    let (obj, grad, _hess, warm) =
+        outer_objective_gradient_hessian(family, specs, options, penalty_counts, rho, warm_start, false)?;
+    Ok((obj, grad, warm))
 }
 
 fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
@@ -1968,6 +2137,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
     theta: &Array1<f64>,
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     warm_start: Option<&CustomFamilyWarmStart>,
+    need_hessian: bool,
 ) -> Result<CustomFamilyJointHyperResult, String> {
     if derivative_blocks.len() != specs.len() {
         return Err(format!(
@@ -1992,8 +2162,15 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
 
     let rho = theta.slice(ndarray::s![..rho_dim]).to_owned();
     let warm_inner = warm_start.map(|w| &w.inner);
-    let (objective, rho_grad, fitted_warm) =
-        outer_objective_and_gradient(family, specs, options, &penalty_counts, &rho, warm_inner)?;
+    let (objective, rho_grad, rho_hess, fitted_warm) = outer_objective_gradient_hessian(
+        family,
+        specs,
+        options,
+        &penalty_counts,
+        &rho,
+        warm_inner,
+        need_hessian,
+    )?;
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, Some(&fitted_warm))?;
     let psi_grad = compute_custom_family_block_psi_gradients(
@@ -2012,6 +2189,15 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
     Ok(CustomFamilyJointHyperResult {
         objective,
         gradient,
+        // Exact outer Hessian derivation currently covers rho-block only
+        // (smoothing-parameter coordinates). For joint theta=[rho,psi],
+        // a full exact Hessian would also require psi/psi and rho/psi second
+        // derivatives, which are not provided by this path.
+        outer_hessian: if need_hessian && psi_dim == 0 {
+            rho_hess
+        } else {
+            None
+        },
         warm_start: CustomFamilyWarmStart { inner: fitted_warm },
     })
 }
@@ -2277,27 +2463,57 @@ pub fn fit_custom_family<F: CustomFamily>(
     let last_outer_error = std::sync::Mutex::new(None::<String>);
     let lower = Array1::<f64>::from_elem(rho0.len(), -30.0);
     let upper = Array1::<f64>::from_elem(rho0.len(), 30.0);
-    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
-    let mut solver = Bfgs::new(rho0.clone(), |x| {
-        if let Some((rho_c, cost_c, grad_c)) = &last_eval
+    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
+    let mut solver = NewtonTrustRegion::new(rho0.clone(), |x, request| {
+        let request_needs_hessian = matches!(
+            request,
+            ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian
+        );
+        if let Some((rho_c, cost_c, grad_c, hess_c)) = &last_eval
             && x.len() == rho_c.len()
             && x.iter()
                 .zip(rho_c.iter())
                 .all(|(&a, &b)| (a - b).abs() <= 1e-12)
+            && (!request_needs_hessian || hess_c.is_some())
         {
-            return (*cost_c, grad_c.clone());
+            return Ok(match request {
+                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                ObjectiveRequest::CostAndGradient => {
+                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                }
+                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                    if let Some(hess) = hess_c {
+                        ObjectiveSample::cost_gradient_hessian(
+                            *cost_c,
+                            grad_c.clone(),
+                            hess.clone(),
+                        )
+                    } else {
+                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                    }
+                }
+            });
         }
 
         let cached = warm_cache.lock().ok().and_then(|g| g.clone());
-        let sample = match outer_objective_and_gradient(
+        let need_hessian = request_needs_hessian;
+        let (obj, grad, hess_opt) = match outer_objective_gradient_hessian(
             family,
             specs,
             options,
             &penalty_counts,
             x,
             cached.as_ref(),
+            need_hessian,
         ) {
-            Ok((obj, grad, warm)) if obj.is_finite() && grad.iter().all(|v| v.is_finite()) => {
+            Ok((obj, grad, hess_opt, warm))
+                if obj.is_finite()
+                    && grad.iter().all(|v| v.is_finite())
+                    && hess_opt
+                        .as_ref()
+                        .map(|h| h.iter().all(|v| v.is_finite()))
+                        .unwrap_or(true) =>
+            {
                 if let Ok(mut guard) = warm_cache.lock() {
                     let seed_ok = cached
                         .as_ref()
@@ -2318,31 +2534,46 @@ pub fn fit_custom_family<F: CustomFamily>(
                 if let Ok(mut guard) = last_outer_error.lock() {
                     *guard = None;
                 }
-                (obj, grad)
+                (obj, grad, hess_opt)
             }
-            Ok((_obj, _grad, _warm)) => {
+            Ok((_obj, _grad, _hess_opt, _warm)) => {
                 if let Ok(mut guard) = last_outer_error.lock() {
                     *guard = Some(
-                        "custom-family outer objective/gradient became non-finite".to_string(),
+                        "custom-family outer objective/derivatives became non-finite".to_string(),
                     );
                 }
-                invalid_outer_bfgs_sample(x)
+                return Err(ObjectiveEvalError::recoverable(
+                    "custom-family outer objective/derivatives became non-finite",
+                ));
             }
             Err(e) => {
                 if let Ok(mut guard) = last_outer_error.lock() {
                     *guard = Some(e);
                 }
-                invalid_outer_bfgs_sample(x)
+                return Err(ObjectiveEvalError::recoverable(
+                    "custom-family outer objective/gradient evaluation failed",
+                ));
             }
         };
-        last_eval = Some((x.clone(), sample.0, sample.1.clone()));
-        sample
+        last_eval = Some((x.clone(), obj, grad.clone(), hess_opt.clone()));
+        Ok(match request {
+            ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(obj),
+            ObjectiveRequest::CostAndGradient => ObjectiveSample::cost_and_gradient(obj, grad),
+            ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                if let Some(hess) = hess_opt {
+                    ObjectiveSample::cost_gradient_hessian(obj, grad, hess)
+                } else {
+                    // Families without D²H support still return exact cost+gradient.
+                    // NewtonTR then uses its configured quasi-Newton fallback model.
+                    ObjectiveSample::cost_and_gradient(obj, grad)
+                }
+            }
+        })
     })
     .with_bounds(lower, upper, 1e-6)
     .with_tolerance(options.outer_tol)
-    .with_no_improve_stop(1e-8, 8)
-    .with_flat_stall_exit(true, 4)
-    .with_curvature_slack_scale(2.0)
+    .with_bfgs_fallback(true)
+    .with_fallback_history(12)
     .with_max_iterations(options.outer_max_iter);
     let last_eval_error = || {
         last_outer_error
@@ -2354,8 +2585,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     };
     let sol = match solver.run() {
         Ok(sol) => sol,
-        Err(BfgsError::MaxIterationsReached { last_solution })
-        | Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
+        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
             if last_solution.final_value.is_finite()
                 && last_solution.final_gradient_norm.is_finite()
             {
@@ -2714,6 +2944,13 @@ mod tests {
         let rel = (g0[0] - g_fd).abs() / g_fd.abs().max(1e-8);
 
         assert!(f0.is_finite());
+        assert_eq!(
+            g0[0].signum(),
+            g_fd.signum(),
+            "outer gradient sign mismatch: analytic={} fd={}",
+            g0[0],
+            g_fd
+        );
         assert!(
             rel < 5e-3,
             "outer gradient mismatch: analytic={} fd={} rel={}",
@@ -2853,6 +3090,14 @@ mod tests {
             .expect("objective-");
             let g_fd = (fp - fm) / (2.0 * h);
             let rel = (g0[k] - g_fd).abs() / g_fd.abs().max(1e-8);
+            assert_eq!(
+                g0[k].signum(),
+                g_fd.signum(),
+                "outer LAML gradient sign mismatch at {}: analytic={} fd={}",
+                k,
+                g0[k],
+                g_fd
+            );
             assert!(
                 rel < 2e-2,
                 "outer LAML gradient mismatch at {}: analytic={} fd={} rel={}",
@@ -2936,6 +3181,14 @@ mod tests {
             .expect("objective-");
             let g_fd = (fp - fm) / (2.0 * h);
             let rel = (g0[k] - g_fd).abs() / g_fd.abs().max(1e-8);
+            assert_eq!(
+                g0[k].signum(),
+                g_fd.signum(),
+                "outer diagonal LAML gradient sign mismatch at {}: analytic={} fd={}",
+                k,
+                g0[k],
+                g_fd
+            );
             assert!(
                 rel < 2e-2,
                 "outer diagonal LAML gradient mismatch at {}: analytic={} fd={} rel={}",
@@ -2945,6 +3198,118 @@ mod tests {
                 rel
             );
         }
+    }
+
+    #[test]
+    fn outer_laml_hessian_joint_exact_binomial_location_scale_matches_fd() {
+        let n = 10usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
+        let weights = Array1::from_elem(n, 1.0);
+        let threshold_spec = ParameterBlockSpec {
+            name: "threshold".to_string(),
+            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            offset: Array1::zeros(n),
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.15]),
+        };
+        let log_sigma_spec = ParameterBlockSpec {
+            name: "log_sigma".to_string(),
+            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            offset: Array1::zeros(n),
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![-0.05]),
+        };
+        let family = BinomialLocationScaleProbitFamily {
+            y,
+            weights,
+            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            sigma_min: 0.05,
+            sigma_max: 4.0,
+            threshold_design: Some(threshold_spec.design.clone()),
+            log_sigma_design: Some(log_sigma_spec.design.clone()),
+        };
+        let specs = vec![threshold_spec, log_sigma_spec];
+        let penalty_counts = vec![1usize, 1usize];
+        let rho = array![0.1, -0.2];
+        let options = BlockwiseFitOptions {
+            use_reml_objective: true,
+            ridge_floor: 1e-10,
+            outer_max_iter: 1,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let (_f0, g0, h0_opt, _) = outer_objective_gradient_hessian(
+            &family,
+            &specs,
+            &options,
+            &penalty_counts,
+            &rho,
+            None,
+            true,
+        )
+        .expect("objective/gradient/hessian");
+        let h0 = h0_opt.expect("analytic outer Hessian should be available");
+        assert_eq!(h0.nrows(), rho.len());
+        assert_eq!(h0.ncols(), rho.len());
+
+        let h = 1e-5;
+        for l in 0..rho.len() {
+            let mut rho_p = rho.clone();
+            let mut rho_m = rho.clone();
+            rho_p[l] += h;
+            rho_m[l] -= h;
+            let (_fp, gp, _, _) = outer_objective_gradient_hessian(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho_p,
+                None,
+                false,
+            )
+            .expect("objective/gradient +");
+            let (_fm, gm, _, _) = outer_objective_gradient_hessian(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho_m,
+                None,
+                false,
+            )
+            .expect("objective/gradient -");
+
+            for k in 0..rho.len() {
+                let h_fd = (gp[k] - gm[k]) / (2.0 * h);
+                let abs_err = (h0[[k, l]] - h_fd).abs();
+                let rel = (h0[[k, l]] - h_fd).abs() / h_fd.abs().max(1e-7);
+                assert_eq!(
+                    h0[[k, l]].signum(),
+                    h_fd.signum(),
+                    "outer Hessian sign mismatch at ({k},{l}): analytic={} fd={}",
+                    h0[[k, l]],
+                    h_fd
+                );
+                assert!(
+                    abs_err < 1e-8 || rel < 2e-2,
+                    "outer Hessian mismatch at ({k},{l}): analytic={} fd={} abs={} rel={}",
+                    h0[[k, l]],
+                    h_fd,
+                    abs_err,
+                    rel
+                );
+            }
+        }
+
+        for i in 0..h0.nrows() {
+            for j in 0..i {
+                let asym = (h0[[i, j]] - h0[[j, i]]).abs();
+                assert!(asym < 1e-8, "outer Hessian not symmetric at ({i},{j}): {asym}");
+            }
+        }
+        let _ = g0;
     }
 
     #[test]

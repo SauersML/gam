@@ -307,6 +307,11 @@ impl<'a> RemlState<'a> {
         //   A_k      = dS/drho_k      = lambda_k S_k
         //   A_{k,l}  = d²S/(drho_k drho_l) = delta_{k,l} A_k
         //
+        // If one parameterizes directly as S(rho)=sum_k rho_k S_k (no exp map),
+        // the same derivation holds with:
+        //   A_k = S_k,  A_{k,l}=0.
+        // The code path here uses log-smoothing coordinates rho with lambda=exp(rho).
+        //
         // The inner mode beta_hat(rho) is defined by the stationarity system
         //
         //   G(beta, rho) = grad_beta L(beta, rho) = 0
@@ -388,6 +393,45 @@ impl<'a> RemlState<'a> {
         //   Q_{kℓ} = B_ℓ' A_k β_hat + 0.5 delta_{kℓ} beta_hat' A_k beta_hat
         //   L_{kℓ} = 0.5 [ -tr(H_+^dagger H_ℓ H_+^dagger H_k) + tr(H_+^dagger H_{kℓ}) ]
         //   P_{kℓ} = -0.5 ∂² log|S|_+ /(∂ρ_k∂ρ_ℓ)
+        //
+        // Equivalent notation often used in Laplace-REML derivations:
+        //   u_k    := dβ̂/dρ_k,        u_{kℓ} := d²β̂/(dρ_k dρ_ℓ),
+        //   J_k    := dJ/dρ_k,         J_{kℓ} := d²J/(dρ_k dρ_ℓ),
+        // with
+        //   u_k    = -J^{-1}(S_k β̂),
+        //   u_{kℓ} = -J^{-1}(J_ℓ u_k + S_k u_ℓ),
+        //   J_k    = S_k + dH[u_k],
+        //   J_{kℓ} = dH[u_{kℓ}] + d²H[u_ℓ,u_k].
+        //
+        // Under this notation:
+        //   V_{kℓ}
+        //   = β̂' S_k u_ℓ
+        //   + 0.5[-tr(J^{-1}J_ℓJ^{-1}J_k) + tr(J^{-1}J_{kℓ})]
+        //   + 0.5 tr(P^+ S_ℓ P^+ S_k),
+        // which is algebraically the same decomposition as Q/L/P above
+        // after mapping A_k = λ_k S_k and the objective sign convention.
+        //
+        // Pseudodeterminant second derivative on fixed active penalty subspace:
+        //   ∂² log|S|_+ /(∂ρ_k∂ρ_ℓ)
+        //   = tr(S^+ A_{kℓ}) - tr(S^+ A_ℓ S^+ A_k),
+        // and with λ_k = exp(ρ_k), A_{kℓ}=delta_{kℓ}A_k.
+        //
+        // Equivalent fixed-basis (rank-stable) form used by structural path:
+        // choose an orthonormal basis R for the penalized range (common nullspace
+        // complement), define S_R = R' S R (SPD), then
+        //   log|S|_+ = log|S_R|,
+        //   S^+ = R S_R^{-1} R',
+        //   ∂ log|S|_+ /∂ρ_k      = tr(S_R^{-1} (R' A_k R)),
+        //   ∂² log|S|_+ /∂ρ_k∂ρ_ℓ = tr(S_R^{-1}(R' A_{kℓ} R))
+        //                           - tr(S_R^{-1}(R' A_ℓ R) S_R^{-1}(R' A_k R)).
+        // This is exactly what `structural_penalty_logdet_derivatives` computes
+        // under a fixed active structural subspace.
+        //
+        // Trace implementation identity behind exact/projected/spectral paths:
+        // if H = L L' and W(A)=L^{-1} A L^{-T}, then
+        //   tr(H^{-1}A)=tr(W(A)),
+        //   tr(H^{-1}A H^{-1}B)=<W(A),W(B)>_F.
+        // We realize these without explicitly forming H^{-1}.
         //
         // Numerically, this function computes:
         //
@@ -883,6 +927,32 @@ impl<'a> RemlState<'a> {
         let mut hess = Array2::<f64>::zeros((k_count, k_count));
         let dense_exact_inner_solve_mode =
             exact_trace_mode && !projected_exact_mode && !spectral_exact_mode;
+        // Full per-pair exact Hessian recipe:
+        //
+        // For each (k,l), with B_k = d beta_hat / d rho_k and B_{k,l} = d² beta_hat /(d rho_k d rho_l):
+        //
+        //   (i)  Solve second sensitivity:
+        //          B_{k,l} = -H^{-1}(H_l B_k + A_k B_l + delta_{k,l} A_k beta_hat).
+        //
+        //   (ii) Build curvature second derivative:
+        //          H_{k,l} = delta_{k,l} A_k
+        //                   + D²(-∇²l)[B_k,B_l]
+        //                   + D(-∇²l)[B_{k,l}]
+        //                = delta_{k,l} A_k + X' diag(d ⊙ u_k ⊙ u_l + c ⊙ u_{k,l}) X.
+        //
+        //   (iii) Assemble objective pieces:
+        //          Q_{k,l} = B_l' A_k beta_hat + 0.5 delta_{k,l} beta_hat' A_k beta_hat,
+        //          L_{k,l} = 0.5( -tr(H^{-1}H_l H^{-1}H_k) + tr(H^{-1}H_{k,l}) ),
+        //          P_{k,l} = -0.5 ∂² log|S|_+ /(∂rho_k ∂rho_l).
+        //
+        //   (iv) Final:
+        //          V_{k,l} = Q_{k,l} + L_{k,l} + P_{k,l},
+        //        mirrored to enforce symmetry.
+        //
+        // Fixed-subspace pseudodeterminant term:
+        //   with S_R = R' S R, rank-stable R,
+        //   ∂² log|S|_+ = tr(S_R^{-1}A_{k,l,R}) - tr(S_R^{-1}A_{l,R} S_R^{-1}A_{k,R}),
+        // exactly supplied by `d2logs`.
         for l in 0..k_count {
             let bl = b_mat.column(l).to_owned();
             let mut rhs_kl_all = Array2::<f64>::zeros((p_dim, k_count));
@@ -894,6 +964,14 @@ impl<'a> RemlState<'a> {
                 //     = -H^{-1}(H_l B_k + A_k B_l + delta_{k,l} A_k beta).
                 //
                 // We form the stacked right-hand sides exactly in that form.
+                //
+                // If we denote w_{k,l} := dB_k/dρ_l, then B_{k,l}=w_{k,l};
+                // this is the exact "second sensitivity" solve from IFT.
+                //
+                // Term-by-term mapping:
+                //   -h_k[l].dot(&bk)      = -(H_l B_k)
+                //   -a_k_mats[k].dot(&bl) = -(A_k B_l)
+                //   -a_k_beta[k]          = -(delta_{k,l} A_k beta), only when k=l.
                 let mut rhs_kl = -h_k[l].dot(&bk);
                 rhs_kl -= &a_k_mats[k].dot(&bl);
                 if k == l {
@@ -906,17 +984,34 @@ impl<'a> RemlState<'a> {
             let compute_entry = |k: usize| -> f64 {
                 // H_{k,l} = delta_{k,l} A_k
                 //          + X' diag(d ⊙ u_k ⊙ u_l + c ⊙ u_{k,l}) X.
+                //
+                // Split into Fréchet pieces:
+                //   delta_{k,l} A_k                      -> penalty second derivative
+                //   X' diag(d ⊙ u_k ⊙ u_l) X            -> D²(-∇²ℓ)[B_k,B_l]
+                //   X' diag(c ⊙ u_{k,l}) X              -> D(-∇²ℓ)[B_{k,l}]
+                // so this is exactly the required
+                //   J_{k,l} = dH[u_{k,l}] + d²H[u_l,u_k]
+                // non-Gaussian curvature term.
                 let mut diag = Array1::<f64>::zeros(n);
                 for i in 0..n {
+                    // Per-observation decomposition:
+                    //   diag_i = d_i u_{i,k} u_{i,l} + c_i u_{i,k,l},
+                    // where
+                    //   u_{i,k}   = (X B_k)_i,
+                    //   u_{i,k,l} = (X B_{k,l})_i.
+                    // This is the scalar weight multiplying x_i x_i^T in
+                    // X' diag(diag) X for the H_{k,l} likelihood part.
                     diag[i] = d[i] * u_mat[[i, k]] * u_mat[[i, l]] + c[i] * u_kl_all[[i, k]];
                 }
 
                 // Quadratic beta contribution:
                 //   Q_{k,l} = B_l' A_k beta + 0.5 delta_{k,l} beta' A_k beta.
+                // `a_k_beta[k]` stores A_k beta and `q_diag[k]` stores beta' A_k beta.
                 let q = bl.dot(&a_k_beta[k]) + if k == l { 0.5 * q_diag[k] } else { 0.0 };
 
                 // Quadratic logdet trace piece:
                 //   t1 = tr(H^{-1} H_l H^{-1} H_k).
+                // `t1_mat` is preassembled from exact or stochastic contractions.
                 let t1 = t1_mat[[l, k]];
                 let t2 = if exact_trace_mode {
                     if projected_exact_mode {
@@ -945,6 +1040,9 @@ impl<'a> RemlState<'a> {
                         } else {
                             Array2::<f64>::zeros((p_dim, p_dim))
                         };
+                        // Add X' diag(diag) X to complete
+                        //   H_{k,l} = delta_{k,l} A_k + X' diag(diag) X
+                        // before optional Firth corrections.
                         let mut weighted_xtdx_kl = Array2::<f64>::zeros(x_dense.raw_dim());
                         h_kl += &Self::xt_diag_x_dense_into(x_dense, &diag, &mut weighted_xtdx_kl);
                         let mut d2_trace_correction = 0.0_f64;
@@ -1007,6 +1105,8 @@ impl<'a> RemlState<'a> {
                         } else {
                             // Dense exact fallback without explicit inverse:
                             //   tr(H^{-1} H_kl) = tr(solve(H, H_kl)).
+                            // If H is SPD and solve(H,·)=H^{-1}(·), diagonal sum of the
+                            // solved block is exactly the required trace.
                             let solved_hkl = solve_h(&h_kl);
                             solved_hkl.diag().sum()
                         }
@@ -1068,6 +1168,8 @@ impl<'a> RemlState<'a> {
                 // L_{k,l} = 0.5 [ -t1 + t2 ]
                 let l_term = 0.5 * (-t1 + t2);
                 // P_{k,l} = -0.5 * d²/drho_k drho_l log|S|_+.
+                // `d2logs[[k,l]]` is ∂² log|S|_+ /(∂ρ_k∂ρ_l), computed on the
+                // fixed structural active penalty subspace.
                 let p_term = -0.5 * d2logs[[k, l]];
                 // Final exact dense transformed Hessian entry:
                 //   V_{k,l} = Q_{k,l} + L_{k,l} + P_{k,l}.
@@ -1083,6 +1185,9 @@ impl<'a> RemlState<'a> {
                     .collect()
             };
             for (k, val) in row_entries {
+                // Exact Hessian symmetry expectation: V_{k,l}=V_{l,k}.
+                // We mirror-write to keep numerical symmetry explicit even when
+                // stochastic traces or floating-point order differ slightly.
                 // Conclusion for the Firth path:
                 // - `q` uses the same implicit derivatives B_k/B_kl as non-Firth,
                 //   but those derivatives were solved on H_total = X'WX + S - H_phi.
@@ -1335,8 +1440,9 @@ impl<'a> RemlState<'a> {
 
 impl<'a> RemlState<'a> {
     pub(super) fn uses_objective_consistent_fd_gradient(&self, rho: &Array1<f64>) -> bool {
+        let _ = rho;
         self.config.link_function() != LinkFunction::Identity
-            && (self.config.objective_consistent_fd_gradient || rho.len() == 1)
+            && self.config.objective_consistent_fd_gradient
     }
 
     /// Helper function that computes gradient using a shared evaluation bundle

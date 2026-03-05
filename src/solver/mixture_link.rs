@@ -894,6 +894,13 @@ mod tests {
             let fd = (&pp - &pm).mapv(|v| v / (2.0 * h));
             for k in 0..pi.len() {
                 let err = (jac[[k, j]] - fd[k]).abs();
+                assert_eq!(
+                    jac[[k, j]].signum(),
+                    fd[k].signum(),
+                    "jac sign mismatch at ({k},{j}): analytic={} fd={}",
+                    jac[[k, j]],
+                    fd[k]
+                );
                 assert!(err < 5e-6, "jac mismatch at ({k},{j}): err={err:e}");
             }
         }
@@ -936,6 +943,10 @@ mod tests {
                 d3: (jp.d3 - jm.d3) / (2.0 * h),
             };
             let an = out.djet_drho[j];
+            assert_eq!(an.mu.signum(), fd.mu.signum());
+            assert_eq!(an.d1.signum(), fd.d1.signum());
+            assert_eq!(an.d2.signum(), fd.d2.signum());
+            assert_eq!(an.d3.signum(), fd.d3.signum());
             assert!((an.mu - fd.mu).abs() < 1e-6);
             assert!((an.d1 - fd.d1).abs() < 1e-6);
             assert!((an.d2 - fd.d2).abs() < 1e-6);
@@ -959,6 +970,10 @@ mod tests {
             d2: (ep_p.d2 - ep_m.d2) / (2.0 * h),
             d3: (ep_p.d3 - ep_m.d3) / (2.0 * h),
         };
+        assert_eq!(out.djet_depsilon.mu.signum(), fd_ep.mu.signum());
+        assert_eq!(out.djet_depsilon.d1.signum(), fd_ep.d1.signum());
+        assert_eq!(out.djet_depsilon.d2.signum(), fd_ep.d2.signum());
+        assert_eq!(out.djet_depsilon.d3.signum(), fd_ep.d3.signum());
         assert!((out.djet_depsilon.mu - fd_ep.mu).abs() < 5e-5);
         assert!((out.djet_depsilon.d1 - fd_ep.d1).abs() < 5e-5);
         assert!((out.djet_depsilon.d2 - fd_ep.d2).abs() < 5e-5);
@@ -972,6 +987,10 @@ mod tests {
             d2: (ld_p.d2 - ld_m.d2) / (2.0 * h),
             d3: (ld_p.d3 - ld_m.d3) / (2.0 * h),
         };
+        assert_eq!(out.djet_dlog_delta.mu.signum(), fd_ld.mu.signum());
+        assert_eq!(out.djet_dlog_delta.d1.signum(), fd_ld.d1.signum());
+        assert_eq!(out.djet_dlog_delta.d2.signum(), fd_ld.d2.signum());
+        assert_eq!(out.djet_dlog_delta.d3.signum(), fd_ld.d3.signum());
         assert!((out.djet_dlog_delta.mu - fd_ld.mu).abs() < 5e-5);
         assert!((out.djet_dlog_delta.d1 - fd_ld.d1).abs() < 5e-5);
         assert!((out.djet_dlog_delta.d2 - fd_ld.d2).abs() < 5e-5);
@@ -1034,6 +1053,9 @@ mod tests {
         let d1_fd = (jp.mu - jm.mu) / (2.0 * h);
         let d2_fd = (jp.d1 - jm.d1) / (2.0 * h);
         let d3_fd = (jp.d2 - jm.d2) / (2.0 * h);
+        assert_eq!(j0.d1.signum(), d1_fd.signum());
+        assert_eq!(j0.d2.signum(), d2_fd.signum());
+        assert_eq!(j0.d3.signum(), d3_fd.signum());
         assert!((j0.d1 - d1_fd).abs() < 5e-5);
         assert!((j0.d2 - d2_fd).abs() < 2e-4);
         assert!((j0.d3 - d3_fd).abs() < 1e-3);
@@ -1083,6 +1105,9 @@ mod tests {
         let d1_fd = (jp.mu - jm.mu) / (2.0 * h);
         let d2_fd = (jp.d1 - jm.d1) / (2.0 * h);
         let d3_fd = (jp.d2 - jm.d2) / (2.0 * h);
+        assert_eq!(j0.d1.signum(), d1_fd.signum());
+        assert_eq!(j0.d2.signum(), d2_fd.signum());
+        assert_eq!(j0.d3.signum(), d3_fd.signum());
         assert!((j0.d1 - d1_fd).abs() < 5e-5);
         assert!((j0.d2 - d2_fd).abs() < 5e-5);
         assert!((j0.d3 - d3_fd).abs() < 2e-4);

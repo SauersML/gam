@@ -33,7 +33,8 @@ use std::collections::BTreeSet;
 use std::f64;
 use std::ops::Range;
 use wolfe_bfgs::{
-    Bfgs, BfgsError, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveRequest, ObjectiveSample,
+    Arc as ArcOptimizer, ArcError, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError,
+    ObjectiveRequest, ObjectiveSample,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4191,7 +4192,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
     let warm_start_fit: FittedTermCollection = (*best).clone();
-    let mut optimizer = NewtonTrustRegion::new(theta0.clone(), |theta, request| {
+    let mut optimizer = ArcOptimizer::new(theta0.clone(), |theta, request| {
         if let Some((theta_c, cost_c, grad_c, h_c)) = &last_eval
             && approx_same_point(theta, theta_c)
         {
@@ -4207,42 +4208,48 @@ fn try_exact_joint_spatial_length_scale_optimization(
         }
 
         let psi_theta = theta.slice(s![rho_dim..]).to_owned();
-        let sample = match apply_spatial_log_length_scales(resolved_spec, spatial_terms, &psi_theta)
-        {
-            Ok(spec_c) => match try_exact_joint_spatial_hyper_cost_gradient_hessian(
-                data,
-                y,
-                weights,
-                offset,
-                theta,
-                rho_dim,
-                &spec_c,
-                &warm_start_fit,
-                family,
-                options,
-                spatial_terms,
-            ) {
-                Ok(Some((cost, grad, hess)))
-                    if cost.is_finite()
-                        && grad.iter().all(|v| v.is_finite())
-                        && hess.nrows() == theta.len()
-                        && hess.ncols() == theta.len()
-                        && hess.iter().all(|v| v.is_finite()) =>
-                {
-                    last_eval = Some((theta.clone(), cost, grad.clone(), hess.clone()));
-                    ObjectiveSample::cost_gradient_hessian(cost, grad, hess)
-                }
-                _ => ObjectiveSample::cost_and_gradient(
-                    1e50 + 0.5 * theta.dot(theta),
-                    Array1::from_elem(theta.len(), 1e6),
-                ),
-            },
-            Err(_) => ObjectiveSample::cost_and_gradient(
-                1e50 + 0.5 * theta.dot(theta),
-                Array1::from_elem(theta.len(), 1e6),
-            ),
+        let spec_c = apply_spatial_log_length_scales(resolved_spec, spatial_terms, &psi_theta)
+            .map_err(|e| {
+                ObjectiveEvalError::recoverable(format!(
+                    "failed to apply spatial log length scales: {e}"
+                ))
+            })?;
+        let (cost, grad, hess) = match try_exact_joint_spatial_hyper_cost_gradient_hessian(
+            data,
+            y,
+            weights,
+            offset,
+            theta,
+            rho_dim,
+            &spec_c,
+            &warm_start_fit,
+            family,
+            options,
+            spatial_terms,
+        ) {
+            Ok(Some((cost, grad, hess)))
+                if cost.is_finite()
+                    && grad.iter().all(|v| v.is_finite())
+                    && hess.nrows() == theta.len()
+                    && hess.ncols() == theta.len()
+                    && hess.iter().all(|v| v.is_finite()) =>
+            {
+                (cost, grad, hess)
+            }
+            _ => {
+                return Err(ObjectiveEvalError::recoverable(
+                    "exact joint spatial objective returned invalid value",
+                ));
+            }
         };
-        Ok(sample)
+        last_eval = Some((theta.clone(), cost, grad.clone(), hess.clone()));
+        Ok(match request {
+            ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
+            ObjectiveRequest::CostAndGradient => ObjectiveSample::cost_and_gradient(cost, grad),
+            ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                ObjectiveSample::cost_gradient_hessian(cost, grad, hess)
+            }
+        })
     })
     .with_bounds(lower, upper, 1e-6)
     .with_tolerance(kappa_options.rel_tol.max(1e-6))
@@ -4252,10 +4259,10 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     let solution = match optimizer.run() {
         Ok(sol) => sol,
-        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
+        Err(ArcError::MaxIterationsReached { last_solution, .. }) => *last_solution,
         Err(err) => {
             return Err(EstimationError::RemlOptimizationFailed(format!(
-                "exact joint spatial length-scale optimization failed: {err:?}"
+                "exact joint spatial length-scale optimization failed (ARC): {err:?}"
             )));
         }
     };
@@ -4586,22 +4593,42 @@ where
             ))
         };
 
-        let mut optimizer = Bfgs::new(theta0.clone(), |theta| {
+        let mut optimizer = NewtonTrustRegion::new(theta0.clone(), |theta, request| {
             if let Some((theta_c, cost_c, grad_c)) = &last_eval
                 && approx_same_point(theta, theta_c)
             {
-                return (*cost_c, grad_c.clone());
+                return Ok(match request {
+                    ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                    ObjectiveRequest::CostAndGradient
+                    | ObjectiveRequest::GradientAndHessian
+                    | ObjectiveRequest::CostGradientHessian => {
+                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                    }
+                });
             }
 
-            let sample = match eval_value(theta) {
+            let (cost, grad) = match eval_value(theta) {
                 Ok((cost, mean_spec_c, noise_spec_c, mean_design_c, noise_design_c, fit_c)) => {
                     let mut objective_only = |probe: &Array1<f64>| -> Result<f64, EstimationError> {
                         let (value, _, _, _, _, _) = eval_value(probe)?;
                         Ok(value)
                     };
-                    let grad =
-                        central_diff_gradient(theta, &lower_eval, &upper_eval, &mut objective_only)
-                            .unwrap_or_else(|_| Array1::from_elem(theta.len(), 1e6));
+                    let grad = central_diff_gradient(
+                        theta,
+                        &lower_eval,
+                        &upper_eval,
+                        &mut objective_only,
+                    )
+                    .map_err(|e| {
+                        ObjectiveEvalError::recoverable(format!(
+                            "two-block spatial gradient evaluation failed: {e}"
+                        ))
+                    })?;
+                    if !cost.is_finite() || grad.iter().any(|v| !v.is_finite()) {
+                        return Err(ObjectiveEvalError::recoverable(
+                            "two-block spatial objective/gradient became non-finite",
+                        ));
+                    }
                     let _ = (
                         mean_spec_c,
                         noise_spec_c,
@@ -4612,24 +4639,30 @@ where
                     last_eval = Some((theta.clone(), cost, grad.clone()));
                     (cost, grad)
                 }
-                Err(_) => (
-                    1e50 + 0.5 * theta.dot(theta),
-                    Array1::from_elem(theta.len(), 1e6),
-                ),
+                Err(e) => {
+                    return Err(ObjectiveEvalError::recoverable(format!(
+                        "two-block spatial objective evaluation failed: {e}"
+                    )));
+                }
             };
-            sample
+            Ok(match request {
+                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
+                ObjectiveRequest::CostAndGradient
+                | ObjectiveRequest::GradientAndHessian
+                | ObjectiveRequest::CostGradientHessian => {
+                    ObjectiveSample::cost_and_gradient(cost, grad)
+                }
+            })
         })
         .with_bounds(lower, upper, 1e-6)
         .with_tolerance(kappa_options.rel_tol.max(1e-6))
         .with_max_iterations(kappa_options.max_outer_iter.max(1))
-        .with_no_improve_stop(1e-8, 8)
-        .with_flat_stall_exit(true, 4)
-        .with_curvature_slack_scale(2.0);
+        .with_bfgs_fallback(true)
+        .with_fallback_history(12);
 
         let solution = match optimizer.run() {
             Ok(sol) => sol,
-            Err(BfgsError::MaxIterationsReached { last_solution })
-            | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+            Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
             Err(err) => return Err(format!("two-block spatial optimization failed: {err:?}")),
         };
 
@@ -4676,7 +4709,8 @@ where
         &TermCollectionSpec,
         &TermCollectionDesign,
         &TermCollectionDesign,
-    ) -> Result<(f64, Array1<f64>), String>,
+        bool,
+    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String>,
 {
     let mean_terms = spatial_length_scale_term_indices(mean_spec);
     let noise_terms = spatial_length_scale_term_indices(noise_spec);
@@ -4764,12 +4798,29 @@ where
         format!("failed to freeze noise spatial basis centers during exact joint κ bootstrap: {e}")
     })?;
 
-    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
-    let mut optimizer = Bfgs::new(joint_setup.theta0.clone(), |theta| {
-        if let Some((theta_c, cost_c, grad_c)) = &last_eval
+    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
+    let mut optimizer = NewtonTrustRegion::new(joint_setup.theta0.clone(), |theta, request| {
+        let need_hessian = matches!(
+            request,
+            ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian
+        );
+        if let Some((theta_c, cost_c, grad_c, hess_c)) = &last_eval
             && approx_same_point(theta, theta_c)
+            && (!need_hessian || hess_c.is_some())
         {
-            return (*cost_c, grad_c.clone());
+            return Ok(match request {
+                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                ObjectiveRequest::CostAndGradient => {
+                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                }
+                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                    if let Some(h) = hess_c {
+                        ObjectiveSample::cost_gradient_hessian(*cost_c, grad_c.clone(), h.clone())
+                    } else {
+                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                    }
+                }
+            });
         }
         let mean_psi = theta
             .slice(s![rho_dim..rho_dim + mean_terms.len()])
@@ -4779,59 +4830,82 @@ where
             match apply_spatial_log_length_scales(&best_mean_spec, &mean_terms, &mean_psi) {
                 Ok(v) => v,
                 Err(_) => {
-                    return (
-                        1e50 + 0.5 * theta.dot(theta),
-                        Array1::from_elem(theta.len(), 1e6),
-                    );
+                    return Err(ObjectiveEvalError::recoverable(
+                        "exact-joint spatial objective failed to apply mean log length scales",
+                    ));
                 }
             };
         let noise_spec_c =
             match apply_spatial_log_length_scales(&best_noise_spec, &noise_terms, &noise_psi) {
                 Ok(v) => v,
                 Err(_) => {
-                    return (
-                        1e50 + 0.5 * theta.dot(theta),
-                        Array1::from_elem(theta.len(), 1e6),
-                    );
+                    return Err(ObjectiveEvalError::recoverable(
+                        "exact-joint spatial objective failed to apply noise log length scales",
+                    ));
                 }
             };
         let (mean_design_c, noise_design_c) = match build_pair(&mean_spec_c, &noise_spec_c) {
             Ok(v) => v,
             Err(_) => {
-                return (
-                    1e50 + 0.5 * theta.dot(theta),
-                    Array1::from_elem(theta.len(), 1e6),
-                );
+                return Err(ObjectiveEvalError::recoverable(
+                    "exact-joint spatial objective failed to build designs",
+                ));
             }
         };
-        match exact_fn(
+        let (cost, grad, hess) = match exact_fn(
             theta,
             &mean_spec_c,
             &noise_spec_c,
             &mean_design_c,
             &noise_design_c,
+            need_hessian,
         ) {
-            Ok((cost, grad)) => {
-                last_eval = Some((theta.clone(), cost, grad.clone()));
-                (cost, grad)
+            Ok((cost, grad, hess)) => {
+                if !cost.is_finite()
+                    || grad.iter().any(|v| !v.is_finite())
+                    || hess
+                        .as_ref()
+                        .map(|h| {
+                            h.nrows() != theta.len()
+                                || h.ncols() != theta.len()
+                                || h.iter().any(|v| !v.is_finite())
+                        })
+                        .unwrap_or(false)
+                {
+                    return Err(ObjectiveEvalError::recoverable(
+                        "exact-joint spatial objective/derivatives became non-finite",
+                    ));
+                }
+                last_eval = Some((theta.clone(), cost, grad.clone(), hess.clone()));
+                (cost, grad, hess)
             }
-            Err(_) => (
-                1e50 + 0.5 * theta.dot(theta),
-                Array1::from_elem(theta.len(), 1e6),
-            ),
-        }
+            Err(_) => {
+                return Err(ObjectiveEvalError::recoverable(
+                    "exact-joint spatial objective/gradient evaluation failed",
+                ));
+            }
+        };
+        Ok(match request {
+            ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
+            ObjectiveRequest::CostAndGradient => ObjectiveSample::cost_and_gradient(cost, grad),
+            ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
+                if let Some(h) = hess {
+                    ObjectiveSample::cost_gradient_hessian(cost, grad, h)
+                } else {
+                    ObjectiveSample::cost_and_gradient(cost, grad)
+                }
+            }
+        })
     })
     .with_bounds(joint_setup.lower.clone(), joint_setup.upper.clone(), 1e-6)
     .with_tolerance(kappa_options.rel_tol.max(1e-6))
     .with_max_iterations(kappa_options.max_outer_iter.max(1))
-    .with_no_improve_stop(1e-8, 8)
-    .with_flat_stall_exit(true, 4)
-    .with_curvature_slack_scale(2.0);
+    .with_bfgs_fallback(true)
+    .with_fallback_history(12);
 
     let solution = match optimizer.run() {
         Ok(sol) => sol,
-        Err(BfgsError::MaxIterationsReached { last_solution })
-        | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
         Err(err) => {
             return Err(format!(
                 "two-block exact joint spatial optimization failed: {err:?}"
@@ -6573,6 +6647,13 @@ mod tests {
 
         for i in 0..analytic.nrows() {
             for j in 0..analytic.ncols() {
+                assert_eq!(
+                    analytic[[i, j]].signum(),
+                    fd[[i, j]].signum(),
+                    "directional derivative sign mismatch at ({i},{j}): analytic={}, fd={}",
+                    analytic[[i, j]],
+                    fd[[i, j]]
+                );
                 assert!(
                     (analytic[[i, j]] - fd[[i, j]]).abs() < 1e-5,
                     "directional derivative mismatch at ({i},{j}): analytic={}, fd={}",

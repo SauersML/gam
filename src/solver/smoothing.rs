@@ -3,8 +3,8 @@ use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 use wolfe_bfgs::{
-    Bfgs, BfgsError, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError,
-    ObjectiveRequest, ObjectiveSample,
+    Arc as ArcOptimizer, ArcError, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, ObjectiveRequest,
+    ObjectiveSample,
 };
 
 #[derive(Clone, Debug)]
@@ -96,23 +96,6 @@ where
     Ok(Array1::from_vec(grad_vals?))
 }
 
-fn invalid_bfgs_sample(rho: &Array1<f64>) -> (f64, Array1<f64>) {
-    // `wolfe_bfgs::Bfgs` requires finite samples, so failed outer evaluations are
-    // turned into a large smooth barrier that pushes the iterate back toward the
-    // bounded interior instead of requesting Hessians or aborting the seed.
-    const COST_BARRIER: f64 = 1e50;
-    const GRAD_SCALE: f64 = 1e6;
-
-    let mut grad = rho.clone();
-    for g in grad.iter_mut() {
-        if !g.is_finite() || g.abs() < 1e-6 {
-            *g = 1.0;
-        }
-    }
-    grad *= GRAD_SCALE;
-    (COST_BARRIER + 0.5 * rho.dot(rho), grad)
-}
-
 fn approx_same_rho_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
     if a.len() != b.len() {
         return false;
@@ -178,7 +161,7 @@ where
     let candidate_seeds: Vec<(usize, Array1<f64>)> = seeds.into_iter().enumerate().collect();
 
     // Screen seeds: evaluate cost at each seed point, sort by cost, and only
-    // run full BFGS on the best screening_budget candidates.
+    // run full trust-region solves on the best screening_budget candidates.
     let screening_budget = options.seed_config.screening_budget.max(1);
     let screened_seeds = if candidate_seeds.len() > screening_budget {
         let mut scored: Vec<(usize, Array1<f64>, f64)> = candidate_seeds
@@ -204,7 +187,7 @@ where
     Ok(screened_seeds)
 }
 
-fn run_single_seed_bfgs<C, Eval>(
+fn run_single_seed_trust_region<C, Eval>(
     context: &mut C,
     rho_seed: &Array1<f64>,
     eval_cost_grad_rho: &mut Eval,
@@ -216,33 +199,49 @@ where
     let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
     let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
-    let mut optimizer = Bfgs::new(rho_seed.clone(), |rho| {
+    let mut optimizer = NewtonTrustRegion::new(rho_seed.clone(), |rho, request| {
         if let Some((rho_c, cost_c, grad_c)) = &last_eval
             && approx_same_rho_point(rho, rho_c)
         {
-            return (*cost_c, grad_c.clone());
+            return Ok(match request {
+                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                ObjectiveRequest::CostAndGradient
+                | ObjectiveRequest::GradientAndHessian
+                | ObjectiveRequest::CostGradientHessian => {
+                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                }
+            });
         }
 
-        let sample = match eval_cost_grad_rho(context, rho) {
+        let (cost, grad_rho) = match eval_cost_grad_rho(context, rho) {
             Ok((cost, grad_rho)) if cost.is_finite() && grad_rho.iter().all(|v| v.is_finite()) => {
                 (cost, grad_rho)
             }
-            _ => invalid_bfgs_sample(rho),
+            _ => {
+                return Err(ObjectiveEvalError::recoverable(
+                    "outer objective returned non-finite cost/gradient",
+                ));
+            }
         };
-        last_eval = Some((rho.clone(), sample.0, sample.1.clone()));
-        sample
+        last_eval = Some((rho.clone(), cost, grad_rho.clone()));
+        Ok(match request {
+            ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
+            ObjectiveRequest::CostAndGradient
+            | ObjectiveRequest::GradientAndHessian
+            | ObjectiveRequest::CostGradientHessian => {
+                ObjectiveSample::cost_and_gradient(cost, grad_rho)
+            }
+        })
     })
     .with_bounds(lower, upper, 1e-6)
     .with_tolerance(options.tol)
     .with_max_iterations(options.max_iter)
-    .with_no_improve_stop(1e-8, 8)
-    .with_flat_stall_exit(true, 4)
-    .with_curvature_slack_scale(2.0);
+    .with_bfgs_fallback(true)
+    .with_fallback_history(12);
 
     let solution = match optimizer.run() {
         Ok(sol) => sol,
-        Err(BfgsError::MaxIterationsReached { last_solution })
-        | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
         Err(_) => return None,
     };
 
@@ -273,7 +272,7 @@ where
     })
 }
 
-fn run_multistart_bfgs<C, Eval>(
+fn run_multistart_trust_region<C, Eval>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     context: &mut C,
@@ -294,7 +293,8 @@ where
     let near_stationary_tol = (options.tol.max(1e-8)) * 2.0;
     let mut best_grad_norm = f64::INFINITY;
     for (_seed_idx, rho_seed) in screened_seeds.iter() {
-        let Some(candidate) = run_single_seed_bfgs(context, rho_seed, eval_cost_grad_rho, options)
+        let Some(candidate) =
+            run_single_seed_trust_region(context, rho_seed, eval_cost_grad_rho, options)
         else {
             continue;
         };
@@ -330,7 +330,7 @@ where
     let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
     let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
-    let mut optimizer = NewtonTrustRegion::new(rho_seed.clone(), |rho, request| {
+    let mut optimizer = ArcOptimizer::new(rho_seed.clone(), |rho, request| {
         if let Some((rho_c, cost_c, grad_c, hess_c)) = &last_eval
             && approx_same_rho_point(rho, rho_c)
         {
@@ -388,7 +388,7 @@ where
 
     let solution = match optimizer.run() {
         Ok(sol) => sol,
-        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
+        Err(ArcError::MaxIterationsReached { last_solution, .. }) => *last_solution,
         Err(_) => return None,
     };
 
@@ -502,7 +502,7 @@ where
     Ok(scored.into_iter().map(|(i, r, _)| (i, r)).collect())
 }
 
-fn run_single_seed_bfgs_parallel<Eval>(
+fn run_single_seed_trust_region_parallel<Eval>(
     rho_seed: &Array1<f64>,
     eval_cost_grad_rho: &Eval,
     options: &SmoothingBfgsOptions,
@@ -513,33 +513,49 @@ where
     let lower = Array1::<f64>::from_elem(rho_seed.len(), -RHO_BOUND);
     let upper = Array1::<f64>::from_elem(rho_seed.len(), RHO_BOUND);
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
-    let mut optimizer = Bfgs::new(rho_seed.clone(), |rho| {
+    let mut optimizer = NewtonTrustRegion::new(rho_seed.clone(), |rho, request| {
         if let Some((rho_c, cost_c, grad_c)) = &last_eval
             && approx_same_rho_point(rho, rho_c)
         {
-            return (*cost_c, grad_c.clone());
+            return Ok(match request {
+                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                ObjectiveRequest::CostAndGradient
+                | ObjectiveRequest::GradientAndHessian
+                | ObjectiveRequest::CostGradientHessian => {
+                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                }
+            });
         }
 
-        let sample = match eval_cost_grad_rho(rho) {
+        let (cost, grad_rho) = match eval_cost_grad_rho(rho) {
             Ok((cost, grad_rho)) if cost.is_finite() && grad_rho.iter().all(|v| v.is_finite()) => {
                 (cost, grad_rho)
             }
-            _ => invalid_bfgs_sample(rho),
+            _ => {
+                return Err(ObjectiveEvalError::recoverable(
+                    "outer objective returned non-finite cost/gradient",
+                ));
+            }
         };
-        last_eval = Some((rho.clone(), sample.0, sample.1.clone()));
-        sample
+        last_eval = Some((rho.clone(), cost, grad_rho.clone()));
+        Ok(match request {
+            ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
+            ObjectiveRequest::CostAndGradient
+            | ObjectiveRequest::GradientAndHessian
+            | ObjectiveRequest::CostGradientHessian => {
+                ObjectiveSample::cost_and_gradient(cost, grad_rho)
+            }
+        })
     })
     .with_bounds(lower, upper, 1e-6)
     .with_tolerance(options.tol)
     .with_max_iterations(options.max_iter)
-    .with_no_improve_stop(1e-8, 8)
-    .with_flat_stall_exit(true, 4)
-    .with_curvature_slack_scale(2.0);
+    .with_bfgs_fallback(true)
+    .with_fallback_history(12);
 
     let solution = match optimizer.run() {
         Ok(sol) => sol,
-        Err(BfgsError::MaxIterationsReached { last_solution })
-        | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
         Err(_) => return None,
     };
 
@@ -570,7 +586,7 @@ where
     })
 }
 
-fn run_multistart_bfgs_parallel<Eval>(
+fn run_multistart_trust_region_parallel<Eval>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,
     eval_cost_grad_rho: &Eval,
@@ -588,7 +604,7 @@ where
     let mut candidates: Vec<(usize, SmoothingBfgsResult)> = screened_seeds
         .into_par_iter()
         .filter_map(|(seed_idx, rho_seed)| {
-            let res = run_single_seed_bfgs_parallel(&rho_seed, eval_cost_grad_rho, options)?;
+            let res = run_single_seed_trust_region_parallel(&rho_seed, eval_cost_grad_rho, options)?;
             Some((seed_idx, res))
         })
         .collect();
@@ -611,7 +627,7 @@ where
     })
 }
 
-/// Generic multi-start BFGS smoothing optimizer over log-smoothing parameters (`rho`).
+/// Generic multi-start trust-region smoothing optimizer over log-smoothing parameters (`rho`).
 ///
 /// This is intended for likelihoods whose outer objective is exposed as a scalar
 /// function of `rho` (for example survival workflows built on working-model PIRLS).
@@ -620,7 +636,7 @@ where
 ///   rho* = argmin_rho V(rho),
 /// where `V` is supplied by the caller.
 ///
-/// The gradient seen by BFGS is always computed by finite differences on `V`:
+/// The gradient seen by the trust-region optimizer is computed by finite differences on `V`:
 ///   grad_k = dV/drho_k ≈ [V(rho+h e_k)-V(rho-h e_k)]/(2h).
 /// This makes the direction field fully consistent with the exact scalar objective,
 /// which is particularly useful for complicated non-Gaussian/survival objectives where
@@ -650,7 +666,7 @@ where
         let grad_rho = finite_diff_gradient_external(rho, options.finite_diff_step, objective)?;
         Ok((cost, grad_rho))
     };
-    run_multistart_bfgs(
+    run_multistart_trust_region(
         num_penalties,
         heuristic_lambdas,
         &mut objective,
@@ -659,7 +675,7 @@ where
     )
 }
 
-/// Generic multi-start BFGS smoothing optimizer over log-smoothing parameters (`rho`)
+/// Generic multi-start trust-region smoothing optimizer over log-smoothing parameters (`rho`)
 /// when the caller can provide an exact objective gradient in rho-space.
 ///
 /// The callback must return:
@@ -680,7 +696,7 @@ where
 /// - `rho_j = log(lambda_j)` for each smoothing parameter.
 /// - The callback returns the scalar outer objective `V(rho)` and its exact
 ///   gradient `g(rho) = dV/drho`.
-/// - BFGS then builds its own quasi-Newton inverse-Hessian approximation from
+/// - the trust-region solver then builds its internal quasi-Newton model from
 ///   successive `(rho, g)` pairs; it does not need the caller's exact Hessian.
 ///
 /// In particular, when the outer objective is
@@ -714,7 +730,7 @@ where
     }
 
     let mut eval_cost_grad_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
-    run_multistart_bfgs(
+    run_multistart_trust_region(
         num_penalties,
         heuristic_lambdas,
         &mut objective_with_gradient,
@@ -725,7 +741,7 @@ where
 
 /// Parallelized multi-start exact-gradient optimizer.
 ///
-/// This variant runs seed screening and candidate BFGS probes concurrently.
+/// This variant runs seed screening and candidate trust-region probes concurrently.
 /// It requires a thread-safe objective callback.
 pub fn optimize_log_smoothing_with_multistart_with_gradient_parallel<F>(
     num_penalties: usize,
@@ -756,7 +772,7 @@ where
             options,
         );
     }
-    run_multistart_bfgs_parallel(
+    run_multistart_trust_region_parallel(
         num_penalties,
         heuristic_lambdas,
         &objective_with_gradient,
@@ -766,7 +782,7 @@ where
 
 /// Parallelized multi-start finite-difference optimizer.
 ///
-/// This variant runs seed screening and candidate BFGS probes concurrently and
+/// This variant runs seed screening and candidate trust-region probes concurrently and
 /// computes each coordinate's central-difference gradient in parallel.
 pub fn optimize_log_smoothing_with_multistart_parallel_fd<F>(
     num_penalties: usize,
@@ -795,7 +811,7 @@ where
             options,
         );
     }
-    run_multistart_bfgs_parallel(
+    run_multistart_trust_region_parallel(
         num_penalties,
         heuristic_lambdas,
         &|rho: &Array1<f64>| {

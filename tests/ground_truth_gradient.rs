@@ -171,6 +171,15 @@ fn test_laml_gradient_nonfirth_well_conditioned() {
     )
     .expect("analytic");
     let fd = fd_gradient(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-4);
+    for i in 0..analytic.len() {
+        assert_eq!(
+            analytic[i].signum(),
+            fd[i].signum(),
+            "nonfirth sign mismatch at i={i}: analytic={} fd={}",
+            analytic[i],
+            fd[i]
+        );
+    }
 
     let dot = analytic.dot(&fd);
     let n_a = analytic.dot(&analytic).sqrt();
@@ -233,6 +242,15 @@ fn test_laml_gradient_logit_with_firth_well_conditioned() {
     )
     .expect("analytic");
     let fd = fd_gradient(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-4);
+    for i in 0..analytic.len() {
+        assert_eq!(
+            analytic[i].signum(),
+            fd[i].signum(),
+            "logit/firth sign mismatch at i={i}: analytic={} fd={}",
+            analytic[i],
+            fd[i]
+        );
+    }
 
     let dot = analytic.dot(&fd);
     let n_a = analytic.dot(&analytic).sqrt();
@@ -294,6 +312,15 @@ fn stress_test_firth_gradient_vs_conditioning() {
             continue;
         };
         let fd = fd_gradient(&y, &w, &x, &offset, &s_list, &opts, &rho, 1e-4);
+        for i in 0..analytic.len() {
+            assert_eq!(
+                analytic[i].signum(),
+                fd[i].signum(),
+                "stress sign mismatch at n={n} p={p} i={i}: analytic={} fd={}",
+                analytic[i],
+                fd[i]
+            );
+        }
         let dot = analytic.dot(&fd);
         let n_a = analytic.dot(&analytic).sqrt();
         let n_f = fd.dot(&fd).sqrt();

@@ -10,7 +10,7 @@
 //! - g(·): Flexible 1D link correction with scale anchor (g(u) = u + B(u)θ)
 //!
 //! The algorithm:
-//! - Outer: gradient-only BFGS over ρ = [log(λ_base), log(λ_link)]
+//! - Outer: gradient-only trust-region optimization over ρ = [log(λ_base), log(λ_link)]
 //! - Inner: Alternating (g|β, β|g with g'(u)*X design)
 //! - LAML cost computed via logdet of joint Gauss-Newton Hessian
 
@@ -34,7 +34,10 @@ use crate::visualizer;
 use faer::Side;
 use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use wolfe_bfgs::{Bfgs, BfgsError, BfgsSolution};
+use wolfe_bfgs::{
+    NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, ObjectiveRequest,
+    ObjectiveSample,
+};
 
 // NOTE on z standardization:
 // We standardize u = Xβ into z_raw = (u - min_u) / (max_u - min_u).
@@ -54,8 +57,6 @@ const JOINT_GRAD_AUDIT_CLAMP_FRAC: f64 = 0.90;
 const JOINT_GRAD_AUDIT_WARMUP_EVALS: usize = 5;
 const JOINT_GRAD_AUDIT_INTERVAL: usize = 20;
 const JOINT_ENABLE_RUNTIME_FD_AUDIT: bool = cfg!(any(test, debug_assertions));
-const OUTER_BFGS_COST_BARRIER: f64 = 1e50;
-const OUTER_BFGS_GRAD_SCALE: f64 = 1e6;
 
 #[inline]
 fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<LikelihoodFamily> {
@@ -94,17 +95,6 @@ fn joint_point_inverse_link(link: LinkFunction, eta: f64) -> f64 {
 fn should_sample_joint_fd_audit(eval_num: usize) -> bool {
     eval_num <= JOINT_GRAD_AUDIT_WARMUP_EVALS
         || (JOINT_GRAD_AUDIT_INTERVAL > 0 && eval_num % JOINT_GRAD_AUDIT_INTERVAL == 0)
-}
-
-fn invalid_outer_bfgs_sample(rho: &Array1<f64>) -> (f64, Array1<f64>) {
-    let mut grad = rho.clone();
-    for g in grad.iter_mut() {
-        if !g.is_finite() || g.abs() < 1e-6 {
-            *g = 1.0;
-        }
-    }
-    grad *= OUTER_BFGS_GRAD_SCALE;
-    (OUTER_BFGS_COST_BARRIER + 0.5 * rho.dot(rho), grad)
 }
 
 /// Ensure a matrix is positive definite by adding ridge if needed for solver stability.
@@ -3012,7 +3002,7 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
             .collect()
     };
 
-    let mut successful_runs: Vec<(String, BfgsSolution, f64)> = Vec::new();
+    let mut successful_runs: Vec<(String, Array1<f64>, f64)> = Vec::new();
     let mut last_error: Option<EstimationError> = None;
     let total_candidates = candidate_plans.len();
     let mut candidate_idx = 0usize;
@@ -3027,7 +3017,7 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
         let lower = Array1::<f64>::from_elem(rho.len(), -RHO_BOUND);
         let upper = Array1::<f64>::from_elem(rho.len(), RHO_BOUND);
         let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
-        let mut solver = Bfgs::new(rho, |rho| {
+        let mut solver = NewtonTrustRegion::new(rho, |rho, request| {
             if let Some((rho_c, cost_c, grad_c)) = &last_eval
                 && rho.len() == rho_c.len()
                 && rho
@@ -3035,44 +3025,57 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
                     .zip(rho_c.iter())
                     .all(|(&a, &b)| (a - b).abs() <= 1e-12)
             {
-                return (*cost_c, grad_c.clone());
+                return Ok(match request {
+                    ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
+                    ObjectiveRequest::CostAndGradient
+                    | ObjectiveRequest::GradientAndHessian
+                    | ObjectiveRequest::CostGradientHessian => {
+                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+                    }
+                });
             }
 
-            let sample = match (
-                reml_state.compute_cost(rho),
-                reml_state.compute_gradient(rho),
-            ) {
+            let (cost, grad) = match (reml_state.compute_cost(rho), reml_state.compute_gradient(rho)) {
                 (Ok(cost), Ok(grad)) if cost.is_finite() && grad.iter().all(|v| v.is_finite()) => {
                     (cost, grad)
                 }
-                _ => invalid_outer_bfgs_sample(rho),
+                _ => {
+                    return Err(ObjectiveEvalError::recoverable(
+                        "joint outer objective/gradient evaluation failed",
+                    ));
+                }
             };
-            last_eval = Some((rho.clone(), sample.0, sample.1.clone()));
-            sample
+            last_eval = Some((rho.clone(), cost, grad.clone()));
+            Ok(match request {
+                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
+                ObjectiveRequest::CostAndGradient
+                | ObjectiveRequest::GradientAndHessian
+                | ObjectiveRequest::CostGradientHessian => {
+                    ObjectiveSample::cost_and_gradient(cost, grad)
+                }
+            })
         })
         .with_bounds(lower, upper, 1e-6)
         .with_tolerance(config.reml_tol)
         .with_max_iterations(config.max_reml_iter)
-        .with_no_improve_stop(1e-8, 8)
-        .with_flat_stall_exit(true, 4)
-        .with_curvature_slack_scale(2.0);
+        .with_bfgs_fallback(true)
+        .with_fallback_history(12);
 
         let solution = match solver.run() {
             Ok(solution) => solution,
-            Err(BfgsError::MaxIterationsReached { last_solution })
-            | Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+            Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
             Err(e) => {
                 last_error = Some(EstimationError::RemlOptimizationFailed(format!(
-                    "BFGS failed for joint model: {e:?}"
+                    "trust-region solve failed for joint model: {e:?}"
                 )));
                 continue;
             }
         };
         let final_value = solution.final_value;
-        successful_runs.push((label, solution, final_value));
+        successful_runs.push((label, solution.final_point.clone(), final_value));
     }
 
-    let (_, best_solution, _) =
+    let (_, best_rho, _) =
         match successful_runs
             .into_iter()
             .min_by(|a, b| match a.2.partial_cmp(&b.2) {
@@ -3089,7 +3092,6 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
             }
         };
 
-    let best_rho = best_solution.final_point;
     let _ = reml_state.compute_cost(&best_rho)?;
     Ok(reml_state.into_result())
 }
@@ -3693,6 +3695,15 @@ mod tests {
         for &(n, ill) in &[(120, false), (120, true), (800, false), (800, true)] {
             match run_case(n, 6, ill, 123) {
                 Ok(Some((grad_analytic, grad_fd, audit_needed))) => {
+                    for i in 0..grad_fd.len() {
+                        assert_eq!(
+                            grad_analytic[i].signum(),
+                            grad_fd[i].signum(),
+                            "analytic/FD gradient sign mismatch: n={n} ill={ill} audit={audit_needed} i={i} analytic={} fd={}",
+                            grad_analytic[i],
+                            grad_fd[i]
+                        );
+                    }
                     let mut diff_norm = 0.0;
                     let mut fd_norm = 0.0;
                     for i in 0..grad_fd.len() {

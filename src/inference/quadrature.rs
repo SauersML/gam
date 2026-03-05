@@ -3315,6 +3315,7 @@ mod tests {
         let mu_minus = logit_posterior_mean(&ctx, eta - h, se);
         let dmu_fd = (mu_plus - mu_minus) / (2.0 * h);
 
+        assert_eq!(dmu.signum(), dmu_fd.signum());
         assert_relative_eq!(dmu, dmu_fd, epsilon = 5e-6, max_relative = 2e-4);
     }
 
@@ -3514,6 +3515,9 @@ mod tests {
         let d1_fd = (plus.mean - minus.mean) / (2.0 * h);
         let d2_fd = (plus.d1 - minus.d1) / (2.0 * h);
         let d3_fd = (plus.d2 - minus.d2) / (2.0 * h);
+        assert_eq!(out.d1.signum(), d1_fd.signum());
+        assert_eq!(out.d2.signum(), d2_fd.signum());
+        assert_eq!(out.d3.signum(), d3_fd.signum());
         assert_relative_eq!(out.d1, d1_fd, epsilon = 2e-5, max_relative = 2e-4);
         assert_relative_eq!(out.d2, d2_fd, epsilon = 4e-5, max_relative = 6e-4);
         assert_relative_eq!(out.d3, d3_fd, epsilon = 8e-5, max_relative = 2e-3);
@@ -3534,6 +3538,9 @@ mod tests {
         let d1_fd = (plus.mean - minus.mean) / (2.0 * h);
         let d2_fd = (plus.d1 - minus.d1) / (2.0 * h);
         let d3_fd = (plus.d2 - minus.d2) / (2.0 * h);
+        assert_eq!(out.d1.signum(), d1_fd.signum());
+        assert_eq!(out.d2.signum(), d2_fd.signum());
+        assert_eq!(out.d3.signum(), d3_fd.signum());
         assert_relative_eq!(out.d1, d1_fd, epsilon = 2e-5, max_relative = 3e-4);
         assert_relative_eq!(out.d2, d2_fd, epsilon = 4e-5, max_relative = 8e-4);
         assert_relative_eq!(out.d3, d3_fd, epsilon = 8e-5, max_relative = 2e-3);
@@ -3550,6 +3557,7 @@ mod tests {
             .expect("exact logit minus")
             .mean;
         let fd = (plus - minus) / (2.0 * h);
+        assert_eq!(out.dmean_dmu.signum(), fd.signum());
         assert_relative_eq!(out.dmean_dmu, fd, epsilon = 1e-6, max_relative = 5e-4);
     }
 

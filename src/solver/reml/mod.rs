@@ -287,6 +287,15 @@ mod tests {
         let b_num = (&b_analytic - &b_fd).mapv(|v| v * v).sum().sqrt();
         let b_den = b_fd.mapv(|v| v * v).sum().sqrt().max(1e-12);
         let b_rel = b_num / b_den;
+        for i in 0..b_analytic.len() {
+            assert_eq!(
+                b_analytic[i].signum(),
+                b_fd[i].signum(),
+                "B sign mismatch at i={i}: analytic={} fd={}",
+                b_analytic[i],
+                b_fd[i]
+            );
+        }
         assert!(
             b_rel < 2e-2,
             "B implicit solve mismatch vs FD: rel={b_rel:.3e}, num={b_num:.3e}, den={b_den:.3e}"
@@ -295,6 +304,17 @@ mod tests {
         let dh_num = (&h_tau_analytic - &h_tau_fd).mapv(|v| v * v).sum().sqrt();
         let dh_den = h_tau_fd.mapv(|v| v * v).sum().sqrt().max(1e-12);
         let dh_rel = dh_num / dh_den;
+        for i in 0..h_tau_analytic.nrows() {
+            for j in 0..h_tau_analytic.ncols() {
+                assert_eq!(
+                    h_tau_analytic[[i, j]].signum(),
+                    h_tau_fd[[i, j]].signum(),
+                    "H_tau sign mismatch at ({i},{j}): analytic={} fd={}",
+                    h_tau_analytic[[i, j]],
+                    h_tau_fd[[i, j]]
+                );
+            }
+        }
         assert!(
             dh_rel < 3e-2,
             "H_tau mismatch vs FD: rel={dh_rel:.3e}, num={dh_num:.3e}, den={dh_den:.3e}"
@@ -302,6 +322,11 @@ mod tests {
 
         let v_abs = (v_tau_analytic - v_tau_fd).abs();
         let v_rel = v_abs / v_tau_fd.abs().max(1e-10);
+        assert_eq!(
+            v_tau_analytic.signum(),
+            v_tau_fd.signum(),
+            "V_tau sign mismatch: analytic={v_tau_analytic:.6e}, fd={v_tau_fd:.6e}"
+        );
         assert!(
             v_rel < 5e-2,
             "V_tau mismatch vs FD: rel={v_rel:.3e}, abs={v_abs:.3e}, analytic={v_tau_analytic:.6e}, fd={v_tau_fd:.6e}"
@@ -526,8 +551,9 @@ mod tests {
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clear_warm_start();
+        let bundle = state.obtain_eval_bundle(&rho).expect("firth eval bundle");
         let g = state
-            .compute_directional_hyper_gradient(&rho, &hyper)
+            .compute_directional_hyper_gradient_with_bundle(&rho, &bundle, &hyper)
             .expect("firth penalty-only directional gradient should evaluate");
         assert!(
             g.is_finite(),
@@ -561,8 +587,9 @@ mod tests {
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clear_warm_start();
+        let bundle = state.obtain_eval_bundle(&rho).expect("firth eval bundle");
         let g = state
-            .compute_directional_hyper_gradient(&rho, &hyper)
+            .compute_directional_hyper_gradient_with_bundle(&rho, &bundle, &hyper)
             .expect("firth design-moving directional gradient should evaluate");
         assert!(
             g.is_finite(),
@@ -598,13 +625,13 @@ mod tests {
         // Dense reference path.
         let dense_state = build_logit_state(&y, &w, &x_dense, &s0, &cfg);
         dense_state.clear_warm_start();
+        let dense_bundle = dense_state.obtain_eval_bundle(&rho).expect("dense bundle");
         let g_dense = dense_state
-            .compute_directional_hyper_gradient(&rho, &hyper)
+            .compute_directional_hyper_gradient_with_bundle(&rho, &dense_bundle, &hyper)
             .expect("dense firth directional gradient");
 
         // Build a synthetic sparse bundle and call sparse branch directly.
         // This validates sparse-branch Firth parity against dense exact math.
-        let dense_bundle = dense_state.obtain_eval_bundle(&rho).expect("dense bundle");
         let h_sparse = dense_to_sparse_symmetric_upper(dense_bundle.h_total.as_ref(), 1e-14)
             .expect("H->sparse upper");
         let sparse_factor = factorize_sparse_spd(&h_sparse).expect("sparse factor");
@@ -947,14 +974,15 @@ mod tests {
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
         state.clear_warm_start();
+        let bundle = state.obtain_eval_bundle(&rho).expect("dense bundle");
 
         let t0 = Instant::now();
         let g_dense = state
-            .compute_directional_hyper_gradient(&rho, &hyper)
+            .compute_directional_hyper_gradient_with_bundle(&rho, &bundle, &hyper)
             .expect("dense directional");
         let dt_dense = t0.elapsed();
 
-        let bundle_dense = state.obtain_eval_bundle(&rho).expect("bundle");
+        let bundle_dense = bundle;
         let h_sparse = dense_to_sparse_symmetric_upper(bundle_dense.h_total.as_ref(), 1e-14)
             .expect("H->sparse upper");
         let sparse_factor = factorize_sparse_spd(&h_sparse).expect("factor");
