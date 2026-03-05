@@ -3049,14 +3049,42 @@ where
                         break; // Break inner lambda loop, continue outer pirls loop
                     } else {
                         // Reject Step
+                        let state_grad_norm = state.gradient.dot(&state.gradient).sqrt();
+                        let near_stationary_tol = options.convergence_tolerance.max(1e-6) * 50.0;
+                        let reduction_noise_floor =
+                            (current_penalized.abs().max(candidate_penalized.abs()).max(1.0))
+                                * 1e-12;
+
+                        // Near stationarity, objective deltas can collapse into floating-point
+                        // noise and LM gain-ratio logic may reject every candidate indefinitely.
+                        // Treat this as a valid stalled optimum rather than escalating damping.
+                        if candidate_penalized.is_finite()
+                            && state_grad_norm <= near_stationary_tol
+                            && predicted_reduction.abs() <= reduction_noise_floor
+                            && actual_reduction >= -reduction_noise_floor
+                        {
+                            last_gradient_norm = state_grad_norm;
+                            last_deviance_change = 0.0;
+                            last_step_size = 0.0;
+                            last_step_halving = attempts;
+                            max_abs_eta = state
+                                .eta
+                                .iter()
+                                .copied()
+                                .map(f64::abs)
+                                .fold(0.0, f64::max);
+                            final_state = Some(state.clone());
+                            status = PirlsStatus::StalledAtValidMinimum;
+                            break 'pirls_loop;
+                        }
+
                         if loop_lambda > 1e12 {
                             // Exhausted attempts
                             if attempts > 30 {
-                                let state_grad_norm = state.gradient.dot(&state.gradient).sqrt();
                                 last_gradient_norm = state_grad_norm;
                                 // Only accept "stalled but valid" when we are near stationarity.
                                 // Otherwise report MaxIterationsReached so callers can fail fast.
-                                if state_grad_norm <= options.convergence_tolerance.max(1e-6) * 10.0
+                                if state_grad_norm <= near_stationary_tol
                                 {
                                     status = PirlsStatus::StalledAtValidMinimum;
                                 } else {

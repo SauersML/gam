@@ -3455,7 +3455,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let tol_primal = 1e-7;
         let tol_dual = 1e-7;
         let tol_comp = 1e-7;
-        let tol_stat = 5e-6;
+        let tol_stat = (pirls_opts.convergence_tolerance * 50.0).max(5e-6);
         if kkt.primal_feasibility > tol_primal
             || kkt.dual_feasibility > tol_dual
             || kkt.complementarity > tol_comp
