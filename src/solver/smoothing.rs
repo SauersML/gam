@@ -144,14 +144,19 @@ fn should_replace_smoothing_candidate(
 }
 
 #[inline]
-fn env_flag(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(raw) => {
-            let v = raw.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        }
-        Err(_) => default,
+fn should_parallelize_smoothing_candidates(
+    num_penalties: usize,
+    options: &SmoothingBfgsOptions,
+) -> bool {
+    if rayon::current_num_threads() <= 1 {
+        return false;
     }
+    let screening_budget = options.seed_config.screening_budget.max(1);
+    let max_seeds = options.seed_config.max_seeds.max(screening_budget);
+    let workload = num_penalties
+        .saturating_mul(screening_budget)
+        .saturating_mul(max_seeds);
+    workload >= 64 || num_penalties >= 8 || screening_budget >= 4
 }
 
 fn screened_seeds<C, Eval>(
@@ -743,7 +748,7 @@ where
             stationary: grad_norm <= options.tol.max(1e-6),
         });
     }
-    if !env_flag("GAM_SMOOTHING_PARALLEL_CANDIDATES", true) {
+    if !should_parallelize_smoothing_candidates(num_penalties, options) {
         return optimize_log_smoothing_with_multistart_with_gradient(
             num_penalties,
             heuristic_lambdas,
@@ -782,7 +787,7 @@ where
             stationary: true,
         });
     }
-    if !env_flag("GAM_SMOOTHING_PARALLEL_CANDIDATES", true) {
+    if !should_parallelize_smoothing_candidates(num_penalties, options) {
         return optimize_log_smoothing_with_multistart(
             num_penalties,
             heuristic_lambdas,

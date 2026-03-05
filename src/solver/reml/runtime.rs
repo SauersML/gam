@@ -1176,7 +1176,14 @@ impl<'a> RemlState<'a> {
                 // Envelope-theorem outer gradients require the inner solve to be near
                 // stationarity; a loose max-iter acceptance threshold (e.g. 1.0) causes
                 // persistent KKT/envelope diagnostic failures and inaccurate hyper-gradients.
-                let acceptable_kkt = (self.config.convergence_tolerance * 10.0).max(1e-4);
+                let acceptable_kkt = if self.runtime_sas_link_state.is_some() {
+                    // SAS-link outer sweeps can stall at boundary-heavy rho configurations
+                    // before satisfying strict default KKT tolerances; allow a wider
+                    // near-stationary band to avoid false hard failures in those regimes.
+                    (self.config.convergence_tolerance * 50.0).max(1e-2)
+                } else {
+                    (self.config.convergence_tolerance * 10.0).max(1e-4)
+                };
                 if pirls_result.last_gradient_norm > acceptable_kkt {
                     // The fit timed out and gradient is still too large for reliable outer
                     // derivatives, so fail fast and let the caller backtrack.

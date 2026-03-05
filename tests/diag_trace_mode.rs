@@ -50,7 +50,7 @@ fn make_problem(
 }
 
 #[test]
-fn compare_trace_third_modes_against_fd() {
+fn trace_third_auto_correction_against_fd() {
     let opts = ExternalOptimOptions {
         mixture_link: None,
         optimize_mixture: false,
@@ -71,36 +71,24 @@ fn compare_trace_third_modes_against_fd() {
 
     for scale in [4.0_f64, 1.0_f64, 0.25_f64] {
         let (x, y, w, offset, s_list) = make_problem(scale);
-        let rel_for = |mode: &str| -> f64 {
-            unsafe {
-                std::env::set_var("GAM_DIAG_TRACE_THIRD_MODE", mode);
-            }
-            let (analytic, fd) = evaluate_external_gradients(
-                y.view(),
-                w.view(),
-                x.view(),
-                offset.view(),
-                &s_list,
-                &opts,
-                &rho,
-            )
-            .expect("gradient eval should succeed");
-            let num = (&analytic - &fd).mapv(|v| v * v).sum().sqrt();
-            let den = fd.mapv(|v| v * v).sum().sqrt().max(1e-12);
-            num / den
-        };
-
-        let rel_minus = rel_for("minus");
-        let rel_plus = rel_for("plus");
-        let rel_zero = rel_for("zero");
+        let (analytic, fd) = evaluate_external_gradients(
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            &s_list,
+            &opts,
+            &rho,
+        )
+        .expect("gradient eval should succeed");
+        let num = (&analytic - &fd).mapv(|v| v * v).sum().sqrt();
+        let den = fd.mapv(|v| v * v).sum().sqrt().max(1e-12);
+        let rel = num / den;
 
         eprintln!(
-            "scale={:.2} trace-third rel errors: minus={:.3e} plus={:.3e} zero={:.3e}",
-            scale, rel_minus, rel_plus, rel_zero
+            "scale={:.2} trace-third auto-correct rel error: {:.3e}",
+            scale, rel
         );
-
-        // Diagnostic-only test: prints relative errors for each trace-third mode.
-        // Intentionally no hard assertion because regime-dependent behavior is what
-        // we are measuring.
+        assert!(rel.is_finite(), "relative error must be finite");
     }
 }

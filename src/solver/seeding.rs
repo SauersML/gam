@@ -53,6 +53,30 @@ fn rho_from_lambda(lambda: f64, bounds: (f64, f64)) -> f64 {
     clamp_to_bounds(lambda.max(1e-12).ln(), bounds)
 }
 
+fn add_nu2_reverse_manifold_seeds(
+    seeds: &mut Vec<Array1<f64>>,
+    seen: &mut HashSet<Vec<u64>>,
+    bounds: (f64, f64),
+    primary: &Array1<f64>,
+) {
+    if primary.len() != 3 {
+        return;
+    }
+    let ln_two = 2.0_f64.ln();
+    let tau_anchors = [primary[2], 0.0, -2.0, 2.0];
+    let log_kappa_grid = [-2.0, -1.0, 0.0, 1.0, 2.0];
+    for &tau_rho in &tau_anchors {
+        for &log_kappa in &log_kappa_grid {
+            // Thread-2 reverse map at nu=2:
+            // lambda0 = tau * kappa^4, lambda1 = tau * 2*kappa^2, lambda2 = tau.
+            let rho2 = clamp_to_bounds(tau_rho, bounds);
+            let rho1 = clamp_to_bounds(tau_rho + ln_two + 2.0 * log_kappa, bounds);
+            let rho0 = clamp_to_bounds(tau_rho + 4.0 * log_kappa, bounds);
+            add_seed_dedup(seeds, seen, Array1::from_vec(vec![rho0, rho1, rho2]));
+        }
+    }
+}
+
 fn halton(mut index: usize, base: usize) -> f64 {
     let mut f = 1.0_f64;
     let mut r = 0.0_f64;
@@ -124,6 +148,11 @@ pub fn generate_rho_candidates(
     add_seed_dedup(&mut seeds, &mut seen, primary.clone());
     // Always include neutral baseline independently of heuristic anchor.
     add_seed_dedup(&mut seeds, &mut seen, Array1::zeros(num_penalties));
+    // For exactly three penalties (mass/tension/stiffness), inject
+    // physically coherent nu=2 manifold seeds in rho-space.
+    if num_penalties == 3 {
+        add_nu2_reverse_manifold_seeds(&mut seeds, &mut seen, bounds, &primary);
+    }
 
     // Backward-compatible scalar heuristic support: treat each value as a symmetric λ seed.
     if let Some(vals) = heuristic_lambdas
@@ -329,5 +358,16 @@ mod tests {
             .iter()
             .any(|s| s.iter().all(|v| (*v - 0.0).abs() < 1e-12));
         assert!(has_zero);
+    }
+
+    #[test]
+    fn three_penalty_seeds_include_nu2_reverse_manifold_triplets() {
+        let cfg = SeedConfig::default();
+        let seeds = generate_rho_candidates(3, None, &cfg);
+        let ln4 = 4.0_f64.ln();
+        let has_nu2_manifold_seed = seeds
+            .iter()
+            .any(|s| s.len() == 3 && ((2.0 * s[1] - s[0] - s[2]) - ln4).abs() < 1e-8);
+        assert!(has_nu2_manifold_seed);
     }
 }

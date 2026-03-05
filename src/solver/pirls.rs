@@ -4608,7 +4608,10 @@ pub fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64
 
 #[inline]
 fn logit_clamp_zero_enabled() -> bool {
-    std::env::var("GAM_DIAG_NO_LOGIT_C_CLAMP").ok().as_deref() != Some("1")
+    // Auto-correct behavior: when logit geometry enters hard-clamped/nonsmooth
+    // regions, force c/d to zero to keep IRLS updates stable and consistent with
+    // piecewise-smooth objective behavior.
+    true
 }
 
 #[inline]

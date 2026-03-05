@@ -41,6 +41,10 @@ bench/plots/
 # local scratch / profiling outputs
 tmp/
 diff.txt
+.tmp_run53_artifacts/
+bench/figures.zip
+run53_duchon_matern_results.txt
+scripts/rust_digest.txt
 
 # Lean/Lake build artifacts
 .lake/

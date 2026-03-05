@@ -1895,6 +1895,9 @@ pub struct BasisBuildResult {
 pub enum PenaltySource {
     Primary,
     DoublePenaltyNullspace,
+    OperatorMass,
+    OperatorTension,
+    OperatorStiffness,
     TensorMarginal { dim: usize },
     TensorGlobalRidge,
     Other(String),
@@ -1914,6 +1917,8 @@ pub struct PenaltyInfo {
     pub effective_rank: usize,
     pub dropped_reason: Option<PenaltyDropReason>,
     pub nullspace_dim_hint: usize,
+    #[serde(default = "default_normalization_scale")]
+    pub normalization_scale: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1921,6 +1926,7 @@ pub struct PenaltyCandidate {
     pub matrix: Array2<f64>,
     pub nullspace_dim_hint: usize,
     pub source: PenaltySource,
+    pub normalization_scale: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1942,6 +1948,18 @@ pub struct BasisPsiDerivativeResult {
 pub struct BasisPsiSecondDerivativeResult {
     pub design_second_derivative: Array2<f64>,
     pub penalties_second_derivative: Vec<Array2<f64>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollocationOperatorMatrices {
+    pub d0: Array2<f64>,
+    pub d1: Array2<f64>,
+    pub d2: Array2<f64>,
+    pub collocation_points: Array2<f64>,
+}
+
+fn default_normalization_scale() -> f64 {
+    1.0
 }
 
 fn validate_center_count(num_centers: usize) -> Result<(), BasisError> {
@@ -2277,6 +2295,7 @@ pub fn build_bspline_basis_1d(
         matrix: s_bend_raw.clone(),
         nullspace_dim_hint: 0,
         source: PenaltySource::Primary,
+        normalization_scale: 1.0,
     }];
     if spec.double_penalty {
         penalties_raw.push(PenaltyCandidate {
@@ -2285,6 +2304,7 @@ pub fn build_bspline_basis_1d(
                 .unwrap_or_else(|| Array2::<f64>::zeros(s_bend_raw.raw_dim())),
             nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
+            normalization_scale: 1.0,
         });
     }
 
@@ -2308,6 +2328,7 @@ pub fn build_bspline_basis_1d(
                     nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
                     matrix,
                     source: candidate.source,
+                    normalization_scale: candidate.normalization_scale,
                 })
             },
         )
@@ -2553,6 +2574,7 @@ pub fn filter_active_penalty_candidates(
             effective_rank: analysis.rank,
             dropped_reason,
             nullspace_dim_hint: candidate.nullspace_dim_hint,
+            normalization_scale: candidate.normalization_scale,
         });
     }
 
@@ -2638,12 +2660,14 @@ pub fn build_thin_plate_basis(
         matrix: tps.penalty_bending.clone(),
         nullspace_dim_hint: tps.num_polynomial_basis,
         source: PenaltySource::Primary,
+        normalization_scale: 1.0,
     }];
     if spec.double_penalty {
         candidates.push(PenaltyCandidate {
             matrix: tps.penalty_ridge.clone(),
             nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
+            normalization_scale: 1.0,
         });
     }
     let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
@@ -2798,6 +2822,259 @@ fn matern_kernel_log_kappa_second_derivative_from_distance(
         }
     };
     Ok(second)
+}
+
+#[inline(always)]
+fn matern_poly_terms(nu: MaternNu, a: f64) -> (f64, f64, f64) {
+    match nu {
+        MaternNu::Half => (1.0, 0.0, 0.0),
+        MaternNu::ThreeHalves => (1.0 + a, 1.0, 0.0),
+        MaternNu::FiveHalves => (1.0 + a + (a * a) / 3.0, 1.0 + (2.0 / 3.0) * a, 2.0 / 3.0),
+        MaternNu::SevenHalves => {
+            let a2 = a * a;
+            (
+                1.0 + a + (2.0 / 5.0) * a2 + (1.0 / 15.0) * a2 * a,
+                1.0 + (4.0 / 5.0) * a + (1.0 / 5.0) * a2,
+                (4.0 / 5.0) + (2.0 / 5.0) * a,
+            )
+        }
+        MaternNu::NineHalves => {
+            let a2 = a * a;
+            let a3 = a2 * a;
+            (
+                1.0 + a + (3.0 / 7.0) * a2 + (2.0 / 21.0) * a3 + (1.0 / 105.0) * a2 * a2,
+                1.0 + (6.0 / 7.0) * a + (2.0 / 7.0) * a2 + (4.0 / 105.0) * a3,
+                (6.0 / 7.0) + (4.0 / 7.0) * a + (4.0 / 35.0) * a2,
+            )
+        }
+    }
+}
+
+#[inline(always)]
+fn matern_kernel_radial_triplet(
+    r: f64,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<(f64, f64, f64), BasisError> {
+    let phi = matern_kernel_from_distance(r, length_scale, nu)?;
+    let q = match nu {
+        MaternNu::Half => 1.0 / length_scale,
+        MaternNu::ThreeHalves => 3.0_f64.sqrt() / length_scale,
+        MaternNu::FiveHalves => 5.0_f64.sqrt() / length_scale,
+        MaternNu::SevenHalves => 7.0_f64.sqrt() / length_scale,
+        MaternNu::NineHalves => 9.0_f64.sqrt() / length_scale,
+    };
+    let a = q * r;
+    let (p, p1, p2) = matern_poly_terms(nu, a);
+    let exp_a = (-a).exp();
+    let phi_r = q * (p1 - p) * exp_a;
+    let phi_rr = q * q * (p2 - 2.0 * p1 + p) * exp_a;
+    Ok((phi, phi_r, phi_rr))
+}
+
+fn duchon_kernel_radial_triplet(
+    r: f64,
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+    coeffs: Option<&DuchonPartialFractionCoeffs>,
+) -> Result<(f64, f64, f64), BasisError> {
+    let value = duchon_matern_kernel_general_from_distance(r, length_scale, p_order, s_order, k_dim, coeffs)?;
+    if r <= 0.0 {
+        return Ok((value, 0.0, 0.0));
+    }
+    let h = (1e-5 * (1.0 + r)).clamp(1e-7, 1e-2);
+    let fp = duchon_matern_kernel_general_from_distance(
+        r + h,
+        length_scale,
+        p_order,
+        s_order,
+        k_dim,
+        coeffs,
+    )?;
+    let fm = duchon_matern_kernel_general_from_distance(
+        (r - h).max(0.0),
+        length_scale,
+        p_order,
+        s_order,
+        k_dim,
+        coeffs,
+    )?;
+    let first = (fp - fm) / (2.0 * h);
+    let second = (fp - 2.0 * value + fm) / (h * h);
+    Ok((value, first, second))
+}
+
+fn symmetrize(matrix: &Array2<f64>) -> Array2<f64> {
+    (matrix + &matrix.t().to_owned()) * 0.5
+}
+
+fn normalize_penalty(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
+    let norm = matrix.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12);
+    (matrix.mapv(|v| v / norm), norm)
+}
+
+fn build_collocation_operators_from_radial<F>(
+    collocation: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    radial_triplet: F,
+) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError>
+where
+    F: Fn(f64) -> Result<(f64, f64, f64), BasisError>,
+{
+    let p = collocation.nrows();
+    let d = collocation.ncols();
+    let m = centers.nrows();
+    let mut d0 = Array2::<f64>::zeros((p, m));
+    let mut d1 = Array2::<f64>::zeros((p * d, m));
+    let mut d2 = Array2::<f64>::zeros((p, m));
+    const R_EPS: f64 = 1e-10;
+    for k in 0..p {
+        for j in 0..m {
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = collocation[[k, c]] - centers[[j, c]];
+                dist2 += delta * delta;
+            }
+            let r = dist2.sqrt();
+            let (phi, phi_r, phi_rr) = radial_triplet(r)?;
+            d0[[k, j]] = phi;
+            if r > R_EPS {
+                let scale = phi_r / r;
+                for c in 0..d {
+                    let delta = collocation[[k, c]] - centers[[j, c]];
+                    d1[[k * d + c, j]] = scale * delta;
+                }
+                d2[[k, j]] = phi_rr + ((d as f64 - 1.0) * phi_r / r);
+            } else {
+                d2[[k, j]] = d as f64 * phi_rr;
+            }
+        }
+    }
+    Ok((d0, d1, d2))
+}
+
+fn operator_penalty_candidates_from_collocation(
+    d0: &Array2<f64>,
+    d1: &Array2<f64>,
+    d2: &Array2<f64>,
+) -> Vec<PenaltyCandidate> {
+    let (s0, c0) = normalize_penalty(&symmetrize(&fast_ata(d0)));
+    let (s1, c1) = normalize_penalty(&symmetrize(&fast_ata(d1)));
+    let (s2, c2) = normalize_penalty(&symmetrize(&fast_ata(d2)));
+    vec![
+        PenaltyCandidate {
+            matrix: s0,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorMass,
+            normalization_scale: c0,
+        },
+        PenaltyCandidate {
+            matrix: s1,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorTension,
+            normalization_scale: c1,
+        },
+        PenaltyCandidate {
+            matrix: s2,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorStiffness,
+            normalization_scale: c2,
+        },
+    ]
+}
+
+pub fn build_matern_collocation_operator_matrices(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    include_intercept: bool,
+    identifiability_transform: Option<ArrayView2<'_, f64>>,
+) -> Result<CollocationOperatorMatrices, BasisError> {
+    let (d0_raw, d1_raw, d2_raw) =
+        build_collocation_operators_from_radial(centers, centers, |r| {
+            matern_kernel_radial_triplet(r, length_scale, nu)
+        })?;
+    let (d0_kernel, d1_kernel, d2_kernel) = if let Some(z) = identifiability_transform {
+        let z = z.to_owned();
+        (fast_ab(&d0_raw, &z), fast_ab(&d1_raw, &z), fast_ab(&d2_raw, &z))
+    } else {
+        (d0_raw, d1_raw, d2_raw)
+    };
+    let p_colloc = centers.nrows();
+    let dim = centers.ncols();
+    let kernel_cols = d0_kernel.ncols();
+    let total_cols = kernel_cols + usize::from(include_intercept);
+    let mut d0 = Array2::<f64>::zeros((p_colloc, total_cols));
+    let mut d1 = Array2::<f64>::zeros((p_colloc * dim, total_cols));
+    let mut d2 = Array2::<f64>::zeros((p_colloc, total_cols));
+    d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel);
+    d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
+    d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
+    if include_intercept {
+        d0.column_mut(kernel_cols).fill(1.0);
+    }
+    Ok(CollocationOperatorMatrices {
+        d0,
+        d1,
+        d2,
+        collocation_points: centers.to_owned(),
+    })
+}
+
+pub fn build_duchon_collocation_operator_matrices(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    power: usize,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<CollocationOperatorMatrices, BasisError> {
+    let p_order = duchon_p_from_nullspace_order(nullspace_order);
+    let s_order = power;
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+    let z = cached_kernel_constraint_nullspace(centers, nullspace_order)?;
+    let (d0_raw, d1_raw, d2_raw) =
+        build_collocation_operators_from_radial(centers, centers, |r| {
+            duchon_kernel_radial_triplet(
+                r,
+                length_scale,
+                p_order,
+                s_order,
+                centers.ncols(),
+                Some(&coeffs),
+            )
+        })?;
+    let d0_kernel = fast_ab(&d0_raw, &z);
+    let d1_kernel = fast_ab(&d1_raw, &z);
+    let d2_kernel = fast_ab(&d2_raw, &z);
+    let poly = polynomial_block_from_order(centers, nullspace_order);
+    let p_colloc = centers.nrows();
+    let dim = centers.ncols();
+    let kernel_cols = d0_kernel.ncols();
+    let poly_cols = poly.ncols();
+    let total_cols = kernel_cols + poly_cols;
+    let mut d0 = Array2::<f64>::zeros((p_colloc, total_cols));
+    d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel);
+    if poly_cols > 0 {
+        d0.slice_mut(s![.., kernel_cols..]).assign(&poly);
+    }
+    let mut d1 = Array2::<f64>::zeros((p_colloc * dim, total_cols));
+    d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
+    if poly_cols > 1 {
+        for k in 0..p_colloc {
+            for axis in 0..dim {
+                d1[[k * dim + axis, kernel_cols + 1 + axis]] = 1.0;
+            }
+        }
+    }
+    let mut d2 = Array2::<f64>::zeros((p_colloc, total_cols));
+    d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
+    Ok(CollocationOperatorMatrices {
+        d0,
+        d1,
+        d2,
+        collocation_points: centers.to_owned(),
+    })
 }
 
 #[inline(always)]
@@ -3583,6 +3860,64 @@ fn cached_kernel_constraint_nullspace(
     Ok((*z).clone())
 }
 
+fn matern_identifiability_transform(
+    centers: ArrayView2<'_, f64>,
+    identifiability: &MaternIdentifiability,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    let k = centers.nrows();
+    match identifiability {
+        MaternIdentifiability::None => Ok(None),
+        MaternIdentifiability::CenterSumToZero => {
+            let q = Array2::<f64>::ones((k, 1));
+            Ok(Some(kernel_constraint_nullspace_from_matrix(q.view())?))
+        }
+        MaternIdentifiability::CenterLinearOrthogonal => {
+            let q = polynomial_block_from_order(centers, DuchonNullspaceOrder::Linear);
+            Ok(Some(kernel_constraint_nullspace_from_matrix(q.view())?))
+        }
+        MaternIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != k {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen Matérn identifiability transform mismatch: centers={k}, transform rows={}",
+                    transform.nrows()
+                )));
+            }
+            Ok(Some(transform.clone()))
+        }
+    }
+}
+
+fn build_matern_operator_penalty_candidates(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    include_intercept: bool,
+    z_opt: Option<&Array2<f64>>,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let ops = build_matern_collocation_operator_matrices(
+        centers,
+        length_scale,
+        nu,
+        include_intercept,
+        z_opt.map(|z| z.view()),
+    )?;
+    Ok(operator_penalty_candidates_from_collocation(
+        &ops.d0, &ops.d1, &ops.d2,
+    ))
+}
+
+fn build_duchon_operator_penalty_candidates(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    power: usize,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let ops = build_duchon_collocation_operator_matrices(centers, length_scale, power, nullspace_order)?;
+    Ok(operator_penalty_candidates_from_collocation(
+        &ops.d0, &ops.d1, &ops.d2,
+    ))
+}
+
 /// Creates a Matérn spline basis from data and centers.
 ///
 /// The design is `[K | 1]` when `include_intercept=true` and `[K]` otherwise, where:
@@ -3715,42 +4050,14 @@ pub fn build_matern_basis(
     spec: &MaternBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let k = centers.nrows();
-    let z_opt = match &spec.identifiability {
-        MaternIdentifiability::None => None,
-        MaternIdentifiability::CenterSumToZero => {
-            let q = Array2::<f64>::ones((k, 1));
-            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
-        }
-        MaternIdentifiability::CenterLinearOrthogonal => {
-            let q = polynomial_block_from_order(centers.view(), DuchonNullspaceOrder::Linear);
-            Some(kernel_constraint_nullspace_from_matrix(q.view())?)
-        }
-        MaternIdentifiability::FrozenTransform { transform } => {
-            if transform.nrows() != k {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "frozen Matérn identifiability transform mismatch: centers={k}, transform rows={}",
-                    transform.nrows()
-                )));
-            }
-            Some(transform.clone())
-        }
-    };
+    let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
 
     // Build an unconstrained kernel block first, then apply center-based
     // coefficient constraints in a deterministic way.
     let m = create_matern_spline_basis(data, centers.view(), spec.length_scale, spec.nu, false)?;
-    let (design, penalty_kernel, identifiability_transform) = if let Some(z) = z_opt {
+    let (design, identifiability_transform) = if let Some(ref z) = z_opt {
         let kernel_raw = m.basis.slice(s![.., 0..m.num_kernel_basis]).to_owned();
         let kernel_constrained = fast_ab(&kernel_raw, &z);
-        let omega_raw = m
-            .penalty_kernel
-            .slice(s![0..m.num_kernel_basis, 0..m.num_kernel_basis])
-            .to_owned();
-        let omega_constrained = {
-            let zt_k = fast_atb(&z, &omega_raw);
-            fast_ab(&zt_k, &z)
-        };
         let mut design = kernel_constrained;
         if spec.include_intercept {
             let n = design.nrows();
@@ -3762,29 +4069,21 @@ pub fn build_matern_basis(
             design_with_intercept.column_mut(p).fill(1.0);
             design = design_with_intercept;
         }
-        let total_cols = design.ncols();
-        let mut penalty = Array2::<f64>::zeros((total_cols, total_cols));
-        let kernel_cols = omega_constrained.ncols();
-        penalty
-            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-            .assign(&omega_constrained);
-        (design, penalty, Some(z))
+        (design, Some(z.clone()))
     } else {
-        (m.basis, m.penalty_kernel, None)
+        (m.basis, None)
     };
-    let mut candidates = vec![PenaltyCandidate {
-        matrix: penalty_kernel.clone(),
-        nullspace_dim_hint: if spec.include_intercept { 1 } else { 0 },
-        source: PenaltySource::Primary,
-    }];
+    let candidates = build_matern_operator_penalty_candidates(
+        centers.view(),
+        spec.length_scale,
+        spec.nu,
+        spec.include_intercept,
+        z_opt.as_ref(),
+    )?;
     if spec.double_penalty {
-        candidates.push(PenaltyCandidate {
-            matrix: build_nullspace_shrinkage_penalty(&penalty_kernel)?
-                .map(|penalty_ridge| penalty_ridge.sym_penalty)
-                .unwrap_or_else(|| Array2::<f64>::zeros(penalty_kernel.raw_dim())),
-            nullspace_dim_hint: 0,
-            source: PenaltySource::DoublePenaltyNullspace,
-        });
+        log::debug!(
+            "Matérn double_penalty requested but ignored because S0 mass penalty already shrinks the nullspace"
+        );
     }
     let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
@@ -4234,17 +4533,16 @@ pub fn build_duchon_basis(
         spec.power,
         spec.nullspace_order,
     )?;
-    let mut candidates = vec![PenaltyCandidate {
-        matrix: d.penalty_kernel.clone(),
-        nullspace_dim_hint: d.num_polynomial_basis,
-        source: PenaltySource::Primary,
-    }];
+    let candidates = build_duchon_operator_penalty_candidates(
+        centers.view(),
+        spec.length_scale,
+        spec.power,
+        spec.nullspace_order,
+    )?;
     if spec.double_penalty {
-        candidates.push(PenaltyCandidate {
-            matrix: d.penalty_ridge.clone(),
-            nullspace_dim_hint: 0,
-            source: PenaltySource::DoublePenaltyNullspace,
-        });
+        log::debug!(
+            "Duchon double_penalty requested but ignored because S0 mass penalty already shrinks the nullspace"
+        );
     }
     let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
