@@ -1770,19 +1770,10 @@ def _load_hgdp_pc_with_imputed_latlon():
 
     known_subpops = [sp for sp in centroids.index if sp in sub_latlon_known.index]
     if len(known_subpops) < 2:
-        # Fallback for datasets where Latitude/Longitude are entirely missing:
-        # derive deterministic pseudo-anchors from centroid PC geometry.
-        c2 = centroids.reset_index()[["Subpopulation", "PC1", "PC2"]].copy()
-        pc1 = c2["PC1"].to_numpy(dtype=float)
-        pc2 = c2["PC2"].to_numpy(dtype=float)
-        pc1_lo, pc1_hi = float(np.min(pc1)), float(np.max(pc1))
-        pc2_lo, pc2_hi = float(np.min(pc2)), float(np.max(pc2))
-        pc1_den = max(pc1_hi - pc1_lo, 1e-8)
-        pc2_den = max(pc2_hi - pc2_lo, 1e-8)
-        c2["Latitude"] = -60.0 + 120.0 * ((pc1 - pc1_lo) / pc1_den)
-        c2["Longitude"] = -170.0 + 340.0 * ((pc2 - pc2_lo) / pc2_den)
-        sub_latlon_known = c2.set_index("Subpopulation")[["Latitude", "Longitude"]]
-        known_subpops = [sp for sp in centroids.index if sp in sub_latlon_known.index]
+        raise RuntimeError(
+            "hgdp_1kg_pc_data.tsv must contain at least two subpopulations with real "
+            "Latitude/Longitude values"
+        )
 
     known_x = centroids.loc[known_subpops].to_numpy(dtype=float)
     known_latlon = sub_latlon_known.loc[known_subpops][["Latitude", "Longitude"]].to_numpy(dtype=float)
@@ -2430,25 +2421,26 @@ def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None =
                     f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
                 )
     else:
-        col = cfg["smooth_col"]
-        if basis in {"thinplate", "tps"}:
-            terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
-        elif basis in {"ps", "bspline", "p-spline"} and "double_penalty" in cfg:
-            dp = "true" if bool(cfg["double_penalty"]) else "false"
-            terms.append(f"s({col}, type=ps, knots={knot_count}, double_penalty={dp})")
-        elif basis in {"ps", "bspline", "p-spline"}:
-            terms.append(f"s({col}, type=ps, knots={knot_count})")
-        elif basis in {"duchon", "matern"}:
-            if basis == "duchon":
-                terms.append(
-                    f"s({col}, type=duchon, centers={knot_count}, order=0, power=1{dp_opt})"
-                )
+        col = cfg.get("smooth_col")
+        if col:
+            if basis in {"thinplate", "tps"}:
+                terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
+            elif basis in {"ps", "bspline", "p-spline"} and "double_penalty" in cfg:
+                dp = "true" if bool(cfg["double_penalty"]) else "false"
+                terms.append(f"s({col}, type=ps, knots={knot_count}, double_penalty={dp})")
+            elif basis in {"ps", "bspline", "p-spline"}:
+                terms.append(f"s({col}, type=ps, knots={knot_count})")
+            elif basis in {"duchon", "matern"}:
+                if basis == "duchon":
+                    terms.append(
+                        f"s({col}, type=duchon, centers={knot_count}, order=0, power=1{dp_opt})"
+                    )
+                else:
+                    terms.append(f"s({col}, type={basis}, centers={knot_count}{dp_opt})")
             else:
-                terms.append(f"s({col}, type={basis}, centers={knot_count}{dp_opt})")
-        else:
-            raise RuntimeError(
-                f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
-            )
+                raise RuntimeError(
+                    f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
+                )
 
     if not terms:
         raise RuntimeError(f"empty Rust term list for scenario '{scenario_name}'")
@@ -3088,17 +3080,38 @@ def run_rust_scenario_cv(
                                 )
             elif ds["family"] == "gaussian":
                 y_test = test_df[ds["target"]].to_numpy(dtype=float)
-                sigma_hat = 1.0
                 try:
                     if model_payload is None:
                         model_payload = json.loads(model_path.read_text())
                         if isinstance(model_payload, dict) and "payload" in model_payload:
                             model_payload = model_payload.get("payload", {})
-                    sigma_hat = float(model_payload.get("fit_result", {}).get("scale", 1.0))
-                except Exception:
-                    sigma_hat = 1.0
+                    sigma_hat_raw = model_payload.get("fit_result", {}).get("scale", None)
+                    sigma_hat = float(sigma_hat_raw)
+                except Exception as e:
+                    return {
+                        "contender": contender_name,
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "fold_id": int(fold_id),
+                        "n_train": int(len(fold.train_idx)),
+                        "n_test": int(len(fold.test_idx)),
+                        "n_folds": int(len(folds)),
+                        "error": f"rust gaussian fit output missing/invalid fit_result.scale: {e}",
+                    }
                 if (not np.isfinite(sigma_hat)) or sigma_hat <= 0.0:
-                    sigma_hat = 1.0
+                    return {
+                        "contender": contender_name,
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "fold_id": int(fold_id),
+                        "n_train": int(len(fold.train_idx)),
+                        "n_test": int(len(fold.test_idx)),
+                        "n_folds": int(len(folds)),
+                        "error": (
+                            "rust gaussian fit_result.scale must be finite and > 0; "
+                            f"got {sigma_hat!r}"
+                        ),
+                    }
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
@@ -3324,7 +3337,6 @@ def _run_rust_gamlss_scenario_cv_variant(
                 test_df.to_csv(test_path, index=False)
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
-            train_pred_path = td_path / f"pred_train_{fold_id}.csv"
 
             fit_cmd = [
                 str(rust_bin),
@@ -3408,29 +3420,47 @@ def _run_rust_gamlss_scenario_cv_variant(
                     }
                 )
             else:
-                # Gaussian GAMLSS: get per-obs sigma from the noise block if available,
-                # otherwise fall back to train-RMSE as sigma estimate.
-                if "sigma" in pred_df.columns:
-                    sigma_hat = pred_df["sigma"].to_numpy(dtype=float)
-                    sigma_hat = np.clip(sigma_hat, 1e-12, None)
-                else:
-                    # Predict on training data to get sigma estimate.
-                    train_pred_cmd = [
-                        str(rust_bin), "predict",
-                        str(model_path), str(train_path),
-                        "--out", str(train_pred_path),
-                    ]
-                    code2, _, _ = run_cmd(train_pred_cmd, cwd=ROOT)
-                    if code2 == 0 and train_pred_path.is_file():
-                        train_pred_df = pd.read_csv(train_pred_path)
-                        if "mean" in train_pred_df.columns:
-                            y_train = train_df[ds["target"]].to_numpy(dtype=float)
-                            pred_train = train_pred_df["mean"].to_numpy(dtype=float)
-                            sigma_hat = max(rmse_score(y_train, pred_train), 1e-12)
-                        else:
-                            sigma_hat = 1.0
-                    else:
-                        sigma_hat = 1.0
+                if "sigma" not in pred_df.columns:
+                    return {
+                        "contender": contender_name,
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "fold_id": int(fold_id),
+                        "n_train": int(len(fold.train_idx)),
+                        "n_test": int(len(fold.test_idx)),
+                        "n_folds": int(len(folds)),
+                        "error": "rust gamlss gaussian prediction output missing 'sigma' column",
+                    }
+                sigma_hat = pred_df["sigma"].to_numpy(dtype=float)
+                if sigma_hat.shape[0] != pred.shape[0]:
+                    return {
+                        "contender": contender_name,
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "fold_id": int(fold_id),
+                        "n_train": int(len(fold.train_idx)),
+                        "n_test": int(len(fold.test_idx)),
+                        "n_folds": int(len(folds)),
+                        "error": (
+                            "rust gamlss gaussian prediction output has invalid 'sigma' length "
+                            f"(got {sigma_hat.shape[0]}, expected {pred.shape[0]})"
+                        ),
+                    }
+                bad_sigma = ~np.isfinite(sigma_hat) | (sigma_hat <= 0.0)
+                if np.any(bad_sigma):
+                    return {
+                        "contender": contender_name,
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "fold_id": int(fold_id),
+                        "n_train": int(len(fold.train_idx)),
+                        "n_test": int(len(fold.test_idx)),
+                        "n_folds": int(len(folds)),
+                        "error": (
+                            "rust gamlss gaussian prediction output has non-finite or non-positive "
+                            f"'sigma' values ({int(np.sum(bad_sigma))} invalid rows)"
+                        ),
+                    }
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
@@ -3780,8 +3810,26 @@ if (family_name == "gaussian") {
   # Gaussian metrics with per-obs sigma from the sigma sub-model.
   sigma_hat <- tryCatch(
     pmax(as.numeric(predict(fit, newdata=test_df, what="sigma", type="response")), 1e-12),
-    error = function(e) rep(max(sqrt(mean((y_test - p)^2)), 1e-12), length(y_test))
+    error = function(e) e
   )
+  if (inherits(sigma_hat, "error")) {
+    out <- list(status="failed", error=paste0("r_gamlss sigma predict failed: ", conditionMessage(sigma_hat)))
+    write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+    quit(save="no")
+  }
+  if (length(sigma_hat) != length(y_test)) {
+    out <- list(
+      status="failed",
+      error=paste0("r_gamlss sigma length mismatch (got ", length(sigma_hat), ", expected ", length(y_test), ")")
+    )
+    write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+    quit(save="no")
+  }
+  if (any(!is.finite(sigma_hat) | sigma_hat <= 0)) {
+    out <- list(status="failed", error="r_gamlss sigma has non-finite or non-positive values")
+    write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+    quit(save="no")
+  }
   rmse <- sqrt(mean((y_test - p)^2))
   mae <- mean(abs(y_test - p))
   sst <- sum((y_test - mean(y_test))^2)
@@ -4312,13 +4360,24 @@ if (ncol(pred) < 1) {
   quit(save="no")
 }
 p <- as.numeric(pred[,1])
-if (ncol(pred) >= 2) {
-  sigma_hat <- pmax(as.numeric(pred[,2]), 1e-12)
-} else {
-  pred_train <- as.matrix(predict(fit, newdata=train_df, type="response"))
-  mu_train <- as.numeric(pred_train[,1])
-  sigma_fallback <- sqrt(mean((as.numeric(train_df[[target_name]]) - mu_train)^2))
-  sigma_hat <- rep(max(sigma_fallback, 1e-12), length(y_test))
+if (ncol(pred) < 2) {
+  out <- list(status="failed", error="r_mgcv_gaulss predict output missing sigma column")
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+sigma_hat <- as.numeric(pred[,2])
+if (length(sigma_hat) != length(y_test)) {
+  out <- list(
+    status="failed",
+    error=paste0("r_mgcv_gaulss sigma length mismatch (got ", length(sigma_hat), ", expected ", length(y_test), ")")
+  )
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+if (any(!is.finite(sigma_hat) | sigma_hat <= 0)) {
+  out <- list(status="failed", error="r_mgcv_gaulss sigma has non-finite or non-positive values")
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
 }
 rmse <- sqrt(mean((y_test - p)^2))
 mae <- mean(abs(y_test - p))
@@ -4498,10 +4557,12 @@ fit <- tryCatch({
     error=function(e) e
   )
   if (inherits(aic_obj, "error")) {
-    selected_mstop <- 200L
+    stop(paste0("AIC selection failed: ", conditionMessage(aic_obj)))
   } else {
     selected_mstop <- as.integer(mstop(aic_obj))
-    if (!is.finite(selected_mstop) || selected_mstop < 1) selected_mstop <- 200L
+    if (!is.finite(selected_mstop) || selected_mstop < 1) {
+      stop(paste0("AIC selection returned invalid mstop: ", as.character(selected_mstop)))
+    }
   }
   fit_final <- fit_full[selected_mstop]
   attr(fit_final, "selected_mstop") <- selected_mstop
@@ -4522,16 +4583,23 @@ p <- tryCatch(
   as.numeric(predict(fit, newdata=test_df, parameter="mu", type="response")),
   error=function(e) e
 )
-if (inherits(p, "error")) {
-  p <- tryCatch(
-    as.numeric(predict(fit, newdata=test_df, which="mu", type="response")),
-    error=function(e) e
-  )
-}
 pred_sec <- proc.time()[["elapsed"]] - pred_t0
 
 if (inherits(p, "error")) {
   out <- list(status="failed", error=paste0("r_gamboostlss predict failed: ", conditionMessage(p)))
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+if (length(p) != length(y_test)) {
+  out <- list(
+    status="failed",
+    error=paste0("r_gamboostlss mu length mismatch (got ", length(p), ", expected ", length(y_test), ")")
+  )
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+if (any(!is.finite(p))) {
+  out <- list(status="failed", error="r_gamboostlss mu has non-finite values")
   write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
   quit(save="no")
 }
@@ -4540,26 +4608,22 @@ sigma_pred <- tryCatch(
   error=function(e) e
 )
 if (inherits(sigma_pred, "error")) {
-  sigma_pred <- tryCatch(
-    as.numeric(predict(fit, newdata=test_df, which="sigma", type="response")),
-    error=function(e) e
-  )
+  out <- list(status="failed", error=paste0("r_gamboostlss sigma predict failed: ", conditionMessage(sigma_pred)))
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
 }
-if (inherits(sigma_pred, "error")) {
-  p_train <- tryCatch(
-    as.numeric(predict(fit, newdata=train_df, parameter="mu", type="response")),
-    error=function(e) e
+if (length(sigma_pred) != length(y_test)) {
+  out <- list(
+    status="failed",
+    error=paste0("r_gamboostlss sigma length mismatch (got ", length(sigma_pred), ", expected ", length(y_test), ")")
   )
-  if (inherits(p_train, "error")) {
-    p_train <- tryCatch(
-      as.numeric(predict(fit, newdata=train_df, which="mu", type="response")),
-      error=function(e) e
-    )
-  }
-  sigma_hat <- max(sqrt(mean((as.numeric(train_df[[target_name]]) - as.numeric(p_train))^2)), 1e-12)
-  sigma_pred <- rep(sigma_hat, length(y_test))
-} else {
-  sigma_pred <- pmax(as.numeric(sigma_pred), 1e-12)
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+if (any(!is.finite(sigma_pred) | sigma_pred <= 0)) {
+  out <- list(status="failed", error="r_gamboostlss sigma has non-finite or non-positive values")
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
 }
 
 rmse <- sqrt(mean((y_test - p)^2))
@@ -4716,38 +4780,18 @@ for (cn in feature_cols) {
   test_df[[cn]] <- (test_df[[cn]] - mu) / sdv
 }
 
-fit_attempt <- function() {
-  f1 <- list(mu = as.formula(mu_formula), sigma = as.formula(sigma_formula))
-  fit <- tryCatch(
-    bamlss(
-      formula = f1,
-      family = "gaussian",
-      data = train_df,
-      optimizer = TRUE,
-      sampler = FALSE,
-      verbose = FALSE
-    ),
-    error = function(e) e
-  )
-  if (!inherits(fit, "error")) return(fit)
-
-  f2 <- list(as.formula(mu_formula), as.formula(sigma_formula))
-  fit2 <- tryCatch(
-    bamlss(
-      formula = f2,
-      family = "gaussian",
-      data = train_df,
-      optimizer = TRUE,
-      sampler = FALSE,
-      verbose = FALSE
-    ),
-    error = function(e) e
-  )
-  fit2
-}
-
 t0 <- proc.time()[["elapsed"]]
-fit <- fit_attempt()
+fit <- tryCatch(
+  bamlss(
+    formula = list(mu = as.formula(mu_formula), sigma = as.formula(sigma_formula)),
+    family = "gaussian",
+    data = train_df,
+    optimizer = TRUE,
+    sampler = FALSE,
+    verbose = FALSE
+  ),
+  error = function(e) e
+)
 fit_sec <- proc.time()[["elapsed"]] - t0
 
 if (inherits(fit, "error")) {
@@ -4756,26 +4800,11 @@ if (inherits(fit, "error")) {
   quit(save="no")
 }
 
-pred_attempt <- function() {
-  p <- tryCatch(
-    as.numeric(predict(fit, newdata=test_df, model="mu", type="response")),
-    error=function(e) e
-  )
-  if (!inherits(p, "error")) return(p)
-  p <- tryCatch(
-    as.numeric(predict(fit, newdata=test_df, parameter="mu", type="response")),
-    error=function(e) e
-  )
-  if (!inherits(p, "error")) return(p)
-  p <- tryCatch(
-    as.numeric(fitted(fit, model="mu", newdata=test_df)),
-    error=function(e) e
-  )
-  p
-}
-
 pred_t0 <- proc.time()[["elapsed"]]
-p <- pred_attempt()
+p <- tryCatch(
+  as.numeric(predict(fit, newdata=test_df, model="mu", type="response")),
+  error=function(e) e
+)
 pred_sec <- proc.time()[["elapsed"]] - pred_t0
 
 if (inherits(p, "error")) {
@@ -4783,45 +4812,40 @@ if (inherits(p, "error")) {
   write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
   quit(save="no")
 }
-sigma_attempt <- function(data_arg) {
-  s <- tryCatch(
-    as.numeric(predict(fit, newdata=data_arg, model="sigma", type="response")),
-    error=function(e) e
+if (length(p) != length(y_test)) {
+  out <- list(
+    status="failed",
+    error=paste0("r_bamlss mu length mismatch (got ", length(p), ", expected ", length(y_test), ")")
   )
-  if (!inherits(s, "error")) return(s)
-  s <- tryCatch(
-    as.numeric(predict(fit, newdata=data_arg, parameter="sigma", type="response")),
-    error=function(e) e
-  )
-  if (!inherits(s, "error")) return(s)
-  s <- tryCatch(
-    as.numeric(fitted(fit, model="sigma", newdata=data_arg)),
-    error=function(e) e
-  )
-  s
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
 }
-sigma_pred <- sigma_attempt(test_df)
+if (any(!is.finite(p))) {
+  out <- list(status="failed", error="r_bamlss mu has non-finite values")
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+sigma_pred <- tryCatch(
+  as.numeric(predict(fit, newdata=test_df, model="sigma", type="response")),
+  error=function(e) e
+)
 if (inherits(sigma_pred, "error")) {
-  p_train <- tryCatch(
-    as.numeric(predict(fit, newdata=train_df, model="mu", type="response")),
-    error=function(e) e
+  out <- list(status="failed", error=paste0("r_bamlss sigma predict failed: ", conditionMessage(sigma_pred)))
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+if (length(sigma_pred) != length(y_test)) {
+  out <- list(
+    status="failed",
+    error=paste0("r_bamlss sigma length mismatch (got ", length(sigma_pred), ", expected ", length(y_test), ")")
   )
-  if (inherits(p_train, "error")) {
-    p_train <- tryCatch(
-      as.numeric(predict(fit, newdata=train_df, parameter="mu", type="response")),
-      error=function(e) e
-    )
-  }
-  if (inherits(p_train, "error")) {
-    p_train <- tryCatch(
-      as.numeric(fitted(fit, model="mu", newdata=train_df)),
-      error=function(e) e
-    )
-  }
-  sigma_hat <- max(sqrt(mean((as.numeric(train_df[[target_name]]) - as.numeric(p_train))^2)), 1e-12)
-  sigma_pred <- rep(sigma_hat, length(y_test))
-} else {
-  sigma_pred <- pmax(as.numeric(sigma_pred), 1e-12)
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+if (any(!is.finite(sigma_pred) | sigma_pred <= 0)) {
+  out <- list(status="failed", error="r_bamlss sigma has non-finite or non-positive values")
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
 }
 
 rmse <- sqrt(mean((y_test - p)^2))
@@ -5003,11 +5027,22 @@ sigma_pred <- tryCatch(
   error=function(e) e
 )
 if (inherits(sigma_pred, "error")) {
-  p_train <- as.numeric(fitted(fit, newdata=train_df, summary=TRUE)[, "Estimate"])
-  sigma_hat <- max(sqrt(mean((as.numeric(train_df[[target_name]]) - p_train)^2)), 1e-12)
-  sigma_pred <- rep(sigma_hat, length(y_test))
-} else {
-  sigma_pred <- pmax(as.numeric(sigma_pred), 1e-12)
+  out <- list(status="failed", error=paste0("r_brms sigma extract failed: ", conditionMessage(sigma_pred)))
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+if (length(sigma_pred) != length(y_test)) {
+  out <- list(
+    status="failed",
+    error=paste0("r_brms sigma length mismatch (got ", length(sigma_pred), ", expected ", length(y_test), ")")
+  )
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+if (any(!is.finite(sigma_pred) | sigma_pred <= 0)) {
+  out <- list(status="failed", error="r_brms sigma has non-finite or non-positive values")
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
 }
 
 rmse <- sqrt(mean((y_test - p)^2))
@@ -5277,6 +5312,12 @@ def run_external_pygam_cv(scenario, *, ds: dict | None = None, folds: list[Fold]
         ds = dataset_for_scenario(scenario)
     if folds is None:
         folds = folds_for_dataset(ds)
+    rust_cfg = _rust_fit_mapping(scenario["name"])
+    if rust_cfg is not None:
+        basis = _canonical_smooth_basis(rust_cfg.get("smooth_basis", "ps"))
+        # pyGAM should not run scenarios requiring unsupported spline families.
+        if basis in {"thinplate", "duchon", "matern"}:
+            return None
     df = pd.DataFrame(ds["rows"])
     x = df[ds["features"]].to_numpy(dtype=float) if ds["features"] else np.empty((len(df), 0))
     y = df[ds["target"]].to_numpy(dtype=float) if ds.get("target") else None
@@ -5376,8 +5417,7 @@ def run_external_pygam_cv(scenario, *, ds: dict | None = None, folds: list[Fold]
                 model = LogisticGAM(terms)
                 linear_part = f"+linear({smooth_count}:{x.shape[1] - 1})" if x.shape[1] > smooth_count else ""
                 model_spec = (
-                    f"LogisticGAM(s(0)+...+s({smooth_count - 1}){linear_part}, n_splines=12) "
-                    "[pygam basis fallback=ps]"
+                    f"LogisticGAM(s(0)+...+s({smooth_count - 1}){linear_part}, n_splines=12)"
                 )
             elif scenario["name"] in {"geo_disease_ps_per_pc"}:
                 terms = s(0, n_splines=10)
@@ -5403,9 +5443,7 @@ def run_external_pygam_cv(scenario, *, ds: dict | None = None, folds: list[Fold]
                     linear_hi = n_pcs - 1
                     linear_part = f"+linear(3:{linear_hi})" if linear_hi >= 3 else ""
                     model_spec = (
-                        f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, "
-                        f"n_splines={k}, requested_basis={geo_cfg['basis_code']}, "
-                        f"pygam_basis=ps)"
+                        f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, n_splines={k})"
                     )
             elif _papuan_oce_scenario_cfg(scenario["name"]) is not None:
                 papuan_cfg = _papuan_oce_scenario_cfg(scenario["name"])
@@ -5425,9 +5463,7 @@ def run_external_pygam_cv(scenario, *, ds: dict | None = None, folds: list[Fold]
                     linear_hi = n_pcs - 1
                     linear_part = f"+linear(3:{linear_hi})" if linear_hi >= 3 else ""
                     model_spec = (
-                        f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, "
-                        f"n_splines={k}, requested_basis={papuan_cfg['basis_code']}, "
-                        f"pygam_basis=ps) [papuan_oce]"
+                        f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, n_splines={k}) [papuan_oce]"
                     )
             elif _geo_subpop16_scenario_cfg(scenario["name"]) is not None:
                 sub_cfg = _geo_subpop16_scenario_cfg(scenario["name"])
@@ -5444,9 +5480,7 @@ def run_external_pygam_cv(scenario, *, ds: dict | None = None, folds: list[Fold]
                         terms = terms + l(j)
                     model = LogisticGAM(terms)
                     model_spec = (
-                        f"LogisticGAM(s(0)+s(1)+s(2)+linear(3:15), "
-                        f"n_splines={k}, requested_basis={sub_cfg['basis_code']}, "
-                        f"pygam_basis=ps) [subpop16]"
+                        f"LogisticGAM(s(0)+s(1)+s(2)+linear(3:15), n_splines={k}) [subpop16]"
                     )
             elif _geo_latlon_scenario_cfg(scenario["name"]) is not None:
                 latlon_cfg = _geo_latlon_scenario_cfg(scenario["name"])
@@ -5463,9 +5497,7 @@ def run_external_pygam_cv(scenario, *, ds: dict | None = None, folds: list[Fold]
                         terms = terms + l(j)
                     model = LogisticGAM(terms)
                     model_spec = (
-                        f"LogisticGAM(s(0)+s(1)+s(2)+linear(3:5), "
-                        f"n_splines={k}, requested_basis={latlon_cfg['basis_code']}, "
-                        f"pygam_basis=ps) [geo_latlon]"
+                        f"LogisticGAM(s(0)+s(1)+s(2)+linear(3:5), n_splines={k}) [geo_latlon]"
                     )
             elif scenario["name"] == "icu_survival_death":
                 model = LogisticGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))
