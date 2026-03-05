@@ -7,25 +7,15 @@ use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
-use rayon::{ThreadPool, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[cfg(test)]
 use approx::assert_abs_diff_eq;
-
-fn bspline_thread_pool() -> &'static ThreadPool {
-    static POOL: OnceLock<ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        ThreadPoolBuilder::new()
-            .build()
-            .expect("bspline thread pool initialization should succeed")
-    })
-}
 
 /// A comprehensive error type for all operations within the basis module.
 #[derive(Error, Debug)]
@@ -833,30 +823,28 @@ impl BasisStorage for DenseStorage {
         let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
 
         if let (true, Some(data_slice)) = (use_parallel, data.as_slice()) {
-            bspline_thread_pool().install(|| {
-                basis_matrix
-                    .axis_iter_mut(Axis(0))
-                    .into_par_iter()
-                    .zip(data_slice.par_iter().copied())
-                    .for_each_init(
-                        || (BasisEvalScratch::new(degree), vec![0.0; support]),
-                        |(scratch, values), (mut row, x)| {
-                            let row_slice = row
-                                .as_slice_mut()
-                                .expect("basis matrix rows should be contiguous");
-                            evaluate_bspline_row_entries(
-                                x,
-                                degree,
-                                knot_view,
-                                eval_kind,
-                                num_basis_functions,
-                                scratch,
-                                values,
-                                |col_j, v| row_slice[col_j] = v,
-                            );
-                        },
-                    );
-            });
+            basis_matrix
+                .axis_iter_mut(Axis(0))
+                .into_par_iter()
+                .zip(data_slice.par_iter().copied())
+                .for_each_init(
+                    || (BasisEvalScratch::new(degree), vec![0.0; support]),
+                    |(scratch, values), (mut row, x)| {
+                        let row_slice = row
+                            .as_slice_mut()
+                            .expect("basis matrix rows should be contiguous");
+                        evaluate_bspline_row_entries(
+                            x,
+                            degree,
+                            knot_view,
+                            eval_kind,
+                            num_basis_functions,
+                            scratch,
+                            values,
+                            |col_j, v| row_slice[col_j] = v,
+                        );
+                    },
+                );
         } else {
             let mut scratch = BasisEvalScratch::new(degree);
             let mut values = vec![0.0; support];
@@ -944,35 +932,32 @@ impl BasisStorage for SparseStorage {
         let triplets: Vec<Triplet<usize, usize, f64>> =
             if let (true, Some(data_slice)) = (use_parallel, data.as_slice()) {
                 const CHUNK_SIZE: usize = 1024;
-                let triplet_chunks: Vec<Vec<Triplet<usize, usize, f64>>> = bspline_thread_pool()
-                    .install(|| {
-                        data_slice
-                            .par_chunks(CHUNK_SIZE)
-                            .enumerate()
-                            .map_init(
-                                || (BasisEvalScratch::new(degree), vec![0.0; support]),
-                                |(scratch, values), (chunk_idx, chunk)| {
-                                    let base_row = chunk_idx * CHUNK_SIZE;
-                                    let mut local =
-                                        Vec::with_capacity(chunk.len().saturating_mul(support));
-                                    for (i, &x) in chunk.iter().enumerate() {
-                                        let row_i = base_row + i;
-                                        evaluate_bspline_row_entries(
-                                            x,
-                                            degree,
-                                            knot_view,
-                                            eval_kind,
-                                            num_basis_functions,
-                                            scratch,
-                                            values,
-                                            |col_j, v| local.push(Triplet::new(row_i, col_j, v)),
-                                        );
-                                    }
-                                    local
-                                },
-                            )
-                            .collect()
-                    });
+                let triplet_chunks: Vec<Vec<Triplet<usize, usize, f64>>> = data_slice
+                    .par_chunks(CHUNK_SIZE)
+                    .enumerate()
+                    .map_init(
+                        || (BasisEvalScratch::new(degree), vec![0.0; support]),
+                        |(scratch, values), (chunk_idx, chunk)| {
+                            let base_row = chunk_idx * CHUNK_SIZE;
+                            let mut local =
+                                Vec::with_capacity(chunk.len().saturating_mul(support));
+                            for (i, &x) in chunk.iter().enumerate() {
+                                let row_i = base_row + i;
+                                evaluate_bspline_row_entries(
+                                    x,
+                                    degree,
+                                    knot_view,
+                                    eval_kind,
+                                    num_basis_functions,
+                                    scratch,
+                                    values,
+                                    |col_j, v| local.push(Triplet::new(row_i, col_j, v)),
+                                );
+                            }
+                            local
+                        },
+                    )
+                    .collect();
 
                 let mut flattened = Vec::with_capacity(nrows.saturating_mul(support));
                 for mut chunk in triplet_chunks {
@@ -1177,45 +1162,43 @@ fn generate_basis_nd_dense(
     };
 
     if nrows >= par_threshold {
-        bspline_thread_pool().install(|| {
-            basis_matrix
-                .axis_iter_mut(Axis(0))
-                .into_par_iter()
-                .enumerate()
-                .for_each_init(
-                    || {
-                        (
-                            degrees
-                                .iter()
-                                .map(|&degree| BasisEvalScratch::new(degree))
-                                .collect::<Vec<_>>(),
-                            supports.iter().map(|&s| vec![0.0; s]).collect::<Vec<_>>(),
-                            vec![0usize; dims],
-                            vec![0usize; dims],
-                        )
-                    },
-                    |(scratch, values, starts, indices), (row_idx, mut row)| {
-                        let row_slice = row
-                            .as_slice_mut()
-                            .expect("basis matrix rows should be contiguous");
-                        fill_tensor_row(
-                            row_idx,
-                            data,
-                            knot_vectors,
-                            degrees,
-                            eval_kinds,
-                            &num_basis,
-                            &supports,
-                            &strides,
-                            scratch,
-                            values,
-                            starts,
-                            indices,
-                            |_, col, value| row_slice[col] = value,
-                        );
-                    },
-                );
-        });
+        basis_matrix
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each_init(
+                || {
+                    (
+                        degrees
+                            .iter()
+                            .map(|&degree| BasisEvalScratch::new(degree))
+                            .collect::<Vec<_>>(),
+                        supports.iter().map(|&s| vec![0.0; s]).collect::<Vec<_>>(),
+                        vec![0usize; dims],
+                        vec![0usize; dims],
+                    )
+                },
+                |(scratch, values, starts, indices), (row_idx, mut row)| {
+                    let row_slice = row
+                        .as_slice_mut()
+                        .expect("basis matrix rows should be contiguous");
+                    fill_tensor_row(
+                        row_idx,
+                        data,
+                        knot_vectors,
+                        degrees,
+                        eval_kinds,
+                        &num_basis,
+                        &supports,
+                        &strides,
+                        scratch,
+                        values,
+                        starts,
+                        indices,
+                        |_, col, value| row_slice[col] = value,
+                    );
+                },
+            );
     } else {
         let mut scratch: Vec<BasisEvalScratch> = degrees
             .iter()
@@ -1279,56 +1262,54 @@ fn generate_basis_nd_sparse(
         64
     };
     let triplets: Vec<Triplet<usize, usize, f64>> = if nrows >= par_threshold {
-        bspline_thread_pool().install(|| {
-            const CHUNK_SIZE: usize = 1024;
-            let row_starts: Vec<usize> = (0..nrows).step_by(CHUNK_SIZE).collect();
-            row_starts
-                .into_par_iter()
-                .map_init(
-                    || {
-                        (
-                            degrees
-                                .iter()
-                                .map(|&degree| BasisEvalScratch::new(degree))
-                                .collect::<Vec<_>>(),
-                            supports.iter().map(|&s| vec![0.0; s]).collect::<Vec<_>>(),
-                            vec![0usize; dims],
-                            vec![0usize; dims],
-                        )
-                    },
-                    |(scratch, values, starts, indices), chunk_start| {
-                        let row_end = (chunk_start + CHUNK_SIZE).min(nrows);
-                        let per_row_nnz = supports.iter().fold(1usize, |acc, &s| acc * s);
-                        let mut local = Vec::with_capacity(
-                            row_end
-                                .saturating_sub(chunk_start)
-                                .saturating_mul(per_row_nnz),
+        const CHUNK_SIZE: usize = 1024;
+        let row_starts: Vec<usize> = (0..nrows).step_by(CHUNK_SIZE).collect();
+        row_starts
+            .into_par_iter()
+            .map_init(
+                || {
+                    (
+                        degrees
+                            .iter()
+                            .map(|&degree| BasisEvalScratch::new(degree))
+                            .collect::<Vec<_>>(),
+                        supports.iter().map(|&s| vec![0.0; s]).collect::<Vec<_>>(),
+                        vec![0usize; dims],
+                        vec![0usize; dims],
+                    )
+                },
+                |(scratch, values, starts, indices), chunk_start| {
+                    let row_end = (chunk_start + CHUNK_SIZE).min(nrows);
+                    let per_row_nnz = supports.iter().fold(1usize, |acc, &s| acc * s);
+                    let mut local = Vec::with_capacity(
+                        row_end
+                            .saturating_sub(chunk_start)
+                            .saturating_mul(per_row_nnz),
+                    );
+                    for row_idx in chunk_start..row_end {
+                        fill_tensor_row(
+                            row_idx,
+                            data,
+                            knot_vectors,
+                            degrees,
+                            eval_kinds,
+                            &num_basis,
+                            &supports,
+                            &strides,
+                            scratch,
+                            values,
+                            starts,
+                            indices,
+                            |_, col, value| local.push(Triplet::new(row_idx, col, value)),
                         );
-                        for row_idx in chunk_start..row_end {
-                            fill_tensor_row(
-                                row_idx,
-                                data,
-                                knot_vectors,
-                                degrees,
-                                eval_kinds,
-                                &num_basis,
-                                &supports,
-                                &strides,
-                                scratch,
-                                values,
-                                starts,
-                                indices,
-                                |_, col, value| local.push(Triplet::new(row_idx, col, value)),
-                            );
-                        }
-                        local
-                    },
-                )
-                .reduce(Vec::new, |mut acc, mut chunk| {
-                    acc.append(&mut chunk);
-                    acc
-                })
-        })
+                    }
+                    local
+                },
+            )
+            .reduce(Vec::new, |mut acc, mut chunk| {
+                acc.append(&mut chunk);
+                acc
+            })
     } else {
         let mut scratch: Vec<BasisEvalScratch> = degrees
             .iter()
@@ -3363,7 +3344,8 @@ pub fn build_duchon_collocation_operator_matrices(
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-    let z = cached_kernel_constraint_nullspace(centers, nullspace_order)?;
+    let mut cache_ctx = BasisCacheContext::default();
+    let z = kernel_constraint_nullspace(centers, nullspace_order, &mut cache_ctx)?;
     let (d0_raw, d1_raw, d2_raw) =
         build_collocation_operators_from_radial(centers, centers, collocation_weights, |r| {
             duchon_kernel_radial_triplet(
@@ -4242,9 +4224,6 @@ struct SpatialDistanceCache {
 const SPATIAL_DISTANCE_CACHE_MAX_ENTRIES: usize = 12;
 const SPATIAL_DISTANCE_CACHE_MIN_PAIRS: usize = 2048;
 
-static SPATIAL_DISTANCE_CACHE: LazyLock<Mutex<SpatialDistanceCache>> =
-    LazyLock::new(|| Mutex::new(SpatialDistanceCache::default()));
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ConstraintNullspaceCacheKey {
     centers_rows: usize,
@@ -4261,8 +4240,11 @@ struct ConstraintNullspaceCache {
 
 const CONSTRAINT_NULLSPACE_CACHE_MAX_ENTRIES: usize = 32;
 
-static CONSTRAINT_NULLSPACE_CACHE: LazyLock<Mutex<ConstraintNullspaceCache>> =
-    LazyLock::new(|| Mutex::new(ConstraintNullspaceCache::default()));
+#[derive(Default)]
+struct BasisCacheContext {
+    spatial_distance: SpatialDistanceCache,
+    constraint_nullspace: ConstraintNullspaceCache,
+}
 
 fn hash_array_view2(values: ArrayView2<'_, f64>) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -4323,6 +4305,7 @@ fn compute_center_center_distances(centers: ArrayView2<'_, f64>) -> Array2<f64> 
 fn spatial_distance_matrices(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
+    cache: &mut BasisCacheContext,
 ) -> Result<(Arc<Array2<f64>>, Arc<Array2<f64>>), BasisError> {
     let n = data.nrows();
     let k = centers.nrows();
@@ -4343,34 +4326,30 @@ fn spatial_distance_matrices(
         centers_hash: hash_array_view2(centers),
     };
 
-    if let Ok(cache) = SPATIAL_DISTANCE_CACHE.lock()
-        && let Some(hit) = cache.map.get(&key)
-    {
+    if let Some(hit) = cache.spatial_distance.map.get(&key) {
         return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
     }
 
     let computed_dc = Arc::new(compute_data_center_distances(data, centers)?);
     let computed_cc = Arc::new(compute_center_center_distances(centers));
 
-    if let Ok(mut cache) = SPATIAL_DISTANCE_CACHE.lock() {
-        if let Some(hit) = cache.map.get(&key) {
-            return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
+    if let Some(hit) = cache.spatial_distance.map.get(&key) {
+        return Ok((hit.data_center_r.clone(), hit.center_center_r.clone()));
+    }
+    cache.spatial_distance.map.insert(
+        key,
+        SpatialDistanceCacheEntry {
+            data_center_r: computed_dc.clone(),
+            center_center_r: computed_cc.clone(),
+        },
+    );
+    cache.spatial_distance.order.push(key);
+    while cache.spatial_distance.map.len() > SPATIAL_DISTANCE_CACHE_MAX_ENTRIES {
+        if cache.spatial_distance.order.is_empty() {
+            break;
         }
-        cache.map.insert(
-            key,
-            SpatialDistanceCacheEntry {
-                data_center_r: computed_dc.clone(),
-                center_center_r: computed_cc.clone(),
-            },
-        );
-        cache.order.push(key);
-        while cache.map.len() > SPATIAL_DISTANCE_CACHE_MAX_ENTRIES {
-            if cache.order.is_empty() {
-                break;
-            }
-            let old_key = cache.order.remove(0);
-            cache.map.remove(&old_key);
-        }
+        let old_key = cache.spatial_distance.order.remove(0);
+        cache.spatial_distance.map.remove(&old_key);
     }
     Ok((computed_dc, computed_cc))
 }
@@ -4382,9 +4361,10 @@ fn constraint_nullspace_order_code(order: DuchonNullspaceOrder) -> u8 {
     }
 }
 
-fn cached_kernel_constraint_nullspace(
+fn kernel_constraint_nullspace(
     centers: ArrayView2<'_, f64>,
     order: DuchonNullspaceOrder,
+    cache: &mut BasisCacheContext,
 ) -> Result<Array2<f64>, BasisError> {
     let key = ConstraintNullspaceCacheKey {
         centers_rows: centers.nrows(),
@@ -4393,28 +4373,24 @@ fn cached_kernel_constraint_nullspace(
         order_code: constraint_nullspace_order_code(order),
     };
 
-    if let Ok(cache) = CONSTRAINT_NULLSPACE_CACHE.lock()
-        && let Some(hit) = cache.map.get(&key)
-    {
+    if let Some(hit) = cache.constraint_nullspace.map.get(&key) {
         return Ok((**hit).clone());
     }
 
     let p_k = polynomial_block_from_order(centers, order);
     let z = Arc::new(kernel_constraint_nullspace_from_matrix(p_k.view())?);
 
-    if let Ok(mut cache) = CONSTRAINT_NULLSPACE_CACHE.lock() {
-        if let Some(hit) = cache.map.get(&key) {
-            return Ok((**hit).clone());
+    if let Some(hit) = cache.constraint_nullspace.map.get(&key) {
+        return Ok((**hit).clone());
+    }
+    cache.constraint_nullspace.map.insert(key, z.clone());
+    cache.constraint_nullspace.order.push(key);
+    while cache.constraint_nullspace.map.len() > CONSTRAINT_NULLSPACE_CACHE_MAX_ENTRIES {
+        if cache.constraint_nullspace.order.is_empty() {
+            break;
         }
-        cache.map.insert(key, z.clone());
-        cache.order.push(key);
-        while cache.map.len() > CONSTRAINT_NULLSPACE_CACHE_MAX_ENTRIES {
-            if cache.order.is_empty() {
-                break;
-            }
-            let old_key = cache.order.remove(0);
-            cache.map.remove(&old_key);
-        }
+        let old_key = cache.constraint_nullspace.order.remove(0);
+        cache.constraint_nullspace.map.remove(&old_key);
     }
 
     Ok((*z).clone())
@@ -4557,7 +4533,8 @@ pub fn create_matern_spline_basis(
     let poly_cols = if include_intercept { 1 } else { 0 };
     let total_cols = k + poly_cols;
 
-    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers)?;
+    let mut cache_ctx = BasisCacheContext::default();
+    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers, &mut cache_ctx)?;
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
@@ -5082,7 +5059,8 @@ fn build_matern_design_psi_derivatives(
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let n = data.nrows();
     let k = centers.nrows();
-    let (data_center_r, _) = spatial_distance_matrices(data, centers)?;
+    let mut cache_ctx = BasisCacheContext::default();
+    let (data_center_r, _) = spatial_distance_matrices(data, centers, &mut cache_ctx)?;
     let mut kernel_psi = Array2::<f64>::zeros((n, k));
     let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
     for i in 0..n {
@@ -5254,7 +5232,8 @@ pub fn create_duchon_spline_basis(
     // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
     // Reparameterizing alpha = Z gamma enforces conditional-PD constraints once
     // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.
-    let z = cached_kernel_constraint_nullspace(centers, nullspace_order)?;
+    let mut cache_ctx = BasisCacheContext::default();
+    let z = kernel_constraint_nullspace(centers, nullspace_order, &mut cache_ctx)?;
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
@@ -5302,7 +5281,7 @@ pub fn create_duchon_spline_basis(
         }
     }
 
-    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers)?;
+    let (data_center_r, center_center_r) = spatial_distance_matrices(data, centers, &mut cache_ctx)?;
 
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
@@ -5682,7 +5661,8 @@ pub fn create_thin_plate_spline_basis(
 
     // Enforce TPS side-constraint P(knots)^T α = 0 by projecting onto
     // the nullspace of P(knots)^T.
-    let z = cached_kernel_constraint_nullspace(knots, DuchonNullspaceOrder::Linear)?;
+    let mut cache_ctx = BasisCacheContext::default();
+    let z = kernel_constraint_nullspace(knots, DuchonNullspaceOrder::Linear, &mut cache_ctx)?;
     let kernel_constrained = fast_ab(&kernel_block, &z);
     let omega_constrained = {
         let zt_o = fast_atb(&z, &omega);

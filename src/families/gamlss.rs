@@ -977,7 +977,7 @@ pub fn fit_gaussian_location_scale(
         spec.mu_block.into_spec("mu")?,
         spec.log_sigma_block.into_spec("log_sigma")?,
     ];
-    fit_custom_family(&family, &blocks, options)
+    Ok(fit_custom_family(&family, &blocks, options)?)
 }
 
 pub fn fit_binomial_logit(
@@ -995,7 +995,7 @@ pub fn fit_binomial_logit(
         weights: spec.weights,
     };
     let blocks = vec![spec.eta_block.into_spec("eta")?];
-    fit_custom_family(&family, &blocks, options)
+    Ok(fit_custom_family(&family, &blocks, options)?)
 }
 
 pub fn fit_poisson_log(
@@ -1012,7 +1012,7 @@ pub fn fit_poisson_log(
         weights: spec.weights,
     };
     let blocks = vec![spec.eta_block.into_spec("eta")?];
-    fit_custom_family(&family, &blocks, options)
+    Ok(fit_custom_family(&family, &blocks, options)?)
 }
 
 pub fn fit_gamma_log(
@@ -1036,7 +1036,7 @@ pub fn fit_gamma_log(
         shape: spec.shape,
     };
     let blocks = vec![spec.eta_block.into_spec("eta")?];
-    fit_custom_family(&family, &blocks, options)
+    Ok(fit_custom_family(&family, &blocks, options)?)
 }
 
 pub fn fit_binomial_location_scale_probit(
@@ -3107,13 +3107,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let pls = x_ls.ncols();
         let beta_layout = GamlssBetaLayout::two_block(pt, pls);
         let total = beta_layout.total();
-        if d_beta_flat.len() != total {
-            return Err(format!(
-                "Gaussian joint d_beta length mismatch: got {}, expected {}",
-                d_beta_flat.len(),
-                total
-            ));
-        }
         let (u_t, u_ls) = beta_layout.split_two(d_beta_flat, "Gaussian joint d_beta")?;
         let d_eta_t = x_t.dot(&u_t);
         let d_eta_ls = x_ls.dot(&u_ls);
@@ -3182,15 +3175,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let pls = x_ls.ncols();
         let beta_layout = GamlssBetaLayout::two_block(pt, pls);
         let total = beta_layout.total();
-        if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
-            return Err(format!(
-                "Gaussian joint second-direction length mismatch: got ({}, {}), expected ({}, {})",
-                d_beta_u_flat.len(),
-                d_beta_v_flat.len(),
-                total,
-                total
-            ));
-        }
         let (u_t, u_ls) = beta_layout.split_two(d_beta_u_flat, "Gaussian joint d_beta_u")?;
         let (v_t, v_ls) = beta_layout.split_two(d_beta_v_flat, "Gaussian joint d_beta_v")?;
         let d_eta_t_u = x_t.dot(&u_t);
@@ -3994,13 +3978,6 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let pls = x_ls.ncols();
         let beta_layout = GamlssBetaLayout::two_block(pt, pls);
         let total = beta_layout.total();
-        if d_beta_flat.len() != total {
-            return Err(format!(
-                "joint d_beta length mismatch: got {}, expected {}",
-                d_beta_flat.len(),
-                total
-            ));
-        }
         let (u_t, u_ls) = beta_layout.split_two(d_beta_flat, "binomial joint d_beta")?;
         let d_eta_t = x_t.dot(&u_t);
         let d_eta_ls = x_ls.dot(&u_ls);
@@ -4173,14 +4150,6 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let pls = x_ls.ncols();
         let beta_layout = GamlssBetaLayout::two_block(pt, pls);
         let total = beta_layout.total();
-        if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
-            return Err(format!(
-                "joint second-direction lengths mismatch: got u={} v={}, expected {}",
-                d_beta_u_flat.len(),
-                d_beta_v_flat.len(),
-                total
-            ));
-        }
         let (u_t, u_ls) = beta_layout.split_two(d_beta_u_flat, "binomial joint d_beta_u")?;
         let (v_t, v_ls) = beta_layout.split_two(d_beta_v_flat, "binomial joint d_beta_v")?;
         let d_eta_t_u = x_t.dot(&u_t);
@@ -5102,13 +5071,6 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let pw = b0.ncols();
         let beta_layout = GamlssBetaLayout::with_wiggle(pt, pls, pw);
         let total = beta_layout.total();
-        if d_beta_flat.len() != total {
-            return Err(format!(
-                "joint d_beta length mismatch: got {}, expected {}",
-                d_beta_flat.len(),
-                total
-            ));
-        }
         let (u_t, u_ls, u_w) = beta_layout.split_three(d_beta_flat, "wiggle joint d_beta")?;
         let d_eta_t = x_t.dot(&u_t);
         let d_eta_ls = x_ls.dot(&u_ls);
@@ -5331,14 +5293,6 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let pw = b0.ncols();
         let beta_layout = GamlssBetaLayout::with_wiggle(pt, pls, pw);
         let total = beta_layout.total();
-        if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
-            return Err(format!(
-                "joint second-direction lengths mismatch: got u={} v={}, expected {}",
-                d_beta_u_flat.len(),
-                d_beta_v_flat.len(),
-                total
-            ));
-        }
         if d0.ncols() != beta_w0.len()
             || dd0.ncols() != beta_w0.len()
             || d3_basis.ncols() != beta_w0.len()

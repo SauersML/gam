@@ -811,7 +811,6 @@ impl<'a> JointModelState<'a> {
         use crate::faer_ndarray::{fast_ata, fast_atv};
         use faer::Side;
 
-        let n = x.nrows();
         let p = x.ncols();
 
         if p == 0 {
@@ -821,13 +820,11 @@ impl<'a> JointModelState<'a> {
         // Compute X'WX via weighted design
         let mut x_weighted = x.clone();
         let mut z_weighted = z.clone();
-        for i in 0..n {
-            let wi = w[i].max(0.0).sqrt();
-            for j in 0..p {
-                x_weighted[[i, j]] *= wi;
-            }
-            z_weighted[i] *= wi;
-        }
+        let sqrt_w = w.mapv(|wi| wi.max(0.0).sqrt());
+        ndarray::Zip::from(x_weighted.rows_mut())
+            .and(sqrt_w.view())
+            .for_each(|mut row, wi| row *= *wi);
+        z_weighted *= &sqrt_w;
         let mut xwx = fast_ata(&x_weighted);
 
         // Add penalty: X'WX + λS (only if penalty matches dimensions)
@@ -963,12 +960,10 @@ impl<'a> JointModelState<'a> {
         let j_mat = self.build_joint_jacobian(b_wiggle, g_prime);
         let penalty = self.build_joint_penalty(lambda_base, lambda_link, b_wiggle.ncols());
         let mut j_weighted = j_mat;
-        for i in 0..j_weighted.nrows() {
-            let sqrt_w = weights[i].max(0.0).sqrt();
-            for j in 0..j_weighted.ncols() {
-                j_weighted[[i, j]] *= sqrt_w;
-            }
-        }
+        let sqrt_w = weights.mapv(|wi| wi.max(0.0).sqrt());
+        ndarray::Zip::from(j_weighted.rows_mut())
+            .and(sqrt_w.view())
+            .for_each(|mut row, wi| row *= *wi);
         let firth = Self::compute_joint_firth_adjustment(&j_weighted, &penalty)?;
         self.ridge_used = self.ridge_used.max(firth.ridge_used);
         let _ = firth.half_log_det;
@@ -1648,12 +1643,10 @@ impl<'a> JointRemlState<'a> {
         let penalty_full = state.build_joint_penalty(lambda_base, lambda_link, p_link);
         let link_penalty = state.build_link_penalty();
         let mut j_weighted = j_mat.clone();
-        for i in 0..n {
-            let scale = weights[i].max(0.0).sqrt();
-            for j in 0..p_total {
-                j_weighted[[i, j]] *= scale;
-            }
-        }
+        let sqrt_w = weights.mapv(|wi| wi.max(0.0).sqrt());
+        ndarray::Zip::from(j_weighted.rows_mut())
+            .and(sqrt_w.view())
+            .for_each(|mut row, wi| row *= *wi);
         let mut h_full = crate::faer_ndarray::fast_ata(&j_weighted);
         if penalty_full.nrows() == p_total && penalty_full.ncols() == p_total {
             h_full += &penalty_full;
@@ -1848,12 +1841,10 @@ impl<'a> JointRemlState<'a> {
             w_eff[i] = weights[i] * g_prime[i] * g_prime[i];
         }
         let mut x_weighted = state.x_base.to_owned();
-        for i in 0..n {
-            let scale = w_eff[i].sqrt();
-            for j in 0..p_base {
-                x_weighted[[i, j]] *= scale;
-            }
-        }
+        let sqrt_w_eff = w_eff.mapv(f64::sqrt);
+        ndarray::Zip::from(x_weighted.rows_mut())
+            .and(sqrt_w_eff.view())
+            .for_each(|mut row, wi| row *= *wi);
         let mut a_mat = crate::faer_ndarray::fast_ata(&x_weighted);
         for (idx, s_k) in state.s_base.iter().enumerate() {
             let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
@@ -1863,21 +1854,17 @@ impl<'a> JointRemlState<'a> {
         }
 
         let mut wb = b_wiggle.clone();
-        for i in 0..n {
-            let scale = weights[i] * g_prime[i];
-            for j in 0..p_link {
-                wb[[i, j]] *= scale;
-            }
-        }
+        let wg = weights * g_prime;
+        ndarray::Zip::from(wb.rows_mut())
+            .and(wg.view())
+            .for_each(|mut row, wi| row *= *wi);
         let c_mat = crate::faer_ndarray::fast_atb(&state.x_base, &wb);
 
         let mut b_weighted = b_wiggle.clone();
-        for i in 0..n {
-            let scale = weights[i].sqrt();
-            for j in 0..p_link {
-                b_weighted[[i, j]] *= scale;
-            }
-        }
+        let sqrt_w = weights.mapv(f64::sqrt);
+        ndarray::Zip::from(b_weighted.rows_mut())
+            .and(sqrt_w.view())
+            .for_each(|mut row, wi| row *= *wi);
         let mut d_mat = crate::faer_ndarray::fast_ata(&b_weighted);
         let link_penalty = state.build_link_penalty();
         if link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
@@ -1909,19 +1896,15 @@ impl<'a> JointRemlState<'a> {
         for (idx, s_k) in state.s_base.iter().enumerate() {
             let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
             if lambda_k > 0.0 && s_k.nrows() == p_base && s_k.ncols() == p_base {
-                for i in 0..p_base {
-                    for j in 0..p_base {
-                        s_lambda[[i, j]] += lambda_k * s_k[[i, j]];
-                    }
-                }
+                s_lambda
+                    .slice_mut(s![..p_base, ..p_base])
+                    .scaled_add(lambda_k, s_k);
             }
         }
         if link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
-            for i in 0..p_link {
-                for j in 0..p_link {
-                    s_lambda[[p_base + i, p_base + j]] += lambda_link * link_penalty[[i, j]];
-                }
-            }
+            s_lambda
+                .slice_mut(s![p_base.., p_base..])
+                .scaled_add(lambda_link, &link_penalty);
         }
 
         let chol = h_mat.cholesky(Side::Lower).ok()?;
@@ -2142,12 +2125,10 @@ impl<'a> JointRemlState<'a> {
         let link_penalty = state.build_link_penalty();
         let penalty_full = state.build_joint_penalty(&lambda_base, lambda_link, p_link);
         let mut j_weighted = j_mat.clone();
-        for i in 0..n {
-            let scale = weights[i].max(0.0).sqrt();
-            for j in 0..p_total {
-                j_weighted[[i, j]] *= scale;
-            }
-        }
+        let sqrt_w = weights.mapv(|wi| wi.max(0.0).sqrt());
+        ndarray::Zip::from(j_weighted.rows_mut())
+            .and(sqrt_w.view())
+            .for_each(|mut row, wi| row *= *wi);
         let mut h_mat = crate::faer_ndarray::fast_ata(&j_weighted);
         if penalty_full.nrows() == p_total && penalty_full.ncols() == p_total {
             h_mat += &penalty_full;
@@ -2209,12 +2190,9 @@ impl<'a> JointRemlState<'a> {
         }
 
         let mut k_w = k_mat.clone();
-        for i in 0..n {
-            let w = weights[i];
-            for j in 0..p_total {
-                k_w[[j, i]] *= w;
-            }
-        }
+        ndarray::Zip::from(k_w.columns_mut())
+            .and(weights.view())
+            .for_each(|mut col, w| col *= *w);
         let mut diag_proj = Array1::<f64>::zeros(n);
         for i in 0..n {
             let mut acc = 0.0;
@@ -2296,12 +2274,10 @@ impl<'a> JointRemlState<'a> {
         let mut q_firth = Array2::<f64>::zeros((p_total, p_total));
         if firth_active {
             let mut j_weighted = j_mat.clone();
-            for i in 0..n {
-                let nu = 0.5 - mu[i];
-                for j in 0..p_total {
-                    j_weighted[[i, j]] *= nu;
-                }
-            }
+            let nu = mu.mapv(|mui| 0.5 - mui);
+            ndarray::Zip::from(j_weighted.rows_mut())
+                .and(nu.view())
+                .for_each(|mut row, nui| row *= *nui);
             // V = J^T diag(0.5 - mu) J (implemented as J^T * (diag(nu) J)).
             let v_mat = crate::faer_ndarray::fast_atb(&j_mat, &j_weighted);
 
@@ -2323,11 +2299,9 @@ impl<'a> JointRemlState<'a> {
                 }
             }
             let mut m_mat = w_mat;
-            for k in 0..p_total {
-                for l in 0..p_total {
-                    m_mat[[k, l]] *= inv_diag[k] * inv_diag[l];
-                }
-            }
+            let inv_col = inv_diag.view().insert_axis(ndarray::Axis(1));
+            let inv_row = inv_diag.view().insert_axis(ndarray::Axis(0));
+            m_mat *= &(inv_col.to_owned() * inv_row);
             let um = fast_ab(&h_vecs, &m_mat); // U M
             q_firth = fast_ab(&um, &h_vecs.t().to_owned()); // U M U^T
         }

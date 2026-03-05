@@ -307,7 +307,10 @@ impl QuadratureContext {
     }
 
     fn clenshaw_curtis_n(&self, n: usize) -> ClenshawCurtisRule {
-        let mut cache = self.cc_cache.lock().expect("cc cache mutex poisoned");
+        let mut cache = match self.cc_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         cache
             .entry(n)
             .or_insert_with(|| compute_clenshaw_curtis_n(n))
@@ -522,7 +525,7 @@ fn compute_gauss_hermite() -> GaussHermiteRule {
 
     // Sort nodes (and corresponding weights) in ascending order
     let mut indices: [usize; N_POINTS] = [0, 1, 2, 3, 4, 5, 6];
-    indices.sort_by(|&a, &b| nodes[a].partial_cmp(&nodes[b]).unwrap());
+    indices.sort_by(|&a, &b| nodes[a].total_cmp(&nodes[b]));
 
     let sorted_nodes: [f64; N_POINTS] = std::array::from_fn(|i| nodes[indices[i]]);
     let sorted_weights: [f64; N_POINTS] = std::array::from_fn(|i| weights[indices[i]]);
@@ -791,9 +794,14 @@ pub fn logit_posterior_mean_with_deriv(
         return (mu, dmu);
     }
 
-    let jet = integrated_inverse_link_jet(ctx, LinkFunction::Logit, eta, se_eta)
-        .expect("logit integrated inverse-link jet should evaluate");
-    (jet.mean, jet.d1)
+    match integrated_inverse_link_jet(ctx, LinkFunction::Logit, eta, se_eta) {
+        Ok(jet) => (jet.mean, jet.d1),
+        Err(_) => {
+            // Panic-free fallback for library callers: degrade to plug-in moments.
+            let mu = sigmoid(eta);
+            (mu, mu * (1.0 - mu))
+        }
+    }
 }
 
 #[inline]
@@ -2260,18 +2268,7 @@ fn integrate_normal_ghq_adaptive<F>(ctx: &QuadratureContext, eta: f64, se_eta: f
 where
     F: Fn(f64) -> f64,
 {
-    if se_eta < 1e-10 {
-        return f(eta);
-    }
-    let n = adaptive_point_count_from_sd(se_eta.abs());
-    with_gh_nodes_weights(ctx, n, |nodes, weights| {
-        let scale = SQRT_2 * se_eta;
-        let mut sum = 0.0;
-        for i in 0..n {
-            sum += weights[i] * f(eta + scale * nodes[i]);
-        }
-        sum / std::f64::consts::PI.sqrt()
-    })
+    integrate_normal_ghq_adaptive_value(ctx, eta, se_eta, f)
 }
 
 #[inline]
@@ -2284,26 +2281,97 @@ fn integrate_normal_ghq_adaptive_jet4<F>(
 where
     F: Fn(f64) -> (f64, f64, f64, f64),
 {
+    integrate_normal_ghq_adaptive_value(ctx, eta, se_eta, f)
+}
+
+trait GhqValue: Sized {
+    fn zero() -> Self;
+    fn add_weighted(&mut self, weight: f64, value: Self);
+    fn scale(self, factor: f64) -> Self;
+}
+
+impl GhqValue for f64 {
+    #[inline]
+    fn zero() -> Self {
+        0.0
+    }
+
+    #[inline]
+    fn add_weighted(&mut self, weight: f64, value: Self) {
+        *self += weight * value;
+    }
+
+    #[inline]
+    fn scale(self, factor: f64) -> Self {
+        self * factor
+    }
+}
+
+impl GhqValue for (f64, f64) {
+    #[inline]
+    fn zero() -> Self {
+        (0.0, 0.0)
+    }
+
+    #[inline]
+    fn add_weighted(&mut self, weight: f64, value: Self) {
+        self.0 += weight * value.0;
+        self.1 += weight * value.1;
+    }
+
+    #[inline]
+    fn scale(self, factor: f64) -> Self {
+        (self.0 * factor, self.1 * factor)
+    }
+}
+
+impl GhqValue for (f64, f64, f64, f64) {
+    #[inline]
+    fn zero() -> Self {
+        (0.0, 0.0, 0.0, 0.0)
+    }
+
+    #[inline]
+    fn add_weighted(&mut self, weight: f64, value: Self) {
+        self.0 += weight * value.0;
+        self.1 += weight * value.1;
+        self.2 += weight * value.2;
+        self.3 += weight * value.3;
+    }
+
+    #[inline]
+    fn scale(self, factor: f64) -> Self {
+        (
+            self.0 * factor,
+            self.1 * factor,
+            self.2 * factor,
+            self.3 * factor,
+        )
+    }
+}
+
+#[inline]
+fn integrate_normal_ghq_adaptive_value<F, R>(
+    ctx: &QuadratureContext,
+    eta: f64,
+    se_eta: f64,
+    f: F,
+) -> R
+where
+    F: Fn(f64) -> R,
+    R: GhqValue,
+{
     if se_eta < 1e-10 {
         return f(eta);
     }
     let n = adaptive_point_count_from_sd(se_eta.abs());
     with_gh_nodes_weights(ctx, n, |nodes, weights| {
         let scale = SQRT_2 * se_eta;
-        let norm = 1.0 / std::f64::consts::PI.sqrt();
-        let mut s0 = 0.0;
-        let mut s1 = 0.0;
-        let mut s2 = 0.0;
-        let mut s3 = 0.0;
+        let mut sum = R::zero();
         for i in 0..n {
-            let (v0, v1, v2, v3) = f(eta + scale * nodes[i]);
-            let w = weights[i];
-            s0 += w * v0;
-            s1 += w * v1;
-            s2 += w * v2;
-            s3 += w * v3;
+            sum.add_weighted(weights[i], f(eta + scale * nodes[i]));
         }
-        (s0 * norm, s1 * norm, s2 * norm, s3 * norm)
+        sum.scale(1.0 / std::f64::consts::PI.sqrt())
     })
 }
 
@@ -2416,23 +2484,7 @@ pub fn normal_expectation_1d_adaptive_pair<F>(
 where
     F: Fn(f64) -> (f64, f64),
 {
-    if se_eta < 1e-10 {
-        return f(eta);
-    }
-    let n = adaptive_point_count_from_sd(se_eta.abs());
-    with_gh_nodes_weights(ctx, n, |nodes, weights| {
-        let scale = SQRT_2 * se_eta;
-        let norm = 1.0 / std::f64::consts::PI.sqrt();
-        let mut s0 = 0.0;
-        let mut s1 = 0.0;
-        for i in 0..n {
-            let (v0, v1) = f(eta + scale * nodes[i]);
-            let w = weights[i];
-            s0 += w * v0;
-            s1 += w * v1;
-        }
-        (s0 * norm, s1 * norm)
-    })
+    integrate_normal_ghq_adaptive_value(ctx, eta, se_eta, f)
 }
 
 fn adaptive_point_count_from_sd(max_sd: f64) -> usize {
@@ -2511,6 +2563,151 @@ fn cholesky_with_jitter(cov: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     None
 }
 
+#[inline]
+fn array_cov_to_vec<const D: usize>(cov: &[[f64; D]; D]) -> Vec<Vec<f64>> {
+    let mut out = vec![vec![0.0; D]; D];
+    for i in 0..D {
+        for j in 0..D {
+            out[i][j] = cov[i][j];
+        }
+    }
+    out
+}
+
+#[inline]
+fn adaptive_point_count_with_cap(max_sd: f64, max_n: usize) -> usize {
+    adaptive_point_count_from_sd(max_sd).min(max_n)
+}
+
+#[inline]
+fn ghq_nd_integrate<const D: usize, F, R>(
+    ctx: &QuadratureContext,
+    mu: [f64; D],
+    cov: [[f64; D]; D],
+    max_n: usize,
+    f: F,
+) -> Option<R>
+where
+    F: Fn([f64; D]) -> R,
+    R: GhqValue,
+{
+    let mut max_var = 0.0_f64;
+    for (i, row) in cov.iter().enumerate() {
+        max_var = max_var.max(row[i]).max(0.0);
+    }
+    let n = adaptive_point_count_with_cap(max_var.sqrt(), max_n);
+
+    let mut cov_vec = array_cov_to_vec(&cov);
+    for (i, row) in cov_vec.iter_mut().enumerate() {
+        row[i] = row[i].max(0.0);
+    }
+    let l = cholesky_with_jitter(&cov_vec)?;
+    let norm = 1.0 / std::f64::consts::PI.powf(0.5 * D as f64);
+
+    Some(with_gh_nodes_weights(ctx, n, |nodes, weights| {
+        let mut acc = R::zero();
+        let mut idx = [0usize; D];
+        loop {
+            let mut z = [0.0_f64; D];
+            let mut weight = 1.0_f64;
+            for d in 0..D {
+                z[d] = SQRT_2 * nodes[idx[d]];
+                weight *= weights[idx[d]];
+            }
+
+            let mut x = mu;
+            for row in 0..D {
+                let mut dot = 0.0_f64;
+                for (col, zc) in z.iter().enumerate().take(row + 1) {
+                    dot += l[row][col] * *zc;
+                }
+                x[row] += dot;
+            }
+            acc.add_weighted(weight, f(x));
+
+            let mut carry = true;
+            for d in (0..D).rev() {
+                idx[d] += 1;
+                if idx[d] < n {
+                    carry = false;
+                    break;
+                }
+                idx[d] = 0;
+            }
+            if carry {
+                break;
+            }
+        }
+        acc.scale(norm)
+    }))
+}
+
+#[inline]
+fn ghq_nd_integrate_result<const D: usize, F, R, E>(
+    ctx: &QuadratureContext,
+    mu: [f64; D],
+    cov: [[f64; D]; D],
+    max_n: usize,
+    f: F,
+) -> Result<Option<R>, E>
+where
+    F: Fn([f64; D]) -> Result<R, E>,
+    R: GhqValue,
+{
+    let mut max_var = 0.0_f64;
+    for (i, row) in cov.iter().enumerate() {
+        max_var = max_var.max(row[i]).max(0.0);
+    }
+    let n = adaptive_point_count_with_cap(max_var.sqrt(), max_n);
+
+    let mut cov_vec = array_cov_to_vec(&cov);
+    for (i, row) in cov_vec.iter_mut().enumerate() {
+        row[i] = row[i].max(0.0);
+    }
+    let l = match cholesky_with_jitter(&cov_vec) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let norm = 1.0 / std::f64::consts::PI.powf(0.5 * D as f64);
+
+    with_gh_nodes_weights(ctx, n, |nodes, weights| {
+        let mut acc = R::zero();
+        let mut idx = [0usize; D];
+        loop {
+            let mut z = [0.0_f64; D];
+            let mut weight = 1.0_f64;
+            for d in 0..D {
+                z[d] = SQRT_2 * nodes[idx[d]];
+                weight *= weights[idx[d]];
+            }
+
+            let mut x = mu;
+            for row in 0..D {
+                let mut dot = 0.0_f64;
+                for (col, zc) in z.iter().enumerate().take(row + 1) {
+                    dot += l[row][col] * *zc;
+                }
+                x[row] += dot;
+            }
+            acc.add_weighted(weight, f(x)?);
+
+            let mut carry = true;
+            for d in (0..D).rev() {
+                idx[d] += 1;
+                if idx[d] < n {
+                    carry = false;
+                    break;
+                }
+                idx[d] = 0;
+            }
+            if carry {
+                break;
+            }
+        }
+        Ok(Some(acc.scale(norm)))
+    })
+}
+
 /// Adaptive 2D GHQ expectation for correlated Gaussian latents.
 pub fn normal_expectation_2d_adaptive<F>(
     ctx: &QuadratureContext,
@@ -2521,30 +2718,8 @@ pub fn normal_expectation_2d_adaptive<F>(
 where
     F: Fn(f64, f64) -> f64,
 {
-    let max_sd = cov[0][0].max(cov[1][1]).max(0.0).sqrt();
-    let n = adaptive_point_count_from_sd(max_sd).min(21);
-    let cov_vec = vec![
-        vec![cov[0][0].max(0.0), cov[0][1]],
-        vec![cov[1][0], cov[1][1].max(0.0)],
-    ];
-    let l = match cholesky_with_jitter(&cov_vec) {
-        Some(v) => v,
-        None => return f(mu[0], mu[1]),
-    };
-    let norm = 1.0 / std::f64::consts::PI;
-    with_gh_nodes_weights(ctx, n, |nodes, weights| {
-        let mut acc = 0.0;
-        for i in 0..n {
-            for j in 0..n {
-                let z1 = SQRT_2 * nodes[i];
-                let z2 = SQRT_2 * nodes[j];
-                let x0 = mu[0] + l[0][0] * z1;
-                let x1 = mu[1] + l[1][0] * z1 + l[1][1] * z2;
-                acc += weights[i] * weights[j] * f(x0, x1);
-            }
-        }
-        acc * norm
-    })
+    ghq_nd_integrate::<2, _, f64>(ctx, mu, cov, 21, |x| f(x[0], x[1]))
+        .unwrap_or_else(|| f(mu[0], mu[1]))
 }
 
 /// Adaptive 2D GHQ expectation for correlated Gaussian latents with a fallible integrand.
@@ -2557,30 +2732,10 @@ pub fn normal_expectation_2d_adaptive_result<F, E>(
 where
     F: Fn(f64, f64) -> Result<f64, E>,
 {
-    let max_sd = cov[0][0].max(cov[1][1]).max(0.0).sqrt();
-    let n = adaptive_point_count_from_sd(max_sd).min(21);
-    let cov_vec = vec![
-        vec![cov[0][0].max(0.0), cov[0][1]],
-        vec![cov[1][0], cov[1][1].max(0.0)],
-    ];
-    let l = match cholesky_with_jitter(&cov_vec) {
-        Some(v) => v,
-        None => return f(mu[0], mu[1]),
-    };
-    let norm = 1.0 / std::f64::consts::PI;
-    with_gh_nodes_weights(ctx, n, |nodes, weights| {
-        let mut acc = 0.0;
-        for i in 0..n {
-            for j in 0..n {
-                let z1 = SQRT_2 * nodes[i];
-                let z2 = SQRT_2 * nodes[j];
-                let x0 = mu[0] + l[0][0] * z1;
-                let x1 = mu[1] + l[1][0] * z1 + l[1][1] * z2;
-                acc += weights[i] * weights[j] * f(x0, x1)?;
-            }
-        }
-        Ok(acc * norm)
-    })
+    match ghq_nd_integrate_result::<2, _, f64, E>(ctx, mu, cov, 21, |x| f(x[0], x[1]))? {
+        Some(v) => Ok(v),
+        None => f(mu[0], mu[1]),
+    }
 }
 
 /// Adaptive 3D GHQ expectation for correlated Gaussian latents.
@@ -2593,36 +2748,9 @@ pub fn normal_expectation_3d_adaptive<F>(
 where
     F: Fn(f64, f64, f64) -> f64,
 {
-    let max_sd = cov[0][0].max(cov[1][1]).max(cov[2][2]).max(0.0).sqrt();
     // 3D tensor GHQ grows cubically; cap nodes per axis for throughput.
-    let n = adaptive_point_count_from_sd(max_sd).min(15);
-    let cov_vec = vec![
-        vec![cov[0][0].max(0.0), cov[0][1], cov[0][2]],
-        vec![cov[1][0], cov[1][1].max(0.0), cov[1][2]],
-        vec![cov[2][0], cov[2][1], cov[2][2].max(0.0)],
-    ];
-    let l = match cholesky_with_jitter(&cov_vec) {
-        Some(v) => v,
-        None => return f(mu[0], mu[1], mu[2]),
-    };
-    let norm = 1.0 / std::f64::consts::PI.powf(1.5);
-    with_gh_nodes_weights(ctx, n, |nodes, weights| {
-        let mut acc = 0.0;
-        for i in 0..n {
-            for j in 0..n {
-                for k in 0..n {
-                    let z0 = SQRT_2 * nodes[i];
-                    let z1 = SQRT_2 * nodes[j];
-                    let z2 = SQRT_2 * nodes[k];
-                    let x0 = mu[0] + l[0][0] * z0;
-                    let x1 = mu[1] + l[1][0] * z0 + l[1][1] * z1;
-                    let x2 = mu[2] + l[2][0] * z0 + l[2][1] * z1 + l[2][2] * z2;
-                    acc += weights[i] * weights[j] * weights[k] * f(x0, x1, x2);
-                }
-            }
-        }
-        acc * norm
-    })
+    ghq_nd_integrate::<3, _, f64>(ctx, mu, cov, 15, |x| f(x[0], x[1], x[2]))
+        .unwrap_or_else(|| f(mu[0], mu[1], mu[2]))
 }
 
 /// Closed-form posterior mean under probit link when eta is Gaussian:

@@ -2954,12 +2954,14 @@ fn evaluate_standard_family_observations(
     y: &Array1<f64>,
     weights: &Array1<f64>,
     eta: &Array1<f64>,
-) -> Result<StandardFamilyObservationState, String> {
+) -> Result<StandardFamilyObservationState, EstimationError> {
     const PROB_EPS: f64 = 1e-10;
     const MU_DERIV_EPS: f64 = 1e-12;
     let n = y.len();
     if weights.len() != n || eta.len() != n {
-        return Err("bounded family observation size mismatch".to_string());
+        return Err(EstimationError::InvalidInput(
+            "bounded family observation size mismatch".to_string(),
+        ));
     }
 
     let mut mu = Array1::<f64>::zeros(n);
@@ -2990,8 +2992,7 @@ fn evaluate_standard_family_observations(
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture => {
                 let jet =
-                    inverse_link_jet_for_family(family, eta_i, mixture_link_state, sas_link_state)
-                        .map_err(|e| e.to_string())?;
+                    inverse_link_jet_for_family(family, eta_i, mixture_link_state, sas_link_state)?;
                 let mu_i_raw = jet.mu;
                 let dmu_deta_raw = jet.d1;
                 let mu_i = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);
@@ -3014,9 +3015,9 @@ fn evaluate_standard_family_observations(
                 log_likelihood += w * (yi * mu_i.ln() + (1.0 - yi) * (1.0 - mu_i).ln());
             }
             LikelihoodFamily::RoystonParmar => {
-                return Err(
+                return Err(EstimationError::InvalidInput(
                     "bounded linear terms are not supported for survival model fits".to_string(),
-                );
+                ));
             }
         }
     }
@@ -3115,7 +3116,8 @@ impl BoundedLinearFamily {
             &self.y,
             &self.weights,
             &eta,
-        )?;
+        )
+        .map_err(|e| e.to_string())?;
 
         let mut prior_grad = Array1::<f64>::zeros(latent_beta.len());
         let mut prior_neg_hess = Array2::<f64>::zeros((latent_beta.len(), latent_beta.len()));
@@ -3522,7 +3524,7 @@ fn fit_bounded_term_collection_for_spec(
             ..BlockwiseFitOptions::default()
         },
     )
-    .map_err(EstimationError::InvalidInput)?;
+    .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
 
     let latent_beta = fit.block_states[0].beta.clone();
     let (beta_user_internal, jac_diag) = family_adapter.user_beta_and_jacobian(&latent_beta);
@@ -3530,11 +3532,9 @@ fn fit_bounded_term_collection_for_spec(
     let latent_cov = fit.covariance_conditional.clone();
     let beta_covariance = latent_cov.as_ref().map(|cov| {
         let mut out = cov.clone();
-        for i in 0..out.nrows() {
-            for j in 0..out.ncols() {
-                out[[i, j]] *= jac_diag[i] * jac_diag[j];
-            }
-        }
+        let jac_col = jac_diag.view().insert_axis(ndarray::Axis(1));
+        let jac_row = jac_diag.view().insert_axis(ndarray::Axis(0));
+        out *= &(jac_col.to_owned() * jac_row);
         conditioning.backtransform_covariance(&out)
     });
     let beta_standard_errors = beta_covariance

@@ -5,10 +5,11 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
 use std::io::{self, IsTerminal, Stdout};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-static VISUALIZER: Mutex<Option<OptimizationVisualizer>> = Mutex::new(None);
+static VISUALIZER: LazyLock<Mutex<Option<OptimizationVisualizer>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 pub struct VisualizerGuard {
     active: bool,
@@ -20,17 +21,6 @@ impl Drop for VisualizerGuard {
             teardown();
         }
     }
-}
-
-impl VisualizerGuard {
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-}
-
-pub fn init_guard(enabled: bool) -> VisualizerGuard {
-    let active = enabled && init();
-    VisualizerGuard { active }
 }
 
 pub struct OptimizationVisualizer {
@@ -335,126 +325,137 @@ impl OptimizationVisualizer {
     }
 }
 
-pub fn init() -> bool {
-    let mut guard = VISUALIZER.lock().unwrap();
-    if guard.is_some() {
-        return true;
+impl VisualizerSession {
+    pub fn new(enabled: bool) -> Self {
+        let visualizer = if enabled {
+            OptimizationVisualizer::new().ok()
+        } else {
+            None
+        };
+        Self { visualizer }
     }
-    match OptimizationVisualizer::new() {
-        Ok(vis) => {
-            *guard = Some(vis);
-            true
-        }
-        Err(_) => false,
+
+    pub fn is_active(&self) -> bool {
+        self.visualizer.is_some()
     }
-}
 
-pub fn update(cost: f64, grad_norm: f64, status_msg: &str, iter: f64, eval_state: &str) {
-    let mut guard = VISUALIZER.lock().unwrap();
-    if let Some(vis) = guard.as_mut() {
-        vis.current_iter = iter;
-        vis.current_cost = cost;
-        vis.current_grad = grad_norm;
-        vis.current_eval_state = eval_state.to_string();
+    pub fn update(
+        &mut self,
+        cost: f64,
+        grad_norm: f64,
+        status_msg: &str,
+        iter: f64,
+        eval_state: &str,
+    ) {
+        if let Some(vis) = self.visualizer.as_mut() {
+            vis.current_iter = iter;
+            vis.current_cost = cost;
+            vis.current_grad = grad_norm;
+            vis.current_eval_state = eval_state.to_string();
 
-        if cost.is_finite() && cost.abs() < 1e15 {
-            let target_series = if eval_state == "trial" {
-                &mut vis.history_cost_trial
-            } else {
-                &mut vis.history_cost_accepted
-            };
-            push_sample(target_series, (iter, cost));
-            if cost < vis.best_cost {
-                vis.best_cost = cost;
+            if cost.is_finite() && cost.abs() < 1e15 {
+                let target_series = if eval_state == "trial" {
+                    &mut vis.history_cost_trial
+                } else {
+                    &mut vis.history_cost_accepted
+                };
+                push_sample(target_series, (iter, cost));
+                if cost < vis.best_cost {
+                    vis.best_cost = cost;
+                }
+            }
+
+            if grad_norm.is_finite() {
+                let grad_log = grad_norm.max(1e-12).log10();
+                push_sample(&mut vis.history_grad_log, (iter, grad_log));
+            }
+
+            vis.current_status = status_msg.to_string();
+
+            if vis.last_draw.elapsed() >= Duration::from_millis(40) {
+                let _ = vis.draw();
+                vis.last_draw = Instant::now();
             }
         }
+    }
 
-        if grad_norm.is_finite() {
-            let grad_log = grad_norm.max(1e-12).log10();
-            push_sample(&mut vis.history_grad_log, (iter, grad_log));
+    pub fn set_stage(&mut self, stage: &str, detail: &str) {
+        if let Some(vis) = self.visualizer.as_mut() {
+            vis.current_stage = stage.to_string();
+            vis.current_detail = detail.to_string();
+            if vis.last_draw.elapsed() >= Duration::from_millis(40) {
+                let _ = vis.draw();
+                vis.last_draw = Instant::now();
+            }
         }
+    }
 
-        vis.current_status = status_msg.to_string();
+    pub fn set_progress(&mut self, label: &str, current: usize, total: Option<usize>) {
+        if let Some(vis) = self.visualizer.as_mut() {
+            vis.progress_label = label.to_string();
+            vis.progress_current = current;
+            vis.progress_total = total;
+            if vis.last_draw.elapsed() >= Duration::from_millis(40) {
+                let _ = vis.draw();
+                vis.last_draw = Instant::now();
+            }
+        }
+    }
 
-        if vis.last_draw.elapsed() >= Duration::from_millis(40) {
+    pub fn set_edf_terms(&mut self, terms: &[(String, f64, f64)]) {
+        if let Some(vis) = self.visualizer.as_mut() {
+            vis.edf_terms = terms.to_vec();
+            if !terms.is_empty() || vis.last_draw.elapsed() >= Duration::from_millis(40) {
+                let _ = vis.draw();
+                vis.last_draw = Instant::now();
+            }
+        }
+    }
+
+    pub fn set_diagnostics(
+        &mut self,
+        condition_number: Option<f64>,
+        step_size: Option<f64>,
+        ridge: Option<f64>,
+    ) {
+        if let Some(vis) = self.visualizer.as_mut() {
+            vis.diagnostics_condition = condition_number;
+            vis.diagnostics_step_size = step_size;
+            vis.diagnostics_ridge = ridge;
+            if vis.last_draw.elapsed() >= Duration::from_millis(40) {
+                let _ = vis.draw();
+                vis.last_draw = Instant::now();
+            }
+        }
+    }
+
+    pub fn push_diagnostic(&mut self, message: &str) {
+        if let Some(vis) = self.visualizer.as_mut() {
+            vis.diagnostics_lines.push(message.to_string());
+            const MAX_LINES: usize = 10;
+            if vis.diagnostics_lines.len() > MAX_LINES {
+                let overflow = vis.diagnostics_lines.len() - MAX_LINES;
+                vis.diagnostics_lines.drain(0..overflow);
+            }
+            if vis.last_draw.elapsed() >= Duration::from_millis(40) {
+                let _ = vis.draw();
+                vis.last_draw = Instant::now();
+            }
+        }
+    }
+
+    pub fn teardown(&mut self) {
+        if let Some(mut vis) = self.visualizer.take() {
             let _ = vis.draw();
-            vis.last_draw = Instant::now();
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
         }
     }
 }
 
-pub fn set_stage(stage: &str, detail: &str) {
-    let mut guard = VISUALIZER.lock().unwrap();
-    if let Some(vis) = guard.as_mut() {
-        vis.current_stage = stage.to_string();
-        vis.current_detail = detail.to_string();
-        if vis.last_draw.elapsed() >= Duration::from_millis(40) {
-            let _ = vis.draw();
-            vis.last_draw = Instant::now();
-        }
-    }
-}
-
-pub fn set_progress(label: &str, current: usize, total: Option<usize>) {
-    let mut guard = VISUALIZER.lock().unwrap();
-    if let Some(vis) = guard.as_mut() {
-        vis.progress_label = label.to_string();
-        vis.progress_current = current;
-        vis.progress_total = total;
-        if vis.last_draw.elapsed() >= Duration::from_millis(40) {
-            let _ = vis.draw();
-            vis.last_draw = Instant::now();
-        }
-    }
-}
-
-pub fn set_edf_terms(terms: &[(String, f64, f64)]) {
-    let mut guard = VISUALIZER.lock().unwrap();
-    if let Some(vis) = guard.as_mut() {
-        vis.edf_terms = terms.to_vec();
-        if !terms.is_empty() || vis.last_draw.elapsed() >= Duration::from_millis(40) {
-            let _ = vis.draw();
-            vis.last_draw = Instant::now();
-        }
-    }
-}
-
-pub fn set_diagnostics(condition_number: Option<f64>, step_size: Option<f64>, ridge: Option<f64>) {
-    let mut guard = VISUALIZER.lock().unwrap();
-    if let Some(vis) = guard.as_mut() {
-        vis.diagnostics_condition = condition_number;
-        vis.diagnostics_step_size = step_size;
-        vis.diagnostics_ridge = ridge;
-        if vis.last_draw.elapsed() >= Duration::from_millis(40) {
-            let _ = vis.draw();
-            vis.last_draw = Instant::now();
-        }
-    }
-}
-
-pub fn push_diagnostic(message: &str) {
-    let mut guard = VISUALIZER.lock().unwrap();
-    if let Some(vis) = guard.as_mut() {
-        vis.diagnostics_lines.push(message.to_string());
-        const MAX_LINES: usize = 10;
-        if vis.diagnostics_lines.len() > MAX_LINES {
-            let overflow = vis.diagnostics_lines.len() - MAX_LINES;
-            vis.diagnostics_lines.drain(0..overflow);
-        }
-        if vis.last_draw.elapsed() >= Duration::from_millis(40) {
-            let _ = vis.draw();
-            vis.last_draw = Instant::now();
-        }
-    }
-}
-
-pub fn teardown() {
-    let mut guard = VISUALIZER.lock().unwrap();
-    if let Some(mut vis) = guard.take() {
-        // Force one final frame so short optimizations still show latest side panels.
-        let _ = vis.draw();
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+impl Drop for VisualizerSession {
+    fn drop(&mut self) {
+        self.teardown();
     }
 }
 

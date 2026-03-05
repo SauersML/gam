@@ -36,12 +36,9 @@ impl<'a> RemlState<'a> {
         t_k.mapv_inplace(|v| v * lambda_k);
 
         let mut z_weighted = z_mat.clone();
-        for i in 0..z_weighted.nrows() {
-            let weight = c_weighted_u_k[i];
-            for j in 0..z_weighted.ncols() {
-                z_weighted[[i, j]] *= weight;
-            }
-        }
+        ndarray::Zip::from(z_weighted.rows_mut())
+            .and(c_weighted_u_k.view())
+            .for_each(|mut row, weight| row *= *weight);
         t_k += &fast_atb(z_mat, &z_weighted);
         t_k
     }
