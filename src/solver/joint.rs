@@ -1267,6 +1267,7 @@ pub struct JointEvalContext {
 pub struct JointRemlState<'a> {
     core: JointCore<'a>,
     eval: JointEvalContext,
+    visualizer: visualizer::VisualizerSession,
 }
 
 struct JointRemlSnapshot {
@@ -1412,6 +1413,7 @@ impl<'a> JointRemlState<'a> {
                 last_outer_step_norm: None,
                 last_eval_rho: None,
             },
+            visualizer: visualizer::VisualizerSession::default(),
         }
     }
 
@@ -2859,12 +2861,14 @@ impl<'a> JointRemlState<'a> {
             Ok(val) if val.is_finite() => val,
             Ok(_) => {
                 eprintln!("[JOINT][REML] Non-finite cost; returning large penalty.");
-                visualizer::push_diagnostic("warning: non-finite joint REML cost encountered");
+                self.visualizer
+                    .push_diagnostic("warning: non-finite joint REML cost encountered");
                 return (f64::INFINITY, Array1::from_elem(rho.len(), f64::NAN));
             }
             Err(err) => {
                 eprintln!("[JOINT][REML] Cost evaluation failed: {err}");
-                visualizer::push_diagnostic(&format!("warning: cost evaluation failed: {err}"));
+                self.visualizer
+                    .push_diagnostic(&format!("warning: cost evaluation failed: {err}"));
                 return (f64::INFINITY, Array1::from_elem(rho.len(), f64::NAN));
             }
         };
@@ -2872,33 +2876,35 @@ impl<'a> JointRemlState<'a> {
             Ok(grad) => grad,
             Err(err) => {
                 eprintln!("[JOINT][REML] Gradient evaluation failed: {err}");
-                visualizer::push_diagnostic(&format!("warning: gradient evaluation failed: {err}"));
+                self.visualizer
+                    .push_diagnostic(&format!("warning: gradient evaluation failed: {err}"));
                 Array1::from_elem(rho.len(), f64::NAN)
             }
         };
         let grad_norm = grad.dot(&grad).sqrt();
         // Push side-panel state before the chart update so the next rendered frame
         // includes objective + EDF + diagnostics together.
-        visualizer::set_edf_terms(&self.eval.cached_edf_terms);
-        visualizer::set_diagnostics(
+        self.visualizer.set_edf_terms(&self.eval.cached_edf_terms);
+        self.visualizer.set_diagnostics(
             self.eval.last_hessian_condition,
             self.eval.last_outer_step_norm,
             Some(self.core.state.ridge_used),
         );
-        visualizer::update(cost, grad_norm, "optimizing", eval_num as f64, "eval");
+        self.visualizer
+            .update(cost, grad_norm, "optimizing", eval_num as f64, "eval");
         if !self.eval.last_converged {
-            visualizer::push_diagnostic(&format!(
+            self.visualizer.push_diagnostic(&format!(
                 "inner backfit not converged (iterations={})",
                 self.eval.last_backfit_iterations
             ));
         } else {
-            visualizer::push_diagnostic(&format!(
+            self.visualizer.push_diagnostic(&format!(
                 "inner backfit converged in {} iterations",
                 self.eval.last_backfit_iterations
             ));
         }
         if self.core.state.ridge_used > 0.0 {
-            visualizer::push_diagnostic(&format!(
+            self.visualizer.push_diagnostic(&format!(
                 "stabilization ridge active: {:.3e}",
                 self.core.state.ridge_used
             ));
@@ -2981,10 +2987,10 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
                 .to_string(),
         ));
     }
-    let _viz_guard = visualizer::init_guard(true);
-    visualizer::set_stage("joint", "initializing");
+    let mut visualizer_session = visualizer::VisualizerSession::new(true);
+    visualizer_session.set_stage("joint", "initializing");
     if config.firth_bias_reduction && matches!(link, LinkFunction::Logit) {
-        visualizer::push_diagnostic("firth bias reduction enabled (separation protection)");
+        visualizer_session.push_diagnostic("firth bias reduction enabled (separation protection)");
     }
     let quad_ctx = QuadratureContext::new();
 
@@ -3000,6 +3006,7 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
         covariate_se,
         quad_ctx,
     );
+    reml_state.visualizer = visualizer_session;
 
     let n_base = reml_state.core.state.s_base.len();
     let heuristic_lambda = {
@@ -3046,8 +3053,12 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
 
     for (label, rho) in candidate_plans.drain(..) {
         candidate_idx += 1;
-        visualizer::set_stage("joint", &format!("candidate {label}"));
-        visualizer::set_progress("Candidates", candidate_idx, Some(total_candidates));
+        reml_state
+            .visualizer
+            .set_stage("joint", &format!("candidate {label}"));
+        reml_state
+            .visualizer
+            .set_progress("Candidates", candidate_idx, Some(total_candidates));
 
         snapshot.restore(&mut reml_state);
         let lower = Array1::<f64>::from_elem(rho.len(), -RHO_BOUND);
