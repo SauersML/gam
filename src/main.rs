@@ -1014,8 +1014,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 payload.joint_ridge_used = Some(joint.ridge_used);
                 payload.training_headers = Some(ds.headers.clone());
                 payload.resolved_term_spec = Some(initial_frozen_spec.clone());
-                let model = SavedModel::from_payload(payload);
-                write_model_json(&out, &model)?;
+                write_payload_json(&out, payload)?;
             }
             return Ok(());
         }
@@ -1169,8 +1168,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         payload.training_headers = Some(ds.headers.clone());
         payload.resolved_term_spec = Some(frozen_spec);
         payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
-        let model = SavedModel::from_payload(payload);
-        write_model_json(&out, &model)?;
+        write_payload_json(&out, payload)?;
     }
 
     Ok(())
@@ -3566,8 +3564,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 Some(inverse_link_to_saved_string(&fitted_inverse_link));
             payload.training_headers = Some(ds.headers.clone());
             payload.resolved_term_spec = Some(frozen_term_spec);
-            let model_out = SavedModel::from_payload(payload);
-            write_model_json(&out, &model_out)?;
+            write_payload_json(&out, payload)?;
         }
         return Ok(());
     }
@@ -3747,8 +3744,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             Some(survival_likelihood_mode_name(likelihood_mode).to_string());
         payload.training_headers = Some(ds.headers.clone());
         payload.resolved_term_spec = Some(frozen_term_spec);
-        let model_out = SavedModel::from_payload(payload);
-        write_model_json(&out, &model_out)?;
+        write_payload_json(&out, payload)?;
     }
     Ok(())
 }
@@ -5283,6 +5279,11 @@ fn write_model_json(path: &Path, model: &SavedModel) -> Result<(), String> {
     model.save_to_path(path)?;
     println!("saved model: {}", path.display());
     Ok(())
+}
+
+fn write_payload_json(path: &Path, payload: FittedModelPayload) -> Result<(), String> {
+    let model = SavedModel::from_payload(payload);
+    write_model_json(path, &model)
 }
 
 fn formula_rhs_text(formula: &str) -> Result<String, String> {
