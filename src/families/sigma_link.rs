@@ -75,6 +75,46 @@ pub fn bounded_sigma_derivs_up_to_third(
     (sigma, d1, d2, d3)
 }
 
+#[inline]
+pub fn bounded_sigma_derivs_up_to_fourth_scalar(
+    eta: f64,
+    sigma_min: f64,
+    sigma_max: f64,
+) -> (f64, f64, f64, f64, f64) {
+    let span = (sigma_max - sigma_min).max(1e-12);
+    let z = eta.clamp(-40.0, 40.0);
+    let p = 1.0 / (1.0 + (-z).exp());
+    let a = p * (1.0 - p);
+    let sigma = sigma_min + span * p;
+    let d1 = span * a;
+    let d2 = span * a * (1.0 - 2.0 * p);
+    let d3 = span * (a * (1.0 - 2.0 * p) * (1.0 - 2.0 * p) - 2.0 * a * a);
+    let d4 = span * a * (1.0 - 2.0 * p) * (1.0 - 12.0 * a);
+    (sigma, d1, d2, d3, d4)
+}
+
+pub fn bounded_sigma_derivs_up_to_fourth(
+    eta: ArrayView1<'_, f64>,
+    sigma_min: f64,
+    sigma_max: f64,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+    let mut sigma = Array1::<f64>::zeros(eta.len());
+    let mut d1 = Array1::<f64>::zeros(eta.len());
+    let mut d2 = Array1::<f64>::zeros(eta.len());
+    let mut d3 = Array1::<f64>::zeros(eta.len());
+    let mut d4 = Array1::<f64>::zeros(eta.len());
+    for i in 0..eta.len() {
+        let (s, ds, d2s, d3s, d4s) =
+            bounded_sigma_derivs_up_to_fourth_scalar(eta[i], sigma_min, sigma_max);
+        sigma[i] = s;
+        d1[i] = ds;
+        d2[i] = d2s;
+        d3[i] = d3s;
+        d4[i] = d4s;
+    }
+    (sigma, d1, d2, d3, d4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,13 +201,28 @@ mod tests {
                 (d1 - d1_fd).abs() < 5e-7,
                 "d1 mismatch at eta={eta}: got {d1}, fd {d1_fd}"
             );
+            assert_eq!(
+                d1.signum(),
+                d1_fd.signum(),
+                "d1 sign mismatch at eta={eta}: got {d1}, fd {d1_fd}"
+            );
             assert!(
                 (d2 - d2_fd).abs() < 5e-5,
                 "d2 mismatch at eta={eta}: got {d2}, fd {d2_fd}"
             );
+            assert_eq!(
+                d2.signum(),
+                d2_fd.signum(),
+                "d2 sign mismatch at eta={eta}: got {d2}, fd {d2_fd}"
+            );
             assert!(
                 (d3 - d3_fd).abs() < 3e-3,
                 "d3 mismatch at eta={eta}: got {d3}, fd {d3_fd}"
+            );
+            assert_eq!(
+                d3.signum(),
+                d3_fd.signum(),
+                "d3 sign mismatch at eta={eta}: got {d3}, fd {d3_fd}"
             );
         }
     }

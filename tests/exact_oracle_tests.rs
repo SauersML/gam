@@ -169,6 +169,14 @@ fn tiny_logit_oracle_gradient_identity_matches_fd_of_log_evidence() {
         let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
         let g_fd = exact_logit_oracle_grad_fd_rho_2d(&y, &x, rho, cfg);
         let rel = (g_exact - g_fd).abs() / g_fd.abs().max(1e-8);
+        assert_eq!(
+            g_exact.signum(),
+            g_fd.signum(),
+            "oracle sign mismatch at rho={:.3}: g_exact={:.6e}, g_fd={:.6e}",
+            rho,
+            g_exact,
+            g_fd
+        );
         assert!(
             rel < 2.5e-2,
             "oracle identity mismatch at rho={:.3}: g_exact={:.6e}, g_fd={:.6e}, rel={:.3e}",
@@ -191,8 +199,9 @@ fn tiny_logit_laml_vs_exact_oracle_regular_regime() {
         let g_laml = laml_gradient_external_logit(&y, &x, rho);
         let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
         assert!(g_laml.is_finite() && g_exact.is_finite());
-        assert!(
-            g_laml.signum() == g_exact.signum() || g_laml.abs() < 1e-8 || g_exact.abs() < 1e-8,
+        assert_eq!(
+            g_laml.signum(),
+            g_exact.signum(),
             "gradient direction mismatch at rho={:.3}: g_laml={:.6e}, g_exact={:.6e}",
             rho,
             g_laml,
@@ -273,8 +282,9 @@ fn tiny_logit_laml_vs_exact_oracle_near_separation_stress() {
         let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
         worst_rel = worst_rel.max(rel_err);
         assert!(g_laml.is_finite() && g_exact.is_finite());
-        assert!(
-            g_laml.signum() == g_exact.signum() || g_laml.abs() < 1e-8 || g_exact.abs() < 1e-8,
+        assert_eq!(
+            g_laml.signum(),
+            g_exact.signum(),
             "stress direction mismatch at rho={:.3}: g_laml={:.6e}, g_exact={:.6e}",
             rho,
             g_laml,
@@ -313,7 +323,7 @@ fn tiny_logit_laml_vs_exact_oracle_stress_sweep_direction_consistent() {
     }
 
     assert!(
-        mismatches <= 1,
+        mismatches == 0,
         "stress sweep produced too many sign mismatches: {mismatches}"
     );
     assert!(
@@ -331,6 +341,7 @@ fn test_laml_gradient_exact_formula_ground_truth() {
     let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
     let g_laml = laml_gradient_external_logit(&y, &x, rho);
     let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
+    assert_eq!(g_laml.signum(), g_exact.signum());
     assert!(
         rel_err < 1.25,
         "ground-truth mismatch at rho={rho:.3}: g_laml={g_laml:.6e}, g_exact={g_exact:.6e}, rel={rel_err:.3e}",
@@ -349,6 +360,7 @@ fn test_laml_gradient_firth_exact_formula_ground_truth() {
     let g_exact = exact_logit_oracle_eval_rho_2d(&y, &x, rho, cfg).grad_rho;
     let g_laml = laml_gradient_external_logit(&y, &x, rho);
     let rel_err = (g_laml - g_exact).abs() / g_exact.abs().max(1e-8);
+    assert_eq!(g_laml.signum(), g_exact.signum());
     assert!(
         rel_err < 2.5,
         "firth-path ground-truth mismatch at rho={rho:.3}: g_laml={g_laml:.6e}, g_exact={g_exact:.6e}, rel={rel_err:.3e}",
@@ -414,6 +426,15 @@ fn test_external_gradient_adapter_isolated_matches_fd_direction() {
         &rho,
     )
     .expect("external gradient evaluation should succeed");
+    for i in 0..analytic.len() {
+        assert_eq!(
+            analytic[i].signum(),
+            fd[i].signum(),
+            "adapter sign mismatch at i={i}: analytic={} fd={}",
+            analytic[i],
+            fd[i]
+        );
+    }
 
     let dot = analytic.dot(&fd);
     let na = analytic.dot(&analytic).sqrt();

@@ -115,6 +115,13 @@ fn full_outer_theta_gradient_matches_fd_for_blended_link() {
             let abs_err = (analytic[j] - fd[j]).abs();
             let scale = analytic[j].abs().max(fd[j].abs()).max(1e-5);
             let rel_err = abs_err / scale;
+            assert_eq!(
+                analytic[j].signum(),
+                fd[j].signum(),
+                "seed={seed} blended grad sign mismatch at j={j}: analytic={:.6e} fd={:.6e}",
+                analytic[j],
+                fd[j]
+            );
             assert!(
                 abs_err < 3e-2 || rel_err < 1.5e-1,
                 "seed={seed} blended grad mismatch at j={j}: analytic={:.6e} fd={:.6e} abs={:.3e} rel={:.3e}",
@@ -192,6 +199,13 @@ fn full_outer_theta_gradient_matches_fd_for_sas_link() {
             let abs_err = (analytic[j] - fd[j]).abs();
             let scale = analytic[j].abs().max(fd[j].abs()).max(1e-5);
             let rel_err = abs_err / scale;
+            assert_eq!(
+                analytic[j].signum(),
+                fd[j].signum(),
+                "seed={seed} SAS grad sign mismatch at j={j}: analytic={:.6e} fd={:.6e}",
+                analytic[j],
+                fd[j]
+            );
             assert!(
                 abs_err < 3e-2 || rel_err < 1.5e-1,
                 "seed={seed} SAS grad mismatch at j={j}: analytic={:.6e} fd={:.6e} abs={:.3e} rel={:.3e}",

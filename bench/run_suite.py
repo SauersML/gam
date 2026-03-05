@@ -2900,8 +2900,6 @@ def run_rust_scenario_cv(
                 fit_cmd = [
                     str(rust_bin),
                     "fit",
-                    "--family",
-                    "royston-parmar",
                     "--formula",
                     fit_formula,
                     "--out",
@@ -2918,7 +2916,7 @@ def run_rust_scenario_cv(
                     train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
                     train_df.to_csv(train_path, index=False)
                     test_df.to_csv(test_path, index=False)
-                family, formula = _rust_formula_for_scenario(
+                _family, formula = _rust_formula_for_scenario(
                     scenario_name,
                     ds,
                     cfg_override=rust_cfg_override,
@@ -2928,8 +2926,6 @@ def run_rust_scenario_cv(
                     fit_cmd = [
                         str(rust_bin),
                         "fit",
-                        "--family",
-                        "auto",
                         "--formula",
                         formula,
                         "--out",
@@ -2940,8 +2936,6 @@ def run_rust_scenario_cv(
                     fit_cmd = [
                         str(rust_bin),
                         "fit",
-                        "--family",
-                        family,
                         "--formula",
                         formula,
                         "--out",
@@ -3341,8 +3335,6 @@ def _run_rust_gamlss_scenario_cv_variant(
             fit_cmd = [
                 str(rust_bin),
                 "fit",
-                "--family",
-                cli_family,
                 "--formula",
                 mean_formula,
                 "--predict-noise",
@@ -3575,8 +3567,6 @@ def run_rust_gamlss_survival_cv(
             fit_cmd = [
                 str(rust_bin),
                 "fit",
-                "--family",
-                "royston-parmar",
                 "--formula",
                 fit_formula,
                 "--out",

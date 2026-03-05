@@ -279,9 +279,16 @@ pub fn generate_rho_candidates(
     // - backward-compatible nu=2 reverse-map seeds,
     // - first-order fallback seeds (lambda2 near lower bound).
     if num_penalties == 3 {
+        // Guarantee a first-order fallback anchor regardless of later truncation.
+        add_seed_dedup(
+            &mut seeds,
+            &mut seen,
+            Array1::from_vec(vec![primary[0], primary[1], bounds.0]),
+        );
+        // Ensure a nu=2-consistent seed is always present before broader grids.
+        add_nu2_reverse_manifold_seeds(&mut seeds, &mut seen, bounds, &primary);
         add_first_order_fallback_seeds(&mut seeds, &mut seen, bounds, heuristic_lambdas);
         add_spde_manifold_seeds(&mut seeds, &mut seen, bounds, heuristic_lambdas, &primary);
-        add_nu2_reverse_manifold_seeds(&mut seeds, &mut seen, bounds, &primary);
     }
 
     // Backward-compatible scalar heuristic support: treat each value as a symmetric λ seed.

@@ -81,6 +81,15 @@ fn trace_third_auto_correction_against_fd() {
             &rho,
         )
         .expect("gradient eval should succeed");
+        for i in 0..analytic.len() {
+            assert_eq!(
+                analytic[i].signum(),
+                fd[i].signum(),
+                "trace-third auto-correct sign mismatch at scale={scale:.2} i={i}: analytic={} fd={}",
+                analytic[i],
+                fd[i]
+            );
+        }
         let num = (&analytic - &fd).mapv(|v| v * v).sum().sqrt();
         let den = fd.mapv(|v| v * v).sum().sqrt().max(1e-12);
         let rel = num / den;

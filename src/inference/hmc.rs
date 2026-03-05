@@ -532,6 +532,14 @@ mod tests {
             let (lp, _) = posterior.compute_logp_and_grad_nd(&z_plus);
             let (lm, _) = posterior.compute_logp_and_grad_nd(&z_minus);
             let fd = (lp - lm) / (2.0 * eps);
+            assert_eq!(
+                grad[j].signum(),
+                fd.signum(),
+                "gradient sign mismatch at {}: analytic={}, fd={}",
+                j,
+                grad[j],
+                fd
+            );
             assert!(
                 (grad[j] - fd).abs() < 1e-5,
                 "gradient mismatch at {}: analytic={}, fd={}",

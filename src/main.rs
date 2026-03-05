@@ -629,7 +629,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             ));
         }
     }
-    let effective_link = link_choice
+    let mut effective_link = link_choice
         .as_ref()
         .map(|c| c.link)
         .unwrap_or_else(|| family_to_link(family));
@@ -639,6 +639,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         && link_choice.is_none()
     {
         family = LikelihoodFamily::BinomialProbit;
+        effective_link = family_to_link(family);
     }
 
     if args.firth && args.predict_noise.is_some() {
@@ -1593,11 +1594,13 @@ fn run_predict_gaussian_location_scale(
         mean_lo = Some(&eta_mu - &sigma.mapv(|s| z * s));
         mean_hi = Some(&eta_mu + &sigma.mapv(|s| z * s));
     }
-    write_prediction_csv(
+    // Gaussian location-scale predictions must always expose sigma as a
+    // distribution parameter (not as generic estimator uncertainty).
+    write_gaussian_location_scale_prediction_csv(
         &args.out,
         eta_mu.view(),
         eta_mu.view(),
-        args.uncertainty.then_some(sigma.view()),
+        sigma.view(),
         mean_lo.as_ref().map(|a| a.view()),
         mean_hi.as_ref().map(|a| a.view()),
     )?;
@@ -7833,6 +7836,70 @@ fn write_prediction_csv(
     Ok(())
 }
 
+fn write_gaussian_location_scale_prediction_csv(
+    path: &Path,
+    eta: ArrayView1<'_, f64>,
+    mean: ArrayView1<'_, f64>,
+    sigma: ArrayView1<'_, f64>,
+    mean_lower: Option<ArrayView1<'_, f64>>,
+    mean_upper: Option<ArrayView1<'_, f64>>,
+) -> Result<(), String> {
+    if eta.len() != mean.len() || eta.len() != sigma.len() {
+        return Err(format!(
+            "internal error: gaussian location-scale output length mismatch (eta={}, mean={}, sigma={})",
+            eta.len(),
+            mean.len(),
+            sigma.len()
+        ));
+    }
+    if mean_lower.is_some() != mean_upper.is_some() {
+        return Err(
+            "internal error: gaussian location-scale output requires both mean_lower and mean_upper"
+                .to_string(),
+        );
+    }
+
+    let mut wtr = WriterBuilder::new()
+        .has_headers(true)
+        .from_path(path)
+        .map_err(|e| format!("failed to create output csv '{}': {e}", path.display()))?;
+
+    if mean_lower.is_some() {
+        wtr.write_record(["eta", "mean", "sigma", "mean_lower", "mean_upper"])
+            .map_err(|e| format!("failed writing csv header: {e}"))?;
+    } else {
+        wtr.write_record(["eta", "mean", "sigma"])
+            .map_err(|e| format!("failed writing csv header: {e}"))?;
+    }
+
+    for i in 0..eta.len() {
+        if let Some(lo) = mean_lower {
+            let hi = mean_upper.as_ref().ok_or_else(|| {
+                "internal error: mean_upper missing while mean_lower is present".to_string()
+            })?;
+            wtr.write_record([
+                format!("{:.12}", eta[i]),
+                format!("{:.12}", mean[i]),
+                format!("{:.12}", sigma[i]),
+                format!("{:.12}", lo[i]),
+                format!("{:.12}", hi[i]),
+            ])
+            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
+        } else {
+            wtr.write_record([
+                format!("{:.12}", eta[i]),
+                format!("{:.12}", mean[i]),
+                format!("{:.12}", sigma[i]),
+            ])
+            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
+        }
+    }
+
+    wtr.flush()
+        .map_err(|e| format!("failed to flush csv writer: {e}"))?;
+    Ok(())
+}
+
 fn write_survival_prediction_csv(
     path: &Path,
     eta: ArrayView1<'_, f64>,
@@ -7912,7 +7979,8 @@ mod tests {
         parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
         parse_surv_response, parse_survival_inverse_link, parse_survival_time_basis_config,
         pretty_family_name, saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design,
-        summarize_wiggle_domain, survival_probability_from_eta, write_survival_prediction_csv,
+        summarize_wiggle_domain, survival_probability_from_eta,
+        write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
     use csv::StringRecord;
     use gam::basis::{BasisOptions, Dense, DuchonNullspaceOrder, KnotSource, create_basis};
@@ -8300,6 +8368,72 @@ mod tests {
         assert_eq!(
             header, "eta,mean,survival_prob,risk_score,failure_prob",
             "survival output schema changed unexpectedly"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gaussian_location_scale_prediction_csv_includes_sigma_column() {
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        path.push(format!("gam_gaussian_loc_scale_pred_schema_{ts}.csv"));
+
+        let eta = array![0.5, -0.25];
+        let mean = eta.clone();
+        let sigma = array![0.3, 0.7];
+        write_gaussian_location_scale_prediction_csv(
+            &path,
+            eta.view(),
+            mean.view(),
+            sigma.view(),
+            None,
+            None,
+        )
+        .expect("write gaussian location-scale prediction csv");
+
+        let text = fs::read_to_string(&path).expect("read csv");
+        let header = text.lines().next().unwrap_or("");
+        assert_eq!(
+            header, "eta,mean,sigma",
+            "gaussian location-scale output schema changed unexpectedly"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gaussian_location_scale_prediction_csv_includes_bounds_when_present() {
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        path.push(format!("gam_gaussian_loc_scale_pred_bounds_{ts}.csv"));
+
+        let eta = array![1.0];
+        let mean = array![1.0];
+        let sigma = array![0.4];
+        let mean_lower = array![0.2];
+        let mean_upper = array![1.8];
+        write_gaussian_location_scale_prediction_csv(
+            &path,
+            eta.view(),
+            mean.view(),
+            sigma.view(),
+            Some(mean_lower.view()),
+            Some(mean_upper.view()),
+        )
+        .expect("write gaussian location-scale prediction csv with bounds");
+
+        let text = fs::read_to_string(&path).expect("read csv");
+        let header = text.lines().next().unwrap_or("");
+        assert_eq!(
+            header, "eta,mean,sigma,mean_lower,mean_upper",
+            "gaussian location-scale output bounds schema changed unexpectedly"
         );
 
         let _ = fs::remove_file(&path);

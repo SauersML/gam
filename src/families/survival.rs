@@ -1135,6 +1135,12 @@ mod tests {
             plus[idx] += eps;
             minus[idx] -= eps;
             let fd = (penalties.deviance(&plus) - penalties.deviance(&minus)) / (2.0 * eps);
+            assert_eq!(
+                grad[idx].signum(),
+                fd.signum(),
+                "gradient/deviance sign mismatch at idx={idx}: grad={} fd={fd}",
+                grad[idx]
+            );
             assert!(
                 (grad[idx] - fd).abs() < 1e-6,
                 "gradient/deviance mismatch at idx={idx}: grad={} fd={fd}",
@@ -1317,6 +1323,12 @@ mod tests {
             let obj_plus = 0.5 * state_plus.deviance + state_plus.penalty_term;
             let obj_minus = 0.5 * state_minus.deviance + state_minus.penalty_term;
             let fd = (obj_plus - obj_minus) / (2.0 * eps);
+            assert_eq!(
+                state.gradient[j].signum(),
+                fd.signum(),
+                "objective/gradient sign mismatch at j={j}: grad={} fd={fd}",
+                state.gradient[j]
+            );
             assert!(
                 (state.gradient[j] - fd).abs() < 1e-5,
                 "objective/gradient mismatch at j={j}: grad={} fd={fd}",
@@ -1389,6 +1401,12 @@ mod tests {
             let obj_plus = 0.5 * state_plus.deviance + state_plus.penalty_term;
             let obj_minus = 0.5 * state_minus.deviance + state_minus.penalty_term;
             let fd = (obj_plus - obj_minus) / (2.0 * eps);
+            assert_eq!(
+                state.gradient[j].signum(),
+                fd.signum(),
+                "structural objective/gradient sign mismatch at j={j}: grad={} fd={fd}",
+                state.gradient[j]
+            );
             assert!(
                 (state.gradient[j] - fd).abs() < 2e-5,
                 "structural objective/gradient mismatch at j={j}: grad={} fd={fd}",
@@ -1718,6 +1736,13 @@ mod tests {
         for k in 0..rho.len() {
             let abs_err = (analytic[k] - fd[k]).abs();
             let rel_err = abs_err / fd[k].abs().max(1e-6);
+            assert_eq!(
+                analytic[k].signum(),
+                fd[k].signum(),
+                "rho-grad sign mismatch at k={k}: analytic={:.6e} fd={:.6e}",
+                analytic[k],
+                fd[k]
+            );
             assert!(
                 rel_err < 6e-1 || abs_err < 2.0,
                 "rho-grad mismatch at k={k}: analytic={:.6e} fd={:.6e} abs={:.3e} rel={:.3e}",
@@ -1813,6 +1838,13 @@ mod tests {
         for k in 0..rho.len() {
             let abs_err = (analytic[k] - fd[k]).abs();
             let rel_err = abs_err / fd[k].abs().max(1e-6);
+            assert_eq!(
+                analytic[k].signum(),
+                fd[k].signum(),
+                "event-heavy rho-grad sign mismatch at k={k}: analytic={:.6e} fd={:.6e}",
+                analytic[k],
+                fd[k]
+            );
             assert!(
                 rel_err < 5e-1 || abs_err < 1.0,
                 "event-heavy rho-grad mismatch at k={k}: analytic={:.6e} fd={:.6e} abs={:.3e} rel={:.3e}",
