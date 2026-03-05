@@ -2931,12 +2931,9 @@ fn matern_kernel_radial_triplet_with_safe_ratio(
             let phi = e;
             let phi_r = -s * e;
             let phi_rr = s * s * e;
-            if r == 0.0 {
-                return Err(BasisError::InvalidInput(
-                    "Matérn nu=1/2 has singular phi'(r)/r at r=0".to_string(),
-                ));
-            }
-            let ratio = phi_r / r;
+            // Safe ratio regularization at r=0 to keep operator assembly finite.
+            let r_eff = r.max(1e-12);
+            let ratio = phi_r / r_eff;
             (phi, phi_r, phi_rr, ratio)
         }
         MaternNu::ThreeHalves => {
@@ -4643,58 +4640,15 @@ pub fn build_matern_basis(
     } else {
         (m.basis, None)
     };
-    let candidates = if spec.double_penalty {
-        // Thread-1 operator decomposition mode:
-        // expose separate (mass, tension, stiffness) energies to REML.
-        build_matern_operator_penalty_candidates(
-            centers.view(),
-            spec.length_scale,
-            spec.nu,
-            spec.include_intercept,
-            z_opt.as_ref(),
-        )?
-    } else {
-        // Legacy Matérn mode for ablations:
-        // retain the classical kernel quadratic form (+ nullspace ridge when needed).
-        let (kernel_penalty, ridge_penalty) = if let Some(ref z) = z_opt {
-            let k = m.num_kernel_basis;
-            let kernel_raw = m.penalty_kernel.slice(s![0..k, 0..k]).to_owned();
-            let kernel_tmp = fast_ab(&kernel_raw, z);
-            let kernel_c = fast_atb(z, &kernel_tmp);
-
-            let ridge_raw = m.penalty_ridge.slice(s![0..k, 0..k]).to_owned();
-            let ridge_tmp = fast_ab(&ridge_raw, z);
-            let ridge_c = fast_atb(z, &ridge_tmp);
-
-            if spec.include_intercept {
-                let p = kernel_c.nrows();
-                let mut kernel_aug = Array2::<f64>::zeros((p + 1, p + 1));
-                kernel_aug.slice_mut(s![0..p, 0..p]).assign(&kernel_c);
-                let mut ridge_aug = Array2::<f64>::zeros((p + 1, p + 1));
-                ridge_aug.slice_mut(s![0..p, 0..p]).assign(&ridge_c);
-                (kernel_aug, ridge_aug)
-            } else {
-                (kernel_c, ridge_c)
-            }
-        } else {
-            (m.penalty_kernel.clone(), m.penalty_ridge.clone())
-        };
-        let mut out = vec![PenaltyCandidate {
-            matrix: kernel_penalty.clone(),
-            nullspace_dim_hint: estimate_penalty_nullity(&kernel_penalty)?,
-            source: PenaltySource::Primary,
-            normalization_scale: 1.0,
-        }];
-        if !ridge_penalty.is_empty() {
-            out.push(PenaltyCandidate {
-                matrix: ridge_penalty.clone(),
-                nullspace_dim_hint: estimate_penalty_nullity(&ridge_penalty)?,
-                source: PenaltySource::DoublePenaltyNullspace,
-                normalization_scale: 1.0,
-            });
-        }
-        out
-    };
+    // Canonical Matérn path: always expose operator penalties
+    // (mass, tension, stiffness). No legacy kernel/ridge branch.
+    let candidates = build_matern_operator_penalty_candidates(
+        centers.view(),
+        spec.length_scale,
+        spec.nu,
+        spec.include_intercept,
+        z_opt.as_ref(),
+    )?;
     let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -4862,25 +4816,14 @@ fn matern_operator_psi_triplet(
     let (phi_rr, phi_rr_psi, phi_rr_psi_psi) = exp_poly_scaled_s2_psi_triplet(s, a, rr, 1.0);
 
     // nu=1/2 has singular phi'(r)/r ~ -kappa/r as r->0.
-    // We keep the implementation exact:
-    // - if dimension>1 and r=0, Laplacian is undefined => return error,
-    // - if dimension=1 and r=0, Laplacian uses only phi'' so ratio is set to 0
-    //   because it is multiplied by (d-1)=0.
+    // We use the same finite r-floor regularization as operator assembly.
     let (ratio, ratio_psi, ratio_psi_psi) = if matches!(nu, MaternNu::Half) {
-        if r == 0.0 {
-            if dimension > 1 {
-                return Err(BasisError::InvalidInput(
-                    "Matérn nu=1/2 has singular phi'(r)/r at r=0 for d>1".to_string(),
-                ));
-            }
-            (0.0, 0.0, 0.0)
-        } else {
-            let e_eff = (-a).exp();
-            let g = -(s / r) * e_eff;
-            let g_psi = -(s / r) * e_eff * (1.0 - a);
-            let g_psi_psi = -(s / r) * e_eff * (1.0 - 3.0 * a + a * a);
-            (g, g_psi, g_psi_psi)
-        }
+        let r_eff = r.max(1e-12);
+        let e_eff = (-a).exp();
+        let g = -(s / r_eff) * e_eff;
+        let g_psi = -(s / r_eff) * e_eff * (1.0 - a);
+        let g_psi_psi = -(s / r_eff) * e_eff * (1.0 - 3.0 * a + a * a);
+        (g, g_psi, g_psi_psi)
     } else {
         exp_poly_scaled_s2_psi_triplet(s, a, q, -1.0)
     };
@@ -5198,15 +5141,15 @@ pub fn build_matern_basis_log_kappa_derivative(
     let penalties_derivative = base
         .penalty_info
         .iter()
-        .map(|info| match info.source {
-            PenaltySource::OperatorMass => Ok(all_penalty_deriv[0].clone()),
-            PenaltySource::OperatorTension => Ok(all_penalty_deriv[1].clone()),
-            PenaltySource::OperatorStiffness => Ok(all_penalty_deriv[2].clone()),
-            _ => Err(BasisError::InvalidInput(
-                "Matérn log-kappa derivative expected operator penalties only".to_string(),
-            )),
+        .map(|info| match &info.source {
+            PenaltySource::OperatorMass => all_penalty_deriv[0].clone(),
+            PenaltySource::OperatorTension => all_penalty_deriv[1].clone(),
+            PenaltySource::OperatorStiffness => all_penalty_deriv[2].clone(),
+            other => {
+                panic!("unexpected Matérn penalty source in canonical operator path: {other:?}")
+            }
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
 
     Ok(BasisPsiDerivativeResult {
         design_derivative,
@@ -5241,15 +5184,15 @@ pub fn build_matern_basis_log_kappa_second_derivative(
     let penalties_second_derivative = base
         .penalty_info
         .iter()
-        .map(|info| match info.source {
-            PenaltySource::OperatorMass => Ok(all_penalty_second_deriv[0].clone()),
-            PenaltySource::OperatorTension => Ok(all_penalty_second_deriv[1].clone()),
-            PenaltySource::OperatorStiffness => Ok(all_penalty_second_deriv[2].clone()),
-            _ => Err(BasisError::InvalidInput(
-                "Matérn log-kappa second derivative expected operator penalties only".to_string(),
-            )),
+        .map(|info| match &info.source {
+            PenaltySource::OperatorMass => all_penalty_second_deriv[0].clone(),
+            PenaltySource::OperatorTension => all_penalty_second_deriv[1].clone(),
+            PenaltySource::OperatorStiffness => all_penalty_second_deriv[2].clone(),
+            other => {
+                panic!("unexpected Matérn penalty source in canonical operator path: {other:?}")
+            }
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
 
     Ok(BasisPsiSecondDerivativeResult {
         design_second_derivative,
@@ -7229,6 +7172,144 @@ pub fn evaluate_bspline_third_derivative_scalar_into(
     Ok(())
 }
 
+/// Evaluates B-spline fourth derivatives at a single scalar point `x` into a provided buffer.
+///
+/// Uses the derivative recursion:
+/// B''''_{i,k}(x) = k * (B'''_{i,k-1}(x)/(t_{i+k}-t_i) - B'''_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}))
+///
+/// This returns derivatives in the raw spline basis. If a model uses an
+/// identifiability/constrained basis `BZ`, the caller must apply that same
+/// constraint transform in derivative space as `B''''Z`.
+pub fn evaluate_bspline_fourth_derivative_scalar(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+) -> Result<(), BasisError> {
+    if degree < 4 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    let num_third_lower = knot_vector.len().saturating_sub(degree);
+    let mut third_lower = vec![0.0; num_third_lower];
+    let mut second_lower = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
+    let mut deriv_lower = vec![0.0; knot_vector.len().saturating_sub(degree - 2)];
+    let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 3)];
+    let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(4));
+    evaluate_bspline_fourth_derivative_scalar_into(
+        x,
+        knot_vector,
+        degree,
+        out,
+        &mut third_lower,
+        &mut second_lower,
+        &mut deriv_lower,
+        &mut lower_basis,
+        &mut lower_scratch,
+    )
+}
+
+/// Zero-allocation version for fourth derivatives: pass pre-allocated buffers.
+/// - `third_lower`: length = knot_vector.len() - degree
+/// - `second_lower`: length = knot_vector.len() - (degree - 1)
+/// - `deriv_lower`: length = knot_vector.len() - (degree - 2)
+/// - `lower_basis`: length = knot_vector.len() - (degree - 3)
+/// - `lower_scratch`: BsplineScratch for degree-4
+pub fn evaluate_bspline_fourth_derivative_scalar_into(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+    third_lower: &mut [f64],
+    second_lower: &mut [f64],
+    deriv_lower: &mut [f64],
+    lower_basis: &mut [f64],
+    lower_scratch: &mut internal::BsplineScratch,
+) -> Result<(), BasisError> {
+    if degree < 4 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    let required_knots = degree + 2;
+    if knot_vector.len() < required_knots {
+        return Err(BasisError::InsufficientKnotsForDegree {
+            degree,
+            required: required_knots,
+            provided: knot_vector.len(),
+        });
+    }
+
+    let num_basis = knot_vector.len() - degree - 1;
+    if out.len() != num_basis {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Output buffer length {} does not match number of basis functions {}",
+            out.len(),
+            num_basis
+        )));
+    }
+
+    let expected_third_lower = knot_vector.len().saturating_sub(degree);
+    if third_lower.len() != expected_third_lower {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Lower-third-derivative buffer length {} does not match expected length {}",
+            third_lower.len(),
+            expected_third_lower
+        )));
+    }
+    let expected_second_lower = knot_vector.len().saturating_sub(degree - 1);
+    if second_lower.len() != expected_second_lower {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Lower-second-derivative buffer length {} does not match expected length {}",
+            second_lower.len(),
+            expected_second_lower
+        )));
+    }
+    let expected_deriv_lower = knot_vector.len().saturating_sub(degree - 2);
+    if deriv_lower.len() != expected_deriv_lower {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Lower-derivative buffer length {} does not match expected length {}",
+            deriv_lower.len(),
+            expected_deriv_lower
+        )));
+    }
+    let expected_lower_basis = knot_vector.len().saturating_sub(degree - 3);
+    if lower_basis.len() != expected_lower_basis {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Lower-basis buffer length {} does not match expected length {}",
+            lower_basis.len(),
+            expected_lower_basis
+        )));
+    }
+
+    evaluate_bspline_third_derivative_scalar_into(
+        x,
+        knot_vector,
+        degree - 1,
+        third_lower,
+        second_lower,
+        deriv_lower,
+        lower_basis,
+        lower_scratch,
+    )?;
+
+    let k = degree as f64;
+    for i in 0..num_basis {
+        let denom1 = knot_vector[i + degree] - knot_vector[i];
+        let denom2 = knot_vector[i + degree + 1] - knot_vector[i + 1];
+        let term1 = if denom1.abs() > 1e-12 {
+            k * third_lower[i] / denom1
+        } else {
+            0.0
+        };
+        let term2 = if denom2.abs() > 1e-12 {
+            k * third_lower[i + 1] / denom2
+        } else {
+            0.0
+        };
+        out[i] = term1 - term2;
+    }
+
+    Ok(())
+}
+
 // Unit tests are crucial for a mathematical library like this.
 #[cfg(test)]
 mod tests {
@@ -8413,6 +8494,7 @@ mod tests {
 
             for j in 0..n_i {
                 let fd = (i_plus[j] - i_minus[j]) / (2.0 * h);
+                assert_eq!(d_i[j].signum(), fd.signum());
                 assert_abs_diff_eq!(fd, d_i[j], epsilon = 2e-5);
             }
         }
@@ -8881,6 +8963,7 @@ mod tests {
         let tol = 1e-3;
         for i in 0..num_basis {
             let fd = (d1_plus[i] - d1_minus[i]) / (2.0 * h);
+            assert_eq!(d2[i].signum(), fd.signum());
             assert!(
                 (d2[i] - fd).abs() < tol,
                 "second derivative mismatch at {}: analytic={}, fd={}",
@@ -8913,11 +8996,47 @@ mod tests {
         let tol = 5e-3;
         for i in 0..num_basis {
             let fd = (d2_plus[i] - d2_minus[i]) / (2.0 * h);
+            assert_eq!(d3[i].signum(), fd.signum());
             assert!(
                 (d3[i] - fd).abs() < tol,
                 "third derivative mismatch at {}: analytic={}, fd={}",
                 i,
                 d3[i],
+                fd
+            );
+        }
+    }
+
+    #[test]
+    fn test_fourth_derivative_matches_finite_difference() {
+        let knots = array![
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0, 1.0, 1.0
+        ];
+        let degree = 4;
+        let num_basis = knots.len() - degree - 1;
+        let mut d3_plus = vec![0.0; num_basis];
+        let mut d3_minus = vec![0.0; num_basis];
+        let mut d4 = vec![0.0; num_basis];
+
+        let x = 0.47;
+        let h = 1e-4;
+
+        evaluate_bspline_third_derivative_scalar(x + h, knots.view(), degree, &mut d3_plus)
+            .expect("third derivative +h");
+        evaluate_bspline_third_derivative_scalar(x - h, knots.view(), degree, &mut d3_minus)
+            .expect("third derivative -h");
+        evaluate_bspline_fourth_derivative_scalar(x, knots.view(), degree, &mut d4)
+            .expect("fourth derivative");
+
+        let tol = 3e-2;
+        for i in 0..num_basis {
+            let fd = (d3_plus[i] - d3_minus[i]) / (2.0 * h);
+            assert_eq!(d4[i].signum(), fd.signum());
+            assert!(
+                (d4[i] - fd).abs() < tol,
+                "fourth derivative mismatch at {}: analytic={}, fd={}",
+                i,
+                d4[i],
                 fd
             );
         }
@@ -9367,6 +9486,22 @@ mod tests {
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
+        for i in 0..deriv.design_derivative.nrows() {
+            for j in 0..deriv.design_derivative.ncols() {
+                assert_eq!(
+                    deriv.design_derivative[[i, j]].signum(),
+                    fd_design[[i, j]].signum()
+                );
+            }
+        }
+        for i in 0..deriv.penalties_derivative[0].nrows() {
+            for j in 0..deriv.penalties_derivative[0].ncols() {
+                assert_eq!(
+                    deriv.penalties_derivative[0][[i, j]].signum(),
+                    fd_penalty[[i, j]].signum()
+                );
+            }
+        }
 
         assert!(
             design_err < 1e-5,
@@ -9423,6 +9558,12 @@ mod tests {
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
+        for i in 0..s_psi.nrows() {
+            for j in 0..s_psi.ncols() {
+                assert_eq!(s_psi[[i, j]].signum(), s_fd[[i, j]].signum());
+                assert_eq!(s_psi_psi[[i, j]].signum(), s2_fd[[i, j]].signum());
+            }
+        }
 
         assert!(err1 < 2e-6, "S' mismatch too large: {err1}");
         assert!(err2 < 5e-4, "S'' mismatch too large: {err2}");
@@ -9466,6 +9607,12 @@ mod tests {
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
+        for i in 0..sn_psi.nrows() {
+            for j in 0..sn_psi.ncols() {
+                assert_eq!(sn_psi[[i, j]].signum(), sn_fd[[i, j]].signum());
+                assert_eq!(sn_psi_psi[[i, j]].signum(), sn2_fd[[i, j]].signum());
+            }
+        }
 
         assert!(err1 < 2e-6, "normalized S' mismatch too large: {err1}");
         assert!(err2 < 5e-4, "normalized S'' mismatch too large: {err2}");
@@ -9551,6 +9698,8 @@ mod tests {
         let fm = matern_kernel_from_distance((r - h).max(0.0), length_scale, nu).expect("fm");
         let first_fd = (fp - fm) / (2.0 * h);
         let second_fd = (fp - 2.0 * phi + fm) / (h * h);
+        assert_eq!(phi_r.signum(), first_fd.signum());
+        assert_eq!(phi_rr.signum(), second_fd.signum());
         assert!((phi_r - first_fd).abs() < 5e-5);
         assert!((phi_rr - second_fd).abs() < 1e-3);
     }
@@ -9618,6 +9767,8 @@ mod tests {
         .expect("fm");
         let first_fd = (fp - fm) / (2.0 * h);
         let second_fd = (fp - 2.0 * phi + fm) / (h * h);
+        assert_eq!(phi_r.signum(), first_fd.signum());
+        assert_eq!(phi_rr.signum(), second_fd.signum());
         assert!((phi_r - first_fd).abs() < 1e-3);
         assert!((phi_rr - second_fd).abs() < 1e-1);
     }
@@ -9655,6 +9806,8 @@ mod tests {
         .expect("fm");
         let first_fd = (fp - fm) / (2.0 * h);
         let second_fd = (fp - 2.0 * phi + fm) / (h * h);
+        assert_eq!(phi_r.signum(), first_fd.signum());
+        assert_eq!(phi_rr.signum(), second_fd.signum());
         assert!((phi_r - first_fd).abs() < 2e-3);
         assert!(phi_rr.is_finite());
         assert!(second_fd.is_finite());
@@ -9692,6 +9845,8 @@ mod tests {
         .expect("fm");
         let first_fd = (fp - fm) / (2.0 * h);
         let second_fd = (fp - 2.0 * phi + fm) / (h * h);
+        assert_eq!(phi_r.signum(), first_fd.signum());
+        assert_eq!(phi_rr.signum(), second_fd.signum());
         assert!((phi_r - first_fd).abs() < 1e-6);
         assert!((phi_rr - second_fd).abs() < 1e-4);
     }
