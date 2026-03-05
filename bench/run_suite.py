@@ -3293,7 +3293,10 @@ def _run_rust_gamlss_scenario_cv_variant(
         }
 
     _, mean_formula = _rust_formula_for_scenario(scenario_name, ds)
-    noise_formula = "y ~ " + " + ".join(f"linear({c})" for c in ds["features"])
+    sigma_rhs = _sigma_feature_rhs(ds)
+    noise_formula = "y ~ " + (
+        " + ".join(f"linear({c})" for c in ds["features"]) if sigma_rhs != "1" else "1"
+    )
     cli_family = binomial_cli_family if family == "binomial" else "gaussian"
     binom_extra = list(binomial_extra_fit_args or [])
     base_df = pd.DataFrame(ds["rows"])
@@ -3650,23 +3653,13 @@ def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
     return f"{ds['target']} ~ " + " + ".join(terms)
 
 
-def _gamlss_linear_mu_formula_for_scenario(scenario_name: str, ds):
-    cfg = _rust_fit_mapping(scenario_name)
-    if cfg is None:
-        return None
-    if ds["family"] not in ("binomial", "gaussian"):
-        return None
+def _sigma_feature_rhs(ds: dict) -> str:
+    features = [str(c) for c in ds.get("features", [])]
+    return " + ".join(features) if features else "1"
 
-    terms = [str(c) for c in cfg.get("linear_cols", [])]
-    smooth_cols = cfg.get("smooth_cols")
-    if smooth_cols:
-        terms.extend(str(col) for col in smooth_cols)
-    elif cfg.get("smooth_col"):
-        terms.append(str(cfg["smooth_col"]))
 
-    if not terms:
-        return None
-    return f"{ds['target']} ~ " + " + ".join(terms)
+def _sigma_feature_formula(ds: dict) -> str:
+    return "~ " + _sigma_feature_rhs(ds)
 
 
 def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -3683,7 +3676,6 @@ def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fo
         folds = folds_for_dataset(ds)
 
     mu_formula = _gamlss_mu_formula_for_scenario(scenario_name, ds)
-    mu_formula_fallback = _gamlss_linear_mu_formula_for_scenario(scenario_name, ds)
     if not mu_formula:
         return None
 
@@ -3697,7 +3689,7 @@ def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fo
             "dataset": ds,
             "scenario_name": scenario_name,
             "mu_formula": mu_formula,
-            "mu_formula_fallback": mu_formula_fallback,
+            "sigma_formula": _sigma_feature_formula(ds),
         }
         data_path.write_text(json.dumps(payload))
 
@@ -3718,7 +3710,7 @@ payload <- fromJSON(data_path, simplifyVector = TRUE)
 df <- as.data.frame(payload$dataset$rows)
 target_name <- as.character(payload$dataset$target)
 mu_formula <- as.character(payload$mu_formula)
-mu_formula_fallback <- as.character(payload$mu_formula_fallback)
+sigma_formula <- as.formula(as.character(payload$sigma_formula))
 family_name <- as.character(payload$dataset$family)
 
 train_idx <- scan(train_idx_path, what=integer(), quiet=TRUE) + 1L
@@ -3740,11 +3732,10 @@ for (cn in feature_cols) {
 # Choose gamlss family based on dataset family.
 if (family_name == "gaussian") {
   gamlss_family <- NO()
-  sigma_formula <- as.formula(paste("~", paste(feature_cols, collapse=" + ")))
 } else {
   gamlss_family <- BI()
-  sigma_formula <- ~1
 }
+# Keep scale model aligned with Rust GAMLSS benchmark path.
 
 t0 <- proc.time()[["elapsed"]]
 fit_formula <- mu_formula
@@ -3758,46 +3749,12 @@ fit <- tryCatch(
   ),
   error = function(e) e
 )
-fit_error_primary <- NULL
-fit_error_fallback <- NULL
-if (inherits(fit, "error")) {
-  fit_error_primary <- conditionMessage(fit)
-  if (!is.na(mu_formula_fallback) && nzchar(mu_formula_fallback) && mu_formula_fallback != mu_formula) {
-    fit_formula <- mu_formula_fallback
-    fit <- tryCatch(
-      gamlss(
-        as.formula(fit_formula),
-        sigma.formula = sigma_formula,
-        family = gamlss_family,
-        data = train_df,
-        control = gamlss.control(n.cyc=200, trace=FALSE)
-      ),
-      error = function(e) e
-    )
-    if (inherits(fit, "error")) {
-      fit_error_fallback <- conditionMessage(fit)
-    }
-  }
-}
 fit_sec <- proc.time()[["elapsed"]] - t0
 
 if (inherits(fit, "error")) {
-  msg <- if (!is.null(fit_error_fallback)) {
-    paste0(
-      fit_error_primary,
-      " | fallback(",
-      mu_formula_fallback,
-      "): ",
-      fit_error_fallback
-    )
-  } else if (!is.null(fit_error_primary)) {
-    fit_error_primary
-  } else {
-    conditionMessage(fit)
-  }
   out <- list(
     status="failed",
-    error=paste0("r_gamlss fit failed: ", msg)
+    error=paste0("r_gamlss fit failed: ", conditionMessage(fit))
   )
   write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
   quit(save="no")
@@ -3881,7 +3838,7 @@ if (family_name == "gaussian") {
     rmse=NULL,
     mae=NULL,
     r2=NULL,
-    model_spec=paste0("gamlss(BI; sigma.formula=~1): ", fit_formula)
+    model_spec=paste0("gamlss(BI; sigma.formula=", deparse(sigma_formula), "): ", fit_formula)
   )
 }
 write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
@@ -4150,9 +4107,15 @@ if (family_name == "binomial") {
     model_spec=ftxt
   )
 } else {
-  p_train <- as.numeric(predict(fit, newdata=train_df, type="response"))
-  sigma_hat <- sqrt(mean((y_train - p_train)^2))
-  sigma_hat <- max(sigma_hat, 1e-12)
+  sigma_hat <- NA_real_
+  fit_scale <- tryCatch(as.numeric(summary(fit)$scale), error=function(e) NA_real_)
+  if (is.finite(fit_scale) && fit_scale > 0) {
+    sigma_hat <- sqrt(fit_scale)
+  } else {
+    p_train <- as.numeric(predict(fit, newdata=train_df, type="response"))
+    sigma_hat <- sqrt(mean((y_train - p_train)^2))
+  }
+  sigma_hat <- max(as.numeric(sigma_hat), 1e-12)
   rmse <- sqrt(mean((y_test - p)^2))
   mae <- mean(abs(y_test - p))
   sst <- sum((y_test - mean(y_test))^2)
@@ -4264,6 +4227,7 @@ def run_external_mgcv_gaulss_cv(scenario, *, ds: dict | None = None, folds: list
             "dataset": ds,
             "scenario_name": scenario["name"],
             "mu_formula": mu_formula,
+            "sigma_rhs": _sigma_feature_rhs(ds),
             "use_select": use_select,
         }
         data_path.write_text(json.dumps(payload))
@@ -4284,6 +4248,7 @@ payload <- fromJSON(data_path, simplifyVector = TRUE)
 df <- as.data.frame(payload$dataset$rows)
 target_name <- as.character(payload$dataset$target)
 mu_formula <- as.character(payload$mu_formula)
+sigma_rhs <- as.character(payload$sigma_rhs)
 use_select <- TRUE
 if (!is.null(payload$use_select)) {
   use_select <- isTRUE(payload$use_select)
@@ -4312,7 +4277,6 @@ if (length(rhs_parts) < 2) {
   quit(save="no")
 }
 mu_rhs <- trimws(rhs_parts[[2]])
-sigma_rhs <- if (length(feature_cols) == 0) "1" else paste(feature_cols, collapse=" + ")
 
 t0 <- proc.time()[["elapsed"]]
 fit <- tryCatch(
@@ -4688,8 +4652,7 @@ def _bamlss_formulas_for_scenario(scenario_name: str, ds):
     mu_formula = _mgcv_formula_for_scenario(scenario_name, ds)
     if not mu_formula:
         return None, None
-    sigma_terms = ds.get("features", [])
-    sigma_formula = "~ " + (" + ".join(sigma_terms) if sigma_terms else "1")
+    sigma_formula = _sigma_feature_formula(ds)
     return mu_formula, sigma_formula
 
 
