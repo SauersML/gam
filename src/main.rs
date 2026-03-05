@@ -211,85 +211,34 @@ struct PredictArgs {
     mode: PredictModeArg,
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Debug, Clone)]
 struct SurvivalArgs {
     data: PathBuf,
-    #[arg(long = "entry")]
     entry: String,
-    #[arg(long = "exit")]
     exit: String,
-    #[arg(long = "event")]
     event: String,
-    #[arg(long = "formula")]
     formula: String,
-    /// Net or crude risk target.
-    #[arg(long = "spec", default_value = "net")]
     spec: String,
-    /// Survival likelihood mode:
-    /// - transformation: Royston-Parmar log-cumulative-hazard with flexible time shape.
-    /// - weibull: parametric Royston-Parmar time shape.
-    /// - probit-location-scale: transformation-family on probit scale with time/location/log-sigma blocks.
-    #[arg(long = "survival-likelihood", default_value = "transformation")]
     survival_likelihood: String,
-    /// Residual distribution used by probit-location-scale transformation survival mode.
-    #[arg(long = "survival-distribution", default_value = "gaussian")]
     survival_distribution: String,
-    /// Optional inverse link override for probit-location-scale survival mode.
-    #[arg(long = "link")]
     link: Option<String>,
-    /// Optional comma-separated initial free logits for blended inverse links (length K-1).
-    #[arg(long = "mixture-rho")]
     mixture_rho: Option<String>,
-    /// Optional initial SAS params as `epsilon,log_delta` (used with `link=sas`).
-    #[arg(long = "sas-init")]
     sas_init: Option<String>,
-    /// Optional initial Beta-Logistic params as `epsilon,delta` (used with `link=beta-logistic`).
-    #[arg(long = "beta-logistic-init")]
     beta_logistic_init: Option<String>,
-    /// Enable learnable monotone wiggle on latent q for survival probit-location-scale.
-    #[arg(long = "learn-link-wiggle", default_value_t = false)]
     learn_link_wiggle: bool,
-    /// B-spline degree for survival link wiggle basis.
-    #[arg(long = "link-wiggle-degree", default_value_t = 3)]
     link_wiggle_degree: usize,
-    /// Number of internal knots for survival link wiggle basis.
-    #[arg(long = "link-wiggle-internal-knots", default_value_t = 7)]
     link_wiggle_internal_knots: usize,
-    /// Add ridge-style double penalty to survival link wiggle block.
-    #[arg(long = "link-wiggle-double-penalty", default_value_t = true)]
     link_wiggle_double_penalty: bool,
-    /// Optional anchor time for time-baseline identifiability in
-    /// survival-likelihood=probit-location-scale. If omitted, earliest entry time is used.
-    #[arg(long = "survival-time-anchor")]
     survival_time_anchor: Option<f64>,
-    /// Baseline target that penalties shrink toward in transformation mode.
-    #[arg(long = "baseline-target", default_value = "linear")]
     baseline_target: String,
-    /// Weibull baseline scale (>0) when baseline-target=weibull.
-    #[arg(long = "baseline-scale")]
     baseline_scale: Option<f64>,
-    /// Shape parameter used by Weibull or Gompertz baseline targets.
-    #[arg(long = "baseline-shape")]
     baseline_shape: Option<f64>,
-    /// Gompertz baseline rate (>0) when baseline-target=gompertz.
-    #[arg(long = "baseline-rate")]
     baseline_rate: Option<f64>,
-    /// Time basis for h(t) in transformation mode.
-    #[arg(long = "time-basis", default_value = "linear")]
     time_basis: String,
-    /// Spline degree for time-basis=bspline|ispline.
-    #[arg(long = "time-degree", default_value_t = 3)]
     time_degree: usize,
-    /// Number of internal knots for time-basis=bspline|ispline.
-    #[arg(long = "time-num-internal-knots", default_value_t = 8)]
     time_num_internal_knots: usize,
-    /// Smoothing lambda for the time bspline/ispline block.
-    #[arg(long = "time-smooth-lambda", default_value_t = 1e-2)]
     time_smooth_lambda: f64,
-    /// Additional ridge penalty applied to non-intercept coefficients.
-    #[arg(long = "ridge-lambda", default_value_t = 1e-6)]
     ridge_lambda: f64,
-    #[arg(long = "out")]
     out: Option<PathBuf>,
 }
 
@@ -576,10 +525,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         if let Some(components) = choice.mixture_components.as_ref() {
             let expected = components.len().saturating_sub(1);
             let initial_rho = if let Some(raw) = effective_mixture_rho.as_deref() {
-                let vals = parse_comma_f64(raw, "--mixture-rho")?;
+                let vals = parse_comma_f64(raw, "link(rho=...)")?;
                 if vals.len() != expected {
                     return Err(format!(
-                        "--mixture-rho length mismatch: expected {expected}, got {}",
+                        "link(rho=...) length mismatch: expected {expected}, got {}",
                         vals.len()
                     ));
                 }
@@ -593,26 +542,26 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             })
         } else {
             if effective_mixture_rho.is_some() {
-                return Err("--mixture-rho requires --link blended(...)/mixture(...)".to_string());
+                return Err("link(rho=...) requires link(type=blended(...)/mixture(...))".to_string());
             }
             None
         }
     } else {
         if effective_mixture_rho.is_some() {
-            return Err("--mixture-rho requires --link blended(...)/mixture(...)".to_string());
+            return Err("link(rho=...) requires link(type=blended(...)/mixture(...))".to_string());
         }
         None
     };
     let sas_link_spec = if let Some(choice) = link_choice.as_ref() {
         if choice.mixture_components.is_none() && choice.link == LinkFunction::Sas {
             if effective_beta_logistic_init.is_some() {
-                return Err("--beta-logistic-init requires --link beta-logistic".to_string());
+                return Err("link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string());
             }
             if let Some(raw) = effective_sas_init.as_deref() {
-                let vals = parse_comma_f64(raw, "--sas-init")?;
+                let vals = parse_comma_f64(raw, "link(sas_init=...)")?;
                 if vals.len() != 2 {
                     return Err(format!(
-                        "--sas-init expects two values: epsilon,log_delta (got {})",
+                        "link(sas_init=...) expects two values: epsilon,log_delta (got {})",
                         vals.len()
                     ));
                 }
@@ -628,13 +577,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             }
         } else if choice.mixture_components.is_none() && choice.link == LinkFunction::BetaLogistic {
             if effective_sas_init.is_some() {
-                return Err("--sas-init requires --link sas".to_string());
+                return Err("link(sas_init=...) requires link(type=sas)".to_string());
             }
             if let Some(raw) = effective_beta_logistic_init.as_deref() {
-                let vals = parse_comma_f64(raw, "--beta-logistic-init")?;
+                let vals = parse_comma_f64(raw, "link(beta_logistic_init=...)")?;
                 if vals.len() != 2 {
                     return Err(format!(
-                        "--beta-logistic-init expects two values: epsilon,delta (got {})",
+                        "link(beta_logistic_init=...) expects two values: epsilon,delta (got {})",
                         vals.len()
                     ));
                 }
@@ -650,19 +599,19 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             }
         } else {
             if effective_sas_init.is_some() {
-                return Err("--sas-init requires --link sas".to_string());
+                return Err("link(sas_init=...) requires link(type=sas)".to_string());
             }
             if effective_beta_logistic_init.is_some() {
-                return Err("--beta-logistic-init requires --link beta-logistic".to_string());
+                return Err("link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string());
             }
             None
         }
     } else {
         if effective_sas_init.is_some() {
-            return Err("--sas-init requires --link sas".to_string());
+            return Err("link(sas_init=...) requires link(type=sas)".to_string());
         }
         if effective_beta_logistic_init.is_some() {
-            return Err("--beta-logistic-init requires --link beta-logistic".to_string());
+            return Err("link(beta_logistic_init=...) requires link(type=beta-logistic)".to_string());
         }
         None
     };
@@ -672,12 +621,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if args.family == FamilyArg::Auto && link_choice.is_none() {
         if is_binary_response(y.view()) {
             inference_notes.push(format!(
-                "Inferred binomial-logit family for response '{}' because all values are binary {{0,1}}. Override with --family or --link.",
+                "Inferred binomial-logit family for response '{}' because all values are binary {{0,1}}. Override with --family or link(type=...).",
                 parsed.response
             ));
         } else {
             inference_notes.push(format!(
-                "Inferred gaussian-identity family for response '{}' because values are not strictly binary. Override with --family or --link.",
+                "Inferred gaussian-identity family for response '{}' because values are not strictly binary. Override with --family or link(type=...).",
                 parsed.response
             ));
         }
@@ -816,7 +765,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 let spec = mixture_link_spec
                     .as_ref()
                     .ok_or_else(|| {
-                        "binomial blended-inverse-link location-scale fitting requires --link blended(...)"
+                        "binomial blended-inverse-link location-scale fitting requires link(type=blended(...))"
                             .to_string()
                     })?
                     .clone();
@@ -826,7 +775,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             }
             LikelihoodFamily::BinomialSas => {
                 let spec = *sas_link_spec.as_ref().ok_or_else(|| {
-                    "binomial SAS location-scale fitting requires --link sas".to_string()
+                    "binomial SAS location-scale fitting requires link(type=sas)".to_string()
                 })?;
                 let state = state_from_sas_spec(spec)
                     .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
@@ -834,7 +783,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             }
             LikelihoodFamily::BinomialBetaLogistic => {
                 let spec = *sas_link_spec.as_ref().ok_or_else(|| {
-                    "binomial beta-logistic location-scale fitting requires --link beta-logistic"
+                    "binomial beta-logistic location-scale fitting requires link(type=beta-logistic)"
                         .to_string()
                 })?;
                 let state = state_from_beta_logistic_spec(spec)
