@@ -9,6 +9,7 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use ndarray::{Array1, Array2};
+use thiserror::Error;
 use wolfe_bfgs::{
     NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, ObjectiveRequest,
     ObjectiveSample,
@@ -258,6 +259,26 @@ pub struct CustomFamilyJointHyperResult {
     pub gradient: Array1<f64>,
     pub outer_hessian: Option<Array2<f64>>,
     pub warm_start: CustomFamilyWarmStart,
+}
+
+#[derive(Debug, Clone, Error)]
+pub enum CustomFamilyError {
+    #[error("custom-family invalid input: {0}")]
+    InvalidInput(String),
+    #[error("custom-family optimization error: {0}")]
+    Optimization(String),
+}
+
+impl From<String> for CustomFamilyError {
+    fn from(value: String) -> Self {
+        Self::InvalidInput(value)
+    }
+}
+
+impl From<CustomFamilyError> for String {
+    fn from(value: CustomFamilyError) -> Self {
+        value.to_string()
+    }
 }
 
 fn validate_block_specs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
@@ -2142,13 +2163,14 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     warm_start: Option<&CustomFamilyWarmStart>,
     need_hessian: bool,
-) -> Result<CustomFamilyJointHyperResult, String> {
+) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
         return Err(format!(
             "joint hyper derivative block count mismatch: got {}, expected {}",
             derivative_blocks.len(),
             specs.len()
-        ));
+        )
+        .into());
     }
 
     let penalty_counts = validate_block_specs(specs)?;
@@ -2161,7 +2183,8 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
             rho_dim + psi_dim,
             rho_dim,
             psi_dim
-        ));
+        )
+        .into());
     }
 
     let rho = theta.slice(ndarray::s![..rho_dim]).to_owned();
@@ -2419,7 +2442,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-) -> Result<BlockwiseFitResult, String> {
+) -> Result<BlockwiseFitResult, CustomFamilyError> {
     let penalty_counts = validate_block_specs(specs)?;
     let rho0 = flatten_log_lambdas(specs);
 
@@ -2604,14 +2627,16 @@ pub fn fit_custom_family<F: CustomFamily>(
                 return Err(format!(
                     "outer smoothing optimization failed: MaxIterationsReached.{details}",
                     details = last_eval_error()
-                ));
+                )
+                .into());
             }
         }
         Err(e) => {
             return Err(format!(
                 "outer smoothing optimization failed: {e:?}.{details}",
                 details = last_eval_error()
-            ));
+            )
+            .into());
         }
     };
 
@@ -3477,7 +3502,7 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            err.contains(
+            err.to_string().contains(
                 "last objective error: synthetic outer objective failure: block[0] evaluate()"
             ),
             "expected preserved root-cause context in error, got: {err}"

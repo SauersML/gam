@@ -1,6 +1,7 @@
 use gam::pirls::update_glm_vectors_by_family;
 use gam::probability::normal_cdf_approx;
-use gam::{FitOptions, GlmLikelihoodFamily, LikelihoodFamily, fit_gam, predict_gam};
+use gam::types::GlmLikelihoodFamily;
+use gam::{FitOptions, LikelihoodFamily, fit_gam, predict_gam};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

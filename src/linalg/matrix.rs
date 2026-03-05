@@ -142,11 +142,55 @@ pub enum DesignMatrix {
 }
 
 pub trait LinearOperator {
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64>;
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64>;
+    fn diag_xt_w_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
+    fn solve_system(
+        &self,
+        weights: &Array1<f64>,
+        rhs: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+    ) -> Result<Array1<f64>, String> {
+        if rhs.len() != self.ncols() {
+            return Err(format!(
+                "solve_system rhs dimension mismatch: rhs length {} != ncols {}",
+                rhs.len(),
+                self.ncols()
+            ));
+        }
+        let mut system = self.diag_xt_w_x(weights)?;
+        if let Some(pen) = penalty {
+            if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
+                return Err(format!(
+                    "solve_system penalty shape mismatch: got {}x{}, expected {}x{}",
+                    pen.nrows(),
+                    pen.ncols(),
+                    system.nrows(),
+                    system.ncols()
+                ));
+            }
+            system += pen;
+        }
+        use crate::faer_ndarray::FaerCholesky;
+        use faer::Side;
+        system
+            .cholesky(Side::Lower)
+            .map(|chol| chol.solve_vec(rhs))
+            .map_err(|_| "solve_system failed to factorize system".to_string())
+    }
+
+    // Backward-compatible aliases.
     fn nrows(&self) -> usize;
     fn ncols(&self) -> usize;
-    fn matvec(&self, vector: &Array1<f64>) -> Array1<f64>;
-    fn matvec_trans(&self, vector: &Array1<f64>) -> Array1<f64>;
-    fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
+    fn matvec(&self, vector: &Array1<f64>) -> Array1<f64> {
+        self.apply(vector)
+    }
+    fn matvec_trans(&self, vector: &Array1<f64>) -> Array1<f64> {
+        self.apply_transpose(vector)
+    }
+    fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        self.diag_xt_w_x(weights)
+    }
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String>;
     fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String>;
 }
@@ -166,7 +210,7 @@ impl LinearOperator for DesignMatrix {
         }
     }
 
-    fn matvec(&self, vector: &Array1<f64>) -> Array1<f64> {
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         match self {
             Self::Dense(matrix) => dense_matvec(matrix, vector),
             Self::Sparse(matrix) => {
@@ -188,7 +232,7 @@ impl LinearOperator for DesignMatrix {
         }
     }
 
-    fn matvec_trans(&self, vector: &Array1<f64>) -> Array1<f64> {
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
         match self {
             Self::Dense(matrix) => dense_transpose_matvec(matrix, vector),
             Self::Sparse(matrix) => {
@@ -211,7 +255,7 @@ impl LinearOperator for DesignMatrix {
         }
     }
 
-    fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+    fn diag_xt_w_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if weights.len() != self.nrows() {
             return Err(format!(
                 "compute_xtwx dimension mismatch: weights length {} != nrows {}",
@@ -375,16 +419,23 @@ impl DesignMatrix {
         }
     }
 
+    pub fn as_sparse(&self) -> Option<&SparseDesignMatrix> {
+        match self {
+            Self::Sparse(matrix) => Some(matrix),
+            Self::Dense(_) => None,
+        }
+    }
+
     pub fn matrix_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        <Self as LinearOperator>::matvec(self, vector)
+        <Self as LinearOperator>::apply(self, vector)
     }
 
     pub fn transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        <Self as LinearOperator>::matvec_trans(self, vector)
+        <Self as LinearOperator>::apply_transpose(self, vector)
     }
 
     pub fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        <Self as LinearOperator>::compute_xtwx(self, weights)
+        <Self as LinearOperator>::diag_xt_w_x(self, weights)
     }
 
     pub fn compute_xtwy(
@@ -397,6 +448,15 @@ impl DesignMatrix {
 
     pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
         <Self as LinearOperator>::quadratic_form_diag(self, middle)
+    }
+
+    pub fn solve_system(
+        &self,
+        weights: &Array1<f64>,
+        rhs: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+    ) -> Result<Array1<f64>, String> {
+        <Self as LinearOperator>::solve_system(self, weights, rhs, penalty)
     }
 }
 

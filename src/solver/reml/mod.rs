@@ -52,12 +52,7 @@ mod tests {
 
         let s_k = r_k.t().dot(&r_k);
         let mut h_k = s_k.mapv(|v| lambda_k * v);
-        let mut x_weighted = x.clone();
-        for i in 0..x_weighted.nrows() {
-            for j in 0..x_weighted.ncols() {
-                x_weighted[[i, j]] *= c_weighted_u_k[i];
-            }
-        }
+        let x_weighted = RemlState::row_scale(&x, &c_weighted_u_k);
         h_k += &fast_atb(&x, &x_weighted);
         let expected = w_pos.t().dot(&h_k).dot(&w_pos);
 
@@ -85,12 +80,7 @@ mod tests {
 
         let s_k = r_k.t().dot(&r_k);
         let mut h_kl = s_k.mapv(|v| lambda_k * v);
-        let mut x_weighted = x.clone();
-        for i in 0..x_weighted.nrows() {
-            for j in 0..x_weighted.ncols() {
-                x_weighted[[i, j]] *= diag_kl[i];
-            }
-        }
+        let x_weighted = RemlState::row_scale(&x, &diag_kl);
         h_kl += &fast_atb(&x, &x_weighted);
         let expected = RemlState::trace_product(&w_pos.dot(&w_pos.t()), &h_kl);
 
@@ -221,24 +211,12 @@ mod tests {
             &eta_dot,
         )
         .expect("directional working curvature should evaluate for logit");
-        let mut wx = x.clone();
-        let mut wx_tau = x_tau.clone();
-        for i in 0..x.nrows() {
-            let wi = pr.solve_weights[i];
-            for j in 0..x.ncols() {
-                wx[[i, j]] *= wi;
-                wx_tau[[i, j]] *= wi;
-            }
-        }
+        let wx = RemlState::row_scale(&x, &pr.solve_weights);
+        let wx_tau = RemlState::row_scale(&x_tau, &pr.solve_weights);
         let mut x_wtau_x = x.clone();
         match w_direction {
             super::DirectionalWorkingCurvature::Diagonal(diag) => {
-                for i in 0..x_wtau_x.nrows() {
-                    let wi = diag[i];
-                    for j in 0..x_wtau_x.ncols() {
-                        x_wtau_x[[i, j]] *= wi;
-                    }
-                }
+                x_wtau_x = RemlState::row_scale(&x_wtau_x, &diag);
             }
         }
         let mut h_tau_analytic = x_tau.t().dot(&wx);

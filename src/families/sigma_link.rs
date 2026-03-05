@@ -251,15 +251,13 @@ mod tests {
             assert!((d3_4 - d3_3).abs() < 1e-12);
 
             let d4_fd = (d3_at(eta + h) - d3_at(eta - h)) / (2.0 * h);
-            if d4_4.abs() > 1e-9 && d4_fd.abs() > 1e-9 {
-                assert_eq!(
-                    d4_4.signum(),
-                    d4_fd.signum(),
-                    "d4 sign mismatch at eta={eta}: got {d4_4}, fd {d4_fd}"
-                );
-            }
+            assert_eq!(
+                d4_4.signum(),
+                d4_fd.signum(),
+                "d4 sign mismatch at eta={eta}: got {d4_4}, fd {d4_fd}"
+            );
             assert!(
-                (d4_4 - d4_fd).abs() < 2e-4,
+                (d4_4 - d4_fd).abs() < 1e-4,
                 "d4 mismatch at eta={eta}: got {d4_4}, fd {d4_fd}"
             );
         }

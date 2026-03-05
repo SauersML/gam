@@ -776,25 +776,11 @@ impl<'a> RemlState<'a> {
         let d = &pirls_result.solve_d_array;
         let c_tau = d * &eta_tau;
         let mut weighted = Array2::<f64>::zeros(x_eval.raw_dim());
-        let mut h_tau = x_tau_t.t().dot(&{
-            let mut wx = x_eval.clone();
-            for i in 0..wx.nrows() {
-                let wi = pirls_result.solve_weights[i];
-                for j in 0..wx.ncols() {
-                    wx[[i, j]] *= wi;
-                }
-            }
-            wx
-        }) + x_eval.t().dot(&{
-            let mut wx_tau = x_tau_t.clone();
-            for i in 0..wx_tau.nrows() {
-                let wi = pirls_result.solve_weights[i];
-                for j in 0..wx_tau.ncols() {
-                    wx_tau[[i, j]] *= wi;
-                }
-            }
-            wx_tau
-        }) + Self::xt_diag_x_dense_into(&x_eval, &w_tau, &mut weighted)
+        let wx = Self::row_scale(&x_eval, &pirls_result.solve_weights);
+        let wx_tau = Self::row_scale(&x_tau_t, &pirls_result.solve_weights);
+        let mut h_tau = x_tau_t.t().dot(&wx)
+            + x_eval.t().dot(&wx_tau)
+            + Self::xt_diag_x_dense_into(&x_eval, &w_tau, &mut weighted)
             + &s_tau_total_t;
         if let Some(op) = firth_op.as_ref() {
             if x_tau_t.iter().any(|v| *v != 0.0) {
@@ -1756,15 +1742,8 @@ impl<'a> RemlState<'a> {
         //   D_{p,τ} = 2*fit_block and profiled_fit_term = D_{p,τ}/(2φ̂).
 
         let w = &pirls_result.solve_weights;
-        let mut wx = x_dense.clone();
-        let mut wx_psi = x_psi_t.clone();
-        for i in 0..wx.nrows() {
-            let wi = w[i];
-            for j in 0..wx.ncols() {
-                wx[[i, j]] *= wi;
-                wx_psi[[i, j]] *= wi;
-            }
-        }
+        let wx = Self::row_scale(&x_dense, w);
+        let wx_psi = Self::row_scale(&x_psi_t, w);
 
         let mut h_psi = x_psi_t.t().dot(&wx);
         h_psi += &x_dense.t().dot(&wx_psi);
@@ -1832,12 +1811,7 @@ impl<'a> RemlState<'a> {
                     // this derivative. Built-in links are diagonal in observation space,
                     // so the operator is represented by the per-row vector `w_direction`.
                     DirectionalWorkingCurvature::Diagonal(w_direction) => {
-                        for i in 0..x_wpsi.nrows() {
-                            let wpsi_i = w_direction[i];
-                            for j in 0..x_wpsi.ncols() {
-                                x_wpsi[[i, j]] *= wpsi_i;
-                            }
-                        }
+                        x_wpsi = Self::row_scale(&x_wpsi, w_direction);
                     }
                 }
                 // Exact total curvature derivative:

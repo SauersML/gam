@@ -1390,20 +1390,18 @@ impl<'a> RemlState<'a> {
         for (cov_point, beta_point) in point_results.into_iter().flatten() {
             mean_hinv += &cov_point.mapv(|v| w * v);
             mean_beta += &beta_point.mapv(|v| w * v);
-            for i in 0..p {
-                let bi = beta_point[i];
-                for j in 0..p {
-                    second_beta[[i, j]] += w * bi * beta_point[j];
-                }
-            }
+            let outer = beta_point
+                .view()
+                .insert_axis(ndarray::Axis(1))
+                .dot(&beta_point.view().insert_axis(ndarray::Axis(0)));
+            second_beta += &outer.mapv(|v| w * v);
         }
 
-        let mut var_beta = second_beta;
-        for i in 0..p {
-            for j in 0..p {
-                var_beta[[i, j]] -= mean_beta[i] * mean_beta[j];
-            }
-        }
+        let mean_outer = mean_beta
+            .view()
+            .insert_axis(ndarray::Axis(1))
+            .dot(&mean_beta.view().insert_axis(ndarray::Axis(0)));
+        let var_beta = second_beta - mean_outer;
 
         let mut total_cov = mean_hinv + var_beta;
         for i in 0..p {
