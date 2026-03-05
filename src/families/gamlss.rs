@@ -1231,7 +1231,12 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 *noise_beta_hint_cell.borrow_mut() = noise_beta_hint.clone();
                 Ok(fit)
             },
-            |theta, mean_spec_resolved, noise_spec_resolved, mean_design, noise_design, need_hessian| {
+            |theta,
+             mean_spec_resolved,
+             noise_spec_resolved,
+             mean_design,
+             noise_design,
+             need_hessian| {
                 let blocks = builder.build_blocks(
                     theta,
                     mean_design,
@@ -1848,12 +1853,7 @@ pub fn fit_binomial_location_scale_probit_terms_workflow(
             beta_wiggle,
         })
     } else {
-        let solved = fit_binomial_location_scale_probit_terms(
-            data,
-            spec,
-            options,
-            kappa_options,
-        )?;
+        let solved = fit_binomial_location_scale_probit_terms(data, spec, options, kappa_options)?;
         Ok(BinomialLocationScaleWorkflowResult {
             fit: solved,
             wiggle_knots: None,
@@ -1933,7 +1933,12 @@ fn binomial_neglog_q_derivatives_from_jet(
 }
 
 #[inline]
-fn binomial_neglog_q_derivatives_probit_closed_form(y: f64, weight: f64, q: f64, mu: f64) -> (f64, f64, f64) {
+fn binomial_neglog_q_derivatives_probit_closed_form(
+    y: f64,
+    weight: f64,
+    q: f64,
+    mu: f64,
+) -> (f64, f64, f64) {
     // Closed-form derivatives for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     // Uses canonical A/A_mu/A_mumu identities from the probit composition.
     let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
@@ -1945,12 +1950,18 @@ fn binomial_neglog_q_derivatives_probit_closed_form(y: f64, weight: f64, q: f64,
 
     let m1 = weight * a * phi;
     let m2 = weight * (a_mu * phi * phi - q * a * phi);
-    let m3 = weight * (a_mumu * phi * phi * phi - 3.0 * q * a_mu * phi * phi + (q * q - 1.0) * a * phi);
+    let m3 =
+        weight * (a_mumu * phi * phi * phi - 3.0 * q * a_mu * phi * phi + (q * q - 1.0) * a * phi);
     (m1, m2, m3)
 }
 
 #[inline]
-fn binomial_neglog_q_fourth_derivative_probit_closed_form(y: f64, weight: f64, q: f64, mu: f64) -> f64 {
+fn binomial_neglog_q_fourth_derivative_probit_closed_form(
+    y: f64,
+    weight: f64,
+    q: f64,
+    mu: f64,
+) -> f64 {
     // Closed-form m4 for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
     let nu = (1.0 - m).max(MIN_PROB);
@@ -1960,21 +1971,28 @@ fn binomial_neglog_q_fourth_derivative_probit_closed_form(y: f64, weight: f64, q
     let a_mumu = 2.0 * (1.0 - y) / (nu * nu * nu) - 2.0 * y / (m * m * m);
     let a_mumumu = 6.0 * (1.0 - y) / (nu * nu * nu * nu) + 6.0 * y / (m * m * m * m);
     weight
-        * (a_mumumu * phi.powi(4)
-            - 6.0 * q * a_mumu * phi.powi(3)
+        * (a_mumumu * phi.powi(4) - 6.0 * q * a_mumu * phi.powi(3)
             + (7.0 * q * q - 4.0) * a_mu * phi * phi
             - (q * q * q - 3.0 * q) * a * phi)
 }
 
 #[inline]
-fn binomial_fourth_from_jet(y: f64, weight: f64, mu: f64, d1: f64, d2: f64, d3: f64, d4: f64) -> f64 {
+fn binomial_fourth_from_jet(
+    y: f64,
+    weight: f64,
+    mu: f64,
+    d1: f64,
+    d2: f64,
+    d3: f64,
+    d4: f64,
+) -> f64 {
     let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
     let one_minus = (1.0 - m).max(MIN_PROB);
     let ell_mu = y / m - (1.0 - y) / one_minus;
     let ell_mumu = -y / (m * m) - (1.0 - y) / (one_minus * one_minus);
     let ell_mumum = 2.0 * y / (m * m * m) - 2.0 * (1.0 - y) / (one_minus * one_minus * one_minus);
-    let ell_mumumum =
-        -6.0 * y / (m * m * m * m) - 6.0 * (1.0 - y) / (one_minus * one_minus * one_minus * one_minus);
+    let ell_mumumum = -6.0 * y / (m * m * m * m)
+        - 6.0 * (1.0 - y) / (one_minus * one_minus * one_minus * one_minus);
     weight
         * (ell_mumumum * d1.powi(4)
             + 6.0 * ell_mumum * d1 * d1 * d2
@@ -2272,7 +2290,9 @@ fn second_directional_hessian_coeff_from_objective_q_terms(
     let d_qaqb_v = dq_a_v * q_b + q_a * dq_b_v;
     let d2_qaqb_uv = d2q_a_uv * q_b + dq_a_u * dq_b_v + dq_a_v * dq_b_u + q_a * d2q_b_uv;
     m4 * dq_u * dq_v * q_a * q_b
-        + m3 * (d2q_uv * q_a * q_b + dq_u * (d_qaqb_v + dq_v * q_ab) + dq_v * (d_qaqb_u + dq_u * q_ab))
+        + m3 * (d2q_uv * q_a * q_b
+            + dq_u * (d_qaqb_v + dq_v * q_ab)
+            + dq_v * (d_qaqb_u + dq_u * q_ab))
         + m2 * (d2_qaqb_uv + d2q_uv * q_ab + dq_u * dq_ab_v + dq_v * dq_ab_u)
         + m1 * d2q_ab_uv
 }
@@ -2798,10 +2818,7 @@ fn gaussian_two_block_weight_jets(
 
     let ll_a = uv_sub(uv_scale(uv_mul(r2, inv_sigma4), 3.0), inv_sigma2);
     let ll_b = uv_sub(inv_sigma, uv_mul(r2, inv_sigma3));
-    let w_ll = uv_scale(
-        uv_add(uv_mul(ll_a, sigma_1_sq), uv_mul(ll_b, sigma_2)),
-        w_i,
-    );
+    let w_ll = uv_scale(uv_add(uv_mul(ll_a, sigma_1_sq), uv_mul(ll_b, sigma_2)), w_i);
 
     (w_tt, w_tl, w_ll)
 }
@@ -4114,14 +4131,14 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let s3 = s2 * s_safe;
             let s4 = s3 * s_safe;
             let s5 = s4 * s_safe;
-            let q_tl_ls_ls = d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i] * ds[i] * ds[i] / s4;
+            let q_tl_ls_ls =
+                d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i] * ds[i] * ds[i] / s4;
             // q_tl_ls_ls_ls is ∂^4 q /(∂eta_t ∂eta_ls^3) = -a''''
             // when q=-eta_t a(eta_ls), written directly via sigma derivatives.
-            let q_tl_ls_ls_ls = d4s[i] / s2
-                - 8.0 * ds[i] * d3s[i] / s3
-                - 6.0 * d2s[i] * d2s[i] / s3
-                + 36.0 * ds[i] * ds[i] * d2s[i] / s4
-                - 24.0 * ds[i] * ds[i] * ds[i] * ds[i] / s5;
+            let q_tl_ls_ls_ls =
+                d4s[i] / s2 - 8.0 * ds[i] * d3s[i] / s3 - 6.0 * d2s[i] * d2s[i] / s3
+                    + 36.0 * ds[i] * ds[i] * d2s[i] / s4
+                    - 24.0 * ds[i] * ds[i] * ds[i] * ds[i] / s5;
             // q_ll_ls_ls = ∂^4 q / ∂eta_ls^4.
             let q_ll_ls_ls = eta_t[i] * q_tl_ls_ls_ls;
 
@@ -4131,8 +4148,8 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let d2q_ls_uv =
                 q.q_tl_ls * (u_ls_i * v_t_i + v_ls_i * u_t_i) + q.q_ll_ls * u_ls_i * v_ls_i;
             let d2q_tl_uv = q_tl_ls_ls * u_ls_i * v_ls_i;
-            let d2q_ll_uv = q_tl_ls_ls * (u_t_i * v_ls_i + v_t_i * u_ls_i)
-                + q_ll_ls_ls * u_ls_i * v_ls_i;
+            let d2q_ll_uv =
+                q_tl_ls_ls * (u_t_i * v_ls_i + v_t_i * u_ls_i) + q_ll_ls_ls * u_ls_i * v_ls_i;
 
             // Build a=q_a q_b and its directional variations for (a,b)=(t,t):
             //   a_tt    = q_t^2,
@@ -4144,8 +4161,21 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let a_tt_uv = 2.0 * (dq_t_u * dq_t_v + q.q_t * d2q_t_uv);
             // For (tt), b=q_tt=0 so Db and D²b vanish.
             let coeff_tt = second_delta_newton_weight_from_q_terms(
-                score_q, curvature_q, third_q, fourth_q, q.q_tt, dq_u, dq_v, d2q_uv, a_tt, a_tt_u,
-                a_tt_v, a_tt_uv, 0.0, 0.0, 0.0,
+                score_q,
+                curvature_q,
+                third_q,
+                fourth_q,
+                q.q_tt,
+                dq_u,
+                dq_v,
+                d2q_uv,
+                a_tt,
+                a_tt_u,
+                a_tt_v,
+                a_tt_uv,
+                0.0,
+                0.0,
+                0.0,
             );
 
             // (t,ls) block:
@@ -4156,10 +4186,8 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let a_tl = q.q_t * q.q_ls;
             let a_tl_u = dq_t_u * q.q_ls + q.q_t * dq_ls_u;
             let a_tl_v = dq_t_v * q.q_ls + q.q_t * dq_ls_v;
-            let a_tl_uv = d2q_t_uv * q.q_ls
-                + dq_t_u * dq_ls_v
-                + dq_t_v * dq_ls_u
-                + q.q_t * d2q_ls_uv;
+            let a_tl_uv =
+                d2q_t_uv * q.q_ls + dq_t_u * dq_ls_v + dq_t_v * dq_ls_u + q.q_t * d2q_ls_uv;
             let coeff_tl = second_delta_newton_weight_from_q_terms(
                 score_q,
                 curvature_q,
@@ -4648,19 +4676,13 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let mut d_beta_flat = Array1::<f64>::zeros(total);
         match block_idx {
             Self::BLOCK_T => {
-                d_beta_flat
-                    .slice_mut(s![0..pt])
-                    .assign(d_beta);
+                d_beta_flat.slice_mut(s![0..pt]).assign(d_beta);
             }
             Self::BLOCK_LOG_SIGMA => {
-                d_beta_flat
-                    .slice_mut(s![pt..pt + pls])
-                    .assign(d_beta);
+                d_beta_flat.slice_mut(s![pt..pt + pls]).assign(d_beta);
             }
             Self::BLOCK_WIGGLE => {
-                d_beta_flat
-                    .slice_mut(s![pt + pls..])
-                    .assign(d_beta);
+                d_beta_flat.slice_mut(s![pt + pls..]).assign(d_beta);
             }
             _ => {}
         }
@@ -4745,10 +4767,13 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             self.sigma_max,
         )?;
         let b0 = self.wiggle_design(core0.q0.view())?;
-        let d0 = self.wiggle_basis_with_options(core0.q0.view(), BasisOptions::first_derivative())?;
+        let d0 =
+            self.wiggle_basis_with_options(core0.q0.view(), BasisOptions::first_derivative())?;
         let dd0 =
             self.wiggle_basis_with_options(core0.q0.view(), BasisOptions::second_derivative())?;
-        if b0.ncols() != beta_w0.len() || d0.ncols() != beta_w0.len() || dd0.ncols() != beta_w0.len()
+        if b0.ncols() != beta_w0.len()
+            || d0.ncols() != beta_w0.len()
+            || dd0.ncols() != beta_w0.len()
         {
             return Err(format!(
                 "wiggle basis/beta mismatch in exact joint Hessian: B={} B'={} B''={} beta_w={}",
@@ -4767,18 +4792,24 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let mut h = Array2::<f64>::zeros((total, total));
         for i in 0..n {
             let q_i = core0.q0[i] + eta_w[i];
-            let (m1, m2, _m3) = if matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
-                binomial_neglog_q_derivatives_probit_closed_form(self.y[i], self.weights[i], q_i, core0.mu[i])
-            } else {
-                binomial_neglog_q_derivatives_from_jet(
-                    self.y[i],
-                    self.weights[i],
-                    core0.mu[i],
-                    core0.dmu_dq[i],
-                    core0.d2mu_dq2[i],
-                    core0.d3mu_dq3[i],
-                )
-            };
+            let (m1, m2, _m3) =
+                if matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+                    binomial_neglog_q_derivatives_probit_closed_form(
+                        self.y[i],
+                        self.weights[i],
+                        q_i,
+                        core0.mu[i],
+                    )
+                } else {
+                    binomial_neglog_q_derivatives_from_jet(
+                        self.y[i],
+                        self.weights[i],
+                        core0.mu[i],
+                        core0.dmu_dq[i],
+                        core0.d2mu_dq2[i],
+                        core0.d3mu_dq3[i],
+                    )
+                };
             let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i], ds[i], d2s[i], d3s[i]);
 
             let q_t = m[i] * q0.q_t;
@@ -4956,7 +4987,8 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let d_eta_t = x_t.dot(&u_t);
         let d_eta_ls = x_ls.dot(&u_ls);
 
-        let d0 = self.wiggle_basis_with_options(core0.q0.view(), BasisOptions::first_derivative())?;
+        let d0 =
+            self.wiggle_basis_with_options(core0.q0.view(), BasisOptions::first_derivative())?;
         let dd0 =
             self.wiggle_basis_with_options(core0.q0.view(), BasisOptions::second_derivative())?;
         let d3q = self.wiggle_d3q_dq03(core0.q0.view(), beta_w0.view())?;
@@ -4977,18 +5009,24 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let mut d_h = Array2::<f64>::zeros((total, total));
         for i in 0..n {
             let q_i = core0.q0[i] + eta_w[i];
-            let (m1, m2, m3) = if matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
-                binomial_neglog_q_derivatives_probit_closed_form(self.y[i], self.weights[i], q_i, core0.mu[i])
-            } else {
-                binomial_neglog_q_derivatives_from_jet(
-                    self.y[i],
-                    self.weights[i],
-                    core0.mu[i],
-                    core0.dmu_dq[i],
-                    core0.d2mu_dq2[i],
-                    core0.d3mu_dq3[i],
-                )
-            };
+            let (m1, m2, m3) =
+                if matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+                    binomial_neglog_q_derivatives_probit_closed_form(
+                        self.y[i],
+                        self.weights[i],
+                        q_i,
+                        core0.mu[i],
+                    )
+                } else {
+                    binomial_neglog_q_derivatives_from_jet(
+                        self.y[i],
+                        self.weights[i],
+                        core0.mu[i],
+                        core0.dmu_dq[i],
+                        core0.d2mu_dq2[i],
+                        core0.d3mu_dq3[i],
+                    )
+                };
             let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i], ds[i], d2s[i], d3s[i]);
             let dq0 = nonwiggle_q_directional(q0, d_eta_t[i], d_eta_ls[i]);
 
@@ -5012,8 +5050,7 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
 
             let delta_q_t = delta_m * q0.q_t + m[i] * dq0.delta_q_t;
             let delta_q_ls = delta_m * q0.q_ls + m[i] * dq0.delta_q_ls;
-            let delta_q_tt =
-                delta_g2 * q0.q_t * q0.q_t + g2[i] * 2.0 * q0.q_t * dq0.delta_q_t;
+            let delta_q_tt = delta_g2 * q0.q_t * q0.q_t + g2[i] * 2.0 * q0.q_t * dq0.delta_q_t;
             let delta_q_tl = delta_g2 * q0.q_t * q0.q_ls
                 + g2[i] * (dq0.delta_q_t * q0.q_ls + q0.q_t * dq0.delta_q_ls)
                 + delta_m * q0.q_tl
@@ -5158,7 +5195,8 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             self.sigma_max,
         )?;
         let b0 = self.wiggle_design(core0.q0.view())?;
-        let d0 = self.wiggle_basis_with_options(core0.q0.view(), BasisOptions::first_derivative())?;
+        let d0 =
+            self.wiggle_basis_with_options(core0.q0.view(), BasisOptions::first_derivative())?;
         let dd0 =
             self.wiggle_basis_with_options(core0.q0.view(), BasisOptions::second_derivative())?;
         let d3_basis = self.wiggle_d3basis_constrained(core0.q0.view())?;
@@ -5231,11 +5269,10 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             let s5 = s4 * s_safe;
             let q0_tl_ls_ls =
                 d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i] * ds[i] * ds[i] / s4;
-            let q0_tl_ls_ls_ls = d4s[i] / s2
-                - 8.0 * ds[i] * d3s[i] / s3
-                - 6.0 * d2s[i] * d2s[i] / s3
-                + 36.0 * ds[i] * ds[i] * d2s[i] / s4
-                - 24.0 * ds[i] * ds[i] * ds[i] * ds[i] / s5;
+            let q0_tl_ls_ls_ls =
+                d4s[i] / s2 - 8.0 * ds[i] * d3s[i] / s3 - 6.0 * d2s[i] * d2s[i] / s3
+                    + 36.0 * ds[i] * ds[i] * d2s[i] / s4
+                    - 24.0 * ds[i] * ds[i] * ds[i] * ds[i] / s5;
             let q0_ll_ls_ls = eta_t[i] * q0_tl_ls_ls_ls;
 
             let u_t_i = d_eta_t_u[i];
@@ -5261,8 +5298,8 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             let d2q0_ls_uv =
                 q0.q_tl_ls * (u_ls_i * v_t_i + v_ls_i * u_t_i) + q0.q_ll_ls * u_ls_i * v_ls_i;
             let d2q0_tl_uv = q0_tl_ls_ls * u_ls_i * v_ls_i;
-            let d2q0_ll_uv = q0_tl_ls_ls * (u_t_i * v_ls_i + v_t_i * u_ls_i)
-                + q0_ll_ls_ls * u_ls_i * v_ls_i;
+            let d2q0_ll_uv =
+                q0_tl_ls_ls * (u_t_i * v_ls_i + v_t_i * u_ls_i) + q0_ll_ls_ls * u_ls_i * v_ls_i;
 
             let br = b0.row(i);
             let dr = d0.row(i);
@@ -5285,12 +5322,10 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             //   d2g2[u,v]=g4*dq0[u]dq0[v] + g3*d2q0[u,v] + (B'''·v_w)dq0[u] + (B'''·u_w)dq0[v].
             let dm_u = b1_u + g2[i] * dq0_u;
             let dm_v = b1_v + g2[i] * dq0_v;
-            let d2m_uv =
-                g3[i] * dq0_u * dq0_v + g2[i] * d2q0_uv + b2_v * dq0_u + b2_u * dq0_v;
+            let d2m_uv = g3[i] * dq0_u * dq0_v + g2[i] * d2q0_uv + b2_v * dq0_u + b2_u * dq0_v;
             let dg2_u = b2_u + g3[i] * dq0_u;
             let dg2_v = b2_v + g3[i] * dq0_v;
-            let d2g2_uv =
-                g4[i] * dq0_u * dq0_v + g3[i] * d2q0_uv + b3_v * dq0_u + b3_u * dq0_v;
+            let d2g2_uv = g4[i] * dq0_u * dq0_v + g3[i] * d2q0_uv + b3_v * dq0_u + b3_u * dq0_v;
 
             // First/second directional terms for total q.
             let dq_u = m[i] * dq0_u + b_u;
@@ -5362,8 +5397,8 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
 
             // Exact second directional coefficients for the scalar block weights.
             let coeff_tt = second_directional_hessian_coeff_from_objective_q_terms(
-                m1, m2, m3, m4, dq_u, dq_v, d2q_uv, q_t, q_t, q_tt, dq_t_u, dq_t_v, dq_t_u,
-                dq_t_v, d2q_t_uv, d2q_t_uv, dq_tt_u, dq_tt_v, d2q_tt_uv,
+                m1, m2, m3, m4, dq_u, dq_v, d2q_uv, q_t, q_t, q_tt, dq_t_u, dq_t_v, dq_t_u, dq_t_v,
+                d2q_t_uv, d2q_t_uv, dq_tt_u, dq_tt_v, d2q_tt_uv,
             );
             let coeff_tl = second_directional_hessian_coeff_from_objective_q_terms(
                 m1, m2, m3, m4, dq_u, dq_v, d2q_uv, q_t, q_ls, q_tl, dq_t_u, dq_t_v, dq_ls_u,
@@ -5415,8 +5450,8 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
                     dq_w_v, d2q_t_uv, d2q_w_uv, dq_tw_u, dq_tw_v, d2q_tw_uv,
                 );
                 let coeff_lw = second_directional_hessian_coeff_from_objective_q_terms(
-                    m1, m2, m3, m4, dq_u, dq_v, d2q_uv, q_ls, q_w, q_lw, dq_ls_u, dq_ls_v,
-                    dq_w_u, dq_w_v, d2q_ls_uv, d2q_w_uv, dq_lw_u, dq_lw_v, d2q_lw_uv,
+                    m1, m2, m3, m4, dq_u, dq_v, d2q_uv, q_ls, q_w, q_lw, dq_ls_u, dq_ls_v, dq_w_u,
+                    dq_w_v, d2q_ls_uv, d2q_w_uv, dq_lw_u, dq_lw_v, d2q_lw_uv,
                 );
 
                 for a_idx in 0..pt {

@@ -1047,10 +1047,20 @@ pub struct WorkingModelPirlsResult {
 //     dV/dρ_k = 0.5 λ_k βᵀ S_k β + 0.5 λ_k tr(H^{-1} S_k) - 0.5 det1[k].
 const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 
+enum WorkingCoordinateDesign {
+    OriginalSparseNative,
+    TransformedExplicit {
+        x_transformed: DesignMatrix,
+        x_csr: Option<SparseRowMat<usize, f64>>,
+    },
+    TransformedImplicit {
+        qs: Array2<f64>,
+    },
+}
+
 struct GamWorkingModel<'a> {
-    x_transformed: Option<DesignMatrix>,
     x_original: DesignMatrix,
-    coordinate_frame: PirlsCoordinateFrame,
+    coordinate_design: WorkingCoordinateDesign,
     offset: Array1<f64>,
     y: ArrayView1<'a, f64>,
     prior_weights: ArrayView1<'a, f64>,
@@ -1058,8 +1068,7 @@ struct GamWorkingModel<'a> {
     e_transformed: Array2<f64>,
     workspace: PirlsWorkspace,
     likelihood: LikelihoodFamily,
-    mixture_link_state: Option<MixtureLinkState>,
-    sas_link_state: Option<SasLinkState>,
+    link_kind: InverseLink,
     firth_bias_reduction: bool,
     firth_log_det: Option<f64>,
     last_mu: Array1<f64>,
@@ -1071,9 +1080,7 @@ struct GamWorkingModel<'a> {
     last_d2mu_deta2: Array1<f64>,
     last_d3mu_deta3: Array1<f64>,
     last_penalty_term: f64,
-    x_csr: Option<SparseRowMat<usize, f64>>,
     x_original_csr: Option<SparseRowMat<usize, f64>>,
-    qs: Option<Array2<f64>>,
     /// Optional per-observation SE for integrated (GHQ) likelihood.
     /// When present, uses integrated family-dispatched working updates.
     covariate_se: Option<Array1<f64>>,
@@ -1108,39 +1115,47 @@ impl<'a> GamWorkingModel<'a> {
         s_transformed: Array2<f64>,
         e_transformed: Array2<f64>,
         workspace: PirlsWorkspace,
-        link: LinkFunction,
-        mixture_link_state: Option<MixtureLinkState>,
-        sas_link_state: Option<SasLinkState>,
+        link_kind: InverseLink,
         firth_bias_reduction: bool,
         qs: Option<Array2<f64>>,
         quad_ctx: crate::quadrature::QuadratureContext,
     ) -> Self {
-        let n = if let Some(x_transformed) = &x_transformed {
-            x_transformed.nrows()
-        } else {
-            x_original.nrows()
-        };
-        let x_csr = x_transformed
-            .as_ref()
-            .and_then(|matrix| matrix.to_csr_cache());
-        let x_original_csr = x_original.to_csr_cache();
-        let likelihood = if mixture_link_state.is_some() {
-            LikelihoodFamily::BinomialMixture
-        } else if sas_link_state.is_some()
-            || matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic)
-        {
-            if matches!(link, LinkFunction::BetaLogistic) {
-                LikelihoodFamily::BinomialBetaLogistic
-            } else {
-                LikelihoodFamily::BinomialSas
+        let coordinate_design = match coordinate_frame {
+            PirlsCoordinateFrame::OriginalSparseNative => {
+                WorkingCoordinateDesign::OriginalSparseNative
             }
-        } else {
-            likelihood_from_link(link)
+            PirlsCoordinateFrame::TransformedQs => {
+                if let Some(x_transformed) = x_transformed {
+                    WorkingCoordinateDesign::TransformedExplicit {
+                        x_csr: x_transformed.to_csr_cache(),
+                        x_transformed,
+                    }
+                } else {
+                    WorkingCoordinateDesign::TransformedImplicit {
+                        qs: qs.expect(
+                            "TransformedQs PIRLS coordinate frame requires either x_transformed or qs",
+                        ),
+                    }
+                }
+            }
+        };
+        let x_original_csr = x_original.to_csr_cache();
+        let n = match &coordinate_design {
+            WorkingCoordinateDesign::OriginalSparseNative => x_original.nrows(),
+            WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
+                x_transformed.nrows()
+            }
+            WorkingCoordinateDesign::TransformedImplicit { .. } => x_original.nrows(),
+        };
+        let likelihood = match &link_kind {
+            InverseLink::Standard(link) => likelihood_from_link(*link),
+            InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
+            InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
+            InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
         };
         GamWorkingModel {
-            x_transformed,
             x_original,
-            coordinate_frame,
+            coordinate_design,
             offset: offset.to_owned(),
             y,
             prior_weights,
@@ -1148,8 +1163,7 @@ impl<'a> GamWorkingModel<'a> {
             e_transformed,
             workspace,
             likelihood,
-            mixture_link_state,
-            sas_link_state,
+            link_kind,
             firth_bias_reduction,
             firth_log_det: None,
             last_mu: Array1::zeros(n),
@@ -1161,9 +1175,7 @@ impl<'a> GamWorkingModel<'a> {
             last_d2mu_deta2: Array1::zeros(n),
             last_d3mu_deta3: Array1::zeros(n),
             last_penalty_term: 0.0,
-            x_csr,
             x_original_csr,
-            qs,
             covariate_se: None,
             quad_ctx,
         }
@@ -1177,10 +1189,22 @@ impl<'a> GamWorkingModel<'a> {
     }
 
     fn into_final_state(self) -> GamModelFinalState {
+        let (x_transformed, coordinate_frame) = match &self.coordinate_design {
+            WorkingCoordinateDesign::OriginalSparseNative => {
+                (None, PirlsCoordinateFrame::OriginalSparseNative)
+            }
+            WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => (
+                Some(x_transformed.clone()),
+                PirlsCoordinateFrame::TransformedQs,
+            ),
+            WorkingCoordinateDesign::TransformedImplicit { .. } => {
+                (None, PirlsCoordinateFrame::TransformedQs)
+            }
+        };
         GamModelFinalState {
-            x_transformed: self.x_transformed,
+            x_transformed,
             x_active: self.x_original,
-            coordinate_frame: self.coordinate_frame,
+            coordinate_frame,
             e_transformed: self.e_transformed,
             final_mu: self.last_mu,
             final_weights: self.last_weights,
@@ -1196,33 +1220,33 @@ impl<'a> GamWorkingModel<'a> {
     }
 
     fn transformed_matvec(&self, beta: &Coefficients) -> Array1<f64> {
-        if matches!(
-            self.coordinate_frame,
-            PirlsCoordinateFrame::OriginalSparseNative
-        ) {
-            return self.x_original.matrix_vector_multiply(beta);
+        match &self.coordinate_design {
+            WorkingCoordinateDesign::OriginalSparseNative => {
+                self.x_original.matrix_vector_multiply(beta)
+            }
+            WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
+                x_transformed.matrix_vector_multiply(beta)
+            }
+            WorkingCoordinateDesign::TransformedImplicit { qs } => {
+                let beta_orig = qs.dot(beta.as_ref());
+                self.x_original.matrix_vector_multiply(&beta_orig)
+            }
         }
-        if let Some(x_transformed) = &self.x_transformed {
-            return x_transformed.matrix_vector_multiply(beta);
-        }
-        let qs = self.qs.as_ref().expect("qs required for implicit design");
-        let beta_orig = qs.dot(beta.as_ref());
-        self.x_original.matrix_vector_multiply(&beta_orig)
     }
 
     fn transformed_transpose_matvec(&self, vec: &Array1<f64>) -> Array1<f64> {
-        if matches!(
-            self.coordinate_frame,
-            PirlsCoordinateFrame::OriginalSparseNative
-        ) {
-            return self.x_original.transpose_vector_multiply(vec);
+        match &self.coordinate_design {
+            WorkingCoordinateDesign::OriginalSparseNative => {
+                self.x_original.transpose_vector_multiply(vec)
+            }
+            WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
+                x_transformed.transpose_vector_multiply(vec)
+            }
+            WorkingCoordinateDesign::TransformedImplicit { qs } => {
+                let xtv = self.x_original.transpose_vector_multiply(vec);
+                qs.t().dot(&xtv)
+            }
         }
-        if let Some(x_transformed) = &self.x_transformed {
-            return x_transformed.transpose_vector_multiply(vec);
-        }
-        let qs = self.qs.as_ref().expect("qs required for implicit design");
-        let xtv = self.x_original.transpose_vector_multiply(vec);
-        qs.t().dot(&xtv)
     }
 
     fn compute_xtwx_for_design(
@@ -1258,19 +1282,37 @@ impl<'a> GamWorkingModel<'a> {
     }
 
     fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
-        if let Some(x_transformed) = self.x_transformed.clone() {
-            let x_csr = self.x_csr.clone();
-            let xtwx = self.compute_xtwx_for_design(&x_transformed, weights, x_csr.as_ref())?;
-            return Ok(xtwx + &self.s_transformed);
+        match &self.coordinate_design {
+            WorkingCoordinateDesign::TransformedExplicit {
+                x_transformed,
+                x_csr,
+            } => {
+                let x_transformed_owned = x_transformed.clone();
+                let x_csr_owned = x_csr.clone();
+                let xtwx = self.compute_xtwx_for_design(
+                    &x_transformed_owned,
+                    weights,
+                    x_csr_owned.as_ref(),
+                )?;
+                Ok(xtwx + &self.s_transformed)
+            }
+            WorkingCoordinateDesign::TransformedImplicit { qs } => {
+                let qs_owned = qs.clone();
+                let x_original = self.x_original.clone();
+                let x_original_csr = self.x_original_csr.clone();
+                let xtwx =
+                    self.compute_xtwx_for_design(&x_original, weights, x_original_csr.as_ref())?;
+                let tmp = crate::faer_ndarray::fast_atb(&qs_owned, &xtwx);
+                Ok(fast_ab(&tmp, &qs_owned) + &self.s_transformed)
+            }
+            WorkingCoordinateDesign::OriginalSparseNative => {
+                let x_original = self.x_original.clone();
+                let x_original_csr = self.x_original_csr.clone();
+                let xtwx =
+                    self.compute_xtwx_for_design(&x_original, weights, x_original_csr.as_ref())?;
+                Ok(xtwx + &self.s_transformed)
+            }
         }
-
-        let x_original = self.x_original.clone();
-        let x_original_csr = self.x_original_csr.clone();
-        let xtwx = self.compute_xtwx_for_design(&x_original, weights, x_original_csr.as_ref())?;
-
-        let qs = self.qs.as_ref().expect("qs required for implicit design");
-        let tmp = crate::faer_ndarray::fast_atb(qs, &xtwx);
-        Ok(fast_ab(&tmp, qs) + &self.s_transformed)
     }
 
     fn sparse_penalized_hessian(
@@ -1309,68 +1351,24 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             quad_ctx: &self.quad_ctx,
             se: se.view(),
         });
-        if let Some(mixture_state) = self.mixture_link_state.as_ref() {
-            if integrated.is_some() {
-                return Err(EstimationError::InvalidInput(
-                    "integrated binomial updates are not yet supported for mixture links"
-                        .to_string(),
-                ));
-            }
-            update_glm_vectors(
-                self.y,
-                &self.workspace.eta_buf,
-                LinkFunction::Logit,
-                self.prior_weights,
-                &mut self.last_mu,
-                &mut self.last_weights,
-                &mut self.last_z,
-                Some(mixture_state),
-                None,
-                Some(WorkingDerivativeBuffersMut {
-                    c: &mut self.last_c,
-                    d: &mut self.last_d,
-                    dmu_deta: &mut self.last_dmu_deta,
-                    d2mu_deta2: &mut self.last_d2mu_deta2,
-                    d3mu_deta3: &mut self.last_d3mu_deta3,
-                }),
-            )?;
-        } else if let Some(sas_state) = self.sas_link_state.as_ref() {
-            if let Some(integ) = integrated {
-                update_glm_vectors_integrated_by_family(
-                    integ.quad_ctx,
-                    self.y,
-                    &self.workspace.eta_buf,
-                    integ.se,
-                    self.likelihood,
-                    self.prior_weights,
-                    &mut self.last_mu,
-                    &mut self.last_weights,
-                    &mut self.last_z,
-                    Some(WorkingDerivativeBuffersMut {
-                        c: &mut self.last_c,
-                        d: &mut self.last_d,
-                        dmu_deta: &mut self.last_dmu_deta,
-                        d2mu_deta2: &mut self.last_d2mu_deta2,
-                        d3mu_deta3: &mut self.last_d3mu_deta3,
-                    }),
-                    None,
-                    Some(sas_state),
-                )?;
-            } else {
+        match &self.link_kind {
+            InverseLink::Mixture(mixture_state) => {
+                if integrated.is_some() {
+                    return Err(EstimationError::InvalidInput(
+                        "integrated binomial updates are not yet supported for mixture links"
+                            .to_string(),
+                    ));
+                }
                 update_glm_vectors(
                     self.y,
                     &self.workspace.eta_buf,
-                    if matches!(self.likelihood, LikelihoodFamily::BinomialBetaLogistic) {
-                        LinkFunction::BetaLogistic
-                    } else {
-                        LinkFunction::Sas
-                    },
+                    LinkFunction::Logit,
                     self.prior_weights,
                     &mut self.last_mu,
                     &mut self.last_weights,
                     &mut self.last_z,
+                    Some(mixture_state),
                     None,
-                    Some(sas_state),
                     Some(WorkingDerivativeBuffersMut {
                         c: &mut self.last_c,
                         d: &mut self.last_d,
@@ -1380,23 +1378,71 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     }),
                 )?;
             }
-        } else {
-            self.likelihood.irls_update(
-                self.y,
-                &self.workspace.eta_buf,
-                self.prior_weights,
-                &mut self.last_mu,
-                &mut self.last_weights,
-                &mut self.last_z,
-                integrated,
-                Some(WorkingDerivativeBuffersMut {
-                    c: &mut self.last_c,
-                    d: &mut self.last_d,
-                    dmu_deta: &mut self.last_dmu_deta,
-                    d2mu_deta2: &mut self.last_d2mu_deta2,
-                    d3mu_deta3: &mut self.last_d3mu_deta3,
-                }),
-            )?;
+            InverseLink::Sas(sas_state) | InverseLink::BetaLogistic(sas_state) => {
+                if let Some(integ) = integrated {
+                    update_glm_vectors_integrated_by_family(
+                        integ.quad_ctx,
+                        self.y,
+                        &self.workspace.eta_buf,
+                        integ.se,
+                        self.likelihood,
+                        self.prior_weights,
+                        &mut self.last_mu,
+                        &mut self.last_weights,
+                        &mut self.last_z,
+                        Some(WorkingDerivativeBuffersMut {
+                            c: &mut self.last_c,
+                            d: &mut self.last_d,
+                            dmu_deta: &mut self.last_dmu_deta,
+                            d2mu_deta2: &mut self.last_d2mu_deta2,
+                            d3mu_deta3: &mut self.last_d3mu_deta3,
+                        }),
+                        None,
+                        Some(sas_state),
+                    )?;
+                } else {
+                    update_glm_vectors(
+                        self.y,
+                        &self.workspace.eta_buf,
+                        if matches!(&self.link_kind, InverseLink::BetaLogistic(_)) {
+                            LinkFunction::BetaLogistic
+                        } else {
+                            LinkFunction::Sas
+                        },
+                        self.prior_weights,
+                        &mut self.last_mu,
+                        &mut self.last_weights,
+                        &mut self.last_z,
+                        None,
+                        Some(sas_state),
+                        Some(WorkingDerivativeBuffersMut {
+                            c: &mut self.last_c,
+                            d: &mut self.last_d,
+                            dmu_deta: &mut self.last_dmu_deta,
+                            d2mu_deta2: &mut self.last_d2mu_deta2,
+                            d3mu_deta3: &mut self.last_d3mu_deta3,
+                        }),
+                    )?;
+                }
+            }
+            InverseLink::Standard(_) => {
+                self.likelihood.irls_update(
+                    self.y,
+                    &self.workspace.eta_buf,
+                    self.prior_weights,
+                    &mut self.last_mu,
+                    &mut self.last_weights,
+                    &mut self.last_z,
+                    integrated,
+                    Some(WorkingDerivativeBuffersMut {
+                        c: &mut self.last_c,
+                        d: &mut self.last_d,
+                        dmu_deta: &mut self.last_dmu_deta,
+                        d2mu_deta2: &mut self.last_d2mu_deta2,
+                        d3mu_deta3: &mut self.last_d3mu_deta3,
+                    }),
+                )?;
+            }
         }
         let weights = self.last_weights.clone();
         let mu = self.last_mu.clone();
@@ -1418,42 +1464,57 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             //
             // Rule: use X_transformed if available; fall back to X_original only
             // when PIRLS is operating directly in the original basis.
-            let (hat_diag, half_log_det) = match (&self.x_transformed, &self.x_csr) {
-                (Some(DesignMatrix::Sparse(_)), Some(csr)) => {
-                    compute_firth_hat_and_half_logdet_sparse(
-                        csr,
-                        weights.view(),
-                        &mut self.workspace,
-                        Some(&self.s_transformed),
-                    )?
-                }
-                (Some(DesignMatrix::Dense(x_dense)), _) => compute_firth_hat_and_half_logdet(
+            let (hat_diag, half_log_det) = match &self.coordinate_design {
+                WorkingCoordinateDesign::TransformedExplicit {
+                    x_transformed: DesignMatrix::Sparse(_),
+                    x_csr: Some(csr),
+                } => compute_firth_hat_and_half_logdet_sparse(
+                    csr,
+                    weights.view(),
+                    &mut self.workspace,
+                    Some(&self.s_transformed),
+                )?,
+                WorkingCoordinateDesign::TransformedExplicit {
+                    x_transformed: DesignMatrix::Dense(x_dense),
+                    ..
+                } => compute_firth_hat_and_half_logdet(
                     x_dense.view(),
                     weights.view(),
                     &mut self.workspace,
                     Some(&self.s_transformed),
                 )?,
-                _ => match (&self.x_original, &self.x_original_csr) {
-                    (DesignMatrix::Sparse(_), Some(csr)) => {
-                        compute_firth_hat_and_half_logdet_sparse(
-                            csr,
+                WorkingCoordinateDesign::TransformedExplicit {
+                    x_transformed: DesignMatrix::Sparse(_),
+                    x_csr: None,
+                } => {
+                    return Err(EstimationError::InvalidInput(
+                        "missing CSR cache for sparse transformed design".to_string(),
+                    ));
+                }
+                WorkingCoordinateDesign::OriginalSparseNative
+                | WorkingCoordinateDesign::TransformedImplicit { .. } => {
+                    match (&self.x_original, &self.x_original_csr) {
+                        (DesignMatrix::Sparse(_), Some(csr)) => {
+                            compute_firth_hat_and_half_logdet_sparse(
+                                csr,
+                                weights.view(),
+                                &mut self.workspace,
+                                Some(&self.s_transformed),
+                            )?
+                        }
+                        (DesignMatrix::Dense(x_dense), _) => compute_firth_hat_and_half_logdet(
+                            x_dense.view(),
                             weights.view(),
                             &mut self.workspace,
                             Some(&self.s_transformed),
-                        )?
+                        )?,
+                        (DesignMatrix::Sparse(_), None) => {
+                            return Err(EstimationError::InvalidInput(
+                                "missing CSR cache for sparse original design".to_string(),
+                            ));
+                        }
                     }
-                    (DesignMatrix::Dense(x_dense), _) => compute_firth_hat_and_half_logdet(
-                        x_dense.view(),
-                        weights.view(),
-                        &mut self.workspace,
-                        Some(&self.s_transformed),
-                    )?,
-                    (DesignMatrix::Sparse(_), None) => {
-                        return Err(EstimationError::InvalidInput(
-                            "missing CSR cache for sparse original design".to_string(),
-                        ));
-                    }
-                },
+                }
             };
             self.firth_log_det = Some(half_log_det);
             firth_hat_diag = Some(hat_diag.clone());
@@ -1481,8 +1542,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         gradient += &s_beta;
 
         let (penalized_hessian, sparse_hessian, ridge_used) = if matches!(
-            self.coordinate_frame,
-            PirlsCoordinateFrame::OriginalSparseNative
+            self.coordinate_design,
+            WorkingCoordinateDesign::OriginalSparseNative
         ) {
             let (h_sparse, ridge_used) = ensure_sparse_positive_definite_with_ridge(|ridge| {
                 self.sparse_penalized_hessian(&weights, ridge)
@@ -3799,12 +3860,12 @@ pub fn fit_model_for_fixed_rho<'a>(
         reparam_result.s_transformed.clone(),
         reparam_result.e_transformed.clone(),
         workspace,
-        link_function,
-        config.link_kind.mixture_state().cloned(),
-        config.link_kind.sas_state().copied(),
+        config.link_kind.clone(),
         config.firth_bias_reduction
-            && config.link_kind.mixture_state().is_none()
-            && matches!(link_function, LinkFunction::Logit),
+            && matches!(
+                &config.link_kind,
+                InverseLink::Standard(LinkFunction::Logit)
+            ),
         if use_explicit {
             None
         } else {
@@ -4162,9 +4223,7 @@ fn fit_model_for_fixed_rho_sparse_implicit(
         reparam_result.s_transformed.clone(),
         reparam_result.e_transformed.clone(),
         workspace,
-        link_function,
-        config.link_kind.mixture_state().cloned(),
-        config.link_kind.sas_state().copied(),
+        config.link_kind.clone(),
         false,
         None,
         quad_ctx,

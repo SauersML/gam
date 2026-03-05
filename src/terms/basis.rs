@@ -9009,9 +9009,7 @@ mod tests {
 
     #[test]
     fn test_fourth_derivative_matches_finite_difference() {
-        let knots = array![
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0, 1.0, 1.0
-        ];
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0, 1.0, 1.0];
         let degree = 4;
         let num_basis = knots.len() - degree - 1;
         let mut d3_plus = vec![0.0; num_basis];

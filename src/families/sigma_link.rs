@@ -97,7 +97,13 @@ pub fn bounded_sigma_derivs_up_to_fourth(
     eta: ArrayView1<'_, f64>,
     sigma_min: f64,
     sigma_max: f64,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+) -> (
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+) {
     let mut sigma = Array1::<f64>::zeros(eta.len());
     let mut d1 = Array1::<f64>::zeros(eta.len());
     let mut d2 = Array1::<f64>::zeros(eta.len());

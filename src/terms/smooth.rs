@@ -4613,17 +4613,13 @@ where
                         let (value, _, _, _, _, _) = eval_value(probe)?;
                         Ok(value)
                     };
-                    let grad = central_diff_gradient(
-                        theta,
-                        &lower_eval,
-                        &upper_eval,
-                        &mut objective_only,
-                    )
-                    .map_err(|e| {
-                        ObjectiveEvalError::recoverable(format!(
-                            "two-block spatial gradient evaluation failed: {e}"
-                        ))
-                    })?;
+                    let grad =
+                        central_diff_gradient(theta, &lower_eval, &upper_eval, &mut objective_only)
+                            .map_err(|e| {
+                                ObjectiveEvalError::recoverable(format!(
+                                    "two-block spatial gradient evaluation failed: {e}"
+                                ))
+                            })?;
                     if !cost.is_finite() || grad.iter().any(|v| !v.is_finite()) {
                         return Err(ObjectiveEvalError::recoverable(
                             "two-block spatial objective/gradient became non-finite",
