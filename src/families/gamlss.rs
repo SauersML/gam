@@ -675,6 +675,8 @@ fn try_binomial_alpha_beta_warm_start(
         ridge_policy: options.ridge_policy,
         // Warm start optimization focuses on robust initialization, not REML correction.
         use_reml_objective: false,
+        // Warm-start covariance is unused.
+        compute_covariance: false,
     };
     let warm_fit = fit_custom_family(&warm_family, &[alpha_spec, beta_spec], &warm_options)?;
     let eta_alpha = &warm_fit.block_states[BinomialAlphaBetaWarmStartFamily::BLOCK_ALPHA].eta;
@@ -956,17 +958,23 @@ pub fn fit_binomial_location_scale_probit(
         }
     }
 
+    let blocks = vec![
+        threshold_block.into_spec("threshold")?,
+        log_sigma_block.into_spec("log_sigma")?,
+    ];
     let family = BinomialLocationScaleProbitFamily {
         y: y.clone(),
         weights: weights.clone(),
         link_kind: link_kind.clone(),
         sigma_min,
         sigma_max,
+        threshold_design: Some(blocks[BinomialLocationScaleProbitFamily::BLOCK_T].design.clone()),
+        log_sigma_design: Some(
+            blocks[BinomialLocationScaleProbitFamily::BLOCK_LOG_SIGMA]
+                .design
+                .clone(),
+        ),
     };
-    let blocks = vec![
-        threshold_block.into_spec("threshold")?,
-        log_sigma_block.into_spec("log_sigma")?,
-    ];
     let fit = fit_custom_family(&family, &blocks, options)?;
     let beta_final = fit.block_states[BinomialLocationScaleProbitFamily::BLOCK_LOG_SIGMA]
         .eta
@@ -1420,6 +1428,8 @@ pub fn fit_binomial_location_scale_probit_terms(
                     link_kind: link_kind.clone(),
                     sigma_min,
                     sigma_max,
+                    threshold_design: Some(threshold_block.design.clone()),
+                    log_sigma_design: Some(noise_block.design.clone()),
                 };
                 let threshold_derivs = build_block_spatial_psi_derivatives(
                     data,
@@ -1792,16 +1802,33 @@ fn binomial_score_curvature_third_from_jet(
     d2: f64,
     d3: f64,
 ) -> (f64, f64, f64) {
+    // Binomial derivatives wrt q via mu:
+    // Per-row log-likelihood is represented in weighted-proportion form:
+    //   ell_i = m_i * [ y_i log(mu_i) + (1-y_i) log(1-mu_i) ],
+    // where `weight = m_i` and `y` is the observed proportion in [0,1].
+    //
+    // mu-space derivatives:
+    //   ell_mu    = y/mu - (1-y)/(1-mu)
+    //   ell_mumu  = -y/mu^2 - (1-y)/(1-mu)^2
+    //   ell_mumum = 2y/mu^3 - 2(1-y)/(1-mu)^3
+    //
+    // q-jet using mu(q) derivatives d1=mu', d2=mu'', d3=mu''':
+    //   s = dell/dq   = ell_mu * mu'
+    //   c = d2ell/dq2 = ell_mumu*(mu')^2 + ell_mu*mu''
+    //   t = d3ell/dq3 = ell_mumum*(mu')^3 + 3*ell_mumu*mu'*mu'' + ell_mu*mu'''
+    //
+    // Returns (score_q, curvature_q, third_q) with curvature_q = -d2ell/dq2.
     let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
     let one_minus = (1.0 - m).max(MIN_PROB);
-    let a1 = y / m - (1.0 - y) / one_minus;
-    let a2 = -y / (m * m) - (1.0 - y) / (one_minus * one_minus);
-    let a3 = 2.0 * y / (m * m * m) - 2.0 * (1.0 - y) / (one_minus * one_minus * one_minus);
-    let score = weight * a1 * d1;
-    let ll_second = weight * (a2 * d1 * d1 + a1 * d2);
-    let curvature = -ll_second;
-    let third = weight * (a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3);
-    (score, curvature, third)
+    let ell_mu = y / m - (1.0 - y) / one_minus;
+    let ell_mumu = -y / (m * m) - (1.0 - y) / (one_minus * one_minus);
+    let ell_mumum = 2.0 * y / (m * m * m) - 2.0 * (1.0 - y) / (one_minus * one_minus * one_minus);
+
+    let score_q = weight * ell_mu * d1;
+    let d2ell_dq2 = weight * (ell_mumu * d1 * d1 + ell_mu * d2);
+    let curvature_q = -d2ell_dq2;
+    let third_q = weight * (ell_mumum * d1 * d1 * d1 + 3.0 * ell_mumu * d1 * d2 + ell_mu * d3);
+    (score_q, curvature_q, third_q)
 }
 
 fn xt_diag_x_design(design: &DesignMatrix, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
@@ -1904,6 +1931,147 @@ struct BinomialLocationScaleCore {
     log_likelihood: f64,
 }
 
+#[derive(Clone, Copy)]
+struct NonWiggleQDerivs {
+    q_t: f64,
+    q_ls: f64,
+    q_tt: f64,
+    q_tl: f64,
+    q_ll: f64,
+    q_tl_ls: f64,
+    q_ll_ls: f64,
+}
+
+#[derive(Clone, Copy)]
+struct NonWiggleQDirectional {
+    delta_q: f64,
+    delta_q_t: f64,
+    delta_q_ls: f64,
+    delta_q_tt: f64,
+    delta_q_tl: f64,
+    delta_q_ll: f64,
+}
+
+#[derive(Clone, Copy)]
+struct EtaTwoBlockJet {
+    grad_t: f64,
+    grad_ls: f64,
+    w_tt: f64,
+    w_tl: f64,
+    w_ll: f64,
+}
+
+/// Chain rule in (eta_t, eta_ls) space for two coupled blocks.
+///
+/// With q = q(eta_t, eta_ls), score s = d ell / dq, and
+/// c = d2 ell / dq2, the eta-space derivatives are:
+///   d ell / d eta_t  = s * q_t
+///   d ell / d eta_ls = s * q_ls
+///   d2 ell / d eta_a d eta_b = c * q_a q_b + s * q_ab.
+///
+/// In this project, `curvature_q` stores -d2 ell / dq2, so c = -curvature_q.
+/// `ExactNewton` requires negative log-likelihood Hessian contributions:
+///   w_ab = - d2 ell / d eta_a d eta_b.
+fn eta_two_block_jet_from_q(
+    score_q: f64,
+    curvature_q: f64,
+    q_t: f64,
+    q_ls: f64,
+    q_tt: f64,
+    q_tl: f64,
+    q_ll: f64,
+) -> EtaTwoBlockJet {
+    let c_q = -curvature_q;
+    EtaTwoBlockJet {
+        grad_t: score_q * q_t,
+        grad_ls: score_q * q_ls,
+        w_tt: -(c_q * q_t * q_t + score_q * q_tt),
+        w_tl: -(c_q * q_t * q_ls + score_q * q_tl),
+        w_ll: -(c_q * q_ls * q_ls + score_q * q_ll),
+    }
+}
+
+/// Generic directional derivative of Newton weight:
+///   w_ab = -(c q_a q_b + s q_ab), with c = d2 ell / dq2.
+/// Along direction u:
+///   delta w_ab =
+///     -[ t delta_q q_a q_b
+///        + c(delta q_a q_b + q_a delta q_b)
+///        + c delta_q q_ab
+///        + s delta q_ab ].
+///
+/// Inputs use project convention `curvature_q = -c`.
+fn delta_newton_weight_from_q_terms(
+    score_q: f64,
+    curvature_q: f64,
+    third_q: f64,
+    q_a: f64,
+    q_b: f64,
+    q_ab: f64,
+    delta_q: f64,
+    delta_q_a: f64,
+    delta_q_b: f64,
+    delta_q_ab: f64,
+) -> f64 {
+    let c_q = -curvature_q;
+    -(third_q * delta_q * q_a * q_b
+        + c_q * (delta_q_a * q_b + q_a * delta_q_b)
+        + c_q * delta_q * q_ab
+        + score_q * delta_q_ab)
+}
+
+/// Non-wiggle location-scale map derivatives:
+/// q(eta_t, eta_ls) = -eta_t / sigma(eta_ls), with:
+/// q_t=-1/sigma, q_ls=eta_t*sigma'/sigma^2, q_tt=0, q_tl=sigma'/sigma^2,
+/// q_ll=eta_t*(sigma''/sigma^2 - 2*(sigma')^2/sigma^3),
+/// q_tl_ls=sigma''/sigma^2 - 2*(sigma')^2/sigma^3,
+/// q_ll_ls=eta_t*(sigma'''/sigma^2 - 6*sigma'*sigma''/sigma^3 + 6*(sigma')^3/sigma^4).
+fn nonwiggle_q_derivs(
+    eta_t: f64,
+    sigma: f64,
+    dsigma: f64,
+    d2sigma: f64,
+    d3sigma: f64,
+) -> NonWiggleQDerivs {
+    let s = sigma.max(1e-12);
+    let s2 = s * s;
+    let s3 = s2 * s;
+    let s4 = s3 * s;
+    let q_tl_ls = d2sigma / s2 - 2.0 * dsigma * dsigma / s3;
+    NonWiggleQDerivs {
+        q_t: -1.0 / s,
+        q_ls: eta_t * dsigma / s2,
+        q_tt: 0.0,
+        q_tl: dsigma / s2,
+        q_ll: eta_t * q_tl_ls,
+        q_tl_ls,
+        q_ll_ls: eta_t
+            * (d3sigma / s2 - 6.0 * dsigma * d2sigma / s3 + 6.0 * dsigma * dsigma * dsigma / s4),
+    }
+}
+
+/// Directional derivatives along (d_eta_t, d_eta_ls):
+/// delta_q = q_t d_eta_t + q_ls d_eta_ls
+/// delta_q_t = q_tl d_eta_ls
+/// delta_q_ls = q_tl d_eta_t + q_ll d_eta_ls
+/// delta_q_tt = 0
+/// delta_q_tl = q_tl_ls d_eta_ls
+/// delta_q_ll = q_tl_ls d_eta_t + q_ll_ls d_eta_ls
+fn nonwiggle_q_directional(
+    q: NonWiggleQDerivs,
+    d_eta_t: f64,
+    d_eta_ls: f64,
+) -> NonWiggleQDirectional {
+    NonWiggleQDirectional {
+        delta_q: q.q_t * d_eta_t + q.q_ls * d_eta_ls,
+        delta_q_t: q.q_tl * d_eta_ls,
+        delta_q_ls: q.q_tl * d_eta_t + q.q_ll * d_eta_ls,
+        delta_q_tt: 0.0,
+        delta_q_tl: q.q_tl_ls * d_eta_ls,
+        delta_q_ll: q.q_tl_ls * d_eta_t + q.q_ll_ls * d_eta_ls,
+    }
+}
+
 fn binomial_location_scale_core(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -1995,8 +2163,6 @@ fn binomial_location_scale_working_sets(
 
             let dq_t = -a_i / s;
             let d2q_t = c_i / (s * s);
-            grad_eta_t[i] = score_q * dq_t;
-            h_eta_t[i] = -(curvature_q * dq_t * dq_t + score_q * d2q_t);
 
             let dq0_ls = -core.q0[i] * core.dsigma_deta[i] / s;
             let d2q0_ls = eta_t[i]
@@ -2004,8 +2170,12 @@ fn binomial_location_scale_working_sets(
                     - 2.0 * core.dsigma_deta[i] * core.dsigma_deta[i] / (s * s * s));
             let dq_ls = a_i * dq0_ls;
             let d2q_ls = a_i * d2q0_ls + c_i * dq0_ls * dq0_ls;
-            grad_eta_ls[i] = score_q * dq_ls;
-            h_eta_ls[i] = -(curvature_q * dq_ls * dq_ls + score_q * d2q_ls);
+            let eta_jet =
+                eta_two_block_jet_from_q(score_q, curvature_q, dq_t, dq_ls, d2q_t, 0.0, d2q_ls);
+            grad_eta_t[i] = eta_jet.grad_t;
+            grad_eta_ls[i] = eta_jet.grad_ls;
+            h_eta_t[i] = eta_jet.w_tt;
+            h_eta_ls[i] = eta_jet.w_ll;
 
             grad_q[i] = score_q;
             h_q_psd[i] = curvature_q.max(0.0);
@@ -2491,6 +2661,8 @@ pub struct BinomialLocationScaleProbitFamily {
     pub sigma_min: f64,
     pub sigma_max: f64,
     pub link_kind: InverseLink,
+    pub threshold_design: Option<DesignMatrix>,
+    pub log_sigma_design: Option<DesignMatrix>,
 }
 
 impl BinomialLocationScaleProbitFamily {
@@ -2511,6 +2683,26 @@ impl BinomialLocationScaleProbitFamily {
             parameter_names: Self::parameter_names(),
             parameter_links: Self::parameter_links(),
         }
+    }
+
+    fn dense_block_designs(&self) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let xt = self
+            .threshold_design
+            .as_ref()
+            .ok_or_else(|| {
+                "BinomialLocationScaleProbitFamily exact path is missing threshold design"
+                    .to_string()
+            })?
+            .to_dense();
+        let xls = self
+            .log_sigma_design
+            .as_ref()
+            .ok_or_else(|| {
+                "BinomialLocationScaleProbitFamily exact path is missing log-sigma design"
+                    .to_string()
+            })?
+            .to_dense();
+        Ok((xt, xls))
     }
 }
 
@@ -2647,10 +2839,12 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let dmu = core.dmu_dq[i];
             let d2mu = core.d2mu_dq2[i];
             let var = (mu * (1.0 - mu)).max(MIN_PROB);
-            let dvar_dq = dmu * (1.0 - 2.0 * mu);
-            let g = dmu * dmu / var;
-            let dg_dq = g * (2.0 * d2mu / dmu - dvar_dq / var);
             let dir = d_eta[i];
+            if !s.is_finite() || !mu.is_finite() || !dmu.is_finite() || !d2mu.is_finite() || !dir.is_finite()
+            {
+                dw[i] = 0.0;
+                continue;
+            }
 
             let (chain, dchain) = match block_idx {
                 Self::BLOCK_T => (-1.0 / s, 0.0),
@@ -2662,17 +2856,272 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
                 }
                 _ => return Ok(None),
             };
+            if !chain.is_finite() || !dchain.is_finite() {
+                dw[i] = 0.0;
+                continue;
+            }
 
+            let dvar_dq = dmu * (1.0 - 2.0 * mu);
+            let g = dmu * dmu / var;
             let raw_w = self.weights[i] * g * chain * chain;
-            if raw_w <= MIN_WEIGHT {
+            if !raw_w.is_finite() || raw_w <= MIN_WEIGHT {
+                dw[i] = 0.0;
+                continue;
+            }
+            // In extreme tails dmu can approach zero numerically; avoid unstable
+            // 2*d2mu/dmu amplification and fall back to the active clamp branch.
+            if dmu.abs() <= MIN_DERIV {
                 dw[i] = 0.0;
                 continue;
             }
 
             let dq = chain * dir;
-            dw[i] = self.weights[i] * (dg_dq * dq * chain * chain + 2.0 * g * chain * dchain);
+            let dg_dq = g * (2.0 * d2mu / dmu - dvar_dq / var);
+            let dw_i = self.weights[i] * (dg_dq * dq * chain * chain + 2.0 * g * chain * dchain);
+            dw[i] = if dw_i.is_finite() { dw_i } else { 0.0 };
         }
         Ok(Some(dw))
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleProbitFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleProbitFamily input size mismatch".to_string());
+        }
+        let (x_t, x_ls) = self.dense_block_designs()?;
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+            self.sigma_min,
+            self.sigma_max,
+        )?;
+        let (sigma, ds, d2s, _) =
+            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let total = pt + pls;
+        let mut h = Array2::<f64>::zeros((total, total));
+        for i in 0..n {
+            let (score_q, curvature_q, _third_q) = binomial_score_curvature_third_from_jet(
+                self.y[i],
+                self.weights[i],
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+            );
+            let q = nonwiggle_q_derivs(eta_t[i], sigma[i], ds[i], d2s[i], 0.0);
+
+            let xtr = x_t.row(i).to_vec();
+            let xlsr = x_ls.row(i).to_vec();
+
+            let eta_jet =
+                eta_two_block_jet_from_q(score_q, curvature_q, q.q_t, q.q_ls, q.q_tt, q.q_tl, q.q_ll);
+            let wt_tt = eta_jet.w_tt;
+            let wt_tl = eta_jet.w_tl;
+            let wt_ll = eta_jet.w_ll;
+
+            for a_idx in 0..pt {
+                for b_idx in a_idx..pt {
+                    h[[a_idx, b_idx]] += wt_tt * xtr[a_idx] * xtr[b_idx];
+                }
+            }
+            for a_idx in 0..pt {
+                for b_idx in 0..pls {
+                    h[[a_idx, pt + b_idx]] += wt_tl * xtr[a_idx] * xlsr[b_idx];
+                }
+            }
+            for a_idx in 0..pls {
+                for b_idx in a_idx..pls {
+                    h[[pt + a_idx, pt + b_idx]] += wt_ll * xlsr[a_idx] * xlsr[b_idx];
+                }
+            }
+        }
+        mirror_upper_to_lower(&mut h);
+        Ok(Some(h))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        // Directional derivative of the joint Hessian H(beta).
+        //
+        // We need dH[u] for outer REML/LAML gradients because:
+        //   dJ/drho_k = S_k + (∂H/∂beta) * (d beta / d rho_k),
+        // where J = H(beta) + P(rho) and u_k = d beta / d rho_k.
+        //
+        // For any direction u = [u_t; u_ls]:
+        //   d eta_t  = X_t  u_t
+        //   d eta_ls = X_ls u_ls
+        //
+        // With q = q(eta_t, eta_ls), define first-order variations:
+        //   delta q      = q_t d eta_t + q_ls d eta_ls
+        //   delta q_t    = q_tl d eta_ls                       (q_tt = 0)
+        //   delta q_ls   = q_tl d eta_t + q_ll d eta_ls
+        //   delta q_tl   = q_tl_ls d eta_ls
+        //   delta q_ll   = q_tl_ls d eta_t + q_ll_ls d eta_ls
+        //
+        // Per-row negative-loglik Hessian weights are:
+        //   w_ab = -(c q_a q_b + s q_ab),  a,b in {t,ls},
+        // where:
+        //   s = d ell / dq     (score_q),
+        //   c = d2 ell / dq2   (= -curvature_q),
+        //   t = d3 ell / dq3   (third_q).
+        //
+        // Directional derivative:
+        //   delta w_ab = -delta(c q_a q_b + s q_ab)
+        //              = -[ t delta_q q_a q_b
+        //                   + c(delta q_a q_b + q_a delta q_b)
+        //                   + c delta_q q_ab
+        //                   + s delta q_ab ].
+        //
+        // Specialized forms used below:
+        //   delta w_tt = -[ t delta_q q_t^2 + 2c(delta q_t)q_t ]
+        //   delta w_tl = -[ t delta_q q_t q_ls
+        //                   + c((delta q_t)q_ls + q_t(delta q_ls))
+        //                   + c delta_q q_tl + s delta q_tl ]
+        //   delta w_ll = -[ t delta_q q_ls^2
+        //                   + 2c(delta q_ls)q_ls
+        //                   + c delta_q q_ll + s delta q_ll ].
+        //
+        // Then assemble:
+        //   dH[u] =
+        //     [ X_t^T  diag(delta w_tt) X_t     X_t^T  diag(delta w_tl) X_ls ]
+        //     [ X_ls^T diag(delta w_tl) X_t     X_ls^T diag(delta w_ll) X_ls ].
+        //
+        // Local variable map:
+        //   q.*  -> q-derivative tuple from `nonwiggle_q_derivs`
+        //   dq.* -> directional q-derivative tuple from `nonwiggle_q_directional`
+        //   coeff_tt/tl/ll -> delta w_tt / delta w_tl / delta w_ll
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleProbitFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleProbitFamily input size mismatch".to_string());
+        }
+        let (x_t, x_ls) = self.dense_block_designs()?;
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let total = pt + pls;
+        if d_beta_flat.len() != total {
+            return Err(format!(
+                "joint d_beta length mismatch: got {}, expected {}",
+                d_beta_flat.len(),
+                total
+            ));
+        }
+        let u_t = d_beta_flat.slice(s![0..pt]).to_owned();
+        let u_ls = d_beta_flat.slice(s![pt..]).to_owned();
+        let d_eta_t = x_t.dot(&u_t);
+        let d_eta_ls = x_ls.dot(&u_ls);
+
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+            self.sigma_min,
+            self.sigma_max,
+        )?;
+        let (sigma, ds, d2s, d3s) =
+            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+
+        let mut d_h = Array2::<f64>::zeros((total, total));
+        for i in 0..n {
+            let (score_q, curvature_q, third_q) = binomial_score_curvature_third_from_jet(
+                self.y[i],
+                self.weights[i],
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+            );
+            let q = nonwiggle_q_derivs(eta_t[i], sigma[i], ds[i], d2s[i], d3s[i]);
+            let dq = nonwiggle_q_directional(q, d_eta_t[i], d_eta_ls[i]);
+
+            let coeff_tt = delta_newton_weight_from_q_terms(
+                score_q,
+                curvature_q,
+                third_q,
+                q.q_t,
+                q.q_t,
+                q.q_tt,
+                dq.delta_q,
+                dq.delta_q_t,
+                dq.delta_q_t,
+                dq.delta_q_tt,
+            );
+            let coeff_tl = delta_newton_weight_from_q_terms(
+                score_q,
+                curvature_q,
+                third_q,
+                q.q_t,
+                q.q_ls,
+                q.q_tl,
+                dq.delta_q,
+                dq.delta_q_t,
+                dq.delta_q_ls,
+                dq.delta_q_tl,
+            );
+            let coeff_ll = delta_newton_weight_from_q_terms(
+                score_q,
+                curvature_q,
+                third_q,
+                q.q_ls,
+                q.q_ls,
+                q.q_ll,
+                dq.delta_q,
+                dq.delta_q_ls,
+                dq.delta_q_ls,
+                dq.delta_q_ll,
+            );
+
+            let xtr = x_t.row(i).to_vec();
+            let xlsr = x_ls.row(i).to_vec();
+            for a_idx in 0..pt {
+                for b_idx in a_idx..pt {
+                    d_h[[a_idx, b_idx]] += coeff_tt * xtr[a_idx] * xtr[b_idx];
+                }
+            }
+            for a_idx in 0..pt {
+                for b_idx in 0..pls {
+                    d_h[[a_idx, pt + b_idx]] += coeff_tl * xtr[a_idx] * xlsr[b_idx];
+                }
+            }
+            for a_idx in 0..pls {
+                for b_idx in a_idx..pls {
+                    d_h[[pt + a_idx, pt + b_idx]] += coeff_ll * xlsr[a_idx] * xlsr[b_idx];
+                }
+            }
+        }
+        mirror_upper_to_lower(&mut d_h);
+        Ok(Some(d_h))
     }
 }
 
@@ -3205,9 +3654,10 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             let br = b.row(i).to_vec();
             let bpr = bp.row(i).to_vec();
 
-            let wt_tt = -(curvature_q * q_t * q_t + score_q * q_tt);
-            let wt_tl = -(curvature_q * q_t * q_ls + score_q * q_tl);
-            let wt_ll = -(curvature_q * q_ls * q_ls + score_q * q_ll);
+            let eta_jet = eta_two_block_jet_from_q(score_q, curvature_q, q_t, q_ls, q_tt, q_tl, q_ll);
+            let wt_tt = eta_jet.w_tt;
+            let wt_tl = eta_jet.w_tl;
+            let wt_ll = eta_jet.w_ll;
 
             for a_idx in 0..pt {
                 for b_idx in a_idx..pt {
@@ -3374,15 +3824,42 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
                 .map(|(lhs, &rhs)| lhs + rhs * (q0_t_ls * d_eta_t[i] + q0_ls_ls * d_eta_ls[i]))
                 .collect::<Vec<_>>();
 
-            let coeff_tt = -(third_q * delta_q * q_t * q_t
-                + curvature_q * (2.0 * delta_q_t * q_t + delta_q * q_tt)
-                + score_q * delta_q_tt);
-            let coeff_tl = -(third_q * delta_q * q_t * q_ls
-                + curvature_q * (delta_q_t * q_ls + q_t * delta_q_ls + delta_q * q_tl)
-                + score_q * delta_q_tl);
-            let coeff_ll = -(third_q * delta_q * q_ls * q_ls
-                + curvature_q * (2.0 * delta_q_ls * q_ls + delta_q * q_ll)
-                + score_q * delta_q_ll);
+            let coeff_tt = delta_newton_weight_from_q_terms(
+                score_q,
+                curvature_q,
+                third_q,
+                q_t,
+                q_t,
+                q_tt,
+                delta_q,
+                delta_q_t,
+                delta_q_t,
+                delta_q_tt,
+            );
+            let coeff_tl = delta_newton_weight_from_q_terms(
+                score_q,
+                curvature_q,
+                third_q,
+                q_t,
+                q_ls,
+                q_tl,
+                delta_q,
+                delta_q_t,
+                delta_q_ls,
+                delta_q_tl,
+            );
+            let coeff_ll = delta_newton_weight_from_q_terms(
+                score_q,
+                curvature_q,
+                third_q,
+                q_ls,
+                q_ls,
+                q_ll,
+                delta_q,
+                delta_q_ls,
+                delta_q_ls,
+                delta_q_ll,
+            );
 
             for a_idx in 0..pt {
                 for b_idx in a_idx..pt {
@@ -3401,28 +3878,52 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             }
             for a_idx in 0..pt {
                 for j in 0..pw {
-                    let coeff = -(third_q * delta_q * q_t * br[j]
-                        + curvature_q
-                            * (delta_q_t * br[j] + q_t * delta_b[j] + delta_q * bpr[j] * q0_t)
-                        + score_q * delta_q_tw[j]);
+                    let coeff = delta_newton_weight_from_q_terms(
+                        score_q,
+                        curvature_q,
+                        third_q,
+                        q_t,
+                        br[j],
+                        bpr[j] * q0_t,
+                        delta_q,
+                        delta_q_t,
+                        delta_b[j],
+                        delta_q_tw[j],
+                    );
                     d_h[[a_idx, pt + pls + j]] += coeff * xtr[a_idx];
                 }
             }
             for a_idx in 0..pls {
                 for j in 0..pw {
-                    let coeff = -(third_q * delta_q * q_ls * br[j]
-                        + curvature_q
-                            * (delta_q_ls * br[j] + q_ls * delta_b[j] + delta_q * bpr[j] * q0_ls)
-                        + score_q * delta_q_lw[j]);
+                    let coeff = delta_newton_weight_from_q_terms(
+                        score_q,
+                        curvature_q,
+                        third_q,
+                        q_ls,
+                        br[j],
+                        bpr[j] * q0_ls,
+                        delta_q,
+                        delta_q_ls,
+                        delta_b[j],
+                        delta_q_lw[j],
+                    );
                     d_h[[pt + a_idx, pt + pls + j]] += coeff * xlsr[a_idx];
                 }
             }
             for a_idx in 0..pw {
                 for b_idx in a_idx..pw {
-                    d_h[[pt + pls + a_idx, pt + pls + b_idx]] +=
-                        -(third_q * delta_q * br[a_idx] * br[b_idx]
-                            + curvature_q
-                                * (delta_b[a_idx] * br[b_idx] + br[a_idx] * delta_b[b_idx]));
+                    d_h[[pt + pls + a_idx, pt + pls + b_idx]] += delta_newton_weight_from_q_terms(
+                        score_q,
+                        curvature_q,
+                        third_q,
+                        br[a_idx],
+                        br[b_idx],
+                        0.0,
+                        delta_q,
+                        delta_b[a_idx],
+                        delta_b[b_idx],
+                        0.0,
+                    );
                 }
             }
         }
@@ -4572,6 +5073,8 @@ mod tests {
             sigma_min: 0.05,
             sigma_max: 10.0,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: None,
+            log_sigma_design: None,
         };
         let states = vec![
             ParameterBlockState {

@@ -6793,4 +6793,90 @@ mod tests {
         assert!((out[0].inv_grad_weight[0] - 1e-2).abs() < 1e-12);
         assert!((out[0].inv_lap_weight[0] - 1e-2).abs() < 1e-12);
     }
+
+    #[test]
+    fn adaptive_weight_inverse_consistency_without_clamp() {
+        let cache = SpatialOperatorRuntimeCache {
+            term_name: "matern".to_string(),
+            feature_cols: vec![0, 1],
+            coeff_global_range: 0..2,
+            tension_penalty_global_idx: 0,
+            stiffness_penalty_global_idx: 1,
+            d1: array![[1.0, 0.0], [0.0, 1.0], [2.0, 0.0], [0.0, 2.0]],
+            d2: array![[1.0, 0.0], [2.0, 0.0]],
+            collocation_points: array![[0.0, 0.0], [1.0, 1.0]],
+            dimension: 2,
+        };
+        let beta = array![1.0, 1.0];
+        let out = compute_spatial_adaptive_weights_for_beta(&beta, &[cache], 1e-6, 1e-6, 1e-12, 1e12);
+        assert_eq!(out.len(), 1);
+        for k in 0..out[0].grad_weight.len() {
+            let pg = out[0].grad_weight[k] * out[0].inv_grad_weight[k];
+            let pc = out[0].lap_weight[k] * out[0].inv_lap_weight[k];
+            assert!((pg - 1.0).abs() < 1e-10, "grad pair mismatch at {k}: {pg}");
+            assert!((pc - 1.0).abs() < 1e-10, "lap pair mismatch at {k}: {pc}");
+        }
+    }
+
+    #[test]
+    fn adaptive_weight_is_monotone_in_signal_magnitude() {
+        let cache = SpatialOperatorRuntimeCache {
+            term_name: "matern".to_string(),
+            feature_cols: vec![0, 1],
+            coeff_global_range: 0..2,
+            tension_penalty_global_idx: 0,
+            stiffness_penalty_global_idx: 1,
+            d1: array![[1.0, 0.0], [0.0, 1.0]],
+            d2: array![[1.0, 0.0]],
+            collocation_points: array![[0.0, 0.0]],
+            dimension: 2,
+        };
+        let beta_small = array![0.25, 0.25];
+        let beta_large = array![2.0, 2.0];
+        let small = compute_spatial_adaptive_weights_for_beta(
+            &beta_small,
+            std::slice::from_ref(&cache),
+            1e-8,
+            1e-8,
+            1e-12,
+            1e12,
+        );
+        let large = compute_spatial_adaptive_weights_for_beta(&beta_large, &[cache], 1e-8, 1e-8, 1e-12, 1e12);
+        assert!(small[0].grad_weight[0] > large[0].grad_weight[0]);
+        assert!(small[0].lap_weight[0] > large[0].lap_weight[0]);
+        assert!(small[0].inv_grad_weight[0] < large[0].inv_grad_weight[0]);
+        assert!(small[0].inv_lap_weight[0] < large[0].inv_lap_weight[0]);
+    }
+
+    #[test]
+    fn adaptive_diagnostics_json_roundtrip_preserves_shapes() {
+        let diag = AdaptiveRegularizationDiagnostics {
+            mm_iterations: 3,
+            converged: true,
+            maps: vec![AdaptiveSpatialMap {
+                term_name: "matern".to_string(),
+                feature_cols: vec![0, 1],
+                collocation_points: array![[1.0, 2.0], [3.0, 4.0]],
+                inv_grad_weight: array![0.1, 0.2],
+                inv_lap_weight: array![0.3, 0.4],
+            }],
+        };
+        let payload = serde_json::to_value(&diag).expect("serialize diagnostics");
+        assert_eq!(payload["mm_iterations"].as_u64(), Some(3));
+        assert_eq!(
+            payload["maps"][0]["collocation_points"]["dim"]
+                .as_array()
+                .map(|v| v.len()),
+            Some(2)
+        );
+        let decoded: AdaptiveRegularizationDiagnostics =
+            serde_json::from_value(payload).expect("deserialize diagnostics");
+        assert_eq!(decoded.mm_iterations, 3);
+        assert!(decoded.converged);
+        assert_eq!(decoded.maps.len(), 1);
+        assert_eq!(decoded.maps[0].collocation_points.nrows(), 2);
+        assert_eq!(decoded.maps[0].collocation_points.ncols(), 2);
+        assert_eq!(decoded.maps[0].inv_grad_weight.len(), 2);
+        assert_eq!(decoded.maps[0].inv_lap_weight.len(), 2);
+    }
 }
