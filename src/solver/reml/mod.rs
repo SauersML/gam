@@ -184,8 +184,10 @@ mod tests {
             penalty_index: None,
             x_tau_original: x_tau.clone(),
             s_tau_original: s_tau.clone(),
+            s_tau_original_components: None,
             x_tau_tau_original: None,
             s_tau_tau_original: None,
+            s_tau_tau_original_components: None,
         };
         let rho = array![0.0];
 
@@ -515,8 +517,10 @@ mod tests {
             penalty_index: None,
             x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
             s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.03], [0.0, 0.03, 0.12],],
+            s_tau_original_components: None,
             x_tau_tau_original: None,
             s_tau_tau_original: None,
+            s_tau_tau_original_components: None,
         };
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
@@ -548,8 +552,10 @@ mod tests {
             penalty_index: None,
             x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 1e-3),
             s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
+            s_tau_original_components: None,
             x_tau_tau_original: None,
             s_tau_tau_original: None,
+            s_tau_tau_original_components: None,
         };
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
@@ -581,8 +587,10 @@ mod tests {
             penalty_index: None,
             x_tau_original: Array2::from_elem((x_dense.nrows(), x_dense.ncols()), 1e-3),
             s_tau_original: Array2::<f64>::zeros((x_dense.ncols(), x_dense.ncols())),
+            s_tau_original_components: None,
             x_tau_tau_original: None,
             s_tau_tau_original: None,
+            s_tau_tau_original_components: None,
         };
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
@@ -665,15 +673,19 @@ mod tests {
                 penalty_index: None,
                 x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
                 s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
+                s_tau_original_components: None,
                 x_tau_tau_original: None,
                 s_tau_tau_original: None,
+                s_tau_tau_original_components: None,
             },
             DirectionalHyperParam {
                 penalty_index: None,
                 x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
                 s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                s_tau_original_components: None,
                 x_tau_tau_original: None,
                 s_tau_tau_original: None,
+                s_tau_tau_original_components: None,
             },
         ];
 
@@ -737,15 +749,19 @@ mod tests {
                 penalty_index: None,
                 x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
                 s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
+                s_tau_original_components: None,
                 x_tau_tau_original: Some(x_second_0),
                 s_tau_tau_original: Some(s_second_0),
+                s_tau_tau_original_components: None,
             },
             DirectionalHyperParam {
                 penalty_index: None,
                 x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
                 s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                s_tau_original_components: None,
                 x_tau_tau_original: Some(x_second_1),
                 s_tau_tau_original: Some(s_second_1),
+                s_tau_tau_original_components: None,
             },
         ];
 
@@ -826,15 +842,19 @@ mod tests {
                 penalty_index: None,
                 x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
                 s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
+                s_tau_original_components: None,
                 x_tau_tau_original: None,
                 s_tau_tau_original: None,
+                s_tau_tau_original_components: None,
             },
             DirectionalHyperParam {
                 penalty_index: None,
                 x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
                 s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                s_tau_original_components: None,
                 x_tau_tau_original: None,
                 s_tau_tau_original: None,
+                s_tau_tau_original_components: None,
             },
         ];
 
@@ -918,8 +938,10 @@ mod tests {
             penalty_index: None,
             x_tau_original: Array2::from_elem((n, p), 5e-5),
             s_tau_original: Array2::<f64>::zeros((p, p)),
+            s_tau_original_components: None,
             x_tau_tau_original: None,
             s_tau_tau_original: None,
+            s_tau_tau_original_components: None,
         };
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
@@ -1007,11 +1029,18 @@ pub(crate) struct DirectionalHyperParam {
     pub penalty_index: Option<usize>,
     pub x_tau_original: Array2<f64>,
     pub s_tau_original: Array2<f64>,
+    // Optional multi-penalty decomposition for a single tau direction:
+    //   dS/dtau = sum_m exp(rho[k_m]) * S_tau_components[m].
+    // This is required when one tau affects multiple penalty blocks.
+    pub s_tau_original_components: Option<Vec<(usize, Array2<f64>)>>,
     // Optional pairwise second hyper-derivatives against all tau directions.
     // If provided, each vector must have length psi_dim and hold X_{tau_i,tau_j}
     // / S_{tau_i,tau_j} in original coordinates.
     pub x_tau_tau_original: Option<Vec<Array2<f64>>>,
     pub s_tau_tau_original: Option<Vec<Array2<f64>>>,
+    // Optional multi-penalty decomposition for pairwise second derivatives:
+    //   d2S/dtau_i dtau_j = sum_m exp(rho[k_m]) * S_tau_tau_components[i][j][m].
+    pub s_tau_tau_original_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
 }
 
 #[derive(Clone, Debug)]

@@ -336,6 +336,12 @@ fn build_block_spatial_psi_derivatives(
                 penalty_index: info.penalty_index,
                 x_psi: info.x_psi,
                 s_psi: info.s_psi,
+                s_psi_components: Some(
+                    info.penalty_indices
+                        .into_iter()
+                        .zip(info.s_psi_components.into_iter())
+                        .collect(),
+                ),
             })
             .collect(),
     ))

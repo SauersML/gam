@@ -279,9 +279,9 @@ pub fn generate_rho_candidates(
     // - backward-compatible nu=2 reverse-map seeds,
     // - first-order fallback seeds (lambda2 near lower bound).
     if num_penalties == 3 {
+        add_first_order_fallback_seeds(&mut seeds, &mut seen, bounds, heuristic_lambdas);
         add_spde_manifold_seeds(&mut seeds, &mut seen, bounds, heuristic_lambdas, &primary);
         add_nu2_reverse_manifold_seeds(&mut seeds, &mut seen, bounds, &primary);
-        add_first_order_fallback_seeds(&mut seeds, &mut seen, bounds, heuristic_lambdas);
     }
 
     // Backward-compatible scalar heuristic support: treat each value as a symmetric λ seed.
