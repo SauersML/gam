@@ -3759,15 +3759,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
 fn run_sample(args: SampleArgs) -> Result<(), String> {
     let model = SavedModel::load_from_path(&args.model)?;
-
-    if model.is_location_scale_model() {
-        return Err(
-            "sample for location-scale models is not available yet; sample the mean-only model instead"
-                .to_string(),
-        );
-    }
-
-    let parsed = parse_formula(&model.formula)?;
     let schema = model.require_data_schema()?;
     let ds = load_dataset_with_schema(&args.data, schema)?;
     let col_map: HashMap<String, usize> = ds
@@ -3785,241 +3776,24 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         ..NutsConfig::default()
     };
 
-    let nuts = if family == LikelihoodFamily::RoystonParmar {
-        let saved_likelihood_mode = parse_survival_likelihood_mode(
-            model
-                .survival_likelihood
-                .as_deref()
-                .unwrap_or("transformation"),
-        )?;
-        if saved_likelihood_mode == SurvivalLikelihoodMode::ProbitLocationScale {
+    let nuts = match model.predict_model_class() {
+        PredictModelClass::Survival => {
+            run_sample_survival(&model, ds.values.view(), &col_map, training_headers, &cfg)?
+        }
+        PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale => {
             return Err(
-                "sample for survival-likelihood=probit-location-scale is not implemented yet"
+                "sample for location-scale models is not available yet; sample the mean-only model instead"
                     .to_string(),
-            );
+            )
         }
-        let entry_name = model
-            .survival_entry
-            .as_ref()
-            .ok_or_else(|| "survival model missing entry column metadata".to_string())?;
-        let exit_name = model
-            .survival_exit
-            .as_ref()
-            .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
-        let event_name = model
-            .survival_event
-            .as_ref()
-            .ok_or_else(|| "survival model missing event column metadata".to_string())?;
-        let entry_col = *col_map
-            .get(entry_name)
-            .ok_or_else(|| format!("entry column '{}' not found", entry_name))?;
-        let exit_col = *col_map
-            .get(exit_name)
-            .ok_or_else(|| format!("exit column '{}' not found", exit_name))?;
-        let event_col = *col_map
-            .get(event_name)
-            .ok_or_else(|| format!("event column '{}' not found", event_name))?;
-
-        let term_spec = resolve_term_spec_for_prediction(
-            &model.resolved_term_spec,
-            training_headers,
+        PredictModelClass::Standard => run_sample_standard(
+            &model,
+            ds.values.view(),
             &col_map,
-            "resolved_term_spec",
-        )?;
-        let cov_design = build_term_collection_design(ds.values.view(), &term_spec)
-            .map_err(|e| format!("failed to build survival design: {e}"))?;
-        let n = ds.values.nrows();
-        let p_cov = cov_design.design.ncols();
-        let mut age_entry = Array1::<f64>::zeros(n);
-        let mut age_exit = Array1::<f64>::zeros(n);
-        let mut event_target = Array1::<u8>::zeros(n);
-        let event_competing = Array1::<u8>::zeros(n);
-        let weights = Array1::<f64>::ones(n);
-        for i in 0..n {
-            let t0 = ds.values[[i, entry_col]].max(1e-9);
-            let t1 = ds.values[[i, exit_col]].max(t0 + 1e-9);
-            age_entry[i] = t0;
-            age_exit[i] = t1;
-            event_target[i] = if ds.values[[i, event_col]] >= 0.5 {
-                1
-            } else {
-                0
-            };
-        }
-        let time_cfg = load_survival_time_basis_config_from_model(&model)?;
-        let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg, None)?;
-        let p_time = time_build.x_exit_time.ncols();
-        let p = p_time + p_cov;
-        let mut x_entry = Array2::<f64>::zeros((n, p));
-        let mut x_exit = Array2::<f64>::zeros((n, p));
-        let mut x_derivative = Array2::<f64>::zeros((n, p));
-        for i in 0..n {
-            for j in 0..p_time {
-                x_entry[[i, j]] = time_build.x_entry_time[[i, j]];
-                x_exit[[i, j]] = time_build.x_exit_time[[i, j]];
-                x_derivative[[i, j]] = time_build.x_derivative_time[[i, j]];
-            }
-            for j in 0..p_cov {
-                let z = cov_design.design[[i, j]];
-                x_entry[[i, p_time + j]] = z;
-                x_exit[[i, p_time + j]] = z;
-            }
-        }
-        let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
-        for s in &time_build.penalties {
-            if s.nrows() == p_time && s.ncols() == p_time {
-                penalty_blocks.push(PenaltyBlock {
-                    matrix: s.clone(),
-                    lambda: time_build.smooth_lambda.unwrap_or(1e-2),
-                    range: 0..p_time,
-                });
-            }
-        }
-        let ridge_lambda = model.survival_ridge_lambda.unwrap_or(1e-4);
-        let ridge_range_start = if time_build.basis_name == "linear" {
-            1
-        } else {
-            0
-        };
-        if ridge_lambda > 0.0 && p > ridge_range_start {
-            let dim = p - ridge_range_start;
-            let mut ridge = Array2::<f64>::zeros((dim, dim));
-            for d in 0..dim {
-                ridge[[d, d]] = 1.0;
-            }
-            penalty_blocks.push(PenaltyBlock {
-                matrix: ridge,
-                lambda: ridge_lambda,
-                range: ridge_range_start..p,
-            });
-        }
-        let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
-        for (idx, block) in penalty_blocks.iter_mut().enumerate() {
-            if let Some(&lam) = fit_saved.lambdas.get(idx) {
-                block.lambda = lam;
-            }
-        }
-        let penalties = PenaltyBlocks::new(penalty_blocks);
-        let survival_spec = match model
-            .survival_spec
-            .as_deref()
-            .unwrap_or("net")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "net" => SurvivalSpec::Net,
-            "crude" => SurvivalSpec::Crude,
-            other => return Err(format!("unsupported saved survival spec '{other}'")),
-        };
-        let monotonicity = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 1e-8,
-        };
-        let baseline_cfg = survival_baseline_config_from_model(&model)?;
-        let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
-            build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
-        let mut model_surv = gam::families::royston_parmar::working_model_from_flattened(
-            penalties.clone(),
-            monotonicity,
-            survival_spec,
-            gam::families::royston_parmar::RoystonParmarInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                weights: weights.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-                eta_offset_entry: Some(eta_offset_entry.view()),
-                eta_offset_exit: Some(eta_offset_exit.view()),
-                derivative_offset_exit: Some(derivative_offset_exit.view()),
-            },
-        )
-        .map_err(|e| format!("failed to construct survival model: {e}"))?;
-        if time_build.basis_name == "ispline" {
-            model_surv
-                .set_structural_monotonicity(true, p_time)
-                .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
-        }
-        let beta0 = fit_saved.beta.clone();
-        let state = model_surv
-            .update_state(&beta0)
-            .map_err(|e| format!("failed to evaluate survival state: {e}"))?;
-        gam::hmc::run_survival_nuts_sampling_flattened(
-            gam::hmc::SurvivalFlatInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                weights: weights.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-                eta_offset_entry: Some(eta_offset_entry.view()),
-                eta_offset_exit: Some(eta_offset_exit.view()),
-                derivative_offset_exit: Some(derivative_offset_exit.view()),
-            },
-            penalties,
-            monotonicity,
-            survival_spec,
-            time_build.basis_name == "ispline",
-            p_time,
-            beta0.view(),
-            state.hessian.view(),
-            &cfg,
-        )
-        .map_err(|e| format!("survival NUTS sampling failed: {e}"))?
-    } else {
-        let y_col = *col_map
-            .get(&parsed.response)
-            .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
-        let y = ds.values.column(y_col).to_owned();
-        let spec = resolve_term_spec_for_prediction(
-            &model.resolved_term_spec,
             training_headers,
-            &col_map,
-            "resolved_term_spec",
-        )?;
-        let design = build_term_collection_design(ds.values.view(), &spec)
-            .map_err(|e| format!("failed to build term collection design: {e}"))?;
-        let weights = Array1::ones(ds.values.nrows());
-        let offset = Array1::zeros(ds.values.nrows());
-        let fit = fit_gam(
-            design.design.view(),
-            y.view(),
-            weights.view(),
-            offset.view(),
-            &design.penalties,
             family,
-            &FitOptions {
-                mixture_link: None,
-                optimize_mixture: false,
-                sas_link: None,
-                optimize_sas: false,
-                max_iter: 80,
-                tol: 1e-6,
-                nullspace_dims: design.nullspace_dims.clone(),
-                linear_constraints: design.linear_constraints.clone(),
-                adaptive_regularization: None,
-            },
-        )
-        .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
-        let penalty = weighted_penalty_matrix(&design.penalties, fit.lambdas.view())?;
-        run_nuts_sampling_flattened_family(
-            family,
-            FamilyNutsInputs::Glm(GlmFlatInputs {
-                x: design.design.view(),
-                y: y.view(),
-                weights: weights.view(),
-                penalty_matrix: penalty.view(),
-                mode: fit.beta.view(),
-                hessian: fit.penalized_hessian.view(),
-                firth_bias_reduction: false,
-            }),
             &cfg,
-        )
-        .map_err(|e| format!("NUTS sampling failed: {e}"))?
+        )?,
     };
 
     let out = args
@@ -4033,6 +3807,249 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         nuts.samples.ncols()
     );
     Ok(())
+}
+
+fn run_sample_survival(
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    cfg: &NutsConfig,
+) -> Result<gam::hmc::NutsResult, String> {
+    let saved_likelihood_mode = parse_survival_likelihood_mode(
+        model
+            .survival_likelihood
+            .as_deref()
+            .unwrap_or("transformation"),
+    )?;
+    if saved_likelihood_mode == SurvivalLikelihoodMode::ProbitLocationScale {
+        return Err(
+            "sample for survival-likelihood=probit-location-scale is not implemented yet".to_string(),
+        );
+    }
+    let entry_name = model
+        .survival_entry
+        .as_ref()
+        .ok_or_else(|| "survival model missing entry column metadata".to_string())?;
+    let exit_name = model
+        .survival_exit
+        .as_ref()
+        .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
+    let event_name = model
+        .survival_event
+        .as_ref()
+        .ok_or_else(|| "survival model missing event column metadata".to_string())?;
+    let entry_col = *col_map
+        .get(entry_name)
+        .ok_or_else(|| format!("entry column '{}' not found", entry_name))?;
+    let exit_col = *col_map
+        .get(exit_name)
+        .ok_or_else(|| format!("exit column '{}' not found", exit_name))?;
+    let event_col = *col_map
+        .get(event_name)
+        .ok_or_else(|| format!("event column '{}' not found", event_name))?;
+    let term_spec = resolve_term_spec_for_prediction(
+        &model.resolved_term_spec,
+        training_headers,
+        col_map,
+        "resolved_term_spec",
+    )?;
+    let cov_design = build_term_collection_design(data, &term_spec)
+        .map_err(|e| format!("failed to build survival design: {e}"))?;
+    let n = data.nrows();
+    let p_cov = cov_design.design.ncols();
+    let mut age_entry = Array1::<f64>::zeros(n);
+    let mut age_exit = Array1::<f64>::zeros(n);
+    let mut event_target = Array1::<u8>::zeros(n);
+    let event_competing = Array1::<u8>::zeros(n);
+    let weights = Array1::<f64>::ones(n);
+    for i in 0..n {
+        let t0 = data[[i, entry_col]].max(1e-9);
+        let t1 = data[[i, exit_col]].max(t0 + 1e-9);
+        age_entry[i] = t0;
+        age_exit[i] = t1;
+        event_target[i] = if data[[i, event_col]] >= 0.5 { 1 } else { 0 };
+    }
+    let time_cfg = load_survival_time_basis_config_from_model(model)?;
+    let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg, None)?;
+    let p_time = time_build.x_exit_time.ncols();
+    let p = p_time + p_cov;
+    let mut x_entry = Array2::<f64>::zeros((n, p));
+    let mut x_exit = Array2::<f64>::zeros((n, p));
+    let mut x_derivative = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        for j in 0..p_time {
+            x_entry[[i, j]] = time_build.x_entry_time[[i, j]];
+            x_exit[[i, j]] = time_build.x_exit_time[[i, j]];
+            x_derivative[[i, j]] = time_build.x_derivative_time[[i, j]];
+        }
+        for j in 0..p_cov {
+            let z = cov_design.design[[i, j]];
+            x_entry[[i, p_time + j]] = z;
+            x_exit[[i, p_time + j]] = z;
+        }
+    }
+    let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
+    for s in &time_build.penalties {
+        if s.nrows() == p_time && s.ncols() == p_time {
+            penalty_blocks.push(PenaltyBlock {
+                matrix: s.clone(),
+                lambda: time_build.smooth_lambda.unwrap_or(1e-2),
+                range: 0..p_time,
+            });
+        }
+    }
+    let ridge_lambda = model.survival_ridge_lambda.unwrap_or(1e-4);
+    let ridge_range_start = if time_build.basis_name == "linear" { 1 } else { 0 };
+    if ridge_lambda > 0.0 && p > ridge_range_start {
+        let dim = p - ridge_range_start;
+        let mut ridge = Array2::<f64>::zeros((dim, dim));
+        for d in 0..dim {
+            ridge[[d, d]] = 1.0;
+        }
+        penalty_blocks.push(PenaltyBlock {
+            matrix: ridge,
+            lambda: ridge_lambda,
+            range: ridge_range_start..p,
+        });
+    }
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    for (idx, block) in penalty_blocks.iter_mut().enumerate() {
+        if let Some(&lam) = fit_saved.lambdas.get(idx) {
+            block.lambda = lam;
+        }
+    }
+    let penalties = PenaltyBlocks::new(penalty_blocks);
+    let survival_spec = match model
+        .survival_spec
+        .as_deref()
+        .unwrap_or("net")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "net" => SurvivalSpec::Net,
+        "crude" => SurvivalSpec::Crude,
+        other => return Err(format!("unsupported saved survival spec '{other}'")),
+    };
+    let monotonicity = MonotonicityPenalty {
+        lambda: 0.0,
+        tolerance: 1e-8,
+    };
+    let baseline_cfg = survival_baseline_config_from_model(model)?;
+    let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
+        build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
+    let mut model_surv = gam::families::royston_parmar::working_model_from_flattened(
+        penalties.clone(),
+        monotonicity,
+        survival_spec,
+        gam::families::royston_parmar::RoystonParmarInputs {
+            age_entry: age_entry.view(),
+            age_exit: age_exit.view(),
+            event_target: event_target.view(),
+            event_competing: event_competing.view(),
+            weights: weights.view(),
+            x_entry: x_entry.view(),
+            x_exit: x_exit.view(),
+            x_derivative: x_derivative.view(),
+            eta_offset_entry: Some(eta_offset_entry.view()),
+            eta_offset_exit: Some(eta_offset_exit.view()),
+            derivative_offset_exit: Some(derivative_offset_exit.view()),
+        },
+    )
+    .map_err(|e| format!("failed to construct survival model: {e}"))?;
+    if time_build.basis_name == "ispline" {
+        model_surv
+            .set_structural_monotonicity(true, p_time)
+            .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
+    }
+    let beta0 = fit_saved.beta.clone();
+    let state = model_surv
+        .update_state(&beta0)
+        .map_err(|e| format!("failed to evaluate survival state: {e}"))?;
+    gam::hmc::run_survival_nuts_sampling_flattened(
+        gam::hmc::SurvivalFlatInputs {
+            age_entry: age_entry.view(),
+            age_exit: age_exit.view(),
+            event_target: event_target.view(),
+            event_competing: event_competing.view(),
+            weights: weights.view(),
+            x_entry: x_entry.view(),
+            x_exit: x_exit.view(),
+            x_derivative: x_derivative.view(),
+            eta_offset_entry: Some(eta_offset_entry.view()),
+            eta_offset_exit: Some(eta_offset_exit.view()),
+            derivative_offset_exit: Some(derivative_offset_exit.view()),
+        },
+        penalties,
+        monotonicity,
+        survival_spec,
+        time_build.basis_name == "ispline",
+        p_time,
+        beta0.view(),
+        state.hessian.view(),
+        cfg,
+    )
+    .map_err(|e| format!("survival NUTS sampling failed: {e}"))
+}
+
+fn run_sample_standard(
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    family: LikelihoodFamily,
+    cfg: &NutsConfig,
+) -> Result<gam::hmc::NutsResult, String> {
+    let parsed = parse_formula(&model.formula)?;
+    let y_col = *col_map
+        .get(&parsed.response)
+        .ok_or_else(|| format!("response column '{}' not found", parsed.response))?;
+    let y = data.column(y_col).to_owned();
+    let spec = resolve_term_spec_for_prediction(
+        &model.resolved_term_spec,
+        training_headers,
+        col_map,
+        "resolved_term_spec",
+    )?;
+    let design = build_term_collection_design(data, &spec)
+        .map_err(|e| format!("failed to build term collection design: {e}"))?;
+    let weights = Array1::ones(data.nrows());
+    let offset = Array1::zeros(data.nrows());
+    let fit = fit_gam(
+        design.design.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &design.penalties,
+        family,
+        &FitOptions {
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            max_iter: 80,
+            tol: 1e-6,
+            nullspace_dims: design.nullspace_dims.clone(),
+            linear_constraints: design.linear_constraints.clone(),
+            adaptive_regularization: None,
+        },
+    )
+    .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
+    let penalty = weighted_penalty_matrix(&design.penalties, fit.lambdas.view())?;
+    run_nuts_sampling_flattened_family(
+        family,
+        FamilyNutsInputs::Glm(GlmFlatInputs {
+            x: design.design.view(),
+            y: y.view(),
+            weights: weights.view(),
+            penalty_matrix: penalty.view(),
+            mode: fit.beta.view(),
+            hessian: fit.penalized_hessian.view(),
+            firth_bias_reduction: false,
+        }),
+        cfg,
+    )
+    .map_err(|e| format!("NUTS sampling failed: {e}"))
 }
 
 fn run_generate(args: GenerateArgs) -> Result<(), String> {
@@ -4054,143 +4071,27 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         .map(|(i, h)| (h.clone(), i))
         .collect();
     let training_headers = model.training_headers.as_ref();
-    let spec = resolve_term_spec_for_prediction(
-        &model.resolved_term_spec,
-        training_headers,
-        &col_map,
-        "resolved_term_spec",
-    )?;
-    if term_spec_has_bounded_terms(&spec) {
-        return Err(
-            "sample is not yet supported for models with bounded() coefficients".to_string(),
-        );
-    }
-    let design = build_term_collection_design(ds.values.view(), &spec)
-        .map_err(|e| format!("failed to build design: {e}"))?;
-    let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
-
-    let spec = if matches!(
-        model.predict_model_class(),
-        PredictModelClass::GaussianLocationScale
-    ) {
-        let beta_mu = fit_saved.beta.clone();
-        let _noise_formula = model
-            .formula_noise
-            .as_ref()
-            .ok_or_else(|| "gaussian-location-scale model is missing formula_noise".to_string())?;
-        let spec_noise = resolve_term_spec_for_prediction(
-            &model.resolved_term_spec_noise,
-            training_headers,
+    let spec = match model.predict_model_class() {
+        PredictModelClass::GaussianLocationScale => run_generate_gaussian_location_scale(
+            &model,
+            ds.values.view(),
             &col_map,
-            "resolved_term_spec_noise",
-        )?;
-        let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
-            .map_err(|e| format!("failed to build noise design: {e}"))?;
-        let beta_noise =
-            Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
-                "gaussian-location-scale model is missing beta_noise".to_string()
-            })?);
-        if beta_mu.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols()
-        {
-            return Err("location-scale model/design dimension mismatch".to_string());
-        }
-        let mean = design.design.dot(&beta_mu);
-        let sigma_min = model.sigma_min.unwrap_or(1e-6);
-        let sigma_max = model.sigma_max.unwrap_or(1e6);
-        let eta_noise = design_noise.design.dot(&beta_noise);
-        let sigma = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max).0;
-        gam::generative::GenerativeSpec {
-            mean,
-            noise: gam::generative::NoiseModel::Gaussian { sigma },
-        }
-    } else if model.is_binomial_location_scale_model() {
-        let saved_link_kind = model.resolved_inverse_link()?.ok_or_else(|| {
-            "saved binomial-location-scale model is missing link state".to_string()
-        })?;
-        let beta_t = fit_saved.beta.clone();
-        let _noise_formula = model
-            .formula_noise
-            .as_ref()
-            .ok_or_else(|| "binomial-location-scale model is missing formula_noise".to_string())?;
-        let spec_noise = resolve_term_spec_for_prediction(
-            &model.resolved_term_spec_noise,
             training_headers,
+        )?,
+        PredictModelClass::BinomialLocationScale => run_generate_binomial_location_scale(
+            &model,
+            ds.values.view(),
             &col_map,
-            "resolved_term_spec_noise",
-        )?;
-        let design_noise = build_term_collection_design(ds.values.view(), &spec_noise)
-            .map_err(|e| format!("failed to build noise design: {e}"))?;
-        let beta_noise =
-            Array1::from_vec(model.beta_noise.clone().ok_or_else(|| {
-                "binomial-location-scale model is missing beta_noise".to_string()
-            })?);
-        if beta_t.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols()
-        {
-            return Err("location-scale model/design dimension mismatch".to_string());
+            training_headers,
+        )?,
+        PredictModelClass::Standard => {
+            run_generate_standard_or_flexible(&model, ds.values.view(), &col_map, training_headers)?
         }
-        let sigma_min = model.sigma_min.unwrap_or(0.05);
-        let sigma_max = model.sigma_max.unwrap_or(20.0);
-        let eta_t = design.design.dot(&beta_t);
-        let eta_noise = design_noise.design.dot(&beta_noise);
-        let sigma = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max).0;
-        let q0 = Array1::from_iter(
-            eta_t
-                .iter()
-                .zip(sigma.iter())
-                .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
-        );
-        let eta = apply_saved_probit_wiggle(&q0, &model)?;
-        let mean = Array1::from_iter(
-            eta.iter()
-                .copied()
-                .map(|v| {
-                    inverse_link_jet_for_inverse_link(&saved_link_kind, v)
-                        .map(|jet| jet.mu.clamp(1e-10, 1.0 - 1e-10))
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("location-scale inverse-link prediction failed: {e}"))?,
-        );
-        gam::generative::GenerativeSpec {
-            mean,
-            noise: gam::generative::NoiseModel::Bernoulli,
-        }
-    } else {
-        let family = model.likelihood();
-        if let Some(joint) = load_joint_result(&model, family)? {
-            if !is_binomial_family(family) {
-                return Err(
-                    "generate for flexible-link models currently supports binomial families only"
-                        .to_string(),
-                );
-            }
-            let beta_base = fit_saved.beta.clone();
-            if beta_base.len() != design.design.ncols() {
-                return Err(format!(
-                    "joint model/design mismatch: beta has {} coefficients but design has {} columns",
-                    beta_base.len(),
-                    design.design.ncols()
-                ));
-            }
-            let eta_base = design.design.dot(&beta_base);
-            let pred = predict_joint(&joint, &eta_base, None);
-            gam::generative::GenerativeSpec {
-                mean: pred.probabilities,
-                noise: gam::generative::NoiseModel::Bernoulli,
-            }
-        } else {
-            let beta = fit_saved.beta.clone();
-            if beta.len() != design.design.ncols() {
-                return Err(format!(
-                    "model/design mismatch: model beta has {} coefficients but design has {} columns",
-                    beta.len(),
-                    design.design.ncols()
-                ));
-            }
-            let offset = Array1::zeros(design.design.nrows());
-            let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
-                .map_err(|e| format!("predict_gam failed: {e}"))?;
-            generative_spec_from_predict(pred, family, Some(fit_saved.scale))
-                .map_err(|e| format!("failed to build generative spec: {e}"))?
+        PredictModelClass::Survival => {
+            return Err(
+                "generate is not available for survival models in this command; use survival-specific simulation APIs"
+                    .to_string(),
+            )
         }
     };
 
@@ -4207,6 +4108,185 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         draws.ncols()
     );
     Ok(())
+}
+
+fn run_generate_gaussian_location_scale(
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+) -> Result<gam::generative::GenerativeSpec, String> {
+    let spec = resolve_term_spec_for_prediction(
+        &model.resolved_term_spec,
+        training_headers,
+        col_map,
+        "resolved_term_spec",
+    )?;
+    if term_spec_has_bounded_terms(&spec) {
+        return Err("sample is not yet supported for models with bounded() coefficients".to_string());
+    }
+    let design = build_term_collection_design(data, &spec)
+        .map_err(|e| format!("failed to build design: {e}"))?;
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    let beta_mu = fit_saved.beta.clone();
+    let _noise_formula = model
+        .formula_noise
+        .as_ref()
+        .ok_or_else(|| "gaussian-location-scale model is missing formula_noise".to_string())?;
+    let spec_noise = resolve_term_spec_for_prediction(
+        &model.resolved_term_spec_noise,
+        training_headers,
+        col_map,
+        "resolved_term_spec_noise",
+    )?;
+    let design_noise = build_term_collection_design(data, &spec_noise)
+        .map_err(|e| format!("failed to build noise design: {e}"))?;
+    let beta_noise = Array1::from_vec(
+        model
+            .beta_noise
+            .clone()
+            .ok_or_else(|| "gaussian-location-scale model is missing beta_noise".to_string())?,
+    );
+    if beta_mu.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols() {
+        return Err("location-scale model/design dimension mismatch".to_string());
+    }
+    let mean = design.design.dot(&beta_mu);
+    let sigma_min = model.sigma_min.unwrap_or(1e-6);
+    let sigma_max = model.sigma_max.unwrap_or(1e6);
+    let eta_noise = design_noise.design.dot(&beta_noise);
+    let sigma = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max).0;
+    Ok(gam::generative::GenerativeSpec {
+        mean,
+        noise: gam::generative::NoiseModel::Gaussian { sigma },
+    })
+}
+
+fn run_generate_binomial_location_scale(
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+) -> Result<gam::generative::GenerativeSpec, String> {
+    let spec = resolve_term_spec_for_prediction(
+        &model.resolved_term_spec,
+        training_headers,
+        col_map,
+        "resolved_term_spec",
+    )?;
+    if term_spec_has_bounded_terms(&spec) {
+        return Err("sample is not yet supported for models with bounded() coefficients".to_string());
+    }
+    let design = build_term_collection_design(data, &spec)
+        .map_err(|e| format!("failed to build design: {e}"))?;
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    let saved_link_kind = model
+        .resolved_inverse_link()?
+        .ok_or_else(|| "saved binomial-location-scale model is missing link state".to_string())?;
+    let beta_t = fit_saved.beta.clone();
+    let _noise_formula = model
+        .formula_noise
+        .as_ref()
+        .ok_or_else(|| "binomial-location-scale model is missing formula_noise".to_string())?;
+    let spec_noise = resolve_term_spec_for_prediction(
+        &model.resolved_term_spec_noise,
+        training_headers,
+        col_map,
+        "resolved_term_spec_noise",
+    )?;
+    let design_noise = build_term_collection_design(data, &spec_noise)
+        .map_err(|e| format!("failed to build noise design: {e}"))?;
+    let beta_noise = Array1::from_vec(
+        model
+            .beta_noise
+            .clone()
+            .ok_or_else(|| "binomial-location-scale model is missing beta_noise".to_string())?,
+    );
+    if beta_t.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols() {
+        return Err("location-scale model/design dimension mismatch".to_string());
+    }
+    let sigma_min = model.sigma_min.unwrap_or(0.05);
+    let sigma_max = model.sigma_max.unwrap_or(20.0);
+    let eta_t = design.design.dot(&beta_t);
+    let eta_noise = design_noise.design.dot(&beta_noise);
+    let sigma = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max).0;
+    let q0 = Array1::from_iter(
+        eta_t
+            .iter()
+            .zip(sigma.iter())
+            .map(|(&t, &s)| (-t / s.max(1e-12)).clamp(-30.0, 30.0)),
+    );
+    let eta = apply_saved_probit_wiggle(&q0, model)?;
+    let mean = Array1::from_iter(
+        eta.iter()
+            .copied()
+            .map(|v| {
+                inverse_link_jet_for_inverse_link(&saved_link_kind, v)
+                    .map(|jet| jet.mu.clamp(1e-10, 1.0 - 1e-10))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("location-scale inverse-link prediction failed: {e}"))?,
+    );
+    Ok(gam::generative::GenerativeSpec {
+        mean,
+        noise: gam::generative::NoiseModel::Bernoulli,
+    })
+}
+
+fn run_generate_standard_or_flexible(
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+) -> Result<gam::generative::GenerativeSpec, String> {
+    let spec = resolve_term_spec_for_prediction(
+        &model.resolved_term_spec,
+        training_headers,
+        col_map,
+        "resolved_term_spec",
+    )?;
+    if term_spec_has_bounded_terms(&spec) {
+        return Err("sample is not yet supported for models with bounded() coefficients".to_string());
+    }
+    let design = build_term_collection_design(data, &spec)
+        .map_err(|e| format!("failed to build design: {e}"))?;
+    let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    let family = model.likelihood();
+    if let Some(joint) = load_joint_result(model, family)? {
+        if !is_binomial_family(family) {
+            return Err(
+                "generate for flexible-link models currently supports binomial families only"
+                    .to_string(),
+            );
+        }
+        let beta_base = fit_saved.beta.clone();
+        if beta_base.len() != design.design.ncols() {
+            return Err(format!(
+                "joint model/design mismatch: beta has {} coefficients but design has {} columns",
+                beta_base.len(),
+                design.design.ncols()
+            ));
+        }
+        let eta_base = design.design.dot(&beta_base);
+        let pred = predict_joint(&joint, &eta_base, None);
+        Ok(gam::generative::GenerativeSpec {
+            mean: pred.probabilities,
+            noise: gam::generative::NoiseModel::Bernoulli,
+        })
+    } else {
+        let beta = fit_saved.beta.clone();
+        if beta.len() != design.design.ncols() {
+            return Err(format!(
+                "model/design mismatch: model beta has {} coefficients but design has {} columns",
+                beta.len(),
+                design.design.ncols()
+            ));
+        }
+        let offset = Array1::zeros(design.design.nrows());
+        let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
+            .map_err(|e| format!("predict_gam failed: {e}"))?;
+        generative_spec_from_predict(pred, family, Some(fit_saved.scale))
+            .map_err(|e| format!("failed to build generative spec: {e}"))
+    }
 }
 
 fn run_report(args: ReportArgs) -> Result<(), String> {
