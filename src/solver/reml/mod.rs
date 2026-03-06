@@ -1094,6 +1094,7 @@ struct FirthDenseOperator {
     // We store reduced-space factors so all derivatives can be evaluated exactly
     // without materializing dense n×n matrices M = X K Xᵀ or P = M⊙M.
     x_dense: Array2<f64>,
+    x_dense_t: Array2<f64>,
     q_basis: Array2<f64>,
     // X_r = XQ
     x_reduced: Array2<f64>,
@@ -1112,6 +1113,7 @@ struct FirthDenseOperator {
     w4: Array1<f64>,
     // B = diag(w') X used in D H_phi and D^2 H_phi contractions.
     b_base: Array2<f64>,
+    b_base_t: Array2<f64>,
     // Cached invariant contraction P*B where P = (X_r K_r X_r') ⊙ (X_r K_r X_r').
     // This avoids recomputing the same O(n r^2 p) block in every directional call.
     p_b_base: Array2<f64>,
