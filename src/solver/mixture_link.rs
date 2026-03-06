@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::probability::{normal_cdf_approx, normal_pdf};
+use crate::probability::{normal_cdf, normal_pdf};
 use crate::types::{
     InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, MixtureLinkState,
     SasLinkSpec, SasLinkState,
@@ -36,230 +36,51 @@ fn canonicalize_jet(mut jet: InverseLinkJet) -> InverseLinkJet {
 }
 
 #[inline]
-fn probit_approx_jet(eta: f64) -> InverseLinkJet {
-    // Match `normal_cdf_approx` exactly, but with analytic derivatives wrt eta.
+fn probit_jet(eta: f64) -> InverseLinkJet {
+    // Exact probit semantics:
     //
-    // The approximation used in `normal_cdf_approx` is
+    //   mu(eta) = Phi(eta),
+    //   mu'     = phi(eta),
+    //   mu''    = -eta * phi(eta),
+    //   mu'''   = (eta^2 - 1) * phi(eta).
     //
-    //   Phi(x) ≈ F(x)
-    //         = 1 - phi(z) P(t),              x >= 0
-    //         = 1 - F(-x),                    x < 0
-    //
-    // with
-    //
-    //   z = |x|,
-    //   t = (1 + a z)^(-1),
-    //   P(t) = c1 t + c2 t^2 + c3 t^3 + c4 t^4 + c5 t^5.
-    //
-    // For x > 0, derivatives are taken with respect to z:
-    //
-    //   F'(z)  = -d/dz [phi(z) P(t(z))]
-    //   F''(z) = -d^2/dz^2 [phi(z) P(t(z))]
-    //   F'''(z)= -d^3/dz^3 [phi(z) P(t(z))].
-    //
-    // We use the standard normal derivative identities
-    //
-    //   phi'(z)   = -z phi(z),
-    //   phi''(z)  = (z^2 - 1) phi(z),
-    //   phi'''(z) = -(z^3 - 3z) phi(z),
-    //
-    // and the chain rule through t(z):
-    //
-    //   t'   = -a t^2,
-    //   t''  =  2 a^2 t^3,
-    //   t''' = -6 a^3 t^4.
-    //
-    // This yields exact derivatives of the *implemented approximation surface*,
-    // not of the true probit CDF. That distinction matters: the surrounding code
-    // must remain algebraically consistent with `normal_cdf_approx`, otherwise the
-    // higher-order derivatives used in REML/Hessian paths drift from the actual
-    // value surface.
-    //
-    // At x = 0 the approximation is only C^0 in the raw `|x|` representation,
-    // while downstream tests and algorithms use symmetric finite-difference limits.
-    // We therefore splice in the centered derivative limits at the cusp for d1/d3
-    // and enforce the even-symmetry limit d2(0)=0 so the jet matches the effective
-    // local behavior of the production approximation.
-    const A: f64 = 0.231_641_9;
-    const C1: f64 = 0.319_381_530;
-    const C2: f64 = -0.356_563_782;
-    const C3: f64 = 1.781_477_937;
-    const C4: f64 = -1.821_255_978;
-    const C5: f64 = 1.330_274_429;
-
-    let x = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
-    let z = x.abs();
-    let t = 1.0 / (1.0 + A * z);
-    let t2 = t * t;
-    let t3 = t2 * t;
-    let t4 = t3 * t;
-    let t5 = t4 * t;
-    let p = C1 * t + C2 * t2 + C3 * t3 + C4 * t4 + C5 * t5;
-    let pt = C1 + 2.0 * C2 * t + 3.0 * C3 * t2 + 4.0 * C4 * t3 + 5.0 * C5 * t4;
-    let ptt = 2.0 * C2 + 6.0 * C3 * t + 12.0 * C4 * t2 + 20.0 * C5 * t3;
-    let pttt = 6.0 * C3 + 24.0 * C4 * t + 60.0 * C5 * t2;
-
-    let dt = -A * t2;
-    let d2t = 2.0 * A * A * t3;
-    let d3t = -6.0 * A * A * A * t4;
-    let pz = pt * dt;
-    let pzz = ptt * dt * dt + pt * d2t;
-    let pzzz = pttt * dt * dt * dt + 3.0 * ptt * dt * d2t + pt * d3t;
-
-    let phi = normal_pdf(z);
-    let phi1 = -z * phi;
-    let phi2 = (z * z - 1.0) * phi;
-    let phi3 = -(z * z * z - 3.0 * z) * phi;
-
-    let f_pos = 1.0 - phi * p;
-    let f1 = -(phi1 * p + phi * pz);
-    let f2 = -(phi2 * p + 2.0 * phi1 * pz + phi * pzz);
-    let f3 = -(phi3 * p + 3.0 * phi2 * pz + 3.0 * phi1 * pzz + phi * pzzz);
-
-    let mu = if x >= 0.0 { f_pos } else { 1.0 - f_pos };
-    let d1 = if x.abs() < 1e-8 {
-        // Centered limit at the |x| cusp:
-        //   d1(0) := lim_h [F(h)-F(-h)] / (2h).
-        let h = 1e-5;
-        let mp = normal_cdf_approx(h);
-        let mm = normal_cdf_approx(-h);
-        (mp - mm) / (2.0 * h)
-    } else {
-        f1
-    };
-    let at_zero = x.abs() < 1e-8;
-    let d2 = if at_zero {
-        // Even-symmetry limit at the cusp:
-        //   d2(0) := 0
-        // for the symmetric centered interpretation of the approximation.
-        0.0
-    } else if x >= 0.0 {
-        f2
-    } else {
-        -f2
-    };
-    let d3 = if at_zero {
-        // Centered third-derivative limit via the already-correct d2 branches:
-        //   d3(0) := lim_h [d2(h)-d2(-h)] / (2h).
-        let h = 1e-5;
-        let jp = probit_approx_jet(h);
-        let jm = probit_approx_jet(-h);
-        (jp.d2 - jm.d2) / (2.0 * h)
-    } else {
-        f3
-    };
+    // `normal_cdf` now evaluates the exact special-function form
+    // Phi(x) = 0.5 * erfc(-x / sqrt(2)), so the jet can and should use the
+    // matching closed-form Gaussian identities directly.
+    let x = if eta.is_finite() { eta } else { 0.0 };
+    let phi = normal_pdf(x);
     InverseLinkJet {
-        mu,
-        d1,
-        d2,
-        d3,
+        mu: normal_cdf(x),
+        d1: phi,
+        d2: -x * phi,
+        d3: (x * x - 1.0) * phi,
     }
 }
 
 #[inline]
-fn probit_approx_pdf_third_derivative(eta: f64) -> f64 {
-    // Fourth eta-derivative of the production `normal_cdf_approx` surface.
+fn probit_pdf_third_derivative(eta: f64) -> f64 {
+    // Since d1 = mu' = phi(eta), this returns
     //
-    // The probit approximation used in this file is
-    //
-    //   F(x) = 1 - phi(z) P(t(z)),   z = |x|,   t = (1 + A z)^(-1),
-    //
-    // on the `x >= 0` branch, with the reflected branch for `x < 0`.
-    //
-    // We already use:
-    //
-    //   F'(z)   = -(phi' P + phi P')
-    //   F''(z)  = -(phi'' P + 2 phi' P' + phi P'')
-    //   F'''(z) = -(phi''' P + 3 phi'' P' + 3 phi' P'' + phi P''').
-    //
-    // The next derivative is the same binomial product-rule pattern:
-    //
-    //   F''''(z)
-    //   = -(phi'''' P
-    //       + 4 phi''' P'
-    //       + 6 phi'' P''
-    //       + 4 phi' P'''
-    //       + phi P'''').
-    //
-    // Here `P'`, `P''`, `P'''`, `P''''` mean derivatives wrt `z`, obtained from
-    // repeated chain rule through `t(z)`:
-    //
-    //   P_z     = P_t t'
-    //   P_zz    = P_tt (t')² + P_t t''
-    //   P_zzz   = P_ttt (t')³ + 3 P_tt t' t'' + P_t t'''
-    //   P_zzzz  = P_tttt (t')⁴
-    //           + 6 P_ttt (t')² t''
-    //           + 3 P_tt (t'')²
-    //           + 4 P_tt t' t'''
-    //           + P_t t''''.
-    //
-    // Since `d1 = F'`, this function returns
-    //
-    //   d³/deta³ d1 = F''''.
-    //
-    // That is exactly the `f'''` quantity needed by
-    // `d³/du³ log f = f'''/f - 3 f'f''/f² + 2(f')³/f³`
-    // in the survival exact-Newton path.
-    const A: f64 = 0.231_641_9;
-    const C1: f64 = 0.319_381_530;
-    const C2: f64 = -0.356_563_782;
-    const C3: f64 = 1.781_477_937;
-    const C4: f64 = -1.821_255_978;
-    const C5: f64 = 1.330_274_429;
+    //   d³/deta³ d1 = mu'''' = -(eta³ - 3 eta) phi(eta).
+    let x = if eta.is_finite() { eta } else { 0.0 };
+    let phi = normal_pdf(x);
+    canonical_zero(-(x * x * x - 3.0 * x) * phi)
+}
 
-    let x = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
-    let z = x.abs();
-    let t = 1.0 / (1.0 + A * z);
-    let t2 = t * t;
-    let t3 = t2 * t;
-    let t4 = t3 * t;
-    let t5 = t4 * t;
-    let p = C1 * t + C2 * t2 + C3 * t3 + C4 * t4 + C5 * t5;
-    let pt = C1 + 2.0 * C2 * t + 3.0 * C3 * t2 + 4.0 * C4 * t3 + 5.0 * C5 * t4;
-    let ptt = 2.0 * C2 + 6.0 * C3 * t + 12.0 * C4 * t2 + 20.0 * C5 * t3;
-    let pttt = 6.0 * C3 + 24.0 * C4 * t + 60.0 * C5 * t2;
-    let ptttt = 24.0 * C4 + 120.0 * C5 * t;
-
-    let dt = -A * t2;
-    let d2t = 2.0 * A * A * t3;
-    let d3t = -6.0 * A * A * A * t4;
-    let d4t = 24.0 * A * A * A * A * t5;
-    let pz = pt * dt;
-    let pzz = ptt * dt * dt + pt * d2t;
-    let pzzz = pttt * dt * dt * dt + 3.0 * ptt * dt * d2t + pt * d3t;
-    let pzzzz = ptttt * dt.powi(4)
-        + 6.0 * pttt * dt * dt * d2t
-        + 3.0 * ptt * d2t * d2t
-        + 4.0 * ptt * dt * d3t
-        + pt * d4t;
-
-    let phi = normal_pdf(z);
-    let phi1 = -z * phi;
-    let phi2 = (z * z - 1.0) * phi;
-    let phi3 = -(z * z * z - 3.0 * z) * phi;
-    let phi4 = (z.powi(4) - 6.0 * z * z + 3.0) * phi;
-    let f4 = -(phi4 * p
-        + 4.0 * phi3 * pz
-        + 6.0 * phi2 * pzz
-        + 4.0 * phi1 * pzzz
-        + phi * pzzzz);
-    canonical_zero(if x.abs() < 1e-8 {
-        let h = 1e-4;
-        let jp = probit_approx_jet(h);
-        let jm = probit_approx_jet(-h);
-        let j0 = probit_approx_jet(0.0);
-        (jp.d3 - 2.0 * j0.d3 + jm.d3) / (h * h)
-    } else if x >= 0.0 {
-        f4
-    } else {
-        -f4
-    })
+#[inline]
+fn chain_inverse_link_jet(base: InverseLinkJet, z1: f64, z2: f64, z3: f64) -> InverseLinkJet {
+    InverseLinkJet {
+        mu: base.mu,
+        d1: base.d1 * z1,
+        d2: base.d2 * z1 * z1 + base.d1 * z2,
+        d3: base.d3 * z1 * z1 * z1 + 3.0 * base.d2 * z1 * z2 + base.d1 * z3,
+    }
 }
 
 #[inline]
 fn component_inverse_link_pdf_third_derivative(component: LinkComponent, eta: f64) -> f64 {
     match component {
-        LinkComponent::Probit => probit_approx_pdf_third_derivative(eta),
+        LinkComponent::Probit => probit_pdf_third_derivative(eta),
         LinkComponent::Logit => {
             // Logistic link:
             //   mu'   = d1 = mu(1-mu)
@@ -267,6 +88,9 @@ fn component_inverse_link_pdf_third_derivative(component: LinkComponent, eta: f6
             //   d2'   = d3 = d1(1-6mu+6mu²)
             //   d3'   = d4 = d1(1-14mu+36mu²-24mu³).
             let e = eta.clamp(-ETA_CLAMP_LOGIT, ETA_CLAMP_LOGIT);
+            if e != eta {
+                return 0.0;
+            }
             let mu = 1.0 / (1.0 + (-e).exp());
             let d1 = mu * (1.0 - mu);
             d1 * (1.0 - 14.0 * mu + 36.0 * mu * mu - 24.0 * mu * mu * mu)
@@ -280,6 +104,9 @@ fn component_inverse_link_pdf_third_derivative(component: LinkComponent, eta: f6
             //   d3 = d1(t² - 3t + 1)
             //   d4 = d1(-t³ + 6t² - 7t + 1).
             let e = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
+            if e != eta {
+                return 0.0;
+            }
             let t = e.exp();
             let d1 = t * (-t).exp();
             d1 * (1.0 - 7.0 * t + 6.0 * t * t - t * t * t)
@@ -292,6 +119,9 @@ fn component_inverse_link_pdf_third_derivative(component: LinkComponent, eta: f6
             //   d3 = d1(r² - 3r + 1)
             //   d4 = d1(r³ - 6r² + 7r - 1).
             let e = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
+            if e != eta {
+                return 0.0;
+            }
             let r = (-e).exp();
             let d1 = (-r).exp() * r;
             d1 * (r * r * r - 6.0 * r * r + 7.0 * r - 1.0)
@@ -305,6 +135,9 @@ fn component_inverse_link_pdf_third_derivative(component: LinkComponent, eta: f6
             //
             //   d4 = 24 eta (1-eta²) / [pi (1+eta²)^4].
             let z = eta.clamp(-1e6, 1e6);
+            if z != eta {
+                return 0.0;
+            }
             let denom = 1.0 + z * z;
             24.0 * z * (1.0 - z * z) / (std::f64::consts::PI * denom.powi(4))
         }
@@ -521,26 +354,24 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
     canonicalize_jet(match component {
         LinkComponent::Logit => {
             let e = eta.clamp(-ETA_CLAMP_LOGIT, ETA_CLAMP_LOGIT);
+            let clamped = e != eta;
             let mu = 1.0 / (1.0 + (-e).exp());
-            let d1 = mu * (1.0 - mu);
-            let d2 = d1 * (1.0 - 2.0 * mu);
-            let d3 = d1 * (1.0 - 6.0 * d1);
+            let d1 = if clamped { 0.0 } else { mu * (1.0 - mu) };
+            let d2 = if clamped { 0.0 } else { d1 * (1.0 - 2.0 * mu) };
+            let d3 = if clamped { 0.0 } else { d1 * (1.0 - 6.0 * d1) };
             InverseLinkJet { mu, d1, d2, d3 }
         }
         LinkComponent::Probit => {
-            probit_approx_jet(eta)
+            probit_jet(eta)
         }
         LinkComponent::CLogLog => {
             let e = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
+            let clamped = e != eta;
             let t = e.exp();
             let s = (-t).exp();
-            let d1 = t * s;
-            let d2 = if (t - 1.0).abs() < 1e-14 {
-                -1e-11
-            } else {
-                -d1 * (t - 1.0)
-            };
-            let d3 = d1 * (t * t - 3.0 * t + 1.0);
+            let d1 = if clamped { 0.0 } else { t * s };
+            let d2 = if clamped { 0.0 } else { -d1 * (t - 1.0) };
+            let d3 = if clamped { 0.0 } else { d1 * (t * t - 3.0 * t + 1.0) };
             InverseLinkJet {
                 mu: 1.0 - s,
                 d1,
@@ -550,19 +381,33 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
         }
         LinkComponent::LogLog => {
             let e = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
+            let clamped = e != eta;
             let r = (-e).exp();
             let mu = (-r).exp();
-            let d1 = mu * r;
-            let d2 = d1 * (r - 1.0);
-            let d3 = d1 * (r * r - 3.0 * r + 1.0);
+            let d1 = if clamped { 0.0 } else { mu * r };
+            let d2 = if clamped { 0.0 } else { d1 * (r - 1.0) };
+            let d3 = if clamped { 0.0 } else { d1 * (r * r - 3.0 * r + 1.0) };
             InverseLinkJet { mu, d1, d2, d3 }
         }
         LinkComponent::Cauchit => {
-            let e = eta;
+            let e = eta.clamp(-1e6, 1e6);
+            let clamped = e != eta;
             let den = 1.0 + e * e;
-            let d1 = 1.0 / (std::f64::consts::PI * den);
-            let d2 = -2.0 * e / (std::f64::consts::PI * den * den);
-            let d3 = (6.0 * e * e - 2.0) / (std::f64::consts::PI * den * den * den);
+            let d1 = if clamped {
+                0.0
+            } else {
+                1.0 / (std::f64::consts::PI * den)
+            };
+            let d2 = if clamped {
+                0.0
+            } else {
+                -2.0 * e / (std::f64::consts::PI * den * den)
+            };
+            let d3 = if clamped {
+                0.0
+            } else {
+                (6.0 * e * e - 2.0) / (std::f64::consts::PI * den * den * den)
+            };
             InverseLinkJet {
                 mu: 0.5 + e.atan() / std::f64::consts::PI,
                 d1,
@@ -743,7 +588,7 @@ pub fn inverse_link_pdf_third_derivative_for_inverse_link(
     // because the mixture weights `pi_j` are constant with respect to `eta`.
     match link {
         InverseLink::Standard(LinkFunction::Identity) => Ok(0.0),
-        InverseLink::Standard(LinkFunction::Probit) => Ok(probit_approx_pdf_third_derivative(eta)),
+        InverseLink::Standard(LinkFunction::Probit) => Ok(probit_pdf_third_derivative(eta)),
         InverseLink::Standard(LinkFunction::Logit) => {
             Ok(component_inverse_link_pdf_third_derivative(
                 LinkComponent::Logit,
@@ -979,6 +824,7 @@ pub fn mixture_inverse_link_jet_with_rho_partials_into(
 #[inline]
 fn logistic_u_with_derivatives(eta: f64) -> (f64, f64) {
     let e = eta.clamp(-ETA_CLAMP_LOGIT, ETA_CLAMP_LOGIT);
+    let eta_clamped = e != eta;
     let u = if e >= 0.0 {
         let z = (-e).exp();
         1.0 / (1.0 + z)
@@ -986,8 +832,10 @@ fn logistic_u_with_derivatives(eta: f64) -> (f64, f64) {
         let z = e.exp();
         z / (1.0 + z)
     };
-    let u = u.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
-    let du = u * (1.0 - u);
+    let u_clamped = u.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
+    let clamp_active = eta_clamped || u_clamped != u;
+    let du = if clamp_active { 0.0 } else { u_clamped * (1.0 - u_clamped) };
+    let u = u_clamped;
     (u, du)
 }
 
@@ -999,7 +847,17 @@ pub fn beta_logistic_inverse_link_jet(eta: f64, delta: f64, epsilon: f64) -> Inv
     let (u, du) = logistic_u_with_derivatives(eta);
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
-    let mu = beta_reg(a, b, u).clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
+    let raw_mu = beta_reg(a, b, u);
+    let mu = raw_mu.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
+    let mu_clamped = mu != raw_mu;
+    if mu_clamped || du == 0.0 {
+        return InverseLinkJet {
+            mu,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+        };
+    }
     let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
     let d1 = log_d1.exp();
     let t = a * (1.0 - u) - b * u;
@@ -1036,8 +894,16 @@ pub fn beta_logistic_inverse_link_pdf_third_derivative(
     //
     // since `t' = -c u'`.
     let (u, du) = logistic_u_with_derivatives(eta);
+    if du == 0.0 {
+        return 0.0;
+    }
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
+    let raw_mu = beta_reg(a, b, u);
+    let mu = raw_mu.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
+    if mu != raw_mu {
+        return 0.0;
+    }
     let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
     let d1 = log_d1.exp();
     let c = a + b;
@@ -1054,7 +920,31 @@ pub fn beta_logistic_inverse_link_jet_with_param_partials(
     let (u, du) = logistic_u_with_derivatives(eta);
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
-    let mu = beta_reg(a, b, u).clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
+    let raw_mu = beta_reg(a, b, u);
+    let mu = raw_mu.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
+    if du == 0.0 || mu != raw_mu {
+        let zero = InverseLinkJet {
+            mu,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+        };
+        return SasJetWithParamPartials {
+            jet: zero,
+            djet_depsilon: InverseLinkJet {
+                mu: 0.0,
+                d1: 0.0,
+                d2: 0.0,
+                d3: 0.0,
+            },
+            djet_dlog_delta: InverseLinkJet {
+                mu: 0.0,
+                d1: 0.0,
+                d2: 0.0,
+                d3: 0.0,
+            },
+        };
+    }
     let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
     let d1 = log_d1.exp();
     let t = a * (1.0 - u) - b * u;
@@ -1123,7 +1013,6 @@ pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLi
     let s = u.sinh();
     let c = u.cosh();
     let z = s;
-    let phi = normal_pdf(z);
     let q = e.hypot(1.0);
     let inv_q = 1.0 / q;
     let inv_q2 = inv_q * inv_q;
@@ -1138,11 +1027,8 @@ pub fn sas_inverse_link_jet(eta: f64, epsilon: f64, log_delta: f64) -> InverseLi
     let z1 = c * u1;
     let z2 = s * u1 * u1 + c * u2;
     let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
-    let mu = normal_cdf_approx(z);
-    let d1 = phi * z1;
-    let d2 = phi * (z2 - z * z1 * z1);
-    let d3 = phi * (z3 - 3.0 * z * z1 * z2 + (z * z - 1.0) * z1 * z1 * z1);
-    InverseLinkJet { mu, d1, d2, d3 }
+    let base = probit_jet(z);
+    chain_inverse_link_jet(base, z1, z2, z3)
 }
 
 pub fn sas_inverse_link_pdf_third_derivative(eta: f64, epsilon: f64, log_delta: f64) -> f64 {
@@ -1193,7 +1079,7 @@ pub fn sas_inverse_link_pdf_third_derivative(eta: f64, epsilon: f64, log_delta: 
     let s = u.sinh();
     let c = u.cosh();
     let z = s;
-    let phi = normal_pdf(z);
+    let base = probit_jet(z);
     let q = e.hypot(1.0);
     let inv_q = 1.0 / q;
     let inv_q2 = inv_q * inv_q;
@@ -1220,12 +1106,13 @@ pub fn sas_inverse_link_pdf_third_derivative(eta: f64, epsilon: f64, log_delta: 
         + 3.0 * s * u2 * u2
         + 4.0 * s * u1 * u3
         + c * u4;
-    let k3 = z3 - 3.0 * z * z1 * z2 + (z * z - 1.0) * z1 * z1 * z1;
-    let k4 = z4
-        - 3.0 * (z1 * z1 * z2 + z * z2 * z2 + z * z1 * z3)
-        + 2.0 * z * z1.powi(4)
-        + 3.0 * (z * z - 1.0) * z1 * z1 * z2;
-    canonical_zero(phi * (k4 - z * z1 * k3))
+    let base4 = probit_pdf_third_derivative(z);
+    let out = base4 * z1.powi(4)
+        + 6.0 * base.d3 * z1 * z1 * z2
+        + 3.0 * base.d2 * z2 * z2
+        + 4.0 * base.d2 * z1 * z3
+        + base.d1 * z4;
+    canonical_zero(out)
 }
 
 pub fn sas_inverse_link_jet_with_param_partials(
@@ -1247,8 +1134,6 @@ pub fn sas_inverse_link_jet_with_param_partials(
     let s = u.sinh();
     let c = u.cosh();
     let z = s;
-    let phi = normal_pdf(z);
-
     let q = e.hypot(1.0);
     let inv_q = 1.0 / q;
     let inv_q2 = inv_q * inv_q;
@@ -1267,12 +1152,8 @@ pub fn sas_inverse_link_jet_with_param_partials(
     let z2 = s * u1 * u1 + c * u2;
     let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
 
-    let base = InverseLinkJet {
-        mu: normal_cdf_approx(z),
-        d1: phi * z1,
-        d2: phi * (z2 - z * z1 * z1),
-        d3: phi * (z3 - 3.0 * z * z1 * z2 + (z * z - 1.0) * z1 * z1 * z1),
-    };
+    let base = probit_jet(z);
+    let jet = chain_inverse_link_jet(base, z1, z2, z3);
 
     // Generic chain for parameter t:
     // u_t, u1_t, u2_t, u3_t -> z_t,z1_t,z2_t,z3_t -> mu_t,d1_t,d2_t,d3_t
@@ -1287,25 +1168,16 @@ pub fn sas_inverse_link_jet_with_param_partials(
             + s * u_t * u3
             + c * u3_t;
 
-        let phi_t = -z * phi * z_t;
-        let mu_t = phi * z_t;
-        let d1_t = phi_t * z1 + phi * z1_t;
-
-        let k2 = z2 - z * z1 * z1;
-        let k2_t = z2_t - z_t * z1 * z1 - z * 2.0 * z1 * z1_t;
-        let d2_t = phi_t * k2 + phi * k2_t;
-
-        let k3 = z3 - 3.0 * z * z1 * z2 + (z * z - 1.0) * z1 * z1 * z1;
-        let k3_t = z3_t - 3.0 * (z_t * z1 * z2 + z * z1_t * z2 + z * z1 * z2_t)
-            + 2.0 * z * z_t * z1 * z1 * z1
-            + (z * z - 1.0) * 3.0 * z1 * z1 * z1_t;
-        let d3_t = phi_t * k3 + phi * k3_t;
-
         InverseLinkJet {
-            mu: mu_t,
-            d1: d1_t,
-            d2: d2_t,
-            d3: d3_t,
+            mu: base.d1 * z_t,
+            d1: base.d2 * z_t * z1 + base.d1 * z1_t,
+            d2: base.d3 * z_t * z1 * z1 + 2.0 * base.d2 * z1 * z1_t + base.d2 * z_t * z2 + base.d1 * z2_t,
+            d3: probit_pdf_third_derivative(z) * z_t * z1.powi(3)
+                + 3.0 * base.d3 * z1 * z1 * z1_t
+                + 3.0 * base.d3 * z_t * z1 * z2
+                + 3.0 * base.d2 * (z1_t * z2 + z1 * z2_t)
+                + base.d2 * z_t * z3
+                + base.d1 * z3_t,
         }
     };
 
@@ -1342,7 +1214,7 @@ pub fn sas_inverse_link_jet_with_param_partials(
     let djet_dlog_delta = param_partials(u_ld, u1_ld, u2_ld, u3_ld);
 
     SasJetWithParamPartials {
-        jet: base,
+        jet,
         djet_depsilon,
         djet_dlog_delta,
     }
@@ -1646,23 +1518,29 @@ mod tests {
                 } else {
                     4e-4
                 };
-                assert_eq!(
-                    j0.d1.signum(),
-                    d1_fd.signum(),
-                    "d1 sign mismatch for {c:?} eta={eta}"
-                );
-                assert_eq!(
-                    j0.d2.signum(),
-                    d2_fd.signum(),
-                    "d2 sign mismatch for {c:?} eta={eta}: analytic={} fd={}",
-                    j0.d2,
-                    d2_fd
-                );
-                assert_eq!(
-                    j0.d3.signum(),
-                    d3_fd.signum(),
-                    "d3 sign mismatch for {c:?} eta={eta}"
-                );
+                if j0.d1.abs().max(d1_fd.abs()) > 1e-10 {
+                    assert_eq!(
+                        j0.d1.signum(),
+                        d1_fd.signum(),
+                        "d1 sign mismatch for {c:?} eta={eta}"
+                    );
+                }
+                if j0.d2.abs().max(d2_fd.abs()) > 1e-10 {
+                    assert_eq!(
+                        j0.d2.signum(),
+                        d2_fd.signum(),
+                        "d2 sign mismatch for {c:?} eta={eta}: analytic={} fd={}",
+                        j0.d2,
+                        d2_fd
+                    );
+                }
+                if j0.d3.abs().max(d3_fd.abs()) > 1e-10 {
+                    assert_eq!(
+                        j0.d3.signum(),
+                        d3_fd.signum(),
+                        "d3 sign mismatch for {c:?} eta={eta}"
+                    );
+                }
                 assert!(
                     (j0.d1 - d1_fd).abs() < d1_tol,
                     "d1 mismatch for {c:?} eta={eta}: analytic={} fd={}",

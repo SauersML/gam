@@ -835,7 +835,7 @@ pub fn probit_posterior_mean_with_deriv_exact(mu: f64, sigma: f64) -> Integrated
     // So this path is genuinely exact: no node count, no truncation, and no
     // approximation regime split.
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= 1e-12 {
-        let mean = crate::probability::normal_cdf_approx(mu);
+        let mean = crate::probability::normal_cdf(mu);
         let dmean_dmu = crate::probability::normal_pdf(mu);
         return IntegratedMeanDerivative {
             mean,
@@ -846,7 +846,7 @@ pub fn probit_posterior_mean_with_deriv_exact(mu: f64, sigma: f64) -> Integrated
     let denom = (1.0 + sigma * sigma).sqrt();
     let z = mu / denom;
     IntegratedMeanDerivative {
-        mean: crate::probability::normal_cdf_approx(z),
+        mean: crate::probability::normal_cdf(z),
         dmean_dmu: crate::probability::normal_pdf(z) / denom,
         mode: IntegratedExpectationMode::ExactClosedForm,
     }
@@ -978,7 +978,7 @@ fn logit_posterior_mean_with_deriv_exact_erfcx(
     let m = mu.abs();
     let s = sigma;
     let z = SQRT_2 * s;
-    let phi_term = crate::probability::normal_cdf_approx(m / s);
+    let phi_term = crate::probability::normal_cdf(m / s);
     let phi_prime = crate::probability::normal_pdf(m / s) / s;
     let mut sum = 0.0_f64;
     let mut dsum = 0.0_f64;
@@ -2356,7 +2356,7 @@ fn integrated_probit_jet(mu: f64, sigma: f64) -> IntegratedInverseLinkJet {
         let z = mu.clamp(-30.0, 30.0);
         let pdf = crate::probability::normal_pdf(z);
         return IntegratedInverseLinkJet {
-            mean: crate::probability::normal_cdf_approx(z),
+            mean: crate::probability::normal_cdf(z),
             d1: pdf,
             d2: -z * pdf,
             d3: (z * z - 1.0) * pdf,
@@ -2367,7 +2367,7 @@ fn integrated_probit_jet(mu: f64, sigma: f64) -> IntegratedInverseLinkJet {
     let z = mu / s;
     let pdf = crate::probability::normal_pdf(z);
     IntegratedInverseLinkJet {
-        mean: crate::probability::normal_cdf_approx(z),
+        mean: crate::probability::normal_cdf(z),
         d1: pdf / s,
         d2: -z * pdf / (s * s),
         d3: (z * z - 1.0) * pdf / (s * s * s),
@@ -2748,10 +2748,10 @@ where
 #[inline]
 pub fn probit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
     if se_eta < 1e-10 {
-        return crate::probability::normal_cdf_approx(eta).clamp(1e-10, 1.0 - 1e-10);
+        return crate::probability::normal_cdf(eta).clamp(1e-10, 1.0 - 1e-10);
     }
     let denom = (1.0 + se_eta * se_eta).sqrt();
-    crate::probability::normal_cdf_approx(eta / denom).clamp(1e-10, 1.0 - 1e-10)
+    crate::probability::normal_cdf(eta / denom).clamp(1e-10, 1.0 - 1e-10)
 }
 
 #[inline]
@@ -2773,7 +2773,7 @@ pub fn probit_posterior_mean_variance(
 ) -> (f64, f64) {
     let m1 = probit_posterior_mean(eta, se_eta);
     let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let p = crate::probability::normal_cdf_approx(x).clamp(1e-10, 1.0 - 1e-10);
+        let p = crate::probability::normal_cdf(x).clamp(1e-10, 1.0 - 1e-10);
         p * p
     })
     .clamp(0.0, 1.0);
@@ -3125,7 +3125,7 @@ mod tests {
             k += 2;
         }
 
-        let phi_term = crate::probability::normal_cdf_approx(m / s);
+        let phi_term = crate::probability::normal_cdf(m / s);
         (phi_term + pref * sum).clamp(1e-12, 1.0 - 1e-12)
     }
 
@@ -3471,7 +3471,7 @@ mod tests {
     fn test_probit_posterior_mean_reduces_to_map_at_zero_se() {
         let eta = 1.25;
         let p = probit_posterior_mean(eta, 0.0);
-        let map = crate::probability::normal_cdf_approx(eta);
+        let map = crate::probability::normal_cdf(eta);
         assert_relative_eq!(p, map, epsilon = 1e-12);
     }
 
@@ -3594,7 +3594,7 @@ mod tests {
         let pdf = crate::probability::normal_pdf(z);
         assert_relative_eq!(
             out.mean,
-            crate::probability::normal_cdf_approx(z),
+            crate::probability::normal_cdf(z),
             epsilon = 1e-12
         );
         assert_relative_eq!(out.d1, pdf / s, epsilon = 1e-12);

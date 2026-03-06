@@ -2,6 +2,7 @@ use crate::estimate::EstimationError;
 use crate::mixture_link::inverse_link_jet_for_family;
 use crate::types::{InverseLink, LikelihoodFamily};
 use ndarray::{Array1, ArrayView1};
+use statrs::function::erf::erfc;
 
 /// Standard normal PDF φ(x).
 #[inline]
@@ -10,17 +11,17 @@ pub fn normal_pdf(x: f64) -> f64 {
     INV_SQRT_2PI * (-0.5 * x * x).exp()
 }
 
-/// Standard normal CDF Φ(x) using a stable Abramowitz-Stegun-style approximation.
+/// Standard normal CDF Φ(x) evaluated via the exact special-function identity
+///
+///   Phi(x) = 0.5 * erfc(-x / sqrt(2)).
+///
+/// This is the exact Gaussian CDF semantics used throughout the codebase. The
+/// numerical `erfc` implementation may use internal approximations, but the
+/// returned function is the standard normal CDF itself rather than a separate
+/// polynomial surrogate surface.
 #[inline]
-pub fn normal_cdf_approx(x: f64) -> f64 {
-    let z = x.abs().clamp(0.0, 30.0);
-    let t = 1.0 / (1.0 + 0.231_641_9 * z);
-    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t - 0.356_563_782)
-        * t
-        + 0.319_381_530)
-        * t;
-    let cdf_pos = 1.0 - normal_pdf(z) * poly;
-    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
+pub fn normal_cdf(x: f64) -> f64 {
+    0.5 * erfc(-x / std::f64::consts::SQRT_2)
 }
 
 /// Standard normal quantile Φ⁻¹(p) using Acklam's rational approximation.

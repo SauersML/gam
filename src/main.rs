@@ -49,7 +49,7 @@ use gam::mixture_link::{
     inverse_link_jet_for_inverse_link, state_from_beta_logistic_spec, state_from_sas_spec,
     state_from_spec,
 };
-use gam::probability::{normal_cdf_approx, standard_normal_quantile, try_inverse_link_array};
+use gam::probability::{normal_cdf, standard_normal_quantile, try_inverse_link_array};
 use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
@@ -1785,7 +1785,7 @@ fn run_predict_binomial_location_scale(
                     [[var_t, cov_tls], [cov_tls, var_ls]],
                     |t, ls| {
                         let sigma = sigma_from_eta_scalar(ls, sigma_min, sigma_max);
-                        normal_cdf_approx((-t / sigma.max(1e-12)).clamp(-30.0, 30.0))
+                        normal_cdf((-t / sigma.max(1e-12)).clamp(-30.0, 30.0))
                             .clamp(1e-10, 1.0 - 1e-10)
                     },
                 )
@@ -1881,7 +1881,7 @@ fn run_predict_binomial_location_scale(
                             }
                         }
                         let denom = (1.0 + var_w.max(0.0)).sqrt().max(1e-12);
-                        Ok(normal_cdf_approx((mean_w / denom).clamp(-30.0, 30.0))
+                        Ok(normal_cdf((mean_w / denom).clamp(-30.0, 30.0))
                             .clamp(1e-10, 1.0 - 1e-10))
                     },
                 )?;
@@ -7333,7 +7333,7 @@ fn build_model_summary(
     let intercept_se = se.and_then(|s| s.get(intercept_idx).copied());
     let intercept_z = intercept_se.and_then(|s| (s > 0.0).then_some(intercept_beta / s));
     let intercept_p = intercept_z
-        .map(|z| 2.0 * (1.0 - normal_cdf_approx(z.abs())))
+        .map(|z| 2.0 * (1.0 - normal_cdf(z.abs())))
         .map(|p| p.clamp(0.0, 1.0));
     parametric_terms.push(ParametricTermSummary {
         name: "Intercept".to_string(),
@@ -7384,7 +7384,7 @@ fn build_model_summary(
             let se_i = se.and_then(|s| s.get(idx).copied());
             let z = se_i.and_then(|s| (s > 0.0).then_some(beta / s));
             let p = z
-                .map(|zz| 2.0 * (1.0 - normal_cdf_approx(zz.abs())))
+                .map(|zz| 2.0 * (1.0 - normal_cdf(zz.abs())))
                 .map(|v| v.clamp(0.0, 1.0));
             let label = if range.end - range.start > 1 {
                 format!("{geometry_label}[{}]", idx - range.start)

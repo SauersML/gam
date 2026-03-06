@@ -1,5 +1,5 @@
 use gam::pirls::update_glm_vectors_by_family;
-use gam::probability::normal_cdf_approx;
+use gam::probability::normal_cdf;
 use gam::types::GlmLikelihoodFamily;
 use gam::{FitOptions, LikelihoodFamily, fit_gam, predict_gam};
 use ndarray::{Array1, Array2};
@@ -16,7 +16,7 @@ fn probit_fit_and_predict_fast_integration() {
     for i in 0..n {
         let xi = -2.0 + 4.0 * (i as f64) / (n as f64 - 1.0);
         let eta = -0.3 + 1.1 * xi;
-        let p = normal_cdf_approx(eta).clamp(1e-8, 1.0 - 1e-8);
+        let p = normal_cdf(eta).clamp(1e-8, 1.0 - 1e-8);
         x[[i, 0]] = 1.0;
         x[[i, 1]] = xi;
         y[i] = if rng.random::<f64>() < p { 1.0 } else { 0.0 };

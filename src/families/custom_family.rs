@@ -2426,8 +2426,10 @@ fn apply_geometry_direction_to_eta_and_trace(
         for i in 0..x_dense.nrows() {
             let wi = w[i];
             if wi != 1.0 {
-                wx.row_mut(i) *= wi;
-                wdx.row_mut(i) *= wi;
+                let mut wx_row = wx.row_mut(i);
+                wx_row *= wi;
+                let mut wdx_row = wdx.row_mut(i);
+                wdx_row *= wi;
             }
         }
         let mut d_h_geom = dx.t().dot(&wx);
