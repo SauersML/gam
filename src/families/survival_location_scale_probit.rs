@@ -11,7 +11,7 @@ use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdf_third_derivative_for_inverse_link,
 };
 use crate::pirls::LinearInequalityConstraints;
-use crate::probability::{normal_cdf_approx, normal_pdf};
+use crate::probability::{normal_cdf, normal_pdf};
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, s};
 
@@ -35,7 +35,7 @@ pub trait ResidualDistributionOps {
 impl ResidualDistributionOps for ResidualDistribution {
     fn cdf(&self, z: f64) -> f64 {
         match self {
-            ResidualDistribution::Gaussian => normal_cdf_approx(z),
+            ResidualDistribution::Gaussian => normal_cdf(z),
             ResidualDistribution::Gumbel => {
                 // F(z)=1-exp(-exp(z))
                 let ez = z.clamp(-40.0, 40.0).exp();
@@ -1470,7 +1470,7 @@ pub fn predict_survival_location_scale_probit(
     let survival_prob = Array1::from_iter(eta.iter().map(|&v| {
         inverse_link_jet_for_inverse_link(&input.inverse_link, v)
             .map(|j| j.mu.clamp(0.0, 1.0))
-            .unwrap_or_else(|_| normal_cdf_approx(v).clamp(0.0, 1.0))
+            .unwrap_or_else(|_| normal_cdf(v).clamp(0.0, 1.0))
     }));
     Ok(SurvivalLocationScaleProbitPredictResult { eta, survival_prob })
 }
@@ -1608,7 +1608,7 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
                         .max(1e-12);
                 inverse_link_jet_for_inverse_link(&input.inverse_link, -h - t / sigma)
                     .map(|j| j.mu.clamp(0.0, 1.0))
-                    .unwrap_or_else(|_| normal_cdf_approx(-h - t / sigma).clamp(0.0, 1.0))
+                    .unwrap_or_else(|_| normal_cdf(-h - t / sigma).clamp(0.0, 1.0))
             },
         )
         .clamp(0.0, 1.0)
@@ -1685,7 +1685,7 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
                         |z| {
                             inverse_link_jet_for_inverse_link(&input.inverse_link, z)
                                 .map(|j| j.mu.clamp(0.0, 1.0))
-                                .unwrap_or_else(|_| normal_cdf_approx(z).clamp(0.0, 1.0))
+                                .unwrap_or_else(|_| normal_cdf(z).clamp(0.0, 1.0))
                         },
                     )
                     .clamp(0.0, 1.0)
@@ -1702,7 +1702,7 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
                     .unwrap_or_else(|_| {
                         if link == LinkFunction::Probit {
                             let denom = (1.0 + var_loc).sqrt().max(1e-12);
-                            normal_cdf_approx((mu_loc / denom).clamp(-30.0, 30.0))
+                            normal_cdf((mu_loc / denom).clamp(-30.0, 30.0))
                         } else {
                             crate::quadrature::normal_expectation_1d_adaptive(
                                 &quad_ctx,
@@ -1711,7 +1711,7 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
                                 |z| {
                                     inverse_link_jet_for_inverse_link(&input.inverse_link, z)
                                         .map(|j| j.mu.clamp(0.0, 1.0))
-                                        .unwrap_or_else(|_| normal_cdf_approx(z).clamp(0.0, 1.0))
+                                        .unwrap_or_else(|_| normal_cdf(z).clamp(0.0, 1.0))
                                 },
                             )
                             .clamp(0.0, 1.0)
@@ -1836,7 +1836,7 @@ pub fn predict_survival_location_scale_probit_with_uncertainty(
                 |x| {
                     let p = inverse_link_jet_for_inverse_link(&input.inverse_link, x)
                         .map(|j| j.mu.clamp(0.0, 1.0))
-                        .unwrap_or_else(|_| normal_cdf_approx(x).clamp(0.0, 1.0));
+                        .unwrap_or_else(|_| normal_cdf(x).clamp(0.0, 1.0));
                     p * p
                 },
             );
@@ -2301,7 +2301,7 @@ mod tests {
             |h, t, ls| {
                 let sigma =
                     bounded_sigma_derivs_up_to_third_scalar(ls, input.sigma_min, input.sigma_max).0;
-                normal_cdf_approx(-h - t / sigma.max(1e-12)).clamp(0.0, 1.0)
+                normal_cdf(-h - t / sigma.max(1e-12)).clamp(0.0, 1.0)
             },
         );
         assert!((reduced.survival_prob[0] - ghq).abs() <= 2e-4);

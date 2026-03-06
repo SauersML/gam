@@ -18,7 +18,7 @@ use crate::linalg::utils::StableSolver;
 use crate::matrix::{DesignMatrix, LinearOperator};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::pirls::WorkingLikelihood as EngineWorkingLikelihood;
-use crate::probability::{normal_cdf_approx, normal_pdf};
+use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
     TwoBlockExactJointHyperSetup, build_term_collection_design,
@@ -682,7 +682,7 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
             // so the warm-start IRLS step is an honest derivative of the coded
             // objective. If this family is ever meant to inform beta, the model
             // itself must change so q_i or ell_i actually depends on beta.
-            let raw_mu = normal_cdf_approx(q);
+            let raw_mu = normal_cdf(q);
             let clamp_active = raw_mu <= MIN_PROB || raw_mu >= 1.0 - MIN_PROB;
             let mu = raw_mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
             let dmu_dq = if clamp_active {
@@ -2070,26 +2070,6 @@ pub enum ParameterLink {
 fn signed_with_floor(v: f64, floor: f64) -> f64 {
     let a = v.abs().max(floor);
     if v >= 0.0 { a } else { -a }
-}
-
-#[inline]
-fn clamp_branch_active(mu: f64) -> bool {
-    // `mu` here is already the probability used by the reported objective:
-    //
-    //   mu_bar(q) = clamp(mu_raw(q), eps, 1-eps).
-    //
-    // Every downstream score / curvature / higher-order derivative helper in
-    // this module is supposed to differentiate that same `mu_bar`, not the raw
-    // inverse link. Away from the clamp kink, an active clamp branch is flat:
-    //
-    //   d mu_bar / dq   = 0,
-    //   d²mu_bar / dq²  = 0,
-    //   d³mu_bar / dq³  = 0,
-    //   d⁴mu_bar / dq⁴  = 0.
-    //
-    // So branch detection is the switch that keeps the analytic derivatives
-    // consistent with the clamped log-likelihood actually accumulated in `ll`.
-    mu <= MIN_PROB || mu >= 1.0 - MIN_PROB
 }
 
 #[inline]

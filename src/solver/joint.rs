@@ -26,7 +26,7 @@ use crate::construction::{
 };
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
-use crate::probability::normal_cdf_approx;
+use crate::probability::normal_cdf;
 use crate::quadrature::QuadratureContext;
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use crate::types::{GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction};
@@ -80,7 +80,7 @@ fn joint_point_inverse_link(link: LinkFunction, eta: f64) -> f64 {
             let e = eta.clamp(-700.0, 700.0);
             1.0 / (1.0 + (-e).exp())
         }
-        LinkFunction::Probit => normal_cdf_approx(eta.clamp(-30.0, 30.0)),
+        LinkFunction::Probit => normal_cdf(eta.clamp(-30.0, 30.0)),
         LinkFunction::CLogLog => {
             let e = eta.clamp(-30.0, 30.0);
             1.0 - (-e.exp()).exp()
