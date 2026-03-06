@@ -354,11 +354,14 @@ impl<'a> RemlState<'a> {
         } else {
             Array1::<f64>::zeros(n)
         };
+        let x_dense_t = x_dense.t().to_owned();
         let b_base = Self::row_scale(x_dense, &w1);
+        let b_base_t = b_base.t().to_owned();
         let p_b_base =
             Self::apply_hadamard_gram_to_matrix(&z_reduced, &k_reduced, &k_reduced, &b_base);
         Ok(FirthDenseOperator {
             x_dense: x_dense.clone(),
+            x_dense_t,
             q_basis,
             x_reduced,
             z_reduced,
@@ -370,6 +373,7 @@ impl<'a> RemlState<'a> {
             w3,
             w4,
             b_base,
+            b_base_t,
             p_b_base,
         })
     }
@@ -451,21 +455,13 @@ impl<'a> RemlState<'a> {
         );
         p_u_q_v.mapv_inplace(|v| -2.0 * v);
         let c_u = &(&op.w3 * &dir.deta) * &op.h_diag + &(&op.w2 * &dir.dh);
-        let diag_term = op
-            .x_dense
-            .t()
-            .dot(&(&eta_v * &c_u.view().insert_axis(Axis(1))));
-        let term1 = op
-            .x_dense
-            .t()
-            .dot(&(&m_q_v * &bu_vec.view().insert_axis(Axis(1))));
+        let diag_term = op.x_dense_t.dot(&(&eta_v * &c_u.view().insert_axis(Axis(1))));
+        let term1 = op.x_dense_t.dot(&(&m_q_v * &bu_vec.view().insert_axis(Axis(1))));
         let term2 = op
-            .x_dense
-            .t()
+            .x_dense_t
             .dot(&(&m_bu_v * &op.w1.view().insert_axis(Axis(1))));
         let term3 = op
-            .x_dense
-            .t()
+            .x_dense_t
             .dot(&(&p_u_q_v * &op.w1.view().insert_axis(Axis(1))));
         0.5 * (diag_term - (term1 + term2 + term3))
     }
@@ -547,92 +543,93 @@ impl<'a> RemlState<'a> {
             + &(&op.w2 * &d2h);
 
         let eta_rhs = op.x_dense.dot(rhs);
-        let diag_term = op
-            .x_dense
-            .t()
-            .dot(&(&eta_rhs * &c_uv.view().insert_axis(Axis(1))));
+        let diag_term = op.x_dense_t.dot(&(&eta_rhs * &c_uv.view().insert_axis(Axis(1))));
 
         let b_uv_vec = &op.w3 * &deta_uv;
-        let b_rhs = &eta_rhs * &op.w1.view().insert_axis(Axis(1));
-        let b_u_rhs = &eta_rhs * &(&op.w2 * &u.deta).view().insert_axis(Axis(1));
-        let b_v_rhs = &eta_rhs * &(&op.w2 * &v.deta).view().insert_axis(Axis(1));
-        let b_uv_rhs = &eta_rhs * &b_uv_vec.view().insert_axis(Axis(1));
+        let b_u_vec = &op.w2 * &u.deta;
+        let b_v_vec = &op.w2 * &v.deta;
+        let b_u_base = &op.x_dense * &b_u_vec.view().insert_axis(Axis(1));
+        let b_v_base = &op.x_dense * &b_v_vec.view().insert_axis(Axis(1));
+        let b_uv_base = &op.x_dense * &b_uv_vec.view().insert_axis(Axis(1));
 
-        let p_b_rhs = Self::apply_hadamard_gram_to_matrix(
+        // Linearity in the rhs argument lets us precompute the expensive
+        // Hadamard-Gram operator on the full base blocks B, B_u, B_v, B_uv once,
+        // then post-multiply by rhs. This preserves the exact operator while
+        // avoiding repeated O(n r^2 c) work for every rhs block.
+        let p_b_rhs = fast_ab(&op.p_b_base, rhs);
+        let p_bu_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
             &op.k_reduced,
             &op.k_reduced,
-            &b_rhs,
+            &b_u_base,
         );
-        let p_bu_rhs = Self::apply_hadamard_gram_to_matrix(
+        let p_bu_rhs = fast_ab(&p_bu_base, rhs);
+        let p_bv_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
             &op.k_reduced,
             &op.k_reduced,
-            &b_u_rhs,
+            &b_v_base,
         );
-        let p_bv_rhs = Self::apply_hadamard_gram_to_matrix(
+        let p_bv_rhs = fast_ab(&p_bv_base, rhs);
+        let p_buv_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
             &op.k_reduced,
             &op.k_reduced,
-            &b_v_rhs,
+            &b_uv_base,
         );
-        let p_buv_rhs = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
-            &op.k_reduced,
-            &b_uv_rhs,
-        );
+        let p_buv_rhs = fast_ab(&p_buv_base, rhs);
 
-        let mut p_v_b_rhs = Self::apply_hadamard_gram_to_matrix(
+        let mut p_v_b_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
             &op.k_reduced,
             &v.a_u_reduced,
-            &b_rhs,
+            &op.b_base,
         );
-        p_v_b_rhs.mapv_inplace(|val| -2.0 * val);
-        let mut p_v_bu_rhs = Self::apply_hadamard_gram_to_matrix(
+        p_v_b_base.mapv_inplace(|val| -2.0 * val);
+        let p_v_b_rhs = fast_ab(&p_v_b_base, rhs);
+        let mut p_v_bu_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
             &op.k_reduced,
             &v.a_u_reduced,
-            &b_u_rhs,
+            &b_u_base,
         );
-        p_v_bu_rhs.mapv_inplace(|val| -2.0 * val);
-        let mut p_u_b_rhs = Self::apply_hadamard_gram_to_matrix(
+        p_v_bu_base.mapv_inplace(|val| -2.0 * val);
+        let p_v_bu_rhs = fast_ab(&p_v_bu_base, rhs);
+        let mut p_u_b_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
             &op.k_reduced,
             &u.a_u_reduced,
-            &b_rhs,
+            &op.b_base,
         );
-        p_u_b_rhs.mapv_inplace(|val| -2.0 * val);
-        let mut p_u_bv_rhs = Self::apply_hadamard_gram_to_matrix(
+        p_u_b_base.mapv_inplace(|val| -2.0 * val);
+        let p_u_b_rhs = fast_ab(&p_u_b_base, rhs);
+        let mut p_u_bv_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
             &op.k_reduced,
             &u.a_u_reduced,
-            &b_v_rhs,
+            &b_v_base,
         );
-        p_u_bv_rhs.mapv_inplace(|val| -2.0 * val);
+        p_u_bv_base.mapv_inplace(|val| -2.0 * val);
+        let p_u_bv_rhs = fast_ab(&p_u_bv_base, rhs);
 
-        let p_nu_nv_rhs = Self::apply_hadamard_gram_to_matrix(
+        let p_nu_nv_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
             &u.a_u_reduced,
             &v.a_u_reduced,
-            &b_rhs,
+            &op.b_base,
         );
-        let p_hw_nuv_rhs = Self::apply_hadamard_gram_to_matrix(
+        let p_hw_nuv_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
             &op.k_reduced,
             &a_uv_reduced,
-            &b_rhs,
+            &op.b_base,
         );
-        let p_uv_rhs = 2.0 * p_nu_nv_rhs - 2.0 * p_hw_nuv_rhs;
-        let b_uv_t = op.x_dense.t().to_owned();
-        let b_u_t = op.x_dense.t().to_owned();
-        let b_v_t = op.x_dense.t().to_owned();
-        let b_base_t = op.x_dense.t().to_owned();
-        let left_uv = &b_uv_t * &b_uv_vec.view().insert_axis(Axis(0));
-        let left_u = &b_u_t * &(&op.w2 * &u.deta).view().insert_axis(Axis(0));
-        let left_v = &b_v_t * &(&op.w2 * &v.deta).view().insert_axis(Axis(0));
-        let left_b = &b_base_t * &op.w1.view().insert_axis(Axis(0));
+        let p_uv_base = 2.0 * p_nu_nv_base - 2.0 * p_hw_nuv_base;
+        let p_uv_rhs = fast_ab(&p_uv_base, rhs);
+        let left_uv = b_uv_base.t().to_owned();
+        let left_u = b_u_base.t().to_owned();
+        let left_v = b_v_base.t().to_owned();
+        let left_b = op.b_base_t.clone();
 
         // Nine-term expansion of D²J₂[u,v] with J₂ = Bᵀ P B.
         let d2_terms = [

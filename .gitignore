@@ -26,6 +26,7 @@ bench/_profile*
 bench/**/_profile*
 bench/artifacts/
 bench/tmp_debug/
+bench/tmp_profile_*/
 bench/ab_*/
 bench/diagf_*/
 bench/scenarios.*.json

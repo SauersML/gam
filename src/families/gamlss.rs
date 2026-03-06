@@ -5847,6 +5847,10 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let nrows = x.nrows();
         Ok((DesignMatrix::Dense(x), Array1::zeros(nrows)))
     }
+
+    fn block_geometry_is_dynamic(&self) -> bool {
+        true
+    }
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {

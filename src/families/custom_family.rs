@@ -97,6 +97,18 @@ pub trait CustomFamily {
         Ok((spec.design.clone(), spec.offset.clone()))
     }
 
+    /// Whether `block_geometry(...)` can change with the current block state.
+    ///
+    /// The default implementation is static: the effective geometry is just the
+    /// stored `spec.design/spec.offset`, so the fit engine can use those
+    /// references directly without repeatedly cloning dense matrices.
+    ///
+    /// Families that override `block_geometry(...)` with state-dependent
+    /// behavior must override this to return `true`.
+    fn block_geometry_is_dynamic(&self) -> bool {
+        false
+    }
+
     /// Optional directional derivative of the effective block geometry wrt the
     /// current block coefficients.
     ///
@@ -378,6 +390,42 @@ fn validate_block_specs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, Stri
     Ok(penalty_counts)
 }
 
+fn with_block_geometry<F: CustomFamily + ?Sized, T>(
+    family: &F,
+    block_states: &[ParameterBlockState],
+    spec: &ParameterBlockSpec,
+    block_idx: usize,
+    f: impl FnOnce(&DesignMatrix, &Array1<f64>) -> Result<T, String>,
+) -> Result<T, String> {
+    if family.block_geometry_is_dynamic() {
+        let (x_dyn, off_dyn) = family.block_geometry(block_states, spec)?;
+        if x_dyn.nrows() != spec.design.nrows() {
+            return Err(format!(
+                "block {block_idx} dynamic design row mismatch: got {}, expected {}",
+                x_dyn.nrows(),
+                spec.design.nrows()
+            ));
+        }
+        if x_dyn.ncols() != spec.design.ncols() {
+            return Err(format!(
+                "block {block_idx} dynamic design col mismatch: got {}, expected {}",
+                x_dyn.ncols(),
+                spec.design.ncols()
+            ));
+        }
+        if off_dyn.len() != spec.design.nrows() {
+            return Err(format!(
+                "block {block_idx} dynamic offset length mismatch: got {}, expected {}",
+                off_dyn.len(),
+                spec.design.nrows()
+            ));
+        }
+        f(&x_dyn, &off_dyn)
+    } else {
+        f(&spec.design, &spec.offset)
+    }
+}
+
 fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
     let total = specs
         .iter()
@@ -427,29 +475,11 @@ fn build_block_states<F: CustomFamily>(
             .initial_beta
             .clone()
             .unwrap_or_else(|| Array1::<f64>::zeros(p));
-        let (x_dyn, off_dyn) = family.block_geometry(&states, spec)?;
-        if x_dyn.nrows() != spec.design.nrows() {
-            return Err(format!(
-                "block {b} dynamic design row mismatch: got {}, expected {}",
-                x_dyn.nrows(),
-                spec.design.nrows()
-            ));
-        }
-        if x_dyn.ncols() != p {
-            return Err(format!(
-                "block {b} dynamic design col mismatch: got {}, expected {p}",
-                x_dyn.ncols()
-            ));
-        }
-        if off_dyn.len() != spec.design.nrows() {
-            return Err(format!(
-                "block {b} dynamic offset length mismatch: got {}, expected {}",
-                off_dyn.len(),
-                spec.design.nrows()
-            ));
-        }
-        let mut eta = x_dyn.matrix_vector_multiply(&beta);
-        eta += &off_dyn;
+        let eta = with_block_geometry(family, &states, spec, b, |x, off| {
+            let mut eta = x.matrix_vector_multiply(&beta);
+            eta += off;
+            Ok(eta)
+        })?;
         states.push(ParameterBlockState { beta, eta });
     }
     Ok(states)
@@ -462,29 +492,10 @@ fn refresh_all_block_etas<F: CustomFamily>(
 ) -> Result<(), String> {
     for b in 0..specs.len() {
         let spec = &specs[b];
-        let p = states[b].beta.len();
-        let (x_dyn, off_dyn) = family.block_geometry(states, spec)?;
-        if x_dyn.nrows() != spec.design.nrows() {
-            return Err(format!(
-                "block {b} dynamic design row mismatch: got {}, expected {}",
-                x_dyn.nrows(),
-                spec.design.nrows()
-            ));
-        }
-        if x_dyn.ncols() != p {
-            return Err(format!(
-                "block {b} dynamic design col mismatch: got {}, expected {p}",
-                x_dyn.ncols()
-            ));
-        }
-        if off_dyn.len() != spec.design.nrows() {
-            return Err(format!(
-                "block {b} dynamic offset length mismatch: got {}, expected {}",
-                off_dyn.len(),
-                spec.design.nrows()
-            ));
-        }
-        states[b].eta = x_dyn.matrix_vector_multiply(&states[b].beta) + &off_dyn;
+        let beta = states[b].beta.clone();
+        states[b].eta = with_block_geometry(family, states, spec, b, |x, off| {
+            Ok(x.matrix_vector_multiply(&beta) + off)
+        })?;
     }
     Ok(())
 }
@@ -596,7 +607,6 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
         &self,
         ctx: &BlockUpdateContext<'_>,
     ) -> Result<BlockUpdateResult, String> {
-        let p = ctx.spec.design.ncols();
         if self.working_response.len() != ctx.spec.design.nrows()
             || self.working_weights.len() != ctx.spec.design.nrows()
         {
@@ -606,33 +616,6 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
             ));
         }
 
-        let (x_dyn, off_dyn) = ctx.family.block_geometry(ctx.states, ctx.spec)?;
-        if x_dyn.nrows() != ctx.spec.design.nrows() {
-            return Err(format!(
-                "block {} dynamic design row mismatch: got {}, expected {}",
-                ctx.block_idx,
-                x_dyn.nrows(),
-                ctx.spec.design.nrows()
-            ));
-        }
-        if x_dyn.ncols() != p {
-            return Err(format!(
-                "block {} dynamic design col mismatch: got {}, expected {p}",
-                ctx.block_idx,
-                x_dyn.ncols()
-            ));
-        }
-        if off_dyn.len() != ctx.spec.design.nrows() {
-            return Err(format!(
-                "block {} dynamic offset length mismatch: got {}, expected {}",
-                ctx.block_idx,
-                off_dyn.len(),
-                ctx.spec.design.nrows()
-            ));
-        }
-
-        let mut y_star = self.working_response.clone();
-        y_star -= &off_dyn;
         let w_clamped = self
             .working_weights
             .mapv(|wi| wi.max(ctx.options.min_weight));
@@ -646,39 +629,48 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
                     )
                 },
             )?;
-            let (mut lhs, rhs_opt) = weighted_normal_equations(&x_dyn, &w_clamped, Some(&y_star))?;
-            let rhs = rhs_opt
-                .ok_or_else(|| "missing weighted RHS in constrained diagonal solve".to_string())?;
-            lhs += ctx.s_lambda;
-            let (beta_constrained, active_set) = solve_quadratic_with_linear_constraints(
-                &lhs,
-                &rhs,
-                &ctx.states[ctx.block_idx].beta,
-                constraints,
-                ctx.cached_active_set,
-            )
-            .map_err(|e| {
-                format!(
-                    "block {} ({}) constrained diagonal solve failed: {e}",
-                    ctx.block_idx, ctx.spec.name
+            with_block_geometry(ctx.family, ctx.states, ctx.spec, ctx.block_idx, |x, off| {
+                let mut y_star = self.working_response.clone();
+                y_star -= off;
+                let (mut lhs, rhs_opt) = weighted_normal_equations(x, &w_clamped, Some(&y_star))?;
+                let rhs = rhs_opt.ok_or_else(|| {
+                    "missing weighted RHS in constrained diagonal solve".to_string()
+                })?;
+                lhs += ctx.s_lambda;
+                let (beta_constrained, active_set) = solve_quadratic_with_linear_constraints(
+                    &lhs,
+                    &rhs,
+                    &ctx.states[ctx.block_idx].beta,
+                    constraints,
+                    ctx.cached_active_set,
                 )
-            })?;
-            Ok(BlockUpdateResult {
-                beta_new_raw: beta_constrained,
-                active_set: Some(active_set),
+                .map_err(|e| {
+                    format!(
+                        "block {} ({}) constrained diagonal solve failed: {e}",
+                        ctx.block_idx, ctx.spec.name
+                    )
+                })?;
+                Ok(BlockUpdateResult {
+                    beta_new_raw: beta_constrained,
+                    active_set: Some(active_set),
+                })
             })
         } else {
-            let beta = solve_block_weighted_system(
-                &x_dyn,
-                &y_star,
-                &w_clamped,
-                ctx.s_lambda,
-                ctx.options.ridge_floor,
-                ctx.options.ridge_policy,
-            )?;
-            Ok(BlockUpdateResult {
-                beta_new_raw: beta,
-                active_set: None,
+            with_block_geometry(ctx.family, ctx.states, ctx.spec, ctx.block_idx, |x, off| {
+                let mut y_star = self.working_response.clone();
+                y_star -= off;
+                let beta = solve_block_weighted_system(
+                    x,
+                    &y_star,
+                    &w_clamped,
+                    ctx.s_lambda,
+                    ctx.options.ridge_floor,
+                    ctx.options.ridge_policy,
+                )?;
+                Ok(BlockUpdateResult {
+                    beta_new_raw: beta,
+                    active_set: None,
+                })
             })
         }
     }
@@ -1187,18 +1179,11 @@ fn blockwise_logdet_terms<F: CustomFamily>(
             BlockWorkingSet::Diagonal {
                 working_response: _,
                 working_weights,
-            } => {
-                let (x_dyn, _) = family.block_geometry(states, spec)?;
-                if x_dyn.ncols() != p {
-                    return Err(format!(
-                        "block {b} dynamic design col mismatch: got {}, expected {p}",
-                        x_dyn.ncols()
-                    ));
-                }
+            } => with_block_geometry(family, states, spec, b, |x_dyn, _| {
                 let w = working_weights.mapv(|wi| wi.max(options.min_weight));
-                let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
-                xtwx
-            }
+                let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
+                Ok(xtwx)
+            })?,
             BlockWorkingSet::ExactNewton {
                 gradient: _,
                 hessian,
@@ -1748,13 +1733,12 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
             BlockWorkingSet::Diagonal {
                 working_response: _,
                 working_weights,
-            } => {
-                let (x_dyn, _) = family.block_geometry(&inner.block_states, spec)?;
+            } => with_block_geometry(family, &inner.block_states, spec, b, |x_dyn, _| {
                 let w = working_weights.mapv(|wi| wi.max(options.min_weight));
-                let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
-                diagonal_design = Some(x_dyn);
-                xtwx
-            }
+                let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
+                diagonal_design = Some(x_dyn.clone());
+                Ok(xtwx)
+            })?,
             BlockWorkingSet::ExactNewton {
                 gradient: _,
                 hessian,
@@ -2060,14 +2044,14 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
         };
 
         let work = &eval.block_working_sets[b];
-        let (x_dyn, _) = family.block_geometry(&inner.block_states, spec)?;
-        let x_dense = x_dyn.to_dense();
+        let x_dense =
+            with_block_geometry(family, &inner.block_states, spec, b, |x_dyn, _| Ok(x_dyn.to_dense()))?;
 
         let (w, u, h_mode, h_inv) = match work {
             BlockWorkingSet::Diagonal {
                 working_response,
                 working_weights,
-            } => {
+            } => with_block_geometry(family, &inner.block_states, spec, b, |x_dyn, _| {
                 if working_response.len() != x_dyn.nrows() || working_weights.len() != x_dyn.nrows()
                 {
                     return Err(format!(
@@ -2077,7 +2061,7 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                 }
                 let w = working_weights.mapv(|wi| wi.max(options.min_weight));
                 let u = &w * &(working_response - eta);
-                let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
+                let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
                 let mut h_for_logdet = xtwx;
                 h_for_logdet += &s_lambda;
                 let h_mode = h_for_logdet.clone();
@@ -2087,8 +2071,8 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                     }
                 }
                 let h_inv = inverse_spd_with_retry(&h_for_logdet, ridge, 8)?;
-                (w, u, h_mode, h_inv)
-            }
+                Ok((w, u, h_mode, h_inv))
+            })?,
             BlockWorkingSet::ExactNewton { .. } => {
                 // The diagonal psi path below relies on the IRLS representation
                 //

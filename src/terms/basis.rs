@@ -2990,10 +2990,6 @@ fn duchon_kernel_radial_triplet(
     k_dim: usize,
     coeffs: Option<&DuchonPartialFractionCoeffs>,
 ) -> Result<(f64, f64, f64), BasisError> {
-    if p_order == 1 && s_order == 4 && k_dim == 10 {
-        return duchon_matern_p1_s4_k10_radial_triplet(r, length_scale);
-    }
-
     // Generic Duchon decomposition derivatives
     // ----------------------------------------
     // Partial-fraction representation:
@@ -3006,8 +3002,6 @@ fn duchon_kernel_radial_triplet(
     // with basis-value construction), and evaluate phi', phi'' analytically by
     // summing derivatives of each block.
     //
-    // This keeps the main derivative path FD-free. Finite-difference fallback is
-    // enabled only if the analytic accumulation becomes non-finite.
     // Full Duchon derivative strategy
     // -------------------------------
     // Kernel is represented by partial fractions:
@@ -3020,8 +3014,6 @@ fn duchon_kernel_radial_triplet(
     //   phi'  = sum_m a_m * Phi_m'  + sum_n b_n * M_n'
     //   phi'' = sum_m a_m * Phi_m'' + sum_n b_n * M_n''.
     //
-    // Finite differences are not used on the main path; they are kept only as a
-    // last-resort fallback when analytic accumulation becomes non-finite.
     let value = duchon_matern_kernel_general_from_distance(
         r,
         length_scale,
@@ -3068,44 +3060,12 @@ fn duchon_kernel_radial_triplet(
     if r == 0.0 {
         first = 0.0;
     }
-    if first.is_finite() && second.is_finite() {
-        return Ok((value, first, second));
-    }
-
-    // Fallback only when analytic path is numerically unstable/exploded.
-    let h = (1e-5 * (1.0 + r_eval)).clamp(1e-7, 1e-2);
-    let fp = duchon_matern_kernel_general_from_distance(
-        r_eval + h,
-        length_scale,
-        p_order,
-        s_order,
-        k_dim,
-        coeffs,
-    )?;
-    let vmid = duchon_matern_kernel_general_from_distance(
-        r_eval,
-        length_scale,
-        p_order,
-        s_order,
-        k_dim,
-        coeffs,
-    )?;
-    let fm = duchon_matern_kernel_general_from_distance(
-        (r_eval - h).max(0.0),
-        length_scale,
-        p_order,
-        s_order,
-        k_dim,
-        coeffs,
-    )?;
-    let first_fd = (fp - fm) / (2.0 * h);
-    let second_fd = (fp - 2.0 * vmid + fm) / (h * h);
-    if !first_fd.is_finite() || !second_fd.is_finite() {
+    if !first.is_finite() || !second.is_finite() {
         return Err(BasisError::InvalidInput(format!(
             "non-finite Duchon radial derivatives at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
         )));
     }
-    Ok((value, first_fd, second_fd))
+    Ok((value, first, second))
 }
 
 fn symmetrize(matrix: &Array2<f64>) -> Array2<f64> {
@@ -3522,8 +3482,6 @@ fn bessel_k1_stable(x: f64) -> f64 {
     }
 }
 
-const DUCHON_SERIES_Z_CUTOFF: f64 = 1.0;
-const DUCHON_ASYMPTOTIC_Z_CUTOFF: f64 = 35.0;
 const DUCHON_DERIVATIVE_R_FLOOR_REL: f64 = 1e-5;
 
 #[inline(always)]
@@ -3700,10 +3658,16 @@ fn duchon_matern_block_triplet(
         return Ok((0.0, 0.0, 0.0));
     }
 
-    // Exact derivatives for c * r^nu * K_nu(kappa r)
-    // -----------------------------------------------
+    // Exact derivatives for one shifted Matérn/Bessel-potential block.
+    //
     // Write
-    //   g(r) = c r^nu K_nu(z),   z = kappa r.
+    //   g(r; kappa) = c * r^nu * K_nu(z),   z = kappa r.
+    //
+    // The joint hyperparameterization is psi = log(kappa), so
+    //   d/dpsi = kappa * d/dkappa
+    // and z_psi = z. This is the Duchon "Matérn-like" block that appears after
+    // partial-fraction decomposition of
+    //   1 / (|w|^(2p) * (|w|^2 + kappa^2)^s).
     //
     // Identity:
     //   dK_nu/dz = -K_{nu-1}(z) - (nu/z) K_nu(z).
@@ -3721,7 +3685,8 @@ fn duchon_matern_block_triplet(
     // which simplifies to
     //   g'' = c kappa^2 r^nu K_{nu-2}(z) - c kappa r^(nu-1) K_{nu-1}(z).
     //
-    // These formulas replace finite differences on the generic Duchon branch.
+    // The resulting first/second radial derivatives are exact closed forms used
+    // by the Duchon operator derivative path, not finite differences.
     let n = n_order as f64;
     let k_half = 0.5 * k_dim as f64;
     let nu = n - k_half;
@@ -3756,7 +3721,7 @@ fn duchon_polyharmonic_block_triplet(
         return Ok((0.0, 0.0, 0.0));
     }
 
-    // Exact radial derivatives for polyharmonic blocks.
+    // Exact radial derivatives for the polyharmonic block Phi_m(r).
     //
     // Let alpha = 2m - d.
     // Case A: phi(r) = c * r^alpha
@@ -3858,11 +3823,6 @@ fn duchon_matern_kernel_general_from_distance(
         ));
     }
     let kappa = 1.0 / length_scale;
-    // Preserve the exact validated closed-form branch for the original primary case.
-    if p_order == 1 && s_order == 4 && k_dim == 10 {
-        return duchon_matern_kernel_p1_s4_k10_from_distance(r, length_scale);
-    }
-
     // For intrinsic p>0 kernels, diagonal values are not uniquely defined in the
     // generalized-kernel sense; use intrinsic convention.
     if r == 0.0 && p_order > 0 {
@@ -3890,308 +3850,6 @@ fn duchon_matern_kernel_general_from_distance(
         val += coeff * duchon_matern_block(r, kappa, n, k_dim)?;
     }
     Ok(val)
-}
-
-#[inline(always)]
-fn duchon_matern_p1_s4_k10_asymptotic(z: f64) -> f64 {
-    // For large z = κr, Bessel terms in the exact closed form are exponentially
-    // suppressed, leaving the algebraic leading term.
-    let invz = 1.0 / z.max(1e-300);
-    let invz2 = invz * invz;
-    let invz4 = invz2 * invz2;
-    48.0 * invz4 * invz4
-}
-
-#[inline(always)]
-fn duchon_matern_p1_s4_k10_closed_form(r: f64, kappa: f64) -> f64 {
-    // Mathematical derivation (primary case: p=1, s=4, k=10):
-    //
-    // Spectral kernel:
-    //   K^(ω) ∝ 1 / (|ω|^(2p) * (κ^2 + |ω|^2)^s)
-    // so here:
-    //   K^(ω) ∝ 1 / (|ω|^2 * (κ^2 + |ω|^2)^4).
-    //
-    // For this specific tuple (p,s,k), the radial kernel is equivalently:
-    //   K(a) = (1/96) ∫_0^1 u^3 K0(a*sqrt(u)) du,   a = κr.
-    //
-    // This function evaluates an exact algebraic reduction of that integral:
-    //   K(a)= 48/a^8
-    //         - (1/48) K1(a)/a
-    //         - (1/8)  K0(a)/a^2
-    //         - (3/4)  K1(a)/a^3
-    //         - 3      K0(a)/a^4
-    //         - 12     K1(a)/a^5
-    //         - 24     K0(a)/a^6
-    //         - 48     K1(a)/a^7.
-    //
-    // IMPORTANT: this representation is exact but numerically ill-conditioned as a->0,
-    // because each term is large and cancellation leaves an O(log a) remainder.
-    // We therefore call this only in the moderate-a regime from the dispatcher.
-    let z = (kappa * r).max(1e-300);
-    // Hot-path speedup: for very large z the exact Bessel terms are negligible.
-    if z > DUCHON_ASYMPTOTIC_Z_CUTOFF {
-        return duchon_matern_p1_s4_k10_asymptotic(z);
-    }
-    let k0 = bessel_k0_stable(z);
-    let k1 = bessel_k1_stable(z);
-    // Faster and slightly more accurate than repeated powi/division:
-    // build reciprocal powers once and evaluate grouped terms.
-    let invz = 1.0 / z;
-    let invz2 = invz * invz;
-    let invz3 = invz2 * invz;
-    let invz4 = invz2 * invz2;
-    let invz5 = invz4 * invz;
-    let invz6 = invz3 * invz3;
-    let invz7 = invz6 * invz;
-    let invz8 = invz4 * invz4;
-    let k1_block = (1.0 / 48.0) * invz + (3.0 / 4.0) * invz3 + 12.0 * invz5 + 48.0 * invz7;
-    let k0_block = (1.0 / 8.0) * invz2 + 3.0 * invz4 + 24.0 * invz6;
-    48.0 * invz8 - k1 * k1_block - k0 * k0_block
-}
-
-#[inline(always)]
-fn duchon_matern_p1_s4_k10_small_a_series(a: f64) -> f64 {
-    // Cancellation-free small-a expansion:
-    //
-    // Start from:
-    //   K(a) = (1/96) ∫_0^1 u^3 K0(a*sqrt(u)) du.
-    //
-    // Expand K0(z) for z->0:
-    //   K0(z) = -log(z/2) - γ + O(z^2 log z),
-    // then integrate term-by-term in u. This yields:
-    //   K(a) =
-    //     L/384 + 1/3072
-    //     + a^2( L/1920 + 11/19200 )
-    //     + a^4( L/36864 + 19/442368 )
-    //     + a^6( L/1548288 + 5/4064256 )
-    //     + a^8( L/113246208 + 103/5435817984 )
-    //   where L = -log(a/2) - γ.
-    //
-    // Remainder after retained a^8 term: O(a^10 log a).
-    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
-    let aa = a.max(1e-300);
-    let l = -(aa * 0.5).ln() - EULER_GAMMA;
-    let a2 = aa * aa;
-    let a4 = a2 * a2;
-    let a6 = a4 * a2;
-    let a8 = a4 * a4;
-
-    l / 384.0
-        + 1.0 / 3072.0
-        + a2 * (l / 1920.0 + 11.0 / 19_200.0)
-        + a4 * (l / 36_864.0 + 19.0 / 442_368.0)
-        + a6 * (l / 1_548_288.0 + 5.0 / 4_064_256.0)
-        + a8 * (l / 113_246_208.0 + 103.0 / 5_435_817_984.0)
-}
-
-#[inline(always)]
-fn duchon_matern_p1_s4_k10_phi_prime_over_r_small_r(r: f64, kappa: f64) -> f64 {
-    // For p=1,s=4,k=10:
-    //   phi'(r)/r =
-    //      -1/(384 r^2)
-    //      -(kappa^2/960) log(kappa r)
-    //      +(kappa^2/960)(log 2 - gamma)
-    //      +(kappa^2/1600)
-    //      + O((kappa r)^2 log r),  r -> 0+.
-    //
-    // We evaluate this asymptotic directly in the small-r regime to avoid
-    // cancellation in raw Bessel/power combinations.
-    const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
-    let rr = r.max(1e-300);
-    let k2 = kappa * kappa;
-    -1.0 / (384.0 * rr * rr) - (k2 / 960.0) * (kappa * rr).ln()
-        + (k2 / 960.0) * (2.0_f64.ln() - EULER_GAMMA)
-        + (k2 / 1600.0)
-}
-
-#[inline(always)]
-fn duchon_matern_p1_s4_k10_radial_triplet(
-    r: f64,
-    length_scale: f64,
-) -> Result<(f64, f64, f64), BasisError> {
-    if !r.is_finite() || r < 0.0 {
-        return Err(BasisError::InvalidInput(
-            "Duchon kernel distance must be finite and non-negative".to_string(),
-        ));
-    }
-    if !length_scale.is_finite() || length_scale <= 0.0 {
-        return Err(BasisError::InvalidInput(
-            "Duchon length_scale must be finite and positive".to_string(),
-        ));
-    }
-
-    // In this branch phi'(r)/r has a non-integrable 1/r^2 singularity as r->0.
-    // Keep collocation operators finite with a local radius floor.
-    let r_floor = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
-    let r_eval = r.max(r_floor);
-    let kappa = 1.0 / length_scale;
-    let a = kappa * r_eval;
-    let value = duchon_matern_kernel_p1_s4_k10_from_distance(r, length_scale)?;
-
-    if a < DUCHON_SERIES_Z_CUTOFF {
-        let ratio = duchon_matern_p1_s4_k10_phi_prime_over_r_small_r(r_eval, kappa);
-        let phi_r = ratio * r_eval;
-        // Using phi'' = ratio + r * d/dr(ratio) with the same asymptotic truncation.
-        let k2 = kappa * kappa;
-        let phi_rr = 1.0 / (384.0 * r_eval * r_eval) - (k2 / 960.0) * (kappa * r_eval).ln()
-            + (k2 / 960.0) * (2.0_f64.ln() - 0.577_215_664_901_532_9)
-            - k2 / 2400.0;
-        return Ok((value, phi_r, phi_rr));
-    }
-
-    // Exact derivative formulas in terms of K0(a), K1(a), with a = kappa r:
-    //
-    // phi'(r) = kappa * [ -384/a^9 + A0(a) K0(a) + A1(a) K1(a) ],
-    // A0(a) = 1/(48a) + 1/a^3 + 24/a^5 + 192/a^7,
-    // A1(a) = 1/(6a^2) + 6/a^4 + 96/a^6 + 384/a^8.
-    //
-    // phi''(r) = kappa^2 * [ 3456/a^10 - B0(a) K0(a) - B1(a) K1(a) ],
-    // B0(a) = 3/(16a^2) + 9/a^4 + 216/a^6 + 1728/a^8,
-    // B1(a) = 1/(48a) + 3/(2a^3) + 54/a^5 + 864/a^7 + 3456/a^9.
-    let k0 = bessel_k0_stable(a);
-    let k1 = bessel_k1_stable(a);
-    let inva = 1.0 / a;
-    let inva2 = inva * inva;
-    let inva3 = inva2 * inva;
-    let inva4 = inva2 * inva2;
-    let inva5 = inva4 * inva;
-    let inva6 = inva3 * inva3;
-    let inva7 = inva6 * inva;
-    let inva8 = inva4 * inva4;
-    let inva9 = inva8 * inva;
-    let inva10 = inva5 * inva5;
-
-    let a0 = (1.0 / 48.0) * inva + inva3 + 24.0 * inva5 + 192.0 * inva7;
-    let a1 = (1.0 / 6.0) * inva2 + 6.0 * inva4 + 96.0 * inva6 + 384.0 * inva8;
-    let phi_r = kappa * (-384.0 * inva9 + a0 * k0 + a1 * k1);
-
-    let b0 = (3.0 / 16.0) * inva2 + 9.0 * inva4 + 216.0 * inva6 + 1728.0 * inva8;
-    let b1 =
-        (1.0 / 48.0) * inva + (3.0 / 2.0) * inva3 + 54.0 * inva5 + 864.0 * inva7 + 3456.0 * inva9;
-    let phi_rr_formula = (kappa * kappa) * (3456.0 * inva10 - b0 * k0 - b1 * k1);
-
-    // Safety guard for curvature: with approximate K0/K1 implementations,
-    // second derivatives can amplify approximation noise. Compare the analytic
-    // closed form against a local central-difference stencil and fall back when
-    // disagreement is large.
-    let h = (1e-5 * (1.0 + r_eval)).clamp(1e-7, 1e-2);
-    let vp = duchon_matern_kernel_p1_s4_k10_from_distance(r_eval + h, length_scale)?;
-    let vm = duchon_matern_kernel_p1_s4_k10_from_distance((r_eval - h).max(0.0), length_scale)?;
-    let v0 = duchon_matern_kernel_p1_s4_k10_from_distance(r_eval, length_scale)?;
-    let phi_rr_fd = (vp - 2.0 * v0 + vm) / (h * h);
-    let mismatch = (phi_rr_formula - phi_rr_fd).abs();
-    let tolerance = 1e-3 + 1e-2 * phi_rr_fd.abs();
-    let phi_rr = if mismatch <= tolerance {
-        phi_rr_formula
-    } else {
-        phi_rr_fd
-    };
-
-    if !value.is_finite() || !phi_r.is_finite() || !phi_rr.is_finite() {
-        return Err(BasisError::InvalidInput(format!(
-            "non-finite closed-form Duchon derivatives at r={r}, length_scale={length_scale}"
-        )));
-    }
-    Ok((value, phi_r, phi_rr))
-}
-
-#[inline(always)]
-#[cfg(test)]
-fn duchon_matern_p1_s4_k10_integral(r: f64, kappa: f64) -> f64 {
-    #[inline(always)]
-    fn simpson<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64) -> f64 {
-        let c = 0.5 * (a + b);
-        (b - a) * (f(a) + 4.0 * f(c) + f(b)) / 6.0
-    }
-
-    fn adaptive_simpson<F: Fn(f64) -> f64>(
-        f: &F,
-        a: f64,
-        b: f64,
-        eps: f64,
-        whole: f64,
-        depth: usize,
-    ) -> f64 {
-        let c = 0.5 * (a + b);
-        let left = simpson(f, a, c);
-        let right = simpson(f, c, b);
-        let delta = left + right - whole;
-        if depth == 0 || delta.abs() <= 15.0 * eps {
-            // Richardson extrapolation.
-            left + right + delta / 15.0
-        } else {
-            adaptive_simpson(f, a, c, eps * 0.5, left, depth - 1)
-                + adaptive_simpson(f, c, b, eps * 0.5, right, depth - 1)
-        }
-    }
-
-    let a = kappa * r;
-    // Substitute u = t^2 to eliminate the sqrt in argument and make the
-    // endpoint behavior smooth: du = 2 t dt, u^3 = t^6, so integrand is
-    // 2 t^7 K0(a t) over t in [0,1].
-    let f_t = |t: f64| -> f64 {
-        if t <= 0.0 {
-            return 0.0;
-        }
-        2.0 * t.powi(7) * bessel_k0_stable(a * t)
-    };
-    let whole = simpson(&f_t, 0.0, 1.0);
-    let integral = adaptive_simpson(&f_t, 0.0, 1.0, 1e-10, whole, 20);
-    integral / 96.0
-}
-
-fn duchon_matern_kernel_p1_s4_k10_from_distance(
-    r: f64,
-    length_scale: f64,
-) -> Result<f64, BasisError> {
-    if !r.is_finite() || r < 0.0 {
-        return Err(BasisError::InvalidInput(
-            "Duchon kernel distance must be finite and non-negative".to_string(),
-        ));
-    }
-    if !length_scale.is_finite() || length_scale <= 0.0 {
-        return Err(BasisError::InvalidInput(
-            "Duchon length_scale must be finite and positive".to_string(),
-        ));
-    }
-    if r == 0.0 {
-        // Borderline regularity note for the current primary case:
-        //   p=1, s=4, k=10  =>  p+s = k/2 (equivalently 2p+2s = k).
-        // In this regime point-evaluation is not strictly proper (log-type
-        // singularity at r->0 in the underlying generalized kernel). For the
-        // spline penalty workflow we therefore use an intrinsic convention on
-        // the diagonal and rely on constrained coefficients + lambda scaling.
-        return Ok(0.0);
-    }
-
-    let kappa = 1.0 / length_scale;
-    let z = kappa * r;
-    // Numerically stable regime split:
-    //
-    // 1) z < 1: series branch.
-    //    Avoids catastrophic cancellation in the closed form near the Sobolev
-    //    boundary p+s=k/2 where the true behavior is logarithmic.
-    //
-    // 2) 1 <= z <= 50: exact closed form with K0/K1.
-    //    Stable in this window and significantly faster than quadrature.
-    //
-    // 3) z > 50: asymptotic branch.
-    //    Kν(z) terms are exponentially small, so dominant algebraic term is 48/z^8.
-    //
-    // We intentionally do NOT evaluate the raw Hankel/inverse-Fourier integral
-    // in production:
-    //   - it is oscillatory with slowly decaying tails,
-    //   - per-entry quadrature cost is too high for O(M^2) kernel builds, and
-    //   - numerical quadrature noise degrades K_CC conditioning and REML gradients.
-    // The integral implementation is retained under #[cfg(test)] only as a
-    // verification oracle against this branch-wise closed-form evaluator.
-    if z < DUCHON_SERIES_Z_CUTOFF {
-        Ok(duchon_matern_p1_s4_k10_small_a_series(z))
-    } else if z > DUCHON_ASYMPTOTIC_Z_CUTOFF {
-        Ok(duchon_matern_p1_s4_k10_asymptotic(z))
-    } else {
-        Ok(duchon_matern_p1_s4_k10_closed_form(r, kappa))
-    }
 }
 
 fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
@@ -5274,6 +4932,722 @@ pub fn build_matern_basis_log_kappa_second_derivative_with_workspace(
     })
 }
 
+#[inline(always)]
+fn duchon_coeff_exponents(p_order: usize, s_order: usize, m_or_n: usize) -> f64 {
+    // In the partial fractions
+    //   1 / (z^p (z + kappa^2)^s)
+    // = Σ a_m(kappa) / z^m + Σ b_n(kappa) / (z + kappa^2)^n,
+    // both a_m and b_n are pure powers of kappa:
+    //   c(kappa) = C * kappa^{-2(p+s-index)}.
+    // With psi = log(kappa), that gives c_psi = alpha c and
+    // c_psipsi = alpha^2 c with alpha below. This is the exact coefficient
+    // derivative rule from the Duchon spectral factorization.
+    -2.0 * (p_order + s_order - m_or_n) as f64
+}
+
+#[inline(always)]
+fn duchon_scaling_exponent(p_order: usize, s_order: usize, k_dim: usize) -> f64 {
+    k_dim as f64 - 2.0 * (p_order + s_order) as f64
+}
+
+#[inline(always)]
+fn duchon_has_classical_second_order_origin(p_order: usize, s_order: usize, k_dim: usize) -> bool {
+    2 * (p_order + s_order) > k_dim + 2
+}
+
+#[inline(always)]
+fn duchon_frozen_transform_for_derivatives(
+    identifiability: &SpatialIdentifiability,
+) -> Result<Option<&Array2<f64>>, BasisError> {
+    match identifiability {
+        SpatialIdentifiability::None => Ok(None),
+        SpatialIdentifiability::FrozenTransform { transform } => Ok(Some(transform)),
+        SpatialIdentifiability::OrthogonalToParametric => Err(BasisError::InvalidInput(
+            "Duchon exact log-kappa derivatives require a frozen or absent spatial identifiability transform".to_string(),
+        )),
+    }
+}
+
+#[inline(always)]
+fn radial_log_power_derivatives(c: f64, e: f64, a: f64, b: f64, r: f64) -> (f64, f64, f64) {
+    let rr = r.max(1e-300);
+    let log_r = rr.ln();
+    let value = c * rr.powf(e) * (a * log_r + b);
+    let first = c * rr.powf(e - 1.0) * (e * (a * log_r + b) + a);
+    let second =
+        c * rr.powf(e - 2.0) * (e * (e - 1.0) * (a * log_r + b) + (2.0 * e - 1.0) * a);
+    (value, first, second)
+}
+
+#[inline(always)]
+fn duchon_polyharmonic_q_l_r_triplets(
+    r: f64,
+    m: usize,
+    k_dim: usize,
+) -> ((f64, f64, f64), (f64, f64, f64)) {
+    if r <= 0.0 {
+        return ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0));
+    }
+    let k_half = 0.5 * k_dim as f64;
+    let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
+    let rr = r.max(1e-300);
+    if k_dim % 2 == 0 && m >= (k_dim / 2) {
+        let c = ((-1.0_f64).powi(m as i32))
+            / (2.0_f64.powi((2 * m - 1) as i32)
+                * std::f64::consts::PI.powf(k_half)
+                * gamma_lanczos(m as f64)
+                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+        let q = radial_log_power_derivatives(c, alpha - 2.0, alpha, 1.0, rr);
+        let lap = radial_log_power_derivatives(
+            c,
+            alpha - 2.0,
+            alpha * (alpha + k_dim as f64 - 2.0),
+            2.0 * alpha + k_dim as f64 - 2.0,
+            rr,
+        );
+        return (q, lap);
+    }
+    let c = gamma_lanczos(k_half - m as f64)
+        / (4.0_f64.powi(m as i32) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m as f64));
+    let q0 = c * alpha * rr.powf(alpha - 2.0);
+    let q1 = c * alpha * (alpha - 2.0) * rr.powf(alpha - 3.0);
+    let q2 = c * alpha * (alpha - 2.0) * (alpha - 3.0) * rr.powf(alpha - 4.0);
+    let l_coeff = c * alpha * (alpha + k_dim as f64 - 2.0);
+    let l0 = l_coeff * rr.powf(alpha - 2.0);
+    let l1 = l_coeff * (alpha - 2.0) * rr.powf(alpha - 3.0);
+    let l2 = l_coeff * (alpha - 2.0) * (alpha - 3.0) * rr.powf(alpha - 4.0);
+    ((q0, q1, q2), (l0, l1, l2))
+}
+
+#[inline(always)]
+fn duchon_matern_block_r3(
+    r: f64,
+    kappa: f64,
+    n_order: usize,
+    k_dim: usize,
+) -> Result<f64, BasisError> {
+    if r <= 0.0 {
+        return Ok(0.0);
+    }
+    let n = n_order as f64;
+    let k_half = 0.5 * k_dim as f64;
+    let nu = n - k_half;
+    let c = kappa.powf(k_half - n)
+        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
+    let z = (kappa * r).max(1e-300);
+    let k_nu_m2 = bessel_k_real_half_integer_or_integer((nu - 2.0).abs(), z)?;
+    let k_nu_m3 = bessel_k_real_half_integer_or_integer((nu - 3.0).abs(), z)?;
+    Ok(-c * kappa.powi(3) * r.powf(nu) * k_nu_m3
+        + 3.0 * c * kappa.powi(2) * r.powf(nu - 1.0) * k_nu_m2)
+}
+
+#[inline(always)]
+fn duchon_matern_block_q_l_r_triplets(
+    r: f64,
+    kappa: f64,
+    n_order: usize,
+    k_dim: usize,
+) -> Result<((f64, f64, f64), (f64, f64, f64)), BasisError> {
+    if r <= 0.0 {
+        return Ok(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)));
+    }
+    let (_value, first, second) = duchon_matern_block_triplet(r, kappa, n_order, k_dim)?;
+    let third = duchon_matern_block_r3(r, kappa, n_order, k_dim)?;
+    let q0 = first / r;
+    let q1 = (second - q0) / r;
+    let q2 = third / r - 2.0 * second / (r * r) + 2.0 * first / (r * r * r);
+    let (m0, m1, m2) = duchon_matern_block_triplet(r, kappa, n_order, k_dim)?;
+    let (prev0, prev1, prev2) = if n_order > 1 {
+        duchon_matern_block_triplet(r, kappa, n_order - 1, k_dim)?
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    let k2 = kappa * kappa;
+    let l0 = k2 * m0 - prev0;
+    let l1 = k2 * m1 - prev1;
+    let l2 = k2 * m2 - prev2;
+    Ok(((q0, q1, q2), (l0, l1, l2)))
+}
+
+#[inline(always)]
+fn duchon_polyharmonic_second_collision_psi_triplet(
+    length_scale: f64,
+    m: usize,
+    k_dim: usize,
+) -> (f64, f64, f64) {
+    // At exact center collisions the individual partial-fraction pieces can be
+    // singular/cancellation-prone. We evaluate the polyharmonic second radial
+    // derivative using the small-r asymptotic branch with r tied to length_scale,
+    // then differentiate that asymptotic in psi analytically.
+    let r_eff = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
+    let k_half = 0.5 * k_dim as f64;
+    let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
+    let e = alpha - 2.0;
+    if k_dim % 2 == 0 && m >= (k_dim / 2) {
+        let c = ((-1.0_f64).powi(m as i32))
+            / (2.0_f64.powi((2 * m - 1) as i32)
+                * std::f64::consts::PI.powf(k_half)
+                * gamma_lanczos(m as f64)
+                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+        let a = alpha * (alpha - 1.0);
+        let b = 2.0 * alpha - 1.0;
+        let base = c * r_eff.powf(e);
+        let second = base * (a * r_eff.ln() + b);
+        let second_psi = -e * second - base * a;
+        let second_psi_psi = e * e * second + 2.0 * e * base * a;
+        (second, second_psi, second_psi_psi)
+    } else {
+        let c = gamma_lanczos(k_half - m as f64)
+            / (4.0_f64.powi(m as i32)
+                * std::f64::consts::PI.powf(k_half)
+                * gamma_lanczos(m as f64));
+        let second = c * alpha * (alpha - 1.0) * r_eff.powf(e);
+        let scale = 2.0 - alpha;
+        (second, scale * second, scale * scale * second)
+    }
+}
+
+#[inline(always)]
+fn duchon_matern_second_collision_psi_triplet(
+    length_scale: f64,
+    n_order: usize,
+    k_dim: usize,
+) -> Result<(f64, f64, f64), BasisError> {
+    // Same collision strategy for shifted blocks: evaluate the second radial
+    // derivative at a length-scale-relative floor and propagate psi derivatives
+    // analytically using the local scaling exponent.
+    let kappa = 1.0 / length_scale;
+    let gamma = DUCHON_DERIVATIVE_R_FLOOR_REL;
+    let r_eff = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8);
+    let (_value, _first, second) = duchon_matern_block_triplet(r_eff, kappa, n_order, k_dim)?;
+    let n = n_order as f64;
+    let nu = n - 0.5 * k_dim as f64;
+    let scale = 2.0 - 2.0 * nu;
+    let _ = gamma;
+    Ok((second, scale * second, scale * scale * second))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PsiTriplet {
+    value: f64,
+    psi: f64,
+    psi_psi: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DuchonRadialCore {
+    phi: PsiTriplet,
+    gradient_ratio: PsiTriplet,
+    laplacian: PsiTriplet,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DuchonRadialJets {
+    phi: f64,
+    phi_r: f64,
+    phi_rr: f64,
+    q: f64,
+    q_r: f64,
+    q_rr: f64,
+    lap: f64,
+    lap_r: f64,
+    lap_rr: f64,
+}
+
+fn duchon_radial_jets(
+    r: f64,
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+    coeffs: &DuchonPartialFractionCoeffs,
+) -> Result<DuchonRadialJets, BasisError> {
+    let kappa = 1.0 / length_scale.max(1e-300);
+    let r_eval = r.max(DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale.max(1e-8));
+    let mut out = DuchonRadialJets::default();
+
+    // Value path keeps the intrinsic diagonal convention used by the actual basis.
+    out.phi =
+        duchon_matern_kernel_general_from_distance(r, length_scale, p_order, s_order, k_dim, Some(coeffs))?;
+    if !out.phi.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite Duchon radial kernel value at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
+        )));
+    }
+
+    for (m, coeff) in coeffs.a.iter().enumerate().skip(1) {
+        if *coeff == 0.0 {
+            continue;
+        }
+        let (_vm, dm, d2m) = duchon_polyharmonic_block_triplet(r_eval, m, k_dim)?;
+        let ((q0, q1, q2), (l0, l1, l2)) = duchon_polyharmonic_q_l_r_triplets(r_eval, m, k_dim);
+        out.phi_r += coeff * dm;
+        out.phi_rr += coeff * d2m;
+        out.q += coeff * q0;
+        out.q_r += coeff * q1;
+        out.q_rr += coeff * q2;
+        out.lap += coeff * l0;
+        out.lap_r += coeff * l1;
+        out.lap_rr += coeff * l2;
+    }
+    for (n, coeff) in coeffs.b.iter().enumerate().skip(1) {
+        if *coeff == 0.0 {
+            continue;
+        }
+        let (_vn, dn, d2n) = duchon_matern_block_triplet(r_eval, kappa, n, k_dim)?;
+        let ((q0, q1, q2), (l0, l1, l2)) =
+            duchon_matern_block_q_l_r_triplets(r_eval, kappa, n, k_dim)?;
+        out.phi_r += coeff * dn;
+        out.phi_rr += coeff * d2n;
+        out.q += coeff * q0;
+        out.q_r += coeff * q1;
+        out.q_rr += coeff * q2;
+        out.lap += coeff * l0;
+        out.lap_r += coeff * l1;
+        out.lap_rr += coeff * l2;
+    }
+
+    if r == 0.0 {
+        out.phi_r = 0.0;
+        out.q = 0.0;
+        out.q_r = 0.0;
+        out.q_rr = 0.0;
+    }
+    if !out.phi_r.is_finite()
+        || !out.phi_rr.is_finite()
+        || !out.q.is_finite()
+        || !out.q_r.is_finite()
+        || !out.q_rr.is_finite()
+        || !out.lap.is_finite()
+        || !out.lap_r.is_finite()
+        || !out.lap_rr.is_finite()
+    {
+        return Err(BasisError::InvalidInput(format!(
+            "non-finite Duchon radial jets at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
+        )));
+    }
+    Ok(out)
+}
+
+fn duchon_radial_core_psi_triplet(
+    r: f64,
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+    coeffs: &DuchonPartialFractionCoeffs,
+) -> Result<DuchonRadialCore, BasisError> {
+    // Duchon spectral derivation
+    // --------------------------
+    // Start from the isotropic spectrum
+    //   K^(ω; kappa) ∝ 1 / (|ω|^(2p) * (kappa^2 + |ω|^2)^s),
+    // with fixed integer orders p,s and continuous scale
+    //   psi = log(kappa),   kappa = 1 / length_scale.
+    //
+    // Rescaling frequency by ω = kappa ξ gives the full spatial kernel scaling law
+    //   phi(r; kappa) = kappa^delta H(kappa r),
+    //   delta = d - 2p - 2s.
+    //
+    // Therefore the exact full-kernel psi derivatives are
+    //   phi_psi     = delta * phi + r * phi_r
+    //   phi_psipsi  = delta^2 * phi + (2 delta + 1) r phi_r + r^2 phi_rr.
+    //
+    // The operator scalars are
+    //   q(r; kappa) = phi_r(r; kappa) / r
+    //   ell(r; kappa) = Δphi(r; kappa) = phi_rr + (d-1) q.
+    // Both q and ell scale with exponent delta + 2, so
+    //   q_psi       = (delta + 2) q + r q_r
+    //   q_psipsi    = (delta + 2)^2 q + (2 delta + 5) r q_r + r^2 q_rr
+    // and identically for ell.
+    //
+    // Once {phi, q, ell} and their psi derivatives are known, the collocation
+    // operators follow exactly:
+    //   D0[k,j]         = phi(r_kj)
+    //   D1[(k,a), j]    = q(r_kj) * (x_{k,a} - c_{j,a})
+    //   D2[k,j]         = ell(r_kj)
+    // and the penalty Hessians come from the Gram identities
+    //   S_psi     = D_psi^T D + D^T D_psi
+    //   S_psipsi  = D_psipsi^T D + 2 D_psi^T D_psi + D^T D_psipsi.
+    //
+    // This helper computes exactly that minimal scalar core:
+    //   phi, q = phi_r / r, ell = Δphi
+    // together with their first and second psi derivatives.
+    let delta = duchon_scaling_exponent(p_order, s_order, k_dim);
+    let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, coeffs)?;
+    let phi = jets.phi;
+    let phi_psi = delta * phi + r * jets.phi_r;
+    let phi_psi_psi =
+        delta * delta * phi + (2.0 * delta + 1.0) * r * jets.phi_r + r * r * jets.phi_rr;
+    if r > 1e-10 {
+        let g = jets.q;
+        let lap = jets.lap;
+        let phi_r = jets.phi_r;
+        let phi_rr = jets.phi_rr;
+        // Full-kernel scaling identity for q = phi_r / r:
+        //   q_psi = (delta + 2) q + r q_r.
+        // Since q_r = (phi_rr - q) / r, this is exactly equivalent to
+        //   q_psi = (delta + 1) q + phi_rr,
+        // which is the form used here because phi_rr is already available from
+        // ell = Δphi = phi_rr + (d-1) q.
+        let g_psi = (delta + 1.0) * g + phi_rr;
+        let g_psi_psi =
+            (delta + 2.0) * (delta + 2.0) * jets.q + (2.0 * delta + 5.0) * r * jets.q_r
+                + r * r * jets.q_rr;
+        let lap_psi = (delta + 2.0) * jets.lap + r * jets.lap_r;
+        let lap_psi_psi =
+            (delta + 2.0) * (delta + 2.0) * jets.lap + (2.0 * delta + 5.0) * r * jets.lap_r
+                + r * r * jets.lap_rr;
+        debug_assert!(
+            ((delta * phi + r * phi_r) - phi_psi).abs() < 1e-7_f64.max(1e-7_f64 * phi.abs())
+        );
+        return Ok(DuchonRadialCore {
+            phi: PsiTriplet {
+                value: phi,
+                psi: phi_psi,
+                psi_psi: phi_psi_psi,
+            },
+            gradient_ratio: PsiTriplet {
+                value: g,
+                psi: g_psi,
+                psi_psi: g_psi_psi,
+            },
+            laplacian: PsiTriplet {
+                value: lap,
+                psi: lap_psi,
+                psi_psi: lap_psi_psi,
+            },
+        });
+    }
+
+    // Continuous center-collision extension for the scalar operator core:
+    //   phi(0; kappa),  g(0; kappa) = 0,  L(0; kappa) = d * phi_rr(0; kappa).
+    let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
+        duchon_phi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
+    Ok(DuchonRadialCore {
+        phi: PsiTriplet {
+            value: phi,
+            psi: phi_psi,
+            psi_psi: phi_psi_psi,
+        },
+        gradient_ratio: PsiTriplet::default(),
+        laplacian: PsiTriplet {
+            value: k_dim as f64 * phi_rr,
+            psi: k_dim as f64 * phi_rr_psi,
+            psi_psi: k_dim as f64 * phi_rr_psi_psi,
+        },
+    })
+}
+
+fn duchon_phi_rr_collision_psi_triplet(
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+    coeffs: &DuchonPartialFractionCoeffs,
+) -> Result<(f64, f64, f64), BasisError> {
+    // Center-collision rule
+    // ---------------------
+    // For a C^2 radial kernel one has
+    //   lim_{r->0} phi_r(r)/r = phi_rr(0),
+    //   lim_{r->0} Δphi(r)    = d * phi_rr(0).
+    //
+    // Spectrally, these classical diagonal limits exist when
+    //   2(p + s) > d + 2.
+    // In that regime phi_rr itself scales with exponent delta + 2, so the
+    // diagonal psi derivatives are exactly
+    //   phi_rr_psi     = (delta + 2) phi_rr
+    //   phi_rr_psipsi  = (delta + 2)^2 phi_rr.
+    //
+    // Outside that regime the kernel is only intrinsic at the origin, so we keep
+    // the assembled intrinsic convention from the matched block expansion.
+    let mut phi_rr = 0.0;
+    let mut phi_rr_psi = 0.0;
+    let mut phi_rr_psi_psi = 0.0;
+    for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
+        if a_m == 0.0 {
+            continue;
+        }
+        let alpha_m = duchon_coeff_exponents(p_order, s_order, m);
+        let (g0, g1, g2) = duchon_polyharmonic_second_collision_psi_triplet(length_scale, m, k_dim);
+        phi_rr += a_m * g0;
+        phi_rr_psi += alpha_m * a_m * g0 + a_m * g1;
+        phi_rr_psi_psi += alpha_m * alpha_m * a_m * g0 + 2.0 * alpha_m * a_m * g1 + a_m * g2;
+    }
+    for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
+        if b_n == 0.0 {
+            continue;
+        }
+        let beta_n = duchon_coeff_exponents(p_order, s_order, n);
+        let (g0, g1, g2) = duchon_matern_second_collision_psi_triplet(length_scale, n, k_dim)?;
+        phi_rr += b_n * g0;
+        phi_rr_psi += beta_n * b_n * g0 + b_n * g1;
+        phi_rr_psi_psi += beta_n * beta_n * b_n * g0 + 2.0 * beta_n * b_n * g1 + b_n * g2;
+    }
+    if duchon_has_classical_second_order_origin(p_order, s_order, k_dim) {
+        let scale = duchon_scaling_exponent(p_order, s_order, k_dim) + 2.0;
+        return Ok((phi_rr, scale * phi_rr, scale * scale * phi_rr));
+    }
+    Ok((phi_rr, phi_rr_psi, phi_rr_psi_psi))
+}
+
+fn build_duchon_design_psi_derivatives_with_workspace(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    // Exact Duchon design derivatives:
+    // 1. evaluate phi_psi and phi_psipsi at each data/center distance
+    // 2. project the kernel block with the same nullspace constraint used by the basis
+    // 3. append polynomial columns; their psi derivatives are zero because p and s are fixed
+    // 4. apply any frozen identifiability transform
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+    let s_order = spec.power;
+    let kappa = 1.0 / spec.length_scale;
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let z_kernel = kernel_constraint_nullspace(centers.view(), spec.nullspace_order, &mut workspace.cache)?;
+    let (data_center_r, _) = spatial_distance_matrices(data, centers.view(), &mut workspace.cache)?;
+    let n = data.nrows();
+    let k = centers.nrows();
+    let mut kernel_psi = Array2::<f64>::zeros((n, k));
+    let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
+    for i in 0..n {
+        for j in 0..k {
+            let r = data_center_r[[i, j]];
+            let core = duchon_radial_core_psi_triplet(
+                r,
+                spec.length_scale,
+                p_order,
+                s_order,
+                data.ncols(),
+                &coeffs,
+            )?;
+            kernel_psi[[i, j]] = core.phi.psi;
+            kernel_psi_psi[[i, j]] = core.phi.psi_psi;
+        }
+    }
+    let kernel_psi = fast_ab(&kernel_psi, &z_kernel);
+    let kernel_psi_psi = fast_ab(&kernel_psi_psi, &z_kernel);
+    let poly_cols = polynomial_block_from_order(data, spec.nullspace_order).ncols();
+    let kernel_cols = kernel_psi.ncols();
+    let total_cols = kernel_cols + poly_cols;
+    let mut out_psi = Array2::<f64>::zeros((n, total_cols));
+    let mut out_psi_psi = Array2::<f64>::zeros((n, total_cols));
+    out_psi.slice_mut(s![.., 0..kernel_cols]).assign(&kernel_psi);
+    out_psi_psi.slice_mut(s![.., 0..kernel_cols]).assign(&kernel_psi_psi);
+    if let Some(zf) = duchon_frozen_transform_for_derivatives(&spec.identifiability)? {
+        if total_cols != zf.nrows() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "frozen Duchon identifiability transform mismatch in design derivatives: local cols={}, transform rows={}",
+                total_cols,
+                zf.nrows()
+            )));
+        }
+        return Ok((fast_ab(&out_psi, zf), fast_ab(&out_psi_psi, zf)));
+    }
+    Ok((out_psi, out_psi_psi))
+}
+
+fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
+    centers: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
+    // Build exact Duchon operator derivatives for the canonical three-penalty path.
+    // With psi = log(kappa), the operator rows are
+    //   D0[k,j]      = phi(r_kj)
+    //   D1[(k,a),j]  = (phi_r(r_kj)/r_kj) * (x_{k,a} - c_{j,a})
+    //   D2[k,j]      = Δ phi(r_kj)
+    //
+    // Then form normalized Gram penalties
+    //   S_i = D_i^T D_i / ||D_i^T D_i||_F
+    // and differentiate them analytically in psi using
+    //   S_psi     = D_psi^T D + D^T D_psi
+    //   S_psipsi  = D_psipsi^T D + 2 D_psi^T D_psi + D^T D_psipsi
+    // followed by the exact Frobenius-norm quotient rule for normalization.
+    //
+    // This matches the continuous Duchon hyperparameter calculus with fixed
+    // integer orders p and s. Changing p or s is discrete model selection, not
+    // part of the psi = log(kappa) Hessian.
+    let p = centers.nrows();
+    let d = centers.ncols();
+    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
+    let s_order = spec.power;
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / spec.length_scale);
+    let z_kernel = kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
+    let mut d0_raw = Array2::<f64>::zeros((p, p));
+    let mut d1_raw = Array2::<f64>::zeros((p * d, p));
+    let mut d2_raw = Array2::<f64>::zeros((p, p));
+    let mut d0_raw_psi = Array2::<f64>::zeros((p, p));
+    let mut d1_raw_psi = Array2::<f64>::zeros((p * d, p));
+    let mut d2_raw_psi = Array2::<f64>::zeros((p, p));
+    let mut d0_raw_psi_psi = Array2::<f64>::zeros((p, p));
+    let mut d1_raw_psi_psi = Array2::<f64>::zeros((p * d, p));
+    let mut d2_raw_psi_psi = Array2::<f64>::zeros((p, p));
+    for k in 0..p {
+        for j in 0..p {
+            let mut dist2 = 0.0;
+            for c in 0..d {
+                let delta = centers[[k, c]] - centers[[j, c]];
+                dist2 += delta * delta;
+            }
+            let r = dist2.sqrt();
+            let core =
+                duchon_radial_core_psi_triplet(r, spec.length_scale, p_order, s_order, d, &coeffs)?;
+            d0_raw[[k, j]] = core.phi.value;
+            d0_raw_psi[[k, j]] = core.phi.psi;
+            d0_raw_psi_psi[[k, j]] = core.phi.psi_psi;
+            for axis in 0..d {
+                let delta = centers[[k, axis]] - centers[[j, axis]];
+                let row = k * d + axis;
+                d1_raw[[row, j]] = core.gradient_ratio.value * delta;
+                d1_raw_psi[[row, j]] = core.gradient_ratio.psi * delta;
+                d1_raw_psi_psi[[row, j]] = core.gradient_ratio.psi_psi * delta;
+            }
+            d2_raw[[k, j]] = core.laplacian.value;
+            d2_raw_psi[[k, j]] = core.laplacian.psi;
+            d2_raw_psi_psi[[k, j]] = core.laplacian.psi_psi;
+        }
+    }
+    let project_kernel = |mat: Array2<f64>| fast_ab(&mat, &z_kernel);
+    let d0_kernel = project_kernel(d0_raw);
+    let d0_kernel_psi = project_kernel(d0_raw_psi);
+    let d0_kernel_psi_psi = project_kernel(d0_raw_psi_psi);
+    let d1_kernel = project_kernel(d1_raw);
+    let d1_kernel_psi = project_kernel(d1_raw_psi);
+    let d1_kernel_psi_psi = project_kernel(d1_raw_psi_psi);
+    let d2_kernel = project_kernel(d2_raw);
+    let d2_kernel_psi = project_kernel(d2_raw_psi);
+    let d2_kernel_psi_psi = project_kernel(d2_raw_psi_psi);
+    let poly = polynomial_block_from_order(centers, spec.nullspace_order);
+    let poly_cols = poly.ncols();
+    let kernel_cols = d0_kernel.ncols();
+    let total_cols = kernel_cols + poly_cols;
+    let mut d0 = Array2::<f64>::zeros((p, total_cols));
+    let mut d1 = Array2::<f64>::zeros((p * d, total_cols));
+    let mut d2 = Array2::<f64>::zeros((p, total_cols));
+    let mut d0_psi = Array2::<f64>::zeros((p, total_cols));
+    let mut d1_psi = Array2::<f64>::zeros((p * d, total_cols));
+    let mut d2_psi = Array2::<f64>::zeros((p, total_cols));
+    let mut d0_psi_psi = Array2::<f64>::zeros((p, total_cols));
+    let mut d1_psi_psi = Array2::<f64>::zeros((p * d, total_cols));
+    let mut d2_psi_psi = Array2::<f64>::zeros((p, total_cols));
+    d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel);
+    d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
+    d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
+    d0_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel_psi);
+    d1_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel_psi);
+    d2_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel_psi);
+    d0_psi_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel_psi_psi);
+    d1_psi_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel_psi_psi);
+    d2_psi_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel_psi_psi);
+    if poly_cols > 0 {
+        d0.slice_mut(s![.., kernel_cols..]).assign(&poly);
+    }
+    if poly_cols > 1 {
+        for k in 0..p {
+            for axis in 0..d {
+                d1[[k * d + axis, kernel_cols + 1 + axis]] = 1.0;
+            }
+        }
+    }
+    if let Some(zf) = duchon_frozen_transform_for_derivatives(&spec.identifiability)? {
+        if total_cols != zf.nrows() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "frozen Duchon identifiability transform mismatch in operator derivatives: local cols={}, transform rows={}",
+                total_cols,
+                zf.nrows()
+            )));
+        }
+        d0 = fast_ab(&d0, zf);
+        d1 = fast_ab(&d1, zf);
+        d2 = fast_ab(&d2, zf);
+        d0_psi = fast_ab(&d0_psi, zf);
+        d1_psi = fast_ab(&d1_psi, zf);
+        d2_psi = fast_ab(&d2_psi, zf);
+        d0_psi_psi = fast_ab(&d0_psi_psi, zf);
+        d1_psi_psi = fast_ab(&d1_psi_psi, zf);
+        d2_psi_psi = fast_ab(&d2_psi_psi, zf);
+    }
+    let (s0, s0_psi, s0_psi_psi) = gram_and_psi_derivatives_from_operator(&d0, &d0_psi, &d0_psi_psi);
+    let (s1, s1_psi, s1_psi_psi) = gram_and_psi_derivatives_from_operator(&d1, &d1_psi, &d1_psi_psi);
+    let (s2, s2_psi, s2_psi_psi) = gram_and_psi_derivatives_from_operator(&d2, &d2_psi, &d2_psi_psi);
+    let (_s0n, s0n_psi, s0n_psi_psi, _c0) = normalize_penalty_with_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
+    let (_s1n, s1n_psi, s1n_psi_psi, _c1) = normalize_penalty_with_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
+    let (_s2n, s2n_psi, s2n_psi_psi, _c2) = normalize_penalty_with_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
+    Ok((vec![s0n_psi, s1n_psi, s2n_psi], vec![s0n_psi_psi, s1n_psi_psi, s2n_psi_psi]))
+}
+
+pub fn build_duchon_basis_log_kappa_derivative(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+) -> Result<BasisPsiDerivativeResult, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    build_duchon_basis_log_kappa_derivative_with_workspace(data, spec, &mut workspace)
+}
+
+pub fn build_duchon_basis_log_kappa_derivative_with_workspace(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisPsiDerivativeResult, BasisError> {
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let base = build_duchon_basis_with_workspace(data, spec, workspace)?;
+    let (design_derivative, _) =
+        build_duchon_design_psi_derivatives_with_workspace(data, spec, workspace)?;
+    let (all_penalty_deriv, _) =
+        build_duchon_operator_penalty_psi_derivatives_with_workspace(centers.view(), spec, workspace)?;
+    let penalties_derivative = base
+        .penalty_info
+        .iter()
+        .map(|info| match &info.source {
+            PenaltySource::OperatorMass => all_penalty_deriv[0].clone(),
+            PenaltySource::OperatorTension => all_penalty_deriv[1].clone(),
+            PenaltySource::OperatorStiffness => all_penalty_deriv[2].clone(),
+            other => panic!("unexpected Duchon penalty source in canonical operator path: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    Ok(BasisPsiDerivativeResult {
+        design_derivative,
+        penalties_derivative,
+    })
+}
+
+pub fn build_duchon_basis_log_kappa_second_derivative(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    build_duchon_basis_log_kappa_second_derivative_with_workspace(data, spec, &mut workspace)
+}
+
+pub fn build_duchon_basis_log_kappa_second_derivative_with_workspace(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let base = build_duchon_basis_with_workspace(data, spec, workspace)?;
+    let (_, design_second_derivative) =
+        build_duchon_design_psi_derivatives_with_workspace(data, spec, workspace)?;
+    let (_, all_penalty_second_deriv) =
+        build_duchon_operator_penalty_psi_derivatives_with_workspace(centers.view(), spec, workspace)?;
+    let penalties_second_derivative = base
+        .penalty_info
+        .iter()
+        .map(|info| match &info.source {
+            PenaltySource::OperatorMass => all_penalty_second_deriv[0].clone(),
+            PenaltySource::OperatorTension => all_penalty_second_deriv[1].clone(),
+            PenaltySource::OperatorStiffness => all_penalty_second_deriv[2].clone(),
+            other => panic!("unexpected Duchon penalty source in canonical operator path: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    Ok(BasisPsiSecondDerivativeResult {
+        design_second_derivative,
+        penalties_second_derivative,
+    })
+}
+
 /// Creates a Duchon-like basis with spectral penalty
 ///   P(w) = ||w||^(2p) * (kappa^2 + ||w||^2)^s
 /// using:
@@ -5288,9 +5662,6 @@ pub fn build_matern_basis_log_kappa_second_derivative_with_workspace(
 ///   - `Linear` -> p = 1
 /// - `s` is determined directly by `power`
 ///
-/// For the historical primary case `(p=1, s=4, k=10)` we retain the exact
-/// specialized branch (series + closed-form + asymptotic) for speed and
-/// numerical stability near the Sobolev boundary.
 pub fn create_duchon_spline_basis(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -7449,6 +7820,30 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
 mod tests {
     use super::*;
     use ndarray::{Array1, array};
+    use num_dual::{DualNum, second_derivative};
+
+    fn scaling_test_profile<D: DualNum<f64> + Copy>(t: D) -> D {
+        D::one() + t * t + t.powi(4)
+    }
+
+    fn scaling_test_phi<D: DualNum<f64> + Copy>(psi: D, r: f64, eta: f64) -> D {
+        let kappa = psi.exp();
+        let t = kappa * D::from(r);
+        (psi * D::from(eta)).exp() * scaling_test_profile(t)
+    }
+
+    fn scaling_test_q<D: DualNum<f64> + Copy>(psi: D, r: f64, eta: f64) -> D {
+        let kappa = psi.exp();
+        let t = kappa * D::from(r);
+        (psi * D::from(eta + 2.0)).exp() * (D::from(2.0) + D::from(4.0) * t * t)
+    }
+
+    fn scaling_test_lap<D: DualNum<f64> + Copy>(psi: D, r: f64, eta: f64, d: f64) -> D {
+        let kappa = psi.exp();
+        let t = kappa * D::from(r);
+        (psi * D::from(eta + 2.0)).exp()
+            * (D::from(2.0 * d) + D::from(4.0 * d + 8.0) * t * t)
+    }
 
     /// Independent recursive implementation of B-spline basis function evaluation.
     /// This implements the Cox-de Boor algorithm using recursion, following the
@@ -9377,58 +9772,6 @@ mod tests {
     }
 
     #[test]
-    fn test_duchon_primary_kernel_branch_policy() {
-        // For z < 1, runtime should use the small-a series branch.
-        let z_small = 0.1;
-        let k_boundary_expected = duchon_matern_p1_s4_k10_small_a_series(z_small);
-        let k_boundary_actual = duchon_matern_kernel_p1_s4_k10_from_distance(z_small, 1.0).unwrap();
-        let rel =
-            (k_boundary_actual - k_boundary_expected).abs() / k_boundary_expected.abs().max(1e-12);
-        assert!(
-            rel < 1e-10,
-            "small-a path should use series branch: expected={}, actual={}, rel={}",
-            k_boundary_expected,
-            k_boundary_actual,
-            rel
-        );
-
-        // In the closed-form branch regime z>=1, result should stay finite.
-        let k_closed = duchon_matern_kernel_p1_s4_k10_from_distance(1.0, 1.0).unwrap();
-        assert!(k_closed.is_finite());
-    }
-
-    #[test]
-    fn test_duchon_closed_form_matches_integral_at_moderate_scale() {
-        let kappa = 1.0;
-        let r = 1.0; // z=1, safely in closed-form branch
-        let k_int = duchon_matern_p1_s4_k10_integral(r, kappa);
-        let k_cf = duchon_matern_p1_s4_k10_closed_form(r, kappa);
-        let rel = (k_int - k_cf).abs() / k_int.abs().max(1e-12);
-        assert!(
-            rel < 2e-2,
-            "closed form should match integral at moderate scale: int={}, cf={}, rel={}",
-            k_int,
-            k_cf,
-            rel
-        );
-    }
-
-    #[test]
-    fn test_duchon_asymptotic_matches_closed_form_large_z() {
-        let z = DUCHON_ASYMPTOTIC_Z_CUTOFF;
-        let k_cf = duchon_matern_p1_s4_k10_closed_form(z, 1.0);
-        let k_asym = duchon_matern_p1_s4_k10_asymptotic(z);
-        let rel = (k_cf - k_asym).abs() / k_cf.abs().max(1e-14);
-        assert!(
-            rel < 1e-8,
-            "asymptotic shortcut should match closed form at cutoff: cf={}, asym={}, rel={}",
-            k_cf,
-            k_asym,
-            rel
-        );
-    }
-
-    #[test]
     fn test_pairwise_distance_bounds_helper() {
         let pts = array![[0.0, 0.0], [3.0, 4.0], [6.0, 8.0]];
         let (r_min, r_max) = pairwise_distance_bounds(pts.view()).expect("bounds should exist");
@@ -9649,6 +9992,260 @@ mod tests {
             penalty_err < 1e-5,
             "penalty derivative mismatch too large: {penalty_err}"
         );
+    }
+
+    #[test]
+    fn test_duchon_log_kappa_derivative_matches_fd() {
+        let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            length_scale: 0.9,
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::None,
+        };
+        let mut workspace = BasisWorkspace::default();
+        let (design_derivative, _) =
+            build_duchon_design_psi_derivatives_with_workspace(data.view(), &spec, &mut workspace)
+                .expect("analytic Duchon design derivative should build");
+        let (penalties_derivative, _) = build_duchon_operator_penalty_psi_derivatives_with_workspace(
+            centers.view(),
+            &spec,
+            &mut workspace,
+        )
+        .expect("analytic Duchon penalty derivative should build");
+
+        let eps: f64 = 1e-6;
+        let kappa = 1.0 / spec.length_scale;
+        let ls_plus = 1.0 / (kappa * eps.exp());
+        let ls_minus = 1.0 / (kappa * (-eps).exp());
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = ls_plus;
+        spec_minus.length_scale = ls_minus;
+        let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+        let plus_penalties =
+            build_duchon_operator_penalty_candidates(centers.view(), ls_plus, spec.power, spec.nullspace_order)
+                .expect("plus operator penalties");
+        let minus_penalties =
+            build_duchon_operator_penalty_candidates(centers.view(), ls_minus, spec.power, spec.nullspace_order)
+                .expect("minus operator penalties");
+
+        let fd_design = (&plus.design - &minus.design) / (2.0 * eps);
+        let design_err = (&design_derivative - &fd_design)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            design_err < 1e-4,
+            "Duchon design derivative mismatch too large: {design_err}"
+        );
+
+        assert_eq!(penalties_derivative.len(), 3);
+        assert_eq!(plus_penalties.len(), 3);
+        assert_eq!(minus_penalties.len(), 3);
+        for penalty_idx in 0..penalties_derivative.len() {
+            let fd_penalty =
+                (&plus_penalties[penalty_idx].matrix - &minus_penalties[penalty_idx].matrix)
+                    / (2.0 * eps);
+            let penalty_err = (&penalties_derivative[penalty_idx] - &fd_penalty)
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                penalty_err < 1e-4,
+                "Duchon penalty derivative mismatch too large for block {penalty_idx}: {penalty_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_duchon_log_kappa_second_derivative_matches_fd() {
+        let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            length_scale: 0.9,
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::None,
+        };
+        let mut workspace = BasisWorkspace::default();
+        let (_, design_second_derivative) =
+            build_duchon_design_psi_derivatives_with_workspace(data.view(), &spec, &mut workspace)
+                .expect("analytic Duchon design second derivative should build");
+        let (_, penalties_second_derivative) =
+            build_duchon_operator_penalty_psi_derivatives_with_workspace(
+                centers.view(),
+                &spec,
+                &mut workspace,
+            )
+            .expect("analytic Duchon penalty second derivative should build");
+        let base = build_duchon_basis(data.view(), &spec).expect("base build");
+
+        let eps: f64 = 2e-5;
+        let kappa = 1.0 / spec.length_scale;
+        let ls_plus = 1.0 / (kappa * eps.exp());
+        let ls_minus = 1.0 / (kappa * (-eps).exp());
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = ls_plus;
+        spec_minus.length_scale = ls_minus;
+        let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+        let base_penalties = build_duchon_operator_penalty_candidates(
+            centers.view(),
+            spec.length_scale,
+            spec.power,
+            spec.nullspace_order,
+        )
+        .expect("base operator penalties");
+        let plus_penalties =
+            build_duchon_operator_penalty_candidates(centers.view(), ls_plus, spec.power, spec.nullspace_order)
+                .expect("plus operator penalties");
+        let minus_penalties =
+            build_duchon_operator_penalty_candidates(centers.view(), ls_minus, spec.power, spec.nullspace_order)
+                .expect("minus operator penalties");
+
+        let fd_design = (&plus.design - &(base.design.clone() * 2.0) + &minus.design) / (eps * eps);
+        let design_err = (&design_second_derivative - &fd_design)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            design_err < 5e-3,
+            "Duchon design second derivative mismatch too large: {design_err}"
+        );
+
+        assert_eq!(penalties_second_derivative.len(), 3);
+        assert_eq!(base_penalties.len(), 3);
+        assert_eq!(plus_penalties.len(), 3);
+        assert_eq!(minus_penalties.len(), 3);
+        for penalty_idx in 0..penalties_second_derivative.len() {
+            let fd_penalty =
+                (&plus_penalties[penalty_idx].matrix - &(base_penalties[penalty_idx].matrix.clone() * 2.0)
+                    + &minus_penalties[penalty_idx].matrix)
+                    / (eps * eps);
+            let penalty_err = (&penalties_second_derivative[penalty_idx] - &fd_penalty)
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                penalty_err < 5e-3,
+                "Duchon penalty second derivative mismatch too large for block {penalty_idx}: {penalty_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_log_kappa_scaling_identities_match_autodiff() {
+        let psi0 = -0.23;
+        let r = 0.71;
+        let d = 5.0;
+        let eta = -3.5;
+        let kappa = psi0.exp();
+        let t = kappa * r;
+        let eta_q = eta + 2.0;
+
+        let (phi, phi_psi_ad, phi_psi_psi_ad) =
+            second_derivative(|psi| scaling_test_phi(psi, r, eta), psi0);
+        let (q, q_psi_ad, q_psi_psi_ad) =
+            second_derivative(|psi| scaling_test_q(psi, r, eta), psi0);
+        let (lap, lap_psi_ad, lap_psi_psi_ad) =
+            second_derivative(|psi| scaling_test_lap(psi, r, eta, d), psi0);
+
+        let phi_r = kappa.powf(eta + 1.0) * (2.0 * t + 4.0 * t.powi(3));
+        let phi_rr = kappa.powf(eta + 2.0) * (2.0 + 12.0 * t * t);
+        let q_r = kappa.powf(eta + 3.0) * (8.0 * t);
+        let q_rr = kappa.powf(eta + 4.0) * 8.0;
+        let lap_r = kappa.powf(eta + 3.0) * ((8.0 * d + 16.0) * t);
+        let lap_rr = kappa.powf(eta + 4.0) * (8.0 * d + 16.0);
+
+        let phi_psi = eta * phi + r * phi_r;
+        let phi_psi_psi = eta * eta * phi + (2.0 * eta + 1.0) * r * phi_r + r * r * phi_rr;
+        let q_psi = eta_q * q + r * q_r;
+        let q_psi_psi = eta_q * eta_q * q + (2.0 * eta_q + 1.0) * r * q_r + r * r * q_rr;
+        let lap_psi = eta_q * lap + r * lap_r;
+        let lap_psi_psi =
+            eta_q * eta_q * lap + (2.0 * eta_q + 1.0) * r * lap_r + r * r * lap_rr;
+
+        assert!((phi_psi - phi_psi_ad).abs() < 1e-12);
+        assert!((phi_psi_psi - phi_psi_psi_ad).abs() < 1e-12);
+        assert!((q_psi - q_psi_ad).abs() < 1e-12);
+        assert!((q_psi_psi - q_psi_psi_ad).abs() < 1e-12);
+        assert!((lap_psi - lap_psi_ad).abs() < 1e-12);
+        assert!((lap_psi_psi - lap_psi_psi_ad).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_duchon_spectral_scaling_matches_implementation() {
+        let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
+        let s_order = 3usize;
+        let k_dim = 4usize;
+        let length_scale_1 = 1.7;
+        let length_scale_2 = 0.85;
+        let kappa_1 = 1.0 / length_scale_1;
+        let kappa_2 = 1.0 / length_scale_2;
+        let scale = kappa_2 / kappa_1;
+        let r = 0.43;
+        let scaled_r = scale * r;
+        let delta = duchon_scaling_exponent(p_order, s_order, k_dim);
+
+        let coeffs_1 = duchon_partial_fraction_coeffs(p_order, s_order, kappa_1);
+        let coeffs_2 = duchon_partial_fraction_coeffs(p_order, s_order, kappa_2);
+
+        let phi_1 = duchon_matern_kernel_general_from_distance(
+            scaled_r,
+            length_scale_1,
+            p_order,
+            s_order,
+            k_dim,
+            Some(&coeffs_1),
+        )
+        .expect("scaled phi_1");
+        let phi_2 = duchon_matern_kernel_general_from_distance(
+            r,
+            length_scale_2,
+            p_order,
+            s_order,
+            k_dim,
+            Some(&coeffs_2),
+        )
+        .expect("phi_2");
+        let jets_1 = duchon_radial_jets(scaled_r, length_scale_1, p_order, s_order, k_dim, &coeffs_1)
+            .expect("jets_1");
+        let jets_2 =
+            duchon_radial_jets(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2).expect("jets_2");
+
+        let phi_scale = scale.powf(delta);
+        let op_scale = scale.powf(delta + 2.0);
+        assert!((phi_2 - phi_scale * phi_1).abs() < 1e-9);
+        assert!((jets_2.q - op_scale * jets_1.q).abs() < 1e-8);
+        assert!((jets_2.lap - op_scale * jets_1.lap).abs() < 1e-8);
+
+        let core = duchon_radial_core_psi_triplet(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2)
+            .expect("radial core");
+        let q_psi_expected = (delta + 2.0) * jets_2.q + r * jets_2.q_r;
+        let q_psi_psi_expected =
+            (delta + 2.0) * (delta + 2.0) * jets_2.q + (2.0 * delta + 5.0) * r * jets_2.q_r
+                + r * r * jets_2.q_rr;
+        let lap_psi_expected = (delta + 2.0) * jets_2.lap + r * jets_2.lap_r;
+        let lap_psi_psi_expected =
+            (delta + 2.0) * (delta + 2.0) * jets_2.lap + (2.0 * delta + 5.0) * r * jets_2.lap_r
+                + r * r * jets_2.lap_rr;
+
+        assert!((core.gradient_ratio.psi - q_psi_expected).abs() < 1e-10);
+        assert!((core.gradient_ratio.psi_psi - q_psi_psi_expected).abs() < 1e-9);
+        assert!((core.laplacian.psi - lap_psi_expected).abs() < 1e-10);
+        assert!((core.laplacian.psi_psi - lap_psi_psi_expected).abs() < 1e-9);
     }
 
     #[test]

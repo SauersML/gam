@@ -460,6 +460,38 @@ def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42, stratified: boo
         raise ValueError(f"Need at least {n_splits} rows for {n_splits}-fold CV; got {n}")
     rng = np.random.default_rng(seed)
 
+    if n_splits == 1:
+        if n < 2:
+            raise ValueError("Need at least 2 rows for a holdout split")
+        test_fraction = 0.2
+        if stratified:
+            classes = np.unique(y)
+            if len(classes) >= 2:
+                test_rows = []
+                for c in classes:
+                    idx = np.where(y == c)[0]
+                    rng.shuffle(idx)
+                    if len(idx) < 2:
+                        raise ValueError(
+                            "Need at least 2 observations in each class for a stratified holdout split"
+                        )
+                    n_test = max(1, int(round(len(idx) * test_fraction)))
+                    n_test = min(n_test, len(idx) - 1)
+                    test_rows.extend(idx[:n_test].tolist())
+                test_idx = np.array(sorted(test_rows), dtype=int)
+                train_mask = np.ones(n, dtype=bool)
+                train_mask[test_idx] = False
+                all_idx = np.arange(n, dtype=int)
+                return [Fold(train_idx=all_idx[train_mask], test_idx=test_idx)]
+        perm = np.arange(n, dtype=int)
+        rng.shuffle(perm)
+        n_test = min(max(1, int(round(n * test_fraction))), n - 1)
+        test_idx = np.sort(perm[:n_test])
+        all_idx = np.arange(n, dtype=int)
+        train_mask = np.ones(n, dtype=bool)
+        train_mask[test_idx] = False
+        return [Fold(train_idx=all_idx[train_mask], test_idx=test_idx)]
+
     if stratified:
         classes = np.unique(y)
         if len(classes) >= 2:
@@ -488,6 +520,18 @@ def make_folds(y: np.ndarray, n_splits: int = 5, seed: int = 42, stratified: boo
         train_mask[test_idx] = False
         folds.append(Fold(train_idx=all_idx[train_mask], test_idx=np.sort(test_idx)))
     return folds
+
+
+def _evaluation_suffix(folds: list[Fold]) -> str:
+    if len(folds) == 1:
+        return "[holdout]"
+    return f"[{len(folds)}-fold CV]"
+
+
+def _evaluation_label(folds: list[Fold]) -> str:
+    if len(folds) == 1:
+        return "holdout"
+    return f"{len(folds)}-fold CV"
 
 
 def auc_score(y: np.ndarray, p: np.ndarray) -> float:
@@ -1463,7 +1507,7 @@ def _synthetic_geo_disease_eas_dataset(n=6000, seed=20260301, n_pcs=16):
 
 def _geo_disease_eas_scenario_cfg(name):
     m = re.match(
-        r"^geo_disease_(eas|eas3)_(tp|duchon|matern|psperpc)_k([0-9]+)(?:_downsample[0-9]+x)?$",
+        r"^geo_disease_(eas|eas3)_(tp|duchon|matern|psperpc)_k([0-9]+)(?:_downsample[0-9]+x)?(?:_holdout)?$",
         str(name),
     )
     if m is None:
@@ -2067,11 +2111,14 @@ def _dataset_for_scenario_unvalidated(s):
 
 def dataset_for_scenario(s):
     ds = _dataset_for_scenario_unvalidated(s)
+    if "cv_splits" in s:
+        ds["_cv_splits"] = int(s["cv_splits"])
     _validate_dataset_schema(ds, scenario_name=s["name"])
     return ds
 
 
 def folds_for_dataset(ds):
+    n_splits = int(ds.get("_cv_splits", CV_SPLITS))
     if ds["family"] == "survival":
         _coerce_positive_survival_dataset_inplace(ds, dataset_name=ds.get("name", "survival_dataset"))
         y = np.array([float(r[ds["event_col"]]) for r in ds["rows"]], dtype=float)
@@ -2079,7 +2126,26 @@ def folds_for_dataset(ds):
     else:
         y = np.array([float(r[ds["target"]]) for r in ds["rows"]], dtype=float)
         stratified = ds["family"] == "binomial"
-    folds = make_folds(y, n_splits=CV_SPLITS, seed=CV_SEED, stratified=stratified)
+    if ds["family"] == "binomial":
+        y_bin = (y > 0.5).astype(int)
+        n_pos = int(np.sum(y_bin == 1))
+        n_neg = int(np.sum(y_bin == 0))
+        min_class = min(n_pos, n_neg)
+        min_required = 2 if n_splits == 1 else n_splits
+        if min_class < min_required:
+            raise RuntimeError(
+                "invalid binomial CV configuration: "
+                f"requested {n_splits} "
+                f"{'holdout split' if n_splits == 1 else 'folds'} but class counts are "
+                f"positives={n_pos}, negatives={n_neg}. "
+                + (
+                    "Each class must have at least two observations for a stratified holdout split. "
+                    if n_splits == 1
+                    else "Each class must have at least one observation per fold. "
+                )
+                + "Increase n or reduce the number of folds."
+            )
+    folds = make_folds(y, n_splits=n_splits, seed=CV_SEED, stratified=stratified)
     n = len(ds["rows"])
     seen = np.zeros(n, dtype=int)
     for f in folds:
@@ -2092,7 +2158,10 @@ def folds_for_dataset(ds):
         if np.any(tr < 0) or np.any(te < 0) or np.any(tr >= n) or np.any(te >= n):
             raise RuntimeError("invalid CV split: index out of bounds")
         seen[te] += 1
-    if not np.all(seen == 1):
+    if len(folds) == 1:
+        if np.any(seen > 1):
+            raise RuntimeError("invalid holdout split: a row appears more than once in the test set")
+    elif not np.all(seen == 1):
         raise RuntimeError("invalid CV split: each row must appear exactly once in test sets")
     return folds
 
@@ -2849,9 +2918,11 @@ def run_rust_scenario_cv(
 
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
+    eval_suffix = _evaluation_suffix(folds)
     ood_rows = []
     continuous_rows = []
     adaptive_rows = []
+    eval_suffix = _evaluation_suffix(folds)
     rust_cfg = _effective_rust_fit_mapping(scenario_name, rust_cfg_override) or {}
     smooth_cols = list(rust_cfg.get("smooth_cols") or ([rust_cfg["smooth_col"]] if "smooth_col" in rust_cfg else []))
     linear_cols = list(rust_cfg.get("linear_cols", []))
@@ -3027,9 +3098,9 @@ def run_rust_scenario_cv(
                         "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": (
-                            "gam fit/predict via release binary [5-fold CV]"
+                            f"gam fit/predict via release binary {eval_suffix}"
                             if not binomial_link
-                            else f"gam fit/predict via release binary (link={binomial_link}) [5-fold CV]"
+                            else f"gam fit/predict via release binary (link={binomial_link}) {eval_suffix}"
                         ),
                     }
                 )
@@ -3116,7 +3187,7 @@ def run_rust_scenario_cv(
                         "mae": mae_score(y_test, pred),
                         "r2": r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": "gam fit/predict via release binary [5-fold CV]",
+                        "model_spec": f"gam fit/predict via release binary {eval_suffix}",
                     }
                 )
             else:
@@ -3145,7 +3216,7 @@ def run_rust_scenario_cv(
                         "predict_horizon_policy": "global train-fold median time",
                         "model_spec": (
                             "survival model via release binary "
-                            f"(c-index on risk score from '{score_src}') [5-fold CV]"
+                            f"(c-index on risk score from '{score_src}') {eval_suffix}"
                         ),
                     }
                 )
@@ -3406,7 +3477,7 @@ def _run_rust_gamlss_scenario_cv_variant(
                         "logloss": log_loss_score(y_test, pred),
                         "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": f"{binomial_model_spec_label} [5-fold CV]",
+                        "model_spec": f"{binomial_model_spec_label} {eval_suffix}",
                     }
                 )
             else:
@@ -3461,7 +3532,7 @@ def _run_rust_gamlss_scenario_cv_variant(
                         "mae": mae_score(y_test, pred),
                         "r2": r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
-                        "model_spec": "gamlss gaussian location-scale via release binary [5-fold CV]",
+                        "model_spec": f"gamlss gaussian location-scale via release binary {eval_suffix}",
                     }
                 )
 
@@ -3942,7 +4013,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         "scenario_name": scenario_name,
         "status": "ok",
         **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
+        "model_spec": f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
     }
 
 
@@ -4248,7 +4319,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         "scenario_name": scenario["name"],
         "status": "ok",
         **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
+        "model_spec": f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
     }
 
 
@@ -4450,7 +4521,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         "scenario_name": scenario["name"],
         "status": "ok",
         **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
+        "model_spec": f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
     }
 
 

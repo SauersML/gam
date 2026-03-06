@@ -4,6 +4,7 @@ use crate::basis::{
     MaternBasisSpec, MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource,
     SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
     apply_weighted_orthogonality_constraint, build_bspline_basis_1d, build_duchon_basis,
+    build_duchon_basis_log_kappa_derivative, build_duchon_basis_log_kappa_second_derivative,
     build_duchon_collocation_operator_matrices, build_matern_basis,
     build_matern_basis_log_kappa_derivative, build_matern_basis_log_kappa_second_derivative,
     build_matern_collocation_operator_matrices, build_thin_plate_basis, estimate_penalty_nullity,
@@ -1619,6 +1620,7 @@ pub fn build_term_collection_design(
     let mut linear_constraint_rows = Vec::<Array1<f64>>::new();
     let mut linear_constraint_b = Vec::<f64>::new();
 
+    let mut penalized_linear_cols = Vec::<usize>::new();
     for (j, linear) in spec.linear_terms.iter().enumerate() {
         let col = p_intercept + j;
         if let Some(lb) = linear.coefficient_min {
@@ -1633,22 +1635,27 @@ pub fn build_term_collection_design(
             linear_constraint_rows.push(row);
             linear_constraint_b.push(-ub);
         }
-        if !linear.double_penalty {
-            continue;
+        if linear.double_penalty {
+            penalized_linear_cols.push(col);
         }
+    }
+
+    if !penalized_linear_cols.is_empty() {
         let mut s = Array2::<f64>::zeros((p_total, p_total));
-        s[[col, col]] = 1.0;
+        for &col in &penalized_linear_cols {
+            s[[col, col]] = 1.0;
+        }
         let global_index = penalties.len();
         penalties.push(s);
         nullspace_dims.push(0);
         penalty_info.push(PenaltyBlockInfo {
             global_index,
-            term_name: Some(linear.name.clone()),
+            term_name: Some("linear".to_string()),
             penalty: PenaltyInfo {
-                source: PenaltySource::Other(format!("LinearDoublePenalty({})", linear.name)),
-                original_index: j,
+                source: PenaltySource::Other("LinearDoublePenaltyGroup".to_string()),
+                original_index: 0,
                 active: true,
-                effective_rank: 1,
+                effective_rank: penalized_linear_cols.len(),
                 dropped_reason: None,
                 nullspace_dim_hint: 0,
                 normalization_scale: 1.0,
@@ -3312,6 +3319,10 @@ impl CustomFamily for BoundedLinearFamily {
         Ok((DesignMatrix::Dense(x), offset))
     }
 
+    fn block_geometry_is_dynamic(&self) -> bool {
+        true
+    }
+
     fn block_geometry_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
@@ -3876,11 +3887,7 @@ fn smooth_term_penalty_index(
     if design.smooth.terms[term_idx].penalties_local.is_empty() {
         return None;
     }
-    let linear_penalties = spec
-        .linear_terms
-        .iter()
-        .filter(|t| t.double_penalty)
-        .count();
+    let linear_penalties = usize::from(spec.linear_terms.iter().any(|t| t.double_penalty));
     let random_penalties = design
         .random_effect_ranges
         .iter()
@@ -3994,6 +4001,11 @@ fn try_build_spatial_term_log_kappa_derivative(
             build_matern_basis_log_kappa_derivative(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
+        SmoothBasisSpec::Duchon { feature_cols, spec } => {
+            let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            build_duchon_basis_log_kappa_derivative(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
         _ => return Ok(None),
     };
     let BasisPsiSecondDerivativeResult {
@@ -4003,6 +4015,11 @@ fn try_build_spatial_term_log_kappa_derivative(
         SmoothBasisSpec::Matern { feature_cols, spec } => {
             let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
             build_matern_basis_log_kappa_second_derivative(x.view(), spec)
+                .map_err(EstimationError::from)?
+        }
+        SmoothBasisSpec::Duchon { feature_cols, spec } => {
+            let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            build_duchon_basis_log_kappa_second_derivative(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
         _ => return Ok(None),
@@ -4081,6 +4098,12 @@ fn try_build_spatial_log_kappa_hyper_dirs(
     design: &TermCollectionDesign,
     spatial_terms: &[usize],
 ) -> Result<Option<Vec<DirectionalHyperParam>>, EstimationError> {
+    // Each spatial term contributes one continuous scale hyperparameter
+    //   psi = log(kappa) = -log(length_scale),
+    // while rho = log(lambda) still indexes the smoothing parameters of the
+    // three operator penalties. The joint outer vector is therefore
+    //   theta = (rho_0, ..., rho_{K-1}, psi_1, ..., psi_q)
+    // for q spatial terms participating in exact joint optimization.
     let Some(info_list) = try_build_spatial_log_kappa_derivative_info_list(
         data,
         resolved_spec,
@@ -4137,6 +4160,10 @@ fn try_exact_joint_spatial_hyper_cost_gradient_hessian(
     options: &FitOptions,
     spatial_terms: &[usize],
 ) -> Result<Option<(f64, Array1<f64>, Array2<f64>)>, EstimationError> {
+    // This path evaluates the exact joint outer derivatives for theta = (rho, psi),
+    // where psi are spatial log-kappa parameters. For each spatial term we provide
+    // X_psi, S_psi, X_psipsi, S_psipsi so Newton trust-region can use an analytic
+    // outer gradient and Hessian instead of finite-difference hyper-directions.
     let design = build_term_collection_design(data, resolved_spec)?;
     let Some(info_list) = try_build_spatial_log_kappa_derivative_info_list(
         data,
@@ -6256,6 +6283,101 @@ mod tests {
     }
 
     #[test]
+    fn exact_duchon_log_kappa_derivative_uses_feature_columns_only() {
+        let n = 28usize;
+        let p = 15usize;
+        let mut data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (0.21 * i as f64).cos();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+            for j in 2..p {
+                data[[i, j]] = ((i + 2 * j) as f64 * 0.09).sin();
+            }
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 7 },
+                        length_scale: 0.7,
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec)
+            .expect("baseline Duchon design should build");
+        let frozen_spec = freeze_spatial_length_scale_terms_from_design(&spec, &design)
+            .expect("freezing Duchon centers from design should succeed");
+
+        match &frozen_spec.smooth_terms[0].basis {
+            SmoothBasisSpec::Duchon { spec, .. } => match &spec.center_strategy {
+                CenterStrategy::UserProvided(centers) => {
+                    assert_eq!(centers.ncols(), 2, "frozen centers should stay term-local");
+                }
+                _ => panic!("expected frozen user-provided centers"),
+            },
+            _ => panic!("expected Duchon term"),
+        }
+
+        let smooth_term = &design.smooth.terms[0];
+        let term_spec = &frozen_spec.smooth_terms[0];
+        let BasisPsiDerivativeResult {
+            design_derivative: local_x_psi,
+            penalties_derivative: local_s_psi,
+        } = match &term_spec.basis {
+            SmoothBasisSpec::Duchon { feature_cols, spec } => {
+                let x = select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
+                build_duchon_basis_log_kappa_derivative(x.view(), spec)
+                    .expect("direct Duchon derivative should build")
+            }
+            _ => panic!("expected Duchon term"),
+        };
+        let BasisPsiSecondDerivativeResult {
+            design_second_derivative: local_x_psi_psi,
+            penalties_second_derivative: local_s_psi_psi,
+        } = match &term_spec.basis {
+            SmoothBasisSpec::Duchon { feature_cols, spec } => {
+                let x = select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
+                build_duchon_basis_log_kappa_second_derivative(x.view(), spec)
+                    .expect("direct Duchon second derivative should build")
+            }
+            _ => panic!("expected Duchon term"),
+        };
+        assert_eq!(local_x_psi.ncols(), smooth_term.coeff_range.len());
+        assert_eq!(local_x_psi_psi.ncols(), smooth_term.coeff_range.len());
+        assert!(!local_s_psi.is_empty());
+        assert_eq!(local_s_psi.len(), local_s_psi_psi.len());
+        assert!(local_s_psi.iter().all(|s| {
+            s.nrows() == smooth_term.coeff_range.len() && s.ncols() == smooth_term.coeff_range.len()
+        }));
+        assert!(local_s_psi_psi.iter().all(|s| {
+            s.nrows() == smooth_term.coeff_range.len() && s.ncols() == smooth_term.coeff_range.len()
+        }));
+
+        let derivative =
+            try_build_spatial_term_log_kappa_derivative(data.view(), &frozen_spec, &design, 0);
+        assert!(
+            derivative.is_ok(),
+            "exact Duchon log-kappa derivative should use only feature_cols; got {derivative:?}"
+        );
+        let derivative = derivative.expect("derivative call should succeed");
+        assert!(derivative.is_some(), "Duchon term should expose an exact derivative");
+    }
+
+    #[test]
     fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern() {
         let n = 60usize;
         let d = 2usize;
@@ -6620,6 +6742,42 @@ mod tests {
             term.coefficient_geometry,
             LinearCoefficientGeometry::Unconstrained
         ));
+    }
+
+    #[test]
+    fn linear_double_penalties_share_one_global_ridge_block() {
+        let data = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let spec = TermCollectionSpec {
+            linear_terms: vec![
+                LinearTermSpec {
+                    name: "x1".to_string(),
+                    feature_col: 0,
+                    double_penalty: true,
+                    coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                    coefficient_min: None,
+                    coefficient_max: None,
+                },
+                LinearTermSpec {
+                    name: "x2".to_string(),
+                    feature_col: 1,
+                    double_penalty: true,
+                    coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                    coefficient_min: None,
+                    coefficient_max: None,
+                },
+            ],
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+        };
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        assert_eq!(design.penalties.len(), 1);
+        assert_eq!(design.penalty_info.len(), 1);
+        assert_eq!(design.penalty_info[0].term_name.as_deref(), Some("linear"));
+        assert_eq!(design.penalty_info[0].penalty.effective_rank, 2);
+        let x1 = design.linear_ranges[0].1.start;
+        let x2 = design.linear_ranges[1].1.start;
+        assert_eq!(design.penalties[0][[x1, x1]], 1.0);
+        assert_eq!(design.penalties[0][[x2, x2]], 1.0);
     }
 
     #[test]

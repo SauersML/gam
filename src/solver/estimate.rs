@@ -1100,10 +1100,11 @@ where
         finite_diff_step: 1e-3,
         // External REML path below provides exact Hessians directly.
         fd_hessian_max_dim: 0,
+        optimizer_kind: crate::solver::smoothing::SmoothingOptimizerKind::Arc,
         seed_config: SeedConfig {
             bounds: (-12.0, 12.0),
             max_seeds: if has_full_heuristic {
-                if k <= 6 { 4 } else { 5 }
+                1
             } else if k <= 4 {
                 8
             } else if k <= 12 {
@@ -1112,7 +1113,7 @@ where
                 12
             },
             screening_budget: if has_full_heuristic {
-                if k <= 6 { 1 } else { 2 }
+                1
             } else if k <= 6 {
                 2
             } else {
@@ -1163,7 +1164,7 @@ where
             "simultaneous mixture and SAS optimization is not supported".to_string(),
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
-        let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
+        let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient(
             k,
             heuristic_lambdas,
             |rho: &Array1<f64>| {
@@ -1177,27 +1178,14 @@ where
                 let grad = reml_state.compute_gradient(rho)?;
                 let grad_sec = t_grad.elapsed().as_secs_f64();
                 let used_stochastic = reml_state.last_gradient_used_stochastic_fallback();
-                let t_hess = Instant::now();
-                let hess = match reml_state.compute_laml_hessian_consistent(rho) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        log::warn!(
-                            "[outer-eval {eval_idx}] Hessian unavailable at rho (fallback to gradient-only sample): {e}"
-                        );
-                        None
-                    }
-                };
-                let hess_sec = t_hess.elapsed().as_secs_f64();
                 log::info!(
-                    "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} hessian={} time_sec(cost={:.3}, grad={:.3}, hess={:.3})",
+                    "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3})",
                     rho.len(),
                     used_stochastic,
-                    hess.is_some(),
                     cost_sec,
                     grad_sec,
-                    hess_sec,
                 );
-                Ok((cost, grad, hess))
+                Ok((cost, grad))
             },
             &smoothing_options,
         )?;
@@ -2938,7 +2926,8 @@ pub use crate::inference::predict::{
     predict_gam_posterior_mean, predict_gam_posterior_mean_with_fit, predict_gam_with_uncertainty,
 };
 pub use crate::solver::smoothing::{
-    SmoothingBfgsOptions, SmoothingBfgsResult, optimize_log_smoothing_with_multistart,
+    SmoothingBfgsOptions, SmoothingBfgsResult, SmoothingOptimizerKind,
+    optimize_log_smoothing_with_multistart,
     optimize_log_smoothing_with_multistart_parallel_fd,
     optimize_log_smoothing_with_multistart_with_gradient,
 };

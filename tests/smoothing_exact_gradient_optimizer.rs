@@ -1,5 +1,5 @@
 use gam::estimate::{
-    SmoothingBfgsOptions, optimize_log_smoothing_with_multistart,
+    SmoothingBfgsOptions, SmoothingOptimizerKind, optimize_log_smoothing_with_multistart,
     optimize_log_smoothing_with_multistart_with_gradient,
 };
 use gam::seeding::{SeedConfig, SeedRiskProfile};
@@ -27,6 +27,7 @@ fn exact_gradient_optimizer_matches_fd_on_quadratic_objective() {
         tol: 1e-8,
         finite_diff_step: 1e-4,
         fd_hessian_max_dim: usize::MAX,
+        optimizer_kind: SmoothingOptimizerKind::TrustRegion,
         seed_config: SeedConfig {
             bounds: (-4.0, 4.0),
             max_seeds: 16,

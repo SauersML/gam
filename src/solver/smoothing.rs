@@ -7,6 +7,12 @@ use wolfe_bfgs::{
     ObjectiveRequest, ObjectiveSample,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmoothingOptimizerKind {
+    TrustRegion,
+    Arc,
+}
+
 #[derive(Clone, Debug)]
 pub struct SmoothingBfgsOptions {
     pub max_iter: usize,
@@ -15,6 +21,7 @@ pub struct SmoothingBfgsOptions {
     /// Retained for API compatibility.
     /// This setting is only used by finite-difference fallback paths.
     pub fd_hessian_max_dim: usize,
+    pub optimizer_kind: SmoothingOptimizerKind,
     pub seed_config: SeedConfig,
 }
 
@@ -25,6 +32,7 @@ impl Default for SmoothingBfgsOptions {
             tol: 1e-5,
             finite_diff_step: 1e-3,
             fd_hessian_max_dim: usize::MAX,
+            optimizer_kind: SmoothingOptimizerKind::TrustRegion,
             seed_config: SeedConfig {
                 risk_profile: SeedRiskProfile::GeneralizedLinear,
                 ..SeedConfig::default()
@@ -667,13 +675,31 @@ where
         let grad_rho = finite_diff_gradient_external(rho, options.finite_diff_step, objective)?;
         Ok((cost, grad_rho))
     };
-    run_multistart_trust_region(
-        num_penalties,
-        heuristic_lambdas,
-        &mut objective,
-        &mut eval_cost_grad_rho,
-        options,
-    )
+    match options.optimizer_kind {
+        SmoothingOptimizerKind::TrustRegion => run_multistart_trust_region(
+            num_penalties,
+            heuristic_lambdas,
+            &mut objective,
+            &mut eval_cost_grad_rho,
+            options,
+        ),
+        SmoothingOptimizerKind::Arc => {
+            let mut objective_with_gradient_hessian =
+                |rho: &Array1<f64>| -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError> {
+                    let cost = objective(rho)?;
+                    let grad_rho =
+                        finite_diff_gradient_external(rho, options.finite_diff_step, &mut objective)?;
+                    Ok((cost, grad_rho, None))
+                };
+            run_multistart_newton(
+                num_penalties,
+                heuristic_lambdas,
+                &mut objective_with_gradient_hessian,
+                &mut |obj, rho| obj(rho),
+                options,
+            )
+        }
+    }
 }
 
 /// Generic multi-start trust-region smoothing optimizer over log-smoothing parameters (`rho`)
@@ -731,13 +757,31 @@ where
     }
 
     let mut eval_cost_grad_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
-    run_multistart_trust_region(
-        num_penalties,
-        heuristic_lambdas,
-        &mut objective_with_gradient,
-        &mut eval_cost_grad_rho,
-        options,
-    )
+    match options.optimizer_kind {
+        SmoothingOptimizerKind::TrustRegion => run_multistart_trust_region(
+            num_penalties,
+            heuristic_lambdas,
+            &mut objective_with_gradient,
+            &mut eval_cost_grad_rho,
+            options,
+        ),
+        SmoothingOptimizerKind::Arc => {
+            let mut eval_cost_grad_hess_rho =
+                |objective: &mut F,
+                 rho: &Array1<f64>|
+                 -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError> {
+                    let (cost, grad) = objective(rho)?;
+                    Ok((cost, grad, None))
+                };
+            run_multistart_newton(
+                num_penalties,
+                heuristic_lambdas,
+                &mut objective_with_gradient,
+                &mut eval_cost_grad_hess_rho,
+                options,
+            )
+        }
+    }
 }
 
 /// Parallelized multi-start exact-gradient optimizer.
@@ -764,6 +808,14 @@ where
             final_grad_norm: grad_norm,
             stationary: grad_norm <= options.tol.max(1e-6),
         });
+    }
+    if options.optimizer_kind == SmoothingOptimizerKind::Arc {
+        return optimize_log_smoothing_with_multistart_with_gradient(
+            num_penalties,
+            heuristic_lambdas,
+            |rho| objective_with_gradient(rho),
+            options,
+        );
     }
     if !should_parallelize_smoothing_candidates(num_penalties, options) {
         return optimize_log_smoothing_with_multistart_with_gradient(
@@ -803,6 +855,14 @@ where
             final_grad_norm: 0.0,
             stationary: true,
         });
+    }
+    if options.optimizer_kind == SmoothingOptimizerKind::Arc {
+        return optimize_log_smoothing_with_multistart(
+            num_penalties,
+            heuristic_lambdas,
+            |rho| objective(rho),
+            options,
+        );
     }
     if !should_parallelize_smoothing_candidates(num_penalties, options) {
         return optimize_log_smoothing_with_multistart(
@@ -852,14 +912,32 @@ where
         });
     }
 
-    let mut eval_cost_grad_hess_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
-    run_multistart_newton(
-        num_penalties,
-        heuristic_lambdas,
-        &mut objective_with_gradient_hessian,
-        &mut eval_cost_grad_hess_rho,
-        options,
-    )
+    match options.optimizer_kind {
+        SmoothingOptimizerKind::TrustRegion => {
+            let mut eval_cost_grad_rho =
+                |objective: &mut F, rho: &Array1<f64>| -> Result<(f64, Array1<f64>), EstimationError> {
+                    let (cost, grad, _) = objective(rho)?;
+                    Ok((cost, grad))
+                };
+            run_multistart_trust_region(
+                num_penalties,
+                heuristic_lambdas,
+                &mut objective_with_gradient_hessian,
+                &mut eval_cost_grad_rho,
+                options,
+            )
+        }
+        SmoothingOptimizerKind::Arc => {
+            let mut eval_cost_grad_hess_rho = |objective: &mut F, rho: &Array1<f64>| objective(rho);
+            run_multistart_newton(
+                num_penalties,
+                heuristic_lambdas,
+                &mut objective_with_gradient_hessian,
+                &mut eval_cost_grad_hess_rho,
+                options,
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -951,6 +1029,53 @@ mod tests {
         assert_eq!(seq.rho.len(), par.rho.len());
         for i in 0..seq.rho.len() {
             assert!((seq.rho[i] - par.rho[i]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn optimizer_kind_arc_and_trust_region_agree_on_exact_gradient_problem() {
+        let heur = [1.0, 1.0, 1.0];
+        let trust = optimize_log_smoothing_with_multistart_with_gradient(
+            3,
+            Some(&heur),
+            |rho: &Array1<f64>| {
+                let mut g = Array1::<f64>::zeros(rho.len());
+                g[0] = rho[0] - 0.7;
+                g[1] = 2.0 * (rho[1] + 1.1);
+                g[2] = 0.5 * (rho[2] - 0.3);
+                Ok((convex_value(rho), g))
+            },
+            &SmoothingBfgsOptions {
+                tol: 1e-8,
+                max_iter: 120,
+                optimizer_kind: SmoothingOptimizerKind::TrustRegion,
+                ..SmoothingBfgsOptions::default()
+            },
+        )
+        .expect("trust-region exact-gradient optimization should succeed");
+
+        let arc = optimize_log_smoothing_with_multistart_with_gradient(
+            3,
+            Some(&heur),
+            |rho: &Array1<f64>| {
+                let mut g = Array1::<f64>::zeros(rho.len());
+                g[0] = rho[0] - 0.7;
+                g[1] = 2.0 * (rho[1] + 1.1);
+                g[2] = 0.5 * (rho[2] - 0.3);
+                Ok((convex_value(rho), g))
+            },
+            &SmoothingBfgsOptions {
+                tol: 1e-8,
+                max_iter: 120,
+                optimizer_kind: SmoothingOptimizerKind::Arc,
+                ..SmoothingBfgsOptions::default()
+            },
+        )
+        .expect("arc exact-gradient optimization should succeed");
+
+        assert!((trust.final_value - arc.final_value).abs() < 1e-8);
+        for i in 0..trust.rho.len() {
+            assert!((trust.rho[i] - arc.rho[i]).abs() < 1e-6);
         }
     }
 }
