@@ -2369,22 +2369,29 @@ fn with_spatial_identifiability_transform(
     transform: Option<&Array2<f64>>,
 ) -> BasisMetadata {
     match metadata {
-        BasisMetadata::ThinPlate { centers, .. } => BasisMetadata::ThinPlate {
+        BasisMetadata::ThinPlate {
+            centers,
+            identifiability_transform,
+        } => BasisMetadata::ThinPlate {
             centers: centers.clone(),
-            identifiability_transform: transform.cloned(),
+            identifiability_transform: transform
+                .cloned()
+                .or_else(|| identifiability_transform.clone()),
         },
         BasisMetadata::Duchon {
             centers,
             length_scale,
             power,
             nullspace_order,
-            ..
+            identifiability_transform,
         } => BasisMetadata::Duchon {
             centers: centers.clone(),
             length_scale: *length_scale,
             power: *power,
             nullspace_order: *nullspace_order,
-            identifiability_transform: transform.cloned(),
+            identifiability_transform: transform
+                .cloned()
+                .or_else(|| identifiability_transform.clone()),
         },
         _ => metadata.clone(),
     }
@@ -6055,6 +6062,86 @@ mod tests {
             }
             other => panic!("expected Duchon metadata, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn adaptive_cache_respects_frozen_joint_duchon_transform() {
+        let n = 12usize;
+        let d = 4usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            for j in 0..d {
+                data[[i, j]] = (i as f64) * 0.13 + (j as f64) * 0.17;
+            }
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_joint".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: (0..d).collect(),
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: 1.0,
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Zero,
+                        double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("term collection design");
+        let caches = extract_spatial_operator_runtime_caches(&spec, &design).expect("adaptive caches");
+        assert_eq!(caches.len(), 1);
+        assert_eq!(caches[0].coeff_global_range.len(), 3);
+        assert_eq!(caches[0].d1.ncols(), 3);
+        assert_eq!(caches[0].d2.ncols(), 3);
+    }
+
+    #[test]
+    fn frozen_joint_duchon_spec_rebuild_keeps_adaptive_cache_in_sync() {
+        let n = 12usize;
+        let d = 4usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            for j in 0..d {
+                data[[i, j]] = (i as f64) * 0.13 + (j as f64) * 0.17;
+            }
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_joint".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: (0..d).collect(),
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: 1.0,
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Zero,
+                        double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("base design");
+        let frozen = freeze_spatial_length_scale_terms_from_design(&spec, &design).expect("freeze spec");
+        let rebuilt = build_term_collection_design(data.view(), &frozen).expect("rebuilt design");
+        let caches = extract_spatial_operator_runtime_caches(&frozen, &rebuilt).expect("adaptive caches");
+        assert_eq!(caches.len(), 1);
+        assert_eq!(rebuilt.smooth.terms[0].coeff_range.len(), 3);
+        assert_eq!(caches[0].d1.ncols(), 3);
+        assert_eq!(caches[0].d2.ncols(), 3);
     }
 
     #[test]
