@@ -8,8 +8,6 @@ use ndarray::Array1;
 use statrs::function::beta::{beta_reg, ln_beta};
 use statrs::function::gamma::digamma;
 
-const ETA_CLAMP_GENERAL: f64 = 30.0;
-const ETA_CLAMP_LOGIT: f64 = 700.0;
 const SAS_U_CLAMP: f64 = 50.0;
 const SAS_LOG_DELTA_BOUND: f64 = 12.0;
 const BETA_LOGISTIC_U_EPS: f64 = 1e-12;
@@ -36,6 +34,23 @@ fn canonicalize_jet(mut jet: InverseLinkJet) -> InverseLinkJet {
 }
 
 #[inline]
+fn logistic_stable(eta: f64) -> f64 {
+    if eta.is_nan() {
+        f64::NAN
+    } else if eta == f64::INFINITY {
+        1.0
+    } else if eta == f64::NEG_INFINITY {
+        0.0
+    } else if eta >= 0.0 {
+        let z = (-eta).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = eta.exp();
+        z / (1.0 + z)
+    }
+}
+
+#[inline]
 fn probit_jet(eta: f64) -> InverseLinkJet {
     // Exact probit semantics:
     //
@@ -47,7 +62,31 @@ fn probit_jet(eta: f64) -> InverseLinkJet {
     // `normal_cdf` now evaluates the exact special-function form
     // Phi(x) = 0.5 * erfc(-x / sqrt(2)), so the jet can and should use the
     // matching closed-form Gaussian identities directly.
-    let x = if eta.is_finite() { eta } else { 0.0 };
+    if eta.is_nan() {
+        return InverseLinkJet {
+            mu: f64::NAN,
+            d1: f64::NAN,
+            d2: f64::NAN,
+            d3: f64::NAN,
+        };
+    }
+    if eta == f64::INFINITY {
+        return InverseLinkJet {
+            mu: 1.0,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+        };
+    }
+    if eta == f64::NEG_INFINITY {
+        return InverseLinkJet {
+            mu: 0.0,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+        };
+    }
+    let x = eta;
     let phi = normal_pdf(x);
     InverseLinkJet {
         mu: normal_cdf(x),
@@ -62,7 +101,13 @@ fn probit_pdf_third_derivative(eta: f64) -> f64 {
     // Since d1 = mu' = phi(eta), this returns
     //
     //   d³/deta³ d1 = mu'''' = -(eta³ - 3 eta) phi(eta).
-    let x = if eta.is_finite() { eta } else { 0.0 };
+    if eta.is_nan() {
+        return f64::NAN;
+    }
+    if !eta.is_finite() {
+        return 0.0;
+    }
+    let x = eta;
     let phi = normal_pdf(x);
     canonical_zero(-(x * x * x - 3.0 * x) * phi)
 }
@@ -87,11 +132,13 @@ fn component_inverse_link_pdf_third_derivative(component: LinkComponent, eta: f6
             //   d1'   = d2 = d1(1-2mu)
             //   d2'   = d3 = d1(1-6mu+6mu²)
             //   d3'   = d4 = d1(1-14mu+36mu²-24mu³).
-            let e = eta.clamp(-ETA_CLAMP_LOGIT, ETA_CLAMP_LOGIT);
-            if e != eta {
+            if eta.is_nan() {
+                return f64::NAN;
+            }
+            if !eta.is_finite() {
                 return 0.0;
             }
-            let mu = 1.0 / (1.0 + (-e).exp());
+            let mu = logistic_stable(eta);
             let d1 = mu * (1.0 - mu);
             d1 * (1.0 - 14.0 * mu + 36.0 * mu * mu - 24.0 * mu * mu * mu)
         }
@@ -103,11 +150,13 @@ fn component_inverse_link_pdf_third_derivative(component: LinkComponent, eta: f6
             //   d2 = d1(-t + 1)
             //   d3 = d1(t² - 3t + 1)
             //   d4 = d1(-t³ + 6t² - 7t + 1).
-            let e = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
-            if e != eta {
+            if eta.is_nan() {
+                return f64::NAN;
+            }
+            if !eta.is_finite() {
                 return 0.0;
             }
-            let t = e.exp();
+            let t = eta.exp();
             let d1 = t * (-t).exp();
             d1 * (1.0 - 7.0 * t + 6.0 * t * t - t * t * t)
         }
@@ -118,11 +167,13 @@ fn component_inverse_link_pdf_third_derivative(component: LinkComponent, eta: f6
             //   d2 = d1(r - 1)
             //   d3 = d1(r² - 3r + 1)
             //   d4 = d1(r³ - 6r² + 7r - 1).
-            let e = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
-            if e != eta {
+            if eta.is_nan() {
+                return f64::NAN;
+            }
+            if !eta.is_finite() {
                 return 0.0;
             }
-            let r = (-e).exp();
+            let r = (-eta).exp();
             let d1 = (-r).exp() * r;
             d1 * (r * r * r - 6.0 * r * r + 7.0 * r - 1.0)
         }
@@ -134,12 +185,14 @@ fn component_inverse_link_pdf_third_derivative(component: LinkComponent, eta: f6
             // Differentiating three more times gives
             //
             //   d4 = 24 eta (1-eta²) / [pi (1+eta²)^4].
-            let z = eta.clamp(-1e6, 1e6);
-            if z != eta {
+            if eta.is_nan() {
+                return f64::NAN;
+            }
+            if !eta.is_finite() {
                 return 0.0;
             }
-            let denom = 1.0 + z * z;
-            24.0 * z * (1.0 - z * z) / (std::f64::consts::PI * denom.powi(4))
+            let denom = 1.0 + eta * eta;
+            24.0 * eta * (1.0 - eta * eta) / (std::f64::consts::PI * denom.powi(4))
         }
     }
 }
@@ -353,25 +406,53 @@ pub fn state_from_spec(spec: &MixtureLinkSpec) -> Result<MixtureLinkState, Strin
 pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> InverseLinkJet {
     canonicalize_jet(match component {
         LinkComponent::Logit => {
-            let e = eta.clamp(-ETA_CLAMP_LOGIT, ETA_CLAMP_LOGIT);
-            let clamped = e != eta;
-            let mu = 1.0 / (1.0 + (-e).exp());
-            let d1 = if clamped { 0.0 } else { mu * (1.0 - mu) };
-            let d2 = if clamped { 0.0 } else { d1 * (1.0 - 2.0 * mu) };
-            let d3 = if clamped { 0.0 } else { d1 * (1.0 - 6.0 * d1) };
+            if eta.is_nan() {
+                return InverseLinkJet {
+                    mu: f64::NAN,
+                    d1: f64::NAN,
+                    d2: f64::NAN,
+                    d3: f64::NAN,
+                };
+            }
+            let mu = logistic_stable(eta);
+            let d1 = if eta.is_finite() { mu * (1.0 - mu) } else { 0.0 };
+            let d2 = if eta.is_finite() { d1 * (1.0 - 2.0 * mu) } else { 0.0 };
+            let d3 = if eta.is_finite() { d1 * (1.0 - 6.0 * d1) } else { 0.0 };
             InverseLinkJet { mu, d1, d2, d3 }
         }
         LinkComponent::Probit => {
             probit_jet(eta)
         }
         LinkComponent::CLogLog => {
-            let e = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
-            let clamped = e != eta;
-            let t = e.exp();
+            if eta.is_nan() {
+                return InverseLinkJet {
+                    mu: f64::NAN,
+                    d1: f64::NAN,
+                    d2: f64::NAN,
+                    d3: f64::NAN,
+                };
+            }
+            if eta == f64::INFINITY {
+                return InverseLinkJet {
+                    mu: 1.0,
+                    d1: 0.0,
+                    d2: 0.0,
+                    d3: 0.0,
+                };
+            }
+            if eta == f64::NEG_INFINITY {
+                return InverseLinkJet {
+                    mu: 0.0,
+                    d1: 0.0,
+                    d2: 0.0,
+                    d3: 0.0,
+                };
+            }
+            let t = eta.exp();
             let s = (-t).exp();
-            let d1 = if clamped { 0.0 } else { t * s };
-            let d2 = if clamped { 0.0 } else { -d1 * (t - 1.0) };
-            let d3 = if clamped { 0.0 } else { d1 * (t * t - 3.0 * t + 1.0) };
+            let d1 = t * s;
+            let d2 = -d1 * (t - 1.0);
+            let d3 = d1 * (t * t - 3.0 * t + 1.0);
             InverseLinkJet {
                 mu: 1.0 - s,
                 d1,
@@ -380,36 +461,64 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
             }
         }
         LinkComponent::LogLog => {
-            let e = eta.clamp(-ETA_CLAMP_GENERAL, ETA_CLAMP_GENERAL);
-            let clamped = e != eta;
-            let r = (-e).exp();
+            if eta.is_nan() {
+                return InverseLinkJet {
+                    mu: f64::NAN,
+                    d1: f64::NAN,
+                    d2: f64::NAN,
+                    d3: f64::NAN,
+                };
+            }
+            if eta == f64::INFINITY {
+                return InverseLinkJet {
+                    mu: 1.0,
+                    d1: 0.0,
+                    d2: 0.0,
+                    d3: 0.0,
+                };
+            }
+            if eta == f64::NEG_INFINITY {
+                return InverseLinkJet {
+                    mu: 0.0,
+                    d1: 0.0,
+                    d2: 0.0,
+                    d3: 0.0,
+                };
+            }
+            let r = (-eta).exp();
             let mu = (-r).exp();
-            let d1 = if clamped { 0.0 } else { mu * r };
-            let d2 = if clamped { 0.0 } else { d1 * (r - 1.0) };
-            let d3 = if clamped { 0.0 } else { d1 * (r * r - 3.0 * r + 1.0) };
+            let d1 = mu * r;
+            let d2 = d1 * (r - 1.0);
+            let d3 = d1 * (r * r - 3.0 * r + 1.0);
             InverseLinkJet { mu, d1, d2, d3 }
         }
         LinkComponent::Cauchit => {
-            let e = eta.clamp(-1e6, 1e6);
-            let clamped = e != eta;
-            let den = 1.0 + e * e;
-            let d1 = if clamped {
-                0.0
-            } else {
+            if eta.is_nan() {
+                return InverseLinkJet {
+                    mu: f64::NAN,
+                    d1: f64::NAN,
+                    d2: f64::NAN,
+                    d3: f64::NAN,
+                };
+            }
+            let den = 1.0 + eta * eta;
+            let d1 = if eta.is_finite() {
                 1.0 / (std::f64::consts::PI * den)
-            };
-            let d2 = if clamped {
-                0.0
             } else {
-                -2.0 * e / (std::f64::consts::PI * den * den)
-            };
-            let d3 = if clamped {
                 0.0
+            };
+            let d2 = if eta.is_finite() {
+                -2.0 * eta / (std::f64::consts::PI * den * den)
             } else {
-                (6.0 * e * e - 2.0) / (std::f64::consts::PI * den * den * den)
+                0.0
+            };
+            let d3 = if eta.is_finite() {
+                (6.0 * eta * eta - 2.0) / (std::f64::consts::PI * den * den * den)
+            } else {
+                0.0
             };
             InverseLinkJet {
-                mu: 0.5 + e.atan() / std::f64::consts::PI,
+                mu: 0.5 + eta.atan() / std::f64::consts::PI,
                 d1,
                 d2,
                 d3,
@@ -823,17 +932,9 @@ pub fn mixture_inverse_link_jet_with_rho_partials_into(
 
 #[inline]
 fn logistic_u_with_derivatives(eta: f64) -> (f64, f64) {
-    let e = eta.clamp(-ETA_CLAMP_LOGIT, ETA_CLAMP_LOGIT);
-    let eta_clamped = e != eta;
-    let u = if e >= 0.0 {
-        let z = (-e).exp();
-        1.0 / (1.0 + z)
-    } else {
-        let z = e.exp();
-        z / (1.0 + z)
-    };
+    let u = logistic_stable(eta);
     let u_clamped = u.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
-    let clamp_active = eta_clamped || u_clamped != u;
+    let clamp_active = !eta.is_finite() || u_clamped != u;
     let du = if clamp_active { 0.0 } else { u_clamped * (1.0 - u_clamped) };
     let u = u_clamped;
     (u, du)

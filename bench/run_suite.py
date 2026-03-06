@@ -1395,7 +1395,7 @@ def _synthetic_thread3_admixture_cliff_dataset(n=6000, seed=20260601):
 
 
 def _synthetic_geo_disease_eas_dataset(n=6000, seed=20260301, n_pcs=16):
-    n = int(max(1000, n))
+    n = int(max(5, n))
     n_pcs = int(max(3, n_pcs))
     rng = np.random.default_rng(int(seed))
 
@@ -1462,7 +1462,10 @@ def _synthetic_geo_disease_eas_dataset(n=6000, seed=20260301, n_pcs=16):
 
 
 def _geo_disease_eas_scenario_cfg(name):
-    m = re.match(r"^geo_disease_(eas|eas3)_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
+    m = re.match(
+        r"^geo_disease_(eas|eas3)_(tp|duchon|matern|psperpc)_k([0-9]+)(?:_downsample[0-9]+x)?$",
+        str(name),
+    )
     if m is None:
         return None
     family_code = m.group(1)
@@ -3071,7 +3074,9 @@ def run_rust_scenario_cv(
                         model_payload = json.loads(model_path.read_text())
                         if isinstance(model_payload, dict) and "payload" in model_payload:
                             model_payload = model_payload.get("payload", {})
-                    sigma_hat_raw = model_payload.get("fit_result", {}).get("scale", None)
+                    sigma_hat_raw = model_payload.get("fit_result", {}).get(
+                        "standard_deviation", None
+                    )
                     sigma_hat = float(sigma_hat_raw)
                 except Exception as e:
                     return {
@@ -3082,7 +3087,10 @@ def run_rust_scenario_cv(
                         "n_train": int(len(fold.train_idx)),
                         "n_test": int(len(fold.test_idx)),
                         "n_folds": int(len(folds)),
-                        "error": f"rust gaussian fit output missing/invalid fit_result.scale: {e}",
+                        "error": (
+                            "rust gaussian fit output missing/invalid "
+                            f"fit_result.standard_deviation: {e}"
+                        ),
                     }
                 if (not np.isfinite(sigma_hat)) or sigma_hat <= 0.0:
                     return {
@@ -3094,7 +3102,7 @@ def run_rust_scenario_cv(
                         "n_test": int(len(fold.test_idx)),
                         "n_folds": int(len(folds)),
                         "error": (
-                            "rust gaussian fit_result.scale must be finite and > 0; "
+                            "rust gaussian fit_result.standard_deviation must be finite and > 0; "
                             f"got {sigma_hat!r}"
                         ),
                     }
@@ -3292,10 +3300,6 @@ def _run_rust_gamlss_scenario_cv_variant(
         }
 
     _, mean_formula = _rust_formula_for_scenario(scenario_name, ds)
-    sigma_rhs = _sigma_feature_rhs(ds)
-    noise_formula = "y ~ " + (
-        " + ".join(f"linear({c})" for c in ds["features"]) if sigma_rhs != "1" else "1"
-    )
     cli_family = binomial_cli_family if family == "binomial" else "gaussian"
     binom_extra = list(binomial_extra_fit_args or [])
     base_df = pd.DataFrame(ds["rows"])
@@ -3321,6 +3325,10 @@ def _run_rust_gamlss_scenario_cv_variant(
                 test_path = td_path / f"test_{fold_id}.csv"
                 train_df.to_csv(train_path, index=False)
                 test_df.to_csv(test_path, index=False)
+            sigma_rhs = _sigma_feature_rhs(ds, scenario_name, n_train=len(fold.train_idx))
+            noise_formula = "y ~ " + (
+                " + ".join(f"linear({c})" for c in sigma_rhs.split(" + ")) if sigma_rhs != "1" else "1"
+            )
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
 
@@ -3557,6 +3565,8 @@ def run_rust_gamlss_survival_cv(
             fit_cmd = [
                 str(rust_bin),
                 "fit",
+                "--survival-likelihood",
+                "probit-location-scale",
                 "--out",
                 str(model_path),
             ]
@@ -3616,9 +3626,9 @@ def run_rust_gamlss_survival_cv(
                     "n_test": int(len(fold.test_idx)),
                     "predict_horizon": float(horizon),
                     "predict_horizon_policy": "global train-fold median time",
-                    "model_spec": (
-                        "survival probit-location-scale via release binary "
-                        f"(c-index on risk score from '{score_src}') [5-fold CV]"
+                        "model_spec": (
+                            "survival probit-location-scale via release binary "
+                            f"(c-index on risk score from '{score_src}') [5-fold CV]"
                     ),
                 }
             )
@@ -3661,13 +3671,23 @@ def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
     return f"{ds['target']} ~ " + " + ".join(terms)
 
 
-def _sigma_feature_rhs(ds: dict) -> str:
+def _sigma_feature_rhs(
+    ds: dict,
+    scenario_name: str | None = None,
+    *,
+    n_train: int | None = None,
+) -> str:
     features = [str(c) for c in ds.get("features", [])]
     return " + ".join(features) if features else "1"
 
 
-def _sigma_feature_formula(ds: dict) -> str:
-    return "~ " + _sigma_feature_rhs(ds)
+def _sigma_feature_formula(
+    ds: dict,
+    scenario_name: str | None = None,
+    *,
+    n_train: int | None = None,
+) -> str:
+    return "~ " + _sigma_feature_rhs(ds, scenario_name, n_train=n_train)
 
 
 def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -3697,7 +3717,7 @@ def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fo
             "dataset": ds,
             "scenario_name": scenario_name,
             "mu_formula": mu_formula,
-            "sigma_formula": _sigma_feature_formula(ds),
+            "sigma_formula": _sigma_feature_formula(ds, scenario_name),
         }
         data_path.write_text(json.dumps(payload))
 

@@ -38,12 +38,27 @@ impl ResidualDistributionOps for ResidualDistribution {
             ResidualDistribution::Gaussian => normal_cdf(z),
             ResidualDistribution::Gumbel => {
                 // F(z)=1-exp(-exp(z))
-                let ez = z.clamp(-40.0, 40.0).exp();
+                if z == f64::INFINITY {
+                    return 1.0;
+                }
+                if z == f64::NEG_INFINITY {
+                    return 0.0;
+                }
+                let ez = z.exp();
                 1.0 - (-ez).exp()
             }
             ResidualDistribution::Logistic => {
-                let zc = z.clamp(-40.0, 40.0);
-                1.0 / (1.0 + (-zc).exp())
+                if z == f64::INFINITY {
+                    1.0
+                } else if z == f64::NEG_INFINITY {
+                    0.0
+                } else if z >= 0.0 {
+                    let e = (-z).exp();
+                    1.0 / (1.0 + e)
+                } else {
+                    let e = z.exp();
+                    e / (1.0 + e)
+                }
             }
         }
     }
@@ -52,7 +67,10 @@ impl ResidualDistributionOps for ResidualDistribution {
         match self {
             ResidualDistribution::Gaussian => normal_pdf(z),
             ResidualDistribution::Gumbel => {
-                let ez = z.clamp(-40.0, 40.0).exp();
+                if z == f64::INFINITY || z == f64::NEG_INFINITY {
+                    return 0.0;
+                }
+                let ez = z.exp();
                 ez * (-ez).exp()
             }
             ResidualDistribution::Logistic => {
@@ -66,7 +84,10 @@ impl ResidualDistributionOps for ResidualDistribution {
         match self {
             ResidualDistribution::Gaussian => -z * normal_pdf(z),
             ResidualDistribution::Gumbel => {
-                let ez = z.clamp(-40.0, 40.0).exp();
+                if z == f64::INFINITY || z == f64::NEG_INFINITY {
+                    return 0.0;
+                }
+                let ez = z.exp();
                 let f = ez * (-ez).exp();
                 f * (1.0 - ez)
             }
@@ -85,7 +106,10 @@ impl ResidualDistributionOps for ResidualDistribution {
                 (z * z - 1.0) * f
             }
             ResidualDistribution::Gumbel => {
-                let ez = z.clamp(-40.0, 40.0).exp();
+                if z == f64::INFINITY || z == f64::NEG_INFINITY {
+                    return 0.0;
+                }
+                let ez = z.exp();
                 let f = ez * (-ez).exp();
                 f * (1.0 - 3.0 * ez + ez * ez)
             }
@@ -104,7 +128,10 @@ impl ResidualDistributionOps for ResidualDistribution {
                 -(z * z * z - 3.0 * z) * f
             }
             ResidualDistribution::Gumbel => {
-                let ez = z.clamp(-40.0, 40.0).exp();
+                if z == f64::INFINITY || z == f64::NEG_INFINITY {
+                    return 0.0;
+                }
+                let ez = z.exp();
                 let f = ez * (-ez).exp();
                 f * (1.0 - 7.0 * ez + 6.0 * ez * ez - ez * ez * ez)
             }
@@ -1702,7 +1729,7 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
                     .unwrap_or_else(|_| {
                         if link == LinkFunction::Probit {
                             let denom = (1.0 + var_loc).sqrt().max(1e-12);
-                            normal_cdf((mu_loc / denom).clamp(-30.0, 30.0))
+                            normal_cdf(mu_loc / denom)
                         } else {
                             crate::quadrature::normal_expectation_1d_adaptive(
                                 &quad_ctx,

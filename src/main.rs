@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_FULL};
 use csv::WriterBuilder;
 use faer::Mat as FaerMat;
@@ -176,7 +176,7 @@ struct FitArgs {
     #[arg(
         value_name = "FORMULA",
         help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
-        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary unpenalized linear term\n- linear(x, min=..., max=...): linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- unpenalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, order=1, power=0)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary penalized linear term (all non-intercept linear coefficients are ridge-penalized by default)\n- linear(x, min=..., max=...): penalized linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for penalized generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- penalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, order=1, power=0)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     formula_positional: String,
     /// P(Y=1|S,x)=Phi((S-T(x))/sigma(x)).
@@ -218,7 +218,7 @@ struct FitArgs {
     #[arg(long = "ridge-lambda", default_value_t = 1e-6)]
     ridge_lambda: f64,
     /// Enable MM-based spatial adaptive regularization for compatible smooth terms.
-    #[arg(long = "adaptive-regularization", default_value_t = false)]
+    #[arg(long = "adaptive-regularization", action = ArgAction::Set, default_value_t = true)]
     adaptive_regularization: bool,
     #[arg(long = "out")]
     out: Option<PathBuf>,
@@ -1785,7 +1785,7 @@ fn run_predict_binomial_location_scale(
                     [[var_t, cov_tls], [cov_tls, var_ls]],
                     |t, ls| {
                         let sigma = sigma_from_eta_scalar(ls, sigma_min, sigma_max);
-                        normal_cdf((-t / sigma.max(1e-12)).clamp(-30.0, 30.0))
+                        normal_cdf(-t / sigma.max(1e-12))
                             .clamp(1e-10, 1.0 - 1e-10)
                     },
                 )
@@ -1881,7 +1881,7 @@ fn run_predict_binomial_location_scale(
                             }
                         }
                         let denom = (1.0 + var_w.max(0.0)).sqrt().max(1e-12);
-                        Ok(normal_cdf((mean_w / denom).clamp(-30.0, 30.0))
+                        Ok(normal_cdf(mean_w / denom)
                             .clamp(1e-10, 1.0 - 1e-10))
                     },
                 )?;
@@ -4363,7 +4363,7 @@ fn run_generate_standard_or_flexible(
         let offset = Array1::zeros(design.design.nrows());
         let pred = predict_gam(design.design.view(), beta.view(), offset.view(), family)
             .map_err(|e| format!("predict_gam failed: {e}"))?;
-        generative_spec_from_predict(pred, family, Some(fit_saved.scale))
+        generative_spec_from_predict(pred, family, Some(fit_saved.standard_deviation))
             .map_err(|e| format!("failed to build generative spec: {e}"))
     }
 }
@@ -5094,7 +5094,7 @@ fn build_location_scale_saved_model(
 fn core_saved_fit_result(
     beta: Array1<f64>,
     lambdas: Array1<f64>,
-    scale: f64,
+    standard_deviation: f64,
     beta_covariance: Option<Array2<f64>>,
     beta_covariance_corrected: Option<Array2<f64>>,
     summary: SavedFitSummary,
@@ -5109,8 +5109,11 @@ fn core_saved_fit_result(
         .expect("core_saved_fit_result called with non-finite beta");
     validate_all_finite("fit_result.lambdas", lambdas.iter().copied())
         .expect("core_saved_fit_result called with non-finite lambdas");
-    ensure_finite_scalar("fit_result.scale", scale)
-        .expect("core_saved_fit_result called with non-finite scale");
+    // Saved-model contract: fit_result.standard_deviation is residual
+    // standard deviation sigma for Gaussian identity models and the canonical
+    // fixed scale for non-Gaussian models.
+    ensure_finite_scalar("fit_result.standard_deviation", standard_deviation)
+        .expect("core_saved_fit_result called with non-finite standard_deviation");
     if let Some(cov) = beta_covariance.as_ref() {
         validate_all_finite("fit_result.beta_covariance", cov.iter().copied())
             .expect("core_saved_fit_result called with non-finite beta_covariance");
@@ -5122,7 +5125,7 @@ fn core_saved_fit_result(
     FitResult {
         beta,
         lambdas,
-        scale,
+        standard_deviation,
         edf_by_block: Vec::new(),
         edf_total: 0.0,
         iterations: summary.iterations,
@@ -6106,7 +6109,7 @@ fn build_term_spec(
                     linear_terms.push(LinearTermSpec {
                         name: name.clone(),
                         feature_col: col,
-                        double_penalty: false,
+                        double_penalty: true,
                         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                         coefficient_min: *coefficient_min,
                         coefficient_max: *coefficient_max,
@@ -6117,7 +6120,7 @@ fn build_term_spec(
                             linear_terms.push(LinearTermSpec {
                                 name: name.clone(),
                                 feature_col: col,
-                                double_penalty: false,
+                                double_penalty: true,
                                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                                 coefficient_min: *coefficient_min,
                                 coefficient_max: *coefficient_max,
@@ -6127,7 +6130,7 @@ fn build_term_spec(
                             linear_terms.push(LinearTermSpec {
                                 name: name.clone(),
                                 feature_col: col,
-                                double_penalty: false,
+                                double_penalty: true,
                                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                                 coefficient_min: *coefficient_min,
                                 coefficient_max: *coefficient_max,
@@ -7742,7 +7745,7 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> FitResult {
     FitResult {
         beta: ext.beta,
         lambdas: ext.lambdas,
-        scale: ext.scale,
+        standard_deviation: ext.standard_deviation,
         edf_by_block: ext.edf_by_block,
         edf_total: ext.edf_total,
         iterations: ext.iterations,
@@ -7989,13 +7992,13 @@ mod tests {
     };
     use csv::StringRecord;
     use gam::basis::{BasisOptions, Dense, DuchonNullspaceOrder, KnotSource, create_basis};
-    use gam::inference::data::{UnseenCategoryPolicy, encode_records_with_schema};
+    use gam::inference::data::{EncodedDataset as Dataset, UnseenCategoryPolicy, encode_records_with_schema};
     use gam::inference::model::FittedModelPayload;
     use gam::inference::model::SchemaColumn;
     use gam::types::{InverseLink, LinkComponent, LinkFunction};
     use gam::{FittedFamily, ModelKind};
     use ndarray::{Array1, ArrayView1, array};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8240,6 +8243,62 @@ mod tests {
             }
             other => panic!("expected nonpositive linear term, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_term_spec_penalizes_all_non_intercept_linear_terms_by_default() {
+        let parsed = parse_formula("y ~ x + linear(z) + nonnegative(w)").expect("formula");
+        let ds = Dataset {
+            headers: vec!["x".to_string(), "z".to_string(), "w".to_string()],
+            values: array![
+                [1.0, 2.0, 3.0],
+                [1.5, 2.5, 3.5],
+                [2.0, 3.0, 4.0],
+            ],
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "x".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "z".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "w".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+            ],
+        };
+        let col_map = HashMap::from([
+            ("x".to_string(), 0usize),
+            ("z".to_string(), 1usize),
+            ("w".to_string(), 2usize),
+        ]);
+        let mut inference_notes = Vec::<String>::new();
+        let spec =
+            super::build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)
+                .expect("term spec");
+
+        assert_eq!(spec.linear_terms.len(), 3);
+        assert!(
+            spec.linear_terms.iter().all(|term| term.double_penalty),
+            "all non-intercept linear terms should be penalized by default: {:?}",
+            spec.linear_terms
+                .iter()
+                .map(|term| (&term.name, term.double_penalty))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

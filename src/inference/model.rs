@@ -574,7 +574,7 @@ impl FittedModel {
 
     pub fn validate_numeric_finiteness(&self) -> Result<(), String> {
         if let Some(fit) = self.fit_result.as_ref() {
-            ensure_finite_scalar("fit_result.scale", fit.scale)?;
+            ensure_finite_scalar("fit_result.standard_deviation", fit.standard_deviation)?;
             ensure_finite_scalar("fit_result.final_grad_norm", fit.final_grad_norm)?;
             ensure_finite_scalar("fit_result.deviance", fit.deviance)?;
             ensure_finite_scalar("fit_result.stable_penalty_term", fit.stable_penalty_term)?;

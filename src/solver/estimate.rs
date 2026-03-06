@@ -785,7 +785,12 @@ impl core::fmt::Debug for EstimationError {
 pub struct ExternalOptimResult {
     pub beta: Array1<f64>,
     pub lambdas: Array1<f64>,
-    pub scale: f64,
+    /// Residual scale on the response scale.
+    ///
+    /// Contract: Gaussian identity models store the residual standard
+    /// deviation sigma here. Non-Gaussian families keep the canonical fixed
+    /// scale (currently 1.0).
+    pub standard_deviation: f64,
     pub edf_by_block: Vec<f64>,
     pub edf_total: f64,
     pub iterations: usize,
@@ -1907,11 +1912,12 @@ where
         edf_by_block.push(edf_k);
     }
 
-    // Persist residual-based scale for Gaussian identity models
-    let scale = match link {
+    // Persist residual-based scale for Gaussian identity models.
+    // Contract: residual standard deviation sigma, not variance.
+    let standard_deviation = match link {
         LinkFunction::Identity => {
             let denom = (n - edf_total).max(1.0);
-            weighted_rss / denom
+            (weighted_rss / denom).sqrt()
         }
         LinkFunction::Logit
         | LinkFunction::Probit
@@ -1978,7 +1984,7 @@ where
     let result = ExternalOptimResult {
         beta: beta_orig_internal,
         lambdas: lambdas.to_owned(),
-        scale,
+        standard_deviation,
         edf_by_block,
         edf_total,
         iterations: iters,
@@ -2257,7 +2263,12 @@ pub struct FitArtifacts {
 pub struct FitResult {
     pub beta: Array1<f64>,
     pub lambdas: Array1<f64>,
-    pub scale: f64,
+    /// Residual scale on the response scale.
+    ///
+    /// Contract: Gaussian identity models store residual standard deviation
+    /// sigma here. This is serialized into saved models and consumed by
+    /// prediction/benchmark code as a standard deviation, not a variance.
+    pub standard_deviation: f64,
     pub edf_by_block: Vec<f64>,
     pub edf_total: f64,
     pub iterations: usize,
@@ -3141,7 +3152,7 @@ where
     Ok(FitResult {
         beta: result.beta,
         lambdas: result.lambdas,
-        scale: result.scale,
+        standard_deviation: result.standard_deviation,
         edf_by_block: result.edf_by_block,
         edf_total: result.edf_total,
         iterations: result.iterations,

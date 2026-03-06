@@ -80,7 +80,7 @@ fn joint_point_inverse_link(link: LinkFunction, eta: f64) -> f64 {
             let e = eta.clamp(-700.0, 700.0);
             1.0 / (1.0 + (-e).exp())
         }
-        LinkFunction::Probit => normal_cdf(eta.clamp(-30.0, 30.0)),
+        LinkFunction::Probit => normal_cdf(eta),
         LinkFunction::CLogLog => {
             let e = eta.clamp(-30.0, 30.0);
             1.0 - (-e.exp()).exp()

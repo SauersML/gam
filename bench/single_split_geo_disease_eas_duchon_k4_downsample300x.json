@@ -1,0 +1,41 @@
+{
+  "scenario": "geo_disease_eas_duchon_k4_downsample300x",
+  "n_train": 15,
+  "n_test": 5,
+  "results": [
+    {
+      "contender": "rust_gam",
+      "status": "ok",
+      "fit_sec": 13.586786625004606,
+      "predict_sec": 0.008610290999058634,
+      "logloss": 0.5926663725659547,
+      "brier": 0.1772558192874364,
+      "auc": 0.5,
+      "mean_min": 0.068638540309,
+      "mean_max": 0.068638705433,
+      "mean_std": 5.342117816641828e-08
+    },
+    {
+      "contender": "rust_gamlss",
+      "status": "failed",
+      "error": "error: unexpected argument '--binomial-family' found\n\n  tip: to pass '--binomial-family' as a value, use '-- --binomial-family'\n\nUsage: gam fit --predict-noise <PREDICT_NOISE> --out <OUT> <DATA> <FORMULA>\n\nFor more information, try '--help'.\n"
+    },
+    {
+      "contender": "r_mgcv",
+      "status": "ok",
+      "fit_sec": 0.765971749991877,
+      "predict_sec": null,
+      "logloss": 5.526204223186509,
+      "brier": 0.1999999999999999,
+      "auc": 0.5,
+      "mean_min": 2.2204e-16,
+      "mean_max": 2.2204e-16,
+      "mean_std": 0.0
+    },
+    {
+      "contender": "r_gamlss",
+      "status": "failed",
+      "error": "missing value where TRUE/FALSE needed"
+    }
+  ]
+}
