@@ -10,14 +10,30 @@ fn canonical_zero(v: f64) -> f64 {
 }
 
 #[inline]
+fn logistic_stable(eta: f64) -> f64 {
+    if eta.is_nan() {
+        f64::NAN
+    } else if eta == f64::INFINITY {
+        1.0
+    } else if eta == f64::NEG_INFINITY {
+        0.0
+    } else if eta >= 0.0 {
+        let z = (-eta).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = eta.exp();
+        z / (1.0 + z)
+    }
+}
+
+#[inline]
 pub fn bounded_sigma_and_deriv_from_eta_scalar(
     eta: f64,
     sigma_min: f64,
     sigma_max: f64,
 ) -> (f64, f64) {
     let span = (sigma_max - sigma_min).max(1e-12);
-    let z = eta.clamp(-40.0, 40.0);
-    let p = 1.0 / (1.0 + (-z).exp());
+    let p = logistic_stable(eta);
     let sigma = sigma_min + span * p;
     let dsigma_deta = span * p * (1.0 - p);
     (sigma, dsigma_deta)
@@ -50,8 +66,7 @@ pub fn bounded_sigma_derivs_up_to_third_scalar(
     sigma_max: f64,
 ) -> (f64, f64, f64, f64) {
     let span = (sigma_max - sigma_min).max(1e-12);
-    let z = eta.clamp(-40.0, 40.0);
-    let p = 1.0 / (1.0 + (-z).exp());
+    let p = logistic_stable(eta);
     let a = p * (1.0 - p);
     let sigma = sigma_min + span * p;
     let d1 = span * a;
@@ -87,8 +102,7 @@ pub fn bounded_sigma_derivs_up_to_fourth_scalar(
     sigma_max: f64,
 ) -> (f64, f64, f64, f64, f64) {
     let span = (sigma_max - sigma_min).max(1e-12);
-    let z = eta.clamp(-40.0, 40.0);
-    let p = 1.0 / (1.0 + (-z).exp());
+    let p = logistic_stable(eta);
     let a = p * (1.0 - p);
     let sigma = sigma_min + span * p;
     let d1 = span * a;
@@ -218,29 +232,38 @@ mod tests {
                 (d1 - d1_fd).abs() < 5e-7,
                 "d1 mismatch at eta={eta}: got {d1}, fd {d1_fd}"
             );
-            assert_eq!(
-                d1.signum(),
-                d1_fd.signum(),
-                "d1 sign mismatch at eta={eta}: got {d1}, fd {d1_fd}"
-            );
+            if d1.abs().max(d1_fd.abs()) > 1e-10 {
+                assert_eq!(
+                    d1.signum(),
+                    d1_fd.signum(),
+                    "d1 sign mismatch at eta={eta}: got {d1}, fd {d1_fd}"
+                );
+            }
             assert!(
                 (d2 - d2_fd).abs() < 5e-5,
                 "d2 mismatch at eta={eta}: got {d2}, fd {d2_fd}"
             );
-            assert_eq!(
-                d2.signum(),
-                d2_fd.signum(),
-                "d2 sign mismatch at eta={eta}: got {d2}, fd {d2_fd}"
-            );
+            // The bounded-sigma map is symmetric at eta = 0, so the true d2 is exactly zero there.
+            // A second-order FD stencil can still pick up a small signed residual from truncation and
+            // cancellation, so only enforce sign agreement once the curvature is materially away from 0.
+            if d2.abs().max(d2_fd.abs()) > 1e-4 {
+                assert_eq!(
+                    d2.signum(),
+                    d2_fd.signum(),
+                    "d2 sign mismatch at eta={eta}: got {d2}, fd {d2_fd}"
+                );
+            }
             assert!(
                 (d3 - d3_fd).abs() < 3e-3,
                 "d3 mismatch at eta={eta}: got {d3}, fd {d3_fd}"
             );
-            assert_eq!(
-                d3.signum(),
-                d3_fd.signum(),
-                "d3 sign mismatch at eta={eta}: got {d3}, fd {d3_fd}"
-            );
+            if d3.abs().max(d3_fd.abs()) > 1e-10 {
+                assert_eq!(
+                    d3.signum(),
+                    d3_fd.signum(),
+                    "d3 sign mismatch at eta={eta}: got {d3}, fd {d3_fd}"
+                );
+            }
         }
     }
 

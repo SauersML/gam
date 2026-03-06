@@ -182,8 +182,10 @@ pub enum LinearCoefficientGeometry {
 pub struct LinearTermSpec {
     pub name: String,
     pub feature_col: usize,
-    /// Optional double-penalty ridge on this linear coefficient.
-    /// If true, emits an identity penalty block for this 1D term.
+    /// Default ridge penalty on this linear coefficient.
+    /// Non-intercept linear terms are penalized by default; set false only to
+    /// opt into an explicitly unpenalized parametric effect.
+    #[serde(default = "default_linear_term_double_penalty")]
     pub double_penalty: bool,
     #[serde(default)]
     pub coefficient_geometry: LinearCoefficientGeometry,
@@ -191,6 +193,10 @@ pub struct LinearTermSpec {
     pub coefficient_min: Option<f64>,
     #[serde(default)]
     pub coefficient_max: Option<f64>,
+}
+
+const fn default_linear_term_double_penalty() -> bool {
+    true
 }
 
 /// Random-effects term specification.
@@ -3626,7 +3632,7 @@ fn fit_bounded_term_collection_for_spec(
         fit: FitResult {
             beta: beta_user,
             lambdas: fit.lambdas,
-            scale: 1.0,
+            standard_deviation: 1.0,
             edf_by_block,
             edf_total,
             iterations: fit.outer_iterations,
@@ -6603,6 +6609,17 @@ mod tests {
         assert_eq!(constraints.b[0], 0.0);
         assert_eq!(constraints.a[[1, linear_idx]], -1.0);
         assert_eq!(constraints.b[1], -1.0);
+    }
+
+    #[test]
+    fn linear_term_spec_defaults_to_penalized_when_field_is_omitted() {
+        let json = r#"{"name":"x","feature_col":0}"#;
+        let term: LinearTermSpec = serde_json::from_str(json).expect("deserialize linear term");
+        assert!(term.double_penalty);
+        assert!(matches!(
+            term.coefficient_geometry,
+            LinearCoefficientGeometry::Unconstrained
+        ));
     }
 
     #[test]

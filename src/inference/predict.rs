@@ -116,7 +116,7 @@ pub struct PredictUncertaintyOptions {
     /// Mean-scale interval construction method.
     pub mean_interval_method: MeanIntervalMethod,
     /// For Gaussian identity, also return observation intervals using
-    /// Var(y_new | x) = Var(eta_hat) + scale.
+    /// Var(y_new | x) = Var(eta_hat) + sigma^2.
     pub include_observation_interval: bool,
 }
 
@@ -805,7 +805,8 @@ where
     let (observation_lower, observation_upper) = if options.include_observation_interval
         && matches!(family, crate::types::LikelihoodFamily::GaussianIdentity)
     {
-        let obs_se = eta_var.mapv(|v| (v + fit.scale.max(0.0)).max(0.0).sqrt());
+        let obs_var = fit.standard_deviation.max(0.0).powi(2);
+        let obs_se = eta_var.mapv(|v| (v + obs_var).max(0.0).sqrt());
         let lower = &eta - &obs_se.mapv(|s| z * s);
         let upper = &eta + &obs_se.mapv(|s| z * s);
         (Some(lower), Some(upper))

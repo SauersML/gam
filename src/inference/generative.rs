@@ -52,6 +52,8 @@ pub fn generative_spec_from_predict(
 ) -> Result<GenerativeSpec, EstimationError> {
     match family {
         LikelihoodFamily::GaussianIdentity => {
+            // Saved/prediction Gaussian scale is the observation standard
+            // deviation sigma, so generative sampling can use it directly.
             let sigma = gaussian_scale
                 .unwrap_or(1.0)
                 .max(0.0);

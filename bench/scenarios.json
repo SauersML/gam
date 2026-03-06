@@ -140,6 +140,21 @@
       "seed": 20260301
     },
     {
+      "name": "geo_disease_eas_duchon_k6_downsample100x",
+      "n": 60,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k4_downsample500x",
+      "n": 12,
+      "seed": 20260301
+    },
+    {
+      "name": "geo_disease_eas_duchon_k4_downsample300x",
+      "n": 20,
+      "seed": 20260301
+    },
+    {
       "name": "geo_disease_eas_duchon_k24",
       "n": 6000,
       "seed": 20260301

@@ -5250,8 +5250,11 @@ pub struct StablePLSResult {
     pub penalized_hessian: Array2<f64>,
     /// Effective degrees of freedom
     pub edf: f64,
-    /// Scale parameter estimate
-    pub scale: f64,
+    /// Residual standard deviation estimate.
+    ///
+    /// Contract: for Gaussian identity models this is the residual standard
+    /// deviation (sigma), not the residual variance/dispersion.
+    pub standard_deviation: f64,
     /// Ridge added to ensure the SPD solve is well-posed.
     pub ridge_used: f64,
 }
@@ -5389,7 +5392,7 @@ pub fn solve_penalized_least_squares(
     // Re-use `regularized_hessian` for EDF to consistency.
     let edf = calculate_edf_with_workspace(&regularized_hessian, e_transformed, workspace)?;
 
-    let scale = calculate_scale(
+    let standard_deviation = calculate_scale(
         &beta_vec,
         x_transformed,
         y,
@@ -5404,7 +5407,7 @@ pub fn solve_penalized_least_squares(
             beta: Coefficients::new(beta_vec),
             penalized_hessian, // Return original H for derivatives
             edf,
-            scale,
+            standard_deviation,
             ridge_used,
         },
         detected_rank, // Return actual numerical rank detected by solver
@@ -5502,9 +5505,11 @@ where
     (p as f64 - tr).clamp(mp, p as f64)
 }
 
-/// Calculate scale parameter correctly for different link functions
-/// For Gaussian (Identity): Based on weighted residual sum of squares
-/// For Binomial (Logit): Fixed at 1.0 as in mgcv
+/// Calculate scale parameter correctly for different link functions.
+///
+/// Contract:
+/// - Gaussian (Identity): residual standard deviation sigma
+/// - Binomial links: fixed at 1.0 as in mgcv
 fn calculate_scale(
     beta: &Array1<f64>,
     x: ArrayView2<f64>,
@@ -5541,7 +5546,7 @@ fn calculate_scale(
             // but mgcv's gam.fit3 uses 'n.true' (unweighted count) in the denominator.
             // We maintain this behavior for strict mgcv parity.
             let effective_n = y.len() as f64;
-            weighted_rss / (effective_n - edf).max(1.0)
+            (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
         }
     }
 }
@@ -5659,7 +5664,7 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_scale_matches_weighted_rss_with_offset() {
+    fn gaussian_scale_matches_weighted_sd_with_offset() {
         let x = array![[1.0], [2.0], [4.0]];
         let beta = array![1.5];
         let offset = array![0.5, -1.0, 2.0];
@@ -5684,7 +5689,7 @@ mod tests {
             .zip(y.iter().zip(fitted.iter()))
             .map(|(&wi, (&yi, &fi))| wi * (yi - fi).powi(2))
             .sum();
-        let expected = rss / ((y.len() as f64 - edf).max(1.0));
+        let expected = (rss / ((y.len() as f64 - edf).max(1.0))).sqrt();
 
         assert!(
             (scale - expected).abs() < 1e-12,
