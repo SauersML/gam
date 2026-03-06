@@ -2971,7 +2971,9 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
                 .to_string(),
         ));
     }
-    let mut visualizer_session = visualizer::VisualizerSession::new(true);
+    // Library code must not own terminal UI lifecycle implicitly.
+    // Keep visualization disabled unless an explicit caller-provided session is wired in.
+    let mut visualizer_session = visualizer::VisualizerSession::default();
     visualizer_session.set_stage("joint", "initializing");
     if config.firth_bias_reduction && matches!(link, LinkFunction::Logit) {
         visualizer_session.push_diagnostic("firth bias reduction enabled (separation protection)");

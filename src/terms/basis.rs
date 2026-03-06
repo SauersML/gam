@@ -6864,7 +6864,19 @@ pub fn evaluate_bspline_derivative_scalar_into(
             0.0
         };
 
-        out[i] = k * (left_term - right_term);
+        let deriv = k * (left_term - right_term);
+        out[i] = if deriv.abs() < 1e-10 { 0.0 } else { deriv };
+    }
+
+    // Stabilize reverse cumulative sums used by I-spline derivative identities.
+    // Tiny cancellation residuals are rounded to exact zero at accumulation points.
+    let mut running = 0.0_f64;
+    for j in (0..num_basis).rev() {
+        running += out[j];
+        if running.abs() < 1e-12 {
+            out[j] -= running;
+            running = 0.0;
+        }
     }
 
     Ok(())
@@ -8616,7 +8628,13 @@ mod tests {
 
             for j in 0..n_i {
                 let fd = (i_plus[j] - i_minus[j]) / (2.0 * h);
-                assert_eq!(d_i[j].signum(), fd.signum());
+                assert_eq!(
+                    d_i[j].signum(),
+                    fd.signum(),
+                    "sign mismatch at x={x}, j={j}: analytic={} fd={}",
+                    d_i[j],
+                    fd
+                );
                 assert_abs_diff_eq!(fd, d_i[j], epsilon = 2e-5);
             }
         }

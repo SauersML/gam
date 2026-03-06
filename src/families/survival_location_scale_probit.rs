@@ -7,7 +7,9 @@ use crate::families::sigma_link::{
     bounded_sigma_derivs_up_to_third, bounded_sigma_derivs_up_to_third_scalar,
 };
 use crate::matrix::DesignMatrix;
-use crate::mixture_link::inverse_link_jet_for_inverse_link;
+use crate::mixture_link::{
+    inverse_link_jet_for_inverse_link, inverse_link_pdf_third_derivative_for_inverse_link,
+};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_cdf_approx, normal_pdf};
 use crate::types::{InverseLink, LinkFunction};
@@ -27,6 +29,7 @@ pub trait ResidualDistributionOps {
     fn pdf(&self, z: f64) -> f64;
     fn pdf_derivative(&self, z: f64) -> f64;
     fn pdf_second_derivative(&self, z: f64) -> f64;
+    fn pdf_third_derivative(&self, z: f64) -> f64;
 }
 
 impl ResidualDistributionOps for ResidualDistribution {
@@ -90,6 +93,25 @@ impl ResidualDistributionOps for ResidualDistribution {
                 let s = self.cdf(z);
                 let f = s * (1.0 - s);
                 f * (1.0 - 6.0 * s + 6.0 * s * s)
+            }
+        }
+    }
+
+    fn pdf_third_derivative(&self, z: f64) -> f64 {
+        match self {
+            ResidualDistribution::Gaussian => {
+                let f = normal_pdf(z);
+                -(z * z * z - 3.0 * z) * f
+            }
+            ResidualDistribution::Gumbel => {
+                let ez = z.clamp(-40.0, 40.0).exp();
+                let f = ez * (-ez).exp();
+                f * (1.0 - 7.0 * ez + 6.0 * ez * ez - ez * ez * ez)
+            }
+            ResidualDistribution::Logistic => {
+                let s = self.cdf(z);
+                let f = s * (1.0 - s);
+                f * (1.0 - 14.0 * s + 36.0 * s * s - 24.0 * s * s * s)
             }
         }
     }
@@ -268,17 +290,48 @@ impl SurvivalLocationScaleProbitFamily {
         (2.0 * r * dr) + (fpp / s + fp * f / (s * s))
     }
 
-    /// Clamp-aware log-pdf and its first/second derivatives.
+    /// Clamp-aware log-pdf and its first/second/third derivatives.
     ///
-    /// The objective uses `log(max(f, MIN_PROB))`, so in the saturated region
-    /// `f <= MIN_PROB` the function is constant and derivatives must be zero.
-    fn clamped_log_pdf_with_derivatives(f: f64, fp: f64, fpp: f64) -> (f64, f64, f64) {
+    /// Let `L(u) = log f(u)` on the unclamped branch. The exact derivatives are:
+    ///
+    /// `L'   = f'/f`
+    ///
+    /// `L''  = d/du(f'/f)
+    ///       = (f'' f - (f')²) / f²
+    ///       = f''/f - (f'/f)²`
+    ///
+    /// For the third derivative, differentiate `L'' = f''/f - (f'/f)^2`:
+    ///
+    /// `d/du[f''/f]   = f'''/f - f'f''/f²`
+    ///
+    /// `d/du[(f'/f)²] = 2(f'/f)(f''/f - (f'/f)²)
+    ///                = 2f'f''/f² - 2(f')³/f³`
+    ///
+    /// so
+    ///
+    /// `L''' = f'''/f - 3 f'f''/f² + 2(f')³/f³`.
+    ///
+    /// This is the exact `d³(log f)/du³` term used in the survival exact-Newton
+    /// Hessian directional derivative. If it is dropped, the event contribution
+    /// to `d³ℓ/dq³` is wrong, which then corrupts the block Hessian drift
+    /// `D H[u]`.
+    ///
+    /// The objective actually uses `log(max(f, MIN_PROB))`, not `log f`, so once
+    /// `f <= MIN_PROB` the active branch is constant and all derivatives must be
+    /// zero. That is why the clamped branch returns `(log MIN_PROB, 0, 0, 0)`.
+    fn clamped_log_pdf_with_derivatives(
+        f: f64,
+        fp: f64,
+        fpp: f64,
+        fppp: f64,
+    ) -> (f64, f64, f64, f64) {
         if f <= MIN_PROB {
-            (MIN_PROB.ln(), 0.0, 0.0)
+            (MIN_PROB.ln(), 0.0, 0.0, 0.0)
         } else {
             let d1 = fp / f;
             let d2 = fpp / f - d1 * d1;
-            (f.ln(), d1, d2)
+            let d3 = fppp / f - 3.0 * fp * fpp / (f * f) + 2.0 * fp * fp * fp / (f * f * f);
+            (f.ln(), d1, d2, d3)
         }
     }
 
@@ -306,6 +359,7 @@ impl SurvivalLocationScaleProbitFamily {
             (s, r, dr, ddr)
         }
     }
+
 }
 
 fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(), String> {
@@ -682,8 +736,12 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                 Self::clamped_survival_neglog_derivatives(raw_s0, f0, fp0, fpp0);
             let (s1, r1, dr1, _ddr1) =
                 Self::clamped_survival_neglog_derivatives(raw_s1, f1, fp1, fpp1);
-            let (log_phi1, dlogphi1, d2logphi1) =
-                Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1);
+            let fppp1 = inverse_link_pdf_third_derivative_for_inverse_link(&self.inverse_link, u1)
+                .map_err(|e| {
+                    format!("inverse link third-derivative evaluation failed at row {i} exit: {e}")
+                })?;
+            let (log_phi1, dlogphi1, d2logphi1, _d3logphi1) =
+                Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1, fppp1);
             let g = d_raw[i];
             let guard = self.derivative_guard;
             let soft = self.derivative_softness.max(0.0);
@@ -702,10 +760,38 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
 
             ll += w * (d * (log_phi1 + g_safe.ln()) + (1.0 - d) * s1.ln() - s0.ln());
 
-            // q derivatives (shared by threshold/log-sigma blocks).
-            // Chain rule map:
-            //   u0 = -h0 + q, u1 = -h1 + q  =>  du0/dq = du1/dq = +1.
-            // So dℓ/dq and d²ℓ/dq² keep the same local signs as r', d²logphi/du².
+            // Row likelihood:
+            //
+            //   ℓ_i(q) = w_i [ d_i (log f(u1) + log g_safe)
+            //                + (1-d_i) log S(u1)
+            //                - log S(u0) ],
+            //
+            // where
+            //   u0 = -h0 + q,   u1 = -h1 + q,
+            //   f = F',         S = 1 - F.
+            //
+            // Define
+            //   r(u) = d/du[-log S(u)] = f/S,
+            // so
+            //   d/du[log S(u)] = -r(u),
+            //   d²/du²[log S(u)] = -r'(u),
+            //   d³/du³[log S(u)] = -r''(u).
+            //
+            // Since `du0/dq = du1/dq = +1`, derivatives wrt `q` are just the
+            // corresponding derivatives wrt `u0` / `u1` composed with the signs
+            // already present in the objective:
+            //
+            //   dℓ_i/dq
+            //   = w_i [ r(u0) + d_i d/du log f(u1) - (1-d_i) r(u1) ]
+            //
+            //   d²ℓ_i/dq²
+            //   = w_i [ r'(u0) + d_i d²/du² log f(u1) - (1-d_i) r'(u1) ]
+            //
+            //   d³ℓ_i/dq³
+            //   = w_i [ r''(u0) + d_i d³/du³ log f(u1) - (1-d_i) r''(u1) ].
+            //
+            // These predictor-space derivatives are shared by the threshold,
+            // log-sigma, and wiggle blocks through the chain rule for `q`.
             d1_q[i] = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));
             d2_q[i] = w * (dr0 + d * d2logphi1 + (1.0 - d) * (-dr1));
 
@@ -862,23 +948,35 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                 Self::clamped_survival_neglog_derivatives(raw_s0, f0, fp0, fpp0);
             let (_s1, r1, dr1, ddr1) =
                 Self::clamped_survival_neglog_derivatives(raw_s1, f1, fp1, fpp1);
-            let (_log_phi1, dlogphi1, d2logphi1) =
-                Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1);
+            let fppp1 = inverse_link_pdf_third_derivative_for_inverse_link(&self.inverse_link, u1)
+                .map_err(|e| {
+                    format!("inverse link third-derivative evaluation failed at row {i} exit: {e}")
+                })?;
+            let (_log_phi1, dlogphi1, d2logphi1, d3logphi1) =
+                Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1, fppp1);
 
-            // q-derivatives of the per-row log-likelihood contribution.
-            // With u0=-h0+q, u1=-h1+q:
-            // dℓ/dq   = w [ r0 + d * dlogphi1 - (1-d) r1 ]
-            // d²ℓ/dq² = w [ r0' + d * d²logphi1 - (1-d) r1' ]
-            // d³ℓ/dq³ = w [ r0'' + d * d³logphi1 - (1-d) r1'' ]
+            // Same rowwise `q` calculus as in `evaluate()`, now keeping the full
+            // third derivative because exact-Newton `D H[u]` differentiates the
+            // block Hessian, and the block Hessian itself already contains the
+            // second `q`-derivative.
+            //
+            // Symbolically:
+            //
+            //   H_eta(q) = - d²ℓ_i / d eta²
+            //
+            // for each block-specific predictor. Differentiating `H_eta` along a
+            // coefficient direction introduces `d³ℓ_i/dq³`, so the event-side
+            // `d³(log f)/du³` contribution is not optional; it is the unique term
+            // coming from differentiating the event log-density curvature.
             d1_q[i] = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));
             d2_q[i] = w * (dr0 + d * d2logphi1 + (1.0 - d) * (-dr1));
-            // Third derivative of log phi using general chain rule:
-            // d³(log φ)/du³ = φ'''/ φ - 3 φ'φ''/ φ² + 2(φ')³/ φ³
-            // We don't have φ''' yet, so approximate with finite difference
-            // of d2logphi for the third-order correction. For Gaussian d³(log φ)/du³ = 0.
-            // For now, use 0 for the event contribution to d3 (matches Gaussian exactly,
-            // small error for Gumbel/Logistic in the Hessian directional derivative).
-            d3_q[i] = w * (ddr0 + (1.0 - d) * (-ddr1));
+            // Third derivative of the q-profile:
+            //
+            //   d³ℓ_i/dq³
+            //   = w_i [ r''(u0) + d_i d³/du³ log f(u1) - (1-d_i) r''(u1) ].
+            //
+            // The previous bug was exactly that the middle term was omitted.
+            d3_q[i] = w * (ddr0 + d * d3logphi1 + (1.0 - d) * (-ddr1));
 
             // Time block contributions use u0/u1 direct dependence.
             // Chain rule map:
@@ -2012,15 +2110,53 @@ mod tests {
     }
 
     #[test]
+    fn residual_pdf_third_derivative_matches_second_derivative_fd() {
+        let dists = [
+            ResidualDistribution::Gaussian,
+            ResidualDistribution::Gumbel,
+            ResidualDistribution::Logistic,
+        ];
+        let zs = [-1.1, -0.4, 0.2, 0.9];
+        let h = 1e-6_f64;
+
+        for &dist in &dists {
+            for &z in &zs {
+                let fd = (dist.pdf_second_derivative(z + h) - dist.pdf_second_derivative(z - h))
+                    / (2.0 * h);
+                let analytic = dist.pdf_third_derivative(z);
+                assert_eq!(
+                    analytic.signum(),
+                    fd.signum(),
+                    "pdf''' sign mismatch for {:?} at z={}: analytic={} fd={}",
+                    dist,
+                    z,
+                    analytic,
+                    fd
+                );
+                assert!(
+                    (analytic - fd).abs() < 5e-5,
+                    "pdf''' mismatch for {:?} at z={}: analytic={} fd={}",
+                    dist,
+                    z,
+                    analytic,
+                    fd
+                );
+            }
+        }
+    }
+
+    #[test]
     fn clamped_log_pdf_derivatives_are_zero_in_saturated_region() {
         let f = MIN_PROB * 0.1;
         let fp = 3.0;
         let fpp = -7.0;
-        let (logf, d1, d2) =
-            SurvivalLocationScaleProbitFamily::clamped_log_pdf_with_derivatives(f, fp, fpp);
+        let fppp = 11.0;
+        let (logf, d1, d2, d3) =
+            SurvivalLocationScaleProbitFamily::clamped_log_pdf_with_derivatives(f, fp, fpp, fppp);
         assert!((logf - MIN_PROB.ln()).abs() <= 1e-15);
         assert_eq!(d1, 0.0);
         assert_eq!(d2, 0.0);
+        assert_eq!(d3, 0.0);
     }
 
     #[test]

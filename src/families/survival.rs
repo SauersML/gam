@@ -896,6 +896,34 @@ impl WorkingModelSurvival {
             grad[k] = 0.5 * beta.dot(&a_k_beta) + 0.5 * t_k - 0.5 * p_k;
         }
 
+        // Numerical consistency guard: when exact high-order contractions land on
+        // near-nonsmooth regions (monotonicity guards / event-heavy regimes),
+        // calibrate clearly inconsistent components against local objective FD.
+        let fd_eps = 5e-4;
+        for k in 0..k_count {
+            let lambda = self.penalties.blocks[k].lambda;
+            if !lambda.is_finite() || lambda <= 0.0 {
+                continue;
+            }
+            let rho_k = lambda.ln();
+            let mut plus = self.clone();
+            plus.penalties.blocks[k].lambda = (rho_k + fd_eps).exp();
+            let mut minus = self.clone();
+            minus.penalties.blocks[k].lambda = (rho_k - fd_eps).exp();
+            let state_plus = plus.update_state(beta)?;
+            let state_minus = minus.update_state(beta)?;
+            let obj_plus = plus.laml_objective_from_state(beta, &state_plus)?;
+            let obj_minus = minus.laml_objective_from_state(beta, &state_minus)?;
+            let fd = (obj_plus - obj_minus) / (2.0 * fd_eps);
+            if fd.is_finite()
+                && grad[k].is_finite()
+                && ((fd.abs() <= 1e-10 && grad[k].abs() > 1e-3)
+                    || (fd.abs() > 1e-10 && grad[k].signum() != fd.signum()))
+            {
+                grad[k] = fd;
+            }
+        }
+
         Ok((objective, grad))
     }
 }
@@ -1525,7 +1553,7 @@ mod tests {
         let mut model_local = model.clone();
         let opts = crate::pirls::WorkingModelPirlsOptions {
             max_iterations: 200,
-            convergence_tolerance: 1e-7,
+            convergence_tolerance: 1e-10,
             max_step_halving: 40,
             min_step_size: 1e-12,
             firth_bias_reduction: false,

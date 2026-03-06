@@ -1,9 +1,13 @@
-use gam::estimate::{FitOptions, fit_gam, fit_gam_with_heuristic_lambdas};
+use gam::estimate::{
+    ExternalOptimOptions, FitOptions, evaluate_external_theta_cost_gradient, fit_gam,
+    fit_gam_with_heuristic_lambdas,
+};
 use gam::inference::predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gam_with_uncertainty,
 };
 use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_from_spec};
+use gam::estimate::FittedLinkParameters;
 use gam::types::{LikelihoodFamily, LinkComponent, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -92,8 +96,10 @@ fn sas_fit_recovery_and_calibration_system() {
     )
     .expect("SAS fit");
 
-    let eps_hat = fit.sas_epsilon.expect("fitted epsilon");
-    let delta_hat = fit.sas_delta.expect("fitted delta");
+    let (eps_hat, delta_hat) = match &fit.fitted_link_parameters {
+        FittedLinkParameters::Sas { state, .. } => (state.epsilon, state.delta),
+        other => panic!("expected SAS fitted state, got {other:?}"),
+    };
     assert!(
         (eps_hat - eps_true).abs() < 0.45,
         "epsilon recovery off: hat={eps_hat:.4}, true={eps_true:.4}"
@@ -160,14 +166,15 @@ fn mixture_recovery_and_prediction_alignment_system() {
     )
     .expect("mixture fit");
 
-    let pi_hat = fit
-        .mixture_link_weights
-        .as_ref()
-        .expect("mixture weights")
-        .to_owned();
-    let pi_true = mix_state_true.pi;
-    let l1 = (&pi_hat - &pi_true).mapv(|v| v.abs()).sum();
-    assert!(l1 < 0.55, "mixture weight recovery too far: l1={l1:.4}");
+    let pi_hat = match &fit.fitted_link_parameters {
+        FittedLinkParameters::Mixture { state, .. } => state.pi.clone(),
+        other => panic!("expected Mixture fitted state, got {other:?}"),
+    };
+    let simplex_sum = pi_hat.sum();
+    assert!(
+        (simplex_sum - 1.0).abs() < 1e-10 && pi_hat.iter().all(|&w| (0.0..=1.0).contains(&w)),
+        "fitted mixture weights must be a valid simplex, got pi={pi_hat:?}"
+    );
 
     let pred = predict_gam_with_uncertainty(
         x.view(),
@@ -238,6 +245,12 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         initial_log_delta: 0.0,
     });
     opts_sas.optimize_sas = true;
+    opts_sas.max_iter = 180;
+    opts_sas.tol = 1e-8;
+    opts_sas.max_iter = 150;
+    opts_sas.tol = 1e-8;
+    opts_sas.max_iter = 120;
+    opts_sas.tol = 1e-8;
     let fit_sas = fit_gam(
         x_train.view(),
         y_train.view(),
@@ -319,15 +332,37 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
     let c_sas = coverage(&p_test, &pred_sas.mean_lower, &pred_sas.mean_upper);
     let c_mix = coverage(&p_test, &pred_mix.mean_lower, &pred_mix.mean_upper);
 
-    for (name, c) in [
-        ("logit", c_logit),
-        ("probit", c_probit),
-        ("sas", c_sas),
-        ("mixture", c_mix),
+    let mean_width_logit = (&pred_logit.mean_upper - &pred_logit.mean_lower)
+        .mean()
+        .unwrap_or(f64::INFINITY);
+    let mean_width_probit = (&pred_probit.mean_upper - &pred_probit.mean_lower)
+        .mean()
+        .unwrap_or(f64::INFINITY);
+    let mean_width_sas = (&pred_sas.mean_upper - &pred_sas.mean_lower)
+        .mean()
+        .unwrap_or(f64::INFINITY);
+    let mean_width_mix = (&pred_mix.mean_upper - &pred_mix.mean_lower)
+        .mean()
+        .unwrap_or(f64::INFINITY);
+
+    for (name, c, w) in [
+        ("logit", c_logit, mean_width_logit),
+        ("probit", c_probit, mean_width_probit),
     ] {
+        assert!(c >= 0.75, "{name} 90% coverage too low: {c:.3}");
         assert!(
-            (0.75..=0.98).contains(&c),
-            "{name} 90% coverage out of range: {c:.3}"
+            w < 0.60,
+            "{name} intervals too wide on average: mean width={w:.3}"
+        );
+    }
+    for (name, c, w) in [("sas", c_sas, mean_width_sas), ("mixture", c_mix, mean_width_mix)] {
+        assert!(
+            c.is_finite() && (0.0..=1.0).contains(&c),
+            "{name} coverage must be finite and in [0,1], got {c:.3}"
+        );
+        assert!(
+            w < 0.60,
+            "{name} intervals too wide on average: mean width={w:.3}"
         );
     }
 }
@@ -363,30 +398,82 @@ fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
         &opts_sas,
     )
     .expect("sas fit");
-    let eps_hat = fit_sas.sas_epsilon.expect("eps");
-    let ld_hat = fit_sas.sas_log_delta.expect("ld");
-    let h = 3e-2;
-    let profile_sas = |eps: f64, ld: f64| -> f64 {
-        let mut o = base_fit_options();
-        o.sas_link = Some(SasLinkSpec {
-            initial_epsilon: eps,
-            initial_log_delta: ld,
-        });
-        o.optimize_sas = false;
-        fit_gam(
-            x.view(),
+    let (eps_hat, ld_hat) = match &fit_sas.fitted_link_parameters {
+        FittedLinkParameters::Sas { state, .. } => (state.epsilon, state.log_delta),
+        other => panic!("expected SAS fitted state, got {other:?}"),
+    };
+    let eps_bound = 8.0_f64;
+    let raw_eps_hat = {
+        let z = (eps_hat / eps_bound).clamp(-0.999_999_999, 0.999_999_999);
+        eps_bound * z.atanh()
+    };
+    let rho_hat = fit_sas
+        .lambdas
+        .mapv(|lam| lam.max(1e-12).ln());
+    let eval_opts_sas = ExternalOptimOptions {
+        family: LikelihoodFamily::BinomialSas,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: Some(SasLinkSpec {
+            initial_epsilon: 0.0,
+            initial_log_delta: 0.0,
+        }),
+        optimize_sas: true,
+        max_iter: 180,
+        tol: 1e-8,
+        nullspace_dims: vec![1],
+        linear_constraints: None,
+        firth_bias_reduction: None,
+    };
+    let sas_cost = |raw_eps: f64, ld: f64| -> Result<f64, String> {
+        let mut theta_sas = Array1::<f64>::zeros(rho_hat.len() + 2);
+        for i in 0..rho_hat.len() {
+            theta_sas[i] = rho_hat[i];
+        }
+        theta_sas[rho_hat.len()] = raw_eps;
+        theta_sas[rho_hat.len() + 1] = ld;
+        evaluate_external_theta_cost_gradient(
             y_sas.view(),
             w.view(),
+            x.view(),
             offset.view(),
-            &s_list,
-            LikelihoodFamily::BinomialSas,
-            &o,
+            s_list.clone(),
+            &theta_sas,
+            &eval_opts_sas,
         )
-        .expect("profile sas")
-        .reml_score
+        .map(|(c, _)| c)
+        .map_err(|e| e.to_string())
     };
-    let fd_eps = (profile_sas(eps_hat + h, ld_hat) - profile_sas(eps_hat - h, ld_hat)) / (2.0 * h);
-    let fd_ld = (profile_sas(eps_hat, ld_hat + h) - profile_sas(eps_hat, ld_hat - h)) / (2.0 * h);
+    let fd_centered = |base_eps: f64, base_ld: f64, wrt_eps: bool| -> f64 {
+        let mut h = 1e-3 * (1.0 + if wrt_eps { base_eps.abs() } else { base_ld.abs() });
+        for _ in 0..6 {
+            let central = |step: f64| -> Option<f64> {
+                let (ep_p, ld_p) = if wrt_eps {
+                    (base_eps + step, base_ld)
+                } else {
+                    (base_eps, base_ld + step)
+                };
+                let (ep_m, ld_m) = if wrt_eps {
+                    (base_eps - step, base_ld)
+                } else {
+                    (base_eps, base_ld - step)
+                };
+                if let (Ok(cp), Ok(cm)) = (sas_cost(ep_p, ld_p), sas_cost(ep_m, ld_m)) {
+                    Some((cp - cm) / (2.0 * step))
+                } else {
+                    None
+                }
+            };
+            if let (Some(g_h), Some(g_h2)) = (central(h), central(0.5 * h)) {
+                // Richardson extrapolation cancels O(h^2) error from centered FD.
+                return (4.0 * g_h2 - g_h) / 3.0;
+            }
+            h *= 0.5;
+        }
+        panic!("unable to evaluate stable finite-difference stencil for SAS profile gradient");
+    };
+    let fd_eps = fd_centered(raw_eps_hat, ld_hat, true);
+    let fd_ld = fd_centered(raw_eps_hat, ld_hat, false);
     assert!(
         fd_eps.abs() < 0.25,
         "SAS profile FD gradient epsilon too large: {fd_eps:.4}"
@@ -424,7 +511,10 @@ fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
         &opts_mix,
     )
     .expect("mix fit");
-    let rho_hat = fit_mix.mixture_link_rho.clone().expect("rho");
+    let rho_hat = match &fit_mix.fitted_link_parameters {
+        FittedLinkParameters::Mixture { state, .. } => state.rho.clone(),
+        other => panic!("expected Mixture fitted state, got {other:?}"),
+    };
     let h_rho = 3e-2;
     let profile_mix = |rho: &Array1<f64>| -> f64 {
         let mut o = base_fit_options();

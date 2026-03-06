@@ -11,8 +11,8 @@ use crate::basis::{
 };
 use crate::construction::kronecker_product;
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState, fit_custom_family,
+    BlockGeometryDirectionalDerivative, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitOptions, FitResult,
@@ -3305,6 +3305,56 @@ impl CustomFamily for BoundedLinearFamily {
         };
         Ok((DesignMatrix::Dense(x), offset))
     }
+
+    fn block_geometry_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        spec: &ParameterBlockSpec,
+        d_beta: &Array1<f64>,
+    ) -> Result<Option<BlockGeometryDirectionalDerivative>, String> {
+        if block_idx != 0 {
+            return Err(format!(
+                "bounded linear family expects block_idx 0 for geometry derivative, got {block_idx}"
+            ));
+        }
+        if block_states.len() != 1 {
+            return Err(format!(
+                "bounded linear family expects 1 block, got {}",
+                block_states.len()
+            ));
+        }
+        if d_beta.len() != spec.design.ncols() {
+            return Err(format!(
+                "bounded linear family geometry derivative direction mismatch: got {}, expected {}",
+                d_beta.len(),
+                spec.design.ncols()
+            ));
+        }
+        let (_beta_user, jac_diag, _second_diag, _third_diag, _prior_third) =
+            self.bounded_term_derivative_data(&block_states[0].beta);
+        let mut d_offset = Array1::<f64>::zeros(self.offset.len());
+        let has_drift = self.bounded_terms.iter().any(|term| {
+            jac_diag[term.col_idx] != 0.0 && d_beta[term.col_idx] != 0.0
+        });
+        if !has_drift {
+            return Ok(Some(BlockGeometryDirectionalDerivative {
+                d_design: None,
+                d_offset,
+            }));
+        }
+        for term in &self.bounded_terms {
+            let col = term.col_idx;
+            let drift = jac_diag[col] * d_beta[col];
+            if drift != 0.0 {
+                d_offset += &(self.design.column(col).to_owned() * drift);
+            }
+        }
+        Ok(Some(BlockGeometryDirectionalDerivative {
+            d_design: None,
+            d_offset,
+        }))
+    }
 }
 
 fn xt_diag_x_dense(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
@@ -5052,7 +5102,21 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
             kappa_options,
             &spatial_terms,
         )? {
-            return Ok(exact_joint);
+            let exact_score = fit_score(&exact_joint.fit);
+            if exact_score <= initial_score + 1e-10 {
+                return Ok(exact_joint);
+            }
+            log::warn!(
+                "[spatial-kappa] exact joint score regressed ({:.6e} -> {:.6e}); keeping baseline",
+                initial_score,
+                exact_score
+            );
+            return Ok(FittedTermCollectionWithSpec {
+                fit: best.fit,
+                design: best.design,
+                resolved_spec,
+                adaptive_diagnostics: best.adaptive_diagnostics,
+            });
         }
         // Fallback path for spatial bases that do not expose exact log-kappa
         // derivatives (e.g. Duchon/TPS variants without analytic X_tau/S_tau).
