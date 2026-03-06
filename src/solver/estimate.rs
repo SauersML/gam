@@ -889,6 +889,53 @@ fn resolve_external_family(
 }
 
 #[inline]
+fn effective_sas_link_for_family(
+    family: crate::types::LikelihoodFamily,
+    sas_link: Option<SasLinkSpec>,
+) -> Option<SasLinkSpec> {
+    if matches!(
+        family,
+        crate::types::LikelihoodFamily::BinomialSas
+            | crate::types::LikelihoodFamily::BinomialBetaLogistic
+    ) && sas_link.is_none()
+    {
+        Some(SasLinkSpec {
+            initial_epsilon: 0.0,
+            initial_log_delta: 0.0,
+        })
+    } else {
+        sas_link
+    }
+}
+
+#[inline]
+fn resolved_external_inverse_link(
+    link: LinkFunction,
+    mixture_link: Option<&MixtureLinkSpec>,
+    sas_link: Option<SasLinkSpec>,
+) -> Result<InverseLink, EstimationError> {
+    if let Some(spec) = mixture_link {
+        return Ok(InverseLink::Mixture(state_from_spec(spec).map_err(|e| {
+            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+        })?));
+    }
+    if let Some(spec) = sas_link {
+        return Ok(match link {
+            LinkFunction::BetaLogistic => {
+                InverseLink::BetaLogistic(state_from_beta_logistic_spec(spec).map_err(|e| {
+                    EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
+                })?)
+            }
+            _ => InverseLink::Sas(
+                state_from_sas_spec(spec)
+                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
+            ),
+        });
+    }
+    Ok(InverseLink::Standard(link))
+}
+
+#[inline]
 fn ensure_exact_directional_hyper_supported(
     link: LinkFunction,
     firth_active: bool,
@@ -1026,19 +1073,6 @@ where
             "BinomialMixture requires mixture_link specification".to_string(),
         ));
     }
-    let effective_sas_link = if matches!(
-        opts.family,
-        crate::types::LikelihoodFamily::BinomialSas
-            | crate::types::LikelihoodFamily::BinomialBetaLogistic
-    ) && opts.sas_link.is_none()
-    {
-        Some(SasLinkSpec {
-            initial_epsilon: 0.0,
-            initial_log_delta: 0.0,
-        })
-    } else {
-        opts.sas_link
-    };
     let x = x.into();
     if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
         return Err(EstimationError::InvalidInput(format!(
@@ -1067,6 +1101,7 @@ where
             active_nullspace_dims.len()
         )));
     }
+    let effective_sas_link = effective_sas_link_for_family(opts.family, opts.sas_link);
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
     if opts.mixture_link.is_some() && opts.sas_link.is_some() {
@@ -1074,24 +1109,8 @@ where
             "mixture_link and sas_link are mutually exclusive for this fit".to_string(),
         ));
     }
-    if let Some(spec) = opts.mixture_link.as_ref() {
-        cfg.link_kind = InverseLink::Mixture(state_from_spec(spec).map_err(|e| {
-            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
-        })?);
-    }
-    if let Some(spec) = effective_sas_link {
-        cfg.link_kind = match link {
-            LinkFunction::BetaLogistic => {
-                InverseLink::BetaLogistic(state_from_beta_logistic_spec(spec).map_err(|e| {
-                    EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
-                })?)
-            }
-            _ => InverseLink::Sas(
-                state_from_sas_spec(spec)
-                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
-            ),
-        };
-    }
+    cfg.link_kind =
+        resolved_external_inverse_link(link, opts.mixture_link.as_ref(), effective_sas_link)?;
 
     let rs_list = compute_penalty_square_roots(&s_list)?;
 
@@ -2163,16 +2182,19 @@ where
         }
     }
 
+    let effective_sas_link = effective_sas_link_for_family(opts.family, opts.sas_link);
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let has_design_drift = hyper_dirs
         .iter()
         .any(|dir| dir.x_tau_original.iter().any(|v| v.abs() > 1e-14));
     ensure_exact_directional_hyper_supported(link, firth_active, has_design_drift, context)?;
-    let cfg = RemlConfig::external(link, opts.tol, firth_active);
+    let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
+    cfg.link_kind =
+        resolved_external_inverse_link(link, opts.mixture_link.as_ref(), effective_sas_link)?;
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let offset_o = offset.to_owned();
-    let reml_state = RemlState::new_with_offset(
+    let mut reml_state = RemlState::new_with_offset(
         y_o.view(),
         x,
         w_o.view(),
@@ -2184,6 +2206,10 @@ where
         None,
         opts.linear_constraints.clone(),
     )?;
+    reml_state.set_link_states(
+        cfg.link_kind.mixture_state().cloned(),
+        cfg.link_kind.sas_state().copied(),
+    );
     reml_state.set_warm_start_original_beta(warm_start_beta);
     eval(&reml_state)
 }
@@ -2999,19 +3025,7 @@ where
             "BinomialMixture requires mixture_link specification".to_string(),
         ));
     }
-    let effective_sas_link = if matches!(
-        family,
-        crate::types::LikelihoodFamily::BinomialSas
-            | crate::types::LikelihoodFamily::BinomialBetaLogistic
-    ) && opts.sas_link.is_none()
-    {
-        Some(SasLinkSpec {
-            initial_epsilon: 0.0,
-            initial_log_delta: 0.0,
-        })
-    } else {
-        opts.sas_link
-    };
+    let effective_sas_link = effective_sas_link_for_family(family, opts.sas_link);
     if opts.mixture_link.is_some() && opts.sas_link.is_some() {
         return Err(EstimationError::InvalidInput(
             "mixture_link and sas_link cannot both be set".to_string(),
@@ -3765,25 +3779,11 @@ where
             theta.len()
         )));
     }
+    let effective_sas_link = effective_sas_link_for_family(opts.family, opts.sas_link);
     let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
     let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
-    if let Some(spec) = opts.mixture_link.as_ref() {
-        cfg.link_kind = InverseLink::Mixture(state_from_spec(spec).map_err(|e| {
-            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
-        })?);
-    }
-    if let Some(spec) = opts.sas_link {
-        cfg.link_kind = if use_beta_logistic {
-            InverseLink::BetaLogistic(state_from_beta_logistic_spec(spec).map_err(|e| {
-                EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
-            })?)
-        } else {
-            InverseLink::Sas(
-                state_from_sas_spec(spec)
-                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?,
-            )
-        };
-    }
+    cfg.link_kind =
+        resolved_external_inverse_link(link, opts.mixture_link.as_ref(), effective_sas_link)?;
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let x_o = x.clone();
