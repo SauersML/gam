@@ -8,8 +8,8 @@ impl<'a> RemlState<'a> {
         structural_rank: usize,
         ridge: f64,
     ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
-        // Full derivation for the penalty pseudo-logdet terms in the outer
-        // gradient/Hessian:
+        // Local derivation for the hard-truncated penalty logdet terms in the
+        // outer gradient/Hessian:
         //
         //   P_k   = -0.5 * d/drho_k     log|S(rho)|_+
         //   P_k,l = -0.5 * d²/(drho_k drho_l) log|S(rho)|_+.
@@ -19,9 +19,11 @@ impl<'a> RemlState<'a> {
         //   A_k    = dS/drho_k      = lambda_k S_k,
         //   A_k,l  = d²S/(drho_k drho_l) = delta_{k,l} A_k.
         //
-        // On a fixed positive-eigenspace / structural penalty subspace,
-        // the pseudodeterminant calculus matches ordinary determinant
-        // calculus with S^{-1} replaced by the inverse on that kept
+        // These identities are exact only on a neighborhood where the retained
+        // structural eigenspace is fixed; equivalently, there must be a
+        // nonzero spectral gap around the hard cutoff used by this helper. On
+        // such a branch, the truncated logdet behaves like ordinary logdet on
+        // the kept subspace, with S^{-1} replaced by the inverse on that
         // subspace:
         //
         //   d/drho_k log|S|_+ = tr(S_+^dagger A_k)
@@ -43,10 +45,12 @@ impl<'a> RemlState<'a> {
         //     = delta_{k,l} det1[k]
         //       - lambda_k lambda_l tr(S_+^dagger S_k S_+^dagger S_l).
         //
-        // This helper realizes exactly that formula on a fixed-rank
-        // reduced penalty space. The fixed-support assumption is the same
-        // one used elsewhere in the dense spectral path: the active penalty
-        // subspace is held constant while differentiating in rho.
+        // This helper realizes that branch-local formula on a fixed-rank
+        // reduced penalty space. It should not be read as an exact derivative
+        // statement at threshold crossings: for a hard truncation, even the
+        // first derivative ceases to be exact when the active projector
+        // changes. The caller is responsible for downgrading "exact" claims
+        // when the retained spectrum loses a gap to the cutoff.
         let k_count = lambdas.len();
         if rs_transformed.len() != k_count {
             return Err(EstimationError::LayoutError(format!(
@@ -1219,23 +1223,25 @@ impl<'a> RemlState<'a> {
     ) -> Option<Array2<f64>> {
         // Always compute the fast first-order correction first.
         let first_order = super::compute_smoothing_correction(self, final_rho, final_fit);
+        let first_order_correction = first_order.correction.clone();
         let n_rho = final_rho.len();
         if n_rho == 0 {
-            return first_order;
+            return first_order_correction;
         }
         if n_rho > AUTO_CUBATURE_MAX_RHO_DIM {
-            return first_order;
+            return first_order_correction;
         }
         if final_fit.beta_transformed.len() > AUTO_CUBATURE_MAX_BETA_DIM {
-            return first_order;
+            return first_order_correction;
         }
         if let Ok(bundle) = self.obtain_eval_bundle(final_rho)
             && bundle.active_subspace_unstable
         {
             // Cubature correction relies on a locally stable outer Hessian.
-            // Near active-subspace crossings of H_+, second-order local models
-            // are unreliable; keep the first-order correction only.
-            return first_order;
+            // Near active-subspace crossings of H_+, the hard-truncated
+            // spectral objective is not described by one smooth quadratic
+            // model, so we keep only the first-order correction.
+            return first_order_correction;
         }
 
         let near_boundary = final_rho
@@ -1249,15 +1255,19 @@ impl<'a> RemlState<'a> {
         let high_grad = grad_norm > 1e-3;
         if !near_boundary && !high_grad {
             // Keep the hot path cheap when the local linearization is likely sufficient.
-            return first_order;
+            return first_order_correction;
         }
 
         // Build V_rho from the outer Hessian around rho_hat.
-        let mut hessian_rho = match self.compute_laml_hessian_consistent(final_rho) {
-            Ok(h) => h,
-            Err(err) => {
-                log::debug!("Auto cubature skipped: rho Hessian unavailable ({}).", err);
-                return first_order;
+        let mut hessian_rho = if let Some(h) = first_order.hessian_rho {
+            h
+        } else {
+            match self.compute_laml_hessian_consistent(final_rho) {
+                Ok(h) => h,
+                Err(err) => {
+                    log::debug!("Auto cubature skipped: rho Hessian unavailable ({}).", err);
+                    return first_order_correction;
+                }
             }
         };
         for i in 0..n_rho {
@@ -1280,7 +1290,7 @@ impl<'a> RemlState<'a> {
         let hessian_rho_inv =
             match matrix_inverse_with_regularization(&hessian_rho, "auto cubature rho Hessian") {
                 Some(v) => v,
-                None => return first_order,
+                None => return first_order_correction,
             };
 
         let max_rho_var = hessian_rho_inv
@@ -1288,14 +1298,14 @@ impl<'a> RemlState<'a> {
             .iter()
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         if !near_boundary && !high_grad && max_rho_var < 0.1 {
-            return first_order;
+            return first_order_correction;
         }
 
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
         let (evals, evecs) = match hessian_rho_inv.eigh(Side::Lower) {
             Ok(x) => x,
-            Err(_) => return first_order,
+            Err(_) => return first_order_correction,
         };
         let mut eig_pairs: Vec<(usize, f64)> = evals
             .iter()
@@ -1304,12 +1314,12 @@ impl<'a> RemlState<'a> {
             .filter(|(_, v)| v.is_finite() && *v > 1e-12)
             .collect();
         if eig_pairs.is_empty() {
-            return first_order;
+            return first_order_correction;
         }
         eig_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let total_var: f64 = eig_pairs.iter().map(|(_, v)| *v).sum();
         if !total_var.is_finite() || total_var <= 0.0 {
-            return first_order;
+            return first_order_correction;
         }
 
         let mut rank = 0usize;
@@ -1325,12 +1335,12 @@ impl<'a> RemlState<'a> {
             }
         }
         if rank == 0 {
-            return first_order;
+            return first_order_correction;
         }
 
         let base_cov = match base_covariance {
             Some(v) => v,
-            None => return first_order,
+            None => return first_order_correction,
         };
         let p = base_cov.nrows();
         let radius = (rank as f64).sqrt();
@@ -1350,7 +1360,7 @@ impl<'a> RemlState<'a> {
             }
         }
         if sigma_points.is_empty() {
-            return first_order;
+            return first_order_correction;
         }
 
         // Disable warm-start and PIRLS-cache coupling while evaluating sigma
@@ -1380,7 +1390,7 @@ impl<'a> RemlState<'a> {
             .collect();
 
         if point_results.iter().any(|r| r.is_none()) {
-            return first_order;
+            return first_order_correction;
         }
 
         let w = 1.0 / (sigma_points.len() as f64);
@@ -1412,7 +1422,7 @@ impl<'a> RemlState<'a> {
             }
         }
         if !total_cov.iter().all(|v| v.is_finite()) {
-            return first_order;
+            return first_order_correction;
         }
 
         let mut corr = total_cov - base_cov;
@@ -1598,10 +1608,13 @@ impl<'a> RemlState<'a> {
             let lambdas = workspace.lambda_view(len).to_owned();
             let mut applied_truncation_corrections: Option<Vec<f64>> = None;
 
-            // Fixed structural-rank pseudo-determinant derivatives:
+            // Branch-local structural truncated-logdet derivatives:
             // d/dρ_k log|S|_+ and d²/(dρ_k dρ_ℓ) log|S|_+ are evaluated on a
             // reduced structural subspace (rank = e_transformed.nrows()) with a
-            // smooth floor in that reduced block. This avoids adaptive rank flips.
+            // smooth floor in that reduced block. These formulas are exact only
+            // while that kept structural subspace stays fixed; they intentionally
+            // avoid adaptive rank flips, but they are not exact at a hard
+            // threshold crossing.
             let (det1_values, _) = self.structural_penalty_logdet_derivatives(
                 rs_transformed,
                 &lambdas,

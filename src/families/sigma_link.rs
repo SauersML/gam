@@ -72,7 +72,12 @@ pub fn bounded_sigma_derivs_up_to_third_scalar(
     let d1 = span * a;
     let d2 = span * a * (1.0 - 2.0 * p);
     let d3 = span * (a * (1.0 - 2.0 * p) * (1.0 - 2.0 * p) - 2.0 * a * a);
-    (sigma, canonical_zero(d1), canonical_zero(d2), canonical_zero(d3))
+    (
+        sigma,
+        canonical_zero(d1),
+        canonical_zero(d2),
+        canonical_zero(d3),
+    )
 }
 
 pub fn bounded_sigma_derivs_up_to_third(

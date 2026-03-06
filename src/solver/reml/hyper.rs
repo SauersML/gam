@@ -42,80 +42,102 @@ impl<'a> JointHyperThetaBlocks<'a> {
 }
 
 impl<'a> RemlState<'a> {
-    fn penalty_first_total(
-        &self,
-        rho: &Array1<f64>,
-        dir: &DirectionalHyperParam,
-        s_tau_t: &Array2<f64>,
-    ) -> Array2<f64> {
-        if let Some(parts) = dir.s_tau_original_components.as_ref() {
-            let mut total = Array2::<f64>::zeros(s_tau_t.raw_dim());
-            for (k, mat) in parts {
-                if *k < rho.len() {
-                    total.scaled_add(rho[*k].exp(), mat);
+    fn sum_penalty_components(
+        p: usize,
+        base: &[PenaltyDerivativeComponent],
+        extra: Option<&[PenaltyDerivativeComponent]>,
+        scale: f64,
+    ) -> Result<Vec<(usize, Array2<f64>)>, EstimationError> {
+        let mut out: Vec<(usize, Array2<f64>)> = base
+            .iter()
+            .map(|component| (component.penalty_index, component.matrix.clone()))
+            .collect();
+        if let Some(extra_components) = extra {
+            for component in extra_components {
+                if component.matrix.nrows() != p || component.matrix.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "penalty derivative component shape mismatch: expected {}x{}, got {}x{}",
+                        p,
+                        p,
+                        component.matrix.nrows(),
+                        component.matrix.ncols()
+                    )));
+                }
+                if let Some((_, existing)) = out
+                    .iter_mut()
+                    .find(|(penalty_index, _)| *penalty_index == component.penalty_index)
+                {
+                    existing.scaled_add(scale, &component.matrix);
+                } else {
+                    out.push((component.penalty_index, component.matrix.mapv(|v| scale * v)));
                 }
             }
-            return total;
         }
-        if let Some(k) = dir.penalty_index {
-            if k < rho.len() {
-                return s_tau_t.mapv(|v| rho[k].exp() * v);
-            }
-            return Array2::<f64>::zeros(s_tau_t.raw_dim());
-        }
-        // Backward-compat mode: caller provided assembled total derivative.
-        s_tau_t.clone()
+        Ok(out)
     }
 
-    fn penalty_second_total(
-        &self,
-        rho: &Array1<f64>,
-        i: usize,
-        j: usize,
+    fn relinearized_penalty_second_components(
         hyper_dirs: &[DirectionalHyperParam],
-        s_tau_tau_t: &[Vec<Array2<f64>>],
-    ) -> Array2<f64> {
-        if let Some(parts_ij) = hyper_dirs
-            .get(i)
-            .and_then(|d| d.s_tau_tau_original_components.as_ref())
-            .and_then(|v| v.get(j))
-        {
-            let mut total = Array2::<f64>::zeros(s_tau_tau_t[i][j].raw_dim());
-            for (k, mat) in parts_ij {
-                if *k < rho.len() {
-                    total.scaled_add(rho[*k].exp(), mat);
+        psi: &Array1<f64>,
+        j: usize,
+        psi_dim: usize,
+        p: usize,
+    ) -> Result<Option<Vec<Vec<(usize, Array2<f64>)>>>, EstimationError> {
+        let mut out = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+        for target in 0..psi_dim {
+            let base = if target == j {
+                hyper_dirs[j]
+                    .penalty_first_components()
+                    .iter()
+                    .map(|component| (component.penalty_index, component.matrix.clone()))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let mut row = base;
+            for i in 0..psi_dim {
+                let amp = psi[i];
+                if amp == 0.0 {
+                    continue;
                 }
+                let extra = hyper_dirs[j].penalty_second_components_for(i).or_else(|| {
+                    hyper_dirs
+                        .get(i)
+                        .and_then(|dir| dir.penalty_second_components_for(j))
+                });
+                row = Self::sum_penalty_components(p, &[], Some(extra.unwrap_or(&[])), amp)?
+                    .into_iter()
+                    .fold(row, |mut acc, (penalty_index, matrix)| {
+                        if let Some((_, existing)) = acc
+                            .iter_mut()
+                            .find(|(existing_index, _)| *existing_index == penalty_index)
+                        {
+                            *existing += &matrix;
+                        } else {
+                            acc.push((penalty_index, matrix));
+                        }
+                        acc
+                    });
             }
-            return total;
+            out[target] = row;
         }
-        if let Some(k) = hyper_dirs[i].penalty_index {
-            if hyper_dirs[j].penalty_index == Some(k) && k < rho.len() {
-                return s_tau_tau_t[i][j].mapv(|v| rho[k].exp() * v);
-            }
-            if hyper_dirs[j].penalty_index.is_none() && k < rho.len() {
-                return s_tau_tau_t[i][j].mapv(|v| rho[k].exp() * v);
-            }
-            return Array2::<f64>::zeros(s_tau_tau_t[i][j].raw_dim());
-        }
-        if let Some(k) = hyper_dirs[j].penalty_index {
-            if hyper_dirs[i].penalty_index.is_none() && k < rho.len() {
-                return s_tau_tau_t[i][j].mapv(|v| rho[k].exp() * v);
-            }
-            return Array2::<f64>::zeros(s_tau_tau_t[i][j].raw_dim());
-        }
-        // Backward-compat mode: already assembled total derivative.
-        s_tau_tau_t[i][j].clone()
+        Ok(Some(out))
     }
 
     fn relinearized_hyper_dirs(
         hyper_dirs: &[DirectionalHyperParam],
         psi: &Array1<f64>,
-    ) -> Vec<DirectionalHyperParam> {
+        p: usize,
+    ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
         let psi_dim = hyper_dirs.len();
         let mut out = Vec::with_capacity(psi_dim);
         for j in 0..psi_dim {
             let mut x_j = hyper_dirs[j].x_tau_original.clone();
-            let mut s_j = hyper_dirs[j].s_tau_original.clone();
+            let mut s_j = hyper_dirs[j]
+                .penalty_first_components()
+                .iter()
+                .map(|component| (component.penalty_index, component.matrix.clone()))
+                .collect::<Vec<_>>();
             for i in 0..psi_dim {
                 let amp = psi[i];
                 if amp == 0.0 {
@@ -124,21 +146,114 @@ impl<'a> RemlState<'a> {
                 if let Some(x_ji) = Self::get_pairwise_second_derivative(hyper_dirs, j, i, true) {
                     x_j.scaled_add(amp, x_ji);
                 }
-                if let Some(s_ji) = Self::get_pairwise_second_derivative(hyper_dirs, j, i, false) {
-                    s_j.scaled_add(amp, s_ji);
-                }
+                let extra = hyper_dirs[j].penalty_second_components_for(i).or_else(|| {
+                    hyper_dirs
+                        .get(i)
+                        .and_then(|dir| dir.penalty_second_components_for(j))
+                });
+                s_j = Self::sum_penalty_components(p, &[], Some(extra.unwrap_or(&[])), amp)?
+                    .into_iter()
+                    .fold(s_j, |mut acc, (penalty_index, matrix)| {
+                        if let Some((_, existing)) = acc
+                            .iter_mut()
+                            .find(|(existing_index, _)| *existing_index == penalty_index)
+                        {
+                            existing.scaled_add(1.0, &matrix);
+                        } else {
+                            acc.push((penalty_index, matrix));
+                        }
+                        acc
+                    });
             }
-            out.push(DirectionalHyperParam {
-                penalty_index: hyper_dirs[j].penalty_index,
-                x_tau_original: x_j,
-                s_tau_original: s_j,
-                s_tau_original_components: hyper_dirs[j].s_tau_original_components.clone(),
-                x_tau_tau_original: hyper_dirs[j].x_tau_tau_original.clone(),
-                s_tau_tau_original: hyper_dirs[j].s_tau_tau_original.clone(),
-                s_tau_tau_original_components: hyper_dirs[j].s_tau_tau_original_components.clone(),
-            });
+            out.push(DirectionalHyperParam::new(
+                x_j,
+                s_j,
+                hyper_dirs[j].x_tau_tau_original.clone(),
+                Self::relinearized_penalty_second_components(hyper_dirs, psi, j, psi_dim, p)?,
+            )?);
         }
-        out
+        Ok(out)
+    }
+
+    fn get_pairwise_second_penalty_component(
+        hyper_dirs: &[DirectionalHyperParam],
+        i: usize,
+        j: usize,
+        penalty_index: usize,
+        p: usize,
+    ) -> Array2<f64> {
+        if let Some(component) = hyper_dirs
+            .get(i)
+            .and_then(|dir| dir.penalty_second_components_for(j))
+            .map(|_| hyper_dirs[i].penalty_second_component_matrix(j, penalty_index, p))
+        {
+            if component.iter().any(|v| *v != 0.0) {
+                return component;
+            }
+        }
+        hyper_dirs
+            .get(j)
+            .map(|dir| dir.penalty_second_component_matrix(i, penalty_index, p))
+            .unwrap_or_else(|| Array2::<f64>::zeros((p, p)))
+    }
+
+    fn add_penalty_components_to_state(
+        s_mod: &mut [Array2<f64>],
+        components: &[PenaltyDerivativeComponent],
+        amp: f64,
+    ) -> Result<(), EstimationError> {
+        for component in components {
+            if component.penalty_index >= s_mod.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "penalty_index {} out of bounds for {} penalties",
+                    component.penalty_index,
+                    s_mod.len()
+                )));
+            }
+            s_mod[component.penalty_index].scaled_add(amp, &component.matrix);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_penalty_component_shapes(
+        components: &[PenaltyDerivativeComponent],
+        p: usize,
+        label: &str,
+    ) -> Result<(), EstimationError> {
+        for component in components {
+            if component.matrix.nrows() != p || component.matrix.ncols() != p {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{} shape mismatch for penalty {}: expected {}x{}, got {}x{}",
+                    label,
+                    component.penalty_index,
+                    p,
+                    p,
+                    component.matrix.nrows(),
+                    component.matrix.ncols()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn transform_penalty_components(
+        components: &[PenaltyDerivativeComponent],
+        qs: &Array2<f64>,
+        free_basis_opt: Option<&Array2<f64>>,
+    ) -> Vec<PenaltyDerivativeComponent> {
+        components
+            .iter()
+            .map(|component| {
+                let mut transformed = qs.t().dot(&component.matrix).dot(qs);
+                if let Some(z) = free_basis_opt {
+                    transformed = z.t().dot(&transformed).dot(z);
+                }
+                PenaltyDerivativeComponent {
+                    penalty_index: component.penalty_index,
+                    matrix: transformed,
+                }
+            })
+            .collect()
     }
 
     fn get_pairwise_second_derivative<'b>(
@@ -153,10 +268,7 @@ impl<'a> RemlState<'a> {
                 .and_then(|d| d.x_tau_tau_original.as_ref())
                 .and_then(|v| v.get(j))
         } else {
-            hyper_dirs
-                .get(i)
-                .and_then(|d| d.s_tau_tau_original.as_ref())
-                .and_then(|v| v.get(j))
+            None
         };
         if from_i.is_some() {
             return from_i;
@@ -167,10 +279,7 @@ impl<'a> RemlState<'a> {
                 .and_then(|d| d.x_tau_tau_original.as_ref())
                 .and_then(|v| v.get(i))
         } else {
-            hyper_dirs
-                .get(j)
-                .and_then(|d| d.s_tau_tau_original.as_ref())
-                .and_then(|v| v.get(i))
+            None
         }
     }
 
@@ -196,16 +305,21 @@ impl<'a> RemlState<'a> {
             )));
         }
         for (j, dir) in hyper_dirs.iter().enumerate() {
-            if let Some(k) = dir.penalty_index
-                && k >= self.s_full_list.len()
-            {
-                return Err(EstimationError::InvalidInput(format!(
-                    "penalty_index {} out of bounds for {} penalties (dir {})",
-                    k,
-                    self.s_full_list.len(),
-                    j
-                )));
+            for component in dir.penalty_first_components() {
+                if component.penalty_index >= self.s_full_list.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "penalty_index {} out of bounds for {} penalties (dir {})",
+                        component.penalty_index,
+                        self.s_full_list.len(),
+                        j
+                    )));
+                }
             }
+            Self::validate_penalty_component_shapes(
+                dir.penalty_first_components(),
+                self.p,
+                &format!("S_tau[{j}]"),
+            )?;
             if let Some(x2) = dir.x_tau_tau_original.as_ref() {
                 if x2.len() != psi_dim {
                     return Err(EstimationError::InvalidInput(format!(
@@ -226,7 +340,7 @@ impl<'a> RemlState<'a> {
                     }
                 }
             }
-            if let Some(s2) = dir.s_tau_tau_original.as_ref() {
+            if let Some(s2) = dir.penalty_second_components.as_ref() {
                 if s2.len() != psi_dim {
                     return Err(EstimationError::InvalidInput(format!(
                         "S_tau_tau[{j}] length mismatch: expected {}, got {}",
@@ -234,16 +348,12 @@ impl<'a> RemlState<'a> {
                         s2.len()
                     )));
                 }
-                for (i, s_ij) in s2.iter().enumerate() {
-                    if s_ij.nrows() != self.p || s_ij.ncols() != self.p {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "S_tau_tau[{j}][{i}] shape mismatch: expected {}x{}, got {}x{}",
-                            self.p,
-                            self.p,
-                            s_ij.nrows(),
-                            s_ij.ncols()
-                        )));
-                    }
+                for (i, components) in s2.iter().enumerate() {
+                    Self::validate_penalty_component_shapes(
+                        components,
+                        self.p,
+                        &format!("S_tau_tau[{j}][{i}]"),
+                    )?;
                 }
             }
         }
@@ -296,32 +406,15 @@ impl<'a> RemlState<'a> {
                     dir.x_tau_original.ncols()
                 )));
             }
-            if dir.s_tau_original.nrows() != self.p || dir.s_tau_original.ncols() != self.p {
-                return Err(EstimationError::InvalidInput(format!(
-                    "joint perturbation S_tau shape mismatch: expected {}x{}, got {}x{}",
-                    self.p,
-                    self.p,
-                    dir.s_tau_original.nrows(),
-                    dir.s_tau_original.ncols()
-                )));
-            }
+            Self::validate_penalty_component_shapes(
+                dir.penalty_first_components(),
+                self.p,
+                "joint perturbation S_tau",
+            )?;
             if let Some(x_mod) = x_mod_dense.as_mut() {
                 x_mod.scaled_add(amp, &dir.x_tau_original);
             }
-            if let Some(k) = dir.penalty_index {
-                if k >= s_mod.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "penalty_index {} out of bounds for {} penalties",
-                        k,
-                        s_mod.len()
-                    )));
-                }
-                s_mod[k].scaled_add(amp, &dir.s_tau_original);
-            } else {
-                for s_k in s_mod.iter_mut() {
-                    s_k.scaled_add(amp, &dir.s_tau_original);
-                }
-            }
+            Self::add_penalty_components_to_state(&mut s_mod, dir.penalty_first_components(), amp)?;
         }
         // Optional nonlinear tau parameterization:
         //   X(psi) += 0.5 * sum_{i,j} psi_i psi_j X_{ij},
@@ -344,22 +437,20 @@ impl<'a> RemlState<'a> {
                 {
                     x_mod.scaled_add(amp, x_ij);
                 }
-                if let Some(s_ij) = Self::get_pairwise_second_derivative(hyper_dirs, i, j, false) {
-                    if let Some(k) = hyper_dirs[i].penalty_index {
-                        if k >= s_mod.len() {
-                            return Err(EstimationError::InvalidInput(format!(
-                                "penalty_index {} out of bounds for {} penalties",
-                                k,
-                                s_mod.len()
-                            )));
-                        }
-                        s_mod[k].scaled_add(amp, s_ij);
-                    } else {
-                        for s_k in s_mod.iter_mut() {
-                            s_k.scaled_add(amp, s_ij);
-                        }
+                let mut second_components = Vec::<PenaltyDerivativeComponent>::new();
+                for penalty_index in 0..s_mod.len() {
+                    let matrix = Self::get_pairwise_second_penalty_component(
+                        hyper_dirs,
+                        i,
+                        j,
+                        penalty_index,
+                        self.p,
+                    );
+                    if matrix.iter().any(|v| *v != 0.0) {
+                        second_components.push(PenaltyDerivativeComponent { penalty_index, matrix });
                     }
                 }
+                Self::add_penalty_components_to_state(&mut s_mod, &second_components, amp)?;
             }
         }
         let x_mod = x_mod_dense
@@ -403,7 +494,7 @@ impl<'a> RemlState<'a> {
         let blocks = JointHyperThetaBlocks::new(theta, rho_dim);
         let rho = blocks.rho_owned();
         let psi = blocks.psi_owned();
-        let eff_dirs = Self::relinearized_hyper_dirs(hyper_dirs, &psi);
+        let eff_dirs = Self::relinearized_hyper_dirs(hyper_dirs, &psi, self.p)?;
         let (cost, rho_grad, psi_grad) = if psi_dim > 0 {
             let pert_state = self.build_joint_perturbed_state(&psi, hyper_dirs)?;
             let bundle = pert_state.obtain_eval_bundle(&rho)?;
@@ -426,8 +517,9 @@ impl<'a> RemlState<'a> {
 
     pub(super) fn compute_mixed_rho_tau_block(
         &self,
+        pert_state: &RemlState<'a>,
         rho: &Array1<f64>,
-        psi: &Array1<f64>,
+        bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<Array2<f64>, EstimationError> {
         let k_count = rho.len();
@@ -470,12 +562,10 @@ impl<'a> RemlState<'a> {
         //   H B_{k,tau} = -(H_tau B_k + A_k beta_tau + A_{k,tau} beta).
         //
         // This removes the previous FD-in-(tau amplitude) mixed block path.
-        let pert_state = self.build_joint_perturbed_state(psi, hyper_dirs)?;
-        let bundle = pert_state.obtain_eval_bundle(rho)?;
         for j in 0..psi_dim {
             let col = pert_state.compute_mixed_rho_tau_column_analytic_with_bundle(
                 rho,
-                &bundle,
+                bundle,
                 &hyper_dirs[j],
             )?;
             mixed.column_mut(j).assign(&col);
@@ -558,10 +648,6 @@ impl<'a> RemlState<'a> {
         let mut h_eff_eval = bundle.h_eff.as_ref().clone();
         let mut h_total_eval = bundle.h_total.as_ref().clone();
         let mut x_tau_t = hyper_dir.x_tau_original.dot(&reparam_result.qs);
-        let mut s_tau_t = {
-            let tmp = reparam_result.qs.t().dot(&hyper_dir.s_tau_original);
-            tmp.dot(&reparam_result.qs)
-        };
 
         if let Some(z) = free_basis_opt.as_ref() {
             beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
@@ -574,17 +660,30 @@ impl<'a> RemlState<'a> {
             h_eff_eval = Self::project_with_basis(bundle.h_eff.as_ref(), z);
             h_total_eval = Self::project_with_basis(bundle.h_total.as_ref(), z);
             x_tau_t = x_tau_t.dot(z);
-            s_tau_t = {
-                let tmp = z.t().dot(&s_tau_t);
-                tmp.dot(z)
-            };
         }
-        let s_tau_total_t = self.penalty_first_total(rho, hyper_dir, &s_tau_t);
-
         let p_dim = beta_eval.len();
         if p_dim == 0 {
             return Ok(out);
         }
+        let penalty_first_components_t = Self::transform_penalty_components(
+            hyper_dir.penalty_first_components(),
+            &reparam_result.qs,
+            free_basis_opt.as_ref(),
+        );
+        let s_tau_total_t = penalty_first_components_t.iter().try_fold(
+            Array2::<f64>::zeros((p_dim, p_dim)),
+            |mut acc, component| {
+                if component.penalty_index >= rho.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "penalty_index {} out of bounds for rho dimension {}",
+                        component.penalty_index,
+                        rho.len()
+                    )));
+                }
+                acc.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+                Ok(acc)
+            },
+        )?;
         if x_eval.ncols() != p_dim || x_tau_t.ncols() != p_dim {
             return Err(EstimationError::InvalidInput(format!(
                 "mixed rho-tau analytic shape mismatch: X={}x{}, X_tau={}x{}, p={}",
@@ -607,6 +706,10 @@ impl<'a> RemlState<'a> {
         // 1) Prefer objective-consistent positive-subspace solve H_+^dagger = W W^T.
         // 2) Fall back to stabilized direct factor solve only when active-subspace diagnostics
         //    are unstable or H_+ factor construction fails in current coordinates.
+        // Near a hard threshold crossing we deliberately stop reusing the
+        // positive-part spectral inverse for IFT solves: that inverse matches
+        // the branch-local truncated-logdet surface, but the branch itself is
+        // no longer stable enough to treat as exact.
         let prefer_h_pos = !bundle.active_subspace_unstable;
         let h_pos_w_for_solve = if prefer_h_pos {
             if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == p_dim {
@@ -844,15 +947,11 @@ impl<'a> RemlState<'a> {
         for k in 0..k_count {
             let b_k = b_k_mat.column(k).to_owned();
             let a_k = &a_k_mats[k];
-            let a_k_tau = if let Some(pk) = hyper_dir.penalty_index {
-                if pk == k {
-                    s_tau_t.mapv(|v| lambdas[k] * v)
-                } else {
-                    Array2::<f64>::zeros(s_tau_t.raw_dim())
-                }
-            } else {
-                s_tau_t.mapv(|v| lambdas[k] * v)
-            };
+            let a_k_tau = penalty_first_components_t
+                .iter()
+                .find(|component| component.penalty_index == k)
+                .map(|component| component.matrix.mapv(|v| lambdas[k] * v))
+                .unwrap_or_else(|| Array2::<f64>::zeros((p_dim, p_dim)));
             // B_{k,τ} solve:
             //   H B_{k,τ} = -(H_τ B_k + A_k β_τ + A_{k,τ} β).
             let rhs_bktau = -(&h_tau.dot(&b_k) + &a_k.dot(&beta_tau) + &a_k_tau.dot(&beta_eval));
@@ -896,8 +995,9 @@ impl<'a> RemlState<'a> {
 
     pub(super) fn compute_tau_tau_block(
         &self,
+        pert_state: &RemlState<'a>,
         rho: &Array1<f64>,
-        psi: &Array1<f64>,
+        bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<Array2<f64>, EstimationError> {
         let psi_dim = hyper_dirs.len();
@@ -932,9 +1032,6 @@ impl<'a> RemlState<'a> {
         //   - implicit partition recursion for β̂_{...},
         //   - total-derivative partition expansion for H(β̂(θ),θ),
         //   - partition logdet formula for D^m log|H|_+ and D^m log|S|_+.
-        let pert_state = self.build_joint_perturbed_state(psi, hyper_dirs)?;
-        let bundle = pert_state.obtain_eval_bundle(rho)?;
-
         let pirls_result = bundle.pirls_result.as_ref();
         let reparam_result = &pirls_result.reparam_result;
         let free_basis_opt = pert_state.active_constraint_free_basis(pirls_result);
@@ -948,26 +1045,14 @@ impl<'a> RemlState<'a> {
         let mut h_eff_eval = bundle.h_eff.as_ref().clone();
         let mut h_total_eval = bundle.h_total.as_ref().clone();
         let mut x_tau_t = Vec::<Array2<f64>>::with_capacity(psi_dim);
-        let mut s_tau_t = Vec::<Array2<f64>>::with_capacity(psi_dim);
         for dir in hyper_dirs {
             x_tau_t.push(dir.x_tau_original.dot(&reparam_result.qs));
-            let tmp = reparam_result.qs.t().dot(&dir.s_tau_original);
-            s_tau_t.push(tmp.dot(&reparam_result.qs));
         }
         let mut x_tau_tau_t = vec![vec![Array2::<f64>::zeros(x_eval.raw_dim()); psi_dim]; psi_dim];
-        let mut s_tau_tau_t =
-            vec![
-                vec![Array2::<f64>::zeros((h_eff_eval.nrows(), h_eff_eval.ncols())); psi_dim];
-                psi_dim
-            ];
         for i in 0..psi_dim {
             for j in 0..psi_dim {
                 if let Some(x_ij) = Self::get_pairwise_second_derivative(hyper_dirs, i, j, true) {
                     x_tau_tau_t[i][j] = x_ij.dot(&reparam_result.qs);
-                }
-                if let Some(s_ij) = Self::get_pairwise_second_derivative(hyper_dirs, i, j, false) {
-                    let tmp = reparam_result.qs.t().dot(s_ij);
-                    s_tau_tau_t[i][j] = tmp.dot(&reparam_result.qs);
                 }
             }
         }
@@ -978,14 +1063,10 @@ impl<'a> RemlState<'a> {
             h_total_eval = Self::project_with_basis(bundle.h_total.as_ref(), z);
             for j in 0..psi_dim {
                 x_tau_t[j] = x_tau_t[j].dot(z);
-                let tmp = z.t().dot(&s_tau_t[j]);
-                s_tau_t[j] = tmp.dot(z);
             }
             for i in 0..psi_dim {
                 for j in 0..psi_dim {
                     x_tau_tau_t[i][j] = x_tau_tau_t[i][j].dot(z);
-                    let tmp = z.t().dot(&s_tau_tau_t[i][j]);
-                    s_tau_tau_t[i][j] = tmp.dot(z);
                 }
             }
         }
@@ -1004,6 +1085,8 @@ impl<'a> RemlState<'a> {
         // Single-inverse doctrine for analytic tau-tau:
         // use the same positive-subspace generalized inverse used by log|H|_+.
         // This keeps all IFT solves and trace contractions on one objective-consistent surface.
+        // Same policy as above: use H_+^dagger only while the retained
+        // eigenspace is stably separated from the dropped spectrum.
         let prefer_h_pos = !bundle.active_subspace_unstable;
         let h_pos_w_for_solve = if prefer_h_pos {
             if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == p_dim {
@@ -1131,13 +1214,51 @@ impl<'a> RemlState<'a> {
         let d = &pirls_result.solve_d_array;
         let w_diag = &pirls_result.solve_weights;
         let lambdas = rho.mapv(f64::exp);
-        let a_tau: Vec<Array2<f64>> = (0..psi_dim)
-            .map(|j| self.penalty_first_total(rho, &hyper_dirs[j], &s_tau_t[j]))
+        let transformed_first_components: Vec<Vec<PenaltyDerivativeComponent>> = hyper_dirs
+            .iter()
+            .map(|dir| {
+                Self::transform_penalty_components(
+                    dir.penalty_first_components(),
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                )
+            })
+            .collect();
+        let a_tau: Vec<Array2<f64>> = transformed_first_components
+            .iter()
+            .map(|components| {
+                components.iter().fold(Array2::<f64>::zeros((p_dim, p_dim)), |mut acc, component| {
+                    acc.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+                    acc
+                })
+            })
             .collect();
         let mut a_tau_tau = vec![vec![Array2::<f64>::zeros((p_dim, p_dim)); psi_dim]; psi_dim];
         for i in 0..psi_dim {
             for j in 0..psi_dim {
-                a_tau_tau[i][j] = self.penalty_second_total(rho, i, j, hyper_dirs, &s_tau_tau_t);
+                let mut total = Array2::<f64>::zeros((p_dim, p_dim));
+                for penalty_index in 0..rho.len() {
+                    let mat = Self::transform_penalty_components(
+                        &[PenaltyDerivativeComponent {
+                            penalty_index,
+                            matrix: Self::get_pairwise_second_penalty_component(
+                                hyper_dirs,
+                                i,
+                                j,
+                                penalty_index,
+                                self.p,
+                            ),
+                        }],
+                        &reparam_result.qs,
+                        free_basis_opt.as_ref(),
+                    );
+                    if let Some(component) = mat.first() {
+                        if component.matrix.iter().any(|v| *v != 0.0) {
+                            total.scaled_add(rho[penalty_index].exp(), &component.matrix);
+                        }
+                    }
+                }
+                a_tau_tau[i][j] = total;
             }
         }
         let firth_op = if firth_logit_active {
@@ -1395,15 +1516,16 @@ impl<'a> RemlState<'a> {
         let blocks = JointHyperThetaBlocks::new(theta, rho_dim);
         let rho = blocks.rho_owned();
         let psi = blocks.psi_owned();
-        let eff_dirs = Self::relinearized_hyper_dirs(hyper_dirs, &psi);
+        let eff_dirs = Self::relinearized_hyper_dirs(hyper_dirs, &psi, self.p)?;
         let (h_rr, h_rtau, h_tt) = if psi_dim > 0 {
             let pert_state = self.build_joint_perturbed_state(&psi, hyper_dirs)?;
+            let bundle = pert_state.obtain_eval_bundle(&rho)?;
             (
                 // Joint block assembly is kept fully analytic/objective-consistent.
                 // Do not route through FD fallback policy here.
                 pert_state.compute_laml_hessian_exact(&rho)?,
-                self.compute_mixed_rho_tau_block(&rho, &psi, &eff_dirs)?,
-                self.compute_tau_tau_block(&rho, &psi, &eff_dirs)?,
+                self.compute_mixed_rho_tau_block(&pert_state, &rho, &bundle, &eff_dirs)?,
+                self.compute_tau_tau_block(&pert_state, &rho, &bundle, &eff_dirs)?,
             )
         } else {
             (
@@ -1494,10 +1616,6 @@ impl<'a> RemlState<'a> {
         let mut e_eval = reparam_result.e_transformed.clone();
 
         let mut x_psi_t = hyper_dir.x_tau_original.dot(&reparam_result.qs);
-        let mut s_psi_t = {
-            let tmp = reparam_result.qs.t().dot(&hyper_dir.s_tau_original);
-            tmp.dot(&reparam_result.qs)
-        };
 
         if let Some(z) = free_basis_opt.as_ref() {
             h_eff_eval = Self::project_with_basis(bundle.h_eff.as_ref(), z);
@@ -1507,11 +1625,26 @@ impl<'a> RemlState<'a> {
             x_transformed_eval = DesignMatrix::Dense(x_dense_arc.as_ref().dot(z));
             e_eval = reparam_result.e_transformed.dot(z);
             x_psi_t = x_psi_t.dot(z);
-            s_psi_t = {
-                let tmp = z.t().dot(&s_psi_t);
-                tmp.dot(z)
-            };
         }
+        let transformed_penalty_components = Self::transform_penalty_components(
+            hyper_dir.penalty_first_components(),
+            &reparam_result.qs,
+            free_basis_opt.as_ref(),
+        );
+        let s_psi_t = transformed_penalty_components.iter().try_fold(
+            Array2::<f64>::zeros((beta_eval.len(), beta_eval.len())),
+            |mut acc, component| {
+                if component.penalty_index >= rho.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "penalty_index {} out of bounds for rho dimension {}",
+                        component.penalty_index,
+                        rho.len()
+                    )));
+                }
+                acc.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+                Ok(acc)
+            },
+        )?;
 
         if x_psi_t.nrows() != self.y.len() || x_psi_t.ncols() != beta_eval.len() {
             return Err(EstimationError::InvalidInput(format!(
@@ -1531,7 +1664,7 @@ impl<'a> RemlState<'a> {
                 s_psi_t.ncols()
             )));
         }
-        let s_psi_total_t = self.penalty_first_total(rho, hyper_dir, &s_psi_t);
+        let s_psi_total_t = s_psi_t.clone();
         let x_dense_arc = x_transformed_eval.to_dense_arc();
         let x_dense = x_dense_arc.as_ref();
         let firth_op = if firth_logit_active {

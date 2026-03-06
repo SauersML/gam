@@ -4974,8 +4974,7 @@ fn radial_log_power_derivatives(c: f64, e: f64, a: f64, b: f64, r: f64) -> (f64,
     let log_r = rr.ln();
     let value = c * rr.powf(e) * (a * log_r + b);
     let first = c * rr.powf(e - 1.0) * (e * (a * log_r + b) + a);
-    let second =
-        c * rr.powf(e - 2.0) * (e * (e - 1.0) * (a * log_r + b) + (2.0 * e - 1.0) * a);
+    let second = c * rr.powf(e - 2.0) * (e * (e - 1.0) * (a * log_r + b) + (2.0 * e - 1.0) * a);
     (value, first, second)
 }
 
@@ -5167,8 +5166,14 @@ fn duchon_radial_jets(
     let mut out = DuchonRadialJets::default();
 
     // Value path keeps the intrinsic diagonal convention used by the actual basis.
-    out.phi =
-        duchon_matern_kernel_general_from_distance(r, length_scale, p_order, s_order, k_dim, Some(coeffs))?;
+    out.phi = duchon_matern_kernel_general_from_distance(
+        r,
+        length_scale,
+        p_order,
+        s_order,
+        k_dim,
+        Some(coeffs),
+    )?;
     if !out.phi.is_finite() {
         return Err(BasisError::InvalidInput(format!(
             "non-finite Duchon radial kernel value at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
@@ -5290,13 +5295,13 @@ fn duchon_radial_core_psi_triplet(
         // which is the form used here because phi_rr is already available from
         // ell = Δphi = phi_rr + (d-1) q.
         let g_psi = (delta + 1.0) * g + phi_rr;
-        let g_psi_psi =
-            (delta + 2.0) * (delta + 2.0) * jets.q + (2.0 * delta + 5.0) * r * jets.q_r
-                + r * r * jets.q_rr;
+        let g_psi_psi = (delta + 2.0) * (delta + 2.0) * jets.q
+            + (2.0 * delta + 5.0) * r * jets.q_r
+            + r * r * jets.q_rr;
         let lap_psi = (delta + 2.0) * jets.lap + r * jets.lap_r;
-        let lap_psi_psi =
-            (delta + 2.0) * (delta + 2.0) * jets.lap + (2.0 * delta + 5.0) * r * jets.lap_r
-                + r * r * jets.lap_rr;
+        let lap_psi_psi = (delta + 2.0) * (delta + 2.0) * jets.lap
+            + (2.0 * delta + 5.0) * r * jets.lap_r
+            + r * r * jets.lap_rr;
         debug_assert!(
             ((delta * phi + r * phi_r) - phi_psi).abs() < 1e-7_f64.max(1e-7_f64 * phi.abs())
         );
@@ -5405,7 +5410,8 @@ fn build_duchon_design_psi_derivatives_with_workspace(
     let s_order = spec.power;
     let kappa = 1.0 / spec.length_scale;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
-    let z_kernel = kernel_constraint_nullspace(centers.view(), spec.nullspace_order, &mut workspace.cache)?;
+    let z_kernel =
+        kernel_constraint_nullspace(centers.view(), spec.nullspace_order, &mut workspace.cache)?;
     let (data_center_r, _) = spatial_distance_matrices(data, centers.view(), &mut workspace.cache)?;
     let n = data.nrows();
     let k = centers.nrows();
@@ -5433,8 +5439,12 @@ fn build_duchon_design_psi_derivatives_with_workspace(
     let total_cols = kernel_cols + poly_cols;
     let mut out_psi = Array2::<f64>::zeros((n, total_cols));
     let mut out_psi_psi = Array2::<f64>::zeros((n, total_cols));
-    out_psi.slice_mut(s![.., 0..kernel_cols]).assign(&kernel_psi);
-    out_psi_psi.slice_mut(s![.., 0..kernel_cols]).assign(&kernel_psi_psi);
+    out_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&kernel_psi);
+    out_psi_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&kernel_psi_psi);
     if let Some(zf) = duchon_frozen_transform_for_derivatives(&spec.identifiability)? {
         if total_cols != zf.nrows() {
             return Err(BasisError::DimensionMismatch(format!(
@@ -5474,7 +5484,8 @@ fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
     let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
     let s_order = spec.power;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / spec.length_scale);
-    let z_kernel = kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
+    let z_kernel =
+        kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
     let mut d0_raw = Array2::<f64>::zeros((p, p));
     let mut d1_raw = Array2::<f64>::zeros((p * d, p));
     let mut d2_raw = Array2::<f64>::zeros((p, p));
@@ -5535,12 +5546,24 @@ fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
     d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel);
     d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
     d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
-    d0_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel_psi);
-    d1_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel_psi);
-    d2_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel_psi);
-    d0_psi_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel_psi_psi);
-    d1_psi_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel_psi_psi);
-    d2_psi_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel_psi_psi);
+    d0_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d0_kernel_psi);
+    d1_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d1_kernel_psi);
+    d2_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d2_kernel_psi);
+    d0_psi_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d0_kernel_psi_psi);
+    d1_psi_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d1_kernel_psi_psi);
+    d2_psi_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&d2_kernel_psi_psi);
     if poly_cols > 0 {
         d0.slice_mut(s![.., kernel_cols..]).assign(&poly);
     }
@@ -5569,13 +5592,22 @@ fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
         d1_psi_psi = fast_ab(&d1_psi_psi, zf);
         d2_psi_psi = fast_ab(&d2_psi_psi, zf);
     }
-    let (s0, s0_psi, s0_psi_psi) = gram_and_psi_derivatives_from_operator(&d0, &d0_psi, &d0_psi_psi);
-    let (s1, s1_psi, s1_psi_psi) = gram_and_psi_derivatives_from_operator(&d1, &d1_psi, &d1_psi_psi);
-    let (s2, s2_psi, s2_psi_psi) = gram_and_psi_derivatives_from_operator(&d2, &d2_psi, &d2_psi_psi);
-    let (_s0n, s0n_psi, s0n_psi_psi, _c0) = normalize_penalty_with_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
-    let (_s1n, s1n_psi, s1n_psi_psi, _c1) = normalize_penalty_with_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
-    let (_s2n, s2n_psi, s2n_psi_psi, _c2) = normalize_penalty_with_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
-    Ok((vec![s0n_psi, s1n_psi, s2n_psi], vec![s0n_psi_psi, s1n_psi_psi, s2n_psi_psi]))
+    let (s0, s0_psi, s0_psi_psi) =
+        gram_and_psi_derivatives_from_operator(&d0, &d0_psi, &d0_psi_psi);
+    let (s1, s1_psi, s1_psi_psi) =
+        gram_and_psi_derivatives_from_operator(&d1, &d1_psi, &d1_psi_psi);
+    let (s2, s2_psi, s2_psi_psi) =
+        gram_and_psi_derivatives_from_operator(&d2, &d2_psi, &d2_psi_psi);
+    let (_s0n, s0n_psi, s0n_psi_psi, _c0) =
+        normalize_penalty_with_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
+    let (_s1n, s1n_psi, s1n_psi_psi, _c1) =
+        normalize_penalty_with_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
+    let (_s2n, s2n_psi, s2n_psi_psi, _c2) =
+        normalize_penalty_with_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
+    Ok((
+        vec![s0n_psi, s1n_psi, s2n_psi],
+        vec![s0n_psi_psi, s1n_psi_psi, s2n_psi_psi],
+    ))
 }
 
 pub fn build_duchon_basis_log_kappa_derivative(
@@ -5595,8 +5627,11 @@ pub fn build_duchon_basis_log_kappa_derivative_with_workspace(
     let base = build_duchon_basis_with_workspace(data, spec, workspace)?;
     let (design_derivative, _) =
         build_duchon_design_psi_derivatives_with_workspace(data, spec, workspace)?;
-    let (all_penalty_deriv, _) =
-        build_duchon_operator_penalty_psi_derivatives_with_workspace(centers.view(), spec, workspace)?;
+    let (all_penalty_deriv, _) = build_duchon_operator_penalty_psi_derivatives_with_workspace(
+        centers.view(),
+        spec,
+        workspace,
+    )?;
     let penalties_derivative = base
         .penalty_info
         .iter()
@@ -5604,7 +5639,9 @@ pub fn build_duchon_basis_log_kappa_derivative_with_workspace(
             PenaltySource::OperatorMass => all_penalty_deriv[0].clone(),
             PenaltySource::OperatorTension => all_penalty_deriv[1].clone(),
             PenaltySource::OperatorStiffness => all_penalty_deriv[2].clone(),
-            other => panic!("unexpected Duchon penalty source in canonical operator path: {other:?}"),
+            other => {
+                panic!("unexpected Duchon penalty source in canonical operator path: {other:?}")
+            }
         })
         .collect::<Vec<_>>();
     Ok(BasisPsiDerivativeResult {
@@ -5631,7 +5668,11 @@ pub fn build_duchon_basis_log_kappa_second_derivative_with_workspace(
     let (_, design_second_derivative) =
         build_duchon_design_psi_derivatives_with_workspace(data, spec, workspace)?;
     let (_, all_penalty_second_deriv) =
-        build_duchon_operator_penalty_psi_derivatives_with_workspace(centers.view(), spec, workspace)?;
+        build_duchon_operator_penalty_psi_derivatives_with_workspace(
+            centers.view(),
+            spec,
+            workspace,
+        )?;
     let penalties_second_derivative = base
         .penalty_info
         .iter()
@@ -5639,7 +5680,9 @@ pub fn build_duchon_basis_log_kappa_second_derivative_with_workspace(
             PenaltySource::OperatorMass => all_penalty_second_deriv[0].clone(),
             PenaltySource::OperatorTension => all_penalty_second_deriv[1].clone(),
             PenaltySource::OperatorStiffness => all_penalty_second_deriv[2].clone(),
-            other => panic!("unexpected Duchon penalty source in canonical operator path: {other:?}"),
+            other => {
+                panic!("unexpected Duchon penalty source in canonical operator path: {other:?}")
+            }
         })
         .collect::<Vec<_>>();
     Ok(BasisPsiSecondDerivativeResult {
@@ -7841,8 +7884,7 @@ mod tests {
     fn scaling_test_lap<D: DualNum<f64> + Copy>(psi: D, r: f64, eta: f64, d: f64) -> D {
         let kappa = psi.exp();
         let t = kappa * D::from(r);
-        (psi * D::from(eta + 2.0)).exp()
-            * (D::from(2.0 * d) + D::from(4.0 * d + 8.0) * t * t)
+        (psi * D::from(eta + 2.0)).exp() * (D::from(2.0 * d) + D::from(4.0 * d + 8.0) * t * t)
     }
 
     /// Independent recursive implementation of B-spline basis function evaluation.
@@ -10010,12 +10052,13 @@ mod tests {
         let (design_derivative, _) =
             build_duchon_design_psi_derivatives_with_workspace(data.view(), &spec, &mut workspace)
                 .expect("analytic Duchon design derivative should build");
-        let (penalties_derivative, _) = build_duchon_operator_penalty_psi_derivatives_with_workspace(
-            centers.view(),
-            &spec,
-            &mut workspace,
-        )
-        .expect("analytic Duchon penalty derivative should build");
+        let (penalties_derivative, _) =
+            build_duchon_operator_penalty_psi_derivatives_with_workspace(
+                centers.view(),
+                &spec,
+                &mut workspace,
+            )
+            .expect("analytic Duchon penalty derivative should build");
 
         let eps: f64 = 1e-6;
         let kappa = 1.0 / spec.length_scale;
@@ -10027,12 +10070,20 @@ mod tests {
         spec_minus.length_scale = ls_minus;
         let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
-        let plus_penalties =
-            build_duchon_operator_penalty_candidates(centers.view(), ls_plus, spec.power, spec.nullspace_order)
-                .expect("plus operator penalties");
-        let minus_penalties =
-            build_duchon_operator_penalty_candidates(centers.view(), ls_minus, spec.power, spec.nullspace_order)
-                .expect("minus operator penalties");
+        let plus_penalties = build_duchon_operator_penalty_candidates(
+            centers.view(),
+            ls_plus,
+            spec.power,
+            spec.nullspace_order,
+        )
+        .expect("plus operator penalties");
+        let minus_penalties = build_duchon_operator_penalty_candidates(
+            centers.view(),
+            ls_minus,
+            spec.power,
+            spec.nullspace_order,
+        )
+        .expect("minus operator penalties");
 
         let fd_design = (&plus.design - &minus.design) / (2.0 * eps);
         let design_err = (&design_derivative - &fd_design)
@@ -10049,9 +10100,9 @@ mod tests {
         assert_eq!(plus_penalties.len(), 3);
         assert_eq!(minus_penalties.len(), 3);
         for penalty_idx in 0..penalties_derivative.len() {
-            let fd_penalty =
-                (&plus_penalties[penalty_idx].matrix - &minus_penalties[penalty_idx].matrix)
-                    / (2.0 * eps);
+            let fd_penalty = (&plus_penalties[penalty_idx].matrix
+                - &minus_penalties[penalty_idx].matrix)
+                / (2.0 * eps);
             let penalty_err = (&penalties_derivative[penalty_idx] - &fd_penalty)
                 .iter()
                 .map(|v| v * v)
@@ -10106,12 +10157,20 @@ mod tests {
             spec.nullspace_order,
         )
         .expect("base operator penalties");
-        let plus_penalties =
-            build_duchon_operator_penalty_candidates(centers.view(), ls_plus, spec.power, spec.nullspace_order)
-                .expect("plus operator penalties");
-        let minus_penalties =
-            build_duchon_operator_penalty_candidates(centers.view(), ls_minus, spec.power, spec.nullspace_order)
-                .expect("minus operator penalties");
+        let plus_penalties = build_duchon_operator_penalty_candidates(
+            centers.view(),
+            ls_plus,
+            spec.power,
+            spec.nullspace_order,
+        )
+        .expect("plus operator penalties");
+        let minus_penalties = build_duchon_operator_penalty_candidates(
+            centers.view(),
+            ls_minus,
+            spec.power,
+            spec.nullspace_order,
+        )
+        .expect("minus operator penalties");
 
         let fd_design = (&plus.design - &(base.design.clone() * 2.0) + &minus.design) / (eps * eps);
         let design_err = (&design_second_derivative - &fd_design)
@@ -10129,10 +10188,10 @@ mod tests {
         assert_eq!(plus_penalties.len(), 3);
         assert_eq!(minus_penalties.len(), 3);
         for penalty_idx in 0..penalties_second_derivative.len() {
-            let fd_penalty =
-                (&plus_penalties[penalty_idx].matrix - &(base_penalties[penalty_idx].matrix.clone() * 2.0)
-                    + &minus_penalties[penalty_idx].matrix)
-                    / (eps * eps);
+            let fd_penalty = (&plus_penalties[penalty_idx].matrix
+                - &(base_penalties[penalty_idx].matrix.clone() * 2.0)
+                + &minus_penalties[penalty_idx].matrix)
+                / (eps * eps);
             let penalty_err = (&penalties_second_derivative[penalty_idx] - &fd_penalty)
                 .iter()
                 .map(|v| v * v)
@@ -10174,8 +10233,7 @@ mod tests {
         let q_psi = eta_q * q + r * q_r;
         let q_psi_psi = eta_q * eta_q * q + (2.0 * eta_q + 1.0) * r * q_r + r * r * q_rr;
         let lap_psi = eta_q * lap + r * lap_r;
-        let lap_psi_psi =
-            eta_q * eta_q * lap + (2.0 * eta_q + 1.0) * r * lap_r + r * r * lap_rr;
+        let lap_psi_psi = eta_q * eta_q * lap + (2.0 * eta_q + 1.0) * r * lap_r + r * r * lap_rr;
 
         assert!((phi_psi - phi_psi_ad).abs() < 1e-12);
         assert!((phi_psi_psi - phi_psi_psi_ad).abs() < 1e-12);
@@ -10220,10 +10278,11 @@ mod tests {
             Some(&coeffs_2),
         )
         .expect("phi_2");
-        let jets_1 = duchon_radial_jets(scaled_r, length_scale_1, p_order, s_order, k_dim, &coeffs_1)
-            .expect("jets_1");
-        let jets_2 =
-            duchon_radial_jets(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2).expect("jets_2");
+        let jets_1 =
+            duchon_radial_jets(scaled_r, length_scale_1, p_order, s_order, k_dim, &coeffs_1)
+                .expect("jets_1");
+        let jets_2 = duchon_radial_jets(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2)
+            .expect("jets_2");
 
         let phi_scale = scale.powf(delta);
         let op_scale = scale.powf(delta + 2.0);
@@ -10231,16 +10290,17 @@ mod tests {
         assert!((jets_2.q - op_scale * jets_1.q).abs() < 1e-8);
         assert!((jets_2.lap - op_scale * jets_1.lap).abs() < 1e-8);
 
-        let core = duchon_radial_core_psi_triplet(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2)
-            .expect("radial core");
+        let core =
+            duchon_radial_core_psi_triplet(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2)
+                .expect("radial core");
         let q_psi_expected = (delta + 2.0) * jets_2.q + r * jets_2.q_r;
-        let q_psi_psi_expected =
-            (delta + 2.0) * (delta + 2.0) * jets_2.q + (2.0 * delta + 5.0) * r * jets_2.q_r
-                + r * r * jets_2.q_rr;
+        let q_psi_psi_expected = (delta + 2.0) * (delta + 2.0) * jets_2.q
+            + (2.0 * delta + 5.0) * r * jets_2.q_r
+            + r * r * jets_2.q_rr;
         let lap_psi_expected = (delta + 2.0) * jets_2.lap + r * jets_2.lap_r;
-        let lap_psi_psi_expected =
-            (delta + 2.0) * (delta + 2.0) * jets_2.lap + (2.0 * delta + 5.0) * r * jets_2.lap_r
-                + r * r * jets_2.lap_rr;
+        let lap_psi_psi_expected = (delta + 2.0) * (delta + 2.0) * jets_2.lap
+            + (2.0 * delta + 5.0) * r * jets_2.lap_r
+            + r * r * jets_2.lap_rr;
 
         assert!((core.gradient_ratio.psi - q_psi_expected).abs() < 1e-10);
         assert!((core.gradient_ratio.psi_psi - q_psi_psi_expected).abs() < 1e-9);

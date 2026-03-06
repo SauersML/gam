@@ -3351,9 +3351,10 @@ impl CustomFamily for BoundedLinearFamily {
         let (_beta_user, jac_diag, _second_diag, _third_diag, _prior_third) =
             self.bounded_term_derivative_data(&block_states[0].beta);
         let mut d_offset = Array1::<f64>::zeros(self.offset.len());
-        let has_drift = self.bounded_terms.iter().any(|term| {
-            jac_diag[term.col_idx] != 0.0 && d_beta[term.col_idx] != 0.0
-        });
+        let has_drift = self
+            .bounded_terms
+            .iter()
+            .any(|term| jac_diag[term.col_idx] != 0.0 && d_beta[term.col_idx] != 0.0);
         if !has_drift {
             return Ok(Some(BlockGeometryDirectionalDerivative {
                 d_design: None,
@@ -4134,15 +4135,12 @@ fn try_build_spatial_log_kappa_hyper_dirs(
             .collect::<Vec<_>>();
         let mut s_second_components = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
         s_second_components[i] = s2_components;
-        hyper_dirs.push(DirectionalHyperParam {
-            penalty_index: None,
-            x_tau_original: info.x_psi,
-            s_tau_original: info.s_psi,
-            s_tau_original_components: Some(s_components),
-            x_tau_tau_original: Some(x_second),
-            s_tau_tau_original: Some(s_second),
-            s_tau_tau_original_components: Some(s_second_components),
-        });
+        hyper_dirs.push(DirectionalHyperParam::new(
+            info.x_psi,
+            s_components,
+            Some(x_second),
+            Some(s_second_components),
+        )?);
     }
     Ok(Some(hyper_dirs))
 }
@@ -4195,15 +4193,12 @@ fn try_exact_joint_spatial_hyper_cost_gradient_hessian(
             .collect::<Vec<_>>();
         let mut s_second_components = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
         s_second_components[i] = s2_components;
-        hyper_dirs.push(DirectionalHyperParam {
-            penalty_index: None,
-            x_tau_original: info.x_psi,
-            s_tau_original: info.s_psi,
-            s_tau_original_components: Some(s_components),
-            x_tau_tau_original: Some(x_second),
-            s_tau_tau_original: Some(s_second),
-            s_tau_tau_original_components: Some(s_second_components),
-        });
+        hyper_dirs.push(DirectionalHyperParam::new(
+            info.x_psi,
+            s_components,
+            Some(x_second),
+            Some(s_second_components),
+        )?);
     }
     let external_opts = external_opts_for_design(family, &design, options);
     let joint = compute_external_joint_hyper_cost_gradient_hessian(
@@ -5157,22 +5152,13 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
         // the stabilized spatial design representation.
         log::debug!(
             "[spatial-kappa] exact joint path unavailable for one or more spatial terms; \
-             using frozen-spec profiled fit fallback"
+             reusing baseline fit with frozen spec"
         );
-        let fallback = fit_term_collection_for_spec(
-            data,
-            y.view(),
-            weights.view(),
-            offset.view(),
-            &resolved_spec,
-            family,
-            options,
-        )?;
         return Ok(FittedTermCollectionWithSpec {
-            fit: fallback.fit,
-            design: fallback.design,
+            fit: best.fit,
+            design: best.design,
             resolved_spec,
-            adaptive_diagnostics: fallback.adaptive_diagnostics,
+            adaptive_diagnostics: best.adaptive_diagnostics,
         });
     }
 
@@ -6339,7 +6325,8 @@ mod tests {
             penalties_derivative: local_s_psi,
         } = match &term_spec.basis {
             SmoothBasisSpec::Duchon { feature_cols, spec } => {
-                let x = select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
+                let x =
+                    select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
                 build_duchon_basis_log_kappa_derivative(x.view(), spec)
                     .expect("direct Duchon derivative should build")
             }
@@ -6350,7 +6337,8 @@ mod tests {
             penalties_second_derivative: local_s_psi_psi,
         } = match &term_spec.basis {
             SmoothBasisSpec::Duchon { feature_cols, spec } => {
-                let x = select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
+                let x =
+                    select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
                 build_duchon_basis_log_kappa_second_derivative(x.view(), spec)
                     .expect("direct Duchon second derivative should build")
             }
@@ -6374,7 +6362,10 @@ mod tests {
             "exact Duchon log-kappa derivative should use only feature_cols; got {derivative:?}"
         );
         let derivative = derivative.expect("derivative call should succeed");
-        assert!(derivative.is_some(), "Duchon term should expose an exact derivative");
+        assert!(
+            derivative.is_some(),
+            "Duchon term should expose an exact derivative"
+        );
     }
 
     #[test]

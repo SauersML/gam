@@ -682,6 +682,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
 
     let spec = build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
+    let spatial_usage_warnings = collect_spatial_smooth_usage_warnings(&spec, &ds.headers, "model");
+    emit_spatial_smooth_usage_warnings("fit-start", &spatial_usage_warnings);
     if !args.no_summary {
         print_inference_summary(&inference_notes);
     }
@@ -732,7 +734,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 geometry,
                 config,
             )
-            .map_err(|e| format!("flexible-link fit failed: {e}"))?;
+            .map_err(|e| {
+                emit_spatial_smooth_usage_warnings("fit-end", &spatial_usage_warnings);
+                format!("flexible-link fit failed: {e}")
+            })?;
 
             if !args.no_summary {
                 println!(
@@ -783,6 +788,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 payload.resolved_term_spec = Some(initial_frozen_spec.clone());
                 write_payload_json(&out, payload)?;
             }
+            emit_spatial_smooth_usage_warnings("fit-end", &spatial_usage_warnings);
             return Ok(());
         }
     }
@@ -881,11 +887,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                         &SpatialLengthScaleOptimizationOptions::default(),
                     )
                     .map_err(|retry_err| {
+                        emit_spatial_smooth_usage_warnings("fit-end", &spatial_usage_warnings);
                         format!(
                             "fit_term_collection failed (SAS optimize->fixed retry also failed): initial={first_err}; retry={retry_err}"
                         )
                     })?
                 } else {
+                    emit_spatial_smooth_usage_warnings("fit-end", &spatial_usage_warnings);
                     return Err(format!("fit_term_collection failed: {first_err}"));
                 }
             }
@@ -944,6 +952,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         write_payload_json(&out, payload)?;
     }
 
+    emit_spatial_smooth_usage_warnings("fit-end", &spatial_usage_warnings);
     Ok(())
 }
 
@@ -974,6 +983,14 @@ fn run_fit_with_predict_noise(
     }
     let noise_spec = build_term_spec(&parsed_noise.terms, ds, col_map, inference_notes)?;
     let mean_spec = build_term_spec(&parsed.terms, ds, col_map, inference_notes)?;
+    let mut spatial_usage_warnings =
+        collect_spatial_smooth_usage_warnings(&mean_spec, &ds.headers, "mean model");
+    spatial_usage_warnings.extend(collect_spatial_smooth_usage_warnings(
+        &noise_spec,
+        &ds.headers,
+        "noise model",
+    ));
+    emit_spatial_smooth_usage_warnings("fit-start", &spatial_usage_warnings);
     if !args.no_summary {
         print_inference_summary(inference_notes);
     }
@@ -1002,7 +1019,10 @@ fn run_fit_with_predict_noise(
             &options,
             &SpatialLengthScaleOptimizationOptions::default(),
         )
-        .map_err(|e| format!("fit_gaussian_location_scale_terms failed: {e}"))?;
+        .map_err(|e| {
+            emit_spatial_smooth_usage_warnings("fit-end", &spatial_usage_warnings);
+            format!("fit_gaussian_location_scale_terms failed: {e}")
+        })?;
         let fit = solved.fit;
         let frozen_mean_spec =
             freeze_term_collection_spec(&solved.mean_spec_resolved, &solved.mean_design)?;
@@ -1044,6 +1064,7 @@ fn run_fit_with_predict_noise(
             );
             write_model_json(out, &model)?;
         }
+        emit_spatial_smooth_usage_warnings("fit-end", &spatial_usage_warnings);
         return Ok(());
     }
 
@@ -1108,7 +1129,11 @@ fn run_fit_with_predict_noise(
             }),
         &options,
         &SpatialLengthScaleOptimizationOptions::default(),
-    )?;
+    )
+    .map_err(|e| {
+        emit_spatial_smooth_usage_warnings("fit-end", &spatial_usage_warnings);
+        e
+    })?;
     if let (Some(knots), Some(degree)) = (solved.wiggle_knots.as_ref(), solved.wiggle_degree) {
         let final_q0 = compute_probit_q0_from_fit(&solved.fit.fit, sigma_min, sigma_max)?;
         let domain = summarize_wiggle_domain(final_q0.view(), knots.view(), degree)?;
@@ -1203,6 +1228,7 @@ fn run_fit_with_predict_noise(
         }
         write_model_json(out, &model)?;
     }
+    emit_spatial_smooth_usage_warnings("fit-end", &spatial_usage_warnings);
     Ok(())
 }
 
@@ -1785,8 +1811,7 @@ fn run_predict_binomial_location_scale(
                     [[var_t, cov_tls], [cov_tls, var_ls]],
                     |t, ls| {
                         let sigma = sigma_from_eta_scalar(ls, sigma_min, sigma_max);
-                        normal_cdf(-t / sigma.max(1e-12))
-                            .clamp(1e-10, 1.0 - 1e-10)
+                        normal_cdf(-t / sigma.max(1e-12)).clamp(1e-10, 1.0 - 1e-10)
                     },
                 )
             }))
@@ -1881,8 +1906,7 @@ fn run_predict_binomial_location_scale(
                             }
                         }
                         let denom = (1.0 + var_w.max(0.0)).sqrt().max(1e-12);
-                        Ok(normal_cdf(mean_w / denom)
-                            .clamp(1e-10, 1.0 - 1e-10))
+                        Ok(normal_cdf(mean_w / denom).clamp(1e-10, 1.0 - 1e-10))
                     },
                 )?;
             }
@@ -5298,6 +5322,83 @@ fn term_spec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
     })
 }
 
+fn spatial_basis_warning_family_and_cols(
+    term: &SmoothTermSpec,
+) -> Option<(&'static str, &[usize])> {
+    match &term.basis {
+        SmoothBasisSpec::ThinPlate { feature_cols, .. } => Some(("thinplate/tps", feature_cols)),
+        SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
+        SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
+        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => None,
+    }
+}
+
+fn collect_spatial_smooth_usage_warnings(
+    spec: &TermCollectionSpec,
+    headers: &[String],
+    label: &str,
+) -> Vec<String> {
+    let mut grouped: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for term in &spec.smooth_terms {
+        let Some((family, feature_cols)) = spatial_basis_warning_family_and_cols(term) else {
+            continue;
+        };
+        if feature_cols.len() != 1 {
+            continue;
+        }
+        let col = feature_cols[0];
+        let feature_name = headers
+            .get(col)
+            .cloned()
+            .unwrap_or_else(|| format!("#{col}"));
+        grouped.entry(family).or_default().push(feature_name);
+    }
+
+    grouped
+        .into_iter()
+        .filter_map(|(family, cols)| {
+            if cols.len() < 2 {
+                return None;
+            }
+            let example = match family {
+                "thinplate/tps" => format!("thinplate({})", cols.join(", ")),
+                "matern" => format!("matern({})", cols.join(", ")),
+                "duchon" => format!("duchon({})", cols.join(", ")),
+                _ => unreachable!("unexpected spatial basis family"),
+            };
+            let bad_example = match family {
+                "thinplate/tps" => cols
+                    .iter()
+                    .map(|col| format!("s({col}, type=tps)"))
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+                "matern" => cols
+                    .iter()
+                    .map(|col| format!("s({col}, type=matern)"))
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+                "duchon" => cols
+                    .iter()
+                    .map(|col| format!("s({col}, type=duchon)"))
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+                _ => unreachable!("unexpected spatial basis family"),
+            };
+            Some(format!(
+                "{label}: detected {} separate 1D {family} spatial smooths over [{}]. These build unrelated additive 1D smooths, not one shared spatial manifold. TIP: if you intended one spatial surface, replace `{bad_example}` with one multivariate term such as `{example}`.",
+                cols.len(),
+                cols.join(", "),
+            ))
+        })
+        .collect()
+}
+
+fn emit_spatial_smooth_usage_warnings(stage: &str, warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("WARNING [{stage}]: {warning}");
+    }
+}
+
 fn validate_frozen_term_collection_spec(
     spec: &TermCollectionSpec,
     label: &str,
@@ -7983,18 +8084,24 @@ mod tests {
         BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, LikelihoodFamily, LinkMode,
         MODEL_VERSION, ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs,
         SurvivalTimeBasisConfig, apply_saved_probit_wiggle, build_survival_time_basis,
-        chi_square_survival_approx, compute_probit_q0_from_eta, core_saved_fit_result,
-        parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
-        parse_surv_response, parse_survival_inverse_link, parse_survival_time_basis_config,
-        pretty_family_name, saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design,
-        summarize_wiggle_domain, survival_probability_from_eta,
+        chi_square_survival_approx, collect_spatial_smooth_usage_warnings,
+        compute_probit_q0_from_eta, core_saved_fit_result, parse_duchon_order, parse_duchon_power,
+        parse_formula, parse_link_choice, parse_surv_response, parse_survival_inverse_link,
+        parse_survival_time_basis_config, pretty_family_name, saved_probit_wiggle_derivative_q0,
+        saved_probit_wiggle_design, summarize_wiggle_domain, survival_probability_from_eta,
         write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
     use csv::StringRecord;
-    use gam::basis::{BasisOptions, Dense, DuchonNullspaceOrder, KnotSource, create_basis};
-    use gam::inference::data::{EncodedDataset as Dataset, UnseenCategoryPolicy, encode_records_with_schema};
+    use gam::basis::{
+        BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, KnotSource,
+        MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
+    };
+    use gam::inference::data::{
+        EncodedDataset as Dataset, UnseenCategoryPolicy, encode_records_with_schema,
+    };
     use gam::inference::model::FittedModelPayload;
     use gam::inference::model::SchemaColumn;
+    use gam::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
     use gam::types::{InverseLink, LinkComponent, LinkFunction};
     use gam::{FittedFamily, ModelKind};
     use ndarray::{Array1, ArrayView1, array};
@@ -8212,6 +8319,141 @@ mod tests {
     }
 
     #[test]
+    fn warns_for_repeated_univariate_duchon_spatial_terms() {
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![
+                SmoothTermSpec {
+                    name: "pc1".to_string(),
+                    basis: SmoothBasisSpec::Duchon {
+                        feature_cols: vec![0],
+                        spec: DuchonBasisSpec {
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                            length_scale: 1.0,
+                            power: 1,
+                            nullspace_order: DuchonNullspaceOrder::Linear,
+                            double_penalty: true,
+                            identifiability: SpatialIdentifiability::default(),
+                        },
+                    },
+                    shape: ShapeConstraint::None,
+                },
+                SmoothTermSpec {
+                    name: "pc2".to_string(),
+                    basis: SmoothBasisSpec::Duchon {
+                        feature_cols: vec![1],
+                        spec: DuchonBasisSpec {
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                            length_scale: 1.0,
+                            power: 1,
+                            nullspace_order: DuchonNullspaceOrder::Linear,
+                            double_penalty: true,
+                            identifiability: SpatialIdentifiability::default(),
+                        },
+                    },
+                    shape: ShapeConstraint::None,
+                },
+                SmoothTermSpec {
+                    name: "pc3".to_string(),
+                    basis: SmoothBasisSpec::Duchon {
+                        feature_cols: vec![2],
+                        spec: DuchonBasisSpec {
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                            length_scale: 1.0,
+                            power: 1,
+                            nullspace_order: DuchonNullspaceOrder::Linear,
+                            double_penalty: true,
+                            identifiability: SpatialIdentifiability::default(),
+                        },
+                    },
+                    shape: ShapeConstraint::None,
+                },
+            ],
+        };
+        let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
+
+        let warnings = collect_spatial_smooth_usage_warnings(&spec, &headers, "model");
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("3 separate 1D duchon spatial smooths"));
+        assert!(warnings[0].contains("[pc1, pc2, pc3]"));
+        assert!(warnings[0].contains("TIP:"));
+        assert!(warnings[0].contains("s(pc1, type=duchon) + s(pc2, type=duchon) + s(pc3, type=duchon)"));
+        assert!(warnings[0].contains("duchon(pc1, pc2, pc3)"));
+    }
+
+    #[test]
+    fn does_not_warn_for_single_multivariate_matern_spatial_term() {
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1, 2],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                        length_scale: 1.0,
+                        nu: MaternNu::ThreeHalves,
+                        double_penalty: true,
+                        include_intercept: false,
+                        identifiability: gam::basis::MaternIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
+
+        let warnings = collect_spatial_smooth_usage_warnings(&spec, &headers, "model");
+
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_for_repeated_univariate_thinplate_spatial_terms() {
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![
+                SmoothTermSpec {
+                    name: "pc1".to_string(),
+                    basis: SmoothBasisSpec::ThinPlate {
+                        feature_cols: vec![0],
+                        spec: ThinPlateBasisSpec {
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                            double_penalty: true,
+                            identifiability: SpatialIdentifiability::default(),
+                        },
+                    },
+                    shape: ShapeConstraint::None,
+                },
+                SmoothTermSpec {
+                    name: "pc2".to_string(),
+                    basis: SmoothBasisSpec::ThinPlate {
+                        feature_cols: vec![1],
+                        spec: ThinPlateBasisSpec {
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                            double_penalty: true,
+                            identifiability: SpatialIdentifiability::default(),
+                        },
+                    },
+                    shape: ShapeConstraint::None,
+                },
+            ],
+        };
+        let headers = vec!["pc1".to_string(), "pc2".to_string()];
+
+        let warnings = collect_spatial_smooth_usage_warnings(&spec, &headers, "model");
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("2 separate 1D thinplate/tps spatial smooths"));
+        assert!(warnings[0].contains("s(pc1, type=tps) + s(pc2, type=tps)"));
+        assert!(warnings[0].contains("thinplate(pc1, pc2)"));
+    }
+
+    #[test]
     fn parse_linear_term_with_box_constraints() {
         let parsed =
             parse_formula("y ~ linear(mu_hat, min=0, max=1) + nonpositive(z)").expect("formula");
@@ -8250,11 +8492,7 @@ mod tests {
         let parsed = parse_formula("y ~ x + linear(z) + nonnegative(w)").expect("formula");
         let ds = Dataset {
             headers: vec!["x".to_string(), "z".to_string(), "w".to_string()],
-            values: array![
-                [1.0, 2.0, 3.0],
-                [1.5, 2.5, 3.5],
-                [2.0, 3.0, 4.0],
-            ],
+            values: array![[1.0, 2.0, 3.0], [1.5, 2.5, 3.5], [2.0, 3.0, 4.0],],
             schema: DataSchema {
                 columns: vec![
                     SchemaColumn {
@@ -8286,9 +8524,8 @@ mod tests {
             ("w".to_string(), 2usize),
         ]);
         let mut inference_notes = Vec::<String>::new();
-        let spec =
-            super::build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)
-                .expect("term spec");
+        let spec = super::build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)
+            .expect("term spec");
 
         assert_eq!(spec.linear_terms.len(), 3);
         assert!(

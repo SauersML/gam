@@ -415,14 +415,24 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
                 };
             }
             let mu = logistic_stable(eta);
-            let d1 = if eta.is_finite() { mu * (1.0 - mu) } else { 0.0 };
-            let d2 = if eta.is_finite() { d1 * (1.0 - 2.0 * mu) } else { 0.0 };
-            let d3 = if eta.is_finite() { d1 * (1.0 - 6.0 * d1) } else { 0.0 };
+            let d1 = if eta.is_finite() {
+                mu * (1.0 - mu)
+            } else {
+                0.0
+            };
+            let d2 = if eta.is_finite() {
+                d1 * (1.0 - 2.0 * mu)
+            } else {
+                0.0
+            };
+            let d3 = if eta.is_finite() {
+                d1 * (1.0 - 6.0 * d1)
+            } else {
+                0.0
+            };
             InverseLinkJet { mu, d1, d2, d3 }
         }
-        LinkComponent::Probit => {
-            probit_jet(eta)
-        }
+        LinkComponent::Probit => probit_jet(eta),
         LinkComponent::CLogLog => {
             if eta.is_nan() {
                 return InverseLinkJet {
@@ -698,18 +708,12 @@ pub fn inverse_link_pdf_third_derivative_for_inverse_link(
     match link {
         InverseLink::Standard(LinkFunction::Identity) => Ok(0.0),
         InverseLink::Standard(LinkFunction::Probit) => Ok(probit_pdf_third_derivative(eta)),
-        InverseLink::Standard(LinkFunction::Logit) => {
-            Ok(component_inverse_link_pdf_third_derivative(
-                LinkComponent::Logit,
-                eta,
-            ))
-        }
-        InverseLink::Standard(LinkFunction::CLogLog) => {
-            Ok(component_inverse_link_pdf_third_derivative(
-                LinkComponent::CLogLog,
-                eta,
-            ))
-        }
+        InverseLink::Standard(LinkFunction::Logit) => Ok(
+            component_inverse_link_pdf_third_derivative(LinkComponent::Logit, eta),
+        ),
+        InverseLink::Standard(LinkFunction::CLogLog) => Ok(
+            component_inverse_link_pdf_third_derivative(LinkComponent::CLogLog, eta),
+        ),
         InverseLink::Standard(LinkFunction::Sas) => {
             Ok(sas_inverse_link_pdf_third_derivative(eta, 0.0, 0.0))
         }
@@ -718,9 +722,9 @@ pub fn inverse_link_pdf_third_derivative_for_inverse_link(
             state.epsilon,
             state.log_delta,
         )),
-        InverseLink::Standard(LinkFunction::BetaLogistic) => {
-            Ok(beta_logistic_inverse_link_pdf_third_derivative(eta, 0.0, 0.0))
-        }
+        InverseLink::Standard(LinkFunction::BetaLogistic) => Ok(
+            beta_logistic_inverse_link_pdf_third_derivative(eta, 0.0, 0.0),
+        ),
         InverseLink::BetaLogistic(state) => Ok(beta_logistic_inverse_link_pdf_third_derivative(
             eta,
             state.log_delta,
@@ -935,7 +939,11 @@ fn logistic_u_with_derivatives(eta: f64) -> (f64, f64) {
     let u = logistic_stable(eta);
     let u_clamped = u.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
     let clamp_active = !eta.is_finite() || u_clamped != u;
-    let du = if clamp_active { 0.0 } else { u_clamped * (1.0 - u_clamped) };
+    let du = if clamp_active {
+        0.0
+    } else {
+        u_clamped * (1.0 - u_clamped)
+    };
     let u = u_clamped;
     (u, du)
 }
@@ -967,11 +975,7 @@ pub fn beta_logistic_inverse_link_jet(eta: f64, delta: f64, epsilon: f64) -> Inv
     InverseLinkJet { mu, d1, d2, d3 }
 }
 
-pub fn beta_logistic_inverse_link_pdf_third_derivative(
-    eta: f64,
-    delta: f64,
-    epsilon: f64,
-) -> f64 {
+pub fn beta_logistic_inverse_link_pdf_third_derivative(eta: f64, delta: f64, epsilon: f64) -> f64 {
     // Beta-logistic link:
     //
     //   u = logistic(eta),
@@ -1202,11 +1206,8 @@ pub fn sas_inverse_link_pdf_third_derivative(eta: f64, epsilon: f64, log_delta: 
     let z1 = c * u1;
     let z2 = s * u1 * u1 + c * u2;
     let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
-    let z4 = s * u1.powi(4)
-        + 6.0 * c * u1 * u1 * u2
-        + 3.0 * s * u2 * u2
-        + 4.0 * s * u1 * u3
-        + c * u4;
+    let z4 =
+        s * u1.powi(4) + 6.0 * c * u1 * u1 * u2 + 3.0 * s * u2 * u2 + 4.0 * s * u1 * u3 + c * u4;
     let base4 = probit_pdf_third_derivative(z);
     let out = base4 * z1.powi(4)
         + 6.0 * base.d3 * z1 * z1 * z2
@@ -1272,7 +1273,10 @@ pub fn sas_inverse_link_jet_with_param_partials(
         InverseLinkJet {
             mu: base.d1 * z_t,
             d1: base.d2 * z_t * z1 + base.d1 * z1_t,
-            d2: base.d3 * z_t * z1 * z1 + 2.0 * base.d2 * z1 * z1_t + base.d2 * z_t * z2 + base.d1 * z2_t,
+            d2: base.d3 * z_t * z1 * z1
+                + 2.0 * base.d2 * z1 * z1_t
+                + base.d2 * z_t * z2
+                + base.d1 * z2_t,
             d3: probit_pdf_third_derivative(z) * z_t * z1.powi(3)
                 + 3.0 * base.d3 * z1 * z1 * z1_t
                 + 3.0 * base.d3 * z_t * z1 * z2

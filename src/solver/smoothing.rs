@@ -684,13 +684,15 @@ where
             options,
         ),
         SmoothingOptimizerKind::Arc => {
-            let mut objective_with_gradient_hessian =
-                |rho: &Array1<f64>| -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError> {
-                    let cost = objective(rho)?;
-                    let grad_rho =
-                        finite_diff_gradient_external(rho, options.finite_diff_step, &mut objective)?;
-                    Ok((cost, grad_rho, None))
-                };
+            let mut objective_with_gradient_hessian = |rho: &Array1<f64>| -> Result<
+                (f64, Array1<f64>, Option<Array2<f64>>),
+                EstimationError,
+            > {
+                let cost = objective(rho)?;
+                let grad_rho =
+                    finite_diff_gradient_external(rho, options.finite_diff_step, &mut objective)?;
+                Ok((cost, grad_rho, None))
+            };
             run_multistart_newton(
                 num_penalties,
                 heuristic_lambdas,
@@ -766,13 +768,15 @@ where
             options,
         ),
         SmoothingOptimizerKind::Arc => {
-            let mut eval_cost_grad_hess_rho =
-                |objective: &mut F,
-                 rho: &Array1<f64>|
-                 -> Result<(f64, Array1<f64>, Option<Array2<f64>>), EstimationError> {
-                    let (cost, grad) = objective(rho)?;
-                    Ok((cost, grad, None))
-                };
+            let mut eval_cost_grad_hess_rho = |objective: &mut F,
+                                               rho: &Array1<f64>|
+             -> Result<
+                (f64, Array1<f64>, Option<Array2<f64>>),
+                EstimationError,
+            > {
+                let (cost, grad) = objective(rho)?;
+                Ok((cost, grad, None))
+            };
             run_multistart_newton(
                 num_penalties,
                 heuristic_lambdas,
@@ -915,7 +919,9 @@ where
     match options.optimizer_kind {
         SmoothingOptimizerKind::TrustRegion => {
             let mut eval_cost_grad_rho =
-                |objective: &mut F, rho: &Array1<f64>| -> Result<(f64, Array1<f64>), EstimationError> {
+                |objective: &mut F,
+                 rho: &Array1<f64>|
+                 -> Result<(f64, Array1<f64>), EstimationError> {
                     let (cost, grad, _) = objective(rho)?;
                     Ok((cost, grad))
                 };

@@ -3592,11 +3592,7 @@ mod tests {
         let s = (1.0 + sigma * sigma).sqrt();
         let z = mu / s;
         let pdf = crate::probability::normal_pdf(z);
-        assert_relative_eq!(
-            out.mean,
-            crate::probability::normal_cdf(z),
-            epsilon = 1e-12
-        );
+        assert_relative_eq!(out.mean, crate::probability::normal_cdf(z), epsilon = 1e-12);
         assert_relative_eq!(out.d1, pdf / s, epsilon = 1e-12);
         assert_relative_eq!(out.d2, -z * pdf / (s * s), epsilon = 1e-12);
         assert_relative_eq!(out.d3, (z * z - 1.0) * pdf / (s * s * s), epsilon = 1e-12);
