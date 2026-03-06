@@ -657,28 +657,65 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
         let mut ll = 0.0_f64;
 
         for i in 0..n {
-            let raw_beta = eta_beta[i];
-            let beta = raw_beta.clamp(self.beta_min, self.beta_max);
-            let dbeta_deta = if raw_beta >= self.beta_min && raw_beta <= self.beta_max {
-                1.0
-            } else {
-                0.0
-            };
             let q = eta_alpha[i];
-            let chain_beta = dbeta_deta * beta;
-            let mu = normal_cdf_approx(q).clamp(MIN_PROB, 1.0 - MIN_PROB);
-            let dmu_dq = normal_pdf(q).max(MIN_DERIV);
+            // Mathematical status of this warm-start family:
+            //
+            //   ell_i(alpha_i, beta_i)
+            //   = w_i [ y_i log Phi(q_i) + (1-y_i) log(1-Phi(q_i)) ],
+            //   q_i = eta_alpha,i.
+            //
+            // As coded, q_i does not depend on eta_beta,i at all. Therefore the
+            // literal per-row objective satisfies
+            //
+            //   d ell_i / d eta_beta,i    = 0,
+            //   d²ell_i / d eta_beta,i²   = 0,
+            //   d²ell_i / d eta_alpha,i d eta_beta,i = 0.
+            //
+            // Earlier versions fabricated a beta working derivative by pushing a
+            // bounded-beta chain rule through an alpha-only likelihood. That was
+            // mathematically false. The current implementation keeps the beta
+            // block neutral:
+            //
+            //   w_beta,i = 0,
+            //   z_beta,i = eta_beta,i,
+            //
+            // so the warm-start IRLS step is an honest derivative of the coded
+            // objective. If this family is ever meant to inform beta, the model
+            // itself must change so q_i or ell_i actually depends on beta.
+            let raw_mu = normal_cdf_approx(q);
+            let clamp_active = raw_mu <= MIN_PROB || raw_mu >= 1.0 - MIN_PROB;
+            let mu = raw_mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
+            let dmu_dq = if clamp_active {
+                0.0
+            } else {
+                normal_pdf(q).max(MIN_DERIV)
+            };
             let var = (mu * (1.0 - mu)).max(MIN_PROB);
 
             ll += self.weights[i] * (self.y[i] * mu.ln() + (1.0 - self.y[i]) * (1.0 - mu).ln());
 
+            // Clamp-consistent derivative:
+            //
+            //   mu_bar(q) = clamp(Phi(q), eps, 1-eps).
+            //
+            // On an active clamp branch mu_bar is locally constant, so the
+            // exact derivative of the reported log-likelihood is zero. In that
+            // region the IRLS surrogate must also be locally flat:
+            //
+            //   w_alpha,i = 0,
+            //   z_alpha,i = eta_alpha,i.
             let dmu_alpha = dmu_dq;
-            w_alpha[i] = (self.weights[i] * (dmu_alpha * dmu_alpha / var)).max(MIN_WEIGHT);
-            z_alpha[i] = eta_alpha[i] + (self.y[i] - mu) / signed_with_floor(dmu_alpha, MIN_DERIV);
+            if dmu_alpha == 0.0 {
+                w_alpha[i] = 0.0;
+                z_alpha[i] = eta_alpha[i];
+            } else {
+                w_alpha[i] = (self.weights[i] * (dmu_alpha * dmu_alpha / var)).max(MIN_WEIGHT);
+                z_alpha[i] =
+                    eta_alpha[i] + (self.y[i] - mu) / signed_with_floor(dmu_alpha, MIN_DERIV);
+            }
 
-            let dmu_beta = dmu_dq * chain_beta;
-            w_beta[i] = (self.weights[i] * (dmu_beta * dmu_beta / var)).max(MIN_WEIGHT);
-            z_beta[i] = eta_beta[i] + (self.y[i] - mu) / signed_with_floor(dmu_beta, MIN_DERIV);
+            w_beta[i] = 0.0;
+            z_beta[i] = eta_beta[i];
         }
 
         Ok(FamilyEvaluation {
@@ -2036,14 +2073,38 @@ fn signed_with_floor(v: f64, floor: f64) -> f64 {
 }
 
 #[inline]
+fn clamp_branch_active(mu: f64) -> bool {
+    // `mu` here is already the probability used by the reported objective:
+    //
+    //   mu_bar(q) = clamp(mu_raw(q), eps, 1-eps).
+    //
+    // Every downstream score / curvature / higher-order derivative helper in
+    // this module is supposed to differentiate that same `mu_bar`, not the raw
+    // inverse link. Away from the clamp kink, an active clamp branch is flat:
+    //
+    //   d mu_bar / dq   = 0,
+    //   d²mu_bar / dq²  = 0,
+    //   d³mu_bar / dq³  = 0,
+    //   d⁴mu_bar / dq⁴  = 0.
+    //
+    // So branch detection is the switch that keeps the analytic derivatives
+    // consistent with the clamped log-likelihood actually accumulated in `ll`.
+    mu <= MIN_PROB || mu >= 1.0 - MIN_PROB
+}
+
+#[inline]
 fn binomial_score_curvature_third_from_jet(
     y: f64,
     weight: f64,
+    clamp_active: bool,
     mu: f64,
     d1: f64,
     d2: f64,
     d3: f64,
 ) -> (f64, f64, f64) {
+    if clamp_active {
+        return (0.0, 0.0, 0.0);
+    }
     // Binomial derivatives wrt q via mu:
     // Per-row log-likelihood is represented in weighted-proportion form:
     //   ell_i = m_i * [ y_i log(mu_i) + (1-y_i) log(1-mu_i) ],
@@ -2077,6 +2138,7 @@ fn binomial_score_curvature_third_from_jet(
 fn binomial_neglog_q_derivatives_from_jet(
     y: f64,
     weight: f64,
+    clamp_active: bool,
     mu: f64,
     d1: f64,
     d2: f64,
@@ -2085,7 +2147,7 @@ fn binomial_neglog_q_derivatives_from_jet(
     // Returns (m1,m2,m3) for F_i(q) = -ell_i(q):
     //   m1 = dF/dq, m2 = d²F/dq², m3 = d³F/dq³.
     let (score_q, curvature_q, third_q) =
-        binomial_score_curvature_third_from_jet(y, weight, mu, d1, d2, d3);
+        binomial_score_curvature_third_from_jet(y, weight, clamp_active, mu, d1, d2, d3);
     (-score_q, curvature_q, -third_q)
 }
 
@@ -2094,8 +2156,12 @@ fn binomial_neglog_q_derivatives_probit_closed_form(
     y: f64,
     weight: f64,
     q: f64,
+    clamp_active: bool,
     mu: f64,
 ) -> (f64, f64, f64) {
+    if clamp_active {
+        return (0.0, 0.0, 0.0);
+    }
     // Closed-form derivatives for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     // Uses canonical A/A_mu/A_mumu identities from the probit composition.
     let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
@@ -2117,8 +2183,12 @@ fn binomial_neglog_q_fourth_derivative_probit_closed_form(
     y: f64,
     weight: f64,
     q: f64,
+    clamp_active: bool,
     mu: f64,
 ) -> f64 {
+    if clamp_active {
+        return 0.0;
+    }
     // Closed-form m4 for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
     let nu = (1.0 - m).max(MIN_PROB);
@@ -2137,12 +2207,16 @@ fn binomial_neglog_q_fourth_derivative_probit_closed_form(
 fn binomial_fourth_from_jet(
     y: f64,
     weight: f64,
+    clamp_active: bool,
     mu: f64,
     d1: f64,
     d2: f64,
     d3: f64,
     d4: f64,
 ) -> f64 {
+    if clamp_active {
+        return 0.0;
+    }
     let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
     let one_minus = (1.0 - m).max(MIN_PROB);
     let ell_mu = y / m - (1.0 - y) / one_minus;
@@ -2240,6 +2314,7 @@ struct BinomialLocationScaleCore {
     dsigma_deta: Array1<f64>,
     q0: Array1<f64>,
     mu: Array1<f64>,
+    clamp_active: Vec<bool>,
     dmu_dq: Array1<f64>,
     d2mu_dq2: Array1<f64>,
     d3mu_dq3: Array1<f64>,
@@ -2462,9 +2537,14 @@ fn second_directional_hessian_coeff_from_objective_q_terms(
     //          + d2q_uv*q_ab + dq_u*dq_ab_v + dq_v*dq_ab_u)
     //    + m1*d2q_ab_uv.
     //
-    // The single dq_u*dq_v*q_ab term is important. A previous version of this
-    // helper accidentally generated it twice by folding dq_v*q_ab into both the
-    // dq_u and dq_v product-rule branches.
+    // The single dq_u*dq_v*q_ab term is important. There is exactly one copy:
+    //
+    //   D_v[m2 * dq_u * B]
+    //   = m3 * dq_v * dq_u * B + m2 * (d2q_uv * B + dq_u * D_v B),
+    //
+    // and no second copy appears elsewhere. A previous version of this helper
+    // accidentally counted this term twice by embedding `dq_v * q_ab` in both
+    // the `dq_u` and `dq_v` product-rule branches.
     let d_qaqb_u = dq_a_u * q_b + q_a * dq_b_u;
     let d_qaqb_v = dq_a_v * q_b + q_a * dq_b_v;
     let d2_qaqb_uv = d2q_a_uv * q_b + dq_a_u * dq_b_v + dq_a_v * dq_b_u + q_a * d2q_b_uv;
@@ -2649,6 +2729,7 @@ fn binomial_location_scale_core(
     let mut dsigma_deta = Array1::<f64>::zeros(n);
     let mut q0 = Array1::<f64>::zeros(n);
     let mut mu = Array1::<f64>::zeros(n);
+    let mut clamp_active = vec![false; n];
     let mut dmu_dq = Array1::<f64>::zeros(n);
     let mut d2mu_dq2 = Array1::<f64>::zeros(n);
     let mut d3mu_dq3 = Array1::<f64>::zeros(n);
@@ -2663,10 +2744,41 @@ fn binomial_location_scale_core(
         let q = q0[i] + eta_wiggle.map_or(0.0, |w| w[i]);
         let jet = inverse_link_jet_for_inverse_link(link_kind, q)
             .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-        mu[i] = jet.mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
-        dmu_dq[i] = jet.d1;
-        d2mu_dq2[i] = jet.d2;
-        d3mu_dq3[i] = jet.d3;
+        // Clamp-consistent row cache:
+        //
+        // The per-row objective is
+        //
+        //   mu_clamped(q) = clamp(mu_raw(q), MIN_PROB, 1-MIN_PROB),
+        //   ell_i         = w_i [ y_i log mu_clamped + (1-y_i) log(1-mu_clamped) ].
+        //
+        // Therefore every cached derivative consumed by score/curvature/Newton
+        // helpers must differentiate `mu_clamped`, not `mu_raw`.
+        //
+        // Away from the clamp kink, the derivative of the clamped map is
+        //
+        //   D mu_clamped[q]
+        //   = mu_raw'(q)     if eps < mu_raw(q) < 1-eps,
+        //   = 0              on an active clamp branch,
+        //
+        // and likewise for higher derivatives.
+        //
+        // Earlier versions cached the raw jet unconditionally, which meant the
+        // code was differentiating the unclamped response surface while the
+        // reported `log_likelihood` evaluated the clamped one. That produced a
+        // definite objective/gradient mismatch in the tails. The branch below
+        // enforces derivative consistency with the actual scalar objective.
+        let raw_mu = jet.mu;
+        mu[i] = raw_mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
+        clamp_active[i] = raw_mu <= MIN_PROB || raw_mu >= 1.0 - MIN_PROB;
+        if clamp_active[i] {
+            dmu_dq[i] = 0.0;
+            d2mu_dq2[i] = 0.0;
+            d3mu_dq3[i] = 0.0;
+        } else {
+            dmu_dq[i] = jet.d1;
+            d2mu_dq2[i] = jet.d2;
+            d3mu_dq3[i] = jet.d3;
+        }
         ll += weights[i] * (y[i] * mu[i].ln() + (1.0 - y[i]) * (1.0 - mu[i]).ln());
     }
 
@@ -2675,6 +2787,7 @@ fn binomial_location_scale_core(
         dsigma_deta,
         q0,
         mu,
+        clamp_active,
         dmu_dq,
         d2mu_dq2,
         d3mu_dq3,
@@ -2705,6 +2818,7 @@ fn binomial_location_scale_working_sets(
             let (score_q, curvature_q, _third_q) = binomial_score_curvature_third_from_jet(
                 y[i],
                 weights[i],
+                core.clamp_active[i],
                 core.mu[i],
                 core.dmu_dq[i],
                 core.d2mu_dq2[i],
@@ -3932,6 +4046,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let (score_q, curvature_q, _third_q) = binomial_score_curvature_third_from_jet(
                 self.y[i],
                 self.weights[i],
+                core.clamp_active[i],
                 core.mu[i],
                 core.dmu_dq[i],
                 core.d2mu_dq2[i],
@@ -4121,6 +4236,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let (score_q, curvature_q, third_q) = binomial_score_curvature_third_from_jet(
                 self.y[i],
                 self.weights[i],
+                core.clamp_active[i],
                 core.mu[i],
                 core.dmu_dq[i],
                 core.d2mu_dq2[i],
@@ -4300,6 +4416,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let (score_q, curvature_q, third_q) = binomial_score_curvature_third_from_jet(
                 self.y[i],
                 self.weights[i],
+                core.clamp_active[i],
                 core.mu[i],
                 core.dmu_dq[i],
                 core.d2mu_dq2[i],
@@ -4308,6 +4425,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let fourth_q = binomial_fourth_from_jet(
                 self.y[i],
                 self.weights[i],
+                core.clamp_active[i],
                 core.mu[i],
                 core.dmu_dq[i],
                 core.d2mu_dq2[i],
@@ -5035,12 +5153,14 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
                         self.y[i],
                         self.weights[i],
                         q_i,
+                        core0.clamp_active[i],
                         core0.mu[i],
                     )
                 } else {
                     binomial_neglog_q_derivatives_from_jet(
                         self.y[i],
                         self.weights[i],
+                        core0.clamp_active[i],
                         core0.mu[i],
                         core0.dmu_dq[i],
                         core0.d2mu_dq2[i],
@@ -5244,12 +5364,14 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
                         self.y[i],
                         self.weights[i],
                         q_i,
+                        core0.clamp_active[i],
                         core0.mu[i],
                     )
                 } else {
                     binomial_neglog_q_derivatives_from_jet(
                         self.y[i],
                         self.weights[i],
+                        core0.clamp_active[i],
                         core0.mu[i],
                         core0.dmu_dq[i],
                         core0.d2mu_dq2[i],
@@ -5469,12 +5591,14 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
                 self.y[i],
                 self.weights[i],
                 q_i,
+                core0.clamp_active[i],
                 core0.mu[i],
             );
             let m4 = binomial_neglog_q_fourth_derivative_probit_closed_form(
                 self.y[i],
                 self.weights[i],
                 q_i,
+                core0.clamp_active[i],
                 core0.mu[i],
             );
 

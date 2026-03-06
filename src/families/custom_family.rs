@@ -2090,6 +2090,23 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                 (w, u, h_mode, h_inv)
             }
             BlockWorkingSet::ExactNewton { .. } => {
+                // The diagonal psi path below relies on the IRLS representation
+                //
+                //   J = X^T W X + S,
+                //   g_psi = X_psi^T u - X^T W eta_psi - S_psi beta,
+                //   J u_psi = -g_psi,
+                //   d/dpsi [0.5 log|J|]
+                //   = 0.5 tr(J^{-1}(J_psi^explicit + D_beta J[u_psi])).
+                //
+                // For ExactNewton blocks the engine does not yet have the
+                // corresponding family-level hooks needed to assemble:
+                //   1. the explicit psi derivative of the exact Hessian,
+                //   2. the stationarity derivative g_psi,
+                //   3. the implicit Hessian drift D_beta J[u_psi].
+                //
+                // Returning an error is deliberate: substituting zero or
+                // reusing the diagonal algebra here would claim an analytic psi
+                // gradient for a formula the engine does not currently know.
                 return Err(format!(
                     "analytic psi gradient is not implemented for exact-newton block {} ({})",
                     b, spec.name
@@ -2345,6 +2362,8 @@ fn apply_geometry_direction_to_eta_and_trace(
     base_d_eta: &mut Array1<f64>,
     geom_dir: Option<BlockGeometryDirectionalDerivative>,
 ) -> Result<f64, String> {
+    // Geometry drift helper for diagonal REML derivatives.
+    //
     // For dynamic block geometry,
     //
     //   eta(beta) = X(beta) beta + o(beta),
@@ -2353,16 +2372,32 @@ fn apply_geometry_direction_to_eta_and_trace(
     //
     //   D eta[u] = X u + (D X[u]) beta + D o[u].
     //
-    // In diagonal working-set REML derivatives this geometry drift enters twice:
+    // The diagonal Hessian used by the REML trace algebra is
+    //
+    //   H(beta) = X(beta)^T W(beta) X(beta) + S.
+    //
+    // Differentiating that composite object along `u` gives
     //
     //   D H[u]
     //   = (D X[u])^T W X
     //   + X^T W (D X[u])
     //   + X^T diag(D w[D eta[u]]) X.
     //
-    // This helper adds `(D X[u]) beta + D o[u]` into the predictor drift fed to
-    // the weight-direction callback, and returns the explicit trace term
-    //   0.5 * tr(H^{-1}[(D X[u])^T W X + X^T W (D X[u])]).
+    // The first two terms are explicit geometry-curvature drift. The third is
+    // the usual weight-direction term, but its argument is the *full*
+    // predictor derivative D eta[u], not just X u.
+    //
+    // This helper therefore does two jobs:
+    //
+    //   1. augment `base_d_eta` by
+    //        (D X[u]) beta + D o[u],
+    //      so the family's dW callback sees the correct predictor direction;
+    //
+    //   2. return the explicit trace contribution
+    //        0.5 tr(H^{-1}[(D X[u])^T W X + X^T W (D X[u])]).
+    //
+    // Without both pieces, a dynamic `block_geometry` family would be
+    // differentiating the wrong Hessian even if its dW callback were exact.
     let Some(geom) = geom_dir else {
         return Ok(0.0);
     };
