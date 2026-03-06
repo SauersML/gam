@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 import os
+import pty
 import re
 import subprocess
 import sys
@@ -374,15 +375,22 @@ def _heartbeat_loop(proc, cmd, stop_event, stats):
 def run_cmd(cmd, cwd=None):
     env = os.environ.copy()
     env.update(_SERIAL_ENV_OVERRIDES)
-    proc = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        bufsize=1,
-    )
+    env["PYTHONUNBUFFERED"] = "1"
+    out_master, out_slave = pty.openpty()
+    err_master, err_slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=out_slave,
+            stderr=err_slave,
+            text=False,
+            env=env,
+            bufsize=0,
+        )
+    finally:
+        os.close(out_slave)
+        os.close(err_slave)
 
     out_buf = []
     err_buf = []
@@ -394,17 +402,27 @@ def run_cmd(cmd, cwd=None):
         "samples": 0,
     }
 
-    def _pump(stream, sink, buf):
+    def _pump(fd, sink, buf):
         try:
-            for line in iter(stream.readline, ""):
-                sink.write(line)
+            while True:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                text = chunk.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+                sink.write(text)
                 sink.flush()
-                buf.append(line)
+                buf.append(text)
         finally:
-            stream.close()
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
-    t_out = threading.Thread(target=_pump, args=(proc.stdout, sys.stdout, out_buf), daemon=True)
-    t_err = threading.Thread(target=_pump, args=(proc.stderr, sys.stderr, err_buf), daemon=True)
+    t_out = threading.Thread(target=_pump, args=(out_master, sys.stdout, out_buf), daemon=True)
+    t_err = threading.Thread(target=_pump, args=(err_master, sys.stderr, err_buf), daemon=True)
     t_hb = threading.Thread(target=_heartbeat_loop, args=(proc, cmd, hb_stop, hb_stats), daemon=True)
     t_out.start()
     t_err.start()
@@ -1555,6 +1573,13 @@ def _geo_disease_eas_scenario_cfg(name):
     }
 
 
+def _scenario_downsample_factor(name: str) -> int | None:
+    m = re.search(r"_downsample([0-9]+)x(?:_holdout)?$", str(name))
+    if m is None:
+        return None
+    return max(1, int(m.group(1)))
+
+
 def _papuan_oce_scenario_cfg(name):
     m = re.match(r"^papuan_oce(4)?_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
     if m is None:
@@ -2109,11 +2134,70 @@ def _dataset_for_scenario_unvalidated(s):
     raise RuntimeError(f"No scenario-specific dataset loader configured for '{name}'")
 
 
+def _downsample_binomial_dataset(
+    ds: dict,
+    *,
+    n: int,
+    seed: int,
+    min_class_count: int,
+) -> dict:
+    rows = list(ds["rows"])
+    target = str(ds["target"])
+    n = int(n)
+    min_class_count = int(min_class_count)
+    if n <= 0 or n > len(rows):
+        raise RuntimeError(f"invalid downsample size {n} for dataset with {len(rows)} rows")
+    if min_class_count < 1:
+        raise RuntimeError(f"min_class_count must be >= 1; got {min_class_count}")
+    if n < 2 * min_class_count:
+        raise RuntimeError(
+            f"downsample size {n} cannot support at least {min_class_count} rows from each class"
+        )
+
+    y = np.array([float(r[target]) > 0.5 for r in rows], dtype=bool)
+    pos_idx = np.flatnonzero(y)
+    neg_idx = np.flatnonzero(~y)
+    if pos_idx.size < min_class_count or neg_idx.size < min_class_count:
+        raise RuntimeError(
+            "source dataset cannot support stratified downsample with required class support: "
+            f"positives={int(pos_idx.size)}, negatives={int(neg_idx.size)}, "
+            f"required_per_class={min_class_count}"
+        )
+
+    rng = np.random.default_rng(int(seed))
+    rng.shuffle(pos_idx)
+    rng.shuffle(neg_idx)
+    pos_rate = float(pos_idx.size / len(rows))
+    n_pos = int(round(n * pos_rate))
+    n_pos = min(max(n_pos, min_class_count), n - min_class_count)
+    n_neg = n - n_pos
+    chosen = np.concatenate([pos_idx[:n_pos], neg_idx[:n_neg]])
+    rng.shuffle(chosen)
+
+    out = dict(ds)
+    out["rows"] = [rows[int(i)] for i in chosen]
+    return out
+
+
 def dataset_for_scenario(s):
+    name = s["name"]
     ds = _dataset_for_scenario_unvalidated(s)
+    downsample_factor = _scenario_downsample_factor(name)
+    if downsample_factor is not None and name.startswith("geo_disease_eas"):
+        full_n = int(max(6000, int(s.get("n", 6000)) * downsample_factor))
+        n_pcs = 3 if name.startswith("geo_disease_eas3_") else 16
+        full_ds = _synthetic_geo_disease_eas_dataset(full_n, s.get("seed", 20260301), n_pcs=n_pcs)
+        n_splits = int(s.get("cv_splits", CV_SPLITS))
+        min_class_count = 2 if n_splits == 1 else n_splits
+        ds = _downsample_binomial_dataset(
+            full_ds,
+            n=int(s.get("n", full_n)),
+            seed=int(s.get("seed", 20260301)),
+            min_class_count=min_class_count,
+        )
     if "cv_splits" in s:
         ds["_cv_splits"] = int(s["cv_splits"])
-    _validate_dataset_schema(ds, scenario_name=s["name"])
+    _validate_dataset_schema(ds, scenario_name=name)
     return ds
 
 
@@ -2922,7 +3006,6 @@ def run_rust_scenario_cv(
     ood_rows = []
     continuous_rows = []
     adaptive_rows = []
-    eval_suffix = _evaluation_suffix(folds)
     rust_cfg = _effective_rust_fit_mapping(scenario_name, rust_cfg_override) or {}
     smooth_cols = list(rust_cfg.get("smooth_cols") or ([rust_cfg["smooth_col"]] if "smooth_col" in rust_cfg else []))
     linear_cols = list(rust_cfg.get("linear_cols", []))
@@ -3375,6 +3458,7 @@ def _run_rust_gamlss_scenario_cv_variant(
     binom_extra = list(binomial_extra_fit_args or [])
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
+    eval_suffix = _evaluation_suffix(folds)
 
     with tempfile.TemporaryDirectory(prefix="gam_bench_rust_gamlss_cv_", dir=str(BENCH_DIR)) as td:
         td_path = Path(td)
