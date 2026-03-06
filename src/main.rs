@@ -113,9 +113,37 @@ fn extract_quoted_field(message: &str) -> Option<String> {
     }
 }
 
+fn classify_invalid_tps_spec(lower: &str) -> Option<String> {
+    if !lower.contains("thin-plate spline") {
+        return None;
+    }
+    if lower.contains("supports dimensions 1..=3") {
+        return Some(
+            "Unsupported thin-plate model specification. Joint thin-plate smooths in this CLI currently support only 1 to 3 covariate dimensions; reduce the joint smooth dimension or choose a different basis."
+                .to_string(),
+        );
+    }
+    if lower.contains("requires at least d+1 knots") {
+        return Some(
+            "Invalid thin-plate model specification. Increase the number of centers/knots for this joint smooth or reduce its covariate dimension."
+                .to_string(),
+        );
+    }
+    if lower.contains("fewer unique covariate combinations than specified maximum degrees of freedom")
+    {
+        return Some(
+            "Invalid thin-plate model specification. The requested basis is too large for the joint covariate support in this term; reduce the basis size or the joint smooth dimension."
+                .to_string(),
+        );
+    }
+    None
+}
+
 fn classify_cli_error(message: String) -> CliError {
     let lower = message.to_ascii_lowercase();
-    let advice = if lower.contains("separation") || lower.contains("perfectly separated") {
+    let advice = if let Some(advice) = classify_invalid_tps_spec(&lower) {
+        Some(advice)
+    } else if lower.contains("separation") || lower.contains("perfectly separated") {
         let culprit = extract_quoted_field(&message);
         Some(match culprit {
             Some(col) => format!(
@@ -6499,6 +6527,13 @@ fn build_smooth_basis(
             })
         }
         "tps" | "thinplate" | "thin-plate" => {
+            if cols.len() > 3 {
+                return Err(format!(
+                    "thinplate/tps smooth '{}' uses {} variables, but this CLI currently supports only 1 to 3 dimensions for joint thin-plate smooths. Reduce the joint smooth dimension or choose a different basis.",
+                    vars.join(", "),
+                    cols.len()
+                ));
+            }
             let centers = parse_count_with_basis_alias(
                 options,
                 "centers",
@@ -8155,6 +8190,7 @@ mod tests {
         BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, LikelihoodFamily, LinkMode,
         MODEL_VERSION, ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs,
         SurvivalTimeBasisConfig, apply_saved_probit_wiggle, build_survival_time_basis,
+        classify_cli_error,
         chi_square_survival_approx, collect_linear_smooth_overlap_warnings,
         collect_spatial_smooth_usage_warnings, compute_probit_q0_from_eta, core_saved_fit_result,
         parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
@@ -8183,6 +8219,28 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn classify_cli_error_specializes_thin_plate_dimension_error() {
+        let err = classify_cli_error(
+            "failed to build term collection design: Invalid input: thin-plate spline (m=2) currently supports dimensions 1..=3, got 6"
+                .to_string(),
+        );
+        let advice = err.advice().expect("thin-plate advice");
+        assert!(advice.contains("Unsupported thin-plate model specification"));
+        assert!(!advice.contains("Shape mismatch detected"));
+    }
+
+    #[test]
+    fn classify_cli_error_specializes_thin_plate_knot_error() {
+        let err = classify_cli_error(
+            "failed to build term collection design: Invalid input: thin-plate spline requires at least d+1 knots (13), got 12"
+                .to_string(),
+        );
+        let advice = err.advice().expect("thin-plate advice");
+        assert!(advice.contains("Increase the number of centers/knots"));
+        assert!(!advice.contains("Shape mismatch detected"));
+    }
 
     fn cindex_uncensored_risk(time: &[f64], score: &[f64]) -> f64 {
         let mut concordant = 0.0;
@@ -8652,6 +8710,65 @@ mod tests {
                 .map(|term| (&term.name, term.double_penalty))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn build_term_spec_rejects_joint_thinplate_above_three_dimensions() {
+        let parsed = parse_formula("y ~ thinplate(pc1, pc2, pc3, pc4)").expect("formula");
+        let ds = Dataset {
+            headers: vec![
+                "pc1".to_string(),
+                "pc2".to_string(),
+                "pc3".to_string(),
+                "pc4".to_string(),
+            ],
+            values: array![
+                [0.1, 0.2, 0.3, 0.4],
+                [0.2, 0.3, 0.4, 0.5],
+                [0.3, 0.4, 0.5, 0.6],
+            ],
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "pc1".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "pc2".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "pc3".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "pc4".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+            ],
+        };
+        let col_map = HashMap::from([
+            ("pc1".to_string(), 0usize),
+            ("pc2".to_string(), 1usize),
+            ("pc3".to_string(), 2usize),
+            ("pc4".to_string(), 3usize),
+        ]);
+        let mut inference_notes = Vec::<String>::new();
+        let err = super::build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)
+            .expect_err("expected thin-plate dimension validation failure");
+        assert!(err.contains("currently supports only 1 to 3 dimensions"));
+        assert!(err.contains("pc1, pc2, pc3, pc4"));
     }
 
     #[test]
