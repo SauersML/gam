@@ -2544,6 +2544,41 @@ def _canonical_smooth_basis(basis):
     return b
 
 
+def _is_joint_spatial_basis(basis: str) -> bool:
+    return _canonical_smooth_basis(basis) in {"thinplate", "tps", "duchon", "matern"}
+
+
+def _requires_joint_spatial_term(cfg: dict | None) -> bool:
+    if not cfg:
+        return False
+    smooth_cols = list(cfg.get("smooth_cols") or [])
+    return _is_joint_spatial_basis(cfg.get("smooth_basis", "ps")) and len(smooth_cols) >= 2
+
+
+def _rust_joint_spatial_term(basis: str, smooth_cols: list[str], knot_count: int, dp_opt: str) -> str:
+    basis = _canonical_smooth_basis(basis)
+    cols = ", ".join(str(c) for c in smooth_cols)
+    if basis in {"thinplate", "tps"}:
+        return f"thinplate({cols}, centers={knot_count}{dp_opt})"
+    if basis == "duchon":
+        return f"duchon({cols}, centers={knot_count}, order=0, power=1{dp_opt})"
+    if basis == "matern":
+        return f"matern({cols}, centers={knot_count}{dp_opt})"
+    raise RuntimeError(f"Unsupported joint Rust spatial basis '{basis}'")
+
+
+def _mgcv_joint_spatial_term(basis: str, smooth_cols: list[str], knot_count: int) -> str:
+    basis = _canonical_smooth_basis(basis)
+    cols = ", ".join(str(c) for c in smooth_cols)
+    if basis in {"thinplate", "tps"}:
+        return f"s({cols}, bs='tp', k=min({knot_count}, nrow(train_df)-1))"
+    if basis == "duchon":
+        return f"s({cols}, bs='ds', m=c(1,0), k=min({knot_count}, nrow(train_df)-1))"
+    if basis == "matern":
+        return f"s({cols}, bs='gp', m=c(-4,1.0), k=min({knot_count}, nrow(train_df)-1))"
+    raise RuntimeError(f"Unsupported joint mgcv spatial basis '{basis}'")
+
+
 def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None = None):
     cfg = _effective_rust_fit_mapping(scenario_name, cfg_override)
     if cfg is None:
@@ -2561,21 +2596,24 @@ def _rust_formula_for_scenario(scenario_name, ds, *, cfg_override: dict | None =
     dp_opt = f", double_penalty={'true' if use_double_penalty else 'false'}"
     smooth_cols = cfg.get("smooth_cols")
     if smooth_cols:
-        for col in smooth_cols:
-            if basis in {"ps", "bspline", "p-spline"}:
-                terms.append(f"s({col}, type=ps, knots={knot_count}{dp_opt})")
-            elif basis in {"thinplate", "tps"}:
-                terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
-            elif basis == "duchon":
-                terms.append(
-                    f"s({col}, type=duchon, centers={knot_count}, order=0, power=1{dp_opt})"
-                )
-            elif basis == "matern":
-                terms.append(f"s({col}, type=matern, centers={knot_count}{dp_opt})")
-            else:
-                raise RuntimeError(
-                    f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
-                )
+        if _is_joint_spatial_basis(basis) and len(smooth_cols) >= 2:
+            terms.append(_rust_joint_spatial_term(basis, smooth_cols, knot_count, dp_opt))
+        else:
+            for col in smooth_cols:
+                if basis in {"ps", "bspline", "p-spline"}:
+                    terms.append(f"s({col}, type=ps, knots={knot_count}{dp_opt})")
+                elif basis in {"thinplate", "tps"}:
+                    terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
+                elif basis == "duchon":
+                    terms.append(
+                        f"s({col}, type=duchon, centers={knot_count}, order=0, power=1{dp_opt})"
+                    )
+                elif basis == "matern":
+                    terms.append(f"s({col}, type=matern, centers={knot_count}{dp_opt})")
+                else:
+                    raise RuntimeError(
+                        f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
+                    )
     else:
         col = cfg.get("smooth_col")
         if col:
@@ -2634,18 +2672,21 @@ def _mgcv_formula_for_scenario(scenario_name, ds):
 
     smooth_cols = cfg.get("smooth_cols")
     if smooth_cols:
-        for col in smooth_cols:
-            k_val = knot_count + 4 if bs_code == "ps" else knot_count
-            if basis == "matern":
-                terms.append(
-                    f"s({col}, bs='gp', m=c(-4,1.0), k=min({k_val}, nrow(train_df)-1))"
-                )
-            elif basis == "duchon":
-                terms.append(
-                    f"s({col}, bs='ds', m=c(1,0), k=min({k_val}, nrow(train_df)-1))"
-                )
-            else:
-                terms.append(f"s({col}, bs='{bs_code}', k=min({k_val}, nrow(train_df)-1))")
+        k_val = knot_count + 4 if bs_code == "ps" else knot_count
+        if _is_joint_spatial_basis(basis) and len(smooth_cols) >= 2:
+            terms.append(_mgcv_joint_spatial_term(basis, smooth_cols, k_val))
+        else:
+            for col in smooth_cols:
+                if basis == "matern":
+                    terms.append(
+                        f"s({col}, bs='gp', m=c(-4,1.0), k=min({k_val}, nrow(train_df)-1))"
+                    )
+                elif basis == "duchon":
+                    terms.append(
+                        f"s({col}, bs='ds', m=c(1,0), k=min({k_val}, nrow(train_df)-1))"
+                    )
+                else:
+                    terms.append(f"s({col}, bs='{bs_code}', k=min({k_val}, nrow(train_df)-1))")
     else:
         col = cfg.get("smooth_col")
         if col:
@@ -3800,7 +3841,10 @@ def run_rust_gamlss_survival_cv(
 
 
 def _is_gamlss_benchmark_scenario(scenario_name: str) -> bool:
-    return _rust_fit_mapping(scenario_name) is not None
+    cfg = _rust_fit_mapping(scenario_name)
+    if cfg is None:
+        return False
+    return not _requires_joint_spatial_term(cfg)
 
 
 def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
@@ -3808,6 +3852,8 @@ def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
     if cfg is None:
         return None
     if ds["family"] not in ("binomial", "gaussian"):
+        return None
+    if _requires_joint_spatial_term(cfg):
         return None
 
     terms = [str(c) for c in cfg.get("linear_cols", [])]
@@ -4614,6 +4660,8 @@ def _gamboostlss_formulas_for_scenario(scenario_name: str, ds):
     if cfg is None:
         return None, None
     if ds["family"] != "gaussian":
+        return None, None
+    if _requires_joint_spatial_term(cfg):
         return None, None
 
     knot_count = max(4, int(cfg.get("knots", 8)))
@@ -5555,23 +5603,6 @@ def run_external_pygam_cv(scenario, *, ds: dict | None = None, folds: list[Fold]
             if x.shape[1] == 1:
                 model = LogisticGAM(s(0, n_splines=8))
                 model_spec = "LogisticGAM(s(0, n_splines=8))"
-            elif scenario["name"] in {
-                "geo_disease_tp",
-                "geo_disease_duchon",
-                "geo_disease_shrinkage",
-                "geo_disease_matern",
-            }:
-                smooth_count = min(4, x.shape[1])
-                terms = s(0, n_splines=12)
-                for j in range(1, smooth_count):
-                    terms = terms + s(j, n_splines=12)
-                for j in range(smooth_count, x.shape[1]):
-                    terms = terms + l(j)
-                model = LogisticGAM(terms)
-                linear_part = f"+linear({smooth_count}:{x.shape[1] - 1})" if x.shape[1] > smooth_count else ""
-                model_spec = (
-                    f"LogisticGAM(s(0)+...+s({smooth_count - 1}){linear_part}, n_splines=12)"
-                )
             elif scenario["name"] in {"geo_disease_ps_per_pc"}:
                 terms = s(0, n_splines=10)
                 for j in range(1, x.shape[1]):
@@ -5582,76 +5613,40 @@ def run_external_pygam_cv(scenario, *, ds: dict | None = None, folds: list[Fold]
                 geo_cfg = _geo_disease_eas_scenario_cfg(scenario["name"])
                 k = int(geo_cfg["knots"])
                 n_pcs = int(geo_cfg["n_pcs"])
-                if geo_cfg["basis_code"] == "psperpc":
-                    terms = s(0, n_splines=k)
-                    for j in range(1, x.shape[1]):
-                        terms = terms + s(j, n_splines=k)
-                    model = LogisticGAM(terms)
-                    model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..{n_pcs - 1})"
-                else:
-                    terms = s(0, n_splines=k) + s(1, n_splines=k) + s(2, n_splines=k)
-                    for j in range(3, x.shape[1]):
-                        terms = terms + l(j)
-                    model = LogisticGAM(terms)
-                    linear_hi = n_pcs - 1
-                    linear_part = f"+linear(3:{linear_hi})" if linear_hi >= 3 else ""
-                    model_spec = (
-                        f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, n_splines={k})"
-                    )
+                assert geo_cfg["basis_code"] == "psperpc"
+                terms = s(0, n_splines=k)
+                for j in range(1, x.shape[1]):
+                    terms = terms + s(j, n_splines=k)
+                model = LogisticGAM(terms)
+                model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..{n_pcs - 1})"
             elif _papuan_oce_scenario_cfg(scenario["name"]) is not None:
                 papuan_cfg = _papuan_oce_scenario_cfg(scenario["name"])
                 k = int(papuan_cfg["knots"])
                 n_pcs = int(papuan_cfg["n_pcs"])
-                if papuan_cfg["basis_code"] == "psperpc":
-                    terms = s(0, n_splines=k)
-                    for j in range(1, x.shape[1]):
-                        terms = terms + s(j, n_splines=k)
-                    model = LogisticGAM(terms)
-                    model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..{n_pcs - 1}) [papuan_oce]"
-                else:
-                    terms = s(0, n_splines=k) + s(1, n_splines=k) + s(2, n_splines=k)
-                    for j in range(3, x.shape[1]):
-                        terms = terms + l(j)
-                    model = LogisticGAM(terms)
-                    linear_hi = n_pcs - 1
-                    linear_part = f"+linear(3:{linear_hi})" if linear_hi >= 3 else ""
-                    model_spec = (
-                        f"LogisticGAM(s(0)+s(1)+s(2){linear_part}, n_splines={k}) [papuan_oce]"
-                    )
+                assert papuan_cfg["basis_code"] == "psperpc"
+                terms = s(0, n_splines=k)
+                for j in range(1, x.shape[1]):
+                    terms = terms + s(j, n_splines=k)
+                model = LogisticGAM(terms)
+                model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..{n_pcs - 1}) [papuan_oce]"
             elif _geo_subpop16_scenario_cfg(scenario["name"]) is not None:
                 sub_cfg = _geo_subpop16_scenario_cfg(scenario["name"])
                 k = int(sub_cfg["knots"])
-                if sub_cfg["basis_code"] == "psperpc":
-                    terms = s(0, n_splines=k)
-                    for j in range(1, x.shape[1]):
-                        terms = terms + s(j, n_splines=k)
-                    model = LogisticGAM(terms)
-                    model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..15) [subpop16]"
-                else:
-                    terms = s(0, n_splines=k) + s(1, n_splines=k) + s(2, n_splines=k)
-                    for j in range(3, x.shape[1]):
-                        terms = terms + l(j)
-                    model = LogisticGAM(terms)
-                    model_spec = (
-                        f"LogisticGAM(s(0)+s(1)+s(2)+linear(3:15), n_splines={k}) [subpop16]"
-                    )
+                assert sub_cfg["basis_code"] == "psperpc"
+                terms = s(0, n_splines=k)
+                for j in range(1, x.shape[1]):
+                    terms = terms + s(j, n_splines=k)
+                model = LogisticGAM(terms)
+                model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..15) [subpop16]"
             elif _geo_latlon_scenario_cfg(scenario["name"]) is not None:
                 latlon_cfg = _geo_latlon_scenario_cfg(scenario["name"])
                 k = int(latlon_cfg["knots"])
-                if latlon_cfg["basis_code"] == "psperpc":
-                    terms = s(0, n_splines=k)
-                    for j in range(1, x.shape[1]):
-                        terms = terms + s(j, n_splines=k)
-                    model = LogisticGAM(terms)
-                    model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..5) [geo_latlon]"
-                else:
-                    terms = s(0, n_splines=k) + s(1, n_splines=k) + s(2, n_splines=k)
-                    for j in range(3, x.shape[1]):
-                        terms = terms + l(j)
-                    model = LogisticGAM(terms)
-                    model_spec = (
-                        f"LogisticGAM(s(0)+s(1)+s(2)+linear(3:5), n_splines={k}) [geo_latlon]"
-                    )
+                assert latlon_cfg["basis_code"] == "psperpc"
+                terms = s(0, n_splines=k)
+                for j in range(1, x.shape[1]):
+                    terms = terms + s(j, n_splines=k)
+                model = LogisticGAM(terms)
+                model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..5) [geo_latlon]"
             elif scenario["name"] == "icu_survival_death":
                 model = LogisticGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))
                 model_spec = "LogisticGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))"

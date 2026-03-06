@@ -173,15 +173,8 @@ mod tests {
         // and Firth-logit modes.
         let x_tau = Array2::<f64>::zeros(x.raw_dim());
         let s_tau = array![[0.0, 0.0, 0.0], [0.0, 0.25, 0.04], [0.0, 0.04, 0.15],];
-        let hyper = DirectionalHyperParam {
-            penalty_index: None,
-            x_tau_original: x_tau.clone(),
-            s_tau_original: s_tau.clone(),
-            s_tau_original_components: None,
-            x_tau_tau_original: None,
-            s_tau_tau_original: None,
-            s_tau_tau_original_components: None,
-        };
+        let hyper = DirectionalHyperParam::single_penalty(0, x_tau.clone(), s_tau.clone(), None, None)
+            .expect("single-penalty hyper direction");
         let rho = array![0.0];
 
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, false);
@@ -519,15 +512,14 @@ mod tests {
             [1.0, 1.2, -0.4],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
-        let hyper = DirectionalHyperParam {
-            penalty_index: None,
-            x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
-            s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.03], [0.0, 0.03, 0.12],],
-            s_tau_original_components: None,
-            x_tau_tau_original: None,
-            s_tau_tau_original: None,
-            s_tau_tau_original_components: None,
-        };
+        let hyper = DirectionalHyperParam::single_penalty(
+            0,
+            Array2::<f64>::zeros((x.nrows(), x.ncols())),
+            array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.03], [0.0, 0.03, 0.12],],
+            None,
+            None,
+        )
+        .expect("single-penalty hyper direction");
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
@@ -555,15 +547,14 @@ mod tests {
             [1.0, 1.2, -0.4],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
-        let hyper = DirectionalHyperParam {
-            penalty_index: None,
-            x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 1e-3),
-            s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
-            s_tau_original_components: None,
-            x_tau_tau_original: None,
-            s_tau_tau_original: None,
-            s_tau_tau_original_components: None,
-        };
+        let hyper = DirectionalHyperParam::single_penalty(
+            0,
+            Array2::from_elem((x.nrows(), x.ncols()), 1e-3),
+            Array2::<f64>::zeros((x.ncols(), x.ncols())),
+            None,
+            None,
+        )
+        .expect("single-penalty hyper direction");
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
@@ -591,15 +582,14 @@ mod tests {
             [1.0, 1.2, -0.4],
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
-        let hyper = DirectionalHyperParam {
-            penalty_index: None,
-            x_tau_original: Array2::from_elem((x_dense.nrows(), x_dense.ncols()), 1e-3),
-            s_tau_original: Array2::<f64>::zeros((x_dense.ncols(), x_dense.ncols())),
-            s_tau_original_components: None,
-            x_tau_tau_original: None,
-            s_tau_tau_original: None,
-            s_tau_tau_original_components: None,
-        };
+        let hyper = DirectionalHyperParam::single_penalty(
+            0,
+            Array2::from_elem((x_dense.nrows(), x_dense.ncols()), 1e-3),
+            Array2::<f64>::zeros((x_dense.ncols(), x_dense.ncols())),
+            None,
+            None,
+        )
+        .expect("single-penalty hyper direction");
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
 
@@ -677,24 +667,22 @@ mod tests {
         let rho = array![0.0];
         let theta = array![0.0, 0.0, 0.0];
         let hyper_dirs = vec![
-            DirectionalHyperParam {
-                penalty_index: None,
-                x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
-                s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
-                s_tau_original_components: None,
-                x_tau_tau_original: None,
-                s_tau_tau_original: None,
-                s_tau_tau_original_components: None,
-            },
-            DirectionalHyperParam {
-                penalty_index: None,
-                x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
-                s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
-                s_tau_original_components: None,
-                x_tau_tau_original: None,
-                s_tau_tau_original: None,
-                s_tau_tau_original_components: None,
-            },
+            DirectionalHyperParam::single_penalty(
+                0,
+                Array2::<f64>::zeros((x.nrows(), x.ncols())),
+                array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
+                None,
+                None,
+            )
+            .expect("single-penalty hyper direction"),
+            DirectionalHyperParam::single_penalty(
+                0,
+                Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
+                Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                None,
+                None,
+            )
+            .expect("single-penalty hyper direction"),
         ];
 
         let h = state
@@ -753,28 +741,30 @@ mod tests {
         x_second_1[1] = Array2::from_elem((x.nrows(), x.ncols()), 4e-5);
         s_second_1[1] = array![[0.0, 0.0, 0.0], [0.0, 0.02, 0.004], [0.0, 0.004, 0.03],];
         let hyper_dirs = vec![
-            DirectionalHyperParam {
-                penalty_index: None,
-                x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
-                s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
-                s_tau_original_components: None,
-                x_tau_tau_original: Some(x_second_0),
-                s_tau_tau_original: Some(s_second_0),
-                s_tau_tau_original_components: None,
-            },
-            DirectionalHyperParam {
-                penalty_index: None,
-                x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
-                s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
-                s_tau_original_components: None,
-                x_tau_tau_original: Some(x_second_1),
-                s_tau_tau_original: Some(s_second_1),
-                s_tau_tau_original_components: None,
-            },
+            DirectionalHyperParam::single_penalty(
+                0,
+                Array2::<f64>::zeros((x.nrows(), x.ncols())),
+                array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
+                Some(x_second_0),
+                Some(s_second_0),
+            )
+            .expect("single-penalty hyper direction"),
+            DirectionalHyperParam::single_penalty(
+                0,
+                Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
+                Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                Some(x_second_1),
+                Some(s_second_1),
+            )
+            .expect("single-penalty hyper direction"),
         ];
 
+        let pert_state = state
+            .build_joint_perturbed_state(&psi, &hyper_dirs)
+            .expect("perturbed state");
+        let bundle = pert_state.obtain_eval_bundle(&rho).expect("bundle");
         let mixed_analytic = state
-            .compute_mixed_rho_tau_block(&rho, &psi, &hyper_dirs)
+            .compute_mixed_rho_tau_block(&pert_state, &rho, &bundle, &hyper_dirs)
             .expect("analytic mixed block");
         assert_eq!(mixed_analytic.nrows(), rho.len());
         assert_eq!(mixed_analytic.ncols(), hyper_dirs.len());
@@ -846,28 +836,30 @@ mod tests {
         let rho = array![0.0];
         let psi = array![0.0, 0.0];
         let hyper_dirs = vec![
-            DirectionalHyperParam {
-                penalty_index: None,
-                x_tau_original: Array2::<f64>::zeros((x.nrows(), x.ncols())),
-                s_tau_original: array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
-                s_tau_original_components: None,
-                x_tau_tau_original: None,
-                s_tau_tau_original: None,
-                s_tau_tau_original_components: None,
-            },
-            DirectionalHyperParam {
-                penalty_index: None,
-                x_tau_original: Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
-                s_tau_original: Array2::<f64>::zeros((x.ncols(), x.ncols())),
-                s_tau_original_components: None,
-                x_tau_tau_original: None,
-                s_tau_tau_original: None,
-                s_tau_tau_original_components: None,
-            },
+            DirectionalHyperParam::single_penalty(
+                0,
+                Array2::<f64>::zeros((x.nrows(), x.ncols())),
+                array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
+                None,
+                None,
+            )
+            .expect("single-penalty hyper direction"),
+            DirectionalHyperParam::single_penalty(
+                0,
+                Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
+                Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                None,
+                None,
+            )
+            .expect("single-penalty hyper direction"),
         ];
 
+        let pert_state = state
+            .build_joint_perturbed_state(&psi, &hyper_dirs)
+            .expect("perturbed state");
+        let bundle = pert_state.obtain_eval_bundle(&rho).expect("bundle");
         let h_tt_analytic = state
-            .compute_tau_tau_block(&rho, &psi, &hyper_dirs)
+            .compute_tau_tau_block(&pert_state, &rho, &bundle, &hyper_dirs)
             .expect("analytic tau-tau block");
         assert_eq!(h_tt_analytic.nrows(), hyper_dirs.len());
         assert_eq!(h_tt_analytic.ncols(), hyper_dirs.len());
@@ -942,15 +934,14 @@ mod tests {
         for j in 1..p {
             s0[[j, j]] = 0.5 + (j as f64) / (p as f64);
         }
-        let hyper = DirectionalHyperParam {
-            penalty_index: None,
-            x_tau_original: Array2::from_elem((n, p), 5e-5),
-            s_tau_original: Array2::<f64>::zeros((p, p)),
-            s_tau_original_components: None,
-            x_tau_tau_original: None,
-            s_tau_tau_original: None,
-            s_tau_tau_original_components: None,
-        };
+        let hyper = DirectionalHyperParam::single_penalty(
+            0,
+            Array2::from_elem((n, p), 5e-5),
+            Array2::<f64>::zeros((p, p)),
+            None,
+            None,
+        )
+        .expect("single-penalty hyper direction");
         let rho = array![0.0];
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
@@ -1032,24 +1023,197 @@ trait PenalizedGeometry {
 }
 
 #[derive(Clone)]
+pub(crate) struct PenaltyDerivativeComponent {
+    pub(crate) penalty_index: usize,
+    pub(crate) matrix: Array2<f64>,
+}
+
+#[derive(Clone)]
 pub(crate) struct DirectionalHyperParam {
-    // If set, derivatives are with respect to this penalty block S_k(psi), unscaled by lambda_k.
-    // If None, derivatives are interpreted as already assembled total-penalty derivatives.
-    pub penalty_index: Option<usize>,
     pub x_tau_original: Array2<f64>,
-    pub s_tau_original: Array2<f64>,
-    // Optional multi-penalty decomposition for a single tau direction:
-    //   dS/dtau = sum_m exp(rho[k_m]) * S_tau_components[m].
-    // This is required when one tau affects multiple penalty blocks.
-    pub s_tau_original_components: Option<Vec<(usize, Array2<f64>)>>,
+    // Canonical penalty representation: every tau direction is decomposed into
+    // base-penalty derivatives. There is no separate "assembled total" path.
+    penalty_first_components: Vec<PenaltyDerivativeComponent>,
     // Optional pairwise second hyper-derivatives against all tau directions.
     // If provided, each vector must have length psi_dim and hold X_{tau_i,tau_j}
-    // / S_{tau_i,tau_j} in original coordinates.
+    // in original coordinates.
     pub x_tau_tau_original: Option<Vec<Array2<f64>>>,
-    pub s_tau_tau_original: Option<Vec<Array2<f64>>>,
-    // Optional multi-penalty decomposition for pairwise second derivatives:
-    //   d2S/dtau_i dtau_j = sum_m exp(rho[k_m]) * S_tau_tau_components[i][j][m].
-    pub s_tau_tau_original_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
+    // Pairwise second derivatives are stored in the same canonical base-penalty
+    // decomposition as the first derivatives.
+    penalty_second_components: Option<Vec<Vec<PenaltyDerivativeComponent>>>,
+}
+
+impl DirectionalHyperParam {
+    fn canonicalize_penalty_components(
+        components: Vec<(usize, Array2<f64>)>,
+    ) -> Result<Vec<PenaltyDerivativeComponent>, EstimationError> {
+        let mut out: Vec<PenaltyDerivativeComponent> = Vec::with_capacity(components.len());
+        for (penalty_index, matrix) in components {
+            if out.iter().any(|c| c.penalty_index == penalty_index) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "duplicate penalty derivative component for penalty {}",
+                    penalty_index
+                )));
+            }
+            out.push(PenaltyDerivativeComponent {
+                penalty_index,
+                matrix,
+            });
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn new(
+        x_tau_original: Array2<f64>,
+        penalty_first_components: Vec<(usize, Array2<f64>)>,
+        x_tau_tau_original: Option<Vec<Array2<f64>>>,
+        penalty_second_components: Option<Vec<Vec<(usize, Array2<f64>)>>>,
+    ) -> Result<Self, EstimationError> {
+        let penalty_first_components =
+            Self::canonicalize_penalty_components(penalty_first_components)?;
+        let penalty_second_components = match penalty_second_components {
+            Some(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    out.push(Self::canonicalize_penalty_components(row)?);
+                }
+                Some(out)
+            }
+            None => None,
+        };
+        Ok(Self {
+            x_tau_original,
+            penalty_first_components,
+            x_tau_tau_original,
+            penalty_second_components,
+        })
+    }
+
+    pub(crate) fn single_penalty(
+        penalty_index: usize,
+        x_tau_original: Array2<f64>,
+        s_tau_original: Array2<f64>,
+        x_tau_tau_original: Option<Vec<Array2<f64>>>,
+        s_tau_tau_original: Option<Vec<Array2<f64>>>,
+    ) -> Result<Self, EstimationError> {
+        let penalty_second_components = s_tau_tau_original.map(|rows| {
+            rows.into_iter()
+                .map(|mat| vec![(penalty_index, mat)])
+                .collect::<Vec<_>>()
+        });
+        Self::new(
+            x_tau_original,
+            vec![(penalty_index, s_tau_original)],
+            x_tau_tau_original,
+            penalty_second_components,
+        )
+    }
+
+    pub(crate) fn zero_penalty(
+        x_tau_original: Array2<f64>,
+        x_tau_tau_original: Option<Vec<Array2<f64>>>,
+        psi_dim: usize,
+    ) -> Result<Self, EstimationError> {
+        Self::new(
+            x_tau_original,
+            Vec::new(),
+            x_tau_tau_original,
+            Some(vec![Vec::new(); psi_dim]),
+        )
+    }
+
+    pub(crate) fn penalty_first_components(&self) -> &[PenaltyDerivativeComponent] {
+        &self.penalty_first_components
+    }
+
+    pub(crate) fn penalty_second_components_for(
+        &self,
+        j: usize,
+    ) -> Option<&[PenaltyDerivativeComponent]> {
+        self.penalty_second_components
+            .as_ref()
+            .and_then(|rows| rows.get(j))
+            .map(|row| row.as_slice())
+    }
+
+    pub(crate) fn penalty_second_component_rows(
+        &self,
+    ) -> Option<&[Vec<PenaltyDerivativeComponent>]> {
+        self.penalty_second_components.as_deref()
+    }
+
+    pub(crate) fn penalty_total_at(
+        &self,
+        rho: &Array1<f64>,
+        p: usize,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let mut total = Array2::<f64>::zeros((p, p));
+        for component in &self.penalty_first_components {
+            if component.penalty_index >= rho.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "penalty_index {} out of bounds for rho dimension {}",
+                    component.penalty_index,
+                    rho.len()
+                )));
+            }
+            total.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+        }
+        Ok(total)
+    }
+
+    pub(crate) fn penalty_component_matrix(
+        &self,
+        penalty_index: usize,
+        p: usize,
+    ) -> Array2<f64> {
+        if let Some(component) = self
+            .penalty_first_components
+            .iter()
+            .find(|component| component.penalty_index == penalty_index)
+        {
+            return component.matrix.clone();
+        }
+        Array2::<f64>::zeros((p, p))
+    }
+
+    pub(crate) fn penalty_second_total_at(
+        &self,
+        rho: &Array1<f64>,
+        j: usize,
+        p: usize,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let mut total = Array2::<f64>::zeros((p, p));
+        if let Some(components) = self.penalty_second_components_for(j) {
+            for component in components {
+                if component.penalty_index >= rho.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "penalty_index {} out of bounds for rho dimension {}",
+                        component.penalty_index,
+                        rho.len()
+                    )));
+                }
+                total.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+            }
+        }
+        Ok(total)
+    }
+
+    pub(crate) fn penalty_second_component_matrix(
+        &self,
+        j: usize,
+        penalty_index: usize,
+        p: usize,
+    ) -> Array2<f64> {
+        if let Some(components) = self.penalty_second_components_for(j) {
+            if let Some(component) = components
+                .iter()
+                .find(|component| component.penalty_index == penalty_index)
+            {
+                return component.matrix.clone();
+            }
+        }
+        Array2::<f64>::zeros((p, p))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1125,6 +1289,13 @@ struct FirthDirection {
     g_u_reduced: Array2<f64>,
     a_u_reduced: Array2<f64>,
     dh: Array1<f64>,
+    // B_u = diag(w'' ⊙ δη_u) X and invariant contractions derived from it.
+    b_u_vec: Array1<f64>,
+    b_u_base: Array2<f64>,
+    b_u_base_t: Array2<f64>,
+    p_bu_base: Array2<f64>,
+    // P_u B = -2 (M ⊙ N_u) B in matrix-free reduced form.
+    p_u_b_base: Array2<f64>,
 }
 
 #[derive(Clone)]
@@ -1233,10 +1404,13 @@ struct EvalShared {
     /// Relative eigengap between kept and dropped spectra around the H_+
     /// threshold used for pseudo-logdet derivatives (if available).
     active_subspace_rel_gap: Option<f64>,
-    /// True when the H_+ active subspace is numerically near a crossing.
-    /// In that regime, second-order outer derivatives are piecewise-smooth and
-    /// we automatically downgrade to safer policies instead of trusting exact
-    /// Hessian identities that assume a fixed active projector.
+    /// True when the H_+ active subspace is numerically near a hard-threshold
+    /// crossing. In that regime, the truncated logdet objective no longer has
+    /// a clean fixed-projector derivative model: even first-order derivatives
+    /// cease to be exact at the crossing, and second-order identities are more
+    /// fragile still. We use this flag to suppress "exact Hessian" claims and
+    /// other branch-local second-order logic that assumes a fixed active
+    /// projector.
     active_subspace_unstable: bool,
     sparse_exact: Option<Arc<SparseExactEvalData>>,
     firth_dense_operator: Option<Arc<FirthDenseOperator>>,

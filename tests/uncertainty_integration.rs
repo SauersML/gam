@@ -1,12 +1,12 @@
-use gam::probability::try_inverse_link_array;
+use gam::estimate::FittedLinkParameters;
 use gam::mixture_link::state_from_spec;
+use gam::probability::try_inverse_link_array;
 use gam::types::LinkComponent;
 use gam::{
     FitOptions, InferenceCovarianceMode, LikelihoodFamily, MeanIntervalMethod,
     PredictUncertaintyOptions, coefficient_uncertainty, fit_gam, predict_gam_posterior_mean,
     predict_gam_with_uncertainty,
 };
-use gam::estimate::FittedLinkParameters;
 use ndarray::{Array1, Array2};
 
 #[test]

@@ -441,15 +441,11 @@ impl<'a> RemlState<'a> {
                 hyper_dir.x_tau_original.ncols()
             )));
         }
-        if hyper_dir.s_tau_original.nrows() != p || hyper_dir.s_tau_original.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "S_tau shape mismatch for sparse directional gradient: expected {}x{}, got {}x{}",
-                p,
-                p,
-                hyper_dir.s_tau_original.nrows(),
-                hyper_dir.s_tau_original.ncols()
-            )));
-        }
+        Self::validate_penalty_component_shapes(
+            hyper_dir.penalty_first_components(),
+            p,
+            "S_tau",
+        )?;
         let firth_logit_active = self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit);
 
@@ -458,18 +454,7 @@ impl<'a> RemlState<'a> {
             * &(&pirls_result.solve_working_response - &pirls_result.final_eta);
 
         let x_tau_beta = hyper_dir.x_tau_original.dot(&beta);
-        let s_tau_total = if let Some(k) = hyper_dir.penalty_index {
-            if k >= rho.len() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "penalty_index {} out of bounds for rho dimension {}",
-                    k,
-                    rho.len()
-                )));
-            }
-            hyper_dir.s_tau_original.mapv(|v| rho[k].exp() * v)
-        } else {
-            hyper_dir.s_tau_original.clone()
-        };
+        let s_tau_total = hyper_dir.penalty_total_at(rho, p)?;
         let weighted_x_tau_beta = &pirls_result.solve_weights * &x_tau_beta;
         let mut g_psi = hyper_dir.x_tau_original.t().dot(&u)
             - self.x().transpose_vector_multiply(&weighted_x_tau_beta)
@@ -508,13 +493,10 @@ impl<'a> RemlState<'a> {
         let fit_block =
             -u.dot(&x_tau_beta) + 0.5 * beta.dot(&s_tau_total.dot(&beta)) + fit_firth_partial;
 
-        let block_support = hyper_dir
-            .penalty_index
-            .and_then(|k| Self::sparse_operator_support_for_term(sparse, k));
         let trace_s_tau = self.trace_hinv_operator_sparse_dispatch(
             sparse,
             p,
-            block_support,
+            None,
             |basis_block: &Array2<f64>| Ok(s_tau_total.dot(basis_block)),
         )?;
         let cross = self.sparse_exact_weighted_cross_trace_xtau(
@@ -1040,6 +1022,10 @@ impl<'a> RemlState<'a> {
             };
         }
         if bundle.active_subspace_unstable {
+            // Hard-truncated logdet identities are only branch-local in rho.
+            // Once the retained H_+ eigenspace is near a threshold crossing,
+            // we stop calling the spectral Hessian "exact" and fall back to
+            // the safer analytic policy.
             return HessianStrategyDecision {
                 strategy: HessianEvalStrategyKind::AnalyticFallback,
                 reason: "active_subspace_unstable",

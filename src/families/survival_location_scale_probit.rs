@@ -386,7 +386,6 @@ impl SurvivalLocationScaleProbitFamily {
             (s, r, dr, ddr)
         }
     }
-
 }
 
 fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(), String> {

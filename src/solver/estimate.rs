@@ -499,16 +499,24 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
 ///   smoothing/heat operator `exp(0.5 * Delta_Sigma)` (equivalently Wick/Isserlis
 ///   contractions of high-order derivatives).
 /// - Those infinite-series corrections are not expanded in this routine.
+pub(crate) struct SmoothingCorrectionComputation {
+    pub correction: Option<Array2<f64>>,
+    pub hessian_rho: Option<Array2<f64>>,
+}
+
 fn compute_smoothing_correction(
     reml_state: &RemlState<'_>,
     final_rho: &Array1<f64>,
     final_fit: &pirls::PirlsResult,
-) -> Option<Array2<f64>> {
+) -> SmoothingCorrectionComputation {
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 
     let n_rho = final_rho.len();
     if n_rho == 0 {
-        return None;
+        return SmoothingCorrectionComputation {
+            correction: None,
+            hessian_rho: None,
+        };
     }
 
     let n_coeffs_trans = final_fit.beta_transformed.len();
@@ -543,7 +551,10 @@ fn compute_smoothing_correction(
         Ok(c) => c,
         Err(_) => {
             log::warn!("Cholesky decomposition failed for smoothing correction; skipping.");
-            return None;
+            return SmoothingCorrectionComputation {
+                correction: None,
+                hessian_rho: None,
+            };
         }
     };
 
@@ -588,7 +599,10 @@ fn compute_smoothing_correction(
                         "Analytic fallback Hessian unavailable ({}); skipping smoothing correction.",
                         fallback_err
                     );
-                    return None;
+                    return SmoothingCorrectionComputation {
+                        correction: None,
+                        hessian_rho: None,
+                    };
                 }
             }
         }
@@ -628,7 +642,10 @@ fn compute_smoothing_correction(
         }
         Err(_) => {
             log::warn!("Failed to invert LAML Hessian for smoothing correction; skipping.");
-            return None;
+            return SmoothingCorrectionComputation {
+                correction: None,
+                hessian_rho: Some(hessian_rho),
+            };
         }
     };
 
@@ -652,7 +669,10 @@ fn compute_smoothing_correction(
     // Validate the result
     if !v_corr_orig.iter().all(|v| v.is_finite()) {
         log::warn!("Non-finite values in smoothing correction matrix; skipping.");
-        return None;
+        return SmoothingCorrectionComputation {
+            correction: None,
+            hessian_rho: Some(hessian_rho),
+        };
     }
 
     // Ensure positive semi-definiteness by clamping negative eigenvalues
@@ -676,15 +696,20 @@ fn compute_smoothing_correction(
                         }
                     }
                 }
-                return Some(result);
+                return SmoothingCorrectionComputation {
+                    correction: Some(result),
+                    hessian_rho: Some(hessian_rho),
+                };
             }
         }
         Err(_) => {
             log::warn!("Eigendecomposition failed for smoothing correction validation.");
         }
     }
-
-    Some(v_corr_orig)
+    SmoothingCorrectionComputation {
+        correction: Some(v_corr_orig),
+        hessian_rho: Some(hessian_rho),
+    }
 }
 
 /// A comprehensive error type for the model estimation process.
@@ -1164,31 +1189,32 @@ where
             "simultaneous mixture and SAS optimization is not supported".to_string(),
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
-        let outer_result = crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient(
-            k,
-            heuristic_lambdas,
-            |rho: &Array1<f64>| {
-                let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
+        let outer_result =
+            crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient(
+                k,
+                heuristic_lambdas,
+                |rho: &Array1<f64>| {
+                    let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
 
-                let t_cost = Instant::now();
-                let cost = reml_state.compute_cost(rho)?;
-                let cost_sec = t_cost.elapsed().as_secs_f64();
+                    let t_cost = Instant::now();
+                    let cost = reml_state.compute_cost(rho)?;
+                    let cost_sec = t_cost.elapsed().as_secs_f64();
 
-                let t_grad = Instant::now();
-                let grad = reml_state.compute_gradient(rho)?;
-                let grad_sec = t_grad.elapsed().as_secs_f64();
-                let used_stochastic = reml_state.last_gradient_used_stochastic_fallback();
-                log::info!(
-                    "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3})",
-                    rho.len(),
-                    used_stochastic,
-                    cost_sec,
-                    grad_sec,
-                );
-                Ok((cost, grad))
-            },
-            &smoothing_options,
-        )?;
+                    let t_grad = Instant::now();
+                    let grad = reml_state.compute_gradient(rho)?;
+                    let grad_sec = t_grad.elapsed().as_secs_f64();
+                    let used_stochastic = reml_state.last_gradient_used_stochastic_fallback();
+                    log::info!(
+                        "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3})",
+                        rho.len(),
+                        used_stochastic,
+                        cost_sec,
+                        grad_sec,
+                    );
+                    Ok((cost, grad))
+                },
+                &smoothing_options,
+            )?;
         (
             outer_result.rho.clone(),
             cfg.link_kind.mixture_state().cloned(),
@@ -2076,14 +2102,14 @@ where
         )));
     }
     for (idx, hyper_dir) in hyper_dirs.iter().enumerate() {
-        if let Some(k) = hyper_dir.penalty_index
-            && k >= s_list.len()
-        {
-            return Err(EstimationError::InvalidInput(format!(
-                "penalty_index for dir {idx} out of bounds: {} >= {}",
-                k,
-                s_list.len()
-            )));
+        for component in hyper_dir.penalty_first_components() {
+            if component.penalty_index >= s_list.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "penalty_index for dir {idx} out of bounds: {} >= {}",
+                    component.penalty_index,
+                    s_list.len()
+                )));
+            }
         }
         if hyper_dir.x_tau_original.nrows() != x.nrows() || hyper_dir.x_tau_original.ncols() != p {
             return Err(EstimationError::InvalidInput(format!(
@@ -2094,15 +2120,11 @@ where
                 hyper_dir.x_tau_original.ncols()
             )));
         }
-        if hyper_dir.s_tau_original.nrows() != p || hyper_dir.s_tau_original.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "S_tau[{idx}] must be {}x{}, got {}x{}",
-                p,
-                p,
-                hyper_dir.s_tau_original.nrows(),
-                hyper_dir.s_tau_original.ncols()
-            )));
-        }
+        RemlState::validate_penalty_component_shapes(
+            hyper_dir.penalty_first_components(),
+            p,
+            &format!("S_tau[{idx}]"),
+        )?;
         if let Some(x2) = hyper_dir.x_tau_tau_original.as_ref() {
             if x2.len() != psi_dim {
                 return Err(EstimationError::InvalidInput(format!(
@@ -2123,7 +2145,7 @@ where
                 }
             }
         }
-        if let Some(s2) = hyper_dir.s_tau_tau_original.as_ref() {
+        if let Some(s2) = hyper_dir.penalty_second_component_rows() {
             if s2.len() != psi_dim {
                 return Err(EstimationError::InvalidInput(format!(
                     "S_tau_tau[{idx}] length mismatch: expected {}, got {}",
@@ -2131,16 +2153,12 @@ where
                     s2.len()
                 )));
             }
-            for (j, s_ij) in s2.iter().enumerate() {
-                if s_ij.nrows() != p || s_ij.ncols() != p {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "S_tau_tau[{idx}][{j}] must be {}x{}, got {}x{}",
-                        p,
-                        p,
-                        s_ij.nrows(),
-                        s_ij.ncols()
-                    )));
-                }
+            for (j, components) in s2.iter().enumerate() {
+                RemlState::validate_penalty_component_shapes(
+                    components,
+                    p,
+                    &format!("S_tau_tau[{idx}][{j}]"),
+                )?;
             }
         }
     }
@@ -2927,8 +2945,7 @@ pub use crate::inference::predict::{
 };
 pub use crate::solver::smoothing::{
     SmoothingBfgsOptions, SmoothingBfgsResult, SmoothingOptimizerKind,
-    optimize_log_smoothing_with_multistart,
-    optimize_log_smoothing_with_multistart_parallel_fd,
+    optimize_log_smoothing_with_multistart, optimize_log_smoothing_with_multistart_parallel_fd,
     optimize_log_smoothing_with_multistart_with_gradient,
 };
 

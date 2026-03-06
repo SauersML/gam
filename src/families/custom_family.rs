@@ -2044,8 +2044,9 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
         };
 
         let work = &eval.block_working_sets[b];
-        let x_dense =
-            with_block_geometry(family, &inner.block_states, spec, b, |x_dyn, _| Ok(x_dyn.to_dense()))?;
+        let x_dense = with_block_geometry(family, &inner.block_states, spec, b, |x_dyn, _| {
+            Ok(x_dyn.to_dense())
+        })?;
 
         let (w, u, h_mode, h_inv) = match work {
             BlockWorkingSet::Diagonal {
@@ -2266,7 +2267,9 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                     options.ridge_floor,
                     options.ridge_policy,
                 )
-                .or_else(|_| pinv_positive_part(&h_mode, options.ridge_floor).map(|h_pinv| h_pinv.dot(&rhs)))?;
+                .or_else(|_| {
+                    pinv_positive_part(&h_mode, options.ridge_floor).map(|h_pinv| h_pinv.dot(&rhs))
+                })?;
                 let mut d_eta_mode = x_dense.dot(&u_psi);
                 trace_acc += apply_geometry_direction_to_eta_and_trace(
                     &x_dense,

@@ -1,3 +1,4 @@
+use gam::estimate::FittedLinkParameters;
 use gam::estimate::{
     ExternalOptimOptions, FitOptions, evaluate_external_theta_cost_gradient, fit_gam,
     fit_gam_with_heuristic_lambdas,
@@ -7,7 +8,6 @@ use gam::inference::predict::{
     predict_gam_with_uncertainty,
 };
 use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_from_spec};
-use gam::estimate::FittedLinkParameters;
 use gam::types::{LikelihoodFamily, LinkComponent, MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -355,7 +355,10 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
             "{name} intervals too wide on average: mean width={w:.3}"
         );
     }
-    for (name, c, w) in [("sas", c_sas, mean_width_sas), ("mixture", c_mix, mean_width_mix)] {
+    for (name, c, w) in [
+        ("sas", c_sas, mean_width_sas),
+        ("mixture", c_mix, mean_width_mix),
+    ] {
         assert!(
             c.is_finite() && (0.0..=1.0).contains(&c),
             "{name} coverage must be finite and in [0,1], got {c:.3}"
@@ -407,9 +410,7 @@ fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
         let z = (eps_hat / eps_bound).clamp(-0.999_999_999, 0.999_999_999);
         eps_bound * z.atanh()
     };
-    let rho_hat = fit_sas
-        .lambdas
-        .mapv(|lam| lam.max(1e-12).ln());
+    let rho_hat = fit_sas.lambdas.mapv(|lam| lam.max(1e-12).ln());
     let eval_opts_sas = ExternalOptimOptions {
         family: LikelihoodFamily::BinomialSas,
         mixture_link: None,
@@ -445,7 +446,13 @@ fn outer_profile_objective_stationary_near_fitted_sas_and_mixture_params() {
         .map_err(|e| e.to_string())
     };
     let fd_centered = |base_eps: f64, base_ld: f64, wrt_eps: bool| -> f64 {
-        let mut h = 1e-3 * (1.0 + if wrt_eps { base_eps.abs() } else { base_ld.abs() });
+        let mut h = 1e-3
+            * (1.0
+                + if wrt_eps {
+                    base_eps.abs()
+                } else {
+                    base_ld.abs()
+                });
         for _ in 0..6 {
             let central = |step: f64| -> Option<f64> {
                 let (ep_p, ld_p) = if wrt_eps {

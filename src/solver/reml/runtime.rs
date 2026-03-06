@@ -909,16 +909,16 @@ impl<'a> RemlState<'a> {
             };
         let active_subspace_unstable =
             active_subspace_rel_gap.is_some_and(|rel_gap| rel_gap < 1e-6);
-        // Active-subspace stability diagnostic for pseudo-logdet derivatives.
-        // Exact second-order identities for log|H|_+ assume a fixed positive
-        // eigenspace. When retained and dropped eigenvalues crowd the threshold,
-        // the objective is near a non-smooth boundary and Hessian updates can be
-        // numerically fragile.
+        // Active-subspace stability diagnostic for hard-truncated logdet
+        // derivatives. The branch-local formulas used elsewhere assume a fixed
+        // retained eigenspace; once retained and dropped eigenvalues crowd the
+        // threshold, even first-order exactness is no longer justified at the
+        // crossing and second-order updates are especially fragile.
         if log::log_enabled!(log::Level::Warn) {
             if active_subspace_unstable {
                 let rel_gap = active_subspace_rel_gap.unwrap_or(f64::NAN);
                 log::warn!(
-                    "[REML] H_+ active-subspace is near instability: min_kept={:.3e}, max_dropped={:.3e}, threshold={:.3e}, rel_gap={:.3e}",
+                    "[REML] H_+ active-subspace is near a hard-threshold crossing: min_kept={:.3e}, max_dropped={:.3e}, threshold={:.3e}, rel_gap={:.3e}; exact truncated-logdet derivatives are branch-local only",
                     min_kept,
                     max_dropped,
                     eig_threshold,

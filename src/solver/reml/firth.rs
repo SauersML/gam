@@ -269,32 +269,44 @@ impl<'a> RemlState<'a> {
                 wi * ti * ti * ti * ti - 22.0 * wi2 * ti * ti + 16.0 * wi3
             };
         }
-        // Build a fixed identifiable basis Q for Col(Xᵀ) from XᵀX eigenvectors.
-        // This gives a pseudoinverse-compatible representation:
-        //   I_+^† = Q I_r^{-1} Qᵀ,   I_r = (XQ)ᵀ W (XQ).
+        // Build a fixed identifiable basis Q for Col(Xᵀ).
+        //
+        // Exact fast path: if XᵀX is already SPD, then X has full column rank and
+        // the identifiable subspace is the whole coefficient space. In that case
+        // we can set Q = I exactly and skip the expensive eigendecomposition.
+        // This preserves the same Jeffreys/Firth objective because
+        //   Col(Xᵀ) = R^p, I_+^† = I^{-1}, and log|XᵀWX|_+ = log|XᵀWX|.
+        //
+        // We only fall back to the spectral route when X is rank-deficient.
         let gram = fast_atb(x_dense, x_dense);
-        let (evals, evecs) = gram
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
-        let max_eval = evals.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-        let tol = (p.max(1) as f64) * f64::EPSILON * max_eval;
-        let keep: Vec<usize> = evals
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &v)| if v > tol { Some(i) } else { None })
-            .collect();
-        let r = keep.len();
+        let (q_basis, x_reduced) = if gram.cholesky(Side::Lower).is_ok() {
+            (Array2::<f64>::eye(p), x_dense.clone())
+        } else {
+            let (evals, evecs) = gram
+                .eigh(Side::Lower)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let max_eval = evals.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+            let tol = (p.max(1) as f64) * f64::EPSILON * max_eval;
+            let keep: Vec<usize> = evals
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v > tol { Some(i) } else { None })
+                .collect();
+            let r = keep.len();
+            if r == 0 {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
+            }
 
-        let mut q_basis = Array2::<f64>::zeros((p, r));
-        for (col_idx, &eig_idx) in keep.iter().enumerate() {
-            q_basis.column_mut(col_idx).assign(&evecs.column(eig_idx));
-        }
-        if r == 0 {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-        let x_reduced = fast_ab(x_dense, &q_basis);
+            let mut q_basis = Array2::<f64>::zeros((p, r));
+            for (col_idx, &eig_idx) in keep.iter().enumerate() {
+                q_basis.column_mut(col_idx).assign(&evecs.column(eig_idx));
+            }
+            let x_reduced = fast_ab(x_dense, &q_basis);
+            (q_basis, x_reduced)
+        };
+        let r = q_basis.ncols();
 
         let weighted_x_reduced = Self::row_scale(&x_reduced, &w);
         // Reduced Fisher on the identifiable subspace:
@@ -413,11 +425,32 @@ impl<'a> RemlState<'a> {
         // Dh[u] = -diag(N_u),  N_u = X T_u Xᵀ, represented here as
         //   N_u = Z A_u Zᵀ in weighted reduced coordinates.
         let dh = -Self::reduced_diag_gram(&op.z_reduced, &a_u_reduced);
+        let b_u_vec = &op.w2 * &deta;
+        let b_u_base = &op.x_dense * &b_u_vec.view().insert_axis(Axis(1));
+        let b_u_base_t = b_u_base.t().to_owned();
+        let p_bu_base = Self::apply_hadamard_gram_to_matrix(
+            &op.z_reduced,
+            &op.k_reduced,
+            &op.k_reduced,
+            &b_u_base,
+        );
+        let mut p_u_b_base = Self::apply_hadamard_gram_to_matrix(
+            &op.z_reduced,
+            &op.k_reduced,
+            &a_u_reduced,
+            &op.b_base,
+        );
+        p_u_b_base.mapv_inplace(|val| -2.0 * val);
         FirthDirection {
             deta,
             g_u_reduced,
             a_u_reduced,
             dh,
+            b_u_vec,
+            b_u_base,
+            b_u_base_t,
+            p_bu_base,
+            p_u_b_base,
         }
     }
 
@@ -443,20 +476,16 @@ impl<'a> RemlState<'a> {
         let q_v = &eta_v * &op.w1.view().insert_axis(Axis(1));
         let m_q_v =
             Self::apply_hadamard_gram_to_matrix(&op.z_reduced, &op.k_reduced, &op.k_reduced, &q_v);
-        let bu_vec = &op.w2 * &dir.deta;
-        let bu_v = &eta_v * &bu_vec.view().insert_axis(Axis(1));
-        let m_bu_v =
-            Self::apply_hadamard_gram_to_matrix(&op.z_reduced, &op.k_reduced, &op.k_reduced, &bu_v);
-        let mut p_u_q_v = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
-            &dir.a_u_reduced,
-            &q_v,
-        );
-        p_u_q_v.mapv_inplace(|v| -2.0 * v);
+        let bu_vec = &dir.b_u_vec;
+        let m_bu_v = fast_ab(&dir.p_bu_base, rhs);
+        let p_u_q_v = fast_ab(&dir.p_u_b_base, rhs);
         let c_u = &(&op.w3 * &dir.deta) * &op.h_diag + &(&op.w2 * &dir.dh);
-        let diag_term = op.x_dense_t.dot(&(&eta_v * &c_u.view().insert_axis(Axis(1))));
-        let term1 = op.x_dense_t.dot(&(&m_q_v * &bu_vec.view().insert_axis(Axis(1))));
+        let diag_term = op
+            .x_dense_t
+            .dot(&(&eta_v * &c_u.view().insert_axis(Axis(1))));
+        let term1 = op
+            .x_dense_t
+            .dot(&(&m_q_v * &bu_vec.view().insert_axis(Axis(1))));
         let term2 = op
             .x_dense_t
             .dot(&(&m_bu_v * &op.w1.view().insert_axis(Axis(1))));
@@ -543,13 +572,13 @@ impl<'a> RemlState<'a> {
             + &(&op.w2 * &d2h);
 
         let eta_rhs = op.x_dense.dot(rhs);
-        let diag_term = op.x_dense_t.dot(&(&eta_rhs * &c_uv.view().insert_axis(Axis(1))));
+        let diag_term = op
+            .x_dense_t
+            .dot(&(&eta_rhs * &c_uv.view().insert_axis(Axis(1))));
 
         let b_uv_vec = &op.w3 * &deta_uv;
-        let b_u_vec = &op.w2 * &u.deta;
-        let b_v_vec = &op.w2 * &v.deta;
-        let b_u_base = &op.x_dense * &b_u_vec.view().insert_axis(Axis(1));
-        let b_v_base = &op.x_dense * &b_v_vec.view().insert_axis(Axis(1));
+        let b_u_base = &u.b_u_base;
+        let b_v_base = &v.b_u_base;
         let b_uv_base = &op.x_dense * &b_uv_vec.view().insert_axis(Axis(1));
 
         // Linearity in the rhs argument lets us precompute the expensive
@@ -557,19 +586,9 @@ impl<'a> RemlState<'a> {
         // then post-multiply by rhs. This preserves the exact operator while
         // avoiding repeated O(n r^2 c) work for every rhs block.
         let p_b_rhs = fast_ab(&op.p_b_base, rhs);
-        let p_bu_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
-            &op.k_reduced,
-            &b_u_base,
-        );
+        let p_bu_base = &u.p_bu_base;
         let p_bu_rhs = fast_ab(&p_bu_base, rhs);
-        let p_bv_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
-            &op.k_reduced,
-            &b_v_base,
-        );
+        let p_bv_base = &v.p_bu_base;
         let p_bv_rhs = fast_ab(&p_bv_base, rhs);
         let p_buv_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
@@ -579,13 +598,7 @@ impl<'a> RemlState<'a> {
         );
         let p_buv_rhs = fast_ab(&p_buv_base, rhs);
 
-        let mut p_v_b_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
-            &v.a_u_reduced,
-            &op.b_base,
-        );
-        p_v_b_base.mapv_inplace(|val| -2.0 * val);
+        let p_v_b_base = &v.p_u_b_base;
         let p_v_b_rhs = fast_ab(&p_v_b_base, rhs);
         let mut p_v_bu_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
@@ -595,13 +608,7 @@ impl<'a> RemlState<'a> {
         );
         p_v_bu_base.mapv_inplace(|val| -2.0 * val);
         let p_v_bu_rhs = fast_ab(&p_v_bu_base, rhs);
-        let mut p_u_b_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
-            &u.a_u_reduced,
-            &op.b_base,
-        );
-        p_u_b_base.mapv_inplace(|val| -2.0 * val);
+        let p_u_b_base = &u.p_u_b_base;
         let p_u_b_rhs = fast_ab(&p_u_b_base, rhs);
         let mut p_u_bv_base = Self::apply_hadamard_gram_to_matrix(
             &op.z_reduced,
@@ -627,9 +634,9 @@ impl<'a> RemlState<'a> {
         let p_uv_base = 2.0 * p_nu_nv_base - 2.0 * p_hw_nuv_base;
         let p_uv_rhs = fast_ab(&p_uv_base, rhs);
         let left_uv = b_uv_base.t().to_owned();
-        let left_u = b_u_base.t().to_owned();
-        let left_v = b_v_base.t().to_owned();
-        let left_b = op.b_base_t.clone();
+        let left_u = &u.b_u_base_t;
+        let left_v = &v.b_u_base_t;
+        let left_b = &op.b_base_t;
 
         // Nine-term expansion of D²J₂[u,v] with J₂ = Bᵀ P B.
         let d2_terms = [

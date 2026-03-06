@@ -1411,7 +1411,9 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     noise_design,
                 )?;
                 let rho = theta
-                    .slice(ndarray::s![..blocks.iter().map(|b| b.penalties.len()).sum::<usize>()])
+                    .slice(ndarray::s![
+                        ..blocks.iter().map(|b| b.penalties.len()).sum::<usize>()
+                    ])
                     .to_owned();
                 let eval = evaluate_custom_family_joint_hyper(
                     &family,
@@ -2529,10 +2531,7 @@ fn second_directional_hessian_coeff_from_objective_q_terms(
     let d_qaqb_v = dq_a_v * q_b + q_a * dq_b_v;
     let d2_qaqb_uv = d2q_a_uv * q_b + dq_a_u * dq_b_v + dq_a_v * dq_b_u + q_a * d2q_b_uv;
     m4 * dq_u * dq_v * q_a * q_b
-        + m3 * (d2q_uv * q_a * q_b
-            + dq_u * d_qaqb_v
-            + dq_v * d_qaqb_u
-            + dq_u * dq_v * q_ab)
+        + m3 * (d2q_uv * q_a * q_b + dq_u * d_qaqb_v + dq_v * d_qaqb_u + dq_u * dq_v * q_ab)
         + m2 * (d2_qaqb_uv + d2q_uv * q_ab + dq_u * dq_ab_v + dq_v * dq_ab_u)
         + m1 * d2q_ab_uv
 }
