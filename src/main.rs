@@ -682,7 +682,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
 
     let spec = build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)?;
-    let spatial_usage_warnings = collect_spatial_smooth_usage_warnings(&spec, &ds.headers, "model");
+    let mut spatial_usage_warnings =
+        collect_spatial_smooth_usage_warnings(&spec, &ds.headers, "model");
+    spatial_usage_warnings.extend(collect_linear_smooth_overlap_warnings(
+        &spec,
+        &ds.headers,
+        "model",
+    ));
     emit_spatial_smooth_usage_warnings("fit-start", &spatial_usage_warnings);
     if !args.no_summary {
         print_inference_summary(&inference_notes);
@@ -985,7 +991,17 @@ fn run_fit_with_predict_noise(
     let mean_spec = build_term_spec(&parsed.terms, ds, col_map, inference_notes)?;
     let mut spatial_usage_warnings =
         collect_spatial_smooth_usage_warnings(&mean_spec, &ds.headers, "mean model");
+    spatial_usage_warnings.extend(collect_linear_smooth_overlap_warnings(
+        &mean_spec,
+        &ds.headers,
+        "mean model",
+    ));
     spatial_usage_warnings.extend(collect_spatial_smooth_usage_warnings(
+        &noise_spec,
+        &ds.headers,
+        "noise model",
+    ));
+    spatial_usage_warnings.extend(collect_linear_smooth_overlap_warnings(
         &noise_spec,
         &ds.headers,
         "noise model",
@@ -5393,6 +5409,61 @@ fn collect_spatial_smooth_usage_warnings(
         .collect()
 }
 
+fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
+    match &term.basis {
+        SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
+        SmoothBasisSpec::ThinPlate { feature_cols, .. }
+        | SmoothBasisSpec::Matern { feature_cols, .. }
+        | SmoothBasisSpec::Duchon { feature_cols, .. }
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
+    }
+}
+
+fn collect_linear_smooth_overlap_warnings(
+    spec: &TermCollectionSpec,
+    headers: &[String],
+    label: &str,
+) -> Vec<String> {
+    let linear_by_col = spec
+        .linear_terms
+        .iter()
+        .map(|term| (term.feature_col, term.name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut warnings = Vec::new();
+    for smooth in &spec.smooth_terms {
+        let overlaps = smooth_term_feature_cols(smooth)
+            .into_iter()
+            .filter_map(|col| {
+                linear_by_col.get(&col).map(|linear_name| {
+                    let feature_name = headers
+                        .get(col)
+                        .cloned()
+                        .unwrap_or_else(|| format!("#{col}"));
+                    (feature_name, (*linear_name).to_string())
+                })
+            })
+            .collect::<Vec<_>>();
+        if overlaps.is_empty() {
+            continue;
+        }
+        let overlap_features = overlaps
+            .iter()
+            .map(|(feature_name, _)| feature_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let linear_terms = overlaps
+            .iter()
+            .map(|(_, linear_name)| format!("linear({linear_name})"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        warnings.push(format!(
+            "{label}: feature(s) [{overlap_features}] appear both in smooth term `{}` and explicit linear term(s) `{linear_terms}`. This usually double-counts the same direction: the smooth already carries low-order structure for its own variables, so adding explicit linear terms on those same variables is typically redundant and can destabilize smoothing/identifiability.",
+            smooth.name
+        ));
+    }
+    warnings
+}
+
 fn emit_spatial_smooth_usage_warnings(stage: &str, warnings: &[String]) {
     for warning in warnings {
         eprintln!("WARNING [{stage}]: {warning}");
@@ -8084,11 +8155,12 @@ mod tests {
         BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, LikelihoodFamily, LinkMode,
         MODEL_VERSION, ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs,
         SurvivalTimeBasisConfig, apply_saved_probit_wiggle, build_survival_time_basis,
-        chi_square_survival_approx, collect_spatial_smooth_usage_warnings,
-        compute_probit_q0_from_eta, core_saved_fit_result, parse_duchon_order, parse_duchon_power,
-        parse_formula, parse_link_choice, parse_surv_response, parse_survival_inverse_link,
-        parse_survival_time_basis_config, pretty_family_name, saved_probit_wiggle_derivative_q0,
-        saved_probit_wiggle_design, summarize_wiggle_domain, survival_probability_from_eta,
+        chi_square_survival_approx, collect_linear_smooth_overlap_warnings,
+        collect_spatial_smooth_usage_warnings, compute_probit_q0_from_eta, core_saved_fit_result,
+        parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
+        parse_surv_response, parse_survival_inverse_link, parse_survival_time_basis_config,
+        pretty_family_name, saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design,
+        summarize_wiggle_domain, survival_probability_from_eta,
         write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
     use csv::StringRecord;
@@ -8101,7 +8173,10 @@ mod tests {
     };
     use gam::inference::model::FittedModelPayload;
     use gam::inference::model::SchemaColumn;
-    use gam::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
+    use gam::smooth::{
+        LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec,
+        SmoothTermSpec, TermCollectionSpec,
+    };
     use gam::types::{InverseLink, LinkComponent, LinkFunction};
     use gam::{FittedFamily, ModelKind};
     use ndarray::{Array1, ArrayView1, array};
@@ -8379,7 +8454,9 @@ mod tests {
         assert!(warnings[0].contains("3 separate 1D duchon spatial smooths"));
         assert!(warnings[0].contains("[pc1, pc2, pc3]"));
         assert!(warnings[0].contains("TIP:"));
-        assert!(warnings[0].contains("s(pc1, type=duchon) + s(pc2, type=duchon) + s(pc3, type=duchon)"));
+        assert!(
+            warnings[0].contains("s(pc1, type=duchon) + s(pc2, type=duchon) + s(pc3, type=duchon)")
+        );
         assert!(warnings[0].contains("duchon(pc1, pc2, pc3)"));
     }
 
@@ -8451,6 +8528,45 @@ mod tests {
         assert!(warnings[0].contains("2 separate 1D thinplate/tps spatial smooths"));
         assert!(warnings[0].contains("s(pc1, type=tps) + s(pc2, type=tps)"));
         assert!(warnings[0].contains("thinplate(pc1, pc2)"));
+    }
+
+    #[test]
+    fn warns_for_linear_terms_overlapping_with_smooth_variables() {
+        let spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "pc1".to_string(),
+                feature_col: 0,
+                double_penalty: true,
+                coefficient_geometry: LinearCoefficientGeometry::default(),
+                coefficient_min: None,
+                coefficient_max: None,
+            }],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon(pc1, pc2, pc3)".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1, 2],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                        length_scale: 1.0,
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
+
+        let warnings = collect_linear_smooth_overlap_warnings(&spec, &headers, "model");
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("feature(s) [pc1]"));
+        assert!(warnings[0].contains("duchon(pc1, pc2, pc3)"));
+        assert!(warnings[0].contains("linear(pc1)"));
+        assert!(warnings[0].contains("double-counts the same direction"));
     }
 
     #[test]

@@ -40,21 +40,6 @@ impl<'a> RemlState<'a> {
         trace
     }
 
-    fn sparse_operator_support_for_term(
-        sparse: &SparseExactEvalData,
-        term_index: usize,
-    ) -> Option<SparseOperatorBlockSupport> {
-        sparse
-            .penalty_blocks
-            .iter()
-            .find(|block| block.term_index == term_index)
-            .map(|block| SparseOperatorBlockSupport {
-                p_start: block.p_start,
-                p_end: block.p_end,
-                strict: block.block_support_strict,
-            })
-    }
-
     fn trace_hinv_operator_sparse_dispatch<F>(
         &self,
         sparse: &SparseExactEvalData,
@@ -441,11 +426,7 @@ impl<'a> RemlState<'a> {
                 hyper_dir.x_tau_original.ncols()
             )));
         }
-        Self::validate_penalty_component_shapes(
-            hyper_dir.penalty_first_components(),
-            p,
-            "S_tau",
-        )?;
+        Self::validate_penalty_component_shapes(hyper_dir.penalty_first_components(), p, "S_tau")?;
         let firth_logit_active = self.config.firth_bias_reduction
             && matches!(self.config.link_function(), LinkFunction::Logit);
 

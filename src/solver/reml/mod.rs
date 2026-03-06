@@ -173,8 +173,9 @@ mod tests {
         // and Firth-logit modes.
         let x_tau = Array2::<f64>::zeros(x.raw_dim());
         let s_tau = array![[0.0, 0.0, 0.0], [0.0, 0.25, 0.04], [0.0, 0.04, 0.15],];
-        let hyper = DirectionalHyperParam::single_penalty(0, x_tau.clone(), s_tau.clone(), None, None)
-            .expect("single-penalty hyper direction");
+        let hyper =
+            DirectionalHyperParam::single_penalty(0, x_tau.clone(), s_tau.clone(), None, None)
+                .expect("single-penalty hyper direction");
         let rho = array![0.0];
 
         let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, false);
@@ -1089,6 +1090,7 @@ impl DirectionalHyperParam {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn single_penalty(
         penalty_index: usize,
         x_tau_original: Array2<f64>,
@@ -1106,19 +1108,6 @@ impl DirectionalHyperParam {
             vec![(penalty_index, s_tau_original)],
             x_tau_tau_original,
             penalty_second_components,
-        )
-    }
-
-    pub(crate) fn zero_penalty(
-        x_tau_original: Array2<f64>,
-        x_tau_tau_original: Option<Vec<Array2<f64>>>,
-        psi_dim: usize,
-    ) -> Result<Self, EstimationError> {
-        Self::new(
-            x_tau_original,
-            Vec::new(),
-            x_tau_tau_original,
-            Some(vec![Vec::new(); psi_dim]),
         )
     }
 
@@ -1157,43 +1146,6 @@ impl DirectionalHyperParam {
                 )));
             }
             total.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
-        }
-        Ok(total)
-    }
-
-    pub(crate) fn penalty_component_matrix(
-        &self,
-        penalty_index: usize,
-        p: usize,
-    ) -> Array2<f64> {
-        if let Some(component) = self
-            .penalty_first_components
-            .iter()
-            .find(|component| component.penalty_index == penalty_index)
-        {
-            return component.matrix.clone();
-        }
-        Array2::<f64>::zeros((p, p))
-    }
-
-    pub(crate) fn penalty_second_total_at(
-        &self,
-        rho: &Array1<f64>,
-        j: usize,
-        p: usize,
-    ) -> Result<Array2<f64>, EstimationError> {
-        let mut total = Array2::<f64>::zeros((p, p));
-        if let Some(components) = self.penalty_second_components_for(j) {
-            for component in components {
-                if component.penalty_index >= rho.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "penalty_index {} out of bounds for rho dimension {}",
-                        component.penalty_index,
-                        rho.len()
-                    )));
-                }
-                total.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
-            }
         }
         Ok(total)
     }

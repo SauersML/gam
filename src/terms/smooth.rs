@@ -311,13 +311,19 @@ pub struct TwoBlockSpatialLengthScaleOptimizationResult<FitOut> {
 
 #[derive(Debug, Clone)]
 pub struct TwoBlockExactJointHyperSetup {
-    pub theta0: Array1<f64>,
-    pub lower: Array1<f64>,
-    pub upper: Array1<f64>,
+    // Exact-joint setup is parameterized in (rho, log_kappa). The spec still stores
+    // length_scale, so conversion happens only when rebuilding a candidate spec.
+    rho0: Array1<f64>,
+    rho_lower: Array1<f64>,
+    rho_upper: Array1<f64>,
+    log_kappa0: SpatialLogKappaCoords,
+    log_kappa_lower: SpatialLogKappaCoords,
+    log_kappa_upper: SpatialLogKappaCoords,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SpatialPsiDerivative {
+    // These are derivatives with respect to psi = log(kappa), not log(length_scale).
     pub penalty_index: usize,
     pub penalty_indices: Vec<usize>,
     pub x_psi: Array2<f64>,
@@ -326,6 +332,133 @@ pub(crate) struct SpatialPsiDerivative {
     pub x_psi_psi: Array2<f64>,
     pub s_psi_psi: Array2<f64>,
     pub s_psi_psi_components: Vec<Array2<f64>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SpatialLogKappaCoords(Array1<f64>);
+
+impl SpatialLogKappaCoords {
+    pub(crate) fn new(values: Array1<f64>) -> Self {
+        Self(values)
+    }
+
+    pub(crate) fn from_length_scales(
+        spec: &TermCollectionSpec,
+        term_indices: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        let mut out = Array1::<f64>::zeros(term_indices.len());
+        for (slot, &term_idx) in term_indices.iter().enumerate() {
+            let length_scale = get_spatial_length_scale(spec, term_idx)
+                .unwrap_or(options.min_length_scale)
+                .clamp(options.min_length_scale, options.max_length_scale);
+            out[slot] = -length_scale.ln();
+        }
+        Self(out)
+    }
+
+    pub(crate) fn lower_bounds(
+        dim: usize,
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        Self(Array1::<f64>::from_elem(
+            dim,
+            -options.max_length_scale.ln(),
+        ))
+    }
+
+    pub(crate) fn upper_bounds(
+        dim: usize,
+        options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Self {
+        Self(Array1::<f64>::from_elem(
+            dim,
+            -options.min_length_scale.ln(),
+        ))
+    }
+
+    fn from_theta_tail(theta: &Array1<f64>, start: usize) -> Self {
+        Self(theta.slice(s![start..]).to_owned())
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn as_array(&self) -> &Array1<f64> {
+        &self.0
+    }
+
+    fn split_at(&self, mid: usize) -> (Self, Self) {
+        (
+            Self(self.0.slice(s![0..mid]).to_owned()),
+            Self(self.0.slice(s![mid..]).to_owned()),
+        )
+    }
+
+    fn to_log_length_scales(&self) -> Array1<f64> {
+        self.0.mapv(|v| -v)
+    }
+
+    fn apply_to_spec(
+        &self,
+        spec: &TermCollectionSpec,
+        term_indices: &[usize],
+    ) -> Result<TermCollectionSpec, EstimationError> {
+        apply_spatial_log_length_scales(spec, term_indices, &self.to_log_length_scales())
+    }
+}
+
+impl TwoBlockExactJointHyperSetup {
+    pub(crate) fn new(
+        rho0: Array1<f64>,
+        rho_lower: Array1<f64>,
+        rho_upper: Array1<f64>,
+        log_kappa0: SpatialLogKappaCoords,
+        log_kappa_lower: SpatialLogKappaCoords,
+        log_kappa_upper: SpatialLogKappaCoords,
+    ) -> Self {
+        Self {
+            rho0,
+            rho_lower,
+            rho_upper,
+            log_kappa0,
+            log_kappa_lower,
+            log_kappa_upper,
+        }
+    }
+
+    pub(crate) fn rho_dim(&self) -> usize {
+        self.rho0.len()
+    }
+
+    pub(crate) fn log_kappa_dim(&self) -> usize {
+        self.log_kappa0.len()
+    }
+
+    pub(crate) fn theta0(&self) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
+        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho0);
+        out.slice_mut(s![self.rho_dim()..])
+            .assign(self.log_kappa0.as_array());
+        out
+    }
+
+    pub(crate) fn lower(&self) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
+        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_lower);
+        out.slice_mut(s![self.rho_dim()..])
+            .assign(self.log_kappa_lower.as_array());
+        out
+    }
+
+    pub(crate) fn upper(&self) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim());
+        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_upper);
+        out.slice_mut(s![self.rho_dim()..])
+            .assign(self.log_kappa_upper.as_array());
+        out
+    }
 }
 
 pub type TwoBlockMaternKappaOptimizationResult<FitOut> =
@@ -597,15 +730,11 @@ fn shape_lower_bounds_local(shape: ShapeConstraint, dim: usize) -> Option<Array1
 }
 
 fn shape_supports_basis(term: &SmoothTermSpec) -> bool {
-    let _ = term;
-    true
+    !matches!(term.basis, SmoothBasisSpec::TensorBSpline { .. })
 }
 
 fn shape_uses_box_reparameterization(basis: &SmoothBasisSpec) -> bool {
-    matches!(
-        basis,
-        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. }
-    )
+    matches!(basis, SmoothBasisSpec::BSpline1D { .. })
 }
 
 fn build_shape_constraint_grid_1d(x: ArrayView1<'_, f64>) -> Result<Array1<f64>, BasisError> {
@@ -699,11 +828,22 @@ fn build_shape_constraint_design_1d(
             };
             build_bspline_basis_1d(x_grid.view(), &eval_spec)?.design
         }
-        (SmoothBasisSpec::ThinPlate { .. }, BasisMetadata::ThinPlate { centers, .. }) => {
+        (
+            SmoothBasisSpec::ThinPlate { .. },
+            BasisMetadata::ThinPlate {
+                centers,
+                identifiability_transform,
+            },
+        ) => {
             let eval_spec = ThinPlateBasisSpec {
                 center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
                 double_penalty: false,
-                identifiability: SpatialIdentifiability::None,
+                identifiability: identifiability_transform
+                    .as_ref()
+                    .map(|z| SpatialIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    })
+                    .unwrap_or(SpatialIdentifiability::None),
             };
             build_thin_plate_basis(grid_2d.view(), &eval_spec)?.design
         }
@@ -1243,7 +1383,7 @@ pub fn build_smooth_design(
     let mut local_box_reparam = Vec::<bool>::with_capacity(terms.len());
 
     for term in terms {
-        if !shape_supports_basis(term) {
+        if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
             return Err(BasisError::InvalidInput(format!(
                 "ShapeConstraint::{:?} is unsupported for term '{}'",
                 term.shape, term.name
@@ -1314,11 +1454,7 @@ pub fn build_smooth_design(
                 build_duchon_basis(x.view(), spec)?
             }
             SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
-                let mut spec_local = spec.clone();
-                if term.shape != ShapeConstraint::None {
-                    spec_local.identifiability = TensorBSplineIdentifiability::None;
-                }
-                build_tensor_bspline_basis(data, feature_cols, &spec_local)?
+                build_tensor_bspline_basis(data, feature_cols, spec)?
             }
         };
 
@@ -2184,15 +2320,26 @@ fn maybe_spatial_identifiability_transform(
             Ok((b_c, Some(z)))
         }
         SpatialIdentifiability::FrozenTransform { transform } => {
-            if design_local.ncols() != transform.nrows() {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "frozen spatial identifiability transform mismatch: design has {} columns but transform has {} rows",
-                    design_local.ncols(),
-                    transform.nrows()
-                )));
+            if matches!(&term_spec.basis, SmoothBasisSpec::Duchon { .. }) {
+                if design_local.ncols() != transform.ncols() {
+                    return Err(BasisError::DimensionMismatch(format!(
+                        "frozen Duchon identifiability transform mismatch after basis build: design has {} columns but transform has {} columns",
+                        design_local.ncols(),
+                        transform.ncols()
+                    )));
+                }
+                Ok((design_local.to_owned(), None))
+            } else {
+                if design_local.ncols() != transform.nrows() {
+                    return Err(BasisError::DimensionMismatch(format!(
+                        "frozen spatial identifiability transform mismatch: design has {} columns but transform has {} rows",
+                        design_local.ncols(),
+                        transform.nrows()
+                    )));
+                }
+                let z = transform.clone();
+                Ok((design_local.dot(&z), Some(z)))
             }
-            let z = transform.clone();
-            Ok((design_local.dot(&z), Some(z)))
         }
     }
 }
@@ -2587,76 +2734,63 @@ fn extract_spatial_operator_runtime_caches(
         let tension_global_idx = global_base_idx + tension_local;
         let stiffness_global_idx = global_base_idx + stiffness_local;
 
-        let (feature_cols, d1, d2, collocation_points, dim) = match (
-            &term_spec.basis,
-            &term_fit.metadata,
-        ) {
-            (
-                SmoothBasisSpec::Matern { feature_cols, .. },
-                BasisMetadata::Matern {
-                    centers,
-                    length_scale,
-                    nu,
-                    include_intercept,
-                    identifiability_transform,
-                },
-            ) => {
-                let ops = build_matern_collocation_operator_matrices(
-                    centers.view(),
-                    None,
-                    *length_scale,
-                    *nu,
-                    *include_intercept,
-                    identifiability_transform.as_ref().map(|z| z.view()),
-                )?;
+        let (feature_cols, d1, d2, collocation_points, dim) =
+            match (&term_spec.basis, &term_fit.metadata) {
                 (
-                    feature_cols.clone(),
-                    ops.d1,
-                    ops.d2,
-                    ops.collocation_points,
-                    centers.ncols(),
-                )
-            }
-            (
-                SmoothBasisSpec::Duchon { feature_cols, .. },
-                BasisMetadata::Duchon {
-                    centers,
-                    length_scale,
-                    power,
-                    nullspace_order,
-                    identifiability_transform,
-                    ..
-                },
-            ) => {
-                let mut ops = build_duchon_collocation_operator_matrices(
-                    centers.view(),
-                    None,
-                    *length_scale,
-                    *power,
-                    *nullspace_order,
-                )?;
-                if let Some(z) = identifiability_transform {
-                    if ops.d1.ncols() != z.nrows() || ops.d2.ncols() != z.nrows() {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "Duchon collocation transform mismatch for term '{}': D1/D2 cols={}, transform rows={}",
-                            term_fit.name,
-                            ops.d1.ncols(),
-                            z.nrows()
-                        )));
-                    }
-                    ops.d1 = ops.d1.dot(z);
-                    ops.d2 = ops.d2.dot(z);
+                    SmoothBasisSpec::Matern { feature_cols, .. },
+                    BasisMetadata::Matern {
+                        centers,
+                        length_scale,
+                        nu,
+                        include_intercept,
+                        identifiability_transform,
+                    },
+                ) => {
+                    let ops = build_matern_collocation_operator_matrices(
+                        centers.view(),
+                        None,
+                        *length_scale,
+                        *nu,
+                        *include_intercept,
+                        identifiability_transform.as_ref().map(|z| z.view()),
+                    )?;
+                    (
+                        feature_cols.clone(),
+                        ops.d1,
+                        ops.d2,
+                        ops.collocation_points,
+                        centers.ncols(),
+                    )
                 }
                 (
-                    feature_cols.clone(),
-                    ops.d1,
-                    ops.d2,
-                    ops.collocation_points,
-                    centers.ncols(),
-                )
-            }
-            _ => continue,
-        };
+                    SmoothBasisSpec::Duchon { feature_cols, .. },
+                    BasisMetadata::Duchon {
+                        centers,
+                        length_scale,
+                        power,
+                        nullspace_order,
+                        identifiability_transform,
+                        ..
+                    },
+                ) => {
+                    let ops = build_duchon_collocation_operator_matrices(
+                        centers.view(),
+                        None,
+                        *length_scale,
+                        *power,
+                        *nullspace_order,
+                        identifiability_transform.as_ref().map(|z| z.view()),
+                    )?;
+                    (
+                        feature_cols.clone(),
+                        ops.d1,
+                        ops.d2,
+                        ops.collocation_points,
+                        centers.ncols(),
+                    )
+                }
+                _ => continue,
+            };
 
         let coeff_global_range =
             (smooth_start + term_fit.coeff_range.start)..(smooth_start + term_fit.coeff_range.end);
@@ -3844,6 +3978,10 @@ fn apply_spatial_log_length_scales(
     term_indices: &[usize],
     theta: &Array1<f64>,
 ) -> Result<TermCollectionSpec, EstimationError> {
+    // This is a boundary helper for the stored model parameterization:
+    //   length_scale = exp(theta).
+    // Exact-joint analytic code should work in SpatialLogKappaCoords and call
+    // SpatialLogKappaCoords::apply_to_spec instead of using this directly.
     if term_indices.len() != theta.len() {
         return Err(EstimationError::InvalidInput(format!(
             "spatial log-length-scale dimension mismatch: terms={} theta={}",
@@ -4114,11 +4252,19 @@ fn try_build_spatial_log_kappa_hyper_dirs(
     else {
         return Ok(None);
     };
+    Ok(Some(spatial_log_kappa_hyper_dirs_from_info_list(
+        info_list,
+    )?))
+}
+
+fn spatial_log_kappa_hyper_dirs_from_info_list(
+    info_list: Vec<SpatialPsiDerivative>,
+) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
     let mut hyper_dirs = Vec::with_capacity(info_list.len());
-    let psi_dim = info_list.len();
+    let log_kappa_dim = info_list.len();
     for (i, info) in info_list.into_iter().enumerate() {
-        let mut x_second = vec![Array2::<f64>::zeros(info.x_psi.raw_dim()); psi_dim];
-        let mut s_second = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); psi_dim];
+        let mut x_second = vec![Array2::<f64>::zeros(info.x_psi.raw_dim()); log_kappa_dim];
+        let mut s_second = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); log_kappa_dim];
         x_second[i] = info.x_psi_psi.clone();
         s_second[i] = info.s_psi_psi.clone();
         let s_components = info
@@ -4133,7 +4279,7 @@ fn try_build_spatial_log_kappa_hyper_dirs(
             .copied()
             .zip(info.s_psi_psi_components.iter().cloned())
             .collect::<Vec<_>>();
-        let mut s_second_components = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+        let mut s_second_components = vec![Vec::<(usize, Array2<f64>)>::new(); log_kappa_dim];
         s_second_components[i] = s2_components;
         hyper_dirs.push(DirectionalHyperParam::new(
             info.x_psi,
@@ -4142,7 +4288,7 @@ fn try_build_spatial_log_kappa_hyper_dirs(
             Some(s_second_components),
         )?);
     }
-    Ok(Some(hyper_dirs))
+    Ok(hyper_dirs)
 }
 
 fn try_exact_joint_spatial_hyper_cost_gradient_hessian(
@@ -4159,9 +4305,9 @@ fn try_exact_joint_spatial_hyper_cost_gradient_hessian(
     spatial_terms: &[usize],
 ) -> Result<Option<(f64, Array1<f64>, Array2<f64>)>, EstimationError> {
     // This path evaluates the exact joint outer derivatives for theta = (rho, psi),
-    // where psi are spatial log-kappa parameters. For each spatial term we provide
-    // X_psi, S_psi, X_psipsi, S_psipsi so Newton trust-region can use an analytic
-    // outer gradient and Hessian instead of finite-difference hyper-directions.
+    // where psi = log(kappa). The optimizer tail is therefore *not*
+    // log(length_scale); conversion to the stored spec parameterization happens only
+    // when rebuilding the candidate spec from SpatialLogKappaCoords.
     let design = build_term_collection_design(data, resolved_spec)?;
     let Some(info_list) = try_build_spatial_log_kappa_derivative_info_list(
         data,
@@ -4172,34 +4318,7 @@ fn try_exact_joint_spatial_hyper_cost_gradient_hessian(
     else {
         return Ok(None);
     };
-    let mut hyper_dirs = Vec::with_capacity(info_list.len());
-    let psi_dim = info_list.len();
-    for (i, info) in info_list.into_iter().enumerate() {
-        let mut x_second = vec![Array2::<f64>::zeros(info.x_psi.raw_dim()); psi_dim];
-        let mut s_second = vec![Array2::<f64>::zeros(info.s_psi.raw_dim()); psi_dim];
-        x_second[i] = info.x_psi_psi.clone();
-        s_second[i] = info.s_psi_psi.clone();
-        let s_components = info
-            .penalty_indices
-            .iter()
-            .copied()
-            .zip(info.s_psi_components.iter().cloned())
-            .collect::<Vec<_>>();
-        let s2_components = info
-            .penalty_indices
-            .iter()
-            .copied()
-            .zip(info.s_psi_psi_components.iter().cloned())
-            .collect::<Vec<_>>();
-        let mut s_second_components = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
-        s_second_components[i] = s2_components;
-        hyper_dirs.push(DirectionalHyperParam::new(
-            info.x_psi,
-            s_components,
-            Some(x_second),
-            Some(s_second_components),
-        )?);
-    }
+    let hyper_dirs = spatial_log_kappa_hyper_dirs_from_info_list(info_list)?;
     let external_opts = external_opts_for_design(family, &design, options);
     let joint = compute_external_joint_hyper_cost_gradient_hessian(
         y,
@@ -4239,30 +4358,22 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     const JOINT_RHO_BOUND: f64 = 12.0;
     let rho_dim = best.fit.lambdas.len();
-    let psi_dim = spatial_terms.len();
-    let mut theta0 = Array1::<f64>::zeros(rho_dim + psi_dim);
-    theta0
-        .slice_mut(s![..rho_dim])
-        .assign(&best.fit.lambdas.mapv(f64::ln));
-    for (slot, &term_idx) in spatial_terms.iter().enumerate() {
-        theta0[rho_dim + slot] = get_spatial_length_scale(resolved_spec, term_idx)
-            .unwrap_or(kappa_options.min_length_scale)
-            .clamp(
-                kappa_options.min_length_scale,
-                kappa_options.max_length_scale,
-            )
-            .ln();
-    }
-
-    let mut lower = Array1::<f64>::from_elem(rho_dim + psi_dim, -JOINT_RHO_BOUND);
-    let mut upper = Array1::<f64>::from_elem(rho_dim + psi_dim, JOINT_RHO_BOUND);
-    for i in 0..psi_dim {
-        lower[rho_dim + i] = kappa_options.min_length_scale.ln();
-        upper[rho_dim + i] = kappa_options.max_length_scale.ln();
-    }
+    let log_kappa0 =
+        SpatialLogKappaCoords::from_length_scales(resolved_spec, spatial_terms, kappa_options);
+    let setup = TwoBlockExactJointHyperSetup::new(
+        best.fit.lambdas.mapv(f64::ln),
+        Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
+        Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
+        log_kappa0,
+        SpatialLogKappaCoords::lower_bounds(spatial_terms.len(), kappa_options),
+        SpatialLogKappaCoords::upper_bounds(spatial_terms.len(), kappa_options),
+    );
 
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Array2<f64>)> = None;
     let warm_start_fit: FittedTermCollection = (*best).clone();
+    let theta0 = setup.theta0();
+    let lower = setup.lower();
+    let upper = setup.upper();
     let mut optimizer = ArcOptimizer::new(theta0.clone(), |theta, request| {
         if let Some((theta_c, cost_c, grad_c, h_c)) = &last_eval
             && approx_same_point(theta, theta_c)
@@ -4278,12 +4389,11 @@ fn try_exact_joint_spatial_length_scale_optimization(
             });
         }
 
-        let psi_theta = theta.slice(s![rho_dim..]).to_owned();
-        let spec_c = apply_spatial_log_length_scales(resolved_spec, spatial_terms, &psi_theta)
+        let log_kappa = SpatialLogKappaCoords::from_theta_tail(theta, rho_dim);
+        let spec_c = log_kappa
+            .apply_to_spec(resolved_spec, spatial_terms)
             .map_err(|e| {
-                ObjectiveEvalError::recoverable(format!(
-                    "failed to apply spatial log length scales: {e}"
-                ))
+                ObjectiveEvalError::recoverable(format!("failed to apply spatial log-kappa: {e}"))
             })?;
         let (cost, grad, hess) = match try_exact_joint_spatial_hyper_cost_gradient_hessian(
             data,
@@ -4340,8 +4450,8 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     let theta_star = solution.final_point;
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
-    let psi_star = theta_star.slice(s![rho_dim..]).to_owned();
-    let resolved_spec = apply_spatial_log_length_scales(resolved_spec, spatial_terms, &psi_star)?;
+    let log_kappa_star = SpatialLogKappaCoords::from_theta_tail(&theta_star, rho_dim);
+    let resolved_spec = log_kappa_star.apply_to_spec(resolved_spec, spatial_terms)?;
     let best = fit_term_collection_for_spec_with_heuristic_lambdas(
         data,
         y,
@@ -4781,8 +4891,8 @@ where
 {
     let mean_terms = spatial_length_scale_term_indices(mean_spec);
     let noise_terms = spatial_length_scale_term_indices(noise_spec);
-    let psi_dim = mean_terms.len() + noise_terms.len();
-    if !kappa_options.enabled || psi_dim == 0 {
+    let log_kappa_dim = mean_terms.len() + noise_terms.len();
+    if !kappa_options.enabled || log_kappa_dim == 0 {
         let mean_design = build_term_collection_design(data, mean_spec).map_err(|e| {
             format!("failed to build mean design during exact joint κ optimization: {e}")
         })?;
@@ -4808,7 +4918,7 @@ where
             )
         })?;
         let fit = fit_fn(
-            &joint_setup.theta0,
+            &joint_setup.theta0().slice(s![..joint_setup.rho_dim()]).to_owned(),
             &resolved_mean_spec,
             &resolved_noise_spec,
             &mean_design,
@@ -4823,19 +4933,19 @@ where
         });
     }
 
-    if joint_setup.theta0.len() < psi_dim
-        || joint_setup.lower.len() != joint_setup.theta0.len()
-        || joint_setup.upper.len() != joint_setup.theta0.len()
-    {
+    let theta0 = joint_setup.theta0();
+    let lower = joint_setup.lower();
+    let upper = joint_setup.upper();
+    if theta0.len() < log_kappa_dim || lower.len() != theta0.len() || upper.len() != theta0.len() {
         return Err(format!(
-            "invalid exact joint theta setup: theta0={}, lower={}, upper={}, required_psi_dim={}",
-            joint_setup.theta0.len(),
-            joint_setup.lower.len(),
-            joint_setup.upper.len(),
-            psi_dim
+            "invalid exact joint theta setup: theta0={}, lower={}, upper={}, required_log_kappa_dim={}",
+            theta0.len(),
+            lower.len(),
+            upper.len(),
+            log_kappa_dim
         ));
     }
-    let rho_dim = joint_setup.theta0.len() - psi_dim;
+    let rho_dim = joint_setup.rho_dim();
 
     let build_pair = |ms: &TermCollectionSpec,
                       ns: &TermCollectionSpec|
@@ -4866,7 +4976,7 @@ where
     })?;
 
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
-    let mut optimizer = NewtonTrustRegion::new(joint_setup.theta0.clone(), |theta, request| {
+    let mut optimizer = NewtonTrustRegion::new(theta0.clone(), |theta, request| {
         let need_hessian = matches!(
             request,
             ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian
@@ -4889,28 +4999,24 @@ where
                 }
             });
         }
-        let mean_psi = theta
-            .slice(s![rho_dim..rho_dim + mean_terms.len()])
-            .to_owned();
-        let noise_psi = theta.slice(s![rho_dim + mean_terms.len()..]).to_owned();
-        let mean_spec_c =
-            match apply_spatial_log_length_scales(&best_mean_spec, &mean_terms, &mean_psi) {
-                Ok(v) => v,
-                Err(_) => {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "exact-joint spatial objective failed to apply mean log length scales",
-                    ));
-                }
-            };
-        let noise_spec_c =
-            match apply_spatial_log_length_scales(&best_noise_spec, &noise_terms, &noise_psi) {
-                Ok(v) => v,
-                Err(_) => {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "exact-joint spatial objective failed to apply noise log length scales",
-                    ));
-                }
-            };
+        let log_kappa = SpatialLogKappaCoords::from_theta_tail(theta, rho_dim);
+        let (mean_log_kappa, noise_log_kappa) = log_kappa.split_at(mean_terms.len());
+        let mean_spec_c = match mean_log_kappa.apply_to_spec(&best_mean_spec, &mean_terms) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(ObjectiveEvalError::recoverable(
+                    "exact-joint spatial objective failed to apply mean log-kappa",
+                ));
+            }
+        };
+        let noise_spec_c = match noise_log_kappa.apply_to_spec(&best_noise_spec, &noise_terms) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(ObjectiveEvalError::recoverable(
+                    "exact-joint spatial objective failed to apply noise log-kappa",
+                ));
+            }
+        };
         let (mean_design_c, noise_design_c) = match build_pair(&mean_spec_c, &noise_spec_c) {
             Ok(v) => v,
             Err(_) => {
@@ -4920,7 +5026,7 @@ where
             }
         };
         let (cost, grad, hess) = match exact_fn(
-            theta,
+            &theta.slice(s![..rho_dim]).to_owned(),
             &mean_spec_c,
             &noise_spec_c,
             &mean_design_c,
@@ -4964,7 +5070,7 @@ where
             }
         })
     })
-    .with_bounds(joint_setup.lower.clone(), joint_setup.upper.clone(), 1e-6)
+    .with_bounds(lower, upper, 1e-6)
     .with_tolerance(kappa_options.rel_tol.max(1e-6))
     .with_max_iterations(kappa_options.max_outer_iter.max(1))
     .with_bfgs_fallback(true)
@@ -4981,21 +5087,18 @@ where
     };
 
     let theta_star = solution.final_point;
-    let mean_psi = theta_star
-        .slice(s![rho_dim..rho_dim + mean_terms.len()])
-        .to_owned();
-    let noise_psi = theta_star
-        .slice(s![rho_dim + mean_terms.len()..])
-        .to_owned();
-    let resolved_mean_spec =
-        apply_spatial_log_length_scales(&best_mean_spec, &mean_terms, &mean_psi)
-            .map_err(|e| e.to_string())?;
-    let resolved_noise_spec =
-        apply_spatial_log_length_scales(&best_noise_spec, &noise_terms, &noise_psi)
-            .map_err(|e| e.to_string())?;
+    let log_kappa_star = SpatialLogKappaCoords::from_theta_tail(&theta_star, rho_dim);
+    let (mean_log_kappa, noise_log_kappa) = log_kappa_star.split_at(mean_terms.len());
+    let resolved_mean_spec = mean_log_kappa
+        .apply_to_spec(&best_mean_spec, &mean_terms)
+        .map_err(|e| e.to_string())?;
+    let resolved_noise_spec = noise_log_kappa
+        .apply_to_spec(&best_noise_spec, &noise_terms)
+        .map_err(|e| e.to_string())?;
     let (mean_design, noise_design) = build_pair(&resolved_mean_spec, &resolved_noise_spec)?;
+    let rho_star = theta_star.slice(s![..rho_dim]).to_owned();
     let fit = fit_fn(
-        &theta_star,
+        &rho_star,
         &resolved_mean_spec,
         &resolved_noise_spec,
         &mean_design,
@@ -5049,11 +5152,12 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
     // When exact derivative information is available for the rebuilt basis and
     // penalty, κ is promoted to a first-class outer hyperparameter beside
     // rho = log(lambda). In that mode this routine runs a joint outer solve in
-    // theta = [rho, psi], where psi are the spatial log-length-scales, using the
+    // theta = [rho, psi], where psi = log(kappa) = -log(length_scale), using the
     // exact directional hyper-gradient path in `reml.rs`.
     //
-    // If a spatial basis does not expose exact log-kappa derivatives, we fall
-    // back to the older coordinate-search strategy in log(length_scale).
+    // If a spatial basis does not expose exact log-kappa derivatives, this
+    // one-block path currently keeps the frozen baseline fit. The older
+    // coordinate-search fallback is not implemented here.
     let mut resolved_spec = spec.clone();
     let spatial_terms = spatial_length_scale_term_indices(&resolved_spec);
     let n = data.nrows();
@@ -5858,6 +5962,99 @@ mod tests {
         assert_eq!(sd.terms.len(), 1);
         assert_eq!(sd.penalties.len(), 3);
         assert_eq!(sd.nullspace_dims.len(), 3);
+    }
+
+    #[test]
+    fn joint_duchon_order_zero_freezes_intercept_orthogonality_transform() {
+        let n = 12usize;
+        let d = 4usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            for j in 0..d {
+                data[[i, j]] = (i as f64) * 0.13 + (j as f64) * 0.17;
+            }
+        }
+
+        let terms = vec![SmoothTermSpec {
+            name: "duchon_joint".to_string(),
+            basis: SmoothBasisSpec::Duchon {
+                feature_cols: (0..d).collect(),
+                spec: DuchonBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                    length_scale: 1.0,
+                    power: 1,
+                    nullspace_order: DuchonNullspaceOrder::Zero,
+                    double_penalty: true,
+                    identifiability: SpatialIdentifiability::default(),
+                },
+            },
+            shape: ShapeConstraint::None,
+        }];
+
+        let sd = build_smooth_design(data.view(), &terms).expect("joint duchon build");
+        assert_eq!(sd.design.ncols(), 3);
+        match &sd.terms[0].metadata {
+            BasisMetadata::Duchon {
+                identifiability_transform,
+                ..
+            } => {
+                let z = identifiability_transform
+                    .as_ref()
+                    .expect("joint duchon should freeze the intercept-orthogonality transform");
+                assert_eq!(z.nrows(), 4);
+                assert_eq!(z.ncols(), 3);
+            }
+            other => panic!("expected Duchon metadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn term_collection_joint_duchon_carries_frozen_transform_into_metadata() {
+        let n = 12usize;
+        let d = 4usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            for j in 0..d {
+                data[[i, j]] = (i as f64) * 0.13 + (j as f64) * 0.17;
+            }
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_joint".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: (0..d).collect(),
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                        length_scale: 1.0,
+                        power: 1,
+                        nullspace_order: DuchonNullspaceOrder::Zero,
+                        double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("term collection design");
+        let term = &design.smooth.terms[0];
+        assert_eq!(term.coeff_range.len(), 3);
+        match &term.metadata {
+            BasisMetadata::Duchon {
+                identifiability_transform,
+                ..
+            } => {
+                let z = identifiability_transform
+                    .as_ref()
+                    .expect("term collection should store frozen Duchon transform");
+                assert_eq!(z.nrows(), 4);
+                assert_eq!(z.ncols(), 3);
+            }
+            other => panic!("expected Duchon metadata, got {other:?}"),
+        }
     }
 
     #[test]

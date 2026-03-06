@@ -1534,13 +1534,12 @@ def _geo_disease_eas_scenario_cfg(name):
     basis_code = m.group(2)
     knots = max(4, int(m.group(3)))
     n_pcs = 3 if family_code == "eas3" else 16
-    smooth_pcs = 3 if n_pcs == 3 else 3
-    linear_start = smooth_pcs + 1
+    smooth_pcs = min(knots, n_pcs)
     if basis_code == "tp":
         return {
             "smooth_basis": "thinplate",
             "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
-            "linear_cols": [f"pc{i}" for i in range(linear_start, n_pcs + 1)],
+            "linear_cols": [],
             "knots": knots,
             "basis_code": basis_code,
             "n_pcs": n_pcs,
@@ -1549,7 +1548,7 @@ def _geo_disease_eas_scenario_cfg(name):
         return {
             "smooth_basis": "duchon",
             "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
-            "linear_cols": [f"pc{i}" for i in range(linear_start, n_pcs + 1)],
+            "linear_cols": [],
             "knots": knots,
             "basis_code": basis_code,
             "n_pcs": n_pcs,
@@ -1558,7 +1557,7 @@ def _geo_disease_eas_scenario_cfg(name):
         return {
             "smooth_basis": "matern",
             "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
-            "linear_cols": [f"pc{i}" for i in range(linear_start, n_pcs + 1)],
+            "linear_cols": [],
             "knots": knots,
             "basis_code": basis_code,
             "n_pcs": n_pcs,
@@ -1598,10 +1597,11 @@ def _papuan_oce_scenario_cfg(name):
             "n_pcs": n_pcs,
         }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
+    smooth_pcs = min(knots, n_pcs)
     return {
         "smooth_basis": smooth_basis,
-        "smooth_cols": [f"pc{i}" for i in range(1, min(3, n_pcs) + 1)],
-        "linear_cols": [f"pc{i}" for i in range(min(3, n_pcs) + 1, n_pcs + 1)],
+        "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+        "linear_cols": [],
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": n_pcs,
@@ -1775,10 +1775,11 @@ def _geo_subpop16_scenario_cfg(name):
             "n_pcs": 16,
         }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
+    smooth_pcs = min(knots, 16)
     return {
         "smooth_basis": smooth_basis,
-        "smooth_cols": [f"pc{i}" for i in range(1, 4)],
-        "linear_cols": [f"pc{i}" for i in range(4, 17)],
+        "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+        "linear_cols": [],
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": 16,
@@ -1803,11 +1804,12 @@ def _geo_latlon_scenario_cfg(name):
             "n_pcs": 6,
         }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
+    smooth_pcs = min(knots, 6)
     return {
         "mode_code": mode_code,
         "smooth_basis": smooth_basis,
-        "smooth_cols": [f"pc{i}" for i in range(1, 4)],
-        "linear_cols": [f"pc{i}" for i in range(4, 7)],
+        "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+        "linear_cols": [],
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": 6,
@@ -2457,30 +2459,30 @@ def _rust_fit_mapping(scenario_name):
         ),
         "geo_disease_tp": dict(
             family="binomial-logit",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_cols=[f"pc{i}" for i in range(1, 13)],
             smooth_basis="thinplate",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            linear_cols=[],
             knots=12,
         ),
         "geo_disease_duchon": dict(
             family="binomial-logit",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_cols=[f"pc{i}" for i in range(1, 13)],
             smooth_basis="duchon",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            linear_cols=[],
             knots=12,
         ),
         "geo_disease_matern": dict(
             family="binomial-logit",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_cols=[f"pc{i}" for i in range(1, 13)],
             smooth_basis="matern",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            linear_cols=[],
             knots=12,
         ),
         "geo_disease_shrinkage": dict(
             family="binomial-logit",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_cols=[f"pc{i}" for i in range(1, 13)],
             smooth_basis="thinplate",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            linear_cols=[],
             knots=12,
         ),
         "geo_disease_ps_per_pc": dict(
