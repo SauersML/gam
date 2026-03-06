@@ -69,7 +69,10 @@ impl<'a> RemlState<'a> {
                 {
                     existing.scaled_add(scale, &component.matrix);
                 } else {
-                    out.push((component.penalty_index, component.matrix.mapv(|v| scale * v)));
+                    out.push((
+                        component.penalty_index,
+                        component.matrix.mapv(|v| scale * v),
+                    ));
                 }
             }
         }
@@ -447,7 +450,10 @@ impl<'a> RemlState<'a> {
                         self.p,
                     );
                     if matrix.iter().any(|v| *v != 0.0) {
-                        second_components.push(PenaltyDerivativeComponent { penalty_index, matrix });
+                        second_components.push(PenaltyDerivativeComponent {
+                            penalty_index,
+                            matrix,
+                        });
                     }
                 }
                 Self::add_penalty_components_to_state(&mut s_mod, &second_components, amp)?;
@@ -1227,10 +1233,13 @@ impl<'a> RemlState<'a> {
         let a_tau: Vec<Array2<f64>> = transformed_first_components
             .iter()
             .map(|components| {
-                components.iter().fold(Array2::<f64>::zeros((p_dim, p_dim)), |mut acc, component| {
-                    acc.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
-                    acc
-                })
+                components.iter().fold(
+                    Array2::<f64>::zeros((p_dim, p_dim)),
+                    |mut acc, component| {
+                        acc.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+                        acc
+                    },
+                )
             })
             .collect();
         let mut a_tau_tau = vec![vec![Array2::<f64>::zeros((p_dim, p_dim)); psi_dim]; psi_dim];

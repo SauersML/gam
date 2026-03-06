@@ -20,8 +20,8 @@ use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::pirls::WorkingLikelihood as EngineWorkingLikelihood;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
-    SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
-    TwoBlockExactJointHyperSetup, build_term_collection_design,
+    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
+    TermCollectionSpec, TwoBlockExactJointHyperSetup, build_term_collection_design,
     freeze_spatial_length_scale_terms_from_design, get_spatial_length_scale,
     optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivative_info_list,
@@ -453,6 +453,9 @@ fn build_block_spatial_psi_derivatives(
     resolved_spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
 ) -> Result<Option<Vec<CustomFamilyBlockPsiDerivative>>, String> {
+    // Custom-family exact blocks consume psi = log(kappa) derivatives. The exact-joint
+    // setup is typed in SpatialLogKappaCoords so these derivatives stay in the same
+    // parameterization end-to-end.
     let spatial_terms = spatial_length_scale_term_indices(resolved_spec);
     let Some(info_list) = try_build_spatial_log_kappa_derivative_info_list(
         data,
@@ -490,45 +493,44 @@ fn build_two_block_exact_joint_setup(
     extra_rho0: &[f64],
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> TwoBlockExactJointHyperSetup {
+    // Exact-joint setup stores the spatial tail in log(kappa), not log(length_scale).
     let mean_terms = spatial_length_scale_term_indices(mean_spec);
     let noise_terms = spatial_length_scale_term_indices(noise_spec);
     let rho_dim = mean_penalties + noise_penalties + extra_rho0.len();
-    let psi_dim = mean_terms.len() + noise_terms.len();
-    let mut theta0 = Array1::<f64>::zeros(rho_dim + psi_dim);
-    let mut lower = Array1::<f64>::from_elem(rho_dim + psi_dim, -12.0);
-    let mut upper = Array1::<f64>::from_elem(rho_dim + psi_dim, 12.0);
+    let mut rho0_vec = Array1::<f64>::zeros(rho_dim);
+    let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
+    let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
+    let mut log_kappa0 = Array1::<f64>::zeros(mean_terms.len() + noise_terms.len());
 
-    for (i, &rho0) in extra_rho0.iter().enumerate() {
-        theta0[mean_penalties + noise_penalties + i] = rho0;
+    for (i, &rho_init) in extra_rho0.iter().enumerate() {
+        rho0_vec[mean_penalties + noise_penalties + i] = rho_init;
     }
     for (slot, &term_idx) in mean_terms.iter().enumerate() {
-        theta0[rho_dim + slot] = get_spatial_length_scale(mean_spec, term_idx)
+        let length_scale = get_spatial_length_scale(mean_spec, term_idx)
             .unwrap_or(kappa_options.min_length_scale)
             .clamp(
                 kappa_options.min_length_scale,
                 kappa_options.max_length_scale,
-            )
-            .ln();
+            );
+        log_kappa0[slot] = -length_scale.ln();
     }
     for (slot, &term_idx) in noise_terms.iter().enumerate() {
-        theta0[rho_dim + mean_terms.len() + slot] = get_spatial_length_scale(noise_spec, term_idx)
+        let length_scale = get_spatial_length_scale(noise_spec, term_idx)
             .unwrap_or(kappa_options.min_length_scale)
             .clamp(
                 kappa_options.min_length_scale,
                 kappa_options.max_length_scale,
-            )
-            .ln();
+            );
+        log_kappa0[mean_terms.len() + slot] = -length_scale.ln();
     }
-    for i in 0..psi_dim {
-        lower[rho_dim + i] = kappa_options.min_length_scale.ln();
-        upper[rho_dim + i] = kappa_options.max_length_scale.ln();
-    }
-
-    TwoBlockExactJointHyperSetup {
-        theta0,
-        lower,
-        upper,
-    }
+    TwoBlockExactJointHyperSetup::new(
+        rho0_vec,
+        rho_lower,
+        rho_upper,
+        SpatialLogKappaCoords::new(log_kappa0),
+        SpatialLogKappaCoords::lower_bounds(mean_terms.len() + noise_terms.len(), kappa_options),
+        SpatialLogKappaCoords::upper_bounds(mean_terms.len() + noise_terms.len(), kappa_options),
+    )
 }
 
 fn solve_weighted_projection(
@@ -1362,10 +1364,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             builder.noise_spec(),
             kappa_options,
             &joint_setup,
-            |theta, _mean_spec_resolved, _noise_spec_resolved, mean_design, noise_design| {
+            |rho, _mean_spec_resolved, _noise_spec_resolved, mean_design, noise_design| {
                 let fit = {
                     let blocks = builder.build_blocks(
-                        theta,
+                        rho,
                         mean_design,
                         noise_design,
                         mean_beta_hint_cell.borrow().clone(),
@@ -1389,14 +1391,14 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 *noise_beta_hint_cell.borrow_mut() = noise_beta_hint.clone();
                 Ok(fit)
             },
-            |theta,
+            |rho,
              mean_spec_resolved,
              noise_spec_resolved,
              mean_design,
              noise_design,
              need_hessian| {
                 let blocks = builder.build_blocks(
-                    theta,
+                    rho,
                     mean_design,
                     noise_design,
                     mean_beta_hint_cell.borrow().clone(),
@@ -1410,16 +1412,11 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     mean_design,
                     noise_design,
                 )?;
-                let rho = theta
-                    .slice(ndarray::s![
-                        ..blocks.iter().map(|b| b.penalties.len()).sum::<usize>()
-                    ])
-                    .to_owned();
                 let eval = evaluate_custom_family_joint_hyper(
                     &family,
                     &blocks,
                     options,
-                    &rho,
+                    rho,
                     &psi_derivative_blocks,
                     warm_state.as_ref(),
                     need_hessian,

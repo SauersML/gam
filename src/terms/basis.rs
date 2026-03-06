@@ -1612,12 +1612,14 @@ pub enum MaternNu {
 }
 
 impl MaternNu {
-    /// Recommend a conservative default for high-dimensional settings.
-    /// This corresponds to choosing `s = ceil(k/2) + 0.5`, giving `nu = s - k/2`.
-    /// For even `k`, this yields `nu = 0.5` (exponential Matérn), avoiding TPS-style
-    /// null-space inflation while preserving rotation invariance.
-    pub fn recommended_for_dimension(_dimension: usize) -> Self {
-        Self::Half
+    /// Recommend the lowest-order half-integer Matérn that stays compatible with
+    /// the canonical mass/tension/stiffness collocation penalties.
+    pub fn recommended_for_dimension(dimension: usize) -> Self {
+        if dimension <= 1 {
+            Self::Half
+        } else {
+            Self::ThreeHalves
+        }
     }
 }
 
@@ -3190,6 +3192,51 @@ fn operator_penalty_candidates_from_collocation(
     ]
 }
 
+fn active_operator_penalty_derivatives(
+    penalty_info: &[PenaltyInfo],
+    operator_derivatives: &[Array2<f64>],
+    label: &str,
+) -> Result<Vec<Array2<f64>>, BasisError> {
+    if operator_derivatives.len() != 3 {
+        return Err(BasisError::InvalidInput(format!(
+            "{label} operator derivative path requires exactly 3 canonical penalties; found {}",
+            operator_derivatives.len()
+        )));
+    }
+
+    penalty_info
+        .iter()
+        .filter(|info| info.active)
+        .map(|info| match &info.source {
+            PenaltySource::OperatorMass => Ok(operator_derivatives[0].clone()),
+            PenaltySource::OperatorTension => Ok(operator_derivatives[1].clone()),
+            PenaltySource::OperatorStiffness => Ok(operator_derivatives[2].clone()),
+            other => Err(BasisError::InvalidInput(format!(
+                "unexpected {label} penalty source in canonical operator path: {other:?}"
+            ))),
+        })
+        .collect()
+}
+
+fn frozen_spatial_identifiability_transform(
+    identifiability: &SpatialIdentifiability,
+    expected_rows: usize,
+    label: &str,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    match identifiability {
+        SpatialIdentifiability::None | SpatialIdentifiability::OrthogonalToParametric => Ok(None),
+        SpatialIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != expected_rows {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen {label} identifiability transform mismatch: rows={}, expected {expected_rows}",
+                    transform.nrows()
+                )));
+            }
+            Ok(Some(transform.clone()))
+        }
+    }
+}
+
 pub fn build_matern_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
     collocation_weights: Option<ArrayView1<'_, f64>>,
@@ -3292,7 +3339,9 @@ pub fn build_matern_collocation_operator_matrices(
     d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
     d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
     if include_intercept {
-        d0.column_mut(kernel_cols).fill(1.0);
+        for (k, &scale_k) in row_scales.iter().enumerate() {
+            d0[[k, kernel_cols]] = scale_k;
+        }
     }
     Ok(CollocationOperatorMatrices {
         d0,
@@ -3308,6 +3357,7 @@ pub fn build_duchon_collocation_operator_matrices(
     length_scale: f64,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
+    identifiability_transform: Option<ArrayView2<'_, f64>>,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let mut workspace = BasisWorkspace::default();
     build_duchon_collocation_operator_matrices_with_workspace(
@@ -3316,6 +3366,7 @@ pub fn build_duchon_collocation_operator_matrices(
         length_scale,
         power,
         nullspace_order,
+        identifiability_transform,
         &mut workspace,
     )
 }
@@ -3326,6 +3377,7 @@ pub fn build_duchon_collocation_operator_matrices_with_workspace(
     length_scale: f64,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
+    identifiability_transform: Option<ArrayView2<'_, f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
@@ -3352,22 +3404,52 @@ pub fn build_duchon_collocation_operator_matrices_with_workspace(
     let kernel_cols = d0_kernel.ncols();
     let poly_cols = poly.ncols();
     let total_cols = kernel_cols + poly_cols;
+    let row_scales = if let Some(w) = collocation_weights {
+        if w.len() != p_colloc {
+            return Err(BasisError::DimensionMismatch(format!(
+                "collocation weight length mismatch: got {}, expected {p_colloc}",
+                w.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(p_colloc);
+        for &wk in w {
+            if !wk.is_finite() || wk < 0.0 {
+                return Err(BasisError::InvalidInput(format!(
+                    "collocation weights must be finite and non-negative; got {wk}"
+                )));
+            }
+            out.push(wk.sqrt());
+        }
+        out
+    } else {
+        vec![1.0; p_colloc]
+    };
     let mut d0 = Array2::<f64>::zeros((p_colloc, total_cols));
     d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel);
     if poly_cols > 0 {
-        d0.slice_mut(s![.., kernel_cols..]).assign(&poly);
+        let mut poly_scaled = poly;
+        for (k, &scale_k) in row_scales.iter().enumerate() {
+            poly_scaled.row_mut(k).mapv_inplace(|v| scale_k * v);
+        }
+        d0.slice_mut(s![.., kernel_cols..]).assign(&poly_scaled);
     }
     let mut d1 = Array2::<f64>::zeros((p_colloc * dim, total_cols));
     d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
     if poly_cols > 1 {
         for k in 0..p_colloc {
             for axis in 0..dim {
-                d1[[k * dim + axis, kernel_cols + 1 + axis]] = 1.0;
+                d1[[k * dim + axis, kernel_cols + 1 + axis]] = row_scales[k];
             }
         }
     }
     let mut d2 = Array2::<f64>::zeros((p_colloc, total_cols));
     d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
+    if let Some(z) = identifiability_transform {
+        let z = z.to_owned();
+        d0 = fast_ab(&d0, &z);
+        d1 = fast_ab(&d1, &z);
+        d2 = fast_ab(&d2, &z);
+    }
     Ok(CollocationOperatorMatrices {
         d0,
         d1,
@@ -4147,6 +4229,7 @@ fn build_duchon_operator_penalty_candidates(
     length_scale: f64,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
+    identifiability_transform: Option<ArrayView2<'_, f64>>,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let ops = build_duchon_collocation_operator_matrices(
         centers,
@@ -4154,6 +4237,7 @@ fn build_duchon_operator_penalty_candidates(
         length_scale,
         power,
         nullspace_order,
+        identifiability_transform,
     )?;
     Ok(operator_penalty_candidates_from_collocation(
         &ops.d0, &ops.d1, &ops.d2,
@@ -4860,18 +4944,8 @@ pub fn build_matern_basis_log_kappa_derivative_with_workspace(
         spec.include_intercept,
         z_opt.as_ref(),
     )?;
-    let penalties_derivative = base
-        .penalty_info
-        .iter()
-        .map(|info| match &info.source {
-            PenaltySource::OperatorMass => all_penalty_deriv[0].clone(),
-            PenaltySource::OperatorTension => all_penalty_deriv[1].clone(),
-            PenaltySource::OperatorStiffness => all_penalty_deriv[2].clone(),
-            other => {
-                panic!("unexpected Matérn penalty source in canonical operator path: {other:?}")
-            }
-        })
-        .collect::<Vec<_>>();
+    let penalties_derivative =
+        active_operator_penalty_derivatives(&base.penalty_info, &all_penalty_deriv, "Matérn")?;
 
     Ok(BasisPsiDerivativeResult {
         design_derivative,
@@ -4913,18 +4987,11 @@ pub fn build_matern_basis_log_kappa_second_derivative_with_workspace(
         spec.include_intercept,
         z_opt.as_ref(),
     )?;
-    let penalties_second_derivative = base
-        .penalty_info
-        .iter()
-        .map(|info| match &info.source {
-            PenaltySource::OperatorMass => all_penalty_second_deriv[0].clone(),
-            PenaltySource::OperatorTension => all_penalty_second_deriv[1].clone(),
-            PenaltySource::OperatorStiffness => all_penalty_second_deriv[2].clone(),
-            other => {
-                panic!("unexpected Matérn penalty source in canonical operator path: {other:?}")
-            }
-        })
-        .collect::<Vec<_>>();
+    let penalties_second_derivative = active_operator_penalty_derivatives(
+        &base.penalty_info,
+        &all_penalty_second_deriv,
+        "Matérn",
+    )?;
 
     Ok(BasisPsiSecondDerivativeResult {
         design_second_derivative,
@@ -5632,18 +5699,8 @@ pub fn build_duchon_basis_log_kappa_derivative_with_workspace(
         spec,
         workspace,
     )?;
-    let penalties_derivative = base
-        .penalty_info
-        .iter()
-        .map(|info| match &info.source {
-            PenaltySource::OperatorMass => all_penalty_deriv[0].clone(),
-            PenaltySource::OperatorTension => all_penalty_deriv[1].clone(),
-            PenaltySource::OperatorStiffness => all_penalty_deriv[2].clone(),
-            other => {
-                panic!("unexpected Duchon penalty source in canonical operator path: {other:?}")
-            }
-        })
-        .collect::<Vec<_>>();
+    let penalties_derivative =
+        active_operator_penalty_derivatives(&base.penalty_info, &all_penalty_deriv, "Duchon")?;
     Ok(BasisPsiDerivativeResult {
         design_derivative,
         penalties_derivative,
@@ -5673,18 +5730,11 @@ pub fn build_duchon_basis_log_kappa_second_derivative_with_workspace(
             spec,
             workspace,
         )?;
-    let penalties_second_derivative = base
-        .penalty_info
-        .iter()
-        .map(|info| match &info.source {
-            PenaltySource::OperatorMass => all_penalty_second_deriv[0].clone(),
-            PenaltySource::OperatorTension => all_penalty_second_deriv[1].clone(),
-            PenaltySource::OperatorStiffness => all_penalty_second_deriv[2].clone(),
-            other => {
-                panic!("unexpected Duchon penalty source in canonical operator path: {other:?}")
-            }
-        })
-        .collect::<Vec<_>>();
+    let penalties_second_derivative = active_operator_penalty_derivatives(
+        &base.penalty_info,
+        &all_penalty_second_deriv,
+        "Duchon",
+    )?;
     Ok(BasisPsiSecondDerivativeResult {
         design_second_derivative,
         penalties_second_derivative,
@@ -5903,7 +5953,7 @@ pub fn build_duchon_basis_with_workspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let d = create_duchon_spline_basis_with_workspace(
+    let mut d = create_duchon_spline_basis_with_workspace(
         data,
         centers.view(),
         spec.length_scale,
@@ -5911,11 +5961,17 @@ pub fn build_duchon_basis_with_workspace(
         spec.nullspace_order,
         workspace,
     )?;
+    let identifiability_transform =
+        frozen_spatial_identifiability_transform(&spec.identifiability, d.basis.ncols(), "Duchon")?;
+    if let Some(z) = identifiability_transform.as_ref() {
+        d.basis = fast_ab(&d.basis, z);
+    }
     let candidates = build_duchon_operator_penalty_candidates(
         centers.view(),
         spec.length_scale,
         spec.power,
         spec.nullspace_order,
+        identifiability_transform.as_ref().map(|z| z.view()),
     )?;
     if spec.double_penalty {
         log::debug!(
@@ -5933,7 +5989,7 @@ pub fn build_duchon_basis_with_workspace(
             length_scale: spec.length_scale,
             power: spec.power,
             nullspace_order: spec.nullspace_order,
-            identifiability_transform: None,
+            identifiability_transform,
         },
     })
 }
@@ -10075,6 +10131,7 @@ mod tests {
             ls_plus,
             spec.power,
             spec.nullspace_order,
+            None,
         )
         .expect("plus operator penalties");
         let minus_penalties = build_duchon_operator_penalty_candidates(
@@ -10082,6 +10139,7 @@ mod tests {
             ls_minus,
             spec.power,
             spec.nullspace_order,
+            None,
         )
         .expect("minus operator penalties");
 
@@ -10155,6 +10213,7 @@ mod tests {
             spec.length_scale,
             spec.power,
             spec.nullspace_order,
+            None,
         )
         .expect("base operator penalties");
         let plus_penalties = build_duchon_operator_penalty_candidates(
@@ -10162,6 +10221,7 @@ mod tests {
             ls_plus,
             spec.power,
             spec.nullspace_order,
+            None,
         )
         .expect("plus operator penalties");
         let minus_penalties = build_duchon_operator_penalty_candidates(
@@ -10169,6 +10229,7 @@ mod tests {
             ls_minus,
             spec.power,
             spec.nullspace_order,
+            None,
         )
         .expect("minus operator penalties");
 
@@ -10667,6 +10728,7 @@ mod tests {
             0.8,
             3,
             DuchonNullspaceOrder::Linear,
+            None,
         )
         .expect("duchon ops");
         assert!(d_ops.d1.iter().all(|v| v.is_finite()));
