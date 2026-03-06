@@ -1,6 +1,7 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
-    BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, DuchonBasisSpec,
+    BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
+    DuchonBasisSpec,
     MaternBasisSpec, MaternIdentifiability, PenaltyCandidate, PenaltyInfo, PenaltySource,
     SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
     apply_weighted_orthogonality_constraint, build_bspline_basis_1d, build_duchon_basis,
@@ -37,6 +38,36 @@ use wolfe_bfgs::{
     Arc as ArcOptimizer, ArcError, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError,
     ObjectiveRequest, ObjectiveSample,
 };
+
+fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
+    match strategy {
+        CenterStrategy::UserProvided(centers) => format!("{} centers", centers.nrows()),
+        CenterStrategy::EqualMass { num_centers }
+        | CenterStrategy::FarthestPoint { num_centers }
+        | CenterStrategy::KMeans { num_centers, .. } => format!("{num_centers} centers"),
+        CenterStrategy::UniformGrid { points_per_dim } => {
+            format!("uniform grid with {points_per_dim} points per dimension")
+        }
+    }
+}
+
+fn rewrite_thin_plate_knots_error(
+    err: BasisError,
+    term_name: &str,
+    feature_count: usize,
+    spec: &ThinPlateBasisSpec,
+) -> BasisError {
+    match err {
+        BasisError::InvalidInput(msg) if msg.contains("thin-plate spline requires at least d+1 knots") => {
+            let min_centers = feature_count + 1;
+            let requested = describe_thin_plate_center_request(&spec.center_strategy);
+            BasisError::InvalidInput(format!(
+                "joint TPS term '{term_name}' over {feature_count} covariates with {requested} is invalid; minimum centers is {min_centers}"
+            ))
+        }
+        other => other,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeConstraint {
@@ -1421,7 +1452,9 @@ pub fn build_smooth_design(
                     shape_axis_col = Some(feature_cols[0]);
                 }
                 let x = select_columns(data, feature_cols)?;
-                build_thin_plate_basis(x.view(), spec)?
+                build_thin_plate_basis(x.view(), spec).map_err(|err| {
+                    rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
+                })?
             }
             SmoothBasisSpec::Matern { feature_cols, spec } => {
                 if term.shape != ShapeConstraint::None {
@@ -5432,6 +5465,39 @@ mod tests {
         assert!(lin.a.nrows() > 0);
         assert_eq!(lin.a.ncols(), sd.design.ncols());
         assert_eq!(lin.b.len(), lin.a.nrows());
+    }
+
+    #[test]
+    fn build_smooth_design_rewrites_thin_plate_knot_count_error_with_term_context() {
+        let data = array![
+            [0.0, 0.0, 0.0],
+            [0.2, 0.1, 0.3],
+            [0.4, 0.3, 0.5],
+            [0.7, 0.6, 0.8],
+        ];
+        let terms = vec![SmoothTermSpec {
+            name: "thinplate(pc1, pc2, pc3)".to_string(),
+            basis: SmoothBasisSpec::ThinPlate {
+                feature_cols: vec![0, 1, 2],
+                spec: ThinPlateBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 3 },
+                    double_penalty: false,
+                    identifiability: SpatialIdentifiability::default(),
+                },
+            },
+            shape: ShapeConstraint::None,
+        }];
+
+        let err = build_smooth_design(data.view(), &terms).expect_err("expected knot-count failure");
+        match err {
+            BasisError::InvalidInput(msg) => {
+                assert!(msg.contains("joint TPS term 'thinplate(pc1, pc2, pc3)'"));
+                assert!(msg.contains("over 3 covariates"));
+                assert!(msg.contains("with 3 centers"));
+                assert!(msg.contains("minimum centers is 4"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

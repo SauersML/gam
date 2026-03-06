@@ -1534,11 +1534,11 @@ def _geo_disease_eas_scenario_cfg(name):
     basis_code = m.group(2)
     knots = max(4, int(m.group(3)))
     n_pcs = 3 if family_code == "eas3" else 16
-    smooth_pcs = min(knots, n_pcs)
+    joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
     if basis_code == "tp":
         return {
             "smooth_basis": "thinplate",
-            "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+            "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
             "linear_cols": [],
             "knots": knots,
             "basis_code": basis_code,
@@ -1547,7 +1547,7 @@ def _geo_disease_eas_scenario_cfg(name):
     if basis_code == "duchon":
         return {
             "smooth_basis": "duchon",
-            "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+            "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
             "linear_cols": [],
             "knots": knots,
             "basis_code": basis_code,
@@ -1556,7 +1556,7 @@ def _geo_disease_eas_scenario_cfg(name):
     if basis_code == "matern":
         return {
             "smooth_basis": "matern",
-            "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+            "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
             "linear_cols": [],
             "knots": knots,
             "basis_code": basis_code,
@@ -1579,6 +1579,19 @@ def _scenario_downsample_factor(name: str) -> int | None:
     return max(1, int(m.group(1)))
 
 
+def _fixed_joint_spatial_pc_count(family: str, n_pcs: int) -> int:
+    n_pcs = int(max(1, n_pcs))
+    family = str(family)
+    # Root-cause fix: joint spatial smooth dimensionality is part of scenario
+    # design, not a function of basis size `k`. Keep the embedding low-dimensional
+    # and fixed per benchmark family so `k` only controls the number of centers.
+    if family in {"geo_disease", "papuan_oce", "geo_subpop16"}:
+        return min(3, n_pcs)
+    if family == "geo_latlon":
+        return min(2, n_pcs)
+    raise RuntimeError(f"unsupported joint spatial benchmark family: {family}")
+
+
 def _papuan_oce_scenario_cfg(name):
     m = re.match(r"^papuan_oce(4)?_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
     if m is None:
@@ -1597,10 +1610,10 @@ def _papuan_oce_scenario_cfg(name):
             "n_pcs": n_pcs,
         }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
-    smooth_pcs = min(knots, n_pcs)
+    joint_pcs = _fixed_joint_spatial_pc_count("papuan_oce", n_pcs)
     return {
         "smooth_basis": smooth_basis,
-        "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+        "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
         "linear_cols": [],
         "knots": knots,
         "basis_code": basis_code,
@@ -1775,10 +1788,10 @@ def _geo_subpop16_scenario_cfg(name):
             "n_pcs": 16,
         }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
-    smooth_pcs = min(knots, 16)
+    joint_pcs = _fixed_joint_spatial_pc_count("geo_subpop16", 16)
     return {
         "smooth_basis": smooth_basis,
-        "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+        "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
         "linear_cols": [],
         "knots": knots,
         "basis_code": basis_code,
@@ -1804,11 +1817,11 @@ def _geo_latlon_scenario_cfg(name):
             "n_pcs": 6,
         }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
-    smooth_pcs = min(knots, 6)
+    joint_pcs = _fixed_joint_spatial_pc_count("geo_latlon", 6)
     return {
         "mode_code": mode_code,
         "smooth_basis": smooth_basis,
-        "smooth_cols": [f"pc{i}" for i in range(1, smooth_pcs + 1)],
+        "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
         "linear_cols": [],
         "knots": knots,
         "basis_code": basis_code,
@@ -2459,28 +2472,36 @@ def _rust_fit_mapping(scenario_name):
         ),
         "geo_disease_tp": dict(
             family="binomial-logit",
-            smooth_cols=[f"pc{i}" for i in range(1, 13)],
+            smooth_cols=[
+                f"pc{i}" for i in range(1, _fixed_joint_spatial_pc_count("geo_disease", 16) + 1)
+            ],
             smooth_basis="thinplate",
             linear_cols=[],
             knots=12,
         ),
         "geo_disease_duchon": dict(
             family="binomial-logit",
-            smooth_cols=[f"pc{i}" for i in range(1, 13)],
+            smooth_cols=[
+                f"pc{i}" for i in range(1, _fixed_joint_spatial_pc_count("geo_disease", 16) + 1)
+            ],
             smooth_basis="duchon",
             linear_cols=[],
             knots=12,
         ),
         "geo_disease_matern": dict(
             family="binomial-logit",
-            smooth_cols=[f"pc{i}" for i in range(1, 13)],
+            smooth_cols=[
+                f"pc{i}" for i in range(1, _fixed_joint_spatial_pc_count("geo_disease", 16) + 1)
+            ],
             smooth_basis="matern",
             linear_cols=[],
             knots=12,
         ),
         "geo_disease_shrinkage": dict(
             family="binomial-logit",
-            smooth_cols=[f"pc{i}" for i in range(1, 13)],
+            smooth_cols=[
+                f"pc{i}" for i in range(1, _fixed_joint_spatial_pc_count("geo_disease", 16) + 1)
+            ],
             smooth_basis="thinplate",
             linear_cols=[],
             knots=12,
