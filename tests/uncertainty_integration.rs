@@ -1,10 +1,12 @@
 use gam::probability::try_inverse_link_array;
+use gam::mixture_link::state_from_spec;
 use gam::types::LinkComponent;
 use gam::{
     FitOptions, InferenceCovarianceMode, LikelihoodFamily, MeanIntervalMethod,
     PredictUncertaintyOptions, coefficient_uncertainty, fit_gam, predict_gam_posterior_mean,
     predict_gam_with_uncertainty,
 };
+use gam::estimate::FittedLinkParameters;
 use ndarray::{Array1, Array2};
 
 #[test]
@@ -332,13 +334,19 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
     .expect("base fit should succeed");
 
     let mut fit = fit_base.clone();
-    fit.mixture_link_components = Some(vec![
-        LinkComponent::Probit,
-        LinkComponent::Logit,
-        LinkComponent::CLogLog,
-    ]);
-    fit.mixture_link_rho = Some(Array1::from_vec(vec![0.4, -0.2]));
-    fit.mixture_link_weights = None;
+    let state = state_from_spec(&gam::types::MixtureLinkSpec {
+        components: vec![
+            LinkComponent::Probit,
+            LinkComponent::Logit,
+            LinkComponent::CLogLog,
+        ],
+        initial_rho: Array1::from_vec(vec![0.4, -0.2]),
+    })
+    .expect("valid synthetic mixture state");
+    fit.fitted_link_parameters = FittedLinkParameters::Mixture {
+        state,
+        covariance: None,
+    };
 
     let pred = predict_gam_with_uncertainty(
         x.view(),

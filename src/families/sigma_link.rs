@@ -5,6 +5,11 @@ use std::fs;
 use std::path::Path;
 
 #[inline]
+fn canonical_zero(v: f64) -> f64 {
+    if v.abs() < 1e-15 { 0.0 } else { v }
+}
+
+#[inline]
 pub fn bounded_sigma_and_deriv_from_eta_scalar(
     eta: f64,
     sigma_min: f64,
@@ -52,7 +57,7 @@ pub fn bounded_sigma_derivs_up_to_third_scalar(
     let d1 = span * a;
     let d2 = span * a * (1.0 - 2.0 * p);
     let d3 = span * (a * (1.0 - 2.0 * p) * (1.0 - 2.0 * p) - 2.0 * a * a);
-    (sigma, d1, d2, d3)
+    (sigma, canonical_zero(d1), canonical_zero(d2), canonical_zero(d3))
 }
 
 pub fn bounded_sigma_derivs_up_to_third(
@@ -90,7 +95,13 @@ pub fn bounded_sigma_derivs_up_to_fourth_scalar(
     let d2 = span * a * (1.0 - 2.0 * p);
     let d3 = span * (a * (1.0 - 2.0 * p) * (1.0 - 2.0 * p) - 2.0 * a * a);
     let d4 = span * a * (1.0 - 2.0 * p) * (1.0 - 12.0 * a);
-    (sigma, d1, d2, d3, d4)
+    (
+        sigma,
+        canonical_zero(d1),
+        canonical_zero(d2),
+        canonical_zero(d3),
+        canonical_zero(d4),
+    )
 }
 
 pub fn bounded_sigma_derivs_up_to_fourth(

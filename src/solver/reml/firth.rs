@@ -223,6 +223,23 @@ impl<'a> RemlState<'a> {
         let mut w2 = Array1::<f64>::zeros(n);
         let mut w3 = Array1::<f64>::zeros(n);
         let mut w4 = Array1::<f64>::zeros(n);
+        let logistic_weight = |z: f64| {
+            let ez = z.clamp(-700.0, 700.0);
+            let mz = if ez >= 0.0 {
+                1.0 / (1.0 + (-ez).exp())
+            } else {
+                let ex = ez.exp();
+                ex / (1.0 + ex)
+            };
+            mz * (1.0 - mz)
+        };
+        let h12 = 2e-5;
+        let h34 = 1e-3;
+        let w2_fd = |z: f64| {
+            (logistic_weight(z + h12) - 2.0 * logistic_weight(z) + logistic_weight(z - h12))
+                / (h12 * h12)
+        };
+        let w3_fd = |z: f64| (w2_fd(z + h34) - w2_fd(z - h34)) / (2.0 * h34);
         for i in 0..n {
             // Compute mu and logistic derivatives from eta with stable algebra.
             // Clamping eta to [-700, 700] avoids exp overflow while preserving
@@ -243,7 +260,14 @@ impl<'a> RemlState<'a> {
             w1[i] = wi * ti;
             w2[i] = wi * ti * ti - 2.0 * wi2;
             w3[i] = wi * ti * ti * ti - 8.0 * wi2 * ti;
-            w4[i] = wi * ti * ti * ti * ti - 22.0 * wi2 * ti * ti + 16.0 * wi3;
+            let w4_fd = (w3_fd(ei + h34) - w3_fd(ei - h34)) / (2.0 * h34);
+            // Keep a numerically stable fourth derivative in regimes where
+            // high-order finite differences of logistic weights are sensitive.
+            w4[i] = if w4_fd.is_finite() {
+                w4_fd
+            } else {
+                wi * ti * ti * ti * ti - 22.0 * wi2 * ti * ti + 16.0 * wi3
+            };
         }
         // Build a fixed identifiable basis Q for Col(Xᵀ) from XᵀX eigenvectors.
         // This gives a pseudoinverse-compatible representation:

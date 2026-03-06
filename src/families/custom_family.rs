@@ -42,6 +42,14 @@ pub struct ParameterBlockState {
     pub eta: Array1<f64>,
 }
 
+#[derive(Clone)]
+pub struct BlockGeometryDirectionalDerivative {
+    /// Directional derivative of the block design matrix along a coefficient-space direction.
+    pub d_design: Option<Array2<f64>>,
+    /// Directional derivative of the block offset along the same direction.
+    pub d_offset: Array1<f64>,
+}
+
 /// Working quantities supplied by a custom family for one block.
 #[derive(Clone)]
 pub enum BlockWorkingSet {
@@ -89,6 +97,40 @@ pub trait CustomFamily {
         Ok((spec.design.clone(), spec.offset.clone()))
     }
 
+    /// Optional directional derivative of the effective block geometry wrt the
+    /// current block coefficients.
+    ///
+    /// For a block with effective predictor
+    ///
+    ///   eta(beta) = X(beta) beta + o(beta),
+    ///
+    /// the directional derivative along `d_beta` is
+    ///
+    ///   D eta[d_beta] = X d_beta + (D X[d_beta]) beta + D o[d_beta].
+    ///
+    /// For diagonal working-set REML derivatives this contributes to both:
+    ///
+    ///   D H[d_beta]
+    ///   = (D X[d_beta])^T W X
+    ///   + X^T W (D X[d_beta])
+    ///   + X^T diag(D w[D eta[d_beta]]) X,
+    ///
+    /// and to the predictor drift fed into the weight directional derivative.
+    ///
+    /// Default `None` means the family is declaring that the current block's
+    /// geometry has no coefficient-dependent drift beyond the base `X d_beta`
+    /// term. Families with dynamic `block_geometry` must implement this hook
+    /// when that declaration is false.
+    fn block_geometry_directional_derivative(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _block_idx: usize,
+        _spec: &ParameterBlockSpec,
+        _d_beta: &Array1<f64>,
+    ) -> Result<Option<BlockGeometryDirectionalDerivative>, String> {
+        Ok(None)
+    }
+
     /// Optional per-block coefficient projection applied after each block update.
     fn post_update_beta(&self, beta: Array1<f64>) -> Result<Array1<f64>, String> {
         Ok(beta)
@@ -112,8 +154,9 @@ pub trait CustomFamily {
     ///   the provided coefficient-space direction `d_beta` at current state.
     /// - shape is `(p_block, p_block)`.
     ///
-    /// Default `None` means the caller may fall back to numerical directional
-    /// differentiation for the `H_rho` correction in LAML gradients.
+    /// Default `None` means no exact directional Hessian drift is available.
+    /// Exact REML/LAML derivative paths that require this term should treat
+    /// `None` as unavailable rather than silently substituting zero.
     fn exact_newton_hessian_directional_derivative(
         &self,
         _block_states: &[ParameterBlockState],
@@ -163,6 +206,18 @@ pub trait CustomFamily {
 
     /// Optional exact directional derivative of diagonal working weights along
     /// a predictor-space direction `d_eta` for `BlockWorkingSet::Diagonal`.
+    ///
+    /// This callback supplies the `dw` term in
+    ///
+    ///   D_beta J[u] = X^T diag(dw) X
+    ///
+    /// for diagonal working-set blocks with
+    ///
+    ///   J = X^T W X + S.
+    ///
+    /// Default `None` means no exact working-weight directional derivative is
+    /// available. Exact REML/LAML derivative paths should not silently replace
+    /// this with zero unless the family truly has constant working weights.
     fn diagonal_working_weights_directional_derivative(
         &self,
         _block_states: &[ParameterBlockState],
@@ -1422,6 +1477,26 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
         // Log-determinant traces may follow a ridge-augmented surface depending
         // on ridge policy, but coupled beta sensitivities below are always solved
         // against the full joint system J.
+        //
+        // Exact REML/LAML first derivative for one smoothing coordinate rho_k:
+        //
+        //   V_k
+        //   = 0.5 beta^T A_k beta
+        //   + 0.5 tr(J_trace^{-1} J_k^total)
+        //   - 0.5 tr(S_+^{-1} A_k),
+        //
+        // where
+        //
+        //   A_k = dP/drho_k,
+        //   J_mode  = H(beta^) + P,
+        //   J_trace = J_mode (+ optional logdet-only ridge),
+        //   J_k^total = A_k + D_beta H[u_k],
+        //   J_mode u_k = -A_k beta^.
+        //
+        // The key algebraic separation is:
+        // - `u_k` must come from the mode system `J_mode`
+        // - the trace may be evaluated on the ridge-adjusted `J_trace`
+        //   if the chosen determinant surface includes that stabilization.
         let mut j_for_traces = j_joint.clone();
         if options.ridge_policy.include_penalty_logdet {
             let ridge = effective_solver_ridge(options.ridge_floor);
@@ -1464,17 +1539,20 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
                 let keep_second_order = need_hessian || options.use_reml_objective;
                 let u_k = if keep_second_order {
                     let rhs_k = -&a_k_beta;
-                    solve_spd_system_with_policy(
+                    match solve_spd_system_with_policy(
                         &j_joint,
                         &rhs_k,
                         options.ridge_floor,
                         options.ridge_policy,
-                    )
-                    .unwrap_or_else(|_| {
-                        pinv_positive_part(&j_joint, options.ridge_floor)
+                    ) {
+                        Ok(sol) => sol,
+                        Err(_) => pinv_positive_part(&j_joint, options.ridge_floor)
                             .map(|j_pinv| j_pinv.dot(&rhs_k))
-                            .unwrap_or_else(|_| -h_inv.dot(&a_k_beta))
-                    })
+                            .map_err(|_| {
+                                "failed to solve joint mode sensitivity system for REML gradient"
+                                    .to_string()
+                            })?,
+                    }
                 } else {
                     Array1::<f64>::zeros(total)
                 };
@@ -1488,27 +1566,27 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
                         );
                     let u_norm = u_k.dot(&u_k).sqrt();
                     // Exact log-determinant derivative structure:
-                    //   d/drho_k log|J| = tr(J^{-1} J_k),
-                    //   J_k = A_k + D H[u_k],
-                    // where A_k = dP/drho_k and u_k solves J u_k = -A_k beta.
                     //
-                    // This keeps full cross-block coupling because u_k is solved against
-                    // the joint J, not per-block diagonals. The REML/LAML contribution used
-                    // below is:
-                    //   0.5 * tr(J^{-1}(A_k + D H[u_k])) - 0.5 * tr(S^+ A_k).
+                    //   d/drho_k log|J_trace|
+                    //   = tr(J_trace^{-1} J_k^total),
                     //
-                    // Exact outer Hessian uses the same coupled quantities:
-                    //   V_{k,l} = beta^T S_k u_l
-                    //           + 0.5 * ( -tr(J^{-1}J_l J^{-1}J_k) + tr(J^{-1}J_{k,l}) )
-                    //           + 0.5 * tr(P^+ S_l P^+ S_k),
-                    // with:
-                    //   J_{k,l} = D H[u_{k,l}] + D^2 H[u_l, u_k],
-                    //   J u_{k,l} = -(J_l u_k + S_k u_l).
-                    // When requested, this routine now evaluates these terms directly.
+                    // with
+                    //
+                    //   J_k^total = A_k + D_beta H[u_k].
+                    //
+                    // The first term A_k is the explicit penalty drift. The
+                    // second term is the implicit beta-path correction: moving
+                    // rho_k changes the fitted mode beta^, and therefore changes
+                    // the likelihood curvature H(beta^).
+                    //
+                    // This branch preserves full cross-block coupling because
+                    // u_k is solved against the full joint mode system, not a
+                    // blockwise approximation.
                     let mut d_j_k = a_k.clone();
                     if u_norm > 1e-14 {
-                        // D H[u_k] is the directional derivative of the joint likelihood
-                        // Hessian wrt beta along u_k = d beta / d rho_k.
+                        // D_beta H[u_k] is the directional derivative of the
+                        // joint likelihood Hessian with respect to beta along
+                        // u_k = d beta^ / d rho_k.
                         let h_rho = family
                             .exact_newton_joint_hessian_directional_derivative(
                                 &inner.block_states,
@@ -1576,17 +1654,20 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
                         let rhs_kl = -(a_terms[k].dot(&u_terms[l])
                             + j_terms[l].dot(&u_terms[k])
                             + delta_kl * a_beta_terms[k].clone());
-                        let u_kl = solve_spd_system_with_policy(
+                        let u_kl = match solve_spd_system_with_policy(
                             &j_joint,
                             &rhs_kl,
                             options.ridge_floor,
                             options.ridge_policy,
-                        )
-                        .unwrap_or_else(|_| {
-                            pinv_positive_part(&j_joint, options.ridge_floor)
+                        ) {
+                            Ok(sol) => sol,
+                            Err(_) => pinv_positive_part(&j_joint, options.ridge_floor)
                                 .map(|j_pinv| j_pinv.dot(&rhs_kl))
-                                .unwrap_or_else(|_| h_inv.dot(&rhs_kl))
-                        });
+                                .map_err(|_| {
+                                    "failed to solve joint second-order mode sensitivity system for REML Hessian"
+                                        .to_string()
+                                })?,
+                        };
                         let dh_u_kl = match family
                             .exact_newton_joint_hessian_directional_derivative(
                                 &inner.block_states,
@@ -1697,8 +1778,9 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
             s_lambda.scaled_add(lambdas[k], s);
         }
 
-        let mut h_for_logdet = xtwx;
-        h_for_logdet += &s_lambda;
+        let mut h_mode = xtwx;
+        h_mode += &s_lambda;
+        let mut h_for_logdet = h_mode.clone();
         if options.ridge_policy.include_penalty_logdet {
             let ridge = effective_solver_ridge(options.ridge_floor);
             for d in 0..p {
@@ -1765,7 +1847,30 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
                 //
                 // `g_logh` is the explicit part 0.5*tr(H^{-1} A_k), and `g_hbeta` below
                 // is the implicit beta-path part 0.5*tr(H^{-1} D H[u_k]).
-                let u_k = -h_inv.dot(&a_k_beta);
+                // Smoothing-coordinate sensitivity solve:
+                //
+                //   rho_k = log lambda_k,
+                //   A_k   = dS/drho_k = lambda_k S_k,
+                //   J     = H(beta^) + S.
+                //
+                // Differentiating stationarity g(beta^,rho)=0 gives
+                //
+                //   J u_k = -A_k beta^,
+                //
+                // so u_k = d beta^ / d rho_k must be solved against the mode
+                // Hessian `h_mode`. The log-determinant may use a ridge-adjusted
+                // matrix for trace evaluation, but that ridge is not part of the
+                // stationarity surface and must not enter the sensitivity solve.
+                let rhs = -&a_k_beta;
+                let u_k = solve_spd_system_with_policy(
+                    &h_mode,
+                    &rhs,
+                    options.ridge_floor,
+                    options.ridge_policy,
+                )
+                .or_else(|_| {
+                    pinv_positive_part(&h_mode, options.ridge_floor).map(|h_pinv| h_pinv.dot(&rhs))
+                })?;
                 let u_norm = u_k.dot(&u_k).sqrt();
                 let g_hbeta = if u_norm <= 1e-14 {
                     0.0
@@ -1790,27 +1895,55 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
                                 }
                                 0.5 * trace_product(&h_inv, &h_exact)
                             } else {
-                                0.0
+                                return Err(format!(
+                                    "missing exact-newton dH callback for block {b} while REML gradient requires H_beta term"
+                                ));
                             }
                         }
                         BlockWorkingSet::Diagonal { .. } => {
                             // For diagonal working sets:
                             //   H = X' diag(w) X + S
-                            //   D H[u_k] = X' diag(dw) X,  dw = D_beta w [u_k].
+                            //   D H[u_k]
+                            //   = (D X[u_k])' W X
+                            //   + X' W (D X[u_k])
+                            //   + X' diag(dw) X,
+                            //   dw = D_beta w [D eta[u_k]].
                             // Then
                             //   tr(H^{-1} D H[u_k]) = sum_i q_i * dw_i,
-                            // where q_i = x_i' H^{-1} x_i (precomputed leverages).
+                            // where q_i = x_i' H^{-1} x_i (precomputed leverages),
+                            // plus the explicit geometry-drift trace from `D X[u_k]`.
                             let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
                                 format!(
                                     "missing dynamic design for block {b} diagonal H_rho trace term"
                                 )
                             })?;
+                            let w_work = match work {
+                                BlockWorkingSet::Diagonal {
+                                    working_response: _,
+                                    working_weights,
+                                } => working_weights.mapv(|wi| wi.max(options.min_weight)),
+                                BlockWorkingSet::ExactNewton { .. } => unreachable!(),
+                            };
                             let leverages = diagonal_leverages.as_ref().ok_or_else(|| {
                                 format!(
                                     "missing leverage cache for block {b} diagonal H_rho trace term"
                                 )
                             })?;
-                            let d_eta = x_dyn.matrix_vector_multiply(&u_k);
+                            let x_dense = x_dyn.to_dense();
+                            let mut d_eta = x_dyn.matrix_vector_multiply(&u_k);
+                            let geom_trace = apply_geometry_direction_to_eta_and_trace(
+                                &x_dense,
+                                beta,
+                                &w_work,
+                                &h_inv,
+                                &mut d_eta,
+                                family.block_geometry_directional_derivative(
+                                    &inner.block_states,
+                                    b,
+                                    spec,
+                                    &u_k,
+                                )?,
+                            )?;
                             if let Some(dw) = family
                                 .diagonal_working_weights_directional_derivative(
                                     &inner.block_states,
@@ -1825,9 +1958,11 @@ fn outer_objective_gradient_hessian<F: CustomFamily>(
                                         leverages.len()
                                     ));
                                 }
-                                0.5 * leverages.dot(&dw)
+                                geom_trace + 0.5 * leverages.dot(&dw)
                             } else {
-                                0.0
+                                return Err(format!(
+                                    "missing diagonal dW callback for block {b} while REML gradient requires H_beta term"
+                                ));
                             }
                         }
                     }
@@ -1928,7 +2063,7 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
         let (x_dyn, _) = family.block_geometry(&inner.block_states, spec)?;
         let x_dense = x_dyn.to_dense();
 
-        let (w, u, h_inv) = match work {
+        let (w, u, h_mode, h_inv) = match work {
             BlockWorkingSet::Diagonal {
                 working_response,
                 working_weights,
@@ -1945,13 +2080,14 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                 let (xtwx, _) = weighted_normal_equations(&x_dyn, &w, None)?;
                 let mut h_for_logdet = xtwx;
                 h_for_logdet += &s_lambda;
+                let h_mode = h_for_logdet.clone();
                 if options.ridge_policy.include_penalty_logdet {
                     for d in 0..p {
                         h_for_logdet[[d, d]] += ridge;
                     }
                 }
                 let h_inv = inverse_spd_with_retry(&h_for_logdet, ridge, 8)?;
-                (w, u, h_inv)
+                (w, u, h_mode, h_inv)
             }
             BlockWorkingSet::ExactNewton { .. } => {
                 return Err(format!(
@@ -1993,6 +2129,16 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
             }
 
             let xpsi_beta = deriv.x_psi.dot(beta);
+            let w_psi = family.diagonal_working_weights_directional_derivative(
+                &inner.block_states,
+                b,
+                &xpsi_beta,
+            )?;
+            if options.use_reml_objective && w_psi.is_none() {
+                return Err(format!(
+                    "missing explicit psi dW callback for block {b} while REML psi gradient requires X^T diag(w_psi) X"
+                ));
+            }
             let s_psi_total = if let Some(parts) = deriv.s_psi_components.as_ref() {
                 let mut total = Array2::<f64>::zeros(deriv.s_psi.raw_dim());
                 for (k, s_part) in parts {
@@ -2014,6 +2160,26 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                 }
                 deriv.s_psi.mapv(|v| lambdas[deriv.penalty_index] * v)
             };
+            // Geometry/penalty derivative psi at the fitted inner mode beta^:
+            //
+            //   V(psi) = f(beta^(psi), psi)
+            //          + 0.5 log|J(beta^(psi), psi)|
+            //          - 0.5 log|S(psi)|_+,
+            //
+            // where
+            //   f(beta,psi) = -ell(beta,psi) + 0.5 beta^T S(psi) beta.
+            //
+            // By the envelope theorem, the fit block is the explicit partial:
+            //
+            //   d/dpsi f(beta^(psi),psi) = f_psi(beta^,psi).
+            //
+            // In the diagonal working-set notation used here,
+            //   u = W(z - eta)
+            // is the predictor-space score contribution, and
+            //   eta_psi = X_psi beta
+            // for this derivative object. Therefore
+            //
+            //   f_psi = -u^T eta_psi + 0.5 beta^T S_psi beta.
             let explicit = -u.dot(&xpsi_beta) + 0.5 * beta.dot(&s_psi_total.dot(beta));
 
             let mut wx_psi = deriv.x_psi.clone();
@@ -2024,15 +2190,136 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                     row *= wi;
                 }
             }
+            // Explicit curvature drift at fixed beta:
+            //
+            //   J = X^T W X + S
+            //
+            // so
+            //
+            //   J_psi^explicit
+            //   = X_psi^T W X
+            //   + X^T W X_psi
+            //   + X^T diag(w_psi) X
+            //   + S_psi.
+            //
+            // The first two terms are assembled through `wx` / `wx_psi`, the
+            // third via `h_w_psi`, and the last by adding `s_psi_total`.
             let mut h_psi = deriv.x_psi.t().dot(&wx);
             h_psi += &x_dense.t().dot(&wx_psi);
+            if let Some(dw) = w_psi {
+                if dw.len() != x_dense.nrows() {
+                    return Err(format!(
+                        "block {b} psi dW length mismatch: got {}, expected {}",
+                        dw.len(),
+                        x_dense.nrows()
+                    ));
+                }
+                let mut h_w_psi = Array2::<f64>::zeros((p, p));
+                for i in 0..x_dense.nrows() {
+                    let wi = dw[i];
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    for a in 0..p {
+                        let xa = x_dense[[i, a]];
+                        for bb in a..p {
+                            h_w_psi[[a, bb]] += wi * xa * x_dense[[i, bb]];
+                        }
+                    }
+                }
+                for a in 0..p {
+                    for bb in 0..a {
+                        h_w_psi[[a, bb]] = h_w_psi[[bb, a]];
+                    }
+                }
+                h_psi += &h_w_psi;
+            }
             h_psi += &s_psi_total;
             let trace_term = if options.use_reml_objective {
-                0.5 * trace_product(&h_inv, &h_psi)
+                // Exact REML trace derivative:
+                //
+                //   d/dpsi [0.5 log|J|]
+                //   = 0.5 tr(J^{-1}(J_psi^explicit + D_beta J[u_psi])).
+                let mut trace_acc = 0.5 * trace_product(&h_inv, &h_psi);
+                // Implicit mode-sensitivity correction:
+                //   0.5 * tr(J^{-1} D_beta J[u_psi]), with
+                //   J * u_psi = -g_psi.
+                let g_psi = {
+                    let eta_psi = xpsi_beta.clone();
+                    // Differentiate block stationarity
+                    //
+                    //   0 = g(beta^(psi),psi) = X^T u - S beta
+                    //
+                    // at fixed beta to obtain
+                    //
+                    //   g_psi = X_psi^T u - X^T W eta_psi - S_psi beta.
+                    let mut out = deriv.x_psi.t().dot(&u);
+                    out -= &x_dense.t().dot(&(&w * &eta_psi));
+                    out -= &s_psi_total.dot(beta);
+                    out
+                };
+                let rhs = -&g_psi;
+                let u_psi = solve_spd_system_with_policy(
+                    &h_mode,
+                    &rhs,
+                    options.ridge_floor,
+                    options.ridge_policy,
+                )
+                .or_else(|_| pinv_positive_part(&h_mode, options.ridge_floor).map(|h_pinv| h_pinv.dot(&rhs)))?;
+                let mut d_eta_mode = x_dense.dot(&u_psi);
+                trace_acc += apply_geometry_direction_to_eta_and_trace(
+                    &x_dense,
+                    beta,
+                    &w,
+                    &h_inv,
+                    &mut d_eta_mode,
+                    family.block_geometry_directional_derivative(
+                        &inner.block_states,
+                        b,
+                        spec,
+                        &u_psi,
+                    )?,
+                )?;
+                if let Some(dw_mode) = family.diagonal_working_weights_directional_derivative(
+                    &inner.block_states,
+                    b,
+                    &d_eta_mode,
+                )? {
+                    if dw_mode.len() != x_dense.nrows() {
+                        return Err(format!(
+                            "block {b} implicit psi dW length mismatch: got {}, expected {}",
+                            dw_mode.len(),
+                            x_dense.nrows()
+                        ));
+                    }
+                    let mut leverage = Array1::<f64>::zeros(x_dense.nrows());
+                    for i in 0..x_dense.nrows() {
+                        let xi = x_dense.row(i).to_owned();
+                        leverage[i] = xi.dot(&h_inv.dot(&xi));
+                    }
+                    // For diagonal working weights,
+                    //
+                    //   D_beta J[u_psi] = X^T diag(dw_mode) X,
+                    //
+                    // hence
+                    //
+                    //   tr(J^{-1} D_beta J[u_psi])
+                    //   = sum_i (x_i^T J^{-1} x_i) dw_mode_i.
+                    trace_acc += 0.5 * leverage.dot(&dw_mode);
+                } else if u_psi.dot(&u_psi).sqrt() > 1e-14 {
+                    return Err(format!(
+                        "missing implicit psi dW callback for block {b} while REML psi gradient requires D_beta J[u_psi]"
+                    ));
+                }
+                trace_acc
             } else {
                 0.0
             };
             let pseudo_det_term = if options.use_reml_objective {
+                // Positive-part penalty determinant correction:
+                //
+                //   d/dpsi [-0.5 log|S|_+]
+                //   = -0.5 tr(S_+^{-1} S_psi).
                 -0.5 * trace_product(
                     s_pinv
                         .as_ref()
@@ -2050,11 +2337,90 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
     Ok(grad)
 }
 
+fn apply_geometry_direction_to_eta_and_trace(
+    x_dense: &Array2<f64>,
+    beta: &Array1<f64>,
+    w: &Array1<f64>,
+    h_inv: &Array2<f64>,
+    base_d_eta: &mut Array1<f64>,
+    geom_dir: Option<BlockGeometryDirectionalDerivative>,
+) -> Result<f64, String> {
+    // For dynamic block geometry,
+    //
+    //   eta(beta) = X(beta) beta + o(beta),
+    //
+    // so along a coefficient-space direction `u`
+    //
+    //   D eta[u] = X u + (D X[u]) beta + D o[u].
+    //
+    // In diagonal working-set REML derivatives this geometry drift enters twice:
+    //
+    //   D H[u]
+    //   = (D X[u])^T W X
+    //   + X^T W (D X[u])
+    //   + X^T diag(D w[D eta[u]]) X.
+    //
+    // This helper adds `(D X[u]) beta + D o[u]` into the predictor drift fed to
+    // the weight-direction callback, and returns the explicit trace term
+    //   0.5 * tr(H^{-1}[(D X[u])^T W X + X^T W (D X[u])]).
+    let Some(geom) = geom_dir else {
+        return Ok(0.0);
+    };
+    if geom.d_offset.len() != x_dense.nrows() {
+        return Err(format!(
+            "geometry directional offset length mismatch: got {}, expected {}",
+            geom.d_offset.len(),
+            x_dense.nrows()
+        ));
+    }
+    *base_d_eta += &geom.d_offset;
+    let mut trace_term = 0.0;
+    if let Some(dx) = geom.d_design {
+        if dx.nrows() != x_dense.nrows() || dx.ncols() != x_dense.ncols() {
+            return Err(format!(
+                "geometry directional design shape mismatch: got {}x{}, expected {}x{}",
+                dx.nrows(),
+                dx.ncols(),
+                x_dense.nrows(),
+                x_dense.ncols()
+            ));
+        }
+        *base_d_eta += &dx.dot(beta);
+        let mut wx = x_dense.clone();
+        let mut wdx = dx.clone();
+        for i in 0..x_dense.nrows() {
+            let wi = w[i];
+            if wi != 1.0 {
+                wx.row_mut(i) *= wi;
+                wdx.row_mut(i) *= wi;
+            }
+        }
+        let mut d_h_geom = dx.t().dot(&wx);
+        d_h_geom += &x_dense.t().dot(&wdx);
+        trace_term = 0.5 * trace_product(h_inv, &d_h_geom);
+    }
+    Ok(trace_term)
+}
+
+/// Evaluate the joint outer hyper surface for the *currently realized* custom-family state.
+///
+/// This function is intentionally not a pure map from a full `theta=[rho, psi]` vector.
+/// The geometry/penalty `psi` coordinates must already have been applied by the caller when
+/// constructing:
+///
+/// - `family`
+/// - `specs`
+/// - `derivative_blocks`
+///
+/// Therefore the explicit input here is only the current smoothing coordinate `rho`.
+/// The returned gradient is still stacked as `[dV/drho, dV/dpsi]`, but the `psi` part is the
+/// derivative of the scalar objective for the *externally realized* `psi` state encoded in those
+/// inputs, not with respect to any unseen local `theta` tail.
 pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-    theta: &Array1<f64>,
+    rho_current: &Array1<f64>,
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     warm_start: Option<&CustomFamilyWarmStart>,
     need_hessian: bool,
@@ -2071,29 +2437,27 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
     let penalty_counts = validate_block_specs(specs)?;
     let rho_dim = penalty_counts.iter().sum::<usize>();
     let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
-    if theta.len() != rho_dim + psi_dim {
+    if rho_current.len() != rho_dim {
         return Err(format!(
-            "joint hyper theta dimension mismatch: got {}, expected {} (rho={} psi={})",
-            theta.len(),
-            rho_dim + psi_dim,
+            "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
+            rho_current.len(),
             rho_dim,
             psi_dim
         )
         .into());
     }
 
-    let rho = theta.slice(ndarray::s![..rho_dim]).to_owned();
     let warm_inner = warm_start.map(|w| &w.inner);
     let (objective, rho_grad, rho_hess, fitted_warm) = outer_objective_gradient_hessian(
         family,
         specs,
         options,
         &penalty_counts,
-        &rho,
+        rho_current,
         warm_inner,
         need_hessian,
     )?;
-    let per_block = split_log_lambdas(&rho, &penalty_counts)?;
+    let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, Some(&fitted_warm))?;
     let psi_grad = compute_custom_family_block_psi_gradients(
         family,
@@ -2104,7 +2468,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
         &mut inner,
     )?;
 
-    let mut gradient = Array1::<f64>::zeros(theta.len());
+    let mut gradient = Array1::<f64>::zeros(rho_dim + psi_dim);
     gradient.slice_mut(ndarray::s![..rho_dim]).assign(&rho_grad);
     gradient.slice_mut(ndarray::s![rho_dim..]).assign(&psi_grad);
 

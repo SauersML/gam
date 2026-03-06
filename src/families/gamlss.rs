@@ -1319,7 +1319,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         let mut warm_state: Option<CustomFamilyWarmStart> = None;
         let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
         let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
-        optimize_two_block_spatial_length_scale_exact_joint(
+        match optimize_two_block_spatial_length_scale_exact_joint(
             data,
             builder.mean_spec(),
             builder.noise_spec(),
@@ -1373,11 +1373,14 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     mean_design,
                     noise_design,
                 )?;
+                let rho = theta
+                    .slice(ndarray::s![..blocks.iter().map(|b| b.penalties.len()).sum::<usize>()])
+                    .to_owned();
                 let eval = evaluate_custom_family_joint_hyper(
                     &family,
                     &blocks,
                     options,
-                    theta,
+                    &rho,
                     &psi_derivative_blocks,
                     warm_state.as_ref(),
                     need_hessian,
@@ -1385,7 +1388,52 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 warm_state = Some(eval.warm_start);
                 Ok((eval.objective, eval.gradient, eval.outer_hessian))
             },
-        )?
+        ) {
+            Ok(sol) => sol,
+            Err(err) => {
+                log::warn!(
+                    "exact two-block spatial optimization failed ({}); falling back to finite-difference optimizer",
+                    err
+                );
+                optimize_two_block_spatial_length_scale(
+                    data,
+                    builder.mean_spec(),
+                    builder.noise_spec(),
+                    kappa_options,
+                    |mean_design, noise_design| {
+                        let theta = compose_theta_from_hints(
+                            mean_design,
+                            noise_design,
+                            &mean_log_lambda_hint,
+                            &noise_log_lambda_hint,
+                            &extra_rho0,
+                        );
+                        let blocks = builder.build_blocks(
+                            &theta,
+                            mean_design,
+                            noise_design,
+                            mean_beta_hint.clone(),
+                            noise_beta_hint.clone(),
+                        )?;
+                        let family = builder.build_family(mean_design, noise_design);
+                        let fit = fit_custom_family(&family, &blocks, options)?;
+                        let layout = GamlssLambdaLayout::two_block(
+                            mean_design.penalties.len(),
+                            noise_design.penalties.len(),
+                        );
+                        if fit.log_lambdas.len() >= layout.total() {
+                            mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
+                            noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
+                        }
+                        let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
+                        mean_beta_hint = Some(mean_beta);
+                        noise_beta_hint = Some(noise_beta);
+                        Ok(fit)
+                    },
+                    |fit| fit.penalized_objective,
+                )?
+            }
+        }
     } else {
         optimize_two_block_spatial_length_scale(
             data,
@@ -1639,6 +1687,10 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitWiggleTermBuilder
 
     fn noise_spec(&self) -> &TermCollectionSpec {
         &self.noise_spec
+    }
+
+    fn exact_spatial_joint_supported(&self) -> bool {
+        false
     }
 
     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
@@ -2384,20 +2436,43 @@ fn second_directional_hessian_coeff_from_objective_q_terms(
     // F = -sum ell, scalar q:
     //   H_ab = m2 * q_a q_b + m1 * q_ab.
     // Exact mixed second directional derivative:
+    //
+    // Write
+    //   A = q_a q_b,
+    //   B = q_ab.
+    //
+    // Then
+    //   H_ab = m2 * A + m1 * B,
+    // where m_k = F^(k)(q).
+    //
+    // First directional derivative along u:
+    //   D_u H_ab
+    //   = m3 * dq_u * A
+    //   + m2 * (D_u A + dq_u * B)
+    //   + m1 * D_u B.
+    //
+    // Differentiate once more along v:
     //   D²H_ab[u,v] =
     //      m4*dq_u*dq_v*q_a*q_b
-    //    + m3*(d2q_uv*q_a*q_b + dq_u*(dq_a_v*q_b + q_a*dq_b_v + dq_v*q_ab)
-    //                     + dq_v*(dq_a_u*q_b + q_a*dq_b_u + dq_u*q_ab))
+    //    + m3*(d2q_uv*q_a*q_b
+    //         + dq_u*(dq_a_v*q_b + q_a*dq_b_v)
+    //         + dq_v*(dq_a_u*q_b + q_a*dq_b_u)
+    //         + dq_u*dq_v*q_ab)
     //    + m2*(d2q_a_uv*q_b + dq_a_u*dq_b_v + dq_a_v*dq_b_u + q_a*d2q_b_uv
     //          + d2q_uv*q_ab + dq_u*dq_ab_v + dq_v*dq_ab_u)
     //    + m1*d2q_ab_uv.
+    //
+    // The single dq_u*dq_v*q_ab term is important. A previous version of this
+    // helper accidentally generated it twice by folding dq_v*q_ab into both the
+    // dq_u and dq_v product-rule branches.
     let d_qaqb_u = dq_a_u * q_b + q_a * dq_b_u;
     let d_qaqb_v = dq_a_v * q_b + q_a * dq_b_v;
     let d2_qaqb_uv = d2q_a_uv * q_b + dq_a_u * dq_b_v + dq_a_v * dq_b_u + q_a * d2q_b_uv;
     m4 * dq_u * dq_v * q_a * q_b
         + m3 * (d2q_uv * q_a * q_b
-            + dq_u * (d_qaqb_v + dq_v * q_ab)
-            + dq_v * (d_qaqb_u + dq_u * q_ab))
+            + dq_u * d_qaqb_v
+            + dq_v * d_qaqb_u
+            + dq_u * dq_v * q_ab)
         + m2 * (d2_qaqb_uv + d2q_uv * q_ab + dq_u * dq_ab_v + dq_v * dq_ab_u)
         + m1 * d2q_ab_uv
 }
@@ -3202,6 +3277,71 @@ impl CustomFamily for GaussianLocationScaleFamily {
         }
         mirror_upper_to_lower(&mut d2_h);
         Ok(Some(d2_h))
+    }
+
+    fn diagonal_working_weights_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        d_eta: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n || d_eta.len() != n {
+            return Err("GaussianLocationScaleFamily input size mismatch".to_string());
+        }
+
+        let (sigma, d_sigma, d2_sigma, _, _) =
+            bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let mut dw = Array1::<f64>::zeros(n);
+        match block_idx {
+            Self::BLOCK_MU => {
+                // Gaussian location block:
+                //
+                //   w_mu = weight / sigma^2.
+                //
+                // This depends only on the scale predictor, so along a
+                // location-only direction d eta_mu the directional derivative is
+                // identically zero.
+                Ok(Some(dw))
+            }
+            Self::BLOCK_LOG_SIGMA => {
+                // Gaussian log-sigma block:
+                //
+                // The PIRLS information weight is
+                //
+                //   w_ls = 2 * weight * g^2,
+                //   g    = sigma'(eta_ls) / sigma(eta_ls).
+                //
+                // Along a direction d eta_ls,
+                //
+                //   dw_ls = 4 * weight * g * dg,
+                //   dg    = (sigma''/sigma - (sigma'/sigma)^2) d eta_ls.
+                //
+                // This is the exact directional derivative needed by the REML
+                // trace term
+                //
+                //   0.5 tr(J^{-1} D_beta J[u])
+                //   = 0.5 sum_i (x_i^T J^{-1} x_i) dw_i
+                //
+                // for diagonal working-set blocks.
+                for i in 0..n {
+                    let s = sigma[i].max(1e-12);
+                    let g = d_sigma[i] / s;
+                    let dg = (d2_sigma[i] / s - d_sigma[i] * d_sigma[i] / (s * s)) * d_eta[i];
+                    dw[i] = 4.0 * self.weights[i] * g * dg;
+                }
+                Ok(Some(dw))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -4750,6 +4890,26 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             ));
         }
 
+        // Block-local exact Newton directional derivative is extracted from the
+        // full joint directional Hessian.
+        //
+        // For the 3-block wiggle model with beta=(beta_t,beta_ls,beta_w),
+        // define the full negative-loglik Hessian H(beta) in flattened block
+        // coordinates. For a direction that moves only one block,
+        //
+        //   u = [u_t, 0,   0]   or
+        //   u = [0,   u_ls,0]   or
+        //   u = [0,   0,   u_w],
+        //
+        // the exact blockwise directional Hessian required by the trait is just
+        // the corresponding principal block of D H[u]:
+        //
+        //   D H_block[u_block]
+        //   = (D H_joint[u])_{block,block}.
+        //
+        // This avoids maintaining a second, partially duplicated derivation for
+        // the block-local case and keeps the exact-newton block callback aligned
+        // with the already-validated joint formulas.
         let mut d_beta_flat = Array1::<f64>::zeros(total);
         match block_idx {
             Self::BLOCK_T => {

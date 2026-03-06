@@ -2,13 +2,14 @@ use ad_trait::AD;
 use ad_trait::differentiable_function::{DifferentiableFunctionTrait, ForwardAD};
 use ad_trait::forward_ad::adfn::adfn;
 use ad_trait::function_engine::FunctionEngine;
-use approx::assert_abs_diff_eq;
 use autodiff::{F1, Float, diff};
 use gam::families::sigma_link::{
     bounded_sigma_derivs_up_to_fourth_scalar, bounded_sigma_derivs_up_to_third_scalar,
 };
 use num_dual::{DualNum, first_derivative, second_derivative, third_derivative};
 use std::marker::PhantomData;
+
+mod common;
 
 #[derive(Clone, Debug)]
 struct E2EData {
@@ -201,18 +202,13 @@ fn sigma_manual_matches_num_dual_first_through_third() {
         let (s3_ad, d1_3_ad, d2_3_ad, d3_ad) =
             third_derivative(|x| sigma_unclamped_numdual(x, sigma_min, sigma_max), eta);
 
-        assert_abs_diff_eq!(s, s_ad, epsilon = 1e-12);
-        assert_abs_diff_eq!(s, s2_ad, epsilon = 1e-12);
-        assert_abs_diff_eq!(s, s3_ad, epsilon = 1e-12);
-
-        assert_abs_diff_eq!(d1, d1_ad, epsilon = 1e-12);
-        assert_abs_diff_eq!(d1, d1_2_ad, epsilon = 1e-12);
-        assert_abs_diff_eq!(d1, d1_3_ad, epsilon = 1e-12);
-
-        assert_abs_diff_eq!(d2, d2_ad, epsilon = 1e-11);
-        assert_abs_diff_eq!(d2, d2_3_ad, epsilon = 1e-11);
-
-        assert_abs_diff_eq!(d3, d3_ad, epsilon = 1e-10);
+        assert_manual_ad_band!("sigma_num_dual", eta, "s", s,
+            "num_dual_1" => s_ad, "num_dual_2" => s2_ad, "num_dual_3" => s3_ad);
+        assert_manual_ad_band!("sigma_num_dual", eta, "d1", d1,
+            "num_dual_1" => d1_ad, "num_dual_2" => d1_2_ad, "num_dual_3" => d1_3_ad);
+        assert_manual_ad_band!("sigma_num_dual", eta, "d2", d2,
+            "num_dual_2" => d2_ad, "num_dual_3" => d2_3_ad);
+        assert_manual_ad_band!("sigma_num_dual", eta, "d3", d3, "num_dual_3" => d3_ad);
     }
 }
 
@@ -234,7 +230,7 @@ fn sigma_manual_matches_autodiff_forward_mode_first_derivative() {
             eta,
         );
 
-        assert_abs_diff_eq!(d1, d1_ad, epsilon = 1e-12);
+        assert_manual_ad_band!("sigma_autodiff", eta, "d1", d1, "autodiff" => d1_ad);
     }
 }
 
@@ -251,7 +247,7 @@ fn sigma_manual_matches_ad_trait_forward_mode_first_derivative() {
     for eta in points {
         let (_, d1, _, _) = bounded_sigma_derivs_up_to_third_scalar(eta, sigma_min, sigma_max);
         let (_value, jac) = engine.derivative(&[eta]);
-        assert_abs_diff_eq!(d1, jac[(0, 0)], epsilon = 1e-12);
+        assert_manual_ad_band!("sigma_ad_trait", eta, "d1", d1, "ad_trait" => jac[(0, 0)]);
     }
 }
 
@@ -301,15 +297,13 @@ fn e2e_manual_derivatives_match_num_dual_and_first_order_ad_engines() {
         let (values_ad_trait, jac_ad_trait) = engine.derivative(&[theta]);
         let d1_ad_trait = jac_ad_trait[(0, 0)];
 
-        assert_abs_diff_eq!(v_manual, e2e_objective_f64(theta, &data), epsilon = 1e-12);
-        assert_abs_diff_eq!(v_manual, v_nd, epsilon = 1e-12);
-        assert_abs_diff_eq!(v_manual, values_ad_trait[0], epsilon = 1e-12);
-
-        assert_abs_diff_eq!(d1_manual, d1_nd, epsilon = 1e-11);
-        assert_abs_diff_eq!(d1_manual, d1_autodiff, epsilon = 1e-10);
-        assert_abs_diff_eq!(d1_manual, d1_ad_trait, epsilon = 1e-10);
-
-        assert_abs_diff_eq!(d2_manual, d2_nd, epsilon = 1e-9);
-        assert_abs_diff_eq!(d3_manual, d3_nd, epsilon = 1e-8);
+        assert_manual_ad_band!("e2e", theta, "value", v_manual,
+            "plain_f64" => e2e_objective_f64(theta, &data),
+            "num_dual" => v_nd,
+            "ad_trait" => values_ad_trait[0]);
+        assert_manual_ad_band!("e2e", theta, "d1", d1_manual,
+            "num_dual" => d1_nd, "autodiff" => d1_autodiff, "ad_trait" => d1_ad_trait);
+        assert_manual_ad_band!("e2e", theta, "d2", d2_manual, "num_dual" => d2_nd);
+        assert_manual_ad_band!("e2e", theta, "d3", d3_manual, "num_dual" => d3_nd);
     }
 }
