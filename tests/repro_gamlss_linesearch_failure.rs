@@ -1,26 +1,28 @@
 use ndarray::{Array1, array};
-use wolfe_bfgs::Bfgs;
+use opt::{Bfgs, Bounds, MaxIterations, ObjectiveEvalError, Tolerance};
+
+use gam::solver::opt_objective::CachedFirstOrderObjective;
 
 #[test]
 fn repro_outer_smoothing_linesearch_failure_raw_solver_errors() {
     let lower = Array1::from_elem(3, -30.0);
     let upper = Array1::from_elem(3, 30.0);
 
-    let mut solver = Bfgs::new(array![0.0, 0.0, 0.0], |x: &Array1<f64>| {
+    let objective = CachedFirstOrderObjective::new(|x: &Array1<f64>| {
         let r2 = x.dot(x);
         if r2 <= 1e-24 {
-            (833.403058988699, array![1.1751972450892738, 0.0, 0.0])
+            Ok((833.403058988699, array![1.1751972450892738, 0.0, 0.0]))
         } else {
-            (f64::INFINITY, Array1::from_elem(3, f64::NAN))
+            Err(ObjectiveEvalError::recoverable(
+                "repro objective returned non-finite values",
+            ))
         }
-    })
-    .with_bounds(lower, upper, 1e-6)
-    .with_tolerance(1e-5)
-    .with_fp_tolerances(1e2, 1e2)
-    .with_accept_flat_midpoint_once(true)
-    .with_jiggle_on_flats(true, 1e-3)
-    .with_multi_direction_rescue(true)
-    .with_max_iterations(60);
+    });
+    let mut solver = Bfgs::new(array![0.0, 0.0, 0.0], objective)
+        .with_bounds(Bounds::new(lower, upper, 1e-6).expect("test bounds must be valid"))
+        .with_tolerance(Tolerance::new(1e-5).expect("test tolerance must be valid"))
+        .with_profile(opt::Profile::Aggressive)
+        .with_max_iterations(MaxIterations::new(60).expect("test max iterations must be valid"));
 
     let result = solver.run();
 

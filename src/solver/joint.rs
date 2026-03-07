@@ -28,15 +28,16 @@ use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
 use crate::probability::normal_cdf;
 use crate::quadrature::QuadratureContext;
+use crate::solver::opt_objective::CachedSecondOrderObjective;
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
 use crate::types::{GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction};
 use crate::visualizer;
 use faer::Side;
 use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use wolfe_bfgs::{
-    NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, ObjectiveRequest,
-    ObjectiveSample,
+use opt::{
+    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError,
+    Tolerance,
 };
 
 // NOTE on z standardization:
@@ -3050,52 +3051,35 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
         let lower = Array1::<f64>::from_elem(rho.len(), -RHO_BOUND);
         let upper = Array1::<f64>::from_elem(rho.len(), RHO_BOUND);
         let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
-        let mut solver = NewtonTrustRegion::new(rho, |rho, request| {
-            if let Some((rho_c, cost_c, grad_c)) = &last_eval
-                && rho.len() == rho_c.len()
-                && rho
-                    .iter()
-                    .zip(rho_c.iter())
-                    .all(|(&a, &b)| (a - b).abs() <= 1e-12)
-            {
-                return Ok(match request {
-                    ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
-                    ObjectiveRequest::CostAndGradient
-                    | ObjectiveRequest::GradientAndHessian
-                    | ObjectiveRequest::CostGradientHessian => {
-                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+        let objective = CachedSecondOrderObjective::new(
+            |rho: &Array1<f64>| {
+                let (cost, grad) = match (
+                    reml_state.compute_cost(rho),
+                    reml_state.compute_gradient(rho),
+                ) {
+                    (Ok(cost), Ok(grad))
+                        if cost.is_finite() && grad.iter().all(|v| v.is_finite()) =>
+                    {
+                        (cost, grad)
                     }
-                });
-            }
-
-            let (cost, grad) = match (
-                reml_state.compute_cost(rho),
-                reml_state.compute_gradient(rho),
-            ) {
-                (Ok(cost), Ok(grad)) if cost.is_finite() && grad.iter().all(|v| v.is_finite()) => {
-                    (cost, grad)
-                }
-                _ => {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "joint outer objective/gradient evaluation failed",
-                    ));
-                }
-            };
-            last_eval = Some((rho.clone(), cost, grad.clone()));
-            Ok(match request {
-                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
-                ObjectiveRequest::CostAndGradient
-                | ObjectiveRequest::GradientAndHessian
-                | ObjectiveRequest::CostGradientHessian => {
-                    ObjectiveSample::cost_and_gradient(cost, grad)
-                }
-            })
-        })
-        .with_bounds(lower, upper, 1e-6)
-        .with_tolerance(config.reml_tol)
-        .with_max_iterations(config.max_reml_iter)
-        .with_bfgs_fallback(true)
-        .with_fallback_history(12);
+                    _ => {
+                        return Err(ObjectiveEvalError::recoverable(
+                            "joint outer objective/gradient evaluation failed",
+                        ));
+                    }
+                };
+                last_eval = Some((rho.clone(), cost, grad.clone()));
+                Ok((cost, grad, None))
+            },
+            1e-4,
+        );
+        let mut solver = NewtonTrustRegion::new(rho, objective)
+            .with_bounds(Bounds::new(lower, upper, 1e-6).expect("joint rho bounds must be valid"))
+            .with_tolerance(Tolerance::new(config.reml_tol).expect("joint tolerance must be valid"))
+            .with_max_iterations(
+                MaxIterations::new(config.max_reml_iter)
+                    .expect("joint max iterations must be valid"),
+            );
 
         let solution = match solver.run() {
             Ok(solution) => solution,
