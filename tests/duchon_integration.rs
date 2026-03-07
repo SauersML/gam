@@ -62,7 +62,7 @@ fn fit_duchon_simulated_10d(
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 36 },
-                    length_scale: 0.9,
+                    length_scale: None,
                     power,
                     nullspace_order,
                     double_penalty: true,
@@ -135,9 +135,9 @@ fn fit_duchon_simulated_10d(
 
 #[test]
 fn duchon_fit_term_collection_gaussian_simulated_10d_default_like_config() {
-    // p=0 / nullspace-order zero can legitimately keep only one active penalty
-    // and is expected to be less expressive than the p=1 configuration below.
-    fit_duchon_simulated_10d(1, DuchonNullspaceOrder::Zero, 1, 0.85);
+    // Pure Duchon uses operator penalties directly. For p=0/s=1 this currently
+    // keeps two active operator blocks in the fitted design.
+    fit_duchon_simulated_10d(1, DuchonNullspaceOrder::Zero, 2, 0.85);
 }
 
 #[test]

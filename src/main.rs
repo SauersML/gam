@@ -204,7 +204,7 @@ struct FitArgs {
     #[arg(
         value_name = "FORMULA",
         help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
-        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary penalized linear term (all non-intercept linear coefficients are ridge-penalized by default)\n- linear(x, min=..., max=...): penalized linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for penalized generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- penalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, order=1, power=0)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary penalized linear term (all non-intercept linear coefficients are ridge-penalized by default)\n- linear(x, min=..., max=...): penalized linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for penalized generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- penalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     formula_positional: String,
     /// P(Y=1|S,x)=Phi((S-T(x))/sigma(x)).
@@ -6585,7 +6585,7 @@ fn build_smooth_basis(
                     center_strategy: CenterStrategy::FarthestPoint {
                         num_centers: centers,
                     },
-                    length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
+                    length_scale: option_f64(options, "length_scale"),
                     power,
                     nullspace_order,
                     double_penalty: smooth_double_penalty,
@@ -6795,7 +6795,7 @@ fn parse_duchon_power(options: &BTreeMap<String, String>) -> Result<usize, Strin
                 raw
             )
         }),
-        None => Ok(1),
+        None => Ok(2),
     }
 }
 
@@ -8463,7 +8463,7 @@ mod tests {
                         feature_cols: vec![0],
                         spec: DuchonBasisSpec {
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                            length_scale: 1.0,
+                            length_scale: Some(1.0),
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             double_penalty: true,
@@ -8478,7 +8478,7 @@ mod tests {
                         feature_cols: vec![1],
                         spec: DuchonBasisSpec {
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                            length_scale: 1.0,
+                            length_scale: Some(1.0),
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             double_penalty: true,
@@ -8493,7 +8493,7 @@ mod tests {
                         feature_cols: vec![2],
                         spec: DuchonBasisSpec {
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                            length_scale: 1.0,
+                            length_scale: Some(1.0),
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             double_penalty: true,
@@ -8606,7 +8606,7 @@ mod tests {
                     feature_cols: vec![0, 1, 2],
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                        length_scale: 1.0,
+                        length_scale: Some(1.0),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         double_penalty: true,
@@ -8805,6 +8805,12 @@ mod tests {
             .expect("expected survival formula config");
         assert_eq!(cfg.spec.as_deref(), Some("crude"));
         assert_eq!(cfg.survival_distribution.as_deref(), Some("gaussian"));
+    }
+
+    #[test]
+    fn parse_duchon_power_defaults_to_two() {
+        let options = BTreeMap::new();
+        assert_eq!(parse_duchon_power(&options).expect("default Duchon power"), 2);
     }
 
     #[test]

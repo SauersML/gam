@@ -62,8 +62,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def true_surface(x: np.ndarray, z: np.ndarray) -> np.ndarray:
-    # Mostly smooth background with a sharp transition into a higher region whose
-    # plateau then undulates along its length instead of staying flat.
+    # Smooth background plus a rotated 2D mesa: the surface rises up, stays high
+    # over a bounded region, then drops back down in both rotated directions.
     u = 0.82 * x + 0.58 * z
     v = -0.46 * x + 0.89 * z
 
@@ -72,20 +72,20 @@ def true_surface(x: np.ndarray, z: np.ndarray) -> np.ndarray:
         + 0.04 * np.cos(2.0 * math.pi * v)
         + 0.03 * np.sin(math.pi * (x - 1.2 * z))
     )
-    curved_frontier = (
-        u
-        - 0.72
-        + 0.11 * np.sin(2.4 * math.pi * v)
-        - 0.07 * (v - 0.15) ** 2
+    u_left = u - 0.34 + 0.04 * np.sin(1.6 * math.pi * v)
+    u_right = u - 0.80 + 0.03 * np.cos(1.9 * math.pi * v - 0.4)
+    v_low = v + 0.26 + 0.03 * np.sin(1.7 * math.pi * u + 0.2)
+    v_high = v - 0.31 + 0.03 * np.cos(1.4 * math.pi * u - 0.3)
+
+    gate_u = (1.0 / (1.0 + np.exp(-u_left / 0.026))) - (1.0 / (1.0 + np.exp(-u_right / 0.028)))
+    gate_v = (1.0 / (1.0 + np.exp(-v_low / 0.03))) - (1.0 / (1.0 + np.exp(-v_high / 0.03)))
+    plateau_gate = gate_u * gate_v
+    plateau_base = 1.18 * plateau_gate
+    plateau_variation = plateau_gate * (
+        0.07 * np.sin(2.0 * math.pi * u + 0.15)
+        + 0.06 * np.cos(2.3 * math.pi * v - 0.1)
     )
-    gate = 1.0 / (1.0 + np.exp(-curved_frontier / 0.032))
-    plateau_base = 1.18 * gate
-    plateau_ripple = gate * (
-        0.16 * np.sin(2.2 * math.pi * v + 0.35)
-        + 0.07 * np.cos(3.1 * math.pi * u - 0.2)
-    )
-    shoulder = 0.06 * gate * np.sin(1.4 * math.pi * (u + 0.3 * v))
-    return smooth_bg + plateau_base + plateau_ripple + shoulder
+    return smooth_bg + plateau_base + plateau_variation
 
 
 def write_csv(path: Path, rows: list[tuple[float, ...]], header: list[str]) -> None:

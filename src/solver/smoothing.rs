@@ -50,6 +50,49 @@ pub struct SmoothingBfgsResult {
     pub stationary: bool,
 }
 
+fn smoothing_debug_enabled() -> bool {
+    matches!(
+        std::env::var("GAM_DEBUG_SMOOTHING").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+fn no_smoothing_seeds_error(
+    solver: &str,
+    num_penalties: usize,
+    options: &SmoothingBfgsOptions,
+) -> EstimationError {
+    EstimationError::RemlOptimizationFailed(format!(
+        "{solver}: no smoothing seeds were generated for {num_penalties} penalty parameter(s) \
+         (seed bounds [{:.1}, {:.1}], max_seeds={}, screening_budget={})",
+        options.seed_config.bounds.0,
+        options.seed_config.bounds.1,
+        options.seed_config.max_seeds,
+        options.seed_config.screening_budget.max(1),
+    ))
+}
+
+fn no_smoothing_candidate_error(
+    solver: &str,
+    num_penalties: usize,
+    screened_seed_count: usize,
+) -> EstimationError {
+    let start_summary = if screened_seed_count == 1 {
+        "the only screened outer-start failed before producing a valid candidate".to_string()
+    } else {
+        "every screened outer-start failed before producing a valid candidate".to_string()
+    };
+    let implication = if screened_seed_count == 1 {
+        "This run only screened one start, so the failure is narrower than a general multistart search failure.".to_string()
+    } else {
+        "This means each start either errored during objective evaluation or produced non-finite cost/gradient values.".to_string()
+    };
+    EstimationError::RemlOptimizationFailed(format!(
+        "{solver}: {start_summary} (num_penalties={num_penalties}, \
+         screened_starts={screened_seed_count}). {implication}"
+    ))
+}
+
 fn finite_diff_gradient_external<F>(
     rho: &Array1<f64>,
     step: f64,
@@ -162,8 +205,10 @@ where
 {
     let seeds = generate_rho_candidates(num_penalties, heuristic_lambdas, &options.seed_config);
     if seeds.is_empty() {
-        return Err(EstimationError::RemlOptimizationFailed(
-            "no smoothing seeds produced".to_string(),
+        return Err(no_smoothing_seeds_error(
+            "trust-region outer optimizer",
+            num_penalties,
+            options,
         ));
     }
     let candidate_seeds: Vec<(usize, Array1<f64>)> = seeds.into_iter().enumerate().collect();
@@ -250,7 +295,15 @@ where
     let solution = match optimizer.run() {
         Ok(sol) => sol,
         Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
-        Err(_) => return None,
+        Err(err) => {
+            if smoothing_debug_enabled() {
+                eprintln!(
+                    "[smoothing-debug] trust-region seed failed: rho_seed={:?} err={err:?}",
+                    rho_seed.to_vec()
+                );
+            }
+            return None;
+        }
     };
 
     let rho = solution.final_point.clone();
@@ -317,8 +370,10 @@ where
     }
 
     best.ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "all smoothing outer starts failed before producing a candidate".to_string(),
+        no_smoothing_candidate_error(
+            "trust-region outer optimizer",
+            num_penalties,
+            screened_seeds.len(),
         )
     })
 }
@@ -397,7 +452,15 @@ where
     let solution = match optimizer.run() {
         Ok(sol) => sol,
         Err(ArcError::MaxIterationsReached { last_solution, .. }) => *last_solution,
-        Err(_) => return None,
+        Err(err) => {
+            if smoothing_debug_enabled() {
+                eprintln!(
+                    "[smoothing-debug] ARC seed failed: rho_seed={:?} err={err:?}",
+                    rho_seed.to_vec()
+                );
+            }
+            return None;
+        }
     };
 
     let rho = solution.final_point.clone();
@@ -472,9 +535,7 @@ where
     }
 
     best.ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "all smoothing outer starts failed before producing a candidate".to_string(),
-        )
+        no_smoothing_candidate_error("ARC outer optimizer", num_penalties, screened_seeds.len())
     })
 }
 
@@ -489,8 +550,10 @@ where
 {
     let seeds = generate_rho_candidates(num_penalties, heuristic_lambdas, &options.seed_config);
     if seeds.is_empty() {
-        return Err(EstimationError::RemlOptimizationFailed(
-            "no smoothing seeds produced".to_string(),
+        return Err(no_smoothing_seeds_error(
+            "parallel trust-region outer optimizer",
+            num_penalties,
+            options,
         ));
     }
     let candidate_seeds: Vec<(usize, Array1<f64>)> = seeds.into_iter().enumerate().collect();
@@ -564,7 +627,15 @@ where
     let solution = match optimizer.run() {
         Ok(sol) => sol,
         Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
-        Err(_) => return None,
+        Err(err) => {
+            if smoothing_debug_enabled() {
+                eprintln!(
+                    "[smoothing-debug] parallel trust-region seed failed: rho_seed={:?} err={err:?}",
+                    rho_seed.to_vec()
+                );
+            }
+            return None;
+        }
     };
 
     let rho = solution.final_point.clone();
@@ -609,6 +680,7 @@ where
         &|rho: &Array1<f64>| eval_cost_grad_rho(rho).map(|(c, _)| c),
         options,
     )?;
+    let screened_seed_count = screened_seeds.len();
     let mut candidates: Vec<(usize, SmoothingBfgsResult)> = screened_seeds
         .into_par_iter()
         .filter_map(|(seed_idx, rho_seed)| {
@@ -618,8 +690,10 @@ where
         })
         .collect();
     if candidates.is_empty() {
-        return Err(EstimationError::RemlOptimizationFailed(
-            "all smoothing outer starts failed before producing a candidate".to_string(),
+        return Err(no_smoothing_candidate_error(
+            "parallel trust-region outer optimizer",
+            num_penalties,
+            screened_seed_count,
         ));
     }
     candidates.sort_by_key(|(seed_idx, _)| *seed_idx);
@@ -630,8 +704,10 @@ where
         }
     }
     best.ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "all smoothing outer starts failed before producing a candidate".to_string(),
+        no_smoothing_candidate_error(
+            "parallel trust-region outer optimizer",
+            num_penalties,
+            screened_seed_count,
         )
     })
 }

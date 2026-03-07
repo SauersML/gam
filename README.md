@@ -8,7 +8,8 @@ PIRLS/REML optimization, joint models, diagnostics/ALO, and HMC.
 High-level smooth term support includes:
 - Isotropic radial smooths (`ThinPlate`, `Matern`, `Duchon`) for same-scale feature spaces.
   Matérn uses explicit `nu` smoothness, while Duchon uses explicit `nullspace_order`
-  and integer `power` parameters.
+  and integer `power` parameters. Pure Duchon is scale-free by default; supplying
+  `length_scale` opts into the hybrid Duchon-Matérn variant.
 - Tensor-product smooths (`TensorBSpline`) for mixed-scale axes (e.g., space x time).
 - Random effects via categorical dummy blocks with identity (ridge) penalties.
 - Bounded parametric coefficients via `bounded(x, min=..., max=...)`, with explicit optional priors on the bounded user-scale coefficient.
@@ -20,6 +21,8 @@ Formula examples:
 - `y ~ age + smooth(bmi) + group(site)`
 - `y ~ nonnegative(effect) + smooth(bmi)`
 - `y ~ bounded(mu_hat, min=0, max=1) + matern(pc1, pc2, pc3)`
+- `y ~ s(pc1, pc2, type=duchon, centers=12)`
+- `y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)`
 - `y ~ bounded(mu_hat, min=0, max=1, prior="log-jacobian") + z`
 - `y ~ bounded(log_v_hat, min=0, max=2, target=1, strength=5) + x`
 

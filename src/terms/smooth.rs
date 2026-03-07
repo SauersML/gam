@@ -296,12 +296,17 @@ pub struct AdaptiveSpatialMap {
     pub term_name: String,
     pub feature_cols: Vec<usize>,
     pub collocation_points: Array2<f64>,
+    pub inv_mag_weight: Array1<f64>,
     pub inv_grad_weight: Array1<f64>,
     pub inv_lap_weight: Array1<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdaptiveRegularizationDiagnostics {
+    pub epsilon_0: f64,
+    pub epsilon_g: f64,
+    pub epsilon_c: f64,
+    pub epsilon_outer_iterations: usize,
     pub mm_iterations: usize,
     pub converged: bool,
     pub maps: Vec<AdaptiveSpatialMap>,
@@ -498,7 +503,10 @@ pub type TwoBlockMaternKappaOptimizationResult<FitOut> =
 #[derive(Debug, Clone)]
 pub struct SpatialLengthScaleOptimizationOptions {
     /// Enable outer-loop optimization over spatial κ (= 1 / length_scale)
-    /// for supported radial-kernel smooths (currently Matérn and Duchon).
+    /// for supported radial-kernel smooths.
+    /// Currently this applies to Matérn and hybrid Duchon terms with an
+    /// explicit `length_scale`; pure Duchon (`length_scale=None`) is scale-free
+    /// and is excluded.
     pub enabled: bool,
     /// Maximum number of coordinate-descent passes over supported spatial terms.
     pub max_outer_iter: usize,
@@ -2494,7 +2502,7 @@ fn fit_term_collection_for_spec_with_heuristic_lambdas(
     }
     let base_design = build_term_collection_design(data, spec)?;
     let base_fit_opts = adaptive_fit_options_base(options, &base_design);
-    let mut fitted = FittedTermCollection {
+    let fitted = FittedTermCollection {
         fit: fit_gam_with_heuristic_lambdas(
             base_design.design.view(),
             y,
@@ -2519,23 +2527,132 @@ fn fit_term_collection_for_spec_with_heuristic_lambdas(
         return Ok(fitted);
     }
 
-    let (eps_g, eps_c) =
+    let (eps_0_init, eps_g_init, eps_c_init) =
         compute_initial_epsilons(&fitted.fit.beta, &runtime_caches, adaptive_opts.min_epsilon);
+    let mut epsilon_outer_iterations = 0usize;
+    let mut best_eps = [eps_0_init, eps_g_init, eps_c_init];
+    let mut best_run = run_spatial_adaptive_mm(
+        fitted,
+        y,
+        weights,
+        offset,
+        family,
+        options,
+        &runtime_caches,
+        best_eps,
+    )?;
 
+    if adaptive_opts.estimate_epsilons {
+        let mut log_eps = Array1::from_vec(best_eps.iter().map(|v| v.ln()).collect());
+        let log_min = adaptive_opts.min_epsilon.max(1e-12).ln();
+        let mut step = adaptive_opts.epsilon_log_step.abs().max(1e-3);
+        for iter in 1..=adaptive_opts.max_epsilon_outer_iter.max(1) {
+            epsilon_outer_iterations = iter;
+            let mut improved = false;
+            for idx in 0..3 {
+                let mut best_local_score = fit_score(&best_run.fitted.fit);
+                let mut best_local_log = log_eps[idx];
+                let mut best_local_run: Option<AdaptiveMmRun> = None;
+                for dir in [-1.0_f64, 1.0_f64] {
+                    let mut trial_log = log_eps.clone();
+                    trial_log[idx] = (trial_log[idx] + dir * step).max(log_min);
+                    let trial_eps = [
+                        trial_log[0].exp(),
+                        trial_log[1].exp(),
+                        trial_log[2].exp(),
+                    ];
+                    let trial_run = run_spatial_adaptive_mm(
+                        best_run.fitted.clone(),
+                        y,
+                        weights,
+                        offset,
+                        family,
+                        options,
+                        &runtime_caches,
+                        trial_eps,
+                    )?;
+                    let trial_score = fit_score(&trial_run.fitted.fit);
+                    if trial_score + 1e-10 < best_local_score {
+                        best_local_score = trial_score;
+                        best_local_log = trial_log[idx];
+                        best_local_run = Some(trial_run);
+                    }
+                }
+                if let Some(run) = best_local_run {
+                    log_eps[idx] = best_local_log;
+                    best_eps = [log_eps[0].exp(), log_eps[1].exp(), log_eps[2].exp()];
+                    best_run = run;
+                    improved = true;
+                }
+            }
+            if !improved {
+                step *= 0.5;
+                if step < 0.05 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let maps = best_run
+        .last_weights
+        .iter()
+        .zip(runtime_caches.iter())
+        .map(|(w, cache)| AdaptiveSpatialMap {
+            term_name: cache.term_name.clone(),
+            feature_cols: cache.feature_cols.clone(),
+            collocation_points: cache.collocation_points.clone(),
+            inv_mag_weight: w.inv_mag_weight.clone(),
+            inv_grad_weight: w.inv_grad_weight.clone(),
+            inv_lap_weight: w.inv_lap_weight.clone(),
+        })
+        .collect();
+    let mut fitted = best_run.fitted;
+    fitted.adaptive_diagnostics = Some(AdaptiveRegularizationDiagnostics {
+        epsilon_0: best_eps[0],
+        epsilon_g: best_eps[1],
+        epsilon_c: best_eps[2],
+        epsilon_outer_iterations,
+        mm_iterations: best_run.mm_iterations,
+        converged: best_run.converged,
+        maps,
+    });
+    Ok(fitted)
+}
+
+struct AdaptiveMmRun {
+    fitted: FittedTermCollection,
+    last_weights: Vec<SpatialAdaptiveWeights>,
+    mm_iterations: usize,
+    converged: bool,
+}
+
+fn run_spatial_adaptive_mm(
+    mut fitted: FittedTermCollection,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+    runtime_caches: &[SpatialOperatorRuntimeCache],
+    epsilons: [f64; 3],
+) -> Result<AdaptiveMmRun, EstimationError> {
+    let adaptive_opts = options.adaptive_regularization.clone().unwrap_or_default();
     let mut mm_iterations = 0usize;
     let mut converged = false;
     let mut last_weights = compute_spatial_adaptive_weights_for_beta(
         &fitted.fit.beta,
-        &runtime_caches,
-        eps_g,
-        eps_c,
+        runtime_caches,
+        epsilons[0],
+        epsilons[1],
+        epsilons[2],
         adaptive_opts.weight_floor,
         adaptive_opts.weight_ceiling,
     );
     for iter in 1..=adaptive_opts.max_mm_iter.max(1) {
         mm_iterations = iter;
         let mut design_iter = fitted.design.clone();
-        apply_spatial_adaptive_penalties(&mut design_iter, &runtime_caches, &last_weights);
+        apply_spatial_adaptive_penalties(&mut design_iter, runtime_caches, &last_weights);
         let fit_iter_opts = adaptive_fit_options_base(options, &design_iter);
         let next_fit = fit_gam_with_heuristic_lambdas_and_warm_start(
             design_iter.design.view(),
@@ -2559,9 +2676,10 @@ fn fit_term_collection_for_spec_with_heuristic_lambdas(
         };
         last_weights = compute_spatial_adaptive_weights_for_beta(
             &fitted.fit.beta,
-            &runtime_caches,
-            eps_g,
-            eps_c,
+            runtime_caches,
+            epsilons[0],
+            epsilons[1],
+            epsilons[2],
             adaptive_opts.weight_floor,
             adaptive_opts.weight_ceiling,
         );
@@ -2570,24 +2688,12 @@ fn fit_term_collection_for_spec_with_heuristic_lambdas(
             break;
         }
     }
-
-    let maps = runtime_caches
-        .iter()
-        .zip(last_weights.iter())
-        .map(|(cache, w)| AdaptiveSpatialMap {
-            term_name: cache.term_name.clone(),
-            feature_cols: cache.feature_cols.clone(),
-            collocation_points: cache.collocation_points.clone(),
-            inv_grad_weight: w.inv_grad_weight.clone(),
-            inv_lap_weight: w.inv_lap_weight.clone(),
-        })
-        .collect();
-    fitted.adaptive_diagnostics = Some(AdaptiveRegularizationDiagnostics {
+    Ok(AdaptiveMmRun {
+        fitted,
+        last_weights,
         mm_iterations,
         converged,
-        maps,
-    });
-    Ok(fitted)
+    })
 }
 
 fn has_bounded_linear_terms(spec: &TermCollectionSpec) -> bool {
@@ -2604,8 +2710,10 @@ struct SpatialOperatorRuntimeCache {
     term_name: String,
     feature_cols: Vec<usize>,
     coeff_global_range: Range<usize>,
+    mass_penalty_global_idx: usize,
     tension_penalty_global_idx: usize,
     stiffness_penalty_global_idx: usize,
+    d0: Array2<f64>,
     d1: Array2<f64>,
     d2: Array2<f64>,
     collocation_points: Array2<f64>,
@@ -2614,8 +2722,10 @@ struct SpatialOperatorRuntimeCache {
 
 #[derive(Clone)]
 struct SpatialAdaptiveWeights {
+    mag_weight: Array1<f64>,
     grad_weight: Array1<f64>,
     lap_weight: Array1<f64>,
+    inv_mag_weight: Array1<f64>,
     inv_grad_weight: Array1<f64>,
     inv_lap_weight: Array1<f64>,
 }
@@ -2623,10 +2733,12 @@ struct SpatialAdaptiveWeights {
 fn collocation_magnitudes_for_beta(
     beta_local: ArrayView1<'_, f64>,
     cache: &SpatialOperatorRuntimeCache,
-) -> (Array1<f64>, Array1<f64>) {
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let mag = cache.d0.dot(&beta_local).mapv(f64::abs);
     let grad_rows = cache.d1.dot(&beta_local);
     let lap = cache.d2.dot(&beta_local);
     let p = cache.collocation_points.nrows();
+    debug_assert_eq!(mag.len(), p);
     debug_assert_eq!(grad_rows.len(), p * cache.dimension);
     debug_assert_eq!(lap.len(), p);
 
@@ -2654,7 +2766,7 @@ fn collocation_magnitudes_for_beta(
             c[k] = lap[k].abs();
         }
     }
-    (g, c)
+    (mag, g, c)
 }
 
 fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
@@ -2754,6 +2866,7 @@ fn extract_spatial_operator_runtime_caches(
             continue;
         };
         let mut active_local_idx = 0usize;
+        let mut mass_local_idx = None;
         let mut tension_local_idx = None;
         let mut stiffness_local_idx = None;
         for info in &term_fit.penalty_info_local {
@@ -2761,20 +2874,23 @@ fn extract_spatial_operator_runtime_caches(
                 continue;
             }
             match info.source {
+                PenaltySource::OperatorMass => mass_local_idx = Some(active_local_idx),
                 PenaltySource::OperatorTension => tension_local_idx = Some(active_local_idx),
                 PenaltySource::OperatorStiffness => stiffness_local_idx = Some(active_local_idx),
                 _ => {}
             }
             active_local_idx += 1;
         }
-        let (Some(tension_local), Some(stiffness_local)) = (tension_local_idx, stiffness_local_idx)
+        let (Some(mass_local), Some(tension_local), Some(stiffness_local)) =
+            (mass_local_idx, tension_local_idx, stiffness_local_idx)
         else {
             continue;
         };
+        let mass_global_idx = global_base_idx + mass_local;
         let tension_global_idx = global_base_idx + tension_local;
         let stiffness_global_idx = global_base_idx + stiffness_local;
 
-        let (feature_cols, d1, d2, collocation_points, dim) =
+        let (feature_cols, d0, d1, d2, collocation_points, dim) =
             match (&term_spec.basis, &term_fit.metadata) {
                 (
                     SmoothBasisSpec::Matern { feature_cols, .. },
@@ -2796,6 +2912,7 @@ fn extract_spatial_operator_runtime_caches(
                     )?;
                     (
                         feature_cols.clone(),
+                        ops.d0,
                         ops.d1,
                         ops.d2,
                         ops.collocation_points,
@@ -2823,6 +2940,7 @@ fn extract_spatial_operator_runtime_caches(
                     )?;
                     (
                         feature_cols.clone(),
+                        ops.d0,
                         ops.d1,
                         ops.d2,
                         ops.collocation_points,
@@ -2834,10 +2952,14 @@ fn extract_spatial_operator_runtime_caches(
 
         let coeff_global_range =
             (smooth_start + term_fit.coeff_range.start)..(smooth_start + term_fit.coeff_range.end);
-        if d1.ncols() != coeff_global_range.len() || d2.ncols() != coeff_global_range.len() {
+        if d0.ncols() != coeff_global_range.len()
+            || d1.ncols() != coeff_global_range.len()
+            || d2.ncols() != coeff_global_range.len()
+        {
             return Err(EstimationError::InvalidInput(format!(
-                "spatial operator dimension mismatch for term '{}': D1 cols={}, D2 cols={}, coeffs={}",
+                "spatial operator dimension mismatch for term '{}': D0 cols={}, D1 cols={}, D2 cols={}, coeffs={}",
                 term_fit.name,
+                d0.ncols(),
                 d1.ncols(),
                 d2.ncols(),
                 coeff_global_range.len()
@@ -2847,8 +2969,10 @@ fn extract_spatial_operator_runtime_caches(
             term_name: term_fit.name.clone(),
             feature_cols,
             coeff_global_range,
+            mass_penalty_global_idx: mass_global_idx,
             tension_penalty_global_idx: tension_global_idx,
             stiffness_penalty_global_idx: stiffness_global_idx,
+            d0,
             d1,
             d2,
             collocation_points,
@@ -2861,6 +2985,7 @@ fn extract_spatial_operator_runtime_caches(
 fn compute_spatial_adaptive_weights_for_beta(
     beta: &Array1<f64>,
     caches: &[SpatialOperatorRuntimeCache],
+    epsilon_0: f64,
     epsilon_g: f64,
     epsilon_c: f64,
     weight_floor: f64,
@@ -2873,11 +2998,13 @@ fn compute_spatial_adaptive_weights_for_beta(
     //   u(t0) = 1 / (2*sqrt(t0^2 + eps^2)).
     //
     // We apply this to:
+    //   t = f_k = |f(z_k)|            (magnitude),
     //   t = g_k = ||nabla f(z_k)||_2  (gradient magnitude),
     //   t = c_k = |Delta f(z_k)|      (laplacian magnitude),
     // both computed from beta^(t-1).
     //
     // These u values define the quadratic surrogate penalties:
+    //   K0 = D0_con^T W_0 D0_con,  W_0 = diag(u_0)
     //   K1 = D1_con^T W_g D1_con,  W_g = diag(u_g) \otimes I_d  (k,axis order)
     //   K2 = D2_con^T W_c D2_con,  W_c = diag(u_c).
     //
@@ -2886,24 +3013,31 @@ fn compute_spatial_adaptive_weights_for_beta(
         .iter()
         .map(|cache| {
             let beta_local = beta.slice(s![cache.coeff_global_range.clone()]);
-            let (g, c) = collocation_magnitudes_for_beta(beta_local, cache);
+            let (f, g, c) = collocation_magnitudes_for_beta(beta_local, cache);
+            let mut u_0 = Array1::<f64>::zeros(f.len());
             let mut u_g = Array1::<f64>::zeros(g.len());
             let mut u_c = Array1::<f64>::zeros(c.len());
+            let mut inv_0 = Array1::<f64>::zeros(f.len());
             let mut inv_g = Array1::<f64>::zeros(g.len());
             let mut inv_c = Array1::<f64>::zeros(c.len());
-            for k in 0..g.len() {
+            for k in 0..f.len() {
                 // MM majorizer weight for Charbonnier:
                 //   u(t0) = 1 / (2*sqrt(t0^2 + eps^2)).
+                let u0 = 0.5 / (f[k] * f[k] + epsilon_0 * epsilon_0).sqrt();
                 let ug = 0.5 / (g[k] * g[k] + epsilon_g * epsilon_g).sqrt();
                 let uc = 0.5 / (c[k] * c[k] + epsilon_c * epsilon_c).sqrt();
+                u_0[k] = u0.clamp(weight_floor, weight_ceiling);
                 u_g[k] = ug.clamp(weight_floor, weight_ceiling);
                 u_c[k] = uc.clamp(weight_floor, weight_ceiling);
+                inv_0[k] = 1.0 / u_0[k];
                 inv_g[k] = 1.0 / u_g[k];
                 inv_c[k] = 1.0 / u_c[k];
             }
             SpatialAdaptiveWeights {
+                mag_weight: u_0,
                 grad_weight: u_g,
                 lap_weight: u_c,
+                inv_mag_weight: inv_0,
                 inv_grad_weight: inv_g,
                 inv_lap_weight: inv_c,
             }
@@ -2915,12 +3049,14 @@ fn compute_initial_epsilons(
     beta: &Array1<f64>,
     caches: &[SpatialOperatorRuntimeCache],
     min_epsilon: f64,
-) -> (f64, f64) {
+) -> (f64, f64, f64) {
+    let mut f_vals = Vec::<f64>::new();
     let mut g_vals = Vec::<f64>::new();
     let mut c_vals = Vec::<f64>::new();
     for cache in caches {
         let beta_local = beta.slice(s![cache.coeff_global_range.clone()]);
-        let (g, c) = collocation_magnitudes_for_beta(beta_local, cache);
+        let (f, g, c) = collocation_magnitudes_for_beta(beta_local, cache);
+        f_vals.extend(f.iter().copied());
         g_vals.extend(g.iter().copied());
         c_vals.extend(c.iter().copied());
     }
@@ -2929,9 +3065,20 @@ fn compute_initial_epsilons(
     //   if s is tiny then fallback to max(Q95(z), RMS(z)),
     //   if still tiny then use absolute floor min_epsilon.
     // Epsilon is then kappa * s.
+    let eps_0 = robust_epsilon_from_samples(&f_vals, min_epsilon);
     let eps_g = robust_epsilon_from_samples(&g_vals, min_epsilon);
     let eps_c = robust_epsilon_from_samples(&c_vals, min_epsilon);
-    (eps_g, eps_c)
+    (eps_0, eps_g, eps_c)
+}
+
+fn weighted_operator_gram_from_d0(d0: &Array2<f64>, weight: &Array1<f64>) -> Array2<f64> {
+    let mut weighted = d0.clone();
+    for k in 0..weight.len() {
+        let w = weight[k].sqrt();
+        weighted.row_mut(k).mapv_inplace(|v| v * w);
+    }
+    let gram = weighted.t().dot(&weighted);
+    (&gram + &gram.t().to_owned()) * 0.5
 }
 
 fn weighted_operator_gram_from_d1(
@@ -2981,6 +3128,7 @@ fn apply_spatial_adaptive_penalties(
 ) {
     // MM surrogate assembly summary:
     //   For fixed weights u^(t), penalties are quadratic:
+    //     K0^(t) = D0_con^T W_0^(t) D0_con
     //     K1^(t) = D1_con^T W_g^(t) D1_con
     //     K2^(t) = D2_con^T W_c^(t) D2_con
     //   with W_g^(t) = diag(u_g^(t)) \otimes I_d for (k,axis) row layout.
@@ -2996,6 +3144,21 @@ fn apply_spatial_adaptive_penalties(
     // and pass S_i^(t) (plus current c_i metadata) into the REML layer.
     let p_total = design.design.ncols();
     for (cache, w) in caches.iter().zip(weights.iter()) {
+        let s0_raw = weighted_operator_gram_from_d0(&cache.d0, &w.mag_weight);
+        let c0 = frobenius_norm(&s0_raw).max(1e-12);
+        let s0 = s0_raw.mapv(|v| v / c0);
+        let mut s0_global = Array2::<f64>::zeros((p_total, p_total));
+        s0_global
+            .slice_mut(s![
+                cache.coeff_global_range.clone(),
+                cache.coeff_global_range.clone()
+            ])
+            .assign(&s0);
+        design.penalties[cache.mass_penalty_global_idx] = s0_global;
+        if let Some(info) = design.penalty_info.get_mut(cache.mass_penalty_global_idx) {
+            info.penalty.normalization_scale = c0;
+        }
+
         let s1_raw = weighted_operator_gram_from_d1(&cache.d1, &w.grad_weight, cache.dimension);
         // Re-normalize every MM step because S1 changes with u^(t).
         // Keeping this scaling current avoids mismatch between the objective being
@@ -3936,7 +4099,8 @@ pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Ve
         .iter()
         .enumerate()
         .filter_map(|(idx, term)| match term.basis {
-            SmoothBasisSpec::Matern { .. } | SmoothBasisSpec::Duchon { .. } => Some(idx),
+            SmoothBasisSpec::Matern { .. } => Some(idx),
+            SmoothBasisSpec::Duchon { ref spec, .. } if spec.length_scale.is_some() => Some(idx),
             _ => None,
         })
         .collect()
@@ -4457,7 +4621,17 @@ fn try_exact_joint_spatial_length_scale_optimization(
             {
                 (cost, grad, hess)
             }
-            _ => {
+            Ok(Some((_cost, _grad, _hess))) => {
+                return Err(ObjectiveEvalError::recoverable(
+                    "exact joint spatial objective returned invalid value",
+                ));
+            }
+            Ok(None) => {
+                return Err(ObjectiveEvalError::recoverable(
+                    "exact joint spatial objective returned invalid value",
+                ));
+            }
+            Err(_err) => {
                 return Err(ObjectiveEvalError::recoverable(
                     "exact joint spatial objective returned invalid value",
                 ));
@@ -4558,7 +4732,7 @@ fn set_spatial_length_scale(
             Ok(())
         }
         SmoothBasisSpec::Duchon { spec, .. } => {
-            spec.length_scale = length_scale;
+            spec.length_scale = Some(length_scale);
             Ok(())
         }
         _ => Err(EstimationError::InvalidInput(format!(
@@ -4573,7 +4747,7 @@ pub(crate) fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usiz
         .get(term_idx)
         .and_then(|term| match &term.basis {
             SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
-            SmoothBasisSpec::Duchon { spec, .. } => Some(spec.length_scale),
+            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale,
             _ => None,
         })
 }
@@ -5185,9 +5359,9 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
     options: &FitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
-    // κ (= 1/length_scale) changes kernel geometry nonlinearly.
-    // That means both basis values B and penalty blocks S change, so each κ
-    // proposals rebuild the spatial basis.
+    // For spatial terms with an explicit length scale, κ (= 1/length_scale)
+    // changes kernel geometry nonlinearly. That means both basis values B and
+    // penalty blocks S change, so each κ proposal rebuilds the spatial basis.
     //
     // When exact derivative information is available for the rebuilt basis and
     // penalty, κ is promoted to a first-class outer hyperparameter beside
@@ -5195,8 +5369,9 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
     // theta = [rho, psi], where psi = log(kappa) = -log(length_scale), using the
     // exact directional hyper-gradient path in `reml.rs`.
     //
-    // If a spatial basis does not expose exact log-kappa derivatives, this
-    // one-block path currently keeps the frozen baseline fit. The older
+    // Pure Duchon terms are scale-free and never enter this outer solve.
+    // If an eligible spatial basis does not expose exact log-kappa derivatives,
+    // this one-block path currently keeps the frozen baseline fit. The older
     // coordinate-search fallback is not implemented here.
     let mut resolved_spec = spec.clone();
     let spatial_terms = spatial_length_scale_term_indices(&resolved_spec);
@@ -5538,7 +5713,7 @@ mod tests {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                    length_scale: 0.9,
+                    length_scale: Some(0.9),
                     power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     double_penalty: false,
@@ -6020,7 +6195,7 @@ mod tests {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                    length_scale: 0.9,
+                    length_scale: Some(0.9),
                     power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     double_penalty: true,
@@ -6038,7 +6213,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_duchon_order_zero_freezes_intercept_orthogonality_transform() {
+    fn joint_duchon_order_zero_raw_smooth_build_preserves_unconstrained_basis() {
         let n = 12usize;
         let d = 4usize;
         let mut data = Array2::<f64>::zeros((n, d));
@@ -6054,7 +6229,7 @@ mod tests {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                    length_scale: 1.0,
+                    length_scale: Some(1.0),
                     power: 1,
                     nullspace_order: DuchonNullspaceOrder::Zero,
                     double_penalty: true,
@@ -6065,17 +6240,16 @@ mod tests {
         }];
 
         let sd = build_smooth_design(data.view(), &terms).expect("joint duchon build");
-        assert_eq!(sd.design.ncols(), 3);
+        assert_eq!(sd.design.ncols(), 4);
         match &sd.terms[0].metadata {
             BasisMetadata::Duchon {
                 identifiability_transform,
                 ..
             } => {
-                let z = identifiability_transform
-                    .as_ref()
-                    .expect("joint duchon should freeze the intercept-orthogonality transform");
-                assert_eq!(z.nrows(), 4);
-                assert_eq!(z.ncols(), 3);
+                assert!(
+                    identifiability_transform.is_none(),
+                    "raw smooth build should not freeze intercept orthogonality before term-collection assembly"
+                );
             }
             other => panic!("expected Duchon metadata, got {other:?}"),
         }
@@ -6101,7 +6275,7 @@ mod tests {
                     feature_cols: (0..d).collect(),
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                        length_scale: 1.0,
+                        length_scale: Some(1.0),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         double_penalty: true,
@@ -6150,7 +6324,7 @@ mod tests {
                     feature_cols: (0..d).collect(),
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                        length_scale: 1.0,
+                        length_scale: Some(1.0),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         double_penalty: true,
@@ -6189,7 +6363,7 @@ mod tests {
                     feature_cols: (0..d).collect(),
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                        length_scale: 1.0,
+                        length_scale: Some(1.0),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         double_penalty: true,
@@ -6642,7 +6816,7 @@ mod tests {
                     feature_cols: vec![0, 1],
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 7 },
-                        length_scale: 0.7,
+                        length_scale: Some(0.7),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         double_penalty: true,
@@ -6912,7 +7086,7 @@ mod tests {
                 feature_cols: vec![0, 1],
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale,
+                    length_scale: Some(length_scale),
                     power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     double_penalty: true,
@@ -7239,15 +7413,18 @@ mod tests {
             term_name: "matern".to_string(),
             feature_cols: vec![0, 1],
             coeff_global_range: 0..2,
-            tension_penalty_global_idx: 0,
-            stiffness_penalty_global_idx: 1,
+            mass_penalty_global_idx: 0,
+            tension_penalty_global_idx: 1,
+            stiffness_penalty_global_idx: 2,
+            d0: array![[5e-10, 0.0], [6e-10, 0.0]],
             d1: array![[1e-10, 0.0], [0.0, 1e-10], [2e-10, 0.0], [0.0, 2e-10]],
             d2: array![[3e-10, 0.0], [4e-10, 0.0]],
             collocation_points: array![[0.0, 0.0], [1.0, 1.0]],
             dimension: 2,
         };
         let beta = array![1.0, 1.0];
-        let (eps_g, eps_c) = compute_initial_epsilons(&beta, &[cache], 1e-8);
+        let (eps_0, eps_g, eps_c) = compute_initial_epsilons(&beta, &[cache], 1e-8);
+        assert!(eps_0 >= 1e-8);
         assert!(eps_g >= 1e-8);
         assert!(eps_c >= 1e-8);
     }
@@ -7283,20 +7460,25 @@ mod tests {
             term_name: "matern".to_string(),
             feature_cols: vec![0, 1],
             coeff_global_range: 0..2,
-            tension_penalty_global_idx: 0,
-            stiffness_penalty_global_idx: 1,
+            mass_penalty_global_idx: 0,
+            tension_penalty_global_idx: 1,
+            stiffness_penalty_global_idx: 2,
+            d0: array![[0.0, 0.0]],
             d1: array![[0.0, 0.0], [0.0, 0.0]],
             d2: array![[0.0, 0.0]],
             collocation_points: array![[0.0, 0.0]],
             dimension: 2,
         };
         let beta = array![0.0, 0.0];
-        let out = compute_spatial_adaptive_weights_for_beta(&beta, &[cache], 1e-8, 1e-8, 1e-8, 1e2);
+        let out =
+            compute_spatial_adaptive_weights_for_beta(&beta, &[cache], 1e-8, 1e-8, 1e-8, 1e-8, 1e2);
         assert_eq!(out.len(), 1);
         // Raw u would be 1/eps = 1e8, so clamp to 1e2.
+        assert!((out[0].mag_weight[0] - 1e2).abs() < 1e-12);
         assert!((out[0].grad_weight[0] - 1e2).abs() < 1e-12);
         assert!((out[0].lap_weight[0] - 1e2).abs() < 1e-12);
         // Diagnostics are 1/u.
+        assert!((out[0].inv_mag_weight[0] - 1e-2).abs() < 1e-12);
         assert!((out[0].inv_grad_weight[0] - 1e-2).abs() < 1e-12);
         assert!((out[0].inv_lap_weight[0] - 1e-2).abs() < 1e-12);
     }
@@ -7307,20 +7489,25 @@ mod tests {
             term_name: "matern".to_string(),
             feature_cols: vec![0, 1],
             coeff_global_range: 0..2,
-            tension_penalty_global_idx: 0,
-            stiffness_penalty_global_idx: 1,
+            mass_penalty_global_idx: 0,
+            tension_penalty_global_idx: 1,
+            stiffness_penalty_global_idx: 2,
+            d0: array![[1.0, 0.0], [2.0, 0.0]],
             d1: array![[1.0, 0.0], [0.0, 1.0], [2.0, 0.0], [0.0, 2.0]],
             d2: array![[1.0, 0.0], [2.0, 0.0]],
             collocation_points: array![[0.0, 0.0], [1.0, 1.0]],
             dimension: 2,
         };
         let beta = array![1.0, 1.0];
-        let out =
-            compute_spatial_adaptive_weights_for_beta(&beta, &[cache], 1e-6, 1e-6, 1e-12, 1e12);
+        let out = compute_spatial_adaptive_weights_for_beta(
+            &beta, &[cache], 1e-6, 1e-6, 1e-6, 1e-12, 1e12,
+        );
         assert_eq!(out.len(), 1);
         for k in 0..out[0].grad_weight.len() {
+            let p0 = out[0].mag_weight[k] * out[0].inv_mag_weight[k];
             let pg = out[0].grad_weight[k] * out[0].inv_grad_weight[k];
             let pc = out[0].lap_weight[k] * out[0].inv_lap_weight[k];
+            assert!((p0 - 1.0).abs() < 1e-10, "mag pair mismatch at {k}: {p0}");
             assert!((pg - 1.0).abs() < 1e-10, "grad pair mismatch at {k}: {pg}");
             assert!((pc - 1.0).abs() < 1e-10, "lap pair mismatch at {k}: {pc}");
         }
@@ -7332,8 +7519,10 @@ mod tests {
             term_name: "matern".to_string(),
             feature_cols: vec![0, 1],
             coeff_global_range: 0..2,
-            tension_penalty_global_idx: 0,
-            stiffness_penalty_global_idx: 1,
+            mass_penalty_global_idx: 0,
+            tension_penalty_global_idx: 1,
+            stiffness_penalty_global_idx: 2,
+            d0: array![[1.0, 0.0]],
             d1: array![[1.0, 0.0], [0.0, 1.0]],
             d2: array![[1.0, 0.0]],
             collocation_points: array![[0.0, 0.0]],
@@ -7346,6 +7535,7 @@ mod tests {
             std::slice::from_ref(&cache),
             1e-8,
             1e-8,
+            1e-8,
             1e-12,
             1e12,
         );
@@ -7354,11 +7544,14 @@ mod tests {
             &[cache],
             1e-8,
             1e-8,
+            1e-8,
             1e-12,
             1e12,
         );
+        assert!(small[0].mag_weight[0] > large[0].mag_weight[0]);
         assert!(small[0].grad_weight[0] > large[0].grad_weight[0]);
         assert!(small[0].lap_weight[0] > large[0].lap_weight[0]);
+        assert!(small[0].inv_mag_weight[0] < large[0].inv_mag_weight[0]);
         assert!(small[0].inv_grad_weight[0] < large[0].inv_grad_weight[0]);
         assert!(small[0].inv_lap_weight[0] < large[0].inv_lap_weight[0]);
     }
@@ -7366,12 +7559,17 @@ mod tests {
     #[test]
     fn adaptive_diagnostics_json_roundtrip_preserves_shapes() {
         let diag = AdaptiveRegularizationDiagnostics {
+            epsilon_0: 0.01,
+            epsilon_g: 0.02,
+            epsilon_c: 0.03,
+            epsilon_outer_iterations: 2,
             mm_iterations: 3,
             converged: true,
             maps: vec![AdaptiveSpatialMap {
                 term_name: "matern".to_string(),
                 feature_cols: vec![0, 1],
                 collocation_points: array![[1.0, 2.0], [3.0, 4.0]],
+                inv_mag_weight: array![0.05, 0.15],
                 inv_grad_weight: array![0.1, 0.2],
                 inv_lap_weight: array![0.3, 0.4],
             }],
@@ -7386,6 +7584,7 @@ mod tests {
         );
         let decoded: AdaptiveRegularizationDiagnostics =
             serde_json::from_value(payload).expect("deserialize diagnostics");
+        assert_eq!(decoded.epsilon_outer_iterations, 2);
         assert_eq!(decoded.mm_iterations, 3);
         assert!(decoded.converged);
         assert_eq!(decoded.maps.len(), 1);
