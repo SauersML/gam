@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
         default=REPO_ROOT / "scripts" / "duchon_2d_surface_order0_power2.png",
     )
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--n-train", type=int, default=900)
+    parser.add_argument("--n-train", type=int, default=1800)
     parser.add_argument("--grid-size", type=int, default=90)
     return parser.parse_args()
 
@@ -85,7 +85,8 @@ def true_surface(x: np.ndarray, z: np.ndarray) -> np.ndarray:
         0.07 * np.sin(2.0 * math.pi * u + 0.15)
         + 0.06 * np.cos(2.3 * math.pi * v - 0.1)
     )
-    return smooth_bg + plateau_base + plateau_variation
+    spike = 1.36 * np.exp(-(((x - 0.76) / 0.055) ** 2 + ((z - 0.24) / 0.045) ** 2))
+    return smooth_bg + plateau_base + plateau_variation + spike
 
 
 def write_csv(path: Path, rows: list[tuple[float, ...]], header: list[str]) -> None:
