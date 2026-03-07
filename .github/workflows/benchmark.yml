@@ -45,7 +45,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install numpy pandas scikit-learn pygam lifelines
+          python3 -m pip install numpy pandas scikit-learn lifelines
 
       - name: Preflight scenario schemas
         shell: bash
@@ -255,7 +255,7 @@ jobs:
               cp -a "${R_LIBS_USER}/." bench/runtime/r-lib/ || true
             fi
             python3 -m pip install --upgrade pip setuptools wheel
-            python3 -m pip install --target bench/runtime/pydeps numpy pandas scikit-learn pygam lifelines scikit-survival xgboost matplotlib
+            python3 -m pip install --target bench/runtime/pydeps numpy pandas scikit-learn lifelines scikit-survival xgboost matplotlib
           fi
           cargo build --release --bin gam
           cp target/release/gam bench/runtime/gam
@@ -381,12 +381,7 @@ jobs:
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
 
-          needs_pygam = bool(mod._should_run_pygam_for_scenario({"name": scenario_name}))
-          if needs_pygam:
-            import pygam  # noqa: F401
-            print(f"python deps ok (scenario={scenario_name}, pygam=required)")
-          else:
-            print(f"python deps ok (scenario={scenario_name}, pygam=not-required)")
+          print(f"python deps ok (scenario={scenario_name})")
           PY
           echo "smoke-load R deps"
           Rscript -e 'library(mgcv); library(jsonlite); library(survival); library(glmnet); library(gamlss); library(gamlss.dist); library(gamboostLSS); library(mboost); library(bamlss); library(brms); cat("R deps ok\n")'
@@ -512,12 +507,7 @@ jobs:
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
 
-          needs_pygam = bool(mod._should_run_pygam_for_scenario({"name": scenario_name}))
-          if needs_pygam:
-            import pygam  # noqa: F401
-            print(f"python deps ok (scenario={scenario_name}, pygam=required)")
-          else:
-            print(f"python deps ok (scenario={scenario_name}, pygam=not-required)")
+          print(f"python deps ok (scenario={scenario_name})")
           PY
           echo "smoke-load R deps"
           Rscript -e 'library(mgcv); library(jsonlite); library(survival); library(glmnet); library(gamlss); library(gamlss.dist); library(gamboostLSS); library(mboost); library(bamlss); library(brms); cat("R deps ok\n")'

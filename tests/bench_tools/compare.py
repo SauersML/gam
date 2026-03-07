@@ -17,13 +17,11 @@ WORKSPACE_ROOT = PROJECT_ROOT.parent
 # --- Model and Data Paths ---
 GNOMON_EXECUTABLE = WORKSPACE_ROOT / "target" / "release" / "gnomon"
 R_MODEL_PATH = SCRIPT_DIR / 'gam_model_fit.rds'
-PYGAM_MODEL_PATH = SCRIPT_DIR / 'gam_model_fit.joblib'
 RUST_MODEL_CONFIG_PATH = PROJECT_ROOT / 'model.toml'
 TEST_DATA_CSV = SCRIPT_DIR / 'test_data.csv' # Use test data for all evaluation
 
 # --- Temporary File Paths for Inference ---
 R_PREDICTIONS_CSV = SCRIPT_DIR / 'r_model_predictions.csv'
-PYGAM_PREDICTIONS_CSV = SCRIPT_DIR / 'pygam_model_predictions.csv'
 RUST_PREDICTIONS_CSV = SCRIPT_DIR / 'rust_model_predictions.csv'
 RUST_FORMATTED_INFERENCE_DATA_TSV = SCRIPT_DIR / 'rust_formatted_inference_data.tsv'
 
@@ -408,39 +406,6 @@ def run_rust_inference(input_csv, temp_tsv, output_csv):
         print(f"\nERROR: gnomon failed. Is it built? Error:\n{e}")
         sys.exit(1)
         
-def run_python_inference(input_csv, output_csv):
-    """Generic function to get predictions from the Python/PyGAM model.
-    Returns True if successful, False if PyGAM model is not available."""
-    print(f"--- Running Python/PyGAM inference on '{input_csv.name}'")
-    
-    # Check if model file exists first
-    if not PYGAM_MODEL_PATH.is_file():
-        print(f"INFO: PyGAM model file not found at {PYGAM_MODEL_PATH}")
-        print("PyGAM will be omitted from comparison. This is not an error.")
-        return False
-        
-    try:
-        # Try to import required modules
-        try:
-            import joblib
-        except ImportError as e:
-            print(f"INFO: Required PyGAM dependencies not available: {e}")
-            print("PyGAM will be omitted from comparison. This is not an error.")
-            return False
-            
-        # Load the model and make predictions
-        model = joblib.load(PYGAM_MODEL_PATH)
-        data = pd.read_csv(input_csv)
-        X = data[['variable_one', 'variable_two']].values
-        predictions = model.predict_proba(X)
-        pd.DataFrame({"pygam_prediction": predictions}).to_csv(output_csv, index=False)
-        return True
-        
-    except Exception as e:
-        print(f"INFO: PyGAM inference failed: {e}")
-        print("PyGAM will be omitted from comparison. This is not an error.")
-        return False
-
 def print_performance_report(df, bootstrap_ci=True, n_boot=1000, seed=42):
     """Calculates and prints all performance metrics based on test data.
     
@@ -461,10 +426,6 @@ def print_performance_report(df, bootstrap_ci=True, n_boot=1000, seed=42):
         "Rust / gnomon": df['rust_prediction'].values
     }
     
-    # Add PyGAM if available
-    if 'pygam_prediction' in df.columns:
-        models["Python / PyGAM"] = df['pygam_prediction'].values
-        
     # Add uncalibrated if available
     if 'uncalibrated_prediction' in df.columns:
         models["Uncalibrated Rust"] = df['uncalibrated_prediction'].values
@@ -547,14 +508,12 @@ def plot_prediction_comparisons(df):
     COLORS = {
         'rust': '#2ca02c',      # Green for Rust
         'r': '#1f77b4',         # Blue for R
-        'pygam': '#ff7f0e',     # Orange for PyGAM
         'uncalibrated': '#9467bd', # Purple for uncalibrated predictions
         'perfect': '#d62728',   # Red for perfect prediction lines
         'grid': '#cccccc'       # Light gray for grids
     }
     
     # Check which models we have
-    has_pygam = 'pygam_prediction' in df.columns
     has_uncalibrated = 'uncalibrated_prediction' in df.columns
     
     # Create custom colormaps with model-specific colors for density plots
@@ -564,9 +523,6 @@ def plot_prediction_comparisons(df):
     # Each colormap transitions from white to the model's color
     r_cmap = LinearSegmentedColormap.from_list('r_cmap', ['#ffffff', COLORS['r']], N=100)
     rust_cmap = LinearSegmentedColormap.from_list('rust_cmap', ['#ffffff', COLORS['rust']], N=100)
-    
-    if has_pygam:
-        pygam_cmap = LinearSegmentedColormap.from_list('pygam_cmap', ['#ffffff', COLORS['pygam']], N=100)
     
     # Define models and their visual attributes
     models = {
@@ -586,16 +542,6 @@ def plot_prediction_comparisons(df):
         }
     }
     
-    # Add PyGAM model if available
-    if has_pygam:
-        models['Python / PyGAM'] = {
-            'predictions': 'pygam_prediction',
-            'color': COLORS['pygam'],
-            'marker': 'o',       # Circle
-            'label': 'Python / PyGAM',
-            'zorder': 2
-        }
-        
     # Add uncalibrated model if available
     if has_uncalibrated:
         models['Uncalibrated Rust'] = {
@@ -607,24 +553,12 @@ def plot_prediction_comparisons(df):
         }
     
     # Create the figure layout
-    if has_pygam:
-        # Create a 2x2 grid for showing each model vs ground truth
-        fig = plt.figure(figsize=(20, 15))
-        gs = fig.add_gridspec(2, 2, wspace=0.2, hspace=0.3)
-        
-        # One plot for each model vs ground truth, plus one for all models together
-        ax_r = fig.add_subplot(gs[0, 0])       # R vs ground truth
-        ax_pygam = fig.add_subplot(gs[0, 1])   # PyGAM vs ground truth
-        ax_rust = fig.add_subplot(gs[1, 0])    # Rust vs ground truth
-        ax_all = fig.add_subplot(gs[1, 1])     # All models vs ground truth
-    else:
-        # Create a 1x3 grid when PyGAM is not available
-        fig = plt.figure(figsize=(20, 7))
-        gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1], wspace=0.2)
-        
-        ax_r = fig.add_subplot(gs[0, 0])      # R vs ground truth
-        ax_rust = fig.add_subplot(gs[0, 1])    # Rust vs ground truth
-        ax_all = fig.add_subplot(gs[0, 2])     # All models vs ground truth
+    fig = plt.figure(figsize=(20, 7))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1], wspace=0.2)
+    
+    ax_r = fig.add_subplot(gs[0, 0])      # R vs ground truth
+    ax_rust = fig.add_subplot(gs[0, 1])   # Rust vs ground truth
+    ax_all = fig.add_subplot(gs[0, 2])    # All models vs ground truth
     
     # Calculate model MAEs for legend
     mae_values = {name: np.mean(np.abs(df['final_probability'] - df[model['predictions']]))
@@ -679,10 +613,6 @@ def plot_prediction_comparisons(df):
     # Plot Rust model vs ground truth
     plot_model_vs_truth(ax_rust, 'Rust / gnomon', models['Rust / gnomon'])
     
-    # Plot PyGAM model vs ground truth (if available)
-    if has_pygam:
-        plot_model_vs_truth(ax_pygam, 'Python / PyGAM', models['Python / PyGAM'])
-    
     # Plot all models together on one graph
     # Plot R model in all-models plot
     r_x = df['final_probability'].values
@@ -698,22 +628,6 @@ def plot_prediction_comparisons(df):
     except Exception:
         ax_all.scatter(r_x, r_y, c=COLORS['r'], s=25, marker='o', alpha=0.3,
                   label=f"R / mgcv (MAE={mae_values['R / mgcv']:.4f})")
-    
-    # PyGAM model (if available)
-    if has_pygam:
-        pygam_x = df['final_probability'].values
-        pygam_y = df['pygam_prediction'].values
-        try:
-            xy = np.vstack([pygam_x, pygam_y])
-            density = gaussian_kde(xy)(xy)
-            idx = np.argsort(density)
-            x, y, density = pygam_x[idx], pygam_y[idx], density[idx]
-            ax_all.scatter(x, y, c=density, cmap=pygam_cmap,
-                      s=25, marker='o', edgecolor='none', alpha=0.5,
-                      label=f"Python / PyGAM (MAE={mae_values['Python / PyGAM']:.4f})")
-        except Exception:
-            ax_all.scatter(pygam_x, pygam_y, c=COLORS['pygam'], s=25, marker='o', alpha=0.3,
-                      label=f"Python / PyGAM (MAE={mae_values['Python / PyGAM']:.4f})")
     
     # Make Rust more prominent in all-models plot
     rust_x = df['final_probability'].values
@@ -856,14 +770,10 @@ def plot_model_surfaces(test_df):
     print("### PLOTTING MODEL SURFACES COMPARISON ###")
     print("#" * 70)
     
-    # Check if PyGAM is available (by looking for the file)
-    has_pygam = PYGAM_MODEL_PATH.is_file()
-    
     # Define consistent colors across all visualizations
     COLORS = {
         'rust': '#2ca02c',      # Green for Rust
         'r': '#1f77b4',         # Blue for R
-        'pygam': '#ff7f0e',     # Orange for PyGAM
         'perfect': '#d62728',   # Red for decision boundaries
         'grid': '#cccccc'       # Light gray for grids
     }
@@ -874,10 +784,6 @@ def plot_model_surfaces(test_df):
     # Create custom colormaps with model-specific colors
     r_cmap = LinearSegmentedColormap.from_list('r_cmap', ['#ffffff', COLORS['r']], N=100)
     rust_cmap = LinearSegmentedColormap.from_list('rust_cmap', ['#ffffff', COLORS['rust']], N=100)
-    
-    # Only create PyGAM colormap if it's available
-    if has_pygam:
-        pygam_cmap = LinearSegmentedColormap.from_list('pygam_cmap', ['#ffffff', COLORS['pygam']], N=100)
     
     # For empirical data, use a neutral colormap
     emp_cmap = 'viridis'
@@ -912,37 +818,14 @@ def plot_model_surfaces(test_df):
     r_preds = pd.read_csv(r_preds_path)['r_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
     rust_preds = pd.read_csv(rust_preds_path)['rust_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
     
-    # Run PyGAM inference only if available
-    if has_pygam:
-        pygam_preds_path = SCRIPT_DIR / 'temp_pygam_surface_preds.csv'
-        pygam_available = run_python_inference(grid_csv_path, pygam_preds_path)
-        
-        if pygam_available and pygam_preds_path.is_file():
-            pygam_preds = pd.read_csv(pygam_preds_path)['pygam_prediction'].values.reshape(GRID_POINTS, GRID_POINTS)
-        else:
-            has_pygam = False
-    
-    # D. Create plot layout based on available models
+    # D. Create plot layout
     print("\n--- Generating Model Surface Plots ---")
-    if has_pygam:
-        # 2x2 layout with all three models + empirical data
-        fig = plt.figure(figsize=(20, 18))
-        gs = fig.add_gridspec(2, 2, height_ratios=[1, 1], hspace=0.4, wspace=0.2)
-        
-        # Model predictions in a clear layout
-        ax1 = fig.add_subplot(gs[0, 0])  # R model (top left)
-        ax2 = fig.add_subplot(gs[0, 1])  # PyGAM model (top right)
-        ax3 = fig.add_subplot(gs[1, 0])  # Rust model (bottom left)
-        ax4 = fig.add_subplot(gs[1, 1])  # Empirical data (bottom right)
-    else:
-        # 1x3 layout with R, Rust, and empirical data
-        fig = plt.figure(figsize=(20, 6))
-        gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1], wspace=0.2)
-        
-        # Model predictions in a clear layout
-        ax1 = fig.add_subplot(gs[0, 0])  # R model (left)
-        ax3 = fig.add_subplot(gs[0, 1])  # Rust model (middle)
-        ax4 = fig.add_subplot(gs[0, 2])  # Empirical data (right)
+    fig = plt.figure(figsize=(20, 6))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1], wspace=0.2)
+    
+    ax1 = fig.add_subplot(gs[0, 0])  # R model (left)
+    ax3 = fig.add_subplot(gs[0, 1])  # Rust model (middle)
+    ax4 = fig.add_subplot(gs[0, 2])  # Empirical data (right)
     
     fig.suptitle("Model Surfaces Comparison", fontsize=24, y=0.98)
     
@@ -961,17 +844,6 @@ def plot_model_surfaces(test_df):
     ax1.grid(color='white', linestyle=':', alpha=0.5)
     fig.colorbar(cf_r, ax=ax1, orientation='vertical', shrink=0.8, 
                 label='Probability (R / mgcv)')
-    
-    # Top right: PyGAM model (if available)
-    if has_pygam:
-        cf_pygam = ax2.contourf(v1_grid, v2_grid, pygam_preds, levels=levels, cmap=pygam_cmap, alpha=0.9)
-        ax2.contour(v1_grid, v2_grid, pygam_preds, levels=[0.25, 0.5, 0.75], colors='white', linewidths=1.0)
-        ax2.contour(v1_grid, v2_grid, pygam_preds, levels=[0.5], colors=COLORS['pygam'], linewidths=2.5)
-        ax2.set_title("Python / PyGAM Model Surface", fontsize=18, pad=10)
-        ax2.set_xlabel("variable_one", fontsize=14)
-        ax2.grid(color='white', linestyle=':', alpha=0.5)
-        fig.colorbar(cf_pygam, ax=ax2, orientation='vertical', shrink=0.8, 
-                    label='Probability (Python / PyGAM)')
     
     # Bottom left: Rust model
     cf_rust = ax3.contourf(v1_grid, v2_grid, rust_preds, levels=levels, cmap=rust_cmap, alpha=0.9)
@@ -994,19 +866,11 @@ def plot_model_surfaces(test_df):
     # Using complementary colors for better visibility on the empirical data plot
     r_color_inv = '#e08846'      # Inverted from blue to orange
     rust_color_inv = '#d73c70'   # Inverted from green to magenta
-    pygam_color_inv = '#0080ff'  # Inverted from orange to blue
-    
     # Add decision boundaries with inverted colors
     ax4.contour(v1_grid, v2_grid, r_preds, levels=[0.5], colors=r_color_inv, linewidths=2.0, linestyles='-', alpha=0.9)
     ax4.contour(
         v1_grid, v2_grid, rust_preds, levels=[0.5], colors=rust_color_inv, linewidths=2.0, linestyles='-', alpha=0.9
     )
-    
-    # Add PyGAM decision boundary if available
-    if has_pygam:
-        ax4.contour(
-            v1_grid, v2_grid, pygam_preds, levels=[0.5], colors=pygam_color_inv, linewidths=2.0, linestyles='-', alpha=0.9
-        )
     
     # Create proxy artists for the legend with inverted colors
     from matplotlib.lines import Line2D
@@ -1014,10 +878,6 @@ def plot_model_surfaces(test_df):
         Line2D([0], [0], color=r_color_inv, lw=2, label='R / mgcv Decision Boundary'),
         Line2D([0], [0], color=rust_color_inv, lw=2, label='Rust / gnomon Decision Boundary')
     ]
-    
-    # Add PyGAM to legend if available
-    if has_pygam:
-        legend_elements.insert(1, Line2D([0], [0], color=pygam_color_inv, lw=2, label='Python / PyGAM Decision Boundary'))
     
     ax4.set_title("Empirical Data with All Decision Boundaries", fontsize=18, pad=10)
     ax4.set_xlabel("variable_one", fontsize=14)
@@ -1027,16 +887,9 @@ def plot_model_surfaces(test_df):
                 label='Probability (Mean outcome)')
     
     # Ensure all subplots share the same axes limits
-    if has_pygam:
-        # When we have all four axes (with PyGAM)
-        for ax in [ax1, ax2, ax3, ax4]:
-            ax.set_xlim(v1_min, v1_max)
-            ax.set_ylim(v2_min, v2_max)
-    else:
-        # When we only have three axes (without PyGAM)
-        for ax in [ax1, ax3, ax4]:
-            ax.set_xlim(v1_min, v1_max)
-            ax.set_ylim(v2_min, v2_max)
+    for ax in [ax1, ax3, ax4]:
+        ax.set_xlim(v1_min, v1_max)
+        ax.set_ylim(v2_min, v2_max)
     
     # Use more compatible padding approach instead of tight_layout
     fig.subplots_adjust(top=0.92, bottom=0.08, left=0.08, right=0.92, hspace=0.4, wspace=0.2)
@@ -1047,10 +900,6 @@ def plot_model_surfaces(test_df):
         if file_path.is_file():
             file_path.unlink()
     
-    # Clean up PyGAM predictions file if it exists
-    if has_pygam and 'pygam_preds_path' in locals() and pygam_preds_path.is_file():
-        pygam_preds_path.unlink()
-
 # --- 4. Main Execution Block ---
 
 def plot_model_calibration_comparison(df):
@@ -1061,48 +910,17 @@ def plot_model_calibration_comparison(df):
     COLORS = {
         'rust': '#2ca02c',      # Green for Rust
         'r': '#1f77b4',         # Blue for R
-        'pygam': '#ff7f0e',     # Orange for PyGAM
         'uncalibrated': '#9467bd', # Purple for uncalibrated predictions
         'perfect': '#d62728',   # Red for perfect prediction lines
     }
     
     # Check which models we have
-    has_pygam = 'pygam_prediction' in df.columns
     has_uncalibrated = 'uncalibrated_prediction' in df.columns
     
     # Set up the figure - adjust grid based on available models
-    if has_pygam and has_uncalibrated:
-        # 2x3 grid with all 4 models
+    if has_uncalibrated:
         fig, axes = plt.subplots(2, 2, figsize=(18, 16))
         fig.suptitle("Model Calibration Comparison", fontsize=20, y=0.98)
-        # Extract data for all models
-        y_true = df['outcome'].values
-        models = {
-            "R / mgcv": {'preds': df['r_prediction'].values, 'color': COLORS['r'], 'ax': axes[0, 0]},
-            "Python / PyGAM": {'preds': df['pygam_prediction'].values, 'color': COLORS['pygam'], 'ax': axes[0, 1]},
-            "Rust / gnomon": {'preds': df['rust_prediction'].values, 'color': COLORS['rust'], 'ax': axes[1, 0]},
-            "Uncalibrated Rust": {'preds': df['uncalibrated_prediction'].values, 'color': COLORS['uncalibrated'], 'ax': axes[1, 1]},
-        }
-        # Create a new figure for the comparison plot
-        _, comp_ax = plt.subplots(1, 1, figsize=(10, 8))
-        comparison_ax = comp_ax
-    elif has_pygam:
-        # 2x2 grid with all 3 models
-        fig, axes = plt.subplots(2, 2, figsize=(18, 16))
-        fig.suptitle("Model Calibration Comparison", fontsize=20, y=0.98)
-        # Extract data for all models
-        y_true = df['outcome'].values
-        models = {
-            "R / mgcv": {'preds': df['r_prediction'].values, 'color': COLORS['r'], 'ax': axes[0, 0]},
-            "Python / PyGAM": {'preds': df['pygam_prediction'].values, 'color': COLORS['pygam'], 'ax': axes[0, 1]},
-            "Rust / gnomon": {'preds': df['rust_prediction'].values, 'color': COLORS['rust'], 'ax': axes[1, 0]},
-        }
-        comparison_ax = axes[1, 1]  # Last plot is for comparison
-    elif has_uncalibrated:
-        # 2x2 grid with R, Rust, and Uncalibrated
-        fig, axes = plt.subplots(2, 2, figsize=(18, 16))
-        fig.suptitle("Model Calibration Comparison", fontsize=20, y=0.98)
-        # Extract data for all models
         y_true = df['outcome'].values
         models = {
             "R / mgcv": {'preds': df['r_prediction'].values, 'color': COLORS['r'], 'ax': axes[0, 0]},
@@ -1211,7 +1029,6 @@ def plot_model_calibration_comparison(df):
 
 def main():
     # --- 1. Check for required files ---
-    # PyGAM is optional, don't check for its existence
     required_files = [R_MODEL_PATH, RUST_MODEL_CONFIG_PATH, TEST_DATA_CSV]
     for f in required_files:
         if not f.is_file():
@@ -1225,19 +1042,13 @@ def main():
 
     # --- 3. Run inference on the test data to get predictions ---
     run_r_inference(TEST_DATA_CSV, R_PREDICTIONS_CSV)
-    pygam_available = run_python_inference(TEST_DATA_CSV, PYGAM_PREDICTIONS_CSV)
     run_rust_inference(TEST_DATA_CSV, RUST_FORMATTED_INFERENCE_DATA_TSV, RUST_PREDICTIONS_CSV)
 
     # --- 4. Combine data and predictions ---
     r_preds_df = pd.read_csv(R_PREDICTIONS_CSV)
     rust_preds_df = pd.read_csv(RUST_PREDICTIONS_CSV)
     
-    # Add PyGAM predictions only if available
-    if pygam_available and PYGAM_PREDICTIONS_CSV.is_file():
-        pygam_preds_df = pd.read_csv(PYGAM_PREDICTIONS_CSV)
-        combined_df = pd.concat([test_df, r_preds_df, pygam_preds_df, rust_preds_df], axis=1)
-    else:
-        combined_df = pd.concat([test_df, r_preds_df, rust_preds_df], axis=1)
+    combined_df = pd.concat([test_df, r_preds_df, rust_preds_df], axis=1)
 
     # --- 5. Report metrics and plot comparisons on test data ---
     # Use bootstrap_ci=True for confidence intervals (can be slow with n_boot=1000)
@@ -1253,10 +1064,6 @@ def main():
         if file_path.is_file():
             file_path.unlink()
     
-    # Clean up PyGAM predictions file if it exists
-    if PYGAM_PREDICTIONS_CSV.is_file():
-        PYGAM_PREDICTIONS_CSV.unlink()
-        
     print("\n--- Analysis script finished successfully. ---")
 
 if __name__ == "__main__":

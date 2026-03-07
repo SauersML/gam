@@ -188,6 +188,14 @@ def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return 1.0 - ss_res / ss_tot
 
 
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
 def fit_mgcv_surface(
     workdir: Path,
     train_csv: Path,
@@ -357,6 +365,17 @@ def make_plot(
     plt.close(fig)
 
 
+def print_metrics_report(metrics: list[tuple[str, float, float, float]]) -> None:
+    print("test-set diagnostics:")
+    for label, r2, rmse_val, mae_val in metrics:
+        print(
+            f"- {label}: "
+            f"R^2={r2:.4f}, "
+            f"RMSE={rmse_val:.4f}, "
+            f"MAE={mae_val:.4f}"
+        )
+
+
 def main() -> int:
     args = parse_args()
     if not args.gam_bin.is_file():
@@ -370,8 +389,13 @@ def main() -> int:
         expected_rows = args.grid_size * args.grid_size
         grid_shape = xx.shape
         surfaces: list[tuple[str, np.ndarray, str, float]] = []
+        metrics: list[tuple[str, float, float, float]] = []
         skipped: list[str] = []
         n_test_rows = len(y_test)
+        true_r2 = r2_score(y_test, true_surface(x_test, z_test))
+        true_rmse = rmse(y_test, true_surface(x_test, z_test))
+        true_mae = mae(y_test, true_surface(x_test, z_test))
+        metrics.append(("true surface", true_r2, true_rmse, true_mae))
         for cfg in CONFIGS:
             try:
                 y_hat, y_test_hat = fit_rust_surface(
@@ -388,7 +412,11 @@ def main() -> int:
             except subprocess.CalledProcessError as exc:
                 skipped.append(f"{cfg.label} (exit {exc.returncode})")
                 continue
-            surfaces.append((cfg.label, y_hat, cfg.color, r2_score(y_test, y_test_hat)))
+            r2 = r2_score(y_test, y_test_hat)
+            rmse_val = rmse(y_test, y_test_hat)
+            mae_val = mae(y_test, y_test_hat)
+            surfaces.append((cfg.label, y_hat, cfg.color, r2))
+            metrics.append((cfg.label, r2, rmse_val, mae_val))
         try:
             y_mgcv, y_mgcv_test = fit_mgcv_surface(
                 workdir,
@@ -399,12 +427,17 @@ def main() -> int:
                 n_test_rows,
                 grid_shape,
             )
-            surfaces.append(("mgcv duchon", y_mgcv, "#edae49", r2_score(y_test, y_mgcv_test)))
+            r2 = r2_score(y_test, y_mgcv_test)
+            rmse_val = rmse(y_test, y_mgcv_test)
+            mae_val = mae(y_test, y_mgcv_test)
+            surfaces.append(("mgcv duchon", y_mgcv, "#edae49", r2))
+            metrics.append(("mgcv duchon", r2, rmse_val, mae_val))
         except subprocess.CalledProcessError as exc:
             skipped.append(f"mgcv duchon (exit {exc.returncode})")
         if len(surfaces) != 3:
             raise RuntimeError(f"expected 3 fitted surfaces, got {len(surfaces)}; skipped={skipped}")
         make_plot(args.out, x_train, z_train, y_train, x_test, z_test, y_test, xx, zz, y_true, surfaces)
+        print_metrics_report(metrics)
 
     if skipped:
         print("skipped configs:")
