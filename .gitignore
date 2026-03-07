@@ -30,7 +30,6 @@ bench/tmp_profile_*/
 bench/ab_*/
 bench/diagf_*/
 bench/debug*_model.json
-bench/scenarios.json
 bench/scenarios.*.json
 scripts/__pycache__/
 scripts/latest_benchmark_summary.md
