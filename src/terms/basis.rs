@@ -1819,10 +1819,11 @@ pub enum DuchonNullspaceOrder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuchonBasisSpec {
     pub center_strategy: CenterStrategy,
-    pub length_scale: f64,
-    /// Integer spectral power `s` in
-    ///   P(w) = ||w||^(2p) * (kappa^2 + ||w||^2)^s
-    /// where `p` is determined by `nullspace_order`.
+    /// Optional hybrid Matérn width. `None` means pure scale-free Duchon with
+    /// spectrum `||w||^(2p + 2s)`. `Some(length_scale)` enables the hybrid
+    /// spectrum `||w||^(2p) * (kappa^2 + ||w||^2)^s`, `kappa = 1/length_scale`.
+    pub length_scale: Option<f64>,
+    /// Integer spectral power `s`.
     pub power: usize,
     pub nullspace_order: DuchonNullspaceOrder,
     pub double_penalty: bool,
@@ -1850,7 +1851,7 @@ pub enum BasisMetadata {
     },
     Duchon {
         centers: Array2<f64>,
-        length_scale: f64,
+        length_scale: Option<f64>,
         power: usize,
         nullspace_order: DuchonNullspaceOrder,
         identifiability_transform: Option<Array2<f64>>,
@@ -2986,7 +2987,7 @@ fn matern_kernel_radial_triplet_with_safe_ratio(
 
 fn duchon_kernel_radial_triplet(
     r: f64,
-    length_scale: f64,
+    length_scale: Option<f64>,
     p_order: usize,
     s_order: usize,
     k_dim: usize,
@@ -3026,10 +3027,23 @@ fn duchon_kernel_radial_triplet(
     )?;
     if !value.is_finite() {
         return Err(BasisError::InvalidInput(format!(
-            "non-finite Duchon radial kernel value at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
+            "non-finite Duchon radial kernel value at r={r}, length_scale={length_scale:?}, p={p_order}, s={s_order}, dim={k_dim}"
         )));
     }
 
+    let Some(length_scale) = length_scale else {
+        let block_order = pure_duchon_block_order(p_order, s_order);
+        let (_v, mut first, second) = duchon_polyharmonic_block_triplet(r, block_order, k_dim)?;
+        if r == 0.0 {
+            first = 0.0;
+        }
+        if !first.is_finite() || !second.is_finite() {
+            return Err(BasisError::InvalidInput(format!(
+                "non-finite pure Duchon radial derivatives at r={r}, order={block_order}, dim={k_dim}"
+            )));
+        }
+        return Ok((value, first, second));
+    };
     let kappa = 1.0 / length_scale.max(1e-300);
     let coeffs_local;
     let coeffs_ref = if let Some(c) = coeffs {
@@ -3064,7 +3078,7 @@ fn duchon_kernel_radial_triplet(
     }
     if !first.is_finite() || !second.is_finite() {
         return Err(BasisError::InvalidInput(format!(
-            "non-finite Duchon radial derivatives at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
+            "non-finite Duchon radial derivatives at r={r}, length_scale={length_scale:?}, p={p_order}, s={s_order}, dim={k_dim}"
         )));
     }
     Ok((value, first, second))
@@ -3354,7 +3368,7 @@ pub fn build_matern_collocation_operator_matrices(
 pub fn build_duchon_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
     collocation_weights: Option<ArrayView1<'_, f64>>,
-    length_scale: f64,
+    length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
@@ -3374,7 +3388,7 @@ pub fn build_duchon_collocation_operator_matrices(
 pub fn build_duchon_collocation_operator_matrices_with_workspace(
     centers: ArrayView2<'_, f64>,
     collocation_weights: Option<ArrayView1<'_, f64>>,
-    length_scale: f64,
+    length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
@@ -3382,7 +3396,9 @@ pub fn build_duchon_collocation_operator_matrices_with_workspace(
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+    let coeffs = length_scale.map(|scale| {
+        duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300))
+    });
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let (d0_raw, d1_raw, d2_raw) =
         build_collocation_operators_from_radial(centers, centers, collocation_weights, |r| {
@@ -3392,7 +3408,7 @@ pub fn build_duchon_collocation_operator_matrices_with_workspace(
                 p_order,
                 s_order,
                 centers.ncols(),
-                Some(&coeffs),
+                coeffs.as_ref(),
             )
         })?;
     let d0_kernel = fast_ab(&d0_raw, &z);
@@ -3843,6 +3859,11 @@ fn duchon_polyharmonic_block_triplet(
     Ok((value, first, second))
 }
 
+#[inline(always)]
+fn pure_duchon_block_order(p_order: usize, s_order: usize) -> usize {
+    p_order + s_order
+}
+
 struct DuchonPartialFractionCoeffs {
     a: Vec<f64>,
     b: Vec<f64>,
@@ -3888,7 +3909,7 @@ fn duchon_partial_fraction_coeffs(
 
 fn duchon_matern_kernel_general_from_distance(
     r: f64,
-    length_scale: f64,
+    length_scale: Option<f64>,
     p_order: usize,
     s_order: usize,
     k_dim: usize,
@@ -3899,17 +3920,24 @@ fn duchon_matern_kernel_general_from_distance(
             "Duchon kernel distance must be finite and non-negative".to_string(),
         ));
     }
-    if !length_scale.is_finite() || length_scale <= 0.0 {
-        return Err(BasisError::InvalidInput(
-            "Duchon length_scale must be finite and positive".to_string(),
-        ));
-    }
-    let kappa = 1.0 / length_scale;
     // For intrinsic p>0 kernels, diagonal values are not uniquely defined in the
     // generalized-kernel sense; use intrinsic convention.
     if r == 0.0 && p_order > 0 {
         return Ok(0.0);
     }
+    let Some(length_scale) = length_scale else {
+        return Ok(duchon_polyharmonic_block(
+            r,
+            pure_duchon_block_order(p_order, s_order),
+            k_dim,
+        ));
+    };
+    if !length_scale.is_finite() || length_scale <= 0.0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon hybrid length_scale must be finite and positive".to_string(),
+        ));
+    }
+    let kappa = 1.0 / length_scale;
 
     let coeffs_local;
     let coeffs_ref = if let Some(c) = coeffs {
@@ -4226,7 +4254,7 @@ fn build_matern_operator_penalty_candidates(
 
 fn build_duchon_operator_penalty_candidates(
     centers: ArrayView2<'_, f64>,
-    length_scale: f64,
+    length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
@@ -5235,7 +5263,7 @@ fn duchon_radial_jets(
     // Value path keeps the intrinsic diagonal convention used by the actual basis.
     out.phi = duchon_matern_kernel_general_from_distance(
         r,
-        length_scale,
+        Some(length_scale),
         p_order,
         s_order,
         k_dim,
@@ -5467,6 +5495,11 @@ fn build_duchon_design_psi_derivatives_with_workspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let length_scale = spec.length_scale.ok_or_else(|| {
+        BasisError::InvalidInput(
+            "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale".to_string(),
+        )
+    })?;
     // Exact Duchon design derivatives:
     // 1. evaluate phi_psi and phi_psipsi at each data/center distance
     // 2. project the kernel block with the same nullspace constraint used by the basis
@@ -5475,7 +5508,7 @@ fn build_duchon_design_psi_derivatives_with_workspace(
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
     let s_order = spec.power;
-    let kappa = 1.0 / spec.length_scale;
+    let kappa = 1.0 / length_scale;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
     let z_kernel =
         kernel_constraint_nullspace(centers.view(), spec.nullspace_order, &mut workspace.cache)?;
@@ -5489,7 +5522,7 @@ fn build_duchon_design_psi_derivatives_with_workspace(
             let r = data_center_r[[i, j]];
             let core = duchon_radial_core_psi_triplet(
                 r,
-                spec.length_scale,
+                length_scale,
                 p_order,
                 s_order,
                 data.ncols(),
@@ -5530,6 +5563,11 @@ fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
+    let length_scale = spec.length_scale.ok_or_else(|| {
+        BasisError::InvalidInput(
+            "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale".to_string(),
+        )
+    })?;
     // Build exact Duchon operator derivatives for the canonical three-penalty path.
     // With psi = log(kappa), the operator rows are
     //   D0[k,j]      = phi(r_kj)
@@ -5550,7 +5588,7 @@ fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
     let d = centers.ncols();
     let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
     let s_order = spec.power;
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / spec.length_scale);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     let z_kernel =
         kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
     let mut d0_raw = Array2::<f64>::zeros((p, p));
@@ -5571,7 +5609,7 @@ fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
             }
             let r = dist2.sqrt();
             let core =
-                duchon_radial_core_psi_triplet(r, spec.length_scale, p_order, s_order, d, &coeffs)?;
+                duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, d, &coeffs)?;
             d0_raw[[k, j]] = core.phi.value;
             d0_raw_psi[[k, j]] = core.phi.psi;
             d0_raw_psi_psi[[k, j]] = core.phi.psi_psi;
@@ -5758,7 +5796,7 @@ pub fn build_duchon_basis_log_kappa_second_derivative_with_workspace(
 pub fn create_duchon_spline_basis(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
-    length_scale: f64,
+    length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
 ) -> Result<DuchonSplineBasis, BasisError> {
@@ -5776,7 +5814,7 @@ pub fn create_duchon_spline_basis(
 pub fn create_duchon_spline_basis_with_workspace(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
-    length_scale: f64,
+    length_scale: Option<f64>,
     power: usize,
     nullspace_order: DuchonNullspaceOrder,
     workspace: &mut BasisWorkspace,
@@ -5815,13 +5853,15 @@ pub fn create_duchon_spline_basis_with_workspace(
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
-    let coeffs = if p_order == 1 && s_order == 4 && d == 10 {
+    let coeffs = if length_scale.is_none() {
+        None
+    } else if p_order == 1 && s_order == 4 && d == 10 {
         None
     } else {
         Some(duchon_partial_fraction_coeffs(
             p_order,
             s_order,
-            1.0 / length_scale.max(1e-300),
+            1.0 / length_scale.unwrap().max(1e-300),
         ))
     };
 
@@ -5843,7 +5883,7 @@ pub fn create_duchon_spline_basis_with_workspace(
     //   κ in [1e-2 / r_max, 1e2 / r_min]
     // where r_min/r_max are pairwise center distance extrema.
     // We keep user-provided κ but emit a warning outside this regime.
-    if let Some((r_min, r_max)) = pairwise_distance_bounds(centers) {
+    if let (Some(length_scale), Some((r_min, r_max))) = (length_scale, pairwise_distance_bounds(centers)) {
         let kappa = 1.0 / length_scale.max(1e-300);
         let kappa_lo = 1e-2 / r_max;
         let kappa_hi = 1e2 / r_min;
@@ -9842,7 +9882,7 @@ mod tests {
         let out = create_duchon_spline_basis(
             data.view(),
             centers.view(),
-            1.0,
+            Some(1.0),
             4,
             DuchonNullspaceOrder::Linear,
         )
@@ -9859,7 +9899,7 @@ mod tests {
         let out = create_duchon_spline_basis(
             data.view(),
             centers.view(),
-            1.0,
+            Some(1.0),
             1,
             DuchonNullspaceOrder::Linear,
         )
@@ -9897,7 +9937,7 @@ mod tests {
         let out = create_duchon_spline_basis(
             data.view(),
             centers.view(),
-            0.9,
+            Some(0.9),
             5,
             DuchonNullspaceOrder::Linear, // p=1
         )
@@ -10098,7 +10138,7 @@ mod tests {
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
-            length_scale: 0.9,
+            length_scale: Some(0.9),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
             double_penalty: false,
@@ -10117,18 +10157,18 @@ mod tests {
             .expect("analytic Duchon penalty derivative should build");
 
         let eps: f64 = 1e-6;
-        let kappa = 1.0 / spec.length_scale;
+        let kappa = 1.0 / spec.length_scale.expect("hybrid Duchon length_scale");
         let ls_plus = 1.0 / (kappa * eps.exp());
         let ls_minus = 1.0 / (kappa * (-eps).exp());
         let mut spec_plus = spec.clone();
         let mut spec_minus = spec.clone();
-        spec_plus.length_scale = ls_plus;
-        spec_minus.length_scale = ls_minus;
+        spec_plus.length_scale = Some(ls_plus);
+        spec_minus.length_scale = Some(ls_minus);
         let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
         let plus_penalties = build_duchon_operator_penalty_candidates(
             centers.view(),
-            ls_plus,
+            Some(ls_plus),
             spec.power,
             spec.nullspace_order,
             None,
@@ -10136,7 +10176,7 @@ mod tests {
         .expect("plus operator penalties");
         let minus_penalties = build_duchon_operator_penalty_candidates(
             centers.view(),
-            ls_minus,
+            Some(ls_minus),
             spec.power,
             spec.nullspace_order,
             None,
@@ -10179,7 +10219,7 @@ mod tests {
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
-            length_scale: 0.9,
+            length_scale: Some(0.9),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
             double_penalty: false,
@@ -10199,13 +10239,13 @@ mod tests {
         let base = build_duchon_basis(data.view(), &spec).expect("base build");
 
         let eps: f64 = 2e-5;
-        let kappa = 1.0 / spec.length_scale;
+        let kappa = 1.0 / spec.length_scale.expect("hybrid Duchon length_scale");
         let ls_plus = 1.0 / (kappa * eps.exp());
         let ls_minus = 1.0 / (kappa * (-eps).exp());
         let mut spec_plus = spec.clone();
         let mut spec_minus = spec.clone();
-        spec_plus.length_scale = ls_plus;
-        spec_minus.length_scale = ls_minus;
+        spec_plus.length_scale = Some(ls_plus);
+        spec_minus.length_scale = Some(ls_minus);
         let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
         let base_penalties = build_duchon_operator_penalty_candidates(
@@ -10218,7 +10258,7 @@ mod tests {
         .expect("base operator penalties");
         let plus_penalties = build_duchon_operator_penalty_candidates(
             centers.view(),
-            ls_plus,
+            Some(ls_plus),
             spec.power,
             spec.nullspace_order,
             None,
@@ -10226,7 +10266,7 @@ mod tests {
         .expect("plus operator penalties");
         let minus_penalties = build_duchon_operator_penalty_candidates(
             centers.view(),
-            ls_minus,
+            Some(ls_minus),
             spec.power,
             spec.nullspace_order,
             None,
@@ -10323,7 +10363,7 @@ mod tests {
 
         let phi_1 = duchon_matern_kernel_general_from_distance(
             scaled_r,
-            length_scale_1,
+            Some(length_scale_1),
             p_order,
             s_order,
             k_dim,
@@ -10332,7 +10372,7 @@ mod tests {
         .expect("scaled phi_1");
         let phi_2 = duchon_matern_kernel_general_from_distance(
             r,
-            length_scale_2,
+            Some(length_scale_2),
             p_order,
             s_order,
             k_dim,
@@ -10487,13 +10527,38 @@ mod tests {
         let out = create_duchon_spline_basis(
             data.view(),
             centers.view(),
-            1.2,
+            Some(1.2),
             4,
             DuchonNullspaceOrder::Zero, // p=0
         )
         .expect("p=0 Duchon case should build");
         assert_eq!(out.num_polynomial_basis, 0);
         assert!(out.penalty_kernel.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_pure_duchon_default_tuple_builds() {
+        let data = array![
+            [0.0, 0.1],
+            [0.2, 0.0],
+            [0.4, 0.2],
+            [0.6, 0.4],
+            [0.8, 0.5]
+        ];
+        let centers = data.slice(s![0..4, ..]).to_owned();
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: None,
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Zero,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::None,
+        };
+        let out = build_duchon_basis(data.view(), &spec)
+            .expect("pure Duchon default tuple should build");
+        assert!(out.design.iter().all(|v| v.is_finite()));
+        assert_eq!(out.penalties.len(), 3);
+        assert!(out.penalties.iter().all(|penalty| penalty.iter().all(|v| v.is_finite())));
     }
 
     #[test]
@@ -10509,7 +10574,7 @@ mod tests {
         let out = create_duchon_spline_basis(
             data.view(),
             centers.view(),
-            1.0,
+            Some(1.0),
             0,
             DuchonNullspaceOrder::Linear,
         )
@@ -10532,7 +10597,7 @@ mod tests {
         let out = create_duchon_spline_basis(
             data.view(),
             centers.view(),
-            1.0,
+            Some(1.0),
             0,
             DuchonNullspaceOrder::Zero,
         )
@@ -10600,12 +10665,12 @@ mod tests {
         let dim = 4usize;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let (phi, phi_r, phi_rr) =
-            duchon_kernel_radial_triplet(r, length_scale, p_order, s_order, dim, Some(&coeffs))
+            duchon_kernel_radial_triplet(r, Some(length_scale), p_order, s_order, dim, Some(&coeffs))
                 .expect("triplet");
         let h = 1e-5;
         let fp = duchon_matern_kernel_general_from_distance(
             r + h,
-            length_scale,
+            Some(length_scale),
             p_order,
             s_order,
             dim,
@@ -10614,7 +10679,7 @@ mod tests {
         .expect("fp");
         let fm = duchon_matern_kernel_general_from_distance(
             r - h,
-            length_scale,
+            Some(length_scale),
             p_order,
             s_order,
             dim,
@@ -10639,12 +10704,12 @@ mod tests {
         let dim = 10usize;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let (phi, phi_r, phi_rr) =
-            duchon_kernel_radial_triplet(r, length_scale, p_order, s_order, dim, Some(&coeffs))
+            duchon_kernel_radial_triplet(r, Some(length_scale), p_order, s_order, dim, Some(&coeffs))
                 .expect("triplet");
         let h = 1e-5;
         let fp = duchon_matern_kernel_general_from_distance(
             r + h,
-            length_scale,
+            Some(length_scale),
             p_order,
             s_order,
             dim,
@@ -10653,7 +10718,7 @@ mod tests {
         .expect("fp");
         let fm = duchon_matern_kernel_general_from_distance(
             r - h,
-            length_scale,
+            Some(length_scale),
             p_order,
             s_order,
             dim,
@@ -10678,12 +10743,12 @@ mod tests {
         let dim = 3usize;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let (phi, phi_r, phi_rr) =
-            duchon_kernel_radial_triplet(r, length_scale, p_order, s_order, dim, Some(&coeffs))
+            duchon_kernel_radial_triplet(r, Some(length_scale), p_order, s_order, dim, Some(&coeffs))
                 .expect("triplet");
         let h = 1e-6;
         let fp = duchon_matern_kernel_general_from_distance(
             r + h,
-            length_scale,
+            Some(length_scale),
             p_order,
             s_order,
             dim,
@@ -10692,7 +10757,7 @@ mod tests {
         .expect("fp");
         let fm = duchon_matern_kernel_general_from_distance(
             r - h,
-            length_scale,
+            Some(length_scale),
             p_order,
             s_order,
             dim,
@@ -10725,7 +10790,7 @@ mod tests {
         let d_ops = build_duchon_collocation_operator_matrices(
             centers.view(),
             None,
-            0.8,
+            Some(0.8),
             3,
             DuchonNullspaceOrder::Linear,
             None,

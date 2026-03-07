@@ -3015,6 +3015,15 @@ mod tests {
                 }],
             })
         }
+
+        fn diagonal_working_weights_directional_derivative(
+            &self,
+            _block_states: &[ParameterBlockState],
+            _block_idx: usize,
+            d_eta: &Array1<f64>,
+        ) -> Result<Option<Array1<f64>>, String> {
+            Ok(Some(Array1::zeros(d_eta.len())))
+        }
     }
 
     #[derive(Clone)]

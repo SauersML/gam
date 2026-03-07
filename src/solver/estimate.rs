@@ -747,7 +747,7 @@ pub enum EstimationError {
     )]
     HessianNotPositiveDefinite { min_eigenvalue: f64 },
 
-    #[error("REML/BFGS optimization failed to converge: {0}")]
+    #[error("REML smoothing optimization failed to converge: {0}")]
     RemlOptimizationFailed(String),
 
     #[error("An internal error occurred during model layout or coefficient mapping: {0}")]
@@ -1135,9 +1135,6 @@ where
     )?;
     reml_state.set_warm_start_original_beta(warm_start_beta);
 
-    let has_full_heuristic = heuristic_lambdas
-        .map(|vals| vals.len() == k && k > 0)
-        .unwrap_or(false);
     let smoothing_options = crate::solver::smoothing::SmoothingBfgsOptions {
         max_iter: opts.max_iter,
         tol: cfg.reml_convergence_tolerance,
@@ -1147,18 +1144,14 @@ where
         optimizer_kind: crate::solver::smoothing::SmoothingOptimizerKind::Arc,
         seed_config: SeedConfig {
             bounds: (-12.0, 12.0),
-            max_seeds: if has_full_heuristic {
-                1
-            } else if k <= 4 {
+            max_seeds: if k <= 4 {
                 8
             } else if k <= 12 {
                 10
             } else {
                 12
             },
-            screening_budget: if has_full_heuristic {
-                1
-            } else if k <= 6 {
+            screening_budget: if k <= 6 {
                 2
             } else {
                 3
@@ -2265,6 +2258,9 @@ pub struct AdaptiveRegularizationOptions {
     pub enabled: bool,
     pub max_mm_iter: usize,
     pub beta_rel_tol: f64,
+    pub estimate_epsilons: bool,
+    pub max_epsilon_outer_iter: usize,
+    pub epsilon_log_step: f64,
     pub min_epsilon: f64,
     pub weight_floor: f64,
     pub weight_ceiling: f64,
@@ -2276,6 +2272,9 @@ impl Default for AdaptiveRegularizationOptions {
             enabled: false,
             max_mm_iter: 10,
             beta_rel_tol: 1e-3,
+            estimate_epsilons: true,
+            max_epsilon_outer_iter: 4,
+            epsilon_log_step: std::f64::consts::LN_2,
             min_epsilon: 1e-8,
             weight_floor: 1e-8,
             weight_ceiling: 1e8,

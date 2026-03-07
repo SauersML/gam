@@ -462,7 +462,13 @@ impl<'a> RemlState<'a> {
         let x_mod = x_mod_dense
             .map(DesignMatrix::from)
             .unwrap_or_else(|| self.x().clone());
-        RemlState::new_with_offset(
+        let warm_start_beta = self
+            .warm_start_beta
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|beta| beta.as_ref().clone());
+        let mut pert_state = RemlState::new_with_offset(
             self.y,
             x_mod,
             self.weights,
@@ -473,7 +479,15 @@ impl<'a> RemlState<'a> {
             Some(self.nullspace_dims.clone()),
             self.coefficient_lower_bounds.clone(),
             self.linear_constraints.clone(),
-        )
+        )?;
+        pert_state.set_link_states(
+            self.runtime_mixture_link_state.clone(),
+            self.runtime_sas_link_state,
+        );
+        if let Some(beta) = warm_start_beta.as_ref() {
+            pert_state.set_warm_start_original_beta(Some(beta.view()));
+        }
+        Ok(pert_state)
     }
 
     pub(super) fn compute_multi_psi_gradient_with_bundle(
