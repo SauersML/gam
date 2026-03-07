@@ -194,7 +194,6 @@ fn duchon_fit_term_collection_gaussian_simulated_10d_with_exact_adaptive_regular
                 enabled: true,
                 max_mm_iter: 4,
                 beta_rel_tol: 1e-4,
-                estimate_epsilons: true,
                 max_epsilon_outer_iter: 2,
                 epsilon_log_step: std::f64::consts::LN_2,
                 min_epsilon: 1e-6,

@@ -56,6 +56,7 @@ pub struct FunctionCallSpec {
 }
 
 pub fn parse_formula_dsl(formula: &str) -> Result<FormulaDslParse, String> {
+    validate_balanced_delimiters(formula, "invalid formula syntax")?;
     let mut parsed = FormulaParser::parse(Rule::formula, formula)
         .map_err(|e| format!("invalid formula syntax: {e}"))?;
     let formula_pair = parsed
@@ -88,6 +89,44 @@ pub fn parse_formula_dsl(formula: &str) -> Result<FormulaDslParse, String> {
         response_expr,
         rhs_terms,
     })
+}
+
+fn delimiter_balance_error(prefix: &str) -> String {
+    format!("{prefix}: unbalanced parentheses or quotes")
+}
+
+// Pest reports malformed delimiters as a generic parse failure. We validate the
+// raw text first so callers get a stable, specific error class for unmatched
+// parentheses/quotes instead of whichever grammar branch happened to fail last.
+fn validate_balanced_delimiters(input: &str, prefix: &str) -> Result<(), String> {
+    let mut stack = Vec::<char>::new();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for ch in input.chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '(' | '[' | '{' if !in_single && !in_double => stack.push(ch),
+            ')' | ']' | '}' if !in_single && !in_double => {
+                let expected = match ch {
+                    ')' => '(',
+                    ']' => '[',
+                    '}' => '{',
+                    _ => unreachable!(),
+                };
+                if stack.pop() != Some(expected) {
+                    return Err(delimiter_balance_error(prefix));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if in_single || in_double || !stack.is_empty() {
+        return Err(delimiter_balance_error(prefix));
+    }
+    Ok(())
 }
 
 fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
@@ -128,6 +167,7 @@ fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
 }
 
 pub fn parse_function_call(input: &str) -> Result<FunctionCallSpec, String> {
+    validate_balanced_delimiters(input, "invalid function call syntax")?;
     let mut parsed = FormulaParser::parse(Rule::top_function_call, input)
         .map_err(|e| format!("invalid function call syntax: {e}"))?;
     let top = parsed
@@ -222,5 +262,17 @@ mod tests {
                 value: "\"duchon\"".to_string()
             }
         );
+    }
+
+    #[test]
+    fn parse_formula_dsl_reports_unbalanced_parentheses() {
+        let err = parse_formula_dsl("y ~ s(x, k=10").expect_err("expected parse failure");
+        assert!(err.contains("unbalanced parentheses"));
+    }
+
+    #[test]
+    fn parse_function_call_reports_unbalanced_parentheses() {
+        let err = parse_function_call("s(x, k=10").expect_err("expected parse failure");
+        assert!(err.contains("unbalanced parentheses"));
     }
 }
