@@ -92,9 +92,10 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
     )
     .expect("Matérn term-collection fit should succeed");
 
-    // With correct double-penalty, Matérn contributes two penalty blocks
-    // (kernel + nullspace ridge), each with its own lambda.
-    assert_eq!(fitted.fit.lambdas.len(), 2);
+    // Matérn uses the operator decomposition and keeps three active
+    // penalties under double_penalty:
+    // magnitude (mass), slope (tension), and curvature (stiffness).
+    assert_eq!(fitted.fit.lambdas.len(), 3);
     assert!(fitted.fit.edf_total.is_finite());
 
     let pred = predict_gam(
