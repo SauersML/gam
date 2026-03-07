@@ -6541,6 +6541,19 @@ def _is_non_blocking_failure(row: dict) -> bool:
     return str(row.get("contender", "")) in NON_BLOCKING_FAILURE_CONTENDERS
 
 
+def _format_blocking_failure(row: dict) -> str:
+    contender = str(row.get("contender", "?"))
+    scenario_name = str(row.get("scenario_name", "?"))
+    error = str(row.get("error", "unknown error")).strip()
+
+    timeout_match = re.search(r"\[HEARTBEAT\]\s+command-timeout\b.*?\btimeout_sec=(\d+)", error)
+    if timeout_match:
+        timeout_sec = int(timeout_match.group(1))
+        return f"{contender} / {scenario_name}: TIMEOUT after {timeout_sec}s"
+
+    return f"{contender} / {scenario_name}: {error or 'unknown error'}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run GAM benchmark suite with leakage-safe 5-fold CV.")
     parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS)
@@ -6808,9 +6821,7 @@ def main():
     if failed_blocking:
         msgs = []
         for r in failed_blocking:
-            msgs.append(
-                f"{r.get('contender','?')} / {r.get('scenario_name','?')}: {r.get('error','unknown error')}"
-            )
+            msgs.append(_format_blocking_failure(r))
         raise SystemExit("benchmark run failed:\n" + "\n".join(msgs))
 
     # Hard guard: benchmark outputs must remain CV-based and leakage-safe.
