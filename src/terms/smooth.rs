@@ -40,8 +40,8 @@ use std::ops::Range;
 use std::sync::Arc as SyncArc;
 use faer::Side;
 use wolfe_bfgs::{
-    Arc as ArcOptimizer, ArcError, NewtonTrustRegion, NewtonTrustRegionError,
-    ObjectiveEvalError, ObjectiveRequest, ObjectiveSample,
+    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, NewtonTrustRegion,
+    NewtonTrustRegionError, ObjectiveEvalError, ObjectiveRequest, ObjectiveSample,
 };
 
 fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
@@ -2678,10 +2678,10 @@ impl CharbonnierScalarBlockState {
         //   d/deps phi(t; eps)      = eps / sqrt(t^2 + eps^2) - 1,
         //   d^2/(dt deps) phi       = -(eps * t) / (t^2 + eps^2)^(3/2).
         //
-        // These exact formulas define the real model we want for the eventual
-        // pseudo-Laplace hyperobjective. However, the currently shipped adaptive
-        // path still solves a majorize-minimize surrogate rather than optimizing
-        // the exact nonquadratic objective directly.
+        // These exact formulas define the real adaptive model used by the
+        // pseudo-Laplace hyperobjective. We still keep the legacy MM majorizer
+        // weights here because they remain useful for diagnostics/tests and for
+        // comparing the old surrogate path against the exact Charbonnier model.
         //
         // For a reference point t0, Charbonnier admits the standard quadratic
         // tangent majorizer in the variable t^2:
@@ -2694,7 +2694,7 @@ impl CharbonnierScalarBlockState {
         //   u_k = 1 / (2 * sqrt(t_k^2 + eps^2)),
         //
         // while the exact derivatives above remain the source of truth for the
-        // future direct inner optimizer and the exact outer hypergradient.
+        // production direct inner optimizer and exact outer hypergradient.
         //
         // Keeping the surrogate weight generation immediately beside the exact
         // scalar Charbonnier formulas is deliberate:
@@ -3214,20 +3214,45 @@ fn extract_spatial_operator_runtime_caches(
         let mut mass_local_idx = None;
         let mut tension_local_idx = None;
         let mut stiffness_local_idx = None;
+        let mut mass_norm = None;
+        let mut tension_norm = None;
+        let mut stiffness_norm = None;
         for info in &term_fit.penalty_info_local {
             if !info.active {
                 continue;
             }
             match info.source {
-                PenaltySource::OperatorMass => mass_local_idx = Some(active_local_idx),
-                PenaltySource::OperatorTension => tension_local_idx = Some(active_local_idx),
-                PenaltySource::OperatorStiffness => stiffness_local_idx = Some(active_local_idx),
+                PenaltySource::OperatorMass => {
+                    mass_local_idx = Some(active_local_idx);
+                    mass_norm = Some(info.normalization_scale);
+                }
+                PenaltySource::OperatorTension => {
+                    tension_local_idx = Some(active_local_idx);
+                    tension_norm = Some(info.normalization_scale);
+                }
+                PenaltySource::OperatorStiffness => {
+                    stiffness_local_idx = Some(active_local_idx);
+                    stiffness_norm = Some(info.normalization_scale);
+                }
                 _ => {}
             }
             active_local_idx += 1;
         }
-        let (Some(mass_local), Some(tension_local), Some(stiffness_local)) =
-            (mass_local_idx, tension_local_idx, stiffness_local_idx)
+        let (
+            Some(mass_local),
+            Some(tension_local),
+            Some(stiffness_local),
+            Some(mass_scale),
+            Some(tension_scale),
+            Some(stiffness_scale),
+        ) = (
+            mass_local_idx,
+            tension_local_idx,
+            stiffness_local_idx,
+            mass_norm,
+            tension_norm,
+            stiffness_norm,
+        )
         else {
             continue;
         };
@@ -3235,7 +3260,7 @@ fn extract_spatial_operator_runtime_caches(
         let tension_global_idx = global_base_idx + tension_local;
         let stiffness_global_idx = global_base_idx + stiffness_local;
 
-        let (feature_cols, d0, d1, d2, collocation_points, dim) =
+        let (feature_cols, mut d0, mut d1, mut d2, collocation_points, dim) =
             match (&term_spec.basis, &term_fit.metadata) {
                 (
                     SmoothBasisSpec::Matern { feature_cols, .. },
@@ -3294,6 +3319,30 @@ fn extract_spatial_operator_runtime_caches(
                 }
                 _ => continue,
             };
+
+        // Runtime operator caches must live on the same normalized penalty scale as the
+        // shipped design penalties. The basis builders normalize S0=D0'D0, S1=D1'D1, and
+        // S2=D2'D2 before exposing them as smoothing blocks, recording the corresponding
+        // Frobenius norms in penalty_info_local.normalization_scale. If the exact adaptive
+        // path uses raw collocation operators here, then its Charbonnier penalties live on a
+        // different geometry from the ordinary Matérn/Duchon penalties:
+        //
+        //   raw quadratic limit:        beta' (D'D) beta
+        //   shipped design penalty:     beta' (D'D / c) beta
+        //
+        // The correct operator-level normalization is therefore
+        //
+        //   D_norm = D / sqrt(c),
+        //
+        // so that D_norm' D_norm = (D'D)/c matches the design penalty exactly. Without this,
+        // adaptive lambdas compensate for hidden operator-scale mismatches and are no longer
+        // comparable to the baseline smoothing parameters.
+        let mass_scale = mass_scale.max(1e-12).sqrt();
+        let tension_scale = tension_scale.max(1e-12).sqrt();
+        let stiffness_scale = stiffness_scale.max(1e-12).sqrt();
+        d0.mapv_inplace(|v| v / mass_scale);
+        d1.mapv_inplace(|v| v / tension_scale);
+        d2.mapv_inplace(|v| v / stiffness_scale);
 
         let coeff_global_range =
             (smooth_start + term_fit.coeff_range.start)..(smooth_start + term_fit.coeff_range.end);
@@ -3633,7 +3682,7 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
         ..BlockwiseFitOptions::default()
     };
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, CustomFamilyWarmStart)> = None;
-    let mut solver = NewtonTrustRegion::new(initial_theta.clone(), |theta, request| {
+    let mut solver = Bfgs::new(initial_theta.clone(), |theta: &Array1<f64>| {
         if let Some((cached_theta, cached_cost, cached_grad, cached_warm)) = &last_eval
             && cached_theta.len() == theta.len()
             && cached_theta
@@ -3642,14 +3691,7 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
                 .all(|(&a, &b)| (a - b).abs() <= 1e-12)
         {
             warm_cache = Some(cached_warm.clone());
-            return Ok(match request {
-                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cached_cost),
-                ObjectiveRequest::CostAndGradient
-                | ObjectiveRequest::GradientAndHessian
-                | ObjectiveRequest::CostGradientHessian => {
-                    ObjectiveSample::cost_and_gradient(*cached_cost, cached_grad.clone())
-                }
-            });
+            return (*cached_cost, cached_grad.clone());
         }
 
         let rho = theta.slice(s![..rho_dim]).to_owned();
@@ -3673,7 +3715,7 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
             })
             .collect::<Vec<_>>();
         let family_eval = base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
-        let result = evaluate_custom_family_joint_hyper(
+        match evaluate_custom_family_joint_hyper(
             &family_eval,
             std::slice::from_ref(&block_spec),
             &outer_opts,
@@ -3681,34 +3723,32 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
             &derivative_blocks,
             warm_cache.as_ref(),
             false,
-        )
-        .map_err(|e| ObjectiveEvalError::recoverable(&e.to_string()))?;
-        let sample = match request {
-            ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(result.objective),
-            ObjectiveRequest::CostAndGradient
-            | ObjectiveRequest::GradientAndHessian
-            | ObjectiveRequest::CostGradientHessian => {
-                ObjectiveSample::cost_and_gradient(result.objective, result.gradient.clone())
+        ) {
+            Ok(result) => {
+                warm_cache = Some(result.warm_start.clone());
+                last_eval = Some((
+                    theta.clone(),
+                    result.objective,
+                    result.gradient.clone(),
+                    result.warm_start,
+                ));
+                (result.objective, result.gradient)
             }
-        };
-        warm_cache = Some(result.warm_start.clone());
-        last_eval = Some((
-            theta.clone(),
-            result.objective,
-            result.gradient.clone(),
-            result.warm_start,
-        ));
-        Ok(sample)
+            Err(_) => (f64::INFINITY, Array1::from_elem(theta.len(), 0.0)),
+        }
     })
     .with_bounds(lower, upper, 1e-6)
     .with_tolerance(options.tol)
-    .with_bfgs_fallback(true)
-    .with_fallback_history(12)
+    .with_fp_tolerances(1e3, 1e2)
+    .with_accept_flat_midpoint_once(true)
+    .with_jiggle_on_flats(true, 1e-3)
+    .with_multi_direction_rescue(true)
     .with_max_iterations(options.max_iter);
 
     let solution = match solver.run() {
         Ok(sol) => sol,
-        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
+        Err(BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
+        Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
         Err(e) => {
             return Err(EstimationError::InvalidInput(format!(
                 "exact spatial adaptive outer optimization failed: {e}"
@@ -9070,6 +9110,409 @@ mod tests {
         assert_eq!(diag.maps.len(), 1);
         assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
         assert!(fit.fit.reml_score.is_finite());
+    }
+
+    #[test]
+    fn exact_spatial_adaptive_joint_hypergradient_matches_finite_difference() {
+        let n = 36usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (0.31 * i as f64).sin();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+            y[i] = (4.0 * x0).sin() + 0.35 * x1 + 0.2 * ((x0 - 0.55) * 18.0).tanh();
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                        length_scale: 0.6,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let baseline = fit_term_collection_for_spec(
+            data.view(),
+            y.view(),
+            Array1::ones(n).view(),
+            Array1::zeros(n).view(),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &FitOptions {
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: None,
+                optimize_sas: false,
+                max_iter: 30,
+                tol: 1e-6,
+                nullspace_dims: vec![],
+                linear_constraints: None,
+                adaptive_regularization: None,
+            },
+        )
+        .expect("baseline fit");
+        let runtime_caches =
+            extract_spatial_operator_runtime_caches(&spec, &baseline.design).expect("runtime caches");
+        assert_eq!(runtime_caches.len(), 1);
+
+        let adaptive_opts = AdaptiveRegularizationOptions::default();
+        let (eps_0_init, eps_g_init, eps_c_init) = compute_initial_epsilons(
+            &baseline.fit.beta,
+            &runtime_caches,
+            adaptive_opts.min_epsilon,
+        )
+        .expect("initial epsilons");
+        let hyper_specs = build_spatial_adaptive_hyper_specs(runtime_caches.len());
+        let derivative_blocks = vec![hyper_specs
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| CustomFamilyBlockPsiDerivative {
+                penalty_index: idx,
+                x_psi: Array2::<f64>::zeros((
+                    baseline.design.design.nrows(),
+                    baseline.design.design.ncols(),
+                )),
+                s_psi: Array2::<f64>::zeros((
+                    baseline.design.design.ncols(),
+                    baseline.design.design.ncols(),
+                )),
+                s_psi_components: None,
+            })
+            .collect::<Vec<_>>()];
+        let base_family = SpatialAdaptiveExactFamily {
+            family: LikelihoodFamily::GaussianIdentity,
+            mixture_link_state: None,
+            sas_link_state: None,
+            y: SyncArc::new(y.clone()),
+            weights: SyncArc::new(Array1::ones(n)),
+            design: SyncArc::new(baseline.design.design.clone()),
+            offset: SyncArc::new(Array1::zeros(n)),
+            linear_constraints: baseline.design.linear_constraints.clone(),
+            runtime_caches: SyncArc::new(runtime_caches.clone()),
+            adaptive_params: Vec::new(),
+            fixed_quadratic_hessian: SyncArc::new(Array2::<f64>::zeros((
+                baseline.design.design.ncols(),
+                baseline.design.design.ncols(),
+            ))),
+            hyper_specs: SyncArc::new(hyper_specs),
+        };
+        let block_spec = ParameterBlockSpec {
+            name: "eta".to_string(),
+            design: DesignMatrix::Dense(baseline.design.design.clone()),
+            offset: Array1::zeros(n),
+            penalties: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(baseline.fit.beta.clone()),
+        };
+        let outer_opts = BlockwiseFitOptions {
+            inner_max_cycles: 30,
+            inner_tol: 1e-6,
+            outer_max_iter: 30,
+            outer_tol: 1e-6,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let objective_and_gradient = |theta: &Array1<f64>| {
+            let family = base_family.with_adaptive_params(
+                vec![SpatialAdaptiveTermHyperParams {
+                    lambda: [theta[0].exp(), theta[1].exp(), theta[2].exp()],
+                    epsilon: [theta[3].exp(), theta[4].exp(), theta[5].exp()],
+                }],
+                SyncArc::new(Array2::<f64>::zeros((
+                    baseline.design.design.ncols(),
+                    baseline.design.design.ncols(),
+                ))),
+            );
+            evaluate_custom_family_joint_hyper(
+                &family,
+                std::slice::from_ref(&block_spec),
+                &outer_opts,
+                &Array1::zeros(0),
+                &derivative_blocks,
+                None,
+                false,
+            )
+            .expect("joint hyper eval")
+        };
+
+        let theta = array![
+            baseline.fit.lambdas[runtime_caches[0].mass_penalty_global_idx]
+                .max(1e-6)
+                .ln(),
+            baseline.fit.lambdas[runtime_caches[0].tension_penalty_global_idx]
+                .max(1e-6)
+                .ln(),
+            baseline.fit.lambdas[runtime_caches[0].stiffness_penalty_global_idx]
+                .max(1e-6)
+                .ln(),
+            eps_0_init.max(1e-6).ln(),
+            eps_g_init.max(1e-6).ln(),
+            eps_c_init.max(1e-6).ln(),
+        ];
+        let analytic = objective_and_gradient(&theta);
+        assert_eq!(analytic.gradient.len(), theta.len());
+        let h = 1e-5;
+        for j in 0..theta.len() {
+            let mut plus = theta.clone();
+            plus[j] += h;
+            let mut minus = theta.clone();
+            minus[j] -= h;
+            let fd =
+                (objective_and_gradient(&plus).objective - objective_and_gradient(&minus).objective)
+                    / (2.0 * h);
+            assert!(
+                (analytic.gradient[j] - fd).abs() < 5e-3 * (1.0 + fd.abs()),
+                "adaptive joint hypergradient mismatch at {j}: analytic={}, fd={fd}",
+                analytic.gradient[j]
+            );
+        }
+    }
+
+    #[test]
+    fn exact_spatial_adaptive_1d_objective_profile_prefers_tiny_gradient_lambda() {
+        let n = 96usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = x;
+            y[i] =
+                0.12 * (2.0 * std::f64::consts::PI * x).sin()
+                    + 0.05 * (5.0 * std::f64::consts::PI * x).cos()
+                    + 1.4 / (1.0 + (-(x - 0.5) / 0.012).exp());
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 31 },
+                        length_scale: None,
+                        power: 2,
+                        nullspace_order: DuchonNullspaceOrder::Zero,
+                        double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let baseline = fit_term_collection_for_spec(
+            data.view(),
+            y.view(),
+            Array1::ones(n).view(),
+            Array1::zeros(n).view(),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &FitOptions {
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: None,
+                optimize_sas: false,
+                max_iter: 20,
+                tol: 1e-6,
+                nullspace_dims: vec![],
+                linear_constraints: None,
+                adaptive_regularization: None,
+            },
+        )
+        .expect("baseline fit");
+        let runtime_caches =
+            extract_spatial_operator_runtime_caches(&spec, &baseline.design).expect("runtime caches");
+        assert_eq!(runtime_caches.len(), 1);
+        let (eps_0, eps_g, eps_c) = compute_initial_epsilons(
+            &baseline.fit.beta,
+            &runtime_caches,
+            1e-8,
+        )
+        .expect("initial epsilons");
+        let hyper_specs = build_spatial_adaptive_hyper_specs(runtime_caches.len());
+        let derivative_blocks = vec![hyper_specs
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| CustomFamilyBlockPsiDerivative {
+                penalty_index: idx,
+                x_psi: Array2::<f64>::zeros((
+                    baseline.design.design.nrows(),
+                    baseline.design.design.ncols(),
+                )),
+                s_psi: Array2::<f64>::zeros((
+                    baseline.design.design.ncols(),
+                    baseline.design.design.ncols(),
+                )),
+                s_psi_components: None,
+            })
+            .collect::<Vec<_>>()];
+        let base_family = SpatialAdaptiveExactFamily {
+            family: LikelihoodFamily::GaussianIdentity,
+            mixture_link_state: None,
+            sas_link_state: None,
+            y: SyncArc::new(y.clone()),
+            weights: SyncArc::new(Array1::ones(n)),
+            design: SyncArc::new(baseline.design.design.clone()),
+            offset: SyncArc::new(Array1::zeros(n)),
+            linear_constraints: baseline.design.linear_constraints.clone(),
+            runtime_caches: SyncArc::new(runtime_caches.clone()),
+            adaptive_params: Vec::new(),
+            fixed_quadratic_hessian: SyncArc::new(Array2::<f64>::zeros((
+                baseline.design.design.ncols(),
+                baseline.design.design.ncols(),
+            ))),
+            hyper_specs: SyncArc::new(hyper_specs),
+        };
+        let block_spec = ParameterBlockSpec {
+            name: "eta".to_string(),
+            design: DesignMatrix::Dense(baseline.design.design.clone()),
+            offset: Array1::zeros(n),
+            penalties: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(baseline.fit.beta.clone()),
+        };
+        let outer_opts = BlockwiseFitOptions {
+            inner_max_cycles: 20,
+            inner_tol: 1e-6,
+            outer_max_iter: 20,
+            outer_tol: 1e-6,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let evaluate_theta = |log_lambda_g: f64| {
+            let family = base_family.with_adaptive_params(
+                vec![SpatialAdaptiveTermHyperParams {
+                    lambda: [1e-12, log_lambda_g.exp(), 1e-12],
+                    epsilon: [eps_0, eps_g, eps_c],
+                }],
+                SyncArc::new(Array2::<f64>::zeros((
+                    baseline.design.design.ncols(),
+                    baseline.design.design.ncols(),
+                ))),
+            );
+            evaluate_custom_family_joint_hyper(
+                &family,
+                std::slice::from_ref(&block_spec),
+                &outer_opts,
+                &Array1::zeros(0),
+                &derivative_blocks,
+                None,
+                false,
+            )
+            .expect("joint hyper eval")
+        };
+
+        let low = evaluate_theta((1e-8_f64).ln());
+        let mid = evaluate_theta((1e-4_f64).ln());
+        let high = evaluate_theta((1e-2_f64).ln());
+
+        assert!(
+            low.objective < mid.objective && mid.objective < high.objective,
+            "expected pseudo-Laplace objective to worsen as gradient lambda increases: low={}, mid={}, high={}",
+            low.objective,
+            mid.objective,
+            high.objective
+        );
+        assert!(
+            low.gradient[1] > 0.0,
+            "expected positive gradient wrt log lambda_g near tiny lambda, got {}",
+            low.gradient[1]
+        );
+    }
+
+    #[test]
+    fn extracted_spatial_runtime_cache_matches_normalized_design_penalties() {
+        let n = 24usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+            data[[i, 1]] = (0.23 * i as f64).cos();
+        }
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 7 },
+                        length_scale: 0.8,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let caches = extract_spatial_operator_runtime_caches(&spec, &design).expect("runtime caches");
+        assert_eq!(caches.len(), 1);
+        let cache = &caches[0];
+        let s0 = {
+            let raw = cache.d0.t().dot(&cache.d0);
+            (&raw + &raw.t()) * 0.5
+        };
+        let s1 = {
+            let raw = cache.d1.t().dot(&cache.d1);
+            (&raw + &raw.t()) * 0.5
+        };
+        let s2 = {
+            let raw = cache.d2.t().dot(&cache.d2);
+            (&raw + &raw.t()) * 0.5
+        };
+
+        let s0_global = penalty_matrix_with_local_block(
+            design.design.ncols(),
+            cache.coeff_global_range.clone(),
+            &s0,
+        );
+        let s1_global = penalty_matrix_with_local_block(
+            design.design.ncols(),
+            cache.coeff_global_range.clone(),
+            &s1,
+        );
+        let s2_global = penalty_matrix_with_local_block(
+            design.design.ncols(),
+            cache.coeff_global_range.clone(),
+            &s2,
+        );
+
+        let err0 = (&s0_global - &design.penalties[cache.mass_penalty_global_idx])
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        let err1 = (&s1_global - &design.penalties[cache.tension_penalty_global_idx])
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        let err2 = (&s2_global - &design.penalties[cache.stiffness_penalty_global_idx])
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+
+        assert!(err0 < 1e-8, "mass penalty mismatch too large: {err0}");
+        assert!(err1 < 1e-8, "tension penalty mismatch too large: {err1}");
+        assert!(err2 < 1e-8, "stiffness penalty mismatch too large: {err2}");
     }
 
     #[test]

@@ -19,6 +19,7 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_GAM_BIN = REPO_ROOT / "target" / "release" / "gam"
+SMOOTH_RESOLUTION = 150
 
 
 @dataclass(frozen=True)
@@ -53,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out",
         type=Path,
-        default=REPO_ROOT / "scripts" / "duchon_2d_surface_order0_power2.png",
+        default=REPO_ROOT / "scripts" / "duchon_2d.png",
     )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--n-train", type=int, default=1800)
@@ -215,7 +216,7 @@ def fit_mgcv_surface(
                 f"train_df <- read.csv({train_csv.as_posix()!r})",
                 f"test_df <- read.csv({test_csv.as_posix()!r})",
                 f"grid_df <- read.csv({grid_csv.as_posix()!r})",
-                "fit <- gam(y ~ s(x, z, bs='ds', m=c(1,0), k=min(31, nrow(train_df)-1)), data=train_df, method='REML', select=TRUE)",
+                f"fit <- gam(y ~ s(x, z, bs='ds', m=c(1,0), k=min({SMOOTH_RESOLUTION}, nrow(train_df)-1)), data=train_df, method='REML', select=TRUE)",
                 "pred_grid <- predict(fit, newdata=grid_df, type='response')",
                 "pred_test <- predict(fit, newdata=test_df, type='response')",
                 f"write.csv(data.frame(mean=pred_grid), file={pred_path.as_posix()!r}, row.names=FALSE)",
@@ -246,7 +247,7 @@ def fit_rust_surface(
     model_path = workdir / f"{slug}.json"
     pred_path = workdir / f"{slug}.csv"
     test_pred_path = workdir / f"{slug}_test.csv"
-    formula = "y ~ s(x, z, type=duchon, centers=31, order=0, power=2)"
+    formula = f"y ~ s(x, z, type=duchon, centers={SMOOTH_RESOLUTION}, order=0, power=2)"
     run(
         [
             gam_bin,
