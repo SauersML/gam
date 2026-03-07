@@ -2527,8 +2527,11 @@ fn fit_term_collection_for_spec_with_heuristic_lambdas(
         return Ok(fitted);
     }
 
-    let (eps_0_init, eps_g_init, eps_c_init) =
-        compute_initial_epsilons(&fitted.fit.beta, &runtime_caches, adaptive_opts.min_epsilon);
+    let (eps_0_init, eps_g_init, eps_c_init) = compute_initial_epsilons(
+        &fitted.fit.beta,
+        &runtime_caches,
+        adaptive_opts.min_epsilon,
+    )?;
     let mut epsilon_outer_iterations = 0usize;
     let mut best_eps = [eps_0_init, eps_g_init, eps_c_init];
     let mut best_run = run_spatial_adaptive_mm(
@@ -2648,7 +2651,7 @@ fn run_spatial_adaptive_mm(
         epsilons[2],
         adaptive_opts.weight_floor,
         adaptive_opts.weight_ceiling,
-    );
+    )?;
     for iter in 1..=adaptive_opts.max_mm_iter.max(1) {
         mm_iterations = iter;
         let mut design_iter = fitted.design.clone();
@@ -2682,7 +2685,7 @@ fn run_spatial_adaptive_mm(
             epsilons[2],
             adaptive_opts.weight_floor,
             adaptive_opts.weight_ceiling,
-        );
+        )?;
         if rel < adaptive_opts.beta_rel_tol {
             converged = true;
             break;
@@ -2730,43 +2733,426 @@ struct SpatialAdaptiveWeights {
     inv_lap_weight: Array1<f64>,
 }
 
-fn collocation_magnitudes_for_beta(
-    beta_local: ArrayView1<'_, f64>,
-    cache: &SpatialOperatorRuntimeCache,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let mag = cache.d0.dot(&beta_local).mapv(f64::abs);
-    let grad_rows = cache.d1.dot(&beta_local);
-    let lap = cache.d2.dot(&beta_local);
-    let p = cache.collocation_points.nrows();
-    debug_assert_eq!(mag.len(), p);
-    debug_assert_eq!(grad_rows.len(), p * cache.dimension);
-    debug_assert_eq!(lap.len(), p);
+#[derive(Clone)]
+struct CharbonnierScalarBlockState {
+    signal: Array1<f64>,
+    radius: Array1<f64>,
+    #[cfg(test)]
+    epsilon: f64,
+}
 
-    let mut g = Array1::<f64>::zeros(p);
-    let mut c = Array1::<f64>::zeros(p);
-    if let Some(grad_slice) = grad_rows.as_slice() {
-        // Exact block interpretation with (k,axis) stacking:
-        //   V = D1_con * beta in R^{P*d},
-        //   grad block for point k is V[k*d .. (k+1)*d].
-        let chunks = grad_slice.chunks_exact(cache.dimension);
-        debug_assert_eq!(chunks.remainder().len(), 0);
-        for (k, grad_block) in chunks.enumerate() {
-            let g2 = grad_block.iter().map(|v| v * v).sum::<f64>();
-            g[k] = g2.sqrt();
-            c[k] = lap[k].abs();
-        }
-    } else {
-        for k in 0..p {
-            let mut g2 = 0.0_f64;
-            for axis in 0..cache.dimension {
-                let v = grad_rows[k * cache.dimension + axis];
-                g2 += v * v;
-            }
-            g[k] = g2.sqrt();
-            c[k] = lap[k].abs();
+impl CharbonnierScalarBlockState {
+    fn from_signal(signal: Array1<f64>, epsilon: f64) -> Self {
+        let eps = epsilon.max(1e-12);
+        let radius = signal.mapv(|t| (t * t + eps * eps).sqrt());
+        Self {
+            signal,
+            radius,
+            #[cfg(test)]
+            epsilon: eps,
         }
     }
-    (mag, g, c)
+
+    fn absolute_signal(&self) -> Array1<f64> {
+        self.signal.mapv(f64::abs)
+    }
+
+    #[cfg(test)]
+    fn penalty_value(&self) -> f64 {
+        self.radius.iter().map(|r| r - self.epsilon).sum::<f64>()
+    }
+
+    #[cfg(test)]
+    fn beta_gradient_coeff(&self) -> Array1<f64> {
+        Array1::from_iter(
+            self.signal
+                .iter()
+                .zip(self.radius.iter())
+                .map(|(t, r)| t / r),
+        )
+    }
+
+    #[cfg(test)]
+    fn beta_hessian_diag(&self) -> Array1<f64> {
+        let eps2 = self.epsilon * self.epsilon;
+        self.radius.mapv(|r| eps2 / (r * r * r))
+    }
+
+    #[cfg(test)]
+    fn epsilon_gradient_terms(&self) -> Array1<f64> {
+        self.radius.mapv(|r| self.epsilon / r - 1.0)
+    }
+
+    #[cfg(test)]
+    fn epsilon_hessian_terms(&self) -> Array1<f64> {
+        Array1::from_iter(
+            self.signal
+                .iter()
+                .zip(self.radius.iter())
+                .map(|(t, r)| (t * t) / (r * r * r)),
+        )
+    }
+
+    #[cfg(test)]
+    fn beta_epsilon_mixed_coeff(&self) -> Array1<f64> {
+        Array1::from_iter(
+            self.signal
+                .iter()
+                .zip(self.radius.iter())
+                .map(|(t, r)| -(self.epsilon * t) / (r * r * r)),
+        )
+    }
+
+    fn surrogate_weights(
+        &self,
+        weight_floor: f64,
+        weight_ceiling: f64,
+    ) -> (Array1<f64>, Array1<f64>) {
+        // Exact scalar Charbonnier block and its MM majorizer.
+        //
+        // The exact scalar penalty used by the nonquadratic spatial regularizer is
+        //
+        //   phi(t; eps) = sqrt(t^2 + eps^2) - eps,
+        //
+        // where:
+        //   - t is the scalar operator response at one collocation point,
+        //   - eps > 0 is the Charbonnier transition scale.
+        //
+        // The key exact scalar derivatives are:
+        //
+        //   d/dt phi(t; eps)        = t / sqrt(t^2 + eps^2),
+        //   d^2/dt^2 phi(t; eps)    = eps^2 / (t^2 + eps^2)^(3/2),
+        //   d/deps phi(t; eps)      = eps / sqrt(t^2 + eps^2) - 1,
+        //   d^2/(dt deps) phi       = -(eps * t) / (t^2 + eps^2)^(3/2).
+        //
+        // These exact formulas define the real model we want for the eventual
+        // pseudo-Laplace hyperobjective. However, the currently shipped adaptive
+        // path still solves a majorize-minimize surrogate rather than optimizing
+        // the exact nonquadratic objective directly.
+        //
+        // For a reference point t0, Charbonnier admits the standard quadratic
+        // tangent majorizer in the variable t^2:
+        //
+        //   phi(t; eps) <= u(t0) * t^2 + const(t0),
+        //   u(t0) = 1 / (2 * sqrt(t0^2 + eps^2)).
+        //
+        // So the MM algorithm reuses only the scalar weight
+        //
+        //   u_k = 1 / (2 * sqrt(t_k^2 + eps^2)),
+        //
+        // while the exact derivatives above remain the source of truth for the
+        // future direct inner optimizer and the exact outer hypergradient.
+        //
+        // Keeping the surrogate weight generation immediately beside the exact
+        // scalar Charbonnier formulas is deliberate:
+        //   1. it avoids a second copy of the scalar algebra,
+        //   2. it makes the current approximation explicit rather than implicit,
+        //   3. it gives one audited location for the transition from the true
+        //      penalty to the MM surrogate.
+        let weight = self
+            .radius
+            .mapv(|r| (0.5 / r).clamp(weight_floor, weight_ceiling));
+        let inv_weight = weight.mapv(|u| 1.0 / u);
+        (weight, inv_weight)
+    }
+
+    #[cfg(test)]
+    fn directional_hessian_diag(&self, direction_signal: &Array1<f64>) -> Array1<f64> {
+        // Scalar-image directional third derivative:
+        //
+        // If t(beta) = A beta and
+        //   H(beta) = A^T diag( eps^2 / (t_k(beta)^2 + eps^2)^(3/2) ) A,
+        // then for q = A u,
+        //
+        //   D(H)[u]
+        //   = A^T diag( -3 eps^2 t_k q_k / (t_k^2 + eps^2)^(5/2) ) A.
+        //
+        // This is one of the exact P_{beta,beta,beta}[u] terms needed by the
+        // Laplace hypergradient
+        //
+        //   d/dtheta log det H = tr(H^{-1} Hdot_theta),
+        //   Hdot_theta = J_{beta,beta,theta} + D_beta(H)[beta_theta].
+        let eps2 = self.epsilon * self.epsilon;
+        Array1::from_iter(
+            self.signal
+                .iter()
+                .zip(direction_signal.iter())
+                .zip(self.radius.iter())
+                .map(|((t, q), r)| -3.0 * eps2 * t * q / r.powi(5)),
+        )
+    }
+}
+
+#[derive(Clone)]
+struct CharbonnierGroupedBlockState {
+    norm: Array1<f64>,
+    radius: Array1<f64>,
+    #[cfg(test)]
+    signal_blocks: Array2<f64>,
+    #[cfg(test)]
+    epsilon: f64,
+}
+
+impl CharbonnierGroupedBlockState {
+    fn from_signal_blocks(signal_blocks: Array2<f64>, epsilon: f64) -> Self {
+        let eps = epsilon.max(1e-12);
+        let norm = Array1::from_iter(
+            signal_blocks
+                .rows()
+                .into_iter()
+                .map(|row| row.iter().map(|v| v * v).sum::<f64>().sqrt()),
+        );
+        let radius = norm.mapv(|g| (g * g + eps * eps).sqrt());
+        Self {
+            norm,
+            radius,
+            #[cfg(test)]
+            signal_blocks,
+            #[cfg(test)]
+            epsilon: eps,
+        }
+    }
+
+    #[cfg(test)]
+    fn penalty_value(&self) -> f64 {
+        self.radius.iter().map(|r| r - self.epsilon).sum::<f64>()
+    }
+
+    fn norm_signal(&self) -> Array1<f64> {
+        self.norm.clone()
+    }
+
+    #[cfg(test)]
+    fn beta_gradient_blocks(&self) -> Array2<f64> {
+        let mut out = self.signal_blocks.clone();
+        for (k, mut row) in out.rows_mut().into_iter().enumerate() {
+            let scale = 1.0 / self.radius[k];
+            row.mapv_inplace(|v| v * scale);
+        }
+        out
+    }
+
+    #[cfg(test)]
+    fn beta_hessian_blocks(&self) -> Vec<Array2<f64>> {
+        let mut out = Vec::with_capacity(self.signal_blocks.nrows());
+        for (k, row) in self.signal_blocks.rows().into_iter().enumerate() {
+            let dim = row.len();
+            let mut block = Array2::<f64>::eye(dim);
+            block.mapv_inplace(|v| v / self.radius[k]);
+            for i in 0..dim {
+                for j in 0..dim {
+                    block[[i, j]] -= row[i] * row[j] / self.radius[k].powi(3);
+                }
+            }
+            out.push(block);
+        }
+        out
+    }
+
+    #[cfg(test)]
+    fn epsilon_gradient_terms(&self) -> Array1<f64> {
+        self.radius.mapv(|r| self.epsilon / r - 1.0)
+    }
+
+    #[cfg(test)]
+    fn epsilon_hessian_terms(&self) -> Array1<f64> {
+        Array1::from_iter(
+            self.norm
+                .iter()
+                .zip(self.radius.iter())
+                .map(|(g, r)| (g * g) / (r * r * r)),
+        )
+    }
+
+    #[cfg(test)]
+    fn beta_epsilon_mixed_blocks(&self) -> Array2<f64> {
+        let mut out = self.signal_blocks.clone();
+        for (k, mut row) in out.rows_mut().into_iter().enumerate() {
+            let scale = -self.epsilon / self.radius[k].powi(3);
+            row.mapv_inplace(|v| v * scale);
+        }
+        out
+    }
+
+    fn surrogate_weights(
+        &self,
+        weight_floor: f64,
+        weight_ceiling: f64,
+    ) -> (Array1<f64>, Array1<f64>) {
+        // Grouped Charbonnier MM weights for the slope block.
+        //
+        // For the grouped penalty, each collocation point contributes
+        //
+        //   phi(g_k; eps_g),
+        //   g_k = ||v_k||_2,
+        //   v_k = G_k beta.
+        //
+        // The exact block gradient is
+        //
+        //   d/d beta phi(g_k; eps_g)
+        //   = G_k^T (v_k / sqrt(||v_k||^2 + eps_g^2)),
+        //
+        // and the exact block Hessian is
+        //
+        //   G_k^T B_k G_k,
+        //
+        //   B_k
+        //   = (1 / r_k) I - (1 / r_k^3) v_k v_k^T,
+        //   r_k = sqrt(||v_k||^2 + eps_g^2).
+        //
+        // The current adaptive path does not use that exact Hessian directly.
+        // Instead it uses the grouped MM majorizer
+        //
+        //   phi(g; eps_g) <= u(g0) * g^2 + const(g0),
+        //   u(g0) = 1 / (2 * sqrt(g0^2 + eps_g^2)),
+        //
+        // which yields the quadratic surrogate
+        //
+        //   K_g = D1^T (diag(u_g) \kron I_d) D1.
+        //
+        // These weights are therefore the grouped analogue of the scalar MM
+        // majorizer above: they are not the exact slope Hessian, they are the
+        // tangent quadratic envelope used by the existing iterative reweighting
+        // scheme. The exact grouped Hessian and third-derivative maps live in the
+        // neighboring methods and are what the direct pseudo-Laplace solver will
+        // ultimately use.
+        let weight = self
+            .radius
+            .mapv(|r| (0.5 / r).clamp(weight_floor, weight_ceiling));
+        let inv_weight = weight.mapv(|u| 1.0 / u);
+        (weight, inv_weight)
+    }
+
+    #[cfg(test)]
+    fn directional_hessian_blocks(&self, direction_blocks: &Array2<f64>) -> Vec<Array2<f64>> {
+        // Exact grouped directional third derivative for the slope penalty.
+        //
+        // For each collocation block k:
+        //   v_k = G_k beta,
+        //   q_k = G_k u,
+        //   r_k = sqrt(||v_k||^2 + eps^2),
+        //
+        // the exact Hessian block is
+        //   B_k = (1 / r_k) I - v_k v_k^T / r_k^3.
+        //
+        // Differentiating B_k along u gives
+        //   M_k(u)
+        //   = -(v_k^T q_k / r_k^3) I
+        //     - (q_k v_k^T + v_k q_k^T) / r_k^3
+        //     + 3 (v_k^T q_k) v_k v_k^T / r_k^5.
+        //
+        // The full directional penalty Hessian map is then
+        //   D(H_g)[u] = lambda_g sum_k G_k^T M_k(u) G_k.
+        let mut out = Vec::with_capacity(self.signal_blocks.nrows());
+        for (k, (v, q)) in self
+            .signal_blocks
+            .rows()
+            .into_iter()
+            .zip(direction_blocks.rows().into_iter())
+            .enumerate()
+        {
+            let dim = v.len();
+            let dot = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f64>();
+            let r3 = self.radius[k].powi(3);
+            let r5 = self.radius[k].powi(5);
+            let mut block = Array2::<f64>::eye(dim);
+            block.mapv_inplace(|x| -dot * x / r3);
+            for i in 0..dim {
+                for j in 0..dim {
+                    block[[i, j]] -= (q[i] * v[j] + v[i] * q[j]) / r3;
+                    block[[i, j]] += 3.0 * dot * v[i] * v[j] / r5;
+                }
+            }
+            out.push(block);
+        }
+        out
+    }
+}
+
+#[derive(Clone)]
+struct SpatialPenaltyExactState {
+    magnitude: CharbonnierScalarBlockState,
+    gradient: CharbonnierGroupedBlockState,
+    curvature: CharbonnierScalarBlockState,
+}
+
+fn collocation_gradient_blocks(
+    grad_rows: &Array1<f64>,
+    dimension: usize,
+) -> Result<Array2<f64>, EstimationError> {
+    if dimension == 0 || grad_rows.len() % dimension != 0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "invalid collocation gradient layout: rows={}, dimension={dimension}",
+            grad_rows.len()
+        )));
+    }
+    let p = grad_rows.len() / dimension;
+    let mut out = Array2::<f64>::zeros((p, dimension));
+    for k in 0..p {
+        for axis in 0..dimension {
+            out[[k, axis]] = grad_rows[k * dimension + axis];
+        }
+    }
+    Ok(out)
+}
+
+impl SpatialPenaltyExactState {
+    fn from_beta_local(
+        beta_local: ArrayView1<'_, f64>,
+        cache: &SpatialOperatorRuntimeCache,
+        epsilons: [f64; 3],
+    ) -> Result<Self, EstimationError> {
+        // Exact collocation-state extraction for the three Charbonnier penalty blocks.
+        //
+        // For one spatial smooth term with coefficient vector beta_local, the exact
+        // operator-decomposition penalty is built from three collocation images:
+        //
+        //   magnitude:  f = D0 beta_local
+        //   slope:      v_k = G_k beta_local
+        //   curvature:  c = D2 beta_local
+        //
+        // where the gradient operator is stored in row-stacked form:
+        //
+        //   D1 beta_local in R^(P * d),
+        //   row layout = (point 0, axis 0..d-1), (point 1, axis 0..d-1), ...
+        //
+        // so we first reshape that stacked vector into the grouped block array
+        //
+        //   [v_0^T
+        //    ...
+        //    v_(P-1)^T]  in R^(P x d).
+        //
+        // The three exact Charbonnier block states then carry:
+        //   - the raw operator signals,
+        //   - their radii sqrt(signal^2 + eps^2) or sqrt(||v_k||^2 + eps^2),
+        //   - and all exact derivatives derived from those radii.
+        //
+        // This is the canonical translation from coefficient-space beta to the
+        // penalty-side mathematical objects used throughout the implementation.
+        let gradient_rows = cache.d1.dot(&beta_local);
+        Ok(Self {
+            magnitude: CharbonnierScalarBlockState::from_signal(
+                cache.d0.dot(&beta_local),
+                epsilons[0],
+            ),
+            gradient: CharbonnierGroupedBlockState::from_signal_blocks(
+                collocation_gradient_blocks(&gradient_rows, cache.dimension)?,
+                epsilons[1],
+            ),
+            curvature: CharbonnierScalarBlockState::from_signal(
+                cache.d2.dot(&beta_local),
+                epsilons[2],
+            ),
+        })
+    }
+
+    fn absolute_collocation_magnitudes(&self) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+        (
+            self.magnitude.absolute_signal(),
+            self.gradient.norm_signal(),
+            self.curvature.absolute_signal(),
+        )
+    }
 }
 
 fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
@@ -2990,7 +3376,7 @@ fn compute_spatial_adaptive_weights_for_beta(
     epsilon_c: f64,
     weight_floor: f64,
     weight_ceiling: f64,
-) -> Vec<SpatialAdaptiveWeights> {
+) -> Result<Vec<SpatialAdaptiveWeights>, EstimationError> {
     // Charbonnier/MM derivation (per collocation scalar t):
     //   psi(t; eps) = sqrt(t^2 + eps^2) - eps
     // and for reference t0 the tangent majorizer in t^2 gives:
@@ -3013,34 +3399,28 @@ fn compute_spatial_adaptive_weights_for_beta(
         .iter()
         .map(|cache| {
             let beta_local = beta.slice(s![cache.coeff_global_range.clone()]);
-            let (f, g, c) = collocation_magnitudes_for_beta(beta_local, cache);
-            let mut u_0 = Array1::<f64>::zeros(f.len());
-            let mut u_g = Array1::<f64>::zeros(g.len());
-            let mut u_c = Array1::<f64>::zeros(c.len());
-            let mut inv_0 = Array1::<f64>::zeros(f.len());
-            let mut inv_g = Array1::<f64>::zeros(g.len());
-            let mut inv_c = Array1::<f64>::zeros(c.len());
-            for k in 0..f.len() {
-                // MM majorizer weight for Charbonnier:
-                //   u(t0) = 1 / (2*sqrt(t0^2 + eps^2)).
-                let u0 = 0.5 / (f[k] * f[k] + epsilon_0 * epsilon_0).sqrt();
-                let ug = 0.5 / (g[k] * g[k] + epsilon_g * epsilon_g).sqrt();
-                let uc = 0.5 / (c[k] * c[k] + epsilon_c * epsilon_c).sqrt();
-                u_0[k] = u0.clamp(weight_floor, weight_ceiling);
-                u_g[k] = ug.clamp(weight_floor, weight_ceiling);
-                u_c[k] = uc.clamp(weight_floor, weight_ceiling);
-                inv_0[k] = 1.0 / u_0[k];
-                inv_g[k] = 1.0 / u_g[k];
-                inv_c[k] = 1.0 / u_c[k];
-            }
-            SpatialAdaptiveWeights {
+            let exact = SpatialPenaltyExactState::from_beta_local(
+                beta_local,
+                cache,
+                [epsilon_0, epsilon_g, epsilon_c],
+            )?;
+            let (u_0, inv_0) = exact
+                .magnitude
+                .surrogate_weights(weight_floor, weight_ceiling);
+            let (u_g, inv_g) = exact
+                .gradient
+                .surrogate_weights(weight_floor, weight_ceiling);
+            let (u_c, inv_c) = exact
+                .curvature
+                .surrogate_weights(weight_floor, weight_ceiling);
+            Ok(SpatialAdaptiveWeights {
                 mag_weight: u_0,
                 grad_weight: u_g,
                 lap_weight: u_c,
                 inv_mag_weight: inv_0,
                 inv_grad_weight: inv_g,
                 inv_lap_weight: inv_c,
-            }
+            })
         })
         .collect()
 }
@@ -3049,13 +3429,18 @@ fn compute_initial_epsilons(
     beta: &Array1<f64>,
     caches: &[SpatialOperatorRuntimeCache],
     min_epsilon: f64,
-) -> (f64, f64, f64) {
+) -> Result<(f64, f64, f64), EstimationError> {
     let mut f_vals = Vec::<f64>::new();
     let mut g_vals = Vec::<f64>::new();
     let mut c_vals = Vec::<f64>::new();
     for cache in caches {
         let beta_local = beta.slice(s![cache.coeff_global_range.clone()]);
-        let (f, g, c) = collocation_magnitudes_for_beta(beta_local, cache);
+        let exact = SpatialPenaltyExactState::from_beta_local(
+            beta_local,
+            cache,
+            [min_epsilon, min_epsilon, min_epsilon],
+        )?;
+        let (f, g, c) = exact.absolute_collocation_magnitudes();
         f_vals.extend(f.iter().copied());
         g_vals.extend(g.iter().copied());
         c_vals.extend(c.iter().copied());
@@ -3068,7 +3453,7 @@ fn compute_initial_epsilons(
     let eps_0 = robust_epsilon_from_samples(&f_vals, min_epsilon);
     let eps_g = robust_epsilon_from_samples(&g_vals, min_epsilon);
     let eps_c = robust_epsilon_from_samples(&c_vals, min_epsilon);
-    (eps_0, eps_g, eps_c)
+    Ok((eps_0, eps_g, eps_c))
 }
 
 fn weighted_operator_gram_from_d0(d0: &Array2<f64>, weight: &Array1<f64>) -> Array2<f64> {
@@ -7423,7 +7808,8 @@ mod tests {
             dimension: 2,
         };
         let beta = array![1.0, 1.0];
-        let (eps_0, eps_g, eps_c) = compute_initial_epsilons(&beta, &[cache], 1e-8);
+        let (eps_0, eps_g, eps_c) =
+            compute_initial_epsilons(&beta, &[cache], 1e-8).expect("initial epsilons");
         assert!(eps_0 >= 1e-8);
         assert!(eps_g >= 1e-8);
         assert!(eps_c >= 1e-8);
@@ -7470,8 +7856,16 @@ mod tests {
             dimension: 2,
         };
         let beta = array![0.0, 0.0];
-        let out =
-            compute_spatial_adaptive_weights_for_beta(&beta, &[cache], 1e-8, 1e-8, 1e-8, 1e-8, 1e2);
+        let out = compute_spatial_adaptive_weights_for_beta(
+            &beta,
+            &[cache],
+            1e-8,
+            1e-8,
+            1e-8,
+            1e-8,
+            1e2,
+        )
+        .expect("adaptive weights");
         assert_eq!(out.len(), 1);
         // Raw u would be 1/eps = 1e8, so clamp to 1e2.
         assert!((out[0].mag_weight[0] - 1e2).abs() < 1e-12);
@@ -7501,7 +7895,8 @@ mod tests {
         let beta = array![1.0, 1.0];
         let out = compute_spatial_adaptive_weights_for_beta(
             &beta, &[cache], 1e-6, 1e-6, 1e-6, 1e-12, 1e12,
-        );
+        )
+        .expect("adaptive weights");
         assert_eq!(out.len(), 1);
         for k in 0..out[0].grad_weight.len() {
             let p0 = out[0].mag_weight[k] * out[0].inv_mag_weight[k];
@@ -7538,7 +7933,8 @@ mod tests {
             1e-8,
             1e-12,
             1e12,
-        );
+        )
+        .expect("small adaptive weights");
         let large = compute_spatial_adaptive_weights_for_beta(
             &beta_large,
             &[cache],
@@ -7547,13 +7943,165 @@ mod tests {
             1e-8,
             1e-12,
             1e12,
-        );
+        )
+        .expect("large adaptive weights");
         assert!(small[0].mag_weight[0] > large[0].mag_weight[0]);
         assert!(small[0].grad_weight[0] > large[0].grad_weight[0]);
         assert!(small[0].lap_weight[0] > large[0].lap_weight[0]);
         assert!(small[0].inv_mag_weight[0] < large[0].inv_mag_weight[0]);
         assert!(small[0].inv_grad_weight[0] < large[0].inv_grad_weight[0]);
         assert!(small[0].inv_lap_weight[0] < large[0].inv_lap_weight[0]);
+    }
+
+    #[test]
+    fn scalar_charbonnier_exact_derivatives_match_finite_difference() {
+        let signal = array![0.7, -1.1];
+        let epsilon = 0.3;
+        let state = CharbonnierScalarBlockState::from_signal(signal.clone(), epsilon);
+        let h = 1e-5;
+        let value = |x: &Array1<f64>| {
+            CharbonnierScalarBlockState::from_signal(x.clone(), epsilon).penalty_value()
+        };
+        for i in 0..signal.len() {
+            let mut plus = signal.clone();
+            plus[i] += h;
+            let mut minus = signal.clone();
+            minus[i] -= h;
+            let grad_fd = (value(&plus) - value(&minus)) / (2.0 * h);
+            let hess_fd = (value(&plus) - 2.0 * value(&signal) + value(&minus)) / (h * h);
+            assert!((state.beta_gradient_coeff()[i] - grad_fd).abs() < 1e-6);
+            assert!((state.beta_hessian_diag()[i] - hess_fd).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn grouped_charbonnier_exact_gradient_matches_finite_difference() {
+        let blocks = array![[0.8, -0.4], [0.3, 0.9]];
+        let epsilon = 0.25;
+        let state = CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), epsilon);
+        let h = 1e-6;
+        let value = |x: &Array2<f64>| {
+            CharbonnierGroupedBlockState::from_signal_blocks(x.clone(), epsilon).penalty_value()
+        };
+        let analytic = state.beta_gradient_blocks();
+        for k in 0..blocks.nrows() {
+            for axis in 0..blocks.ncols() {
+                let mut plus = blocks.clone();
+                plus[[k, axis]] += h;
+                let mut minus = blocks.clone();
+                minus[[k, axis]] -= h;
+                let grad_fd = (value(&plus) - value(&minus)) / (2.0 * h);
+                assert!((analytic[[k, axis]] - grad_fd).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_charbonnier_epsilon_derivatives_match_finite_difference() {
+        let signal = array![0.4, -0.9];
+        let epsilon = 0.35;
+        let state = CharbonnierScalarBlockState::from_signal(signal.clone(), epsilon);
+        let h = 1e-5;
+        let value = |eps: f64| CharbonnierScalarBlockState::from_signal(signal.clone(), eps).penalty_value();
+        let grad_fd = (value(epsilon + h) - value(epsilon - h)) / (2.0 * h);
+        let hess_fd = (value(epsilon + h) - 2.0 * value(epsilon) + value(epsilon - h)) / (h * h);
+        assert!((state.epsilon_gradient_terms().sum() - grad_fd).abs() < 1e-6);
+        assert!((state.epsilon_hessian_terms().sum() - hess_fd).abs() < 1e-4);
+
+        let mixed = state.beta_epsilon_mixed_coeff();
+        for i in 0..signal.len() {
+            let eval_grad = |eps: f64| {
+                CharbonnierScalarBlockState::from_signal(signal.clone(), eps).beta_gradient_coeff()[i]
+            };
+            let mixed_fd = (eval_grad(epsilon + h) - eval_grad(epsilon - h)) / (2.0 * h);
+            assert!((mixed[i] - mixed_fd).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn scalar_charbonnier_directional_hessian_matches_finite_difference() {
+        let signal = array![0.5, -0.6];
+        let epsilon = 0.2;
+        let direction = array![0.3, -0.1];
+        let state = CharbonnierScalarBlockState::from_signal(signal.clone(), epsilon);
+        let h = 1e-6;
+        let analytic = state.directional_hessian_diag(&direction);
+        let eval_hess = |step: f64| {
+            let shifted = &signal + &(direction.mapv(|v| step * v));
+            CharbonnierScalarBlockState::from_signal(shifted, epsilon).beta_hessian_diag()
+        };
+        let fd = (&eval_hess(h) - &eval_hess(-h)) / (2.0 * h);
+        for i in 0..signal.len() {
+            assert!((analytic[i] - fd[i]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn grouped_charbonnier_hessian_and_epsilon_derivatives_match_finite_difference() {
+        let blocks = array![[0.7, -0.2], [0.1, 0.8]];
+        let epsilon = 0.3;
+        let state = CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), epsilon);
+        let h = 1e-5;
+        let hess_blocks = state.beta_hessian_blocks();
+        for k in 0..blocks.nrows() {
+            for axis in 0..blocks.ncols() {
+                let eval_grad = |step: f64| {
+                    let mut shifted = blocks.clone();
+                    shifted[[k, axis]] += step;
+                    CharbonnierGroupedBlockState::from_signal_blocks(shifted, epsilon)
+                        .beta_gradient_blocks()
+                        .row(k)
+                        .to_owned()
+                };
+                let grad_fd = (&eval_grad(h) - &eval_grad(-h)) / (2.0 * h);
+                for j in 0..blocks.ncols() {
+                    assert!((hess_blocks[k][[j, axis]] - grad_fd[j]).abs() < 1e-5);
+                }
+            }
+        }
+
+        let value =
+            |eps: f64| CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), eps).penalty_value();
+        let grad_fd = (value(epsilon + h) - value(epsilon - h)) / (2.0 * h);
+        let hess_fd = (value(epsilon + h) - 2.0 * value(epsilon) + value(epsilon - h)) / (h * h);
+        assert!((state.epsilon_gradient_terms().sum() - grad_fd).abs() < 1e-6);
+        assert!((state.epsilon_hessian_terms().sum() - hess_fd).abs() < 1e-4);
+
+        let mixed_blocks = state.beta_epsilon_mixed_blocks();
+        for k in 0..blocks.nrows() {
+            for axis in 0..blocks.ncols() {
+                let eval_grad = |eps: f64| {
+                    CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), eps)
+                        .beta_gradient_blocks()[[k, axis]]
+                };
+                let mixed_fd = (eval_grad(epsilon + h) - eval_grad(epsilon - h)) / (2.0 * h);
+                assert!((mixed_blocks[[k, axis]] - mixed_fd).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_charbonnier_directional_hessian_matches_finite_difference() {
+        let blocks = array![[0.6, -0.2], [0.4, 0.5]];
+        let direction = array![[0.1, -0.3], [0.2, 0.15]];
+        let epsilon = 0.4;
+        let state = CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), epsilon);
+        let analytic = state.directional_hessian_blocks(&direction);
+        let h = 1e-6;
+        let eval_hess = |step: f64| {
+            let shifted = &blocks + &(direction.mapv(|v| step * v));
+            CharbonnierGroupedBlockState::from_signal_blocks(shifted, epsilon).beta_hessian_blocks()
+        };
+        let plus = eval_hess(h);
+        let minus = eval_hess(-h);
+        for k in 0..analytic.len() {
+            let fd = (&plus[k] - &minus[k]) / (2.0 * h);
+            for i in 0..fd.nrows() {
+                for j in 0..fd.ncols() {
+                    assert!((analytic[k][[i, j]] - fd[[i, j]]).abs() < 1e-5);
+                }
+            }
+        }
     }
 
     #[test]
