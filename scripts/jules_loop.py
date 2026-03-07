@@ -2,8 +2,8 @@
 Jules optimizer loop for GAM Lean files.
 
 This script runs inside the GitHub Actions workflow and asks Jules to improve
-existing Lean files under src/. It only commits patches that modify existing
-src/**/*.lean files and do not regress a previously passing Lean check.
+existing Lean files in the repository. It only commits patches that modify
+existing `*.lean` files and do not regress a previously passing Lean check.
 """
 import datetime
 import os
@@ -20,16 +20,18 @@ RETRY_DELAY = 60
 BRANCH_PATTERN = re.compile(r"^jules-improvement-\d{8}-\d{6}$")
 DIRECT_PR_ERROR = (
     "Jules attempted to create a PR directly. "
-    "This loop only accepts patches that modify existing src/**/*.lean files."
+    "This loop only accepts patches that modify existing .lean files."
 )
 
 
 def strip_ansi(text):
+    """Remove ANSI escape sequences from a log string."""
     ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
     return ansi_escape.sub("", text)
 
 
 def run_command(cmd, check=False):
+    """Run a shell command and return stripped stdout, stderr, and exit code."""
     if isinstance(cmd, list):
         result = subprocess.run(cmd, check=False, capture_output=True, text=True)
     else:
@@ -42,6 +44,7 @@ def run_command(cmd, check=False):
 
 
 def filter_noise(logs):
+    """Drop routine build noise from Lean logs."""
     noise_patterns = [
         "Replayed Mathlib.",
         "✔ [",
@@ -57,6 +60,7 @@ def filter_noise(logs):
 
 
 def get_run_info():
+    """Read the latest local build status and filtered logs from the environment."""
     local_log_file = os.environ["LOCAL_LOG_FILE"]
     local_status = os.environ["LOCAL_BUILD_STATUS"]
     with open(local_log_file, "r", encoding="utf-8") as handle:
@@ -69,6 +73,7 @@ def get_run_info():
 
 
 def verify_lean_build():
+    """Run the local Lean check script and report whether it succeeded."""
     _, stderr, code = run_command("./scripts/lean-check-all.sh")
     if code != 0 and stderr:
         sys.stderr.write(stderr[:4000])
@@ -76,6 +81,7 @@ def verify_lean_build():
 
 
 def call_jules(prompt, attempt):
+    """Submit a prompt to Jules and poll until a changeset is available."""
     api_key = os.environ["JULES_API_KEY"]
     repo = os.environ["GITHUB_REPOSITORY"]
     payload = {
@@ -127,6 +133,7 @@ def call_jules(prompt, attempt):
 
 
 def validate_patch(patch):
+    """Reject patches that violate the repository's mutation rules."""
     additions = 0
     deletions = 0
     deleted_theorem_lines = []
@@ -158,66 +165,104 @@ def validate_patch(patch):
         return False, "Patch only deletes lines"
     if not touched_files:
         return False, "Patch does not modify any files"
-    invalid_paths = [
-        path for path in touched_files
-        if not path.startswith("src/") or not path.endswith(".lean")
-    ]
+    invalid_paths = [path for path in touched_files if not path.endswith(".lean")]
     if invalid_paths:
-        return False, f"Patch modifies non-Lean src files: {', '.join(sorted(invalid_paths))}"
+        return False, f"Patch modifies non-Lean files: {', '.join(sorted(invalid_paths))}"
     return True, ""
 
 
 def build_prompt(conclusion, logs):
-    restrictions = (
-        "\n\nRules:\n"
-        "- Edit only existing files under src/ ending in .lean.\n"
-        "- Do not create files.\n"
-        "- Do not delete files.\n"
-        "- Do not edit lakefile.lean, lean-toolchain, lake-manifest.json, workflows, scripts, or Rust files.\n"
-        "- Do not delete theorems.\n"
-        "- Do not submit patches that only delete lines.\n"
-        "- Run the Lean checks yourself before submitting.\n"
-        "- Prioritize meaningful proof or specification improvements over style changes.\n"
+    """Build the Jules prompt for the current build outcome."""
+    # Common restrictions for all prompts
+    version_restriction = (
+        "\n\nNOTE:\n"
+        "- You are encouraged to proactively search the web.\n"
+        "- DO NOT modify 'lean-toolchain' - the Lean version is intentionally pinned.\n"
+        "- DO NOT modify version specifiers in 'lakefile.lean' (e.g., mathlib version).\n"
+        "- Focus ONLY on existing .lean files for improvements.\n"
+        "- Always try to improve something--commit and finish. "
+        "No further instruction will be given.\n"
+        "- CRITICAL: DO NOT create new files. ONLY edit existing files.\n"
+        "- CRITICAL: DO NOT delete theorems. DO NOT submit patches that only delete lines.\n"
     )
+
+    # Build the prompt based on previous run status
     if conclusion == "success":
-        return (
-            "The GAM Lean checks passed. Improve an existing Lean file under src/. "
-            "Strengthen proofs, remove weak or vacuous reasoning, or fix a real issue. "
-            "Only edit existing src/**/*.lean files. Do not create new files."
-            + restrictions
+        prompt = (
+            "The Lean Proof build passed successfully. "
+            "Please find one thing to do or strengthen in an existing Lean "
+            "file anywhere in the repository. Do not create new files. You "
+            "must successfully compile the code yourself. If the build times "
+            "out or fails, do not submit it and keep working. You are not "
+            "allowed to use 'native_decide' or similar."
+            "If the build executes and terminates the shell, count that as a "
+            "failure. Always tail build logs. You can optimize code, "
+            "strengthen proofs, replace 'sorry' or 'axiom' with actual proofs. "
+            "Feel free to try big or multiple tasks. We should also remove and "
+            "fix specification gaming or vacuous verification. It involves "
+            "writing theorem statements that appear rigorous in natural "
+            "language but are mathematically constructed to be trivial or "
+            "tautological. The most common tactic is begging the question, "
+            "where the theorem explicitly includes the desired conclusion "
+            "within its own hypothesis, rendering the proof a simple "
+            "restatement of the input. Another tactic is the trivial witness, "
+            "where a property regarding a complex mathematical object is "
+            "proven by providing a hardcoded constant that technically "
+            "satisfies a loose inequality without actually computing or "
+            "representing the complex object itself. Finally, ex post facto "
+            "construction involves defining a bounding function or rule only "
+            "after calculating the specific error value, ensuring the "
+            "condition is met by definition rather than by deriving a "
+            "meaningful general law. For all of these, if they occur, we need "
+            "to address them well and improve the code. Once specification "
+            "gaming is fixed, you may add new Lean proofs corresponding to "
+            "the Rust code or get the Lean code to match what the Rust code "
+            "does."
+            "IMPORTANT: Ensure your changes compile and that all proofs are "
+            "valid. Axioms are just as bad as sorrys and all axioms must be "
+            "replaced with real proofs. Do not assume more than is necessary. "
+            "Do not attempt low-importance small changes like style "
+            "improvements, comments, etc."
+            "Do not break existing functionality. DO NOT DELETE THEOREMS. DO "
+            "NOT submit patches that only delete lines."
+            + version_restriction
         )
-    return (
-        "The GAM Lean checks failed. Here are the logs:\n\n"
-        f"{logs}\n\n"
-        "Analyze the errors and improve the Lean files under src/. "
-        "Only edit existing src/**/*.lean files. Do not create new files."
-        + restrictions
-    )
+    else:
+        # Failure case
+        prompt = (
+            f"The Lean Proof build failed. "
+            f"Here are the logs from the run (ANSI colors stripped):\n\n{logs}\n\n"
+            "Please analyze the logs and fix the errors in the existing Lean "
+            "files. If the code does not compile, you can commit a small "
+            "improvement even if it is not a complete fix. You can search the "
+            "web to find the latest documentation for the "
+            "dependencies/libraries you're using. You can proactively find "
+            "examples or code snippets that can help inform your edits. It's "
+            "a good idea to web search."
+            "You should check if your changes compile and that all proofs are "
+            "valid. However, if the code does not compile, improve what you "
+            "can as much as possible before submitting. It's okay if it still "
+            "fails to compile as long as it is in a better state. At the same "
+            "time, feel free to fix multiple issues at once, and don't afraid "
+            "to make big improvements. You can do it!"
+            + version_restriction
+        )
+    return prompt
 
 
-def main():
-    conclusion, logs = get_run_info()
-    prompt = build_prompt(conclusion, logs)
-
-    changeset = None
+def get_changeset(prompt):
+    """Retry Jules until a changeset is returned or retries are exhausted."""
     for attempt in range(1, MAX_RETRIES + 1):
         changeset = call_jules(prompt, attempt)
         if changeset:
-            break
+            return changeset
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_DELAY)
-    if not changeset:
-        sys.exit(0)
-    patch = changeset.get("gitPatch", {}).get("unidiffPatch")
-    message = changeset.get("gitPatch", {}).get("suggestedCommitMessage", "Jules improvement")
-    if not patch:
-        sys.exit(0)
+    return None
 
-    is_valid, reason = validate_patch(patch)
-    if not is_valid:
-        print(reason)
-        sys.exit(0)
 
+def apply_patch_on_branch(patch):
+    """Write, validate, and apply the generated patch on a fresh branch."""
     with open("jules.patch", "w", encoding="utf-8") as handle:
         handle.write(patch)
 
@@ -232,20 +277,11 @@ def main():
     if code != 0:
         print(err)
         sys.exit(0)
+    return branch_name
 
-    run_command('git config user.name "Jules Bot"', check=True)
-    run_command('git config user.email "jules-bot@google.com"', check=True)
-    run_command("git add src", check=True)
-    _, _, code = run_command("git diff --cached --quiet")
-    if code == 0:
-        sys.exit(0)
 
-    if conclusion == "success" and not verify_lean_build():
-        sys.exit(0)
-
-    if conclusion != "success":
-        verify_lean_build()
-
+def create_pull_request(message, branch_name):
+    """Push the branch and open a pull request with the commit message."""
     run_command(["git", "commit", "-m", message], check=True)
     run_command(f"git push origin {branch_name}", check=True)
 
@@ -277,6 +313,41 @@ def main():
         ],
         check=True,
     )
+
+
+def main():
+    """Run the Jules improvement loop and open a PR for accepted changes."""
+    conclusion, logs = get_run_info()
+    prompt = build_prompt(conclusion, logs)
+    changeset = get_changeset(prompt)
+    if not changeset:
+        sys.exit(0)
+    patch = changeset.get("gitPatch", {}).get("unidiffPatch")
+    message = changeset.get("gitPatch", {}).get("suggestedCommitMessage", "Jules improvement")
+    if not patch:
+        sys.exit(0)
+
+    is_valid, reason = validate_patch(patch)
+    if not is_valid:
+        print(reason)
+        sys.exit(0)
+
+    branch_name = apply_patch_on_branch(patch)
+
+    run_command('git config user.name "Jules Bot"', check=True)
+    run_command('git config user.email "jules-bot@google.com"', check=True)
+    run_command(["git", "add", "--", "*.lean"], check=True)
+    _, _, code = run_command("git diff --cached --quiet")
+    if code == 0:
+        sys.exit(0)
+
+    if conclusion == "success" and not verify_lean_build():
+        sys.exit(0)
+
+    if conclusion != "success":
+        verify_lean_build()
+
+    create_pull_request(message, branch_name)
 
 
 if __name__ == "__main__":
