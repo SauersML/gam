@@ -29,6 +29,7 @@ bench/tmp_debug/
 bench/tmp_profile_*/
 bench/ab_*/
 bench/diagf_*/
+bench/debug*_model.json
 bench/scenarios.*.json
 scripts/__pycache__/
 scripts/latest_benchmark_summary.md
@@ -48,6 +49,8 @@ diff.txt
 bench/figures.zip
 run53_duchon_matern_results.txt
 scripts/rust_digest.txt
+bench/direct_fold3_model.json
+bench/direct_fold3_model_noadapt.json
 
 # Lean/Lake build artifacts
 .lake/
