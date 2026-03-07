@@ -1272,7 +1272,7 @@ struct FirthTauExactKernel {
 }
 
 /// Holds the state for the outer REML optimization and supplies cost and
-/// gradient evaluations to the `wolfe_bfgs` optimizer.
+/// gradient evaluations to the `opt` optimizer.
 ///
 /// The `cache` field uses `RefCell` to enable interior mutability. This is a crucial
 /// performance optimization. The `cost_and_grad` closure required by the BFGS

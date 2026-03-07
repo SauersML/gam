@@ -229,7 +229,7 @@ where
         tol: options.tol,
         finite_diff_step: options.finite_diff_step,
         fd_hessian_max_dim: usize::MAX,
-        optimizer_kind: crate::estimate::SmoothingOptimizerKind::TrustRegion,
+        optimizer_kind: crate::estimate::SmoothingOptimizerKind::Bfgs,
         seed_config: options.seed_config,
     };
     let result = crate::estimate::optimize_log_smoothing_with_multistart_with_gradient(
@@ -296,7 +296,7 @@ where
         tol: options.tol,
         finite_diff_step: options.finite_diff_step,
         fd_hessian_max_dim: usize::MAX,
-        optimizer_kind: crate::estimate::SmoothingOptimizerKind::TrustRegion,
+        optimizer_kind: crate::estimate::SmoothingOptimizerKind::Bfgs,
         seed_config: options.seed_config,
     };
     let result = crate::estimate::optimize_log_smoothing_with_multistart_parallel_fd(

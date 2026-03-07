@@ -44,6 +44,7 @@ fn simulate_duchon_regression(n: usize, d: usize) -> (Array2<f64>, Array1<f64>, 
     (x, y, y_true)
 }
 
+
 fn fit_duchon_simulated_10d(
     power: usize,
     nullspace_order: DuchonNullspaceOrder,

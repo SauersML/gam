@@ -31,6 +31,7 @@ use crate::mixture_link::{
     state_from_spec,
 };
 use crate::pirls::LinearInequalityConstraints;
+use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
 use crate::types::{LikelihoodFamily, MixtureLinkState, SasLinkState};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
@@ -39,9 +40,9 @@ use std::f64;
 use std::ops::Range;
 use std::sync::Arc as SyncArc;
 use faer::Side;
-use wolfe_bfgs::{
-    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, NewtonTrustRegion,
-    NewtonTrustRegionError, ObjectiveEvalError, ObjectiveRequest, ObjectiveSample,
+use opt::{
+    Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, MaxIterations,
+    NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
 };
 
 fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
@@ -2602,7 +2603,10 @@ impl CharbonnierScalarBlockState {
     }
 
     fn penalty_value(&self) -> f64 {
-        self.radius.iter().map(|r| r - self.epsilon).sum::<f64>()
+        self.radius
+            .iter()
+            .map(|r| self.epsilon * (r - self.epsilon))
+            .sum::<f64>()
     }
 
     fn beta_gradient_coeff(&self) -> Array1<f64> {
@@ -2610,31 +2614,53 @@ impl CharbonnierScalarBlockState {
             self.signal
                 .iter()
                 .zip(self.radius.iter())
-                .map(|(t, r)| t / r),
+                .map(|(t, r)| self.epsilon * t / r),
         )
     }
 
     fn beta_hessian_diag(&self) -> Array1<f64> {
-        let eps2 = self.epsilon * self.epsilon;
-        self.radius.mapv(|r| eps2 / (r * r * r))
+        let eps3 = self.epsilon.powi(3);
+        self.radius.mapv(|r| eps3 / (r * r * r))
     }
 
     fn epsilon_gradient_terms(&self) -> Array1<f64> {
-        // Log-epsilon note:
-        //   eta = log eps,  eps = exp(eta).
-        // This method returns d/deps phi(t; eps), not d/deta.
-        // The exact scalar derivative is
-        //   d/deps [sqrt(t^2 + eps^2) - eps] = eps / sqrt(t^2 + eps^2) - 1.
-        // Therefore
-        //   d/deta phi = eps * d/deps phi = eps^2 / sqrt(t^2 + eps^2) - eps.
-        self.radius.mapv(|r| self.epsilon / r - 1.0)
+        // Root-cause fix: the exact adaptive production model uses the scaled
+        // Charbonnier / pseudo-Huber block
+        //
+        //   psi(t; eps) = eps * (sqrt(t^2 + eps^2) - eps),
+        //
+        // not the raw Charbonnier block sqrt(t^2 + eps^2) - eps.
+        //
+        // The raw form makes lambda and eps nearly confounded:
+        //
+        //   lambda * (sqrt(t^2 + eps^2) - eps)
+        //   = (lambda / (2 eps)) t^2 + O(t^4),
+        //
+        // so the outer optimizer can move along flat valleys by shrinking
+        // lambda toward zero while inflating eps. That is exactly the
+        // pathological adaptive behavior seen in the 2D production traces.
+        //
+        // The scaled pseudo-Huber form removes that local scale confounding:
+        //
+        //   psi(t; eps) = 0.5 t^2 + O(t^4 / eps^2)
+        //
+        // near t = 0, so lambda controls local quadratic shrinkage while eps
+        // controls where the penalty transitions toward the linear tail.
+        //
+        // This method returns d/deps psi(t; eps), not d/deta.
+        //
+        //   d/deps [eps * (sqrt(t^2 + eps^2) - eps)]
+        //   = sqrt(t^2 + eps^2) + eps^2 / sqrt(t^2 + eps^2) - 2 eps.
+        self.radius
+            .mapv(|r| r + (self.epsilon * self.epsilon) / r - 2.0 * self.epsilon)
     }
 
     fn beta_epsilon_mixed_coeff(&self) -> Array1<f64> {
         // Mixed derivative with respect to beta and the raw epsilon coordinate:
         //
-        //   d/dt phi(t; eps)        = t / s
-        //   d/(dt deps) phi(t; eps) = -(eps * t) / s^3,
+        //   d/dt psi(t; eps)        = eps * t / s
+        //   d/(dt deps) psi(t; eps) = t / s - eps^2 t / s^3
+        //                           = t^3 / s^3,
         //   s = sqrt(t^2 + eps^2).
         //
         // For log-epsilon eta = log eps, multiply this coefficient by eps.
@@ -2642,7 +2668,7 @@ impl CharbonnierScalarBlockState {
             self.signal
                 .iter()
                 .zip(self.radius.iter())
-                .map(|(t, r)| -(self.epsilon * t) / (r * r * r)),
+                .map(|(t, r)| (t * t * t) / (r * r * r)),
         )
     }
 
@@ -2652,7 +2678,7 @@ impl CharbonnierScalarBlockState {
             self.signal
                 .iter()
                 .zip(self.radius.iter())
-                .map(|(t, r)| (t * t) / (r * r * r)),
+                .map(|(t, r)| (3.0 * self.epsilon * t * t + 2.0 * self.epsilon.powi(3)) / (r * r * r) - 2.0),
         )
     }
 
@@ -2661,11 +2687,11 @@ impl CharbonnierScalarBlockState {
         weight_floor: f64,
         weight_ceiling: f64,
     ) -> (Array1<f64>, Array1<f64>) {
-        // Exact scalar Charbonnier block and its MM majorizer.
+        // Exact scalar scaled-Charbonnier / pseudo-Huber block and its MM majorizer.
         //
         // The exact scalar penalty used by the nonquadratic spatial regularizer is
         //
-        //   phi(t; eps) = sqrt(t^2 + eps^2) - eps,
+        //   psi(t; eps) = eps * (sqrt(t^2 + eps^2) - eps),
         //
         // where:
         //   - t is the scalar operator response at one collocation point,
@@ -2673,25 +2699,25 @@ impl CharbonnierScalarBlockState {
         //
         // The key exact scalar derivatives are:
         //
-        //   d/dt phi(t; eps)        = t / sqrt(t^2 + eps^2),
-        //   d^2/dt^2 phi(t; eps)    = eps^2 / (t^2 + eps^2)^(3/2),
-        //   d/deps phi(t; eps)      = eps / sqrt(t^2 + eps^2) - 1,
-        //   d^2/(dt deps) phi       = -(eps * t) / (t^2 + eps^2)^(3/2).
+        //   d/dt psi(t; eps)        = eps * t / sqrt(t^2 + eps^2),
+        //   d^2/dt^2 psi(t; eps)    = eps^3 / (t^2 + eps^2)^(3/2),
+        //   d/deps psi(t; eps)      = sqrt(t^2 + eps^2) + eps^2 / sqrt(t^2 + eps^2) - 2 eps,
+        //   d^2/(dt deps) psi       = t^3 / (t^2 + eps^2)^(3/2).
         //
         // These exact formulas define the real adaptive model used by the
         // pseudo-Laplace hyperobjective. We still keep the legacy MM majorizer
         // weights here because they remain useful for diagnostics/tests and for
         // comparing the old surrogate path against the exact Charbonnier model.
         //
-        // For a reference point t0, Charbonnier admits the standard quadratic
+        // For a reference point t0, the same tangent majorizer in t^2 gives
         // tangent majorizer in the variable t^2:
         //
-        //   phi(t; eps) <= u(t0) * t^2 + const(t0),
-        //   u(t0) = 1 / (2 * sqrt(t0^2 + eps^2)).
+        //   psi(t; eps) <= u(t0) * t^2 + const(t0),
+        //   u(t0) = eps / (2 * sqrt(t0^2 + eps^2)).
         //
         // So the MM algorithm reuses only the scalar weight
         //
-        //   u_k = 1 / (2 * sqrt(t_k^2 + eps^2)),
+        //   u_k = eps / (2 * sqrt(t_k^2 + eps^2)),
         //
         // while the exact derivatives above remain the source of truth for the
         // production direct inner optimizer and exact outer hypergradient.
@@ -2704,7 +2730,7 @@ impl CharbonnierScalarBlockState {
         //      penalty to the MM surrogate.
         let weight = self
             .radius
-            .mapv(|r| (0.5 / r).clamp(weight_floor, weight_ceiling));
+            .mapv(|r| (0.5 * self.epsilon / r).clamp(weight_floor, weight_ceiling));
         let inv_weight = weight.mapv(|u| 1.0 / u);
         (weight, inv_weight)
     }
@@ -2724,23 +2750,23 @@ impl CharbonnierScalarBlockState {
         //
         //   d/dtheta log det H = tr(H^{-1} Hdot_theta),
         //   Hdot_theta = J_{beta,beta,theta} + D_beta(H)[beta_theta].
-        let eps2 = self.epsilon * self.epsilon;
+        let eps3 = self.epsilon.powi(3);
         Array1::from_iter(
             self.signal
                 .iter()
                 .zip(direction_signal.iter())
                 .zip(self.radius.iter())
-                .map(|((t, q), r)| -3.0 * eps2 * t * q / r.powi(5)),
+                .map(|((t, q), r)| -3.0 * eps3 * t * q / r.powi(5)),
         )
     }
 
     fn log_epsilon_beta_hessian_diag(&self) -> Array1<f64> {
-        let eps2 = self.epsilon * self.epsilon;
+        let eps3 = self.epsilon.powi(3);
         Array1::from_iter(
             self.signal
                 .iter()
                 .zip(self.radius.iter())
-                .map(|(t, r)| eps2 * (2.0 * t * t - eps2) / r.powi(5)),
+                .map(|(t, r)| 3.0 * eps3 * t * t / r.powi(5)),
         )
     }
 }
@@ -2772,7 +2798,10 @@ impl CharbonnierGroupedBlockState {
     }
 
     fn penalty_value(&self) -> f64 {
-        self.radius.iter().map(|r| r - self.epsilon).sum::<f64>()
+        self.radius
+            .iter()
+            .map(|r| self.epsilon * (r - self.epsilon))
+            .sum::<f64>()
     }
 
     fn norm_signal(&self) -> Array1<f64> {
@@ -2782,7 +2811,7 @@ impl CharbonnierGroupedBlockState {
     fn beta_gradient_blocks(&self) -> Array2<f64> {
         let mut out = self.signal_blocks.clone();
         for (k, mut row) in out.rows_mut().into_iter().enumerate() {
-            let scale = 1.0 / self.radius[k];
+            let scale = self.epsilon / self.radius[k];
             row.mapv_inplace(|v| v * scale);
         }
         out
@@ -2793,10 +2822,10 @@ impl CharbonnierGroupedBlockState {
         for (k, row) in self.signal_blocks.rows().into_iter().enumerate() {
             let dim = row.len();
             let mut block = Array2::<f64>::eye(dim);
-            block.mapv_inplace(|v| v / self.radius[k]);
+            block.mapv_inplace(|v| self.epsilon * v / self.radius[k]);
             for i in 0..dim {
                 for j in 0..dim {
-                    block[[i, j]] -= row[i] * row[j] / self.radius[k].powi(3);
+                    block[[i, j]] -= self.epsilon * row[i] * row[j] / self.radius[k].powi(3);
                 }
             }
             out.push(block);
@@ -2805,27 +2834,27 @@ impl CharbonnierGroupedBlockState {
     }
 
     fn epsilon_gradient_terms(&self) -> Array1<f64> {
-        // Raw-epsilon derivative for one grouped Charbonnier block:
+        // Raw-epsilon derivative for one grouped scaled-Charbonnier block:
         //
-        //   phi(g; eps) = sqrt(g^2 + eps^2) - eps,
-        //   d/deps phi   = eps / sqrt(g^2 + eps^2) - 1,
+        //   psi(g; eps) = eps * (sqrt(g^2 + eps^2) - eps),
+        //   d/deps psi   = sqrt(g^2 + eps^2) + eps^2 / sqrt(g^2 + eps^2) - 2 eps,
         //
-        // with g = ||v||_2. For eta = log eps, the exact derivative is
-        //   d/deta phi = eps^2 / sqrt(g^2 + eps^2) - eps.
-        self.radius.mapv(|r| self.epsilon / r - 1.0)
+        // with g = ||v||_2. For eta = log eps, multiply this by eps.
+        self.radius
+            .mapv(|r| r + (self.epsilon * self.epsilon) / r - 2.0 * self.epsilon)
     }
 
     fn beta_epsilon_mixed_blocks(&self) -> Array2<f64> {
         // Raw-epsilon mixed block:
         //
-        //   d/d beta phi(||v||; eps) = G^T (v / s),
-        //   d/(d beta deps) phi      = G^T (-(eps / s^3) v),
+        //   d/d beta psi(||v||; eps) = G^T (eps * v / s),
+        //   d/(d beta deps) psi      = G^T (((||v||^2) / s^3) v),
         //   s = sqrt(||v||^2 + eps^2).
         //
         // For log-epsilon eta = log eps, multiply the inner vector by eps.
         let mut out = self.signal_blocks.clone();
         for (k, mut row) in out.rows_mut().into_iter().enumerate() {
-            let scale = -self.epsilon / self.radius[k].powi(3);
+            let scale = (self.norm[k] * self.norm[k]) / self.radius[k].powi(3);
             row.mapv_inplace(|v| v * scale);
         }
         out
@@ -2837,7 +2866,7 @@ impl CharbonnierGroupedBlockState {
             self.norm
                 .iter()
                 .zip(self.radius.iter())
-                .map(|(g, r)| (g * g) / (r * r * r)),
+                .map(|(g, r)| (3.0 * self.epsilon * g * g + 2.0 * self.epsilon.powi(3)) / (r * r * r) - 2.0),
         )
     }
 
@@ -2846,22 +2875,22 @@ impl CharbonnierGroupedBlockState {
         weight_floor: f64,
         weight_ceiling: f64,
     ) -> (Array1<f64>, Array1<f64>) {
-        // Grouped Charbonnier MM weights for the slope block.
+        // Grouped scaled-Charbonnier / pseudo-Huber MM weights for the slope block.
         //
         // For the grouped penalty, each collocation point contributes
         //
-        //   phi(g_k; eps_g),
+        //   psi(g_k; eps_g) = eps_g * (sqrt(g_k^2 + eps_g^2) - eps_g),
         //   g_k = ||v_k||_2,
         //   v_k = G_k beta.
         //
         // The exact block gradient is
         //
-        //   d/d beta phi(g_k; eps_g)
-        //   = G_k^T (v_k / sqrt(||v_k||^2 + eps_g^2)),
+        //   d/d beta psi(g_k; eps_g)
+        //   = G_k^T (eps_g * v_k / sqrt(||v_k||^2 + eps_g^2)),
         //
         // and the exact block Hessian is
         //
-        //   G_k^T B_k G_k,
+        //   G_k^T (eps_g B_k) G_k,
         //
         //   B_k
         //   = (1 / r_k) I - (1 / r_k^3) v_k v_k^T,
@@ -2870,8 +2899,8 @@ impl CharbonnierGroupedBlockState {
         // The current adaptive path does not use that exact Hessian directly.
         // Instead it uses the grouped MM majorizer
         //
-        //   phi(g; eps_g) <= u(g0) * g^2 + const(g0),
-        //   u(g0) = 1 / (2 * sqrt(g0^2 + eps_g^2)),
+        //   psi(g; eps_g) <= u(g0) * g^2 + const(g0),
+        //   u(g0) = eps_g / (2 * sqrt(g0^2 + eps_g^2)),
         //
         // which yields the quadratic surrogate
         //
@@ -2885,7 +2914,7 @@ impl CharbonnierGroupedBlockState {
         // ultimately use.
         let weight = self
             .radius
-            .mapv(|r| (0.5 / r).clamp(weight_floor, weight_ceiling));
+            .mapv(|r| (0.5 * self.epsilon / r).clamp(weight_floor, weight_ceiling));
         let inv_weight = weight.mapv(|u| 1.0 / u);
         (weight, inv_weight)
     }
@@ -2898,7 +2927,8 @@ impl CharbonnierGroupedBlockState {
         //   q_k = G_k u,
         //   r_k = sqrt(||v_k||^2 + eps^2),
         //
-        // the exact Hessian block is
+        // the exact Hessian block for psi(g; eps) = eps * (sqrt(g^2 + eps^2) - eps) is
+        //   eps * B_k,
         //   B_k = (1 / r_k) I - v_k v_k^T / r_k^3.
         //
         // Differentiating B_k along u gives
@@ -2913,7 +2943,7 @@ impl CharbonnierGroupedBlockState {
         //   B_k = (1 / r_k) I - v_k v_k^T / r_k^3.
         //
         // The full directional penalty Hessian map is then
-        //   D(H_g)[u] = lambda_g sum_k G_k^T M_k(u) G_k.
+        //   D(H_g)[u] = lambda_g * eps * sum_k G_k^T M_k(u) G_k.
         let mut out = Vec::with_capacity(self.signal_blocks.nrows());
         for (k, (v, q)) in self
             .signal_blocks
@@ -2934,23 +2964,25 @@ impl CharbonnierGroupedBlockState {
                     block[[i, j]] += 3.0 * dot * v[i] * v[j] / r5;
                 }
             }
+            block.mapv_inplace(|x| self.epsilon * x);
             out.push(block);
         }
         out
     }
 
     fn log_epsilon_beta_hessian_blocks(&self) -> Vec<Array2<f64>> {
-        let eps2 = self.epsilon * self.epsilon;
         let mut out = Vec::with_capacity(self.signal_blocks.nrows());
         for (k, row) in self.signal_blocks.rows().into_iter().enumerate() {
             let dim = row.len();
             let r3 = self.radius[k].powi(3);
             let r5 = self.radius[k].powi(5);
             let mut block = Array2::<f64>::eye(dim);
-            block.mapv_inplace(|v| -eps2 * v / r3);
+            let norm2 = self.norm[k] * self.norm[k];
+            block.mapv_inplace(|v| self.epsilon * norm2 * v / r3);
             for i in 0..dim {
                 for j in 0..dim {
-                    block[[i, j]] += 3.0 * eps2 * row[i] * row[j] / r5;
+                    block[[i, j]] +=
+                        self.epsilon * (2.0 * self.epsilon * self.epsilon - norm2) * row[i] * row[j] / r5;
                 }
             }
             out.push(block);
@@ -3385,11 +3417,11 @@ fn compute_spatial_adaptive_weights_for_beta(
     weight_floor: f64,
     weight_ceiling: f64,
 ) -> Result<Vec<SpatialAdaptiveWeights>, EstimationError> {
-    // Charbonnier/MM derivation (per collocation scalar t):
-    //   psi(t; eps) = sqrt(t^2 + eps^2) - eps
+    // Scaled Charbonnier / pseudo-Huber MM derivation (per collocation scalar t):
+    //   psi(t; eps) = eps * (sqrt(t^2 + eps^2) - eps)
     // and for reference t0 the tangent majorizer in t^2 gives:
     //   psi(t) <= u(t0) * t^2 + const(t0),
-    //   u(t0) = 1 / (2*sqrt(t0^2 + eps^2)).
+    //   u(t0) = eps / (2*sqrt(t0^2 + eps^2)).
     //
     // We apply this to:
     //   t = f_k = |f(z_k)|            (magnitude),
@@ -3657,14 +3689,22 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
 
     let mut warm_cache = None::<CustomFamilyWarmStart>;
     let rho_dim = retained_penalties.len();
+    const EPSILON_LOG_WINDOW: f64 = 6.0;
     let lower = Array1::from_iter((0..initial_theta.len()).map(|idx| {
         if idx < rho_dim + runtime_caches.len() * 3 {
             -30.0
         } else {
-            adaptive_opts.min_epsilon.max(1e-12).ln()
+            (initial_theta[idx] - EPSILON_LOG_WINDOW)
+                .max(adaptive_opts.min_epsilon.max(1e-12).ln())
         }
     }));
-    let upper = Array1::from_elem(initial_theta.len(), 30.0);
+    let upper = Array1::from_iter((0..initial_theta.len()).map(|idx| {
+        if idx < rho_dim + runtime_caches.len() * 3 {
+            30.0
+        } else {
+            initial_theta[idx] + EPSILON_LOG_WINDOW
+        }
+    }));
     let block_spec = ParameterBlockSpec {
         name: "eta".to_string(),
         design: DesignMatrix::Dense(baseline.design.design.clone()),
@@ -3682,7 +3722,7 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
         ..BlockwiseFitOptions::default()
     };
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, CustomFamilyWarmStart)> = None;
-    let mut solver = Bfgs::new(initial_theta.clone(), |theta: &Array1<f64>| {
+    let objective = CachedFirstOrderObjective::new(|theta: &Array1<f64>| {
         if let Some((cached_theta, cached_cost, cached_grad, cached_warm)) = &last_eval
             && cached_theta.len() == theta.len()
             && cached_theta
@@ -3691,7 +3731,7 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
                 .all(|(&a, &b)| (a - b).abs() <= 1e-12)
         {
             warm_cache = Some(cached_warm.clone());
-            return (*cached_cost, cached_grad.clone());
+            return Ok((*cached_cost, cached_grad.clone()));
         }
 
         let rho = theta.slice(s![..rho_dim]).to_owned();
@@ -3715,7 +3755,7 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
             })
             .collect::<Vec<_>>();
         let family_eval = base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
-        match evaluate_custom_family_joint_hyper(
+        let result = evaluate_custom_family_joint_hyper(
             &family_eval,
             std::slice::from_ref(&block_spec),
             &outer_opts,
@@ -3723,27 +3763,29 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
             &derivative_blocks,
             warm_cache.as_ref(),
             false,
-        ) {
-            Ok(result) => {
-                warm_cache = Some(result.warm_start.clone());
-                last_eval = Some((
-                    theta.clone(),
-                    result.objective,
-                    result.gradient.clone(),
-                    result.warm_start,
-                ));
-                (result.objective, result.gradient)
-            }
-            Err(_) => (f64::INFINITY, Array1::from_elem(theta.len(), 0.0)),
+        )
+        .map_err(|err| ObjectiveEvalError::recoverable(err.to_string()))?;
+        if !result.objective.is_finite() || result.gradient.iter().any(|v| !v.is_finite()) {
+            return Err(ObjectiveEvalError::recoverable(
+                "exact spatial adaptive objective returned non-finite values",
+            ));
         }
-    })
-    .with_bounds(lower, upper, 1e-6)
-    .with_tolerance(options.tol)
-    .with_fp_tolerances(1e3, 1e2)
-    .with_accept_flat_midpoint_once(true)
-    .with_jiggle_on_flats(true, 1e-3)
-    .with_multi_direction_rescue(true)
-    .with_max_iterations(options.max_iter);
+        warm_cache = Some(result.warm_start.clone());
+        last_eval = Some((
+            theta.clone(),
+            result.objective,
+            result.gradient.clone(),
+            result.warm_start,
+        ));
+        Ok((result.objective, result.gradient))
+    });
+    let mut solver = Bfgs::new(initial_theta.clone(), objective)
+        .with_bounds(Bounds::new(lower, upper, 1e-6).expect("adaptive theta bounds must be valid"))
+        .with_tolerance(Tolerance::new(options.tol).expect("adaptive tolerance must be valid"))
+        .with_profile(opt::Profile::Aggressive)
+        .with_max_iterations(
+            MaxIterations::new(options.max_iter).expect("adaptive max_iter must be valid"),
+        );
 
     let solution = match solver.run() {
         Ok(sol) => sol,
@@ -6046,79 +6088,59 @@ fn try_exact_joint_spatial_length_scale_optimization(
     let theta0 = setup.theta0();
     let lower = setup.lower();
     let upper = setup.upper();
-    let mut optimizer = ArcOptimizer::new(theta0.clone(), |theta, request| {
-        if let Some((theta_c, cost_c, grad_c, h_c)) = &last_eval
-            && approx_same_point(theta, theta_c)
-        {
-            return Ok(match request {
-                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
-                ObjectiveRequest::CostAndGradient => {
-                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+    let objective = CachedSecondOrderObjective::new(
+        |theta: &Array1<f64>| {
+            let log_kappa = SpatialLogKappaCoords::from_theta_tail(theta, rho_dim);
+            let spec_c = log_kappa
+                .apply_to_spec(resolved_spec, spatial_terms)
+                .map_err(|e| {
+                    ObjectiveEvalError::recoverable(format!(
+                        "failed to apply spatial log-kappa: {e}"
+                    ))
+                })?;
+            let (cost, grad, hess) = match try_exact_joint_spatial_hyper_cost_gradient_hessian(
+                data,
+                y,
+                weights,
+                offset,
+                theta,
+                rho_dim,
+                &spec_c,
+                &warm_start_fit,
+                family,
+                options,
+                spatial_terms,
+            ) {
+                Ok(Some((cost, grad, hess)))
+                    if cost.is_finite()
+                        && grad.iter().all(|v| v.is_finite())
+                        && hess.nrows() == theta.len()
+                        && hess.ncols() == theta.len()
+                        && hess.iter().all(|v| v.is_finite()) =>
+                {
+                    (cost, grad, hess)
                 }
-                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
-                    ObjectiveSample::cost_gradient_hessian(*cost_c, grad_c.clone(), h_c.clone())
+                _ => {
+                    return Err(ObjectiveEvalError::recoverable(
+                        "exact joint spatial objective returned invalid value",
+                    ));
                 }
-            });
-        }
-
-        let log_kappa = SpatialLogKappaCoords::from_theta_tail(theta, rho_dim);
-        let spec_c = log_kappa
-            .apply_to_spec(resolved_spec, spatial_terms)
-            .map_err(|e| {
-                ObjectiveEvalError::recoverable(format!("failed to apply spatial log-kappa: {e}"))
-            })?;
-        let (cost, grad, hess) = match try_exact_joint_spatial_hyper_cost_gradient_hessian(
-            data,
-            y,
-            weights,
-            offset,
-            theta,
-            rho_dim,
-            &spec_c,
-            &warm_start_fit,
-            family,
-            options,
-            spatial_terms,
-        ) {
-            Ok(Some((cost, grad, hess)))
-                if cost.is_finite()
-                    && grad.iter().all(|v| v.is_finite())
-                    && hess.nrows() == theta.len()
-                    && hess.ncols() == theta.len()
-                    && hess.iter().all(|v| v.is_finite()) =>
-            {
-                (cost, grad, hess)
-            }
-            Ok(Some((_cost, _grad, _hess))) => {
-                return Err(ObjectiveEvalError::recoverable(
-                    "exact joint spatial objective returned invalid value",
-                ));
-            }
-            Ok(None) => {
-                return Err(ObjectiveEvalError::recoverable(
-                    "exact joint spatial objective returned invalid value",
-                ));
-            }
-            Err(_err) => {
-                return Err(ObjectiveEvalError::recoverable(
-                    "exact joint spatial objective returned invalid value",
-                ));
-            }
-        };
-        last_eval = Some((theta.clone(), cost, grad.clone(), hess.clone()));
-        Ok(match request {
-            ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
-            ObjectiveRequest::CostAndGradient => ObjectiveSample::cost_and_gradient(cost, grad),
-            ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
-                ObjectiveSample::cost_gradient_hessian(cost, grad, hess)
-            }
-        })
-    })
-    .with_bounds(lower, upper, 1e-6)
-    .with_tolerance(kappa_options.rel_tol.max(1e-6))
-    .with_max_iterations(kappa_options.max_outer_iter.max(1))
-    .with_bfgs_fallback(true)
-    .with_fallback_history(12);
+            };
+            last_eval = Some((theta.clone(), cost, grad.clone(), hess.clone()));
+            Ok((cost, grad, Some(hess)))
+        },
+        1e-4,
+    );
+    let mut optimizer = ArcOptimizer::new(theta0.clone(), objective)
+    .with_bounds(Bounds::new(lower, upper, 1e-6).expect("joint theta bounds must be valid"))
+    .with_tolerance(
+        Tolerance::new(kappa_options.rel_tol.max(1e-6))
+            .expect("joint tolerance must be valid"),
+    )
+    .with_max_iterations(
+        MaxIterations::new(kappa_options.max_outer_iter.max(1))
+            .expect("joint max iterations must be valid"),
+    );
 
     let solution = match optimizer.run() {
         Ok(sol) => sol,
@@ -6456,68 +6478,61 @@ where
             ))
         };
 
-        let mut optimizer = NewtonTrustRegion::new(theta0.clone(), |theta, request| {
-            if let Some((theta_c, cost_c, grad_c)) = &last_eval
-                && approx_same_point(theta, theta_c)
-            {
-                return Ok(match request {
-                    ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
-                    ObjectiveRequest::CostAndGradient
-                    | ObjectiveRequest::GradientAndHessian
-                    | ObjectiveRequest::CostGradientHessian => {
-                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
+        let objective = CachedSecondOrderObjective::new(
+            |theta: &Array1<f64>| {
+                let (cost, grad) = match eval_value(theta) {
+                    Ok((cost, mean_spec_c, noise_spec_c, mean_design_c, noise_design_c, fit_c)) => {
+                        let mut objective_only =
+                            |probe: &Array1<f64>| -> Result<f64, EstimationError> {
+                                let (value, _, _, _, _, _) = eval_value(probe)?;
+                                Ok(value)
+                            };
+                        let grad = central_diff_gradient(
+                            theta,
+                            &lower_eval,
+                            &upper_eval,
+                            &mut objective_only,
+                        )
+                        .map_err(|e| {
+                            ObjectiveEvalError::recoverable(format!(
+                                "two-block spatial gradient evaluation failed: {e}"
+                            ))
+                        })?;
+                        if !cost.is_finite() || grad.iter().any(|v| !v.is_finite()) {
+                            return Err(ObjectiveEvalError::recoverable(
+                                "two-block spatial objective/gradient became non-finite",
+                            ));
+                        }
+                        let _ = (
+                            mean_spec_c,
+                            noise_spec_c,
+                            mean_design_c,
+                            noise_design_c,
+                            fit_c,
+                        );
+                        last_eval = Some((theta.clone(), cost, grad.clone()));
+                        (cost, grad)
                     }
-                });
-            }
-
-            let (cost, grad) = match eval_value(theta) {
-                Ok((cost, mean_spec_c, noise_spec_c, mean_design_c, noise_design_c, fit_c)) => {
-                    let mut objective_only = |probe: &Array1<f64>| -> Result<f64, EstimationError> {
-                        let (value, _, _, _, _, _) = eval_value(probe)?;
-                        Ok(value)
-                    };
-                    let grad =
-                        central_diff_gradient(theta, &lower_eval, &upper_eval, &mut objective_only)
-                            .map_err(|e| {
-                                ObjectiveEvalError::recoverable(format!(
-                                    "two-block spatial gradient evaluation failed: {e}"
-                                ))
-                            })?;
-                    if !cost.is_finite() || grad.iter().any(|v| !v.is_finite()) {
-                        return Err(ObjectiveEvalError::recoverable(
-                            "two-block spatial objective/gradient became non-finite",
-                        ));
+                    Err(e) => {
+                        return Err(ObjectiveEvalError::recoverable(format!(
+                            "two-block spatial objective evaluation failed: {e}"
+                        )));
                     }
-                    let _ = (
-                        mean_spec_c,
-                        noise_spec_c,
-                        mean_design_c,
-                        noise_design_c,
-                        fit_c,
-                    );
-                    last_eval = Some((theta.clone(), cost, grad.clone()));
-                    (cost, grad)
-                }
-                Err(e) => {
-                    return Err(ObjectiveEvalError::recoverable(format!(
-                        "two-block spatial objective evaluation failed: {e}"
-                    )));
-                }
-            };
-            Ok(match request {
-                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
-                ObjectiveRequest::CostAndGradient
-                | ObjectiveRequest::GradientAndHessian
-                | ObjectiveRequest::CostGradientHessian => {
-                    ObjectiveSample::cost_and_gradient(cost, grad)
-                }
-            })
-        })
-        .with_bounds(lower, upper, 1e-6)
-        .with_tolerance(kappa_options.rel_tol.max(1e-6))
-        .with_max_iterations(kappa_options.max_outer_iter.max(1))
-        .with_bfgs_fallback(true)
-        .with_fallback_history(12);
+                };
+                Ok((cost, grad, None))
+            },
+            1e-4,
+        );
+        let mut optimizer = NewtonTrustRegion::new(theta0.clone(), objective)
+        .with_bounds(Bounds::new(lower, upper, 1e-6).expect("two-block bounds must be valid"))
+        .with_tolerance(
+            Tolerance::new(kappa_options.rel_tol.max(1e-6))
+                .expect("two-block tolerance must be valid"),
+        )
+        .with_max_iterations(
+            MaxIterations::new(kappa_options.max_outer_iter.max(1))
+                .expect("two-block max iterations must be valid"),
+        );
 
         let solution = match optimizer.run() {
             Ok(sol) => sol,
@@ -6658,29 +6673,7 @@ where
     })?;
 
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
-    let mut optimizer = NewtonTrustRegion::new(theta0.clone(), |theta, request| {
-        let need_hessian = matches!(
-            request,
-            ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian
-        );
-        if let Some((theta_c, cost_c, grad_c, hess_c)) = &last_eval
-            && approx_same_point(theta, theta_c)
-            && (!need_hessian || hess_c.is_some())
-        {
-            return Ok(match request {
-                ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(*cost_c),
-                ObjectiveRequest::CostAndGradient => {
-                    ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
-                }
-                ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
-                    if let Some(h) = hess_c {
-                        ObjectiveSample::cost_gradient_hessian(*cost_c, grad_c.clone(), h.clone())
-                    } else {
-                        ObjectiveSample::cost_and_gradient(*cost_c, grad_c.clone())
-                    }
-                }
-            });
-        }
+    let objective = CachedSecondOrderObjective::new(|theta: &Array1<f64>| {
         let log_kappa = SpatialLogKappaCoords::from_theta_tail(theta, rho_dim);
         let (mean_log_kappa, noise_log_kappa) = log_kappa.split_at(mean_terms.len());
         let mean_spec_c = match mean_log_kappa.apply_to_spec(&best_mean_spec, &mean_terms) {
@@ -6713,7 +6706,7 @@ where
             &noise_spec_c,
             &mean_design_c,
             &noise_design_c,
-            need_hessian,
+            true,
         ) {
             Ok((cost, grad, hess)) => {
                 if !cost.is_finite()
@@ -6740,23 +6733,18 @@ where
                 ));
             }
         };
-        Ok(match request {
-            ObjectiveRequest::CostOnly => ObjectiveSample::cost_only(cost),
-            ObjectiveRequest::CostAndGradient => ObjectiveSample::cost_and_gradient(cost, grad),
-            ObjectiveRequest::GradientAndHessian | ObjectiveRequest::CostGradientHessian => {
-                if let Some(h) = hess {
-                    ObjectiveSample::cost_gradient_hessian(cost, grad, h)
-                } else {
-                    ObjectiveSample::cost_and_gradient(cost, grad)
-                }
-            }
-        })
-    })
-    .with_bounds(lower, upper, 1e-6)
-    .with_tolerance(kappa_options.rel_tol.max(1e-6))
-    .with_max_iterations(kappa_options.max_outer_iter.max(1))
-    .with_bfgs_fallback(true)
-    .with_fallback_history(12);
+        Ok((cost, grad, hess))
+    }, 1e-4);
+    let mut optimizer = NewtonTrustRegion::new(theta0.clone(), objective)
+    .with_bounds(Bounds::new(lower, upper, 1e-6).expect("exact joint bounds must be valid"))
+    .with_tolerance(
+        Tolerance::new(kappa_options.rel_tol.max(1e-6))
+            .expect("exact joint tolerance must be valid"),
+    )
+    .with_max_iterations(
+        MaxIterations::new(kappa_options.max_outer_iter.max(1))
+            .expect("exact joint max iterations must be valid"),
+    );
 
     let solution = match optimizer.run() {
         Ok(sol) => sol,
@@ -9437,6 +9425,82 @@ mod tests {
     }
 
     #[test]
+    fn exact_spatial_adaptive_high_center_duchon_fit_no_longer_fails_in_outer_solver() {
+        let n = 320usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = x;
+            y[i] =
+                0.12 * (2.0 * std::f64::consts::PI * x).sin()
+                    + 0.05 * (5.0 * std::f64::consts::PI * x).cos()
+                    + 1.4 / (1.0 + (-(x - 0.5) / 0.012).exp());
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 120 },
+                        length_scale: None,
+                        power: 2,
+                        nullspace_order: DuchonNullspaceOrder::Zero,
+                        double_penalty: true,
+                        identifiability: SpatialIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let fit = fit_term_collection_for_spec(
+            data.view(),
+            y.view(),
+            Array1::ones(n).view(),
+            Array1::zeros(n).view(),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &FitOptions {
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: None,
+                optimize_sas: false,
+                max_iter: 40,
+                tol: 1e-6,
+                nullspace_dims: vec![],
+                linear_constraints: None,
+                adaptive_regularization: Some(AdaptiveRegularizationOptions {
+                    enabled: true,
+                    max_mm_iter: 10,
+                    beta_rel_tol: 1e-3,
+                    max_epsilon_outer_iter: 4,
+                    epsilon_log_step: std::f64::consts::LN_2,
+                    min_epsilon: 1e-8,
+                    weight_floor: 1e-8,
+                    weight_ceiling: 1e8,
+                }),
+            },
+        )
+        .expect("high-center adaptive Duchon fit should not fail");
+
+        assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
+        assert!(fit.fit.deviance.is_finite());
+        assert!(fit.fit.edf_total.is_finite());
+        let diag = fit
+            .adaptive_diagnostics
+            .as_ref()
+            .expect("adaptive diagnostics should be present");
+        assert!(diag.epsilon_0.is_finite() && diag.epsilon_0 > 0.0);
+        assert!(diag.epsilon_g.is_finite() && diag.epsilon_g > 0.0);
+        assert!(diag.epsilon_c.is_finite() && diag.epsilon_c > 0.0);
+    }
+
+    #[test]
     fn extracted_spatial_runtime_cache_matches_normalized_design_penalties() {
         let n = 24usize;
         let mut data = Array2::<f64>::zeros((n, 2));
@@ -9683,6 +9747,100 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn scalar_charbonnier_local_quadratic_curvature_is_epsilon_invariant() {
+        let signal = array![0.0, 0.0, 0.0];
+        let small = CharbonnierScalarBlockState::from_signal(signal.clone(), 1e-3);
+        let large = CharbonnierScalarBlockState::from_signal(signal, 1e3);
+        for (&a, &b) in small
+            .beta_hessian_diag()
+            .iter()
+            .zip(large.beta_hessian_diag().iter())
+        {
+            assert!((a - 1.0).abs() < 1e-10, "small-epsilon curvature should be 1, got {a}");
+            assert!((b - 1.0).abs() < 1e-10, "large-epsilon curvature should be 1, got {b}");
+        }
+    }
+
+    #[test]
+    fn grouped_charbonnier_local_quadratic_curvature_is_epsilon_invariant() {
+        let blocks = array![[0.0, 0.0], [0.0, 0.0]];
+        let small = CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), 1e-3);
+        let large = CharbonnierGroupedBlockState::from_signal_blocks(blocks, 1e3);
+        for (small_block, large_block) in small
+            .beta_hessian_blocks()
+            .into_iter()
+            .zip(large.beta_hessian_blocks().into_iter())
+        {
+            let eye = Array2::<f64>::eye(small_block.nrows());
+            assert!(
+                (&small_block - &eye).mapv(f64::abs).sum() < 1e-10,
+                "small-epsilon grouped curvature should equal identity"
+            );
+            assert!(
+                (&large_block - &eye).mapv(f64::abs).sum() < 1e-10,
+                "large-epsilon grouped curvature should equal identity"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_charbonnier_zero_signal_has_zero_epsilon_gradient() {
+        let state = CharbonnierScalarBlockState::from_signal(array![0.0, 0.0, 0.0], 0.37);
+        assert!(
+            state.epsilon_gradient_terms().mapv(f64::abs).sum() < 1e-12,
+            "scaled Charbonnier should have zero epsilon gradient at zero signal"
+        );
+        assert!(
+            state.beta_epsilon_mixed_coeff().mapv(f64::abs).sum() < 1e-12,
+            "scaled Charbonnier should have zero beta/epsilon mixed derivative at zero signal"
+        );
+    }
+
+    #[test]
+    fn grouped_charbonnier_zero_signal_has_zero_epsilon_gradient() {
+        let state =
+            CharbonnierGroupedBlockState::from_signal_blocks(array![[0.0, 0.0], [0.0, 0.0]], 0.37);
+        assert!(
+            state.epsilon_gradient_terms().mapv(f64::abs).sum() < 1e-12,
+            "scaled grouped Charbonnier should have zero epsilon gradient at zero signal"
+        );
+        assert!(
+            state.beta_epsilon_mixed_blocks().mapv(f64::abs).sum() < 1e-12,
+            "scaled grouped Charbonnier should have zero beta/epsilon mixed derivative at zero signal"
+        );
+    }
+
+    #[test]
+    fn scalar_charbonnier_small_signal_matches_half_quadratic_across_epsilons() {
+        let signal = array![1e-5, -2e-5, 3e-5];
+        let target = 0.5 * signal.iter().map(|v| v * v).sum::<f64>();
+        for &epsilon in &[1e-3, 1e-1, 1.0, 1e2] {
+            let state = CharbonnierScalarBlockState::from_signal(signal.clone(), epsilon);
+            let value = state.penalty_value();
+            let rel = (value - target).abs() / target.max(1e-20);
+            assert!(
+                rel < 5e-3,
+                "scaled scalar Charbonnier should match 0.5*t^2 locally across epsilons: eps={epsilon}, value={value}, target={target}, rel={rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_charbonnier_small_signal_matches_half_quadratic_across_epsilons() {
+        let blocks = array![[1e-5, -2e-5], [3e-5, 4e-5]];
+        let target = 0.5 * blocks.iter().map(|v| v * v).sum::<f64>();
+        for &epsilon in &[1e-3, 1e-1, 1.0, 1e2] {
+            let state = CharbonnierGroupedBlockState::from_signal_blocks(blocks.clone(), epsilon);
+            let value = state.penalty_value();
+            let rel = (value - target).abs() / target.max(1e-20);
+            assert!(
+                rel < 5e-3,
+                "scaled grouped Charbonnier should match 0.5*||v||^2 locally across epsilons: eps={epsilon}, value={value}, target={target}, rel={rel}"
+            );
         }
     }
 
