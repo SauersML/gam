@@ -49,5 +49,5 @@ runs:
         python3 --version
         Rscript --version
         python3 -m pip install --upgrade pip setuptools wheel
-        python3 -m pip install numpy pandas scikit-learn pygam lifelines scikit-survival xgboost
+        python3 -m pip install numpy pandas scikit-learn lifelines scikit-survival xgboost
         Rscript -e 'install.packages(c("mgcv","jsonlite","survival","glmnet","gamlss","gamlss.dist","gamboostLSS","mboost","bamlss","brms"), repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"), Ncpus=max(1L, parallel::detectCores()-1L))'

@@ -75,7 +75,6 @@ import pandas as pd  # noqa: E402
 from lifelines import CoxPHFitter, LogNormalAFTFitter, WeibullAFTFitter  # noqa: E402
 from lifelines.exceptions import ConvergenceWarning  # noqa: E402
 from lifelines.utils import concordance_index  # noqa: E402
-from pygam import LinearGAM, LogisticGAM, l, s  # noqa: E402
 from sklearn.metrics import roc_auc_score  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -5531,235 +5530,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
     }
 
 
-def run_external_pygam_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
-    if ds is None:
-        ds = dataset_for_scenario(scenario)
-    if folds is None:
-        folds = folds_for_dataset(ds)
-    rust_cfg = _rust_fit_mapping(scenario["name"])
-    if rust_cfg is not None:
-        basis = _canonical_smooth_basis(rust_cfg.get("smooth_basis", "ps"))
-        # pyGAM should not run scenarios requiring unsupported spline families.
-        if basis in {"thinplate", "duchon", "matern"}:
-            return None
-    df = pd.DataFrame(ds["rows"])
-    x = df[ds["features"]].to_numpy(dtype=float) if ds["features"] else np.empty((len(df), 0))
-    y = df[ds["target"]].to_numpy(dtype=float) if ds.get("target") else None
-
-    cv_rows = []
-    for fold in folds:
-        x_train = x[fold.train_idx]
-        x_test = x[fold.test_idx]
-        y_train = y[fold.train_idx] if y is not None else None
-        y_test = y[fold.test_idx] if y is not None else None
-
-        if ds["family"] == "survival":
-            time_col = ds["time_col"]
-            event_col = ds["event_col"]
-            train_df = df.iloc[fold.train_idx].copy()
-            test_df = df.iloc[fold.test_idx].copy()
-            feature_cols = ds["features"]
-            for col in feature_cols:
-                mu = float(train_df[col].mean())
-                sdv = float(train_df[col].std())
-                if (not np.isfinite(sdv)) or sdv < 1e-8:
-                    sdv = 1.0
-                train_df[col] = (train_df[col] - mu) / sdv
-                test_df[col] = (test_df[col] - mu) / sdv
-            fit_feature_cols = feature_cols
-            if scenario["name"] == "icu_survival_death" and "bmi" in feature_cols:
-                train_df, test_df, bmi_spline_cols = _augment_bmi_spline_linear_hinges(
-                    train_df, test_df, n_knots=6
-                )
-                fit_feature_cols = [c for c in feature_cols if c != "bmi"] + bmi_spline_cols
-            fit_start = datetime.now(timezone.utc)
-            cph = CoxPHFitter(penalizer=1e-4)
-            with warnings.catch_warnings(record=True) as wlist:
-                warnings.simplefilter("always")
-                cph.fit(
-                    train_df[[*fit_feature_cols, time_col, event_col]],
-                    duration_col=time_col,
-                    event_col=event_col,
-                )
-            conv_warn = [w for w in wlist if issubclass(w.category, ConvergenceWarning)]
-            fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
-
-            pred_start = datetime.now(timezone.utc)
-            risk = cph.predict_partial_hazard(test_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
-            pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
-            event_times = test_df[time_col].to_numpy(dtype=float)
-            events = test_df[event_col].to_numpy(dtype=float)
-            cidx = _lifelines_cindex_from_risk(event_times, risk, events)
-            cv_rows.append(
-                {
-                    "fit_sec": fit_sec,
-                    "predict_sec": pred_sec,
-                    "auc": cidx,
-                    "brier": survival_partial_brier_score(event_times, risk, events),
-                    "logloss": survival_partial_log_loss(event_times, risk, events),
-                    "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
-                    "n_test": int(len(fold.test_idx)),
-                    "warning": (
-                        f"lifelines convergence warning: {str(conv_warn[0].message)}"
-                        if conv_warn
-                        else None
-                    ),
-                    "model_spec": (
-                        "CoxPHFitter(train-fold z-score; bmi 6-knot hinge spline; penalizer=1e-4; "
-                        "c-index on partial-hazard risk score)"
-                        if scenario["name"] == "icu_survival_death"
-                        else "CoxPHFitter(linear terms; train-fold z-score; penalizer=1e-4; "
-                        "c-index on partial-hazard risk score)"
-                    ),
-                }
-            )
-            continue
-
-        if x_train.shape[1] > 0:
-            mu = np.mean(x_train, axis=0)
-            sdv = np.std(x_train, axis=0, ddof=1)
-            sdv[~np.isfinite(sdv) | (sdv < 1e-8)] = 1.0
-            x_train = (x_train - mu) / sdv
-            x_test = (x_test - mu) / sdv
-
-        if ds["family"] == "binomial":
-            if x.shape[1] == 1:
-                model = LogisticGAM(s(0, n_splines=8))
-                model_spec = "LogisticGAM(s(0, n_splines=8))"
-            elif scenario["name"] in {"geo_disease_ps_per_pc"}:
-                terms = s(0, n_splines=10)
-                for j in range(1, x.shape[1]):
-                    terms = terms + s(j, n_splines=10)
-                model = LogisticGAM(terms)
-                model_spec = "LogisticGAM(sum_j s(j, n_splines=10), j=0..15)"
-            elif _geo_disease_eas_scenario_cfg(scenario["name"]) is not None:
-                geo_cfg = _geo_disease_eas_scenario_cfg(scenario["name"])
-                k = int(geo_cfg["knots"])
-                n_pcs = int(geo_cfg["n_pcs"])
-                assert geo_cfg["basis_code"] == "psperpc"
-                terms = s(0, n_splines=k)
-                for j in range(1, x.shape[1]):
-                    terms = terms + s(j, n_splines=k)
-                model = LogisticGAM(terms)
-                model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..{n_pcs - 1})"
-            elif _papuan_oce_scenario_cfg(scenario["name"]) is not None:
-                papuan_cfg = _papuan_oce_scenario_cfg(scenario["name"])
-                k = int(papuan_cfg["knots"])
-                n_pcs = int(papuan_cfg["n_pcs"])
-                assert papuan_cfg["basis_code"] == "psperpc"
-                terms = s(0, n_splines=k)
-                for j in range(1, x.shape[1]):
-                    terms = terms + s(j, n_splines=k)
-                model = LogisticGAM(terms)
-                model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..{n_pcs - 1}) [papuan_oce]"
-            elif _geo_subpop16_scenario_cfg(scenario["name"]) is not None:
-                sub_cfg = _geo_subpop16_scenario_cfg(scenario["name"])
-                k = int(sub_cfg["knots"])
-                assert sub_cfg["basis_code"] == "psperpc"
-                terms = s(0, n_splines=k)
-                for j in range(1, x.shape[1]):
-                    terms = terms + s(j, n_splines=k)
-                model = LogisticGAM(terms)
-                model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..15) [subpop16]"
-            elif _geo_latlon_scenario_cfg(scenario["name"]) is not None:
-                latlon_cfg = _geo_latlon_scenario_cfg(scenario["name"])
-                k = int(latlon_cfg["knots"])
-                assert latlon_cfg["basis_code"] == "psperpc"
-                terms = s(0, n_splines=k)
-                for j in range(1, x.shape[1]):
-                    terms = terms + s(j, n_splines=k)
-                model = LogisticGAM(terms)
-                model_spec = f"LogisticGAM(sum_j s(j, n_splines={k}), j=0..5) [geo_latlon]"
-            elif scenario["name"] == "icu_survival_death":
-                model = LogisticGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))
-                model_spec = "LogisticGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))"
-            elif scenario["name"] == "horse_colic":
-                model = LogisticGAM(l(0) + s(1, n_splines=8) + l(2))
-                model_spec = "LogisticGAM(l(0) + s(1, n_splines=8) + l(2))"
-            elif scenario["name"] == "haberman_survival":
-                model = LogisticGAM(l(0) + l(1) + s(2, n_splines=8))
-                model_spec = "LogisticGAM(l(0) + l(1) + s(2, n_splines=8))"
-            else:
-                model = LogisticGAM(l(0) + s(1, n_splines=8))
-                model_spec = "LogisticGAM(l(0) + s(1, n_splines=8))"
-            fit_start = datetime.now(timezone.utc)
-            lam_grid = np.logspace(-4, 4, 17)
-            model.gridsearch(x_train, y_train, lam=lam_grid, objective="AICc", progress=False)
-            fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
-
-            pred_start = datetime.now(timezone.utc)
-            pred = model.predict_mu(x_test).astype(float)
-            pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
-            cv_rows.append(
-                {
-                    "fit_sec": fit_sec,
-                    "predict_sec": pred_sec,
-                    "auc": auc_score(y_test, pred),
-                    "brier": brier_score(y_test, pred),
-                    "logloss": log_loss_score(y_test, pred),
-                    "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
-                    "n_test": int(len(fold.test_idx)),
-                    "model_spec": model_spec,
-                }
-            )
-            continue
-
-        if scenario["name"] == "wine_gamair":
-            model = LinearGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))
-            model_spec = "LinearGAM(l(0) + l(1) + l(2) + l(3) + s(4, n_splines=10))"
-        elif scenario["name"] in {"us48_demand_5day", "us48_demand_31day"}:
-            model = LinearGAM(s(0, n_splines=10) + l(1) + l(2) + l(3))
-            model_spec = "LinearGAM(s(0, n_splines=10) + l(1) + l(2) + l(3))"
-        elif scenario["name"] == "icu_survival_los":
-            model = LinearGAM(s(0, n_splines=10) + l(1) + l(2) + l(3) + l(4))
-            model_spec = "LinearGAM(s(0, n_splines=10) + l(1) + l(2) + l(3) + l(4))"
-        elif scenario["name"] in {"wine_temp_vs_year", "wine_price_vs_temp"}:
-            model = LinearGAM(s(0, n_splines=10))
-            model_spec = "LinearGAM(s(0, n_splines=10))"
-        else:
-            model = LinearGAM(s(0, n_splines=25))
-            model_spec = "LinearGAM(s(0, n_splines=25))"
-
-        fit_start = datetime.now(timezone.utc)
-        lam_grid = np.logspace(-4, 4, 17)
-        model.gridsearch(x_train, y_train, lam=lam_grid, objective="AICc", progress=False)
-        fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
-
-        pred_start = datetime.now(timezone.utc)
-        pred = model.predict(x_test).astype(float)
-        pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
-        pred_train = model.predict(x_train).astype(float)
-        sigma_hat = max(rmse_score(y_train, pred_train), 1e-12)
-
-        cv_rows.append(
-            {
-                "fit_sec": fit_sec,
-                "predict_sec": pred_sec,
-                "logloss": gaussian_log_loss_score(y_test, pred, sigma_hat),
-                "mse": mse_score(y_test, pred),
-                "rmse": rmse_score(y_test, pred),
-                "mae": mae_score(y_test, pred),
-                "r2": r2_score(y_test, pred),
-                "n_test": int(len(fold.test_idx)),
-                "model_spec": model_spec,
-            }
-        )
-
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "python_lifelines" if ds["family"] == "survival" else "python_pygam",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": (
-            f"{cv_rows[0]['model_spec']} [5-fold CV]"
-            if ds["family"] == "survival"
-            else f"{cv_rows[0]['model_spec']} [lam by UBRE/GCV; 5-fold CV]"
-        ),
-    }
-
-
 def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
     if ds is None:
         ds = dataset_for_scenario(scenario)
@@ -6520,23 +6290,6 @@ def _is_contender_enabled(s_cfg, contender: str) -> bool:
     return contender not in excluded
 
 
-def _should_run_pygam_for_scenario(s_cfg, *, ds: dict | None = None):
-    if not _is_contender_enabled(s_cfg, "python_pygam"):
-        return False
-    if ds is None:
-        ds = dataset_for_scenario(s_cfg)
-    # pyGAM has no native censored-likelihood survival model support in this harness.
-    if ds["family"] == "survival":
-        return False
-
-    rust_cfg = _rust_fit_mapping(s_cfg["name"])
-    if rust_cfg is None:
-        return True
-    basis = _canonical_smooth_basis(rust_cfg.get("smooth_basis", "ps"))
-    # pyGAM in this harness does not provide native thin-plate/Duchon/Matérn bases.
-    return basis not in {"thinplate", "duchon", "matern"}
-
-
 def _is_non_blocking_failure(row: dict) -> bool:
     return str(row.get("contender", "")) in NON_BLOCKING_FAILURE_CONTENDERS
 
@@ -6746,8 +6499,6 @@ def main():
             )
             if mgcv_surv_row is not None:
                 results.append(mgcv_surv_row)
-            if _should_run_pygam_for_scenario(s_cfg, ds=ds):
-                results.append(run_external_pygam_cv(s_cfg, ds=ds, folds=folds))
             sksurv_rsf_row = (
                 run_external_sksurv_rsf_cv(s_cfg, ds=ds, folds=folds)
                 if _is_contender_enabled(s_cfg, "python_sksurv_rsf")

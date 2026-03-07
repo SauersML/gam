@@ -62,28 +62,24 @@
       "name": "icu_survival_death",
       "dataset": "icu_survival_death",
       "exclude_contenders": [
-        "python_pygam"
       ]
     },
     {
       "name": "icu_survival_los",
       "dataset": "icu_survival_los",
       "exclude_contenders": [
-        "python_pygam"
       ]
     },
     {
       "name": "heart_failure_survival",
       "dataset": "heart_failure_clinical_records_dataset",
       "exclude_contenders": [
-        "python_pygam"
       ]
     },
     {
       "name": "cirrhosis_survival",
       "dataset": "cirrhosis",
       "exclude_contenders": [
-        "python_pygam"
       ]
     },
     {
@@ -111,7 +107,6 @@
       "n": 4000,
       "seed": 20260226,
       "exclude_contenders": [
-        "python_pygam"
       ]
     },
     {
@@ -199,7 +194,6 @@
       "n": 6000,
       "seed": 20260301,
       "exclude_contenders": [
-        "python_pygam"
       ]
     },
     {
@@ -287,7 +281,6 @@
       "n": 6000,
       "seed": 20260315,
       "exclude_contenders": [
-        "python_pygam"
       ]
     },
     {
@@ -488,7 +481,6 @@
       "prevalence_min": 0.01,
       "prevalence_max": 0.1,
       "exclude_contenders": [
-        "python_pygam"
       ]
     },
     {
@@ -563,7 +555,6 @@
       "prevalence_min": 0.01,
       "prevalence_max": 0.1,
       "exclude_contenders": [
-        "python_pygam"
       ]
     },
     {
@@ -589,7 +580,6 @@
         "r_bamlss",
         "r_brms",
         "r_mgcv_coxph",
-        "python_pygam",
         "python_sksurv_rsf",
         "python_sksurv_coxnet",
         "python_lifelines_coxph_enet",
@@ -614,7 +604,6 @@
         "r_bamlss",
         "r_brms",
         "r_mgcv_coxph",
-        "python_pygam",
         "python_sksurv_rsf",
         "python_sksurv_coxnet",
         "python_lifelines_coxph_enet",
@@ -639,7 +628,6 @@
         "r_bamlss",
         "r_brms",
         "r_mgcv_coxph",
-        "python_pygam",
         "python_sksurv_rsf",
         "python_sksurv_coxnet",
         "python_lifelines_coxph_enet",
@@ -663,7 +651,6 @@
         "r_bamlss",
         "r_brms",
         "r_mgcv_coxph",
-        "python_pygam",
         "python_sksurv_rsf",
         "python_sksurv_coxnet",
         "python_lifelines_coxph_enet",
