@@ -482,8 +482,8 @@ impl SurvivalLocationScaleFamily {
             dq_ls[i] = eta_t[i] * d2q_tls[i];
             d3q_tls_ls[i] = d2s[i] / s2 - 2.0 * ds[i] * ds[i] / s3;
             d2q_ls[i] = eta_t[i] * d3q_tls_ls[i];
-            d3q_ls[i] = eta_t[i]
-                * (d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i].powi(3) / s4);
+            d3q_ls[i] =
+                eta_t[i] * (d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i].powi(3) / s4);
         }
 
         Ok(SurvivalJointQuantities {
@@ -1092,12 +1092,7 @@ fn weighted_crossprod_dense(
     Ok(left.t().dot(&weighted_right))
 }
 
-fn assign_block(
-    target: &mut Array2<f64>,
-    row_start: usize,
-    col_start: usize,
-    block: &Array2<f64>,
-) {
+fn assign_block(target: &mut Array2<f64>, row_start: usize, col_start: usize, block: &Array2<f64>) {
     let row_end = row_start + block.nrows();
     let col_end = col_start + block.ncols();
     target
@@ -1574,29 +1569,16 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             weighted_crossprod_dense(&self.x_time_entry, &(-&q.h_time_h0 * &q.dq_t), &x_threshold)?;
         let h_h1_t =
             weighted_crossprod_dense(&self.x_time_exit, &(-&q.h_time_h1 * &q.dq_t), &x_threshold)?;
-        assign_symmetric_block(
-            &mut joint,
-            offsets[0],
-            offsets[1],
-            &(h_h0_t + h_h1_t),
-        );
+        assign_symmetric_block(&mut joint, offsets[0], offsets[1], &(h_h0_t + h_h1_t));
 
         let h_h0_ls = weighted_crossprod_dense(
             &self.x_time_entry,
             &(-&q.h_time_h0 * &q.dq_ls),
             &x_log_sigma,
         )?;
-        let h_h1_ls = weighted_crossprod_dense(
-            &self.x_time_exit,
-            &(-&q.h_time_h1 * &q.dq_ls),
-            &x_log_sigma,
-        )?;
-        assign_symmetric_block(
-            &mut joint,
-            offsets[0],
-            offsets[2],
-            &(h_h0_ls + h_h1_ls),
-        );
+        let h_h1_ls =
+            weighted_crossprod_dense(&self.x_time_exit, &(-&q.h_time_h1 * &q.dq_ls), &x_log_sigma)?;
+        assign_symmetric_block(&mut joint, offsets[0], offsets[2], &(h_h0_ls + h_h1_ls));
 
         if let (Some(x_w_dense), Some(w_offset)) = (x_w.as_ref(), offsets.get(3).copied()) {
             let h_ww = weighted_crossprod_dense(x_w_dense, &(-&q.d2_q), x_w_dense)?;
@@ -1605,18 +1587,12 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             let h_tw = weighted_crossprod_dense(&x_threshold, &(-&q.d2_q * &q.dq_t), x_w_dense)?;
             assign_symmetric_block(&mut joint, offsets[1], w_offset, &h_tw);
 
-            let h_lw =
-                weighted_crossprod_dense(&x_log_sigma, &(-&q.d2_q * &q.dq_ls), x_w_dense)?;
+            let h_lw = weighted_crossprod_dense(&x_log_sigma, &(-&q.d2_q * &q.dq_ls), x_w_dense)?;
             assign_symmetric_block(&mut joint, offsets[2], w_offset, &h_lw);
 
             let h_h0_w = weighted_crossprod_dense(&self.x_time_entry, &(-&q.h_time_h0), x_w_dense)?;
             let h_h1_w = weighted_crossprod_dense(&self.x_time_exit, &(-&q.h_time_h1), x_w_dense)?;
-            assign_symmetric_block(
-                &mut joint,
-                offsets[0],
-                w_offset,
-                &(h_h0_w + h_h1_w),
-            );
+            assign_symmetric_block(&mut joint, offsets[0], w_offset, &(h_h0_w + h_h1_w));
         }
 
         Ok(Some(joint))
@@ -1710,8 +1686,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         //   D_u H = sum_i [ w^(3) delta_i a_i a_i^T
         //                 + w^(2)(...) + w^(1) C_i[u] ]
         // from the derivation.
-        let d_h_t = -(&d_d2_q * &q.dq_t.mapv(|v| v * v)
-            + &(&q.d2_q * &(2.0 * &delta_q_t * &q.dq_t)));
+        let d_h_t =
+            -(&d_d2_q * &q.dq_t.mapv(|v| v * v) + &(&q.d2_q * &(2.0 * &delta_q_t * &q.dq_t)));
         let d_h_tt = weighted_crossprod_dense(&x_threshold, &d_h_t, &x_threshold)?;
         assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d_h_tt);
 
@@ -1739,12 +1715,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             &(-(&dh_h1 * &q.dq_t + &q.h_time_h1 * &delta_q_t)),
             &x_threshold,
         )?;
-        assign_symmetric_block(
-            &mut joint,
-            offsets[0],
-            offsets[1],
-            &(d_h_h0_t + d_h_h1_t),
-        );
+        assign_symmetric_block(&mut joint, offsets[0], offsets[1], &(d_h_h0_t + d_h_h1_t));
 
         let d_h_h0_l = weighted_crossprod_dense(
             &self.x_time_entry,
@@ -1756,12 +1727,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             &(-(&dh_h1 * &q.dq_ls + &q.h_time_h1 * &delta_q_ls)),
             &x_log_sigma,
         )?;
-        assign_symmetric_block(
-            &mut joint,
-            offsets[0],
-            offsets[2],
-            &(d_h_h0_l + d_h_h1_l),
-        );
+        assign_symmetric_block(&mut joint, offsets[0], offsets[2], &(d_h_h0_l + d_h_h1_l));
 
         if let (Some(x_w_dense), Some(w_offset)) = (x_w.as_ref(), offsets.get(3).copied()) {
             let d_h_tw = weighted_crossprod_dense(
@@ -1778,20 +1744,12 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             )?;
             assign_symmetric_block(&mut joint, offsets[2], w_offset, &d_h_lw);
 
-            let d_h_ww =
-                weighted_crossprod_dense(x_w_dense, &(-&d_d2_q), x_w_dense)?;
+            let d_h_ww = weighted_crossprod_dense(x_w_dense, &(-&d_d2_q), x_w_dense)?;
             assign_symmetric_block(&mut joint, w_offset, w_offset, &d_h_ww);
 
-            let d_h_h0_w =
-                weighted_crossprod_dense(&self.x_time_entry, &(-&dh_h0), x_w_dense)?;
-            let d_h_h1_w =
-                weighted_crossprod_dense(&self.x_time_exit, &(-&dh_h1), x_w_dense)?;
-            assign_symmetric_block(
-                &mut joint,
-                offsets[0],
-                w_offset,
-                &(d_h_h0_w + d_h_h1_w),
-            );
+            let d_h_h0_w = weighted_crossprod_dense(&self.x_time_entry, &(-&dh_h0), x_w_dense)?;
+            let d_h_h1_w = weighted_crossprod_dense(&self.x_time_exit, &(-&dh_h1), x_w_dense)?;
+            assign_symmetric_block(&mut joint, offsets[0], w_offset, &(d_h_h0_w + d_h_h1_w));
         }
 
         Ok(Some(joint))
@@ -3194,10 +3152,9 @@ mod tests {
 
     #[test]
     fn log_sigma_exact_newton_hessian_matches_negative_gradient_jacobian() {
-        let family =
-            survival_exact_newton_test_family_with_inverse_link(
-                residual_distribution_inverse_link(ResidualDistribution::Logistic),
-            );
+        let family = survival_exact_newton_test_family_with_inverse_link(
+            residual_distribution_inverse_link(ResidualDistribution::Logistic),
+        );
         let beta_time = array![0.2];
         let beta_threshold = array![0.35];
         let beta_log_sigma = array![-0.15];
@@ -3453,14 +3410,19 @@ mod tests {
             )) / (2.0 * eps);
 
             if label == "cloglog-near-fit" {
-                let fp = objective(&array![beta_time[0] + eps], &beta_threshold, &beta_log_sigma);
-                let fm = objective(&array![beta_time[0] - eps], &beta_threshold, &beta_log_sigma);
+                let fp = objective(
+                    &array![beta_time[0] + eps],
+                    &beta_threshold,
+                    &beta_log_sigma,
+                );
+                let fm = objective(
+                    &array![beta_time[0] - eps],
+                    &beta_threshold,
+                    &beta_log_sigma,
+                );
                 eprintln!(
                     "cloglog near-fit full objective fp={} fm={} fd0={} analytic0={}",
-                    fp,
-                    fm,
-                    fd[0],
-                    analytic[0]
+                    fp, fm, fd[0], analytic[0]
                 );
             }
 
@@ -3652,8 +3614,11 @@ mod tests {
             let beta_time_plus = array![beta_time[0] + eps * direction[0]];
             let beta_threshold_plus = array![beta_threshold[0] + eps * direction[1]];
             let beta_log_sigma_plus = array![beta_log_sigma[0] + eps * direction[2]];
-            let plus_states =
-                survival_exact_newton_rebuild_states(&beta_time_plus, &beta_threshold_plus, &beta_log_sigma_plus);
+            let plus_states = survival_exact_newton_rebuild_states(
+                &beta_time_plus,
+                &beta_threshold_plus,
+                &beta_log_sigma_plus,
+            );
             let h_plus = family
                 .exact_newton_joint_hessian(&plus_states)
                 .expect("joint H plus")
@@ -3700,14 +3665,9 @@ mod tests {
             .expect("center outer objective/gradient");
             assert!(center.objective.is_finite());
             assert_eq!(center.gradient.len(), rho.len());
-            let debug_terms = debug_exact_newton_rho_gradient_terms(
-                &family,
-                &specs,
-                &options,
-                &rho,
-                None,
-            )
-            .expect("debug exact rho terms");
+            let debug_terms =
+                debug_exact_newton_rho_gradient_terms(&family, &specs, &options, &rho, None)
+                    .expect("debug exact rho terms");
 
             for k in 0..rho.len() {
                 let mut rho_p = rho.clone();
@@ -3796,7 +3756,6 @@ mod tests {
             }
         }
     }
-
 
     #[test]
     fn posterior_mean_prediction_matches_deterministic_when_covariance_is_zero() {
@@ -4282,10 +4241,7 @@ mod tests {
             ],
             11,
             |x| {
-                let sigma =
-                    exp_sigma_derivs_up_to_third_scalar(x[2])
-                        .0
-                        .max(1e-12);
+                let sigma = exp_sigma_derivs_up_to_third_scalar(x[2]).0.max(1e-12);
                 (1.0 - normal_cdf(-x[0] - x[1] / sigma + x[3])).clamp(0.0, 1.0)
             },
         );

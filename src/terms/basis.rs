@@ -1844,7 +1844,6 @@ pub struct DuchonBasisSpec {
     /// Integer spectral power `s`.
     pub power: usize,
     pub nullspace_order: DuchonNullspaceOrder,
-    pub double_penalty: bool,
     #[serde(default)]
     pub identifiability: SpatialIdentifiability,
 }
@@ -4387,6 +4386,8 @@ fn build_matern_double_penalty_candidates(
     Ok(candidates)
 }
 
+#[cfg(test)]
+#[cfg(test)]
 fn build_duchon_operator_penalty_candidates(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
@@ -5460,10 +5461,13 @@ struct PsiTriplet {
     psi_psi: f64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 struct DuchonRadialCore {
     phi: PsiTriplet,
+    #[cfg(test)]
     gradient_ratio: PsiTriplet,
+    #[cfg(test)]
     laplacian: PsiTriplet,
 }
 
@@ -5611,21 +5615,22 @@ fn duchon_radial_core_psi_triplet(
     let phi_psi_psi =
         delta * delta * phi + (2.0 * delta + 1.0) * r * jets.phi_r + r * r * jets.phi_rr;
     if r > 1e-10 {
-        let g = jets.q;
-        let lap = jets.lap;
         let phi_r = jets.phi_r;
-        let phi_rr = jets.phi_rr;
         // Full-kernel scaling identity for q = phi_r / r:
         //   q_psi = (delta + 2) q + r q_r.
         // Since q_r = (phi_rr - q) / r, this is exactly equivalent to
         //   q_psi = (delta + 1) q + phi_rr,
         // which is the form used here because phi_rr is already available from
         // ell = Δphi = phi_rr + (d-1) q.
-        let g_psi = (delta + 1.0) * g + phi_rr;
+        #[cfg(test)]
+        let g_psi = (delta + 1.0) * jets.q + jets.phi_rr;
+        #[cfg(test)]
         let g_psi_psi = (delta + 2.0) * (delta + 2.0) * jets.q
             + (2.0 * delta + 5.0) * r * jets.q_r
             + r * r * jets.q_rr;
+        #[cfg(test)]
         let lap_psi = (delta + 2.0) * jets.lap + r * jets.lap_r;
+        #[cfg(test)]
         let lap_psi_psi = (delta + 2.0) * (delta + 2.0) * jets.lap
             + (2.0 * delta + 5.0) * r * jets.lap_r
             + r * r * jets.lap_rr;
@@ -5638,11 +5643,13 @@ fn duchon_radial_core_psi_triplet(
                 psi: phi_psi,
                 psi_psi: phi_psi_psi,
             },
+            #[cfg(test)]
             gradient_ratio: PsiTriplet {
                 value: g,
                 psi: g_psi,
                 psi_psi: g_psi_psi,
             },
+            #[cfg(test)]
             laplacian: PsiTriplet {
                 value: lap,
                 psi: lap_psi,
@@ -5653,15 +5660,20 @@ fn duchon_radial_core_psi_triplet(
 
     // Continuous center-collision extension for the scalar operator core:
     //   phi(0; kappa),  g(0; kappa) = 0,  L(0; kappa) = d * phi_rr(0; kappa).
+    #[cfg(test)]
     let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
         duchon_phi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
+    #[cfg(not(test))]
+    let _ = duchon_phi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
     Ok(DuchonRadialCore {
         phi: PsiTriplet {
             value: phi,
             psi: phi_psi,
             psi_psi: phi_psi_psi,
         },
+        #[cfg(test)]
         gradient_ratio: PsiTriplet::default(),
+        #[cfg(test)]
         laplacian: PsiTriplet {
             value: k_dim as f64 * phi_rr,
             psi: k_dim as f64 * phi_rr_psi,
@@ -5852,7 +5864,8 @@ fn build_duchon_primary_penalty_with_psi_derivatives(
     let mut s = Array2::<f64>::zeros((total_cols, total_cols));
     let mut s_psi = Array2::<f64>::zeros((total_cols, total_cols));
     let mut s_psi_psi = Array2::<f64>::zeros((total_cols, total_cols));
-    s.slice_mut(s![0..kernel_cols, 0..kernel_cols]).assign(&kernel);
+    s.slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&kernel);
     s_psi
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&kernel_psi);
@@ -5874,6 +5887,8 @@ fn build_duchon_primary_penalty_with_psi_derivatives(
     Ok((s_norm, s_norm_psi, s_norm_psi_psi, c))
 }
 
+#[cfg(test)]
+#[cfg(test)]
 fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
     centers: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -6067,8 +6082,11 @@ pub fn build_duchon_basis_log_kappa_derivative_with_workspace(
         identifiability_transform,
         workspace,
     )?;
-    let penalties_derivative =
-        active_primary_double_penalty_derivatives(&base.penalty_info, &primary_derivative, "Duchon")?;
+    let penalties_derivative = active_primary_double_penalty_derivatives(
+        &base.penalty_info,
+        &primary_derivative,
+        "Duchon",
+    )?;
     Ok(BasisPsiDerivativeResult {
         design_derivative,
         penalties_derivative,
@@ -6361,14 +6379,12 @@ pub fn build_duchon_basis_with_workspace(
         source: PenaltySource::Primary,
         normalization_scale: 1.0,
     }];
-    if spec.double_penalty {
-        candidates.push(PenaltyCandidate {
-            matrix: d.penalty_ridge.clone(),
-            nullspace_dim_hint: 0,
-            source: PenaltySource::DoublePenaltyNullspace,
-            normalization_scale: 1.0,
-        });
-    }
+    candidates.push(PenaltyCandidate {
+        matrix: d.penalty_ridge.clone(),
+        nullspace_dim_hint: 0,
+        source: PenaltySource::DoublePenaltyNullspace,
+        normalization_scale: 1.0,
+    });
     if let Some(z) = identifiability_transform.as_ref() {
         candidates = candidates
             .into_iter()
@@ -7169,6 +7185,8 @@ pub(crate) mod internal {
         if min_val == max_val && num_internal_knots > 0 {
             return Err(BasisError::DegenerateRange(num_internal_knots));
         }
+        let scale = (max_val - min_val).abs().max(1.0);
+        let tol = 1e-12 * scale;
 
         let total_knots = num_internal_knots + 2 * (degree + 1);
         let mut knots = Vec::with_capacity(total_knots);
@@ -7177,7 +7195,26 @@ pub(crate) mod internal {
         }
 
         if num_internal_knots > 0 {
-            let n = sorted.len();
+            let mut support = Vec::with_capacity(sorted.len());
+            let mut last: Option<f64> = None;
+            for &x in &sorted {
+                if x <= min_val + tol || x >= max_val - tol {
+                    continue;
+                }
+                if last.map(|prev| (x - prev).abs() <= tol).unwrap_or(false) {
+                    continue;
+                }
+                support.push(x);
+                last = Some(x);
+            }
+            if support.is_empty() {
+                return Err(BasisError::InvalidInput(format!(
+                    "quantile knot placement requires distinct interior support between {:.6e} and {:.6e}",
+                    min_val, max_val
+                )));
+            }
+            let n = support.len();
+            let mut prev_q = min_val;
             for j in 1..=num_internal_knots {
                 let p = j as f64 / (num_internal_knots + 1) as f64;
                 let pos = p * (n.saturating_sub(1) as f64);
@@ -7185,11 +7222,20 @@ pub(crate) mod internal {
                 let hi = pos.ceil() as usize;
                 let frac = pos - lo as f64;
                 let q = if lo == hi {
-                    sorted[lo]
+                    support[lo]
                 } else {
-                    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+                    support[lo] * (1.0 - frac) + support[hi] * frac
                 };
-                knots.push(q.clamp(min_val, max_val));
+                let q = q.clamp(min_val, max_val);
+                if q <= prev_q + tol || q >= max_val - tol {
+                    return Err(BasisError::InvalidInput(format!(
+                        "quantile knot placement produced a non-interior knot at index {}: {:.6e}",
+                        j - 1,
+                        q
+                    )));
+                }
+                knots.push(q);
+                prev_q = q;
             }
         }
 
@@ -9007,6 +9053,36 @@ mod tests {
     }
 
     #[test]
+    fn test_quantile_knot_generation_excludes_boundary_point_masses() {
+        let mut x = vec![1e-9; 16];
+        x.extend([4.0, 7.0, 10.0, 20.0, 40.0, 80.0, 160.0, 285.0]);
+        let x = Array1::from_vec(x).mapv(f64::ln);
+        let knots = internal::generate_full_knot_vector_quantile(x.view(), 6, 3)
+            .expect("quantile knots should be inferred from strict interior support");
+
+        let lower = knots[0];
+        let upper = knots[knots.len() - 1];
+        for &k in knots.iter().skip(4).take(6) {
+            assert!(
+                k > lower,
+                "internal knot should be strictly above lower boundary"
+            );
+            assert!(
+                k < upper,
+                "internal knot should be strictly below upper boundary"
+            );
+        }
+
+        let g = compute_greville_abscissae(&knots, 3).expect("Greville abscissae should be valid");
+        for i in 1..g.len() {
+            assert!(
+                g[i] > g[i - 1],
+                "Greville abscissae must be strictly increasing to support divided differences"
+            );
+        }
+    }
+
+    #[test]
     fn test_bspline_identifiability_default_weighted_sum_to_zero() {
         let x = Array::linspace(0.0, 1.0, 40);
         let spec = BSplineBasisSpec {
@@ -10460,7 +10536,6 @@ mod tests {
             length_scale: Some(1.0),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
-            double_penalty: false,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
@@ -10488,7 +10563,6 @@ mod tests {
             length_scale: Some(1.0),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
-            double_penalty: false,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
@@ -10529,7 +10603,6 @@ mod tests {
             length_scale: None,
             power: 1,
             nullspace_order: DuchonNullspaceOrder::Zero,
-            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
@@ -10539,21 +10612,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_duchon_basis_double_penalty_adds_nullspace_shrinkage_block() {
-        let data = array![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-            [0.5, 0.5]
-        ];
+    fn test_build_duchon_basis_always_adds_nullspace_shrinkage_block() {
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: Some(1.0),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
-            double_penalty: true,
-            identifiability: SpatialIdentifiability::OrthogonalToParametric,
+            identifiability: SpatialIdentifiability::None,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penalty_info.len(), 2);
@@ -10856,29 +10922,19 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.9),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
-            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
         };
         let mut workspace = BasisWorkspace::default();
-        let (design_derivative, _) = build_duchon_design_psi_derivatives_with_workspace(
+        let derivative = build_duchon_basis_log_kappa_derivative_with_workspace(
             data.view(),
             &spec,
-            None,
             &mut workspace,
         )
-        .expect("analytic Duchon design derivative should build");
-        let (penalties_derivative, _) =
-            build_duchon_operator_penalty_psi_derivatives_with_workspace(
-                centers.view(),
-                &spec,
-                None,
-                &mut workspace,
-            )
-            .expect("analytic Duchon penalty derivative should build");
+        .expect("analytic Duchon derivative should build");
 
         let eps: f64 = 1e-6;
         let kappa = 1.0 / spec.length_scale.expect("hybrid Duchon length_scale");
@@ -10890,25 +10946,8 @@ mod tests {
         spec_minus.length_scale = Some(ls_minus);
         let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
-        let plus_penalties = build_duchon_operator_penalty_candidates(
-            centers.view(),
-            Some(ls_plus),
-            spec.power,
-            spec.nullspace_order,
-            None,
-        )
-        .expect("plus operator penalties");
-        let minus_penalties = build_duchon_operator_penalty_candidates(
-            centers.view(),
-            Some(ls_minus),
-            spec.power,
-            spec.nullspace_order,
-            None,
-        )
-        .expect("minus operator penalties");
-
         let fd_design = (&plus.design - &minus.design) / (2.0 * eps);
-        let design_err = (&design_derivative - &fd_design)
+        let design_err = (&derivative.design_derivative - &fd_design)
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
@@ -10918,21 +10957,23 @@ mod tests {
             "Duchon design derivative mismatch too large: {design_err}"
         );
 
-        assert_eq!(penalties_derivative.len(), 3);
-        assert_eq!(plus_penalties.len(), 3);
-        assert_eq!(minus_penalties.len(), 3);
-        for penalty_idx in 0..penalties_derivative.len() {
-            let fd_penalty = (&plus_penalties[penalty_idx].matrix
-                - &minus_penalties[penalty_idx].matrix)
-                / (2.0 * eps);
-            let penalty_err = (&penalties_derivative[penalty_idx] - &fd_penalty)
-                .iter()
-                .map(|v| v * v)
-                .sum::<f64>()
-                .sqrt();
+        assert_eq!(derivative.penalties_derivative.len(), plus.penalties.len());
+        let fd_primary_penalty = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
+        let primary_penalty_err = (&derivative.penalties_derivative[0] - &fd_primary_penalty)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            primary_penalty_err < 1e-4,
+            "Duchon primary penalty derivative mismatch too large: {primary_penalty_err}"
+        );
+        if derivative.penalties_derivative.len() > 1 {
             assert!(
-                penalty_err < 1e-4,
-                "Duchon penalty derivative mismatch too large for block {penalty_idx}: {penalty_err}"
+                derivative.penalties_derivative[1]
+                    .iter()
+                    .all(|v| v.abs() < 1e-12),
+                "nullspace shrinkage derivative should be zero"
             );
         }
     }
@@ -10942,29 +10983,19 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.9),
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Linear,
-            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
         };
         let mut workspace = BasisWorkspace::default();
-        let (_, design_second_derivative) = build_duchon_design_psi_derivatives_with_workspace(
+        let second_derivative = build_duchon_basis_log_kappa_second_derivative_with_workspace(
             data.view(),
             &spec,
-            None,
             &mut workspace,
         )
-        .expect("analytic Duchon design second derivative should build");
-        let (_, penalties_second_derivative) =
-            build_duchon_operator_penalty_psi_derivatives_with_workspace(
-                centers.view(),
-                &spec,
-                None,
-                &mut workspace,
-            )
-            .expect("analytic Duchon penalty second derivative should build");
+        .expect("analytic Duchon second derivative should build");
         let base = build_duchon_basis(data.view(), &spec).expect("base build");
 
         let eps: f64 = 2e-5;
@@ -10977,33 +11008,8 @@ mod tests {
         spec_minus.length_scale = Some(ls_minus);
         let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
         let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
-        let base_penalties = build_duchon_operator_penalty_candidates(
-            centers.view(),
-            spec.length_scale,
-            spec.power,
-            spec.nullspace_order,
-            None,
-        )
-        .expect("base operator penalties");
-        let plus_penalties = build_duchon_operator_penalty_candidates(
-            centers.view(),
-            Some(ls_plus),
-            spec.power,
-            spec.nullspace_order,
-            None,
-        )
-        .expect("plus operator penalties");
-        let minus_penalties = build_duchon_operator_penalty_candidates(
-            centers.view(),
-            Some(ls_minus),
-            spec.power,
-            spec.nullspace_order,
-            None,
-        )
-        .expect("minus operator penalties");
-
         let fd_design = (&plus.design - &(base.design.clone() * 2.0) + &minus.design) / (eps * eps);
-        let design_err = (&design_second_derivative - &fd_design)
+        let design_err = (&second_derivative.design_second_derivative - &fd_design)
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
@@ -11013,23 +11019,29 @@ mod tests {
             "Duchon design second derivative mismatch too large: {design_err}"
         );
 
-        assert_eq!(penalties_second_derivative.len(), 3);
-        assert_eq!(base_penalties.len(), 3);
-        assert_eq!(plus_penalties.len(), 3);
-        assert_eq!(minus_penalties.len(), 3);
-        for penalty_idx in 0..penalties_second_derivative.len() {
-            let fd_penalty = (&plus_penalties[penalty_idx].matrix
-                - &(base_penalties[penalty_idx].matrix.clone() * 2.0)
-                + &minus_penalties[penalty_idx].matrix)
-                / (eps * eps);
-            let penalty_err = (&penalties_second_derivative[penalty_idx] - &fd_penalty)
-                .iter()
-                .map(|v| v * v)
-                .sum::<f64>()
-                .sqrt();
+        assert_eq!(
+            second_derivative.penalties_second_derivative.len(),
+            base.penalties.len()
+        );
+        let fd_primary_penalty = (&plus.penalties[0] - &(base.penalties[0].clone() * 2.0)
+            + &minus.penalties[0])
+            / (eps * eps);
+        let primary_penalty_err = (&second_derivative.penalties_second_derivative[0]
+            - &fd_primary_penalty)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            primary_penalty_err < 5e-3,
+            "Duchon primary penalty second derivative mismatch too large: {primary_penalty_err}"
+        );
+        if second_derivative.penalties_second_derivative.len() > 1 {
             assert!(
-                penalty_err < 5e-3,
-                "Duchon penalty second derivative mismatch too large for block {penalty_idx}: {penalty_err}"
+                second_derivative.penalties_second_derivative[1]
+                    .iter()
+                    .all(|v| v.abs() < 1e-12),
+                "nullspace shrinkage second derivative should be zero"
             );
         }
     }
@@ -11274,13 +11286,12 @@ mod tests {
             length_scale: None,
             power: 2,
             nullspace_order: DuchonNullspaceOrder::Zero,
-            double_penalty: false,
             identifiability: SpatialIdentifiability::None,
         };
         let out =
             build_duchon_basis(data.view(), &spec).expect("pure Duchon default tuple should build");
         assert!(out.design.iter().all(|v| v.is_finite()));
-        assert_eq!(out.penalties.len(), 3);
+        assert_eq!(out.penalties.len(), 1);
         assert!(
             out.penalties
                 .iter()

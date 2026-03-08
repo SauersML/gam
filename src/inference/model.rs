@@ -307,6 +307,7 @@ impl FittedModel {
                 Self::Standard { payload }
             }
         }
+        .with_synchronized_stateful_link_metadata()
     }
 
     #[inline]
@@ -324,6 +325,55 @@ impl FittedModel {
             Self::Standard { payload }
             | Self::LocationScale { payload }
             | Self::Survival { payload } => payload,
+        }
+    }
+
+    fn with_synchronized_stateful_link_metadata(mut self) -> Self {
+        self.synchronize_stateful_link_metadata();
+        self
+    }
+
+    fn synchronize_stateful_link_metadata(&mut self) {
+        let payload = self.payload_mut();
+        let Some(fit) = payload.fit_result.as_ref() else {
+            return;
+        };
+        match (&mut payload.family_state, &fit.fitted_link_parameters) {
+            (
+                FittedFamily::Standard {
+                    likelihood: LikelihoodFamily::BinomialSas,
+                    sas_state,
+                    ..
+                },
+                FittedLinkParameters::Sas { state, covariance },
+            ) => {
+                *sas_state = Some(*state);
+                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
+            }
+            (
+                FittedFamily::Standard {
+                    likelihood: LikelihoodFamily::BinomialBetaLogistic,
+                    sas_state,
+                    ..
+                },
+                FittedLinkParameters::BetaLogistic { state, covariance },
+            ) => {
+                *sas_state = Some(*state);
+                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
+            }
+            (
+                FittedFamily::Standard {
+                    likelihood: LikelihoodFamily::BinomialMixture,
+                    mixture_state,
+                    ..
+                },
+                FittedLinkParameters::Mixture { state, covariance },
+            ) => {
+                *mixture_state = Some(state.clone());
+                payload.mixture_link_param_covariance =
+                    covariance.as_ref().map(array2_to_nested_vec);
+            }
+            _ => {}
         }
     }
 
@@ -484,15 +534,17 @@ impl FittedModel {
             .map_err(|e| format!("failed to read model '{}': {e}", path.display()))?;
         let model: Self = serde_json::from_str(&payload)
             .map_err(|e| format!("failed to parse model json: {e}"))?;
+        let model = model.with_synchronized_stateful_link_metadata();
         model.validate_for_persistence()?;
         model.validate_numeric_finiteness()?;
         Ok(model)
     }
 
     pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
-        self.validate_for_persistence()?;
-        self.validate_numeric_finiteness()?;
-        let payload = serde_json::to_string_pretty(self)
+        let normalized = self.clone().with_synchronized_stateful_link_metadata();
+        normalized.validate_for_persistence()?;
+        normalized.validate_numeric_finiteness()?;
+        let payload = serde_json::to_string_pretty(&normalized)
             .map_err(|e| format!("failed to serialize model: {e}"))?;
         fs::write(path, payload)
             .map_err(|e| format!("failed to write model '{}': {e}", path.display()))?;
@@ -738,6 +790,10 @@ impl FittedModel {
         }
         Ok(())
     }
+}
+
+fn array2_to_nested_vec(a: &ndarray::Array2<f64>) -> Vec<Vec<f64>> {
+    a.rows().into_iter().map(|row| row.to_vec()).collect()
 }
 
 fn ensure_finite_scalar(name: &str, value: f64) -> Result<(), String> {

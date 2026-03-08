@@ -1474,7 +1474,11 @@ fn run_predict_survival(
             .slice_mut(s![.., time_build.x_exit_time.ncols()..])
             .assign(&cov_design.design);
         let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
-            apply_scale_deviation_transform(&survival_primary_design, &cov_design.design, transform)?
+            apply_scale_deviation_transform(
+                &survival_primary_design,
+                &cov_design.design,
+                transform,
+            )?
         } else {
             cov_design.design.clone()
         };
@@ -6852,7 +6856,6 @@ fn build_smooth_basis(
                     length_scale: option_f64(options, "length_scale"),
                     power,
                     nullspace_order,
-                    double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                 },
             })
@@ -8731,7 +8734,6 @@ mod tests {
                             length_scale: Some(1.0),
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
-                            double_penalty: true,
                             identifiability: SpatialIdentifiability::default(),
                         },
                     },
@@ -8746,7 +8748,6 @@ mod tests {
                             length_scale: Some(1.0),
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
-                            double_penalty: true,
                             identifiability: SpatialIdentifiability::default(),
                         },
                     },
@@ -8761,7 +8762,6 @@ mod tests {
                             length_scale: Some(1.0),
                             power: 1,
                             nullspace_order: DuchonNullspaceOrder::Linear,
-                            double_penalty: true,
                             identifiability: SpatialIdentifiability::default(),
                         },
                     },
@@ -8874,7 +8874,6 @@ mod tests {
                         length_scale: Some(1.0),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
-                        double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
                 },
@@ -9600,6 +9599,36 @@ mod tests {
 
         assert_eq!(built.basis_name, "ispline");
         assert!(built.knots.as_ref().is_some_and(|k| !k.is_empty()));
+        assert!(built.x_exit_time.ncols() > 0);
+        assert!(built.x_derivative_time.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn bspline_time_basis_inference_uses_unique_support_for_origin_entries() {
+        let age_entry = Array1::from_vec(vec![1e-9; 8]);
+        let age_exit = Array1::from_vec(vec![4.0, 7.0, 10.0, 20.0, 40.0, 80.0, 160.0, 285.0]);
+        let built = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::BSpline {
+                degree: 3,
+                knots: Array1::zeros(0),
+                smooth_lambda: 1e-2,
+            },
+            Some((6, 1e-6)),
+        )
+        .expect("build bspline time basis with repeated origin entries");
+
+        let knots = built
+            .knots
+            .as_ref()
+            .expect("bspline time basis should retain inferred knots");
+        let lower_boundary = knots[0];
+        let upper_boundary = knots[knots.len() - 1];
+        for &k in &knots[4..(knots.len() - 4)] {
+            assert!(k > lower_boundary);
+            assert!(k < upper_boundary);
+        }
         assert!(built.x_exit_time.ncols() > 0);
         assert!(built.x_derivative_time.iter().all(|v| v.is_finite()));
     }

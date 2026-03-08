@@ -55,6 +55,8 @@ bench/plots/
 
 # local scratch / profiling outputs
 tmp/
+tmp_cont_cv*/
+tmp_continuous_order_repro/
 diff.txt
 .tmp_run53_artifacts/
 bench/figures.zip

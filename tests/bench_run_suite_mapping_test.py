@@ -1,5 +1,8 @@
 import importlib.util
+import json
+import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -38,6 +41,67 @@ class RunSuiteMappingTests(unittest.TestCase):
             self.assertEqual(cfg["smooth_basis"], "thinplate")
             self.assertEqual(cfg["smooth_cols"], ["pc1", "pc2", "pc3"])
             self.assertEqual(cfg["knots"], 12)
+
+    def test_thread3_adaptive_reml_uses_current_boolean_cli(self) -> None:
+        seen = []
+        orig_run = _RUN_SUITE.run_rust_scenario_cv
+        orig_parse_args = _RUN_SUITE.argparse.ArgumentParser.parse_args
+        orig_dataset = _RUN_SUITE.dataset_for_scenario
+        orig_folds = _RUN_SUITE.folds_for_dataset
+        orig_assert_parity = _RUN_SUITE._assert_basis_parity_for_scenario
+        orig_shared = _RUN_SUITE.build_shared_fold_artifacts
+        orig_enabled = _RUN_SUITE._is_contender_enabled
+        orig_figures = _RUN_SUITE.generate_scenario_figures
+        orig_zip = _RUN_SUITE.zip_figure_dir
+        try:
+            def _fake_run_rust_scenario_cv(*args, **kwargs):
+                if kwargs.get("contender_name") == "rust_thread3_adaptive_reml":
+                    seen.append(list(kwargs.get("rust_fit_extra_args") or []))
+                return {
+                    "status": "ok",
+                    "scenario_name": "thread3_admixture_cliff",
+                    "contender": kwargs.get("contender_name", "rust_gam"),
+                    "model_spec": "5-fold CV",
+                }
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                scenario_path = td_path / "scenarios.json"
+                out_path = td_path / "results.json"
+                scenario_path.write_text(json.dumps({"scenarios": [{"name": "thread3_admixture_cliff"}]}))
+
+                _RUN_SUITE.run_rust_scenario_cv = _fake_run_rust_scenario_cv
+                _RUN_SUITE.argparse.ArgumentParser.parse_args = lambda _self: SimpleNamespace(
+                    scenarios=scenario_path,
+                    out=out_path,
+                    scenario_names=None,
+                )
+                _RUN_SUITE.dataset_for_scenario = lambda _scenario: {
+                    "rows": [{"y": 0.0}],
+                    "features": ["pc1"],
+                    "target": "y",
+                    "family": "binomial",
+                }
+                _RUN_SUITE.folds_for_dataset = lambda _ds: []
+                _RUN_SUITE._assert_basis_parity_for_scenario = lambda *args, **kwargs: None
+                _RUN_SUITE.build_shared_fold_artifacts = lambda *args, **kwargs: []
+                _RUN_SUITE._is_contender_enabled = lambda *_args, **_kwargs: False
+                _RUN_SUITE.generate_scenario_figures = lambda *_args, **_kwargs: []
+                _RUN_SUITE.zip_figure_dir = lambda *_args, **_kwargs: None
+                _RUN_SUITE.main()
+        finally:
+            _RUN_SUITE.run_rust_scenario_cv = orig_run
+            _RUN_SUITE.argparse.ArgumentParser.parse_args = orig_parse_args
+            _RUN_SUITE.dataset_for_scenario = orig_dataset
+            _RUN_SUITE.folds_for_dataset = orig_folds
+            _RUN_SUITE._assert_basis_parity_for_scenario = orig_assert_parity
+            _RUN_SUITE.build_shared_fold_artifacts = orig_shared
+            _RUN_SUITE._is_contender_enabled = orig_enabled
+            _RUN_SUITE.generate_scenario_figures = orig_figures
+            _RUN_SUITE.zip_figure_dir = orig_zip
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0], ["--adaptive-regularization", "true"])
 
 
 if __name__ == "__main__":
