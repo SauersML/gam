@@ -301,6 +301,24 @@ struct SurvivalRowDerivatives {
     d_h_d: f64,
 }
 
+struct SurvivalJointQuantities {
+    d1_q: Array1<f64>,
+    d2_q: Array1<f64>,
+    d3_q: Array1<f64>,
+    h_time_h0: Array1<f64>,
+    h_time_h1: Array1<f64>,
+    h_time_d: Array1<f64>,
+    d_h_h0: Array1<f64>,
+    d_h_h1: Array1<f64>,
+    d_h_d: Array1<f64>,
+    dq_t: Array1<f64>,
+    dq_ls: Array1<f64>,
+    d2q_tls: Array1<f64>,
+    d2q_ls: Array1<f64>,
+    d3q_tls_ls: Array1<f64>,
+    d3q_ls: Array1<f64>,
+}
+
 impl SurvivalLocationScaleFamily {
     const BLOCK_TIME: usize = 0;
     const BLOCK_THRESHOLD: usize = 1;
@@ -310,6 +328,174 @@ impl SurvivalLocationScaleFamily {
     #[inline]
     fn expected_blocks(&self) -> usize {
         if self.x_link_wiggle.is_some() { 4 } else { 3 }
+    }
+
+    #[inline]
+    fn joint_block_dims(&self) -> Vec<usize> {
+        let mut dims = vec![
+            self.x_time_entry.ncols(),
+            self.x_threshold.ncols(),
+            self.x_log_sigma.ncols(),
+        ];
+        if let Some(x_w) = self.x_link_wiggle.as_ref() {
+            dims.push(x_w.ncols());
+        }
+        dims
+    }
+
+    #[inline]
+    fn joint_block_offsets(&self) -> Vec<usize> {
+        let dims = self.joint_block_dims();
+        let mut offsets = Vec::with_capacity(dims.len() + 1);
+        offsets.push(0);
+        let mut acc = 0usize;
+        for dim in dims {
+            acc += dim;
+            offsets.push(acc);
+        }
+        offsets
+    }
+
+    fn validate_joint_states<'a>(
+        &self,
+        block_states: &'a [ParameterBlockState],
+    ) -> Result<
+        (
+            ndarray::ArrayView1<'a, f64>,
+            ndarray::ArrayView1<'a, f64>,
+            ndarray::ArrayView1<'a, f64>,
+            &'a Array1<f64>,
+            &'a Array1<f64>,
+            Option<&'a Array1<f64>>,
+        ),
+        String,
+    > {
+        if block_states.len() != self.expected_blocks() {
+            return Err(format!(
+                "SurvivalLocationScaleFamily expects {} blocks, got {}",
+                self.expected_blocks(),
+                block_states.len()
+            ));
+        }
+        let n = self.n;
+        let eta_time = &block_states[Self::BLOCK_TIME].eta;
+        let eta_t = &block_states[Self::BLOCK_THRESHOLD].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let eta_w = self
+            .x_link_wiggle
+            .as_ref()
+            .map(|_| &block_states[Self::BLOCK_LINK_WIGGLE].eta);
+        if eta_time.len() != 3 * n || eta_t.len() != n || eta_ls.len() != n {
+            return Err("survival probit-location-scale eta dimension mismatch".to_string());
+        }
+        if let Some(w) = eta_w
+            && w.len() != n
+        {
+            return Err("survival probit-location-scale wiggle eta dimension mismatch".to_string());
+        }
+        Ok((
+            eta_time.slice(s![0..n]),
+            eta_time.slice(s![n..2 * n]),
+            eta_time.slice(s![2 * n..3 * n]),
+            eta_t,
+            eta_ls,
+            eta_w,
+        ))
+    }
+
+    fn collect_joint_quantities(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<SurvivalJointQuantities, String> {
+        let n = self.n;
+        let (h0, h1, d_raw, eta_t, eta_ls, eta_w) = self.validate_joint_states(block_states)?;
+        let (sigma, ds, d2s, d3s) =
+            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let mut d1_q = Array1::<f64>::zeros(n);
+        let mut d2_q = Array1::<f64>::zeros(n);
+        let mut d3_q = Array1::<f64>::zeros(n);
+        let mut h_time_h0 = Array1::<f64>::zeros(n);
+        let mut h_time_h1 = Array1::<f64>::zeros(n);
+        let mut h_time_d = Array1::<f64>::zeros(n);
+        let mut d_h_h0 = Array1::<f64>::zeros(n);
+        let mut d_h_h1 = Array1::<f64>::zeros(n);
+        let mut d_h_d = Array1::<f64>::zeros(n);
+
+        for i in 0..n {
+            let state = self.row_predictor_state(
+                h0[i],
+                h1[i],
+                d_raw[i],
+                eta_t[i],
+                sigma[i],
+                eta_w.map(|w| w[i]),
+            );
+            let Some(row) = self.row_derivatives(i, state)? else {
+                continue;
+            };
+            d1_q[i] = row.d1_q;
+            d2_q[i] = row.d2_q;
+            d3_q[i] = row.d3_q;
+            h_time_h0[i] = row.h_time_h0;
+            h_time_h1[i] = row.h_time_h1;
+            h_time_d[i] = row.h_time_d;
+            d_h_h0[i] = row.d_h_h0;
+            d_h_h1[i] = row.d_h_h1;
+            d_h_d[i] = row.d_h_d;
+        }
+
+        // q(eta_t, eta_ls, eta_w) = -eta_t / sigma(eta_ls) + eta_w.
+        //
+        // The exact derivatives used in the joint Hessian and D_u H are:
+        //
+        //   q_t      = -1 / sigma
+        //   q_ls     = eta_t * sigma' / sigma^2
+        //   q_t,ls   = sigma' / sigma^2
+        //   q_ls,ls  = eta_t * (sigma''/sigma^2 - 2 sigma'^2/sigma^3)
+        //   q_t,ls,ls= sigma''/sigma^2 - 2 sigma'^2/sigma^3
+        //   q_ls,ls,ls
+        //            = eta_t * (sigma'''/sigma^2 - 6 sigma' sigma''/sigma^3
+        //                        + 6 sigma'^3/sigma^4).
+        //
+        // These are the scalar q_{i,b}, q_{i,bc}, q_{i,bcd} objects from the
+        // derivation, specialized to the threshold / scale / wiggle blocks.
+        let mut dq_t = Array1::<f64>::zeros(n);
+        let mut dq_ls = Array1::<f64>::zeros(n);
+        let mut d2q_tls = Array1::<f64>::zeros(n);
+        let mut d2q_ls = Array1::<f64>::zeros(n);
+        let mut d3q_tls_ls = Array1::<f64>::zeros(n);
+        let mut d3q_ls = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let s = sigma[i].max(1e-12);
+            let s2 = (s * s).max(1e-12);
+            let s3 = (s2 * s).max(1e-12);
+            let s4 = (s3 * s).max(1e-12);
+            dq_t[i] = -1.0 / s;
+            d2q_tls[i] = ds[i] / s2;
+            dq_ls[i] = eta_t[i] * d2q_tls[i];
+            d3q_tls_ls[i] = d2s[i] / s2 - 2.0 * ds[i] * ds[i] / s3;
+            d2q_ls[i] = eta_t[i] * d3q_tls_ls[i];
+            d3q_ls[i] = eta_t[i]
+                * (d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i].powi(3) / s4);
+        }
+
+        Ok(SurvivalJointQuantities {
+            d1_q,
+            d2_q,
+            d3_q,
+            h_time_h0,
+            h_time_h1,
+            h_time_d,
+            d_h_h0,
+            d_h_h1,
+            d_h_d,
+            dq_t,
+            dq_ls,
+            d2q_tls,
+            d2q_ls,
+            d3q_tls_ls,
+            d3q_ls,
+        })
     }
 
     /// Hazard-like survival ratio and its first derivative.
@@ -873,6 +1059,57 @@ fn rowwise_cross_quadratic_design(
     rowwise_dot_design_with_dense(right, &left_middle)
 }
 
+fn weighted_crossprod_dense(
+    left: &Array2<f64>,
+    weights: &Array1<f64>,
+    right: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    if left.nrows() != weights.len() || right.nrows() != weights.len() {
+        return Err(format!(
+            "weighted_crossprod_dense row mismatch: left is {}x{}, weights has {}, right is {}x{}",
+            left.nrows(),
+            left.ncols(),
+            weights.len(),
+            right.nrows(),
+            right.ncols()
+        ));
+    }
+    let mut weighted_right = right.clone();
+    for i in 0..weighted_right.nrows() {
+        let wi = weights[i];
+        if wi == 1.0 {
+            continue;
+        }
+        weighted_right.row_mut(i).mapv_inplace(|v| wi * v);
+    }
+    Ok(left.t().dot(&weighted_right))
+}
+
+fn assign_block(
+    target: &mut Array2<f64>,
+    row_start: usize,
+    col_start: usize,
+    block: &Array2<f64>,
+) {
+    let row_end = row_start + block.nrows();
+    let col_end = col_start + block.ncols();
+    target
+        .slice_mut(s![row_start..row_end, col_start..col_end])
+        .assign(block);
+}
+
+fn assign_symmetric_block(
+    target: &mut Array2<f64>,
+    row_start: usize,
+    col_start: usize,
+    block: &Array2<f64>,
+) {
+    assign_block(target, row_start, col_start, block);
+    if row_start != col_start || block.nrows() != block.ncols() {
+        assign_block(target, col_start, row_start, &block.t().to_owned());
+    }
+}
+
 fn validate_predict_inverse_link(inverse_link: &InverseLink) -> Result<(), String> {
     match inverse_link {
         InverseLink::Standard(LinkFunction::Sas) => Err(
@@ -1025,34 +1262,8 @@ fn lift_conditional_covariance(
 
 impl CustomFamily for SurvivalLocationScaleFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != self.expected_blocks() {
-            return Err(format!(
-                "SurvivalLocationScaleFamily expects {} blocks, got {}",
-                self.expected_blocks(),
-                block_states.len()
-            ));
-        }
         let n = self.n;
-        let eta_time = &block_states[Self::BLOCK_TIME].eta;
-        let eta_t = &block_states[Self::BLOCK_THRESHOLD].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let eta_w = self
-            .x_link_wiggle
-            .as_ref()
-            .map(|_| &block_states[Self::BLOCK_LINK_WIGGLE].eta);
-        if eta_time.len() != 3 * n || eta_t.len() != n || eta_ls.len() != n {
-            return Err("survival probit-location-scale eta dimension mismatch".to_string());
-        }
-        if let Some(w) = eta_w
-            && w.len() != n
-        {
-            return Err("survival probit-location-scale wiggle eta dimension mismatch".to_string());
-        }
-
-        let h0 = eta_time.slice(s![0..n]);
-        let h1 = eta_time.slice(s![n..2 * n]);
-        let d_raw = eta_time.slice(s![2 * n..3 * n]);
-
+        let (h0, h1, d_raw, eta_t, eta_ls, eta_w) = self.validate_joint_states(block_states)?;
         let (sigma, ds, d2s, _d3s) =
             bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
         let mut ll = 0.0;
@@ -1163,34 +1374,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_idx: usize,
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != self.expected_blocks() {
-            return Err(format!(
-                "SurvivalLocationScaleFamily expects {} blocks, got {}",
-                self.expected_blocks(),
-                block_states.len()
-            ));
-        }
         let n = self.n;
-        let eta_time = &block_states[Self::BLOCK_TIME].eta;
-        let eta_t = &block_states[Self::BLOCK_THRESHOLD].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let eta_w = self
-            .x_link_wiggle
-            .as_ref()
-            .map(|_| &block_states[Self::BLOCK_LINK_WIGGLE].eta);
-        if eta_time.len() != 3 * n || eta_t.len() != n || eta_ls.len() != n {
-            return Err("survival probit-location-scale eta dimension mismatch".to_string());
-        }
-        if let Some(w) = eta_w
-            && w.len() != n
-        {
-            return Err("survival probit-location-scale wiggle eta dimension mismatch".to_string());
-        }
-
-        let h0 = eta_time.slice(s![0..n]);
-        let h1 = eta_time.slice(s![n..2 * n]);
-        let d_raw = eta_time.slice(s![2 * n..3 * n]);
-
+        let (h0, h1, d_raw, eta_t, eta_ls, eta_w) = self.validate_joint_states(block_states)?;
         let (sigma, ds, d2s, d3s) =
             bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
         let mut d1_q = Array1::<f64>::zeros(n);
@@ -1323,6 +1508,288 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             }
             _ => Ok(None),
         }
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        let q = self.collect_joint_quantities(block_states)?;
+        let offsets = self.joint_block_offsets();
+        let p_total = *offsets
+            .last()
+            .ok_or_else(|| "missing joint block offsets".to_string())?;
+        let x_threshold = self.x_threshold.to_dense();
+        let x_log_sigma = self.x_log_sigma.to_dense();
+        let x_w = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense);
+        let mut joint = Array2::<f64>::zeros((p_total, p_total));
+
+        // Full predictor-space negative Hessian:
+        //
+        //   H = -d²ℓ/dβ²
+        //
+        // The time block contributes through three distinct linear predictors
+        // (entry h0, exit h1, derivative d), while the remaining blocks enter
+        // through the single scalar coupled predictor
+        //
+        //   q(eta_t, eta_ls, eta_w) = -eta_t / sigma(eta_ls) + eta_w.
+        //
+        // For any q-block pair (b, c) in {threshold, log_sigma, wiggle},
+        // the exact negative Hessian weight is
+        //
+        //   H_bc = -[ d²ℓ/dq² * q_b q_c + dℓ/dq * q_bc ].
+        //
+        // For the cross terms between h0/h1 and a q-block b:
+        //
+        //   H_h0,b = -d²ℓ/(dh0 dq) * q_b = -h_h0 * q_b
+        //   H_h1,b = -d²ℓ/(dh1 dq) * q_b = -h_h1 * q_b.
+        //
+        // This is exactly the full coupled H(beta^) that the outer LAML
+        // gradient derivation requires. The blockwise fallback previously used
+        // only the diagonal H_bb pieces and therefore discarded the
+        // threshold/scale/wiggle response to smoothing changes.
+        let h_time = fast_xt_diag_x(&self.x_time_entry, &q.h_time_h0)
+            + fast_xt_diag_x(&self.x_time_exit, &q.h_time_h1)
+            + fast_xt_diag_x(&self.x_time_deriv, &q.h_time_d);
+        assign_symmetric_block(&mut joint, offsets[0], offsets[0], &h_time);
+
+        let h_t = -(&q.d2_q * &q.dq_t.mapv(|v| v * v));
+        let h_tt = weighted_crossprod_dense(&x_threshold, &h_t, &x_threshold)?;
+        assign_symmetric_block(&mut joint, offsets[1], offsets[1], &h_tt);
+
+        let h_ls = -(&q.d2_q * &q.dq_ls.mapv(|v| v * v) + &(&q.d1_q * &q.d2q_ls));
+        let h_ll = weighted_crossprod_dense(&x_log_sigma, &h_ls, &x_log_sigma)?;
+        assign_symmetric_block(&mut joint, offsets[2], offsets[2], &h_ll);
+
+        let h_tl_weights = -(&q.d2_q * &(&q.dq_t * &q.dq_ls) + &(&q.d1_q * &q.d2q_tls));
+        let h_tl = weighted_crossprod_dense(&x_threshold, &h_tl_weights, &x_log_sigma)?;
+        assign_symmetric_block(&mut joint, offsets[1], offsets[2], &h_tl);
+
+        let h_h0_t =
+            weighted_crossprod_dense(&self.x_time_entry, &(-&q.h_time_h0 * &q.dq_t), &x_threshold)?;
+        let h_h1_t =
+            weighted_crossprod_dense(&self.x_time_exit, &(-&q.h_time_h1 * &q.dq_t), &x_threshold)?;
+        assign_symmetric_block(
+            &mut joint,
+            offsets[0],
+            offsets[1],
+            &(h_h0_t + h_h1_t),
+        );
+
+        let h_h0_ls = weighted_crossprod_dense(
+            &self.x_time_entry,
+            &(-&q.h_time_h0 * &q.dq_ls),
+            &x_log_sigma,
+        )?;
+        let h_h1_ls = weighted_crossprod_dense(
+            &self.x_time_exit,
+            &(-&q.h_time_h1 * &q.dq_ls),
+            &x_log_sigma,
+        )?;
+        assign_symmetric_block(
+            &mut joint,
+            offsets[0],
+            offsets[2],
+            &(h_h0_ls + h_h1_ls),
+        );
+
+        if let (Some(x_w_dense), Some(w_offset)) = (x_w.as_ref(), offsets.get(3).copied()) {
+            let h_ww = weighted_crossprod_dense(x_w_dense, &(-&q.d2_q), x_w_dense)?;
+            assign_symmetric_block(&mut joint, w_offset, w_offset, &h_ww);
+
+            let h_tw = weighted_crossprod_dense(&x_threshold, &(-&q.d2_q * &q.dq_t), x_w_dense)?;
+            assign_symmetric_block(&mut joint, offsets[1], w_offset, &h_tw);
+
+            let h_lw =
+                weighted_crossprod_dense(&x_log_sigma, &(-&q.d2_q * &q.dq_ls), x_w_dense)?;
+            assign_symmetric_block(&mut joint, offsets[2], w_offset, &h_lw);
+
+            let h_h0_w = weighted_crossprod_dense(&self.x_time_entry, &(-&q.h_time_h0), x_w_dense)?;
+            let h_h1_w = weighted_crossprod_dense(&self.x_time_exit, &(-&q.h_time_h1), x_w_dense)?;
+            assign_symmetric_block(
+                &mut joint,
+                offsets[0],
+                w_offset,
+                &(h_h0_w + h_h1_w),
+            );
+        }
+
+        Ok(Some(joint))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let q = self.collect_joint_quantities(block_states)?;
+        let offsets = self.joint_block_offsets();
+        let p_total = *offsets
+            .last()
+            .ok_or_else(|| "missing joint block offsets".to_string())?;
+        if d_beta_flat.len() != p_total {
+            return Err(format!(
+                "joint d_beta length mismatch: got {}, expected {p_total}",
+                d_beta_flat.len()
+            ));
+        }
+
+        let time_dir = d_beta_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
+        let threshold_dir = d_beta_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
+        let log_sigma_dir = d_beta_flat.slice(s![offsets[2]..offsets[3]]).to_owned();
+        let wiggle_dir = if self.x_link_wiggle.is_some() {
+            Some(d_beta_flat.slice(s![offsets[3]..offsets[4]]).to_owned())
+        } else {
+            None
+        };
+
+        let delta_h0 = self.x_time_entry.dot(&time_dir);
+        let delta_h1 = self.x_time_exit.dot(&time_dir);
+        let delta_d = self.x_time_deriv.dot(&time_dir);
+        let delta_t = self.x_threshold.matrix_vector_multiply(&threshold_dir);
+        let delta_ls = self.x_log_sigma.matrix_vector_multiply(&log_sigma_dir);
+        let delta_w = match (self.x_link_wiggle.as_ref(), wiggle_dir.as_ref()) {
+            (Some(x_w), Some(dir)) => x_w.matrix_vector_multiply(dir),
+            _ => Array1::zeros(self.n),
+        };
+
+        // Full refit-path directional contractions.
+        //
+        // The exact outer derivative needs D_u H along the joint mode
+        // sensitivity u = d beta^ / d rho. In predictor space that direction is
+        // summarized by:
+        //
+        //   delta_h0 = X_entry u_time
+        //   delta_h1 = X_exit  u_time
+        //   delta_d  = X_deriv u_time
+        //   delta_t  = X_t     u_threshold
+        //   delta_ls = X_ls    u_log_sigma
+        //   delta_w  = X_w     u_wiggle
+        //
+        // and therefore
+        //
+        //   delta_q = q_t delta_t + q_ls delta_ls + delta_w.
+        //
+        // Every Hessian block drifts through this full direction; the previous
+        // blockwise path effectively set delta_t = delta_ls = delta_w = 0,
+        // which is exactly the bug the finite-difference test exposed.
+        let delta_q = &q.dq_t * &delta_t + &q.dq_ls * &delta_ls + &delta_w;
+        let delta_q_t = &q.d2q_tls * &delta_ls;
+        let delta_q_ls = &q.d2q_tls * &delta_t + &q.d2q_ls * &delta_ls;
+        let delta_q_tls = &q.d3q_tls_ls * &delta_ls;
+        let delta_q_ls_ls = &q.d3q_tls_ls * &delta_t + &q.d3q_ls * &delta_ls;
+        let d_d1_q = &q.d2_q * &delta_q + &q.h_time_h0 * &delta_h0 + &q.h_time_h1 * &delta_h1;
+        let d_d2_q = &q.d3_q * &delta_q - &q.d_h_h0 * &delta_h0 - &q.d_h_h1 * &delta_h1;
+
+        let x_threshold = self.x_threshold.to_dense();
+        let x_log_sigma = self.x_log_sigma.to_dense();
+        let x_w = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense);
+        let mut joint = Array2::<f64>::zeros((p_total, p_total));
+
+        let dh_h0 = &q.d_h_h0 * &(&delta_h0 - &delta_q);
+        let dh_h1 = &q.d_h_h1 * &(&delta_h1 - &delta_q);
+        let dh_d = &q.d_h_d * &delta_d;
+        let d_h_time = fast_xt_diag_x(&self.x_time_entry, &dh_h0)
+            + fast_xt_diag_x(&self.x_time_exit, &dh_h1)
+            + fast_xt_diag_x(&self.x_time_deriv, &dh_d);
+        assign_symmetric_block(&mut joint, offsets[0], offsets[0], &d_h_time);
+
+        // q-only blocks use the exact scalar third-order contraction
+        //
+        //   D_u H_bc
+        //   = -[ d³ℓ/dq³ * delta_q * q_b q_c
+        //        + d²ℓ/dq² * (delta_q_b q_c + q_b delta_q_c + delta_q q_bc)
+        //        + dℓ/dq * delta_q_bc ].
+        //
+        // This is the family-specific specialization of the generic formula
+        //   D_u H = sum_i [ w^(3) delta_i a_i a_i^T
+        //                 + w^(2)(...) + w^(1) C_i[u] ]
+        // from the derivation.
+        let d_h_t = -(&d_d2_q * &q.dq_t.mapv(|v| v * v)
+            + &(&q.d2_q * &(2.0 * &delta_q_t * &q.dq_t)));
+        let d_h_tt = weighted_crossprod_dense(&x_threshold, &d_h_t, &x_threshold)?;
+        assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d_h_tt);
+
+        let d_h_tl_weights = -(&d_d2_q * &(&q.dq_t * &q.dq_ls)
+            + &(&q.d2_q * &(&delta_q_t * &q.dq_ls + &q.dq_t * &delta_q_ls))
+            + &(&d_d1_q * &q.d2q_tls)
+            + &(&q.d1_q * &delta_q_tls));
+        let d_h_tl = weighted_crossprod_dense(&x_threshold, &d_h_tl_weights, &x_log_sigma)?;
+        assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d_h_tl);
+
+        let d_h_l = -(&d_d2_q * &q.dq_ls.mapv(|v| v * v)
+            + &(&q.d2_q * &(2.0 * &delta_q_ls * &q.dq_ls))
+            + &(&d_d1_q * &q.d2q_ls)
+            + &(&q.d1_q * &delta_q_ls_ls));
+        let d_h_ll = weighted_crossprod_dense(&x_log_sigma, &d_h_l, &x_log_sigma)?;
+        assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d_h_ll);
+
+        let d_h_h0_t = weighted_crossprod_dense(
+            &self.x_time_entry,
+            &(-(&dh_h0 * &q.dq_t + &q.h_time_h0 * &delta_q_t)),
+            &x_threshold,
+        )?;
+        let d_h_h1_t = weighted_crossprod_dense(
+            &self.x_time_exit,
+            &(-(&dh_h1 * &q.dq_t + &q.h_time_h1 * &delta_q_t)),
+            &x_threshold,
+        )?;
+        assign_symmetric_block(
+            &mut joint,
+            offsets[0],
+            offsets[1],
+            &(d_h_h0_t + d_h_h1_t),
+        );
+
+        let d_h_h0_l = weighted_crossprod_dense(
+            &self.x_time_entry,
+            &(-(&dh_h0 * &q.dq_ls + &q.h_time_h0 * &delta_q_ls)),
+            &x_log_sigma,
+        )?;
+        let d_h_h1_l = weighted_crossprod_dense(
+            &self.x_time_exit,
+            &(-(&dh_h1 * &q.dq_ls + &q.h_time_h1 * &delta_q_ls)),
+            &x_log_sigma,
+        )?;
+        assign_symmetric_block(
+            &mut joint,
+            offsets[0],
+            offsets[2],
+            &(d_h_h0_l + d_h_h1_l),
+        );
+
+        if let (Some(x_w_dense), Some(w_offset)) = (x_w.as_ref(), offsets.get(3).copied()) {
+            let d_h_tw = weighted_crossprod_dense(
+                &x_threshold,
+                &(-(&d_d2_q * &q.dq_t + &q.d2_q * &delta_q_t)),
+                x_w_dense,
+            )?;
+            assign_symmetric_block(&mut joint, offsets[1], w_offset, &d_h_tw);
+
+            let d_h_lw = weighted_crossprod_dense(
+                &x_log_sigma,
+                &(-(&d_d2_q * &q.dq_ls + &q.d2_q * &delta_q_ls)),
+                x_w_dense,
+            )?;
+            assign_symmetric_block(&mut joint, offsets[2], w_offset, &d_h_lw);
+
+            let d_h_ww =
+                weighted_crossprod_dense(x_w_dense, &(-&d_d2_q), x_w_dense)?;
+            assign_symmetric_block(&mut joint, w_offset, w_offset, &d_h_ww);
+
+            let d_h_h0_w =
+                weighted_crossprod_dense(&self.x_time_entry, &(-&dh_h0), x_w_dense)?;
+            let d_h_h1_w =
+                weighted_crossprod_dense(&self.x_time_exit, &(-&dh_h1), x_w_dense)?;
+            assign_symmetric_block(
+                &mut joint,
+                offsets[0],
+                w_offset,
+                &(d_h_h0_w + d_h_h1_w),
+            );
+        }
+
+        Ok(Some(joint))
     }
 
     fn block_linear_constraints(
@@ -2797,6 +3264,128 @@ mod tests {
                     &format!("survival {label} block {} dH", block_idx),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn joint_exact_newton_hessian_matches_negative_gradient_jacobian_for_non_probit_links() {
+        let beta_time = array![0.2];
+        let beta_threshold = array![0.35];
+        let beta_log_sigma = array![-0.15];
+        let eps = 1e-6;
+
+        for (label, inverse_link) in survival_non_probit_test_links() {
+            let family = survival_exact_newton_test_family_with_inverse_link(inverse_link);
+            let states =
+                survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+            let analytic = family
+                .exact_newton_joint_hessian(&states)
+                .expect("joint exact hessian")
+                .expect("expected exact joint hessian");
+
+            let flatten_grad = |eval: FamilyEvaluation| -> Array1<f64> {
+                let mut out = Array1::<f64>::zeros(3);
+                for (block_idx, slot) in out.iter_mut().enumerate() {
+                    *slot = match &eval.block_working_sets[block_idx] {
+                        BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+                        BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton block"),
+                    };
+                }
+                out
+            };
+
+            let mut fd = Array2::<f64>::zeros((3, 3));
+            for j in 0..3 {
+                let mut beta_time_plus = beta_time.clone();
+                let mut beta_threshold_plus = beta_threshold.clone();
+                let mut beta_log_sigma_plus = beta_log_sigma.clone();
+                let mut beta_time_minus = beta_time.clone();
+                let mut beta_threshold_minus = beta_threshold.clone();
+                let mut beta_log_sigma_minus = beta_log_sigma.clone();
+                match j {
+                    0 => {
+                        beta_time_plus[0] += eps;
+                        beta_time_minus[0] -= eps;
+                    }
+                    1 => {
+                        beta_threshold_plus[0] += eps;
+                        beta_threshold_minus[0] -= eps;
+                    }
+                    2 => {
+                        beta_log_sigma_plus[0] += eps;
+                        beta_log_sigma_minus[0] -= eps;
+                    }
+                    _ => unreachable!(),
+                }
+                let grad_plus = flatten_grad(
+                    family
+                        .evaluate(&survival_exact_newton_rebuild_states(
+                            &beta_time_plus,
+                            &beta_threshold_plus,
+                            &beta_log_sigma_plus,
+                        ))
+                        .expect("eval plus"),
+                );
+                let grad_minus = flatten_grad(
+                    family
+                        .evaluate(&survival_exact_newton_rebuild_states(
+                            &beta_time_minus,
+                            &beta_threshold_minus,
+                            &beta_log_sigma_minus,
+                        ))
+                        .expect("eval minus"),
+                );
+                let col = -(grad_plus - grad_minus) / (2.0 * eps);
+                fd.column_mut(j).assign(&col);
+            }
+
+            crate::testing::assert_matrix_derivative_fd(
+                &fd,
+                &analytic,
+                2e-4,
+                &format!("survival {label} joint H"),
+            );
+        }
+    }
+
+    #[test]
+    fn joint_exact_newton_hessian_directional_derivative_matches_fd_for_non_probit_links() {
+        let beta_time = array![0.2];
+        let beta_threshold = array![0.35];
+        let beta_log_sigma = array![-0.15];
+        let direction = array![0.7, -0.4, 0.5];
+        let eps = 1e-6;
+
+        for (label, inverse_link) in survival_non_probit_test_links() {
+            let family = survival_exact_newton_test_family_with_inverse_link(inverse_link);
+            let states =
+                survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+            let analytic = family
+                .exact_newton_joint_hessian_directional_derivative(&states, &direction)
+                .expect("analytic joint dH")
+                .expect("expected exact joint dH");
+
+            let beta_time_plus = array![beta_time[0] + eps * direction[0]];
+            let beta_threshold_plus = array![beta_threshold[0] + eps * direction[1]];
+            let beta_log_sigma_plus = array![beta_log_sigma[0] + eps * direction[2]];
+            let plus_states =
+                survival_exact_newton_rebuild_states(&beta_time_plus, &beta_threshold_plus, &beta_log_sigma_plus);
+            let h_plus = family
+                .exact_newton_joint_hessian(&plus_states)
+                .expect("joint H plus")
+                .expect("expected exact joint H plus");
+            let h_base = family
+                .exact_newton_joint_hessian(&states)
+                .expect("joint H base")
+                .expect("expected exact joint H base");
+            let fd = (h_plus - h_base) / eps;
+
+            crate::testing::assert_matrix_derivative_fd(
+                &fd,
+                &analytic,
+                5e-4,
+                &format!("survival {label} joint dH"),
+            );
         }
     }
 
