@@ -1583,117 +1583,16 @@ where
                     }
                     grad[k + j] = -direct_ll_buf[j] + 0.5 * trace_term;
                 }
-                if use_sas {
-                    let mut eval_sas_total_cost =
-                        |raw_epsilon: f64, raw_log_delta: f64| -> Result<f64, EstimationError> {
-                            let epsilon = if use_beta_logistic {
-                                raw_epsilon
-                            } else {
-                                let (v, _) = sas_effective_epsilon(raw_epsilon);
-                                v
-                            };
-                            let sas_state = if use_beta_logistic {
-                                state_from_beta_logistic_spec(SasLinkSpec {
-                                    initial_epsilon: epsilon,
-                                    initial_log_delta: raw_log_delta,
-                                })
-                                .map_err(|e| {
-                                    EstimationError::InvalidInput(format!(
-                                        "invalid Beta-Logistic link: {e}"
-                                    ))
-                                })?
-                            } else {
-                                state_from_sas_spec(SasLinkSpec {
-                                    initial_epsilon: epsilon,
-                                    initial_log_delta: raw_log_delta,
-                                })
-                                .map_err(|e| {
-                                    EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
-                                })?
-                            };
-                            reml_eval.set_link_states(None, Some(sas_state));
-                            let mut c = reml_eval.compute_cost(&rho_buf)?;
-                            if sas_ridge > 0.0 {
-                                c += 0.5 * sas_ridge * raw_log_delta * raw_log_delta;
-                                if !use_beta_logistic {
-                                    let (barrier_cost, _) =
-                                        sas_log_delta_edge_barrier_cost_grad(raw_log_delta);
-                                    c += barrier_cost;
-                                }
-                            }
-                            Ok(c)
-                        };
-
-                    let raw_epsilon = theta[k];
-                    let raw_log_delta = theta[k + 1];
-                    let mut h_eps = 1e-3 * (1.0 + raw_epsilon.abs());
-                    let mut h_ld = 1e-3 * (1.0 + raw_log_delta.abs());
-                    let fd_eps = loop {
-                        let fp = eval_sas_total_cost(raw_epsilon + h_eps, raw_log_delta);
-                        let fm = eval_sas_total_cost(raw_epsilon - h_eps, raw_log_delta);
-                        if let (Ok(fp), Ok(fm)) = (fp, fm) {
-                            break (fp - fm) / (2.0 * h_eps);
-                        }
-                        h_eps *= 0.5;
-                        if h_eps < 1e-7 {
-                            return Err(EstimationError::InvalidInput(
-                                "failed to evaluate stable SAS epsilon finite-difference gradient"
-                                    .to_string(),
-                            ));
-                        }
-                    };
-                    let fd_ld = loop {
-                        let fp = eval_sas_total_cost(raw_epsilon, raw_log_delta + h_ld);
-                        let fm = eval_sas_total_cost(raw_epsilon, raw_log_delta - h_ld);
-                        if let (Ok(fp), Ok(fm)) = (fp, fm) {
-                            break (fp - fm) / (2.0 * h_ld);
-                        }
-                        h_ld *= 0.5;
-                        if h_ld < 1e-7 {
-                            return Err(EstimationError::InvalidInput(
-                                "failed to evaluate stable SAS log-delta finite-difference gradient"
-                                    .to_string(),
-                            ));
-                        }
-                    };
-                    grad[k] = fd_eps;
-                    grad[k + 1] = fd_ld;
-
-                    // Restore link state corresponding to current theta for downstream calls.
-                    let epsilon = if use_beta_logistic {
-                        raw_epsilon
-                    } else {
-                        let (v, _) = sas_effective_epsilon(raw_epsilon);
-                        v
-                    };
-                    let sas_state = if use_beta_logistic {
-                        state_from_beta_logistic_spec(SasLinkSpec {
-                            initial_epsilon: epsilon,
-                            initial_log_delta: raw_log_delta,
-                        })
-                        .map_err(|e| {
-                            EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
-                        })?
-                    } else {
-                        state_from_sas_spec(SasLinkSpec {
-                            initial_epsilon: epsilon,
-                            initial_log_delta: raw_log_delta,
-                        })
-                        .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?
-                    };
-                    reml_eval.set_link_states(None, Some(sas_state));
-                } else {
-                    if use_sas && !use_beta_logistic {
-                        let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
-                        grad[k] *= d_eps_d_raw;
-                    }
-                    if use_sas && sas_ridge > 0.0 {
-                        let log_delta = theta[k + 1];
-                        grad[k + 1] += sas_ridge * log_delta;
-                        if !use_beta_logistic {
-                            let (_, barrier_grad) = sas_log_delta_edge_barrier_cost_grad(log_delta);
-                            grad[k + 1] += barrier_grad;
-                        }
+                if use_sas && !use_beta_logistic {
+                    let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
+                    grad[k] *= d_eps_d_raw;
+                }
+                if use_sas && sas_ridge > 0.0 {
+                    let log_delta = theta[k + 1];
+                    grad[k + 1] += sas_ridge * log_delta;
+                    if !use_beta_logistic {
+                        let (_, barrier_grad) = sas_log_delta_edge_barrier_cost_grad(log_delta);
+                        grad[k + 1] += barrier_grad;
                     }
                 }
                 let grad_sec = t_grad.elapsed().as_secs_f64();
@@ -3939,76 +3838,6 @@ where
         }
     }
 
-    if use_sas {
-        let mut eval_sas_total_cost =
-            |raw_epsilon: f64, raw_log_delta: f64| -> Result<f64, EstimationError> {
-                let epsilon = if use_beta_logistic {
-                    raw_epsilon
-                } else {
-                    let (v, _) = sas_effective_epsilon(raw_epsilon);
-                    v
-                };
-                let sas_state = if use_beta_logistic {
-                    state_from_beta_logistic_spec(SasLinkSpec {
-                        initial_epsilon: epsilon,
-                        initial_log_delta: raw_log_delta,
-                    })
-                    .map_err(|e| {
-                        EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
-                    })?
-                } else {
-                    state_from_sas_spec(SasLinkSpec {
-                        initial_epsilon: epsilon,
-                        initial_log_delta: raw_log_delta,
-                    })
-                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?
-                };
-                reml_state.set_link_states(None, Some(sas_state));
-                let mut c = reml_state.compute_cost(&rho)?;
-                if sas_ridge > 0.0 {
-                    c += 0.5 * sas_ridge * raw_log_delta * raw_log_delta;
-                    if !use_beta_logistic {
-                        let (barrier_cost, _) = sas_log_delta_edge_barrier_cost_grad(raw_log_delta);
-                        c += barrier_cost;
-                    }
-                }
-                Ok(c)
-            };
-
-        let raw_epsilon = theta[k];
-        let raw_log_delta = theta[k + 1];
-        let mut h_eps = 1e-3 * (1.0 + raw_epsilon.abs());
-        let mut h_ld = 1e-3 * (1.0 + raw_log_delta.abs());
-        grad[k] = loop {
-            let fp = eval_sas_total_cost(raw_epsilon + h_eps, raw_log_delta);
-            let fm = eval_sas_total_cost(raw_epsilon - h_eps, raw_log_delta);
-            if let (Ok(fp), Ok(fm)) = (fp, fm) {
-                break (fp - fm) / (2.0 * h_eps);
-            }
-            h_eps *= 0.5;
-            if h_eps < 1e-7 {
-                return Err(EstimationError::InvalidInput(
-                    "failed to evaluate stable SAS epsilon finite-difference gradient".to_string(),
-                ));
-            }
-        };
-        grad[k + 1] = loop {
-            let fp = eval_sas_total_cost(raw_epsilon, raw_log_delta + h_ld);
-            let fm = eval_sas_total_cost(raw_epsilon, raw_log_delta - h_ld);
-            if let (Ok(fp), Ok(fm)) = (fp, fm) {
-                break (fp - fm) / (2.0 * h_ld);
-            }
-            h_ld *= 0.5;
-            if h_ld < 1e-7 {
-                return Err(EstimationError::InvalidInput(
-                    "failed to evaluate stable SAS log-delta finite-difference gradient"
-                        .to_string(),
-                ));
-            }
-        };
-        return Ok((cost, grad));
-    }
-
     let (pirls_mix, h_pos_w) = reml_state.pirls_result_and_hpos_for_rho(&rho)?;
     let eta = &pirls_mix.final_eta;
     let x_t = &pirls_mix.x_transformed;
@@ -4153,6 +3982,18 @@ where
             trace_term += leverage[i] * dw_total;
         }
         grad[k + j] = -direct_ll[j] + 0.5 * trace_term;
+    }
+    if use_sas && !use_beta_logistic {
+        let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
+        grad[k] *= d_eps_d_raw;
+    }
+    if use_sas && sas_ridge > 0.0 {
+        let log_delta = theta[k + 1];
+        grad[k + 1] += sas_ridge * log_delta;
+        if !use_beta_logistic {
+            let (_, barrier_grad) = sas_log_delta_edge_barrier_cost_grad(log_delta);
+            grad[k + 1] += barrier_grad;
+        }
     }
     Ok((cost, grad))
 }
