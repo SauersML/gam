@@ -253,6 +253,20 @@ pub struct WorkingModelSurvival {
 }
 
 impl WorkingModelSurvival {
+    fn stabilized_structural_derivative(&self, deriv: f64) -> Option<f64> {
+        const STRUCTURAL_MONO_ROUNDOFF_TOL: f64 = 1e-7;
+        if !self.structurally_monotonic {
+            return None;
+        }
+        if deriv >= 1e-12 {
+            return Some(deriv);
+        }
+        if deriv >= -STRUCTURAL_MONO_ROUNDOFF_TOL {
+            return Some(1e-12);
+        }
+        None
+    }
+
     fn validate_penalties(
         penalties: &PenaltyBlocks,
         coefficient_dim: usize,
@@ -290,6 +304,9 @@ impl WorkingModelSurvival {
     }
 
     fn derivative_guard(&self) -> f64 {
+        if self.structurally_monotonic {
+            return 1e-12;
+        }
         self.monotonicity.tolerance.max(1e-12)
     }
 
@@ -306,11 +323,20 @@ impl WorkingModelSurvival {
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
         let tol = self.derivative_guard();
         let p = self.x_derivative.ncols();
+        const DERIVATIVE_ROW_NORM_TOL: f64 = 1e-12;
         if p == 0 {
             return None;
         }
         let active_rows: Vec<usize> = (0..self.x_derivative.nrows())
-            .filter(|&i| self.sample_weight[i] > 0.0)
+            .filter(|&i| {
+                self.sample_weight[i] > 0.0
+                    && self
+                        .x_derivative
+                        .row(i)
+                        .iter()
+                        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                        > DERIVATIVE_ROW_NORM_TOL
+            })
             .collect();
         if active_rows.is_empty() {
             return None;
@@ -552,8 +578,10 @@ impl WorkingModelSurvival {
             let has_entry_interval = !self.entry_at_origin[i];
             let h_s = if has_entry_interval { h_entry[i] } else { 0.0 };
             let h_e = h_exit[i];
-            let deriv = derivative_raw[i];
-            if deriv <= derivative_guard_numerical || !deriv.is_finite() {
+            let deriv = self
+                .stabilized_structural_derivative(derivative_raw[i])
+                .unwrap_or(derivative_raw[i]);
+            if deriv < derivative_guard_numerical || !deriv.is_finite() {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
                     "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
                     i, deriv, derivative_guard
@@ -906,8 +934,10 @@ impl WorkingModelSurvival {
 
                 // Event part:
                 // d/dβ [ gsd gsd^T / s^2 - diag(he) - diag(hsd / s) ][u]
-                let s_i = deriv_raw[i];
-                if s_i <= guard_numerical || !s_i.is_finite() {
+                let s_i = self
+                    .stabilized_structural_derivative(deriv_raw[i])
+                    .unwrap_or(deriv_raw[i]);
+                if s_i < guard_numerical || !s_i.is_finite() {
                     return Err(EstimationError::ParameterConstraintViolation(format!(
                         "survival monotonicity violated in LAML trace contraction at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
                         i, s_i, guard
@@ -2316,6 +2346,77 @@ mod tests {
         assert_eq!(constraints.a.nrows(), 1);
         assert!((constraints.a[[0, 1]] - 1.0).abs() <= 1e-12);
         assert!((constraints.b[0] - 8e-8).abs() <= 1e-18);
+    }
+
+    #[test]
+    fn monotonicity_constraints_skip_numerically_zero_rows() {
+        let age_entry = array![1.0_f64, 1.0, 1.0];
+        let age_exit = array![2.0_f64, 3.0, 4.0];
+        let event_target = array![0u8, 0u8, 0u8];
+        let event_competing = array![0u8, 0u8, 0u8];
+        let sample_weight = array![1.0, 1.0, 1.0];
+        let x_entry = array![[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]];
+        let x_exit = x_entry.clone();
+        let x_derivative = array![[0.0, 0.0], [0.0, 1e-16], [0.0, 0.25]];
+
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct survival model");
+
+        let constraints = model
+            .monotonicity_linear_constraints()
+            .expect("nonzero derivative row should remain");
+        assert_eq!(constraints.a.nrows(), 1);
+        assert!((constraints.a[[0, 1]] - 1.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn structural_monotonicity_clamps_tiny_negative_roundoff() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[0.0]];
+        let x_exit = array![[0.0]];
+        let x_derivative = array![[1.0]];
+        let mut model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct survival model");
+        model
+            .set_structural_monotonicity(true, 1)
+            .expect("enable structural monotonicity");
+
+        let state = model
+            .update_state(&array![-1e-8])
+            .expect("tiny structural roundoff should be clamped");
+        assert!(state.deviance.is_finite());
     }
 
     #[test]

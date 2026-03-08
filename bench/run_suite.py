@@ -839,12 +839,12 @@ def r2_score(y: np.ndarray, mu: np.ndarray) -> float:
 
 def _survival_risk_from_rust_pred(pred_df: pd.DataFrame) -> tuple[np.ndarray, str]:
     # Canonical survival ranking: model-native risk score (higher => earlier failure).
-    for col in ("risk_score", "eta", "failure_prob"):
+    for col in ("failure_prob", "risk_score", "eta"):
         if col in pred_df.columns:
             return pred_df[col].to_numpy(dtype=float), col
     raise RuntimeError(
         "rust survival prediction output missing required risk column; "
-        "expected one of: risk_score, eta, failure_prob"
+        "expected one of: failure_prob, risk_score, eta"
     )
 
 
@@ -3102,8 +3102,17 @@ def _extract_thread3_adaptive_fold_metrics(model_payload: dict | None, ds: dict)
 
 
 def _rust_survival_fit_options_for_scenario(scenario_name):
-    # Keep defaults close to CLI behavior and only enable a flexible time basis
-    # where it provides clear discrimination gains.
+    # Use a flexible time basis by default. The linear log-time basis underfits
+    # the baseline hazard on ICU benchmarks and hurts native survival
+    # calibration even when ranking is acceptable.
+    if scenario_name in {"icu_survival_death", "icu_survival_los"}:
+        return {
+            "time_basis": "bspline",
+            "time_degree": 3,
+            "time_num_internal_knots": 10,
+            "time_smooth_lambda": 5e-2,
+            "ridge_lambda": 1e-6,
+        }
     if scenario_name in {"heart_failure_survival", "cirrhosis_survival"}:
         return {
             "time_basis": "bspline",
@@ -3112,10 +3121,73 @@ def _rust_survival_fit_options_for_scenario(scenario_name):
             "time_smooth_lambda": 1e-2,
             "ridge_lambda": 1e-6,
         }
+    if scenario_name == "haberman_survival":
+        return {
+            "time_basis": "bspline",
+            "time_degree": 3,
+            "time_num_internal_knots": 6,
+            "time_smooth_lambda": 2e-2,
+            "ridge_lambda": 1e-6,
+        }
     return {
-        "time_basis": "linear",
-        "ridge_lambda": 1e-4,
+        "time_basis": "bspline",
+        "time_degree": 3,
+        "time_num_internal_knots": 8,
+        "time_smooth_lambda": 1e-2,
+        "ridge_lambda": 1e-6,
     }
+
+
+def _rust_native_survival_matrix_from_model(
+    *,
+    rust_bin: Path,
+    model_path: Path,
+    predict_df: pd.DataFrame,
+    time_col: str,
+    grid: np.ndarray,
+    fold_dir: Path,
+) -> np.ndarray:
+    n = len(predict_df)
+    grid = np.asarray(grid, dtype=float).reshape(-1)
+    if n == 0 or grid.size == 0:
+        raise RuntimeError("native Rust survival matrix requires non-empty rows and time grid")
+
+    stacked = pd.concat(
+        [
+            predict_df.assign(**{time_col: float(t), "__grid_id": int(j)})
+            for j, t in enumerate(grid)
+        ],
+        axis=0,
+        ignore_index=True,
+    )
+    stacked_path = fold_dir / "native_survival_input.csv"
+    stacked_pred_path = fold_dir / "native_survival_pred.csv"
+    stacked.to_csv(stacked_path, index=False)
+
+    code, out, err = run_cmd(
+        [
+            str(rust_bin),
+            "predict",
+            str(model_path),
+            str(stacked_path),
+            "--out",
+            str(stacked_pred_path),
+        ],
+        cwd=ROOT,
+    )
+    if code != 0:
+        raise RuntimeError((err.strip() or out.strip() or "rust native survival predict failed"))
+
+    pred_df = pd.read_csv(stacked_pred_path)
+    if "survival_prob" not in pred_df.columns:
+        raise RuntimeError("rust survival prediction output missing 'survival_prob' column")
+    surv = pred_df["survival_prob"].to_numpy(dtype=float)
+    expected = n * grid.size
+    if surv.shape[0] != expected:
+        raise RuntimeError(
+            f"rust native survival predict length mismatch: got {surv.shape[0]}, expected {expected}"
+        )
+    return surv.reshape(grid.size, n).T
 
 
 def _ensure_rust_binary():
@@ -3188,7 +3260,6 @@ def run_rust_scenario_cv(
             test_eval_df = test_df.copy()
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
-            train_pred_path = td_path / f"pred_train_{fold_id}.csv"
             shared_artifact = (
                 shared_fold_artifacts[fold_id]
                 if shared_fold_artifacts is not None and fold_id < len(shared_fold_artifacts)
@@ -3318,14 +3389,6 @@ def run_rust_scenario_cv(
                 "--out",
                 str(pred_path),
             ]
-            train_pred_cmd = [
-                str(rust_bin),
-                "predict",
-                str(model_path),
-                str(train_path),
-                "--out",
-                str(train_pred_path),
-            ]
             t1 = perf_counter()
             code, out, err = run_cmd(pred_cmd, cwd=ROOT)
             if code != 0 and _looks_like_missing_csv(err or out):
@@ -3340,17 +3403,6 @@ def run_rust_scenario_cv(
                     "error": (err.strip() or out.strip() or "rust predict failed"),
                 }
             pred_df = pd.read_csv(pred_path)
-            train_pred_df = None
-            if ds["family"] == "survival":
-                code, out, err = run_cmd(train_pred_cmd, cwd=ROOT)
-                if code != 0:
-                    return {
-                        "contender": contender_name,
-                        "scenario_name": scenario_name,
-                        "status": "failed",
-                        "error": (err.strip() or out.strip() or "rust train predict failed"),
-                    }
-                train_pred_df = pd.read_csv(train_pred_path)
             if "mean" not in pred_df.columns:
                 return {
                     "contender": contender_name,
@@ -3467,7 +3519,23 @@ def run_rust_scenario_cv(
             else:
                 try:
                     risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
-                    train_risk_score, _ = _survival_risk_from_rust_pred(train_pred_df)
+                except RuntimeError as e:
+                    return {
+                        "contender": contender_name,
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "error": str(e),
+                    }
+                try:
+                    survival_grid = _survival_score_grid(train_df, test_eval_df, ds["time_col"])
+                    survival_matrix = _rust_native_survival_matrix_from_model(
+                        rust_bin=rust_bin,
+                        model_path=model_path,
+                        predict_df=test_df.assign(__entry=0.0),
+                        time_col=ds["time_col"],
+                        grid=survival_grid,
+                        fold_dir=td_path,
+                    )
                 except RuntimeError as e:
                     return {
                         "contender": contender_name,
@@ -3481,7 +3549,8 @@ def run_rust_scenario_cv(
                     time_col=ds["time_col"],
                     event_col=ds["event_col"],
                     risk_score=risk_score,
-                    train_risk_score=train_risk_score,
+                    survival_grid=survival_grid,
+                    survival_matrix=survival_matrix,
                 )
                 cv_rows.append(
                     {
@@ -3494,7 +3563,7 @@ def run_rust_scenario_cv(
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": (
                             "survival model via release binary "
-                            f"(c-index on risk score from '{score_src}'; lifted survival scores from train-fold calibrated risk) {eval_suffix}"
+                            f"(c-index on risk score from '{score_src}'; native survival curve scoring) {eval_suffix}"
                         ),
                     }
                 )
@@ -3882,7 +3951,6 @@ def run_rust_gamlss_survival_cv(
             test_path = td_path / f"test_{fold_id}.csv"
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
-            train_pred_path = td_path / f"pred_train_{fold_id}.csv"
 
             # Z-score features.
             fit_feature_cols = list(ds["features"])
@@ -3942,11 +4010,6 @@ def run_rust_gamlss_survival_cv(
                 str(model_path), str(test_path),
                 "--out", str(pred_path),
             ]
-            train_pred_cmd = [
-                str(rust_bin), "predict",
-                str(model_path), str(train_path),
-                "--out", str(train_pred_path),
-            ]
             t1 = perf_counter()
             code, out, err = run_cmd(pred_cmd, cwd=ROOT)
             pred_sec = perf_counter() - t1
@@ -3959,20 +4022,25 @@ def run_rust_gamlss_survival_cv(
                     "error": (err.strip() or out.strip() or "rust gamlss survival predict failed"),
                 }
             pred_df = pd.read_csv(pred_path)
-            code, out, err = run_cmd(train_pred_cmd, cwd=ROOT)
-            if code != 0:
+            try:
+                risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
+            except RuntimeError as e:
                 return {
                     "contender": "rust_gamlss_survival",
                     "scenario_name": scenario_name,
                     "status": "failed",
-                    "fold_id": int(fold_id),
-                    "error": (err.strip() or out.strip() or "rust gamlss survival train predict failed"),
+                    "error": str(e),
                 }
-            train_pred_df = pd.read_csv(train_pred_path)
-
             try:
-                risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
-                train_risk_score, _ = _survival_risk_from_rust_pred(train_pred_df)
+                survival_grid = _survival_score_grid(train_df, test_eval_df, ds["time_col"])
+                survival_matrix = _rust_native_survival_matrix_from_model(
+                    rust_bin=rust_bin,
+                    model_path=model_path,
+                    predict_df=test_df.assign(__entry=0.0),
+                    time_col=ds["time_col"],
+                    grid=survival_grid,
+                    fold_dir=td_path,
+                )
             except RuntimeError as e:
                 return {
                     "contender": "rust_gamlss_survival",
@@ -3986,7 +4054,8 @@ def run_rust_gamlss_survival_cv(
                 time_col=ds["time_col"],
                 event_col=ds["event_col"],
                 risk_score=risk_score,
-                train_risk_score=train_risk_score,
+                survival_grid=survival_grid,
+                survival_matrix=survival_matrix,
             )
             cv_rows.append(
                 {
@@ -3999,7 +4068,7 @@ def run_rust_gamlss_survival_cv(
                     "n_test": int(len(fold.test_idx)),
                         "model_spec": (
                             "survival probit-location-scale via release binary "
-                            f"(c-index on risk score from '{score_src}'; lifted survival scores from train-fold calibrated risk) [5-fold CV]"
+                            f"(c-index on risk score from '{score_src}'; native survival curve scoring) [5-fold CV]"
                     ),
                 }
             )

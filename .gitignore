@@ -15,6 +15,9 @@ benchmarks/results*.json
 benchmarks/*.png
 benchmarks/*_fitted.csv
 benchmarks/datasets/hgdp_1kg_pc_data.tsv
+bench/datasets/hgdp_1kg_pc_data.tsv
+bench/datasets/icu_survival_death.csv
+bench/datasets/icu_survival_los.csv
 # Bench runtime outputs
 bench/runtime/
 bench/results*.json
@@ -28,6 +31,9 @@ bench/codex_*/
 bench/_profile*
 bench/**/_profile*
 bench/artifacts/
+bench/native_surv_dbg_*/
+bench/tmp_*.csv
+bench/tmp_*.model.json
 bench/tmp_debug/
 bench/tmp_profile_*/
 bench/dbg_surv_*/

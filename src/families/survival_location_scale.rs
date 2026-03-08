@@ -1842,7 +1842,10 @@ pub fn predict_survival_location_scale_posterior_mean(
                     )
                     .0
                     .max(1e-12);
-                    inverse_link_survival_prob_value(&input.inverse_link, -x[0] - x[1] / sigma + x[3])
+                    inverse_link_survival_prob_value(
+                        &input.inverse_link,
+                        -x[0] - x[1] / sigma + x[3],
+                    )
                 },
             )
             .clamp(0.0, 1.0)
@@ -1908,19 +1911,13 @@ pub fn predict_survival_location_scale_posterior_mean(
             {
                 return fallback_row(i);
             }
-            let sigma = bounded_sigma_derivs_up_to_third_scalar(
-                mu_l_i,
-                input.sigma_min,
-                input.sigma_max,
-            )
-            .0
-            .max(1e-12);
+            let sigma =
+                bounded_sigma_derivs_up_to_third_scalar(mu_l_i, input.sigma_min, input.sigma_max)
+                    .0
+                    .max(1e-12);
             let q_l = 1.0 / sigma;
             let mu_base = -mu_h[i] - q_l * mu_t[i] + mu_w_i;
-            let var_base = var_h
-                + q_l * q_l * var_t
-                + var_w_i
-                + 2.0 * q_l * cov_ht_i
+            let var_base = var_h + q_l * q_l * var_t + var_w_i + 2.0 * q_l * cov_ht_i
                 - 2.0 * cov_hw_i
                 - 2.0 * q_l * cov_tw_i;
             let mu_loc = mu_base;
@@ -1928,38 +1925,30 @@ pub fn predict_survival_location_scale_posterior_mean(
             return gaussian_survival_mean(mu_loc, var_loc);
         }
 
-        crate::quadrature::normal_expectation_1d_adaptive(
-            &quad_ctx,
-            mu_l_i,
-            var_ls.sqrt(),
-            |ls| {
-                let sigma =
-                    bounded_sigma_derivs_up_to_third_scalar(ls, input.sigma_min, input.sigma_max)
-                        .0
-                        .max(1e-12);
-                let q_l = 1.0 / sigma;
-                let delta_l = ls - mu_l_i;
-                let mu_base = -mu_h[i] - q_l * mu_t[i] + mu_w_i;
-                let cov_eta_l = cov_hl_i + q_l * cov_tl_i - cov_lw_i;
-                let mu_loc = mu_base - (cov_eta_l / var_ls) * delta_l;
-                let var_base = var_h
-                    + q_l * q_l * var_t
-                    + var_w_i
-                    + 2.0 * q_l * cov_ht_i
-                    - 2.0 * cov_hw_i
-                    - 2.0 * q_l * cov_tw_i;
-                let var_loc = (var_base - cov_eta_l * cov_eta_l / var_ls).max(0.0);
-                if !mu_loc.is_finite() || !var_loc.is_finite() {
-                    return fallback_row(i);
-                }
-                // This is the payoff of the conditional Gaussian reduction above:
-                // for fixed ls, eta = -h - t / sigma(ls) + w is Gaussian, so we
-                // hand its conditional mean and standard deviation straight to
-                // the shared integrated-expectation dispatcher instead of
-                // integrating over h, t, and w explicitly.
-                gaussian_survival_mean(mu_loc, var_loc)
-            },
-        )
+        crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, mu_l_i, var_ls.sqrt(), |ls| {
+            let sigma =
+                bounded_sigma_derivs_up_to_third_scalar(ls, input.sigma_min, input.sigma_max)
+                    .0
+                    .max(1e-12);
+            let q_l = 1.0 / sigma;
+            let delta_l = ls - mu_l_i;
+            let mu_base = -mu_h[i] - q_l * mu_t[i] + mu_w_i;
+            let cov_eta_l = cov_hl_i + q_l * cov_tl_i - cov_lw_i;
+            let mu_loc = mu_base - (cov_eta_l / var_ls) * delta_l;
+            let var_base = var_h + q_l * q_l * var_t + var_w_i + 2.0 * q_l * cov_ht_i
+                - 2.0 * cov_hw_i
+                - 2.0 * q_l * cov_tw_i;
+            let var_loc = (var_base - cov_eta_l * cov_eta_l / var_ls).max(0.0);
+            if !mu_loc.is_finite() || !var_loc.is_finite() {
+                return fallback_row(i);
+            }
+            // This is the payoff of the conditional Gaussian reduction above:
+            // for fixed ls, eta = -h - t / sigma(ls) + w is Gaussian, so we
+            // hand its conditional mean and standard deviation straight to
+            // the shared integrated-expectation dispatcher instead of
+            // integrating over h, t, and w explicitly.
+            gaussian_survival_mean(mu_loc, var_loc)
+        })
         .clamp(0.0, 1.0)
     }));
 

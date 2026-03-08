@@ -2284,17 +2284,18 @@ impl<'a> RemlState<'a> {
         }
 
         // === Output Summary (single print, not in a loop) ===
-        if report.has_issues() {
-            println!("\n[GRADIENT DIAGNOSTICS] Issues detected:");
-            println!("{}", report.summary());
+        if report.has_issues() && log::log_enabled!(log::Level::Warn) {
+            log::warn!(
+                "[GRADIENT DIAGNOSTICS] Issues detected:\n{}",
+                report.summary()
+            );
 
-            // Also log total gradient comparison
             if let (Some(analytic), Some(numeric)) =
                 (&report.analytic_gradient, &report.numeric_gradient)
             {
                 let diff = analytic - numeric;
                 let rel_l2 = diff.dot(&diff).sqrt() / numeric.dot(numeric).sqrt().max(1e-8);
-                println!(
+                log::warn!(
                     "[GRADIENT DIAGNOSTICS] Total gradient rel. L2 error: {:.2e}",
                     rel_l2
                 );
