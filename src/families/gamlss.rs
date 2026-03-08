@@ -4729,7 +4729,10 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let (sigma, ds, d2s, d3s, d4s) =
             bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
 
-        let mut d2_h = Array2::<f64>::zeros((total, total));
+        let mut w_tt_diag = Array1::<f64>::zeros(n);
+        let mut w_tl_diag = Array1::<f64>::zeros(n);
+        let mut w_ll_diag = Array1::<f64>::zeros(n);
+
         for i in 0..n {
             // Per-observation 4th-order ingredients for l(Phi(q)):
             //   s = l'(q), c = l''(q), t = l'''(q), r = l''''(q).
@@ -4817,7 +4820,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let a_tt_v = 2.0 * q.q_t * dq_t_v;
             let a_tt_uv = 2.0 * (dq_t_u * dq_t_v + q.q_t * d2q_t_uv);
             // For (tt), b=q_tt=0 so Db and D²b vanish.
-            let coeff_tt = second_delta_newton_weight_from_q_terms(
+            w_tt_diag[i] = second_delta_newton_weight_from_q_terms(
                 score_q,
                 curvature_q,
                 third_q,
@@ -4845,7 +4848,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let a_tl_v = dq_t_v * q.q_ls + q.q_t * dq_ls_v;
             let a_tl_uv =
                 d2q_t_uv * q.q_ls + dq_t_u * dq_ls_v + dq_t_v * dq_ls_u + q.q_t * d2q_ls_uv;
-            let coeff_tl = second_delta_newton_weight_from_q_terms(
+            w_tl_diag[i] = second_delta_newton_weight_from_q_terms(
                 score_q,
                 curvature_q,
                 third_q,
@@ -4871,7 +4874,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let a_ll_u = 2.0 * q.q_ls * dq_ls_u;
             let a_ll_v = 2.0 * q.q_ls * dq_ls_v;
             let a_ll_uv = 2.0 * (dq_ls_u * dq_ls_v + q.q_ls * d2q_ls_uv);
-            let coeff_ll = second_delta_newton_weight_from_q_terms(
+            w_ll_diag[i] = second_delta_newton_weight_from_q_terms(
                 score_q,
                 curvature_q,
                 third_q,
@@ -4888,25 +4891,23 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
                 dq_ll_v,
                 d2q_ll_uv,
             );
+        }
 
-            let xtr = x_t.row(i).to_vec();
-            let xlsr = x_ls.row(i).to_vec();
-            for a_idx in 0..pt {
-                for b_idx in a_idx..pt {
-                    d2_h[[a_idx, b_idx]] += coeff_tt * xtr[a_idx] * xtr[b_idx];
-                }
-            }
-            for a_idx in 0..pt {
-                for b_idx in 0..pls {
-                    d2_h[[a_idx, pt + b_idx]] += coeff_tl * xtr[a_idx] * xlsr[b_idx];
-                }
-            }
-            for a_idx in 0..pls {
-                for b_idx in a_idx..pls {
-                    d2_h[[pt + a_idx, pt + b_idx]] += coeff_ll * xlsr[a_idx] * xlsr[b_idx];
-                }
+        let d2_h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let d2_h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
+        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
+        for i in 0..n {
+            let w = w_tl_diag[i];
+            for j in 0..pls {
+                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
             }
         }
+        let d2_h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
+
+        let mut d2_h = Array2::<f64>::zeros((total, total));
+        d2_h.slice_mut(s![0..pt, 0..pt]).assign(&d2_h_tt);
+        d2_h.slice_mut(s![0..pt, pt..total]).assign(&d2_h_tl);
+        d2_h.slice_mut(s![pt..total, pt..total]).assign(&d2_h_ll);
         mirror_upper_to_lower(&mut d2_h);
         Ok(Some(d2_h))
     }
@@ -6910,29 +6911,12 @@ mod tests {
             let h_plus = extract(family.evaluate(&plus_states).expect("plus eval"), block_idx);
             let h_base = extract(base_eval.clone(), block_idx);
             let fd = (h_plus - h_base) / eps;
-            for i in 0..analytic.nrows() {
-                for j in 0..analytic.ncols() {
-                    assert_eq!(
-                        analytic[[i, j]].signum(),
-                        fd[[i, j]].signum(),
-                        "block {} dH sign mismatch at ({}, {}): analytic={}, fd={}",
-                        block_idx,
-                        i,
-                        j,
-                        analytic[[i, j]],
-                        fd[[i, j]]
-                    );
-                    assert!(
-                        (analytic[[i, j]] - fd[[i, j]]).abs() < 5e-4,
-                        "block {} dH mismatch at ({}, {}): analytic={}, fd={}",
-                        block_idx,
-                        i,
-                        j,
-                        analytic[[i, j]],
-                        fd[[i, j]]
-                    );
-                }
-            }
+            crate::testing::assert_matrix_derivative_fd(
+                &fd,
+                &analytic,
+                5e-4,
+                &format!("block {} dH", block_idx),
+            );
         }
     }
 
@@ -7065,27 +7049,7 @@ mod tests {
             .expect("plus joint hessian")
             .expect("expected plus joint hessian");
         let fd = (h_plus - base_h) / eps;
-        for i in 0..analytic.nrows() {
-            for j in 0..analytic.ncols() {
-                assert_eq!(
-                    analytic[[i, j]].signum(),
-                    fd[[i, j]].signum(),
-                    "joint dH sign mismatch at ({}, {}): analytic={}, fd={}",
-                    i,
-                    j,
-                    analytic[[i, j]],
-                    fd[[i, j]]
-                );
-                assert!(
-                    (analytic[[i, j]] - fd[[i, j]]).abs() < 2e-3,
-                    "joint dH mismatch at ({}, {}): analytic={}, fd={}",
-                    i,
-                    j,
-                    analytic[[i, j]],
-                    fd[[i, j]]
-                );
-            }
-        }
+        crate::testing::assert_matrix_derivative_fd(&fd, &analytic, 2e-3, "joint dH");
     }
 
     #[test]
@@ -7203,27 +7167,7 @@ mod tests {
             .expect("expected joint exact dH minus");
         let fd = (d_h_plus - d_h_minus) / (2.0 * eps);
 
-        for i in 0..analytic.nrows() {
-            for j in 0..analytic.ncols() {
-                assert_eq!(
-                    analytic[[i, j]].signum(),
-                    fd[[i, j]].signum(),
-                    "joint d2H sign mismatch at ({}, {}): analytic={}, fd={}",
-                    i,
-                    j,
-                    analytic[[i, j]],
-                    fd[[i, j]]
-                );
-                assert!(
-                    (analytic[[i, j]] - fd[[i, j]]).abs() < 4e-3,
-                    "joint d2H mismatch at ({}, {}): analytic={}, fd={}",
-                    i,
-                    j,
-                    analytic[[i, j]],
-                    fd[[i, j]]
-                );
-            }
-        }
+        crate::testing::assert_matrix_derivative_fd(&fd, &analytic, 4e-3, "joint d2H");
     }
 
     #[test]
@@ -7387,67 +7331,9 @@ mod tests {
             .to_owned();
 
         for i in 0..h_t_ls.nrows() {
-            for j in 0..h_t_ls.ncols() {
-                assert_eq!(
-                    h_t_ls[[i, j]].signum(),
-                    fd_t_ls[[i, j]].signum(),
-                    "H_t_ls sign mismatch at ({}, {}): analytic={}, fd={}",
-                    i,
-                    j,
-                    h_t_ls[[i, j]],
-                    fd_t_ls[[i, j]]
-                );
-                assert!(
-                    (h_t_ls[[i, j]] - fd_t_ls[[i, j]]).abs() < 2e-4,
-                    "H_t_ls mismatch at ({}, {}): analytic={}, fd={}",
-                    i,
-                    j,
-                    h_t_ls[[i, j]],
-                    fd_t_ls[[i, j]]
-                );
-            }
-        }
-        for i in 0..h_t_w.nrows() {
-            for j in 0..h_t_w.ncols() {
-                assert_eq!(
-                    h_t_w[[i, j]].signum(),
-                    fd_t_w[[i, j]].signum(),
-                    "H_t_w sign mismatch at ({}, {}): analytic={}, fd={}",
-                    i,
-                    j,
-                    h_t_w[[i, j]],
-                    fd_t_w[[i, j]]
-                );
-                assert!(
-                    (h_t_w[[i, j]] - fd_t_w[[i, j]]).abs() < 4e-4,
-                    "H_t_w mismatch at ({}, {}): analytic={}, fd={}",
-                    i,
-                    j,
-                    h_t_w[[i, j]],
-                    fd_t_w[[i, j]]
-                );
-            }
-        }
-        for i in 0..h_ls_w.nrows() {
-            for j in 0..h_ls_w.ncols() {
-                assert_eq!(
-                    h_ls_w[[i, j]].signum(),
-                    fd_ls_w[[i, j]].signum(),
-                    "H_ls_w sign mismatch at ({}, {}): analytic={}, fd={}",
-                    i,
-                    j,
-                    h_ls_w[[i, j]],
-                    fd_ls_w[[i, j]]
-                );
-                assert!(
-                    (h_ls_w[[i, j]] - fd_ls_w[[i, j]]).abs() < 6e-4,
-                    "H_ls_w mismatch at ({}, {}): analytic={}, fd={}",
-                    i,
-                    j,
-                    h_ls_w[[i, j]],
-                    fd_ls_w[[i, j]]
-                );
-            }
+            crate::testing::assert_matrix_derivative_fd(&fd_t_ls, &h_t_ls, 2e-4, "H_t_ls");
+            crate::testing::assert_matrix_derivative_fd(&fd_t_w, &h_t_w, 4e-4, "H_t_w");
+            crate::testing::assert_matrix_derivative_fd(&fd_ls_w, &h_ls_w, 6e-4, "H_ls_w");
         }
     }
 

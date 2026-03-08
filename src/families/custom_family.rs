@@ -840,12 +840,22 @@ fn solve_kkt_step(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
     active_a: &Array2<f64>,
+    active_residual: Option<&Array1<f64>>,
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
     let p = hessian.nrows();
     if hessian.ncols() != p || gradient.len() != p || active_a.ncols() != p {
         return Err("constrained KKT step: dimension mismatch".to_string());
     }
     let m = active_a.nrows();
+    if let Some(residual) = active_residual
+        && residual.len() != m
+    {
+        return Err(format!(
+            "constrained KKT step: active residual length mismatch: got {}, expected {}",
+            residual.len(),
+            m
+        ));
+    }
     if m == 0 {
         let rhs = gradient.mapv(|v| -v);
         let solver = StableSolver::new("custom-family unconstrained kkt step");
@@ -872,6 +882,11 @@ fn solve_kkt_step(
     let mut rhs = Array1::<f64>::zeros(p + m);
     for i in 0..p {
         rhs[i] = -gradient[i];
+    }
+    if let Some(residual) = active_residual {
+        for i in 0..m {
+            rhs[p + i] = residual[i];
+        }
     }
 
     let kkt_view = FaerArrayView::new(&kkt);
@@ -982,10 +997,12 @@ fn solve_quadratic_with_linear_constraints(
     for _ in 0..((p + m + 8) * 4) {
         let gradient = hessian.dot(&x) - rhs;
         let mut a_w = Array2::<f64>::zeros((active.len(), p));
+        let mut residual_w = Array1::<f64>::zeros(active.len());
         for (r, &idx) in active.iter().enumerate() {
             a_w.row_mut(r).assign(&constraints.a.row(idx));
+            residual_w[r] = constraints.b[idx] - constraints.a.row(idx).dot(&x);
         }
-        let (direction, lambda_sys) = solve_kkt_step(hessian, &gradient, &a_w)?;
+        let (direction, lambda_sys) = solve_kkt_step(hessian, &gradient, &a_w, Some(&residual_w))?;
         let step_norm = direction.iter().map(|v| v * v).sum::<f64>().sqrt();
         if step_norm <= tol_step {
             if active.is_empty() {

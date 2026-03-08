@@ -1081,21 +1081,27 @@ impl<'a> RemlState<'a> {
             } else {
                 InverseLink::Standard(self.config.link_function())
             };
+            let problem = pirls::PirlsProblem {
+                x: &self.x,
+                offset: self.offset.view(),
+                y: self.y,
+                prior_weights: self.weights,
+                covariate_se: None,
+            };
+            let penalty = pirls::PenaltyConfig {
+                rs_original: &self.rs_list,
+                balanced_penalty_root: Some(&self.balanced_penalty_root),
+                reparam_invariant: Some(&self.reparam_invariant),
+                p: self.p,
+                coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
+                linear_constraints_original: self.linear_constraints.as_ref(),
+            };
             pirls::fit_model_for_fixed_rho_matrix(
                 LogSmoothingParamsView::new(rho.view()),
-                &self.x,
-                self.offset.view(),
-                self.y,
-                self.weights,
-                &self.rs_list,
-                Some(&self.balanced_penalty_root),
-                Some(&self.reparam_invariant),
-                self.p,
+                problem,
+                penalty,
                 &pirls_config,
                 warm_start_ref,
-                self.coefficient_lower_bounds.as_ref(),
-                self.linear_constraints.as_ref(),
-                None, // No SE for base model
             )
         };
 

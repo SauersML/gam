@@ -6,7 +6,11 @@ use std::path::Path;
 
 #[inline]
 fn canonical_zero(v: f64) -> f64 {
-    if v.abs() < 1e-15 { 0.0 } else { v }
+    if v.abs() < 1e-15 {
+        0.0
+    } else {
+        v
+    }
 }
 
 #[inline]
@@ -27,12 +31,23 @@ fn logistic_stable(eta: f64) -> f64 {
 }
 
 #[inline]
+fn validated_bounded_sigma_span(sigma_min: f64, sigma_max: f64) -> f64 {
+    assert!(sigma_min.is_finite(), "sigma_min must be finite");
+    assert!(sigma_max.is_finite(), "sigma_max must be finite");
+    assert!(
+        sigma_max > sigma_min,
+        "sigma_max must be greater than sigma_min"
+    );
+    sigma_max - sigma_min
+}
+
+#[inline]
 pub fn bounded_sigma_and_deriv_from_eta_scalar(
     eta: f64,
     sigma_min: f64,
     sigma_max: f64,
 ) -> (f64, f64) {
-    let span = (sigma_max - sigma_min).max(1e-12);
+    let span = validated_bounded_sigma_span(sigma_min, sigma_max);
     let p = logistic_stable(eta);
     let sigma = sigma_min + span * p;
     let dsigma_deta = span * p * (1.0 - p);
@@ -46,9 +61,8 @@ pub fn bounded_sigma_from_eta_scalar(eta: f64, sigma_min: f64, sigma_max: f64) -
 
 #[inline]
 pub fn bounded_sigma_eta_for_sigma_scalar(sigma: f64, sigma_min: f64, sigma_max: f64) -> f64 {
-    let span = (sigma_max - sigma_min).max(1e-12);
-    let sigma_target = sigma.clamp(sigma_min + 1e-12, sigma_max - 1e-12);
-    let p = ((sigma_target - sigma_min) / span).clamp(1e-12, 1.0 - 1e-12);
+    let span = validated_bounded_sigma_span(sigma_min, sigma_max);
+    let p = ((sigma - sigma_min) / span).clamp(1e-12, 1.0 - 1e-12);
     (p / (1.0 - p)).ln()
 }
 
@@ -73,7 +87,7 @@ pub fn bounded_sigma_derivs_up_to_third_scalar(
     sigma_min: f64,
     sigma_max: f64,
 ) -> (f64, f64, f64, f64) {
-    let span = (sigma_max - sigma_min).max(1e-12);
+    let span = validated_bounded_sigma_span(sigma_min, sigma_max);
     let p = logistic_stable(eta);
     let a = p * (1.0 - p);
     let sigma = sigma_min + span * p;
@@ -114,7 +128,7 @@ pub fn bounded_sigma_derivs_up_to_fourth_scalar(
     sigma_min: f64,
     sigma_max: f64,
 ) -> (f64, f64, f64, f64, f64) {
-    let span = (sigma_max - sigma_min).max(1e-12);
+    let span = validated_bounded_sigma_span(sigma_min, sigma_max);
     let p = logistic_stable(eta);
     let a = p * (1.0 - p);
     let sigma = sigma_min + span * p;
@@ -326,5 +340,42 @@ mod tests {
             assert!((d3[i] - d3s).abs() < 1e-12);
             assert!((d4[i] - d4s).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn bounded_sigma_respects_ultra_narrow_bounds() {
+        let sigma_min = 1.0;
+        let sigma_max = 1.0 + 5e-13;
+
+        let sigma_mid = bounded_sigma_from_eta_scalar(0.0, sigma_min, sigma_max);
+        let sigma_hi = bounded_sigma_from_eta_scalar(f64::INFINITY, sigma_min, sigma_max);
+        let sigma_lo = bounded_sigma_from_eta_scalar(f64::NEG_INFINITY, sigma_min, sigma_max);
+
+        assert!(sigma_mid >= sigma_min && sigma_mid <= sigma_max);
+        assert_eq!(sigma_hi, sigma_max);
+        assert_eq!(sigma_lo, sigma_min);
+    }
+
+    #[test]
+    fn bounded_sigma_inverse_accepts_ultra_narrow_bounds() {
+        let sigma_min = 1.0;
+        let sigma_max = 1.0 + 5e-13;
+        let sigma = sigma_min + 2.5e-13;
+
+        let eta = bounded_sigma_eta_for_sigma_scalar(sigma, sigma_min, sigma_max);
+
+        assert!(eta.is_finite());
+    }
+
+    #[test]
+    #[should_panic(expected = "sigma_max must be greater than sigma_min")]
+    fn bounded_sigma_forward_rejects_equal_bounds() {
+        let _ = bounded_sigma_from_eta_scalar(0.0, 1.0, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "sigma_max must be greater than sigma_min")]
+    fn bounded_sigma_inverse_rejects_reversed_bounds() {
+        let _ = bounded_sigma_eta_for_sigma_scalar(1.0, 2.0, 1.0);
     }
 }
