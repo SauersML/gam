@@ -6840,6 +6840,12 @@ fn build_smooth_basis(
             })
         }
         "duchon" => {
+            if options.contains_key("double_penalty") {
+                return Err(
+                    "duchon smooths always include nullspace shrinkage; remove double_penalty"
+                        .to_string(),
+                );
+            }
             let centers = parse_count_with_basis_alias(
                 options,
                 "centers",
@@ -9154,6 +9160,13 @@ mod tests {
             }
             other => panic!("expected smooth term, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_formula_rejects_duchon_double_penalty_option() {
+        let err = parse_formula("y ~ s(pc1, pc2, type=duchon, double_penalty=false)")
+            .expect_err("duchon double_penalty should be rejected");
+        assert!(err.contains("duchon smooths always include nullspace shrinkage"));
     }
 
     #[test]

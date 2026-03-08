@@ -916,15 +916,14 @@ fn flatten_exact_newton_penalized_gradient(
     let mut at = 0usize;
     for b in 0..states.len() {
         let p = states[b].beta.len();
-        let score = match &eval.block_working_sets[b] {
-            BlockWorkingSet::ExactNewton { gradient, .. } => gradient,
-            _ => {
-                return Err(
+        let score =
+            match &eval.block_working_sets[b] {
+                BlockWorkingSet::ExactNewton { gradient, .. } => gradient,
+                _ => return Err(
                     "exact-newton joint polish requires exact-newton working sets for all blocks"
                         .to_string(),
-                )
-            }
-        };
+                ),
+            };
         if score.len() != p || s_lambdas[b].nrows() != p || s_lambdas[b].ncols() != p {
             return Err(format!(
                 "exact-newton joint gradient flatten shape mismatch on block {b}"
@@ -934,7 +933,8 @@ fn flatten_exact_newton_penalized_gradient(
         if mode_ridge > 0.0 {
             penalized_grad += &states[b].beta.mapv(|v| mode_ridge * v);
         }
-        grad.slice_mut(ndarray::s![at..at + p]).assign(&penalized_grad);
+        grad.slice_mut(ndarray::s![at..at + p])
+            .assign(&penalized_grad);
         at += p;
     }
     Ok(grad)
@@ -989,11 +989,13 @@ fn inner_exact_joint_fit<F: CustomFamily>(
         Ok(states)
     };
 
-    let eval_value = |beta_flat: &Array1<f64>| -> Result<(f64, Array1<f64>, Array2<f64>, Vec<ParameterBlockState>), String> {
+    let eval_value = |beta_flat: &Array1<f64>| -> Result<
+        (f64, Array1<f64>, Array2<f64>, Vec<ParameterBlockState>),
+        String,
+    > {
         let states = project_states(beta_flat)?;
         let eval = family.evaluate(&states)?;
-        let grad =
-            flatten_exact_newton_penalized_gradient(&eval, &states, s_lambdas, mode_ridge)?;
+        let grad = flatten_exact_newton_penalized_gradient(&eval, &states, s_lambdas, mode_ridge)?;
         let mut h = family
             .exact_newton_joint_hessian(&states)?
             .ok_or_else(|| "missing joint exact-newton Hessian in inner exact fit".to_string())?;
@@ -1007,8 +1009,8 @@ fn inner_exact_joint_fit<F: CustomFamily>(
             ));
         }
         h += &s_joint;
-        let objective =
-            -eval.log_likelihood + total_quadratic_penalty(&states, s_lambdas, ridge, options.ridge_policy);
+        let objective = -eval.log_likelihood
+            + total_quadratic_penalty(&states, s_lambdas, ridge, options.ridge_policy);
         Ok((objective, grad, h, states))
     };
 
@@ -1017,19 +1019,21 @@ fn inner_exact_joint_fit<F: CustomFamily>(
     let upper = Array1::<f64>::from_elem(total, 1e12);
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Vec<ParameterBlockState>)> = None;
     let objective = CachedSecondOrderObjective::new(
-        |x: &Array1<f64>| {
-            match eval_value(x) {
-                Ok((obj, grad, h, states)) if obj.is_finite() && grad.iter().all(|v| v.is_finite()) && h.iter().all(|v| v.is_finite()) => {
-                    last_eval = Some((x.clone(), obj, grad.clone(), states));
-                    Ok((obj, grad, Some(h)))
-                }
-                Ok((_obj, _grad, _h, _states)) => Err(ObjectiveEvalError::recoverable(
-                    "custom-family exact-joint inner objective/derivatives became non-finite",
-                )),
-                Err(e) => Err(ObjectiveEvalError::recoverable(format!(
-                    "custom-family exact-joint inner evaluation failed: {e}"
-                ))),
+        |x: &Array1<f64>| match eval_value(x) {
+            Ok((obj, grad, h, states))
+                if obj.is_finite()
+                    && grad.iter().all(|v| v.is_finite())
+                    && h.iter().all(|v| v.is_finite()) =>
+            {
+                last_eval = Some((x.clone(), obj, grad.clone(), states));
+                Ok((obj, grad, Some(h)))
             }
+            Ok((_obj, _grad, _h, _states)) => Err(ObjectiveEvalError::recoverable(
+                "custom-family exact-joint inner objective/derivatives became non-finite",
+            )),
+            Err(e) => Err(ObjectiveEvalError::recoverable(format!(
+                "custom-family exact-joint inner evaluation failed: {e}"
+            ))),
         },
         1e-4,
     );
@@ -1050,30 +1054,34 @@ fn inner_exact_joint_fit<F: CustomFamily>(
         Err(err) => {
             return Err(format!(
                 "custom-family exact-joint inner optimization failed: {err:?}"
-            ))
+            ));
         }
     };
 
-    let (_beta_star, states) =
-        if let Some((x, _obj, _grad, states)) = last_eval.take() {
-            if x.len() == solution.final_point.len()
-                && x.iter()
-                    .zip(solution.final_point.iter())
-                    .all(|(&a, &b)| (a - b).abs() <= 1e-10)
-            {
-                (x, states)
-            } else {
-                let states = project_states(&solution.final_point)?;
-                (solution.final_point.clone(), states)
-            }
+    let (_beta_star, states) = if let Some((x, _obj, _grad, states)) = last_eval.take() {
+        if x.len() == solution.final_point.len()
+            && x.iter()
+                .zip(solution.final_point.iter())
+                .all(|(&a, &b)| (a - b).abs() <= 1e-10)
+        {
+            (x, states)
         } else {
             let states = project_states(&solution.final_point)?;
             (solution.final_point.clone(), states)
-        };
+        }
+    } else {
+        let states = project_states(&solution.final_point)?;
+        (solution.final_point.clone(), states)
+    };
     let eval = family.evaluate(&states)?;
-    let stationarity_inf =
-        exact_newton_joint_stationarity_inf_norm(&eval, &states, s_lambdas, ridge, options.ridge_policy)?
-            .ok_or_else(|| "inner exact-joint fit expected exact-newton working sets".to_string())?;
+    let stationarity_inf = exact_newton_joint_stationarity_inf_norm(
+        &eval,
+        &states,
+        s_lambdas,
+        ridge,
+        options.ridge_policy,
+    )?
+    .ok_or_else(|| "inner exact-joint fit expected exact-newton working sets".to_string())?;
     if stationarity_inf > options.inner_tol.max(1e-12) {
         return Err(format!(
             "custom-family exact-joint inner optimization stalled before stationarity: inf_norm={stationarity_inf:.3e}"
@@ -2451,6 +2459,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
             options.ridge_floor,
             options.ridge_policy,
             strict_spd,
+            allow_semidefinite,
         )?;
         let diagonal_leverages = diagonal_design
             .as_ref()
@@ -2536,7 +2545,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                 // stationarity surface and must not enter the sensitivity solve.
                 let rhs = -&a_k_beta;
                 let u_k = if strict_spd {
-                    strict_solve_spd(&h_mode, &rhs)?
+                    strict_solve_spd_with_semidefinite_option(&h_mode, &rhs, allow_semidefinite)?
                 } else {
                     solve_spd_system_with_policy(
                         &h_mode,
@@ -2733,6 +2742,7 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
     let include_logdet_h = include_exact_newton_logdet_h(family);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
+    let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinite_hessian();
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let eval = family.evaluate(&inner.block_states)?;
     if eval.block_working_sets.len() != specs.len() {
@@ -2814,6 +2824,7 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                     options.ridge_floor,
                     options.ridge_policy,
                     strict_spd,
+                    allow_semidefinite,
                 )?;
                 Ok((w, u, h_mode, h_inv))
             })?,
@@ -2840,6 +2851,7 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                     options.ridge_floor,
                     options.ridge_policy,
                     strict_spd,
+                    allow_semidefinite,
                 )?;
 
                 for deriv in psi_terms {
@@ -2911,7 +2923,11 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                         let explicit = 0.5 * beta.dot(&s_psi_total.dot(beta));
                         let rhs = s_psi_total.dot(beta);
                         let u_psi = if strict_spd {
-                            strict_solve_spd(&h_mode, &rhs)?
+                            strict_solve_spd_with_semidefinite_option(
+                                &h_mode,
+                                &rhs,
+                                allow_semidefinite,
+                            )?
                         } else {
                             solve_spd_system_with_policy(
                                 &h_mode,
@@ -3410,6 +3426,7 @@ pub(crate) fn debug_exact_newton_rho_gradient_terms<F: CustomFamily>(
     let include_logdet_h = include_exact_newton_logdet_h(family);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
+    let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinite_hessian();
     let ridge = effective_solver_ridge(options.ridge_floor);
     let mode_ridge = if options.ridge_policy.include_quadratic_penalty {
         ridge
@@ -3458,10 +3475,14 @@ pub(crate) fn debug_exact_newton_rho_gradient_terms<F: CustomFamily>(
         ridge,
         options.ridge_policy,
     )?
-    .ok_or_else(|| "debug_exact_newton_rho_gradient_terms expected exact-newton working sets".to_string())?;
+    .ok_or_else(|| {
+        "debug_exact_newton_rho_gradient_terms expected exact-newton working sets".to_string()
+    })?;
     let h_joint_unpen = family
         .exact_newton_joint_hessian(&inner.block_states)?
-        .ok_or_else(|| "debug_exact_newton_rho_gradient_terms requires a joint exact Hessian".to_string())?;
+        .ok_or_else(|| {
+            "debug_exact_newton_rho_gradient_terms requires a joint exact Hessian".to_string()
+        })?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     let beta_flat = flatten_state_betas(&inner.block_states, specs);
@@ -3523,6 +3544,7 @@ pub(crate) fn debug_exact_newton_rho_gradient_terms<F: CustomFamily>(
         options.ridge_floor,
         options.ridge_policy,
         strict_spd,
+        allow_semidefinite,
     )?;
 
     let mut penalty_term = Array1::<f64>::zeros(rho_current.len());
@@ -3549,18 +3571,18 @@ pub(crate) fn debug_exact_newton_rho_gradient_terms<F: CustomFamily>(
                 &rhs_k,
                 joint_tangent_basis.as_ref(),
                 strict_spd,
+                allow_semidefinite,
                 options,
                 "debug joint mode sensitivity system",
             )?;
             u_terms.push(u_k.clone());
             let g_log_s = if include_logdet_s {
-                0.5
-                    * trace_product(
-                        s_pinv_joint
-                            .as_ref()
-                            .ok_or_else(|| "missing joint S^+ for debug gradient".to_string())?,
-                        &a_k,
-                    )
+                0.5 * trace_product(
+                    s_pinv_joint
+                        .as_ref()
+                        .ok_or_else(|| "missing joint S^+ for debug gradient".to_string())?,
+                    &a_k,
+                )
             } else {
                 0.0
             };
@@ -3571,10 +3593,7 @@ pub(crate) fn debug_exact_newton_rho_gradient_terms<F: CustomFamily>(
             };
             let g_log_h_implicit = if include_logdet_h && u_k.dot(&u_k).sqrt() > 1e-14 {
                 let h_rho = family
-                    .exact_newton_joint_hessian_directional_derivative(
-                        &synced_joint_states,
-                        &u_k,
-                    )?
+                    .exact_newton_joint_hessian_directional_derivative(&synced_joint_states, &u_k)?
                     .ok_or_else(|| {
                         "joint exact-newton dH unavailable for debug outer gradient".to_string()
                     })?;
@@ -3777,12 +3796,13 @@ fn solve_mode_sensitivity(
     rhs: &Array1<f64>,
     tangent_basis: Option<&Array2<f64>>,
     strict_spd: bool,
+    allow_semidefinite: bool,
     _options: &BlockwiseFitOptions,
     context: &str,
 ) -> Result<Array1<f64>, String> {
     let solve_dense = |matrix: &Array2<f64>, vector: &Array1<f64>| -> Result<Array1<f64>, String> {
         if strict_spd {
-            strict_solve_spd(matrix, vector)
+            strict_solve_spd_with_semidefinite_option(matrix, vector, allow_semidefinite)
         } else {
             solve_dense_symmetric_indefinite(matrix, vector, context)
         }
@@ -4857,6 +4877,34 @@ mod tests {
     }
 
     #[test]
+    fn strict_psd_positive_part_geometry_accepts_semidefinite_boundary() {
+        let h = array![[4.0, 0.0], [0.0, 0.0]];
+        let rhs = array![8.0, 3.0];
+        let sol = strict_solve_spd_with_semidefinite_option(&h, &rhs, true)
+            .expect("semidefinite positive-part solve");
+        let inv = strict_inverse_spd_with_semidefinite_option(&h, true)
+            .expect("semidefinite positive-part inverse");
+        let logdet = strict_logdet_spd_with_semidefinite_option(&h, true)
+            .expect("semidefinite positive-part logdet");
+        assert!((sol[0] - 2.0).abs() < 1e-12);
+        assert!(sol[1].abs() < 1e-12);
+        assert!((inv[[0, 0]] - 0.25).abs() < 1e-12);
+        assert!(inv[[1, 1]].abs() < 1e-12);
+        assert!((logdet - 4.0_f64.ln()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn strict_psd_positive_part_geometry_still_rejects_indefinite_matrix() {
+        let h = array![[1.0, 0.0], [0.0, -1e-3]];
+        let err = strict_solve_spd_with_semidefinite_option(&h, &array![1.0, 0.0], true)
+            .expect_err("indefinite matrix must still be rejected");
+        assert!(
+            err.contains("strict pseudo-laplace SPD solve failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn pseudo_laplace_exact_newton_symmetrizes_nearly_symmetric_hessian() {
         let spec = ParameterBlockSpec {
             name: "nearly_symmetric".to_string(),
@@ -5022,8 +5070,6 @@ mod tests {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
-            threshold_design: Some(threshold_spec.design.clone()),
-            log_sigma_design: Some(log_sigma_spec.design.clone()),
         };
         let specs = vec![threshold_spec, log_sigma_spec];
         let penalty_counts = vec![1usize, 1usize];
@@ -5111,8 +5157,6 @@ mod tests {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
-            threshold_design: Some(threshold_spec.design.clone()),
-            log_sigma_design: Some(log_sigma_spec.design.clone()),
         };
         let specs = vec![threshold_spec, log_sigma_spec];
         let penalty_counts = vec![1usize, 1usize];

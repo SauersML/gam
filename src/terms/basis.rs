@@ -5645,13 +5645,13 @@ fn duchon_radial_core_psi_triplet(
             },
             #[cfg(test)]
             gradient_ratio: PsiTriplet {
-                value: g,
+                value: jets.q,
                 psi: g_psi,
                 psi_psi: g_psi_psi,
             },
             #[cfg(test)]
             laplacian: PsiTriplet {
-                value: lap,
+                value: jets.lap,
                 psi: lap_psi,
                 psi_psi: lap_psi_psi,
             },
@@ -9032,7 +9032,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_bspline_basis_1d_quantile_rejects_singular_divided_difference_penalty() {
+    fn test_build_bspline_basis_1d_quantile_rejects_missing_interior_support() {
         let x = array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
         let spec = BSplineBasisSpec {
             degree: 2,
@@ -9045,11 +9045,12 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
         };
 
-        let built = build_bspline_basis_1d(x.view(), &spec)
-            .expect("quantile builder should collapse duplicated knots safely");
-        assert_eq!(built.penalties.len(), 1);
-        assert!(built.penalties[0].iter().all(|v| v.is_finite()));
-        assert!(built.design.iter().all(|v| v.is_finite()));
+        match build_bspline_basis_1d(x.view(), &spec).unwrap_err() {
+            BasisError::InvalidInput(msg) => {
+                assert!(msg.contains("distinct interior support"));
+            }
+            err => panic!("expected InvalidInput for missing interior support, got {err:?}"),
+        }
     }
 
     #[test]
