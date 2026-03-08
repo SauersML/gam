@@ -15,7 +15,7 @@ use crate::custom_family::{
     BlockGeometryDirectionalDerivative, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
     CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, ExactNewtonOuterObjective,
     ExactNewtonPsiGradientContext, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    evaluate_custom_family_joint_hyper, fit_custom_family,
+    evaluate_custom_family_joint_hyper, fit_custom_family, symmetrize_dense_in_place,
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitOptions, FitResult,
@@ -477,6 +477,23 @@ impl SpatialLogKappaCoords {
 }
 
 impl TwoBlockExactJointHyperSetup {
+    fn sanitize_rho_seed(
+        rho0: Array1<f64>,
+        rho_lower: &Array1<f64>,
+        rho_upper: &Array1<f64>,
+    ) -> Array1<f64> {
+        Array1::from_iter(rho0.iter().enumerate().map(|(idx, &value)| {
+            let lo = rho_lower[idx];
+            let hi = rho_upper[idx];
+            let fallback = 0.0_f64.clamp(lo, hi);
+            if value.is_finite() {
+                value.clamp(lo, hi)
+            } else {
+                fallback
+            }
+        }))
+    }
+
     pub(crate) fn new(
         rho0: Array1<f64>,
         rho_lower: Array1<f64>,
@@ -485,6 +502,7 @@ impl TwoBlockExactJointHyperSetup {
         log_kappa_lower: SpatialLogKappaCoords,
         log_kappa_upper: SpatialLogKappaCoords,
     ) -> Self {
+        let rho0 = Self::sanitize_rho_seed(rho0, &rho_lower, &rho_upper);
         Self {
             rho0,
             rho_lower,
@@ -1023,7 +1041,6 @@ fn build_shape_constraint_design_1d(
                 length_scale: *length_scale,
                 power: *power,
                 nullspace_order: *nullspace_order,
-                double_penalty: false,
                 identifiability: identifiability_transform
                     .as_ref()
                     .map(|z| SpatialIdentifiability::FrozenTransform {
@@ -5019,6 +5036,7 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         }
         let mut h_total = eval.total_objective_hessian(&self.design)?;
         h_total += &quadratic;
+        symmetrize_dense_in_place(&mut h_total);
         let chol = h_total
             .cholesky(Side::Lower)
             .map_err(|_| "strict pseudo-laplace SPD solve failed for adaptive psi".to_string())?;
@@ -7663,7 +7681,6 @@ mod tests {
                     length_scale: Some(0.9),
                     power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
-                    double_penalty: false,
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
                 },
             },
@@ -8121,8 +8138,8 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        assert_eq!(sd.penalties.len(), 3);
-        assert_eq!(sd.nullspace_dims.len(), 3);
+        assert_eq!(sd.penalties.len(), 2);
+        assert_eq!(sd.nullspace_dims.len(), 2);
     }
 
     #[test]
@@ -8145,7 +8162,6 @@ mod tests {
                     length_scale: Some(0.9),
                     power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
-                    double_penalty: true,
                     identifiability: SpatialIdentifiability::default(),
                 },
             },
@@ -8179,7 +8195,6 @@ mod tests {
                     length_scale: Some(1.0),
                     power: 1,
                     nullspace_order: DuchonNullspaceOrder::Zero,
-                    double_penalty: true,
                     identifiability: SpatialIdentifiability::default(),
                 },
             },
@@ -8225,7 +8240,6 @@ mod tests {
                         length_scale: Some(1.0),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Zero,
-                        double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
                 },
@@ -8275,7 +8289,6 @@ mod tests {
                         length_scale: Some(1.0),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Zero,
-                        double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
                 },
@@ -8287,10 +8300,7 @@ mod tests {
             build_term_collection_design(data.view(), &spec).expect("term collection design");
         let caches =
             extract_spatial_operator_runtime_caches(&spec, &design).expect("adaptive caches");
-        assert_eq!(caches.len(), 1);
-        assert_eq!(caches[0].coeff_global_range.len(), 3);
-        assert_eq!(caches[0].d1.ncols(), 3);
-        assert_eq!(caches[0].d2.ncols(), 3);
+        assert_eq!(caches.len(), 0);
     }
 
     #[test]
@@ -8316,7 +8326,6 @@ mod tests {
                         length_scale: Some(1.0),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Zero,
-                        double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
                 },
@@ -8330,10 +8339,8 @@ mod tests {
         let rebuilt = build_term_collection_design(data.view(), &frozen).expect("rebuilt design");
         let caches =
             extract_spatial_operator_runtime_caches(&frozen, &rebuilt).expect("adaptive caches");
-        assert_eq!(caches.len(), 1);
+        assert_eq!(caches.len(), 0);
         assert_eq!(rebuilt.smooth.terms[0].coeff_range.len(), 3);
-        assert_eq!(caches[0].d1.ncols(), 3);
-        assert_eq!(caches[0].d2.ncols(), 3);
     }
 
     #[test]
@@ -8771,7 +8778,6 @@ mod tests {
                         length_scale: Some(0.7),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
-                        double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
                 },
@@ -9115,7 +9121,6 @@ mod tests {
                         length_scale: Some(0.9),
                         power: 1,
                         nullspace_order: DuchonNullspaceOrder::Linear,
-                        double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
                 },
@@ -9201,7 +9206,6 @@ mod tests {
                     length_scale: Some(length_scale),
                     power: 3,
                     nullspace_order: DuchonNullspaceOrder::Linear,
-                    double_penalty: true,
                     identifiability: SpatialIdentifiability::default(),
                 },
             },
@@ -9951,7 +9955,6 @@ mod tests {
                         length_scale: None,
                         power: 2,
                         nullspace_order: DuchonNullspaceOrder::Zero,
-                        double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
                 },
@@ -10103,7 +10106,6 @@ mod tests {
                         length_scale: None,
                         power: 2,
                         nullspace_order: DuchonNullspaceOrder::Zero,
-                        double_penalty: true,
                         identifiability: SpatialIdentifiability::default(),
                     },
                 },
@@ -10151,6 +10153,25 @@ mod tests {
         assert!(diag.epsilon_0.is_finite() && diag.epsilon_0 > 0.0);
         assert!(diag.epsilon_g.is_finite() && diag.epsilon_g > 0.0);
         assert!(diag.epsilon_c.is_finite() && diag.epsilon_c > 0.0);
+    }
+
+    #[test]
+    fn two_block_exact_joint_setup_sanitizes_non_finite_rho_seed() {
+        let setup = TwoBlockExactJointHyperSetup::new(
+            array![f64::NEG_INFINITY, 0.25, f64::INFINITY],
+            array![-12.0, -12.0, -12.0],
+            array![12.0, 12.0, 12.0],
+            SpatialLogKappaCoords::new(array![0.5]),
+            SpatialLogKappaCoords::new(array![-2.0]),
+            SpatialLogKappaCoords::new(array![2.0]),
+        );
+
+        let theta0 = setup.theta0();
+        assert!(theta0.iter().all(|v| v.is_finite()));
+        assert_eq!(theta0[0], 0.0);
+        assert_eq!(theta0[1], 0.25);
+        assert_eq!(theta0[2], 0.0);
+        assert_eq!(theta0[3], 0.5);
     }
 
     #[test]

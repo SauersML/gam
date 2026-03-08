@@ -12,9 +12,7 @@ use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
 };
-use crate::families::sigma_link::{
-    SigmaJet1,
-};
+use crate::families::sigma_link::SigmaJet1;
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
@@ -816,7 +814,10 @@ fn identified_binomial_log_sigma_design(
         &threshold_design.design,
         &log_sigma_design.design,
         weights,
-        log_sigma_design.intercept_range.end.min(log_sigma_design.design.ncols()),
+        log_sigma_design
+            .intercept_range
+            .end
+            .min(log_sigma_design.design.ncols()),
     )
 }
 
@@ -1441,12 +1442,6 @@ pub fn fit_binomial_location_scale(
         y: y.clone(),
         weights: weights.clone(),
         link_kind: link_kind.clone(),
-        threshold_design: Some(blocks[BinomialLocationScaleFamily::BLOCK_T].design.clone()),
-        log_sigma_design: Some(
-            blocks[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
-                .design
-                .clone(),
-        ),
     };
     let fit = fit_custom_family(&family, &blocks, options)?;
     let beta_final = fit.block_states[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
@@ -1880,7 +1875,10 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
                 &mean_design.design,
                 &noise_design.design,
                 &self.weights,
-                noise_design.intercept_range.end.min(noise_design.design.ncols()),
+                noise_design
+                    .intercept_range
+                    .end
+                    .min(noise_design.design.ncols()),
             )?),
             offset: Array1::zeros(self.y.len()),
             penalties: noise_design.penalties.clone(),
@@ -1916,7 +1914,10 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             &mean_design.design,
             &noise_design.design,
             &self.weights,
-            noise_design.intercept_range.end.min(noise_design.design.ncols()),
+            noise_design
+                .intercept_range
+                .end
+                .min(noise_design.design.ncols()),
         )
         .expect("prepared Gaussian log-sigma design should match block construction");
         GaussianLocationScaleFamily {
@@ -2014,8 +2015,6 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            threshold_design: None,
-            log_sigma_design: None,
         }
     }
 
@@ -3066,7 +3065,10 @@ fn binomial_location_scale_row(
     eta_wiggle: f64,
     link_kind: &InverseLink,
 ) -> Result<BinomialLocationScaleRow, String> {
-    let SigmaJet1 { sigma, d1: dsigma_deta } = exp_sigma_jet1_scalar(eta_ls);
+    let SigmaJet1 {
+        sigma,
+        d1: dsigma_deta,
+    } = exp_sigma_jet1_scalar(eta_ls);
     let q0 = binomial_location_scale_q0(eta_t, sigma);
     let q = q0 + eta_wiggle;
     let jet = inverse_link_jet_for_inverse_link(link_kind, q)
@@ -3207,10 +3209,12 @@ fn binomial_location_scale_working_sets(
             .transpose_vector_multiply(&grad_eta_ls);
         let hess_ls = xt_diag_x_symmetric(geom.log_sigma_design, &h_eta_ls)?.to_dense();
         let w_ws = match (geom.wiggle_design, grad_q, h_q_psd) {
-            (Some(wiggle_design), Some(grad_q), Some(h_q_psd)) => Some(BlockWorkingSet::ExactNewton {
-                gradient: fast_atv(wiggle_design, &grad_q),
-                hessian: SymmetricMatrix::Dense(xt_diag_x_dense(wiggle_design, &h_q_psd)?),
-            }),
+            (Some(wiggle_design), Some(grad_q), Some(h_q_psd)) => {
+                Some(BlockWorkingSet::ExactNewton {
+                    gradient: fast_atv(wiggle_design, &grad_q),
+                    hessian: SymmetricMatrix::Dense(xt_diag_x_dense(wiggle_design, &h_q_psd)?),
+                })
+            }
             _ => None,
         };
 
@@ -3309,7 +3313,13 @@ pub struct GaussianLocationScaleFamily {
 #[inline]
 fn gaussian_sigma_derivs_up_to_fourth(
     eta: ArrayView1<'_, f64>,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+) -> (
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+) {
     let sigma = eta.mapv(f64::exp);
     (
         sigma.clone(),
@@ -3838,8 +3848,6 @@ pub struct BinomialLocationScaleFamily {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
     pub link_kind: InverseLink,
-    pub threshold_design: Option<DesignMatrix>,
-    pub log_sigma_design: Option<DesignMatrix>,
 }
 
 impl BinomialLocationScaleFamily {
@@ -3862,23 +3870,6 @@ impl BinomialLocationScaleFamily {
         }
     }
 
-    fn dense_block_designs(&self) -> Result<(Array2<f64>, Array2<f64>), String> {
-        let xt = self
-            .threshold_design
-            .as_ref()
-            .ok_or_else(|| {
-                "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
-            })?
-            .to_dense();
-        let xls = self
-            .log_sigma_design
-            .as_ref()
-            .ok_or_else(|| {
-                "BinomialLocationScaleFamily exact path is missing log-sigma design".to_string()
-            })?
-            .to_dense();
-        Ok((xt, xls))
-    }
 }
 
 impl CustomFamily for BinomialLocationScaleFamily {
@@ -3911,19 +3902,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
             eta_ls,
             None,
             None,
-            Some(BinomialLocationScaleExactGeometry {
-                threshold_design: self.threshold_design.as_ref().ok_or_else(|| {
-                    "BinomialLocationScaleFamily exact-newton path is missing threshold design"
-                        .to_string()
-                })?,
-                log_sigma_design: self.log_sigma_design.as_ref().ok_or_else(|| {
-                    "BinomialLocationScaleFamily exact-newton path is missing log-sigma design"
-                        .to_string()
-                })?,
-                wiggle_design: None,
-                d2sigma_deta2: &core.dsigma_deta,
-                d2q_dq02: None,
-            }),
+            None,
             &core,
         )?;
 
@@ -4633,8 +4612,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
         }
         let mut mean = Array1::<f64>::zeros(self.y.len());
         for i in 0..mean.len() {
-            let sigma =
-                exp_sigma_from_eta_scalar(eta_ls[i]).max(1e-12);
+            let sigma = exp_sigma_from_eta_scalar(eta_ls[i]).max(1e-12);
             let q = binomial_location_scale_q0(eta_t[i], sigma);
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
                 .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
@@ -6439,15 +6417,9 @@ mod tests {
             wiggle_degree: 2,
         };
 
-        let core_for_q0 = binomial_location_scale_core(
-            &y,
-            &weights,
-            &eta_t,
-            &eta_ls,
-            None,
-            &family.link_kind
-        )
-        .expect("core q0");
+        let core_for_q0 =
+            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+                .expect("core q0");
         let beta_wiggle = Array1::from_vec(vec![0.1; wiggle_block.design.ncols()]);
         let eta_w = family
             .wiggle_design(core_for_q0.q0.view())
@@ -6460,7 +6432,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             Some(&eta_w),
-            &family.link_kind
+            &family.link_kind,
         )
         .expect("core");
         let dq_dq0 = family
@@ -6615,15 +6587,9 @@ mod tests {
 
         let eta_t = Array1::from_vec(vec![0.4; n]);
         let eta_ls = Array1::from_vec(vec![-0.2; n]);
-        let core_for_q0 = binomial_location_scale_core(
-            &y,
-            &weights,
-            &eta_t,
-            &eta_ls,
-            None,
-            &family.link_kind
-        )
-        .expect("core q0");
+        let core_for_q0 =
+            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+                .expect("core q0");
         let beta_w = Array1::from_vec(vec![0.05; wiggle_block.design.ncols()]);
         let eta_w = family
             .wiggle_design(core_for_q0.q0.view())
@@ -6712,15 +6678,9 @@ mod tests {
         let beta_ls = Array1::from_vec(vec![-0.15]);
         let eta_t = threshold_design.matrix_vector_multiply(&beta_t);
         let eta_ls = log_sigma_design.matrix_vector_multiply(&beta_ls);
-        let core_for_q0 = binomial_location_scale_core(
-            &y,
-            &weights,
-            &eta_t,
-            &eta_ls,
-            None,
-            &family.link_kind
-        )
-        .expect("core q0");
+        let core_for_q0 =
+            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+                .expect("core q0");
         let beta_w = Array1::from_vec(vec![0.04; wiggle_block.design.ncols()]);
         let eta_w = family
             .wiggle_design(core_for_q0.q0.view())
@@ -6777,7 +6737,7 @@ mod tests {
                 &plus_states[BinomialLocationScaleWiggleFamily::BLOCK_T].eta,
                 &plus_states[BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA].eta,
                 None,
-                &family.link_kind
+                &family.link_kind,
             )
             .expect("plus core q0");
             plus_states[BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE].eta = family
@@ -6829,15 +6789,9 @@ mod tests {
         let beta_ls = Array1::from_vec(vec![-0.15]);
         let eta_t = threshold_design.matrix_vector_multiply(&beta_t);
         let eta_ls = log_sigma_design.matrix_vector_multiply(&beta_ls);
-        let core_for_q0 = binomial_location_scale_core(
-            &y,
-            &weights,
-            &eta_t,
-            &eta_ls,
-            None,
-            &family.link_kind
-        )
-        .expect("core q0");
+        let core_for_q0 =
+            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+                .expect("core q0");
         let beta_w = Array1::from_vec(vec![0.04; wiggle_block.design.ncols()]);
         let eta_w = family
             .wiggle_design(core_for_q0.q0.view())
@@ -6902,7 +6856,7 @@ mod tests {
             &plus_states[BinomialLocationScaleWiggleFamily::BLOCK_T].eta,
             &plus_states[BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA].eta,
             None,
-            &family.link_kind
+            &family.link_kind,
         )
         .expect("plus core q0");
         plus_states[BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE].eta = family
@@ -6958,7 +6912,7 @@ mod tests {
                 &eta_t,
                 &eta_ls,
                 None,
-                &family.link_kind
+                &family.link_kind,
             )
             .expect("core q0");
             let eta_w = family
@@ -7071,7 +7025,7 @@ mod tests {
                 &eta_t,
                 &eta_ls,
                 None,
-                &family.link_kind
+                &family.link_kind,
             )
             .expect("core q0");
             let eta_w = family
@@ -7320,15 +7274,9 @@ mod tests {
             },
         ];
         let spec = family.generative_spec(&states).expect("generative spec");
-        let core = binomial_location_scale_core(
-            &y,
-            &weights,
-            &eta_t,
-            &eta_ls,
-            None,
-            &family.link_kind
-        )
-        .expect("core");
+        let core =
+            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+                .expect("core");
         for i in 0..n {
             assert!(
                 (spec.mean[i] - core.mu[i]).abs() < 1e-7,
@@ -7367,15 +7315,9 @@ mod tests {
             wiggle_degree: 2,
         };
 
-        let core_for_q0 = binomial_location_scale_core(
-            &y,
-            &weights,
-            &eta_t,
-            &eta_ls,
-            None,
-            &family.link_kind
-        )
-        .expect("core q0");
+        let core_for_q0 =
+            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+                .expect("core q0");
         let beta_w = Array1::from_vec(vec![0.15; wiggle_block.design.ncols()]);
         let eta_w = family
             .wiggle_design(core_for_q0.q0.view())
@@ -7430,7 +7372,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             Some(&eta_w),
-            &family.link_kind
+            &family.link_kind,
         )
         .expect("core with wiggle");
         for i in 0..n {

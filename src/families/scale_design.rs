@@ -147,7 +147,11 @@ pub fn build_scale_deviation_transform(
         residual.mapv_inplace(|v| v - center);
         let orig_ss = weighted_centered_ss(col.view(), weights)?;
         let resid_ss = weighted_centered_ss(residual.view(), weights)?;
-        let scale = if resid_ss.is_finite() && resid_ss > COLUMN_TOL && orig_ss.is_finite() && orig_ss > COLUMN_TOL {
+        let scale = if resid_ss.is_finite()
+            && resid_ss > COLUMN_TOL
+            && orig_ss.is_finite()
+            && orig_ss > COLUMN_TOL
+        {
             (orig_ss / resid_ss).sqrt()
         } else {
             1.0
@@ -181,9 +185,8 @@ pub fn apply_scale_deviation_transform(
     let projected = primary_design.dot(&transform.projection_coef);
     for j in transform.non_intercept_start.min(out.ncols())..out.ncols() {
         for i in 0..out.nrows() {
-            out[[i, j]] =
-                (out[[i, j]] - projected[[i, j]] - transform.weighted_column_mean[j])
-                    * transform.rescale[j];
+            out[[i, j]] = (out[[i, j]] - projected[[i, j]] - transform.weighted_column_mean[j])
+                * transform.rescale[j];
         }
     }
     Ok(out)

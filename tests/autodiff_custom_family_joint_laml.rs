@@ -3,7 +3,9 @@ use ad_trait::differentiable_function::{DifferentiableFunctionTrait, ForwardAD};
 use ad_trait::forward_ad::adfn::adfn;
 use ad_trait::function_engine::FunctionEngine;
 use autodiff::{F1, Float, diff};
-use gam::families::custom_family::{CustomFamilyBlockPsiDerivative, evaluate_custom_family_joint_hyper};
+use gam::families::custom_family::{
+    CustomFamilyBlockPsiDerivative, evaluate_custom_family_joint_hyper,
+};
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
@@ -225,8 +227,10 @@ impl<T: AD> DifferentiableFunctionTrait<T> for CoupledQuarticObjectiveFn<T> {
             + T::constant(0.5) * d * beta2 * beta2;
         let curvature = T::one() + T::constant(3.0) * a * eta * eta;
         let det = (curvature + lambda) * (curvature + d) - curvature * curvature;
-        vec![nll + T::constant(0.5) * lambda * beta1 * beta1 + T::constant(0.5) * det.ln()
-            - T::constant(0.5) * rho]
+        vec![
+            nll + T::constant(0.5) * lambda * beta1 * beta1 + T::constant(0.5) * det.ln()
+                - T::constant(0.5) * rho,
+        ]
     }
 
     fn num_inputs(&self) -> usize {

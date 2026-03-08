@@ -1081,6 +1081,21 @@ fn resolved_external_config(
 }
 
 #[inline]
+fn external_smoothing_optimizer_kind(
+    optimize_mixture: bool,
+    optimize_sas: bool,
+) -> SmoothingOptimizerKind {
+    if optimize_mixture || optimize_sas {
+        // This branch exposes exact outer gradients but not an exact Hessian.
+        // ARC would finite-difference that Hessian from repeated full REML/PIRLS
+        // evaluations, which is disproportionately expensive for SAS/mixture links.
+        SmoothingOptimizerKind::Bfgs
+    } else {
+        SmoothingOptimizerKind::Arc
+    }
+}
+
+#[inline]
 fn ensure_exact_directional_hyper_supported(
     link: LinkFunction,
     firth_active: bool,
@@ -1277,7 +1292,7 @@ where
         finite_diff_step: 1e-3,
         // External REML path below provides exact Hessians directly.
         fd_hessian_max_dim: 0,
-        optimizer_kind: crate::solver::smoothing::SmoothingOptimizerKind::Arc,
+        optimizer_kind: external_smoothing_optimizer_kind(opts.optimize_mixture, opts.optimize_sas),
         seed_config: SeedConfig {
             bounds: (-12.0, 12.0),
             max_seeds: if k <= 4 {
@@ -4170,6 +4185,22 @@ mod fd_policy_tests {
         // <20 rule still triggers Firth because support per parameter is weak.
         assert!(should_enable_firth_from_class_support(425.0, 225));
         assert!(!should_enable_firth_from_class_support(460.0, 225));
+    }
+
+    #[test]
+    fn auxiliary_link_outer_optimization_uses_bfgs() {
+        assert_eq!(
+            external_smoothing_optimizer_kind(false, false),
+            SmoothingOptimizerKind::Arc
+        );
+        assert_eq!(
+            external_smoothing_optimizer_kind(true, false),
+            SmoothingOptimizerKind::Bfgs
+        );
+        assert_eq!(
+            external_smoothing_optimizer_kind(false, true),
+            SmoothingOptimizerKind::Bfgs
+        );
     }
 
     fn build_tiny_design(n: usize) -> Array2<f64> {

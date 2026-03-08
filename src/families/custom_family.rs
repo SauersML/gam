@@ -286,6 +286,16 @@ pub trait CustomFamily {
     ) -> Result<Option<f64>, String> {
         Ok(None)
     }
+
+    /// Whether pseudo-Laplace traces and sensitivities may use the positive
+    /// curvature subspace when the exact mode Hessian is only semidefinite.
+    ///
+    /// Families that legitimately optimize to boundary regimes with exact
+    /// zero-curvature directions can opt in; truly indefinite Hessians are
+    /// still rejected.
+    fn exact_newton_allows_semidefinite_hessian(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -1342,14 +1352,8 @@ fn stable_logdet_with_ridge_policy(
     ridge_policy: RidgePolicy,
 ) -> Result<f64, String> {
     let mut a = matrix.clone();
+    symmetrize_dense_in_place(&mut a);
     let p = a.nrows();
-    for i in 0..p {
-        for j in 0..i {
-            let v = 0.5 * (a[[i, j]] + a[[j, i]]);
-            a[[i, j]] = v;
-            a[[j, i]] = v;
-        }
-    }
     let ridge = if ridge_policy.include_penalty_logdet {
         effective_solver_ridge(ridge_floor)
     } else {
@@ -1386,9 +1390,13 @@ fn logdet_trace_inverse_with_ridge_policy(
     ridge_floor: f64,
     ridge_policy: RidgePolicy,
     strict_spd: bool,
+    allow_semidefinite: bool,
 ) -> Result<Array2<f64>, String> {
     if strict_spd {
-        return strict_inverse_spd(matrix_on_logdet_surface);
+        return strict_inverse_spd_with_semidefinite_option(
+            matrix_on_logdet_surface,
+            allow_semidefinite,
+        );
     }
 
     match ridge_policy.determinant_mode {
@@ -1459,15 +1467,30 @@ fn inverse_spd_with_retry(
         .ok_or_else(|| "failed to invert SPD system after ridge retries".to_string())
 }
 
+pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
+    let p = matrix.nrows();
+    for i in 0..p {
+        for j in 0..i {
+            let v = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
+            matrix[[i, j]] = v;
+            matrix[[j, i]] = v;
+        }
+    }
+}
+
 fn strict_solve_spd(matrix: &Array2<f64>, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
-    let chol = matrix
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let chol = sym
         .cholesky(Side::Lower)
         .map_err(|_| "strict pseudo-laplace SPD solve failed".to_string())?;
     Ok(chol.solve_vec(rhs))
 }
 
 fn strict_inverse_spd(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let chol = matrix
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let chol = sym
         .cholesky(Side::Lower)
         .map_err(|_| "strict pseudo-laplace SPD inverse failed".to_string())?;
     let ident = Array2::<f64>::eye(matrix.nrows());
@@ -1475,10 +1498,77 @@ fn strict_inverse_spd(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
 }
 
 fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
-    let chol = matrix
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let chol = sym
         .cholesky(Side::Lower)
         .map_err(|_| "strict pseudo-laplace SPD logdet failed".to_string())?;
     Ok(2.0 * chol.diag().mapv(f64::ln).sum())
+}
+
+fn strict_psd_positive_part_inverse_and_logdet(
+    matrix: &Array2<f64>,
+) -> Result<(Array2<f64>, f64), String> {
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower)
+        .map_err(|e| format!("strict pseudo-laplace PSD eigendecomposition failed: {e}"))?;
+    let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    let tol = (max_abs_eval * 1e-12).max(1e-14);
+    if evals.iter().any(|&ev| ev < -tol) {
+        return Err("strict pseudo-laplace SPD solve failed".to_string());
+    }
+    let p = matrix.nrows();
+    let mut pinv = Array2::<f64>::zeros((p, p));
+    let mut logdet = 0.0;
+    for k in 0..p {
+        let ev = evals[k];
+        if ev > tol {
+            logdet += ev.ln();
+            let inv_ev = 1.0 / ev;
+            for i in 0..p {
+                let uik = evecs[(i, k)];
+                for j in 0..p {
+                    pinv[[i, j]] += inv_ev * uik * evecs[(j, k)];
+                }
+            }
+        }
+    }
+    Ok((pinv, logdet))
+}
+
+fn strict_solve_spd_with_semidefinite_option(
+    matrix: &Array2<f64>,
+    rhs: &Array1<f64>,
+    allow_semidefinite: bool,
+) -> Result<Array1<f64>, String> {
+    if allow_semidefinite {
+        let (pinv, _) = strict_psd_positive_part_inverse_and_logdet(matrix)?;
+        return Ok(pinv.dot(rhs));
+    }
+    strict_solve_spd(matrix, rhs)
+}
+
+fn strict_inverse_spd_with_semidefinite_option(
+    matrix: &Array2<f64>,
+    allow_semidefinite: bool,
+) -> Result<Array2<f64>, String> {
+    if allow_semidefinite {
+        let (pinv, _) = strict_psd_positive_part_inverse_and_logdet(matrix)?;
+        return Ok(pinv);
+    }
+    strict_inverse_spd(matrix)
+}
+
+fn strict_logdet_spd_with_semidefinite_option(
+    matrix: &Array2<f64>,
+    allow_semidefinite: bool,
+) -> Result<f64, String> {
+    if allow_semidefinite {
+        let (_, logdet) = strict_psd_positive_part_inverse_and_logdet(matrix)?;
+        return Ok(logdet);
+    }
+    strict_logdet_spd(matrix)
 }
 
 fn solve_dense_symmetric_indefinite(
@@ -1565,6 +1655,7 @@ fn blockwise_logdet_terms<F: CustomFamily>(
 ) -> Result<(f64, f64), String> {
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
+    let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinite_hessian();
     refresh_all_block_etas(family, specs, states)?;
     if let Some(h_joint) = family.exact_newton_joint_hessian(states)? {
         let ranges = block_param_ranges(specs);
@@ -1602,7 +1693,7 @@ fn blockwise_logdet_terms<F: CustomFamily>(
         let mut h = h_joint;
         h += &s_joint;
         let logdet_h_total = if strict_spd {
-            strict_logdet_spd(&h)?
+            strict_logdet_spd_with_semidefinite_option(&h, allow_semidefinite)?
         } else {
             stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?
         };
@@ -1659,7 +1750,7 @@ fn blockwise_logdet_terms<F: CustomFamily>(
         let mut h = xtwx;
         h += &s_lambda;
         logdet_h_total += if strict_spd {
-            strict_logdet_spd(&h)?
+            strict_logdet_spd_with_semidefinite_option(&h, allow_semidefinite)?
         } else {
             stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?
         };
@@ -1918,6 +2009,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
     let include_logdet_h = include_exact_newton_logdet_h(family);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
+    let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinite_hessian();
     let per_block = split_log_lambdas(rho, penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
     let ridge = effective_solver_ridge(options.ridge_floor);
@@ -2071,6 +2163,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
             options.ridge_floor,
             options.ridge_policy,
             strict_spd,
+            allow_semidefinite,
         )?;
         let mut at = 0usize;
         let mut a_terms: Vec<Array2<f64>> = Vec::new();
@@ -2100,6 +2193,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                         &rhs_k,
                         joint_tangent_basis.as_ref(),
                         strict_spd,
+                        allow_semidefinite,
                         options,
                         "joint mode sensitivity system for REML gradient",
                     )?
@@ -2216,6 +2310,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                             &rhs_kl,
                             joint_tangent_basis.as_ref(),
                             strict_spd,
+                            allow_semidefinite,
                             options,
                             "joint second-order mode sensitivity system for REML Hessian",
                         )?;
@@ -4430,6 +4525,42 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct OneBlockNearlySymmetricPseudoLaplaceFamily;
+
+    impl CustomFamily for OneBlockNearlySymmetricPseudoLaplaceFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let beta = block_states
+                .first()
+                .ok_or_else(|| "missing block 0".to_string())?
+                .beta
+                .clone();
+            let h = array![[2.0, 0.1], [3.0, 2.0]];
+            let gradient = -h.dot(&beta);
+            Ok(FamilyEvaluation {
+                log_likelihood: -0.5 * beta.dot(&h.dot(&beta)),
+                block_working_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient,
+                    hessian: SymmetricMatrix::Dense(h),
+                }],
+            })
+        }
+
+        fn exact_newton_outer_objective(&self) -> ExactNewtonOuterObjective {
+            ExactNewtonOuterObjective::PseudoLaplace
+        }
+
+        fn exact_newton_joint_hessian(
+            &self,
+            _block_states: &[ParameterBlockState],
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(array![[2.0, 0.1], [3.0, 2.0]]))
+        }
+    }
+
+    #[derive(Clone)]
     struct OneBlockAlwaysErrorFamily;
 
     impl CustomFamily for OneBlockAlwaysErrorFamily {
@@ -4722,6 +4853,33 @@ mod tests {
             msg.contains("strict pseudo-laplace SPD")
                 || msg.contains("strict pseudo-laplace SPD logdet"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn pseudo_laplace_exact_newton_symmetrizes_nearly_symmetric_hessian() {
+        let spec = ParameterBlockSpec {
+            name: "nearly_symmetric".to_string(),
+            design: DesignMatrix::Dense(array![[1.0, 0.0], [0.0, 1.0]]),
+            offset: array![0.0, 0.0],
+            penalties: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0, 0.0]),
+        };
+        let fit = fit_custom_family(
+            &OneBlockNearlySymmetricPseudoLaplaceFamily,
+            &[spec],
+            &BlockwiseFitOptions {
+                use_reml_objective: true,
+                compute_covariance: false,
+                ..BlockwiseFitOptions::default()
+            },
+        )
+        .expect("nearly symmetric pseudo-laplace Hessian should be accepted after symmetrization");
+        assert!(
+            fit.penalized_objective.is_finite(),
+            "expected finite pseudo-laplace objective, got {}",
+            fit.penalized_objective
         );
     }
 

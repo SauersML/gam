@@ -6785,16 +6785,7 @@ def main():
                         collect_adaptive_diagnostics=True,
                         rust_fit_extra_args=[
                             "--adaptive-regularization",
-                            "--adaptive-max-mm-iter",
-                            "8",
-                            "--adaptive-beta-rel-tol",
-                            "1e-3",
-                            "--adaptive-min-epsilon",
-                            "1e-8",
-                            "--adaptive-weight-floor",
-                            "1e-8",
-                            "--adaptive-weight-ceiling",
-                            "1e8",
+                            "true",
                         ],
                     )
                 )
