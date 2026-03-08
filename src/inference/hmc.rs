@@ -1709,7 +1709,7 @@ pub struct SurvivalNutsInputs<'a> {
 /// Family-dispatched flattened NUTS inputs.
 pub enum FamilyNutsInputs<'a> {
     Glm(GlmFlatInputs<'a>),
-    Survival(SurvivalNutsInputs<'a>),
+    Survival(Box<SurvivalNutsInputs<'a>>),
 }
 
 /// Family-agnostic flattened NUTS entrypoint across all supported likelihood families.
@@ -2604,7 +2604,7 @@ pub fn run_survival_nuts_sampling_flattened<'a>(
 ) -> Result<NutsResult, String> {
     run_nuts_sampling_flattened_family(
         LikelihoodFamily::RoystonParmar,
-        FamilyNutsInputs::Survival(SurvivalNutsInputs {
+        FamilyNutsInputs::Survival(Box::new(SurvivalNutsInputs {
             flat,
             penalties,
             monotonicity,
@@ -2613,7 +2613,7 @@ pub fn run_survival_nuts_sampling_flattened<'a>(
             structural_time_columns,
             mode,
             hessian,
-        }),
+        })),
         config,
     )
 }

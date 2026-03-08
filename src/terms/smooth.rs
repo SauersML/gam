@@ -5055,7 +5055,9 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
                 let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
                 let tol = (max_abs_eval * 1e-12).max(1e-14);
                 if evals.iter().any(|&ev| ev < -tol) {
-                    return Err("strict pseudo-laplace SPD solve failed for adaptive psi".to_string());
+                    return Err(
+                        "strict pseudo-laplace SPD solve failed for adaptive psi".to_string()
+                    );
                 }
                 let p = h_total.nrows();
                 let mut h_inv = Array2::<f64>::zeros((p, p));
@@ -5876,7 +5878,6 @@ impl<FitOut: Clone> TwoBlockSpatialHyperState<FitOut> {
             self.evals.remove(0);
         }
     }
-
 }
 
 #[derive(Clone)]

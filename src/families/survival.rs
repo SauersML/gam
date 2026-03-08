@@ -485,6 +485,7 @@ impl WorkingModelSurvival {
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     fn transformed_coefficients(
         &self,
         beta: &Array1<f64>,
@@ -1057,6 +1058,7 @@ fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
 ///
 /// This keeps biology/data wiring out of `gam` while centralizing the
 /// integration engine in one place.
+#[allow(clippy::too_many_arguments)]
 pub fn calculate_crude_risk_quadrature<F>(
     t0: f64,
     t1: f64,

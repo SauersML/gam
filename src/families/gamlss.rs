@@ -189,6 +189,7 @@ impl GamlssBetaLayout {
         self.pt + self.pls + self.pw
     }
 
+    #[allow(clippy::type_complexity)]
     fn split_three(
         self,
         flat: &Array1<f64>,
@@ -559,7 +560,7 @@ fn build_block_spatial_psi_derivatives(
                 s_psi_components: Some(
                     info.penalty_indices
                         .into_iter()
-                        .zip(info.s_psi_components.into_iter())
+                        .zip(info.s_psi_components)
                         .collect(),
                 ),
             })
@@ -960,6 +961,7 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn try_binomial_alpha_beta_warm_start(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -990,9 +992,9 @@ fn try_binomial_alpha_beta_warm_start(
     };
 
     let warm_options = BlockwiseFitOptions {
-        inner_max_cycles: options.inner_max_cycles.min(40).max(5),
+        inner_max_cycles: options.inner_max_cycles.clamp(5, 40),
         inner_tol: options.inner_tol,
-        outer_max_iter: options.outer_max_iter.min(20).max(3),
+        outer_max_iter: options.outer_max_iter.clamp(3, 20),
         outer_tol: options.outer_tol.max(1e-6),
         min_weight: options.min_weight,
         ridge_floor: options.ridge_floor.max(1e-10),
@@ -2608,14 +2610,6 @@ struct NonWiggleQDirectional {
 }
 
 #[derive(Clone, Copy)]
-struct EtaTwoBlockJet {
-    grad_t: f64,
-    grad_ls: f64,
-    w_tt: f64,
-    w_ll: f64,
-}
-
-#[derive(Clone, Copy)]
 struct ClampedInverseLinkRow {
     mu: f64,
     clamp_active: bool,
@@ -2633,61 +2627,6 @@ struct BinomialLocationScaleRow {
     ll: f64,
 }
 
-/// Chain rule in (eta_t, eta_ls) space for two coupled blocks.
-///
-/// With q = q(eta_t, eta_ls), score s = d ell / dq, and
-/// c = d2 ell / dq2, the eta-space derivatives are:
-///   d ell / d eta_t  = s * q_t
-///   d ell / d eta_ls = s * q_ls
-///   d2 ell / d eta_a d eta_b = c * q_a q_b + s * q_ab.
-///
-/// In this project, `curvature_q` stores -d2 ell / dq2, so c = -curvature_q.
-/// `ExactNewton` requires negative log-likelihood Hessian contributions:
-///   w_ab = - d2 ell / d eta_a d eta_b.
-fn eta_two_block_jet_from_q(
-    score_q: f64,
-    curvature_q: f64,
-    q_t: f64,
-    q_ls: f64,
-    q_ll: f64,
-) -> EtaTwoBlockJet {
-    // Full rowwise calculus for eta=(eta_t,eta_ls):
-    //
-    // Let ell(q) be per-row log-likelihood, with
-    //   s := d ell/dq,   c := d² ell/dq².
-    // Define objective piece as negative log-likelihood in eta:
-    //   F(eta_t,eta_ls) = -ell(q(eta_t,eta_ls)).
-    //
-    // First derivatives:
-    //   F_t  = -(d ell/dq) q_t  = -s q_t,
-    //   F_ls = -(d ell/dq) q_ls = -s q_ls.
-    //
-    // Code stores gradient entries with sign convention consistent with
-    // `score_q = d ell/dq`, hence `grad_* = score_q * q_*` here.
-    //
-    // Second derivatives (Hessian of -ell wrt eta):
-    //   F_ab
-    //   = - d/d eta_b (s q_a)
-    //   = -( (d s/d eta_b) q_a + s q_ab )
-    //   = -( c q_b q_a + s q_ab ).
-    //
-    // Therefore
-    //   w_tt = -(c q_t q_t + s q_tt),
-    //   w_tl = -(c q_t q_ls + s q_tl),
-    //   w_ll = -(c q_ls q_ls + s q_ll).
-    //
-    // In this module `curvature_q` is ell''(q), usually non-positive near the
-    // mode for binomial/probit; we write c_q = -curvature_q to match the
-    // positive-curvature convention used in these Newton weights.
-    let c_q = -curvature_q;
-    EtaTwoBlockJet {
-        grad_t: score_q * q_t,
-        grad_ls: score_q * q_ls,
-        w_tt: -(c_q * q_t * q_t),
-        w_ll: -(c_q * q_ls * q_ls + score_q * q_ll),
-    }
-}
-
 #[inline]
 fn hessian_coeff_from_objective_q_terms(m1: f64, m2: f64, q_a: f64, q_b: f64, q_ab: f64) -> f64 {
     // F = -sum ell, scalar q:
@@ -2696,6 +2635,7 @@ fn hessian_coeff_from_objective_q_terms(m1: f64, m2: f64, q_a: f64, q_b: f64, q_
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn directional_hessian_coeff_from_objective_q_terms(
     m1: f64,
     m2: f64,
@@ -2714,6 +2654,7 @@ fn directional_hessian_coeff_from_objective_q_terms(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn second_directional_hessian_coeff_from_objective_q_terms(
     m1: f64,
     m2: f64,
@@ -2986,6 +2927,7 @@ fn binomial_location_scale_core(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn binomial_location_scale_working_sets(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -3017,20 +2959,31 @@ fn binomial_location_scale_working_sets(
             );
             let a_i = dq_dq0.map_or(1.0, |v| v[i]);
             let c_i = geom.d2q_dq02.map_or(0.0, |v| v[i]);
-            let s = core.sigma[i].max(1e-12);
+            let q0 = nonwiggle_q_derivs(
+                eta_t[i],
+                core.sigma[i],
+                core.dsigma_deta[i],
+                geom.d2sigma_deta2[i],
+                0.0,
+            );
+            let q_t = a_i * q0.q_t;
+            let q_ls = a_i * q0.q_ls;
+            let q_tt = c_i * q0.q_t * q0.q_t;
+            let q_ll = c_i * q0.q_ls * q0.q_ls + a_i * q0.q_ll;
+            let (m1, m2, _m3) = binomial_neglog_q_derivatives_from_jet(
+                y[i],
+                weights[i],
+                core.clamp_active[i],
+                core.mu[i],
+                core.dmu_dq[i],
+                core.d2mu_dq2[i],
+                core.d3mu_dq3[i],
+            );
 
-            let dq_t = -a_i / s;
-            let dq0_ls = -core.q0[i] * core.dsigma_deta[i] / s;
-            let d2q0_ls = eta_t[i]
-                * (geom.d2sigma_deta2[i] / (s * s)
-                    - 2.0 * core.dsigma_deta[i] * core.dsigma_deta[i] / (s * s * s));
-            let dq_ls = a_i * dq0_ls;
-            let d2q_ls = a_i * d2q0_ls + c_i * dq0_ls * dq0_ls;
-            let eta_jet = eta_two_block_jet_from_q(score_q, curvature_q, dq_t, dq_ls, d2q_ls);
-            grad_eta_t[i] = eta_jet.grad_t;
-            grad_eta_ls[i] = eta_jet.grad_ls;
-            h_eta_t[i] = eta_jet.w_tt;
-            h_eta_ls[i] = eta_jet.w_ll;
+            grad_eta_t[i] = score_q * q_t;
+            grad_eta_ls[i] = score_q * q_ls;
+            h_eta_t[i] = hessian_coeff_from_objective_q_terms(m1, m2, q_t, q_t, q_tt);
+            h_eta_ls[i] = hessian_coeff_from_objective_q_terms(m1, m2, q_ls, q_ls, q_ll);
 
             if let Some(grad_q) = grad_q.as_mut() {
                 grad_q[i] = score_q;
@@ -3149,6 +3102,7 @@ pub struct GaussianLocationScaleFamily {
 }
 
 #[inline]
+#[allow(clippy::type_complexity)]
 fn gaussian_sigma_derivs_up_to_fourth(
     eta: ArrayView1<'_, f64>,
 ) -> (
@@ -5158,6 +5112,8 @@ mod tests {
         compute_greville_abscissae,
     };
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
+    use ndarray::array;
+    use num_dual::{DualNum, second_derivative};
 
     fn intercept_block(n: usize) -> ParameterBlockInput {
         ParameterBlockInput {
@@ -5167,6 +5123,97 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         }
+    }
+
+    fn logistic_numdual<D: DualNum<f64> + Copy>(x: D) -> D {
+        D::one() / (D::one() + (-x).exp())
+    }
+
+    fn bspline_basis_scalar_numdual<D: DualNum<f64> + Copy>(
+        x: D,
+        knots: &Array1<f64>,
+        degree: usize,
+    ) -> Vec<D> {
+        let n_basis = knots.len() - degree - 1;
+        let x_real = x.re();
+        let mut basis = vec![D::zero(); n_basis];
+        let last_knot = knots[knots.len() - 1];
+        for j in 0..n_basis {
+            let left = knots[j];
+            let right = knots[j + 1];
+            let active = if x_real == last_knot {
+                j + 1 == n_basis
+            } else {
+                left <= x_real && x_real < right
+            };
+            if active {
+                basis[j] = D::one();
+            }
+        }
+        for k in 1..=degree {
+            let mut next = vec![D::zero(); n_basis];
+            for j in 0..n_basis {
+                let mut acc = D::zero();
+                let left_denom = knots[j + k] - knots[j];
+                if left_denom > 0.0 {
+                    acc += ((x - D::from(knots[j])) / D::from(left_denom)) * basis[j];
+                }
+                if j + 1 < n_basis {
+                    let right_denom = knots[j + k + 1] - knots[j + 1];
+                    if right_denom > 0.0 {
+                        acc +=
+                            ((D::from(knots[j + k + 1]) - x) / D::from(right_denom)) * basis[j + 1];
+                    }
+                }
+                next[j] = acc;
+            }
+            basis = next;
+        }
+        basis
+    }
+
+    fn constrained_wiggle_basis_scalar_numdual<D: DualNum<f64> + Copy>(
+        x: D,
+        knots: &Array1<f64>,
+        degree: usize,
+    ) -> Array1<D> {
+        let (z, _penalty) = compute_geometric_constraint_transform(knots, degree, 2)
+            .expect("wiggle constraint transform");
+        let full = bspline_basis_scalar_numdual(x, knots, degree);
+        let mut constrained = Array1::from_elem(z.ncols(), D::zero());
+        for j in 0..z.nrows() {
+            for k in 0..z.ncols() {
+                constrained[k] += full[j] * D::from(z[[j, k]]);
+            }
+        }
+        constrained
+    }
+
+    fn wiggle_negloglik_threshold_numdual<D: DualNum<f64> + Copy>(
+        beta_t: D,
+        beta_ls: f64,
+        beta_w: &Array1<f64>,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        knots: &Array1<f64>,
+        degree: usize,
+    ) -> D {
+        let sigma = D::from(beta_ls).exp();
+        let q0 = -beta_t / sigma;
+        let basis = constrained_wiggle_basis_scalar_numdual(q0, knots, degree);
+        let mut eta_w = D::zero();
+        for j in 0..beta_w.len() {
+            eta_w += basis[j] * D::from(beta_w[j]);
+        }
+        let q = q0 + eta_w;
+        let mu = logistic_numdual(q);
+        let one_minus_mu = D::one() - mu;
+        let mut out = D::zero();
+        for i in 0..y.len() {
+            out -= D::from(weights[i])
+                * (D::from(y[i]) * mu.ln() + D::from(1.0 - y[i]) * one_minus_mu.ln());
+        }
+        out
     }
 
     #[test]
@@ -6070,6 +6117,81 @@ mod tests {
                 &format!("block {} dH", block_idx),
             );
         }
+    }
+
+    #[test]
+    fn wiggle_threshold_block_exact_hessian_matches_autodiff_objective() {
+        let n = 7usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold_block = intercept_block(n);
+        let log_sigma_block = intercept_block(n);
+        let q_seed = Array1::linspace(-1.4, 1.4, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::build_wiggle_block_input(
+            q_seed.view(),
+            3,
+            4,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let threshold_design = threshold_block.design.clone();
+        let log_sigma_design = log_sigma_block.design.clone();
+        let family = BinomialLocationScaleWiggleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Logit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            wiggle_knots: knots.clone(),
+            wiggle_degree: 3,
+        };
+
+        let beta_t0 = 0.25;
+        let beta_ls0 = -0.15;
+        let beta_t = array![beta_t0];
+        let beta_ls = array![beta_ls0];
+        let eta_t = threshold_design.matrix_vector_multiply(&beta_t);
+        let eta_ls = log_sigma_design.matrix_vector_multiply(&beta_ls);
+        let core_for_q0 =
+            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+                .expect("core q0");
+        let beta_w = Array1::from_vec(vec![0.04; wiggle_block.design.ncols()]);
+        let eta_w = family
+            .wiggle_design(core_for_q0.q0.view())
+            .expect("wiggle design")
+            .dot(&beta_w);
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t,
+                eta: eta_t,
+            },
+            ParameterBlockState {
+                beta: beta_ls,
+                eta: eta_ls,
+            },
+            ParameterBlockState {
+                beta: beta_w.clone(),
+                eta: eta_w,
+            },
+        ];
+
+        let eval = family.evaluate(&states).expect("evaluate wiggle family");
+        let block_hessian =
+            match &eval.block_working_sets[BinomialLocationScaleWiggleFamily::BLOCK_T] {
+                BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
+                BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton threshold block"),
+            };
+        let (_value_ad, _grad_ad, hess_ad) = second_derivative(
+            |bt| wiggle_negloglik_threshold_numdual(bt, beta_ls0, &beta_w, &y, &weights, &knots, 3),
+            beta_t0,
+        );
+        assert!(
+            (block_hessian[[0, 0]] - hess_ad).abs() <= 5e-6,
+            "wiggle threshold exact hessian mismatch: evaluate()={} autodiff={}",
+            block_hessian[[0, 0]],
+            hess_ad
+        );
     }
 
     #[test]

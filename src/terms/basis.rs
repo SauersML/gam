@@ -9723,7 +9723,12 @@ mod tests {
         .expect("dense second derivative");
         let basis = basis.as_ref();
         assert!(basis.row(0).iter().all(|v| v.abs() <= 1e-12));
-        assert!(basis.row(basis.nrows() - 1).iter().all(|v| v.abs() <= 1e-12));
+        assert!(
+            basis
+                .row(basis.nrows() - 1)
+                .iter()
+                .all(|v| v.abs() <= 1e-12)
+        );
     }
 
     #[test]

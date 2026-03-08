@@ -941,6 +941,7 @@ fn apply_post_update_to_all_blocks<F: CustomFamily>(
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 fn inner_exact_joint_fit<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -984,18 +985,13 @@ fn inner_exact_joint_fit<F: CustomFamily>(
         let states = project_states(beta_flat)?;
         let eval = family.evaluate(&states)?;
         let grad = flatten_exact_newton_penalized_gradient(&eval, &states, s_lambdas, mode_ridge)?;
-        let mut h = family
-            .exact_newton_joint_hessian(&states)?
-            .ok_or_else(|| "missing joint exact-newton Hessian in inner exact fit".to_string())?;
-        if h.nrows() != total || h.ncols() != total {
-            return Err(format!(
-                "joint exact-newton inner Hessian shape mismatch: got {}x{}, expected {}x{}",
-                h.nrows(),
-                h.ncols(),
-                total,
-                total
-            ));
-        }
+        let mut h = exact_newton_joint_hessian_symmetrized(
+            family,
+            &states,
+            total,
+            "joint exact-newton inner Hessian shape mismatch",
+        )?
+        .ok_or_else(|| "missing joint exact-newton Hessian in inner exact fit".to_string())?;
         h += &s_joint;
         let objective = -eval.log_likelihood
             + total_quadratic_penalty(&states, s_lambdas, ridge, options.ridge_policy);
@@ -1474,6 +1470,28 @@ pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
     }
 }
 
+fn exact_newton_joint_hessian_symmetrized<F: CustomFamily>(
+    family: &F,
+    states: &[ParameterBlockState],
+    total: usize,
+    context: &str,
+) -> Result<Option<Array2<f64>>, String> {
+    let Some(mut h) = family.exact_newton_joint_hessian(states)? else {
+        return Ok(None);
+    };
+    if h.nrows() != total || h.ncols() != total {
+        return Err(format!(
+            "{context}: got {}x{}, expected {}x{}",
+            h.nrows(),
+            h.ncols(),
+            total,
+            total
+        ));
+    }
+    symmetrize_dense_in_place(&mut h);
+    Ok(Some(h))
+}
+
 fn strict_solve_spd(matrix: &Array2<f64>, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
@@ -1653,18 +1671,14 @@ fn blockwise_logdet_terms<F: CustomFamily>(
     let strict_spd = use_exact_newton_strict_spd(family);
     let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinite_hessian();
     refresh_all_block_etas(family, specs, states)?;
-    if let Some(h_joint) = family.exact_newton_joint_hessian(states)? {
-        let ranges = block_param_ranges(specs);
-        let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-        if h_joint.nrows() != total || h_joint.ncols() != total {
-            return Err(format!(
-                "joint exact-newton Hessian shape mismatch in logdet terms: got {}x{}, expected {}x{}",
-                h_joint.nrows(),
-                h_joint.ncols(),
-                total,
-                total
-            ));
-        }
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if let Some(h_joint) = exact_newton_joint_hessian_symmetrized(
+        family,
+        states,
+        total,
+        "joint exact-newton Hessian shape mismatch in logdet terms",
+    )? {
         let mut s_joint = Array2::<f64>::zeros((total, total));
         let mut logdet_s_total = 0.0;
         for (b, spec) in specs.iter().enumerate() {
@@ -1992,7 +2006,6 @@ fn inner_blockwise_fit<F: CustomFamily>(
 /// Inner loop: cyclic blockwise penalized weighted regressions.
 /// Outer loop: trust-region optimization of all log-smoothing parameters using
 /// exact cost/gradient samples.
-
 fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -2055,18 +2068,14 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let eval = family.evaluate(&inner.block_states)?;
-    if let Some(h_joint_unpen) = family.exact_newton_joint_hessian(&inner.block_states)? {
-        let ranges = block_param_ranges(specs);
-        let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-        if h_joint_unpen.nrows() != total || h_joint_unpen.ncols() != total {
-            return Err(format!(
-                "joint exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
-                h_joint_unpen.nrows(),
-                h_joint_unpen.ncols(),
-                total,
-                total
-            ));
-        }
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if let Some(h_joint_unpen) = exact_newton_joint_hessian_symmetrized(
+        family,
+        &inner.block_states,
+        total,
+        "joint exact-newton Hessian shape mismatch in outer gradient",
+    )? {
         let beta_flat = flatten_state_betas(&inner.block_states, specs);
         let synced_joint_states =
             synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
@@ -2672,6 +2681,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
     })
 }
 
+#[allow(clippy::type_complexity)]
 fn outer_objective_gradient_hessian<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -3777,18 +3787,14 @@ fn compute_joint_covariance<F: CustomFamily>(
     per_block_log_lambdas: &[Array1<f64>],
     options: &BlockwiseFitOptions,
 ) -> Result<Array2<f64>, String> {
-    let mut h = if let Some(h_exact) = family.exact_newton_joint_hessian(states)? {
-        let ranges = block_param_ranges(specs);
-        let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-        if h_exact.nrows() != total || h_exact.ncols() != total {
-            return Err(format!(
-                "joint exact-newton Hessian shape mismatch in covariance: got {}x{}, expected {}x{}",
-                h_exact.nrows(),
-                h_exact.ncols(),
-                total,
-                total
-            ));
-        }
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    let mut h = if let Some(h_exact) = exact_newton_joint_hessian_symmetrized(
+        family,
+        states,
+        total,
+        "joint exact-newton Hessian shape mismatch in covariance",
+    )? {
         let mut h = h_exact;
         for (b, spec) in specs.iter().enumerate() {
             let (start, end) = ranges[b];
@@ -3804,14 +3810,7 @@ fn compute_joint_covariance<F: CustomFamily>(
     } else {
         compute_joint_hessian_from_objective(family, specs, states, per_block_log_lambdas)?
     };
-    let p_total = h.nrows();
-    for i in 0..p_total {
-        for j in 0..i {
-            let v = 0.5 * (h[[i, j]] + h[[j, i]]);
-            h[[i, j]] = v;
-            h[[j, i]] = v;
-        }
-    }
+    symmetrize_dense_in_place(&mut h);
     if use_exact_newton_strict_spd(family) {
         strict_inverse_spd(&h)
     } else {
@@ -3822,6 +3821,7 @@ fn compute_joint_covariance<F: CustomFamily>(
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn fit_custom_family<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -3875,72 +3875,69 @@ pub fn fit_custom_family<F: CustomFamily>(
     let lower = Array1::<f64>::from_elem(rho0.len(), -30.0);
     let upper = Array1::<f64>::from_elem(rho0.len(), 30.0);
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
-    let objective = CachedFirstOrderObjective::new(
-        |x: &Array1<f64>| {
-            let cached = warm_cache.lock().ok().and_then(|g| g.clone());
-            let (obj, grad, hess_opt) = match outer_objective_gradient_hessian(
-                family,
-                specs,
-                options,
-                &penalty_counts,
-                x,
-                cached.as_ref(),
-                true,
-            ) {
-                Ok((obj, grad, hess_opt, warm))
-                    if obj.is_finite()
-                        && grad.iter().all(|v| v.is_finite())
-                        && hess_opt
-                            .as_ref()
-                            .map(|h| h.iter().all(|v| v.is_finite()))
-                            .unwrap_or(true) =>
-                {
-                    if let Ok(mut guard) = warm_cache.lock() {
-                        let seed_ok = cached
-                            .as_ref()
-                            .map(|c| {
-                                c.rho.len() == x.len()
-                                    && c.rho
-                                        .iter()
-                                        .zip(x.iter())
-                                        .all(|(&a, &b)| (a - b).abs() <= 1.5)
-                            })
-                            .unwrap_or(true);
-                        if seed_ok {
-                            *guard = Some(warm);
-                        } else {
-                            *guard = None;
-                        }
-                    }
-                    if let Ok(mut guard) = last_outer_error.lock() {
+    let objective = CachedFirstOrderObjective::new(|x: &Array1<f64>| {
+        let cached = warm_cache.lock().ok().and_then(|g| g.clone());
+        let (obj, grad, hess_opt) = match outer_objective_gradient_hessian(
+            family,
+            specs,
+            options,
+            &penalty_counts,
+            x,
+            cached.as_ref(),
+            true,
+        ) {
+            Ok((obj, grad, hess_opt, warm))
+                if obj.is_finite()
+                    && grad.iter().all(|v| v.is_finite())
+                    && hess_opt
+                        .as_ref()
+                        .map(|h| h.iter().all(|v| v.is_finite()))
+                        .unwrap_or(true) =>
+            {
+                if let Ok(mut guard) = warm_cache.lock() {
+                    let seed_ok = cached
+                        .as_ref()
+                        .map(|c| {
+                            c.rho.len() == x.len()
+                                && c.rho
+                                    .iter()
+                                    .zip(x.iter())
+                                    .all(|(&a, &b)| (a - b).abs() <= 1.5)
+                        })
+                        .unwrap_or(true);
+                    if seed_ok {
+                        *guard = Some(warm);
+                    } else {
                         *guard = None;
                     }
-                    (obj, grad, hess_opt)
                 }
-                Ok((_obj, _grad, _hess_opt, _warm)) => {
-                    if let Ok(mut guard) = last_outer_error.lock() {
-                        *guard = Some(
-                            "custom-family outer objective/derivatives became non-finite"
-                                .to_string(),
-                        );
-                    }
-                    return Err(ObjectiveEvalError::recoverable(
-                        "custom-family outer objective/derivatives became non-finite",
-                    ));
+                if let Ok(mut guard) = last_outer_error.lock() {
+                    *guard = None;
                 }
-                Err(e) => {
-                    if let Ok(mut guard) = last_outer_error.lock() {
-                        *guard = Some(e);
-                    }
-                    return Err(ObjectiveEvalError::recoverable(
-                        "custom-family outer objective/gradient evaluation failed",
-                    ));
+                (obj, grad, hess_opt)
+            }
+            Ok((_obj, _grad, _hess_opt, _warm)) => {
+                if let Ok(mut guard) = last_outer_error.lock() {
+                    *guard = Some(
+                        "custom-family outer objective/derivatives became non-finite".to_string(),
+                    );
                 }
-            };
-            last_eval = Some((x.clone(), obj, grad.clone(), hess_opt.clone()));
-            Ok((obj, grad))
-        },
-    );
+                return Err(ObjectiveEvalError::recoverable(
+                    "custom-family outer objective/derivatives became non-finite",
+                ));
+            }
+            Err(e) => {
+                if let Ok(mut guard) = last_outer_error.lock() {
+                    *guard = Some(e);
+                }
+                return Err(ObjectiveEvalError::recoverable(
+                    "custom-family outer objective/gradient evaluation failed",
+                ));
+            }
+        };
+        last_eval = Some((x.clone(), obj, grad.clone(), hess_opt.clone()));
+        Ok((obj, grad))
+    });
     let mut solver = Bfgs::new(rho0.clone(), objective)
         .with_bounds(
             Bounds::new(lower, upper, 1e-6).expect("custom-family rho bounds must be valid"),
