@@ -5,6 +5,7 @@ use crate::types::{Coefficients, LinearPredictor};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 use thiserror::Error;
@@ -152,6 +153,75 @@ fn scale_matrix_columns(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
     scaled
 }
 
+fn compress_positive_collinear_constraints(
+    a: &Array2<f64>,
+    b: &Array1<f64>,
+) -> LinearInequalityConstraints {
+    const SCALE_TOL: f64 = 1e-14;
+    const KEY_TOL: f64 = 1e-12;
+
+    let mut grouped: BTreeMap<Vec<i64>, (Vec<f64>, f64)> = BTreeMap::new();
+    let mut fallback_rows: Vec<(Vec<f64>, f64)> = Vec::new();
+
+    for i in 0..a.nrows() {
+        let row = a.row(i);
+        let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        if !scale.is_finite() || scale <= SCALE_TOL {
+            if b[i] > 0.0 {
+                fallback_rows.push((row.to_vec(), b[i]));
+            }
+            continue;
+        }
+
+        let normalized_row: Vec<f64> = row
+            .iter()
+            .map(|&v| {
+                let scaled = v / scale;
+                if scaled.abs() <= KEY_TOL { 0.0 } else { scaled }
+            })
+            .collect();
+        let normalized_rhs = b[i] / scale;
+        let key: Vec<i64> = normalized_row
+            .iter()
+            .map(|&v| (v / KEY_TOL).round() as i64)
+            .collect();
+
+        match grouped.get_mut(&key) {
+            Some((_row, rhs_max)) => {
+                if normalized_rhs > *rhs_max {
+                    *rhs_max = normalized_rhs;
+                }
+            }
+            None => {
+                grouped.insert(key, (normalized_row, normalized_rhs));
+            }
+        }
+    }
+
+    let n_rows = grouped.len() + fallback_rows.len();
+    let n_cols = a.ncols();
+    let mut a_out = Array2::<f64>::zeros((n_rows, n_cols));
+    let mut b_out = Array1::<f64>::zeros(n_rows);
+
+    let mut out_row = 0usize;
+    for (_key, (row, rhs)) in grouped {
+        for (j, value) in row.into_iter().enumerate() {
+            a_out[[out_row, j]] = value;
+        }
+        b_out[out_row] = rhs;
+        out_row += 1;
+    }
+    for (row, rhs) in fallback_rows {
+        for (j, value) in row.into_iter().enumerate() {
+            a_out[[out_row, j]] = value;
+        }
+        b_out[out_row] = rhs;
+        out_row += 1;
+    }
+
+    LinearInequalityConstraints { a: a_out, b: b_out }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MonotonicityPenalty {
     pub tolerance: f64,
@@ -251,7 +321,7 @@ impl WorkingModelSurvival {
             a.row_mut(r).assign(&self.x_derivative.row(i));
             b[r] = tol - self.offset_derivative_exit[i];
         }
-        Some(LinearInequalityConstraints { a, b })
+        Some(compress_positive_collinear_constraints(&a, &b))
     }
 
     pub fn from_engine_inputs(
@@ -1270,7 +1340,15 @@ mod tests {
         let constraints = model
             .monotonicity_linear_constraints()
             .expect("all weighted rows should contribute monotonicity constraints");
-        assert_eq!(constraints.a.nrows(), 2);
+        assert_eq!(constraints.a.nrows(), 1);
+        for i in 0..x_derivative.nrows() {
+            let row = x_derivative.row(i);
+            let original_rhs = 1e-8_f64;
+            let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            let normalized_rhs = original_rhs / scale;
+            let lhs = constraints.a.row(0).dot(&array![1.0]);
+            assert!(lhs >= normalized_rhs - 1e-18);
+        }
     }
 
     #[test]
@@ -2152,6 +2230,123 @@ mod tests {
                 abs_err,
                 rel_err
             );
+        }
+    }
+
+    #[test]
+    fn monotonicity_constraints_collapse_positive_collinear_rows() {
+        let a = array![[0.0, 0.5, 0.0], [0.0, 0.25, 0.0], [0.0, 0.125, 0.0]];
+        let b = array![1e-8, 1e-8, 1e-8];
+
+        let compressed = compress_positive_collinear_constraints(&a, &b);
+
+        assert_eq!(compressed.a.nrows(), 1);
+        assert_eq!(compressed.a.ncols(), 3);
+        assert!(compressed.a[[0, 0]].abs() <= 1e-12);
+        assert!((compressed.a[[0, 1]] - 1.0).abs() <= 1e-12);
+        assert!(compressed.a[[0, 2]].abs() <= 1e-12);
+        assert!((compressed.b[0] - 8e-8).abs() <= 1e-18);
+    }
+
+    #[test]
+    fn monotonicity_constraints_preserve_distinct_directions() {
+        let a = array![[1.0, 0.0], [0.0, 1.0], [2.0, 0.0]];
+        let b = array![0.2, 0.3, 0.1];
+
+        let compressed = compress_positive_collinear_constraints(&a, &b);
+
+        assert_eq!(compressed.a.nrows(), 2);
+        let mut saw_x = false;
+        let mut saw_y = false;
+        for i in 0..compressed.a.nrows() {
+            if (compressed.a[[i, 0]] - 1.0).abs() <= 1e-12 && compressed.a[[i, 1]].abs() <= 1e-12 {
+                saw_x = true;
+                assert!((compressed.b[i] - 0.2).abs() <= 1e-12);
+            }
+            if compressed.a[[i, 0]].abs() <= 1e-12 && (compressed.a[[i, 1]] - 1.0).abs() <= 1e-12 {
+                saw_y = true;
+                assert!((compressed.b[i] - 0.3).abs() <= 1e-12);
+            }
+        }
+        assert!(saw_x);
+        assert!(saw_y);
+    }
+
+    #[test]
+    fn linear_time_monotonicity_constraints_reduce_to_single_halfspace() {
+        let age_entry = array![1.0_f64, 1.0, 1.0];
+        let age_exit = array![2.0_f64, 4.0, 8.0];
+        let event_target = array![0u8, 1u8, 0u8];
+        let event_competing = array![0u8, 0u8, 0u8];
+        let sample_weight = array![1.0, 1.0, 1.0];
+        let x_entry = array![
+            [1.0, age_entry[0].ln()],
+            [1.0, age_entry[1].ln()],
+            [1.0, age_entry[2].ln()]
+        ];
+        let x_exit = array![
+            [1.0, age_exit[0].ln()],
+            [1.0, age_exit[1].ln()],
+            [1.0, age_exit[2].ln()]
+        ];
+        let x_derivative = array![[0.0, 0.5], [0.0, 0.25], [0.0, 0.125]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct linear survival model");
+
+        let constraints = model
+            .monotonicity_linear_constraints()
+            .expect("monotonicity constraints");
+        assert_eq!(constraints.a.nrows(), 1);
+        assert!((constraints.a[[0, 1]] - 1.0).abs() <= 1e-12);
+        assert!((constraints.b[0] - 8e-8).abs() <= 1e-18);
+    }
+
+    #[test]
+    fn compressed_monotonicity_constraints_preserve_uncompressed_feasible_region() {
+        let uncompressed_constraints = LinearInequalityConstraints {
+            a: array![
+                [0.0, 0.5, 0.0],
+                [0.0, 1.0 / 3.0, 0.0],
+                [0.0, 0.2, 0.0],
+                [0.0, 0.125, 0.0]
+            ],
+            b: Array1::from_elem(4, 1e-8),
+        };
+        let compressed_constraints = compress_positive_collinear_constraints(
+            &uncompressed_constraints.a,
+            &uncompressed_constraints.b,
+        );
+
+        let candidates = [
+            array![0.0, 1e-9, 0.0],
+            array![0.0, 4e-8, 0.0],
+            array![0.0, 8e-8, 0.0],
+            array![0.0, 2e-7, 1.5],
+        ];
+        for beta in candidates {
+            let uncompressed_ok = (0..uncompressed_constraints.a.nrows()).all(|i| {
+                uncompressed_constraints.a.row(i).dot(&beta) >= uncompressed_constraints.b[i]
+            });
+            let compressed_ok = (0..compressed_constraints.a.nrows())
+                .all(|i| compressed_constraints.a.row(i).dot(&beta) >= compressed_constraints.b[i]);
+            assert_eq!(compressed_ok, uncompressed_ok);
         }
     }
 }
