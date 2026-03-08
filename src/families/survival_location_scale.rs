@@ -1625,34 +1625,37 @@ pub fn predict_survival_location_scale_posterior_mean(
     // Uncertainty-aware survival posterior mean with conditional Gaussian
     // reduction.
     //
-    // The deterministic survival predictor already computes the location-scale
-    // latent pieces
+    // The deterministic survival predictor already computes the latent pieces
     //
-    //   h   = time block linear predictor
-    //   t   = threshold block linear predictor
-    //   ls  = log-sigma block linear predictor.
+    //   h  = time block linear predictor
+    //   t  = threshold block linear predictor
+    //   ls = log-sigma block linear predictor
+    //   w  = optional link-wiggle predictor.
     //
-    // Under coefficient uncertainty these three latent quantities are jointly
-    // Gaussian row by row. The naive route is a full 3D Gaussian expectation of
-    // the survival/probit inverse link. The expensive part is unnecessary:
-    // conditional on ls, the pair (h, t) remains jointly Gaussian, and the
-    // probit argument
+    // Under the Gaussian coefficient approximation, the rowwise latent vector
     //
-    //   eta_loc(ls) = -h - t / sigma(ls)
+    //   (h, t, ls, w)
     //
-    // is then an affine transformation of that conditional Gaussian pair.
-    // Therefore eta_loc(ls) | ls is itself Gaussian with an analytically
-    // available conditional mean and variance.
+    // is jointly Gaussian, with w identically zero when no wiggle block is
+    // present. The posterior-mean target is
     //
-    // Once the inner latent is Gaussian, the exact integrated inverse-link
-    // machinery from quadrature.rs applies again:
+    //   E[g(eta)],
+    //   eta = -h - t / sigma(ls) + w.
     //
-    //   E[Phi(Eta_loc) | ls]
-    //     = integrated_inverse_link_mean_and_derivative(Probit, mu_loc|ls, sd_loc|ls).mean.
+    // A direct evaluation is a 3D expectation without wiggle and a 4D
+    // expectation with wiggle. We do not need to integrate over all latent
+    // dimensions directly. Conditioning on ls is enough:
     //
-    // So the original 3D integral collapses to:
-    //   1D Gaussian integration over ls
-    //   + exact inner Gaussian-link convolution.
+    //   (h, t, w) | ls  is Gaussian,
+    //   eta | ls        is affine in (h, t, w),
+    //
+    // so eta | ls is itself Gaussian with exact conditional mean and variance.
+    // That reduces the full posterior mean to
+    //
+    //   E[g(eta)] = E_ls[ E[g(eta) | ls] ],
+    //
+    // i.e. a 1D outer Gaussian expectation over ls, where the inner object is
+    // the existing Gaussian-uncertain scalar inverse-link expectation.
     //
     // If the conditioning algebra becomes numerically unsafe, this routine
     // falls back to direct adaptive Gaussian expectation rather than forcing
@@ -1761,6 +1764,43 @@ pub fn predict_survival_location_scale_posterior_mean(
     let mixture_state = input.inverse_link.mixture_state();
     let sas_state = input.inverse_link.sas_state();
     let quad_ctx = crate::quadrature::QuadratureContext::new();
+    const VAR_L_DEGENERATE_TOL: f64 = 1e-12;
+    const CROSS_L_DEGENERATE_TOL: f64 = 1e-10;
+    let gaussian_survival_mean = |mu_loc: f64, var_loc: f64| {
+        let var_loc = var_loc.max(0.0);
+        if matches!(input.inverse_link, InverseLink::Mixture(_)) {
+            return crate::quadrature::normal_expectation_1d_adaptive(
+                &quad_ctx,
+                mu_loc,
+                var_loc.sqrt(),
+                |z| inverse_link_survival_prob_value(&input.inverse_link, z),
+            )
+            .clamp(0.0, 1.0);
+        }
+        crate::quadrature::integrated_inverse_link_jet_with_state(
+            &quad_ctx,
+            link,
+            mu_loc,
+            var_loc.sqrt(),
+            mixture_state,
+            sas_state,
+        )
+        .map(|jet| (1.0 - jet.mean).clamp(0.0, 1.0))
+        .unwrap_or_else(|_| {
+            if link == LinkFunction::Probit {
+                let denom = (1.0 + var_loc).sqrt().max(1e-12);
+                (1.0 - normal_cdf(mu_loc / denom)).clamp(0.0, 1.0)
+            } else {
+                crate::quadrature::normal_expectation_1d_adaptive(
+                    &quad_ctx,
+                    mu_loc,
+                    var_loc.sqrt(),
+                    |z| inverse_link_survival_prob_value(&input.inverse_link, z),
+                )
+                .clamp(0.0, 1.0)
+            }
+        })
+    };
 
     let fallback_row = |i: usize| {
         if let Some(mu_w) = mu_w.as_ref() {
@@ -1842,6 +1882,7 @@ pub fn predict_survival_location_scale_posterior_mean(
         let cov_hw_i = cov_hw_rows.as_ref().map_or(0.0, |vals| vals[i]);
         let cov_tw_i = cov_tw_rows.as_ref().map_or(0.0, |vals| vals[i]);
         let cov_lw_i = cov_lw_rows.as_ref().map_or(0.0, |vals| vals[i]);
+        let mu_l_i = mu_ls[i];
 
         if !(var_h.is_finite()
             && var_t.is_finite()
@@ -1857,143 +1898,66 @@ pub fn predict_survival_location_scale_posterior_mean(
             return fallback_row(i);
         }
 
-        if var_ls <= 1e-12 {
-            if cov_hl_i.abs() > 1e-10 || cov_tl_i.abs() > 1e-10 || cov_lw_i.abs() > 1e-10 {
+        // Exact degenerate limit: if Var(L)=0, PSD implies the cross-covariances
+        // with L vanish, so the outer expectation collapses to the point mass
+        // L = mu_l.
+        if var_ls <= VAR_L_DEGENERATE_TOL {
+            if cov_hl_i.abs() > CROSS_L_DEGENERATE_TOL
+                || cov_tl_i.abs() > CROSS_L_DEGENERATE_TOL
+                || cov_lw_i.abs() > CROSS_L_DEGENERATE_TOL
+            {
                 return fallback_row(i);
             }
             let sigma = bounded_sigma_derivs_up_to_third_scalar(
-                mu_ls[i],
+                mu_l_i,
                 input.sigma_min,
                 input.sigma_max,
             )
             .0
             .max(1e-12);
-            let inv_sigma = 1.0 / sigma;
-            let mu_loc = -mu_h[i] - mu_t[i] * inv_sigma + mu_w_i;
-            let var_loc = (var_h
-                + var_t * inv_sigma * inv_sigma
+            let q_l = 1.0 / sigma;
+            let mu_base = -mu_h[i] - q_l * mu_t[i] + mu_w_i;
+            let var_base = var_h
+                + q_l * q_l * var_t
                 + var_w_i
-                + 2.0 * cov_ht_i * inv_sigma
+                + 2.0 * q_l * cov_ht_i
                 - 2.0 * cov_hw_i
-                - 2.0 * inv_sigma * cov_tw_i)
-                .max(0.0);
-            if matches!(input.inverse_link, InverseLink::Mixture(_)) {
-                return crate::quadrature::normal_expectation_1d_adaptive(
-                    &quad_ctx,
-                    mu_loc,
-                    var_loc.sqrt(),
-                    |z| inverse_link_survival_prob_value(&input.inverse_link, z),
-                )
-                .clamp(0.0, 1.0);
-            }
-            return crate::quadrature::integrated_inverse_link_jet_with_state(
-                &quad_ctx,
-                link,
-                mu_loc,
-                var_loc.sqrt(),
-                mixture_state,
-                sas_state,
-            )
-            .map(|jet| (1.0 - jet.mean).clamp(0.0, 1.0))
-            .unwrap_or_else(|_| {
-                if link == LinkFunction::Probit {
-                    let denom = (1.0 + var_loc).sqrt().max(1e-12);
-                    (1.0 - normal_cdf(mu_loc / denom)).clamp(0.0, 1.0)
-                } else {
-                    crate::quadrature::normal_expectation_1d_adaptive(
-                        &quad_ctx,
-                        mu_loc,
-                        var_loc.sqrt(),
-                        |z| inverse_link_survival_prob_value(&input.inverse_link, z),
-                    )
-                    .clamp(0.0, 1.0)
-                }
-            });
-        }
-
-        let beta_h_ls = cov_hl_i / var_ls;
-        let beta_t_ls = cov_tl_i / var_ls;
-        let beta_w_ls = cov_lw_i / var_ls;
-        let var_h_cond = var_h - beta_h_ls * cov_hl_i;
-        let var_t_cond = var_t - beta_t_ls * cov_tl_i;
-        let var_w_cond = var_w_i - beta_w_ls * cov_lw_i;
-        let cov_ht_cond = cov_ht_i - beta_h_ls * cov_tl_i;
-        let cov_hw_cond = cov_hw_i - beta_h_ls * cov_lw_i;
-        let cov_tw_cond = cov_tw_i - beta_t_ls * cov_lw_i;
-
-        if !(var_h_cond.is_finite()
-            && var_t_cond.is_finite()
-            && var_w_cond.is_finite()
-            && cov_ht_cond.is_finite()
-            && cov_hw_cond.is_finite()
-            && cov_tw_cond.is_finite())
-        {
-            return fallback_row(i);
-        }
-        if var_h_cond < -1e-10 || var_t_cond < -1e-10 || var_w_cond < -1e-10 {
-            return fallback_row(i);
+                - 2.0 * q_l * cov_tw_i;
+            let mu_loc = mu_base;
+            let var_loc = var_base.max(0.0);
+            return gaussian_survival_mean(mu_loc, var_loc);
         }
 
         crate::quadrature::normal_expectation_1d_adaptive(
             &quad_ctx,
-            mu_ls[i],
+            mu_l_i,
             var_ls.sqrt(),
             |ls| {
                 let sigma =
                     bounded_sigma_derivs_up_to_third_scalar(ls, input.sigma_min, input.sigma_max)
                         .0
                         .max(1e-12);
-                let inv_sigma = 1.0 / sigma;
-                let delta_ls = ls - mu_ls[i];
-                let mu_h_cond = mu_h[i] + beta_h_ls * delta_ls;
-                let mu_t_cond = mu_t[i] + beta_t_ls * delta_ls;
-                let mu_w_cond = mu_w_i + beta_w_ls * delta_ls;
-                let mu_loc = -mu_h_cond - mu_t_cond * inv_sigma + mu_w_cond;
-                let var_loc = (var_h_cond
-                    + var_t_cond * inv_sigma * inv_sigma
-                    + var_w_cond
-                    + 2.0 * cov_ht_cond * inv_sigma
-                    - 2.0 * cov_hw_cond
-                    - 2.0 * inv_sigma * cov_tw_cond)
-                    .max(0.0);
-                // This is the payoff of the conditional Gaussian reduction above:
-                // for a fixed ls, the inner latent quantity eta_loc is Gaussian, so
-                // we can hand its conditional mean and standard deviation straight
-                // to the shared integrated-expectation dispatcher instead of doing
-                // another nested quadrature over the remaining latent blocks.
-                if matches!(input.inverse_link, InverseLink::Mixture(_)) {
-                    crate::quadrature::normal_expectation_1d_adaptive(
-                        &quad_ctx,
-                        mu_loc,
-                        var_loc.sqrt(),
-                        |z| inverse_link_survival_prob_value(&input.inverse_link, z),
-                    )
-                    .clamp(0.0, 1.0)
-                } else {
-                    crate::quadrature::integrated_inverse_link_jet_with_state(
-                        &quad_ctx,
-                        link,
-                        mu_loc,
-                        var_loc.sqrt(),
-                        mixture_state,
-                        sas_state,
-                    )
-                    .map(|jet| (1.0 - jet.mean).clamp(0.0, 1.0))
-                    .unwrap_or_else(|_| {
-                        if link == LinkFunction::Probit {
-                            let denom = (1.0 + var_loc).sqrt().max(1e-12);
-                            (1.0 - normal_cdf(mu_loc / denom)).clamp(0.0, 1.0)
-                        } else {
-                            crate::quadrature::normal_expectation_1d_adaptive(
-                                &quad_ctx,
-                                mu_loc,
-                                var_loc.sqrt(),
-                                |z| inverse_link_survival_prob_value(&input.inverse_link, z),
-                            )
-                            .clamp(0.0, 1.0)
-                        }
-                    })
+                let q_l = 1.0 / sigma;
+                let delta_l = ls - mu_l_i;
+                let mu_base = -mu_h[i] - q_l * mu_t[i] + mu_w_i;
+                let cov_eta_l = cov_hl_i + q_l * cov_tl_i - cov_lw_i;
+                let mu_loc = mu_base - (cov_eta_l / var_ls) * delta_l;
+                let var_base = var_h
+                    + q_l * q_l * var_t
+                    + var_w_i
+                    + 2.0 * q_l * cov_ht_i
+                    - 2.0 * cov_hw_i
+                    - 2.0 * q_l * cov_tw_i;
+                let var_loc = (var_base - cov_eta_l * cov_eta_l / var_ls).max(0.0);
+                if !mu_loc.is_finite() || !var_loc.is_finite() {
+                    return fallback_row(i);
                 }
+                // This is the payoff of the conditional Gaussian reduction above:
+                // for fixed ls, eta = -h - t / sigma(ls) + w is Gaussian, so we
+                // hand its conditional mean and standard deviation straight to
+                // the shared integrated-expectation dispatcher instead of
+                // integrating over h, t, and w explicitly.
+                gaussian_survival_mean(mu_loc, var_loc)
             },
         )
         .clamp(0.0, 1.0)
