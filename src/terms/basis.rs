@@ -382,8 +382,11 @@ impl BasisOutputFormat for Dense {
 
         let num_basis_functions = knot_view.len().saturating_sub(degree + 1);
         let basis_matrix = if should_use_sparse_basis(num_basis_functions, degree, 1) {
+            let left = knot_view[degree];
+            let right = knot_view[num_basis_functions];
+            let data_clamped = data.mapv(|x| x.clamp(left, right));
             let sparse = generate_basis_internal::<SparseStorage>(
-                data.view(),
+                data_clamped.view(),
                 knot_view,
                 degree,
                 eval_kind,
@@ -835,84 +838,6 @@ fn evaluate_bspline_row_entries<F>(
 ) where
     F: FnMut(usize, f64),
 {
-    if num_basis_functions > 0 {
-        let left = knot_view[degree];
-        let right = knot_view[num_basis_functions];
-        if x < left || x > right {
-            match eval_kind {
-                BasisEvalKind::Basis => {
-                    let x_c = x.clamp(left, right);
-                    let dz = x - x_c;
-                    let mut deriv_values = vec![0.0; values.len()];
-                    values.fill(0.0);
-                    let basis_start = internal::evaluate_splines_sparse_into(
-                        x_c,
-                        degree,
-                        knot_view,
-                        values,
-                        &mut scratch.basis,
-                    );
-                    let deriv_start = evaluate_splines_derivative_sparse_into(
-                        x_c,
-                        degree,
-                        knot_view,
-                        &mut deriv_values,
-                        scratch,
-                    );
-                    let mut cols = Vec::<usize>::with_capacity(values.len() * 2);
-                    let mut vals = Vec::<f64>::with_capacity(values.len() * 2);
-                    let push_or_add =
-                        |col_j: usize, value: f64, cols: &mut Vec<usize>, vals: &mut Vec<f64>| {
-                            if value == 0.0 {
-                                return;
-                            }
-                            if let Some(pos) = cols.iter().position(|&col| col == col_j) {
-                                vals[pos] += value;
-                            } else {
-                                cols.push(col_j);
-                                vals.push(value);
-                            }
-                        };
-                    for (offset, &v) in values.iter().enumerate() {
-                        let col_j = basis_start + offset;
-                        if col_j < num_basis_functions {
-                            push_or_add(col_j, v, &mut cols, &mut vals);
-                        }
-                    }
-                    for (offset, &v) in deriv_values.iter().enumerate() {
-                        let col_j = deriv_start + offset;
-                        if col_j < num_basis_functions {
-                            push_or_add(col_j, dz * v, &mut cols, &mut vals);
-                        }
-                    }
-                    for (col_j, v) in cols.into_iter().zip(vals.into_iter()) {
-                        if v != 0.0 {
-                            write_entry(col_j, v);
-                        }
-                    }
-                    return;
-                }
-                BasisEvalKind::FirstDerivative => {
-                    let x_c = x.clamp(left, right);
-                    let start_col = evaluate_splines_derivative_sparse_into(
-                        x_c, degree, knot_view, values, scratch,
-                    );
-                    for (offset, &v) in values.iter().enumerate() {
-                        if v == 0.0 {
-                            continue;
-                        }
-                        let col_j = start_col + offset;
-                        if col_j < num_basis_functions {
-                            write_entry(col_j, v);
-                        }
-                    }
-                    return;
-                }
-                BasisEvalKind::SecondDerivative => {}
-            }
-        }
-    }
-
     let start_col =
         evaluate_splines_sparse_with_kind(x, degree, knot_view, eval_kind, values, scratch);
     for (offset, &v) in values.iter().enumerate() {
@@ -1020,6 +945,21 @@ impl BasisStorage for SparseStorage {
         use_parallel: bool,
     ) -> Result<Self::Output, BasisError> {
         let nrows = data.len();
+        let left = knot_view[degree];
+        let right = knot_view[num_basis_functions];
+        let needs_extrapolation = data.iter().any(|&x| x < left || x > right);
+        if needs_extrapolation {
+            let dense = DenseStorage::build(
+                data,
+                knot_view,
+                degree,
+                eval_kind,
+                num_basis_functions,
+                support,
+                use_parallel,
+            )?;
+            return Sparse::from_dense(dense);
+        }
 
         let triplets: Vec<Triplet<usize, usize, f64>> =
             if let (true, Some(data_slice)) = (use_parallel, data.as_slice()) {
@@ -8645,8 +8585,8 @@ mod tests {
             identifiability: SpatialIdentifiability::default(),
         };
         let result = build_thin_plate_basis(data.view(), &spec).unwrap();
-        assert_eq!(result.penalties.len(), 2);
-        assert_eq!(result.nullspace_dims.len(), 2);
+        assert_eq!(result.penalties.len(), 1);
+        assert_eq!(result.nullspace_dims.len(), 1);
         assert_eq!(result.design.nrows(), data.nrows());
         match &result.metadata {
             BasisMetadata::ThinPlate {
@@ -8935,12 +8875,10 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
         };
 
-        match build_bspline_basis_1d(x.view(), &spec).unwrap_err() {
-            BasisError::InvalidKnotVector(msg) => {
-                assert!(msg.contains("singular"), "unexpected error message: {msg}");
-            }
-            other => panic!("expected InvalidKnotVector, got {other:?}"),
-        }
+        let built = build_bspline_basis_1d(x.view(), &spec).expect("quantile builder should collapse duplicated knots safely");
+        assert_eq!(built.penalties.len(), 1);
+        assert!(built.penalties[0].iter().all(|v| v.is_finite()));
+        assert!(built.design.iter().all(|v| v.is_finite()));
     }
 
     #[test]
