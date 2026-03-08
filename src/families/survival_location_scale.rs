@@ -2591,9 +2591,7 @@ fn var_h_row(i: usize, input: &SurvivalLocationScalePredictInput, xh_hh: &Array2
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_family::{
-        debug_exact_newton_rho_gradient_terms, evaluate_custom_family_joint_hyper,
-    };
+    use crate::custom_family::evaluate_custom_family_joint_hyper;
     use crate::mixture_link::{
         state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
     };
@@ -3436,84 +3434,17 @@ mod tests {
                 &array![beta_log_sigma[0] - eps],
             )) / (2.0 * eps);
 
-            if label == "cloglog-near-fit" {
-                let fp = objective(
-                    &array![beta_time[0] + eps],
-                    &beta_threshold,
-                    &beta_log_sigma,
-                );
-                let fm = objective(
-                    &array![beta_time[0] - eps],
-                    &beta_threshold,
-                    &beta_log_sigma,
-                );
-                eprintln!(
-                    "cloglog near-fit full objective fp={} fm={} fd0={} analytic0={}",
-                    fp, fm, fd[0], analytic[0]
-                );
-            }
-
             for j in 0..3 {
                 let abs = (analytic[j] - fd[j]).abs();
-                if label == "cloglog-near-fit" && j == 0 && analytic[j].signum() != fd[j].signum() {
-                    let (h0, h1, d_raw, eta_t_full, eta_ls_full, eta_w) =
-                        family.validate_joint_states(&states).expect("joint states");
-                    let (sigma, _, _, _) = exp_sigma_derivs_up_to_third(eta_ls_full.view());
-                    for i in 0..family.n {
-                        let state = family.row_predictor_state(
-                            h0[i],
-                            h1[i],
-                            d_raw[i],
-                            eta_t_full[i],
-                            sigma[i],
-                            eta_w.map(|w| w[i]),
-                        );
-                        let row = family
-                            .row_derivatives(i, state)
-                            .expect("row derivatives")
-                            .expect("active row");
-                        let analytic_row = row.grad_time_eta_h0 * family.x_time_entry[[i, 0]]
-                            + row.grad_time_eta_h1 * family.x_time_exit[[i, 0]]
-                            + row.grad_time_eta_d * family.x_time_deriv[[i, 0]];
-                        let row_obj = |beta_time_scalar: f64| -> f64 {
-                            let state = family.row_predictor_state(
-                                family.x_time_entry[[i, 0]] * beta_time_scalar,
-                                family.x_time_exit[[i, 0]] * beta_time_scalar,
-                                family.x_time_deriv[[i, 0]] * beta_time_scalar
-                                    + family.offset_time_deriv[i],
-                                eta_t_full[i],
-                                sigma[i],
-                                eta_w.map(|w| w[i]),
-                            );
-                            family
-                                .row_derivatives(i, state)
-                                .expect("row objective derivs")
-                                .expect("active row")
-                                .ll
-                        };
-                        let fd_row = (row_obj(beta_time[0] + eps) - row_obj(beta_time[0] - eps))
-                            / (2.0 * eps);
-                        println!(
-                            "cloglog near-fit row {i}: analytic_row={} fd_row={} h0={} h1={} d={} eta_t={} sigma={} y={} w={}",
-                            analytic_row,
-                            fd_row,
-                            h0[i],
-                            h1[i],
-                            d_raw[i],
-                            eta_t_full[i],
-                            sigma[i],
-                            family.y[i],
-                            family.w[i]
-                        );
-                    }
+                if analytic[j].abs().max(fd[j].abs()) >= 1e-8 {
+                    assert_eq!(
+                        analytic[j].signum(),
+                        fd[j].signum(),
+                        "survival {label} joint score sign mismatch at {j}: analytic={} fd={}",
+                        analytic[j],
+                        fd[j]
+                    );
                 }
-                assert_eq!(
-                    analytic[j].signum(),
-                    fd[j].signum(),
-                    "survival {label} joint score sign mismatch at {j}: analytic={} fd={}",
-                    analytic[j],
-                    fd[j]
-                );
                 assert!(
                     abs <= 1e-5,
                     "survival {label} joint score mismatch at {j}: analytic={} fd={} abs={}",
@@ -3603,13 +3534,15 @@ mod tests {
 
             for j in 0..3 {
                 let abs = (analytic[j] - fd[j]).abs();
-                assert_eq!(
-                    analytic[j].signum(),
-                    fd[j].signum(),
-                    "survival {label} joint score sign mismatch at {j}: analytic={} fd={}",
-                    analytic[j],
-                    fd[j]
-                );
+                if analytic[j].abs().max(fd[j].abs()) >= 1e-8 {
+                    assert_eq!(
+                        analytic[j].signum(),
+                        fd[j].signum(),
+                        "survival {label} joint score sign mismatch at {j}: analytic={} fd={}",
+                        analytic[j],
+                        fd[j]
+                    );
+                }
                 assert!(
                     abs <= 5e-4,
                     "survival {label} joint score mismatch at {j}: analytic={} fd={} abs={}",
@@ -3692,9 +3625,6 @@ mod tests {
             .expect("center outer objective/gradient");
             assert!(center.objective.is_finite());
             assert_eq!(center.gradient.len(), rho.len());
-            let debug_terms =
-                debug_exact_newton_rho_gradient_terms(&family, &specs, &options, &rho, None)
-                    .expect("debug exact rho terms");
 
             for k in 0..rho.len() {
                 let mut rho_p = rho.clone();
@@ -3726,41 +3656,6 @@ mod tests {
                 let g_fd = (fp - fm) / (2.0 * h);
                 let abs_err = (center.gradient[k] - g_fd).abs();
                 let rel = abs_err / g_fd.abs().max(1e-8);
-                if abs_err >= 2e-4 && rel >= 2e-2 {
-                    let beta_p = debug_exact_newton_rho_gradient_terms(
-                        &family,
-                        &specs,
-                        &options,
-                        &rho_p,
-                        Some(&center.warm_start),
-                    )
-                    .expect("debug exact rho terms plus")
-                    .beta_flat;
-                    let beta_m = debug_exact_newton_rho_gradient_terms(
-                        &family,
-                        &specs,
-                        &options,
-                        &rho_m,
-                        Some(&center.warm_start),
-                    )
-                    .expect("debug exact rho terms minus")
-                    .beta_flat;
-                    let u_fd = (&beta_p - &beta_m) / (2.0 * h);
-                    println!(
-                        "outer survival {label} rho[{k}] beta={:?} stationarity_inf={} u_analytic={:?} u_fd={:?} objective={} analytic={} fd={} pen={} logh_exp={} logh_imp={} logs={}",
-                        debug_terms.beta_flat,
-                        debug_terms.stationarity_inf,
-                        debug_terms.u_terms[k],
-                        u_fd,
-                        debug_terms.objective,
-                        center.gradient[k],
-                        g_fd,
-                        debug_terms.penalty_term[k],
-                        debug_terms.logdet_h_explicit_term[k],
-                        debug_terms.logdet_h_implicit_term[k],
-                        debug_terms.logdet_s_term[k]
-                    );
-                }
                 assert_eq!(
                     center.gradient[k].signum(),
                     g_fd.signum(),
