@@ -564,7 +564,7 @@
       "prevalence_max": 0.1
     },
     {
-      "name": "thread2_fractional_spde_nu18",
+      "name": "continuous_order_fractional_spde_nu18",
       "n": 512,
       "seed": 20260501,
       "true_nu": 1.8,
@@ -590,7 +590,7 @@
       ]
     },
     {
-      "name": "thread2_boundary_rough",
+      "name": "continuous_order_boundary_rough",
       "n": 512,
       "seed": 20260502,
       "exclude_contenders": [
@@ -614,7 +614,7 @@
       ]
     },
     {
-      "name": "thread2_boundary_smooth",
+      "name": "continuous_order_boundary_smooth",
       "n": 512,
       "seed": 20260503,
       "exclude_contenders": [

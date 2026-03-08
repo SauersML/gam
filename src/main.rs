@@ -1044,9 +1044,6 @@ fn run_fit_with_predict_noise(
     if !args.no_summary {
         print_inference_summary(inference_notes);
     }
-    let sigma_min = 0.05;
-    let sigma_max = 20.0;
-
     if family == LikelihoodFamily::GaussianIdentity {
         if formula_link_wiggle.is_some() {
             return Err(
@@ -1171,8 +1168,6 @@ fn run_fit_with_predict_noise(
             y: y.clone(),
             weights: Array1::ones(y.len()),
             link_kind: location_scale_link_kind.clone(),
-            sigma_min,
-            sigma_max,
             threshold_spec: mean_spec.clone(),
             log_sigma_spec: noise_spec.clone(),
         },
@@ -1192,7 +1187,7 @@ fn run_fit_with_predict_noise(
         e
     })?;
     if let (Some(knots), Some(degree)) = (solved.wiggle_knots.as_ref(), solved.wiggle_degree) {
-        let final_q0 = compute_probit_q0_from_fit(&solved.fit.fit, sigma_min, sigma_max)?;
+        let final_q0 = compute_probit_q0_from_fit(&solved.fit.fit)?;
         let domain = summarize_wiggle_domain(final_q0.view(), knots.view(), degree)?;
         if domain.outside_count > 0 {
             eprintln!(
@@ -1249,8 +1244,8 @@ fn run_fit_with_predict_noise(
             frozen_noise_spec,
             fit_result,
             fit.block_states.get(1).map(|b| b.beta.to_vec()),
-            Some(sigma_min),
-            Some(sigma_max),
+            None,
+            None,
         );
         match &location_scale_link_kind {
             InverseLink::Sas(state) => {
@@ -1435,13 +1430,11 @@ fn run_predict_survival(
             eta_offset_exit[i] = eta0;
         }
         let survival_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
-        let sigma_min = model.survival_sigma_min.unwrap_or(0.05);
-        let sigma_max = model.survival_sigma_max.unwrap_or(20.0);
         let eta_t =
             DesignMatrix::Dense(cov_design.design.clone()).matrix_vector_multiply(&beta_threshold);
         let eta_ls =
             DesignMatrix::Dense(cov_design.design.clone()).matrix_vector_multiply(&beta_log_sigma);
-        let (sigma, _ds) = sigma_and_deriv_from_eta(eta_ls.view(), sigma_min, sigma_max);
+        let sigma = eta_ls.mapv(f64::exp);
         let beta_link_wiggle = model
             .beta_wiggle
             .as_ref()
@@ -1465,8 +1458,6 @@ fn run_predict_survival(
             x_log_sigma: DesignMatrix::Dense(cov_design.design.clone()),
             eta_log_sigma_offset: Array1::zeros(n),
             x_link_wiggle: x_link_wiggle.clone(),
-            sigma_min,
-            sigma_max,
             inverse_link: survival_inverse_link.clone(),
         };
         let fit_stub = gam::survival_location_scale::SurvivalLocationScaleFitResult {
@@ -1799,9 +1790,8 @@ fn run_predict_binomial_location_scale(
     let saved_loc_link = saved_link_kind.ok_or_else(|| {
         "binomial-location-scale model is missing link state/metadata".to_string()
     })?;
-    let sigma_min = model.sigma_min.unwrap_or(0.05);
-    let sigma_max = model.sigma_max.unwrap_or(20.0);
-    let (sigma, dsigma) = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max);
+    let sigma = eta_noise.mapv(f64::exp);
+    let dsigma = sigma.clone();
     let q0 = Array1::from_iter(
         eta_t
             .iter()
@@ -1871,7 +1861,7 @@ fn run_predict_binomial_location_scale(
                     [eta_t[i], eta_noise[i]],
                     [[var_t, cov_tls], [cov_tls, var_ls]],
                     |t, ls| {
-                        let sigma = sigma_from_eta_scalar(ls, sigma_min, sigma_max);
+                        let sigma = ls.exp();
                         normal_cdf(-t / sigma.max(1e-12)).clamp(1e-10, 1.0 - 1e-10)
                     },
                 )
@@ -1946,7 +1936,7 @@ fn run_predict_binomial_location_scale(
                     [eta_t[i], eta_noise[i]],
                     [[var_t, cov_tls], [cov_tls, var_ls]],
                     |t, ls| {
-                        let sigma = sigma_from_eta_scalar(ls, sigma_min, sigma_max).max(1e-12);
+                        let sigma = ls.exp().max(1e-12);
                         let q0 = (-t / sigma).clamp(-30.0, 30.0);
                         let xw = saved_probit_wiggle_basis_row_scalar(q0, model)?;
                         if xw.len() != p_w {
@@ -3788,8 +3778,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_ridge_lambda = Some(effective_args.ridge_lambda);
             payload.survival_likelihood =
                 Some(survival_likelihood_mode_name(likelihood_mode).to_string());
-            payload.survival_sigma_min = Some(0.05);
-            payload.survival_sigma_max = Some(20.0);
             payload.survival_beta_time = Some(fit.beta_time.to_vec());
             payload.survival_beta_threshold = Some(fit.beta_threshold.to_vec());
             payload.survival_beta_log_sigma = Some(fit.beta_log_sigma.to_vec());
@@ -4835,7 +4823,7 @@ th {{ background: #f6f8fa; }}
 <table><tr><th>Index</th><th>Estimate</th><th>Std. Error</th></tr>{coef_rows}</table>
 	<h2>EDF by Penalty Block</h2>
 	<table><tr><th>Block</th><th>EDF</th></tr>{edf_rows}</table>
-	<h2>Continuous Smoothness Order (Thread 2)</h2>
+	<h2>Continuous Smoothness Order</h2>
 	<table><tr><th>Term</th><th>lambda0</th><th>lambda1</th><th>lambda2</th><th>R</th><th>nu</th><th>kappa^2</th><th>Status</th></tr>{continuous_rows}</table>
 	<h2>Diagnostics</h2>
 <div class="grid">
@@ -5096,8 +5084,6 @@ struct WiggleDomainDiagnostics {
 fn compute_probit_q0_from_eta(
     eta_t: ArrayView1<'_, f64>,
     eta_ls: ArrayView1<'_, f64>,
-    sigma_min: f64,
-    sigma_max: f64,
 ) -> Result<Array1<f64>, String> {
     if eta_t.len() != eta_ls.len() {
         return Err(format!(
@@ -5108,17 +5094,13 @@ fn compute_probit_q0_from_eta(
     }
     let mut q0 = Array1::<f64>::zeros(eta_t.len());
     for i in 0..q0.len() {
-        let sigma = sigma_from_eta_scalar(eta_ls[i], sigma_min, sigma_max).max(1e-12);
+        let sigma = eta_ls[i].exp().max(1e-12);
         q0[i] = -eta_t[i] / sigma;
     }
     Ok(q0)
 }
 
-fn compute_probit_q0_from_fit(
-    fit: &gam::BlockwiseFitResult,
-    sigma_min: f64,
-    sigma_max: f64,
-) -> Result<Array1<f64>, String> {
+fn compute_probit_q0_from_fit(fit: &gam::BlockwiseFitResult) -> Result<Array1<f64>, String> {
     let eta_t = fit
         .block_states
         .first()
@@ -5131,7 +5113,7 @@ fn compute_probit_q0_from_fit(
         .ok_or_else(|| "pilot fit is missing log-sigma block".to_string())?
         .eta
         .view();
-    compute_probit_q0_from_eta(eta_t, eta_ls, sigma_min, sigma_max)
+    compute_probit_q0_from_eta(eta_t, eta_ls)
 }
 
 fn summarize_wiggle_domain(
@@ -7768,7 +7750,7 @@ fn build_model_summary(
             // Unscaling identity for physical lambdas:
             //   S_tilde_k = S_k / c_k, and
             //   lambda_tilde_k * S_tilde_k = (lambda_tilde_k / c_k) * S_k.
-            // Therefore physical lambda used by Thread-2 diagnostics is
+            // Therefore physical lambda used by continuous-order diagnostics is
             //   lambda_k = lambda_tilde_k / c_k.
             // If legacy metadata is missing/corrupt, fallback c_k=1 preserves
             // backward-compatible behavior.

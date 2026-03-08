@@ -2460,7 +2460,7 @@ fn unscale_to_physical_lambdas(
     Some(out)
 }
 
-// Thread 2: Continuous smoothness/order diagnostic from three operator penalties.
+// Continuous smoothness/order diagnostic from three operator penalties.
 //
 // Full derivation and implementation contract
 // -------------------------------------------
@@ -2663,7 +2663,7 @@ pub fn compute_continuous_smoothness_order(
         };
     }
     let nu = r_ratio / (r_ratio - 2.0);
-    // Closed-form extraction required by Thread 2 (Section 3):
+    // Closed-form extraction required by the continuous-order benchmark:
     //
     //   R = lambda1^2 / (lambda0*lambda2) = 2*nu/(nu-1)
     //   => nu = R/(R-2).
@@ -2858,7 +2858,7 @@ impl fmt::Display for ModelSummary {
             .filter_map(|t| t.continuous_order.as_ref().map(|o| (&t.name, o)))
             .collect::<Vec<_>>();
         if !order_terms.is_empty() {
-            writeln!(f, "Continuous Smoothness Order (Thread 2):")?;
+            writeln!(f, "Continuous Smoothness Order:")?;
             writeln!(
                 f,
                 "{:<name_w$} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>20}",
