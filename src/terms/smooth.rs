@@ -6981,7 +6981,7 @@ where
             ))
         };
 
-        let objective = CachedSecondOrderObjective::new(
+        let objective = CachedFirstOrderObjective::new(
             |theta: &Array1<f64>| {
                 let (cost, grad) = match eval_value(theta) {
                     Ok((cost, mean_spec_c, noise_spec_c, mean_design_c, noise_design_c, fit_c)) => {
@@ -7022,16 +7022,16 @@ where
                         )));
                     }
                 };
-                Ok((cost, grad, None))
+                Ok((cost, grad))
             },
-            1e-4,
         );
-        let mut optimizer = NewtonTrustRegion::new(theta0.clone(), objective)
+        let mut optimizer = Bfgs::new(theta0.clone(), objective)
             .with_bounds(Bounds::new(lower, upper, 1e-6).expect("two-block bounds must be valid"))
             .with_tolerance(
                 Tolerance::new(kappa_options.rel_tol.max(1e-6))
                     .expect("two-block tolerance must be valid"),
             )
+            .with_profile(opt::Profile::Aggressive)
             .with_max_iterations(
                 MaxIterations::new(kappa_options.max_outer_iter.max(1))
                     .expect("two-block max iterations must be valid"),
@@ -7039,7 +7039,8 @@ where
 
         let solution = match optimizer.run() {
             Ok(sol) => sol,
-            Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
+            Err(BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
+            Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
             Err(err) => return Err(format!("two-block spatial optimization failed: {err:?}")),
         };
 

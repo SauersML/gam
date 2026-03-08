@@ -1613,6 +1613,10 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mut noise_log_lambda_hint: Option<Array1<f64>> = None;
     let mut mean_beta_hint: Option<Array1<f64>> = None;
     let mut noise_beta_hint: Option<Array1<f64>> = None;
+    let mut spatial_search_options = options.clone();
+    spatial_search_options.use_reml_objective = false;
+    spatial_search_options.compute_covariance = false;
+    spatial_search_options.outer_max_iter = 0;
     let extra_rho0 = builder.extra_rho0()?;
 
     let mean_boot_design =
@@ -1635,7 +1639,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             (Some(_), Some(_))
         );
 
-    let solved = if exact_joint_ready {
+    let mut used_fd_spatial_search = false;
+    let mut solved = if exact_joint_ready {
         let joint_setup = build_two_block_exact_joint_setup(
             builder.mean_spec(),
             builder.noise_spec(),
@@ -1718,6 +1723,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     "exact two-block spatial optimization failed ({}); falling back to finite-difference optimizer",
                     err
                 );
+                used_fd_spatial_search = true;
                 optimize_two_block_spatial_length_scale(
                     data,
                     builder.mean_spec(),
@@ -1739,7 +1745,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                             noise_beta_hint.clone(),
                         )?;
                         let family = builder.build_family(mean_design, noise_design);
-                        let fit = fit_custom_family(&family, &blocks, options)?;
+                        let fit = fit_custom_family(&family, &blocks, &spatial_search_options)?;
                         let layout = GamlssLambdaLayout::two_block(
                             mean_design.penalties.len(),
                             noise_design.penalties.len(),
@@ -1758,6 +1764,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             }
         }
     } else {
+        used_fd_spatial_search = true;
         optimize_two_block_spatial_length_scale(
             data,
             builder.mean_spec(),
@@ -1779,7 +1786,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     noise_beta_hint.clone(),
                 )?;
                 let family = builder.build_family(mean_design, noise_design);
-                let fit = fit_custom_family(&family, &blocks, options)?;
+                let fit = fit_custom_family(&family, &blocks, &spatial_search_options)?;
                 let layout = GamlssLambdaLayout::two_block(
                     mean_design.penalties.len(),
                     noise_design.penalties.len(),
@@ -1796,6 +1803,25 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             |fit| fit.penalized_objective,
         )?
     };
+
+    if used_fd_spatial_search {
+        let theta = compose_theta_from_hints(
+            &solved.mean_design,
+            &solved.noise_design,
+            &mean_log_lambda_hint,
+            &noise_log_lambda_hint,
+            &extra_rho0,
+        );
+        let blocks = builder.build_blocks(
+            &theta,
+            &solved.mean_design,
+            &solved.noise_design,
+            mean_beta_hint.clone(),
+            noise_beta_hint.clone(),
+        )?;
+        let family = builder.build_family(&solved.mean_design, &solved.noise_design);
+        solved.fit = fit_custom_family(&family, &blocks, options)?;
+    }
 
     Ok(BlockwiseTermFitResult {
         fit: solved.fit,

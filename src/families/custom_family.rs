@@ -393,19 +393,6 @@ pub struct CustomFamilyJointHyperResult {
     pub warm_start: CustomFamilyWarmStart,
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) struct ExactNewtonRhoGradientDebug {
-    pub objective: f64,
-    pub penalty_term: Array1<f64>,
-    pub logdet_h_explicit_term: Array1<f64>,
-    pub logdet_h_implicit_term: Array1<f64>,
-    pub logdet_s_term: Array1<f64>,
-    pub beta_flat: Array1<f64>,
-    pub stationarity_inf: f64,
-    pub u_terms: Vec<Array1<f64>>,
-}
-
 struct OuterObjectiveEvalResult {
     objective: f64,
     gradient: Array1<f64>,
@@ -3409,6 +3396,18 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
             inner: result.warm_start,
         },
     })
+}
+
+#[cfg(test)]
+pub(crate) struct ExactNewtonRhoGradientDebug {
+    pub objective: f64,
+    pub penalty_term: Array1<f64>,
+    pub logdet_h_explicit_term: Array1<f64>,
+    pub logdet_h_implicit_term: Array1<f64>,
+    pub logdet_s_term: Array1<f64>,
+    pub beta_flat: Array1<f64>,
+    pub stationarity_inf: f64,
+    pub u_terms: Vec<Array1<f64>>,
 }
 
 #[cfg(test)]
