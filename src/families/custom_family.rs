@@ -3016,7 +3016,9 @@ fn post_update_tangent_basis_for_block<F: CustomFamily>(
     }
 
     let identity = Array2::<f64>::eye(p);
-    let jac_err = (&jac - &identity).iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+    let jac_err = (&jac - &identity)
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()));
     if jac_err <= 1e-10 {
         return Ok(None);
     }
@@ -3048,13 +3050,14 @@ fn joint_post_update_tangent_basis<F: CustomFamily>(
     let mut total_rank = 0usize;
     for (block_idx, &(start, end)) in ranges.iter().enumerate() {
         let p = end - start;
-        let basis = match post_update_tangent_basis_for_block(family, specs, block_states, block_idx)? {
-            Some(basis) => {
-                any_reduced = true;
-                basis
-            }
-            None => Array2::<f64>::eye(p),
-        };
+        let basis =
+            match post_update_tangent_basis_for_block(family, specs, block_states, block_idx)? {
+                Some(basis) => {
+                    any_reduced = true;
+                    basis
+                }
+                None => Array2::<f64>::eye(p),
+            };
         total_rank += basis.ncols();
         blocks.push(basis);
     }
@@ -3070,7 +3073,8 @@ fn joint_post_update_tangent_basis<F: CustomFamily>(
         if width == 0 {
             continue;
         }
-        basis.slice_mut(ndarray::s![start..end, col_at..col_at + width])
+        basis
+            .slice_mut(ndarray::s![start..end, col_at..col_at + width])
             .assign(block_basis);
         col_at += width;
     }
@@ -3090,7 +3094,9 @@ fn solve_mode_sensitivity(
             strict_solve_spd(matrix, vector)
         } else {
             solve_spd_system_with_policy(matrix, vector, options.ridge_floor, options.ridge_policy)
-                .or_else(|_| pinv_positive_part(matrix, options.ridge_floor).map(|pinv| pinv.dot(vector)))
+                .or_else(|_| {
+                    pinv_positive_part(matrix, options.ridge_floor).map(|pinv| pinv.dot(vector))
+                })
                 .map_err(|_| format!("failed to solve {context}"))
         }
     };

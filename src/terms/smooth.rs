@@ -6585,9 +6585,14 @@ where
                     if interior_value > left_value.min(right_value) + 1e-12
                         && interior_value < left_value.max(right_value) - 1e-12
                     {
-                        let interior_theta = coordinate_probe(&current_theta, coord, interior_value);
+                        let interior_theta =
+                            coordinate_probe(&current_theta, coord, interior_value);
                         let interior_cost = eval_value(&mut hyper_state, &interior_theta)?.0;
-                        if spatial_score_improves(interior_cost, current_cost, kappa_options.rel_tol) {
+                        if spatial_score_improves(
+                            interior_cost,
+                            current_cost,
+                            kappa_options.rel_tol,
+                        ) {
                             current_theta = interior_theta;
                             current_cost = interior_cost;
                             best_eval = hyper_state.best().ok_or_else(|| {
@@ -9170,7 +9175,10 @@ mod tests {
             _ => panic!("expected Duchon term"),
         };
         assert_eq!(optimized_ls, baseline_ls);
-        assert_eq!(optimized.design.design.ncols(), baseline.design.design.ncols());
+        assert_eq!(
+            optimized.design.design.ncols(),
+            baseline.design.design.ncols()
+        );
     }
 
     #[test]

@@ -235,7 +235,7 @@ struct FitArgs {
     #[arg(long = "baseline-makeham")]
     baseline_makeham: Option<f64>,
     /// Time basis for survival mode (`linear`, `ispline`, ...).
-    #[arg(long = "time-basis", default_value = "linear")]
+    #[arg(long = "time-basis", default_value = "bspline")]
     time_basis: String,
     /// Degree for survival time basis.
     #[arg(long = "time-degree", default_value_t = 3)]
@@ -1054,8 +1054,7 @@ fn run_fit_with_predict_noise(
         }
         let response_scale = sample_std(y.view()).max(1e-6);
         let y_scaled = y.mapv(|v| v / response_scale);
-        let sigma_min = (response_scale * 1e-3).max(1e-6);
-        let sigma_max = (response_scale * 1e3).max(sigma_min * 10.0);
+        let (sigma_min, sigma_max) = gaussian_location_scale_sigma_bounds(response_scale, y.len());
         let sigma_min_scaled = (sigma_min / response_scale).max(1e-6);
         let sigma_max_scaled = (sigma_max / response_scale).max(sigma_min_scaled * 10.0);
         let options = blockwise_options_from_fit_args(args)?;
@@ -2687,6 +2686,53 @@ fn build_survival_time_basis(
     let log_entry = age_entry.mapv(|t| t.max(1e-9).ln());
     let log_exit = age_exit.mapv(|t| t.max(1e-9).ln());
 
+    fn infer_survival_time_knots(
+        combined: &Array1<f64>,
+        degree: usize,
+        num_internal_knots: usize,
+        basis_options: BasisOptions,
+    ) -> Result<Array1<f64>, String> {
+        let infer_with =
+            |placement: gam::basis::BSplineKnotPlacement| -> Result<Array1<f64>, String> {
+                let built = build_bspline_basis_1d(
+                    combined.view(),
+                    &BSplineBasisSpec {
+                        degree,
+                        penalty_order: 2,
+                        knot_spec: BSplineKnotSpec::Automatic {
+                            num_internal_knots: Some(num_internal_knots),
+                            placement,
+                        },
+                        double_penalty: false,
+                        identifiability: BSplineIdentifiability::None,
+                    },
+                )
+                .map_err(|e| format!("failed to infer survival time knots: {e}"))?;
+                let knots = match built.metadata {
+                    gam::basis::BasisMetadata::BSpline1D { knots, .. } => knots,
+                    _ => {
+                        return Err(
+                            "internal error: expected BSpline1D metadata for survival time basis"
+                                .to_string(),
+                        );
+                    }
+                };
+                create_basis::<Dense>(
+                    combined.view(),
+                    KnotSource::Provided(knots.view()),
+                    degree,
+                    basis_options,
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(knots)
+            };
+
+        match infer_with(gam::basis::BSplineKnotPlacement::Quantile) {
+            Ok(knots) => Ok(knots),
+            Err(_) => infer_with(gam::basis::BSplineKnotPlacement::Uniform),
+        }
+    }
+
     match cfg {
         SurvivalTimeBasisConfig::Linear => {
             let mut x_entry_time = Array2::<f64>::zeros((n, 2));
@@ -2726,27 +2772,12 @@ fn build_survival_time_basis(
                     combined[i] = log_entry[i];
                     combined[n + i] = log_exit[i];
                 }
-                let built = build_bspline_basis_1d(
-                    combined.view(),
-                    &BSplineBasisSpec {
-                        degree,
-                        penalty_order: 2,
-                        knot_spec: BSplineKnotSpec::Automatic {
-                            num_internal_knots: Some(num_internal_knots),
-                            placement: gam::basis::BSplineKnotPlacement::Quantile,
-                        },
-                        double_penalty: false,
-                        identifiability: BSplineIdentifiability::None,
-                    },
-                )
-                .map_err(|e| format!("failed to build bspline time basis: {e}"))?;
-                match built.metadata {
-                    gam::basis::BasisMetadata::BSpline1D { knots, .. } => knots,
-                    _ => {
-                        return Err("internal error: expected BSpline1D metadata for time basis"
-                            .to_string());
-                    }
-                }
+                infer_survival_time_knots(
+                    &combined,
+                    degree,
+                    num_internal_knots,
+                    BasisOptions::value(),
+                )?
             } else {
                 knots
             };
@@ -2822,29 +2853,12 @@ fn build_survival_time_basis(
                     combined[i] = log_entry[i];
                     combined[n + i] = log_exit[i];
                 }
-                let built = build_bspline_basis_1d(
-                    combined.view(),
-                    &BSplineBasisSpec {
-                        degree: bspline_degree,
-                        penalty_order: 2,
-                        knot_spec: BSplineKnotSpec::Automatic {
-                            num_internal_knots: Some(num_internal_knots),
-                            placement: gam::basis::BSplineKnotPlacement::Quantile,
-                        },
-                        double_penalty: false,
-                        identifiability: BSplineIdentifiability::None,
-                    },
-                )
-                .map_err(|e| format!("failed to build ispline knot basis: {e}"))?;
-                match built.metadata {
-                    BasisMetadata::BSpline1D { knots, .. } => knots,
-                    _ => {
-                        return Err(
-                            "internal error: expected BSpline1D metadata for ispline time basis"
-                                .to_string(),
-                        );
-                    }
-                }
+                infer_survival_time_knots(
+                    &combined,
+                    bspline_degree,
+                    num_internal_knots,
+                    BasisOptions::i_spline(),
+                )?
             } else {
                 knots
             };
@@ -3120,10 +3134,7 @@ fn project_beta_to_linear_constraints(
             }
             let norm2 = ai.dot(&ai);
             if !norm2.is_finite() || norm2 <= 1e-20 {
-                return Err(format!(
-                    "cannot satisfy linear constraint row {i}: near-zero row norm with positive violation {:.3e}",
-                    deficit
-                ));
+                continue;
             }
             let alpha = deficit / norm2;
             for j in 0..beta.len() {
@@ -3827,9 +3838,17 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     let penalties = PenaltyBlocks::new(penalty_blocks.clone());
 
+    let monotonicity = MonotonicityPenalty {
+        tolerance: if time_build.basis_name == "ispline" {
+            0.0
+        } else {
+            1e-8
+        },
+    };
+
     let mut model = gam::families::royston_parmar::working_model_from_flattened(
         penalties,
-        MonotonicityPenalty { tolerance: 1e-8 },
+        monotonicity,
         survival_spec,
         gam::families::royston_parmar::RoystonParmarInputs {
             age_entry: age_entry.view(),
@@ -4161,7 +4180,13 @@ fn run_sample_survival(
         }
         other => return Err(format!("unsupported saved survival spec '{other}'")),
     };
-    let monotonicity = MonotonicityPenalty { tolerance: 1e-8 };
+    let monotonicity = MonotonicityPenalty {
+        tolerance: if time_build.basis_name == "ispline" {
+            0.0
+        } else {
+            1e-8
+        },
+    };
     let baseline_cfg = survival_baseline_config_from_model(model)?;
     let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
         build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
@@ -6932,6 +6957,21 @@ fn sample_std(v: ArrayView1<'_, f64>) -> f64 {
     var.max(0.0).sqrt()
 }
 
+fn gaussian_location_scale_sigma_bounds(response_scale: f64, n_obs: usize) -> (f64, f64) {
+    let scale = response_scale.max(1e-6);
+    let sigma_floor_frac = if n_obs < 64 {
+        0.05
+    } else if n_obs < 256 {
+        0.02
+    } else {
+        0.01
+    };
+    let sigma_cap_mult = if n_obs < 64 { 20.0 } else { 50.0 };
+    let sigma_min = (scale * sigma_floor_frac).max(1e-6);
+    let sigma_max = (scale * sigma_cap_mult).max(sigma_min * 20.0);
+    (sigma_min, sigma_max)
+}
+
 fn resolve_family(
     arg: FamilyArg,
     link_choice: Option<LinkChoice>,
@@ -8290,12 +8330,12 @@ mod tests {
         apply_saved_probit_wiggle, build_survival_time_basis, chi_square_survival_approx,
         classify_cli_error, collect_linear_smooth_overlap_warnings,
         collect_spatial_smooth_usage_warnings, compute_probit_q0_from_eta, core_saved_fit_result,
-        evaluate_survival_baseline, parse_duchon_order, parse_duchon_power, parse_formula,
-        parse_link_choice, parse_surv_response, parse_survival_baseline_config,
-        parse_survival_inverse_link, parse_survival_time_basis_config, pretty_family_name,
-        saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design, summarize_wiggle_domain,
-        survival_probability_from_eta, write_gaussian_location_scale_prediction_csv,
-        write_survival_prediction_csv,
+        evaluate_survival_baseline, gaussian_location_scale_sigma_bounds, parse_duchon_order,
+        parse_duchon_power, parse_formula, parse_link_choice, parse_surv_response,
+        parse_survival_baseline_config, parse_survival_inverse_link,
+        parse_survival_time_basis_config, pretty_family_name, saved_probit_wiggle_derivative_q0,
+        saved_probit_wiggle_design, summarize_wiggle_domain, survival_probability_from_eta,
+        write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
     use csv::StringRecord;
     use gam::basis::{
@@ -9112,6 +9152,22 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_location_scale_sigma_bounds_raise_small_sample_floor() {
+        let (small_min, small_max) = gaussian_location_scale_sigma_bounds(10.0, 32);
+        let (large_min, large_max) = gaussian_location_scale_sigma_bounds(10.0, 1024);
+        assert!(
+            small_min > large_min,
+            "small-sample sigma floor should be stricter: small={small_min} large={large_min}"
+        );
+        assert!(
+            small_max < large_max,
+            "small-sample sigma cap should be tighter: small={small_max} large={large_max}"
+        );
+        assert!(small_min > 0.0 && large_min > 0.0);
+        assert!(small_max > small_min && large_max > large_min);
+    }
+
+    #[test]
     fn parse_survival_baseline_accepts_gompertz_makeham() {
         let cfg = parse_survival_baseline_config(
             "gompertz-makeham",
@@ -9413,6 +9469,28 @@ mod tests {
                 assert!((built.x_derivative_time[[i, j]] - expected).abs() <= 1e-12);
             }
         }
+    }
+
+    #[test]
+    fn ispline_time_basis_inference_falls_back_when_quantile_knots_degenerate() {
+        let age_entry = Array1::from_vec(vec![1e-9; 8]);
+        let age_exit = Array1::from_vec(vec![1e-9, 1e-9, 1e-9, 1e-9, 0.5, 1.0, 2.0, 4.0]);
+        let built = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 3,
+                knots: Array1::zeros(0),
+                smooth_lambda: 1e-2,
+            },
+            Some((6, 1e-6)),
+        )
+        .expect("build ispline time basis with fallback knot inference");
+
+        assert_eq!(built.basis_name, "ispline");
+        assert!(built.knots.as_ref().is_some_and(|k| !k.is_empty()));
+        assert!(built.x_exit_time.ncols() > 0);
+        assert!(built.x_derivative_time.iter().all(|v| v.is_finite()));
     }
 
     #[test]

@@ -8875,7 +8875,8 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
         };
 
-        let built = build_bspline_basis_1d(x.view(), &spec).expect("quantile builder should collapse duplicated knots safely");
+        let built = build_bspline_basis_1d(x.view(), &spec)
+            .expect("quantile builder should collapse duplicated knots safely");
         assert_eq!(built.penalties.len(), 1);
         assert!(built.penalties[0].iter().all(|v| v.is_finite()));
         assert!(built.design.iter().all(|v| v.is_finite()));
