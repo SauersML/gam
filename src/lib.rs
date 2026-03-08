@@ -93,9 +93,9 @@ pub use terms::layout::{
 pub use terms::smooth::{
     BoundedCoefficientPriorSpec, FittedTermCollection, FittedTermCollectionWithSpec,
     LinearCoefficientGeometry, LinearTermSpec, MaternKappaOptimizationOptions,
-    RandomEffectTermSpec, RawSmoothDesign, ShapeConstraint, SmoothBasisSpec, SmoothDesign, SmoothTerm,
-    SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TensorBSplineSpec, TermCollectionDesign,
-    TermCollectionSpec, TwoBlockMaternKappaOptimizationResult,
+    RandomEffectTermSpec, RawSmoothDesign, ShapeConstraint, SmoothBasisSpec, SmoothDesign,
+    SmoothTerm, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TensorBSplineSpec,
+    TermCollectionDesign, TermCollectionSpec, TwoBlockMaternKappaOptimizationResult,
     TwoBlockSpatialLengthScaleOptimizationResult, build_smooth_design,
     build_term_collection_design, fit_term_collection,
     fit_term_collection_with_matern_kappa_optimization,
