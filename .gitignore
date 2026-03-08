@@ -1,9 +1,11 @@
 target/
+target-codex/
 Cargo.lock
 __pycache__/
 bench/**/__pycache__/
 benchmarks/**/__pycache__/
 tests/**/__pycache__/
+tests/bench_tools/*.joblib
 =
 benchmarks/results.cv_*.json
 benchmarks/results.*.local.json
@@ -37,6 +39,7 @@ scripts/__pycache__/
 scripts/latest_benchmark_summary.md
 scripts/scripts/latest_benchmark_summary.md
 *.png
+src/rust_digest.txt
 
 # macOS metadata
 .DS_Store
@@ -53,6 +56,12 @@ run53_duchon_matern_results.txt
 scripts/rust_digest.txt
 bench/direct_fold3_model.json
 bench/direct_fold3_model_noadapt.json
+bench/us48_debug_after_fix/
+bench/us48_debug_artifacts/
+bench/us48_debug_artifacts_after/
+bench/us48_debug_artifacts_logsigma/
+bench/us48_debug_final/
+bench/us48_scale_experiment/
 
 # Lean/Lake build artifacts
 .lake/
