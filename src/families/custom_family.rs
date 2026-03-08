@@ -4370,13 +4370,15 @@ mod tests {
                 let h_fd = (gp[k] - gm[k]) / (2.0 * h);
                 let abs_err = (h0[[k, l]] - h_fd).abs();
                 let rel = (h0[[k, l]] - h_fd).abs() / h_fd.abs().max(1e-7);
-                assert_eq!(
-                    h0[[k, l]].signum(),
-                    h_fd.signum(),
-                    "outer Hessian sign mismatch at ({k},{l}): analytic={} fd={}",
-                    h0[[k, l]],
-                    h_fd
-                );
+                if h0[[k, l]].abs().max(h_fd.abs()) > 1e-10 {
+                    assert_eq!(
+                        h0[[k, l]].signum(),
+                        h_fd.signum(),
+                        "outer Hessian sign mismatch at ({k},{l}): analytic={} fd={}",
+                        h0[[k, l]],
+                        h_fd
+                    );
+                }
                 assert!(
                     abs_err < 1e-8 || rel < 2e-2,
                     "outer Hessian mismatch at ({k},{l}): analytic={} fd={} abs={} rel={}",

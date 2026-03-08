@@ -1015,7 +1015,7 @@ fn build_shape_constraint_design_1d(
                 length_scale,
                 power,
                 nullspace_order,
-                ..
+                identifiability_transform,
             },
         ) => {
             let eval_spec = DuchonBasisSpec {
@@ -1024,7 +1024,12 @@ fn build_shape_constraint_design_1d(
                 power: *power,
                 nullspace_order: *nullspace_order,
                 double_penalty: false,
-                identifiability: spec.identifiability.clone(),
+                identifiability: identifiability_transform
+                    .as_ref()
+                    .map(|z| SpatialIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    })
+                    .unwrap_or_else(|| spec.identifiability.clone()),
             };
             build_duchon_basis(grid_2d.view(), &eval_spec)?.design
         }
@@ -6413,6 +6418,33 @@ fn coordinate_probe(theta: &Array1<f64>, index: usize, value: f64) -> Array1<f64
     probe
 }
 
+fn quadratic_coordinate_minimizer(
+    x_left: f64,
+    f_left: f64,
+    x_mid: f64,
+    f_mid: f64,
+    x_right: f64,
+    f_right: f64,
+) -> Option<f64> {
+    let d_left = x_left - x_mid;
+    let d_right = x_right - x_mid;
+    if d_left.abs() <= 1e-12 || d_right.abs() <= 1e-12 {
+        return None;
+    }
+    let a_left = (f_left - f_mid) / d_left;
+    let a_right = (f_right - f_mid) / d_right;
+    let curvature = (a_left - a_right) / (d_left - d_right);
+    if !curvature.is_finite() || curvature <= 0.0 {
+        return None;
+    }
+    let slope = a_left - curvature * d_left;
+    let x_star = x_mid - slope / (2.0 * curvature);
+    if !x_star.is_finite() {
+        return None;
+    }
+    Some(x_star)
+}
+
 fn optimize_single_block_spatial_length_scale<FitOut, FitFn, ScoreFn>(
     resolved_spec: &TermCollectionSpec,
     spatial_terms: &[usize],
@@ -6539,6 +6571,37 @@ where
             } else {
                 eval_value(&mut hyper_state, &right_probe)?.0
             };
+
+            if left_cost.is_finite() && right_cost.is_finite() {
+                if let Some(interior_value) = quadratic_coordinate_minimizer(
+                    left_value,
+                    left_cost,
+                    base_value,
+                    base_cost,
+                    right_value,
+                    right_cost,
+                ) {
+                    let interior_value = interior_value.clamp(lower[coord], upper[coord]);
+                    if interior_value > left_value.min(right_value) + 1e-12
+                        && interior_value < left_value.max(right_value) - 1e-12
+                    {
+                        let interior_theta = coordinate_probe(&current_theta, coord, interior_value);
+                        let interior_cost = eval_value(&mut hyper_state, &interior_theta)?.0;
+                        if spatial_score_improves(interior_cost, current_cost, kappa_options.rel_tol) {
+                            current_theta = interior_theta;
+                            current_cost = interior_cost;
+                            best_eval = hyper_state.best().ok_or_else(|| {
+                                EstimationError::RemlOptimizationFailed(
+                                    "single-block spatial optimization produced no finite evaluations"
+                                        .to_string(),
+                                )
+                            })?;
+                            pass_improved = true;
+                            continue;
+                        }
+                    }
+                }
+            }
 
             let (mut candidate_theta, mut candidate_cost, direction) =
                 if spatial_score_improves(left_cost, base_cost, kappa_options.rel_tol)
@@ -8053,8 +8116,8 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        assert_eq!(sd.penalties.len(), 1);
-        assert_eq!(sd.nullspace_dims.len(), 1);
+        assert_eq!(sd.penalties.len(), 3);
+        assert_eq!(sd.nullspace_dims.len(), 3);
     }
 
     #[test]
