@@ -1,5 +1,6 @@
-use faer::sparse::{SparseColMat, SparseRowMat};
+use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView2};
+use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
@@ -142,13 +143,45 @@ pub enum DesignMatrix {
 }
 
 /// A unified representation of a symmetric matrix, typically an assembled Hessian.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum SymmetricMatrix {
     Dense(Array2<f64>),
     Sparse(faer::sparse::SparseColMat<usize, f64>),
 }
 
 impl SymmetricMatrix {
+    pub fn as_dense(&self) -> Option<&Array2<f64>> {
+        match self {
+            Self::Dense(mat) => Some(mat),
+            Self::Sparse(_) => None,
+        }
+    }
+
+    pub fn to_dense(&self) -> Array2<f64> {
+        match self {
+            Self::Dense(mat) => mat.clone(),
+            Self::Sparse(mat) => {
+                let mut out = Array2::<f64>::zeros((mat.nrows(), mat.ncols()));
+                let (symbolic, values) = mat.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..mat.ncols() {
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    for idx in start..end {
+                        let row = row_idx[idx];
+                        let value = values[idx];
+                        out[[row, col]] += value;
+                        if row != col {
+                            out[[col, row]] += value;
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
     pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
         match self {
             Self::Dense(mat) => {
@@ -178,13 +211,39 @@ impl SymmetricMatrix {
             Self::Sparse(m) => m.ncols(),
         }
     }
+
+    pub fn dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        match self {
+            Self::Dense(mat) => mat.dot(rhs),
+            Self::Sparse(mat) => {
+                let mut out = Array1::<f64>::zeros(mat.nrows());
+                let (symbolic, values) = mat.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..mat.ncols() {
+                    let rhs_j = rhs[col];
+                    let start = col_ptr[col];
+                    let end = col_ptr[col + 1];
+                    for idx in start..end {
+                        let row = row_idx[idx];
+                        let value = values[idx];
+                        out[row] += value * rhs_j;
+                        if row != col {
+                            out[col] += value * rhs[row];
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
 }
 
 /// A generic abstraction over a factorized symmetric positive-definite (or regularized) system.
 pub trait FactorizedSystem: Send + Sync {
     /// Solve $H x = b$ for a single right-hand side.
     fn solve(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, String>;
-    
+
     /// Solve $H X = B$ for multiple right-hand sides.
     fn solve_multi(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String>;
 
@@ -196,6 +255,29 @@ pub trait LinearOperator {
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn diag_xt_w_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
+    fn factorize_system(
+        &self,
+        weights: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+    ) -> Result<Box<dyn FactorizedSystem>, String> {
+        let mut system = self.diag_xt_w_x(weights)?;
+        if let Some(pen) = penalty {
+            if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
+                return Err(format!(
+                    "factorize_system penalty shape mismatch: got {}x{}, expected {}x{}",
+                    pen.nrows(),
+                    pen.ncols(),
+                    system.nrows(),
+                    system.ncols()
+                ));
+            }
+            system += pen;
+        }
+        let factor = crate::linalg::utils::StableSolver::new("linear operator system")
+            .factorize(&system)
+            .map_err(|e| format!("factorize_system failed: {e:?}"))?;
+        Ok(Box::new(factor))
+    }
     fn solve_system(
         &self,
         weights: &Array1<f64>,
@@ -209,25 +291,7 @@ pub trait LinearOperator {
                 self.ncols()
             ));
         }
-        let mut system = self.diag_xt_w_x(weights)?;
-        if let Some(pen) = penalty {
-            if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
-                return Err(format!(
-                    "solve_system penalty shape mismatch: got {}x{}, expected {}x{}",
-                    pen.nrows(),
-                    pen.ncols(),
-                    system.nrows(),
-                    system.ncols()
-                ));
-            }
-            system += pen;
-        }
-        use crate::faer_ndarray::FaerCholesky;
-        use faer::Side;
-        system
-            .cholesky(Side::Lower)
-            .map(|chol| chol.solve_vec(rhs))
-            .map_err(|_| "solve_system failed to factorize system".to_string())
+        self.factorize_system(weights, penalty)?.solve(rhs)
     }
 
     // Backward-compatible aliases.
@@ -370,6 +434,30 @@ impl LinearOperator for DesignMatrix {
         Ok(xtwx)
     }
 
+    fn factorize_system(
+        &self,
+        weights: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+    ) -> Result<Box<dyn FactorizedSystem>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "factorize_system dimension mismatch: weights length {} != nrows {}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        match self {
+            Self::Dense(_) => self.factorize_system_dense(weights, penalty),
+            Self::Sparse(matrix) => {
+                let system =
+                    assemble_sparse_weighted_gram_system(matrix, weights, penalty)?;
+                let factor = crate::linalg::sparse_exact::factorize_sparse_spd(&system)
+                    .map_err(|e| format!("factorize_system failed: {e:?}"))?;
+                Ok(Box::new(factor))
+            }
+        }
+    }
+
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         if weights.len() != self.nrows() || y.len() != self.nrows() {
             return Err(format!(
@@ -438,6 +526,96 @@ impl LinearOperator for DesignMatrix {
         }
         Ok(out)
     }
+}
+
+impl DesignMatrix {
+    fn factorize_system_dense(
+        &self,
+        weights: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+    ) -> Result<Box<dyn FactorizedSystem>, String> {
+        let mut system = self.diag_xt_w_x(weights)?;
+        if let Some(pen) = penalty {
+            if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
+                return Err(format!(
+                    "factorize_system penalty shape mismatch: got {}x{}, expected {}x{}",
+                    pen.nrows(),
+                    pen.ncols(),
+                    system.nrows(),
+                    system.ncols()
+                ));
+            }
+            system += pen;
+        }
+        let factor = crate::linalg::utils::StableSolver::new("linear operator system")
+            .factorize(&system)
+            .map_err(|e| format!("factorize_system failed: {e:?}"))?;
+        Ok(Box::new(factor))
+    }
+}
+
+fn assemble_sparse_weighted_gram_system(
+    matrix: &SparseDesignMatrix,
+    weights: &Array1<f64>,
+    penalty: Option<&Array2<f64>>,
+) -> Result<SparseColMat<usize, f64>, String> {
+    let csr = matrix
+        .to_csr_arc()
+        .ok_or_else(|| "failed to obtain CSR view in factorize_system".to_string())?;
+    let sym = csr.symbolic();
+    let row_ptr = sym.row_ptr();
+    let col_idx = sym.col_idx();
+    let vals = csr.val();
+    let p = matrix.ncols();
+    let mut upper = BTreeMap::<(usize, usize), f64>::new();
+
+    for i in 0..csr.nrows() {
+        let wi = weights[i].max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        let start = row_ptr[i];
+        let end = row_ptr[i + 1];
+        for a_ptr in start..end {
+            let a = col_idx[a_ptr];
+            let xa = vals[a_ptr];
+            for b_ptr in a_ptr..end {
+                let b = col_idx[b_ptr];
+                let xb = vals[b_ptr];
+                let key = if a <= b { (a, b) } else { (b, a) };
+                *upper.entry(key).or_insert(0.0) += wi * xa * xb;
+            }
+        }
+    }
+
+    if let Some(pen) = penalty {
+        if pen.nrows() != p || pen.ncols() != p {
+            return Err(format!(
+                "factorize_system penalty shape mismatch: got {}x{}, expected {}x{}",
+                pen.nrows(),
+                pen.ncols(),
+                p,
+                p
+            ));
+        }
+        for i in 0..p {
+            for j in i..p {
+                let value = pen[[i, j]];
+                if value != 0.0 {
+                    *upper.entry((i, j)).or_insert(0.0) += value;
+                }
+            }
+        }
+    }
+
+    let mut triplets = Vec::with_capacity(upper.len());
+    for ((row, col), value) in upper {
+        if value != 0.0 {
+            triplets.push(Triplet::new(row, col, value));
+        }
+    }
+    Ok(SparseColMat::try_new_from_triplets(p, p, &triplets)
+        .map_err(|_| "failed to build sparse penalized system".to_string())?)
 }
 
 impl DesignMatrix {
@@ -516,6 +694,14 @@ impl DesignMatrix {
     ) -> Result<Array1<f64>, String> {
         <Self as LinearOperator>::solve_system(self, weights, rhs, penalty)
     }
+
+    pub fn factorize_system(
+        &self,
+        weights: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+    ) -> Result<Box<dyn FactorizedSystem>, String> {
+        <Self as LinearOperator>::factorize_system(self, weights, penalty)
+    }
 }
 
 impl<'a> From<ArrayView2<'a, f64>> for DesignMatrix {
@@ -557,8 +743,8 @@ impl From<&DesignMatrix> for DesignMatrix {
 #[cfg(test)]
 mod tests {
     use super::{DesignMatrix, dense_matvec, dense_transpose_matvec};
-    use faer::sparse::{SparseColMat, SymbolicSparseColMat};
-    use ndarray::array;
+    use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
+    use ndarray::{Array2, array};
 
     #[test]
     fn dense_matvec_matches_ndarray_dot() {
@@ -607,6 +793,40 @@ mod tests {
         let y_dense = dense.dot(&v);
         for i in 0..y_sparse.len() {
             assert!((y_sparse[i] - y_dense[i]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn sparse_factorized_solve_matches_dense_operator_solve() {
+        let triplets = vec![
+            Triplet::new(0usize, 0usize, 1.0),
+            Triplet::new(1, 0, 2.0),
+            Triplet::new(1, 1, -1.0),
+            Triplet::new(2, 1, 3.0),
+            Triplet::new(2, 2, 0.5),
+        ];
+        let sparse = SparseColMat::try_new_from_triplets(3, 3, &triplets)
+            .expect("sparse design should build");
+        let sparse_design = DesignMatrix::from(sparse);
+        let dense_design = DesignMatrix::Dense(sparse_design.to_dense());
+        let weights = array![1.5, 0.75, 2.0];
+        let rhs = array![1.0, -0.5, 2.0];
+        let penalty = Array2::from_diag(&array![0.25, 0.5, 0.75]);
+
+        let sparse_sol = sparse_design
+            .solve_system(&weights, &rhs, Some(&penalty))
+            .expect("sparse solve should factorize natively");
+        let dense_sol = dense_design
+            .solve_system(&weights, &rhs, Some(&penalty))
+            .expect("dense solve should factorize");
+
+        for i in 0..rhs.len() {
+            assert!(
+                (sparse_sol[i] - dense_sol[i]).abs() < 1e-10,
+                "solution mismatch at {i}: sparse={} dense={}",
+                sparse_sol[i],
+                dense_sol[i]
+            );
         }
     }
 }

@@ -81,9 +81,19 @@ impl crate::matrix::FactorizedSystem for FaerSymmetricFactor {
 
     fn logdet(&self) -> f64 {
         match self {
-            FaerSymmetricFactor::Llt(f) => 2.0 * f.L().diagonal().column_vector().as_mat().iter().map(|&x| x.ln()).sum::<f64>(),
-            FaerSymmetricFactor::Ldlt(f) => f.D().diagonal().column_vector().as_mat().iter().map(|&x| x.ln()).sum::<f64>(),
-            FaerSymmetricFactor::Lblt(f) => {
+            FaerSymmetricFactor::Llt(f) => {
+                2.0 * f
+                    .L()
+                    .diagonal()
+                    .column_vector()
+                    .iter()
+                    .map(|&x| x.ln())
+                    .sum::<f64>()
+            }
+            FaerSymmetricFactor::Ldlt(f) => {
+                f.D().column_vector().iter().map(|&x| x.ln()).sum::<f64>()
+            }
+            FaerSymmetricFactor::Lblt(_f) => {
                 // lblt doesn't easily expose diagonal determinant. Fallback to sparse or other representations if needed, but typically Lblt is indefinite!
                 // Actually faer doesn't easily expose lblt logdet since it has 2x2 blocks.
                 // For our ML systems, if we dropped to LBLT, the matrix was indefinite and logdet is ill-defined (or complex).
@@ -389,15 +399,7 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     x: &ArrayBase<S1, Ix2>,
     w: &ArrayBase<S2, Ix1>,
 ) -> Array2<f64> {
-    let (n, p) = x.dim();
-    debug_assert_eq!(n, w.len(), "X rows must match W length");
-    let mut w_x = Array2::<f64>::zeros((n, p));
-    for j in 0..p {
-        for i in 0..n {
-            w_x[[i, j]] = w[i] * x[[i, j]];
-        }
-    }
-    fast_atb(x, &w_x)
+    fast_xt_diag_y(x, w, x)
 }
 
 /// Compute A^T * diag(W) * B
@@ -410,12 +412,7 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     let (n, q) = y.dim();
     debug_assert_eq!(n, w.len(), "Y rows must match W length");
     debug_assert_eq!(n, x.nrows(), "X rows must match Y rows");
-    let mut w_y = Array2::<f64>::zeros((n, q));
-    for j in 0..q {
-        for i in 0..n {
-            w_y[[i, j]] = w[i] * y[[i, j]];
-        }
-    }
+    let w_y = Array2::from_shape_fn((n, q), |(i, j)| w[i] * y[[i, j]]);
     fast_atb(x, &w_y)
 }
 

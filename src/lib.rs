@@ -19,10 +19,14 @@ pub use families::custom_family;
 pub use families::gamlss;
 pub use families::survival;
 pub use families::survival_location_scale_probit;
+pub use families::strategy;
 
 pub use families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
     KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
+};
+pub use families::strategy::{
+    FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_from_fit,
 };
 pub use families::gamlss::{
     BinomialLocationScaleProbitFamily, BinomialLocationScaleProbitSpec,

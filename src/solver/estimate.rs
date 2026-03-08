@@ -1871,7 +1871,7 @@ where
     };
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, outer_result.iterations);
-    let (pirls_res, _) = pirls::fit_model_for_fixed_rho_matrix(
+    let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(final_rho.view()),
         pirls::PirlsProblem {
             x: &x_fit_o,

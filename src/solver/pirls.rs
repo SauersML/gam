@@ -6,9 +6,8 @@ use crate::faer_ndarray::{
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, sparse_symmetric_upper_matvec_public,
-    sparse_to_dense_symmetric_upper_public,
 };
-use crate::linalg::utils::StableSolver;
+use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::{DesignMatrix, LinearOperator};
 use crate::mixture_link::{
     InverseLinkJet as MixtureInverseLinkJet, inverse_link_jet_for_link_function,
@@ -690,6 +689,7 @@ pub struct WorkingState {
     pub eta: LinearPredictor,
     pub gradient: Array1<f64>,
     pub hessian: crate::linalg::matrix::SymmetricMatrix,
+    pub sparse_hessian: Option<faer::sparse::SparseColMat<usize, f64>>,
     pub deviance: f64,
     pub penalty_term: f64,
     pub firth: FirthDiagnostics,
@@ -1054,7 +1054,6 @@ struct GamWorkingModel<'a> {
 }
 
 struct GamModelFinalState {
-    x_transformed: Option<DesignMatrix>,
     x_active: DesignMatrix,
     coordinate_frame: PirlsCoordinateFrame,
     e_transformed: Array2<f64>,
@@ -1153,32 +1152,50 @@ impl<'a> GamWorkingModel<'a> {
     }
 
     fn into_final_state(self) -> GamModelFinalState {
-        let (x_transformed, coordinate_frame) = match &self.coordinate_design {
-            WorkingCoordinateDesign::OriginalSparseNative => {
-                (None, PirlsCoordinateFrame::OriginalSparseNative)
-            }
-            WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => (
-                Some(x_transformed.clone()),
-                PirlsCoordinateFrame::TransformedQs,
+        let GamWorkingModel {
+            x_original,
+            coordinate_design,
+            e_transformed,
+            last_mu,
+            last_weights,
+            last_z,
+            last_c,
+            last_d,
+            last_dmu_deta,
+            last_d2mu_deta2,
+            last_d3mu_deta3,
+            last_penalty_term,
+            ..
+        } = self;
+        let (x_active, coordinate_frame) = match coordinate_design {
+            WorkingCoordinateDesign::OriginalSparseNative => (
+                x_original,
+                PirlsCoordinateFrame::OriginalSparseNative,
             ),
-            WorkingCoordinateDesign::TransformedImplicit { .. } => {
-                (None, PirlsCoordinateFrame::TransformedQs)
+            WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
+                (x_transformed, PirlsCoordinateFrame::TransformedQs)
+            }
+            WorkingCoordinateDesign::TransformedImplicit { qs } => {
+                let x_transformed_dense = design_dot_dense_rhs(&x_original, &qs);
+                (
+                    maybe_sparse_design(&x_transformed_dense),
+                    PirlsCoordinateFrame::TransformedQs,
+                )
             }
         };
         GamModelFinalState {
-            x_transformed,
-            x_active: self.x_original,
+            x_active,
             coordinate_frame,
-            e_transformed: self.e_transformed,
-            final_mu: self.last_mu,
-            final_weights: self.last_weights,
-            final_z: self.last_z,
-            final_c: self.last_c,
-            final_d: self.last_d,
-            final_dmu_deta: self.last_dmu_deta,
-            final_d2mu_deta2: self.last_d2mu_deta2,
-            final_d3mu_deta3: self.last_d3mu_deta3,
-            penalty_term: self.last_penalty_term,
+            e_transformed,
+            final_mu: last_mu,
+            final_weights: last_weights,
+            final_z: last_z,
+            final_c: last_c,
+            final_d: last_d,
+            final_dmu_deta: last_dmu_deta,
+            final_d2mu_deta2: last_d2mu_deta2,
+            final_d3mu_deta3: last_d3mu_deta3,
+            penalty_term: last_penalty_term,
         }
     }
 
@@ -1501,7 +1518,11 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         Ok(WorkingState {
             eta: LinearPredictor::new(self.workspace.eta_buf.clone()),
             gradient,
-            hessian: penalized_hessian,
+            hessian: if let Some(h_sparse) = sparse_hessian.clone() {
+                crate::linalg::matrix::SymmetricMatrix::Sparse(h_sparse)
+            } else {
+                crate::linalg::matrix::SymmetricMatrix::Dense(penalized_hessian)
+            },
             sparse_hessian,
             deviance,
             penalty_term,
@@ -2297,8 +2318,15 @@ fn solve_newton_direction_with_lower_bounds(
     let mut d_free = Array1::<f64>::zeros(p);
     for _ in 0..(p + 4) {
         let free_idx: Vec<usize> = (0..p).filter(|&i| !active[i]).collect();
+        let active_idx: Vec<usize> = (0..p).filter(|&i| active[i]).collect();
+        direction_out.fill(0.0);
+        for &i in &active_idx {
+            let lb = lower_bounds[i];
+            if lb.is_finite() {
+                direction_out[i] = lb - beta[i];
+            }
+        }
         if free_idx.is_empty() {
-            direction_out.fill(0.0);
             if let Some(hint) = active_hint {
                 hint.clear();
                 hint.extend((0..p).filter(|&i| active[i]));
@@ -2311,12 +2339,14 @@ fn solve_newton_direction_with_lower_bounds(
         let mut g_f = Array1::<f64>::zeros(n_free);
         for (ii, &i) in free_idx.iter().enumerate() {
             g_f[ii] = gradient[i];
+            for &j in &active_idx {
+                g_f[ii] += hessian[[i, j]] * direction_out[j];
+            }
             for (jj, &j) in free_idx.iter().enumerate() {
                 h_ff[[ii, jj]] = hessian[[i, j]];
             }
         }
         solve_subsystem_direction(&h_ff, &g_f, &mut d_free)?;
-        direction_out.fill(0.0);
         for (ii, &i) in free_idx.iter().enumerate() {
             direction_out[i] = d_free[ii];
         }
@@ -2329,13 +2359,11 @@ fn solve_newton_direction_with_lower_bounds(
             if !lb.is_finite() {
                 continue;
             }
+            let slack = beta[i] - lb;
             let di = direction_out[i];
-            if di < 0.0 {
-                let alpha_i = (lb - beta[i]) / di;
-                if alpha_i.is_finite() && alpha_i >= 0.0 && alpha_i < best_alpha {
-                    best_alpha = alpha_i;
-                    hit_idx = Some(i);
-                }
+            if let Some(alpha_i) = boundary_hit_step_fraction(slack, di, best_alpha) {
+                best_alpha = alpha_i;
+                hit_idx = Some(i);
             }
         }
         if let Some(i_hit) = hit_idx {
@@ -2549,12 +2577,9 @@ fn solve_newton_direction_with_linear_constraints(
             let ai = constraints.a.row(i);
             let slack = ai.dot(&x) - constraints.b[i];
             let ai_d = ai.dot(&d);
-            if ai_d < -1e-14 {
-                let cand = (slack / (-ai_d)).max(0.0);
-                if cand < alpha {
-                    alpha = cand;
-                    entering = Some(i);
-                }
+            if let Some(cand) = boundary_hit_step_fraction(slack, ai_d, alpha) {
+                alpha = cand;
+                entering = Some(i);
             }
         }
 
@@ -2875,9 +2900,11 @@ where
             // 1. Solve (H + λI)δ = -g
             // We clone the Hessian effectively implementing H_damped = H + λI
             let mut regularized = state.hessian.clone();
-            let dim = regularized.nrows();
-            for i in 0..dim {
-                regularized[[i, i]] += loop_lambda;
+            if let crate::linalg::matrix::SymmetricMatrix::Dense(ref mut dense) = regularized {
+                let dim = dense.nrows();
+                for i in 0..dim {
+                    dense[[i, i]] += loop_lambda;
+                }
             }
 
             let has_constraints =
@@ -2896,7 +2923,7 @@ where
                 }
             } else if let Some(lin) = options.linear_constraints.as_ref() {
                 solve_newton_direction_with_linear_constraints(
-                    &regularized,
+                    regularized.as_dense().expect("dense regularized Hessian"),
                     &state.gradient,
                     beta.as_ref(),
                     lin,
@@ -2905,7 +2932,7 @@ where
                 )
             } else if let Some(lb) = options.coefficient_lower_bounds.as_ref() {
                 solve_newton_direction_with_lower_bounds(
-                    &regularized,
+                    regularized.as_dense().expect("dense regularized Hessian"),
                     &state.gradient,
                     beta.as_ref(),
                     lb,
@@ -2913,7 +2940,11 @@ where
                     bound_active_hint.as_mut(),
                 )
             } else {
-                solve_newton_direction_dense(&regularized, &state.gradient, &mut newton_direction)
+                solve_newton_direction_dense(
+                    regularized.as_dense().expect("dense regularized Hessian"),
+                    &state.gradient,
+                    &mut newton_direction,
+                )
             } {
                 Ok(()) => &newton_direction,
                 Err(e) => {
@@ -3506,13 +3537,20 @@ pub struct PenaltyConfig<'a> {
 ///
 /// This architecture ensures optimal numerical stability throughout the entire
 /// fitting process by working in a well-conditioned parameter space.
-pub fn fit_model_for_fixed_rho<'a>(
+pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     rho: LogSmoothingParamsView<'_>,
-    problem: PirlsProblem<'a, DesignMatrix>,
+    problem: PirlsProblem<'a, X>,
     penalty: PenaltyConfig<'_>,
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
+    let PirlsProblem {
+        x,
+        offset,
+        y,
+        prior_weights,
+        covariate_se,
+    } = problem;
     let quad_ctx = crate::quadrature::QuadratureContext::new();
     let lambdas = rho.exp();
     let lambdas_slice = lambdas.as_slice_memory_order().ok_or_else(|| {
@@ -3551,19 +3589,24 @@ pub fn fit_model_for_fixed_rho<'a>(
             EngineDims::new(penalty.p, penalty.rs_original.len()),
         )?
     };
-    let transformed_bounds =
-        build_transformed_lower_bound_constraints(&reparam_result.qs, penalty.coefficient_lower_bounds);
-    let transformed_linear =
-        build_transformed_linear_constraints(&reparam_result.qs, penalty.linear_constraints_original);
+    let transformed_bounds = build_transformed_lower_bound_constraints(
+        &reparam_result.qs,
+        penalty.coefficient_lower_bounds,
+    );
+    let transformed_linear = build_transformed_linear_constraints(
+        &reparam_result.qs,
+        penalty.linear_constraints_original,
+    );
     let linear_constraints = merge_linear_constraints(transformed_bounds, transformed_linear);
 
+    let x_original: DesignMatrix = x.into();
     let eb_rows = eb.nrows();
     let e_rows = reparam_result.e_transformed.nrows();
-    let mut workspace = PirlsWorkspace::new(problem.x.nrows(), problem.x.ncols(), eb_rows, e_rows);
-
+    let mut workspace =
+        PirlsWorkspace::new(x_original.nrows(), x_original.ncols(), eb_rows, e_rows);
     let solver_decision = should_use_sparse_native_pirls(
         &mut workspace,
-        &problem.x,
+        &x_original,
         &reparam_result.s_transformed,
         config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
         penalty.linear_constraints_original,
@@ -3573,34 +3616,45 @@ pub fn fit_model_for_fixed_rho<'a>(
 
     let use_sparse_native = matches!(solver_decision.path, PirlsLinearSolvePath::SparseNative);
 
-    let (x_active, coordinate_frame, reparam_result_active, x_transformed_dense) = if use_sparse_native {
-        let sparse_reparam = build_sparse_native_reparam_result(
-            reparam_result.clone(),
-            penalty.rs_original,
-            lambdas_slice,
-            penalty.p,
-        );
-        (problem.x.clone(), PirlsCoordinateFrame::OriginalSparseNative, sparse_reparam, None)
-    } else {
-        let dense_x = problem.x.to_dense_arc();
-        let x_transformed = dense_x.dot(&reparam_result.qs);
-        (maybe_sparse_design(&x_transformed), PirlsCoordinateFrame::TransformedQs, reparam_result.clone(), Some(x_transformed))
+    let (x_active, coordinate_frame, reparam_result_active, x_transformed_dense) =
+        if use_sparse_native {
+            let sparse_reparam = build_sparse_native_reparam_result(
+                reparam_result.clone(),
+                penalty.rs_original,
+                lambdas_slice,
+                penalty.p,
+            );
+            (
+                x_original.clone(),
+                PirlsCoordinateFrame::OriginalSparseNative,
+                sparse_reparam,
+                None,
+            )
+        } else {
+            let dense_x = x_original.to_dense_arc();
+            let x_transformed = dense_x.dot(&reparam_result.qs);
+            (
+                maybe_sparse_design(&x_transformed),
+                PirlsCoordinateFrame::TransformedQs,
+                reparam_result.clone(),
+            Some(x_transformed),
+        )
     };
 
     if matches!(link_function, LinkFunction::Identity) {
         let x_transformed_dense = x_transformed_dense
             .as_ref()
             .expect("explicit transform required for identity link");
-        let x_transformed = x_transformed.expect("explicit transform required for identity link");
+        let x_transformed_design = maybe_sparse_design(x_transformed_dense);
         let (pls_result, _) = solve_penalized_least_squares(
             x_transformed_dense.view(),
-            problem.y,
-            problem.prior_weights,
-            problem.offset,
+            y,
+            prior_weights,
+            offset,
             &reparam_result.e_transformed,
             &reparam_result.s_transformed,
             &mut workspace,
-            problem.y,
+            y,
             link_function,
         )?;
 
@@ -3609,12 +3663,12 @@ pub fn fit_model_for_fixed_rho<'a>(
         let edf = pls_result.edf;
         let base_ridge = pls_result.ridge_used;
 
-        let prior_weights_owned = problem.prior_weights.to_owned();
-        let mut eta = problem.offset.to_owned();
+        let prior_weights_owned = prior_weights.to_owned();
+        let mut eta = offset.to_owned();
         eta += &x_transformed_dense.dot(beta_transformed.as_ref());
         let final_eta = eta.clone();
         let final_mu = eta.clone();
-        let final_z = problem.y.to_owned();
+        let final_z = y.to_owned();
 
         let mut weighted_residual = final_mu.clone();
         weighted_residual -= &final_z;
@@ -3624,7 +3678,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
-        let deviance = calculate_deviance(problem.y, &final_mu, link_function, problem.prior_weights);
+        let deviance = calculate_deviance(y, &final_mu, link_function, prior_weights);
         let mut stabilized_hessian = penalized_hessian.clone();
         let ridge_used = base_ridge;
         if ridge_used > 0.0 {
@@ -3645,7 +3699,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         let working_state = WorkingState {
             eta: LinearPredictor::new(final_mu.clone()),
             gradient: gradient.clone(),
-            hessian: penalized_hessian.clone(),
+            hessian: crate::linalg::matrix::SymmetricMatrix::Dense(penalized_hessian.clone()),
             sparse_hessian: None,
             deviance,
             penalty_term,
@@ -3688,7 +3742,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             stable_penalty_term: penalty_term,
             firth: FirthDiagnostics::Inactive,
             final_weights: prior_weights_owned.clone(),
-            final_offset: problem.offset.to_owned(),
+            final_offset: offset.to_owned(),
             final_eta: final_eta.clone(),
             final_mu: final_mu.clone(),
             solve_weights: prior_weights_owned,
@@ -3708,8 +3762,8 @@ pub fn fit_model_for_fixed_rho<'a>(
             constraint_kkt: working_summary.constraint_kkt.clone(),
             linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
-            x_active: x_transformed.clone(),
-            x_transformed,
+            x_active: x_transformed_design.clone(),
+            x_transformed: x_transformed_design,
             coordinate_frame: PirlsCoordinateFrame::TransformedQs,
         };
 
@@ -3718,14 +3772,18 @@ pub fn fit_model_for_fixed_rho<'a>(
 
     let x_original_for_result = x_original.clone();
     let mut working_model = GamWorkingModel::new(
-        x_transformed,
-        x_original,
-        PirlsCoordinateFrame::TransformedQs,
-        problem.offset,
-        problem.y,
-        problem.prior_weights,
-        reparam_result.s_transformed.clone(),
-        reparam_result.e_transformed.clone(),
+        if use_sparse_native {
+            None
+        } else {
+            Some(x_active.clone())
+        },
+        x_original.clone(),
+        coordinate_frame.clone(),
+        offset,
+        y,
+        prior_weights,
+        reparam_result_active.s_transformed.clone(),
+        reparam_result_active.e_transformed.clone(),
         workspace,
         config.link_kind.clone(),
         config.firth_bias_reduction
@@ -3733,17 +3791,13 @@ pub fn fit_model_for_fixed_rho<'a>(
                 &config.link_kind,
                 InverseLink::Standard(LinkFunction::Logit)
             ),
-        if use_explicit {
-            None
-        } else {
-            Some(reparam_result.qs.clone())
-        },
+        None, // We either use explicit dense transform or sparse native without qs
         quad_ctx,
     );
 
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.
     // This is used by the calibrator to coherently account for base prediction uncertainty.
-    if let Some(se) = problem.covariate_se {
+    if let Some(se) = covariate_se {
         working_model = working_model.with_covariate_se(se.to_owned());
     }
 
@@ -3754,8 +3808,8 @@ pub fn fit_model_for_fixed_rho<'a>(
             Coefficients::new(default_beta_guess_external(
                 penalty.p,
                 link_function,
-                problem.y,
-                problem.prior_weights,
+                y,
+                prior_weights,
                 config.link_kind.mixture_state(),
                 config.link_kind.sas_state(),
             ))
@@ -3800,7 +3854,6 @@ pub fn fit_model_for_fixed_rho<'a>(
 
     let final_state = working_model.into_final_state();
     let GamModelFinalState {
-        x_transformed,
         x_active,
         coordinate_frame,
         e_transformed,
@@ -3816,7 +3869,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         ..
     } = final_state;
 
-    let penalized_hessian_transformed = working_summary.state.hessian.clone();
+    let penalized_hessian_transformed = working_summary.state.hessian.to_dense();
     // P-IRLS already folded any stabilization ridge directly into the Hessian.
     // Keep that exact matrix so outer LAML derivatives stay consistent:
     // H_eff = X'WX + S_λ + ridge I (if ridge_used > 0).
@@ -3878,16 +3931,17 @@ pub fn fit_model_for_fixed_rho<'a>(
         working_summary.status = status.clone();
     }
 
-    let x_transformed = if let Some(x_transformed) = x_transformed {
-        x_transformed
+    let x_transformed_final = if let Some(xt) = x_transformed_dense {
+        maybe_sparse_design(&xt)
     } else {
-        let x_transformed_dense = design_dot_dense_rhs(&x_original_for_result, &reparam_result.qs);
-        maybe_sparse_design(&x_transformed_dense)
+        let x_transformed_dense_res =
+            design_dot_dense_rhs(&x_original_for_result, &reparam_result.qs);
+        maybe_sparse_design(&x_transformed_dense_res)
     };
 
     let pirls_result = assemble_pirls_result(
         &working_summary,
-        offset.view(),
+        offset,
         penalized_hessian_transformed,
         stabilized_hessian_transformed,
         edf,
@@ -3901,8 +3955,8 @@ pub fn fit_model_for_fixed_rho<'a>(
         &final_d2mu_deta2,
         &final_d3mu_deta3,
         status,
-        reparam_result,
-        x_transformed.clone(),
+        reparam_result_active,
+        x_transformed_final,
         x_active,
         coordinate_frame,
         linear_constraints,
@@ -3910,8 +3964,6 @@ pub fn fit_model_for_fixed_rho<'a>(
 
     Ok((pirls_result, working_summary))
 }
-
-
 
 #[derive(Clone)]
 pub struct RunPirlsOptions {
@@ -4024,7 +4076,7 @@ pub fn run_pirls<'a>(
             offset,
             y,
             prior_weights,
-            covariate_se,
+            covariate_se: covariate_se.map(|se| se.view()),
         },
         PenaltyConfig {
             rs_original,
@@ -5319,11 +5371,12 @@ pub fn compute_final_penalized_hessian(
 #[cfg(test)]
 mod tests {
     use super::{
-        InverseLinkJet, LinearInequalityConstraints, PirlsConfig, PirlsLinearSolvePath,
-        PirlsWorkspace, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_scale,
-        compute_constraint_kkt_diagnostics, default_beta_guess_external, fit_model_for_fixed_rho,
-        logit_clamp_zero_enabled, should_use_sparse_native_pirls,
-        solve_newton_direction_with_linear_constraints, update_glm_vectors_integrated_for_link,
+        InverseLinkJet, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
+        PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, WorkingDerivativeBuffersMut,
+        bernoulli_geometry_from_jet, calculate_scale, compute_constraint_kkt_diagnostics,
+        default_beta_guess_external, fit_model_for_fixed_rho, logit_clamp_zero_enabled,
+        should_use_sparse_native_pirls, solve_newton_direction_with_linear_constraints,
+        solve_newton_direction_with_lower_bounds, update_glm_vectors_integrated_for_link,
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
@@ -5456,6 +5509,39 @@ mod tests {
             (direction[0] - 0.1).abs() <= 1e-10,
             "expected step to upper bound (0.1), got {}",
             direction[0]
+        );
+    }
+
+    #[test]
+    fn linear_constraint_active_set_ignores_near_tangential_inactive_rows() {
+        let hessian = array![[1.0, 0.0], [0.0, 1.0]];
+        let gradient = array![-1.0, 0.0];
+        let beta = array![0.0, 0.0];
+        let constraints = LinearInequalityConstraints {
+            a: array![[-1e-16, 1.0]],
+            b: array![-1.0],
+        };
+        let mut direction = Array1::zeros(2);
+
+        solve_newton_direction_with_linear_constraints(
+            &hessian,
+            &gradient,
+            &beta,
+            &constraints,
+            &mut direction,
+            None,
+        )
+        .expect("near-tangential inactive row should not block the Newton step");
+
+        assert!(
+            (direction[0] - 1.0).abs() <= 1e-12,
+            "expected unconstrained x-step of 1.0, got {}",
+            direction[0]
+        );
+        assert!(
+            direction[1].abs() <= 1e-12,
+            "expected zero y-step, got {}",
+            direction[1]
         );
     }
 
@@ -5651,19 +5737,23 @@ mod tests {
 
         let (fit, _) = fit_model_for_fixed_rho(
             LogSmoothingParamsView::new(rho.view()),
-            x.view(),
-            offset.view(),
-            y.view(),
-            w.view(),
-            &rs,
-            None,
-            None,
-            1,
+            PirlsProblem {
+                x: x.view(),
+                offset: offset.view(),
+                y: y.view(),
+                prior_weights: w.view(),
+                covariate_se: Some(covariate_se.view()),
+            },
+            PenaltyConfig {
+                rs_original: &rs,
+                balanced_penalty_root: None,
+                reparam_invariant: None,
+                p: 1,
+                coefficient_lower_bounds: None,
+                linear_constraints_original: None,
+            },
             &config,
             Some(&Coefficients::new(array![0.0])),
-            None,
-            None,
-            Some(&covariate_se),
         )
         .expect("integrated logit PIRLS fit");
 
@@ -5721,5 +5811,56 @@ mod tests {
                 max_relative = 1e-7
             );
         }
+    }
+
+    #[test]
+    fn linear_constraint_active_set_projects_warm_active_rows_back_to_boundary() {
+        let hessian = array![[2.0]];
+        let gradient = array![0.0];
+        let beta = array![1e-9];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![0.0],
+        };
+        let mut direction = Array1::zeros(1);
+        let mut active_hint = vec![0];
+
+        solve_newton_direction_with_linear_constraints(
+            &hessian,
+            &gradient,
+            &beta,
+            &constraints,
+            &mut direction,
+            Some(&mut active_hint),
+        )
+        .expect("active-set solve should succeed");
+
+        assert_relative_eq!(direction[0], -1e-9, epsilon = 1e-14);
+        let projected = &beta + &direction;
+        assert_relative_eq!(projected[0], 0.0, epsilon = 1e-14);
+    }
+
+    #[test]
+    fn lower_bound_active_set_projects_warm_active_bounds_back_to_boundary() {
+        let hessian = array![[2.0]];
+        let gradient = array![0.0];
+        let beta = array![1e-9];
+        let lower_bounds = array![0.0];
+        let mut direction = Array1::zeros(1);
+        let mut active_hint = vec![0];
+
+        solve_newton_direction_with_lower_bounds(
+            &hessian,
+            &gradient,
+            &beta,
+            &lower_bounds,
+            &mut direction,
+            Some(&mut active_hint),
+        )
+        .expect("lower-bound active-set solve should succeed");
+
+        assert_relative_eq!(direction[0], -1e-9, epsilon = 1e-14);
+        let projected = &beta + &direction;
+        assert_relative_eq!(projected[0], 0.0, epsilon = 1e-14);
     }
 }

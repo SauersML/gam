@@ -1,6 +1,6 @@
 use crate::faer_ndarray::FaerCholesky;
 use crate::faer_ndarray::{FaerArrayView, FaerEigh};
-use crate::linalg::utils::StableSolver;
+use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::DesignMatrix;
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::opt_objective::CachedSecondOrderObjective;
@@ -1038,12 +1038,9 @@ fn solve_quadratic_with_linear_constraints(
             }
             let ai = constraints.a.row(i);
             let ai_d = ai.dot(&direction);
-            if ai_d < -1e-14 {
-                let cand = (slack[i] / (-ai_d)).max(0.0);
-                if cand < alpha {
-                    alpha = cand;
-                    entering = Some(i);
-                }
+            if let Some(cand) = boundary_hit_step_fraction(slack[i], ai_d, alpha) {
+                alpha = cand;
+                entering = Some(i);
             }
         }
 
@@ -3325,6 +3322,7 @@ mod tests {
         BinomialLocationScaleProbitFamily, BinomialLocationScaleProbitWiggleFamily,
     };
     use crate::matrix::DesignMatrix;
+    use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
 
@@ -4347,6 +4345,61 @@ mod tests {
             beta[0]
         );
         assert_eq!(active.len(), 1);
+    }
+
+    #[test]
+    fn quadratic_linear_constraints_ignore_near_tangential_inactive_rows() {
+        let hessian = array![[1.0, 0.0], [0.0, 1.0]];
+        let rhs = array![1.0, 0.0];
+        let beta_start = array![0.0, 0.0];
+        let constraints = LinearInequalityConstraints {
+            a: array![[-1e-16, 1.0]],
+            b: array![-1.0],
+        };
+
+        let (beta, active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("near-tangential inactive row should not block the quadratic step");
+
+        assert!(
+            (beta[0] - 1.0).abs() <= 1e-12,
+            "expected unconstrained x-solution of 1.0, got {}",
+            beta[0]
+        );
+        assert!(
+            beta[1].abs() <= 1e-12,
+            "expected zero y-solution, got {}",
+            beta[1]
+        );
+        assert!(active.is_empty(), "no row should become active");
+    }
+
+    #[test]
+    fn quadratic_linear_constraints_project_warm_active_rows_back_to_boundary() {
+        let hessian = array![[2.0]];
+        let rhs = array![0.0];
+        let beta_start = array![1e-9];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![0.0],
+        };
+
+        let (beta, active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            Some(&[0]),
+        )
+        .expect("constrained quadratic solve should project back to the boundary");
+
+        assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
+        assert_eq!(active, vec![0]);
     }
 
     #[test]

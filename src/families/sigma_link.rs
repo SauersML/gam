@@ -4,13 +4,32 @@ use std::fs;
 #[cfg(test)]
 use std::path::Path;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SigmaJet1 {
+    pub sigma: f64,
+    pub d1: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SigmaJet3 {
+    pub sigma: f64,
+    pub d1: f64,
+    pub d2: f64,
+    pub d3: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SigmaJet4 {
+    pub sigma: f64,
+    pub d1: f64,
+    pub d2: f64,
+    pub d3: f64,
+    pub d4: f64,
+}
+
 #[inline]
 fn canonical_zero(v: f64) -> f64 {
-    if v.abs() < 1e-15 {
-        0.0
-    } else {
-        v
-    }
+    if v.abs() < 1e-15 { 0.0 } else { v }
 }
 
 #[inline]
@@ -42,21 +61,28 @@ fn validated_bounded_sigma_span(sigma_min: f64, sigma_max: f64) -> f64 {
 }
 
 #[inline]
+pub fn bounded_sigma_jet1_scalar(eta: f64, sigma_min: f64, sigma_max: f64) -> SigmaJet1 {
+    let span = validated_bounded_sigma_span(sigma_min, sigma_max);
+    let p = logistic_stable(eta);
+    SigmaJet1 {
+        sigma: sigma_min + span * p,
+        d1: span * p * (1.0 - p),
+    }
+}
+
+#[inline]
 pub fn bounded_sigma_and_deriv_from_eta_scalar(
     eta: f64,
     sigma_min: f64,
     sigma_max: f64,
 ) -> (f64, f64) {
-    let span = validated_bounded_sigma_span(sigma_min, sigma_max);
-    let p = logistic_stable(eta);
-    let sigma = sigma_min + span * p;
-    let dsigma_deta = span * p * (1.0 - p);
-    (sigma, dsigma_deta)
+    let jet = bounded_sigma_jet1_scalar(eta, sigma_min, sigma_max);
+    (jet.sigma, jet.d1)
 }
 
 #[inline]
 pub fn bounded_sigma_from_eta_scalar(eta: f64, sigma_min: f64, sigma_max: f64) -> f64 {
-    bounded_sigma_and_deriv_from_eta_scalar(eta, sigma_min, sigma_max).0
+    bounded_sigma_jet1_scalar(eta, sigma_min, sigma_max).sigma
 }
 
 #[inline]
@@ -74,11 +100,26 @@ pub fn bounded_sigma_and_deriv_from_eta(
     let mut sigma = Array1::<f64>::zeros(eta.len());
     let mut dsigma = Array1::<f64>::zeros(eta.len());
     for i in 0..eta.len() {
-        let (s, ds) = bounded_sigma_and_deriv_from_eta_scalar(eta[i], sigma_min, sigma_max);
-        sigma[i] = s;
-        dsigma[i] = ds;
+        let jet = bounded_sigma_jet1_scalar(eta[i], sigma_min, sigma_max);
+        sigma[i] = jet.sigma;
+        dsigma[i] = jet.d1;
     }
     (sigma, dsigma)
+}
+
+#[inline]
+pub fn bounded_sigma_jet3_scalar(eta: f64, sigma_min: f64, sigma_max: f64) -> SigmaJet3 {
+    let span = validated_bounded_sigma_span(sigma_min, sigma_max);
+    let p = logistic_stable(eta);
+    let a = p * (1.0 - p);
+    let odd = 1.0 - 2.0 * p;
+    let d1 = span * a;
+    SigmaJet3 {
+        sigma: sigma_min + span * p,
+        d1: canonical_zero(d1),
+        d2: canonical_zero(span * a * odd),
+        d3: canonical_zero(span * (a * odd * odd - 2.0 * a * a)),
+    }
 }
 
 #[inline]
@@ -87,19 +128,8 @@ pub fn bounded_sigma_derivs_up_to_third_scalar(
     sigma_min: f64,
     sigma_max: f64,
 ) -> (f64, f64, f64, f64) {
-    let span = validated_bounded_sigma_span(sigma_min, sigma_max);
-    let p = logistic_stable(eta);
-    let a = p * (1.0 - p);
-    let sigma = sigma_min + span * p;
-    let d1 = span * a;
-    let d2 = span * a * (1.0 - 2.0 * p);
-    let d3 = span * (a * (1.0 - 2.0 * p) * (1.0 - 2.0 * p) - 2.0 * a * a);
-    (
-        sigma,
-        canonical_zero(d1),
-        canonical_zero(d2),
-        canonical_zero(d3),
-    )
+    let jet = bounded_sigma_jet3_scalar(eta, sigma_min, sigma_max);
+    (jet.sigma, jet.d1, jet.d2, jet.d3)
 }
 
 pub fn bounded_sigma_derivs_up_to_third(
@@ -112,14 +142,29 @@ pub fn bounded_sigma_derivs_up_to_third(
     let mut d2 = Array1::<f64>::zeros(eta.len());
     let mut d3 = Array1::<f64>::zeros(eta.len());
     for i in 0..eta.len() {
-        let (s, ds, d2s, d3s) =
-            bounded_sigma_derivs_up_to_third_scalar(eta[i], sigma_min, sigma_max);
-        sigma[i] = s;
-        d1[i] = ds;
-        d2[i] = d2s;
-        d3[i] = d3s;
+        let jet = bounded_sigma_jet3_scalar(eta[i], sigma_min, sigma_max);
+        sigma[i] = jet.sigma;
+        d1[i] = jet.d1;
+        d2[i] = jet.d2;
+        d3[i] = jet.d3;
     }
     (sigma, d1, d2, d3)
+}
+
+#[inline]
+pub fn bounded_sigma_jet4_scalar(eta: f64, sigma_min: f64, sigma_max: f64) -> SigmaJet4 {
+    let span = validated_bounded_sigma_span(sigma_min, sigma_max);
+    let p = logistic_stable(eta);
+    let a = p * (1.0 - p);
+    let odd = 1.0 - 2.0 * p;
+    let d1 = span * a;
+    SigmaJet4 {
+        sigma: sigma_min + span * p,
+        d1: canonical_zero(d1),
+        d2: canonical_zero(span * a * odd),
+        d3: canonical_zero(span * (a * odd * odd - 2.0 * a * a)),
+        d4: canonical_zero(span * a * odd * (1.0 - 12.0 * a)),
+    }
 }
 
 #[inline]
@@ -128,21 +173,8 @@ pub fn bounded_sigma_derivs_up_to_fourth_scalar(
     sigma_min: f64,
     sigma_max: f64,
 ) -> (f64, f64, f64, f64, f64) {
-    let span = validated_bounded_sigma_span(sigma_min, sigma_max);
-    let p = logistic_stable(eta);
-    let a = p * (1.0 - p);
-    let sigma = sigma_min + span * p;
-    let d1 = span * a;
-    let d2 = span * a * (1.0 - 2.0 * p);
-    let d3 = span * (a * (1.0 - 2.0 * p) * (1.0 - 2.0 * p) - 2.0 * a * a);
-    let d4 = span * a * (1.0 - 2.0 * p) * (1.0 - 12.0 * a);
-    (
-        sigma,
-        canonical_zero(d1),
-        canonical_zero(d2),
-        canonical_zero(d3),
-        canonical_zero(d4),
-    )
+    let jet = bounded_sigma_jet4_scalar(eta, sigma_min, sigma_max);
+    (jet.sigma, jet.d1, jet.d2, jet.d3, jet.d4)
 }
 
 pub fn bounded_sigma_derivs_up_to_fourth(
@@ -162,13 +194,12 @@ pub fn bounded_sigma_derivs_up_to_fourth(
     let mut d3 = Array1::<f64>::zeros(eta.len());
     let mut d4 = Array1::<f64>::zeros(eta.len());
     for i in 0..eta.len() {
-        let (s, ds, d2s, d3s, d4s) =
-            bounded_sigma_derivs_up_to_fourth_scalar(eta[i], sigma_min, sigma_max);
-        sigma[i] = s;
-        d1[i] = ds;
-        d2[i] = d2s;
-        d3[i] = d3s;
-        d4[i] = d4s;
+        let jet = bounded_sigma_jet4_scalar(eta[i], sigma_min, sigma_max);
+        sigma[i] = jet.sigma;
+        d1[i] = jet.d1;
+        d2[i] = jet.d2;
+        d3[i] = jet.d3;
+        d4[i] = jet.d4;
     }
     (sigma, d1, d2, d3, d4)
 }

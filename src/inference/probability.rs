@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::mixture_link::inverse_link_jet_for_family;
+use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::types::{InverseLink, LikelihoodFamily};
 use ndarray::{Array1, ArrayView1};
 use statrs::function::erf::erfc;
@@ -87,16 +87,7 @@ pub fn try_inverse_link_array(
     eta: ArrayView1<'_, f64>,
     link_kind: Option<&InverseLink>,
 ) -> Result<Array1<f64>, EstimationError> {
-    if matches!(family, LikelihoodFamily::RoystonParmar) {
-        return Ok(eta.to_owned());
-    }
-    let mixture_state = link_kind.and_then(|k| k.mixture_state());
-    let sas_state = link_kind.and_then(|k| k.sas_state());
-    let mut out = Array1::<f64>::zeros(eta.len());
-    for i in 0..eta.len() {
-        out[i] = inverse_link_jet_for_family(family, eta[i], mixture_state, sas_state)?.mu;
-    }
-    Ok(out)
+    strategy_for_family(family, link_kind).inverse_link_array(eta)
 }
 
 #[cfg(test)]

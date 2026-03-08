@@ -1,7 +1,7 @@
 use super::*;
 
 impl<'a> RemlState<'a> {
-    pub(super) fn xt_diag_x_dense_into(
+    pub(crate) fn xt_diag_x_dense_into(
         x: &Array2<f64>,
         diag: &Array1<f64>,
         weighted: &mut Array2<f64>,
@@ -13,7 +13,7 @@ impl<'a> RemlState<'a> {
         fast_atb(x, weighted)
     }
 
-    pub(super) fn row_scale(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
+    pub(crate) fn row_scale(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
         let mut out = x.clone();
         ndarray::Zip::from(out.rows_mut())
             .and(scale.view())
@@ -21,7 +21,7 @@ impl<'a> RemlState<'a> {
         out
     }
 
-    pub(super) fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         debug_assert_eq!(a.nrows(), b.ncols());
         debug_assert_eq!(a.ncols(), b.nrows());
         let elems = a.nrows().saturating_mul(a.ncols());
@@ -41,7 +41,7 @@ impl<'a> RemlState<'a> {
         }))
     }
 
-    pub(super) fn trace_hdag_operator_apply<S, A>(
+    pub(crate) fn trace_hdag_operator_apply<S, A>(
         p_dim: usize,
         h_pos_w: Option<&Array2<f64>>,
         h_pos_w_t: Option<&Array2<f64>>,
@@ -75,7 +75,7 @@ impl<'a> RemlState<'a> {
         acc
     }
 
-    pub(super) fn bilinear_form(
+    pub(crate) fn bilinear_form(
         mat: &Array2<f64>,
         left: ndarray::ArrayView1<'_, f64>,
         right: ndarray::ArrayView1<'_, f64>,
@@ -95,7 +95,7 @@ impl<'a> RemlState<'a> {
         acc.sum()
     }
 
-    pub(super) fn reduced_weighted_gram(z: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
+    pub(crate) fn reduced_weighted_gram(z: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
         // Returns Zᵀ diag(weights) Z (exact).
         //
         // Used for:
@@ -106,7 +106,7 @@ impl<'a> RemlState<'a> {
         fast_atb(z, &weighted)
     }
 
-    pub(super) fn reduced_cross_weighted_gram(
+    pub(crate) fn reduced_cross_weighted_gram(
         z_left: &Array2<f64>,
         z_right: &Array2<f64>,
         weights: &Array1<f64>,
@@ -119,7 +119,7 @@ impl<'a> RemlState<'a> {
         fast_atb(z_left, &weighted)
     }
 
-    pub(super) fn reduced_diag_gram(z: &Array2<f64>, a: &Array2<f64>) -> Array1<f64> {
+    pub(crate) fn reduced_diag_gram(z: &Array2<f64>, a: &Array2<f64>) -> Array1<f64> {
         // Returns diag(Z A Zᵀ), exact without forming dense n×n matrix.
         //
         // Identity:
@@ -129,7 +129,7 @@ impl<'a> RemlState<'a> {
         (z * &za).sum_axis(ndarray::Axis(1))
     }
 
-    pub(super) fn apply_hadamard_gram(
+    pub(crate) fn apply_hadamard_gram(
         z: &Array2<f64>,
         a_left: &Array2<f64>,
         a_right: &Array2<f64>,
@@ -149,7 +149,7 @@ impl<'a> RemlState<'a> {
         Self::reduced_diag_gram(z, &t)
     }
 
-    pub(super) fn apply_hadamard_gram_to_matrix(
+    pub(crate) fn apply_hadamard_gram_to_matrix(
         z: &Array2<f64>,
         a_left: &Array2<f64>,
         a_right: &Array2<f64>,
@@ -171,6 +171,83 @@ impl<'a> RemlState<'a> {
         out
     }
 
+    pub(super) fn build_firth_dense_operator(
+        x_dense: &Array2<f64>,
+        eta: &Array1<f64>,
+    ) -> Result<FirthDenseOperator, EstimationError> {
+        FirthDenseOperator::build(x_dense, eta)
+    }
+
+    pub(super) fn firth_direction(op: &FirthDenseOperator, u: &Array1<f64>) -> FirthDirection {
+        op.direction(u)
+    }
+
+    pub(super) fn firth_direction_from_deta(
+        op: &FirthDenseOperator,
+        deta: Array1<f64>,
+    ) -> FirthDirection {
+        op.direction_from_deta(deta)
+    }
+
+    pub(super) fn firth_hphi_direction(
+        op: &FirthDenseOperator,
+        dir: &FirthDirection,
+    ) -> Array2<f64> {
+        op.hphi_direction(dir)
+    }
+
+    pub(super) fn firth_hphi_direction_apply(
+        op: &FirthDenseOperator,
+        dir: &FirthDirection,
+        rhs: &Array2<f64>,
+    ) -> Array2<f64> {
+        op.hphi_direction_apply(dir, rhs)
+    }
+
+    pub(super) fn firth_hphi_second_direction_apply(
+        op: &FirthDenseOperator,
+        u: &FirthDirection,
+        v: &FirthDirection,
+        rhs: &Array2<f64>,
+    ) -> Array2<f64> {
+        op.hphi_second_direction_apply(u, v, rhs)
+    }
+
+    pub(super) fn firth_exact_tau_kernel(
+        op: &FirthDenseOperator,
+        x_tau: &Array2<f64>,
+        beta: &Array1<f64>,
+        include_hphi_tau_kernel: bool,
+    ) -> FirthTauExactKernel {
+        op.exact_tau_kernel(x_tau, beta, include_hphi_tau_kernel)
+    }
+
+    pub(super) fn firth_hphi_tau_partial_prepare(
+        op: &FirthDenseOperator,
+        x_tau: &Array2<f64>,
+        beta: &Array1<f64>,
+    ) -> FirthTauPartialKernel {
+        op.hphi_tau_partial_prepare(x_tau, beta)
+    }
+
+    pub(super) fn firth_hphi_tau_partial_apply(
+        op: &FirthDenseOperator,
+        x_tau: &Array2<f64>,
+        kernel: &FirthTauPartialKernel,
+        rhs: &Array2<f64>,
+    ) -> Array2<f64> {
+        op.hphi_tau_partial_apply(x_tau, kernel, rhs)
+    }
+
+    pub(super) fn firth_hphi_trace_apply_combined(
+        op: &FirthDenseOperator,
+        dir: &FirthDirection,
+        x_tau: &Array2<f64>,
+        tau_kernel: Option<&FirthTauPartialKernel>,
+        rhs: &Array2<f64>,
+    ) -> Array2<f64> {
+        op.hphi_trace_apply_combined(dir, x_tau, tau_kernel, rhs)
+    }
 }
 
 impl FirthDenseOperator {
@@ -398,10 +475,7 @@ impl FirthDenseOperator {
         self.direction_from_deta(deta)
     }
 
-    pub(crate) fn direction_from_deta(
-        &self,
-        deta: Array1<f64>,
-    ) -> FirthDirection {
+    pub(crate) fn direction_from_deta(&self, deta: Array1<f64>) -> FirthDirection {
         // Directional building blocks for u:
         //   δη_u = X u
         //   I_u  = Xᵀ diag(w' ⊙ δη_u) X
@@ -477,8 +551,12 @@ impl FirthDenseOperator {
         // trace contractions through tr(H^{-1} ·).
         let eta_v = self.x_dense.dot(rhs);
         let q_v = &eta_v * &self.w1.view().insert_axis(Axis(1));
-        let m_q_v =
-            RemlState::apply_hadamard_gram_to_matrix(&self.z_reduced, &self.k_reduced, &self.k_reduced, &q_v);
+        let m_q_v = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
+            &q_v,
+        );
         let bu_vec = &dir.b_u_vec;
         let m_bu_v = fast_ab(&dir.p_bu_base, rhs);
         let p_u_q_v = fast_ab(&dir.p_u_b_base, rhs);
@@ -498,10 +576,7 @@ impl FirthDenseOperator {
         0.5 * (diag_term - (term1 + term2 + term3))
     }
 
-    pub(crate) fn hphi_direction(
-        &self,
-        dir: &FirthDirection,
-    ) -> Array2<f64> {
+    pub(crate) fn hphi_direction(&self, dir: &FirthDirection) -> Array2<f64> {
         let p = self.x_dense.ncols();
         let eye = Array2::<f64>::eye(p);
         let mut out = self.hphi_direction_apply(dir, &eye);
@@ -685,7 +760,7 @@ impl FirthDenseOperator {
         debug_assert_eq!(a.ncols(), m.nrows());
         debug_assert_eq!(b.ncols(), m.ncols());
         let am = fast_ab(a, m);
-        RemlState::rowwise_dot(&am, b)
+        Self::rowwise_dot(&am, b)
     }
 
     pub(crate) fn dot_i_and_h(
@@ -726,8 +801,8 @@ impl FirthDenseOperator {
 
         let dot_k = -self.k_reduced.dot(&dot_i).dot(&self.k_reduced);
         let x_tauk = x_tau_reduced.dot(&self.k_reduced);
-        let dot_h_explicit = 2.0 * RemlState::rowwise_dot(&x_tauk, &self.x_reduced);
-        let dot_h_implicit = RemlState::rowwise_dot(&self.x_reduced.dot(&dot_k), &self.x_reduced);
+        let dot_h_explicit = 2.0 * Self::rowwise_dot(&x_tauk, &self.x_reduced);
+        let dot_h_implicit = Self::rowwise_dot(&self.x_reduced.dot(&dot_k), &self.x_reduced);
         let dot_h = dot_h_explicit + dot_h_implicit;
         (dot_i, dot_h)
     }
@@ -757,10 +832,11 @@ impl FirthDenseOperator {
         //
         // These are the literal trace/hat closed forms for Phi_tau and Phi_beta,tau.
         let deta_partial = x_tau.dot(beta);
-        let (dot_i_partial, dot_h_partial) = self.dot_i_and_h( x_tau, &deta_partial);
+        let (dot_i_partial, dot_h_partial) = self.dot_i_and_h(x_tau, &deta_partial);
 
         let first = 0.5 * x_tau.t().dot(&(&self.w1 * &self.h_diag));
-        let second_vec = &(&(&self.w2 * &deta_partial) * &self.h_diag) + &(&self.w1 * &dot_h_partial);
+        let second_vec =
+            &(&(&self.w2 * &deta_partial) * &self.h_diag) + &(&self.w1 * &dot_h_partial);
         let second = 0.5 * self.x_dense.t().dot(&second_vec);
         let g_phi_tau = first + second;
         let phi_tau_partial = 0.5 * RemlState::trace_product(&self.k_reduced, &dot_i_partial);
@@ -788,7 +864,7 @@ impl FirthDenseOperator {
         beta: &Array1<f64>,
     ) -> FirthTauPartialKernel {
         let deta_partial = x_tau.dot(beta);
-        let (dot_i_partial, dot_h_partial) = self.dot_i_and_h( x_tau, &deta_partial);
+        let (dot_i_partial, dot_h_partial) = self.dot_i_and_h(x_tau, &deta_partial);
         self.hphi_tau_partial_prepare_from_partials(
             x_tau,
             &deta_partial,
@@ -817,12 +893,14 @@ impl FirthDenseOperator {
         }
     }
 
-    pub(crate) fn apply_pbar_to_matrix(
-        &self,
-        mat: &Array2<f64>,
-    ) -> Array2<f64> {
+    pub(crate) fn apply_pbar_to_matrix(&self, mat: &Array2<f64>) -> Array2<f64> {
         // Applies P̄ = (X_r K_r X_rᵀ)⊙(X_r K_r X_rᵀ) to each column of mat.
-        RemlState::apply_hadamard_gram_to_matrix(&self.z_reduced, &self.k_reduced, &self.k_reduced, mat)
+        RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
+            mat,
+        )
     }
 
     pub(crate) fn apply_mtau_to_matrix(
@@ -849,14 +927,19 @@ impl FirthDenseOperator {
             let v = mat.column(col).to_owned();
             let s_zz = RemlState::reduced_weighted_gram(&self.z_reduced, &v);
             let m_zz = self.k_reduced.dot(&s_zz).dot(&self.k_reduced);
-            let t1 = RemlState::rowwise_bilinear(&self.z_reduced, &m_zz, &kernel.x_tau_reduced);
+            let t1 = Self::rowwise_bilinear(&self.z_reduced, &m_zz, &kernel.x_tau_reduced);
 
-            let s_zt = RemlState::reduced_cross_weighted_gram(&self.z_reduced, &kernel.x_tau_reduced, &v);
+            let s_zt =
+                RemlState::reduced_cross_weighted_gram(&self.z_reduced, &kernel.x_tau_reduced, &v);
             let m_zt = self.k_reduced.dot(&s_zt).dot(&self.k_reduced);
             let t2 = RemlState::reduced_diag_gram(&self.z_reduced, &m_zt);
 
-            let t3 =
-                RemlState::apply_hadamard_gram(&self.z_reduced, &self.k_reduced, &kernel.dot_k_reduced, &v);
+            let t3 = RemlState::apply_hadamard_gram(
+                &self.z_reduced,
+                &self.k_reduced,
+                &kernel.dot_k_reduced,
+                &v,
+            );
 
             let y = 2.0 * (t1 + t2 + t3);
             out.column_mut(col).assign(&y);
@@ -898,9 +981,9 @@ impl FirthDenseOperator {
         let q_v = &eta_v * &self.w1.view().insert_axis(Axis(1));
         let q_v_tau = &eta_v * &kernel.dot_w1.view().insert_axis(Axis(1))
             + &eta_v_tau * &self.w1.view().insert_axis(Axis(1));
-        let m_q_v = self.apply_pbar_to_matrix( &q_v);
-        let m_q_v_tau = self.apply_mtau_to_matrix( kernel, &q_v)
-            + self.apply_pbar_to_matrix( &q_v_tau);
+        let m_q_v = self.apply_pbar_to_matrix(&q_v);
+        let m_q_v_tau =
+            self.apply_mtau_to_matrix(kernel, &q_v) + self.apply_pbar_to_matrix(&q_v_tau);
         let r_v = &(&eta_v * &self.w2.view().insert_axis(Axis(1)))
             * &self.h_diag.view().insert_axis(Axis(1))
             - &(&m_q_v * &self.w1.view().insert_axis(Axis(1)));
@@ -936,12 +1019,20 @@ impl FirthDenseOperator {
         let q_v = &eta_v * &self.w1.view().insert_axis(Axis(1));
 
         // D(H_phi)[dir] contribution:
-        let m_q_v =
-            RemlState::apply_hadamard_gram_to_matrix(&self.z_reduced, &self.k_reduced, &self.k_reduced, &q_v);
+        let m_q_v = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
+            &q_v,
+        );
         let bu_vec = &self.w2 * &dir.deta;
         let bu_v = &eta_v * &bu_vec.view().insert_axis(Axis(1));
-        let m_bu_v =
-            RemlState::apply_hadamard_gram_to_matrix(&self.z_reduced, &self.k_reduced, &self.k_reduced, &bu_v);
+        let m_bu_v = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
+            &bu_v,
+        );
         let mut p_u_q_v = RemlState::apply_hadamard_gram_to_matrix(
             &self.z_reduced,
             &self.k_reduced,
@@ -973,9 +1064,9 @@ impl FirthDenseOperator {
             let eta_v_tau = x_tau.dot(rhs);
             let q_v_tau = &eta_v * &kernel.dot_w1.view().insert_axis(Axis(1))
                 + &eta_v_tau * &self.w1.view().insert_axis(Axis(1));
-            let m_q_v_kernel = self.apply_pbar_to_matrix( &q_v);
-            let m_q_v_tau = self.apply_mtau_to_matrix( kernel, &q_v)
-                + self.apply_pbar_to_matrix( &q_v_tau);
+            let m_q_v_kernel = self.apply_pbar_to_matrix(&q_v);
+            let m_q_v_tau =
+                self.apply_mtau_to_matrix(kernel, &q_v) + self.apply_pbar_to_matrix(&q_v_tau);
             let r_v = &(&eta_v * &self.w2.view().insert_axis(Axis(1)))
                 * &self.h_diag.view().insert_axis(Axis(1))
                 - &(&m_q_v_kernel * &self.w1.view().insert_axis(Axis(1)));

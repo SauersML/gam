@@ -27,6 +27,7 @@ use crate::construction::{
     stable_reparameterization_with_invariant_engine,
 };
 use crate::estimate::EstimationError;
+use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
 use crate::probability::normal_cdf;
 use crate::quadrature::QuadratureContext;
@@ -1617,15 +1618,11 @@ impl<'a> JointRemlState<'a> {
                     LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
                     LinkFunction::Identity => unreachable!("identity handled above"),
                 };
+                let strategy = strategy_for_family(family, None);
                 for i in 0..n {
                     let se_i = state.covariate_se.as_ref().map_or(0.0, |se| se[i]);
-                    let moments =
-                        crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
-                            &state.quad_ctx,
-                            family,
-                            eta[i],
-                            se_i,
-                        )
+                    let moments = strategy
+                        .integrated_moments(&state.quad_ctx, eta[i], se_i)
                         .expect("binomial family moments must be available");
                     let dmu = moments.d1.abs().max(MIN_DMU);
                     mu[i] = moments.mean;
@@ -2094,15 +2091,10 @@ impl<'a> JointRemlState<'a> {
                     LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
                     LinkFunction::Identity => unreachable!("identity handled above"),
                 };
+                let strategy = strategy_for_family(family, None);
                 for i in 0..n {
                     let se_i = state.covariate_se.as_ref().map_or(0.0, |se| se[i]);
-                    let moments =
-                        crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
-                            &state.quad_ctx,
-                            family,
-                            eta[i],
-                            se_i,
-                        )?;
+                    let moments = strategy.integrated_moments(&state.quad_ctx, eta[i], se_i)?;
                     let d1 = moments.d1.abs().max(MIN_DMU);
                     let d2 = if moments.d2.is_finite() {
                         moments.d2
@@ -3461,14 +3453,11 @@ pub fn predict_joint(
         let eff_se: Array1<f64> = deriv.mapv(f64::abs) * se;
 
         let probs = if let Some(family) = integrated_binomial_family_from_link(result.link) {
+            let strategy = strategy_for_family(family.into(), None);
             (0..n)
                 .map(|i| {
-                    crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
-                        &quad_ctx,
-                        family.into(),
-                        eta_cal[i],
-                        eff_se[i],
-                    )
+                    strategy
+                        .integrated_moments(&quad_ctx, eta_cal[i], eff_se[i])
                     .map(|m| m.mean)
                     .unwrap_or_else(|_| joint_point_inverse_link(result.link, eta_cal[i]))
                 })
@@ -3480,14 +3469,11 @@ pub fn predict_joint(
         (probs, Some(eff_se))
     } else {
         let probs = if let Some(family) = integrated_binomial_family_from_link(result.link) {
+            let strategy = strategy_for_family(family.into(), None);
             (0..n)
                 .map(|i| {
-                    crate::quadrature::IntegratedMomentsProvider::evaluate_family_moments(
-                        &quad_ctx,
-                        family.into(),
-                        eta_cal[i],
-                        0.0,
-                    )
+                    strategy
+                        .integrated_moments(&quad_ctx, eta_cal[i], 0.0)
                     .map(|m| m.mean)
                     .unwrap_or_else(|_| joint_point_inverse_link(result.link, eta_cal[i]))
                 })
