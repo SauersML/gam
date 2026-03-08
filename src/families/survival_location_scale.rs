@@ -81,7 +81,7 @@ impl ResidualDistributionOps for ResidualDistribution {
         match self {
             ResidualDistribution::Gaussian => normal_pdf(z),
             ResidualDistribution::Gumbel => {
-                if z == f64::INFINITY || z == f64::NEG_INFINITY {
+                if z.is_infinite() {
                     return 0.0;
                 }
                 let ez = z.exp();
@@ -98,7 +98,7 @@ impl ResidualDistributionOps for ResidualDistribution {
         match self {
             ResidualDistribution::Gaussian => -z * normal_pdf(z),
             ResidualDistribution::Gumbel => {
-                if z == f64::INFINITY || z == f64::NEG_INFINITY {
+                if z.is_infinite() {
                     return 0.0;
                 }
                 let ez = z.exp();
@@ -120,7 +120,7 @@ impl ResidualDistributionOps for ResidualDistribution {
                 (z * z - 1.0) * f
             }
             ResidualDistribution::Gumbel => {
-                if z == f64::INFINITY || z == f64::NEG_INFINITY {
+                if z.is_infinite() {
                     return 0.0;
                 }
                 let ez = z.exp();
@@ -142,7 +142,7 @@ impl ResidualDistributionOps for ResidualDistribution {
                 -(z * z * z - 3.0 * z) * f
             }
             ResidualDistribution::Gumbel => {
-                if z == f64::INFINITY || z == f64::NEG_INFINITY {
+                if z.is_infinite() {
                     return 0.0;
                 }
                 let ez = z.exp();
@@ -364,6 +364,7 @@ impl SurvivalLocationScaleFamily {
         offsets
     }
 
+    #[allow(clippy::type_complexity)]
     fn validate_joint_states<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
@@ -2470,13 +2471,15 @@ pub fn predict_survival_location_scale_with_uncertainty(
                 .to_string(),
         );
     }
-    if let Some(xw) = input.x_link_wiggle.as_ref() {
-        if xw.nrows() != n {
-            return Err(
-                "predict_survival_location_scale_with_uncertainty: x_link_wiggle row mismatch"
-                    .to_string(),
-            );
-        }
+    if input
+        .x_link_wiggle
+        .as_ref()
+        .is_some_and(|xw| xw.nrows() != n)
+    {
+        return Err(
+            "predict_survival_location_scale_with_uncertainty: x_link_wiggle row mismatch"
+                .to_string(),
+        );
     }
 
     let (sigma, ds, _, _) = exp_sigma_derivs_up_to_third(predictors.eta_ls.view());

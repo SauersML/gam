@@ -167,6 +167,7 @@ pub fn bounded_sigma_derivs_up_to_fourth_scalar(
     (jet.sigma, jet.d1, jet.d2, jet.d3, jet.d4)
 }
 
+#[allow(clippy::type_complexity)]
 pub fn bounded_sigma_derivs_up_to_fourth(
     eta: ArrayView1<'_, f64>,
     sigma_min: f64,
