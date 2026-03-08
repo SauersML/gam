@@ -879,31 +879,6 @@ def _rust_survival_fit_cli_args(scenario_name: str) -> list[str]:
     return args
 
 
-def _augment_bmi_spline_linear_hinges(train_df: pd.DataFrame, test_df: pd.DataFrame, n_knots: int = 6):
-    if "bmi" not in train_df.columns or n_knots < 2:
-        return train_df, test_df, []
-    x_tr = train_df["bmi"].to_numpy(dtype=float)
-    # Leakage-safe: knots from train-fold only.
-    qs = np.linspace(0.1, 0.9, n_knots - 1)
-    knots = np.unique(np.quantile(x_tr, qs))
-
-    tr = train_df.copy()
-    te = test_df.copy()
-    cols = []
-    base_col = "bmi_spline_0"
-    tr[base_col] = tr["bmi"]
-    te[base_col] = te["bmi"]
-    cols.append(base_col)
-    for j, k in enumerate(knots, start=1):
-        cn = f"bmi_spline_{j}"
-        tr[cn] = np.maximum(0.0, tr["bmi"] - float(k))
-        te[cn] = np.maximum(0.0, te["bmi"] - float(k))
-        cols.append(cn)
-    tr = tr.drop(columns=["bmi"])
-    te = te.drop(columns=["bmi"])
-    return tr, te, cols
-
-
 def _load_lidar_dataset():
     d = pd.read_csv(DATASET_DIR / "lidar.csv")
     d = d[["range", "logratio"]].dropna()
@@ -1447,7 +1422,7 @@ def _sample_fractional_spde_1d_field(n: int, *, rng: np.random.Generator, nu: fl
     return field / sd
 
 
-def _synthetic_thread2_continuous_order_dataset(
+def _synthetic_continuous_order_dataset(
     *,
     mode: str,
     n: int = 512,
@@ -1481,7 +1456,7 @@ def _synthetic_thread2_continuous_order_dataset(
         k2 = None
         expected = ["Ok", "IntrinsicLimit"]
     else:
-        raise RuntimeError(f"unsupported thread2 synthetic mode '{mode}'")
+        raise RuntimeError(f"unsupported continuous-order synthetic mode '{mode}'")
 
     rows = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x, y)]
     out = {
@@ -1489,12 +1464,12 @@ def _synthetic_thread2_continuous_order_dataset(
         "rows": rows,
         "features": ["x"],
         "target": "y",
-        "thread2_expected_statuses": expected,
+        "continuous_order_expected_statuses": expected,
     }
     if true_nu is not None:
-        out["thread2_true_nu"] = float(true_nu)
+        out["continuous_order_true_nu"] = float(true_nu)
     if true_kappa2 is not None:
-        out["thread2_true_kappa2"] = float(true_kappa2)
+        out["continuous_order_true_kappa2"] = float(true_kappa2)
     return out
 
 
@@ -2199,22 +2174,22 @@ def _dataset_for_scenario_unvalidated(s):
         )
     if name.startswith("geo_disease_"):
         return _synthetic_geo_disease_dataset(s.get("n", 4000), s.get("seed", 20260226))
-    if name == "thread2_fractional_spde_nu18":
-        return _synthetic_thread2_continuous_order_dataset(
+    if name == "continuous_order_fractional_spde_nu18":
+        return _synthetic_continuous_order_dataset(
             mode="fractional",
             n=s.get("n", 512),
             seed=s.get("seed", 20260501),
             true_nu=s.get("true_nu", 1.8),
             true_kappa2=s.get("true_kappa2", 0.7),
         )
-    if name == "thread2_boundary_rough":
-        return _synthetic_thread2_continuous_order_dataset(
+    if name == "continuous_order_boundary_rough":
+        return _synthetic_continuous_order_dataset(
             mode="rough",
             n=s.get("n", 512),
             seed=s.get("seed", 20260502),
         )
-    if name == "thread2_boundary_smooth":
-        return _synthetic_thread2_continuous_order_dataset(
+    if name == "continuous_order_boundary_smooth":
+        return _synthetic_continuous_order_dataset(
             mode="smooth",
             n=s.get("n", 512),
             seed=s.get("seed", 20260503),
@@ -2560,19 +2535,55 @@ def _rust_fit_mapping(scenario_name):
             knots=12,
         ),
         "haberman_survival": dict(
-            family="binomial-logit", smooth_col="axil_nodes", linear_cols=["age", "op_year"], smooth_basis="ps", knots=8
+            family="binomial-logit",
+            smooth_cols=["age", "op_year", "axil_nodes"],
+            linear_cols=[],
+            smooth_basis="ps",
+            knots=8,
         ),
         "icu_survival_death": dict(
             family="binomial-logit",
-            smooth_col="time",
-            linear_cols=["age", "bmi", "hr_max", "sysbp_min"],
+            smooth_cols=["age", "bmi", "hr_max", "sysbp_min"],
+            linear_cols=[],
             smooth_basis="ps",
             knots=7,
         ),
         "icu_survival_los": dict(
             family="binomial-logit",
-            smooth_col="age",
-            linear_cols=["bmi", "hr_max", "sysbp_min", "temp_apache", "time"],
+            smooth_cols=["age", "bmi", "hr_max", "sysbp_min", "temp_apache"],
+            linear_cols=[],
+            smooth_basis="ps",
+            knots=7,
+        ),
+        "heart_failure_survival": dict(
+            family="binomial-logit",
+            smooth_cols=[
+                "age",
+                "log_creatinine_phosphokinase",
+                "ejection_fraction",
+                "log_platelets",
+                "log_serum_creatinine",
+                "serum_sodium",
+            ],
+            linear_cols=["anaemia", "diabetes", "high_blood_pressure", "sex", "smoking"],
+            smooth_basis="ps",
+            knots=7,
+        ),
+        "cirrhosis_survival": dict(
+            family="binomial-logit",
+            smooth_cols=[
+                "age",
+                "bilirubin",
+                "cholesterol",
+                "albumin",
+                "copper",
+                "alk_phos",
+                "sgot",
+                "tryglicerides",
+                "platelets",
+                "prothrombin",
+            ],
+            linear_cols=["drug", "sex_male", "ascites", "hepatomegaly", "spiders", "edema", "stage"],
             smooth_basis="ps",
             knots=7,
         ),
@@ -2619,7 +2630,7 @@ def _rust_fit_mapping(scenario_name):
             linear_cols=[],
             knots=10,
         ),
-        "thread2_fractional_spde_nu18": dict(
+        "continuous_order_fractional_spde_nu18": dict(
             family="gaussian",
             smooth_col="x",
             linear_cols=[],
@@ -2627,7 +2638,7 @@ def _rust_fit_mapping(scenario_name):
             knots=24,
             double_penalty=True,
         ),
-        "thread2_boundary_rough": dict(
+        "continuous_order_boundary_rough": dict(
             family="gaussian",
             smooth_col="x",
             linear_cols=[],
@@ -2635,7 +2646,7 @@ def _rust_fit_mapping(scenario_name):
             knots=24,
             double_penalty=True,
         ),
-        "thread2_boundary_smooth": dict(
+        "continuous_order_boundary_smooth": dict(
             family="gaussian",
             smooth_col="x",
             linear_cols=[],
@@ -2835,31 +2846,55 @@ def _mgcv_formula_for_scenario(scenario_name, ds):
     return f"{target} ~ " + " + ".join(terms)
 
 
-def _rust_survival_formula_for_scenario(scenario_name, feature_cols=None):
-    if scenario_name == "icu_survival_death":
-        if feature_cols is not None:
-            if len(feature_cols) == 0:
-                raise RuntimeError("icu_survival_death: empty feature list for Rust survival formula")
-            return " + ".join(f"linear({c})" for c in feature_cols)
-        return "linear(age) + s(bmi, type=ps, knots=6) + linear(hr_max) + linear(sysbp_min)"
-    if scenario_name == "heart_failure_survival":
-        return (
-            "linear(age) + linear(anaemia) + linear(log_creatinine_phosphokinase) + linear(diabetes) + "
-            "linear(ejection_fraction) + linear(high_blood_pressure) + linear(log_platelets) + "
-            "linear(log_serum_creatinine) + linear(serum_sodium) + linear(sex) + linear(smoking)"
+def _survival_formula_mapping(scenario_name: str) -> dict:
+    cfg = _rust_fit_mapping(scenario_name)
+    if cfg is None:
+        raise RuntimeError(f"No survival formula mapping configured for scenario '{scenario_name}'")
+    basis = _canonical_smooth_basis(cfg.get("smooth_basis", "ps"))
+    if basis != "ps":
+        raise RuntimeError(
+            f"Unsupported survival smooth basis '{basis}' for scenario '{scenario_name}'; expected ps"
         )
-    if scenario_name == "cirrhosis_survival":
-        return (
-            "linear(drug) + linear(sex_male) + linear(ascites) + linear(hepatomegaly) + linear(spiders) + "
-            "linear(edema) + linear(age) + linear(bilirubin) + linear(cholesterol) + linear(albumin) + "
-            "linear(copper) + linear(alk_phos) + linear(sgot) + linear(tryglicerides) + linear(platelets) + "
-            "linear(prothrombin) + linear(stage)"
+    smooth_cols = list(cfg.get("smooth_cols") or ([cfg["smooth_col"]] if cfg.get("smooth_col") else []))
+    linear_cols = list(cfg.get("linear_cols", []))
+    overlap = sorted(set(smooth_cols) & set(linear_cols))
+    if overlap:
+        raise RuntimeError(
+            f"survival formula mapping overlaps smooth and linear terms for '{scenario_name}': {overlap}"
         )
-    if scenario_name == "haberman_survival":
-        return "linear(age) + linear(op_year) + s(axil_nodes, type=ps, knots=8)"
-    if scenario_name == "icu_survival_los":
-        return "linear(age) + linear(bmi) + linear(hr_max) + linear(sysbp_min) + linear(temp_apache)"
-    raise RuntimeError(f"No Rust survival formula configured for scenario '{scenario_name}'")
+    if not smooth_cols and not linear_cols:
+        raise RuntimeError(f"empty survival term mapping for scenario '{scenario_name}'")
+    return {
+        "smooth_cols": smooth_cols,
+        "linear_cols": linear_cols,
+        "knots": max(4, int(cfg.get("knots", 8))),
+    }
+
+
+def _rust_survival_formula_for_scenario(scenario_name: str) -> str:
+    cfg = _survival_formula_mapping(scenario_name)
+    terms = [f"linear({c})" for c in cfg["linear_cols"]]
+    terms.extend(f"s({c}, type=ps, knots={cfg['knots']})" for c in cfg["smooth_cols"])
+    return " + ".join(terms)
+
+
+def _coxph_survival_formula_for_scenario(scenario_name: str, ds: dict) -> str:
+    cfg = _survival_formula_mapping(scenario_name)
+    terms = list(cfg["linear_cols"])
+    terms.extend(
+        f"pspline({c}, df=min({cfg['knots']}, nrow(train_df)-1))" for c in cfg["smooth_cols"]
+    )
+    return f"Surv({ds['time_col']}, {ds['event_col']}) ~ " + " + ".join(terms)
+
+
+def _mgcv_survival_formula_for_scenario(scenario_name: str, ds: dict) -> str:
+    cfg = _survival_formula_mapping(scenario_name)
+    k_val = cfg["knots"] + 4
+    terms = list(cfg["linear_cols"])
+    terms.extend(
+        f"s({c}, bs='ps', k=min({k_val}, nrow(train_df)-1))" for c in cfg["smooth_cols"]
+    )
+    return f"{ds['time_col']} ~ " + " + ".join(terms)
 
 
 def _append_formula_link_term(formula: str, link_name: str | None) -> str:
@@ -3269,7 +3304,6 @@ def run_rust_scenario_cv(
             if ds["family"] == "survival":
                 train_path = td_path / f"train_{fold_id}.csv"
                 test_path = td_path / f"test_{fold_id}.csv"
-                fit_feature_cols = list(ds["features"])
                 for col in ds["features"]:
                     mu = float(train_df[col].mean())
                     sdv = float(train_df[col].std())
@@ -3277,11 +3311,6 @@ def run_rust_scenario_cv(
                         sdv = 1.0
                     train_df[col] = (train_df[col] - mu) / sdv
                     test_df[col] = (test_df[col] - mu) / sdv
-                if scenario_name == "icu_survival_death" and "bmi" in ds["features"]:
-                    train_df, test_df, bmi_spline_cols = _augment_bmi_spline_linear_hinges(
-                        train_df, test_df, n_knots=6
-                    )
-                    fit_feature_cols = [c for c in ds["features"] if c != "bmi"] + bmi_spline_cols
                 train_df["__entry"] = 0.0
                 # Rust survival predict requires an explicit evaluation time.
                 horizon = _survival_eval_horizon(train_df, ds["time_col"])
@@ -3290,9 +3319,7 @@ def run_rust_scenario_cv(
                 test_pred_df[ds["time_col"]] = horizon
                 train_df.to_csv(train_path, index=False)
                 test_pred_df.to_csv(test_path, index=False)
-                rhs_formula = _rust_survival_formula_for_scenario(
-                    scenario_name, feature_cols=fit_feature_cols
-                )
+                rhs_formula = _rust_survival_formula_for_scenario(scenario_name)
                 fit_formula = (
                     f"Surv(__entry, {ds['time_col']}, {ds['event_col']}) ~ {rhs_formula}"
                 )
@@ -3600,12 +3627,12 @@ def run_rust_scenario_cv(
             if valid_k2
             else None
         )
-        true_nu = ds.get("thread2_true_nu")
+        true_nu = ds.get("continuous_order_true_nu")
         if true_nu is not None and metrics["continuous_order_nu"] is not None:
             metrics["continuous_order_nu_abs_error"] = float(
                 abs(float(metrics["continuous_order_nu"]) - float(true_nu))
             )
-        expected = ds.get("thread2_expected_statuses")
+        expected = ds.get("continuous_order_expected_statuses")
         if isinstance(expected, list) and expected:
             mode = str(metrics["continuous_order_status_mode"])
             metrics["continuous_order_boundary_ok"] = bool(mode in {str(x) for x in expected})
@@ -3953,7 +3980,6 @@ def run_rust_gamlss_survival_cv(
             pred_path = td_path / f"pred_{fold_id}.csv"
 
             # Z-score features.
-            fit_feature_cols = list(ds["features"])
             for col in ds["features"]:
                 mu = float(train_df[col].mean())
                 sdv = float(train_df[col].std())
@@ -3961,11 +3987,6 @@ def run_rust_gamlss_survival_cv(
                     sdv = 1.0
                 train_df[col] = (train_df[col] - mu) / sdv
                 test_df[col] = (test_df[col] - mu) / sdv
-            if scenario_name == "icu_survival_death" and "bmi" in ds["features"]:
-                train_df, test_df, bmi_spline_cols = _augment_bmi_spline_linear_hinges(
-                    train_df, test_df, n_knots=6
-                )
-                fit_feature_cols = [c for c in ds["features"] if c != "bmi"] + bmi_spline_cols
             train_df["__entry"] = 0.0
             horizon = _survival_eval_horizon(train_df, ds["time_col"])
             test_pred_df = test_df.copy()
@@ -3974,9 +3995,7 @@ def run_rust_gamlss_survival_cv(
             train_df.to_csv(train_path, index=False)
             test_pred_df.to_csv(test_path, index=False)
 
-            rhs_formula = _rust_survival_formula_for_scenario(
-                scenario_name, feature_cols=fit_feature_cols
-            )
+            rhs_formula = _rust_survival_formula_for_scenario(scenario_name)
             fit_formula = (
                 f"Surv(__entry, {ds['time_col']}, {ds['event_col']}) ~ {rhs_formula}"
             )
@@ -4419,6 +4438,11 @@ def run_external_mgcv_cv(scenario, *, ds: dict | None = None, folds: list[Fold] 
             "dataset": ds,
             "scenario_name": scenario["name"],
             "mgcv_formula": mgcv_formula,
+            "survival_formula": (
+                _coxph_survival_formula_for_scenario(scenario["name"], ds)
+                if ds["family"] == "survival"
+                else None
+            ),
             "use_select": use_select,
         }
         data_path.write_text(json.dumps(payload))
@@ -4448,6 +4472,10 @@ scenario_name <- as.character(payload$scenario_name)
 mgcv_formula <- NULL
 if (!is.null(payload$mgcv_formula)) {
   mgcv_formula <- as.character(payload$mgcv_formula)
+}
+survival_formula <- NULL
+if (!is.null(payload$survival_formula)) {
+  survival_formula <- as.character(payload$survival_formula)
 }
 use_select <- TRUE
 if (!is.null(payload$use_select)) {
@@ -4490,37 +4518,10 @@ if (family_name == "survival") {
     train_df[[cn]] <- (train_df[[cn]] - mu) / sdv
     test_df[[cn]] <- (test_df[[cn]] - mu) / sdv
   }
-  if (scenario_name == "icu_survival_death") {
-    if ("bmi" %in% colnames(train_df)) {
-      qs <- seq(0.1, 0.9, length.out=5)
-      knots <- unique(as.numeric(stats::quantile(train_df[["bmi"]], probs=qs, names=FALSE, type=7)))
-      train_df[["bmi_spline_0"]] <- train_df[["bmi"]]
-      test_df[["bmi_spline_0"]] <- test_df[["bmi"]]
-      bmi_cols <- c("bmi_spline_0")
-      if (length(knots) > 0) {
-        for (j in seq_along(knots)) {
-          cn <- sprintf("bmi_spline_%d", j)
-          train_df[[cn]] <- pmax(0.0, train_df[["bmi"]] - as.numeric(knots[[j]]))
-          test_df[[cn]] <- pmax(0.0, test_df[["bmi"]] - as.numeric(knots[[j]]))
-          bmi_cols <- c(bmi_cols, cn)
-        }
-      }
-      train_df[["bmi"]] <- NULL
-      test_df[["bmi"]] <- NULL
-      ftxt <- paste(
-        "Surv(time, event) ~ age + hr_max + sysbp_min +",
-        paste(bmi_cols, collapse=" + ")
-      )
-    } else {
-      ftxt <- "Surv(time, event) ~ age + hr_max + sysbp_min"
-    }
-  } else if (scenario_name == "heart_failure_survival") {
-    ftxt <- "Surv(time, event) ~ age + anaemia + log_creatinine_phosphokinase + diabetes + ejection_fraction + high_blood_pressure + log_platelets + log_serum_creatinine + serum_sodium + sex + smoking"
-  } else if (scenario_name == "cirrhosis_survival") {
-    ftxt <- "Surv(time, event) ~ drug + sex_male + ascites + hepatomegaly + spiders + edema + age + bilirubin + cholesterol + albumin + copper + alk_phos + sgot + tryglicerides + platelets + prothrombin + stage"
-  } else {
-    ftxt <- "Surv(time, event) ~ age + bmi + hr_max + sysbp_min + temp_apache"
+  if (is.null(survival_formula) || !nzchar(survival_formula)) {
+    stop(sprintf("missing survival formula for scenario: %s", scenario_name))
   }
+  ftxt <- survival_formula
   t0 <- proc.time()[["elapsed"]]
   fit <- coxph(as.formula(ftxt), data=train_df, ties="efron")
   fit_sec <- proc.time()[["elapsed"]] - t0
@@ -5608,6 +5609,7 @@ def run_external_mgcv_survival_cv(scenario, *, ds: dict | None = None, folds: li
         payload = {
             "dataset": ds,
             "scenario_name": scenario["name"],
+            "survival_formula": _mgcv_survival_formula_for_scenario(scenario["name"], ds),
         }
         data_path.write_text(json.dumps(payload))
 
@@ -5629,6 +5631,7 @@ df <- as.data.frame(payload$dataset$rows)
 scenario_name <- as.character(payload$scenario_name)
 time_col <- as.character(payload$dataset$time_col)
 event_col <- as.character(payload$dataset$event_col)
+survival_formula <- as.character(payload$survival_formula)
 
 train_idx <- scan(train_idx_path, what=integer(), quiet=TRUE) + 1L
 test_idx <- scan(test_idx_path, what=integer(), quiet=TRUE) + 1L
@@ -5645,40 +5648,10 @@ for (cn in feature_cols) {
   test_df[[cn]] <- (test_df[[cn]] - mu) / sdv
 }
 
-if (scenario_name == "icu_survival_death") {
-  if ("bmi" %in% colnames(train_df)) {
-    qs <- seq(0.1, 0.9, length.out=5)
-    knots <- unique(as.numeric(stats::quantile(train_df[["bmi"]], probs=qs, names=FALSE, type=7)))
-    train_df[["bmi_spline_0"]] <- train_df[["bmi"]]
-    test_df[["bmi_spline_0"]] <- test_df[["bmi"]]
-    bmi_cols <- c("bmi_spline_0")
-    if (length(knots) > 0) {
-      for (j in seq_along(knots)) {
-        cn <- sprintf("bmi_spline_%d", j)
-        train_df[[cn]] <- pmax(0.0, train_df[["bmi"]] - as.numeric(knots[[j]]))
-        test_df[[cn]] <- pmax(0.0, test_df[["bmi"]] - as.numeric(knots[[j]]))
-        bmi_cols <- c(bmi_cols, cn)
-      }
-    }
-    train_df[["bmi"]] <- NULL
-    test_df[["bmi"]] <- NULL
-    rhs <- paste(
-      "age + hr_max + sysbp_min +",
-      paste(bmi_cols, collapse=" + ")
-    )
-  } else {
-    rhs <- "age + hr_max + sysbp_min"
-  }
-} else if (scenario_name == "heart_failure_survival") {
-  rhs <- "age + anaemia + log_creatinine_phosphokinase + diabetes + ejection_fraction + high_blood_pressure + log_platelets + log_serum_creatinine + serum_sodium + sex + smoking"
-} else if (scenario_name == "cirrhosis_survival") {
-  rhs <- "drug + sex_male + ascites + hepatomegaly + spiders + edema + age + bilirubin + cholesterol + albumin + copper + alk_phos + sgot + tryglicerides + platelets + prothrombin + stage"
-} else if (scenario_name == "haberman_survival") {
-  rhs <- "age + op_year + s(axil_nodes, bs='ps', k=min(12, nrow(train_df)-1))"
-} else {
-  rhs <- "age + bmi + hr_max + sysbp_min + temp_apache"
+if (!nzchar(survival_formula)) {
+  stop(sprintf("missing mgcv survival formula for scenario: %s", scenario_name))
 }
-ftxt <- sprintf("%s ~ %s", time_col, rhs)
+ftxt <- survival_formula
 
 t0 <- proc.time()[["elapsed"]]
 fit <- gam(
@@ -5979,11 +5952,6 @@ def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, fo
         test_df = df.iloc[fold.test_idx].copy()
         train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
         fit_feature_cols = feature_cols
-        if scenario["name"] == "icu_survival_death" and "bmi" in feature_cols:
-            train_df, test_df, bmi_spline_cols = _augment_bmi_spline_linear_hinges(
-                train_df, test_df, n_knots=6
-            )
-            fit_feature_cols = [c for c in feature_cols if c != "bmi"] + bmi_spline_cols
 
         fit_start = datetime.now(timezone.utc)
         cph = CoxPHFitter(penalizer=0.05, l1_ratio=0.5)
@@ -6712,11 +6680,11 @@ def main():
                         eval_ood=True,
                     )
                 )
-            if str(s_cfg.get("name", "")).startswith("thread2_"):
+            if str(s_cfg.get("name", "")).startswith("continuous_order_"):
                 results.append(
                     run_rust_scenario_cv(
                         s_cfg,
-                        contender_name="rust_thread2_order_probe",
+                        contender_name="rust_continuous_order_probe",
                         ds=ds,
                         folds=folds,
                         shared_fold_artifacts=shared_fold_artifacts,

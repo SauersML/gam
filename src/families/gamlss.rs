@@ -10,8 +10,7 @@ use crate::custom_family::{
 };
 use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::sigma_link::{
-    SigmaJet1, bounded_sigma_derivs_up_to_fourth, bounded_sigma_derivs_up_to_third,
-    bounded_sigma_eta_for_sigma_scalar, bounded_sigma_from_eta_scalar, bounded_sigma_jet1_scalar,
+    SigmaJet1, bounded_sigma_derivs_up_to_third, bounded_sigma_eta_for_sigma_scalar,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
@@ -1094,8 +1093,6 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
 fn try_binomial_alpha_beta_warm_start(
     y: &Array1<f64>,
     weights: &Array1<f64>,
-    sigma_min: f64,
-    sigma_max: f64,
     threshold_block: &ParameterBlockInput,
     log_sigma_block: &ParameterBlockInput,
     options: &BlockwiseFitOptions,
@@ -1144,8 +1141,8 @@ fn try_binomial_alpha_beta_warm_start(
     // This warm-start family currently identifies alpha only. Seed the
     // log-sigma block from a deterministic midpoint sigma instead of reusing
     // the beta block's penalty-only iterate.
-    let sigma_target = 0.5 * (sigma_min + sigma_max);
-    let eta_ls_target = bounded_sigma_eta_for_sigma_scalar(sigma_target, sigma_min, sigma_max);
+    let sigma_target: f64 = 1.0;
+    let eta_ls_target = 0.0;
     let beta_obs = Array1::from_elem(y.len(), 1.0 / sigma_target.max(1e-12));
     let t_target = Array1::from_iter(
         eta_alpha
@@ -1524,8 +1521,6 @@ pub fn fit_binomial_location_scale(
         match try_binomial_alpha_beta_warm_start(
             &y,
             &weights,
-            sigma_min,
-            sigma_max,
             &threshold_block,
             &log_sigma_block,
             options,
@@ -1564,7 +1559,7 @@ pub fn fit_binomial_location_scale(
     let fit = fit_custom_family(&family, &blocks, options)?;
     let beta_final = fit.block_states[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
         .eta
-        .mapv(|eta| 1.0 / bounded_sigma_from_eta_scalar(eta, sigma_min, sigma_max).max(1e-12));
+        .mapv(|eta| 1.0 / exp_sigma_from_eta_scalar(eta).max(1e-12));
     emit_binomial_alpha_beta_warnings("final-fit", &beta_final, &y, &weights);
     Ok(fit)
 }
@@ -1618,8 +1613,6 @@ pub fn fit_binomial_location_scale_wiggle(
         match try_binomial_alpha_beta_warm_start(
             &y,
             &weights,
-            sigma_min,
-            sigma_max,
             &threshold_block,
             &log_sigma_block,
             options,
@@ -1661,7 +1654,7 @@ pub fn fit_binomial_location_scale_wiggle(
     let fit = fit_custom_family(&family, &blocks, options)?;
     let beta_final = fit.block_states[BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA]
         .eta
-        .mapv(|eta| 1.0 / bounded_sigma_from_eta_scalar(eta, sigma_min, sigma_max).max(1e-12));
+        .mapv(|eta| 1.0 / exp_sigma_from_eta_scalar(eta).max(1e-12));
     emit_binomial_alpha_beta_warnings("final-fit-wiggle", &beta_final, &y, &weights);
     Ok(fit)
 }
@@ -3187,13 +3180,8 @@ fn binomial_location_scale_row(
     eta_ls: f64,
     eta_wiggle: f64,
     link_kind: &InverseLink,
-    sigma_min: f64,
-    sigma_max: f64,
 ) -> Result<BinomialLocationScaleRow, String> {
-    let SigmaJet1 {
-        sigma,
-        d1: dsigma_deta,
-    } = bounded_sigma_jet1_scalar(eta_ls, sigma_min, sigma_max);
+    let SigmaJet1 { sigma, d1: dsigma_deta } = exp_sigma_jet1_scalar(eta_ls);
     let q0 = binomial_location_scale_q0(eta_t, sigma);
     let q = q0 + eta_wiggle;
     let jet = inverse_link_jet_for_inverse_link(link_kind, q)
@@ -3216,8 +3204,6 @@ fn binomial_location_scale_core(
     eta_ls: &Array1<f64>,
     eta_wiggle: Option<&Array1<f64>>,
     link_kind: &InverseLink,
-    sigma_min: f64,
-    sigma_max: f64,
 ) -> Result<BinomialLocationScaleCore, String> {
     let n = y.len();
     if weights.len() != n || eta_t.len() != n || eta_ls.len() != n {
@@ -3247,8 +3233,6 @@ fn binomial_location_scale_core(
             eta_ls[i],
             eta_wiggle.map_or(0.0, |w| w[i]),
             link_kind,
-            sigma_min,
-            sigma_max,
         )?;
         sigma[i] = row.sigma;
         dsigma_deta[i] = row.dsigma_deta;
@@ -3443,6 +3427,25 @@ fn gaussian_sigma_derivs_up_to_fourth(
         sigma.clone(),
         sigma,
     )
+}
+
+#[inline]
+fn exp_sigma_jet1_scalar(eta: f64) -> SigmaJet1 {
+    let sigma = eta.exp();
+    SigmaJet1 { sigma, d1: sigma }
+}
+
+#[inline]
+fn exp_sigma_from_eta_scalar(eta: f64) -> f64 {
+    eta.exp()
+}
+
+#[inline]
+fn exp_sigma_derivs_up_to_third(
+    eta: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+    let sigma = eta.mapv(f64::exp);
+    (sigma.clone(), sigma.clone(), sigma.clone(), sigma)
 }
 
 impl GaussianLocationScaleFamily {
@@ -4306,14 +4309,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
         if block_idx == Self::BLOCK_LOG_SIGMA {
-            let target_eta_mean =
-                bounded_sigma_eta_for_sigma_scalar(1.0, self.sigma_min, self.sigma_max);
-            return project_block_beta_to_weighted_eta_mean_zero(
-                beta,
-                spec,
-                &self.weights,
-                target_eta_mean,
-            );
+            return project_block_beta_to_weighted_eta_mean_zero(beta, spec, &self.weights, 0.0);
         }
         Ok(beta)
     }
@@ -4339,8 +4335,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
             eta_ls,
             None,
             &self.link_kind,
-            self.sigma_min,
-            self.sigma_max,
         )?;
         let (t_ws, ls_ws, _none) = binomial_location_scale_working_sets(
             &self.y,
@@ -4437,11 +4431,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
             eta_ls,
             None,
             &self.link_kind,
-            self.sigma_min,
-            self.sigma_max,
         )?;
-        let (_, dsigma_deta, d2sigma_deta2, _) =
-            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (_, dsigma_deta, d2sigma_deta2, _) = exp_sigma_derivs_up_to_third(eta_ls.view());
 
         let mut dw = Array1::<f64>::zeros(n);
         for i in 0..n {
@@ -4547,11 +4538,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
             eta_ls,
             None,
             &self.link_kind,
-            self.sigma_min,
-            self.sigma_max,
         )?;
-        let (sigma, ds, d2s, _) =
-            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, _) = exp_sigma_derivs_up_to_third(eta_ls.view());
 
         let mut w_tt_diag = Array1::<f64>::zeros(n);
         let mut w_tl_diag = Array1::<f64>::zeros(n);
@@ -4723,11 +4711,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
             eta_ls,
             None,
             &self.link_kind,
-            self.sigma_min,
-            self.sigma_max,
         )?;
-        let (sigma, ds, d2s, d3s) =
-            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
 
         let mut w_tt_diag = Array1::<f64>::zeros(n);
         let mut w_tl_diag = Array1::<f64>::zeros(n);
@@ -4874,11 +4859,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
             eta_ls,
             None,
             &self.link_kind,
-            self.sigma_min,
-            self.sigma_max,
         )?;
-        let (sigma, ds, d2s, d3s, d4s) =
-            bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, d3s, d4s) = gaussian_sigma_derivs_up_to_fourth(eta_ls.view());
 
         let mut w_tt_diag = Array1::<f64>::zeros(n);
         let mut w_tl_diag = Array1::<f64>::zeros(n);
@@ -5072,7 +5054,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
         let mut mean = Array1::<f64>::zeros(self.y.len());
         for i in 0..mean.len() {
             let sigma =
-                bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
+                exp_sigma_from_eta_scalar(eta_ls[i]).max(1e-12);
             let q = binomial_location_scale_q0(eta_t[i], sigma);
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
                 .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
@@ -5404,16 +5386,13 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             eta_ls,
             Some(eta_w),
             &self.link_kind,
-            self.sigma_min,
-            self.sigma_max,
         )?;
         let wiggle_design = self.wiggle_design(core.q0.view())?;
         let dq_dq0 =
             self.wiggle_dq_dq0(core.q0.view(), block_states[Self::BLOCK_WIGGLE].beta.view())?;
         let d2q_dq02 =
             self.wiggle_d2q_dq02(core.q0.view(), block_states[Self::BLOCK_WIGGLE].beta.view())?;
-        let (_, _, d2sigma_deta2, _) =
-            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (_, _, d2sigma_deta2, _) = exp_sigma_derivs_up_to_third(eta_ls.view());
         let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
             "BinomialLocationScaleWiggleFamily exact-newton path is missing threshold design"
                 .to_string()
@@ -5470,8 +5449,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             eta_ls,
             None,
             &self.link_kind,
-            self.sigma_min,
-            self.sigma_max,
         )?;
         let b0 = self.wiggle_design(core0.q0.view())?;
         let pw = b0.ncols();
@@ -5601,8 +5578,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             eta_ls,
             Some(eta_w),
             &self.link_kind,
-            self.sigma_min,
-            self.sigma_max,
         )?;
         let b0 = self.wiggle_design(core0.q0.view())?;
         let d0 =
@@ -5623,8 +5598,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         }
         let m = d0.dot(&beta_w0) + 1.0;
         let g2 = dd0.dot(&beta_w0);
-        let (sigma, ds, d2s, d3s) =
-            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
         let pw = b0.ncols();
         let total = pt + pls + pw;
         let mut coeff_tt = Array1::<f64>::zeros(n);
@@ -5774,8 +5748,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             eta_ls,
             Some(eta_w),
             &self.link_kind,
-            self.sigma_min,
-            self.sigma_max,
         )?;
         let b0 = self.wiggle_design(core0.q0.view())?;
         let pw = b0.ncols();
@@ -5966,8 +5938,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             eta_ls,
             Some(eta_w),
             &self.link_kind,
-            self.sigma_min,
-            self.sigma_max,
         )?;
         let b0 = self.wiggle_design(core0.q0.view())?;
         let d0 =
@@ -6004,8 +5974,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let g2 = dd0.dot(&beta_w0);
         let g3 = d3q;
         let g4 = d4q;
-        let (sigma, ds, d2s, d3s, d4s) =
-            bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, d3s, d4s) = gaussian_sigma_derivs_up_to_fourth(eta_ls.view());
 
         let mut d2_h = Array2::<f64>::zeros((total, total));
         for i in 0..n {
@@ -6276,8 +6245,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         }
         let mut q0 = Array1::<f64>::zeros(eta_t.len());
         for i in 0..q0.len() {
-            let sigma =
-                bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
+            let sigma = exp_sigma_from_eta_scalar(eta_ls[i]).max(1e-12);
             q0[i] = binomial_location_scale_q0(eta_t[i], sigma);
         }
         let x = self.wiggle_design(q0.view())?;
@@ -6319,8 +6287,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleWiggleFamily {
         }
         let mut mean = Array1::<f64>::zeros(self.y.len());
         for i in 0..mean.len() {
-            let sigma =
-                bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
+            let sigma = exp_sigma_from_eta_scalar(eta_ls[i]).max(1e-12);
             let q0 = binomial_location_scale_q0(eta_t[i], sigma);
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q0 + eta_w[i])
                 .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
@@ -6377,8 +6344,6 @@ mod tests {
         let (beta_t, beta_ls, beta_obs) = try_binomial_alpha_beta_warm_start(
             &y,
             &weights,
-            0.25,
-            4.0,
             &threshold,
             &log_sigma,
             &BlockwiseFitOptions::default(),
@@ -6937,9 +6902,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
-            &family.link_kind,
-            family.sigma_min,
-            family.sigma_max,
+            &family.link_kind
         )
         .expect("core q0");
         let beta_wiggle = Array1::from_vec(vec![0.1; wiggle_block.design.ncols()]);
@@ -6954,9 +6917,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             Some(&eta_w),
-            &family.link_kind,
-            family.sigma_min,
-            family.sigma_max,
+            &family.link_kind
         )
         .expect("core");
         let dq_dq0 = family
@@ -7033,8 +6994,6 @@ mod tests {
             &eta_ls,
             Some(&eta_w),
             &InverseLink::Standard(LinkFunction::Probit),
-            0.25,
-            4.0,
         )
         .expect("core");
         assert!(core.clamp_active.iter().all(|v| *v));
@@ -7121,9 +7080,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
-            &family.link_kind,
-            family.sigma_min,
-            family.sigma_max,
+            &family.link_kind
         )
         .expect("core q0");
         let beta_w = Array1::from_vec(vec![0.05; wiggle_block.design.ncols()]);
@@ -7222,9 +7179,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
-            &family.link_kind,
-            family.sigma_min,
-            family.sigma_max,
+            &family.link_kind
         )
         .expect("core q0");
         let beta_w = Array1::from_vec(vec![0.04; wiggle_block.design.ncols()]);
@@ -7283,9 +7238,7 @@ mod tests {
                 &plus_states[BinomialLocationScaleWiggleFamily::BLOCK_T].eta,
                 &plus_states[BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA].eta,
                 None,
-                &family.link_kind,
-                family.sigma_min,
-                family.sigma_max,
+                &family.link_kind
             )
             .expect("plus core q0");
             plus_states[BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE].eta = family
@@ -7345,9 +7298,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
-            &family.link_kind,
-            family.sigma_min,
-            family.sigma_max,
+            &family.link_kind
         )
         .expect("core q0");
         let beta_w = Array1::from_vec(vec![0.04; wiggle_block.design.ncols()]);
@@ -7414,9 +7365,7 @@ mod tests {
             &plus_states[BinomialLocationScaleWiggleFamily::BLOCK_T].eta,
             &plus_states[BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA].eta,
             None,
-            &family.link_kind,
-            family.sigma_min,
-            family.sigma_max,
+            &family.link_kind
         )
         .expect("plus core q0");
         plus_states[BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE].eta = family
@@ -7474,9 +7423,7 @@ mod tests {
                 &eta_t,
                 &eta_ls,
                 None,
-                &family.link_kind,
-                family.sigma_min,
-                family.sigma_max,
+                &family.link_kind
             )
             .expect("core q0");
             let eta_w = family
@@ -7591,9 +7538,7 @@ mod tests {
                 &eta_t,
                 &eta_ls,
                 None,
-                &family.link_kind,
-                family.sigma_min,
-                family.sigma_max,
+                &family.link_kind
             )
             .expect("core q0");
             let eta_w = family
@@ -7850,9 +7795,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
-            &family.link_kind,
-            family.sigma_min,
-            family.sigma_max,
+            &family.link_kind
         )
         .expect("core");
         for i in 0..n {
@@ -7901,9 +7844,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             None,
-            &family.link_kind,
-            family.sigma_min,
-            family.sigma_max,
+            &family.link_kind
         )
         .expect("core q0");
         let beta_w = Array1::from_vec(vec![0.15; wiggle_block.design.ncols()]);
@@ -7960,9 +7901,7 @@ mod tests {
             &eta_t,
             &eta_ls,
             Some(&eta_w),
-            &family.link_kind,
-            family.sigma_min,
-            family.sigma_max,
+            &family.link_kind
         )
         .expect("core with wiggle");
         for i in 0..n {

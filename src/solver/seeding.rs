@@ -192,7 +192,7 @@ fn add_nu2_reverse_manifold_seeds(
     let log_kappa_grid = [-2.0, -1.0, 0.0, 1.0, 2.0];
     for &tau_rho in &tau_anchors {
         for &log_kappa in &log_kappa_grid {
-            // Thread-2 reverse map at nu=2:
+            // Continuous-order reverse map at nu=2:
             // lambda0 = tau * kappa^4, lambda1 = tau * 2*kappa^2, lambda2 = tau.
             let rho2 = clamp_to_bounds(tau_rho, bounds);
             let rho1 = clamp_to_bounds(tau_rho + ln_two + 2.0 * log_kappa, bounds);
