@@ -8,7 +8,7 @@ use crate::custom_family::{
     CustomFamilyBlockPsiDerivative, FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec,
     ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
-use crate::faer_ndarray::fast_atv;
+use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::sigma_link::{
     bounded_sigma_and_deriv_from_eta_scalar, bounded_sigma_derivs_up_to_fourth,
     bounded_sigma_derivs_up_to_third, bounded_sigma_eta_for_sigma_scalar,
@@ -2565,19 +2565,45 @@ fn xt_diag_x_dense(design: &Array2<f64>, diag: &Array1<f64>) -> Result<Array2<f6
             diag.len()
         ));
     }
-    let p = design.ncols();
-    let n = design.nrows();
-    let mut x_weighted = Array2::<f64>::zeros((n, p));
-    for i in 0..n {
-        let wi = diag[i];
-        if wi == 0.0 {
-            continue;
-        }
-        for j in 0..p {
-            x_weighted[[i, j]] = design[[i, j]] * wi;
-        }
+    Ok(fast_xt_diag_x(design, diag))
+}
+
+fn xt_diag_y_dense(
+    left: &Array2<f64>,
+    diag: &Array1<f64>,
+    right: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    if left.nrows() != diag.len() {
+        return Err(format!(
+            "xt_diag_y_dense row mismatch: left has {} rows but diag has {} entries",
+            left.nrows(),
+            diag.len()
+        ));
     }
-    Ok(crate::faer_ndarray::fast_atb(design, &x_weighted))
+    if right.nrows() != diag.len() {
+        return Err(format!(
+            "xt_diag_y_dense row mismatch: right has {} rows but diag has {} entries",
+            right.nrows(),
+            diag.len()
+        ));
+    }
+    Ok(fast_xt_diag_y(left, diag, right))
+}
+
+fn assemble_two_block_symmetric(
+    upper_left: &Array2<f64>,
+    upper_right: &Array2<f64>,
+    lower_right: &Array2<f64>,
+) -> Array2<f64> {
+    let pt = upper_left.nrows();
+    let pls = lower_right.nrows();
+    let total = pt + pls;
+    let mut out = Array2::<f64>::zeros((total, total));
+    out.slice_mut(s![0..pt, 0..pt]).assign(upper_left);
+    out.slice_mut(s![0..pt, pt..total]).assign(upper_right);
+    out.slice_mut(s![pt..total, pt..total]).assign(lower_right);
+    mirror_upper_to_lower(&mut out);
+    out
 }
 
 fn mirror_upper_to_lower(target: &mut Array2<f64>) {
@@ -3541,22 +3567,9 @@ impl CustomFamily for GaussianLocationScaleFamily {
         }
 
         let h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let h_tl = xt_diag_y_dense(&x_t, &w_tl_diag, &x_ls)?;
         let h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
-        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
-        for i in 0..n {
-            let w = w_tl_diag[i];
-            for j in 0..pls {
-                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
-            }
-        }
-        let h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
-
-        let mut h = Array2::<f64>::zeros((total, total));
-        h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
-        h.slice_mut(s![0..pt, pt..total]).assign(&h_tl);
-        h.slice_mut(s![pt..total, pt..total]).assign(&h_ll);
-        mirror_upper_to_lower(&mut h);
-        Ok(Some(h))
+        Ok(Some(assemble_two_block_symmetric(&h_tt, &h_tl, &h_ll)))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -3613,22 +3626,11 @@ impl CustomFamily for GaussianLocationScaleFamily {
         }
 
         let d_h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let d_h_tl = xt_diag_y_dense(&x_t, &w_tl_diag, &x_ls)?;
         let d_h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
-        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
-        for i in 0..n {
-            let w = w_tl_diag[i];
-            for j in 0..pls {
-                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
-            }
-        }
-        let d_h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
-
-        let mut d_h = Array2::<f64>::zeros((total, total));
-        d_h.slice_mut(s![0..pt, 0..pt]).assign(&d_h_tt);
-        d_h.slice_mut(s![0..pt, pt..total]).assign(&d_h_tl);
-        d_h.slice_mut(s![pt..total, pt..total]).assign(&d_h_ll);
-        mirror_upper_to_lower(&mut d_h);
-        Ok(Some(d_h))
+        Ok(Some(assemble_two_block_symmetric(
+            &d_h_tt, &d_h_tl, &d_h_ll,
+        )))
     }
 
     fn exact_newton_joint_hessian_second_directional_derivative(
@@ -3689,22 +3691,11 @@ impl CustomFamily for GaussianLocationScaleFamily {
         }
 
         let d2_h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let d2_h_tl = xt_diag_y_dense(&x_t, &w_tl_diag, &x_ls)?;
         let d2_h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
-        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
-        for i in 0..n {
-            let w = w_tl_diag[i];
-            for j in 0..pls {
-                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
-            }
-        }
-        let d2_h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
-
-        let mut d2_h = Array2::<f64>::zeros((total, total));
-        d2_h.slice_mut(s![0..pt, 0..pt]).assign(&d2_h_tt);
-        d2_h.slice_mut(s![0..pt, pt..total]).assign(&d2_h_tl);
-        d2_h.slice_mut(s![pt..total, pt..total]).assign(&d2_h_ll);
-        mirror_upper_to_lower(&mut d2_h);
-        Ok(Some(d2_h))
+        Ok(Some(assemble_two_block_symmetric(
+            &d2_h_tt, &d2_h_tl, &d2_h_ll,
+        )))
     }
 
     fn diagonal_working_weights_directional_derivative(
@@ -4375,7 +4366,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let total = pt + pls;
-        
+
         let mut w_tt_diag = Array1::<f64>::zeros(n);
         let mut w_tl_diag = Array1::<f64>::zeros(n);
         let mut w_ll_diag = Array1::<f64>::zeros(n);
@@ -4407,22 +4398,9 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         }
 
         let h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let h_tl = xt_diag_y_dense(&x_t, &w_tl_diag, &x_ls)?;
         let h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
-        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
-        for i in 0..n {
-            let w = w_tl_diag[i];
-            for j in 0..pls {
-                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
-            }
-        }
-        let h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
-
-        let mut h = Array2::<f64>::zeros((total, total));
-        h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
-        h.slice_mut(s![0..pt, pt..total]).assign(&h_tl);
-        h.slice_mut(s![pt..total, pt..total]).assign(&h_ll);
-        mirror_upper_to_lower(&mut h);
-        Ok(Some(h))
+        Ok(Some(assemble_two_block_symmetric(&h_tt, &h_tl, &h_ll)))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -4622,22 +4600,11 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         }
 
         let d_h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let d_h_tl = xt_diag_y_dense(&x_t, &w_tl_diag, &x_ls)?;
         let d_h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
-        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
-        for i in 0..n {
-            let w = w_tl_diag[i];
-            for j in 0..pls {
-                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
-            }
-        }
-        let d_h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
-
-        let mut d_h = Array2::<f64>::zeros((total, total));
-        d_h.slice_mut(s![0..pt, 0..pt]).assign(&d_h_tt);
-        d_h.slice_mut(s![0..pt, pt..total]).assign(&d_h_tl);
-        d_h.slice_mut(s![pt..total, pt..total]).assign(&d_h_ll);
-        mirror_upper_to_lower(&mut d_h);
-        Ok(Some(d_h))
+        Ok(Some(assemble_two_block_symmetric(
+            &d_h_tt, &d_h_tl, &d_h_ll,
+        )))
     }
 
     fn exact_newton_joint_hessian_second_directional_derivative(
@@ -4894,22 +4861,11 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         }
 
         let d2_h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let d2_h_tl = xt_diag_y_dense(&x_t, &w_tl_diag, &x_ls)?;
         let d2_h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
-        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
-        for i in 0..n {
-            let w = w_tl_diag[i];
-            for j in 0..pls {
-                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
-            }
-        }
-        let d2_h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
-
-        let mut d2_h = Array2::<f64>::zeros((total, total));
-        d2_h.slice_mut(s![0..pt, 0..pt]).assign(&d2_h_tt);
-        d2_h.slice_mut(s![0..pt, pt..total]).assign(&d2_h_tl);
-        d2_h.slice_mut(s![pt..total, pt..total]).assign(&d2_h_ll);
-        mirror_upper_to_lower(&mut d2_h);
-        Ok(Some(d2_h))
+        Ok(Some(assemble_two_block_symmetric(
+            &d2_h_tt, &d2_h_tl, &d2_h_ll,
+        )))
     }
 }
 
@@ -5487,7 +5443,14 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
         let pw = b0.ncols();
         let total = pt + pls + pw;
-        let mut h = Array2::<f64>::zeros((total, total));
+        let mut coeff_tt = Array1::<f64>::zeros(n);
+        let mut coeff_tl = Array1::<f64>::zeros(n);
+        let mut coeff_ll = Array1::<f64>::zeros(n);
+        let mut coeff_tw_b = Array1::<f64>::zeros(n);
+        let mut coeff_tw_d = Array1::<f64>::zeros(n);
+        let mut coeff_lw_b = Array1::<f64>::zeros(n);
+        let mut coeff_lw_d = Array1::<f64>::zeros(n);
+        let mut coeff_ww = Array1::<f64>::zeros(n);
         for i in 0..n {
             let q_i = core0.q0[i] + eta_w[i];
             let (m1, m2, _m3) =
@@ -5518,73 +5481,32 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             let q_tl = g2[i] * q0.q_t * q0.q_ls + m[i] * q0.q_tl;
             let q_ll = g2[i] * q0.q_ls * q0.q_ls + m[i] * q0.q_ll;
 
-            let xtr = x_t.row(i);
-            let xlsr = x_ls.row(i);
-            let br = b0.row(i);
-            let dr = d0.row(i);
-            // (tt) block:
-            //   H_tt,i = m2 * q_t^2 + m1 * q_tt
-            //          = m2 * (m q0_t)^2 + m1 * (g2 q0_t^2).
-            let coeff_tt = hessian_coeff_from_objective_q_terms(m1, m2, q_t, q_t, q_tt);
-            // (tl) block:
-            //   H_tl,i = m2 * q_t q_l + m1 * q_tl
-            //          = m2 * (m q0_t)(m q0_l)
-            //            + m1 * (g2 q0_t q0_l + m q0_tl).
-            let coeff_tl = hessian_coeff_from_objective_q_terms(m1, m2, q_t, q_ls, q_tl);
-            // (ll) block:
-            //   H_ll,i = m2 * q_l^2 + m1 * q_ll
-            //          = m2 * (m q0_l)^2
-            //            + m1 * (g2 q0_l^2 + m q0_ll).
-            let coeff_ll = hessian_coeff_from_objective_q_terms(m1, m2, q_ls, q_ls, q_ll);
-
-            for a_idx in 0..pt {
-                for b_idx in a_idx..pt {
-                    h[[a_idx, b_idx]] += coeff_tt * xtr[a_idx] * xtr[b_idx];
-                }
-            }
-            for a_idx in 0..pt {
-                for b_idx in 0..pls {
-                    h[[a_idx, pt + b_idx]] += coeff_tl * xtr[a_idx] * xlsr[b_idx];
-                }
-            }
-            for a_idx in 0..pls {
-                for b_idx in a_idx..pls {
-                    h[[pt + a_idx, pt + b_idx]] += coeff_ll * xlsr[a_idx] * xlsr[b_idx];
-                }
-            }
-
-            for a_idx in 0..pt {
-                for j in 0..pw {
-                    let q_w = br[j];
-                    let q_tw = dr[j] * q0.q_t;
-                    // (tw) block:
-                    //   H_tw,i = m2 * q_t q_w + m1 * q_tw
-                    //          = m2 * (m q0_t) B + m1 * (q0_t B').
-                    let w_tw = hessian_coeff_from_objective_q_terms(m1, m2, q_t, q_w, q_tw);
-                    h[[a_idx, pt + pls + j]] += w_tw * xtr[a_idx];
-                }
-            }
-            for a_idx in 0..pls {
-                for j in 0..pw {
-                    let q_w = br[j];
-                    let q_lw = dr[j] * q0.q_ls;
-                    // (lw) block:
-                    //   H_lw,i = m2 * q_l q_w + m1 * q_lw
-                    //          = m2 * (m q0_l) B + m1 * (q0_l B').
-                    let w_lw = hessian_coeff_from_objective_q_terms(m1, m2, q_ls, q_w, q_lw);
-                    h[[pt + a_idx, pt + pls + j]] += w_lw * xlsr[a_idx];
-                }
-            }
-            for j in 0..pw {
-                for k in j..pw {
-                    // (ww) block:
-                    //   H_ww,i = m2 * q_w q_w^T + m1 * q_ww
-                    //          = m2 * B B^T       (since q_ww = 0).
-                    let w_ww = hessian_coeff_from_objective_q_terms(m1, m2, br[j], br[k], 0.0);
-                    h[[pt + pls + j, pt + pls + k]] += w_ww;
-                }
-            }
+            coeff_tt[i] = hessian_coeff_from_objective_q_terms(m1, m2, q_t, q_t, q_tt);
+            coeff_tl[i] = hessian_coeff_from_objective_q_terms(m1, m2, q_t, q_ls, q_tl);
+            coeff_ll[i] = hessian_coeff_from_objective_q_terms(m1, m2, q_ls, q_ls, q_ll);
+            coeff_tw_b[i] = m2 * q_t;
+            coeff_tw_d[i] = m1 * q0.q_t;
+            coeff_lw_b[i] = m2 * q_ls;
+            coeff_lw_d[i] = m1 * q0.q_ls;
+            coeff_ww[i] = m2;
         }
+        let h_tt = xt_diag_x_dense(&x_t, &coeff_tt)?;
+        let h_tl = xt_diag_y_dense(&x_t, &coeff_tl, &x_ls)?;
+        let h_ll = xt_diag_x_dense(&x_ls, &coeff_ll)?;
+        let h_tw =
+            xt_diag_y_dense(&x_t, &coeff_tw_b, &b0)? + &xt_diag_y_dense(&x_t, &coeff_tw_d, &d0)?;
+        let h_lw =
+            xt_diag_y_dense(&x_ls, &coeff_lw_b, &b0)? + &xt_diag_y_dense(&x_ls, &coeff_lw_d, &d0)?;
+        let h_ww = xt_diag_x_dense(&b0, &coeff_ww)?;
+
+        let mut h = Array2::<f64>::zeros((total, total));
+        h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
+        h.slice_mut(s![0..pt, pt..pt + pls]).assign(&h_tl);
+        h.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&h_ll);
+        h.slice_mut(s![0..pt, pt + pls..total]).assign(&h_tw);
+        h.slice_mut(s![pt..pt + pls, pt + pls..total]).assign(&h_lw);
+        h.slice_mut(s![pt + pls..total, pt + pls..total])
+            .assign(&h_ww);
         mirror_upper_to_lower(&mut h);
         Ok(Some(h))
     }
@@ -5698,7 +5620,17 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         let (sigma, ds, d2s, d3s) =
             bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
 
-        let mut d_h = Array2::<f64>::zeros((total, total));
+        let mut coeff_tt = Array1::<f64>::zeros(n);
+        let mut coeff_tl = Array1::<f64>::zeros(n);
+        let mut coeff_ll = Array1::<f64>::zeros(n);
+        let mut coeff_tw_b = Array1::<f64>::zeros(n);
+        let mut coeff_tw_d = Array1::<f64>::zeros(n);
+        let mut coeff_tw_dd = Array1::<f64>::zeros(n);
+        let mut coeff_lw_b = Array1::<f64>::zeros(n);
+        let mut coeff_lw_d = Array1::<f64>::zeros(n);
+        let mut coeff_lw_dd = Array1::<f64>::zeros(n);
+        let mut coeff_ww_bb = Array1::<f64>::zeros(n);
+        let mut coeff_ww_db = Array1::<f64>::zeros(n);
         for i in 0..n {
             let q_i = core0.q0[i] + eta_w[i];
             let (m1, m2, m3) =
@@ -5761,92 +5693,57 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
             //
             // (tt):
             //   dH_tt = m3*dq*q_t^2 + m2*(2*dq_t*q_t + dq*q_tt) + m1*dq_tt.
-            let coeff_tt = directional_hessian_coeff_from_objective_q_terms(
+            let coeff_tt_i = directional_hessian_coeff_from_objective_q_terms(
                 m1, m2, m3, delta_q, q_t, q_t, q_tt, delta_q_t, delta_q_t, delta_q_tt,
             );
             // (tl):
             //   dH_tl = m3*dq*q_t*q_l
             //        + m2*(dq_t*q_l + q_t*dq_l + dq*q_tl)
             //        + m1*dq_tl.
-            let coeff_tl = directional_hessian_coeff_from_objective_q_terms(
+            let coeff_tl_i = directional_hessian_coeff_from_objective_q_terms(
                 m1, m2, m3, delta_q, q_t, q_ls, q_tl, delta_q_t, delta_q_ls, delta_q_tl,
             );
             // (ll):
             //   dH_ll = m3*dq*q_l^2 + m2*(2*dq_l*q_l + dq*q_ll) + m1*dq_ll.
-            let coeff_ll = directional_hessian_coeff_from_objective_q_terms(
+            let coeff_ll_i = directional_hessian_coeff_from_objective_q_terms(
                 m1, m2, m3, delta_q, q_ls, q_ls, q_ll, delta_q_ls, delta_q_ls, delta_q_ll,
             );
 
-            let xtr = x_t.row(i);
-            let xlsr = x_ls.row(i);
-            for a_idx in 0..pt {
-                for b_idx in a_idx..pt {
-                    d_h[[a_idx, b_idx]] += coeff_tt * xtr[a_idx] * xtr[b_idx];
-                }
-            }
-            for a_idx in 0..pt {
-                for b_idx in 0..pls {
-                    d_h[[a_idx, pt + b_idx]] += coeff_tl * xtr[a_idx] * xlsr[b_idx];
-                }
-            }
-            for a_idx in 0..pls {
-                for b_idx in a_idx..pls {
-                    d_h[[pt + a_idx, pt + b_idx]] += coeff_ll * xlsr[a_idx] * xlsr[b_idx];
-                }
-            }
-
-            for j in 0..pw {
-                let q_w = br[j];
-                let q_tw = dr[j] * q0.q_t;
-                let q_lw = dr[j] * q0.q_ls;
-                // Canonical mixed-block identities:
-                //   q_w      = B
-                //   q_tw     = q0_t * B'
-                //   q_lw     = q0_ls * B'
-                //   dq_w     = B' * dq0
-                //   dq_tw    = (dq0_t) B' + (dq0) q0_t B''
-                //   dq_lw    = (dq0_ls) B' + (dq0) q0_ls B''
-                let delta_q_w = dr[j] * dq0.delta_q;
-                let delta_q_tw = ddr[j] * dq0.delta_q * q0.q_t + dr[j] * dq0.delta_q_t;
-                let delta_q_lw = ddr[j] * dq0.delta_q * q0.q_ls + dr[j] * dq0.delta_q_ls;
-                // (tw):
-                //   dH_tw = m3*dq*q_t*q_w
-                //        + m2*(dq_t*q_w + q_t*dq_w + dq*q_tw)
-                //        + m1*dq_tw.
-                let coeff_tw = directional_hessian_coeff_from_objective_q_terms(
-                    m1, m2, m3, delta_q, q_t, q_w, q_tw, delta_q_t, delta_q_w, delta_q_tw,
-                );
-                // (lw):
-                //   dH_lw = m3*dq*q_l*q_w
-                //        + m2*(dq_l*q_w + q_l*dq_w + dq*q_lw)
-                //        + m1*dq_lw.
-                let coeff_lw = directional_hessian_coeff_from_objective_q_terms(
-                    m1, m2, m3, delta_q, q_ls, q_w, q_lw, delta_q_ls, delta_q_w, delta_q_lw,
-                );
-                for a_idx in 0..pt {
-                    d_h[[a_idx, pt + pls + j]] += coeff_tw * xtr[a_idx];
-                }
-                for a_idx in 0..pls {
-                    d_h[[pt + a_idx, pt + pls + j]] += coeff_lw * xlsr[a_idx];
-                }
-            }
-
-            for j in 0..pw {
-                let q_wj = br[j];
-                let delta_q_wj = dr[j] * dq0.delta_q;
-                for k in j..pw {
-                    let q_wk = br[k];
-                    let delta_q_wk = dr[k] * dq0.delta_q;
-                    // (ww):
-                    //   dH_ww = m3*dq*q_w*q_w + m2*(dq_w*q_w + q_w*dq_w)
-                    //        + m1*dq_ww, with q_ww=dq_ww=0.
-                    let coeff_ww = directional_hessian_coeff_from_objective_q_terms(
-                        m1, m2, m3, delta_q, q_wj, q_wk, 0.0, delta_q_wj, delta_q_wk, 0.0,
-                    );
-                    d_h[[pt + pls + j, pt + pls + k]] += coeff_ww;
-                }
-            }
+            coeff_tt[i] = coeff_tt_i;
+            coeff_tl[i] = coeff_tl_i;
+            coeff_ll[i] = coeff_ll_i;
+            coeff_tw_b[i] = m3 * delta_q * q_t + m2 * delta_q_t;
+            coeff_tw_d[i] = m2 * (q_t * dq0.delta_q + delta_q * q0.q_t) + m1 * dq0.delta_q_t;
+            coeff_tw_dd[i] = m1 * dq0.delta_q * q0.q_t;
+            coeff_lw_b[i] = m3 * delta_q * q_ls + m2 * delta_q_ls;
+            coeff_lw_d[i] = m2 * (q_ls * dq0.delta_q + delta_q * q0.q_ls) + m1 * dq0.delta_q_ls;
+            coeff_lw_dd[i] = m1 * dq0.delta_q * q0.q_ls;
+            coeff_ww_bb[i] = m3 * delta_q;
+            coeff_ww_db[i] = m2 * dq0.delta_q;
         }
+        let d_h_tt = xt_diag_x_dense(&x_t, &coeff_tt)?;
+        let d_h_tl = xt_diag_y_dense(&x_t, &coeff_tl, &x_ls)?;
+        let d_h_ll = xt_diag_x_dense(&x_ls, &coeff_ll)?;
+        let d_h_tw = xt_diag_y_dense(&x_t, &coeff_tw_b, &b0)?
+            + &xt_diag_y_dense(&x_t, &coeff_tw_d, &d0)?
+            + &xt_diag_y_dense(&x_t, &coeff_tw_dd, &dd0)?;
+        let d_h_lw = xt_diag_y_dense(&x_ls, &coeff_lw_b, &b0)?
+            + &xt_diag_y_dense(&x_ls, &coeff_lw_d, &d0)?
+            + &xt_diag_y_dense(&x_ls, &coeff_lw_dd, &dd0)?;
+        let mut d_h_ww = xt_diag_x_dense(&b0, &coeff_ww_bb)?;
+        d_h_ww += &xt_diag_y_dense(&d0, &coeff_ww_db, &b0)?;
+        d_h_ww += &xt_diag_y_dense(&b0, &coeff_ww_db, &d0)?;
+
+        let mut d_h = Array2::<f64>::zeros((total, total));
+        d_h.slice_mut(s![0..pt, 0..pt]).assign(&d_h_tt);
+        d_h.slice_mut(s![0..pt, pt..pt + pls]).assign(&d_h_tl);
+        d_h.slice_mut(s![pt..pt + pls, pt..pt + pls])
+            .assign(&d_h_ll);
+        d_h.slice_mut(s![0..pt, pt + pls..total]).assign(&d_h_tw);
+        d_h.slice_mut(s![pt..pt + pls, pt + pls..total])
+            .assign(&d_h_lw);
+        d_h.slice_mut(s![pt + pls..total, pt + pls..total])
+            .assign(&d_h_ww);
         mirror_upper_to_lower(&mut d_h);
         Ok(Some(d_h))
     }
@@ -7330,11 +7227,9 @@ mod tests {
             .slice(ndarray::s![pt..pt + pls, pt + pls..pt + pls + pw])
             .to_owned();
 
-        for i in 0..h_t_ls.nrows() {
-            crate::testing::assert_matrix_derivative_fd(&fd_t_ls, &h_t_ls, 2e-4, "H_t_ls");
-            crate::testing::assert_matrix_derivative_fd(&fd_t_w, &h_t_w, 4e-4, "H_t_w");
-            crate::testing::assert_matrix_derivative_fd(&fd_ls_w, &h_ls_w, 6e-4, "H_ls_w");
-        }
+        crate::testing::assert_matrix_derivative_fd(&fd_t_ls, &h_t_ls, 2e-4, "H_t_ls");
+        crate::testing::assert_matrix_derivative_fd(&fd_t_w, &h_t_w, 4e-4, "H_t_w");
+        crate::testing::assert_matrix_derivative_fd(&fd_ls_w, &h_ls_w, 6e-4, "H_ls_w");
     }
 
     #[test]

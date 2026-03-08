@@ -1,5 +1,6 @@
 use crate::custom_family::{BlockwiseFitResult, CustomFamily, ParameterBlockState};
 use crate::estimate::{EstimationError, PredictResult, predict_gam};
+use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::DesignMatrix;
 use crate::types::LikelihoodFamily;
 use ndarray::{Array1, Array2, ArrayView1};
@@ -50,33 +51,12 @@ pub fn generative_spec_from_predict(
     family: LikelihoodFamily,
     gaussian_scale: Option<f64>,
 ) -> Result<GenerativeSpec, EstimationError> {
-    match family {
-        LikelihoodFamily::GaussianIdentity => {
-            // Saved/prediction Gaussian scale is the observation standard
-            // deviation sigma, so generative sampling can use it directly.
-            let sigma = gaussian_scale
-                .unwrap_or(1.0)
-                .max(0.0);
-            Ok(GenerativeSpec {
-                mean: prediction.mean,
-                noise: NoiseModel::Gaussian {
-                    sigma: Array1::from_elem(prediction.eta.len(), sigma),
-                },
-            })
-        }
-        LikelihoodFamily::BinomialLogit
-        | LikelihoodFamily::BinomialProbit
-        | LikelihoodFamily::BinomialCLogLog
-        | LikelihoodFamily::BinomialSas
-        | LikelihoodFamily::BinomialBetaLogistic
-        | LikelihoodFamily::BinomialMixture => Ok(GenerativeSpec {
-            mean: prediction.mean,
-            noise: NoiseModel::Bernoulli,
-        }),
-        LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-            "RoystonParmar generative sampling is not exposed via this generic API; use survival-specific simulation APIs".to_string(),
-        )),
-    }
+    let strategy = strategy_for_family(family, None);
+    let noise = strategy.simulate_noise(&prediction.mean, gaussian_scale)?;
+    Ok(GenerativeSpec {
+        mean: prediction.mean,
+        noise,
+    })
 }
 
 /// Convenience builder: from design + coefficients directly.

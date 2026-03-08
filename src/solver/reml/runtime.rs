@@ -1096,7 +1096,7 @@ impl<'a> RemlState<'a> {
                 coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
                 linear_constraints_original: self.linear_constraints.as_ref(),
             };
-            pirls::fit_model_for_fixed_rho_matrix(
+            pirls::fit_model_for_fixed_rho(
                 LogSmoothingParamsView::new(rho.view()),
                 problem,
                 penalty,

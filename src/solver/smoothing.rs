@@ -1287,7 +1287,6 @@ mod tests {
             Ok(-x[0])
         };
         let mut reset = |_objective: &mut _| {};
-        let mut eval_cost = |objective: &mut _, x: &Array1<f64>| objective(x);
         let grad = finite_diff_gradient_external(
             &rho,
             1e-3,
@@ -1295,7 +1294,7 @@ mod tests {
             &upper,
             &mut objective,
             &mut reset,
-            &mut eval_cost,
+            &mut |objective: &mut _, x: &Array1<f64>| objective(x),
             -RHO_BOUND,
         )
         .expect("bound-aware finite differences should stay feasible");

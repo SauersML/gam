@@ -1,6 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
-use crate::linalg::utils::StableSolver;
+use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_xt_diag_x};
 use crate::pirls::{LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState};
 use crate::types::{Coefficients, LinearPredictor};
 use faer::Side;
@@ -133,6 +132,18 @@ impl PenaltyBlocks {
             }
         }
     }
+}
+
+fn scale_matrix_columns(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
+    debug_assert_eq!(x.ncols(), scale.len(), "column scaling dimension mismatch");
+    let mut scaled = x.clone();
+    for (j, factor) in scale.iter().copied().enumerate() {
+        if factor == 1.0 {
+            continue;
+        }
+        scaled.column_mut(j).mapv_inplace(|v| v * factor);
+    }
+    scaled
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -405,22 +416,22 @@ impl WorkingModelSurvival {
             ));
         }
 
+        let x_entry_jac = scale_matrix_columns(&self.x_entry, &jac);
+        let x_exit_jac = scale_matrix_columns(&self.x_exit, &jac);
+        let x_derivative_jac = scale_matrix_columns(&self.x_derivative, &jac);
+
         let mut nll = 0.0;
-        let mut grad = Array1::<f64>::zeros(p);
-        let mut h = Array2::<f64>::zeros((p, p));
+        let mut w_exit_interval = Array1::<f64>::zeros(n);
+        let mut w_entry_interval = Array1::<f64>::zeros(n);
+        let mut w_event = Array1::<f64>::zeros(n);
+        let mut w_event_inv_deriv = Array1::<f64>::zeros(n);
+        let mut w_event_outer = Array1::<f64>::zeros(n);
 
         let derivative_guard = self.monotonicity.tolerance.max(1e-12);
         // Match strict monotonicity intent while tolerating tiny solver/BLAS roundoff
         // near the active boundary.
         let derivative_guard_numerical =
             (derivative_guard - (1e-10_f64).min(0.01 * derivative_guard)).max(1e-12);
-        // Reuse per-row work buffers to avoid hot-loop heap allocations.
-        let mut g_eta_exit = vec![0.0_f64; p];
-        let mut g_eta_entry = vec![0.0_f64; p];
-        let mut h_eta_exit_diag = vec![0.0_f64; p];
-        let mut h_eta_entry_diag = vec![0.0_f64; p];
-        let mut g_s = vec![0.0_f64; p];
-        let mut h_s_diag = vec![0.0_f64; p];
         for i in 0..n {
             let w = self.sample_weight[i];
             if w <= 0.0 {
@@ -439,50 +450,11 @@ impl WorkingModelSurvival {
             let has_entry_interval = !self.entry_at_origin[i];
             let h_s = if has_entry_interval { h_entry[i] } else { 0.0 };
             let h_e = h_exit[i];
+            w_exit_interval[i] = w * h_e;
+            if has_entry_interval {
+                w_entry_interval[i] = w * h_s;
+            }
             nll += w * (h_e - h_s);
-
-            let x_s = self.x_entry.row(i);
-            let x_e = self.x_exit.row(i);
-            let d_row = self.x_derivative.row(i);
-
-            // Interval contribution to NLL:
-            //   exp(eta_exit) - exp(eta_entry)
-            // Gradient piece:
-            //   exp(eta_exit) * d_eta_exit/d_beta - exp(eta_entry) * d_eta_entry/d_beta
-            for j in 0..p {
-                g_eta_exit[j] = x_e[j] * jac[j];
-                g_eta_entry[j] = x_s[j] * jac[j];
-                h_eta_exit_diag[j] = x_e[j] * curvature[j];
-                h_eta_entry_diag[j] = x_s[j] * curvature[j];
-
-                let mut g_j = h_e * g_eta_exit[j];
-                if has_entry_interval {
-                    g_j -= h_s * g_eta_entry[j];
-                }
-                grad[j] += w * g_j;
-            }
-
-            // Hessian piece from interval contribution:
-            // For f(beta)=exp(eta(beta)):
-            //   Hess[f] = f * (grad_eta grad_eta^T + Hess_eta)
-            // where Hess_eta is diagonal in this parameterization.
-            for r in 0..p {
-                let ge_r = g_eta_exit[r];
-                let gs_r = g_eta_entry[r];
-                for c in 0..p {
-                    let mut h_rc = h_e * ge_r * g_eta_exit[c];
-                    if r == c {
-                        h_rc += h_e * h_eta_exit_diag[r];
-                    }
-                    if has_entry_interval {
-                        h_rc -= h_s * gs_r * g_eta_entry[c];
-                        if r == c {
-                            h_rc -= h_s * h_eta_entry_diag[r];
-                        }
-                    }
-                    h[[r, c]] += w * h_rc;
-                }
-            }
 
             if d > 0.0 {
                 let deriv = derivative_raw[i];
@@ -494,34 +466,28 @@ impl WorkingModelSurvival {
                 }
                 let inv_deriv = 1.0 / deriv;
                 nll += -w * (eta_exit[i] + deriv.ln());
-
-                // Event contribution:
-                //   - (eta_exit + log(s_i)), with s_i = d_i^T beta = derivative_raw[i].
-                //
-                // Gradient piece:
-                //   -d_eta_exit/d_beta - (d_s/d_beta) / s_i
-                for j in 0..p {
-                    g_s[j] = d_row[j] * jac[j];
-                    h_s_diag[j] = d_row[j] * curvature[j];
-                    grad[j] += -w * (g_eta_exit[j] + inv_deriv * g_s[j]);
-                }
-
-                // Exact Hessian from:
-                //   -eta_exit(beta) - log(s_i(beta)).
-                // -eta_exit contributes -Hess(eta_exit), diagonal in this map.
-                // -log(s) contributes (grad_s grad_s^T)/s^2 - Hess(s)/s.
-                let log_s_second = inv_deriv * inv_deriv;
-                for r in 0..p {
-                    for c in 0..p {
-                        let mut h_rc = w * log_s_second * g_s[r] * g_s[c];
-                        if r == c {
-                            h_rc += -w * h_eta_exit_diag[r];
-                            h_rc += -w * inv_deriv * h_s_diag[r];
-                        }
-                        h[[r, c]] += h_rc;
-                    }
-                }
+                w_event[i] = w;
+                w_event_inv_deriv[i] = w * inv_deriv;
+                w_event_outer[i] = w * inv_deriv * inv_deriv;
             }
+        }
+
+        let mut grad = fast_atv(&x_exit_jac, &w_exit_interval);
+        grad -= &fast_atv(&x_entry_jac, &w_entry_interval);
+        grad -= &fast_atv(&x_exit_jac, &w_event);
+        grad -= &fast_atv(&x_derivative_jac, &w_event_inv_deriv);
+
+        let mut h = fast_xt_diag_x(&x_exit_jac, &w_exit_interval);
+        h -= &fast_xt_diag_x(&x_entry_jac, &w_entry_interval);
+        h += &fast_xt_diag_x(&x_derivative_jac, &w_event_outer);
+
+        let diag_correction = &curvature
+            * &(&fast_atv(&self.x_exit, &w_exit_interval)
+                - &fast_atv(&self.x_entry, &w_entry_interval)
+                - &fast_atv(&self.x_exit, &w_event)
+                - &fast_atv(&self.x_derivative, &w_event_inv_deriv));
+        for j in 0..p {
+            h[[j, j]] += diag_correction[j];
         }
 
         let penalty_grad = self.penalties.gradient(beta);
@@ -547,7 +513,7 @@ impl WorkingModelSurvival {
         Ok(WorkingState {
             eta: LinearPredictor::new(eta_exit),
             gradient: total_grad,
-            hessian: h,
+            hessian: crate::linalg::matrix::SymmetricMatrix::Dense(h),
             sparse_hessian: None,
             deviance,
             penalty_term: penalty_dev + ridge_penalty,
@@ -569,12 +535,12 @@ impl WorkingModelSurvival {
         }
 
         // Robust logdet for H: Cholesky on SPD path, eigen fallback otherwise.
-        let logdet_h = if let Ok(chol) = state.hessian.clone().cholesky(Side::Lower) {
+        let h_dense = state.hessian.to_dense();
+        let logdet_h = if let Ok(chol) = h_dense.clone().cholesky(Side::Lower) {
             let l = chol.lower_triangular();
             2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>()
         } else {
-            let (eval, _) = state
-                .hessian
+            let (eval, _) = h_dense
                 .eigh(Side::Lower)
                 .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
             let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
@@ -674,14 +640,15 @@ impl WorkingModelSurvival {
         // Reuse one symmetric factorization for all H^{-1} applications.
         // This is the core speed-up: exact contractions via solves, no dense
         // inverse assembly.
-        let factor = StableSolver::new("survival hessian")
-            .factorize(&state.hessian)
-            .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+        let factor = state
+            .hessian
+            .factorize()
+            .map_err(EstimationError::InvalidInput)?;
 
         let solve_mat = |rhs: &Array2<f64>| -> Array2<f64> {
-            let rhs_view = FaerArrayView::new(rhs);
-            let solved = factor.solve(rhs_view.as_ref());
-            Array2::from_shape_fn((solved.nrows(), solved.ncols()), |(i, j)| solved[(i, j)])
+            factor
+                .solve_multi(rhs)
+                .expect("survival Hessian solve should succeed")
         };
         let solve_vec = |rhs: &Array1<f64>| -> Array1<f64> {
             let rhs_mat = rhs.clone().insert_axis(Axis(1));
@@ -1640,12 +1607,12 @@ mod tests {
             .laml_objective_and_rho_gradient(&beta, &state)
             .expect("laml objective for no-penalty model");
 
-        let logdet_h = if let Ok(chol) = state.hessian.clone().cholesky(Side::Lower) {
+        let h_dense = state.hessian.to_dense();
+        let logdet_h = if let Ok(chol) = h_dense.clone().cholesky(Side::Lower) {
             let l = chol.lower_triangular();
             2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>()
         } else {
-            let (eval, _) = state
-                .hessian
+            let (eval, _) = h_dense
                 .eigh(Side::Lower)
                 .expect("eigh fallback for hessian logdet");
             let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));

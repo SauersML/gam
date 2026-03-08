@@ -2,7 +2,7 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
     ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
-use crate::faer_ndarray::FaerSvd;
+use crate::faer_ndarray::{FaerSvd, fast_xt_diag_x};
 use crate::families::sigma_link::{
     bounded_sigma_derivs_up_to_third, bounded_sigma_derivs_up_to_third_scalar,
 };
@@ -274,6 +274,31 @@ struct SurvivalLocationScaleProbitFamily {
     x_link_wiggle: Option<Array2<f64>>,
 }
 
+#[derive(Clone, Copy)]
+struct SurvivalPredictorState {
+    h0: f64,
+    h1: f64,
+    d_raw: f64,
+    q: f64,
+}
+
+#[derive(Clone, Copy)]
+struct SurvivalRowDerivatives {
+    ll: f64,
+    d1_q: f64,
+    d2_q: f64,
+    d3_q: f64,
+    grad_time_eta_h0: f64,
+    grad_time_eta_h1: f64,
+    grad_time_eta_d: f64,
+    h_time_h0: f64,
+    h_time_h1: f64,
+    h_time_d: f64,
+    d_h_h0: f64,
+    d_h_h1: f64,
+    d_h_d: f64,
+}
+
 impl SurvivalLocationScaleProbitFamily {
     const BLOCK_TIME: usize = 0;
     const BLOCK_THRESHOLD: usize = 1;
@@ -385,6 +410,88 @@ impl SurvivalLocationScaleProbitFamily {
             let ddr = Self::survival_ratio_second_derivative(r, dr, f, fp, fpp, s);
             (s, r, dr, ddr)
         }
+    }
+
+    fn row_predictor_state(
+        &self,
+        h0: f64,
+        h1: f64,
+        d_raw: f64,
+        eta_t: f64,
+        sigma: f64,
+        eta_w: Option<f64>,
+    ) -> SurvivalPredictorState {
+        let base = -eta_t / sigma.max(1e-12);
+        SurvivalPredictorState {
+            h0,
+            h1,
+            d_raw,
+            q: base + eta_w.unwrap_or(0.0),
+        }
+    }
+
+    fn row_derivatives(
+        &self,
+        row: usize,
+        state: SurvivalPredictorState,
+    ) -> Result<Option<SurvivalRowDerivatives>, String> {
+        let w = self.w[row];
+        if w <= 0.0 {
+            return Ok(None);
+        }
+        let d = self.y[row].clamp(0.0, 1.0);
+        let u0 = -state.h0 + state.q;
+        let u1 = -state.h1 + state.q;
+        let j0 = inverse_link_jet_for_inverse_link(&self.inverse_link, u0)
+            .map_err(|e| format!("inverse link evaluation failed at row {row} entry: {e}"))?;
+        let j1 = inverse_link_jet_for_inverse_link(&self.inverse_link, u1)
+            .map_err(|e| format!("inverse link evaluation failed at row {row} exit: {e}"))?;
+        let (s0, r0, dr0, ddr0) =
+            Self::clamped_survival_neglog_derivatives(1.0 - j0.mu, j0.d1, j0.d2, j0.d3);
+        let (s1, r1, dr1, ddr1) =
+            Self::clamped_survival_neglog_derivatives(1.0 - j1.mu, j1.d1, j1.d2, j1.d3);
+        let fppp1 = inverse_link_pdf_third_derivative_for_inverse_link(&self.inverse_link, u1)
+            .map_err(|e| {
+                format!("inverse link third-derivative evaluation failed at row {row} exit: {e}")
+            })?;
+        let (log_phi1, dlogphi1, d2logphi1, d3logphi1) =
+            Self::clamped_log_pdf_with_derivatives(j1.d1, j1.d2, j1.d3, fppp1);
+
+        let guard = self.derivative_guard;
+        let soft = self.derivative_softness.max(0.0);
+        let g = state.d_raw;
+        let g_safe = (g + soft).max(1e-12);
+        if !g.is_finite() {
+            return Err(format!(
+                "survival probit-location-scale non-finite d_eta/dt at row {row}: {g}"
+            ));
+        }
+        if guard > 0.0 && g <= guard {
+            return Err(format!(
+                "survival probit-location-scale monotonicity violated at row {row}: d_eta/dt={g:.3e} <= guard={:.3e}",
+                guard
+            ));
+        }
+
+        let d1_q = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));
+        let d2_q = w * (dr0 + d * d2logphi1 + (1.0 - d) * (-dr1));
+        let d3_q = w * (ddr0 + d * d3logphi1 + (1.0 - d) * (-ddr1));
+
+        Ok(Some(SurvivalRowDerivatives {
+            ll: w * (d * (log_phi1 + g_safe.ln()) + (1.0 - d) * s1.ln() - s0.ln()),
+            d1_q,
+            d2_q,
+            d3_q,
+            grad_time_eta_h0: -w * r0,
+            grad_time_eta_h1: -w * (d * dlogphi1 + (1.0 - d) * (-r1)),
+            grad_time_eta_d: w * d / g_safe,
+            h_time_h0: -w * dr0,
+            h_time_h1: -w * (d * d2logphi1 + (1.0 - d) * (-dr1)),
+            h_time_d: w * d / (g_safe * g_safe),
+            d_h_h0: w * ddr0,
+            d_h_h1: w * d * d3logphi1 - w * (1.0 - d) * ddr1,
+            d_h_d: -2.0 * w * d / (g_safe * g_safe * g_safe),
+        }))
     }
 }
 
@@ -664,22 +771,6 @@ fn dense_design(design: &DesignMatrix, name: &str) -> Result<Array2<f64>, String
     }
 }
 
-fn xt_diag_x(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
-    let n = x.nrows();
-    let p = x.ncols();
-    let mut x_weighted = Array2::<f64>::zeros((n, p));
-    for i in 0..n {
-        let wi = w[i];
-        if wi == 0.0 {
-            continue;
-        }
-        for j in 0..p {
-            x_weighted[[i, j]] = x[[i, j]] * wi;
-        }
-    }
-    crate::faer_ndarray::fast_atb(x, &x_weighted)
-}
-
 impl CustomFamily for SurvivalLocationScaleProbitFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != self.expected_blocks() {
@@ -732,114 +823,42 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
         let mut d2_q = Array1::<f64>::zeros(n);
 
         for i in 0..n {
-            let w = self.w[i];
-            if w <= 0.0 {
+            let state = self.row_predictor_state(
+                h0[i],
+                h1[i],
+                d_raw[i],
+                eta_t[i],
+                sigma[i],
+                eta_w.map(|w| w[i]),
+            );
+            let Some(row) = self.row_derivatives(i, state)? else {
                 continue;
-            }
-            let d = self.y[i].clamp(0.0, 1.0);
-            let u0 = -h0[i] + q[i];
-            let u1 = -h1[i] + q[i];
-            let j0 = inverse_link_jet_for_inverse_link(&self.inverse_link, u0)
-                .map_err(|e| format!("inverse link evaluation failed at row {i} entry: {e}"))?;
-            let j1 = inverse_link_jet_for_inverse_link(&self.inverse_link, u1)
-                .map_err(|e| format!("inverse link evaluation failed at row {i} exit: {e}"))?;
-            let f0 = j0.d1;
-            let f1 = j1.d1;
-            let fp0 = j0.d2;
-            let fp1 = j1.d2;
-            let fpp0 = j0.d3;
-            let fpp1 = j1.d3;
-            let raw_s0 = 1.0 - j0.mu;
-            let raw_s1 = 1.0 - j1.mu;
-            let (s0, r0, dr0, _ddr0) =
-                Self::clamped_survival_neglog_derivatives(raw_s0, f0, fp0, fpp0);
-            let (s1, r1, dr1, _ddr1) =
-                Self::clamped_survival_neglog_derivatives(raw_s1, f1, fp1, fpp1);
-            let fppp1 = inverse_link_pdf_third_derivative_for_inverse_link(&self.inverse_link, u1)
-                .map_err(|e| {
-                    format!("inverse link third-derivative evaluation failed at row {i} exit: {e}")
-                })?;
-            let (log_phi1, dlogphi1, d2logphi1, _d3logphi1) =
-                Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1, fppp1);
-            let g = d_raw[i];
-            let guard = self.derivative_guard;
-            let soft = self.derivative_softness.max(0.0);
-            let g_safe = (g + soft).max(1e-12);
-            if !g.is_finite() {
-                return Err(format!(
-                    "survival probit-location-scale non-finite d_eta/dt at row {i}: {g}"
-                ));
-            }
-            if guard > 0.0 && g <= guard {
-                return Err(format!(
-                    "survival probit-location-scale monotonicity violated at row {i}: d_eta/dt={g:.3e} <= guard={:.3e}",
-                    guard
-                ));
-            }
-
-            ll += w * (d * (log_phi1 + g_safe.ln()) + (1.0 - d) * s1.ln() - s0.ln());
-
-            // Row likelihood:
-            //
-            //   ℓ_i(q) = w_i [ d_i (log f(u1) + log g_safe)
-            //                + (1-d_i) log S(u1)
-            //                - log S(u0) ],
-            //
-            // where
-            //   u0 = -h0 + q,   u1 = -h1 + q,
-            //   f = F',         S = 1 - F.
-            //
-            // Define
-            //   r(u) = d/du[-log S(u)] = f/S,
-            // so
-            //   d/du[log S(u)] = -r(u),
-            //   d²/du²[log S(u)] = -r'(u),
-            //   d³/du³[log S(u)] = -r''(u).
-            //
-            // Since `du0/dq = du1/dq = +1`, derivatives wrt `q` are just the
-            // corresponding derivatives wrt `u0` / `u1` composed with the signs
-            // already present in the objective:
-            //
-            //   dℓ_i/dq
-            //   = w_i [ r(u0) + d_i d/du log f(u1) - (1-d_i) r(u1) ]
-            //
-            //   d²ℓ_i/dq²
-            //   = w_i [ r'(u0) + d_i d²/du² log f(u1) - (1-d_i) r'(u1) ]
-            //
-            //   d³ℓ_i/dq³
-            //   = w_i [ r''(u0) + d_i d³/du³ log f(u1) - (1-d_i) r''(u1) ].
-            //
-            // These predictor-space derivatives are shared by the threshold,
-            // log-sigma, and wiggle blocks through the chain rule for `q`.
-            d1_q[i] = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));
-            d2_q[i] = w * (dr0 + d * d2logphi1 + (1.0 - d) * (-dr1));
-
-            // time block eta-derivatives
-            // BlockWorkingSet::ExactNewton stores H = -∂²ℓ/∂β² (PSD near optimum),
-            // which is why the row-wise second-derivative terms carry a leading minus.
-            grad_time_eta_h0[i] = -w * r0;
-            grad_time_eta_h1[i] = -w * (d * dlogphi1 + (1.0 - d) * (-r1));
-            grad_time_eta_d[i] = w * d / g_safe;
-
-            h_time_h0[i] = -w * dr0;
-            h_time_h1[i] = -w * (d * d2logphi1 + (1.0 - d) * (-dr1));
-            h_time_d[i] = w * d / (g_safe * g_safe);
+            };
+            ll += row.ll;
+            d1_q[i] = row.d1_q;
+            d2_q[i] = row.d2_q;
+            grad_time_eta_h0[i] = row.grad_time_eta_h0;
+            grad_time_eta_h1[i] = row.grad_time_eta_h1;
+            grad_time_eta_d[i] = row.grad_time_eta_d;
+            h_time_h0[i] = row.h_time_h0;
+            h_time_h1[i] = row.h_time_h1;
+            h_time_d[i] = row.h_time_d;
         }
 
         // Block 0: exact beta-space gradient/Hessian
         let grad_time = self.x_time_entry.t().dot(&grad_time_eta_h0)
             + self.x_time_exit.t().dot(&grad_time_eta_h1)
             + self.x_time_deriv.t().dot(&grad_time_eta_d);
-        let hess_time = xt_diag_x(&self.x_time_entry, &h_time_h0)
-            + xt_diag_x(&self.x_time_exit, &h_time_h1)
-            + xt_diag_x(&self.x_time_deriv, &h_time_d);
+        let hess_time = fast_xt_diag_x(&self.x_time_entry, &h_time_h0)
+            + fast_xt_diag_x(&self.x_time_exit, &h_time_h1)
+            + fast_xt_diag_x(&self.x_time_deriv, &h_time_d);
 
         // Block 1: threshold eta_t enters q linearly with dq/deta_t = -1/sigma.
         let dq_t = sigma.mapv(|s| -1.0 / s.max(1e-12));
         let grad_eta_t = &d1_q * &dq_t;
         let h_eta_t = -(&d2_q * &dq_t.mapv(|v| v * v));
         let grad_t = self.x_threshold.t().dot(&grad_eta_t);
-        let hess_t = xt_diag_x(&self.x_threshold, &h_eta_t);
+        let hess_t = fast_xt_diag_x(&self.x_threshold, &h_eta_t);
 
         // Block 2: eta_ls enters q via bounded sigma map.
         let dq_ls = Array1::from_iter(
@@ -862,7 +881,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
         let grad_eta_ls = &d1_q * &dq_ls;
         let h_eta_ls = -(&d2_q * &dq_ls.mapv(|v| v * v) + &(&d1_q * &d2q_ls));
         let grad_ls = self.x_log_sigma.t().dot(&grad_eta_ls);
-        let hess_ls = xt_diag_x(&self.x_log_sigma, &h_eta_ls);
+        let hess_ls = fast_xt_diag_x(&self.x_log_sigma, &h_eta_ls);
 
         let mut block_working_sets = vec![
             BlockWorkingSet::ExactNewton {
@@ -880,7 +899,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
         ];
         if let Some(x_w) = self.x_link_wiggle.as_ref() {
             let grad_w = x_w.t().dot(&d1_q);
-            let hess_w = xt_diag_x(x_w, &(-&d2_q));
+            let hess_w = fast_xt_diag_x(x_w, &(-&d2_q));
             block_working_sets.push(BlockWorkingSet::ExactNewton {
                 gradient: grad_w,
                 hessian: hess_w,
@@ -944,83 +963,23 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
         let mut d_h_d = Array1::<f64>::zeros(n);
 
         for i in 0..n {
-            let w = self.w[i];
-            if w <= 0.0 {
+            let state = self.row_predictor_state(
+                h0[i],
+                h1[i],
+                d_raw[i],
+                eta_t[i],
+                sigma[i],
+                eta_w.map(|w| w[i]),
+            );
+            let Some(row) = self.row_derivatives(i, state)? else {
                 continue;
-            }
-            let d = self.y[i].clamp(0.0, 1.0);
-            let u0 = -h0[i] + q[i];
-            let u1 = -h1[i] + q[i];
-            let j0 = inverse_link_jet_for_inverse_link(&self.inverse_link, u0)
-                .map_err(|e| format!("inverse link evaluation failed at row {i} entry: {e}"))?;
-            let j1 = inverse_link_jet_for_inverse_link(&self.inverse_link, u1)
-                .map_err(|e| format!("inverse link evaluation failed at row {i} exit: {e}"))?;
-            let f0 = j0.d1;
-            let f1 = j1.d1;
-            let fp0 = j0.d2;
-            let fp1 = j1.d2;
-            let fpp0 = j0.d3;
-            let fpp1 = j1.d3;
-            let raw_s0 = 1.0 - j0.mu;
-            let raw_s1 = 1.0 - j1.mu;
-            let (_s0, r0, dr0, ddr0) =
-                Self::clamped_survival_neglog_derivatives(raw_s0, f0, fp0, fpp0);
-            let (_s1, r1, dr1, ddr1) =
-                Self::clamped_survival_neglog_derivatives(raw_s1, f1, fp1, fpp1);
-            let fppp1 = inverse_link_pdf_third_derivative_for_inverse_link(&self.inverse_link, u1)
-                .map_err(|e| {
-                    format!("inverse link third-derivative evaluation failed at row {i} exit: {e}")
-                })?;
-            let (_log_phi1, dlogphi1, d2logphi1, d3logphi1) =
-                Self::clamped_log_pdf_with_derivatives(f1, fp1, fpp1, fppp1);
-
-            // Same rowwise `q` calculus as in `evaluate()`, now keeping the full
-            // third derivative because exact-Newton `D H[u]` differentiates the
-            // block Hessian, and the block Hessian itself already contains the
-            // second `q`-derivative.
-            //
-            // Symbolically:
-            //
-            //   H_eta(q) = - d²ℓ_i / d eta²
-            //
-            // for each block-specific predictor. Differentiating `H_eta` along a
-            // coefficient direction introduces `d³ℓ_i/dq³`, so the event-side
-            // `d³(log f)/du³` contribution is not optional; it is the unique term
-            // coming from differentiating the event log-density curvature.
-            d1_q[i] = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));
-            d2_q[i] = w * (dr0 + d * d2logphi1 + (1.0 - d) * (-dr1));
-            // Third derivative of the q-profile:
-            //
-            //   d³ℓ_i/dq³
-            //   = w_i [ r''(u0) + d_i d³/du³ log f(u1) - (1-d_i) r''(u1) ].
-            //
-            // The previous bug was exactly that the middle term was omitted.
-            d3_q[i] = w * (ddr0 + d * d3logphi1 + (1.0 - d) * (-ddr1));
-
-            // Time block contributions use u0/u1 direct dependence.
-            // Chain rule map:
-            //   du0/dh0 = -1, du1/dh1 = -1.
-            // Then BlockWorkingSet::ExactNewton uses H = -∂²ℓ/∂β², so one more
-            // leading minus appears when assembling per-row second derivatives.
-            // The derivative row uses log(d_safe) only for events.
-            d_h_h0[i] = w * ddr0;
-            d_h_h1[i] = -w * (1.0 - d) * ddr1;
-            let g = d_raw[i];
-            let guard = self.derivative_guard;
-            let soft = self.derivative_softness.max(0.0);
-            let g_safe = (g + soft).max(1e-12);
-            if !g.is_finite() {
-                return Err(format!(
-                    "survival probit-location-scale non-finite d_eta/dt in Hessian directional derivative at row {i}: {g}"
-                ));
-            }
-            if guard > 0.0 && g <= guard {
-                return Err(format!(
-                    "survival probit-location-scale monotonicity violated in Hessian directional derivative at row {i}: d_eta/dt={g:.3e} <= guard={:.3e}",
-                    guard
-                ));
-            }
-            d_h_d[i] = -2.0 * w * d / (g_safe * g_safe * g_safe);
+            };
+            d1_q[i] = row.d1_q;
+            d2_q[i] = row.d2_q;
+            d3_q[i] = row.d3_q;
+            d_h_h0[i] = row.d_h_h0;
+            d_h_h1[i] = row.d_h_h1;
+            d_h_d[i] = row.d_h_d;
         }
 
         match block_idx {
@@ -1038,9 +997,9 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                 let w0 = &d_h_h0 * &d_eta_h0;
                 let w1 = &d_h_h1 * &d_eta_h1;
                 let wd = &d_h_d * &d_eta_d;
-                let d_h = xt_diag_x(&self.x_time_entry, &w0)
-                    + xt_diag_x(&self.x_time_exit, &w1)
-                    + xt_diag_x(&self.x_time_deriv, &wd);
+                let d_h = fast_xt_diag_x(&self.x_time_entry, &w0)
+                    + fast_xt_diag_x(&self.x_time_exit, &w1)
+                    + fast_xt_diag_x(&self.x_time_deriv, &wd);
                 Ok(Some(d_h))
             }
             Self::BLOCK_THRESHOLD => {
@@ -1056,7 +1015,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                 // Since q(eta_t) is linear in eta_t, only dq_t is nonzero:
                 // H = -d²ℓ/deta², so dH[u] picks up the leading minus too.
                 let d_h_eta = -(&d3_q * &dq_t.mapv(|v| v * v * v) * &d_eta_t);
-                let d_h = xt_diag_x(&self.x_threshold, &d_h_eta);
+                let d_h = fast_xt_diag_x(&self.x_threshold, &d_h_eta);
                 Ok(Some(d_h))
             }
             Self::BLOCK_LOG_SIGMA => {
@@ -1104,7 +1063,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                     + &(&d1_q * &d3q))
                     * &d_eta_ls;
                 let d_h_eta = -d_h_eta;
-                let d_h = xt_diag_x(&self.x_log_sigma, &d_h_eta);
+                let d_h = fast_xt_diag_x(&self.x_log_sigma, &d_h_eta);
                 Ok(Some(d_h))
             }
             Self::BLOCK_LINK_WIGGLE => {
@@ -1121,7 +1080,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                 }
                 let d_eta_w = x_w.dot(d_beta);
                 let d_h_eta = -(&d3_q * &d_eta_w);
-                let d_h = xt_diag_x(x_w, &d_h_eta);
+                let d_h = fast_xt_diag_x(x_w, &d_h_eta);
                 Ok(Some(d_h))
             }
             _ => Ok(None),
@@ -1911,6 +1870,7 @@ fn cov_tl_row(i: usize, x_log_sigma_dense: &Array2<f64>, xt_tl: &Array2<f64>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_family::evaluate_custom_family_joint_hyper;
     use crate::mixture_link::{
         state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
     };
@@ -1937,6 +1897,15 @@ mod tests {
         }
     }
 
+    fn survival_exact_newton_test_family_with_inverse_link(
+        inverse_link: InverseLink,
+    ) -> SurvivalLocationScaleProbitFamily {
+        SurvivalLocationScaleProbitFamily {
+            inverse_link,
+            ..survival_exact_newton_test_family()
+        }
+    }
+
     fn survival_exact_newton_test_states(beta_t: f64) -> Vec<ParameterBlockState> {
         vec![
             ParameterBlockState {
@@ -1951,6 +1920,117 @@ mod tests {
                 beta: array![-0.15],
                 eta: array![-0.15, 0.045, -0.075],
             },
+        ]
+    }
+
+    fn survival_exact_newton_rebuild_states(
+        beta_time: &Array1<f64>,
+        beta_threshold: &Array1<f64>,
+        beta_log_sigma: &Array1<f64>,
+    ) -> Vec<ParameterBlockState> {
+        vec![
+            ParameterBlockState {
+                beta: beta_time.clone(),
+                eta: array![
+                    beta_time[0],
+                    beta_time[0],
+                    beta_time[0],
+                    1.2 * beta_time[0],
+                    0.9 * beta_time[0],
+                    1.4 * beta_time[0],
+                    beta_time[0] + 0.5,
+                    beta_time[0] + 0.7,
+                    beta_time[0] + 0.6
+                ],
+            },
+            ParameterBlockState {
+                beta: beta_threshold.clone(),
+                eta: array![
+                    beta_threshold[0],
+                    0.4 * beta_threshold[0],
+                    -0.6 * beta_threshold[0]
+                ],
+            },
+            ParameterBlockState {
+                beta: beta_log_sigma.clone(),
+                eta: array![
+                    beta_log_sigma[0],
+                    -0.3 * beta_log_sigma[0],
+                    0.5 * beta_log_sigma[0]
+                ],
+            },
+        ]
+    }
+
+    fn survival_outer_gradient_test_specs() -> Vec<ParameterBlockSpec> {
+        vec![
+            ParameterBlockSpec {
+                name: "time_transform".to_string(),
+                design: DesignMatrix::Dense(array![
+                    [1.0],
+                    [1.0],
+                    [1.0],
+                    [1.2],
+                    [0.9],
+                    [1.4],
+                    [1.0],
+                    [1.0],
+                    [1.0]
+                ]),
+                offset: Array1::zeros(9),
+                penalties: vec![Array2::eye(1)],
+                initial_log_lambdas: array![0.0],
+                initial_beta: Some(array![0.2]),
+            },
+            ParameterBlockSpec {
+                name: "threshold".to_string(),
+                design: DesignMatrix::Dense(array![[1.0], [0.4], [-0.6]]),
+                offset: Array1::zeros(3),
+                penalties: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: Some(array![0.35]),
+            },
+            ParameterBlockSpec {
+                name: "log_sigma".to_string(),
+                design: DesignMatrix::Dense(array![[1.0], [-0.3], [0.5]]),
+                offset: Array1::zeros(3),
+                penalties: Vec::new(),
+                initial_log_lambdas: Array1::zeros(0),
+                initial_beta: Some(array![-0.15]),
+            },
+        ]
+    }
+
+    fn survival_non_probit_test_links() -> Vec<(&'static str, InverseLink)> {
+        vec![
+            (
+                "logistic",
+                residual_distribution_inverse_link(ResidualDistribution::Logistic),
+            ),
+            (
+                "cloglog",
+                residual_distribution_inverse_link(ResidualDistribution::Gumbel),
+            ),
+            (
+                "sas",
+                InverseLink::Sas(
+                    state_from_sas_spec(SasLinkSpec {
+                        initial_epsilon: 0.1,
+                        initial_log_delta: -0.2,
+                    })
+                    .expect("sas state"),
+                ),
+            ),
+            (
+                "beta-logistic",
+                InverseLink::BetaLogistic(
+                    state_from_beta_logistic_spec(SasLinkSpec {
+                        initial_epsilon: 0.05,
+                        initial_log_delta: 0.1,
+                    })
+                    .expect("beta-logistic state"),
+                ),
+            ),
         ]
     }
 
@@ -2248,10 +2328,8 @@ mod tests {
         let beta_t = 0.35;
         let states = survival_exact_newton_test_states(beta_t);
         let eval = family.evaluate(&states).expect("evaluate at center");
-        let BlockWorkingSet::ExactNewton {
-            gradient,
-            hessian,
-        } = &eval.block_working_sets[SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
+        let BlockWorkingSet::ExactNewton { gradient, hessian } =
+            &eval.block_working_sets[SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
         else {
             panic!("threshold block should use exact newton");
         };
@@ -2296,6 +2374,158 @@ mod tests {
             hessian[[0, 0]],
             fd_neg_grad_jac
         );
+    }
+
+    #[test]
+    fn exact_newton_block_directional_derivatives_match_fd_for_non_probit_links() {
+        let extract_hessian = |eval: FamilyEvaluation, block_idx: usize| -> Array2<f64> {
+            match &eval.block_working_sets[block_idx] {
+                BlockWorkingSet::ExactNewton { hessian, .. } => hessian.clone(),
+                BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton block"),
+            }
+        };
+
+        let beta_time = array![0.2];
+        let beta_threshold = array![0.35];
+        let beta_log_sigma = array![-0.15];
+        let eps = 1e-6;
+
+        for (label, inverse_link) in survival_non_probit_test_links() {
+            let family = survival_exact_newton_test_family_with_inverse_link(inverse_link);
+            let states =
+                survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+            let base_eval = family.evaluate(&states).expect("base eval");
+
+            for (block_idx, direction) in [
+                (SurvivalLocationScaleProbitFamily::BLOCK_TIME, array![1.0]),
+                (
+                    SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD,
+                    array![1.0],
+                ),
+                (
+                    SurvivalLocationScaleProbitFamily::BLOCK_LOG_SIGMA,
+                    array![1.0],
+                ),
+            ] {
+                let analytic = family
+                    .exact_newton_hessian_directional_derivative(&states, block_idx, &direction)
+                    .expect("analytic dH")
+                    .expect("expected exact dH");
+
+                let mut beta_time_plus = beta_time.clone();
+                let mut beta_threshold_plus = beta_threshold.clone();
+                let mut beta_log_sigma_plus = beta_log_sigma.clone();
+                match block_idx {
+                    SurvivalLocationScaleProbitFamily::BLOCK_TIME => {
+                        beta_time_plus += &(eps * &direction);
+                    }
+                    SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD => {
+                        beta_threshold_plus += &(eps * &direction);
+                    }
+                    SurvivalLocationScaleProbitFamily::BLOCK_LOG_SIGMA => {
+                        beta_log_sigma_plus += &(eps * &direction);
+                    }
+                    _ => panic!("unexpected block"),
+                }
+
+                let plus_states = survival_exact_newton_rebuild_states(
+                    &beta_time_plus,
+                    &beta_threshold_plus,
+                    &beta_log_sigma_plus,
+                );
+                let h_plus =
+                    extract_hessian(family.evaluate(&plus_states).expect("plus eval"), block_idx);
+                let h_base = extract_hessian(base_eval.clone(), block_idx);
+                let fd = (h_plus - h_base) / eps;
+                crate::testing::assert_matrix_derivative_fd(
+                    &fd,
+                    &analytic,
+                    5e-4,
+                    &format!("survival {label} block {} dH", block_idx),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outer_laml_gradient_matches_fd_for_non_probit_survival_links() {
+        let specs = survival_outer_gradient_test_specs();
+        let options = BlockwiseFitOptions {
+            use_reml_objective: true,
+            ridge_floor: 1e-10,
+            outer_max_iter: 1,
+            ..BlockwiseFitOptions::default()
+        };
+        let rho = array![0.12];
+        let derivative_blocks = vec![Vec::new(), Vec::new(), Vec::new()];
+        let h = 1e-5;
+
+        for (label, inverse_link) in survival_non_probit_test_links() {
+            let family = survival_exact_newton_test_family_with_inverse_link(inverse_link);
+            let center = evaluate_custom_family_joint_hyper(
+                &family,
+                &specs,
+                &options,
+                &rho,
+                &derivative_blocks,
+                None,
+                false,
+            )
+            .expect("center outer objective/gradient");
+            assert!(center.objective.is_finite());
+            assert_eq!(center.gradient.len(), rho.len());
+
+            for k in 0..rho.len() {
+                let mut rho_p = rho.clone();
+                let mut rho_m = rho.clone();
+                rho_p[k] += h;
+                rho_m[k] -= h;
+                let fp = evaluate_custom_family_joint_hyper(
+                    &family,
+                    &specs,
+                    &options,
+                    &rho_p,
+                    &derivative_blocks,
+                    Some(&center.warm_start),
+                    false,
+                )
+                .expect("objective+")
+                .objective;
+                let fm = evaluate_custom_family_joint_hyper(
+                    &family,
+                    &specs,
+                    &options,
+                    &rho_m,
+                    &derivative_blocks,
+                    Some(&center.warm_start),
+                    false,
+                )
+                .expect("objective-")
+                .objective;
+                let g_fd = (fp - fm) / (2.0 * h);
+                let abs_err = (center.gradient[k] - g_fd).abs();
+                let rel = abs_err / g_fd.abs().max(1e-8);
+                assert_eq!(
+                    center.gradient[k].signum(),
+                    g_fd.signum(),
+                    "outer survival LAML gradient sign mismatch for {} at {}: analytic={} fd={}",
+                    label,
+                    k,
+                    center.gradient[k],
+                    g_fd
+                );
+                assert!(
+                    abs_err < 2e-4 || rel < 2e-2,
+                    "outer survival LAML gradient mismatch for {} at {}: analytic={} fd={} abs={} rel={}",
+                    label,
+                    k,
+                    center.gradient[k],
+                    g_fd,
+                    abs_err,
+                    rel
+                );
+            }
+        }
     }
 
     #[test]

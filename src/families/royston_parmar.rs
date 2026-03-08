@@ -74,7 +74,7 @@ pub fn expected_hessian_from_flattened(
     let state = model
         .update_state(&beta.to_owned())
         .map_err(|e| crate::estimate::EstimationError::InvalidSpecification(e.to_string()))?;
-    Ok(state.hessian)
+    Ok(state.hessian.to_dense())
 }
 
 /// Options for survival smoothing-parameter optimization over `rho = log(lambda)`.

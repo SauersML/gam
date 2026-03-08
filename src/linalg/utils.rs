@@ -197,6 +197,36 @@ pub(crate) fn add_ridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
     regularized
 }
 
+pub(crate) fn boundary_hit_step_fraction(
+    slack: f64,
+    directional_slack_change: f64,
+    current_step_limit: f64,
+) -> Option<f64> {
+    if !slack.is_finite()
+        || !directional_slack_change.is_finite()
+        || !current_step_limit.is_finite()
+        || current_step_limit <= 0.0
+    {
+        return None;
+    }
+
+    let scale = slack
+        .abs()
+        .max(directional_slack_change.abs())
+        .max(current_step_limit.abs())
+        .max(1.0);
+    let directional_tol = (64.0 * f64::EPSILON * scale).max(1e-14);
+    if directional_slack_change >= -directional_tol {
+        return None;
+    }
+
+    let step = (slack / -directional_slack_change).max(0.0);
+    if step.is_finite() && step < current_step_limit {
+        return Some(step);
+    }
+    None
+}
+
 #[derive(Clone)]
 pub(crate) struct RidgePlanner {
     cond_estimate: Option<f64>,
@@ -300,5 +330,28 @@ impl RidgePlanner {
 
     pub(crate) fn attempts(&self) -> usize {
         self.attempts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::boundary_hit_step_fraction;
+
+    #[test]
+    fn boundary_hit_step_fraction_ignores_near_tangential_direction() {
+        let step = boundary_hit_step_fraction(1.0, -1e-16, 1.0);
+        assert_eq!(step, None);
+    }
+
+    #[test]
+    fn boundary_hit_step_fraction_returns_first_finite_hit() {
+        let step = boundary_hit_step_fraction(0.25, -0.5, 1.0);
+        assert_eq!(step, Some(0.5));
+    }
+
+    #[test]
+    fn boundary_hit_step_fraction_rejects_non_finite_candidate() {
+        let step = boundary_hit_step_fraction(1.0, f64::NEG_INFINITY, 1.0);
+        assert_eq!(step, None);
     }
 }

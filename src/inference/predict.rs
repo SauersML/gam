@@ -1,13 +1,12 @@
 use crate::estimate::{EstimationError, FitResult, FittedLinkState};
+use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
-    InverseLinkJet, beta_logistic_inverse_link_jet,
-    beta_logistic_inverse_link_jet_with_param_partials, mixture_inverse_link_jet,
-    mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet,
-    sas_inverse_link_jet_with_param_partials,
+    InverseLinkJet, beta_logistic_inverse_link_jet_with_param_partials,
+    mixture_inverse_link_jet_with_rho_partials_into, sas_inverse_link_jet_with_param_partials,
 };
-use crate::probability::{standard_normal_quantile, try_inverse_link_array};
-use crate::types::{InverseLink, LinkFunction};
+use crate::probability::standard_normal_quantile;
+use crate::types::InverseLink;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 pub(crate) fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
@@ -29,7 +28,7 @@ fn apply_family_inverse_link(
             "prediction uncertainty for RoystonParmar is not available in predict_gam".to_string(),
         ));
     }
-    try_inverse_link_array(family, eta.view(), link_kind)
+    strategy_for_family(family, link_kind).inverse_link_array(eta.view())
 }
 
 #[inline]
@@ -167,18 +166,6 @@ pub struct CoefficientUncertaintyResult {
     pub covariance_mode_requested: InferenceCovarianceMode,
 }
 
-#[inline]
-fn family_link_for_integrated_expectation(
-    family: crate::types::LikelihoodFamily,
-) -> Option<LinkFunction> {
-    match family {
-        crate::types::LikelihoodFamily::BinomialLogit => Some(LinkFunction::Logit),
-        crate::types::LikelihoodFamily::BinomialProbit => Some(LinkFunction::Probit),
-        crate::types::LikelihoodFamily::BinomialCLogLog => Some(LinkFunction::CLogLog),
-        _ => None,
-    }
-}
-
 /// Generic engine prediction for external designs.
 /// This API is domain-agnostic: callers provide only design matrix, coefficients, offset, and family.
 pub fn predict_gam<X>(
@@ -288,54 +275,13 @@ where
     let eta_var = linear_predictor_variance(&x, &covariance.to_owned())?;
     let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
     let quad_ctx = crate::quadrature::QuadratureContext::new();
-
-    let mean = match family_link_for_integrated_expectation(family) {
-        Some(link) => {
-            let means: Result<Vec<f64>, EstimationError> = eta
-                .iter()
-                .zip(eta_standard_error.iter())
-                .map(|(&e, &se)| {
-                    // Prediction-time uncertainty propagation deliberately shares
-                    // the same dispatcher as integrated PIRLS:
-                    //
-                    //   mean_i = E[g^{-1}(Eta_i)],
-                    //   Eta_i  ~ N(e, se^2).
-                    //
-                    // That means every exact/controlled decision for a link is
-                    // made once in quadrature.rs and reused here unchanged. This
-                    // avoids silent drift where fitting and prediction would apply
-                    // different Gaussian-uncertainty mathematics to the same link.
-                    crate::quadrature::integrated_inverse_link_mean_and_derivative(
-                        &quad_ctx, link, e, se,
-                    )
-                    .map(|v| v.mean)
-                })
-                .collect();
-            Array1::from_vec(means?)
-        }
-        None => match family {
-            crate::types::LikelihoodFamily::GaussianIdentity => eta.clone(),
-            crate::types::LikelihoodFamily::BinomialSas => {
-                return Err(EstimationError::InvalidInput(
-                    "predict_gam_posterior_mean for BinomialSas requires SAS link parameters; use predict_gam_with_uncertainty with a FitResult or CLI prediction path".to_string(),
-                ));
-            }
-            crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-                return Err(EstimationError::InvalidInput(
-                    "predict_gam_posterior_mean for BinomialBetaLogistic requires fitted link parameters; use predict_gam_with_uncertainty with a FitResult or CLI prediction path".to_string(),
-                ));
-            }
-            crate::types::LikelihoodFamily::BinomialMixture => {
-                return Err(EstimationError::InvalidInput(
-                    "predict_gam_posterior_mean for BinomialMixture requires mixture link state; use predict_gam_with_uncertainty with a FitResult or CLI prediction path".to_string(),
-                ));
-            }
-            crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
-            crate::types::LikelihoodFamily::BinomialLogit
-            | crate::types::LikelihoodFamily::BinomialProbit
-            | crate::types::LikelihoodFamily::BinomialCLogLog => unreachable!(),
-        },
-    };
+    let strategy = strategy_for_family(family, None);
+    let means: Result<Vec<f64>, EstimationError> = eta
+        .iter()
+        .zip(eta_standard_error.iter())
+        .map(|(&e, &se)| strategy.posterior_mean(&quad_ctx, e, se))
+        .collect();
+    let mean = Array1::from_vec(means?);
 
     Ok(PredictPosteriorMeanResult {
         eta,
@@ -395,63 +341,13 @@ where
     let eta_var = linear_predictor_variance(&x, &covariance.to_owned())?;
     let eta_standard_error = eta_var.mapv(|v| v.max(0.0).sqrt());
     let quad_ctx = crate::quadrature::QuadratureContext::new();
-
-    let mean = match family {
-        crate::types::LikelihoodFamily::BinomialSas => {
-            let state = match fit.fitted_link_state(crate::types::LikelihoodFamily::BinomialSas)? {
-                FittedLinkState::Sas { state, .. } => state,
-                _ => {
-                    return Err(EstimationError::InvalidInput(
-                        "internal mismatch: expected BinomialSas fitted link state".to_string(),
-                    ));
-                }
-            };
-            Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
-                crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, se, |x| {
-                    sas_inverse_link_jet(x, state.epsilon, state.log_delta).mu
-                })
-            }))
-        }
-        crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-            let state = match fit
-                .fitted_link_state(crate::types::LikelihoodFamily::BinomialBetaLogistic)?
-            {
-                FittedLinkState::BetaLogistic { state, .. } => state,
-                _ => {
-                    return Err(EstimationError::InvalidInput(
-                        "internal mismatch: expected BinomialBetaLogistic fitted link state"
-                            .to_string(),
-                    ));
-                }
-            };
-            Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
-                crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, se, |x| {
-                    beta_logistic_inverse_link_jet(x, state.log_delta, state.epsilon).mu
-                })
-            }))
-        }
-        crate::types::LikelihoodFamily::BinomialMixture => {
-            let state = match fit
-                .fitted_link_state(crate::types::LikelihoodFamily::BinomialMixture)?
-            {
-                FittedLinkState::Mixture { state, .. } => state,
-                _ => {
-                    return Err(EstimationError::InvalidInput(
-                        "internal mismatch: expected BinomialMixture fitted link state".to_string(),
-                    ));
-                }
-            };
-            Array1::from_iter(eta.iter().zip(eta_standard_error.iter()).map(|(&e, &se)| {
-                crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, e, se, |x| {
-                    mixture_inverse_link_jet(&state, x).mu
-                })
-            }))
-        }
-        _ => {
-            // Reuse existing integrated-dispatch implementation for standard links.
-            return predict_gam_posterior_mean(x, beta, offset, family, covariance);
-        }
-    };
+    let strategy = strategy_from_fit(family, fit)?;
+    let means: Result<Vec<f64>, EstimationError> = eta
+        .iter()
+        .zip(eta_standard_error.iter())
+        .map(|(&e, &se)| strategy.posterior_mean(&quad_ctx, e, se))
+        .collect();
+    let mean = Array1::from_vec(means?);
 
     Ok(PredictPosteriorMeanResult {
         eta,
@@ -603,6 +499,7 @@ where
         Some(FittedLinkState::Mixture { state, .. }) => Some(InverseLink::Mixture(state.clone())),
         None => None,
     };
+    let strategy = strategy_for_family(family, link_kind.as_ref());
     let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;
 
     let eta_var = linear_predictor_variance(&x, cov)?;
@@ -647,78 +544,7 @@ where
         .unwrap_or_default();
     for i in 0..eta.len() {
         let se_i = eta_var[i].max(0.0).sqrt();
-        let mut mean_var = match family {
-            crate::types::LikelihoodFamily::GaussianIdentity => eta_var[i].max(0.0),
-            crate::types::LikelihoodFamily::BinomialLogit => {
-                let (_, v) =
-                    crate::quadrature::logit_posterior_mean_variance(&quad_ctx, eta[i], se_i);
-                v.max(0.0)
-            }
-            crate::types::LikelihoodFamily::BinomialProbit => {
-                let (_, v) =
-                    crate::quadrature::probit_posterior_mean_variance(&quad_ctx, eta[i], se_i);
-                v.max(0.0)
-            }
-            crate::types::LikelihoodFamily::BinomialCLogLog => {
-                let (_, v) =
-                    crate::quadrature::cloglog_posterior_mean_variance(&quad_ctx, eta[i], se_i);
-                v.max(0.0)
-            }
-            crate::types::LikelihoodFamily::BinomialSas => {
-                let sas = sas_state.ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "BinomialSas uncertainty requires fitted sas_epsilon/sas_log_delta"
-                            .to_string(),
-                    )
-                })?;
-                let (m1, m2) = crate::quadrature::normal_expectation_1d_adaptive_pair(
-                    &quad_ctx,
-                    eta[i],
-                    se_i,
-                    |x| {
-                        let p = sas_inverse_link_jet(x, sas.epsilon, sas.log_delta).mu;
-                        (p, p * p)
-                    },
-                );
-                (m2 - m1 * m1).max(0.0)
-            }
-            crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-                let sas = sas_state.ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "BinomialBetaLogistic uncertainty requires fitted parameters".to_string(),
-                    )
-                })?;
-                let (m1, m2) = crate::quadrature::normal_expectation_1d_adaptive_pair(
-                    &quad_ctx,
-                    eta[i],
-                    se_i,
-                    |x| {
-                        let p = beta_logistic_inverse_link_jet(x, sas.log_delta, sas.epsilon).mu;
-                        (p, p * p)
-                    },
-                );
-                (m2 - m1 * m1).max(0.0)
-            }
-            crate::types::LikelihoodFamily::BinomialMixture => {
-                let state = mixture_state.as_ref().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "BinomialMixture uncertainty requires fitted mixture link state"
-                            .to_string(),
-                    )
-                })?;
-                let (m1, m2) = crate::quadrature::normal_expectation_1d_adaptive_pair(
-                    &quad_ctx,
-                    eta[i],
-                    se_i,
-                    |x| {
-                        let p = mixture_inverse_link_jet(state, x).mu;
-                        (p, p * p)
-                    },
-                );
-                (m2 - m1 * m1).max(0.0)
-            }
-            crate::types::LikelihoodFamily::RoystonParmar => unreachable!(),
-        };
+        let (_, mut mean_var) = strategy.posterior_mean_variance(&quad_ctx, eta[i], se_i)?;
         if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
             && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                 FittedLinkState::Sas { covariance, .. } => covariance.as_ref(),
@@ -914,6 +740,7 @@ pub fn coefficient_uncertainty_with_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::LinkFunction;
     use ndarray::{Array2, array};
 
     #[test]

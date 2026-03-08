@@ -3852,7 +3852,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     );
 
     if let Some(out) = args.out {
-        let cov = match invert_symmetric_matrix(&state.hessian) {
+        let hessian = state.hessian.to_dense();
+        let cov = match invert_symmetric_matrix(&hessian) {
             Ok(c) => Some(c),
             Err(e) => {
                 eprintln!(
@@ -4122,6 +4123,7 @@ fn run_sample_survival(
     let state = model_surv
         .update_state(&beta0)
         .map_err(|e| format!("failed to evaluate survival state: {e}"))?;
+    let hessian = state.hessian.to_dense();
     gam::hmc::run_survival_nuts_sampling_flattened(
         gam::hmc::SurvivalFlatInputs {
             age_entry: age_entry.view(),
@@ -4142,7 +4144,7 @@ fn run_sample_survival(
         time_build.basis_name == "ispline",
         p_time,
         beta0.view(),
-        state.hessian.view(),
+        hessian.view(),
         cfg,
     )
     .map_err(|e| format!("survival NUTS sampling failed: {e}"))
