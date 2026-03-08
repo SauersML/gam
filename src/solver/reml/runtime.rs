@@ -21,6 +21,9 @@ impl<'a> RemlState<'a> {
         edf: f64,
         trace_h_inv_s_lambda: f64,
     ) {
+        if !log::log_enabled!(log::Level::Info) {
+            return;
+        }
         const GAM_REPEAT_EMIT: u64 = 50;
         const GAM_MIN_EMIT_GAP: u64 = 200;
         let rho_q = quantize_vec(rho.as_slice().unwrap_or_default(), 5e-3, 1e-6);
@@ -41,7 +44,7 @@ impl<'a> RemlState<'a> {
                 if *repeat >= GAM_REPEAT_EMIT
                     && eval_idx.saturating_sub(*last_emit) >= GAM_MIN_EMIT_GAP
                 {
-                    println!("[GAM COST] {}", last.format_summary());
+                    log::info!("[GAM COST] {}", last.format_summary());
                     *repeat = 0;
                     *last_emit = eval_idx;
                 }
@@ -51,14 +54,14 @@ impl<'a> RemlState<'a> {
             let emit_prev =
                 last.count > 1 && eval_idx.saturating_sub(*last_emit) >= GAM_MIN_EMIT_GAP;
             if emit_prev {
-                println!("[GAM COST] {}", last.format_summary());
+                log::info!("[GAM COST] {}", last.format_summary());
                 *last_emit = eval_idx;
             }
         }
 
         let new_agg = CostAgg::new(key, laml, edf, trace_h_inv_s_lambda, stab_q, raw_q);
         if eval_idx.saturating_sub(*last_emit) >= GAM_MIN_EMIT_GAP {
-            println!("[GAM COST] {}", new_agg.format_summary());
+            log::info!("[GAM COST] {}", new_agg.format_summary());
             *last_emit = eval_idx;
         }
         *last_opt = Some(new_agg);
@@ -1106,7 +1109,7 @@ impl<'a> RemlState<'a> {
         };
 
         if let Err(e) = &pirls_result {
-            println!("[GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
+            log::warn!("[GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
             // Keep the previous successful warm start even when a trial point
             // fails. Outer line search commonly probes unstable candidates and
             // then returns to nearby feasible rho values where the prior warm
@@ -1255,7 +1258,7 @@ impl<'a> RemlState<'a> {
                     .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
                     .collect();
                 if !(at_lower.is_empty() && at_upper.is_empty()) {
-                    eprintln!(
+                    log::debug!(
                         "[Diag] rho bounds: lower={:?} upper={:?}",
                         at_lower, at_upper
                     );
@@ -1283,7 +1286,7 @@ impl<'a> RemlState<'a> {
                     .filter_map(|(i, &v)| if v >= RHO_BOUND - 1e-8 { Some(i) } else { None })
                     .collect();
                 if !(at_lower.is_empty() && at_upper.is_empty()) {
-                    eprintln!(
+                    log::debug!(
                         "[Diag] rho bounds: lower={:?} upper={:?}",
                         at_lower, at_upper
                     );
@@ -1339,7 +1342,7 @@ impl<'a> RemlState<'a> {
             && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
         {
             if should_emit_h_min_eig_diag(min_eig) {
-                eprintln!(
+                log::debug!(
                     "[Diag] H min_eig={:.3e} (ridge={:.3e})",
                     min_eig, ridge_used
                 );

@@ -470,7 +470,6 @@ fn validate_gaussian_location_scale_term_spec(
     validate_term_data_rows(context, n, data.nrows())?;
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validate_weights(&spec.weights, context)?;
-    validate_sigma_bounds(spec.sigma_min, spec.sigma_max, context)?;
     Ok(())
 }
 
@@ -739,8 +738,6 @@ fn solve_penalized_weighted_projection(
 fn gaussian_location_scale_warm_start(
     y: &Array1<f64>,
     weights: &Array1<f64>,
-    sigma_min: f64,
-    sigma_max: f64,
     mu_block: &ParameterBlockSpec,
     log_sigma_block: &ParameterBlockSpec,
     ridge_floor: f64,
@@ -775,13 +772,11 @@ fn gaussian_location_scale_warm_start(
             "gaussian location-scale warm start could not estimate residual scale".to_string(),
         );
     }
-    let sigma_hat = (weighted_ss / weight_sum)
-        .sqrt()
-        .clamp(sigma_min.max(1e-10), sigma_max.max(sigma_min + 1e-10));
+    let sigma_hat = (weighted_ss / weight_sum).sqrt().max(1e-10);
     let beta_log_sigma = if let Some(beta) = noise_beta_hint {
         beta.clone()
     } else {
-        let eta_sigma = bounded_sigma_eta_for_sigma_scalar(sigma_hat, sigma_min, sigma_max);
+        let eta_sigma = sigma_hat.ln();
         let sigma_target = Array1::from_elem(y.len(), eta_sigma);
         solve_penalized_weighted_projection(
             &log_sigma_block.design,
@@ -1190,8 +1185,6 @@ fn try_binomial_alpha_beta_warm_start(
 pub struct GaussianLocationScaleSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub mu_block: ParameterBlockInput,
     pub log_sigma_block: ParameterBlockInput,
 }
@@ -1248,8 +1241,6 @@ pub struct BinomialLocationScaleWiggleSpec {
 pub struct GaussianLocationScaleTermSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub mean_spec: TermCollectionSpec,
     pub log_sigma_spec: TermCollectionSpec,
 }
@@ -1401,19 +1392,12 @@ pub fn fit_gaussian_location_scale(
     let n = spec.y.len();
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validate_weights(&spec.weights, "fit_gaussian_location_scale")?;
-    validate_sigma_bounds(
-        spec.sigma_min,
-        spec.sigma_max,
-        "fit_gaussian_location_scale",
-    )?;
     validate_block_rows("mu", n, &spec.mu_block)?;
     validate_block_rows("log_sigma", n, &spec.log_sigma_block)?;
 
     let GaussianLocationScaleSpec {
         y,
         weights,
-        sigma_min,
-        sigma_max,
         mu_block,
         log_sigma_block,
     } = spec;
@@ -1423,8 +1407,6 @@ pub fn fit_gaussian_location_scale(
         let (beta_mu0, beta_ls0, sigma0) = gaussian_location_scale_warm_start(
             &y,
             &weights,
-            sigma_min,
-            sigma_max,
             &mu_spec,
             &log_sigma_spec,
             options.ridge_floor,
@@ -1446,8 +1428,6 @@ pub fn fit_gaussian_location_scale(
     let family = GaussianLocationScaleFamily {
         y,
         weights,
-        sigma_min,
-        sigma_max,
         mu_design: Some(mu_spec.design.clone()),
         log_sigma_design: Some(log_sigma_spec.design.clone()),
     };
@@ -1971,8 +1951,6 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
 struct GaussianLocationScaleTermBuilder {
     y: Array1<f64>,
     weights: Array1<f64>,
-    sigma_min: f64,
-    sigma_max: f64,
     mean_spec: TermCollectionSpec,
     noise_spec: TermCollectionSpec,
 }
@@ -2023,8 +2001,6 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             let (beta_mu0, beta_ls0, _) = gaussian_location_scale_warm_start(
                 &self.y,
                 &self.weights,
-                self.sigma_min,
-                self.sigma_max,
                 &mean_spec,
                 &noise_spec,
                 1e-10,
@@ -2049,8 +2025,6 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         GaussianLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
-            sigma_min: self.sigma_min,
-            sigma_max: self.sigma_max,
             mu_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
             log_sigma_design: Some(DesignMatrix::Dense(noise_design.design.clone())),
         }
@@ -2321,8 +2295,6 @@ pub fn fit_gaussian_location_scale_terms(
         GaussianLocationScaleTermBuilder {
             y: spec.y,
             weights: spec.weights,
-            sigma_min: spec.sigma_min,
-            sigma_max: spec.sigma_max,
             mean_spec: spec.mean_spec,
             noise_spec: spec.log_sigma_spec,
         },
@@ -3455,10 +3427,22 @@ fn binomial_location_scale_working_sets(
 pub struct GaussianLocationScaleFamily {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub mu_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
+}
+
+#[inline]
+fn gaussian_sigma_derivs_up_to_fourth(
+    eta: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+    let sigma = eta.mapv(f64::exp);
+    (
+        sigma.clone(),
+        sigma.clone(),
+        sigma.clone(),
+        sigma.clone(),
+        sigma,
+    )
 }
 
 impl GaussianLocationScaleFamily {
@@ -3659,10 +3643,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let mut ll = 0.0;
 
         for i in 0..n {
-            let SigmaJet1 {
-                sigma: sigma_i,
-                d1: dsigma_deta_i,
-            } = bounded_sigma_jet1_scalar(eta_log_sigma[i], self.sigma_min, self.sigma_max);
+            let sigma_i = eta_log_sigma[i].exp();
+            let dsigma_deta_i = sigma_i;
             sigma[i] = sigma_i;
             dsigma_deta[i] = dsigma_deta_i;
             let r = self.y[i] - eta_mu[i];
@@ -3738,7 +3720,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         }
         let (x_t, x_ls) = self.dense_block_designs()?;
         let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
-            bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
+            gaussian_sigma_derivs_up_to_fourth(eta_ls.view());
 
         let mut w_tt_diag = Array1::<f64>::zeros(n);
         let mut w_tl_diag = Array1::<f64>::zeros(n);
@@ -3796,7 +3778,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let d_eta_t = x_t.dot(&u_t);
         let d_eta_ls = x_ls.dot(&u_ls);
         let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
-            bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
+            gaussian_sigma_derivs_up_to_fourth(eta_ls.view());
 
         let mut w_tt_diag = Array1::<f64>::zeros(n);
         let mut w_tl_diag = Array1::<f64>::zeros(n);
@@ -3860,7 +3842,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let d_eta_t_v = x_t.dot(&v_t);
         let d_eta_ls_v = x_ls.dot(&v_ls);
         let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
-            bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
+            gaussian_sigma_derivs_up_to_fourth(eta_ls.view());
 
         let mut w_tt_diag = Array1::<f64>::zeros(n);
         let mut w_tl_diag = Array1::<f64>::zeros(n);
@@ -3914,8 +3896,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
 
-        let (sigma, d_sigma, d2_sigma, _, _) =
-            bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (sigma, d_sigma, d2_sigma, _, _) = gaussian_sigma_derivs_up_to_fourth(eta_ls.view());
         let mut dw = Array1::<f64>::zeros(n);
         match block_idx {
             Self::BLOCK_MU => {
@@ -3979,9 +3960,7 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
             ));
         }
         let mu = block_states[Self::BLOCK_MU].eta.clone();
-        let sigma = block_states[Self::BLOCK_LOG_SIGMA]
-            .eta
-            .mapv(|eta| bounded_sigma_from_eta_scalar(eta, self.sigma_min, self.sigma_max));
+        let sigma = block_states[Self::BLOCK_LOG_SIGMA].eta.mapv(f64::exp);
         Ok(GenerativeSpec {
             mean: mu,
             noise: NoiseModel::Gaussian { sigma },
@@ -6422,8 +6401,6 @@ mod tests {
         let gaussian = GaussianLocationScaleFamily {
             y: Array1::from_vec(vec![2.0, -1.0]),
             weights: weights.clone(),
-            sigma_min: 0.2,
-            sigma_max: 3.0,
             mu_design: None,
             log_sigma_design: None,
         };
@@ -6569,8 +6546,6 @@ mod tests {
         let family = GaussianLocationScaleFamily {
             y: Array1::from_vec(vec![0.3]),
             weights: Array1::from_vec(vec![1.0]),
-            sigma_min: 0.1,
-            sigma_max: 5.0,
             mu_design: None,
             log_sigma_design: None,
         };
@@ -6602,8 +6577,6 @@ mod tests {
         let family = GaussianLocationScaleFamily {
             y: Array1::from_vec(vec![1.2]),
             weights: Array1::from_vec(vec![1.0]),
-            sigma_min: 0.2,
-            sigma_max: 3.0,
             mu_design: None,
             log_sigma_design: None,
         };
@@ -6757,8 +6730,6 @@ mod tests {
         let spec = GaussianLocationScaleTermSpec {
             y: Array1::zeros(n),
             weights: Array1::from_vec(vec![1.0, 1.0, -0.5, 1.0, 1.0, 1.0, 1.0, 1.0]),
-            sigma_min: 0.2,
-            sigma_max: 3.0,
             mean_spec: simple_matern_term_collection(&[0, 1], 0.35),
             log_sigma_spec: simple_matern_term_collection(&[0, 1], 0.6),
         };
@@ -6843,8 +6814,6 @@ mod tests {
         let spec = GaussianLocationScaleTermSpec {
             y,
             weights,
-            sigma_min: 0.2,
-            sigma_max: 3.0,
             mean_spec: simple_matern_term_collection(&[0, 1], 0.35),
             log_sigma_spec: simple_matern_term_collection(&[0, 1], 0.6),
         };

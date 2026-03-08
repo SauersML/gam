@@ -1044,6 +1044,8 @@ fn run_fit_with_predict_noise(
     if !args.no_summary {
         print_inference_summary(inference_notes);
     }
+    let sigma_min = 0.05;
+    let sigma_max = 20.0;
 
     if family == LikelihoodFamily::GaussianIdentity {
         if formula_link_wiggle.is_some() {
@@ -1054,17 +1056,12 @@ fn run_fit_with_predict_noise(
         }
         let response_scale = sample_std(y.view()).max(1e-6);
         let y_scaled = y.mapv(|v| v / response_scale);
-        let (sigma_min, sigma_max) = gaussian_location_scale_sigma_bounds(response_scale, y.len());
-        let sigma_min_scaled = (sigma_min / response_scale).max(1e-6);
-        let sigma_max_scaled = (sigma_max / response_scale).max(sigma_min_scaled * 10.0);
         let options = blockwise_options_from_fit_args(args)?;
         let solved = fit_gaussian_location_scale_terms(
             ds.values.view(),
             GaussianLocationScaleTermSpec {
                 y: y_scaled,
                 weights: Array1::ones(y.len()),
-                sigma_min: sigma_min_scaled,
-                sigma_max: sigma_max_scaled,
                 mean_spec: mean_spec.clone(),
                 log_sigma_spec: noise_spec.clone(),
             },
@@ -1121,8 +1118,8 @@ fn run_fit_with_predict_noise(
                 frozen_noise_spec,
                 fit_result,
                 fit.block_states.get(1).map(|b| b.beta.to_vec()),
-                sigma_min,
-                sigma_max,
+                None,
+                None,
             );
             write_model_json(out, &model)?;
         }
@@ -1167,8 +1164,6 @@ fn run_fit_with_predict_noise(
         _ => InverseLink::Standard(effective_link),
     };
 
-    let sigma_min = 0.05;
-    let sigma_max = 20.0;
     let options = blockwise_options_from_fit_args(args)?;
     let solved = fit_binomial_location_scale_terms_workflow(
         ds.values.view(),
@@ -1254,8 +1249,8 @@ fn run_fit_with_predict_noise(
             frozen_noise_spec,
             fit_result,
             fit.block_states.get(1).map(|b| b.beta.to_vec()),
-            sigma_min,
-            sigma_max,
+            Some(sigma_min),
+            Some(sigma_max),
         );
         match &location_scale_link_kind {
             InverseLink::Sas(state) => {
@@ -1719,9 +1714,7 @@ fn run_predict_gaussian_location_scale(
     }
     let eta_mu = design_mu.design.dot(&beta_mu);
     let eta_noise = design_noise.design.dot(&beta_noise);
-    let sigma_min = model.sigma_min.unwrap_or(1e-6);
-    let sigma_max = model.sigma_max.unwrap_or(1e6);
-    let sigma = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max).0;
+    let sigma = eta_noise.mapv(f64::exp);
     let mut mean_lo = None;
     let mut mean_hi = None;
     if args.uncertainty {
@@ -4406,10 +4399,8 @@ fn run_generate_gaussian_location_scale(
         return Err("location-scale model/design dimension mismatch".to_string());
     }
     let mean = design.design.dot(&beta_mu);
-    let sigma_min = model.sigma_min.unwrap_or(1e-6);
-    let sigma_max = model.sigma_max.unwrap_or(1e6);
     let eta_noise = design_noise.design.dot(&beta_noise);
-    let sigma = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max).0;
+    let sigma = eta_noise.mapv(f64::exp);
     Ok(gam::generative::GenerativeSpec {
         mean,
         noise: gam::generative::NoiseModel::Gaussian { sigma },
@@ -5242,8 +5233,8 @@ fn build_location_scale_saved_model(
     resolved_term_spec_noise: TermCollectionSpec,
     fit_result: FitResult,
     beta_noise: Option<Vec<f64>>,
-    sigma_min: f64,
-    sigma_max: f64,
+    sigma_min: Option<f64>,
+    sigma_max: Option<f64>,
 ) -> SavedModel {
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -5264,8 +5255,8 @@ fn build_location_scale_saved_model(
     payload.link = link;
     payload.formula_noise = Some(noise_formula);
     payload.beta_noise = beta_noise;
-    payload.sigma_min = Some(sigma_min);
-    payload.sigma_max = Some(sigma_max);
+    payload.sigma_min = sigma_min;
+    payload.sigma_max = sigma_max;
     payload.training_headers = Some(training_headers);
     payload.resolved_term_spec = Some(resolved_term_spec);
     payload.resolved_term_spec_noise = Some(resolved_term_spec_noise);
@@ -6957,21 +6948,6 @@ fn sample_std(v: ArrayView1<'_, f64>) -> f64 {
     var.max(0.0).sqrt()
 }
 
-fn gaussian_location_scale_sigma_bounds(response_scale: f64, n_obs: usize) -> (f64, f64) {
-    let scale = response_scale.max(1e-6);
-    let sigma_floor_frac = if n_obs < 64 {
-        0.05
-    } else if n_obs < 256 {
-        0.02
-    } else {
-        0.01
-    };
-    let sigma_cap_mult = if n_obs < 64 { 20.0 } else { 50.0 };
-    let sigma_min = (scale * sigma_floor_frac).max(1e-6);
-    let sigma_max = (scale * sigma_cap_mult).max(sigma_min * 20.0);
-    (sigma_min, sigma_max)
-}
-
 fn resolve_family(
     arg: FamilyArg,
     link_choice: Option<LinkChoice>,
@@ -8330,8 +8306,8 @@ mod tests {
         apply_saved_probit_wiggle, build_survival_time_basis, chi_square_survival_approx,
         classify_cli_error, collect_linear_smooth_overlap_warnings,
         collect_spatial_smooth_usage_warnings, compute_probit_q0_from_eta, core_saved_fit_result,
-        evaluate_survival_baseline, gaussian_location_scale_sigma_bounds, parse_duchon_order,
-        parse_duchon_power, parse_formula, parse_link_choice, parse_surv_response,
+        evaluate_survival_baseline, parse_duchon_order, parse_duchon_power, parse_formula,
+        parse_link_choice, parse_surv_response,
         parse_survival_baseline_config, parse_survival_inverse_link,
         parse_survival_time_basis_config, pretty_family_name, saved_probit_wiggle_derivative_q0,
         saved_probit_wiggle_design, summarize_wiggle_domain, survival_probability_from_eta,
@@ -9149,22 +9125,6 @@ mod tests {
         };
         let cfg = parse_survival_time_basis_config(&args).expect("parse ispline time basis");
         assert!(matches!(cfg, SurvivalTimeBasisConfig::ISpline { .. }));
-    }
-
-    #[test]
-    fn gaussian_location_scale_sigma_bounds_raise_small_sample_floor() {
-        let (small_min, small_max) = gaussian_location_scale_sigma_bounds(10.0, 32);
-        let (large_min, large_max) = gaussian_location_scale_sigma_bounds(10.0, 1024);
-        assert!(
-            small_min > large_min,
-            "small-sample sigma floor should be stricter: small={small_min} large={large_min}"
-        );
-        assert!(
-            small_max < large_max,
-            "small-sample sigma cap should be tighter: small={small_max} large={large_max}"
-        );
-        assert!(small_min > 0.0 && large_min > 0.0);
-        assert!(small_max > small_min && large_max > large_min);
     }
 
     #[test]
