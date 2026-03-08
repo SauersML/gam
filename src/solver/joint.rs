@@ -947,7 +947,7 @@ impl<'a> JointModelState<'a> {
             if wi <= 0.0 {
                 continue;
             }
-            let mi = mu[i].clamp(1e-8, 1.0 - 1e-8);
+            let mi = mu[i];
             z_firth[i] += hat_diag[i] * (0.5 - mi) / wi;
         }
         z_firth
@@ -2581,7 +2581,7 @@ impl<'a> JointRemlState<'a> {
                         // So
                         //   dW/dη = obs_w * [2 d1 d2 / var - d1^2 * (d1 (1-2mu)) / var^2].
                         for i in 0..n {
-                            let mu_i = mu[i].clamp(PROB_EPS, 1.0 - PROB_EPS);
+                            let mu_i = mu[i];
                             let d1 = integrated_d1[i].max(1e-8);
                             let d2 = integrated_d2[i];
                             let var = (mu_i * (1.0 - mu_i)).max(PROB_EPS);

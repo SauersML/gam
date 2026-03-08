@@ -1126,8 +1126,6 @@ fn run_fit_with_predict_noise(
                 frozen_noise_spec,
                 fit_result,
                 fit.block_states.get(1).map(|b| b.beta.to_vec()),
-                None,
-                None,
                 Some(&gaussian_noise_transform),
             );
             write_model_json(out, &model)?;
@@ -1268,8 +1266,6 @@ fn run_fit_with_predict_noise(
             frozen_noise_spec,
             fit_result,
             fit.block_states.get(1).map(|b| b.beta.to_vec()),
-            None,
-            None,
             Some(&binomial_noise_transform),
         );
         match &location_scale_link_kind {
@@ -1934,7 +1930,7 @@ fn run_predict_binomial_location_scale(
                     [[var_t, cov_tls], [cov_tls, var_ls]],
                     |t, ls| {
                         let sigma = ls.exp();
-                        normal_cdf(-t / sigma.max(1e-12)).clamp(1e-10, 1.0 - 1e-10)
+                        normal_cdf(-t / sigma.max(1e-12))
                     },
                 )
             }))
@@ -2029,7 +2025,7 @@ fn run_predict_binomial_location_scale(
                             }
                         }
                         let denom = (1.0 + var_w.max(0.0)).sqrt().max(1e-12);
-                        Ok(normal_cdf(mean_w / denom).clamp(1e-10, 1.0 - 1e-10))
+                        Ok(normal_cdf(mean_w / denom))
                     },
                 )?;
             }
@@ -4584,10 +4580,7 @@ fn run_generate_binomial_location_scale(
     let mean = Array1::from_iter(
         eta.iter()
             .copied()
-            .map(|v| {
-                inverse_link_jet_for_inverse_link(&saved_link_kind, v)
-                    .map(|jet| jet.mu.clamp(1e-10, 1.0 - 1e-10))
-            })
+            .map(|v| inverse_link_jet_for_inverse_link(&saved_link_kind, v).map(|jet| jet.mu))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("location-scale inverse-link prediction failed: {e}"))?,
     );
@@ -5344,8 +5337,6 @@ fn build_location_scale_saved_model(
     resolved_term_spec_noise: TermCollectionSpec,
     fit_result: FitResult,
     beta_noise: Option<Vec<f64>>,
-    sigma_min: Option<f64>,
-    sigma_max: Option<f64>,
     noise_transform: Option<&ScaleDeviationTransform>,
 ) -> SavedModel {
     let mut payload = FittedModelPayload::new(
@@ -5367,8 +5358,6 @@ fn build_location_scale_saved_model(
     payload.link = link;
     payload.formula_noise = Some(noise_formula);
     payload.beta_noise = beta_noise;
-    payload.sigma_min = sigma_min;
-    payload.sigma_max = sigma_max;
     if let Some(transform) = noise_transform {
         payload.noise_projection = Some(
             transform
@@ -7808,7 +7797,7 @@ fn build_model_summary(
                 .map(|(&yy, &ww)| yy * ww)
                 .sum::<f64>()
                 / wsum;
-            Array1::from_elem(y.len(), p.clamp(1e-8, 1.0 - 1e-8))
+            Array1::from_elem(y.len(), p)
         }
         LikelihoodFamily::RoystonParmar => Array1::from_elem(y.len(), 0.0),
     };
@@ -9767,8 +9756,6 @@ mod tests {
             sas_param_covariance: None,
             formula_noise: None,
             beta_noise: None,
-            sigma_min: None,
-            sigma_max: None,
             noise_projection: None,
             noise_center: None,
             noise_scale: None,
@@ -9797,8 +9784,6 @@ mod tests {
             survival_time_smooth_lambda: None,
             survival_ridge_lambda: None,
             survival_likelihood: None,
-            survival_sigma_min: None,
-            survival_sigma_max: None,
             survival_beta_time: None,
             survival_beta_threshold: None,
             survival_beta_log_sigma: None,
@@ -9966,8 +9951,6 @@ mod tests {
             sas_param_covariance: None,
             formula_noise: None,
             beta_noise: None,
-            sigma_min: None,
-            sigma_max: None,
             noise_projection: None,
             noise_center: None,
             noise_scale: None,
@@ -9996,8 +9979,6 @@ mod tests {
             survival_time_smooth_lambda: None,
             survival_ridge_lambda: None,
             survival_likelihood: None,
-            survival_sigma_min: None,
-            survival_sigma_max: None,
             survival_beta_time: None,
             survival_beta_threshold: None,
             survival_beta_log_sigma: None,
@@ -10034,8 +10015,6 @@ mod tests {
             sas_param_covariance: None,
             formula_noise: None,
             beta_noise: None,
-            sigma_min: None,
-            sigma_max: None,
             noise_projection: None,
             noise_center: None,
             noise_scale: None,
@@ -10064,8 +10043,6 @@ mod tests {
             survival_time_smooth_lambda: None,
             survival_ridge_lambda: None,
             survival_likelihood: None,
-            survival_sigma_min: None,
-            survival_sigma_max: None,
             survival_beta_time: None,
             survival_beta_threshold: None,
             survival_beta_log_sigma: None,

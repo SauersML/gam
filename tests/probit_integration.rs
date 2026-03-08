@@ -16,7 +16,7 @@ fn probit_fit_and_predict_fast_integration() {
     for i in 0..n {
         let xi = -2.0 + 4.0 * (i as f64) / (n as f64 - 1.0);
         let eta = -0.3 + 1.1 * xi;
-        let p = normal_cdf(eta).clamp(1e-8, 1.0 - 1e-8);
+        let p = normal_cdf(eta);
         x[[i, 0]] = 1.0;
         x[[i, 1]] = xi;
         y[i] = if rng.random::<f64>() < p { 1.0 } else { 0.0 };
@@ -64,7 +64,7 @@ fn probit_fit_and_predict_fast_integration() {
     assert!(
         pred.mean
             .iter()
-            .all(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
+            .all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
     );
 
     let brier = (&pred.mean - &y)
@@ -97,8 +97,8 @@ fn probit_working_vectors_are_finite_for_extreme_eta() {
     )
     .expect("probit working-vector update should succeed");
 
-    assert!(mu.iter().all(|v| v.is_finite() && *v > 0.0 && *v < 1.0));
-    assert!(weights.iter().all(|v| v.is_finite() && *v > 0.0));
+    assert!(mu.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0));
+    assert!(weights.iter().all(|v| v.is_finite() && *v >= 0.0));
     assert!(z.iter().all(|v| v.is_finite()));
 }
 
@@ -113,7 +113,7 @@ fn cloglog_fit_and_predict_fast_integration() {
         let xi = -2.0 + 4.0 * (i as f64) / (n as f64 - 1.0);
         let eta = -0.4 + 0.9 * xi;
         let z = eta.clamp(-30.0, 30.0);
-        let p = (1.0 - (-(z.exp())).exp()).clamp(1e-8, 1.0 - 1e-8);
+        let p = 1.0 - (-(z.exp())).exp();
         x[[i, 0]] = 1.0;
         x[[i, 1]] = xi;
         y[i] = if rng.random::<f64>() < p { 1.0 } else { 0.0 };
@@ -157,7 +157,7 @@ fn cloglog_fit_and_predict_fast_integration() {
     assert!(
         pred.mean
             .iter()
-            .all(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
+            .all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
     );
 }
 
@@ -181,7 +181,7 @@ fn cloglog_working_vectors_are_finite_for_extreme_eta() {
     )
     .expect("cloglog working-vector update should succeed");
 
-    assert!(mu.iter().all(|v| v.is_finite() && *v > 0.0 && *v < 1.0));
-    assert!(weights.iter().all(|v| v.is_finite() && *v > 0.0));
+    assert!(mu.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0));
+    assert!(weights.iter().all(|v| v.is_finite() && *v >= 0.0));
     assert!(z.iter().all(|v| v.is_finite()));
 }

@@ -1633,12 +1633,15 @@ pub fn build_smooth_design(
             }
         };
 
-        if matches!(term.basis, SmoothBasisSpec::Matern { .. }) {
-            let (penalties, nullspace_dims, penalty_info) =
-                matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
-            built.penalties = penalties;
-            built.nullspace_dims = nullspace_dims;
-            built.penalty_info = penalty_info;
+        match &term.basis {
+            SmoothBasisSpec::Matern { .. } => {
+                let (penalties, nullspace_dims, penalty_info) =
+                    matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
+                built.penalties = penalties;
+                built.nullspace_dims = nullspace_dims;
+                built.penalty_info = penalty_info;
+            }
+            _ => {}
         }
 
         let p_local = built.design.ncols();
@@ -4374,7 +4377,7 @@ fn evaluate_standard_family_observations(
                     strategy_for_family(family, inverse_link.as_ref()).inverse_link_jet(eta_i)?;
                 let mu_i_raw = jet.mu;
                 let dmu_deta_raw = jet.d1;
-                let mu_i = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);
+                let mu_i = mu_i_raw;
                 let dmu_deta = dmu_deta_raw.max(MU_DERIV_EPS);
                 let d2mu_deta2 = jet.d2;
                 let d3mu_deta3 = jet.d3;
@@ -8208,8 +8211,10 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.design.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        assert_eq!(sd.penalties.len(), 2);
-        assert_eq!(sd.nullspace_dims.len(), 2);
+        // Spatial smooths use the canonical operator penalty triplet:
+        // mass + tension + stiffness.
+        assert_eq!(sd.penalties.len(), 3);
+        assert_eq!(sd.nullspace_dims.len(), 3);
     }
 
     #[test]
@@ -10398,6 +10403,94 @@ mod tests {
         assert!(err0 < 1e-8, "mass penalty mismatch too large: {err0}");
         assert!(err1 < 1e-8, "tension penalty mismatch too large: {err1}");
         assert!(err2 < 1e-8, "stiffness penalty mismatch too large: {err2}");
+    }
+
+    #[test]
+    fn extracted_duchon_spatial_runtime_cache_matches_normalized_design_penalties() {
+        let n = 32usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+        }
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 11 },
+                        length_scale: Some(0.8),
+                        power: 2,
+                        nullspace_order: DuchonNullspaceOrder::Zero,
+                        identifiability: SpatialIdentifiability::default(),
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        assert_eq!(design.penalties.len(), 3);
+        let caches =
+            extract_spatial_operator_runtime_caches(&spec, &design).expect("runtime caches");
+        assert_eq!(caches.len(), 1);
+        let cache = &caches[0];
+        let s0 = {
+            let raw = cache.d0.t().dot(&cache.d0);
+            (&raw + &raw.t()) * 0.5
+        };
+        let s1 = {
+            let raw = cache.d1.t().dot(&cache.d1);
+            (&raw + &raw.t()) * 0.5
+        };
+        let s2 = {
+            let raw = cache.d2.t().dot(&cache.d2);
+            (&raw + &raw.t()) * 0.5
+        };
+
+        let s0_global = penalty_matrix_with_local_block(
+            design.design.ncols(),
+            cache.coeff_global_range.clone(),
+            &s0,
+        );
+        let s1_global = penalty_matrix_with_local_block(
+            design.design.ncols(),
+            cache.coeff_global_range.clone(),
+            &s1,
+        );
+        let s2_global = penalty_matrix_with_local_block(
+            design.design.ncols(),
+            cache.coeff_global_range.clone(),
+            &s2,
+        );
+
+        let err0 = (&s0_global - &design.penalties[cache.mass_penalty_global_idx])
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        let err1 = (&s1_global - &design.penalties[cache.tension_penalty_global_idx])
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        let err2 = (&s2_global - &design.penalties[cache.stiffness_penalty_global_idx])
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+
+        assert!(
+            err0 < 1e-8,
+            "Duchon mass penalty mismatch too large: {err0}"
+        );
+        assert!(
+            err1 < 1e-8,
+            "Duchon tension penalty mismatch too large: {err1}"
+        );
+        assert!(
+            err2 < 1e-8,
+            "Duchon stiffness penalty mismatch too large: {err2}"
+        );
     }
 
     #[test]

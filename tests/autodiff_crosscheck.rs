@@ -4,7 +4,7 @@ use ad_trait::forward_ad::adfn::adfn;
 use ad_trait::function_engine::FunctionEngine;
 use autodiff::{F1, Float, diff};
 use gam::families::sigma_link::{
-    bounded_sigma_derivs_up_to_fourth_scalar, bounded_sigma_derivs_up_to_third_scalar,
+    exp_sigma_derivs_up_to_fourth_scalar, exp_sigma_derivs_up_to_third_scalar,
 };
 use num_dual::{DualNum, first_derivative, second_derivative, third_derivative};
 use std::marker::PhantomData;
@@ -17,22 +17,17 @@ struct E2EData {
     b: Vec<f64>,
     y: Vec<f64>,
     w: Vec<f64>,
-    sigma_min: f64,
-    sigma_max: f64,
 }
 
-fn sigma_unclamped_numdual<D: DualNum<f64> + Copy>(eta: D, sigma_min: f64, sigma_max: f64) -> D {
-    let span = (sigma_max - sigma_min).max(1e-12);
-    let one = D::one();
-    let p = one / (one + (-eta).exp());
-    D::from(sigma_min) + D::from(span) * p
+fn sigma_numdual<D: DualNum<f64> + Copy>(eta: D) -> D {
+    eta.exp()
 }
 
 fn e2e_objective_numdual<D: DualNum<f64> + Copy>(theta: D, data: &E2EData) -> D {
     let mut acc = D::zero();
     for i in 0..data.a.len() {
         let eta = theta * D::from(data.a[i]) + D::from(data.b[i]);
-        let s = sigma_unclamped_numdual(eta, data.sigma_min, data.sigma_max);
+        let s = sigma_numdual(eta);
         let y = D::from(data.y[i]);
         let half = D::from(0.5);
         let phi = s.ln() + half * (y / s) * (y / s);
@@ -43,11 +38,9 @@ fn e2e_objective_numdual<D: DualNum<f64> + Copy>(theta: D, data: &E2EData) -> D 
 
 fn e2e_objective_f64(theta: f64, data: &E2EData) -> f64 {
     let mut acc = 0.0;
-    let span = (data.sigma_max - data.sigma_min).max(1e-12);
     for i in 0..data.a.len() {
         let eta = theta * data.a[i] + data.b[i];
-        let p = 1.0 / (1.0 + (-eta).exp());
-        let s = data.sigma_min + span * p;
+        let s = eta.exp();
         let y = data.y[i];
         let phi = s.ln() + 0.5 * (y / s) * (y / s);
         acc += data.w[i] * phi;
@@ -63,8 +56,7 @@ fn e2e_manual_derivatives(theta: f64, data: &E2EData) -> (f64, f64, f64, f64) {
 
     for i in 0..data.a.len() {
         let eta = theta * data.a[i] + data.b[i];
-        let (s, s1, s2, s3, _) =
-            bounded_sigma_derivs_up_to_fourth_scalar(eta, data.sigma_min, data.sigma_max);
+        let (s, s1, s2, s3, _) = exp_sigma_derivs_up_to_fourth_scalar(eta);
 
         let y = data.y[i];
         let y2 = y * y;
@@ -95,22 +87,19 @@ fn e2e_manual_derivatives(theta: f64, data: &E2EData) -> (f64, f64, f64, f64) {
 
 #[derive(Clone)]
 struct SigmaFn<T: AD> {
-    sigma_min: T,
-    span: T,
+    _marker: PhantomData<T>,
 }
 
 impl<T: AD> SigmaFn<T> {
-    fn new(sigma_min: f64, sigma_max: f64) -> Self {
+    fn new() -> Self {
         Self {
-            sigma_min: T::constant(sigma_min),
-            span: T::constant((sigma_max - sigma_min).max(1e-12)),
+            _marker: PhantomData,
         }
     }
 
     fn to_other_ad_type<T2: AD>(&self) -> SigmaFn<T2> {
         SigmaFn {
-            sigma_min: self.sigma_min.to_other_ad_type::<T2>(),
-            span: self.span.to_other_ad_type::<T2>(),
+            _marker: PhantomData,
         }
     }
 }
@@ -119,9 +108,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for SigmaFn<T> {
     const NAME: &'static str = "SigmaFn";
 
     fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
-        let eta = inputs[0];
-        let p = T::one() / (T::one() + (-eta).exp());
-        vec![self.sigma_min + self.span * p]
+        vec![inputs[0].exp()]
     }
 
     fn num_inputs(&self) -> usize {
@@ -160,14 +147,11 @@ impl<T: AD> DifferentiableFunctionTrait<T> for E2EFn<T> {
 
     fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
         let theta = inputs[0];
-        let sigma_min = T::constant(self.data.sigma_min);
-        let span = T::constant((self.data.sigma_max - self.data.sigma_min).max(1e-12));
         let mut acc = T::zero();
 
         for i in 0..self.data.a.len() {
             let eta = theta * T::constant(self.data.a[i]) + T::constant(self.data.b[i]);
-            let p = T::one() / (T::one() + (-eta).exp());
-            let s = sigma_min + span * p;
+            let s = eta.exp();
             let y = T::constant(self.data.y[i]);
             let w = T::constant(self.data.w[i]);
             let phi = s.ln() + T::constant(0.5) * (y / s) * (y / s);
@@ -188,19 +172,14 @@ impl<T: AD> DifferentiableFunctionTrait<T> for E2EFn<T> {
 
 #[test]
 fn sigma_manual_matches_num_dual_first_through_third() {
-    let sigma_min = 0.05;
-    let sigma_max = 12.0;
     let points = [-7.0, -3.0, -1.25, -0.2, 0.0, 0.4, 1.7, 3.2, 6.5];
 
     for eta in points {
-        let (s, d1, d2, d3) = bounded_sigma_derivs_up_to_third_scalar(eta, sigma_min, sigma_max);
+        let (s, d1, d2, d3) = exp_sigma_derivs_up_to_third_scalar(eta);
 
-        let (s_ad, d1_ad) =
-            first_derivative(|x| sigma_unclamped_numdual(x, sigma_min, sigma_max), eta);
-        let (s2_ad, d1_2_ad, d2_ad) =
-            second_derivative(|x| sigma_unclamped_numdual(x, sigma_min, sigma_max), eta);
-        let (s3_ad, d1_3_ad, d2_3_ad, d3_ad) =
-            third_derivative(|x| sigma_unclamped_numdual(x, sigma_min, sigma_max), eta);
+        let (s_ad, d1_ad) = first_derivative(sigma_numdual, eta);
+        let (s2_ad, d1_2_ad, d2_ad) = second_derivative(sigma_numdual, eta);
+        let (s3_ad, d1_3_ad, d2_3_ad, d3_ad) = third_derivative(sigma_numdual, eta);
 
         assert_manual_ad_band!("sigma_num_dual", eta, "s", s,
             "num_dual_1" => s_ad, "num_dual_2" => s2_ad, "num_dual_3" => s3_ad);
@@ -214,21 +193,11 @@ fn sigma_manual_matches_num_dual_first_through_third() {
 
 #[test]
 fn sigma_manual_matches_autodiff_forward_mode_first_derivative() {
-    let sigma_min: f64 = 0.1;
-    let sigma_max: f64 = 6.2;
-    let span = (sigma_max - sigma_min).max(1e-12);
     let points = [-6.0, -2.0, -0.3, 0.3, 1.4, 4.0, 6.0];
 
     for eta in points {
-        let (_, d1, _, _) = bounded_sigma_derivs_up_to_third_scalar(eta, sigma_min, sigma_max);
-
-        let d1_ad = diff(
-            |x: F1| {
-                let p = F1::cst(1.0) / (F1::cst(1.0) + (-x).exp());
-                F1::cst(sigma_min) + F1::cst(span) * p
-            },
-            eta,
-        );
+        let (_, d1, _, _) = exp_sigma_derivs_up_to_third_scalar(eta);
+        let d1_ad = diff(|x: F1| x.exp(), eta);
 
         assert_manual_ad_band!("sigma_autodiff", eta, "d1", d1, "autodiff" => d1_ad);
     }
@@ -236,16 +205,14 @@ fn sigma_manual_matches_autodiff_forward_mode_first_derivative() {
 
 #[test]
 fn sigma_manual_matches_ad_trait_forward_mode_first_derivative() {
-    let sigma_min = 0.2;
-    let sigma_max = 4.4;
     let points = [-5.0, -1.1, -0.1, 0.7, 1.8, 3.0, 5.0];
 
-    let f_std = SigmaFn::<f64>::new(sigma_min, sigma_max);
+    let f_std = SigmaFn::<f64>::new();
     let f_ad = f_std.to_other_ad_type::<adfn<1>>();
     let engine = FunctionEngine::new(f_std, f_ad, ForwardAD::new());
 
     for eta in points {
-        let (_, d1, _, _) = bounded_sigma_derivs_up_to_third_scalar(eta, sigma_min, sigma_max);
+        let (_, d1, _, _) = exp_sigma_derivs_up_to_third_scalar(eta);
         let (_value, jac) = engine.derivative(&[eta]);
         assert_manual_ad_band!("sigma_ad_trait", eta, "d1", d1, "ad_trait" => jac[(0, 0)]);
     }
@@ -258,8 +225,6 @@ fn e2e_manual_derivatives_match_num_dual_and_first_order_ad_engines() {
         b: vec![-0.2, 1.1, -1.4, 0.9, 0.3, -0.7],
         y: vec![0.5, -1.2, 0.9, 1.7, -0.4, 0.2],
         w: vec![1.0, 0.8, 1.3, 0.7, 1.1, 0.9],
-        sigma_min: 0.15,
-        sigma_max: 5.5,
     };
 
     let f_std = E2EFn::<f64>::new(data.clone());
@@ -279,12 +244,10 @@ fn e2e_manual_derivatives_match_num_dual_and_first_order_ad_engines() {
 
         let d1_autodiff = diff(
             |x: F1| {
-                let span = data.sigma_max - data.sigma_min;
                 let mut acc = F1::cst(0.0);
                 for i in 0..data.a.len() {
                     let eta = x * data.a[i] + data.b[i];
-                    let p = F1::cst(1.0) / (F1::cst(1.0) + (-eta).exp());
-                    let s = F1::cst(data.sigma_min) + F1::cst(span) * p;
+                    let s = eta.exp();
                     let y = data.y[i];
                     let phi = s.ln() + F1::cst(0.5) * (y / s) * (y / s);
                     acc += data.w[i] * phi;

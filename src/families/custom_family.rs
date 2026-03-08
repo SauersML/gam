@@ -1028,7 +1028,7 @@ fn inner_exact_joint_fit<F: CustomFamily>(
                 .expect("inner exact-joint tolerance must be valid"),
         )
         .with_max_iterations(
-            MaxIterations::new(options.inner_max_cycles.max(100))
+            MaxIterations::new(options.inner_max_cycles.max(200))
                 .expect("inner exact-joint max iterations must be valid"),
         );
 
@@ -4864,6 +4864,8 @@ mod tests {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            threshold_design: None,
+            log_sigma_design: None,
         };
         let specs = vec![threshold_spec, log_sigma_spec];
         let penalty_counts = vec![1usize, 1usize];
@@ -4947,10 +4949,14 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.05]),
         };
+        let threshold_design = threshold_spec.design.clone();
+        let log_sigma_design = log_sigma_spec.design.clone();
         let family = BinomialLocationScaleFamily {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            threshold_design: Some(threshold_design),
+            log_sigma_design: Some(log_sigma_design),
         };
         let specs = vec![threshold_spec, log_sigma_spec];
         let penalty_counts = vec![1usize, 1usize];

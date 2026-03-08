@@ -631,7 +631,6 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
         mu: &Array1<f64>,
         prior_weights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
-        const EPS: f64 = 1e-8;
         match self {
             GlmLikelihoodFamily::GaussianIdentity => {
                 let ll = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
@@ -652,7 +651,7 @@ impl WorkingLikelihood for GlmLikelihoodFamily {
                 let ll = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
                     0.0,
                     |acc, &yi, &mui, &wi| {
-                        let p = mui.clamp(EPS, 1.0 - EPS);
+                        let p = mui;
                         acc + wi * (yi * p.ln() + (1.0 - yi) * (1.0 - p).ln())
                     },
                 );
@@ -4387,7 +4386,7 @@ fn bernoulli_geometry_from_jet(
     const MIN_D_FOR_Z: f64 = 1e-6;
     const PROB_EPS: f64 = 1e-8;
 
-    let mu = jet.mu.clamp(PROB_EPS, 1.0 - PROB_EPS);
+    let mu = jet.mu;
     let v = (mu * (1.0 - mu)).max(PROB_EPS);
     let n0 = jet.d1 * jet.d1;
     let fisher = n0 / v;
@@ -4396,8 +4395,7 @@ fn bernoulli_geometry_from_jet(
     } else {
         fisher
     };
-    let nonsmooth =
-        eta_raw != eta_used || mu <= PROB_EPS || mu >= 1.0 - PROB_EPS || fisher <= MIN_WEIGHT;
+    let nonsmooth = eta_raw != eta_used || fisher <= MIN_WEIGHT;
     let (c, d) = if nonsmooth && zero_on_nonsmooth {
         (0.0, 0.0)
     } else {
@@ -4964,7 +4962,7 @@ pub fn calculate_deviance(
     link: LinkFunction,
     prior_weights: ArrayView1<f64>,
 ) -> f64 {
-    const EPS: f64 = 1e-8; // Increased from 1e-9 for better numerical stability
+    const EPS: f64 = 1e-8;
     match link {
         LinkFunction::Logit
         | LinkFunction::Probit
@@ -4974,7 +4972,7 @@ pub fn calculate_deviance(
             let total_residual = ndarray::Zip::from(y).and(mu).and(prior_weights).fold(
                 0.0,
                 |acc, &yi, &mui, &wi| {
-                    let mui_c = mui.clamp(EPS, 1.0 - EPS);
+                    let mui_c = mui;
                     // More numerically stable formulation: use difference of logs instead of log of ratio
                     let term1 = if yi > EPS {
                         yi * (yi.ln() - mui_c.ln())

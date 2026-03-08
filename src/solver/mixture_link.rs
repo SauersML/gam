@@ -956,10 +956,8 @@ pub fn beta_logistic_inverse_link_jet(eta: f64, delta: f64, epsilon: f64) -> Inv
     let (u, du) = logistic_u_with_derivatives(eta);
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
-    let raw_mu = beta_reg(a, b, u);
-    let mu = raw_mu.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
-    let mu_clamped = mu != raw_mu;
-    if mu_clamped || du == 0.0 {
+    let mu = beta_reg(a, b, u);
+    if du == 0.0 {
         return InverseLinkJet {
             mu,
             d1: 0.0,
@@ -1004,11 +1002,7 @@ pub fn beta_logistic_inverse_link_pdf_third_derivative(eta: f64, delta: f64, eps
     }
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
-    let raw_mu = beta_reg(a, b, u);
-    let mu = raw_mu.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
-    if mu != raw_mu {
-        return 0.0;
-    }
+    let _mu = beta_reg(a, b, u);
     let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
     let d1 = log_d1.exp();
     let c = a + b;
@@ -1025,9 +1019,8 @@ pub fn beta_logistic_inverse_link_jet_with_param_partials(
     let (u, du) = logistic_u_with_derivatives(eta);
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
-    let raw_mu = beta_reg(a, b, u);
-    let mu = raw_mu.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
-    if du == 0.0 || mu != raw_mu {
+    let mu = beta_reg(a, b, u);
+    if du == 0.0 {
         let zero = InverseLinkJet {
             mu,
             d1: 0.0,
