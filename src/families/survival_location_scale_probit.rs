@@ -667,24 +667,17 @@ fn dense_design(design: &DesignMatrix, name: &str) -> Result<Array2<f64>, String
 fn xt_diag_x(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
     let n = x.nrows();
     let p = x.ncols();
-    let mut out = Array2::<f64>::zeros((p, p));
+    let mut x_weighted = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         let wi = w[i];
         if wi == 0.0 {
             continue;
         }
-        for a in 0..p {
-            let xa = x[[i, a]];
-            let wxa = wi * xa;
-            out[[a, a]] += wxa * x[[i, a]];
-            for b in (a + 1)..p {
-                let update = wxa * x[[i, b]];
-                out[[a, b]] += update;
-                out[[b, a]] += update;
-            }
+        for j in 0..p {
+            x_weighted[[i, j]] = x[[i, j]] * wi;
         }
     }
-    out
+    crate::faer_ndarray::fast_atb(x, &x_weighted)
 }
 
 impl CustomFamily for SurvivalLocationScaleProbitFamily {

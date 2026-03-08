@@ -38,7 +38,7 @@ mod tests {
     };
     use crate::pirls::{PirlsCoordinateFrame, directional_working_curvature_from_eta};
     use faer::Side;
-    use ndarray::{Array1, Array2, array};
+    use ndarray::{Array1, Array2, array, s};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -571,6 +571,53 @@ mod tests {
     }
 
     #[test]
+    fn directional_hyper_gradient_ignores_h_pos_factor_when_active_subspace_is_unstable() {
+        let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.1, 0.2],
+            [1.0, -0.6, -0.3],
+            [1.0, -0.1, 0.5],
+            [1.0, 0.3, -0.7],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, -0.4],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
+        let hyper = DirectionalHyperParam::single_penalty(
+            0,
+            Array2::from_elem((x.nrows(), x.ncols()), 1e-3),
+            Array2::<f64>::zeros((x.ncols(), x.ncols())),
+            None,
+            None,
+        )
+        .expect("single-penalty hyper direction");
+        let rho = array![0.0];
+        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-8, true);
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        state.clear_warm_start();
+        let dense_bundle = state.obtain_eval_bundle(&rho).expect("dense bundle");
+
+        let mut unstable_bundle = dense_bundle.clone();
+        unstable_bundle.active_subspace_unstable = true;
+        let g_unstable = state
+            .compute_directional_hyper_gradient_with_bundle(&rho, &unstable_bundle, &hyper)
+            .expect("unstable bundle directional gradient");
+
+        let mut poisoned_bundle = unstable_bundle.clone();
+        poisoned_bundle.h_pos_factor_w =
+            Arc::new(Array2::<f64>::zeros(dense_bundle.h_pos_factor_w.raw_dim()));
+        let g_poisoned = state
+            .compute_directional_hyper_gradient_with_bundle(&rho, &poisoned_bundle, &hyper)
+            .expect("poisoned unstable bundle directional gradient");
+
+        let abs = (g_unstable - g_poisoned).abs();
+        assert!(
+            abs < 1e-10,
+            "unstable directional gradient should ignore cached H_+ factor: stable-fallback={g_unstable:.6e}, poisoned={g_poisoned:.6e}, abs={abs:.3e}"
+        );
+    }
+
+    #[test]
     fn sparse_exact_directional_firth_branch_is_wired_and_matches_dense() {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
@@ -707,6 +754,123 @@ mod tests {
         assert!(
             mixed_0.is_finite() && mixed_1.is_finite(),
             "mixed blocks must be finite"
+        );
+    }
+
+    #[test]
+    fn joint_tau_tau_linear_dirs_match_fd_reference_away_from_zero_psi() {
+        let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.2, 0.3],
+            [1.0, -0.8, -0.4],
+            [1.0, -0.3, 0.7],
+            [1.0, 0.1, -0.9],
+            [1.0, 0.5, 0.2],
+            [1.0, 0.9, -0.1],
+            [1.0, 1.3, 0.8],
+            [1.0, 1.7, -0.6],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
+        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, true);
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        state.clear_warm_start();
+        let rho = array![0.0];
+        let psi = array![0.7, -0.4];
+        let theta = array![rho[0], psi[0], psi[1]];
+        let hyper_dirs = vec![
+            DirectionalHyperParam::single_penalty(
+                0,
+                Array2::<f64>::zeros((x.nrows(), x.ncols())),
+                array![[0.0, 0.0, 0.0], [0.0, 0.2, 0.01], [0.0, 0.01, 0.15],],
+                None,
+                None,
+            )
+            .expect("linear tau direction"),
+            DirectionalHyperParam::single_penalty(
+                0,
+                Array2::from_elem((x.nrows(), x.ncols()), 2e-4),
+                Array2::<f64>::zeros((x.ncols(), x.ncols())),
+                None,
+                None,
+            )
+            .expect("linear tau direction"),
+        ];
+
+        let h = state
+            .compute_joint_hyper_hessian(&theta, rho.len(), &hyper_dirs)
+            .expect("joint hyper hessian");
+        let h_tt_analytic = h.slice(s![rho.len().., rho.len()..]).to_owned();
+
+        let mut h_tt_fd = Array2::<f64>::zeros((hyper_dirs.len(), hyper_dirs.len()));
+        for j in 0..hyper_dirs.len() {
+            let h = 1e-5;
+            let mut theta_plus = theta.clone();
+            let mut theta_minus = theta.clone();
+            theta_plus[rho.len() + j] += h;
+            theta_minus[rho.len() + j] -= h;
+            let (_, g_plus) = state
+                .compute_joint_hyper_cost_gradient(&theta_plus, rho.len(), &hyper_dirs)
+                .expect("g+");
+            let (_, g_minus) = state
+                .compute_joint_hyper_cost_gradient(&theta_minus, rho.len(), &hyper_dirs)
+                .expect("g-");
+            let tau_col =
+                (&g_plus.slice(s![rho.len()..]) - &g_minus.slice(s![rho.len()..])) / (2.0 * h);
+            h_tt_fd.column_mut(j).assign(&tau_col);
+        }
+        for i in 0..h_tt_fd.nrows() {
+            for j in 0..i {
+                let avg = 0.5 * (h_tt_fd[[i, j]] + h_tt_fd[[j, i]]);
+                h_tt_fd[[i, j]] = avg;
+                h_tt_fd[[j, i]] = avg;
+            }
+        }
+
+        let num = (&h_tt_analytic - &h_tt_fd)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let den = h_tt_fd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
+        let rel = num / den;
+        assert!(
+            rel < 3e-1,
+            "linear-dir joint tau-tau block deviates from FD reference away from zero psi: rel={rel:.3e}, analytic={h_tt_analytic:?}, fd={h_tt_fd:?}"
+        );
+    }
+
+    #[test]
+    fn joint_hyper_validation_rejects_out_of_bounds_second_order_penalty_index() {
+        let y = array![0.0, 1.0, 0.0, 1.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -0.5, 0.2],
+            [1.0, -0.1, -0.3],
+            [1.0, 0.4, 0.6],
+            [1.0, 0.9, -0.2],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
+        let cfg = RemlConfig::external(LinkFunction::Logit, 1e-10, true);
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let theta = array![0.0, 0.0];
+        let hyper_dirs = vec![
+            DirectionalHyperParam::new(
+                Array2::<f64>::zeros((x.nrows(), x.ncols())),
+                vec![(0, Array2::<f64>::zeros((x.ncols(), x.ncols())))],
+                None,
+                Some(vec![vec![(1, Array2::<f64>::eye(x.ncols()))]]),
+            )
+            .expect("hyper direction with invalid second-order penalty index"),
+        ];
+
+        let err = state
+            .compute_joint_hyper_hessian(&theta, 1, &hyper_dirs)
+            .expect_err("invalid second-order penalty index should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("penalty_index 1 out of bounds") && msg.contains("S_tau_tau[0][0]"),
+            "unexpected validation error: {msg}"
         );
     }
 

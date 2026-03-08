@@ -7,7 +7,9 @@
 //!
 //! Where:
 //! - Xβ: High-dimensional predictors (high-dimensional predictors) with ridge penalty
-//! - g(·): Flexible 1D link correction with scale anchor (g(u) = u + B(u)θ)
+//! - g(·): Flexible 1D link correction with a constrained spline wiggle
+//!   whose intercept and linear components are projected out
+//!   (g(u) = u + B(u)θ in the constrained basis)
 //!
 //! The algorithm:
 //! - Outer: gradient-only trust-region optimization over ρ = [log(λ_base), log(λ_link)]
@@ -28,16 +30,15 @@ use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
 use crate::probability::normal_cdf;
 use crate::quadrature::QuadratureContext;
-use crate::solver::opt_objective::CachedSecondOrderObjective;
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
+use crate::solver::opt_objective::CachedSecondOrderObjective;
 use crate::types::{GlmLikelihoodFamily, InverseLink, LikelihoodFamily, LinkFunction};
 use crate::visualizer;
 use faer::Side;
 use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use opt::{
-    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError,
-    Tolerance,
+    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
 };
 
 // NOTE on z standardization:
@@ -74,6 +75,17 @@ fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<GlmLikelih
 }
 
 #[inline]
+fn joint_prediction_supported(link: LinkFunction) -> Result<(), EstimationError> {
+    if matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic) {
+        return Err(EstimationError::InvalidSpecification(
+            "predict_joint does not support state-less SAS/Beta-Logistic links; explicit fitted link state is required"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
 fn joint_point_inverse_link(link: LinkFunction, eta: f64) -> f64 {
     match link {
         LinkFunction::Identity => eta,
@@ -86,9 +98,20 @@ fn joint_point_inverse_link(link: LinkFunction, eta: f64) -> f64 {
             let e = eta.clamp(-30.0, 30.0);
             1.0 - (-e.exp()).exp()
         }
-        // Joint state-less pipeline does not support SAS; this sentinel keeps
-        // failure explicit if an incompatible model reaches prediction.
-        LinkFunction::Sas | LinkFunction::BetaLogistic => f64::NAN,
+        LinkFunction::Sas | LinkFunction::BetaLogistic => unreachable!(
+            "joint_point_inverse_link called for unsupported state-less SAS/Beta-Logistic link"
+        ),
+    }
+}
+
+#[inline]
+fn seed_risk_profile_for_joint_link(link: LinkFunction) -> SeedRiskProfile {
+    match link {
+        LinkFunction::Identity => SeedRiskProfile::Gaussian,
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
+            SeedRiskProfile::GeneralizedLinear
+        }
+        LinkFunction::Sas | LinkFunction::BetaLogistic => SeedRiskProfile::GeneralizedLinear,
     }
 }
 
@@ -1186,7 +1209,9 @@ impl<'a> JointModelState<'a> {
 /// The inner solve uses a Jacobian J instead of fixed design X:
 ///   J_i = [g'(u_i) * x_i | B(u_i)]
 ///
-/// Identifiability: scale anchor enforces g(0)≈0, g'(0)≈1
+/// Identifiability: the wiggle basis is projected into the null space of the
+/// intercept and linear functions, so the flexible correction cannot absorb the
+/// global level or slope already carried by the base predictor.
 pub(crate) fn fit_joint_model<'a>(
     y: ArrayView1<'a, f64>,
     weights: ArrayView1<'a, f64>,
@@ -2385,13 +2410,21 @@ impl<'a> JointRemlState<'a> {
         // Raw penalty for link block and its projection (constant for this rho).
         let s_raw = if p_link > 0 {
             let greville_for_penalty =
-                penalty_greville_abscissae_for_knots(knot_vector, state.degree).unwrap_or(None);
+                penalty_greville_abscissae_for_knots(knot_vector, state.degree).map_err(|e| {
+                    EstimationError::InvalidSpecification(format!(
+                        "invalid joint link-basis penalty geometry: {e}"
+                    ))
+                })?;
             create_difference_penalty_matrix(
                 n_raw,
                 2,
                 greville_for_penalty.as_ref().map(|g| g.view()),
             )
-            .unwrap_or_else(|_| Array2::zeros((n_raw, n_raw)))
+            .map_err(|e| {
+                EstimationError::InvalidSpecification(format!(
+                    "failed to construct joint link-basis penalty: {e}"
+                ))
+            })?
         } else {
             Array2::zeros((0, 0))
         };
@@ -2913,22 +2946,7 @@ impl<'a> JointRemlState<'a> {
             .unwrap_or_else(|| Array1::zeros(0));
         let b_wiggle = state.build_link_basis_from_state(&state.base_linear_predictor());
         let eta = state.compute_eta_full(&state.base_linear_predictor(), &b_wiggle);
-        let mut mu = Array1::<f64>::zeros(state.n_obs());
-        let mut weights = Array1::<f64>::zeros(state.n_obs());
-        let mut z = Array1::<f64>::zeros(state.n_obs());
-        if let Err(e) = crate::pirls::update_glm_vectors(
-            state.y,
-            &eta,
-            &InverseLink::Standard(state.link),
-            state.weights,
-            &mut mu,
-            &mut weights,
-            &mut z,
-            None,
-        ) {
-            log::warn!("joint final working-vector update failed: {}", e);
-        }
-        let deviance = state.compute_deviance(&mu);
+        let deviance = state.recompute_deviance_from_eta(&eta);
         JointModelResult {
             beta_base: state.beta_base,
             beta_link: state.beta_link,
@@ -3015,7 +3033,7 @@ pub(crate) fn fit_joint_model_with_reml<'a>(
             4
         },
         screen_max_inner_iterations: 5,
-        risk_profile: SeedRiskProfile::Survival,
+        risk_profile: seed_risk_profile_for_joint_link(link),
     };
     let seed_candidates =
         generate_rho_candidates(n_base + 1, heuristic_lambdas.as_deref(), &seed_config);
@@ -3387,7 +3405,8 @@ pub fn predict_joint(
     result: &JointModelResult,
     eta_base: &Array1<f64>,
     se_base: Option<&Array1<f64>>,
-) -> JointModelPrediction {
+) -> Result<JointModelPrediction, EstimationError> {
+    joint_prediction_supported(result.link)?;
     let n = eta_base.len();
 
     // Use stored knot range from training for consistent standardization
@@ -3479,11 +3498,11 @@ pub fn predict_joint(
         (probs, None)
     };
 
-    JointModelPrediction {
+    Ok(JointModelPrediction {
         eta: eta_cal,
         probabilities,
         effective_se,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -3561,7 +3580,7 @@ mod tests {
         let eta_base = Array1::from_vec(vec![-2.0, -1.0, 0.0, 1.0, 2.0]);
 
         // Predict without SE (should give sigmoid of eta)
-        let pred = predict_joint(&result, &eta_base, None);
+        let pred = predict_joint(&result, &eta_base, None).expect("joint prediction");
 
         assert_eq!(pred.eta.len(), 5);
         assert_eq!(pred.probabilities.len(), 5);
@@ -3615,7 +3634,7 @@ mod tests {
         let eta_base = Array1::from_vec(vec![0.0, 1.0, 2.0]);
         let se_base = Array1::from_vec(vec![0.5, 0.5, 0.5]);
 
-        let pred = predict_joint(&result, &eta_base, Some(&se_base));
+        let pred = predict_joint(&result, &eta_base, Some(&se_base)).expect("joint prediction");
 
         assert!(pred.effective_se.is_some());
         let eff_se = pred.effective_se.unwrap();
@@ -3624,6 +3643,34 @@ mod tests {
         // With zero wiggle, g'(u)=1 so effective SE equals base SE.
         for i in 0..3 {
             assert!((eff_se[i] - se_base[i]).abs() < 0.1);
+        }
+    }
+
+    #[test]
+    fn test_predict_joint_rejects_stateless_sas() {
+        let degree = 3;
+        let knot_vector = Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
+        let num_basis = knot_vector.len().saturating_sub(degree + 1);
+        let result = JointModelResult {
+            beta_base: Array1::zeros(1),
+            beta_link: Array1::zeros(num_basis),
+            lambdas: vec![1.0],
+            deviance: 0.0,
+            edf: 0.0,
+            backfit_iterations: 0,
+            converged: false,
+            knot_range: (0.0, 1.0),
+            knot_vector,
+            link_transform: Array2::eye(num_basis),
+            degree,
+            link: LinkFunction::Sas,
+            s_link_constrained: Array2::eye(num_basis),
+            ridge_used: 0.0,
+        };
+        let eta_base = Array1::zeros(2);
+        match predict_joint(&result, &eta_base, None) {
+            Ok(_) => panic!("stateless SAS must fail"),
+            Err(err) => assert!(format!("{err}").contains("state-less SAS/Beta-Logistic")),
         }
     }
 
@@ -3810,6 +3857,72 @@ mod tests {
             .compute_gradient_analytic_for_test(&rho)
             .expect("integrated logit analytic gradient");
         assert!(grad.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_into_result_preserves_integrated_deviance_path() {
+        let n = 48;
+        let p = 3;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = -1.0 + 2.0 * (i as f64) / ((n - 1) as f64);
+            x[[i, 2]] = ((i as f64) / 7.0).sin();
+        }
+        let beta = Array1::from_vec(vec![0.25, -0.9, 0.55]);
+        let eta = x.dot(&beta);
+        let y = eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
+        let weights = Array1::ones(n);
+        let s = vec![Array2::eye(p)];
+        let layout = EngineDims::new(p, 1);
+        let mut reml_state = JointRemlState::new(
+            y.view(),
+            weights.view(),
+            x.view(),
+            s,
+            layout,
+            LinkFunction::Logit,
+            &JointModelConfig::default(),
+            Some(Array1::from_elem(n, 0.4)),
+            QuadratureContext::new(),
+        );
+        reml_state.core.state.beta_base = beta;
+        let u = reml_state.core.state.base_linear_predictor();
+        reml_state
+            .core
+            .state
+            .build_link_basis(&u)
+            .expect("link basis");
+        let eta_full = reml_state
+            .core
+            .state
+            .compute_eta_full(&u, &reml_state.core.state.build_link_basis_from_state(&u));
+        let expected = reml_state.core.state.recompute_deviance_from_eta(&eta_full);
+        let result = reml_state.into_result();
+        assert!(
+            (result.deviance - expected).abs() <= 1e-10,
+            "integrated final deviance drifted: got {}, expected {}",
+            result.deviance,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_joint_seed_profile_matches_link_family() {
+        assert_eq!(
+            seed_risk_profile_for_joint_link(LinkFunction::Identity),
+            SeedRiskProfile::Gaussian
+        );
+        for link in [
+            LinkFunction::Logit,
+            LinkFunction::Probit,
+            LinkFunction::CLogLog,
+        ] {
+            assert_eq!(
+                seed_risk_profile_for_joint_link(link),
+                SeedRiskProfile::GeneralizedLinear
+            );
+        }
     }
 
     #[test]

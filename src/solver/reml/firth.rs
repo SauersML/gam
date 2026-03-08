@@ -741,8 +741,8 @@ impl<'a> RemlState<'a> {
         // and optional H_{phi,tau}|beta kernel for later matrix-free applies.
         //
         // Closed forms (reduced Fisher, fixed active subspace):
-        //   Phi = -0.5 log|I_r|, I_r = X_r' W X_r, K_r = I_r^{-1}
-        //   Phi_tau|beta = -0.5 tr(K_r I_{r,tau}).
+        //   Phi = 0.5 log|I_r|, I_r = X_r' W X_r, K_r = I_r^{-1}
+        //   Phi_tau|beta = 0.5 tr(K_r I_{r,tau}).
         //
         //   (g_phi)_tau = Phi_beta,tau
         //               = 0.5 X_tau' (w1 .* h)
@@ -760,7 +760,7 @@ impl<'a> RemlState<'a> {
         let second_vec = &(&(&op.w2 * &deta_partial) * &op.h_diag) + &(&op.w1 * &dot_h_partial);
         let second = 0.5 * op.x_dense.t().dot(&second_vec);
         let g_phi_tau = first + second;
-        let phi_tau_partial = -0.5 * Self::trace_product(&op.k_reduced, &dot_i_partial);
+        let phi_tau_partial = 0.5 * Self::trace_product(&op.k_reduced, &dot_i_partial);
 
         let tau_kernel = if include_hphi_tau_kernel {
             Some(Self::firth_hphi_tau_partial_prepare_from_partials(
@@ -1015,6 +1015,22 @@ mod tests {
         (f(x + h) - 2.0 * f(x) + f(x - h)) / (h * h)
     }
 
+    fn firth_phi_value(x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
+        let eta = x.dot(beta);
+        let op = RemlState::build_firth_dense_operator(x, &eta).expect("firth operator");
+        let fisher = fast_atb(&op.x_reduced, &RemlState::row_scale(&op.x_reduced, &op.w));
+        let (evals, _) = fisher
+            .eigh(Side::Lower)
+            .expect("reduced Fisher eigendecomp");
+        0.5 * evals.iter().map(|v| v.ln()).sum::<f64>()
+    }
+
+    fn firth_grad_phi(x: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
+        let eta = x.dot(beta);
+        let op = RemlState::build_firth_dense_operator(x, &eta).expect("firth operator");
+        0.5 * x.t().dot(&(&op.w1 * &op.h_diag))
+    }
+
     #[test]
     fn firth_logistic_weight_derivatives_match_finite_difference() {
         let x = array![
@@ -1123,5 +1139,74 @@ mod tests {
         let diff = &direct - &via_apply;
         let err = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
         assert!(err < 1e-10, "direction/apply mismatch: {err:e}");
+    }
+
+    #[test]
+    fn firth_phi_tau_partial_matches_finite_difference_logdet() {
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.6, -0.3],
+            [1.0, -0.1, 0.5],
+            [1.0, 0.3, -0.7],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, -0.4],
+        ];
+        let x_tau = array![
+            [0.0, 0.15, -0.05],
+            [0.0, -0.10, 0.02],
+            [0.0, 0.08, 0.04],
+            [0.0, -0.06, -0.03],
+            [0.0, 0.05, 0.01],
+            [0.0, -0.12, 0.06],
+        ];
+        let beta = array![0.1, -0.25, 0.2];
+        let eta = x.dot(&beta);
+        let op = RemlState::build_firth_dense_operator(&x, &eta).expect("firth operator");
+        let analytic = RemlState::firth_exact_tau_kernel(&op, &x_tau, &beta, false).phi_tau_partial;
+
+        let h = 1e-6;
+        let x_plus = &x + &(h * &x_tau);
+        let x_minus = &x - &(h * &x_tau);
+        let fd = (firth_phi_value(&x_plus, &beta) - firth_phi_value(&x_minus, &beta)) / (2.0 * h);
+
+        assert!(
+            (analytic - fd).abs() < 1e-6,
+            "Phi_tau mismatch: analytic={analytic:.12e}, fd={fd:.12e}"
+        );
+    }
+
+    #[test]
+    fn firth_g_phi_tau_matches_finite_difference_grad_phi() {
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.6, -0.3],
+            [1.0, -0.1, 0.5],
+            [1.0, 0.3, -0.7],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, -0.4],
+        ];
+        let x_tau = array![
+            [0.0, 0.15, -0.05],
+            [0.0, -0.10, 0.02],
+            [0.0, 0.08, 0.04],
+            [0.0, -0.06, -0.03],
+            [0.0, 0.05, 0.01],
+            [0.0, -0.12, 0.06],
+        ];
+        let beta = array![0.1, -0.25, 0.2];
+        let eta = x.dot(&beta);
+        let op = RemlState::build_firth_dense_operator(&x, &eta).expect("firth operator");
+        let analytic = RemlState::firth_exact_tau_kernel(&op, &x_tau, &beta, false).g_phi_tau;
+
+        let h = 1e-6;
+        let x_plus = &x + &(h * &x_tau);
+        let x_minus = &x - &(h * &x_tau);
+        let fd = (firth_grad_phi(&x_plus, &beta) - firth_grad_phi(&x_minus, &beta)) / (2.0 * h);
+
+        let err = (&analytic - &fd).iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            err < 1e-6,
+            "g_phi_tau mismatch: analytic={analytic:?}, fd={fd:?}, err={err:e}"
+        );
     }
 }

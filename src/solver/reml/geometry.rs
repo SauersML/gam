@@ -1,7 +1,32 @@
 use super::*;
 use crate::linalg::sparse_exact::SparseOperatorBlockSupport;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SparseExactLikelihoodStructure {
+    GaussianProfiledScale,
+    SinglePredictorDiagonalCurvature,
+}
+
 impl<'a> RemlState<'a> {
+    fn sparse_exact_likelihood_structure(&self) -> SparseExactLikelihoodStructure {
+        match self.config.link_function() {
+            // Important scope note:
+            // `RemlState` is the single-predictor GLM/GAM REML engine.
+            // In the currently supported family set, `Identity` reaches this
+            // code only for Gaussian-with-profiled-scale fits. Multi-block
+            // GAMLSS and survival models are routed through the custom-family
+            // engine instead, where joint block curvature is handled explicitly.
+            LinkFunction::Identity => SparseExactLikelihoodStructure::GaussianProfiledScale,
+            LinkFunction::Logit
+            | LinkFunction::Probit
+            | LinkFunction::CLogLog
+            | LinkFunction::Sas
+            | LinkFunction::BetaLogistic => {
+                SparseExactLikelihoodStructure::SinglePredictorDiagonalCurvature
+            }
+        }
+    }
+
     fn operator_block_is_local(
         direction_block: &Array2<f64>,
         p_start: usize,
@@ -86,8 +111,8 @@ impl<'a> RemlState<'a> {
         })?;
         let pirls_result = bundle.pirls_result.as_ref();
         let prior_cost = self.compute_soft_prior_cost(rho);
-        match self.config.link_function() {
-            LinkFunction::Identity => {
+        match self.sparse_exact_likelihood_structure() {
+            SparseExactLikelihoodStructure::GaussianProfiledScale => {
                 let n = self.y.len() as f64;
                 let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
                 let rss = pirls_result.deviance;
@@ -100,7 +125,7 @@ impl<'a> RemlState<'a> {
                     + ((n - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
                 Ok(reml + prior_cost)
             }
-            _ => {
+            SparseExactLikelihoodStructure::SinglePredictorDiagonalCurvature => {
                 let mut penalised_ll =
                     -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
                 if self.config.firth_bias_reduction
@@ -197,8 +222,8 @@ impl<'a> RemlState<'a> {
             None
         };
 
-        match self.config.link_function() {
-            LinkFunction::Identity => {
+        match self.sparse_exact_likelihood_structure() {
+            SparseExactLikelihoodStructure::GaussianProfiledScale => {
                 let n = self.y.len() as f64;
                 let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
                 let rss = pirls_result.deviance;
@@ -218,7 +243,7 @@ impl<'a> RemlState<'a> {
                         - 0.5 * det1_values[block.term_index];
                 }
             }
-            _ => {
+            SparseExactLikelihoodStructure::SinglePredictorDiagonalCurvature => {
                 if let Some(op) = firth_op.as_ref() {
                     // Firth/logit sparse-exact gradient:
                     //   g_k = 0.5 β'A_kβ + 0.5 tr(H^{-1} H_k) - 0.5 tr(S_+^dag A_k),
@@ -487,8 +512,8 @@ impl<'a> RemlState<'a> {
         )?;
         let mut trace_h = trace_s_tau + 2.0 * cross;
 
-        match self.config.link_function() {
-            LinkFunction::Identity => {
+        match self.sparse_exact_likelihood_structure() {
+            SparseExactLikelihoodStructure::GaussianProfiledScale => {
                 let e = &pirls_result.reparam_result.e_transformed;
                 let (penalty_rank, _) =
                     self.fixed_subspace_penalty_rank_and_logdet(e, pirls_result.ridge_passport)?;
@@ -510,7 +535,7 @@ impl<'a> RemlState<'a> {
                 let dp_tau = 2.0 * fit_block;
                 Ok(dp_tau / (2.0 * phi) + 0.5 * trace_h - 0.5 * pseudo_det_trace)
             }
-            _ => {
+            SparseExactLikelihoodStructure::SinglePredictorDiagonalCurvature => {
                 let runtime_link = self.runtime_inverse_link();
                 let w_tau = crate::pirls::directional_working_curvature_from_eta_with_state(
                     &runtime_link,
@@ -1057,6 +1082,9 @@ impl<'a> RemlState<'a> {
                 density_h_upper_est,
             };
 
+        // This selector only chooses geometry for the single-predictor
+        // `RemlState` engine. Distributional GAMLSS and survival families do
+        // not route here; they use the custom-family exact-Newton engine.
         if self.config.firth_bias_reduction
             && !matches!(self.config.link_function(), LinkFunction::Logit)
         {

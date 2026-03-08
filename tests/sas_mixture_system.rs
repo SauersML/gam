@@ -9,7 +9,7 @@ use gam::inference::predict::{
 };
 use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_from_spec};
 use gam::types::{LikelihoodFamily, LinkComponent, MixtureLinkSpec, SasLinkSpec};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -194,6 +194,50 @@ fn mixture_recovery_and_prediction_alignment_system() {
         pred_rmse_vs_truth < 0.11,
         "mixture truth-prob RMSE too high: {pred_rmse_vs_truth:.4}"
     );
+}
+
+#[test]
+fn theta_evaluator_accepts_intrinsic_sas_defaults() {
+    let n = 48usize;
+    let x = build_design(n);
+    let beta_true = Array1::from_vec(vec![-0.15, 0.8, -0.35, 0.25]);
+    let eta = x.dot(&beta_true);
+    let y = eta.mapv(|e| {
+        let p = sas_inverse_link_jet(e, 0.0, 0.0).mu;
+        if p > 0.5 { 1.0 } else { 0.0 }
+    });
+    let w = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let s_list = one_penalty_for_non_intercept(x.ncols());
+
+    let opts = ExternalOptimOptions {
+        family: LikelihoodFamily::BinomialSas,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        max_iter: 50,
+        tol: 1e-7,
+        nullspace_dims: vec![1],
+        linear_constraints: None,
+        firth_bias_reduction: None,
+    };
+
+    let theta = array![0.2, -0.1, 0.05];
+    let (cost, grad) = evaluate_external_theta_cost_gradient(
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        s_list,
+        &theta,
+        &opts,
+    )
+    .expect("theta evaluator should use default SAS auxiliary state");
+
+    assert!(cost.is_finite());
+    assert_eq!(grad.len(), theta.len());
+    assert!(grad.iter().all(|v| v.is_finite()));
 }
 
 #[test]

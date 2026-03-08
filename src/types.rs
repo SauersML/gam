@@ -99,7 +99,8 @@ impl InverseLink {
     }
 }
 
-/// Engine-level likelihood selector used by generic solver entrypoints.
+/// Engine-level likelihood selector used by generic APIs.
+/// Some families remain restricted to domain-specific entrypoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LikelihoodFamily {
     GaussianIdentity,

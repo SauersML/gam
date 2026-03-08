@@ -9,11 +9,10 @@ use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2};
-use thiserror::Error;
 use opt::{
-    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError,
-    Tolerance,
+    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
 };
+use thiserror::Error;
 
 /// Optional known link metadata when a family uses a learnable wiggle correction.
 #[derive(Debug, Clone, Copy)]
@@ -1212,7 +1211,10 @@ fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(family: &F) -> bool {
     )
 }
 
-fn include_exact_newton_logdet_s<F: CustomFamily + ?Sized>(family: &F, options: &BlockwiseFitOptions) -> bool {
+fn include_exact_newton_logdet_s<F: CustomFamily + ?Sized>(
+    family: &F,
+    options: &BlockwiseFitOptions,
+) -> bool {
     family.exact_newton_outer_objective() == ExactNewtonOuterObjective::QuadraticReml
         && options.use_reml_objective
 }
@@ -1430,8 +1432,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
             for bt in 0..8 {
                 let alpha = 0.5f64.powi(bt);
                 let trial_beta_raw = &beta_old + &delta.mapv(|v| alpha * v);
-                let trial_beta =
-                    family.post_update_block_beta(&states, b, spec, trial_beta_raw)?;
+                let trial_beta = family.post_update_block_beta(&states, b, spec, trial_beta_raw)?;
                 states[b].beta = trial_beta;
                 refresh_all_block_etas(family, specs, &mut states)?;
                 let trial_eval = family.evaluate(&states)?;
@@ -1683,13 +1684,12 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                 };
                 let g = if include_logdet_h || include_logdet_s {
                     let g_logs = if include_logdet_s {
-                        0.5
-                            * trace_product(
-                                s_pinv_joint.as_ref().ok_or_else(|| {
-                                    "missing joint S^+ for REML gradient".to_string()
-                                })?,
-                                &a_k,
-                            )
+                        0.5 * trace_product(
+                            s_pinv_joint
+                                .as_ref()
+                                .ok_or_else(|| "missing joint S^+ for REML gradient".to_string())?,
+                            &a_k,
+                        )
                     } else {
                         0.0
                     };
@@ -1990,13 +1990,12 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                     0.0
                 };
                 let g_logs = if include_logdet_s {
-                    0.5
-                        * trace_product(
-                            s_pinv
-                                .as_ref()
-                                .ok_or_else(|| "missing S^+ for REML gradient".to_string())?,
-                            &a_k,
-                        )
+                    0.5 * trace_product(
+                        s_pinv
+                            .as_ref()
+                            .ok_or_else(|| "missing S^+ for REML gradient".to_string())?,
+                        &a_k,
+                    )
                 } else {
                     0.0
                 };
@@ -2433,13 +2432,12 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                             0.0
                         };
                         let pseudo_det = if include_logdet_s {
-                            -0.5
-                                * trace_product(
-                                    s_pinv.as_ref().ok_or_else(|| {
-                                        "missing S^+ for exact-newton psi gradient".to_string()
-                                    })?,
-                                    &s_psi_total,
-                                )
+                            -0.5 * trace_product(
+                                s_pinv.as_ref().ok_or_else(|| {
+                                    "missing S^+ for exact-newton psi gradient".to_string()
+                                })?,
+                                &s_psi_total,
+                            )
                         } else {
                             0.0
                         };
