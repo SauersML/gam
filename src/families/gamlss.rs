@@ -11,7 +11,8 @@ use crate::custom_family::{
 use crate::faer_ndarray::fast_atv;
 use crate::families::sigma_link::{
     bounded_sigma_and_deriv_from_eta_scalar, bounded_sigma_derivs_up_to_fourth,
-    bounded_sigma_derivs_up_to_third, bounded_sigma_from_eta_scalar,
+    bounded_sigma_derivs_up_to_third, bounded_sigma_eta_for_sigma_scalar,
+    bounded_sigma_from_eta_scalar,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::linalg::utils::StableSolver;
@@ -576,6 +577,56 @@ fn weighted_prevalence(y: &Array1<f64>, weights: &Array1<f64>) -> f64 {
     (y_w_sum / w_sum).clamp(0.0, 1.0)
 }
 
+fn project_block_beta_to_weighted_eta_mean_zero(
+    beta: Array1<f64>,
+    spec: &ParameterBlockSpec,
+    weights: &Array1<f64>,
+    target_eta_mean: f64,
+) -> Result<Array1<f64>, String> {
+    let x = spec.design.to_dense();
+    let n = x.nrows();
+    let p = x.ncols();
+    if beta.len() != p {
+        return Err(format!(
+            "weighted eta gauge projection beta length mismatch: got {}, expected {p}",
+            beta.len()
+        ));
+    }
+    if spec.offset.len() != n || weights.len() != n {
+        return Err(format!(
+            "weighted eta gauge projection row mismatch: design={n}, offset={}, weights={}",
+            spec.offset.len(),
+            weights.len()
+        ));
+    }
+    let w_sum: f64 = weights.iter().copied().sum();
+    if !w_sum.is_finite() || w_sum <= 0.0 {
+        return Err("weighted eta gauge projection requires positive finite total weight".to_string());
+    }
+
+    let mut c = Array1::<f64>::zeros(p);
+    let mut offset_mean = 0.0;
+    for i in 0..n {
+        let wi = weights[i] / w_sum;
+        offset_mean += wi * spec.offset[i];
+        for j in 0..p {
+            c[j] += wi * x[[i, j]];
+        }
+    }
+    let c_norm_sq = c.dot(&c);
+    if !c_norm_sq.is_finite() || c_norm_sq <= 1e-12 {
+        return Err(
+            "weighted eta gauge projection found a degenerate anchor direction for this block"
+                .to_string(),
+        );
+    }
+    let shift = (c.dot(&beta) + offset_mean - target_eta_mean) / c_norm_sq;
+    if !shift.is_finite() {
+        return Err("weighted eta gauge projection produced a non-finite shift".to_string());
+    }
+    Ok(&beta - &(c * shift))
+}
+
 fn emit_binomial_alpha_beta_warnings(
     context: &str,
     beta_values: &Array1<f64>,
@@ -735,7 +786,13 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
         })
     }
 
-    fn post_update_beta(&self, beta: Array1<f64>) -> Result<Array1<f64>, String> {
+    fn post_update_block_beta(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _block_idx: usize,
+        _spec: &ParameterBlockSpec,
+        beta: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
         Ok(beta.mapv(|v| v.clamp(self.beta_min, self.beta_max)))
     }
 }
@@ -3779,6 +3836,26 @@ impl BinomialLocationScaleProbitFamily {
 }
 
 impl CustomFamily for BinomialLocationScaleProbitFamily {
+    fn post_update_block_beta(
+        &self,
+        _block_states: &[ParameterBlockState],
+        block_idx: usize,
+        spec: &ParameterBlockSpec,
+        beta: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        if block_idx == Self::BLOCK_LOG_SIGMA {
+            let target_eta_mean =
+                bounded_sigma_eta_for_sigma_scalar(1.0, self.sigma_min, self.sigma_max);
+            return project_block_beta_to_weighted_eta_mean_zero(
+                beta,
+                spec,
+                &self.weights,
+                target_eta_mean,
+            );
+        }
+        Ok(beta)
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(format!(
@@ -4875,6 +4952,26 @@ impl BinomialLocationScaleProbitWiggleFamily {
 }
 
 impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
+    fn post_update_block_beta(
+        &self,
+        _block_states: &[ParameterBlockState],
+        block_idx: usize,
+        spec: &ParameterBlockSpec,
+        beta: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        if block_idx == Self::BLOCK_LOG_SIGMA {
+            let target_eta_mean =
+                bounded_sigma_eta_for_sigma_scalar(1.0, self.sigma_min, self.sigma_max);
+            return project_block_beta_to_weighted_eta_mean_zero(
+                beta,
+                spec,
+                &self.weights,
+                target_eta_mean,
+            );
+        }
+        Ok(beta)
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 3 {
             return Err(format!(
