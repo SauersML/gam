@@ -27,8 +27,8 @@ use crate::construction::{
     stable_reparameterization_with_invariant_engine,
 };
 use crate::estimate::EstimationError;
-use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::faer_ndarray::{FaerEigh, fast_ab, fast_ata, fast_atb, fast_atv};
+use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::probability::normal_cdf;
 use crate::quadrature::QuadratureContext;
 use crate::seeding::{SeedConfig, SeedRiskProfile, generate_rho_candidates};
@@ -3458,8 +3458,8 @@ pub fn predict_joint(
                 .map(|i| {
                     strategy
                         .integrated_moments(&quad_ctx, eta_cal[i], eff_se[i])
-                    .map(|m| m.mean)
-                    .unwrap_or_else(|_| joint_point_inverse_link(result.link, eta_cal[i]))
+                        .map(|m| m.mean)
+                        .unwrap_or_else(|_| joint_point_inverse_link(result.link, eta_cal[i]))
                 })
                 .collect::<Array1<f64>>()
         } else {
@@ -3474,8 +3474,8 @@ pub fn predict_joint(
                 .map(|i| {
                     strategy
                         .integrated_moments(&quad_ctx, eta_cal[i], 0.0)
-                    .map(|m| m.mean)
-                    .unwrap_or_else(|_| joint_point_inverse_link(result.link, eta_cal[i]))
+                        .map(|m| m.mean)
+                        .unwrap_or_else(|_| joint_point_inverse_link(result.link, eta_cal[i]))
                 })
                 .collect::<Array1<f64>>()
         } else {

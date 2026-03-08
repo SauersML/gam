@@ -17,6 +17,10 @@ pub enum SurvivalError {
     NonFiniteInput,
     #[error("crude risk integration setup is invalid")]
     InvalidIntegrationSetup,
+    #[error("cumulative hazard must be nondecreasing")]
+    NonMonotoneCumulativeHazard,
+    #[error("instantaneous hazard must stay strictly positive during integration")]
+    NonPositiveHazard,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -148,20 +152,16 @@ fn scale_matrix_columns(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MonotonicityPenalty {
-    pub lambda: f64,
     pub tolerance: f64,
 }
 
 impl Default for MonotonicityPenalty {
     fn default() -> Self {
-        Self {
-            lambda: 1.0,
-            tolerance: 0.0,
-        }
+        Self { tolerance: 0.0 }
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct WorkingModelSurvival {
     age_entry: Array1<f64>,
     age_exit: Array1<f64>,
@@ -183,20 +183,81 @@ pub struct WorkingModelSurvival {
 }
 
 impl WorkingModelSurvival {
-    pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
-        if self.structurally_monotonic {
-            // With structural monotonic reparameterization, feasibility is enforced
-            // through positive time weights (exp-map), so linear constraints no longer
-            // represent the active geometry.
-            return None;
+    fn validate_penalties(
+        penalties: &PenaltyBlocks,
+        coefficient_dim: usize,
+    ) -> Result<(), SurvivalError> {
+        for block in &penalties.blocks {
+            if !block.lambda.is_finite() || block.lambda < 0.0 {
+                return Err(SurvivalError::NonFiniteInput);
+            }
+            if block.range.start > block.range.end || block.range.end > coefficient_dim {
+                return Err(SurvivalError::DimensionMismatch);
+            }
+            let block_dim = block.range.end - block.range.start;
+            if block.matrix.nrows() != block_dim || block.matrix.ncols() != block_dim {
+                return Err(SurvivalError::DimensionMismatch);
+            }
+            if block.matrix.iter().any(|v| !v.is_finite()) {
+                return Err(SurvivalError::NonFiniteInput);
+            }
         }
-        let tol = self.monotonicity.tolerance.max(1e-12);
+        Ok(())
+    }
+
+    fn spd_logdet(hessian: &Array2<f64>) -> Result<f64, EstimationError> {
+        if let Ok(chol) = hessian.clone().cholesky(Side::Lower) {
+            let l = chol.lower_triangular();
+            return Ok(2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>());
+        }
+
+        let (eval, _) = hessian
+            .eigh(Side::Lower)
+            .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+        let min_eval = eval
+            .iter()
+            .fold(f64::INFINITY, |acc, &value| acc.min(value));
+        if min_eval.is_finite() {
+            return Err(EstimationError::HessianNotPositiveDefinite {
+                min_eigenvalue: min_eval,
+            });
+        }
+        Err(EstimationError::InvalidInput(
+            "survival LAML Hessian eigenspectrum is non-finite".to_string(),
+        ))
+    }
+
+    fn derivative_guard(&self) -> f64 {
+        self.monotonicity.tolerance.max(1e-12)
+    }
+
+    fn derivative_guard_numerical(&self) -> f64 {
+        let derivative_guard = self.derivative_guard();
+        (derivative_guard - (1e-10_f64).min(0.01 * derivative_guard)).max(1e-12)
+    }
+
+    fn interval_increment_guard(&self, h_entry: f64, h_exit: f64) -> f64 {
+        let scale = h_entry.abs().max(h_exit.abs()).max(1.0);
+        1e-10 * scale
+    }
+
+    fn event_indicator(&self, i: usize) -> f64 {
+        match self.spec {
+            SurvivalSpec::Net => f64::from(self.event_target[i]),
+            SurvivalSpec::Crude => {
+                f64::from((self.event_target[i] > 0 || self.event_competing[i] > 0) as u8)
+            }
+        }
+    }
+
+    pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
+        let tol = self.derivative_guard();
         let p = self.x_derivative.ncols();
         if p == 0 {
             return None;
         }
         let active_rows: Vec<usize> = (0..self.x_derivative.nrows())
-            .filter(|&i| self.sample_weight[i] > 0.0 && self.event_target[i] > 0)
+            .filter(|&i| self.sample_weight[i] > 0.0)
             .collect();
         if active_rows.is_empty() {
             return None;
@@ -235,6 +296,7 @@ impl WorkingModelSurvival {
         // allows REML-selected penalties to control how far we depart from the
         // target in sparse-vs-rich data regimes.
         let n = inputs.age_entry.len();
+        let p = inputs.x_entry.ncols();
         if inputs.age_exit.len() != n
             || inputs.event_target.len() != n
             || inputs.event_competing.len() != n
@@ -247,6 +309,7 @@ impl WorkingModelSurvival {
         {
             return Err(SurvivalError::DimensionMismatch);
         }
+        Self::validate_penalties(&penalties, p)?;
 
         if inputs.age_entry.iter().any(|v| !v.is_finite())
             || inputs.age_exit.iter().any(|v| !v.is_finite())
@@ -257,6 +320,13 @@ impl WorkingModelSurvival {
             || inputs.x_entry.iter().any(|v| !v.is_finite())
             || inputs.x_exit.iter().any(|v| !v.is_finite())
             || inputs.x_derivative.iter().any(|v| !v.is_finite())
+            || inputs.event_target.iter().any(|&v| v > 1)
+            || inputs.event_competing.iter().any(|&v| v > 1)
+            || inputs
+                .event_target
+                .iter()
+                .zip(inputs.event_competing.iter())
+                .any(|(&target, &competing)| target > 0 && competing > 0)
         {
             return Err(SurvivalError::NonFiniteInput);
         }
@@ -303,14 +373,11 @@ impl WorkingModelSurvival {
         })
     }
 
-    /// Enable/disable structural monotonicity for the time block.
+    /// Enable/disable monotonic time-block enforcement metadata.
     ///
-    /// When enabled, the first `time_columns` coefficients are mapped with `exp`
-    /// before entering the predictor. This guarantees strictly positive weights
-    /// on the monotone time basis.
-    ///
-    /// Any unconstrained intercept should live outside this structural time block
-    /// (for example in the parametric/covariate design).
+    /// Monotonicity is enforced through linear inequality constraints on the
+    /// derivative design; enabling this records how many leading time columns
+    /// belong to that constrained block.
     pub fn set_structural_monotonicity(
         &mut self,
         enabled: bool,
@@ -328,6 +395,11 @@ impl WorkingModelSurvival {
                 "structural monotonicity requires at least one time column".to_string(),
             ));
         }
+        // Monotonicity is enforced through the exact linear inequality geometry
+        // A beta >= b so smoothing continues to act on the realized coefficient
+        // vector used by the survival basis. This avoids the exponential
+        // reparameterization that biased the baseline shape under heavy
+        // smoothing.
         self.structurally_monotonic = enabled;
         self.structural_time_columns = if enabled { time_columns } else { 0 };
         Ok(())
@@ -338,26 +410,11 @@ impl WorkingModelSurvival {
         beta: &Array1<f64>,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let p = beta.len();
-        let mut theta = beta.clone();
-        let mut jac = Array1::<f64>::ones(p);
-        let mut curvature = Array1::<f64>::zeros(p);
-
-        if self.structurally_monotonic {
-            let time_cols = self.structural_time_columns.min(p);
-            for j in 0..time_cols {
-                let w = beta[j].exp();
-                if !w.is_finite() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "non-finite exp(beta[{j}]) in structural monotonic parameterization"
-                    )));
-                }
-                theta[j] = w;
-                jac[j] = w;
-                curvature[j] = w;
-            }
-        }
-
-        Ok((theta, jac, curvature))
+        Ok((
+            beta.clone(),
+            Array1::<f64>::ones(p),
+            Array1::<f64>::zeros(p),
+        ))
     }
 
     pub fn update_state(&self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
@@ -366,7 +423,6 @@ impl WorkingModelSurvival {
                 "survival beta dimension mismatch".to_string(),
             ));
         }
-        let _ = self.spec;
 
         let n = self.x_exit.nrows();
         let p = self.x_exit.ncols();
@@ -381,25 +437,21 @@ impl WorkingModelSurvival {
         //
         // The per-subject negative log-likelihood used below is
         //   NLL_i(beta) = exp(eta1_i) - exp(eta0_i) - delta_i * (eta1_i + log(s_i)),
-        // with delta_i = event_target_i.
+        // with delta_i selected from:
+        //   - Net   : target events only,
+        //   - Crude : any first event (target or competing).
         //
         // This is exactly the form whose derivatives are:
         //   grad_i = exp(eta1_i) a1_i - exp(eta0_i) a0_i - delta_i * (a1_i + d_i / s_i)
         //   Hess_i = exp(eta1_i) a1_i a1_i^T - exp(eta0_i) a0_i a0_i^T
         //            + delta_i * (d_i d_i^T) / s_i^2.
         //
-        // Structural-monotonic option:
-        //   beta_time = [beta0, beta1, ..., beta_{K-1}] (all in the structural block),
-        //   theta_j = exp(beta_j) for j in the structural block,
-        //   theta_cov = beta_cov outside the structural block.
-        // Then eta = X * theta + offset.
-        // Chain rule to beta-space:
-        //   d eta / d beta_j = X_j * d theta_j/d beta_j
-        //   d² eta / d beta_j² = X_j * d² theta_j/d beta_j²
-        // where (for transformed time columns) both first and second derivatives are exp(beta_j).
+        // Monotonicity is enforced through linear inequality constraints on the
+        // derivative design, not through a nonlinear coefficient map. This keeps
+        // the baseline smoothing penalty on the actual spline coefficients.
         //
-        // The loop below computes exact beta-space derivatives for either mode,
-        // then adds penalties.
+        // The loop below computes exact beta-space derivatives and then adds
+        // penalties.
         // Total predictor = target offset + learned deviation.
         // This is the same architecture used for flexible binary links:
         // principled default, plus penalized wiggle/deviation.
@@ -427,11 +479,10 @@ impl WorkingModelSurvival {
         let mut w_event_inv_deriv = Array1::<f64>::zeros(n);
         let mut w_event_outer = Array1::<f64>::zeros(n);
 
-        let derivative_guard = self.monotonicity.tolerance.max(1e-12);
+        let derivative_guard = self.derivative_guard();
         // Match strict monotonicity intent while tolerating tiny solver/BLAS roundoff
         // near the active boundary.
-        let derivative_guard_numerical =
-            (derivative_guard - (1e-10_f64).min(0.01 * derivative_guard)).max(1e-12);
+        let derivative_guard_numerical = self.derivative_guard_numerical();
         for i in 0..n {
             let w = self.sample_weight[i];
             if w <= 0.0 {
@@ -444,12 +495,27 @@ impl WorkingModelSurvival {
                     "survival ages must be finite with age_exit >= age_entry".to_string(),
                 ));
             }
-            let _e_competing = self.event_competing[i];
-            let d = f64::from(self.event_target[i]);
+            let d = self.event_indicator(i);
 
             let has_entry_interval = !self.entry_at_origin[i];
             let h_s = if has_entry_interval { h_entry[i] } else { 0.0 };
             let h_e = h_exit[i];
+            let deriv = derivative_raw[i];
+            if deriv <= derivative_guard_numerical || !deriv.is_finite() {
+                return Err(EstimationError::ParameterConstraintViolation(format!(
+                    "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
+                    i, deriv, derivative_guard
+                )));
+            }
+            if has_entry_interval {
+                let increment_guard = self.interval_increment_guard(h_s, h_e);
+                if h_e + increment_guard < h_s {
+                    return Err(EstimationError::ParameterConstraintViolation(format!(
+                        "survival cumulative hazard decreased over row {}: H(exit)={:.6e} < H(entry)={:.6e}",
+                        i, h_e, h_s
+                    )));
+                }
+            }
             w_exit_interval[i] = w * h_e;
             if has_entry_interval {
                 w_entry_interval[i] = w * h_s;
@@ -457,13 +523,6 @@ impl WorkingModelSurvival {
             nll += w * (h_e - h_s);
 
             if d > 0.0 {
-                let deriv = derivative_raw[i];
-                if deriv <= derivative_guard_numerical || !deriv.is_finite() {
-                    return Err(EstimationError::ParameterConstraintViolation(format!(
-                        "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
-                        i, deriv, derivative_guard
-                    )));
-                }
                 let inv_deriv = 1.0 / deriv;
                 nll += -w * (eta_exit[i] + deriv.ln());
                 w_event[i] = w;
@@ -534,19 +593,8 @@ impl WorkingModelSurvival {
             ));
         }
 
-        // Robust logdet for H: Cholesky on SPD path, eigen fallback otherwise.
         let h_dense = state.hessian.to_dense();
-        let logdet_h = if let Ok(chol) = h_dense.clone().cholesky(Side::Lower) {
-            let l = chol.lower_triangular();
-            2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>()
-        } else {
-            let (eval, _) = h_dense
-                .eigh(Side::Lower)
-                .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
-            let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-            let tol = (max_eval * 1e-12).max(1e-14);
-            eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum()
-        };
+        let logdet_h = Self::spd_logdet(&h_dense)?;
 
         if self.penalties.blocks.is_empty() {
             // With no penalty blocks, S=0 and log|S|_+ = 0 by convention.
@@ -606,7 +654,8 @@ impl WorkingModelSurvival {
     /// and `dH_nll/d beta [u_k]` is the exact directional derivative of the
     /// (unpenalized) Hessian with respect to `beta` along `u_k`.
     ///
-    /// This is exact in both linear and structural-monotonic parameterizations.
+    /// This is exact for the constrained coefficient parameterization used by
+    /// the survival engine.
     ///
     /// Exact trace-contraction implementation details:
     /// - factorize `H` once,
@@ -664,21 +713,14 @@ impl WorkingModelSurvival {
         // Keep outer gradient contractions consistent with the fitted inner state:
         // the working predictor includes target baseline offsets plus learned deviation.
         let (theta, jac, curvature) = self.transformed_coefficients(beta)?;
-        let mut third = Array1::<f64>::zeros(p);
-        if self.structurally_monotonic {
-            let time_cols = self.structural_time_columns.min(p);
-            for j in 0..time_cols {
-                // For theta_j = exp(beta_j): first=second=third=exp(beta_j).
-                third[j] = theta[j];
-            }
-        }
+        let third = Array1::<f64>::zeros(p);
         let eta_entry = self.x_entry.dot(&theta) + &self.offset_eta_entry;
         let eta_exit = self.x_exit.dot(&theta) + &self.offset_eta_exit;
         let deriv_raw = self.x_derivative.dot(&theta) + &self.offset_derivative_exit;
         let exp_entry = eta_entry.mapv(f64::exp);
         let exp_exit = eta_exit.mapv(f64::exp);
-        let guard = self.monotonicity.tolerance.max(1e-12);
-        let guard_numerical = (guard - (1e-10_f64).min(0.01 * guard)).max(1e-12);
+        let guard = self.derivative_guard();
+        let guard_numerical = self.derivative_guard_numerical();
         let n = self.x_exit.nrows();
         let mut b_dir = Array2::<f64>::zeros((p, p));
         let mut ge = vec![0.0_f64; p];
@@ -812,14 +854,14 @@ impl WorkingModelSurvival {
 
                 // Event part:
                 // d/dβ [ gsd gsd^T / s^2 - diag(he) - diag(hsd / s) ][u]
-                if self.event_target[i] > 0 {
-                    let s_i = deriv_raw[i];
-                    if s_i <= guard_numerical || !s_i.is_finite() {
-                        return Err(EstimationError::ParameterConstraintViolation(format!(
-                            "survival monotonicity violated in LAML trace contraction at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
-                            i, s_i, guard
-                        )));
-                    }
+                let s_i = deriv_raw[i];
+                if s_i <= guard_numerical || !s_i.is_finite() {
+                    return Err(EstimationError::ParameterConstraintViolation(format!(
+                        "survival monotonicity violated in LAML trace contraction at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
+                        i, s_i, guard
+                    )));
+                }
+                if self.event_indicator(i) > 0.0 {
                     let inv_s = 1.0 / s_i;
                     let inv_s2 = inv_s * inv_s;
                     let inv_s3 = inv_s2 * inv_s;
@@ -861,34 +903,6 @@ impl WorkingModelSurvival {
             // 0.5 * beta^T A_k beta + 0.5 * tr(H^{-1} dH/drho_k) - 0.5 * tr(S^+ A_k),
             // with tr(H^{-1} dH/drho_k) = trace_hinv_ak + trace_third.
             grad[k] = 0.5 * beta.dot(&a_k_beta) + 0.5 * t_k - 0.5 * p_k;
-        }
-
-        // Numerical consistency guard: when exact high-order contractions land on
-        // near-nonsmooth regions (monotonicity guards / event-heavy regimes),
-        // calibrate clearly inconsistent components against local objective FD.
-        let fd_eps = 5e-4;
-        for k in 0..k_count {
-            let lambda = self.penalties.blocks[k].lambda;
-            if !lambda.is_finite() || lambda <= 0.0 {
-                continue;
-            }
-            let rho_k = lambda.ln();
-            let mut plus = self.clone();
-            plus.penalties.blocks[k].lambda = (rho_k + fd_eps).exp();
-            let mut minus = self.clone();
-            minus.penalties.blocks[k].lambda = (rho_k - fd_eps).exp();
-            let state_plus = plus.update_state(beta)?;
-            let state_minus = minus.update_state(beta)?;
-            let obj_plus = plus.laml_objective_from_state(beta, &state_plus)?;
-            let obj_minus = minus.laml_objective_from_state(beta, &state_minus)?;
-            let fd = (obj_plus - obj_minus) / (2.0 * fd_eps);
-            if fd.is_finite()
-                && grad[k].is_finite()
-                && ((fd.abs() <= 1e-10 && grad[k].abs() > 1e-3)
-                    || (fd.abs() > 1e-10 && grad[k].signum() != fd.signum()))
-            {
-                grad[k] = fd;
-            }
         }
 
         Ok((objective, grad))
@@ -1039,33 +1053,37 @@ where
             if !inst_hazard_d.is_finite() || !hazard_d.is_finite() || !hazard_m.is_finite() {
                 return Err(SurvivalError::NonFiniteInput);
             }
+            if inst_hazard_d <= 0.0 {
+                return Err(SurvivalError::NonPositiveHazard);
+            }
 
-            let h_dis_cond = (hazard_d - h_dis_t0).max(0.0);
-            let h_mor_cond = (hazard_m - h_mor_t0).max(0.0);
+            if hazard_d < h_dis_t0 || hazard_m < h_mor_t0 {
+                return Err(SurvivalError::NonMonotoneCumulativeHazard);
+            }
+
+            let h_dis_cond = hazard_d - h_dis_t0;
+            let h_mor_cond = hazard_m - h_mor_t0;
             let s_total = (-(h_dis_cond + h_mor_cond)).exp();
 
             total_risk += w * inst_hazard_d * s_total * half_width;
 
             // d Risk / d beta_d:
             //   integral [ d h_d * S_total - h_d * S_total * d H_d ] du
-            if inst_hazard_d > 0.0 {
-                let weight = w * s_total * half_width;
-                for j in 0..coeff_len_d {
-                    let mut g = inst_hazard_d * (1.0 - hazard_d) * design_d[j];
-                    g += hazard_d * deriv_d[j];
-                    g += inst_hazard_d * h_dis_t0 * design_d_t0[j];
-                    disease_gradient[j] += weight * g;
-                }
+            let weight = w * s_total * half_width;
+            for j in 0..coeff_len_d {
+                let d_inst_hazard =
+                    inst_hazard_d * (1.0 - hazard_d) * design_d[j] + hazard_d * deriv_d[j];
+                let d_hazard_cond = hazard_d * design_d[j] - h_dis_t0 * design_d_t0[j];
+                let g = d_inst_hazard - inst_hazard_d * d_hazard_cond;
+                disease_gradient[j] += weight * g;
             }
 
             // d Risk / d beta_m:
             //   -integral h_d * S_total * d H_m(u|t0) du
-            if inst_hazard_d > 0.0 && hazard_m > 0.0 {
-                let weight = w * inst_hazard_d * s_total * half_width;
-                for j in 0..coeff_len_m {
-                    let g = -hazard_m * design_m[j] + h_mor_t0 * design_m_t0[j];
-                    mortality_gradient[j] += weight * g;
-                }
+            let weight = w * inst_hazard_d * s_total * half_width;
+            for j in 0..coeff_len_m {
+                let g = -hazard_m * design_m[j] + h_mor_t0 * design_m_t0[j];
+                mortality_gradient[j] += weight * g;
             }
         }
     }
@@ -1153,10 +1171,7 @@ mod tests {
         let x_exit = array![[1.0, age_exit[0].ln()], [1.0, age_exit[1].ln()]];
         let x_derivative = array![[0.0, 1.0 / age_exit[0]], [0.0, 1.0 / age_exit[1]]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 1e-8,
-        };
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.0, 0.8];
 
         let base = WorkingModelSurvival::from_engine_inputs(
@@ -1211,6 +1226,202 @@ mod tests {
     }
 
     #[test]
+    fn crude_spec_treats_competing_events_as_failures() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![0u8];
+        let event_competing = array![1u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[0.1]];
+        let x_exit = array![[0.4]];
+        let x_derivative = array![[1.0]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let beta = array![0.0];
+
+        let net = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties.clone(),
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct net survival model");
+        let crude = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties.clone(),
+            mono,
+            SurvivalSpec::Crude,
+        )
+        .expect("construct crude survival model");
+        let any_event = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: array![1u8].view(),
+                event_competing: array![0u8].view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct any-event survival model");
+
+        let state_net = net.update_state(&beta).expect("net state");
+        let state_crude = crude.update_state(&beta).expect("crude state");
+        let state_any = any_event.update_state(&beta).expect("any-event state");
+
+        assert!(
+            (state_crude.deviance - state_net.deviance).abs() > 1e-8,
+            "crude likelihood should differ from net when competing failures are present"
+        );
+        assert!(
+            (state_crude.deviance - state_any.deviance).abs() < 1e-12,
+            "crude single-hazard likelihood should treat competing events as failures"
+        );
+    }
+
+    #[test]
+    fn monotonicity_constraints_cover_all_weighted_rows() {
+        let age_entry = array![1.0_f64, 1.5_f64];
+        let age_exit = array![2.0_f64, 2.5_f64];
+        let event_target = array![0u8, 0u8];
+        let event_competing = array![0u8, 1u8];
+        let sample_weight = array![1.0, 1.0];
+        let x_entry = array![[0.2], [0.1]];
+        let x_exit = array![[0.3], [0.2]];
+        let x_derivative = array![[1.0], [1.0]];
+
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct censored survival model");
+
+        let constraints = model
+            .monotonicity_linear_constraints()
+            .expect("all weighted rows should contribute monotonicity constraints");
+        assert_eq!(constraints.a.nrows(), 2);
+    }
+
+    #[test]
+    fn decreasing_interval_is_rejected_without_target_events() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![0u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[0.5]];
+        let x_exit = array![[0.0]];
+        let x_derivative = array![[1.0]];
+
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct censored survival model");
+
+        let err = model
+            .update_state(&array![1.0])
+            .expect_err("decreasing cumulative hazard increment should be rejected");
+        assert!(
+            err.to_string().contains("cumulative hazard decreased"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn smooth_crude_risk(beta_d: f64, beta_m: f64) -> CrudeRiskResult {
+        calculate_crude_risk_quadrature(
+            0.0,
+            1.0,
+            &[0.0, 1.0],
+            beta_d.exp(),
+            beta_m.exp(),
+            array![1.0].view(),
+            array![1.0].view(),
+            |u, design_d, deriv_d, design_m| {
+                let cumulative_d = beta_d.exp() * (1.0 + 0.2 * u);
+                let cumulative_m = beta_m.exp() * (1.0 + 0.1 * u);
+                let inst_hazard_d = 0.2 * beta_d.exp();
+                design_d[0] = 1.0;
+                deriv_d[0] = inst_hazard_d;
+                design_m[0] = 1.0;
+                Ok((inst_hazard_d, cumulative_d, cumulative_m))
+            },
+        )
+        .expect("smooth crude-risk quadrature should succeed")
+    }
+
+    #[test]
+    fn crude_risk_gradient_matches_monotone_objective() {
+        let beta_d = -0.2_f64;
+        let beta_m = -0.5_f64;
+        let result = smooth_crude_risk(beta_d, beta_m);
+        let eps = 1e-6;
+
+        let fd_d = (smooth_crude_risk(beta_d + eps, beta_m).risk
+            - smooth_crude_risk(beta_d - eps, beta_m).risk)
+            / (2.0 * eps);
+        let fd_m = (smooth_crude_risk(beta_d, beta_m + eps).risk
+            - smooth_crude_risk(beta_d, beta_m - eps).risk)
+            / (2.0 * eps);
+
+        assert!(
+            (result.disease_gradient[0] - fd_d).abs() < 1e-5,
+            "disease gradient mismatch for monotone crude risk: analytic={} fd={fd_d}",
+            result.disease_gradient[0]
+        );
+        assert!(
+            (result.mortality_gradient[0] - fd_m).abs() < 1e-5,
+            "mortality gradient mismatch for monotone crude risk: analytic={} fd={fd_m}",
+            result.mortality_gradient[0]
+        );
+    }
+
+    #[test]
     fn survival_ridge_penalty_scalar_matches_gradient_hessian_scaling() {
         let age_entry = array![1.0_f64, 2.0_f64];
         let age_exit = array![2.0_f64, 3.5_f64];
@@ -1225,10 +1436,7 @@ mod tests {
             lambda: 1.7,
             range: 1..2,
         }]);
-        let mono = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 1e-8,
-        };
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.2, 0.4];
 
         let model = WorkingModelSurvival::from_engine_inputs(
@@ -1259,6 +1467,78 @@ mod tests {
     }
 
     #[test]
+    fn negative_penalty_lambda_is_rejected() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[1.0, 0.0]];
+        let x_exit = array![[1.0, 0.5]];
+        let x_derivative = array![[0.0, 1.0]];
+        let penalties = PenaltyBlocks::new(vec![PenaltyBlock {
+            matrix: array![[1.0]],
+            lambda: -0.1,
+            range: 1..2,
+        }]);
+
+        let err = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect_err("negative lambda must be rejected");
+
+        assert!(matches!(err, SurvivalError::NonFiniteInput));
+    }
+
+    #[test]
+    fn penalty_block_range_and_shape_must_match_coefficients() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[1.0, 0.0]];
+        let x_exit = array![[1.0, 0.5]];
+        let x_derivative = array![[0.0, 1.0]];
+        let penalties = PenaltyBlocks::new(vec![PenaltyBlock {
+            matrix: array![[1.0]],
+            lambda: 0.5,
+            range: 0..2,
+        }]);
+
+        let err = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect_err("penalty block geometry must match coefficient support");
+
+        assert!(matches!(err, SurvivalError::DimensionMismatch));
+    }
+
+    #[test]
     fn survival_gradient_matches_objective_fd_with_ridge_scaling() {
         let age_entry = array![1.0_f64, 2.0_f64, 3.0_f64];
         let age_exit = array![2.0_f64, 3.5_f64, 4.0_f64];
@@ -1281,10 +1561,7 @@ mod tests {
             [0.0, 1.0 / age_exit[2]]
         ];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 1e-8,
-        };
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.0, 3.0];
 
         let model = WorkingModelSurvival::from_engine_inputs(
@@ -1356,10 +1633,7 @@ mod tests {
             [0.0, 0.6, 1.32, 0.0]
         ];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 1e-8,
-        };
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let mut model = WorkingModelSurvival::from_engine_inputs(
             SurvivalEngineInputs {
                 age_entry: age_entry.view(),
@@ -1379,7 +1653,7 @@ mod tests {
         model
             .set_structural_monotonicity(true, 3)
             .expect("enable structural monotonicity");
-        assert!(model.monotonicity_linear_constraints().is_none());
+        assert!(model.monotonicity_linear_constraints().is_some());
 
         let beta = array![-1.0, -0.3, 0.1, 0.2];
         let state = model.update_state(&beta).expect("state at structural beta");
@@ -1419,10 +1693,7 @@ mod tests {
         let x_exit = array![[1.0, 0.5, -0.5], [1.0, 0.8, 0.2]];
         let x_derivative = array![[0.0, 0.9, 0.0], [0.0, 0.7, 0.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 1e-8,
-        };
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let mut model = WorkingModelSurvival::from_engine_inputs(
             SurvivalEngineInputs {
                 age_entry: age_entry.view(),
@@ -1459,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_monotonic_exponentiates_first_time_column() {
+    fn structural_monotonicity_keeps_linear_constraint_geometry() {
         let age_entry = array![1.0_f64];
         let age_exit = array![2.0_f64];
         let event_target = array![1u8];
@@ -1470,10 +1741,7 @@ mod tests {
         let x_derivative = array![[1.0]];
 
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 1e-8,
-        };
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let mut model = WorkingModelSurvival::from_engine_inputs(
             SurvivalEngineInputs {
                 age_entry: age_entry.view(),
@@ -1494,17 +1762,21 @@ mod tests {
         let beta = array![-3.0];
         assert!(
             model.update_state(&beta).is_err(),
-            "without structural mapping, negative coefficient should violate derivative guard"
+            "negative derivative coefficient should violate derivative guard"
         );
 
         model
             .set_structural_monotonicity(true, 1)
             .expect("enable structural monotonicity");
-        let state = model
-            .update_state(&beta)
-            .expect("first structural time column should be exponentiated");
-        assert!(state.deviance.is_finite());
-        assert!(state.gradient[0].is_finite());
+        let constraints = model
+            .monotonicity_linear_constraints()
+            .expect("monotonicity constraints should remain active");
+        assert_eq!(constraints.a.nrows(), 1);
+        assert_eq!(constraints.a[[0, 0]], 1.0);
+        assert!(
+            model.update_state(&beta).is_err(),
+            "enabling structural monotonicity should not reparameterize the coefficient"
+        );
     }
 
     fn model_with_rho(base: &WorkingModelSurvival, rho: &Array1<f64>) -> WorkingModelSurvival {
@@ -1554,6 +1826,65 @@ mod tests {
     }
 
     #[test]
+    fn update_state_rejects_negative_exit_derivative_for_censored_rows() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![1.1_f64];
+        let event_target = array![0u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[0.0]];
+        let x_exit = array![[0.0]];
+        let x_derivative = array![[-1.0]];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("construct censored survival model");
+
+        let err = model
+            .update_state(&array![1.0])
+            .expect_err("censored row should still enforce monotonic derivative");
+        assert!(
+            matches!(err, EstimationError::ParameterConstraintViolation(_)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn crude_risk_quadrature_rejects_decreasing_cumulative_hazard() {
+        let err = calculate_crude_risk_quadrature(
+            1.0,
+            2.0,
+            &[],
+            0.4,
+            0.2,
+            array![1.0].view(),
+            array![1.0].view(),
+            |_u, design_d, deriv_d, design_m| {
+                design_d[0] = 1.0;
+                deriv_d[0] = 0.0;
+                design_m[0] = 1.0;
+                Ok((0.1, 0.3, 0.25))
+            },
+        )
+        .expect_err("non-monotone cumulative hazards should fail");
+        assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+    }
+
+    #[test]
     fn laml_no_penalties_matches_documented_objective() {
         let age_entry = array![40.0, 45.0, 50.0, 55.0];
         let age_exit = array![44.0, 49.0, 54.0, 59.0];
@@ -1579,10 +1910,7 @@ mod tests {
             [0.0, 0.02, 0.001]
         ];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 1e-8,
-        };
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-2.0, 0.7, 0.2];
 
         let model = WorkingModelSurvival::from_engine_inputs(
@@ -1678,10 +2006,7 @@ mod tests {
                 range: 2..3,
             },
         ]);
-        let mono = MonotonicityPenalty {
-            lambda: 0.5,
-            tolerance: 1e-6,
-        };
+        let mono = MonotonicityPenalty { tolerance: 1e-6 };
 
         let base_model = WorkingModelSurvival::from_engine_inputs_with_offsets(
             SurvivalEngineInputs {
@@ -1789,10 +2114,7 @@ mod tests {
                 range: 2..3,
             },
         ]);
-        let mono = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 1e-8,
-        };
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
         let base_model = WorkingModelSurvival::from_engine_inputs(
             SurvivalEngineInputs {
                 age_entry: age_entry.view(),

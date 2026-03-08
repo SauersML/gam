@@ -10,15 +10,12 @@ use crate::custom_family::{
 };
 use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::sigma_link::{
-    bounded_sigma_and_deriv_from_eta_scalar, bounded_sigma_derivs_up_to_fourth,
-    bounded_sigma_derivs_up_to_third, bounded_sigma_eta_for_sigma_scalar,
-    bounded_sigma_from_eta_scalar,
+    SigmaJet1, bounded_sigma_derivs_up_to_fourth, bounded_sigma_derivs_up_to_third,
+    bounded_sigma_eta_for_sigma_scalar, bounded_sigma_from_eta_scalar, bounded_sigma_jet1_scalar,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
-use crate::linalg::utils::StableSolver;
-use crate::matrix::{DesignMatrix, LinearOperator};
+use crate::matrix::DesignMatrix;
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
-use crate::pirls::WorkingLikelihood as EngineWorkingLikelihood;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
@@ -27,6 +24,7 @@ use crate::smooth::{
     optimize_two_block_spatial_length_scale, optimize_two_block_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivative_info_list,
 };
+use crate::solver::pirls::WorkingLikelihood;
 use crate::types::{GlmLikelihoodFamily, InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1, s};
 const MIN_PROB: f64 = 1e-10;
@@ -547,21 +545,13 @@ fn solve_weighted_projection(
         return Err("solve_weighted_projection dimension mismatch".to_string());
     }
 
-    let mut xtwx = design.compute_xtwx(weights)?;
     let y_star = target_eta - offset;
-    let mut wy = y_star;
-    for i in 0..n {
-        wy[i] *= weights[i].max(0.0);
-    }
-    let xtwy = design.matvec_trans(&wy);
-    for a in 0..p {
-        xtwx[[a, a]] += ridge_floor.max(1e-12);
-    }
-
-    let solver = StableSolver::new("gamlss weighted projection");
-    let beta = solver
-        .solve_vector_with_ridge_retries(&xtwx, &xtwy, 0.0)
-        .ok_or_else(|| "solve_weighted_projection produced non-finite coefficients".to_string())?;
+    let xtwy = design.compute_xtwy(weights, &y_star)?;
+    let ridge = ridge_floor.max(1e-12);
+    let penalty = Array2::from_diag(&Array1::from_elem(p, ridge));
+    let beta = design
+        .solve_system(weights, &xtwy, Some(&penalty))
+        .map_err(|_| "solve_weighted_projection produced non-finite coefficients".to_string())?;
     if beta.iter().any(|v| !v.is_finite()) {
         return Err("solve_weighted_projection produced non-finite coefficients".to_string());
     }
@@ -590,13 +580,9 @@ fn solve_penalized_weighted_projection(
         ));
     }
 
-    let mut xtwx = design.compute_xtwx(weights)?;
     let y_star = target_eta - offset;
-    let mut wy = y_star;
-    for i in 0..n {
-        wy[i] *= weights[i].max(0.0);
-    }
-    let xtwy = design.matvec_trans(&wy);
+    let xtwy = design.compute_xtwy(weights, &y_star)?;
+    let mut penalty = Array2::<f64>::zeros((p, p));
     for (k, s) in penalties.iter().enumerate() {
         let lambda = log_lambdas[k].exp();
         if !lambda.is_finite() || lambda < 0.0 {
@@ -605,16 +591,16 @@ fn solve_penalized_weighted_projection(
                 log_lambdas[k]
             ));
         }
-        xtwx.scaled_add(lambda, s);
+        penalty.scaled_add(lambda, s);
     }
+    let ridge = ridge_floor.max(1e-12);
     for a in 0..p {
-        xtwx[[a, a]] += ridge_floor.max(1e-12);
+        penalty[[a, a]] += ridge;
     }
 
-    let solver = StableSolver::new("gamlss penalized weighted projection");
-    let beta = solver
-        .solve_vector_with_ridge_retries(&xtwx, &xtwy, 0.0)
-        .ok_or_else(|| {
+    let beta = design
+        .solve_system(weights, &xtwy, Some(&penalty))
+        .map_err(|_| {
             "solve_penalized_weighted_projection produced non-finite coefficients".to_string()
         })?;
     if beta.iter().any(|v| !v.is_finite()) {
@@ -876,8 +862,6 @@ fn emit_binomial_alpha_beta_warnings(
 struct BinomialAlphaBetaWarmStartFamily {
     y: Array1<f64>,
     weights: Array1<f64>,
-    beta_min: f64,
-    beta_max: f64,
 }
 
 impl BinomialAlphaBetaWarmStartFamily {
@@ -982,16 +966,6 @@ impl CustomFamily for BinomialAlphaBetaWarmStartFamily {
             ],
         })
     }
-
-    fn post_update_block_beta(
-        &self,
-        _block_states: &[ParameterBlockState],
-        _block_idx: usize,
-        _spec: &ParameterBlockSpec,
-        beta: Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        Ok(beta.mapv(|v| v.clamp(self.beta_min, self.beta_max)))
-    }
 }
 
 fn try_binomial_alpha_beta_warm_start(
@@ -1003,13 +977,9 @@ fn try_binomial_alpha_beta_warm_start(
     log_sigma_block: &ParameterBlockInput,
     options: &BlockwiseFitOptions,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
-    let beta_min = (1.0 / sigma_max.max(1e-12)).max(1e-12);
-    let beta_max = (1.0 / sigma_min.max(1e-12)).max(beta_min + 1e-12);
     let warm_family = BinomialAlphaBetaWarmStartFamily {
         y: y.clone(),
         weights: weights.clone(),
-        beta_min,
-        beta_max,
     };
 
     let alpha_spec = ParameterBlockSpec {
@@ -2664,6 +2634,24 @@ struct EtaTwoBlockJet {
     w_ll: f64,
 }
 
+#[derive(Clone, Copy)]
+struct ClampedInverseLinkRow {
+    mu: f64,
+    clamp_active: bool,
+    d1: f64,
+    d2: f64,
+    d3: f64,
+}
+
+#[derive(Clone, Copy)]
+struct BinomialLocationScaleRow {
+    sigma: f64,
+    dsigma_deta: f64,
+    q0: f64,
+    clamped_mu: ClampedInverseLinkRow,
+    ll: f64,
+}
+
 /// Chain rule in (eta_t, eta_ls) space for two coupled blocks.
 ///
 /// With q = q(eta_t, eta_ls), score s = d ell / dq, and
@@ -3015,6 +3003,64 @@ fn nonwiggle_q_directional(
     }
 }
 
+#[inline]
+fn clamped_inverse_link_row(jet: crate::mixture_link::InverseLinkJet) -> ClampedInverseLinkRow {
+    let raw_mu = jet.mu;
+    let mu = raw_mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
+    let clamp_active = raw_mu <= MIN_PROB || raw_mu >= 1.0 - MIN_PROB;
+    if clamp_active {
+        ClampedInverseLinkRow {
+            mu,
+            clamp_active,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
+        }
+    } else {
+        ClampedInverseLinkRow {
+            mu,
+            clamp_active,
+            d1: jet.d1,
+            d2: jet.d2,
+            d3: jet.d3,
+        }
+    }
+}
+
+#[inline]
+fn binomial_location_scale_q0(eta_t: f64, sigma: f64) -> f64 {
+    -eta_t / sigma.max(1e-12)
+}
+
+fn binomial_location_scale_row(
+    y: f64,
+    weight: f64,
+    eta_t: f64,
+    eta_ls: f64,
+    eta_wiggle: f64,
+    link_kind: &InverseLink,
+    sigma_min: f64,
+    sigma_max: f64,
+) -> Result<BinomialLocationScaleRow, String> {
+    let SigmaJet1 {
+        sigma,
+        d1: dsigma_deta,
+    } = bounded_sigma_jet1_scalar(eta_ls, sigma_min, sigma_max);
+    let q0 = binomial_location_scale_q0(eta_t, sigma);
+    let q = q0 + eta_wiggle;
+    let jet = inverse_link_jet_for_inverse_link(link_kind, q)
+        .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
+    let clamped_mu = clamped_inverse_link_row(jet);
+    let ll = weight * (y * clamped_mu.mu.ln() + (1.0_f64 - y) * (1.0_f64 - clamped_mu.mu).ln());
+    Ok(BinomialLocationScaleRow {
+        sigma,
+        dsigma_deta,
+        q0,
+        clamped_mu,
+        ll,
+    })
+}
+
 fn binomial_location_scale_core(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -3046,50 +3092,25 @@ fn binomial_location_scale_core(
     let mut ll = 0.0;
 
     for i in 0..n {
-        let (sigma_i, dsigma_deta_i) =
-            bounded_sigma_and_deriv_from_eta_scalar(eta_ls[i], sigma_min, sigma_max);
-        sigma[i] = sigma_i;
-        dsigma_deta[i] = dsigma_deta_i;
-        q0[i] = -eta_t[i] / sigma[i].max(1e-12);
-        let q = q0[i] + eta_wiggle.map_or(0.0, |w| w[i]);
-        let jet = inverse_link_jet_for_inverse_link(link_kind, q)
-            .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-        // Clamp-consistent row cache:
-        //
-        // The per-row objective is
-        //
-        //   mu_clamped(q) = clamp(mu_raw(q), MIN_PROB, 1-MIN_PROB),
-        //   ell_i         = w_i [ y_i log mu_clamped + (1-y_i) log(1-mu_clamped) ].
-        //
-        // Therefore every cached derivative consumed by score/curvature/Newton
-        // helpers must differentiate `mu_clamped`, not `mu_raw`.
-        //
-        // Away from the clamp kink, the derivative of the clamped map is
-        //
-        //   D mu_clamped[q]
-        //   = mu_raw'(q)     if eps < mu_raw(q) < 1-eps,
-        //   = 0              on an active clamp branch,
-        //
-        // and likewise for higher derivatives.
-        //
-        // Earlier versions cached the raw jet unconditionally, which meant the
-        // code was differentiating the unclamped response surface while the
-        // reported `log_likelihood` evaluated the clamped one. That produced a
-        // definite objective/gradient mismatch in the tails. The branch below
-        // enforces derivative consistency with the actual scalar objective.
-        let raw_mu = jet.mu;
-        mu[i] = raw_mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
-        clamp_active[i] = raw_mu <= MIN_PROB || raw_mu >= 1.0 - MIN_PROB;
-        if clamp_active[i] {
-            dmu_dq[i] = 0.0;
-            d2mu_dq2[i] = 0.0;
-            d3mu_dq3[i] = 0.0;
-        } else {
-            dmu_dq[i] = jet.d1;
-            d2mu_dq2[i] = jet.d2;
-            d3mu_dq3[i] = jet.d3;
-        }
-        ll += weights[i] * (y[i] * mu[i].ln() + (1.0 - y[i]) * (1.0 - mu[i]).ln());
+        let row = binomial_location_scale_row(
+            y[i],
+            weights[i],
+            eta_t[i],
+            eta_ls[i],
+            eta_wiggle.map_or(0.0, |w| w[i]),
+            link_kind,
+            sigma_min,
+            sigma_max,
+        )?;
+        sigma[i] = row.sigma;
+        dsigma_deta[i] = row.dsigma_deta;
+        q0[i] = row.q0;
+        mu[i] = row.clamped_mu.mu;
+        clamp_active[i] = row.clamped_mu.clamp_active;
+        dmu_dq[i] = row.clamped_mu.d1;
+        d2mu_dq2[i] = row.clamped_mu.d2;
+        d3mu_dq3[i] = row.clamped_mu.d3;
+        ll += row.ll;
     }
 
     Ok(BinomialLocationScaleCore {
@@ -3462,11 +3483,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let mut ll = 0.0;
 
         for i in 0..n {
-            let (sigma_i, dsigma_deta_i) = bounded_sigma_and_deriv_from_eta_scalar(
-                eta_log_sigma[i],
-                self.sigma_min,
-                self.sigma_max,
-            );
+            let SigmaJet1 {
+                sigma: sigma_i,
+                d1: dsigma_deta_i,
+            } = bounded_sigma_jet1_scalar(eta_log_sigma[i], self.sigma_min, self.sigma_max);
             sigma[i] = sigma_i;
             dsigma_deta[i] = dsigma_deta_i;
             let r = self.y[i] - eta_mu[i];
@@ -3535,9 +3555,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
         let (x_t, x_ls) = self.dense_block_designs()?;
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let total = pt + pls;
         let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
             bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
 
@@ -3593,7 +3610,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let beta_layout = GamlssBetaLayout::two_block(pt, pls);
-        let total = beta_layout.total();
         let (u_t, u_ls) = beta_layout.split_two(d_beta_flat, "Gaussian joint d_beta")?;
         let d_eta_t = x_t.dot(&u_t);
         let d_eta_ls = x_ls.dot(&u_ls);
@@ -3655,7 +3671,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let beta_layout = GamlssBetaLayout::two_block(pt, pls);
-        let total = beta_layout.total();
         let (u_t, u_ls) = beta_layout.split_two(d_beta_u_flat, "Gaussian joint d_beta_u")?;
         let (v_t, v_ls) = beta_layout.split_two(d_beta_v_flat, "Gaussian joint d_beta_v")?;
         let d_eta_t_u = x_t.dot(&u_t);
@@ -4363,10 +4378,6 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let (sigma, ds, d2s, _) =
             bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
 
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let total = pt + pls;
-
         let mut w_tt_diag = Array1::<f64>::zeros(n);
         let mut w_tl_diag = Array1::<f64>::zeros(n);
         let mut w_ll_diag = Array1::<f64>::zeros(n);
@@ -4526,7 +4537,6 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let beta_layout = GamlssBetaLayout::two_block(pt, pls);
-        let total = beta_layout.total();
         let (u_t, u_ls) = beta_layout.split_two(d_beta_flat, "binomial joint d_beta")?;
         let d_eta_t = x_t.dot(&u_t);
         let d_eta_ls = x_ls.dot(&u_ls);
@@ -4675,7 +4685,6 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let beta_layout = GamlssBetaLayout::two_block(pt, pls);
-        let total = beta_layout.total();
         let (u_t, u_ls) = beta_layout.split_two(d_beta_u_flat, "binomial joint d_beta_u")?;
         let (v_t, v_ls) = beta_layout.split_two(d_beta_v_flat, "binomial joint d_beta_v")?;
         let d_eta_t_u = x_t.dot(&u_t);
@@ -4889,7 +4898,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitFamily {
         for i in 0..mean.len() {
             let sigma =
                 bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
-            let q = -eta_t[i] / sigma;
+            let q = binomial_location_scale_q0(eta_t[i], sigma);
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
                 .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
             mean[i] = jet.mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
@@ -6094,7 +6103,7 @@ impl CustomFamily for BinomialLocationScaleProbitWiggleFamily {
         for i in 0..q0.len() {
             let sigma =
                 bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
-            q0[i] = -eta_t[i] / sigma;
+            q0[i] = binomial_location_scale_q0(eta_t[i], sigma);
         }
         let x = self.wiggle_design(q0.view())?;
         if x.ncols() != spec.design.ncols() {
@@ -6139,7 +6148,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleProbitWiggleFamily {
         for i in 0..mean.len() {
             let sigma =
                 bounded_sigma_from_eta_scalar(eta_ls[i], self.sigma_min, self.sigma_max).max(1e-12);
-            let q0 = -eta_t[i] / sigma;
+            let q0 = binomial_location_scale_q0(eta_t[i], sigma);
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q0 + eta_w[i])
                 .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
             mean[i] = jet.mu.clamp(MIN_PROB, 1.0 - MIN_PROB);

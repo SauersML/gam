@@ -3759,10 +3759,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
     let mut model = gam::families::royston_parmar::working_model_from_flattened(
         penalties,
-        MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 1e-8,
-        },
+        MonotonicityPenalty { tolerance: 1e-8 },
         survival_spec,
         gam::families::royston_parmar::RoystonParmarInputs {
             age_entry: age_entry.view(),
@@ -4088,10 +4085,7 @@ fn run_sample_survival(
         "crude" => SurvivalSpec::Crude,
         other => return Err(format!("unsupported saved survival spec '{other}'")),
     };
-    let monotonicity = MonotonicityPenalty {
-        lambda: 0.0,
-        tolerance: 1e-8,
-    };
+    let monotonicity = MonotonicityPenalty { tolerance: 1e-8 };
     let baseline_cfg = survival_baseline_config_from_model(model)?;
     let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
         build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;

@@ -1168,10 +1168,9 @@ impl<'a> GamWorkingModel<'a> {
             ..
         } = self;
         let (x_active, coordinate_frame) = match coordinate_design {
-            WorkingCoordinateDesign::OriginalSparseNative => (
-                x_original,
-                PirlsCoordinateFrame::OriginalSparseNative,
-            ),
+            WorkingCoordinateDesign::OriginalSparseNative => {
+                (x_original, PirlsCoordinateFrame::OriginalSparseNative)
+            }
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 (x_transformed, PirlsCoordinateFrame::TransformedQs)
             }
@@ -3637,9 +3636,9 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
                 maybe_sparse_design(&x_transformed),
                 PirlsCoordinateFrame::TransformedQs,
                 reparam_result.clone(),
-            Some(x_transformed),
-        )
-    };
+                Some(x_transformed),
+            )
+        };
 
     if matches!(link_function, LinkFunction::Identity) {
         let x_transformed_dense = x_transformed_dense

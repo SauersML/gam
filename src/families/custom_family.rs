@@ -597,24 +597,26 @@ fn solve_block_weighted_system(
     ridge_policy: RidgePolicy,
 ) -> Result<Array1<f64>, String> {
     let n = x.nrows();
+    let p = x.ncols();
     if y_star.len() != n || w.len() != n {
         return Err("weighted-system dimension mismatch".to_string());
     }
 
-    let (xtwx_base, xtwy_opt) = weighted_normal_equations(x, w, Some(y_star))?;
-    let xtwy = xtwy_opt.ok_or_else(|| "missing weighted RHS in block solve".to_string())?;
+    let xtwy = x.compute_xtwy(w, y_star)?;
     let base_ridge = if ridge_policy.include_laplace_hessian {
         effective_solver_ridge(ridge_floor)
     } else {
         0.0
     };
 
-    let mut xtwx = xtwx_base.clone();
-    xtwx += s_lambda;
-    let solver = StableSolver::new("custom-family weighted block solve");
-    solver
-        .solve_vector_with_ridge_retries(&xtwx, &xtwy, base_ridge)
-        .ok_or_else(|| "block solve failed after ridge retries".to_string())
+    let mut penalty = s_lambda.clone();
+    if base_ridge > 0.0 {
+        for i in 0..p {
+            penalty[[i, i]] += base_ridge;
+        }
+    }
+    x.solve_system(w, &xtwy, Some(&penalty))
+        .map_err(|_| "block solve failed after ridge retries".to_string())
 }
 
 fn solve_spd_system_with_policy(
