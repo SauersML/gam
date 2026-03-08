@@ -23,6 +23,15 @@ pub enum BasisError {
     #[error("Spline degree must be at least 1, but was {0}.")]
     InvalidDegree(usize),
 
+    #[error(
+        "Spline degree {degree} is too low for derivative order {derivative_order}; need degree >= {minimum_degree}."
+    )]
+    InsufficientDegreeForDerivative {
+        degree: usize,
+        derivative_order: usize,
+        minimum_degree: usize,
+    },
+
     #[error("Data range is invalid: start ({0}) must be less than or equal to end ({1}).")]
     InvalidRange(f64, f64),
 
@@ -470,6 +479,14 @@ fn apply_dense_bspline_extrapolation(
         }
     }
 
+    if matches!(eval_kind, BasisEvalKind::SecondDerivative) {
+        for (i, &x) in data.iter().enumerate() {
+            if x < left || x > right {
+                basis_matrix.row_mut(i).fill(0.0);
+            }
+        }
+    }
+
     if matches!(eval_kind, BasisEvalKind::Basis) {
         let z_clamped = data.mapv(|x| x.clamp(left, right));
         apply_linear_extension_from_first_derivative(
@@ -557,7 +574,7 @@ fn validate_knots_for_degree(
         return Err(BasisError::InvalidDegree(degree));
     }
 
-    let required_knots = degree + 2;
+    let required_knots = 2 * (degree + 1);
     if knot_vector.len() < required_knots {
         return Err(BasisError::InsufficientKnotsForDegree {
             degree,
@@ -4387,7 +4404,7 @@ fn build_matern_double_penalty_candidates(
 }
 
 #[cfg(test)]
-#[cfg(test)]
+#[allow(dead_code)]
 fn build_duchon_operator_penalty_candidates(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
@@ -5888,7 +5905,7 @@ fn build_duchon_primary_penalty_with_psi_derivatives(
 }
 
 #[cfg(test)]
-#[cfg(test)]
+#[allow(dead_code)]
 fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
     centers: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -7442,17 +7459,7 @@ pub fn evaluate_bspline_basis_scalar(
     out: &mut [f64],
     scratch: &mut SplineScratch,
 ) -> Result<(), BasisError> {
-    if degree < 1 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    let required_knots = degree + 2;
-    if knot_vector.len() < required_knots {
-        return Err(BasisError::InsufficientKnotsForDegree {
-            degree,
-            required: required_knots,
-            provided: knot_vector.len(),
-        });
-    }
+    validate_knots_for_degree(knot_vector, degree)?;
 
     let num_basis = knot_vector.len() - degree - 1;
     if out.len() != num_basis {
@@ -7540,18 +7547,19 @@ pub fn evaluate_ispline_scalar_with_scratch(
         .checked_add(1)
         .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
     validate_knots_for_degree(knot_vector, bs_degree)?;
-    let num_basis = knot_vector.len() - bs_degree - 1;
-    if out.len() != num_basis {
+    let num_bspline_basis = knot_vector.len() - bs_degree - 1;
+    let num_ispline_basis = num_bspline_basis.saturating_sub(1);
+    if out.len() != num_ispline_basis {
         return Err(BasisError::DimensionMismatch(format!(
             "I-spline output buffer length {} does not match basis size {}",
             out.len(),
-            num_basis
+            num_ispline_basis
         )));
     }
 
     // Domain for B_{., degree+1} is [t_{degree+1}, t_{num_basis}].
     let left = knot_vector[bs_degree];
-    let right = knot_vector[num_basis];
+    let right = knot_vector[num_bspline_basis];
     let support = bs_degree + 1;
     if x < left {
         out.fill(0.0);
@@ -7561,10 +7569,10 @@ pub fn evaluate_ispline_scalar_with_scratch(
         if scratch.left_local.len() < support {
             scratch.left_local.resize(support, 0.0);
         }
-        if scratch.left_offsets.len() < num_basis {
-            scratch.left_offsets.resize(num_basis, 0.0);
+        if scratch.left_offsets.len() < num_bspline_basis {
+            scratch.left_offsets.resize(num_bspline_basis, 0.0);
         }
-        scratch.left_offsets[..num_basis].fill(0.0);
+        scratch.left_offsets[..num_bspline_basis].fill(0.0);
         let left_local = &mut scratch.left_local[..support];
         left_local.fill(0.0);
         scratch.left_inner.ensure_degree(bs_degree);
@@ -7575,21 +7583,19 @@ pub fn evaluate_ispline_scalar_with_scratch(
             left_local,
             &mut scratch.left_inner,
         );
-        let left_offsets = &mut scratch.left_offsets[..num_basis];
+        let left_offsets = &mut scratch.left_offsets[..num_bspline_basis];
         let mut left_running = 0.0_f64;
         for offset in (0..support).rev() {
             let j = left_start + offset;
-            if j >= num_basis {
+            if j >= num_bspline_basis {
                 continue;
             }
             left_running += left_local[offset];
             left_offsets[j] = left_running;
         }
-        for j in 0..num_basis {
-            out[j] = 1.0 - left_offsets[j];
-            if out[j].abs() <= 1e-15 {
-                out[j] = 0.0;
-            }
+        for j in 1..num_bspline_basis {
+            let value = 1.0 - left_offsets[j];
+            out[j - 1] = if value.abs() <= 1e-15 { 0.0 } else { value };
         }
         return Ok(());
     }
@@ -7615,29 +7621,31 @@ pub fn evaluate_ispline_scalar_with_scratch(
     );
 
     let total = local.iter().copied().sum::<f64>();
-    let lead_end = start.min(num_basis);
-    if lead_end > 0 {
-        out[..lead_end].fill(total);
+    let lead_end = start.min(num_bspline_basis);
+    if lead_end > 1 {
+        out[..(lead_end - 1)].fill(total);
     }
 
     let mut running = 0.0f64;
     for offset in (0..support).rev() {
         let j = start + offset;
-        if j >= num_basis {
+        if j >= num_bspline_basis {
             continue;
         }
         running += local[offset];
-        out[j] = running;
+        if j > 0 {
+            out[j - 1] = running;
+        }
     }
 
     // Subtract left-boundary constants so I_j(left) = 0 exactly.
     if scratch.left_local.len() < support {
         scratch.left_local.resize(support, 0.0);
     }
-    if scratch.left_offsets.len() < num_basis {
-        scratch.left_offsets.resize(num_basis, 0.0);
+    if scratch.left_offsets.len() < num_bspline_basis {
+        scratch.left_offsets.resize(num_bspline_basis, 0.0);
     }
-    scratch.left_offsets[..num_basis].fill(0.0);
+    scratch.left_offsets[..num_bspline_basis].fill(0.0);
     let left_local = &mut scratch.left_local[..support];
     left_local.fill(0.0);
     scratch.left_inner.ensure_degree(bs_degree);
@@ -7648,20 +7656,21 @@ pub fn evaluate_ispline_scalar_with_scratch(
         left_local,
         &mut scratch.left_inner,
     );
-    let left_offsets = &mut scratch.left_offsets[..num_basis];
+    let left_offsets = &mut scratch.left_offsets[..num_bspline_basis];
     let mut left_running = 0.0_f64;
     for offset in (0..support).rev() {
         let j = left_start + offset;
-        if j >= num_basis {
+        if j >= num_bspline_basis {
             continue;
         }
         left_running += left_local[offset];
         left_offsets[j] = left_running;
     }
-    for j in 0..num_basis {
-        out[j] -= left_offsets[j];
-        if out[j].abs() <= 1e-15 {
-            out[j] = 0.0;
+    for j in 1..num_bspline_basis {
+        let out_idx = j - 1;
+        out[out_idx] -= left_offsets[j];
+        if out[out_idx].abs() <= 1e-15 {
+            out[out_idx] = 0.0;
         }
     }
     Ok(())
@@ -7724,17 +7733,7 @@ pub fn evaluate_bspline_derivative_scalar_into(
     lower_basis: &mut [f64],
     lower_scratch: &mut internal::BsplineScratch,
 ) -> Result<(), BasisError> {
-    if degree < 1 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    let required_knots = degree + 2;
-    if knot_vector.len() < required_knots {
-        return Err(BasisError::InsufficientKnotsForDegree {
-            degree,
-            required: required_knots,
-            provided: knot_vector.len(),
-        });
-    }
+    validate_knots_for_degree(knot_vector, degree)?;
 
     let num_basis = knot_vector.len() - degree - 1;
     if out.len() != num_basis {
@@ -7921,13 +7920,14 @@ fn create_ispline_dense(
         .checked_add(1)
         .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
     validate_knots_for_degree(knot_vector, bs_degree)?;
-    let num_basis = knot_vector.len() - bs_degree - 1;
-    let mut out = Array2::<f64>::zeros((data.len(), num_basis));
+    let num_bspline_basis = knot_vector.len() - bs_degree - 1;
+    let num_ispline_basis = num_bspline_basis.saturating_sub(1);
+    let mut out = Array2::<f64>::zeros((data.len(), num_ispline_basis));
     let mut scratch = internal::BsplineScratch::new(bs_degree);
     let support = bs_degree + 1;
     let mut local = vec![0.0; support];
     let left = knot_vector[bs_degree];
-    let right = knot_vector[num_basis];
+    let right = knot_vector[num_bspline_basis];
 
     // Left-boundary cumulative constants for anchoring I_j(left)=0.
     let mut left_local = vec![0.0_f64; support];
@@ -7939,11 +7939,11 @@ fn create_ispline_dense(
         &mut left_local,
         &mut left_scratch,
     );
-    let mut left_offsets = vec![0.0_f64; num_basis];
+    let mut left_offsets = vec![0.0_f64; num_bspline_basis];
     let mut left_running = 0.0_f64;
     for offset in (0..support).rev() {
         let j = left_start + offset;
-        if j >= num_basis {
+        if j >= num_bspline_basis {
             continue;
         }
         left_running += left_local[offset];
@@ -7955,8 +7955,9 @@ fn create_ispline_dense(
             continue;
         }
         if x >= right {
-            for j in 0..num_basis {
-                out[[row_i, j]] = 1.0 - left_offsets[j];
+            for j in 1..num_bspline_basis {
+                let value = 1.0 - left_offsets[j];
+                out[[row_i, j - 1]] = if value.abs() <= 1e-15 { 0.0 } else { value };
             }
             continue;
         }
@@ -7968,18 +7969,21 @@ fn create_ispline_dense(
             &mut scratch,
         );
         let total = local.iter().copied().sum::<f64>();
-        let lead_end = start.min(num_basis);
-        if lead_end > 0 {
-            out.slice_mut(s![row_i, 0..lead_end]).fill(total);
+        let lead_end = start.min(num_bspline_basis);
+        if lead_end > 1 {
+            out.slice_mut(s![row_i, 0..(lead_end - 1)]).fill(total);
         }
         let mut running = 0.0f64;
         for offset in (0..support).rev() {
             let j = start + offset;
-            if j >= num_basis {
+            if j >= num_bspline_basis {
                 continue;
             }
             running += local[offset];
-            out[[row_i, j]] = running - left_offsets[j];
+            if j > 0 {
+                let value = running - left_offsets[j];
+                out[[row_i, j - 1]] = if value.abs() <= 1e-15 { 0.0 } else { value };
+            }
         }
     }
     Ok(out)
@@ -8000,7 +8004,11 @@ pub fn evaluate_bspline_second_derivative_scalar(
     out: &mut [f64],
 ) -> Result<(), BasisError> {
     if degree < 2 {
-        return Err(BasisError::InvalidDegree(degree));
+        return Err(BasisError::InsufficientDegreeForDerivative {
+            degree,
+            derivative_order: 2,
+            minimum_degree: 2,
+        });
     }
     let num_basis_lower = knot_vector
         .len()
@@ -8034,16 +8042,13 @@ pub fn evaluate_bspline_second_derivative_scalar_into(
     lower_scratch: &mut internal::BsplineScratch,
 ) -> Result<(), BasisError> {
     if degree < 2 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    let required_knots = degree + 2;
-    if knot_vector.len() < required_knots {
-        return Err(BasisError::InsufficientKnotsForDegree {
+        return Err(BasisError::InsufficientDegreeForDerivative {
             degree,
-            required: required_knots,
-            provided: knot_vector.len(),
+            derivative_order: 2,
+            minimum_degree: 2,
         });
     }
+    validate_knots_for_degree(knot_vector, degree)?;
 
     let num_basis = knot_vector.len() - degree - 1;
     if out.len() != num_basis {
@@ -8052,6 +8057,14 @@ pub fn evaluate_bspline_second_derivative_scalar_into(
             out.len(),
             num_basis
         )));
+    }
+    if num_basis > 0 {
+        let left = knot_vector[degree];
+        let right = knot_vector[num_basis];
+        if x < left || x > right {
+            out.fill(0.0);
+            return Ok(());
+        }
     }
 
     let num_basis_lower = knot_vector
@@ -8118,7 +8131,11 @@ pub fn evaluate_bspline_third_derivative_scalar(
     out: &mut [f64],
 ) -> Result<(), BasisError> {
     if degree < 3 {
-        return Err(BasisError::InvalidDegree(degree));
+        return Err(BasisError::InsufficientDegreeForDerivative {
+            degree,
+            derivative_order: 3,
+            minimum_degree: 3,
+        });
     }
     let num_second_lower = knot_vector.len().saturating_sub(degree);
     let mut second_lower = vec![0.0; num_second_lower];
@@ -8153,16 +8170,13 @@ pub fn evaluate_bspline_third_derivative_scalar_into(
     lower_scratch: &mut internal::BsplineScratch,
 ) -> Result<(), BasisError> {
     if degree < 3 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    let required_knots = degree + 2;
-    if knot_vector.len() < required_knots {
-        return Err(BasisError::InsufficientKnotsForDegree {
+        return Err(BasisError::InsufficientDegreeForDerivative {
             degree,
-            required: required_knots,
-            provided: knot_vector.len(),
+            derivative_order: 3,
+            minimum_degree: 3,
         });
     }
+    validate_knots_for_degree(knot_vector, degree)?;
 
     let num_basis = knot_vector.len() - degree - 1;
     if out.len() != num_basis {
@@ -8171,6 +8185,14 @@ pub fn evaluate_bspline_third_derivative_scalar_into(
             out.len(),
             num_basis
         )));
+    }
+    if num_basis > 0 {
+        let left = knot_vector[degree];
+        let right = knot_vector[num_basis];
+        if x < left || x > right {
+            out.fill(0.0);
+            return Ok(());
+        }
     }
 
     let expected_second_lower = knot_vector.len().saturating_sub(degree);
@@ -8243,7 +8265,11 @@ pub fn evaluate_bspline_fourth_derivative_scalar(
     out: &mut [f64],
 ) -> Result<(), BasisError> {
     if degree < 4 {
-        return Err(BasisError::InvalidDegree(degree));
+        return Err(BasisError::InsufficientDegreeForDerivative {
+            degree,
+            derivative_order: 4,
+            minimum_degree: 4,
+        });
     }
     let num_third_lower = knot_vector.len().saturating_sub(degree);
     let mut third_lower = vec![0.0; num_third_lower];
@@ -8282,16 +8308,13 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
     lower_scratch: &mut internal::BsplineScratch,
 ) -> Result<(), BasisError> {
     if degree < 4 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    let required_knots = degree + 2;
-    if knot_vector.len() < required_knots {
-        return Err(BasisError::InsufficientKnotsForDegree {
+        return Err(BasisError::InsufficientDegreeForDerivative {
             degree,
-            required: required_knots,
-            provided: knot_vector.len(),
+            derivative_order: 4,
+            minimum_degree: 4,
         });
     }
+    validate_knots_for_degree(knot_vector, degree)?;
 
     let num_basis = knot_vector.len() - degree - 1;
     if out.len() != num_basis {
@@ -8300,6 +8323,14 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
             out.len(),
             num_basis
         )));
+    }
+    if num_basis > 0 {
+        let left = knot_vector[degree];
+        let right = knot_vector[num_basis];
+        if x < left || x > right {
+            out.fill(0.0);
+            return Ok(());
+        }
     }
 
     let expected_third_lower = knot_vector.len().saturating_sub(degree);
@@ -9673,15 +9704,14 @@ mod tests {
     fn test_ispline_scalar_boundary_behavior() {
         let knots = array![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0];
         let degree = 1usize;
-        let n_ispline = knots.len() - (degree + 1) - 1;
+        let n_ispline = knots.len() - (degree + 1) - 2;
         let mut out = vec![0.0; n_ispline];
 
         evaluate_ispline_scalar(-10.0, knots.view(), degree, &mut out).expect("left boundary eval");
         assert!(out.iter().all(|&v| v.abs() <= 1e-12));
 
         evaluate_ispline_scalar(10.0, knots.view(), degree, &mut out).expect("right boundary eval");
-        assert!(out[0].abs() <= 1e-12);
-        for &v in out.iter().skip(1) {
+        for &v in &out {
             assert!((v - 1.0).abs() <= 1e-12);
         }
     }
@@ -9690,7 +9720,7 @@ mod tests {
     fn test_ispline_scalar_is_monotone_in_x() {
         let knots = array![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0];
         let degree = 1usize;
-        let n_ispline = knots.len() - (degree + 1) - 1;
+        let n_ispline = knots.len() - (degree + 1) - 2;
         let xs = [0.0, 0.25, 0.75, 1.5, 2.2, 2.8, 3.0];
 
         let mut prev = vec![0.0; n_ispline];
@@ -9769,8 +9799,7 @@ mod tests {
         .expect("create ispline basis");
         let i_basis = i_basis.as_ref();
         assert!(i_basis.row(0).iter().all(|v| v.abs() <= 1e-12));
-        assert!(i_basis[[2, 0]].abs() <= 1e-12);
-        for j in 1..i_basis.ncols() {
+        for j in 0..i_basis.ncols() {
             assert!((i_basis[[2, j]] - 1.0).abs() <= 1e-12);
         }
         for &v in i_basis.row(1) {
@@ -9779,23 +9808,45 @@ mod tests {
     }
 
     #[test]
+    fn test_ispline_basis_drops_identically_zero_leading_column() {
+        let knots = array![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0];
+        let degree = 1usize;
+        let x = array![0.0, 0.5, 1.5, 2.5, 3.0];
+        let (i_basis, _) = create_basis::<Dense>(
+            x.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::i_spline(),
+        )
+        .expect("create ispline basis");
+        let i_basis = i_basis.as_ref();
+        assert_eq!(i_basis.ncols(), knots.len() - (degree + 1) - 2);
+        for j in 0..i_basis.ncols() {
+            assert!(
+                i_basis.column(j).iter().any(|&v| v.abs() > 1e-12),
+                "I-spline column {j} should not be identically zero"
+            );
+        }
+    }
+
+    #[test]
     fn test_ispline_derivative_matches_cumulative_bspline_derivative_finite_difference() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0, 3.0];
         let degree = 2usize;
         let bs_degree = degree + 1;
-        let n_i = knots.len() - bs_degree - 1;
+        let n_i = knots.len() - bs_degree - 2;
 
         // Check at interior points away from knot boundaries for stable central differences.
         let xs = [0.35, 0.8, 1.4, 2.2];
         let h = 1e-6;
         for &x in &xs {
-            let mut db = vec![0.0; n_i];
+            let mut db = vec![0.0; n_i + 1];
             evaluate_bspline_derivative_scalar(x, knots.view(), bs_degree, &mut db).expect("B'(x)");
             let mut d_i = vec![0.0; n_i];
             let mut running = 0.0_f64;
-            for j in (0..n_i).rev() {
+            for j in (1..(n_i + 1)).rev() {
                 running += db[j];
-                d_i[j] = running;
+                d_i[j - 1] = running;
             }
 
             crate::assert_central_difference_array!(
@@ -9809,6 +9860,93 @@ mod tests {
                 d_i,
                 2e-5
             );
+        }
+    }
+
+    #[test]
+    fn test_validate_knots_for_degree_rejects_too_few_knots_for_degree_domain() {
+        let knots = array![0.0, 0.0, 1.0, 1.0];
+        let err = create_basis::<Dense>(
+            array![0.5].view(),
+            KnotSource::Provided(knots.view()),
+            2,
+            BasisOptions::value(),
+        )
+        .expect_err("degree-2 basis should reject knot vectors with too few knots");
+        match err {
+            BasisError::InsufficientKnotsForDegree {
+                degree,
+                required,
+                provided,
+            } => {
+                assert_eq!(degree, 2);
+                assert_eq!(required, 6);
+                assert_eq!(provided, 4);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dense_second_derivative_zeroes_outside_domain_even_on_sparse_heuristic_path() {
+        let degree = 3usize;
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0, 1.0];
+        let mut xs = Vec::with_capacity(128);
+        xs.push(-0.2);
+        for i in 0..126 {
+            xs.push(i as f64 / 125.0);
+        }
+        xs.push(1.2);
+        let x = Array1::from_vec(xs);
+        let (basis, _) = create_basis::<Dense>(
+            x.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::second_derivative(),
+        )
+        .expect("dense second derivative");
+        let basis = basis.as_ref();
+        assert!(basis.row(0).iter().all(|v| v.abs() <= 1e-12));
+        assert!(basis.row(basis.nrows() - 1).iter().all(|v| v.abs() <= 1e-12));
+    }
+
+    #[test]
+    fn test_scalar_higher_derivatives_are_zero_outside_domain() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.4, 0.8, 1.0, 1.0, 1.0, 1.0];
+        let mut second = vec![1.0; knots.len() - 3 - 1];
+        evaluate_bspline_second_derivative_scalar(-0.1, knots.view(), 3, &mut second)
+            .expect("second derivative");
+        assert!(second.iter().all(|v| v.abs() <= 1e-12));
+
+        let mut third = vec![1.0; knots.len() - 3 - 1];
+        evaluate_bspline_third_derivative_scalar(1.1, knots.view(), 3, &mut third)
+            .expect("third derivative");
+        assert!(third.iter().all(|v| v.abs() <= 1e-12));
+
+        let knots4 = array![0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let mut fourth = vec![1.0; knots4.len() - 4 - 1];
+        evaluate_bspline_fourth_derivative_scalar(-0.2, knots4.view(), 4, &mut fourth)
+            .expect("fourth derivative");
+        assert!(fourth.iter().all(|v| v.abs() <= 1e-12));
+    }
+
+    #[test]
+    fn test_higher_derivative_degree_errors_are_specific() {
+        let knots = array![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let mut out = vec![0.0; knots.len() - 1 - 1];
+        let err = evaluate_bspline_second_derivative_scalar(0.5, knots.view(), 1, &mut out)
+            .expect_err("degree-1 second derivative should fail");
+        match err {
+            BasisError::InsufficientDegreeForDerivative {
+                degree,
+                derivative_order,
+                minimum_degree,
+            } => {
+                assert_eq!(degree, 1);
+                assert_eq!(derivative_order, 2);
+                assert_eq!(minimum_degree, 2);
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 

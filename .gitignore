@@ -55,6 +55,7 @@ bench/plots/
 
 # local scratch / profiling outputs
 tmp/
+tmp_cont_verify/
 tmp_cont_cv*/
 tmp_continuous_order_repro/
 diff.txt

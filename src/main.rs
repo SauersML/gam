@@ -2947,60 +2947,30 @@ fn build_survival_time_basis(
             if p_time_full == 0 {
                 return Err("internal error: empty ispline time basis".to_string());
             }
-            if db_exit.ncols() < p_time_full {
+            if db_exit.ncols() != p_time_full + 1 {
                 return Err(
-                    "internal error: ispline derivative basis has fewer columns than basis"
+                    "internal error: ispline derivative basis width must exceed basis width by one"
                         .to_string(),
                 );
             }
 
-            // Structural monotonicity should only exponentiate shape-varying time
-            // columns. Drop any constant columns from the I-spline block (for
-            // anchored I-splines this includes the leading intercept-like column).
-            let constant_tol = 1e-12_f64;
-            let mut keep_cols: Vec<usize> = Vec::new();
-            for j in 0..p_time_full {
-                let mut min_v = f64::INFINITY;
-                let mut max_v = f64::NEG_INFINITY;
-                for i in 0..n {
-                    let ve = x_exit_time_full[[i, j]];
-                    let vs = x_entry_time_full[[i, j]];
-                    min_v = min_v.min(ve.min(vs));
-                    max_v = max_v.max(ve.max(vs));
-                }
-                if (max_v - min_v) > constant_tol {
-                    keep_cols.push(j);
-                }
-            }
-            if keep_cols.is_empty() {
-                return Err(
-                    "internal error: ispline basis has no shape-varying time columns".to_string(),
-                );
-            }
-
-            let p_time = keep_cols.len();
-            let mut x_entry_time = Array2::<f64>::zeros((n, p_time));
-            let mut x_exit_time = Array2::<f64>::zeros((n, p_time));
-            for i in 0..n {
-                for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                    x_entry_time[[i, j_new]] = x_entry_time_full[[i, j_old]];
-                    x_exit_time[[i, j_new]] = x_exit_time_full[[i, j_old]];
-                }
-            }
+            let p_time = p_time_full;
+            let x_entry_time = x_entry_time_full.to_owned();
+            let x_exit_time = x_exit_time_full.to_owned();
 
             // For I_j(log t) = sum_{m=j..} B_m(log t), derivative in log-time is
             // dI_j/dlogt = sum_{m=j..} dB_m/dlogt. Then apply dlogt/dt = 1/t.
             let mut x_derivative_time = Array2::<f64>::zeros((n, p_time));
             for i in 0..n {
                 let mut running = 0.0_f64;
-                let mut d_i_log = vec![0.0_f64; p_time_full];
-                for j in (0..p_time_full).rev() {
+                let mut d_i_log = vec![0.0_f64; p_time];
+                for j in (1..db_exit.ncols()).rev() {
                     running += db_exit[[i, j]];
-                    d_i_log[j] = running;
+                    d_i_log[j - 1] = running;
                 }
                 let chain = 1.0 / age_exit[i].max(1e-9);
-                for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                    x_derivative_time[[i, j_new]] = d_i_log[j_old] * chain;
+                for j in 0..p_time {
+                    x_derivative_time[[i, j]] = d_i_log[j] * chain;
                 }
             }
 
@@ -3026,13 +2996,7 @@ fn build_survival_time_basis(
                 if s.nrows() != p_time_full || s.ncols() != p_time_full {
                     continue;
                 }
-                let mut trimmed = Array2::<f64>::zeros((p_time, p_time));
-                for (ri, &r_old) in keep_cols.iter().enumerate() {
-                    for (ci, &c_old) in keep_cols.iter().enumerate() {
-                        trimmed[[ri, ci]] = s[[r_old, c_old]];
-                    }
-                }
-                penalties.push(trimmed);
+                penalties.push(s.clone());
             }
 
             Ok(SurvivalTimeBuildOutput {
@@ -9564,31 +9528,18 @@ mod tests {
         let entry_full = entry_full.as_ref();
         let exit_full = exit_full.as_ref();
 
-        let mut keep_cols: Vec<usize> = Vec::new();
-        for j in 0..exit_full.ncols() {
-            let mut min_v = f64::INFINITY;
-            let mut max_v = f64::NEG_INFINITY;
-            for i in 0..entry_full.nrows() {
-                let ve = exit_full[[i, j]];
-                let vs = entry_full[[i, j]];
-                min_v = min_v.min(ve.min(vs));
-                max_v = max_v.max(ve.max(vs));
-            }
-            if (max_v - min_v) > 1e-12 {
-                keep_cols.push(j);
-            }
-        }
-        assert_eq!(p_time, keep_cols.len());
+        assert_eq!(p_time, exit_full.ncols());
+        assert_eq!(db_exit.ncols(), p_time + 1);
         for i in 0..age_exit.len() {
             let mut running = 0.0_f64;
-            let mut d_i = vec![0.0_f64; db_exit.ncols()];
-            for j in (0..db_exit.ncols()).rev() {
+            let mut d_i = vec![0.0_f64; p_time];
+            for j in (1..db_exit.ncols()).rev() {
                 running += db_exit[[i, j]];
-                d_i[j] = running;
+                d_i[j - 1] = running;
             }
             let chain = 1.0 / age_exit[i].max(1e-9);
             for j in 0..p_time {
-                let expected = d_i[keep_cols[j]] * chain;
+                let expected = d_i[j] * chain;
                 assert!((built.x_derivative_time[[i, j]] - expected).abs() <= 1e-12);
             }
         }
@@ -9647,7 +9598,7 @@ mod tests {
     }
 
     #[test]
-    fn ispline_time_basis_drops_constant_columns_before_structural_block() {
+    fn ispline_time_basis_contains_only_shape_varying_columns() {
         let age_entry = Array1::from_vec(vec![1.0, 1.5, 2.0, 2.5]);
         let age_exit = Array1::from_vec(vec![1.2, 1.9, 2.8, 3.1]);
         let knots = Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.8, 1.2, 1.6, 1.6, 1.6, 1.6]);
@@ -9665,7 +9616,7 @@ mod tests {
         )
         .expect("build ispline time basis");
 
-        // Returned structural block must contain only shape-varying columns.
+        // The source I-spline basis should already exclude the zero anchored column.
         for j in 0..built.x_exit_time.ncols() {
             let mut min_v = f64::INFINITY;
             let mut max_v = f64::NEG_INFINITY;
