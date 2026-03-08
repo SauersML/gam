@@ -1616,7 +1616,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mut spatial_search_options = options.clone();
     spatial_search_options.use_reml_objective = false;
     spatial_search_options.compute_covariance = false;
-    spatial_search_options.outer_max_iter = 0;
+    spatial_search_options.outer_max_iter = 1;
     let extra_rho0 = builder.extra_rho0()?;
 
     let mean_boot_design =
@@ -4173,7 +4173,6 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(out)
     }
 
-    #[allow(dead_code)]
     fn dense_block_designs(&self) -> Result<(Array2<f64>, Array2<f64>), String> {
         let xt = self
             .threshold_design
