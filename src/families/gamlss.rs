@@ -181,34 +181,12 @@ struct GamlssBetaLayout {
 }
 
 impl GamlssBetaLayout {
-    fn two_block(pt: usize, pls: usize) -> Self {
-        Self { pt, pls, pw: 0 }
-    }
-
     fn with_wiggle(pt: usize, pls: usize, pw: usize) -> Self {
         Self { pt, pls, pw }
     }
 
     fn total(self) -> usize {
         self.pt + self.pls + self.pw
-    }
-
-    fn split_two(
-        self,
-        flat: &Array1<f64>,
-        context: &str,
-    ) -> Result<(Array1<f64>, Array1<f64>), String> {
-        if flat.len() != self.total() {
-            return Err(format!(
-                "{context} length mismatch: got {}, expected {}",
-                flat.len(),
-                self.total()
-            ));
-        }
-        Ok((
-            flat.slice(s![0..self.pt]).to_owned(),
-            flat.slice(s![self.pt..self.pt + self.pls]).to_owned(),
-        ))
     }
 
     fn split_three(
@@ -2523,35 +2501,6 @@ fn binomial_neglog_q_fourth_derivative_probit_closed_form(
             - (q * q * q - 3.0 * q) * a * phi)
 }
 
-#[inline]
-fn binomial_fourth_from_jet(
-    y: f64,
-    weight: f64,
-    clamp_active: bool,
-    mu: f64,
-    d1: f64,
-    d2: f64,
-    d3: f64,
-    d4: f64,
-) -> f64 {
-    if clamp_active {
-        return 0.0;
-    }
-    let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
-    let one_minus = (1.0 - m).max(MIN_PROB);
-    let ell_mu = y / m - (1.0 - y) / one_minus;
-    let ell_mumu = -y / (m * m) - (1.0 - y) / (one_minus * one_minus);
-    let ell_mumum = 2.0 * y / (m * m * m) - 2.0 * (1.0 - y) / (one_minus * one_minus * one_minus);
-    let ell_mumumum = -6.0 * y / (m * m * m * m)
-        - 6.0 * (1.0 - y) / (one_minus * one_minus * one_minus * one_minus);
-    weight
-        * (ell_mumumum * d1.powi(4)
-            + 6.0 * ell_mumum * d1 * d1 * d2
-            + 3.0 * ell_mumu * d2 * d2
-            + 4.0 * ell_mumu * d1 * d3
-            + ell_mu * d4)
-}
-
 fn xt_diag_x_dense(design: &Array2<f64>, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
     if design.nrows() != diag.len() {
         return Err(format!(
@@ -2583,22 +2532,6 @@ fn xt_diag_y_dense(
         ));
     }
     Ok(fast_xt_diag_y(left, diag, right))
-}
-
-fn assemble_two_block_symmetric(
-    upper_left: &Array2<f64>,
-    upper_right: &Array2<f64>,
-    lower_right: &Array2<f64>,
-) -> Array2<f64> {
-    let pt = upper_left.nrows();
-    let pls = lower_right.nrows();
-    let total = pt + pls;
-    let mut out = Array2::<f64>::zeros((total, total));
-    out.slice_mut(s![0..pt, 0..pt]).assign(upper_left);
-    out.slice_mut(s![0..pt, pt..total]).assign(upper_right);
-    out.slice_mut(s![pt..total, pt..total]).assign(lower_right);
-    mirror_upper_to_lower(&mut out);
-    out
 }
 
 fn mirror_upper_to_lower(target: &mut Array2<f64>) {
@@ -2633,7 +2566,6 @@ struct BinomialLocationScaleCore {
 struct NonWiggleQDerivs {
     q_t: f64,
     q_ls: f64,
-    q_tt: f64,
     q_tl: f64,
     q_ll: f64,
     q_tl_ls: f64,
@@ -2645,7 +2577,6 @@ struct NonWiggleQDirectional {
     delta_q: f64,
     delta_q_t: f64,
     delta_q_ls: f64,
-    delta_q_tt: f64,
     delta_q_tl: f64,
     delta_q_ll: f64,
 }
@@ -2655,7 +2586,6 @@ struct EtaTwoBlockJet {
     grad_t: f64,
     grad_ls: f64,
     w_tt: f64,
-    w_tl: f64,
     w_ll: f64,
 }
 
@@ -2693,8 +2623,6 @@ fn eta_two_block_jet_from_q(
     curvature_q: f64,
     q_t: f64,
     q_ls: f64,
-    q_tt: f64,
-    q_tl: f64,
     q_ll: f64,
 ) -> EtaTwoBlockJet {
     // Full rowwise calculus for eta=(eta_t,eta_ls):
@@ -2729,62 +2657,9 @@ fn eta_two_block_jet_from_q(
     EtaTwoBlockJet {
         grad_t: score_q * q_t,
         grad_ls: score_q * q_ls,
-        w_tt: -(c_q * q_t * q_t + score_q * q_tt),
-        w_tl: -(c_q * q_t * q_ls + score_q * q_tl),
+        w_tt: -(c_q * q_t * q_t),
         w_ll: -(c_q * q_ls * q_ls + score_q * q_ll),
     }
-}
-
-/// Generic directional derivative of Newton weight:
-///   w_ab = -(c q_a q_b + s q_ab), with c = d2 ell / dq2.
-/// Along direction u:
-///   delta w_ab =
-///     -[ t delta_q q_a q_b
-///        + c(delta q_a q_b + q_a delta q_b)
-///        + c delta_q q_ab
-///        + s delta q_ab ].
-///
-/// Inputs use project convention `curvature_q = -c`.
-fn delta_newton_weight_from_q_terms(
-    score_q: f64,
-    curvature_q: f64,
-    third_q: f64,
-    q_a: f64,
-    q_b: f64,
-    q_ab: f64,
-    delta_q: f64,
-    delta_q_a: f64,
-    delta_q_b: f64,
-    delta_q_ab: f64,
-) -> f64 {
-    // Start from
-    //   w_ab = -(c q_a q_b + s q_ab).
-    //
-    // Directional derivative along u:
-    //   dot{w}_ab
-    //   = -dot(c q_a q_b + s q_ab)
-    //   = -( dot{c} q_a q_b + c dot{q}_a q_b + c q_a dot{q}_b
-    //       + dot{s} q_ab + s dot{q}_{ab} ).
-    //
-    // With chain identities wrt q:
-    //   dot{s} = c dot{q},   dot{c} = t dot{q},
-    // this becomes
-    //   dot{w}_ab
-    //   = -( t dot{q} q_a q_b
-    //       + c(dot{q}_a q_b + q_a dot{q}_b)
-    //       + c dot{q} q_ab
-    //       + s dot{q}_{ab} ).
-    //
-    // Parameter mapping here:
-    //   delta_q    -> dot{q},
-    //   delta_q_a  -> dot{q}_a,
-    //   delta_q_b  -> dot{q}_b,
-    //   delta_q_ab -> dot{q}_{ab}.
-    let c_q = -curvature_q;
-    -(third_q * delta_q * q_a * q_b
-        + c_q * (delta_q_a * q_b + q_a * delta_q_b)
-        + c_q * delta_q * q_ab
-        + score_q * delta_q_ab)
 }
 
 #[inline]
@@ -2880,64 +2755,6 @@ fn second_directional_hessian_coeff_from_objective_q_terms(
         + m1 * d2q_ab_uv
 }
 
-#[inline]
-fn second_delta_newton_weight_from_q_terms(
-    score_q: f64,
-    curvature_q: f64,
-    third_q: f64,
-    fourth_q: f64,
-    q_ab_term: f64,
-    d_q_u: f64,
-    d_q_v: f64,
-    d2_q_uv: f64,
-    a0: f64,
-    a_u: f64,
-    a_v: f64,
-    a_uv: f64,
-    b_u: f64,
-    b_v: f64,
-    b_uv: f64,
-) -> f64 {
-    // Exact symmetric bilinear second variation for the generic weight
-    //   w = -(c a + s b),
-    // where, in eta-space:
-    //   a  is one of (q_t^2, q_t q_ls, q_ls^2),
-    //   b  is one of (q_tt, q_tl, q_ll),
-    // and wrt q:
-    //   s = l'(q), c = l''(q), t = l'''(q), f = l''''(q).
-    //
-    // Directional chain identities along u and v:
-    //   Ds[u] = c dq_u,    Dc[u] = t dq_u,
-    //   D²s[u,v] = t dq_u dq_v + c d²q_uv,
-    //   D²c[u,v] = f dq_u dq_v + t d²q_uv.
-    //
-    // Product-rule expansion:
-    //   D²w[u,v] = -(
-    //      D²c[u,v] a
-    //    + Dc[u] Da[v] + Dc[v] Da[u] + c D²a[u,v]
-    //    + D²s[u,v] b
-    //    + Ds[u] Db[v] + Ds[v] Db[u] + s D²b[u,v] ).
-    //
-    // Argument mapping in this helper:
-    //   a0   = a,      a_u = Da[u],   a_v = Da[v],   a_uv = D²a[u,v]
-    //   q_ab_term = b, b_u = Db[u],   b_v = Db[v],   b_uv = D²b[u,v].
-    let c_q = -curvature_q;
-    let ds_u = c_q * d_q_u;
-    let ds_v = c_q * d_q_v;
-    let dc_u = third_q * d_q_u;
-    let dc_v = third_q * d_q_v;
-    let ddc_uv = fourth_q * d_q_v * d_q_u + third_q * d2_q_uv;
-    let dds_uv = third_q * d_q_v * d_q_u + c_q * d2_q_uv;
-    -(ddc_uv * a0
-        + dc_u * a_v
-        + dc_v * a_u
-        + c_q * a_uv
-        + dds_uv * q_ab_term
-        + ds_u * b_v
-        + ds_v * b_u
-        + score_q * b_uv)
-}
-
 /// Non-wiggle location-scale map derivatives:
 /// q(eta_t, eta_ls) = -eta_t / sigma(eta_ls), with:
 /// q_t=-1/sigma, q_ls=eta_t*sigma'/sigma^2, q_tt=0, q_tl=sigma'/sigma^2,
@@ -2984,7 +2801,6 @@ fn nonwiggle_q_derivs(
     NonWiggleQDerivs {
         q_t: -1.0 / s,
         q_ls: eta_t * dsigma / s2,
-        q_tt: 0.0,
         q_tl: dsigma / s2,
         q_ll: eta_t * q_tl_ls,
         q_tl_ls,
@@ -3022,7 +2838,6 @@ fn nonwiggle_q_directional(
         delta_q: q.q_t * d_eta_t + q.q_ls * d_eta_ls,
         delta_q_t: q.q_tl * d_eta_ls,
         delta_q_ls: q.q_tl * d_eta_t + q.q_ll * d_eta_ls,
-        delta_q_tt: 0.0,
         delta_q_tl: q.q_tl_ls * d_eta_ls,
         delta_q_ll: q.q_tl_ls * d_eta_t + q.q_ll_ls * d_eta_ls,
     }
@@ -3179,16 +2994,13 @@ fn binomial_location_scale_working_sets(
             let s = core.sigma[i].max(1e-12);
 
             let dq_t = -a_i / s;
-            let d2q_t = c_i / (s * s);
-
             let dq0_ls = -core.q0[i] * core.dsigma_deta[i] / s;
             let d2q0_ls = eta_t[i]
                 * (geom.d2sigma_deta2[i] / (s * s)
                     - 2.0 * core.dsigma_deta[i] * core.dsigma_deta[i] / (s * s * s));
             let dq_ls = a_i * dq0_ls;
             let d2q_ls = a_i * d2q0_ls + c_i * dq0_ls * dq0_ls;
-            let eta_jet =
-                eta_two_block_jet_from_q(score_q, curvature_q, dq_t, dq_ls, d2q_t, 0.0, d2q_ls);
+            let eta_jet = eta_two_block_jet_from_q(score_q, curvature_q, dq_t, dq_ls, d2q_ls);
             grad_eta_t[i] = eta_jet.grad_t;
             grad_eta_ls[i] = eta_jet.grad_ls;
             h_eta_t[i] = eta_jet.w_tt;
