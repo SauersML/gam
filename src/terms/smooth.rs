@@ -5876,6 +5876,7 @@ impl<FitOut: Clone> TwoBlockSpatialHyperState<FitOut> {
             self.evals.remove(0);
         }
     }
+
 }
 
 #[derive(Clone)]
@@ -6425,37 +6426,6 @@ fn try_exact_joint_spatial_length_scale_optimization(
     }))
 }
 
-fn central_diff_gradient<F>(
-    theta: &Array1<f64>,
-    lower: &Array1<f64>,
-    upper: &Array1<f64>,
-    objective: &mut F,
-) -> Result<Array1<f64>, EstimationError>
-where
-    F: FnMut(&Array1<f64>) -> Result<f64, EstimationError>,
-{
-    let mut grad = Array1::<f64>::zeros(theta.len());
-    let mut plus = theta.clone();
-    let mut minus = theta.clone();
-    for i in 0..theta.len() {
-        let base = theta[i];
-        let h_raw = 1e-3_f64 * (1.0 + base.abs());
-        let h = h_raw
-            .min((upper[i] - base).max(0.0))
-            .min((base - lower[i]).max(0.0))
-            .max(1e-6);
-        plus[i] = (base + h).min(upper[i]);
-        minus[i] = (base - h).max(lower[i]);
-        let fp = objective(&plus)?;
-        let fm = objective(&minus)?;
-        let denom = (plus[i] - minus[i]).abs().max(1e-12);
-        grad[i] = (fp - fm) / denom;
-        plus[i] = base;
-        minus[i] = base;
-    }
-    Ok(grad)
-}
-
 fn spatial_score_improves(candidate: f64, baseline: f64, rel_tol: f64) -> bool {
     candidate.is_finite() && candidate + rel_tol * (1.0 + baseline.abs()) < baseline
 }
@@ -6899,8 +6869,6 @@ where
         let mut theta0 = Array1::<f64>::zeros(total_terms);
         let lower = Array1::<f64>::from_elem(total_terms, kappa_options.min_length_scale.ln());
         let upper = Array1::<f64>::from_elem(total_terms, kappa_options.max_length_scale.ln());
-        let lower_eval = lower.clone();
-        let upper_eval = upper.clone();
         for (slot, &term_idx) in mean_terms.iter().enumerate() {
             theta0[slot] = get_spatial_length_scale(&best_mean_spec, term_idx)
                 .unwrap_or(kappa_options.min_length_scale)
@@ -6920,7 +6888,6 @@ where
                 .ln();
         }
 
-        let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>)> = None;
         let mut hyper_state =
             TwoBlockSpatialHyperState::<FitOut>::new(kappa_options.max_outer_iter.max(8) * 4);
 
@@ -6981,77 +6948,148 @@ where
             ))
         };
 
-        let objective = CachedFirstOrderObjective::new(
-            |theta: &Array1<f64>| {
-                let (cost, grad) = match eval_value(theta) {
-                    Ok((cost, mean_spec_c, noise_spec_c, mean_design_c, noise_design_c, fit_c)) => {
-                        let mut objective_only =
-                            |probe: &Array1<f64>| -> Result<f64, EstimationError> {
-                                let (value, _, _, _, _, _) = eval_value(probe)?;
-                                Ok(value)
-                            };
-                        let grad = central_diff_gradient(
-                            theta,
-                            &lower_eval,
-                            &upper_eval,
-                            &mut objective_only,
-                        )
-                        .map_err(|e| {
-                            ObjectiveEvalError::recoverable(format!(
-                                "two-block spatial gradient evaluation failed: {e}"
-                            ))
-                        })?;
-                        if !cost.is_finite() || grad.iter().any(|v| !v.is_finite()) {
-                            return Err(ObjectiveEvalError::recoverable(
-                                "two-block spatial objective/gradient became non-finite",
-                            ));
-                        }
-                        let _ = (
-                            mean_spec_c,
-                            noise_spec_c,
-                            mean_design_c,
-                            noise_design_c,
-                            fit_c,
-                        );
-                        last_eval = Some((theta.clone(), cost, grad.clone()));
-                        (cost, grad)
-                    }
-                    Err(e) => {
-                        return Err(ObjectiveEvalError::recoverable(format!(
-                            "two-block spatial objective evaluation failed: {e}"
-                        )));
-                    }
-                };
-                Ok((cost, grad))
-            },
-        );
-        let mut optimizer = Bfgs::new(theta0.clone(), objective)
-            .with_bounds(Bounds::new(lower, upper, 1e-6).expect("two-block bounds must be valid"))
-            .with_tolerance(
-                Tolerance::new(kappa_options.rel_tol.max(1e-6))
-                    .expect("two-block tolerance must be valid"),
-            )
-            .with_profile(opt::Profile::Aggressive)
-            .with_max_iterations(
-                MaxIterations::new(kappa_options.max_outer_iter.max(1))
-                    .expect("two-block max iterations must be valid"),
-            );
-
-        let solution = match optimizer.run() {
-            Ok(sol) => sol,
-            Err(BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
-            Err(BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-            Err(err) => return Err(format!("two-block spatial optimization failed: {err:?}")),
+        let mut current_theta = theta0.clone();
+        let mut current_cost = if initial_score.is_finite() {
+            initial_score
+        } else {
+            f64::INFINITY
+        };
+        let mut best_eval = TwoBlockHyperEval {
+            theta: theta0.clone(),
+            cost: current_cost,
+            mean_spec: best_mean_spec.clone(),
+            noise_spec: best_noise_spec.clone(),
+            mean_design: best_mean_design.clone(),
+            noise_design: best_noise_design.clone(),
+            fit: best_fit.clone(),
         };
 
-        let theta_star = solution.final_point;
-        let (_cost, mean_spec_c, noise_spec_c, mean_design_c, noise_design_c, fit_c) =
-            eval_value(&theta_star).map_err(|e| e.to_string())?;
-        best_mean_spec = mean_spec_c;
-        best_noise_spec = noise_spec_c;
-        best_mean_design = mean_design_c;
-        best_noise_design = noise_design_c;
-        best_fit = fit_c;
+        for _pass in 0..kappa_options.max_outer_iter {
+            let mut pass_improved = false;
+            for coord in 0..current_theta.len() {
+                let base_value = current_theta[coord];
+                let base_cost = current_cost;
+                let left_value = (base_value - kappa_options.log_step).max(lower[coord]);
+                let right_value = (base_value + kappa_options.log_step).min(upper[coord]);
+
+                let left_probe = coordinate_probe(&current_theta, coord, left_value);
+                let right_probe = coordinate_probe(&current_theta, coord, right_value);
+                let left_cost = if approx_same_point(&left_probe, &current_theta) {
+                    f64::INFINITY
+                } else {
+                    eval_value(&left_probe).map_err(|e| e.to_string())?.0
+                };
+                let right_cost = if approx_same_point(&right_probe, &current_theta) {
+                    f64::INFINITY
+                } else {
+                    eval_value(&right_probe).map_err(|e| e.to_string())?.0
+                };
+
+                if left_cost.is_finite() && right_cost.is_finite() {
+                    if let Some(interior_value) = quadratic_coordinate_minimizer(
+                        left_value,
+                        left_cost,
+                        base_value,
+                        base_cost,
+                        right_value,
+                        right_cost,
+                    ) {
+                        let interior_value = interior_value.clamp(lower[coord], upper[coord]);
+                        if interior_value > left_value.min(right_value) + 1e-12
+                            && interior_value < left_value.max(right_value) - 1e-12
+                        {
+                            let interior_theta =
+                                coordinate_probe(&current_theta, coord, interior_value);
+                            let interior_cost =
+                                eval_value(&interior_theta).map_err(|e| e.to_string())?.0;
+                            if spatial_score_improves(
+                                interior_cost,
+                                current_cost,
+                                kappa_options.rel_tol,
+                            ) {
+                                current_theta = interior_theta;
+                                current_cost = interior_cost;
+                                let (
+                                    cost,
+                                    mean_spec_c,
+                                    noise_spec_c,
+                                    mean_design_c,
+                                    noise_design_c,
+                                    fit_c,
+                                ) = eval_value(&current_theta).map_err(|e| e.to_string())?;
+                                best_eval = TwoBlockHyperEval {
+                                    theta: current_theta.clone(),
+                                    cost,
+                                    mean_spec: mean_spec_c,
+                                    noise_spec: noise_spec_c,
+                                    mean_design: mean_design_c,
+                                    noise_design: noise_design_c,
+                                    fit: fit_c,
+                                };
+                                pass_improved = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                let (mut candidate_theta, mut candidate_cost, direction) =
+                    if spatial_score_improves(left_cost, base_cost, kappa_options.rel_tol)
+                        && left_cost <= right_cost
+                    {
+                        (left_probe, left_cost, -1.0_f64)
+                    } else if spatial_score_improves(right_cost, base_cost, kappa_options.rel_tol) {
+                        (right_probe, right_cost, 1.0_f64)
+                    } else {
+                        continue;
+                    };
+
+                loop {
+                    let next_value = (candidate_theta[coord] + direction * kappa_options.log_step)
+                        .clamp(lower[coord], upper[coord]);
+                    if (next_value - candidate_theta[coord]).abs() <= 1e-12 {
+                        break;
+                    }
+                    let next_theta = coordinate_probe(&candidate_theta, coord, next_value);
+                    if approx_same_point(&next_theta, &candidate_theta) {
+                        break;
+                    }
+                    let next_cost = eval_value(&next_theta).map_err(|e| e.to_string())?.0;
+                    if !spatial_score_improves(next_cost, candidate_cost, kappa_options.rel_tol) {
+                        break;
+                    }
+                    candidate_theta = next_theta;
+                    candidate_cost = next_cost;
+                }
+
+                if spatial_score_improves(candidate_cost, current_cost, kappa_options.rel_tol) {
+                    current_theta = candidate_theta;
+                    current_cost = candidate_cost;
+                    let (cost, mean_spec_c, noise_spec_c, mean_design_c, noise_design_c, fit_c) =
+                        eval_value(&current_theta).map_err(|e| e.to_string())?;
+                    best_eval = TwoBlockHyperEval {
+                        theta: current_theta.clone(),
+                        cost,
+                        mean_spec: mean_spec_c,
+                        noise_spec: noise_spec_c,
+                        mean_design: mean_design_c,
+                        noise_design: noise_design_c,
+                        fit: fit_c,
+                    };
+                    pass_improved = true;
+                }
+            }
+
+            if !pass_improved {
+                break;
+            }
+        }
+
+        best_mean_spec = best_eval.mean_spec;
+        best_noise_spec = best_eval.noise_spec;
+        best_mean_design = best_eval.mean_design;
+        best_noise_design = best_eval.noise_design;
+        best_fit = best_eval.fit;
     }
 
     Ok(TwoBlockSpatialLengthScaleOptimizationResult {
