@@ -1,7 +1,7 @@
 use crate::faer_ndarray::FaerCholesky;
-use crate::faer_ndarray::{FaerArrayView, FaerEigh};
+use crate::faer_ndarray::{FaerArrayView, FaerEigh, FaerSvd};
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
-use crate::matrix::DesignMatrix;
+use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::opt_objective::CachedSecondOrderObjective;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
@@ -66,7 +66,7 @@ pub enum BlockWorkingSet {
     /// `hessian` is -∇² log L wrt block coefficients (positive semidefinite near optimum).
     ExactNewton {
         gradient: Array1<f64>,
-        hessian: Array2<f64>,
+        hessian: SymmetricMatrix,
     },
 }
 
@@ -317,7 +317,7 @@ impl Default for BlockwiseFitOptions {
             ridge_floor: 1e-12,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_reml_objective: true,
-            compute_covariance: true,
+            compute_covariance: false,
         }
     }
 }
@@ -744,7 +744,56 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
 
 struct ExactNewtonBlockUpdater<'a> {
     gradient: &'a Array1<f64>,
-    hessian: &'a Array2<f64>,
+    hessian: &'a SymmetricMatrix,
+}
+
+fn solve_symmetric_system_with_policy(
+    lhs: &SymmetricMatrix,
+    rhs: &Array1<f64>,
+    ridge_floor: f64,
+    ridge_policy: RidgePolicy,
+) -> Result<Array1<f64>, String> {
+    match lhs {
+        SymmetricMatrix::Dense(dense) => {
+            solve_spd_system_with_policy(dense, rhs, ridge_floor, ridge_policy)
+        }
+        SymmetricMatrix::Sparse(_) => {
+            if lhs.nrows() != lhs.ncols() || rhs.len() != lhs.nrows() {
+                return Err("exact-newton sparse system dimension mismatch".to_string());
+            }
+            let base_ridge = if ridge_policy.include_laplace_hessian {
+                effective_solver_ridge(ridge_floor)
+            } else {
+                0.0
+            };
+            let mut ridge = 0.0_f64;
+            for _ in 0..8 {
+                let system = if ridge > 0.0 {
+                    lhs.add_ridge(ridge)?
+                } else {
+                    lhs.clone()
+                };
+                match system.factorize().and_then(|factor| factor.solve(rhs)) {
+                    Ok(solution) if solution.iter().all(|v| v.is_finite()) => return Ok(solution),
+                    _ => {
+                        ridge = if ridge == 0.0 {
+                            base_ridge.max(1e-12)
+                        } else {
+                            ridge * 10.0
+                        };
+                    }
+                }
+            }
+            Err("exact-newton sparse block solve failed after ridge retries".to_string())
+        }
+    }
+}
+
+fn strict_solve_symmetric(lhs: &SymmetricMatrix, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
+    match lhs {
+        SymmetricMatrix::Dense(dense) => strict_solve_spd(dense, rhs),
+        SymmetricMatrix::Sparse(_) => lhs.factorize()?.solve(rhs),
+    }
 }
 
 impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
@@ -771,8 +820,7 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
             ));
         }
 
-        let mut lhs = self.hessian.clone();
-        lhs += ctx.s_lambda;
+        let lhs = self.hessian.add_dense(ctx.s_lambda)?;
         let mut rhs = self.hessian.dot(&ctx.states[ctx.block_idx].beta);
         rhs += self.gradient;
 
@@ -785,8 +833,9 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                     )
                 },
             )?;
+            let lhs_dense = lhs.to_dense();
             let (beta_constrained, active_set) = solve_quadratic_with_linear_constraints(
-                &lhs,
+                &lhs_dense,
                 &rhs,
                 &ctx.states[ctx.block_idx].beta,
                 constraints,
@@ -804,9 +853,9 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
             })
         } else {
             let beta = if use_exact_newton_strict_spd(ctx.family) {
-                strict_solve_spd(&lhs, &rhs)?
+                strict_solve_symmetric(&lhs, &rhs)?
             } else {
-                solve_spd_system_with_policy(
+                solve_symmetric_system_with_policy(
                     &lhs,
                     &rhs,
                     ctx.options.ridge_floor,
@@ -1316,7 +1365,7 @@ fn blockwise_logdet_terms<F: CustomFamily>(
                         p
                     ));
                 }
-                hessian.clone()
+                hessian.to_dense()
             }
         };
 
@@ -1551,6 +1600,10 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
             ));
         }
         let beta_flat = flatten_state_betas(&inner.block_states, specs);
+        let synced_joint_states =
+            synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
+        let joint_tangent_basis =
+            joint_post_update_tangent_basis(family, specs, &synced_joint_states)?;
         let mut s_joint = Array2::<f64>::zeros((total, total));
         let mut s_pinv_joint = if include_logdet_s {
             Some(Array2::<f64>::zeros((total, total)))
@@ -1664,24 +1717,14 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                 let keep_second_order = need_hessian || include_logdet_h || include_logdet_s;
                 let u_k = if keep_second_order {
                     let rhs_k = -&a_k_beta;
-                    if strict_spd {
-                        strict_solve_spd(&j_joint, &rhs_k)?
-                    } else {
-                        match solve_spd_system_with_policy(
-                            &j_joint,
-                            &rhs_k,
-                            options.ridge_floor,
-                            options.ridge_policy,
-                        ) {
-                            Ok(sol) => sol,
-                            Err(_) => pinv_positive_part(&j_joint, options.ridge_floor)
-                                .map(|j_pinv| j_pinv.dot(&rhs_k))
-                                .map_err(|_| {
-                                    "failed to solve joint mode sensitivity system for REML gradient"
-                                        .to_string()
-                                })?,
-                        }
-                    }
+                    solve_mode_sensitivity(
+                        &j_joint,
+                        &rhs_k,
+                        joint_tangent_basis.as_ref(),
+                        strict_spd,
+                        options,
+                        "joint mode sensitivity system for REML gradient",
+                    )?
                 } else {
                     Array1::<f64>::zeros(total)
                 };
@@ -1721,7 +1764,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                         // u_k = d beta^ / d rho_k.
                         let h_rho = family
                             .exact_newton_joint_hessian_directional_derivative(
-                                &inner.block_states,
+                                &synced_joint_states,
                                 &u_k,
                             )?
                             .ok_or_else(|| {
@@ -1790,27 +1833,17 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                         let rhs_kl = -(a_terms[k].dot(&u_terms[l])
                             + j_terms[l].dot(&u_terms[k])
                             + delta_kl * a_beta_terms[k].clone());
-                        let u_kl = if strict_spd {
-                            strict_solve_spd(&j_joint, &rhs_kl)?
-                        } else {
-                            match solve_spd_system_with_policy(
-                                &j_joint,
-                                &rhs_kl,
-                                options.ridge_floor,
-                                options.ridge_policy,
-                            ) {
-                                Ok(sol) => sol,
-                                Err(_) => pinv_positive_part(&j_joint, options.ridge_floor)
-                                    .map(|j_pinv| j_pinv.dot(&rhs_kl))
-                                    .map_err(|_| {
-                                        "failed to solve joint second-order mode sensitivity system for REML Hessian"
-                                            .to_string()
-                                    })?,
-                            }
-                        };
+                        let u_kl = solve_mode_sensitivity(
+                            &j_joint,
+                            &rhs_kl,
+                            joint_tangent_basis.as_ref(),
+                            strict_spd,
+                            options,
+                            "joint second-order mode sensitivity system for REML Hessian",
+                        )?;
                         let dh_u_kl = match family
                             .exact_newton_joint_hessian_directional_derivative(
-                                &inner.block_states,
+                                &synced_joint_states,
                                 &u_kl,
                             )? {
                             Some(v) => v,
@@ -1821,7 +1854,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                         };
                         let d2h_ul_uk = match family
                             .exact_newton_joint_hessian_second_directional_derivative(
-                                &inner.block_states,
+                                &synced_joint_states,
                                 &u_terms[l],
                                 &u_terms[k],
                             )? {
@@ -1921,7 +1954,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                         p
                     ));
                 }
-                hessian.clone()
+                hessian.to_dense()
             }
         };
 
@@ -2311,7 +2344,7 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                         p
                     ));
                 }
-                let mut h_mode = hessian.clone();
+                let mut h_mode = hessian.to_dense();
                 h_mode += &s_lambda;
                 let mut h_for_logdet = h_mode.clone();
                 if !strict_spd && options.ridge_policy.include_penalty_logdet {
@@ -2925,6 +2958,164 @@ fn set_states_from_flat_beta(
     Ok(())
 }
 
+fn synchronized_states_from_flat_beta<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    beta_flat: &Array1<f64>,
+) -> Result<Vec<ParameterBlockState>, String> {
+    let mut synced = states.to_vec();
+    set_states_from_flat_beta(&mut synced, specs, beta_flat)?;
+    refresh_all_block_etas(family, specs, &mut synced)?;
+    Ok(synced)
+}
+
+fn post_update_tangent_basis_for_block<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    block_states: &[ParameterBlockState],
+    block_idx: usize,
+) -> Result<Option<Array2<f64>>, String> {
+    let spec = specs.get(block_idx).ok_or_else(|| {
+        format!(
+            "post-update tangent basis block index {block_idx} out of bounds for {} specs",
+            specs.len()
+        )
+    })?;
+    let state = block_states.get(block_idx).ok_or_else(|| {
+        format!(
+            "post-update tangent basis block index {block_idx} out of bounds for {} states",
+            block_states.len()
+        )
+    })?;
+    let p = state.beta.len();
+    if p == 0 {
+        return Ok(Some(Array2::zeros((0, 0))));
+    }
+
+    let base = family.post_update_block_beta(block_states, block_idx, spec, state.beta.clone())?;
+    if base.len() != p {
+        return Err(format!(
+            "post-update tangent basis block {block_idx} returned beta length {}, expected {p}",
+            base.len()
+        ));
+    }
+
+    let mut jac = Array2::<f64>::zeros((p, p));
+    for j in 0..p {
+        let mut probe = base.clone();
+        probe[j] += 1.0;
+        let mapped = family.post_update_block_beta(block_states, block_idx, spec, probe)?;
+        if mapped.len() != p {
+            return Err(format!(
+                "post-update tangent basis block {block_idx} probe returned beta length {}, expected {p}",
+                mapped.len()
+            ));
+        }
+        jac.column_mut(j).assign(&(&mapped - &base));
+    }
+
+    let identity = Array2::<f64>::eye(p);
+    let jac_err = (&jac - &identity).iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+    if jac_err <= 1e-10 {
+        return Ok(None);
+    }
+
+    let (u_opt, singular, _) = jac
+        .svd(true, false)
+        .map_err(|e| format!("post-update tangent basis SVD failed for block {block_idx}: {e}"))?;
+    let u = u_opt.ok_or_else(|| {
+        format!("post-update tangent basis SVD omitted left singular vectors for block {block_idx}")
+    })?;
+    let max_sv = singular.iter().fold(0.0_f64, |m, &s| m.max(s.abs()));
+    let tol = (max_sv * 1e-10).max(1e-12);
+    let rank = singular.iter().filter(|&&s| s > tol).count();
+    if rank == p {
+        return Ok(None);
+    }
+    Ok(Some(u.slice(ndarray::s![.., 0..rank]).to_owned()))
+}
+
+fn joint_post_update_tangent_basis<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    block_states: &[ParameterBlockState],
+) -> Result<Option<Array2<f64>>, String> {
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
+    let mut blocks: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
+    let mut any_reduced = false;
+    let mut total_rank = 0usize;
+    for (block_idx, &(start, end)) in ranges.iter().enumerate() {
+        let p = end - start;
+        let basis = match post_update_tangent_basis_for_block(family, specs, block_states, block_idx)? {
+            Some(basis) => {
+                any_reduced = true;
+                basis
+            }
+            None => Array2::<f64>::eye(p),
+        };
+        total_rank += basis.ncols();
+        blocks.push(basis);
+    }
+    if !any_reduced {
+        return Ok(None);
+    }
+
+    let mut basis = Array2::<f64>::zeros((total, total_rank));
+    let mut col_at = 0usize;
+    for (block_idx, block_basis) in blocks.iter().enumerate() {
+        let (start, end) = ranges[block_idx];
+        let width = block_basis.ncols();
+        if width == 0 {
+            continue;
+        }
+        basis.slice_mut(ndarray::s![start..end, col_at..col_at + width])
+            .assign(block_basis);
+        col_at += width;
+    }
+    Ok(Some(basis))
+}
+
+fn solve_mode_sensitivity(
+    lhs: &Array2<f64>,
+    rhs: &Array1<f64>,
+    tangent_basis: Option<&Array2<f64>>,
+    strict_spd: bool,
+    options: &BlockwiseFitOptions,
+    context: &str,
+) -> Result<Array1<f64>, String> {
+    let solve_dense = |matrix: &Array2<f64>, vector: &Array1<f64>| -> Result<Array1<f64>, String> {
+        if strict_spd {
+            strict_solve_spd(matrix, vector)
+        } else {
+            solve_spd_system_with_policy(matrix, vector, options.ridge_floor, options.ridge_policy)
+                .or_else(|_| pinv_positive_part(matrix, options.ridge_floor).map(|pinv| pinv.dot(vector)))
+                .map_err(|_| format!("failed to solve {context}"))
+        }
+    };
+
+    match tangent_basis {
+        Some(basis) => {
+            if basis.nrows() != lhs.nrows() {
+                return Err(format!(
+                    "{context} tangent basis row mismatch: got {}, expected {}",
+                    basis.nrows(),
+                    lhs.nrows()
+                ));
+            }
+            if basis.ncols() == 0 {
+                return Ok(Array1::zeros(lhs.nrows()));
+            }
+            let lhs_reduced = basis.t().dot(lhs).dot(basis);
+            let rhs_reduced = basis.t().dot(rhs);
+            let sol_reduced = solve_dense(&lhs_reduced, &rhs_reduced)?;
+            Ok(basis.dot(&sol_reduced))
+        }
+        None => solve_dense(lhs, rhs),
+    }
+}
+
 fn penalized_objective_at_beta<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -3400,7 +3591,7 @@ mod tests {
                 log_likelihood: ll,
                 block_working_sets: vec![BlockWorkingSet::ExactNewton {
                     gradient: array![g],
-                    hessian: array![[1.0]],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
                 }],
             })
         }
@@ -3433,7 +3624,7 @@ mod tests {
                 log_likelihood: 0.0,
                 block_working_sets: vec![BlockWorkingSet::ExactNewton {
                     gradient: array![0.0],
-                    hessian: array![[2.0]],
+                    hessian: SymmetricMatrix::Dense(array![[2.0]]),
                 }],
             })
         }
@@ -3488,7 +3679,7 @@ mod tests {
                 log_likelihood: -resid * resid,
                 block_working_sets: vec![BlockWorkingSet::ExactNewton {
                     gradient: array![-2.0 * resid],
-                    hessian: array![[2.0]],
+                    hessian: SymmetricMatrix::Dense(array![[2.0]]),
                 }],
             })
         }
@@ -3534,7 +3725,7 @@ mod tests {
                 log_likelihood: 0.0,
                 block_working_sets: vec![BlockWorkingSet::ExactNewton {
                     gradient: array![0.0],
-                    hessian: array![[1.0]],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
                 }],
             })
         }
@@ -3574,7 +3765,7 @@ mod tests {
                 log_likelihood: 0.0,
                 block_working_sets: vec![BlockWorkingSet::ExactNewton {
                     gradient: array![0.0],
-                    hessian: array![[-1.0]],
+                    hessian: SymmetricMatrix::Dense(array![[-1.0]]),
                 }],
             })
         }

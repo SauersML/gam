@@ -1,6 +1,7 @@
 use gam::families::custom_family::{
     CustomFamilyBlockPsiDerivative, ExactNewtonOuterObjective, evaluate_custom_family_joint_hyper,
 };
+use gam::matrix::SymmetricMatrix;
 use gam::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState,
@@ -26,7 +27,7 @@ impl CustomFamily for ScalarPseudoLaplaceRhoFamily {
             log_likelihood: -resid * resid,
             block_working_sets: vec![BlockWorkingSet::ExactNewton {
                 gradient: array![-2.0 * resid],
-                hessian: array![[2.0]],
+                hessian: SymmetricMatrix::Dense(array![[2.0]]),
             }],
         })
     }
@@ -76,7 +77,7 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
             log_likelihood: -(resid * resid + 0.25 * self.psi * self.psi),
             block_working_sets: vec![BlockWorkingSet::ExactNewton {
                 gradient: array![-2.0 * resid],
-                hessian: array![[2.0]],
+                hessian: SymmetricMatrix::Dense(array![[2.0]]),
             }],
         })
     }
