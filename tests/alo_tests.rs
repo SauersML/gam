@@ -1,7 +1,7 @@
 use faer::Side;
 use gam::alo::compute_alo_diagnostics_from_pirls;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetric_with_fallback, fast_ata};
-use gam::pirls::{self, PirlsConfig};
+use gam::pirls::{self, PenaltyConfig, PirlsConfig, PirlsProblem};
 use gam::types::{InverseLink, LinkFunction, LogSmoothingParamsView};
 use ndarray::{Array1, Array2, Axis};
 use rand::SeedableRng;
@@ -52,18 +52,22 @@ fn fit_unpenalized(
     };
     let (res, _) = pirls::fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(rho.view()),
-        x.view(),
-        offset.view(),
-        y.view(),
-        w_prior.view(),
-        &rs_original,
-        None,
-        None,
-        x.ncols(),
+        PirlsProblem {
+            x: x.view(),
+            offset: offset.view(),
+            y: y.view(),
+            prior_weights: w_prior.view(),
+            covariate_se: None,
+        },
+        PenaltyConfig {
+            rs_original: &rs_original,
+            balanced_penalty_root: None,
+            reparam_invariant: None,
+            p: x.ncols(),
+            coefficient_lower_bounds: None,
+            linear_constraints_original: None,
+        },
         &cfg,
-        None,
-        None,
-        None,
         None,
     )
     .expect("unpenalized PIRLS fit");

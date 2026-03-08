@@ -3,8 +3,8 @@ use crate::inference::generative::NoiseModel;
 use crate::mixture_link::{InverseLinkJet, inverse_link_jet_for_family, mixture_inverse_link_jet};
 use crate::quadrature::{
     IntegratedMomentsJet, QuadratureContext, cloglog_posterior_mean_variance,
-    integrated_family_moments_jet_with_state, integrated_inverse_link_mean_and_derivative,
-    integrated_inverse_link_jet_with_state, logit_posterior_mean_variance,
+    integrated_family_moments_jet_with_state, integrated_inverse_link_jet_with_state,
+    integrated_inverse_link_mean_and_derivative, logit_posterior_mean_variance,
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
     probit_posterior_mean_variance,
 };
@@ -87,7 +87,9 @@ pub fn strategy_from_fit(
 impl ResolvedFamilyStrategy {
     #[inline]
     fn mixture_state(&self) -> Option<&crate::types::MixtureLinkState> {
-        self.inverse_link.as_ref().and_then(InverseLink::mixture_state)
+        self.inverse_link
+            .as_ref()
+            .and_then(InverseLink::mixture_state)
     }
 
     #[inline]
@@ -162,15 +164,13 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             LikelihoodFamily::GaussianIdentity => Ok(eta),
             LikelihoodFamily::BinomialLogit
             | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog => {
-                integrated_inverse_link_mean_and_derivative(
-                    quad_ctx,
-                    self.link_function(),
-                    eta,
-                    se_eta,
-                )
-                .map(|v| v.mean)
-            }
+            | LikelihoodFamily::BinomialCLogLog => integrated_inverse_link_mean_and_derivative(
+                quad_ctx,
+                self.link_function(),
+                eta,
+                se_eta,
+            )
+            .map(|v| v.mean),
             LikelihoodFamily::BinomialSas | LikelihoodFamily::BinomialBetaLogistic => {
                 integrated_inverse_link_jet_with_state(
                     quad_ctx,
@@ -208,15 +208,15 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
     ) -> Result<(f64, f64), EstimationError> {
         match self.family {
             LikelihoodFamily::GaussianIdentity => Ok((eta, (se_eta * se_eta).max(0.0))),
-            LikelihoodFamily::BinomialLogit => Ok(logit_posterior_mean_variance(
-                quad_ctx, eta, se_eta,
-            )),
-            LikelihoodFamily::BinomialProbit => Ok(probit_posterior_mean_variance(
-                quad_ctx, eta, se_eta,
-            )),
-            LikelihoodFamily::BinomialCLogLog => Ok(cloglog_posterior_mean_variance(
-                quad_ctx, eta, se_eta,
-            )),
+            LikelihoodFamily::BinomialLogit => {
+                Ok(logit_posterior_mean_variance(quad_ctx, eta, se_eta))
+            }
+            LikelihoodFamily::BinomialProbit => {
+                Ok(probit_posterior_mean_variance(quad_ctx, eta, se_eta))
+            }
+            LikelihoodFamily::BinomialCLogLog => {
+                Ok(cloglog_posterior_mean_variance(quad_ctx, eta, se_eta))
+            }
             LikelihoodFamily::BinomialSas => {
                 let state = self.sas_state().ok_or_else(|| {
                     EstimationError::InvalidInput(

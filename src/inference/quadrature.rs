@@ -238,17 +238,6 @@ pub struct IntegratedMomentsJet {
     pub mode: IntegratedExpectationMode,
 }
 
-/// Inference-layer contract used by solver code: request integrated moments
-/// for a family under Gaussian uncertainty in the linear predictor.
-pub trait IntegratedMomentsProvider {
-    fn evaluate_family_moments(
-        &self,
-        family: LikelihoodFamily,
-        eta: f64,
-        se_eta: f64,
-    ) -> Result<IntegratedMomentsJet, EstimationError>;
-}
-
 const LOGIT_SIGMA_DEGENERATE: f64 = 2.5e-1;
 const CLOGLOG_SIGMA_DEGENERATE: f64 = 1e-10;
 const CLOGLOG_SIGMA_TAYLOR_MAX: f64 = 0.25;
@@ -2204,18 +2193,6 @@ pub fn integrated_family_moments_jet_with_state(
         LikelihoodFamily::BinomialMixture => Err(EstimationError::InvalidInput(
             "Integrated moments dispatcher does not support binomial mixture links yet".to_string(),
         )),
-    }
-}
-
-impl IntegratedMomentsProvider for QuadratureContext {
-    #[inline]
-    fn evaluate_family_moments(
-        &self,
-        family: LikelihoodFamily,
-        eta: f64,
-        se_eta: f64,
-    ) -> Result<IntegratedMomentsJet, EstimationError> {
-        integrated_family_moments_jet(self, family, eta, se_eta)
     }
 }
 

@@ -17,16 +17,13 @@ pub use terms::{basis, construction, hull, layout, smooth};
 
 pub use families::custom_family;
 pub use families::gamlss;
+pub use families::strategy;
 pub use families::survival;
 pub use families::survival_location_scale_probit;
-pub use families::strategy;
 
 pub use families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
     KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
-};
-pub use families::strategy::{
-    FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_from_fit,
 };
 pub use families::gamlss::{
     BinomialLocationScaleProbitFamily, BinomialLocationScaleProbitSpec,
@@ -43,6 +40,9 @@ pub use families::gamlss::{
     fit_binomial_location_scale_probit_wiggle_terms_auto, fit_binomial_logit, fit_gamma_log,
     fit_gaussian_location_scale, fit_gaussian_location_scale_terms, fit_poisson_log,
     initialize_wiggle_knots_from_seed,
+};
+pub use families::strategy::{
+    FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_from_fit,
 };
 pub use families::survival_location_scale_probit::{
     CovariateBlockInput, ResidualDistribution, ResidualDistributionOps,

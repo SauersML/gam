@@ -22,12 +22,10 @@ use crate::estimate::{
     compute_external_joint_hyper_cost_gradient_hessian, fit_gam_with_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::faer_ndarray::{FaerCholesky, fast_atv};
+use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::DesignMatrix;
-use crate::mixture_link::{
-    state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
-};
+use crate::mixture_link::{state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec};
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkState, SasLinkState};
@@ -4240,15 +4238,18 @@ fn evaluate_standard_family_observations(
                 let inverse_link = if let Some(state) = mixture_link_state {
                     Some(InverseLink::Mixture(state.clone()))
                 } else if let Some(state) = sas_link_state {
-                    Some(if matches!(family, LikelihoodFamily::BinomialBetaLogistic) {
-                        InverseLink::BetaLogistic(*state)
-                    } else {
-                        InverseLink::Sas(*state)
-                    })
+                    Some(
+                        if matches!(family, LikelihoodFamily::BinomialBetaLogistic) {
+                            InverseLink::BetaLogistic(*state)
+                        } else {
+                            InverseLink::Sas(*state)
+                        },
+                    )
                 } else {
                     None
                 };
-                let jet = strategy_for_family(family, inverse_link.as_ref()).inverse_link_jet(eta_i)?;
+                let jet =
+                    strategy_for_family(family, inverse_link.as_ref()).inverse_link_jet(eta_i)?;
                 let mu_i_raw = jet.mu;
                 let dmu_deta_raw = jet.d1;
                 let mu_i = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);

@@ -449,8 +449,7 @@ impl LinearOperator for DesignMatrix {
         match self {
             Self::Dense(_) => self.factorize_system_dense(weights, penalty),
             Self::Sparse(matrix) => {
-                let system =
-                    assemble_sparse_weighted_gram_system(matrix, weights, penalty)?;
+                let system = assemble_sparse_weighted_gram_system(matrix, weights, penalty)?;
                 let factor = crate::linalg::sparse_exact::factorize_sparse_spd(&system)
                     .map_err(|e| format!("factorize_system failed: {e:?}"))?;
                 Ok(Box::new(factor))

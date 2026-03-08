@@ -893,10 +893,7 @@ mod tests {
         let x_derivative = array![[0.0, 1.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
         // Force fallback by setting tolerance above d_eta/dt near the mode.
-        let monotonicity = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 3.0,
-        };
+        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
         let mode = array![0.0, 0.0];
         let hessian = Array2::<f64>::eye(2);
 
@@ -939,10 +936,7 @@ mod tests {
         let x_entry = array![[0.2, 0.1]];
         let x_exit = array![[0.6, 0.3]];
         let x_derivative = array![[1.0, 0.0]];
-        let monotonicity = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 3.0,
-        };
+        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
         let mode = array![0.0, 0.0];
         let hessian = Array2::<f64>::eye(2);
         let z = array![std::f64::consts::LN_2, 0.0];
@@ -1017,10 +1011,7 @@ mod tests {
         // Zero derivative design so derivative_offset_exit drives d_eta/dt.
         let x_derivative = array![[0.0, 0.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let monotonicity = MonotonicityPenalty {
-            lambda: 0.0,
-            tolerance: 3.0,
-        };
+        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
         let mode = array![0.0, 0.0];
         let hessian = Array2::<f64>::eye(2);
         let z = array![0.0, 0.0];
@@ -1906,23 +1897,12 @@ mod survival_hmc {
         fn monotonicity_surrogate_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
             // Transform z (whitened) -> β (original): β = μ + L @ z
             let beta = self.data.mode.as_ref() + &self.chol.dot(z);
-            let p = beta.len();
-            let mut theta = beta.clone();
-            let mut jac = Array1::<f64>::ones(p);
-            if self.data.structurally_monotonic {
-                let time_cols = self.data.structural_time_columns.min(p);
-                for j in 0..time_cols {
-                    let w = beta[j].exp();
-                    theta[j] = w;
-                    jac[j] = w;
-                }
-            }
             // Keep fallback feasibility aligned with the exact monotonicity
             // guard in WorkingModelSurvival::update_state:
-            //   d_eta_dt = X_derivative * theta + derivative_offset_exit.
+            //   d_eta_dt = X_derivative * beta + derivative_offset_exit.
             // The offset shifts the barrier value but has zero beta-derivative.
             let d_eta_dt =
-                self.data.x_derivative.dot(&theta) + self.data.offset_derivative_exit.as_ref();
+                self.data.x_derivative.dot(&beta) + self.data.offset_derivative_exit.as_ref();
             let tol = self.data.monotonicity.tolerance.max(1e-12);
 
             // Barrier settings: smooth enough for HMC geometry, steep enough to
@@ -1948,7 +1928,7 @@ mod survival_hmc {
                 let dlogp_dd = barrier_weight * w * 2.0 * sp * sig / soft_scale;
                 let x_row = self.data.x_derivative.row(i);
                 for j in 0..grad_beta.len() {
-                    grad_beta[j] += dlogp_dd * x_row[j] * jac[j];
+                    grad_beta[j] += dlogp_dd * x_row[j];
                 }
             }
 

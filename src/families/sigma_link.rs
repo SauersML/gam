@@ -71,16 +71,6 @@ pub fn bounded_sigma_jet1_scalar(eta: f64, sigma_min: f64, sigma_max: f64) -> Si
 }
 
 #[inline]
-pub fn bounded_sigma_and_deriv_from_eta_scalar(
-    eta: f64,
-    sigma_min: f64,
-    sigma_max: f64,
-) -> (f64, f64) {
-    let jet = bounded_sigma_jet1_scalar(eta, sigma_min, sigma_max);
-    (jet.sigma, jet.d1)
-}
-
-#[inline]
 pub fn bounded_sigma_from_eta_scalar(eta: f64, sigma_min: f64, sigma_max: f64) -> f64 {
     bounded_sigma_jet1_scalar(eta, sigma_min, sigma_max).sigma
 }
@@ -90,21 +80,6 @@ pub fn bounded_sigma_eta_for_sigma_scalar(sigma: f64, sigma_min: f64, sigma_max:
     let span = validated_bounded_sigma_span(sigma_min, sigma_max);
     let p = ((sigma - sigma_min) / span).clamp(1e-12, 1.0 - 1e-12);
     (p / (1.0 - p)).ln()
-}
-
-pub fn bounded_sigma_and_deriv_from_eta(
-    eta: ArrayView1<'_, f64>,
-    sigma_min: f64,
-    sigma_max: f64,
-) -> (Array1<f64>, Array1<f64>) {
-    let mut sigma = Array1::<f64>::zeros(eta.len());
-    let mut dsigma = Array1::<f64>::zeros(eta.len());
-    for i in 0..eta.len() {
-        let jet = bounded_sigma_jet1_scalar(eta[i], sigma_min, sigma_max);
-        sigma[i] = jet.sigma;
-        dsigma[i] = jet.d1;
-    }
-    (sigma, dsigma)
 }
 
 #[inline]

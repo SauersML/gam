@@ -1,6 +1,6 @@
 use gam::construction::compute_penalty_square_roots;
 use gam::estimate::{ExternalOptimOptions, evaluate_external_cost_and_ridge};
-use gam::pirls::{PirlsConfig, fit_model_for_fixed_rho};
+use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho};
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, LogSmoothingParamsView};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -48,18 +48,22 @@ fn fit_beta_norm(
     let offset = Array1::<f64>::zeros(y.len());
     let (fit, _) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(array![rho].view()),
-        x.view(),
-        offset.view(),
-        y.view(),
-        w.view(),
-        rs,
-        None,
-        None,
-        x.ncols(),
+        PirlsProblem {
+            x: x.view(),
+            offset: offset.view(),
+            y: y.view(),
+            prior_weights: w.view(),
+            covariate_se: None,
+        },
+        PenaltyConfig {
+            rs_original: rs,
+            balanced_penalty_root: None,
+            reparam_invariant: None,
+            p: x.ncols(),
+            coefficient_lower_bounds: None,
+            linear_constraints_original: None,
+        },
         &cfg,
-        None,
-        None,
-        None,
         None,
     )
     .expect("fit");
@@ -86,18 +90,22 @@ fn proxy_cost_with_pirls(
     let offset = Array1::<f64>::zeros(y.len());
     let (fit, _) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(array![rho].view()),
-        x.view(),
-        offset.view(),
-        y.view(),
-        w.view(),
-        rs,
-        None,
-        None,
-        x.ncols(),
+        PirlsProblem {
+            x: x.view(),
+            offset: offset.view(),
+            y: y.view(),
+            prior_weights: w.view(),
+            covariate_se: None,
+        },
+        PenaltyConfig {
+            rs_original: rs,
+            balanced_penalty_root: None,
+            reparam_invariant: None,
+            p: x.ncols(),
+            coefficient_lower_bounds: None,
+            linear_constraints_original: None,
+        },
         &cfg,
-        None,
-        None,
-        None,
         None,
     )
     .expect("fit");
