@@ -72,7 +72,7 @@ for _k, _v in _SERIAL_ENV_OVERRIDES.items():
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from lifelines import CoxPHFitter, LogNormalAFTFitter, WeibullAFTFitter  # noqa: E402
+from lifelines import CoxPHFitter, KaplanMeierFitter, LogNormalAFTFitter, WeibullAFTFitter  # noqa: E402
 from lifelines.exceptions import ConvergenceWarning  # noqa: E402
 from lifelines.utils import concordance_index  # noqa: E402
 from sklearn.metrics import roc_auc_score  # noqa: E402
@@ -597,97 +597,158 @@ def nagelkerke_r2_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> flo
     return float(r2_cs / max_r2_cs)
 
 
-def _km_censoring_survival_table(
+def _survival_score_grid(train_df: pd.DataFrame, test_df: pd.DataFrame, time_col: str) -> np.ndarray:
+    train_times = train_df[time_col].to_numpy(dtype=float)
+    test_times = test_df[time_col].to_numpy(dtype=float)
+    times = np.concatenate([train_times, test_times])
+    times = times[np.isfinite(times) & (times > 0.0)]
+    if times.size == 0:
+        return np.array([0.0, 1.0], dtype=float)
+    grid = np.unique(times)
+    if grid[0] > 0.0:
+        grid = np.concatenate([[0.0], grid])
+    else:
+        grid[0] = 0.0
+    if grid.size == 1:
+        grid = np.array([0.0, max(float(grid[0]), 1.0)], dtype=float)
+    return grid.astype(float, copy=False)
+
+
+def _repeat_survival_curve(surv: np.ndarray, n_rows: int) -> np.ndarray:
+    curve = np.asarray(surv, dtype=float).reshape(1, -1)
+    return np.repeat(curve, n_rows, axis=0)
+
+
+def _sksurv_survival_matrix(pred_survival_fns, grid: np.ndarray) -> np.ndarray:
+    rows = []
+    for fn in pred_survival_fns:
+        vals = np.asarray(fn(grid), dtype=float).reshape(-1)
+        rows.append(vals)
+    surv = np.asarray(rows, dtype=float)
+    surv[:, 0] = 1.0
+    surv = np.clip(surv, 1e-12, 1.0)
+    return np.minimum.accumulate(surv, axis=1)
+
+
+def _lifelines_survival_matrix(surv_df: pd.DataFrame) -> np.ndarray:
+    surv = surv_df.to_numpy(dtype=float).T
+    surv[:, 0] = 1.0
+    surv = np.clip(surv, 1e-12, 1.0)
+    return np.minimum.accumulate(surv, axis=1)
+
+
+def _survival_matrix_from_risk_calibration(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    *,
+    time_col: str,
+    event_col: str,
+    train_risk: np.ndarray,
+    test_risk: np.ndarray,
+    grid: np.ndarray,
+) -> np.ndarray:
+    train_times = train_df[time_col].to_numpy(dtype=float)
+    train_events = (train_df[event_col].to_numpy(dtype=float) > 0.5).astype(float)
+    tr_risk = np.asarray(train_risk, dtype=float).reshape(-1)
+    te_risk = np.asarray(test_risk, dtype=float).reshape(-1)
+    if tr_risk.shape[0] != train_times.shape[0]:
+        raise ValueError(
+            f"train risk length mismatch: got {tr_risk.shape[0]}, expected {train_times.shape[0]}"
+        )
+    if te_risk.shape[0] != len(test_df):
+        raise ValueError(f"test risk length mismatch: got {te_risk.shape[0]}, expected {len(test_df)}")
+
+    finite_mask = np.isfinite(train_times) & np.isfinite(train_events) & np.isfinite(tr_risk) & (train_times > 0.0)
+    if int(np.sum(finite_mask)) == 0:
+        return _repeat_survival_curve(np.ones_like(grid, dtype=float), len(test_df))
+
+    tr_times = train_times[finite_mask]
+    tr_events = train_events[finite_mask]
+    tr_risk = tr_risk[finite_mask]
+    if tr_risk.size < 2 or float(np.nanstd(tr_risk)) < 1e-12:
+        km = KaplanMeierFitter()
+        km.fit(tr_times, event_observed=tr_events)
+        surv = km.predict(grid).to_numpy(dtype=float)
+        surv[0] = 1.0
+        surv = np.clip(surv, 1e-12, 1.0)
+        surv = np.minimum.accumulate(surv)
+        return _repeat_survival_curve(surv, len(test_df))
+
+    calib_train = pd.DataFrame(
+        {
+            "__time": tr_times,
+            "__event": tr_events,
+            "__risk": tr_risk,
+        }
+    )
+    calib_test = pd.DataFrame({"__risk": np.asarray(te_risk, dtype=float).reshape(-1)})
+    cph = CoxPHFitter(penalizer=1e-8)
+    cph.fit(calib_train, duration_col="__time", event_col="__event")
+    surv_df = cph.predict_survival_function(calib_test, times=grid)
+    surv = surv_df.to_numpy(dtype=float).T
+    surv[:, 0] = 1.0
+    surv = np.clip(surv, 1e-12, 1.0)
+    surv = np.minimum.accumulate(surv, axis=1)
+    return surv
+
+
+def survival_lifted_metrics(
     event_times: np.ndarray,
     events: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    times = np.asarray(event_times, dtype=float).reshape(-1)
-    obs = (np.asarray(events, dtype=float).reshape(-1) > 0.5)
-    mask = np.isfinite(times) & np.isfinite(obs.astype(float)) & (times >= 0.0)
-    if int(np.sum(mask)) == 0:
-        return None
-    times = times[mask]
-    obs = obs[mask]
-    unique_times = np.unique(times)
-    surv = np.empty(unique_times.shape[0], dtype=float)
-    g = 1.0
-    for i, t in enumerate(unique_times):
-        at_risk = int(np.sum(times >= t))
-        if at_risk <= 0:
-            surv[i] = g
-            continue
-        censored = int(np.sum((times == t) & (~obs)))
-        if censored > 0:
-            g *= max(1.0 - censored / at_risk, 0.0)
-        surv[i] = g
-    return unique_times, surv
-
-
-def _km_survival_at(
-    km_table: tuple[np.ndarray, np.ndarray] | None,
-    t: float,
-) -> float:
-    if km_table is None or not np.isfinite(t):
-        return 1.0
-    times, surv = km_table
-    idx = np.searchsorted(times, t, side="right") - 1
-    if idx < 0:
-        return 1.0
-    return float(surv[idx])
-
-
-def survival_ipcw_horizon_metrics(
-    train_event_times: np.ndarray,
-    train_events: np.ndarray,
-    test_event_times: np.ndarray,
-    test_events: np.ndarray,
-    horizon: float,
-    failure_prob: np.ndarray,
+    grid: np.ndarray,
+    survival_matrix: np.ndarray,
     eps: float = 1e-12,
 ) -> dict[str, float | None]:
-    times = np.asarray(test_event_times, dtype=float).reshape(-1)
-    events = (np.asarray(test_events, dtype=float).reshape(-1) > 0.5)
-    p_fail = np.asarray(failure_prob, dtype=float).reshape(-1)
-    if times.shape != events.shape or times.shape != p_fail.shape or times.size == 0:
+    times = np.asarray(event_times, dtype=float).reshape(-1)
+    obs = (np.asarray(events, dtype=float).reshape(-1) > 0.5)
+    surv = np.asarray(survival_matrix, dtype=float)
+    grid = np.asarray(grid, dtype=float).reshape(-1)
+    if surv.ndim != 2 or surv.shape[0] != times.shape[0] or surv.shape[1] != grid.shape[0]:
         return {"brier": None, "logloss": None, "nagelkerke_r2": None}
-    if not np.isfinite(horizon) or horizon <= 0.0:
+    if grid.shape[0] < 2:
         return {"brier": None, "logloss": None, "nagelkerke_r2": None}
-
-    km_table = _km_censoring_survival_table(train_event_times, train_events)
-    g_h = max(_km_survival_at(km_table, horizon), eps)
-    weights = np.zeros_like(times, dtype=float)
-    target = ((times <= horizon) & events).astype(float)
-    for i in range(times.size):
-        ti = times[i]
-        if ti <= horizon and events[i]:
-            weights[i] = 1.0 / max(_km_survival_at(km_table, ti), eps)
-        elif ti > horizon:
-            weights[i] = 1.0 / g_h
-    weight_sum = float(np.sum(weights))
-    if weight_sum <= 0.0 or not np.isfinite(weight_sum):
+    if not np.all(np.diff(grid) > 0.0):
         return {"brier": None, "logloss": None, "nagelkerke_r2": None}
 
-    p_safe = np.clip(p_fail, eps, 1.0 - eps)
-    brier = float(np.sum(weights * (p_safe - target) ** 2) / weight_sum)
-    ll_model = float(
-        np.sum(weights * (target * np.log(p_safe) + (1.0 - target) * np.log(1.0 - p_safe)))
+    surv = np.clip(surv, eps, 1.0)
+    surv[:, 0] = 1.0
+    surv = np.minimum.accumulate(surv, axis=1)
+    cumhaz = -np.log(np.clip(surv, eps, 1.0))
+    dt = np.diff(grid)
+    haz = np.maximum(np.diff(cumhaz, axis=1) / dt.reshape(1, -1), 0.0)
+    haz_sq_prefix = np.concatenate(
+        [np.zeros((surv.shape[0], 1), dtype=float), np.cumsum((haz**2) * dt.reshape(1, -1), axis=1)],
+        axis=1,
     )
-    logloss = float(-ll_model / weight_sum)
 
-    p_null = float(np.clip(np.sum(weights * target) / weight_sum, eps, 1.0 - eps))
-    ll_null = float(
-        np.sum(weights * (target * np.log(p_null) + (1.0 - target) * np.log(1.0 - p_null)))
-    )
-    r2_cs = 1.0 - exp_saturated((2.0 / weight_sum) * (ll_null - ll_model))
-    max_r2_cs = 1.0 - exp_saturated((2.0 / weight_sum) * ll_null)
+    log_losses = np.empty(times.shape[0], dtype=float)
+    brier_losses = np.empty(times.shape[0], dtype=float)
+    for i, z in enumerate(times):
+        if not np.isfinite(z) or z <= 0.0:
+            return {"brier": None, "logloss": None, "nagelkerke_r2": None}
+        j = int(np.searchsorted(grid, z, side="left"))
+        if j >= grid.shape[0]:
+            j = grid.shape[0] - 1
+        if abs(grid[j] - z) <= 1e-12:
+            interval_idx = max(j - 1, 0)
+            h_z = haz[i, interval_idx]
+            h2_int = haz_sq_prefix[i, j]
+            hcum_z = cumhaz[i, j]
+        else:
+            interval_idx = max(j - 1, 0)
+            elapsed = z - grid[interval_idx]
+            h_z = haz[i, interval_idx]
+            h2_int = haz_sq_prefix[i, interval_idx] + (h_z**2) * elapsed
+            hcum_z = cumhaz[i, interval_idx] + h_z * elapsed
+        log_losses[i] = float(hcum_z - (math.log(max(h_z, eps)) if obs[i] else 0.0))
+        brier_losses[i] = float(0.5 * h2_int - (h_z if obs[i] else 0.0))
+
+    logloss = float(np.mean(log_losses))
+    brier = float(np.mean(brier_losses))
+
+    grid_null = np.asarray(grid, dtype=float)
     nagelkerke = None
-    if np.isfinite(r2_cs) and np.isfinite(max_r2_cs) and max_r2_cs > 0.0:
-        nagelkerke = float(r2_cs / max_r2_cs)
-    return {
-        "brier": brier,
-        "logloss": logloss,
-        "nagelkerke_r2": nagelkerke,
-    }
+    return {"brier": brier, "logloss": logloss, "nagelkerke_r2": nagelkerke}
 
 
 def score_survival_fold(
@@ -697,30 +758,36 @@ def score_survival_fold(
     time_col: str,
     event_col: str,
     risk_score: np.ndarray,
-    failure_prob: np.ndarray | None = None,
+    train_risk_score: np.ndarray | None = None,
+    survival_grid: np.ndarray | None = None,
+    survival_matrix: np.ndarray | None = None,
 ) -> dict[str, float | None]:
     event_times = test_df[time_col].to_numpy(dtype=float)
     events = test_df[event_col].to_numpy(dtype=float)
+    if survival_grid is not None and survival_matrix is not None:
+        grid = np.asarray(survival_grid, dtype=float)
+        surv = np.asarray(survival_matrix, dtype=float)
+    else:
+        if train_risk_score is None:
+            raise ValueError("score_survival_fold requires train_risk_score when survival_matrix is not provided")
+        grid = _survival_score_grid(train_df, test_df, time_col)
+        surv = _survival_matrix_from_risk_calibration(
+            train_df,
+            test_df,
+            time_col=time_col,
+            event_col=event_col,
+            train_risk=np.asarray(train_risk_score, dtype=float).reshape(-1),
+            test_risk=np.asarray(risk_score, dtype=float).reshape(-1),
+            grid=grid,
+        )
+    proper_metrics = survival_lifted_metrics(event_times, events, grid, surv)
     metrics: dict[str, float | None] = {
         "auc": _lifelines_cindex_from_risk(event_times, risk_score, events),
-        "brier": None,
-        "logloss": None,
-        "nagelkerke_r2": None,
+        "brier": proper_metrics["brier"],
+        "logloss": proper_metrics["logloss"],
+        "nagelkerke_r2": proper_metrics["nagelkerke_r2"],
         "predict_horizon": None,
     }
-    if failure_prob is None:
-        return metrics
-    horizon = _survival_eval_horizon(train_df, time_col)
-    prob_metrics = survival_ipcw_horizon_metrics(
-        train_df[time_col].to_numpy(dtype=float),
-        train_df[event_col].to_numpy(dtype=float),
-        event_times,
-        events,
-        horizon,
-        failure_prob,
-    )
-    metrics.update(prob_metrics)
-    metrics["predict_horizon"] = float(horizon)
     return metrics
 
 
@@ -810,21 +877,6 @@ def _rust_survival_fit_cli_args(scenario_name: str) -> list[str]:
         cli_key = "--" + key.replace("_", "-")
         args.extend([cli_key, str(cfg[key])])
     return args
-
-
-def _survival_failure_probability_from_rust_pred(pred_df: pd.DataFrame) -> np.ndarray:
-    if "failure_prob" in pred_df.columns:
-        return pred_df["failure_prob"].to_numpy(dtype=float)
-    if "survival_prob" in pred_df.columns:
-        surv = pred_df["survival_prob"].to_numpy(dtype=float)
-        return 1.0 - surv
-    if "mean" in pred_df.columns:
-        surv = pred_df["mean"].to_numpy(dtype=float)
-        return 1.0 - surv
-    raise RuntimeError(
-        "rust survival prediction output missing failure probability column; "
-        "expected one of: failure_prob, survival_prob, mean"
-    )
 
 
 def _augment_bmi_spline_linear_hinges(train_df: pd.DataFrame, test_df: pd.DataFrame, n_knots: int = 6):
@@ -3136,6 +3188,7 @@ def run_rust_scenario_cv(
             test_eval_df = test_df.copy()
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
+            train_pred_path = td_path / f"pred_train_{fold_id}.csv"
             shared_artifact = (
                 shared_fold_artifacts[fold_id]
                 if shared_fold_artifacts is not None and fold_id < len(shared_fold_artifacts)
@@ -3265,6 +3318,14 @@ def run_rust_scenario_cv(
                 "--out",
                 str(pred_path),
             ]
+            train_pred_cmd = [
+                str(rust_bin),
+                "predict",
+                str(model_path),
+                str(train_path),
+                "--out",
+                str(train_pred_path),
+            ]
             t1 = perf_counter()
             code, out, err = run_cmd(pred_cmd, cwd=ROOT)
             if code != 0 and _looks_like_missing_csv(err or out):
@@ -3279,6 +3340,17 @@ def run_rust_scenario_cv(
                     "error": (err.strip() or out.strip() or "rust predict failed"),
                 }
             pred_df = pd.read_csv(pred_path)
+            train_pred_df = None
+            if ds["family"] == "survival":
+                code, out, err = run_cmd(train_pred_cmd, cwd=ROOT)
+                if code != 0:
+                    return {
+                        "contender": contender_name,
+                        "scenario_name": scenario_name,
+                        "status": "failed",
+                        "error": (err.strip() or out.strip() or "rust train predict failed"),
+                    }
+                train_pred_df = pd.read_csv(train_pred_path)
             if "mean" not in pred_df.columns:
                 return {
                     "contender": contender_name,
@@ -3395,7 +3467,7 @@ def run_rust_scenario_cv(
             else:
                 try:
                     risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
-                    failure_prob = _survival_failure_probability_from_rust_pred(pred_df)
+                    train_risk_score, _ = _survival_risk_from_rust_pred(train_pred_df)
                 except RuntimeError as e:
                     return {
                         "contender": contender_name,
@@ -3409,7 +3481,7 @@ def run_rust_scenario_cv(
                     time_col=ds["time_col"],
                     event_col=ds["event_col"],
                     risk_score=risk_score,
-                    failure_prob=failure_prob,
+                    train_risk_score=train_risk_score,
                 )
                 cv_rows.append(
                     {
@@ -3420,11 +3492,9 @@ def run_rust_scenario_cv(
                         "logloss": surv_metrics["logloss"],
                         "nagelkerke_r2": surv_metrics["nagelkerke_r2"],
                         "n_test": int(len(fold.test_idx)),
-                        "predict_horizon": surv_metrics["predict_horizon"],
-                        "predict_horizon_policy": "global train-fold median time",
                         "model_spec": (
                             "survival model via release binary "
-                            f"(c-index on risk score from '{score_src}'; IPCW horizon scores on failure_prob) {eval_suffix}"
+                            f"(c-index on risk score from '{score_src}'; lifted survival scores from train-fold calibrated risk) {eval_suffix}"
                         ),
                     }
                 )
@@ -3812,6 +3882,7 @@ def run_rust_gamlss_survival_cv(
             test_path = td_path / f"test_{fold_id}.csv"
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
+            train_pred_path = td_path / f"pred_train_{fold_id}.csv"
 
             # Z-score features.
             fit_feature_cols = list(ds["features"])
@@ -3871,6 +3942,11 @@ def run_rust_gamlss_survival_cv(
                 str(model_path), str(test_path),
                 "--out", str(pred_path),
             ]
+            train_pred_cmd = [
+                str(rust_bin), "predict",
+                str(model_path), str(train_path),
+                "--out", str(train_pred_path),
+            ]
             t1 = perf_counter()
             code, out, err = run_cmd(pred_cmd, cwd=ROOT)
             pred_sec = perf_counter() - t1
@@ -3883,10 +3959,20 @@ def run_rust_gamlss_survival_cv(
                     "error": (err.strip() or out.strip() or "rust gamlss survival predict failed"),
                 }
             pred_df = pd.read_csv(pred_path)
+            code, out, err = run_cmd(train_pred_cmd, cwd=ROOT)
+            if code != 0:
+                return {
+                    "contender": "rust_gamlss_survival",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "error": (err.strip() or out.strip() or "rust gamlss survival train predict failed"),
+                }
+            train_pred_df = pd.read_csv(train_pred_path)
 
             try:
                 risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
-                failure_prob = _survival_failure_probability_from_rust_pred(pred_df)
+                train_risk_score, _ = _survival_risk_from_rust_pred(train_pred_df)
             except RuntimeError as e:
                 return {
                     "contender": "rust_gamlss_survival",
@@ -3900,7 +3986,7 @@ def run_rust_gamlss_survival_cv(
                 time_col=ds["time_col"],
                 event_col=ds["event_col"],
                 risk_score=risk_score,
-                failure_prob=failure_prob,
+                train_risk_score=train_risk_score,
             )
             cv_rows.append(
                 {
@@ -3911,11 +3997,9 @@ def run_rust_gamlss_survival_cv(
                     "logloss": surv_metrics["logloss"],
                     "nagelkerke_r2": surv_metrics["nagelkerke_r2"],
                     "n_test": int(len(fold.test_idx)),
-                    "predict_horizon": surv_metrics["predict_horizon"],
-                    "predict_horizon_policy": "global train-fold median time",
                         "model_spec": (
                             "survival probit-location-scale via release binary "
-                            f"(c-index on risk score from '{score_src}'; IPCW horizon scores on failure_prob) [5-fold CV]"
+                            f"(c-index on risk score from '{score_src}'; lifted survival scores from train-fold calibrated risk) [5-fold CV]"
                     ),
                 }
             )
@@ -4373,6 +4457,7 @@ if (family_name == "survival") {
   fit_sec <- proc.time()[["elapsed"]] - t0
 
   pred_t0 <- proc.time()[["elapsed"]]
+  lp_train <- as.numeric(predict(fit, newdata=train_df, type="lp"))
   lp <- as.numeric(predict(fit, newdata=test_df, type="lp"))
   pred_sec <- proc.time()[["elapsed"]] - pred_t0
 
@@ -4382,6 +4467,7 @@ if (family_name == "survival") {
     fit_sec=fit_sec,
     predict_sec=pred_sec,
     auc=NULL,
+    train_risk=as.numeric(lp_train),
     risk=risk,
     brier=NULL,
     logloss=NULL,
@@ -4517,6 +4603,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                 event_times = test_df[ds["time_col"]].to_numpy(dtype=float)
                 events = test_df[ds["event_col"]].to_numpy(dtype=float)
                 risk = np.asarray(fold_row.get("risk", []), dtype=float).reshape(-1)
+                train_risk = np.asarray(fold_row.get("train_risk", []), dtype=float).reshape(-1)
                 if risk.shape[0] != event_times.shape[0]:
                     return {
                         "contender": contender_name,
@@ -4527,18 +4614,30 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                             f"(got {risk.shape[0]}, expected {event_times.shape[0]})"
                         ),
                     }
+                if train_risk.shape[0] != len(fold.train_idx):
+                    return {
+                        "contender": contender_name,
+                        "scenario_name": scenario["name"],
+                        "status": "failed",
+                        "error": (
+                            "r_survival_coxph fold output missing/invalid train risk vector "
+                            f"(got {train_risk.shape[0]}, expected {len(fold.train_idx)})"
+                        ),
+                    }
                 surv_metrics = score_survival_fold(
                     train_df,
                     test_df,
                     time_col=ds["time_col"],
                     event_col=ds["event_col"],
                     risk_score=risk,
+                    train_risk_score=train_risk,
                 )
                 fold_row["auc"] = surv_metrics["auc"]
                 fold_row["brier"] = surv_metrics["brier"]
                 fold_row["logloss"] = surv_metrics["logloss"]
                 fold_row["nagelkerke_r2"] = surv_metrics["nagelkerke_r2"]
                 fold_row.pop("risk", None)
+                fold_row.pop("train_risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
@@ -5534,6 +5633,7 @@ out <- list(
   fit_sec=fit_sec,
   predict_sec=pred_sec,
   auc=NULL,
+  train_risk=as.numeric(lp_train),
   risk=risk,
   brier=NULL,
   logloss=NULL,
@@ -5579,6 +5679,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             event_times = test_df[ds["time_col"]].to_numpy(dtype=float)
             events = test_df[ds["event_col"]].to_numpy(dtype=float)
             risk = np.asarray(fold_row.get("risk", []), dtype=float).reshape(-1)
+            train_risk = np.asarray(fold_row.get("train_risk", []), dtype=float).reshape(-1)
             if risk.shape[0] != event_times.shape[0]:
                 return {
                     "contender": "r_mgcv_coxph",
@@ -5589,18 +5690,30 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                         f"(got {risk.shape[0]}, expected {event_times.shape[0]})"
                     ),
                 }
+            if train_risk.shape[0] != len(fold.train_idx):
+                return {
+                    "contender": "r_mgcv_coxph",
+                    "scenario_name": scenario["name"],
+                    "status": "failed",
+                    "error": (
+                        "r_mgcv_coxph fold output missing/invalid train risk vector "
+                        f"(got {train_risk.shape[0]}, expected {len(fold.train_idx)})"
+                    ),
+                }
             surv_metrics = score_survival_fold(
                 train_df,
                 test_df,
                 time_col=ds["time_col"],
                 event_col=ds["event_col"],
                 risk_score=risk,
+                train_risk_score=train_risk,
             )
             fold_row["auc"] = surv_metrics["auc"]
             fold_row["brier"] = surv_metrics["brier"]
             fold_row["logloss"] = surv_metrics["logloss"]
             fold_row["nagelkerke_r2"] = surv_metrics["nagelkerke_r2"]
             fold_row.pop("risk", None)
+            fold_row.pop("train_risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
@@ -5662,6 +5775,7 @@ def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
         pred_start = datetime.now(timezone.utc)
+        train_risk = rsf.predict(x_train).astype(float)
         risk = rsf.predict(x_test).astype(float)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
 
@@ -5677,6 +5791,7 @@ def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[
                     time_col=time_col,
                     event_col=event_col,
                     risk_score=risk,
+                    train_risk_score=train_risk,
                 ),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": (
@@ -5743,6 +5858,7 @@ def run_external_sksurv_coxnet_cv(scenario, *, ds: dict | None = None, folds: li
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
         pred_start = datetime.now(timezone.utc)
+        train_risk = model.predict(x_train).astype(float)
         risk = model.predict(x_test).astype(float)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
         event_times = test_df[time_col].to_numpy(dtype=float)
@@ -5757,6 +5873,7 @@ def run_external_sksurv_coxnet_cv(scenario, *, ds: dict | None = None, folds: li
                     time_col=time_col,
                     event_col=event_col,
                     risk_score=risk,
+                    train_risk_score=train_risk,
                 ),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": "CoxnetSurvivalAnalysis(l1_ratio=0.5, alpha_min_ratio=0.01)",
@@ -5812,6 +5929,7 @@ def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, fo
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
         pred_start = datetime.now(timezone.utc)
+        train_risk = cph.predict_partial_hazard(train_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
         risk = cph.predict_partial_hazard(test_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
         event_times = test_df[time_col].to_numpy(dtype=float)
@@ -5826,6 +5944,7 @@ def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, fo
                     time_col=time_col,
                     event_col=event_col,
                     risk_score=risk,
+                    train_risk_score=train_risk,
                 ),
                 "n_test": int(len(fold.test_idx)),
                 "warning": (
@@ -5951,6 +6070,7 @@ out <- list(
   fit_sec=fit_sec,
   predict_sec=pred_sec,
   auc=NULL,
+  train_risk=as.numeric(lp_train),
   risk=risk,
   brier=NULL,
   logloss=NULL,
@@ -5996,6 +6116,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             event_times = test_df[ds["time_col"]].to_numpy(dtype=float)
             events = test_df[ds["event_col"]].to_numpy(dtype=float)
             risk = np.asarray(fold_row.get("risk", []), dtype=float).reshape(-1)
+            train_risk = np.asarray(fold_row.get("train_risk", []), dtype=float).reshape(-1)
             if risk.shape[0] != event_times.shape[0]:
                 return {
                     "contender": "r_glmnet_cox",
@@ -6006,18 +6127,30 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                         f"(got {risk.shape[0]}, expected {event_times.shape[0]})"
                     ),
                 }
+            if train_risk.shape[0] != len(fold.train_idx):
+                return {
+                    "contender": "r_glmnet_cox",
+                    "scenario_name": scenario["name"],
+                    "status": "failed",
+                    "error": (
+                        "r_glmnet_cox fold output missing/invalid train risk vector "
+                        f"(got {train_risk.shape[0]}, expected {len(fold.train_idx)})"
+                    ),
+                }
             surv_metrics = score_survival_fold(
                 train_df,
                 test_df,
                 time_col=ds["time_col"],
                 event_col=ds["event_col"],
                 risk_score=risk,
+                train_risk_score=train_risk,
             )
             fold_row["auc"] = surv_metrics["auc"]
             fold_row["brier"] = surv_metrics["brier"]
             fold_row["logloss"] = surv_metrics["logloss"]
             fold_row["nagelkerke_r2"] = surv_metrics["nagelkerke_r2"]
             fold_row.pop("risk", None)
+            fold_row.pop("train_risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
@@ -6086,6 +6219,7 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
         gb_model.fit(x_train, y_train)
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
         pred_start = datetime.now(timezone.utc)
+        train_gb_risk = gb_model.predict(x_train).astype(float)
         gb_risk = gb_model.predict(x_test).astype(float)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
         gb_rows.append(
@@ -6098,6 +6232,7 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
                     time_col=time_col,
                     event_col=event_col,
                     risk_score=gb_risk,
+                    train_risk_score=train_gb_risk,
                 ),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": gb_spec,
@@ -6114,6 +6249,7 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
         cgb_model.fit(x_train, y_train)
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
         pred_start = datetime.now(timezone.utc)
+        train_cgb_risk = cgb_model.predict(x_train).astype(float)
         cgb_risk = cgb_model.predict(x_test).astype(float)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
         cgb_rows.append(
@@ -6126,6 +6262,7 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
                     time_col=time_col,
                     event_col=event_col,
                     risk_score=cgb_risk,
+                    train_risk_score=train_cgb_risk,
                 ),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": cgb_spec,
@@ -6190,7 +6327,9 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
         conv_warn = [w for w in wlist if issubclass(w.category, ConvergenceWarning)]
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
         pred_start = datetime.now(timezone.utc)
+        train_pred_time = weibull.predict_expectation(train_df[feature_cols]).to_numpy(dtype=float).reshape(-1)
         pred_time = weibull.predict_expectation(test_df[feature_cols]).to_numpy(dtype=float).reshape(-1)
+        train_risk = -train_pred_time
         risk = -pred_time
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
         weibull_rows.append(
@@ -6203,6 +6342,7 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
                     time_col=time_col,
                     event_col=event_col,
                     risk_score=risk,
+                    train_risk_score=train_risk,
                 ),
                 "n_test": int(len(fold.test_idx)),
                 "warning": (
@@ -6226,7 +6366,9 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
         conv_warn = [w for w in wlist if issubclass(w.category, ConvergenceWarning)]
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
         pred_start = datetime.now(timezone.utc)
+        train_pred_time = lognormal.predict_expectation(train_df[feature_cols]).to_numpy(dtype=float).reshape(-1)
         pred_time = lognormal.predict_expectation(test_df[feature_cols]).to_numpy(dtype=float).reshape(-1)
+        train_risk = -train_pred_time
         risk = -pred_time
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
         lognormal_rows.append(
@@ -6239,6 +6381,7 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
                     time_col=time_col,
                     event_col=event_col,
                     risk_score=risk,
+                    train_risk_score=train_risk,
                 ),
                 "n_test": int(len(fold.test_idx)),
                 "warning": (
@@ -6336,7 +6479,9 @@ def run_external_xgboost_aft_cv(scenario, *, ds: dict | None = None, folds: list
         fit_sec = (datetime.now(timezone.utc) - fit_start).total_seconds()
 
         pred_start = datetime.now(timezone.utc)
+        train_pred_time = booster.predict(dtrain).astype(float).reshape(-1)
         pred_time = booster.predict(dtest).astype(float).reshape(-1)
+        train_risk = -train_pred_time
         risk = -pred_time
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
 
@@ -6352,6 +6497,7 @@ def run_external_xgboost_aft_cv(scenario, *, ds: dict | None = None, folds: list
                     time_col=time_col,
                     event_col=event_col,
                     risk_score=risk,
+                    train_risk_score=train_risk,
                 ),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": (
