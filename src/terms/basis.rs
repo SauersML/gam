@@ -4403,28 +4403,6 @@ fn build_matern_double_penalty_candidates(
     Ok(candidates)
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-fn build_duchon_operator_penalty_candidates(
-    centers: ArrayView2<'_, f64>,
-    length_scale: Option<f64>,
-    power: usize,
-    nullspace_order: DuchonNullspaceOrder,
-    identifiability_transform: Option<ArrayView2<'_, f64>>,
-) -> Result<Vec<PenaltyCandidate>, BasisError> {
-    let ops = build_duchon_collocation_operator_matrices(
-        centers,
-        None,
-        length_scale,
-        power,
-        nullspace_order,
-        identifiability_transform,
-    )?;
-    Ok(operator_penalty_candidates_from_collocation(
-        &ops.d0, &ops.d1, &ops.d2,
-    ))
-}
-
 /// Creates a Matérn spline basis from data and centers.
 ///
 /// The design is `[K | 1]` when `include_intercept=true` and `[K]` otherwise, where:
@@ -5478,7 +5456,6 @@ struct PsiTriplet {
     psi_psi: f64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 struct DuchonRadialCore {
     phi: PsiTriplet,
