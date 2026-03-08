@@ -2284,7 +2284,11 @@ fn solve_newton_direction_with_lower_bounds(
 
     // Fast path: if unconstrained Newton step is already feasible for all lower
     // bounds, it is the exact constrained minimizer (strict convex quadratic).
-    if solve_newton_direction_dense(hessian, gradient, direction_out).is_ok() {
+    let has_active_hint = active_hint
+        .as_ref()
+        .map(|hint| !hint.is_empty())
+        .unwrap_or(false);
+    if !has_active_hint && solve_newton_direction_dense(hessian, gradient, direction_out).is_ok() {
         let mut feasible = true;
         for i in 0..p {
             let lb = lower_bounds[i];
@@ -2299,10 +2303,12 @@ fn solve_newton_direction_with_lower_bounds(
     }
 
     let mut active = vec![false; p];
+    let mut hint_locked = vec![false; p];
     if let Some(hint) = active_hint.as_ref() {
         for &idx in hint.iter() {
             if idx < p {
                 active[idx] = true;
+                hint_locked[idx] = true;
             }
         }
     }
@@ -2379,7 +2385,7 @@ fn solve_newton_direction_with_lower_bounds(
         let mut worst_violation = 0.0_f64;
         let mut release_idx: Option<usize> = None;
         for i in 0..p {
-            if !active[i] {
+            if !active[i] || hint_locked[i] {
                 continue;
             }
             let lambda_i = gradient[i] + hd[i];
@@ -2493,7 +2499,11 @@ fn solve_newton_direction_with_linear_constraints(
     let mut g_cur = gradient.to_owned();
 
     // Fast path: unconstrained Newton step already satisfies all inequalities.
-    if solve_newton_direction_dense(hessian, gradient, direction_out).is_ok() {
+    let has_active_hint = active_hint
+        .as_ref()
+        .map(|hint| !hint.is_empty())
+        .unwrap_or(false);
+    if !has_active_hint && solve_newton_direction_dense(hessian, gradient, direction_out).is_ok() {
         let candidate = beta + &*direction_out;
         let mut feasible = true;
         for i in 0..m {
@@ -2510,11 +2520,13 @@ fn solve_newton_direction_with_linear_constraints(
 
     let mut active: Vec<usize> = Vec::new();
     let mut is_active = vec![false; m];
+    let mut hint_locked = vec![false; m];
     if let Some(hint) = active_hint.as_ref() {
         for &idx in hint.iter() {
             if idx < m && !is_active[idx] {
                 active.push(idx);
                 is_active[idx] = true;
+                hint_locked[idx] = true;
             }
         }
     }
@@ -2548,6 +2560,9 @@ fn solve_newton_direction_with_linear_constraints(
             // Therefore release active rows with the most negative lambda_true.
             let mut most_negative_true = -tol_dual;
             for (pos, &lam_sys) in lambda_w.iter().enumerate() {
+                if hint_locked[active[pos]] {
+                    continue;
+                }
                 let lam_true = -lam_sys;
                 if lam_true < most_negative_true {
                     most_negative_true = lam_true;
