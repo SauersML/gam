@@ -171,7 +171,10 @@ impl<'a> RemlState<'a> {
         out
     }
 
-    pub(super) fn build_firth_dense_operator(
+}
+
+impl FirthDenseOperator {
+    pub(crate) fn build(
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
@@ -308,7 +311,7 @@ impl<'a> RemlState<'a> {
         };
         let r = q_basis.ncols();
 
-        let weighted_x_reduced = Self::row_scale(&x_reduced, &w);
+        let weighted_x_reduced = RemlState::row_scale(&x_reduced, &w);
         // Reduced Fisher on the identifiable subspace:
         //   I_r = X_rᵀ W X_r = Zᵀ Z.
         // Under finite-logit eta, W has strictly positive diagonal entries and
@@ -362,15 +365,15 @@ impl<'a> RemlState<'a> {
         // H_phi, D(H_phi), and D²(H_phi).
         let z_reduced = x_reduced.clone();
         let h_diag = if r > 0 {
-            Self::reduced_diag_gram(&z_reduced, &k_reduced)
+            RemlState::reduced_diag_gram(&z_reduced, &k_reduced)
         } else {
             Array1::<f64>::zeros(n)
         };
         let x_dense_t = x_dense.t().to_owned();
-        let b_base = Self::row_scale(x_dense, &w1);
+        let b_base = RemlState::row_scale(x_dense, &w1);
         let b_base_t = b_base.t().to_owned();
         let p_b_base =
-            Self::apply_hadamard_gram_to_matrix(&z_reduced, &k_reduced, &k_reduced, &b_base);
+            RemlState::apply_hadamard_gram_to_matrix(&z_reduced, &k_reduced, &k_reduced, &b_base);
         Ok(FirthDenseOperator {
             x_dense: x_dense.clone(),
             x_dense_t,
@@ -390,13 +393,13 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    pub(super) fn firth_direction(op: &FirthDenseOperator, u: &Array1<f64>) -> FirthDirection {
-        let deta = op.x_dense.dot(u);
-        Self::firth_direction_from_deta(op, deta)
+    pub(crate) fn direction(&self, u: &Array1<f64>) -> FirthDirection {
+        let deta = self.x_dense.dot(u);
+        self.direction_from_deta(deta)
     }
 
-    pub(super) fn firth_direction_from_deta(
-        op: &FirthDenseOperator,
+    pub(crate) fn direction_from_deta(
+        &self,
         deta: Array1<f64>,
     ) -> FirthDirection {
         // Directional building blocks for u:
@@ -414,31 +417,31 @@ impl<'a> RemlState<'a> {
         // is exact for logit with finite eta (w_i > 0) and fixed rank(X).
         // s_u is the diagonal weight for D I[u]:
         //   D I[u] = Xᵀ diag(s_u) X,  s_u = w' ⊙ (X u).
-        let s_u = &op.w1 * &deta;
+        let s_u = &self.w1 * &deta;
         // G_u = X_rᵀ diag(s_u) X_r,  A_u = K_r G_u K_r.
         // These are reduced-space forms of
         //   I_u and T_u = K I_u K
         // from the full-space derivation.
-        let g_u_reduced = Self::reduced_weighted_gram(&op.x_reduced, &s_u);
-        let k_g_u = op.k_reduced.dot(&g_u_reduced);
-        let a_u_reduced = k_g_u.dot(&op.k_reduced);
+        let g_u_reduced = RemlState::reduced_weighted_gram(&self.x_reduced, &s_u);
+        let k_g_u = self.k_reduced.dot(&g_u_reduced);
+        let a_u_reduced = k_g_u.dot(&self.k_reduced);
         // Dh[u] = -diag(N_u),  N_u = X T_u Xᵀ, represented here as
         //   N_u = Z A_u Zᵀ in weighted reduced coordinates.
-        let dh = -Self::reduced_diag_gram(&op.z_reduced, &a_u_reduced);
-        let b_u_vec = &op.w2 * &deta;
-        let b_u_base = &op.x_dense * &b_u_vec.view().insert_axis(Axis(1));
+        let dh = -RemlState::reduced_diag_gram(&self.z_reduced, &a_u_reduced);
+        let b_u_vec = &self.w2 * &deta;
+        let b_u_base = &self.x_dense * &b_u_vec.view().insert_axis(Axis(1));
         let b_u_base_t = b_u_base.t().to_owned();
-        let p_bu_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
-            &op.k_reduced,
+        let p_bu_base = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
             &b_u_base,
         );
-        let mut p_u_b_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
+        let mut p_u_b_base = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
             &a_u_reduced,
-            &op.b_base,
+            &self.b_base,
         );
         p_u_b_base.mapv_inplace(|val| -2.0 * val);
         FirthDirection {
@@ -454,12 +457,12 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(super) fn firth_hphi_direction_apply(
-        op: &FirthDenseOperator,
+    pub(crate) fn hphi_direction_apply(
+        &self,
         dir: &FirthDirection,
         rhs: &Array2<f64>,
     ) -> Array2<f64> {
-        let p = op.x_dense.ncols();
+        let p = self.x_dense.ncols();
         if rhs.nrows() != p {
             return Array2::<f64>::zeros((p, rhs.ncols()));
         }
@@ -472,36 +475,36 @@ impl<'a> RemlState<'a> {
         //       - B_uᵀ P (B V) - Bᵀ P (B_u V) - Bᵀ P_u (B V) ].
         // This avoids dense p×p materialization and is used by sparse exact
         // trace contractions through tr(H^{-1} ·).
-        let eta_v = op.x_dense.dot(rhs);
-        let q_v = &eta_v * &op.w1.view().insert_axis(Axis(1));
+        let eta_v = self.x_dense.dot(rhs);
+        let q_v = &eta_v * &self.w1.view().insert_axis(Axis(1));
         let m_q_v =
-            Self::apply_hadamard_gram_to_matrix(&op.z_reduced, &op.k_reduced, &op.k_reduced, &q_v);
+            RemlState::apply_hadamard_gram_to_matrix(&self.z_reduced, &self.k_reduced, &self.k_reduced, &q_v);
         let bu_vec = &dir.b_u_vec;
         let m_bu_v = fast_ab(&dir.p_bu_base, rhs);
         let p_u_q_v = fast_ab(&dir.p_u_b_base, rhs);
-        let c_u = &(&op.w3 * &dir.deta) * &op.h_diag + &(&op.w2 * &dir.dh);
-        let diag_term = op
+        let c_u = &(&self.w3 * &dir.deta) * &self.h_diag + &(&self.w2 * &dir.dh);
+        let diag_term = self
             .x_dense_t
             .dot(&(&eta_v * &c_u.view().insert_axis(Axis(1))));
-        let term1 = op
+        let term1 = self
             .x_dense_t
             .dot(&(&m_q_v * &bu_vec.view().insert_axis(Axis(1))));
-        let term2 = op
+        let term2 = self
             .x_dense_t
-            .dot(&(&m_bu_v * &op.w1.view().insert_axis(Axis(1))));
-        let term3 = op
+            .dot(&(&m_bu_v * &self.w1.view().insert_axis(Axis(1))));
+        let term3 = self
             .x_dense_t
-            .dot(&(&p_u_q_v * &op.w1.view().insert_axis(Axis(1))));
+            .dot(&(&p_u_q_v * &self.w1.view().insert_axis(Axis(1))));
         0.5 * (diag_term - (term1 + term2 + term3))
     }
 
-    pub(super) fn firth_hphi_direction(
-        op: &FirthDenseOperator,
+    pub(crate) fn hphi_direction(
+        &self,
         dir: &FirthDirection,
     ) -> Array2<f64> {
-        let p = op.x_dense.ncols();
+        let p = self.x_dense.ncols();
         let eye = Array2::<f64>::eye(p);
-        let mut out = Self::firth_hphi_direction_apply(op, dir, &eye);
+        let mut out = self.hphi_direction_apply(dir, &eye);
         // Exact first directional derivative of H_φ:
         //   D H_φ[u]
         //   = 0.5 [ Xᵀ diag(c_u) X
@@ -524,13 +527,13 @@ impl<'a> RemlState<'a> {
         out
     }
 
-    pub(super) fn firth_hphi_second_direction_apply(
-        op: &FirthDenseOperator,
+    pub(crate) fn hphi_second_direction_apply(
+        &self,
         u: &FirthDirection,
         v: &FirthDirection,
         rhs: &Array2<f64>,
     ) -> Array2<f64> {
-        let p = op.x_dense.ncols();
+        let p = self.x_dense.ncols();
         if rhs.nrows() != p {
             return Array2::<f64>::zeros((p, rhs.ncols()));
         }
@@ -551,58 +554,58 @@ impl<'a> RemlState<'a> {
         let deta_uv = &u.deta * &v.deta;
         // Mixed reduced Gram:
         //   G_uv = X_rᵀ diag(w'' ⊙ (Xu) ⊙ (Xv)) X_r.
-        let s_uv = &op.w2 * &deta_uv;
-        let g_uv_reduced = Self::reduced_weighted_gram(&op.x_reduced, &s_uv);
-        let k_g_uv = op.k_reduced.dot(&g_uv_reduced);
-        let k_g_v = op.k_reduced.dot(&v.g_u_reduced);
-        let k_g_u = op.k_reduced.dot(&u.g_u_reduced);
+        let s_uv = &self.w2 * &deta_uv;
+        let g_uv_reduced = RemlState::reduced_weighted_gram(&self.x_reduced, &s_uv);
+        let k_g_uv = self.k_reduced.dot(&g_uv_reduced);
+        let k_g_v = self.k_reduced.dot(&v.g_u_reduced);
+        let k_g_u = self.k_reduced.dot(&u.g_u_reduced);
         // Reduced form of:
         //   T_{u,v} = K I_{u,v} K - K I_v K I_u K - K I_u K I_v K.
-        let a_uv_reduced = k_g_uv.dot(&op.k_reduced)
-            - k_g_v.dot(&k_g_u).dot(&op.k_reduced)
-            - k_g_u.dot(&k_g_v).dot(&op.k_reduced);
-        let d2h = -Self::reduced_diag_gram(&op.z_reduced, &a_uv_reduced);
+        let a_uv_reduced = k_g_uv.dot(&self.k_reduced)
+            - k_g_v.dot(&k_g_u).dot(&self.k_reduced)
+            - k_g_u.dot(&k_g_v).dot(&self.k_reduced);
+        let d2h = -RemlState::reduced_diag_gram(&self.z_reduced, &a_uv_reduced);
         // Implements mixed diagonal coefficient:
         //   c_uv = w'''' ⊙ (Xu) ⊙ (Xv) ⊙ h
         //          + w''' ⊙ ((Xu) ⊙ Dh[v] + (Xv) ⊙ Dh[u])
         //          + w'' ⊙ D²h[u,v].
-        let c_uv = &(&(&op.w4 * &deta_uv) * &op.h_diag)
-            + &(&op.w3 * &(&u.deta * &v.dh))
-            + &(&op.w3 * &(&v.deta * &u.dh))
-            + &(&op.w2 * &d2h);
+        let c_uv = &(&(&self.w4 * &deta_uv) * &self.h_diag)
+            + &(&self.w3 * &(&u.deta * &v.dh))
+            + &(&self.w3 * &(&v.deta * &u.dh))
+            + &(&self.w2 * &d2h);
 
-        let eta_rhs = op.x_dense.dot(rhs);
-        let diag_term = op
+        let eta_rhs = self.x_dense.dot(rhs);
+        let diag_term = self
             .x_dense_t
             .dot(&(&eta_rhs * &c_uv.view().insert_axis(Axis(1))));
 
-        let b_uv_vec = &op.w3 * &deta_uv;
+        let b_uv_vec = &self.w3 * &deta_uv;
         let b_u_base = &u.b_u_base;
         let b_v_base = &v.b_u_base;
-        let b_uv_base = &op.x_dense * &b_uv_vec.view().insert_axis(Axis(1));
+        let b_uv_base = &self.x_dense * &b_uv_vec.view().insert_axis(Axis(1));
 
         // Linearity in the rhs argument lets us precompute the expensive
         // Hadamard-Gram operator on the full base blocks B, B_u, B_v, B_uv once,
         // then post-multiply by rhs. This preserves the exact operator while
         // avoiding repeated O(n r^2 c) work for every rhs block.
-        let p_b_rhs = fast_ab(&op.p_b_base, rhs);
+        let p_b_rhs = fast_ab(&self.p_b_base, rhs);
         let p_bu_base = &u.p_bu_base;
         let p_bu_rhs = fast_ab(&p_bu_base, rhs);
         let p_bv_base = &v.p_bu_base;
         let p_bv_rhs = fast_ab(&p_bv_base, rhs);
-        let p_buv_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
-            &op.k_reduced,
+        let p_buv_base = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
             &b_uv_base,
         );
         let p_buv_rhs = fast_ab(&p_buv_base, rhs);
 
         let p_v_b_base = &v.p_u_b_base;
         let p_v_b_rhs = fast_ab(&p_v_b_base, rhs);
-        let mut p_v_bu_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
+        let mut p_v_bu_base = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
             &v.a_u_reduced,
             &b_u_base,
         );
@@ -610,33 +613,33 @@ impl<'a> RemlState<'a> {
         let p_v_bu_rhs = fast_ab(&p_v_bu_base, rhs);
         let p_u_b_base = &u.p_u_b_base;
         let p_u_b_rhs = fast_ab(&p_u_b_base, rhs);
-        let mut p_u_bv_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
+        let mut p_u_bv_base = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
             &u.a_u_reduced,
             &b_v_base,
         );
         p_u_bv_base.mapv_inplace(|val| -2.0 * val);
         let p_u_bv_rhs = fast_ab(&p_u_bv_base, rhs);
 
-        let p_nu_nv_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
+        let p_nu_nv_base = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
             &u.a_u_reduced,
             &v.a_u_reduced,
-            &op.b_base,
+            &self.b_base,
         );
-        let p_hw_nuv_base = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
+        let p_hw_nuv_base = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
             &a_uv_reduced,
-            &op.b_base,
+            &self.b_base,
         );
         let p_uv_base = 2.0 * p_nu_nv_base - 2.0 * p_hw_nuv_base;
         let p_uv_rhs = fast_ab(&p_uv_base, rhs);
         let left_uv = b_uv_base.t().to_owned();
         let left_u = &u.b_u_base_t;
         let left_v = &v.b_u_base_t;
-        let left_b = &op.b_base_t;
+        let left_b = &self.b_base_t;
 
         // Nine-term expansion of D²J₂[u,v] with J₂ = Bᵀ P B.
         let d2_terms = [
@@ -682,11 +685,11 @@ impl<'a> RemlState<'a> {
         debug_assert_eq!(a.ncols(), m.nrows());
         debug_assert_eq!(b.ncols(), m.ncols());
         let am = fast_ab(a, m);
-        Self::rowwise_dot(&am, b)
+        RemlState::rowwise_dot(&am, b)
     }
 
-    pub(super) fn firth_dot_i_and_h(
-        op: &FirthDenseOperator,
+    pub(crate) fn dot_i_and_h(
+        &self,
         x_tau: &Array2<f64>,
         deta: &Array1<f64>,
     ) -> (Array2<f64>, Array1<f64>) {
@@ -709,28 +712,28 @@ impl<'a> RemlState<'a> {
         // We return:
         //   dot_i  = I_{r,tau}|beta,
         //   dot_h  = h_tau|beta.
-        let x_tau_reduced = fast_ab(x_tau, &op.q_basis);
+        let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
 
-        let wx_reduced = Self::row_scale(&op.x_reduced, &op.w);
-        let wx_tau_reduced = Self::row_scale(&x_tau_reduced, &op.w);
+        let wx_reduced = RemlState::row_scale(&self.x_reduced, &self.w);
+        let wx_tau_reduced = RemlState::row_scale(&x_tau_reduced, &self.w);
 
-        let dw = &op.w1 * deta;
-        let dwx_reduced = Self::row_scale(&op.x_reduced, &dw);
+        let dw = &self.w1 * deta;
+        let dwx_reduced = RemlState::row_scale(&self.x_reduced, &dw);
 
         let dot_i = fast_ab(&x_tau_reduced.t().to_owned(), &wx_reduced)
-            + fast_ab(&op.x_reduced.t().to_owned(), &wx_tau_reduced)
-            + fast_ab(&op.x_reduced.t().to_owned(), &dwx_reduced);
+            + fast_ab(&self.x_reduced.t().to_owned(), &wx_tau_reduced)
+            + fast_ab(&self.x_reduced.t().to_owned(), &dwx_reduced);
 
-        let dot_k = -op.k_reduced.dot(&dot_i).dot(&op.k_reduced);
-        let x_tauk = x_tau_reduced.dot(&op.k_reduced);
-        let dot_h_explicit = 2.0 * Self::rowwise_dot(&x_tauk, &op.x_reduced);
-        let dot_h_implicit = Self::rowwise_dot(&op.x_reduced.dot(&dot_k), &op.x_reduced);
+        let dot_k = -self.k_reduced.dot(&dot_i).dot(&self.k_reduced);
+        let x_tauk = x_tau_reduced.dot(&self.k_reduced);
+        let dot_h_explicit = 2.0 * RemlState::rowwise_dot(&x_tauk, &self.x_reduced);
+        let dot_h_implicit = RemlState::rowwise_dot(&self.x_reduced.dot(&dot_k), &self.x_reduced);
         let dot_h = dot_h_explicit + dot_h_implicit;
         (dot_i, dot_h)
     }
 
-    pub(super) fn firth_exact_tau_kernel(
-        op: &FirthDenseOperator,
+    pub(crate) fn exact_tau_kernel(
+        &self,
         x_tau: &Array2<f64>,
         beta: &Array1<f64>,
         include_hphi_tau_kernel: bool,
@@ -754,17 +757,16 @@ impl<'a> RemlState<'a> {
         //
         // These are the literal trace/hat closed forms for Phi_tau and Phi_beta,tau.
         let deta_partial = x_tau.dot(beta);
-        let (dot_i_partial, dot_h_partial) = Self::firth_dot_i_and_h(op, x_tau, &deta_partial);
+        let (dot_i_partial, dot_h_partial) = self.dot_i_and_h( x_tau, &deta_partial);
 
-        let first = 0.5 * x_tau.t().dot(&(&op.w1 * &op.h_diag));
-        let second_vec = &(&(&op.w2 * &deta_partial) * &op.h_diag) + &(&op.w1 * &dot_h_partial);
-        let second = 0.5 * op.x_dense.t().dot(&second_vec);
+        let first = 0.5 * x_tau.t().dot(&(&self.w1 * &self.h_diag));
+        let second_vec = &(&(&self.w2 * &deta_partial) * &self.h_diag) + &(&self.w1 * &dot_h_partial);
+        let second = 0.5 * self.x_dense.t().dot(&second_vec);
         let g_phi_tau = first + second;
-        let phi_tau_partial = 0.5 * Self::trace_product(&op.k_reduced, &dot_i_partial);
+        let phi_tau_partial = 0.5 * RemlState::trace_product(&self.k_reduced, &dot_i_partial);
 
         let tau_kernel = if include_hphi_tau_kernel {
-            Some(Self::firth_hphi_tau_partial_prepare_from_partials(
-                op,
+            Some(self.hphi_tau_partial_prepare_from_partials(
                 x_tau,
                 &deta_partial,
                 dot_h_partial,
@@ -780,15 +782,14 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(super) fn firth_hphi_tau_partial_prepare(
-        op: &FirthDenseOperator,
+    pub(crate) fn hphi_tau_partial_prepare(
+        &self,
         x_tau: &Array2<f64>,
         beta: &Array1<f64>,
     ) -> FirthTauPartialKernel {
         let deta_partial = x_tau.dot(beta);
-        let (dot_i_partial, dot_h_partial) = Self::firth_dot_i_and_h(op, x_tau, &deta_partial);
-        Self::firth_hphi_tau_partial_prepare_from_partials(
-            op,
+        let (dot_i_partial, dot_h_partial) = self.dot_i_and_h( x_tau, &deta_partial);
+        self.hphi_tau_partial_prepare_from_partials(
             x_tau,
             &deta_partial,
             dot_h_partial,
@@ -796,17 +797,17 @@ impl<'a> RemlState<'a> {
         )
     }
 
-    fn firth_hphi_tau_partial_prepare_from_partials(
-        op: &FirthDenseOperator,
+    fn hphi_tau_partial_prepare_from_partials(
+        &self,
         x_tau: &Array2<f64>,
         deta_partial: &Array1<f64>,
         dot_h_partial: Array1<f64>,
         dot_i_partial: Array2<f64>,
     ) -> FirthTauPartialKernel {
-        let dot_w1 = &op.w2 * deta_partial;
-        let dot_w2 = &op.w3 * deta_partial;
-        let x_tau_reduced = fast_ab(x_tau, &op.q_basis);
-        let dot_k = -op.k_reduced.dot(&dot_i_partial).dot(&op.k_reduced);
+        let dot_w1 = &self.w2 * deta_partial;
+        let dot_w2 = &self.w3 * deta_partial;
+        let x_tau_reduced = fast_ab(x_tau, &self.q_basis);
+        let dot_k = -self.k_reduced.dot(&dot_i_partial).dot(&self.k_reduced);
         FirthTauPartialKernel {
             dot_w1,
             dot_w2,
@@ -816,16 +817,16 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(super) fn firth_apply_pbar_to_matrix(
-        op: &FirthDenseOperator,
+    pub(crate) fn apply_pbar_to_matrix(
+        &self,
         mat: &Array2<f64>,
     ) -> Array2<f64> {
         // Applies P̄ = (X_r K_r X_rᵀ)⊙(X_r K_r X_rᵀ) to each column of mat.
-        Self::apply_hadamard_gram_to_matrix(&op.z_reduced, &op.k_reduced, &op.k_reduced, mat)
+        RemlState::apply_hadamard_gram_to_matrix(&self.z_reduced, &self.k_reduced, &self.k_reduced, mat)
     }
 
-    pub(super) fn firth_apply_mtau_to_matrix(
-        op: &FirthDenseOperator,
+    pub(crate) fn apply_mtau_to_matrix(
+        &self,
         kernel: &FirthTauPartialKernel,
         mat: &Array2<f64>,
     ) -> Array2<f64> {
@@ -840,22 +841,22 @@ impl<'a> RemlState<'a> {
         //   (P⊙(Z_tau K Zᵀ))v   : rowwise bilinear with K (Zᵀdiag(v)Z) K
         //   (P⊙(Z K Z_tauᵀ))v   : diag_Z( K (Zᵀdiag(v)Z_tau) K )
         //   (P⊙(Z dotK Zᵀ))v    : Hadamard-Gram apply with (K, dotK).
-        if mat.nrows() != op.x_dense.nrows() || mat.ncols() == 0 {
+        if mat.nrows() != self.x_dense.nrows() || mat.ncols() == 0 {
             return Array2::<f64>::zeros(mat.raw_dim());
         }
         let mut out = Array2::<f64>::zeros(mat.raw_dim());
         for col in 0..mat.ncols() {
             let v = mat.column(col).to_owned();
-            let s_zz = Self::reduced_weighted_gram(&op.z_reduced, &v);
-            let m_zz = op.k_reduced.dot(&s_zz).dot(&op.k_reduced);
-            let t1 = Self::rowwise_bilinear(&op.z_reduced, &m_zz, &kernel.x_tau_reduced);
+            let s_zz = RemlState::reduced_weighted_gram(&self.z_reduced, &v);
+            let m_zz = self.k_reduced.dot(&s_zz).dot(&self.k_reduced);
+            let t1 = RemlState::rowwise_bilinear(&self.z_reduced, &m_zz, &kernel.x_tau_reduced);
 
-            let s_zt = Self::reduced_cross_weighted_gram(&op.z_reduced, &kernel.x_tau_reduced, &v);
-            let m_zt = op.k_reduced.dot(&s_zt).dot(&op.k_reduced);
-            let t2 = Self::reduced_diag_gram(&op.z_reduced, &m_zt);
+            let s_zt = RemlState::reduced_cross_weighted_gram(&self.z_reduced, &kernel.x_tau_reduced, &v);
+            let m_zt = self.k_reduced.dot(&s_zt).dot(&self.k_reduced);
+            let t2 = RemlState::reduced_diag_gram(&self.z_reduced, &m_zt);
 
             let t3 =
-                Self::apply_hadamard_gram(&op.z_reduced, &op.k_reduced, &kernel.dot_k_reduced, &v);
+                RemlState::apply_hadamard_gram(&self.z_reduced, &self.k_reduced, &kernel.dot_k_reduced, &v);
 
             let y = 2.0 * (t1 + t2 + t3);
             out.column_mut(col).assign(&y);
@@ -863,13 +864,13 @@ impl<'a> RemlState<'a> {
         out
     }
 
-    pub(super) fn firth_hphi_tau_partial_apply(
-        op: &FirthDenseOperator,
+    pub(crate) fn hphi_tau_partial_apply(
+        &self,
         x_tau: &Array2<f64>,
         kernel: &FirthTauPartialKernel,
         rhs: &Array2<f64>,
     ) -> Array2<f64> {
-        let p = op.x_dense.ncols();
+        let p = self.x_dense.ncols();
         if rhs.nrows() != p {
             return Array2::<f64>::zeros((p, rhs.ncols()));
         }
@@ -892,35 +893,35 @@ impl<'a> RemlState<'a> {
         //     ].
         // This routine evaluates that form in reduced coordinates without forming
         // dense 3rd-order tensors explicitly.
-        let eta_v = op.x_dense.dot(rhs);
+        let eta_v = self.x_dense.dot(rhs);
         let eta_v_tau = x_tau.dot(rhs);
-        let q_v = &eta_v * &op.w1.view().insert_axis(Axis(1));
+        let q_v = &eta_v * &self.w1.view().insert_axis(Axis(1));
         let q_v_tau = &eta_v * &kernel.dot_w1.view().insert_axis(Axis(1))
-            + &eta_v_tau * &op.w1.view().insert_axis(Axis(1));
-        let m_q_v = Self::firth_apply_pbar_to_matrix(op, &q_v);
-        let m_q_v_tau = Self::firth_apply_mtau_to_matrix(op, kernel, &q_v)
-            + Self::firth_apply_pbar_to_matrix(op, &q_v_tau);
-        let r_v = &(&eta_v * &op.w2.view().insert_axis(Axis(1)))
-            * &op.h_diag.view().insert_axis(Axis(1))
-            - &(&m_q_v * &op.w1.view().insert_axis(Axis(1)));
+            + &eta_v_tau * &self.w1.view().insert_axis(Axis(1));
+        let m_q_v = self.apply_pbar_to_matrix( &q_v);
+        let m_q_v_tau = self.apply_mtau_to_matrix( kernel, &q_v)
+            + self.apply_pbar_to_matrix( &q_v_tau);
+        let r_v = &(&eta_v * &self.w2.view().insert_axis(Axis(1)))
+            * &self.h_diag.view().insert_axis(Axis(1))
+            - &(&m_q_v * &self.w1.view().insert_axis(Axis(1)));
         let r_v_tau = (&(&eta_v * &kernel.dot_w2.view().insert_axis(Axis(1)))
-            + &(&eta_v_tau * &op.w2.view().insert_axis(Axis(1))))
-            * &op.h_diag.view().insert_axis(Axis(1))
-            + &(&eta_v * &op.w2.view().insert_axis(Axis(1)))
+            + &(&eta_v_tau * &self.w2.view().insert_axis(Axis(1))))
+            * &self.h_diag.view().insert_axis(Axis(1))
+            + &(&eta_v * &self.w2.view().insert_axis(Axis(1)))
                 * &kernel.dot_h_partial.view().insert_axis(Axis(1))
             - &(&m_q_v * &kernel.dot_w1.view().insert_axis(Axis(1))
-                + &m_q_v_tau * &op.w1.view().insert_axis(Axis(1)));
-        0.5 * (x_tau.t().dot(&r_v) + op.x_dense.t().dot(&r_v_tau))
+                + &m_q_v_tau * &self.w1.view().insert_axis(Axis(1)));
+        0.5 * (x_tau.t().dot(&r_v) + self.x_dense.t().dot(&r_v_tau))
     }
 
-    pub(super) fn firth_hphi_trace_apply_combined(
-        op: &FirthDenseOperator,
+    pub(crate) fn hphi_trace_apply_combined(
+        &self,
         dir: &FirthDirection,
         x_tau: &Array2<f64>,
         tau_kernel: Option<&FirthTauPartialKernel>,
         rhs: &Array2<f64>,
     ) -> Array2<f64> {
-        let p = op.x_dense.ncols();
+        let p = self.x_dense.ncols();
         if rhs.nrows() != p {
             return Array2::<f64>::zeros((p, rhs.ncols()));
         }
@@ -931,61 +932,61 @@ impl<'a> RemlState<'a> {
         // Shared block intermediates:
         // eta_v, q_v, and P(q_v) are reused by both
         //   H_{phi,tau}|beta(·) and D(H_phi)[dir](·).
-        let eta_v = op.x_dense.dot(rhs);
-        let q_v = &eta_v * &op.w1.view().insert_axis(Axis(1));
+        let eta_v = self.x_dense.dot(rhs);
+        let q_v = &eta_v * &self.w1.view().insert_axis(Axis(1));
 
         // D(H_phi)[dir] contribution:
         let m_q_v =
-            Self::apply_hadamard_gram_to_matrix(&op.z_reduced, &op.k_reduced, &op.k_reduced, &q_v);
-        let bu_vec = &op.w2 * &dir.deta;
+            RemlState::apply_hadamard_gram_to_matrix(&self.z_reduced, &self.k_reduced, &self.k_reduced, &q_v);
+        let bu_vec = &self.w2 * &dir.deta;
         let bu_v = &eta_v * &bu_vec.view().insert_axis(Axis(1));
         let m_bu_v =
-            Self::apply_hadamard_gram_to_matrix(&op.z_reduced, &op.k_reduced, &op.k_reduced, &bu_v);
-        let mut p_u_q_v = Self::apply_hadamard_gram_to_matrix(
-            &op.z_reduced,
-            &op.k_reduced,
+            RemlState::apply_hadamard_gram_to_matrix(&self.z_reduced, &self.k_reduced, &self.k_reduced, &bu_v);
+        let mut p_u_q_v = RemlState::apply_hadamard_gram_to_matrix(
+            &self.z_reduced,
+            &self.k_reduced,
             &dir.a_u_reduced,
             &q_v,
         );
         p_u_q_v.mapv_inplace(|v| -2.0 * v);
-        let c_u = &(&op.w3 * &dir.deta) * &op.h_diag + &(&op.w2 * &dir.dh);
-        let diag_term = op
+        let c_u = &(&self.w3 * &dir.deta) * &self.h_diag + &(&self.w2 * &dir.dh);
+        let diag_term = self
             .x_dense
             .t()
             .dot(&(&eta_v * &c_u.view().insert_axis(Axis(1))));
-        let term1 = op
+        let term1 = self
             .x_dense
             .t()
             .dot(&(&m_q_v * &bu_vec.view().insert_axis(Axis(1))));
-        let term2 = op
+        let term2 = self
             .x_dense
             .t()
-            .dot(&(&m_bu_v * &op.w1.view().insert_axis(Axis(1))));
-        let term3 = op
+            .dot(&(&m_bu_v * &self.w1.view().insert_axis(Axis(1))));
+        let term3 = self
             .x_dense
             .t()
-            .dot(&(&p_u_q_v * &op.w1.view().insert_axis(Axis(1))));
+            .dot(&(&p_u_q_v * &self.w1.view().insert_axis(Axis(1))));
         let mut out = 0.5 * (diag_term - (term1 + term2 + term3));
 
         if let Some(kernel) = tau_kernel {
             // H_{phi,tau}|beta contribution, reusing eta_v and q_v.
             let eta_v_tau = x_tau.dot(rhs);
             let q_v_tau = &eta_v * &kernel.dot_w1.view().insert_axis(Axis(1))
-                + &eta_v_tau * &op.w1.view().insert_axis(Axis(1));
-            let m_q_v_kernel = Self::firth_apply_pbar_to_matrix(op, &q_v);
-            let m_q_v_tau = Self::firth_apply_mtau_to_matrix(op, kernel, &q_v)
-                + Self::firth_apply_pbar_to_matrix(op, &q_v_tau);
-            let r_v = &(&eta_v * &op.w2.view().insert_axis(Axis(1)))
-                * &op.h_diag.view().insert_axis(Axis(1))
-                - &(&m_q_v_kernel * &op.w1.view().insert_axis(Axis(1)));
+                + &eta_v_tau * &self.w1.view().insert_axis(Axis(1));
+            let m_q_v_kernel = self.apply_pbar_to_matrix( &q_v);
+            let m_q_v_tau = self.apply_mtau_to_matrix( kernel, &q_v)
+                + self.apply_pbar_to_matrix( &q_v_tau);
+            let r_v = &(&eta_v * &self.w2.view().insert_axis(Axis(1)))
+                * &self.h_diag.view().insert_axis(Axis(1))
+                - &(&m_q_v_kernel * &self.w1.view().insert_axis(Axis(1)));
             let r_v_tau = (&(&eta_v * &kernel.dot_w2.view().insert_axis(Axis(1)))
-                + &(&eta_v_tau * &op.w2.view().insert_axis(Axis(1))))
-                * &op.h_diag.view().insert_axis(Axis(1))
-                + &(&eta_v * &op.w2.view().insert_axis(Axis(1)))
+                + &(&eta_v_tau * &self.w2.view().insert_axis(Axis(1))))
+                * &self.h_diag.view().insert_axis(Axis(1))
+                + &(&eta_v * &self.w2.view().insert_axis(Axis(1)))
                     * &kernel.dot_h_partial.view().insert_axis(Axis(1))
                 - &(&m_q_v_kernel * &kernel.dot_w1.view().insert_axis(Axis(1))
-                    + &m_q_v_tau * &op.w1.view().insert_axis(Axis(1)));
-            out += &(0.5 * (x_tau.t().dot(&r_v) + op.x_dense.t().dot(&r_v_tau)));
+                    + &m_q_v_tau * &self.w1.view().insert_axis(Axis(1)));
+            out += &(0.5 * (x_tau.t().dot(&r_v) + self.x_dense.t().dot(&r_v_tau)));
         }
         out
     }
@@ -1017,7 +1018,7 @@ mod tests {
 
     fn firth_phi_value(x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
         let eta = x.dot(beta);
-        let op = RemlState::build_firth_dense_operator(x, &eta).expect("firth operator");
+        let op = FirthDenseOperator::build(x, &eta).expect("firth operator");
         let fisher = fast_atb(&op.x_reduced, &RemlState::row_scale(&op.x_reduced, &op.w));
         let (evals, _) = fisher
             .eigh(Side::Lower)
@@ -1027,7 +1028,7 @@ mod tests {
 
     fn firth_grad_phi(x: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
         let eta = x.dot(beta);
-        let op = RemlState::build_firth_dense_operator(x, &eta).expect("firth operator");
+        let op = FirthDenseOperator::build(x, &eta).expect("firth operator");
         0.5 * x.t().dot(&(&op.w1 * &op.h_diag))
     }
 
@@ -1042,7 +1043,7 @@ mod tests {
         ];
         let beta = array![0.15, -0.6, 0.35];
         let eta = x.dot(&beta);
-        let op = RemlState::build_firth_dense_operator(&x, &eta).expect("firth operator");
+        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
 
         let h12 = 2e-5;
         let h34 = 1e-3;
@@ -1081,16 +1082,16 @@ mod tests {
         ];
         let beta = array![0.1, -0.25, 0.2];
         let eta = x.dot(&beta);
-        let op = RemlState::build_firth_dense_operator(&x, &eta).expect("firth operator");
+        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
 
         let u = array![0.3, -0.2, 0.4];
         let v = array![-0.5, 0.1, 0.25];
-        let du = RemlState::firth_direction(&op, &u);
-        let dv = RemlState::firth_direction(&op, &v);
+        let du = op.direction(&u);
+        let dv = op.direction(&v);
 
         let eye = Array2::<f64>::eye(x.ncols());
-        let uv = RemlState::firth_hphi_second_direction_apply(&op, &du, &dv, &eye);
-        let vu = RemlState::firth_hphi_second_direction_apply(&op, &dv, &du, &eye);
+        let uv = op.hphi_second_direction_apply(&du, &dv, &eye);
+        let vu = op.hphi_second_direction_apply(&dv, &du, &eye);
 
         for i in 0..uv.nrows() {
             for j in 0..uv.ncols() {
@@ -1121,13 +1122,13 @@ mod tests {
         ];
         let beta = array![0.08, -0.22, 0.27];
         let eta = x.dot(&beta);
-        let op = RemlState::build_firth_dense_operator(&x, &eta).expect("firth operator");
+        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
         let u = Array1::from_vec(vec![0.25, -0.4, 0.35]);
-        let dir = RemlState::firth_direction(&op, &u);
+        let dir = op.direction(&u);
 
         let p = x.ncols();
         let eye = Array2::<f64>::eye(p);
-        let mut via_apply = RemlState::firth_hphi_direction_apply(&op, &dir, &eye);
+        let mut via_apply = op.hphi_direction_apply(&dir, &eye);
         for i in 0..p {
             for j in 0..i {
                 let sym = 0.5 * (via_apply[[i, j]] + via_apply[[j, i]]);
@@ -1135,7 +1136,7 @@ mod tests {
                 via_apply[[j, i]] = sym;
             }
         }
-        let direct = RemlState::firth_hphi_direction(&op, &dir);
+        let direct = op.hphi_direction(&dir);
         let diff = &direct - &via_apply;
         let err = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
         assert!(err < 1e-10, "direction/apply mismatch: {err:e}");
@@ -1161,8 +1162,8 @@ mod tests {
         ];
         let beta = array![0.1, -0.25, 0.2];
         let eta = x.dot(&beta);
-        let op = RemlState::build_firth_dense_operator(&x, &eta).expect("firth operator");
-        let analytic = RemlState::firth_exact_tau_kernel(&op, &x_tau, &beta, false).phi_tau_partial;
+        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let analytic = op.exact_tau_kernel(&x_tau, &beta, false).phi_tau_partial;
 
         let h = 1e-6;
         let x_plus = &x + &(h * &x_tau);
@@ -1195,8 +1196,8 @@ mod tests {
         ];
         let beta = array![0.1, -0.25, 0.2];
         let eta = x.dot(&beta);
-        let op = RemlState::build_firth_dense_operator(&x, &eta).expect("firth operator");
-        let analytic = RemlState::firth_exact_tau_kernel(&op, &x_tau, &beta, false).g_phi_tau;
+        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let analytic = op.exact_tau_kernel(&x_tau, &beta, false).g_phi_tau;
 
         let h = 1e-6;
         let x_plus = &x + &(h * &x_tau);

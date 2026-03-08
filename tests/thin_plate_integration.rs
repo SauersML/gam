@@ -33,7 +33,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
 
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
-    let s_list = tps.penalty_matrices();
+    let s_list = vec![tps.penalty_bending.clone(), tps.penalty_ridge.clone()];
 
     let fit = fit_gam(
         tps.basis.view(),
@@ -109,7 +109,10 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
         create_thin_plate_spline_basis_with_knot_count(x_train.view(), 30).expect("TPS basis");
     let weights = Array1::ones(n_train);
     let offset = Array1::zeros(n_train);
-    let s_list = tps_train.penalty_matrices();
+    let s_list = vec![
+        tps_train.penalty_bending.clone(),
+        tps_train.penalty_ridge.clone(),
+    ];
 
     let fit = fit_gam(
         tps_train.basis.view(),
@@ -201,7 +204,10 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
 
     let (tps_train, knots) =
         create_thin_plate_spline_basis_with_knot_count(x_train.view(), 36).expect("3D TPS basis");
-    let s_list = tps_train.penalty_matrices();
+    let s_list = vec![
+        tps_train.penalty_bending.clone(),
+        tps_train.penalty_ridge.clone(),
+    ];
     let rs_list = compute_penalty_square_roots(&s_list).expect("3D TPS penalty roots");
     assert!(
         !rs_list[0].is_empty() && rs_list[0].nrows() > 0,

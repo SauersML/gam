@@ -141,6 +141,57 @@ pub enum DesignMatrix {
     Sparse(SparseDesignMatrix),
 }
 
+/// A unified representation of a symmetric matrix, typically an assembled Hessian.
+#[derive(Clone)]
+pub enum SymmetricMatrix {
+    Dense(Array2<f64>),
+    Sparse(faer::sparse::SparseColMat<usize, f64>),
+}
+
+impl SymmetricMatrix {
+    pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
+        match self {
+            Self::Dense(mat) => {
+                let factor = crate::linalg::utils::StableSolver::new("unnamed")
+                    .factorize(mat)
+                    .map_err(|e| format!("Dense SymmetricMatrix factorization failed: {e:?}"))?;
+                Ok(Box::new(factor))
+            }
+            Self::Sparse(mat) => {
+                let factor = crate::linalg::sparse_exact::factorize_sparse_spd(mat)
+                    .map_err(|e| format!("Sparse SymmetricMatrix factorization failed: {e:?}"))?;
+                Ok(Box::new(factor))
+            }
+        }
+    }
+
+    pub fn nrows(&self) -> usize {
+        match self {
+            Self::Dense(m) => m.nrows(),
+            Self::Sparse(m) => m.nrows(),
+        }
+    }
+
+    pub fn ncols(&self) -> usize {
+        match self {
+            Self::Dense(m) => m.ncols(),
+            Self::Sparse(m) => m.ncols(),
+        }
+    }
+}
+
+/// A generic abstraction over a factorized symmetric positive-definite (or regularized) system.
+pub trait FactorizedSystem: Send + Sync {
+    /// Solve $H x = b$ for a single right-hand side.
+    fn solve(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, String>;
+    
+    /// Solve $H X = B$ for multiple right-hand sides.
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String>;
+
+    /// Return the log-determinant of the factorized matrix.
+    fn logdet(&self) -> f64;
+}
+
 pub trait LinearOperator {
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64>;

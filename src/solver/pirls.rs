@@ -689,8 +689,7 @@ impl FirthDiagnostics {
 pub struct WorkingState {
     pub eta: LinearPredictor,
     pub gradient: Array1<f64>,
-    pub hessian: Array2<f64>,
-    pub sparse_hessian: Option<SparseColMat<usize, f64>>,
+    pub hessian: crate::linalg::matrix::SymmetricMatrix,
     pub deviance: f64,
     pub penalty_term: f64,
     pub firth: FirthDiagnostics,
@@ -2384,9 +2383,24 @@ fn solve_kkt_direction(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
     active_a: &Array2<f64>,
+    active_residual: Option<&Array1<f64>>,
 ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
     let p = hessian.nrows();
     let m = active_a.nrows();
+    if hessian.ncols() != p || gradient.len() != p || active_a.ncols() != p {
+        return Err(EstimationError::InvalidInput(
+            "KKT solve dimension mismatch".to_string(),
+        ));
+    }
+    if let Some(residual) = active_residual
+        && residual.len() != m
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "KKT active residual length mismatch: got {}, expected {}",
+            residual.len(),
+            m
+        )));
+    }
     if m == 0 {
         let mut d = Array1::<f64>::zeros(p);
         solve_newton_direction_dense(hessian, gradient, &mut d)?;
@@ -2400,6 +2414,11 @@ fn solve_kkt_direction(
     let mut rhs = Array1::<f64>::zeros(p + m);
     for i in 0..p {
         rhs[i] = -gradient[i];
+    }
+    if let Some(residual) = active_residual {
+        for i in 0..m {
+            rhs[p + i] = residual[i];
+        }
     }
 
     let kkt_view = FaerArrayView::new(&kkt);
@@ -2482,10 +2501,12 @@ fn solve_newton_direction_with_linear_constraints(
 
     for _ in 0..((p + m + 8) * 4) {
         let mut a_w = Array2::<f64>::zeros((active.len(), p));
+        let mut residual_w = Array1::<f64>::zeros(active.len());
         for (r, &idx) in active.iter().enumerate() {
             a_w.row_mut(r).assign(&constraints.a.row(idx));
+            residual_w[r] = constraints.b[idx] - constraints.a.row(idx).dot(&x);
         }
-        let (d, lambda_w) = solve_kkt_direction(hessian, &g_cur, &a_w)?;
+        let (d, lambda_w) = solve_kkt_direction(hessian, &g_cur, &a_w, Some(&residual_w))?;
         let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
         if step_norm <= tol_step {
             if active.is_empty() {
@@ -3454,6 +3475,23 @@ fn build_sparse_native_reparam_result(
     }
 }
 
+pub struct PirlsProblem<'a, X> {
+    pub x: X,
+    pub offset: ArrayView1<'a, f64>,
+    pub y: ArrayView1<'a, f64>,
+    pub prior_weights: ArrayView1<'a, f64>,
+    pub covariate_se: Option<ArrayView1<'a, f64>>,
+}
+
+pub struct PenaltyConfig<'a> {
+    pub rs_original: &'a [Array2<f64>],
+    pub balanced_penalty_root: Option<&'a Array2<f64>>,
+    pub reparam_invariant: Option<&'a crate::construction::ReparamInvariant>,
+    pub p: usize,
+    pub coefficient_lower_bounds: Option<&'a Array1<f64>>,
+    pub linear_constraints_original: Option<&'a LinearInequalityConstraints>,
+}
+
 /// P-IRLS solver that follows mgcv's architecture exactly
 ///
 /// This function implements the complete algorithm from mgcv's gam.fit3 function
@@ -3470,20 +3508,10 @@ fn build_sparse_native_reparam_result(
 /// fitting process by working in a well-conditioned parameter space.
 pub fn fit_model_for_fixed_rho<'a>(
     rho: LogSmoothingParamsView<'_>,
-    x: ArrayView2<'a, f64>,
-    offset: ArrayView1<f64>,
-    y: ArrayView1<'a, f64>,
-    prior_weights: ArrayView1<'a, f64>,
-    rs_original: &[Array2<f64>],
-    balanced_penalty_root: Option<&Array2<f64>>,
-    reparam_invariant: Option<&crate::construction::ReparamInvariant>,
-    p: usize,
+    problem: PirlsProblem<'a, DesignMatrix>,
+    penalty: PenaltyConfig<'_>,
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
-    coefficient_lower_bounds: Option<&Array1<f64>>,
-    linear_constraints_original: Option<&LinearInequalityConstraints>,
-    // Optional per-observation SE for integrated (GHQ) likelihood in calibrator fitting.
-    covariate_se: Option<&Array1<f64>>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let quad_ctx = crate::quadrature::QuadratureContext::new();
     let lambdas = rho.exp();
@@ -3498,95 +3526,66 @@ pub fn fit_model_for_fixed_rho<'a>(
         stable_reparameterization_with_invariant_engine,
     };
 
-    let eb_cow: Cow<'_, Array2<f64>> = if let Some(precomputed) = balanced_penalty_root {
+    let eb_cow: Cow<'_, Array2<f64>> = if let Some(precomputed) = penalty.balanced_penalty_root {
         Cow::Borrowed(precomputed)
     } else {
-        let mut s_list_full = Vec::with_capacity(rs_original.len());
-        for rs in rs_original {
+        let mut s_list_full = Vec::with_capacity(penalty.rs_original.len());
+        for rs in penalty.rs_original {
             s_list_full.push(rs.t().dot(rs));
         }
-        Cow::Owned(create_balanced_penalty_root(&s_list_full, p)?)
+        Cow::Owned(create_balanced_penalty_root(&s_list_full, penalty.p)?)
     };
     let eb: &Array2<f64> = eb_cow.as_ref();
 
-    let reparam_result = if let Some(invariant) = reparam_invariant {
+    let reparam_result = if let Some(invariant) = penalty.reparam_invariant {
         stable_reparameterization_with_invariant_engine(
-            rs_original,
+            penalty.rs_original,
             lambdas_slice,
-            EngineDims::new(p, rs_original.len()),
+            EngineDims::new(penalty.p, penalty.rs_original.len()),
             invariant,
         )?
     } else {
         stable_reparameterization_engine(
-            rs_original,
+            penalty.rs_original,
             lambdas_slice,
-            EngineDims::new(p, rs_original.len()),
+            EngineDims::new(penalty.p, penalty.rs_original.len()),
         )?
     };
     let transformed_bounds =
-        build_transformed_lower_bound_constraints(&reparam_result.qs, coefficient_lower_bounds);
+        build_transformed_lower_bound_constraints(&reparam_result.qs, penalty.coefficient_lower_bounds);
     let transformed_linear =
-        build_transformed_linear_constraints(&reparam_result.qs, linear_constraints_original);
+        build_transformed_linear_constraints(&reparam_result.qs, penalty.linear_constraints_original);
     let linear_constraints = merge_linear_constraints(transformed_bounds, transformed_linear);
-    let x_original_sparse = if matches!(link_function, LinkFunction::Logit | LinkFunction::Probit)
-        && !config.firth_bias_reduction
-    {
-        sparse_from_dense_view(x)
-    } else {
-        None
-    };
-    let use_implicit = matches!(link_function, LinkFunction::Logit | LinkFunction::Probit)
-        && !config.firth_bias_reduction
-        && x_original_sparse.is_some();
-    let use_explicit = !use_implicit;
-
-    let x_transformed_dense = if use_explicit {
-        Some(x.dot(&reparam_result.qs))
-    } else {
-        None
-    };
-    let x_transformed = x_transformed_dense
-        .as_ref()
-        .map(|matrix| maybe_sparse_design(matrix));
-
-    let x_original = if use_explicit {
-        DesignMatrix::from(x.to_owned())
-    } else {
-        x_original_sparse.unwrap_or_else(|| DesignMatrix::from(x.to_owned()))
-    };
 
     let eb_rows = eb.nrows();
     let e_rows = reparam_result.e_transformed.nrows();
-    let mut workspace = PirlsWorkspace::new(x.nrows(), x.ncols(), eb_rows, e_rows);
+    let mut workspace = PirlsWorkspace::new(problem.x.nrows(), problem.x.ncols(), eb_rows, e_rows);
+
     let solver_decision = should_use_sparse_native_pirls(
         &mut workspace,
-        &x_original,
+        &problem.x,
         &reparam_result.s_transformed,
         config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
-        linear_constraints_original,
-        use_explicit || matches!(link_function, LinkFunction::Identity),
+        penalty.linear_constraints_original,
+        matches!(link_function, LinkFunction::Identity),
     );
     solver_decision.log_once();
-    if matches!(solver_decision.path, PirlsLinearSolvePath::SparseNative)
-        && let Some(x_sparse) = x_original.as_sparse()
-    {
-        return fit_model_for_fixed_rho_sparse_implicit(
-            rho,
-            x_sparse,
-            offset,
-            y,
-            prior_weights,
-            rs_original,
-            balanced_penalty_root,
-            reparam_invariant,
-            p,
-            config,
-            warm_start_beta,
-            coefficient_lower_bounds,
-            linear_constraints_original,
-            covariate_se,
+
+    let use_sparse_native = matches!(solver_decision.path, PirlsLinearSolvePath::SparseNative);
+
+    let (x_active, coordinate_frame, reparam_result_active, x_transformed_dense) = if use_sparse_native {
+        let sparse_reparam = build_sparse_native_reparam_result(
+            reparam_result.clone(),
+            penalty.rs_original,
+            lambdas_slice,
+            penalty.p,
         );
-    }
+        (problem.x.clone(), PirlsCoordinateFrame::OriginalSparseNative, sparse_reparam, None)
+    } else {
+        let dense_x = problem.x.to_dense_arc();
+        let x_transformed = dense_x.dot(&reparam_result.qs);
+        (maybe_sparse_design(&x_transformed), PirlsCoordinateFrame::TransformedQs, reparam_result.clone(), Some(x_transformed))
+    };
 
     if matches!(link_function, LinkFunction::Identity) {
         let x_transformed_dense = x_transformed_dense
@@ -3595,13 +3594,13 @@ pub fn fit_model_for_fixed_rho<'a>(
         let x_transformed = x_transformed.expect("explicit transform required for identity link");
         let (pls_result, _) = solve_penalized_least_squares(
             x_transformed_dense.view(),
-            y,
-            prior_weights,
-            offset.view(),
+            problem.y,
+            problem.prior_weights,
+            problem.offset,
             &reparam_result.e_transformed,
             &reparam_result.s_transformed,
             &mut workspace,
-            y,
+            problem.y,
             link_function,
         )?;
 
@@ -3610,12 +3609,12 @@ pub fn fit_model_for_fixed_rho<'a>(
         let edf = pls_result.edf;
         let base_ridge = pls_result.ridge_used;
 
-        let prior_weights_owned = prior_weights.to_owned();
-        let mut eta = offset.to_owned();
+        let prior_weights_owned = problem.prior_weights.to_owned();
+        let mut eta = problem.offset.to_owned();
         eta += &x_transformed_dense.dot(beta_transformed.as_ref());
         let final_eta = eta.clone();
         let final_mu = eta.clone();
-        let final_z = y.to_owned();
+        let final_z = problem.y.to_owned();
 
         let mut weighted_residual = final_mu.clone();
         weighted_residual -= &final_z;
@@ -3625,7 +3624,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
-        let deviance = calculate_deviance(y, &final_mu, link_function, prior_weights);
+        let deviance = calculate_deviance(problem.y, &final_mu, link_function, problem.prior_weights);
         let mut stabilized_hessian = penalized_hessian.clone();
         let ridge_used = base_ridge;
         if ridge_used > 0.0 {
@@ -3689,7 +3688,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             stable_penalty_term: penalty_term,
             firth: FirthDiagnostics::Inactive,
             final_weights: prior_weights_owned.clone(),
-            final_offset: offset.to_owned(),
+            final_offset: problem.offset.to_owned(),
             final_eta: final_eta.clone(),
             final_mu: final_mu.clone(),
             solve_weights: prior_weights_owned,
@@ -3722,9 +3721,9 @@ pub fn fit_model_for_fixed_rho<'a>(
         x_transformed,
         x_original,
         PirlsCoordinateFrame::TransformedQs,
-        offset,
-        y,
-        prior_weights,
+        problem.offset,
+        problem.y,
+        problem.prior_weights,
         reparam_result.s_transformed.clone(),
         reparam_result.e_transformed.clone(),
         workspace,
@@ -3744,24 +3743,24 @@ pub fn fit_model_for_fixed_rho<'a>(
 
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.
     // This is used by the calibrator to coherently account for base prediction uncertainty.
-    if let Some(se) = covariate_se {
+    if let Some(se) = problem.covariate_se {
         working_model = working_model.with_covariate_se(se.to_owned());
     }
 
     let mut beta_guess_original = warm_start_beta
-        .filter(|beta| beta.len() == p)
+        .filter(|beta| beta.len() == penalty.p)
         .map(|beta| beta.to_owned())
         .unwrap_or_else(|| {
             Coefficients::new(default_beta_guess_external(
-                p,
+                penalty.p,
                 link_function,
-                y,
-                prior_weights,
+                problem.y,
+                problem.prior_weights,
                 config.link_kind.mixture_state(),
                 config.link_kind.sas_state(),
             ))
         });
-    if let Some(lb) = coefficient_lower_bounds {
+    if let Some(lb) = penalty.coefficient_lower_bounds {
         project_coefficients_to_lower_bounds(&mut beta_guess_original.0, lb);
     }
     let initial_beta = reparam_result.qs.t().dot(beta_guess_original.as_ref());
@@ -3912,314 +3911,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     Ok((pirls_result, working_summary))
 }
 
-/// Design-matrix-native wrapper for `fit_model_for_fixed_rho`.
-/// This keeps sparse designs across higher-level API boundaries and only
-/// materializes dense storage inside PIRLS when required by the current
-/// reparameterization implementation.
-pub fn fit_model_for_fixed_rho_matrix(
-    rho: LogSmoothingParamsView<'_>,
-    x: &DesignMatrix,
-    offset: ArrayView1<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    prior_weights: ArrayView1<'_, f64>,
-    rs_original: &[Array2<f64>],
-    balanced_penalty_root: Option<&Array2<f64>>,
-    reparam_invariant: Option<&crate::construction::ReparamInvariant>,
-    p: usize,
-    config: &PirlsConfig,
-    warm_start_beta: Option<&Coefficients>,
-    coefficient_lower_bounds: Option<&Array1<f64>>,
-    linear_constraints_original: Option<&LinearInequalityConstraints>,
-    covariate_se: Option<&Array1<f64>>,
-) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
-    if let Some(x_sparse) = x.as_sparse() {
-        if matches!(
-            config.link_function(),
-            LinkFunction::Identity | LinkFunction::Logit | LinkFunction::Probit
-        ) && !config.firth_bias_reduction
-        {
-            return fit_model_for_fixed_rho_sparse_implicit(
-                rho,
-                x_sparse,
-                offset,
-                y,
-                prior_weights,
-                rs_original,
-                balanced_penalty_root,
-                reparam_invariant,
-                p,
-                config,
-                warm_start_beta,
-                coefficient_lower_bounds,
-                linear_constraints_original,
-                covariate_se,
-            );
-        }
-        let dense_arc = x.to_dense_arc();
-        let dense = dense_arc.as_ref();
-        fit_model_for_fixed_rho(
-            rho,
-            dense.view(),
-            offset,
-            y,
-            prior_weights,
-            rs_original,
-            balanced_penalty_root,
-            reparam_invariant,
-            p,
-            config,
-            warm_start_beta,
-            coefficient_lower_bounds,
-            linear_constraints_original,
-            covariate_se,
-        )
-    } else {
-        let dense_arc = x.to_dense_arc();
-        let dense = dense_arc.as_ref();
-        fit_model_for_fixed_rho(
-            rho,
-            dense.view(),
-            offset,
-            y,
-            prior_weights,
-            rs_original,
-            balanced_penalty_root,
-            reparam_invariant,
-            p,
-            config,
-            warm_start_beta,
-            coefficient_lower_bounds,
-            linear_constraints_original,
-            covariate_se,
-        )
-    }
-}
 
-fn fit_model_for_fixed_rho_sparse_implicit(
-    rho: LogSmoothingParamsView<'_>,
-    x_sparse: &SparseColMat<usize, f64>,
-    offset: ArrayView1<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    prior_weights: ArrayView1<'_, f64>,
-    rs_original: &[Array2<f64>],
-    balanced_penalty_root: Option<&Array2<f64>>,
-    reparam_invariant: Option<&crate::construction::ReparamInvariant>,
-    p: usize,
-    config: &PirlsConfig,
-    warm_start_beta: Option<&Coefficients>,
-    coefficient_lower_bounds: Option<&Array1<f64>>,
-    linear_constraints_original: Option<&LinearInequalityConstraints>,
-    covariate_se: Option<&Array1<f64>>,
-) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
-    let quad_ctx = crate::quadrature::QuadratureContext::new();
-    let lambdas = rho.exp();
-    let lambdas_slice = lambdas.as_slice_memory_order().ok_or_else(|| {
-        EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
-    })?;
-    let link_function = config.link_function();
-    use crate::construction::{
-        EngineDims, create_balanced_penalty_root, stable_reparameterization_engine,
-        stable_reparameterization_with_invariant_engine,
-    };
-    let eb_cow: Cow<'_, Array2<f64>> = if let Some(precomputed) = balanced_penalty_root {
-        Cow::Borrowed(precomputed)
-    } else {
-        let mut s_list_full = Vec::with_capacity(rs_original.len());
-        for rs in rs_original {
-            s_list_full.push(rs.t().dot(rs));
-        }
-        Cow::Owned(create_balanced_penalty_root(&s_list_full, p)?)
-    };
-    let eb: &Array2<f64> = eb_cow.as_ref();
-    let reparam_result = if let Some(invariant) = reparam_invariant {
-        stable_reparameterization_with_invariant_engine(
-            rs_original,
-            lambdas_slice,
-            EngineDims::new(p, rs_original.len()),
-            invariant,
-        )?
-    } else {
-        stable_reparameterization_engine(
-            rs_original,
-            lambdas_slice,
-            EngineDims::new(p, rs_original.len()),
-        )?
-    };
-    let reparam_result =
-        build_sparse_native_reparam_result(reparam_result, rs_original, lambdas_slice, p);
-    let x_original = DesignMatrix::from(x_sparse.clone());
-    let eb_rows = eb.nrows();
-    let e_rows = reparam_result.e_transformed.nrows();
-    let mut workspace = PirlsWorkspace::new(x_sparse.nrows(), x_sparse.ncols(), eb_rows, e_rows);
-    let solver_decision = should_use_sparse_native_pirls(
-        &mut workspace,
-        &x_original,
-        &reparam_result.s_transformed,
-        false,
-        linear_constraints_original,
-        false,
-    );
-    solver_decision.log_once();
-    if !matches!(solver_decision.path, PirlsLinearSolvePath::SparseNative) {
-        let dense_arc = x_original.to_dense_arc();
-        return fit_model_for_fixed_rho(
-            rho,
-            dense_arc.as_ref().view(),
-            offset,
-            y,
-            prior_weights,
-            rs_original,
-            balanced_penalty_root,
-            reparam_invariant,
-            p,
-            config,
-            warm_start_beta,
-            coefficient_lower_bounds,
-            linear_constraints_original,
-            covariate_se,
-        );
-    }
-    let mut working_model = GamWorkingModel::new(
-        None,
-        x_original.clone(),
-        PirlsCoordinateFrame::OriginalSparseNative,
-        offset,
-        y,
-        prior_weights,
-        reparam_result.s_transformed.clone(),
-        reparam_result.e_transformed.clone(),
-        workspace,
-        config.link_kind.clone(),
-        false,
-        None,
-        quad_ctx,
-    );
-    if let Some(se) = covariate_se {
-        working_model = working_model.with_covariate_se(se.to_owned());
-    }
-    let mut beta_guess_original = warm_start_beta
-        .filter(|beta| beta.len() == p)
-        .map(|beta| beta.to_owned())
-        .unwrap_or_else(|| {
-            Coefficients::new(default_beta_guess_external(
-                p,
-                link_function,
-                y,
-                prior_weights,
-                config.link_kind.mixture_state(),
-                config.link_kind.sas_state(),
-            ))
-        });
-    if let Some(lb) = coefficient_lower_bounds {
-        project_coefficients_to_lower_bounds(&mut beta_guess_original.0, lb);
-    }
-    let initial_beta = beta_guess_original.as_ref().clone();
-    let linear_constraints = linear_constraints_original.cloned();
-    let options = WorkingModelPirlsOptions {
-        max_iterations: config.max_iterations,
-        convergence_tolerance: config.convergence_tolerance,
-        max_step_halving: 30,
-        min_step_size: 1e-10,
-        firth_bias_reduction: false,
-        coefficient_lower_bounds: coefficient_lower_bounds.cloned(),
-        linear_constraints: linear_constraints.clone(),
-    };
-    let mut iteration_logger = |info: &WorkingModelIterationInfo| {
-        log::debug!(
-            "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} (halving {})",
-            info.iteration,
-            info.deviance,
-            info.gradient_norm,
-            info.step_size,
-            info.step_halving
-        );
-    };
-    let mut working_summary = run_working_model_pirls(
-        &mut working_model,
-        Coefficients::new(initial_beta),
-        &options,
-        &mut iteration_logger,
-    )?;
-    let final_state = working_model.into_final_state();
-    let GamModelFinalState {
-        x_transformed,
-        x_active,
-        coordinate_frame,
-        e_transformed,
-        final_mu,
-        final_weights,
-        final_z,
-        final_c,
-        final_d,
-        final_dmu_deta,
-        final_d2mu_deta2,
-        final_d3mu_deta3,
-        penalty_term,
-        ..
-    } = final_state;
-    let penalized_hessian_transformed =
-        if let Some(h_sparse) = working_summary.state.sparse_hessian.as_ref() {
-            sparse_to_dense_symmetric_upper_public(h_sparse)
-        } else {
-            working_summary.state.hessian.clone()
-        };
-    let stabilized_hessian_transformed = penalized_hessian_transformed.clone();
-    let mut edf = calculate_edf(&penalized_hessian_transformed, &e_transformed)?;
-    if !edf.is_finite() || edf.is_nan() {
-        let p = penalized_hessian_transformed.ncols() as f64;
-        let r = e_transformed.nrows() as f64;
-        edf = (p - r).max(0.0);
-    }
-    let mut status = working_summary.status;
-    if matches!(status, PirlsStatus::MaxIterationsReached) {
-        let dev_scale = working_summary.state.deviance.abs().max(1.0);
-        let dev_tol = options.convergence_tolerance * dev_scale;
-        let step_floor = options.min_step_size * 2.0;
-        if working_summary.last_deviance_change.abs() <= dev_tol
-            || working_summary.last_step_size <= step_floor
-        {
-            status = PirlsStatus::StalledAtValidMinimum;
-            working_summary.status = status;
-        }
-    }
-    let has_penalty = e_transformed.nrows() > 0;
-    if detect_logit_instability(
-        link_function,
-        has_penalty,
-        false,
-        &working_summary,
-        &final_mu,
-        &final_weights,
-        y,
-    ) {
-        status = PirlsStatus::Unstable;
-        working_summary.status = status;
-    }
-    let x_transformed = x_transformed.unwrap_or_else(|| x_active.clone());
-    let pirls_result = assemble_pirls_result(
-        &working_summary,
-        offset.view(),
-        penalized_hessian_transformed,
-        stabilized_hessian_transformed,
-        edf,
-        penalty_term,
-        &final_mu,
-        &final_weights,
-        &final_z,
-        &final_c,
-        &final_d,
-        &final_dmu_deta,
-        &final_d2mu_deta2,
-        &final_d3mu_deta3,
-        status,
-        reparam_result,
-        x_transformed,
-        x_active,
-        coordinate_frame,
-        linear_constraints,
-    );
-    Ok((pirls_result, working_summary))
-}
 
 #[derive(Clone)]
 pub struct RunPirlsOptions {
@@ -4327,19 +4019,23 @@ pub fn run_pirls<'a>(
     };
     fit_model_for_fixed_rho(
         rho,
-        x,
-        offset,
-        y,
-        prior_weights,
-        rs_original,
-        balanced_penalty_root,
-        reparam_invariant,
-        p,
+        PirlsProblem {
+            x,
+            offset,
+            y,
+            prior_weights,
+            covariate_se,
+        },
+        PenaltyConfig {
+            rs_original,
+            balanced_penalty_root,
+            reparam_invariant,
+            p,
+            coefficient_lower_bounds,
+            linear_constraints_original,
+        },
         &cfg,
         warm_start_beta,
-        coefficient_lower_bounds,
-        linear_constraints_original,
-        covariate_se,
     )
 }
 

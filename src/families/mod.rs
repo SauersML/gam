@@ -3,5 +3,6 @@ pub mod family_meta;
 pub mod gamlss;
 pub mod royston_parmar;
 pub mod sigma_link;
+pub mod strategy;
 pub mod survival;
 pub mod survival_location_scale_probit;

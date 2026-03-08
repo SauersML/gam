@@ -1873,14 +1873,21 @@ where
     let iters = std::cmp::max(1, outer_result.iterations);
     let (pirls_res, _) = pirls::fit_model_for_fixed_rho_matrix(
         LogSmoothingParamsView::new(final_rho.view()),
-        &x_fit_o,
-        offset_o.view(),
-        y_o.view(),
-        w_o.view(),
-        &rs_list,
-        Some(reml_state.balanced_penalty_root()),
-        None,
-        p,
+        pirls::PirlsProblem {
+            x: &x_fit_o,
+            offset: offset_o.view(),
+            y: y_o.view(),
+            prior_weights: w_o.view(),
+            covariate_se: None,
+        },
+        pirls::PenaltyConfig {
+            rs_original: &rs_list,
+            balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
+            reparam_invariant: None,
+            p,
+            coefficient_lower_bounds: None,
+            linear_constraints_original: fit_linear_constraints.as_ref(),
+        },
         &pirls::PirlsConfig {
             link_kind: if let Some(state) = final_mixture_state.clone() {
                 InverseLink::Mixture(state)
@@ -1896,9 +1903,6 @@ where
             ..cfg.as_pirls_config()
         },
         None,
-        None,
-        fit_linear_constraints.as_ref(),
-        None, // No SE for base external optimization
     )?;
 
     // Map beta back to original basis

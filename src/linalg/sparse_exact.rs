@@ -19,6 +19,20 @@ pub struct SparseExactFactor {
     logdet: f64,
 }
 
+impl crate::matrix::FactorizedSystem for SparseExactFactor {
+    fn solve(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
+        solve_sparse_spd(self, rhs).map_err(|e| e.to_string())
+    }
+
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
+        solve_sparse_spd_multi(self, rhs).map_err(|e| e.to_string())
+    }
+
+    fn logdet(&self) -> f64 {
+        self.logdet
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct SparseTraceWorkspace {
     selected_block_inv_cache: BTreeMap<(usize, usize), Array2<f64>>,

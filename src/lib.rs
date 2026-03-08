@@ -6,6 +6,8 @@ pub mod inference;
 pub mod linalg;
 pub mod solver;
 pub mod terms;
+#[cfg(test)]
+pub mod testing;
 pub mod types;
 
 pub use inference::{alo, data, diagnostics, generative, hmc, predict, probability, quadrature};

@@ -837,7 +837,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
         // Block 1: threshold eta_t enters q linearly with dq/deta_t = -1/sigma.
         let dq_t = sigma.mapv(|s| -1.0 / s.max(1e-12));
         let grad_eta_t = &d1_q * &dq_t;
-        let h_eta_t = &d2_q * &dq_t.mapv(|v| v * v);
+        let h_eta_t = -(&d2_q * &dq_t.mapv(|v| v * v));
         let grad_t = self.x_threshold.t().dot(&grad_eta_t);
         let hess_t = xt_diag_x(&self.x_threshold, &h_eta_t);
 
@@ -860,7 +860,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                 }),
         );
         let grad_eta_ls = &d1_q * &dq_ls;
-        let h_eta_ls = &d2_q * &dq_ls.mapv(|v| v * v) + &(&d1_q * &d2q_ls);
+        let h_eta_ls = -(&d2_q * &dq_ls.mapv(|v| v * v) + &(&d1_q * &d2q_ls));
         let grad_ls = self.x_log_sigma.t().dot(&grad_eta_ls);
         let hess_ls = xt_diag_x(&self.x_log_sigma, &h_eta_ls);
 
@@ -880,7 +880,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
         ];
         if let Some(x_w) = self.x_link_wiggle.as_ref() {
             let grad_w = x_w.t().dot(&d1_q);
-            let hess_w = xt_diag_x(x_w, &d2_q);
+            let hess_w = xt_diag_x(x_w, &(-&d2_q));
             block_working_sets.push(BlockWorkingSet::ExactNewton {
                 gradient: grad_w,
                 hessian: hess_w,
@@ -1054,8 +1054,8 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                 let dq_t = sigma.mapv(|s| -1.0 / s.max(1e-12));
                 let d_eta_t = self.x_threshold.dot(d_beta);
                 // Since q(eta_t) is linear in eta_t, only dq_t is nonzero:
-                // dH[u] = X^T diag( d³ℓ/dq³ * (dq_t)^3 * u_eta ) X.
-                let d_h_eta = &d3_q * &dq_t.mapv(|v| v * v * v) * &d_eta_t;
+                // H = -d²ℓ/deta², so dH[u] picks up the leading minus too.
+                let d_h_eta = -(&d3_q * &dq_t.mapv(|v| v * v * v) * &d_eta_t);
                 let d_h = xt_diag_x(&self.x_threshold, &d_h_eta);
                 Ok(Some(d_h))
             }
@@ -1097,12 +1097,13 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                         }),
                 );
                 let d_eta_ls = self.x_log_sigma.dot(d_beta);
-                // Full third-order chain rule:
-                // d/deta [d²ℓ/deta²] = d³ℓ/dq³ (dq)^3 + 3 d²ℓ/dq² dq d²q + dℓ/dq d³q.
+                // Full third-order chain rule for H = -d²ℓ/deta²:
+                // dH/deta = -[ d³ℓ/dq³ (dq)^3 + 3 d²ℓ/dq² dq d²q + dℓ/dq d³q ].
                 let d_h_eta = (&d3_q * &dq.mapv(|v| v * v * v)
                     + &(&d2_q * &(3.0 * &dq * &d2q))
                     + &(&d1_q * &d3q))
                     * &d_eta_ls;
+                let d_h_eta = -d_h_eta;
                 let d_h = xt_diag_x(&self.x_log_sigma, &d_h_eta);
                 Ok(Some(d_h))
             }
@@ -1119,7 +1120,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
                     ));
                 }
                 let d_eta_w = x_w.dot(d_beta);
-                let d_h_eta = &d3_q * &d_eta_w;
+                let d_h_eta = -(&d3_q * &d_eta_w);
                 let d_h = xt_diag_x(x_w, &d_h_eta);
                 Ok(Some(d_h))
             }
@@ -1914,7 +1915,44 @@ mod tests {
         state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
     };
     use crate::types::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
-    use ndarray::array;
+    use ndarray::{Array1, array};
+
+    fn survival_exact_newton_test_family() -> SurvivalLocationScaleProbitFamily {
+        SurvivalLocationScaleProbitFamily {
+            n: 3,
+            y: array![1.0, 0.0, 1.0],
+            w: array![1.0, 0.8, 1.2],
+            sigma_min: 0.3,
+            sigma_max: 2.5,
+            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+            derivative_guard: 1e-8,
+            derivative_softness: 1e-6,
+            x_time_entry: array![[1.0], [1.0], [1.0]],
+            x_time_exit: array![[1.2], [0.9], [1.4]],
+            x_time_deriv: array![[1.0], [1.0], [1.0]],
+            offset_time_deriv: array![0.5, 0.7, 0.6],
+            x_threshold: array![[1.0], [0.4], [-0.6]],
+            x_log_sigma: array![[1.0], [-0.3], [0.5]],
+            x_link_wiggle: None,
+        }
+    }
+
+    fn survival_exact_newton_test_states(beta_t: f64) -> Vec<ParameterBlockState> {
+        vec![
+            ParameterBlockState {
+                beta: array![0.2],
+                eta: array![0.1, 0.35, -0.2, 0.25, 0.6, 0.15, 0.5, 0.7, 0.6],
+            },
+            ParameterBlockState {
+                beta: array![beta_t],
+                eta: array![beta_t, 0.4 * beta_t, -0.6 * beta_t],
+            },
+            ParameterBlockState {
+                beta: array![-0.15],
+                eta: array![-0.15, 0.045, -0.075],
+            },
+        ]
+    }
 
     #[test]
     fn identified_time_block_zeroes_anchor_row() {
@@ -2202,6 +2240,62 @@ mod tests {
         assert_eq!(r_high, 0.0);
         assert_eq!(dr_high, 0.0);
         assert_eq!(ddr_high, 0.0);
+    }
+
+    #[test]
+    fn threshold_exact_newton_hessian_matches_negative_gradient_jacobian() {
+        let family = survival_exact_newton_test_family();
+        let beta_t = 0.35;
+        let states = survival_exact_newton_test_states(beta_t);
+        let eval = family.evaluate(&states).expect("evaluate at center");
+        let BlockWorkingSet::ExactNewton {
+            gradient,
+            hessian,
+        } = &eval.block_working_sets[SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
+        else {
+            panic!("threshold block should use exact newton");
+        };
+
+        let eps = 1e-6;
+        let eval_plus = family
+            .evaluate(&survival_exact_newton_test_states(beta_t + eps))
+            .expect("evaluate at beta + eps");
+        let eval_minus = family
+            .evaluate(&survival_exact_newton_test_states(beta_t - eps))
+            .expect("evaluate at beta - eps");
+        let grad_plus = match &eval_plus.block_working_sets
+            [SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
+        {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("threshold block should use exact newton"),
+        };
+        let grad_minus = match &eval_minus.block_working_sets
+            [SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
+        {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("threshold block should use exact newton"),
+        };
+        let fd_neg_grad_jac = -(grad_plus - grad_minus) / (2.0 * eps);
+
+        assert!(
+            (gradient[0]).is_finite() && hessian[[0, 0]].is_finite(),
+            "non-finite threshold exact-newton quantities: grad={} hess={}",
+            gradient[0],
+            hessian[[0, 0]]
+        );
+        assert_eq!(
+            hessian[[0, 0]].signum(),
+            fd_neg_grad_jac.signum(),
+            "threshold Hessian sign mismatch: analytic={} fd={}",
+            hessian[[0, 0]],
+            fd_neg_grad_jac
+        );
+        assert!(
+            (hessian[[0, 0]] - fd_neg_grad_jac).abs() <= 1e-5,
+            "threshold Hessian mismatch: analytic={} fd={}",
+            hessian[[0, 0]],
+            fd_neg_grad_jac
+        );
     }
 
     #[test]

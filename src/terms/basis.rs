@@ -1580,10 +1580,16 @@ pub fn create_difference_penalty_matrix(
             let nrows = d.nrows();
             for i in 0..nrows {
                 let span = g[i + o] - g[i];
-                if span.abs() > 1e-12 {
-                    let mut row = d.row_mut(i);
-                    row /= span;
+                if span.abs() <= 1e-12 {
+                    return Err(BasisError::InvalidKnotVector(format!(
+                        "singular divided-difference span at order {o}, row {i}: Greville abscissae g[{}]={:.6e} and g[{i}]={:.6e} collapse",
+                        i + o,
+                        g[i + o],
+                        g[i]
+                    )));
                 }
+                let mut row = d.row_mut(i);
+                row /= span;
             }
         }
     }
@@ -1685,14 +1691,6 @@ pub struct ThinPlateSplineBasis {
     pub dimension: usize,
 }
 
-impl ThinPlateSplineBasis {
-    /// Returns the two standard TPS penalties for double-penalty REML:
-    /// `[S_bending, I_ridge]`.
-    pub fn penalty_matrices(&self) -> Vec<Array2<f64>> {
-        vec![self.penalty_bending.clone(), self.penalty_ridge.clone()]
-    }
-}
-
 /// Matérn smoothness parameter `nu` (half-integer variants with closed forms).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum MaternNu {
@@ -1736,12 +1734,6 @@ pub struct DuchonSplineBasis {
     pub num_polynomial_basis: usize,
     pub dimension: usize,
     pub nullspace_order: DuchonNullspaceOrder,
-}
-
-impl DuchonSplineBasis {
-    pub fn penalty_matrices(&self) -> Vec<Array2<f64>> {
-        vec![self.penalty_kernel.clone(), self.penalty_ridge.clone()]
-    }
 }
 
 /// Which knot strategy to use for 1D B-spline bases.
@@ -3401,6 +3393,34 @@ fn append_intercept_to_transform(transform: &Array2<f64>) -> Array2<f64> {
     out
 }
 
+fn project_penalty_matrix(matrix: &Array2<f64>, transform: Option<&Array2<f64>>) -> Array2<f64> {
+    let projected = if let Some(z) = transform {
+        let zt_s = z.t().dot(matrix);
+        zt_s.dot(z)
+    } else {
+        matrix.clone()
+    };
+    symmetrize(&projected)
+}
+
+fn normalize_penalty_candidate(
+    matrix: Array2<f64>,
+    nullspace_dim_hint: usize,
+    source: PenaltySource,
+) -> PenaltyCandidate {
+    let (matrix, normalization_scale) = if matrix.iter().all(|v| v.abs() <= 1e-12) {
+        (matrix, 1.0)
+    } else {
+        normalize_penalty(&matrix)
+    };
+    PenaltyCandidate {
+        matrix,
+        nullspace_dim_hint,
+        source,
+        normalization_scale,
+    }
+}
+
 pub fn build_matern_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
     collocation_weights: Option<ArrayView1<'_, f64>>,
@@ -4401,6 +4421,24 @@ fn build_matern_operator_penalty_candidates(
     ))
 }
 
+fn build_matern_double_penalty_candidates(
+    spline: &MaternSplineBasis,
+    full_transform: Option<&Array2<f64>>,
+) -> Vec<PenaltyCandidate> {
+    vec![
+        normalize_penalty_candidate(
+            project_penalty_matrix(&spline.penalty_kernel, full_transform),
+            0,
+            PenaltySource::Primary,
+        ),
+        normalize_penalty_candidate(
+            project_penalty_matrix(&spline.penalty_ridge, full_transform),
+            0,
+            PenaltySource::DoublePenaltyNullspace,
+        ),
+    ]
+}
+
 fn build_duchon_operator_penalty_candidates(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
@@ -4605,30 +4643,7 @@ pub fn build_matern_basis_with_workspace(
         m.basis.clone()
     };
     let candidates = if spec.double_penalty {
-        vec![
-            PenaltyCandidate {
-                matrix: if let Some(transform) = full_transform.as_ref() {
-                    let zt_s = transform.t().dot(&m.penalty_kernel);
-                    zt_s.dot(transform)
-                } else {
-                    m.penalty_kernel.clone()
-                },
-                nullspace_dim_hint: 0,
-                source: PenaltySource::Primary,
-                normalization_scale: 1.0,
-            },
-            PenaltyCandidate {
-                matrix: if let Some(transform) = full_transform.as_ref() {
-                    let zt_s = transform.t().dot(&m.penalty_ridge);
-                    zt_s.dot(transform)
-                } else {
-                    m.penalty_ridge.clone()
-                },
-                nullspace_dim_hint: 0,
-                source: PenaltySource::DoublePenaltyNullspace,
-                normalization_scale: 1.0,
-            },
-        ]
+        build_matern_double_penalty_candidates(&m, full_transform.as_ref())
     } else {
         build_matern_operator_penalty_candidates(
             centers.view(),
@@ -9632,11 +9647,6 @@ mod tests {
         let xs = [0.35, 0.8, 1.4, 2.2];
         let h = 1e-6;
         for &x in &xs {
-            let mut i_plus = vec![0.0; n_i];
-            let mut i_minus = vec![0.0; n_i];
-            evaluate_ispline_scalar(x + h, knots.view(), degree, &mut i_plus).expect("I(x+h)");
-            evaluate_ispline_scalar(x - h, knots.view(), degree, &mut i_minus).expect("I(x-h)");
-
             let mut db = vec![0.0; n_i];
             evaluate_bspline_derivative_scalar(x, knots.view(), bs_degree, &mut db).expect("B'(x)");
             let mut d_i = vec![0.0; n_i];
@@ -9646,17 +9656,17 @@ mod tests {
                 d_i[j] = running;
             }
 
-            for j in 0..n_i {
-                let fd = (i_plus[j] - i_minus[j]) / (2.0 * h);
-                assert_eq!(
-                    d_i[j].signum(),
-                    fd.signum(),
-                    "sign mismatch at x={x}, j={j}: analytic={} fd={}",
-                    d_i[j],
-                    fd
-                );
-                assert_abs_diff_eq!(fd, d_i[j], epsilon = 2e-5);
-            }
+            crate::assert_central_difference_array!(
+                x,
+                h,
+                |x_eval| {
+                    let mut i_v = vec![0.0; n_i];
+                    evaluate_ispline_scalar(x_eval, knots.view(), degree, &mut i_v).unwrap();
+                    i_v
+                },
+                d_i,
+                2e-5
+            );
         }
     }
 
@@ -10104,8 +10114,6 @@ mod tests {
         let degree = 3;
         let num_basis = knots.len() - degree - 1;
         let mut d1 = vec![0.0; num_basis];
-        let mut d1_plus = vec![0.0; num_basis];
-        let mut d1_minus = vec![0.0; num_basis];
         let mut d2 = vec![0.0; num_basis];
 
         let x = 0.37;
@@ -10113,25 +10121,20 @@ mod tests {
 
         evaluate_bspline_derivative_scalar(x, knots.view(), degree, &mut d1)
             .expect("first derivative");
-        evaluate_bspline_derivative_scalar(x + h, knots.view(), degree, &mut d1_plus)
-            .expect("first derivative +h");
-        evaluate_bspline_derivative_scalar(x - h, knots.view(), degree, &mut d1_minus)
-            .expect("first derivative -h");
         evaluate_bspline_second_derivative_scalar(x, knots.view(), degree, &mut d2)
             .expect("second derivative");
 
-        let tol = 1e-3;
-        for i in 0..num_basis {
-            let fd = (d1_plus[i] - d1_minus[i]) / (2.0 * h);
-            assert_eq!(d2[i].signum(), fd.signum());
-            assert!(
-                (d2[i] - fd).abs() < tol,
-                "second derivative mismatch at {}: analytic={}, fd={}",
-                i,
-                d2[i],
-                fd
-            );
-        }
+        crate::assert_central_difference_array!(
+            x,
+            h,
+            |x_eval| {
+                let mut v = vec![0.0; num_basis];
+                evaluate_bspline_derivative_scalar(x_eval, knots.view(), degree, &mut v).unwrap();
+                v
+            },
+            d2,
+            1e-3
+        );
     }
 
     #[test]
@@ -10139,32 +10142,26 @@ mod tests {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
         let degree = 3;
         let num_basis = knots.len() - degree - 1;
-        let mut d2_plus = vec![0.0; num_basis];
-        let mut d2_minus = vec![0.0; num_basis];
         let mut d3 = vec![0.0; num_basis];
 
         let x = 0.37;
         let h = 1e-4;
 
-        evaluate_bspline_second_derivative_scalar(x + h, knots.view(), degree, &mut d2_plus)
-            .expect("second derivative +h");
-        evaluate_bspline_second_derivative_scalar(x - h, knots.view(), degree, &mut d2_minus)
-            .expect("second derivative -h");
         evaluate_bspline_third_derivative_scalar(x, knots.view(), degree, &mut d3)
             .expect("third derivative");
 
-        let tol = 5e-3;
-        for i in 0..num_basis {
-            let fd = (d2_plus[i] - d2_minus[i]) / (2.0 * h);
-            assert_eq!(d3[i].signum(), fd.signum());
-            assert!(
-                (d3[i] - fd).abs() < tol,
-                "third derivative mismatch at {}: analytic={}, fd={}",
-                i,
-                d3[i],
-                fd
-            );
-        }
+        crate::assert_central_difference_array!(
+            x,
+            h,
+            |x_eval| {
+                let mut v = vec![0.0; num_basis];
+                evaluate_bspline_second_derivative_scalar(x_eval, knots.view(), degree, &mut v)
+                    .unwrap();
+                v
+            },
+            d3,
+            5e-3
+        );
     }
 
     #[test]
@@ -10172,32 +10169,26 @@ mod tests {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0, 1.0, 1.0];
         let degree = 4;
         let num_basis = knots.len() - degree - 1;
-        let mut d3_plus = vec![0.0; num_basis];
-        let mut d3_minus = vec![0.0; num_basis];
         let mut d4 = vec![0.0; num_basis];
 
         let x = 0.47;
         let h = 1e-4;
 
-        evaluate_bspline_third_derivative_scalar(x + h, knots.view(), degree, &mut d3_plus)
-            .expect("third derivative +h");
-        evaluate_bspline_third_derivative_scalar(x - h, knots.view(), degree, &mut d3_minus)
-            .expect("third derivative -h");
         evaluate_bspline_fourth_derivative_scalar(x, knots.view(), degree, &mut d4)
             .expect("fourth derivative");
 
-        let tol = 3e-2;
-        for i in 0..num_basis {
-            let fd = (d3_plus[i] - d3_minus[i]) / (2.0 * h);
-            assert_eq!(d4[i].signum(), fd.signum());
-            assert!(
-                (d4[i] - fd).abs() < tol,
-                "fourth derivative mismatch at {}: analytic={}, fd={}",
-                i,
-                d4[i],
-                fd
-            );
-        }
+        crate::assert_central_difference_array!(
+            x,
+            h,
+            |x_eval| {
+                let mut v = vec![0.0; num_basis];
+                evaluate_bspline_third_derivative_scalar(x_eval, knots.view(), degree, &mut v)
+                    .unwrap();
+                v
+            },
+            d4,
+            3e-2
+        );
     }
 
     #[test]
