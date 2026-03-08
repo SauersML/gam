@@ -2,6 +2,7 @@ pub mod custom_family;
 pub mod family_meta;
 pub mod gamlss;
 pub mod royston_parmar;
+pub mod scale_design;
 pub mod sigma_link;
 pub mod strategy;
 pub mod survival;

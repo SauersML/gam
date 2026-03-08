@@ -21,8 +21,9 @@ use gam::estimate::{
 use gam::families::family_meta::{
     family_to_link, family_to_string, is_binomial_family, pretty_family_name,
 };
-use gam::families::sigma_link::{
-    bounded_sigma_and_deriv_from_eta as sigma_and_deriv_from_eta,
+use gam::families::scale_design::{
+    ScaleDeviationTransform, apply_scale_deviation_transform, build_scale_deviation_transform,
+    infer_non_intercept_start,
 };
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BinomialLocationScaleWiggleWorkflowConfig,
@@ -1103,6 +1104,17 @@ fn run_fit_with_predict_noise(
                 SavedFitSummary::from_blockwise_fit(&fit)?
                     .rescaled_gaussian_location_scale(response_scale, y.len())?,
             );
+            let gaussian_noise_transform = build_scale_deviation_transform(
+                &solved.mean_design.design,
+                &solved.noise_design.design,
+                &Array1::ones(y.len()),
+                solved
+                    .noise_design
+                    .intercept_range
+                    .end
+                    .min(solved.noise_design.design.ncols()),
+            )
+            .map_err(|e| format!("failed to encode Gaussian noise transform: {e}"))?;
             let model = build_location_scale_saved_model(
                 formula_text.to_string(),
                 FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
@@ -1116,6 +1128,7 @@ fn run_fit_with_predict_noise(
                 fit.block_states.get(1).map(|b| b.beta.to_vec()),
                 None,
                 None,
+                Some(&gaussian_noise_transform),
             );
             write_model_json(out, &model)?;
         }
@@ -1167,8 +1180,6 @@ fn run_fit_with_predict_noise(
             y: y.clone(),
             weights: Array1::ones(y.len()),
             link_kind: location_scale_link_kind.clone(),
-            sigma_min: 1.0,
-            sigma_max: 2.0,
             threshold_spec: mean_spec.clone(),
             log_sigma_spec: noise_spec.clone(),
         },
@@ -1234,6 +1245,18 @@ fn run_fit_with_predict_noise(
             fit.covariance_conditional.clone(),
             SavedFitSummary::from_blockwise_fit(&fit)?,
         );
+        let binomial_noise_transform = build_scale_deviation_transform(
+            &solved.fit.mean_design.design,
+            &solved.fit.noise_design.design,
+            &Array1::ones(y.len()),
+            solved
+                .fit
+                .noise_design
+                .intercept_range
+                .end
+                .min(solved.fit.noise_design.design.ncols()),
+        )
+        .map_err(|e| format!("failed to encode binomial noise transform: {e}"))?;
         let mut model = build_location_scale_saved_model(
             formula_text.to_string(),
             FAMILY_BINOMIAL_LOCATION_SCALE.to_string(),
@@ -1247,6 +1270,7 @@ fn run_fit_with_predict_noise(
             fit.block_states.get(1).map(|b| b.beta.to_vec()),
             None,
             None,
+            Some(&binomial_noise_transform),
         );
         match &location_scale_link_kind {
             InverseLink::Sas(state) => {
@@ -1433,8 +1457,29 @@ fn run_predict_survival(
         let survival_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
         let eta_t =
             DesignMatrix::Dense(cov_design.design.clone()).matrix_vector_multiply(&beta_threshold);
-        let eta_ls =
-            DesignMatrix::Dense(cov_design.design.clone()).matrix_vector_multiply(&beta_log_sigma);
+        let survival_noise_transform = scale_transform_from_payload(
+            &model.survival_noise_projection,
+            &model.survival_noise_center,
+            &model.survival_noise_scale,
+            model.survival_noise_non_intercept_start,
+        )?;
+        let mut survival_primary_design = Array2::<f64>::zeros((
+            n,
+            time_build.x_exit_time.ncols() + cov_design.design.ncols(),
+        ));
+        survival_primary_design
+            .slice_mut(s![.., 0..time_build.x_exit_time.ncols()])
+            .assign(&time_build.x_exit_time);
+        survival_primary_design
+            .slice_mut(s![.., time_build.x_exit_time.ncols()..])
+            .assign(&cov_design.design);
+        let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
+            apply_scale_deviation_transform(&survival_primary_design, &cov_design.design, transform)?
+        } else {
+            cov_design.design.clone()
+        };
+        let eta_ls = DesignMatrix::Dense(prepared_sigma_design.clone())
+            .matrix_vector_multiply(&beta_log_sigma);
         let sigma = eta_ls.mapv(f64::exp);
         let beta_link_wiggle = model
             .beta_wiggle
@@ -1456,11 +1501,9 @@ fn run_predict_survival(
             eta_time_offset_exit: eta_offset_exit.clone(),
             x_threshold: DesignMatrix::Dense(cov_design.design.clone()),
             eta_threshold_offset: Array1::zeros(n),
-            x_log_sigma: DesignMatrix::Dense(cov_design.design.clone()),
+            x_log_sigma: DesignMatrix::Dense(prepared_sigma_design),
             eta_log_sigma_offset: Array1::zeros(n),
             x_link_wiggle: x_link_wiggle.clone(),
-            sigma_min: 1.0,
-            sigma_max: 2.0,
             inverse_link: survival_inverse_link.clone(),
         };
         let fit_stub = gam::survival_location_scale::SurvivalLocationScaleFitResult {
@@ -1706,8 +1749,19 @@ fn run_predict_gaussian_location_scale(
             design_noise.design.ncols()
         ));
     }
+    let noise_transform = scale_transform_from_payload(
+        &model.noise_projection,
+        &model.noise_center,
+        &model.noise_scale,
+        model.noise_non_intercept_start,
+    )?;
+    let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
+        apply_scale_deviation_transform(&design_mu.design, &design_noise.design, transform)?
+    } else {
+        design_noise.design.clone()
+    };
     let eta_mu = design_mu.design.dot(&beta_mu);
-    let eta_noise = design_noise.design.dot(&beta_noise);
+    let eta_noise = prepared_noise_design.dot(&beta_noise);
     let sigma = eta_noise.mapv(f64::exp);
     let mut mean_lo = None;
     let mut mean_hi = None;
@@ -1788,8 +1842,19 @@ fn run_predict_binomial_location_scale(
             design_noise.design.ncols()
         ));
     }
+    let noise_transform = scale_transform_from_payload(
+        &model.noise_projection,
+        &model.noise_center,
+        &model.noise_scale,
+        model.noise_non_intercept_start,
+    )?;
+    let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
+        apply_scale_deviation_transform(&design_t.design, &design_noise.design, transform)?
+    } else {
+        design_noise.design.clone()
+    };
     let eta_t = design_t.design.dot(&beta_t);
-    let eta_noise = design_noise.design.dot(&beta_noise);
+    let eta_noise = prepared_noise_design.dot(&beta_noise);
     let saved_loc_link = saved_link_kind.ok_or_else(|| {
         "binomial-location-scale model is missing link state/metadata".to_string()
     })?;
@@ -3475,8 +3540,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 age_exit: age_exit.clone(),
                 event_target: event_target.mapv(f64::from),
                 weights: weights.clone(),
-                sigma_min: 0.05,
-                sigma_max: 20.0,
                 inverse_link,
                 derivative_guard: 0.0,
                 derivative_softness: 1e-6,
@@ -3694,7 +3757,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 .map_err(|e| format!("survival probit-location-scale pilot fit failed: {e}"))?;
             let eta_t = cov_design.design.dot(&pilot.beta_threshold);
             let eta_ls = cov_design.design.dot(&pilot.beta_log_sigma);
-            let (sigma, _ds) = sigma_and_deriv_from_eta(eta_ls.view(), 0.05, 20.0);
+            let sigma = eta_ls.mapv(f64::exp);
             let q_seed = Array1::from_iter(
                 eta_t
                     .iter()
@@ -3784,6 +3847,36 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_beta_time = Some(fit.beta_time.to_vec());
             payload.survival_beta_threshold = Some(fit.beta_threshold.to_vec());
             payload.survival_beta_log_sigma = Some(fit.beta_log_sigma.to_vec());
+            let mut survival_primary_design = Array2::<f64>::zeros((
+                n,
+                time_build.x_exit_time.ncols() + cov_design.design.ncols(),
+            ));
+            survival_primary_design
+                .slice_mut(s![.., 0..time_build.x_exit_time.ncols()])
+                .assign(&time_build.x_exit_time);
+            survival_primary_design
+                .slice_mut(s![.., time_build.x_exit_time.ncols()..])
+                .assign(&cov_design.design);
+            let survival_noise_transform = build_scale_deviation_transform(
+                &survival_primary_design,
+                &cov_design.design,
+                &weights,
+                infer_non_intercept_start(&cov_design.design, &weights),
+            )
+            .map_err(|e| format!("failed to encode survival noise transform: {e}"))?;
+            payload.survival_noise_projection = Some(
+                survival_noise_transform
+                    .projection_coef
+                    .rows()
+                    .into_iter()
+                    .map(|row| row.to_vec())
+                    .collect(),
+            );
+            payload.survival_noise_center =
+                Some(survival_noise_transform.weighted_column_mean.to_vec());
+            payload.survival_noise_scale = Some(survival_noise_transform.rescale.to_vec());
+            payload.survival_noise_non_intercept_start =
+                Some(survival_noise_transform.non_intercept_start);
             payload.survival_distribution =
                 Some(inverse_link_to_saved_string(&fitted_inverse_link));
             payload.training_headers = Some(ds.headers.clone());
@@ -4389,8 +4482,19 @@ fn run_generate_gaussian_location_scale(
     if beta_mu.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols() {
         return Err("location-scale model/design dimension mismatch".to_string());
     }
+    let noise_transform = scale_transform_from_payload(
+        &model.noise_projection,
+        &model.noise_center,
+        &model.noise_scale,
+        model.noise_non_intercept_start,
+    )?;
     let mean = design.design.dot(&beta_mu);
-    let eta_noise = design_noise.design.dot(&beta_noise);
+    let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
+        apply_scale_deviation_transform(&design.design, &design_noise.design, transform)?
+    } else {
+        design_noise.design.clone()
+    };
+    let eta_noise = prepared_noise_design.dot(&beta_noise);
     let sigma = eta_noise.mapv(f64::exp);
     Ok(gam::generative::GenerativeSpec {
         mean,
@@ -4443,11 +4547,20 @@ fn run_generate_binomial_location_scale(
     if beta_t.len() != design.design.ncols() || beta_noise.len() != design_noise.design.ncols() {
         return Err("location-scale model/design dimension mismatch".to_string());
     }
-    let sigma_min = model.sigma_min.unwrap_or(0.05);
-    let sigma_max = model.sigma_max.unwrap_or(20.0);
+    let noise_transform = scale_transform_from_payload(
+        &model.noise_projection,
+        &model.noise_center,
+        &model.noise_scale,
+        model.noise_non_intercept_start,
+    )?;
     let eta_t = design.design.dot(&beta_t);
-    let eta_noise = design_noise.design.dot(&beta_noise);
-    let sigma = sigma_and_deriv_from_eta(eta_noise.view(), sigma_min, sigma_max).0;
+    let prepared_noise_design = if let Some(transform) = noise_transform.as_ref() {
+        apply_scale_deviation_transform(&design.design, &design_noise.design, transform)?
+    } else {
+        design_noise.design.clone()
+    };
+    let eta_noise = prepared_noise_design.dot(&beta_noise);
+    let sigma = eta_noise.mapv(f64::exp);
     let q0 = Array1::from_iter(
         eta_t
             .iter()
@@ -5220,6 +5333,7 @@ fn build_location_scale_saved_model(
     beta_noise: Option<Vec<f64>>,
     sigma_min: Option<f64>,
     sigma_max: Option<f64>,
+    noise_transform: Option<&ScaleDeviationTransform>,
 ) -> SavedModel {
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -5242,10 +5356,62 @@ fn build_location_scale_saved_model(
     payload.beta_noise = beta_noise;
     payload.sigma_min = sigma_min;
     payload.sigma_max = sigma_max;
+    if let Some(transform) = noise_transform {
+        payload.noise_projection = Some(
+            transform
+                .projection_coef
+                .rows()
+                .into_iter()
+                .map(|row| row.to_vec())
+                .collect(),
+        );
+        payload.noise_center = Some(transform.weighted_column_mean.to_vec());
+        payload.noise_scale = Some(transform.rescale.to_vec());
+        payload.noise_non_intercept_start = Some(transform.non_intercept_start);
+    }
     payload.training_headers = Some(training_headers);
     payload.resolved_term_spec = Some(resolved_term_spec);
     payload.resolved_term_spec_noise = Some(resolved_term_spec_noise);
     SavedModel::from_payload(payload)
+}
+
+fn scale_transform_from_payload(
+    projection: &Option<Vec<Vec<f64>>>,
+    center: &Option<Vec<f64>>,
+    scale: &Option<Vec<f64>>,
+    non_intercept_start: Option<usize>,
+) -> Result<Option<ScaleDeviationTransform>, String> {
+    let (Some(projection), Some(center), Some(scale), Some(non_intercept_start)) = (
+        projection.as_ref(),
+        center.as_ref(),
+        scale.as_ref(),
+        non_intercept_start,
+    ) else {
+        return Ok(None);
+    };
+    let rows = projection.len();
+    let cols = center.len();
+    if cols != scale.len() {
+        return Err("saved scale transform center/scale length mismatch".to_string());
+    }
+    if rows == 0 && cols > 0 {
+        return Err("saved scale transform projection has zero rows".to_string());
+    }
+    let mut mat = Array2::<f64>::zeros((rows, cols));
+    for (i, row) in projection.iter().enumerate() {
+        if row.len() != cols {
+            return Err("saved scale transform projection width mismatch".to_string());
+        }
+        for (j, &value) in row.iter().enumerate() {
+            mat[[i, j]] = value;
+        }
+    }
+    Ok(Some(ScaleDeviationTransform {
+        projection_coef: mat,
+        weighted_column_mean: Array1::from_vec(center.clone()),
+        rescale: Array1::from_vec(scale.clone()),
+        non_intercept_start,
+    }))
 }
 
 fn core_saved_fit_result(
@@ -8292,11 +8458,11 @@ mod tests {
         classify_cli_error, collect_linear_smooth_overlap_warnings,
         collect_spatial_smooth_usage_warnings, compute_probit_q0_from_eta, core_saved_fit_result,
         evaluate_survival_baseline, parse_duchon_order, parse_duchon_power, parse_formula,
-        parse_link_choice, parse_surv_response,
-        parse_survival_baseline_config, parse_survival_inverse_link,
-        parse_survival_time_basis_config, pretty_family_name, saved_probit_wiggle_derivative_q0,
-        saved_probit_wiggle_design, summarize_wiggle_domain, survival_probability_from_eta,
-        write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
+        parse_link_choice, parse_surv_response, parse_survival_baseline_config,
+        parse_survival_inverse_link, parse_survival_time_basis_config, pretty_family_name,
+        saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design, summarize_wiggle_domain,
+        survival_probability_from_eta, write_gaussian_location_scale_prediction_csv,
+        write_survival_prediction_csv,
     };
     use csv::StringRecord;
     use gam::basis::{
@@ -9509,6 +9675,10 @@ mod tests {
             beta_noise: None,
             sigma_min: None,
             sigma_max: None,
+            noise_projection: None,
+            noise_center: None,
+            noise_scale: None,
+            noise_non_intercept_start: None,
             joint_beta_link: None,
             joint_knot_range: None,
             joint_knot_vector: None,
@@ -9538,6 +9708,10 @@ mod tests {
             survival_beta_time: None,
             survival_beta_threshold: None,
             survival_beta_log_sigma: None,
+            survival_noise_projection: None,
+            survival_noise_center: None,
+            survival_noise_scale: None,
+            survival_noise_non_intercept_start: None,
             survival_distribution: None,
             training_headers: None,
             resolved_term_spec: None,
@@ -9648,7 +9822,8 @@ mod tests {
     fn probit_q0_helper_matches_manual_threshold_over_sigma() {
         let eta_t = array![0.8, -0.4, 1.2];
         let eta_ls = array![-1.0, 0.0, 1.5];
-        let q0 = compute_probit_q0_from_eta(eta_t.view(), eta_ls.view()).expect("compute probit q0");
+        let q0 =
+            compute_probit_q0_from_eta(eta_t.view(), eta_ls.view()).expect("compute probit q0");
         for i in 0..q0.len() {
             let sigma = eta_ls[i].exp().max(1e-12);
             let expected = -eta_t[i] / sigma;
@@ -9699,6 +9874,10 @@ mod tests {
             beta_noise: None,
             sigma_min: None,
             sigma_max: None,
+            noise_projection: None,
+            noise_center: None,
+            noise_scale: None,
+            noise_non_intercept_start: None,
             joint_beta_link: None,
             joint_knot_range: None,
             joint_knot_vector: None,
@@ -9728,6 +9907,10 @@ mod tests {
             survival_beta_time: None,
             survival_beta_threshold: None,
             survival_beta_log_sigma: None,
+            survival_noise_projection: None,
+            survival_noise_center: None,
+            survival_noise_scale: None,
+            survival_noise_non_intercept_start: None,
             survival_distribution: None,
             training_headers: None,
             resolved_term_spec: None,
@@ -9759,6 +9942,10 @@ mod tests {
             beta_noise: None,
             sigma_min: None,
             sigma_max: None,
+            noise_projection: None,
+            noise_center: None,
+            noise_scale: None,
+            noise_non_intercept_start: None,
             joint_beta_link: None,
             joint_knot_range: None,
             joint_knot_vector: None,
@@ -9788,6 +9975,10 @@ mod tests {
             survival_beta_time: None,
             survival_beta_threshold: None,
             survival_beta_log_sigma: None,
+            survival_noise_projection: None,
+            survival_noise_center: None,
+            survival_noise_scale: None,
+            survival_noise_non_intercept_start: None,
             survival_distribution: None,
             training_headers: None,
             resolved_term_spec: None,

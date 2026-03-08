@@ -1260,7 +1260,8 @@ impl<'a> RemlState<'a> {
                 if !(at_lower.is_empty() && at_upper.is_empty()) {
                     log::debug!(
                         "[Diag] rho bounds: lower={:?} upper={:?}",
-                        at_lower, at_upper
+                        at_lower,
+                        at_upper
                     );
                 }
                 return Ok(f64::INFINITY);
@@ -1288,7 +1289,8 @@ impl<'a> RemlState<'a> {
                 if !(at_lower.is_empty() && at_upper.is_empty()) {
                     log::debug!(
                         "[Diag] rho bounds: lower={:?} upper={:?}",
-                        at_lower, at_upper
+                        at_lower,
+                        at_upper
                     );
                 }
                 return Err(e);
@@ -1344,7 +1346,8 @@ impl<'a> RemlState<'a> {
             if should_emit_h_min_eig_diag(min_eig) {
                 log::debug!(
                     "[Diag] H min_eig={:.3e} (ridge={:.3e})",
-                    min_eig, ridge_used
+                    min_eig,
+                    ridge_used
                 );
             }
 

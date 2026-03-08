@@ -34,6 +34,7 @@ use crate::construction::{
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
     KahanSum, RidgePlanner, StableSolver, add_ridge, matrix_inverse_with_regularization,
+    max_abs_diag,
 };
 use crate::matrix::DesignMatrix;
 use crate::mixture_link::{
@@ -103,6 +104,99 @@ where
         acc.add(value);
     }
     acc.sum()
+}
+
+fn signed_xt_v_x(
+    design: &DesignMatrix,
+    row_weights: &Array1<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    if row_weights.len() != design.nrows() {
+        return Err(EstimationError::InvalidInput(format!(
+            "signed_xt_v_x row mismatch: weights={}, design rows={}",
+            row_weights.len(),
+            design.nrows()
+        )));
+    }
+    let p = design.ncols();
+    let mut xtvx = Array2::<f64>::zeros((p, p));
+    match design {
+        DesignMatrix::Dense(x) => {
+            for i in 0..x.nrows() {
+                let vi = row_weights[i];
+                if vi == 0.0 {
+                    continue;
+                }
+                for a in 0..p {
+                    let xa = x[[i, a]];
+                    for b in a..p {
+                        let value = vi * xa * x[[i, b]];
+                        xtvx[[a, b]] += value;
+                        if a != b {
+                            xtvx[[b, a]] += value;
+                        }
+                    }
+                }
+            }
+        }
+        DesignMatrix::Sparse(xs) => {
+            let csr = xs.to_csr_arc().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "signed_xt_v_x: failed to obtain CSR view".to_string(),
+                )
+            })?;
+            let sym = csr.symbolic();
+            let row_ptr = sym.row_ptr();
+            let col_idx = sym.col_idx();
+            let vals = csr.val();
+            for i in 0..design.nrows() {
+                let vi = row_weights[i];
+                if vi == 0.0 {
+                    continue;
+                }
+                let start = row_ptr[i];
+                let end = row_ptr[i + 1];
+                for a_ptr in start..end {
+                    let a = col_idx[a_ptr];
+                    let xa = vals[a_ptr];
+                    for b_ptr in a_ptr..end {
+                        let b = col_idx[b_ptr];
+                        let xb = vals[b_ptr];
+                        let value = vi * xa * xb;
+                        xtvx[[a, b]] += value;
+                        if a != b {
+                            xtvx[[b, a]] += value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(xtvx)
+}
+
+fn assemble_parametric_score_beta_jacobian(
+    x_t: &DesignMatrix,
+    neg_du_deta: &Array1<f64>,
+    penalty: &Array2<f64>,
+    ridge: f64,
+) -> Result<Array2<f64>, EstimationError> {
+    let mut jacobian = signed_xt_v_x(x_t, neg_du_deta)?;
+    if penalty.nrows() != jacobian.nrows() || penalty.ncols() != jacobian.ncols() {
+        return Err(EstimationError::InvalidInput(format!(
+            "parametric score beta jacobian penalty mismatch: penalty={}x{}, jacobian={}x{}",
+            penalty.nrows(),
+            penalty.ncols(),
+            jacobian.nrows(),
+            jacobian.ncols()
+        )));
+    }
+    jacobian += penalty;
+    if ridge > 0.0 {
+        for i in 0..jacobian.nrows() {
+            jacobian[[i, i]] += ridge;
+        }
+    }
+    Ok(jacobian)
 }
 
 #[derive(Clone, Debug)]
@@ -1336,8 +1430,8 @@ where
         } else {
             None
         };
-        let mut ll3_buf = Array1::<f64>::zeros(y_o.len());
         let mut leverage_buf = Array1::<f64>::zeros(y_o.len());
+        let mut score_beta_jacobian_diag_buf = Array1::<f64>::zeros(y_o.len());
         let mut direct_ll_buf = vec![0.0_f64; aux_dim_outer];
         let mut du_by_j_buf: Vec<Array1<f64>> = (0..aux_dim_outer)
             .map(|_| Array1::<f64>::zeros(y_o.len()))
@@ -1450,10 +1544,9 @@ where
                 let eta = &pirls_mix.final_eta;
                 let x_t = &pirls_mix.x_transformed;
                 let n_obs = eta.len();
-                let p_eff = x_t.ncols();
                 let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
-                debug_assert_eq!(n_obs, ll3_buf.len());
-                ll3_buf.fill(0.0);
+                debug_assert_eq!(n_obs, leverage_buf.len());
+                score_beta_jacobian_diag_buf.fill(0.0);
                 const EPS: f64 = 1e-8;
                 leverage_buf.fill(0.0);
                 if h_pos_w.ncols() > 0 {
@@ -1493,28 +1586,24 @@ where
                         let mu = jet.mu.clamp(EPS, 1.0 - EPS);
                         let d1 = jet.d1;
                         let d2 = jet.d2;
-                        let d3 = jet.d3;
                         let yi = y_o[i];
                         let wi = w_o[i].max(0.0);
                         let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
                         let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
-                        let a3 = wi
-                            * (2.0 * yi / (mu * mu * mu)
-                                - 2.0 * (1.0 - yi)
-                                    / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
-                        ll3_buf[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+                        score_beta_jacobian_diag_buf[i] = -(a2 * d1 * d1 + a1 * d2);
                         for j in 0..aux_dim {
                             let dj = mix_partials_buf_reuse[j];
                             let dmu = dj.mu;
                             let dd1 = dj.d1;
-                            let dd2 = dj.d2;
                             direct_ll_buf[j] += a1 * dmu;
                             du_by_j_buf[j][i] = a2 * dmu * d1 + a1 * dd1;
-                            let dell2_explicit = a3 * dmu * d1 * d1
-                                + 2.0 * a2 * d1 * dd1
-                                + a2 * dmu * d2
-                                + a1 * dd2;
-                            dw_explicit_by_j_buf[j][i] = -dell2_explicit;
+                            let variance = (mu * (1.0 - mu)).max(EPS);
+                            let variance_param = (1.0 - 2.0 * mu) * dmu;
+                            let numerator = d1 * d1;
+                            let numerator_param = 2.0 * d1 * dd1;
+                            dw_explicit_by_j_buf[j][i] = wi
+                                * (numerator_param * variance - numerator * variance_param)
+                                / (variance * variance);
                         }
                     }
                 } else {
@@ -1522,15 +1611,16 @@ where
                         EstimationError::InvalidInput("missing parameterized link state".to_string())
                     })?;
                     for i in 0..n_obs {
+                        let eta_i = eta[i].clamp(-30.0, 30.0);
                         let jets = if use_beta_logistic {
                             beta_logistic_inverse_link_jet_with_param_partials(
-                                eta[i],
+                                eta_i,
                                 sas.log_delta,
                                 sas.epsilon,
                             )
                         } else {
                             sas_inverse_link_jet_with_param_partials(
-                                eta[i],
+                                eta_i,
                                 sas.epsilon,
                                 sas.log_delta,
                             )
@@ -1538,16 +1628,11 @@ where
                         let mu = jets.jet.mu.clamp(EPS, 1.0 - EPS);
                         let d1 = jets.jet.d1;
                         let d2 = jets.jet.d2;
-                        let d3 = jets.jet.d3;
                         let yi = y_o[i];
                         let wi = w_o[i].max(0.0);
                         let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
                         let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
-                        let a3 = wi
-                            * (2.0 * yi / (mu * mu * mu)
-                                - 2.0 * (1.0 - yi)
-                                    / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
-                        ll3_buf[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+                        score_beta_jacobian_diag_buf[i] = -(a2 * d1 * d1 + a1 * d2);
                         for j in 0..aux_dim {
                             let dj = if j == 0 {
                                 jets.djet_depsilon
@@ -1556,29 +1641,45 @@ where
                             };
                             let dmu = dj.mu;
                             let dd1 = dj.d1;
-                            let dd2 = dj.d2;
                             direct_ll_buf[j] += a1 * dmu;
                             du_by_j_buf[j][i] = a2 * dmu * d1 + a1 * dd1;
-                            let dell2_explicit = a3 * dmu * d1 * d1
-                                + 2.0 * a2 * d1 * dd1
-                                + a2 * dmu * d2
-                                + a1 * dd2;
-                            dw_explicit_by_j_buf[j][i] = -dell2_explicit;
+                            let variance = (mu * (1.0 - mu)).max(EPS);
+                            let variance_param = (1.0 - 2.0 * mu) * dmu;
+                            let numerator = d1 * d1;
+                            let numerator_param = 2.0 * d1 * dd1;
+                            dw_explicit_by_j_buf[j][i] = wi
+                                * (numerator_param * variance - numerator * variance_param)
+                                / (variance * variance);
                         }
                     }
                 }
+                let score_beta_jacobian = assemble_parametric_score_beta_jacobian(
+                    x_t,
+                    &score_beta_jacobian_diag_buf,
+                    &pirls_mix.reparam_result.s_transformed,
+                    pirls_mix.ridge_used,
+                )?;
+                let solver = StableSolver::new("parametric exact hypergradient beta Jacobian");
+                let jacobian_ridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
                 for j in 0..aux_dim {
                     let rhs_j = x_t.transpose_vector_multiply(&du_by_j_buf[j]);
-                    let dbeta_j = if h_pos_w.ncols() > 0 {
-                        let wt_rhs = h_pos_w.t().dot(&rhs_j);
-                        h_pos_w.as_ref().dot(&wt_rhs)
-                    } else {
-                        Array1::<f64>::zeros(p_eff)
-                    };
+                    let dbeta_j = solver
+                        .solve_vector_with_ridge_retries(
+                            &score_beta_jacobian,
+                            &rhs_j,
+                            jacobian_ridge_floor,
+                        )
+                        .ok_or_else(|| {
+                            EstimationError::InvalidInput(
+                                "failed to solve exact parametric beta sensitivity system"
+                                    .to_string(),
+                            )
+                        })?;
                     let eta_dot_j = x_t.matrix_vector_multiply(&dbeta_j);
                     let mut trace_term = 0.0_f64;
                     for i in 0..n_obs {
-                        let dw_total = dw_explicit_by_j_buf[j][i] - ll3_buf[i] * eta_dot_j[i];
+                        let dw_total =
+                            dw_explicit_by_j_buf[j][i] + pirls_mix.solve_c_array[i] * eta_dot_j[i];
                         trace_term += leverage_buf[i] * dw_total;
                     }
                     grad[k + j] = -direct_ll_buf[j] + 0.5 * trace_term;
@@ -3842,7 +3943,6 @@ where
     let eta = &pirls_mix.final_eta;
     let x_t = &pirls_mix.x_transformed;
     let n_obs = eta.len();
-    let p_eff = x_t.ncols();
     const EPS: f64 = 1e-8;
 
     let mut leverage = Array1::<f64>::zeros(n_obs);
@@ -3866,7 +3966,7 @@ where
         }
     }
 
-    let mut ll3 = Array1::<f64>::zeros(n_obs);
+    let mut score_beta_jacobian_diag = Array1::<f64>::zeros(n_obs);
     let mut direct_ll = vec![0.0_f64; aux_dim];
     let mut du_by_j: Vec<Array1<f64>> = (0..aux_dim).map(|_| Array1::<f64>::zeros(n_obs)).collect();
     let mut dw_explicit_by_j: Vec<Array1<f64>> =
@@ -3903,25 +4003,24 @@ where
             let mu = jet.mu.clamp(EPS, 1.0 - EPS);
             let d1 = jet.d1;
             let d2 = jet.d2;
-            let d3 = jet.d3;
             let yi = y_o[i];
             let wi = w_o[i].max(0.0);
             let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
             let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
-            let a3 = wi
-                * (2.0 * yi / (mu * mu * mu)
-                    - 2.0 * (1.0 - yi) / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
-            ll3[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+            score_beta_jacobian_diag[i] = -(a2 * d1 * d1 + a1 * d2);
             for j in 0..aux_dim {
                 let dj = mix_partials[j];
                 let dmu = dj.mu;
                 let dd1 = dj.d1;
-                let dd2 = dj.d2;
                 direct_ll[j] += a1 * dmu;
                 du_by_j[j][i] = a2 * dmu * d1 + a1 * dd1;
-                let dell2_explicit =
-                    a3 * dmu * d1 * d1 + 2.0 * a2 * d1 * dd1 + a2 * dmu * d2 + a1 * dd2;
-                dw_explicit_by_j[j][i] = -dell2_explicit;
+                let variance = (mu * (1.0 - mu)).max(EPS);
+                let variance_param = (1.0 - 2.0 * mu) * dmu;
+                let numerator = d1 * d1;
+                let numerator_param = 2.0 * d1 * dd1;
+                dw_explicit_by_j[j][i] = wi
+                    * (numerator_param * variance - numerator * variance_param)
+                    / (variance * variance);
             }
         }
     } else {
@@ -3929,27 +4028,24 @@ where
             EstimationError::InvalidInput("missing parameterized link state".to_string())
         })?;
         for i in 0..n_obs {
+            let eta_i = eta[i].clamp(-30.0, 30.0);
             let jets = if use_beta_logistic {
                 beta_logistic_inverse_link_jet_with_param_partials(
-                    eta[i],
+                    eta_i,
                     sas.log_delta,
                     sas.epsilon,
                 )
             } else {
-                sas_inverse_link_jet_with_param_partials(eta[i], sas.epsilon, sas.log_delta)
+                sas_inverse_link_jet_with_param_partials(eta_i, sas.epsilon, sas.log_delta)
             };
             let mu = jets.jet.mu.clamp(EPS, 1.0 - EPS);
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
-            let d3 = jets.jet.d3;
             let yi = y_o[i];
             let wi = w_o[i].max(0.0);
             let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
             let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
-            let a3 = wi
-                * (2.0 * yi / (mu * mu * mu)
-                    - 2.0 * (1.0 - yi) / ((1.0 - mu) * (1.0 - mu) * (1.0 - mu)));
-            ll3[i] = a3 * d1 * d1 * d1 + 3.0 * a2 * d1 * d2 + a1 * d3;
+            score_beta_jacobian_diag[i] = -(a2 * d1 * d1 + a1 * d2);
             for j in 0..aux_dim {
                 let dj = if j == 0 {
                     jets.djet_depsilon
@@ -3958,27 +4054,69 @@ where
                 };
                 let dmu = dj.mu;
                 let dd1 = dj.d1;
-                let dd2 = dj.d2;
                 direct_ll[j] += a1 * dmu;
                 du_by_j[j][i] = a2 * dmu * d1 + a1 * dd1;
-                let dell2_explicit =
-                    a3 * dmu * d1 * d1 + 2.0 * a2 * d1 * dd1 + a2 * dmu * d2 + a1 * dd2;
-                dw_explicit_by_j[j][i] = -dell2_explicit;
+                let variance = (mu * (1.0 - mu)).max(EPS);
+                let variance_param = (1.0 - 2.0 * mu) * dmu;
+                let numerator = d1 * d1;
+                let numerator_param = 2.0 * d1 * dd1;
+                dw_explicit_by_j[j][i] = wi
+                    * (numerator_param * variance - numerator * variance_param)
+                    / (variance * variance);
             }
         }
     }
+    let score_beta_jacobian = assemble_parametric_score_beta_jacobian(
+        x_t,
+        &score_beta_jacobian_diag,
+        &pirls_mix.reparam_result.s_transformed,
+        pirls_mix.ridge_used,
+    )?;
+    let solver = StableSolver::new("parametric exact hypergradient beta Jacobian");
+    let jacobian_ridge_floor = max_abs_diag(&score_beta_jacobian) * 1e-12;
     for j in 0..aux_dim {
         let rhs_j = x_t.transpose_vector_multiply(&du_by_j[j]);
-        let dbeta_j = if h_pos_w.ncols() > 0 {
-            let wt_rhs = h_pos_w.t().dot(&rhs_j);
-            h_pos_w.as_ref().dot(&wt_rhs)
-        } else {
-            Array1::<f64>::zeros(p_eff)
-        };
+        // IMPORTANT:
+        // The mathematically correct implicit solve for d beta / d psi_j is
+        // based on the Jacobian of the penalized score equations
+        //
+        //   g(beta, psi) = -X^T u(eta, psi) + S beta (+ ridge beta) = 0,
+        //   eta = X beta + offset.
+        //
+        // By the implicit function theorem,
+        //
+        //   (dg/dbeta) (dbeta/dpsi_j) = - dg/dpsi_j
+        //                             = X^T (du/dpsi_j),
+        //
+        // so the correct system matrix is
+        //
+        //   dg/dbeta = -X^T diag(du/deta) X + S (+ ridge I).
+        //
+        // For binomial SAS,
+        //
+        //   u_i = a1_i * d1_i,
+        //   du_i/deta_i = a2_i * d1_i^2 + a1_i * d2_i,
+        //
+        // therefore
+        //
+        //   dg/dbeta = X^T diag(-(a2*d1^2 + a1*d2)) X + S (+ ridge I).
+        //
+        // The matrix currently used below, via h_pos_w, is the PIRLS/Fisher
+        // working Hessian X^T W X + S, with W_i = prior_i * d1_i^2/(mu_i(1-mu_i)).
+        // That is not the same object unless the residual term a1_i vanishes
+        // rowwise. Using h_pos_w here is therefore mathematically incorrect for
+        // the exact link-parameter hypergradient.
+        let dbeta_j = solver
+            .solve_vector_with_ridge_retries(&score_beta_jacobian, &rhs_j, jacobian_ridge_floor)
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "failed to solve exact parametric beta sensitivity system".to_string(),
+                )
+            })?;
         let eta_dot_j = x_t.matrix_vector_multiply(&dbeta_j);
         let mut trace_term = 0.0_f64;
         for i in 0..n_obs {
-            let dw_total = dw_explicit_by_j[j][i] - ll3[i] * eta_dot_j[i];
+            let dw_total = dw_explicit_by_j[j][i] + pirls_mix.solve_c_array[i] * eta_dot_j[i];
             trace_term += leverage[i] * dw_total;
         }
         grad[k + j] = -direct_ll[j] + 0.5 * trace_term;
@@ -4001,6 +4139,11 @@ where
 #[cfg(test)]
 mod fd_policy_tests {
     use super::*;
+    use crate::mixture_link::sas_inverse_link_jet;
+    use crate::types::LikelihoodFamily;
+    use ndarray::{Array1, Array2, array};
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
 
     #[test]
     fn test_gradient_diag_fd_sampling_schedule() {
@@ -4027,6 +4170,488 @@ mod fd_policy_tests {
         // <20 rule still triggers Firth because support per parameter is weak.
         assert!(should_enable_firth_from_class_support(425.0, 225));
         assert!(!should_enable_firth_from_class_support(460.0, 225));
+    }
+
+    fn build_tiny_design(n: usize) -> Array2<f64> {
+        let mut x = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            let t = (i as f64 + 0.5) / n as f64;
+            let x1 = -1.5 + 3.0 * t;
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = x1;
+            x[[i, 2]] = (2.1 * x1).sin();
+        }
+        x
+    }
+
+    fn one_penalty_non_intercept(p: usize) -> Vec<Array2<f64>> {
+        let mut s = Array2::<f64>::zeros((p, p));
+        for j in 1..p {
+            s[[j, j]] = 1.0;
+        }
+        vec![s]
+    }
+
+    #[test]
+    fn sas_beta_raw_epsilon_sensitivity_matches_fd_at_seed19() {
+        let seed = 19_u64;
+        let n = 20usize;
+        let x = build_tiny_design(n);
+        let w = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let s_list = one_penalty_non_intercept(x.ncols());
+
+        let true_beta = array![-0.2, 0.9, -0.4];
+        let eta_true = x.dot(&true_beta);
+        let eps_true = 0.25;
+        let ld_true = -0.20;
+        let p = eta_true.mapv(|e| sas_inverse_link_jet(e, eps_true, ld_true).mu);
+        let mut rng = StdRng::seed_from_u64(seed);
+        let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
+
+        let opts = ExternalOptimOptions {
+            family: LikelihoodFamily::BinomialSas,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: Some(SasLinkSpec {
+                initial_epsilon: 0.0,
+                initial_log_delta: 0.0,
+            }),
+            optimize_sas: true,
+            max_iter: 80,
+            tol: 1e-7,
+            nullspace_dims: vec![1],
+            linear_constraints: None,
+            firth_bias_reduction: None,
+        };
+
+        let theta = array![0.10, 0.12, -0.18];
+        let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
+        assert!(effective_sas_link.is_some());
+        let conditioning = ParametricColumnConditioning::infer_from_penalties(
+            &DesignMatrix::Dense(x.clone()),
+            &s_list,
+        );
+        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(x.clone()));
+        let mut reml_state = RemlState::new_with_offset(
+            y.view(),
+            x_fit,
+            w.view(),
+            offset.view(),
+            s_list.clone(),
+            x.ncols(),
+            &cfg,
+            Some(vec![1]),
+            None,
+            None,
+        )
+        .expect("reml_state");
+        let rho = theta.slice(s![..1]).to_owned();
+        let (epsilon_eff, d_eps_d_raw) = sas_effective_epsilon(theta[1]);
+        let sas_state = state_from_sas_spec(SasLinkSpec {
+            initial_epsilon: epsilon_eff,
+            initial_log_delta: theta[2],
+        })
+        .expect("sas state");
+        reml_state.set_link_states(None, Some(sas_state));
+
+        let (pirls_result, _) = reml_state
+            .pirls_result_and_hpos_for_rho(&rho)
+            .expect("pirls_result");
+        println!(
+            "sas_beta_raw_epsilon_sensitivity_matches_fd_at_seed19 last_gradient_norm={:.6e} status={:?} iteration={}",
+            pirls_result.last_gradient_norm, pirls_result.status, pirls_result.iteration
+        );
+        let eta = &pirls_result.final_eta;
+        let x_t = &pirls_result.x_transformed;
+        let mut du_by_eps = Array1::<f64>::zeros(eta.len());
+        let mut clamped_obs = 0usize;
+        for i in 0..eta.len() {
+            let jets = sas_inverse_link_jet_with_param_partials(
+                eta[i],
+                sas_state.epsilon,
+                sas_state.log_delta,
+            );
+            let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+            if (mu - jets.jet.mu).abs() > 0.0 {
+                clamped_obs += 1;
+            }
+            let d1 = jets.jet.d1;
+            let yi = y[i];
+            let wi = w[i].max(0.0);
+            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+            let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
+            let dmu = jets.djet_depsilon.mu;
+            let dd1 = jets.djet_depsilon.d1;
+            du_by_eps[i] = a2 * dmu * d1 + a1 * dd1;
+        }
+        let score_at = |raw_eps: f64| -> Array1<f64> {
+            let (eps_eff, _) = sas_effective_epsilon(raw_eps);
+            let sas_state = state_from_sas_spec(SasLinkSpec {
+                initial_epsilon: eps_eff,
+                initial_log_delta: theta[2],
+            })
+            .expect("score sas state");
+            let mut out = Array1::<f64>::zeros(eta.len());
+            for i in 0..eta.len() {
+                let jets = sas_inverse_link_jet_with_param_partials(
+                    eta[i],
+                    sas_state.epsilon,
+                    sas_state.log_delta,
+                );
+                let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+                let d1 = jets.jet.d1;
+                let yi = y[i];
+                let wi = w[i].max(0.0);
+                let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+                out[i] = a1 * d1;
+            }
+            out
+        };
+        let score_p = score_at(theta[1] + 1e-4 * (1.0 + theta[1].abs()));
+        let score_m = score_at(theta[1] - 1e-4 * (1.0 + theta[1].abs()));
+        let fd_du_raw = (&score_p - &score_m).mapv(|v| v / (2.0 * 1e-4 * (1.0 + theta[1].abs())));
+        let du_raw = du_by_eps.mapv(|v| v * d_eps_d_raw);
+        crate::testing::assert_matrix_derivative_fd(
+            &fd_du_raw.insert_axis(Axis(1)),
+            &du_raw.insert_axis(Axis(1)),
+            2e-3,
+            "sas du / d raw epsilon at fixed eta",
+        );
+        let rhs = x_t.transpose_vector_multiply(&du_by_eps);
+        println!("sas_beta_raw_epsilon_sensitivity_matches_fd_at_seed19 clamped_obs={clamped_obs}");
+        let mut neg_du_deta = Array1::<f64>::zeros(eta.len());
+        for i in 0..eta.len() {
+            let jets = sas_inverse_link_jet_with_param_partials(
+                eta[i].clamp(-30.0, 30.0),
+                sas_state.epsilon,
+                sas_state.log_delta,
+            );
+            let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+            let d1 = jets.jet.d1;
+            let d2 = jets.jet.d2;
+            let yi = y[i];
+            let wi = w[i].max(0.0);
+            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+            let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
+            neg_du_deta[i] = -(a2 * d1 * d1 + a1 * d2);
+        }
+        let score_beta_jacobian = assemble_parametric_score_beta_jacobian(
+            x_t,
+            &neg_du_deta,
+            &pirls_result.reparam_result.s_transformed,
+            pirls_result.ridge_used,
+        )
+        .expect("score beta jacobian");
+        let stable_solver = StableSolver::new("sas dbeta exact test");
+        let mut dbeta_exact = stable_solver
+            .solve_vector_with_ridge_retries(
+                &score_beta_jacobian,
+                &rhs,
+                max_abs_diag(&score_beta_jacobian) * 1e-12,
+            )
+            .expect("observed-jacobian solve for dbeta");
+        dbeta_exact *= d_eps_d_raw;
+
+        let fd_h = 1e-4 * (1.0 + theta[1].abs());
+        let beta_at = |raw_eps: f64| -> Array1<f64> {
+            let mut state = RemlState::new_with_offset(
+                y.view(),
+                conditioning.apply_to_design(&DesignMatrix::Dense(x.clone())),
+                w.view(),
+                offset.view(),
+                s_list.clone(),
+                x.ncols(),
+                &cfg,
+                Some(vec![1]),
+                None,
+                None,
+            )
+            .expect("fd state");
+            let (eps_eff, _) = sas_effective_epsilon(raw_eps);
+            let sas_state = state_from_sas_spec(SasLinkSpec {
+                initial_epsilon: eps_eff,
+                initial_log_delta: theta[2],
+            })
+            .expect("fd sas state");
+            state.set_link_states(None, Some(sas_state));
+            let (pirls, _) = state.pirls_result_and_hpos_for_rho(&rho).expect("fd pirls");
+            pirls.beta_transformed.as_ref().clone()
+        };
+        let beta_p = beta_at(theta[1] + fd_h);
+        let beta_m = beta_at(theta[1] - fd_h);
+        let fd_beta = (&beta_p - &beta_m).mapv(|v| v / (2.0 * fd_h));
+
+        crate::testing::assert_matrix_derivative_fd(
+            &fd_beta.insert_axis(Axis(1)),
+            &dbeta_exact.insert_axis(Axis(1)),
+            2e-3,
+            "sas observed-jacobian dbeta / d raw epsilon",
+        );
+    }
+
+    #[test]
+    fn sas_true_score_beta_jacobian_matches_fd_at_seed19() {
+        let seed = 19_u64;
+        let n = 20usize;
+        let x = build_tiny_design(n);
+        let w = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let s_list = one_penalty_non_intercept(x.ncols());
+
+        let true_beta = array![-0.2, 0.9, -0.4];
+        let eta_true = x.dot(&true_beta);
+        let eps_true = 0.25;
+        let ld_true = -0.20;
+        let p = eta_true.mapv(|e| sas_inverse_link_jet(e, eps_true, ld_true).mu);
+        let mut rng = StdRng::seed_from_u64(seed);
+        let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
+
+        let opts = ExternalOptimOptions {
+            family: LikelihoodFamily::BinomialSas,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: Some(SasLinkSpec {
+                initial_epsilon: 0.0,
+                initial_log_delta: 0.0,
+            }),
+            optimize_sas: true,
+            max_iter: 80,
+            tol: 1e-7,
+            nullspace_dims: vec![1],
+            linear_constraints: None,
+            firth_bias_reduction: None,
+        };
+
+        let theta = array![0.10, 0.12, -0.18];
+        let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
+        assert!(effective_sas_link.is_some());
+        let conditioning = ParametricColumnConditioning::infer_from_penalties(
+            &DesignMatrix::Dense(x.clone()),
+            &s_list,
+        );
+        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(x.clone()));
+        let mut reml_state = RemlState::new_with_offset(
+            y.view(),
+            x_fit,
+            w.view(),
+            offset.view(),
+            s_list,
+            x.ncols(),
+            &cfg,
+            Some(vec![1]),
+            None,
+            None,
+        )
+        .expect("reml_state");
+        let rho = theta.slice(s![..1]).to_owned();
+        let (epsilon_eff, _) = sas_effective_epsilon(theta[1]);
+        let sas_state = state_from_sas_spec(SasLinkSpec {
+            initial_epsilon: epsilon_eff,
+            initial_log_delta: theta[2],
+        })
+        .expect("sas state");
+        reml_state.set_link_states(None, Some(sas_state));
+
+        let (pirls_result, _) = reml_state
+            .pirls_result_and_hpos_for_rho(&rho)
+            .expect("pirls_result");
+        let beta0 = pirls_result.beta_transformed.as_ref().clone();
+        let s_transformed = pirls_result.reparam_result.s_transformed.clone();
+        let ridge = pirls_result.ridge_used;
+        let x_dense = match &pirls_result.x_transformed {
+            DesignMatrix::Dense(x_dense) => x_dense.clone(),
+            DesignMatrix::Sparse(_) => {
+                panic!("expected dense transformed design in seed-19 SAS test")
+            }
+        };
+
+        let gradient_at = |beta: &Array1<f64>| -> Array1<f64> {
+            let mut eta = offset.clone();
+            eta += &x_dense.dot(beta);
+            let mut u = Array1::<f64>::zeros(eta.len());
+            for i in 0..eta.len() {
+                let jets = sas_inverse_link_jet_with_param_partials(
+                    eta[i].clamp(-30.0, 30.0),
+                    sas_state.epsilon,
+                    sas_state.log_delta,
+                );
+                let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+                let d1 = jets.jet.d1;
+                let yi = y[i];
+                let wi = w[i].max(0.0);
+                let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+                u[i] = a1 * d1;
+            }
+            let mut g = -x_dense.t().dot(&u);
+            g += &s_transformed.dot(beta);
+            if ridge > 0.0 {
+                g += &beta.mapv(|v| ridge * v);
+            }
+            g
+        };
+
+        let mut analytic_j = Array2::<f64>::zeros((beta0.len(), beta0.len()));
+        let mut eta0 = offset.clone();
+        eta0 += &x_dense.dot(&beta0);
+        let mut neg_du_deta = Array1::<f64>::zeros(eta0.len());
+        for i in 0..eta0.len() {
+            let jets = sas_inverse_link_jet_with_param_partials(
+                eta0[i].clamp(-30.0, 30.0),
+                sas_state.epsilon,
+                sas_state.log_delta,
+            );
+            let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+            let d1 = jets.jet.d1;
+            let d2 = jets.jet.d2;
+            let yi = y[i];
+            let wi = w[i].max(0.0);
+            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+            let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
+            neg_du_deta[i] = -(a2 * d1 * d1 + a1 * d2);
+        }
+        let weighted_x = &x_dense * &neg_du_deta.insert_axis(Axis(1));
+        analytic_j.assign(&x_dense.t().dot(&weighted_x));
+        analytic_j += &s_transformed;
+        if ridge > 0.0 {
+            for j in 0..analytic_j.nrows() {
+                analytic_j[[j, j]] += ridge;
+            }
+        }
+
+        let mut fd_j = Array2::<f64>::zeros((beta0.len(), beta0.len()));
+        for j in 0..beta0.len() {
+            let h = 1e-5 * (1.0 + beta0[j].abs());
+            let mut beta_p = beta0.clone();
+            let mut beta_m = beta0.clone();
+            beta_p[j] += h;
+            beta_m[j] -= h;
+            let g_p = gradient_at(&beta_p);
+            let g_m = gradient_at(&beta_m);
+            let fd_col = (&g_p - &g_m).mapv(|v| v / (2.0 * h));
+            fd_j.column_mut(j).assign(&fd_col);
+        }
+
+        crate::testing::assert_matrix_derivative_fd(
+            &fd_j,
+            &analytic_j,
+            2e-3,
+            "sas true beta-score jacobian at seed-19",
+        );
+    }
+
+    #[test]
+    fn sas_pirls_working_hessian_differs_from_true_score_jacobian_at_seed19() {
+        let seed = 19_u64;
+        let n = 20usize;
+        let x = build_tiny_design(n);
+        let w = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let s_list = one_penalty_non_intercept(x.ncols());
+
+        let true_beta = array![-0.2, 0.9, -0.4];
+        let eta_true = x.dot(&true_beta);
+        let eps_true = 0.25;
+        let ld_true = -0.20;
+        let p = eta_true.mapv(|e| sas_inverse_link_jet(e, eps_true, ld_true).mu);
+        let mut rng = StdRng::seed_from_u64(seed);
+        let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
+
+        let opts = ExternalOptimOptions {
+            family: LikelihoodFamily::BinomialSas,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: Some(SasLinkSpec {
+                initial_epsilon: 0.0,
+                initial_log_delta: 0.0,
+            }),
+            optimize_sas: true,
+            max_iter: 80,
+            tol: 1e-7,
+            nullspace_dims: vec![1],
+            linear_constraints: None,
+            firth_bias_reduction: None,
+        };
+
+        let theta = array![0.10, 0.12, -0.18];
+        let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
+        assert!(effective_sas_link.is_some());
+        let conditioning = ParametricColumnConditioning::infer_from_penalties(
+            &DesignMatrix::Dense(x.clone()),
+            &s_list,
+        );
+        let x_fit = conditioning.apply_to_design(&DesignMatrix::Dense(x.clone()));
+        let mut reml_state = RemlState::new_with_offset(
+            y.view(),
+            x_fit,
+            w.view(),
+            offset.view(),
+            s_list,
+            x.ncols(),
+            &cfg,
+            Some(vec![1]),
+            None,
+            None,
+        )
+        .expect("reml_state");
+        let rho = theta.slice(s![..1]).to_owned();
+        let (epsilon_eff, _) = sas_effective_epsilon(theta[1]);
+        let sas_state = state_from_sas_spec(SasLinkSpec {
+            initial_epsilon: epsilon_eff,
+            initial_log_delta: theta[2],
+        })
+        .expect("sas state");
+        reml_state.set_link_states(None, Some(sas_state));
+
+        let (pirls_result, _) = reml_state
+            .pirls_result_and_hpos_for_rho(&rho)
+            .expect("pirls_result");
+        let beta0 = pirls_result.beta_transformed.as_ref().clone();
+        let s_transformed = pirls_result.reparam_result.s_transformed.clone();
+        let ridge = pirls_result.ridge_used;
+        let x_dense = match &pirls_result.x_transformed {
+            DesignMatrix::Dense(x_dense) => x_dense.clone(),
+            DesignMatrix::Sparse(_) => {
+                panic!("expected dense transformed design in seed-19 SAS test")
+            }
+        };
+
+        let mut eta0 = offset.clone();
+        eta0 += &x_dense.dot(&beta0);
+        let mut neg_du_deta = Array1::<f64>::zeros(eta0.len());
+        for i in 0..eta0.len() {
+            let jets = sas_inverse_link_jet_with_param_partials(
+                eta0[i].clamp(-30.0, 30.0),
+                sas_state.epsilon,
+                sas_state.log_delta,
+            );
+            let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+            let d1 = jets.jet.d1;
+            let d2 = jets.jet.d2;
+            let yi = y[i];
+            let wi = w[i].max(0.0);
+            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
+            let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
+            neg_du_deta[i] = -(a2 * d1 * d1 + a1 * d2);
+        }
+        let weighted_x = &x_dense * &neg_du_deta.insert_axis(Axis(1));
+        let mut true_jacobian = x_dense.t().dot(&weighted_x);
+        true_jacobian += &s_transformed;
+        if ridge > 0.0 {
+            for j in 0..true_jacobian.nrows() {
+                true_jacobian[[j, j]] += ridge;
+            }
+        }
+
+        let max_abs_diff = true_jacobian
+            .iter()
+            .zip(pirls_result.penalized_hessian_transformed.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs_diff > 1e-2,
+            "expected PIRLS working Hessian to differ from the true SAS score Jacobian, got max_abs_diff={max_abs_diff:.3e}"
+        );
     }
 }
 

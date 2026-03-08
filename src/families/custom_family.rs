@@ -383,6 +383,19 @@ pub struct CustomFamilyJointHyperResult {
     pub warm_start: CustomFamilyWarmStart,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) struct ExactNewtonRhoGradientDebug {
+    pub objective: f64,
+    pub penalty_term: Array1<f64>,
+    pub logdet_h_explicit_term: Array1<f64>,
+    pub logdet_h_implicit_term: Array1<f64>,
+    pub logdet_s_term: Array1<f64>,
+    pub beta_flat: Array1<f64>,
+    pub stationarity_inf: f64,
+    pub u_terms: Vec<Array1<f64>>,
+}
+
 struct OuterObjectiveEvalResult {
     objective: f64,
     gradient: Array1<f64>,
@@ -747,55 +760,6 @@ struct ExactNewtonBlockUpdater<'a> {
     hessian: &'a SymmetricMatrix,
 }
 
-fn solve_symmetric_system_with_policy(
-    lhs: &SymmetricMatrix,
-    rhs: &Array1<f64>,
-    ridge_floor: f64,
-    ridge_policy: RidgePolicy,
-) -> Result<Array1<f64>, String> {
-    match lhs {
-        SymmetricMatrix::Dense(dense) => {
-            solve_spd_system_with_policy(dense, rhs, ridge_floor, ridge_policy)
-        }
-        SymmetricMatrix::Sparse(_) => {
-            if lhs.nrows() != lhs.ncols() || rhs.len() != lhs.nrows() {
-                return Err("exact-newton sparse system dimension mismatch".to_string());
-            }
-            let base_ridge = if ridge_policy.include_laplace_hessian {
-                effective_solver_ridge(ridge_floor)
-            } else {
-                0.0
-            };
-            let mut ridge = 0.0_f64;
-            for _ in 0..8 {
-                let system = if ridge > 0.0 {
-                    lhs.add_ridge(ridge)?
-                } else {
-                    lhs.clone()
-                };
-                match system.factorize().and_then(|factor| factor.solve(rhs)) {
-                    Ok(solution) if solution.iter().all(|v| v.is_finite()) => return Ok(solution),
-                    _ => {
-                        ridge = if ridge == 0.0 {
-                            base_ridge.max(1e-12)
-                        } else {
-                            ridge * 10.0
-                        };
-                    }
-                }
-            }
-            Err("exact-newton sparse block solve failed after ridge retries".to_string())
-        }
-    }
-}
-
-fn strict_solve_symmetric(lhs: &SymmetricMatrix, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
-    match lhs {
-        SymmetricMatrix::Dense(dense) => strict_solve_spd(dense, rhs),
-        SymmetricMatrix::Sparse(_) => lhs.factorize()?.solve(rhs),
-    }
-}
-
 impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
     fn compute_update_step(
         &self,
@@ -852,16 +816,57 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                 active_set: Some(active_set),
             })
         } else {
-            let beta = if use_exact_newton_strict_spd(ctx.family) {
-                strict_solve_symmetric(&lhs, &rhs)?
+            // Solve for the Newton step, not the next beta directly.
+            //
+            // For the penalized negative objective
+            //
+            //   Q(beta) = -log L(beta) + 0.5 beta^T S beta,
+            //
+            // the exact block gradient and Hessian are
+            //
+            //   grad_Q = S beta - gradient,
+            //   hess_Q = hessian + S.
+            //
+            // The Newton step must therefore satisfy
+            //
+            //   hess_Q * delta = -grad_Q = gradient - S beta.
+            //
+            // This form stays correct even when the linear solver adds a
+            // numerical ridge to the left-hand side to stabilize an indefinite
+            // or nearly singular block. Solving directly for `beta_new` with a
+            // ridged matrix would require an extra `ridge * beta` term on the
+            // right-hand side; without it the step is distorted, which can trap
+            // exact-Newton block updates on nonconvex blocks such as survival
+            // `log_sigma`.
+            let rhs_step = self.gradient - &ctx.s_lambda.dot(&ctx.states[ctx.block_idx].beta);
+            let mut lhs_dense = lhs.to_dense();
+            if !use_exact_newton_strict_spd(ctx.family) {
+                let (evals, _) = FaerEigh::eigh(&lhs_dense, Side::Lower).map_err(|e| {
+                    format!(
+                        "block {} ({}) exact-newton eigendecomposition failed: {e}",
+                        ctx.block_idx, ctx.spec.name
+                    )
+                })?;
+                let min_eval = evals.iter().fold(f64::INFINITY, |m, &v| m.min(v));
+                let floor = effective_solver_ridge(ctx.options.ridge_floor);
+                if min_eval <= floor {
+                    let shift = floor - min_eval;
+                    for d in 0..lhs_dense.nrows() {
+                        lhs_dense[[d, d]] += shift;
+                    }
+                }
+            }
+            let delta = if use_exact_newton_strict_spd(ctx.family) {
+                strict_solve_spd(&lhs_dense, &rhs_step)?
             } else {
-                solve_symmetric_system_with_policy(
-                    &lhs,
-                    &rhs,
+                solve_spd_system_with_policy(
+                    &lhs_dense,
+                    &rhs_step,
                     ctx.options.ridge_floor,
                     ctx.options.ridge_policy,
                 )?
             };
+            let beta = &ctx.states[ctx.block_idx].beta + &delta;
             Ok(BlockUpdateResult {
                 beta_new_raw: beta,
                 active_set: None,
@@ -885,6 +890,210 @@ impl BlockWorkingSet {
             }
         }
     }
+}
+
+fn flatten_exact_newton_penalized_gradient(
+    eval: &FamilyEvaluation,
+    states: &[ParameterBlockState],
+    s_lambdas: &[Array2<f64>],
+    mode_ridge: f64,
+) -> Result<Array1<f64>, String> {
+    if eval.block_working_sets.len() != states.len() || states.len() != s_lambdas.len() {
+        return Err("exact-newton joint gradient flatten: block dimension mismatch".to_string());
+    }
+    let total = states.iter().map(|st| st.beta.len()).sum::<usize>();
+    let mut grad = Array1::<f64>::zeros(total);
+    let mut at = 0usize;
+    for b in 0..states.len() {
+        let p = states[b].beta.len();
+        let score = match &eval.block_working_sets[b] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient,
+            _ => {
+                return Err(
+                    "exact-newton joint polish requires exact-newton working sets for all blocks"
+                        .to_string(),
+                )
+            }
+        };
+        if score.len() != p || s_lambdas[b].nrows() != p || s_lambdas[b].ncols() != p {
+            return Err(format!(
+                "exact-newton joint gradient flatten shape mismatch on block {b}"
+            ));
+        }
+        let mut penalized_grad = s_lambdas[b].dot(&states[b].beta) - score;
+        if mode_ridge > 0.0 {
+            penalized_grad += &states[b].beta.mapv(|v| mode_ridge * v);
+        }
+        grad.slice_mut(ndarray::s![at..at + p]).assign(&penalized_grad);
+        at += p;
+    }
+    Ok(grad)
+}
+
+fn apply_post_update_to_all_blocks<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &mut [ParameterBlockState],
+) -> Result<(), String> {
+    for b in 0..states.len() {
+        let beta = states[b].beta.clone();
+        states[b].beta = family.post_update_block_beta(states, b, &specs[b], beta)?;
+    }
+    refresh_all_block_etas(family, specs, states)?;
+    Ok(())
+}
+
+fn inner_exact_joint_fit<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    block_log_lambdas: &[Array1<f64>],
+    s_lambdas: &[Array2<f64>],
+    options: &BlockwiseFitOptions,
+    states0: &[ParameterBlockState],
+    active_sets: Vec<Option<Vec<usize>>>,
+) -> Result<BlockwiseInnerResult, String> {
+    let ridge = effective_solver_ridge(options.ridge_floor);
+    let mode_ridge = if options.ridge_policy.include_quadratic_penalty {
+        ridge
+    } else {
+        0.0
+    };
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
+    let mut s_joint = Array2::<f64>::zeros((total, total));
+    for (b, &(start, end)) in ranges.iter().enumerate() {
+        s_joint
+            .slice_mut(ndarray::s![start..end, start..end])
+            .assign(&s_lambdas[b]);
+    }
+    if mode_ridge > 0.0 {
+        for d in 0..total {
+            s_joint[[d, d]] += mode_ridge;
+        }
+    }
+
+    let project_states = |beta_flat: &Array1<f64>| -> Result<Vec<ParameterBlockState>, String> {
+        let mut states = states0.to_vec();
+        set_states_from_flat_beta(&mut states, specs, beta_flat)?;
+        apply_post_update_to_all_blocks(family, specs, &mut states)?;
+        Ok(states)
+    };
+
+    let eval_value = |beta_flat: &Array1<f64>| -> Result<(f64, Array1<f64>, Array2<f64>, Vec<ParameterBlockState>), String> {
+        let states = project_states(beta_flat)?;
+        let eval = family.evaluate(&states)?;
+        let grad =
+            flatten_exact_newton_penalized_gradient(&eval, &states, s_lambdas, mode_ridge)?;
+        let mut h = family
+            .exact_newton_joint_hessian(&states)?
+            .ok_or_else(|| "missing joint exact-newton Hessian in inner exact fit".to_string())?;
+        if h.nrows() != total || h.ncols() != total {
+            return Err(format!(
+                "joint exact-newton inner Hessian shape mismatch: got {}x{}, expected {}x{}",
+                h.nrows(),
+                h.ncols(),
+                total,
+                total
+            ));
+        }
+        h += &s_joint;
+        let objective =
+            -eval.log_likelihood + total_quadratic_penalty(&states, s_lambdas, ridge, options.ridge_policy);
+        Ok((objective, grad, h, states))
+    };
+
+    let beta0 = flatten_state_betas(states0, specs);
+    let lower = Array1::<f64>::from_elem(total, -1e12);
+    let upper = Array1::<f64>::from_elem(total, 1e12);
+    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Vec<ParameterBlockState>)> = None;
+    let objective = CachedSecondOrderObjective::new(
+        |x: &Array1<f64>| {
+            match eval_value(x) {
+                Ok((obj, grad, h, states)) if obj.is_finite() && grad.iter().all(|v| v.is_finite()) && h.iter().all(|v| v.is_finite()) => {
+                    last_eval = Some((x.clone(), obj, grad.clone(), states));
+                    Ok((obj, grad, Some(h)))
+                }
+                Ok((_obj, _grad, _h, _states)) => Err(ObjectiveEvalError::recoverable(
+                    "custom-family exact-joint inner objective/derivatives became non-finite",
+                )),
+                Err(e) => Err(ObjectiveEvalError::recoverable(format!(
+                    "custom-family exact-joint inner evaluation failed: {e}"
+                ))),
+            }
+        },
+        1e-4,
+    );
+    let mut solver = NewtonTrustRegion::new(beta0.clone(), objective)
+        .with_bounds(Bounds::new(lower, upper, 1e-6).expect("beta bounds must be valid"))
+        .with_tolerance(
+            Tolerance::new(options.inner_tol.max(1e-12))
+                .expect("inner exact-joint tolerance must be valid"),
+        )
+        .with_max_iterations(
+            MaxIterations::new(options.inner_max_cycles.max(100))
+                .expect("inner exact-joint max iterations must be valid"),
+        );
+
+    let solution = match solver.run() {
+        Ok(sol) => sol,
+        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
+        Err(err) => {
+            return Err(format!(
+                "custom-family exact-joint inner optimization failed: {err:?}"
+            ))
+        }
+    };
+
+    let (_beta_star, states) =
+        if let Some((x, _obj, _grad, states)) = last_eval.take() {
+            if x.len() == solution.final_point.len()
+                && x.iter()
+                    .zip(solution.final_point.iter())
+                    .all(|(&a, &b)| (a - b).abs() <= 1e-10)
+            {
+                (x, states)
+            } else {
+                let states = project_states(&solution.final_point)?;
+                (solution.final_point.clone(), states)
+            }
+        } else {
+            let states = project_states(&solution.final_point)?;
+            (solution.final_point.clone(), states)
+        };
+    let eval = family.evaluate(&states)?;
+    let stationarity_inf =
+        exact_newton_joint_stationarity_inf_norm(&eval, &states, s_lambdas, ridge, options.ridge_policy)?
+            .ok_or_else(|| "inner exact-joint fit expected exact-newton working sets".to_string())?;
+    if stationarity_inf > options.inner_tol.max(1e-12) {
+        return Err(format!(
+            "custom-family exact-joint inner optimization stalled before stationarity: inf_norm={stationarity_inf:.3e}"
+        ));
+    }
+
+    let penalty_value = total_quadratic_penalty(&states, s_lambdas, ridge, options.ridge_policy);
+    let (block_logdet_h, block_logdet_s) = {
+        let mut states_for_logdet = states.clone();
+        blockwise_logdet_terms(
+            family,
+            specs,
+            &mut states_for_logdet,
+            block_log_lambdas,
+            options,
+        )?
+    };
+
+    let cycles = solution.iterations;
+    let converged = stationarity_inf <= options.inner_tol.max(1e-12);
+    Ok(BlockwiseInnerResult {
+        block_states: states,
+        active_sets,
+        log_likelihood: eval.log_likelihood,
+        penalty_value,
+        cycles,
+        converged,
+        block_logdet_h,
+        block_logdet_s,
+    })
 }
 
 fn solve_kkt_step(
@@ -1172,6 +1381,44 @@ fn stable_logdet_with_ridge_policy(
     }
 }
 
+fn logdet_trace_inverse_with_ridge_policy(
+    matrix_on_logdet_surface: &Array2<f64>,
+    ridge_floor: f64,
+    ridge_policy: RidgePolicy,
+    strict_spd: bool,
+) -> Result<Array2<f64>, String> {
+    if strict_spd {
+        return strict_inverse_spd(matrix_on_logdet_surface);
+    }
+
+    match ridge_policy.determinant_mode {
+        // For the full determinant surface, d log|H| = tr(H^{-1} dH).
+        RidgeDeterminantMode::Full => inverse_spd_with_retry(
+            matrix_on_logdet_surface,
+            effective_solver_ridge(ridge_floor),
+            8,
+        )
+        .or_else(|_| pinv_positive_part(matrix_on_logdet_surface, ridge_floor)),
+
+        // For the positive-part pseudo-determinant surface,
+        //
+        //   log|H|_+ = sum_{lambda_j > floor} log lambda_j,
+        //
+        // the matching first derivative is the trace against the positive-part
+        // pseudoinverse on that same ridge-adjusted surface, not against the
+        // ordinary inverse of a nearby SPD surrogate.
+        RidgeDeterminantMode::PositivePart => {
+            let positive_floor = if ridge_policy.include_penalty_logdet {
+                effective_solver_ridge(ridge_floor)
+            } else {
+                0.0
+            }
+            .max(1e-14);
+            pinv_positive_part_with_floor(matrix_on_logdet_surface, positive_floor)
+        }
+    }
+}
+
 fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     let (r, c) = a.dim();
     let mut t = 0.0;
@@ -1234,16 +1481,42 @@ fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
     Ok(2.0 * chol.diag().mapv(f64::ln).sum())
 }
 
-fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
+fn solve_dense_symmetric_indefinite(
+    matrix: &Array2<f64>,
+    rhs: &Array1<f64>,
+    context: &str,
+) -> Result<Array1<f64>, String> {
+    if matrix.nrows() != matrix.ncols() || rhs.len() != matrix.nrows() {
+        return Err(format!("{context}: dimension mismatch"));
+    }
+    let matrix_view = FaerArrayView::new(matrix);
+    let solver = FaerLblt::new(matrix_view.as_ref(), Side::Lower);
+    let mut rhs_mat = FaerMat::zeros(rhs.len(), 1);
+    for i in 0..rhs.len() {
+        rhs_mat[(i, 0)] = rhs[i];
+    }
+    solver.solve_in_place(rhs_mat.as_mut());
+    let mut out = Array1::<f64>::zeros(rhs.len());
+    for i in 0..rhs.len() {
+        out[i] = rhs_mat[(i, 0)];
+    }
+    if !out.iter().all(|v| v.is_finite()) {
+        return Err(format!("{context}: solve produced non-finite values"));
+    }
+    Ok(out)
+}
+
+fn pinv_positive_part_with_floor(
+    matrix: &Array2<f64>,
+    positive_floor: f64,
+) -> Result<Array2<f64>, String> {
     let (evals, evecs) = FaerEigh::eigh(matrix, Side::Lower)
         .map_err(|e| format!("eigh failed in positive-part pseudoinverse: {e}"))?;
     let p = matrix.nrows();
-    let max_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let tol = (max_eval * 1e-12).max(ridge_floor.max(1e-14));
     let mut pinv = Array2::<f64>::zeros((p, p));
     for k in 0..p {
         let ev = evals[k];
-        if ev > tol {
+        if ev > positive_floor {
             let inv_ev = 1.0 / ev;
             for i in 0..p {
                 let uik = evecs[(i, k)];
@@ -1254,6 +1527,14 @@ fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f
         }
     }
     Ok(pinv)
+}
+
+fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
+    let (evals, _) = FaerEigh::eigh(matrix, Side::Lower)
+        .map_err(|e| format!("eigh failed in positive-part pseudoinverse: {e}"))?;
+    let max_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let tol = (max_eval * 1e-12).max(ridge_floor.max(1e-14));
+    pinv_positive_part_with_floor(matrix, tol)
 }
 
 fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(family: &F) -> bool {
@@ -1402,6 +1683,13 @@ fn inner_blockwise_fit<F: CustomFamily>(
 ) -> Result<BlockwiseInnerResult, String> {
     let mut states = build_block_states(family, specs)?;
     refresh_all_block_etas(family, specs, &mut states)?;
+    let has_joint_exact_hessian = family.exact_newton_joint_hessian(&states)?.is_some();
+    let inner_tol = options.inner_tol;
+    let inner_max_cycles = if has_joint_exact_hessian {
+        options.inner_max_cycles.max(200)
+    } else {
+        options.inner_max_cycles
+    };
     let mut s_lambdas = Vec::with_capacity(specs.len());
     for (b, spec) in specs.iter().enumerate() {
         let p = spec.design.ncols();
@@ -1426,6 +1714,17 @@ fn inner_blockwise_fit<F: CustomFamily>(
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
     }
+    if has_joint_exact_hessian {
+        return inner_exact_joint_fit(
+            family,
+            specs,
+            block_log_lambdas,
+            &s_lambdas,
+            options,
+            &states,
+            cached_active_sets,
+        );
+    }
     let initial_eval = family.evaluate(&states)?;
     let mut current_penalty =
         total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
@@ -1433,7 +1732,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
     let mut converged = false;
     let mut cycles_done = 0usize;
 
-    for cycle in 0..options.inner_max_cycles {
+    for cycle in 0..inner_max_cycles {
         let mut max_beta_step = 0.0_f64;
 
         let mut objective_cycle_prev = last_objective;
@@ -1475,7 +1774,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 block_quadratic_penalty(&beta_old, s_lambda, ridge, options.ridge_policy);
             let step = delta.iter().copied().map(f64::abs).fold(0.0, f64::max);
             max_beta_step = max_beta_step.max(step);
-            if step <= options.inner_tol {
+            if step <= inner_tol {
                 continue;
             }
 
@@ -1500,6 +1799,44 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 }
             }
             if !accepted {
+                states[b].beta = beta_old.clone();
+                refresh_all_block_etas(family, specs, &mut states)?;
+                if let BlockWorkingSet::ExactNewton { gradient, .. } = work {
+                    let descent_dir = gradient - &s_lambda.dot(&beta_old);
+                    let dir_norm = descent_dir.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+                    if dir_norm > inner_tol {
+                        for bt in 0..12 {
+                            let alpha = 0.5f64.powi(bt);
+                            let trial_beta_raw = &beta_old + &descent_dir.mapv(|v| alpha * v);
+                            let trial_beta =
+                                family.post_update_block_beta(&states, b, spec, trial_beta_raw)?;
+                            states[b].beta = trial_beta;
+                            refresh_all_block_etas(family, specs, &mut states)?;
+                            let trial_eval = family.evaluate(&states)?;
+                            let trial_block_penalty = block_quadratic_penalty(
+                                &states[b].beta,
+                                s_lambda,
+                                ridge,
+                                options.ridge_policy,
+                            );
+                            let trial_penalty =
+                                current_penalty - old_block_penalty + trial_block_penalty;
+                            let trial_objective = -trial_eval.log_likelihood + trial_penalty;
+                            if trial_objective.is_finite()
+                                && trial_objective <= objective_cycle_prev + 1e-10
+                            {
+                                objective_cycle_prev = trial_objective;
+                                current_penalty = trial_penalty;
+                                accepted = true;
+                                break;
+                            }
+                            states[b].beta = beta_old.clone();
+                            refresh_all_block_etas(family, specs, &mut states)?;
+                        }
+                    }
+                }
+            }
+            if !accepted {
                 states[b].beta = beta_old;
                 refresh_all_block_etas(family, specs, &mut states)?;
             }
@@ -1513,8 +1850,33 @@ fn inner_blockwise_fit<F: CustomFamily>(
         last_objective = objective;
         cycles_done = cycle + 1;
 
-        let objective_tol = options.inner_tol * (1.0 + objective.abs());
-        if max_beta_step <= options.inner_tol && objective_change <= objective_tol {
+        let objective_tol = inner_tol * (1.0 + objective.abs());
+        let exact_joint_stationarity_ok = if has_joint_exact_hessian {
+            let stationarity_inf = exact_newton_joint_stationarity_inf_norm(
+                &eval,
+                &states,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+            )?
+                    .ok_or_else(|| {
+                        "joint exact-newton Hessian is available, but the family did not return exact-newton working sets for all blocks".to_string()
+                    })?;
+            // The exact outer LAML formulas differentiate the jointly refit
+            // inner mode. For coupled exact-Newton families that means we need
+            // the full penalized first-order condition to be genuinely small,
+            // not merely that coordinate updates have stalled. We therefore use
+            // a stricter coupled stationarity check here than the generic
+            // blockwise `inner_tol`, which is tuned to per-block coefficient
+            // changes rather than gradient residuals.
+            stationarity_inf <= inner_tol
+        } else {
+            true
+        };
+        if max_beta_step <= inner_tol
+            && objective_change <= objective_tol
+            && exact_joint_stationarity_ok
+        {
             converged = true;
             break;
         }
@@ -1558,18 +1920,36 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho, penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    let ridge = effective_solver_ridge(options.ridge_floor);
+    let mode_ridge = if options.ridge_policy.include_quadratic_penalty {
+        ridge
+    } else {
+        0.0
+    };
+    let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
+        && !options.ridge_policy.include_quadratic_penalty
+    {
+        ridge
+    } else {
+        0.0
+    };
     // Outer objective at fixed rho:
-    //   V(rho) = -ell(beta^) + 0.5 * beta^T P(rho) beta^
-    //            + 0.5 * log|J(beta^,rho)| - 0.5 * log|P(rho)|_+,
+    //   V(rho) = -ell(beta^) + 0.5 * beta^T P_mode(rho) beta^
+    //            + 0.5 * log|J_trace(beta^,rho)| - 0.5 * log|P_trace(rho)|_+,
     // where beta^ solves g(beta,rho)=0 with
-    //   g(beta,rho) = -∇_beta ell(beta) + P(rho) beta,
-    //   J(beta,rho) = H(beta) + P(rho),  H(beta) = -∇^2_beta ell(beta).
+    //   g(beta,rho) = -∇_beta ell(beta) + P_mode(rho) beta,
+    //   J_mode(beta,rho) = H(beta) + P_mode(rho),
+    //   H(beta) = -∇^2_beta ell(beta).
+    //
+    // `P_mode` includes the rho-independent stabilization ridge exactly when
+    // that ridge participates in the quadratic objective. `P_trace`/`J_trace`
+    // additionally include any ridge used only by the determinant surface.
     //
     // The exact outer gradient used below is:
     //   V_k = 0.5*beta^T A_k beta^
-    //       + 0.5*tr(J^{-1}(A_k + D H[u_k]))
-    //       - 0.5*tr(P_+^{-1} A_k),
-    // with A_k=dP/drho_k and u_k=d beta^/drho_k.
+    //       + 0.5*tr(J_trace^{-1}(A_k + D H[u_k]))
+    //       - 0.5*tr(P_trace,+^{-1} A_k),
+    // with A_k=dS_lambda/drho_k and u_k=d beta^/drho_k.
     let objective = -inner.log_likelihood
         + inner.penalty_value
         + if include_logdet_h {
@@ -1621,30 +2001,39 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
             s_joint
                 .slice_mut(ndarray::s![start..end, start..end])
                 .assign(&s_lambda);
+            if mode_ridge > 0.0 {
+                for d in start..end {
+                    s_joint[[d, d]] += mode_ridge;
+                }
+            }
             if let Some(s_pinv) = s_pinv_joint.as_mut() {
-                let s_part = pinv_positive_part(
-                    &s_lambda,
-                    if options.ridge_policy.include_penalty_logdet {
-                        effective_solver_ridge(options.ridge_floor)
-                    } else {
-                        options.ridge_floor
-                    },
-                )?;
+                let mut s_for_logdet = s_lambda.clone();
+                if options.ridge_policy.include_penalty_logdet {
+                    for d in 0..p {
+                        s_for_logdet[[d, d]] += ridge;
+                    }
+                }
+                let s_floor = if options.ridge_policy.include_penalty_logdet {
+                    ridge
+                } else {
+                    0.0
+                }
+                .max(1e-14);
+                let s_part = pinv_positive_part_with_floor(&s_for_logdet, s_floor)?;
                 s_pinv
                     .slice_mut(ndarray::s![start..end, start..end])
                     .assign(&s_part);
             }
         }
         // Inner stationarity for the coupled blocks is:
-        //   g(beta,rho) = -∇_beta ell(beta) + P(rho) beta = 0.
+        //   g(beta,rho) = -∇_beta ell(beta) + P_mode(rho) beta = 0.
         // Differentiating w.r.t. rho_k gives the exact sensitivity system:
-        //   J * u_k = -(dP/drho_k) beta,  with u_k = d beta / d rho_k.
-        // We use A_k := dP/drho_k and J = H(beta) + P(rho), where
+        //   J_mode * u_k = -A_k beta,  with u_k = d beta / d rho_k.
+        // We use A_k := dS_lambda/drho_k and J_mode = H(beta) + P_mode(rho), where
         // H(beta) = -∇^2_beta ell(beta) is the full joint likelihood curvature.
         //
-        // Here `h_joint_unpen` is H(beta) and `s_joint` is P(rho), so
-        // `j_joint = h_joint_unpen + s_joint` is the coupled Jacobian/Hessian used
-        // in both sensitivity solves and log|J| trace terms.
+        // Here `h_joint_unpen` is H(beta) and `s_joint` is P_mode(rho), so
+        // `j_joint = h_joint_unpen + s_joint` is the coupled mode Jacobian.
         let mut j_joint = h_joint_unpen.clone();
         j_joint += &s_joint;
 
@@ -1672,28 +2061,17 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
         // - the trace may be evaluated on the ridge-adjusted `J_trace`
         //   if the chosen determinant surface includes that stabilization.
         let mut j_for_traces = j_joint.clone();
-        if !strict_spd && options.ridge_policy.include_penalty_logdet {
-            let ridge = effective_solver_ridge(options.ridge_floor);
+        if !strict_spd && extra_logdet_ridge > 0.0 {
             for d in 0..total {
-                j_for_traces[[d, d]] += ridge;
+                j_for_traces[[d, d]] += extra_logdet_ridge;
             }
         }
-        let h_inv = if strict_spd {
-            strict_inverse_spd(&j_for_traces)?
-        } else {
-            match inverse_spd_with_retry(
-                &j_for_traces,
-                effective_solver_ridge(options.ridge_floor),
-                8,
-            ) {
-                Ok(inv) => inv,
-                Err(_) => {
-                    // Joint exact geometry can be mildly indefinite away from the inner mode.
-                    // Fall back to a positive-part pseudoinverse to keep outer gradients defined.
-                    pinv_positive_part(&j_for_traces, options.ridge_floor)?
-                }
-            }
-        };
+        let h_inv = logdet_trace_inverse_with_ridge_policy(
+            &j_for_traces,
+            options.ridge_floor,
+            options.ridge_policy,
+            strict_spd,
+        )?;
         let mut at = 0usize;
         let mut a_terms: Vec<Array2<f64>> = Vec::new();
         let mut a_beta_terms: Vec<Array1<f64>> = Vec::new();
@@ -1973,15 +2351,12 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                 h_for_logdet[[d, d]] += ridge;
             }
         }
-        let h_inv = if strict_spd {
-            strict_inverse_spd(&h_for_logdet)?
-        } else {
-            inverse_spd_with_retry(
-                &h_for_logdet,
-                effective_solver_ridge(options.ridge_floor),
-                8,
-            )?
-        };
+        let h_inv = logdet_trace_inverse_with_ridge_policy(
+            &h_for_logdet,
+            options.ridge_floor,
+            options.ridge_policy,
+            strict_spd,
+        )?;
         let diagonal_leverages = diagonal_design
             .as_ref()
             .map(|x_dyn| leverage_quadratic_forms(x_dyn, &h_inv));
@@ -1994,7 +2369,13 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
             }
         }
         let s_pinv = if include_logdet_s {
-            Some(pinv_positive_part(&s_for_logdet, options.ridge_floor)?)
+            let s_floor = if options.ridge_policy.include_penalty_logdet {
+                effective_solver_ridge(options.ridge_floor)
+            } else {
+                0.0
+            }
+            .max(1e-14);
+            Some(pinv_positive_part_with_floor(&s_for_logdet, s_floor)?)
         } else {
             None
         };
@@ -2294,7 +2675,13 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
             }
         }
         let s_pinv = if include_logdet_s {
-            Some(pinv_positive_part(&s_for_logdet, options.ridge_floor)?)
+            let s_floor = if options.ridge_policy.include_penalty_logdet {
+                effective_solver_ridge(options.ridge_floor)
+            } else {
+                0.0
+            }
+            .max(1e-14);
+            Some(pinv_positive_part_with_floor(&s_for_logdet, s_floor)?)
         } else {
             None
         };
@@ -2327,11 +2714,12 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                         h_for_logdet[[d, d]] += ridge;
                     }
                 }
-                let h_inv = if strict_spd {
-                    strict_inverse_spd(&h_for_logdet)?
-                } else {
-                    inverse_spd_with_retry(&h_for_logdet, ridge, 8)?
-                };
+                let h_inv = logdet_trace_inverse_with_ridge_policy(
+                    &h_for_logdet,
+                    options.ridge_floor,
+                    options.ridge_policy,
+                    strict_spd,
+                )?;
                 Ok((w, u, h_mode, h_inv))
             })?,
             BlockWorkingSet::ExactNewton { gradient, hessian } => {
@@ -2352,11 +2740,12 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                         h_for_logdet[[d, d]] += ridge;
                     }
                 }
-                let h_inv = if strict_spd {
-                    strict_inverse_spd(&h_for_logdet)?
-                } else {
-                    inverse_spd_with_retry(&h_for_logdet, ridge, 8)?
-                };
+                let h_inv = logdet_trace_inverse_with_ridge_policy(
+                    &h_for_logdet,
+                    options.ridge_floor,
+                    options.ridge_policy,
+                    strict_spd,
+                )?;
 
                 for deriv in psi_terms {
                     // Exact-Newton generic psi-gradient path for penalty-only psi
@@ -2911,6 +3300,213 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn debug_exact_newton_rho_gradient_terms<F: CustomFamily>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_current: &Array1<f64>,
+    warm_start: Option<&CustomFamilyWarmStart>,
+) -> Result<ExactNewtonRhoGradientDebug, CustomFamilyError> {
+    let penalty_counts = validate_block_specs(specs)?;
+    let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
+    let warm_inner = warm_start.map(|w| &w.inner);
+    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_inner)?;
+    let include_logdet_h = include_exact_newton_logdet_h(family);
+    let include_logdet_s = include_exact_newton_logdet_s(family, options);
+    let strict_spd = use_exact_newton_strict_spd(family);
+    let ridge = effective_solver_ridge(options.ridge_floor);
+    let mode_ridge = if options.ridge_policy.include_quadratic_penalty {
+        ridge
+    } else {
+        0.0
+    };
+    let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
+        && !options.ridge_policy.include_quadratic_penalty
+    {
+        ridge
+    } else {
+        0.0
+    };
+
+    let objective = -inner.log_likelihood
+        + inner.penalty_value
+        + if include_logdet_h {
+            0.5 * inner.block_logdet_h
+        } else {
+            0.0
+        }
+        - if include_logdet_s {
+            0.5 * inner.block_logdet_s
+        } else {
+            0.0
+        };
+
+    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    let eval = family.evaluate(&inner.block_states)?;
+    let stationarity_inf = exact_newton_joint_stationarity_inf_norm(
+        &eval,
+        &inner.block_states,
+        &per_block
+            .iter()
+            .enumerate()
+            .map(|(b, lambdas_log)| {
+                let p = specs[b].design.ncols();
+                let lambdas = lambdas_log.mapv(f64::exp);
+                let mut s_lambda = Array2::<f64>::zeros((p, p));
+                for (k, s) in specs[b].penalties.iter().enumerate() {
+                    s_lambda.scaled_add(lambdas[k], s);
+                }
+                s_lambda
+            })
+            .collect::<Vec<_>>(),
+        ridge,
+        options.ridge_policy,
+    )?
+    .ok_or_else(|| "debug_exact_newton_rho_gradient_terms expected exact-newton working sets".to_string())?;
+    let h_joint_unpen = family
+        .exact_newton_joint_hessian(&inner.block_states)?
+        .ok_or_else(|| "debug_exact_newton_rho_gradient_terms requires a joint exact Hessian".to_string())?;
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    let beta_flat = flatten_state_betas(&inner.block_states, specs);
+    let synced_joint_states =
+        synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
+    let joint_tangent_basis = joint_post_update_tangent_basis(family, specs, &synced_joint_states)?;
+    let mut s_joint = Array2::<f64>::zeros((total, total));
+    let mut s_pinv_joint = if include_logdet_s {
+        Some(Array2::<f64>::zeros((total, total)))
+    } else {
+        None
+    };
+    for (b, spec) in specs.iter().enumerate() {
+        let (start, end) = ranges[b];
+        let p = end - start;
+        let lambdas = per_block[b].mapv(f64::exp);
+        let mut s_lambda = Array2::<f64>::zeros((p, p));
+        for (k, s) in spec.penalties.iter().enumerate() {
+            s_lambda.scaled_add(lambdas[k], s);
+        }
+        s_joint
+            .slice_mut(ndarray::s![start..end, start..end])
+            .assign(&s_lambda);
+        if mode_ridge > 0.0 {
+            for d in start..end {
+                s_joint[[d, d]] += mode_ridge;
+            }
+        }
+        if let Some(s_pinv) = s_pinv_joint.as_mut() {
+            let mut s_for_logdet = s_lambda.clone();
+            if options.ridge_policy.include_penalty_logdet {
+                for d in 0..p {
+                    s_for_logdet[[d, d]] += ridge;
+                }
+            }
+            let s_floor = if options.ridge_policy.include_penalty_logdet {
+                ridge
+            } else {
+                0.0
+            }
+            .max(1e-14);
+            let s_part = pinv_positive_part_with_floor(&s_for_logdet, s_floor)?;
+            s_pinv
+                .slice_mut(ndarray::s![start..end, start..end])
+                .assign(&s_part);
+        }
+    }
+
+    let mut j_joint = h_joint_unpen.clone();
+    j_joint += &s_joint;
+    let mut j_for_traces = j_joint.clone();
+    if !strict_spd && extra_logdet_ridge > 0.0 {
+        for d in 0..total {
+            j_for_traces[[d, d]] += extra_logdet_ridge;
+        }
+    }
+    let h_inv = logdet_trace_inverse_with_ridge_policy(
+        &j_for_traces,
+        options.ridge_floor,
+        options.ridge_policy,
+        strict_spd,
+    )?;
+
+    let mut penalty_term = Array1::<f64>::zeros(rho_current.len());
+    let mut logdet_h_explicit_term = Array1::<f64>::zeros(rho_current.len());
+    let mut logdet_h_implicit_term = Array1::<f64>::zeros(rho_current.len());
+    let mut logdet_s_term = Array1::<f64>::zeros(rho_current.len());
+    let mut u_terms = Vec::with_capacity(rho_current.len());
+    let mut at = 0usize;
+    for b in 0..specs.len() {
+        let spec = &specs[b];
+        let (start, end) = ranges[b];
+        let beta_block = beta_flat.slice(ndarray::s![start..end]).to_owned();
+        let lambdas = per_block[b].mapv(f64::exp);
+        for (k, s_k) in spec.penalties.iter().enumerate() {
+            let mut a_k = Array2::<f64>::zeros((total, total));
+            let local = s_k.mapv(|v| lambdas[k] * v);
+            a_k.slice_mut(ndarray::s![start..end, start..end])
+                .assign(&local);
+            let a_k_beta = a_k.dot(&beta_flat);
+            let g_pen = 0.5 * beta_block.dot(&local.dot(&beta_block));
+            let rhs_k = -&a_k_beta;
+            let u_k = solve_mode_sensitivity(
+                &j_joint,
+                &rhs_k,
+                joint_tangent_basis.as_ref(),
+                strict_spd,
+                options,
+                "debug joint mode sensitivity system",
+            )?;
+            u_terms.push(u_k.clone());
+            let g_log_s = if include_logdet_s {
+                0.5
+                    * trace_product(
+                        s_pinv_joint
+                            .as_ref()
+                            .ok_or_else(|| "missing joint S^+ for debug gradient".to_string())?,
+                        &a_k,
+                    )
+            } else {
+                0.0
+            };
+            let g_log_h_explicit = if include_logdet_h {
+                0.5 * trace_product(&h_inv, &a_k)
+            } else {
+                0.0
+            };
+            let g_log_h_implicit = if include_logdet_h && u_k.dot(&u_k).sqrt() > 1e-14 {
+                let h_rho = family
+                    .exact_newton_joint_hessian_directional_derivative(
+                        &synced_joint_states,
+                        &u_k,
+                    )?
+                    .ok_or_else(|| {
+                        "joint exact-newton dH unavailable for debug outer gradient".to_string()
+                    })?;
+                0.5 * trace_product(&h_inv, &h_rho)
+            } else {
+                0.0
+            };
+            penalty_term[at + k] = g_pen;
+            logdet_h_explicit_term[at + k] = g_log_h_explicit;
+            logdet_h_implicit_term[at + k] = g_log_h_implicit;
+            logdet_s_term[at + k] = g_log_s;
+        }
+        at += spec.penalties.len();
+    }
+
+    Ok(ExactNewtonRhoGradientDebug {
+        objective,
+        penalty_term,
+        logdet_h_explicit_term,
+        logdet_h_implicit_term,
+        logdet_s_term,
+        beta_flat,
+        stationarity_inf,
+        u_terms,
+    })
+}
+
 fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
     let mut out = Vec::with_capacity(specs.len());
     let mut at = 0usize;
@@ -3086,18 +3682,14 @@ fn solve_mode_sensitivity(
     rhs: &Array1<f64>,
     tangent_basis: Option<&Array2<f64>>,
     strict_spd: bool,
-    options: &BlockwiseFitOptions,
+    _options: &BlockwiseFitOptions,
     context: &str,
 ) -> Result<Array1<f64>, String> {
     let solve_dense = |matrix: &Array2<f64>, vector: &Array1<f64>| -> Result<Array1<f64>, String> {
         if strict_spd {
             strict_solve_spd(matrix, vector)
         } else {
-            solve_spd_system_with_policy(matrix, vector, options.ridge_floor, options.ridge_policy)
-                .or_else(|_| {
-                    pinv_positive_part(matrix, options.ridge_floor).map(|pinv| pinv.dot(vector))
-                })
-                .map_err(|_| format!("failed to solve {context}"))
+            solve_dense_symmetric_indefinite(matrix, vector, context)
         }
     };
 
@@ -3153,6 +3745,55 @@ fn penalized_objective_at_beta<F: CustomFamily>(
         }
     }
     Ok(-eval.log_likelihood + penalty)
+}
+
+fn exact_newton_joint_stationarity_inf_norm(
+    eval: &FamilyEvaluation,
+    states: &[ParameterBlockState],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> Result<Option<f64>, String> {
+    if eval.block_working_sets.len() != states.len() || states.len() != s_lambdas.len() {
+        return Err("exact-newton joint stationarity check: block dimension mismatch".to_string());
+    }
+
+    let mut inf_norm = 0.0_f64;
+    for b in 0..states.len() {
+        let gradient = match &eval.block_working_sets[b] {
+            // For exact-Newton families the block score is ∇ log L with respect
+            // to that block, while the penalized negative objective is
+            //
+            //   Q(beta, rho) = -log L(beta) + 0.5 beta^T P_mode(rho) beta,
+            //
+            // where `P_mode` includes the rho-independent stabilization ridge
+            // exactly when that ridge participates in the quadratic objective.
+            //
+            // The coupled first-order condition is therefore
+            //
+            //   ∇Q = -∇ log L + P beta = 0.
+            //
+            // So the exact penalized stationarity residual for block b is
+            //
+            //   r_b = P_mode,b * beta_b - gradient_b.
+            //
+            // This is the quantity that must be small at the inner mode before
+            // the outer LAML derivative formulas are trustworthy. Using only
+            // coordinate step size can declare convergence too early for
+            // coupled exact-Newton families, leaving a visibly wrong outer
+            // objective/gradient even when the blockwise updates have nearly
+            // stalled.
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient,
+            _ => return Ok(None),
+        };
+        let mut residual = s_lambdas[b].dot(&states[b].beta) - gradient;
+        if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+            residual += &states[b].beta.mapv(|v| ridge * v);
+        }
+        let block_inf = residual.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        inf_norm = inf_norm.max(block_inf);
+    }
+    Ok(Some(inf_norm))
 }
 
 fn compute_joint_hessian_from_objective<F: CustomFamily>(
@@ -4130,8 +4771,6 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y,
             weights,
-            sigma_min: 0.05,
-            sigma_max: 4.0,
             link_kind: crate::types::InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
@@ -4225,8 +4864,6 @@ mod tests {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
-            sigma_min: 0.05,
-            sigma_max: 4.0,
             threshold_design: Some(threshold_spec.design.clone()),
             log_sigma_design: Some(log_sigma_spec.design.clone()),
         };
@@ -4316,8 +4953,6 @@ mod tests {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
-            sigma_min: 0.05,
-            sigma_max: 4.0,
             threshold_design: Some(threshold_spec.design.clone()),
             log_sigma_design: Some(log_sigma_spec.design.clone()),
         };
