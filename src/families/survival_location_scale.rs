@@ -6,7 +6,7 @@ use crate::faer_ndarray::{FaerSvd, fast_xt_diag_x};
 use crate::families::sigma_link::{
     bounded_sigma_derivs_up_to_third, bounded_sigma_derivs_up_to_third_scalar,
 };
-use crate::matrix::DesignMatrix;
+use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_pdf_third_derivative_for_inverse_link,
 };
@@ -779,52 +779,6 @@ fn select_anchor_row(age_entry: &Array1<f64>, time_anchor: Option<f64>) -> Resul
     }
 }
 
-fn xt_diag_x_design(design: &DesignMatrix, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
-    if design.nrows() != diag.len() {
-        return Err(format!(
-            "xt_diag_x_design row mismatch: design has {} rows but diag has {} entries",
-            design.nrows(),
-            diag.len()
-        ));
-    }
-    match design {
-        DesignMatrix::Dense(x) => Ok(fast_xt_diag_x(x, diag)),
-        DesignMatrix::Sparse(xs) => {
-            let csr = xs
-                .to_csr_arc()
-                .ok_or_else(|| "xt_diag_x_design: failed to obtain CSR view".to_string())?;
-            let sym = csr.symbolic();
-            let row_ptr = sym.row_ptr();
-            let col_idx = sym.col_idx();
-            let vals = csr.val();
-            let p = xs.ncols();
-            let mut out = Array2::<f64>::zeros((p, p));
-            for i in 0..xs.nrows() {
-                let wi = diag[i];
-                if wi == 0.0 {
-                    continue;
-                }
-                let start = row_ptr[i];
-                let end = row_ptr[i + 1];
-                for a_ptr in start..end {
-                    let a = col_idx[a_ptr];
-                    let xa = vals[a_ptr];
-                    for b_ptr in a_ptr..end {
-                        let b = col_idx[b_ptr];
-                        let xb = vals[b_ptr];
-                        let value = wi * xa * xb;
-                        out[[a, b]] += value;
-                        if a != b {
-                            out[[b, a]] += value;
-                        }
-                    }
-                }
-            }
-            Ok(out)
-        }
-    }
-}
-
 fn design_times_dense(design: &DesignMatrix, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
     if design.ncols() != rhs.nrows() {
         return Err(format!(
@@ -1149,7 +1103,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let grad_eta_t = &d1_q * &dq_t;
         let h_eta_t = -(&d2_q * &dq_t.mapv(|v| v * v));
         let grad_t = self.x_threshold.transpose_vector_multiply(&grad_eta_t);
-        let hess_t = xt_diag_x_design(&self.x_threshold, &h_eta_t)?;
+        let hess_t = xt_diag_x_symmetric(&self.x_threshold, &h_eta_t)?;
 
         // Block 2: eta_ls enters q via bounded sigma map.
         let dq_ls = Array1::from_iter(
@@ -1172,12 +1126,12 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let grad_eta_ls = &d1_q * &dq_ls;
         let h_eta_ls = -(&d2_q * &dq_ls.mapv(|v| v * v) + &(&d1_q * &d2q_ls));
         let grad_ls = self.x_log_sigma.transpose_vector_multiply(&grad_eta_ls);
-        let hess_ls = xt_diag_x_design(&self.x_log_sigma, &h_eta_ls)?;
+        let hess_ls = xt_diag_x_symmetric(&self.x_log_sigma, &h_eta_ls)?;
 
         let mut block_working_sets = vec![
             BlockWorkingSet::ExactNewton {
                 gradient: grad_time,
-                hessian: hess_time,
+                hessian: SymmetricMatrix::Dense(hess_time),
             },
             BlockWorkingSet::ExactNewton {
                 gradient: grad_t,
@@ -1190,7 +1144,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         ];
         if let Some(x_w) = self.x_link_wiggle.as_ref() {
             let grad_w = x_w.transpose_vector_multiply(&d1_q);
-            let hess_w = xt_diag_x_design(x_w, &(-&d2_q))?;
+            let hess_w = xt_diag_x_symmetric(x_w, &(-&d2_q))?;
             block_working_sets.push(BlockWorkingSet::ExactNewton {
                 gradient: grad_w,
                 hessian: hess_w,
@@ -1299,8 +1253,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 // Since q(eta_t) is linear in eta_t, only dq_t is nonzero:
                 // H = -d²ℓ/deta², so dH[u] picks up the leading minus too.
                 let d_h_eta = -(&d3_q * &dq_t.mapv(|v| v * v * v) * &d_eta_t);
-                let d_h = xt_diag_x_design(&self.x_threshold, &d_h_eta)?;
-                Ok(Some(d_h))
+                let d_h = xt_diag_x_symmetric(&self.x_threshold, &d_h_eta)?;
+                Ok(Some(d_h.to_dense()))
             }
             Self::BLOCK_LOG_SIGMA => {
                 if d_beta.len() != self.x_log_sigma.ncols() {
@@ -1347,8 +1301,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                     + &(&d1_q * &d3q))
                     * &d_eta_ls;
                 let d_h_eta = -d_h_eta;
-                let d_h = xt_diag_x_design(&self.x_log_sigma, &d_h_eta)?;
-                Ok(Some(d_h))
+                let d_h = xt_diag_x_symmetric(&self.x_log_sigma, &d_h_eta)?;
+                Ok(Some(d_h.to_dense()))
             }
             Self::BLOCK_LINK_WIGGLE => {
                 let x_w = self.x_link_wiggle.as_ref().ok_or_else(|| {
@@ -1364,8 +1318,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 }
                 let d_eta_w = x_w.matrix_vector_multiply(d_beta);
                 let d_h_eta = -(&d3_q * &d_eta_w);
-                let d_h = xt_diag_x_design(x_w, &d_h_eta)?;
-                Ok(Some(d_h))
+                let d_h = xt_diag_x_symmetric(x_w, &d_h_eta)?;
+                Ok(Some(d_h.to_dense()))
             }
             _ => Ok(None),
         }
@@ -2629,6 +2583,7 @@ mod tests {
         else {
             panic!("threshold block should use exact newton");
         };
+        let hessian = hessian.to_dense();
 
         let eps = 1e-6;
         let eval_plus = family
@@ -2674,7 +2629,7 @@ mod tests {
     fn exact_newton_block_directional_derivatives_match_fd_for_non_probit_links() {
         let extract_hessian = |eval: FamilyEvaluation, block_idx: usize| -> Array2<f64> {
             match &eval.block_working_sets[block_idx] {
-                BlockWorkingSet::ExactNewton { hessian, .. } => hessian.clone(),
+                BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
                 BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton block"),
             }
         };
@@ -2886,6 +2841,8 @@ mod tests {
                         hessian: sparse_h,
                     },
                 ) => {
+                    let dense_h = dense_h.to_dense();
+                    let sparse_h = sparse_h.to_dense();
                     assert_eq!(dense_g.len(), sparse_g.len());
                     assert_eq!(dense_h.dim(), sparse_h.dim());
                     for i in 0..dense_g.len() {

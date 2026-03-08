@@ -14,7 +14,7 @@ use crate::families::sigma_link::{
     bounded_sigma_eta_for_sigma_scalar, bounded_sigma_from_eta_scalar, bounded_sigma_jet1_scalar,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
-use crate::matrix::DesignMatrix;
+use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
@@ -1307,6 +1307,73 @@ pub struct BinomialLocationScaleWorkflowResult {
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
     pub beta_wiggle: Option<Vec<f64>>,
+}
+
+pub type BinomialLocationScaleProbitSpec = BinomialLocationScaleSpec;
+pub type BinomialLocationScaleProbitWiggleSpec = BinomialLocationScaleWiggleSpec;
+pub type BinomialLocationScaleProbitTermSpec = BinomialLocationScaleTermSpec;
+pub type BinomialLocationScaleProbitWiggleTermSpec = BinomialLocationScaleWiggleTermSpec;
+pub type BinomialLocationScaleProbitFamily = BinomialLocationScaleFamily;
+pub type BinomialLocationScaleProbitWiggleFamily = BinomialLocationScaleWiggleFamily;
+
+pub fn fit_binomial_location_scale_probit(
+    spec: BinomialLocationScaleProbitSpec,
+    options: &BlockwiseFitOptions,
+) -> Result<BlockwiseFitResult, String> {
+    fit_binomial_location_scale(spec, options)
+}
+
+pub fn fit_binomial_location_scale_probit_wiggle(
+    spec: BinomialLocationScaleProbitWiggleSpec,
+    options: &BlockwiseFitOptions,
+) -> Result<BlockwiseFitResult, String> {
+    fit_binomial_location_scale_wiggle(spec, options)
+}
+
+pub fn fit_binomial_location_scale_probit_terms(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: BinomialLocationScaleProbitTermSpec,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<BlockwiseTermFitResult, String> {
+    fit_binomial_location_scale_terms(data, spec, options, kappa_options)
+}
+
+pub fn fit_binomial_location_scale_probit_wiggle_terms(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: BinomialLocationScaleProbitWiggleTermSpec,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<BlockwiseTermFitResult, String> {
+    fit_binomial_location_scale_wiggle_terms(data, spec, options, kappa_options)
+}
+
+pub fn fit_binomial_location_scale_probit_wiggle_terms_auto(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: BinomialLocationScaleProbitTermSpec,
+    wiggle_cfg: WiggleBlockConfig,
+    wiggle_penalty_orders: &[usize],
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<BlockwiseTermWiggleFitResult, String> {
+    fit_binomial_location_scale_wiggle_terms_auto(
+        data,
+        spec,
+        wiggle_cfg,
+        wiggle_penalty_orders,
+        options,
+        kappa_options,
+    )
+}
+
+pub fn fit_binomial_location_scale_probit_terms_workflow(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: BinomialLocationScaleProbitTermSpec,
+    wiggle: Option<BinomialLocationScaleWiggleWorkflowConfig>,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<BinomialLocationScaleWorkflowResult, String> {
+    fit_binomial_location_scale_terms_workflow(data, spec, wiggle, options, kappa_options)
 }
 
 fn slice_log_lambda_block(
@@ -2636,30 +2703,6 @@ fn binomial_fourth_from_jet(
             + ell_mu * d4)
 }
 
-fn xt_diag_x_design(design: &DesignMatrix, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
-    let x = design.to_dense();
-    if x.nrows() != diag.len() {
-        return Err(format!(
-            "xt_diag_x_design row mismatch: design has {} rows but diag has {} entries",
-            x.nrows(),
-            diag.len()
-        ));
-    }
-    let p = x.ncols();
-    let n = x.nrows();
-    let mut x_weighted = Array2::<f64>::zeros((n, p));
-    for i in 0..n {
-        let wi = diag[i];
-        if wi == 0.0 {
-            continue;
-        }
-        for j in 0..p {
-            x_weighted[[i, j]] = x[[i, j]] * wi;
-        }
-    }
-    Ok(crate::faer_ndarray::fast_atb(&x, &x_weighted))
-}
-
 fn xt_diag_x_dense(design: &Array2<f64>, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
     if design.nrows() != diag.len() {
         return Err(format!(
@@ -3313,26 +3356,26 @@ fn binomial_location_scale_working_sets(
         }
 
         let grad_t = geom.threshold_design.transpose_vector_multiply(&grad_eta_t);
-        let hess_t = xt_diag_x_design(geom.threshold_design, &h_eta_t)?;
+        let hess_t = xt_diag_x_symmetric(geom.threshold_design, &h_eta_t)?.to_dense();
         let grad_ls = geom
             .log_sigma_design
             .transpose_vector_multiply(&grad_eta_ls);
-        let hess_ls = xt_diag_x_design(geom.log_sigma_design, &h_eta_ls)?;
+        let hess_ls = xt_diag_x_symmetric(geom.log_sigma_design, &h_eta_ls)?.to_dense();
         let grad_w = fast_atv(geom.wiggle_design, &grad_q);
         let hess_w = xt_diag_x_dense(geom.wiggle_design, &h_q_psd)?;
 
         return Ok((
             BlockWorkingSet::ExactNewton {
                 gradient: grad_t,
-                hessian: hess_t,
+                hessian: SymmetricMatrix::Dense(hess_t),
             },
             BlockWorkingSet::ExactNewton {
                 gradient: grad_ls,
-                hessian: hess_ls,
+                hessian: SymmetricMatrix::Dense(hess_ls),
             },
             Some(BlockWorkingSet::ExactNewton {
                 gradient: grad_w,
-                hessian: hess_w,
+                hessian: SymmetricMatrix::Dense(hess_w),
             }),
         ));
     }
@@ -7139,6 +7182,7 @@ mod tests {
         assert_eq!(eval.block_working_sets.len(), 3);
         match &eval.block_working_sets[0] {
             BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                let hessian = hessian.to_dense();
                 assert_eq!(gradient.len(), 1);
                 assert_eq!(hessian.dim(), (1, 1));
                 assert!(gradient[0].is_finite());
@@ -7148,6 +7192,7 @@ mod tests {
         }
         match &eval.block_working_sets[1] {
             BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                let hessian = hessian.to_dense();
                 assert_eq!(gradient.len(), 1);
                 assert_eq!(hessian.dim(), (1, 1));
                 assert!(gradient[0].is_finite());
@@ -7157,6 +7202,7 @@ mod tests {
         }
         match &eval.block_working_sets[2] {
             BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                let hessian = hessian.to_dense();
                 assert_eq!(gradient.len(), beta_w.len());
                 assert_eq!(hessian.nrows(), beta_w.len());
                 assert_eq!(hessian.ncols(), beta_w.len());
@@ -7238,7 +7284,7 @@ mod tests {
                 BlockWorkingSet::ExactNewton {
                     gradient: _,
                     hessian,
-                } => hessian.clone(),
+                } => hessian.to_dense(),
                 BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton"),
             }
         };

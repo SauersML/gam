@@ -1,3 +1,4 @@
+use crate::faer_ndarray::fast_xt_diag_x;
 use crate::types::RidgePolicy;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView2};
@@ -199,6 +200,43 @@ impl SymmetricMatrix {
         }
     }
 
+    pub fn add_dense(&self, other: &Array2<f64>) -> Result<Self, String> {
+        if self.nrows() != other.nrows() || self.ncols() != other.ncols() {
+            return Err(format!(
+                "SymmetricMatrix::add_dense shape mismatch: lhs {}x{}, rhs {}x{}",
+                self.nrows(),
+                self.ncols(),
+                other.nrows(),
+                other.ncols()
+            ));
+        }
+        match self {
+            Self::Dense(mat) => {
+                let mut out = mat.clone();
+                out += other;
+                Ok(Self::Dense(out))
+            }
+            Self::Sparse(mat) => {
+                let other_sparse =
+                    crate::linalg::sparse_exact::dense_to_sparse_symmetric_upper(other, 0.0)
+                        .map_err(|e| format!("SymmetricMatrix::add_dense failed: {e}"))?;
+                Ok(Self::Sparse(add_sparse_symmetric_upper(
+                    mat,
+                    &other_sparse,
+                )?))
+            }
+        }
+    }
+
+    pub fn add_ridge(&self, ridge: f64) -> Result<Self, String> {
+        let n = self.nrows();
+        let mut diagonal = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            diagonal[[i, i]] = ridge;
+        }
+        self.add_dense(&diagonal)
+    }
+
     pub fn nrows(&self) -> usize {
         match self {
             Self::Dense(m) => m.nrows(),
@@ -238,6 +276,90 @@ impl SymmetricMatrix {
             }
         }
     }
+}
+
+pub fn xt_diag_x_symmetric(
+    design: &DesignMatrix,
+    diag: &Array1<f64>,
+) -> Result<SymmetricMatrix, String> {
+    if design.nrows() != diag.len() {
+        return Err(format!(
+            "xt_diag_x_symmetric row mismatch: design has {} rows but diag has {} entries",
+            design.nrows(),
+            diag.len()
+        ));
+    }
+    match design {
+        DesignMatrix::Dense(x) => Ok(SymmetricMatrix::Dense(fast_xt_diag_x(x, diag))),
+        DesignMatrix::Sparse(xs) => {
+            let csr = xs
+                .to_csr_arc()
+                .ok_or_else(|| "xt_diag_x_symmetric: failed to obtain CSR view".to_string())?;
+            let sym = csr.symbolic();
+            let row_ptr = sym.row_ptr();
+            let col_idx = sym.col_idx();
+            let vals = csr.val();
+            let mut upper = Vec::new();
+            for i in 0..xs.nrows() {
+                let wi = diag[i];
+                if wi == 0.0 {
+                    continue;
+                }
+                let start = row_ptr[i];
+                let end = row_ptr[i + 1];
+                for a_ptr in start..end {
+                    let a = col_idx[a_ptr];
+                    let xa = vals[a_ptr];
+                    for b_ptr in a_ptr..end {
+                        let b = col_idx[b_ptr];
+                        let xb = vals[b_ptr];
+                        let value = wi * xa * xb;
+                        let (row, col) = if a <= b { (a, b) } else { (b, a) };
+                        upper.push(Triplet::new(row, col, value));
+                    }
+                }
+            }
+            let sparse = SparseColMat::try_new_from_triplets(xs.ncols(), xs.ncols(), &upper)
+                .map_err(|_| {
+                    "xt_diag_x_symmetric: failed to assemble sparse symmetric matrix".to_string()
+                })?;
+            Ok(SymmetricMatrix::Sparse(sparse))
+        }
+    }
+}
+
+fn add_sparse_symmetric_upper(
+    lhs: &SparseColMat<usize, f64>,
+    rhs: &SparseColMat<usize, f64>,
+) -> Result<SparseColMat<usize, f64>, String> {
+    if lhs.nrows() != rhs.nrows() || lhs.ncols() != rhs.ncols() {
+        return Err(format!(
+            "add_sparse_symmetric_upper shape mismatch: lhs {}x{}, rhs {}x{}",
+            lhs.nrows(),
+            lhs.ncols(),
+            rhs.nrows(),
+            rhs.ncols()
+        ));
+    }
+    let mut upper = BTreeMap::<(usize, usize), f64>::new();
+    for matrix in [lhs, rhs] {
+        let (symbolic, values) = matrix.parts();
+        let col_ptr = symbolic.col_ptr();
+        let row_idx = symbolic.row_idx();
+        for col in 0..matrix.ncols() {
+            for idx in col_ptr[col]..col_ptr[col + 1] {
+                let row = row_idx[idx];
+                let key = if row <= col { (row, col) } else { (col, row) };
+                *upper.entry(key).or_insert(0.0) += values[idx];
+            }
+        }
+    }
+    let triplets: Vec<_> = upper
+        .into_iter()
+        .filter_map(|((row, col), value)| (value != 0.0).then_some(Triplet::new(row, col, value)))
+        .collect();
+    SparseColMat::try_new_from_triplets(lhs.nrows(), lhs.ncols(), &triplets)
+        .map_err(|_| "add_sparse_symmetric_upper failed to assemble CSC".to_string())
 }
 
 /// A generic abstraction over a factorized symmetric positive-definite (or regularized) system.
@@ -530,33 +652,27 @@ impl LinearOperator for DesignMatrix {
                 }
             }
             Self::Sparse(xs) => {
-                if let Ok(csr) = xs.as_ref().to_row_major() {
-                    let sym = csr.symbolic();
-                    let row_ptr = sym.row_ptr();
-                    let col_idx = sym.col_idx();
-                    let vals = csr.val();
-                    for i in 0..xs.nrows() {
-                        let start = row_ptr[i];
-                        let end = row_ptr[i + 1];
-                        let mut acc = 0.0_f64;
-                        for a in start..end {
-                            let j = col_idx[a];
-                            let xij = vals[a];
-                            for b in start..end {
-                                let k = col_idx[b];
-                                let xik = vals[b];
-                                acc += xij * middle[[j, k]] * xik;
-                            }
+                let csr = xs
+                    .to_csr_arc()
+                    .ok_or_else(|| "quadratic_form_diag: failed to obtain CSR view".to_string())?;
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for i in 0..xs.nrows() {
+                    let start = row_ptr[i];
+                    let end = row_ptr[i + 1];
+                    let mut acc = 0.0_f64;
+                    for a in start..end {
+                        let j = col_idx[a];
+                        let xij = vals[a];
+                        for b in start..end {
+                            let k = col_idx[b];
+                            let xik = vals[b];
+                            acc += xij * middle[[j, k]] * xik;
                         }
-                        out[i] = acc.max(0.0);
                     }
-                } else {
-                    let dense_arc = self.to_dense_arc();
-                    let dense = dense_arc.as_ref();
-                    let xc = dense.dot(middle);
-                    for i in 0..dense.nrows() {
-                        out[i] = dense.row(i).dot(&xc.row(i)).max(0.0);
-                    }
+                    out[i] = acc.max(0.0);
                 }
             }
         }
