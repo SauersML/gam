@@ -1,9 +1,9 @@
-use gam::{
-    CenterStrategy, FitOptions, LikelihoodFamily, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
-    fit_term_collection, predict_gam,
-};
 use gam::estimate::AdaptiveRegularizationOptions;
+use gam::{
+    CenterStrategy, FitOptions, LikelihoodFamily, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, fit_term_collection,
+    predict_gam,
+};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -92,10 +92,11 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
     )
     .expect("Matérn term-collection fit should succeed");
 
-    // Matérn uses the operator decomposition and keeps three active
-    // penalties under double_penalty:
-    // magnitude (mass), slope (tension), and curvature (stiffness).
-    assert_eq!(fitted.fit.lambdas.len(), 3);
+    // With `double_penalty=true`, the Matérn basis uses the normalized RKHS
+    // kernel penalty plus a null-space shrinkage block. Under center-sum-to-zero
+    // and no explicit intercept, the shrinkage block is inactive, so only the
+    // primary penalty remains.
+    assert_eq!(fitted.fit.lambdas.len(), 1);
     assert!(fitted.fit.edf_total.is_finite());
 
     let pred = predict_gam(
@@ -138,9 +139,9 @@ fn matern_fit_term_collection_gaussian_simulated_10d_with_exact_adaptive_regular
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
             name: "matern_10d".to_string(),
-                basis: SmoothBasisSpec::Matern {
-                    feature_cols: (0..d).collect(),
-                    spec: MaternBasisSpec {
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: (0..d).collect(),
+                spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale: 0.95,
                     nu: MaternNu::FiveHalves,

@@ -129,7 +129,8 @@ fn classify_invalid_tps_spec(lower: &str) -> Option<String> {
                 .to_string(),
         );
     }
-    if lower.contains("fewer unique covariate combinations than specified maximum degrees of freedom")
+    if lower
+        .contains("fewer unique covariate combinations than specified maximum degrees of freedom")
     {
         return Some(
             "Invalid thin-plate model specification. The requested basis is too large for the joint covariate support in this term; reduce the basis size or the joint smooth dimension."
@@ -1046,17 +1047,20 @@ fn run_fit_with_predict_noise(
                     .to_string(),
             );
         }
-        let sd = sample_std(y.view()).max(1e-6);
-        let sigma_min = (sd * 1e-3).max(1e-6);
-        let sigma_max = (sd * 1e3).max(sigma_min * 10.0);
+        let response_scale = sample_std(y.view()).max(1e-6);
+        let y_scaled = y.mapv(|v| v / response_scale);
+        let sigma_min = (response_scale * 1e-3).max(1e-6);
+        let sigma_max = (response_scale * 1e3).max(sigma_min * 10.0);
+        let sigma_min_scaled = (sigma_min / response_scale).max(1e-6);
+        let sigma_max_scaled = (sigma_max / response_scale).max(sigma_min_scaled * 10.0);
         let options = blockwise_options_from_fit_args(args)?;
         let solved = fit_gaussian_location_scale_terms(
             ds.values.view(),
             GaussianLocationScaleTermSpec {
-                y: y.clone(),
+                y: y_scaled,
                 weights: Array1::ones(y.len()),
-                sigma_min,
-                sigma_max,
+                sigma_min: sigma_min_scaled,
+                sigma_max: sigma_max_scaled,
                 mean_spec: mean_spec.clone(),
                 log_sigma_spec: noise_spec.clone(),
             },
@@ -1083,14 +1087,24 @@ fn run_fit_with_predict_noise(
                 .block_states
                 .first()
                 .map(|b| b.beta.clone())
-                .unwrap_or_else(|| Array1::zeros(0));
+                .unwrap_or_else(|| Array1::zeros(0))
+                .mapv(|v| v * response_scale);
+            let beta_covariance = fit
+                .covariance_conditional
+                .clone()
+                .map(|cov| cov.mapv(|v| v * response_scale * response_scale));
+            let beta_covariance_corrected = fit
+                .covariance_conditional
+                .clone()
+                .map(|cov| cov.mapv(|v| v * response_scale * response_scale));
             let fit_result = core_saved_fit_result(
                 beta_mean,
                 fit.lambdas.clone(),
                 1.0,
-                fit.covariance_conditional.clone(),
-                fit.covariance_conditional.clone(),
-                SavedFitSummary::from_blockwise_fit(&fit)?,
+                beta_covariance,
+                beta_covariance_corrected,
+                SavedFitSummary::from_blockwise_fit(&fit)?
+                    .rescaled_gaussian_location_scale(response_scale, y.len())?,
             );
             let model = build_location_scale_saved_model(
                 formula_text.to_string(),
@@ -2069,7 +2083,8 @@ fn run_predict_standard_or_flexible(
             predict_joint(&joint, &eta_base, se_base.as_ref())
         } else {
             predict_joint(&joint, &eta_base, None)
-        };
+        }
+        .map_err(|e| format!("joint prediction failed: {e}"))?;
         let mut mean_lo = None;
         let mut mean_hi = None;
         if args.uncertainty {
@@ -4414,7 +4429,8 @@ fn run_generate_standard_or_flexible(
             ));
         }
         let eta_base = design.design.dot(&beta_base);
-        let pred = predict_joint(&joint, &eta_base, None);
+        let pred = predict_joint(&joint, &eta_base, None)
+            .map_err(|e| format!("joint prediction failed: {e}"))?;
         Ok(gam::generative::GenerativeSpec {
             mean: pred.probabilities,
             noise: gam::generative::NoiseModel::Bernoulli,
@@ -5261,6 +5277,19 @@ impl SavedFitSummary {
             reml_score: fit.penalized_objective,
         }
         .validated()
+    }
+
+    fn rescaled_gaussian_location_scale(
+        mut self,
+        response_scale: f64,
+        n_obs: usize,
+    ) -> Result<Self, String> {
+        let n = n_obs as f64;
+        let log_scale = response_scale.max(1e-12).ln();
+        self.deviance += 2.0 * n * log_scale;
+        self.reml_score += n * log_scale;
+        self.max_abs_eta *= response_scale;
+        self.validated()
     }
 
     fn from_joint_result(joint: &JointModelResult) -> Result<Self, String> {
@@ -8186,8 +8215,7 @@ mod tests {
         BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, LikelihoodFamily, LinkMode,
         MODEL_VERSION, ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs,
         SurvivalTimeBasisConfig, apply_saved_probit_wiggle, build_survival_time_basis,
-        classify_cli_error,
-        chi_square_survival_approx, collect_linear_smooth_overlap_warnings,
+        chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlap_warnings,
         collect_spatial_smooth_usage_warnings, compute_probit_q0_from_eta, core_saved_fit_result,
         parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
         parse_surv_response, parse_survival_inverse_link, parse_survival_time_basis_config,
@@ -8806,7 +8834,10 @@ mod tests {
     #[test]
     fn parse_duchon_power_defaults_to_two() {
         let options = BTreeMap::new();
-        assert_eq!(parse_duchon_power(&options).expect("default Duchon power"), 2);
+        assert_eq!(
+            parse_duchon_power(&options).expect("default Duchon power"),
+            2
+        );
     }
 
     #[test]

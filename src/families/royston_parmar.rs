@@ -178,8 +178,9 @@ fn warn_survival_lambda_optimization_health(
 ///
 /// The caller provides the exact survival objective and exact gradient in rho-space:
 ///   `(value, grad_rho) = (V(rho), dV/drho)`.
-/// The optimizer in `estimate.rs` then runs multi-start BFGS in unconstrained
-/// coordinates and applies the chain rule internally.
+/// The engine optimizer then runs multi-start BFGS directly in `rho = log(lambda)`
+/// coordinates and uses that gradient as-is; it does not apply any additional
+/// `lambda -> rho` chain-rule transform.
 pub fn optimize_survival_lambdas_with_multistart<F>(
     num_penalties: usize,
     heuristic_lambdas: Option<&[f64]>,

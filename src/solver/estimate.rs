@@ -222,6 +222,39 @@ impl ParametricColumnConditioning {
         })
     }
 
+    fn transform_directional_hyper_to_internal(
+        &self,
+        hyper_dir: &DirectionalHyperParam,
+    ) -> Result<DirectionalHyperParam, EstimationError> {
+        let x_tau_original = self.transform_matrix_columns_with_a(&hyper_dir.x_tau_original);
+        let x_tau_tau_original = hyper_dir.x_tau_tau_original.as_ref().map(|rows| {
+            rows.iter()
+                .map(|mat| self.transform_matrix_columns_with_a(mat))
+                .collect::<Vec<_>>()
+        });
+        let penalty_first_components = hyper_dir
+            .penalty_first_components()
+            .iter()
+            .map(|component| (component.penalty_index, component.matrix.clone()))
+            .collect::<Vec<_>>();
+        let penalty_second_components = hyper_dir.penalty_second_component_rows().map(|rows| {
+            rows.iter()
+                .map(|components| {
+                    components
+                        .iter()
+                        .map(|component| (component.penalty_index, component.matrix.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
+        DirectionalHyperParam::new(
+            x_tau_original,
+            penalty_first_components,
+            x_tau_tau_original,
+            penalty_second_components,
+        )
+    }
+
     fn backtransform_beta(&self, beta_internal: &Array1<f64>) -> Array1<f64> {
         let mut beta = beta_internal.clone();
         for &(j, mean, scale) in &self.columns {
@@ -805,7 +838,8 @@ impl core::fmt::Debug for EstimationError {
 //
 // The model is: η = g(Xβ) where g is a learned flexible link function.
 // Domain-specific training orchestration is handled by caller adapters.
-// The gam engine exposes matrix/family-based APIs: fit_gam / optimize_external_design.
+// The gam engine exposes matrix/family-based external-design APIs for supported
+// GLM-style families: fit_gam / optimize_external_design.
 
 pub struct ExternalOptimResult {
     pub beta: Array1<f64>,
@@ -915,9 +949,9 @@ fn resolved_external_inverse_link(
     sas_link: Option<SasLinkSpec>,
 ) -> Result<InverseLink, EstimationError> {
     if let Some(spec) = mixture_link {
-        return Ok(InverseLink::Mixture(state_from_spec(spec).map_err(|e| {
-            EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
-        })?));
+        return Ok(InverseLink::Mixture(state_from_spec(spec).map_err(
+            |e| EstimationError::InvalidInput(format!("invalid blended inverse link: {e}")),
+        )?));
     }
     if let Some(spec) = sas_link {
         return Ok(match link {
@@ -933,6 +967,23 @@ fn resolved_external_inverse_link(
         });
     }
     Ok(InverseLink::Standard(link))
+}
+
+#[inline]
+fn resolved_external_config(
+    opts: &ExternalOptimOptions,
+) -> Result<(RemlConfig, Option<SasLinkSpec>), EstimationError> {
+    if opts.mixture_link.is_some() && opts.sas_link.is_some() {
+        return Err(EstimationError::InvalidInput(
+            "mixture_link and sas_link are mutually exclusive".to_string(),
+        ));
+    }
+    let effective_sas_link = effective_sas_link_for_family(opts.family, opts.sas_link);
+    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+    let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
+    cfg.link_kind =
+        resolved_external_inverse_link(link, opts.mixture_link.as_ref(), effective_sas_link)?;
+    Ok((cfg, effective_sas_link))
 }
 
 #[inline]
@@ -1101,16 +1152,7 @@ where
             active_nullspace_dims.len()
         )));
     }
-    let effective_sas_link = effective_sas_link_for_family(opts.family, opts.sas_link);
-    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
-    let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
-    if opts.mixture_link.is_some() && opts.sas_link.is_some() {
-        return Err(EstimationError::InvalidInput(
-            "mixture_link and sas_link are mutually exclusive for this fit".to_string(),
-        ));
-    }
-    cfg.link_kind =
-        resolved_external_inverse_link(link, opts.mixture_link.as_ref(), effective_sas_link)?;
+    let (cfg, effective_sas_link) = resolved_external_config(opts)?;
 
     let rs_list = compute_penalty_square_roots(&s_list)?;
 
@@ -1121,7 +1163,7 @@ where
     let x_fit_o = x_fit.clone();
     let offset_o = offset.to_owned();
     let s_list_shared = Arc::new(s_list);
-    let reml_state = RemlState::new_with_offset_shared(
+    let mut reml_state = RemlState::new_with_offset_shared(
         y_o.view(),
         x_fit_o.clone(),
         w_o.view(),
@@ -1151,17 +1193,13 @@ where
             } else {
                 12
             },
-            screening_budget: if k <= 6 {
-                2
-            } else {
-                3
-            },
-            screen_max_inner_iterations: if matches!(link, LinkFunction::Identity) {
+            screening_budget: if k <= 6 { 2 } else { 3 },
+            screen_max_inner_iterations: if matches!(cfg.link_function(), LinkFunction::Identity) {
                 3
             } else {
                 5
             },
-            risk_profile: if matches!(link, LinkFunction::Identity) {
+            risk_profile: if matches!(cfg.link_function(), LinkFunction::Identity) {
                 SeedRiskProfile::Gaussian
             } else {
                 SeedRiskProfile::GeneralizedLinear
@@ -1202,20 +1240,23 @@ where
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
         let outer_result =
-            crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient(
+            crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_state(
                 k,
                 heuristic_lambdas,
-                |rho: &Array1<f64>| {
+                &mut reml_state,
+                |state| state.set_warm_start_original_beta(None),
+                |state, rho: &Array1<f64>| state.compute_cost(rho),
+                |state, rho: &Array1<f64>| {
                     let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
 
                     let t_cost = Instant::now();
-                    let cost = reml_state.compute_cost(rho)?;
+                    let cost = state.compute_cost(rho)?;
                     let cost_sec = t_cost.elapsed().as_secs_f64();
 
                     let t_grad = Instant::now();
-                    let grad = reml_state.compute_gradient(rho)?;
+                    let grad = state.compute_gradient(rho)?;
                     let grad_sec = t_grad.elapsed().as_secs_f64();
-                    let used_stochastic = reml_state.last_gradient_used_stochastic_fallback();
+                    let used_stochastic = state.last_gradient_used_stochastic_fallback();
                     log::info!(
                         "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3})",
                         rho.len(),
@@ -1238,7 +1279,8 @@ where
     } else {
         let use_mixture = mixture_dim > 0;
         let use_sas = sas_dim > 0;
-        let use_beta_logistic = use_sas && matches!(link, LinkFunction::BetaLogistic);
+        let use_beta_logistic =
+            use_sas && matches!(cfg.link_function(), LinkFunction::BetaLogistic);
         let theta_dim = k + mixture_dim + sas_dim;
         let sas_spec = sas_opt_spec;
         let mix_spec = mixture_opt_spec
@@ -1843,7 +1885,7 @@ where
             link_kind: if let Some(state) = final_mixture_state.clone() {
                 InverseLink::Mixture(state)
             } else if let Some(state) = final_sas_state {
-                if matches!(link, LinkFunction::BetaLogistic) {
+                if matches!(cfg.link_function(), LinkFunction::BetaLogistic) {
                     InverseLink::BetaLogistic(state)
                 } else {
                     InverseLink::Sas(state)
@@ -1868,7 +1910,7 @@ where
 
     // Weighted residual sum of squares for Gaussian models
     let n = y_o.len() as f64;
-    let weighted_rss = if matches!(link, LinkFunction::Identity) {
+    let weighted_rss = if matches!(cfg.link_function(), LinkFunction::Identity) {
         let fitted = {
             let mut eta = offset_o.clone();
             eta += &x_o.matrix_vector_multiply(&beta_orig);
@@ -1940,7 +1982,7 @@ where
 
     // Persist residual-based scale for Gaussian identity models.
     // Contract: residual standard deviation sigma, not variance.
-    let standard_deviation = match link {
+    let standard_deviation = match cfg.link_function() {
         LinkFunction::Identity => {
             let denom = (n - edf_total).max(1.0);
             (weighted_rss / denom).sqrt()
@@ -2075,7 +2117,7 @@ fn validate_and_build_reml_state<X, T, F>(
 ) -> Result<T, EstimationError>
 where
     X: Into<DesignMatrix>,
-    F: for<'a> FnOnce(&RemlState<'a>) -> Result<T, EstimationError>,
+    F: for<'a> FnOnce(&RemlState<'a>, &[DirectionalHyperParam]) -> Result<T, EstimationError>,
 {
     let x = x.into();
     if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
@@ -2175,21 +2217,30 @@ where
         }
     }
 
-    let effective_sas_link = effective_sas_link_for_family(opts.family, opts.sas_link);
-    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
-    let has_design_drift = hyper_dirs
+    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_list);
+    let x_fit = conditioning.apply_to_design(&x);
+    let fit_linear_constraints =
+        conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
+    let conditioned_hyper_dirs = hyper_dirs
+        .iter()
+        .map(|dir| conditioning.transform_directional_hyper_to_internal(dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (cfg, _) = resolved_external_config(opts)?;
+    let has_design_drift = conditioned_hyper_dirs
         .iter()
         .any(|dir| dir.x_tau_original.iter().any(|v| v.abs() > 1e-14));
-    ensure_exact_directional_hyper_supported(link, firth_active, has_design_drift, context)?;
-    let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
-    cfg.link_kind =
-        resolved_external_inverse_link(link, opts.mixture_link.as_ref(), effective_sas_link)?;
+    ensure_exact_directional_hyper_supported(
+        cfg.link_function(),
+        cfg.firth_bias_reduction,
+        has_design_drift,
+        context,
+    )?;
     let y_o = y.to_owned();
     let w_o = w.to_owned();
     let offset_o = offset.to_owned();
     let mut reml_state = RemlState::new_with_offset(
         y_o.view(),
-        x,
+        x_fit,
         w_o.view(),
         offset_o.view(),
         s_list,
@@ -2197,14 +2248,14 @@ where
         &cfg,
         Some(active_nullspace_dims),
         None,
-        opts.linear_constraints.clone(),
+        fit_linear_constraints,
     )?;
     reml_state.set_link_states(
         cfg.link_kind.mixture_state().cloned(),
         cfg.link_kind.sas_state().copied(),
     );
     reml_state.set_warm_start_original_beta(warm_start_beta);
-    eval(&reml_state)
+    eval(&reml_state, &conditioned_hyper_dirs)
 }
 
 pub(crate) fn compute_external_joint_hyper_cost_gradient_hessian<X>(
@@ -2234,8 +2285,12 @@ where
         warm_start_beta,
         opts,
         "compute_external_joint_hyper_cost_gradient_hessian",
-        |reml_state| {
-            reml_state.compute_joint_hyper_cost_gradient_hessian(theta, rho_dim, hyper_dirs)
+        |reml_state, conditioned_hyper_dirs| {
+            reml_state.compute_joint_hyper_cost_gradient_hessian(
+                theta,
+                rho_dim,
+                conditioned_hyper_dirs,
+            )
         },
     )
 }
@@ -2972,8 +3027,10 @@ pub use crate::solver::smoothing::{
     optimize_log_smoothing_with_multistart_with_gradient,
 };
 
-/// Canonical engine entrypoint for external designs.
-/// Likelihood dispatch is determined exclusively by `family`.
+/// Canonical engine entrypoint for external designs on supported GLM-style
+/// families.
+/// Likelihood dispatch is determined by `family` together with external-link
+/// options in `opts`; survival families use survival-specific training APIs.
 pub fn fit_gam_with_heuristic_lambdas<X>(
     x: X,
     y: ArrayView1<'_, f64>,
@@ -3194,8 +3251,9 @@ where
     })
 }
 
-/// Canonical engine entrypoint for external designs.
-/// Likelihood dispatch is determined exclusively by `family`.
+/// External-design GAM entrypoint for GLM-style families supported by
+/// `optimize_external_design`.
+/// Survival families such as `RoystonParmar` use survival-specific training APIs.
 pub fn fit_gam<X>(
     x: X,
     y: ArrayView1<'_, f64>,
@@ -3619,17 +3677,19 @@ where
         )));
     }
 
-    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
-    let cfg = RemlConfig::external(link, opts.tol, firth_active);
+    let (cfg, _) = resolved_external_config(opts)?;
 
     let y_o = y.to_owned();
     let w_o = w.to_owned();
-    let x_o = x.clone();
     let offset_o = offset.to_owned();
+    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_vec);
+    let x_fit = conditioning.apply_to_design(&x);
+    let fit_linear_constraints =
+        conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
 
-    let reml_state = RemlState::new_with_offset(
+    let mut reml_state = RemlState::new_with_offset(
         y_o.view(),
-        x_o,
+        x_fit,
         w_o.view(),
         offset_o.view(),
         s_vec,
@@ -3637,8 +3697,12 @@ where
         &cfg,
         Some(active_nullspace_dims),
         None,
-        opts.linear_constraints.clone(),
+        fit_linear_constraints,
     )?;
+    reml_state.set_link_states(
+        cfg.link_kind.mixture_state().cloned(),
+        cfg.link_kind.sas_state().copied(),
+    );
 
     let analytic_grad = reml_state.compute_gradient(rho)?;
     let fd_grad = compute_fd_gradient(&reml_state, rho)?;
@@ -3686,17 +3750,19 @@ where
         )));
     }
 
-    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
-    let cfg = RemlConfig::external(link, opts.tol, firth_active);
+    let (cfg, _) = resolved_external_config(opts)?;
 
     let y_o = y.to_owned();
     let w_o = w.to_owned();
-    let x_o = x.clone();
     let offset_o = offset.to_owned();
+    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_vec);
+    let x_fit = conditioning.apply_to_design(&x);
+    let fit_linear_constraints =
+        conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
 
-    let reml_state = RemlState::new_with_offset(
+    let mut reml_state = RemlState::new_with_offset(
         y_o.view(),
-        x_o,
+        x_fit,
         w_o.view(),
         offset_o.view(),
         s_vec,
@@ -3704,8 +3770,12 @@ where
         &cfg,
         Some(active_nullspace_dims),
         None,
-        opts.linear_constraints.clone(),
+        fit_linear_constraints,
     )?;
+    reml_state.set_link_states(
+        cfg.link_kind.mixture_state().cloned(),
+        cfg.link_kind.sas_state().copied(),
+    );
 
     let cost = reml_state.compute_cost(rho)?;
     let ridge = reml_state.last_ridge_used().unwrap_or(0.0);
@@ -3747,18 +3817,14 @@ where
         "evaluate_external_theta_cost_gradient",
     )?;
     let k = active_nullspace_dims.len();
+    let (cfg, effective_sas_link) = resolved_external_config(opts)?;
     let use_mixture = opts.mixture_link.is_some();
-    let use_sas = opts.sas_link.is_some();
+    let use_sas = effective_sas_link.is_some();
     let use_beta_logistic = use_sas
         && matches!(
             opts.family,
             crate::types::LikelihoodFamily::BinomialBetaLogistic
         );
-    if use_mixture && use_sas {
-        return Err(EstimationError::InvalidInput(
-            "mixture_link and sas_link are mutually exclusive for this evaluator".to_string(),
-        ));
-    }
     let aux_dim = if use_mixture {
         opts.mixture_link
             .as_ref()
@@ -3776,18 +3842,16 @@ where
             theta.len()
         )));
     }
-    let effective_sas_link = effective_sas_link_for_family(opts.family, opts.sas_link);
-    let (link, firth_active) = resolve_external_family(opts.family, opts.firth_bias_reduction)?;
-    let mut cfg = RemlConfig::external(link, opts.tol, firth_active);
-    cfg.link_kind =
-        resolved_external_inverse_link(link, opts.mixture_link.as_ref(), effective_sas_link)?;
     let y_o = y.to_owned();
     let w_o = w.to_owned();
-    let x_o = x.clone();
     let offset_o = offset.to_owned();
+    let conditioning = ParametricColumnConditioning::infer_from_penalties(&x, &s_list);
+    let x_fit = conditioning.apply_to_design(&x);
+    let fit_linear_constraints =
+        conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
     let mut reml_state = RemlState::new_with_offset(
         y_o.view(),
-        x_o,
+        x_fit,
         w_o.view(),
         offset_o.view(),
         s_list,
@@ -3795,8 +3859,12 @@ where
         &cfg,
         Some(active_nullspace_dims),
         None,
-        opts.linear_constraints.clone(),
+        fit_linear_constraints,
     )?;
+    reml_state.set_link_states(
+        cfg.link_kind.mixture_state().cloned(),
+        cfg.link_kind.sas_state().copied(),
+    );
     let rho = theta.slice(s![..k]).to_owned();
     let mut mix_state_eval: Option<crate::types::MixtureLinkState> = None;
     let mut sas_state_eval: Option<crate::types::SasLinkState> = None;
@@ -3846,7 +3914,7 @@ where
     if aux_dim == 0 {
         return Ok((cost, grad));
     }
-    if firth_active {
+    if cfg.firth_bias_reduction {
         return Err(EstimationError::InvalidInput(
             "theta-space link-parameter gradients are incompatible with Firth-adjusted outer gradients"
                 .to_string(),
@@ -3865,6 +3933,76 @@ where
             let (barrier_cost, _) = sas_log_delta_edge_barrier_cost_grad(log_delta);
             cost += barrier_cost;
         }
+    }
+
+    if use_sas {
+        let mut eval_sas_total_cost =
+            |raw_epsilon: f64, raw_log_delta: f64| -> Result<f64, EstimationError> {
+                let epsilon = if use_beta_logistic {
+                    raw_epsilon
+                } else {
+                    let (v, _) = sas_effective_epsilon(raw_epsilon);
+                    v
+                };
+                let sas_state = if use_beta_logistic {
+                    state_from_beta_logistic_spec(SasLinkSpec {
+                        initial_epsilon: epsilon,
+                        initial_log_delta: raw_log_delta,
+                    })
+                    .map_err(|e| {
+                        EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
+                    })?
+                } else {
+                    state_from_sas_spec(SasLinkSpec {
+                        initial_epsilon: epsilon,
+                        initial_log_delta: raw_log_delta,
+                    })
+                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?
+                };
+                reml_state.set_link_states(None, Some(sas_state));
+                let mut c = reml_state.compute_cost(&rho)?;
+                if sas_ridge > 0.0 {
+                    c += 0.5 * sas_ridge * raw_log_delta * raw_log_delta;
+                    if !use_beta_logistic {
+                        let (barrier_cost, _) = sas_log_delta_edge_barrier_cost_grad(raw_log_delta);
+                        c += barrier_cost;
+                    }
+                }
+                Ok(c)
+            };
+
+        let raw_epsilon = theta[k];
+        let raw_log_delta = theta[k + 1];
+        let mut h_eps = 1e-3 * (1.0 + raw_epsilon.abs());
+        let mut h_ld = 1e-3 * (1.0 + raw_log_delta.abs());
+        grad[k] = loop {
+            let fp = eval_sas_total_cost(raw_epsilon + h_eps, raw_log_delta);
+            let fm = eval_sas_total_cost(raw_epsilon - h_eps, raw_log_delta);
+            if let (Ok(fp), Ok(fm)) = (fp, fm) {
+                break (fp - fm) / (2.0 * h_eps);
+            }
+            h_eps *= 0.5;
+            if h_eps < 1e-7 {
+                return Err(EstimationError::InvalidInput(
+                    "failed to evaluate stable SAS epsilon finite-difference gradient".to_string(),
+                ));
+            }
+        };
+        grad[k + 1] = loop {
+            let fp = eval_sas_total_cost(raw_epsilon, raw_log_delta + h_ld);
+            let fm = eval_sas_total_cost(raw_epsilon, raw_log_delta - h_ld);
+            if let (Ok(fp), Ok(fm)) = (fp, fm) {
+                break (fp - fm) / (2.0 * h_ld);
+            }
+            h_ld *= 0.5;
+            if h_ld < 1e-7 {
+                return Err(EstimationError::InvalidInput(
+                    "failed to evaluate stable SAS log-delta finite-difference gradient"
+                        .to_string(),
+                ));
+            }
+        };
+        return Ok((cost, grad));
     }
 
     let (pirls_mix, h_pos_w) = reml_state.pirls_result_and_hpos_for_rho(&rho)?;
@@ -4011,17 +4149,6 @@ where
             trace_term += leverage[i] * dw_total;
         }
         grad[k + j] = -direct_ll[j] + 0.5 * trace_term;
-    }
-    if use_sas && !use_beta_logistic {
-        let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
-        grad[k] *= d_eps_d_raw;
-    }
-    if use_sas && sas_ridge > 0.0 {
-        grad[k + 1] += sas_ridge * theta[k + 1];
-        if !use_beta_logistic {
-            let (_, barrier_grad) = sas_log_delta_edge_barrier_cost_grad(theta[k + 1]);
-            grad[k + 1] += barrier_grad;
-        }
     }
     Ok((cost, grad))
 }

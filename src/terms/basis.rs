@@ -399,6 +399,7 @@ impl BasisOutputFormat for Dense {
                     dense[[row_idx[idx], col]] += values[idx];
                 }
             }
+            apply_dense_bspline_extrapolation(data, knot_view, degree, eval_kind, &mut dense)?;
             dense
         } else {
             generate_basis_internal::<DenseStorage>(data.view(), knot_view, degree, eval_kind)?
@@ -425,6 +426,59 @@ impl BasisOutputFormat for Dense {
         }
         Ok(Arc::new(dense))
     }
+}
+
+fn apply_dense_bspline_extrapolation(
+    data: ArrayView1<f64>,
+    knot_view: ArrayView1<f64>,
+    degree: usize,
+    eval_kind: BasisEvalKind,
+    basis_matrix: &mut Array2<f64>,
+) -> Result<(), BasisError> {
+    let num_basis_functions = basis_matrix.ncols();
+    if num_basis_functions == 0 {
+        return Ok(());
+    }
+
+    let left = knot_view[degree];
+    let right = knot_view[num_basis_functions];
+
+    if matches!(eval_kind, BasisEvalKind::FirstDerivative) {
+        let num_basis_lower = knot_view.len().saturating_sub(degree);
+        let mut lower_basis = vec![0.0; num_basis_lower];
+        let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(1));
+        for (i, &x) in data.iter().enumerate() {
+            if x >= left && x <= right {
+                continue;
+            }
+            let x_c = x.clamp(left, right);
+            let mut row = basis_matrix.row_mut(i);
+            let row_slice = row
+                .as_slice_mut()
+                .expect("basis matrix rows should be contiguous");
+            evaluate_bspline_derivative_scalar_into(
+                x_c,
+                knot_view,
+                degree,
+                row_slice,
+                &mut lower_basis,
+                &mut lower_scratch,
+            )?;
+        }
+    }
+
+    if matches!(eval_kind, BasisEvalKind::Basis) {
+        let z_clamped = data.mapv(|x| x.clamp(left, right));
+        apply_linear_extension_from_first_derivative(
+            data,
+            z_clamped.view(),
+            knot_view,
+            degree,
+            basis_matrix,
+        )?;
+    }
+
+    Ok(())
 }
 
 impl BasisOutputFormat for Sparse {
@@ -567,18 +621,20 @@ fn evaluate_splines_derivative_sparse_into_with_lower(
     lower_scratch: &mut internal::BsplineScratch,
 ) -> usize {
     let num_basis = knot_view.len().saturating_sub(degree + 1);
-    if num_basis > 0 {
+    let x_eval = if num_basis > 0 {
         let left = knot_view[degree];
         let right = knot_view[num_basis];
-        // Constant extrapolation outside the domain implies zero derivatives.
-        if x < left || x > right {
-            values.fill(0.0);
-            return 0;
-        }
+        x.clamp(left, right)
+    } else {
+        x
+    };
+    if num_basis > 0 {
+        // Linear extrapolation outside the domain uses the boundary slope, so
+        // first derivatives clamp to the nearest boundary derivative value.
     }
 
     let start_col =
-        internal::evaluate_splines_sparse_into(x, degree, knot_view, values, basis_scratch);
+        internal::evaluate_splines_sparse_into(x_eval, degree, knot_view, values, basis_scratch);
     if degree == 0 {
         values.fill(0.0);
         return start_col;
@@ -591,7 +647,7 @@ fn evaluate_splines_derivative_sparse_into_with_lower(
     }
 
     let start_lower = internal::evaluate_splines_sparse_into(
-        x,
+        x_eval,
         lower_degree,
         knot_view,
         lower_values,
@@ -779,6 +835,84 @@ fn evaluate_bspline_row_entries<F>(
 ) where
     F: FnMut(usize, f64),
 {
+    if num_basis_functions > 0 {
+        let left = knot_view[degree];
+        let right = knot_view[num_basis_functions];
+        if x < left || x > right {
+            match eval_kind {
+                BasisEvalKind::Basis => {
+                    let x_c = x.clamp(left, right);
+                    let dz = x - x_c;
+                    let mut deriv_values = vec![0.0; values.len()];
+                    values.fill(0.0);
+                    let basis_start = internal::evaluate_splines_sparse_into(
+                        x_c,
+                        degree,
+                        knot_view,
+                        values,
+                        &mut scratch.basis,
+                    );
+                    let deriv_start = evaluate_splines_derivative_sparse_into(
+                        x_c,
+                        degree,
+                        knot_view,
+                        &mut deriv_values,
+                        scratch,
+                    );
+                    let mut cols = Vec::<usize>::with_capacity(values.len() * 2);
+                    let mut vals = Vec::<f64>::with_capacity(values.len() * 2);
+                    let push_or_add =
+                        |col_j: usize, value: f64, cols: &mut Vec<usize>, vals: &mut Vec<f64>| {
+                            if value == 0.0 {
+                                return;
+                            }
+                            if let Some(pos) = cols.iter().position(|&col| col == col_j) {
+                                vals[pos] += value;
+                            } else {
+                                cols.push(col_j);
+                                vals.push(value);
+                            }
+                        };
+                    for (offset, &v) in values.iter().enumerate() {
+                        let col_j = basis_start + offset;
+                        if col_j < num_basis_functions {
+                            push_or_add(col_j, v, &mut cols, &mut vals);
+                        }
+                    }
+                    for (offset, &v) in deriv_values.iter().enumerate() {
+                        let col_j = deriv_start + offset;
+                        if col_j < num_basis_functions {
+                            push_or_add(col_j, dz * v, &mut cols, &mut vals);
+                        }
+                    }
+                    for (col_j, v) in cols.into_iter().zip(vals.into_iter()) {
+                        if v != 0.0 {
+                            write_entry(col_j, v);
+                        }
+                    }
+                    return;
+                }
+                BasisEvalKind::FirstDerivative => {
+                    let x_c = x.clamp(left, right);
+                    let start_col = evaluate_splines_derivative_sparse_into(
+                        x_c, degree, knot_view, values, scratch,
+                    );
+                    for (offset, &v) in values.iter().enumerate() {
+                        if v == 0.0 {
+                            continue;
+                        }
+                        let col_j = start_col + offset;
+                        if col_j < num_basis_functions {
+                            write_entry(col_j, v);
+                        }
+                    }
+                    return;
+                }
+                BasisEvalKind::SecondDerivative => {}
+            }
+        }
+    }
+
     let start_col =
         evaluate_splines_sparse_with_kind(x, degree, knot_view, eval_kind, values, scratch);
     for (offset, &v) in values.iter().enumerate() {
@@ -865,49 +999,7 @@ impl BasisStorage for DenseStorage {
             }
         }
 
-        if num_basis_functions > 0 {
-            let left = knot_view[degree];
-            let right = knot_view[num_basis_functions];
-
-            // For linear continuation, d/dx outside domain should equal the boundary slope.
-            // Sparse derivative kernels still zero outside, so patch dense rows here.
-            if matches!(eval_kind, BasisEvalKind::FirstDerivative) {
-                let num_basis_lower = knot_view.len().saturating_sub(degree);
-                let mut lower_basis = vec![0.0; num_basis_lower];
-                let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(1));
-                for (i, &x) in data.iter().enumerate() {
-                    if x >= left && x <= right {
-                        continue;
-                    }
-                    let x_c = x.clamp(left, right);
-                    let mut row = basis_matrix.row_mut(i);
-                    let row_slice = row
-                        .as_slice_mut()
-                        .expect("basis matrix rows should be contiguous");
-                    evaluate_bspline_derivative_scalar_into(
-                        x_c,
-                        knot_view,
-                        degree,
-                        row_slice,
-                        &mut lower_basis,
-                        &mut lower_scratch,
-                    )?;
-                }
-            }
-
-            // Apply C1 linear continuation outside the knot domain for basis-value
-            // evaluation so extrapolation is not artificially flat.
-            if matches!(eval_kind, BasisEvalKind::Basis) {
-                let z_clamped = data.mapv(|x| x.clamp(left, right));
-                apply_linear_extension_from_first_derivative(
-                    data,
-                    z_clamped.view(),
-                    knot_view,
-                    degree,
-                    &mut basis_matrix,
-                )?;
-            }
-        }
+        apply_dense_bspline_extrapolation(data, knot_view, degree, eval_kind, &mut basis_matrix)?;
 
         Ok(basis_matrix)
     }
@@ -1632,12 +1724,6 @@ pub struct MaternSplineBasis {
     pub num_kernel_basis: usize,
     pub num_polynomial_basis: usize,
     pub dimension: usize,
-}
-
-impl MaternSplineBasis {
-    pub fn penalty_matrices(&self) -> Vec<Array2<f64>> {
-        vec![self.penalty_kernel.clone(), self.penalty_ridge.clone()]
-    }
 }
 
 /// Duchon-like radial basis and penalties with explicit low-frequency null-space order.
@@ -2648,6 +2734,17 @@ pub fn build_thin_plate_basis_with_workspace(
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let tps = create_thin_plate_spline_basis_with_workspace(data, centers.view(), workspace)?;
+    let identifiability_transform = spatial_identifiability_transform_from_design(
+        data,
+        tps.basis.view(),
+        &spec.identifiability,
+        "ThinPlate",
+    )?;
+    let design = if let Some(z) = identifiability_transform.as_ref() {
+        fast_ab(&tps.basis, z)
+    } else {
+        tps.basis.clone()
+    };
     let mut candidates = vec![PenaltyCandidate {
         matrix: tps.penalty_bending.clone(),
         nullspace_dim_hint: tps.num_polynomial_basis,
@@ -2662,15 +2759,30 @@ pub fn build_thin_plate_basis_with_workspace(
             normalization_scale: 1.0,
         });
     }
+    if let Some(z) = identifiability_transform.as_ref() {
+        candidates = candidates
+            .into_iter()
+            .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
+                let zt_s = z.t().dot(&candidate.matrix);
+                let matrix = zt_s.dot(z);
+                Ok(PenaltyCandidate {
+                    nullspace_dim_hint: estimate_penalty_nullity(&matrix)?,
+                    matrix,
+                    source: candidate.source,
+                    normalization_scale: candidate.normalization_scale,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
     let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design: tps.basis,
+        design,
         penalties,
         nullspace_dims,
         penalty_info,
         metadata: BasisMetadata::ThinPlate {
             centers,
-            identifiability_transform: None,
+            identifiability_transform,
         },
     })
 }
@@ -3251,6 +3363,44 @@ fn frozen_spatial_identifiability_transform(
     }
 }
 
+fn spatial_parametric_constraint_block(data: ArrayView2<'_, f64>) -> Array2<f64> {
+    let n = data.nrows();
+    let d = data.ncols();
+    let mut c = Array2::<f64>::ones((n, d + 1));
+    if d > 0 {
+        c.slice_mut(s![.., 1..]).assign(&data);
+    }
+    c
+}
+
+fn spatial_identifiability_transform_from_design(
+    data: ArrayView2<'_, f64>,
+    design: ArrayView2<'_, f64>,
+    identifiability: &SpatialIdentifiability,
+    label: &str,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    match identifiability {
+        SpatialIdentifiability::None => Ok(None),
+        SpatialIdentifiability::OrthogonalToParametric => {
+            let c = spatial_parametric_constraint_block(data);
+            let (_design_constrained, z) =
+                apply_weighted_orthogonality_constraint(design, c.view(), None)?;
+            Ok(Some(z))
+        }
+        SpatialIdentifiability::FrozenTransform { .. } => {
+            frozen_spatial_identifiability_transform(identifiability, design.ncols(), label)
+        }
+    }
+}
+
+fn append_intercept_to_transform(transform: &Array2<f64>) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros((transform.nrows() + 1, transform.ncols() + 1));
+    out.slice_mut(s![0..transform.nrows(), 0..transform.ncols()])
+        .assign(transform);
+    out[[transform.nrows(), transform.ncols()]] = 1.0;
+    out
+}
+
 pub fn build_matern_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
     collocation_weights: Option<ArrayView1<'_, f64>>,
@@ -3396,9 +3546,8 @@ pub fn build_duchon_collocation_operator_matrices_with_workspace(
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
-    let coeffs = length_scale.map(|scale| {
-        duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300))
-    });
+    let coeffs = length_scale
+        .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let (d0_raw, d1_raw, d2_raw) =
         build_collocation_operators_from_radial(centers, centers, collocation_weights, |r| {
@@ -4434,44 +4583,61 @@ pub fn build_matern_basis_with_workspace(
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
-
-    // Build an unconstrained kernel block first, then apply center-based
-    // coefficient constraints in a deterministic way.
     let m = create_matern_spline_basis_with_workspace(
         data,
         centers.view(),
         spec.length_scale,
         spec.nu,
-        false,
+        spec.include_intercept,
         workspace,
     )?;
-    let (design, identifiability_transform) = if let Some(ref z) = z_opt {
-        let kernel_raw = m.basis.slice(s![.., 0..m.num_kernel_basis]).to_owned();
-        let kernel_constrained = fast_ab(&kernel_raw, &z);
-        let mut design = kernel_constrained;
+    let identifiability_transform = z_opt.clone();
+    let full_transform = z_opt.as_ref().map(|z| {
         if spec.include_intercept {
-            let n = design.nrows();
-            let p = design.ncols();
-            let mut design_with_intercept = Array2::<f64>::zeros((n, p + 1));
-            design_with_intercept
-                .slice_mut(s![.., 0..p])
-                .assign(&design);
-            design_with_intercept.column_mut(p).fill(1.0);
-            design = design_with_intercept;
+            append_intercept_to_transform(z)
+        } else {
+            z.clone()
         }
-        (design, Some(z.clone()))
+    });
+    let design = if let Some(transform) = full_transform.as_ref() {
+        fast_ab(&m.basis, transform)
     } else {
-        (m.basis, None)
+        m.basis.clone()
     };
-    // Canonical Matérn path: always expose operator penalties
-    // (mass, tension, stiffness). No legacy kernel/ridge branch.
-    let candidates = build_matern_operator_penalty_candidates(
-        centers.view(),
-        spec.length_scale,
-        spec.nu,
-        spec.include_intercept,
-        z_opt.as_ref(),
-    )?;
+    let candidates = if spec.double_penalty {
+        vec![
+            PenaltyCandidate {
+                matrix: if let Some(transform) = full_transform.as_ref() {
+                    let zt_s = transform.t().dot(&m.penalty_kernel);
+                    zt_s.dot(transform)
+                } else {
+                    m.penalty_kernel.clone()
+                },
+                nullspace_dim_hint: 0,
+                source: PenaltySource::Primary,
+                normalization_scale: 1.0,
+            },
+            PenaltyCandidate {
+                matrix: if let Some(transform) = full_transform.as_ref() {
+                    let zt_s = transform.t().dot(&m.penalty_ridge);
+                    zt_s.dot(transform)
+                } else {
+                    m.penalty_ridge.clone()
+                },
+                nullspace_dim_hint: 0,
+                source: PenaltySource::DoublePenaltyNullspace,
+                normalization_scale: 1.0,
+            },
+        ]
+    } else {
+        build_matern_operator_penalty_candidates(
+            centers.view(),
+            spec.length_scale,
+            spec.nu,
+            spec.include_intercept,
+            z_opt.as_ref(),
+        )?
+    };
     let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -4934,6 +5100,84 @@ fn build_matern_design_psi_derivatives(
     Ok((out_psi, out_psi_psi))
 }
 
+fn build_matern_double_penalty_primary_with_psi_derivatives(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    include_intercept: bool,
+    z_opt: Option<&Array2<f64>>,
+) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>, f64), BasisError> {
+    let k = centers.nrows();
+    let kernel_cols = z_opt.map(|z| z.ncols()).unwrap_or(k);
+    let total_cols = kernel_cols + usize::from(include_intercept);
+    let mut kernel = Array2::<f64>::zeros((k, k));
+    let mut kernel_psi = Array2::<f64>::zeros((k, k));
+    let mut kernel_psi_psi = Array2::<f64>::zeros((k, k));
+
+    for i in 0..k {
+        for j in i..k {
+            let mut dist2 = 0.0;
+            for axis in 0..centers.ncols() {
+                let delta = centers[[i, axis]] - centers[[j, axis]];
+                dist2 += delta * delta;
+            }
+            let r = dist2.sqrt();
+            let value = matern_kernel_from_distance(r, length_scale, nu)?;
+            let d1 = matern_kernel_log_kappa_derivative_from_distance(r, length_scale, nu)?;
+            let d2 = matern_kernel_log_kappa_second_derivative_from_distance(r, length_scale, nu)?;
+            kernel[[i, j]] = value;
+            kernel[[j, i]] = value;
+            kernel_psi[[i, j]] = d1;
+            kernel_psi[[j, i]] = d1;
+            kernel_psi_psi[[i, j]] = d2;
+            kernel_psi_psi[[j, i]] = d2;
+        }
+    }
+
+    let (kernel, kernel_psi, kernel_psi_psi) = if let Some(z) = z_opt {
+        let zt_s = z.t().dot(&kernel);
+        let zt_d1 = z.t().dot(&kernel_psi);
+        let zt_d2 = z.t().dot(&kernel_psi_psi);
+        (zt_s.dot(z), zt_d1.dot(z), zt_d2.dot(z))
+    } else {
+        (kernel, kernel_psi, kernel_psi_psi)
+    };
+
+    let mut s = Array2::<f64>::zeros((total_cols, total_cols));
+    let mut s_psi = Array2::<f64>::zeros((total_cols, total_cols));
+    let mut s_psi_psi = Array2::<f64>::zeros((total_cols, total_cols));
+    s.slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&kernel);
+    s_psi
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&kernel_psi);
+    s_psi_psi
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&kernel_psi_psi);
+    let (s_norm, s_norm_psi, s_norm_psi_psi, c) =
+        normalize_penalty_with_psi_derivatives(&s, &s_psi, &s_psi_psi);
+    Ok((s_norm, s_norm_psi, s_norm_psi_psi, c))
+}
+
+fn active_matern_double_penalty_derivatives(
+    penalty_info: &[PenaltyInfo],
+    primary_derivative: &Array2<f64>,
+) -> Result<Vec<Array2<f64>>, BasisError> {
+    penalty_info
+        .iter()
+        .filter(|info| info.active)
+        .map(|info| match &info.source {
+            PenaltySource::Primary => Ok(primary_derivative.clone()),
+            PenaltySource::DoublePenaltyNullspace => {
+                Ok(Array2::<f64>::zeros(primary_derivative.raw_dim()))
+            }
+            other => Err(BasisError::InvalidInput(format!(
+                "unexpected Matérn penalty source in double-penalty path: {other:?}"
+            ))),
+        })
+        .collect()
+}
+
 pub fn build_matern_basis_log_kappa_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
@@ -4947,12 +5191,7 @@ pub fn build_matern_basis_log_kappa_derivative_with_workspace(
     spec: &MaternBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
-    // Analytic psi derivative assembly for the Matérn basis block:
-    // - design derivative X_psi from closed-form Matérn value derivatives,
-    // - penalty derivatives S_psi from operator-collocation derivatives.
-    //
-    // Penalty routing uses source tags (mass/tension/stiffness) so the returned
-    // list order matches the active penalty order seen by REML.
+    // Analytic psi derivative assembly for the Matérn basis block.
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
     let base = build_matern_basis_with_workspace(data, spec, workspace)?;
@@ -4965,15 +5204,26 @@ pub fn build_matern_basis_log_kappa_derivative_with_workspace(
         z_opt.as_ref(),
         workspace,
     )?;
-    let (all_penalty_deriv, _) = build_matern_operator_penalty_psi_derivatives(
-        centers.view(),
-        spec.length_scale,
-        spec.nu,
-        spec.include_intercept,
-        z_opt.as_ref(),
-    )?;
-    let penalties_derivative =
-        active_operator_penalty_derivatives(&base.penalty_info, &all_penalty_deriv, "Matérn")?;
+    let penalties_derivative = if spec.double_penalty {
+        let (_, primary_derivative, _, _) =
+            build_matern_double_penalty_primary_with_psi_derivatives(
+                centers.view(),
+                spec.length_scale,
+                spec.nu,
+                spec.include_intercept,
+                z_opt.as_ref(),
+            )?;
+        active_matern_double_penalty_derivatives(&base.penalty_info, &primary_derivative)?
+    } else {
+        let (all_penalty_deriv, _) = build_matern_operator_penalty_psi_derivatives(
+            centers.view(),
+            spec.length_scale,
+            spec.nu,
+            spec.include_intercept,
+            z_opt.as_ref(),
+        )?;
+        active_operator_penalty_derivatives(&base.penalty_info, &all_penalty_deriv, "Matérn")?
+    };
 
     Ok(BasisPsiDerivativeResult {
         design_derivative,
@@ -5008,18 +5258,30 @@ pub fn build_matern_basis_log_kappa_second_derivative_with_workspace(
         z_opt.as_ref(),
         workspace,
     )?;
-    let (_, all_penalty_second_deriv) = build_matern_operator_penalty_psi_derivatives(
-        centers.view(),
-        spec.length_scale,
-        spec.nu,
-        spec.include_intercept,
-        z_opt.as_ref(),
-    )?;
-    let penalties_second_derivative = active_operator_penalty_derivatives(
-        &base.penalty_info,
-        &all_penalty_second_deriv,
-        "Matérn",
-    )?;
+    let penalties_second_derivative = if spec.double_penalty {
+        let (_, _, primary_second_derivative, _) =
+            build_matern_double_penalty_primary_with_psi_derivatives(
+                centers.view(),
+                spec.length_scale,
+                spec.nu,
+                spec.include_intercept,
+                z_opt.as_ref(),
+            )?;
+        active_matern_double_penalty_derivatives(&base.penalty_info, &primary_second_derivative)?
+    } else {
+        let (_, all_penalty_second_deriv) = build_matern_operator_penalty_psi_derivatives(
+            centers.view(),
+            spec.length_scale,
+            spec.nu,
+            spec.include_intercept,
+            z_opt.as_ref(),
+        )?;
+        active_operator_penalty_derivatives(
+            &base.penalty_info,
+            &all_penalty_second_deriv,
+            "Matérn",
+        )?
+    };
 
     Ok(BasisPsiSecondDerivativeResult {
         design_second_derivative,
@@ -5048,19 +5310,6 @@ fn duchon_scaling_exponent(p_order: usize, s_order: usize, k_dim: usize) -> f64 
 #[inline(always)]
 fn duchon_has_classical_second_order_origin(p_order: usize, s_order: usize, k_dim: usize) -> bool {
     2 * (p_order + s_order) > k_dim + 2
-}
-
-#[inline(always)]
-fn duchon_frozen_transform_for_derivatives(
-    identifiability: &SpatialIdentifiability,
-) -> Result<Option<&Array2<f64>>, BasisError> {
-    match identifiability {
-        SpatialIdentifiability::None => Ok(None),
-        SpatialIdentifiability::FrozenTransform { transform } => Ok(Some(transform)),
-        SpatialIdentifiability::OrthogonalToParametric => Err(BasisError::InvalidInput(
-            "Duchon exact log-kappa derivatives require a frozen or absent spatial identifiability transform".to_string(),
-        )),
-    }
 }
 
 #[inline(always)]
@@ -5493,11 +5742,13 @@ fn duchon_phi_rr_collision_psi_triplet(
 fn build_duchon_design_psi_derivatives_with_workspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
+    identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let length_scale = spec.length_scale.ok_or_else(|| {
         BasisError::InvalidInput(
-            "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale".to_string(),
+            "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale"
+                .to_string(),
         )
     })?;
     // Exact Duchon design derivatives:
@@ -5545,10 +5796,10 @@ fn build_duchon_design_psi_derivatives_with_workspace(
     out_psi_psi
         .slice_mut(s![.., 0..kernel_cols])
         .assign(&kernel_psi_psi);
-    if let Some(zf) = duchon_frozen_transform_for_derivatives(&spec.identifiability)? {
+    if let Some(zf) = identifiability_transform {
         if total_cols != zf.nrows() {
             return Err(BasisError::DimensionMismatch(format!(
-                "frozen Duchon identifiability transform mismatch in design derivatives: local cols={}, transform rows={}",
+                "Duchon identifiability transform mismatch in design derivatives: local cols={}, transform rows={}",
                 total_cols,
                 zf.nrows()
             )));
@@ -5561,11 +5812,13 @@ fn build_duchon_design_psi_derivatives_with_workspace(
 fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
     centers: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
+    identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
     let length_scale = spec.length_scale.ok_or_else(|| {
         BasisError::InvalidInput(
-            "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale".to_string(),
+            "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale"
+                .to_string(),
         )
     })?;
     // Build exact Duchon operator derivatives for the canonical three-penalty path.
@@ -5679,10 +5932,10 @@ fn build_duchon_operator_penalty_psi_derivatives_with_workspace(
             }
         }
     }
-    if let Some(zf) = duchon_frozen_transform_for_derivatives(&spec.identifiability)? {
+    if let Some(zf) = identifiability_transform {
         if total_cols != zf.nrows() {
             return Err(BasisError::DimensionMismatch(format!(
-                "frozen Duchon identifiability transform mismatch in operator derivatives: local cols={}, transform rows={}",
+                "Duchon identifiability transform mismatch in operator derivatives: local cols={}, transform rows={}",
                 total_cols,
                 zf.nrows()
             )));
@@ -5730,11 +5983,23 @@ pub fn build_duchon_basis_log_kappa_derivative_with_workspace(
 ) -> Result<BasisPsiDerivativeResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let base = build_duchon_basis_with_workspace(data, spec, workspace)?;
-    let (design_derivative, _) =
-        build_duchon_design_psi_derivatives_with_workspace(data, spec, workspace)?;
+    let identifiability_transform = match &base.metadata {
+        BasisMetadata::Duchon {
+            identifiability_transform,
+            ..
+        } => identifiability_transform.as_ref(),
+        _ => None,
+    };
+    let (design_derivative, _) = build_duchon_design_psi_derivatives_with_workspace(
+        data,
+        spec,
+        identifiability_transform,
+        workspace,
+    )?;
     let (all_penalty_deriv, _) = build_duchon_operator_penalty_psi_derivatives_with_workspace(
         centers.view(),
         spec,
+        identifiability_transform,
         workspace,
     )?;
     let penalties_derivative =
@@ -5760,12 +6025,24 @@ pub fn build_duchon_basis_log_kappa_second_derivative_with_workspace(
 ) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let base = build_duchon_basis_with_workspace(data, spec, workspace)?;
-    let (_, design_second_derivative) =
-        build_duchon_design_psi_derivatives_with_workspace(data, spec, workspace)?;
+    let identifiability_transform = match &base.metadata {
+        BasisMetadata::Duchon {
+            identifiability_transform,
+            ..
+        } => identifiability_transform.as_ref(),
+        _ => None,
+    };
+    let (_, design_second_derivative) = build_duchon_design_psi_derivatives_with_workspace(
+        data,
+        spec,
+        identifiability_transform,
+        workspace,
+    )?;
     let (_, all_penalty_second_deriv) =
         build_duchon_operator_penalty_psi_derivatives_with_workspace(
             centers.view(),
             spec,
+            identifiability_transform,
             workspace,
         )?;
     let penalties_second_derivative = active_operator_penalty_derivatives(
@@ -5883,7 +6160,9 @@ pub fn create_duchon_spline_basis_with_workspace(
     //   κ in [1e-2 / r_max, 1e2 / r_min]
     // where r_min/r_max are pairwise center distance extrema.
     // We keep user-provided κ but emit a warning outside this regime.
-    if let (Some(length_scale), Some((r_min, r_max))) = (length_scale, pairwise_distance_bounds(centers)) {
+    if let (Some(length_scale), Some((r_min, r_max))) =
+        (length_scale, pairwise_distance_bounds(centers))
+    {
         let kappa = 1.0 / length_scale.max(1e-300);
         let kappa_lo = 1e-2 / r_max;
         let kappa_hi = 1e2 / r_min;
@@ -5993,7 +6272,7 @@ pub fn build_duchon_basis_with_workspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let mut d = create_duchon_spline_basis_with_workspace(
+    let d = create_duchon_spline_basis_with_workspace(
         data,
         centers.view(),
         spec.length_scale,
@@ -6001,11 +6280,17 @@ pub fn build_duchon_basis_with_workspace(
         spec.nullspace_order,
         workspace,
     )?;
-    let identifiability_transform =
-        frozen_spatial_identifiability_transform(&spec.identifiability, d.basis.ncols(), "Duchon")?;
-    if let Some(z) = identifiability_transform.as_ref() {
-        d.basis = fast_ab(&d.basis, z);
-    }
+    let identifiability_transform = spatial_identifiability_transform_from_design(
+        data,
+        d.basis.view(),
+        &spec.identifiability,
+        "Duchon",
+    )?;
+    let design = if let Some(z) = identifiability_transform.as_ref() {
+        fast_ab(&d.basis, z)
+    } else {
+        d.basis.clone()
+    };
     let candidates = build_duchon_operator_penalty_candidates(
         centers.view(),
         spec.length_scale,
@@ -6020,7 +6305,7 @@ pub fn build_duchon_basis_with_workspace(
     }
     let (penalties, nullspace_dims, penalty_info) = filter_active_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
-        design: d.basis,
+        design,
         penalties,
         nullspace_dims,
         penalty_info,
@@ -7958,6 +8243,7 @@ pub fn evaluate_bspline_fourth_derivative_scalar_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smooth::orthogonality_relative_residual;
     use ndarray::{Array1, array};
     use num_dual::{DualNum, second_derivative};
 
@@ -8072,6 +8358,17 @@ mod tests {
             expected_s.as_slice().unwrap(),
             epsilon = 1e-9
         );
+    }
+
+    #[test]
+    fn test_penalty_matrix_rejects_singular_greville_span() {
+        let g = array![0.0, 0.0, 0.5, 1.0];
+        match create_difference_penalty_matrix(4, 1, Some(g.view())).unwrap_err() {
+            BasisError::InvalidKnotVector(msg) => {
+                assert!(msg.contains("singular"));
+            }
+            other => panic!("expected InvalidKnotVector, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8334,6 +8631,52 @@ mod tests {
         assert_eq!(result.penalties.len(), 2);
         assert_eq!(result.nullspace_dims.len(), 2);
         assert_eq!(result.design.nrows(), data.nrows());
+        match &result.metadata {
+            BasisMetadata::ThinPlate {
+                identifiability_transform,
+                ..
+            } => assert!(identifiability_transform.is_some()),
+            other => panic!("expected thin-plate metadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_thin_plate_basis_default_identifiability_is_orthogonal_to_parametric_block() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.25],
+            [0.25, 0.75]
+        ];
+        let spec = ThinPlateBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::OrthogonalToParametric,
+        };
+        let result = build_thin_plate_basis(data.view(), &spec).unwrap();
+
+        let mut c = Array2::<f64>::ones((data.nrows(), data.ncols() + 1));
+        c.slice_mut(s![.., 1..]).assign(&data);
+        let cross = result.design.t().dot(&c);
+        let rel = orthogonality_relative_residual(result.design.view(), c.view());
+
+        assert!(
+            rel < 1e-10,
+            "TPS design is not orthogonal to [1, x]: relative residual={rel:.3e}"
+        );
+        assert!(
+            cross.iter().all(|v| v.abs() < 1e-10),
+            "TPS cross-moment against parametric block is not numerically zero"
+        );
+        match &result.metadata {
+            BasisMetadata::ThinPlate {
+                identifiability_transform,
+                ..
+            } => assert!(identifiability_transform.is_some()),
+            other => panic!("expected thin-plate metadata, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8559,6 +8902,28 @@ mod tests {
             max_abs < 1e-10,
             "quantile penalty mismatch: max_abs_diff={max_abs:.3e}"
         );
+    }
+
+    #[test]
+    fn test_build_bspline_basis_1d_quantile_rejects_singular_divided_difference_penalty() {
+        let x = array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let spec = BSplineBasisSpec {
+            degree: 2,
+            penalty_order: 2,
+            knot_spec: BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(3),
+                placement: BSplineKnotPlacement::Quantile,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+        };
+
+        match build_bspline_basis_1d(x.view(), &spec).unwrap_err() {
+            BasisError::InvalidKnotVector(msg) => {
+                assert!(msg.contains("singular"), "unexpected error message: {msg}");
+            }
+            other => panic!("expected InvalidKnotVector, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8982,30 +9347,96 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_derivatives_are_zero_outside_domain() {
+    fn test_dense_basis_preserves_linear_extension_when_internal_builder_goes_sparse() {
+        let degree = 3usize;
+        let knots = internal::generate_full_knot_vector((0.0, 10.0), 36, degree).unwrap();
+        let x = array![-0.5, 10.5];
+        let x_c = array![0.0, 10.0];
+        assert!(should_use_sparse_basis(
+            knots.len().saturating_sub(degree + 1),
+            degree,
+            1
+        ));
+
+        let (b_raw, _) = create_basis::<Dense>(
+            x.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .unwrap();
+        let (b_c, _) = create_basis::<Dense>(
+            x_c.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .unwrap();
+        let (db_c, _) = create_basis::<Dense>(
+            x_c.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .unwrap();
+
+        for i in 0..x.len() {
+            let dz = x[i] - x_c[i];
+            for j in 0..b_raw.ncols() {
+                let expected = b_c[[i, j]] + dz * db_c[[i, j]];
+                assert_abs_diff_eq!(b_raw[[i, j]], expected, epsilon = 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sparse_derivatives_use_boundary_slope_outside_domain() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
         let degree = 3usize;
         let support = degree + 1;
         let mut scratch = BasisEvalScratch::new(degree);
         let mut d1 = vec![0.0; support];
         let mut d2 = vec![0.0; support];
+        let mut d1_left = vec![0.0; support];
+        let mut d1_right = vec![0.0; support];
 
-        let _ = evaluate_splines_derivative_sparse_into(
+        let start_left = evaluate_splines_derivative_sparse_into(
+            0.0,
+            degree,
+            knots.view(),
+            &mut d1_left,
+            &mut scratch,
+        );
+        let start = evaluate_splines_derivative_sparse_into(
             -10.0,
             degree,
             knots.view(),
             &mut d1,
             &mut scratch,
         );
-        assert!(d1.iter().all(|v| v.abs() < 1e-12));
-        let _ = evaluate_splines_derivative_sparse_into(
+        assert_eq!(start, start_left);
+        for i in 0..support {
+            assert_abs_diff_eq!(d1[i], d1_left[i], epsilon = 1e-12);
+        }
+
+        let start_right = evaluate_splines_derivative_sparse_into(
+            4.0,
+            degree,
+            knots.view(),
+            &mut d1_right,
+            &mut scratch,
+        );
+        let start = evaluate_splines_derivative_sparse_into(
             10.0,
             degree,
             knots.view(),
             &mut d1,
             &mut scratch,
         );
-        assert!(d1.iter().all(|v| v.abs() < 1e-12));
+        assert_eq!(start, start_right);
+        for i in 0..support {
+            assert_abs_diff_eq!(d1[i], d1_right[i], epsilon = 1e-12);
+        }
 
         let _ = evaluate_splines_second_derivative_sparse_into(
             -10.0,
@@ -9023,6 +9454,62 @@ mod tests {
             &mut scratch,
         );
         assert!(d2.iter().all(|v| v.abs() < 1e-12));
+    }
+
+    #[test]
+    fn test_create_basis_sparse_matches_dense_extrapolation_outside_domain() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
+        let degree = 3usize;
+        let x = array![-0.5, 4.5];
+        let (dense_basis, _) = create_basis::<Dense>(
+            x.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .unwrap();
+        let sparse_basis = generate_basis_internal::<SparseStorage>(
+            x.view(),
+            knots.view(),
+            degree,
+            BasisEvalKind::Basis,
+        )
+        .unwrap();
+        let sparse_dense = <Dense as BasisOutputFormat>::from_sparse(sparse_basis).unwrap();
+        assert_eq!(dense_basis.dim(), sparse_dense.dim());
+        for i in 0..dense_basis.nrows() {
+            for j in 0..dense_basis.ncols() {
+                assert_abs_diff_eq!(dense_basis[[i, j]], sparse_dense[[i, j]], epsilon = 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_basis_sparse_first_derivative_matches_dense_outside_domain() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
+        let degree = 3usize;
+        let x = array![-0.25, 4.25];
+        let (dense_deriv, _) = create_basis::<Dense>(
+            x.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::first_derivative(),
+        )
+        .unwrap();
+        let sparse_deriv = generate_basis_internal::<SparseStorage>(
+            x.view(),
+            knots.view(),
+            degree,
+            BasisEvalKind::FirstDerivative,
+        )
+        .unwrap();
+        let sparse_dense = <Dense as BasisOutputFormat>::from_sparse(sparse_deriv).unwrap();
+        assert_eq!(dense_deriv.dim(), sparse_dense.dim());
+        for i in 0..dense_deriv.nrows() {
+            for j in 0..dense_deriv.ncols() {
+                assert_abs_diff_eq!(dense_deriv[[i, j]], sparse_dense[[i, j]], epsilon = 1e-10);
+            }
+        }
     }
 
     #[test]
@@ -9910,6 +10397,69 @@ mod tests {
     }
 
     #[test]
+    fn test_build_duchon_basis_freezes_default_spatial_identifiability() {
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+            length_scale: Some(1.0),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::OrthogonalToParametric,
+        };
+        let out = build_duchon_basis(data.view(), &spec).unwrap();
+        match &out.metadata {
+            BasisMetadata::Duchon {
+                identifiability_transform,
+                ..
+            } => assert!(identifiability_transform.is_some()),
+            other => panic!("expected Duchon metadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_duchon_basis_default_identifiability_is_orthogonal_to_parametric_block() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.25],
+            [0.25, 0.75]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+            length_scale: Some(1.0),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::OrthogonalToParametric,
+        };
+        let out = build_duchon_basis(data.view(), &spec).unwrap();
+
+        let mut c = Array2::<f64>::ones((data.nrows(), data.ncols() + 1));
+        c.slice_mut(s![.., 1..]).assign(&data);
+        let cross = out.design.t().dot(&c);
+        let rel = orthogonality_relative_residual(out.design.view(), c.view());
+
+        assert!(
+            rel < 1e-10,
+            "Duchon design is not orthogonal to [1, x]: relative residual={rel:.3e}"
+        );
+        assert!(
+            cross.iter().all(|v| v.abs() < 1e-10),
+            "Duchon cross-moment against parametric block is not numerically zero"
+        );
+        match &out.metadata {
+            BasisMetadata::Duchon {
+                identifiability_transform,
+                ..
+            } => assert!(identifiability_transform.is_some()),
+            other => panic!("expected Duchon metadata, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_pairwise_distance_bounds_helper() {
         let pts = array![[0.0, 0.0], [3.0, 4.0], [6.0, 8.0]];
         let (r_min, r_max) = pairwise_distance_bounds(pts.view()).expect("bounds should exist");
@@ -10017,22 +10567,11 @@ mod tests {
             identifiability: MaternIdentifiability::CenterSumToZero,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
-        assert_eq!(out.penalties.len(), 3);
-        assert_eq!(out.nullspace_dims.len(), 3);
-        assert_eq!(out.penalty_info.len(), 3);
+        assert_eq!(out.penalties.len(), 1);
+        assert_eq!(out.nullspace_dims.len(), 1);
+        assert_eq!(out.penalty_info.len(), 1);
         assert!(out.penalty_info.iter().all(|info| info.active));
-        assert!(matches!(
-            out.penalty_info[0].source,
-            PenaltySource::OperatorMass
-        ));
-        assert!(matches!(
-            out.penalty_info[1].source,
-            PenaltySource::OperatorTension
-        ));
-        assert!(matches!(
-            out.penalty_info[2].source,
-            PenaltySource::OperatorStiffness
-        ));
+        assert!(matches!(out.penalty_info[0].source, PenaltySource::Primary));
     }
 
     #[test]
@@ -10048,21 +10587,14 @@ mod tests {
             identifiability: MaternIdentifiability::CenterSumToZero,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
-        assert_eq!(out.penalties.len(), 3);
-        assert_eq!(out.nullspace_dims.len(), 3);
-        assert_eq!(out.penalty_info.len(), 3);
+        assert_eq!(out.penalties.len(), 2);
+        assert_eq!(out.nullspace_dims.len(), 2);
+        assert_eq!(out.penalty_info.len(), 2);
         assert!(out.penalty_info.iter().all(|info| info.active));
-        assert!(matches!(
-            out.penalty_info[0].source,
-            PenaltySource::OperatorMass
-        ));
+        assert!(matches!(out.penalty_info[0].source, PenaltySource::Primary));
         assert!(matches!(
             out.penalty_info[1].source,
-            PenaltySource::OperatorTension
-        ));
-        assert!(matches!(
-            out.penalty_info[2].source,
-            PenaltySource::OperatorStiffness
+            PenaltySource::DoublePenaltyNullspace
         ));
     }
 
@@ -10133,6 +10665,52 @@ mod tests {
     }
 
     #[test]
+    fn test_matern_double_penalty_log_kappa_derivative_matches_fd() {
+        let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let spec = MaternBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: 0.9,
+            nu: MaternNu::FiveHalves,
+            include_intercept: true,
+            double_penalty: true,
+            identifiability: MaternIdentifiability::CenterSumToZero,
+        };
+        let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
+            .expect("analytic Matérn double-penalty derivative should build");
+
+        let eps: f64 = 1e-6;
+        let kappa = 1.0 / spec.length_scale;
+        let ls_plus = 1.0 / (kappa * eps.exp());
+        let ls_minus = 1.0 / (kappa * (-eps).exp());
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = ls_plus;
+        spec_minus.length_scale = ls_minus;
+        let plus = build_matern_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_matern_basis(data.view(), &spec_minus).expect("minus build");
+
+        let fd_primary = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
+        let primary_err = (&deriv.penalties_derivative[0] - &fd_primary)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+
+        assert!(
+            primary_err < 1e-5,
+            "double-penalty primary derivative mismatch too large: {primary_err}"
+        );
+        assert_eq!(deriv.penalties_derivative.len(), 2);
+        assert!(
+            deriv.penalties_derivative[1]
+                .iter()
+                .all(|v| v.abs() < 1e-12),
+            "nullspace shrinkage derivative should be zero"
+        );
+    }
+
+    #[test]
     fn test_duchon_log_kappa_derivative_matches_fd() {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
@@ -10145,13 +10723,18 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
         };
         let mut workspace = BasisWorkspace::default();
-        let (design_derivative, _) =
-            build_duchon_design_psi_derivatives_with_workspace(data.view(), &spec, &mut workspace)
-                .expect("analytic Duchon design derivative should build");
+        let (design_derivative, _) = build_duchon_design_psi_derivatives_with_workspace(
+            data.view(),
+            &spec,
+            None,
+            &mut workspace,
+        )
+        .expect("analytic Duchon design derivative should build");
         let (penalties_derivative, _) =
             build_duchon_operator_penalty_psi_derivatives_with_workspace(
                 centers.view(),
                 &spec,
+                None,
                 &mut workspace,
             )
             .expect("analytic Duchon penalty derivative should build");
@@ -10226,13 +10809,18 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
         };
         let mut workspace = BasisWorkspace::default();
-        let (_, design_second_derivative) =
-            build_duchon_design_psi_derivatives_with_workspace(data.view(), &spec, &mut workspace)
-                .expect("analytic Duchon design second derivative should build");
+        let (_, design_second_derivative) = build_duchon_design_psi_derivatives_with_workspace(
+            data.view(),
+            &spec,
+            None,
+            &mut workspace,
+        )
+        .expect("analytic Duchon design second derivative should build");
         let (_, penalties_second_derivative) =
             build_duchon_operator_penalty_psi_derivatives_with_workspace(
                 centers.view(),
                 &spec,
+                None,
                 &mut workspace,
             )
             .expect("analytic Duchon penalty second derivative should build");
@@ -10538,13 +11126,7 @@ mod tests {
 
     #[test]
     fn test_pure_duchon_default_tuple_builds() {
-        let data = array![
-            [0.0, 0.1],
-            [0.2, 0.0],
-            [0.4, 0.2],
-            [0.6, 0.4],
-            [0.8, 0.5]
-        ];
+        let data = array![[0.0, 0.1], [0.2, 0.0], [0.4, 0.2], [0.6, 0.4], [0.8, 0.5]];
         let centers = data.slice(s![0..4, ..]).to_owned();
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
@@ -10554,11 +11136,15 @@ mod tests {
             double_penalty: false,
             identifiability: SpatialIdentifiability::None,
         };
-        let out = build_duchon_basis(data.view(), &spec)
-            .expect("pure Duchon default tuple should build");
+        let out =
+            build_duchon_basis(data.view(), &spec).expect("pure Duchon default tuple should build");
         assert!(out.design.iter().all(|v| v.is_finite()));
         assert_eq!(out.penalties.len(), 3);
-        assert!(out.penalties.iter().all(|penalty| penalty.iter().all(|v| v.is_finite())));
+        assert!(
+            out.penalties
+                .iter()
+                .all(|penalty| penalty.iter().all(|v| v.is_finite()))
+        );
     }
 
     #[test]
@@ -10664,9 +11250,15 @@ mod tests {
         let s_order = 3usize;
         let dim = 4usize;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-        let (phi, phi_r, phi_rr) =
-            duchon_kernel_radial_triplet(r, Some(length_scale), p_order, s_order, dim, Some(&coeffs))
-                .expect("triplet");
+        let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
+            r,
+            Some(length_scale),
+            p_order,
+            s_order,
+            dim,
+            Some(&coeffs),
+        )
+        .expect("triplet");
         let h = 1e-5;
         let fp = duchon_matern_kernel_general_from_distance(
             r + h,
@@ -10703,9 +11295,15 @@ mod tests {
         let s_order = 4usize;
         let dim = 10usize;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-        let (phi, phi_r, phi_rr) =
-            duchon_kernel_radial_triplet(r, Some(length_scale), p_order, s_order, dim, Some(&coeffs))
-                .expect("triplet");
+        let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
+            r,
+            Some(length_scale),
+            p_order,
+            s_order,
+            dim,
+            Some(&coeffs),
+        )
+        .expect("triplet");
         let h = 1e-5;
         let fp = duchon_matern_kernel_general_from_distance(
             r + h,
@@ -10742,9 +11340,15 @@ mod tests {
         let s_order = 0usize;
         let dim = 3usize;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-        let (phi, phi_r, phi_rr) =
-            duchon_kernel_radial_triplet(r, Some(length_scale), p_order, s_order, dim, Some(&coeffs))
-                .expect("triplet");
+        let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
+            r,
+            Some(length_scale),
+            p_order,
+            s_order,
+            dim,
+            Some(&coeffs),
+        )
+        .expect("triplet");
         let h = 1e-6;
         let fp = duchon_matern_kernel_general_from_distance(
             r + h,

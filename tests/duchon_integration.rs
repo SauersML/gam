@@ -1,9 +1,9 @@
+use gam::estimate::AdaptiveRegularizationOptions;
 use gam::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, FitOptions, LikelihoodFamily,
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, fit_term_collection,
     predict_gam,
 };
-use gam::estimate::AdaptiveRegularizationOptions;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -43,7 +43,6 @@ fn simulate_duchon_regression(n: usize, d: usize) -> (Array2<f64>, Array1<f64>, 
 
     (x, y, y_true)
 }
-
 
 fn fit_duchon_simulated_10d(
     power: usize,

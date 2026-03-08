@@ -1327,7 +1327,8 @@ impl<'a> RemlState<'a> {
         // Only check eigenvalues if we needed to add a ridge
         const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
         let want_hot_diag = self.should_compute_hot_diagnostics(cost_call_idx);
-        if ridge_used > 0.0 && want_hot_diag
+        if ridge_used > 0.0
+            && want_hot_diag
             && let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
             && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
         {

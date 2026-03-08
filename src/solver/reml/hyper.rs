@@ -81,48 +81,20 @@ impl<'a> RemlState<'a> {
 
     fn relinearized_penalty_second_components(
         hyper_dirs: &[DirectionalHyperParam],
-        psi: &Array1<f64>,
         j: usize,
         psi_dim: usize,
         p: usize,
     ) -> Result<Option<Vec<Vec<(usize, Array2<f64>)>>>, EstimationError> {
         let mut out = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
         for target in 0..psi_dim {
-            let base = if target == j {
-                hyper_dirs[j]
-                    .penalty_first_components()
-                    .iter()
-                    .map(|component| (component.penalty_index, component.matrix.clone()))
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            let mut row = base;
-            for i in 0..psi_dim {
-                let amp = psi[i];
-                if amp == 0.0 {
-                    continue;
-                }
-                let extra = hyper_dirs[j].penalty_second_components_for(i).or_else(|| {
+            let extra = hyper_dirs[j]
+                .penalty_second_components_for(target)
+                .or_else(|| {
                     hyper_dirs
-                        .get(i)
+                        .get(target)
                         .and_then(|dir| dir.penalty_second_components_for(j))
                 });
-                row = Self::sum_penalty_components(p, &[], Some(extra.unwrap_or(&[])), amp)?
-                    .into_iter()
-                    .fold(row, |mut acc, (penalty_index, matrix)| {
-                        if let Some((_, existing)) = acc
-                            .iter_mut()
-                            .find(|(existing_index, _)| *existing_index == penalty_index)
-                        {
-                            *existing += &matrix;
-                        } else {
-                            acc.push((penalty_index, matrix));
-                        }
-                        acc
-                    });
-            }
-            out[target] = row;
+            out[target] = Self::sum_penalty_components(p, &[], extra, 1.0)?;
         }
         Ok(Some(out))
     }
@@ -172,7 +144,7 @@ impl<'a> RemlState<'a> {
                 x_j,
                 s_j,
                 hyper_dirs[j].x_tau_tau_original.clone(),
-                Self::relinearized_penalty_second_components(hyper_dirs, psi, j, psi_dim, p)?,
+                Self::relinearized_penalty_second_components(hyper_dirs, j, psi_dim, p)?,
             )?);
         }
         Ok(out)
@@ -352,6 +324,15 @@ impl<'a> RemlState<'a> {
                     )));
                 }
                 for (i, components) in s2.iter().enumerate() {
+                    for component in components {
+                        if component.penalty_index >= self.s_full_list.len() {
+                            return Err(EstimationError::InvalidInput(format!(
+                                "penalty_index {} out of bounds for {} penalties (S_tau_tau[{j}][{i}])",
+                                component.penalty_index,
+                                self.s_full_list.len(),
+                            )));
+                        }
+                    }
                     Self::validate_penalty_component_shapes(
                         components,
                         self.p,
@@ -1715,12 +1696,19 @@ impl<'a> RemlState<'a> {
         //
         // This matches the same pseudo-logdet active subspace used in
         // 0.5*tr(H_+^dagger H_tau), avoiding inverse-mismatch between trace and IFT.
-        let h_pos_w_for_solve =
+        let prefer_h_pos = !bundle.active_subspace_unstable;
+        let h_pos_w_for_solve = if prefer_h_pos {
             if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == h_solve_eval.nrows() {
                 Some(bundle.h_pos_factor_w.as_ref().clone())
             } else {
                 None
-            };
+            }
+        } else {
+            log::warn!(
+                "Directional hyper-gradient using stabilized direct fallback for implicit solves (active subspace unstable)."
+            );
+            None
+        };
         let h_pos_w_for_solve_t = h_pos_w_for_solve.as_ref().map(|w| w.t().to_owned());
         enum DirectionalSolveFactor {
             Cached(Arc<FaerFactor>),
@@ -1784,12 +1772,15 @@ impl<'a> RemlState<'a> {
         //   0.5 * tr(H_+^dagger A) = 0.5 * tr(W^T A W), H_+^dagger = W W^T.
         // Fall back to solve-surface contraction only when projected/active
         // coordinates are not aligned with the cached spectral basis.
-        let h_pos_w =
+        let h_pos_w = if prefer_h_pos {
             if free_basis_opt.is_none() && bundle.h_pos_factor_w.nrows() == h_solve_eval.nrows() {
                 Some(bundle.h_pos_factor_w.as_ref().clone())
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         let h_pos_w_t = h_pos_w.as_ref().map(|w| w.t().to_owned());
         let half_trace_h_pos = |a: &Array2<f64>| -> f64 {
             if let (Some(w), Some(w_t)) = (h_pos_w.as_ref(), h_pos_w_t.as_ref()) {
@@ -1831,7 +1822,7 @@ impl<'a> RemlState<'a> {
         // With Firth enabled this is:
         //   g_τ = (g_std)_τ - (g_phi)_τ|_{beta fixed},
         // where (g_phi)_τ comes from reduced Fisher pseudodeterminant calculus:
-        //   Phi = -0.5 log|I_r|_+, I_r = X_r^T W X_r.
+        //   Phi = 0.5 log|I_r|_+, I_r = X_r^T W X_r.
         // This RHS is exactly `g_psi`, and `solve_h_vec(g_psi)` computes B
         // without ever forming H^{-1} explicitly.
         let mut g_psi = x_psi_t.t().dot(&u)
@@ -1849,7 +1840,7 @@ impl<'a> RemlState<'a> {
             //   (g_phi)_tau
             //   = 0.5 X_tau' (w' ⊙ h)
             //     + 0.5 X'((w'' ⊙ (X_tau β)) ⊙ h + w' ⊙ h_tau|beta),
-            //   Phi_tau|beta = -0.5 tr(I_r^{-1} I_{r,tau}),
+            //   Phi_tau|beta = 0.5 tr(I_r^{-1} I_{r,tau}),
             // with I_r = X_r' W X_r and h_i = x_{r,i}' I_r^{-1} x_{r,i}.
             let need_tau_kernel = x_psi_t.iter().any(|v| *v != 0.0);
             let tau_bundle =
@@ -1879,7 +1870,7 @@ impl<'a> RemlState<'a> {
         //   d/dtau J(beta_hat,tau) = partial_tau J | beta_hat,
         // i.e. no explicit B term.
         // For Firth-logit:
-        //   Phi_tau|beta = -0.5 tr(I_r^+ I_{r,tau}),
+        //   Phi_tau|beta = 0.5 tr(I_r^+ I_{r,tau}),
         // added via `fit_firth_partial`.
         let fit_block = -u.dot(&xpsi_beta)
             + 0.5 * beta_eval.dot(&s_psi_total_t.dot(&beta_eval))

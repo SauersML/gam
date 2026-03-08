@@ -108,7 +108,9 @@ fn scalar_pseudo_laplace_rho_objective_numdual<D: DualNum<f64> + Copy>(rho: D, t
     let lambda = rho.exp();
     let beta_hat = D::from(2.0 * target) / (D::from(2.0) + lambda);
     let resid = beta_hat - D::from(target);
-    resid * resid + D::from(0.5) * lambda * beta_hat * beta_hat + D::from(0.5) * (D::from(2.0) + lambda).ln()
+    resid * resid
+        + D::from(0.5) * lambda * beta_hat * beta_hat
+        + D::from(0.5) * (D::from(2.0) + lambda).ln()
 }
 
 fn scalar_pseudo_laplace_psi_objective_numdual<D: DualNum<f64> + Copy>(psi: D) -> D {
@@ -157,8 +159,10 @@ fn exact_newton_pseudo_laplace_rho_gradient_matches_num_dual_band() {
             false,
         )
         .expect("pseudo-laplace rho hyper eval");
-        let (value_nd, grad_nd) =
-            first_derivative(|x| scalar_pseudo_laplace_rho_objective_numdual(x, family.target), rho);
+        let (value_nd, grad_nd) = first_derivative(
+            |x| scalar_pseudo_laplace_rho_objective_numdual(x, family.target),
+            rho,
+        );
         let value_f64 = scalar_pseudo_laplace_rho_objective_f64(rho, family.target);
         let h = 1e-6;
         let grad_fd = (scalar_pseudo_laplace_rho_objective_f64(rho + h, family.target)
@@ -219,7 +223,8 @@ fn exact_newton_pseudo_laplace_psi_gradient_matches_num_dual_band() {
             false,
         )
         .expect("pseudo-laplace psi hyper eval");
-        let (value_nd, grad_nd) = first_derivative(scalar_pseudo_laplace_psi_objective_numdual, psi);
+        let (value_nd, grad_nd) =
+            first_derivative(scalar_pseudo_laplace_psi_objective_numdual, psi);
         let value_f64 = scalar_pseudo_laplace_psi_objective_f64(psi);
         let h = 1e-6;
         let grad_fd = (scalar_pseudo_laplace_psi_objective_f64(psi + h)

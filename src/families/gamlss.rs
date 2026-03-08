@@ -5,8 +5,8 @@ use crate::basis::{
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily,
-    CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, FamilyEvaluation, KnownLinkWiggle,
-    ParameterBlockSpec, ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
+    CustomFamilyBlockPsiDerivative, FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec,
+    ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::faer_ndarray::fast_atv;
 use crate::families::sigma_link::{
@@ -568,6 +568,123 @@ fn solve_weighted_projection(
     Ok(beta)
 }
 
+fn solve_penalized_weighted_projection(
+    design: &DesignMatrix,
+    offset: &Array1<f64>,
+    target_eta: &Array1<f64>,
+    weights: &Array1<f64>,
+    penalties: &[Array2<f64>],
+    log_lambdas: &Array1<f64>,
+    ridge_floor: f64,
+) -> Result<Array1<f64>, String> {
+    let n = design.nrows();
+    let p = design.ncols();
+    if offset.len() != n || target_eta.len() != n || weights.len() != n {
+        return Err("solve_penalized_weighted_projection dimension mismatch".to_string());
+    }
+    if penalties.len() != log_lambdas.len() {
+        return Err(format!(
+            "solve_penalized_weighted_projection lambda mismatch: penalties={}, log_lambdas={}",
+            penalties.len(),
+            log_lambdas.len()
+        ));
+    }
+
+    let mut xtwx = design.compute_xtwx(weights)?;
+    let y_star = target_eta - offset;
+    let mut wy = y_star;
+    for i in 0..n {
+        wy[i] *= weights[i].max(0.0);
+    }
+    let xtwy = design.matvec_trans(&wy);
+    for (k, s) in penalties.iter().enumerate() {
+        let lambda = log_lambdas[k].exp();
+        if !lambda.is_finite() || lambda < 0.0 {
+            return Err(format!(
+                "solve_penalized_weighted_projection encountered invalid lambda at index {k}: {}",
+                log_lambdas[k]
+            ));
+        }
+        xtwx.scaled_add(lambda, s);
+    }
+    for a in 0..p {
+        xtwx[[a, a]] += ridge_floor.max(1e-12);
+    }
+
+    let solver = StableSolver::new("gamlss penalized weighted projection");
+    let beta = solver
+        .solve_vector_with_ridge_retries(&xtwx, &xtwy, 0.0)
+        .ok_or_else(|| {
+            "solve_penalized_weighted_projection produced non-finite coefficients".to_string()
+        })?;
+    if beta.iter().any(|v| !v.is_finite()) {
+        return Err(
+            "solve_penalized_weighted_projection produced non-finite coefficients".to_string(),
+        );
+    }
+    Ok(beta)
+}
+
+fn gaussian_location_scale_warm_start(
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    sigma_min: f64,
+    sigma_max: f64,
+    mu_block: &ParameterBlockSpec,
+    log_sigma_block: &ParameterBlockSpec,
+    ridge_floor: f64,
+    mean_beta_hint: Option<&Array1<f64>>,
+    noise_beta_hint: Option<&Array1<f64>>,
+) -> Result<(Array1<f64>, Array1<f64>, f64), String> {
+    let beta_mu = if let Some(beta) = mean_beta_hint {
+        beta.clone()
+    } else {
+        solve_penalized_weighted_projection(
+            &mu_block.design,
+            &mu_block.offset,
+            y,
+            weights,
+            &mu_block.penalties,
+            &mu_block.initial_log_lambdas,
+            ridge_floor,
+        )?
+    };
+    let mut mu_hat = mu_block.design.matrix_vector_multiply(&beta_mu);
+    mu_hat += &mu_block.offset;
+    let mut weighted_ss = 0.0;
+    let mut weight_sum = 0.0;
+    for i in 0..y.len() {
+        let wi = weights[i].max(0.0);
+        let resid = y[i] - mu_hat[i];
+        weighted_ss += wi * resid * resid;
+        weight_sum += wi;
+    }
+    if !weighted_ss.is_finite() || !weight_sum.is_finite() || weight_sum <= 0.0 {
+        return Err(
+            "gaussian location-scale warm start could not estimate residual scale".to_string(),
+        );
+    }
+    let sigma_hat = (weighted_ss / weight_sum)
+        .sqrt()
+        .clamp(sigma_min.max(1e-10), sigma_max.max(sigma_min + 1e-10));
+    let beta_log_sigma = if let Some(beta) = noise_beta_hint {
+        beta.clone()
+    } else {
+        let eta_sigma = bounded_sigma_eta_for_sigma_scalar(sigma_hat, sigma_min, sigma_max);
+        let sigma_target = Array1::from_elem(y.len(), eta_sigma);
+        solve_penalized_weighted_projection(
+            &log_sigma_block.design,
+            &log_sigma_block.offset,
+            &sigma_target,
+            weights,
+            &log_sigma_block.penalties,
+            &log_sigma_block.initial_log_lambdas,
+            ridge_floor,
+        )?
+    };
+    Ok((beta_mu, beta_log_sigma, sigma_hat))
+}
+
 fn weighted_prevalence(y: &Array1<f64>, weights: &Array1<f64>) -> f64 {
     let w_sum: f64 = weights.iter().copied().sum();
     if w_sum <= 0.0 {
@@ -601,7 +718,9 @@ fn project_block_beta_to_weighted_eta_mean_zero(
     }
     let w_sum: f64 = weights.iter().copied().sum();
     if !w_sum.is_finite() || w_sum <= 0.0 {
-        return Err("weighted eta gauge projection requires positive finite total weight".to_string());
+        return Err(
+            "weighted eta gauge projection requires positive finite total weight".to_string(),
+        );
     }
 
     let mut c = Array1::<f64>::zeros(p);
@@ -925,19 +1044,23 @@ fn try_binomial_alpha_beta_warm_start(
     };
     let warm_fit = fit_custom_family(&warm_family, &[alpha_spec, beta_spec], &warm_options)?;
     let eta_alpha = &warm_fit.block_states[BinomialAlphaBetaWarmStartFamily::BLOCK_ALPHA].eta;
-    let eta_beta = &warm_fit.block_states[BinomialAlphaBetaWarmStartFamily::BLOCK_BETA].eta;
-    if eta_alpha.len() != y.len() || eta_beta.len() != y.len() {
+    if eta_alpha.len() != y.len() {
         return Err("warm start eta length mismatch".to_string());
     }
 
-    let beta_obs = eta_beta.mapv(|v| v.clamp(beta_min, beta_max));
+    // This warm-start family currently identifies alpha only. Seed the
+    // log-sigma block from a deterministic midpoint sigma instead of reusing
+    // the beta block's penalty-only iterate.
+    let sigma_target = 0.5 * (sigma_min + sigma_max);
+    let eta_ls_target = bounded_sigma_eta_for_sigma_scalar(sigma_target, sigma_min, sigma_max);
+    let beta_obs = Array1::from_elem(y.len(), 1.0 / sigma_target.max(1e-12));
     let t_target = Array1::from_iter(
         eta_alpha
             .iter()
             .zip(beta_obs.iter())
             .map(|(&a, &b)| -a / b.max(1e-12)),
     );
-    let log_sigma_target = beta_obs.mapv(|b| -b.max(1e-12).ln());
+    let log_sigma_target = Array1::from_elem(y.len(), eta_ls_target);
     // T = -alpha/beta is noisy when beta is small (large sigma). Weight the
     // projection by beta^2 (inverse variance of T under fixed alpha noise).
     let t_projection_w = Array1::from_iter(
@@ -1120,18 +1243,49 @@ pub fn fit_gaussian_location_scale(
     validate_block_rows("mu", n, &spec.mu_block)?;
     validate_block_rows("log_sigma", n, &spec.log_sigma_block)?;
 
+    let GaussianLocationScaleSpec {
+        y,
+        weights,
+        sigma_min,
+        sigma_max,
+        mu_block,
+        log_sigma_block,
+    } = spec;
+    let mut mu_spec = mu_block.into_spec("mu")?;
+    let mut log_sigma_spec = log_sigma_block.into_spec("log_sigma")?;
+    if mu_spec.initial_beta.is_none() || log_sigma_spec.initial_beta.is_none() {
+        let (beta_mu0, beta_ls0, sigma0) = gaussian_location_scale_warm_start(
+            &y,
+            &weights,
+            sigma_min,
+            sigma_max,
+            &mu_spec,
+            &log_sigma_spec,
+            options.ridge_floor,
+            mu_spec.initial_beta.as_ref(),
+            log_sigma_spec.initial_beta.as_ref(),
+        )?;
+        if mu_spec.initial_beta.is_none() {
+            mu_spec.initial_beta = Some(beta_mu0);
+        }
+        if log_sigma_spec.initial_beta.is_none() {
+            log_sigma_spec.initial_beta = Some(beta_ls0);
+        }
+        log::info!(
+            "[GAMLSS][fit_gaussian_location_scale] initialized at residual sigma {:.6e}",
+            sigma0
+        );
+    }
+
     let family = GaussianLocationScaleFamily {
-        y: spec.y,
-        weights: spec.weights,
-        sigma_min: spec.sigma_min,
-        sigma_max: spec.sigma_max,
-        mu_design: Some(spec.mu_block.design.clone()),
-        log_sigma_design: Some(spec.log_sigma_block.design.clone()),
+        y,
+        weights,
+        sigma_min,
+        sigma_max,
+        mu_design: Some(mu_spec.design.clone()),
+        log_sigma_design: Some(log_sigma_spec.design.clone()),
     };
-    let blocks = vec![
-        spec.mu_block.into_spec("mu")?,
-        spec.log_sigma_block.into_spec("log_sigma")?,
-    ];
+    let blocks = vec![mu_spec, log_sigma_spec];
     Ok(fit_custom_family(&family, &blocks, options)?)
 }
 
@@ -1490,7 +1644,6 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             extra_rho0.as_slice().unwrap_or(&[]),
             kappa_options,
         );
-        let mut warm_state: Option<CustomFamilyWarmStart> = None;
         let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
         let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
         match optimize_two_block_spatial_length_scale_exact_joint(
@@ -1553,10 +1706,9 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     options,
                     rho,
                     &psi_derivative_blocks,
-                    warm_state.as_ref(),
+                    None,
                     need_hessian,
                 )?;
-                warm_state = Some(eval.warm_start);
                 Ok((eval.objective, eval.gradient, eval.outer_hessian))
             },
         ) {
@@ -1687,24 +1839,44 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             noise_design.penalties.len(),
         );
         layout.validate_theta_len(theta.len(), "gaussian location-scale")?;
-        Ok(vec![
-            ParameterBlockSpec {
-                name: "mu".to_string(),
-                design: DesignMatrix::Dense(mean_design.design.clone()),
-                offset: Array1::zeros(self.y.len()),
-                penalties: mean_design.penalties.clone(),
-                initial_log_lambdas: layout.mean_from(theta),
-                initial_beta: mean_beta_hint,
-            },
-            ParameterBlockSpec {
-                name: "log_sigma".to_string(),
-                design: DesignMatrix::Dense(noise_design.design.clone()),
-                offset: Array1::zeros(self.y.len()),
-                penalties: noise_design.penalties.clone(),
-                initial_log_lambdas: layout.noise_from(theta),
-                initial_beta: noise_beta_hint,
-            },
-        ])
+        let mean_log_lambdas = layout.mean_from(theta);
+        let noise_log_lambdas = layout.noise_from(theta);
+        let mut mean_spec = ParameterBlockSpec {
+            name: "mu".to_string(),
+            design: DesignMatrix::Dense(mean_design.design.clone()),
+            offset: Array1::zeros(self.y.len()),
+            penalties: mean_design.penalties.clone(),
+            initial_log_lambdas: mean_log_lambdas,
+            initial_beta: mean_beta_hint,
+        };
+        let mut noise_spec = ParameterBlockSpec {
+            name: "log_sigma".to_string(),
+            design: DesignMatrix::Dense(noise_design.design.clone()),
+            offset: Array1::zeros(self.y.len()),
+            penalties: noise_design.penalties.clone(),
+            initial_log_lambdas: noise_log_lambdas,
+            initial_beta: noise_beta_hint,
+        };
+        if mean_spec.initial_beta.is_none() || noise_spec.initial_beta.is_none() {
+            let (beta_mu0, beta_ls0, _) = gaussian_location_scale_warm_start(
+                &self.y,
+                &self.weights,
+                self.sigma_min,
+                self.sigma_max,
+                &mean_spec,
+                &noise_spec,
+                1e-10,
+                mean_spec.initial_beta.as_ref(),
+                noise_spec.initial_beta.as_ref(),
+            )?;
+            if mean_spec.initial_beta.is_none() {
+                mean_spec.initial_beta = Some(beta_mu0);
+            }
+            if noise_spec.initial_beta.is_none() {
+                noise_spec.initial_beta = Some(beta_ls0);
+            }
+        }
+        Ok(vec![mean_spec, noise_spec])
     }
 
     fn build_family(
@@ -2087,6 +2259,11 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms_auto(
             .zip(sigma.iter())
             .map(|(&t, &s)| -t / s.max(1e-12)),
     );
+    let identified_noise_design = identified_binomial_log_sigma_design(
+        &pilot.mean_design,
+        &pilot.noise_design,
+        &spec.weights,
+    )?;
 
     let threshold_penalty_count = pilot.mean_design.penalties.len();
     let noise_penalty_count = pilot.noise_design.penalties.len();
@@ -2131,7 +2308,7 @@ pub fn fit_binomial_location_scale_probit_wiggle_terms_auto(
                 initial_beta: pilot.fit.block_states.first().map(|b| b.beta.clone()),
             },
             log_sigma_block: ParameterBlockInput {
-                design: DesignMatrix::Dense(pilot.noise_design.design.clone()),
+                design: DesignMatrix::Dense(identified_noise_design),
                 offset: Array1::zeros(pilot.noise_design.design.nrows()),
                 penalties: pilot.noise_design.penalties.clone(),
                 initial_log_lambdas: Some(noise_log_lambdas),
@@ -2366,25 +2543,18 @@ fn xt_diag_x_design(design: &DesignMatrix, diag: &Array1<f64>) -> Result<Array2<
         ));
     }
     let p = x.ncols();
-    let mut out = Array2::<f64>::zeros((p, p));
-    for i in 0..x.nrows() {
+    let n = x.nrows();
+    let mut x_weighted = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
         let wi = diag[i];
         if wi == 0.0 {
             continue;
         }
-        for a in 0..p {
-            let xa = x[[i, a]];
-            for b in a..p {
-                out[[a, b]] += wi * xa * x[[i, b]];
-            }
+        for j in 0..p {
+            x_weighted[[i, j]] = x[[i, j]] * wi;
         }
     }
-    for a in 0..p {
-        for b in 0..a {
-            out[[a, b]] = out[[b, a]];
-        }
-    }
-    Ok(out)
+    Ok(crate::faer_ndarray::fast_atb(&x, &x_weighted))
 }
 
 fn xt_diag_x_dense(design: &Array2<f64>, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
@@ -2396,25 +2566,18 @@ fn xt_diag_x_dense(design: &Array2<f64>, diag: &Array1<f64>) -> Result<Array2<f6
         ));
     }
     let p = design.ncols();
-    let mut out = Array2::<f64>::zeros((p, p));
-    for i in 0..design.nrows() {
+    let n = design.nrows();
+    let mut x_weighted = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
         let wi = diag[i];
         if wi == 0.0 {
             continue;
         }
-        for a in 0..p {
-            let xa = design[[i, a]];
-            for b in a..p {
-                out[[a, b]] += wi * xa * design[[i, b]];
-            }
+        for j in 0..p {
+            x_weighted[[i, j]] = design[[i, j]] * wi;
         }
     }
-    for a in 0..p {
-        for b in 0..a {
-            out[[a, b]] = out[[b, a]];
-        }
-    }
-    Ok(out)
+    Ok(crate::faer_ndarray::fast_atb(design, &x_weighted))
 }
 
 fn mirror_upper_to_lower(target: &mut Array2<f64>) {
@@ -3008,8 +3171,13 @@ fn binomial_location_scale_working_sets(
         // Location/threshold chain: dq/deta_t = -1/sigma
         let chain_t = -link_chain / core.sigma[i].max(1e-12);
         let dmu_t = core.dmu_dq[i] * chain_t;
-        w_t[i] = (weights[i] * (dmu_t * dmu_t / var)).max(MIN_WEIGHT);
-        z_t[i] = eta_t[i] + (y[i] - core.mu[i]) / signed_with_floor(dmu_t, MIN_DERIV);
+        if dmu_t == 0.0 {
+            w_t[i] = 0.0;
+            z_t[i] = eta_t[i];
+        } else {
+            w_t[i] = (weights[i] * (dmu_t * dmu_t / var)).max(MIN_WEIGHT);
+            z_t[i] = eta_t[i] + (y[i] - core.mu[i]) / signed_with_floor(dmu_t, MIN_DERIV);
+        }
 
         // Scale chain: dq/deta_log_sigma = -q0 * dsigma/deta / sigma
         // This is the generic location-scale structure; the -Z multiplier appears here.
@@ -3018,14 +3186,24 @@ fn binomial_location_scale_working_sets(
             -link_chain * core.q0[i] * core.dsigma_deta[i] / s
         };
         let dmu_ls = core.dmu_dq[i] * chain_ls;
-        w_ls[i] = (weights[i] * (dmu_ls * dmu_ls / var)).max(MIN_WEIGHT);
-        z_ls[i] = eta_ls[i] + (y[i] - core.mu[i]) / signed_with_floor(dmu_ls, MIN_DERIV);
+        if dmu_ls == 0.0 {
+            w_ls[i] = 0.0;
+            z_ls[i] = eta_ls[i];
+        } else {
+            w_ls[i] = (weights[i] * (dmu_ls * dmu_ls / var)).max(MIN_WEIGHT);
+            z_ls[i] = eta_ls[i] + (y[i] - core.mu[i]) / signed_with_floor(dmu_ls, MIN_DERIV);
+        }
 
         if let (Some(eta_w), Some(z_wv), Some(w_wv)) = (eta_wiggle, z_w.as_mut(), w_w.as_mut()) {
             // Wiggle enters additively in q, so chain is 1.
             let dmu_w = core.dmu_dq[i];
-            w_wv[i] = (weights[i] * (dmu_w * dmu_w / var)).max(MIN_WEIGHT);
-            z_wv[i] = eta_w[i] + (y[i] - core.mu[i]) / signed_with_floor(dmu_w, MIN_DERIV);
+            if dmu_w == 0.0 {
+                w_wv[i] = 0.0;
+                z_wv[i] = eta_w[i];
+            } else {
+                w_wv[i] = (weights[i] * (dmu_w * dmu_w / var)).max(MIN_WEIGHT);
+                z_wv[i] = eta_w[i] + (y[i] - core.mu[i]) / signed_with_floor(dmu_w, MIN_DERIV);
+            }
         }
     }
 
@@ -3337,7 +3515,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
             bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
 
-        let mut h = Array2::<f64>::zeros((total, total));
+        let mut w_tt_diag = Array1::<f64>::zeros(n);
+        let mut w_tl_diag = Array1::<f64>::zeros(n);
+        let mut w_ll_diag = Array1::<f64>::zeros(n);
+
         for i in 0..n {
             let (w_tt, w_tl, w_ll) = gaussian_two_block_weight_jets(
                 self.y[i],
@@ -3354,24 +3535,26 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 0.0,
                 0.0,
             );
-            let xtr = x_t.row(i).to_vec();
-            let xlsr = x_ls.row(i).to_vec();
-            for a_idx in 0..pt {
-                for b_idx in a_idx..pt {
-                    h[[a_idx, b_idx]] += w_tt.v * xtr[a_idx] * xtr[b_idx];
-                }
-            }
-            for a_idx in 0..pt {
-                for b_idx in 0..pls {
-                    h[[a_idx, pt + b_idx]] += w_tl.v * xtr[a_idx] * xlsr[b_idx];
-                }
-            }
-            for a_idx in 0..pls {
-                for b_idx in a_idx..pls {
-                    h[[pt + a_idx, pt + b_idx]] += w_ll.v * xlsr[a_idx] * xlsr[b_idx];
-                }
+            w_tt_diag[i] = w_tt.v;
+            w_tl_diag[i] = w_tl.v;
+            w_ll_diag[i] = w_ll.v;
+        }
+
+        let h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
+        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
+        for i in 0..n {
+            let w = w_tl_diag[i];
+            for j in 0..pls {
+                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
             }
         }
+        let h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
+
+        let mut h = Array2::<f64>::zeros((total, total));
+        h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
+        h.slice_mut(s![0..pt, pt..total]).assign(&h_tl);
+        h.slice_mut(s![pt..total, pt..total]).assign(&h_ll);
         mirror_upper_to_lower(&mut h);
         Ok(Some(h))
     }
@@ -3404,7 +3587,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
             bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
 
-        let mut d_h = Array2::<f64>::zeros((total, total));
+        let mut w_tt_diag = Array1::<f64>::zeros(n);
+        let mut w_tl_diag = Array1::<f64>::zeros(n);
+        let mut w_ll_diag = Array1::<f64>::zeros(n);
+
         for i in 0..n {
             let (w_tt, w_tl, w_ll) = gaussian_two_block_weight_jets(
                 self.y[i],
@@ -3421,24 +3607,26 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 0.0,
                 0.0,
             );
-            let xtr = x_t.row(i).to_vec();
-            let xlsr = x_ls.row(i).to_vec();
-            for a_idx in 0..pt {
-                for b_idx in a_idx..pt {
-                    d_h[[a_idx, b_idx]] += w_tt.du * xtr[a_idx] * xtr[b_idx];
-                }
-            }
-            for a_idx in 0..pt {
-                for b_idx in 0..pls {
-                    d_h[[a_idx, pt + b_idx]] += w_tl.du * xtr[a_idx] * xlsr[b_idx];
-                }
-            }
-            for a_idx in 0..pls {
-                for b_idx in a_idx..pls {
-                    d_h[[pt + a_idx, pt + b_idx]] += w_ll.du * xlsr[a_idx] * xlsr[b_idx];
-                }
+            w_tt_diag[i] = w_tt.du;
+            w_tl_diag[i] = w_tl.du;
+            w_ll_diag[i] = w_ll.du;
+        }
+
+        let d_h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let d_h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
+        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
+        for i in 0..n {
+            let w = w_tl_diag[i];
+            for j in 0..pls {
+                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
             }
         }
+        let d_h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
+
+        let mut d_h = Array2::<f64>::zeros((total, total));
+        d_h.slice_mut(s![0..pt, 0..pt]).assign(&d_h_tt);
+        d_h.slice_mut(s![0..pt, pt..total]).assign(&d_h_tl);
+        d_h.slice_mut(s![pt..total, pt..total]).assign(&d_h_ll);
         mirror_upper_to_lower(&mut d_h);
         Ok(Some(d_h))
     }
@@ -3475,7 +3663,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
             bounded_sigma_derivs_up_to_fourth(eta_ls.view(), self.sigma_min, self.sigma_max);
 
-        let mut d2_h = Array2::<f64>::zeros((total, total));
+        let mut w_tt_diag = Array1::<f64>::zeros(n);
+        let mut w_tl_diag = Array1::<f64>::zeros(n);
+        let mut w_ll_diag = Array1::<f64>::zeros(n);
+
         for i in 0..n {
             let (w_tt, w_tl, w_ll) = gaussian_two_block_weight_jets(
                 self.y[i],
@@ -3492,24 +3683,26 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 d_eta_t_v[i],
                 d_eta_ls_v[i],
             );
-            let xtr = x_t.row(i).to_vec();
-            let xlsr = x_ls.row(i).to_vec();
-            for a_idx in 0..pt {
-                for b_idx in a_idx..pt {
-                    d2_h[[a_idx, b_idx]] += w_tt.duv * xtr[a_idx] * xtr[b_idx];
-                }
-            }
-            for a_idx in 0..pt {
-                for b_idx in 0..pls {
-                    d2_h[[a_idx, pt + b_idx]] += w_tl.duv * xtr[a_idx] * xlsr[b_idx];
-                }
-            }
-            for a_idx in 0..pls {
-                for b_idx in a_idx..pls {
-                    d2_h[[pt + a_idx, pt + b_idx]] += w_ll.duv * xlsr[a_idx] * xlsr[b_idx];
-                }
+            w_tt_diag[i] = w_tt.duv;
+            w_tl_diag[i] = w_tl.duv;
+            w_ll_diag[i] = w_ll.duv;
+        }
+
+        let d2_h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let d2_h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
+        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
+        for i in 0..n {
+            let w = w_tl_diag[i];
+            for j in 0..pls {
+                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
             }
         }
+        let d2_h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
+
+        let mut d2_h = Array2::<f64>::zeros((total, total));
+        d2_h.slice_mut(s![0..pt, 0..pt]).assign(&d2_h_tt);
+        d2_h.slice_mut(s![0..pt, pt..total]).assign(&d2_h_tl);
+        d2_h.slice_mut(s![pt..total, pt..total]).assign(&d2_h_ll);
         mirror_upper_to_lower(&mut d2_h);
         Ok(Some(d2_h))
     }
@@ -4182,7 +4375,11 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let total = pt + pls;
-        let mut h = Array2::<f64>::zeros((total, total));
+        
+        let mut w_tt_diag = Array1::<f64>::zeros(n);
+        let mut w_tl_diag = Array1::<f64>::zeros(n);
+        let mut w_ll_diag = Array1::<f64>::zeros(n);
+
         for i in 0..n {
             let (score_q, curvature_q, _third_q) = binomial_score_curvature_third_from_jet(
                 self.y[i],
@@ -4195,9 +4392,6 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             );
             let q = nonwiggle_q_derivs(eta_t[i], sigma[i], ds[i], d2s[i], 0.0);
 
-            let xtr = x_t.row(i).to_vec();
-            let xlsr = x_ls.row(i).to_vec();
-
             let eta_jet = eta_two_block_jet_from_q(
                 score_q,
                 curvature_q,
@@ -4207,26 +4401,26 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
                 q.q_tl,
                 q.q_ll,
             );
-            let wt_tt = eta_jet.w_tt;
-            let wt_tl = eta_jet.w_tl;
-            let wt_ll = eta_jet.w_ll;
+            w_tt_diag[i] = eta_jet.w_tt;
+            w_tl_diag[i] = eta_jet.w_tl;
+            w_ll_diag[i] = eta_jet.w_ll;
+        }
 
-            for a_idx in 0..pt {
-                for b_idx in a_idx..pt {
-                    h[[a_idx, b_idx]] += wt_tt * xtr[a_idx] * xtr[b_idx];
-                }
-            }
-            for a_idx in 0..pt {
-                for b_idx in 0..pls {
-                    h[[a_idx, pt + b_idx]] += wt_tl * xtr[a_idx] * xlsr[b_idx];
-                }
-            }
-            for a_idx in 0..pls {
-                for b_idx in a_idx..pls {
-                    h[[pt + a_idx, pt + b_idx]] += wt_ll * xlsr[a_idx] * xlsr[b_idx];
-                }
+        let h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
+        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
+        for i in 0..n {
+            let w = w_tl_diag[i];
+            for j in 0..pls {
+                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
             }
         }
+        let h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
+
+        let mut h = Array2::<f64>::zeros((total, total));
+        h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
+        h.slice_mut(s![0..pt, pt..total]).assign(&h_tl);
+        h.slice_mut(s![pt..total, pt..total]).assign(&h_ll);
         mirror_upper_to_lower(&mut h);
         Ok(Some(h))
     }
@@ -4372,7 +4566,10 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
         let (sigma, ds, d2s, d3s) =
             bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
 
-        let mut d_h = Array2::<f64>::zeros((total, total));
+        let mut w_tt_diag = Array1::<f64>::zeros(n);
+        let mut w_tl_diag = Array1::<f64>::zeros(n);
+        let mut w_ll_diag = Array1::<f64>::zeros(n);
+
         for i in 0..n {
             let (score_q, curvature_q, third_q) = binomial_score_curvature_third_from_jet(
                 self.y[i],
@@ -4386,11 +4583,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
             let q = nonwiggle_q_derivs(eta_t[i], sigma[i], ds[i], d2s[i], d3s[i]);
             let dq = nonwiggle_q_directional(q, d_eta_t[i], d_eta_ls[i]);
 
-            // (tt) block:
-            //   w_tt = -(c q_t^2 + s q_tt), and q_tt=0.
-            //   delta w_tt = -[ t delta_q q_t^2 + 2c(delta q_t)q_t + c delta_q q_tt + s delta q_tt ].
-            // Here q_tt=delta q_tt=0, so only the first two terms remain.
-            let coeff_tt = delta_newton_weight_from_q_terms(
+            w_tt_diag[i] = delta_newton_weight_from_q_terms(
                 score_q,
                 curvature_q,
                 third_q,
@@ -4402,12 +4595,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
                 dq.delta_q_t,
                 dq.delta_q_tt,
             );
-            // (t,ls) block:
-            //   w_tl = -(c q_t q_ls + s q_tl).
-            //   delta w_tl = -[ t delta_q q_t q_ls
-            //                   + c((delta q_t)q_ls + q_t(delta q_ls))
-            //                   + c delta_q q_tl + s delta q_tl ].
-            let coeff_tl = delta_newton_weight_from_q_terms(
+            w_tl_diag[i] = delta_newton_weight_from_q_terms(
                 score_q,
                 curvature_q,
                 third_q,
@@ -4419,12 +4607,7 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
                 dq.delta_q_ls,
                 dq.delta_q_tl,
             );
-            // (ls,ls) block:
-            //   w_ll = -(c q_ls^2 + s q_ll).
-            //   delta w_ll = -[ t delta_q q_ls^2
-            //                   + 2c(delta q_ls)q_ls
-            //                   + c delta_q q_ll + s delta q_ll ].
-            let coeff_ll = delta_newton_weight_from_q_terms(
+            w_ll_diag[i] = delta_newton_weight_from_q_terms(
                 score_q,
                 curvature_q,
                 third_q,
@@ -4436,25 +4619,23 @@ impl CustomFamily for BinomialLocationScaleProbitFamily {
                 dq.delta_q_ls,
                 dq.delta_q_ll,
             );
+        }
 
-            let xtr = x_t.row(i).to_vec();
-            let xlsr = x_ls.row(i).to_vec();
-            for a_idx in 0..pt {
-                for b_idx in a_idx..pt {
-                    d_h[[a_idx, b_idx]] += coeff_tt * xtr[a_idx] * xtr[b_idx];
-                }
-            }
-            for a_idx in 0..pt {
-                for b_idx in 0..pls {
-                    d_h[[a_idx, pt + b_idx]] += coeff_tl * xtr[a_idx] * xlsr[b_idx];
-                }
-            }
-            for a_idx in 0..pls {
-                for b_idx in a_idx..pls {
-                    d_h[[pt + a_idx, pt + b_idx]] += coeff_ll * xlsr[a_idx] * xlsr[b_idx];
-                }
+        let d_h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
+        let d_h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
+        let mut wtl_x_ls = Array2::<f64>::zeros((n, pls));
+        for i in 0..n {
+            let w = w_tl_diag[i];
+            for j in 0..pls {
+                wtl_x_ls[[i, j]] = x_ls[[i, j]] * w;
             }
         }
+        let d_h_tl = crate::faer_ndarray::fast_atb(&x_t, &wtl_x_ls);
+
+        let mut d_h = Array2::<f64>::zeros((total, total));
+        d_h.slice_mut(s![0..pt, 0..pt]).assign(&d_h_tt);
+        d_h.slice_mut(s![0..pt, pt..total]).assign(&d_h_tl);
+        d_h.slice_mut(s![pt..total, pt..total]).assign(&d_h_ll);
         mirror_upper_to_lower(&mut d_h);
         Ok(Some(d_h))
     }
@@ -6129,6 +6310,8 @@ mod tests {
         assert!(beta_t[0].is_finite());
         assert!(beta_ls[0].is_finite());
         assert!(beta_obs.iter().all(|v| v.is_finite() && *v > 0.0));
+        let expected_beta = 1.0 / ((0.25 + 4.0) * 0.5);
+        assert!(beta_obs.iter().all(|v| (*v - expected_beta).abs() < 1e-12));
     }
 
     #[test]
@@ -6445,6 +6628,73 @@ mod tests {
                 ls_w[i],
                 expected_w_ls
             );
+        }
+    }
+
+    #[test]
+    fn clamped_binomial_working_sets_stay_locally_flat() {
+        let n = 4usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let eta_t = Array1::from_vec(vec![1.0e6, -1.0e6, 1.0e6, -1.0e6]);
+        let eta_ls = Array1::zeros(n);
+        let eta_w = Array1::from_vec(vec![0.2, -0.1, 0.3, -0.2]);
+        let dq_dq0 = Array1::from_vec(vec![1.0; n]);
+
+        let core = binomial_location_scale_core(
+            &y,
+            &weights,
+            &eta_t,
+            &eta_ls,
+            Some(&eta_w),
+            &InverseLink::Standard(LinkFunction::Probit),
+            0.25,
+            4.0,
+        )
+        .expect("core");
+        assert!(core.clamp_active.iter().all(|v| *v));
+
+        let (t_ws, ls_ws, w_ws) = binomial_location_scale_working_sets(
+            &y,
+            &weights,
+            &eta_t,
+            &eta_ls,
+            Some(&eta_w),
+            Some(&dq_dq0),
+            None,
+            &core,
+        )
+        .expect("working sets");
+
+        match &t_ws {
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => {
+                assert_eq!(working_response, &eta_t);
+                assert!(working_weights.iter().all(|w| *w == 0.0));
+            }
+            BlockWorkingSet::ExactNewton { .. } => panic!("expected diagonal threshold block"),
+        }
+        match &ls_ws {
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => {
+                assert_eq!(working_response, &eta_ls);
+                assert!(working_weights.iter().all(|w| *w == 0.0));
+            }
+            BlockWorkingSet::ExactNewton { .. } => panic!("expected diagonal log-sigma block"),
+        }
+        match w_ws.expect("wiggle block") {
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => {
+                assert_eq!(working_response, eta_w);
+                assert!(working_weights.iter().all(|w| *w == 0.0));
+            }
+            BlockWorkingSet::ExactNewton { .. } => panic!("expected diagonal wiggle block"),
         }
     }
 

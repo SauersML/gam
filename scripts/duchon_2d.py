@@ -57,37 +57,68 @@ def parse_args() -> argparse.Namespace:
         default=REPO_ROOT / "scripts" / "duchon_2d.png",
     )
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--n-train", type=int, default=1800)
+    parser.add_argument("--n-train", type=int, default=4320)
+    parser.add_argument("--n-test", type=int, default=10800)
     parser.add_argument("--grid-size", type=int, default=90)
     return parser.parse_args()
 
 
 def true_surface(x: np.ndarray, z: np.ndarray) -> np.ndarray:
-    # Smooth background plus a rotated 2D mesa: the surface rises up, stays high
-    # over a bounded region, then drops back down in both rotated directions.
-    u = 0.82 * x + 0.58 * z
-    v = -0.46 * x + 0.89 * z
+    def sigmoid(t: np.ndarray, scale: float) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-t / scale))
 
-    smooth_bg = (
-        0.06 * np.sin(2.0 * math.pi * u)
-        + 0.04 * np.cos(2.0 * math.pi * v)
-        + 0.03 * np.sin(math.pi * (x - 1.2 * z))
-    )
-    u_left = u - 0.34 + 0.04 * np.sin(1.6 * math.pi * v)
-    u_right = u - 0.80 + 0.03 * np.cos(1.9 * math.pi * v - 0.4)
-    v_low = v + 0.26 + 0.03 * np.sin(1.7 * math.pi * u + 0.2)
-    v_high = v - 0.31 + 0.03 * np.cos(1.4 * math.pi * u - 0.3)
+    def rotated_bump(
+        x0: float,
+        z0: float,
+        amp: float,
+        sx: float,
+        sz: float,
+        theta: float,
+    ) -> np.ndarray:
+        dx = x - x0
+        dz = z - z0
+        ct = math.cos(theta)
+        st = math.sin(theta)
+        xr = ct * dx + st * dz
+        zr = -st * dx + ct * dz
+        return amp * np.exp(-0.5 * ((xr / sx) ** 2 + (zr / sz) ** 2))
 
-    gate_u = (1.0 / (1.0 + np.exp(-u_left / 0.026))) - (1.0 / (1.0 + np.exp(-u_right / 0.028)))
-    gate_v = (1.0 / (1.0 + np.exp(-v_low / 0.03))) - (1.0 / (1.0 + np.exp(-v_high / 0.03)))
-    plateau_gate = gate_u * gate_v
-    plateau_base = 1.18 * plateau_gate
-    plateau_variation = plateau_gate * (
-        0.07 * np.sin(2.0 * math.pi * u + 0.15)
-        + 0.06 * np.cos(2.3 * math.pi * v - 0.1)
+    # Large-scale regions: mostly flat, with a few broad plateaus and basins.
+    region_a = (sigmoid(x - 0.18, 0.025) - sigmoid(x - 0.42, 0.025)) * (
+        sigmoid(z - 0.12, 0.03) - sigmoid(z - 0.36, 0.03)
     )
-    spike = 1.36 * np.exp(-(((x - 0.76) / 0.055) ** 2 + ((z - 0.24) / 0.045) ** 2))
-    return smooth_bg + plateau_base + plateau_variation + spike
+    region_b = (sigmoid(x - 0.56, 0.03) - sigmoid(x - 0.90, 0.03)) * (
+        sigmoid(z - 0.58, 0.03) - sigmoid(z - 0.88, 0.03)
+    )
+    region_c = (sigmoid(x - 0.48, 0.028) - sigmoid(x - 0.72, 0.028)) * (
+        sigmoid(z - 0.20, 0.028) - sigmoid(z - 0.44, 0.028)
+    )
+    flat_regions = 0.65 * region_a - 0.42 * region_b + 0.28 * region_c
+
+    # Keep the background gentle so the flat regions still read as flat.
+    background = (
+        0.025 * np.sin(2.0 * math.pi * (0.7 * x + 0.2 * z))
+        + 0.02 * np.cos(2.0 * math.pi * (-0.25 * x + 0.65 * z))
+    )
+
+    # Many localized spikes with varying sign, scale, and orientation.
+    spikes = (
+        rotated_bump(0.12, 0.18, 0.95, 0.020, 0.050, 0.35)
+        + rotated_bump(0.20, 0.74, 0.72, 0.030, 0.022, -0.85)
+        + rotated_bump(0.28, 0.46, -0.55, 0.050, 0.018, 0.55)
+        + rotated_bump(0.34, 0.86, 1.15, 0.018, 0.040, 1.05)
+        + rotated_bump(0.41, 0.24, 0.58, 0.026, 0.026, 0.00)
+        + rotated_bump(0.47, 0.63, -0.62, 0.040, 0.020, -0.30)
+        + rotated_bump(0.55, 0.12, 0.88, 0.022, 0.060, 0.90)
+        + rotated_bump(0.61, 0.49, 1.25, 0.015, 0.028, -1.10)
+        + rotated_bump(0.68, 0.78, -0.48, 0.060, 0.022, 0.40)
+        + rotated_bump(0.74, 0.30, 1.40, 0.020, 0.020, 0.00)
+        + rotated_bump(0.81, 0.57, 0.66, 0.030, 0.017, -0.70)
+        + rotated_bump(0.88, 0.18, -0.52, 0.045, 0.020, 0.20)
+        + rotated_bump(0.84, 0.84, 0.92, 0.024, 0.045, -0.45)
+    )
+
+    return background + flat_regions + spikes
 
 
 def write_csv(path: Path, rows: list[tuple[float, ...]], header: list[str]) -> None:
@@ -102,7 +133,7 @@ def run(cmd: list[str | Path]) -> None:
 
 
 def build_demo_data(
-    workdir: Path, seed: int, n_train: int, grid_size: int
+    workdir: Path, seed: int, n_train: int, n_test: int, grid_size: int
 ) -> tuple[
     Path,
     Path,
@@ -118,20 +149,12 @@ def build_demo_data(
     np.ndarray,
 ]:
     rng = np.random.default_rng(seed)
-    n_total = n_train
-    x_all = rng.uniform(0.0, 1.0, size=n_total)
-    z_all = rng.uniform(0.0, 1.0, size=n_total)
-    y_all = true_surface(x_all, z_all) + rng.normal(0.0, 0.08, size=n_total)
-    perm = rng.permutation(n_total)
-    n_train_split = int(round(0.8 * n_total))
-    train_idx = perm[:n_train_split]
-    test_idx = perm[n_train_split:]
-    x_train = x_all[train_idx]
-    z_train = z_all[train_idx]
-    y_train = y_all[train_idx]
-    x_test = x_all[test_idx]
-    z_test = z_all[test_idx]
-    y_test = y_all[test_idx]
+    x_train = rng.uniform(0.0, 1.0, size=n_train)
+    z_train = rng.uniform(0.0, 1.0, size=n_train)
+    y_train = true_surface(x_train, z_train) + rng.normal(0.0, 0.08, size=n_train)
+    x_test = rng.uniform(0.0, 1.0, size=n_test)
+    z_test = rng.uniform(0.0, 1.0, size=n_test)
+    y_test = true_surface(x_test, z_test) + rng.normal(0.0, 0.08, size=n_test)
 
     x_axis = np.linspace(0.0, 1.0, grid_size)
     z_axis = np.linspace(0.0, 1.0, grid_size)
@@ -385,7 +408,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="duchon_2d_surface_") as tmpdir:
         workdir = Path(tmpdir)
         train_csv, test_csv, grid_csv, x_train, z_train, y_train, x_test, z_test, y_test, xx, zz, y_true = build_demo_data(
-            workdir, args.seed, args.n_train, args.grid_size
+            workdir, args.seed, args.n_train, args.n_test, args.grid_size
         )
         expected_rows = args.grid_size * args.grid_size
         grid_shape = xx.shape

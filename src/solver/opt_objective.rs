@@ -88,7 +88,9 @@ impl<F> CachedSecondOrderObjective<F> {
         x: &Array1<f64>,
     ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), ObjectiveEvalError>
     where
-        F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), ObjectiveEvalError>,
+        F: FnMut(
+            &Array1<f64>,
+        ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), ObjectiveEvalError>,
     {
         if let Some(sample) = &self.last
             && approx_same_point(x, &sample.x)
@@ -111,7 +113,9 @@ impl<F> CachedSecondOrderObjective<F> {
         x: &Array1<f64>,
     ) -> Result<Array2<f64>, ObjectiveEvalError>
     where
-        F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), ObjectiveEvalError>,
+        F: FnMut(
+            &Array1<f64>,
+        ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), ObjectiveEvalError>,
     {
         let p = x.len();
         let h = self.finite_diff_step;

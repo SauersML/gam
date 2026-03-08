@@ -5,6 +5,7 @@ use ad_trait::function_engine::FunctionEngine;
 use autodiff::{F1, Float, diff};
 use gam::mixture_link::component_inverse_link_jet;
 use gam::types::LinkComponent;
+use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative, second_derivative, third_derivative};
 use std::marker::PhantomData;
 
@@ -49,6 +50,186 @@ fn weight_f1(x: F1) -> F1 {
 fn weight_ad<T: AD>(x: T) -> T {
     let m = logistic_ad(x);
     m * (T::one() - m)
+}
+
+fn det3<D: DualNum<f64> + Copy>(m: &[[D; 3]; 3]) -> D {
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+}
+
+fn inv3<D: DualNum<f64> + Copy>(m: &[[D; 3]; 3]) -> [[D; 3]; 3] {
+    let det = det3(m);
+    let inv_det = D::one() / det;
+    [
+        [
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+        ],
+        [
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
+        ],
+        [
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+        ],
+    ]
+}
+
+fn matmul3_vec3<D: DualNum<f64> + Copy>(m: &[[D; 3]; 3], v: &[D; 3]) -> [D; 3] {
+    let mut out = [D::zero(); 3];
+    for i in 0..3 {
+        out[i] = m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2];
+    }
+    out
+}
+
+fn dot3<D: DualNum<f64> + Copy>(a: &[D; 3], b: &[D; 3]) -> D {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn firth_phi_numdual<D: DualNum<f64> + Copy>(
+    tau: D,
+    x: &Array2<f64>,
+    x_tau: &Array2<f64>,
+    beta: &Array1<f64>,
+) -> D {
+    let mut info = [[D::zero(); 3]; 3];
+    for i in 0..x.nrows() {
+        let mut row = [D::zero(); 3];
+        for j in 0..3 {
+            row[j] = D::from(x[[i, j]]) + tau * D::from(x_tau[[i, j]]);
+        }
+        let eta = row[0] * D::from(beta[0]) + row[1] * D::from(beta[1]) + row[2] * D::from(beta[2]);
+        let w = weight_numdual(eta);
+        for a in 0..3 {
+            for b in 0..3 {
+                info[a][b] += w * row[a] * row[b];
+            }
+        }
+    }
+    D::from(0.5) * det3(&info).ln()
+}
+
+fn firth_grad_phi_numdual<D: DualNum<f64> + Copy>(
+    tau: D,
+    x: &Array2<f64>,
+    x_tau: &Array2<f64>,
+    beta: &Array1<f64>,
+) -> [D; 3] {
+    let mut rows = Vec::with_capacity(x.nrows());
+    let mut w1 = Vec::with_capacity(x.nrows());
+    let mut info = [[D::zero(); 3]; 3];
+
+    for i in 0..x.nrows() {
+        let mut row = [D::zero(); 3];
+        for j in 0..3 {
+            row[j] = D::from(x[[i, j]]) + tau * D::from(x_tau[[i, j]]);
+        }
+        let eta = row[0] * D::from(beta[0]) + row[1] * D::from(beta[1]) + row[2] * D::from(beta[2]);
+        let mu = logistic_numdual(eta);
+        let w = mu * (D::one() - mu);
+        let t = D::one() - D::from(2.0) * mu;
+        w1.push(w * t);
+        rows.push(row);
+        for a in 0..3 {
+            for b in 0..3 {
+                info[a][b] += w * row[a] * row[b];
+            }
+        }
+    }
+
+    let k = inv3(&info);
+    let mut grad = [D::zero(); 3];
+    for (i, row) in rows.iter().enumerate() {
+        let kr = matmul3_vec3(&k, row);
+        let h = dot3(row, &kr);
+        for j in 0..3 {
+            grad[j] += D::from(0.5) * row[j] * w1[i] * h;
+        }
+    }
+    grad
+}
+
+fn firth_tau_manual(
+    x: &Array2<f64>,
+    x_tau: &Array2<f64>,
+    beta: &Array1<f64>,
+) -> (f64, Array1<f64>) {
+    let n = x.nrows();
+    let eta = x.dot(beta);
+    let mu = eta.mapv(|z| 1.0 / (1.0 + (-z).exp()));
+    let w = &mu * &(1.0 - &mu);
+    let t = 1.0 - 2.0 * &mu;
+    let w1 = &w * &t;
+    let w2 = &w * &(&t * &t) - 2.0 * &w * &w;
+    let deta = x_tau.dot(beta);
+
+    let mut info = [[0.0; 3]; 3];
+    for i in 0..n {
+        for a in 0..3 {
+            for b in 0..3 {
+                info[a][b] += w[i] * x[[i, a]] * x[[i, b]];
+            }
+        }
+    }
+    let k = inv3(&info);
+
+    let mut h = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let row = [x[[i, 0]], x[[i, 1]], x[[i, 2]]];
+        let kr = matmul3_vec3(&k, &row);
+        h[i] = dot3(&row, &kr);
+    }
+
+    let mut dot_i = [[0.0; 3]; 3];
+    for i in 0..n {
+        for a in 0..3 {
+            for b in 0..3 {
+                dot_i[a][b] += w[i] * x_tau[[i, a]] * x[[i, b]]
+                    + w[i] * x[[i, a]] * x_tau[[i, b]]
+                    + w1[i] * deta[i] * x[[i, a]] * x[[i, b]];
+            }
+        }
+    }
+
+    let mut phi_tau = 0.0;
+    for i in 0..3 {
+        for j in 0..3 {
+            phi_tau += k[i][j] * dot_i[j][i];
+        }
+    }
+    phi_tau *= 0.5;
+
+    let mut dot_k = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            for a in 0..3 {
+                for b in 0..3 {
+                    dot_k[i][j] -= k[i][a] * dot_i[a][b] * k[b][j];
+                }
+            }
+        }
+    }
+
+    let mut dot_h = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let row = [x[[i, 0]], x[[i, 1]], x[[i, 2]]];
+        let row_tau = [x_tau[[i, 0]], x_tau[[i, 1]], x_tau[[i, 2]]];
+        let kk = matmul3_vec3(&k, &row);
+        let dk = matmul3_vec3(&dot_k, &row);
+        dot_h[i] = 2.0 * dot3(&row_tau, &kk) + dot3(&row, &dk);
+    }
+
+    let mut g_phi_tau = 0.5 * x_tau.t().dot(&(&w1 * &h));
+    let second_vec = &(&(&w2 * &deta) * &h) + &(&w1 * &dot_h);
+    g_phi_tau += &(0.5 * x.t().dot(&second_vec));
+
+    (phi_tau, g_phi_tau)
 }
 
 #[derive(Clone)]
@@ -255,5 +436,50 @@ fn firth_logistic_weight_derivatives_match_three_autodiff_engines() {
             "fd(num_dual w3;h/2)" => w4_fd_h2,
             "fd(num_dual w3;h)" => w4_fd_h,
             "fd(num_dual w3;2h)" => w4_fd_2h);
+    }
+}
+
+#[test]
+fn firth_tau_manual_matches_autodiff_band() {
+    let x = array![
+        [1.0, -1.0, 0.2],
+        [1.0, -0.6, -0.3],
+        [1.0, -0.1, 0.5],
+        [1.0, 0.3, -0.7],
+        [1.0, 0.8, 0.1],
+        [1.0, 1.2, -0.4],
+    ];
+    let x_tau = array![
+        [0.0, 0.15, -0.05],
+        [0.0, -0.10, 0.02],
+        [0.0, 0.08, 0.04],
+        [0.0, -0.06, -0.03],
+        [0.0, 0.05, 0.01],
+        [0.0, -0.12, 0.06],
+    ];
+    let beta = array![0.1, -0.25, 0.2];
+
+    let (phi_tau_manual, g_phi_tau_manual) = firth_tau_manual(&x, &x_tau, &beta);
+    let (_phi0, phi_tau_nd) =
+        first_derivative(|tau| firth_phi_numdual(tau, &x, &x_tau, &beta), 0.0);
+
+    let h = 1e-6;
+    let phi_fd = (firth_phi_numdual(h, &x, &x_tau, &beta)
+        - firth_phi_numdual(-h, &x, &x_tau, &beta))
+        / (2.0 * h);
+
+    assert_manual_ad_band!("firth_tau", 0.0, "phi_tau", phi_tau_manual,
+        "num_dual" => phi_tau_nd,
+        "fd" => phi_fd);
+
+    for j in 0..3 {
+        let (_gj0, gj_nd) =
+            first_derivative(|tau| firth_grad_phi_numdual(tau, &x, &x_tau, &beta)[j], 0.0);
+        let gj_fd = (firth_grad_phi_numdual(h, &x, &x_tau, &beta)[j]
+            - firth_grad_phi_numdual(-h, &x, &x_tau, &beta)[j])
+            / (2.0 * h);
+        assert_manual_ad_band!("firth_tau", j as f64, "g_phi_tau", g_phi_tau_manual[j],
+            "num_dual" => gj_nd,
+            "fd" => gj_fd);
     }
 }
