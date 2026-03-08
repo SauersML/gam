@@ -414,6 +414,11 @@ pub fn solve_sparse_spd(
     for i in 0..rhs.len() {
         result[i] = out[(i, 0)];
     }
+    if !result.iter().all(|v| v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "sparse SPD solve produced non-finite values".to_string(),
+        ));
+    }
     Ok(result)
 }
 
@@ -428,6 +433,11 @@ pub fn solve_sparse_spd_multi(
         for i in 0..rhs.nrows() {
             result[[i, j]] = out[(i, j)];
         }
+    }
+    if !result.iter().all(|v| v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "sparse SPD multi-solve produced non-finite values".to_string(),
+        ));
     }
     Ok(result)
 }

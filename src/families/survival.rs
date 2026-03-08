@@ -15,6 +15,8 @@ pub enum SurvivalError {
     DimensionMismatch,
     #[error("inputs contain non-finite values")]
     NonFiniteInput,
+    #[error("survival spec '{0}' is not supported by the one-hazard survival engine")]
+    UnsupportedSpec(&'static str),
     #[error("crude risk integration setup is invalid")]
     InvalidIntegrationSetup,
     #[error("cumulative hazard must be nondecreasing")]
@@ -167,7 +169,6 @@ pub struct WorkingModelSurvival {
     age_exit: Array1<f64>,
     entry_at_origin: Array1<bool>,
     event_target: Array1<u8>,
-    event_competing: Array1<u8>,
     sample_weight: Array1<f64>,
     x_entry: Array2<f64>,
     x_exit: Array2<f64>,
@@ -177,7 +178,6 @@ pub struct WorkingModelSurvival {
     offset_derivative_exit: Array1<f64>,
     penalties: PenaltyBlocks,
     monotonicity: MonotonicityPenalty,
-    spec: SurvivalSpec,
     structurally_monotonic: bool,
     structural_time_columns: usize,
 }
@@ -214,17 +214,9 @@ impl WorkingModelSurvival {
         let (eval, _) = hessian
             .eigh(Side::Lower)
             .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
-        let min_eval = eval
-            .iter()
-            .fold(f64::INFINITY, |acc, &value| acc.min(value));
-        if min_eval.is_finite() {
-            return Err(EstimationError::HessianNotPositiveDefinite {
-                min_eigenvalue: min_eval,
-            });
-        }
-        Err(EstimationError::InvalidInput(
-            "survival LAML Hessian eigenspectrum is non-finite".to_string(),
-        ))
+        let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let tol = (max_eval * 1e-12).max(1e-14);
+        Ok(eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum())
     }
 
     fn derivative_guard(&self) -> f64 {
@@ -239,15 +231,6 @@ impl WorkingModelSurvival {
     fn interval_increment_guard(&self, h_entry: f64, h_exit: f64) -> f64 {
         let scale = h_entry.abs().max(h_exit.abs()).max(1.0);
         1e-10 * scale
-    }
-
-    fn event_indicator(&self, i: usize) -> f64 {
-        match self.spec {
-            SurvivalSpec::Net => f64::from(self.event_target[i]),
-            SurvivalSpec::Crude => {
-                f64::from((self.event_target[i] > 0 || self.event_competing[i] > 0) as u8)
-            }
-        }
     }
 
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
@@ -287,6 +270,9 @@ impl WorkingModelSurvival {
         monotonicity: MonotonicityPenalty,
         spec: SurvivalSpec,
     ) -> Result<Self, SurvivalError> {
+        if spec == SurvivalSpec::Crude {
+            return Err(SurvivalError::UnsupportedSpec("crude"));
+        }
         // This constructor is the engine-level hook for transformation-model style
         // baselines:
         //   eta(t, x) = eta_target(t) + eta_deviation(t, x).
@@ -357,7 +343,6 @@ impl WorkingModelSurvival {
             age_exit: inputs.age_exit.to_owned(),
             entry_at_origin: inputs.age_entry.mapv(|t| t <= 1e-8),
             event_target: inputs.event_target.to_owned(),
-            event_competing: inputs.event_competing.to_owned(),
             sample_weight: inputs.sample_weight.to_owned(),
             x_entry: inputs.x_entry.to_owned(),
             x_exit: inputs.x_exit.to_owned(),
@@ -367,7 +352,6 @@ impl WorkingModelSurvival {
             offset_derivative_exit,
             penalties,
             monotonicity,
-            spec,
             structurally_monotonic: false,
             structural_time_columns: 0,
         })
@@ -437,9 +421,7 @@ impl WorkingModelSurvival {
         //
         // The per-subject negative log-likelihood used below is
         //   NLL_i(beta) = exp(eta1_i) - exp(eta0_i) - delta_i * (eta1_i + log(s_i)),
-        // with delta_i selected from:
-        //   - Net   : target events only,
-        //   - Crude : any first event (target or competing).
+        // with delta_i = event_target_i.
         //
         // This is exactly the form whose derivatives are:
         //   grad_i = exp(eta1_i) a1_i - exp(eta0_i) a0_i - delta_i * (a1_i + d_i / s_i)
@@ -495,7 +477,7 @@ impl WorkingModelSurvival {
                     "survival ages must be finite with age_exit >= age_entry".to_string(),
                 ));
             }
-            let d = self.event_indicator(i);
+            let d = f64::from(self.event_target[i]);
 
             let has_entry_interval = !self.entry_at_origin[i];
             let h_s = if has_entry_interval { h_entry[i] } else { 0.0 };
@@ -861,7 +843,7 @@ impl WorkingModelSurvival {
                         i, s_i, guard
                     )));
                 }
-                if self.event_indicator(i) > 0.0 {
+                if self.event_target[i] > 0 {
                     let inv_s = 1.0 / s_i;
                     let inv_s2 = inv_s * inv_s;
                     let inv_s3 = inv_s2 * inv_s;
@@ -1226,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn crude_spec_treats_competing_events_as_failures() {
+    fn crude_spec_is_rejected_by_one_hazard_engine() {
         let age_entry = array![1.0_f64];
         let age_exit = array![2.0_f64];
         let event_target = array![0u8];
@@ -1237,46 +1219,13 @@ mod tests {
         let x_derivative = array![[1.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
-        let beta = array![0.0];
 
-        let net = WorkingModelSurvival::from_engine_inputs(
+        let err = WorkingModelSurvival::from_engine_inputs(
             SurvivalEngineInputs {
                 age_entry: age_entry.view(),
                 age_exit: age_exit.view(),
                 event_target: event_target.view(),
                 event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
-            penalties.clone(),
-            mono,
-            SurvivalSpec::Net,
-        )
-        .expect("construct net survival model");
-        let crude = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                sample_weight: sample_weight.view(),
-                x_entry: x_entry.view(),
-                x_exit: x_exit.view(),
-                x_derivative: x_derivative.view(),
-            },
-            penalties.clone(),
-            mono,
-            SurvivalSpec::Crude,
-        )
-        .expect("construct crude survival model");
-        let any_event = WorkingModelSurvival::from_engine_inputs(
-            SurvivalEngineInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: array![1u8].view(),
-                event_competing: array![0u8].view(),
                 sample_weight: sample_weight.view(),
                 x_entry: x_entry.view(),
                 x_exit: x_exit.view(),
@@ -1284,22 +1233,10 @@ mod tests {
             },
             penalties,
             mono,
-            SurvivalSpec::Net,
+            SurvivalSpec::Crude,
         )
-        .expect("construct any-event survival model");
-
-        let state_net = net.update_state(&beta).expect("net state");
-        let state_crude = crude.update_state(&beta).expect("crude state");
-        let state_any = any_event.update_state(&beta).expect("any-event state");
-
-        assert!(
-            (state_crude.deviance - state_net.deviance).abs() > 1e-8,
-            "crude likelihood should differ from net when competing failures are present"
-        );
-        assert!(
-            (state_crude.deviance - state_any.deviance).abs() < 1e-12,
-            "crude single-hazard likelihood should treat competing events as failures"
-        );
+        .expect_err("crude fitting should be rejected by the one-hazard engine");
+        assert!(matches!(err, SurvivalError::UnsupportedSpec("crude")));
     }
 
     #[test]
@@ -1655,7 +1592,7 @@ mod tests {
             .expect("enable structural monotonicity");
         assert!(model.monotonicity_linear_constraints().is_some());
 
-        let beta = array![-1.0, -0.3, 0.1, 0.2];
+        let beta = array![0.2, 0.2, 0.1, 0.2];
         let state = model.update_state(&beta).expect("state at structural beta");
         let eps = 1e-7;
         for j in 0..beta.len() {
@@ -1719,7 +1656,7 @@ mod tests {
             lambda: 0.7,
             range: 1..2,
         }]);
-        let beta = array![-1.0, -0.2, 0.1];
+        let beta = array![0.2, 0.2, 0.1];
         let state = model.update_state(&beta).expect("state at structural beta");
         let (obj, grad) = model
             .laml_objective_and_rho_gradient(&beta, &state)
@@ -1885,6 +1822,27 @@ mod tests {
     }
 
     #[test]
+    fn crude_risk_quadrature_rejects_nonpositive_instantaneous_hazard() {
+        let err = calculate_crude_risk_quadrature(
+            1.0,
+            2.0,
+            &[],
+            0.4,
+            0.2,
+            array![1.0].view(),
+            array![1.0].view(),
+            |_u, design_d, deriv_d, design_m| {
+                design_d[0] = 1.0;
+                deriv_d[0] = 0.0;
+                design_m[0] = 1.0;
+                Ok((0.0, 0.4, 0.25))
+            },
+        )
+        .expect_err("nonpositive hazards should fail");
+        assert!(matches!(err, SurvivalError::NonPositiveHazard));
+    }
+
+    #[test]
     fn laml_no_penalties_matches_documented_objective() {
         let age_entry = array![40.0, 45.0, 50.0, 55.0];
         let age_exit = array![44.0, 49.0, 54.0, 59.0];
@@ -1936,17 +1894,7 @@ mod tests {
             .expect("laml objective for no-penalty model");
 
         let h_dense = state.hessian.to_dense();
-        let logdet_h = if let Ok(chol) = h_dense.clone().cholesky(Side::Lower) {
-            let l = chol.lower_triangular();
-            2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>()
-        } else {
-            let (eval, _) = h_dense
-                .eigh(Side::Lower)
-                .expect("eigh fallback for hessian logdet");
-            let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-            let tol = (max_eval * 1e-12).max(1e-14);
-            eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum()
-        };
+        let logdet_h = WorkingModelSurvival::spd_logdet(&h_dense).expect("SPD hessian logdet");
         let expected = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h;
 
         assert_eq!(grad.len(), 0);
@@ -1956,6 +1904,42 @@ mod tests {
             obj,
             expected
         );
+    }
+
+    #[test]
+    fn laml_objective_uses_positive_spectrum_logdet_fallback() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![1u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[0.0]];
+        let x_exit = array![[0.2]];
+        let x_derivative = array![[0.5]];
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct survival model");
+        let beta = array![0.3];
+        let mut state = model.update_state(&beta).expect("state at beta");
+        state.hessian = crate::linalg::matrix::SymmetricMatrix::Dense(array![[-1.0]]);
+
+        let objective = model
+            .laml_objective_from_state(&beta, &state)
+            .expect("indefinite hessian should use positive-spectrum logdet fallback");
+        assert!(objective.is_finite());
     }
 
     #[test]

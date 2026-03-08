@@ -36,7 +36,7 @@ pub struct ParameterBlockSpec {
 }
 
 /// Current state for a parameter block.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ParameterBlockState {
     pub beta: Array1<f64>,
     pub eta: Array1<f64>,
@@ -322,7 +322,7 @@ impl Default for BlockwiseFitOptions {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BlockwiseInnerResult {
     pub block_states: Vec<ParameterBlockState>,
     pub active_sets: Vec<Option<Vec<usize>>>,
@@ -341,7 +341,7 @@ struct ConstrainedWarmStart {
     active_sets: Vec<Option<Vec<usize>>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BlockwiseFitResult {
     pub block_states: Vec<ParameterBlockState>,
     pub log_likelihood: f64,
@@ -597,25 +597,11 @@ fn solve_block_weighted_system(
     ridge_policy: RidgePolicy,
 ) -> Result<Array1<f64>, String> {
     let n = x.nrows();
-    let p = x.ncols();
     if y_star.len() != n || w.len() != n {
         return Err("weighted-system dimension mismatch".to_string());
     }
-
     let xtwy = x.compute_xtwy(w, y_star)?;
-    let base_ridge = if ridge_policy.include_laplace_hessian {
-        effective_solver_ridge(ridge_floor)
-    } else {
-        0.0
-    };
-
-    let mut penalty = s_lambda.clone();
-    if base_ridge > 0.0 {
-        for i in 0..p {
-            penalty[[i, i]] += base_ridge;
-        }
-    }
-    x.solve_system(w, &xtwy, Some(&penalty))
+    x.solve_system_with_policy(w, &xtwy, Some(s_lambda), ridge_floor, ridge_policy)
         .map_err(|_| "block solve failed after ridge retries".to_string())
 }
 
@@ -656,6 +642,20 @@ struct BlockUpdateResult {
     active_set: Option<Vec<usize>>,
 }
 
+#[inline]
+fn floor_positive_working_weight(raw_weight: f64, min_weight: f64) -> f64 {
+    if raw_weight <= 0.0 {
+        0.0
+    } else {
+        raw_weight.max(min_weight)
+    }
+}
+
+#[inline]
+fn floor_positive_working_weights(working_weights: &Array1<f64>, min_weight: f64) -> Array1<f64> {
+    working_weights.mapv(|wi| floor_positive_working_weight(wi, min_weight))
+}
+
 trait ParameterBlockUpdater {
     fn compute_update_step(
         &self,
@@ -682,9 +682,9 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
             ));
         }
 
-        let w_clamped = self
-            .working_weights
-            .mapv(|wi| wi.max(ctx.options.min_weight));
+        // Zero-weight observations are semantically excluded and must stay inactive.
+        let w_clamped =
+            floor_positive_working_weights(self.working_weights, ctx.options.min_weight);
 
         if let Some(constraints) = ctx.linear_constraints {
             check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(
@@ -960,19 +960,6 @@ fn solve_quadratic_with_linear_constraints(
     let feas_tol = 1e-8;
 
     check_linear_feasibility(beta_start, constraints, feas_tol)?;
-
-    // Fast path: unconstrained optimum is feasible.
-    if let Ok(beta_unc) = solve_spd_system_with_policy(
-        hessian,
-        rhs,
-        0.0,
-        RidgePolicy::explicit_stabilization_pospart(),
-    ) {
-        let slack = constraints.a.dot(&beta_unc) - &constraints.b;
-        if slack.iter().all(|&s| s >= -feas_tol) {
-            return Ok((beta_unc, Vec::new()));
-        }
-    }
 
     let mut x = beta_start.to_owned();
     let mut slack = constraints.a.dot(&x) - &constraints.b;
@@ -1312,7 +1299,7 @@ fn blockwise_logdet_terms<F: CustomFamily>(
                 working_response: _,
                 working_weights,
             } => with_block_geometry(family, states, spec, b, |x_dyn, _| {
-                let w = working_weights.mapv(|wi| wi.max(options.min_weight));
+                let w = floor_positive_working_weights(working_weights, options.min_weight);
                 let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
                 Ok(xtwx)
             })?,
@@ -1916,7 +1903,7 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                 working_response: _,
                 working_weights,
             } => with_block_geometry(family, &inner.block_states, spec, b, |x_dyn, _| {
-                let w = working_weights.mapv(|wi| wi.max(options.min_weight));
+                let w = floor_positive_working_weights(working_weights, options.min_weight);
                 let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
                 diagonal_design = Some(x_dyn.clone());
                 Ok(xtwx)
@@ -2103,7 +2090,10 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                                 BlockWorkingSet::Diagonal {
                                     working_response: _,
                                     working_weights,
-                                } => working_weights.mapv(|wi| wi.max(options.min_weight)),
+                                } => floor_positive_working_weights(
+                                    working_weights,
+                                    options.min_weight,
+                                ),
                                 BlockWorkingSet::ExactNewton { .. } => unreachable!(),
                             };
                             let leverages = diagonal_leverages.as_ref().ok_or_else(|| {
@@ -2293,7 +2283,7 @@ fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
                         spec.name
                     ));
                 }
-                let w = working_weights.mapv(|wi| wi.max(options.min_weight));
+                let w = floor_positive_working_weights(working_weights, options.min_weight);
                 let u = &w * &(working_response - eta);
                 let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
                 let mut h_for_logdet = xtwx;
@@ -3320,9 +3310,7 @@ pub fn fit_custom_family<F: CustomFamily>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::gamlss::{
-        BinomialLocationScaleProbitFamily, BinomialLocationScaleProbitWiggleFamily,
-    };
+    use crate::families::gamlss::{BinomialLocationScaleFamily, BinomialLocationScaleWiggleFamily};
     use crate::matrix::DesignMatrix;
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
@@ -3330,6 +3318,15 @@ mod tests {
 
     #[derive(Clone)]
     struct OneBlockIdentityFamily;
+
+    #[test]
+    fn floor_positive_working_weights_preserves_exact_zeros() {
+        let weights = array![0.0, 1.0e-16, 0.25];
+        let floored = floor_positive_working_weights(&weights, 1.0e-6);
+        assert_eq!(floored[0], 0.0);
+        assert_eq!(floored[1], 1.0e-6);
+        assert_eq!(floored[2], 0.25);
+    }
 
     impl CustomFamily for OneBlockIdentityFamily {
         fn evaluate(
@@ -3933,7 +3930,7 @@ mod tests {
             initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
         };
 
-        let family = BinomialLocationScaleProbitWiggleFamily {
+        let family = BinomialLocationScaleWiggleFamily {
             y,
             weights,
             sigma_min: 0.05,
@@ -4027,7 +4024,7 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
         };
-        let family = BinomialLocationScaleProbitFamily {
+        let family = BinomialLocationScaleFamily {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
@@ -4118,7 +4115,7 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.05]),
         };
-        let family = BinomialLocationScaleProbitFamily {
+        let family = BinomialLocationScaleFamily {
             y,
             weights,
             link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),

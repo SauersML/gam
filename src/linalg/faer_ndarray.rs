@@ -64,6 +64,9 @@ impl crate::matrix::FactorizedSystem for FaerSymmetricFactor {
         let mut out = rhs.clone();
         let mut out_mat = array1_to_col_mat_mut(&mut out);
         self.solve_in_place(out_mat.as_mut());
+        if !out.iter().all(|v| v.is_finite()) {
+            return Err("symmetric factor solve produced non-finite values".to_string());
+        }
         Ok(out)
     }
 
@@ -76,6 +79,9 @@ impl crate::matrix::FactorizedSystem for FaerSymmetricFactor {
         }
         let mut out_mat = array2_to_mat_mut(&mut out);
         self.solve_in_place(out_mat.as_mut());
+        if !out.iter().all(|v| v.is_finite()) {
+            return Err("symmetric factor multi-solve produced non-finite values".to_string());
+        }
         Ok(out)
     }
 
