@@ -22,7 +22,7 @@ use crate::estimate::{
     compute_external_joint_hyper_cost_gradient_hessian, fit_gam_with_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::{FaerCholesky, fast_atv};
+use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec};
@@ -4918,6 +4918,10 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         ExactNewtonOuterObjective::PseudoLaplace
     }
 
+    fn exact_newton_allows_semidefinite_hessian(&self) -> bool {
+        true
+    }
+
     fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
@@ -5037,13 +5041,39 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         let mut h_total = eval.total_objective_hessian(&self.design)?;
         h_total += &quadratic;
         symmetrize_dense_in_place(&mut h_total);
-        let chol = h_total
-            .cholesky(Side::Lower)
-            .map_err(|_| "strict pseudo-laplace SPD solve failed for adaptive psi".to_string())?;
-        let u = chol.solve_vec(&beta_mixed);
-        let h_inv = {
-            let ident = Array2::<f64>::eye(h_total.nrows());
-            chol.solve_mat(&ident)
+        let (u, h_inv) = match h_total.cholesky(Side::Lower) {
+            Ok(chol) => {
+                let u = chol.solve_vec(&beta_mixed);
+                let ident = Array2::<f64>::eye(h_total.nrows());
+                let h_inv = chol.solve_mat(&ident);
+                (u, h_inv)
+            }
+            Err(_) => {
+                let (evals, evecs) = FaerEigh::eigh(&h_total, Side::Lower).map_err(|e| {
+                    format!("strict pseudo-laplace adaptive psi eigendecomposition failed: {e}")
+                })?;
+                let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+                let tol = (max_abs_eval * 1e-12).max(1e-14);
+                if evals.iter().any(|&ev| ev < -tol) {
+                    return Err("strict pseudo-laplace SPD solve failed for adaptive psi".to_string());
+                }
+                let p = h_total.nrows();
+                let mut h_inv = Array2::<f64>::zeros((p, p));
+                for k in 0..p {
+                    let ev = evals[k];
+                    if ev <= tol {
+                        continue;
+                    }
+                    let inv_ev = 1.0 / ev;
+                    for i in 0..p {
+                        let uik = evecs[(i, k)];
+                        for j in 0..p {
+                            h_inv[[i, j]] += inv_ev * uik * evecs[(j, k)];
+                        }
+                    }
+                }
+                (h_inv.dot(&beta_mixed), h_inv)
+            }
         };
         let h_beta = self.exact_hessian_directional_derivative_from_evaluation(beta, &eval, &u)?;
         let mut h_dot = beta_hessian_explicit;
@@ -9544,6 +9574,82 @@ mod tests {
         assert!(eps_0 >= 1e-8);
         assert!(eps_g >= 1e-8);
         assert!(eps_c >= 1e-8);
+    }
+
+    #[test]
+    fn adaptive_exact_psi_gradient_symmetrizes_nearly_symmetric_hessian() {
+        let family = SpatialAdaptiveExactFamily {
+            family: LikelihoodFamily::GaussianIdentity,
+            mixture_link_state: None,
+            sas_link_state: None,
+            y: SyncArc::new(array![0.0, 0.0]),
+            weights: SyncArc::new(array![1.0, 1.0]),
+            design: SyncArc::new(array![[1.0, 0.0], [0.0, 1.0]]),
+            offset: SyncArc::new(array![0.0, 0.0]),
+            linear_constraints: None,
+            runtime_caches: SyncArc::new(vec![SpatialOperatorRuntimeCache {
+                term_name: "toy".to_string(),
+                feature_cols: vec![0],
+                coeff_global_range: 0..2,
+                mass_penalty_global_idx: 0,
+                tension_penalty_global_idx: 1,
+                stiffness_penalty_global_idx: 2,
+                d0: array![[1.0, 0.0], [0.0, 1.0]],
+                d1: array![[1.0, 0.0], [0.0, 1.0]],
+                d2: array![[1.0, 0.0], [0.0, 1.0]],
+                collocation_points: array![[0.0], [1.0]],
+                dimension: 1,
+            }]),
+            adaptive_params: vec![SpatialAdaptiveTermHyperParams {
+                lambda: [1.0, 1.0, 1.0],
+                epsilon: [1.0, 1.0, 1.0],
+            }],
+            fixed_quadratic_hessian: SyncArc::new(array![[0.0, 0.1], [3.0, 0.0]]),
+            hyper_specs: SyncArc::new(build_spatial_adaptive_hyper_specs(1)),
+        };
+        let spec = ParameterBlockSpec {
+            name: "toy".to_string(),
+            design: DesignMatrix::Dense(array![[1.0, 0.0], [0.0, 1.0]]),
+            offset: array![0.0, 0.0],
+            penalties: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0, 0.0]),
+        };
+        let deriv = CustomFamilyBlockPsiDerivative {
+            penalty_index: 0,
+            x_psi: Array2::zeros((2, 2)),
+            s_psi: Array2::zeros((2, 2)),
+            s_psi_components: None,
+        };
+        let lambdas = Array1::zeros(0);
+        let options = BlockwiseFitOptions {
+            use_reml_objective: true,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let state = vec![ParameterBlockState {
+            beta: array![0.0, 0.0],
+            eta: array![0.0, 0.0],
+        }];
+
+        let gradient = family
+            .exact_newton_block_psi_gradient(
+                &state,
+                0,
+                ExactNewtonPsiGradientContext {
+                    spec: &spec,
+                    deriv: &deriv,
+                    lambdas: &lambdas,
+                    options: &options,
+                },
+            )
+            .expect("adaptive psi gradient should tolerate nearly symmetric Hessian")
+            .expect("adaptive psi gradient should be present");
+
+        assert!(
+            gradient.is_finite(),
+            "expected finite adaptive psi gradient after symmetrization, got {gradient}"
+        );
     }
 
     #[test]
