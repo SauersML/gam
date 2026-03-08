@@ -189,6 +189,18 @@ pub struct SmoothDesign {
     pub linear_constraints: Option<LinearInequalityConstraints>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RawSmoothDesign {
+    pub design: Array2<f64>,
+    pub penalties: Vec<Array2<f64>>,
+    pub nullspace_dims: Vec<usize>,
+    pub penalty_info: Vec<PenaltyBlockInfo>,
+    pub dropped_penalty_info: Vec<DroppedPenaltyBlockInfo>,
+    pub terms: Vec<SmoothTerm>,
+    pub coefficient_lower_bounds: Option<Array1<f64>>,
+    pub linear_constraints: Option<LinearInequalityConstraints>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BoundedCoefficientPriorSpec {
     None,
@@ -1412,7 +1424,7 @@ impl SmoothDesign {
 pub fn build_smooth_design(
     data: ArrayView2<'_, f64>,
     terms: &[SmoothTermSpec],
-) -> Result<SmoothDesign, BasisError> {
+) -> Result<RawSmoothDesign, BasisError> {
     let n = data.nrows();
     let mut local_designs = Vec::<Array2<f64>>::with_capacity(terms.len());
     let mut local_penalties = Vec::<Vec<Array2<f64>>>::with_capacity(terms.len());
@@ -1700,7 +1712,7 @@ pub fn build_smooth_design(
         "global smooth penalty metadata bookkeeping diverged"
     );
 
-    Ok(SmoothDesign {
+    Ok(RawSmoothDesign {
         design,
         penalties: penalties_global,
         nullspace_dims: nullspace_dims_global,
@@ -1998,7 +2010,7 @@ pub fn dropped_penalty_block_report(design: &TermCollectionDesign) -> Vec<Droppe
 }
 
 fn apply_spatial_orthogonality_to_parametric(
-    smooth: SmoothDesign,
+    smooth: RawSmoothDesign,
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     smooth_specs: &[SmoothTermSpec],
@@ -2382,26 +2394,15 @@ fn maybe_spatial_identifiability_transform(
             Ok((b_c, Some(z)))
         }
         SpatialIdentifiability::FrozenTransform { transform } => {
-            if matches!(&term_spec.basis, SmoothBasisSpec::Duchon { .. }) {
-                if design_local.ncols() != transform.ncols() {
-                    return Err(BasisError::DimensionMismatch(format!(
-                        "frozen Duchon identifiability transform mismatch after basis build: design has {} columns but transform has {} columns",
-                        design_local.ncols(),
-                        transform.ncols()
-                    )));
-                }
-                Ok((design_local.to_owned(), None))
-            } else {
-                if design_local.ncols() != transform.nrows() {
-                    return Err(BasisError::DimensionMismatch(format!(
-                        "frozen spatial identifiability transform mismatch: design has {} columns but transform has {} rows",
-                        design_local.ncols(),
-                        transform.nrows()
-                    )));
-                }
-                let z = transform.clone();
-                Ok((design_local.dot(&z), Some(z)))
+            if design_local.ncols() != transform.nrows() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen spatial identifiability transform mismatch: design has {} columns but transform has {} rows",
+                    design_local.ncols(),
+                    transform.nrows()
+                )));
             }
+            let z = transform.clone();
+            Ok((design_local.dot(&z), Some(z)))
         }
     }
 }

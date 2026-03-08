@@ -1,3 +1,4 @@
+use crate::types::RidgePolicy;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView2};
 use std::collections::BTreeMap;
@@ -284,14 +285,50 @@ pub trait LinearOperator {
         rhs: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
     ) -> Result<Array1<f64>, String> {
+        self.solve_system_with_policy(
+            weights,
+            rhs,
+            penalty,
+            1e-15,
+            RidgePolicy::explicit_stabilization_pospart(),
+        )
+    }
+    fn solve_system_with_policy(
+        &self,
+        weights: &Array1<f64>,
+        rhs: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        ridge_floor: f64,
+        ridge_policy: RidgePolicy,
+    ) -> Result<Array1<f64>, String> {
         if rhs.len() != self.ncols() {
             return Err(format!(
-                "solve_system rhs dimension mismatch: rhs length {} != ncols {}",
+                "solve_system_with_policy rhs dimension mismatch: rhs length {} != ncols {}",
                 rhs.len(),
                 self.ncols()
             ));
         }
-        self.factorize_system(weights, penalty)?.solve(rhs)
+        let mut system = self.diag_xt_w_x(weights)?;
+        if let Some(pen) = penalty {
+            if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
+                return Err(format!(
+                    "solve_system_with_policy penalty shape mismatch: got {}x{}, expected {}x{}",
+                    pen.nrows(),
+                    pen.ncols(),
+                    system.nrows(),
+                    system.ncols()
+                ));
+            }
+            system += pen;
+        }
+        let base_ridge = if ridge_policy.include_laplace_hessian {
+            ridge_floor.max(1e-15)
+        } else {
+            0.0
+        };
+        crate::linalg::utils::StableSolver::new("linear operator system")
+            .solve_vector_with_ridge_retries(&system, rhs, base_ridge)
+            .ok_or_else(|| "solve_system_with_policy failed after ridge retries".to_string())
     }
 
     // Backward-compatible aliases.
@@ -694,6 +731,24 @@ impl DesignMatrix {
         <Self as LinearOperator>::solve_system(self, weights, rhs, penalty)
     }
 
+    pub fn solve_system_with_policy(
+        &self,
+        weights: &Array1<f64>,
+        rhs: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        ridge_floor: f64,
+        ridge_policy: RidgePolicy,
+    ) -> Result<Array1<f64>, String> {
+        <Self as LinearOperator>::solve_system_with_policy(
+            self,
+            weights,
+            rhs,
+            penalty,
+            ridge_floor,
+            ridge_policy,
+        )
+    }
+
     pub fn factorize_system(
         &self,
         weights: &Array1<f64>,
@@ -827,5 +882,21 @@ mod tests {
                 dense_sol[i]
             );
         }
+    }
+
+    #[test]
+    fn solve_system_stabilizes_indefinite_penalty_and_returns_finite_solution() {
+        let design = DesignMatrix::Dense(array![[1.0, 0.0], [0.0, 0.0]]);
+        let weights = array![1.0, 1.0];
+        let rhs = array![2.0, 0.0];
+        let penalty = array![[0.0, 0.0], [0.0, -1e-12]];
+
+        let beta = design
+            .solve_system(&weights, &rhs, Some(&penalty))
+            .expect("solve_system should stabilize indefinite systems");
+
+        assert!(beta.iter().all(|v| v.is_finite()));
+        assert!((beta[0] - 2.0).abs() < 1e-10);
+        assert!(beta[1].abs() < 1e-8);
     }
 }

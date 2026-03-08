@@ -4424,19 +4424,21 @@ fn build_matern_operator_penalty_candidates(
 fn build_matern_double_penalty_candidates(
     spline: &MaternSplineBasis,
     full_transform: Option<&Array2<f64>>,
-) -> Vec<PenaltyCandidate> {
-    vec![
-        normalize_penalty_candidate(
-            project_penalty_matrix(&spline.penalty_kernel, full_transform),
-            0,
-            PenaltySource::Primary,
-        ),
-        normalize_penalty_candidate(
-            project_penalty_matrix(&spline.penalty_ridge, full_transform),
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let primary = project_penalty_matrix(&spline.penalty_kernel, full_transform);
+    let mut candidates = vec![normalize_penalty_candidate(
+        primary.clone(),
+        0,
+        PenaltySource::Primary,
+    )];
+    if let Some(shrinkage) = build_nullspace_shrinkage_penalty(&primary)? {
+        candidates.push(normalize_penalty_candidate(
+            shrinkage.sym_penalty,
             0,
             PenaltySource::DoublePenaltyNullspace,
-        ),
-    ]
+        ));
+    }
+    Ok(candidates)
 }
 
 fn build_duchon_operator_penalty_candidates(
@@ -4643,7 +4645,7 @@ pub fn build_matern_basis_with_workspace(
         m.basis.clone()
     };
     let candidates = if spec.double_penalty {
-        build_matern_double_penalty_candidates(&m, full_transform.as_ref())
+        build_matern_double_penalty_candidates(&m, full_transform.as_ref())?
     } else {
         build_matern_operator_penalty_candidates(
             centers.view(),

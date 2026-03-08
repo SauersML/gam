@@ -26,9 +26,9 @@ use gam::families::sigma_link::{
     bounded_sigma_from_eta_scalar as sigma_from_eta_scalar,
 };
 use gam::gamlss::{
-    BinomialLocationScaleProbitTermSpec, BinomialLocationScaleWiggleWorkflowConfig,
+    BinomialLocationScaleTermSpec, BinomialLocationScaleWiggleWorkflowConfig,
     GaussianLocationScaleTermSpec, WiggleBlockConfig, build_wiggle_block_input_from_knots,
-    build_wiggle_block_input_from_seed, fit_binomial_location_scale_probit_terms_workflow,
+    build_wiggle_block_input_from_seed, fit_binomial_location_scale_terms_workflow,
     fit_gaussian_location_scale_terms,
 };
 use gam::generative::{generative_spec_from_predict, sample_observation_replicates};
@@ -225,12 +225,15 @@ struct FitArgs {
     /// Weibull baseline scale (>0) when baseline-target=weibull.
     #[arg(long = "baseline-scale")]
     baseline_scale: Option<f64>,
-    /// Baseline shape parameter (Weibull/Gompertz as applicable).
+    /// Baseline shape parameter (Weibull/Gompertz/Gompertz-Makeham as applicable).
     #[arg(long = "baseline-shape")]
     baseline_shape: Option<f64>,
-    /// Gompertz baseline rate when baseline-target=gompertz.
+    /// Gompertz hazard rate (>0) when baseline-target=gompertz or gompertz-makeham.
     #[arg(long = "baseline-rate")]
     baseline_rate: Option<f64>,
+    /// Makeham additive hazard (>0) when baseline-target=gompertz-makeham.
+    #[arg(long = "baseline-makeham")]
+    baseline_makeham: Option<f64>,
     /// Time basis for survival mode (`linear`, `ispline`, ...).
     #[arg(long = "time-basis", default_value = "linear")]
     time_basis: String,
@@ -290,6 +293,7 @@ struct SurvivalArgs {
     baseline_scale: Option<f64>,
     baseline_shape: Option<f64>,
     baseline_rate: Option<f64>,
+    baseline_makeham: Option<f64>,
     time_basis: String,
     time_degree: usize,
     time_num_internal_knots: usize,
@@ -516,6 +520,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             baseline_scale: args.baseline_scale,
             baseline_shape: args.baseline_shape,
             baseline_rate: args.baseline_rate,
+            baseline_makeham: args.baseline_makeham,
             time_basis: args.time_basis.clone(),
             time_degree: args.time_degree,
             time_num_internal_knots: args.time_num_internal_knots,
@@ -1166,9 +1171,9 @@ fn run_fit_with_predict_noise(
     let sigma_min = 0.05;
     let sigma_max = 20.0;
     let options = blockwise_options_from_fit_args(args)?;
-    let solved = fit_binomial_location_scale_probit_terms_workflow(
+    let solved = fit_binomial_location_scale_terms_workflow(
         ds.values.view(),
-        BinomialLocationScaleProbitTermSpec {
+        BinomialLocationScaleTermSpec {
             y: y.clone(),
             weights: Array1::ones(y.len()),
             link_kind: location_scale_link_kind.clone(),
@@ -1462,7 +1467,9 @@ fn run_predict_survival(
             x_time_exit: time_build.x_exit_time.clone(),
             eta_time_offset_exit: eta_offset_exit.clone(),
             x_threshold: DesignMatrix::Dense(cov_design.design.clone()),
+            eta_threshold_offset: Array1::zeros(n),
             x_log_sigma: DesignMatrix::Dense(cov_design.design.clone()),
+            eta_log_sigma_offset: Array1::zeros(n),
             x_link_wiggle: x_link_wiggle.clone(),
             sigma_min,
             sigma_max,
@@ -1491,16 +1498,17 @@ fn run_predict_survival(
                 (pred.survival_prob.clone(), None)
             } else {
                 let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-                let out = gam::survival_location_scale::predict_survival_location_scale_with_uncertainty(
-                    &pred_input,
-                    &fit_stub,
-                    &cov_mat,
-                    true,
-                    false,
-                )
-                .map_err(|e| {
-                    format!("survival probit-location-scale posterior-mean predict failed: {e}")
-                })?;
+                let out =
+                    gam::survival_location_scale::predict_survival_location_scale_with_uncertainty(
+                        &pred_input,
+                        &fit_stub,
+                        &cov_mat,
+                        true,
+                        false,
+                    )
+                    .map_err(|e| {
+                        format!("survival probit-location-scale posterior-mean predict failed: {e}")
+                    })?;
                 (out.survival_prob, Some(out.eta_standard_error))
             }
         } else {
@@ -1514,14 +1522,17 @@ fn run_predict_survival(
                 (Array1::zeros(n), Array1::zeros(n))
             } else {
                 let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-                let out = gam::survival_location_scale::predict_survival_location_scale_with_uncertainty(
-                    &pred_input,
-                    &fit_stub,
-                    &cov_mat,
-                    args.mode == PredictModeArg::PosteriorMean,
-                    true,
-                )
-                .map_err(|e| format!("survival probit-location-scale uncertainty predict failed: {e}"))?;
+                let out =
+                    gam::survival_location_scale::predict_survival_location_scale_with_uncertainty(
+                        &pred_input,
+                        &fit_stub,
+                        &cov_mat,
+                        args.mode == PredictModeArg::PosteriorMean,
+                        true,
+                    )
+                    .map_err(|e| {
+                        format!("survival probit-location-scale uncertainty predict failed: {e}")
+                    })?;
                 let se = eta_se_default
                     .clone()
                     .unwrap_or(out.eta_standard_error.clone());
@@ -2358,6 +2369,8 @@ enum SurvivalBaselineTarget {
     Weibull,
     // Parametric target: Gompertz baseline encoded in eta_target(t) = log(H0(t)).
     Gompertz,
+    // Parametric target: Gompertz-Makeham baseline encoded in eta_target(t) = log(H0(t)).
+    GompertzMakeham,
 }
 
 #[derive(Clone, Debug)]
@@ -2366,6 +2379,7 @@ struct SurvivalBaselineConfig {
     scale: Option<f64>,
     shape: Option<f64>,
     rate: Option<f64>,
+    makeham: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -2407,20 +2421,22 @@ fn parse_survival_baseline_config(
     scale: Option<f64>,
     shape: Option<f64>,
     rate: Option<f64>,
+    makeham: Option<f64>,
 ) -> Result<SurvivalBaselineConfig, String> {
     // Design principle:
     // baseline-target selects what the penalty shrinks *toward*.
     // - linear   => generic default,
-    // - weibull/gompertz => story-informed default.
+    // - weibull/gompertz/gompertz-makeham => story-informed default.
     //
     // In all cases, the fitted deviation can move away when data supports it.
     let target = match target_raw.to_ascii_lowercase().as_str() {
         "linear" => SurvivalBaselineTarget::Linear,
         "weibull" => SurvivalBaselineTarget::Weibull,
         "gompertz" => SurvivalBaselineTarget::Gompertz,
+        "gompertz-makeham" => SurvivalBaselineTarget::GompertzMakeham,
         other => {
             return Err(format!(
-                "unsupported --baseline-target '{other}'; use linear|weibull|gompertz"
+                "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
             ));
         }
     };
@@ -2431,6 +2447,7 @@ fn parse_survival_baseline_config(
             scale: None,
             shape: None,
             rate: None,
+            makeham: None,
         }),
         SurvivalBaselineTarget::Weibull => {
             let scale = scale.ok_or_else(|| {
@@ -2450,6 +2467,7 @@ fn parse_survival_baseline_config(
                 scale: Some(scale),
                 shape: Some(shape),
                 rate: None,
+                makeham: None,
             })
         }
         SurvivalBaselineTarget::Gompertz => {
@@ -2470,6 +2488,36 @@ fn parse_survival_baseline_config(
                 scale: None,
                 shape: Some(shape),
                 rate: Some(rate),
+                makeham: None,
+            })
+        }
+        SurvivalBaselineTarget::GompertzMakeham => {
+            let rate = rate.ok_or_else(|| {
+                "--baseline-target gompertz-makeham requires --baseline-rate > 0".to_string()
+            })?;
+            let shape = shape.ok_or_else(|| {
+                "--baseline-target gompertz-makeham requires --baseline-shape".to_string()
+            })?;
+            let makeham = makeham.ok_or_else(|| {
+                "--baseline-target gompertz-makeham requires --baseline-makeham > 0".to_string()
+            })?;
+            if !rate.is_finite()
+                || rate <= 0.0
+                || !shape.is_finite()
+                || !makeham.is_finite()
+                || makeham <= 0.0
+            {
+                return Err(
+                    "gompertz-makeham baseline requires finite --baseline-shape, positive --baseline-rate, and positive --baseline-makeham"
+                        .to_string(),
+                );
+            }
+            Ok(SurvivalBaselineConfig {
+                target,
+                scale: None,
+                shape: Some(shape),
+                rate: Some(rate),
+                makeham: Some(makeham),
             })
         }
     }
@@ -2516,6 +2564,7 @@ fn survival_baseline_config_from_model(
         model.survival_baseline_scale,
         model.survival_baseline_shape,
         model.survival_baseline_rate,
+        model.survival_baseline_makeham,
     )
 }
 
@@ -2524,6 +2573,7 @@ fn survival_baseline_target_name(target: SurvivalBaselineTarget) -> &'static str
         SurvivalBaselineTarget::Linear => "linear",
         SurvivalBaselineTarget::Weibull => "weibull",
         SurvivalBaselineTarget::Gompertz => "gompertz",
+        SurvivalBaselineTarget::GompertzMakeham => "gompertz-makeham",
     }
 }
 
@@ -2941,6 +2991,17 @@ fn evaluate_survival_baseline(
             "survival ages must be finite and positive for baseline target evaluation".to_string(),
         );
     }
+
+    fn gompertz_components(age: f64, rate: f64, shape: f64) -> (f64, f64) {
+        if shape.abs() < 1e-10 {
+            return (rate * age, rate);
+        }
+        let shape_age = shape * age;
+        let cumulative_hazard = (rate / shape) * shape_age.exp_m1();
+        let instant_hazard = rate * shape_age.exp();
+        (cumulative_hazard, instant_hazard)
+    }
+
     match cfg.target {
         SurvivalBaselineTarget::Linear => Ok((0.0, 0.0)),
         SurvivalBaselineTarget::Weibull => {
@@ -2953,19 +3014,29 @@ fn evaluate_survival_baseline(
         SurvivalBaselineTarget::Gompertz => {
             let rate = cfg.rate.unwrap_or(1.0);
             let shape = cfg.shape.unwrap_or(0.0);
-            if shape.abs() < 1e-10 {
-                let h = rate * age;
-                if h <= 0.0 || !h.is_finite() {
-                    return Err("invalid gompertz baseline at near-zero shape".to_string());
-                }
-                return Ok((h.ln(), 1.0 / age));
-            }
-            let exp_term = (shape * age).exp();
-            let h = (rate / shape) * (exp_term - 1.0);
+            let (h, inst) = gompertz_components(age, rate, shape);
             if h <= 0.0 || !h.is_finite() {
-                return Err("gompertz baseline produced non-positive cumulative hazard".to_string());
+                return Err(if shape.abs() < 1e-10 {
+                    "invalid gompertz baseline at near-zero shape".to_string()
+                } else {
+                    "gompertz baseline produced non-positive cumulative hazard".to_string()
+                });
             }
-            let inst = rate * exp_term;
+            let derivative = inst / h;
+            Ok((h.ln(), derivative))
+        }
+        SurvivalBaselineTarget::GompertzMakeham => {
+            let makeham = cfg.makeham.unwrap_or(0.0);
+            let rate = cfg.rate.unwrap_or(1.0);
+            let shape = cfg.shape.unwrap_or(0.0);
+            let (h_gompertz, inst_gompertz) = gompertz_components(age, rate, shape);
+            let h = makeham * age + h_gompertz;
+            if h <= 0.0 || !h.is_finite() {
+                return Err(
+                    "gompertz-makeham baseline produced non-positive cumulative hazard".to_string(),
+                );
+            }
+            let inst = makeham + inst_gompertz;
             let derivative = inst / h;
             Ok((h.ln(), derivative))
         }
@@ -3279,8 +3350,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
     let survival_spec = match effective_spec.to_ascii_lowercase().as_str() {
         "net" => SurvivalSpec::Net,
-        "crude" => SurvivalSpec::Crude,
-        other => return Err(format!("unsupported --spec '{other}'; use net|crude")),
+        "crude" => {
+            return Err(
+                "survival spec 'crude' is not supported by the one-hazard fitter; use spec=net and compute crude risk from separate cause-specific hazards"
+                    .to_string(),
+            );
+        }
+        other => return Err(format!("unsupported --spec '{other}'; use net")),
     };
     let likelihood_mode = parse_survival_likelihood_mode(&effective_args.survival_likelihood)?;
     let _survival_distribution = parse_survival_distribution(&effective_survival_distribution)?;
@@ -3292,9 +3368,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             || effective_args.baseline_scale.is_some()
             || effective_args.baseline_shape.is_some()
             || effective_args.baseline_rate.is_some()
+            || effective_args.baseline_makeham.is_some()
         {
             return Err(
-                "--survival-likelihood weibull uses the built-in parametric baseline; do not set --baseline-target/--baseline-scale/--baseline-shape/--baseline-rate"
+                "--survival-likelihood weibull uses the built-in parametric baseline; do not set --baseline-target/--baseline-scale/--baseline-shape/--baseline-rate/--baseline-makeham"
                     .to_string(),
             );
         }
@@ -3316,10 +3393,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 effective_args.baseline_scale,
                 effective_args.baseline_shape,
                 effective_args.baseline_rate,
+                effective_args.baseline_makeham,
             )?
         }
         SurvivalLikelihoodMode::Weibull => {
-            parse_survival_baseline_config("linear", None, None, None)?
+            parse_survival_baseline_config("linear", None, None, None, None)?
         }
     };
     if !effective_args.ridge_lambda.is_finite() || effective_args.ridge_lambda < 0.0 {
@@ -3451,9 +3529,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     initial_log_delta: theta[1],
                 })
                 .map_err(EstimationError::InvalidInput)?;
-                let fit =
-                    fit_survival_location_scale(build_spec(InverseLink::Sas(state), None))
-                        .map_err(EstimationError::InvalidInput)?;
+                let fit = fit_survival_location_scale(build_spec(InverseLink::Sas(state), None))
+                    .map_err(EstimationError::InvalidInput)?;
                 Ok(fit.penalized_objective)
             };
             let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
@@ -3508,11 +3585,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     initial_log_delta: theta[1],
                 })
                 .map_err(EstimationError::InvalidInput)?;
-                let fit = fit_survival_location_scale(build_spec(
-                    InverseLink::BetaLogistic(state),
-                    None,
-                ))
-                .map_err(EstimationError::InvalidInput)?;
+                let fit =
+                    fit_survival_location_scale(build_spec(InverseLink::BetaLogistic(state), None))
+                        .map_err(EstimationError::InvalidInput)?;
                 Ok(fit.penalized_objective)
             };
             let init = Array1::from_vec(vec![state0.epsilon, state0.log_delta]);
@@ -3565,11 +3640,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     initial_rho: rho.clone(),
                 })
                 .map_err(EstimationError::InvalidInput)?;
-                let fit = fit_survival_location_scale(build_spec(
-                    InverseLink::Mixture(state),
-                    None,
-                ))
-                .map_err(EstimationError::InvalidInput)?;
+                let fit =
+                    fit_survival_location_scale(build_spec(InverseLink::Mixture(state), None))
+                        .map_err(EstimationError::InvalidInput)?;
                 Ok(fit.penalized_objective)
             };
             let mut opt = SmoothingBfgsOptions {
@@ -3620,9 +3693,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     penalty_orders: vec![1, 2, 3],
                     double_penalty: true,
                 });
-            let pilot =
-                fit_survival_location_scale(build_spec(fitted_inverse_link.clone(), None))
-                    .map_err(|e| format!("survival probit-location-scale pilot fit failed: {e}"))?;
+            let pilot = fit_survival_location_scale(build_spec(fitted_inverse_link.clone(), None))
+                .map_err(|e| format!("survival probit-location-scale pilot fit failed: {e}"))?;
             let eta_t = cov_design.design.dot(&pilot.beta_threshold);
             let eta_ls = cov_design.design.dot(&pilot.beta_log_sigma);
             let (sigma, _ds) = sigma_and_deriv_from_eta(eta_ls.view(), 0.05, 20.0);
@@ -3648,11 +3720,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 initial_log_lambdas: wiggle_block.initial_log_lambdas,
                 initial_beta: wiggle_block.initial_beta,
             };
-            fit_survival_location_scale(build_spec(
-                fitted_inverse_link.clone(),
-                Some(wiggle_input),
-            ))
-            .map_err(|e| format!("survival probit-location-scale wiggle fit failed: {e}"))?
+            fit_survival_location_scale(build_spec(fitted_inverse_link.clone(), Some(wiggle_input)))
+                .map_err(|e| format!("survival probit-location-scale wiggle fit failed: {e}"))?
         } else {
             fit_survival_location_scale(build_spec(fitted_inverse_link.clone(), None))
                 .map_err(|e| format!("survival probit-location-scale fit failed: {e}"))?
@@ -3707,6 +3776,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_baseline_scale = baseline_cfg.scale;
             payload.survival_baseline_shape = baseline_cfg.shape;
             payload.survival_baseline_rate = baseline_cfg.rate;
+            payload.survival_baseline_makeham = baseline_cfg.makeham;
             payload.survival_time_basis = Some(time_build.basis_name.clone());
             payload.survival_time_degree = time_build.degree;
             payload.survival_time_knots = time_build.knots.clone();
@@ -3892,6 +3962,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.survival_baseline_scale = baseline_cfg.scale;
         payload.survival_baseline_shape = baseline_cfg.shape;
         payload.survival_baseline_rate = baseline_cfg.rate;
+        payload.survival_baseline_makeham = baseline_cfg.makeham;
         payload.survival_time_basis = Some(time_build.basis_name.clone());
         payload.survival_time_degree = time_build.degree;
         payload.survival_time_knots = time_build.knots.clone();
@@ -4082,7 +4153,12 @@ fn run_sample_survival(
         .as_str()
     {
         "net" => SurvivalSpec::Net,
-        "crude" => SurvivalSpec::Crude,
+        "crude" => {
+            return Err(
+                "saved survival spec 'crude' is not supported by the one-hazard survival engine; refit or export a net survival model for this path"
+                    .to_string(),
+            );
+        }
         other => return Err(format!("unsupported saved survival spec '{other}'")),
     };
     let monotonicity = MonotonicityPenalty { tolerance: 1e-8 };
@@ -8210,14 +8286,16 @@ mod tests {
     use super::{
         BoundedCoefficientPriorSpec, ColumnKindTag, DataSchema, LikelihoodFamily, LinkMode,
         MODEL_VERSION, ParsedTerm, SavedFitSummary, SavedModel, SurvivalArgs,
-        SurvivalTimeBasisConfig, apply_saved_probit_wiggle, build_survival_time_basis,
-        chi_square_survival_approx, classify_cli_error, collect_linear_smooth_overlap_warnings,
+        SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalTimeBasisConfig,
+        apply_saved_probit_wiggle, build_survival_time_basis, chi_square_survival_approx,
+        classify_cli_error, collect_linear_smooth_overlap_warnings,
         collect_spatial_smooth_usage_warnings, compute_probit_q0_from_eta, core_saved_fit_result,
-        parse_duchon_order, parse_duchon_power, parse_formula, parse_link_choice,
-        parse_surv_response, parse_survival_inverse_link, parse_survival_time_basis_config,
-        pretty_family_name, saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design,
-        summarize_wiggle_domain, survival_probability_from_eta,
-        write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
+        evaluate_survival_baseline, parse_duchon_order, parse_duchon_power, parse_formula,
+        parse_link_choice, parse_surv_response, parse_survival_baseline_config,
+        parse_survival_inverse_link, parse_survival_time_basis_config, pretty_family_name,
+        saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design, summarize_wiggle_domain,
+        survival_probability_from_eta, write_gaussian_location_scale_prediction_csv,
+        write_survival_prediction_csv,
     };
     use csv::StringRecord;
     use gam::basis::{
@@ -9021,6 +9099,7 @@ mod tests {
             baseline_scale: None,
             baseline_shape: None,
             baseline_rate: None,
+            baseline_makeham: None,
             time_basis: "ispline".to_string(),
             time_degree: 2,
             time_num_internal_knots: 6,
@@ -9030,6 +9109,71 @@ mod tests {
         };
         let cfg = parse_survival_time_basis_config(&args).expect("parse ispline time basis");
         assert!(matches!(cfg, SurvivalTimeBasisConfig::ISpline { .. }));
+    }
+
+    #[test]
+    fn parse_survival_baseline_accepts_gompertz_makeham() {
+        let cfg = parse_survival_baseline_config(
+            "gompertz-makeham",
+            None,
+            Some(0.08),
+            Some(0.015),
+            Some(0.002),
+        )
+        .expect("parse gompertz-makeham baseline");
+        assert_eq!(cfg.target, SurvivalBaselineTarget::GompertzMakeham);
+        assert_eq!(cfg.shape, Some(0.08));
+        assert_eq!(cfg.rate, Some(0.015));
+        assert_eq!(cfg.makeham, Some(0.002));
+    }
+
+    #[test]
+    fn parse_survival_baseline_rejects_missing_gompertz_makeham_term() {
+        let err =
+            parse_survival_baseline_config("gompertz-makeham", None, Some(0.08), Some(0.015), None)
+                .expect_err("missing makeham term should fail");
+        assert!(err.contains("--baseline-makeham"));
+    }
+
+    #[test]
+    fn evaluate_survival_baseline_matches_gompertz_makeham_formula() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(0.07),
+            rate: Some(0.012),
+            makeham: Some(0.003),
+        };
+        let age = 11.5;
+        let (eta, derivative) =
+            evaluate_survival_baseline(age, &cfg).expect("evaluate gompertz-makeham baseline");
+        let shape = cfg.shape.expect("shape");
+        let rate = cfg.rate.expect("rate");
+        let makeham = cfg.makeham.expect("makeham");
+        let cumulative_hazard = makeham * age + (rate / shape) * ((shape * age).exp() - 1.0);
+        let expected_eta = cumulative_hazard.ln();
+        let expected_derivative = (makeham + rate * (shape * age).exp()) / cumulative_hazard;
+        assert!((eta - expected_eta).abs() <= 1e-12);
+        assert!((derivative - expected_derivative).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn evaluate_survival_baseline_handles_near_zero_gompertz_makeham_shape() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(1e-14),
+            rate: Some(0.012),
+            makeham: Some(0.003),
+        };
+        let age = 11.5;
+        let (eta, derivative) =
+            evaluate_survival_baseline(age, &cfg).expect("evaluate near-zero gompertz-makeham");
+        let cumulative_hazard = (cfg.rate.expect("rate") + cfg.makeham.expect("makeham")) * age;
+        let expected_eta = cumulative_hazard.ln();
+        let expected_derivative = 1.0 / age;
+        assert!((eta - expected_eta).abs() <= 1e-12);
+        assert!((derivative - expected_derivative).abs() <= 1e-12);
     }
 
     fn base_survival_args_for_link_tests() -> SurvivalArgs {
@@ -9050,6 +9194,7 @@ mod tests {
             baseline_scale: None,
             baseline_shape: None,
             baseline_rate: None,
+            baseline_makeham: None,
             time_basis: "linear".to_string(),
             time_degree: 3,
             time_num_internal_knots: 8,
@@ -9163,6 +9308,7 @@ mod tests {
             baseline_scale: None,
             baseline_shape: None,
             baseline_rate: None,
+            baseline_makeham: None,
             time_basis: "linear".to_string(),
             time_degree: 3,
             time_num_internal_knots: 8,
@@ -9330,7 +9476,7 @@ mod tests {
                 likelihood: LikelihoodFamily::BinomialProbit,
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
-            family: "binomial-location-scale-probit".to_string(),
+            family: "binomial-location-scale".to_string(),
             fit_result: None,
             data_schema: None,
             link: Some("probit".to_string()),
@@ -9357,6 +9503,7 @@ mod tests {
             survival_baseline_scale: None,
             survival_baseline_shape: None,
             survival_baseline_rate: None,
+            survival_baseline_makeham: None,
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
@@ -9520,7 +9667,7 @@ mod tests {
                 likelihood: LikelihoodFamily::BinomialProbit,
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
-            family: "binomial-location-scale-probit".to_string(),
+            family: "binomial-location-scale".to_string(),
             fit_result: None,
             data_schema: None,
             link: Some("probit".to_string()),
@@ -9547,6 +9694,7 @@ mod tests {
             survival_baseline_scale: None,
             survival_baseline_shape: None,
             survival_baseline_rate: None,
+            survival_baseline_makeham: None,
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
@@ -9579,7 +9727,7 @@ mod tests {
                 likelihood: LikelihoodFamily::BinomialProbit,
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
-            family: "binomial-location-scale-probit".to_string(),
+            family: "binomial-location-scale".to_string(),
             fit_result: None,
             data_schema: None,
             link: Some("probit".to_string()),
@@ -9606,6 +9754,7 @@ mod tests {
             survival_baseline_scale: None,
             survival_baseline_shape: None,
             survival_baseline_rate: None,
+            survival_baseline_makeham: None,
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,

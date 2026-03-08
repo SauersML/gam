@@ -93,6 +93,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub survival_baseline_rate: Option<f64>,
     #[serde(default)]
+    pub survival_baseline_makeham: Option<f64>,
+    #[serde(default)]
     pub survival_time_basis: Option<String>,
     #[serde(default)]
     pub survival_time_degree: Option<usize>,
@@ -166,6 +168,7 @@ impl FittedModelPayload {
             survival_baseline_scale: None,
             survival_baseline_shape: None,
             survival_baseline_rate: None,
+            survival_baseline_makeham: None,
             survival_time_basis: None,
             survival_time_degree: None,
             survival_time_knots: None,
@@ -644,6 +647,7 @@ impl FittedModel {
             ("survival_baseline_scale", self.survival_baseline_scale),
             ("survival_baseline_shape", self.survival_baseline_shape),
             ("survival_baseline_rate", self.survival_baseline_rate),
+            ("survival_baseline_makeham", self.survival_baseline_makeham),
             (
                 "survival_time_smooth_lambda",
                 self.survival_time_smooth_lambda,
