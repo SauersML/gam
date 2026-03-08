@@ -55,10 +55,6 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub beta_noise: Option<Vec<f64>>,
     #[serde(default)]
-    pub sigma_min: Option<f64>,
-    #[serde(default)]
-    pub sigma_max: Option<f64>,
-    #[serde(default)]
     pub noise_projection: Option<Vec<Vec<f64>>>,
     #[serde(default)]
     pub noise_center: Option<Vec<f64>>,
@@ -115,10 +111,6 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub survival_likelihood: Option<String>,
     #[serde(default)]
-    pub survival_sigma_min: Option<f64>,
-    #[serde(default)]
-    pub survival_sigma_max: Option<f64>,
-    #[serde(default)]
     pub survival_beta_time: Option<Vec<f64>>,
     #[serde(default)]
     pub survival_beta_threshold: Option<Vec<f64>>,
@@ -165,8 +157,6 @@ impl FittedModelPayload {
             sas_param_covariance: None,
             formula_noise: None,
             beta_noise: None,
-            sigma_min: None,
-            sigma_max: None,
             noise_projection: None,
             noise_center: None,
             noise_scale: None,
@@ -195,8 +185,6 @@ impl FittedModelPayload {
             survival_time_smooth_lambda: None,
             survival_ridge_lambda: None,
             survival_likelihood: None,
-            survival_sigma_min: None,
-            survival_sigma_max: None,
             survival_beta_time: None,
             survival_beta_threshold: None,
             survival_beta_log_sigma: None,
@@ -718,8 +706,6 @@ impl FittedModel {
         }
 
         for (name, opt) in [
-            ("sigma_min", self.sigma_min),
-            ("sigma_max", self.sigma_max),
             ("survival_baseline_scale", self.survival_baseline_scale),
             ("survival_baseline_shape", self.survival_baseline_shape),
             ("survival_baseline_rate", self.survival_baseline_rate),
@@ -729,8 +715,6 @@ impl FittedModel {
                 self.survival_time_smooth_lambda,
             ),
             ("survival_ridge_lambda", self.survival_ridge_lambda),
-            ("survival_sigma_min", self.survival_sigma_min),
-            ("survival_sigma_max", self.survival_sigma_max),
             ("joint_ridge_used", self.joint_ridge_used),
         ] {
             if let Some(v) = opt {

@@ -744,7 +744,7 @@ fn wilkinson_shift(a: f64, c: f64, b: f64) -> f64 {
 /// When `se_eta` is zero or very small, this reduces to `sigmoid(eta)`.
 #[inline]
 pub fn logit_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
-    integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid).clamp(1e-10, 1.0 - 1e-10)
+    integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid)
 }
 
 /// Computes the integrated probability AND its derivative with respect to eta.
@@ -1029,7 +1029,7 @@ fn logit_posterior_mean_with_deriv_exact_erfcx(
         ));
     }
     Ok(IntegratedMeanDerivative {
-        mean: mean.clamp(1e-12, 1.0 - 1e-12),
+        mean,
         dmean_dmu: dmean,
         mode: IntegratedExpectationMode::ExactSpecialFunction,
     })
@@ -1066,7 +1066,7 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     let f4 = surv * (ex - 7.0 * e2x + 6.0 * e3x - e4x);
     let f5 = surv * (ex - 15.0 * e2x + 25.0 * e3x - 10.0 * e4x + e5x);
     IntegratedMeanDerivative {
-        mean: (f0 + 0.5 * s2 * f2 + (s4 / 24.0) * f4).clamp(1e-12, 1.0 - 1e-12),
+        mean: f0 + 0.5 * s2 * f2 + (s4 / 24.0) * f4,
         dmean_dmu: (f1 + 0.5 * s2 * f3 + (s4 / 24.0) * f5).max(0.0),
         mode: IntegratedExpectationMode::ControlledAsymptotic,
     }
@@ -1334,9 +1334,9 @@ fn cloglog_mean_from_survival(survival: f64) -> f64 {
         // since exp(log S) = S. This is the stable way to recover the cloglog
         // mean in the regime mu << 0 where S is extremely close to 1 and the
         // desired probability is tiny.
-        (-survival.ln().exp_m1()).clamp(1e-12, 1.0 - 1e-12)
+        -survival.ln().exp_m1()
     } else {
-        (1.0 - survival).clamp(1e-12, 1.0 - 1e-12)
+        1.0 - survival
     }
 }
 
@@ -1846,7 +1846,7 @@ pub(crate) fn cloglog_posterior_mean_with_deriv_controlled(
         let ez = z.exp();
         let surv = (-ez).exp();
         return IntegratedMeanDerivative {
-            mean: (1.0 - surv).clamp(1e-12, 1.0 - 1e-12),
+            mean: 1.0 - surv,
             dmean_dmu: (ez * surv).max(0.0),
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
@@ -2004,7 +2004,7 @@ fn integrated_sas_jet_ghq(
         sas_point_jet(x, sas_state.epsilon, sas_state.log_delta)
     });
     IntegratedInverseLinkJet {
-        mean: mean.clamp(1e-12, 1.0 - 1e-12),
+        mean,
         d1: d1.max(0.0),
         d2,
         d3,
@@ -2027,7 +2027,7 @@ fn integrated_beta_logistic_jet_ghq(
         beta_logistic_point_jet(x, beta_state.log_delta, beta_state.epsilon)
     });
     IntegratedInverseLinkJet {
-        mean: mean.clamp(1e-12, 1.0 - 1e-12),
+        mean,
         d1: d1.max(0.0),
         d2,
         d3,
@@ -2107,7 +2107,7 @@ pub fn integrated_family_moments_jet_with_state(
     match family {
         LikelihoodFamily::BinomialLogit => {
             let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Logit, e, se)?;
-            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            let mean = jet.mean;
             Ok(IntegratedMomentsJet {
                 mean,
                 variance: (mean * (1.0 - mean)).max(PROB_EPS),
@@ -2119,7 +2119,7 @@ pub fn integrated_family_moments_jet_with_state(
         }
         LikelihoodFamily::BinomialProbit => {
             let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::Probit, e, se)?;
-            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            let mean = jet.mean;
             Ok(IntegratedMomentsJet {
                 mean,
                 variance: (mean * (1.0 - mean)).max(PROB_EPS),
@@ -2131,7 +2131,7 @@ pub fn integrated_family_moments_jet_with_state(
         }
         LikelihoodFamily::BinomialCLogLog => {
             let jet = integrated_inverse_link_jet(quad_ctx, LinkFunction::CLogLog, e, se)?;
-            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            let mean = jet.mean;
             Ok(IntegratedMomentsJet {
                 mean,
                 variance: (mean * (1.0 - mean)).max(PROB_EPS),
@@ -2150,7 +2150,7 @@ pub fn integrated_family_moments_jet_with_state(
                 mixture_link_state,
                 sas_link_state,
             )?;
-            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            let mean = jet.mean;
             Ok(IntegratedMomentsJet {
                 mean,
                 variance: (mean * (1.0 - mean)).max(PROB_EPS),
@@ -2169,7 +2169,7 @@ pub fn integrated_family_moments_jet_with_state(
                 mixture_link_state,
                 sas_link_state,
             )?;
-            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            let mean = jet.mean;
             Ok(IntegratedMomentsJet {
                 mean,
                 variance: (mean * (1.0 - mean)).max(PROB_EPS),
@@ -2381,7 +2381,7 @@ fn integrated_logit_jet_ghq(
 ) -> IntegratedInverseLinkJet {
     let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, logit_point_jet);
     IntegratedInverseLinkJet {
-        mean: mean.clamp(1e-10, 1.0 - 1e-10),
+        mean,
         d1: d1.max(0.0),
         d2,
         d3,
@@ -2401,7 +2401,7 @@ fn integrated_cloglog_jet_ghq(
 ) -> IntegratedInverseLinkJet {
     let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, cloglog_point_jet);
     IntegratedInverseLinkJet {
-        mean: mean.clamp(1e-12, 1.0 - 1e-12),
+        mean,
         d1: d1.max(0.0),
         d2,
         d3,
@@ -2725,15 +2725,15 @@ where
 #[inline]
 pub fn probit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
     if se_eta < 1e-10 {
-        return crate::probability::normal_cdf(eta).clamp(1e-10, 1.0 - 1e-10);
+        return crate::probability::normal_cdf(eta);
     }
     let denom = (1.0 + se_eta * se_eta).sqrt();
-    crate::probability::normal_cdf(eta / denom).clamp(1e-10, 1.0 - 1e-10)
+    crate::probability::normal_cdf(eta / denom)
 }
 
 #[inline]
 pub fn logit_posterior_mean_variance(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
-    let m1 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid).clamp(1e-10, 1.0 - 1e-10);
+    let m1 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid);
     let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
         let p = sigmoid(x);
         p * p
@@ -2750,7 +2750,7 @@ pub fn probit_posterior_mean_variance(
 ) -> (f64, f64) {
     let m1 = probit_posterior_mean(eta, se_eta);
     let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let p = crate::probability::normal_cdf(x).clamp(1e-10, 1.0 - 1e-10);
+        let p = crate::probability::normal_cdf(x);
         p * p
     })
     .clamp(0.0, 1.0);
@@ -2783,7 +2783,7 @@ pub fn cloglog_posterior_mean_variance(
     // E[S] or 1 - E[S].
     let (survival, _) = cloglog_survival_term_controlled(ctx, eta, se_eta);
     let (survival_sq, _) = cloglog_survival_second_moment_controlled(ctx, eta, se_eta);
-    let mean = cloglog_mean_from_survival(survival).clamp(1e-10, 1.0 - 1e-10);
+    let mean = cloglog_mean_from_survival(survival);
     let variance = (survival_sq - survival * survival).max(0.0);
     (mean, variance)
 }
@@ -2825,7 +2825,7 @@ pub fn cloglog_posterior_mean_variance(
 #[inline]
 pub fn cloglog_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
     let (survival, _) = cloglog_survival_term_controlled(ctx, eta, se_eta);
-    cloglog_mean_from_survival(survival).clamp(1e-10, 1.0 - 1e-10)
+    cloglog_mean_from_survival(survival)
 }
 
 /// Posterior mean under the Royston-Parmar survival transform:
@@ -2912,10 +2912,10 @@ pub fn survival_posterior_mean_variance(
 /// numerical evaluation error of w(z).
 pub fn logit_posterior_mean_exact(mu: f64, sigma: f64) -> f64 {
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= 0.0 {
-        return sigmoid(mu).clamp(1e-12, 1.0 - 1e-12);
+        return sigmoid(mu);
     }
     if sigma < 1e-10 {
-        return sigmoid(mu).clamp(1e-12, 1.0 - 1e-12);
+        return sigmoid(mu);
     }
 
     let sqrt2_sigma = SQRT_2 * sigma;
@@ -2947,7 +2947,7 @@ pub fn logit_posterior_mean_exact(mu: f64, sigma: f64) -> f64 {
         }
     }
 
-    (0.5 - coeff * sum_im).clamp(1e-12, 1.0 - 1e-12)
+    0.5 - coeff * sum_im
 }
 
 /// Faddeeva function w(z)=exp(-z^2)erfc(-iz) for Im(z)>0.
@@ -3060,10 +3060,10 @@ mod tests {
     //     [erfcx((k s^2 + m)/(sqrt(2)s)) - erfcx((k s^2 - m)/(sqrt(2)s))].
     fn exact_logistic_expectation_erfcx_series(m: f64, s: f64) -> f64 {
         if !(m.is_finite() && s.is_finite()) || s <= 0.0 {
-            return sigmoid(m).clamp(1e-12, 1.0 - 1e-12);
+            return sigmoid(m);
         }
         if s < 1e-10 {
-            return sigmoid(m).clamp(1e-12, 1.0 - 1e-12);
+            return sigmoid(m);
         }
 
         let pref = 0.5 * (-(m * m) / (2.0 * s * s)).exp();
@@ -3103,7 +3103,7 @@ mod tests {
         }
 
         let phi_term = crate::probability::normal_cdf(m / s);
-        (phi_term + pref * sum).clamp(1e-12, 1.0 - 1e-12)
+        phi_term + pref * sum
     }
 
     fn high_res_sigmoid_integral(eta: f64, se: f64) -> f64 {
@@ -3124,7 +3124,7 @@ mod tests {
                 sum += 4.0 * integrand(x);
             }
         }
-        (sum * h / 3.0).clamp(1e-10, 1.0 - 1e-10)
+        sum * h / 3.0
     }
 
     #[test]

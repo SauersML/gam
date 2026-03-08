@@ -1583,7 +1583,7 @@ where
                             eta[i],
                             &mut mix_partials_buf_reuse,
                         );
-                        let mu = jet.mu.clamp(EPS, 1.0 - EPS);
+                        let mu = jet.mu;
                         let d1 = jet.d1;
                         let d2 = jet.d2;
                         let yi = y_o[i];
@@ -1625,7 +1625,7 @@ where
                                 sas.log_delta,
                             )
                         };
-                        let mu = jets.jet.mu.clamp(EPS, 1.0 - EPS);
+                        let mu = jets.jet.mu;
                         let d1 = jets.jet.d1;
                         let d2 = jets.jet.d2;
                         let yi = y_o[i];
@@ -4000,7 +4000,7 @@ where
                 eta[i],
                 &mut mix_partials,
             );
-            let mu = jet.mu.clamp(EPS, 1.0 - EPS);
+            let mu = jet.mu;
             let d1 = jet.d1;
             let d2 = jet.d2;
             let yi = y_o[i];
@@ -4038,7 +4038,7 @@ where
             } else {
                 sas_inverse_link_jet_with_param_partials(eta_i, sas.epsilon, sas.log_delta)
             };
-            let mu = jets.jet.mu.clamp(EPS, 1.0 - EPS);
+            let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
             let yi = y_o[i];
@@ -4272,7 +4272,7 @@ mod fd_policy_tests {
                 sas_state.epsilon,
                 sas_state.log_delta,
             );
-            let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+            let mu = jets.jet.mu;
             if (mu - jets.jet.mu).abs() > 0.0 {
                 clamped_obs += 1;
             }
@@ -4299,7 +4299,7 @@ mod fd_policy_tests {
                     sas_state.epsilon,
                     sas_state.log_delta,
                 );
-                let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+                let mu = jets.jet.mu;
                 let d1 = jets.jet.d1;
                 let yi = y[i];
                 let wi = w[i].max(0.0);
@@ -4327,7 +4327,7 @@ mod fd_policy_tests {
                 sas_state.epsilon,
                 sas_state.log_delta,
             );
-            let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+            let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
             let yi = y[i];
@@ -4476,7 +4476,7 @@ mod fd_policy_tests {
                     sas_state.epsilon,
                     sas_state.log_delta,
                 );
-                let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+                let mu = jets.jet.mu;
                 let d1 = jets.jet.d1;
                 let yi = y[i];
                 let wi = w[i].max(0.0);
@@ -4501,7 +4501,7 @@ mod fd_policy_tests {
                 sas_state.epsilon,
                 sas_state.log_delta,
             );
-            let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+            let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
             let yi = y[i];
@@ -4625,7 +4625,7 @@ mod fd_policy_tests {
                 sas_state.epsilon,
                 sas_state.log_delta,
             );
-            let mu = jets.jet.mu.clamp(1e-8, 1.0 - 1e-8);
+            let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
             let yi = y[i];

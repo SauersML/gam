@@ -141,7 +141,7 @@ pub fn sample_observations<R: rand::Rng + ?Sized>(
         NoiseModel::Bernoulli => {
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {
-                let p = spec.mean[i].clamp(1e-12, 1.0 - 1e-12);
+                let p = spec.mean[i];
                 let dist = rand_distr::Bernoulli::new(p).map_err(|e| {
                     EstimationError::InvalidInput(format!("invalid Bernoulli probability {p}: {e}"))
                 })?;
