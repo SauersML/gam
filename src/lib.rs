@@ -19,7 +19,7 @@ pub use families::custom_family;
 pub use families::gamlss;
 pub use families::strategy;
 pub use families::survival;
-pub use families::survival_location_scale_probit;
+pub use families::survival_location_scale;
 
 pub use families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
@@ -44,12 +44,13 @@ pub use families::gamlss::{
 pub use families::strategy::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_from_fit,
 };
-pub use families::survival_location_scale_probit::{
-    CovariateBlockInput, ResidualDistribution, ResidualDistributionOps,
-    SurvivalLocationScaleProbitFitResult, SurvivalLocationScaleProbitPredictInput,
-    SurvivalLocationScaleProbitPredictResult, SurvivalLocationScaleProbitSpec, TimeBlockInput,
-    fit_survival_location_scale_probit, predict_survival_location_scale_probit,
-    predict_survival_location_scale_probit_posterior_mean,
+pub use families::survival_location_scale::{
+    CovariateBlockInput, LinkWiggleBlockInput, ResidualDistribution,
+    ResidualDistributionOps, SurvivalLocationScaleFitResult, SurvivalLocationScalePredictInput,
+    SurvivalLocationScalePredictResult, SurvivalLocationScalePredictUncertaintyResult,
+    SurvivalLocationScaleSpec, TimeBlockInput, fit_survival_location_scale,
+    predict_survival_location_scale, predict_survival_location_scale_posterior_mean,
+    predict_survival_location_scale_with_uncertainty,
 };
 pub use inference::alo::{
     AloDiagnostics, compute_alo_diagnostics, compute_alo_diagnostics_from_fit,

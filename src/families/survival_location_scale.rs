@@ -189,7 +189,7 @@ pub struct LinkWiggleBlockInput {
 }
 
 #[derive(Clone)]
-pub struct SurvivalLocationScaleProbitSpec {
+pub struct SurvivalLocationScaleSpec {
     pub age_entry: Array1<f64>,
     pub age_exit: Array1<f64>,
     pub event_target: Array1<f64>,
@@ -213,7 +213,7 @@ pub struct SurvivalLocationScaleProbitSpec {
 }
 
 #[derive(Clone)]
-pub struct SurvivalLocationScaleProbitFitResult {
+pub struct SurvivalLocationScaleFitResult {
     pub beta_time: Array1<f64>,
     pub beta_threshold: Array1<f64>,
     pub beta_log_sigma: Array1<f64>,
@@ -231,7 +231,7 @@ pub struct SurvivalLocationScaleProbitFitResult {
 }
 
 #[derive(Clone)]
-pub struct SurvivalLocationScaleProbitPredictInput {
+pub struct SurvivalLocationScalePredictInput {
     pub x_time_exit: Array2<f64>,
     pub eta_time_offset_exit: Array1<f64>,
     pub x_threshold: DesignMatrix,
@@ -243,20 +243,20 @@ pub struct SurvivalLocationScaleProbitPredictInput {
 }
 
 #[derive(Clone)]
-pub struct SurvivalLocationScaleProbitPredictResult {
+pub struct SurvivalLocationScalePredictResult {
     pub eta: Array1<f64>,
     pub survival_prob: Array1<f64>,
 }
 
 #[derive(Clone)]
-pub struct SurvivalLocationScaleProbitPredictUncertaintyResult {
+pub struct SurvivalLocationScalePredictUncertaintyResult {
     pub eta: Array1<f64>,
     pub survival_prob: Array1<f64>,
     pub eta_standard_error: Array1<f64>,
     pub response_standard_error: Option<Array1<f64>>,
 }
 
-struct SurvivalLocationScaleProbitFamily {
+struct SurvivalLocationScaleFamily {
     n: usize,
     y: Array1<f64>,
     w: Array1<f64>,
@@ -299,7 +299,7 @@ struct SurvivalRowDerivatives {
     d_h_d: f64,
 }
 
-impl SurvivalLocationScaleProbitFamily {
+impl SurvivalLocationScaleFamily {
     const BLOCK_TIME: usize = 0;
     const BLOCK_THRESHOLD: usize = 1;
     const BLOCK_LOG_SIGMA: usize = 2;
@@ -760,7 +760,7 @@ fn select_anchor_row(age_entry: &Array1<f64>, time_anchor: Option<f64>) -> Resul
         Some(t_anchor) => {
             if !t_anchor.is_finite() {
                 return Err(format!(
-                    "fit_survival_location_scale_probit: non-finite time_anchor {t_anchor}"
+                    "fit_survival_location_scale: non-finite time_anchor {t_anchor}"
                 ));
             }
             age_entry
@@ -833,11 +833,11 @@ fn lift_conditional_covariance(
     t_map.dot(cov_reduced).dot(&t_map.t())
 }
 
-impl CustomFamily for SurvivalLocationScaleProbitFamily {
+impl CustomFamily for SurvivalLocationScaleFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != self.expected_blocks() {
             return Err(format!(
-                "SurvivalLocationScaleProbitFamily expects {} blocks, got {}",
+                "SurvivalLocationScaleFamily expects {} blocks, got {}",
                 self.expected_blocks(),
                 block_states.len()
             ));
@@ -975,7 +975,7 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != self.expected_blocks() {
             return Err(format!(
-                "SurvivalLocationScaleProbitFamily expects {} blocks, got {}",
+                "SurvivalLocationScaleFamily expects {} blocks, got {}",
                 self.expected_blocks(),
                 block_states.len()
             ));
@@ -1166,16 +1166,16 @@ impl CustomFamily for SurvivalLocationScaleProbitFamily {
     }
 }
 
-pub fn fit_survival_location_scale_probit(
-    spec: SurvivalLocationScaleProbitSpec,
-) -> Result<SurvivalLocationScaleProbitFitResult, String> {
+pub fn fit_survival_location_scale(
+    spec: SurvivalLocationScaleSpec,
+) -> Result<SurvivalLocationScaleFitResult, String> {
     let n = spec.event_target.len();
     if n == 0 {
-        return Err("fit_survival_location_scale_probit: empty dataset".to_string());
+        return Err("fit_survival_location_scale: empty dataset".to_string());
     }
     if spec.age_entry.len() != n || spec.age_exit.len() != n || spec.weights.len() != n {
         return Err(
-            "fit_survival_location_scale_probit: top-level input size mismatch".to_string(),
+            "fit_survival_location_scale: top-level input size mismatch".to_string(),
         );
     }
     if !spec.sigma_min.is_finite()
@@ -1185,18 +1185,18 @@ pub fn fit_survival_location_scale_probit(
         || spec.sigma_min >= spec.sigma_max
     {
         return Err(format!(
-            "fit_survival_location_scale_probit: invalid sigma bounds (min={}, max={})",
+            "fit_survival_location_scale: invalid sigma bounds (min={}, max={})",
             spec.sigma_min, spec.sigma_max
         ));
     }
     if !(spec.tol.is_finite() && spec.tol > 0.0) {
         return Err(format!(
-            "fit_survival_location_scale_probit: invalid tol {}",
+            "fit_survival_location_scale: invalid tol {}",
             spec.tol
         ));
     }
     if spec.max_iter == 0 {
-        return Err("fit_survival_location_scale_probit: max_iter must be > 0".to_string());
+        return Err("fit_survival_location_scale: max_iter must be > 0".to_string());
     }
     validate_time_block(n, &spec.time_block)?;
     validate_cov_block("threshold_block", n, &spec.threshold_block)?;
@@ -1211,7 +1211,7 @@ pub fn fit_survival_location_scale_probit(
             || spec.age_exit[i] < spec.age_entry[i]
         {
             return Err(format!(
-                "fit_survival_location_scale_probit: invalid interval at row {} (entry={}, exit={})",
+                "fit_survival_location_scale: invalid interval at row {} (entry={}, exit={})",
                 i + 1,
                 spec.age_entry[i],
                 spec.age_exit[i]
@@ -1219,14 +1219,14 @@ pub fn fit_survival_location_scale_probit(
         }
         if !spec.weights[i].is_finite() || spec.weights[i] < 0.0 {
             return Err(format!(
-                "fit_survival_location_scale_probit: invalid weight at row {} ({})",
+                "fit_survival_location_scale: invalid weight at row {} ({})",
                 i + 1,
                 spec.weights[i]
             ));
         }
         if !spec.event_target[i].is_finite() || !(0.0..=1.0).contains(&spec.event_target[i]) {
             return Err(format!(
-                "fit_survival_location_scale_probit: event_target must be in [0,1], found {} at row {}",
+                "fit_survival_location_scale: event_target must be in [0,1], found {} at row {}",
                 spec.event_target[i],
                 i + 1
             ));
@@ -1297,7 +1297,7 @@ pub fn fit_survival_location_scale_probit(
         None
     };
 
-    let family = SurvivalLocationScaleProbitFamily {
+    let family = SurvivalLocationScaleFamily {
         n,
         y: spec.event_target,
         w: spec.weights,
@@ -1365,19 +1365,19 @@ pub fn fit_survival_location_scale_probit(
         None
     };
 
-    let beta_time_reduced = fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_TIME]
+    let beta_time_reduced = fit.block_states[SurvivalLocationScaleFamily::BLOCK_TIME]
         .beta
         .clone();
     let beta_time = time_prepared.transform.z.dot(&beta_time_reduced);
-    let beta_threshold = fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
+    let beta_threshold = fit.block_states[SurvivalLocationScaleFamily::BLOCK_THRESHOLD]
         .beta
         .clone();
-    let beta_log_sigma = fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_LOG_SIGMA]
+    let beta_log_sigma = fit.block_states[SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA]
         .beta
         .clone();
     let beta_link_wiggle = if family.x_link_wiggle.is_some() {
         Some(
-            fit.block_states[SurvivalLocationScaleProbitFamily::BLOCK_LINK_WIGGLE]
+            fit.block_states[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE]
                 .beta
                 .clone(),
         )
@@ -1393,7 +1393,7 @@ pub fn fit_survival_location_scale_probit(
         lift_conditional_covariance(cov_reduced, z, p_t, p_ls, p_w)
     });
 
-    Ok(SurvivalLocationScaleProbitFitResult {
+    Ok(SurvivalLocationScaleFitResult {
         beta_time,
         beta_threshold,
         beta_log_sigma,
@@ -1411,14 +1411,14 @@ pub fn fit_survival_location_scale_probit(
     })
 }
 
-pub fn predict_survival_location_scale_probit(
-    input: &SurvivalLocationScaleProbitPredictInput,
-    fit: &SurvivalLocationScaleProbitFitResult,
-) -> Result<SurvivalLocationScaleProbitPredictResult, String> {
+pub fn predict_survival_location_scale(
+    input: &SurvivalLocationScalePredictInput,
+    fit: &SurvivalLocationScaleFitResult,
+) -> Result<SurvivalLocationScalePredictResult, String> {
     let n = input.x_time_exit.nrows();
     if input.x_time_exit.ncols() != fit.beta_time.len() {
         return Err(format!(
-            "predict_survival_location_scale_probit: time design/beta mismatch: {} vs {}",
+            "predict_survival_location_scale: time design/beta mismatch: {} vs {}",
             input.x_time_exit.ncols(),
             fit.beta_time.len()
         ));
@@ -1428,26 +1428,26 @@ pub fn predict_survival_location_scale_probit(
         || input.x_log_sigma.nrows() != n
     {
         return Err(
-            "predict_survival_location_scale_probit: row mismatch across inputs".to_string(),
+            "predict_survival_location_scale: row mismatch across inputs".to_string(),
         );
     }
     if let (Some(xw), Some(beta_w)) = (&input.x_link_wiggle, &fit.beta_link_wiggle) {
         if xw.nrows() != n {
             return Err(format!(
-                "predict_survival_location_scale_probit: link-wiggle row mismatch: got {}, expected {n}",
+                "predict_survival_location_scale: link-wiggle row mismatch: got {}, expected {n}",
                 xw.nrows()
             ));
         }
         if xw.ncols() != beta_w.len() {
             return Err(format!(
-                "predict_survival_location_scale_probit: link-wiggle design/beta mismatch: {} vs {}",
+                "predict_survival_location_scale: link-wiggle design/beta mismatch: {} vs {}",
                 xw.ncols(),
                 beta_w.len()
             ));
         }
     } else if input.x_link_wiggle.is_some() || fit.beta_link_wiggle.is_some() {
         return Err(
-            "predict_survival_location_scale_probit: link-wiggle metadata is partial; both design and beta must be provided"
+            "predict_survival_location_scale: link-wiggle metadata is partial; both design and beta must be provided"
                 .to_string(),
         );
     }
@@ -1482,19 +1482,19 @@ pub fn predict_survival_location_scale_probit(
         eta.iter()
             .map(|&v| inverse_link_survival_prob(&input.inverse_link, v)),
     );
-    Ok(SurvivalLocationScaleProbitPredictResult { eta, survival_prob })
+    Ok(SurvivalLocationScalePredictResult { eta, survival_prob })
 }
 
-pub fn predict_survival_location_scale_probit_posterior_mean(
-    input: &SurvivalLocationScaleProbitPredictInput,
-    fit: &SurvivalLocationScaleProbitFitResult,
+pub fn predict_survival_location_scale_posterior_mean(
+    input: &SurvivalLocationScalePredictInput,
+    fit: &SurvivalLocationScaleFitResult,
     covariance: &Array2<f64>,
-) -> Result<SurvivalLocationScaleProbitPredictResult, String> {
+) -> Result<SurvivalLocationScalePredictResult, String> {
     if fit.beta_link_wiggle.is_some() || input.x_link_wiggle.is_some() {
         // Exact posterior integration with a learned wiggle introduces an additional
         // latent Gaussian dimension. Keep production behavior stable by returning
         // deterministic predictions until dedicated 4D integration is added.
-        return predict_survival_location_scale_probit(input, fit);
+        return predict_survival_location_scale(input, fit);
     }
     // Uncertainty-aware survival posterior mean with conditional Gaussian
     // reduction.
@@ -1530,7 +1530,7 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
     //
     // If the conditioning algebra becomes numerically unsafe, this routine
     // falls back to the old 3D quadrature rather than forcing the reduction.
-    let pred = predict_survival_location_scale_probit(input, fit)?;
+    let pred = predict_survival_location_scale(input, fit)?;
     let n = input.x_time_exit.nrows();
     let p_time = fit.beta_time.len();
     let p_t = fit.beta_threshold.len();
@@ -1538,7 +1538,7 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
     let p_total = p_time + p_t + p_ls;
     if covariance.nrows() != p_total || covariance.ncols() != p_total {
         return Err(format!(
-            "predict_survival_location_scale_probit_posterior_mean: covariance shape mismatch: got {}x{}, expected {}x{}",
+            "predict_survival_location_scale_posterior_mean: covariance shape mismatch: got {}x{}, expected {}x{}",
             covariance.nrows(),
             covariance.ncols(),
             p_total,
@@ -1553,7 +1553,7 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
 
     if x_threshold_dense.nrows() != n || x_log_sigma_dense.nrows() != n {
         return Err(
-            "predict_survival_location_scale_probit_posterior_mean: row mismatch across dense design views"
+            "predict_survival_location_scale_posterior_mean: row mismatch across dense design views"
                 .to_string(),
         );
     }
@@ -1723,20 +1723,20 @@ pub fn predict_survival_location_scale_probit_posterior_mean(
         .clamp(0.0, 1.0)
     }));
 
-    Ok(SurvivalLocationScaleProbitPredictResult {
+    Ok(SurvivalLocationScalePredictResult {
         eta: pred.eta,
         survival_prob,
     })
 }
 
-pub fn predict_survival_location_scale_probit_with_uncertainty(
-    input: &SurvivalLocationScaleProbitPredictInput,
-    fit: &SurvivalLocationScaleProbitFitResult,
+pub fn predict_survival_location_scale_with_uncertainty(
+    input: &SurvivalLocationScalePredictInput,
+    fit: &SurvivalLocationScaleFitResult,
     covariance: &Array2<f64>,
     posterior_mean: bool,
     include_response_sd: bool,
-) -> Result<SurvivalLocationScaleProbitPredictUncertaintyResult, String> {
-    let base = predict_survival_location_scale_probit(input, fit)?;
+) -> Result<SurvivalLocationScalePredictUncertaintyResult, String> {
+    let base = predict_survival_location_scale(input, fit)?;
     let n = input.x_time_exit.nrows();
     let p_time = fit.beta_time.len();
     let p_t = fit.beta_threshold.len();
@@ -1745,7 +1745,7 @@ pub fn predict_survival_location_scale_probit_with_uncertainty(
     let p_total = p_time + p_t + p_ls + p_w;
     if covariance.nrows() != p_total || covariance.ncols() != p_total {
         return Err(format!(
-            "predict_survival_location_scale_probit_with_uncertainty: covariance shape mismatch: got {}x{}, expected {}x{}",
+            "predict_survival_location_scale_with_uncertainty: covariance shape mismatch: got {}x{}, expected {}x{}",
             covariance.nrows(),
             covariance.ncols(),
             p_total,
@@ -1754,7 +1754,7 @@ pub fn predict_survival_location_scale_probit_with_uncertainty(
     }
     if p_w > 0 && (fit.beta_link_wiggle.is_none() || input.x_link_wiggle.is_none()) {
         return Err(
-            "predict_survival_location_scale_probit_with_uncertainty: wiggle covariance provided but wiggle design/beta is partial"
+            "predict_survival_location_scale_with_uncertainty: wiggle covariance provided but wiggle design/beta is partial"
                 .to_string(),
         );
     }
@@ -1768,14 +1768,14 @@ pub fn predict_survival_location_scale_probit_with_uncertainty(
 
     if x_threshold_dense.nrows() != n || x_log_sigma_dense.nrows() != n {
         return Err(
-            "predict_survival_location_scale_probit_with_uncertainty: row mismatch across dense design views"
+            "predict_survival_location_scale_with_uncertainty: row mismatch across dense design views"
                 .to_string(),
         );
     }
     if let Some(xw) = x_link_wiggle_dense {
         if xw.nrows() != n {
             return Err(
-                "predict_survival_location_scale_probit_with_uncertainty: x_link_wiggle row mismatch"
+                "predict_survival_location_scale_with_uncertainty: x_link_wiggle row mismatch"
                     .to_string(),
             );
         }
@@ -1821,7 +1821,7 @@ pub fn predict_survival_location_scale_probit_with_uncertainty(
     let eta_se = eta_var.mapv(f64::sqrt);
 
     let survival_prob = if posterior_mean {
-        predict_survival_location_scale_probit_posterior_mean(input, fit, covariance)?.survival_prob
+        predict_survival_location_scale_posterior_mean(input, fit, covariance)?.survival_prob
     } else {
         base.survival_prob.clone()
     };
@@ -1844,7 +1844,7 @@ pub fn predict_survival_location_scale_probit_with_uncertainty(
         None
     };
 
-    Ok(SurvivalLocationScaleProbitPredictUncertaintyResult {
+    Ok(SurvivalLocationScalePredictUncertaintyResult {
         eta: base.eta,
         survival_prob,
         eta_standard_error: eta_se,
@@ -1855,7 +1855,7 @@ pub fn predict_survival_location_scale_probit_with_uncertainty(
 #[inline]
 fn var_h_row(
     i: usize,
-    input: &SurvivalLocationScaleProbitPredictInput,
+    input: &SurvivalLocationScalePredictInput,
     xh_hh: &Array2<f64>,
 ) -> f64 {
     input.x_time_exit.row(i).dot(&xh_hh.row(i)).max(0.0)
@@ -1896,8 +1896,8 @@ mod tests {
     use crate::types::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
     use ndarray::{Array1, array};
 
-    fn survival_exact_newton_test_family() -> SurvivalLocationScaleProbitFamily {
-        SurvivalLocationScaleProbitFamily {
+    fn survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
+        SurvivalLocationScaleFamily {
             n: 3,
             y: array![1.0, 0.0, 1.0],
             w: array![1.0, 0.8, 1.2],
@@ -1918,8 +1918,8 @@ mod tests {
 
     fn survival_exact_newton_test_family_with_inverse_link(
         inverse_link: InverseLink,
-    ) -> SurvivalLocationScaleProbitFamily {
-        SurvivalLocationScaleProbitFamily {
+    ) -> SurvivalLocationScaleFamily {
+        SurvivalLocationScaleFamily {
             inverse_link,
             ..survival_exact_newton_test_family()
         }
@@ -2243,8 +2243,8 @@ mod tests {
                 let fpp = dist.pdf_second_derivative(z);
 
                 let (r, dr) =
-                    SurvivalLocationScaleProbitFamily::survival_ratio_first_derivative(f, fp, s);
-                let ddr = SurvivalLocationScaleProbitFamily::survival_ratio_second_derivative(
+                    SurvivalLocationScaleFamily::survival_ratio_first_derivative(f, fp, s);
+                let ddr = SurvivalLocationScaleFamily::survival_ratio_second_derivative(
                     r, dr, f, fp, fpp, s,
                 );
 
@@ -2323,7 +2323,7 @@ mod tests {
         let fpp = -7.0;
         let fppp = 11.0;
         let (logf, d1, d2, d3) =
-            SurvivalLocationScaleProbitFamily::clamped_log_pdf_with_derivatives(f, fp, fpp, fppp);
+            SurvivalLocationScaleFamily::clamped_log_pdf_with_derivatives(f, fp, fpp, fppp);
         assert!((logf - MIN_PROB.ln()).abs() <= 1e-15);
         assert_eq!(d1, 0.0);
         assert_eq!(d2, 0.0);
@@ -2334,7 +2334,7 @@ mod tests {
     fn clamped_survival_neglog_derivatives_are_zero_on_clamp_bounds() {
         // Lower clamp active.
         let (s_low, r_low, dr_low, ddr_low) =
-            SurvivalLocationScaleProbitFamily::clamped_survival_neglog_derivatives(
+            SurvivalLocationScaleFamily::clamped_survival_neglog_derivatives(
                 MIN_PROB * 0.1,
                 0.2,
                 -0.3,
@@ -2347,7 +2347,7 @@ mod tests {
 
         // Upper clamp active.
         let (s_high, r_high, dr_high, ddr_high) =
-            SurvivalLocationScaleProbitFamily::clamped_survival_neglog_derivatives(
+            SurvivalLocationScaleFamily::clamped_survival_neglog_derivatives(
                 1.1, 0.2, -0.3, 0.4,
             );
         assert_eq!(s_high, 1.0);
@@ -2359,7 +2359,7 @@ mod tests {
     #[test]
     fn clamped_log_with_derivatives_is_flat_below_floor() {
         let (log_x, d1, d2, d3) =
-            SurvivalLocationScaleProbitFamily::clamped_log_with_derivatives(-0.25, 1e-12);
+            SurvivalLocationScaleFamily::clamped_log_with_derivatives(-0.25, 1e-12);
         assert!((log_x - 1e-12_f64.ln()).abs() <= 1e-15);
         assert_eq!(d1, 0.0);
         assert_eq!(d2, 0.0);
@@ -2405,7 +2405,7 @@ mod tests {
         let states = survival_exact_newton_test_states(beta_t);
         let eval = family.evaluate(&states).expect("evaluate at center");
         let BlockWorkingSet::ExactNewton { gradient, hessian } =
-            &eval.block_working_sets[SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
+            &eval.block_working_sets[SurvivalLocationScaleFamily::BLOCK_THRESHOLD]
         else {
             panic!("threshold block should use exact newton");
         };
@@ -2418,13 +2418,13 @@ mod tests {
             .evaluate(&survival_exact_newton_test_states(beta_t - eps))
             .expect("evaluate at beta - eps");
         let grad_plus = match &eval_plus.block_working_sets
-            [SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
+            [SurvivalLocationScaleFamily::BLOCK_THRESHOLD]
         {
             BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
             _ => panic!("threshold block should use exact newton"),
         };
         let grad_minus = match &eval_minus.block_working_sets
-            [SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD]
+            [SurvivalLocationScaleFamily::BLOCK_THRESHOLD]
         {
             BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
             _ => panic!("threshold block should use exact newton"),
@@ -2473,13 +2473,13 @@ mod tests {
             let base_eval = family.evaluate(&states).expect("base eval");
 
             for (block_idx, direction) in [
-                (SurvivalLocationScaleProbitFamily::BLOCK_TIME, array![1.0]),
+                (SurvivalLocationScaleFamily::BLOCK_TIME, array![1.0]),
                 (
-                    SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD,
+                    SurvivalLocationScaleFamily::BLOCK_THRESHOLD,
                     array![1.0],
                 ),
                 (
-                    SurvivalLocationScaleProbitFamily::BLOCK_LOG_SIGMA,
+                    SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA,
                     array![1.0],
                 ),
             ] {
@@ -2492,13 +2492,13 @@ mod tests {
                 let mut beta_threshold_plus = beta_threshold.clone();
                 let mut beta_log_sigma_plus = beta_log_sigma.clone();
                 match block_idx {
-                    SurvivalLocationScaleProbitFamily::BLOCK_TIME => {
+                    SurvivalLocationScaleFamily::BLOCK_TIME => {
                         beta_time_plus += &(eps * &direction);
                     }
-                    SurvivalLocationScaleProbitFamily::BLOCK_THRESHOLD => {
+                    SurvivalLocationScaleFamily::BLOCK_THRESHOLD => {
                         beta_threshold_plus += &(eps * &direction);
                     }
-                    SurvivalLocationScaleProbitFamily::BLOCK_LOG_SIGMA => {
+                    SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA => {
                         beta_log_sigma_plus += &(eps * &direction);
                     }
                     _ => panic!("unexpected block"),
@@ -2606,7 +2606,7 @@ mod tests {
 
     #[test]
     fn posterior_mean_prediction_matches_deterministic_when_covariance_is_zero() {
-        let input = SurvivalLocationScaleProbitPredictInput {
+        let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.2],
             x_threshold: DesignMatrix::Dense(array![[1.0, -0.2]]),
@@ -2616,7 +2616,7 @@ mod tests {
             sigma_max: 2.0,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
-        let fit = SurvivalLocationScaleProbitFitResult {
+        let fit = SurvivalLocationScaleFitResult {
             beta_time: array![0.4, -0.1],
             beta_threshold: array![0.2, 0.3],
             beta_log_sigma: array![-0.5, 0.1],
@@ -2632,10 +2632,10 @@ mod tests {
             converged: true,
             covariance_conditional: None,
         };
-        let deterministic = predict_survival_location_scale_probit(&input, &fit).expect("predict");
+        let deterministic = predict_survival_location_scale(&input, &fit).expect("predict");
         let expected = inverse_link_survival_prob(&input.inverse_link, deterministic.eta[0]);
         assert!((deterministic.survival_prob[0] - expected).abs() <= 1e-12);
-        let posterior = predict_survival_location_scale_probit_posterior_mean(
+        let posterior = predict_survival_location_scale_posterior_mean(
             &input,
             &fit,
             &Array2::zeros((6, 6)),
@@ -2646,7 +2646,7 @@ mod tests {
 
     #[test]
     fn gaussian_posterior_mean_reduction_matches_3d_ghq_small_case() {
-        let input = SurvivalLocationScaleProbitPredictInput {
+        let input = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.1],
             x_threshold: DesignMatrix::Dense(array![[1.0, 0.25]]),
@@ -2656,7 +2656,7 @@ mod tests {
             sigma_max: 1.8,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
-        let fit = SurvivalLocationScaleProbitFitResult {
+        let fit = SurvivalLocationScaleFitResult {
             beta_time: array![0.3, -0.2],
             beta_threshold: array![0.1, 0.2],
             beta_log_sigma: array![-0.4, 0.15],
@@ -2681,7 +2681,7 @@ mod tests {
             [0.0, 0.0, 0.0, 0.0, 0.005, 0.02],
         ];
         let reduced =
-            predict_survival_location_scale_probit_posterior_mean(&input, &fit, &covariance)
+            predict_survival_location_scale_posterior_mean(&input, &fit, &covariance)
                 .expect("reduced posterior mean");
 
         let mu_h = input.x_time_exit.row(0).dot(&fit.beta_time) + input.eta_time_offset_exit[0];
@@ -2730,7 +2730,7 @@ mod tests {
 
     #[test]
     fn predict_supports_sas_beta_logistic_and_mixture_links() {
-        let fit = SurvivalLocationScaleProbitFitResult {
+        let fit = SurvivalLocationScaleFitResult {
             beta_time: array![0.4, -0.1],
             beta_threshold: array![0.2, 0.3],
             beta_log_sigma: array![-0.5, 0.1],
@@ -2746,7 +2746,7 @@ mod tests {
             converged: true,
             covariance_conditional: None,
         };
-        let base = SurvivalLocationScaleProbitPredictInput {
+        let base = SurvivalLocationScalePredictInput {
             x_time_exit: array![[1.0, 0.5]],
             eta_time_offset_exit: array![0.2],
             x_threshold: DesignMatrix::Dense(array![[1.0, -0.2]]),
@@ -2782,11 +2782,11 @@ mod tests {
         for link in [sas, beta_logistic, mixture] {
             let mut input = base.clone();
             input.inverse_link = link;
-            let pred = predict_survival_location_scale_probit(&input, &fit).expect("predict");
+            let pred = predict_survival_location_scale(&input, &fit).expect("predict");
             assert!(pred.survival_prob[0].is_finite());
             assert!(pred.survival_prob[0] > 0.0 && pred.survival_prob[0] < 1.0);
             let cov = Array2::eye(6) * 1e-3;
-            let pm = predict_survival_location_scale_probit_posterior_mean(&input, &fit, &cov)
+            let pm = predict_survival_location_scale_posterior_mean(&input, &fit, &cov)
                 .expect("posterior mean");
             assert!(pm.survival_prob[0].is_finite());
             assert!(pm.survival_prob[0] > 0.0 && pm.survival_prob[0] < 1.0);
