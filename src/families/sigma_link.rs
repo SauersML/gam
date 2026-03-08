@@ -44,6 +44,14 @@ pub fn bounded_sigma_from_eta_scalar(eta: f64, sigma_min: f64, sigma_max: f64) -
     bounded_sigma_and_deriv_from_eta_scalar(eta, sigma_min, sigma_max).0
 }
 
+#[inline]
+pub fn bounded_sigma_eta_for_sigma_scalar(sigma: f64, sigma_min: f64, sigma_max: f64) -> f64 {
+    let span = (sigma_max - sigma_min).max(1e-12);
+    let sigma_target = sigma.clamp(sigma_min + 1e-12, sigma_max - 1e-12);
+    let p = ((sigma_target - sigma_min) / span).clamp(1e-12, 1.0 - 1e-12);
+    (p / (1.0 - p)).ln()
+}
+
 pub fn bounded_sigma_and_deriv_from_eta(
     eta: ArrayView1<'_, f64>,
     sigma_min: f64,

@@ -169,7 +169,13 @@ pub trait CustomFamily {
     }
 
     /// Optional per-block coefficient projection applied after each block update.
-    fn post_update_beta(&self, beta: Array1<f64>) -> Result<Array1<f64>, String> {
+    fn post_update_block_beta(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _block_idx: usize,
+        _spec: &ParameterBlockSpec,
+        beta: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
         Ok(beta)
     }
 
@@ -1408,7 +1414,7 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 cached_active_sets[b] = Some(active_set);
             }
             let beta_new_raw = update.beta_new_raw;
-            let beta_new = family.post_update_beta(beta_new_raw)?;
+            let beta_new = family.post_update_block_beta(&states, b, spec, beta_new_raw)?;
             let beta_old = states[b].beta.clone();
             let delta = &beta_new - &beta_old;
             let old_block_penalty =
@@ -1424,7 +1430,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
             for bt in 0..8 {
                 let alpha = 0.5f64.powi(bt);
                 let trial_beta_raw = &beta_old + &delta.mapv(|v| alpha * v);
-                let trial_beta = family.post_update_beta(trial_beta_raw)?;
+                let trial_beta =
+                    family.post_update_block_beta(&states, b, spec, trial_beta_raw)?;
                 states[b].beta = trial_beta;
                 refresh_all_block_etas(family, specs, &mut states)?;
                 let trial_eval = family.evaluate(&states)?;

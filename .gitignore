@@ -22,11 +22,13 @@ bench/*_rust_fitted.csv
 bench/**/*_rust_fitted.csv
 bench/gam_bench_rust_cv_*/
 bench/gam_bench_*/
+bench/codex_*/
 bench/_profile*
 bench/**/_profile*
 bench/artifacts/
 bench/tmp_debug/
 bench/tmp_profile_*/
+bench/dbg_surv_*/
 bench/ab_*/
 bench/diagf_*/
 bench/debug*_model.json

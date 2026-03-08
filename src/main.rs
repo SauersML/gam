@@ -5749,10 +5749,6 @@ fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
         }
     }
 
-    if terms.is_empty() {
-        return Err("formula has no usable terms".to_string());
-    }
-
     Ok(ParsedFormula {
         response: lhs.to_string(),
         terms,

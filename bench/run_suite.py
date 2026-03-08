@@ -597,108 +597,131 @@ def nagelkerke_r2_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> flo
     return float(r2_cs / max_r2_cs)
 
 
-def _survival_partial_loglik_stats(
-    event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray, eps: float = 1e-12
-) -> tuple[float | None, int]:
+def _km_censoring_survival_table(
+    event_times: np.ndarray,
+    events: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
     times = np.asarray(event_times, dtype=float).reshape(-1)
-    eta = np.asarray(risk_score, dtype=float).reshape(-1)
-    obs = (np.asarray(events, dtype=float).reshape(-1) > 0.5).astype(float)
-    if times.shape != eta.shape or times.shape != obs.shape or times.size == 0:
-        return None, 0
-
-    event_mask = obs > 0.5
-    if int(np.sum(event_mask)) == 0:
-        return None, 0
-
-    unique_event_times = np.unique(times[event_mask])
-    total = 0.0
-    n_events = 0
-    for t in unique_event_times:
-        d = (times == t) & event_mask
-        m = int(np.sum(d))
-        if m == 0:
-            continue
-        risk_set = times >= t
-        risk_eta = eta[risk_set]
-        if risk_eta.size == 0:
-            continue
-        max_eta = float(np.max(risk_eta))
-        log_denom = max_eta + math.log(float(np.sum(np.exp(risk_eta - max_eta))) + eps)
-        total += float(np.sum(eta[d])) - float(m) * log_denom
-        n_events += m
-
-    if n_events == 0:
-        return None, 0
-    return float(total), n_events
-
-
-def survival_partial_log_loss(
-    event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray, eps: float = 1e-12
-) -> float | None:
-    total, n_events = _survival_partial_loglik_stats(event_times, risk_score, events, eps=eps)
-    if total is None or n_events == 0:
+    obs = (np.asarray(events, dtype=float).reshape(-1) > 0.5)
+    mask = np.isfinite(times) & np.isfinite(obs.astype(float)) & (times >= 0.0)
+    if int(np.sum(mask)) == 0:
         return None
-    return float(-total / n_events)
+    times = times[mask]
+    obs = obs[mask]
+    unique_times = np.unique(times)
+    surv = np.empty(unique_times.shape[0], dtype=float)
+    g = 1.0
+    for i, t in enumerate(unique_times):
+        at_risk = int(np.sum(times >= t))
+        if at_risk <= 0:
+            surv[i] = g
+            continue
+        censored = int(np.sum((times == t) & (~obs)))
+        if censored > 0:
+            g *= max(1.0 - censored / at_risk, 0.0)
+        surv[i] = g
+    return unique_times, surv
 
 
-def survival_partial_nagelkerke_r2(
-    event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray, eps: float = 1e-12
-) -> float | None:
-    ll_model, n_events = _survival_partial_loglik_stats(event_times, risk_score, events, eps=eps)
-    if ll_model is None or n_events == 0:
-        return None
-    ll_null, _ = _survival_partial_loglik_stats(
-        event_times,
-        np.zeros_like(np.asarray(risk_score, dtype=float).reshape(-1)),
-        events,
-        eps=eps,
+def _km_survival_at(
+    km_table: tuple[np.ndarray, np.ndarray] | None,
+    t: float,
+) -> float:
+    if km_table is None or not np.isfinite(t):
+        return 1.0
+    times, surv = km_table
+    idx = np.searchsorted(times, t, side="right") - 1
+    if idx < 0:
+        return 1.0
+    return float(surv[idx])
+
+
+def survival_ipcw_horizon_metrics(
+    train_event_times: np.ndarray,
+    train_events: np.ndarray,
+    test_event_times: np.ndarray,
+    test_events: np.ndarray,
+    horizon: float,
+    failure_prob: np.ndarray,
+    eps: float = 1e-12,
+) -> dict[str, float | None]:
+    times = np.asarray(test_event_times, dtype=float).reshape(-1)
+    events = (np.asarray(test_events, dtype=float).reshape(-1) > 0.5)
+    p_fail = np.asarray(failure_prob, dtype=float).reshape(-1)
+    if times.shape != events.shape or times.shape != p_fail.shape or times.size == 0:
+        return {"brier": None, "logloss": None, "nagelkerke_r2": None}
+    if not np.isfinite(horizon) or horizon <= 0.0:
+        return {"brier": None, "logloss": None, "nagelkerke_r2": None}
+
+    km_table = _km_censoring_survival_table(train_event_times, train_events)
+    g_h = max(_km_survival_at(km_table, horizon), eps)
+    weights = np.zeros_like(times, dtype=float)
+    target = ((times <= horizon) & events).astype(float)
+    for i in range(times.size):
+        ti = times[i]
+        if ti <= horizon and events[i]:
+            weights[i] = 1.0 / max(_km_survival_at(km_table, ti), eps)
+        elif ti > horizon:
+            weights[i] = 1.0 / g_h
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0.0 or not np.isfinite(weight_sum):
+        return {"brier": None, "logloss": None, "nagelkerke_r2": None}
+
+    p_safe = np.clip(p_fail, eps, 1.0 - eps)
+    brier = float(np.sum(weights * (p_safe - target) ** 2) / weight_sum)
+    ll_model = float(
+        np.sum(weights * (target * np.log(p_safe) + (1.0 - target) * np.log(1.0 - p_safe)))
     )
-    if ll_null is None:
-        return None
-    r2_cs = 1.0 - exp_saturated((2.0 / n_events) * (ll_null - ll_model))
-    max_r2_cs = 1.0 - exp_saturated((2.0 / n_events) * ll_null)
-    if not np.isfinite(r2_cs) or not np.isfinite(max_r2_cs) or max_r2_cs <= 0.0:
-        return None
-    return float(r2_cs / max_r2_cs)
+    logloss = float(-ll_model / weight_sum)
+
+    p_null = float(np.clip(np.sum(weights * target) / weight_sum, eps, 1.0 - eps))
+    ll_null = float(
+        np.sum(weights * (target * np.log(p_null) + (1.0 - target) * np.log(1.0 - p_null)))
+    )
+    r2_cs = 1.0 - exp_saturated((2.0 / weight_sum) * (ll_null - ll_model))
+    max_r2_cs = 1.0 - exp_saturated((2.0 / weight_sum) * ll_null)
+    nagelkerke = None
+    if np.isfinite(r2_cs) and np.isfinite(max_r2_cs) and max_r2_cs > 0.0:
+        nagelkerke = float(r2_cs / max_r2_cs)
+    return {
+        "brier": brier,
+        "logloss": logloss,
+        "nagelkerke_r2": nagelkerke,
+    }
 
 
-def survival_partial_brier_score(
-    event_times: np.ndarray, risk_score: np.ndarray, events: np.ndarray, eps: float = 1e-12
-) -> float | None:
-    times = np.asarray(event_times, dtype=float).reshape(-1)
-    eta = np.asarray(risk_score, dtype=float).reshape(-1)
-    obs = (np.asarray(events, dtype=float).reshape(-1) > 0.5).astype(float)
-    if times.shape != eta.shape or times.shape != obs.shape or times.size == 0:
-        return None
-
-    event_mask = obs > 0.5
-    if int(np.sum(event_mask)) == 0:
-        return None
-
-    unique_event_times = np.unique(times[event_mask])
-    total = 0.0
-    denom = 0
-    for t in unique_event_times:
-        d = (times == t) & event_mask
-        m = int(np.sum(d))
-        if m == 0:
-            continue
-        risk_set = times >= t
-        risk_eta = eta[risk_set]
-        if risk_eta.size == 0:
-            continue
-        max_eta = float(np.max(risk_eta))
-        weights = np.exp(risk_eta - max_eta)
-        probs = weights / max(float(np.sum(weights)), eps)
-        target = np.zeros_like(probs, dtype=float)
-        target[d[risk_set]] = 1.0 / m
-        score = float(np.sum((probs - target) ** 2))
-        total += float(m) * score
-        denom += m
-
-    if denom == 0:
-        return None
-    return float(total / denom)
+def score_survival_fold(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    *,
+    time_col: str,
+    event_col: str,
+    risk_score: np.ndarray,
+    failure_prob: np.ndarray | None = None,
+) -> dict[str, float | None]:
+    event_times = test_df[time_col].to_numpy(dtype=float)
+    events = test_df[event_col].to_numpy(dtype=float)
+    metrics: dict[str, float | None] = {
+        "auc": _lifelines_cindex_from_risk(event_times, risk_score, events),
+        "brier": None,
+        "logloss": None,
+        "nagelkerke_r2": None,
+        "predict_horizon": None,
+    }
+    if failure_prob is None:
+        return metrics
+    horizon = _survival_eval_horizon(train_df, time_col)
+    prob_metrics = survival_ipcw_horizon_metrics(
+        train_df[time_col].to_numpy(dtype=float),
+        train_df[event_col].to_numpy(dtype=float),
+        event_times,
+        events,
+        horizon,
+        failure_prob,
+    )
+    metrics.update(prob_metrics)
+    metrics["predict_horizon"] = float(horizon)
+    return metrics
 
 
 def rmse_score(y: np.ndarray, mu: np.ndarray) -> float:
@@ -770,6 +793,38 @@ def _survival_eval_horizon(train_df: pd.DataFrame, time_col: str) -> float:
     if (not np.isfinite(horizon)) or horizon <= 0.0:
         horizon = 1.0
     return horizon
+
+
+def _rust_survival_fit_cli_args(scenario_name: str) -> list[str]:
+    cfg = _rust_survival_fit_options_for_scenario(scenario_name)
+    args: list[str] = []
+    for key in (
+        "time_basis",
+        "time_degree",
+        "time_num_internal_knots",
+        "time_smooth_lambda",
+        "ridge_lambda",
+    ):
+        if key not in cfg:
+            continue
+        cli_key = "--" + key.replace("_", "-")
+        args.extend([cli_key, str(cfg[key])])
+    return args
+
+
+def _survival_failure_probability_from_rust_pred(pred_df: pd.DataFrame) -> np.ndarray:
+    if "failure_prob" in pred_df.columns:
+        return pred_df["failure_prob"].to_numpy(dtype=float)
+    if "survival_prob" in pred_df.columns:
+        surv = pred_df["survival_prob"].to_numpy(dtype=float)
+        return 1.0 - surv
+    if "mean" in pred_df.columns:
+        surv = pred_df["mean"].to_numpy(dtype=float)
+        return 1.0 - surv
+    raise RuntimeError(
+        "rust survival prediction output missing failure probability column; "
+        "expected one of: failure_prob, survival_prob, mean"
+    )
 
 
 def _augment_bmi_spline_linear_hinges(train_df: pd.DataFrame, test_df: pd.DataFrame, n_knots: int = 6):
@@ -3123,6 +3178,7 @@ def run_rust_scenario_cv(
                     "--out",
                     str(model_path),
                 ]
+                fit_cmd.extend(_rust_survival_fit_cli_args(scenario_name))
             else:
                 if shared_artifact is not None:
                     train_path = shared_artifact.train_scaled_csv
@@ -3337,10 +3393,9 @@ def run_rust_scenario_cv(
                     }
                 )
             else:
-                event_times = test_eval_df[ds["time_col"]].to_numpy(dtype=float)
-                events = test_eval_df[ds["event_col"]].to_numpy(dtype=float)
                 try:
                     risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
+                    failure_prob = _survival_failure_probability_from_rust_pred(pred_df)
                 except RuntimeError as e:
                     return {
                         "contender": contender_name,
@@ -3348,21 +3403,28 @@ def run_rust_scenario_cv(
                         "status": "failed",
                         "error": str(e),
                     }
-                cidx = _lifelines_cindex_from_risk(event_times, risk_score, events)
+                surv_metrics = score_survival_fold(
+                    train_df,
+                    test_eval_df,
+                    time_col=ds["time_col"],
+                    event_col=ds["event_col"],
+                    risk_score=risk_score,
+                    failure_prob=failure_prob,
+                )
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
                         "predict_sec": float(pred_sec),
-                        "auc": cidx,
-                        "brier": survival_partial_brier_score(event_times, risk_score, events),
-                        "logloss": survival_partial_log_loss(event_times, risk_score, events),
-                        "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk_score, events),
+                        "auc": surv_metrics["auc"],
+                        "brier": surv_metrics["brier"],
+                        "logloss": surv_metrics["logloss"],
+                        "nagelkerke_r2": surv_metrics["nagelkerke_r2"],
                         "n_test": int(len(fold.test_idx)),
-                        "predict_horizon": float(horizon),
+                        "predict_horizon": surv_metrics["predict_horizon"],
                         "predict_horizon_policy": "global train-fold median time",
                         "model_spec": (
                             "survival model via release binary "
-                            f"(c-index on risk score from '{score_src}') {eval_suffix}"
+                            f"(c-index on risk score from '{score_src}'; IPCW horizon scores on failure_prob) {eval_suffix}"
                         ),
                     }
                 )
@@ -3788,6 +3850,7 @@ def run_rust_gamlss_survival_cv(
                 "--out",
                 str(model_path),
             ]
+            fit_cmd.extend(_rust_survival_fit_cli_args(scenario_name))
             fit_cmd.extend(["--no-summary"])
             fit_cmd.extend([str(train_path), fit_formula])
 
@@ -3821,10 +3884,9 @@ def run_rust_gamlss_survival_cv(
                 }
             pred_df = pd.read_csv(pred_path)
 
-            event_times = test_eval_df[ds["time_col"]].to_numpy(dtype=float)
-            events = test_eval_df[ds["event_col"]].to_numpy(dtype=float)
             try:
                 risk_score, score_src = _survival_risk_from_rust_pred(pred_df)
+                failure_prob = _survival_failure_probability_from_rust_pred(pred_df)
             except RuntimeError as e:
                 return {
                     "contender": "rust_gamlss_survival",
@@ -3832,21 +3894,28 @@ def run_rust_gamlss_survival_cv(
                     "status": "failed",
                     "error": str(e),
                 }
-            cidx = _lifelines_cindex_from_risk(event_times, risk_score, events)
+            surv_metrics = score_survival_fold(
+                train_df,
+                test_eval_df,
+                time_col=ds["time_col"],
+                event_col=ds["event_col"],
+                risk_score=risk_score,
+                failure_prob=failure_prob,
+            )
             cv_rows.append(
                 {
                     "fit_sec": float(fit_sec),
                     "predict_sec": float(pred_sec),
-                    "auc": cidx,
-                    "brier": survival_partial_brier_score(event_times, risk_score, events),
-                    "logloss": survival_partial_log_loss(event_times, risk_score, events),
-                    "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk_score, events),
+                    "auc": surv_metrics["auc"],
+                    "brier": surv_metrics["brier"],
+                    "logloss": surv_metrics["logloss"],
+                    "nagelkerke_r2": surv_metrics["nagelkerke_r2"],
                     "n_test": int(len(fold.test_idx)),
-                    "predict_horizon": float(horizon),
+                    "predict_horizon": surv_metrics["predict_horizon"],
                     "predict_horizon_policy": "global train-fold median time",
                         "model_spec": (
                             "survival probit-location-scale via release binary "
-                            f"(c-index on risk score from '{score_src}') [5-fold CV]"
+                            f"(c-index on risk score from '{score_src}'; IPCW horizon scores on failure_prob) [5-fold CV]"
                     ),
                 }
             )
@@ -3900,6 +3969,8 @@ def _sigma_feature_rhs(
     *,
     n_train: int | None = None,
 ) -> str:
+    if ds.get("family") == "binomial":
+        return "1"
     features = [str(c) for c in ds.get("features", [])]
     return " + ".join(features) if features else "1"
 
@@ -4456,10 +4527,17 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                             f"(got {risk.shape[0]}, expected {event_times.shape[0]})"
                         ),
                     }
-                fold_row["auc"] = _lifelines_cindex_from_risk(event_times, risk, events)
-                fold_row["brier"] = survival_partial_brier_score(event_times, risk, events)
-                fold_row["logloss"] = survival_partial_log_loss(event_times, risk, events)
-                fold_row["nagelkerke_r2"] = survival_partial_nagelkerke_r2(event_times, risk, events)
+                surv_metrics = score_survival_fold(
+                    train_df,
+                    test_df,
+                    time_col=ds["time_col"],
+                    event_col=ds["event_col"],
+                    risk_score=risk,
+                )
+                fold_row["auc"] = surv_metrics["auc"]
+                fold_row["brier"] = surv_metrics["brier"]
+                fold_row["logloss"] = surv_metrics["logloss"]
+                fold_row["nagelkerke_r2"] = surv_metrics["nagelkerke_r2"]
                 fold_row.pop("risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
@@ -5511,10 +5589,17 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                         f"(got {risk.shape[0]}, expected {event_times.shape[0]})"
                     ),
                 }
-            fold_row["auc"] = _lifelines_cindex_from_risk(event_times, risk, events)
-            fold_row["brier"] = survival_partial_brier_score(event_times, risk, events)
-            fold_row["logloss"] = survival_partial_log_loss(event_times, risk, events)
-            fold_row["nagelkerke_r2"] = survival_partial_nagelkerke_r2(event_times, risk, events)
+            surv_metrics = score_survival_fold(
+                train_df,
+                test_df,
+                time_col=ds["time_col"],
+                event_col=ds["event_col"],
+                risk_score=risk,
+            )
+            fold_row["auc"] = surv_metrics["auc"]
+            fold_row["brier"] = surv_metrics["brier"]
+            fold_row["logloss"] = surv_metrics["logloss"]
+            fold_row["nagelkerke_r2"] = surv_metrics["nagelkerke_r2"]
             fold_row.pop("risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
@@ -5586,10 +5671,13 @@ def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
-                "auc": _lifelines_cindex_from_risk(event_times, risk, events),
-                "brier": survival_partial_brier_score(event_times, risk, events),
-                "logloss": survival_partial_log_loss(event_times, risk, events),
-                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
+                **score_survival_fold(
+                    train_df,
+                    test_df,
+                    time_col=time_col,
+                    event_col=event_col,
+                    risk_score=risk,
+                ),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": (
                     "RandomSurvivalForest("
@@ -5663,10 +5751,13 @@ def run_external_sksurv_coxnet_cv(scenario, *, ds: dict | None = None, folds: li
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
-                "auc": _lifelines_cindex_from_risk(event_times, risk, events),
-                "brier": survival_partial_brier_score(event_times, risk, events),
-                "logloss": survival_partial_log_loss(event_times, risk, events),
-                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
+                **score_survival_fold(
+                    train_df,
+                    test_df,
+                    time_col=time_col,
+                    event_col=event_col,
+                    risk_score=risk,
+                ),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": "CoxnetSurvivalAnalysis(l1_ratio=0.5, alpha_min_ratio=0.01)",
             }
@@ -5729,10 +5820,13 @@ def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, fo
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
-                "auc": _lifelines_cindex_from_risk(event_times, risk, events),
-                "brier": survival_partial_brier_score(event_times, risk, events),
-                "logloss": survival_partial_log_loss(event_times, risk, events),
-                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
+                **score_survival_fold(
+                    train_df,
+                    test_df,
+                    time_col=time_col,
+                    event_col=event_col,
+                    risk_score=risk,
+                ),
                 "n_test": int(len(fold.test_idx)),
                 "warning": (
                     f"lifelines convergence warning: {str(conv_warn[0].message)}"
@@ -5912,10 +6006,17 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                         f"(got {risk.shape[0]}, expected {event_times.shape[0]})"
                     ),
                 }
-            fold_row["auc"] = _lifelines_cindex_from_risk(event_times, risk, events)
-            fold_row["brier"] = survival_partial_brier_score(event_times, risk, events)
-            fold_row["logloss"] = survival_partial_log_loss(event_times, risk, events)
-            fold_row["nagelkerke_r2"] = survival_partial_nagelkerke_r2(event_times, risk, events)
+            surv_metrics = score_survival_fold(
+                train_df,
+                test_df,
+                time_col=ds["time_col"],
+                event_col=ds["event_col"],
+                risk_score=risk,
+            )
+            fold_row["auc"] = surv_metrics["auc"]
+            fold_row["brier"] = surv_metrics["brier"]
+            fold_row["logloss"] = surv_metrics["logloss"]
+            fold_row["nagelkerke_r2"] = surv_metrics["nagelkerke_r2"]
             fold_row.pop("risk", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
@@ -5991,10 +6092,13 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
-                "auc": _lifelines_cindex_from_risk(event_times, gb_risk, events),
-                "brier": survival_partial_brier_score(event_times, gb_risk, events),
-                "logloss": survival_partial_log_loss(event_times, gb_risk, events),
-                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, gb_risk, events),
+                **score_survival_fold(
+                    train_df,
+                    test_df,
+                    time_col=time_col,
+                    event_col=event_col,
+                    risk_score=gb_risk,
+                ),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": gb_spec,
             }
@@ -6016,10 +6120,13 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
-                "auc": _lifelines_cindex_from_risk(event_times, cgb_risk, events),
-                "brier": survival_partial_brier_score(event_times, cgb_risk, events),
-                "logloss": survival_partial_log_loss(event_times, cgb_risk, events),
-                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, cgb_risk, events),
+                **score_survival_fold(
+                    train_df,
+                    test_df,
+                    time_col=time_col,
+                    event_col=event_col,
+                    risk_score=cgb_risk,
+                ),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": cgb_spec,
             }
@@ -6090,10 +6197,13 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
-                "auc": _lifelines_cindex_from_risk(event_times, risk, events),
-                "brier": survival_partial_brier_score(event_times, risk, events),
-                "logloss": survival_partial_log_loss(event_times, risk, events),
-                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
+                **score_survival_fold(
+                    train_df,
+                    test_df,
+                    time_col=time_col,
+                    event_col=event_col,
+                    risk_score=risk,
+                ),
                 "n_test": int(len(fold.test_idx)),
                 "warning": (
                     f"lifelines convergence warning: {str(conv_warn[0].message)}"
@@ -6123,10 +6233,13 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
-                "auc": _lifelines_cindex_from_risk(event_times, risk, events),
-                "brier": survival_partial_brier_score(event_times, risk, events),
-                "logloss": survival_partial_log_loss(event_times, risk, events),
-                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
+                **score_survival_fold(
+                    train_df,
+                    test_df,
+                    time_col=time_col,
+                    event_col=event_col,
+                    risk_score=risk,
+                ),
                 "n_test": int(len(fold.test_idx)),
                 "warning": (
                     f"lifelines convergence warning: {str(conv_warn[0].message)}"
@@ -6233,10 +6346,13 @@ def run_external_xgboost_aft_cv(scenario, *, ds: dict | None = None, folds: list
             {
                 "fit_sec": fit_sec,
                 "predict_sec": pred_sec,
-                "auc": _lifelines_cindex_from_risk(event_times, risk, events),
-                "brier": survival_partial_brier_score(event_times, risk, events),
-                "logloss": survival_partial_log_loss(event_times, risk, events),
-                "nagelkerke_r2": survival_partial_nagelkerke_r2(event_times, risk, events),
+                **score_survival_fold(
+                    train_df,
+                    test_df,
+                    time_col=time_col,
+                    event_col=event_col,
+                    risk_score=risk,
+                ),
                 "n_test": int(len(fold.test_idx)),
                 "model_spec": (
                     "xgboost.train(objective='survival:aft',loss='normal',scale=1.0,"
