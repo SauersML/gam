@@ -2747,6 +2747,12 @@ fn build_survival_time_basis(
         num_internal_knots: usize,
         basis_options: BasisOptions,
     ) -> Result<Array1<f64>, String> {
+        fn should_retry_with_uniform(err: &str) -> bool {
+            err.contains("distinct interior support")
+                || err.contains("non-interior knot")
+                || err.contains("Data range has zero width")
+        }
+
         let infer_with =
             |placement: gam::basis::BSplineKnotPlacement| -> Result<Array1<f64>, String> {
                 let built = build_bspline_basis_1d(
@@ -2784,7 +2790,10 @@ fn build_survival_time_basis(
 
         match infer_with(gam::basis::BSplineKnotPlacement::Quantile) {
             Ok(knots) => Ok(knots),
-            Err(_) => infer_with(gam::basis::BSplineKnotPlacement::Uniform),
+            Err(err) if should_retry_with_uniform(&err) => {
+                infer_with(gam::basis::BSplineKnotPlacement::Uniform)
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -9595,6 +9604,25 @@ mod tests {
         }
         assert!(built.x_exit_time.ncols() > 0);
         assert!(built.x_derivative_time.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn survival_time_basis_inference_surfaces_nonfinite_quantile_errors() {
+        let age_entry = Array1::from_vec(vec![1e-9; 4]);
+        let age_exit = Array1::from_vec(vec![0.5, 1.0, f64::NAN, 4.0]);
+        let err = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::BSpline {
+                degree: 3,
+                knots: Array1::zeros(0),
+                smooth_lambda: 1e-2,
+            },
+            Some((4, 1e-6)),
+        )
+        .expect_err("non-finite times should not retry through uniform knots");
+
+        assert!(err.contains("quantile knot placement requires finite data"));
     }
 
     #[test]

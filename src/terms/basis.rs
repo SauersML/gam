@@ -10746,8 +10746,13 @@ mod tests {
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penalties.len(), 1);
-        assert_eq!(out.penalty_info.len(), 1);
+        assert_eq!(out.penalty_info.len(), 2);
         assert!(matches!(out.penalty_info[0].source, PenaltySource::Primary));
+        assert!(matches!(
+            out.penalty_info[1].source,
+            PenaltySource::DoublePenaltyNullspace
+        ));
+        assert!(!out.penalty_info[1].active);
     }
 
     #[test]

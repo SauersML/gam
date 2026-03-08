@@ -15,7 +15,7 @@ use crate::probability::{normal_cdf, normal_pdf};
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, s};
 
-const MIN_PROB: f64 = 1e-300;
+const MIN_PROB: f64 = 1e-12;
 
 #[inline]
 fn exp_sigma_derivs_up_to_third(
@@ -655,10 +655,37 @@ impl SurvivalLocationScaleFamily {
             .map_err(|e| format!("inverse link evaluation failed at row {row} entry: {e}"))?;
         let j1 = inverse_link_jet_for_inverse_link(&self.inverse_link, u1)
             .map_err(|e| format!("inverse link evaluation failed at row {row} exit: {e}"))?;
+        // The row likelihood is written in terms of the survival values
+        //
+        //   S(u0),  S(u1),
+        //
+        // not in terms of the failure probability `mu = F(u)`.
+        //
+        // Numerically, reconstructing `S` as `1 - mu` is unsafe in the upper
+        // tail. For cloglog/Gumbel in particular, fitted rows can legitimately
+        // land near `S(u) ~ 1e-12`, where `mu` is already within a few ulps of 1.
+        // Then:
+        //
+        //   S_direct  = exp(-exp(u))
+        //   S_naive   = 1 - (1 - S_direct)
+        //
+        // and the latter loses the very quantity the objective differentiates.
+        //
+        // The exact score / Hessian algebra from the derivation assumes the row
+        // objective and its derivatives are taken with respect to the *same*
+        // scalar function
+        //
+        //   ell = w [ d(log f(u1) + log g) + (1-d) log S(u1) - log S(u0) ].
+        //
+        // So we evaluate `S` directly through the inverse-link-specific stable
+        // survival helper and only use the inverse-link jet for the density-side
+        // derivatives `(f, f', f'')`.
+        let raw_s0 = inverse_link_survival_prob_value(&self.inverse_link, u0);
+        let raw_s1 = inverse_link_survival_prob_value(&self.inverse_link, u1);
         let (s0, r0, dr0, ddr0) =
-            Self::clamped_survival_neglog_derivatives(1.0 - j0.mu, j0.d1, j0.d2, j0.d3);
+            Self::clamped_survival_neglog_derivatives(raw_s0, j0.d1, j0.d2, j0.d3);
         let (s1, r1, dr1, ddr1) =
-            Self::clamped_survival_neglog_derivatives(1.0 - j1.mu, j1.d1, j1.d2, j1.d3);
+            Self::clamped_survival_neglog_derivatives(raw_s1, j1.d1, j1.d2, j1.d3);
         let fppp1 = inverse_link_pdf_third_derivative_for_inverse_link(&self.inverse_link, u1)
             .map_err(|e| {
                 format!("inverse link third-derivative evaluation failed at row {row} exit: {e}")
