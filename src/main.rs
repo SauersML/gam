@@ -23,7 +23,6 @@ use gam::families::family_meta::{
 };
 use gam::families::sigma_link::{
     bounded_sigma_and_deriv_from_eta as sigma_and_deriv_from_eta,
-    bounded_sigma_from_eta_scalar as sigma_from_eta_scalar,
 };
 use gam::gamlss::{
     BinomialLocationScaleTermSpec, BinomialLocationScaleWiggleWorkflowConfig,
@@ -1168,6 +1167,8 @@ fn run_fit_with_predict_noise(
             y: y.clone(),
             weights: Array1::ones(y.len()),
             link_kind: location_scale_link_kind.clone(),
+            sigma_min: 1.0,
+            sigma_max: 2.0,
             threshold_spec: mean_spec.clone(),
             log_sigma_spec: noise_spec.clone(),
         },
@@ -1458,6 +1459,8 @@ fn run_predict_survival(
             x_log_sigma: DesignMatrix::Dense(cov_design.design.clone()),
             eta_log_sigma_offset: Array1::zeros(n),
             x_link_wiggle: x_link_wiggle.clone(),
+            sigma_min: 1.0,
+            sigma_max: 2.0,
             inverse_link: survival_inverse_link.clone(),
         };
         let fit_stub = gam::survival_location_scale::SurvivalLocationScaleFitResult {
@@ -9645,10 +9648,9 @@ mod tests {
     fn probit_q0_helper_matches_manual_threshold_over_sigma() {
         let eta_t = array![0.8, -0.4, 1.2];
         let eta_ls = array![-1.0, 0.0, 1.5];
-        let q0 = compute_probit_q0_from_eta(eta_t.view(), eta_ls.view(), 0.05, 20.0)
-            .expect("compute probit q0");
+        let q0 = compute_probit_q0_from_eta(eta_t.view(), eta_ls.view()).expect("compute probit q0");
         for i in 0..q0.len() {
-            let sigma = super::sigma_from_eta_scalar(eta_ls[i], 0.05, 20.0).max(1e-12);
+            let sigma = eta_ls[i].exp().max(1e-12);
             let expected = -eta_t[i] / sigma;
             assert!((q0[i] - expected).abs() < 1e-12);
         }

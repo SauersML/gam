@@ -2085,6 +2085,62 @@ def _geo_subpop16_dataset(seed=20260330, prevalence_min=0.02, prevalence_max=0.4
     }
 
 
+def _geo_subpop16_randomprev_randomscale_dataset(
+    seed=20260701,
+    prevalence_min=0.02,
+    prevalence_max=0.40,
+    noise_scale_min=0.25,
+    noise_scale_max=0.85,
+):
+    if not HGDP_1KG_PC_TSV.exists():
+        raise RuntimeError(f"missing required PC dataset: {HGDP_1KG_PC_TSV}")
+
+    rng = np.random.default_rng(int(seed))
+    raw = pd.read_csv(HGDP_1KG_PC_TSV, sep="\t")
+    pc_cols = [f"PC{i}" for i in range(1, 17)]
+    required = {"Subpopulation", *pc_cols}
+    missing = sorted(required - set(raw.columns))
+    if missing:
+        raise RuntimeError(f"hgdp_1kg_pc_data.tsv is missing required columns: {missing}")
+
+    d = raw[["Subpopulation", *pc_cols]].dropna().copy()
+    d["Subpopulation"] = d["Subpopulation"].astype(str)
+    if d.empty:
+        raise RuntimeError("hgdp_1kg_pc_data.tsv has no complete rows for Subpopulation + PC1..PC16")
+
+    subpops = sorted(d["Subpopulation"].unique().tolist())
+    if len(subpops) < 2:
+        raise RuntimeError("need at least two subpopulations for prevalence simulation")
+
+    prevalence_map = {
+        sp: float(rng.uniform(float(prevalence_min), float(prevalence_max))) for sp in subpops
+    }
+    noise_scale_map = {
+        sp: float(rng.uniform(float(noise_scale_min), float(noise_scale_max))) for sp in subpops
+    }
+
+    base_prev = d["Subpopulation"].map(prevalence_map).to_numpy(dtype=float)
+    base_prev = np.clip(base_prev, 1e-5, 1.0 - 1e-5)
+    base_eta = np.log(base_prev / (1.0 - base_prev))
+    noise_scale = d["Subpopulation"].map(noise_scale_map).to_numpy(dtype=float)
+    eta = base_eta + rng.normal(0.0, noise_scale, size=len(d))
+    p = 1.0 / (1.0 + np.exp(-eta))
+    d["y"] = (rng.random(len(d)) < p).astype(float)
+
+    rows = []
+    for _, row in d.iterrows():
+        out = {f"pc{i}": float(row[f"PC{i}"]) for i in range(1, 17)}
+        out["y"] = float(row["y"])
+        rows.append(out)
+
+    return {
+        "family": "binomial",
+        "rows": rows,
+        "features": [f"pc{i}" for i in range(1, 17)],
+        "target": "y",
+    }
+
+
 def _validate_dataset_schema(ds, scenario_name):
     if not isinstance(ds, dict):
         raise RuntimeError(f"{scenario_name}: dataset loader must return a dict")
@@ -2158,6 +2214,14 @@ def _dataset_for_scenario_unvalidated(s):
         return _synthetic_papuan_oce_dataset(s.get("n", 6000), s.get("seed", 20260315), n_pcs=4)
     if name.startswith("papuan_oce_"):
         return _synthetic_papuan_oce_dataset(s.get("n", 6000), s.get("seed", 20260315), n_pcs=16)
+    if name == "geo_subpop16_randomprev_randomscale_duchonfull_k50":
+        return _geo_subpop16_randomprev_randomscale_dataset(
+            seed=s.get("seed", 20260701),
+            prevalence_min=s.get("prevalence_min", 0.02),
+            prevalence_max=s.get("prevalence_max", 0.40),
+            noise_scale_min=s.get("noise_scale_min", 0.25),
+            noise_scale_max=s.get("noise_scale_max", 0.85),
+        )
     if name.startswith("geo_subpop16_"):
         return _geo_subpop16_dataset(
             seed=s.get("seed", 20260330),
@@ -2629,6 +2693,13 @@ def _rust_fit_mapping(scenario_name):
             smooth_basis="ps",
             linear_cols=[],
             knots=10,
+        ),
+        "geo_subpop16_randomprev_randomscale_duchonfull_k50": dict(
+            family="binomial-logit",
+            smooth_cols=[f"pc{i}" for i in range(1, 17)],
+            smooth_basis="duchon",
+            linear_cols=[],
+            knots=50,
         ),
         "continuous_order_fractional_spde_nu18": dict(
             family="gaussian",

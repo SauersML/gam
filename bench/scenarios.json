@@ -416,6 +416,31 @@
       "prevalence_max": 0.4
     },
     {
+      "name": "geo_subpop16_randomprev_randomscale_duchonfull_k50",
+      "seed": 20260701,
+      "prevalence_min": 0.02,
+      "prevalence_max": 0.4,
+      "noise_scale_min": 0.25,
+      "noise_scale_max": 0.85,
+      "exclude_contenders": [
+        "r_gamlss",
+        "r_mgcv_gaulss",
+        "r_gamboostlss",
+        "r_bamlss",
+        "r_brms",
+        "rust_gam_sas",
+        "rust_gamlss_survival",
+        "r_mgcv_coxph",
+        "python_sksurv_rsf",
+        "python_sksurv_coxnet",
+        "python_lifelines_coxph_enet",
+        "r_glmnet_cox",
+        "python_sksurv_gb_coxph",
+        "python_lifelines_weibull_aft",
+        "python_xgboost_aft"
+      ]
+    },
+    {
       "name": "geo_latlon_superpopnoise_tp_k6",
       "seed": 20260401,
       "prevalence_min": 0.01,
