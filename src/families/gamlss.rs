@@ -627,6 +627,84 @@ fn project_block_beta_to_weighted_eta_mean_zero(
     Ok(&beta - &(c * shift))
 }
 
+fn weighted_column_mean(col: ArrayView1<'_, f64>, weights: &Array1<f64>) -> Result<f64, String> {
+    if col.len() != weights.len() {
+        return Err("weighted column mean dimension mismatch".to_string());
+    }
+    let w_sum: f64 = weights.iter().copied().sum();
+    if !w_sum.is_finite() || w_sum <= 0.0 {
+        return Err("weighted column mean requires positive finite total weight".to_string());
+    }
+    Ok(col
+        .iter()
+        .zip(weights.iter())
+        .map(|(&x, &w)| x * w)
+        .sum::<f64>()
+        / w_sum)
+}
+
+fn weighted_centered_column_ss(
+    col: ArrayView1<'_, f64>,
+    weights: &Array1<f64>,
+) -> Result<f64, String> {
+    let mean = weighted_column_mean(col, weights)?;
+    Ok(col
+        .iter()
+        .zip(weights.iter())
+        .map(|(&x, &w)| {
+            let dx = x - mean;
+            w * dx * dx
+        })
+        .sum())
+}
+
+fn identified_binomial_log_sigma_design(
+    threshold_design: &TermCollectionDesign,
+    log_sigma_design: &TermCollectionDesign,
+    weights: &Array1<f64>,
+) -> Result<Array2<f64>, String> {
+    let xt = &threshold_design.design;
+    let mut xls = log_sigma_design.design.clone();
+    let n = xt.nrows();
+    if xls.nrows() != n || weights.len() != n {
+        return Err(format!(
+            "identified binomial log-sigma design row mismatch: threshold={}, log_sigma={}, weights={}",
+            n,
+            xls.nrows(),
+            weights.len()
+        ));
+    }
+
+    let non_intercept_start = log_sigma_design.intercept_range.end.min(xls.ncols());
+    if non_intercept_start >= xls.ncols() {
+        return Ok(xls);
+    }
+
+    let threshold_op = DesignMatrix::Dense(xt.clone());
+    let zero_offset = Array1::<f64>::zeros(n);
+    for j in non_intercept_start..xls.ncols() {
+        let col = xls.column(j).to_owned();
+        let projection_beta =
+            solve_weighted_projection(&threshold_op, &zero_offset, &col, weights, 1e-10)?;
+        let fitted = xt.dot(&projection_beta);
+        let mut residual = &col - &fitted;
+        let residual_mean = weighted_column_mean(residual.view(), weights)?;
+        residual.mapv_inplace(|v| v - residual_mean);
+
+        let orig_ss = weighted_centered_column_ss(col.view(), weights)?;
+        let resid_ss = weighted_centered_column_ss(residual.view(), weights)?;
+        if !resid_ss.is_finite() || resid_ss <= 1e-12 {
+            residual.fill(0.0);
+        } else if orig_ss.is_finite() && orig_ss > 1e-12 {
+            let rescale = (orig_ss / resid_ss).sqrt();
+            residual.mapv_inplace(|v| v * rescale);
+        }
+        xls.column_mut(j).assign(&residual);
+    }
+
+    Ok(xls)
+}
+
 fn emit_binomial_alpha_beta_warnings(
     context: &str,
     beta_values: &Array1<f64>,
@@ -1702,6 +1780,8 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitTermBuilder {
             noise_design.penalties.len(),
         );
         layout.validate_theta_len(theta.len(), "binomial location-scale")?;
+        let identified_noise_design =
+            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
         Ok(vec![
             ParameterBlockSpec {
                 name: "threshold".to_string(),
@@ -1713,7 +1793,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitTermBuilder {
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
-                design: DesignMatrix::Dense(noise_design.design.clone()),
+                design: DesignMatrix::Dense(identified_noise_design),
                 offset: Array1::zeros(self.y.len()),
                 penalties: noise_design.penalties.clone(),
                 initial_log_lambdas: layout.noise_from(theta),
@@ -1727,6 +1807,9 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
+        let identified_noise_design =
+            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)
+                .expect("identified binomial log-sigma design should match block construction");
         BinomialLocationScaleProbitFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
@@ -1734,7 +1817,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitTermBuilder {
             sigma_min: self.sigma_min,
             sigma_max: self.sigma_max,
             threshold_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(noise_design.design.clone())),
+            log_sigma_design: Some(DesignMatrix::Dense(identified_noise_design)),
         }
     }
 
@@ -1804,6 +1887,8 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitWiggleTermBuilder
             self.wiggle_block.penalties.len(),
         );
         layout.validate_theta_len(theta.len(), "wiggle location-scale")?;
+        let identified_noise_design =
+            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
         Ok(vec![
             ParameterBlockSpec {
                 name: "threshold".to_string(),
@@ -1815,7 +1900,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitWiggleTermBuilder
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
-                design: DesignMatrix::Dense(noise_design.design.clone()),
+                design: DesignMatrix::Dense(identified_noise_design),
                 offset: Array1::zeros(self.y.len()),
                 penalties: noise_design.penalties.clone(),
                 initial_log_lambdas: layout.noise_from(theta),
@@ -1837,6 +1922,9 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitWiggleTermBuilder
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
+        let identified_noise_design =
+            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)
+                .expect("identified binomial log-sigma design should match block construction");
         BinomialLocationScaleProbitWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
@@ -1844,7 +1932,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleProbitWiggleTermBuilder
             sigma_min: self.sigma_min,
             sigma_max: self.sigma_max,
             threshold_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(noise_design.design.clone())),
+            log_sigma_design: Some(DesignMatrix::Dense(identified_noise_design)),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
         }
