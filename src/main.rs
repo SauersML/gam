@@ -58,10 +58,10 @@ use gam::smooth::{
 };
 use gam::smoothing::{SmoothingBfgsOptions, optimize_log_smoothing_with_multistart};
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
-use gam::survival_location_scale_probit::{
+use gam::survival_location_scale::{
     CovariateBlockInput, LinkWiggleBlockInput, ResidualDistribution,
-    SurvivalLocationScaleProbitPredictInput, SurvivalLocationScaleProbitSpec, TimeBlockInput,
-    fit_survival_location_scale_probit, predict_survival_location_scale_probit,
+    SurvivalLocationScalePredictInput, SurvivalLocationScaleSpec, TimeBlockInput,
+    fit_survival_location_scale, predict_survival_location_scale,
     residual_distribution_inverse_link,
 };
 use gam::types::{
@@ -1458,7 +1458,7 @@ fn run_predict_survival(
         } else {
             None
         };
-        let pred_input = SurvivalLocationScaleProbitPredictInput {
+        let pred_input = SurvivalLocationScalePredictInput {
             x_time_exit: time_build.x_exit_time.clone(),
             eta_time_offset_exit: eta_offset_exit.clone(),
             x_threshold: DesignMatrix::Dense(cov_design.design.clone()),
@@ -1468,7 +1468,7 @@ fn run_predict_survival(
             sigma_max,
             inverse_link: survival_inverse_link.clone(),
         };
-        let fit_stub = gam::survival_location_scale_probit::SurvivalLocationScaleProbitFitResult {
+        let fit_stub = gam::survival_location_scale::SurvivalLocationScaleFitResult {
             beta_time: beta_time.clone(),
             beta_threshold: beta_threshold.clone(),
             beta_log_sigma: beta_log_sigma.clone(),
@@ -1484,14 +1484,14 @@ fn run_predict_survival(
             converged: true,
             covariance_conditional: None,
         };
-        let pred = predict_survival_location_scale_probit(&pred_input, &fit_stub)
+        let pred = predict_survival_location_scale(&pred_input, &fit_stub)
             .map_err(|e| format!("survival probit-location-scale predict failed: {e}"))?;
         let (mean, eta_se_default) = if args.mode == PredictModeArg::PosteriorMean {
             if beta_link_wiggle.is_some() {
                 (pred.survival_prob.clone(), None)
             } else {
                 let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-                let out = gam::survival_location_scale_probit::predict_survival_location_scale_probit_with_uncertainty(
+                let out = gam::survival_location_scale::predict_survival_location_scale_with_uncertainty(
                     &pred_input,
                     &fit_stub,
                     &cov_mat,
@@ -1514,7 +1514,7 @@ fn run_predict_survival(
                 (Array1::zeros(n), Array1::zeros(n))
             } else {
                 let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-                let out = gam::survival_location_scale_probit::predict_survival_location_scale_probit_with_uncertainty(
+                let out = gam::survival_location_scale::predict_survival_location_scale_with_uncertainty(
                     &pred_input,
                     &fit_stub,
                     &cov_mat,
@@ -3394,8 +3394,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
         let build_spec = |inverse_link: InverseLink,
                           link_wiggle_block: Option<LinkWiggleBlockInput>|
-         -> SurvivalLocationScaleProbitSpec {
-            SurvivalLocationScaleProbitSpec {
+         -> SurvivalLocationScaleSpec {
+            SurvivalLocationScaleSpec {
                 age_entry: age_entry.clone(),
                 age_exit: age_exit.clone(),
                 event_target: event_target.mapv(f64::from),
@@ -3452,7 +3452,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 })
                 .map_err(EstimationError::InvalidInput)?;
                 let fit =
-                    fit_survival_location_scale_probit(build_spec(InverseLink::Sas(state), None))
+                    fit_survival_location_scale(build_spec(InverseLink::Sas(state), None))
                         .map_err(EstimationError::InvalidInput)?;
                 Ok(fit.penalized_objective)
             };
@@ -3508,7 +3508,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     initial_log_delta: theta[1],
                 })
                 .map_err(EstimationError::InvalidInput)?;
-                let fit = fit_survival_location_scale_probit(build_spec(
+                let fit = fit_survival_location_scale(build_spec(
                     InverseLink::BetaLogistic(state),
                     None,
                 ))
@@ -3565,7 +3565,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     initial_rho: rho.clone(),
                 })
                 .map_err(EstimationError::InvalidInput)?;
-                let fit = fit_survival_location_scale_probit(build_spec(
+                let fit = fit_survival_location_scale(build_spec(
                     InverseLink::Mixture(state),
                     None,
                 ))
@@ -3621,7 +3621,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     double_penalty: true,
                 });
             let pilot =
-                fit_survival_location_scale_probit(build_spec(fitted_inverse_link.clone(), None))
+                fit_survival_location_scale(build_spec(fitted_inverse_link.clone(), None))
                     .map_err(|e| format!("survival probit-location-scale pilot fit failed: {e}"))?;
             let eta_t = cov_design.design.dot(&pilot.beta_threshold);
             let eta_ls = cov_design.design.dot(&pilot.beta_log_sigma);
@@ -3648,13 +3648,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 initial_log_lambdas: wiggle_block.initial_log_lambdas,
                 initial_beta: wiggle_block.initial_beta,
             };
-            fit_survival_location_scale_probit(build_spec(
+            fit_survival_location_scale(build_spec(
                 fitted_inverse_link.clone(),
                 Some(wiggle_input),
             ))
             .map_err(|e| format!("survival probit-location-scale wiggle fit failed: {e}"))?
         } else {
-            fit_survival_location_scale_probit(build_spec(fitted_inverse_link.clone(), None))
+            fit_survival_location_scale(build_spec(fitted_inverse_link.clone(), None))
                 .map_err(|e| format!("survival probit-location-scale fit failed: {e}"))?
         };
         println!(
@@ -5309,7 +5309,7 @@ impl SavedFitSummary {
     }
 
     fn from_survival_location_scale_fit(
-        fit: &gam::survival_location_scale_probit::SurvivalLocationScaleProbitFitResult,
+        fit: &gam::survival_location_scale::SurvivalLocationScaleFitResult,
     ) -> Result<Self, String> {
         let deviance = -2.0 * fit.log_likelihood;
         let stable_penalty_term = 2.0 * fit.penalized_objective - deviance;
