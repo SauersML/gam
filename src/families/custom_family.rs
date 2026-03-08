@@ -3,14 +3,15 @@ use crate::faer_ndarray::{FaerArrayView, FaerEigh, FaerSvd};
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
-use crate::solver::opt_objective::CachedSecondOrderObjective;
+use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2};
 use opt::{
-    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError, Tolerance,
+    Bfgs, BfgsError, Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError,
+    ObjectiveEvalError, Tolerance,
 };
 use thiserror::Error;
 
@@ -3398,228 +3399,6 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
     })
 }
 
-#[cfg(test)]
-pub(crate) struct ExactNewtonRhoGradientDebug {
-    pub objective: f64,
-    pub penalty_term: Array1<f64>,
-    pub logdet_h_explicit_term: Array1<f64>,
-    pub logdet_h_implicit_term: Array1<f64>,
-    pub logdet_s_term: Array1<f64>,
-    pub beta_flat: Array1<f64>,
-    pub stationarity_inf: f64,
-    pub u_terms: Vec<Array1<f64>>,
-}
-
-#[cfg(test)]
-pub(crate) fn debug_exact_newton_rho_gradient_terms<F: CustomFamily>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    rho_current: &Array1<f64>,
-    warm_start: Option<&CustomFamilyWarmStart>,
-) -> Result<ExactNewtonRhoGradientDebug, CustomFamilyError> {
-    let penalty_counts = validate_block_specs(specs)?;
-    let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
-    let warm_inner = warm_start.map(|w| &w.inner);
-    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_inner)?;
-    let include_logdet_h = include_exact_newton_logdet_h(family);
-    let include_logdet_s = include_exact_newton_logdet_s(family, options);
-    let strict_spd = use_exact_newton_strict_spd(family);
-    let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinite_hessian();
-    let ridge = effective_solver_ridge(options.ridge_floor);
-    let mode_ridge = if options.ridge_policy.include_quadratic_penalty {
-        ridge
-    } else {
-        0.0
-    };
-    let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
-        && !options.ridge_policy.include_quadratic_penalty
-    {
-        ridge
-    } else {
-        0.0
-    };
-
-    let objective = -inner.log_likelihood
-        + inner.penalty_value
-        + if include_logdet_h {
-            0.5 * inner.block_logdet_h
-        } else {
-            0.0
-        }
-        - if include_logdet_s {
-            0.5 * inner.block_logdet_s
-        } else {
-            0.0
-        };
-
-    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-    let eval = family.evaluate(&inner.block_states)?;
-    let stationarity_inf = exact_newton_joint_stationarity_inf_norm(
-        &eval,
-        &inner.block_states,
-        &per_block
-            .iter()
-            .enumerate()
-            .map(|(b, lambdas_log)| {
-                let p = specs[b].design.ncols();
-                let lambdas = lambdas_log.mapv(f64::exp);
-                let mut s_lambda = Array2::<f64>::zeros((p, p));
-                for (k, s) in specs[b].penalties.iter().enumerate() {
-                    s_lambda.scaled_add(lambdas[k], s);
-                }
-                s_lambda
-            })
-            .collect::<Vec<_>>(),
-        ridge,
-        options.ridge_policy,
-    )?
-    .ok_or_else(|| {
-        "debug_exact_newton_rho_gradient_terms expected exact-newton working sets".to_string()
-    })?;
-    let h_joint_unpen = family
-        .exact_newton_joint_hessian(&inner.block_states)?
-        .ok_or_else(|| {
-            "debug_exact_newton_rho_gradient_terms requires a joint exact Hessian".to_string()
-        })?;
-    let ranges = block_param_ranges(specs);
-    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    let beta_flat = flatten_state_betas(&inner.block_states, specs);
-    let synced_joint_states =
-        synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
-    let joint_tangent_basis = joint_post_update_tangent_basis(family, specs, &synced_joint_states)?;
-    let mut s_joint = Array2::<f64>::zeros((total, total));
-    let mut s_pinv_joint = if include_logdet_s {
-        Some(Array2::<f64>::zeros((total, total)))
-    } else {
-        None
-    };
-    for (b, spec) in specs.iter().enumerate() {
-        let (start, end) = ranges[b];
-        let p = end - start;
-        let lambdas = per_block[b].mapv(f64::exp);
-        let mut s_lambda = Array2::<f64>::zeros((p, p));
-        for (k, s) in spec.penalties.iter().enumerate() {
-            s_lambda.scaled_add(lambdas[k], s);
-        }
-        s_joint
-            .slice_mut(ndarray::s![start..end, start..end])
-            .assign(&s_lambda);
-        if mode_ridge > 0.0 {
-            for d in start..end {
-                s_joint[[d, d]] += mode_ridge;
-            }
-        }
-        if let Some(s_pinv) = s_pinv_joint.as_mut() {
-            let mut s_for_logdet = s_lambda.clone();
-            if options.ridge_policy.include_penalty_logdet {
-                for d in 0..p {
-                    s_for_logdet[[d, d]] += ridge;
-                }
-            }
-            let s_floor = if options.ridge_policy.include_penalty_logdet {
-                ridge
-            } else {
-                0.0
-            }
-            .max(1e-14);
-            let s_part = pinv_positive_part_with_floor(&s_for_logdet, s_floor)?;
-            s_pinv
-                .slice_mut(ndarray::s![start..end, start..end])
-                .assign(&s_part);
-        }
-    }
-
-    let mut j_joint = h_joint_unpen.clone();
-    j_joint += &s_joint;
-    let mut j_for_traces = j_joint.clone();
-    if !strict_spd && extra_logdet_ridge > 0.0 {
-        for d in 0..total {
-            j_for_traces[[d, d]] += extra_logdet_ridge;
-        }
-    }
-    let h_inv = logdet_trace_inverse_with_ridge_policy(
-        &j_for_traces,
-        options.ridge_floor,
-        options.ridge_policy,
-        strict_spd,
-        allow_semidefinite,
-    )?;
-
-    let mut penalty_term = Array1::<f64>::zeros(rho_current.len());
-    let mut logdet_h_explicit_term = Array1::<f64>::zeros(rho_current.len());
-    let mut logdet_h_implicit_term = Array1::<f64>::zeros(rho_current.len());
-    let mut logdet_s_term = Array1::<f64>::zeros(rho_current.len());
-    let mut u_terms = Vec::with_capacity(rho_current.len());
-    let mut at = 0usize;
-    for b in 0..specs.len() {
-        let spec = &specs[b];
-        let (start, end) = ranges[b];
-        let beta_block = beta_flat.slice(ndarray::s![start..end]).to_owned();
-        let lambdas = per_block[b].mapv(f64::exp);
-        for (k, s_k) in spec.penalties.iter().enumerate() {
-            let mut a_k = Array2::<f64>::zeros((total, total));
-            let local = s_k.mapv(|v| lambdas[k] * v);
-            a_k.slice_mut(ndarray::s![start..end, start..end])
-                .assign(&local);
-            let a_k_beta = a_k.dot(&beta_flat);
-            let g_pen = 0.5 * beta_block.dot(&local.dot(&beta_block));
-            let rhs_k = -&a_k_beta;
-            let u_k = solve_mode_sensitivity(
-                &j_joint,
-                &rhs_k,
-                joint_tangent_basis.as_ref(),
-                strict_spd,
-                allow_semidefinite,
-                options,
-                "debug joint mode sensitivity system",
-            )?;
-            u_terms.push(u_k.clone());
-            let g_log_s = if include_logdet_s {
-                0.5 * trace_product(
-                    s_pinv_joint
-                        .as_ref()
-                        .ok_or_else(|| "missing joint S^+ for debug gradient".to_string())?,
-                    &a_k,
-                )
-            } else {
-                0.0
-            };
-            let g_log_h_explicit = if include_logdet_h {
-                0.5 * trace_product(&h_inv, &a_k)
-            } else {
-                0.0
-            };
-            let g_log_h_implicit = if include_logdet_h && u_k.dot(&u_k).sqrt() > 1e-14 {
-                let h_rho = family
-                    .exact_newton_joint_hessian_directional_derivative(&synced_joint_states, &u_k)?
-                    .ok_or_else(|| {
-                        "joint exact-newton dH unavailable for debug outer gradient".to_string()
-                    })?;
-                0.5 * trace_product(&h_inv, &h_rho)
-            } else {
-                0.0
-            };
-            penalty_term[at + k] = g_pen;
-            logdet_h_explicit_term[at + k] = g_log_h_explicit;
-            logdet_h_implicit_term[at + k] = g_log_h_implicit;
-            logdet_s_term[at + k] = g_log_s;
-        }
-        at += spec.penalties.len();
-    }
-
-    Ok(ExactNewtonRhoGradientDebug {
-        objective,
-        penalty_term,
-        logdet_h_explicit_term,
-        logdet_h_implicit_term,
-        logdet_s_term,
-        beta_flat,
-        stationarity_inf,
-        u_terms,
-    })
-}
-
 fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
     let mut out = Vec::with_capacity(specs.len());
     let mut at = 0usize;
@@ -4096,7 +3875,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     let lower = Array1::<f64>::from_elem(rho0.len(), -30.0);
     let upper = Array1::<f64>::from_elem(rho0.len(), 30.0);
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
-    let objective = CachedSecondOrderObjective::new(
+    let objective = CachedFirstOrderObjective::new(
         |x: &Array1<f64>| {
             let cached = warm_cache.lock().ok().and_then(|g| g.clone());
             let (obj, grad, hess_opt) = match outer_objective_gradient_hessian(
@@ -4159,17 +3938,17 @@ pub fn fit_custom_family<F: CustomFamily>(
                 }
             };
             last_eval = Some((x.clone(), obj, grad.clone(), hess_opt.clone()));
-            Ok((obj, grad, hess_opt))
+            Ok((obj, grad))
         },
-        1e-4,
     );
-    let mut solver = NewtonTrustRegion::new(rho0.clone(), objective)
+    let mut solver = Bfgs::new(rho0.clone(), objective)
         .with_bounds(
             Bounds::new(lower, upper, 1e-6).expect("custom-family rho bounds must be valid"),
         )
         .with_tolerance(
             Tolerance::new(options.outer_tol).expect("custom-family tolerance must be valid"),
         )
+        .with_profile(opt::Profile::Aggressive)
         .with_max_iterations(
             MaxIterations::new(options.outer_max_iter)
                 .expect("custom-family max iterations must be valid"),
@@ -4184,7 +3963,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     };
     let sol = match solver.run() {
         Ok(sol) => sol,
-        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
+        Err(BfgsError::MaxIterationsReached { last_solution }) => {
             if last_solution.final_value.is_finite()
                 && last_solution.final_gradient_norm.is_finite()
             {
@@ -4198,6 +3977,25 @@ pub fn fit_custom_family<F: CustomFamily>(
             } else {
                 return Err(format!(
                     "outer smoothing optimization failed: MaxIterationsReached.{details}",
+                    details = last_eval_error()
+                )
+                .into());
+            }
+        }
+        Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
+            if last_solution.final_value.is_finite()
+                && last_solution.final_gradient_norm.is_finite()
+            {
+                log::warn!(
+                    "Outer smoothing line search failed; using best-so-far solution (iter={}, f={:.6e}, ||g||={:.3e}).",
+                    last_solution.iterations,
+                    last_solution.final_value,
+                    last_solution.final_gradient_norm
+                );
+                *last_solution
+            } else {
+                return Err(format!(
+                    "outer smoothing optimization failed: LineSearchFailed.{details}",
                     details = last_eval_error()
                 )
                 .into());

@@ -2963,9 +2963,36 @@ fn build_survival_time_basis(
                 );
             }
 
-            let p_time = p_time_full;
-            let x_entry_time = x_entry_time_full.to_owned();
-            let x_exit_time = x_exit_time_full.to_owned();
+            let constant_tol = 1e-12_f64;
+            let mut keep_cols: Vec<usize> = Vec::new();
+            for j in 0..p_time_full {
+                let mut min_v = f64::INFINITY;
+                let mut max_v = f64::NEG_INFINITY;
+                for i in 0..n {
+                    let ve = x_exit_time_full[[i, j]];
+                    let vs = x_entry_time_full[[i, j]];
+                    min_v = min_v.min(ve.min(vs));
+                    max_v = max_v.max(ve.max(vs));
+                }
+                if (max_v - min_v) > constant_tol {
+                    keep_cols.push(j);
+                }
+            }
+            if keep_cols.is_empty() {
+                return Err(
+                    "internal error: ispline basis has no shape-varying time columns".to_string(),
+                );
+            }
+
+            let p_time = keep_cols.len();
+            let mut x_entry_time = Array2::<f64>::zeros((n, p_time));
+            let mut x_exit_time = Array2::<f64>::zeros((n, p_time));
+            for i in 0..n {
+                for (j_new, &j_old) in keep_cols.iter().enumerate() {
+                    x_entry_time[[i, j_new]] = x_entry_time_full[[i, j_old]];
+                    x_exit_time[[i, j_new]] = x_exit_time_full[[i, j_old]];
+                }
+            }
 
             // For I_j(log t) = sum_{m=j..} B_m(log t), derivative in log-time is
             // dI_j/dlogt = sum_{m=j..} dB_m/dlogt. Then apply dlogt/dt = 1/t.
@@ -2973,13 +3000,15 @@ fn build_survival_time_basis(
             for i in 0..n {
                 let mut running = 0.0_f64;
                 let mut d_i_log = vec![0.0_f64; p_time];
+                let mut d_i_log_full = vec![0.0_f64; p_time_full];
                 for j in (1..db_exit.ncols()).rev() {
                     running += db_exit[[i, j]];
-                    d_i_log[j - 1] = running;
+                    d_i_log_full[j - 1] = running;
                 }
                 let chain = 1.0 / age_exit[i].max(1e-9);
-                for j in 0..p_time {
-                    x_derivative_time[[i, j]] = d_i_log[j] * chain;
+                for (j_new, &j_old) in keep_cols.iter().enumerate() {
+                    d_i_log[j_new] = d_i_log_full[j_old];
+                    x_derivative_time[[i, j_new]] = d_i_log[j_new] * chain;
                 }
             }
 
@@ -2997,15 +3026,22 @@ fn build_survival_time_basis(
                 },
             )
             .map_err(|e| format!("failed to build ispline smoothing penalty: {e}"))?;
-            if penalty_basis.design.ncols() != p_time_full {
+            if penalty_basis.design.ncols() != p_time_full + 1 {
                 return Err("internal error: ispline penalty dimension mismatch".to_string());
             }
             let mut penalties = Vec::<Array2<f64>>::new();
             for s in &penalty_basis.penalties {
-                if s.nrows() != p_time_full || s.ncols() != p_time_full {
+                if s.nrows() != p_time_full + 1 || s.ncols() != p_time_full + 1 {
                     continue;
                 }
-                penalties.push(s.clone());
+                let reduced = s.slice(ndarray::s![1.., 1..]).to_owned();
+                let mut local = Array2::<f64>::zeros((p_time, p_time));
+                for (i_new, &i_old) in keep_cols.iter().enumerate() {
+                    for (j_new, &j_old) in keep_cols.iter().enumerate() {
+                        local[[i_new, j_new]] = reduced[[i_old, j_old]];
+                    }
+                }
+                penalties.push(local);
             }
 
             Ok(SurvivalTimeBuildOutput {
@@ -9136,9 +9172,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_formula_rejects_duchon_double_penalty_option() {
-        let err = parse_formula("y ~ s(pc1, pc2, type=duchon, double_penalty=false)")
-            .expect_err("duchon double_penalty should be rejected");
+    fn build_term_spec_rejects_duchon_double_penalty_option() {
+        let parsed = parse_formula("y ~ s(pc1, pc2, type=duchon, double_penalty=false)")
+            .expect("formula should parse before basis validation");
+        let ds = Dataset {
+            headers: vec!["pc1".to_string(), "pc2".to_string()],
+            values: array![[0.1, 0.2], [0.2, 0.3], [0.3, 0.4]],
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "pc1".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "pc2".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Continuous],
+        };
+        let col_map = HashMap::from([("pc1".to_string(), 0usize), ("pc2".to_string(), 1usize)]);
+        let mut inference_notes = Vec::<String>::new();
+        let err = super::build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)
+            .expect_err("duchon double_penalty should be rejected at basis-build time");
         assert!(err.contains("duchon smooths always include nullspace shrinkage"));
     }
 
@@ -9519,6 +9578,13 @@ mod tests {
         .expect("build bspline derivative for derivative check");
         let db_exit = db_exit.as_ref();
         let p_time = built.x_exit_time.ncols();
+        let (exit_full, _) = create_basis::<Dense>(
+            log_exit.view(),
+            KnotSource::Provided(knots.view()),
+            degree,
+            BasisOptions::i_spline(),
+        )
+        .expect("build ispline exit basis for keep-cols");
         let log_entry = age_entry.mapv(|t| t.max(1e-9).ln());
         let (entry_full, _) = create_basis::<Dense>(
             log_entry.view(),
@@ -9527,28 +9593,35 @@ mod tests {
             BasisOptions::i_spline(),
         )
         .expect("build ispline entry basis for keep-cols");
-        let (exit_full, _) = create_basis::<Dense>(
-            log_exit.view(),
-            KnotSource::Provided(knots.view()),
-            degree,
-            BasisOptions::i_spline(),
-        )
-        .expect("build ispline exit basis for keep-cols");
         let entry_full = entry_full.as_ref();
         let exit_full = exit_full.as_ref();
 
-        assert_eq!(p_time, exit_full.ncols());
-        assert_eq!(db_exit.ncols(), p_time + 1);
+        let mut keep_cols: Vec<usize> = Vec::new();
+        for j in 0..exit_full.ncols() {
+            let mut min_v = f64::INFINITY;
+            let mut max_v = f64::NEG_INFINITY;
+            for i in 0..entry_full.nrows() {
+                let ve = exit_full[[i, j]];
+                let vs = entry_full[[i, j]];
+                min_v = min_v.min(ve.min(vs));
+                max_v = max_v.max(ve.max(vs));
+            }
+            if (max_v - min_v) > 1e-12 {
+                keep_cols.push(j);
+            }
+        }
+        assert_eq!(p_time, keep_cols.len());
+        assert_eq!(db_exit.ncols(), exit_full.ncols() + 1);
         for i in 0..age_exit.len() {
             let mut running = 0.0_f64;
-            let mut d_i = vec![0.0_f64; p_time];
+            let mut d_i_full = vec![0.0_f64; exit_full.ncols()];
             for j in (1..db_exit.ncols()).rev() {
                 running += db_exit[[i, j]];
-                d_i[j - 1] = running;
+                d_i_full[j - 1] = running;
             }
             let chain = 1.0 / age_exit[i].max(1e-9);
             for j in 0..p_time {
-                let expected = d_i[j] * chain;
+                let expected = d_i_full[keep_cols[j]] * chain;
                 assert!((built.x_derivative_time[[i, j]] - expected).abs() <= 1e-12);
             }
         }

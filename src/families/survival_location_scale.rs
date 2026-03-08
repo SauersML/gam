@@ -710,6 +710,34 @@ impl SurvivalLocationScaleFamily {
             ));
         }
 
+        // With
+        //
+        //   ell = w [ d(log f(u1) + log g) + (1-d) log S(u1) - log S(u0) ],
+        //   u0 = q - h0,
+        //   u1 = q - h1,
+        //
+        // the rowwise derivatives from the audit are
+        //
+        //   ell_q   = w [ r(u0) + d d/du log f(u1) - (1-d) r(u1) ]
+        //   ell_qq  = w [ r'(u0) + d d²/du² log f(u1) - (1-d) r'(u1) ]
+        //   ell_qqq = w [ r''(u0) + d d³/du³ log f(u1) - (1-d) r''(u1) ]
+        //
+        // where r(u) = f(u) / S(u) = d/du[-log S(u)].
+        //
+        // The time-side partials follow from u0 = q - h0 and u1 = q - h1:
+        //
+        //   ell_h0   = -w r(u0)
+        //   ell_h1   = -w [ d d/du log f(u1) - (1-d) r(u1) ]
+        //   ell_h0q  = -w r'(u0)
+        //   ell_h1q  = -w [ d d²/du² log f(u1) - (1-d) r'(u1) ]
+        //
+        // so the exact identities
+        //
+        //   ell_q  = -ell_h0 - ell_h1
+        //   ell_qq = -ell_h0q - ell_h1q
+        //
+        // should hold rowwise for every inverse link. The permanent tests below
+        // lock those identities in directly.
         let d1_q = w * (r0 + d * dlogphi1 + (1.0 - d) * (-r1));
         let d2_q = w * (dr0 + d * d2logphi1 + (1.0 - d) * (-dr1));
         let d3_q = w * (ddr0 + d * d3logphi1 + (1.0 - d) * (-ddr1));
@@ -3549,6 +3577,58 @@ mod tests {
                     analytic[j],
                     fd[j],
                     abs
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row_derivative_identities_hold_for_non_probit_links() {
+        let beta_time = array![0.8153913537182474];
+        let beta_threshold = array![0.35];
+        let beta_log_sigma = array![0.4];
+
+        for (label, inverse_link) in survival_non_probit_test_links() {
+            let family = survival_exact_newton_test_family_with_inverse_link(inverse_link);
+            let states =
+                survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+            let (h0, h1, d_raw, eta_t_full, eta_ls_full, eta_w) =
+                family.validate_joint_states(&states).expect("joint states");
+            let (sigma, _, _, _) = exp_sigma_derivs_up_to_third(eta_ls_full.view());
+
+            for i in 0..family.n {
+                let state = family.row_predictor_state(
+                    h0[i],
+                    h1[i],
+                    d_raw[i],
+                    eta_t_full[i],
+                    sigma[i],
+                    eta_w.map(|w| w[i]),
+                );
+                let row = family
+                    .row_derivatives(i, state)
+                    .expect("row derivatives")
+                    .expect("active row");
+
+                let ell_h0 = row.grad_time_eta_h0;
+                let ell_h1 = row.grad_time_eta_h1;
+                let ell_q = row.d1_q;
+                let ell_h0q = row.h_time_h0;
+                let ell_h1q = row.h_time_h1;
+                let ell_qq = row.d2_q;
+                assert!(
+                    (ell_q + ell_h0 + ell_h1).abs() <= 1e-10,
+                    "survival {label} row {i} violated ell_q = -ell_h0 - ell_h1: q={} h0={} h1={}",
+                    ell_q,
+                    ell_h0,
+                    ell_h1
+                );
+                assert!(
+                    (ell_qq + ell_h0q + ell_h1q).abs() <= 1e-10,
+                    "survival {label} row {i} violated ell_qq = -ell_h0q - ell_h1q: qq={} h0q={} h1q={}",
+                    ell_qq,
+                    ell_h0q,
+                    ell_h1q
                 );
             }
         }
