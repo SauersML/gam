@@ -3,8 +3,8 @@ use crate::custom_family::{
     ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
 use crate::faer_ndarray::{FaerSvd, fast_xt_diag_x};
-use crate::families::sigma_link::{
-    bounded_sigma_derivs_up_to_third, bounded_sigma_derivs_up_to_third_scalar,
+use crate::families::scale_design::{
+    apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
 use crate::mixture_link::{
@@ -15,7 +15,21 @@ use crate::probability::{normal_cdf, normal_pdf};
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, s};
 
-const MIN_PROB: f64 = 1e-12;
+const MIN_PROB: f64 = 1e-300;
+
+#[inline]
+fn exp_sigma_derivs_up_to_third(
+    eta: ndarray::ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+    let sigma = eta.mapv(f64::exp);
+    (sigma.clone(), sigma.clone(), sigma.clone(), sigma)
+}
+
+#[inline]
+fn exp_sigma_derivs_up_to_third_scalar(eta: f64) -> (f64, f64, f64, f64) {
+    let sigma = eta.exp();
+    (sigma, sigma, sigma, sigma)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidualDistribution {
@@ -194,8 +208,6 @@ pub struct SurvivalLocationScaleSpec {
     pub age_exit: Array1<f64>,
     pub event_target: Array1<f64>,
     pub weights: Array1<f64>,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub inverse_link: InverseLink,
     pub derivative_guard: f64,
     pub derivative_softness: f64,
@@ -239,8 +251,6 @@ pub struct SurvivalLocationScalePredictInput {
     pub x_log_sigma: DesignMatrix,
     pub eta_log_sigma_offset: Array1<f64>,
     pub x_link_wiggle: Option<DesignMatrix>,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub inverse_link: InverseLink,
 }
 
@@ -262,8 +272,6 @@ struct SurvivalLocationScaleFamily {
     n: usize,
     y: Array1<f64>,
     w: Array1<f64>,
-    sigma_min: f64,
-    sigma_max: f64,
     inverse_link: InverseLink,
     derivative_guard: f64,
     derivative_softness: f64,
@@ -409,8 +417,7 @@ impl SurvivalLocationScaleFamily {
     ) -> Result<SurvivalJointQuantities, String> {
         let n = self.n;
         let (h0, h1, d_raw, eta_t, eta_ls, eta_w) = self.validate_joint_states(block_states)?;
-        let (sigma, ds, d2s, d3s) =
-            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
         let mut d3_q = Array1::<f64>::zeros(n);
@@ -1264,8 +1271,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let n = self.n;
         let (h0, h1, d_raw, eta_t, eta_ls, eta_w) = self.validate_joint_states(block_states)?;
-        let (sigma, ds, d2s, _d3s) =
-            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, _d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
         let mut ll = 0.0;
 
         let mut grad_time_eta_h0 = Array1::<f64>::zeros(n);
@@ -1376,8 +1382,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         let n = self.n;
         let (h0, h1, d_raw, eta_t, eta_ls, eta_w) = self.validate_joint_states(block_states)?;
-        let (sigma, ds, d2s, d3s) =
-            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
         let mut d3_q = Array1::<f64>::zeros(n);
@@ -1833,17 +1838,6 @@ pub fn fit_survival_location_scale(
     if spec.age_entry.len() != n || spec.age_exit.len() != n || spec.weights.len() != n {
         return Err("fit_survival_location_scale: top-level input size mismatch".to_string());
     }
-    if !spec.sigma_min.is_finite()
-        || !spec.sigma_max.is_finite()
-        || spec.sigma_min <= 0.0
-        || spec.sigma_max <= 0.0
-        || spec.sigma_min >= spec.sigma_max
-    {
-        return Err(format!(
-            "fit_survival_location_scale: invalid sigma bounds (min={}, max={})",
-            spec.sigma_min, spec.sigma_max
-        ));
-    }
     if !(spec.tol.is_finite() && spec.tol > 0.0) {
         return Err(format!(
             "fit_survival_location_scale: invalid tol {}",
@@ -1925,9 +1919,33 @@ pub fn fit_survival_location_scale(
         )?,
         initial_beta: spec.threshold_block.initial_beta.clone(),
     };
+    let time_primary_design = time_prepared.design_exit.clone();
+    let threshold_primary_design = spec.threshold_block.design.to_dense();
+    let mut survival_primary_design = Array2::<f64>::zeros((
+        n,
+        time_primary_design.ncols() + threshold_primary_design.ncols(),
+    ));
+    survival_primary_design
+        .slice_mut(s![.., 0..time_primary_design.ncols()])
+        .assign(&time_primary_design);
+    survival_primary_design
+        .slice_mut(s![.., time_primary_design.ncols()..])
+        .assign(&threshold_primary_design);
+    let raw_log_sigma_design = spec.log_sigma_block.design.to_dense();
+    let non_intercept_start = infer_non_intercept_start(&raw_log_sigma_design, &spec.weights);
+    let log_sigma_design = apply_scale_deviation_transform(
+        &survival_primary_design,
+        &raw_log_sigma_design,
+        &build_scale_deviation_transform(
+            &survival_primary_design,
+            &raw_log_sigma_design,
+            &spec.weights,
+            non_intercept_start,
+        )?,
+    )?;
     let log_sigma_spec = ParameterBlockSpec {
         name: "log_sigma".to_string(),
-        design: spec.log_sigma_block.design.clone(),
+        design: DesignMatrix::Dense(log_sigma_design.clone()),
         offset: spec.log_sigma_block.offset.clone(),
         penalties: spec.log_sigma_block.penalties.clone(),
         initial_log_lambdas: initial_log_lambdas(
@@ -1953,8 +1971,6 @@ pub fn fit_survival_location_scale(
         n,
         y: spec.event_target,
         w: spec.weights,
-        sigma_min: spec.sigma_min,
-        sigma_max: spec.sigma_max,
         inverse_link: spec.inverse_link,
         derivative_guard: spec.derivative_guard,
         derivative_softness: spec.derivative_softness,
@@ -1963,7 +1979,7 @@ pub fn fit_survival_location_scale(
         x_time_deriv: time_prepared.design_derivative_exit,
         offset_time_deriv: spec.time_block.derivative_offset_exit.clone(),
         x_threshold: spec.threshold_block.design.clone(),
-        x_log_sigma: spec.log_sigma_block.design.clone(),
+        x_log_sigma: DesignMatrix::Dense(log_sigma_design),
         x_link_wiggle: wiggle_spec.as_ref().map(|s| s.design.clone()),
     };
 
@@ -2057,11 +2073,7 @@ pub fn predict_survival_location_scale(
 ) -> Result<SurvivalLocationScalePredictResult, String> {
     let predictors = prediction_linear_predictors(input, fit)?;
     let n = input.x_time_exit.nrows();
-    let (sigma, _, _, _) = bounded_sigma_derivs_up_to_third(
-        predictors.eta_ls.view(),
-        input.sigma_min,
-        input.sigma_max,
-    );
+    let (sigma, _, _, _) = exp_sigma_derivs_up_to_third(predictors.eta_ls.view());
     let eta = Array1::from_iter(
         predictors
             .h
@@ -2302,13 +2314,7 @@ pub fn predict_survival_location_scale_posterior_mean(
                 ],
                 11,
                 |x| {
-                    let sigma = bounded_sigma_derivs_up_to_third_scalar(
-                        x[2],
-                        input.sigma_min,
-                        input.sigma_max,
-                    )
-                    .0
-                    .max(1e-12);
+                    let sigma = exp_sigma_derivs_up_to_third_scalar(x[2]).0.max(1e-12);
                     inverse_link_survival_prob_value(
                         &input.inverse_link,
                         -x[0] - x[1] / sigma + x[3],
@@ -2326,13 +2332,7 @@ pub fn predict_survival_location_scale_posterior_mean(
                     [cov_hl_rows[i], cov_tl_rows[i], var_ls_rows[i]],
                 ],
                 |h, t, ls| {
-                    let sigma = bounded_sigma_derivs_up_to_third_scalar(
-                        ls,
-                        input.sigma_min,
-                        input.sigma_max,
-                    )
-                    .0
-                    .max(1e-12);
+                    let sigma = exp_sigma_derivs_up_to_third_scalar(ls).0.max(1e-12);
                     inverse_link_survival_prob_value(&input.inverse_link, -h - t / sigma)
                 },
             )
@@ -2378,10 +2378,7 @@ pub fn predict_survival_location_scale_posterior_mean(
             {
                 return fallback_row(i);
             }
-            let sigma =
-                bounded_sigma_derivs_up_to_third_scalar(mu_l_i, input.sigma_min, input.sigma_max)
-                    .0
-                    .max(1e-12);
+            let sigma = exp_sigma_derivs_up_to_third_scalar(mu_l_i).0.max(1e-12);
             let q_l = 1.0 / sigma;
             let mu_base = -mu_h[i] - q_l * mu_t[i] + mu_w_i;
             let var_base = var_h + q_l * q_l * var_t + var_w_i + 2.0 * q_l * cov_ht_i
@@ -2393,10 +2390,7 @@ pub fn predict_survival_location_scale_posterior_mean(
         }
 
         crate::quadrature::normal_expectation_1d_adaptive(&quad_ctx, mu_l_i, var_ls.sqrt(), |ls| {
-            let sigma =
-                bounded_sigma_derivs_up_to_third_scalar(ls, input.sigma_min, input.sigma_max)
-                    .0
-                    .max(1e-12);
+            let sigma = exp_sigma_derivs_up_to_third_scalar(ls).0.max(1e-12);
             let q_l = 1.0 / sigma;
             let delta_l = ls - mu_l_i;
             let mu_base = -mu_h[i] - q_l * mu_t[i] + mu_w_i;
@@ -2472,11 +2466,7 @@ pub fn predict_survival_location_scale_with_uncertainty(
         }
     }
 
-    let (sigma, ds, _, _) = bounded_sigma_derivs_up_to_third(
-        predictors.eta_ls.view(),
-        input.sigma_min,
-        input.sigma_max,
-    );
+    let (sigma, ds, _, _) = exp_sigma_derivs_up_to_third(predictors.eta_ls.view());
 
     let cov_hh = covariance.slice(s![0..p_time, 0..p_time]).to_owned();
     let cov_tt = covariance
@@ -2616,7 +2606,9 @@ fn var_h_row(i: usize, input: &SurvivalLocationScalePredictInput, xh_hh: &Array2
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_family::evaluate_custom_family_joint_hyper;
+    use crate::custom_family::{
+        debug_exact_newton_rho_gradient_terms, evaluate_custom_family_joint_hyper,
+    };
     use crate::mixture_link::{
         state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec,
     };
@@ -2645,8 +2637,6 @@ mod tests {
             n: 3,
             y: array![1.0, 0.0, 1.0],
             w: array![1.0, 0.8, 1.2],
-            sigma_min: 0.3,
-            sigma_max: 2.5,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
             derivative_guard: 1e-8,
             derivative_softness: 1e-6,
@@ -3203,6 +3193,57 @@ mod tests {
     }
 
     #[test]
+    fn log_sigma_exact_newton_hessian_matches_negative_gradient_jacobian() {
+        let family =
+            survival_exact_newton_test_family_with_inverse_link(
+                residual_distribution_inverse_link(ResidualDistribution::Logistic),
+            );
+        let beta_time = array![0.2];
+        let beta_threshold = array![0.35];
+        let beta_log_sigma = array![-0.15];
+        let states =
+            survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+        let eval = family.evaluate(&states).expect("evaluate at center");
+        let BlockWorkingSet::ExactNewton { hessian, .. } =
+            &eval.block_working_sets[SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA]
+        else {
+            panic!("log-sigma block should use exact newton");
+        };
+        let hessian = hessian.to_dense();
+
+        let eps = 1e-6;
+        let grad_at = |beta_ls: f64| -> f64 {
+            let eval = family
+                .evaluate(&survival_exact_newton_rebuild_states(
+                    &beta_time,
+                    &beta_threshold,
+                    &array![beta_ls],
+                ))
+                .expect("evaluate shifted log-sigma");
+            match &eval.block_working_sets[SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA] {
+                BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+                _ => panic!("log-sigma block should use exact newton"),
+            }
+        };
+        let fd_neg_grad_jac =
+            -(grad_at(beta_log_sigma[0] + eps) - grad_at(beta_log_sigma[0] - eps)) / (2.0 * eps);
+
+        assert_eq!(
+            hessian[[0, 0]].signum(),
+            fd_neg_grad_jac.signum(),
+            "log-sigma Hessian sign mismatch: analytic={} fd={}",
+            hessian[[0, 0]],
+            fd_neg_grad_jac
+        );
+        assert!(
+            (hessian[[0, 0]] - fd_neg_grad_jac).abs() <= 1e-5,
+            "log-sigma Hessian mismatch: analytic={} fd={}",
+            hessian[[0, 0]],
+            fd_neg_grad_jac
+        );
+    }
+
+    #[test]
     fn exact_newton_block_directional_derivatives_match_fd_for_non_probit_links() {
         let extract_hessian = |eval: FamilyEvaluation, block_idx: usize| -> Array2<f64> {
             match &eval.block_working_sets[block_idx] {
@@ -3349,6 +3390,249 @@ mod tests {
     }
 
     #[test]
+    fn joint_exact_newton_score_matches_loglikelihood_fd_for_non_probit_links() {
+        let beta_time = array![0.2];
+        let beta_threshold = array![0.35];
+        let beta_log_sigma = array![-0.15];
+        let eps = 1e-6;
+
+        for (label, inverse_link) in survival_non_probit_test_links() {
+            let family = survival_exact_newton_test_family_with_inverse_link(inverse_link);
+            let states =
+                survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+            let eval = family.evaluate(&states).expect("evaluate");
+            let analytic = Array1::from_vec(vec![
+                match &eval.block_working_sets[SurvivalLocationScaleFamily::BLOCK_TIME] {
+                    BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+                    _ => panic!("expected exact newton block"),
+                },
+                match &eval.block_working_sets[SurvivalLocationScaleFamily::BLOCK_THRESHOLD] {
+                    BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+                    _ => panic!("expected exact newton block"),
+                },
+                match &eval.block_working_sets[SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA] {
+                    BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+                    _ => panic!("expected exact newton block"),
+                },
+            ]);
+
+            let objective = |bt: &Array1<f64>, bth: &Array1<f64>, bls: &Array1<f64>| -> f64 {
+                family
+                    .evaluate(&survival_exact_newton_rebuild_states(bt, bth, bls))
+                    .expect("eval objective")
+                    .log_likelihood
+            };
+
+            let mut fd = Array1::<f64>::zeros(3);
+            fd[0] = (objective(
+                &array![beta_time[0] + eps],
+                &beta_threshold,
+                &beta_log_sigma,
+            ) - objective(
+                &array![beta_time[0] - eps],
+                &beta_threshold,
+                &beta_log_sigma,
+            )) / (2.0 * eps);
+            fd[1] = (objective(
+                &beta_time,
+                &array![beta_threshold[0] + eps],
+                &beta_log_sigma,
+            ) - objective(
+                &beta_time,
+                &array![beta_threshold[0] - eps],
+                &beta_log_sigma,
+            )) / (2.0 * eps);
+            fd[2] = (objective(
+                &beta_time,
+                &beta_threshold,
+                &array![beta_log_sigma[0] + eps],
+            ) - objective(
+                &beta_time,
+                &beta_threshold,
+                &array![beta_log_sigma[0] - eps],
+            )) / (2.0 * eps);
+
+            if label == "cloglog-near-fit" {
+                let fp = objective(&array![beta_time[0] + eps], &beta_threshold, &beta_log_sigma);
+                let fm = objective(&array![beta_time[0] - eps], &beta_threshold, &beta_log_sigma);
+                eprintln!(
+                    "cloglog near-fit full objective fp={} fm={} fd0={} analytic0={}",
+                    fp,
+                    fm,
+                    fd[0],
+                    analytic[0]
+                );
+            }
+
+            for j in 0..3 {
+                let abs = (analytic[j] - fd[j]).abs();
+                if label == "cloglog-near-fit" && j == 0 && analytic[j].signum() != fd[j].signum() {
+                    let (h0, h1, d_raw, eta_t_full, eta_ls_full, eta_w) =
+                        family.validate_joint_states(&states).expect("joint states");
+                    let (sigma, _, _, _) = exp_sigma_derivs_up_to_third(eta_ls_full.view());
+                    for i in 0..family.n {
+                        let state = family.row_predictor_state(
+                            h0[i],
+                            h1[i],
+                            d_raw[i],
+                            eta_t_full[i],
+                            sigma[i],
+                            eta_w.map(|w| w[i]),
+                        );
+                        let row = family
+                            .row_derivatives(i, state)
+                            .expect("row derivatives")
+                            .expect("active row");
+                        let analytic_row = row.grad_time_eta_h0 * family.x_time_entry[[i, 0]]
+                            + row.grad_time_eta_h1 * family.x_time_exit[[i, 0]]
+                            + row.grad_time_eta_d * family.x_time_deriv[[i, 0]];
+                        let row_obj = |beta_time_scalar: f64| -> f64 {
+                            let state = family.row_predictor_state(
+                                family.x_time_entry[[i, 0]] * beta_time_scalar,
+                                family.x_time_exit[[i, 0]] * beta_time_scalar,
+                                family.x_time_deriv[[i, 0]] * beta_time_scalar
+                                    + family.offset_time_deriv[i],
+                                eta_t_full[i],
+                                sigma[i],
+                                eta_w.map(|w| w[i]),
+                            );
+                            family
+                                .row_derivatives(i, state)
+                                .expect("row objective derivs")
+                                .expect("active row")
+                                .ll
+                        };
+                        let fd_row = (row_obj(beta_time[0] + eps) - row_obj(beta_time[0] - eps))
+                            / (2.0 * eps);
+                        println!(
+                            "cloglog near-fit row {i}: analytic_row={} fd_row={} h0={} h1={} d={} eta_t={} sigma={} y={} w={}",
+                            analytic_row,
+                            fd_row,
+                            h0[i],
+                            h1[i],
+                            d_raw[i],
+                            eta_t_full[i],
+                            sigma[i],
+                            family.y[i],
+                            family.w[i]
+                        );
+                    }
+                }
+                assert_eq!(
+                    analytic[j].signum(),
+                    fd[j].signum(),
+                    "survival {label} joint score sign mismatch at {j}: analytic={} fd={}",
+                    analytic[j],
+                    fd[j]
+                );
+                assert!(
+                    abs <= 1e-5,
+                    "survival {label} joint score mismatch at {j}: analytic={} fd={} abs={}",
+                    analytic[j],
+                    fd[j],
+                    abs
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn joint_exact_newton_score_matches_loglikelihood_fd_near_fitted_non_probit_points() {
+        let eps = 1e-6;
+        let cases = vec![
+            (
+                "logistic-near-fit",
+                residual_distribution_inverse_link(ResidualDistribution::Logistic),
+                array![0.7746886451475979],
+                array![-0.6407086184606554],
+                array![-0.15],
+            ),
+            (
+                "cloglog-near-fit",
+                residual_distribution_inverse_link(ResidualDistribution::Gumbel),
+                array![0.8153913537182474],
+                array![14.123707996892579],
+                array![1.4355329717917449],
+            ),
+        ];
+
+        for (label, inverse_link, beta_time, beta_threshold, beta_log_sigma) in cases {
+            let family = survival_exact_newton_test_family_with_inverse_link(inverse_link);
+            let states =
+                survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+            let eval = family.evaluate(&states).expect("evaluate");
+            let analytic = Array1::from_vec(vec![
+                match &eval.block_working_sets[SurvivalLocationScaleFamily::BLOCK_TIME] {
+                    BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+                    _ => panic!("expected exact newton block"),
+                },
+                match &eval.block_working_sets[SurvivalLocationScaleFamily::BLOCK_THRESHOLD] {
+                    BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+                    _ => panic!("expected exact newton block"),
+                },
+                match &eval.block_working_sets[SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA] {
+                    BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+                    _ => panic!("expected exact newton block"),
+                },
+            ]);
+
+            let objective = |bt: &Array1<f64>, bth: &Array1<f64>, bls: &Array1<f64>| -> f64 {
+                family
+                    .evaluate(&survival_exact_newton_rebuild_states(bt, bth, bls))
+                    .expect("eval objective")
+                    .log_likelihood
+            };
+
+            let mut fd = Array1::<f64>::zeros(3);
+            fd[0] = (objective(
+                &array![beta_time[0] + eps],
+                &beta_threshold,
+                &beta_log_sigma,
+            ) - objective(
+                &array![beta_time[0] - eps],
+                &beta_threshold,
+                &beta_log_sigma,
+            )) / (2.0 * eps);
+            fd[1] = (objective(
+                &beta_time,
+                &array![beta_threshold[0] + eps],
+                &beta_log_sigma,
+            ) - objective(
+                &beta_time,
+                &array![beta_threshold[0] - eps],
+                &beta_log_sigma,
+            )) / (2.0 * eps);
+            fd[2] = (objective(
+                &beta_time,
+                &beta_threshold,
+                &array![beta_log_sigma[0] + eps],
+            ) - objective(
+                &beta_time,
+                &beta_threshold,
+                &array![beta_log_sigma[0] - eps],
+            )) / (2.0 * eps);
+
+            for j in 0..3 {
+                let abs = (analytic[j] - fd[j]).abs();
+                assert_eq!(
+                    analytic[j].signum(),
+                    fd[j].signum(),
+                    "survival {label} joint score sign mismatch at {j}: analytic={} fd={}",
+                    analytic[j],
+                    fd[j]
+                );
+                assert!(
+                    abs <= 5e-4,
+                    "survival {label} joint score mismatch at {j}: analytic={} fd={} abs={}",
+                    analytic[j],
+                    fd[j],
+                    abs
+                );
+            }
+        }
+    }
+
+    #[test]
     fn joint_exact_newton_hessian_directional_derivative_matches_fd_for_non_probit_links() {
         let beta_time = array![0.2];
         let beta_threshold = array![0.35];
@@ -3416,6 +3700,14 @@ mod tests {
             .expect("center outer objective/gradient");
             assert!(center.objective.is_finite());
             assert_eq!(center.gradient.len(), rho.len());
+            let debug_terms = debug_exact_newton_rho_gradient_terms(
+                &family,
+                &specs,
+                &options,
+                &rho,
+                None,
+            )
+            .expect("debug exact rho terms");
 
             for k in 0..rho.len() {
                 let mut rho_p = rho.clone();
@@ -3447,6 +3739,41 @@ mod tests {
                 let g_fd = (fp - fm) / (2.0 * h);
                 let abs_err = (center.gradient[k] - g_fd).abs();
                 let rel = abs_err / g_fd.abs().max(1e-8);
+                if abs_err >= 2e-4 && rel >= 2e-2 {
+                    let beta_p = debug_exact_newton_rho_gradient_terms(
+                        &family,
+                        &specs,
+                        &options,
+                        &rho_p,
+                        Some(&center.warm_start),
+                    )
+                    .expect("debug exact rho terms plus")
+                    .beta_flat;
+                    let beta_m = debug_exact_newton_rho_gradient_terms(
+                        &family,
+                        &specs,
+                        &options,
+                        &rho_m,
+                        Some(&center.warm_start),
+                    )
+                    .expect("debug exact rho terms minus")
+                    .beta_flat;
+                    let u_fd = (&beta_p - &beta_m) / (2.0 * h);
+                    println!(
+                        "outer survival {label} rho[{k}] beta={:?} stationarity_inf={} u_analytic={:?} u_fd={:?} objective={} analytic={} fd={} pen={} logh_exp={} logh_imp={} logs={}",
+                        debug_terms.beta_flat,
+                        debug_terms.stationarity_inf,
+                        debug_terms.u_terms[k],
+                        u_fd,
+                        debug_terms.objective,
+                        center.gradient[k],
+                        g_fd,
+                        debug_terms.penalty_term[k],
+                        debug_terms.logdet_h_explicit_term[k],
+                        debug_terms.logdet_h_implicit_term[k],
+                        debug_terms.logdet_s_term[k]
+                    );
+                }
                 assert_eq!(
                     center.gradient[k].signum(),
                     g_fd.signum(),
@@ -3470,6 +3797,7 @@ mod tests {
         }
     }
 
+
     #[test]
     fn posterior_mean_prediction_matches_deterministic_when_covariance_is_zero() {
         let input = SurvivalLocationScalePredictInput {
@@ -3480,8 +3808,6 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(array![[1.0, 0.3]]),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
-            sigma_min: 0.1,
-            sigma_max: 2.0,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let fit = SurvivalLocationScaleFitResult {
@@ -3600,16 +3926,13 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(array![[1.0, 0.3]]),
             eta_log_sigma_offset: array![0.4],
             x_link_wiggle: None,
-            sigma_min: 0.1,
-            sigma_max: 2.0,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let pred = predict_survival_location_scale(&input, &fit).expect("predict");
 
         let eta_t = array![1.0, -0.2].dot(&fit.beta_threshold) + input.eta_threshold_offset[0];
         let eta_ls = array![1.0, 0.3].dot(&fit.beta_log_sigma) + input.eta_log_sigma_offset[0];
-        let sigma =
-            bounded_sigma_derivs_up_to_third_scalar(eta_ls, input.sigma_min, input.sigma_max).0;
+        let sigma = exp_sigma_derivs_up_to_third_scalar(eta_ls).0;
         let h = array![1.0, 0.5].dot(&fit.beta_time) + input.eta_time_offset_exit[0];
         let expected_eta = -h - eta_t / sigma.max(1e-12);
         let expected_survival =
@@ -3649,8 +3972,6 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(x_log_sigma_dense.clone()),
             eta_log_sigma_offset: array![0.4, 0.1],
             x_link_wiggle: Some(DesignMatrix::Dense(x_wiggle_dense.clone())),
-            sigma_min: 0.1,
-            sigma_max: 2.0,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let sparse_input = SurvivalLocationScalePredictInput {
@@ -3735,8 +4056,6 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(array![[1.0, -0.15]]),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
-            sigma_min: 0.2,
-            sigma_max: 1.8,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let fit = SurvivalLocationScaleFitResult {
@@ -3802,8 +4121,7 @@ mod tests {
                 [cov_hl_i, cov_tl_i, var_ls],
             ],
             |h, t, ls| {
-                let sigma =
-                    bounded_sigma_derivs_up_to_third_scalar(ls, input.sigma_min, input.sigma_max).0;
+                let sigma = exp_sigma_derivs_up_to_third_scalar(ls).0;
                 (1.0 - normal_cdf(-h - t / sigma.max(1e-12))).clamp(0.0, 1.0)
             },
         );
@@ -3822,8 +4140,6 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(x_log_sigma_dense.clone()),
             eta_log_sigma_offset: array![0.0, -0.03],
             x_link_wiggle: None,
-            sigma_min: 0.2,
-            sigma_max: 1.8,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let sparse_input = SurvivalLocationScalePredictInput {
@@ -3878,8 +4194,6 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(array![[1.0, 0.3]]),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: Some(DesignMatrix::Dense(array![[1.0, 0.1]])),
-            sigma_min: 0.1,
-            sigma_max: 2.0,
             inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         };
         let fit = SurvivalLocationScaleFitResult {
@@ -3969,7 +4283,7 @@ mod tests {
             11,
             |x| {
                 let sigma =
-                    bounded_sigma_derivs_up_to_third_scalar(x[2], input.sigma_min, input.sigma_max)
+                    exp_sigma_derivs_up_to_third_scalar(x[2])
                         .0
                         .max(1e-12);
                 (1.0 - normal_cdf(-x[0] - x[1] / sigma + x[3])).clamp(0.0, 1.0)
@@ -4004,8 +4318,6 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(array![[1.0, 0.3]]),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
-            sigma_min: 0.1,
-            sigma_max: 2.0,
             inverse_link: InverseLink::Standard(LinkFunction::BetaLogistic),
         };
 
@@ -4041,8 +4353,6 @@ mod tests {
             x_log_sigma: DesignMatrix::Dense(array![[1.0, 0.3]]),
             eta_log_sigma_offset: array![0.0],
             x_link_wiggle: None,
-            sigma_min: 0.1,
-            sigma_max: 2.0,
             inverse_link: InverseLink::Standard(LinkFunction::Probit),
         };
 

@@ -59,6 +59,14 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub sigma_max: Option<f64>,
     #[serde(default)]
+    pub noise_projection: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
+    pub noise_center: Option<Vec<f64>>,
+    #[serde(default)]
+    pub noise_scale: Option<Vec<f64>>,
+    #[serde(default)]
+    pub noise_non_intercept_start: Option<usize>,
+    #[serde(default)]
     pub joint_beta_link: Option<Vec<f64>>,
     #[serde(default)]
     pub joint_knot_range: Option<(f64, f64)>,
@@ -117,6 +125,14 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub survival_beta_log_sigma: Option<Vec<f64>>,
     #[serde(default)]
+    pub survival_noise_projection: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
+    pub survival_noise_center: Option<Vec<f64>>,
+    #[serde(default)]
+    pub survival_noise_scale: Option<Vec<f64>>,
+    #[serde(default)]
+    pub survival_noise_non_intercept_start: Option<usize>,
+    #[serde(default)]
     pub survival_distribution: Option<String>,
     #[serde(default)]
     pub training_headers: Option<Vec<String>>,
@@ -151,6 +167,10 @@ impl FittedModelPayload {
             beta_noise: None,
             sigma_min: None,
             sigma_max: None,
+            noise_projection: None,
+            noise_center: None,
+            noise_scale: None,
+            noise_non_intercept_start: None,
             joint_beta_link: None,
             joint_knot_range: None,
             joint_knot_vector: None,
@@ -180,6 +200,10 @@ impl FittedModelPayload {
             survival_beta_time: None,
             survival_beta_threshold: None,
             survival_beta_log_sigma: None,
+            survival_noise_projection: None,
+            survival_noise_center: None,
+            survival_noise_scale: None,
+            survival_noise_non_intercept_start: None,
             survival_distribution: None,
             training_headers: None,
             resolved_term_spec: None,
@@ -670,6 +694,15 @@ impl FittedModel {
         if let Some(v) = self.beta_noise.as_ref() {
             validate_all_finite("beta_noise", v.iter().copied())?;
         }
+        if let Some(v) = self.noise_projection.as_ref() {
+            validate_all_finite("noise_projection", v.iter().flatten().copied())?;
+        }
+        if let Some(v) = self.noise_center.as_ref() {
+            validate_all_finite("noise_center", v.iter().copied())?;
+        }
+        if let Some(v) = self.noise_scale.as_ref() {
+            validate_all_finite("noise_scale", v.iter().copied())?;
+        }
         if let Some(v) = self.joint_beta_link.as_ref() {
             validate_all_finite("joint_beta_link", v.iter().copied())?;
         }
@@ -687,6 +720,15 @@ impl FittedModel {
         }
         if let Some(v) = self.survival_beta_log_sigma.as_ref() {
             validate_all_finite("survival_beta_log_sigma", v.iter().copied())?;
+        }
+        if let Some(v) = self.survival_noise_projection.as_ref() {
+            validate_all_finite("survival_noise_projection", v.iter().flatten().copied())?;
+        }
+        if let Some(v) = self.survival_noise_center.as_ref() {
+            validate_all_finite("survival_noise_center", v.iter().copied())?;
+        }
+        if let Some(v) = self.survival_noise_scale.as_ref() {
+            validate_all_finite("survival_noise_scale", v.iter().copied())?;
         }
         if let Some(v) = self.mixture_link_param_covariance.as_ref() {
             validate_all_finite("mixture_link_param_covariance", v.iter().flatten().copied())?;

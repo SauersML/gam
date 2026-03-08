@@ -9,8 +9,11 @@ use crate::custom_family::{
     ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
+use crate::families::scale_design::{
+    apply_scale_deviation_transform, build_scale_deviation_transform, infer_non_intercept_start,
+};
 use crate::families::sigma_link::{
-    SigmaJet1, bounded_sigma_derivs_up_to_third, bounded_sigma_eta_for_sigma_scalar,
+    SigmaJet1,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::{DesignMatrix, SymmetricMatrix, xt_diag_x_symmetric};
@@ -302,23 +305,6 @@ impl ParameterBlockInput {
     }
 }
 
-fn validate_sigma_bounds(sigma_min: f64, sigma_max: f64, context: &str) -> Result<(), String> {
-    if !sigma_min.is_finite() || !sigma_max.is_finite() {
-        return Err(format!("{context}: sigma bounds must be finite"));
-    }
-    if sigma_min <= 0.0 || sigma_max <= 0.0 {
-        return Err(format!(
-            "{context}: sigma bounds must be strictly positive (got min={sigma_min}, max={sigma_max})"
-        ));
-    }
-    if sigma_min > sigma_max {
-        return Err(format!(
-            "{context}: sigma_min ({sigma_min}) must be <= sigma_max ({sigma_max})"
-        ));
-    }
-    Ok(())
-}
-
 fn validate_len_match(name: &str, expected: usize, found: usize) -> Result<(), String> {
     if expected != found {
         return Err(format!(
@@ -482,7 +468,6 @@ fn validate_binomial_location_scale_term_spec(
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validate_weights(&spec.weights, context)?;
     validate_binomial_response(&spec.y, context)?;
-    validate_sigma_bounds(spec.sigma_min, spec.sigma_max, context)?;
     Ok(())
 }
 
@@ -496,7 +481,6 @@ fn validate_binomial_location_scale_wiggle_term_spec(
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validate_weights(&spec.weights, context)?;
     validate_binomial_response(&spec.y, context)?;
-    validate_sigma_bounds(spec.sigma_min, spec.sigma_max, context)?;
     validate_block_rows("wiggle", n, &spec.wiggle_block)?;
     if spec.wiggle_degree < 1 {
         return Err(format!(
@@ -799,87 +783,28 @@ fn weighted_prevalence(y: &Array1<f64>, weights: &Array1<f64>) -> f64 {
     (y_w_sum / w_sum).clamp(0.0, 1.0)
 }
 
-fn project_block_beta_to_weighted_eta_mean_zero(
-    beta: Array1<f64>,
-    spec: &ParameterBlockSpec,
+fn prepared_scale_design(
+    primary_design: &Array2<f64>,
+    noise_design: &Array2<f64>,
     weights: &Array1<f64>,
-    target_eta_mean: f64,
-) -> Result<Array1<f64>, String> {
-    let x = spec.design.to_dense();
-    let n = x.nrows();
-    let p = x.ncols();
-    if beta.len() != p {
-        return Err(format!(
-            "weighted eta gauge projection beta length mismatch: got {}, expected {p}",
-            beta.len()
-        ));
-    }
-    if spec.offset.len() != n || weights.len() != n {
-        return Err(format!(
-            "weighted eta gauge projection row mismatch: design={n}, offset={}, weights={}",
-            spec.offset.len(),
-            weights.len()
-        ));
-    }
-    let w_sum: f64 = weights.iter().copied().sum();
-    if !w_sum.is_finite() || w_sum <= 0.0 {
-        return Err(
-            "weighted eta gauge projection requires positive finite total weight".to_string(),
-        );
-    }
-
-    let mut c = Array1::<f64>::zeros(p);
-    let mut offset_mean = 0.0;
-    for i in 0..n {
-        let wi = weights[i] / w_sum;
-        offset_mean += wi * spec.offset[i];
-        for j in 0..p {
-            c[j] += wi * x[[i, j]];
-        }
-    }
-    let c_norm_sq = c.dot(&c);
-    if !c_norm_sq.is_finite() || c_norm_sq <= 1e-12 {
-        return Err(
-            "weighted eta gauge projection found a degenerate anchor direction for this block"
-                .to_string(),
-        );
-    }
-    let shift = (c.dot(&beta) + offset_mean - target_eta_mean) / c_norm_sq;
-    if !shift.is_finite() {
-        return Err("weighted eta gauge projection produced a non-finite shift".to_string());
-    }
-    Ok(&beta - &(c * shift))
+    non_intercept_start: usize,
+) -> Result<Array2<f64>, String> {
+    let transform = build_scale_deviation_transform(
+        primary_design,
+        noise_design,
+        weights,
+        non_intercept_start,
+    )?;
+    apply_scale_deviation_transform(primary_design, noise_design, &transform)
 }
 
-fn weighted_column_mean(col: ArrayView1<'_, f64>, weights: &Array1<f64>) -> Result<f64, String> {
-    if col.len() != weights.len() {
-        return Err("weighted column mean dimension mismatch".to_string());
-    }
-    let w_sum: f64 = weights.iter().copied().sum();
-    if !w_sum.is_finite() || w_sum <= 0.0 {
-        return Err("weighted column mean requires positive finite total weight".to_string());
-    }
-    Ok(col
-        .iter()
-        .zip(weights.iter())
-        .map(|(&x, &w)| x * w)
-        .sum::<f64>()
-        / w_sum)
-}
-
-fn weighted_centered_column_ss(
-    col: ArrayView1<'_, f64>,
+fn prepared_gaussian_log_sigma_design(
+    mu_design: &Array2<f64>,
+    log_sigma_design: &Array2<f64>,
     weights: &Array1<f64>,
-) -> Result<f64, String> {
-    let mean = weighted_column_mean(col, weights)?;
-    Ok(col
-        .iter()
-        .zip(weights.iter())
-        .map(|(&x, &w)| {
-            let dx = x - mean;
-            w * dx * dx
-        })
-        .sum())
+    non_intercept_start: usize,
+) -> Result<Array2<f64>, String> {
+    prepared_scale_design(mu_design, log_sigma_design, weights, non_intercept_start)
 }
 
 fn identified_binomial_log_sigma_design(
@@ -887,46 +812,12 @@ fn identified_binomial_log_sigma_design(
     log_sigma_design: &TermCollectionDesign,
     weights: &Array1<f64>,
 ) -> Result<Array2<f64>, String> {
-    let xt = &threshold_design.design;
-    let mut xls = log_sigma_design.design.clone();
-    let n = xt.nrows();
-    if xls.nrows() != n || weights.len() != n {
-        return Err(format!(
-            "identified binomial log-sigma design row mismatch: threshold={}, log_sigma={}, weights={}",
-            n,
-            xls.nrows(),
-            weights.len()
-        ));
-    }
-
-    let non_intercept_start = log_sigma_design.intercept_range.end.min(xls.ncols());
-    if non_intercept_start >= xls.ncols() {
-        return Ok(xls);
-    }
-
-    let threshold_op = DesignMatrix::Dense(xt.clone());
-    let zero_offset = Array1::<f64>::zeros(n);
-    for j in non_intercept_start..xls.ncols() {
-        let col = xls.column(j).to_owned();
-        let projection_beta =
-            solve_weighted_projection(&threshold_op, &zero_offset, &col, weights, 1e-10)?;
-        let fitted = xt.dot(&projection_beta);
-        let mut residual = &col - &fitted;
-        let residual_mean = weighted_column_mean(residual.view(), weights)?;
-        residual.mapv_inplace(|v| v - residual_mean);
-
-        let orig_ss = weighted_centered_column_ss(col.view(), weights)?;
-        let resid_ss = weighted_centered_column_ss(residual.view(), weights)?;
-        if !resid_ss.is_finite() || resid_ss <= 1e-12 {
-            residual.fill(0.0);
-        } else if orig_ss.is_finite() && orig_ss > 1e-12 {
-            let rescale = (orig_ss / resid_ss).sqrt();
-            residual.mapv_inplace(|v| v * rescale);
-        }
-        xls.column_mut(j).assign(&residual);
-    }
-
-    Ok(xls)
+    prepared_scale_design(
+        &threshold_design.design,
+        &log_sigma_design.design,
+        weights,
+        log_sigma_design.intercept_range.end.min(log_sigma_design.design.ncols()),
+    )
 }
 
 fn emit_binomial_alpha_beta_warnings(
@@ -1214,8 +1105,6 @@ pub struct BinomialLocationScaleSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
     pub link_kind: InverseLink,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub threshold_block: ParameterBlockInput,
     pub log_sigma_block: ParameterBlockInput,
 }
@@ -1225,8 +1114,6 @@ pub struct BinomialLocationScaleWiggleSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
     pub link_kind: InverseLink,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
     pub threshold_block: ParameterBlockInput,
@@ -1247,8 +1134,6 @@ pub struct BinomialLocationScaleTermSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
     pub link_kind: InverseLink,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub threshold_spec: TermCollectionSpec,
     pub log_sigma_spec: TermCollectionSpec,
 }
@@ -1258,8 +1143,6 @@ pub struct BinomialLocationScaleWiggleTermSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
     pub link_kind: InverseLink,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub threshold_spec: TermCollectionSpec,
     pub log_sigma_spec: TermCollectionSpec,
     pub wiggle_knots: Array1<f64>,
@@ -1400,6 +1283,15 @@ pub fn fit_gaussian_location_scale(
     } = spec;
     let mut mu_spec = mu_block.into_spec("mu")?;
     let mut log_sigma_spec = log_sigma_block.into_spec("log_sigma")?;
+    let mu_dense = mu_spec.design.to_dense();
+    let raw_log_sigma_dense = log_sigma_spec.design.to_dense();
+    let non_intercept_start = infer_non_intercept_start(&raw_log_sigma_dense, &weights);
+    log_sigma_spec.design = DesignMatrix::Dense(prepared_gaussian_log_sigma_design(
+        &mu_dense,
+        &raw_log_sigma_dense,
+        &weights,
+        non_intercept_start,
+    )?);
     if mu_spec.initial_beta.is_none() || log_sigma_spec.initial_beta.is_none() {
         let (beta_mu0, beta_ls0, sigma0) = gaussian_location_scale_warm_start(
             &y,
@@ -1499,11 +1391,6 @@ pub fn fit_binomial_location_scale(
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validate_weights(&spec.weights, "fit_binomial_location_scale")?;
     validate_binomial_response(&spec.y, "fit_binomial_location_scale")?;
-    validate_sigma_bounds(
-        spec.sigma_min,
-        spec.sigma_max,
-        "fit_binomial_location_scale",
-    )?;
     validate_block_rows("threshold", n, &spec.threshold_block)?;
     validate_block_rows("log_sigma", n, &spec.log_sigma_block)?;
 
@@ -1511,11 +1398,18 @@ pub fn fit_binomial_location_scale(
         y,
         weights,
         link_kind,
-        sigma_min,
-        sigma_max,
         mut threshold_block,
         mut log_sigma_block,
     } = spec;
+    let threshold_dense = threshold_block.design.to_dense();
+    let raw_log_sigma_dense = log_sigma_block.design.to_dense();
+    let non_intercept_start = infer_non_intercept_start(&raw_log_sigma_dense, &weights);
+    log_sigma_block.design = DesignMatrix::Dense(prepared_scale_design(
+        &threshold_dense,
+        &raw_log_sigma_dense,
+        &weights,
+        non_intercept_start,
+    )?);
 
     if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
         match try_binomial_alpha_beta_warm_start(
@@ -1547,8 +1441,6 @@ pub fn fit_binomial_location_scale(
         y: y.clone(),
         weights: weights.clone(),
         link_kind: link_kind.clone(),
-        sigma_min,
-        sigma_max,
         threshold_design: Some(blocks[BinomialLocationScaleFamily::BLOCK_T].design.clone()),
         log_sigma_design: Some(
             blocks[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
@@ -1572,11 +1464,6 @@ pub fn fit_binomial_location_scale_wiggle(
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validate_weights(&spec.weights, "fit_binomial_location_scale_wiggle")?;
     validate_binomial_response(&spec.y, "fit_binomial_location_scale_wiggle")?;
-    validate_sigma_bounds(
-        spec.sigma_min,
-        spec.sigma_max,
-        "fit_binomial_location_scale_wiggle",
-    )?;
     validate_block_rows("threshold", n, &spec.threshold_block)?;
     validate_block_rows("log_sigma", n, &spec.log_sigma_block)?;
     validate_block_rows("wiggle", n, &spec.wiggle_block)?;
@@ -1598,14 +1485,21 @@ pub fn fit_binomial_location_scale_wiggle(
         y,
         weights,
         link_kind,
-        sigma_min,
-        sigma_max,
         wiggle_knots,
         wiggle_degree,
         mut threshold_block,
         mut log_sigma_block,
         wiggle_block,
     } = spec;
+    let threshold_dense = threshold_block.design.to_dense();
+    let raw_log_sigma_dense = log_sigma_block.design.to_dense();
+    let non_intercept_start = infer_non_intercept_start(&raw_log_sigma_dense, &weights);
+    log_sigma_block.design = DesignMatrix::Dense(prepared_scale_design(
+        &threshold_dense,
+        &raw_log_sigma_dense,
+        &weights,
+        non_intercept_start,
+    )?);
 
     if (threshold_block.initial_beta.is_none() || log_sigma_block.initial_beta.is_none())
         && matches!(link_kind, InverseLink::Standard(LinkFunction::Probit))
@@ -1639,8 +1533,6 @@ pub fn fit_binomial_location_scale_wiggle(
         y: y.clone(),
         weights: weights.clone(),
         link_kind: link_kind.clone(),
-        sigma_min,
-        sigma_max,
         threshold_design: Some(threshold_block.design.clone()),
         log_sigma_design: Some(log_sigma_block.design.clone()),
         wiggle_knots,
@@ -1984,7 +1876,12 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         };
         let mut noise_spec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(noise_design.design.clone()),
+            design: DesignMatrix::Dense(prepared_gaussian_log_sigma_design(
+                &mean_design.design,
+                &noise_design.design,
+                &self.weights,
+                noise_design.intercept_range.end.min(noise_design.design.ncols()),
+            )?),
             offset: Array1::zeros(self.y.len()),
             penalties: noise_design.penalties.clone(),
             initial_log_lambdas: noise_log_lambdas,
@@ -2015,11 +1912,18 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
+        let prepared_noise_design = prepared_gaussian_log_sigma_design(
+            &mean_design.design,
+            &noise_design.design,
+            &self.weights,
+            noise_design.intercept_range.end.min(noise_design.design.ncols()),
+        )
+        .expect("prepared Gaussian log-sigma design should match block construction");
         GaussianLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             mu_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(noise_design.design.clone())),
+            log_sigma_design: Some(DesignMatrix::Dense(prepared_noise_design)),
         }
     }
 
@@ -2047,8 +1951,6 @@ struct BinomialLocationScaleTermBuilder {
     y: Array1<f64>,
     weights: Array1<f64>,
     link_kind: InverseLink,
-    sigma_min: f64,
-    sigma_max: f64,
     mean_spec: TermCollectionSpec,
     noise_spec: TermCollectionSpec,
 }
@@ -2105,20 +2007,15 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
 
     fn build_family(
         &self,
-        mean_design: &TermCollectionDesign,
-        noise_design: &TermCollectionDesign,
+        _mean_design: &TermCollectionDesign,
+        _noise_design: &TermCollectionDesign,
     ) -> Self::Family {
-        let identified_noise_design =
-            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)
-                .expect("identified binomial log-sigma design should match block construction");
         BinomialLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            sigma_min: self.sigma_min,
-            sigma_max: self.sigma_max,
-            threshold_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(identified_noise_design)),
+            threshold_design: None,
+            log_sigma_design: None,
         }
     }
 
@@ -2146,8 +2043,6 @@ struct BinomialLocationScaleWiggleTermBuilder {
     y: Array1<f64>,
     weights: Array1<f64>,
     link_kind: InverseLink,
-    sigma_min: f64,
-    sigma_max: f64,
     mean_spec: TermCollectionSpec,
     noise_spec: TermCollectionSpec,
     wiggle_knots: Array1<f64>,
@@ -2230,8 +2125,6 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            sigma_min: self.sigma_min,
-            sigma_max: self.sigma_max,
             threshold_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
             log_sigma_design: Some(DesignMatrix::Dense(identified_noise_design)),
             wiggle_knots: self.wiggle_knots.clone(),
@@ -2309,8 +2202,6 @@ pub fn fit_binomial_location_scale_terms(
             y: spec.y,
             weights: spec.weights,
             link_kind: spec.link_kind,
-            sigma_min: spec.sigma_min,
-            sigma_max: spec.sigma_max,
             mean_spec: spec.threshold_spec,
             noise_spec: spec.log_sigma_spec,
         },
@@ -2336,8 +2227,6 @@ pub fn fit_binomial_location_scale_wiggle_terms(
             y: spec.y,
             weights: spec.weights,
             link_kind: spec.link_kind,
-            sigma_min: spec.sigma_min,
-            sigma_max: spec.sigma_max,
             mean_spec: spec.threshold_spec,
             noise_spec: spec.log_sigma_spec,
             wiggle_knots: spec.wiggle_knots,
@@ -2363,8 +2252,6 @@ pub fn fit_binomial_location_scale_wiggle_terms_auto(
             y: spec.y.clone(),
             weights: spec.weights.clone(),
             link_kind: spec.link_kind.clone(),
-            sigma_min: spec.sigma_min,
-            sigma_max: spec.sigma_max,
             threshold_spec: spec.threshold_spec.clone(),
             log_sigma_spec: spec.log_sigma_spec.clone(),
         },
@@ -2386,7 +2273,7 @@ pub fn fit_binomial_location_scale_wiggle_terms_auto(
         .ok_or_else(|| "pilot fit is missing log_sigma block".to_string())?
         .eta
         .view();
-    let sigma = bounded_sigma_derivs_up_to_third(eta_ls, spec.sigma_min, spec.sigma_max).0;
+    let sigma = eta_ls.mapv(f64::exp);
     let q_seed = Array1::from_iter(
         eta_t
             .iter()
@@ -2430,8 +2317,6 @@ pub fn fit_binomial_location_scale_wiggle_terms_auto(
             y: spec.y,
             weights: spec.weights,
             link_kind: spec.link_kind,
-            sigma_min: spec.sigma_min,
-            sigma_max: spec.sigma_max,
             wiggle_knots: wiggle_knots.clone(),
             wiggle_degree: wiggle_cfg.degree,
             threshold_block: ParameterBlockInput {
@@ -2728,9 +2613,9 @@ fn mirror_upper_to_lower(target: &mut Array2<f64>) {
 struct BinomialLocationScaleExactGeometry<'a> {
     threshold_design: &'a DesignMatrix,
     log_sigma_design: &'a DesignMatrix,
-    wiggle_design: &'a Array2<f64>,
+    wiggle_design: Option<&'a Array2<f64>>,
     d2sigma_deta2: &'a Array1<f64>,
-    d2q_dq02: &'a Array1<f64>,
+    d2q_dq02: Option<&'a Array1<f64>>,
 }
 
 struct BinomialLocationScaleCore {
@@ -3274,8 +3159,8 @@ fn binomial_location_scale_working_sets(
         let mut h_eta_t = Array1::<f64>::zeros(n);
         let mut grad_eta_ls = Array1::<f64>::zeros(n);
         let mut h_eta_ls = Array1::<f64>::zeros(n);
-        let mut grad_q = Array1::<f64>::zeros(n);
-        let mut h_q_psd = Array1::<f64>::zeros(n);
+        let mut grad_q = eta_wiggle.map(|_| Array1::<f64>::zeros(n));
+        let mut h_q_psd = eta_wiggle.map(|_| Array1::<f64>::zeros(n));
 
         for i in 0..n {
             let (score_q, curvature_q, _third_q) = binomial_score_curvature_third_from_jet(
@@ -3288,7 +3173,7 @@ fn binomial_location_scale_working_sets(
                 core.d3mu_dq3[i],
             );
             let a_i = dq_dq0.map_or(1.0, |v| v[i]);
-            let c_i = geom.d2q_dq02[i];
+            let c_i = geom.d2q_dq02.map_or(0.0, |v| v[i]);
             let s = core.sigma[i].max(1e-12);
 
             let dq_t = -a_i / s;
@@ -3307,8 +3192,12 @@ fn binomial_location_scale_working_sets(
             h_eta_t[i] = eta_jet.w_tt;
             h_eta_ls[i] = eta_jet.w_ll;
 
-            grad_q[i] = score_q;
-            h_q_psd[i] = curvature_q.max(0.0);
+            if let Some(grad_q) = grad_q.as_mut() {
+                grad_q[i] = score_q;
+            }
+            if let Some(h_q_psd) = h_q_psd.as_mut() {
+                h_q_psd[i] = curvature_q.max(0.0);
+            }
         }
 
         let grad_t = geom.threshold_design.transpose_vector_multiply(&grad_eta_t);
@@ -3317,8 +3206,13 @@ fn binomial_location_scale_working_sets(
             .log_sigma_design
             .transpose_vector_multiply(&grad_eta_ls);
         let hess_ls = xt_diag_x_symmetric(geom.log_sigma_design, &h_eta_ls)?.to_dense();
-        let grad_w = fast_atv(geom.wiggle_design, &grad_q);
-        let hess_w = xt_diag_x_dense(geom.wiggle_design, &h_q_psd)?;
+        let w_ws = match (geom.wiggle_design, grad_q, h_q_psd) {
+            (Some(wiggle_design), Some(grad_q), Some(h_q_psd)) => Some(BlockWorkingSet::ExactNewton {
+                gradient: fast_atv(wiggle_design, &grad_q),
+                hessian: SymmetricMatrix::Dense(xt_diag_x_dense(wiggle_design, &h_q_psd)?),
+            }),
+            _ => None,
+        };
 
         return Ok((
             BlockWorkingSet::ExactNewton {
@@ -3329,10 +3223,7 @@ fn binomial_location_scale_working_sets(
                 gradient: grad_ls,
                 hessian: SymmetricMatrix::Dense(hess_ls),
             },
-            Some(BlockWorkingSet::ExactNewton {
-                gradient: grad_w,
-                hessian: SymmetricMatrix::Dense(hess_w),
-            }),
+            w_ws,
         ));
     }
 
@@ -3467,163 +3358,6 @@ impl GaussianLocationScaleFamily {
             parameter_links: Self::parameter_links(),
         }
     }
-
-    fn dense_block_designs(&self) -> Result<(Array2<f64>, Array2<f64>), String> {
-        let x_mu = self
-            .mu_design
-            .as_ref()
-            .ok_or_else(|| {
-                "GaussianLocationScaleFamily exact path is missing mu design".to_string()
-            })?
-            .to_dense();
-        let x_ls = self
-            .log_sigma_design
-            .as_ref()
-            .ok_or_else(|| {
-                "GaussianLocationScaleFamily exact path is missing log-sigma design".to_string()
-            })?
-            .to_dense();
-        Ok((x_mu, x_ls))
-    }
-}
-
-#[derive(Clone, Copy)]
-struct UvJet {
-    v: f64,
-    du: f64,
-    dv: f64,
-    duv: f64,
-}
-
-#[inline]
-fn uv_const(v: f64) -> UvJet {
-    UvJet {
-        v,
-        du: 0.0,
-        dv: 0.0,
-        duv: 0.0,
-    }
-}
-
-#[inline]
-fn uv_add(a: UvJet, b: UvJet) -> UvJet {
-    UvJet {
-        v: a.v + b.v,
-        du: a.du + b.du,
-        dv: a.dv + b.dv,
-        duv: a.duv + b.duv,
-    }
-}
-
-#[inline]
-fn uv_sub(a: UvJet, b: UvJet) -> UvJet {
-    UvJet {
-        v: a.v - b.v,
-        du: a.du - b.du,
-        dv: a.dv - b.dv,
-        duv: a.duv - b.duv,
-    }
-}
-
-#[inline]
-fn uv_mul(a: UvJet, b: UvJet) -> UvJet {
-    UvJet {
-        v: a.v * b.v,
-        du: a.du * b.v + a.v * b.du,
-        dv: a.dv * b.v + a.v * b.dv,
-        duv: a.duv * b.v + a.du * b.dv + a.dv * b.du + a.v * b.duv,
-    }
-}
-
-#[inline]
-fn uv_inv(x: UvJet) -> UvJet {
-    let v2 = x.v * x.v;
-    let v3 = v2 * x.v;
-    UvJet {
-        v: 1.0 / x.v,
-        du: -x.du / v2,
-        dv: -x.dv / v2,
-        duv: -x.duv / v2 + 2.0 * x.du * x.dv / v3,
-    }
-}
-
-#[inline]
-fn uv_scale(a: UvJet, s: f64) -> UvJet {
-    UvJet {
-        v: a.v * s,
-        du: a.du * s,
-        dv: a.dv * s,
-        duv: a.duv * s,
-    }
-}
-
-#[inline]
-fn gaussian_two_block_weight_jets(
-    y_i: f64,
-    w_i: f64,
-    eta_t_i: f64,
-    _eta_ls_i: f64,
-    sigma_i: f64,
-    d_sigma_i: f64,
-    d2_sigma_i: f64,
-    d3_sigma_i: f64,
-    d4_sigma_i: f64,
-    z_t_u: f64,
-    z_ls_u: f64,
-    z_t_v: f64,
-    z_ls_v: f64,
-) -> (UvJet, UvJet, UvJet) {
-    let eta_t = UvJet {
-        v: eta_t_i,
-        du: z_t_u,
-        dv: z_t_v,
-        duv: 0.0,
-    };
-    let eta_ls_u = z_ls_u;
-    let eta_ls_v = z_ls_v;
-    let sigma = UvJet {
-        v: sigma_i.max(1e-12),
-        du: d_sigma_i * eta_ls_u,
-        dv: d_sigma_i * eta_ls_v,
-        duv: d2_sigma_i * eta_ls_u * eta_ls_v,
-    };
-    let sigma_1 = UvJet {
-        v: d_sigma_i,
-        du: d2_sigma_i * eta_ls_u,
-        dv: d2_sigma_i * eta_ls_v,
-        duv: d3_sigma_i * eta_ls_u * eta_ls_v,
-    };
-    let sigma_2 = UvJet {
-        v: d2_sigma_i,
-        du: d3_sigma_i * eta_ls_u,
-        dv: d3_sigma_i * eta_ls_v,
-        duv: d4_sigma_i * eta_ls_u * eta_ls_v,
-    };
-
-    // Exact eta-space Newton weights for Gaussian location-scale:
-    //   H_tt = w / sigma^2
-    //   H_tl = 2 w r sigma' / sigma^3
-    //   H_ll = w * [ (3 r^2 / sigma^4 - 1 / sigma^2) (sigma')^2
-    //                + (1 / sigma - r^2 / sigma^3) sigma'' ],
-    // where r = y - eta_t.
-    // UvJet algebra propagates D[·](u), D[·](v), and D²[·](u,v) exactly.
-    let inv_sigma = uv_inv(sigma);
-    let inv_sigma2 = uv_mul(inv_sigma, inv_sigma);
-    let inv_sigma3 = uv_mul(inv_sigma2, inv_sigma);
-    let inv_sigma4 = uv_mul(inv_sigma3, inv_sigma);
-
-    let r = uv_sub(uv_const(y_i), eta_t);
-    let r2 = uv_mul(r, r);
-    let sigma_1_sq = uv_mul(sigma_1, sigma_1);
-
-    let w_tt = uv_scale(inv_sigma2, w_i);
-    let w_tl = uv_scale(uv_mul(uv_mul(r, sigma_1), inv_sigma3), 2.0 * w_i);
-
-    let ll_a = uv_sub(uv_scale(uv_mul(r2, inv_sigma4), 3.0), inv_sigma2);
-    let ll_b = uv_sub(inv_sigma, uv_mul(r2, inv_sigma3));
-    let w_ll = uv_scale(uv_add(uv_mul(ll_a, sigma_1_sq), uv_mul(ll_b, sigma_2)), w_i);
-
-    (w_tt, w_tl, w_ll)
 }
 
 impl CustomFamily for GaussianLocationScaleFamily {
@@ -3707,177 +3441,26 @@ impl CustomFamily for GaussianLocationScaleFamily {
 
     fn exact_newton_joint_hessian(
         &self,
-        block_states: &[ParameterBlockState],
+        _block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 2 {
-            return Err(format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ));
-        }
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_MU].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err("GaussianLocationScaleFamily input size mismatch".to_string());
-        }
-        let (x_t, x_ls) = self.dense_block_designs()?;
-        let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
-            gaussian_sigma_derivs_up_to_fourth(eta_ls.view());
-
-        let mut w_tt_diag = Array1::<f64>::zeros(n);
-        let mut w_tl_diag = Array1::<f64>::zeros(n);
-        let mut w_ll_diag = Array1::<f64>::zeros(n);
-
-        for i in 0..n {
-            let (w_tt, w_tl, w_ll) = gaussian_two_block_weight_jets(
-                self.y[i],
-                self.weights[i],
-                eta_t[i],
-                eta_ls[i],
-                sigma[i],
-                d_sigma[i],
-                d2_sigma[i],
-                d3_sigma[i],
-                d4_sigma[i],
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            );
-            w_tt_diag[i] = w_tt.v;
-            w_tl_diag[i] = w_tl.v;
-            w_ll_diag[i] = w_ll.v;
-        }
-
-        let h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
-        let h_tl = xt_diag_y_dense(&x_t, &w_tl_diag, &x_ls)?;
-        let h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
-        Ok(Some(assemble_two_block_symmetric(&h_tt, &h_tl, &h_ll)))
+        Ok(None)
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        d_beta_flat: &Array1<f64>,
+        _block_states: &[ParameterBlockState],
+        _d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 2 {
-            return Err(format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ));
-        }
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_MU].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err("GaussianLocationScaleFamily input size mismatch".to_string());
-        }
-        let (x_t, x_ls) = self.dense_block_designs()?;
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let beta_layout = GamlssBetaLayout::two_block(pt, pls);
-        let (u_t, u_ls) = beta_layout.split_two(d_beta_flat, "Gaussian joint d_beta")?;
-        let d_eta_t = x_t.dot(&u_t);
-        let d_eta_ls = x_ls.dot(&u_ls);
-        let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
-            gaussian_sigma_derivs_up_to_fourth(eta_ls.view());
-
-        let mut w_tt_diag = Array1::<f64>::zeros(n);
-        let mut w_tl_diag = Array1::<f64>::zeros(n);
-        let mut w_ll_diag = Array1::<f64>::zeros(n);
-
-        for i in 0..n {
-            let (w_tt, w_tl, w_ll) = gaussian_two_block_weight_jets(
-                self.y[i],
-                self.weights[i],
-                eta_t[i],
-                eta_ls[i],
-                sigma[i],
-                d_sigma[i],
-                d2_sigma[i],
-                d3_sigma[i],
-                d4_sigma[i],
-                d_eta_t[i],
-                d_eta_ls[i],
-                0.0,
-                0.0,
-            );
-            w_tt_diag[i] = w_tt.du;
-            w_tl_diag[i] = w_tl.du;
-            w_ll_diag[i] = w_ll.du;
-        }
-
-        let d_h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
-        let d_h_tl = xt_diag_y_dense(&x_t, &w_tl_diag, &x_ls)?;
-        let d_h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
-        Ok(Some(assemble_two_block_symmetric(
-            &d_h_tt, &d_h_tl, &d_h_ll,
-        )))
+        Ok(None)
     }
 
     fn exact_newton_joint_hessian_second_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
+        _block_states: &[ParameterBlockState],
+        _d_beta_u_flat: &Array1<f64>,
+        _d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 2 {
-            return Err(format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ));
-        }
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_MU].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err("GaussianLocationScaleFamily input size mismatch".to_string());
-        }
-        let (x_t, x_ls) = self.dense_block_designs()?;
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let beta_layout = GamlssBetaLayout::two_block(pt, pls);
-        let (u_t, u_ls) = beta_layout.split_two(d_beta_u_flat, "Gaussian joint d_beta_u")?;
-        let (v_t, v_ls) = beta_layout.split_two(d_beta_v_flat, "Gaussian joint d_beta_v")?;
-        let d_eta_t_u = x_t.dot(&u_t);
-        let d_eta_ls_u = x_ls.dot(&u_ls);
-        let d_eta_t_v = x_t.dot(&v_t);
-        let d_eta_ls_v = x_ls.dot(&v_ls);
-        let (sigma, d_sigma, d2_sigma, d3_sigma, d4_sigma) =
-            gaussian_sigma_derivs_up_to_fourth(eta_ls.view());
-
-        let mut w_tt_diag = Array1::<f64>::zeros(n);
-        let mut w_tl_diag = Array1::<f64>::zeros(n);
-        let mut w_ll_diag = Array1::<f64>::zeros(n);
-
-        for i in 0..n {
-            let (w_tt, w_tl, w_ll) = gaussian_two_block_weight_jets(
-                self.y[i],
-                self.weights[i],
-                eta_t[i],
-                eta_ls[i],
-                sigma[i],
-                d_sigma[i],
-                d2_sigma[i],
-                d3_sigma[i],
-                d4_sigma[i],
-                d_eta_t_u[i],
-                d_eta_ls_u[i],
-                d_eta_t_v[i],
-                d_eta_ls_v[i],
-            );
-            w_tt_diag[i] = w_tt.duv;
-            w_tl_diag[i] = w_tl.duv;
-            w_ll_diag[i] = w_ll.duv;
-        }
-
-        let d2_h_tt = xt_diag_x_dense(&x_t, &w_tt_diag)?;
-        let d2_h_tl = xt_diag_y_dense(&x_t, &w_tl_diag, &x_ls)?;
-        let d2_h_ll = xt_diag_x_dense(&x_ls, &w_ll_diag)?;
-        Ok(Some(assemble_two_block_symmetric(
-            &d2_h_tt, &d2_h_tl, &d2_h_ll,
-        )))
+        Ok(None)
     }
 
     fn diagonal_working_weights_directional_derivative(
@@ -4254,8 +3837,6 @@ impl CustomFamilyGenerative for GammaLogFamily {
 pub struct BinomialLocationScaleFamily {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub link_kind: InverseLink,
     pub threshold_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
@@ -4301,19 +3882,6 @@ impl BinomialLocationScaleFamily {
 }
 
 impl CustomFamily for BinomialLocationScaleFamily {
-    fn post_update_block_beta(
-        &self,
-        _block_states: &[ParameterBlockState],
-        block_idx: usize,
-        spec: &ParameterBlockSpec,
-        beta: Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        if block_idx == Self::BLOCK_LOG_SIGMA {
-            return project_block_beta_to_weighted_eta_mean_zero(beta, spec, &self.weights, 0.0);
-        }
-        Ok(beta)
-    }
-
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(format!(
@@ -4343,7 +3911,19 @@ impl CustomFamily for BinomialLocationScaleFamily {
             eta_ls,
             None,
             None,
-            None,
+            Some(BinomialLocationScaleExactGeometry {
+                threshold_design: self.threshold_design.as_ref().ok_or_else(|| {
+                    "BinomialLocationScaleFamily exact-newton path is missing threshold design"
+                        .to_string()
+                })?,
+                log_sigma_design: self.log_sigma_design.as_ref().ok_or_else(|| {
+                    "BinomialLocationScaleFamily exact-newton path is missing log-sigma design"
+                        .to_string()
+                })?,
+                wiggle_design: None,
+                d2sigma_deta2: &core.dsigma_deta,
+                d2q_dq02: None,
+            }),
             &core,
         )?;
 
@@ -5077,8 +4657,6 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
 pub struct BinomialLocationScaleWiggleFamily {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
-    pub sigma_min: f64,
-    pub sigma_max: f64,
     pub link_kind: InverseLink,
     pub threshold_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
@@ -5344,26 +4922,6 @@ impl BinomialLocationScaleWiggleFamily {
 }
 
 impl CustomFamily for BinomialLocationScaleWiggleFamily {
-    fn post_update_block_beta(
-        &self,
-        _block_states: &[ParameterBlockState],
-        block_idx: usize,
-        spec: &ParameterBlockSpec,
-        beta: Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        if block_idx == Self::BLOCK_LOG_SIGMA {
-            let target_eta_mean =
-                bounded_sigma_eta_for_sigma_scalar(1.0, self.sigma_min, self.sigma_max);
-            return project_block_beta_to_weighted_eta_mean_zero(
-                beta,
-                spec,
-                &self.weights,
-                target_eta_mean,
-            );
-        }
-        Ok(beta)
-    }
-
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 3 {
             return Err(format!(
@@ -5411,9 +4969,9 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             Some(BinomialLocationScaleExactGeometry {
                 threshold_design,
                 log_sigma_design,
-                wiggle_design: &wiggle_design,
+                wiggle_design: Some(&wiggle_design),
                 d2sigma_deta2: &d2sigma_deta2,
-                d2q_dq02: &d2q_dq02,
+                d2q_dq02: Some(&d2q_dq02),
             }),
             &core,
         )?;
@@ -5773,8 +5331,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let m = d0.dot(&beta_w0) + 1.0;
         let g2 = dd0.dot(&beta_w0);
         let g3 = d3q;
-        let (sigma, ds, d2s, d3s) =
-            bounded_sigma_derivs_up_to_third(eta_ls.view(), self.sigma_min, self.sigma_max);
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
 
         let mut coeff_tt = Array1::<f64>::zeros(n);
         let mut coeff_tl = Array1::<f64>::zeros(n);
@@ -6355,7 +5912,7 @@ mod tests {
         assert!(beta_t[0].is_finite());
         assert!(beta_ls[0].is_finite());
         assert!(beta_obs.iter().all(|v| v.is_finite() && *v > 0.0));
-        let expected_beta = 1.0 / ((0.25 + 4.0) * 0.5);
+        let expected_beta = 1.0;
         assert!(beta_obs.iter().all(|v| (*v - expected_beta).abs() < 1e-12));
     }
 
@@ -6610,8 +6167,6 @@ mod tests {
             y,
             weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
-            sigma_min: 0.3,
-            sigma_max: 3.0,
             threshold_block: intercept_block(n),
             log_sigma_block: intercept_block(n),
         };
@@ -6636,8 +6191,6 @@ mod tests {
             y,
             weights,
             link_kind: InverseLink::Sas(sas),
-            sigma_min: 0.3,
-            sigma_max: 3.0,
             threshold_block: intercept_block(n),
             log_sigma_block: intercept_block(n),
         };
@@ -6721,8 +6274,6 @@ mod tests {
             y: Array1::from_vec(vec![0.0, 1.0, 0.0, 2.0, 1.0, 0.0, 1.0, 0.0]),
             weights: Array1::from_elem(n, 1.0),
             link_kind: InverseLink::Standard(LinkFunction::Probit),
-            sigma_min: 0.25,
-            sigma_max: 3.5,
             threshold_spec: simple_matern_term_collection(&[0, 1], 0.4),
             log_sigma_spec: simple_matern_term_collection(&[0, 1], 0.75),
         };
@@ -6745,8 +6296,6 @@ mod tests {
             y: Array1::from_elem(n, 0.0),
             weights: Array1::from_elem(n, 1.0),
             link_kind: InverseLink::Standard(LinkFunction::Probit),
-            sigma_min: 0.25,
-            sigma_max: 3.5,
             threshold_spec: simple_matern_term_collection(&[0, 1], 0.4),
             log_sigma_spec: simple_matern_term_collection(&[0, 1], 0.75),
         };
@@ -6808,8 +6357,6 @@ mod tests {
             y,
             weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
-            sigma_min: 0.25,
-            sigma_max: 3.5,
             threshold_spec: simple_matern_term_collection(&[0, 1], 0.4),
             log_sigma_spec: simple_matern_term_collection(&[0, 1], 0.75),
         };
@@ -6848,8 +6395,6 @@ mod tests {
             y,
             weights,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
-            sigma_min: 0.25,
-            sigma_max: 3.5,
             threshold_spec: simple_matern_term_collection(&[0, 1], 0.45),
             log_sigma_spec: simple_matern_term_collection(&[0, 1], 0.8),
             wiggle_knots: knots,
@@ -6887,8 +6432,6 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            sigma_min: 0.05,
-            sigma_max: 20.0,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: None,
             log_sigma_design: None,
@@ -7063,8 +6606,6 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            sigma_min: 0.05,
-            sigma_max: 5.0,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design),
             log_sigma_design: Some(log_sigma_design),
@@ -7160,8 +6701,6 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            sigma_min: 0.05,
-            sigma_max: 4.0,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
@@ -7279,8 +6818,6 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            sigma_min: 0.05,
-            sigma_max: 4.0,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
@@ -7402,8 +6939,6 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            sigma_min: 0.05,
-            sigma_max: 4.0,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
@@ -7517,8 +7052,6 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            sigma_min: 0.05,
-            sigma_max: 4.0,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: Some(threshold_design.clone()),
             log_sigma_design: Some(log_sigma_design.clone()),
@@ -7772,8 +7305,6 @@ mod tests {
         let family = BinomialLocationScaleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            sigma_min: 0.05,
-            sigma_max: 10.0,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: None,
             log_sigma_design: None,
@@ -7829,8 +7360,6 @@ mod tests {
         let family = BinomialLocationScaleWiggleFamily {
             y: y.clone(),
             weights: weights.clone(),
-            sigma_min: 0.1,
-            sigma_max: 8.0,
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             threshold_design: None,
             log_sigma_design: None,
