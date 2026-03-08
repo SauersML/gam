@@ -3219,8 +3219,9 @@ fn robust_epsilon_from_samples(values: &[f64], min_epsilon_cfg: f64) -> f64 {
         scale = s_min;
     }
 
-    // Epsilon is a fraction of robust scale.
-    let kappa = 1e-2_f64;
+    // Start near the observed operator scale so the optimizer begins in a
+    // neutral regime where both quadratic and linear behavior are reachable.
+    let kappa = 1.0_f64;
     (kappa * scale).max(s_min)
 }
 
