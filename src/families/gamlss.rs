@@ -6284,6 +6284,71 @@ mod tests {
     }
 
     #[test]
+    fn binomial_location_scale_log_sigma_weight_directional_derivative_matches_finite_difference() {
+        let family = BinomialLocationScaleFamily {
+            y: Array1::from_vec(vec![0.0]),
+            weights: Array1::from_vec(vec![1.0]),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: None,
+            log_sigma_design: None,
+        };
+        let eta_t = Array1::from_vec(vec![0.35]);
+        let eta_ls = Array1::from_vec(vec![-0.2]);
+        let states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: eta_t,
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: eta_ls.clone(),
+            },
+        ];
+        let d_eta = Array1::from_vec(vec![1.0]);
+
+        let dw = family
+            .diagonal_working_weights_directional_derivative(
+                &states,
+                BinomialLocationScaleFamily::BLOCK_LOG_SIGMA,
+                &d_eta,
+            )
+            .expect("binomial directional derivative")
+            .expect("binomial log-sigma derivative");
+
+        let eps = 1e-6;
+        let mut states_plus = states.clone();
+        states_plus[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta[0] += eps;
+        let eval_plus = family.evaluate(&states_plus).expect("binomial eval plus");
+        let w_plus =
+            match &eval_plus.block_working_sets[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA] {
+                BlockWorkingSet::Diagonal {
+                    working_response: _,
+                    working_weights,
+                } => working_weights[0],
+                BlockWorkingSet::ExactNewton { .. } => {
+                    panic!("expected diagonal binomial log-sigma block")
+                }
+            };
+
+        let mut states_minus = states;
+        states_minus[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta[0] -= eps;
+        let eval_minus = family.evaluate(&states_minus).expect("binomial eval minus");
+        let w_minus =
+            match &eval_minus.block_working_sets[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA] {
+                BlockWorkingSet::Diagonal {
+                    working_response: _,
+                    working_weights,
+                } => working_weights[0],
+                BlockWorkingSet::ExactNewton { .. } => {
+                    panic!("expected diagonal binomial log-sigma block")
+                }
+            };
+
+        let fd = (w_plus - w_minus) / (2.0 * eps);
+        assert!((dw[0] - fd).abs() < 1e-6, "dw={} fd={}", dw[0], fd);
+    }
+
+    #[test]
     fn fit_binomial_location_scale_runs_with_warm_start_path() {
         let n = 32usize;
         let y = Array1::from_vec((0..n).map(|i| if i % 4 == 0 { 1.0 } else { 0.0 }).collect());
@@ -6415,16 +6480,22 @@ mod tests {
 
     #[test]
     fn binomial_location_scale_term_builder_requires_exact_spatial_joint_path() {
+        let n = 8usize;
         let builder = BinomialLocationScaleTermBuilder {
-            y: Array1::from_elem(4, 0.0),
-            weights: Array1::from_elem(4, 1.0),
+            y: Array1::from_elem(n, 0.0),
+            weights: Array1::from_elem(n, 1.0),
             link_kind: InverseLink::Standard(LinkFunction::Probit),
             mean_spec: simple_matern_term_collection(&[0, 1], 0.4),
             noise_spec: simple_matern_term_collection(&[0, 1], 0.75),
         };
         assert!(builder.exact_spatial_joint_supported());
         assert!(builder.require_exact_spatial_joint());
-        let data = Array2::<f64>::zeros((4, 2));
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
+        }
         let mean_design =
             build_term_collection_design(data.view(), builder.mean_spec()).expect("mean design");
         let noise_design =
