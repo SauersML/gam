@@ -93,6 +93,27 @@ fn matref_is_finite(mat: MatRef<'_, f64>) -> bool {
     true
 }
 
+const BINOMIAL_AUX_MU_EPS: f64 = 1e-12;
+
+#[derive(Clone, Copy, Debug)]
+struct BinomialAuxTerms {
+    a1: f64,
+    a2: f64,
+}
+
+#[inline]
+fn stabilized_binomial_aux_terms(yi: f64, wi: f64, mu: f64) -> BinomialAuxTerms {
+    let mu = if mu.is_finite() {
+        mu.clamp(BINOMIAL_AUX_MU_EPS, 1.0 - BINOMIAL_AUX_MU_EPS)
+    } else {
+        0.5
+    };
+    let one_minus_mu = 1.0 - mu;
+    let a1 = wi * (yi / mu - (1.0 - yi) / one_minus_mu);
+    let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minus_mu * one_minus_mu));
+    BinomialAuxTerms { a1, a2 }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PirlsLinearSolvePath {
     DenseTransformed,
@@ -1256,6 +1277,35 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
+    fn observed_binomial_score_jacobian_diagonal(
+        &self,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        let needs_observed_jacobian = matches!(
+            self.link_kind,
+            InverseLink::Sas(_) | InverseLink::BetaLogistic(_)
+        ) && matches!(
+            self.likelihood,
+            GlmLikelihoodFamily::BinomialSas | GlmLikelihoodFamily::BinomialBetaLogistic
+        );
+        if !needs_observed_jacobian {
+            return Ok(None);
+        }
+
+        let n = self.y.len();
+        let mut neg_du_deta = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let aux = stabilized_binomial_aux_terms(
+                self.y[i],
+                self.prior_weights[i].max(0.0),
+                self.last_mu[i],
+            );
+            let d1 = self.last_dmu_deta[i];
+            let d2 = self.last_d2mu_deta2[i];
+            neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
+        }
+        Ok(Some(neg_du_deta))
+    }
+
     fn sparse_penalized_hessian(
         &mut self,
         weights: &Array1<f64>,
@@ -1474,17 +1524,20 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
         let s_beta = self.s_transformed.dot(beta.as_ref());
         gradient += &s_beta;
+        let hessian_diag = self
+            .observed_binomial_score_jacobian_diagonal()?
+            .unwrap_or_else(|| weights.clone());
 
         let (penalized_hessian, sparse_hessian, ridge_used) = if matches!(
             self.coordinate_design,
             WorkingCoordinateDesign::OriginalSparseNative
         ) {
             let (h_sparse, ridge_used) = ensure_sparse_positive_definite_with_ridge(|ridge| {
-                self.sparse_penalized_hessian(&weights, ridge)
+                self.sparse_penalized_hessian(&hessian_diag, ridge)
             })?;
             (Array2::zeros((0, 0)), Some(h_sparse), ridge_used)
         } else {
-            let mut penalized_hessian = self.penalized_hessian(&weights)?;
+            let mut penalized_hessian = self.penalized_hessian(&hessian_diag)?;
             #[cfg(debug_assertions)]
             debug_assert_symmetric_tol(&penalized_hessian, "PIRLS penalized Hessian", 1e-8);
             let ridge_used = ensure_positive_definite_with_ridge(

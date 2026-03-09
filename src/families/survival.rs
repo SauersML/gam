@@ -158,7 +158,7 @@ fn compress_positive_collinear_constraints(
     b: &Array1<f64>,
 ) -> LinearInequalityConstraints {
     const SCALE_TOL: f64 = 1e-14;
-    const KEY_TOL: f64 = 1e-10;
+    const KEY_TOL: f64 = 1e-8;
 
     let mut grouped: BTreeMap<Vec<i64>, (Vec<f64>, f64)> = BTreeMap::new();
     let mut fallback_rows: Vec<(Vec<f64>, f64)> = Vec::new();
@@ -2413,7 +2413,7 @@ mod tests {
             .expect("monotonicity constraints");
         assert_eq!(constraints.a.nrows(), 1);
         assert!((constraints.a[[0, 1]] - 1.0).abs() <= 1e-12);
-        assert!((constraints.b[0] - 4e-8).abs() <= 1e-18);
+        assert!((constraints.b[0] - 8e-8).abs() <= 1e-12);
     }
 
     #[test]

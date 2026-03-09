@@ -4534,7 +4534,7 @@ mod fd_policy_tests {
     }
 
     #[test]
-    fn sas_pirls_working_hessian_differs_from_true_score_jacobian_at_seed19() {
+    fn sas_pirls_hessian_matches_true_score_jacobian_at_seed19() {
         let seed = 19_u64;
         let n = 20usize;
         let x = build_tiny_design(n);
@@ -4639,8 +4639,8 @@ mod fd_policy_tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         assert!(
-            max_abs_diff > 1e-2,
-            "expected PIRLS working Hessian to differ from the true SAS score Jacobian, got max_abs_diff={max_abs_diff:.3e}"
+            max_abs_diff <= 2e-3,
+            "expected PIRLS Hessian to match the true SAS score Jacobian, got max_abs_diff={max_abs_diff:.3e}"
         );
     }
 

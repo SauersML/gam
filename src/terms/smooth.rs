@@ -7255,26 +7255,26 @@ where
             let (mean_log_kappa, noise_log_kappa) = log_kappa.split_at(mean_terms.len());
             let mean_spec_c = match mean_log_kappa.apply_to_spec(&best_mean_spec, &mean_terms) {
                 Ok(v) => v,
-                Err(_) => {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "exact-joint spatial objective failed to apply mean log-kappa",
-                    ));
+                Err(err) => {
+                    return Err(ObjectiveEvalError::recoverable(format!(
+                        "exact-joint spatial objective failed to apply mean log-kappa: {err}"
+                    )));
                 }
             };
             let noise_spec_c = match noise_log_kappa.apply_to_spec(&best_noise_spec, &noise_terms) {
                 Ok(v) => v,
-                Err(_) => {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "exact-joint spatial objective failed to apply noise log-kappa",
-                    ));
+                Err(err) => {
+                    return Err(ObjectiveEvalError::recoverable(format!(
+                        "exact-joint spatial objective failed to apply noise log-kappa: {err}"
+                    )));
                 }
             };
             let (mean_design_c, noise_design_c) = match build_pair(&mean_spec_c, &noise_spec_c) {
                 Ok(v) => v,
-                Err(_) => {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "exact-joint spatial objective failed to build designs",
-                    ));
+                Err(err) => {
+                    return Err(ObjectiveEvalError::recoverable(format!(
+                        "exact-joint spatial objective failed to build designs: {err}"
+                    )));
                 }
             };
             // Exact spatial joint optimization is now a true second-order path.
@@ -7290,29 +7290,37 @@ where
                 true,
             ) {
                 Ok((cost, grad, hess)) => {
-                    if !cost.is_finite()
-                        || grad.iter().any(|v| !v.is_finite())
-                        || hess.is_none()
-                        || hess
-                            .as_ref()
-                            .map(|h| {
-                                h.nrows() != theta.len()
-                                    || h.ncols() != theta.len()
-                                    || h.iter().any(|v| !v.is_finite())
-                            })
-                            .unwrap_or(true)
+                    let cost_finite = cost.is_finite();
+                    let grad_finite = grad.iter().all(|v| v.is_finite());
+                    let hessian_present = hess.is_some();
+                    let (hess_rows, hess_cols, hess_finite, hess_shape_ok) = hess
+                        .as_ref()
+                        .map(|h| {
+                            (
+                                h.nrows(),
+                                h.ncols(),
+                                h.iter().all(|v| v.is_finite()),
+                                h.nrows() == theta.len() && h.ncols() == theta.len(),
+                            )
+                        })
+                        .unwrap_or((0, 0, false, false));
+                    if !cost_finite || !grad_finite || !hessian_present || !hess_shape_ok || !hess_finite
                     {
-                        return Err(ObjectiveEvalError::recoverable(
-                            "exact-joint spatial objective/gradient/hessian became non-finite or incomplete",
-                        ));
+                        return Err(ObjectiveEvalError::recoverable(format!(
+                            "exact-joint spatial objective/gradient/hessian became non-finite or incomplete: cost_finite={cost_finite}, grad_all_finite={grad_finite}, hessian_present={hessian_present}, hessian_shape={}x{} expected {}x{}, hessian_all_finite={hess_finite}",
+                            hess_rows,
+                            hess_cols,
+                            theta.len(),
+                            theta.len(),
+                        )));
                     }
                     last_eval = Some((theta.clone(), cost, grad.clone(), hess.clone()));
                     (cost, grad, hess)
                 }
-                Err(_) => {
-                    return Err(ObjectiveEvalError::recoverable(
-                        "exact-joint spatial objective/gradient evaluation failed",
-                    ));
+                Err(err) => {
+                    return Err(ObjectiveEvalError::recoverable(format!(
+                        "exact-joint spatial objective/gradient evaluation failed: {err}"
+                    )));
                 }
             };
             Ok((cost, grad, hess))
@@ -7334,9 +7342,7 @@ where
         Ok(sol) => sol,
         Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
         Err(err) => {
-            return Err(format!(
-                "two-block exact joint spatial optimization failed: {err:?}"
-            ));
+            return Err(format!("two-block exact joint spatial optimization failed: {err}"));
         }
     };
 
