@@ -254,11 +254,8 @@ pub struct WorkingModelSurvival {
 
 impl WorkingModelSurvival {
     fn row_derivative_constraint_lower_bound(&self, row: usize) -> f64 {
-        if self.event_target[row] > 0 {
-            self.derivative_guard()
-        } else {
-            0.0
-        }
+        let _ = row;
+        self.derivative_guard()
     }
 
     fn stabilized_structural_derivative(&self, deriv: f64) -> Option<f64> {
@@ -566,9 +563,6 @@ impl WorkingModelSurvival {
         let mut w_event_outer = Array1::<f64>::zeros(n);
 
         let derivative_guard = self.derivative_guard();
-        // Only target-event rows require strict positivity because the likelihood
-        // evaluates log(d eta / d t) there. Censored rows are governed by the
-        // cumulative-hazard increment check below.
         let derivative_guard_numerical = self.derivative_guard_numerical();
         for i in 0..n {
             let w = self.sample_weight[i];
@@ -596,7 +590,7 @@ impl WorkingModelSurvival {
                     i, deriv, derivative_guard
                 )));
             }
-            if d > 0.0 && deriv < derivative_guard_numerical {
+            if deriv < derivative_guard_numerical {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
                     "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
                     i, deriv, derivative_guard
@@ -1393,6 +1387,7 @@ mod tests {
             .monotonicity_linear_constraints()
             .expect("all weighted rows should contribute monotonicity constraints");
         assert_eq!(constraints.a.nrows(), 1);
+        assert!((constraints.b[0] - 1e-8).abs() < 1e-18);
         for i in 0..x_derivative.nrows() {
             let row = x_derivative.row(i);
             let original_rhs = 1e-8_f64;

@@ -563,7 +563,7 @@ fn build_block_spatial_psi_derivatives(
                 let s_shape = info.s_psi.raw_dim();
                 let penalty_indices = info.penalty_indices.clone();
                 CustomFamilyBlockPsiDerivative {
-                    penalty_index: info.penalty_index,
+                    penalty_index: Some(info.penalty_index),
                     x_psi: info.x_psi,
                     s_psi: info.s_psi,
                     s_psi_components: Some(
@@ -3325,6 +3325,15 @@ pub struct GaussianLocationScaleFamily {
     pub log_sigma_design: Option<DesignMatrix>,
 }
 
+struct GaussianLocationScaleJointPsiDirection {
+    block_idx: usize,
+    local_idx: usize,
+    x_mu_psi: Array2<f64>,
+    x_ls_psi: Array2<f64>,
+    z_mu_psi: Array1<f64>,
+    z_ls_psi: Array1<f64>,
+}
+
 #[inline]
 #[allow(clippy::type_complexity)]
 fn gaussian_sigma_derivs_up_to_fourth(
@@ -3364,6 +3373,827 @@ impl GaussianLocationScaleFamily {
             parameter_names: Self::parameter_names(),
             parameter_links: Self::parameter_links(),
         }
+    }
+
+    fn exact_joint_supported(&self) -> bool {
+        self.mu_design.is_some() && self.log_sigma_design.is_some()
+    }
+
+    fn dense_block_designs(&self) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let mu_design = self
+            .mu_design
+            .as_ref()
+            .ok_or_else(|| "GaussianLocationScaleFamily exact path is missing mu design".to_string())?;
+        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
+            "GaussianLocationScaleFamily exact path is missing log-sigma design".to_string()
+        })?;
+        Ok((mu_design.to_dense(), log_sigma_design.to_dense()))
+    }
+
+    fn dense_block_designs_from_specs(
+        &self,
+        specs: &[ParameterBlockSpec],
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        if specs.len() != 2 {
+            return Err(format!(
+                "GaussianLocationScaleFamily spec-aware exact path expects 2 specs, got {}",
+                specs.len()
+            ));
+        }
+        Ok((
+            specs[Self::BLOCK_MU].design.to_dense(),
+            specs[Self::BLOCK_LOG_SIGMA].design.to_dense(),
+        ))
+    }
+
+    fn exact_joint_dense_block_designs(
+        &self,
+        specs: Option<&[ParameterBlockSpec]>,
+    ) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+        if self.exact_joint_supported() {
+            return self.dense_block_designs().map(Some);
+        }
+        if let Some(specs) = specs {
+            return self.dense_block_designs_from_specs(specs).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn exact_newton_joint_hessian_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_mu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_mu = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_mu.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("GaussianLocationScaleFamily input size mismatch".to_string());
+        }
+
+        let sigma = eta_ls.mapv(f64::exp);
+        let p_mu = x_mu.ncols();
+        let p_ls = x_ls.ncols();
+        let total = p_mu + p_ls;
+        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
+        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
+        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let s = sigma[i].max(1e-12);
+            let q = (self.y[i] - eta_mu[i]) / s;
+            let w = self.weights[i];
+            h_mu_mu_coeff[i] = w / (s * s);
+            h_mu_ls_coeff[i] = 2.0 * w * q / s;
+            h_ls_ls_coeff[i] = 2.0 * w * q * q;
+        }
+
+        let h_mu_mu = xt_diag_x_dense(x_mu, &h_mu_mu_coeff)?;
+        let h_mu_ls = xt_diag_y_dense(x_mu, &h_mu_ls_coeff, x_ls)?;
+        let h_ls_ls = xt_diag_x_dense(x_ls, &h_ls_ls_coeff)?;
+        let mut out = Array2::<f64>::zeros((total, total));
+        out.slice_mut(s![0..p_mu, 0..p_mu]).assign(&h_mu_mu);
+        out.slice_mut(s![0..p_mu, p_mu..total]).assign(&h_mu_ls);
+        out.slice_mut(s![p_mu..total, p_mu..total]).assign(&h_ls_ls);
+        mirror_upper_to_lower(&mut out);
+        Ok(Some(out))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_mu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_mu = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_mu.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("GaussianLocationScaleFamily input size mismatch".to_string());
+        }
+
+        let p_mu = x_mu.ncols();
+        let p_ls = x_ls.ncols();
+        let total = p_mu + p_ls;
+        if d_beta_flat.len() != total {
+            return Err(format!(
+                "GaussianLocationScaleFamily joint d_beta length mismatch: got {}, expected {}",
+                d_beta_flat.len(),
+                total
+            ));
+        }
+        let u_mu = d_beta_flat.slice(s![0..p_mu]).to_owned();
+        let u_ls = d_beta_flat.slice(s![p_mu..p_mu + p_ls]).to_owned();
+        let xi_mu = x_mu.dot(&u_mu);
+        let xi_ls = x_ls.dot(&u_ls);
+        let sigma = eta_ls.mapv(f64::exp);
+        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
+        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
+        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
+        let mut dh_mu_mu = Array1::<f64>::zeros(n);
+        let mut dh_mu_ls = Array1::<f64>::zeros(n);
+        let mut dh_ls_ls = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let s = sigma[i].max(1e-12);
+            let q = (self.y[i] - eta_mu[i]) / s;
+            let w = self.weights[i];
+            h_mu_mu_coeff[i] = w / (s * s);
+            h_mu_ls_coeff[i] = 2.0 * w * q / s;
+            h_ls_ls_coeff[i] = 2.0 * w * q * q;
+            dh_mu_mu[i] = -2.0 * h_mu_mu_coeff[i] * xi_ls[i];
+            dh_mu_ls[i] = -2.0 * h_mu_mu_coeff[i] * xi_mu[i] - 2.0 * h_mu_ls_coeff[i] * xi_ls[i];
+            dh_ls_ls[i] = -2.0 * h_mu_ls_coeff[i] * xi_mu[i] - 2.0 * h_ls_ls_coeff[i] * xi_ls[i];
+        }
+
+        let d_h_mu_mu = xt_diag_x_dense(x_mu, &dh_mu_mu)?;
+        let d_h_mu_ls = xt_diag_y_dense(x_mu, &dh_mu_ls, x_ls)?;
+        let d_h_ls_ls = xt_diag_x_dense(x_ls, &dh_ls_ls)?;
+        let mut out = Array2::<f64>::zeros((total, total));
+        out.slice_mut(s![0..p_mu, 0..p_mu]).assign(&d_h_mu_mu);
+        out.slice_mut(s![0..p_mu, p_mu..total]).assign(&d_h_mu_ls);
+        out.slice_mut(s![p_mu..total, p_mu..total]).assign(&d_h_ls_ls);
+        mirror_upper_to_lower(&mut out);
+        Ok(Some(out))
+    }
+
+    fn exact_newton_joint_hessian_second_directional_derivative_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_mu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_mu = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_mu.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("GaussianLocationScaleFamily input size mismatch".to_string());
+        }
+
+        let p_mu = x_mu.ncols();
+        let p_ls = x_ls.ncols();
+        let total = p_mu + p_ls;
+        if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
+            return Err(format!(
+                "GaussianLocationScaleFamily joint second directional derivative length mismatch: got {} and {}, expected {}",
+                d_beta_u_flat.len(),
+                d_beta_v_flat.len(),
+                total
+            ));
+        }
+        let u_mu = d_beta_u_flat.slice(s![0..p_mu]).to_owned();
+        let u_ls = d_beta_u_flat.slice(s![p_mu..p_mu + p_ls]).to_owned();
+        let v_mu = d_beta_v_flat.slice(s![0..p_mu]).to_owned();
+        let v_ls = d_beta_v_flat.slice(s![p_mu..p_mu + p_ls]).to_owned();
+        let xi_mu_u = x_mu.dot(&u_mu);
+        let xi_ls_u = x_ls.dot(&u_ls);
+        let xi_mu_v = x_mu.dot(&v_mu);
+        let xi_ls_v = x_ls.dot(&v_ls);
+        let sigma = eta_ls.mapv(f64::exp);
+        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
+        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
+        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
+        let mut d2h_mu_mu = Array1::<f64>::zeros(n);
+        let mut d2h_mu_ls = Array1::<f64>::zeros(n);
+        let mut d2h_ls_ls = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let s = sigma[i].max(1e-12);
+            let q = (self.y[i] - eta_mu[i]) / s;
+            let w = self.weights[i];
+            h_mu_mu_coeff[i] = w / (s * s);
+            h_mu_ls_coeff[i] = 2.0 * w * q / s;
+            h_ls_ls_coeff[i] = 2.0 * w * q * q;
+            d2h_mu_mu[i] = 4.0 * h_mu_mu_coeff[i] * xi_ls_u[i] * xi_ls_v[i];
+            d2h_mu_ls[i] = 4.0
+                * (h_mu_mu_coeff[i] * (xi_mu_u[i] * xi_ls_v[i] + xi_mu_v[i] * xi_ls_u[i])
+                    + h_mu_ls_coeff[i] * xi_ls_u[i] * xi_ls_v[i]);
+            d2h_ls_ls[i] = 4.0
+                * (h_mu_mu_coeff[i] * xi_mu_u[i] * xi_mu_v[i]
+                    + h_mu_ls_coeff[i]
+                        * (xi_mu_u[i] * xi_ls_v[i] + xi_mu_v[i] * xi_ls_u[i])
+                    + h_ls_ls_coeff[i] * xi_ls_u[i] * xi_ls_v[i]);
+        }
+
+        let d2_h_mu_mu = xt_diag_x_dense(x_mu, &d2h_mu_mu)?;
+        let d2_h_mu_ls = xt_diag_y_dense(x_mu, &d2h_mu_ls, x_ls)?;
+        let d2_h_ls_ls = xt_diag_x_dense(x_ls, &d2h_ls_ls)?;
+        let mut out = Array2::<f64>::zeros((total, total));
+        out.slice_mut(s![0..p_mu, 0..p_mu]).assign(&d2_h_mu_mu);
+        out.slice_mut(s![0..p_mu, p_mu..total]).assign(&d2_h_mu_ls);
+        out.slice_mut(s![p_mu..total, p_mu..total]).assign(&d2_h_ls_ls);
+        mirror_upper_to_lower(&mut out);
+        Ok(Some(out))
+    }
+
+    fn exact_newton_joint_psi_direction(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        x_mu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+        if block_states.len() != 2 || derivative_blocks.len() != 2 {
+            return Err(format!(
+                "GaussianLocationScaleFamily joint psi direction expects 2 blocks and 2 derivative block lists, got {} and {}",
+                block_states.len(),
+                derivative_blocks.len()
+            ));
+        }
+        let n = self.y.len();
+        let p_mu = x_mu.ncols();
+        let p_ls = x_ls.ncols();
+        let beta_mu = &block_states[Self::BLOCK_MU].beta;
+        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
+
+        let mut global = 0usize;
+        for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+            for (local_idx, deriv) in block_derivs.iter().enumerate() {
+                if global == psi_index {
+                    let mut x_mu_psi = Array2::<f64>::zeros((n, p_mu));
+                    let mut x_ls_psi = Array2::<f64>::zeros((n, p_ls));
+                    match block_idx {
+                        Self::BLOCK_MU => {
+                            if deriv.x_psi.nrows() != n || deriv.x_psi.ncols() != p_mu {
+                                return Err(format!(
+                                    "GaussianLocationScaleFamily mu x_psi shape mismatch: got {}x{}, expected {}x{}",
+                                    deriv.x_psi.nrows(),
+                                    deriv.x_psi.ncols(),
+                                    n,
+                                    p_mu
+                                ));
+                            }
+                            x_mu_psi.assign(&deriv.x_psi);
+                        }
+                        Self::BLOCK_LOG_SIGMA => {
+                            if deriv.x_psi.nrows() != n || deriv.x_psi.ncols() != p_ls {
+                                return Err(format!(
+                                    "GaussianLocationScaleFamily log-sigma x_psi shape mismatch: got {}x{}, expected {}x{}",
+                                    deriv.x_psi.nrows(),
+                                    deriv.x_psi.ncols(),
+                                    n,
+                                    p_ls
+                                ));
+                            }
+                            x_ls_psi.assign(&deriv.x_psi);
+                        }
+                        _ => return Ok(None),
+                    }
+                    return Ok(Some(GaussianLocationScaleJointPsiDirection {
+                        block_idx,
+                        local_idx,
+                        z_mu_psi: x_mu_psi.dot(beta_mu),
+                        z_ls_psi: x_ls_psi.dot(beta_ls),
+                        x_mu_psi,
+                        x_ls_psi,
+                    }));
+                }
+                global += 1;
+            }
+        }
+        Ok(None)
+    }
+
+    fn exact_newton_joint_psi_second_design_drifts(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_a: &GaussianLocationScaleJointPsiDirection,
+        psi_b: &GaussianLocationScaleJointPsiDirection,
+        x_mu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>, Array1<f64>), String> {
+        let n = self.y.len();
+        let p_mu = x_mu.ncols();
+        let p_ls = x_ls.ncols();
+        let beta_mu = &block_states[Self::BLOCK_MU].beta;
+        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
+        let mut x_mu_ab = Array2::<f64>::zeros((n, p_mu));
+        let mut x_ls_ab = Array2::<f64>::zeros((n, p_ls));
+        if psi_a.block_idx == psi_b.block_idx {
+            let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
+            if let Some(x_psi_psi) = deriv.x_psi_psi.as_ref() {
+                if let Some(x_ab) = x_psi_psi.get(psi_b.local_idx) {
+                    match psi_a.block_idx {
+                        Self::BLOCK_MU => {
+                            if x_ab.nrows() != n || x_ab.ncols() != p_mu {
+                                return Err(format!(
+                                    "GaussianLocationScaleFamily mu x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
+                                    x_ab.nrows(),
+                                    x_ab.ncols(),
+                                    n,
+                                    p_mu
+                                ));
+                            }
+                            x_mu_ab.assign(x_ab);
+                        }
+                        Self::BLOCK_LOG_SIGMA => {
+                            if x_ab.nrows() != n || x_ab.ncols() != p_ls {
+                                return Err(format!(
+                                    "GaussianLocationScaleFamily log-sigma x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
+                                    x_ab.nrows(),
+                                    x_ab.ncols(),
+                                    n,
+                                    p_ls
+                                ));
+                            }
+                            x_ls_ab.assign(x_ab);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let z_mu_ab = x_mu_ab.dot(beta_mu);
+        let z_ls_ab = x_ls_ab.dot(beta_ls);
+        Ok((x_mu_ab, x_ls_ab, z_mu_ab, z_ls_ab))
+    }
+
+    fn exact_newton_joint_psi_terms_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        x_mu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        if specs.len() != 2 || derivative_blocks.len() != 2 {
+            return Err(format!(
+                "GaussianLocationScaleFamily joint psi terms expect 2 specs and 2 derivative blocks, got {} and {}",
+                specs.len(),
+                derivative_blocks.len()
+            ));
+        }
+        let Some(dir_a) =
+            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_index, x_mu, x_ls)?
+        else {
+            return Ok(None);
+        };
+        // Gaussian 2-block location-scale family in the unified flattened
+        // coefficient space beta = [beta_mu; beta_sigma]:
+        //
+        //   mu_i = z_i^T beta_mu,
+        //   ell_i = x_i^T beta_sigma,
+        //   s_i = exp(ell_i),
+        //   r_i = y_i - mu_i,
+        //   q_i = r_i / s_i,
+        //   w_i = s_i^{-2},
+        //   alpha_i = r_i s_i^{-2},
+        //   b_i = q_i^2.
+        //
+        // The first fixed-beta psi object returned here is likelihood-only:
+        //
+        //   D_a         = -alpha^T m_a + (1 - b)^T ell_a
+        //   D_{beta a}  = [ -X_mu^T alpha_a - X_{mu,a}^T alpha ;
+        //                   -X_sigma^T b_a + X_{sigma,a}^T (1-b) ]
+        //   D_{bb a}    = [ X_mu^T W_a X_mu + X_{mu,a}^T W X_mu + X_mu^T W X_{mu,a},
+        //                   2( X_mu^T A_a X_sigma + X_{mu,a}^T A X_sigma + X_mu^T A X_{sigma,a} );
+        //                   sym,
+        //                   2( X_sigma^T B_a X_sigma + X_{sigma,a}^T B X_sigma + X_sigma^T B X_{sigma,a} ) ]
+        //
+        // with m_a = X_{mu,a} beta_mu, ell_a = X_{sigma,a} beta_sigma and
+        // rowwise scalar drifts
+        //
+        //   w_a     = -2 w * ell_a
+        //   alpha_a = -w * m_a - 2 alpha * ell_a
+        //   b_a     = -2 alpha * m_a - 2 b * ell_a.
+        //
+        // Generic code in custom_family.rs promotes these likelihood-only
+        // objects to the full fixed-beta V_a / g_a / H_a by adding S_a.
+        let n = self.y.len();
+        let eta_mu = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let sigma = eta_ls.mapv(f64::exp);
+        let p_mu = x_mu.ncols();
+        let p_ls = x_ls.ncols();
+        let total = p_mu + p_ls;
+        let mut score_mu = Array1::<f64>::zeros(n);
+        let mut score_ls = Array1::<f64>::zeros(n);
+        let mut dscore_mu = Array1::<f64>::zeros(n);
+        let mut dscore_ls = Array1::<f64>::zeros(n);
+        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
+        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
+        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
+        let mut dh_mu_mu = Array1::<f64>::zeros(n);
+        let mut dh_mu_ls = Array1::<f64>::zeros(n);
+        let mut dh_ls_ls = Array1::<f64>::zeros(n);
+        let mut objective_psi = 0.0;
+        for i in 0..n {
+            let s = sigma[i].max(1e-12);
+            let q = (self.y[i] - eta_mu[i]) / s;
+            let w = self.weights[i];
+            score_mu[i] = -w * q / s;
+            score_ls[i] = w * (1.0 - q * q);
+            h_mu_mu_coeff[i] = w / (s * s);
+            h_mu_ls_coeff[i] = 2.0 * w * q / s;
+            h_ls_ls_coeff[i] = 2.0 * w * q * q;
+            dscore_mu[i] = h_mu_mu_coeff[i] * dir_a.z_mu_psi[i] + h_mu_ls_coeff[i] * dir_a.z_ls_psi[i];
+            dscore_ls[i] = h_mu_ls_coeff[i] * dir_a.z_mu_psi[i] + h_ls_ls_coeff[i] * dir_a.z_ls_psi[i];
+            dh_mu_mu[i] = -2.0 * h_mu_mu_coeff[i] * dir_a.z_ls_psi[i];
+            dh_mu_ls[i] = -2.0 * h_mu_mu_coeff[i] * dir_a.z_mu_psi[i]
+                - 2.0 * h_mu_ls_coeff[i] * dir_a.z_ls_psi[i];
+            dh_ls_ls[i] = -2.0 * h_mu_ls_coeff[i] * dir_a.z_mu_psi[i]
+                - 2.0 * h_ls_ls_coeff[i] * dir_a.z_ls_psi[i];
+            objective_psi += score_mu[i] * dir_a.z_mu_psi[i] + score_ls[i] * dir_a.z_ls_psi[i];
+        }
+
+        let mut score_psi = Array1::<f64>::zeros(total);
+        score_psi
+            .slice_mut(s![0..p_mu])
+            .assign(&(dir_a.x_mu_psi.t().dot(&score_mu) + x_mu.t().dot(&dscore_mu)));
+        score_psi
+            .slice_mut(s![p_mu..p_mu + p_ls])
+            .assign(&(dir_a.x_ls_psi.t().dot(&score_ls) + x_ls.t().dot(&dscore_ls)));
+
+        let h_mu_mu = xt_diag_y_dense(&dir_a.x_mu_psi, &h_mu_mu_coeff, x_mu)?
+            + &xt_diag_y_dense(x_mu, &h_mu_mu_coeff, &dir_a.x_mu_psi)?
+            + &xt_diag_x_dense(x_mu, &dh_mu_mu)?;
+        let h_mu_ls = xt_diag_y_dense(&dir_a.x_mu_psi, &h_mu_ls_coeff, x_ls)?
+            + &xt_diag_y_dense(x_mu, &h_mu_ls_coeff, &dir_a.x_ls_psi)?
+            + &xt_diag_y_dense(x_mu, &dh_mu_ls, x_ls)?;
+        let h_ls_ls = xt_diag_y_dense(&dir_a.x_ls_psi, &h_ls_ls_coeff, x_ls)?
+            + &xt_diag_y_dense(x_ls, &h_ls_ls_coeff, &dir_a.x_ls_psi)?
+            + &xt_diag_x_dense(x_ls, &dh_ls_ls)?;
+
+        let mut hessian_psi = Array2::<f64>::zeros((total, total));
+        hessian_psi.slice_mut(s![0..p_mu, 0..p_mu]).assign(&h_mu_mu);
+        hessian_psi
+            .slice_mut(s![0..p_mu, p_mu..p_mu + p_ls])
+            .assign(&h_mu_ls);
+        hessian_psi
+            .slice_mut(s![p_mu..p_mu + p_ls, p_mu..p_mu + p_ls])
+            .assign(&h_ls_ls);
+        mirror_upper_to_lower(&mut hessian_psi);
+
+        Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+            objective_psi,
+            score_psi,
+            hessian_psi,
+        }))
+    }
+
+    fn exact_newton_joint_psi_second_order_terms_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+        x_mu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let Some(dir_i) =
+            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_i, x_mu, x_ls)?
+        else {
+            return Ok(None);
+        };
+        let Some(dir_j) =
+            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_j, x_mu, x_ls)?
+        else {
+            return Ok(None);
+        };
+        let (x_mu_ab, x_ls_ab, z_mu_ab, z_ls_ab) =
+            self.exact_newton_joint_psi_second_design_drifts(
+                block_states,
+                derivative_blocks,
+                &dir_i,
+                &dir_j,
+                x_mu,
+                x_ls,
+            )?;
+        // Second fixed-beta psi objects for the same Gaussian location-scale
+        // kernel. Using the notation from the first-order comment, the rowwise
+        // second psi drifts are
+        //
+        //   w_ab     = 4 w * ell_a * ell_b - 2 w * ell_ab
+        //   alpha_ab = 2 w * (m_a * ell_b + m_b * ell_a)
+        //              + 4 alpha * ell_a * ell_b
+        //              - w * m_ab
+        //              - 2 alpha * ell_ab
+        //   b_ab     = 2 w * m_a * m_b
+        //              + 4 alpha * (m_a * ell_b + m_b * ell_a)
+        //              + 4 b * ell_a * ell_b
+        //              - 2 alpha * m_ab
+        //              - 2 b * ell_ab.
+        //
+        // The exact likelihood-only second-order objects are then:
+        //
+        //   D_ab,
+        //   D_{beta ab},
+        //   D_{beta beta ab},
+        //
+        // assembled from the usual product-rule expansion over realized
+        // design motion X_{.,a}, X_{.,b}, X_{.,ab}. Generic code adds S_ab.
+        let n = self.y.len();
+        let eta_mu = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let sigma = eta_ls.mapv(f64::exp);
+        let p_mu = x_mu.ncols();
+        let p_ls = x_ls.ncols();
+        let total = p_mu + p_ls;
+
+        let mut score_mu = Array1::<f64>::zeros(n);
+        let mut score_ls = Array1::<f64>::zeros(n);
+        let mut dscore_mu_i = Array1::<f64>::zeros(n);
+        let mut dscore_mu_j = Array1::<f64>::zeros(n);
+        let mut dscore_ls_i = Array1::<f64>::zeros(n);
+        let mut dscore_ls_j = Array1::<f64>::zeros(n);
+        let mut d2score_mu = Array1::<f64>::zeros(n);
+        let mut d2score_ls = Array1::<f64>::zeros(n);
+        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
+        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
+        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
+        let mut dh_mu_mu_i = Array1::<f64>::zeros(n);
+        let mut dh_mu_mu_j = Array1::<f64>::zeros(n);
+        let mut dh_mu_ls_i = Array1::<f64>::zeros(n);
+        let mut dh_mu_ls_j = Array1::<f64>::zeros(n);
+        let mut dh_ls_ls_i = Array1::<f64>::zeros(n);
+        let mut dh_ls_ls_j = Array1::<f64>::zeros(n);
+        let mut d2h_mu_mu = Array1::<f64>::zeros(n);
+        let mut d2h_mu_ls = Array1::<f64>::zeros(n);
+        let mut d2h_ls_ls = Array1::<f64>::zeros(n);
+        let mut objective_psi_psi = 0.0;
+        for i in 0..n {
+            let s = sigma[i].max(1e-12);
+            let q = (self.y[i] - eta_mu[i]) / s;
+            let w = self.weights[i];
+            score_mu[i] = -w * q / s;
+            score_ls[i] = w * (1.0 - q * q);
+            h_mu_mu_coeff[i] = w / (s * s);
+            h_mu_ls_coeff[i] = 2.0 * w * q / s;
+            h_ls_ls_coeff[i] = 2.0 * w * q * q;
+            dscore_mu_i[i] = h_mu_mu_coeff[i] * dir_i.z_mu_psi[i] + h_mu_ls_coeff[i] * dir_i.z_ls_psi[i];
+            dscore_mu_j[i] = h_mu_mu_coeff[i] * dir_j.z_mu_psi[i] + h_mu_ls_coeff[i] * dir_j.z_ls_psi[i];
+            dscore_ls_i[i] = h_mu_ls_coeff[i] * dir_i.z_mu_psi[i] + h_ls_ls_coeff[i] * dir_i.z_ls_psi[i];
+            dscore_ls_j[i] = h_mu_ls_coeff[i] * dir_j.z_mu_psi[i] + h_ls_ls_coeff[i] * dir_j.z_ls_psi[i];
+            d2score_mu[i] = h_mu_mu_coeff[i]
+                * (z_mu_ab[i]
+                    - 2.0 * (dir_i.z_mu_psi[i] * dir_j.z_ls_psi[i]
+                        + dir_j.z_mu_psi[i] * dir_i.z_ls_psi[i]))
+                + h_mu_ls_coeff[i] * (z_ls_ab[i] - 2.0 * dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i]);
+            d2score_ls[i] = -2.0 * h_mu_mu_coeff[i] * dir_i.z_mu_psi[i] * dir_j.z_mu_psi[i]
+                + h_mu_ls_coeff[i]
+                    * (z_mu_ab[i]
+                        - 2.0 * (dir_i.z_mu_psi[i] * dir_j.z_ls_psi[i]
+                            + dir_j.z_mu_psi[i] * dir_i.z_ls_psi[i]))
+                + h_ls_ls_coeff[i] * (z_ls_ab[i] - 2.0 * dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i]);
+            dh_mu_mu_i[i] = -2.0 * h_mu_mu_coeff[i] * dir_i.z_ls_psi[i];
+            dh_mu_mu_j[i] = -2.0 * h_mu_mu_coeff[i] * dir_j.z_ls_psi[i];
+            dh_mu_ls_i[i] = -2.0 * h_mu_mu_coeff[i] * dir_i.z_mu_psi[i]
+                - 2.0 * h_mu_ls_coeff[i] * dir_i.z_ls_psi[i];
+            dh_mu_ls_j[i] = -2.0 * h_mu_mu_coeff[i] * dir_j.z_mu_psi[i]
+                - 2.0 * h_mu_ls_coeff[i] * dir_j.z_ls_psi[i];
+            dh_ls_ls_i[i] = -2.0 * h_mu_ls_coeff[i] * dir_i.z_mu_psi[i]
+                - 2.0 * h_ls_ls_coeff[i] * dir_i.z_ls_psi[i];
+            dh_ls_ls_j[i] = -2.0 * h_mu_ls_coeff[i] * dir_j.z_mu_psi[i]
+                - 2.0 * h_ls_ls_coeff[i] * dir_j.z_ls_psi[i];
+            d2h_mu_mu[i] = 4.0 * h_mu_mu_coeff[i] * dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i]
+                - 2.0 * h_mu_mu_coeff[i] * z_ls_ab[i];
+            d2h_mu_ls[i] = 4.0
+                * (h_mu_mu_coeff[i]
+                    * (dir_i.z_mu_psi[i] * dir_j.z_ls_psi[i]
+                        + dir_j.z_mu_psi[i] * dir_i.z_ls_psi[i])
+                    + h_mu_ls_coeff[i] * dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i])
+                - 2.0 * h_mu_mu_coeff[i] * z_mu_ab[i]
+                - 2.0 * h_mu_ls_coeff[i] * z_ls_ab[i];
+            d2h_ls_ls[i] = 4.0
+                * (h_mu_mu_coeff[i] * dir_i.z_mu_psi[i] * dir_j.z_mu_psi[i]
+                    + h_mu_ls_coeff[i]
+                        * (dir_i.z_mu_psi[i] * dir_j.z_ls_psi[i]
+                            + dir_j.z_mu_psi[i] * dir_i.z_ls_psi[i])
+                    + h_ls_ls_coeff[i] * dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i])
+                - 2.0 * h_mu_ls_coeff[i] * z_mu_ab[i]
+                - 2.0 * h_ls_ls_coeff[i] * z_ls_ab[i];
+            let q_i = -dir_i.z_mu_psi[i] / s - q * dir_i.z_ls_psi[i];
+            let q_j = -dir_j.z_mu_psi[i] / s - q * dir_j.z_ls_psi[i];
+            let q_ij = -z_mu_ab[i] / s
+                + (dir_i.z_mu_psi[i] * dir_j.z_ls_psi[i]
+                    + dir_j.z_mu_psi[i] * dir_i.z_ls_psi[i])
+                    / s
+                + q * (dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i] - z_ls_ab[i]);
+            objective_psi_psi += w * (q_i * q_j + q * q_ij + z_ls_ab[i]);
+        }
+
+        let mut score_psi_psi = Array1::<f64>::zeros(total);
+        score_psi_psi.slice_mut(s![0..p_mu]).assign(
+            &(x_mu_ab.t().dot(&score_mu)
+                + dir_i.x_mu_psi.t().dot(&dscore_mu_j)
+                + dir_j.x_mu_psi.t().dot(&dscore_mu_i)
+                + x_mu.t().dot(&d2score_mu)),
+        );
+        score_psi_psi.slice_mut(s![p_mu..p_mu + p_ls]).assign(
+            &(x_ls_ab.t().dot(&score_ls)
+                + dir_i.x_ls_psi.t().dot(&dscore_ls_j)
+                + dir_j.x_ls_psi.t().dot(&dscore_ls_i)
+                + x_ls.t().dot(&d2score_ls)),
+        );
+
+        let h_mu_mu = xt_diag_y_dense(&x_mu_ab, &h_mu_mu_coeff, x_mu)?
+            + &xt_diag_y_dense(&dir_i.x_mu_psi, &h_mu_mu_coeff, &dir_j.x_mu_psi)?
+            + &xt_diag_y_dense(&dir_j.x_mu_psi, &h_mu_mu_coeff, &dir_i.x_mu_psi)?
+            + &xt_diag_y_dense(&dir_i.x_mu_psi, &dh_mu_mu_j, x_mu)?
+            + &xt_diag_y_dense(&dir_j.x_mu_psi, &dh_mu_mu_i, x_mu)?
+            + &xt_diag_y_dense(x_mu, &dh_mu_mu_i, &dir_j.x_mu_psi)?
+            + &xt_diag_y_dense(x_mu, &dh_mu_mu_j, &dir_i.x_mu_psi)?
+            + &xt_diag_x_dense(x_mu, &d2h_mu_mu)?
+            + &xt_diag_y_dense(x_mu, &h_mu_mu_coeff, &x_mu_ab)?;
+        let h_mu_ls = xt_diag_y_dense(&x_mu_ab, &h_mu_ls_coeff, x_ls)?
+            + &xt_diag_y_dense(&dir_i.x_mu_psi, &h_mu_ls_coeff, &dir_j.x_ls_psi)?
+            + &xt_diag_y_dense(&dir_j.x_mu_psi, &h_mu_ls_coeff, &dir_i.x_ls_psi)?
+            + &xt_diag_y_dense(&dir_i.x_mu_psi, &dh_mu_ls_j, x_ls)?
+            + &xt_diag_y_dense(&dir_j.x_mu_psi, &dh_mu_ls_i, x_ls)?
+            + &xt_diag_y_dense(x_mu, &dh_mu_ls_i, &dir_j.x_ls_psi)?
+            + &xt_diag_y_dense(x_mu, &dh_mu_ls_j, &dir_i.x_ls_psi)?
+            + &xt_diag_y_dense(x_mu, &d2h_mu_ls, x_ls)?
+            + &xt_diag_y_dense(x_mu, &h_mu_ls_coeff, &x_ls_ab)?;
+        let h_ls_ls = xt_diag_y_dense(&x_ls_ab, &h_ls_ls_coeff, x_ls)?
+            + &xt_diag_y_dense(&dir_i.x_ls_psi, &h_ls_ls_coeff, &dir_j.x_ls_psi)?
+            + &xt_diag_y_dense(&dir_j.x_ls_psi, &h_ls_ls_coeff, &dir_i.x_ls_psi)?
+            + &xt_diag_y_dense(&dir_i.x_ls_psi, &dh_ls_ls_j, x_ls)?
+            + &xt_diag_y_dense(&dir_j.x_ls_psi, &dh_ls_ls_i, x_ls)?
+            + &xt_diag_y_dense(x_ls, &dh_ls_ls_i, &dir_j.x_ls_psi)?
+            + &xt_diag_y_dense(x_ls, &dh_ls_ls_j, &dir_i.x_ls_psi)?
+            + &xt_diag_x_dense(x_ls, &d2h_ls_ls)?
+            + &xt_diag_y_dense(x_ls, &h_ls_ls_coeff, &x_ls_ab)?;
+
+        let mut hessian_psi_psi = Array2::<f64>::zeros((total, total));
+        hessian_psi_psi
+            .slice_mut(s![0..p_mu, 0..p_mu])
+            .assign(&h_mu_mu);
+        hessian_psi_psi
+            .slice_mut(s![0..p_mu, p_mu..p_mu + p_ls])
+            .assign(&h_mu_ls);
+        hessian_psi_psi
+            .slice_mut(s![p_mu..p_mu + p_ls, p_mu..p_mu + p_ls])
+            .assign(&h_ls_ls);
+        mirror_upper_to_lower(&mut hessian_psi_psi);
+
+        Ok(Some(
+            crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
+                objective_psi_psi,
+                score_psi_psi,
+                hessian_psi_psi,
+            },
+        ))
+    }
+
+    fn exact_newton_joint_psi_hessian_directional_derivative_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+        x_mu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some(dir_a) =
+            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_index, x_mu, x_ls)?
+        else {
+            return Ok(None);
+        };
+        let n = self.y.len();
+        let eta_mu = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_mu.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("GaussianLocationScaleFamily input size mismatch".to_string());
+        }
+        let p_mu = x_mu.ncols();
+        let p_ls = x_ls.ncols();
+        let total = p_mu + p_ls;
+        if d_beta_flat.len() != total {
+            return Err(format!(
+                "GaussianLocationScaleFamily joint psi hessian directional derivative length mismatch: got {}, expected {}",
+                d_beta_flat.len(),
+                total
+            ));
+        }
+        let u_mu = d_beta_flat.slice(s![0..p_mu]).to_owned();
+        let u_ls = d_beta_flat.slice(s![p_mu..p_mu + p_ls]).to_owned();
+        let xi_mu = x_mu.dot(&u_mu);
+        let xi_ls = x_ls.dot(&u_ls);
+        let uza_mu = dir_a.x_mu_psi.dot(&u_mu);
+        let uza_ls = dir_a.x_ls_psi.dot(&u_ls);
+        // Mixed drift T_a[u] = D_beta H_a^{(D)}[u] for the Gaussian family.
+        //
+        // Along u = [u_mu; u_sigma], define xi = X_mu u_mu and zeta = X_sigma u_sigma.
+        // The first beta-directional drifts of the Gaussian row scalars are
+        //
+        //   d_u w     = -2 w * zeta
+        //   d_u alpha = -w * xi - 2 alpha * zeta
+        //   d_u b     = -2 alpha * xi - 2 b * zeta.
+        //
+        // Differentiating the psi-a scalar drifts once more gives
+        //
+        //   d_u w_a     = 4 w * ell_a * zeta - 2 w * zeta_a
+        //   d_u alpha_a = 2 w * (m_a * zeta + ell_a * xi)
+        //                 - w * xi_a
+        //                 + 4 alpha * ell_a * zeta
+        //                 - 2 alpha * zeta_a
+        //   d_u b_a     = 2 w * m_a * xi
+        //                 + 4 alpha * (m_a * zeta + ell_a * xi)
+        //                 + 4 b * ell_a * zeta
+        //                 - 2 alpha * xi_a
+        //                 - 2 b * zeta_a.
+        //
+        // The matrix drift returned here is the exact likelihood-only
+        //
+        //   T_a[u] = D_beta H_{psi_a}^{(D)}[u],
+        //
+        // assembled blockwise as
+        //
+        //   K_mumu,a[u]   = X_mu^T W_a[u] X_mu
+        //                   + X_{mu,a}^T W[u] X_mu
+        //                   + X_mu^T W[u] X_{mu,a}
+        //   K_musigma,a[u]= 2( X_mu^T A_a[u] X_sigma
+        //                   + X_{mu,a}^T A[u] X_sigma
+        //                   + X_mu^T A[u] X_{sigma,a} )
+        //   K_sigmasigma,a[u]
+        //                   = 2( X_sigma^T B_a[u] X_sigma
+        //                   + X_{sigma,a}^T B[u] X_sigma
+        //                   + X_sigma^T B[u] X_{sigma,a} ).
+        //
+        // Generic code then combines this with S(theta)-motion and the profile
+        // mode responses to form ddot H_{ij}.
+        let sigma = eta_ls.mapv(f64::exp);
+        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
+        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
+        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
+        let mut dh_mu_mu_u = Array1::<f64>::zeros(n);
+        let mut dh_mu_ls_u = Array1::<f64>::zeros(n);
+        let mut dh_ls_ls_u = Array1::<f64>::zeros(n);
+        let mut d2h_mu_mu = Array1::<f64>::zeros(n);
+        let mut d2h_mu_ls = Array1::<f64>::zeros(n);
+        let mut d2h_ls_ls = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let s = sigma[i].max(1e-12);
+            let q = (self.y[i] - eta_mu[i]) / s;
+            let w = self.weights[i];
+            h_mu_mu_coeff[i] = w / (s * s);
+            h_mu_ls_coeff[i] = 2.0 * w * q / s;
+            h_ls_ls_coeff[i] = 2.0 * w * q * q;
+            dh_mu_mu_u[i] = -2.0 * h_mu_mu_coeff[i] * xi_ls[i];
+            dh_mu_ls_u[i] = -2.0 * h_mu_mu_coeff[i] * xi_mu[i] - 2.0 * h_mu_ls_coeff[i] * xi_ls[i];
+            dh_ls_ls_u[i] = -2.0 * h_mu_ls_coeff[i] * xi_mu[i] - 2.0 * h_ls_ls_coeff[i] * xi_ls[i];
+            d2h_mu_mu[i] = 4.0 * h_mu_mu_coeff[i] * xi_ls[i] * dir_a.z_ls_psi[i]
+                - 2.0 * h_mu_mu_coeff[i] * uza_ls[i];
+            d2h_mu_ls[i] = 4.0
+                * (h_mu_mu_coeff[i]
+                    * (xi_ls[i] * dir_a.z_mu_psi[i] + xi_mu[i] * dir_a.z_ls_psi[i])
+                    + h_mu_ls_coeff[i] * xi_ls[i] * dir_a.z_ls_psi[i])
+                - 2.0 * h_mu_mu_coeff[i] * uza_mu[i]
+                - 2.0 * h_mu_ls_coeff[i] * uza_ls[i];
+            d2h_ls_ls[i] = 4.0
+                * (h_mu_mu_coeff[i] * xi_mu[i] * dir_a.z_mu_psi[i]
+                    + h_mu_ls_coeff[i]
+                        * (xi_ls[i] * dir_a.z_mu_psi[i] + xi_mu[i] * dir_a.z_ls_psi[i])
+                    + h_ls_ls_coeff[i] * xi_ls[i] * dir_a.z_ls_psi[i])
+                - 2.0 * h_mu_ls_coeff[i] * uza_mu[i]
+                - 2.0 * h_ls_ls_coeff[i] * uza_ls[i];
+        }
+
+        let tt_block = xt_diag_y_dense(&dir_a.x_mu_psi, &dh_mu_mu_u, x_mu)?
+            + &xt_diag_y_dense(x_mu, &dh_mu_mu_u, &dir_a.x_mu_psi)?
+            + &xt_diag_x_dense(x_mu, &d2h_mu_mu)?;
+        let tl_block = xt_diag_y_dense(&dir_a.x_mu_psi, &dh_mu_ls_u, x_ls)?
+            + &xt_diag_y_dense(x_mu, &dh_mu_ls_u, &dir_a.x_ls_psi)?
+            + &xt_diag_y_dense(x_mu, &d2h_mu_ls, x_ls)?;
+        let ll_block = xt_diag_y_dense(&dir_a.x_ls_psi, &dh_ls_ls_u, x_ls)?
+            + &xt_diag_y_dense(x_ls, &dh_ls_ls_u, &dir_a.x_ls_psi)?
+            + &xt_diag_x_dense(x_ls, &d2h_ls_ls)?;
+
+        let mut out = Array2::<f64>::zeros((total, total));
+        out.slice_mut(s![0..p_mu, 0..p_mu]).assign(&tt_block);
+        out.slice_mut(s![0..p_mu, p_mu..p_mu + p_ls]).assign(&tl_block);
+        out.slice_mut(s![p_mu..p_mu + p_ls, p_mu..p_mu + p_ls])
+            .assign(&ll_block);
+        mirror_upper_to_lower(&mut out);
+        Ok(Some(out))
     }
 }
 
@@ -3448,26 +4278,46 @@ impl CustomFamily for GaussianLocationScaleFamily {
 
     fn exact_newton_joint_hessian(
         &self,
-        _block_states: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        let Some((x_mu, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_from_designs(block_states, &x_mu, &x_ls)
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _d_beta_flat: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        let Some((x_mu, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_directional_derivative_from_designs(
+            block_states,
+            &x_mu,
+            &x_ls,
+            d_beta_flat,
+        )
     }
 
     fn exact_newton_joint_hessian_second_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _d_beta_u_flat: &Array1<f64>,
-        _d_beta_v_flat: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        let Some((x_mu, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_second_directional_derivative_from_designs(
+            block_states,
+            &x_mu,
+            &x_ls,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
     }
 
     fn diagonal_working_weights_directional_derivative(
@@ -3538,6 +4388,115 @@ impl CustomFamily for GaussianLocationScaleFamily {
             }
             _ => Ok(None),
         }
+    }
+
+    fn exact_newton_joint_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_mu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_from_designs(block_states, &x_mu, &x_ls)
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_mu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_directional_derivative_from_designs(
+            block_states,
+            &x_mu,
+            &x_ls,
+            d_beta_flat,
+        )
+    }
+
+    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_mu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_second_directional_derivative_from_designs(
+            block_states,
+            &x_mu,
+            &x_ls,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+    }
+
+    fn exact_newton_joint_psi_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        let Some((x_mu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psi_terms_from_designs(
+            block_states,
+            specs,
+            derivative_blocks,
+            psi_index,
+            &x_mu,
+            &x_ls,
+        )
+    }
+
+    fn exact_newton_joint_psi_second_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let Some((x_mu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psi_second_order_terms_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_i,
+            psi_j,
+            &x_mu,
+            &x_ls,
+        )
+    }
+
+    fn exact_newton_joint_psi_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_mu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psi_hessian_directional_derivative_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            d_beta_flat,
+            &x_mu,
+            &x_ls,
+        )
     }
 }
 
@@ -5603,6 +6562,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
             d_beta_v_flat,
         )
     }
+
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleFamily {
@@ -9099,6 +10059,80 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_location_scale_exact_newton_spatial_joint_hyper_returns_full_hessian() {
+        let n = 12usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
+        }
+        let y = Array1::from_iter((0..n).map(|i| {
+            let x0 = data[[i, 0]];
+            let x1 = data[[i, 1]];
+            0.4 * x0 - 0.2 * x1 + 0.15
+        }));
+        let weights = Array1::from_elem(n, 1.0);
+        let mean_spec = simple_matern_term_collection(&[0, 1], 0.45);
+        let noise_spec = simple_matern_term_collection(&[0, 1], 0.8);
+        let builder = GaussianLocationScaleTermBuilder {
+            y,
+            weights,
+            mean_spec: mean_spec.clone(),
+            noise_spec: noise_spec.clone(),
+        };
+        let mean_design =
+            build_term_collection_design(data.view(), &mean_spec).expect("build mean design");
+        let noise_design =
+            build_term_collection_design(data.view(), &noise_spec).expect("build noise design");
+        let mean_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(&mean_spec, &mean_design)
+                .expect("freeze mean spec");
+        let noise_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(&noise_spec, &noise_design)
+                .expect("freeze noise spec");
+        let rho =
+            compose_theta_from_hints(&mean_design, &noise_design, &None, &None, &Array1::zeros(0));
+        let blocks = builder
+            .build_blocks(&rho, &mean_design, &noise_design, None, None)
+            .expect("build blocks");
+        let family = builder.build_family(&mean_design, &noise_design);
+        let derivative_blocks = builder
+            .build_psi_derivative_blocks(
+                data.view(),
+                &mean_spec_resolved,
+                &noise_spec_resolved,
+                &mean_design,
+                &noise_design,
+            )
+            .expect("psi derivative blocks");
+        let eval = evaluate_custom_family_joint_hyper(
+            &family,
+            &blocks,
+            &BlockwiseFitOptions {
+                use_reml_objective: true,
+                outer_max_iter: 1,
+                ..BlockwiseFitOptions::default()
+            },
+            &rho,
+            &derivative_blocks,
+            None,
+            true,
+        )
+        .expect("exact spatial joint hyper eval");
+        assert!(eval.objective.is_finite());
+        assert!(eval.gradient.iter().all(|v| v.is_finite()));
+        let hess = eval
+            .outer_hessian
+            .expect("exact spatial joint hyper path should return a full [rho, psi] hessian");
+        let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
+        let theta_dim = rho.len() + psi_dim;
+        assert_eq!(hess.nrows(), theta_dim);
+        assert_eq!(hess.ncols(), theta_dim);
+        assert!(hess.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn binomial_location_scale_wiggle_family_exposes_joint_psi_hook_surface() {
         let n = 12usize;
         let mut data = Array2::<f64>::zeros((n, 2));
@@ -9214,6 +10248,110 @@ mod tests {
             )
             .expect("joint psi mixed drift call")
             .expect("wiggle family should return joint psi mixed drift");
+        assert_eq!(mixed.dim(), (total, total));
+    }
+
+    #[test]
+    fn gaussian_location_scale_family_exposes_joint_psi_hook_surface() {
+        let n = 10usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.0 * std::f64::consts::PI * t).cos();
+        }
+        let y = Array1::from_iter((0..n).map(|i| {
+            let x0 = data[[i, 0]];
+            let x1 = data[[i, 1]];
+            0.3 * x0 - 0.15 * x1 + 0.2
+        }));
+        let weights = Array1::from_elem(n, 1.0);
+        let mean_spec = simple_matern_term_collection(&[0, 1], 0.4);
+        let noise_spec = simple_matern_term_collection(&[0, 1], 0.7);
+        let builder = GaussianLocationScaleTermBuilder {
+            y,
+            weights,
+            mean_spec: mean_spec.clone(),
+            noise_spec: noise_spec.clone(),
+        };
+        let mean_design =
+            build_term_collection_design(data.view(), &mean_spec).expect("build mean design");
+        let noise_design =
+            build_term_collection_design(data.view(), &noise_spec).expect("build noise design");
+        let mean_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(&mean_spec, &mean_design)
+                .expect("freeze mean spec");
+        let noise_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(&noise_spec, &noise_design)
+                .expect("freeze noise spec");
+        let rho =
+            compose_theta_from_hints(&mean_design, &noise_design, &None, &None, &Array1::zeros(0));
+        let blocks = builder
+            .build_blocks(&rho, &mean_design, &noise_design, None, None)
+            .expect("build blocks");
+        let family = builder.build_family(&mean_design, &noise_design);
+        let fit = fit_custom_family(
+            &family,
+            &blocks,
+            &BlockwiseFitOptions {
+                use_reml_objective: true,
+                outer_max_iter: 1,
+                ..BlockwiseFitOptions::default()
+            },
+        )
+        .expect("fit gaussian family for joint psi hooks");
+        let derivative_blocks = builder
+            .build_psi_derivative_blocks(
+                data.view(),
+                &mean_spec_resolved,
+                &noise_spec_resolved,
+                &mean_design,
+                &noise_design,
+            )
+            .expect("psi derivative blocks");
+        let psi_terms = family
+            .exact_newton_joint_psi_terms(&fit.block_states, &blocks, &derivative_blocks, 0)
+            .expect("joint psi terms call")
+            .expect("gaussian family should return joint psi terms");
+        let psi2_terms = family
+            .exact_newton_joint_psi_second_order_terms(
+                &fit.block_states,
+                &blocks,
+                &derivative_blocks,
+                0,
+                0,
+            )
+            .expect("joint psi second-order call")
+            .expect("gaussian family should return joint psi second-order terms");
+        let total = fit
+            .block_states
+            .iter()
+            .map(|state| state.beta.len())
+            .sum::<usize>();
+        assert_eq!(psi_terms.score_psi.len(), total);
+        assert_eq!(psi_terms.hessian_psi.dim(), (total, total));
+        assert_eq!(psi2_terms.score_psi_psi.len(), total);
+        assert_eq!(psi2_terms.hessian_psi_psi.dim(), (total, total));
+
+        let mut d_beta_flat = Array1::<f64>::zeros(total);
+        let mut at = 0usize;
+        for state in &fit.block_states {
+            let end = at + state.beta.len();
+            d_beta_flat
+                .slice_mut(s![at..end])
+                .assign(&state.beta.mapv(|v| 0.2 * v + 0.15));
+            at = end;
+        }
+        let mixed = family
+            .exact_newton_joint_psi_hessian_directional_derivative(
+                &fit.block_states,
+                &blocks,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+            )
+            .expect("joint psi mixed drift call")
+            .expect("gaussian family should return joint psi mixed drift");
         assert_eq!(mixed.dim(), (total, total));
     }
 

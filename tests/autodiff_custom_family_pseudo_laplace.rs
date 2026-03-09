@@ -223,7 +223,7 @@ fn exact_newton_pseudo_laplace_psi_gradient_matches_num_dual_band() {
         initial_beta: Some(array![0.0]),
     };
     let deriv = CustomFamilyBlockPsiDerivative {
-        penalty_index: 0,
+        penalty_index: Some(0),
         x_psi: Array2::zeros((1, 1)),
         s_psi: Array2::zeros((1, 1)),
         s_psi_components: Some(Vec::new()),

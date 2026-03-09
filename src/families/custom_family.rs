@@ -402,6 +402,68 @@ pub trait CustomFamily {
         )
     }
 
+    /// Optional joint multi-block outer-hyper surrogate Hessian over the
+    /// flattened coefficient vector.
+    ///
+    /// This hook exists for families whose inner working representation is
+    /// block-diagonal/diagonal in `evaluate(...)`, but whose outer profiled
+    /// smoothing derivatives are still joint because the fitted mode response
+    /// couples blocks. The generic blockwise outer-hyper surrogate only sees
+    /// per-block working sets, so it cannot recover missing cross-block
+    /// curvature on its own.
+    ///
+    /// Families that can construct a mathematically valid joint surrogate
+    /// `H_L(beta)` for the current realized `specs` may override this and the
+    /// two directional derivative hooks below. Generic code then reuses the
+    /// same joint rho-calculus as the exact path, but on the family-supplied
+    /// surrogate curvature instead of the exact Newton Hessian.
+    ///
+    /// Default behavior is to reuse the spec-aware exact joint curvature when
+    /// the family already provides it. That is the mathematically correct
+    /// repair for the old broken multi-block blockwise surrogate path: if the
+    /// family knows the full coupled Hessian and its beta-drifts, generic code
+    /// should use that joint information instead of pretending per-block
+    /// working sets are enough.
+    fn joint_outer_hyper_surrogate_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_with_specs(block_states, specs)
+    }
+
+    /// Optional first beta-directional derivative of the joint surrogate
+    /// outer-hyper Hessian.
+    fn joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_directional_derivative_with_specs(
+            block_states,
+            specs,
+            d_beta_flat,
+        )
+    }
+
+    /// Optional second beta-directional derivative of the joint surrogate
+    /// outer-hyper Hessian.
+    fn joint_outer_hyper_surrogate_hessian_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_second_directional_derivative_with_specs(
+            block_states,
+            specs,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+    }
+
     /// Optional exact directional derivative of diagonal working weights along
     /// a predictor-space direction `d_eta` for `BlockWorkingSet::Diagonal`.
     ///
@@ -613,7 +675,7 @@ fn finite_penalized_objective(log_likelihood: f64, penalty_value: f64, reml_term
 
 #[derive(Clone)]
 pub struct CustomFamilyBlockPsiDerivative {
-    pub penalty_index: usize,
+    pub penalty_index: Option<usize>,
     pub x_psi: Array2<f64>,
     pub s_psi: Array2<f64>,
     pub s_psi_components: Option<Vec<(usize, Array2<f64>)>>,
@@ -2734,14 +2796,327 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
             inner,
         });
     }
-    // At this point the joint exact path is unavailable. For some families
-    // that is acceptable: the generic blockwise diagonal surrogate below is
-    // the best derivative information they can provide.
+    if let Some(h_joint_unpen) = family
+        .joint_outer_hyper_surrogate_hessian_with_specs(&inner.block_states, specs)?
+        .map(|h| {
+            symmetrized_square_matrix(
+                h,
+                total,
+                "joint outer-hyper surrogate Hessian shape mismatch",
+            )
+        })
+        .transpose()?
+    {
+        let beta_flat = flatten_state_betas(&inner.block_states, specs);
+        let mut s_joint = Array2::<f64>::zeros((total, total));
+        let mut s_pinv_joint = if include_logdet_s {
+            Some(Array2::<f64>::zeros((total, total)))
+        } else {
+            None
+        };
+        for (b, spec) in specs.iter().enumerate() {
+            let (start, end) = ranges[b];
+            let p = end - start;
+            let lambdas = per_block[b].mapv(f64::exp);
+            let mut s_lambda = Array2::<f64>::zeros((p, p));
+            for (k, s) in spec.penalties.iter().enumerate() {
+                s_lambda.scaled_add(lambdas[k], s);
+            }
+            s_joint
+                .slice_mut(ndarray::s![start..end, start..end])
+                .assign(&s_lambda);
+            if mode_ridge > 0.0 {
+                for d in start..end {
+                    s_joint[[d, d]] += mode_ridge;
+                }
+            }
+            if let Some(s_pinv) = s_pinv_joint.as_mut() {
+                let mut s_for_logdet = s_lambda.clone();
+                if options.ridge_policy.include_penalty_logdet {
+                    for d in 0..p {
+                        s_for_logdet[[d, d]] += ridge;
+                    }
+                }
+                let s_floor = if options.ridge_policy.include_penalty_logdet {
+                    ridge
+                } else {
+                    0.0
+                }
+                .max(1e-14);
+                let s_part = pinv_positive_part_with_floor(&s_for_logdet, s_floor)?;
+                s_pinv
+                    .slice_mut(ndarray::s![start..end, start..end])
+                    .assign(&s_part);
+            }
+        }
+        let mut j_joint = h_joint_unpen.clone();
+        j_joint += &s_joint;
+        let mut j_for_traces = j_joint.clone();
+        if !strict_spd && extra_logdet_ridge > 0.0 {
+            for d in 0..total {
+                j_for_traces[[d, d]] += extra_logdet_ridge;
+            }
+        }
+        let h_inv = logdet_trace_inverse_with_ridge_policy(
+            &j_for_traces,
+            options.ridge_floor,
+            options.ridge_policy,
+            strict_spd,
+            allow_semidefinite,
+        )?;
+        let logdet_h_total = if include_logdet_h {
+            if strict_spd {
+                strict_logdet_spd_with_semidefinite_option(&j_for_traces, allow_semidefinite)?
+            } else {
+                stable_logdet_with_ridge_policy(
+                    &j_for_traces,
+                    options.ridge_floor,
+                    options.ridge_policy,
+                )?
+            }
+        } else {
+            0.0
+        };
+        let logdet_s_total = if include_logdet_s {
+            let mut acc = 0.0;
+            for (b, spec) in specs.iter().enumerate() {
+                let lambdas = per_block[b].mapv(f64::exp);
+                let mut s_lambda = Array2::<f64>::zeros(spec.penalties[0].raw_dim());
+                for (k, s) in spec.penalties.iter().enumerate() {
+                    s_lambda.scaled_add(lambdas[k], s);
+                }
+                acc += stable_logdet_with_ridge_policy(
+                    &s_lambda,
+                    options.ridge_floor,
+                    options.ridge_policy,
+                )?;
+            }
+            acc
+        } else {
+            0.0
+        };
+        let objective = -inner.log_likelihood + inner.penalty_value + 0.5 * logdet_h_total
+            - 0.5 * logdet_s_total;
+
+        let mut at = 0usize;
+        let mut a_terms: Vec<Array2<f64>> = Vec::new();
+        let mut a_beta_terms: Vec<Array1<f64>> = Vec::new();
+        let mut u_terms: Vec<Array1<f64>> = Vec::new();
+        let mut j_terms: Vec<Array2<f64>> = Vec::new();
+        for b in 0..specs.len() {
+            let spec = &specs[b];
+            let (start, end) = ranges[b];
+            let beta_block = beta_flat.slice(ndarray::s![start..end]).to_owned();
+            let lambdas = per_block[b].mapv(f64::exp);
+            for (k, s_k) in spec.penalties.iter().enumerate() {
+                let mut a_k = Array2::<f64>::zeros((total, total));
+                let local = s_k.mapv(|v| lambdas[k] * v);
+                a_k.slice_mut(ndarray::s![start..end, start..end])
+                    .assign(&local);
+                let a_k_beta = a_k.dot(&beta_flat);
+                let g_pen = 0.5 * beta_block.dot(&local.dot(&beta_block));
+                let keep_second_order = need_hessian || include_logdet_h || include_logdet_s;
+                let u_k = if keep_second_order {
+                    solve_mode_sensitivity(
+                        &j_joint,
+                        &(-&a_k_beta),
+                        None,
+                        strict_spd,
+                        allow_semidefinite,
+                        options,
+                        "joint mode sensitivity system for surrogate REML gradient",
+                    )?
+                } else {
+                    Array1::<f64>::zeros(total)
+                };
+                let g = if include_logdet_h || include_logdet_s {
+                    let g_logs = if include_logdet_s {
+                        0.5 * trace_product(
+                            s_pinv_joint
+                                .as_ref()
+                                .ok_or_else(|| "missing joint S^+ for surrogate REML gradient".to_string())?,
+                            &a_k,
+                        )
+                    } else {
+                        0.0
+                    };
+                    let mut d_j_k = a_k.clone();
+                    if u_k.dot(&u_k).sqrt() > 1e-14 {
+                        let h_rho = family
+                            .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+                                &inner.block_states,
+                                specs,
+                                &u_k,
+                            )?
+                            .ok_or_else(|| {
+                                "joint surrogate dH unavailable for analytic outer gradient"
+                                    .to_string()
+                            })?;
+                        d_j_k += &symmetrized_square_matrix(
+                            h_rho,
+                            total,
+                            "joint surrogate dH shape mismatch",
+                        )?;
+                    }
+                    let g_logj = if include_logdet_h {
+                        0.5 * trace_product(&h_inv, &d_j_k)
+                    } else {
+                        0.0
+                    };
+                    if need_hessian {
+                        a_terms.push(a_k.clone());
+                        a_beta_terms.push(a_k_beta.clone());
+                        u_terms.push(u_k.clone());
+                        j_terms.push(d_j_k);
+                    }
+                    g_pen + g_logj - g_logs
+                } else {
+                    if need_hessian {
+                        a_terms.push(a_k.clone());
+                        a_beta_terms.push(a_k_beta.clone());
+                        u_terms.push(u_k.clone());
+                    }
+                    g_pen
+                };
+                grad[at + k] = g;
+            }
+            at += spec.penalties.len();
+        }
+        if need_hessian {
+            let mut hess = Array2::<f64>::zeros((rho.len(), rho.len()));
+            let mut hess_available = true;
+            for k in 0..rho.len() {
+                for l in k..rho.len() {
+                    let delta_kl = if k == l { 1.0 } else { 0.0 };
+                    let mut v_kl = a_beta_terms[k].dot(&u_terms[l])
+                        + 0.5 * delta_kl * beta_flat.dot(&a_beta_terms[k]);
+                    if include_logdet_h || include_logdet_s {
+                        let tr_prod = trace_jinv_a_jinv_b(&h_inv, &j_terms[l], &j_terms[k]);
+                        let rhs_kl = -(a_terms[k].dot(&u_terms[l])
+                            + j_terms[l].dot(&u_terms[k])
+                            + delta_kl * a_beta_terms[k].clone());
+                        let u_kl = solve_mode_sensitivity(
+                            &j_joint,
+                            &rhs_kl,
+                            None,
+                            strict_spd,
+                            allow_semidefinite,
+                            options,
+                            "joint second-order mode sensitivity system for surrogate REML Hessian",
+                        )?;
+                        let dh_u_kl = match family
+                            .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+                                &inner.block_states,
+                                specs,
+                                &u_kl,
+                            )? {
+                            Some(v) => symmetrized_square_matrix(
+                                v,
+                                total,
+                                "joint surrogate second-order dH shape mismatch",
+                            )?,
+                            None => {
+                                hess_available = false;
+                                break;
+                            }
+                        };
+                        let d2h_ul_uk = match family
+                            .joint_outer_hyper_surrogate_hessian_second_directional_derivative_with_specs(
+                                &inner.block_states,
+                                specs,
+                                &u_terms[l],
+                                &u_terms[k],
+                            )? {
+                            Some(v) => symmetrized_square_matrix(
+                                v,
+                                total,
+                                "joint surrogate d2H shape mismatch",
+                            )?,
+                            None => {
+                                hess_available = false;
+                                break;
+                            }
+                        };
+                        let mut j_kl = dh_u_kl;
+                        j_kl += &d2h_ul_uk;
+                        if delta_kl > 0.0 {
+                            j_kl += &a_terms[k];
+                        }
+                        let tr_second = trace_product(&h_inv, &j_kl);
+                        let tr_h = if include_logdet_h {
+                            0.5 * (-tr_prod + tr_second)
+                        } else {
+                            0.0
+                        };
+                        let tr_p = if include_logdet_s {
+                            0.5 * trace_jinv_a_jinv_b(
+                                s_pinv_joint.as_ref().ok_or_else(|| {
+                                    "missing joint S^+ for surrogate REML Hessian".to_string()
+                                })?,
+                                &a_terms[l],
+                                &a_terms[k],
+                            ) - 0.5
+                                * delta_kl
+                                * trace_product(
+                                    s_pinv_joint.as_ref().ok_or_else(|| {
+                                        "missing joint S^+ for surrogate REML Hessian".to_string()
+                                    })?,
+                                    &a_terms[k],
+                                )
+                        } else {
+                            0.0
+                        };
+                        v_kl += tr_h + tr_p;
+                    }
+                    hess[[k, l]] = v_kl;
+                    hess[[l, k]] = v_kl;
+                }
+                if !hess_available {
+                    break;
+                }
+            }
+            if hess_available {
+                outer_hessian = Some(hess);
+            }
+        }
+        let warm = ConstrainedWarmStart {
+            rho: rho.clone(),
+            block_beta: inner
+                .block_states
+                .iter()
+                .map(|st| st.beta.clone())
+                .collect(),
+            active_sets: inner.active_sets.clone(),
+        };
+        return Ok(OuterObjectiveEvalResult {
+            objective,
+            gradient: grad,
+            outer_hessian,
+            warm_start: warm,
+            inner,
+        });
+    }
+    // At this point the joint exact path is unavailable.
     //
-    // For coupled multi-block families that explicitly require a joint outer
-    // hyper path, however, dropping into that blockwise surrogate would be
-    // wrong. In those cases the correct behavior is to fail loudly rather than
-    // silently optimize a different objective.
+    // The old generic fallback below is only mathematically defensible when
+    // there is a single block. Once there are multiple blocks, generic code
+    // has no way to prove that the profiled objective is actually block
+    // separable. A multi-block family can have penalty-local forcing
+    //
+    //   g_i = S_i beta
+    //
+    // while still having a coupled fitted-mode response
+    //
+    //   H beta_i = -g_i
+    //
+    // because the likelihood contributes off-diagonal block curvature. In
+    // that case a blockwise surrogate solve computes the derivative of a
+    // different objective. The correct behavior is therefore:
+    //
+    // - exact joint path if available
+    // - otherwise fail for multi-block families
+    // - only permit the generic blockwise surrogate in the single-block case,
+    //   where it coincides with the full system.
     if family.requires_joint_outer_hyper_path() {
         return Err(
             "outer hyper-derivative evaluation requires a joint exact path for this family"
@@ -3939,15 +4314,17 @@ fn joint_theta_penalty_first_matrix(
                     total_local.scaled_add(per_block[*block_idx][*penalty_idx].exp(), s_part);
                 }
                 total_local
-            } else {
-                if deriv.penalty_index >= per_block[*block_idx].len() {
+            } else if let Some(penalty_index) = deriv.penalty_index {
+                if penalty_index >= per_block[*block_idx].len() {
                     return Err(format!(
                         "psi penalty derivative index {} out of bounds for block {}",
-                        deriv.penalty_index, block_idx
+                        penalty_index, block_idx
                     ));
                 }
                 deriv.s_psi
-                    .mapv(|v| per_block[*block_idx][deriv.penalty_index].exp() * v)
+                    .mapv(|v| per_block[*block_idx][penalty_index].exp() * v)
+            } else {
+                Array2::<f64>::zeros((p, p))
             };
             s_i.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
             Ok(s_i)
@@ -4041,7 +4418,7 @@ fn joint_theta_penalty_second_matrix(
                     }
                 }
                 total_local
-            } else if deriv.penalty_index == *pi {
+            } else if deriv.penalty_index == Some(*pi) {
                 deriv.s_psi
                     .mapv(|v| per_block[*bi][*pi].exp() * v)
             } else {
@@ -4085,13 +4462,16 @@ fn joint_theta_penalty_second_matrix(
                 total_local
             } else if let Some(parts) = deriv.s_psi_psi.as_ref() {
                 if let Some(s_part) = parts.get(*lj) {
-                    if deriv.penalty_index >= per_block[*bi].len() {
+                    let Some(penalty_index) = deriv.penalty_index else {
+                        return Ok(s_ij);
+                    };
+                    if penalty_index >= per_block[*bi].len() {
                         return Err(format!(
                             "psi second-derivative penalty index {} out of bounds for block {}",
-                            deriv.penalty_index, bi
+                            penalty_index, bi
                         ));
                     }
-                    s_part.mapv(|v| per_block[*bi][deriv.penalty_index].exp() * v)
+                    s_part.mapv(|v| per_block[*bi][penalty_index].exp() * v)
                 } else {
                     Array2::<f64>::zeros((p, p))
                 }
@@ -4956,6 +5336,70 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct TwoBlockJointSurrogateFamily;
+
+    impl CustomFamily for TwoBlockJointSurrogateFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n0 = block_states
+                .first()
+                .ok_or_else(|| "missing block 0".to_string())?
+                .eta
+                .len();
+            let n1 = block_states
+                .get(1)
+                .ok_or_else(|| "missing block 1".to_string())?
+                .eta
+                .len();
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                block_working_sets: vec![
+                    BlockWorkingSet::Diagonal {
+                        working_response: Array1::zeros(n0),
+                        working_weights: Array1::ones(n0),
+                    },
+                    BlockWorkingSet::Diagonal {
+                        working_response: Array1::zeros(n1),
+                        working_weights: Array1::ones(n1),
+                    },
+                ],
+            })
+        }
+
+        fn exact_newton_joint_hessian_with_specs(
+            &self,
+            _block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+        ) -> Result<Option<Array2<f64>>, String> {
+            let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+            Ok(Some(Array2::eye(p)))
+        }
+
+        fn exact_newton_joint_hessian_directional_derivative_with_specs(
+            &self,
+            _block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+            _d_beta_flat: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+            Ok(Some(Array2::zeros((p, p))))
+        }
+
+        fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+            &self,
+            _block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+            _d_beta_u_flat: &Array1<f64>,
+            _d_beta_v_flat: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+            Ok(Some(Array2::zeros((p, p))))
+        }
+    }
+
+    #[derive(Clone)]
     struct OneBlockPseudoLaplaceExactFamily {
         target: f64,
     }
@@ -5032,11 +5476,26 @@ mod tests {
             ExactNewtonOuterObjective::PseudoLaplace
         }
 
+        fn exact_newton_joint_hessian(
+            &self,
+            _block_states: &[ParameterBlockState],
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(array![[1.0]]))
+        }
+
         fn exact_newton_hessian_directional_derivative(
             &self,
             _block_states: &[ParameterBlockState],
             _block_idx: usize,
             _d_beta: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(array![[0.0]]))
+        }
+
+        fn exact_newton_joint_hessian_directional_derivative(
+            &self,
+            _block_states: &[ParameterBlockState],
+            _d_beta_flat: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
             Ok(Some(array![[0.0]]))
         }
@@ -5320,6 +5779,49 @@ mod tests {
     }
 
     #[test]
+    fn outer_gradient_uses_joint_surrogate_for_multiblock_diagonal_family() {
+        let spec0 = ParameterBlockSpec {
+            name: "block0".to_string(),
+            design: DesignMatrix::Dense(array![[1.0], [1.0]]),
+            offset: array![0.0, 0.0],
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.0]),
+        };
+        let spec1 = ParameterBlockSpec {
+            name: "block1".to_string(),
+            design: DesignMatrix::Dense(array![[1.0], [1.0]]),
+            offset: array![0.0, 0.0],
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.0]),
+        };
+        let options = BlockwiseFitOptions {
+            use_reml_objective: true,
+            ridge_floor: 1e-10,
+            outer_max_iter: 1,
+            ..BlockwiseFitOptions::default()
+        };
+        let penalty_counts = vec![1usize, 1usize];
+        let rho = array![0.0, 0.0];
+
+        let result = outer_objective_and_gradient(
+            &TwoBlockJointSurrogateFamily,
+            &[spec0, spec1],
+            &options,
+            &penalty_counts,
+            &rho,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "default joint multi-block surrogate path should succeed without blockwise dW callbacks: {:?}",
+            result.err()
+        );
+    }
+
+
+    #[test]
     fn exact_newton_pseudo_laplace_objective_uses_logdet_h_without_logdet_s() {
         let spec = ParameterBlockSpec {
             name: "pseudo_laplace".to_string(),
@@ -5361,7 +5863,7 @@ mod tests {
             initial_beta: Some(array![0.0]),
         };
         let deriv = CustomFamilyBlockPsiDerivative {
-            penalty_index: 0,
+            penalty_index: None,
             x_psi: Array2::zeros((1, 1)),
             s_psi: Array2::zeros((1, 1)),
             s_psi_components: None,

@@ -2302,12 +2302,10 @@ fn solve_newton_direction_with_lower_bounds(
     }
 
     let mut active = vec![false; p];
-    let mut hint_locked = vec![false; p];
     if let Some(hint) = active_hint.as_ref() {
         for &idx in hint.iter() {
             if idx < p {
                 active[idx] = true;
-                hint_locked[idx] = true;
             }
         }
     }
@@ -2331,6 +2329,20 @@ fn solve_newton_direction_with_lower_bounds(
             }
         }
         if free_idx.is_empty() {
+            let hd = hessian.dot(direction_out);
+            let mut worst_violation = 0.0_f64;
+            let mut release_idx: Option<usize> = None;
+            for &i in &active_idx {
+                let lambda_i = gradient[i] + hd[i];
+                if lambda_i < worst_violation {
+                    worst_violation = lambda_i;
+                    release_idx = Some(i);
+                }
+            }
+            if let Some(idx) = release_idx {
+                active[idx] = false;
+                continue;
+            }
             if let Some(hint) = active_hint {
                 hint.clear();
                 hint.extend((0..p).filter(|&i| active[i]));
@@ -2384,7 +2396,7 @@ fn solve_newton_direction_with_lower_bounds(
         let mut worst_violation = 0.0_f64;
         let mut release_idx: Option<usize> = None;
         for i in 0..p {
-            if !active[i] || hint_locked[i] {
+            if !active[i] {
                 continue;
             }
             let lambda_i = gradient[i] + hd[i];
@@ -2519,13 +2531,11 @@ fn solve_newton_direction_with_linear_constraints(
 
     let mut active: Vec<usize> = Vec::new();
     let mut is_active = vec![false; m];
-    let mut hint_locked = vec![false; m];
     if let Some(hint) = active_hint.as_ref() {
         for &idx in hint.iter() {
             if idx < m && !is_active[idx] {
                 active.push(idx);
                 is_active[idx] = true;
-                hint_locked[idx] = true;
             }
         }
     }
@@ -2559,9 +2569,6 @@ fn solve_newton_direction_with_linear_constraints(
             // Therefore release active rows with the most negative lambda_true.
             let mut most_negative_true = -tol_dual;
             for (pos, &lam_sys) in lambda_w.iter().enumerate() {
-                if hint_locked[active[pos]] {
-                    continue;
-                }
                 let lam_true = -lam_sys;
                 if lam_true < most_negative_true {
                     most_negative_true = lam_true;
@@ -5853,6 +5860,36 @@ mod tests {
     }
 
     #[test]
+    fn linear_constraint_active_set_releases_stale_warm_hint() {
+        let hessian = array![[1.0]];
+        let gradient = array![-1.0];
+        let beta = array![0.0];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0], [-1.0]],
+            b: array![0.0, -0.1],
+        };
+        let mut direction = Array1::zeros(1);
+        let mut active_hint = vec![0];
+
+        solve_newton_direction_with_linear_constraints(
+            &hessian,
+            &gradient,
+            &beta,
+            &constraints,
+            &mut direction,
+            Some(&mut active_hint),
+        )
+        .expect("stale warm active-set hint should be releasable");
+
+        assert!(
+            (direction[0] - 0.1).abs() <= 1e-10,
+            "expected step to upper bound (0.1), got {}",
+            direction[0]
+        );
+        assert_eq!(active_hint, vec![1]);
+    }
+
+    #[test]
     fn lower_bound_active_set_projects_warm_active_bounds_back_to_boundary() {
         let hessian = array![[2.0]];
         let gradient = array![0.0];
@@ -5874,5 +5911,32 @@ mod tests {
         assert_relative_eq!(direction[0], -1e-9, epsilon = 1e-14);
         let projected = &beta + &direction;
         assert_relative_eq!(projected[0], 0.0, epsilon = 1e-14);
+    }
+
+    #[test]
+    fn lower_bound_active_set_releases_stale_warm_hint() {
+        let hessian = array![[1.0]];
+        let gradient = array![-1.0];
+        let beta = array![0.0];
+        let lower_bounds = array![0.0];
+        let mut direction = Array1::zeros(1);
+        let mut active_hint = vec![0];
+
+        solve_newton_direction_with_lower_bounds(
+            &hessian,
+            &gradient,
+            &beta,
+            &lower_bounds,
+            &mut direction,
+            Some(&mut active_hint),
+        )
+        .expect("stale warm lower-bound hint should be releasable");
+
+        assert!(
+            (direction[0] - 1.0).abs() <= 1e-12,
+            "expected unconstrained step of 1.0 after releasing stale bound, got {}",
+            direction[0]
+        );
+        assert!(active_hint.is_empty());
     }
 }
