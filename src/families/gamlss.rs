@@ -6349,6 +6349,69 @@ mod tests {
     }
 
     #[test]
+    fn binomial_location_scale_threshold_weight_directional_derivative_matches_finite_difference() {
+        let family = BinomialLocationScaleFamily {
+            y: Array1::from_vec(vec![1.0]),
+            weights: Array1::from_vec(vec![1.0]),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: None,
+            log_sigma_design: None,
+        };
+        let eta_t = Array1::from_vec(vec![0.35]);
+        let eta_ls = Array1::from_vec(vec![-0.2]);
+        let states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: eta_t.clone(),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: eta_ls,
+            },
+        ];
+        let d_eta = Array1::from_vec(vec![1.0]);
+
+        let dw = family
+            .diagonal_working_weights_directional_derivative(
+                &states,
+                BinomialLocationScaleFamily::BLOCK_T,
+                &d_eta,
+            )
+            .expect("binomial directional derivative")
+            .expect("binomial threshold derivative");
+
+        let eps = 1e-6;
+        let mut states_plus = states.clone();
+        states_plus[BinomialLocationScaleFamily::BLOCK_T].eta[0] += eps;
+        let eval_plus = family.evaluate(&states_plus).expect("binomial eval plus");
+        let w_plus = match &eval_plus.block_working_sets[BinomialLocationScaleFamily::BLOCK_T] {
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights,
+            } => working_weights[0],
+            BlockWorkingSet::ExactNewton { .. } => {
+                panic!("expected diagonal binomial threshold block")
+            }
+        };
+
+        let mut states_minus = states;
+        states_minus[BinomialLocationScaleFamily::BLOCK_T].eta[0] -= eps;
+        let eval_minus = family.evaluate(&states_minus).expect("binomial eval minus");
+        let w_minus = match &eval_minus.block_working_sets[BinomialLocationScaleFamily::BLOCK_T] {
+            BlockWorkingSet::Diagonal {
+                working_response: _,
+                working_weights,
+            } => working_weights[0],
+            BlockWorkingSet::ExactNewton { .. } => {
+                panic!("expected diagonal binomial threshold block")
+            }
+        };
+
+        let fd = (w_plus - w_minus) / (2.0 * eps);
+        assert!((dw[0] - fd).abs() < 1e-6, "dw={} fd={}", dw[0], fd);
+    }
+
+    #[test]
     fn fit_binomial_location_scale_runs_with_warm_start_path() {
         let n = 32usize;
         let y = Array1::from_vec((0..n).map(|i| if i % 4 == 0 { 1.0 } else { 0.0 }).collect());
