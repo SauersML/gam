@@ -3325,7 +3325,6 @@ const BINOMIAL_AUX_MU_EPS: f64 = 1e-12;
 
 #[derive(Clone, Copy, Debug)]
 struct BinomialAuxTerms {
-    mu: f64,
     a1: f64,
     a2: f64,
     variance: f64,
@@ -3343,7 +3342,6 @@ fn stabilized_binomial_aux_terms(yi: f64, wi: f64, mu: f64) -> BinomialAuxTerms 
     let a1 = wi * (yi / mu - (1.0 - yi) / one_minus_mu);
     let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minus_mu * one_minus_mu));
     BinomialAuxTerms {
-        mu,
         a1,
         a2,
         variance: mu * one_minus_mu,
@@ -3955,8 +3953,6 @@ where
     let eta = &pirls_mix.final_eta;
     let x_t = &pirls_mix.x_transformed;
     let n_obs = eta.len();
-    const EPS: f64 = 1e-8;
-
     let mut leverage = Array1::<f64>::zeros(n_obs);
     if h_pos_w.ncols() > 0 {
         match x_t {
@@ -4017,22 +4013,20 @@ where
             let d2 = jet.d2;
             let yi = y_o[i];
             let wi = w_o[i].max(0.0);
-            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
-            let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
-            score_beta_jacobian_diag[i] = -(a2 * d1 * d1 + a1 * d2);
+            let aux = stabilized_binomial_aux_terms(yi, wi, mu);
+            score_beta_jacobian_diag[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
             for j in 0..aux_dim {
                 let dj = mix_partials[j];
                 let dmu = dj.mu;
                 let dd1 = dj.d1;
-                direct_ll[j] += a1 * dmu;
-                du_by_j[j][i] = a2 * dmu * d1 + a1 * dd1;
-                let variance = (mu * (1.0 - mu)).max(EPS);
-                let variance_param = (1.0 - 2.0 * mu) * dmu;
+                direct_ll[j] += aux.a1 * dmu;
+                du_by_j[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
+                let variance_param = aux.variance_mu_scale * dmu;
                 let numerator = d1 * d1;
                 let numerator_param = 2.0 * d1 * dd1;
                 dw_explicit_by_j[j][i] = wi
-                    * (numerator_param * variance - numerator * variance_param)
-                    / (variance * variance);
+                    * (numerator_param * aux.variance - numerator * variance_param)
+                    / (aux.variance * aux.variance);
             }
         }
     } else {
@@ -4055,9 +4049,8 @@ where
             let d2 = jets.jet.d2;
             let yi = y_o[i];
             let wi = w_o[i].max(0.0);
-            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
-            let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
-            score_beta_jacobian_diag[i] = -(a2 * d1 * d1 + a1 * d2);
+            let aux = stabilized_binomial_aux_terms(yi, wi, mu);
+            score_beta_jacobian_diag[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
             for j in 0..aux_dim {
                 let dj = if j == 0 {
                     jets.djet_depsilon
@@ -4066,15 +4059,14 @@ where
                 };
                 let dmu = dj.mu;
                 let dd1 = dj.d1;
-                direct_ll[j] += a1 * dmu;
-                du_by_j[j][i] = a2 * dmu * d1 + a1 * dd1;
-                let variance = (mu * (1.0 - mu)).max(EPS);
-                let variance_param = (1.0 - 2.0 * mu) * dmu;
+                direct_ll[j] += aux.a1 * dmu;
+                du_by_j[j][i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
+                let variance_param = aux.variance_mu_scale * dmu;
                 let numerator = d1 * d1;
                 let numerator_param = 2.0 * d1 * dd1;
                 dw_explicit_by_j[j][i] = wi
-                    * (numerator_param * variance - numerator * variance_param)
-                    / (variance * variance);
+                    * (numerator_param * aux.variance - numerator * variance_param)
+                    / (aux.variance * aux.variance);
             }
         }
     }
@@ -4285,17 +4277,16 @@ mod fd_policy_tests {
                 sas_state.log_delta,
             );
             let mu = jets.jet.mu;
-            if (mu - jets.jet.mu).abs() > 0.0 {
+            let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+            if (mu.is_finite() && (mu <= BINOMIAL_AUX_MU_EPS || mu >= 1.0 - BINOMIAL_AUX_MU_EPS))
+                || !mu.is_finite()
+            {
                 clamped_obs += 1;
             }
             let d1 = jets.jet.d1;
-            let yi = y[i];
-            let wi = w[i].max(0.0);
-            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
-            let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
             let dmu = jets.djet_depsilon.mu;
             let dd1 = jets.djet_depsilon.d1;
-            du_by_eps[i] = a2 * dmu * d1 + a1 * dd1;
+            du_by_eps[i] = aux.a2 * dmu * d1 + aux.a1 * dd1;
         }
         let score_at = |raw_eps: f64| -> Array1<f64> {
             let (eps_eff, _) = sas_effective_epsilon(raw_eps);
@@ -4313,10 +4304,8 @@ mod fd_policy_tests {
                 );
                 let mu = jets.jet.mu;
                 let d1 = jets.jet.d1;
-                let yi = y[i];
-                let wi = w[i].max(0.0);
-                let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
-                out[i] = a1 * d1;
+                let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+                out[i] = aux.a1 * d1;
             }
             out
         };
@@ -4342,11 +4331,8 @@ mod fd_policy_tests {
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
-            let yi = y[i];
-            let wi = w[i].max(0.0);
-            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
-            let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
-            neg_du_deta[i] = -(a2 * d1 * d1 + a1 * d2);
+            let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+            neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
         }
         let score_beta_jacobian = assemble_parametric_score_beta_jacobian(
             x_t,
@@ -4490,10 +4476,8 @@ mod fd_policy_tests {
                 );
                 let mu = jets.jet.mu;
                 let d1 = jets.jet.d1;
-                let yi = y[i];
-                let wi = w[i].max(0.0);
-                let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
-                u[i] = a1 * d1;
+                let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+                u[i] = aux.a1 * d1;
             }
             let mut g = -x_dense.t().dot(&u);
             g += &s_transformed.dot(beta);
@@ -4516,11 +4500,8 @@ mod fd_policy_tests {
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
-            let yi = y[i];
-            let wi = w[i].max(0.0);
-            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
-            let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
-            neg_du_deta[i] = -(a2 * d1 * d1 + a1 * d2);
+            let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+            neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
         }
         let weighted_x = &x_dense * &neg_du_deta.insert_axis(Axis(1));
         analytic_j.assign(&x_dense.t().dot(&weighted_x));
@@ -4640,11 +4621,8 @@ mod fd_policy_tests {
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
-            let yi = y[i];
-            let wi = w[i].max(0.0);
-            let a1 = wi * (yi / mu - (1.0 - yi) / (1.0 - mu));
-            let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / ((1.0 - mu) * (1.0 - mu)));
-            neg_du_deta[i] = -(a2 * d1 * d1 + a1 * d2);
+            let aux = stabilized_binomial_aux_terms(y[i], w[i].max(0.0), mu);
+            neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
         }
         let weighted_x = &x_dense * &neg_du_deta.insert_axis(Axis(1));
         let mut true_jacobian = x_dense.t().dot(&weighted_x);
@@ -4664,6 +4642,33 @@ mod fd_policy_tests {
             max_abs_diff > 1e-2,
             "expected PIRLS working Hessian to differ from the true SAS score Jacobian, got max_abs_diff={max_abs_diff:.3e}"
         );
+    }
+
+    #[test]
+    fn stabilized_binomial_aux_terms_stay_finite_for_saturated_sas_probabilities() {
+        let saturated_cases = [
+            (
+                0.0,
+                sas_inverse_link_jet_with_param_partials(-30.0, 0.0, 12.0)
+                    .jet
+                    .mu,
+            ),
+            (
+                1.0,
+                sas_inverse_link_jet_with_param_partials(30.0, 0.0, 12.0)
+                    .jet
+                    .mu,
+            ),
+        ];
+        for (yi, mu) in saturated_cases {
+            let aux = stabilized_binomial_aux_terms(yi, 1.0, mu);
+            assert!(aux.a1.is_finite(), "a1 must be finite for yi={yi} mu={mu}");
+            assert!(aux.a2.is_finite(), "a2 must be finite for yi={yi} mu={mu}");
+            assert!(
+                aux.variance.is_finite() && aux.variance > 0.0,
+                "variance must be finite and positive for yi={yi} mu={mu}"
+            );
+        }
     }
 }
 

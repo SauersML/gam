@@ -13,8 +13,8 @@ use crate::basis::{
 use crate::construction::kronecker_product;
 use crate::custom_family::{
     BlockGeometryDirectionalDerivative, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
-    CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, ExactNewtonOuterObjective,
-    ExactNewtonPsiGradientContext, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
+    ExactNewtonOuterObjective, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     evaluate_custom_family_joint_hyper, fit_custom_family, symmetrize_dense_in_place,
 };
 use crate::estimate::{
@@ -5035,26 +5035,28 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         Ok(self.linear_constraints.clone())
     }
 
-    fn exact_newton_block_psi_gradient(
+    fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
-        block_idx: usize,
-        ctx: ExactNewtonPsiGradientContext<'_>,
-    ) -> Result<Option<f64>, String> {
-        if block_idx != 0 {
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        if block_states.len() != 1 || specs.len() != 1 || derivative_blocks.len() != 1 {
             return Err(format!(
-                "spatial adaptive exact family expects block_idx 0, got {block_idx}"
+                "spatial adaptive exact family expects one block/state/spec/psi payload, got states={} specs={} deriv_blocks={}",
+                block_states.len(),
+                specs.len(),
+                derivative_blocks.len()
             ));
         }
+        let deriv = derivative_blocks[0]
+            .get(psi_index)
+            .ok_or_else(|| format!("adaptive psi index {} out of bounds", psi_index))?;
         let hyper = self
             .hyper_specs
-            .get(ctx.deriv.penalty_index)
-            .ok_or_else(|| {
-                format!(
-                    "adaptive psi index {} out of bounds",
-                    ctx.deriv.penalty_index
-                )
-            })?;
+            .get(deriv.penalty_index)
+            .ok_or_else(|| format!("adaptive psi index {} out of bounds", deriv.penalty_index))?;
         let beta = &block_states[0].beta;
         let eval = self.exact_evaluation(beta)?;
         let (direct, beta_mixed, beta_hessian_explicit) =
@@ -5080,53 +5082,11 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         //   - `beta_hessian_explicit` is J_{beta,beta,a},
         //   - `exact_hessian_directional_derivative_from_evaluation(..., u)` returns
         //     D_beta(H)[u] for the exact likelihood-plus-Charbonnier model.
-        let mut quadratic = Array2::<f64>::zeros((beta.len(), beta.len()));
-        for (k, penalty) in ctx.spec.penalties.iter().enumerate() {
-            quadratic.scaled_add(ctx.lambdas[k], penalty);
-        }
-        let mut h_total = eval.total_objective_hessian(&self.design)?;
-        h_total += &quadratic;
-        symmetrize_dense_in_place(&mut h_total);
-        let (u, h_inv) = match h_total.cholesky(Side::Lower) {
-            Ok(chol) => {
-                let u = chol.solve_vec(&beta_mixed);
-                let ident = Array2::<f64>::eye(h_total.nrows());
-                let h_inv = chol.solve_mat(&ident);
-                (u, h_inv)
-            }
-            Err(_) => {
-                let (evals, evecs) = FaerEigh::eigh(&h_total, Side::Lower).map_err(|e| {
-                    format!("strict pseudo-laplace adaptive psi eigendecomposition failed: {e}")
-                })?;
-                let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-                let tol = (max_abs_eval * 1e-12).max(1e-14);
-                if evals.iter().any(|&ev| ev < -tol) {
-                    return Err(
-                        "strict pseudo-laplace SPD solve failed for adaptive psi".to_string()
-                    );
-                }
-                let p = h_total.nrows();
-                let mut h_inv = Array2::<f64>::zeros((p, p));
-                for k in 0..p {
-                    let ev = evals[k];
-                    if ev <= tol {
-                        continue;
-                    }
-                    let inv_ev = 1.0 / ev;
-                    for i in 0..p {
-                        let uik = evecs[(i, k)];
-                        for j in 0..p {
-                            h_inv[[i, j]] += inv_ev * uik * evecs[(j, k)];
-                        }
-                    }
-                }
-                (h_inv.dot(&beta_mixed), h_inv)
-            }
-        };
-        let h_beta = self.exact_hessian_directional_derivative_from_evaluation(beta, &eval, &u)?;
-        let mut h_dot = beta_hessian_explicit;
-        h_dot -= &h_beta;
-        Ok(Some(direct + 0.5 * trace_of_dense_product(&h_inv, &h_dot)?))
+        Ok(Some(ExactNewtonJointPsiTerms {
+            objective_psi: direct,
+            score_psi: beta_mixed,
+            hessian_psi: beta_hessian_explicit,
+        }))
     }
 }
 
@@ -7293,17 +7253,22 @@ where
                     ));
                 }
             };
+            // Exact spatial joint optimization is now a true second-order path.
+            // The family callback must return the full profiled/Laplace Hessian
+            // in theta = [rho, psi]; NewtonTrustRegion is not allowed to run on
+            // a gradient-only surrogate here.
             let (cost, grad, hess) = match exact_fn(
                 &theta.slice(s![..rho_dim]).to_owned(),
                 &mean_spec_c,
                 &noise_spec_c,
                 &mean_design_c,
                 &noise_design_c,
-                false,
+                true,
             ) {
                 Ok((cost, grad, hess)) => {
                     if !cost.is_finite()
                         || grad.iter().any(|v| !v.is_finite())
+                        || hess.is_none()
                         || hess
                             .as_ref()
                             .map(|h| {
@@ -7311,10 +7276,10 @@ where
                                     || h.ncols() != theta.len()
                                     || h.iter().any(|v| !v.is_finite())
                             })
-                            .unwrap_or(false)
+                            .unwrap_or(true)
                     {
                         return Err(ObjectiveEvalError::recoverable(
-                            "exact-joint spatial objective/derivatives became non-finite",
+                            "exact-joint spatial objective/gradient/hessian became non-finite or incomplete",
                         ));
                     }
                     last_eval = Some((theta.clone(), cost, grad.clone(), hess.clone()));
@@ -9753,34 +9718,20 @@ mod tests {
             s_psi_psi: None,
             s_psi_psi_components: None,
         };
-        let lambdas = Array1::zeros(0);
-        let options = BlockwiseFitOptions {
-            use_reml_objective: true,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
         let state = vec![ParameterBlockState {
             beta: array![0.0, 0.0],
             eta: array![0.0, 0.0],
         }];
 
         let gradient = family
-            .exact_newton_block_psi_gradient(
-                &state,
-                0,
-                ExactNewtonPsiGradientContext {
-                    spec: &spec,
-                    deriv: &deriv,
-                    lambdas: &lambdas,
-                    options: &options,
-                },
-            )
-            .expect("adaptive psi gradient should tolerate nearly symmetric Hessian")
-            .expect("adaptive psi gradient should be present");
+            .exact_newton_joint_psi_terms(&state, std::slice::from_ref(&spec), &[vec![deriv]], 0)
+            .expect("adaptive joint psi terms should tolerate nearly symmetric Hessian")
+            .expect("adaptive joint psi terms should be present")
+            .objective_psi;
 
         assert!(
             gradient.is_finite(),
-            "expected finite adaptive psi gradient after symmetrization, got {gradient}"
+            "expected finite adaptive joint psi objective term after symmetrization, got {gradient}"
         );
     }
 
