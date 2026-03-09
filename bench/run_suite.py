@@ -3732,6 +3732,15 @@ def run_rust_scenario_cv(
                     }
                 )
 
+    if not cv_rows:
+        return {
+            "contender": contender_name,
+            "family": ds["family"],
+            "scenario_name": scenario_name,
+            "status": "failed",
+            "error": "no cross-validation folds generated for scenario",
+        }
+
     metrics = aggregate_cv_rows(cv_rows, ds["family"])
     if ood_rows:
         denom = max(sum(int(r["n_test"]) for r in ood_rows), 1)
@@ -4048,6 +4057,15 @@ def _run_rust_gamlss_scenario_cv_variant(
                     }
                 )
 
+    if not cv_rows:
+        return {
+            "contender": contender_name,
+            "family": family,
+            "scenario_name": scenario_name,
+            "status": "failed",
+            "error": "no cross-validation folds generated for scenario",
+        }
+
     metrics = aggregate_cv_rows(cv_rows, family)
     return {
         "contender": contender_name,
@@ -4228,6 +4246,15 @@ def run_rust_gamlss_survival_cv(
                     ),
                 }
             )
+
+    if not cv_rows:
+        return {
+            "contender": "rust_gamlss_survival",
+            "family": ds["family"],
+            "scenario_name": scenario_name,
+            "status": "failed",
+            "error": "no cross-validation folds generated for scenario",
+        }
 
     metrics = aggregate_cv_rows(cv_rows, ds["family"])
     return {
