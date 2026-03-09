@@ -759,7 +759,7 @@ pub fn logit_posterior_mean_with_deriv(
     ctx: &QuadratureContext,
     eta: f64,
     se_eta: f64,
-) -> (f64, f64) {
+) -> Result<(f64, f64), EstimationError> {
     // Important architectural note:
     // This is the current integrated-PIRLS hot path for logit measurement-error
     // updates. It still uses GHQ for robustness, but mathematically this is one
@@ -781,17 +781,11 @@ pub fn logit_posterior_mean_with_deriv(
     if se_eta < 1e-10 {
         let mu = sigmoid(eta);
         let dmu = mu * (1.0 - mu);
-        return (mu, dmu);
+        return Ok((mu, dmu));
     }
 
-    match integrated_inverse_link_jet(ctx, LinkFunction::Logit, eta, se_eta) {
-        Ok(jet) => (jet.mean, jet.d1),
-        Err(_) => {
-            // Panic-free fallback for library callers: degrade to plug-in moments.
-            let mu = sigmoid(eta);
-            (mu, mu * (1.0 - mu))
-        }
-    }
+    let jet = integrated_inverse_link_jet(ctx, LinkFunction::Logit, eta, se_eta)?;
+    Ok((jet.mean, jet.d1))
 }
 
 #[inline]
@@ -1922,17 +1916,10 @@ pub fn integrated_inverse_link_mean_and_derivative(
         // Use the exact plug-in limit when sigma is effectively zero and route
         // everything else through the validated GHQ backend.
         LinkFunction::Logit if sigma <= LOGIT_SIGMA_DEGENERATE => {
-            Ok(logit_posterior_mean_with_deriv_exact(mu, sigma).unwrap_or_else(|_| {
-                let mean = sigmoid(mu);
-                IntegratedMeanDerivative {
-                    mean,
-                    dmean_dmu: mean * (1.0 - mean),
-                    mode: IntegratedExpectationMode::ExactClosedForm,
-                }
-            }))
+            logit_posterior_mean_with_deriv_exact(mu, sigma)
         }
         LinkFunction::Logit => {
-            let (mean, dmean_dmu) = logit_posterior_mean_with_deriv(quad_ctx, mu, sigma);
+            let (mean, dmean_dmu) = logit_posterior_mean_with_deriv(quad_ctx, mu, sigma)?;
             Ok(IntegratedMeanDerivative {
                 mean,
                 dmean_dmu,
@@ -2202,28 +2189,19 @@ pub fn logit_posterior_mean_with_deriv_batch(
     ctx: &QuadratureContext,
     eta: &ndarray::Array1<f64>,
     se_eta: &ndarray::Array1<f64>,
-) -> (ndarray::Array1<f64>, ndarray::Array1<f64>) {
+) -> Result<(ndarray::Array1<f64>, ndarray::Array1<f64>), EstimationError> {
     let n = eta.len();
     let mut mu = ndarray::Array1::<f64>::zeros(n);
     let mut dmu = ndarray::Array1::<f64>::zeros(n);
 
     for i in 0..n {
-        let integrated = integrated_inverse_link_mean_and_derivative(
-            ctx,
-            LinkFunction::Logit,
-            eta[i],
-            se_eta[i],
-        )
-        .unwrap_or_else(|_| IntegratedMeanDerivative {
-            mean: sigmoid(eta[i]),
-            dmean_dmu: sigmoid(eta[i]) * (1.0 - sigmoid(eta[i])),
-            mode: IntegratedExpectationMode::QuadratureFallback,
-        });
+        let integrated =
+            integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, eta[i], se_eta[i])?;
         mu[i] = integrated.mean;
         dmu[i] = integrated.dmean_dmu;
     }
 
-    (mu, dmu)
+    Ok((mu, dmu))
 }
 
 /// Computes posterior mean probabilities for a batch of predictions.
@@ -2233,12 +2211,14 @@ pub fn logit_posterior_mean_batch(
     ctx: &QuadratureContext,
     eta: &ndarray::Array1<f64>,
     se_eta: &ndarray::Array1<f64>,
-) -> ndarray::Array1<f64> {
-    ndarray::Zip::from(eta).and(se_eta).map_collect(|&e, &se| {
-        integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, e, se)
-            .map(|v| v.mean)
-            .unwrap_or_else(|_| sigmoid(e))
-    })
+) -> Result<ndarray::Array1<f64>, EstimationError> {
+    let mut out = ndarray::Array1::<f64>::zeros(eta.len());
+    for i in 0..eta.len() {
+        out[i] =
+            integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, eta[i], se_eta[i])?
+                .mean;
+    }
+    Ok(out)
 }
 
 trait GhqValue: Sized {
@@ -3374,7 +3354,8 @@ mod tests {
         let ctx = QuadratureContext::new();
         let eta = 20.0;
         let se = 0.0;
-        let (_, dmu) = logit_posterior_mean_with_deriv(&ctx, eta, se);
+        let (_, dmu) = logit_posterior_mean_with_deriv(&ctx, eta, se)
+            .expect("logit posterior mean derivative should evaluate");
         assert!(dmu > 0.0);
         assert!(
             dmu < 1e-6,
@@ -3389,7 +3370,8 @@ mod tests {
         let se = 0.9;
         let h = 1e-5;
 
-        let (_, dmu) = logit_posterior_mean_with_deriv(&ctx, eta, se);
+        let (_, dmu) = logit_posterior_mean_with_deriv(&ctx, eta, se)
+            .expect("logit posterior mean derivative should evaluate");
         let mu_plus = logit_posterior_mean(&ctx, eta + h, se);
         let mu_minus = logit_posterior_mean(&ctx, eta - h, se);
         let dmu_fd = (mu_plus - mu_minus) / (2.0 * h);
@@ -3752,8 +3734,10 @@ mod tests {
         let ctx = QuadratureContext::new();
         let eta = ndarray::array![-2.0, 0.0, 1.25, 35.0];
         let se = ndarray::array![0.1, 0.5, 1.0, 1.0];
-        let batch_mean = logit_posterior_mean_batch(&ctx, &eta, &se);
-        let (batch_mu, batch_dmu) = logit_posterior_mean_with_deriv_batch(&ctx, &eta, &se);
+        let batch_mean = logit_posterior_mean_batch(&ctx, &eta, &se)
+            .expect("logit posterior mean batch should evaluate");
+        let (batch_mu, batch_dmu) = logit_posterior_mean_with_deriv_batch(&ctx, &eta, &se)
+            .expect("logit posterior mean derivative batch should evaluate");
         for i in 0..eta.len() {
             let direct = integrated_inverse_link_mean_and_derivative(
                 &ctx,

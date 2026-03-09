@@ -237,7 +237,8 @@ where
     // expectation dispatcher as integrated PIRLS. That keeps fitting-time and
     // prediction-time uncertainty propagation on the same mathematical object:
     // if a link has an exact closed form or guarded special-function backend,
-    // both paths use it; if not, both paths fall back consistently.
+    // both paths use it; numerical failure is propagated rather than silently
+    // degrading to a plug-in mean.
     let x = x.into();
     if x.ncols() != beta.len() {
         return Err(EstimationError::InvalidInput(format!(
