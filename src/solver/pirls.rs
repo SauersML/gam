@@ -2479,6 +2479,71 @@ fn solve_kkt_direction(
     Ok((d, lambda))
 }
 
+fn working_set_kkt_diagnostics(
+    hessian: &Array2<f64>,
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    active: &[usize],
+) -> Result<ConstraintKktDiagnostics, EstimationError> {
+    let p = constraints.a.ncols();
+    if hessian.nrows() != p || hessian.ncols() != p || x.len() != p || gradient.len() != p {
+        return Err(EstimationError::InvalidInput(
+            "working-set KKT diagnostic dimension mismatch".to_string(),
+        ));
+    }
+    let m = constraints.a.nrows();
+    let mut slack = Array1::<f64>::zeros(m);
+    let mut primal_feasibility: f64 = 0.0;
+    for i in 0..m {
+        let s_i = constraints.a.row(i).dot(x) - constraints.b[i];
+        slack[i] = s_i;
+        primal_feasibility = primal_feasibility.max((-s_i).max(0.0));
+    }
+
+    let mut lambda = Array1::<f64>::zeros(m);
+    if !active.is_empty() {
+        let mut a_w = Array2::<f64>::zeros((active.len(), p));
+        let mut residual_w = Array1::<f64>::zeros(active.len());
+        for (r, &idx) in active.iter().enumerate() {
+            if idx >= m {
+                return Err(EstimationError::InvalidInput(format!(
+                    "working-set KKT active index {} out of bounds for {} constraints",
+                    idx, m
+                )));
+            }
+            a_w.row_mut(r).assign(&constraints.a.row(idx));
+            residual_w[r] = constraints.b[idx] - constraints.a.row(idx).dot(x);
+        }
+        let (_, lambda_sys) = solve_kkt_direction(hessian, gradient, &a_w, Some(&residual_w))?;
+        for (r, &idx) in active.iter().enumerate() {
+            lambda[idx] = -lambda_sys[r];
+        }
+    }
+
+    let mut dual_feasibility: f64 = 0.0;
+    let mut complementarity: f64 = 0.0;
+    for i in 0..m {
+        dual_feasibility = dual_feasibility.max((-lambda[i]).max(0.0));
+        complementarity = complementarity.max((lambda[i] * slack[i]).abs());
+    }
+    let stationarity = {
+        let mut resid = gradient.to_owned();
+        resid -= &constraints.a.t().dot(&lambda);
+        resid.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+    };
+
+    Ok(ConstraintKktDiagnostics {
+        n_constraints: m,
+        n_active: active.len(),
+        primal_feasibility,
+        dual_feasibility,
+        complementarity,
+        stationarity,
+        active_tolerance: 1e-8,
+    })
+}
+
 fn solve_newton_direction_with_linear_constraints(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -2628,9 +2693,10 @@ fn solve_newton_direction_with_linear_constraints(
     }
 
     let (worst, row) = max_linear_constraint_violation(&x, constraints);
+    let working_kkt = working_set_kkt_diagnostics(hessian, &x, &g_cur, constraints, &active)?;
     let kkt = compute_constraint_kkt_diagnostics(&x, &g_cur, constraints);
     let grad_inf = g_cur.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let stationarity_rel = kkt.stationarity / grad_inf.max(1.0);
+    let stationarity_rel = working_kkt.stationarity / grad_inf.max(1.0);
     let step_inf = d_total.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let hd_total = hessian.dot(&d_total);
     let predicted_delta = gradient.dot(&d_total)
@@ -2644,17 +2710,12 @@ fn solve_newton_direction_with_linear_constraints(
     // the iterate is already KKT-feasible to numerical precision. In that
     // regime, accept the direction and let the outer LM acceptance test decide
     // whether objective reduction is sufficient.
-    //
-    // Complementarity uses multipliers reconstructed from an active-set normal
-    // equation solve (not the exact QP dual from the final iterate), so we
-    // enforce a modest tolerance here while keeping primal/dual feasibility
-    // strict.
-    let kkt_strong_ok =
-        (kkt.stationarity <= 2e-6 || stationarity_rel <= 2e-6) && kkt.complementarity <= 1e-3;
+    let kkt_strong_ok = (working_kkt.stationarity <= 2e-6 || stationarity_rel <= 2e-6)
+        && working_kkt.complementarity <= 1e-6;
     let model_descent_ok = predicted_delta <= -1e-10 * (1.0 + grad_inf * step_inf);
     let near_null_step_ok = step_inf <= 1e-10;
     if worst <= 1e-8
-        && kkt.dual_feasibility <= 1e-8
+        && working_kkt.dual_feasibility <= 1e-8
         && (kkt_strong_ok || model_descent_ok || near_null_step_ok)
     {
         if let Some(hint) = active_hint {
@@ -2665,13 +2726,15 @@ fn solve_newton_direction_with_linear_constraints(
         return Ok(());
     }
     Err(EstimationError::ParameterConstraintViolation(format!(
-        "linear-constrained Newton active-set failed to converge; max(Aβ-b violation)={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
-        kkt.primal_feasibility,
+        "linear-constrained Newton active-set failed to converge; max(Aβ-b violation)={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]; diagnostic-reconstruction[dual={:.3e}, stat={:.3e}]",
+        working_kkt.primal_feasibility,
+        working_kkt.dual_feasibility,
+        working_kkt.complementarity,
+        working_kkt.stationarity,
+        working_kkt.n_active,
+        working_kkt.n_constraints,
         kkt.dual_feasibility,
-        kkt.complementarity,
-        kkt.stationarity,
-        kkt.n_active,
-        kkt.n_constraints
+        kkt.stationarity
     )))
 }
 
@@ -5887,6 +5950,28 @@ mod tests {
             direction[0]
         );
         assert_eq!(active_hint, vec![1]);
+    }
+
+    #[test]
+    fn working_set_kkt_diagnostics_use_active_set_multipliers() {
+        let hessian = array![[2.0, 0.0], [0.0, 3.0]];
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 0.0], [2.0, 0.0], [0.0, 1.0]],
+            b: array![0.0, 0.0, 0.0],
+        };
+        let x = array![0.0, 0.0];
+        let lambda_true = array![1.0, 0.5, 2.0];
+        let gradient = constraints.a.t().dot(&lambda_true);
+        let active = vec![0, 1, 2];
+
+        let kkt = working_set_kkt_diagnostics(&hessian, &x, &gradient, &constraints, &active)
+            .expect("working-set KKT diagnostics");
+
+        assert!(kkt.primal_feasibility <= 1e-12);
+        assert!(kkt.dual_feasibility <= 1e-12);
+        assert!(kkt.complementarity <= 1e-12);
+        assert!(kkt.stationarity <= 1e-12);
+        assert_eq!(kkt.n_active, 3);
     }
 
     #[test]
