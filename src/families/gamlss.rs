@@ -3334,6 +3334,57 @@ struct GaussianLocationScaleJointPsiDirection {
     z_ls_psi: Array1<f64>,
 }
 
+struct GaussianJointRowScalars {
+    w: Array1<f64>,
+    m: Array1<f64>,
+    n: Array1<f64>,
+}
+
+fn gaussian_joint_row_scalars(
+    y: &Array1<f64>,
+    eta_mu: &Array1<f64>,
+    eta_ls: &Array1<f64>,
+    weights: &Array1<f64>,
+) -> Result<GaussianJointRowScalars, String> {
+    let n_obs = y.len();
+    if eta_mu.len() != n_obs || eta_ls.len() != n_obs || weights.len() != n_obs {
+        return Err("Gaussian joint row scalar input size mismatch".to_string());
+    }
+    let sigma = eta_ls.mapv(|v| v.exp().max(1e-12));
+    let r = y - eta_mu;
+    let w = weights / sigma.mapv(|s| s * s);
+    let m = &r * &w;
+    let n = r.mapv(|ri| ri * ri) * &w;
+    Ok(GaussianJointRowScalars { w, m, n })
+}
+
+fn gaussian_joint_first_directional_weights(
+    scalars: &GaussianJointRowScalars,
+    dot_mu: &Array1<f64>,
+    dot_eta: &Array1<f64>,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let w_u = -2.0 * &scalars.w * dot_eta;
+    let c_u = -2.0 * &scalars.w * dot_mu - 4.0 * &scalars.m * dot_eta;
+    let d_u = -4.0 * &scalars.m * dot_mu - 4.0 * &scalars.n * dot_eta;
+    (w_u, c_u, d_u)
+}
+
+fn gaussian_joint_second_directional_weights(
+    scalars: &GaussianJointRowScalars,
+    dot_mu_u: &Array1<f64>,
+    dot_eta_u: &Array1<f64>,
+    dot_mu_v: &Array1<f64>,
+    dot_eta_v: &Array1<f64>,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let w_uv = 4.0 * &scalars.w * dot_eta_u * dot_eta_v;
+    let c_uv = 4.0 * &scalars.w * &(dot_mu_u * dot_eta_v + dot_mu_v * dot_eta_u)
+        + 8.0 * &scalars.m * dot_eta_u * dot_eta_v;
+    let d_uv = 4.0 * &scalars.w * dot_mu_u * dot_mu_v
+        + 8.0 * &scalars.m * &(dot_mu_u * dot_eta_v + dot_mu_v * dot_eta_u)
+        + 8.0 * &scalars.n * dot_eta_u * dot_eta_v;
+    (w_uv, c_uv, d_uv)
+}
+
 #[inline]
 #[allow(clippy::type_complexity)]
 fn gaussian_sigma_derivs_up_to_fourth(
@@ -3438,21 +3489,13 @@ impl GaussianLocationScaleFamily {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
 
-        let sigma = eta_ls.mapv(f64::exp);
         let p_mu = x_mu.ncols();
         let p_ls = x_ls.ncols();
         let total = p_mu + p_ls;
-        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
-        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
-        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let s = sigma[i].max(1e-12);
-            let q = (self.y[i] - eta_mu[i]) / s;
-            let w = self.weights[i];
-            h_mu_mu_coeff[i] = w / (s * s);
-            h_mu_ls_coeff[i] = 2.0 * w * q / s;
-            h_ls_ls_coeff[i] = 2.0 * w * q * q;
-        }
+        let rows = gaussian_joint_row_scalars(&self.y, eta_mu, eta_ls, &self.weights)?;
+        let h_mu_mu_coeff = rows.w.clone();
+        let h_mu_ls_coeff = 2.0 * &rows.m;
+        let h_ls_ls_coeff = 2.0 * &rows.n;
 
         let h_mu_mu = xt_diag_x_dense(x_mu, &h_mu_mu_coeff)?;
         let h_mu_ls = xt_diag_y_dense(x_mu, &h_mu_ls_coeff, x_ls)?;
@@ -3499,24 +3542,9 @@ impl GaussianLocationScaleFamily {
         let u_ls = d_beta_flat.slice(s![p_mu..p_mu + p_ls]).to_owned();
         let xi_mu = x_mu.dot(&u_mu);
         let xi_ls = x_ls.dot(&u_ls);
-        let sigma = eta_ls.mapv(f64::exp);
-        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
-        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
-        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
-        let mut dh_mu_mu = Array1::<f64>::zeros(n);
-        let mut dh_mu_ls = Array1::<f64>::zeros(n);
-        let mut dh_ls_ls = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let s = sigma[i].max(1e-12);
-            let q = (self.y[i] - eta_mu[i]) / s;
-            let w = self.weights[i];
-            h_mu_mu_coeff[i] = w / (s * s);
-            h_mu_ls_coeff[i] = 2.0 * w * q / s;
-            h_ls_ls_coeff[i] = 2.0 * w * q * q;
-            dh_mu_mu[i] = -2.0 * h_mu_mu_coeff[i] * xi_ls[i];
-            dh_mu_ls[i] = -2.0 * h_mu_mu_coeff[i] * xi_mu[i] - 2.0 * h_mu_ls_coeff[i] * xi_ls[i];
-            dh_ls_ls[i] = -2.0 * h_mu_ls_coeff[i] * xi_mu[i] - 2.0 * h_ls_ls_coeff[i] * xi_ls[i];
-        }
+        let rows = gaussian_joint_row_scalars(&self.y, eta_mu, eta_ls, &self.weights)?;
+        let (dh_mu_mu, dh_mu_ls, dh_ls_ls) =
+            gaussian_joint_first_directional_weights(&rows, &xi_mu, &xi_ls);
 
         let d_h_mu_mu = xt_diag_x_dense(x_mu, &dh_mu_mu)?;
         let d_h_mu_ls = xt_diag_y_dense(x_mu, &dh_mu_ls, x_ls)?;
@@ -3569,30 +3597,10 @@ impl GaussianLocationScaleFamily {
         let xi_ls_u = x_ls.dot(&u_ls);
         let xi_mu_v = x_mu.dot(&v_mu);
         let xi_ls_v = x_ls.dot(&v_ls);
-        let sigma = eta_ls.mapv(f64::exp);
-        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
-        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
-        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
-        let mut d2h_mu_mu = Array1::<f64>::zeros(n);
-        let mut d2h_mu_ls = Array1::<f64>::zeros(n);
-        let mut d2h_ls_ls = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let s = sigma[i].max(1e-12);
-            let q = (self.y[i] - eta_mu[i]) / s;
-            let w = self.weights[i];
-            h_mu_mu_coeff[i] = w / (s * s);
-            h_mu_ls_coeff[i] = 2.0 * w * q / s;
-            h_ls_ls_coeff[i] = 2.0 * w * q * q;
-            d2h_mu_mu[i] = 4.0 * h_mu_mu_coeff[i] * xi_ls_u[i] * xi_ls_v[i];
-            d2h_mu_ls[i] = 4.0
-                * (h_mu_mu_coeff[i] * (xi_mu_u[i] * xi_ls_v[i] + xi_mu_v[i] * xi_ls_u[i])
-                    + h_mu_ls_coeff[i] * xi_ls_u[i] * xi_ls_v[i]);
-            d2h_ls_ls[i] = 4.0
-                * (h_mu_mu_coeff[i] * xi_mu_u[i] * xi_mu_v[i]
-                    + h_mu_ls_coeff[i]
-                        * (xi_mu_u[i] * xi_ls_v[i] + xi_mu_v[i] * xi_ls_u[i])
-                    + h_ls_ls_coeff[i] * xi_ls_u[i] * xi_ls_v[i]);
-        }
+        let rows = gaussian_joint_row_scalars(&self.y, eta_mu, eta_ls, &self.weights)?;
+        let (d2h_mu_mu, d2h_mu_ls, d2h_ls_ls) = gaussian_joint_second_directional_weights(
+            &rows, &xi_mu_u, &xi_ls_u, &xi_mu_v, &xi_ls_v,
+        );
 
         let d2_h_mu_mu = xt_diag_x_dense(x_mu, &d2h_mu_mu)?;
         let d2_h_mu_ls = xt_diag_y_dense(x_mu, &d2h_mu_ls, x_ls)?;
