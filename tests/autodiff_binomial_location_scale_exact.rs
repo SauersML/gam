@@ -133,11 +133,7 @@ fn psi_quantity_numdual<D: DualNum<f64> + Copy>(
     }
 }
 
-fn psi_quantity_f1(
-    psi: F1,
-    p: &CombinedLocationScaleParams,
-    quantity: PsiQuantity,
-) -> F1 {
+fn psi_quantity_f1(psi: F1, p: &CombinedLocationScaleParams, quantity: PsiQuantity) -> F1 {
     let z1 = z1_f1(psi, p);
     let z2 = z2_f1(psi, p);
     let x = x_f1(psi, p);
@@ -314,9 +310,11 @@ fn manual_row_geometry(psi: f64, p: &CombinedLocationScaleParams) -> ManualRowGe
     let zeta = x * u[2];
     let zeta_a = x_a * u[2];
     let mut delta_a = [[0.0; 3]; 3];
-    delta_a[0][2] = s * (-zeta * z1_a * x - zeta * z1 * x_a + ell_a * zeta * z1 * x - zeta_a * z1 * x);
+    delta_a[0][2] =
+        s * (-zeta * z1_a * x - zeta * z1 * x_a + ell_a * zeta * z1 * x - zeta_a * z1 * x);
     delta_a[2][0] = delta_a[0][2];
-    delta_a[1][2] = s * (-zeta * z2_a * x - zeta * z2 * x_a + ell_a * zeta * z2 * x - zeta_a * z2 * x);
+    delta_a[1][2] =
+        s * (-zeta * z2_a * x - zeta * z2 * x_a + ell_a * zeta * z2 * x - zeta_a * z2 * x);
     delta_a[2][1] = delta_a[1][2];
     delta_a[2][2] = alpha_a * x * x + alpha * (2.0 * x_a * x);
 
@@ -400,12 +398,16 @@ fn eps_hessian_psi_numdual<D: DualNum<f64> + Copy>(
     r_a[1][2] = s * (z2_a * x + z2 * x_a - ell_a * z2 * x);
     r_a[2][1] = r_a[1][2];
     r_a[2][2] = h * x * x + q * (D::from(2.0) * x_a * x);
-    nu * h * b[i] * b[j]
-        + w * (c[i] * b[j] + b[i] * c[j] + h * q_mat[i][j])
-        + r * r_a[i][j]
+    nu * h * b[i] * b[j] + w * (c[i] * b[j] + b[i] * c[j] + h * q_mat[i][j]) + r * r_a[i][j]
 }
 
-fn eps_hessian_psi_f1(eps: F1, psi0: f64, p: &CombinedLocationScaleParams, i: usize, j: usize) -> F1 {
+fn eps_hessian_psi_f1(
+    eps: F1,
+    psi0: f64,
+    p: &CombinedLocationScaleParams,
+    i: usize,
+    j: usize,
+) -> F1 {
     let beta_1 = F1::cst(p.beta_1) + F1::cst(p.u_1) * eps;
     let beta_2 = F1::cst(p.beta_2) + F1::cst(p.u_2) * eps;
     let beta_ls = F1::cst(p.beta_ls) + F1::cst(p.u_ls) * eps;
@@ -444,12 +446,16 @@ fn eps_hessian_psi_f1(eps: F1, psi0: f64, p: &CombinedLocationScaleParams, i: us
     r_a[1][2] = s * (z2_a * x + z2 * x_a - ell_a * z2 * x);
     r_a[2][1] = r_a[1][2];
     r_a[2][2] = h * x * x + q * (F1::cst(2.0) * x_a * x);
-    nu * h * b[i] * b[j]
-        + w * (c[i] * b[j] + b[i] * c[j] + h * q_mat[i][j])
-        + r * r_a[i][j]
+    nu * h * b[i] * b[j] + w * (c[i] * b[j] + b[i] * c[j] + h * q_mat[i][j]) + r * r_a[i][j]
 }
 
-fn eps_hessian_psi_ad<T: AD>(eps: T, psi0: f64, p: &CombinedLocationScaleParams, i: usize, j: usize) -> T {
+fn eps_hessian_psi_ad<T: AD>(
+    eps: T,
+    psi0: f64,
+    p: &CombinedLocationScaleParams,
+    i: usize,
+    j: usize,
+) -> T {
     let beta_1 = T::constant(p.beta_1) + T::constant(p.u_1) * eps;
     let beta_2 = T::constant(p.beta_2) + T::constant(p.u_2) * eps;
     let beta_ls = T::constant(p.beta_ls) + T::constant(p.u_ls) * eps;
@@ -488,9 +494,7 @@ fn eps_hessian_psi_ad<T: AD>(eps: T, psi0: f64, p: &CombinedLocationScaleParams,
     r_a[1][2] = s * (z2_a * x + z2 * x_a - ell_a * z2 * x);
     r_a[2][1] = r_a[1][2];
     r_a[2][2] = h * x * x + q * (T::constant(2.0) * x_a * x);
-    nu * h * b[i] * b[j]
-        + w * (c[i] * b[j] + b[i] * c[j] + h * q_mat[i][j])
-        + r * r_a[i][j]
+    nu * h * b[i] * b[j] + w * (c[i] * b[j] + b[i] * c[j] + h * q_mat[i][j]) + r * r_a[i][j]
 }
 
 #[derive(Clone)]
@@ -522,7 +526,13 @@ impl<T: AD> DifferentiableFunctionTrait<T> for EpsHessianPsiFn<T> {
     const NAME: &'static str = "EpsHessianPsiFn";
 
     fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
-        vec![eps_hessian_psi_ad(inputs[0], self.psi0, &self.params, self.i, self.j)]
+        vec![eps_hessian_psi_ad(
+            inputs[0],
+            self.psi0,
+            &self.params,
+            self.i,
+            self.j,
+        )]
     }
 
     fn num_inputs(&self) -> usize {

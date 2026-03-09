@@ -10442,15 +10442,8 @@ mod tests {
             LikelihoodFamily::BinomialProbit,
             LikelihoodFamily::BinomialCLogLog,
         ] {
-            let obs = evaluate_standard_family_observations(
-                family,
-                None,
-                None,
-                &y,
-                &weights,
-                &eta,
-            )
-            .expect("tail observations");
+            let obs = evaluate_standard_family_observations(family, None, None, &y, &weights, &eta)
+                .expect("tail observations");
             assert!(obs.log_likelihood.is_finite(), "family={family:?}");
             assert!(
                 obs.score.iter().all(|v| v.is_finite())

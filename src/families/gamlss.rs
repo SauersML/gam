@@ -210,7 +210,6 @@ impl GamlssBetaLayout {
             flat.slice(s![self.pt + self.pls..self.total()]).to_owned(),
         ))
     }
-
 }
 
 /// Generic block input for high-level built-in family APIs.
@@ -3340,6 +3339,38 @@ struct GaussianJointRowScalars {
     n: Array1<f64>,
 }
 
+struct GaussianJointPsiFirstWeights {
+    objective_psi_row: Array1<f64>,
+    score_mu: Array1<f64>,
+    score_ls: Array1<f64>,
+    dscore_mu: Array1<f64>,
+    dscore_ls: Array1<f64>,
+    h_mu_mu: Array1<f64>,
+    h_mu_ls: Array1<f64>,
+    h_ls_ls: Array1<f64>,
+    dh_mu_mu: Array1<f64>,
+    dh_mu_ls: Array1<f64>,
+    dh_ls_ls: Array1<f64>,
+}
+
+struct GaussianJointPsiSecondWeights {
+    objective_psi_psi_row: Array1<f64>,
+    d2score_mu: Array1<f64>,
+    d2score_ls: Array1<f64>,
+    d2h_mu_mu: Array1<f64>,
+    d2h_mu_ls: Array1<f64>,
+    d2h_ls_ls: Array1<f64>,
+}
+
+struct GaussianJointPsiMixedDriftWeights {
+    dh_mu_mu_u: Array1<f64>,
+    dh_mu_ls_u: Array1<f64>,
+    dh_ls_ls_u: Array1<f64>,
+    d2h_mu_mu: Array1<f64>,
+    d2h_mu_ls: Array1<f64>,
+    d2h_ls_ls: Array1<f64>,
+}
+
 fn gaussian_joint_row_scalars(
     y: &Array1<f64>,
     eta_mu: &Array1<f64>,
@@ -3383,6 +3414,240 @@ fn gaussian_joint_second_directional_weights(
         + 8.0 * &scalars.m * &(dot_mu_u * dot_eta_v + dot_mu_v * dot_eta_u)
         + 8.0 * &scalars.n * dot_eta_u * dot_eta_v;
     (w_uv, c_uv, d_uv)
+}
+
+fn gaussian_joint_psi_first_weights(
+    scalars: &GaussianJointRowScalars,
+    mu_a: &Array1<f64>,
+    eta_a: &Array1<f64>,
+) -> GaussianJointPsiFirstWeights {
+    let score_mu = -&scalars.m;
+    let score_ls = 1.0 - &scalars.n;
+    let dscore_mu = &scalars.w * mu_a + 2.0 * &scalars.m * eta_a;
+    let dscore_ls = 2.0 * &scalars.m * mu_a + 2.0 * &scalars.n * eta_a;
+    let h_mu_mu = scalars.w.clone();
+    let h_mu_ls = 2.0 * &scalars.m;
+    let h_ls_ls = 2.0 * &scalars.n;
+    let dh_mu_mu = -2.0 * &scalars.w * eta_a;
+    let dh_mu_ls = -2.0 * &scalars.w * mu_a - 4.0 * &scalars.m * eta_a;
+    let dh_ls_ls = -4.0 * &scalars.m * mu_a - 4.0 * &scalars.n * eta_a;
+    let objective_psi_row = -&scalars.m * mu_a + &score_ls * eta_a;
+    GaussianJointPsiFirstWeights {
+        objective_psi_row,
+        score_mu,
+        score_ls,
+        dscore_mu,
+        dscore_ls,
+        h_mu_mu,
+        h_mu_ls,
+        h_ls_ls,
+        dh_mu_mu,
+        dh_mu_ls,
+        dh_ls_ls,
+    }
+}
+
+fn gaussian_joint_psi_second_weights(
+    scalars: &GaussianJointRowScalars,
+    mu_a: &Array1<f64>,
+    eta_a: &Array1<f64>,
+    mu_b: &Array1<f64>,
+    eta_b: &Array1<f64>,
+    mu_ab: &Array1<f64>,
+    eta_ab: &Array1<f64>,
+) -> GaussianJointPsiSecondWeights {
+    let cross_mu_eta = mu_a * eta_b + mu_b * eta_a;
+    let objective_psi_psi_row = &scalars.w * mu_a * mu_b
+        + 2.0 * &scalars.m * &cross_mu_eta
+        + 2.0 * &scalars.n * eta_a * eta_b
+        - &scalars.m * mu_ab
+        + (1.0 - &scalars.n) * eta_ab;
+    let d2score_mu =
+        &scalars.w * mu_ab - 2.0 * &scalars.w * &cross_mu_eta - 4.0 * &scalars.m * eta_a * eta_b
+            + 2.0 * &scalars.m * eta_ab;
+    let d2score_ls = -2.0 * &scalars.w * mu_a * mu_b
+        - 4.0 * &scalars.m * &cross_mu_eta
+        - 4.0 * &scalars.n * eta_a * eta_b
+        + 2.0 * &scalars.m * mu_ab
+        + 2.0 * &scalars.n * eta_ab;
+    let d2h_mu_mu = 4.0 * &scalars.w * eta_a * eta_b - 2.0 * &scalars.w * eta_ab;
+    let d2h_mu_ls = -2.0 * &scalars.w * mu_ab
+        + 4.0 * &scalars.w * &cross_mu_eta
+        + 8.0 * &scalars.m * eta_a * eta_b
+        - 4.0 * &scalars.m * eta_ab;
+    let d2h_ls_ls = 4.0 * &scalars.w * mu_a * mu_b
+        + 8.0 * &scalars.m * &cross_mu_eta
+        + 8.0 * &scalars.n * eta_a * eta_b
+        - 4.0 * &scalars.m * mu_ab
+        - 4.0 * &scalars.n * eta_ab;
+    GaussianJointPsiSecondWeights {
+        objective_psi_psi_row,
+        d2score_mu,
+        d2score_ls,
+        d2h_mu_mu,
+        d2h_mu_ls,
+        d2h_ls_ls,
+    }
+}
+
+fn gaussian_joint_psi_mixed_drift_weights(
+    scalars: &GaussianJointRowScalars,
+    dot_mu: &Array1<f64>,
+    dot_eta: &Array1<f64>,
+    mu_a: &Array1<f64>,
+    eta_a: &Array1<f64>,
+    dot_mu_a: &Array1<f64>,
+    dot_eta_a: &Array1<f64>,
+) -> GaussianJointPsiMixedDriftWeights {
+    let (_, dh_mu_ls_u, dh_ls_ls_u) =
+        gaussian_joint_first_directional_weights(scalars, dot_mu, dot_eta);
+    let dh_mu_mu_u = -2.0 * &scalars.w * dot_eta;
+    let d2h_mu_mu = 4.0 * &scalars.w * dot_eta * eta_a - 2.0 * &scalars.w * dot_eta_a;
+    let cross_mu_eta = dot_eta * mu_a + dot_mu * eta_a;
+    let d2h_mu_ls = -2.0 * &scalars.w * dot_mu_a
+        + 4.0 * &scalars.w * &cross_mu_eta
+        + 8.0 * &scalars.m * dot_eta * eta_a
+        - 4.0 * &scalars.m * dot_eta_a;
+    let d2h_ls_ls = 4.0 * &scalars.w * dot_mu * mu_a
+        + 8.0 * &scalars.m * &cross_mu_eta
+        + 8.0 * &scalars.n * dot_eta * eta_a
+        - 4.0 * &scalars.m * dot_mu_a
+        - 4.0 * &scalars.n * dot_eta_a;
+    GaussianJointPsiMixedDriftWeights {
+        dh_mu_mu_u,
+        dh_mu_ls_u,
+        dh_ls_ls_u,
+        d2h_mu_mu,
+        d2h_mu_ls,
+        d2h_ls_ls,
+    }
+}
+
+fn gaussian_pack_joint_score(score_mu: &Array1<f64>, score_ls: &Array1<f64>) -> Array1<f64> {
+    let p_mu = score_mu.len();
+    let p_ls = score_ls.len();
+    let mut out = Array1::<f64>::zeros(p_mu + p_ls);
+    out.slice_mut(s![0..p_mu]).assign(score_mu);
+    out.slice_mut(s![p_mu..p_mu + p_ls]).assign(score_ls);
+    out
+}
+
+fn gaussian_pack_joint_symmetric_hessian(
+    h_mu_mu: &Array2<f64>,
+    h_mu_ls: &Array2<f64>,
+    h_ls_ls: &Array2<f64>,
+) -> Array2<f64> {
+    let p_mu = h_mu_mu.nrows();
+    let p_ls = h_ls_ls.nrows();
+    let total = p_mu + p_ls;
+    let mut out = Array2::<f64>::zeros((total, total));
+    out.slice_mut(s![0..p_mu, 0..p_mu]).assign(h_mu_mu);
+    out.slice_mut(s![0..p_mu, p_mu..total]).assign(h_mu_ls);
+    out.slice_mut(s![p_mu..total, p_mu..total]).assign(h_ls_ls);
+    mirror_upper_to_lower(&mut out);
+    out
+}
+
+fn gaussian_joint_hessian_from_coeffs(
+    x_mu: &Array2<f64>,
+    x_ls: &Array2<f64>,
+    h_mu_mu_coeff: &Array1<f64>,
+    h_mu_ls_coeff: &Array1<f64>,
+    h_ls_ls_coeff: &Array1<f64>,
+) -> Result<Array2<f64>, String> {
+    let h_mu_mu = xt_diag_x_dense(x_mu, h_mu_mu_coeff)?;
+    let h_mu_ls = xt_diag_y_dense(x_mu, h_mu_ls_coeff, x_ls)?;
+    let h_ls_ls = xt_diag_x_dense(x_ls, h_ls_ls_coeff)?;
+    Ok(gaussian_pack_joint_symmetric_hessian(
+        &h_mu_mu, &h_mu_ls, &h_ls_ls,
+    ))
+}
+
+fn gaussian_joint_psi_hessian_from_weights(
+    x_mu: &Array2<f64>,
+    x_ls: &Array2<f64>,
+    x_mu_psi: &Array2<f64>,
+    x_ls_psi: &Array2<f64>,
+    weights: &GaussianJointPsiFirstWeights,
+) -> Result<Array2<f64>, String> {
+    let h_mu_mu = xt_diag_y_dense(x_mu_psi, &weights.h_mu_mu, x_mu)?
+        + &xt_diag_y_dense(x_mu, &weights.h_mu_mu, x_mu_psi)?
+        + &xt_diag_x_dense(x_mu, &weights.dh_mu_mu)?;
+    let h_mu_ls = xt_diag_y_dense(x_mu_psi, &weights.h_mu_ls, x_ls)?
+        + &xt_diag_y_dense(x_mu, &weights.h_mu_ls, x_ls_psi)?
+        + &xt_diag_y_dense(x_mu, &weights.dh_mu_ls, x_ls)?;
+    let h_ls_ls = xt_diag_y_dense(x_ls_psi, &weights.h_ls_ls, x_ls)?
+        + &xt_diag_y_dense(x_ls, &weights.h_ls_ls, x_ls_psi)?
+        + &xt_diag_x_dense(x_ls, &weights.dh_ls_ls)?;
+    Ok(gaussian_pack_joint_symmetric_hessian(
+        &h_mu_mu, &h_mu_ls, &h_ls_ls,
+    ))
+}
+
+fn gaussian_joint_psi_second_hessian_from_weights(
+    x_mu: &Array2<f64>,
+    x_ls: &Array2<f64>,
+    x_mu_i: &Array2<f64>,
+    x_ls_i: &Array2<f64>,
+    x_mu_j: &Array2<f64>,
+    x_ls_j: &Array2<f64>,
+    x_mu_ab: &Array2<f64>,
+    x_ls_ab: &Array2<f64>,
+    weights_i: &GaussianJointPsiFirstWeights,
+    weights_j: &GaussianJointPsiFirstWeights,
+    second_weights: &GaussianJointPsiSecondWeights,
+) -> Result<Array2<f64>, String> {
+    let h_mu_mu = xt_diag_y_dense(x_mu_ab, &weights_i.h_mu_mu, x_mu)?
+        + &xt_diag_y_dense(x_mu_i, &weights_i.h_mu_mu, x_mu_j)?
+        + &xt_diag_y_dense(x_mu_j, &weights_i.h_mu_mu, x_mu_i)?
+        + &xt_diag_y_dense(x_mu_i, &weights_j.dh_mu_mu, x_mu)?
+        + &xt_diag_y_dense(x_mu_j, &weights_i.dh_mu_mu, x_mu)?
+        + &xt_diag_y_dense(x_mu, &weights_i.dh_mu_mu, x_mu_j)?
+        + &xt_diag_y_dense(x_mu, &weights_j.dh_mu_mu, x_mu_i)?
+        + &xt_diag_x_dense(x_mu, &second_weights.d2h_mu_mu)?
+        + &xt_diag_y_dense(x_mu, &weights_i.h_mu_mu, x_mu_ab)?;
+    let h_mu_ls = xt_diag_y_dense(x_mu_ab, &weights_i.h_mu_ls, x_ls)?
+        + &xt_diag_y_dense(x_mu_i, &weights_i.h_mu_ls, x_ls_j)?
+        + &xt_diag_y_dense(x_mu_j, &weights_i.h_mu_ls, x_ls_i)?
+        + &xt_diag_y_dense(x_mu_i, &weights_j.dh_mu_ls, x_ls)?
+        + &xt_diag_y_dense(x_mu_j, &weights_i.dh_mu_ls, x_ls)?
+        + &xt_diag_y_dense(x_mu, &weights_i.dh_mu_ls, x_ls_j)?
+        + &xt_diag_y_dense(x_mu, &weights_j.dh_mu_ls, x_ls_i)?
+        + &xt_diag_y_dense(x_mu, &second_weights.d2h_mu_ls, x_ls)?
+        + &xt_diag_y_dense(x_mu, &weights_i.h_mu_ls, x_ls_ab)?;
+    let h_ls_ls = xt_diag_y_dense(x_ls_ab, &weights_i.h_ls_ls, x_ls)?
+        + &xt_diag_y_dense(x_ls_i, &weights_i.h_ls_ls, x_ls_j)?
+        + &xt_diag_y_dense(x_ls_j, &weights_i.h_ls_ls, x_ls_i)?
+        + &xt_diag_y_dense(x_ls_i, &weights_j.dh_ls_ls, x_ls)?
+        + &xt_diag_y_dense(x_ls_j, &weights_i.dh_ls_ls, x_ls)?
+        + &xt_diag_y_dense(x_ls, &weights_i.dh_ls_ls, x_ls_j)?
+        + &xt_diag_y_dense(x_ls, &weights_j.dh_ls_ls, x_ls_i)?
+        + &xt_diag_x_dense(x_ls, &second_weights.d2h_ls_ls)?
+        + &xt_diag_y_dense(x_ls, &weights_i.h_ls_ls, x_ls_ab)?;
+    Ok(gaussian_pack_joint_symmetric_hessian(
+        &h_mu_mu, &h_mu_ls, &h_ls_ls,
+    ))
+}
+
+fn gaussian_joint_psi_mixed_hessian_drift_from_weights(
+    x_mu: &Array2<f64>,
+    x_ls: &Array2<f64>,
+    x_mu_psi: &Array2<f64>,
+    x_ls_psi: &Array2<f64>,
+    mixed_weights: &GaussianJointPsiMixedDriftWeights,
+) -> Result<Array2<f64>, String> {
+    let h_mu_mu = xt_diag_y_dense(x_mu_psi, &mixed_weights.dh_mu_mu_u, x_mu)?
+        + &xt_diag_y_dense(x_mu, &mixed_weights.dh_mu_mu_u, x_mu_psi)?
+        + &xt_diag_x_dense(x_mu, &mixed_weights.d2h_mu_mu)?;
+    let h_mu_ls = xt_diag_y_dense(x_mu_psi, &mixed_weights.dh_mu_ls_u, x_ls)?
+        + &xt_diag_y_dense(x_mu, &mixed_weights.dh_mu_ls_u, x_ls_psi)?
+        + &xt_diag_y_dense(x_mu, &mixed_weights.d2h_mu_ls, x_ls)?;
+    let h_ls_ls = xt_diag_y_dense(x_ls_psi, &mixed_weights.dh_ls_ls_u, x_ls)?
+        + &xt_diag_y_dense(x_ls, &mixed_weights.dh_ls_ls_u, x_ls_psi)?
+        + &xt_diag_x_dense(x_ls, &mixed_weights.d2h_ls_ls)?;
+    Ok(gaussian_pack_joint_symmetric_hessian(
+        &h_mu_mu, &h_mu_ls, &h_ls_ls,
+    ))
 }
 
 #[inline]
@@ -3431,10 +3696,9 @@ impl GaussianLocationScaleFamily {
     }
 
     fn dense_block_designs(&self) -> Result<(Array2<f64>, Array2<f64>), String> {
-        let mu_design = self
-            .mu_design
-            .as_ref()
-            .ok_or_else(|| "GaussianLocationScaleFamily exact path is missing mu design".to_string())?;
+        let mu_design = self.mu_design.as_ref().ok_or_else(|| {
+            "GaussianLocationScaleFamily exact path is missing mu design".to_string()
+        })?;
         let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
             "GaussianLocationScaleFamily exact path is missing log-sigma design".to_string()
         })?;
@@ -3489,23 +3753,14 @@ impl GaussianLocationScaleFamily {
             return Err("GaussianLocationScaleFamily input size mismatch".to_string());
         }
 
-        let p_mu = x_mu.ncols();
-        let p_ls = x_ls.ncols();
-        let total = p_mu + p_ls;
         let rows = gaussian_joint_row_scalars(&self.y, eta_mu, eta_ls, &self.weights)?;
-        let h_mu_mu_coeff = rows.w.clone();
-        let h_mu_ls_coeff = 2.0 * &rows.m;
-        let h_ls_ls_coeff = 2.0 * &rows.n;
-
-        let h_mu_mu = xt_diag_x_dense(x_mu, &h_mu_mu_coeff)?;
-        let h_mu_ls = xt_diag_y_dense(x_mu, &h_mu_ls_coeff, x_ls)?;
-        let h_ls_ls = xt_diag_x_dense(x_ls, &h_ls_ls_coeff)?;
-        let mut out = Array2::<f64>::zeros((total, total));
-        out.slice_mut(s![0..p_mu, 0..p_mu]).assign(&h_mu_mu);
-        out.slice_mut(s![0..p_mu, p_mu..total]).assign(&h_mu_ls);
-        out.slice_mut(s![p_mu..total, p_mu..total]).assign(&h_ls_ls);
-        mirror_upper_to_lower(&mut out);
-        Ok(Some(out))
+        Ok(Some(gaussian_joint_hessian_from_coeffs(
+            x_mu,
+            x_ls,
+            &rows.w,
+            &(2.0 * &rows.m),
+            &(2.0 * &rows.n),
+        )?))
     }
 
     fn exact_newton_joint_hessian_directional_derivative_from_designs(
@@ -3546,15 +3801,9 @@ impl GaussianLocationScaleFamily {
         let (dh_mu_mu, dh_mu_ls, dh_ls_ls) =
             gaussian_joint_first_directional_weights(&rows, &xi_mu, &xi_ls);
 
-        let d_h_mu_mu = xt_diag_x_dense(x_mu, &dh_mu_mu)?;
-        let d_h_mu_ls = xt_diag_y_dense(x_mu, &dh_mu_ls, x_ls)?;
-        let d_h_ls_ls = xt_diag_x_dense(x_ls, &dh_ls_ls)?;
-        let mut out = Array2::<f64>::zeros((total, total));
-        out.slice_mut(s![0..p_mu, 0..p_mu]).assign(&d_h_mu_mu);
-        out.slice_mut(s![0..p_mu, p_mu..total]).assign(&d_h_mu_ls);
-        out.slice_mut(s![p_mu..total, p_mu..total]).assign(&d_h_ls_ls);
-        mirror_upper_to_lower(&mut out);
-        Ok(Some(out))
+        Ok(Some(gaussian_joint_hessian_from_coeffs(
+            x_mu, x_ls, &dh_mu_mu, &dh_mu_ls, &dh_ls_ls,
+        )?))
     }
 
     fn exact_newton_joint_hessian_second_directional_derivative_from_designs(
@@ -3602,15 +3851,9 @@ impl GaussianLocationScaleFamily {
             &rows, &xi_mu_u, &xi_ls_u, &xi_mu_v, &xi_ls_v,
         );
 
-        let d2_h_mu_mu = xt_diag_x_dense(x_mu, &d2h_mu_mu)?;
-        let d2_h_mu_ls = xt_diag_y_dense(x_mu, &d2h_mu_ls, x_ls)?;
-        let d2_h_ls_ls = xt_diag_x_dense(x_ls, &d2h_ls_ls)?;
-        let mut out = Array2::<f64>::zeros((total, total));
-        out.slice_mut(s![0..p_mu, 0..p_mu]).assign(&d2_h_mu_mu);
-        out.slice_mut(s![0..p_mu, p_mu..total]).assign(&d2_h_mu_ls);
-        out.slice_mut(s![p_mu..total, p_mu..total]).assign(&d2_h_ls_ls);
-        mirror_upper_to_lower(&mut out);
-        Ok(Some(out))
+        Ok(Some(gaussian_joint_hessian_from_coeffs(
+            x_mu, x_ls, &d2h_mu_mu, &d2h_mu_ls, &d2h_ls_ls,
+        )?))
     }
 
     fn exact_newton_joint_psi_direction(
@@ -3759,8 +4002,13 @@ impl GaussianLocationScaleFamily {
                 derivative_blocks.len()
             ));
         }
-        let Some(dir_a) =
-            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_index, x_mu, x_ls)?
+        let Some(dir_a) = self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            x_mu,
+            x_ls,
+        )?
         else {
             return Ok(None);
         };
@@ -3795,70 +4043,22 @@ impl GaussianLocationScaleFamily {
         //
         // Generic code in custom_family.rs promotes these likelihood-only
         // objects to the full fixed-beta V_a / g_a / H_a by adding S_a.
-        let n = self.y.len();
         let eta_mu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let sigma = eta_ls.mapv(f64::exp);
-        let p_mu = x_mu.ncols();
-        let p_ls = x_ls.ncols();
-        let total = p_mu + p_ls;
-        let mut score_mu = Array1::<f64>::zeros(n);
-        let mut score_ls = Array1::<f64>::zeros(n);
-        let mut dscore_mu = Array1::<f64>::zeros(n);
-        let mut dscore_ls = Array1::<f64>::zeros(n);
-        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
-        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
-        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
-        let mut dh_mu_mu = Array1::<f64>::zeros(n);
-        let mut dh_mu_ls = Array1::<f64>::zeros(n);
-        let mut dh_ls_ls = Array1::<f64>::zeros(n);
-        let mut objective_psi = 0.0;
-        for i in 0..n {
-            let s = sigma[i].max(1e-12);
-            let q = (self.y[i] - eta_mu[i]) / s;
-            let w = self.weights[i];
-            score_mu[i] = -w * q / s;
-            score_ls[i] = w * (1.0 - q * q);
-            h_mu_mu_coeff[i] = w / (s * s);
-            h_mu_ls_coeff[i] = 2.0 * w * q / s;
-            h_ls_ls_coeff[i] = 2.0 * w * q * q;
-            dscore_mu[i] = h_mu_mu_coeff[i] * dir_a.z_mu_psi[i] + h_mu_ls_coeff[i] * dir_a.z_ls_psi[i];
-            dscore_ls[i] = h_mu_ls_coeff[i] * dir_a.z_mu_psi[i] + h_ls_ls_coeff[i] * dir_a.z_ls_psi[i];
-            dh_mu_mu[i] = -2.0 * h_mu_mu_coeff[i] * dir_a.z_ls_psi[i];
-            dh_mu_ls[i] = -2.0 * h_mu_mu_coeff[i] * dir_a.z_mu_psi[i]
-                - 2.0 * h_mu_ls_coeff[i] * dir_a.z_ls_psi[i];
-            dh_ls_ls[i] = -2.0 * h_mu_ls_coeff[i] * dir_a.z_mu_psi[i]
-                - 2.0 * h_ls_ls_coeff[i] * dir_a.z_ls_psi[i];
-            objective_psi += score_mu[i] * dir_a.z_mu_psi[i] + score_ls[i] * dir_a.z_ls_psi[i];
-        }
-
-        let mut score_psi = Array1::<f64>::zeros(total);
-        score_psi
-            .slice_mut(s![0..p_mu])
-            .assign(&(dir_a.x_mu_psi.t().dot(&score_mu) + x_mu.t().dot(&dscore_mu)));
-        score_psi
-            .slice_mut(s![p_mu..p_mu + p_ls])
-            .assign(&(dir_a.x_ls_psi.t().dot(&score_ls) + x_ls.t().dot(&dscore_ls)));
-
-        let h_mu_mu = xt_diag_y_dense(&dir_a.x_mu_psi, &h_mu_mu_coeff, x_mu)?
-            + &xt_diag_y_dense(x_mu, &h_mu_mu_coeff, &dir_a.x_mu_psi)?
-            + &xt_diag_x_dense(x_mu, &dh_mu_mu)?;
-        let h_mu_ls = xt_diag_y_dense(&dir_a.x_mu_psi, &h_mu_ls_coeff, x_ls)?
-            + &xt_diag_y_dense(x_mu, &h_mu_ls_coeff, &dir_a.x_ls_psi)?
-            + &xt_diag_y_dense(x_mu, &dh_mu_ls, x_ls)?;
-        let h_ls_ls = xt_diag_y_dense(&dir_a.x_ls_psi, &h_ls_ls_coeff, x_ls)?
-            + &xt_diag_y_dense(x_ls, &h_ls_ls_coeff, &dir_a.x_ls_psi)?
-            + &xt_diag_x_dense(x_ls, &dh_ls_ls)?;
-
-        let mut hessian_psi = Array2::<f64>::zeros((total, total));
-        hessian_psi.slice_mut(s![0..p_mu, 0..p_mu]).assign(&h_mu_mu);
-        hessian_psi
-            .slice_mut(s![0..p_mu, p_mu..p_mu + p_ls])
-            .assign(&h_mu_ls);
-        hessian_psi
-            .slice_mut(s![p_mu..p_mu + p_ls, p_mu..p_mu + p_ls])
-            .assign(&h_ls_ls);
-        mirror_upper_to_lower(&mut hessian_psi);
+        let rows = gaussian_joint_row_scalars(&self.y, eta_mu, eta_ls, &self.weights)?;
+        let weights_a = gaussian_joint_psi_first_weights(&rows, &dir_a.z_mu_psi, &dir_a.z_ls_psi);
+        let objective_psi = weights_a.objective_psi_row.sum();
+        let score_psi = gaussian_pack_joint_score(
+            &(dir_a.x_mu_psi.t().dot(&weights_a.score_mu) + x_mu.t().dot(&weights_a.dscore_mu)),
+            &(dir_a.x_ls_psi.t().dot(&weights_a.score_ls) + x_ls.t().dot(&weights_a.dscore_ls)),
+        );
+        let hessian_psi = gaussian_joint_psi_hessian_from_weights(
+            x_mu,
+            x_ls,
+            &dir_a.x_mu_psi,
+            &dir_a.x_ls_psi,
+            &weights_a,
+        )?;
 
         Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
             objective_psi,
@@ -3876,18 +4076,28 @@ impl GaussianLocationScaleFamily {
         x_mu: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let Some(dir_i) =
-            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_i, x_mu, x_ls)?
+        let Some(dir_i) = self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_i,
+            x_mu,
+            x_ls,
+        )?
         else {
             return Ok(None);
         };
-        let Some(dir_j) =
-            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_j, x_mu, x_ls)?
+        let Some(dir_j) = self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_j,
+            x_mu,
+            x_ls,
+        )?
         else {
             return Ok(None);
         };
-        let (x_mu_ab, x_ls_ab, z_mu_ab, z_ls_ab) =
-            self.exact_newton_joint_psi_second_design_drifts(
+        let (x_mu_ab, x_ls_ab, z_mu_ab, z_ls_ab) = self
+            .exact_newton_joint_psi_second_design_drifts(
                 block_states,
                 derivative_blocks,
                 &dir_i,
@@ -3918,149 +4128,45 @@ impl GaussianLocationScaleFamily {
         //
         // assembled from the usual product-rule expansion over realized
         // design motion X_{.,a}, X_{.,b}, X_{.,ab}. Generic code adds S_ab.
-        let n = self.y.len();
         let eta_mu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let sigma = eta_ls.mapv(f64::exp);
-        let p_mu = x_mu.ncols();
-        let p_ls = x_ls.ncols();
-        let total = p_mu + p_ls;
-
-        let mut score_mu = Array1::<f64>::zeros(n);
-        let mut score_ls = Array1::<f64>::zeros(n);
-        let mut dscore_mu_i = Array1::<f64>::zeros(n);
-        let mut dscore_mu_j = Array1::<f64>::zeros(n);
-        let mut dscore_ls_i = Array1::<f64>::zeros(n);
-        let mut dscore_ls_j = Array1::<f64>::zeros(n);
-        let mut d2score_mu = Array1::<f64>::zeros(n);
-        let mut d2score_ls = Array1::<f64>::zeros(n);
-        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
-        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
-        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
-        let mut dh_mu_mu_i = Array1::<f64>::zeros(n);
-        let mut dh_mu_mu_j = Array1::<f64>::zeros(n);
-        let mut dh_mu_ls_i = Array1::<f64>::zeros(n);
-        let mut dh_mu_ls_j = Array1::<f64>::zeros(n);
-        let mut dh_ls_ls_i = Array1::<f64>::zeros(n);
-        let mut dh_ls_ls_j = Array1::<f64>::zeros(n);
-        let mut d2h_mu_mu = Array1::<f64>::zeros(n);
-        let mut d2h_mu_ls = Array1::<f64>::zeros(n);
-        let mut d2h_ls_ls = Array1::<f64>::zeros(n);
-        let mut objective_psi_psi = 0.0;
-        for i in 0..n {
-            let s = sigma[i].max(1e-12);
-            let q = (self.y[i] - eta_mu[i]) / s;
-            let w = self.weights[i];
-            score_mu[i] = -w * q / s;
-            score_ls[i] = w * (1.0 - q * q);
-            h_mu_mu_coeff[i] = w / (s * s);
-            h_mu_ls_coeff[i] = 2.0 * w * q / s;
-            h_ls_ls_coeff[i] = 2.0 * w * q * q;
-            dscore_mu_i[i] = h_mu_mu_coeff[i] * dir_i.z_mu_psi[i] + h_mu_ls_coeff[i] * dir_i.z_ls_psi[i];
-            dscore_mu_j[i] = h_mu_mu_coeff[i] * dir_j.z_mu_psi[i] + h_mu_ls_coeff[i] * dir_j.z_ls_psi[i];
-            dscore_ls_i[i] = h_mu_ls_coeff[i] * dir_i.z_mu_psi[i] + h_ls_ls_coeff[i] * dir_i.z_ls_psi[i];
-            dscore_ls_j[i] = h_mu_ls_coeff[i] * dir_j.z_mu_psi[i] + h_ls_ls_coeff[i] * dir_j.z_ls_psi[i];
-            d2score_mu[i] = h_mu_mu_coeff[i]
-                * (z_mu_ab[i]
-                    - 2.0 * (dir_i.z_mu_psi[i] * dir_j.z_ls_psi[i]
-                        + dir_j.z_mu_psi[i] * dir_i.z_ls_psi[i]))
-                + h_mu_ls_coeff[i] * (z_ls_ab[i] - 2.0 * dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i]);
-            d2score_ls[i] = -2.0 * h_mu_mu_coeff[i] * dir_i.z_mu_psi[i] * dir_j.z_mu_psi[i]
-                + h_mu_ls_coeff[i]
-                    * (z_mu_ab[i]
-                        - 2.0 * (dir_i.z_mu_psi[i] * dir_j.z_ls_psi[i]
-                            + dir_j.z_mu_psi[i] * dir_i.z_ls_psi[i]))
-                + h_ls_ls_coeff[i] * (z_ls_ab[i] - 2.0 * dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i]);
-            dh_mu_mu_i[i] = -2.0 * h_mu_mu_coeff[i] * dir_i.z_ls_psi[i];
-            dh_mu_mu_j[i] = -2.0 * h_mu_mu_coeff[i] * dir_j.z_ls_psi[i];
-            dh_mu_ls_i[i] = -2.0 * h_mu_mu_coeff[i] * dir_i.z_mu_psi[i]
-                - 2.0 * h_mu_ls_coeff[i] * dir_i.z_ls_psi[i];
-            dh_mu_ls_j[i] = -2.0 * h_mu_mu_coeff[i] * dir_j.z_mu_psi[i]
-                - 2.0 * h_mu_ls_coeff[i] * dir_j.z_ls_psi[i];
-            dh_ls_ls_i[i] = -2.0 * h_mu_ls_coeff[i] * dir_i.z_mu_psi[i]
-                - 2.0 * h_ls_ls_coeff[i] * dir_i.z_ls_psi[i];
-            dh_ls_ls_j[i] = -2.0 * h_mu_ls_coeff[i] * dir_j.z_mu_psi[i]
-                - 2.0 * h_ls_ls_coeff[i] * dir_j.z_ls_psi[i];
-            d2h_mu_mu[i] = 4.0 * h_mu_mu_coeff[i] * dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i]
-                - 2.0 * h_mu_mu_coeff[i] * z_ls_ab[i];
-            d2h_mu_ls[i] = 4.0
-                * (h_mu_mu_coeff[i]
-                    * (dir_i.z_mu_psi[i] * dir_j.z_ls_psi[i]
-                        + dir_j.z_mu_psi[i] * dir_i.z_ls_psi[i])
-                    + h_mu_ls_coeff[i] * dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i])
-                - 2.0 * h_mu_mu_coeff[i] * z_mu_ab[i]
-                - 2.0 * h_mu_ls_coeff[i] * z_ls_ab[i];
-            d2h_ls_ls[i] = 4.0
-                * (h_mu_mu_coeff[i] * dir_i.z_mu_psi[i] * dir_j.z_mu_psi[i]
-                    + h_mu_ls_coeff[i]
-                        * (dir_i.z_mu_psi[i] * dir_j.z_ls_psi[i]
-                            + dir_j.z_mu_psi[i] * dir_i.z_ls_psi[i])
-                    + h_ls_ls_coeff[i] * dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i])
-                - 2.0 * h_mu_ls_coeff[i] * z_mu_ab[i]
-                - 2.0 * h_ls_ls_coeff[i] * z_ls_ab[i];
-            let q_i = -dir_i.z_mu_psi[i] / s - q * dir_i.z_ls_psi[i];
-            let q_j = -dir_j.z_mu_psi[i] / s - q * dir_j.z_ls_psi[i];
-            let q_ij = -z_mu_ab[i] / s
-                + (dir_i.z_mu_psi[i] * dir_j.z_ls_psi[i]
-                    + dir_j.z_mu_psi[i] * dir_i.z_ls_psi[i])
-                    / s
-                + q * (dir_i.z_ls_psi[i] * dir_j.z_ls_psi[i] - z_ls_ab[i]);
-            objective_psi_psi += w * (q_i * q_j + q * q_ij + z_ls_ab[i]);
-        }
-
-        let mut score_psi_psi = Array1::<f64>::zeros(total);
-        score_psi_psi.slice_mut(s![0..p_mu]).assign(
-            &(x_mu_ab.t().dot(&score_mu)
-                + dir_i.x_mu_psi.t().dot(&dscore_mu_j)
-                + dir_j.x_mu_psi.t().dot(&dscore_mu_i)
-                + x_mu.t().dot(&d2score_mu)),
+        let rows = gaussian_joint_row_scalars(&self.y, eta_mu, eta_ls, &self.weights)?;
+        let weights_i = gaussian_joint_psi_first_weights(&rows, &dir_i.z_mu_psi, &dir_i.z_ls_psi);
+        let weights_j = gaussian_joint_psi_first_weights(&rows, &dir_j.z_mu_psi, &dir_j.z_ls_psi);
+        let second_weights = gaussian_joint_psi_second_weights(
+            &rows,
+            &dir_i.z_mu_psi,
+            &dir_i.z_ls_psi,
+            &dir_j.z_mu_psi,
+            &dir_j.z_ls_psi,
+            &z_mu_ab,
+            &z_ls_ab,
         );
-        score_psi_psi.slice_mut(s![p_mu..p_mu + p_ls]).assign(
-            &(x_ls_ab.t().dot(&score_ls)
-                + dir_i.x_ls_psi.t().dot(&dscore_ls_j)
-                + dir_j.x_ls_psi.t().dot(&dscore_ls_i)
-                + x_ls.t().dot(&d2score_ls)),
+        let objective_psi_psi = second_weights.objective_psi_psi_row.sum();
+
+        let score_psi_psi = gaussian_pack_joint_score(
+            &(x_mu_ab.t().dot(&weights_i.score_mu)
+                + dir_i.x_mu_psi.t().dot(&weights_j.dscore_mu)
+                + dir_j.x_mu_psi.t().dot(&weights_i.dscore_mu)
+                + x_mu.t().dot(&second_weights.d2score_mu)),
+            &(x_ls_ab.t().dot(&weights_i.score_ls)
+                + dir_i.x_ls_psi.t().dot(&weights_j.dscore_ls)
+                + dir_j.x_ls_psi.t().dot(&weights_i.dscore_ls)
+                + x_ls.t().dot(&second_weights.d2score_ls)),
         );
-
-        let h_mu_mu = xt_diag_y_dense(&x_mu_ab, &h_mu_mu_coeff, x_mu)?
-            + &xt_diag_y_dense(&dir_i.x_mu_psi, &h_mu_mu_coeff, &dir_j.x_mu_psi)?
-            + &xt_diag_y_dense(&dir_j.x_mu_psi, &h_mu_mu_coeff, &dir_i.x_mu_psi)?
-            + &xt_diag_y_dense(&dir_i.x_mu_psi, &dh_mu_mu_j, x_mu)?
-            + &xt_diag_y_dense(&dir_j.x_mu_psi, &dh_mu_mu_i, x_mu)?
-            + &xt_diag_y_dense(x_mu, &dh_mu_mu_i, &dir_j.x_mu_psi)?
-            + &xt_diag_y_dense(x_mu, &dh_mu_mu_j, &dir_i.x_mu_psi)?
-            + &xt_diag_x_dense(x_mu, &d2h_mu_mu)?
-            + &xt_diag_y_dense(x_mu, &h_mu_mu_coeff, &x_mu_ab)?;
-        let h_mu_ls = xt_diag_y_dense(&x_mu_ab, &h_mu_ls_coeff, x_ls)?
-            + &xt_diag_y_dense(&dir_i.x_mu_psi, &h_mu_ls_coeff, &dir_j.x_ls_psi)?
-            + &xt_diag_y_dense(&dir_j.x_mu_psi, &h_mu_ls_coeff, &dir_i.x_ls_psi)?
-            + &xt_diag_y_dense(&dir_i.x_mu_psi, &dh_mu_ls_j, x_ls)?
-            + &xt_diag_y_dense(&dir_j.x_mu_psi, &dh_mu_ls_i, x_ls)?
-            + &xt_diag_y_dense(x_mu, &dh_mu_ls_i, &dir_j.x_ls_psi)?
-            + &xt_diag_y_dense(x_mu, &dh_mu_ls_j, &dir_i.x_ls_psi)?
-            + &xt_diag_y_dense(x_mu, &d2h_mu_ls, x_ls)?
-            + &xt_diag_y_dense(x_mu, &h_mu_ls_coeff, &x_ls_ab)?;
-        let h_ls_ls = xt_diag_y_dense(&x_ls_ab, &h_ls_ls_coeff, x_ls)?
-            + &xt_diag_y_dense(&dir_i.x_ls_psi, &h_ls_ls_coeff, &dir_j.x_ls_psi)?
-            + &xt_diag_y_dense(&dir_j.x_ls_psi, &h_ls_ls_coeff, &dir_i.x_ls_psi)?
-            + &xt_diag_y_dense(&dir_i.x_ls_psi, &dh_ls_ls_j, x_ls)?
-            + &xt_diag_y_dense(&dir_j.x_ls_psi, &dh_ls_ls_i, x_ls)?
-            + &xt_diag_y_dense(x_ls, &dh_ls_ls_i, &dir_j.x_ls_psi)?
-            + &xt_diag_y_dense(x_ls, &dh_ls_ls_j, &dir_i.x_ls_psi)?
-            + &xt_diag_x_dense(x_ls, &d2h_ls_ls)?
-            + &xt_diag_y_dense(x_ls, &h_ls_ls_coeff, &x_ls_ab)?;
-
-        let mut hessian_psi_psi = Array2::<f64>::zeros((total, total));
-        hessian_psi_psi
-            .slice_mut(s![0..p_mu, 0..p_mu])
-            .assign(&h_mu_mu);
-        hessian_psi_psi
-            .slice_mut(s![0..p_mu, p_mu..p_mu + p_ls])
-            .assign(&h_mu_ls);
-        hessian_psi_psi
-            .slice_mut(s![p_mu..p_mu + p_ls, p_mu..p_mu + p_ls])
-            .assign(&h_ls_ls);
-        mirror_upper_to_lower(&mut hessian_psi_psi);
+        let hessian_psi_psi = gaussian_joint_psi_second_hessian_from_weights(
+            x_mu,
+            x_ls,
+            &dir_i.x_mu_psi,
+            &dir_i.x_ls_psi,
+            &dir_j.x_mu_psi,
+            &dir_j.x_ls_psi,
+            &x_mu_ab,
+            &x_ls_ab,
+            &weights_i,
+            &weights_j,
+            &second_weights,
+        )?;
 
         Ok(Some(
             crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
@@ -4080,17 +4186,18 @@ impl GaussianLocationScaleFamily {
         x_mu: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some(dir_a) =
-            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_index, x_mu, x_ls)?
+        let Some(dir_a) = self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            x_mu,
+            x_ls,
+        )?
         else {
             return Ok(None);
         };
-        let n = self.y.len();
         let eta_mu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_mu.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err("GaussianLocationScaleFamily input size mismatch".to_string());
-        }
         let p_mu = x_mu.ncols();
         let p_ls = x_ls.ncols();
         let total = p_mu + p_ls;
@@ -4148,60 +4255,24 @@ impl GaussianLocationScaleFamily {
         //
         // Generic code then combines this with S(theta)-motion and the profile
         // mode responses to form ddot H_{ij}.
-        let sigma = eta_ls.mapv(f64::exp);
-        let mut h_mu_mu_coeff = Array1::<f64>::zeros(n);
-        let mut h_mu_ls_coeff = Array1::<f64>::zeros(n);
-        let mut h_ls_ls_coeff = Array1::<f64>::zeros(n);
-        let mut dh_mu_mu_u = Array1::<f64>::zeros(n);
-        let mut dh_mu_ls_u = Array1::<f64>::zeros(n);
-        let mut dh_ls_ls_u = Array1::<f64>::zeros(n);
-        let mut d2h_mu_mu = Array1::<f64>::zeros(n);
-        let mut d2h_mu_ls = Array1::<f64>::zeros(n);
-        let mut d2h_ls_ls = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let s = sigma[i].max(1e-12);
-            let q = (self.y[i] - eta_mu[i]) / s;
-            let w = self.weights[i];
-            h_mu_mu_coeff[i] = w / (s * s);
-            h_mu_ls_coeff[i] = 2.0 * w * q / s;
-            h_ls_ls_coeff[i] = 2.0 * w * q * q;
-            dh_mu_mu_u[i] = -2.0 * h_mu_mu_coeff[i] * xi_ls[i];
-            dh_mu_ls_u[i] = -2.0 * h_mu_mu_coeff[i] * xi_mu[i] - 2.0 * h_mu_ls_coeff[i] * xi_ls[i];
-            dh_ls_ls_u[i] = -2.0 * h_mu_ls_coeff[i] * xi_mu[i] - 2.0 * h_ls_ls_coeff[i] * xi_ls[i];
-            d2h_mu_mu[i] = 4.0 * h_mu_mu_coeff[i] * xi_ls[i] * dir_a.z_ls_psi[i]
-                - 2.0 * h_mu_mu_coeff[i] * uza_ls[i];
-            d2h_mu_ls[i] = 4.0
-                * (h_mu_mu_coeff[i]
-                    * (xi_ls[i] * dir_a.z_mu_psi[i] + xi_mu[i] * dir_a.z_ls_psi[i])
-                    + h_mu_ls_coeff[i] * xi_ls[i] * dir_a.z_ls_psi[i])
-                - 2.0 * h_mu_mu_coeff[i] * uza_mu[i]
-                - 2.0 * h_mu_ls_coeff[i] * uza_ls[i];
-            d2h_ls_ls[i] = 4.0
-                * (h_mu_mu_coeff[i] * xi_mu[i] * dir_a.z_mu_psi[i]
-                    + h_mu_ls_coeff[i]
-                        * (xi_ls[i] * dir_a.z_mu_psi[i] + xi_mu[i] * dir_a.z_ls_psi[i])
-                    + h_ls_ls_coeff[i] * xi_ls[i] * dir_a.z_ls_psi[i])
-                - 2.0 * h_mu_ls_coeff[i] * uza_mu[i]
-                - 2.0 * h_ls_ls_coeff[i] * uza_ls[i];
-        }
+        let rows = gaussian_joint_row_scalars(&self.y, eta_mu, eta_ls, &self.weights)?;
+        let mixed_weights = gaussian_joint_psi_mixed_drift_weights(
+            &rows,
+            &xi_mu,
+            &xi_ls,
+            &dir_a.z_mu_psi,
+            &dir_a.z_ls_psi,
+            &uza_mu,
+            &uza_ls,
+        );
 
-        let tt_block = xt_diag_y_dense(&dir_a.x_mu_psi, &dh_mu_mu_u, x_mu)?
-            + &xt_diag_y_dense(x_mu, &dh_mu_mu_u, &dir_a.x_mu_psi)?
-            + &xt_diag_x_dense(x_mu, &d2h_mu_mu)?;
-        let tl_block = xt_diag_y_dense(&dir_a.x_mu_psi, &dh_mu_ls_u, x_ls)?
-            + &xt_diag_y_dense(x_mu, &dh_mu_ls_u, &dir_a.x_ls_psi)?
-            + &xt_diag_y_dense(x_mu, &d2h_mu_ls, x_ls)?;
-        let ll_block = xt_diag_y_dense(&dir_a.x_ls_psi, &dh_ls_ls_u, x_ls)?
-            + &xt_diag_y_dense(x_ls, &dh_ls_ls_u, &dir_a.x_ls_psi)?
-            + &xt_diag_x_dense(x_ls, &d2h_ls_ls)?;
-
-        let mut out = Array2::<f64>::zeros((total, total));
-        out.slice_mut(s![0..p_mu, 0..p_mu]).assign(&tt_block);
-        out.slice_mut(s![0..p_mu, p_mu..p_mu + p_ls]).assign(&tl_block);
-        out.slice_mut(s![p_mu..p_mu + p_ls, p_mu..p_mu + p_ls])
-            .assign(&ll_block);
-        mirror_upper_to_lower(&mut out);
-        Ok(Some(out))
+        Ok(Some(gaussian_joint_psi_mixed_hessian_drift_from_weights(
+            x_mu,
+            x_ls,
+            &dir_a.x_mu_psi,
+            &dir_a.x_ls_psi,
+            &mixed_weights,
+        )?))
     }
 }
 
@@ -5472,7 +5543,8 @@ impl BinomialLocationScaleFamily {
             psi_index,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
 
@@ -5676,7 +5748,8 @@ impl BinomialLocationScaleFamily {
             psi_i,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let Some(dir_j) = self.exact_newton_joint_psi_direction(
@@ -5685,7 +5758,8 @@ impl BinomialLocationScaleFamily {
             psi_j,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let (x_t_ab, x_ls_ab, z_t_ab, z_ls_ab) = self.exact_newton_joint_psi_second_design_drifts(
@@ -5879,8 +5953,7 @@ impl BinomialLocationScaleFamily {
             dr_ls_i[row] = -u * q_i;
             dr_ls_j[row] = -u * q_j;
             d2r_t[row] = r
-                * (-c * q_i * q_j
-                    - b * q_ij
+                * (-c * q_i * q_j - b * q_ij
                     + b * (q_i * dir_j.z_ls_psi[row] + q_j * dir_i.z_ls_psi[row])
                     - a * dir_i.z_ls_psi[row] * dir_j.z_ls_psi[row]
                     + a * z_ls_ab[row]);
@@ -5897,19 +5970,16 @@ impl BinomialLocationScaleFamily {
             dh_ll_j[row] = (a + 3.0 * q * b + q * q * c) * q_j;
             d2h_tt[row] = r
                 * r
-                * (d * q_i * q_j
-                    + c * q_ij
+                * (d * q_i * q_j + c * q_ij
                     - 2.0 * c * (q_j * dir_i.z_ls_psi[row] + q_i * dir_j.z_ls_psi[row])
                     + 4.0 * b * dir_i.z_ls_psi[row] * dir_j.z_ls_psi[row]
                     - 2.0 * b * z_ls_ab[row]);
             d2h_tl[row] = r
-                * (((3.0 * c + q * d) * q_j) * q_i
-                    + (2.0 * b + q * c) * q_ij
-                    - (2.0 * b + q * c)
-                        * (q_j * dir_i.z_ls_psi[row] + q_i * dir_j.z_ls_psi[row])
+                * (((3.0 * c + q * d) * q_j) * q_i + (2.0 * b + q * c) * q_ij
+                    - (2.0 * b + q * c) * (q_j * dir_i.z_ls_psi[row] + q_i * dir_j.z_ls_psi[row])
                     + u * (dir_i.z_ls_psi[row] * dir_j.z_ls_psi[row] - z_ls_ab[row]));
-            d2h_ll[row] =
-                (4.0 * b + 5.0 * q * c + q * q * d) * q_i * q_j + (a + 3.0 * q * b + q * q * c) * q_ij;
+            d2h_ll[row] = (4.0 * b + 5.0 * q * c + q * q * d) * q_i * q_j
+                + (a + 3.0 * q * b + q * q * c) * q_ij;
 
             objective_psi_psi += a * q_ij + b * q_i * q_j;
         }
@@ -5992,7 +6062,8 @@ impl BinomialLocationScaleFamily {
             psi_index,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let n = self.y.len();
@@ -6107,13 +6178,11 @@ impl BinomialLocationScaleFamily {
                     - 2.0 * c * (q_a * xi_ls[row] + du * dir_a.z_ls_psi[row])
                     + 4.0 * b * xi_ls[row] * dir_a.z_ls_psi[row]);
             dh_tl_u[row] = r
-                * (((3.0 * c + q * d) * q_a) * du
-                    + (2.0 * b + q * c) * q_au
-                    - (2.0 * b + q * c)
-                        * (q_a * xi_ls[row] + du * dir_a.z_ls_psi[row])
+                * (((3.0 * c + q * d) * q_a) * du + (2.0 * b + q * c) * q_au
+                    - (2.0 * b + q * c) * (q_a * xi_ls[row] + du * dir_a.z_ls_psi[row])
                     + u * xi_ls[row] * dir_a.z_ls_psi[row]);
-            dh_ll_u[row] =
-                (4.0 * b + 5.0 * q * c + q * q * d) * du * q_a + (a + 3.0 * q * b + q * q * c) * q_au;
+            dh_ll_u[row] = (4.0 * b + 5.0 * q * c + q * q * d) * du * q_a
+                + (a + 3.0 * q * b + q * q * c) * q_au;
         }
 
         let tt_block = xt_diag_y_dense(&dir_a.x_t_psi, &h_tt_u, x_t)?
@@ -6133,7 +6202,6 @@ impl BinomialLocationScaleFamily {
         mirror_upper_to_lower(&mut out);
         Ok(Some(out))
     }
-
 }
 
 impl CustomFamily for BinomialLocationScaleFamily {
@@ -6570,7 +6638,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
             d_beta_v_flat,
         )
     }
-
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleFamily {
@@ -7031,7 +7098,8 @@ impl BinomialLocationScaleWiggleFamily {
             psi_index,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let n = self.y.len();
@@ -7127,7 +7195,8 @@ impl BinomialLocationScaleWiggleFamily {
             let q0_t_a = q0_geom.q_tl * dir_a.z_ls_psi[row];
             let q0_ls_a = q0_geom.q_tl * dir_a.z_t_psi[row] + q0_geom.q_ll * dir_a.z_ls_psi[row];
             let q0_tl_a = q0_geom.q_tl_ls * dir_a.z_ls_psi[row];
-            let q0_ll_a = q0_geom.q_tl_ls * dir_a.z_t_psi[row] + q0_geom.q_ll_ls * dir_a.z_ls_psi[row];
+            let q0_ll_a =
+                q0_geom.q_tl_ls * dir_a.z_t_psi[row] + q0_geom.q_ll_ls * dir_a.z_ls_psi[row];
 
             let q_t = m[row] * q0_geom.q_t;
             let q_ls = m[row] * q0_geom.q_ls;
@@ -7136,8 +7205,8 @@ impl BinomialLocationScaleWiggleFamily {
             let q_ll = g2[row] * q0_geom.q_ls * q0_geom.q_ls + m[row] * q0_geom.q_ll;
             let q_t_a = g2[row] * q0_a * q0_geom.q_t + m[row] * q0_t_a;
             let q_ls_a = g2[row] * q0_a * q0_geom.q_ls + m[row] * q0_ls_a;
-            let q_tt_a = g3[row] * q0_a * q0_geom.q_t * q0_geom.q_t
-                + g2[row] * (2.0 * q0_geom.q_t * q0_t_a);
+            let q_tt_a =
+                g3[row] * q0_a * q0_geom.q_t * q0_geom.q_t + g2[row] * (2.0 * q0_geom.q_t * q0_t_a);
             let q_tl_a = g3[row] * q0_a * q0_geom.q_t * q0_geom.q_ls
                 + g2[row] * (q0_t_a * q0_geom.q_ls + q0_geom.q_t * q0_ls_a + q0_a * q0_geom.q_tl)
                 + m[row] * q0_tl_a;
@@ -7150,8 +7219,7 @@ impl BinomialLocationScaleWiggleFamily {
             let dd_row = dd0.row(row);
             let q_w_a = d_row.to_owned() * q0_a;
             let q_tw_a = dd_row.to_owned() * (q0_a * q0_geom.q_t) + &(d_row.to_owned() * q0_t_a);
-            let q_lw_a =
-                dd_row.to_owned() * (q0_a * q0_geom.q_ls) + &(d_row.to_owned() * q0_ls_a);
+            let q_lw_a = dd_row.to_owned() * (q0_a * q0_geom.q_ls) + &(d_row.to_owned() * q0_ls_a);
 
             let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_probit_closed_form(
                 self.y[row],
@@ -7169,15 +7237,14 @@ impl BinomialLocationScaleWiggleFamily {
 
             let mut b = Array1::<f64>::zeros(total);
             b.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t));
-            b.slice_mut(s![pt..pt + pls]).assign(&(xlsr.to_owned() * q_ls));
+            b.slice_mut(s![pt..pt + pls])
+                .assign(&(xlsr.to_owned() * q_ls));
             b.slice_mut(s![pt + pls..]).assign(&b_row.to_owned());
 
             let mut c_a = Array1::<f64>::zeros(total);
-            c_a
-                .slice_mut(s![0..pt])
+            c_a.slice_mut(s![0..pt])
                 .assign(&(xtr.to_owned() * q_t_a + xta.to_owned() * q_t));
-            c_a
-                .slice_mut(s![pt..pt + pls])
+            c_a.slice_mut(s![pt..pt + pls])
                 .assign(&(xlsr.to_owned() * q_ls_a + xlsa.to_owned() * q_ls));
             c_a.slice_mut(s![pt + pls..]).assign(&q_w_a);
 
@@ -7185,14 +7252,32 @@ impl BinomialLocationScaleWiggleFamily {
 
             let mut q_mat = Array2::<f64>::zeros((total, total));
             {
-                let tt = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt;
-                let tl = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl;
-                let ll = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll;
+                let tt = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                    * q_tt;
+                let tl = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_tl;
+                let ll = xlsr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_ll;
                 q_mat.slice_mut(s![0..pt, 0..pt]).assign(&tt);
                 q_mat.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl);
                 q_mat.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll);
-                let tw = xtr.to_owned().insert_axis(Axis(1)).dot(&(d_row.to_owned() * q0_geom.q_t).insert_axis(Axis(0)));
-                let lw = xlsr.to_owned().insert_axis(Axis(1)).dot(&(d_row.to_owned() * q0_geom.q_ls).insert_axis(Axis(0)));
+                let tw = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.to_owned() * q0_geom.q_t).insert_axis(Axis(0)));
+                let lw = xlsr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.to_owned() * q0_geom.q_ls).insert_axis(Axis(0)));
                 q_mat.slice_mut(s![0..pt, pt + pls..]).assign(&tw);
                 q_mat.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw);
                 mirror_upper_to_lower(&mut q_mat);
@@ -7200,31 +7285,90 @@ impl BinomialLocationScaleWiggleFamily {
 
             let mut r_a = Array2::<f64>::zeros((total, total));
             {
-                let tt = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_a
-                    + xta.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xta.to_owned().insert_axis(Axis(0))) * q_tt;
-                let tl = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_a
-                    + xta.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_tl;
-                let ll = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_a
-                    + xlsa.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll
-                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_ll;
+                let tt = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                    * q_tt_a
+                    + xta
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                        * q_tt
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xta.to_owned().insert_axis(Axis(0)))
+                        * q_tt;
+                let tl = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_tl_a
+                    + xta
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_tl
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
+                        * q_tl;
+                let ll = xlsr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_ll_a
+                    + xlsa
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_ll
+                    + xlsr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
+                        * q_ll;
                 r_a.slice_mut(s![0..pt, 0..pt]).assign(&tt);
                 r_a.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl);
                 r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll);
-                let tw = xta.to_owned().insert_axis(Axis(1)).dot(&(d_row.to_owned() * q0_geom.q_t).insert_axis(Axis(0)))
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&q_tw_a.insert_axis(Axis(0)));
-                let lw = xlsa.to_owned().insert_axis(Axis(1)).dot(&(d_row.to_owned() * q0_geom.q_ls).insert_axis(Axis(0)))
-                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&q_lw_a.insert_axis(Axis(0)));
+                let tw = xta
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.to_owned() * q0_geom.q_t).insert_axis(Axis(0)))
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_tw_a.insert_axis(Axis(0)));
+                let lw = xlsa
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.to_owned() * q0_geom.q_ls).insert_axis(Axis(0)))
+                    + xlsr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_lw_a.insert_axis(Axis(0)));
                 r_a.slice_mut(s![0..pt, pt + pls..]).assign(&tw);
                 r_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw);
                 mirror_upper_to_lower(&mut r_a);
             }
 
-            let bb = b.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
-            let ca_bt = c_a.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
-            let b_cat = b.view().insert_axis(Axis(1)).dot(&c_a.view().insert_axis(Axis(0)));
-            hessian_psi += &(loss_3 * m[row] * q0_a * bb + loss_2 * (ca_bt + b_cat + (m[row] * q0_a) * q_mat) + loss_1 * r_a);
+            let bb = b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&b.view().insert_axis(Axis(0)));
+            let ca_bt = c_a
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&b.view().insert_axis(Axis(0)));
+            let b_cat = b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&c_a.view().insert_axis(Axis(0)));
+            hessian_psi += &(loss_3 * m[row] * q0_a * bb
+                + loss_2 * (ca_bt + b_cat + (m[row] * q0_a) * q_mat)
+                + loss_1 * r_a);
         }
 
         Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
@@ -7259,7 +7403,8 @@ impl BinomialLocationScaleWiggleFamily {
             psi_i,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let Some(dir_b) = self.exact_newton_joint_psi_direction(
@@ -7268,7 +7413,8 @@ impl BinomialLocationScaleWiggleFamily {
             psi_j,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let (x_t_ab, x_ls_ab, z_t_ab, z_ls_ab) = self.exact_newton_joint_psi_second_design_drifts(
@@ -7419,8 +7565,10 @@ impl BinomialLocationScaleWiggleFamily {
             let q0_tl_b = q0_geom.q_tl_ls * dir_b.z_ls_psi[row];
             let q0_tl_ab = q0_tl_ls_ls * dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row]
                 + q0_geom.q_tl_ls * z_ls_ab[row];
-            let q0_ll_a = q0_geom.q_tl_ls * dir_a.z_t_psi[row] + q0_geom.q_ll_ls * dir_a.z_ls_psi[row];
-            let q0_ll_b = q0_geom.q_tl_ls * dir_b.z_t_psi[row] + q0_geom.q_ll_ls * dir_b.z_ls_psi[row];
+            let q0_ll_a =
+                q0_geom.q_tl_ls * dir_a.z_t_psi[row] + q0_geom.q_ll_ls * dir_a.z_ls_psi[row];
+            let q0_ll_b =
+                q0_geom.q_tl_ls * dir_b.z_t_psi[row] + q0_geom.q_ll_ls * dir_b.z_ls_psi[row];
             let q0_ll_ab = q0_ab;
 
             let m_a = g2[row] * q0_a;
@@ -7443,8 +7591,7 @@ impl BinomialLocationScaleWiggleFamily {
             let q_ls_a = m_a * q0_geom.q_ls + m[row] * q0_ls_a;
             let q_ls_b = m_b * q0_geom.q_ls + m[row] * q0_ls_b;
             let q_t_ab = m_ab * q0_geom.q_t + m_a * q0_t_b + m_b * q0_t_a + m[row] * q0_t_ab;
-            let q_ls_ab =
-                m_ab * q0_geom.q_ls + m_a * q0_ls_b + m_b * q0_ls_a + m[row] * q0_ls_ab;
+            let q_ls_ab = m_ab * q0_geom.q_ls + m_a * q0_ls_b + m_b * q0_ls_a + m[row] * q0_ls_ab;
             let q_tt_a = g2_a * q0_geom.q_t * q0_geom.q_t + g2[row] * 2.0 * q0_geom.q_t * q0_t_a;
             let q_tt_b = g2_b * q0_geom.q_t * q0_geom.q_t + g2[row] * 2.0 * q0_geom.q_t * q0_t_b;
             let q_tt_ab = g2_ab * q0_geom.q_t * q0_geom.q_t
@@ -7500,8 +7647,14 @@ impl BinomialLocationScaleWiggleFamily {
             let q_lw_a = &dd_row * (q0_a * q0_geom.q_ls) + &(&d_row * q0_ls_a);
             let q_lw_b = &dd_row * (q0_b * q0_geom.q_ls) + &(&d_row * q0_ls_b);
             let d0_ab = &d3_row * (q0_a * q0_b) + &(&dd_row * q0_ab);
-            let q_tw_ab = &d0_ab * q0_geom.q_t + &(&(&dd_row * q0_b) * q0_t_a) + &(&(&dd_row * q0_a) * q0_t_b) + &(&d_row * q0_t_ab);
-            let q_lw_ab = &d0_ab * q0_geom.q_ls + &(&(&dd_row * q0_b) * q0_ls_a) + &(&(&dd_row * q0_a) * q0_ls_b) + &(&d_row * q0_ls_ab);
+            let q_tw_ab = &d0_ab * q0_geom.q_t
+                + &(&(&dd_row * q0_b) * q0_t_a)
+                + &(&(&dd_row * q0_a) * q0_t_b)
+                + &(&d_row * q0_t_ab);
+            let q_lw_ab = &d0_ab * q0_geom.q_ls
+                + &(&(&dd_row * q0_b) * q0_ls_a)
+                + &(&(&dd_row * q0_a) * q0_ls_b)
+                + &(&d_row * q0_ls_ab);
 
             let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_probit_closed_form(
                 self.y[row],
@@ -7528,15 +7681,20 @@ impl BinomialLocationScaleWiggleFamily {
 
             let mut b = Array1::<f64>::zeros(total);
             b.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t));
-            b.slice_mut(s![pt..pt + pls]).assign(&(xlsr.to_owned() * q_ls));
+            b.slice_mut(s![pt..pt + pls])
+                .assign(&(xlsr.to_owned() * q_ls));
             b.slice_mut(s![pt + pls..]).assign(&b_row);
             let mut c_a = Array1::<f64>::zeros(total);
-            c_a.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t_a + xta.to_owned() * q_t));
-            c_a.slice_mut(s![pt..pt + pls]).assign(&(xlsr.to_owned() * q_ls_a + xlsa.to_owned() * q_ls));
+            c_a.slice_mut(s![0..pt])
+                .assign(&(xtr.to_owned() * q_t_a + xta.to_owned() * q_t));
+            c_a.slice_mut(s![pt..pt + pls])
+                .assign(&(xlsr.to_owned() * q_ls_a + xlsa.to_owned() * q_ls));
             c_a.slice_mut(s![pt + pls..]).assign(&q_w_a);
             let mut c_b = Array1::<f64>::zeros(total);
-            c_b.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t_b + xtb.to_owned() * q_t));
-            c_b.slice_mut(s![pt..pt + pls]).assign(&(xlsr.to_owned() * q_ls_b + xlsb.to_owned() * q_ls));
+            c_b.slice_mut(s![0..pt])
+                .assign(&(xtr.to_owned() * q_t_b + xtb.to_owned() * q_t));
+            c_b.slice_mut(s![pt..pt + pls])
+                .assign(&(xlsr.to_owned() * q_ls_b + xlsb.to_owned() * q_ls));
             c_b.slice_mut(s![pt + pls..]).assign(&q_w_b);
             let mut c_ab = Array1::<f64>::zeros(total);
             c_ab.slice_mut(s![0..pt]).assign(
@@ -7563,113 +7721,394 @@ impl BinomialLocationScaleWiggleFamily {
             let mut r_b = Array2::<f64>::zeros((total, total));
             let mut r_ab = Array2::<f64>::zeros((total, total));
             {
-                let tt = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt;
-                let tl = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl;
-                let ll = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll;
+                let tt = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                    * q_tt;
+                let tl = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_tl;
+                let ll = xlsr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_ll;
                 q_mat.slice_mut(s![0..pt, 0..pt]).assign(&tt);
                 q_mat.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl);
                 q_mat.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll);
-                let tw = xtr.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)));
-                let lw = xlsr.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)));
+                let tw = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)));
+                let lw = xlsr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)));
                 q_mat.slice_mut(s![0..pt, pt + pls..]).assign(&tw);
                 q_mat.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw);
                 mirror_upper_to_lower(&mut q_mat);
 
-                let tt_a = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_a
-                    + xta.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xta.to_owned().insert_axis(Axis(0))) * q_tt;
-                let tl_a = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_a
-                    + xta.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_tl;
-                let ll_a = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_a
-                    + xlsa.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll
-                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_ll;
+                let tt_a = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                    * q_tt_a
+                    + xta
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                        * q_tt
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xta.to_owned().insert_axis(Axis(0)))
+                        * q_tt;
+                let tl_a = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_tl_a
+                    + xta
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_tl
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
+                        * q_tl;
+                let ll_a = xlsr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_ll_a
+                    + xlsa
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_ll
+                    + xlsr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
+                        * q_ll;
                 r_a.slice_mut(s![0..pt, 0..pt]).assign(&tt_a);
                 r_a.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl_a);
                 r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll_a);
-                let tw_a = xta.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)))
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&q_tw_a.view().insert_axis(Axis(0)));
-                let lw_a = xlsa.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
-                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&q_lw_a.view().insert_axis(Axis(0)));
+                let tw_a = xta
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)))
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_tw_a.view().insert_axis(Axis(0)));
+                let lw_a = xlsa
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
+                    + xlsr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_lw_a.view().insert_axis(Axis(0)));
                 r_a.slice_mut(s![0..pt, pt + pls..]).assign(&tw_a);
                 r_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw_a);
                 mirror_upper_to_lower(&mut r_a);
 
-                let tt_b = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_b
-                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xtb.to_owned().insert_axis(Axis(0))) * q_tt;
-                let tl_b = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_b
-                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_tl;
-                let ll_b = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_b
-                    + xlsb.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll
-                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_ll;
+                let tt_b = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                    * q_tt_b
+                    + xtb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                        * q_tt
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xtb.to_owned().insert_axis(Axis(0)))
+                        * q_tt;
+                let tl_b = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_tl_b
+                    + xtb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_tl
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
+                        * q_tl;
+                let ll_b = xlsr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_ll_b
+                    + xlsb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_ll
+                    + xlsr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
+                        * q_ll;
                 r_b.slice_mut(s![0..pt, 0..pt]).assign(&tt_b);
                 r_b.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl_b);
                 r_b.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll_b);
-                let tw_b = xtb.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)))
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&q_tw_b.view().insert_axis(Axis(0)));
-                let lw_b = xlsb.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
-                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&q_lw_b.view().insert_axis(Axis(0)));
+                let tw_b = xtb
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)))
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_tw_b.view().insert_axis(Axis(0)));
+                let lw_b = xlsb
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
+                    + xlsr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_lw_b.view().insert_axis(Axis(0)));
                 r_b.slice_mut(s![0..pt, pt + pls..]).assign(&tw_b);
                 r_b.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw_b);
                 mirror_upper_to_lower(&mut r_b);
 
-                let tt_ab = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_ab
-                    + xta.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_b
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xta.to_owned().insert_axis(Axis(0))) * q_tt_b
-                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_a
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xtb.to_owned().insert_axis(Axis(0))) * q_tt_a
-                    + xtab.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xtab.to_owned().insert_axis(Axis(0))) * q_tt
-                    + xta.to_owned().insert_axis(Axis(1)).dot(&xtb.to_owned().insert_axis(Axis(0))) * q_tt
-                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xta.to_owned().insert_axis(Axis(0))) * q_tt;
-                let tl_ab = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_ab
-                    + xta.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_b
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_tl_b
-                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_a
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_tl_a
-                    + xtab.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsab.to_owned().insert_axis(Axis(0))) * q_tl
-                    + xta.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_tl
-                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_tl;
-                let ll_ab = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_ab
-                    + xlsa.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_b
-                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_ll_b
-                    + xlsb.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_a
-                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_ll_a
-                    + xlsab.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll
-                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsab.to_owned().insert_axis(Axis(0))) * q_ll
-                    + xlsa.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_ll
-                    + xlsb.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_ll;
+                let tt_ab = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                    * q_tt_ab
+                    + xta
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                        * q_tt_b
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xta.to_owned().insert_axis(Axis(0)))
+                        * q_tt_b
+                    + xtb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                        * q_tt_a
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xtb.to_owned().insert_axis(Axis(0)))
+                        * q_tt_a
+                    + xtab
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
+                        * q_tt
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xtab.to_owned().insert_axis(Axis(0)))
+                        * q_tt
+                    + xta
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xtb.to_owned().insert_axis(Axis(0)))
+                        * q_tt
+                    + xtb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xta.to_owned().insert_axis(Axis(0)))
+                        * q_tt;
+                let tl_ab = xtr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_tl_ab
+                    + xta
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_tl_b
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
+                        * q_tl_b
+                    + xtb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_tl_a
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
+                        * q_tl_a
+                    + xtab
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_tl
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsab.to_owned().insert_axis(Axis(0)))
+                        * q_tl
+                    + xta
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
+                        * q_tl
+                    + xtb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
+                        * q_tl;
+                let ll_ab = xlsr
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                    * q_ll_ab
+                    + xlsa
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_ll_b
+                    + xlsr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
+                        * q_ll_b
+                    + xlsb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_ll_a
+                    + xlsr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
+                        * q_ll_a
+                    + xlsab
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
+                        * q_ll
+                    + xlsr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsab.to_owned().insert_axis(Axis(0)))
+                        * q_ll
+                    + xlsa
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
+                        * q_ll
+                    + xlsb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
+                        * q_ll;
                 r_ab.slice_mut(s![0..pt, 0..pt]).assign(&tt_ab);
                 r_ab.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl_ab);
-                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll_ab);
-                let tw_ab = xtab.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)))
-                    + xta.to_owned().insert_axis(Axis(1)).dot(&q_tw_b.view().insert_axis(Axis(0)))
-                    + xtb.to_owned().insert_axis(Axis(1)).dot(&q_tw_a.view().insert_axis(Axis(0)))
-                    + xtr.to_owned().insert_axis(Axis(1)).dot(&q_tw_ab.view().insert_axis(Axis(0)));
-                let lw_ab = xlsab.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
-                    + xlsa.to_owned().insert_axis(Axis(1)).dot(&q_lw_b.view().insert_axis(Axis(0)))
-                    + xlsb.to_owned().insert_axis(Axis(1)).dot(&q_lw_a.view().insert_axis(Axis(0)))
-                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&q_lw_ab.view().insert_axis(Axis(0)));
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls])
+                    .assign(&ll_ab);
+                let tw_ab = xtab
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)))
+                    + xta
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_tw_b.view().insert_axis(Axis(0)))
+                    + xtb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_tw_a.view().insert_axis(Axis(0)))
+                    + xtr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_tw_ab.view().insert_axis(Axis(0)));
+                let lw_ab = xlsab
+                    .to_owned()
+                    .insert_axis(Axis(1))
+                    .dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
+                    + xlsa
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_lw_b.view().insert_axis(Axis(0)))
+                    + xlsb
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_lw_a.view().insert_axis(Axis(0)))
+                    + xlsr
+                        .to_owned()
+                        .insert_axis(Axis(1))
+                        .dot(&q_lw_ab.view().insert_axis(Axis(0)));
                 r_ab.slice_mut(s![0..pt, pt + pls..]).assign(&tw_ab);
                 r_ab.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw_ab);
                 mirror_upper_to_lower(&mut r_ab);
             }
 
-            let bb = b.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
-            let cab_bt = c_ab.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
-            let b_cab_t = b.view().insert_axis(Axis(1)).dot(&c_ab.view().insert_axis(Axis(0)));
-            let ca_cb_t = c_a.view().insert_axis(Axis(1)).dot(&c_b.view().insert_axis(Axis(0)));
-            let cb_ca_t = c_b.view().insert_axis(Axis(1)).dot(&c_a.view().insert_axis(Axis(0)));
-            let ca_bt = c_a.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
-            let b_cat = b.view().insert_axis(Axis(1)).dot(&c_a.view().insert_axis(Axis(0)));
-            let cb_bt = c_b.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
-            let b_cbt = b.view().insert_axis(Axis(1)).dot(&c_b.view().insert_axis(Axis(0)));
+            let bb = b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&b.view().insert_axis(Axis(0)));
+            let cab_bt = c_ab
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&b.view().insert_axis(Axis(0)));
+            let b_cab_t = b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&c_ab.view().insert_axis(Axis(0)));
+            let ca_cb_t = c_a
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&c_b.view().insert_axis(Axis(0)));
+            let cb_ca_t = c_b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&c_a.view().insert_axis(Axis(0)));
+            let ca_bt = c_a
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&b.view().insert_axis(Axis(0)));
+            let b_cat = b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&c_a.view().insert_axis(Axis(0)));
+            let cb_bt = c_b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&b.view().insert_axis(Axis(0)));
+            let b_cbt = b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&c_b.view().insert_axis(Axis(0)));
 
             hessian_psi_psi += &(loss_1 * r_ab
-                + loss_2 * (q_b * r_a + q_a * r_b + cab_bt + b_cab_t + ca_cb_t + cb_ca_t + q_ab * &q_mat)
+                + loss_2
+                    * (q_b * r_a
+                        + q_a * r_b
+                        + cab_bt
+                        + b_cab_t
+                        + ca_cb_t
+                        + cb_ca_t
+                        + q_ab * &q_mat)
                 + loss_3 * (q_b * (ca_bt + b_cat) + q_a * (cb_bt + b_cbt) + q_a * q_b * &q_mat)
                 + (loss_4 * q_a * q_b + loss_3 * q_ab) * bb);
         }
@@ -7701,7 +8140,8 @@ impl BinomialLocationScaleWiggleFamily {
             psi_index,
             x_t,
             x_ls,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let pt = x_t.ncols();
@@ -7736,8 +8176,10 @@ impl BinomialLocationScaleWiggleFamily {
         let d4q = self.wiggle_d4q_dq04(base_core.q0.view(), beta_w.view())?;
         let pw = b0.ncols();
         let layout = GamlssBetaLayout::with_wiggle(pt, pls, pw);
-        let (u_t, u_ls, u_w) =
-            layout.split_three(d_beta_flat, "wiggle joint psi hessian directional derivative")?;
+        let (u_t, u_ls, u_w) = layout.split_three(
+            d_beta_flat,
+            "wiggle joint psi hessian directional derivative",
+        )?;
         let total = pt + pls + pw;
         if d0.ncols() != beta_w.len()
             || dd0.ncols() != beta_w.len()
@@ -7789,12 +8231,10 @@ impl BinomialLocationScaleWiggleFamily {
             let s3 = s2 * s_safe;
             let s4 = s3 * s_safe;
             let s5 = s4 * s_safe;
-            let q0_tl_ls_ls =
-                d3s[row] / s2 - 6.0 * ds[row] * d2s[row] / s3 + 6.0 * ds[row] * ds[row] * ds[row] / s4;
+            let q0_tl_ls_ls = d3s[row] / s2 - 6.0 * ds[row] * d2s[row] / s3
+                + 6.0 * ds[row] * ds[row] * ds[row] / s4;
             let q0_tl_ls_ls_ls =
-                d4s[row] / s2
-                    - 8.0 * ds[row] * d3s[row] / s3
-                    - 6.0 * d2s[row] * d2s[row] / s3
+                d4s[row] / s2 - 8.0 * ds[row] * d3s[row] / s3 - 6.0 * d2s[row] * d2s[row] / s3
                     + 36.0 * ds[row] * ds[row] * d2s[row] / s4
                     - 24.0 * ds[row] * ds[row] * ds[row] * ds[row] / s5;
             let q0_ll_ls_ls = eta_t[row] * q0_tl_ls_ls_ls;
@@ -7826,18 +8266,14 @@ impl BinomialLocationScaleWiggleFamily {
 
             let q0_a = -q0.q_t * dir_a.z_t_psi[row] - q0.q_ls * dir_a.z_ls_psi[row];
             let q0_t_a = q0.q_tl_ls * dir_a.z_ls_psi[row];
-            let q0_ls_a =
-                q0.q_tl_ls * dir_a.z_t_psi[row] + q0.q_ll_ls * dir_a.z_ls_psi[row];
+            let q0_ls_a = q0.q_tl_ls * dir_a.z_t_psi[row] + q0.q_ll_ls * dir_a.z_ls_psi[row];
             let q0_tl_a = q0.q_tl_ls * dir_a.z_ls_psi[row];
-            let q0_ll_a =
-                q0.q_tl_ls * dir_a.z_t_psi[row] + q0.q_ll_ls * dir_a.z_ls_psi[row];
+            let q0_ll_a = q0.q_tl_ls * dir_a.z_t_psi[row] + q0.q_ll_ls * dir_a.z_ls_psi[row];
             let dq0_a_u = q0_t_a * xi_t_i + q0_ls_a * xi_ls_i;
             let dq0_t_a_u = dq0_tl_ls_u * dir_a.z_ls_psi[row];
-            let dq0_ls_a_u =
-                dq0_tl_ls_u * dir_a.z_t_psi[row] + dq0_ll_ls_u * dir_a.z_ls_psi[row];
+            let dq0_ls_a_u = dq0_tl_ls_u * dir_a.z_t_psi[row] + dq0_ll_ls_u * dir_a.z_ls_psi[row];
             let dq0_tl_a_u = dq0_tl_ls_u * dir_a.z_ls_psi[row];
-            let dq0_ll_a_u =
-                dq0_tl_ls_u * dir_a.z_t_psi[row] + dq0_ll_ls_u * dir_a.z_ls_psi[row];
+            let dq0_ll_a_u = dq0_tl_ls_u * dir_a.z_t_psi[row] + dq0_ll_ls_u * dir_a.z_ls_psi[row];
 
             let q_t = m[row] * q0.q_t;
             let q_ls = m[row] * q0.q_ls;
@@ -7854,8 +8290,7 @@ impl BinomialLocationScaleWiggleFamily {
             let q_a = m[row] * q0_a;
             let q_t_a = g2[row] * q0_a * q0.q_t + m[row] * q0_t_a;
             let q_ls_a = g2[row] * q0_a * q0.q_ls + m[row] * q0_ls_a;
-            let q_tt_a = g3[row] * q0_a * q0.q_t * q0.q_t
-                + g2[row] * (2.0 * q0.q_t * q0_t_a);
+            let q_tt_a = g3[row] * q0_a * q0.q_t * q0.q_t + g2[row] * (2.0 * q0.q_t * q0_t_a);
             let q_tl_a = g3[row] * q0_a * q0.q_t * q0.q_ls
                 + g2[row] * (q0_t_a * q0.q_ls + q0.q_t * q0_ls_a + q0_a * q0.q_tl)
                 + m[row] * q0_tl_a;
@@ -7920,11 +8355,9 @@ impl BinomialLocationScaleWiggleFamily {
             b.slice_mut(s![pt + pls..]).assign(&br);
 
             let mut c_a = Array1::<f64>::zeros(total);
-            c_a
-                .slice_mut(s![0..pt])
+            c_a.slice_mut(s![0..pt])
                 .assign(&(xtr.clone() * q_t_a + xta.clone() * q_t));
-            c_a
-                .slice_mut(s![pt..pt + pls])
+            c_a.slice_mut(s![pt..pt + pls])
                 .assign(&(xlsr.clone() * q_ls_a + xlsa.clone() * q_ls));
             c_a.slice_mut(s![pt + pls..]).assign(&q_w_a);
 
@@ -7935,7 +8368,9 @@ impl BinomialLocationScaleWiggleFamily {
             gamma
                 .slice_mut(s![pt..pt + pls])
                 .assign(&(xlsr.clone() * (q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u)));
-            gamma.slice_mut(s![pt + pls..]).assign(&(dr.clone() * dq0_u));
+            gamma
+                .slice_mut(s![pt + pls..])
+                .assign(&(dr.clone() * dq0_u));
 
             let q_tw_a_dot_u = q_tw_a.dot(&u_w);
             let q_lw_a_dot_u = q_lw_a.dot(&u_w);
@@ -7947,8 +8382,7 @@ impl BinomialLocationScaleWiggleFamily {
                         + q_tl_a * xi_ls_i
                         + q_tl * xi_lsa_i
                         + q_tw_a_dot_u)
-                    + xta.clone()
-                        * (q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u)),
+                    + xta.clone() * (q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u)),
             );
             gamma_a.slice_mut(s![pt..pt + pls]).assign(
                 &(xlsr.clone()
@@ -7957,8 +8391,7 @@ impl BinomialLocationScaleWiggleFamily {
                         + q_ll_a * xi_ls_i
                         + q_ll * xi_lsa_i
                         + q_lw_a_dot_u)
-                    + xlsa.clone()
-                        * (q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u)),
+                    + xlsa.clone() * (q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u)),
             );
             gamma_a.slice_mut(s![pt + pls..]).assign(
                 &(q_tw_a.clone() * xi_t_i
@@ -7971,102 +8404,259 @@ impl BinomialLocationScaleWiggleFamily {
             let alpha_a = c_a.dot(d_beta_flat);
 
             let mut q_mat = Array2::<f64>::zeros((total, total));
-            q_mat
-                .slice_mut(s![0..pt, 0..pt])
-                .assign(&(xtr.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * q_tt));
-            q_mat
-                .slice_mut(s![0..pt, pt..pt + pls])
-                .assign(&(xtr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_tl));
-            q_mat
-                .slice_mut(s![pt..pt + pls, pt..pt + pls])
-                .assign(&(xlsr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_ll));
-            q_mat
-                .slice_mut(s![0..pt, pt + pls..])
-                .assign(&xtr.view().insert_axis(Axis(1)).dot(&q_tw.view().insert_axis(Axis(0))));
-            q_mat
-                .slice_mut(s![pt..pt + pls, pt + pls..])
-                .assign(&xlsr.view().insert_axis(Axis(1)).dot(&q_lw.view().insert_axis(Axis(0))));
+            q_mat.slice_mut(s![0..pt, 0..pt]).assign(
+                &(xtr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xtr.view().insert_axis(Axis(0)))
+                    * q_tt),
+            );
+            q_mat.slice_mut(s![0..pt, pt..pt + pls]).assign(
+                &(xtr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.view().insert_axis(Axis(0)))
+                    * q_tl),
+            );
+            q_mat.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
+                &(xlsr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.view().insert_axis(Axis(0)))
+                    * q_ll),
+            );
+            q_mat.slice_mut(s![0..pt, pt + pls..]).assign(
+                &xtr.view()
+                    .insert_axis(Axis(1))
+                    .dot(&q_tw.view().insert_axis(Axis(0))),
+            );
+            q_mat.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
+                &xlsr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&q_lw.view().insert_axis(Axis(0))),
+            );
             mirror_upper_to_lower(&mut q_mat);
 
             let mut r_a = Array2::<f64>::zeros((total, total));
             r_a.slice_mut(s![0..pt, 0..pt]).assign(
-                &(xtr.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * q_tt_a
-                    + xta.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * q_tt
-                    + xtr.view().insert_axis(Axis(1)).dot(&xta.view().insert_axis(Axis(0))) * q_tt),
+                &(xtr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xtr.view().insert_axis(Axis(0)))
+                    * q_tt_a
+                    + xta
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xtr.view().insert_axis(Axis(0)))
+                        * q_tt
+                    + xtr
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xta.view().insert_axis(Axis(0)))
+                        * q_tt),
             );
             r_a.slice_mut(s![0..pt, pt..pt + pls]).assign(
-                &(xtr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_tl_a
-                    + xta.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_tl
-                    + xtr.view().insert_axis(Axis(1)).dot(&xlsa.view().insert_axis(Axis(0))) * q_tl),
+                &(xtr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.view().insert_axis(Axis(0)))
+                    * q_tl_a
+                    + xta
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.view().insert_axis(Axis(0)))
+                        * q_tl
+                    + xtr
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.view().insert_axis(Axis(0)))
+                        * q_tl),
             );
             r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
-                &(xlsr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_ll_a
-                    + xlsa.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_ll
-                    + xlsr.view().insert_axis(Axis(1)).dot(&xlsa.view().insert_axis(Axis(0))) * q_ll),
+                &(xlsr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.view().insert_axis(Axis(0)))
+                    * q_ll_a
+                    + xlsa
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.view().insert_axis(Axis(0)))
+                        * q_ll
+                    + xlsr
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.view().insert_axis(Axis(0)))
+                        * q_ll),
             );
             r_a.slice_mut(s![0..pt, pt + pls..]).assign(
-                &(xta.view().insert_axis(Axis(1)).dot(&q_tw.view().insert_axis(Axis(0)))
-                    + xtr.view().insert_axis(Axis(1)).dot(&q_tw_a.view().insert_axis(Axis(0)))),
+                &(xta
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&q_tw.view().insert_axis(Axis(0)))
+                    + xtr
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&q_tw_a.view().insert_axis(Axis(0)))),
             );
             r_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
-                &(xlsa.view().insert_axis(Axis(1)).dot(&q_lw.view().insert_axis(Axis(0)))
-                    + xlsr.view().insert_axis(Axis(1)).dot(&q_lw_a.view().insert_axis(Axis(0)))),
+                &(xlsa
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&q_lw.view().insert_axis(Axis(0)))
+                    + xlsr
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&q_lw_a.view().insert_axis(Axis(0)))),
             );
             mirror_upper_to_lower(&mut r_a);
 
             let mut c_u = Array2::<f64>::zeros((total, total));
             c_u.slice_mut(s![0..pt, 0..pt]).assign(
-                &(xtr.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * dq_tt_u),
+                &(xtr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xtr.view().insert_axis(Axis(0)))
+                    * dq_tt_u),
             );
             c_u.slice_mut(s![0..pt, pt..pt + pls]).assign(
-                &(xtr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_tl_u),
+                &(xtr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.view().insert_axis(Axis(0)))
+                    * dq_tl_u),
             );
             c_u.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
-                &(xlsr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_ll_u),
+                &(xlsr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.view().insert_axis(Axis(0)))
+                    * dq_ll_u),
             );
             c_u.slice_mut(s![0..pt, pt + pls..]).assign(
-                &xtr.view().insert_axis(Axis(1)).dot(&dq_tw_u.view().insert_axis(Axis(0))),
+                &xtr.view()
+                    .insert_axis(Axis(1))
+                    .dot(&dq_tw_u.view().insert_axis(Axis(0))),
             );
             c_u.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
-                &xlsr.view().insert_axis(Axis(1)).dot(&dq_lw_u.view().insert_axis(Axis(0))),
+                &xlsr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&dq_lw_u.view().insert_axis(Axis(0))),
             );
             mirror_upper_to_lower(&mut c_u);
 
             let mut delta_a = Array2::<f64>::zeros((total, total));
             delta_a.slice_mut(s![0..pt, 0..pt]).assign(
-                &(xtr.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * dq_tt_a_u
-                    + xta.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * dq_tt_u
-                    + xtr.view().insert_axis(Axis(1)).dot(&xta.view().insert_axis(Axis(0))) * dq_tt_u),
+                &(xtr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xtr.view().insert_axis(Axis(0)))
+                    * dq_tt_a_u
+                    + xta
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xtr.view().insert_axis(Axis(0)))
+                        * dq_tt_u
+                    + xtr
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xta.view().insert_axis(Axis(0)))
+                        * dq_tt_u),
             );
             delta_a.slice_mut(s![0..pt, pt..pt + pls]).assign(
-                &(xtr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_tl_a_u
-                    + xta.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_tl_u
-                    + xtr.view().insert_axis(Axis(1)).dot(&xlsa.view().insert_axis(Axis(0))) * dq_tl_u),
+                &(xtr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.view().insert_axis(Axis(0)))
+                    * dq_tl_a_u
+                    + xta
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.view().insert_axis(Axis(0)))
+                        * dq_tl_u
+                    + xtr
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.view().insert_axis(Axis(0)))
+                        * dq_tl_u),
             );
             delta_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
-                &(xlsr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_ll_a_u
-                    + xlsa.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_ll_u
-                    + xlsr.view().insert_axis(Axis(1)).dot(&xlsa.view().insert_axis(Axis(0))) * dq_ll_u),
+                &(xlsr
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&xlsr.view().insert_axis(Axis(0)))
+                    * dq_ll_a_u
+                    + xlsa
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsr.view().insert_axis(Axis(0)))
+                        * dq_ll_u
+                    + xlsr
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&xlsa.view().insert_axis(Axis(0)))
+                        * dq_ll_u),
             );
             delta_a.slice_mut(s![0..pt, pt + pls..]).assign(
-                &(xta.view().insert_axis(Axis(1)).dot(&dq_tw_u.view().insert_axis(Axis(0)))
-                    + xtr.view().insert_axis(Axis(1)).dot(&dq_tw_a_u.view().insert_axis(Axis(0)))),
+                &(xta
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&dq_tw_u.view().insert_axis(Axis(0)))
+                    + xtr
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&dq_tw_a_u.view().insert_axis(Axis(0)))),
             );
             delta_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
-                &(xlsa.view().insert_axis(Axis(1)).dot(&dq_lw_u.view().insert_axis(Axis(0)))
-                    + xlsr.view().insert_axis(Axis(1)).dot(&dq_lw_a_u.view().insert_axis(Axis(0)))),
+                &(xlsa
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&dq_lw_u.view().insert_axis(Axis(0)))
+                    + xlsr
+                        .view()
+                        .insert_axis(Axis(1))
+                        .dot(&dq_lw_a_u.view().insert_axis(Axis(0)))),
             );
             mirror_upper_to_lower(&mut delta_a);
 
-            let bb = b.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
-            let cb = c_a.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
-            let bc = b.view().insert_axis(Axis(1)).dot(&c_a.view().insert_axis(Axis(0)));
-            let gb = gamma.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
-            let bg = b.view().insert_axis(Axis(1)).dot(&gamma.view().insert_axis(Axis(0)));
-            let gab = gamma_a.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
-            let bga = b.view().insert_axis(Axis(1)).dot(&gamma_a.view().insert_axis(Axis(0)));
-            let gc = gamma.view().insert_axis(Axis(1)).dot(&c_a.view().insert_axis(Axis(0)));
-            let cg = c_a.view().insert_axis(Axis(1)).dot(&gamma.view().insert_axis(Axis(0)));
+            let bb = b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&b.view().insert_axis(Axis(0)));
+            let cb = c_a
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&b.view().insert_axis(Axis(0)));
+            let bc = b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&c_a.view().insert_axis(Axis(0)));
+            let gb = gamma
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&b.view().insert_axis(Axis(0)));
+            let bg = b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&gamma.view().insert_axis(Axis(0)));
+            let gab = gamma_a
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&b.view().insert_axis(Axis(0)));
+            let bga = b
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&gamma_a.view().insert_axis(Axis(0)));
+            let gc = gamma
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&c_a.view().insert_axis(Axis(0)));
+            let cg = c_a
+                .view()
+                .insert_axis(Axis(1))
+                .dot(&gamma.view().insert_axis(Axis(0)));
 
             out += &(loss_1 * &delta_a);
             out += &(loss_2
@@ -9987,8 +10577,7 @@ mod tests {
             data[[i, 0]] = t;
             data[[i, 1]] = (2.25 * std::f64::consts::PI * t).sin();
         }
-        let y =
-            Array1::from_iter((0..n).map(|i| if i % 3 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
+        let y = Array1::from_iter((0..n).map(|i| if i % 3 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
         let weights = Array1::from_elem(n, 1.0);
         let mean_spec = simple_matern_term_collection(&[0, 1], 0.45);
         let noise_spec = simple_matern_term_collection(&[0, 1], 0.8);
@@ -10057,9 +10646,9 @@ mod tests {
         .expect("exact wiggle spatial joint hyper eval");
         assert!(eval.objective.is_finite());
         assert!(eval.gradient.iter().all(|v| v.is_finite()));
-        let hess = eval
-            .outer_hessian
-            .expect("exact wiggle spatial joint hyper path should return a full [rho, psi] hessian");
+        let hess = eval.outer_hessian.expect(
+            "exact wiggle spatial joint hyper path should return a full [rho, psi] hessian",
+        );
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
         let theta_dim = rho.len() + psi_dim;
         assert_eq!(hess.nrows(), theta_dim);
@@ -10149,8 +10738,7 @@ mod tests {
             data[[i, 0]] = t;
             data[[i, 1]] = (1.75 * std::f64::consts::PI * t).cos();
         }
-        let y =
-            Array1::from_iter((0..n).map(|i| if i % 4 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
+        let y = Array1::from_iter((0..n).map(|i| if i % 4 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
         let weights = Array1::from_elem(n, 1.0);
         let mean_spec = simple_matern_term_collection(&[0, 1], 0.4);
         let noise_spec = simple_matern_term_collection(&[0, 1], 0.7);
