@@ -10810,21 +10810,27 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalties.len(), 3);
+        assert_eq!(out.penalties.len(), 2);
         assert_eq!(out.penalty_info.len(), 3);
         assert!(matches!(
             out.penalty_info[0].source,
             PenaltySource::OperatorMass
         ));
+        assert!(out.penalty_info[0].active);
         assert!(matches!(
             out.penalty_info[1].source,
             PenaltySource::OperatorTension
         ));
+        assert!(out.penalty_info[1].active);
         assert!(matches!(
             out.penalty_info[2].source,
             PenaltySource::OperatorStiffness
         ));
-        assert!(out.penalty_info.iter().all(|info| info.active));
+        assert!(!out.penalty_info[2].active);
+        assert!(matches!(
+            out.penalty_info[2].dropped_reason,
+            Some(PenaltyDropReason::ZeroMatrix)
+        ));
     }
 
     #[test]
