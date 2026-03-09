@@ -2092,12 +2092,6 @@ impl<'a> RemlState<'a> {
         Ok(gradient_result)
     }
 
-    pub fn last_gradient_used_stochastic_fallback(&self) -> bool {
-        self.arena
-            .last_gradient_used_stochastic_fallback
-            .load(Ordering::Relaxed)
-    }
-
     pub(super) fn should_use_stochastic_exact_gradient(
         &self,
         bundle: &EvalShared,
