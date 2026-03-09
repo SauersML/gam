@@ -2752,6 +2752,26 @@ fn nonwiggle_q_derivs(
     let s2 = s * s;
     let s3 = s2 * s;
     let s4 = s3 * s;
+    // For q0(t,l) = -t / sigma(l), the base derivatives used throughout the
+    // wiggle exact-geometry path are
+    //
+    //   q0_t  = -1 / sigma,
+    //   q0_l  = t sigma'(l) / sigma(l)^2,
+    //   q0_tt = 0,
+    //   q0_tl = sigma'(l) / sigma(l)^2,
+    //   q0_ll = t [ sigma''/sigma^2 - 2 (sigma')^2 / sigma^3 ].
+    //
+    // For the exp scale used here, sigma(l)=exp(l), so sigma'=sigma''=sigma
+    // and these simplify to
+    //
+    //   q0_t  = -1/sigma,
+    //   q0_l  = t/sigma = -q0,
+    //   q0_tt = 0,
+    //   q0_tl = 1/sigma,
+    //   q0_ll = q0.
+    //
+    // That final sign is the easy one to get wrong. The exact wiggle Hessian
+    // fix depends on preserving q0_ll = q0, not -q0.
     let q_tl_ls = d2sigma / s2 - 2.0 * dsigma * dsigma / s3;
     NonWiggleQDerivs {
         q_t: -1.0 / s,
@@ -2936,6 +2956,56 @@ fn binomial_location_scale_working_sets(
                 geom.d2sigma_deta2[i],
                 0.0,
             );
+            // Full rowwise chain rule for the exact wiggle geometry.
+            //
+            // For one observation we work with
+            //
+            //   q0(t, l) = -t / sigma(l),
+            //   q(t, l)  = q0 + w(q0),
+            //   F(q)     = -ell(q),
+            //
+            // where t = eta_t, l = eta_log_sigma, sigma(l) = exp(l), and
+            //
+            //   a_i = dq/dq0 = 1 + w'(q0),
+            //   c_i = d^2 q / d q0^2 = w''(q0).
+            //
+            // The non-wiggle derivatives returned by `nonwiggle_q_derivs` are
+            //
+            //   q0_t  = -1/sigma,
+            //   q0_l  = -q0,
+            //   q0_tt = 0,
+            //   q0_tl = 1/sigma,
+            //   q0_ll = q0.
+            //
+            // The wiggle-composed scalar q = h(q0) with h'(q0)=a_i and
+            // h''(q0)=c_i then satisfies
+            //
+            //   q_t  = a_i * q0_t,
+            //   q_l  = a_i * q0_l,
+            //   q_tt = c_i * q0_t^2 + a_i * q0_tt,
+            //   q_tl = c_i * q0_t q0_l + a_i * q0_tl,
+            //   q_ll = c_i * q0_l^2 + a_i * q0_ll.
+            //
+            // Because q0_tt = 0, the threshold curvature reduces to
+            //
+            //   q_tt = c_i * q0_t^2.
+            //
+            // This is the term the old code was missing. The exact negative
+            // log-likelihood Hessian in (t, l) coordinates is
+            //
+            //   F_ab = m2 * q_a q_b + m1 * q_ab,
+            //
+            // where (m1, m2) are the first and second derivatives of F with
+            // respect to the scalar q. In particular,
+            //
+            //   F_tt = m2 * q_t^2 + m1 * q_tt,
+            //   F_ll = m2 * q_l^2 + m1 * q_ll.
+            //
+            // So once the wiggle is nonlinear (c_i != 0), dropping q_tt from
+            // the threshold block is mathematically wrong even though q0 itself
+            // is linear in eta_t. The spatial wiggle failure that triggered this
+            // patch was exactly that omission surfacing inside the exact-Newton
+            // path.
             let q_t = a_i * q0.q_t;
             let q_ls = a_i * q0.q_ls;
             let q_tt = c_i * q0.q_t * q0.q_t;
