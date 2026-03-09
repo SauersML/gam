@@ -158,7 +158,7 @@ fn compress_positive_collinear_constraints(
     b: &Array1<f64>,
 ) -> LinearInequalityConstraints {
     const SCALE_TOL: f64 = 1e-14;
-    const KEY_TOL: f64 = 1e-12;
+    const KEY_TOL: f64 = 1e-10;
 
     let mut grouped: BTreeMap<Vec<i64>, (Vec<f64>, f64)> = BTreeMap::new();
     let mut fallback_rows: Vec<(Vec<f64>, f64)> = Vec::new();
@@ -2317,6 +2317,57 @@ mod tests {
         }
         assert!(saw_x);
         assert!(saw_y);
+    }
+
+    #[test]
+    fn monotonicity_constraints_cluster_near_collinear_rows() {
+        let a = array![
+            [0.0, 0.5, 0.0],
+            [0.0, 0.50000000003, 0.0],
+            [0.0, 0.49999999997, 0.0]
+        ];
+        let b = array![1e-8, 1.00000000005e-8, 0.99999999995e-8];
+
+        let compressed = compress_positive_collinear_constraints(&a, &b);
+
+        assert_eq!(compressed.a.nrows(), 1);
+        assert_eq!(compressed.a.ncols(), 3);
+        assert!(compressed.a[[0, 0]].abs() <= 1e-12);
+        assert!((compressed.a[[0, 1]] - 1.0).abs() <= 1e-12);
+        assert!(compressed.a[[0, 2]].abs() <= 1e-12);
+        assert!((compressed.b[0] - 2.0e-8).abs() <= 1e-18);
+    }
+
+    #[test]
+    fn monotonicity_constraints_cluster_spline_like_near_duplicates() {
+        let a = array![
+            [0.0, 0.401, 0.302, 0.197],
+            [0.0, 0.40100000003, 0.30199999998, 0.19700000001],
+            [0.0, 0.40099999997, 0.30200000002, 0.19699999999],
+            [0.0, 0.125, 0.500, 0.375]
+        ];
+        let b = array![2.0e-8, 2.00000000004e-8, 1.99999999996e-8, 3.0e-8];
+
+        let compressed = compress_positive_collinear_constraints(&a, &b);
+
+        assert_eq!(compressed.a.nrows(), 2);
+        let mut clustered_face = false;
+        let mut distinct_face = false;
+        for i in 0..compressed.a.nrows() {
+            let row = compressed.a.row(i);
+            if row[1] > 0.99 && row[2] > 0.7 && row[3] > 0.49 {
+                clustered_face = true;
+                assert!((compressed.b[i] - (2.0e-8 / 0.401)).abs() <= 1e-12);
+            } else {
+                distinct_face = true;
+                assert!((row[1] - 0.25).abs() <= 1e-12);
+                assert!((row[2] - 1.0).abs() <= 1e-12);
+                assert!((row[3] - 0.75).abs() <= 1e-12);
+                assert!((compressed.b[i] - 6.0e-8).abs() <= 1e-18);
+            }
+        }
+        assert!(clustered_face);
+        assert!(distinct_face);
     }
 
     #[test]

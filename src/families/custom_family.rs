@@ -2932,9 +2932,9 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                 let g = if include_logdet_h || include_logdet_s {
                     let g_logs = if include_logdet_s {
                         0.5 * trace_product(
-                            s_pinv_joint
-                                .as_ref()
-                                .ok_or_else(|| "missing joint S^+ for surrogate REML gradient".to_string())?,
+                            s_pinv_joint.as_ref().ok_or_else(|| {
+                                "missing joint S^+ for surrogate REML gradient".to_string()
+                            })?,
                             &a_k,
                         )
                     } else {
@@ -3559,12 +3559,13 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
         total,
         "joint exact-newton Hessian shape mismatch in joint hyper evaluator",
     )?
-    .ok_or_else(|| "joint exact-newton Hessian unavailable for full [rho, psi] outer calculus".to_string())?;
+    .ok_or_else(|| {
+        "joint exact-newton Hessian unavailable for full [rho, psi] outer calculus".to_string()
+    })?;
     let beta_flat = flatten_state_betas(&inner.block_states, specs);
     let synced_joint_states =
         synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
-    let joint_tangent_basis =
-        joint_post_update_tangent_basis(family, specs, &synced_joint_states)?;
+    let joint_tangent_basis = joint_post_update_tangent_basis(family, specs, &synced_joint_states)?;
     let ridge = effective_solver_ridge(options.ridge_floor);
     let mode_ridge = if options.ridge_policy.include_quadratic_penalty {
         ridge
@@ -3719,13 +3720,12 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
             Array2::<f64>::zeros((total, total))
         };
         let dot_h_i = &h_i + &d_h_beta_i;
-        let grad_i = v_i
-            + if include_logdet_h {
+        let grad_i =
+            v_i + if include_logdet_h {
                 0.5 * trace_product(&h_inv, &dot_h_i)
             } else {
                 0.0
-            }
-            - if include_logdet_s { 0.5 * log_s_i } else { 0.0 };
+            } - if include_logdet_s { 0.5 * log_s_i } else { 0.0 };
         gradient[coord.global_idx()] = grad_i;
         v_i_terms.push(v_i);
         g_i_terms.push(g_i);
@@ -3771,7 +3771,8 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
                                 )
                             })?;
                         (
-                            psi_terms.objective_psi_psi + 0.5 * beta_flat.dot(&s_ij.dot(&beta_flat)),
+                            psi_terms.objective_psi_psi
+                                + 0.5 * beta_flat.dot(&s_ij.dot(&beta_flat)),
                             psi_terms.score_psi_psi + &s_ij.dot(&beta_flat),
                             psi_terms.hessian_psi_psi + &s_ij,
                         )
@@ -3875,32 +3876,25 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
                 )?;
                 let profile_term = v_ij + g_i_terms[i].dot(&beta_i_terms[j]);
                 let log_h_term = if include_logdet_h {
-                    0.5
-                        * (trace_product(&h_inv, &ddot_h_ij)
-                            - trace_jinv_a_jinv_b(
-                                &h_inv,
-                                &dot_h_i_terms[j],
-                                &dot_h_i_terms[i],
-                            ))
+                    0.5 * (trace_product(&h_inv, &ddot_h_ij)
+                        - trace_jinv_a_jinv_b(&h_inv, &dot_h_i_terms[j], &dot_h_i_terms[i]))
                 } else {
                     0.0
                 };
                 let log_s_term = if include_logdet_s {
-                    -0.5
-                        * trace_product(
-                            s_pinv_joint
-                                .as_ref()
-                                .ok_or_else(|| "missing joint S^+ for second derivative".to_string())?,
-                            &s_ij,
+                    -0.5 * trace_product(
+                        s_pinv_joint
+                            .as_ref()
+                            .ok_or_else(|| "missing joint S^+ for second derivative".to_string())?,
+                        &s_ij,
+                    ) + 0.5
+                        * trace_jinv_a_jinv_b(
+                            s_pinv_joint.as_ref().ok_or_else(|| {
+                                "missing joint S^+ for second derivative".to_string()
+                            })?,
+                            &s_i_terms[j],
+                            &s_i_terms[i],
                         )
-                        + 0.5
-                            * trace_jinv_a_jinv_b(
-                                s_pinv_joint
-                                    .as_ref()
-                                    .ok_or_else(|| "missing joint S^+ for second derivative".to_string())?,
-                                &s_i_terms[j],
-                                &s_i_terms[i],
-                            )
                 } else {
                     0.0
                 };
@@ -4154,7 +4148,11 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
     Ok(CustomFamilyJointHyperResult {
         objective: result.objective,
         gradient,
-        outer_hessian: if need_hessian { result.outer_hessian } else { None },
+        outer_hessian: if need_hessian {
+            result.outer_hessian
+        } else {
+            None
+        },
         warm_start: CustomFamilyWarmStart {
             inner: result.warm_start,
         },
@@ -4290,7 +4288,8 @@ fn joint_theta_penalty_first_matrix(
             let mut s_i = Array2::<f64>::zeros((total, total));
             let local = spec.penalties[*penalty_idx]
                 .mapv(|v| per_block[*block_idx][*penalty_idx].exp() * v);
-            s_i.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
+            s_i.slice_mut(ndarray::s![start..end, start..end])
+                .assign(&local);
             Ok(s_i)
         }
         JointHyperCoord::Psi {
@@ -4321,12 +4320,14 @@ fn joint_theta_penalty_first_matrix(
                         penalty_index, block_idx
                     ));
                 }
-                deriv.s_psi
+                deriv
+                    .s_psi
                     .mapv(|v| per_block[*block_idx][penalty_index].exp() * v)
             } else {
                 Array2::<f64>::zeros((p, p))
             };
-            s_i.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
+            s_i.slice_mut(ndarray::s![start..end, start..end])
+                .assign(&local);
             Ok(s_i)
         }
     }
@@ -4375,7 +4376,8 @@ fn joint_theta_penalty_second_matrix(
             if bi == bj && pi == pj {
                 let (start, end) = ranges[*bi];
                 let local = specs[*bi].penalties[*pi].mapv(|v| per_block[*bi][*pi].exp() * v);
-                s_ij.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
+                s_ij.slice_mut(ndarray::s![start..end, start..end])
+                    .assign(&local);
             }
             Ok(s_ij)
         }
@@ -4419,12 +4421,12 @@ fn joint_theta_penalty_second_matrix(
                 }
                 total_local
             } else if deriv.penalty_index == Some(*pi) {
-                deriv.s_psi
-                    .mapv(|v| per_block[*bi][*pi].exp() * v)
+                deriv.s_psi.mapv(|v| per_block[*bi][*pi].exp() * v)
             } else {
                 Array2::<f64>::zeros((p, p))
             };
-            s_ij.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
+            s_ij.slice_mut(ndarray::s![start..end, start..end])
+                .assign(&local);
             Ok(s_ij)
         }
         (
@@ -4478,7 +4480,8 @@ fn joint_theta_penalty_second_matrix(
             } else {
                 Array2::<f64>::zeros((p, p))
             };
-            s_ij.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
+            s_ij.slice_mut(ndarray::s![start..end, start..end])
+                .assign(&local);
             Ok(s_ij)
         }
     }
@@ -5819,7 +5822,6 @@ mod tests {
             result.err()
         );
     }
-
 
     #[test]
     fn exact_newton_pseudo_laplace_objective_uses_logdet_h_without_logdet_s() {

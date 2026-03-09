@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use faer::linalg::cholesky::llt::factor::LltParams;
 use faer::{Auto, MatRef, Spec};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 // Local alias used by internal tests/helpers.
@@ -2479,47 +2480,131 @@ fn solve_kkt_direction(
     Ok((d, lambda))
 }
 
-fn working_set_kkt_diagnostics(
-    hessian: &Array2<f64>,
+struct CompressedActiveWorkingSet {
+    constraints: LinearInequalityConstraints,
+    groups: Vec<Vec<usize>>,
+}
+
+fn compress_active_working_set(
     x: &Array1<f64>,
-    gradient: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
     active: &[usize],
-) -> Result<ConstraintKktDiagnostics, EstimationError> {
+) -> Result<CompressedActiveWorkingSet, EstimationError> {
+    const SCALE_TOL: f64 = 1e-14;
+    const KEY_TOL: f64 = 1e-10;
+
     let p = constraints.a.ncols();
-    if hessian.nrows() != p || hessian.ncols() != p || x.len() != p || gradient.len() != p {
+    if x.len() != p {
+        return Err(EstimationError::InvalidInput(
+            "active working-set compression dimension mismatch".to_string(),
+        ));
+    }
+
+    let mut grouped: BTreeMap<Vec<i64>, (Vec<f64>, f64, Vec<usize>)> = BTreeMap::new();
+    let mut fallback_rows: Vec<(Vec<f64>, f64, Vec<usize>)> = Vec::new();
+
+    for (pos, &idx) in active.iter().enumerate() {
+        if idx >= constraints.a.nrows() {
+            return Err(EstimationError::InvalidInput(format!(
+                "active working-set index {} out of bounds for {} constraints",
+                idx,
+                constraints.a.nrows()
+            )));
+        }
+        let row = constraints.a.row(idx);
+        let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        if !scale.is_finite() || scale <= SCALE_TOL {
+            let rhs = constraints.b[idx];
+            fallback_rows.push((row.to_vec(), rhs, vec![pos]));
+            continue;
+        }
+
+        let normalized_row: Vec<f64> = row
+            .iter()
+            .map(|&v| {
+                let scaled = v / scale;
+                if scaled.abs() <= KEY_TOL { 0.0 } else { scaled }
+            })
+            .collect();
+        let normalized_rhs = constraints.b[idx] / scale;
+        let key: Vec<i64> = normalized_row
+            .iter()
+            .map(|&v| (v / KEY_TOL).round() as i64)
+            .collect();
+
+        match grouped.get_mut(&key) {
+            Some((row_rep, rhs_max, group_positions)) => {
+                if normalized_rhs > *rhs_max {
+                    *row_rep = normalized_row;
+                    *rhs_max = normalized_rhs;
+                }
+                group_positions.push(pos);
+            }
+            None => {
+                grouped.insert(key, (normalized_row, normalized_rhs, vec![pos]));
+            }
+        }
+    }
+
+    let n_rows = grouped.len() + fallback_rows.len();
+    let mut a_out = Array2::<f64>::zeros((n_rows, p));
+    let mut b_out = Array1::<f64>::zeros(n_rows);
+    let mut groups_out: Vec<Vec<usize>> = Vec::with_capacity(n_rows);
+
+    let mut out_row = 0usize;
+    for (_key, (row, rhs, positions)) in grouped {
+        for (j, value) in row.into_iter().enumerate() {
+            a_out[[out_row, j]] = value;
+        }
+        b_out[out_row] = rhs;
+        groups_out.push(positions);
+        out_row += 1;
+    }
+    for (row, rhs, positions) in fallback_rows {
+        for (j, value) in row.into_iter().enumerate() {
+            a_out[[out_row, j]] = value;
+        }
+        b_out[out_row] = rhs;
+        groups_out.push(positions);
+        out_row += 1;
+    }
+
+    Ok(CompressedActiveWorkingSet {
+        constraints: LinearInequalityConstraints { a: a_out, b: b_out },
+        groups: groups_out,
+    })
+}
+
+fn working_set_kkt_diagnostics_from_multipliers(
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    working_constraints: &LinearInequalityConstraints,
+    lambda_active_true: &Array1<f64>,
+    n_total_constraints: usize,
+) -> Result<ConstraintKktDiagnostics, EstimationError> {
+    let p = working_constraints.a.ncols();
+    if x.len() != p || gradient.len() != p {
         return Err(EstimationError::InvalidInput(
             "working-set KKT diagnostic dimension mismatch".to_string(),
         ));
     }
-    let m = constraints.a.nrows();
+    if lambda_active_true.len() != working_constraints.a.nrows() {
+        return Err(EstimationError::InvalidInput(format!(
+            "working-set KKT multiplier length mismatch: got {}, expected {}",
+            lambda_active_true.len(),
+            working_constraints.a.nrows()
+        )));
+    }
+    let m = working_constraints.a.nrows();
     let mut slack = Array1::<f64>::zeros(m);
     let mut primal_feasibility: f64 = 0.0;
     for i in 0..m {
-        let s_i = constraints.a.row(i).dot(x) - constraints.b[i];
+        let s_i = working_constraints.a.row(i).dot(x) - working_constraints.b[i];
         slack[i] = s_i;
         primal_feasibility = primal_feasibility.max((-s_i).max(0.0));
     }
 
-    let mut lambda = Array1::<f64>::zeros(m);
-    if !active.is_empty() {
-        let mut a_w = Array2::<f64>::zeros((active.len(), p));
-        let mut residual_w = Array1::<f64>::zeros(active.len());
-        for (r, &idx) in active.iter().enumerate() {
-            if idx >= m {
-                return Err(EstimationError::InvalidInput(format!(
-                    "working-set KKT active index {} out of bounds for {} constraints",
-                    idx, m
-                )));
-            }
-            a_w.row_mut(r).assign(&constraints.a.row(idx));
-            residual_w[r] = constraints.b[idx] - constraints.a.row(idx).dot(x);
-        }
-        let (_, lambda_sys) = solve_kkt_direction(hessian, gradient, &a_w, Some(&residual_w))?;
-        for (r, &idx) in active.iter().enumerate() {
-            lambda[idx] = -lambda_sys[r];
-        }
-    }
+    let lambda = lambda_active_true.to_owned();
 
     let mut dual_feasibility: f64 = 0.0;
     let mut complementarity: f64 = 0.0;
@@ -2529,13 +2614,13 @@ fn working_set_kkt_diagnostics(
     }
     let stationarity = {
         let mut resid = gradient.to_owned();
-        resid -= &constraints.a.t().dot(&lambda);
+        resid -= &working_constraints.a.t().dot(&lambda);
         resid.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
     };
 
     Ok(ConstraintKktDiagnostics {
-        n_constraints: m,
-        n_active: active.len(),
+        n_constraints: n_total_constraints,
+        n_active: m,
         primal_feasibility,
         dual_feasibility,
         complementarity,
@@ -2611,18 +2696,42 @@ fn solve_newton_direction_with_linear_constraints(
             is_active[i] = true;
         }
     }
+    let mut last_working_x = x.clone();
+    let mut last_working_direction = d_total.clone();
+    let mut last_working_gradient = g_cur.clone();
+    let mut last_working_active = active.clone();
+    let mut last_working_constraints = LinearInequalityConstraints {
+        a: Array2::<f64>::zeros((0, p)),
+        b: Array1::<f64>::zeros(0),
+    };
+    let mut last_working_lambda_true = Array1::<f64>::zeros(0);
 
     for _ in 0..((p + m + 8) * 4) {
-        let mut a_w = Array2::<f64>::zeros((active.len(), p));
-        let mut residual_w = Array1::<f64>::zeros(active.len());
-        for (r, &idx) in active.iter().enumerate() {
-            a_w.row_mut(r).assign(&constraints.a.row(idx));
-            residual_w[r] = constraints.b[idx] - constraints.a.row(idx).dot(&x);
+        let compressed_working = compress_active_working_set(&x, constraints, &active)?;
+        let mut residual_w = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
+        for r in 0..compressed_working.constraints.a.nrows() {
+            residual_w[r] = compressed_working.constraints.b[r]
+                - compressed_working.constraints.a.row(r).dot(&x);
         }
-        let (d, lambda_w) = solve_kkt_direction(hessian, &g_cur, &a_w, Some(&residual_w))?;
+        let (d, lambda_w) = solve_kkt_direction(
+            hessian,
+            &g_cur,
+            &compressed_working.constraints.a,
+            Some(&residual_w),
+        )?;
+        last_working_x.assign(&x);
+        last_working_direction.assign(&d_total);
+        last_working_gradient.assign(&g_cur);
+        last_working_active.clear();
+        last_working_active.extend(active.iter().copied());
+        last_working_constraints = LinearInequalityConstraints {
+            a: compressed_working.constraints.a.clone(),
+            b: compressed_working.constraints.b.clone(),
+        };
+        last_working_lambda_true = lambda_w.mapv(|lam_sys| -lam_sys);
         let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
         if step_norm <= tol_step {
-            if active.is_empty() {
+            if compressed_working.groups.is_empty() {
                 direction_out.assign(&d_total);
                 return Ok(());
             }
@@ -2633,16 +2742,18 @@ fn solve_newton_direction_with_linear_constraints(
             // lambda_true = -lambda_sys, and dual feasibility requires lambda_true >= 0.
             // Therefore release active rows with the most negative lambda_true.
             let mut most_negative_true = -tol_dual;
-            for (pos, &lam_sys) in lambda_w.iter().enumerate() {
+            for (group_pos, &lam_sys) in lambda_w.iter().enumerate() {
                 let lam_true = -lam_sys;
                 if lam_true < most_negative_true {
                     most_negative_true = lam_true;
-                    remove_pos = Some(pos);
+                    remove_pos = Some(group_pos);
                 }
             }
-            if let Some(pos) = remove_pos {
-                let idx = active.remove(pos);
-                is_active[idx] = false;
+            if let Some(group_pos) = remove_pos {
+                for &active_pos in compressed_working.groups[group_pos].iter().rev() {
+                    let idx = active.remove(active_pos);
+                    is_active[idx] = false;
+                }
                 continue;
             }
             if let Some(hint) = active_hint {
@@ -2692,16 +2803,27 @@ fn solve_newton_direction_with_linear_constraints(
         }
     }
 
-    let (worst, row) = max_linear_constraint_violation(&x, constraints);
-    let working_kkt = working_set_kkt_diagnostics(hessian, &x, &g_cur, constraints, &active)?;
-    let kkt = compute_constraint_kkt_diagnostics(&x, &g_cur, constraints);
-    let grad_inf = g_cur.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let (worst, row) = max_linear_constraint_violation(&last_working_x, constraints);
+    let working_kkt = working_set_kkt_diagnostics_from_multipliers(
+        &last_working_x,
+        &last_working_gradient,
+        &last_working_constraints,
+        &last_working_lambda_true,
+        m,
+    )?;
+    let kkt =
+        compute_constraint_kkt_diagnostics(&last_working_x, &last_working_gradient, constraints);
+    let grad_inf = last_working_gradient
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let stationarity_rel = working_kkt.stationarity / grad_inf.max(1.0);
-    let step_inf = d_total.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let hd_total = hessian.dot(&d_total);
-    let predicted_delta = gradient.dot(&d_total)
+    let step_inf = last_working_direction
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let hd_total = hessian.dot(&last_working_direction);
+    let predicted_delta = gradient.dot(&last_working_direction)
         + 0.5
-            * d_total
+            * last_working_direction
                 .iter()
                 .zip(hd_total.iter())
                 .map(|(a, b)| a * b)
@@ -2720,9 +2842,9 @@ fn solve_newton_direction_with_linear_constraints(
     {
         if let Some(hint) = active_hint {
             hint.clear();
-            hint.extend(active.iter().copied());
+            hint.extend(last_working_active.iter().copied());
         }
-        direction_out.assign(&d_total);
+        direction_out.assign(&last_working_direction);
         return Ok(());
     }
     Err(EstimationError::ParameterConstraintViolation(format!(
@@ -5455,10 +5577,11 @@ mod tests {
     use super::{
         InverseLinkJet, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, WorkingDerivativeBuffersMut,
-        bernoulli_geometry_from_jet, calculate_scale, compute_constraint_kkt_diagnostics,
-        default_beta_guess_external, fit_model_for_fixed_rho, logit_clamp_zero_enabled,
-        should_use_sparse_native_pirls, solve_newton_direction_with_linear_constraints,
-        solve_newton_direction_with_lower_bounds, update_glm_vectors_integrated_for_link,
+        bernoulli_geometry_from_jet, calculate_scale, compress_active_working_set,
+        compute_constraint_kkt_diagnostics, default_beta_guess_external, fit_model_for_fixed_rho,
+        logit_clamp_zero_enabled, should_use_sparse_native_pirls,
+        solve_newton_direction_with_linear_constraints, solve_newton_direction_with_lower_bounds,
+        update_glm_vectors_integrated_for_link, working_set_kkt_diagnostics_from_multipliers,
     };
     use crate::matrix::DesignMatrix;
     use crate::probability::standard_normal_quantile;
@@ -5954,24 +6077,53 @@ mod tests {
 
     #[test]
     fn working_set_kkt_diagnostics_use_active_set_multipliers() {
-        let hessian = array![[2.0, 0.0], [0.0, 3.0]];
-        let constraints = LinearInequalityConstraints {
+        let working_constraints = LinearInequalityConstraints {
             a: array![[1.0, 0.0], [2.0, 0.0], [0.0, 1.0]],
             b: array![0.0, 0.0, 0.0],
         };
         let x = array![0.0, 0.0];
         let lambda_true = array![1.0, 0.5, 2.0];
-        let gradient = constraints.a.t().dot(&lambda_true);
-        let active = vec![0, 1, 2];
+        let gradient = working_constraints.a.t().dot(&lambda_true);
 
-        let kkt = working_set_kkt_diagnostics(&hessian, &x, &gradient, &constraints, &active)
-            .expect("working-set KKT diagnostics");
+        let kkt = working_set_kkt_diagnostics_from_multipliers(
+            &x,
+            &gradient,
+            &working_constraints,
+            &lambda_true,
+            3,
+        )
+        .expect("working-set KKT diagnostics");
 
         assert!(kkt.primal_feasibility <= 1e-12);
         assert!(kkt.dual_feasibility <= 1e-12);
         assert!(kkt.complementarity <= 1e-12);
         assert!(kkt.stationarity <= 1e-12);
         assert_eq!(kkt.n_active, 3);
+    }
+
+    #[test]
+    fn compress_active_working_set_groups_near_collinear_rows() {
+        let constraints = LinearInequalityConstraints {
+            a: array![
+                [0.0, 0.5, 0.0],
+                [0.0, 0.50000000000003, 0.0],
+                [1.0, 0.0, 0.0]
+            ],
+            b: array![1e-8, 1.00000000000005e-8, 0.2],
+        };
+        let x = array![0.0, 0.0, 0.0];
+        let active = vec![0, 1, 2];
+
+        let compressed =
+            compress_active_working_set(&x, &constraints, &active).expect("compress working set");
+
+        assert_eq!(compressed.constraints.a.nrows(), 2);
+        assert_eq!(compressed.groups.len(), 2);
+        assert!(
+            compressed.groups.iter().any(|g| g == &vec![0, 1]),
+            "near-collinear rows should be grouped together: {:?}",
+            compressed.groups
+        );
     }
 
     #[test]
