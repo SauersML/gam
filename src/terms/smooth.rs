@@ -3379,7 +3379,7 @@ fn extract_spatial_operator_runtime_caches(
     {
         let term_is_frozen = match (&term_spec.basis, &term_fit.metadata) {
             (
-                SmoothBasisSpec::Duchon { spec, .. },
+                SmoothBasisSpec::Duchon { feature_cols, spec },
                 BasisMetadata::Duchon {
                     identifiability_transform,
                     ..
@@ -3390,9 +3390,10 @@ fn extract_spatial_operator_runtime_caches(
                     SpatialIdentifiability::OrthogonalToParametric
                         | SpatialIdentifiability::FrozenTransform { .. }
                 ) && identifiability_transform.is_some()
+                    && feature_cols.len() > 1
             }
             (
-                SmoothBasisSpec::ThinPlate { spec, .. },
+                SmoothBasisSpec::ThinPlate { feature_cols, spec },
                 BasisMetadata::ThinPlate {
                     identifiability_transform,
                     ..
@@ -3403,6 +3404,7 @@ fn extract_spatial_operator_runtime_caches(
                     SpatialIdentifiability::OrthogonalToParametric
                         | SpatialIdentifiability::FrozenTransform { .. }
                 ) && identifiability_transform.is_some()
+                    && feature_cols.len() > 1
             }
             (SmoothBasisSpec::Matern { spec, .. }, BasisMetadata::Matern { .. }) => {
                 matches!(
