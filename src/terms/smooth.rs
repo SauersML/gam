@@ -3871,6 +3871,7 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
         ..BlockwiseFitOptions::default()
     };
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, CustomFamilyWarmStart)> = None;
+    let mut objective_eval_count = 0usize;
     let objective = CachedFirstOrderObjective::new(|theta: &Array1<f64>| {
         if let Some((cached_theta, cached_cost, cached_grad, cached_warm)) = &last_eval
             && cached_theta.len() == theta.len()
@@ -3883,6 +3884,7 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
             return Ok((*cached_cost, cached_grad.clone()));
         }
 
+        objective_eval_count += 1;
         let rho = theta.slice(s![..rho_dim]).to_owned();
         let adaptive_lambda_start = rho_dim;
         let adaptive_lambda_end = adaptive_lambda_start + runtime_caches.len() * 3;

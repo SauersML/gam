@@ -3877,13 +3877,18 @@ pub fn fit_custom_family<F: CustomFamily>(
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
     let objective = CachedFirstOrderObjective::new(|x: &Array1<f64>| {
         let cached = warm_cache.lock().ok().and_then(|g| g.clone());
+        let warm_start = if include_exact_newton_logdet_h(family) {
+            None
+        } else {
+            cached.as_ref()
+        };
         let (obj, grad, hess_opt) = match outer_objective_gradient_hessian(
             family,
             specs,
             options,
             &penalty_counts,
             x,
-            cached.as_ref(),
+            warm_start,
             true,
         ) {
             Ok((obj, grad, hess_opt, warm))
