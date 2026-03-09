@@ -5,8 +5,8 @@ use crate::basis::{
 };
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily,
-    CustomFamilyBlockPsiDerivative, FamilyEvaluation, KnownLinkWiggle, ParameterBlockSpec,
-    ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
+    CustomFamilyBlockPsiDerivative, ExactNewtonBlockPsiTerms, FamilyEvaluation, KnownLinkWiggle,
+    ParameterBlockSpec, ParameterBlockState, evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::scale_design::{
@@ -552,19 +552,44 @@ fn build_block_spatial_psi_derivatives(
     else {
         return Ok(None);
     };
+    let psi_dim = info_list.len();
     Ok(Some(
         info_list
             .into_iter()
-            .map(|info| CustomFamilyBlockPsiDerivative {
-                penalty_index: info.penalty_index,
-                x_psi: info.x_psi,
-                s_psi: info.s_psi,
-                s_psi_components: Some(
-                    info.penalty_indices
-                        .into_iter()
-                        .zip(info.s_psi_components)
-                        .collect(),
-                ),
+            .enumerate()
+            .map(|(psi_idx, info)| {
+                let x_shape = info.x_psi.raw_dim();
+                let s_shape = info.s_psi.raw_dim();
+                let penalty_indices = info.penalty_indices.clone();
+                CustomFamilyBlockPsiDerivative {
+                    penalty_index: info.penalty_index,
+                    x_psi: info.x_psi,
+                    s_psi: info.s_psi,
+                    s_psi_components: Some(
+                        info.penalty_indices
+                            .into_iter()
+                            .zip(info.s_psi_components)
+                            .collect(),
+                    ),
+                    x_psi_psi: Some({
+                        let mut rows = vec![Array2::<f64>::zeros(x_shape); psi_dim];
+                        rows[psi_idx] = info.x_psi_psi;
+                        rows
+                    }),
+                    s_psi_psi: Some({
+                        let mut rows = vec![Array2::<f64>::zeros(s_shape); psi_dim];
+                        rows[psi_idx] = info.s_psi_psi;
+                        rows
+                    }),
+                    s_psi_psi_components: Some({
+                        let mut rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
+                        rows[psi_idx] = penalty_indices
+                            .into_iter()
+                            .zip(info.s_psi_psi_components)
+                            .collect();
+                        rows
+                    }),
+                }
             })
             .collect(),
     ))
@@ -2034,19 +2059,15 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
-        let _identified_noise_design =
+        let identified_noise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)
                 .expect("identified binomial log-sigma design");
         BinomialLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            // Spatial joint hyper-optimization needs analytic psi gradients for
-            // moving designs. The exact-Newton block path does not expose that
-            // callback for this family yet, so term collections intentionally
-            // use the diagonal analytic path here.
-            threshold_design: None,
-            log_sigma_design: None,
+            threshold_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
+            log_sigma_design: Some(DesignMatrix::Dense(identified_noise_design)),
         }
     }
 
@@ -2668,6 +2689,39 @@ fn directional_hessian_coeff_from_objective_q_terms(
     // F = -sum ell, scalar q:
     //   dH_ab[u] = m3*dq*q_a*q_b + m2*(dq_a*q_b + q_a*dq_b + dq*q_ab) + m1*dq_ab.
     m3 * dq * q_a * q_b + m2 * (dq_a * q_b + q_a * dq_b + dq * q_ab) + m1 * dq_ab
+}
+
+struct BlockPsiPrimitiveBundle {
+    // Exact first-order moving-design payload for one block-local psi direction.
+    //
+    // This is the minimal family-specific data needed by the generic
+    // exact-Newton psi derivative path:
+    //
+    //   objective_psi = V_psi^explicit
+    //   score_psi     = g_psi^explicit = V_{beta psi}^explicit
+    //   hess_eta      = rowwise coefficients of H(beta)^explicit
+    //   hess_eta_psi  = rowwise coefficients of H_psi^explicit
+    //
+    // The outer code then adds penalty terms and solves the profiled mode
+    // response
+    //
+    //   beta_psi = -(H + S)^{-1}(g_psi^explicit + S_psi beta),
+    //
+    // before forming the total Hessian drift
+    //
+    //   Hdot = H_psi^explicit + S_psi + D_beta H[beta_psi].
+    //
+    // This bundle deliberately stops at first order. The exact joint outer
+    // Hessian needs a second-order analogue carrying
+    //
+    //   V_{ij}^explicit, g_{ij}^explicit, H_{ij}^explicit
+    //
+    // plus contracted third/fourth beta-derivative operators, which live in
+    // the newer second-order custom-family API rather than here.
+    objective_psi: f64,
+    score_psi: Array1<f64>,
+    hess_eta: Array1<f64>,
+    hess_eta_psi: Array1<f64>,
 }
 
 #[inline]
@@ -3744,6 +3798,175 @@ impl BinomialLocationScaleFamily {
         })?;
         Ok((threshold_design.to_dense(), log_sigma_design.to_dense()))
     }
+
+    fn exact_newton_block_psi_primitives(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        x_psi: &Array2<f64>,
+    ) -> Result<Option<BlockPsiPrimitiveBundle>, String> {
+        if !self.exact_joint_supported() {
+            return Ok(None);
+        }
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleFamily input size mismatch".to_string());
+        }
+        let (x_t, x_ls) = self.dense_block_designs()?;
+        let (x_block, beta_block) = match block_idx {
+            Self::BLOCK_T => (&x_t, &block_states[Self::BLOCK_T].beta),
+            Self::BLOCK_LOG_SIGMA => (&x_ls, &block_states[Self::BLOCK_LOG_SIGMA].beta),
+            _ => return Ok(None),
+        };
+        if x_psi.nrows() != n || x_psi.ncols() != x_block.ncols() {
+            return Err(format!(
+                "BinomialLocationScaleFamily x_psi shape mismatch on block {}: got {}x{}, expected {}x{}",
+                block_idx,
+                x_psi.nrows(),
+                x_psi.ncols(),
+                n,
+                x_block.ncols()
+            ));
+        }
+
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+        let z_psi = x_psi.dot(beta_block);
+
+        // First-order exact moving-design derivation for one block-local psi
+        // direction.
+        //
+        // Model:
+        //   q = -eta_t exp(-eta_ls),
+        //   eta_t  = X_t beta_t,
+        //   eta_ls = X_ls beta_ls.
+        //
+        // For one active block b with moving design X_b(psi), define the
+        // explicit fixed-beta predictor drift
+        //
+        //   z_psi = d eta_b / d psi | beta fixed = X_{b,psi} beta_b.
+        //
+        // Because the spatial derivative payload is block-local, the other
+        // predictor is fixed explicitly under this psi coordinate.
+        //
+        // Let
+        //
+        //   a_i = F_i'(q_i),
+        //   b_i = F_i''(q_i),
+        //   c_i = F_i'''(q_i),
+        //
+        // and J = dq/dbeta for the active block. At fixed beta the exact score
+        // derivative is
+        //
+        //   g_psi = J_psi^T a + J^T diag(b) q_psi.
+        //
+        // This is the primary exact primitive because the mode response is
+        //
+        //   beta_psi = -(H + S)^{-1}(g_psi + S_psi beta).
+        //
+        // Threshold block:
+        //   q = -d eta_t, d = sigma^{-1}
+        //   q_psi = -d z_psi
+        //   J_t = -diag(d) X_t
+        //   J_{t,psi} = -diag(d) X_{t,psi}
+        //
+        // so
+        //
+        //   g_{t,psi}
+        //   = -X_{t,psi}^T(d a) + X_t^T(d^2 b ⊙ z_psi).
+        //
+        // Log-sigma block:
+        //   q_psi = -q z_psi
+        //   J_ls = -diag(q) X_ls
+        //   J_{ls,psi} = -diag(q_psi) X_ls - diag(q) X_{ls,psi}
+        //
+        // so
+        //
+        //   g_{ls,psi}
+        //   = -X_{ls,psi}^T(q a) - X_ls^T((a + q b) ⊙ q_psi).
+        //
+        // The envelope term for the fixed-beta objective piece is
+        //
+        //   V_psi^explicit = grad_eta^T z_psi,
+        //
+        // with
+        //
+        //   grad_eta_t  = -d a,
+        //   grad_eta_ls = -q a.
+        //
+        // The Laplace trace additionally needs H_psi^explicit. Rather than
+        // building that first and backing out the score, we compute the score
+        // primitive above directly, keep the rowwise Hessian coefficients
+        //
+        //   h_t      = d^2 b,
+        //   h_{t,psi}= d^2 c q_psi,
+        //
+        //   h_ls      = q a + q^2 b,
+        //   h_{ls,psi}= (a + 3 q b + q^2 c) q_psi,
+        //
+        // and let the caller form
+        //
+        //   Hdot = H_psi^explicit + S_psi + D_beta H[beta_psi]
+        //
+        // only when the trace term actually needs it. That keeps the family
+        // callback organized around the exact mode-response algebra instead of
+        // around the more expensive Hessian-motion object.
+        let mut grad_eta = Array1::<f64>::zeros(n);
+        let mut grad_eta_psi = Array1::<f64>::zeros(n);
+        let mut hess_eta = Array1::<f64>::zeros(n);
+        let mut hess_eta_psi = Array1::<f64>::zeros(n);
+        let mut objective_psi = 0.0;
+
+        for i in 0..n {
+            let q = core.q0[i];
+            let d = 1.0 / core.sigma[i];
+            let (a, b, c) = binomial_neglog_q_derivatives_probit_closed_form(
+                self.y[i],
+                self.weights[i],
+                q,
+                core.mu[i],
+            );
+            match block_idx {
+                Self::BLOCK_T => {
+                    let q_psi = -d * z_psi[i];
+                    grad_eta[i] = -d * a;
+                    grad_eta_psi[i] = d * d * b * z_psi[i];
+                    hess_eta[i] = d * d * b;
+                    hess_eta_psi[i] = d * d * c * q_psi;
+                }
+                Self::BLOCK_LOG_SIGMA => {
+                    let q_psi = -q * z_psi[i];
+                    grad_eta[i] = -q * a;
+                    grad_eta_psi[i] = -(a + q * b) * q_psi;
+                    hess_eta[i] = q * a + q * q * b;
+                    hess_eta_psi[i] = (a + 3.0 * q * b + q * q * c) * q_psi;
+                }
+                _ => unreachable!(),
+            }
+            objective_psi += grad_eta[i] * z_psi[i];
+        }
+
+        Ok(Some(BlockPsiPrimitiveBundle {
+            objective_psi,
+            score_psi: x_psi.t().dot(&grad_eta) + x_block.t().dot(&grad_eta_psi),
+            hess_eta,
+            hess_eta_psi,
+        }))
+    }
 }
 
 impl CustomFamily for BinomialLocationScaleFamily {
@@ -3974,6 +4197,100 @@ impl CustomFamily for BinomialLocationScaleFamily {
             dw[i] = if dw_i.is_finite() { dw_i } else { 0.0 };
         }
         Ok(Some(dw))
+    }
+
+    fn exact_newton_block_psi_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        ctx: crate::custom_family::ExactNewtonPsiGradientContext<'_>,
+    ) -> Result<Option<ExactNewtonBlockPsiTerms>, String> {
+        // -----------------------------------------------------------------
+        // Exact moving-design psi terms for the 2-block probit location-scale
+        // family.
+        //
+        // The implementation is intentionally organized around the cheapest
+        // exact primitive:
+        //
+        //   g_psi = J_psi^T a + J^T B q_psi,
+        //
+        // because the exact mode response only needs
+        //
+        //   beta_psi = -(H + S)^{-1}(g_psi + S_psi beta).
+        //
+        // The helper above computes that first-order object, the envelope
+        // objective term, and the rowwise Hessian coefficients required only by
+        // the Laplace trace. This keeps first-order mode response logic
+        // separate from heavier Hessian-motion algebra.
+        // -----------------------------------------------------------------
+        let Some(primitives) =
+            self.exact_newton_block_psi_primitives(block_states, block_idx, &ctx.deriv.x_psi)?
+        else {
+            return Ok(None);
+        };
+        let (x_t, x_ls) = self.dense_block_designs()?;
+        let x_block = match block_idx {
+            Self::BLOCK_T => &x_t,
+            Self::BLOCK_LOG_SIGMA => &x_ls,
+            _ => return Ok(None),
+        };
+        let hessian_psi = xt_diag_y_dense(&ctx.deriv.x_psi, &primitives.hess_eta, x_block)?
+            + &xt_diag_y_dense(x_block, &primitives.hess_eta, &ctx.deriv.x_psi)?
+            + &xt_diag_x_dense(x_block, &primitives.hess_eta_psi)?;
+
+        Ok(Some(ExactNewtonBlockPsiTerms {
+            objective_psi: primitives.objective_psi,
+            score_psi: primitives.score_psi,
+            hessian_psi,
+        }))
+    }
+
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        d_beta: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.exact_joint_supported() {
+            return Ok(None);
+        }
+        let (x_t, x_ls) = self.dense_block_designs()?;
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let total = pt + pls;
+        let (start, end, joint_direction) = match block_idx {
+            Self::BLOCK_T => {
+                if d_beta.len() != pt {
+                    return Err(format!(
+                        "BinomialLocationScaleFamily threshold d_beta length mismatch: got {}, expected {}",
+                        d_beta.len(),
+                        pt
+                    ));
+                }
+                let mut dir = Array1::<f64>::zeros(total);
+                dir.slice_mut(s![0..pt]).assign(d_beta);
+                (0usize, pt, dir)
+            }
+            Self::BLOCK_LOG_SIGMA => {
+                if d_beta.len() != pls {
+                    return Err(format!(
+                        "BinomialLocationScaleFamily log-sigma d_beta length mismatch: got {}, expected {}",
+                        d_beta.len(),
+                        pls
+                    ));
+                }
+                let mut dir = Array1::<f64>::zeros(total);
+                dir.slice_mut(s![pt..pt + pls]).assign(d_beta);
+                (pt, pt + pls, dir)
+            }
+            _ => return Ok(None),
+        };
+        let joint = self
+            .exact_newton_joint_hessian_directional_derivative(block_states, &joint_direction)?
+            .ok_or_else(|| {
+                format!("missing joint exact-newton directional Hessian for block {block_idx}")
+            })?;
+        Ok(Some(joint.slice(s![start..end, start..end]).to_owned()))
     }
 
     fn exact_newton_joint_hessian(
@@ -6107,6 +6424,76 @@ mod tests {
         };
         assert!(builder.exact_spatial_joint_supported());
         assert!(builder.require_exact_spatial_joint());
+        let data = Array2::<f64>::zeros((4, 2));
+        let mean_design =
+            build_term_collection_design(data.view(), builder.mean_spec()).expect("mean design");
+        let noise_design =
+            build_term_collection_design(data.view(), builder.noise_spec()).expect("noise design");
+        let family = builder.build_family(&mean_design, &noise_design);
+        assert!(family.exact_joint_supported());
+    }
+
+    #[test]
+    fn binomial_location_scale_exact_newton_spatial_joint_hyper_evaluates_finitely() {
+        let n = 12usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.0 * std::f64::consts::PI * t).cos();
+        }
+        let y = Array1::from_iter((0..n).map(|i| if i % 3 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let mean_spec = simple_matern_term_collection(&[0, 1], 0.45);
+        let noise_spec = simple_matern_term_collection(&[0, 1], 0.8);
+        let builder = BinomialLocationScaleTermBuilder {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            mean_spec: mean_spec.clone(),
+            noise_spec: noise_spec.clone(),
+        };
+        let mean_design =
+            build_term_collection_design(data.view(), &mean_spec).expect("build mean design");
+        let noise_design =
+            build_term_collection_design(data.view(), &noise_spec).expect("build noise design");
+        let mean_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(&mean_spec, &mean_design)
+                .expect("freeze mean spec");
+        let noise_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(&noise_spec, &noise_design)
+                .expect("freeze noise spec");
+        let rho =
+            compose_theta_from_hints(&mean_design, &noise_design, &None, &None, &Array1::zeros(0));
+        let blocks = builder
+            .build_blocks(&rho, &mean_design, &noise_design, None, None)
+            .expect("build blocks");
+        let family = builder.build_family(&mean_design, &noise_design);
+        let derivative_blocks = builder
+            .build_psi_derivative_blocks(
+                data.view(),
+                &mean_spec_resolved,
+                &noise_spec_resolved,
+                &mean_design,
+                &noise_design,
+            )
+            .expect("psi derivative blocks");
+        let eval = evaluate_custom_family_joint_hyper(
+            &family,
+            &blocks,
+            &BlockwiseFitOptions {
+                use_reml_objective: true,
+                outer_max_iter: 1,
+                ..BlockwiseFitOptions::default()
+            },
+            &rho,
+            &derivative_blocks,
+            None,
+            false,
+        )
+        .expect("exact spatial joint hyper eval");
+        assert!(eval.objective.is_finite());
+        assert!(eval.gradient.iter().all(|v| v.is_finite()));
     }
 
     #[test]

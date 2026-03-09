@@ -202,6 +202,9 @@ fn exact_newton_pseudo_laplace_psi_gradient_matches_num_dual_band() {
         x_psi: Array2::zeros((1, 1)),
         s_psi: Array2::zeros((1, 1)),
         s_psi_components: Some(Vec::new()),
+        x_psi_psi: None,
+        s_psi_psi: None,
+        s_psi_psi_components: None,
     };
     let derivative_blocks = vec![vec![deriv]];
     let options = BlockwiseFitOptions {

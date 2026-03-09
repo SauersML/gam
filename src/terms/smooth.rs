@@ -3828,6 +3828,9 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
                     baseline.design.design.ncols(),
                 )),
                 s_psi_components: None,
+                x_psi_psi: None,
+                s_psi_psi: None,
+                s_psi_psi_components: None,
             })
             .collect::<Vec<_>>(),
     ];
@@ -7294,7 +7297,7 @@ where
                 &noise_spec_c,
                 &mean_design_c,
                 &noise_design_c,
-                true,
+                false,
             ) {
                 Ok((cost, grad, hess)) => {
                     if !cost.is_finite()
@@ -9744,6 +9747,9 @@ mod tests {
             x_psi: Array2::zeros((2, 2)),
             s_psi: Array2::zeros((2, 2)),
             s_psi_components: None,
+            x_psi_psi: None,
+            s_psi_psi: None,
+            s_psi_psi_components: None,
         };
         let lambdas = Array1::zeros(0);
         let options = BlockwiseFitOptions {
@@ -10067,6 +10073,9 @@ mod tests {
                         baseline.design.design.ncols(),
                     )),
                     s_psi_components: None,
+                    x_psi_psi: None,
+                    s_psi_psi: None,
+                    s_psi_psi_components: None,
                 })
                 .collect::<Vec<_>>(),
         ];
@@ -10233,6 +10242,9 @@ mod tests {
                         baseline.design.design.ncols(),
                     )),
                     s_psi_components: None,
+                    x_psi_psi: None,
+                    s_psi_psi: None,
+                    s_psi_psi_components: None,
                 })
                 .collect::<Vec<_>>(),
         ];
