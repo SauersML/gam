@@ -5447,6 +5447,99 @@ mod tests {
     }
 
     #[test]
+    fn outer_laml_gradient_diagonal_binomial_location_scale_hard_case_matches_fd() {
+        let n = 9usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_elem(n, 1.0);
+        let threshold_spec = ParameterBlockSpec {
+            name: "threshold".to_string(),
+            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            offset: Array1::zeros(n),
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.2]),
+        };
+        let log_sigma_spec = ParameterBlockSpec {
+            name: "log_sigma".to_string(),
+            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            offset: Array1::zeros(n),
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![-0.1]),
+        };
+        let family = BinomialLocationScaleFamily {
+            y,
+            weights,
+            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            threshold_design: None,
+            log_sigma_design: None,
+        };
+        let specs = vec![threshold_spec, log_sigma_spec];
+        let penalty_counts = vec![1usize, 1usize];
+        let rho = array![0.15, -0.25];
+        let options = BlockwiseFitOptions {
+            use_reml_objective: true,
+            ridge_floor: 1e-10,
+            outer_max_iter: 1,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let (f0, g0, _) =
+            outer_objective_and_gradient(&family, &specs, &options, &penalty_counts, &rho, None)
+                .expect("objective/gradient");
+        assert!(f0.is_finite());
+        assert_eq!(g0.len(), rho.len());
+
+        let h = 1e-5;
+        for k in 0..rho.len() {
+            let mut rho_p = rho.clone();
+            let mut rho_m = rho.clone();
+            rho_p[k] += h;
+            rho_m[k] -= h;
+            let (fp, _, _) = outer_objective_and_gradient(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho_p,
+                None,
+            )
+            .expect("objective+");
+            let (fm, _, _) = outer_objective_and_gradient(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho_m,
+                None,
+            )
+            .expect("objective-");
+            let g_fd = (fp - fm) / (2.0 * h);
+            let abs = (g0[k] - g_fd).abs();
+            let rel = abs / g_fd.abs().max(1e-8);
+            if abs >= 2e-3 {
+                assert_eq!(
+                    g0[k].signum(),
+                    g_fd.signum(),
+                    "outer diagonal hard-case LAML gradient sign mismatch at {}: analytic={} fd={}",
+                    k,
+                    g0[k],
+                    g_fd
+                );
+            }
+            assert!(
+                abs < 2e-3 || rel < 2e-3,
+                "outer diagonal hard-case LAML gradient mismatch at {}: analytic={} fd={} abs={} rel={}",
+                k,
+                g0[k],
+                g_fd,
+                abs,
+                rel
+            );
+        }
+    }
+
+    #[test]
     fn outer_laml_hessian_joint_exact_binomial_location_scale_matches_fd() {
         let n = 10usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
