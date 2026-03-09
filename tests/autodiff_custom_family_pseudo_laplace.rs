@@ -1,5 +1,6 @@
 use gam::families::custom_family::{
-    CustomFamilyBlockPsiDerivative, ExactNewtonOuterObjective, evaluate_custom_family_joint_hyper,
+    CustomFamilyBlockPsiDerivative, ExactNewtonJointPsiTerms, ExactNewtonOuterObjective,
+    evaluate_custom_family_joint_hyper,
 };
 use gam::matrix::SymmetricMatrix;
 use gam::{
@@ -95,13 +96,37 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
         Ok(Some(array![[0.0]]))
     }
 
-    fn exact_newton_block_psi_gradient(
+    fn exact_newton_joint_hessian(
         &self,
         _block_states: &[ParameterBlockState],
-        _block_idx: usize,
-        _ctx: gam::families::custom_family::ExactNewtonPsiGradientContext<'_>,
-    ) -> Result<Option<f64>, String> {
-        Ok(Some(0.5 * self.psi))
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(Some(array![[2.0]]))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(Some(array![[0.0]]))
+    }
+
+    fn exact_newton_joint_psi_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _psi_index: usize,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        let beta = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta[0];
+        Ok(Some(ExactNewtonJointPsiTerms {
+            objective_psi: -2.0 * (beta - self.psi) + 0.5 * self.psi,
+            score_psi: array![0.0],
+            hessian_psi: array![[0.0]],
+        }))
     }
 }
 

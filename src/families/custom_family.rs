@@ -728,13 +728,13 @@ impl JointHyperCoord {
 // Hence the exact joint profiled/Laplace derivatives are
 //
 //   J_i
-//   = V_i + 0.5 tr(H^{-1} dot H_i) - 0.5 partial_i log|S|_+,
+//   = V_i + 0.5 tr(H^{-1} dot H_i) - 0.5 partial_i log|S(theta)|_+,
 //
 //   J_ij
 //   = (V_ij - g_i^T H^{-1} g_j)
 //     + 0.5 [ tr(H^{-1} ddot H_ij)
 //             - tr(H^{-1} dot H_j H^{-1} dot H_i) ]
-//     - 0.5 partial^2_{ij} log|S|_+.
+//     - 0.5 partial^2_{ij} log|S(theta)|_+.
 //
 // In this unified view rho and psi are the same outer calculus. They differ
 // only in where their fixed-beta derivative objects come from:
@@ -3150,14 +3150,28 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
     // - build `ddot H_ij` and the exact Hessian
     //
     // The generic code owns every realized penalty contribution S_i / S_ij.
-    // Families contribute only the likelihood-side exact joint psi objects and
-    // the mixed contraction T_i[u] = D_beta H_i[u].
+    // Families contribute only the likelihood-side exact joint hyper objects
+    //
+    //   D_i, D_{beta i}, D_{beta beta i},
+    //   D_ij, D_{beta ij}, D_{beta beta ij},
+    //   T_i[u] = D_beta H_i^{(D)}[u],
+    //
+    // where H_i^{(D)} denotes the likelihood-side fixed-beta Hessian drift.
+    // Generic code then promotes those likelihood-only objects to the full
+    // profiled quantities by adding
+    //
+    //   0.5 beta^T S_i beta,  S_i beta,  S_i
+    //
+    // and similarly at second order with S_ij. This ownership split is what
+    // makes the unified exact path correct when psi moves realized component
+    // penalties, because mixed rho/psi and pure psi penalty terms enter
+    // automatically through S(theta).
     let include_logdet_h = include_exact_newton_logdet_h(family);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinite_hessian();
     let per_block = split_log_lambdas(rho_current, penalty_counts)?;
-    refresh_all_block_etas(family, specs, inner)?;
+    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     let rho_dim = penalty_counts.iter().sum::<usize>();
@@ -3263,7 +3277,6 @@ fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
             &per_block,
             derivative_blocks,
             total,
-            rho_dim,
             coord,
         )?;
         let (v_i, g_i, h_i) = match coord {
@@ -3672,19 +3685,25 @@ fn apply_geometry_direction_to_eta_and_trace(
 ///   J_i
 ///   = V_i
 ///     + 0.5 tr(H^{-1} dot H_i)
-///     - 0.5 partial_i log|S|_+,
+///     - 0.5 partial_i log|S(theta)|_+,
 ///
 ///   J_ij
 ///   = (V_ij - g_i^T H^{-1} g_j)
 ///     + 0.5 [ tr(H^{-1} ddot H_ij)
 ///             - tr(H^{-1} dot H_j H^{-1} dot H_i) ]
-///     - 0.5 partial^2_{ij} log|S|_+.
+///     - 0.5 partial^2_{ij} log|S(theta)|_+.
 ///
-/// In this unified view rho and psi differ only in their fixed-beta derivative
-/// objects:
+/// In this unified view rho and psi differ only in the likelihood-side
+/// fixed-beta derivative objects contributed by the family. The generic exact
+/// assembler always adds realized penalty motion through `S(theta)` for every
+/// hypercoordinate:
 ///
-/// - rho coordinates are penalty-only at fixed beta
-/// - psi coordinates come from the family's joint exact psi hooks
+/// - `rho` coordinates usually have zero likelihood-side objects and pick up
+///   their fixed-beta derivatives entirely from `S_rho` / `S_{rho rho}`
+/// - `psi` coordinates contribute likelihood-side objects from the family's
+///   joint exact psi hooks and may also pick up extra penalty terms through
+///   `S_psi`, `S_{rho psi}`, and `S_{psi psi}` when realized penalties move
+///   with `psi`
 ///
 /// The implementation below follows this unified calculus directly. Once a
 /// family supplies the joint fixed-beta psi objects and the mixed
@@ -3862,13 +3881,27 @@ fn flatten_joint_hyper_coords(
     Ok(coords)
 }
 
+// Build S_i = partial_{theta_i} S(theta) in flattened coefficient space.
+//
+// This helper is intentionally generic in theta = [rho, psi]:
+//
+// - rho coordinates contribute the usual log-lambda scaled penalty block
+// - psi coordinates contribute realized penalty drift from the spatial
+//   derivative payload, including summed component penalties when one psi
+//   coordinate moves several penalty components at once
+//
+// The returned matrix is the generic penalty contribution to the fixed-beta
+// objects:
+//
+//   V_i += 0.5 beta^T S_i beta,
+//   g_i += S_i beta,
+//   H_i += S_i.
 fn joint_theta_penalty_first_matrix(
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
     per_block: &[Array1<f64>],
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     total: usize,
-    rho_dim: usize,
     coord: &JointHyperCoord,
 ) -> Result<Array2<f64>, String> {
     match coord {
@@ -3917,12 +3950,28 @@ fn joint_theta_penalty_first_matrix(
                     .mapv(|v| per_block[*block_idx][deriv.penalty_index].exp() * v)
             };
             s_i.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
-            let _ = rho_dim;
             Ok(s_i)
         }
     }
 }
 
+// Build S_ij = partial^2_{theta_i theta_j} S(theta) in flattened coefficient
+// space.
+//
+// This handles all mixed exact-penalty cases used by the unified outer
+// Hessian:
+//
+// - rho/rho from the usual log-linear penalty scaling
+// - rho/psi when a psi coordinate moves the realized penalty associated with a
+//   rho coordinate
+// - psi/psi from realized second penalty drift carried by the derivative
+//   payload
+//
+// The returned matrix is the generic penalty contribution to
+//
+//   V_ij += 0.5 beta^T S_ij beta,
+//   g_ij += S_ij beta,
+//   H_ij += S_ij.
 fn joint_theta_penalty_second_matrix(
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],

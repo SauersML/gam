@@ -28,7 +28,7 @@ use crate::smooth::{
 };
 use crate::solver::pirls::WorkingLikelihood;
 use crate::types::{GlmLikelihoodFamily, InverseLink, LinkFunction};
-use ndarray::{Array1, Array2, ArrayView1, s};
+use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 const MIN_PROB: f64 = 1e-10;
 const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
@@ -210,6 +210,7 @@ impl GamlssBetaLayout {
             flat.slice(s![self.pt + self.pls..self.total()]).to_owned(),
         ))
     }
+
 }
 
 /// Generic block input for high-level built-in family APIs.
@@ -1669,7 +1670,107 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
 
     let require_exact_spatial_joint = builder.require_exact_spatial_joint();
     let mut used_fd_spatial_search = false;
-    let mut solved = if exact_joint_ready {
+
+    // Covered exact spatial families must use the unified exact-joint hyper
+    // path and must never fall back to the older finite-difference search.
+    // That exact path is the only implementation that knows how to evaluate
+    // the full profiled/Laplace objective over theta = [rho, psi] with the
+    // real joint Hessian required by NewtonTR/ARC.
+    let mut solved = if require_exact_spatial_joint {
+        if !exact_joint_ready {
+            return Err(
+                "exact two-block spatial optimization is required for this family, but analytic spatial psi derivatives are unavailable"
+                    .to_string(),
+            );
+        }
+        let joint_setup = build_two_block_exact_joint_setup(
+            builder.mean_spec(),
+            builder.noise_spec(),
+            mean_boot_design.penalties.len(),
+            noise_boot_design.penalties.len(),
+            extra_rho0.as_slice().unwrap_or(&[]),
+            kappa_options,
+        );
+        let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
+        let noise_beta_hint_cell = std::cell::RefCell::new(noise_beta_hint.clone());
+        optimize_two_block_spatial_length_scale_exact_joint(
+            data,
+            builder.mean_spec(),
+            builder.noise_spec(),
+            kappa_options,
+            &joint_setup,
+            |rho, _mean_spec_resolved, _noise_spec_resolved, mean_design, noise_design| {
+                let fit = {
+                    let blocks = builder.build_blocks(
+                        rho,
+                        mean_design,
+                        noise_design,
+                        mean_beta_hint_cell.borrow().clone(),
+                        noise_beta_hint_cell.borrow().clone(),
+                    )?;
+                    let family = builder.build_family(mean_design, noise_design);
+                    fit_custom_family(&family, &blocks, options)?
+                };
+                let layout = GamlssLambdaLayout::two_block(
+                    mean_design.penalties.len(),
+                    noise_design.penalties.len(),
+                );
+                if fit.log_lambdas.len() >= layout.total() {
+                    mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
+                    noise_log_lambda_hint = Some(layout.noise_from(&fit.log_lambdas));
+                }
+                let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
+                mean_beta_hint = Some(mean_beta);
+                noise_beta_hint = Some(noise_beta);
+                *mean_beta_hint_cell.borrow_mut() = mean_beta_hint.clone();
+                *noise_beta_hint_cell.borrow_mut() = noise_beta_hint.clone();
+                Ok(fit)
+            },
+            |rho,
+             mean_spec_resolved,
+             noise_spec_resolved,
+             mean_design,
+             noise_design,
+             need_hessian| {
+                let blocks = builder.build_blocks(
+                    rho,
+                    mean_design,
+                    noise_design,
+                    mean_beta_hint_cell.borrow().clone(),
+                    noise_beta_hint_cell.borrow().clone(),
+                )?;
+                let family = builder.build_family(mean_design, noise_design);
+                let psi_derivative_blocks = builder.build_psi_derivative_blocks(
+                    data,
+                    mean_spec_resolved,
+                    noise_spec_resolved,
+                    mean_design,
+                    noise_design,
+                )?;
+                let eval = evaluate_custom_family_joint_hyper(
+                    &family,
+                    &blocks,
+                    options,
+                    rho,
+                    &psi_derivative_blocks,
+                    None,
+                    need_hessian,
+                )?;
+                if need_hessian && eval.outer_hessian.is_none() {
+                    return Err(
+                        "exact two-block spatial objective requires a full joint [rho, psi] hessian"
+                            .to_string(),
+                    );
+                }
+                Ok((eval.objective, eval.gradient, eval.outer_hessian))
+            },
+        )
+        .map_err(|err| {
+            format!(
+                "exact two-block spatial optimization failed and finite-difference fallback is disabled for this family: {err}"
+            )
+        })?
+    } else if exact_joint_ready {
         let joint_setup = build_two_block_exact_joint_setup(
             builder.mean_spec(),
             builder.noise_spec(),
@@ -1754,9 +1855,9 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         ) {
             Ok(sol) => sol,
             Err(err) => {
-                if require_exact_spatial_joint {
+                if !kappa_options.allow_finite_difference_fallback {
                     return Err(format!(
-                        "exact two-block spatial optimization failed and finite-difference fallback is disabled for this family: {err}"
+                        "exact two-block spatial optimization failed ({err}); finite-difference fallback is disabled by default"
                     ));
                 }
                 log::warn!(
@@ -1804,9 +1905,9 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             }
         }
     } else {
-        if require_exact_spatial_joint {
+        if !kappa_options.allow_finite_difference_fallback {
             return Err(
-                "exact two-block spatial optimization is required for this family, but analytic spatial psi derivatives are unavailable"
+                "finite-difference spatial length-scale optimization is disabled by default; enable allow_finite_difference_fallback to use the legacy coordinate-search path"
                     .to_string(),
             );
         }
@@ -2120,7 +2221,11 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
     }
 
     fn exact_spatial_joint_supported(&self) -> bool {
-        false
+        true
+    }
+
+    fn require_exact_spatial_joint(&self) -> bool {
+        true
     }
 
     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
@@ -2223,6 +2328,14 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         let noise_derivs =
             build_block_spatial_psi_derivatives(data, noise_spec_resolved, noise_design)?
                 .ok_or_else(|| "missing log_sigma spatial psi derivatives".to_string())?;
+        // The wiggle block has no direct spatial design matrix of its own in the
+        // term builder. Spatial psi moves the wiggle family only through the
+        // realized threshold/log-sigma designs, which in turn perturb q0 and the
+        // realized wiggle basis B(q0). The exact joint wiggle psi hooks consume
+        // those threshold/log-sigma derivative payloads and reconstruct the full
+        // flattened likelihood-side [rho, psi] calculus internally, so the
+        // wiggle block intentionally contributes no direct CustomFamilyBlockPsiDerivative
+        // entries here.
         Ok(vec![mean_derivs, noise_derivs, Vec::new()])
     }
 }
@@ -3745,6 +3858,15 @@ struct BinomialLocationScaleJointPsiDirection {
     z_ls_psi: Array1<f64>,
 }
 
+struct BinomialLocationScaleWiggleJointPsiDirection {
+    block_idx: usize,
+    local_idx: usize,
+    x_t_psi: Array2<f64>,
+    x_ls_psi: Array2<f64>,
+    z_t_psi: Array1<f64>,
+    z_ls_psi: Array1<f64>,
+}
+
 impl BinomialLocationScaleFamily {
     pub const BLOCK_T: usize = 0;
     pub const BLOCK_LOG_SIGMA: usize = 1;
@@ -4354,6 +4476,9 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+            return Ok(None);
+        }
         if block_states.len() != 2 {
             return Err(format!(
                 "BinomialLocationScaleFamily expects 2 blocks, got {}",
@@ -4393,7 +4518,18 @@ impl BinomialLocationScaleFamily {
         //
         //   V_psi^explicit,  g_psi^explicit,  H_psi^explicit,
         //
-        // all in this flattened coefficient space.
+        // all in this flattened coefficient space. These are likelihood-only
+        // objects:
+        //
+        //   D_psi, D_{beta psi}, D_{beta beta psi}
+        //
+        // Generic exact-joint code adds the realized penalty motion
+        //
+        //   0.5 beta^T S_psi beta,  S_psi beta,  S_psi
+        //
+        // when forming V_i, g_i, H_i. Keeping the family hook likelihood-only
+        // is what makes the unified S(theta) outer calculus correct for both
+        // psi-moving designs and psi-moving penalties.
         //
         // Model:
         //   eta_t  = X_t beta_t,
@@ -4564,6 +4700,9 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+            return Ok(None);
+        }
         let Some(dir_i) = self.exact_newton_joint_psi_direction(
             block_states,
             derivative_blocks,
@@ -4658,11 +4797,21 @@ impl BinomialLocationScaleFamily {
         // calculus, these rowwise coefficient drifts are precisely the
         // likelihood-side pieces of
         //
-        //   H_ab = D_{beta beta psi_a psi_b},
+        //   D_{beta beta psi_a psi_b},
         //
         // before the generic assembler adds any realized-penalty contribution
         //
         //   S_ab = partial_{psi_a psi_b} S(theta).
+        //
+        // So this helper returns likelihood-only
+        //
+        //   D_ab, D_{beta ab}, D_{beta beta ab},
+        //
+        // and the unified exact assembler in custom_family.rs forms
+        //
+        //   V_ab = D_ab + 0.5 beta^T S_ab beta,
+        //   g_ab = D_{beta ab} + S_ab beta,
+        //   H_ab = D_{beta beta ab} + S_ab.
         //
         // Once H_ab is known, the outer assembler combines it with the joint
         // mode responses beta_a, beta_b, beta_ab and the contractions
@@ -5529,6 +5678,12 @@ impl BinomialLocationScaleWiggleFamily {
         }
     }
 
+    fn exact_joint_supported(&self) -> bool {
+        matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit))
+            && self.threshold_design.is_some()
+            && self.log_sigma_design.is_some()
+    }
+
     pub fn initialize_wiggle_knots_from_q(
         q_seed: ArrayView1<'_, f64>,
         degree: usize,
@@ -5739,6 +5894,1231 @@ impl BinomialLocationScaleWiggleFamily {
         Ok((xt, xls))
     }
 
+    fn dense_block_designs_from_specs(
+        &self,
+        specs: &[ParameterBlockSpec],
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        if specs.len() != 3 {
+            return Err(format!(
+                "BinomialLocationScaleWiggleFamily expects 3 specs, got {}",
+                specs.len()
+            ));
+        }
+        let xt = specs[Self::BLOCK_T].design.to_dense();
+        let xls = specs[Self::BLOCK_LOG_SIGMA].design.to_dense();
+        Ok((xt, xls))
+    }
+
+    fn exact_joint_dense_block_designs(
+        &self,
+        specs: Option<&[ParameterBlockSpec]>,
+    ) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+        if !self.exact_joint_supported() {
+            return Ok(None);
+        }
+        if let Some(specs) = specs {
+            return self.dense_block_designs_from_specs(specs).map(Some);
+        }
+        self.dense_block_designs().map(Some)
+    }
+
+    fn exact_newton_joint_psi_direction(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Option<BinomialLocationScaleWiggleJointPsiDirection>, String> {
+        if block_states.len() != 3 || derivative_blocks.len() != 3 {
+            return Err(format!(
+                "BinomialLocationScaleWiggleFamily joint psi direction expects 3 blocks and 3 derivative block lists, got {} and {}",
+                block_states.len(),
+                derivative_blocks.len()
+            ));
+        }
+        let n = self.y.len();
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let beta_t = &block_states[Self::BLOCK_T].beta;
+        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
+        let mut global = 0usize;
+        for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+            for (local_idx, deriv) in block_derivs.iter().enumerate() {
+                if global == psi_index {
+                    let mut x_t_psi = Array2::<f64>::zeros((n, pt));
+                    let mut x_ls_psi = Array2::<f64>::zeros((n, pls));
+                    match block_idx {
+                        Self::BLOCK_T => {
+                            if deriv.x_psi.nrows() != n || deriv.x_psi.ncols() != pt {
+                                return Err(format!(
+                                    "BinomialLocationScaleWiggleFamily threshold x_psi shape mismatch: got {}x{}, expected {}x{}",
+                                    deriv.x_psi.nrows(),
+                                    deriv.x_psi.ncols(),
+                                    n,
+                                    pt
+                                ));
+                            }
+                            x_t_psi.assign(&deriv.x_psi);
+                        }
+                        Self::BLOCK_LOG_SIGMA => {
+                            if deriv.x_psi.nrows() != n || deriv.x_psi.ncols() != pls {
+                                return Err(format!(
+                                    "BinomialLocationScaleWiggleFamily log-sigma x_psi shape mismatch: got {}x{}, expected {}x{}",
+                                    deriv.x_psi.nrows(),
+                                    deriv.x_psi.ncols(),
+                                    n,
+                                    pls
+                                ));
+                            }
+                            x_ls_psi.assign(&deriv.x_psi);
+                        }
+                        Self::BLOCK_WIGGLE => return Ok(None),
+                        _ => return Ok(None),
+                    }
+                    return Ok(Some(BinomialLocationScaleWiggleJointPsiDirection {
+                        block_idx,
+                        local_idx,
+                        z_t_psi: x_t_psi.dot(beta_t),
+                        z_ls_psi: x_ls_psi.dot(beta_ls),
+                        x_t_psi,
+                        x_ls_psi,
+                    }));
+                }
+                global += 1;
+            }
+        }
+        Ok(None)
+    }
+
+    fn exact_newton_joint_psi_second_design_drifts(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_a: &BinomialLocationScaleWiggleJointPsiDirection,
+        psi_b: &BinomialLocationScaleWiggleJointPsiDirection,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>, Array1<f64>), String> {
+        let n = self.y.len();
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let beta_t = &block_states[Self::BLOCK_T].beta;
+        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
+        let mut x_t_ab = Array2::<f64>::zeros((n, pt));
+        let mut x_ls_ab = Array2::<f64>::zeros((n, pls));
+        if psi_a.block_idx == psi_b.block_idx {
+            let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
+            if let Some(x_psi_psi) = deriv.x_psi_psi.as_ref() {
+                if let Some(x_ab) = x_psi_psi.get(psi_b.local_idx) {
+                    match psi_a.block_idx {
+                        Self::BLOCK_T => {
+                            if x_ab.nrows() != n || x_ab.ncols() != pt {
+                                return Err(format!(
+                                    "BinomialLocationScaleWiggleFamily threshold x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
+                                    x_ab.nrows(),
+                                    x_ab.ncols(),
+                                    n,
+                                    pt
+                                ));
+                            }
+                            x_t_ab.assign(x_ab);
+                        }
+                        Self::BLOCK_LOG_SIGMA => {
+                            if x_ab.nrows() != n || x_ab.ncols() != pls {
+                                return Err(format!(
+                                    "BinomialLocationScaleWiggleFamily log-sigma x_psi_psi shape mismatch: got {}x{}, expected {}x{}",
+                                    x_ab.nrows(),
+                                    x_ab.ncols(),
+                                    n,
+                                    pls
+                                ));
+                            }
+                            x_ls_ab.assign(x_ab);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let z_t_ab = x_t_ab.dot(beta_t);
+        let z_ls_ab = x_ls_ab.dot(beta_ls);
+        Ok((x_t_ab, x_ls_ab, z_t_ab, z_ls_ab))
+    }
+
+    fn exact_newton_joint_psi_terms_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+            return Ok(None);
+        }
+        let Some(dir_a) = self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            x_t,
+            x_ls,
+        )? else {
+            return Ok(None);
+        };
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let eta_w = &block_states[Self::BLOCK_WIGGLE].eta;
+        let beta_w = &block_states[Self::BLOCK_WIGGLE].beta;
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            Some(eta_w),
+            &self.link_kind,
+        )?;
+        let base_core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+        let b0 = self.wiggle_design(base_core.q0.view())?;
+        let d0 =
+            self.wiggle_basis_with_options(base_core.q0.view(), BasisOptions::first_derivative())?;
+        let dd0 =
+            self.wiggle_basis_with_options(base_core.q0.view(), BasisOptions::second_derivative())?;
+        let d3q = self.wiggle_d3q_dq03(base_core.q0.view(), beta_w.view())?;
+        let m = d0.dot(beta_w) + 1.0;
+        let g2 = dd0.dot(beta_w);
+        let g3 = d3q;
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
+
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let pw = b0.ncols();
+        let total = pt + pls + pw;
+        let mut objective_psi = 0.0;
+        let mut score_psi = Array1::<f64>::zeros(total);
+        let mut hessian_psi = Array2::<f64>::zeros((total, total));
+
+        // -----------------------------------------------------------------
+        // Exact likelihood-only joint psi terms for the probit wiggle family.
+        //
+        // This helper is intentionally the same generic rowwise kernel as the
+        // non-wiggle family. The only difference is the location-side row:
+        //
+        //   gamma = [beta_t; beta_w],
+        //   delta = beta_ls,
+        //   z_r   = [x_{t,r}; B_r(q0)],
+        //   x_r   = x_{ls,r},
+        //   a_r   = z_r^T gamma,
+        //   ell_r = x_r^T delta,
+        //   q_r   = -a_r exp(-ell_r).
+        //
+        // In this wiggle family we realize the same kernel through the chain
+        //
+        //   q = q0 + beta_w^T B(q0),
+        //   q0 = -eta_t exp(-eta_ls),
+        //   m  = dq/dq0   = 1 + beta_w^T B'(q0),
+        //   g2 = d²q/dq0² = beta_w^T B''(q0),
+        //   g3 = d³q/dq0³ = beta_w^T B'''(q0).
+        //
+        // For a realized hyperdirection psi_a:
+        //
+        //   h_a     = q_{psi_a},
+        //   c_a     = q_{beta psi_a},
+        //   R_a     = q_{beta beta psi_a},
+        //
+        // and the generic scalar-loss identities are
+        //
+        //   D_a            = sum_r r_r h_{r,a},
+        //   D_{beta a}     = sum_r [ w_r h_{r,a} b_r + r_r c_{r,a} ],
+        //   D_{beta beta a}
+        //                  = sum_r [ nu_r h_{r,a} b_r b_r^T
+        //                              + w_r(c_{r,a} b_r^T + b_r c_{r,a}^T + h_{r,a} Q_r)
+        //                              + r_r R_{r,a} ].
+        //
+        // Generic exact-joint code adds all realized penalty motion S_a after
+        // the fact, so this family hook must stay likelihood-only.
+        //
+        // The rowwise objects below are the wiggle specialization of the same
+        // q_r = -a_r exp(-ell_r) kernel. All wiggle-specific complexity is
+        // localized to the realized row B_r(q0) and its q0-derivatives.
+        // -----------------------------------------------------------------
+        for row in 0..n {
+            let q0 = base_core.q0[row];
+            let q = q0 + eta_w[row];
+            let q0_geom = nonwiggle_q_derivs(eta_t[row], sigma[row], ds[row], d2s[row], d3s[row]);
+            let r_sigma = 1.0 / sigma[row].max(1e-12);
+            let q0_a = -r_sigma * dir_a.z_t_psi[row] - q0 * dir_a.z_ls_psi[row];
+            let q0_t_a = q0_geom.q_tl * dir_a.z_ls_psi[row];
+            let q0_ls_a = q0_geom.q_tl * dir_a.z_t_psi[row] + q0_geom.q_ll * dir_a.z_ls_psi[row];
+            let q0_tl_a = q0_geom.q_tl_ls * dir_a.z_ls_psi[row];
+            let q0_ll_a = q0_geom.q_tl_ls * dir_a.z_t_psi[row] + q0_geom.q_ll_ls * dir_a.z_ls_psi[row];
+
+            let q_t = m[row] * q0_geom.q_t;
+            let q_ls = m[row] * q0_geom.q_ls;
+            let q_tt = g2[row] * q0_geom.q_t * q0_geom.q_t;
+            let q_tl = g2[row] * q0_geom.q_t * q0_geom.q_ls + m[row] * q0_geom.q_tl;
+            let q_ll = g2[row] * q0_geom.q_ls * q0_geom.q_ls + m[row] * q0_geom.q_ll;
+            let q_t_a = g2[row] * q0_a * q0_geom.q_t + m[row] * q0_t_a;
+            let q_ls_a = g2[row] * q0_a * q0_geom.q_ls + m[row] * q0_ls_a;
+            let q_tt_a = g3[row] * q0_a * q0_geom.q_t * q0_geom.q_t
+                + g2[row] * (2.0 * q0_geom.q_t * q0_t_a);
+            let q_tl_a = g3[row] * q0_a * q0_geom.q_t * q0_geom.q_ls
+                + g2[row] * (q0_t_a * q0_geom.q_ls + q0_geom.q_t * q0_ls_a + q0_a * q0_geom.q_tl)
+                + m[row] * q0_tl_a;
+            let q_ll_a = g3[row] * q0_a * q0_geom.q_ls * q0_geom.q_ls
+                + g2[row] * (2.0 * q0_geom.q_ls * q0_ls_a + q0_a * q0_geom.q_ll)
+                + m[row] * q0_ll_a;
+
+            let b_row = b0.row(row);
+            let d_row = d0.row(row);
+            let dd_row = dd0.row(row);
+            let q_w_a = d_row.to_owned() * q0_a;
+            let q_tw_a = dd_row.to_owned() * (q0_a * q0_geom.q_t) + &(d_row.to_owned() * q0_t_a);
+            let q_lw_a =
+                dd_row.to_owned() * (q0_a * q0_geom.q_ls) + &(d_row.to_owned() * q0_ls_a);
+
+            let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_probit_closed_form(
+                self.y[row],
+                self.weights[row],
+                q,
+                core.mu[row],
+            );
+
+            objective_psi += loss_1 * m[row] * q0_a;
+
+            let xtr = x_t.row(row);
+            let xlsr = x_ls.row(row);
+            let xta = dir_a.x_t_psi.row(row);
+            let xlsa = dir_a.x_ls_psi.row(row);
+
+            let mut b = Array1::<f64>::zeros(total);
+            b.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t));
+            b.slice_mut(s![pt..pt + pls]).assign(&(xlsr.to_owned() * q_ls));
+            b.slice_mut(s![pt + pls..]).assign(&b_row.to_owned());
+
+            let mut c_a = Array1::<f64>::zeros(total);
+            c_a
+                .slice_mut(s![0..pt])
+                .assign(&(xtr.to_owned() * q_t_a + xta.to_owned() * q_t));
+            c_a
+                .slice_mut(s![pt..pt + pls])
+                .assign(&(xlsr.to_owned() * q_ls_a + xlsa.to_owned() * q_ls));
+            c_a.slice_mut(s![pt + pls..]).assign(&q_w_a);
+
+            score_psi += &(loss_2 * m[row] * q0_a * &b + loss_1 * &c_a);
+
+            let mut q_mat = Array2::<f64>::zeros((total, total));
+            {
+                let tt = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt;
+                let tl = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl;
+                let ll = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll;
+                q_mat.slice_mut(s![0..pt, 0..pt]).assign(&tt);
+                q_mat.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl);
+                q_mat.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll);
+                let tw = xtr.to_owned().insert_axis(Axis(1)).dot(&(d_row.to_owned() * q0_geom.q_t).insert_axis(Axis(0)));
+                let lw = xlsr.to_owned().insert_axis(Axis(1)).dot(&(d_row.to_owned() * q0_geom.q_ls).insert_axis(Axis(0)));
+                q_mat.slice_mut(s![0..pt, pt + pls..]).assign(&tw);
+                q_mat.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw);
+                mirror_upper_to_lower(&mut q_mat);
+            }
+
+            let mut r_a = Array2::<f64>::zeros((total, total));
+            {
+                let tt = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_a
+                    + xta.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xta.to_owned().insert_axis(Axis(0))) * q_tt;
+                let tl = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_a
+                    + xta.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_tl;
+                let ll = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_a
+                    + xlsa.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll
+                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_ll;
+                r_a.slice_mut(s![0..pt, 0..pt]).assign(&tt);
+                r_a.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl);
+                r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll);
+                let tw = xta.to_owned().insert_axis(Axis(1)).dot(&(d_row.to_owned() * q0_geom.q_t).insert_axis(Axis(0)))
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&q_tw_a.insert_axis(Axis(0)));
+                let lw = xlsa.to_owned().insert_axis(Axis(1)).dot(&(d_row.to_owned() * q0_geom.q_ls).insert_axis(Axis(0)))
+                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&q_lw_a.insert_axis(Axis(0)));
+                r_a.slice_mut(s![0..pt, pt + pls..]).assign(&tw);
+                r_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw);
+                mirror_upper_to_lower(&mut r_a);
+            }
+
+            let bb = b.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
+            let ca_bt = c_a.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
+            let b_cat = b.view().insert_axis(Axis(1)).dot(&c_a.view().insert_axis(Axis(0)));
+            hessian_psi += &(loss_3 * m[row] * q0_a * bb + loss_2 * (ca_bt + b_cat + (m[row] * q0_a) * q_mat) + loss_1 * r_a);
+        }
+
+        Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+            objective_psi,
+            score_psi,
+            hessian_psi,
+        }))
+    }
+
+    fn exact_newton_joint_psi_second_order_terms_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+            return Ok(None);
+        }
+        if block_states.len() != 3 || derivative_blocks.len() != 3 {
+            return Err(format!(
+                "BinomialLocationScaleWiggleFamily joint psi second-order terms expect 3 blocks and 3 derivative block lists, got {} and {}",
+                block_states.len(),
+                derivative_blocks.len()
+            ));
+        }
+        let Some(dir_a) = self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_i,
+            x_t,
+            x_ls,
+        )? else {
+            return Ok(None);
+        };
+        let Some(dir_b) = self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_j,
+            x_t,
+            x_ls,
+        )? else {
+            return Ok(None);
+        };
+        let (x_t_ab, x_ls_ab, z_t_ab, z_ls_ab) = self.exact_newton_joint_psi_second_design_drifts(
+            block_states,
+            derivative_blocks,
+            &dir_a,
+            &dir_b,
+            x_t,
+            x_ls,
+        )?;
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let eta_w = &block_states[Self::BLOCK_WIGGLE].eta;
+        let beta_w = &block_states[Self::BLOCK_WIGGLE].beta;
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            Some(eta_w),
+            &self.link_kind,
+        )?;
+        let base_core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+        let b0 = self.wiggle_design(base_core.q0.view())?;
+        let d0 =
+            self.wiggle_basis_with_options(base_core.q0.view(), BasisOptions::first_derivative())?;
+        let dd0 =
+            self.wiggle_basis_with_options(base_core.q0.view(), BasisOptions::second_derivative())?;
+        let d3_basis = self.wiggle_d3basis_constrained(base_core.q0.view())?;
+        let d3q = self.wiggle_d3q_dq03(base_core.q0.view(), beta_w.view())?;
+        let d4q = self.wiggle_d4q_dq04(base_core.q0.view(), beta_w.view())?;
+        if b0.ncols() != beta_w.len()
+            || d0.ncols() != beta_w.len()
+            || dd0.ncols() != beta_w.len()
+            || d3_basis.ncols() != beta_w.len()
+        {
+            return Err(format!(
+                "wiggle derivative/beta mismatch in joint psi psi terms: B={} B'={} B''={} B'''={} beta_w={}",
+                b0.ncols(),
+                d0.ncols(),
+                dd0.ncols(),
+                d3_basis.ncols(),
+                beta_w.len()
+            ));
+        }
+        let m = d0.dot(beta_w) + 1.0;
+        let g2 = dd0.dot(beta_w);
+        let g3 = d3q;
+        let g4 = d4q;
+        let (sigma, ds, d2s, d3s) = exp_sigma_derivs_up_to_third(eta_ls.view());
+
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let pw = b0.ncols();
+        let total = pt + pls + pw;
+        let mut objective_psi_psi = 0.0;
+        let mut score_psi_psi = Array1::<f64>::zeros(total);
+        let mut hessian_psi_psi = Array2::<f64>::zeros((total, total));
+
+        // -----------------------------------------------------------------
+        // Likelihood-only exact psi/psi terms for the wiggle family.
+        //
+        // This is the same generic second-order kernel as the non-wiggle path,
+        // still over the flattened coefficients beta = [beta_t; beta_ls; beta_w].
+        // The family provides only the likelihood-side fixed-beta objects
+        //
+        //   D_ab, D_{beta ab}, D_{beta beta ab},
+        //
+        // while generic exact-joint code in custom_family.rs adds all realized
+        // penalty motion S_ab.
+        //
+        // Using the generic rowwise notation
+        //
+        //   h_a   = q_{psi_a},      h_b   = q_{psi_b},
+        //   h_ab  = q_{psi_a psi_b},
+        //   c_a   = q_{beta psi_a}, c_b   = q_{beta psi_b},
+        //   c_ab  = q_{beta psi_a psi_b},
+        //   R_a   = q_{beta beta psi_a},
+        //   R_b   = q_{beta beta psi_b},
+        //   R_ab  = q_{beta beta psi_a psi_b},
+        //
+        // the exact scalar-loss kernel is
+        //
+        //   D_ab
+        //   = sum_r [ w_r h_{r,a} h_{r,b} + r_r h_{r,ab} ],
+        //
+        //   D_{beta ab}
+        //   = sum_r [
+        //       r_r c_{r,ab}
+        //       + w_r h_{r,b} c_{r,a}
+        //       + w_r h_{r,a} c_{r,b}
+        //       + (w_r h_{r,ab} + nu_r h_{r,a} h_{r,b}) b_r
+        //     ],
+        //
+        //   D_{beta beta ab}
+        //   = sum_r [
+        //       r_r R_{r,ab}
+        //       + w_r h_{r,b} R_{r,a}
+        //       + w_r h_{r,a} R_{r,b}
+        //       + w_r(c_{r,ab} b_r^T + b_r c_{r,ab}^T
+        //             + c_{r,a} c_{r,b}^T + c_{r,b} c_{r,a}^T
+        //             + h_{r,ab} Q_r)
+        //       + nu_r h_{r,b}(c_{r,a} b_r^T + b_r c_{r,a}^T)
+        //       + nu_r h_{r,a}(c_{r,b} b_r^T + b_r c_{r,b}^T)
+        //       + nu_r h_{r,a} h_{r,b} Q_r
+        //       + (tau_r h_{r,a} h_{r,b} + nu_r h_{r,ab}) b_r b_r^T
+        //     ].
+        //
+        // The wiggle specialization enters only through the rowwise q-objects
+        // built below from the combined location-side row z_r = [x_{t,r}; B_r(q0)].
+        // -----------------------------------------------------------------
+        for row in 0..n {
+            let q0 = base_core.q0[row];
+            let q = q0 + eta_w[row];
+            let q0_geom = nonwiggle_q_derivs(eta_t[row], sigma[row], ds[row], d2s[row], d3s[row]);
+            let s_safe = sigma[row].max(1e-12);
+            let s2 = s_safe * s_safe;
+            let s3 = s2 * s_safe;
+            let s4 = s3 * s_safe;
+            let q0_tl_ls_ls =
+                d3s[row] / s2 - 6.0 * ds[row] * d2s[row] / s3 + 6.0 * ds[row].powi(3) / s4;
+            let r_sigma = 1.0 / s_safe;
+
+            let q0_a = -r_sigma * dir_a.z_t_psi[row] - q0 * dir_a.z_ls_psi[row];
+            let q0_b = -r_sigma * dir_b.z_t_psi[row] - q0 * dir_b.z_ls_psi[row];
+            let q0_ab = -r_sigma * z_t_ab[row]
+                + r_sigma
+                    * (dir_a.z_t_psi[row] * dir_b.z_ls_psi[row]
+                        + dir_b.z_t_psi[row] * dir_a.z_ls_psi[row])
+                + q0 * (dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row] - z_ls_ab[row]);
+
+            let q0_t_a = q0_geom.q_tl * dir_a.z_ls_psi[row];
+            let q0_t_b = q0_geom.q_tl * dir_b.z_ls_psi[row];
+            let q0_t_ab = q0_geom.q_tl_ls * dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row]
+                + q0_geom.q_tl * z_ls_ab[row];
+            let q0_ls_a = q0_geom.q_tl * dir_a.z_t_psi[row] + q0_geom.q_ll * dir_a.z_ls_psi[row];
+            let q0_ls_b = q0_geom.q_tl * dir_b.z_t_psi[row] + q0_geom.q_ll * dir_b.z_ls_psi[row];
+            let q0_ls_ab = -q0_ab;
+            let q0_tl_a = q0_geom.q_tl_ls * dir_a.z_ls_psi[row];
+            let q0_tl_b = q0_geom.q_tl_ls * dir_b.z_ls_psi[row];
+            let q0_tl_ab = q0_tl_ls_ls * dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row]
+                + q0_geom.q_tl_ls * z_ls_ab[row];
+            let q0_ll_a = q0_geom.q_tl_ls * dir_a.z_t_psi[row] + q0_geom.q_ll_ls * dir_a.z_ls_psi[row];
+            let q0_ll_b = q0_geom.q_tl_ls * dir_b.z_t_psi[row] + q0_geom.q_ll_ls * dir_b.z_ls_psi[row];
+            let q0_ll_ab = q0_ab;
+
+            let m_a = g2[row] * q0_a;
+            let m_b = g2[row] * q0_b;
+            let m_ab = g3[row] * q0_a * q0_b + g2[row] * q0_ab;
+            let g2_a = g3[row] * q0_a;
+            let g2_b = g3[row] * q0_b;
+            let g2_ab = g4[row] * q0_a * q0_b + g3[row] * q0_ab;
+
+            let q_a = m[row] * q0_a;
+            let q_b = m[row] * q0_b;
+            let q_ab = m[row] * q0_ab + g2[row] * q0_a * q0_b;
+            let q_t = m[row] * q0_geom.q_t;
+            let q_ls = m[row] * q0_geom.q_ls;
+            let q_tt = g2[row] * q0_geom.q_t * q0_geom.q_t;
+            let q_tl = g2[row] * q0_geom.q_t * q0_geom.q_ls + m[row] * q0_geom.q_tl;
+            let q_ll = g2[row] * q0_geom.q_ls * q0_geom.q_ls + m[row] * q0_geom.q_ll;
+            let q_t_a = m_a * q0_geom.q_t + m[row] * q0_t_a;
+            let q_t_b = m_b * q0_geom.q_t + m[row] * q0_t_b;
+            let q_ls_a = m_a * q0_geom.q_ls + m[row] * q0_ls_a;
+            let q_ls_b = m_b * q0_geom.q_ls + m[row] * q0_ls_b;
+            let q_t_ab = m_ab * q0_geom.q_t + m_a * q0_t_b + m_b * q0_t_a + m[row] * q0_t_ab;
+            let q_ls_ab =
+                m_ab * q0_geom.q_ls + m_a * q0_ls_b + m_b * q0_ls_a + m[row] * q0_ls_ab;
+            let q_tt_a = g2_a * q0_geom.q_t * q0_geom.q_t + g2[row] * 2.0 * q0_geom.q_t * q0_t_a;
+            let q_tt_b = g2_b * q0_geom.q_t * q0_geom.q_t + g2[row] * 2.0 * q0_geom.q_t * q0_t_b;
+            let q_tt_ab = g2_ab * q0_geom.q_t * q0_geom.q_t
+                + g2_a * 2.0 * q0_geom.q_t * q0_t_b
+                + g2_b * 2.0 * q0_geom.q_t * q0_t_a
+                + g2[row] * (2.0 * q0_t_a * q0_t_b + 2.0 * q0_geom.q_t * q0_t_ab);
+            let q_tl_a = g2_a * q0_geom.q_t * q0_geom.q_ls
+                + g2[row] * (q0_t_a * q0_geom.q_ls + q0_geom.q_t * q0_ls_a)
+                + m_a * q0_geom.q_tl
+                + m[row] * q0_tl_a;
+            let q_tl_b = g2_b * q0_geom.q_t * q0_geom.q_ls
+                + g2[row] * (q0_t_b * q0_geom.q_ls + q0_geom.q_t * q0_ls_b)
+                + m_b * q0_geom.q_tl
+                + m[row] * q0_tl_b;
+            let q_tl_ab = g2_ab * q0_geom.q_t * q0_geom.q_ls
+                + g2_a * (q0_t_b * q0_geom.q_ls + q0_geom.q_t * q0_ls_b)
+                + g2_b * (q0_t_a * q0_geom.q_ls + q0_geom.q_t * q0_ls_a)
+                + g2[row]
+                    * (q0_t_ab * q0_geom.q_ls
+                        + q0_t_a * q0_ls_b
+                        + q0_t_b * q0_ls_a
+                        + q0_geom.q_t * q0_ls_ab)
+                + m_ab * q0_geom.q_tl
+                + m_a * q0_tl_b
+                + m_b * q0_tl_a
+                + m[row] * q0_tl_ab;
+            let q_ll_a = g2_a * q0_geom.q_ls * q0_geom.q_ls
+                + g2[row] * 2.0 * q0_geom.q_ls * q0_ls_a
+                + m_a * q0_geom.q_ll
+                + m[row] * q0_ll_a;
+            let q_ll_b = g2_b * q0_geom.q_ls * q0_geom.q_ls
+                + g2[row] * 2.0 * q0_geom.q_ls * q0_ls_b
+                + m_b * q0_geom.q_ll
+                + m[row] * q0_ll_b;
+            let q_ll_ab = g2_ab * q0_geom.q_ls * q0_geom.q_ls
+                + g2_a * 2.0 * q0_geom.q_ls * q0_ls_b
+                + g2_b * 2.0 * q0_geom.q_ls * q0_ls_a
+                + g2[row] * (2.0 * q0_ls_a * q0_ls_b + 2.0 * q0_geom.q_ls * q0_ls_ab)
+                + m_ab * q0_geom.q_ll
+                + m_a * q0_ll_b
+                + m_b * q0_ll_a
+                + m[row] * q0_ll_ab;
+
+            let b_row = b0.row(row).to_owned();
+            let d_row = d0.row(row).to_owned();
+            let dd_row = dd0.row(row).to_owned();
+            let d3_row = d3_basis.row(row).to_owned();
+            let q_w_a = &d_row * q0_a;
+            let q_w_b = &d_row * q0_b;
+            let q_w_ab = &dd_row * (q0_a * q0_b) + &(&d_row * q0_ab);
+            let q_tw_a = &dd_row * (q0_a * q0_geom.q_t) + &(&d_row * q0_t_a);
+            let q_tw_b = &dd_row * (q0_b * q0_geom.q_t) + &(&d_row * q0_t_b);
+            let q_lw_a = &dd_row * (q0_a * q0_geom.q_ls) + &(&d_row * q0_ls_a);
+            let q_lw_b = &dd_row * (q0_b * q0_geom.q_ls) + &(&d_row * q0_ls_b);
+            let d0_ab = &d3_row * (q0_a * q0_b) + &(&dd_row * q0_ab);
+            let q_tw_ab = &d0_ab * q0_geom.q_t + &(&(&dd_row * q0_b) * q0_t_a) + &(&(&dd_row * q0_a) * q0_t_b) + &(&d_row * q0_t_ab);
+            let q_lw_ab = &d0_ab * q0_geom.q_ls + &(&(&dd_row * q0_b) * q0_ls_a) + &(&(&dd_row * q0_a) * q0_ls_b) + &(&d_row * q0_ls_ab);
+
+            let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_probit_closed_form(
+                self.y[row],
+                self.weights[row],
+                q,
+                core.mu[row],
+            );
+            let loss_4 = binomial_neglog_q_fourth_derivative_probit_closed_form(
+                self.y[row],
+                self.weights[row],
+                q,
+                core.mu[row],
+            );
+            objective_psi_psi += loss_2 * q_a * q_b + loss_1 * q_ab;
+
+            let xtr = x_t.row(row);
+            let xlsr = x_ls.row(row);
+            let xta = dir_a.x_t_psi.row(row);
+            let xtb = dir_b.x_t_psi.row(row);
+            let xlsa = dir_a.x_ls_psi.row(row);
+            let xlsb = dir_b.x_ls_psi.row(row);
+            let xtab = x_t_ab.row(row);
+            let xlsab = x_ls_ab.row(row);
+
+            let mut b = Array1::<f64>::zeros(total);
+            b.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t));
+            b.slice_mut(s![pt..pt + pls]).assign(&(xlsr.to_owned() * q_ls));
+            b.slice_mut(s![pt + pls..]).assign(&b_row);
+            let mut c_a = Array1::<f64>::zeros(total);
+            c_a.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t_a + xta.to_owned() * q_t));
+            c_a.slice_mut(s![pt..pt + pls]).assign(&(xlsr.to_owned() * q_ls_a + xlsa.to_owned() * q_ls));
+            c_a.slice_mut(s![pt + pls..]).assign(&q_w_a);
+            let mut c_b = Array1::<f64>::zeros(total);
+            c_b.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t_b + xtb.to_owned() * q_t));
+            c_b.slice_mut(s![pt..pt + pls]).assign(&(xlsr.to_owned() * q_ls_b + xlsb.to_owned() * q_ls));
+            c_b.slice_mut(s![pt + pls..]).assign(&q_w_b);
+            let mut c_ab = Array1::<f64>::zeros(total);
+            c_ab.slice_mut(s![0..pt]).assign(
+                &(xtr.to_owned() * q_t_ab
+                    + xta.to_owned() * q_t_b
+                    + xtb.to_owned() * q_t_a
+                    + xtab.to_owned() * q_t),
+            );
+            c_ab.slice_mut(s![pt..pt + pls]).assign(
+                &(xlsr.to_owned() * q_ls_ab
+                    + xlsa.to_owned() * q_ls_b
+                    + xlsb.to_owned() * q_ls_a
+                    + xlsab.to_owned() * q_ls),
+            );
+            c_ab.slice_mut(s![pt + pls..]).assign(&q_w_ab);
+
+            score_psi_psi += &(loss_1 * &c_ab
+                + loss_2 * q_b * &c_a
+                + loss_2 * q_a * &c_b
+                + (loss_2 * q_ab + loss_3 * q_a * q_b) * &b);
+
+            let mut q_mat = Array2::<f64>::zeros((total, total));
+            let mut r_a = Array2::<f64>::zeros((total, total));
+            let mut r_b = Array2::<f64>::zeros((total, total));
+            let mut r_ab = Array2::<f64>::zeros((total, total));
+            {
+                let tt = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt;
+                let tl = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl;
+                let ll = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll;
+                q_mat.slice_mut(s![0..pt, 0..pt]).assign(&tt);
+                q_mat.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl);
+                q_mat.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll);
+                let tw = xtr.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)));
+                let lw = xlsr.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)));
+                q_mat.slice_mut(s![0..pt, pt + pls..]).assign(&tw);
+                q_mat.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw);
+                mirror_upper_to_lower(&mut q_mat);
+
+                let tt_a = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_a
+                    + xta.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xta.to_owned().insert_axis(Axis(0))) * q_tt;
+                let tl_a = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_a
+                    + xta.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_tl;
+                let ll_a = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_a
+                    + xlsa.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll
+                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_ll;
+                r_a.slice_mut(s![0..pt, 0..pt]).assign(&tt_a);
+                r_a.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl_a);
+                r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll_a);
+                let tw_a = xta.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)))
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&q_tw_a.view().insert_axis(Axis(0)));
+                let lw_a = xlsa.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
+                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&q_lw_a.view().insert_axis(Axis(0)));
+                r_a.slice_mut(s![0..pt, pt + pls..]).assign(&tw_a);
+                r_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw_a);
+                mirror_upper_to_lower(&mut r_a);
+
+                let tt_b = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_b
+                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xtb.to_owned().insert_axis(Axis(0))) * q_tt;
+                let tl_b = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_b
+                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_tl;
+                let ll_b = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_b
+                    + xlsb.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll
+                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_ll;
+                r_b.slice_mut(s![0..pt, 0..pt]).assign(&tt_b);
+                r_b.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl_b);
+                r_b.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll_b);
+                let tw_b = xtb.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)))
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&q_tw_b.view().insert_axis(Axis(0)));
+                let lw_b = xlsb.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
+                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&q_lw_b.view().insert_axis(Axis(0)));
+                r_b.slice_mut(s![0..pt, pt + pls..]).assign(&tw_b);
+                r_b.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw_b);
+                mirror_upper_to_lower(&mut r_b);
+
+                let tt_ab = xtr.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_ab
+                    + xta.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_b
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xta.to_owned().insert_axis(Axis(0))) * q_tt_b
+                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt_a
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xtb.to_owned().insert_axis(Axis(0))) * q_tt_a
+                    + xtab.to_owned().insert_axis(Axis(1)).dot(&xtr.to_owned().insert_axis(Axis(0))) * q_tt
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xtab.to_owned().insert_axis(Axis(0))) * q_tt
+                    + xta.to_owned().insert_axis(Axis(1)).dot(&xtb.to_owned().insert_axis(Axis(0))) * q_tt
+                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xta.to_owned().insert_axis(Axis(0))) * q_tt;
+                let tl_ab = xtr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_ab
+                    + xta.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_b
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_tl_b
+                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl_a
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_tl_a
+                    + xtab.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_tl
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&xlsab.to_owned().insert_axis(Axis(0))) * q_tl
+                    + xta.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_tl
+                    + xtb.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_tl;
+                let ll_ab = xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_ab
+                    + xlsa.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_b
+                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_ll_b
+                    + xlsb.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll_a
+                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_ll_a
+                    + xlsab.to_owned().insert_axis(Axis(1)).dot(&xlsr.to_owned().insert_axis(Axis(0))) * q_ll
+                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&xlsab.to_owned().insert_axis(Axis(0))) * q_ll
+                    + xlsa.to_owned().insert_axis(Axis(1)).dot(&xlsb.to_owned().insert_axis(Axis(0))) * q_ll
+                    + xlsb.to_owned().insert_axis(Axis(1)).dot(&xlsa.to_owned().insert_axis(Axis(0))) * q_ll;
+                r_ab.slice_mut(s![0..pt, 0..pt]).assign(&tt_ab);
+                r_ab.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl_ab);
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll_ab);
+                let tw_ab = xtab.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_t).insert_axis(Axis(0)))
+                    + xta.to_owned().insert_axis(Axis(1)).dot(&q_tw_b.view().insert_axis(Axis(0)))
+                    + xtb.to_owned().insert_axis(Axis(1)).dot(&q_tw_a.view().insert_axis(Axis(0)))
+                    + xtr.to_owned().insert_axis(Axis(1)).dot(&q_tw_ab.view().insert_axis(Axis(0)));
+                let lw_ab = xlsab.to_owned().insert_axis(Axis(1)).dot(&(d_row.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
+                    + xlsa.to_owned().insert_axis(Axis(1)).dot(&q_lw_b.view().insert_axis(Axis(0)))
+                    + xlsb.to_owned().insert_axis(Axis(1)).dot(&q_lw_a.view().insert_axis(Axis(0)))
+                    + xlsr.to_owned().insert_axis(Axis(1)).dot(&q_lw_ab.view().insert_axis(Axis(0)));
+                r_ab.slice_mut(s![0..pt, pt + pls..]).assign(&tw_ab);
+                r_ab.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw_ab);
+                mirror_upper_to_lower(&mut r_ab);
+            }
+
+            let bb = b.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
+            let cab_bt = c_ab.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
+            let b_cab_t = b.view().insert_axis(Axis(1)).dot(&c_ab.view().insert_axis(Axis(0)));
+            let ca_cb_t = c_a.view().insert_axis(Axis(1)).dot(&c_b.view().insert_axis(Axis(0)));
+            let cb_ca_t = c_b.view().insert_axis(Axis(1)).dot(&c_a.view().insert_axis(Axis(0)));
+            let ca_bt = c_a.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
+            let b_cat = b.view().insert_axis(Axis(1)).dot(&c_a.view().insert_axis(Axis(0)));
+            let cb_bt = c_b.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
+            let b_cbt = b.view().insert_axis(Axis(1)).dot(&c_b.view().insert_axis(Axis(0)));
+
+            hessian_psi_psi += &(loss_1 * r_ab
+                + loss_2 * (q_b * r_a + q_a * r_b + cab_bt + b_cab_t + ca_cb_t + cb_ca_t + q_ab * &q_mat)
+                + loss_3 * (q_b * (ca_bt + b_cat) + q_a * (cb_bt + b_cbt) + q_a * q_b * &q_mat)
+                + (loss_4 * q_a * q_b + loss_3 * q_ab) * bb);
+        }
+
+        Ok(Some(
+            crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
+                objective_psi_psi,
+                score_psi_psi,
+                hessian_psi_psi,
+            },
+        ))
+    }
+
+    fn exact_newton_joint_psi_hessian_directional_derivative_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+            return Ok(None);
+        }
+        let Some(dir_a) = self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            x_t,
+            x_ls,
+        )? else {
+            return Ok(None);
+        };
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let eta_w = &block_states[Self::BLOCK_WIGGLE].eta;
+        let beta_w = &block_states[Self::BLOCK_WIGGLE].beta;
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            Some(eta_w),
+            &self.link_kind,
+        )?;
+        let base_core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+        let b0 = self.wiggle_design(base_core.q0.view())?;
+        let d0 =
+            self.wiggle_basis_with_options(base_core.q0.view(), BasisOptions::first_derivative())?;
+        let dd0 =
+            self.wiggle_basis_with_options(base_core.q0.view(), BasisOptions::second_derivative())?;
+        let d3_basis = self.wiggle_d3basis_constrained(base_core.q0.view())?;
+        let d4q = self.wiggle_d4q_dq04(base_core.q0.view(), beta_w.view())?;
+        let pw = b0.ncols();
+        let layout = GamlssBetaLayout::with_wiggle(pt, pls, pw);
+        let (u_t, u_ls, u_w) =
+            layout.split_three(d_beta_flat, "wiggle joint psi hessian directional derivative")?;
+        let total = pt + pls + pw;
+        if d0.ncols() != beta_w.len()
+            || dd0.ncols() != beta_w.len()
+            || d3_basis.ncols() != beta_w.len()
+        {
+            return Err(format!(
+                "wiggle derivative/beta mismatch in joint psi mixed drift: B'={} B''={} B'''={} beta_w={}",
+                d0.ncols(),
+                dd0.ncols(),
+                d3_basis.ncols(),
+                beta_w.len()
+            ));
+        }
+        let xi_t = x_t.dot(&u_t);
+        let xi_ls = x_ls.dot(&u_ls);
+        let m = d0.dot(beta_w) + 1.0;
+        let g2 = dd0.dot(beta_w);
+        let g3 = self.wiggle_d3q_dq03(base_core.q0.view(), beta_w.view())?;
+        let g4 = d4q;
+        let (sigma, ds, d2s, d3s, d4s) = gaussian_sigma_derivs_up_to_fourth(eta_ls.view());
+
+        // Exact likelihood-side mixed drift T_a[u] = D_beta H_{psi_a}^{(D)}[u].
+        //
+        // The unified outer Hessian in custom_family.rs uses
+        //   ddot H_ij = H_ij + T_i[beta_j] + T_j[beta_i]
+        //             + D_beta H[beta_ij] + D_beta^2 H[beta_i, beta_j].
+        //
+        // For wiggle we still use the same scalar-loss row kernel as non-wiggle;
+        // only the location-side row changes to z_r = [x_{t,r}; B_r(q0)] with
+        // q = q0 + beta_w^T B(q0), q0 = -eta_t exp(-eta_ls).
+        let mut out = Array2::<f64>::zeros((total, total));
+        for row in 0..n {
+            let q = core.q0[row] + eta_w[row];
+            let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_probit_closed_form(
+                self.y[row],
+                self.weights[row],
+                q,
+                core.mu[row],
+            );
+            let loss_4 = binomial_neglog_q_fourth_derivative_probit_closed_form(
+                self.y[row],
+                self.weights[row],
+                q,
+                core.mu[row],
+            );
+            let q0 = nonwiggle_q_derivs(eta_t[row], sigma[row], ds[row], d2s[row], d3s[row]);
+            let s_safe = sigma[row].max(1e-12);
+            let s2 = s_safe * s_safe;
+            let s3 = s2 * s_safe;
+            let s4 = s3 * s_safe;
+            let s5 = s4 * s_safe;
+            let q0_tl_ls_ls =
+                d3s[row] / s2 - 6.0 * ds[row] * d2s[row] / s3 + 6.0 * ds[row] * ds[row] * ds[row] / s4;
+            let q0_tl_ls_ls_ls =
+                d4s[row] / s2
+                    - 8.0 * ds[row] * d3s[row] / s3
+                    - 6.0 * d2s[row] * d2s[row] / s3
+                    + 36.0 * ds[row] * ds[row] * d2s[row] / s4
+                    - 24.0 * ds[row] * ds[row] * ds[row] * ds[row] / s5;
+            let q0_ll_ls_ls = eta_t[row] * q0_tl_ls_ls_ls;
+
+            let xtr = x_t.row(row).to_owned();
+            let xlsr = x_ls.row(row).to_owned();
+            let xta = dir_a.x_t_psi.row(row).to_owned();
+            let xlsa = dir_a.x_ls_psi.row(row).to_owned();
+            let br = b0.row(row).to_owned();
+            let dr = d0.row(row).to_owned();
+            let ddr = dd0.row(row).to_owned();
+            let d3r = d3_basis.row(row).to_owned();
+
+            let xi_t_i = xi_t[row];
+            let xi_ls_i = xi_ls[row];
+            let xi_ta_i = xta.dot(&u_t);
+            let xi_lsa_i = xlsa.dot(&u_ls);
+            let d_dot_u = dr.dot(&u_w);
+            let dd_dot_u = ddr.dot(&u_w);
+            let d3_dot_u = d3r.dot(&u_w);
+
+            let dq0_u = q0.q_t * xi_t_i + q0.q_ls * xi_ls_i;
+            let dq0_t_u = q0.q_tl * xi_ls_i;
+            let dq0_ls_u = q0.q_tl * xi_t_i + q0.q_ll * xi_ls_i;
+            let dq0_tl_u = q0.q_tl_ls * xi_ls_i;
+            let dq0_ll_u = q0.q_tl_ls * xi_t_i + q0.q_ll_ls * xi_ls_i;
+            let dq0_tl_ls_u = q0_tl_ls_ls * xi_ls_i;
+            let dq0_ll_ls_u = q0_tl_ls_ls * xi_t_i + q0_ll_ls_ls * xi_ls_i;
+
+            let q0_a = -q0.q_t * dir_a.z_t_psi[row] - q0.q_ls * dir_a.z_ls_psi[row];
+            let q0_t_a = q0.q_tl_ls * dir_a.z_ls_psi[row];
+            let q0_ls_a =
+                q0.q_tl_ls * dir_a.z_t_psi[row] + q0.q_ll_ls * dir_a.z_ls_psi[row];
+            let q0_tl_a = q0.q_tl_ls * dir_a.z_ls_psi[row];
+            let q0_ll_a =
+                q0.q_tl_ls * dir_a.z_t_psi[row] + q0.q_ll_ls * dir_a.z_ls_psi[row];
+            let dq0_a_u = q0_t_a * xi_t_i + q0_ls_a * xi_ls_i;
+            let dq0_t_a_u = dq0_tl_ls_u * dir_a.z_ls_psi[row];
+            let dq0_ls_a_u =
+                dq0_tl_ls_u * dir_a.z_t_psi[row] + dq0_ll_ls_u * dir_a.z_ls_psi[row];
+            let dq0_tl_a_u = dq0_tl_ls_u * dir_a.z_ls_psi[row];
+            let dq0_ll_a_u =
+                dq0_tl_ls_u * dir_a.z_t_psi[row] + dq0_ll_ls_u * dir_a.z_ls_psi[row];
+
+            let q_t = m[row] * q0.q_t;
+            let q_ls = m[row] * q0.q_ls;
+            let q_tt = g2[row] * q0.q_t * q0.q_t;
+            let q_tl = g2[row] * q0.q_t * q0.q_ls + m[row] * q0.q_tl;
+            let q_ll = g2[row] * q0.q_ls * q0.q_ls + m[row] * q0.q_ll;
+            let q_tw = dr.clone() * q0.q_t;
+            let q_lw = dr.clone() * q0.q_ls;
+
+            let dm_u = g2[row] * dq0_u + d_dot_u;
+            let dg2_u = g3[row] * dq0_u + dd_dot_u;
+            let dg3_u = g4[row] * dq0_u + d3_dot_u;
+
+            let q_a = m[row] * q0_a;
+            let q_t_a = g2[row] * q0_a * q0.q_t + m[row] * q0_t_a;
+            let q_ls_a = g2[row] * q0_a * q0.q_ls + m[row] * q0_ls_a;
+            let q_tt_a = g3[row] * q0_a * q0.q_t * q0.q_t
+                + g2[row] * (2.0 * q0.q_t * q0_t_a);
+            let q_tl_a = g3[row] * q0_a * q0.q_t * q0.q_ls
+                + g2[row] * (q0_t_a * q0.q_ls + q0.q_t * q0_ls_a + q0_a * q0.q_tl)
+                + m[row] * q0_tl_a;
+            let q_ll_a = g3[row] * q0_a * q0.q_ls * q0.q_ls
+                + g2[row] * (2.0 * q0.q_ls * q0_ls_a + q0_a * q0.q_ll)
+                + m[row] * q0_ll_a;
+            let q_w_a = dr.clone() * q0_a;
+            let q_tw_a = ddr.clone() * (q0_a * q0.q_t) + &(dr.clone() * q0_t_a);
+            let q_lw_a = ddr.clone() * (q0_a * q0.q_ls) + &(dr.clone() * q0_ls_a);
+
+            let dq_tt_u = dg2_u * q0.q_t * q0.q_t + g2[row] * (2.0 * q0.q_t * dq0_t_u);
+            let dq_tl_u = dg2_u * q0.q_t * q0.q_ls
+                + g2[row] * (dq0_t_u * q0.q_ls + q0.q_t * dq0_ls_u)
+                + dm_u * q0.q_tl
+                + m[row] * dq0_tl_u;
+            let dq_ll_u = dg2_u * q0.q_ls * q0.q_ls
+                + g2[row] * (2.0 * q0.q_ls * dq0_ls_u)
+                + dm_u * q0.q_ll
+                + m[row] * dq0_ll_u;
+            let dq_tw_u = ddr.clone() * (dq0_u * q0.q_t) + &(dr.clone() * dq0_t_u);
+            let dq_lw_u = ddr.clone() * (dq0_u * q0.q_ls) + &(dr.clone() * dq0_ls_u);
+
+            let dq_tt_a_u = dg3_u * q0_a * q0.q_t * q0.q_t
+                + g3[row] * (dq0_a_u * q0.q_t * q0.q_t + 2.0 * q0_a * q0.q_t * dq0_t_u)
+                + dg2_u * (2.0 * q0.q_t * q0_t_a)
+                + g2[row] * (2.0 * dq0_t_u * q0_t_a + 2.0 * q0.q_t * dq0_t_a_u);
+            let dq_tl_a_u = dg3_u * q0_a * q0.q_t * q0.q_ls
+                + g3[row]
+                    * (dq0_a_u * q0.q_t * q0.q_ls
+                        + q0_a * dq0_t_u * q0.q_ls
+                        + q0_a * q0.q_t * dq0_ls_u)
+                + dg2_u * (q0_t_a * q0.q_ls + q0.q_t * q0_ls_a + q0_a * q0.q_tl)
+                + g2[row]
+                    * (dq0_t_a_u * q0.q_ls
+                        + q0_t_a * dq0_ls_u
+                        + dq0_t_u * q0_ls_a
+                        + q0.q_t * dq0_ls_a_u
+                        + dq0_a_u * q0.q_tl
+                        + q0_a * dq0_tl_u)
+                + dm_u * q0_tl_a
+                + m[row] * dq0_tl_a_u;
+            let dq_ll_a_u = dg3_u * q0_a * q0.q_ls * q0.q_ls
+                + g3[row] * (dq0_a_u * q0.q_ls * q0.q_ls + 2.0 * q0_a * q0.q_ls * dq0_ls_u)
+                + dg2_u * (2.0 * q0.q_ls * q0_ls_a + q0_a * q0.q_ll)
+                + g2[row]
+                    * (2.0 * dq0_ls_u * q0_ls_a
+                        + 2.0 * q0.q_ls * dq0_ls_a_u
+                        + dq0_a_u * q0.q_ll
+                        + q0_a * dq0_ll_u)
+                + dm_u * q0_ll_a
+                + m[row] * dq0_ll_a_u;
+            let dq_tw_a_u = d3r.clone() * (dq0_u * q0_a * q0.q_t)
+                + &(ddr.clone() * (dq0_a_u * q0.q_t + q0_a * dq0_t_u + dq0_u * q0_t_a))
+                + &(dr.clone() * dq0_t_a_u);
+            let dq_lw_a_u = d3r.clone() * (dq0_u * q0_a * q0.q_ls)
+                + &(ddr.clone() * (dq0_a_u * q0.q_ls + q0_a * dq0_ls_u + dq0_u * q0_ls_a))
+                + &(dr.clone() * dq0_ls_a_u);
+
+            let mut b = Array1::<f64>::zeros(total);
+            b.slice_mut(s![0..pt]).assign(&(xtr.clone() * q_t));
+            b.slice_mut(s![pt..pt + pls]).assign(&(xlsr.clone() * q_ls));
+            b.slice_mut(s![pt + pls..]).assign(&br);
+
+            let mut c_a = Array1::<f64>::zeros(total);
+            c_a
+                .slice_mut(s![0..pt])
+                .assign(&(xtr.clone() * q_t_a + xta.clone() * q_t));
+            c_a
+                .slice_mut(s![pt..pt + pls])
+                .assign(&(xlsr.clone() * q_ls_a + xlsa.clone() * q_ls));
+            c_a.slice_mut(s![pt + pls..]).assign(&q_w_a);
+
+            let mut gamma = Array1::<f64>::zeros(total);
+            gamma
+                .slice_mut(s![0..pt])
+                .assign(&(xtr.clone() * (q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u)));
+            gamma
+                .slice_mut(s![pt..pt + pls])
+                .assign(&(xlsr.clone() * (q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u)));
+            gamma.slice_mut(s![pt + pls..]).assign(&(dr.clone() * dq0_u));
+
+            let q_tw_a_dot_u = q_tw_a.dot(&u_w);
+            let q_lw_a_dot_u = q_lw_a.dot(&u_w);
+            let mut gamma_a = Array1::<f64>::zeros(total);
+            gamma_a.slice_mut(s![0..pt]).assign(
+                &(xtr.clone()
+                    * (q_tt_a * xi_t_i
+                        + q_tt * xi_ta_i
+                        + q_tl_a * xi_ls_i
+                        + q_tl * xi_lsa_i
+                        + q_tw_a_dot_u)
+                    + xta.clone()
+                        * (q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u)),
+            );
+            gamma_a.slice_mut(s![pt..pt + pls]).assign(
+                &(xlsr.clone()
+                    * (q_tl_a * xi_t_i
+                        + q_tl * xi_ta_i
+                        + q_ll_a * xi_ls_i
+                        + q_ll * xi_lsa_i
+                        + q_lw_a_dot_u)
+                    + xlsa.clone()
+                        * (q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u)),
+            );
+            gamma_a.slice_mut(s![pt + pls..]).assign(
+                &(q_tw_a.clone() * xi_t_i
+                    + q_tw.clone() * xi_ta_i
+                    + q_lw_a.clone() * xi_ls_i
+                    + q_lw.clone() * xi_lsa_i),
+            );
+
+            let alpha = b.dot(d_beta_flat);
+            let alpha_a = c_a.dot(d_beta_flat);
+
+            let mut q_mat = Array2::<f64>::zeros((total, total));
+            q_mat
+                .slice_mut(s![0..pt, 0..pt])
+                .assign(&(xtr.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * q_tt));
+            q_mat
+                .slice_mut(s![0..pt, pt..pt + pls])
+                .assign(&(xtr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_tl));
+            q_mat
+                .slice_mut(s![pt..pt + pls, pt..pt + pls])
+                .assign(&(xlsr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_ll));
+            q_mat
+                .slice_mut(s![0..pt, pt + pls..])
+                .assign(&xtr.view().insert_axis(Axis(1)).dot(&q_tw.view().insert_axis(Axis(0))));
+            q_mat
+                .slice_mut(s![pt..pt + pls, pt + pls..])
+                .assign(&xlsr.view().insert_axis(Axis(1)).dot(&q_lw.view().insert_axis(Axis(0))));
+            mirror_upper_to_lower(&mut q_mat);
+
+            let mut r_a = Array2::<f64>::zeros((total, total));
+            r_a.slice_mut(s![0..pt, 0..pt]).assign(
+                &(xtr.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * q_tt_a
+                    + xta.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * q_tt
+                    + xtr.view().insert_axis(Axis(1)).dot(&xta.view().insert_axis(Axis(0))) * q_tt),
+            );
+            r_a.slice_mut(s![0..pt, pt..pt + pls]).assign(
+                &(xtr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_tl_a
+                    + xta.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_tl
+                    + xtr.view().insert_axis(Axis(1)).dot(&xlsa.view().insert_axis(Axis(0))) * q_tl),
+            );
+            r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
+                &(xlsr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_ll_a
+                    + xlsa.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * q_ll
+                    + xlsr.view().insert_axis(Axis(1)).dot(&xlsa.view().insert_axis(Axis(0))) * q_ll),
+            );
+            r_a.slice_mut(s![0..pt, pt + pls..]).assign(
+                &(xta.view().insert_axis(Axis(1)).dot(&q_tw.view().insert_axis(Axis(0)))
+                    + xtr.view().insert_axis(Axis(1)).dot(&q_tw_a.view().insert_axis(Axis(0)))),
+            );
+            r_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
+                &(xlsa.view().insert_axis(Axis(1)).dot(&q_lw.view().insert_axis(Axis(0)))
+                    + xlsr.view().insert_axis(Axis(1)).dot(&q_lw_a.view().insert_axis(Axis(0)))),
+            );
+            mirror_upper_to_lower(&mut r_a);
+
+            let mut c_u = Array2::<f64>::zeros((total, total));
+            c_u.slice_mut(s![0..pt, 0..pt]).assign(
+                &(xtr.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * dq_tt_u),
+            );
+            c_u.slice_mut(s![0..pt, pt..pt + pls]).assign(
+                &(xtr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_tl_u),
+            );
+            c_u.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
+                &(xlsr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_ll_u),
+            );
+            c_u.slice_mut(s![0..pt, pt + pls..]).assign(
+                &xtr.view().insert_axis(Axis(1)).dot(&dq_tw_u.view().insert_axis(Axis(0))),
+            );
+            c_u.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
+                &xlsr.view().insert_axis(Axis(1)).dot(&dq_lw_u.view().insert_axis(Axis(0))),
+            );
+            mirror_upper_to_lower(&mut c_u);
+
+            let mut delta_a = Array2::<f64>::zeros((total, total));
+            delta_a.slice_mut(s![0..pt, 0..pt]).assign(
+                &(xtr.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * dq_tt_a_u
+                    + xta.view().insert_axis(Axis(1)).dot(&xtr.view().insert_axis(Axis(0))) * dq_tt_u
+                    + xtr.view().insert_axis(Axis(1)).dot(&xta.view().insert_axis(Axis(0))) * dq_tt_u),
+            );
+            delta_a.slice_mut(s![0..pt, pt..pt + pls]).assign(
+                &(xtr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_tl_a_u
+                    + xta.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_tl_u
+                    + xtr.view().insert_axis(Axis(1)).dot(&xlsa.view().insert_axis(Axis(0))) * dq_tl_u),
+            );
+            delta_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
+                &(xlsr.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_ll_a_u
+                    + xlsa.view().insert_axis(Axis(1)).dot(&xlsr.view().insert_axis(Axis(0))) * dq_ll_u
+                    + xlsr.view().insert_axis(Axis(1)).dot(&xlsa.view().insert_axis(Axis(0))) * dq_ll_u),
+            );
+            delta_a.slice_mut(s![0..pt, pt + pls..]).assign(
+                &(xta.view().insert_axis(Axis(1)).dot(&dq_tw_u.view().insert_axis(Axis(0)))
+                    + xtr.view().insert_axis(Axis(1)).dot(&dq_tw_a_u.view().insert_axis(Axis(0)))),
+            );
+            delta_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
+                &(xlsa.view().insert_axis(Axis(1)).dot(&dq_lw_u.view().insert_axis(Axis(0)))
+                    + xlsr.view().insert_axis(Axis(1)).dot(&dq_lw_a_u.view().insert_axis(Axis(0)))),
+            );
+            mirror_upper_to_lower(&mut delta_a);
+
+            let bb = b.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
+            let cb = c_a.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
+            let bc = b.view().insert_axis(Axis(1)).dot(&c_a.view().insert_axis(Axis(0)));
+            let gb = gamma.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
+            let bg = b.view().insert_axis(Axis(1)).dot(&gamma.view().insert_axis(Axis(0)));
+            let gab = gamma_a.view().insert_axis(Axis(1)).dot(&b.view().insert_axis(Axis(0)));
+            let bga = b.view().insert_axis(Axis(1)).dot(&gamma_a.view().insert_axis(Axis(0)));
+            let gc = gamma.view().insert_axis(Axis(1)).dot(&c_a.view().insert_axis(Axis(0)));
+            let cg = c_a.view().insert_axis(Axis(1)).dot(&gamma.view().insert_axis(Axis(0)));
+
+            out += &(loss_1 * &delta_a);
+            out += &(loss_2
+                * (&(alpha * &r_a)
+                    + &(q_a * &c_u)
+                    + &gab
+                    + &bga
+                    + &gc
+                    + &cg
+                    + &(alpha_a * &q_mat)));
+            out += &(loss_3
+                * (&((alpha * q_a) * &bb)
+                    + &(q_a * (&gb + &bg))
+                    + &(alpha * (&cb + &bc + &(q_a * &q_mat)))));
+            out += &((loss_4 * alpha * q_a + loss_3 * alpha_a) * &bb);
+        }
+        mirror_upper_to_lower(&mut out);
+        Ok(Some(out))
+    }
+
     /// Build a turnkey wiggle block from a q-seed vector and knot settings.
     /// Returns both the block input and the generated knot vector.
     pub fn build_wiggle_block_input(
@@ -5820,6 +7200,10 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             log_likelihood: core.log_likelihood,
             block_working_sets: vec![t_ws, ls_ws, w_ws],
         })
+    }
+
+    fn requires_joint_outer_hyper_path(&self) -> bool {
+        true
     }
 
     fn exact_newton_hessian_directional_derivative(
@@ -5964,7 +7348,9 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             return Err("BinomialLocationScaleWiggleFamily input size mismatch".to_string());
         }
 
-        let (x_t, x_ls) = self.dense_block_designs()?;
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
+            return Ok(None);
+        };
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let beta_w0 = block_states[Self::BLOCK_WIGGLE].beta.clone();
@@ -6132,7 +7518,9 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             return Err("BinomialLocationScaleWiggleFamily input size mismatch".to_string());
         }
 
-        let (x_t, x_ls) = self.dense_block_designs()?;
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
+            return Ok(None);
+        };
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let beta_w0 = block_states[Self::BLOCK_WIGGLE].beta.clone();
@@ -6319,7 +7707,9 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             return Err("BinomialLocationScaleWiggleFamily input size mismatch".to_string());
         }
 
-        let (x_t, x_ls) = self.dense_block_designs()?;
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
+            return Ok(None);
+        };
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let beta_w0 = block_states[Self::BLOCK_WIGGLE].beta.clone();
@@ -6608,6 +7998,148 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
 
         mirror_upper_to_lower(&mut d2_h);
         Ok(Some(d2_h))
+    }
+
+    fn exact_newton_joint_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        let shadow = Self {
+            y: self.y.clone(),
+            weights: self.weights.clone(),
+            link_kind: self.link_kind.clone(),
+            threshold_design: Some(DesignMatrix::Dense(x_t)),
+            log_sigma_design: Some(DesignMatrix::Dense(x_ls)),
+            wiggle_knots: self.wiggle_knots.clone(),
+            wiggle_degree: self.wiggle_degree,
+        };
+        shadow.exact_newton_joint_hessian(block_states)
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        let shadow = Self {
+            y: self.y.clone(),
+            weights: self.weights.clone(),
+            link_kind: self.link_kind.clone(),
+            threshold_design: Some(DesignMatrix::Dense(x_t)),
+            log_sigma_design: Some(DesignMatrix::Dense(x_ls)),
+            wiggle_knots: self.wiggle_knots.clone(),
+            wiggle_degree: self.wiggle_degree,
+        };
+        shadow.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)
+    }
+
+    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        let shadow = Self {
+            y: self.y.clone(),
+            weights: self.weights.clone(),
+            link_kind: self.link_kind.clone(),
+            threshold_design: Some(DesignMatrix::Dense(x_t)),
+            log_sigma_design: Some(DesignMatrix::Dense(x_ls)),
+            wiggle_knots: self.wiggle_knots.clone(),
+            wiggle_degree: self.wiggle_degree,
+        };
+        shadow.exact_newton_joint_hessian_second_directional_derivative(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+    }
+
+    fn exact_newton_joint_psi_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        // These three joint psi hooks are the wiggle family's exact
+        // likelihood-side contribution to the unified full [rho, psi] outer
+        // Hessian:
+        //
+        //   exact_newton_joint_psi_terms(...)                    -> D_a, D_{beta a}, D_{beta beta a}
+        //   exact_newton_joint_psi_second_order_terms(...)       -> D_ab, D_{beta ab}, D_{beta beta ab}
+        //   exact_newton_joint_psi_hessian_directional_derivative(...) -> T_a[u]
+        //
+        // Generic exact-joint code in custom_family.rs adds all realized
+        // penalty motion S_a / S_ab and combines these likelihood-only objects
+        // with the joint mode solves beta_i, beta_ij and the total Hessian
+        // drifts dot H_i, ddot H_ij. Keeping this contract explicit is what
+        // makes the wiggle family's full [rho, psi] Hessian real rather than a
+        // gradient-only or block-local surrogate.
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psi_terms_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            &x_t,
+            &x_ls,
+        )
+    }
+
+    fn exact_newton_joint_psi_second_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psi_second_order_terms_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_i,
+            psi_j,
+            &x_t,
+            &x_ls,
+        )
+    }
+
+    fn exact_newton_joint_psi_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_psi_hessian_directional_derivative_from_designs(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            d_beta_flat,
+            &x_t,
+            &x_ls,
+        )
     }
 
     fn known_link_wiggle(&self) -> Option<KnownLinkWiggle> {
@@ -7288,6 +8820,7 @@ mod tests {
             log_step: std::f64::consts::LN_2,
             min_length_scale: 0.1,
             max_length_scale: 2.0,
+            allow_finite_difference_fallback: false,
         }
     }
 
@@ -7369,7 +8902,46 @@ mod tests {
     }
 
     #[test]
-    fn binomial_location_scale_exact_newton_spatial_joint_hyper_evaluates_finitely() {
+    fn binomial_location_scale_wiggle_term_builder_requires_exact_spatial_joint_path() {
+        let n = 8usize;
+        let q_seed = Array1::linspace(-1.25, 1.25, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::build_wiggle_block_input(
+            q_seed.view(),
+            2,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let builder = BinomialLocationScaleWiggleTermBuilder {
+            y: Array1::from_elem(n, 0.0),
+            weights: Array1::from_elem(n, 1.0),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            mean_spec: simple_matern_term_collection(&[0, 1], 0.4),
+            noise_spec: simple_matern_term_collection(&[0, 1], 0.75),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+            wiggle_block,
+        };
+        assert!(builder.exact_spatial_joint_supported());
+        assert!(builder.require_exact_spatial_joint());
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
+        }
+        let mean_design =
+            build_term_collection_design(data.view(), builder.mean_spec()).expect("mean design");
+        let noise_design =
+            build_term_collection_design(data.view(), builder.noise_spec()).expect("noise design");
+        let family = builder.build_family(&mean_design, &noise_design);
+        assert!(family.exact_joint_supported());
+        assert!(family.requires_joint_outer_hyper_path());
+    }
+
+    #[test]
+    fn binomial_location_scale_exact_newton_spatial_joint_hyper_returns_full_hessian() {
         let n = 12usize;
         let mut data = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
@@ -7424,11 +8996,225 @@ mod tests {
             &rho,
             &derivative_blocks,
             None,
-            false,
+            true,
         )
         .expect("exact spatial joint hyper eval");
         assert!(eval.objective.is_finite());
         assert!(eval.gradient.iter().all(|v| v.is_finite()));
+        let hess = eval
+            .outer_hessian
+            .expect("exact spatial joint hyper path should return a full [rho, psi] hessian");
+        let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
+        let theta_dim = rho.len() + psi_dim;
+        assert_eq!(hess.nrows(), theta_dim);
+        assert_eq!(hess.ncols(), theta_dim);
+    }
+
+    #[test]
+    fn binomial_location_scale_wiggle_exact_newton_spatial_joint_hyper_returns_full_hessian() {
+        let n = 14usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (2.25 * std::f64::consts::PI * t).sin();
+        }
+        let y =
+            Array1::from_iter((0..n).map(|i| if i % 3 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let mean_spec = simple_matern_term_collection(&[0, 1], 0.45);
+        let noise_spec = simple_matern_term_collection(&[0, 1], 0.8);
+        let q_seed = Array1::linspace(-1.5, 1.5, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::build_wiggle_block_input(
+            q_seed.view(),
+            2,
+            4,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let builder = BinomialLocationScaleWiggleTermBuilder {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            mean_spec: mean_spec.clone(),
+            noise_spec: noise_spec.clone(),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+            wiggle_block,
+        };
+        let mean_design =
+            build_term_collection_design(data.view(), &mean_spec).expect("build mean design");
+        let noise_design =
+            build_term_collection_design(data.view(), &noise_spec).expect("build noise design");
+        let mean_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(&mean_spec, &mean_design)
+                .expect("freeze mean spec");
+        let noise_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(&noise_spec, &noise_design)
+                .expect("freeze noise spec");
+        let rho = compose_theta_from_hints(
+            &mean_design,
+            &noise_design,
+            &None,
+            &None,
+            &builder.extra_rho0().expect("wiggle rho0"),
+        );
+        let blocks = builder
+            .build_blocks(&rho, &mean_design, &noise_design, None, None)
+            .expect("build blocks");
+        let family = builder.build_family(&mean_design, &noise_design);
+        let derivative_blocks = builder
+            .build_psi_derivative_blocks(
+                data.view(),
+                &mean_spec_resolved,
+                &noise_spec_resolved,
+                &mean_design,
+                &noise_design,
+            )
+            .expect("psi derivative blocks");
+        let eval = evaluate_custom_family_joint_hyper(
+            &family,
+            &blocks,
+            &BlockwiseFitOptions {
+                use_reml_objective: true,
+                outer_max_iter: 1,
+                ..BlockwiseFitOptions::default()
+            },
+            &rho,
+            &derivative_blocks,
+            None,
+            true,
+        )
+        .expect("exact wiggle spatial joint hyper eval");
+        assert!(eval.objective.is_finite());
+        assert!(eval.gradient.iter().all(|v| v.is_finite()));
+        let hess = eval
+            .outer_hessian
+            .expect("exact wiggle spatial joint hyper path should return a full [rho, psi] hessian");
+        let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
+        let theta_dim = rho.len() + psi_dim;
+        assert_eq!(hess.nrows(), theta_dim);
+        assert_eq!(hess.ncols(), theta_dim);
+    }
+
+    #[test]
+    fn binomial_location_scale_wiggle_family_exposes_joint_psi_hook_surface() {
+        let n = 12usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = (1.75 * std::f64::consts::PI * t).cos();
+        }
+        let y =
+            Array1::from_iter((0..n).map(|i| if i % 4 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
+        let weights = Array1::from_elem(n, 1.0);
+        let mean_spec = simple_matern_term_collection(&[0, 1], 0.4);
+        let noise_spec = simple_matern_term_collection(&[0, 1], 0.7);
+        let q_seed = Array1::linspace(-1.25, 1.25, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::build_wiggle_block_input(
+            q_seed.view(),
+            2,
+            3,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let builder = BinomialLocationScaleWiggleTermBuilder {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            mean_spec: mean_spec.clone(),
+            noise_spec: noise_spec.clone(),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+            wiggle_block,
+        };
+        let mean_design =
+            build_term_collection_design(data.view(), &mean_spec).expect("build mean design");
+        let noise_design =
+            build_term_collection_design(data.view(), &noise_spec).expect("build noise design");
+        let mean_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(&mean_spec, &mean_design)
+                .expect("freeze mean spec");
+        let noise_spec_resolved =
+            freeze_spatial_length_scale_terms_from_design(&noise_spec, &noise_design)
+                .expect("freeze noise spec");
+        let rho = compose_theta_from_hints(
+            &mean_design,
+            &noise_design,
+            &None,
+            &None,
+            &builder.extra_rho0().expect("wiggle rho0"),
+        );
+        let blocks = builder
+            .build_blocks(&rho, &mean_design, &noise_design, None, None)
+            .expect("build blocks");
+        let family = builder.build_family(&mean_design, &noise_design);
+        let fit = fit_custom_family(
+            &family,
+            &blocks,
+            &BlockwiseFitOptions {
+                use_reml_objective: true,
+                outer_max_iter: 1,
+                ..BlockwiseFitOptions::default()
+            },
+        )
+        .expect("fit wiggle family for joint psi hooks");
+        let derivative_blocks = builder
+            .build_psi_derivative_blocks(
+                data.view(),
+                &mean_spec_resolved,
+                &noise_spec_resolved,
+                &mean_design,
+                &noise_design,
+            )
+            .expect("psi derivative blocks");
+        let psi_terms = family
+            .exact_newton_joint_psi_terms(&fit.block_states, &blocks, &derivative_blocks, 0)
+            .expect("joint psi terms call")
+            .expect("wiggle family should return joint psi terms");
+        let psi2_terms = family
+            .exact_newton_joint_psi_second_order_terms(
+                &fit.block_states,
+                &blocks,
+                &derivative_blocks,
+                0,
+                0,
+            )
+            .expect("joint psi second-order call")
+            .expect("wiggle family should return joint psi second-order terms");
+        let total = fit
+            .block_states
+            .iter()
+            .map(|state| state.beta.len())
+            .sum::<usize>();
+        assert_eq!(psi_terms.score_psi.len(), total);
+        assert_eq!(psi_terms.hessian_psi.dim(), (total, total));
+        assert_eq!(psi2_terms.score_psi_psi.len(), total);
+        assert_eq!(psi2_terms.hessian_psi_psi.dim(), (total, total));
+
+        let mut d_beta_flat = Array1::<f64>::zeros(total);
+        let mut at = 0usize;
+        for state in &fit.block_states {
+            let end = at + state.beta.len();
+            d_beta_flat
+                .slice_mut(s![at..end])
+                .assign(&state.beta.mapv(|v| 0.25 * v + 0.1));
+            at = end;
+        }
+        let mixed = family
+            .exact_newton_joint_psi_hessian_directional_derivative(
+                &fit.block_states,
+                &blocks,
+                &derivative_blocks,
+                0,
+                &d_beta_flat,
+            )
+            .expect("joint psi mixed drift call")
+            .expect("wiggle family should return joint psi mixed drift");
+        assert_eq!(mixed.dim(), (total, total));
     }
 
     #[test]

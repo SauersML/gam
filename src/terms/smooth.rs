@@ -15,21 +15,20 @@ use crate::custom_family::{
     BlockGeometryDirectionalDerivative, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
     CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
     ExactNewtonOuterObjective, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    evaluate_custom_family_joint_hyper, fit_custom_family, symmetrize_dense_in_place,
+    evaluate_custom_family_joint_hyper, fit_custom_family,
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitOptions, FitResult,
     compute_external_joint_hyper_cost_gradient_hessian, fit_gam_with_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv};
+use crate::faer_ndarray::fast_atv;
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::mixture_link::{state_from_beta_logistic_spec, state_from_sas_spec, state_from_spec};
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
 use crate::types::{InverseLink, LikelihoodFamily, MixtureLinkState, SasLinkState};
-use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, MaxIterations, NewtonTrustRegion,
@@ -565,6 +564,11 @@ pub struct SpatialLengthScaleOptimizationOptions {
     pub min_length_scale: f64,
     /// Maximum allowed length_scale during κ search.
     pub max_length_scale: f64,
+    /// Allow the legacy finite-difference / coordinate-search spatial optimizer.
+    ///
+    /// This is intentionally opt-in. The default exact spatial path should not
+    /// silently degrade to the older finite-difference search.
+    pub allow_finite_difference_fallback: bool,
 }
 
 pub type MaternKappaOptimizationOptions = SpatialLengthScaleOptimizationOptions;
@@ -579,6 +583,7 @@ impl Default for SpatialLengthScaleOptimizationOptions {
             log_step: std::f64::consts::LN_2,
             min_length_scale: 1e-3,
             max_length_scale: 1e3,
+            allow_finite_difference_fallback: false,
         }
     }
 }
@@ -7380,15 +7385,17 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
     // penalty blocks S change, so each κ proposal rebuilds the spatial basis.
     //
     // When exact derivative information is available for the rebuilt basis and
-    // penalty, κ is promoted to a first-class outer hyperparameter beside
+    // penalty, kappa is promoted to a first-class outer hyperparameter beside
     // rho = log(lambda). In that mode this routine runs a joint outer solve in
-    // theta = [rho, psi], where psi = log(kappa) = -log(length_scale), using the
-    // exact directional hyper-gradient path in `reml.rs`.
+    // theta = [rho, psi], where psi = log(kappa) = -log(length_scale), and the
+    // optimizer is expected to consume a real joint Hessian. NewtonTrustRegion
+    // and ARC are not meant to run on a gradient-only surrogate here.
     //
-    // Only Matérn terms participate in this outer solve.
+    // Only Matern terms participate in this outer solve.
     // If an eligible spatial basis does not expose exact log-kappa derivatives,
-    // this routine falls back to a real bounded coordinate search over
-    // log(length_scale), refitting the model at each proposal.
+    // the default behavior is now to fail rather than silently degrade to the
+    // older bounded coordinate-search path. That legacy fallback remains
+    // available only when explicitly enabled in the spatial options.
     let mut resolved_spec = spec.clone();
     let spatial_terms = spatial_length_scale_term_indices(&resolved_spec);
     let n = data.nrows();
@@ -7480,6 +7487,12 @@ pub fn fit_term_collection_with_spatial_length_scale_optimization(
                 resolved_spec,
                 adaptive_diagnostics: best.adaptive_diagnostics,
             });
+        }
+        if !kappa_options.allow_finite_difference_fallback {
+            return Err(EstimationError::InvalidInput(
+                "exact joint spatial length-scale path is unavailable and finite-difference fallback is disabled by default"
+                    .to_string(),
+            ));
         }
         log::debug!(
             "[spatial-kappa] exact joint path unavailable for one or more spatial terms; \
@@ -8709,6 +8722,7 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
+                allow_finite_difference_fallback: true,
             },
         )
         .expect("optimized fit should succeed");
@@ -8785,6 +8799,7 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
+                allow_finite_difference_fallback: true,
             },
             |mean_design, noise_design| {
                 Ok(mean_design.design.ncols() as f64
@@ -9048,6 +9063,7 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
+                allow_finite_difference_fallback: true,
             },
         )
         .expect("optimized fit should succeed");
@@ -9139,6 +9155,7 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
+                allow_finite_difference_fallback: true,
             },
         )
         .expect("binomial-logit Matérn spatial κ optimization should succeed");
@@ -9198,6 +9215,7 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
+                allow_finite_difference_fallback: true,
             },
             |cand_spec| {
                 let design = build_term_collection_design(data.view(), cand_spec)?;
@@ -9358,6 +9376,7 @@ mod tests {
                 log_step: std::f64::consts::LN_2,
                 min_length_scale: 1e-3,
                 max_length_scale: 1e3,
+                allow_finite_difference_fallback: true,
             },
             |mean_design, noise_design| {
                 Ok(mean_design.design.ncols() as f64
