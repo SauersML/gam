@@ -7304,7 +7304,11 @@ where
                             )
                         })
                         .unwrap_or((0, 0, false, false));
-                    if !cost_finite || !grad_finite || !hessian_present || !hess_shape_ok || !hess_finite
+                    if !cost_finite
+                        || !grad_finite
+                        || !hessian_present
+                        || !hess_shape_ok
+                        || !hess_finite
                     {
                         return Err(ObjectiveEvalError::recoverable(format!(
                             "exact-joint spatial objective/gradient/hessian became non-finite or incomplete: cost_finite={cost_finite}, grad_all_finite={grad_finite}, hessian_present={hessian_present}, hessian_shape={}x{} expected {}x{}, hessian_all_finite={hess_finite}",
@@ -7342,7 +7346,9 @@ where
         Ok(sol) => sol,
         Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
         Err(err) => {
-            return Err(format!("two-block exact joint spatial optimization failed: {err}"));
+            return Err(format!(
+                "two-block exact joint spatial optimization failed: {err}"
+            ));
         }
     };
 
