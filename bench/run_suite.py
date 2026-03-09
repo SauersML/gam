@@ -3274,12 +3274,11 @@ def _extract_thread3_adaptive_fold_metrics(model_payload: dict | None, ds: dict)
 
 
 def _rust_survival_fit_options_for_scenario(scenario_name):
-    # Use a flexible time basis by default. The linear log-time basis underfits
-    # the baseline hazard on ICU benchmarks and hurts native survival
-    # calibration even when ranking is acceptable.
+    # Survival time effects must use a structurally monotone basis so the
+    # fitted cumulative baseline cannot violate survival semantics.
     if scenario_name in {"icu_survival_death", "icu_survival_los"}:
         return {
-            "time_basis": "bspline",
+            "time_basis": "ispline",
             "time_degree": 3,
             "time_num_internal_knots": 10,
             "time_smooth_lambda": 5e-2,
@@ -3287,7 +3286,7 @@ def _rust_survival_fit_options_for_scenario(scenario_name):
         }
     if scenario_name in {"heart_failure_survival", "cirrhosis_survival"}:
         return {
-            "time_basis": "bspline",
+            "time_basis": "ispline",
             "time_degree": 3,
             "time_num_internal_knots": 8,
             "time_smooth_lambda": 1e-2,
@@ -3295,14 +3294,14 @@ def _rust_survival_fit_options_for_scenario(scenario_name):
         }
     if scenario_name == "haberman_survival":
         return {
-            "time_basis": "bspline",
+            "time_basis": "ispline",
             "time_degree": 3,
             "time_num_internal_knots": 6,
             "time_smooth_lambda": 2e-2,
             "ridge_lambda": 1e-6,
         }
     return {
-        "time_basis": "bspline",
+        "time_basis": "ispline",
         "time_degree": 3,
         "time_num_internal_knots": 8,
         "time_smooth_lambda": 1e-2,
@@ -3401,6 +3400,11 @@ def run_rust_scenario_cv(
     scenario_name = scenario["name"]
     if ds is None:
         ds = dataset_for_scenario(scenario)
+    if ds["family"] == "survival":
+        raise RuntimeError(
+            "run_rust_scenario_cv does not support survival scenarios; "
+            "use run_rust_gamlss_survival_cv instead"
+        )
     if folds is None:
         folds = folds_for_dataset(ds)
 
@@ -6812,15 +6816,15 @@ def main():
         _assert_basis_parity_for_scenario(s_cfg, ds=ds)
         with tempfile.TemporaryDirectory(prefix="gam_bench_shared_folds_", dir=str(BENCH_DIR)) as shared_td:
             shared_fold_artifacts = build_shared_fold_artifacts(ds, folds, Path(shared_td))
-            # Invariant: Rust GAM must run for every scenario, including survival.
-            results.append(
-                run_rust_scenario_cv(
-                    s_cfg,
-                    ds=ds,
-                    folds=folds,
-                    shared_fold_artifacts=shared_fold_artifacts,
+            if ds["family"] != "survival":
+                results.append(
+                    run_rust_scenario_cv(
+                        s_cfg,
+                        ds=ds,
+                        folds=folds,
+                        shared_fold_artifacts=shared_fold_artifacts,
+                    )
                 )
-            )
             if _is_matern_rust_scenario(s_cfg):
                 results.append(
                     run_rust_scenario_cv(
@@ -7011,12 +7015,16 @@ def main():
 
     for s_cfg in scenarios:
         s_name = s_cfg["name"]
-        has_rust = any(
-            r.get("scenario_name") == s_name and r.get("contender") == "rust_gam"
+        ds = dataset_for_scenario(s_cfg)
+        required_contender = "rust_gamlss_survival" if ds["family"] == "survival" else "rust_gam"
+        has_required = any(
+            r.get("scenario_name") == s_name and r.get("contender") == required_contender
             for r in results
         )
-        if not has_rust:
-            raise SystemExit(f"missing required rust_gam result for scenario '{s_name}'")
+        if not has_required:
+            raise SystemExit(
+                f"missing required {required_contender} result for scenario '{s_name}'"
+            )
 
     # Hard guard: benchmark runs must fail in CI for blocking contender failures.
     # Non-blocking contenders still emit failed rows in the output for diagnostics.

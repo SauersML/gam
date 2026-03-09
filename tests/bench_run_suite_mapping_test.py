@@ -135,7 +135,9 @@ class RunSuiteMappingTests(unittest.TestCase):
                 _RUN_SUITE.folds_for_dataset = lambda _ds: []
                 _RUN_SUITE._assert_basis_parity_for_scenario = lambda *args, **kwargs: None
                 _RUN_SUITE.build_shared_fold_artifacts = lambda *args, **kwargs: []
-                _RUN_SUITE._is_contender_enabled = lambda *_args, **_kwargs: False
+                _RUN_SUITE._is_contender_enabled = (
+                    lambda _scenario, contender: contender == "rust_gamlss_survival"
+                )
                 _RUN_SUITE.generate_scenario_figures = lambda *_args, **_kwargs: []
                 _RUN_SUITE.zip_figure_dir = lambda *_args, **_kwargs: None
                 _RUN_SUITE.main()
@@ -152,6 +154,109 @@ class RunSuiteMappingTests(unittest.TestCase):
 
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0], ["--adaptive-regularization", "true"])
+
+    def test_survival_benchmark_fit_options_require_structural_ispline_basis(self) -> None:
+        expected = {
+            "haberman_survival": 6,
+            "icu_survival_death": 10,
+            "icu_survival_los": 10,
+            "heart_failure_survival": 8,
+            "cirrhosis_survival": 8,
+        }
+        for scenario_name, expected_knots in expected.items():
+            with self.subTest(scenario_name=scenario_name):
+                cfg = _RUN_SUITE._rust_survival_fit_options_for_scenario(scenario_name)
+                self.assertEqual(cfg["time_basis"], "ispline")
+                self.assertEqual(cfg["time_degree"], 3)
+                self.assertEqual(cfg["time_num_internal_knots"], expected_knots)
+                self.assertGreaterEqual(cfg["time_smooth_lambda"], 0.0)
+
+    def test_survival_benchmark_cli_args_emit_ispline(self) -> None:
+        args = _RUN_SUITE._rust_survival_fit_cli_args("icu_survival_death")
+        self.assertIn("--time-basis", args)
+        idx = args.index("--time-basis")
+        self.assertEqual(args[idx + 1], "ispline")
+
+    def test_run_rust_scenario_cv_rejects_survival_misuse(self) -> None:
+        scenario = {"name": "heart_failure_survival"}
+        ds = _RUN_SUITE.dataset_for_scenario(scenario)
+        with self.assertRaisesRegex(RuntimeError, "run_rust_gamlss_survival_cv"):
+            _RUN_SUITE.run_rust_scenario_cv(scenario, ds=ds, folds=[])
+
+    def test_main_does_not_schedule_rust_gam_for_survival_scenarios(self) -> None:
+        seen = []
+        orig_run = _RUN_SUITE.run_rust_scenario_cv
+        orig_run_gamlss_survival = _RUN_SUITE.run_rust_gamlss_survival_cv
+        orig_parse_args = _RUN_SUITE.argparse.ArgumentParser.parse_args
+        orig_dataset = _RUN_SUITE.dataset_for_scenario
+        orig_folds = _RUN_SUITE.folds_for_dataset
+        orig_assert_parity = _RUN_SUITE._assert_basis_parity_for_scenario
+        orig_shared = _RUN_SUITE.build_shared_fold_artifacts
+        orig_enabled = _RUN_SUITE._is_contender_enabled
+        orig_figures = _RUN_SUITE.generate_scenario_figures
+        orig_zip = _RUN_SUITE.zip_figure_dir
+        try:
+            def _fake_run_rust_scenario_cv(*args, **kwargs):
+                seen.append(("rust_gam", kwargs.get("contender_name", "rust_gam")))
+                return {
+                    "status": "ok",
+                    "scenario_name": "heart_failure_survival",
+                    "contender": "rust_gam",
+                    "model_spec": "5-fold CV",
+                }
+
+            def _fake_run_rust_gamlss_survival_cv(*args, **kwargs):
+                seen.append(("survival", "rust_gamlss_survival"))
+                return {
+                    "status": "ok",
+                    "scenario_name": "heart_failure_survival",
+                    "contender": "rust_gamlss_survival",
+                    "model_spec": "5-fold CV",
+                }
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                scenario_path = td_path / "scenarios.json"
+                out_path = td_path / "results.json"
+                scenario_path.write_text(json.dumps({"scenarios": [{"name": "heart_failure_survival"}]}))
+
+                _RUN_SUITE.run_rust_scenario_cv = _fake_run_rust_scenario_cv
+                _RUN_SUITE.run_rust_gamlss_survival_cv = _fake_run_rust_gamlss_survival_cv
+                _RUN_SUITE.argparse.ArgumentParser.parse_args = lambda _self: SimpleNamespace(
+                    scenarios=scenario_path,
+                    out=out_path,
+                    scenario_names=None,
+                )
+                _RUN_SUITE.dataset_for_scenario = lambda _scenario: {
+                    "rows": [{"time": 1.0, "event": 1.0, "x": 0.0}],
+                    "features": ["x"],
+                    "family": "survival",
+                    "time_col": "time",
+                    "event_col": "event",
+                }
+                _RUN_SUITE.folds_for_dataset = lambda _ds: []
+                _RUN_SUITE._assert_basis_parity_for_scenario = lambda *args, **kwargs: None
+                _RUN_SUITE.build_shared_fold_artifacts = lambda *args, **kwargs: []
+                _RUN_SUITE._is_contender_enabled = (
+                    lambda _scenario, contender: contender == "rust_gamlss_survival"
+                )
+                _RUN_SUITE.generate_scenario_figures = lambda *_args, **_kwargs: []
+                _RUN_SUITE.zip_figure_dir = lambda *_args, **_kwargs: None
+                _RUN_SUITE.main()
+        finally:
+            _RUN_SUITE.run_rust_scenario_cv = orig_run
+            _RUN_SUITE.run_rust_gamlss_survival_cv = orig_run_gamlss_survival
+            _RUN_SUITE.argparse.ArgumentParser.parse_args = orig_parse_args
+            _RUN_SUITE.dataset_for_scenario = orig_dataset
+            _RUN_SUITE.folds_for_dataset = orig_folds
+            _RUN_SUITE._assert_basis_parity_for_scenario = orig_assert_parity
+            _RUN_SUITE.build_shared_fold_artifacts = orig_shared
+            _RUN_SUITE._is_contender_enabled = orig_enabled
+            _RUN_SUITE.generate_scenario_figures = orig_figures
+            _RUN_SUITE.zip_figure_dir = orig_zip
+
+        self.assertNotIn(("rust_gam", "rust_gam"), seen)
+        self.assertIn(("survival", "rust_gamlss_survival"), seen)
 
 
 if __name__ == "__main__":

@@ -1414,13 +1414,7 @@ fn run_predict_survival(
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let t0_raw = data[[i, entry_col]];
-        let t1_raw = data[[i, exit_col]];
-        if !t0_raw.is_finite() || !t1_raw.is_finite() {
-            return Err(format!("non-finite survival times at row {}", i + 1));
-        }
-        let t0 = t0_raw.max(1e-9);
-        let t1 = t1_raw.max(t0 + 1e-9);
+        let (t0, t1) = normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i)?;
         age_entry[i] = t0;
         age_exit[i] = t1;
     }
@@ -1433,10 +1427,7 @@ fn run_predict_survival(
             .unwrap_or("transformation"),
     )?;
     if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull {
-        require_structural_survival_time_basis(
-            &time_build.basis_name,
-            "saved survival sampling",
-        )?;
+        require_structural_survival_time_basis(&time_build.basis_name, "saved survival sampling")?;
     }
     let saved_likelihood_mode = parse_survival_likelihood_mode(
         model
@@ -2471,19 +2462,41 @@ struct SurvivalTimeBuildOutput {
     smooth_lambda: Option<f64>,
 }
 
+const SURVIVAL_TIME_FLOOR: f64 = 1e-9;
+
+fn normalize_survival_time_pair(
+    entry_raw: f64,
+    exit_raw: f64,
+    row_index: usize,
+) -> Result<(f64, f64), String> {
+    if !entry_raw.is_finite() || !exit_raw.is_finite() {
+        return Err(format!(
+            "non-finite survival times at row {}",
+            row_index + 1
+        ));
+    }
+    if entry_raw < 0.0 || exit_raw < 0.0 {
+        return Err(format!("negative survival times at row {}", row_index + 1));
+    }
+
+    let entry = entry_raw.max(SURVIVAL_TIME_FLOOR);
+    let exit = exit_raw.max(entry + SURVIVAL_TIME_FLOOR);
+    Ok((entry, exit))
+}
+
 fn survival_basis_supports_structural_monotonicity(basis_name: &str) -> bool {
     basis_name.eq_ignore_ascii_case("ispline")
 }
 
-fn require_structural_survival_time_basis(
-    basis_name: &str,
-    context: &str,
-) -> Result<(), String> {
+fn require_structural_survival_time_basis(basis_name: &str, context: &str) -> Result<(), String> {
     if survival_basis_supports_structural_monotonicity(basis_name) {
         return Ok(());
     }
     Err(format!(
-        "{context} requires a structural monotone survival time basis; got '{basis_name}'. Use --time-basis ispline."
+        "{context} requires a structural monotone survival time basis, but got '{basis_name}'. \
+Only `ispline` is accepted here because its basis functions enforce a monotone cumulative time effect by construction. \
+`{basis_name}` can fit non-monotone shapes, which can break survival semantics. \
+Re-run with `--time-basis ispline`."
     ))
 }
 
@@ -2677,13 +2690,14 @@ fn parse_survival_time_basis_config(
                 smooth_lambda: args.time_smooth_lambda,
             })
         }
-        "linear" | "bspline" => Err(format!(
-            "survival monotone time basis must be structural; got '{}'. Use --time-basis ispline.",
-            args.time_basis
-        )),
-        other => Err(format!(
-            "unsupported --time-basis '{other}'; use ispline"
-        )),
+        "linear" | "bspline" => {
+            require_structural_survival_time_basis(
+                &args.time_basis,
+                "survival model configuration",
+            )?;
+            unreachable!("non-structural survival basis unexpectedly validated");
+        }
+        other => Err(format!("unsupported --time-basis '{other}'; use ispline")),
     }
 }
 
@@ -2742,12 +2756,36 @@ fn build_survival_time_basis(
     cfg: SurvivalTimeBasisConfig,
     infer_knots_if_needed: Option<(usize, f64)>,
 ) -> Result<SurvivalTimeBuildOutput, String> {
+    fn checked_log_survival_times(times: &Array1<f64>, label: &str) -> Result<Array1<f64>, String> {
+        if let Some(row) = times.iter().position(|t| !t.is_finite()) {
+            return Err(format!(
+                "survival time basis requires finite {label} times (row {})",
+                row + 1
+            ));
+        }
+        if let Some(row) = times.iter().position(|t| *t < 0.0) {
+            return Err(format!(
+                "survival time basis requires non-negative {label} times (row {})",
+                row + 1
+            ));
+        }
+        Ok(times.mapv(|t| t.max(SURVIVAL_TIME_FLOOR).ln()))
+    }
+
     let n = age_entry.len();
     if n != age_exit.len() {
         return Err("survival time basis requires matching entry/exit lengths".to_string());
     }
-    let log_entry = age_entry.mapv(|t| t.max(1e-9).ln());
-    let log_exit = age_exit.mapv(|t| t.max(1e-9).ln());
+    for i in 0..n {
+        if age_exit[i] < age_entry[i] {
+            return Err(format!(
+                "survival time basis requires exit times >= entry times (row {})",
+                i + 1
+            ));
+        }
+    }
+    let log_entry = checked_log_survival_times(age_entry, "entry")?;
+    let log_exit = checked_log_survival_times(age_exit, "exit")?;
 
     fn infer_survival_time_knots(
         combined: &Array1<f64>,
@@ -2755,10 +2793,61 @@ fn build_survival_time_basis(
         num_internal_knots: usize,
         basis_options: BasisOptions,
     ) -> Result<Array1<f64>, String> {
-        fn should_retry_with_uniform(err: &str) -> bool {
-            err.contains("distinct interior support")
-                || err.contains("non-interior knot")
-                || err.contains("Data range has zero width")
+        fn quantile_knot_inference_needs_uniform_fallback(
+            combined: &Array1<f64>,
+            num_internal_knots: usize,
+        ) -> bool {
+            if num_internal_knots == 0 || combined.is_empty() {
+                return false;
+            }
+
+            let mut sorted: Vec<f64> = combined.iter().copied().collect();
+            sorted.sort_by(f64::total_cmp);
+            let min_val = sorted[0];
+            let max_val = *sorted.last().unwrap_or(&min_val);
+            if min_val == max_val {
+                return false;
+            }
+
+            let scale = (max_val - min_val).abs().max(1.0);
+            let tol = 1e-12 * scale;
+            let mut support = Vec::with_capacity(sorted.len());
+            let mut last: Option<f64> = None;
+            for &x in &sorted {
+                if x <= min_val + tol || x >= max_val - tol {
+                    continue;
+                }
+                if last.map(|prev| (x - prev).abs() <= tol).unwrap_or(false) {
+                    continue;
+                }
+                support.push(x);
+                last = Some(x);
+            }
+            if support.is_empty() {
+                return true;
+            }
+
+            let n = support.len();
+            let mut prev_q = min_val;
+            for j in 1..=num_internal_knots {
+                let p = j as f64 / (num_internal_knots + 1) as f64;
+                let pos = p * (n.saturating_sub(1) as f64);
+                let lo = pos.floor() as usize;
+                let hi = pos.ceil() as usize;
+                let frac = pos - lo as f64;
+                let q = if lo == hi {
+                    support[lo]
+                } else {
+                    support[lo] * (1.0 - frac) + support[hi] * frac
+                }
+                .clamp(min_val, max_val);
+                if q <= prev_q + tol || q >= max_val - tol {
+                    return true;
+                }
+                prev_q = q;
+            }
+
+            false
         }
 
         let infer_with =
@@ -2796,12 +2885,10 @@ fn build_survival_time_basis(
                 Ok(knots)
             };
 
-        match infer_with(gam::basis::BSplineKnotPlacement::Quantile) {
-            Ok(knots) => Ok(knots),
-            Err(err) if should_retry_with_uniform(&err) => {
-                infer_with(gam::basis::BSplineKnotPlacement::Uniform)
-            }
-            Err(err) => Err(err),
+        if quantile_knot_inference_needs_uniform_fallback(combined, num_internal_knots) {
+            infer_with(gam::basis::BSplineKnotPlacement::Uniform)
+        } else {
+            infer_with(gam::basis::BSplineKnotPlacement::Quantile)
         }
     }
 
@@ -2815,7 +2902,7 @@ fn build_survival_time_basis(
                 x_exit_time[[i, 0]] = 1.0;
                 x_entry_time[[i, 1]] = log_entry[i];
                 x_exit_time[[i, 1]] = log_exit[i];
-                x_derivative_time[[i, 1]] = 1.0 / age_exit[i].max(1e-9);
+                x_derivative_time[[i, 1]] = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
             }
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time,
@@ -2889,7 +2976,7 @@ fn build_survival_time_basis(
                     &mut deriv_buf,
                 )
                 .map_err(|e| format!("failed to evaluate bspline derivative: {e}"))?;
-                let chain = 1.0 / age_exit[i].max(1e-9);
+                let chain = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
                 for j in 0..p_time {
                     x_derivative_time[[i, j]] = deriv_buf[j] * chain;
                 }
@@ -3013,7 +3100,7 @@ fn build_survival_time_basis(
                     running += db_exit[[i, j]];
                     d_i_log_full[j - 1] = running;
                 }
-                let chain = 1.0 / age_exit[i].max(1e-9);
+                let chain = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
                 for (j_new, &j_old) in keep_cols.iter().enumerate() {
                     d_i_log[j_new] = d_i_log_full[j_old];
                     x_derivative_time[[i, j_new]] = d_i_log[j_new] * chain;
@@ -3423,14 +3510,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let weights = Array1::<f64>::ones(n);
 
     for i in 0..n {
-        let t0_raw = ds.values[[i, entry_col]];
-        let t1_raw = ds.values[[i, exit_col]];
+        let (t0, t1) =
+            normalize_survival_time_pair(ds.values[[i, entry_col]], ds.values[[i, exit_col]], i)?;
         let ev = ds.values[[i, event_col]];
-        if !t0_raw.is_finite() || !t1_raw.is_finite() {
-            return Err(format!("non-finite survival times at row {}", i + 1));
-        }
-        let t0 = t0_raw.max(1e-9);
-        let t1 = t1_raw.max(t0 + 1e-9);
         age_entry[i] = t0;
         age_exit[i] = t1;
         event_target[i] = if ev >= 0.5 { 1 } else { 0 };
@@ -3447,10 +3529,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         )),
     )?;
     if likelihood_mode != SurvivalLikelihoodMode::Weibull {
-        require_structural_survival_time_basis(
-            &time_build.basis_name,
-            "survival fitting",
-        )?;
+        require_structural_survival_time_basis(&time_build.basis_name, "survival fitting")?;
     }
     let p_time = time_build.x_exit_time.ncols();
     let p = p_time + p_cov;
@@ -4114,8 +4193,7 @@ fn run_sample_survival(
     let event_competing = Array1::<u8>::zeros(n);
     let weights = Array1::<f64>::ones(n);
     for i in 0..n {
-        let t0 = data[[i, entry_col]].max(1e-9);
-        let t1 = data[[i, exit_col]].max(t0 + 1e-9);
+        let (t0, t1) = normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i)?;
         age_entry[i] = t0;
         age_exit[i] = t1;
         event_target[i] = if data[[i, event_col]] >= 0.5 { 1 } else { 0 };
@@ -9263,12 +9341,25 @@ mod tests {
             .expect_err("linear survival time basis should be rejected");
         assert!(err.contains("structural"));
         assert!(err.contains("ispline"));
+        assert!(err.contains("survival semantics"));
 
         args.time_basis = "bspline".to_string();
         let err = parse_survival_time_basis_config(&args)
             .expect_err("bspline survival time basis should be rejected");
         assert!(err.contains("structural"));
         assert!(err.contains("ispline"));
+        assert!(err.contains("non-monotone"));
+    }
+
+    #[test]
+    fn structural_survival_basis_error_explains_why_bspline_is_rejected() {
+        let err = super::require_structural_survival_time_basis("bspline", "survival benchmark")
+            .expect_err("bspline should be rejected");
+        assert!(err.contains("survival benchmark"));
+        assert!(err.contains("Only `ispline` is accepted"));
+        assert!(err.contains("monotone cumulative time effect"));
+        assert!(err.contains("survival semantics"));
+        assert!(err.contains("`--time-basis ispline`"));
     }
 
     #[test]
@@ -9277,6 +9368,17 @@ mod tests {
         assert!(survival_basis_supports_structural_monotonicity("ISPLINE"));
         assert!(!survival_basis_supports_structural_monotonicity("linear"));
         assert!(!survival_basis_supports_structural_monotonicity("bspline"));
+    }
+
+    #[test]
+    fn normalize_survival_time_pair_rejects_invalid_raw_times() {
+        let err = super::normalize_survival_time_pair(1.0, f64::NAN, 2)
+            .expect_err("non-finite exit time should fail");
+        assert!(err.contains("non-finite survival times at row 3"));
+
+        let err = super::normalize_survival_time_pair(-1.0, 2.0, 4)
+            .expect_err("negative entry time should fail");
+        assert!(err.contains("negative survival times at row 5"));
     }
 
     #[test]
@@ -9703,7 +9805,7 @@ mod tests {
     }
 
     #[test]
-    fn survival_time_basis_inference_surfaces_nonfinite_quantile_errors() {
+    fn survival_time_basis_inference_rejects_nonfinite_times_before_knot_retry() {
         let age_entry = Array1::from_vec(vec![1e-9; 4]);
         let age_exit = Array1::from_vec(vec![0.5, 1.0, f64::NAN, 4.0]);
         let err = build_survival_time_basis(
@@ -9718,7 +9820,45 @@ mod tests {
         )
         .expect_err("non-finite times should not retry through uniform knots");
 
-        assert!(err.contains("quantile knot placement requires finite data"));
+        assert!(err.contains("survival time basis requires finite exit times (row 3)"));
+    }
+
+    #[test]
+    fn survival_time_basis_rejects_reversed_intervals_before_basis_construction() {
+        let age_entry = Array1::from_vec(vec![1.0, 3.0]);
+        let age_exit = Array1::from_vec(vec![2.0, 2.5]);
+        let err = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::BSpline {
+                degree: 3,
+                knots: Array1::zeros(0),
+                smooth_lambda: 1e-2,
+            },
+            Some((4, 1e-6)),
+        )
+        .expect_err("exit before entry should fail");
+
+        assert!(err.contains("survival time basis requires exit times >= entry times (row 2)"));
+    }
+
+    #[test]
+    fn survival_time_basis_zero_width_data_surfaces_range_error_without_uniform_retry() {
+        let age_entry = Array1::from_vec(vec![1.0; 4]);
+        let age_exit = Array1::from_vec(vec![1.0; 4]);
+        let err = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::BSpline {
+                degree: 3,
+                knots: Array1::zeros(0),
+                smooth_lambda: 1e-2,
+            },
+            Some((4, 1e-6)),
+        )
+        .expect_err("zero-width time support should fail");
+
+        assert!(err.contains("Data range has zero width"));
     }
 
     #[test]
