@@ -1,7 +1,8 @@
 use crate::faer_ndarray::{
-    FaerEigh, FaerLinalgError, FaerSvd, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
+    FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
     rrqr_nullspace_basis,
 };
+use crate::linalg::faer_ndarray::FaerSvd;
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
@@ -5309,26 +5310,6 @@ fn active_matern_double_penalty_derivatives(
         .collect()
 }
 
-fn active_primary_double_penalty_derivatives(
-    penalty_info: &[PenaltyInfo],
-    primary_derivative: &Array2<f64>,
-    label: &str,
-) -> Result<Vec<Array2<f64>>, BasisError> {
-    penalty_info
-        .iter()
-        .filter(|info| info.active)
-        .map(|info| match &info.source {
-            PenaltySource::Primary => Ok(primary_derivative.clone()),
-            PenaltySource::DoublePenaltyNullspace => {
-                Ok(Array2::<f64>::zeros(primary_derivative.raw_dim()))
-            }
-            other => Err(BasisError::InvalidInput(format!(
-                "unexpected {label} penalty source in primary/double-penalty path: {other:?}"
-            ))),
-        })
-        .collect()
-}
-
 pub fn build_matern_basis_log_kappa_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
@@ -6133,89 +6114,6 @@ fn build_duchon_design_psi_derivatives_with_workspace(
     Ok((out_psi, out_psi_psi))
 }
 
-fn build_duchon_primary_penalty_with_psi_derivatives(
-    centers: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-    identifiability_transform: Option<&Array2<f64>>,
-    workspace: &mut BasisWorkspace,
-) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>, f64), BasisError> {
-    let length_scale = spec.length_scale.ok_or_else(|| {
-        BasisError::InvalidInput(
-            "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale"
-                .to_string(),
-        )
-    })?;
-    let p_order = duchon_p_from_nullspace_order(spec.nullspace_order);
-    let s_order = spec.power;
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-    let z_kernel =
-        kernel_constraint_nullspace(centers, spec.nullspace_order, &mut workspace.cache)?;
-    let k = centers.nrows();
-    let poly_cols = polynomial_block_from_order(centers, spec.nullspace_order).ncols();
-    let kernel_cols = z_kernel.ncols();
-    let total_cols = kernel_cols + poly_cols;
-
-    let mut kernel = Array2::<f64>::zeros((k, k));
-    let mut kernel_psi = Array2::<f64>::zeros((k, k));
-    let mut kernel_psi_psi = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let mut dist2 = 0.0;
-            for axis in 0..centers.ncols() {
-                let delta = centers[[i, axis]] - centers[[j, axis]];
-                dist2 += delta * delta;
-            }
-            let r = dist2.sqrt();
-            let core = duchon_radial_core_psi_triplet(
-                r,
-                length_scale,
-                p_order,
-                s_order,
-                centers.ncols(),
-                &coeffs,
-            )?;
-            kernel[[i, j]] = core.phi.value;
-            kernel[[j, i]] = core.phi.value;
-            kernel_psi[[i, j]] = core.phi.psi;
-            kernel_psi[[j, i]] = core.phi.psi;
-            kernel_psi_psi[[i, j]] = core.phi.psi_psi;
-            kernel_psi_psi[[j, i]] = core.phi.psi_psi;
-        }
-    }
-
-    let zt_s = z_kernel.t().dot(&kernel);
-    let zt_s_psi = z_kernel.t().dot(&kernel_psi);
-    let zt_s_psi_psi = z_kernel.t().dot(&kernel_psi_psi);
-    let kernel = zt_s.dot(&z_kernel);
-    let kernel_psi = zt_s_psi.dot(&z_kernel);
-    let kernel_psi_psi = zt_s_psi_psi.dot(&z_kernel);
-
-    let mut s = Array2::<f64>::zeros((total_cols, total_cols));
-    let mut s_psi = Array2::<f64>::zeros((total_cols, total_cols));
-    let mut s_psi_psi = Array2::<f64>::zeros((total_cols, total_cols));
-    s.slice_mut(s![0..kernel_cols, 0..kernel_cols])
-        .assign(&kernel);
-    s_psi
-        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-        .assign(&kernel_psi);
-    s_psi_psi
-        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-        .assign(&kernel_psi_psi);
-
-    let (s, s_psi, s_psi_psi) = if let Some(zf) = identifiability_transform {
-        let zt_s = zf.t().dot(&s);
-        let zt_s_psi = zf.t().dot(&s_psi);
-        let zt_s_psi_psi = zf.t().dot(&s_psi_psi);
-        (zt_s.dot(zf), zt_s_psi.dot(zf), zt_s_psi_psi.dot(zf))
-    } else {
-        (s, s_psi, s_psi_psi)
-    };
-
-    let (s_norm, s_norm_psi, s_norm_psi_psi, c) =
-        normalize_penalty_with_psi_derivatives(&s, &s_psi, &s_psi_psi);
-    Ok((s_norm, s_norm_psi, s_norm_psi_psi, c))
-}
-
 pub fn build_duchon_basis_log_kappa_derivative(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -6244,34 +6142,14 @@ pub fn build_duchon_basis_log_kappa_derivative_with_workspace(
         identifiability_transform,
         workspace,
     )?;
-    let penalties_derivative = if base.penalty_info.iter().any(|info| {
-        matches!(
-            info.source,
-            PenaltySource::OperatorMass
-                | PenaltySource::OperatorTension
-                | PenaltySource::OperatorStiffness
-        )
-    }) {
-        let (all_penalty_deriv, _) = build_duchon_operator_penalty_psi_derivatives(
-            centers.view(),
-            spec,
-            identifiability_transform,
-            workspace,
-        )?;
-        active_operator_penalty_derivatives(&base.penalty_info, &all_penalty_deriv, "Duchon")?
-    } else {
-        let (_, primary_derivative, _, _) = build_duchon_primary_penalty_with_psi_derivatives(
-            centers.view(),
-            spec,
-            identifiability_transform,
-            workspace,
-        )?;
-        active_primary_double_penalty_derivatives(
-            &base.penalty_info,
-            &primary_derivative,
-            "Duchon",
-        )?
-    };
+    let (all_penalty_deriv, _) = build_duchon_operator_penalty_psi_derivatives(
+        centers.view(),
+        spec,
+        identifiability_transform,
+        workspace,
+    )?;
+    let penalties_derivative =
+        active_operator_penalty_derivatives(&base.penalty_info, &all_penalty_deriv, "Duchon")?;
     Ok(BasisPsiDerivativeResult {
         design_derivative,
         penalties_derivative,
@@ -6306,39 +6184,17 @@ pub fn build_duchon_basis_log_kappa_second_derivative_with_workspace(
         identifiability_transform,
         workspace,
     )?;
-    let penalties_second_derivative = if base.penalty_info.iter().any(|info| {
-        matches!(
-            info.source,
-            PenaltySource::OperatorMass
-                | PenaltySource::OperatorTension
-                | PenaltySource::OperatorStiffness
-        )
-    }) {
-        let (_, all_penalty_second_deriv) = build_duchon_operator_penalty_psi_derivatives(
-            centers.view(),
-            spec,
-            identifiability_transform,
-            workspace,
-        )?;
-        active_operator_penalty_derivatives(
-            &base.penalty_info,
-            &all_penalty_second_deriv,
-            "Duchon",
-        )?
-    } else {
-        let (_, _, primary_second_derivative, _) =
-            build_duchon_primary_penalty_with_psi_derivatives(
-                centers.view(),
-                spec,
-                identifiability_transform,
-                workspace,
-            )?;
-        active_primary_double_penalty_derivatives(
-            &base.penalty_info,
-            &primary_second_derivative,
-            "Duchon",
-        )?
-    };
+    let (_, all_penalty_second_deriv) = build_duchon_operator_penalty_psi_derivatives(
+        centers.view(),
+        spec,
+        identifiability_transform,
+        workspace,
+    )?;
+    let penalties_second_derivative = active_operator_penalty_derivatives(
+        &base.penalty_info,
+        &all_penalty_second_deriv,
+        "Duchon",
+    )?;
     Ok(BasisPsiSecondDerivativeResult {
         design_second_derivative,
         penalties_second_derivative,

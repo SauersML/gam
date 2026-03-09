@@ -1257,7 +1257,7 @@ where
     let x_fit_o = x_fit.clone();
     let offset_o = offset.to_owned();
     let s_list_shared = Arc::new(s_list);
-    let mut reml_state = RemlState::new_with_offset_shared(
+    let reml_state = RemlState::new_with_offset_shared(
         y_o.view(),
         x_fit_o.clone(),
         w_o.view(),
@@ -1334,31 +1334,35 @@ where
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
         let outer_result =
-            crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_state(
+            crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
                 k,
                 heuristic_lambdas,
-                &mut reml_state,
-                |state| state.set_warm_start_original_beta(None),
-                |state, rho: &Array1<f64>| state.compute_cost(rho),
-                |state, rho: &Array1<f64>| {
+                |rho: &Array1<f64>| {
                     let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
+                    reml_state.set_warm_start_original_beta(None);
 
                     let t_cost = Instant::now();
-                    let cost = state.compute_cost(rho)?;
+                    let cost = reml_state.compute_cost(rho)?;
                     let cost_sec = t_cost.elapsed().as_secs_f64();
 
                     let t_grad = Instant::now();
-                    let grad = state.compute_gradient(rho)?;
+                    let grad = reml_state.compute_gradient(rho)?;
                     let grad_sec = t_grad.elapsed().as_secs_f64();
-                    let used_stochastic = state.last_gradient_used_stochastic_fallback();
+                    let used_stochastic = reml_state.last_gradient_used_stochastic_fallback();
+
+                    let t_hess = Instant::now();
+                    let hess = reml_state.compute_laml_hessian_consistent(rho)?;
+                    let hess_sec = t_hess.elapsed().as_secs_f64();
+
                     log::info!(
-                        "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3})",
+                        "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3}, hess={:.3})",
                         rho.len(),
                         used_stochastic,
                         cost_sec,
                         grad_sec,
+                        hess_sec,
                     );
-                    Ok((cost, grad))
+                    Ok((cost, grad, Some(hess)))
                 },
                 &smoothing_options,
             )?;

@@ -1028,7 +1028,7 @@ fn inner_exact_joint_fit<F: CustomFamily>(
                 .expect("inner exact-joint tolerance must be valid"),
         )
         .with_max_iterations(
-            MaxIterations::new(options.inner_max_cycles.max(200))
+            MaxIterations::new(options.inner_max_cycles.max(500))
                 .expect("inner exact-joint max iterations must be valid"),
         );
 
@@ -1815,17 +1815,6 @@ fn inner_blockwise_fit<F: CustomFamily>(
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
     }
-    if has_joint_exact_hessian {
-        return inner_exact_joint_fit(
-            family,
-            specs,
-            block_log_lambdas,
-            &s_lambdas,
-            options,
-            &states,
-            cached_active_sets,
-        );
-    }
     let initial_eval = family.evaluate(&states)?;
     let mut current_penalty =
         total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
@@ -1984,6 +1973,17 @@ fn inner_blockwise_fit<F: CustomFamily>(
     }
 
     let final_eval = family.evaluate(&states)?;
+    if has_joint_exact_hessian && !converged {
+        return inner_exact_joint_fit(
+            family,
+            specs,
+            block_log_lambdas,
+            &s_lambdas,
+            options,
+            &states,
+            cached_active_sets,
+        );
+    }
     let penalty_value = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
 
     let (block_logdet_h, block_logdet_s) =
