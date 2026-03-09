@@ -5,6 +5,10 @@ inputs:
     description: "Install benchmark Python/R dependencies in the job environment"
     required: false
     default: "true"
+  r-version:
+    description: "R version to install for benchmark jobs"
+    required: false
+    default: "4.4.3"
 runs:
   using: composite
   steps:
@@ -20,7 +24,9 @@ runs:
         python-version: "3.11"
 
     - name: Set up R
-      uses: r-lib/actions/setup-r@v2
+      uses: ./.github/actions/setup-bench-r
+      with:
+        r-version: ${{ inputs.r-version }}
 
     - name: Cache Python packages
       uses: actions/cache@v4
