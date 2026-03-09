@@ -20,6 +20,7 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_NO_PYTHON_VERSION_WARNING: "1"
   R_LIBS_USER: ${{ github.workspace }}/.r-lib
+  BENCH_R_VERSION: "4.4.3"
   BENCH_RUNTIME_CACHE_VERSION: v2
 
 jobs:
@@ -237,6 +238,7 @@ jobs:
         uses: ./.github/actions/bench-setup
         with:
           install-runtime-deps: "true"
+          r-version: ${{ env.BENCH_R_VERSION }}
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -327,9 +329,9 @@ jobs:
           python-version: "3.11"
 
       - name: Set up R
-        uses: r-lib/actions/setup-r@v2
+        uses: ./.github/actions/setup-bench-r
         with:
-          r-version: system
+          r-version: ${{ env.BENCH_R_VERSION }}
 
       - name: Download shared runtime
         uses: actions/download-artifact@v4
@@ -455,9 +457,9 @@ jobs:
           python-version: "3.11"
 
       - name: Set up R
-        uses: r-lib/actions/setup-r@v2
+        uses: ./.github/actions/setup-bench-r
         with:
-          r-version: system
+          r-version: ${{ env.BENCH_R_VERSION }}
 
       - name: Download shared runtime
         uses: actions/download-artifact@v4
