@@ -3824,8 +3824,8 @@ fn fit_term_collection_with_exact_spatial_adaptive_regularization(
         hyper_specs
             .iter()
             .enumerate()
-            .map(|(idx, _)| CustomFamilyBlockPsiDerivative {
-                penalty_index: idx,
+            .map(|(_, _)| CustomFamilyBlockPsiDerivative {
+                penalty_index: None,
                 x_psi: Array2::<f64>::zeros((
                     baseline.design.design.nrows(),
                     baseline.design.design.ncols(),
@@ -4328,6 +4328,14 @@ fn stable_sigmoid(theta: f64) -> f64 {
     }
 }
 
+fn stable_softplus(x: f64) -> f64 {
+    if x > 0.0 {
+        x + (-x).exp().ln_1p()
+    } else {
+        x.exp().ln_1p()
+    }
+}
+
 fn bounded_latent_to_user(theta: f64, min: f64, max: f64) -> (f64, f64, f64) {
     let z = stable_sigmoid(theta);
     let width = max - min;
@@ -4402,8 +4410,19 @@ fn evaluate_standard_family_observations(
                 neg_hessian_eta_derivative[i] = 0.0;
                 log_likelihood += -0.5 * w * resid * resid;
             }
-            LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
+            LikelihoodFamily::BinomialLogit => {
+                let mu_i = stable_sigmoid(eta_i);
+                let curvature = (mu_i * (1.0 - mu_i)).max(0.0);
+                mu[i] = mu_i;
+                score[i] = w * (yi - mu_i);
+                fisher_weight[i] = curvature.max(MU_DERIV_EPS);
+                neg_hessian_eta[i] = curvature;
+                neg_hessian_eta_derivative[i] = curvature * (1.0 - 2.0 * mu_i);
+                let log_mu = -stable_softplus(-eta_i);
+                let log_one_minus_mu = -stable_softplus(eta_i);
+                log_likelihood += w * (yi * log_mu + (1.0 - yi) * log_one_minus_mu);
+            }
+            LikelihoodFamily::BinomialProbit
             | LikelihoodFamily::BinomialCLogLog
             | LikelihoodFamily::BinomialSas
             | LikelihoodFamily::BinomialBetaLogistic
@@ -4425,7 +4444,7 @@ fn evaluate_standard_family_observations(
                     strategy_for_family(family, inverse_link.as_ref()).inverse_link_jet(eta_i)?;
                 let mu_i_raw = jet.mu;
                 let dmu_deta_raw = jet.d1;
-                let mu_i = mu_i_raw;
+                let mu_i = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);
                 let dmu_deta = dmu_deta_raw.max(MU_DERIV_EPS);
                 let d2mu_deta2 = jet.d2;
                 let d3mu_deta3 = jet.d3;
@@ -5055,13 +5074,13 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
                 derivative_blocks.len()
             ));
         }
-        let deriv = derivative_blocks[0]
+        let _deriv = derivative_blocks[0]
             .get(psi_index)
             .ok_or_else(|| format!("adaptive psi index {} out of bounds", psi_index))?;
         let hyper = self
             .hyper_specs
-            .get(deriv.penalty_index)
-            .ok_or_else(|| format!("adaptive psi index {} out of bounds", deriv.penalty_index))?;
+            .get(psi_index)
+            .ok_or_else(|| format!("adaptive psi index {} out of bounds", psi_index))?;
         let beta = &block_states[0].beta;
         let eval = self.exact_evaluation(beta)?;
         let (direct, beta_mixed, beta_hessian_explicit) =
@@ -9729,7 +9748,7 @@ mod tests {
             initial_beta: Some(array![0.0, 0.0]),
         };
         let deriv = CustomFamilyBlockPsiDerivative {
-            penalty_index: 0,
+            penalty_index: None,
             x_psi: Array2::zeros((2, 2)),
             s_psi: Array2::zeros((2, 2)),
             s_psi_components: None,
@@ -10034,8 +10053,8 @@ mod tests {
             hyper_specs
                 .iter()
                 .enumerate()
-                .map(|(idx, _)| CustomFamilyBlockPsiDerivative {
-                    penalty_index: idx,
+                .map(|(_, _)| CustomFamilyBlockPsiDerivative {
+                    penalty_index: None,
                     x_psi: Array2::<f64>::zeros((
                         baseline.design.design.nrows(),
                         baseline.design.design.ncols(),
@@ -10203,8 +10222,8 @@ mod tests {
             hyper_specs
                 .iter()
                 .enumerate()
-                .map(|(idx, _)| CustomFamilyBlockPsiDerivative {
-                    penalty_index: idx,
+                .map(|(_, _)| CustomFamilyBlockPsiDerivative {
+                    penalty_index: None,
                     x_psi: Array2::<f64>::zeros((
                         baseline.design.design.nrows(),
                         baseline.design.design.ncols(),
@@ -10367,6 +10386,79 @@ mod tests {
         assert!(diag.epsilon_0.is_finite() && diag.epsilon_0 > 0.0);
         assert!(diag.epsilon_g.is_finite() && diag.epsilon_g > 0.0);
         assert!(diag.epsilon_c.is_finite() && diag.epsilon_c > 0.0);
+    }
+
+    #[test]
+    fn binomial_logit_tail_curvature_uses_stable_exact_formula() {
+        let eta = array![30.0, 30.0, -30.0, -30.0, 40.0, -40.0];
+        let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let weights = Array1::ones(eta.len());
+        let obs = evaluate_standard_family_observations(
+            LikelihoodFamily::BinomialLogit,
+            None,
+            None,
+            &y,
+            &weights,
+            &eta,
+        )
+        .expect("stable logit observations");
+
+        for i in 0..eta.len() {
+            let mu = stable_sigmoid(eta[i]);
+            let target = mu * (1.0 - mu);
+            let d_target = target * (1.0 - 2.0 * mu);
+            assert!(
+                (obs.neg_hessian_eta[i] - target).abs() <= 1e-12 * (1.0 + target.abs()),
+                "eta={} y={} curvature={} target={target}",
+                eta[i],
+                y[i],
+                obs.neg_hessian_eta[i]
+            );
+            assert!(
+                (obs.neg_hessian_eta_derivative[i] - d_target).abs()
+                    <= 1e-12 * (1.0 + d_target.abs()),
+                "eta={} y={} dcurvature={} target={d_target}",
+                eta[i],
+                y[i],
+                obs.neg_hessian_eta_derivative[i]
+            );
+            assert!(
+                obs.neg_hessian_eta[i].is_finite()
+                    && obs.neg_hessian_eta_derivative[i].is_finite()
+                    && obs.log_likelihood.is_finite(),
+                "expected finite logit tail observation state at eta={} y={}",
+                eta[i],
+                y[i]
+            );
+        }
+    }
+
+    #[test]
+    fn non_logit_binomial_tail_observations_stay_finite() {
+        let eta = array![12.0, -12.0, 18.0, -18.0];
+        let y = array![0.0, 1.0, 1.0, 0.0];
+        let weights = Array1::ones(eta.len());
+        for family in [
+            LikelihoodFamily::BinomialProbit,
+            LikelihoodFamily::BinomialCLogLog,
+        ] {
+            let obs = evaluate_standard_family_observations(
+                family,
+                None,
+                None,
+                &y,
+                &weights,
+                &eta,
+            )
+            .expect("tail observations");
+            assert!(obs.log_likelihood.is_finite(), "family={family:?}");
+            assert!(
+                obs.score.iter().all(|v| v.is_finite())
+                    && obs.neg_hessian_eta.iter().all(|v| v.is_finite())
+                    && obs.neg_hessian_eta_derivative.iter().all(|v| v.is_finite()),
+                "family={family:?}"
+            );
+        }
     }
 
     #[test]
