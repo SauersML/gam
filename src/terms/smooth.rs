@@ -452,7 +452,7 @@ impl SpatialLogKappaCoords {
         self.0.len()
     }
 
-    fn as_array(&self) -> &Array1<f64> {
+    pub(crate) fn as_array(&self) -> &Array1<f64> {
         &self.0
     }
 
@@ -467,7 +467,7 @@ impl SpatialLogKappaCoords {
         self.0.mapv(|v| -v)
     }
 
-    fn apply_to_spec(
+    pub(crate) fn apply_to_spec(
         &self,
         spec: &TermCollectionSpec,
         term_indices: &[usize],
@@ -3405,7 +3405,10 @@ fn extract_spatial_operator_runtime_caches(
                 ) && identifiability_transform.is_some()
             }
             (SmoothBasisSpec::Matern { spec, .. }, BasisMetadata::Matern { .. }) => {
-                matches!(spec.identifiability, MaternIdentifiability::FrozenTransform { .. })
+                matches!(
+                    spec.identifiability,
+                    MaternIdentifiability::FrozenTransform { .. }
+                )
             }
             _ => false,
         };

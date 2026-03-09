@@ -1532,6 +1532,9 @@ trait LocationScaleFamilyBuilder {
     fn exact_spatial_joint_supported(&self) -> bool {
         true
     }
+    fn require_exact_spatial_joint(&self) -> bool {
+        false
+    }
     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         Ok(Array1::zeros(0))
     }
@@ -1639,6 +1642,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             (Some(_), Some(_))
         );
 
+    let require_exact_spatial_joint = builder.require_exact_spatial_joint();
     let mut used_fd_spatial_search = false;
     let mut solved = if exact_joint_ready {
         let joint_setup = build_two_block_exact_joint_setup(
@@ -1719,6 +1723,11 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         ) {
             Ok(sol) => sol,
             Err(err) => {
+                if require_exact_spatial_joint {
+                    return Err(format!(
+                        "exact two-block spatial optimization failed and finite-difference fallback is disabled for this family: {err}"
+                    ));
+                }
                 log::warn!(
                     "exact two-block spatial optimization failed ({}); falling back to finite-difference optimizer",
                     err
@@ -1764,6 +1773,12 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             }
         }
     } else {
+        if require_exact_spatial_joint {
+            return Err(
+                "exact two-block spatial optimization is required for this family, but analytic spatial psi derivatives are unavailable"
+                    .to_string(),
+            );
+        }
         used_fd_spatial_search = true;
         optimize_two_block_spatial_length_scale(
             data,
@@ -1972,7 +1987,11 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
     }
 
     fn exact_spatial_joint_supported(&self) -> bool {
-        false
+        true
+    }
+
+    fn require_exact_spatial_joint(&self) -> bool {
+        true
     }
 
     fn build_blocks(
@@ -2015,15 +2034,19 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
-        let identified_noise_design =
+        let _identified_noise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)
                 .expect("identified binomial log-sigma design");
         BinomialLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(mean_design.design.clone())),
-            log_sigma_design: Some(DesignMatrix::Dense(identified_noise_design)),
+            // Spatial joint hyper-optimization needs analytic psi gradients for
+            // moving designs. The exact-Newton block path does not expose that
+            // callback for this family yet, so term collections intentionally
+            // use the diagonal analytic path here.
+            threshold_design: None,
+            log_sigma_design: None,
         }
     }
 
@@ -2484,7 +2507,10 @@ fn binomial_neglog_q_derivatives_probit_closed_form(
 ) -> (f64, f64, f64) {
     // Closed-form derivatives for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     // Uses canonical A/A_mu/A_mumu identities from the probit composition.
-    let m = mu;
+    let (m, clamp_active) = clamped_binomial_probability(mu);
+    if clamp_active || weight == 0.0 || !q.is_finite() {
+        return (0.0, 0.0, 0.0);
+    }
     let nu = 1.0 - m;
     let phi = normal_pdf(q);
     let a = (1.0 - y) / nu - y / m;
@@ -2506,7 +2532,10 @@ fn binomial_neglog_q_fourth_derivative_probit_closed_form(
     mu: f64,
 ) -> f64 {
     // Closed-form m4 for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
-    let m = mu;
+    let (m, clamp_active) = clamped_binomial_probability(mu);
+    if clamp_active || weight == 0.0 || !q.is_finite() {
+        return 0.0;
+    }
     let nu = 1.0 - m;
     let phi = normal_pdf(q);
     let a = (1.0 - y) / nu - y / m;
@@ -2829,6 +2858,15 @@ fn inverse_link_row(jet: crate::mixture_link::InverseLinkJet) -> InverseLinkRow 
 }
 
 #[inline]
+fn clamped_binomial_probability(mu: f64) -> (f64, bool) {
+    if !mu.is_finite() {
+        return (0.5, true);
+    }
+    let clamped = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
+    (clamped, clamped != mu)
+}
+
+#[inline]
 fn binomial_location_scale_q0(eta_t: f64, sigma: f64) -> f64 {
     -eta_t / sigma.max(1e-12)
 }
@@ -2847,8 +2885,15 @@ fn binomial_location_scale_row(
     } = exp_sigma_jet1_scalar(eta_ls);
     let q0 = binomial_location_scale_q0(eta_t, sigma);
     let q = q0 + eta_wiggle;
-    let jet = inverse_link_jet_for_inverse_link(link_kind, q)
+    let mut jet = inverse_link_jet_for_inverse_link(link_kind, q)
         .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
+    let (mu_clamped, clamp_active) = clamped_binomial_probability(jet.mu);
+    jet.mu = mu_clamped;
+    if clamp_active {
+        jet.d1 = 0.0;
+        jet.d2 = 0.0;
+        jet.d3 = 0.0;
+    }
     let inverse_link = inverse_link_row(jet);
     let ll = weight * (y * inverse_link.mu.ln() + (1.0_f64 - y) * (1.0_f64 - inverse_link.mu).ln());
     Ok(BinomialLocationScaleRow {
@@ -5998,6 +6043,70 @@ mod tests {
             min_length_scale: 0.1,
             max_length_scale: 2.0,
         }
+    }
+
+    #[test]
+    fn binomial_location_scale_exact_probit_tail_objects_stay_finite() {
+        let n = 6usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_elem(n, 1.0);
+        let threshold_design = DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0));
+        let log_sigma_design = DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0));
+        let family = BinomialLocationScaleFamily {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+        };
+        let beta_t = array![250.0];
+        let beta_ls = array![0.0];
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: threshold_design.matrix_vector_multiply(&beta_t),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: log_sigma_design.matrix_vector_multiply(&beta_ls),
+            },
+        ];
+
+        let eval = family
+            .evaluate(&states)
+            .expect("evaluate tail-stable family");
+        assert!(eval.log_likelihood.is_finite());
+        let joint = family
+            .exact_newton_joint_hessian(&states)
+            .expect("joint hessian")
+            .expect("expected exact joint hessian");
+        assert!(joint.iter().all(|v| v.is_finite()));
+        let direction = array![0.1, -0.2];
+        let d_h = family
+            .exact_newton_joint_hessian_directional_derivative(&states, &direction)
+            .expect("joint dH")
+            .expect("expected exact joint dH");
+        assert!(d_h.iter().all(|v| v.is_finite()));
+        let d2_h = family
+            .exact_newton_joint_hessian_second_directional_derivative(
+                &states, &direction, &direction,
+            )
+            .expect("joint d2H")
+            .expect("expected exact joint d2H");
+        assert!(d2_h.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn binomial_location_scale_term_builder_requires_exact_spatial_joint_path() {
+        let builder = BinomialLocationScaleTermBuilder {
+            y: Array1::from_elem(4, 0.0),
+            weights: Array1::from_elem(4, 1.0),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            mean_spec: simple_matern_term_collection(&[0, 1], 0.4),
+            noise_spec: simple_matern_term_collection(&[0, 1], 0.75),
+        };
+        assert!(builder.exact_spatial_joint_supported());
+        assert!(builder.require_exact_spatial_joint());
     }
 
     #[test]
