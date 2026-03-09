@@ -5658,6 +5658,29 @@ fn scaled_log_kappa_derivatives(
     exponent: f64,
     r: f64,
 ) -> (f64, f64) {
+    // Scaling-law differentiation template
+    // ------------------------------------
+    // For any radial quantity of the form
+    //   F(r; kappa) = kappa^a G(kappa r),
+    // with psi = log(kappa), one has d/dpsi = kappa d/dkappa.
+    //
+    // Writing t = kappa r,
+    //   F_psi
+    //   = kappa d/dkappa [kappa^a G(t)]
+    //   = a kappa^a G(t) + kappa^a (kappa r) G'(t)
+    //   = a F + r F_r.
+    //
+    // Differentiating again,
+    //   F_psipsi
+    //   = d/dpsi [a F + r F_r]
+    //   = a F_psi + r (F_r)_psi
+    //   = a (a F + r F_r) + r d/dr(F_psi)
+    //   = a^2 F + (2a + 1) r F_r + r^2 F_rr.
+    //
+    // This helper is the common exact formula used for:
+    //   - phi            with exponent delta
+    //   - q = phi_r / r  with exponent delta + 2
+    //   - Delta phi      with exponent delta + 2.
     let first = exponent * value + r * radial_first;
     let second = exponent * exponent * value
         + (2.0 * exponent + 1.0) * r * radial_first
@@ -5667,6 +5690,21 @@ fn scaled_log_kappa_derivatives(
 
 #[inline(always)]
 fn duchon_operator_scaling_exponent(p_order: usize, s_order: usize, k_dim: usize) -> f64 {
+    // For the hybrid Duchon spectrum
+    //   1 / (|w|^(2p) (kappa^2 + |w|^2)^s),
+    // the spatial kernel scales as
+    //   phi(r; kappa) = kappa^delta H(kappa r),
+    // where
+    //   delta = d - 2p - 2s.
+    //
+    // A first spatial derivative contributes one extra factor of kappa, so
+    // phi_r scales like kappa^(delta + 1). Dividing by r gives
+    //   q(r; kappa) = phi_r / r = kappa^(delta + 2) Q(kappa r).
+    //
+    // The Laplacian also contributes two spatial derivatives, so
+    //   Delta phi(r; kappa) = kappa^(delta + 2) L(kappa r).
+    //
+    // Thus both Duchon operator scalars use exponent delta + 2.
     duchon_scaling_exponent(p_order, s_order, k_dim) + 2.0
 }
 
@@ -5678,6 +5716,16 @@ fn duchon_q_psi_triplet_from_jets(
     k_dim: usize,
     r: f64,
 ) -> (f64, f64) {
+    // Exact scaling derivatives for
+    //   q(r; kappa) = phi_r(r; kappa) / r.
+    //
+    // Since q scales like kappa^(delta + 2),
+    //   q_psi     = (delta + 2) q + r q_r
+    //   q_psipsi  = (delta + 2)^2 q + (2 delta + 5) r q_r + r^2 q_rr.
+    //
+    // For r > 0 this is algebraically equivalent to
+    //   q_psi = (delta + 1) q + phi_rr,
+    // because q_r = (phi_rr - q) / r.
     scaled_log_kappa_derivatives(
         jets.q,
         jets.q_r,
@@ -5695,6 +5743,13 @@ fn duchon_laplacian_psi_triplet_from_jets(
     k_dim: usize,
     r: f64,
 ) -> (f64, f64) {
+    // Exact scaling derivatives for
+    //   ell(r; kappa) = Delta phi(r; kappa).
+    //
+    // The Laplacian raises the scaling exponent by 2, so ell follows the same
+    // exponent as q:
+    //   ell_psi     = (delta + 2) ell + r ell_r
+    //   ell_psipsi  = (delta + 2)^2 ell + (2 delta + 5) r ell_r + r^2 ell_rr.
     scaled_log_kappa_derivatives(
         jets.lap,
         jets.lap_r,
@@ -5711,6 +5766,18 @@ fn duchon_collision_operator_core_from_phi_rr(
     phi_rr_psi_psi: f64,
     k_dim: usize,
 ) -> (PsiTriplet, PsiTriplet) {
+    // Center-collision identities for a C^2 radial kernel:
+    //   q(0)       = lim_{r->0} phi_r(r)/r = phi_rr(0)
+    //   Delta phi(0) = d * phi_rr(0).
+    //
+    // The same identities propagate to psi derivatives as long as the
+    // corresponding collision limits exist:
+    //   q_psi(0)        = phi_rr_psi(0)
+    //   q_psipsi(0)     = phi_rr_psipsi(0)
+    //   (Delta phi)_psi(0)    = d * phi_rr_psi(0)
+    //   (Delta phi)_psipsi(0) = d * phi_rr_psipsi(0).
+    //
+    // This helper packages exactly those canonical origin values.
     (
         PsiTriplet {
             value: phi_rr,
@@ -5785,6 +5852,16 @@ fn duchon_radial_jets(
     }
 
     if r == 0.0 {
+        // The off-origin derivative path uses a small-r evaluation floor to keep
+        // the partial-fraction pieces numerically stable. At an exact collision we
+        // do not want to inherit that surrogate for the operator scalars. Instead
+        // we impose the mathematically checked collision limits:
+        //   phi_r(0)   = 0
+        //   q(0)       = phi_rr(0)
+        //   Delta phi(0) = d * phi_rr(0).
+        //
+        // This keeps the raw radial jets aligned with the collision convention
+        // used by the higher-level Duchon operator and psi-derivative code.
         out.phi_r = 0.0;
         let (phi_rr, _, _) =
             duchon_phi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
@@ -5855,6 +5932,15 @@ fn duchon_radial_core_psi_triplet(
     // This helper computes exactly that minimal scalar core:
     //   phi, q = phi_r / r, ell = Δphi
     // together with their first and second psi derivatives.
+    //
+    // Representation note:
+    //   When p > 0 the Duchon kernel is only conditionally positive definite, so
+    //   the spatial kernel is canonical only up to polynomial additions. The
+    //   formulas in this helper are therefore tied to the specific representative
+    //   encoded by the partial-fraction construction and the collision rules used
+    //   below. The operator penalties, exact psi derivatives, and center-collision
+    //   limits all have to use that same representative or the resulting penalty
+    //   geometry will drift across code paths.
     let delta = duchon_scaling_exponent(p_order, s_order, k_dim);
     let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, coeffs)?;
     let phi = jets.phi;
@@ -5891,7 +5977,17 @@ fn duchon_radial_core_psi_triplet(
     }
 
     // Continuous center-collision extension for the scalar operator core:
-    //   q(0; kappa) = phi_rr(0; kappa),  L(0; kappa) = d * phi_rr(0; kappa).
+    //   q(0; kappa) = phi_rr(0; kappa)
+    //   L(0; kappa) = d * phi_rr(0; kappa).
+    //
+    // In the classical C^2 regime, phi_rr itself scales with exponent delta + 2,
+    // so one expects
+    //   phi_rr_psi      = (delta + 2) phi_rr
+    //   phi_rr_psipsi   = (delta + 2)^2 phi_rr.
+    //
+    // The helper invoked here computes the representative-specific collision
+    // values used by this implementation, preserving consistency even when the
+    // origin is only available through the intrinsic Duchon convention.
     #[cfg(test)]
     let (gradient_ratio, laplacian) = {
         let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
@@ -5931,8 +6027,12 @@ fn duchon_phi_rr_collision_psi_triplet(
     //   phi_rr_psi     = (delta + 2) phi_rr
     //   phi_rr_psipsi  = (delta + 2)^2 phi_rr.
     //
-    // Outside that regime the kernel is only intrinsic at the origin, so we keep
-    // the assembled intrinsic convention from the matched block expansion.
+    // Outside that regime the kernel can be only intrinsic / representative-
+    // dependent at the origin. In that case we do not force the pure scaling
+    // identities; instead we keep the assembled collision convention from the
+    // matched partial-fraction expansion. That preserves consistency between the
+    // basis values, the operator penalties, and the exact psi derivatives even
+    // when the classical origin interpretation is unavailable.
     let mut phi_rr = 0.0;
     let mut phi_rr_psi = 0.0;
     let mut phi_rr_psi_psi = 0.0;

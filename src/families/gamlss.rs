@@ -6770,6 +6770,158 @@ mod tests {
     }
 
     #[test]
+    fn wiggle_family_joint_hessian_matches_fd_gradients_with_nontrivial_designs() {
+        let n = 9usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let t_grid = Array1::linspace(0.0, 1.0, n);
+        let threshold_x = Array2::from_shape_fn((n, 3), |(i, j)| match j {
+            0 => 1.0,
+            1 => t_grid[i] - 0.5,
+            2 => (2.0 * std::f64::consts::PI * t_grid[i]).sin(),
+            _ => unreachable!(),
+        });
+        let log_sigma_x = Array2::from_shape_fn((n, 2), |(i, j)| match j {
+            0 => 1.0,
+            1 => (3.0 * std::f64::consts::PI * t_grid[i]).cos(),
+            _ => unreachable!(),
+        });
+        let threshold_design = DesignMatrix::Dense(threshold_x.clone());
+        let log_sigma_design = DesignMatrix::Dense(log_sigma_x.clone());
+        let q_seed = Array1::linspace(-1.3, 1.1, n);
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::build_wiggle_block_input(
+            q_seed.view(),
+            3,
+            4,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let family = BinomialLocationScaleWiggleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+            wiggle_knots: knots,
+            wiggle_degree: 3,
+        };
+
+        let rebuild_states = |beta_t: &Array1<f64>,
+                              beta_ls: &Array1<f64>,
+                              beta_w: &Array1<f64>|
+         -> Vec<ParameterBlockState> {
+            let eta_t = threshold_design.matrix_vector_multiply(beta_t);
+            let eta_ls = log_sigma_design.matrix_vector_multiply(beta_ls);
+            let core_q0 = binomial_location_scale_core(
+                &y,
+                &weights,
+                &eta_t,
+                &eta_ls,
+                None,
+                &family.link_kind,
+            )
+            .expect("core q0");
+            let eta_w = family
+                .wiggle_design(core_q0.q0.view())
+                .expect("wiggle design")
+                .dot(beta_w);
+            vec![
+                ParameterBlockState {
+                    beta: beta_t.clone(),
+                    eta: eta_t,
+                },
+                ParameterBlockState {
+                    beta: beta_ls.clone(),
+                    eta: eta_ls,
+                },
+                ParameterBlockState {
+                    beta: beta_w.clone(),
+                    eta: eta_w,
+                },
+            ]
+        };
+
+        let extract_gradient = |eval: &FamilyEvaluation, block_idx: usize| -> Array1<f64> {
+            match &eval.block_working_sets[block_idx] {
+                BlockWorkingSet::ExactNewton {
+                    gradient,
+                    hessian: _,
+                } => gradient.clone(),
+                BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton"),
+            }
+        };
+
+        let beta_t = Array1::from_vec(vec![0.15, -0.3, 0.2]);
+        let beta_ls = Array1::from_vec(vec![-0.2, 0.1]);
+        let beta_w = Array1::from_vec(vec![0.04; wiggle_block.design.ncols()]);
+        let states = rebuild_states(&beta_t, &beta_ls, &beta_w);
+        let h_joint = family
+            .exact_newton_joint_hessian(&states)
+            .expect("joint hessian")
+            .expect("expected joint exact hessian");
+        let pt = beta_t.len();
+        let pls = beta_ls.len();
+        let eps = 1e-6;
+        let total = pt + pls + beta_w.len();
+        let mut fd = Array2::<f64>::zeros((total, total));
+        let source_offsets = [0usize, pt, pt + pls];
+
+        for source_block in 0..3 {
+            let source_len = states[source_block].beta.len();
+            for j in 0..source_len {
+                let mut beta_t_plus = beta_t.clone();
+                let mut beta_ls_plus = beta_ls.clone();
+                let mut beta_w_plus = beta_w.clone();
+                let mut beta_t_minus = beta_t.clone();
+                let mut beta_ls_minus = beta_ls.clone();
+                let mut beta_w_minus = beta_w.clone();
+                match source_block {
+                    BinomialLocationScaleWiggleFamily::BLOCK_T => {
+                        beta_t_plus[j] += eps;
+                        beta_t_minus[j] -= eps;
+                    }
+                    BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA => {
+                        beta_ls_plus[j] += eps;
+                        beta_ls_minus[j] -= eps;
+                    }
+                    BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE => {
+                        beta_w_plus[j] += eps;
+                        beta_w_minus[j] -= eps;
+                    }
+                    _ => unreachable!(),
+                }
+                let eval_plus = family
+                    .evaluate(&rebuild_states(&beta_t_plus, &beta_ls_plus, &beta_w_plus))
+                    .expect("eval plus");
+                let eval_minus = family
+                    .evaluate(&rebuild_states(
+                        &beta_t_minus,
+                        &beta_ls_minus,
+                        &beta_w_minus,
+                    ))
+                    .expect("eval minus");
+
+                let mut row_offset = 0usize;
+                for target_block in 0..3 {
+                    let grad_plus = extract_gradient(&eval_plus, target_block);
+                    let grad_minus = extract_gradient(&eval_minus, target_block);
+                    let col = (&grad_plus - &grad_minus).mapv(|v| -v / (2.0 * eps));
+                    let col_idx = source_offsets[source_block] + j;
+                    fd.slice_mut(s![
+                        row_offset..row_offset + grad_plus.len(),
+                        col_idx..col_idx + 1
+                    ])
+                    .assign(&col.insert_axis(Axis(1)));
+                    row_offset += grad_plus.len();
+                }
+            }
+        }
+
+        crate::testing::assert_matrix_derivative_fd(&fd, &h_joint, 4e-4, "wiggle joint hessian");
+    }
+
+    #[test]
     fn wiggle_family_joint_exact_hessian_directional_derivative_matches_finite_difference() {
         let n = 7usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
@@ -7155,6 +7307,220 @@ mod tests {
         crate::testing::assert_matrix_derivative_fd(&fd_t_ls, &h_t_ls, 2e-4, "H_t_ls");
         crate::testing::assert_matrix_derivative_fd(&fd_t_w, &h_t_w, 4e-4, "H_t_w");
         crate::testing::assert_matrix_derivative_fd(&fd_ls_w, &h_ls_w, 6e-4, "H_ls_w");
+    }
+
+    #[test]
+    fn nonwiggle_family_evaluate_returns_exact_newton_blocks_when_designs_are_present() {
+        let n = 6usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => t - 0.5,
+                _ => unreachable!(),
+            }
+        }));
+        let log_sigma_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => (2.0 * std::f64::consts::PI * t).cos(),
+                _ => unreachable!(),
+            }
+        }));
+        let family = BinomialLocationScaleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+        };
+
+        let beta_t = array![0.2, -0.15];
+        let beta_ls = array![-0.1, 0.05];
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: threshold_design.matrix_vector_multiply(&beta_t),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: log_sigma_design.matrix_vector_multiply(&beta_ls),
+            },
+        ];
+
+        let eval = family.evaluate(&states).expect("evaluate nonwiggle family");
+        assert_eq!(eval.block_working_sets.len(), 2);
+        let joint = family
+            .exact_newton_joint_hessian(&states)
+            .expect("joint hessian")
+            .expect("expected joint exact hessian");
+        let pt = beta_t.len();
+        let pls = beta_ls.len();
+
+        for (block_idx, (start, end)) in [(0usize, pt), (pt, pt + pls)].into_iter().enumerate() {
+            let block_hessian = match &eval.block_working_sets[block_idx] {
+                BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
+                BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton block"),
+            };
+            let joint_block = joint.slice(s![start..end, start..end]).to_owned();
+            crate::testing::assert_matrix_derivative_fd(
+                &joint_block,
+                &block_hessian,
+                1e-10,
+                &format!("nonwiggle block {block_idx} principal block"),
+            );
+        }
+    }
+
+    #[test]
+    fn nonwiggle_family_joint_exact_hessian_directional_derivative_matches_finite_difference() {
+        let n = 8usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => (2.0 * std::f64::consts::PI * t).sin(),
+                _ => unreachable!(),
+            }
+        }));
+        let log_sigma_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => t - 0.5,
+                _ => unreachable!(),
+            }
+        }));
+        let family = BinomialLocationScaleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+        };
+
+        let rebuild_states = |beta_t: &Array1<f64>, beta_ls: &Array1<f64>| {
+            vec![
+                ParameterBlockState {
+                    beta: beta_t.clone(),
+                    eta: threshold_design.matrix_vector_multiply(beta_t),
+                },
+                ParameterBlockState {
+                    beta: beta_ls.clone(),
+                    eta: log_sigma_design.matrix_vector_multiply(beta_ls),
+                },
+            ]
+        };
+
+        let beta_t = array![0.2, -0.1];
+        let beta_ls = array![-0.15, 0.08];
+        let states = rebuild_states(&beta_t, &beta_ls);
+        let base_h = family
+            .exact_newton_joint_hessian(&states)
+            .expect("joint hessian")
+            .expect("expected joint exact hessian");
+        let direction = array![0.2, 0.3, -0.15, 0.1];
+        let analytic = family
+            .exact_newton_joint_hessian_directional_derivative(&states, &direction)
+            .expect("joint dH")
+            .expect("expected joint exact dH");
+
+        let eps = 1e-6;
+        let dir_t = direction.slice(s![0..beta_t.len()]).to_owned();
+        let dir_ls = direction.slice(s![beta_t.len()..]).to_owned();
+        let states_plus =
+            rebuild_states(&(&beta_t + &(eps * &dir_t)), &(&beta_ls + &(eps * &dir_ls)));
+        let h_plus = family
+            .exact_newton_joint_hessian(&states_plus)
+            .expect("plus joint hessian")
+            .expect("expected plus joint hessian");
+        let fd = (h_plus - base_h) / eps;
+        crate::testing::assert_matrix_derivative_fd(&fd, &analytic, 2e-3, "nonwiggle joint dH");
+    }
+
+    #[test]
+    fn nonwiggle_family_joint_exact_hessian_second_directional_derivative_matches_finite_difference()
+     {
+        let n = 8usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let threshold_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => (2.0 * std::f64::consts::PI * t).sin(),
+                _ => unreachable!(),
+            }
+        }));
+        let log_sigma_design = DesignMatrix::Dense(Array2::from_shape_fn((n, 2), |(i, j)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            match j {
+                0 => 1.0,
+                1 => t - 0.5,
+                _ => unreachable!(),
+            }
+        }));
+        let family = BinomialLocationScaleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_design: Some(threshold_design.clone()),
+            log_sigma_design: Some(log_sigma_design.clone()),
+        };
+
+        let rebuild_states = |beta_t: &Array1<f64>, beta_ls: &Array1<f64>| {
+            vec![
+                ParameterBlockState {
+                    beta: beta_t.clone(),
+                    eta: threshold_design.matrix_vector_multiply(beta_t),
+                },
+                ParameterBlockState {
+                    beta: beta_ls.clone(),
+                    eta: log_sigma_design.matrix_vector_multiply(beta_ls),
+                },
+            ]
+        };
+
+        let beta_t = array![0.2, -0.1];
+        let beta_ls = array![-0.15, 0.08];
+        let states = rebuild_states(&beta_t, &beta_ls);
+        let direction_u = array![0.2, 0.3, -0.15, 0.1];
+        let direction_v = array![-0.05, 0.12, 0.08, -0.09];
+        let analytic = family
+            .exact_newton_joint_hessian_second_directional_derivative(
+                &states,
+                &direction_u,
+                &direction_v,
+            )
+            .expect("joint d2H")
+            .expect("expected joint exact d2H");
+
+        let eps = 1e-6;
+        let step_t = direction_v.slice(s![0..beta_t.len()]).to_owned();
+        let step_ls = direction_v.slice(s![beta_t.len()..]).to_owned();
+        let states_plus = rebuild_states(
+            &(&beta_t + &(eps * &step_t)),
+            &(&beta_ls + &(eps * &step_ls)),
+        );
+        let states_minus = rebuild_states(
+            &(&beta_t - &(eps * &step_t)),
+            &(&beta_ls - &(eps * &step_ls)),
+        );
+        let d_h_plus = family
+            .exact_newton_joint_hessian_directional_derivative(&states_plus, &direction_u)
+            .expect("joint dH plus")
+            .expect("expected joint exact dH plus");
+        let d_h_minus = family
+            .exact_newton_joint_hessian_directional_derivative(&states_minus, &direction_u)
+            .expect("joint dH minus")
+            .expect("expected joint exact dH minus");
+        let fd = (d_h_plus - d_h_minus) / (2.0 * eps);
+        crate::testing::assert_matrix_derivative_fd(&fd, &analytic, 4e-3, "nonwiggle joint d2H");
     }
 
     #[test]
