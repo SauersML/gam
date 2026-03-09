@@ -239,25 +239,12 @@ impl RidgePlanner {
     pub(crate) fn new(matrix: &Array2<f64>) -> Self {
         let scale = max_abs_diag(matrix);
         let min_step = scale * 1e-10;
-        let cond_estimate = calculate_condition_number(matrix)
-            .ok()
-            .filter(|c| c.is_finite() && *c > 0.0);
-        let mut ridge = min_step;
-        if let Some(cond) = cond_estimate {
-            if !cond.is_finite() {
-                ridge = scale * 1e-8;
-            } else if cond > HESSIAN_CONDITION_TARGET {
-                // If initial condition estimate is already above target, seed ridge
-                // proportional to the excess so the first retry is meaningful.
-                ridge = min_step * (cond / HESSIAN_CONDITION_TARGET);
-            }
-        } else {
-            ridge = scale * 1e-8;
-        }
-        ridge = ridge.max(min_step);
+        // Most Hessians factorize on the first attempt. Avoid an eager exact
+        // condition-number decomposition here and only pay for spectral
+        // diagnostics after an actual factorization failure.
         Self {
-            cond_estimate,
-            ridge,
+            cond_estimate: None,
+            ridge: min_step,
             attempts: 0,
             scale,
         }

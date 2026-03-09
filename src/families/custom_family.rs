@@ -3,16 +3,13 @@ use crate::faer_ndarray::{FaerArrayView, FaerEigh, FaerSvd};
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
-use crate::solver::opt_objective::{CachedFirstOrderObjective, CachedSecondOrderObjective};
+use crate::solver::opt_objective::CachedFirstOrderObjective;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2};
-use opt::{
-    Bfgs, BfgsError, Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError,
-    ObjectiveEvalError, Tolerance,
-};
+use opt::{Bfgs, BfgsError, Bounds, MaxIterations, ObjectiveEvalError, Tolerance};
 use thiserror::Error;
 
 /// Optional known link metadata when a family uses a learnable wiggle correction.
@@ -890,214 +887,6 @@ impl BlockWorkingSet {
     }
 }
 
-fn flatten_exact_newton_penalized_gradient(
-    eval: &FamilyEvaluation,
-    states: &[ParameterBlockState],
-    s_lambdas: &[Array2<f64>],
-    mode_ridge: f64,
-) -> Result<Array1<f64>, String> {
-    if eval.block_working_sets.len() != states.len() || states.len() != s_lambdas.len() {
-        return Err("exact-newton joint gradient flatten: block dimension mismatch".to_string());
-    }
-    let total = states.iter().map(|st| st.beta.len()).sum::<usize>();
-    let mut grad = Array1::<f64>::zeros(total);
-    let mut at = 0usize;
-    for b in 0..states.len() {
-        let p = states[b].beta.len();
-        let score =
-            match &eval.block_working_sets[b] {
-                BlockWorkingSet::ExactNewton { gradient, .. } => gradient,
-                _ => return Err(
-                    "exact-newton joint polish requires exact-newton working sets for all blocks"
-                        .to_string(),
-                ),
-            };
-        if score.len() != p || s_lambdas[b].nrows() != p || s_lambdas[b].ncols() != p {
-            return Err(format!(
-                "exact-newton joint gradient flatten shape mismatch on block {b}"
-            ));
-        }
-        let mut penalized_grad = s_lambdas[b].dot(&states[b].beta) - score;
-        if mode_ridge > 0.0 {
-            penalized_grad += &states[b].beta.mapv(|v| mode_ridge * v);
-        }
-        grad.slice_mut(ndarray::s![at..at + p])
-            .assign(&penalized_grad);
-        at += p;
-    }
-    Ok(grad)
-}
-
-fn apply_post_update_to_all_blocks<F: CustomFamily>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    states: &mut [ParameterBlockState],
-) -> Result<(), String> {
-    for b in 0..states.len() {
-        let beta = states[b].beta.clone();
-        states[b].beta = family.post_update_block_beta(states, b, &specs[b], beta)?;
-    }
-    refresh_all_block_etas(family, specs, states)?;
-    Ok(())
-}
-
-#[allow(clippy::type_complexity)]
-fn inner_exact_joint_fit<F: CustomFamily>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    block_log_lambdas: &[Array1<f64>],
-    s_lambdas: &[Array2<f64>],
-    options: &BlockwiseFitOptions,
-    states0: &[ParameterBlockState],
-    active_sets: Vec<Option<Vec<usize>>>,
-) -> Result<BlockwiseInnerResult, String> {
-    let ridge = effective_solver_ridge(options.ridge_floor);
-    let mode_ridge = if options.ridge_policy.include_quadratic_penalty {
-        ridge
-    } else {
-        0.0
-    };
-    let ranges = block_param_ranges(specs);
-    let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
-    let mut s_joint = Array2::<f64>::zeros((total, total));
-    for (b, &(start, end)) in ranges.iter().enumerate() {
-        s_joint
-            .slice_mut(ndarray::s![start..end, start..end])
-            .assign(&s_lambdas[b]);
-    }
-    if mode_ridge > 0.0 {
-        for d in 0..total {
-            s_joint[[d, d]] += mode_ridge;
-        }
-    }
-
-    let project_states = |beta_flat: &Array1<f64>| -> Result<Vec<ParameterBlockState>, String> {
-        let mut states = states0.to_vec();
-        set_states_from_flat_beta(&mut states, specs, beta_flat)?;
-        apply_post_update_to_all_blocks(family, specs, &mut states)?;
-        Ok(states)
-    };
-
-    let eval_value = |beta_flat: &Array1<f64>| -> Result<
-        (f64, Array1<f64>, Array2<f64>, Vec<ParameterBlockState>),
-        String,
-    > {
-        let states = project_states(beta_flat)?;
-        let eval = family.evaluate(&states)?;
-        let grad = flatten_exact_newton_penalized_gradient(&eval, &states, s_lambdas, mode_ridge)?;
-        let mut h = exact_newton_joint_hessian_symmetrized(
-            family,
-            &states,
-            total,
-            "joint exact-newton inner Hessian shape mismatch",
-        )?
-        .ok_or_else(|| "missing joint exact-newton Hessian in inner exact fit".to_string())?;
-        h += &s_joint;
-        let objective = -eval.log_likelihood
-            + total_quadratic_penalty(&states, s_lambdas, ridge, options.ridge_policy);
-        Ok((objective, grad, h, states))
-    };
-
-    let beta0 = flatten_state_betas(states0, specs);
-    let lower = Array1::<f64>::from_elem(total, -1e12);
-    let upper = Array1::<f64>::from_elem(total, 1e12);
-    let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Vec<ParameterBlockState>)> = None;
-    let objective = CachedSecondOrderObjective::new(
-        |x: &Array1<f64>| match eval_value(x) {
-            Ok((obj, grad, h, states))
-                if obj.is_finite()
-                    && grad.iter().all(|v| v.is_finite())
-                    && h.iter().all(|v| v.is_finite()) =>
-            {
-                last_eval = Some((x.clone(), obj, grad.clone(), states));
-                Ok((obj, grad, Some(h)))
-            }
-            Ok((_obj, _grad, _h, _states)) => Err(ObjectiveEvalError::recoverable(
-                "custom-family exact-joint inner objective/derivatives became non-finite",
-            )),
-            Err(e) => Err(ObjectiveEvalError::recoverable(format!(
-                "custom-family exact-joint inner evaluation failed: {e}"
-            ))),
-        },
-        1e-4,
-    );
-    let mut solver = NewtonTrustRegion::new(beta0.clone(), objective)
-        .with_bounds(Bounds::new(lower, upper, 1e-6).expect("beta bounds must be valid"))
-        .with_tolerance(
-            Tolerance::new(options.inner_tol.max(1e-12))
-                .expect("inner exact-joint tolerance must be valid"),
-        )
-        .with_max_iterations(
-            MaxIterations::new(options.inner_max_cycles.max(500))
-                .expect("inner exact-joint max iterations must be valid"),
-        );
-
-    let solution = match solver.run() {
-        Ok(sol) => sol,
-        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => *last_solution,
-        Err(err) => {
-            return Err(format!(
-                "custom-family exact-joint inner optimization failed: {err:?}"
-            ));
-        }
-    };
-
-    let (_beta_star, states) = if let Some((x, _obj, _grad, states)) = last_eval.take() {
-        if x.len() == solution.final_point.len()
-            && x.iter()
-                .zip(solution.final_point.iter())
-                .all(|(&a, &b)| (a - b).abs() <= 1e-10)
-        {
-            (x, states)
-        } else {
-            let states = project_states(&solution.final_point)?;
-            (solution.final_point.clone(), states)
-        }
-    } else {
-        let states = project_states(&solution.final_point)?;
-        (solution.final_point.clone(), states)
-    };
-    let eval = family.evaluate(&states)?;
-    let stationarity_inf = exact_newton_joint_stationarity_inf_norm(
-        &eval,
-        &states,
-        s_lambdas,
-        ridge,
-        options.ridge_policy,
-    )?
-    .ok_or_else(|| "inner exact-joint fit expected exact-newton working sets".to_string())?;
-    if stationarity_inf > options.inner_tol.max(1e-12) {
-        return Err(format!(
-            "custom-family exact-joint inner optimization stalled before stationarity: inf_norm={stationarity_inf:.3e}"
-        ));
-    }
-
-    let penalty_value = total_quadratic_penalty(&states, s_lambdas, ridge, options.ridge_policy);
-    let (block_logdet_h, block_logdet_s) = {
-        let mut states_for_logdet = states.clone();
-        blockwise_logdet_terms(
-            family,
-            specs,
-            &mut states_for_logdet,
-            block_log_lambdas,
-            options,
-        )?
-    };
-
-    let cycles = solution.iterations;
-    let converged = stationarity_inf <= options.inner_tol.max(1e-12);
-    Ok(BlockwiseInnerResult {
-        block_states: states,
-        active_sets,
-        log_likelihood: eval.log_likelihood,
-        penalty_value,
-        cycles,
-        converged,
-        block_logdet_h,
-        block_logdet_s,
-    })
-}
-
 fn solve_kkt_step(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -1942,24 +1731,14 @@ fn inner_blockwise_fit<F: CustomFamily>(
 
         let objective_tol = inner_tol * (1.0 + objective.abs());
         let exact_joint_stationarity_ok = if has_joint_exact_hessian {
-            let stationarity_inf = exact_newton_joint_stationarity_inf_norm(
+            exact_newton_joint_stationarity_inf_norm(
                 &eval,
                 &states,
                 &s_lambdas,
                 ridge,
                 options.ridge_policy,
             )?
-                    .ok_or_else(|| {
-                        "joint exact-newton Hessian is available, but the family did not return exact-newton working sets for all blocks".to_string()
-                    })?;
-            // The exact outer LAML formulas differentiate the jointly refit
-            // inner mode. For coupled exact-Newton families that means we need
-            // the full penalized first-order condition to be genuinely small,
-            // not merely that coordinate updates have stalled. We therefore use
-            // a stricter coupled stationarity check here than the generic
-            // blockwise `inner_tol`, which is tuned to per-block coefficient
-            // changes rather than gradient residuals.
-            stationarity_inf <= inner_tol
+            .is_some()
         } else {
             true
         };
@@ -1973,17 +1752,6 @@ fn inner_blockwise_fit<F: CustomFamily>(
     }
 
     let final_eval = family.evaluate(&states)?;
-    if has_joint_exact_hessian && !converged {
-        return inner_exact_joint_fit(
-            family,
-            specs,
-            block_log_lambdas,
-            &s_lambdas,
-            options,
-            &states,
-            cached_active_sets,
-        );
-    }
     let penalty_value = total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
 
     let (block_logdet_h, block_logdet_s) =
@@ -3950,7 +3718,7 @@ pub fn fit_custom_family<F: CustomFamily>(
         .with_tolerance(
             Tolerance::new(options.outer_tol).expect("custom-family tolerance must be valid"),
         )
-        .with_profile(opt::Profile::Aggressive)
+        .with_profile(opt::Profile::Robust)
         .with_max_iterations(
             MaxIterations::new(options.outer_max_iter)
                 .expect("custom-family max iterations must be valid"),

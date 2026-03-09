@@ -1333,38 +1333,21 @@ where
             "simultaneous mixture and SAS optimization is not supported".to_string(),
         ));
     } else if mixture_dim == 0 && sas_dim == 0 {
+        let mut pure_smoothing_options = smoothing_options.clone();
+        pure_smoothing_options.optimizer_kind =
+            crate::solver::smoothing::SmoothingOptimizerKind::Bfgs;
         let outer_result =
-            crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient_and_hessian(
+            crate::solver::smoothing::optimize_log_smoothing_with_multistart_with_gradient(
                 k,
                 heuristic_lambdas,
                 |rho: &Array1<f64>| {
-                    let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
+                    outer_eval_idx.fetch_add(1, Ordering::Relaxed);
                     reml_state.set_warm_start_original_beta(None);
-
-                    let t_cost = Instant::now();
                     let cost = reml_state.compute_cost(rho)?;
-                    let cost_sec = t_cost.elapsed().as_secs_f64();
-
-                    let t_grad = Instant::now();
                     let grad = reml_state.compute_gradient(rho)?;
-                    let grad_sec = t_grad.elapsed().as_secs_f64();
-                    let used_stochastic = reml_state.last_gradient_used_stochastic_fallback();
-
-                    let t_hess = Instant::now();
-                    let hess = reml_state.compute_laml_hessian_consistent(rho)?;
-                    let hess_sec = t_hess.elapsed().as_secs_f64();
-
-                    log::info!(
-                        "[outer-eval {eval_idx}] k={} grad_calls=1 stochastic_fallback={} time_sec(cost={:.3}, grad={:.3}, hess={:.3})",
-                        rho.len(),
-                        used_stochastic,
-                        cost_sec,
-                        grad_sec,
-                        hess_sec,
-                    );
-                    Ok((cost, grad, Some(hess)))
+                    Ok((cost, grad))
                 },
-                &smoothing_options,
+                &pure_smoothing_options,
             )?;
         (
             outer_result.rho.clone(),
