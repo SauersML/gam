@@ -3799,6 +3799,436 @@ impl BinomialLocationScaleFamily {
         Ok((threshold_design.to_dense(), log_sigma_design.to_dense()))
     }
 
+    fn dense_block_designs_from_specs(
+        &self,
+        specs: &[ParameterBlockSpec],
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        if specs.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleFamily spec-aware exact path expects 2 specs, got {}",
+                specs.len()
+            ));
+        }
+        Ok((
+            specs[Self::BLOCK_T].design.to_dense(),
+            specs[Self::BLOCK_LOG_SIGMA].design.to_dense(),
+        ))
+    }
+
+    fn exact_joint_dense_block_designs(
+        &self,
+        specs: Option<&[ParameterBlockSpec]>,
+    ) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+        // The probit non-wiggle family is structurally capable of exact joint
+        // outer rho-derivatives whenever the realized threshold and log-sigma
+        // designs are available somewhere. Prefer cached family designs when
+        // present, but allow the outer hyper code to recover the exact same
+        // joint path from the realized `specs`.
+        //
+        // This is not a convenience fallback. The coupled profiled derivative
+        // is defined in terms of the joint mode system
+        //
+        //   H u_k = -A_k beta,
+        //
+        // so if the block specs already determine the realized joint
+        // curvature, forcing the code back onto a blockwise surrogate just
+        // because the family did not cache duplicate dense designs would be
+        // mathematically wrong.
+        if !matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+            return Ok(None);
+        }
+        if self.threshold_design.is_some() && self.log_sigma_design.is_some() {
+            return self.dense_block_designs().map(Some);
+        }
+        if let Some(specs) = specs {
+            return self.dense_block_designs_from_specs(specs).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn exact_newton_joint_hessian_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        // Exact joint coefficient-space Hessian for the probit, non-wiggle
+        // location-scale family.
+        //
+        // At the fitted mode, the correct joint outer smoothing sensitivity is
+        //
+        //   H u_k = -g_k,
+        //   g_k = A_k beta,
+        //
+        // so the solve must use the full joint working-curvature matrix `H`.
+        // For this family the likelihood is coupled through
+        //
+        //   q = -eta_t exp(-eta_ls),
+        //
+        // so the threshold and log-sigma blocks are not independent even if
+        // the penalties are block-diagonal.
+        //
+        // Write for row i
+        //
+        //   t_i = x_i^T beta_t,
+        //   s_i = z_i^T beta_ls,
+        //   r_i = exp(-s_i),
+        //   q_i = -t_i r_i,
+        //   F_i(q) = -w_i [ y_i log Phi(q) + (1-y_i) log(1-Phi(q)) ].
+        //
+        // Let
+        //
+        //   m1_i = F_i'(q_i),
+        //   m2_i = F_i''(q_i).
+        //
+        // The q-derivatives with respect to the two predictors are
+        //
+        //   q_t  = -r,
+        //   q_ls = -q,
+        //   q_tt = 0,
+        //   q_t,ls = r,
+        //   q_ls,ls = q.
+        //
+        // For any scalar-composition objective G(t,s)=F(q(t,s)), the Hessian
+        // coefficients are
+        //
+        //   G_ab = m2 q_a q_b + m1 q_ab.
+        //
+        // Therefore the exact rowwise joint curvature in (eta_t, eta_ls) is
+        //
+        //   coeff_tt = m2 r^2,
+        //   coeff_t,ls = r (m1 + q m2),
+        //   coeff_ls,ls = q (m1 + q m2),
+        //
+        // and the full joint coefficient-space Hessian is assembled as
+        //
+        //   H_tt    = X_t^T diag(coeff_tt)    X_t,
+        //   H_t,ls  = X_t^T diag(coeff_t,ls)  X_ls,
+        //   H_ls,ls = X_ls^T diag(coeff_ls,ls) X_ls.
+        //
+        // The off-diagonal block is generally nonzero. That is exactly the
+        // coupling term the broken blockwise outer-gradient path was dropping.
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleFamily input size mismatch".to_string());
+        }
+
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let mut coeff_tt = Array1::<f64>::zeros(n);
+        let mut coeff_tl = Array1::<f64>::zeros(n);
+        let mut coeff_ll = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let q = core.q0[i];
+            let r = 1.0 / core.sigma[i].max(1e-12);
+            let (m1, m2, _m3) = binomial_neglog_q_derivatives_probit_closed_form(
+                self.y[i],
+                self.weights[i],
+                q,
+                core.mu[i],
+            );
+            coeff_tt[i] = m2 * r * r;
+            coeff_tl[i] = r * (m1 + q * m2);
+            coeff_ll[i] = q * (m1 + q * m2);
+        }
+
+        let h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
+        let h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
+        let h_ll = xt_diag_x_dense(x_ls, &coeff_ll)?;
+        let total = pt + pls;
+        let mut h = Array2::<f64>::zeros((total, total));
+        h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
+        h.slice_mut(s![0..pt, pt..total]).assign(&h_tl);
+        h.slice_mut(s![pt..total, pt..total]).assign(&h_ll);
+        mirror_upper_to_lower(&mut h);
+        Ok(Some(h))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        // Exact first directional derivative D_beta H_L[u] of the joint
+        // likelihood curvature.
+        //
+        // Write
+        //
+        //   t  = X_t beta_t,
+        //   ls = X_ls beta_ls,
+        //   s  = exp(-ls),
+        //   q  = -t .* s.
+        //
+        // For a full coefficient-space direction
+        //
+        //   u = (u_t, u_ls),
+        //   xi_t  = X_t u_t,
+        //   xi_ls = X_ls u_ls,
+        //
+        // the induced q-direction is
+        //
+        //   alpha = D q[u] = -s .* xi_t - q .* xi_ls.
+        //
+        // The joint diagonal-working-curvature likelihood matrix is
+        //
+        //   H_L = J^T W J,
+        //   J_t  = -diag(s) X_t,
+        //   J_ls = -diag(q) X_ls.
+        //
+        // Differentiating once gives
+        //
+        //   D_beta H_L[u]
+        //   = K[u]^T W J
+        //     + J^T W K[u]
+        //     + J^T diag(nu .* alpha) J,
+        //
+        // where
+        //
+        //   K_t[u]  = diag(s .* xi_ls) X_t,
+        //   K_ls[u] = diag(s .* xi_t + q .* xi_ls) X_ls,
+        //
+        // and `nu = d'''(q)` is the third derivative of the scalar row loss.
+        // This is exactly the joint curvature drift that enters the profiled
+        // derivative through
+        //
+        //   dot H_k = A_k + D_beta H_L[u_k],
+        //   dJ/drho_k
+        //   = 0.5 beta^T A_k beta
+        //     + 0.5 tr(H^{-1} dot H_k)
+        //     - 0.5 tr(S^+ A_k).
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleFamily input size mismatch".to_string());
+        }
+
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        if d_beta_flat.len() != pt + pls {
+            return Err(format!(
+                "BinomialLocationScaleFamily joint d_beta length mismatch: got {}, expected {}",
+                d_beta_flat.len(),
+                pt + pls
+            ));
+        }
+        let u_t = d_beta_flat.slice(s![0..pt]).to_owned();
+        let u_ls = d_beta_flat.slice(s![pt..pt + pls]).to_owned();
+        let d_eta_t = x_t.dot(&u_t);
+        let d_eta_ls = x_ls.dot(&u_ls);
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+
+        let mut coeff_tt = Array1::<f64>::zeros(n);
+        let mut coeff_tl = Array1::<f64>::zeros(n);
+        let mut coeff_ll = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let q = core.q0[i];
+            let r = 1.0 / core.sigma[i].max(1e-12);
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(
+                self.y[i],
+                self.weights[i],
+                q,
+                core.mu[i],
+            );
+            let a = d_eta_t[i];
+            let b = d_eta_ls[i];
+            let du = -r * a - q * b;
+            coeff_tt[i] = r * r * (m3 * du - 2.0 * m2 * b);
+            coeff_tl[i] = r * (q * m3 * du + m2 * (2.0 * du - q * b) - m1 * b);
+            coeff_ll[i] = (m1 + 3.0 * q * m2 + q * q * m3) * du;
+        }
+
+        let d_h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
+        let d_h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
+        let d_h_ll = xt_diag_x_dense(x_ls, &coeff_ll)?;
+        let total = pt + pls;
+        let mut d_h = Array2::<f64>::zeros((total, total));
+        d_h.slice_mut(s![0..pt, 0..pt]).assign(&d_h_tt);
+        d_h.slice_mut(s![0..pt, pt..total]).assign(&d_h_tl);
+        d_h.slice_mut(s![pt..total, pt..total]).assign(&d_h_ll);
+        mirror_upper_to_lower(&mut d_h);
+        Ok(Some(d_h))
+    }
+
+    fn exact_newton_joint_hessian_second_directional_derivative_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        // Exact mixed second directional derivative D_beta^2 H_L[u, v].
+        //
+        // This is the family-specific part of the total second curvature drift
+        //
+        //   ddot H_{k,l}
+        //   = B_{k,l}
+        //     + D_beta H_L[u_{k,l}]
+        //     + D_beta^2 H_L[u_l, u_k],
+        //
+        // used in the profiled outer Hessian
+        //
+        //   d^2J/(drho_k drho_l)
+        //   = u_l^T A_k beta
+        //     + 0.5 beta^T B_{k,l} beta
+        //     + 0.5 tr(H^{-1} ddot H_{k,l})
+        //     - 0.5 tr(H^{-1} dot H_l H^{-1} dot H_k)
+        //     - 0.5 d^2/drho_k drho_l log|S|_+.
+        //
+        // For directions
+        //
+        //   u = (u_t, u_ls),  v = (v_t, v_ls),
+        //
+        // define the rowwise predictor perturbations
+        //
+        //   xi_t^(u)  = X_t u_t,    xi_ls^(u)  = X_ls u_ls,
+        //   xi_t^(v)  = X_t v_t,    xi_ls^(v)  = X_ls v_ls.
+        //
+        // With
+        //
+        //   s = exp(-eta_ls),
+        //   q = -eta_t .* s,
+        //
+        // the first and second q-drifts are
+        //
+        //   alpha(u)   = D q[u]   = -s .* xi_t^(u) - q .* xi_ls^(u),
+        //   alpha(v)   = D q[v]   = -s .* xi_t^(v) - q .* xi_ls^(v),
+        //   alpha(u,v) = D^2 q[u,v]
+        //              = s .* (xi_t^(u) .* xi_ls^(v) + xi_t^(v) .* xi_ls^(u))
+        //                + q .* xi_ls^(u) .* xi_ls^(v).
+        //
+        // Differentiating the scalar-composition Hessian coefficients twice
+        // yields the rowwise formulas below. Those formulas are exactly the
+        // fourth-order beta-curvature contraction needed to make the joint
+        // rho-Hessian path consistent with the first-order joint solve.
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err("BinomialLocationScaleFamily input size mismatch".to_string());
+        }
+
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let total = pt + pls;
+        if d_beta_u_flat.len() != total {
+            return Err(format!(
+                "BinomialLocationScaleFamily joint d_beta_u length mismatch: got {}, expected {}",
+                d_beta_u_flat.len(),
+                total
+            ));
+        }
+        if d_beta_v_flat.len() != total {
+            return Err(format!(
+                "BinomialLocationScaleFamily joint d_beta_v length mismatch: got {}, expected {}",
+                d_beta_v_flat.len(),
+                total
+            ));
+        }
+        let u_t = d_beta_u_flat.slice(s![0..pt]).to_owned();
+        let u_ls = d_beta_u_flat.slice(s![pt..total]).to_owned();
+        let v_t = d_beta_v_flat.slice(s![0..pt]).to_owned();
+        let v_ls = d_beta_v_flat.slice(s![pt..total]).to_owned();
+        let d_eta_t_u = x_t.dot(&u_t);
+        let d_eta_ls_u = x_ls.dot(&u_ls);
+        let d_eta_t_v = x_t.dot(&v_t);
+        let d_eta_ls_v = x_ls.dot(&v_ls);
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+
+        let mut coeff_tt = Array1::<f64>::zeros(n);
+        let mut coeff_tl = Array1::<f64>::zeros(n);
+        let mut coeff_ll = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let q = core.q0[i];
+            let r = 1.0 / core.sigma[i].max(1e-12);
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(
+                self.y[i],
+                self.weights[i],
+                q,
+                core.mu[i],
+            );
+            let m4 = binomial_neglog_q_fourth_derivative_probit_closed_form(
+                self.y[i],
+                self.weights[i],
+                q,
+                core.mu[i],
+            );
+            let a = d_eta_t_u[i];
+            let b = d_eta_ls_u[i];
+            let c = d_eta_t_v[i];
+            let d = d_eta_ls_v[i];
+            let du = -r * a - q * b;
+            let dv = -r * c - q * d;
+            let d2 = r * (a * d + b * c) + q * b * d;
+            coeff_tt[i] =
+                r * r * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
+            coeff_tl[i] = r
+                * (q * m4 * du * dv
+                    + m3 * (q * d2 + 3.0 * du * dv - q * (d * du + b * dv))
+                    + m2 * (q * b * d + 2.0 * d2 - 2.0 * (d * du + b * dv))
+                    + m1 * b * d);
+            coeff_ll[i] = q * q * m4 * du * dv
+                + m3 * (q * q * d2 + 5.0 * q * du * dv)
+                + m2 * (3.0 * q * d2 + 4.0 * du * dv)
+                + m1 * d2;
+        }
+
+        let d2_h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
+        let d2_h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
+        let d2_h_ll = xt_diag_x_dense(x_ls, &coeff_ll)?;
+        let mut d2_h = Array2::<f64>::zeros((total, total));
+        d2_h.slice_mut(s![0..pt, 0..pt]).assign(&d2_h_tt);
+        d2_h.slice_mut(s![0..pt, pt..total]).assign(&d2_h_tl);
+        d2_h.slice_mut(s![pt..total, pt..total]).assign(&d2_h_ll);
+        mirror_upper_to_lower(&mut d2_h);
+        Ok(Some(d2_h))
+    }
+
     fn exact_newton_block_psi_primitives(
         &self,
         block_states: &[ParameterBlockState],
@@ -4063,6 +4493,10 @@ impl CustomFamily for BinomialLocationScaleFamily {
         })
     }
 
+    fn requires_joint_outer_hyper_path(&self) -> bool {
+        matches!(self.link_kind, InverseLink::Standard(LinkFunction::Probit))
+    }
+
     fn diagonal_working_weights_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
@@ -4297,97 +4731,10 @@ impl CustomFamily for BinomialLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        // Exact joint coefficient-space Hessian for the probit, non-wiggle
-        // location-scale family.
-        //
-        // Definitions for row i:
-        //   t_i = x_i^T beta_t
-        //   s_i = z_i^T beta_s
-        //   r_i = exp(-s_i)
-        //   q_i = -t_i r_i
-        //   F_i(q) = -w_i [ y_i log Phi(q) + (1-y_i) log(1-Phi(q)) ].
-        //
-        // Let
-        //   m1_i = F_i'(q_i),
-        //   m2_i = F_i''(q_i).
-        //
-        // For q(t,s) = -t exp(-s), the predictor derivatives are
-        //   q_t  = -r,
-        //   q_s  = -q,
-        //   q_tt = 0,
-        //   q_ts = r,
-        //   q_ss = q.
-        //
-        // For any scalar-composition objective G(t,s)=F(q(t,s)),
-        // the Hessian coefficients are
-        //   G_ab = m2 q_a q_b + m1 q_ab.
-        //
-        // Therefore the exact rowwise coefficient-space blocks are
-        //   coeff_tt = m2 r^2,
-        //   coeff_ts = r (m1 + q m2),
-        //   coeff_ss = q (m1 + q m2),
-        //
-        // and the full joint Hessian is assembled as
-        //   H_tt = X_t^T diag(coeff_tt) X_t,
-        //   H_ts = X_t^T diag(coeff_ts) X_s,
-        //   H_ss = X_s^T diag(coeff_ss) X_s.
-        //
-        // Rows on an active probability clamp branch contribute zero because
-        // the probit derivative helpers return m1=m2=0 there.
-        if !self.exact_joint_supported() {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
             return Ok(None);
-        }
-        if block_states.len() != 2 {
-            return Err(format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ));
-        }
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err("BinomialLocationScaleFamily input size mismatch".to_string());
-        }
-
-        let (x_t, x_ls) = self.dense_block_designs()?;
-        let core = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            eta_t,
-            eta_ls,
-            None,
-            &self.link_kind,
-        )?;
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q = core.q0[i];
-            let r = 1.0 / core.sigma[i].max(1e-12);
-            let (m1, m2, _m3) = binomial_neglog_q_derivatives_probit_closed_form(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-            );
-            coeff_tt[i] = m2 * r * r;
-            coeff_tl[i] = r * (m1 + q * m2);
-            coeff_ll[i] = q * (m1 + q * m2);
-        }
-
-        let h_tt = xt_diag_x_dense(&x_t, &coeff_tt)?;
-        let h_tl = xt_diag_y_dense(&x_t, &coeff_tl, &x_ls)?;
-        let h_ll = xt_diag_x_dense(&x_ls, &coeff_ll)?;
-        let total = pt + pls;
-        let mut h = Array2::<f64>::zeros((total, total));
-        h.slice_mut(s![0..pt, 0..pt]).assign(&h_tt);
-        h.slice_mut(s![0..pt, pt..total]).assign(&h_tl);
-        h.slice_mut(s![pt..total, pt..total]).assign(&h_ll);
-        mirror_upper_to_lower(&mut h);
-        Ok(Some(h))
+        };
+        self.exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -4395,107 +4742,15 @@ impl CustomFamily for BinomialLocationScaleFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        // Exact directional derivative D H[u] of the joint Hessian.
-        //
-        // Write the flattened coefficient-space direction as
-        //   u = (u_t, u_s),
-        // with rowwise predictor perturbations
-        //   a = (X_t u_t)_i,
-        //   b = (X_s u_s)_i.
-        //
-        // Using q = -t exp(-s), define
-        //   r  = exp(-s),
-        //   du = D q[u] = q_t a + q_s b = -r a - q b.
-        //
-        // The needed directional q-derivatives are
-        //   D q_t [u]  =  r b,
-        //   D q_s [u]  = -du,
-        //   D q_ts[u]  = -r b,
-        //   D q_ss[u]  =  du.
-        //
-        // Let m1=F'(q), m2=F''(q), m3=F'''(q). For
-        //   H_ab = m2 q_a q_b + m1 q_ab,
-        // the exact first directional derivative is
-        //
-        //   D H_ab[u]
-        //   = m3 du q_a q_b
-        //   + m2 ( Dq_a[u] q_b + q_a Dq_b[u] + du q_ab )
-        //   + m1 Dq_ab[u].
-        //
-        // Specializing to the non-wiggle exp-scale family yields the rowwise
-        // coefficients implemented below:
-        //   coeff_tt_u = r^2 (m3 du - 2 m2 b),
-        //   coeff_ts_u = r (q m3 du + m2(2 du - q b) - m1 b),
-        //   coeff_ss_u = (m1 + 3 q m2 + q^2 m3) du.
-        if !self.exact_joint_supported() {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
             return Ok(None);
-        }
-        if block_states.len() != 2 {
-            return Err(format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ));
-        }
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err("BinomialLocationScaleFamily input size mismatch".to_string());
-        }
-
-        let (x_t, x_ls) = self.dense_block_designs()?;
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        if d_beta_flat.len() != pt + pls {
-            return Err(format!(
-                "BinomialLocationScaleFamily joint d_beta length mismatch: got {}, expected {}",
-                d_beta_flat.len(),
-                pt + pls
-            ));
-        }
-        let u_t = d_beta_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_flat.slice(s![pt..pt + pls]).to_owned();
-        let d_eta_t = x_t.dot(&u_t);
-        let d_eta_ls = x_ls.dot(&u_ls);
-        let core = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            eta_t,
-            eta_ls,
-            None,
-            &self.link_kind,
-        )?;
-
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q = core.q0[i];
-            let r = 1.0 / core.sigma[i].max(1e-12);
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-            );
-            let a = d_eta_t[i];
-            let b = d_eta_ls[i];
-            let du = -r * a - q * b;
-            coeff_tt[i] = r * r * (m3 * du - 2.0 * m2 * b);
-            coeff_tl[i] = r * (q * m3 * du + m2 * (2.0 * du - q * b) - m1 * b);
-            coeff_ll[i] = (m1 + 3.0 * q * m2 + q * q * m3) * du;
-        }
-
-        let d_h_tt = xt_diag_x_dense(&x_t, &coeff_tt)?;
-        let d_h_tl = xt_diag_y_dense(&x_t, &coeff_tl, &x_ls)?;
-        let d_h_ll = xt_diag_x_dense(&x_ls, &coeff_ll)?;
-        let total = pt + pls;
-        let mut d_h = Array2::<f64>::zeros((total, total));
-        d_h.slice_mut(s![0..pt, 0..pt]).assign(&d_h_tt);
-        d_h.slice_mut(s![0..pt, pt..total]).assign(&d_h_tl);
-        d_h.slice_mut(s![pt..total, pt..total]).assign(&d_h_ll);
-        mirror_upper_to_lower(&mut d_h);
-        Ok(Some(d_h))
+        };
+        self.exact_newton_joint_hessian_directional_derivative_from_designs(
+            block_states,
+            &x_t,
+            &x_ls,
+            d_beta_flat,
+        )
     }
 
     fn exact_newton_joint_hessian_second_directional_derivative(
@@ -4504,154 +4759,63 @@ impl CustomFamily for BinomialLocationScaleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        // Exact mixed second directional derivative D^2 H[u,v].
-        //
-        // Directions:
-        //   u = (u_t, u_s),   v = (v_t, v_s)
-        // with rowwise predictor perturbations
-        //   a = (X_t u_t)_i,  b = (X_s u_s)_i,
-        //   c = (X_t v_t)_i,  d = (X_s v_s)_i.
-        //
-        // For q = -t exp(-s), define
-        //   du = Dq[u] = -r a - q b,
-        //   dv = Dq[v] = -r c - q d,
-        //   d2 = D^2 q[u,v] = r (a d + b c) + q b d.
-        //
-        // The scalar-composition Hessian identity is
-        //   H_ab = m2 q_a q_b + m1 q_ab,
-        // where m_k = F^(k)(q).
-        //
-        // Differentiating twice gives
-        //
-        //   D^2 H_ab[u,v] =
-        //      m4 du dv q_a q_b
-        //    + m3 ( d2 q_a q_b
-        //         + du (Dq_a[v] q_b + q_a Dq_b[v])
-        //         + dv (Dq_a[u] q_b + q_a Dq_b[u])
-        //         + du dv q_ab )
-        //    + m2 ( D^2 q_a[u,v] q_b + Dq_a[u] Dq_b[v] + Dq_a[v] Dq_b[u]
-        //         + q_a D^2 q_b[u,v]
-        //         + d2 q_ab + du Dq_ab[v] + dv Dq_ab[u] )
-        //    + m1 D^2 q_ab[u,v].
-        //
-        // Specializing all q-derivatives for q=-t exp(-s) and simplifying gives
-        // the exact rowwise block coefficients:
-        //
-        //   coeff_tt_uv =
-        //     r^2 [ m4 du dv + m3(d2 - 2 d du - 2 b dv) + 4 m2 b d ]
-        //
-        //   coeff_ts_uv =
-        //     r [ q m4 du dv
-        //       + m3(q d2 + 3 du dv - q(d du + b dv))
-        //       + m2(q b d + 2 d2 - 2(d du + b dv))
-        //       + m1 b d ]
-        //
-        //   coeff_ss_uv =
-        //     q^2 m4 du dv
-        //     + m3(q^2 d2 + 5 q du dv)
-        //     + m2(3 q d2 + 4 du dv)
-        //     + m1 d2.
-        //
-        // These are exactly the quantities the outer exact-LAML Hessian path
-        // needs for J_{k,l} = D H[u_{k,l}] + D^2 H[u_l, u_k] + delta_{k,l} A_k.
-        if !self.exact_joint_supported() {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
             return Ok(None);
-        }
-        if block_states.len() != 2 {
-            return Err(format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ));
-        }
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err("BinomialLocationScaleFamily input size mismatch".to_string());
-        }
+        };
+        self.exact_newton_joint_hessian_second_directional_derivative_from_designs(
+            block_states,
+            &x_t,
+            &x_ls,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+    }
 
-        let (x_t, x_ls) = self.dense_block_designs()?;
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let total = pt + pls;
-        if d_beta_u_flat.len() != total {
-            return Err(format!(
-                "BinomialLocationScaleFamily joint d_beta_u length mismatch: got {}, expected {}",
-                d_beta_u_flat.len(),
-                total
-            ));
-        }
-        if d_beta_v_flat.len() != total {
-            return Err(format!(
-                "BinomialLocationScaleFamily joint d_beta_v length mismatch: got {}, expected {}",
-                d_beta_v_flat.len(),
-                total
-            ));
-        }
-        let u_t = d_beta_u_flat.slice(s![0..pt]).to_owned();
-        let u_ls = d_beta_u_flat.slice(s![pt..total]).to_owned();
-        let v_t = d_beta_v_flat.slice(s![0..pt]).to_owned();
-        let v_ls = d_beta_v_flat.slice(s![pt..total]).to_owned();
-        let d_eta_t_u = x_t.dot(&u_t);
-        let d_eta_ls_u = x_ls.dot(&u_ls);
-        let d_eta_t_v = x_t.dot(&v_t);
-        let d_eta_ls_v = x_ls.dot(&v_ls);
-        let core = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            eta_t,
-            eta_ls,
-            None,
-            &self.link_kind,
-        )?;
+    fn exact_newton_joint_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)
+    }
 
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q = core.q0[i];
-            let r = 1.0 / core.sigma[i].max(1e-12);
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-            );
-            let m4 = binomial_neglog_q_fourth_derivative_probit_closed_form(
-                self.y[i],
-                self.weights[i],
-                q,
-                core.mu[i],
-            );
-            let a = d_eta_t_u[i];
-            let b = d_eta_ls_u[i];
-            let c = d_eta_t_v[i];
-            let d = d_eta_ls_v[i];
-            let du = -r * a - q * b;
-            let dv = -r * c - q * d;
-            let d2 = r * (a * d + b * c) + q * b * d;
-            coeff_tt[i] =
-                r * r * (m4 * du * dv + m3 * (d2 - 2.0 * d * du - 2.0 * b * dv) + 4.0 * m2 * b * d);
-            coeff_tl[i] = r
-                * (q * m4 * du * dv
-                    + m3 * (q * d2 + 3.0 * du * dv - q * (d * du + b * dv))
-                    + m2 * (q * b * d + 2.0 * d2 - 2.0 * (d * du + b * dv))
-                    + m1 * b * d);
-            coeff_ll[i] = q * q * m4 * du * dv
-                + m3 * (q * q * d2 + 5.0 * q * du * dv)
-                + m2 * (3.0 * q * d2 + 4.0 * du * dv)
-                + m1 * d2;
-        }
+    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_directional_derivative_from_designs(
+            block_states,
+            &x_t,
+            &x_ls,
+            d_beta_flat,
+        )
+    }
 
-        let d2_h_tt = xt_diag_x_dense(&x_t, &coeff_tt)?;
-        let d2_h_tl = xt_diag_y_dense(&x_t, &coeff_tl, &x_ls)?;
-        let d2_h_ll = xt_diag_x_dense(&x_ls, &coeff_ll)?;
-        let mut d2_h = Array2::<f64>::zeros((total, total));
-        d2_h.slice_mut(s![0..pt, 0..pt]).assign(&d2_h_tt);
-        d2_h.slice_mut(s![0..pt, pt..total]).assign(&d2_h_tl);
-        d2_h.slice_mut(s![pt..total, pt..total]).assign(&d2_h_ll);
-        mirror_upper_to_lower(&mut d2_h);
-        Ok(Some(d2_h))
+    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.exact_newton_joint_hessian_second_directional_derivative_from_designs(
+            block_states,
+            &x_t,
+            &x_ls,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
     }
 }
 

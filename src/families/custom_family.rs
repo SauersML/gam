@@ -104,6 +104,33 @@ pub trait CustomFamily {
         ExactNewtonOuterObjective::QuadraticReml
     }
 
+    /// Whether outer hyper-derivative evaluation must use a joint exact path.
+    ///
+    /// Default `false` allows the generic blockwise diagonal fallback when a
+    /// family does not provide joint exact curvature.
+    ///
+    /// Families with coupled multi-block likelihoods can override this to
+    /// prevent the outer code from silently evaluating a mathematically
+    /// invalid block-local surrogate. The failure mode is:
+    ///
+    /// 1. the outer derivative still has block-local forcing
+    ///      g_k = A_k beta
+    ///    because `rho_k` enters only through the penalty;
+    /// 2. but the fitted mode response is not block-local,
+    ///      H u_k = -g_k,
+    ///    because the likelihood Hessian has off-diagonal block coupling;
+    /// 3. therefore a blockwise solve
+    ///      H_b u_{k,b} = -(A_k beta)_b
+    ///    is not the derivative of the profiled objective the code claims to
+    ///    be optimizing.
+    ///
+    /// When this flag is `true`, the family is asserting that any outer
+    /// hyper-derivative path must first obtain the full joint exact curvature
+    /// before it can return a mathematically valid result.
+    fn requires_joint_outer_hyper_path(&self) -> bool {
+        false
+    }
+
     /// Optional metadata describing a known link with learnable wiggle.
     fn known_link_wiggle(&self) -> Option<KnownLinkWiggle> {
         None
@@ -242,6 +269,128 @@ pub trait CustomFamily {
         _d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(None)
+    }
+
+    /// Optional spec-aware exact joint Hessian.
+    ///
+    /// This hook exists because the outer hyper-derivative code works from the
+    /// realized block specs, while some family instances may or may not cache
+    /// those realized designs internally.
+    ///
+    /// The profiled/Laplace outer objective used here is
+    ///
+    ///   J(rho)
+    ///   = V(beta(rho), rho)
+    ///     + 0.5 log|H(beta(rho), rho)|
+    ///     - 0.5 log|S(rho)|_+,
+    ///
+    /// evaluated at the fitted inner mode defined by
+    ///
+    ///   F(beta, rho) := D_beta V(beta, rho) = 0,
+    ///   H(beta, rho) := F_beta(beta, rho) = H_L(beta) + S(rho).
+    ///
+    /// Since the likelihood has no explicit rho-dependence, the fixed-beta
+    /// forcing for smoothing coordinate rho_k is
+    ///
+    ///   g_k := F_{rho_k} = A_k beta,
+    ///   A_k := dS/drho_k.
+    ///
+    /// Differentiating stationarity gives the exact joint mode response
+    ///
+    ///   H u_k = -g_k,
+    ///   u_k = d beta / d rho_k.
+    ///
+    /// Even if `A_k` is supported in only one penalty block, the solve for
+    /// `u_k` must use the full joint Hessian `H`, because the likelihood can
+    /// couple blocks through off-diagonal curvature. The first outer
+    /// derivative is then
+    ///
+    ///   dJ/drho_k
+    ///   = 0.5 beta^T A_k beta
+    ///     + 0.5 tr(H^{-1}(A_k + D_beta H_L[u_k]))
+    ///     - 0.5 tr(S^+ A_k).
+    ///
+    /// Families such as binomial location-scale with
+    ///
+    ///   q = -eta_t exp(-eta_ls)
+    ///
+    /// have exactly that coupled structure: the penalty forcing is block-local
+    /// but the fitted mode response and the resulting `D_beta H_L[u_k]` drift
+    /// are joint objects. If the realized `specs` already contain the designs
+    /// needed to build those objects, the outer code should use them directly
+    /// rather than falling back to a weaker blockwise surrogate just because
+    /// the family instance itself did not cache the same designs.
+    ///
+    /// The default implementation delegates to `exact_newton_joint_hessian`.
+    fn exact_newton_joint_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian(block_states)
+    }
+
+    /// Optional spec-aware exact first directional derivative of the joint Hessian.
+    ///
+    /// This is the spec-aware analogue of
+    /// `exact_newton_joint_hessian_directional_derivative`. It returns the
+    /// exact joint likelihood-curvature drift
+    ///
+    ///   D_beta H_L[u],
+    ///
+    /// for a flattened coefficient-space direction `u`. In the profiled
+    /// Laplace gradient this appears after solving the exact joint mode
+    /// response
+    ///
+    ///   H u_k = -A_k beta,
+    ///   dot H_k = A_k + D_beta H_L[u_k].
+    ///
+    /// Families that can reconstruct the exact joint geometry from `specs`
+    /// should override this alongside
+    /// `exact_newton_joint_hessian_with_specs`.
+    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)
+    }
+
+    /// Optional spec-aware exact second directional derivative of the joint Hessian.
+    ///
+    /// This is the spec-aware analogue of
+    /// `exact_newton_joint_hessian_second_directional_derivative`. For
+    /// rho/rho outer Hessian entries it supplies the exact joint second-order
+    /// likelihood-curvature drift
+    ///
+    ///   D_beta^2 H_L[u_l, u_k],
+    ///
+    /// which combines with
+    ///
+    ///   dot H_k = A_k + D_beta H_L[u_k]
+    ///
+    /// and the second mode response
+    ///
+    ///   H u_{k,l}
+    ///   = -(A_k u_l + A_l u_k + B_{k,l} beta + D_beta H_L[u_l] u_k)
+    ///
+    /// to form
+    ///
+    ///   ddot H_{k,l}
+    ///   = B_{k,l} + D_beta H_L[u_{k,l}] + D_beta^2 H_L[u_l, u_k].
+    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_second_directional_derivative(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
     }
 
     /// Optional exact directional derivative of diagonal working weights along
@@ -1554,10 +1703,11 @@ pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
 fn exact_newton_joint_hessian_symmetrized<F: CustomFamily>(
     family: &F,
     states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
     total: usize,
     context: &str,
 ) -> Result<Option<Array2<f64>>, String> {
-    let Some(mut h) = family.exact_newton_joint_hessian(states)? else {
+    let Some(mut h) = family.exact_newton_joint_hessian_with_specs(states, specs)? else {
         return Ok(None);
     };
     if h.nrows() != total || h.ncols() != total {
@@ -1799,6 +1949,7 @@ fn blockwise_logdet_terms<F: CustomFamily>(
     if let Some(h_joint) = exact_newton_joint_hessian_symmetrized(
         family,
         states,
+        specs,
         total,
         "joint exact-newton Hessian shape mismatch in logdet terms",
     )? {
@@ -2177,9 +2328,56 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
     let eval = family.evaluate(&inner.block_states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    // Joint exact-Hessian path for the current realized family/spec state.
+    //
+    // The outer objective is the profiled Laplace surface
+    //
+    //   J(rho)
+    //   = V(beta(rho), rho)
+    //     + 0.5 log|H(beta(rho), rho)|
+    //     - 0.5 log|S(rho)|_+,
+    //
+    // evaluated at the fitted inner mode. Here
+    //
+    //   F(beta, rho) := D_beta V(beta, rho) = 0,
+    //   H(beta, rho) := F_beta(beta, rho) = H_L(beta) + S(rho).
+    //
+    // Because the likelihood has no explicit rho-dependence, the fixed-beta
+    // forcing for smoothing coordinate rho_k is
+    //
+    //   g_k := F_{rho_k} = A_k beta,
+    //   A_k := dS/drho_k.
+    //
+    // Differentiating stationarity gives the exact joint mode response
+    //
+    //   H u_k = -g_k,
+    //   u_k = d beta / d rho_k.
+    //
+    // The first profiled derivative is therefore
+    //
+    //   dJ/drho_k
+    //   = 0.5 beta^T A_k beta
+    //     + 0.5 tr(H^{-1} dot H_k)
+    //     - 0.5 tr(S^+ A_k),
+    //
+    // with total curvature drift
+    //
+    //   dot H_k = A_k + D_beta H_L[u_k].
+    //
+    // The key structural fact is that `g_k` can be penalty-local while `u_k`
+    // is not. Once the likelihood couples blocks, solving only inside the
+    // penalized block computes the derivative of a different surrogate
+    // objective. Families such as binomial location-scale with
+    //
+    //   q = -eta_t exp(-eta_ls)
+    //
+    // therefore must use this joint path whenever the realized specs provide
+    // enough design information to build the exact joint curvature, even if
+    // the family instance itself did not cache those designs internally.
     if let Some(h_joint_unpen) = exact_newton_joint_hessian_symmetrized(
         family,
         &inner.block_states,
+        specs,
         total,
         "joint exact-newton Hessian shape mismatch in outer gradient",
     )? {
@@ -2229,41 +2427,47 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                     .assign(&s_part);
             }
         }
-        // Inner stationarity for the coupled blocks is:
-        //   g(beta,rho) = -∇_beta ell(beta) + P_mode(rho) beta = 0.
-        // Differentiating w.r.t. rho_k gives the exact sensitivity system:
-        //   J_mode * u_k = -A_k beta,  with u_k = d beta / d rho_k.
-        // We use A_k := dS_lambda/drho_k and J_mode = H(beta) + P_mode(rho), where
-        // H(beta) = -∇^2_beta ell(beta) is the full joint likelihood curvature.
+        // Inner stationarity for the coupled blocks is
         //
-        // Here `h_joint_unpen` is H(beta) and `s_joint` is P_mode(rho), so
-        // `j_joint = h_joint_unpen + s_joint` is the coupled mode Jacobian.
+        //   F(beta, rho) = D_beta V(beta, rho) = 0.
+        //
+        // Differentiating with respect to rho_k gives
+        //
+        //   H u_k = -g_k,
+        //   g_k = A_k beta,
+        //
+        // where `A_k = dS/drho_k`. Here `h_joint_unpen` is the joint
+        // likelihood curvature `H_L`, `s_joint` is the joint penalty matrix
+        // `S`, and
+        //
+        //   j_joint = h_joint_unpen + s_joint
+        //
+        // is the exact joint mode Jacobian used to solve `u_k`.
         let mut j_joint = h_joint_unpen.clone();
         j_joint += &s_joint;
 
         // Log-determinant traces may follow a ridge-augmented surface depending
-        // on ridge policy, but coupled beta sensitivities below are always solved
-        // against the full joint system J.
+        // on ridge policy, but the coupled beta sensitivities are always
+        // solved against the true joint mode system.
         //
-        // Exact REML/LAML first derivative for one smoothing coordinate rho_k:
+        // The exact first derivative for smoothing coordinate rho_k is
         //
-        //   V_k
+        //   dJ/drho_k
         //   = 0.5 beta^T A_k beta
-        //   + 0.5 tr(J_trace^{-1} J_k^total)
-        //   - 0.5 tr(S_+^{-1} A_k),
+        //     + 0.5 tr(J_trace^{-1} dot J_k)
+        //     - 0.5 tr(S_+^{-1} A_k),
         //
         // where
         //
-        //   A_k = dP/drho_k,
-        //   J_mode  = H(beta^) + P,
+        //   J_mode  = H_L(beta^) + S,
         //   J_trace = J_mode (+ optional logdet-only ridge),
-        //   J_k^total = A_k + D_beta H[u_k],
+        //   dot J_k = A_k + D_beta H_L[u_k],
         //   J_mode u_k = -A_k beta^.
         //
-        // The key algebraic separation is:
-        // - `u_k` must come from the mode system `J_mode`
-        // - the trace may be evaluated on the ridge-adjusted `J_trace`
-        //   if the chosen determinant surface includes that stabilization.
+        // The algebraic separation is:
+        // - `u_k` must come from the full joint mode system `J_mode`
+        // - the trace can be evaluated on the ridge-adjusted `J_trace`
+        //   if the chosen determinant surface includes that stabilization
         let mut j_for_traces = j_joint.clone();
         if !strict_spd && extra_logdet_ridge > 0.0 {
             for d in 0..total {
@@ -2327,28 +2531,26 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                     // Exact log-determinant derivative structure:
                     //
                     //   d/drho_k log|J_trace|
-                    //   = tr(J_trace^{-1} J_k^total),
+                    //   = tr(J_trace^{-1} dot J_k),
                     //
                     // with
                     //
-                    //   J_k^total = A_k + D_beta H[u_k].
+                    //   dot J_k = A_k + D_beta H_L[u_k].
                     //
-                    // The first term A_k is the explicit penalty drift. The
-                    // second term is the implicit beta-path correction: moving
-                    // rho_k changes the fitted mode beta^, and therefore changes
-                    // the likelihood curvature H(beta^).
-                    //
-                    // This branch preserves full cross-block coupling because
-                    // u_k is solved against the full joint mode system, not a
-                    // blockwise approximation.
+                    // The first term `A_k` is the explicit penalty drift. The
+                    // second term is the implicit mode-path correction: moving
+                    // rho_k changes the fitted coefficients, which changes the
+                    // joint likelihood curvature. This remains a full joint
+                    // object even when `A_k` is supported in only one block.
                     let mut d_j_k = a_k.clone();
                     if u_norm > 1e-14 {
-                        // D_beta H[u_k] is the directional derivative of the
-                        // joint likelihood Hessian with respect to beta along
-                        // u_k = d beta^ / d rho_k.
+                        // D_beta H_L[u_k] is the directional derivative of the
+                        // joint likelihood curvature with respect to beta along
+                        // the exact joint mode response u_k = d beta^ / d rho_k.
                         let h_rho = family
-                            .exact_newton_joint_hessian_directional_derivative(
+                            .exact_newton_joint_hessian_directional_derivative_with_specs(
                                 &synced_joint_states,
+                                specs,
                                 &u_k,
                             )?
                             .ok_or_else(|| {
@@ -2395,13 +2597,39 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
             let mut hess_available = true;
             for k in 0..rho.len() {
                 for l in k..rho.len() {
-                    // Outer Hessian entry (rho = log lambda coordinates):
-                    //   V_{k,l} =
-                    //     beta^T A_k u_l + 0.5*delta_{k,l}*beta^T A_k beta
-                    //   + 0.5*( -tr(J^{-1}J_l J^{-1}J_k) + tr(J^{-1}J_{k,l}) )
-                    //   + 0.5*tr(P^+ A_l P^+ A_k) - 0.5*delta_{k,l}*tr(P^+ A_k),
-                    // where A_k = dP/drho_k = lambda_k S_k and
-                    // delta_{k,l} A_k appears because dA_k/drho_l = delta_{k,l} A_k.
+                    // Exact profiled/Laplace Hessian entry for rho = log lambda:
+                    //
+                    //   d^2J / (drho_k drho_l)
+                    //   = u_l^T A_k beta
+                    //     + 0.5 beta^T B_{k,l} beta
+                    //     + 0.5 tr(H^{-1} ddot H_{k,l})
+                    //     - 0.5 tr(H^{-1} dot H_l H^{-1} dot H_k)
+                    //     - 0.5 d^2/drho_k drho_l log|S|_+.
+                    //
+                    // For simple log-scaled penalties, B_{k,l} = delta_{k,l} A_k.
+                    // The code stores
+                    //
+                    //   dot H_k = A_k + D_beta H_L[u_k]
+                    //
+                    // in `j_terms[k]`, then forms
+                    //
+                    //   ddot H_{k,l}
+                    //   = D_beta H_L[u_{k,l}]
+                    //     + D_beta^2 H_L[u_l, u_k]
+                    //     + delta_{k,l} A_k.
+                    //
+                    // The second mode response is solved from
+                    //
+                    //   H u_{k,l}
+                    //   = -(A_k u_l + dot H_l u_k + delta_{k,l} A_k beta),
+                    //
+                    // which is the log-scaled specialization of
+                    //
+                    //   H u_{k,l}
+                    //   = -(A_k u_l + A_l u_k + B_{k,l} beta + D_beta H_L[u_l] u_k).
+                    //
+                    // The positive-part penalty term below is the corresponding
+                    // second derivative of -0.5 log|S|_+.
                     let delta_kl = if k == l { 1.0 } else { 0.0 };
                     let mut v_kl = a_beta_terms[k].dot(&u_terms[l])
                         + 0.5 * delta_kl * beta_flat.dot(&a_beta_terms[k]);
@@ -2422,8 +2650,9 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                             "joint second-order mode sensitivity system for REML Hessian",
                         )?;
                         let dh_u_kl = match family
-                            .exact_newton_joint_hessian_directional_derivative(
+                            .exact_newton_joint_hessian_directional_derivative_with_specs(
                                 &synced_joint_states,
+                                specs,
                                 &u_kl,
                             )? {
                             Some(v) => symmetrized_square_matrix(
@@ -2437,8 +2666,9 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                             }
                         };
                         let d2h_ul_uk = match family
-                            .exact_newton_joint_hessian_second_directional_derivative(
+                            .exact_newton_joint_hessian_second_directional_derivative_with_specs(
                                 &synced_joint_states,
+                                specs,
                                 &u_terms[l],
                                 &u_terms[k],
                             )? {
@@ -2512,6 +2742,20 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
             warm_start: warm,
             inner,
         });
+    }
+    // At this point the joint exact path is unavailable. For some families
+    // that is acceptable: the generic blockwise diagonal surrogate below is
+    // the best derivative information they can provide.
+    //
+    // For coupled multi-block families that explicitly require a joint outer
+    // hyper path, however, dropping into that blockwise surrogate would be
+    // wrong. In those cases the correct behavior is to fail loudly rather than
+    // silently optimize a different objective.
+    if family.requires_joint_outer_hyper_path() {
+        return Err(
+            "outer hyper-derivative evaluation requires a joint exact path for this family"
+                .to_string(),
+        );
     }
     let mut at = 0usize;
     for b in 0..specs.len() {
@@ -4198,6 +4442,7 @@ fn compute_joint_covariance<F: CustomFamily>(
     let mut h = if let Some(h_exact) = exact_newton_joint_hessian_symmetrized(
         family,
         states,
+        specs,
         total,
         "joint exact-newton Hessian shape mismatch in covariance",
     )? {
@@ -5708,6 +5953,110 @@ mod tests {
                 beta_dense[j],
                 beta_sparse[j]
             );
+        }
+    }
+
+    #[test]
+    fn outer_laml_hessian_joint_exact_binomial_location_scale_hard_case_matches_fd() {
+        let n = 9usize;
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        let weights = Array1::from_elem(n, 1.0);
+        let threshold_spec = ParameterBlockSpec {
+            name: "threshold".to_string(),
+            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            offset: Array1::zeros(n),
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.2]),
+        };
+        let log_sigma_spec = ParameterBlockSpec {
+            name: "log_sigma".to_string(),
+            design: DesignMatrix::Dense(Array2::from_elem((n, 1), 1.0)),
+            offset: Array1::zeros(n),
+            penalties: vec![Array2::eye(1)],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![-0.1]),
+        };
+        let family = BinomialLocationScaleFamily {
+            y,
+            weights,
+            link_kind: crate::types::InverseLink::Standard(crate::types::LinkFunction::Probit),
+            threshold_design: None,
+            log_sigma_design: None,
+        };
+        let specs = vec![threshold_spec, log_sigma_spec];
+        let penalty_counts = vec![1usize, 1usize];
+        let rho = array![0.15, -0.25];
+        let options = BlockwiseFitOptions {
+            use_reml_objective: true,
+            ridge_floor: 1e-10,
+            outer_max_iter: 1,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let (_f0, _g0, h0_opt, _) = outer_objective_gradient_hessian(
+            &family,
+            &specs,
+            &options,
+            &penalty_counts,
+            &rho,
+            None,
+            true,
+        )
+        .expect("objective/gradient/hessian");
+        let h0 = h0_opt.expect("analytic outer Hessian should be available");
+        assert_eq!(h0.nrows(), rho.len());
+        assert_eq!(h0.ncols(), rho.len());
+
+        let h = 1e-5;
+        for l in 0..rho.len() {
+            let mut rho_p = rho.clone();
+            let mut rho_m = rho.clone();
+            rho_p[l] += h;
+            rho_m[l] -= h;
+            let (_fp, gp, _, _) = outer_objective_gradient_hessian(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho_p,
+                None,
+                false,
+            )
+            .expect("objective/gradient +");
+            let (_fm, gm, _, _) = outer_objective_gradient_hessian(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho_m,
+                None,
+                false,
+            )
+            .expect("objective/gradient -");
+
+            for k in 0..rho.len() {
+                let h_fd = (gp[k] - gm[k]) / (2.0 * h);
+                let abs_err = (h0[[k, l]] - h_fd).abs();
+                let rel = abs_err / h_fd.abs().max(1e-7);
+                if h0[[k, l]].abs().max(h_fd.abs()) > 1e-10 {
+                    assert_eq!(
+                        h0[[k, l]].signum(),
+                        h_fd.signum(),
+                        "hard-case outer Hessian sign mismatch at ({k},{l}): analytic={} fd={}",
+                        h0[[k, l]],
+                        h_fd
+                    );
+                }
+                assert!(
+                    abs_err < 1e-8 || rel < 2e-2,
+                    "hard-case outer Hessian mismatch at ({k},{l}): analytic={} fd={} abs={} rel={}",
+                    h0[[k, l]],
+                    h_fd,
+                    abs_err,
+                    rel
+                );
+            }
         }
     }
 
