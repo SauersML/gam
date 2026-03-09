@@ -46,6 +46,18 @@ class RunSuiteMappingTests(unittest.TestCase):
         self.assert_joint_mapping("papuan_oce4_tp_k12", expected_dim=3, expected_knots=12)
         self.assert_joint_mapping("geo_subpop16_tp_k24", expected_dim=3, expected_knots=24)
 
+    def test_geo_subpop16_dataset_builds_without_external_pc_file(self) -> None:
+        ds = _RUN_SUITE.dataset_for_scenario({"name": "geo_subpop16_tp_k6"})
+        self.assertEqual(ds["family"], "binomial")
+        self.assertEqual(ds["features"], [f"pc{i}" for i in range(1, 17)])
+        self.assertGreater(len(ds["rows"]), 0)
+
+    def test_geo_latlon_dataset_builds_without_external_pc_file(self) -> None:
+        ds = _RUN_SUITE.dataset_for_scenario({"name": "geo_latlon_superpopnoise_tp_k12"})
+        self.assertEqual(ds["family"], "binomial")
+        self.assertEqual(ds["features"], [f"pc{i}" for i in range(1, 7)])
+        self.assertGreater(len(ds["rows"]), 0)
+
     def test_legacy_geo_disease_tp_scenarios_use_fixed_joint_embedding(self) -> None:
         for scenario_name in ("geo_disease_tp", "geo_disease_shrinkage"):
             cfg = _RUN_SUITE._rust_fit_mapping(scenario_name)

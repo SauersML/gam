@@ -115,8 +115,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--input",
-        default="bench/datasets/hgdp_1kg_pc_data.tsv",
-        help="Input TSV with PC1..PC16 and Subpopulation",
+        default=None,
+        help="Optional TSV with PC1..PC16 and Subpopulation; defaults to the synthetic in-repo panel",
     )
     parser.add_argument(
         "--out-png",
@@ -130,13 +130,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    inp = Path(args.input)
     out_png = Path(args.out_png)
     out_csv = Path(args.out_csv)
     out_png.parent.mkdir(parents=True, exist_ok=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(inp, sep="\t")
+    if args.input:
+        df = pd.read_csv(Path(args.input), sep="\t")
+    else:
+        from run_suite import _synthetic_hgdp_1kg_pc_panel
+
+        df = _synthetic_hgdp_1kg_pc_panel()
     pc_cols = [f"PC{i}" for i in range(1, 17)]
     need = {"Subpopulation", "PC1", "PC2", *pc_cols}
     missing = need.difference(df.columns)

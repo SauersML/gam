@@ -89,7 +89,6 @@ HEARTBEAT_INTERVAL_SEC = 15.0
 # diagnostics capture meaningful process stats before exit.
 HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
-HGDP_1KG_PC_TSV = DATASET_DIR / "hgdp_1kg_pc_data.tsv"
 NON_BLOCKING_FAILURE_CONTENDERS = {
     # These external stacks are kept in the benchmark output for visibility,
     # but occasional fit/predict failures should not fail the whole CI shard.
@@ -112,6 +111,9 @@ _LEAN_PROFILE_EXCLUDED_CONTENDERS = {
     "python_lifelines_lognormal_aft",
     "python_xgboost_aft",
 }
+_SYNTHETIC_PC_PANEL_SEED = 20260329
+_SYNTHETIC_PC_PANEL_ROWS_PER_SUBPOP = 40
+_SYNTHETIC_PC_PANEL: pd.DataFrame | None = None
 
 
 @dataclass(frozen=True)
@@ -1910,15 +1912,85 @@ def _geo_latlon_scenario_cfg(name):
     }
 
 
+def _synthetic_hgdp_1kg_pc_panel():
+    global _SYNTHETIC_PC_PANEL
+    if _SYNTHETIC_PC_PANEL is not None:
+        return _SYNTHETIC_PC_PANEL.copy()
+
+    rng = np.random.default_rng(_SYNTHETIC_PC_PANEL_SEED)
+    superpop_specs = [
+        {"name": "AFR", "lat": 2.0, "lon": 20.0},
+        {"name": "EUR", "lat": 50.0, "lon": 15.0},
+        {"name": "EAS", "lat": 35.0, "lon": 115.0},
+        {"name": "SAS", "lat": 20.0, "lon": 78.0},
+        {"name": "AMR", "lat": -12.0, "lon": -72.0},
+        {"name": "OCE", "lat": -8.0, "lon": 145.0},
+    ]
+    rows = []
+    sample_idx = 0
+    pc_cols = [f"PC{i}" for i in range(1, 17)]
+
+    for super_idx, spec in enumerate(superpop_specs):
+        superpop_shift = rng.normal(loc=0.0, scale=0.85, size=16)
+        for sub_idx in range(4):
+            sub_name = f"{spec['name']}_SUB{sub_idx + 1:02d}"
+            sub_lat = float(spec["lat"] + rng.normal(0.0, 5.0))
+            sub_lon = float(spec["lon"] + rng.normal(0.0, 7.5))
+            sub_shift = rng.normal(loc=0.0, scale=0.30, size=16)
+            for _ in range(_SYNTHETIC_PC_PANEL_ROWS_PER_SUBPOP):
+                sample_lat = float(np.clip(sub_lat + rng.normal(0.0, 1.2), -58.0, 72.0))
+                sample_lon = float(((sub_lon + rng.normal(0.0, 1.8) + 180.0) % 360.0) - 180.0)
+                lat_norm = sample_lat / 90.0
+                lon_norm = sample_lon / 180.0
+                geo_terms = np.array(
+                    [
+                        lat_norm,
+                        lon_norm,
+                        lat_norm * lon_norm,
+                        np.sin(np.pi * lat_norm),
+                        np.cos(np.pi * lon_norm),
+                        np.sin(np.pi * (lat_norm + lon_norm) / 2.0),
+                        lat_norm**2,
+                        lon_norm**2,
+                        np.cos(np.pi * lat_norm),
+                        np.sin(np.pi * lon_norm),
+                        lat_norm - lon_norm,
+                        lat_norm + lon_norm,
+                        np.sin(np.pi * lat_norm * lon_norm),
+                        np.cos(np.pi * (lat_norm - lon_norm) / 2.0),
+                        lat_norm**3,
+                        lon_norm**3,
+                    ],
+                    dtype=float,
+                )
+                pcs = (
+                    1.55 * superpop_shift
+                    + 0.90 * sub_shift
+                    + 1.20 * geo_terms
+                    + rng.normal(loc=0.0, scale=0.18, size=16)
+                )
+                row = {
+                    "sample_id": f"sample_{sample_idx:05d}",
+                    "Superpopulation": spec["name"],
+                    "Subpopulation": sub_name,
+                    "Latitude": sample_lat,
+                    "Longitude": sample_lon,
+                }
+                row.update({col: float(pcs[i]) for i, col in enumerate(pc_cols)})
+                rows.append(row)
+                sample_idx += 1
+
+    _SYNTHETIC_PC_PANEL = pd.DataFrame(rows)
+    return _SYNTHETIC_PC_PANEL.copy()
+
+
 def _load_hgdp_pc_with_imputed_latlon():
-    if not HGDP_1KG_PC_TSV.exists():
-        raise RuntimeError(f"missing required PC dataset: {HGDP_1KG_PC_TSV}")
-    raw = pd.read_csv(HGDP_1KG_PC_TSV, sep="\t")
+    raw = _synthetic_hgdp_1kg_pc_panel()
     pc_cols = [f"PC{i}" for i in range(1, 17)]
     required = {"sample_id", "Superpopulation", "Subpopulation", "Latitude", "Longitude", *pc_cols}
     missing = sorted(required - set(raw.columns))
     if missing:
-        raise RuntimeError(f"hgdp_1kg_pc_data.tsv is missing required columns: {missing}")
+        raise RuntimeError(f"synthetic hgdp_1kg pc panel is missing required columns: {missing}")
 
     d = raw[["sample_id", "Superpopulation", "Subpopulation", "Latitude", "Longitude", *pc_cols]].copy()
     d["Subpopulation"] = d["Subpopulation"].astype(str)
@@ -1927,7 +1999,7 @@ def _load_hgdp_pc_with_imputed_latlon():
         d[c] = pd.to_numeric(d[c], errors="coerce")
     d = d.dropna(subset=pc_cols).copy()
     if d.empty:
-        raise RuntimeError("hgdp_1kg_pc_data.tsv has no complete rows for PC1..PC16")
+        raise RuntimeError("synthetic hgdp_1kg pc panel has no complete rows for PC1..PC16")
 
     centroids = d.groupby("Subpopulation", dropna=False)[pc_cols].mean(numeric_only=True)
     sub_latlon_known = (
@@ -1939,7 +2011,7 @@ def _load_hgdp_pc_with_imputed_latlon():
     known_subpops = [sp for sp in centroids.index if sp in sub_latlon_known.index]
     if len(known_subpops) < 2:
         raise RuntimeError(
-            "hgdp_1kg_pc_data.tsv must contain at least two subpopulations with real "
+            "synthetic hgdp_1kg pc panel must contain at least two subpopulations with real "
             "Latitude/Longitude values"
         )
 
@@ -2019,21 +2091,18 @@ def _geo_latlon_dataset(mode_code, seed=20260401, prevalence_min=0.01, prevalenc
 
 
 def _geo_subpop16_dataset(seed=20260330, prevalence_min=0.02, prevalence_max=0.40):
-    if not HGDP_1KG_PC_TSV.exists():
-        raise RuntimeError(f"missing required PC dataset: {HGDP_1KG_PC_TSV}")
-
     rng = np.random.default_rng(int(seed))
-    raw = pd.read_csv(HGDP_1KG_PC_TSV, sep="\t")
+    raw = _synthetic_hgdp_1kg_pc_panel()
     pc_cols = [f"PC{i}" for i in range(1, 17)]
     required = {"Subpopulation", *pc_cols}
     missing = sorted(required - set(raw.columns))
     if missing:
-        raise RuntimeError(f"hgdp_1kg_pc_data.tsv is missing required columns: {missing}")
+        raise RuntimeError(f"synthetic hgdp_1kg pc panel is missing required columns: {missing}")
 
     d = raw[["Subpopulation", *pc_cols]].dropna().copy()
     d["Subpopulation"] = d["Subpopulation"].astype(str)
     if d.empty:
-        raise RuntimeError("hgdp_1kg_pc_data.tsv has no complete rows for Subpopulation + PC1..PC16")
+        raise RuntimeError("synthetic hgdp_1kg pc panel has no complete rows for Subpopulation + PC1..PC16")
 
     subpops = sorted(d["Subpopulation"].unique().tolist())
     if len(subpops) < 2:
@@ -2092,21 +2161,18 @@ def _geo_subpop16_randomprev_randomscale_dataset(
     noise_scale_min=0.25,
     noise_scale_max=0.85,
 ):
-    if not HGDP_1KG_PC_TSV.exists():
-        raise RuntimeError(f"missing required PC dataset: {HGDP_1KG_PC_TSV}")
-
     rng = np.random.default_rng(int(seed))
-    raw = pd.read_csv(HGDP_1KG_PC_TSV, sep="\t")
+    raw = _synthetic_hgdp_1kg_pc_panel()
     pc_cols = [f"PC{i}" for i in range(1, 17)]
     required = {"Subpopulation", *pc_cols}
     missing = sorted(required - set(raw.columns))
     if missing:
-        raise RuntimeError(f"hgdp_1kg_pc_data.tsv is missing required columns: {missing}")
+        raise RuntimeError(f"synthetic hgdp_1kg pc panel is missing required columns: {missing}")
 
     d = raw[["Subpopulation", *pc_cols]].dropna().copy()
     d["Subpopulation"] = d["Subpopulation"].astype(str)
     if d.empty:
-        raise RuntimeError("hgdp_1kg_pc_data.tsv has no complete rows for Subpopulation + PC1..PC16")
+        raise RuntimeError("synthetic hgdp_1kg pc panel has no complete rows for Subpopulation + PC1..PC16")
 
     subpops = sorted(d["Subpopulation"].unique().tolist())
     if len(subpops) < 2:
