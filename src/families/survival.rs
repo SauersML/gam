@@ -312,12 +312,16 @@ impl WorkingModelSurvival {
         if self.structurally_monotonic {
             return 1e-12;
         }
-        self.monotonicity.tolerance.max(1e-12)
+        self.monotonicity.tolerance.max(0.0)
     }
 
     fn derivative_guard_numerical(&self) -> f64 {
         let derivative_guard = self.derivative_guard();
-        (derivative_guard - (1e-10_f64).min(0.01 * derivative_guard)).max(1e-12)
+        if derivative_guard <= 0.0 {
+            0.0
+        } else {
+            (derivative_guard - (1e-10_f64).min(0.01 * derivative_guard)).max(1e-12)
+        }
     }
 
     fn interval_increment_guard(&self, h_entry: f64, h_exit: f64) -> f64 {
@@ -326,6 +330,9 @@ impl WorkingModelSurvival {
     }
 
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
+        if self.structurally_monotonic {
+            return None;
+        }
         let p = self.x_derivative.ncols();
         const DERIVATIVE_ROW_NORM_TOL: f64 = 1e-12;
         if p == 0 {
@@ -479,11 +486,27 @@ impl WorkingModelSurvival {
                 "structural monotonicity requires at least one time column".to_string(),
             ));
         }
-        // Monotonicity is enforced through the exact linear inequality geometry
-        // A beta >= b so smoothing continues to act on the realized coefficient
-        // vector used by the survival basis. This avoids the exponential
-        // reparameterization that biased the baseline shape under heavy
-        // smoothing.
+        if enabled {
+            const STRUCTURAL_DERIV_TOL: f64 = 1e-12;
+            for i in 0..self.x_derivative.nrows() {
+                for j in 0..time_columns {
+                    let v = self.x_derivative[[i, j]];
+                    if v < -STRUCTURAL_DERIV_TOL {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "structural monotonicity requires nonnegative time-derivative basis entries; found x_derivative[{i},{j}]={v:.3e}"
+                        )));
+                    }
+                }
+                for j in time_columns..p {
+                    let v = self.x_derivative[[i, j]];
+                    if v.abs() > STRUCTURAL_DERIV_TOL {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "structural monotonicity requires zero derivative contribution outside the time block; found x_derivative[{i},{j}]={v:.3e}"
+                        )));
+                    }
+                }
+            }
+        }
         self.structurally_monotonic = enabled;
         self.structural_time_columns = if enabled { time_columns } else { 0 };
         Ok(())
@@ -495,11 +518,18 @@ impl WorkingModelSurvival {
         beta: &Array1<f64>,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let p = beta.len();
-        Ok((
-            beta.clone(),
-            Array1::<f64>::ones(p),
-            Array1::<f64>::zeros(p),
-        ))
+        let mut theta = beta.clone();
+        let mut jac = Array1::<f64>::ones(p);
+        let mut curvature = Array1::<f64>::zeros(p);
+        if self.structurally_monotonic {
+            for j in 0..self.structural_time_columns {
+                let exp_beta = beta[j].exp();
+                theta[j] = exp_beta;
+                jac[j] = exp_beta;
+                curvature[j] = exp_beta;
+            }
+        }
+        Ok((theta, jac, curvature))
     }
 
     pub fn update_state(&self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
@@ -1378,7 +1408,7 @@ mod tests {
                 x_derivative: x_derivative.view(),
             },
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 1e-8 },
+            MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct censored survival model");
@@ -1387,10 +1417,10 @@ mod tests {
             .monotonicity_linear_constraints()
             .expect("all weighted rows should contribute monotonicity constraints");
         assert_eq!(constraints.a.nrows(), 1);
-        assert!((constraints.b[0] - 1e-8).abs() < 1e-18);
+        assert!(constraints.b[0].abs() < 1e-18);
         for i in 0..x_derivative.nrows() {
             let row = x_derivative.row(i);
-            let original_rhs = 1e-8_f64;
+            let original_rhs = model.derivative_guard();
             let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
             let normalized_rhs = original_rhs / scale;
             let lhs = constraints.a.row(0).dot(&array![1.0]);
@@ -1421,7 +1451,7 @@ mod tests {
                 x_derivative: x_derivative.view(),
             },
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 1e-8 },
+            MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct censored survival model");
@@ -1556,7 +1586,7 @@ mod tests {
                 x_derivative: x_derivative.view(),
             },
             penalties,
-            MonotonicityPenalty { tolerance: 1e-8 },
+            MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect_err("negative lambda must be rejected");
@@ -1715,7 +1745,7 @@ mod tests {
         model
             .set_structural_monotonicity(true, 3)
             .expect("enable structural monotonicity");
-        assert!(model.monotonicity_linear_constraints().is_some());
+        assert!(model.monotonicity_linear_constraints().is_none());
 
         let beta = array![0.2, 0.2, 0.1, 0.2];
         let state = model.update_state(&beta).expect("state at structural beta");
@@ -1792,7 +1822,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_monotonicity_keeps_linear_constraint_geometry() {
+    fn structural_monotonicity_reparameterizes_time_block_and_drops_linear_constraints() {
         let age_entry = array![1.0_f64];
         let age_exit = array![2.0_f64];
         let event_target = array![1u8];
@@ -1830,15 +1860,14 @@ mod tests {
         model
             .set_structural_monotonicity(true, 1)
             .expect("enable structural monotonicity");
-        let constraints = model
-            .monotonicity_linear_constraints()
-            .expect("monotonicity constraints should remain active");
-        assert_eq!(constraints.a.nrows(), 1);
-        assert_eq!(constraints.a[[0, 0]], 1.0);
         assert!(
-            model.update_state(&beta).is_err(),
-            "enabling structural monotonicity should not reparameterize the coefficient"
+            model.monotonicity_linear_constraints().is_none(),
+            "structural monotonicity should not emit legacy linear constraints"
         );
+        let state = model
+            .update_state(&beta)
+            .expect("structural monotonicity should reparameterize the time block");
+        assert!(state.deviance.is_finite());
     }
 
     fn model_with_rho(base: &WorkingModelSurvival, rho: &Array1<f64>) -> WorkingModelSurvival {
@@ -2053,7 +2082,7 @@ mod tests {
                 x_derivative: x_derivative.view(),
             },
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 1e-8 },
+            MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct survival model");
@@ -2439,7 +2468,7 @@ mod tests {
                 x_derivative: x_derivative.view(),
             },
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 1e-8 },
+            MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct survival model");
@@ -2475,14 +2504,14 @@ mod tests {
                 x_derivative: x_derivative.view(),
             },
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 1e-8 },
+            MonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct censored survival model");
 
         let state = model
             .update_state(&array![0.0])
-            .expect("censored boundary derivative should remain feasible");
+            .expect("censored boundary derivative should remain feasible with zero tolerance");
         assert!(state.deviance.is_finite());
     }
 
