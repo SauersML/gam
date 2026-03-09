@@ -279,18 +279,18 @@ pub trait CustomFamily {
     ///
     /// The profiled/Laplace outer objective used here is
     ///
-    ///   J(rho)
-    ///   = V(beta(rho), rho)
-    ///     + 0.5 log|H(beta(rho), rho)|
-    ///     - 0.5 log|S(rho)|_+,
+    ///   J(theta)
+    ///   = V(beta(theta), theta)
+    ///     + 0.5 log|H(beta(theta), theta)|
+    ///     - 0.5 log|S(theta)|_+,
     ///
     /// evaluated at the fitted inner mode defined by
     ///
-    ///   F(beta, rho) := D_beta V(beta, rho) = 0,
-    ///   H(beta, rho) := F_beta(beta, rho) = H_L(beta) + S(rho).
+    ///   F(beta, theta) := D_beta V(beta, theta) = 0,
+    ///   H(beta, theta) := F_beta(beta, theta) = H_L(beta, theta) + S(theta).
     ///
-    /// Since the likelihood has no explicit rho-dependence, the fixed-beta
-    /// forcing for smoothing coordinate rho_k is
+    /// For pure rho directions on families whose likelihood has no explicit
+    /// rho-dependence, the fixed-beta forcing is
     ///
     ///   g_k := F_{rho_k} = A_k beta,
     ///   A_k := dS/drho_k.
@@ -305,10 +305,19 @@ pub trait CustomFamily {
     /// couple blocks through off-diagonal curvature. The first outer
     /// derivative is then
     ///
-    ///   dJ/drho_k
+    ///   dJ/dtheta_i
     ///   = 0.5 beta^T A_k beta
     ///     + 0.5 tr(H^{-1}(A_k + D_beta H_L[u_k]))
-    ///     - 0.5 tr(S^+ A_k).
+    ///     - 0.5 tr(S^+ A_k),
+    ///
+    /// and when psi moves realized penalties the same spec-aware hook must be
+    /// able to reconstruct H(beta, theta), D_beta H[u], and D_beta^2 H[u, v]
+    /// from the current realized specs so the generic joint assembler can form
+    ///
+    ///   dot H_i  = H_i + D_beta H[beta_i],
+    ///   ddot H_ij
+    ///   = H_ij + T_i[beta_j] + T_j[beta_i]
+    ///     + D_beta H[beta_ij] + D_beta^2 H[beta_i, beta_j].
     ///
     /// Families such as binomial location-scale with
     ///
@@ -416,208 +425,85 @@ pub trait CustomFamily {
         Ok(None)
     }
 
-    /// Optional exact psi-gradient for blocks using `BlockWorkingSet::ExactNewton`.
+    /// Optional exact first-order joint psi terms over the flattened
+    /// coefficient vector.
     ///
-    /// Families that expose an exact coefficient-space Hessian rather than a
-    /// diagonal IRLS working set cannot reuse the diagonal psi-gradient algebra
-    /// below. They must provide the derivative of the active outer objective
-    /// directly for the externally realized psi direction encoded in `ctx.deriv`.
+    /// Families with coupled exact-joint curvature must provide psi objects in
+    /// the same flattened coefficient space used by the existing joint Hessian
+    /// hooks:
     ///
-    /// Returning `None` means the family does not provide an analytic exact-Newton
-    /// psi gradient for this block.
-    fn exact_newton_block_psi_gradient(
-        &self,
-        _block_states: &[ParameterBlockState],
-        _block_idx: usize,
-        _ctx: ExactNewtonPsiGradientContext<'_>,
-    ) -> Result<Option<f64>, String> {
-        Ok(None)
-    }
-
-    /// Optional explicit moving-design psi terms for exact-Newton blocks.
+    ///   objective_psi = V_psi^explicit,
+    ///   score_psi     = g_psi^explicit,
+    ///   hessian_psi   = H_psi^explicit.
     ///
-    /// This is the structured version of `exact_newton_block_psi_gradient`.
-    /// Families with a design X(psi) that moves under the hyperparameter can
-    /// provide the explicit derivatives of the unpenalized block objective,
-    /// gradient, and Hessian at fixed beta:
-    ///
-    ///   V_psi^explicit, g_psi^explicit, H_psi^explicit.
-    ///
-    /// The generic exact-Newton hypergradient code then:
-    ///
-    /// 1. adds the penalty terms
-    ///      0.5 beta^T S_psi beta,
-    ///      S_psi beta,
-    ///      S_psi,
-    /// 2. solves the implicit mode sensitivity
-    ///      beta_psi = -(H + S)^{-1} (g_psi^explicit + S_psi beta),
-    /// 3. adds the beta-path Hessian contribution
-    ///      D_beta H[beta_psi],
-    /// 4. evaluates the REML / Laplace traces
-    ///      0.5 tr((H+S)^{-1} Hdot) - 0.5 tr(S_+^{-1} S_psi).
-    ///
-    /// So this callback should return only the explicit moving-design pieces
-    /// from the family likelihood geometry, excluding the penalty derivatives.
-    ///
-    /// Conceptually this is the first-order slice of the full profiled/Hessian
-    /// calculus:
-    ///
-    ///   J_i
-    ///   = V_i
-    ///     + 0.5 tr(H^{-1} \dot H_i)
-    ///     - 0.5 tr(S^+ S_i),
-    ///
-    /// with
+    /// Generic code then adds the realized penalty surface, solves
     ///
     ///   beta_i = -H^{-1} g_i,
-    ///   \dot H_i = H_i + T[beta_i].
     ///
-    /// The companion second-order hook below exists because differentiating
-    /// this identity again introduces V_{ij}, g_{ij}, H_{ij}, beta_{ij},
-    /// \ddot H_{ij}, and contracted fourth-order beta curvature.
-    fn exact_newton_block_psi_terms(
+    /// forms
+    ///
+    ///   dot H_i = H_i + D_beta H[beta_i],
+    ///
+    /// and plugs those objects into the unified profiled/Laplace gradient
+    ///
+    ///   J_i = V_i + 0.5 tr(H^{-1} dot H_i) - 0.5 partial_i log|S(theta)|_+.
+    ///
+    /// The current block-local exact-Newton psi hooks are not sufficient for a
+    /// full joint hyper Hessian on coupled families; joint exact-joint hyper
+    /// evaluation must use this flattened-coefficient hook instead.
+    fn exact_newton_joint_psi_terms(
         &self,
         _block_states: &[ParameterBlockState],
-        _block_idx: usize,
-        _ctx: ExactNewtonPsiGradientContext<'_>,
-    ) -> Result<Option<ExactNewtonBlockPsiTerms>, String> {
+        _specs: &[ParameterBlockSpec],
+        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _psi_index: usize,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         Ok(None)
     }
 
-    /// Optional explicit second-order moving-design psi terms for exact-Newton
-    /// blocks.
+    /// Optional exact second-order joint psi terms over the flattened
+    /// coefficient vector.
     ///
-    /// Full exact profiled/Laplace derivation for two outer coordinates
-    /// theta_i, theta_j:
-    ///
-    /// Let
-    ///
-    ///   V(beta, theta) = L(beta, theta) + 0.5 beta^T S(theta) beta,
-    ///   g              = V_beta,
-    ///   H              = V_{beta beta},
-    ///
-    /// and let beta*(theta) be the exact inner mode:
-    ///
-    ///   g(beta*(theta), theta) = 0.
-    ///
-    /// Write fixed-beta theta partials as
-    ///
-    ///   g_i   = V_{beta i},
-    ///   g_{ij}= V_{beta ij},
-    ///   H_i   = V_{beta beta i},
-    ///   H_{ij}= V_{beta beta ij}.
-    ///
-    /// The profiled outer objective is
-    ///
-    ///   J(theta)
-    ///   = V(beta*(theta), theta)
-    ///     + 0.5 log|H(beta*(theta), theta)|
-    ///     - 0.5 log|S(theta)|_+.
-    ///
-    /// Differentiating stationarity once gives the exact first mode response
-    ///
-    ///   beta_i = -H^{-1} g_i.
-    ///
-    /// Differentiating stationarity again gives the second mode response
-    ///
-    ///   beta_{ij}
-    ///   = -H^{-1}(g_{ij} + H_i beta_j + H_j beta_i + T[beta_i] beta_j),
-    ///
-    /// where
-    ///
-    ///   T[u] = D_beta H[u]
-    ///
-    /// is the contracted third beta derivative of V, viewed as a matrix. The
-    /// third derivative is symmetric in its beta slots, so
-    ///
-    ///   T[beta_i] beta_j = T[beta_j] beta_i.
-    ///
-    /// The exact profiled penalized-objective block is
-    ///
-    ///   P_{ij} = V_{ij} - g_i^T H^{-1} g_j.
-    ///
-    /// For the Laplace log|H| term, define total mode-following Hessian drifts
-    ///
-    ///   \dot H_i = H_i + T[beta_i],
-    ///
-    ///   \ddot H_{ij}
-    ///   = H_{ij}
-    ///     + T_i[beta_j]
-    ///     + T_j[beta_i]
-    ///     + T[beta_{ij}]
-    ///     + Q[beta_i, beta_j],
-    ///
-    /// where
-    ///
-    ///   T_i[u] = D_beta H_i[u],
-    ///   Q[u,v] = D_beta^2 H[u,v].
-    ///
-    /// Then the exact joint outer Hessian is
-    ///
-    ///   J_{ij}
-    ///   = (V_{ij} - g_i^T H^{-1} g_j)
-    ///     + 0.5[ tr(H^{-1} \ddot H_{ij})
-    ///            - tr(H^{-1} \dot H_j H^{-1} \dot H_i) ]
-    ///     - 0.5[ tr(S^+ S_{ij}) - tr(S^+ S_j S^+ S_i) ].
-    ///
-    /// The only family-specific pieces in that formula are the fixed-beta
-    /// likelihood derivatives and the beta-direction contractions of H.
-    ///
-    /// For two hyper coordinates i,j, this callback returns the fixed-beta
-    /// second partials of the unpenalized block objective:
+    /// For two outer coordinates theta_i, theta_j the exact profiled/Laplace
+    /// Hessian uses fixed-beta second partials
     ///
     ///   V_{ij}^explicit, g_{ij}^explicit, H_{ij}^explicit.
     ///
-    /// These are the exact moving-design likelihood pieces needed by the full
-    /// profiled outer Hessian
-    ///
-    ///   J_{ij}
-    ///   = (V_{ij} - g_i^T H^{-1} g_j)
-    ///     + 0.5[ tr(H^{-1} \tilde H_{ij})
-    ///            - tr(H^{-1} \tilde H_i H^{-1} \tilde H_j) ]
-    ///     - 0.5[ tr(S^+ S_{ij}) - tr(S^+ S_i S^+ S_j) ].
-    ///
-    /// Here the generic outer code is responsible for:
-    ///
-    /// 1. adding the penalty second derivatives
-    ///      0.5 beta^T S_{ij} beta,
-    ///      S_{ij} beta,
-    ///      S_{ij},
-    /// 2. solving the exact mode responses
-    ///      beta_i  = -H^{-1} g_i,
-    ///      beta_j  = -H^{-1} g_j,
-    ///      beta_ij = -H^{-1}(g_{ij} + H_i beta_j + H_j beta_i
-    ///                         + T[beta_i, beta_j]),
-    /// 3. assembling the total Hessian drifts
-    ///      \tilde H_i  = H_i  + T[beta_i],
-    ///      \tilde H_{ij}= H_{ij}
-    ///                    + T_i[beta_j]
-    ///                    + T_j[beta_i]
-    ///                    + Q[beta_i, beta_j]
-    ///                    + T[beta_ij].
-    ///
-    /// For theta = [rho, psi], the rho blocks are usually penalty-only at fixed
-    /// beta:
-    ///
-    ///   g_rho   = S_rho beta,
-    ///   H_rho   = S_rho,
-    ///   g_{rho,psi} = S_{rho,psi} beta,
-    ///   H_{rho,psi} = S_{rho,psi},
-    ///
-    /// while the psi blocks are the moving-design family pieces returned here
-    /// and by the first-order psi callback.
-    ///
-    /// Families do not need to materialize full third- or fourth-order
-    /// coefficient tensors, but exact second-order outer methods do need the
-    /// corresponding contractions. This callback supplies only the explicit
-    /// fixed-beta second partials; the contraction operators remain separate.
-    fn exact_newton_block_psi_second_order_terms(
+    /// For psi/psi blocks this callback returns those explicit family terms in
+    /// flattened coefficient coordinates. Generic code adds penalty
+    /// contributions and profile/Laplace corrections.
+    fn exact_newton_joint_psi_second_order_terms(
         &self,
         _block_states: &[ParameterBlockState],
-        _block_idx: usize,
-        _ctx_i: ExactNewtonPsiGradientContext<'_>,
-        _ctx_j: ExactNewtonPsiGradientContext<'_>,
-    ) -> Result<Option<ExactNewtonBlockPsiSecondOrderTerms>, String> {
+        _specs: &[ParameterBlockSpec],
+        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _psi_i: usize,
+        _psi_j: usize,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        Ok(None)
+    }
+
+    /// Optional mixed beta/psi Hessian drift D_beta H_psi[u].
+    ///
+    /// This is the missing T_i[u] object in the full exact joint profiled
+    /// Hessian:
+    ///
+    ///   ddot H_{ij}
+    ///   = H_{ij}
+    ///     + D_beta H_i[beta_j]
+    ///     + D_beta H_j[beta_i]
+    ///     + D_beta H[beta_{ij}]
+    ///     + D_beta^2 H[beta_i, beta_j].
+    ///
+    /// For i = psi_a this hook supplies D_beta H_{psi_a}[u].
+    fn exact_newton_joint_psi_hessian_directional_derivative(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _psi_index: usize,
+        _d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
         Ok(None)
     }
 
@@ -737,25 +623,17 @@ pub struct CustomFamilyBlockPsiDerivative {
 }
 
 #[derive(Clone)]
-pub struct ExactNewtonBlockPsiTerms {
+pub struct ExactNewtonJointPsiTerms {
     pub objective_psi: f64,
     pub score_psi: Array1<f64>,
     pub hessian_psi: Array2<f64>,
 }
 
 #[derive(Clone)]
-pub struct ExactNewtonBlockPsiSecondOrderTerms {
+pub struct ExactNewtonJointPsiSecondOrderTerms {
     pub objective_psi_psi: f64,
     pub score_psi_psi: Array1<f64>,
     pub hessian_psi_psi: Array2<f64>,
-}
-
-#[derive(Clone, Copy)]
-pub struct ExactNewtonPsiGradientContext<'a> {
-    pub spec: &'a ParameterBlockSpec,
-    pub deriv: &'a CustomFamilyBlockPsiDerivative,
-    pub lambdas: &'a Array1<f64>,
-    pub options: &'a BlockwiseFitOptions,
 }
 
 #[derive(Clone)]
@@ -777,6 +655,119 @@ struct OuterObjectiveEvalResult {
     warm_start: ConstrainedWarmStart,
     inner: BlockwiseInnerResult,
 }
+
+#[derive(Clone, Debug)]
+enum JointHyperCoord {
+    Rho {
+        block_idx: usize,
+        penalty_idx: usize,
+        global_idx: usize,
+    },
+    Psi {
+        block_idx: usize,
+        local_idx: usize,
+        global_idx: usize,
+    },
+}
+
+impl JointHyperCoord {
+    fn global_idx(&self) -> usize {
+        match self {
+            Self::Rho { global_idx, .. } | Self::Psi { global_idx, .. } => *global_idx,
+        }
+    }
+}
+
+// Unified exact joint hyper-calculus over theta = [rho, psi].
+//
+// The correct outer problem is not “a rho objective plus a separate psi
+// objective”. It is one profiled/Laplace surface over one flattened hypervector
+//
+//   theta = [rho, psi],
+//
+// one flattened joint coefficient vector
+//
+//   beta = [beta_1; ...; beta_B],
+//
+// and one joint exact mode system
+//
+//   F(beta, theta) := V_beta(beta, theta) = 0,
+//   H(beta, theta) := V_beta_beta(beta, theta).
+//
+// For every hypercoordinate theta_i we need the fixed-beta objects
+//
+//   V_i = partial_{theta_i} V,
+//   g_i = partial_{theta_i} F,
+//   H_i = partial_{theta_i} H,
+//
+// and for every pair (i, j)
+//
+//   V_ij, g_ij, H_ij,
+//
+// together with the beta-curvature contractions
+//
+//   D_beta H[u],
+//   D_beta^2 H[u, v],
+//   T_i[u] := D_beta H_i[u].
+//
+// The exact profiled mode response and total Hessian drifts are then
+//
+//   beta_i  = -H^{-1} g_i,
+//   beta_ij = -H^{-1}(g_ij + H_i beta_j + H_j beta_i + D_beta H[beta_i] beta_j),
+//
+//   dot H_i
+//   = H_i + D_beta H[beta_i],
+//
+//   ddot H_ij
+//   = H_ij
+//     + T_i[beta_j]
+//     + T_j[beta_i]
+//     + D_beta H[beta_ij]
+//     + D_beta^2 H[beta_i, beta_j].
+//
+// Hence the exact joint profiled/Laplace derivatives are
+//
+//   J_i
+//   = V_i + 0.5 tr(H^{-1} dot H_i) - 0.5 partial_i log|S|_+,
+//
+//   J_ij
+//   = (V_ij - g_i^T H^{-1} g_j)
+//     + 0.5 [ tr(H^{-1} ddot H_ij)
+//             - tr(H^{-1} dot H_j H^{-1} dot H_i) ]
+//     - 0.5 partial^2_{ij} log|S|_+.
+//
+// In this unified view rho and psi are the same outer calculus. They differ
+// only in where their fixed-beta derivative objects come from:
+//
+// - rho coordinates often contribute only through the penalty surface,
+//     but the generic assembler intentionally treats the penalty as S(theta),
+//     not S(rho), so mixed rho/psi penalty terms are allowed whenever realized
+//     component penalties move with psi:
+//       V_i  = D_i  + 0.5 beta^T S_i beta
+//       g_i  = D_beta_i  + S_i beta
+//       H_i  = D_beta_beta_i + S_i
+//       V_ij = D_ij + 0.5 beta^T S_ij beta
+//       g_ij = D_beta_ij + S_ij beta
+//       H_ij = D_beta_beta_ij + S_ij.
+//
+// - psi coordinates come from the family-specific joint exact psi hooks, while
+//   the generic assembler still owns any realized-penalty motion through
+//   S_i / S_ij:
+//     objective_psi            <-> V_i
+//     score_psi                <-> g_i
+//     hessian_psi              <-> H_i
+//     objective_psi_psi        <-> V_ij
+//     score_psi_psi            <-> g_ij
+//     hessian_psi_psi          <-> H_ij
+//     D_beta H_psi[u]          <-> T_i[u].
+//
+// For coupled families this means any block-local psi path is wrong. Even when
+// g_i is sparse or penalty-local, beta_i is defined by the full joint solve
+//
+//   beta_i = -H^{-1} g_i,
+//
+// so every exact outer derivative must be assembled in this joint flattened
+// space.
 
 #[derive(Debug, Clone, Error)]
 pub enum CustomFamilyError {
@@ -2332,15 +2323,15 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
     //
     // The outer objective is the profiled Laplace surface
     //
-    //   J(rho)
-    //   = V(beta(rho), rho)
-    //     + 0.5 log|H(beta(rho), rho)|
-    //     - 0.5 log|S(rho)|_+,
+    //   J(theta)
+    //   = V(beta(theta), theta)
+    //     + 0.5 log|H(beta(theta), theta)|
+    //     - 0.5 log|S(theta)|_+,
     //
     // evaluated at the fitted inner mode. Here
     //
-    //   F(beta, rho) := D_beta V(beta, rho) = 0,
-    //   H(beta, rho) := F_beta(beta, rho) = H_L(beta) + S(rho).
+    //   F(beta, theta) := D_beta V(beta, theta) = 0,
+    //   H(beta, theta) := F_beta(beta, theta) = H_L(beta, theta) + S(theta).
     //
     // Because the likelihood has no explicit rho-dependence, the fixed-beta
     // forcing for smoothing coordinate rho_k is
@@ -3079,696 +3070,460 @@ fn outer_objective_and_gradient<F: CustomFamily>(
     Ok((obj, grad, warm))
 }
 
-fn compute_custom_family_block_psi_gradients<F: CustomFamily>(
+fn compute_custom_family_joint_hyper_exact<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-    per_block: &[Array1<f64>],
+    penalty_counts: &[usize],
+    rho_current: &Array1<f64>,
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     inner: &mut BlockwiseInnerResult,
-) -> Result<Array1<f64>, String> {
+    need_hessian: bool,
+) -> Result<(Array1<f64>, Option<Array2<f64>>), String> {
+    // Full exact joint profiled/Laplace outer calculus over
+    //
+    //   theta = [rho, psi]
+    //
+    // is assembled here in one flattened coefficient space. The family has
+    // already exposed the exact inner mode beta^(theta) through `inner`, so
+    // this routine builds the full outer derivatives from fixed-beta pieces.
+    //
+    // Write
+    //
+    //   V(beta, theta) = D(beta, psi) + 0.5 beta^T S(theta) beta,
+    //   F(beta, theta) = V_beta(beta, theta),
+    //   H(beta, theta) = V_beta_beta(beta, theta).
+    //
+    // At the fitted inner mode,
+    //
+    //   F(beta^(theta), theta) = 0.
+    //
+    // For each hypercoordinate theta_i we need the fixed-beta objects
+    //
+    //   V_i, g_i := F_i, H_i,
+    //
+    // and for each pair (i, j)
+    //
+    //   V_ij, g_ij, H_ij,
+    //
+    // together with the beta-curvature contractions
+    //
+    //   D_beta H[u], D_beta^2 H[u, v], T_i[u] := D_beta H_i[u].
+    //
+    // The profiled mode responses are the joint solves
+    //
+    //   beta_i  = -H^{-1} g_i,
+    //   beta_ij = -H^{-1}(g_ij + H_i beta_j + H_j beta_i + D_beta H[beta_i] beta_j).
+    //
+    // The total Hessian drifts feeding the Laplace block are then
+    //
+    //   dot H_i
+    //   = H_i + D_beta H[beta_i],
+    //
+    //   ddot H_ij
+    //   = H_ij
+    //     + T_i[beta_j]
+    //     + T_j[beta_i]
+    //     + D_beta H[beta_ij]
+    //     + D_beta^2 H[beta_i, beta_j].
+    //
+    // Hence the exact outer derivatives are
+    //
+    //   J_i
+    //   = V_i
+    //     + 0.5 tr(H^{-1} dot H_i)
+    //     - 0.5 partial_i log|S(theta)|_+,
+    //
+    //   J_ij
+    //   = (V_ij - g_i^T H^{-1} g_j)
+    //     + 0.5 [ tr(H^{-1} ddot H_ij)
+    //             - tr(H^{-1} dot H_j H^{-1} dot H_i) ]
+    //     - 0.5 partial^2_{ij} log|S(theta)|_+.
+    //
+    // This routine follows those formulas literally:
+    //
+    // - build fixed-beta first-order objects (`v_i`, `g_i`, `h_i`, `s_i`)
+    // - solve the joint first-order mode response `beta_i`
+    // - build `dot H_i` and the exact gradient
+    // - build fixed-beta second-order objects (`v_ij`, `g_ij`, `h_ij`, `s_ij`)
+    // - solve the joint second-order mode response `beta_ij`
+    // - build `ddot H_ij` and the exact Hessian
+    //
+    // The generic code owns every realized penalty contribution S_i / S_ij.
+    // Families contribute only the likelihood-side exact joint psi objects and
+    // the mixed contraction T_i[u] = D_beta H_i[u].
     let include_logdet_h = include_exact_newton_logdet_h(family);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinite_hessian();
-    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-    let eval = family.evaluate(&inner.block_states)?;
-    if eval.block_working_sets.len() != specs.len() {
-        return Err(format!(
-            "family returned {} block working sets, expected {}",
-            eval.block_working_sets.len(),
-            specs.len()
-        ));
-    }
-
-    let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
-    let mut grad = Array1::<f64>::zeros(psi_dim);
+    let per_block = split_log_lambdas(rho_current, penalty_counts)?;
+    refresh_all_block_etas(family, specs, inner)?;
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    let rho_dim = penalty_counts.iter().sum::<usize>();
+    let coords = flatten_joint_hyper_coords(specs, derivative_blocks)?;
+    let theta_dim = coords.len();
+    let h_joint_unpen = exact_newton_joint_hessian_symmetrized(
+        family,
+        &inner.block_states,
+        specs,
+        total,
+        "joint exact-newton Hessian shape mismatch in joint hyper evaluator",
+    )?
+    .ok_or_else(|| "joint exact-newton Hessian unavailable for full [rho, psi] outer calculus".to_string())?;
+    let beta_flat = flatten_state_betas(&inner.block_states, specs);
+    let synced_joint_states =
+        synchronized_states_from_flat_beta(family, specs, &inner.block_states, &beta_flat)?;
+    let joint_tangent_basis =
+        joint_post_update_tangent_basis(family, specs, &synced_joint_states)?;
     let ridge = effective_solver_ridge(options.ridge_floor);
-    let mut at = 0usize;
+    let mode_ridge = if options.ridge_policy.include_quadratic_penalty {
+        ridge
+    } else {
+        0.0
+    };
+    let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
+        && !options.ridge_policy.include_quadratic_penalty
+    {
+        ridge
+    } else {
+        0.0
+    };
 
+    let mut s_joint = Array2::<f64>::zeros((total, total));
+    let mut s_pinv_joint = if include_logdet_s {
+        Some(Array2::<f64>::zeros((total, total)))
+    } else {
+        None
+    };
     for (b, spec) in specs.iter().enumerate() {
-        let psi_terms = &derivative_blocks[b];
-        if psi_terms.is_empty() {
-            continue;
-        }
-
-        let p = spec.design.ncols();
-        let beta = &inner.block_states[b].beta;
-        let eta = &inner.block_states[b].eta;
+        let (start, end) = ranges[b];
+        let p = end - start;
         let lambdas = per_block[b].mapv(f64::exp);
         let mut s_lambda = Array2::<f64>::zeros((p, p));
         for (k, s) in spec.penalties.iter().enumerate() {
             s_lambda.scaled_add(lambdas[k], s);
         }
-
-        let mut s_for_logdet = s_lambda.clone();
-        if options.ridge_policy.include_penalty_logdet {
-            for d in 0..p {
-                s_for_logdet[[d, d]] += ridge;
+        s_joint
+            .slice_mut(ndarray::s![start..end, start..end])
+            .assign(&s_lambda);
+        if mode_ridge > 0.0 {
+            for d in start..end {
+                s_joint[[d, d]] += mode_ridge;
             }
         }
-        let s_pinv = if include_logdet_s {
+        if let Some(s_pinv) = s_pinv_joint.as_mut() {
+            let mut s_for_logdet = s_lambda.clone();
+            if options.ridge_policy.include_penalty_logdet {
+                for d in 0..p {
+                    s_for_logdet[[d, d]] += ridge;
+                }
+            }
             let s_floor = if options.ridge_policy.include_penalty_logdet {
-                effective_solver_ridge(options.ridge_floor)
+                ridge
             } else {
                 0.0
             }
             .max(1e-14);
-            Some(pinv_positive_part_with_floor(&s_for_logdet, s_floor)?)
-        } else {
-            None
-        };
-
-        let work = &eval.block_working_sets[b];
-        let x_dense = with_block_geometry(family, &inner.block_states, spec, b, |x_dyn, _| {
-            Ok(x_dyn.to_dense())
-        })?;
-
-        let (w, u, h_mode, h_inv) = match work {
-            BlockWorkingSet::Diagonal {
-                working_response,
-                working_weights,
-            } => with_block_geometry(family, &inner.block_states, spec, b, |x_dyn, _| {
-                if working_response.len() != x_dyn.nrows() || working_weights.len() != x_dyn.nrows()
-                {
-                    return Err(format!(
-                        "family diagonal working-set size mismatch on block {b} ({})",
-                        spec.name
-                    ));
-                }
-                let w = floor_positive_working_weights(working_weights, options.min_weight);
-                let u = &w * &(working_response - eta);
-                let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
-                let mut h_for_logdet = xtwx;
-                h_for_logdet += &s_lambda;
-                let h_mode = h_for_logdet.clone();
-                if !strict_spd && options.ridge_policy.include_penalty_logdet {
-                    for d in 0..p {
-                        h_for_logdet[[d, d]] += ridge;
-                    }
-                }
-                let h_inv = logdet_trace_inverse_with_ridge_policy(
-                    &h_for_logdet,
-                    options.ridge_floor,
-                    options.ridge_policy,
-                    strict_spd,
-                    allow_semidefinite,
-                )?;
-                Ok((w, u, h_mode, h_inv))
-            })?,
-            BlockWorkingSet::ExactNewton { gradient, hessian } => {
-                if hessian.nrows() != p || hessian.ncols() != p {
-                    return Err(format!(
-                        "exact-newton block {b} Hessian shape mismatch in psi gradient: got {}x{}, expected {}x{}",
-                        hessian.nrows(),
-                        hessian.ncols(),
-                        p,
-                        p
-                    ));
-                }
-                let mut h_mode = hessian.to_dense();
-                h_mode += &s_lambda;
-                let mut h_for_logdet = h_mode.clone();
-                if !strict_spd && options.ridge_policy.include_penalty_logdet {
-                    for d in 0..p {
-                        h_for_logdet[[d, d]] += ridge;
-                    }
-                }
-                let h_inv = logdet_trace_inverse_with_ridge_policy(
-                    &h_for_logdet,
-                    options.ridge_floor,
-                    options.ridge_policy,
-                    strict_spd,
-                    allow_semidefinite,
-                )?;
-
-                for deriv in psi_terms {
-                    // Exact-Newton generic psi-gradient path for penalty-only psi
-                    // directions.
-                    //
-                    // This covers the mathematically important case used by the
-                    // spatial Charbonnier hyperparameters:
-                    //   - the likelihood has no direct psi dependence,
-                    //   - the design does not move with psi (X_psi = 0),
-                    //   - only the penalty surface changes.
-                    //
-                    // Then the exact outer derivative of
-                    //
-                    //   V(psi) = -loglik(beta^(psi)) + 0.5 beta^T S(psi) beta
-                    //            + 0.5 log|H(beta^(psi), psi)|
-                    //            - 0.5 log|S(psi)|_+
-                    //
-                    // reduces to:
-                    //
-                    //   explicit  = 0.5 beta^T S_psi beta
-                    //   H_mode u  = S_psi beta
-                    //   Hdot      = S_psi + D_beta H[-u]
-                    //   dV/dpsi   = explicit + 0.5 tr(H^{-1} Hdot)
-                    //               - 0.5 tr(S_+^{-1} S_psi).
-                    //
-                    // Since beta_psi = -u and the family callback already returns
-                    // D_beta H[direction], we form that exact quantity directly.
-                    let xpsi_nonzero = deriv.x_psi.iter().any(|v| *v != 0.0);
-                    let generic_supported = !xpsi_nonzero;
-                    let family_terms = family.exact_newton_block_psi_terms(
-                        &inner.block_states,
-                        b,
-                        ExactNewtonPsiGradientContext {
-                            spec,
-                            deriv,
-                            lambdas: &lambdas,
-                            options,
-                        },
-                    )?;
-                    let family_value = family.exact_newton_block_psi_gradient(
-                        &inner.block_states,
-                        b,
-                        ExactNewtonPsiGradientContext {
-                            spec,
-                            deriv,
-                            lambdas: &lambdas,
-                            options,
-                        },
-                    )?;
-                    let s_psi_total = if let Some(parts) = deriv.s_psi_components.as_ref() {
-                        let mut total = Array2::<f64>::zeros(deriv.s_psi.raw_dim());
-                        for (k, s_part) in parts {
-                            if *k >= lambdas.len() {
-                                if family_value.is_some() {
-                                    continue;
-                                }
-                                return Err(format!(
-                                    "psi derivative component penalty index {} out of bounds for exact-newton block {}",
-                                    k, b
-                                ));
-                            }
-                            total.scaled_add(lambdas[*k], s_part);
-                        }
-                        total
-                    } else if deriv.penalty_index < lambdas.len() {
-                        deriv.s_psi.mapv(|v| lambdas[deriv.penalty_index] * v)
-                    } else if family_terms.is_some() || family_value.is_some() {
-                        Array2::<f64>::zeros(deriv.s_psi.raw_dim())
-                    } else {
-                        return Err(format!(
-                            "psi derivative penalty index {} out of bounds for exact-newton block {}",
-                            deriv.penalty_index, b
-                        ));
-                    };
-                    let value = if let Some(terms) = family_terms {
-                        if terms.score_psi.len() != p {
-                            return Err(format!(
-                                "exact-newton psi score length mismatch on block {b}: got {}, expected {}",
-                                terms.score_psi.len(),
-                                p
-                            ));
-                        }
-                        if terms.hessian_psi.nrows() != p || terms.hessian_psi.ncols() != p {
-                            return Err(format!(
-                                "exact-newton psi Hessian shape mismatch on block {b}: got {}x{}, expected {}x{}",
-                                terms.hessian_psi.nrows(),
-                                terms.hessian_psi.ncols(),
-                                p,
-                                p
-                            ));
-                        }
-
-                        // Full moving-design exact-Newton first-order derivation:
-                        //
-                        // Let the profiled block contribution be
-                        //
-                        //   J(psi)
-                        //   = V(beta*(psi), psi)
-                        //     + 0.5 log|H_mode(beta*(psi), psi)|
-                        //     - 0.5 log|S(psi)|_+,
-                        //
-                        // with penalized inner objective
-                        //
-                        //   V(beta, psi) = L(beta, psi) + 0.5 beta^T S(psi) beta,
-                        //
-                        // score
-                        //
-                        //   g(beta, psi) = V_beta,
-                        //
-                        // and exact mode defined by stationarity
-                        //
-                        //   g(beta*(psi), psi) = 0.
-                        //
-                        // Differentiate stationarity:
-                        //
-                        //   0 = d/dpsi g(beta*(psi), psi)
-                        //     = g_beta beta_psi + g_psi
-                        //     = (H + S) beta_psi + g_psi,
-                        //
-                        // so the exact mode response is
-                        //
-                        //   beta_psi = -(H + S)^{-1} g_psi.
-                        //
-                        // The family callback supplies only the explicit
-                        // fixed-beta likelihood pieces
-                        //
-                        //   V_psi^explicit, g_psi^explicit, H_psi^explicit.
-                        //
-                        // Generic code then adds the penalty surface:
-                        //
-                        //   explicit = V_psi^explicit + 0.5 beta^T S_psi beta
-                        //   g_psi    = g_psi^explicit + S_psi beta
-                        //   H_psi    = H_psi^explicit + S_psi.
-                        //
-                        // The envelope/profile identity gives the exact first
-                        // derivative of the profiled objective:
-                        //
-                        //   dJ/dpsi
-                        //   = explicit
-                        //     + 0.5 tr(H_mode^{-1} Hdot)
-                        //     - 0.5 tr(S_+^{-1} S_psi),
-                        //
-                        // where the total mode-following Hessian drift is
-                        //
-                        //   Hdot = H_psi + D_beta H[beta_psi].
-                        //
-                        // So the implementation below is literally:
-                        //
-                        // 1. build the explicit fixed-beta pieces returned by
-                        //    the family callback
-                        // 2. add penalty derivatives
-                        // 3. solve beta_psi = -(H+S)^{-1} g_psi
-                        // 4. evaluate Hdot = H_psi + D_beta H[beta_psi]
-                        // 5. assemble the log|H| and log|S|_+ trace terms.
-                        //
-                        // The still-missing second-order joint hyper-Hessian in
-                        // theta = [rho, psi] differentiates this profile
-                        // identity once more:
-                        //
-                        //   J_{ij}
-                        //   = (V_{ij} - g_i^T H^{-1} g_j)
-                        //     + 0.5[ tr(H^{-1} \tilde H_{ij})
-                        //            - tr(H^{-1} \tilde H_i H^{-1} \tilde H_j) ]
-                        //     - 0.5[ tr(S^+ S_{ij}) - tr(S^+ S_i S^+ S_j) ].
-                        //
-                        // with
-                        //
-                        //   beta_i  = -H^{-1} g_i,
-                        //   beta_{ij}
-                        //     = -H^{-1}(g_{ij} + H_i beta_j + H_j beta_i
-                        //                + T[beta_i, beta_j]),
-                        //
-                        // and total Hessian drifts
-                        //
-                        //   \tilde H_i  = H_i + T[beta_i],
-                        //   \tilde H_{ij}
-                        //     = H_{ij}
-                        //       + T_i[beta_j]
-                        //       + T_j[beta_i]
-                        //       + Q[beta_i, beta_j]
-                        //       + T[beta_{ij}].
-                        //
-                        // That second-order calculus is not implemented here
-                        // yet, so `outer_hessian` is still suppressed when psi
-                        // coordinates are present.
-                        //
-                        // The penalty-only generic path below is the special
-                        // case H_psi^explicit = 0 and g_psi^explicit = 0.
-                        let explicit = terms.objective_psi + 0.5 * beta.dot(&s_psi_total.dot(beta));
-                        let rhs = &terms.score_psi + &s_psi_total.dot(beta);
-                        let u_psi = if strict_spd {
-                            strict_solve_spd_with_semidefinite_option(
-                                &h_mode,
-                                &rhs,
-                                allow_semidefinite,
-                            )?
-                        } else {
-                            solve_spd_system_with_policy(
-                                &h_mode,
-                                &rhs,
-                                options.ridge_floor,
-                                options.ridge_policy,
-                            )
-                            .or_else(|_| {
-                                pinv_positive_part(&h_mode, options.ridge_floor)
-                                    .map(|h_pinv| h_pinv.dot(&rhs))
-                            })?
-                        };
-                        let beta_psi = -&u_psi;
-                        let mut h_dot = terms.hessian_psi.clone();
-                        h_dot += &s_psi_total;
-                        if beta_psi.dot(&beta_psi).sqrt() > 1e-14 {
-                            let h_beta = family
-                                .exact_newton_hessian_directional_derivative(
-                                    &inner.block_states,
-                                    b,
-                                    &beta_psi,
-                                )?
-                                .ok_or_else(|| {
-                                    format!(
-                                        "missing exact-newton dH callback for structured psi terms on block {b}"
-                                    )
-                                })?;
-                            if h_beta.nrows() != p || h_beta.ncols() != p {
-                                return Err(format!(
-                                    "exact-newton structured psi dH shape mismatch on block {b}: got {}x{}, expected {}x{}",
-                                    h_beta.nrows(),
-                                    h_beta.ncols(),
-                                    p,
-                                    p
-                                ));
-                            }
-                            h_dot += &h_beta;
-                        }
-                        let h_trace = if include_logdet_h {
-                            0.5 * trace_of_product(&h_inv, &h_dot)?
-                        } else {
-                            0.0
-                        };
-                        let pseudo_det = if include_logdet_s {
-                            -0.5 * trace_of_product(
-                                s_pinv.as_ref().ok_or_else(|| {
-                                    "missing S^+ for exact-newton psi terms".to_string()
-                                })?,
-                                &s_psi_total,
-                            )?
-                        } else {
-                            0.0
-                        };
-                        Ok(explicit + h_trace + pseudo_det)
-                    } else if let Some(value) = family_value {
-                        Ok(value)
-                    } else if generic_supported {
-                        let explicit = 0.5 * beta.dot(&s_psi_total.dot(beta));
-                        let rhs = s_psi_total.dot(beta);
-                        let u_psi = if strict_spd {
-                            strict_solve_spd_with_semidefinite_option(
-                                &h_mode,
-                                &rhs,
-                                allow_semidefinite,
-                            )?
-                        } else {
-                            solve_spd_system_with_policy(
-                                &h_mode,
-                                &rhs,
-                                options.ridge_floor,
-                                options.ridge_policy,
-                            )
-                            .or_else(|_| {
-                                pinv_positive_part(&h_mode, options.ridge_floor)
-                                    .map(|h_pinv| h_pinv.dot(&rhs))
-                            })?
-                        };
-                        let beta_psi = -&u_psi;
-                        let mut h_dot = s_psi_total.clone();
-                        if beta_psi.dot(&beta_psi).sqrt() > 1e-14 {
-                            let h_beta = family
-                                .exact_newton_hessian_directional_derivative(
-                                    &inner.block_states,
-                                    b,
-                                    &beta_psi,
-                                )?
-                                .ok_or_else(|| {
-                                    format!(
-                                        "missing exact-newton dH callback for psi gradient on block {b}"
-                                    )
-                                })?;
-                            if h_beta.nrows() != p || h_beta.ncols() != p {
-                                return Err(format!(
-                                    "exact-newton psi dH shape mismatch on block {b}: got {}x{}, expected {}x{}",
-                                    h_beta.nrows(),
-                                    h_beta.ncols(),
-                                    p,
-                                    p
-                                ));
-                            }
-                            h_dot += &h_beta;
-                        }
-                        let h_trace = if include_logdet_h {
-                            0.5 * trace_product(&h_inv, &h_dot)
-                        } else {
-                            0.0
-                        };
-                        let pseudo_det = if include_logdet_s {
-                            -0.5 * trace_product(
-                                s_pinv.as_ref().ok_or_else(|| {
-                                    "missing S^+ for exact-newton psi gradient".to_string()
-                                })?,
-                                &s_psi_total,
-                            )
-                        } else {
-                            0.0
-                        };
-                        Ok(explicit + h_trace + pseudo_det)
-                    } else {
-                        Err(format!(
-                            "analytic psi gradient is not implemented for exact-newton block {} ({})",
-                            b, spec.name
-                        ))
-                    }?;
-                    let _ = gradient;
-                    grad[at] = value;
-                    at += 1;
-                }
-                continue;
-            }
-        };
-
-        let mut wx = x_dense.clone();
-        for i in 0..wx.nrows() {
-            let wi = w[i];
-            if wi != 1.0 {
-                let mut row = wx.row_mut(i);
-                row *= wi;
-            }
+            let s_part = pinv_positive_part_with_floor(&s_for_logdet, s_floor)?;
+            s_pinv
+                .slice_mut(ndarray::s![start..end, start..end])
+                .assign(&s_part);
         }
+    }
+    let mut h_mode = h_joint_unpen.clone();
+    h_mode += &s_joint;
+    let mut h_for_traces = h_mode.clone();
+    if !strict_spd && extra_logdet_ridge > 0.0 {
+        for d in 0..total {
+            h_for_traces[[d, d]] += extra_logdet_ridge;
+        }
+    }
+    let h_inv = logdet_trace_inverse_with_ridge_policy(
+        &h_for_traces,
+        options.ridge_floor,
+        options.ridge_policy,
+        strict_spd,
+        allow_semidefinite,
+    )?;
 
-        for deriv in psi_terms {
-            if deriv.x_psi.nrows() != x_dense.nrows() || deriv.x_psi.ncols() != x_dense.ncols() {
-                return Err(format!(
-                    "X_psi shape mismatch on block {}: expected {}x{}, got {}x{}",
-                    b,
-                    x_dense.nrows(),
-                    x_dense.ncols(),
-                    deriv.x_psi.nrows(),
-                    deriv.x_psi.ncols()
-                ));
-            }
-            if deriv.s_psi.nrows() != p || deriv.s_psi.ncols() != p {
-                return Err(format!(
-                    "S_psi shape mismatch on block {}: expected {}x{}, got {}x{}",
-                    b,
-                    p,
-                    p,
-                    deriv.s_psi.nrows(),
-                    deriv.s_psi.ncols()
-                ));
-            }
+    let mut v_i_terms: Vec<f64> = Vec::with_capacity(theta_dim);
+    let mut g_i_terms: Vec<Array1<f64>> = Vec::with_capacity(theta_dim);
+    let mut h_i_terms: Vec<Array2<f64>> = Vec::with_capacity(theta_dim);
+    let mut s_i_terms: Vec<Array2<f64>> = Vec::with_capacity(theta_dim);
+    let mut beta_i_terms: Vec<Array1<f64>> = Vec::with_capacity(theta_dim);
+    let mut d_h_beta_i_terms: Vec<Array2<f64>> = Vec::with_capacity(theta_dim);
+    let mut dot_h_i_terms: Vec<Array2<f64>> = Vec::with_capacity(theta_dim);
+    let mut gradient = Array1::<f64>::zeros(theta_dim);
 
-            let xpsi_beta = deriv.x_psi.dot(beta);
-            let w_psi = family.diagonal_working_weights_directional_derivative(
-                &inner.block_states,
-                b,
-                &xpsi_beta,
-            )?;
-            if options.use_reml_objective && w_psi.is_none() {
-                return Err(format!(
-                    "missing explicit psi dW callback for block {b} while REML psi gradient requires X^T diag(w_psi) X"
-                ));
+    for coord in &coords {
+        let s_i = joint_theta_penalty_first_matrix(
+            specs,
+            &ranges,
+            &per_block,
+            derivative_blocks,
+            total,
+            rho_dim,
+            coord,
+        )?;
+        let (v_i, g_i, h_i) = match coord {
+            JointHyperCoord::Rho { .. } => {
+                let g = s_i.dot(&beta_flat);
+                let v = 0.5 * beta_flat.dot(&g);
+                (v, g, s_i.clone())
             }
-            let s_psi_total = if let Some(parts) = deriv.s_psi_components.as_ref() {
-                let mut total = Array2::<f64>::zeros(deriv.s_psi.raw_dim());
-                for (k, s_part) in parts {
-                    if *k >= lambdas.len() {
-                        return Err(format!(
-                            "psi derivative component penalty index {} out of bounds for block {}",
-                            k, b
-                        ));
-                    }
-                    total.scaled_add(lambdas[*k], s_part);
-                }
-                total
+            JointHyperCoord::Psi { .. } => {
+                let psi_idx = coord.global_idx() - rho_dim;
+                let psi_terms = family
+                    .exact_newton_joint_psi_terms(
+                        &synced_joint_states,
+                        specs,
+                        derivative_blocks,
+                        psi_idx,
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "missing exact joint psi terms for psi coordinate {} while full [rho, psi] Hessian is required",
+                            psi_idx
+                        )
+                    })?;
+                let g = &psi_terms.score_psi + &s_i.dot(&beta_flat);
+                let v = psi_terms.objective_psi + 0.5 * beta_flat.dot(&s_i.dot(&beta_flat));
+                let h = psi_terms.hessian_psi + &s_i;
+                (v, g, h)
+            }
+        };
+        let log_s_i = if include_logdet_s {
+            trace_product(
+                s_pinv_joint
+                    .as_ref()
+                    .ok_or_else(|| "missing joint S^+ for first derivative".to_string())?,
+                &s_i,
+            )
+        } else {
+            0.0
+        };
+        let beta_i = solve_mode_sensitivity(
+            &h_mode,
+            &(-&g_i),
+            joint_tangent_basis.as_ref(),
+            strict_spd,
+            allow_semidefinite,
+            options,
+            "joint mode sensitivity system for full [rho, psi] outer calculus",
+        )?;
+        let d_h_beta_i = if beta_i.dot(&beta_i).sqrt() > 1e-14 {
+            symmetrized_square_matrix(
+                family
+                    .exact_newton_joint_hessian_directional_derivative_with_specs(
+                        &synced_joint_states,
+                        specs,
+                        &beta_i,
+                    )?
+                    .ok_or_else(|| {
+                        "missing joint exact-newton dH for full [rho, psi] outer calculus"
+                            .to_string()
+                    })?,
+                total,
+                "joint exact-newton dH shape mismatch in full [rho, psi] outer calculus",
+            )?
+        } else {
+            Array2::<f64>::zeros((total, total))
+        };
+        let dot_h_i = &h_i + &d_h_beta_i;
+        let grad_i = v_i
+            + if include_logdet_h {
+                0.5 * trace_product(&h_inv, &dot_h_i)
             } else {
-                if deriv.penalty_index >= lambdas.len() {
-                    return Err(format!(
-                        "psi derivative penalty index {} out of bounds for block {}",
-                        deriv.penalty_index, b
-                    ));
-                }
-                deriv.s_psi.mapv(|v| lambdas[deriv.penalty_index] * v)
-            };
-            // Geometry/penalty derivative psi at the fitted inner mode beta^:
-            //
-            //   V(psi) = f(beta^(psi), psi)
-            //          + 0.5 log|J(beta^(psi), psi)|
-            //          - 0.5 log|S(psi)|_+,
-            //
-            // where
-            //   f(beta,psi) = -ell(beta,psi) + 0.5 beta^T S(psi) beta.
-            //
-            // By the envelope theorem, the fit block is the explicit partial:
-            //
-            //   d/dpsi f(beta^(psi),psi) = f_psi(beta^,psi).
-            //
-            // In the diagonal working-set notation used here,
-            //   u = W(z - eta)
-            // is the predictor-space score contribution, and
-            //   eta_psi = X_psi beta
-            // for this derivative object. Therefore
-            //
-            //   f_psi = -u^T eta_psi + 0.5 beta^T S_psi beta.
-            let explicit = -u.dot(&xpsi_beta) + 0.5 * beta.dot(&s_psi_total.dot(beta));
+                0.0
+            }
+            - if include_logdet_s { 0.5 * log_s_i } else { 0.0 };
+        gradient[coord.global_idx()] = grad_i;
+        v_i_terms.push(v_i);
+        g_i_terms.push(g_i);
+        h_i_terms.push(h_i);
+        s_i_terms.push(s_i);
+        beta_i_terms.push(beta_i);
+        d_h_beta_i_terms.push(d_h_beta_i);
+        dot_h_i_terms.push(dot_h_i);
+    }
 
-            let mut wx_psi = deriv.x_psi.clone();
-            for i in 0..wx_psi.nrows() {
-                let wi = w[i];
-                if wi != 1.0 {
-                    let mut row = wx_psi.row_mut(i);
-                    row *= wi;
-                }
-            }
-            // Explicit curvature drift at fixed beta:
-            //
-            //   J = X^T W X + S
-            //
-            // so
-            //
-            //   J_psi^explicit
-            //   = X_psi^T W X
-            //   + X^T W X_psi
-            //   + X^T diag(w_psi) X
-            //   + S_psi.
-            //
-            // The first two terms are assembled through `wx` / `wx_psi`, the
-            // third via `h_w_psi`, and the last by adding `s_psi_total`.
-            let mut h_psi = deriv.x_psi.t().dot(&wx);
-            h_psi += &x_dense.t().dot(&wx_psi);
-            if let Some(dw) = w_psi {
-                if dw.len() != x_dense.nrows() {
-                    return Err(format!(
-                        "block {b} psi dW length mismatch: got {}, expected {}",
-                        dw.len(),
-                        x_dense.nrows()
-                    ));
-                }
-                let mut h_w_psi = Array2::<f64>::zeros((p, p));
-                for i in 0..x_dense.nrows() {
-                    let wi = dw[i];
-                    if wi == 0.0 {
-                        continue;
-                    }
-                    for a in 0..p {
-                        let xa = x_dense[[i, a]];
-                        for bb in a..p {
-                            h_w_psi[[a, bb]] += wi * xa * x_dense[[i, bb]];
-                        }
-                    }
-                }
-                for a in 0..p {
-                    for bb in 0..a {
-                        h_w_psi[[a, bb]] = h_w_psi[[bb, a]];
-                    }
-                }
-                h_psi += &h_w_psi;
-            }
-            h_psi += &s_psi_total;
-            let trace_term = if options.use_reml_objective {
-                // Exact REML trace derivative:
-                //
-                //   d/dpsi [0.5 log|J|]
-                //   = 0.5 tr(J^{-1}(J_psi^explicit + D_beta J[u_psi])).
-                let mut trace_acc = 0.5 * trace_product(&h_inv, &h_psi);
-                // Implicit mode-sensitivity correction:
-                //   0.5 * tr(J^{-1} D_beta J[u_psi]), with
-                //   J * u_psi = -g_psi.
-                let g_psi = {
-                    let eta_psi = xpsi_beta.clone();
-                    // Differentiate block stationarity
-                    //
-                    //   0 = g(beta^(psi),psi) = X^T u - S beta
-                    //
-                    // at fixed beta to obtain
-                    //
-                    //   g_psi = X_psi^T u - X^T W eta_psi - S_psi beta.
-                    let mut out = deriv.x_psi.t().dot(&u);
-                    out -= &x_dense.t().dot(&(&w * &eta_psi));
-                    out -= &s_psi_total.dot(beta);
-                    out
-                };
-                let rhs = -&g_psi;
-                let u_psi = solve_spd_system_with_policy(
-                    &h_mode,
-                    &rhs,
-                    options.ridge_floor,
-                    options.ridge_policy,
-                )
-                .or_else(|_| {
-                    pinv_positive_part(&h_mode, options.ridge_floor).map(|h_pinv| h_pinv.dot(&rhs))
-                })?;
-                let mut d_eta_mode = x_dense.dot(&u_psi);
-                trace_acc += apply_geometry_direction_to_eta_and_trace(
-                    &x_dense,
-                    beta,
-                    &w,
-                    &h_inv,
-                    &mut d_eta_mode,
-                    family.block_geometry_directional_derivative(
-                        &inner.block_states,
-                        b,
-                        spec,
-                        &u_psi,
-                    )?,
+    let mut outer_hessian = if need_hessian {
+        Some(Array2::<f64>::zeros((theta_dim, theta_dim)))
+    } else {
+        None
+    };
+    if let Some(hess) = outer_hessian.as_mut() {
+        for i in 0..theta_dim {
+            for j in i..theta_dim {
+                let s_ij = joint_theta_penalty_second_matrix(
+                    specs,
+                    &ranges,
+                    &per_block,
+                    derivative_blocks,
+                    total,
+                    &coords[i],
+                    &coords[j],
                 )?;
-                if let Some(dw_mode) = family.diagonal_working_weights_directional_derivative(
-                    &inner.block_states,
-                    b,
-                    &d_eta_mode,
-                )? {
-                    if dw_mode.len() != x_dense.nrows() {
-                        return Err(format!(
-                            "block {b} implicit psi dW length mismatch: got {}, expected {}",
-                            dw_mode.len(),
-                            x_dense.nrows()
-                        ));
+                let (v_ij, g_ij, h_ij) = match (&coords[i], &coords[j]) {
+                    (JointHyperCoord::Psi { .. }, JointHyperCoord::Psi { .. }) => {
+                        let psi_i = coords[i].global_idx() - rho_dim;
+                        let psi_j = coords[j].global_idx() - rho_dim;
+                        let psi_terms = family
+                            .exact_newton_joint_psi_second_order_terms(
+                                &synced_joint_states,
+                                specs,
+                                derivative_blocks,
+                                psi_i,
+                                psi_j,
+                            )?
+                            .ok_or_else(|| {
+                                format!(
+                                    "missing exact joint psi second-order terms for psi coordinates ({psi_i}, {psi_j})"
+                                )
+                            })?;
+                        (
+                            psi_terms.objective_psi_psi + 0.5 * beta_flat.dot(&s_ij.dot(&beta_flat)),
+                            psi_terms.score_psi_psi + &s_ij.dot(&beta_flat),
+                            psi_terms.hessian_psi_psi + &s_ij,
+                        )
                     }
-                    let mut leverage = Array1::<f64>::zeros(x_dense.nrows());
-                    for i in 0..x_dense.nrows() {
-                        let xi = x_dense.row(i).to_owned();
-                        leverage[i] = xi.dot(&h_inv.dot(&xi));
+                    _ => {
+                        let g = s_ij.dot(&beta_flat);
+                        let v = 0.5 * beta_flat.dot(&g);
+                        (v, g, s_ij.clone())
                     }
-                    // For diagonal working weights,
-                    //
-                    //   D_beta J[u_psi] = X^T diag(dw_mode) X,
-                    //
-                    // hence
-                    //
-                    //   tr(J^{-1} D_beta J[u_psi])
-                    //   = sum_i (x_i^T J^{-1} x_i) dw_mode_i.
-                    trace_acc += 0.5 * leverage.dot(&dw_mode);
-                } else if u_psi.dot(&u_psi).sqrt() > 1e-14 {
-                    return Err(format!(
-                        "missing implicit psi dW callback for block {b} while REML psi gradient requires D_beta J[u_psi]"
-                    ));
+                };
+                let beta_ij_rhs = &g_ij
+                    + &h_i_terms[i].dot(&beta_i_terms[j])
+                    + &h_i_terms[j].dot(&beta_i_terms[i])
+                    + &d_h_beta_i_terms[i].dot(&beta_i_terms[j]);
+                let beta_ij = solve_mode_sensitivity(
+                    &h_mode,
+                    &(-beta_ij_rhs),
+                    joint_tangent_basis.as_ref(),
+                    strict_spd,
+                    allow_semidefinite,
+                    options,
+                    "joint second-order mode sensitivity system for full [rho, psi] outer calculus",
+                )?;
+                let mut ddot_h_ij = h_ij.clone();
+                match &coords[i] {
+                    JointHyperCoord::Psi { .. } => {
+                        let psi_i = coords[i].global_idx() - rho_dim;
+                        ddot_h_ij += &symmetrized_square_matrix(
+                            family
+                                .exact_newton_joint_psi_hessian_directional_derivative(
+                                    &synced_joint_states,
+                                    specs,
+                                    derivative_blocks,
+                                    psi_i,
+                                    &beta_i_terms[j],
+                                )?
+                                .ok_or_else(|| {
+                                    format!(
+                                        "missing exact joint psi mixed Hessian drift for psi coordinate {}",
+                                        psi_i
+                                    )
+                                })?,
+                            total,
+                            "joint exact-newton D_beta H_psi[u] shape mismatch",
+                        )?;
+                    }
+                    JointHyperCoord::Rho { .. } => {}
                 }
-                trace_acc
-            } else {
-                0.0
-            };
-            let pseudo_det_term = if options.use_reml_objective {
-                // Positive-part penalty determinant correction:
-                //
-                //   d/dpsi [-0.5 log|S|_+]
-                //   = -0.5 tr(S_+^{-1} S_psi).
-                -0.5 * trace_product(
-                    s_pinv
-                        .as_ref()
-                        .ok_or_else(|| "missing S^+ for psi gradient".to_string())?,
-                    &s_psi_total,
-                )
-            } else {
-                0.0
-            };
-            grad[at] = explicit + trace_term + pseudo_det_term;
-            at += 1;
+                match &coords[j] {
+                    JointHyperCoord::Psi { .. } => {
+                        let psi_j = coords[j].global_idx() - rho_dim;
+                        ddot_h_ij += &symmetrized_square_matrix(
+                            family
+                                .exact_newton_joint_psi_hessian_directional_derivative(
+                                    &synced_joint_states,
+                                    specs,
+                                    derivative_blocks,
+                                    psi_j,
+                                    &beta_i_terms[i],
+                                )?
+                                .ok_or_else(|| {
+                                    format!(
+                                        "missing exact joint psi mixed Hessian drift for psi coordinate {}",
+                                        psi_j
+                                    )
+                                })?,
+                            total,
+                            "joint exact-newton D_beta H_psi[u] shape mismatch",
+                        )?;
+                    }
+                    JointHyperCoord::Rho { .. } => {}
+                }
+                ddot_h_ij += &symmetrized_square_matrix(
+                    family
+                        .exact_newton_joint_hessian_directional_derivative_with_specs(
+                            &synced_joint_states,
+                            specs,
+                            &beta_ij,
+                        )?
+                        .ok_or_else(|| {
+                            "missing joint exact-newton dH for second-order [rho, psi] calculus"
+                                .to_string()
+                        })?,
+                    total,
+                    "joint exact-newton dH(beta_ij) shape mismatch",
+                )?;
+                ddot_h_ij += &symmetrized_square_matrix(
+                    family
+                        .exact_newton_joint_hessian_second_directional_derivative_with_specs(
+                            &synced_joint_states,
+                            specs,
+                            &beta_i_terms[i],
+                            &beta_i_terms[j],
+                        )?
+                        .ok_or_else(|| {
+                            "missing joint exact-newton d2H for second-order [rho, psi] calculus"
+                                .to_string()
+                        })?,
+                    total,
+                    "joint exact-newton d2H shape mismatch in full [rho, psi] outer calculus",
+                )?;
+                let profile_term = v_ij + g_i_terms[i].dot(&beta_i_terms[j]);
+                let log_h_term = if include_logdet_h {
+                    0.5
+                        * (trace_product(&h_inv, &ddot_h_ij)
+                            - trace_jinv_a_jinv_b(
+                                &h_inv,
+                                &dot_h_i_terms[j],
+                                &dot_h_i_terms[i],
+                            ))
+                } else {
+                    0.0
+                };
+                let log_s_term = if include_logdet_s {
+                    -0.5
+                        * trace_product(
+                            s_pinv_joint
+                                .as_ref()
+                                .ok_or_else(|| "missing joint S^+ for second derivative".to_string())?,
+                            &s_ij,
+                        )
+                        + 0.5
+                            * trace_jinv_a_jinv_b(
+                                s_pinv_joint
+                                    .as_ref()
+                                    .ok_or_else(|| "missing joint S^+ for second derivative".to_string())?,
+                                &s_i_terms[j],
+                                &s_i_terms[i],
+                            )
+                } else {
+                    0.0
+                };
+                let value = profile_term + log_h_term + log_s_term;
+                hess[[i, j]] = value;
+                hess[[j, i]] = value;
+            }
         }
     }
 
-    Ok(grad)
+    Ok((gradient, outer_hessian))
 }
 
 fn apply_geometry_direction_to_eta_and_trace(
@@ -3858,66 +3613,84 @@ fn apply_geometry_direction_to_eta_and_trace(
 
 /// Evaluate the joint outer hyper surface for the *currently realized* custom-family state.
 ///
-/// This function is intentionally not a pure map from a full `theta=[rho, psi]` vector.
-/// The geometry/penalty `psi` coordinates must already have been applied by the caller when
+/// The caller has already applied the current spatial coordinates `psi` when
 /// constructing:
 ///
 /// - `family`
 /// - `specs`
 /// - `derivative_blocks`
 ///
-/// Therefore the explicit input here is only the current smoothing coordinate `rho`.
-/// The returned gradient is still stacked as `[dV/drho, dV/dpsi]`, but the `psi` part is the
-/// derivative of the scalar objective for the *externally realized* `psi` state encoded in those
-/// inputs, not with respect to any unseen local `theta` tail.
+/// so the explicit input here is still only the smoothing vector `rho_current`.
+/// Mathematically, however, the surface being differentiated is the full joint
+/// profiled/Laplace objective in
 ///
-/// Exact derivative structure:
+///   theta = [rho, psi].
 ///
-/// 1. First-order joint gradient
+/// The exact outer calculus is unified across all hypercoordinates:
 ///
-/// For theta = [rho, psi], this entry point currently computes
+///   J(theta)
+///   = V(beta^(theta), theta)
+///     + 0.5 log|H(beta^(theta), theta)|
+///     - 0.5 log|S(theta)|_+,
+///
+/// with stationarity and joint curvature
+///
+///   F(beta, theta) := V_beta(beta, theta) = 0,
+///   H(beta, theta) := V_beta_beta(beta, theta).
+///
+/// For each theta_i we need the fixed-beta objects
+///
+///   V_i, g_i := F_i, H_i,
+///
+/// and for each pair (i, j)
+///
+///   V_ij, g_ij, H_ij,
+///
+/// together with the beta-curvature contractions
+///
+///   D_beta H[u], D_beta^2 H[u, v], T_i[u] := D_beta H_i[u].
+///
+/// These determine the exact joint mode responses
+///
+///   beta_i  = -H^{-1} g_i,
+///   beta_ij = -H^{-1}(g_ij + H_i beta_j + H_j beta_i + D_beta H[beta_i] beta_j),
+///
+/// and the total Hessian drifts
+///
+///   dot H_i
+///   = H_i + D_beta H[beta_i],
+///
+///   ddot H_ij
+///   = H_ij
+///     + T_i[beta_j]
+///     + T_j[beta_i]
+///     + D_beta H[beta_ij]
+///     + D_beta^2 H[beta_i, beta_j].
+///
+/// Therefore the exact joint outer derivatives are
 ///
 ///   J_i
 ///   = V_i
-///     + 0.5 tr(H^{-1} \dot H_i)
-///     - 0.5 tr(S^+ S_i),
+///     + 0.5 tr(H^{-1} dot H_i)
+///     - 0.5 partial_i log|S|_+,
 ///
-/// where:
+///   J_ij
+///   = (V_ij - g_i^T H^{-1} g_j)
+///     + 0.5 [ tr(H^{-1} ddot H_ij)
+///             - tr(H^{-1} dot H_j H^{-1} dot H_i) ]
+///     - 0.5 partial^2_{ij} log|S|_+.
 ///
-///   V_i = partial_{theta_i} V(beta*(theta), theta),
-///   \dot H_i = H_i + T[beta_i],
-///   beta_i = -H^{-1} g_i.
+/// In this unified view rho and psi differ only in their fixed-beta derivative
+/// objects:
 ///
-/// The rho block comes from `outer_objective_gradient_hessian_internal`, and
-/// the psi block comes from `compute_custom_family_block_psi_gradients`.
+/// - rho coordinates are penalty-only at fixed beta
+/// - psi coordinates come from the family's joint exact psi hooks
 ///
-/// 2. Missing second-order joint Hessian
-///
-/// A full exact outer Hessian would need
-///
-///   J_{ij}
-///   = (V_{ij} - g_i^T H^{-1} g_j)
-///     + 0.5[ tr(H^{-1} \ddot H_{ij})
-///            - tr(H^{-1} \dot H_j H^{-1} \dot H_i) ]
-///     - 0.5[ tr(S^+ S_{ij}) - tr(S^+ S_j S^+ S_i) ].
-///
-/// with
-///
-///   beta_i  = -H^{-1} g_i,
-///   beta_{ij}
-///     = -H^{-1}(g_{ij} + H_i beta_j + H_j beta_i + T[beta_i] beta_j),
-///
-///   \dot H_i = H_i + T[beta_i],
-///   \ddot H_{ij}
-///     = H_{ij}
-///       + T_i[beta_j]
-///       + T_j[beta_i]
-///       + T[beta_{ij}]
-///       + Q[beta_i, beta_j].
-///
-/// That second-order assembly is not implemented here yet. This function
-/// therefore returns `outer_hessian = None` whenever psi coordinates are
-/// present, even though the first-order psi gradient is exact.
+/// The implementation below follows this unified calculus directly. Once a
+/// family supplies the joint fixed-beta psi objects and the mixed
+/// `D_beta H_psi[u]` contraction, exact joint hyper evaluation treats `rho`
+/// and `psi` identically and returns the full profiled/Laplace Hessian over
+/// `theta = [rho, psi]`.
 pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -3958,81 +3731,36 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
         warm_start.map(|w| &w.inner),
         need_hessian,
     )?;
-    let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
-    let psi_grad = compute_custom_family_block_psi_gradients(
-        family,
-        specs,
-        options,
-        &per_block,
-        derivative_blocks,
-        &mut result.inner,
-    )?;
+    if psi_dim > 0 {
+        let (gradient, outer_hessian) = compute_custom_family_joint_hyper_exact(
+            family,
+            specs,
+            options,
+            &penalty_counts,
+            rho_current,
+            derivative_blocks,
+            &mut result.inner,
+            need_hessian,
+        )?;
+        return Ok(CustomFamilyJointHyperResult {
+            objective: result.objective,
+            gradient,
+            outer_hessian,
+            warm_start: CustomFamilyWarmStart {
+                inner: result.warm_start,
+            },
+        });
+    }
 
     let mut gradient = Array1::<f64>::zeros(rho_dim + psi_dim);
     gradient
         .slice_mut(ndarray::s![..rho_dim])
         .assign(&result.gradient);
-    gradient.slice_mut(ndarray::s![rho_dim..]).assign(&psi_grad);
 
     Ok(CustomFamilyJointHyperResult {
         objective: result.objective,
         gradient,
-        // Exact outer Hessian derivation currently covers rho-block only
-        // (smoothing-parameter coordinates). For joint theta = [rho, psi], the
-        // profiled objective is
-        //
-        //   J(theta)
-        //   = V(beta*(theta), theta)
-        //     + 0.5 log|H_mode(beta*(theta), theta)|
-        //     - 0.5 log|S(theta)|_+,
-        //
-        // with stationarity g(beta*(theta), theta) = 0 and first-order mode
-        // response
-        //
-        //   beta_i = -H^{-1} g_i.
-        //
-        // The current implementation computes J_i exactly for psi directions by
-        // combining:
-        //
-        //   explicit_i,
-        //   g_i,
-        //   H_i + D_beta H[beta_i],
-        //
-        // inside `compute_custom_family_block_psi_gradients`.
-        //
-        // A full exact Hessian J_{ij} would require the complete profiled
-        // decomposition
-        //
-        //   J_{ij}
-        //   = (V_{ij} - g_i^T H^{-1} g_j)
-        //     + 0.5[ tr(H^{-1} \tilde H_{ij})
-        //            - tr(H^{-1} \tilde H_i H^{-1} \tilde H_j) ]
-        //     - 0.5[ tr(S^+ S_{ij}) - tr(S^+ S_i S^+ S_j) ].
-        //
-        // In practical code terms that means adding the fixed-beta second
-        // partials
-        //
-        //   V_{ij}, g_{ij}, H_{ij}, S_{ij},
-        //
-        // together with the contracted beta-curvature operators needed to form
-        // the total Hessian drifts
-        //
-        //   \tilde H_i  = H_i + T[beta_i],
-        //   \tilde H_{ij}
-        //     = H_{ij}
-        //       + T_i[beta_j]
-        //       + T_j[beta_i]
-        //       + Q[beta_i, beta_j]
-        //       + T[beta_{ij}].
-        //
-        // Until those exact second-order psi objects exist, returning a
-        // partial Hessian here would be wrong, so the joint path intentionally
-        // suppresses `outer_hessian` whenever psi_dim > 0.
-        outer_hessian: if need_hessian && psi_dim == 0 {
-            result.outer_hessian
-        } else {
-            None
-        },
+        outer_hessian: if need_hessian { result.outer_hessian } else { None },
         warm_start: CustomFamilyWarmStart {
             inner: result.warm_start,
         },
@@ -4086,26 +3814,6 @@ fn set_states_from_flat_beta(
     Ok(())
 }
 
-fn trace_of_product(a: &Array2<f64>, b: &Array2<f64>) -> Result<f64, String> {
-    if a.nrows() != a.ncols() || b.nrows() != b.ncols() || a.nrows() != b.nrows() {
-        return Err(format!(
-            "trace_of_product shape mismatch: a={}x{}, b={}x{}",
-            a.nrows(),
-            a.ncols(),
-            b.nrows(),
-            b.ncols()
-        ));
-    }
-    let n = a.nrows();
-    let mut out = 0.0;
-    for i in 0..n {
-        for j in 0..n {
-            out += a[[i, j]] * b[[j, i]];
-        }
-    }
-    Ok(out)
-}
-
 fn synchronized_states_from_flat_beta<F: CustomFamily>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -4116,6 +3824,235 @@ fn synchronized_states_from_flat_beta<F: CustomFamily>(
     set_states_from_flat_beta(&mut synced, specs, beta_flat)?;
     refresh_all_block_etas(family, specs, &mut synced)?;
     Ok(synced)
+}
+
+fn flatten_joint_hyper_coords(
+    specs: &[ParameterBlockSpec],
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+) -> Result<Vec<JointHyperCoord>, String> {
+    if derivative_blocks.len() != specs.len() {
+        return Err(format!(
+            "joint hyper derivative block count mismatch: got {}, expected {}",
+            derivative_blocks.len(),
+            specs.len()
+        ));
+    }
+    let mut coords = Vec::new();
+    let mut global = 0usize;
+    for (block_idx, spec) in specs.iter().enumerate() {
+        for penalty_idx in 0..spec.penalties.len() {
+            coords.push(JointHyperCoord::Rho {
+                block_idx,
+                penalty_idx,
+                global_idx: global,
+            });
+            global += 1;
+        }
+    }
+    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+        for local_idx in 0..block_derivs.len() {
+            coords.push(JointHyperCoord::Psi {
+                block_idx,
+                local_idx,
+                global_idx: global,
+            });
+            global += 1;
+        }
+    }
+    Ok(coords)
+}
+
+fn joint_theta_penalty_first_matrix(
+    specs: &[ParameterBlockSpec],
+    ranges: &[(usize, usize)],
+    per_block: &[Array1<f64>],
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    total: usize,
+    rho_dim: usize,
+    coord: &JointHyperCoord,
+) -> Result<Array2<f64>, String> {
+    match coord {
+        JointHyperCoord::Rho {
+            block_idx,
+            penalty_idx,
+            ..
+        } => {
+            let spec = &specs[*block_idx];
+            let (start, end) = ranges[*block_idx];
+            let mut s_i = Array2::<f64>::zeros((total, total));
+            let local = spec.penalties[*penalty_idx]
+                .mapv(|v| per_block[*block_idx][*penalty_idx].exp() * v);
+            s_i.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
+            Ok(s_i)
+        }
+        JointHyperCoord::Psi {
+            block_idx,
+            local_idx,
+            ..
+        } => {
+            let deriv = &derivative_blocks[*block_idx][*local_idx];
+            let (start, end) = ranges[*block_idx];
+            let p = end - start;
+            let mut s_i = Array2::<f64>::zeros((total, total));
+            let local = if let Some(parts) = deriv.s_psi_components.as_ref() {
+                let mut total_local = Array2::<f64>::zeros((p, p));
+                for (penalty_idx, s_part) in parts {
+                    if *penalty_idx >= per_block[*block_idx].len() {
+                        return Err(format!(
+                            "psi penalty derivative component {} out of bounds for block {}",
+                            penalty_idx, block_idx
+                        ));
+                    }
+                    total_local.scaled_add(per_block[*block_idx][*penalty_idx].exp(), s_part);
+                }
+                total_local
+            } else {
+                if deriv.penalty_index >= per_block[*block_idx].len() {
+                    return Err(format!(
+                        "psi penalty derivative index {} out of bounds for block {}",
+                        deriv.penalty_index, block_idx
+                    ));
+                }
+                deriv.s_psi
+                    .mapv(|v| per_block[*block_idx][deriv.penalty_index].exp() * v)
+            };
+            s_i.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
+            let _ = rho_dim;
+            Ok(s_i)
+        }
+    }
+}
+
+fn joint_theta_penalty_second_matrix(
+    specs: &[ParameterBlockSpec],
+    ranges: &[(usize, usize)],
+    per_block: &[Array1<f64>],
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    total: usize,
+    coord_i: &JointHyperCoord,
+    coord_j: &JointHyperCoord,
+) -> Result<Array2<f64>, String> {
+    match (coord_i, coord_j) {
+        (
+            JointHyperCoord::Rho {
+                block_idx: bi,
+                penalty_idx: pi,
+                ..
+            },
+            JointHyperCoord::Rho {
+                block_idx: bj,
+                penalty_idx: pj,
+                ..
+            },
+        ) => {
+            let mut s_ij = Array2::<f64>::zeros((total, total));
+            if bi == bj && pi == pj {
+                let (start, end) = ranges[*bi];
+                let local = specs[*bi].penalties[*pi].mapv(|v| per_block[*bi][*pi].exp() * v);
+                s_ij.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
+            }
+            Ok(s_ij)
+        }
+        (
+            JointHyperCoord::Rho {
+                block_idx: bi,
+                penalty_idx: pi,
+                ..
+            },
+            JointHyperCoord::Psi {
+                block_idx: bj,
+                local_idx: lj,
+                ..
+            },
+        )
+        | (
+            JointHyperCoord::Psi {
+                block_idx: bj,
+                local_idx: lj,
+                ..
+            },
+            JointHyperCoord::Rho {
+                block_idx: bi,
+                penalty_idx: pi,
+                ..
+            },
+        ) => {
+            let mut s_ij = Array2::<f64>::zeros((total, total));
+            if bi != bj {
+                return Ok(s_ij);
+            }
+            let (start, end) = ranges[*bi];
+            let p = end - start;
+            let deriv = &derivative_blocks[*bj][*lj];
+            let local = if let Some(parts) = deriv.s_psi_components.as_ref() {
+                let mut total_local = Array2::<f64>::zeros((p, p));
+                for (penalty_idx, s_part) in parts {
+                    if *penalty_idx == *pi {
+                        total_local += &s_part.mapv(|v| per_block[*bi][*pi].exp() * v);
+                    }
+                }
+                total_local
+            } else if deriv.penalty_index == *pi {
+                deriv.s_psi
+                    .mapv(|v| per_block[*bi][*pi].exp() * v)
+            } else {
+                Array2::<f64>::zeros((p, p))
+            };
+            s_ij.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
+            Ok(s_ij)
+        }
+        (
+            JointHyperCoord::Psi {
+                block_idx: bi,
+                local_idx: li,
+                ..
+            },
+            JointHyperCoord::Psi {
+                block_idx: bj,
+                local_idx: lj,
+                ..
+            },
+        ) => {
+            let mut s_ij = Array2::<f64>::zeros((total, total));
+            if bi != bj {
+                return Ok(s_ij);
+            }
+            let (start, end) = ranges[*bi];
+            let p = end - start;
+            let deriv = &derivative_blocks[*bi][*li];
+            let local = if let Some(parts) = deriv.s_psi_psi_components.as_ref() {
+                let mut total_local = Array2::<f64>::zeros((p, p));
+                if let Some(pair_parts) = parts.get(*lj) {
+                    for (penalty_idx, s_part) in pair_parts {
+                        if *penalty_idx >= per_block[*bi].len() {
+                            return Err(format!(
+                                "psi second-derivative component {} out of bounds for block {}",
+                                penalty_idx, bi
+                            ));
+                        }
+                        total_local.scaled_add(per_block[*bi][*penalty_idx].exp(), s_part);
+                    }
+                }
+                total_local
+            } else if let Some(parts) = deriv.s_psi_psi.as_ref() {
+                if let Some(s_part) = parts.get(*lj) {
+                    if deriv.penalty_index >= per_block[*bi].len() {
+                        return Err(format!(
+                            "psi second-derivative penalty index {} out of bounds for block {}",
+                            deriv.penalty_index, bi
+                        ));
+                    }
+                    s_part.mapv(|v| per_block[*bi][deriv.penalty_index].exp() * v)
+                } else {
+                    Array2::<f64>::zeros((p, p))
+                }
+            } else {
+                Array2::<f64>::zeros((p, p))
+            };
+            s_ij.slice_mut(ndarray::s![start..end, start..end]).assign(&local);
+            Ok(s_ij)
+        }
+    }
 }
 
 fn post_update_tangent_basis_for_block<F: CustomFamily>(
@@ -5055,13 +4992,18 @@ mod tests {
             Ok(Some(array![[0.0]]))
         }
 
-        fn exact_newton_block_psi_gradient(
+        fn exact_newton_joint_psi_terms(
             &self,
             _block_states: &[ParameterBlockState],
-            _block_idx: usize,
-            _ctx: ExactNewtonPsiGradientContext<'_>,
-        ) -> Result<Option<f64>, String> {
-            Ok(Some(3.5))
+            _specs: &[ParameterBlockSpec],
+            _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+            _psi_index: usize,
+        ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+            Ok(Some(ExactNewtonJointPsiTerms {
+                objective_psi: 3.5,
+                score_psi: array![0.0],
+                hessian_psi: array![[0.0]],
+            }))
         }
     }
 
@@ -5360,7 +5302,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_newton_family_hook_can_supply_psi_gradient_without_quadratic_spsi() {
+    fn exact_newton_joint_psi_hook_can_supply_fixed_beta_terms_without_quadratic_spsi() {
         let spec = ParameterBlockSpec {
             name: "psi_hook".to_string(),
             design: DesignMatrix::Dense(array![[1.0]]),
@@ -5391,11 +5333,11 @@ mod tests {
             None,
             false,
         )
-        .expect("joint hyper eval with exact psi hook");
+        .expect("joint hyper eval with exact joint psi hook");
         assert_eq!(result.gradient.len(), 1);
         assert!(
             (result.gradient[0] - 3.5).abs() < 1e-12,
-            "expected family-supplied psi gradient, got {}",
+            "expected family-supplied joint psi term, got {}",
             result.gradient[0]
         );
     }

@@ -952,13 +952,19 @@ impl WorkingModelSurvival {
                 let s_i = self
                     .stabilized_structural_derivative(deriv_raw[i])
                     .unwrap_or(deriv_raw[i]);
-                if s_i < guard_numerical || !s_i.is_finite() {
+                if !s_i.is_finite() {
                     return Err(EstimationError::ParameterConstraintViolation(format!(
                         "survival monotonicity violated in LAML trace contraction at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
                         i, s_i, guard
                     )));
                 }
                 if self.event_target[i] > 0 {
+                    if s_i < guard_numerical {
+                        return Err(EstimationError::ParameterConstraintViolation(format!(
+                            "survival monotonicity violated in LAML trace contraction at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
+                            i, s_i, guard
+                        )));
+                    }
                     let inv_s = 1.0 / s_i;
                     let inv_s2 = inv_s * inv_s;
                     let inv_s3 = inv_s2 * inv_s;
@@ -2361,7 +2367,7 @@ mod tests {
             .expect("monotonicity constraints");
         assert_eq!(constraints.a.nrows(), 1);
         assert!((constraints.a[[0, 1]] - 1.0).abs() <= 1e-12);
-        assert!((constraints.b[0] - 8e-8).abs() <= 1e-18);
+        assert!((constraints.b[0] - 4e-8).abs() <= 1e-18);
     }
 
     #[test]
@@ -2397,6 +2403,77 @@ mod tests {
             .expect("nonzero derivative row should remain");
         assert_eq!(constraints.a.nrows(), 1);
         assert!((constraints.a[[0, 1]] - 1.0).abs() <= 1e-12);
+        assert!(constraints.b[0].abs() <= 1e-18);
+    }
+
+    #[test]
+    fn censored_rows_allow_zero_boundary_derivative() {
+        let age_entry = array![1.0_f64];
+        let age_exit = array![2.0_f64];
+        let event_target = array![0u8];
+        let event_competing = array![0u8];
+        let sample_weight = array![1.0];
+        let x_entry = array![[0.0]];
+        let x_exit = array![[0.0]];
+        let x_derivative = array![[1.0]];
+
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct censored survival model");
+
+        let state = model
+            .update_state(&array![0.0])
+            .expect("censored boundary derivative should remain feasible");
+        assert!(state.deviance.is_finite());
+    }
+
+    #[test]
+    fn event_rows_keep_positive_derivative_constraint() {
+        let age_entry = array![1.0_f64, 1.0];
+        let age_exit = array![2.0_f64, 4.0];
+        let event_target = array![0u8, 1u8];
+        let event_competing = array![0u8, 0u8];
+        let sample_weight = array![1.0, 1.0];
+        let x_entry = array![[0.0], [0.0]];
+        let x_exit = array![[0.0], [0.0]];
+        let x_derivative = array![[0.5], [0.25]];
+
+        let model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sample_weight: sample_weight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct mixed survival model");
+
+        let constraints = model
+            .monotonicity_linear_constraints()
+            .expect("event row should induce positive lower bound");
+        assert_eq!(constraints.a.nrows(), 1);
+        assert!((constraints.a[[0, 0]] - 1.0).abs() <= 1e-12);
+        assert!((constraints.b[0] - 4e-8).abs() <= 1e-18);
     }
 
     #[test]

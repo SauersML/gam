@@ -235,7 +235,7 @@ struct FitArgs {
     #[arg(long = "baseline-makeham")]
     baseline_makeham: Option<f64>,
     /// Time basis for survival mode (`linear`, `ispline`, ...).
-    #[arg(long = "time-basis", default_value = "bspline")]
+    #[arg(long = "time-basis", default_value = "ispline")]
     time_basis: String,
     /// Degree for survival time basis.
     #[arg(long = "time-degree", default_value_t = 3)]
@@ -2459,6 +2459,10 @@ struct SurvivalTimeBuildOutput {
     smooth_lambda: Option<f64>,
 }
 
+fn survival_basis_supports_structural_monotonicity(basis_name: &str) -> bool {
+    basis_name.eq_ignore_ascii_case("ispline")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SurvivalLikelihoodMode {
     Transformation,
@@ -2681,7 +2685,7 @@ fn load_survival_time_basis_config_from_model(
     match model
         .survival_time_basis
         .as_deref()
-        .unwrap_or("linear")
+        .ok_or_else(|| "saved survival model missing survival_time_basis".to_string())?
         .to_ascii_lowercase()
         .as_str()
     {
@@ -3446,16 +3450,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     .to_string(),
             );
         }
-        if !effective_args.time_basis.eq_ignore_ascii_case("linear")
-            || effective_args.time_degree != 3
-            || effective_args.time_num_internal_knots != 8
-            || (effective_args.time_smooth_lambda - 1e-2).abs() > 1e-15
-        {
-            return Err(
-                "--survival-likelihood weibull requires parametric time shape; leave --time-* options at defaults"
-                    .to_string(),
-            );
-        }
     }
     let baseline_cfg = match likelihood_mode {
         SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::ProbitLocationScale => {
@@ -3925,7 +3919,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let penalties = PenaltyBlocks::new(penalty_blocks.clone());
 
     let monotonicity = MonotonicityPenalty {
-        tolerance: if time_build.basis_name == "ispline" {
+        tolerance: if survival_basis_supports_structural_monotonicity(&time_build.basis_name) {
             0.0
         } else {
             1e-8
@@ -3951,7 +3945,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
-    if time_build.basis_name == "ispline" {
+    if survival_basis_supports_structural_monotonicity(&time_build.basis_name) {
         model
             .set_structural_monotonicity(true, p_time)
             .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
@@ -4267,7 +4261,7 @@ fn run_sample_survival(
         other => return Err(format!("unsupported saved survival spec '{other}'")),
     };
     let monotonicity = MonotonicityPenalty {
-        tolerance: if time_build.basis_name == "ispline" {
+        tolerance: if survival_basis_supports_structural_monotonicity(&time_build.basis_name) {
             0.0
         } else {
             1e-8
@@ -4295,7 +4289,7 @@ fn run_sample_survival(
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
-    if time_build.basis_name == "ispline" {
+    if survival_basis_supports_structural_monotonicity(&time_build.basis_name) {
         model_surv
             .set_structural_monotonicity(true, p_time)
             .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
@@ -4322,7 +4316,7 @@ fn run_sample_survival(
         penalties,
         monotonicity,
         survival_spec,
-        time_build.basis_name == "ispline",
+        survival_basis_supports_structural_monotonicity(&time_build.basis_name),
         p_time,
         beta0.view(),
         hessian.view(),
@@ -8468,8 +8462,8 @@ mod tests {
         parse_link_choice, parse_surv_response, parse_survival_baseline_config,
         parse_survival_inverse_link, parse_survival_time_basis_config, pretty_family_name,
         saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design, summarize_wiggle_domain,
-        survival_probability_from_eta, write_gaussian_location_scale_prediction_csv,
-        write_survival_prediction_csv,
+        survival_basis_supports_structural_monotonicity, survival_probability_from_eta,
+        write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
     };
     use csv::StringRecord;
     use gam::basis::{
@@ -9312,6 +9306,80 @@ mod tests {
         };
         let cfg = parse_survival_time_basis_config(&args).expect("parse ispline time basis");
         assert!(matches!(cfg, SurvivalTimeBasisConfig::ISpline { .. }));
+    }
+
+    #[test]
+    fn structural_survival_basis_detection_is_ispline_only() {
+        assert!(survival_basis_supports_structural_monotonicity("ispline"));
+        assert!(survival_basis_supports_structural_monotonicity("ISPLINE"));
+        assert!(!survival_basis_supports_structural_monotonicity("linear"));
+        assert!(!survival_basis_supports_structural_monotonicity("bspline"));
+    }
+
+    #[test]
+    fn saved_survival_model_requires_time_basis_metadata() {
+        let model = SavedModel::from_payload(FittedModelPayload {
+            version: MODEL_VERSION,
+            formula: "Surv(start, stop, event) ~ x".to_string(),
+            model_kind: ModelKind::Survival,
+            family_state: FittedFamily::Survival {
+                likelihood: LikelihoodFamily::RoystonParmar,
+                survival_likelihood: Some("transformation".to_string()),
+                survival_distribution: Some("gaussian".to_string()),
+            },
+            family: "survival".to_string(),
+            fit_result: None,
+            data_schema: None,
+            link: None,
+            mixture_link_param_covariance: None,
+            sas_param_covariance: None,
+            formula_noise: None,
+            beta_noise: None,
+            noise_projection: None,
+            noise_center: None,
+            noise_scale: None,
+            noise_non_intercept_start: None,
+            joint_beta_link: None,
+            joint_knot_range: None,
+            joint_knot_vector: None,
+            joint_link_transform: None,
+            joint_degree: None,
+            joint_ridge_used: None,
+            probit_wiggle_knots: None,
+            probit_wiggle_degree: None,
+            beta_wiggle: None,
+            survival_entry: Some("start".to_string()),
+            survival_exit: Some("stop".to_string()),
+            survival_event: Some("event".to_string()),
+            survival_spec: Some("net".to_string()),
+            survival_baseline_target: Some("linear".to_string()),
+            survival_baseline_scale: None,
+            survival_baseline_shape: None,
+            survival_baseline_rate: None,
+            survival_baseline_makeham: None,
+            survival_time_basis: None,
+            survival_time_degree: None,
+            survival_time_knots: None,
+            survival_time_smooth_lambda: None,
+            survival_ridge_lambda: None,
+            survival_likelihood: Some("transformation".to_string()),
+            survival_beta_time: None,
+            survival_beta_threshold: None,
+            survival_beta_log_sigma: None,
+            survival_noise_projection: None,
+            survival_noise_center: None,
+            survival_noise_scale: None,
+            survival_noise_non_intercept_start: None,
+            survival_distribution: Some("gaussian".to_string()),
+            training_headers: None,
+            resolved_term_spec: None,
+            resolved_term_spec_noise: None,
+            adaptive_regularization_diagnostics: None,
+        });
+
+        let err = super::load_survival_time_basis_config_from_model(&model)
+            .expect_err("survival model without basis metadata should fail");
+        assert!(err.contains("missing survival_time_basis"));
     }
 
     #[test]
