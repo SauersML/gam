@@ -1911,129 +1911,15 @@ fn run_predict_binomial_location_scale(
     let use_probit_integrated =
         matches!(saved_loc_link, InverseLink::Standard(LinkFunction::Probit));
     let mean = if args.mode == PredictModeArg::PosteriorMean && use_probit_integrated {
-        // Keep existing integrated posterior-mean behavior for probit location-scale.
-        if p_w == 0 {
-            let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-            let cov_tt = cov_mat.slice(s![0..p_t, 0..p_t]).to_owned();
-            let cov_ll = cov_mat
-                .slice(s![p_t..p_t + p_ls, p_t..p_t + p_ls])
-                .to_owned();
-            let cov_tl = cov_mat.slice(s![0..p_t, p_t..p_t + p_ls]).to_owned();
-            let xd_t_covtt = design_t.design.dot(&cov_tt);
-            let xd_l_covll = design_noise.design.dot(&cov_ll);
-            let xd_t_covtl = design_t.design.dot(&cov_tl);
-            let quad_ctx = gam::quadrature::QuadratureContext::new();
-            Array1::from_iter((0..eta.len()).map(|i| {
-                let var_t = design_t.design.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
-                let var_ls = design_noise.design.row(i).dot(&xd_l_covll.row(i)).max(0.0);
-                let cov_tls = design_noise.design.row(i).dot(&xd_t_covtl.row(i));
-                gam::quadrature::normal_expectation_2d_adaptive(
-                    &quad_ctx,
-                    [eta_t[i], eta_noise[i]],
-                    [[var_t, cov_tls], [cov_tls, var_ls]],
-                    |t, ls| {
-                        let sigma = ls.exp();
-                        normal_cdf(-t / sigma.max(1e-12))
-                    },
-                )
-            }))
-        } else {
-            let cov_mat = covariance_from_model(model, args.covariance_mode)?;
-            let cov_tt = cov_mat.slice(s![0..p_t, 0..p_t]).to_owned();
-            let cov_ll = cov_mat
-                .slice(s![p_t..p_t + p_ls, p_t..p_t + p_ls])
-                .to_owned();
-            let cov_tl = cov_mat.slice(s![0..p_t, p_t..p_t + p_ls]).to_owned();
-            let cov_tw = cov_mat
-                .slice(s![0..p_t, p_t + p_ls..p_t + p_ls + p_w])
-                .to_owned();
-            let cov_lw = cov_mat
-                .slice(s![p_t..p_t + p_ls, p_t + p_ls..p_t + p_ls + p_w])
-                .to_owned();
-            let cov_ww = cov_mat
-                .slice(s![
-                    p_t + p_ls..p_t + p_ls + p_w,
-                    p_t + p_ls..p_t + p_ls + p_w
-                ])
-                .to_owned();
-            let xd_t_covtt = design_t.design.dot(&cov_tt);
-            let xd_l_covll = design_noise.design.dot(&cov_ll);
-            let xd_t_covtl = design_t.design.dot(&cov_tl);
-            let xd_t_covtw = design_t.design.dot(&cov_tw);
-            let xd_l_covlw = design_noise.design.dot(&cov_lw);
-            let quad_ctx = gam::quadrature::QuadratureContext::new();
-            let beta_w = Array1::from_vec(model.beta_wiggle.clone().ok_or_else(|| {
-                "binomial-location-scale wiggle model is missing beta_wiggle".to_string()
-            })?);
-            if beta_w.len() != p_w {
-                return Err(format!(
-                    "wiggle model/design mismatch: beta_wiggle has {} coefficients but expected {}",
-                    beta_w.len(),
-                    p_w
-                ));
-            }
-            let mut out = Array1::<f64>::zeros(eta.len());
-            for i in 0..eta.len() {
-                let var_t = design_t.design.row(i).dot(&xd_t_covtt.row(i)).max(0.0);
-                let var_ls = design_noise.design.row(i).dot(&xd_l_covll.row(i)).max(0.0);
-                let cov_tls = design_noise.design.row(i).dot(&xd_t_covtl.row(i));
-                let suv_t = xd_t_covtw.row(i).to_owned();
-                let suv_ls = xd_l_covlw.row(i).to_owned();
-                let inv_uu = invert_2x2_with_jitter(var_t, cov_tls, var_ls);
-                let mut k0 = Array1::<f64>::zeros(p_w);
-                let mut k1 = Array1::<f64>::zeros(p_w);
-                for j in 0..p_w {
-                    k0[j] = suv_t[j] * inv_uu[0][0] + suv_ls[j] * inv_uu[1][0];
-                    k1[j] = suv_t[j] * inv_uu[0][1] + suv_ls[j] * inv_uu[1][1];
-                }
-                let mut cov_w_cond = cov_ww.clone();
-                for r in 0..p_w {
-                    for c in 0..p_w {
-                        cov_w_cond[[r, c]] -= k0[r] * suv_t[c] + k1[r] * suv_ls[c];
-                    }
-                }
-                for d in 0..p_w {
-                    cov_w_cond[[d, d]] = cov_w_cond[[d, d]].max(0.0);
-                }
-                for r in 0..p_w {
-                    for c in 0..r {
-                        let v = 0.5 * (cov_w_cond[[r, c]] + cov_w_cond[[c, r]]);
-                        cov_w_cond[[r, c]] = v;
-                        cov_w_cond[[c, r]] = v;
-                    }
-                }
-                out[i] = gam::quadrature::normal_expectation_2d_adaptive_result(
-                    &quad_ctx,
-                    [eta_t[i], eta_noise[i]],
-                    [[var_t, cov_tls], [cov_tls, var_ls]],
-                    |t, ls| {
-                        let sigma = ls.exp().max(1e-12);
-                        let q0 = (-t / sigma).clamp(-30.0, 30.0);
-                        let xw = saved_probit_wiggle_basis_row_scalar(q0, model)?;
-                        if xw.len() != p_w {
-                            return Err(format!(
-                                "saved probit wiggle scalar basis width mismatch: got {}, expected {}",
-                                xw.len(),
-                                p_w
-                            ));
-                        }
-                        let dt = t - eta_t[i];
-                        let dls = ls - eta_noise[i];
-                        let mean_w = q0 + xw.dot(&beta_w) + dt * xw.dot(&k0) + dls * xw.dot(&k1);
-                        let mut var_w = 0.0;
-                        for r in 0..p_w {
-                            let xr = xw[r];
-                            for c in 0..p_w {
-                                var_w += xr * cov_w_cond[[r, c]] * xw[c];
-                            }
-                        }
-                        let denom = (1.0 + var_w.max(0.0)).sqrt().max(1e-12);
-                        Ok(normal_cdf(mean_w / denom))
-                    },
-                )?;
-            }
-            out
-        }
+        let se_q = eta_se_base.as_ref().ok_or_else(|| {
+            "internal error: probit posterior-mean prediction requested without q SE"
+                .to_string()
+        })?;
+        Array1::from_iter(
+            eta.iter()
+                .zip(se_q.iter())
+                .map(|(&q, &se)| gam::quadrature::probit_posterior_mean(q, se.max(0.0))),
+        )
     } else {
         try_inverse_link_array(
             inverse_link_to_binomial_family(saved_loc_link),
@@ -3341,46 +3227,6 @@ fn saved_probit_wiggle_basis(
                 .to_string(),
         ),
     }
-}
-
-fn saved_probit_wiggle_basis_row_scalar(
-    q0: f64,
-    model: &SavedModel,
-) -> Result<Array1<f64>, String> {
-    let q = Array1::from_vec(vec![q0]);
-    let x = saved_probit_wiggle_design(&q, model)?.ok_or_else(|| {
-        "saved model is missing probit wiggle metadata while wiggle path requested".to_string()
-    })?;
-    if x.nrows() != 1 {
-        return Err(format!(
-            "saved probit wiggle scalar evaluation expected 1 row, got {}",
-            x.nrows()
-        ));
-    }
-    Ok(x.row(0).to_owned())
-}
-
-fn invert_2x2_with_jitter(a11: f64, a12: f64, a22: f64) -> [[f64; 2]; 2] {
-    let mut d11 = a11.max(0.0);
-    let mut d22 = a22.max(0.0);
-    let mut d12 = a12;
-    for retry in 0..8 {
-        let jitter = if retry == 0 {
-            0.0
-        } else {
-            1e-12 * 10f64.powi((retry - 1) as i32)
-        };
-        let e11 = d11 + jitter;
-        let e22 = d22 + jitter;
-        let det = e11 * e22 - d12 * d12;
-        if det.is_finite() && det > 1e-24 {
-            return [[e22 / det, -d12 / det], [-d12 / det, e11 / det]];
-        }
-        d12 *= 0.999;
-        d11 = d11.max(1e-16);
-        d22 = d22.max(1e-16);
-    }
-    [[1.0 / d11.max(1e-8), 0.0], [0.0, 1.0 / d22.max(1e-8)]]
 }
 
 fn saved_probit_wiggle_derivative_q0(
@@ -8463,6 +8309,7 @@ mod tests {
         evaluate_survival_baseline, parse_duchon_order, parse_duchon_power, parse_formula,
         parse_link_choice, parse_surv_response, parse_survival_baseline_config,
         parse_survival_inverse_link, parse_survival_time_basis_config, pretty_family_name,
+        run_predict_binomial_location_scale,
         saved_probit_wiggle_derivative_q0, saved_probit_wiggle_design, summarize_wiggle_domain,
         survival_basis_supports_structural_monotonicity, survival_probability_from_eta,
         write_gaussian_location_scale_prediction_csv, write_survival_prediction_csv,
@@ -8483,10 +8330,116 @@ mod tests {
     };
     use gam::types::{InverseLink, LinkComponent, LinkFunction};
     use gam::{FittedFamily, ModelKind};
-    use ndarray::{Array1, ArrayView1, array};
+    use crate::{CovarianceModeArg, PredictArgs, PredictModeArg};
+    use ndarray::{Array1, Array2, ArrayView1, array};
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
+    use tempfile::tempdir;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn empty_term_spec() -> TermCollectionSpec {
+        TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+        }
+    }
+
+    fn saved_fit_summary_stub() -> SavedFitSummary {
+        SavedFitSummary {
+            iterations: 0,
+            final_grad_norm: 0.0,
+            pirls_status: gam::pirls::PirlsStatus::Converged,
+            deviance: 0.0,
+            stable_penalty_term: 0.0,
+            max_abs_eta: 0.0,
+            reml_score: 0.0,
+        }
+    }
+
+    fn csv_mean_at(path: &std::path::Path, row_idx: usize) -> f64 {
+        let mut rdr = csv::Reader::from_path(path).expect("open prediction csv");
+        let rows = rdr
+            .deserialize::<BTreeMap<String, String>>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse prediction csv");
+        rows[row_idx]["mean"].parse::<f64>().expect("mean should parse")
+    }
+
+    fn intercept_only_binomial_location_scale_model(
+        beta_t: f64,
+        beta_ls: f64,
+        covariance: Array2<f64>,
+        beta_wiggle: Option<Vec<f64>>,
+        wiggle_knots: Option<Vec<f64>>,
+        wiggle_degree: Option<usize>,
+    ) -> SavedModel {
+        let fit_result = core_saved_fit_result(
+            array![beta_t],
+            Array1::zeros(0),
+            1.0,
+            Some(covariance.clone()),
+            Some(covariance),
+            saved_fit_summary_stub(),
+        );
+        SavedModel::from_payload(FittedModelPayload {
+            version: MODEL_VERSION,
+            formula: "y ~ 1".to_string(),
+            model_kind: ModelKind::LocationScale,
+            family_state: FittedFamily::LocationScale {
+                likelihood: LikelihoodFamily::BinomialProbit,
+                base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
+            },
+            family: "binomial-location-scale".to_string(),
+            fit_result: Some(fit_result),
+            data_schema: None,
+            link: Some("probit".to_string()),
+            mixture_link_param_covariance: None,
+            sas_param_covariance: None,
+            formula_noise: Some("y ~ 1".to_string()),
+            beta_noise: Some(vec![beta_ls]),
+            noise_projection: None,
+            noise_center: None,
+            noise_scale: None,
+            noise_non_intercept_start: None,
+            joint_beta_link: None,
+            joint_knot_range: None,
+            joint_knot_vector: None,
+            joint_link_transform: None,
+            joint_degree: None,
+            joint_ridge_used: None,
+            probit_wiggle_knots: wiggle_knots,
+            probit_wiggle_degree: wiggle_degree,
+            beta_wiggle,
+            survival_entry: None,
+            survival_exit: None,
+            survival_event: None,
+            survival_spec: None,
+            survival_baseline_target: None,
+            survival_baseline_scale: None,
+            survival_baseline_shape: None,
+            survival_baseline_rate: None,
+            survival_baseline_makeham: None,
+            survival_time_basis: None,
+            survival_time_degree: None,
+            survival_time_knots: None,
+            survival_time_smooth_lambda: None,
+            survival_ridge_lambda: None,
+            survival_likelihood: None,
+            survival_beta_time: None,
+            survival_beta_threshold: None,
+            survival_beta_log_sigma: None,
+            survival_noise_projection: None,
+            survival_noise_center: None,
+            survival_noise_scale: None,
+            survival_noise_non_intercept_start: None,
+            survival_distribution: None,
+            training_headers: Some(vec![]),
+            resolved_term_spec: Some(empty_term_spec()),
+            resolved_term_spec_noise: Some(empty_term_spec()),
+            adaptive_regularization_diagnostics: None,
+        })
+    }
 
     #[test]
     fn classify_cli_error_specializes_thin_plate_dimension_error() {
@@ -10242,5 +10195,125 @@ mod tests {
         assert_eq!(super::heuristic_knots_for_column(col.view()), 4);
         let bigger = Array1::from_iter((0..200).map(|v| v as f64));
         assert_eq!(super::heuristic_knots_for_column(bigger.view()), 20);
+    }
+
+    #[test]
+    fn probit_location_scale_posterior_mean_uses_latent_q_se_for_nonwiggle_models() {
+        let beta_t = -0.4;
+        let beta_ls = -1.3;
+        let cov = array![[0.2, 0.0], [0.0, 5.0]];
+        let model =
+            intercept_only_binomial_location_scale_model(beta_t, beta_ls, cov.clone(), None, None, None);
+        let td = tempdir().expect("tempdir");
+        let out_path = td.path().join("pred.csv");
+        let args = PredictArgs {
+            model: td.path().join("unused_model.json"),
+            new_data: td.path().join("unused_data.csv"),
+            out: out_path.clone(),
+            uncertainty: false,
+            level: 0.95,
+            covariance_mode: CovarianceModeArg::Corrected,
+            mode: PredictModeArg::PosteriorMean,
+        };
+        let data = ndarray::Array2::<f64>::zeros((1, 0));
+        let headers = vec![];
+        let col_map = HashMap::new();
+
+        run_predict_binomial_location_scale(
+            &args,
+            &model,
+            data.view(),
+            &col_map,
+            Some(&headers),
+            Some(&InverseLink::Standard(LinkFunction::Probit)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("predict nonwiggle probit location-scale");
+
+        let sigma = beta_ls.exp();
+        let q = -beta_t / sigma;
+        let dq = array![-1.0 / sigma, beta_t / sigma];
+        let q_var = dq.dot(&cov.dot(&dq)).max(0.0);
+        let expected = gam::quadrature::probit_posterior_mean(q, q_var.sqrt());
+        let got = csv_mean_at(&out_path, 0);
+        assert!(
+            (got - expected).abs() < 1e-10,
+            "posterior mean should use latent-q probit integration: got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn probit_location_scale_posterior_mean_uses_latent_q_se_for_wiggle_models() {
+        let beta_t = -0.4;
+        let beta_ls = -1.3;
+        let knots = vec![-3.0, -3.0, -3.0, -3.0, 0.0, 3.0, 3.0, 3.0, 3.0];
+        let beta_wiggle = vec![0.25, -0.1, 0.05];
+        let cov = array![
+            [0.2, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 5.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.4, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.3, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.2]
+        ];
+        let model = intercept_only_binomial_location_scale_model(
+            beta_t,
+            beta_ls,
+            cov.clone(),
+            Some(beta_wiggle.clone()),
+            Some(knots),
+            Some(3),
+        );
+        let td = tempdir().expect("tempdir");
+        let out_path = td.path().join("pred.csv");
+        let args = PredictArgs {
+            model: td.path().join("unused_model.json"),
+            new_data: td.path().join("unused_data.csv"),
+            out: out_path.clone(),
+            uncertainty: false,
+            level: 0.95,
+            covariance_mode: CovarianceModeArg::Corrected,
+            mode: PredictModeArg::PosteriorMean,
+        };
+        let data = ndarray::Array2::<f64>::zeros((1, 0));
+        let headers = vec![];
+        let col_map = HashMap::new();
+
+        run_predict_binomial_location_scale(
+            &args,
+            &model,
+            data.view(),
+            &col_map,
+            Some(&headers),
+            Some(&InverseLink::Standard(LinkFunction::Probit)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("predict wiggle probit location-scale");
+
+        let sigma = beta_ls.exp();
+        let q0 = array![(-beta_t / sigma).clamp(-30.0, 30.0)];
+        let eta = apply_saved_probit_wiggle(&q0, &model).expect("apply wiggle");
+        let dq_dq0 = saved_probit_wiggle_derivative_q0(&q0, &model).expect("dq/dq0");
+        let wiggle_design = saved_probit_wiggle_design(&q0, &model)
+            .expect("wiggle design")
+            .expect("wiggle metadata should yield basis");
+        let mut grad = Array1::<f64>::zeros(2 + beta_wiggle.len());
+        grad[0] = -dq_dq0[0] / sigma;
+        grad[1] = dq_dq0[0] * beta_t / sigma;
+        for j in 0..beta_wiggle.len() {
+            grad[2 + j] = wiggle_design[[0, j]];
+        }
+        let q_var = grad.dot(&cov.dot(&grad)).max(0.0);
+        let expected = gam::quadrature::probit_posterior_mean(eta[0], q_var.sqrt());
+        let got = csv_mean_at(&out_path, 0);
+        assert!(
+            (got - expected).abs() < 1e-10,
+            "wiggle posterior mean should use latent-q probit integration: got {got}, expected {expected}"
+        );
     }
 }
