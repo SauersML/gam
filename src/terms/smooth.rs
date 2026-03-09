@@ -3377,6 +3377,41 @@ fn extract_spatial_operator_runtime_caches(
         .zip(design.smooth.terms.iter())
         .enumerate()
     {
+        let term_is_frozen = match (&term_spec.basis, &term_fit.metadata) {
+            (
+                SmoothBasisSpec::Duchon { spec, .. },
+                BasisMetadata::Duchon {
+                    identifiability_transform,
+                    ..
+                },
+            ) => {
+                matches!(
+                    spec.identifiability,
+                    SpatialIdentifiability::OrthogonalToParametric
+                        | SpatialIdentifiability::FrozenTransform { .. }
+                ) && identifiability_transform.is_some()
+            }
+            (
+                SmoothBasisSpec::ThinPlate { spec, .. },
+                BasisMetadata::ThinPlate {
+                    identifiability_transform,
+                    ..
+                },
+            ) => {
+                matches!(
+                    spec.identifiability,
+                    SpatialIdentifiability::OrthogonalToParametric
+                        | SpatialIdentifiability::FrozenTransform { .. }
+                ) && identifiability_transform.is_some()
+            }
+            (SmoothBasisSpec::Matern { spec, .. }, BasisMetadata::Matern { .. }) => {
+                matches!(spec.identifiability, MaternIdentifiability::FrozenTransform { .. })
+            }
+            _ => false,
+        };
+        if term_is_frozen {
+            continue;
+        }
         let Some(global_base_idx) = smooth_term_penalty_index(spec, design, term_idx) else {
             continue;
         };
@@ -8416,6 +8451,47 @@ mod tests {
             extract_spatial_operator_runtime_caches(&frozen, &rebuilt).expect("adaptive caches");
         assert_eq!(caches.len(), 0);
         assert_eq!(rebuilt.smooth.terms[0].coeff_range.len(), 3);
+    }
+
+    #[test]
+    fn frozen_joint_matern_spec_rebuild_keeps_adaptive_cache_in_sync() {
+        let n = 12usize;
+        let d = 2usize;
+        let mut data = Array2::<f64>::zeros((n, d));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 * 0.13;
+            data[[i, 1]] = (i as f64 * 0.17).sin();
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern_joint".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: (0..d).collect(),
+                    spec: MaternBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                        length_scale: 1.0,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("base design");
+        let frozen =
+            freeze_spatial_length_scale_terms_from_design(&spec, &design).expect("freeze spec");
+        let rebuilt = build_term_collection_design(data.view(), &frozen).expect("rebuilt design");
+        let caches =
+            extract_spatial_operator_runtime_caches(&frozen, &rebuilt).expect("adaptive caches");
+        assert_eq!(caches.len(), 0);
+        assert_eq!(rebuilt.smooth.terms.len(), 1);
+        assert!(!rebuilt.smooth.terms[0].coeff_range.is_empty());
     }
 
     #[test]
