@@ -12,9 +12,20 @@ if _SPEC is None or _SPEC.loader is None:
     raise RuntimeError(f"failed to load benchmark runner from {_RUN_SUITE_PATH}")
 _RUN_SUITE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_RUN_SUITE)
+_REPO_ROOT = Path("/Users/user/gam")
+_GITIGNORE_PATH = _REPO_ROOT / ".gitignore"
 
 
 class RunSuiteMappingTests(unittest.TestCase):
+    def test_checked_in_benchmark_datasets_are_not_gitignored(self) -> None:
+        ignored_entries = {
+            line.strip()
+            for line in _GITIGNORE_PATH.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        self.assertNotIn("bench/datasets/icu_survival_death.csv", ignored_entries)
+        self.assertNotIn("bench/datasets/icu_survival_los.csv", ignored_entries)
+
     def assert_joint_mapping(self, scenario_name: str, expected_dim: int, expected_knots: int) -> None:
         cfg = _RUN_SUITE._rust_fit_mapping(scenario_name)
         self.assertIsNotNone(cfg, scenario_name)

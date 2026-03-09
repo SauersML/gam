@@ -16,8 +16,6 @@ benchmarks/*.png
 benchmarks/*_fitted.csv
 benchmarks/datasets/hgdp_1kg_pc_data.tsv
 bench/datasets/hgdp_1kg_pc_data.tsv
-bench/datasets/icu_survival_death.csv
-bench/datasets/icu_survival_los.csv
 # Bench runtime outputs
 bench/runtime/
 bench/results*.json
