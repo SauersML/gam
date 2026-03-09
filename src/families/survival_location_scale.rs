@@ -3724,7 +3724,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn outer_laml_gradient_matches_fd_for_logistic_survival_link() {
         let specs = survival_outer_gradient_test_specs();
