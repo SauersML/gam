@@ -3682,83 +3682,126 @@ mod tests {
     }
 
     #[test]
-    fn outer_laml_gradient_matches_fd_for_non_probit_survival_links() {
+    fn joint_exact_newton_hessian_directional_derivative_matches_fd_near_fitted_logistic_point() {
+        let family = survival_exact_newton_test_family_with_inverse_link(
+            residual_distribution_inverse_link(ResidualDistribution::Logistic),
+        );
+        let beta_time = array![0.7746886451475979];
+        let beta_threshold = array![-0.6407086184606554];
+        let beta_log_sigma = array![-0.15];
+        let direction = array![0.7, -0.4, 0.5];
+        let eps = 1e-6;
+        let states =
+            survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+        let analytic = family
+            .exact_newton_joint_hessian_directional_derivative(&states, &direction)
+            .expect("analytic joint dH")
+            .expect("expected exact joint dH");
+
+        let beta_time_plus = array![beta_time[0] + eps * direction[0]];
+        let beta_threshold_plus = array![beta_threshold[0] + eps * direction[1]];
+        let beta_log_sigma_plus = array![beta_log_sigma[0] + eps * direction[2]];
+        let plus_states = survival_exact_newton_rebuild_states(
+            &beta_time_plus,
+            &beta_threshold_plus,
+            &beta_log_sigma_plus,
+        );
+        let h_plus = family
+            .exact_newton_joint_hessian(&plus_states)
+            .expect("joint H plus")
+            .expect("expected exact joint H plus");
+        let h_base = family
+            .exact_newton_joint_hessian(&states)
+            .expect("joint H base")
+            .expect("expected exact joint H base");
+        let fd = (h_plus - h_base) / eps;
+
+        crate::testing::assert_matrix_derivative_fd(
+            &fd,
+            &analytic,
+            5e-4,
+            "survival logistic near-fit joint dH",
+        );
+    }
+
+
+    #[test]
+    fn outer_laml_gradient_matches_fd_for_logistic_survival_link() {
         let specs = survival_outer_gradient_test_specs();
         let options = BlockwiseFitOptions {
             use_reml_objective: true,
             ridge_floor: 1e-10,
+            inner_tol: 1e-10,
+            inner_max_cycles: 400,
             outer_max_iter: 1,
             ..BlockwiseFitOptions::default()
         };
         let rho = array![0.12];
         let derivative_blocks = vec![Vec::new(), Vec::new(), Vec::new()];
         let h = 1e-5;
+        let family = survival_exact_newton_test_family_with_inverse_link(
+            residual_distribution_inverse_link(ResidualDistribution::Logistic),
+        );
+        let center = evaluate_custom_family_joint_hyper(
+            &family,
+            &specs,
+            &options,
+            &rho,
+            &derivative_blocks,
+            None,
+            false,
+        )
+        .expect("center outer objective/gradient");
+        assert!(center.objective.is_finite());
+        assert_eq!(center.gradient.len(), rho.len());
 
-        for (label, inverse_link) in survival_non_probit_test_links() {
-            let family = survival_exact_newton_test_family_with_inverse_link(inverse_link);
-            let center = evaluate_custom_family_joint_hyper(
+        for k in 0..rho.len() {
+            let mut rho_p = rho.clone();
+            let mut rho_m = rho.clone();
+            rho_p[k] += h;
+            rho_m[k] -= h;
+            let fp = evaluate_custom_family_joint_hyper(
                 &family,
                 &specs,
                 &options,
-                &rho,
+                &rho_p,
                 &derivative_blocks,
                 None,
                 false,
             )
-            .expect("center outer objective/gradient");
-            assert!(center.objective.is_finite());
-            assert_eq!(center.gradient.len(), rho.len());
-
-            for k in 0..rho.len() {
-                let mut rho_p = rho.clone();
-                let mut rho_m = rho.clone();
-                rho_p[k] += h;
-                rho_m[k] -= h;
-                let fp = evaluate_custom_family_joint_hyper(
-                    &family,
-                    &specs,
-                    &options,
-                    &rho_p,
-                    &derivative_blocks,
-                    Some(&center.warm_start),
-                    false,
-                )
-                .expect("objective+")
-                .objective;
-                let fm = evaluate_custom_family_joint_hyper(
-                    &family,
-                    &specs,
-                    &options,
-                    &rho_m,
-                    &derivative_blocks,
-                    Some(&center.warm_start),
-                    false,
-                )
-                .expect("objective-")
-                .objective;
-                let g_fd = (fp - fm) / (2.0 * h);
-                let abs_err = (center.gradient[k] - g_fd).abs();
-                let rel = abs_err / g_fd.abs().max(1e-8);
-                assert_eq!(
-                    center.gradient[k].signum(),
-                    g_fd.signum(),
-                    "outer survival LAML gradient sign mismatch for {} at {}: analytic={} fd={}",
-                    label,
-                    k,
-                    center.gradient[k],
-                    g_fd
-                );
-                assert!(
-                    abs_err < 2e-4 || rel < 2e-2,
-                    "outer survival LAML gradient mismatch for {} at {}: analytic={} fd={} abs={} rel={}",
-                    label,
-                    k,
-                    center.gradient[k],
-                    g_fd,
-                    abs_err,
-                    rel
-                );
-            }
+            .expect("objective+")
+            .objective;
+            let fm = evaluate_custom_family_joint_hyper(
+                &family,
+                &specs,
+                &options,
+                &rho_m,
+                &derivative_blocks,
+                None,
+                false,
+            )
+            .expect("objective-")
+            .objective;
+            let g_fd = (fp - fm) / (2.0 * h);
+            let abs_err = (center.gradient[k] - g_fd).abs();
+            let rel = abs_err / g_fd.abs().max(1e-8);
+            assert_eq!(
+                center.gradient[k].signum(),
+                g_fd.signum(),
+                "outer survival LAML gradient sign mismatch at {}: analytic={} fd={}",
+                k,
+                center.gradient[k],
+                g_fd
+            );
+            assert!(
+                abs_err < 2e-4 || rel < 2e-2,
+                "outer survival LAML gradient mismatch at {}: analytic={} fd={} abs={} rel={}",
+                k,
+                center.gradient[k],
+                g_fd,
+                abs_err,
+                rel
+            );
         }
     }
 

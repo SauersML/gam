@@ -1369,6 +1369,24 @@ fn exact_newton_joint_hessian_symmetrized<F: CustomFamily>(
     Ok(Some(h))
 }
 
+fn symmetrized_square_matrix(
+    mut matrix: Array2<f64>,
+    expected: usize,
+    context: &str,
+) -> Result<Array2<f64>, String> {
+    if matrix.nrows() != expected || matrix.ncols() != expected {
+        return Err(format!(
+            "{context}: got {}x{}, expected {}x{}",
+            matrix.nrows(),
+            matrix.ncols(),
+            expected,
+            expected
+        ));
+    }
+    symmetrize_dense_in_place(&mut matrix);
+    Ok(matrix)
+}
+
 fn strict_solve_spd(matrix: &Array2<f64>, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
@@ -1686,8 +1704,16 @@ fn inner_blockwise_fit<F: CustomFamily>(
     let mut states = build_block_states(family, specs)?;
     refresh_all_block_etas(family, specs, &mut states)?;
     let has_joint_exact_hessian = family.exact_newton_joint_hessian(&states)?.is_some();
-    let inner_tol = options.inner_tol;
-    let inner_max_cycles = options.inner_max_cycles;
+    let inner_tol = if has_joint_exact_hessian {
+        options.inner_tol.min(1e-10)
+    } else {
+        options.inner_tol
+    };
+    let inner_max_cycles = if has_joint_exact_hessian {
+        options.inner_max_cycles.max(4000)
+    } else {
+        options.inner_max_cycles
+    };
     let mut s_lambdas = Vec::with_capacity(specs.len());
     for (b, spec) in specs.iter().enumerate() {
         let p = spec.design.ncols();
@@ -1846,7 +1872,8 @@ fn inner_blockwise_fit<F: CustomFamily>(
                 ridge,
                 options.ridge_policy,
             )?
-            .is_some()
+            .map(|residual| residual <= inner_tol)
+            .unwrap_or(true)
         } else {
             true
         };
@@ -2125,19 +2152,14 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                                     .to_string()
                             })?;
                         let h_rho = if h_rho.iter().all(|v| v.is_finite()) {
-                            h_rho
+                            symmetrized_square_matrix(
+                                h_rho,
+                                total,
+                                "joint exact-newton dH shape mismatch",
+                            )?
                         } else {
                             Array2::<f64>::zeros((total, total))
                         };
-                        if h_rho.nrows() != total || h_rho.ncols() != total {
-                            return Err(format!(
-                                "joint exact-newton dH shape mismatch: got {}x{}, expected {}x{}",
-                                h_rho.nrows(),
-                                h_rho.ncols(),
-                                total,
-                                total
-                            ));
-                        }
                         d_j_k += &h_rho;
                     }
                     let g_logj = if include_logdet_h {
@@ -2200,7 +2222,11 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                                 &synced_joint_states,
                                 &u_kl,
                             )? {
-                            Some(v) => v,
+                            Some(v) => symmetrized_square_matrix(
+                                v,
+                                total,
+                                "joint exact-newton second-order dH shape mismatch",
+                            )?,
                             None => {
                                 hess_available = false;
                                 break;
@@ -2212,7 +2238,11 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                                 &u_terms[l],
                                 &u_terms[k],
                             )? {
-                            Some(v) => v,
+                            Some(v) => symmetrized_square_matrix(
+                                v,
+                                total,
+                                "joint exact-newton d2H shape mismatch",
+                            )?,
                             None => {
                                 hess_available = false;
                                 break;
@@ -2444,15 +2474,11 @@ fn outer_objective_gradient_hessian_internal<F: CustomFamily>(
                                     &u_k,
                                 )?
                             {
-                                if h_exact.nrows() != p || h_exact.ncols() != p {
-                                    return Err(format!(
-                                        "block {b} exact-newton dH shape mismatch: got {}x{}, expected {}x{}",
-                                        h_exact.nrows(),
-                                        h_exact.ncols(),
-                                        p,
-                                        p
-                                    ));
-                                }
+                                let h_exact = symmetrized_square_matrix(
+                                    h_exact,
+                                    p,
+                                    &format!("block {b} exact-newton dH shape mismatch"),
+                                )?;
                                 0.5 * trace_product(&h_inv, &h_exact)
                             } else {
                                 return Err(format!(
@@ -3241,14 +3267,13 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily>(
         .into());
     }
 
-    let warm_inner = warm_start.map(|w| &w.inner);
     let mut result = outer_objective_gradient_hessian_internal(
         family,
         specs,
         options,
         &penalty_counts,
         rho_current,
-        warm_inner,
+        warm_start.map(|w| &w.inner),
         need_hessian,
     )?;
     let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
