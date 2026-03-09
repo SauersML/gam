@@ -253,6 +253,14 @@ pub struct WorkingModelSurvival {
 }
 
 impl WorkingModelSurvival {
+    fn row_derivative_constraint_lower_bound(&self, row: usize) -> f64 {
+        if self.event_target[row] > 0 {
+            self.derivative_guard()
+        } else {
+            0.0
+        }
+    }
+
     fn stabilized_structural_derivative(&self, deriv: f64) -> Option<f64> {
         const STRUCTURAL_MONO_ROUNDOFF_TOL: f64 = 1e-7;
         if !self.structurally_monotonic {
@@ -321,7 +329,6 @@ impl WorkingModelSurvival {
     }
 
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
-        let tol = self.derivative_guard();
         let p = self.x_derivative.ncols();
         const DERIVATIVE_ROW_NORM_TOL: f64 = 1e-12;
         if p == 0 {
@@ -345,7 +352,7 @@ impl WorkingModelSurvival {
         let mut b = Array1::<f64>::zeros(active_rows.len());
         for (r, &i) in active_rows.iter().enumerate() {
             a.row_mut(r).assign(&self.x_derivative.row(i));
-            b[r] = tol - self.offset_derivative_exit[i];
+            b[r] = self.row_derivative_constraint_lower_bound(i) - self.offset_derivative_exit[i];
         }
         Some(compress_positive_collinear_constraints(&a, &b))
     }
@@ -559,8 +566,9 @@ impl WorkingModelSurvival {
         let mut w_event_outer = Array1::<f64>::zeros(n);
 
         let derivative_guard = self.derivative_guard();
-        // Match strict monotonicity intent while tolerating tiny solver/BLAS roundoff
-        // near the active boundary.
+        // Only target-event rows require strict positivity because the likelihood
+        // evaluates log(d eta / d t) there. Censored rows are governed by the
+        // cumulative-hazard increment check below.
         let derivative_guard_numerical = self.derivative_guard_numerical();
         for i in 0..n {
             let w = self.sample_weight[i];
@@ -582,7 +590,13 @@ impl WorkingModelSurvival {
             let deriv = self
                 .stabilized_structural_derivative(derivative_raw[i])
                 .unwrap_or(derivative_raw[i]);
-            if deriv < derivative_guard_numerical || !deriv.is_finite() {
+            if !deriv.is_finite() {
+                return Err(EstimationError::ParameterConstraintViolation(format!(
+                    "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
+                    i, deriv, derivative_guard
+                )));
+            }
+            if d > 0.0 && deriv < derivative_guard_numerical {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
                     "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
                     i, deriv, derivative_guard

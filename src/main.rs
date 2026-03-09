@@ -6839,10 +6839,10 @@ fn build_smooth_basis(
         }
         "duchon" => {
             if options.contains_key("double_penalty") {
-                return Err(
-                    "duchon smooths always include nullspace shrinkage; remove double_penalty"
-                        .to_string(),
-                );
+                inference_notes.push(format!(
+                    "Warning: ignored redundant double_penalty option for Duchon smooth '{}'; Duchon smooths always include nullspace shrinkage.",
+                    vars.join(",")
+                ));
             }
             let centers = parse_count_with_basis_alias(
                 options,
@@ -9161,7 +9161,7 @@ mod tests {
     }
 
     #[test]
-    fn build_term_spec_rejects_duchon_double_penalty_option() {
+    fn build_term_spec_warns_and_ignores_duchon_double_penalty_option() {
         let parsed = parse_formula("y ~ s(pc1, pc2, type=duchon, double_penalty=false)")
             .expect("formula should parse before basis validation");
         let ds = Dataset {
@@ -9185,9 +9185,12 @@ mod tests {
         };
         let col_map = HashMap::from([("pc1".to_string(), 0usize), ("pc2".to_string(), 1usize)]);
         let mut inference_notes = Vec::<String>::new();
-        let err = super::build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)
-            .expect_err("duchon double_penalty should be rejected at basis-build time");
-        assert!(err.contains("duchon smooths always include nullspace shrinkage"));
+        let spec = super::build_term_spec(&parsed.terms, &ds, &col_map, &mut inference_notes)
+            .expect("duchon double_penalty should be accepted and ignored");
+        assert_eq!(spec.smooth_terms.len(), 1);
+        assert_eq!(inference_notes.len(), 1);
+        assert!(inference_notes[0].contains("ignored redundant double_penalty option"));
+        assert!(inference_notes[0].contains("Duchon smooths always include nullspace shrinkage"));
     }
 
     #[test]
