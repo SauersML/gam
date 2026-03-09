@@ -6072,7 +6072,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_constraint_active_set_projects_warm_active_rows_back_to_boundary() {
+    fn linear_constraint_active_set_releases_stale_warm_boundary_hint() {
         let hessian = array![[2.0]];
         let gradient = array![0.0];
         let beta = array![1e-9];
@@ -6093,9 +6093,10 @@ mod tests {
         )
         .expect("active-set solve should succeed");
 
-        assert_relative_eq!(direction[0], -1e-9, epsilon = 1e-14);
+        assert_relative_eq!(direction[0], 0.0, epsilon = 1e-14);
         let projected = &beta + &direction;
-        assert_relative_eq!(projected[0], 0.0, epsilon = 1e-14);
+        assert_relative_eq!(projected[0], beta[0], epsilon = 1e-14);
+        assert!(active_hint.is_empty());
     }
 
     #[test]
@@ -6180,7 +6181,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_bound_active_set_projects_warm_active_bounds_back_to_boundary() {
+    fn lower_bound_active_set_releases_stale_warm_boundary_hint() {
         let hessian = array![[2.0]];
         let gradient = array![0.0];
         let beta = array![1e-9];
@@ -6198,9 +6199,10 @@ mod tests {
         )
         .expect("lower-bound active-set solve should succeed");
 
-        assert_relative_eq!(direction[0], -1e-9, epsilon = 1e-14);
+        assert_relative_eq!(direction[0], 0.0, epsilon = 1e-14);
         let projected = &beta + &direction;
-        assert_relative_eq!(projected[0], 0.0, epsilon = 1e-14);
+        assert_relative_eq!(projected[0], beta[0], epsilon = 1e-14);
+        assert!(active_hint.is_empty());
     }
 
     #[test]

@@ -1432,6 +1432,18 @@ fn run_predict_survival(
             .as_deref()
             .unwrap_or("transformation"),
     )?;
+    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull {
+        require_structural_survival_time_basis(
+            &time_build.basis_name,
+            "saved survival sampling",
+        )?;
+    }
+    let saved_likelihood_mode = parse_survival_likelihood_mode(
+        model
+            .survival_likelihood
+            .as_deref()
+            .unwrap_or("transformation"),
+    )?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::ProbitLocationScale {
         let beta_time = Array1::from_vec(model.survival_beta_time.clone().ok_or_else(|| {
             "saved probit-location-scale model missing survival_beta_time".to_string()
@@ -2463,6 +2475,18 @@ fn survival_basis_supports_structural_monotonicity(basis_name: &str) -> bool {
     basis_name.eq_ignore_ascii_case("ispline")
 }
 
+fn require_structural_survival_time_basis(
+    basis_name: &str,
+    context: &str,
+) -> Result<(), String> {
+    if survival_basis_supports_structural_monotonicity(basis_name) {
+        return Ok(());
+    }
+    Err(format!(
+        "{context} requires a structural monotone survival time basis; got '{basis_name}'. Use --time-basis ispline."
+    ))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SurvivalLikelihoodMode {
     Transformation,
@@ -2635,26 +2659,6 @@ fn parse_survival_time_basis_config(
     args: &SurvivalArgs,
 ) -> Result<SurvivalTimeBasisConfig, String> {
     match args.time_basis.to_ascii_lowercase().as_str() {
-        "linear" => Ok(SurvivalTimeBasisConfig::Linear),
-        "bspline" => {
-            if args.time_degree < 1 {
-                return Err("--time-degree must be >= 1 for bspline time basis".to_string());
-            }
-            if args.time_num_internal_knots == 0 {
-                return Err(
-                    "--time-num-internal-knots must be > 0 for bspline time basis".to_string(),
-                );
-            }
-            if !args.time_smooth_lambda.is_finite() || args.time_smooth_lambda < 0.0 {
-                return Err("--time-smooth-lambda must be finite and >= 0".to_string());
-            }
-            // Placeholder knots; real knots are inferred from training data.
-            Ok(SurvivalTimeBasisConfig::BSpline {
-                degree: args.time_degree,
-                knots: Array1::zeros(0),
-                smooth_lambda: args.time_smooth_lambda,
-            })
-        }
         "ispline" => {
             if args.time_degree < 1 {
                 return Err("--time-degree must be >= 1 for ispline time basis".to_string());
@@ -2673,8 +2677,12 @@ fn parse_survival_time_basis_config(
                 smooth_lambda: args.time_smooth_lambda,
             })
         }
+        "linear" | "bspline" => Err(format!(
+            "survival monotone time basis must be structural; got '{}'. Use --time-basis ispline.",
+            args.time_basis
+        )),
         other => Err(format!(
-            "unsupported --time-basis '{other}'; use linear|bspline|ispline"
+            "unsupported --time-basis '{other}'; use ispline"
         )),
     }
 }
@@ -3148,79 +3156,6 @@ fn build_survival_baseline_offsets(
     Ok((eta_entry, eta_exit, derivative_exit))
 }
 
-fn max_linear_constraint_violation(
-    beta: &Array1<f64>,
-    constraints: &gam::pirls::LinearInequalityConstraints,
-) -> (f64, usize) {
-    let mut worst = 0.0_f64;
-    let mut worst_row = 0usize;
-    for i in 0..constraints.a.nrows() {
-        let slack = constraints.a.row(i).dot(beta) - constraints.b[i];
-        let viol = (-slack).max(0.0);
-        if viol > worst {
-            worst = viol;
-            worst_row = i;
-        }
-    }
-    (worst, worst_row)
-}
-
-fn project_beta_to_linear_constraints(
-    beta: &mut Array1<f64>,
-    constraints: &gam::pirls::LinearInequalityConstraints,
-    feasibility_tol: f64,
-    max_passes: usize,
-) -> Result<(), String> {
-    if constraints.a.ncols() != beta.len() || constraints.a.nrows() != constraints.b.len() {
-        return Err(format!(
-            "linear constraint shape mismatch while projecting initial beta: A={}x{}, b={}, beta={}",
-            constraints.a.nrows(),
-            constraints.a.ncols(),
-            constraints.b.len(),
-            beta.len()
-        ));
-    }
-    if max_passes == 0 {
-        return Err("project_beta_to_linear_constraints requires max_passes > 0".to_string());
-    }
-
-    // Cyclic orthogonal projection onto half-spaces A_i * beta >= b_i.
-    // This is a standard feasibility method for convex linear inequalities and
-    // gives us a monotonicity-feasible PIRLS starting point without changing the
-    // fitted objective.
-    for _ in 0..max_passes {
-        let mut any_updated = false;
-        for i in 0..constraints.a.nrows() {
-            let ai = constraints.a.row(i);
-            let deficit = constraints.b[i] - ai.dot(beta);
-            if deficit <= feasibility_tol {
-                continue;
-            }
-            let norm2 = ai.dot(&ai);
-            if !norm2.is_finite() || norm2 <= 1e-20 {
-                continue;
-            }
-            let alpha = deficit / norm2;
-            for j in 0..beta.len() {
-                beta[j] += alpha * ai[j];
-            }
-            any_updated = true;
-        }
-        let (worst, _) = max_linear_constraint_violation(beta, constraints);
-        if worst <= feasibility_tol {
-            return Ok(());
-        }
-        if !any_updated {
-            break;
-        }
-    }
-
-    let (worst, row) = max_linear_constraint_violation(beta, constraints);
-    Err(format!(
-        "failed to project initial beta to linear feasibility: max(Aβ-b violation)={worst:.3e} at row {row}"
-    ))
-}
-
 fn apply_saved_probit_wiggle(q0: &Array1<f64>, model: &SavedModel) -> Result<Array1<f64>, String> {
     match (
         model.probit_wiggle_knots.as_ref(),
@@ -3511,6 +3446,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             effective_args.ridge_lambda,
         )),
     )?;
+    if likelihood_mode != SurvivalLikelihoodMode::Weibull {
+        require_structural_survival_time_basis(
+            &time_build.basis_name,
+            "survival fitting",
+        )?;
+    }
     let p_time = time_build.x_exit_time.ncols();
     let p = p_time + p_cov;
     let mut x_entry = Array2::<f64>::zeros((n, p));
@@ -3918,13 +3859,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     let penalties = PenaltyBlocks::new(penalty_blocks.clone());
 
-    let monotonicity = MonotonicityPenalty {
-        tolerance: if survival_basis_supports_structural_monotonicity(&time_build.basis_name) {
-            0.0
-        } else {
-            1e-8
-        },
-    };
+    let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
 
     let mut model = gam::families::royston_parmar::working_model_from_flattened(
         penalties,
@@ -3945,7 +3880,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
-    if survival_basis_supports_structural_monotonicity(&time_build.basis_name) {
+    if likelihood_mode != SurvivalLikelihoodMode::Weibull {
         model
             .set_structural_monotonicity(true, p_time)
             .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
@@ -3954,12 +3889,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut beta0 = Array1::<f64>::zeros(p);
     beta0[0] = -3.0;
     beta0[1] = 1.0;
-    let linear_constraints = model.monotonicity_linear_constraints();
-    if let Some(lin) = linear_constraints.as_ref() {
-        project_beta_to_linear_constraints(&mut beta0, lin, 1e-10, 64).map_err(|e| {
-            format!("failed to initialize monotonicity-feasible survival beta: {e}")
-        })?;
-    }
+    let linear_constraints = None;
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
         convergence_tolerance: 1e-6,
@@ -4260,13 +4190,7 @@ fn run_sample_survival(
         }
         other => return Err(format!("unsupported saved survival spec '{other}'")),
     };
-    let monotonicity = MonotonicityPenalty {
-        tolerance: if survival_basis_supports_structural_monotonicity(&time_build.basis_name) {
-            0.0
-        } else {
-            1e-8
-        },
-    };
+    let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
     let baseline_cfg = survival_baseline_config_from_model(model)?;
     let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
         build_survival_baseline_offsets(&age_entry, &age_exit, &baseline_cfg)?;
@@ -4289,7 +4213,7 @@ fn run_sample_survival(
         },
     )
     .map_err(|e| format!("failed to construct survival model: {e}"))?;
-    if survival_basis_supports_structural_monotonicity(&time_build.basis_name) {
+    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull {
         model_surv
             .set_structural_monotonicity(true, p_time)
             .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
@@ -4316,7 +4240,7 @@ fn run_sample_survival(
         penalties,
         monotonicity,
         survival_spec,
-        survival_basis_supports_structural_monotonicity(&time_build.basis_name),
+        saved_likelihood_mode != SurvivalLikelihoodMode::Weibull,
         p_time,
         beta0.view(),
         hessian.view(),
@@ -9306,6 +9230,45 @@ mod tests {
         };
         let cfg = parse_survival_time_basis_config(&args).expect("parse ispline time basis");
         assert!(matches!(cfg, SurvivalTimeBasisConfig::ISpline { .. }));
+    }
+
+    #[test]
+    fn parse_survival_time_basis_rejects_nonstructural_bases() {
+        let mut args = SurvivalArgs {
+            data: std::path::PathBuf::from("dummy.csv"),
+            entry: "entry".to_string(),
+            exit: "exit".to_string(),
+            event: "event".to_string(),
+            formula: "1".to_string(),
+            survival_likelihood: "transformation".to_string(),
+            survival_distribution: "gaussian".to_string(),
+            link: None,
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "linear".to_string(),
+            time_degree: 2,
+            time_num_internal_knots: 6,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            out: None,
+        };
+        let err = parse_survival_time_basis_config(&args)
+            .expect_err("linear survival time basis should be rejected");
+        assert!(err.contains("structural"));
+        assert!(err.contains("ispline"));
+
+        args.time_basis = "bspline".to_string();
+        let err = parse_survival_time_basis_config(&args)
+            .expect_err("bspline survival time basis should be rejected");
+        assert!(err.contains("structural"));
+        assert!(err.contains("ispline"));
     }
 
     #[test]
