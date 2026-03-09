@@ -14,17 +14,44 @@ _RUN_SUITE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_RUN_SUITE)
 _REPO_ROOT = Path("/Users/user/gam")
 _GITIGNORE_PATH = _REPO_ROOT / ".gitignore"
+_BENCH_DATASET_DIR = _REPO_ROOT / "bench" / "datasets"
+_REQUIRED_BENCHMARK_DATASETS = {
+    "31_day.csv",
+    "bone.csv",
+    "cirrhosis.csv",
+    "five_day.csv",
+    "haberman.csv",
+    "heart_failure_clinical_records_dataset.csv",
+    "horse.csv",
+    "icu_survival_death.csv",
+    "icu_survival_los.csv",
+    "lidar.csv",
+    "prostate.csv",
+    "wine.csv",
+}
 
 
 class RunSuiteMappingTests(unittest.TestCase):
+    def test_required_benchmark_datasets_exist(self) -> None:
+        missing = sorted(
+            dataset_name
+            for dataset_name in _REQUIRED_BENCHMARK_DATASETS
+            if not (_BENCH_DATASET_DIR / dataset_name).exists()
+        )
+        self.assertEqual(missing, [])
+
     def test_checked_in_benchmark_datasets_are_not_gitignored(self) -> None:
         ignored_entries = {
             line.strip()
             for line in _GITIGNORE_PATH.read_text().splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         }
-        self.assertNotIn("bench/datasets/icu_survival_death.csv", ignored_entries)
-        self.assertNotIn("bench/datasets/icu_survival_los.csv", ignored_entries)
+        ignored_required = sorted(
+            f"bench/datasets/{dataset_name}"
+            for dataset_name in _REQUIRED_BENCHMARK_DATASETS
+            if f"bench/datasets/{dataset_name}" in ignored_entries
+        )
+        self.assertEqual(ignored_required, [])
 
     def assert_joint_mapping(self, scenario_name: str, expected_dim: int, expected_knots: int) -> None:
         cfg = _RUN_SUITE._rust_fit_mapping(scenario_name)
