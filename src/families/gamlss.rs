@@ -34,6 +34,7 @@ const MIN_DERIV: f64 = 1e-8;
 const MIN_WEIGHT: f64 = 1e-12;
 const BETA_RANGE_WARN_THRESHOLD: f64 = 1.10;
 const BINOMIAL_EFFECTIVE_N_WARN_THRESHOLD: f64 = 25.0;
+const BINOMIAL_LOG_SIGMA_SHRINKAGE_LOG_LAMBDA_INIT: f64 = 0.0;
 
 #[inline]
 fn floor_positive_weight(raw_weight: f64, min_weight: f64) -> f64 {
@@ -827,6 +828,39 @@ fn identified_binomial_log_sigma_design(
     )
 }
 
+fn identity_penalty(dim: usize) -> Array2<f64> {
+    let mut penalty = Array2::<f64>::zeros((dim, dim));
+    for i in 0..dim {
+        penalty[[i, i]] = 1.0;
+    }
+    penalty
+}
+
+fn append_log_lambda_value(log_lambdas: &Array1<f64>, value: f64) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(log_lambdas.len() + 1);
+    if !log_lambdas.is_empty() {
+        out.slice_mut(s![0..log_lambdas.len()]).assign(log_lambdas);
+    }
+    out[log_lambdas.len()] = value;
+    out
+}
+
+fn append_binomial_log_sigma_shrinkage_penalty_input(block: &mut ParameterBlockInput) {
+    let p = block.design.ncols();
+    block.penalties.push(identity_penalty(p));
+    block.initial_log_lambdas = Some(match block.initial_log_lambdas.take() {
+        Some(log_lambdas) => append_log_lambda_value(
+            &log_lambdas,
+            BINOMIAL_LOG_SIGMA_SHRINKAGE_LOG_LAMBDA_INIT,
+        ),
+        None => Array1::from_vec(vec![BINOMIAL_LOG_SIGMA_SHRINKAGE_LOG_LAMBDA_INIT]),
+    });
+}
+
+fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectionDesign) {
+    design.penalties.push(identity_penalty(design.design.ncols()));
+}
+
 fn emit_binomial_alpha_beta_warnings(
     context: &str,
     beta_values: &Array1<f64>,
@@ -1412,6 +1446,7 @@ pub fn fit_binomial_location_scale(
         &weights,
         non_intercept_start,
     )?);
+    append_binomial_log_sigma_shrinkage_penalty_input(&mut log_sigma_block);
 
     if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
         match try_binomial_alpha_beta_warm_start(
@@ -1498,6 +1533,7 @@ pub fn fit_binomial_location_scale_wiggle(
         &weights,
         non_intercept_start,
     )?);
+    append_binomial_log_sigma_shrinkage_penalty_input(&mut log_sigma_block);
 
     if (threshold_block.initial_beta.is_none() || log_sigma_block.initial_beta.is_none())
         && matches!(link_kind, InverseLink::Standard(LinkFunction::Probit))
@@ -1560,6 +1596,18 @@ trait LocationScaleFamilyBuilder {
     fn require_exact_spatial_joint(&self) -> bool {
         false
     }
+    fn mean_penalty_count(&self, mean_design: &TermCollectionDesign) -> usize {
+        mean_design.penalties.len()
+    }
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+        noise_design.penalties.len()
+    }
+    fn augment_result_designs(
+        &self,
+        _mean_design: &mut TermCollectionDesign,
+        _noise_design: &mut TermCollectionDesign,
+    ) {
+    }
     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         Ok(Array1::zeros(0))
     }
@@ -1599,15 +1647,15 @@ trait LocationScaleFamilyBuilder {
 }
 
 fn compose_theta_from_hints(
-    mean_design: &TermCollectionDesign,
-    noise_design: &TermCollectionDesign,
+    mean_penalty_count: usize,
+    noise_penalty_count: usize,
     mean_log_lambda_hint: &Option<Array1<f64>>,
     noise_log_lambda_hint: &Option<Array1<f64>>,
     extra_rho0: &Array1<f64>,
 ) -> Array1<f64> {
     let layout = GamlssLambdaLayout::with_wiggle(
-        mean_design.penalties.len(),
-        noise_design.penalties.len(),
+        mean_penalty_count,
+        noise_penalty_count,
         extra_rho0.len(),
     );
     let mut theta = Array1::<f64>::zeros(layout.total());
@@ -1669,6 +1717,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
 
     let require_exact_spatial_joint = builder.require_exact_spatial_joint();
     let mut used_fd_spatial_search = false;
+    let mean_penalty_count = builder.mean_penalty_count(&mean_boot_design);
+    let noise_penalty_count = builder.noise_penalty_count(&noise_boot_design);
 
     // Covered exact spatial families must use the unified exact-joint hyper
     // path and must never fall back to the older finite-difference search.
@@ -1685,8 +1735,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         let joint_setup = build_two_block_exact_joint_setup(
             builder.mean_spec(),
             builder.noise_spec(),
-            mean_boot_design.penalties.len(),
-            noise_boot_design.penalties.len(),
+            mean_penalty_count,
+            noise_penalty_count,
             extra_rho0.as_slice().unwrap_or(&[]),
             kappa_options,
         );
@@ -1711,8 +1761,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     fit_custom_family(&family, &blocks, options)?
                 };
                 let layout = GamlssLambdaLayout::two_block(
-                    mean_design.penalties.len(),
-                    noise_design.penalties.len(),
+                    builder.mean_penalty_count(mean_design),
+                    builder.noise_penalty_count(noise_design),
                 );
                 if fit.log_lambdas.len() >= layout.total() {
                     mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
@@ -1773,8 +1823,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         let joint_setup = build_two_block_exact_joint_setup(
             builder.mean_spec(),
             builder.noise_spec(),
-            mean_boot_design.penalties.len(),
-            noise_boot_design.penalties.len(),
+            mean_penalty_count,
+            noise_penalty_count,
             extra_rho0.as_slice().unwrap_or(&[]),
             kappa_options,
         );
@@ -1799,8 +1849,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     fit_custom_family(&family, &blocks, options)?
                 };
                 let layout = GamlssLambdaLayout::two_block(
-                    mean_design.penalties.len(),
-                    noise_design.penalties.len(),
+                    builder.mean_penalty_count(mean_design),
+                    builder.noise_penalty_count(noise_design),
                 );
                 if fit.log_lambdas.len() >= layout.total() {
                     mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
@@ -1871,8 +1921,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     kappa_options,
                     |mean_design, noise_design| {
                         let theta = compose_theta_from_hints(
-                            mean_design,
-                            noise_design,
+                            builder.mean_penalty_count(mean_design),
+                            builder.noise_penalty_count(noise_design),
                             &mean_log_lambda_hint,
                             &noise_log_lambda_hint,
                             &extra_rho0,
@@ -1887,8 +1937,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         let family = builder.build_family(mean_design, noise_design);
                         let fit = fit_custom_family(&family, &blocks, &spatial_search_options)?;
                         let layout = GamlssLambdaLayout::two_block(
-                            mean_design.penalties.len(),
-                            noise_design.penalties.len(),
+                            builder.mean_penalty_count(mean_design),
+                            builder.noise_penalty_count(noise_design),
                         );
                         if fit.log_lambdas.len() >= layout.total() {
                             mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
@@ -1918,8 +1968,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             kappa_options,
             |mean_design, noise_design| {
                 let theta = compose_theta_from_hints(
-                    mean_design,
-                    noise_design,
+                    builder.mean_penalty_count(mean_design),
+                    builder.noise_penalty_count(noise_design),
                     &mean_log_lambda_hint,
                     &noise_log_lambda_hint,
                     &extra_rho0,
@@ -1934,8 +1984,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 let family = builder.build_family(mean_design, noise_design);
                 let fit = fit_custom_family(&family, &blocks, &spatial_search_options)?;
                 let layout = GamlssLambdaLayout::two_block(
-                    mean_design.penalties.len(),
-                    noise_design.penalties.len(),
+                    builder.mean_penalty_count(mean_design),
+                    builder.noise_penalty_count(noise_design),
                 );
                 if fit.log_lambdas.len() >= layout.total() {
                     mean_log_lambda_hint = Some(layout.mean_from(&fit.log_lambdas));
@@ -1952,8 +2002,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
 
     if used_fd_spatial_search {
         let theta = compose_theta_from_hints(
-            &solved.mean_design,
-            &solved.noise_design,
+            builder.mean_penalty_count(&solved.mean_design),
+            builder.noise_penalty_count(&solved.noise_design),
             &mean_log_lambda_hint,
             &noise_log_lambda_hint,
             &extra_rho0,
@@ -1968,6 +2018,8 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         let family = builder.build_family(&solved.mean_design, &solved.noise_design);
         solved.fit = fit_custom_family(&family, &blocks, options)?;
     }
+
+    builder.augment_result_designs(&mut solved.mean_design, &mut solved.noise_design);
 
     Ok(BlockwiseTermFitResult {
         fit: solved.fit,
@@ -2125,6 +2177,18 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         true
     }
 
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+        noise_design.penalties.len() + 1
+    }
+
+    fn augment_result_designs(
+        &self,
+        _mean_design: &mut TermCollectionDesign,
+        noise_design: &mut TermCollectionDesign,
+    ) {
+        append_binomial_log_sigma_shrinkage_penalty_design(noise_design);
+    }
+
     fn build_blocks(
         &self,
         theta: &Array1<f64>,
@@ -2133,13 +2197,21 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         mean_beta_hint: Option<Array1<f64>>,
         noise_beta_hint: Option<Array1<f64>>,
     ) -> Result<Vec<ParameterBlockSpec>, String> {
-        let layout = GamlssLambdaLayout::two_block(
-            mean_design.penalties.len(),
-            noise_design.penalties.len(),
-        );
+        let layout =
+            GamlssLambdaLayout::two_block(mean_design.penalties.len(), self.noise_penalty_count(noise_design));
         layout.validate_theta_len(theta.len(), "binomial location-scale")?;
         let identified_noise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
+        let mut log_sigma_penalties = noise_design.penalties.clone();
+        log_sigma_penalties.push(identity_penalty(identified_noise_design.ncols()));
+        let log_sigma_spec = ParameterBlockSpec {
+            name: "log_sigma".to_string(),
+            design: DesignMatrix::Dense(identified_noise_design),
+            offset: Array1::zeros(self.y.len()),
+            penalties: log_sigma_penalties,
+            initial_log_lambdas: layout.noise_from(theta),
+            initial_beta: noise_beta_hint,
+        };
         Ok(vec![
             ParameterBlockSpec {
                 name: "threshold".to_string(),
@@ -2149,14 +2221,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
                 initial_log_lambdas: layout.mean_from(theta),
                 initial_beta: mean_beta_hint,
             },
-            ParameterBlockSpec {
-                name: "log_sigma".to_string(),
-                design: DesignMatrix::Dense(identified_noise_design),
-                offset: Array1::zeros(self.y.len()),
-                penalties: noise_design.penalties.clone(),
-                initial_log_lambdas: layout.noise_from(theta),
-                initial_beta: noise_beta_hint,
-            },
+            log_sigma_spec,
         ])
     }
 
@@ -2231,6 +2296,18 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         initial_log_lambdas_or_zeros(&self.wiggle_block)
     }
 
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+        noise_design.penalties.len() + 1
+    }
+
+    fn augment_result_designs(
+        &self,
+        _mean_design: &mut TermCollectionDesign,
+        noise_design: &mut TermCollectionDesign,
+    ) {
+        append_binomial_log_sigma_shrinkage_penalty_design(noise_design);
+    }
+
     fn build_blocks(
         &self,
         theta: &Array1<f64>,
@@ -2241,12 +2318,22 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
     ) -> Result<Vec<ParameterBlockSpec>, String> {
         let layout = GamlssLambdaLayout::with_wiggle(
             mean_design.penalties.len(),
-            noise_design.penalties.len(),
+            self.noise_penalty_count(noise_design),
             self.wiggle_block.penalties.len(),
         );
         layout.validate_theta_len(theta.len(), "wiggle location-scale")?;
         let identified_noise_design =
             identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
+        let mut log_sigma_penalties = noise_design.penalties.clone();
+        log_sigma_penalties.push(identity_penalty(identified_noise_design.ncols()));
+        let log_sigma_spec = ParameterBlockSpec {
+            name: "log_sigma".to_string(),
+            design: DesignMatrix::Dense(identified_noise_design),
+            offset: Array1::zeros(self.y.len()),
+            penalties: log_sigma_penalties,
+            initial_log_lambdas: layout.noise_from(theta),
+            initial_beta: noise_beta_hint,
+        };
         Ok(vec![
             ParameterBlockSpec {
                 name: "threshold".to_string(),
@@ -2256,14 +2343,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                 initial_log_lambdas: layout.mean_from(theta),
                 initial_beta: mean_beta_hint,
             },
-            ParameterBlockSpec {
-                name: "log_sigma".to_string(),
-                design: DesignMatrix::Dense(identified_noise_design),
-                offset: Array1::zeros(self.y.len()),
-                penalties: noise_design.penalties.clone(),
-                initial_log_lambdas: layout.noise_from(theta),
-                initial_beta: noise_beta_hint,
-            },
+            log_sigma_spec,
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
                 design: self.wiggle_block.design.clone(),
@@ -10322,6 +10402,44 @@ mod tests {
     }
 
     #[test]
+    fn fit_binomial_location_scale_applies_shrinkage_to_log_sigma_block() {
+        let n = 64usize;
+        let y = Array1::from_vec(
+            (0..n)
+                .map(|i| if i % 5 == 0 || i % 7 == 0 { 1.0 } else { 0.0 })
+                .collect(),
+        );
+        let weights = Array1::from_vec(vec![1.0; n]);
+        let spec = BinomialLocationScaleSpec {
+            y,
+            weights,
+            link_kind: InverseLink::Standard(LinkFunction::Probit),
+            threshold_block: intercept_block(n),
+            log_sigma_block: intercept_block(n),
+        };
+
+        let fit = fit_binomial_location_scale(
+            spec,
+            &BlockwiseFitOptions {
+                compute_covariance: true,
+                ..BlockwiseFitOptions::default()
+            },
+        )
+        .expect("binomial location-scale family should fit with shrinkage penalty");
+        assert_eq!(fit.log_lambdas.len(), 1);
+        assert_eq!(fit.lambdas.len(), 1);
+        let covariance = fit
+            .covariance_conditional
+            .as_ref()
+            .expect("conditional covariance");
+        assert!(
+            covariance[[1, 1]].is_finite() && covariance[[1, 1]] < 50.0,
+            "log_sigma variance should be regularized, got {}",
+            covariance[[1, 1]]
+        );
+    }
+
+    #[test]
     fn fit_binomial_location_scale_sas_runs() {
         let n = 28usize;
         let y = Array1::from_vec((0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect());
@@ -10528,8 +10646,13 @@ mod tests {
         let noise_spec_resolved =
             freeze_spatial_length_scale_terms_from_design(&noise_spec, &noise_design)
                 .expect("freeze noise spec");
-        let rho =
-            compose_theta_from_hints(&mean_design, &noise_design, &None, &None, &Array1::zeros(0));
+        let rho = compose_theta_from_hints(
+            builder.mean_penalty_count(&mean_design),
+            builder.noise_penalty_count(&noise_design),
+            &None,
+            &None,
+            &Array1::zeros(0),
+        );
         let blocks = builder
             .build_blocks(&rho, &mean_design, &noise_design, None, None)
             .expect("build blocks");
@@ -10611,8 +10734,8 @@ mod tests {
             freeze_spatial_length_scale_terms_from_design(&noise_spec, &noise_design)
                 .expect("freeze noise spec");
         let rho = compose_theta_from_hints(
-            &mean_design,
-            &noise_design,
+            builder.mean_penalty_count(&mean_design),
+            builder.noise_penalty_count(&noise_design),
             &None,
             &None,
             &builder.extra_rho0().expect("wiggle rho0"),
@@ -10688,8 +10811,13 @@ mod tests {
         let noise_spec_resolved =
             freeze_spatial_length_scale_terms_from_design(&noise_spec, &noise_design)
                 .expect("freeze noise spec");
-        let rho =
-            compose_theta_from_hints(&mean_design, &noise_design, &None, &None, &Array1::zeros(0));
+        let rho = compose_theta_from_hints(
+            builder.mean_penalty_count(&mean_design),
+            builder.noise_penalty_count(&noise_design),
+            &None,
+            &None,
+            &Array1::zeros(0),
+        );
         let blocks = builder
             .build_blocks(&rho, &mean_design, &noise_design, None, None)
             .expect("build blocks");
@@ -10772,8 +10900,8 @@ mod tests {
             freeze_spatial_length_scale_terms_from_design(&noise_spec, &noise_design)
                 .expect("freeze noise spec");
         let rho = compose_theta_from_hints(
-            &mean_design,
-            &noise_design,
+            builder.mean_penalty_count(&mean_design),
+            builder.noise_penalty_count(&noise_design),
             &None,
             &None,
             &builder.extra_rho0().expect("wiggle rho0"),
@@ -10880,8 +11008,13 @@ mod tests {
         let noise_spec_resolved =
             freeze_spatial_length_scale_terms_from_design(&noise_spec, &noise_design)
                 .expect("freeze noise spec");
-        let rho =
-            compose_theta_from_hints(&mean_design, &noise_design, &None, &None, &Array1::zeros(0));
+        let rho = compose_theta_from_hints(
+            builder.mean_penalty_count(&mean_design),
+            builder.noise_penalty_count(&noise_design),
+            &None,
+            &None,
+            &Array1::zeros(0),
+        );
         let blocks = builder
             .build_blocks(&rho, &mean_design, &noise_design, None, None)
             .expect("build blocks");
