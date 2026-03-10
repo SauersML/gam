@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+from collections import deque
 import json
 import math
 import os
-import pty
 import re
 import subprocess
 import sys
@@ -92,6 +92,7 @@ HEARTBEAT_INTERVAL_SEC = 15.0
 # diagnostics capture meaningful process stats before exit.
 HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
+_MAX_CAPTURE_CHARS = 200000
 NON_BLOCKING_FAILURE_CONTENDERS = {
     # These external stacks are kept in the benchmark output for visibility,
     # but occasional fit/predict failures should not fail the whole CI shard.
@@ -175,8 +176,7 @@ def _fmt_cpu_total_pct(cpu_pct):
         cpu_val = float(cpu_pct)
     except Exception:
         return "n/a"
-    ncpu = os.cpu_count() or 1
-    return f"{(cpu_val / float(ncpu)):.1f}"
+    return f"{cpu_val:.1f}"
 
 
 def _fmt_pct(numer, denom):
@@ -375,32 +375,29 @@ def _heartbeat_loop(proc, cmd, stop_event, stats):
         print(_collect_heartbeat_snapshot(proc, cmd_preview, stats, start), file=sys.stderr, flush=True)
 
 
+def _workspace_tempdir(prefix: str):
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=str(BENCH_DIR))
+
+
 def run_cmd(cmd, cwd=None):
     env = os.environ.copy()
     env.update(_SERIAL_ENV_OVERRIDES)
     env["PYTHONUNBUFFERED"] = "1"
-    out_master, out_slave = pty.openpty()
-    err_master, err_slave = pty.openpty()
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            stdout=out_slave,
-            stderr=err_slave,
-            text=False,
-            env=env,
-            bufsize=0,
-        )
-    except Exception:
-        os.close(out_master)
-        os.close(err_master)
-        raise
-    finally:
-        os.close(out_slave)
-        os.close(err_slave)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        env=env,
+        bufsize=0,
+    )
 
-    out_buf = []
-    err_buf = []
+    out_buf: deque[str] = deque()
+    err_buf: deque[str] = deque()
+    out_chars = 0
+    err_chars = 0
     hb_stop = threading.Event()
     hb_stats = {
         "peak_proc_rss_kib": 0,
@@ -409,27 +406,35 @@ def run_cmd(cmd, cwd=None):
         "samples": 0,
     }
 
-    def _pump(fd, sink, buf):
+    def _append_capped(buf: deque[str], text: str, current_chars: int) -> int:
+        buf.append(text)
+        current_chars += len(text)
+        while current_chars > _MAX_CAPTURE_CHARS and buf:
+            current_chars -= len(buf.popleft())
+        return current_chars
+
+    def _pump(pipe, sink, buf, char_count_name):
+        nonlocal out_chars, err_chars
         try:
             while True:
-                try:
-                    chunk = os.read(fd, 4096)
-                except OSError:
-                    break
+                chunk = pipe.read(4096)
                 if not chunk:
                     break
                 text = chunk.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
                 sink.write(text)
                 sink.flush()
-                buf.append(text)
+                if char_count_name == "out":
+                    out_chars = _append_capped(buf, text, out_chars)
+                else:
+                    err_chars = _append_capped(buf, text, err_chars)
         finally:
             try:
-                os.close(fd)
-            except OSError:
+                pipe.close()
+            except Exception:
                 pass
 
-    t_out = threading.Thread(target=_pump, args=(out_master, sys.stdout, out_buf), daemon=True)
-    t_err = threading.Thread(target=_pump, args=(err_master, sys.stderr, err_buf), daemon=True)
+    t_out = threading.Thread(target=_pump, args=(proc.stdout, sys.stdout, out_buf, "out"), daemon=True)
+    t_err = threading.Thread(target=_pump, args=(proc.stderr, sys.stderr, err_buf, "err"), daemon=True)
     t_hb = threading.Thread(target=_heartbeat_loop, args=(proc, cmd, hb_stop, hb_stats), daemon=True)
     t_out.start()
     t_err.start()
@@ -458,7 +463,7 @@ def run_cmd(cmd, cwd=None):
             f"[HEARTBEAT] command-timeout rc=124 timeout_sec={_CMD_TIMEOUT_SEC} "
             f"pid={proc.pid} cmd='{(' '.join(str(x) for x in cmd[:5]) + (' ...' if len(cmd) > 5 else ''))}'\n"
         )
-        err_buf.append(timeout_msg)
+        err_chars = _append_capped(err_buf, timeout_msg, err_chars)
         print(timeout_msg, file=sys.stderr, flush=True)
     print(
         f"[HEARTBEAT] command-exit rc={rc} pid={proc.pid} "
@@ -2870,38 +2875,48 @@ def _rust_fit_mapping(scenario_name):
     return {
         "small_dense": dict(
             family="binomial-logit",
-            smooth_col="x2",
-            linear_cols=["x1"],
+            smooth_cols=["x1", "x2"],
+            linear_cols=[],
             smooth_basis="ps",
             knots=7,
             double_penalty=False,
         ),
-        "medium": dict(family="binomial-logit", smooth_col="x2", linear_cols=["x1"], smooth_basis="ps", knots=7),
+        "medium": dict(
+            family="binomial-logit",
+            smooth_cols=["x1", "x2"],
+            linear_cols=[],
+            smooth_basis="ps",
+            knots=7,
+        ),
         "pathological_ill_conditioned": dict(
-            family="binomial-logit", smooth_col="x2", linear_cols=["x1"], smooth_basis="ps", knots=7
+            family="binomial-logit",
+            smooth_cols=["x1", "x2"],
+            linear_cols=[],
+            smooth_basis="ps",
+            knots=7,
         ),
         "lidar_semipar": dict(family="gaussian", smooth_col="range", linear_cols=[], smooth_basis="ps", knots=24),
         "bone_gamair": dict(family="binomial-logit", smooth_col="t", linear_cols=["trt_auto"], smooth_basis="ps", knots=8),
         "prostate_gamair": dict(
             family="binomial-logit",
-            smooth_col="pc2",
-            linear_cols=["pc1"],
+            smooth_cols=["pc1", "pc2"],
+            linear_cols=[],
             smooth_basis="ps",
             knots=8,
             double_penalty=False,
         ),
         "horse_colic": dict(
             family="binomial-logit",
-            smooth_col="pulse",
-            linear_cols=["rectal_temp", "packed_cell_volume"],
+            smooth_cols=["pulse", "rectal_temp", "packed_cell_volume"],
+            linear_cols=[],
             smooth_basis="ps",
             knots=8,
             double_penalty=False,
         ),
         "wine_gamair": dict(
             family="gaussian",
-            smooth_col="s_temp",
-            linear_cols=["year", "h_rain", "w_rain", "h_temp"],
+            smooth_cols=["s_temp", "year", "h_rain", "w_rain", "h_temp"],
+            linear_cols=[],
             smooth_basis="ps",
             knots=7,
             double_penalty=True,
@@ -2914,15 +2929,15 @@ def _rust_fit_mapping(scenario_name):
         ),
         "us48_demand_5day": dict(
             family="gaussian",
-            smooth_col="hour",
-            linear_cols=["demand_forecast", "net_generation", "total_interchange"],
+            smooth_cols=["hour", "demand_forecast", "net_generation", "total_interchange"],
+            linear_cols=[],
             smooth_basis="ps",
             knots=8,
         ),
         "us48_demand_31day": dict(
             family="gaussian",
-            smooth_col="hour",
-            linear_cols=["demand_forecast", "net_generation", "total_interchange"],
+            smooth_cols=["hour", "demand_forecast", "net_generation", "total_interchange"],
+            linear_cols=[],
             smooth_basis="ps",
             knots=12,
         ),
@@ -2974,8 +2989,10 @@ def _rust_fit_mapping(scenario_name):
                 "tryglicerides",
                 "platelets",
                 "prothrombin",
+                "edema",
+                "stage",
             ],
-            linear_cols=["drug", "sex_male", "ascites", "hepatomegaly", "spiders", "edema", "stage"],
+            linear_cols=["drug", "sex_male", "ascites", "hepatomegaly", "spiders"],
             smooth_basis="ps",
             knots=7,
         ),
@@ -3055,9 +3072,9 @@ def _rust_fit_mapping(scenario_name):
         ),
         "thread3_admixture_cliff": dict(
             family="binomial-logit",
-            smooth_cols=["pc1", "pc2", "pc3", "pc4"],
+            smooth_cols=[f"pc{i}" for i in range(1, 17)],
             smooth_basis="matern",
-            linear_cols=[f"pc{i}" for i in range(5, 17)],
+            linear_cols=[],
             knots=16,
             double_penalty=True,
         ),
@@ -3683,7 +3700,7 @@ def run_rust_scenario_cv(
     smooth_cols = list(rust_cfg.get("smooth_cols") or ([rust_cfg["smooth_col"]] if "smooth_col" in rust_cfg else []))
     linear_cols = list(rust_cfg.get("linear_cols", []))
     # Use a workspace-local temp root to reduce /tmp lifecycle flakiness in CI.
-    with tempfile.TemporaryDirectory(prefix="gam_bench_rust_cv_", dir=str(BENCH_DIR)) as td:
+    with _workspace_tempdir(prefix="gam_bench_rust_cv_") as td:
         td_path = Path(td)
         for fold_id, fold in enumerate(folds):
             train_df = base_df.iloc[fold.train_idx].copy()
@@ -4116,7 +4133,7 @@ def _run_rust_gamlss_scenario_cv_variant(
     plot_payload = _init_plot_payload(ds)
     eval_suffix = _evaluation_suffix(folds)
 
-    with tempfile.TemporaryDirectory(prefix="gam_bench_rust_gamlss_cv_", dir=str(BENCH_DIR)) as td:
+    with _workspace_tempdir(prefix="gam_bench_rust_gamlss_cv_") as td:
         td_path = Path(td)
         for fold_id, fold in enumerate(folds):
             train_df = base_df.iloc[fold.train_idx].copy()
@@ -4349,7 +4366,7 @@ def run_rust_gamlss_survival_cv(
     cv_rows = []
     plot_payload = _init_plot_payload(ds)
 
-    with tempfile.TemporaryDirectory(prefix="gam_bench_rust_gamlss_surv_cv_", dir=str(BENCH_DIR)) as td:
+    with _workspace_tempdir(prefix="gam_bench_rust_gamlss_surv_cv_") as td:
         td_path = Path(td)
         for fold_id, fold in enumerate(folds):
             train_df = base_df.iloc[fold.train_idx].copy()
@@ -4534,23 +4551,58 @@ def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
     return f"{ds['target']} ~ " + " + ".join(terms)
 
 
-def _sigma_feature_rhs(
-    ds: dict,
-    scenario_name: str | None = None,
-    *,
-    n_train: int | None = None,
-) -> str:
-    features = [str(c) for c in ds.get("features", [])]
-    return " + ".join(features) if features else "1"
+def _scenario_knot_count(scenario_name: str | None, default: int = 8) -> int:
+    if not scenario_name:
+        return int(default)
+    cfg = _rust_fit_mapping(scenario_name)
+    if cfg is None:
+        return int(default)
+    return max(4, int(cfg.get("knots", default)))
 
 
-def _sigma_feature_formula(
-    ds: dict,
-    scenario_name: str | None = None,
-    *,
-    n_train: int | None = None,
-) -> str:
-    return "~ " + _sigma_feature_rhs(ds, scenario_name, n_train=n_train)
+def _feature_should_be_smooth(ds: dict, col: str) -> bool:
+    vals = pd.to_numeric(pd.Series([row.get(col) for row in ds["rows"]]), errors="coerce").dropna()
+    if vals.empty:
+        return False
+    unique_vals = np.unique(vals.to_numpy(dtype=float))
+    return unique_vals.size > 2
+
+
+def _sigma_feature_terms(ds: dict, *, scenario_name: str | None, backend: str) -> list[str]:
+    knot_count = _scenario_knot_count(scenario_name)
+    knot_expr = f"max(1, min({knot_count}, nrow(train_df)-1))"
+    mgcv_k = f"min({knot_count + 4}, nrow(train_df)-1)"
+    brms_k = str(knot_count)
+    terms: list[str] = []
+    for col in [str(c) for c in ds.get("features", [])]:
+        if _feature_should_be_smooth(ds, col):
+            if backend == "rust":
+                terms.append(f"s({col}, type=ps, knots={knot_count})")
+            elif backend == "r_gamlss":
+                terms.append(f"pb({col}, inter={knot_expr})")
+            elif backend == "mgcv":
+                terms.append(f"s({col}, bs='ps', k={mgcv_k})")
+            elif backend == "gamboostlss":
+                terms.append(f"bbs({col}, knots={knot_expr})")
+            elif backend == "bamlss":
+                terms.append(f"s({col}, bs='ps', k={mgcv_k})")
+            elif backend == "brms":
+                terms.append(f"s({col}, k={brms_k})")
+            else:
+                raise RuntimeError(f"unsupported sigma backend '{backend}'")
+        else:
+            if backend == "rust":
+                terms.append(f"linear({col})")
+            elif backend == "gamboostlss":
+                terms.append(f"bols({col}, intercept=FALSE)")
+            else:
+                terms.append(col)
+    return terms
+
+
+def _sigma_feature_formula(ds: dict, *, scenario_name: str | None, backend: str) -> str:
+    terms = _sigma_feature_terms(ds, scenario_name=scenario_name, backend=backend)
+    return "~ " + (" + ".join(terms) if terms else "1")
 
 
 def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -4570,7 +4622,7 @@ def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fo
     if not mu_formula:
         return None
 
-    with tempfile.TemporaryDirectory(prefix="gam_bench_r_gamlss_cv_") as td:
+    with _workspace_tempdir(prefix="gam_bench_r_gamlss_cv_") as td:
         td_path = Path(td)
         data_path = td_path / "data.json"
         out_path = td_path / "out.json"
@@ -4792,7 +4844,7 @@ def run_external_mgcv_cv(scenario, *, ds: dict | None = None, folds: list[Fold] 
                 f"Missing required shared mgcv formula for non-survival scenario '{scenario['name']}'"
             )
 
-    with tempfile.TemporaryDirectory(prefix="gam_bench_mgcv_cv_") as td:
+    with _workspace_tempdir(prefix="gam_bench_mgcv_cv_") as td:
         td_path = Path(td)
         data_path = td_path / "data.json"
         out_path = td_path / "out.json"
@@ -5121,7 +5173,7 @@ def run_external_mgcv_gaulss_cv(scenario, *, ds: dict | None = None, folds: list
     rust_cfg = _rust_fit_mapping(scenario["name"])
     use_select = bool((rust_cfg or {}).get("double_penalty", True))
 
-    with tempfile.TemporaryDirectory(prefix="gam_bench_mgcv_gaulss_cv_") as td:
+    with _workspace_tempdir(prefix="gam_bench_mgcv_gaulss_cv_") as td:
         td_path = Path(td)
         data_path = td_path / "data.json"
         out_path = td_path / "out.json"
@@ -5374,7 +5426,7 @@ def run_external_r_gamboostlss_cv(scenario, *, ds: dict | None = None, folds: li
     if not mu_formula:
         return None
 
-    with tempfile.TemporaryDirectory(prefix="gam_bench_r_gamboostlss_cv_") as td:
+    with _workspace_tempdir(prefix="gam_bench_r_gamboostlss_cv_") as td:
         td_path = Path(td)
         data_path = td_path / "data.json"
         out_path = td_path / "out.json"
@@ -5630,7 +5682,7 @@ def run_external_r_bamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fo
     if not mu_formula:
         return None
 
-    with tempfile.TemporaryDirectory(prefix="gam_bench_r_bamlss_cv_") as td:
+    with _workspace_tempdir(prefix="gam_bench_r_bamlss_cv_") as td:
         td_path = Path(td)
         data_path = td_path / "data.json"
         out_path = td_path / "out.json"
@@ -5854,7 +5906,7 @@ def run_external_r_brms_cv(scenario, *, ds: dict | None = None, folds: list[Fold
     if not mu_formula:
         return None
 
-    with tempfile.TemporaryDirectory(prefix="gam_bench_r_brms_cv_") as td:
+    with _workspace_tempdir(prefix="gam_bench_r_brms_cv_") as td:
         td_path = Path(td)
         data_path = td_path / "data.json"
         out_path = td_path / "out.json"
@@ -6066,7 +6118,7 @@ def run_external_mgcv_survival_cv(scenario, *, ds: dict | None = None, folds: li
     if folds is None:
         folds = folds_for_dataset(ds)
 
-    with tempfile.TemporaryDirectory(prefix="gam_bench_mgcv_surv_cv_") as td:
+    with _workspace_tempdir(prefix="gam_bench_mgcv_surv_cv_") as td:
         td_path = Path(td)
         data_path = td_path / "data.json"
         out_path = td_path / "out.json"
@@ -6506,7 +6558,7 @@ def run_external_glmnet_cox_cv(scenario, *, ds: dict | None = None, folds: list[
     if folds is None:
         folds = folds_for_dataset(ds)
 
-    with tempfile.TemporaryDirectory(prefix="gam_bench_glmnet_cox_cv_") as td:
+    with _workspace_tempdir(prefix="gam_bench_glmnet_cox_cv_") as td:
         td_path = Path(td)
         data_path = td_path / "data.json"
         out_path = td_path / "out.json"
@@ -7187,7 +7239,7 @@ def main():
         ds = dataset_for_scenario(s_cfg)
         folds = folds_for_dataset(ds)
         _assert_basis_parity_for_scenario(s_cfg, ds=ds)
-        with tempfile.TemporaryDirectory(prefix="gam_bench_shared_folds_", dir=str(BENCH_DIR)) as shared_td:
+        with _workspace_tempdir(prefix="gam_bench_shared_folds_") as shared_td:
             shared_fold_artifacts = build_shared_fold_artifacts(ds, folds, Path(shared_td))
             if ds["family"] != "survival":
                 results.append(
