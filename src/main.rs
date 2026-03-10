@@ -7347,6 +7347,10 @@ fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
     }
 }
 
+fn survival_link_usage() -> &'static str {
+    "use identity|logit|probit|cloglog|loglog|cauchit|sas|beta-logistic|blended(...)/mixture(...)"
+}
+
 fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, String> {
     if let Some(raw) = args.link.as_deref() {
         let name = raw.trim().to_ascii_lowercase();
@@ -7378,11 +7382,28 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
             .map_err(|e| format!("invalid survival {name} link state: {e}"))?;
             return Ok(InverseLink::Mixture(state));
         }
+        if name.starts_with("flexible(") {
+            return Err(format!(
+                "survival --link does not support flexible(...); {}",
+                survival_link_usage()
+            ));
+        }
     }
-    let choice = parse_link_choice(args.link.as_deref(), false)?;
+    let choice = parse_link_choice(args.link.as_deref(), false).map_err(|err| {
+        if let Some(raw) = args.link.as_deref() {
+            let name = raw.trim().to_ascii_lowercase();
+            if err.starts_with("unsupported --link ") {
+                return format!("unsupported survival --link '{name}'; {}", survival_link_usage());
+            }
+        }
+        err
+    })?;
     if let Some(choice) = choice {
         if !matches!(choice.mode, LinkMode::Strict) {
-            return Err("survival link does not support flexible(...)".to_string());
+            return Err(format!(
+                "survival --link does not support flexible(...); {}",
+                survival_link_usage()
+            ));
         }
         if let Some(components) = choice.mixture_components {
             if args.sas_init.is_some() || args.beta_logistic_init.is_some() {
@@ -9982,6 +10003,25 @@ mod tests {
             }
             _ => panic!("expected mixture-backed cauchit survival link"),
         }
+    }
+
+    #[test]
+    fn parse_survival_inverse_link_rejects_flexible_links_with_survival_specific_message() {
+        let mut args = base_survival_args_for_link_tests();
+        args.link = Some("flexible(logit)".to_string());
+        let err = parse_survival_inverse_link(&args).expect_err("expected flexible survival rejection");
+        assert!(err.contains("survival --link does not support flexible(...)"));
+        assert!(err.contains("use identity|logit|probit|cloglog|loglog|cauchit|sas|beta-logistic|blended(...)/mixture(...)"));
+    }
+
+    #[test]
+    fn parse_survival_inverse_link_reports_survival_specific_supported_links() {
+        let mut args = base_survival_args_for_link_tests();
+        args.link = Some("bogus".to_string());
+        let err = parse_survival_inverse_link(&args).expect_err("expected unsupported survival link");
+        assert!(err.contains("unsupported survival --link 'bogus'"));
+        assert!(err.contains("use identity|logit|probit|cloglog|loglog|cauchit|sas|beta-logistic|blended(...)/mixture(...)"));
+        assert!(!err.contains("flexible(...)"));
     }
 
     #[test]
