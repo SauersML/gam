@@ -4108,6 +4108,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 .fill(min_uniform_time_coef * 1.05);
         }
     }
+    let beta0_norm = beta0.dot(&beta0).sqrt();
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
         convergence_tolerance: 1e-6,
@@ -4130,9 +4131,65 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     match summary.status {
         gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum => {}
         other => {
+            let event_count = event_target.iter().filter(|&&ev| ev > 0).count();
+            let event_rate = if n > 0 {
+                event_count as f64 / n as f64
+            } else {
+                0.0
+            };
+            let min_entry = age_entry.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_exit = age_exit.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let beta_norm = beta.dot(&beta).sqrt();
+            let linear_constraint_count = pirls_opts
+                .linear_constraints
+                .as_ref()
+                .map(|c| c.a.nrows())
+                .unwrap_or(0);
+            let constraint_mode = if linear_constraint_count > 0 {
+                format!("linear-inequality({linear_constraint_count})")
+            } else {
+                "none".to_string()
+            };
+            let kkt_summary = summary
+                .constraint_kkt
+                .as_ref()
+                .map(|kkt| {
+                    format!(
+                        " | kkt[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
+                        kkt.primal_feasibility,
+                        kkt.dual_feasibility,
+                        kkt.complementarity,
+                        kkt.stationarity,
+                        kkt.n_active,
+                        kkt.n_constraints
+                    )
+                })
+                .unwrap_or_default();
             return Err(format!(
-                "survival constrained PIRLS did not converge: status={other:?}, grad_norm={:.3e}",
-                summary.lastgradient_norm
+                "survival constrained PIRLS did not converge: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}, last_deviance_change={:.3e}, last_step_size={:.3e}, last_step_halving={}, max_abs_eta={:.3e}, beta0_norm={:.3e}, beta_norm={:.3e}; run[likelihood={}, spec={}, baseline_target={}, time_basis={}, constraint_mode={}, n={}, events={}, event_rate={:.4}, time_range=[{:.3e}, {:.3e}], p_time={}, p_cov={}, formula=\"{}\"]{}",
+                summary.lastgradient_norm,
+                summary.iterations,
+                state.deviance,
+                summary.last_deviance_change,
+                summary.last_step_size,
+                summary.last_step_halving,
+                summary.max_abs_eta,
+                beta0_norm,
+                beta_norm,
+                survival_likelihood_modename(likelihood_mode),
+                effectivespec,
+                survival_baseline_targetname(baseline_cfg.target),
+                time_build.basisname,
+                constraint_mode,
+                n,
+                event_count,
+                event_rate,
+                min_entry,
+                max_exit,
+                p_time,
+                p_cov,
+                formula,
+                kkt_summary
             ));
         }
     }
@@ -4231,13 +4288,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 
 fn run_sample(args: SampleArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.start_workflow("Sample", 5);
     progress.set_stage("sample", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
+    progress.advance_workflow(1);
     let schema = model.require_data_schema()?;
     progress.set_stage("sample", "loading sampling data");
-    progress.set_progress("Sampling", 0, Some(4));
     let ds = load_datasetwith_schema(&args.data, schema)?;
-    progress.set_progress("Sampling", 1, Some(4));
+    progress.advance_workflow(2);
     let col_map: HashMap<String, usize> = ds
         .headers
         .iter()
@@ -4254,7 +4312,6 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     };
 
     progress.set_stage("sample", "running posterior sampling");
-    progress.set_progress("Sampling", 2, Some(4));
     progress.teardown();
     let nuts = match model.predict_model_class() {
         PredictModelClass::Survival => {
@@ -4288,10 +4345,11 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         .out
         .unwrap_or_else(|| PathBuf::from("posterior_samples.csv"));
     let mut progress = gam::visualizer::VisualizerSession::new(true);
-    progress.set_progress("Sampling", 3, Some(4));
+    progress.start_workflow("Sample", 5);
+    progress.advance_workflow(4);
     progress.set_stage("sample", "writing posterior draws");
     write_matrix_csv(&out, &nuts.samples, "beta")?;
-    progress.set_progress("Sampling", 4, Some(4));
+    progress.advance_workflow(5);
     progress.finish_progress("sampling complete");
     println!(
         "wrote posterior samples: {} (rows={}, cols={})",
@@ -4351,6 +4409,7 @@ fn run_sample_survival(
     )?;
     let cov_design = build_term_collection_design(data, &termspec)
         .map_err(|e| format!("failed to build survival design: {e}"))?;
+    progress.advance_workflow(3);
     let n = data.nrows();
     let p_cov = cov_design.design.ncols();
     let mut age_entry = Array1::<f64>::zeros(n);
@@ -4540,6 +4599,7 @@ fn run_sample_standard(
         },
     )
     .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
+    progress.advance_workflow(3);
     let penalty = weighted_penalty_matrix(&design.penalties, fit.lambdas.view())?;
     run_nuts_sampling_flattened_family(
         family,
@@ -9057,7 +9117,9 @@ mod tests {
         let data = ndarray::Array2::<f64>::zeros((1, 0));
         let headers = vec![];
         let col_map = HashMap::new();
+        let mut progress = gam::visualizer::VisualizerSession::new(false);
         run_predict_binomial_location_scale(
+            &mut progress,
             &args,
             model,
             data.view(),
@@ -9942,8 +10004,16 @@ mod tests {
         let data = ndarray::Array2::<f64>::zeros((1, 0));
         let headers = vec![];
         let col_map = HashMap::new();
-        run_predict_gaussian_location_scale(&args, &model, data.view(), &col_map, Some(&headers))
-            .expect("predict gaussian location-scale");
+        let mut progress = gam::visualizer::VisualizerSession::new(false);
+        run_predict_gaussian_location_scale(
+            &mut progress,
+            &args,
+            &model,
+            data.view(),
+            &col_map,
+            Some(&headers),
+        )
+        .expect("predict gaussian location-scale");
         assert!((csv_mean_at(&out_path, 0) - 12.0).abs() < 1e-12);
         assert!((csv_sigma_at(&out_path, 0) - 5.0).abs() < 1e-12);
     }
@@ -9954,9 +10024,15 @@ mod tests {
         let data = ndarray::Array2::<f64>::zeros((2, 0));
         let headers = vec![];
         let col_map = HashMap::new();
-        let spec =
-            run_generate_gaussian_location_scale(&model, data.view(), &col_map, Some(&headers))
-                .expect("generate gaussian location-scale");
+        let mut progress = gam::visualizer::VisualizerSession::new(false);
+        let spec = run_generate_gaussian_location_scale(
+            &mut progress,
+            &model,
+            data.view(),
+            &col_map,
+            Some(&headers),
+        )
+        .expect("generate gaussian location-scale");
         assert_eq!(spec.mean.to_vec(), vec![-3.0, -3.0]);
         match spec.noise {
             gam::generative::NoiseModel::Gaussian { sigma } => {
