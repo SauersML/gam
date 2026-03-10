@@ -942,22 +942,34 @@ fn lane_line(name: &str, lane: &LaneState, class: StatusClass) -> TextLine<'stat
 }
 
 fn dumb_render_lines(model: &VisualizerModel) -> Vec<String> {
+    if model.current_stage == "init"
+        && model.current_detail.is_empty()
+        && model.diagnostics_lines.is_empty()
+        && !model.current_cost.is_finite()
+        && !model.current_grad.is_finite()
+    {
+        return Vec::new();
+    }
     let mut lines = Vec::new();
     let elapsed = model.start_time.elapsed().as_secs();
     let status_class = classify_model_status(model);
+    let detail = if model.current_detail.is_empty() {
+        model.current_status.as_str()
+    } else {
+        model.current_detail.as_str()
+    };
     lines.push(format!(
-        "[{}] {} | {} | elapsed={}s | status={}",
+        "[{}] {} | {} | elapsed={}s",
         status_label(status_class),
         model.current_stage,
-        model.current_detail,
+        detail,
         elapsed,
-        model.current_status
     ));
     if !model.primary_lane.label.is_empty() {
-        lines.push(render_dumb_lane("Outer Opt", &model.primary_lane, model));
+        lines.push(render_dumb_lane("Workflow", &model.primary_lane, model));
     }
     if !model.secondary_lane.label.is_empty() {
-        lines.push(render_dumb_lane("Inner PIRLS", &model.secondary_lane, model));
+        lines.push(render_dumb_lane("Inner", &model.secondary_lane, model));
     }
     if let Some(last) = model.diagnostics_lines.last() {
         lines.push(format!("Note: {last}"));
@@ -969,37 +981,51 @@ fn render_dumb_lane(prefix: &str, lane: &LaneState, model: &VisualizerModel) -> 
     match lane.total {
         Some(total) if total > 0 => {
             let ratio = lane.current.min(total) as f64 / total as f64;
-            format!(
-                "{prefix}: {:>3}% ▕{}▏ ETA: {} | {} | LAML: {} | |grad|: {}",
-                (ratio * 100.0).round() as usize,
-                unicode_bar(ratio, 16),
-                estimate_eta(model, lane),
-                lane.label,
-                format_metric(model.current_cost, "{:.4}"),
-                format_metric(model.current_grad, "{:.3e}"),
-            )
+            let mut parts = vec![
+                format!("{prefix}: {}", lane.label),
+                format!("{:>3}% ▕{}▏", (ratio * 100.0).round() as usize, unicode_bar(ratio, 16)),
+            ];
+            if let Some(eta) = estimate_eta(model, lane) {
+                parts.push(format!("ETA: {eta}"));
+            }
+            if model.current_cost.is_finite() {
+                parts.push(format!("objective={}", format_metric(model.current_cost, "{:.4}")));
+            }
+            if model.current_grad.is_finite() {
+                parts.push(format!("|grad|={}", format_metric(model.current_grad, "{:.3e}")));
+            }
+            parts.join(" | ")
         }
-        _ => format!(
-            "{prefix}: {} | step={} | LAML: {} | |grad|: {}",
-            lane.label,
-            lane.current,
-            format_metric(model.current_cost, "{:.4}"),
-            format_metric(model.current_grad, "{:.3e}"),
-        ),
+        _ => {
+            let mut parts = vec![format!("{prefix}: {}", lane.label), format!("step={}", lane.current)];
+            if model.current_cost.is_finite() {
+                parts.push(format!("objective={}", format_metric(model.current_cost, "{:.4}")));
+            }
+            if model.current_grad.is_finite() {
+                parts.push(format!("|grad|={}", format_metric(model.current_grad, "{:.3e}")));
+            }
+            parts.join(" | ")
+        }
     }
 }
 
-fn estimate_eta(model: &VisualizerModel, lane: &LaneState) -> String {
+fn estimate_eta(model: &VisualizerModel, lane: &LaneState) -> Option<String> {
     let Some(total) = lane.total else {
-        return "n/a".to_string();
+        return None;
     };
-    if lane.current == 0 {
-        return "n/a".to_string();
+    if lane.current == 0 || lane.current >= total {
+        return None;
     }
     let elapsed = model.start_time.elapsed().as_secs_f64();
+    if elapsed < 1.0 {
+        return None;
+    }
     let rate = lane.current as f64 / elapsed.max(1e-6);
+    if rate <= 0.0 {
+        return None;
+    }
     let remaining = total.saturating_sub(lane.current) as f64 / rate.max(1e-6);
-    format!("{:.0}s", remaining.max(0.0))
+    Some(format!("{:.0}s", remaining.max(0.0)))
 }
 
 fn format_metric(value: f64, fmt: &str) -> String {
@@ -1089,8 +1115,26 @@ mod tests {
         session.advance_workflow(4);
         session.update(42.0, 1e-3, "optimizing", 4.0, "accepted", Some(10));
         let lines = dumb_render_lines(&session.model);
-        assert!(lines.iter().any(|line| line.contains("Outer Opt:")));
+        assert!(lines.iter().any(|line| line.contains("Workflow: REML")));
         assert!(lines.iter().any(|line| line.contains("ETA:")));
+    }
+
+    #[test]
+    fn dumb_renderer_suppresses_uninitialized_frames() {
+        let session = VisualizerSession::new(false);
+        let lines = dumb_render_lines(&session.model);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn dumb_renderer_omits_placeholder_metrics() {
+        let mut session = VisualizerSession::new(false);
+        session.set_stage("fit", "loading survival data");
+        session.start_workflow("Survival Fit", 5);
+        session.advance_workflow(1);
+        let lines = dumb_render_lines(&session.model);
+        assert!(lines.iter().all(|line| !line.contains("n/a")));
+        assert!(lines.iter().any(|line| line.contains("Workflow: Survival Fit")));
     }
 
     #[test]
