@@ -1,5 +1,6 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_xt_diag_x};
+use crate::linalg::utils::{default_slq_parameters, stochastic_lanczos_logdet_spd};
 use crate::pirls::{LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState};
 use crate::types::{Coefficients, LinearPredictor};
 use faer::Side;
@@ -299,9 +300,14 @@ impl WorkingModelSurvival {
             return Ok(2.0 * (0..l.nrows()).map(|i| l[[i, i]].ln()).sum::<f64>());
         }
 
-        let (eval, _) = hessian
-            .eigh(Side::Lower)
-            .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+        let (eval, _) = match hessian.eigh(Side::Lower) {
+            Ok(out) => out,
+            Err(_) => {
+                let (probes, steps) = default_slq_parameters(hessian.nrows());
+                return stochastic_lanczos_logdet_spd(hessian, probes, steps, 97)
+                    .map_err(EstimationError::InvalidInput);
+            }
+        };
         let max_eval = eval.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
         let tol = (max_eval * 1e-12).max(1e-14);
         Ok(eval.iter().filter(|&&v| v > tol).map(|&v| v.ln()).sum())

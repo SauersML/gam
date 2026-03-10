@@ -1,7 +1,8 @@
 use crate::faer_ndarray::FaerCholesky;
 use crate::faer_ndarray::{FaerArrayView, FaerEigh, FaerSvd};
 use crate::linalg::utils::{
-    StableSolver, boundary_hit_step_fraction, stochastic_lanczos_logdet_spd,
+    StableSolver, boundary_hit_step_fraction, default_slq_parameters,
+    stochastic_lanczos_logdet_spd,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -1591,7 +1592,8 @@ fn stable_logdet_with_ridge_policy(
             Ok(2.0 * chol.diag().mapv(f64::ln).sum())
         }
         RidgeDeterminantMode::StochasticLanczos => {
-            stochastic_lanczos_logdet_spd(&a, 16, 32, 42)
+            let (probes, steps) = default_slq_parameters(p);
+            stochastic_lanczos_logdet_spd(&a, probes, steps, 42)
         }
         RidgeDeterminantMode::PositivePart => {
             // Positive-part determinant policy for numerically hostile exact

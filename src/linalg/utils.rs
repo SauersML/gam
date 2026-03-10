@@ -299,7 +299,7 @@ where
     None
 }
 
-pub(crate) fn stochastic_lanczos_logdet_spd(
+pub fn stochastic_lanczos_logdet_spd(
     matrix: &Array2<f64>,
     num_probes: usize,
     lanczos_steps: usize,
@@ -309,29 +309,52 @@ pub(crate) fn stochastic_lanczos_logdet_spd(
     if matrix.ncols() != p {
         return Err("SLQ requires a square matrix".to_string());
     }
-    if p == 0 {
+    stochastic_lanczos_logdet_spd_operator(
+        p,
+        |v| matrix.dot(v),
+        num_probes,
+        lanczos_steps,
+        seed,
+    )
+}
+
+pub fn stochastic_lanczos_logdet_spd_operator<F>(
+    dim: usize,
+    apply: F,
+    num_probes: usize,
+    lanczos_steps: usize,
+    seed: u64,
+) -> Result<f64, String>
+where
+    F: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    if dim == 0 {
         return Ok(0.0);
     }
     let probes = num_probes.max(1);
-    let steps = lanczos_steps.clamp(2, p.max(2));
+    let steps = lanczos_steps.clamp(2, dim.max(2));
     let mut rng = StdRng::seed_from_u64(seed);
     let mut estimate = 0.0;
     for _ in 0..probes {
-        let mut z = Array1::<f64>::zeros(p);
-        for i in 0..p {
+        let mut z = Array1::<f64>::zeros(dim);
+        for i in 0..dim {
             z[i] = if rng.random::<bool>() { 1.0 } else { -1.0 };
         }
-        estimate += lanczos_logdet_probe(matrix, &z, steps)?;
+        estimate += lanczos_logdet_probe_operator(dim, &apply, &z, steps)?;
     }
     Ok(estimate / probes as f64)
 }
 
-fn lanczos_logdet_probe(
-    matrix: &Array2<f64>,
+fn lanczos_logdet_probe_operator<F>(
+    dim: usize,
+    apply: &F,
     probe: &Array1<f64>,
     max_steps: usize,
-) -> Result<f64, String> {
-    let p = probe.len();
+) -> Result<f64, String>
+where
+    F: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    let p = dim;
     let probe_norm_sq = probe.dot(probe);
     if !probe_norm_sq.is_finite() || probe_norm_sq <= 0.0 {
         return Err("SLQ probe has invalid norm".to_string());
@@ -344,7 +367,7 @@ fn lanczos_logdet_probe(
     let tol = 1e-12;
 
     for _ in 0..max_steps {
-        let mut v = matrix.dot(&q);
+        let mut v = apply(&q);
         if beta_prev > 0.0 {
             v.scaled_add(-beta_prev, &q_prev);
         }
@@ -390,6 +413,20 @@ fn lanczos_logdet_probe(
         quad += weight * evals[k].ln();
     }
     Ok(probe_norm_sq * quad)
+}
+
+pub fn default_slq_parameters(dim: usize) -> (usize, usize) {
+    let probes = if dim <= 32 {
+        256
+    } else if dim < 128 {
+        128
+    } else if dim < 512 {
+        48
+    } else {
+        32
+    };
+    let steps = if dim <= 128 { dim.max(8) } else { dim.clamp(32, 96) };
+    (probes, steps)
 }
 
 #[derive(Clone)]
@@ -487,7 +524,11 @@ impl RidgePlanner {
 
 #[cfg(test)]
 mod tests {
-    use super::{boundary_hit_step_fraction, solve_spd_pcg, stochastic_lanczos_logdet_spd};
+    use super::{
+        boundary_hit_step_fraction, default_slq_parameters, solve_spd_pcg,
+        stochastic_lanczos_logdet_spd, stochastic_lanczos_logdet_spd_operator,
+    };
+    use crate::faer_ndarray::FaerCholesky;
     use faer::Side;
     use ndarray::{Array1, array};
 
@@ -530,5 +571,26 @@ mod tests {
         let exact_logdet = 2.0 * exact.diag().mapv(f64::ln).sum();
         let approx = stochastic_lanczos_logdet_spd(&h, 16, 12, 7).expect("slq");
         assert!((approx - exact_logdet).abs() < 5e-2);
+    }
+
+    #[test]
+    fn operator_slq_matches_dense_slq() {
+        let h = array![
+            [3.5, 0.2, 0.1, 0.0],
+            [0.2, 4.0, 0.3, 0.1],
+            [0.1, 0.3, 5.0, 0.4],
+            [0.0, 0.1, 0.4, 3.8]
+        ];
+        let (probes, steps) = default_slq_parameters(h.nrows());
+        let dense = stochastic_lanczos_logdet_spd(&h, probes, steps, 13).expect("dense slq");
+        let op = stochastic_lanczos_logdet_spd_operator(
+            h.nrows(),
+            |v| h.dot(v),
+            probes,
+            steps,
+            13,
+        )
+        .expect("operator slq");
+        assert!((dense - op).abs() < 1e-10);
     }
 }
