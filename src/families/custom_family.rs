@@ -1,6 +1,8 @@
 use crate::faer_ndarray::FaerCholesky;
 use crate::faer_ndarray::{FaerArrayView, FaerEigh, FaerSvd};
-use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
+use crate::linalg::utils::{
+    StableSolver, boundary_hit_step_fraction, stochastic_lanczos_logdet_spd,
+};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::solver::opt_objective::CachedFirstOrderObjective;
@@ -1588,6 +1590,9 @@ fn stable_logdet_with_ridge_policy(
             })?;
             Ok(2.0 * chol.diag().mapv(f64::ln).sum())
         }
+        RidgeDeterminantMode::StochasticLanczos => {
+            stochastic_lanczos_logdet_spd(&a, 16, 32, 42)
+        }
         RidgeDeterminantMode::PositivePart => {
             // Positive-part determinant policy for numerically hostile exact
             // Newton systems.
@@ -1676,7 +1681,7 @@ fn logdet_trace_inverse_with_ridge_policy(
 
     match ridge_policy.determinant_mode {
         // For the full determinant surface, d log|H| = tr(H^{-1} dH).
-        RidgeDeterminantMode::Full => inverse_spdwith_retry(
+        RidgeDeterminantMode::Full | RidgeDeterminantMode::StochasticLanczos => inverse_spdwith_retry(
             matrix_on_logdet_surface,
             effective_solverridge(ridge_floor),
             8,
@@ -5950,6 +5955,28 @@ mod tests {
             err.contains("strict pseudo-laplace SPD solve failed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn slq_determinant_mode_tracks_exact_full_logdet_policy() {
+        let h = array![
+            [6.0, 0.8, 0.1],
+            [0.8, 4.5, 0.4],
+            [0.1, 0.4, 3.2]
+        ];
+        let exact = stable_logdet_with_ridge_policy(
+            &h,
+            1e-8,
+            RidgePolicy::explicit_stabilization_full(),
+        )
+        .expect("exact logdet");
+        let slq = stable_logdet_with_ridge_policy(
+            &h,
+            1e-8,
+            RidgePolicy::explicit_stabilization_full_slq(),
+        )
+        .expect("slq logdet");
+        assert!((slq - exact).abs() < 5e-2, "slq={slq}, exact={exact}");
     }
 
     #[test]
