@@ -6,13 +6,16 @@ use crate::linalg::utils::{
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
-use crate::solver::opt_objective::CachedFirstOrderObjective;
+use crate::solver::opt_objective::CachedSecondOrderObjective;
 use crate::types::{LinkFunction, RidgeDeterminantMode, RidgePolicy};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use ndarray::{Array1, Array2};
-use opt::{Bfgs, BfgsError, Bounds, MaxIterations, ObjectiveEvalError, Tolerance};
+use opt::{
+    Bounds, MaxIterations, NewtonTrustRegion, NewtonTrustRegionError, ObjectiveEvalError,
+    Tolerance,
+};
 use thiserror::Error;
 
 /// Optional known link metadata when a family uses a learnable wiggle correction.
@@ -1712,7 +1715,7 @@ fn logdet_trace_inverse_with_ridge_policy(
     }
 }
 
-const AUTO_SLQ_LOGDET_MIN_DIM: usize = 1024;
+const AUTO_SLQ_LOGDET_MIN_DIM: usize = 4096;
 
 fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
     match ridge_policy.determinant_mode {
@@ -3455,7 +3458,7 @@ fn outerobjective_andgradient<F: CustomFamily>(
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
 ) -> Result<(f64, Array1<f64>, ConstrainedWarmStart), String> {
-    let (obj, grad, hess, warm) = outerobjectivegradienthessian(
+    let (obj, grad, _, warm) = outerobjectivegradienthessian(
         family,
         specs,
         options,
@@ -5000,7 +5003,8 @@ pub fn fit_custom_family<F: CustomFamily>(
     let lower = Array1::<f64>::from_elem(rho0.len(), -30.0);
     let upper = Array1::<f64>::from_elem(rho0.len(), 30.0);
     let mut last_eval: Option<(Array1<f64>, f64, Array1<f64>, Option<Array2<f64>>)> = None;
-    let objective = CachedFirstOrderObjective::new(|x: &Array1<f64>| {
+    let objective = CachedSecondOrderObjective::new(
+        |x: &Array1<f64>| {
         let cached = warm_cache.lock().ok().and_then(|g| g.clone());
         let warm_start = if include_exact_newton_logdet_h(family) {
             None
@@ -5053,10 +5057,10 @@ pub fn fit_custom_family<F: CustomFamily>(
                     );
                 }
                 if include_exact_newton_logdet_h(family)
-                    && let Some((x_prev, obj_prev, grad_prev, _)) = last_eval.as_ref()
+                    && let Some((x_prev, obj_prev, grad_prev, hess_prev)) = last_eval.as_ref()
                     && x_prev.len() == x.len()
                 {
-                    return Ok((*obj_prev, grad_prev.clone()));
+                    return Ok((*obj_prev, grad_prev.clone(), hess_prev.clone()));
                 }
                 return Err(ObjectiveEvalError::recoverable(
                     "custom-family outer objective/derivatives became non-finite",
@@ -5067,10 +5071,10 @@ pub fn fit_custom_family<F: CustomFamily>(
                     *guard = Some(e);
                 }
                 if include_exact_newton_logdet_h(family)
-                    && let Some((x_prev, obj_prev, grad_prev, _)) = last_eval.as_ref()
+                    && let Some((x_prev, obj_prev, grad_prev, hess_prev)) = last_eval.as_ref()
                     && x_prev.len() == x.len()
                 {
-                    return Ok((*obj_prev, grad_prev.clone()));
+                    return Ok((*obj_prev, grad_prev.clone(), hess_prev.clone()));
                 }
                 return Err(ObjectiveEvalError::recoverable(
                     "custom-family outer objective/gradient evaluation failed",
@@ -5078,21 +5082,22 @@ pub fn fit_custom_family<F: CustomFamily>(
             }
         };
         last_eval = Some((x.clone(), obj, grad.clone(), hess_opt.clone()));
-        Ok((obj, grad))
-    });
+        Ok((obj, grad, hess_opt))
+    },
+        1e-4,
+    );
     let outer_max_iter = if include_exact_newton_logdet_h(family) {
         options.outer_max_iter.min(3).max(1)
     } else {
         options.outer_max_iter
     };
-    let mut solver = Bfgs::new(rho0.clone(), objective)
+    let mut solver = NewtonTrustRegion::new(rho0.clone(), objective)
         .with_bounds(
             Bounds::new(lower, upper, 1e-6).expect("custom-family rho bounds must be valid"),
         )
         .with_tolerance(
             Tolerance::new(options.outer_tol).expect("custom-family tolerance must be valid"),
         )
-        .with_profile(opt::Profile::Robust)
         .with_max_iterations(
             MaxIterations::new(outer_max_iter).expect("custom-family max iterations must be valid"),
         );
@@ -5106,7 +5111,7 @@ pub fn fit_custom_family<F: CustomFamily>(
     };
     let sol = match solver.run() {
         Ok(sol) => sol,
-        Err(BfgsError::MaxIterationsReached { last_solution }) => {
+        Err(NewtonTrustRegionError::MaxIterationsReached { last_solution }) => {
             if last_solution.final_value.is_finite()
                 && last_solution.final_gradient_norm.is_finite()
             {
@@ -5120,25 +5125,6 @@ pub fn fit_custom_family<F: CustomFamily>(
             } else {
                 return Err(format!(
                     "outer smoothing optimization failed: MaxIterationsReached.{details}",
-                    details = last_eval_error()
-                )
-                .into());
-            }
-        }
-        Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
-            if last_solution.final_value.is_finite()
-                && last_solution.final_gradient_norm.is_finite()
-            {
-                log::warn!(
-                    "Outer smoothing line search failed; using best-so-far solution (iter={}, f={:.6e}, ||g||={:.3e}).",
-                    last_solution.iterations,
-                    last_solution.final_value,
-                    last_solution.final_gradient_norm
-                );
-                *last_solution
-            } else {
-                return Err(format!(
-                    "outer smoothing optimization failed: LineSearchFailed.{details}",
                     details = last_eval_error()
                 )
                 .into());
@@ -5266,6 +5252,8 @@ mod tests {
             block_idx: usize,
             d_eta: &Array1<f64>,
         ) -> Result<Option<Array1<f64>>, String> {
+            let _ = block_states;
+            let _ = block_idx;
             Ok(Some(Array1::zeros(d_eta.len())))
         }
     }
@@ -5305,6 +5293,8 @@ mod tests {
             block_idx: usize,
             spec: &ParameterBlockSpec,
         ) -> Result<Option<LinearInequalityConstraints>, String> {
+            let _ = block_states;
+            let _ = spec;
             if block_idx != 0 {
                 return Ok(None);
             }
@@ -5323,6 +5313,7 @@ mod tests {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
+            let _ = block_states;
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -5338,6 +5329,9 @@ mod tests {
             block_idx: usize,
             d_beta: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
+            let _ = block_idx;
+            let _ = d_beta;
             Err(
                 "blockwise exact-newton path should not be used when joint path is available"
                     .to_string(),
@@ -5348,6 +5342,7 @@ mod tests {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
             Ok(Some(array![[2.0]]))
         }
 
@@ -5356,6 +5351,8 @@ mod tests {
             block_states: &[ParameterBlockState],
             d_beta_flat: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
+            let _ = d_beta_flat;
             Ok(Some(array![[0.0]]))
         }
     }
@@ -5398,6 +5395,7 @@ mod tests {
             block_states: &[ParameterBlockState],
             specs: &[ParameterBlockSpec],
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
             let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
             Ok(Some(Array2::eye(p)))
         }
@@ -5408,6 +5406,8 @@ mod tests {
             specs: &[ParameterBlockSpec],
             d_beta_flat: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
+            let _ = d_beta_flat;
             let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
             Ok(Some(Array2::zeros((p, p))))
         }
@@ -5419,6 +5419,9 @@ mod tests {
             d_beta_u_flat: &Array1<f64>,
             d_betav_flat: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
+            let _ = d_beta_u_flat;
+            let _ = d_betav_flat;
             let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
             Ok(Some(Array2::zeros((p, p))))
         }
@@ -5459,6 +5462,7 @@ mod tests {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
             Ok(Some(array![[2.0]]))
         }
 
@@ -5468,6 +5472,9 @@ mod tests {
             block_idx: usize,
             d_beta: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
+            let _ = block_idx;
+            let _ = d_beta;
             Ok(Some(array![[0.0]]))
         }
 
@@ -5476,6 +5483,8 @@ mod tests {
             block_states: &[ParameterBlockState],
             d_beta_flat: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
+            let _ = d_beta_flat;
             Ok(Some(array![[0.0]]))
         }
     }
@@ -5488,6 +5497,7 @@ mod tests {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
+            let _ = block_states;
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -5505,6 +5515,7 @@ mod tests {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
             Ok(Some(array![[1.0]]))
         }
 
@@ -5514,6 +5525,9 @@ mod tests {
             block_idx: usize,
             d_beta: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
+            let _ = block_idx;
+            let _ = d_beta;
             Ok(Some(array![[0.0]]))
         }
 
@@ -5522,6 +5536,8 @@ mod tests {
             block_states: &[ParameterBlockState],
             d_beta_flat: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
+            let _ = d_beta_flat;
             Ok(Some(array![[0.0]]))
         }
 
@@ -5532,6 +5548,10 @@ mod tests {
             derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
             psi_index: usize,
         ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+            let _ = block_states;
+            let _ = specs;
+            let _ = derivative_blocks;
+            let _ = psi_index;
             Ok(Some(ExactNewtonJointPsiTerms {
                 objective_psi: 3.5,
                 score_psi: array![0.0],
@@ -5548,6 +5568,7 @@ mod tests {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
+            let _ = block_states;
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -5565,6 +5586,7 @@ mod tests {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
             Ok(Some(array![[-1.0]]))
         }
     }
@@ -5601,6 +5623,7 @@ mod tests {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            let _ = block_states;
             Ok(Some(array![[2.0, 0.1], [3.0, 2.0]]))
         }
     }
@@ -5613,6 +5636,7 @@ mod tests {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
+            let _ = block_states;
             Err("synthetic outer objective failure: block[0] evaluate()".to_string())
         }
     }
@@ -6403,6 +6427,8 @@ mod tests {
                 false,
             )
             .expect("objective/gradient -");
+            let _ = fp;
+            let _ = fm;
 
             for k in 0..rho.len() {
                 let hfd = (gp[k] - gm[k]) / (2.0 * h);
@@ -6427,6 +6453,7 @@ mod tests {
                 );
             }
         }
+        let _ = f0;
 
         for i in 0..h0.nrows() {
             for j in 0..i {
@@ -6573,6 +6600,8 @@ mod tests {
                 false,
             )
             .expect("objective/gradient -");
+            let _ = fp;
+            let _ = fm;
 
             for k in 0..rho.len() {
                 let hfd = (gp[k] - gm[k]) / (2.0 * h);
@@ -6597,6 +6626,8 @@ mod tests {
                 );
             }
         }
+        let _ = f0;
+        let _ = g0;
     }
 
     #[test]
