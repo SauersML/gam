@@ -480,8 +480,15 @@ fn run() -> CliResult<()> {
 fn blockwise_options_from_fit_args(args: &FitArgs) -> Result<gam::BlockwiseFitOptions, String> {
     let mut options = gam::BlockwiseFitOptions::default();
     let _ = args;
-    options.compute_covariance = true;
+    options.compute_covariance = false;
     Ok(options)
+}
+
+fn compact_fit_result_for_batch(fit: &mut FitResult) {
+    fit.working_weights = Array1::zeros(0);
+    fit.working_response = Array1::zeros(0);
+    fit.reparam_qs = None;
+    fit.artifacts = gam::estimate::FitArtifacts { pirls: None };
 }
 
 fn run_fit(args: FitArgs) -> Result<(), String> {
@@ -835,7 +842,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             return Ok(());
         }
     }
-    let (fit, design, resolvedspec, adaptive_regularization_diagnostics): (
+    let (mut fit, design, resolvedspec, adaptive_regularization_diagnostics): (
         FitResult,
         gam::smooth::TermCollectionDesign,
         TermCollectionSpec,
@@ -871,8 +878,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;
         (fit_result_from_external(ext), design, spec.clone(), None)
     } else {
-        let bootstrap_design = build_term_collection_design(ds.values.view(), &spec)
-            .map_err(|e| format!("failed to build term collection design: {e}"))?;
         let adaptive_opts = if args.adaptive_regularization {
             Some(AdaptiveRegularizationOptions {
                 enabled: true,
@@ -893,7 +898,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             max_iter: fit_max_iter,
             tol: fit_tol,
             nullspace_dims: vec![],
-            linear_constraints: bootstrap_design.linear_constraints.clone(),
+            linear_constraints: None,
             adaptive_regularization: adaptive_opts,
         };
         let fitted = match fit_term_collectionwith_spatial_length_scale_optimization(
@@ -948,6 +953,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             fitted.adaptive_diagnostics,
         )
     };
+
+    if args.no_summary {
+        compact_fit_result_for_batch(&mut fit);
+    }
 
     let frozenspec = freeze_term_collectionspec(&resolvedspec, &design)?;
 
