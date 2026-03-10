@@ -6,6 +6,10 @@ use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
+const MATRIX_FREE_PCG_MIN_P: usize = 512;
+const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
+const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
+
 #[inline]
 fn dense_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<f64> {
     let nrows = matrix.nrows();
@@ -378,6 +382,10 @@ pub trait LinearOperator {
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
+    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String>;
+    fn uses_matrix_free_pcg(&self) -> bool {
+        false
+    }
     fn factorize_system(
         &self,
         weights: &Array1<f64>,
@@ -448,6 +456,53 @@ pub trait LinearOperator {
         } else {
             0.0
         };
+        if self.uses_matrix_free_pcg() && self.ncols() >= MATRIX_FREE_PCG_MIN_P {
+            let mut preconditioner = self.diag_gram(weights)?;
+            if let Some(pen) = penalty {
+                for i in 0..preconditioner.len() {
+                    preconditioner[i] += pen[[i, i]];
+                }
+            }
+            for retry in 0..8 {
+                let ridge = if baseridge > 0.0 {
+                    baseridge * 10f64.powi(retry as i32)
+                } else {
+                    0.0
+                };
+                let mut precond_retry = preconditioner.clone();
+                if ridge > 0.0 {
+                    for i in 0..precond_retry.len() {
+                        precond_retry[i] += ridge;
+                    }
+                }
+                let solved = crate::linalg::utils::solve_spd_pcg(
+                    |v| {
+                        let xv = self.apply(v);
+                        let mut weighted_xv = xv;
+                        for i in 0..weighted_xv.len() {
+                            weighted_xv[i] *= weights[i].max(0.0);
+                        }
+                        let mut out = self.apply_transpose(&weighted_xv);
+                        if let Some(pen) = penalty {
+                            out += &pen.dot(v);
+                        }
+                        if ridge > 0.0 {
+                            out += &v.mapv(|x| ridge * x);
+                        }
+                        out
+                    },
+                    rhs,
+                    &precond_retry,
+                    MATRIX_FREE_PCG_REL_TOL,
+                    MATRIX_FREE_PCG_MAX_ITER.max(4 * self.ncols()),
+                );
+                if let Some(solution) = solved
+                    && solution.iter().all(|v| v.is_finite())
+                {
+                    return Ok(solution);
+                }
+            }
+        }
         crate::linalg::utils::StableSolver::new("linear operator system")
             .solvevectorwithridge_retries(&system, rhs, baseridge)
             .ok_or_else(|| "solve_systemwith_policy failed after ridge retries".to_string())
@@ -470,6 +525,10 @@ pub trait LinearOperator {
 }
 
 impl LinearOperator for DesignMatrix {
+    fn uses_matrix_free_pcg(&self) -> bool {
+        matches!(self, Self::Dense(_))
+    }
+
     fn nrows(&self) -> usize {
         match self {
             Self::Dense(matrix) => matrix.nrows(),
@@ -591,6 +650,54 @@ impl LinearOperator for DesignMatrix {
             }
         }
         Ok(xtwx)
+    }
+
+    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "diag_gram dimension mismatch: weights length {} != nrows {}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        let p = self.ncols();
+        let mut diag = Array1::<f64>::zeros(p);
+        match self {
+            Self::Dense(x) => {
+                for i in 0..x.nrows() {
+                    let wi = weights[i].max(0.0);
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    for j in 0..p {
+                        let xij = x[[i, j]];
+                        diag[j] += wi * xij * xij;
+                    }
+                }
+            }
+            Self::Sparse(xs) => {
+                let csr = xs
+                    .as_ref()
+                    .to_row_major()
+                    .map_err(|_| "failed to obtain CSR view in diag_gram".to_string())?;
+                let sym = csr.symbolic();
+                let row_ptr = sym.row_ptr();
+                let col_idx = sym.col_idx();
+                let vals = csr.val();
+                for i in 0..self.nrows() {
+                    let wi = weights[i].max(0.0);
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    for idx in row_ptr[i]..row_ptr[i + 1] {
+                        let j = col_idx[idx];
+                        let xij = vals[idx];
+                        diag[j] += wi * xij * xij;
+                    }
+                }
+            }
+        }
+        Ok(diag)
     }
 
     fn factorize_system(
