@@ -10,8 +10,6 @@ fn minimal_fit_result(fitted_link_parameters: FittedLinkParameters) -> FitResult
         beta: Array1::from_vec(vec![0.0]),
         lambdas: Array1::zeros(0),
         standard_deviation: 1.0,
-        edf_by_block: vec![],
-        edf_total: 0.0,
         iterations: 1,
         finalgrad_norm: 0.0,
         pirls_status: PirlsStatus::Converged,
@@ -19,16 +17,8 @@ fn minimal_fit_result(fitted_link_parameters: FittedLinkParameters) -> FitResult
         stable_penalty_term: 0.0,
         max_abs_eta: 0.0,
         constraint_kkt: None,
-        smoothing_correction: None,
-        penalized_hessian: Array2::eye(1),
-        working_weights: Array1::from_vec(vec![1.0]),
-        working_response: Array1::from_vec(vec![0.0]),
-        reparam_qs: None,
         artifacts: FitArtifacts { pirls: None },
-        beta_covariance: None,
-        beta_standard_errors: None,
-        beta_covariance_corrected: None,
-        beta_standard_errors_corrected: None,
+        inference: None,
         reml_score: 0.0,
         fitted_link_parameters,
     }
@@ -36,10 +26,11 @@ fn minimal_fit_result(fitted_link_parameters: FittedLinkParameters) -> FitResult
 
 #[test]
 fn save_and_load_syncs_standard_sas_state_from_fit_result() {
+    let log_delta = -0.4;
     let sas_state = SasLinkState {
         epsilon: 0.25,
-        log_delta: -0.4,
-        delta: 0.6703200460356393,
+        log_delta,
+        delta: log_delta.exp(),
     };
     let covariance =
         Array2::from_shape_vec((2, 2), vec![0.1, 0.02, 0.02, 0.2]).expect("2x2 covariance");
@@ -68,10 +59,13 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     });
 
     let model = FittedModel::from_payload(payload);
-    assert_eq!(
-        model.saved_sas_state().expect("saved sas state"),
-        Some(sas_state)
-    );
+    let saved_state = model
+        .saved_sas_state()
+        .expect("saved sas state")
+        .expect("expected synchronized sas state");
+    assert_eq!(saved_state.epsilon, sas_state.epsilon);
+    assert_eq!(saved_state.log_delta, sas_state.log_delta);
+    assert!((saved_state.delta - sas_state.log_delta.exp()).abs() < 1e-15);
 
     let dir = tempdir().expect("temp dir");
     let path = dir.path().join("model.json");
@@ -84,10 +78,13 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     );
 
     let loaded = FittedModel::load_from_path(&path).expect("load model");
-    assert_eq!(
-        loaded.saved_sas_state().expect("loaded sas state"),
-        Some(sas_state)
-    );
+    let loaded_state = loaded
+        .saved_sas_state()
+        .expect("loaded sas state")
+        .expect("expected loaded sas state");
+    assert_eq!(loaded_state.epsilon, sas_state.epsilon);
+    assert_eq!(loaded_state.log_delta, sas_state.log_delta);
+    assert!((loaded_state.delta - sas_state.log_delta.exp()).abs() < 1e-15);
     let FittedModel::Standard { payload } = loaded else {
         panic!("expected standard model");
     };

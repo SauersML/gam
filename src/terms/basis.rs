@@ -11521,6 +11521,7 @@ mod tests {
             Some(&coeffs),
         )
         .expect("radial triplet at origin");
+        let _ = phi;
         let (phi_rr_collision, _, _) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi_rr");
@@ -11604,6 +11605,8 @@ mod tests {
 
         let (sn, sn_psi, sn_psi_psi, c) =
             normalize_penaltywith_psi_derivatives(&s, &s_psi, &s_psi_psi);
+        let _ = sn;
+        let _ = c;
 
         let h = 1e-6;
         let eval_snorm = |psi: f64| {
@@ -11769,6 +11772,9 @@ mod tests {
         let ls = 1.3;
         let (phi, phi_r, phi_rr, ratio) =
             matern_kernel_radial_tripletwith_safe_ratio(0.0, ls, MaternNu::Half).expect("half");
+        let _ = phi;
+        let _ = phi_r;
+        let _ = phi_rr;
         assert!(ratio.is_finite());
         assert!(ratio < 0.0);
     }

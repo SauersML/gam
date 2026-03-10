@@ -40,6 +40,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -50,16 +51,14 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     .expect("fit should succeed");
 
     let cov = fit
-        .beta_covariance
-        .as_ref()
+        .beta_covariance()
         .expect("conditional covariance should be available");
     assert_eq!(cov.nrows(), fit.beta.len());
     assert_eq!(cov.ncols(), fit.beta.len());
     assert!(cov.iter().all(|v| v.is_finite()));
 
     let se = fit
-        .beta_standard_errors
-        .as_ref()
+        .beta_standard_errors()
         .expect("standard errors should be available");
     assert_eq!(se.len(), fit.beta.len());
     assert!(se.iter().all(|v| v.is_finite() && *v >= 0.0));
@@ -110,6 +109,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 50,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -185,6 +185,7 @@ fn gaussian_prediction_intervals_includeobservation_noise() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 40,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -250,6 +251,7 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -259,8 +261,7 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
     )
     .expect("fit should succeed");
     let cov = fit
-        .beta_covariance
-        .as_ref()
+        .beta_covariance()
         .expect("covariance should be available");
     let pred = predict_gam_posterior_mean(
         x.view(),
@@ -324,6 +325,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 80,
             tol: 1e-6,
             nullspace_dims: vec![1],

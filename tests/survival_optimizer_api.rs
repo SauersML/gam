@@ -119,6 +119,7 @@ fn fit_gam_rejects_royston_parmar_and_points_to_survival_api() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
+        compute_inference: true,
         max_iter: 60,
         tol: 1e-6,
         nullspace_dims: Vec::new(),

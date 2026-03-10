@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover
 DEFAULT_WORKFLOW = "benchmark.yml"
 DEFAULT_OUT = Path("scripts/latest_benchmark_summary.md")
 DEFAULT_LOCAL_TZ = "America/Chicago"
-DEFAULT_RUN_SCAN_LIMIT = 20
+PAGE_SIZE = 100
 
 
 def run_cmd(args: list[str], *, capture: bool = True) -> subprocess.CompletedProcess:
@@ -52,15 +52,42 @@ def parse_owner_repo() -> tuple[str, str]:
     return owner, name
 
 
-def get_recent_workflow_runs(
-    owner: str, repo: str, workflow: str, *, limit: int = DEFAULT_RUN_SCAN_LIMIT
-) -> list[dict[str, Any]]:
-    path = f"/repos/{owner}/{repo}/actions/workflows/{workflow}/runs?per_page={limit}"
-    payload = gh_api_json(path)
-    runs = payload.get("workflow_runs", [])
-    if not runs:
-        raise RuntimeError(f"no runs found for workflow '{workflow}'")
-    return list(runs)
+def get_run(owner: str, repo: str, run_id: int) -> dict[str, Any]:
+    payload = gh_api_json(f"/repos/{owner}/{repo}/actions/runs/{run_id}")
+    if not payload:
+        raise RuntimeError(f"failed to load workflow run {run_id}")
+    return dict(payload)
+
+
+def get_recent_runs_with_shard_artifacts(owner: str, repo: str) -> list[int]:
+    run_ids: list[int] = []
+    seen: set[int] = set()
+    page = 1
+    while True:
+        path = f"/repos/{owner}/{repo}/actions/artifacts?per_page={PAGE_SIZE}&page={page}"
+        payload = gh_api_json(path)
+        chunk = payload.get("artifacts", [])
+        if not chunk:
+            break
+        for artifact in chunk:
+            name = str(artifact.get("name", ""))
+            if not name.startswith("bench-") or name == "bench-runtime" or bool(artifact.get("expired", False)):
+                continue
+            workflow_run = artifact.get("workflow_run") or {}
+            run_id = workflow_run.get("id")
+            if run_id is None:
+                continue
+            run_id_int = int(run_id)
+            if run_id_int in seen:
+                continue
+            seen.add(run_id_int)
+            run_ids.append(run_id_int)
+        if len(chunk) < PAGE_SIZE:
+            break
+        page += 1
+    if not run_ids:
+        raise RuntimeError(f"no workflow run with benchmark shard artifacts found for '{DEFAULT_WORKFLOW}'")
+    return run_ids
 
 
 def list_artifacts(owner: str, repo: str, run_id: int) -> list[dict[str, Any]]:
@@ -277,22 +304,19 @@ def main() -> int:
     selected_run: dict[str, Any] | None = None
     rows: list[dict[str, Any]] = []
     shard_artifacts: list[dict[str, Any]] = []
-    runs = get_recent_workflow_runs(owner, repo, DEFAULT_WORKFLOW, limit=DEFAULT_RUN_SCAN_LIMIT)
-    for run in runs:
-        run_id = int(run["id"])
+    candidate_run_ids = get_recent_runs_with_shard_artifacts(owner, repo)
+    for run_id in candidate_run_ids:
         candidate_rows, candidate_artifacts = load_rows_from_run(owner, repo, run_id)
         if candidate_rows:
-            selected_run = run
+            selected_run = get_run(owner, repo, run_id)
             rows = candidate_rows
             shard_artifacts = candidate_artifacts
             break
 
     if selected_run is None:
-        selected_run = runs[0]
-        run_id = int(selected_run["id"])
-        rows, shard_artifacts = load_rows_from_run(owner, repo, run_id)
-    else:
-        run_id = int(selected_run["id"])
+        raise RuntimeError(f"no workflow run with benchmark shard data found for '{DEFAULT_WORKFLOW}'")
+
+    run_id = int(selected_run["id"])
 
     created_at = datetime.fromisoformat(str(selected_run["created_at"]).replace("Z", "+00:00")).astimezone(
         timezone.utc

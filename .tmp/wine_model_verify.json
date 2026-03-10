@@ -1,0 +1,289 @@
+{
+  "model_type": "standard",
+  "payload": {
+    "version": 2,
+    "formula": "price ~ s(temp, type=ps, knots=7)",
+    "model_kind": "standard",
+    "family_state": {
+      "family_kind": "standard",
+      "likelihood": "GaussianIdentity",
+      "link": "Identity",
+      "mixture_state": null,
+      "sas_state": null
+    },
+    "family": "gaussian",
+    "fit_result": {
+      "beta": {
+        "v": 1,
+        "dim": [
+          11
+        ],
+        "data": [
+          25.815789466890582,
+          -11.05155547844862,
+          -7.826242625533316,
+          -3.110099340329338,
+          4.113838566412696,
+          9.824850286986978,
+          14.221867229901907,
+          12.060848030566017,
+          7.6855149576805,
+          2.9466512646283007,
+          -1.727303428972422
+        ]
+      },
+      "lambdas": {
+        "v": 1,
+        "dim": [
+          2
+        ],
+        "data": [
+          182.51362833948596,
+          0.7215328199421274
+        ]
+      },
+      "standard_deviation": 16.186295210649693,
+      "iterations": 16,
+      "finalgrad_norm": 3.4284958860047805e-9,
+      "pirls_status": "Converged",
+      "deviance": 9955.853800559444,
+      "stable_penalty_term": 595.0664749127933,
+      "max_abs_eta": 35.27717915088193,
+      "constraint_kkt": null,
+      "artifacts": {},
+      "inference": null,
+      "reml_score": 160.53333654257875,
+      "fitted_link_parameters": "Standard"
+    },
+    "data_schema": {
+      "columns": [
+        {
+          "name": "temp",
+          "kind": "continuous",
+          "levels": []
+        },
+        {
+          "name": "price",
+          "kind": "continuous",
+          "levels": []
+        }
+      ]
+    },
+    "link": null,
+    "mixture_link_param_covariance": null,
+    "sas_param_covariance": null,
+    "formula_noise": null,
+    "beta_noise": null,
+    "noise_projection": null,
+    "noise_center": null,
+    "noise_scale": null,
+    "noise_non_intercept_start": null,
+    "gaussian_response_scale": null,
+    "joint_beta_link": null,
+    "joint_knot_range": null,
+    "joint_knot_vector": null,
+    "joint_link_transform": null,
+    "joint_degree": null,
+    "jointridge_used": null,
+    "probitwiggle_knots": null,
+    "probitwiggle_degree": null,
+    "betawiggle": null,
+    "survival_entry": null,
+    "survival_exit": null,
+    "survival_event": null,
+    "survivalspec": null,
+    "survival_baseline_target": null,
+    "survival_baseline_scale": null,
+    "survival_baseline_shape": null,
+    "survival_baseline_rate": null,
+    "survival_baseline_makeham": null,
+    "survival_time_basis": null,
+    "survival_time_degree": null,
+    "survival_time_knots": null,
+    "survival_time_smooth_lambda": null,
+    "survivalridge_lambda": null,
+    "survival_likelihood": null,
+    "survival_beta_time": null,
+    "survival_beta_threshold": null,
+    "survival_beta_log_sigma": null,
+    "survival_noise_projection": null,
+    "survival_noise_center": null,
+    "survival_noise_scale": null,
+    "survival_noise_non_intercept_start": null,
+    "survival_distribution": null,
+    "training_headers": [
+      "temp",
+      "price"
+    ],
+    "resolved_termspec": {
+      "linear_terms": [],
+      "random_effect_terms": [],
+      "smooth_terms": [
+        {
+          "name": "s(temp, type=ps, knots=7)",
+          "basis": {
+            "BSpline1D": {
+              "feature_col": 0,
+              "spec": {
+                "degree": 3,
+                "penalty_order": 2,
+                "knotspec": {
+                  "Provided": {
+                    "v": 1,
+                    "dim": [
+                      15
+                    ],
+                    "data": [
+                      15.0,
+                      15.0,
+                      15.0,
+                      15.0,
+                      15.45,
+                      15.9,
+                      16.35,
+                      16.8,
+                      17.25,
+                      17.700000000000003,
+                      18.150000000000002,
+                      18.6,
+                      18.6,
+                      18.6,
+                      18.6
+                    ]
+                  }
+                },
+                "double_penalty": true,
+                "identifiability": {
+                  "FrozenTransform": {
+                    "transform": {
+                      "v": 1,
+                      "dim": [
+                        11,
+                        10
+                      ],
+                      "data": [
+                        -0.05495329685449484,
+                        -0.1958116134970724,
+                        -0.3495100359427365,
+                        -0.5582206548107991,
+                        -0.5243239534820081,
+                        -0.4630095032938739,
+                        -0.16491879013138802,
+                        -0.007715843395432797,
+                        0.0,
+                        -0.06440667750309773,
+                        0.9971633364725849,
+                        -0.010107704069551294,
+                        -0.01804154487854335,
+                        -0.028815089583147022,
+                        -0.027065357686011576,
+                        -0.023900334393365197,
+                        -0.008513030950441706,
+                        -0.0003982882337528084,
+                        0.0,
+                        -0.0033246426229671605,
+                        -0.010107704069551292,
+                        0.963983856185184,
+                        -0.06428629790859326,
+                        -0.1026749896239791,
+                        -0.09644028041494716,
+                        -0.08516255272319699,
+                        -0.030333945760711172,
+                        -0.0014191953195189868,
+                        0.0,
+                        -0.011846489174763506,
+                        -0.01804154487854335,
+                        -0.06428629790859326,
+                        0.8852534541165311,
+                        -0.1832676758696622,
+                        -0.17213915595797755,
+                        -0.15200920073979574,
+                        -0.05414397176840429,
+                        -0.0025331643934503436,
+                        0.0,
+                        -0.021145154688839415,
+                        -0.028815089583147022,
+                        -0.10267498962397911,
+                        -0.1832676758696622,
+                        0.7072936639611187,
+                        -0.27493239814488213,
+                        -0.24278179979969877,
+                        -0.08647615308982999,
+                        -0.004045848590988475,
+                        0.0,
+                        -0.03377202621561769,
+                        -0.027065357686011572,
+                        -0.09644028041494716,
+                        -0.17213915595797755,
+                        -0.27493239814488213,
+                        0.7417622571051712,
+                        -0.22803941775963257,
+                        -0.08122508201589726,
+                        -0.003800173480029479,
+                        0.0,
+                        -0.03172129542299431,
+                        -0.023900334393365197,
+                        -0.08516255272319699,
+                        -0.1520092007397957,
+                        -0.24278179979969874,
+                        -0.22803941775963257,
+                        0.7986275148271769,
+                        -0.07172661983003464,
+                        -0.003355781142048049,
+                        0.0,
+                        -0.028011806708622584,
+                        -0.008513030950441708,
+                        -0.030333945760711176,
+                        -0.0541439717684043,
+                        -0.08647615308982999,
+                        -0.08122508201589727,
+                        -0.07172661983003464,
+                        0.974451782785384,
+                        -0.00119529159111239,
+                        0.0,
+                        -0.009977491258636674,
+                        -0.0003982882337528084,
+                        -0.0014191953195189868,
+                        -0.0025331643934503436,
+                        -0.004045848590988475,
+                        -0.003800173480029479,
+                        -0.003355781142048049,
+                        -0.0011952915911123897,
+                        0.99994407742913,
+                        0.0,
+                        -0.0004668040553147872,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        -0.00332464262296716,
+                        -0.011846489174763507,
+                        -0.021145154688839415,
+                        -0.03377202621561769,
+                        -0.03172129542299431,
+                        -0.028011806708622584,
+                        -0.009977491258636674,
+                        -0.0004668040553147872,
+                        0.0,
+                        0.9961034333245289
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "shape": "None"
+        }
+      ]
+    },
+    "resolved_termspec_noise": null,
+    "adaptive_regularization_diagnostics": null
+  }
+}

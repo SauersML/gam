@@ -32,6 +32,69 @@ _REQUIRED_BENCHMARK_DATASETS = {
 
 
 class RunSuiteMappingTests(unittest.TestCase):
+    def test_r_gamlss_sigma_formula_rejects_constant_sigma(self) -> None:
+        ds = {
+            "rows": [{"y": 1.0}],
+            "features": [],
+            "target": "y",
+            "family": "gaussian",
+        }
+        with self.assertRaisesRegex(RuntimeError, "requires a non-constant sigma model"):
+            _RUN_SUITE._sigma_feature_formula(ds, scenario_name="toy", backend="r_gamlss")
+
+    def test_run_external_r_gamlss_cv_supports_binomial_family(self) -> None:
+        scenario = {"name": "small_dense"}
+        ds = {
+            "family": "binomial",
+            "rows": [
+                {"x1": 0.0, "x2": 0.0, "y": 0.0},
+                {"x1": 1.0, "x2": 1.0, "y": 1.0},
+            ],
+            "features": ["x1", "x2"],
+            "target": "y",
+        }
+        folds = [SimpleNamespace(train_idx=[0], test_idx=[1])]
+        seen_scripts: list[str] = []
+        orig_run_cmd = _RUN_SUITE.run_cmd
+        orig_tempdir = _RUN_SUITE._workspace_tempdir
+        try:
+            def _fake_run_cmd(cmd, cwd=None):
+                if cmd[0] == "Rscript":
+                    script = Path(cmd[1]).read_text()
+                    seen_scripts.append(script)
+                    out_path = Path(cmd[3])
+                    out_path.write_text(
+                        json.dumps(
+                            {
+                                "status": "ok",
+                                "fit_sec": 0.1,
+                                "predict_sec": 0.01,
+                                "pred": [0.8],
+                                "sigma": [1.2],
+                                "model_spec": "gamlss(BI; sigma.formula=~ pb(x1) + pb(x2)): y ~ pb(x1)",
+                            }
+                        )
+                    )
+                    return 0, "", ""
+                return orig_run_cmd(cmd, cwd=cwd)
+
+            _RUN_SUITE.run_cmd = _fake_run_cmd
+            with tempfile.TemporaryDirectory() as td:
+                temp_root = Path(td)
+                _RUN_SUITE._workspace_tempdir = lambda prefix="": tempfile.TemporaryDirectory(
+                    prefix=prefix, dir=temp_root
+                )
+                result = _RUN_SUITE.run_external_r_gamlss_cv(scenario, ds=ds, folds=folds)
+        finally:
+            _RUN_SUITE.run_cmd = orig_run_cmd
+            _RUN_SUITE._workspace_tempdir = orig_tempdir
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["family"], "binomial")
+        self.assertTrue(any("family = fit_family" in script for script in seen_scripts))
+        self.assertTrue(any("BI()" in script for script in seen_scripts))
+
     def test_required_benchmark_datasets_exist(self) -> None:
         missing = sorted(
             dataset_name
@@ -259,6 +322,163 @@ class RunSuiteMappingTests(unittest.TestCase):
 
         self.assertNotIn(("rust_gam", "rust_gam"), seen)
         self.assertIn(("survival", "rust_gamlss_survival"), seen)
+
+    def test_main_skips_flexible_variants_for_gaussian_scenarios(self) -> None:
+        seen_rust = []
+        seen_gamlss = []
+        orig_run = _RUN_SUITE.run_rust_scenario_cv
+        orig_run_gamlss = _RUN_SUITE.run_rust_gamlss_scenario_cv
+        orig_run_gamlss_survival = _RUN_SUITE.run_rust_gamlss_survival_cv
+        orig_parse_args = _RUN_SUITE.argparse.ArgumentParser.parse_args
+        orig_dataset = _RUN_SUITE.dataset_for_scenario
+        orig_folds = _RUN_SUITE.folds_for_dataset
+        orig_assert_parity = _RUN_SUITE._assert_basis_parity_for_scenario
+        orig_shared = _RUN_SUITE.build_shared_fold_artifacts
+        orig_enabled = _RUN_SUITE._is_contender_enabled
+        orig_figures = _RUN_SUITE.generate_scenario_figures
+        orig_zip = _RUN_SUITE.zip_figure_dir
+        try:
+            def _fake_run_rust_scenario_cv(*args, **kwargs):
+                seen_rust.append(kwargs.get("contender_name", "rust_gam"))
+                return {
+                    "status": "ok",
+                    "scenario_name": "lidar_semipar",
+                    "contender": kwargs.get("contender_name", "rust_gam"),
+                    "model_spec": "cv",
+                    "evaluation": "cv",
+                }
+
+            def _fake_run_rust_gamlss_scenario_cv(*args, **kwargs):
+                seen_gamlss.append(kwargs.get("contender_name", "rust_gamlss"))
+                return {
+                    "status": "ok",
+                    "scenario_name": "lidar_semipar",
+                    "contender": kwargs.get("contender_name", "rust_gamlss"),
+                    "model_spec": "cv",
+                    "evaluation": "cv",
+                }
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                scenario_path = td_path / "scenarios.json"
+                out_path = td_path / "results.json"
+                scenario_path.write_text(json.dumps({"scenarios": [{"name": "lidar_semipar"}]}))
+
+                _RUN_SUITE.run_rust_scenario_cv = _fake_run_rust_scenario_cv
+                _RUN_SUITE.run_rust_gamlss_scenario_cv = _fake_run_rust_gamlss_scenario_cv
+                _RUN_SUITE.run_rust_gamlss_survival_cv = lambda *args, **kwargs: None
+                _RUN_SUITE.argparse.ArgumentParser.parse_args = lambda _self: SimpleNamespace(
+                    scenarios=scenario_path,
+                    out=out_path,
+                    scenario_names=None,
+                )
+                _RUN_SUITE.dataset_for_scenario = lambda _scenario: {
+                    "rows": [{"y": 0.0, "range": 0.0}],
+                    "features": ["range"],
+                    "target": "y",
+                    "family": "gaussian",
+                }
+                _RUN_SUITE.folds_for_dataset = lambda _ds: []
+                _RUN_SUITE._assert_basis_parity_for_scenario = lambda *args, **kwargs: None
+                _RUN_SUITE.build_shared_fold_artifacts = lambda *args, **kwargs: []
+                _RUN_SUITE._is_contender_enabled = (
+                    lambda _scenario, contender: contender in {"rust_gam_sas", "rust_gamlss_survival"}
+                )
+                _RUN_SUITE.generate_scenario_figures = lambda *_args, **_kwargs: []
+                _RUN_SUITE.zip_figure_dir = lambda *_args, **_kwargs: None
+                _RUN_SUITE.main()
+        finally:
+            _RUN_SUITE.run_rust_scenario_cv = orig_run
+            _RUN_SUITE.run_rust_gamlss_scenario_cv = orig_run_gamlss
+            _RUN_SUITE.run_rust_gamlss_survival_cv = orig_run_gamlss_survival
+            _RUN_SUITE.argparse.ArgumentParser.parse_args = orig_parse_args
+            _RUN_SUITE.dataset_for_scenario = orig_dataset
+            _RUN_SUITE.folds_for_dataset = orig_folds
+            _RUN_SUITE._assert_basis_parity_for_scenario = orig_assert_parity
+            _RUN_SUITE.build_shared_fold_artifacts = orig_shared
+            _RUN_SUITE._is_contender_enabled = orig_enabled
+            _RUN_SUITE.generate_scenario_figures = orig_figures
+            _RUN_SUITE.zip_figure_dir = orig_zip
+
+        self.assertIn("rust_gam", seen_rust)
+        self.assertNotIn("rust_gam_flexible", seen_rust)
+        self.assertIn("rust_gamlss", seen_gamlss)
+        self.assertNotIn("rust_gamlss_flexible", seen_gamlss)
+
+    def test_main_skips_flexible_variants_for_survival_scenarios(self) -> None:
+        seen_survival = []
+        orig_run = _RUN_SUITE.run_rust_scenario_cv
+        orig_run_gamlss = _RUN_SUITE.run_rust_gamlss_scenario_cv
+        orig_run_gamlss_survival = _RUN_SUITE.run_rust_gamlss_survival_cv
+        orig_parse_args = _RUN_SUITE.argparse.ArgumentParser.parse_args
+        orig_dataset = _RUN_SUITE.dataset_for_scenario
+        orig_folds = _RUN_SUITE.folds_for_dataset
+        orig_assert_parity = _RUN_SUITE._assert_basis_parity_for_scenario
+        orig_shared = _RUN_SUITE.build_shared_fold_artifacts
+        orig_enabled = _RUN_SUITE._is_contender_enabled
+        orig_figures = _RUN_SUITE.generate_scenario_figures
+        orig_zip = _RUN_SUITE.zip_figure_dir
+        try:
+            def _fake_run_rust_gamlss_survival_cv(*args, **kwargs):
+                seen_survival.append(kwargs.get("contender_name", "rust_gamlss_survival"))
+                return {
+                    "status": "ok",
+                    "scenario_name": "heart_failure_survival",
+                    "contender": kwargs.get("contender_name", "rust_gamlss_survival"),
+                    "model_spec": "cv",
+                    "evaluation": "cv",
+                }
+
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                scenario_path = td_path / "scenarios.json"
+                out_path = td_path / "results.json"
+                scenario_path.write_text(json.dumps({"scenarios": [{"name": "heart_failure_survival"}]}))
+
+                _RUN_SUITE.run_rust_scenario_cv = lambda *args, **kwargs: {
+                    "status": "ok",
+                    "scenario_name": "heart_failure_survival",
+                    "contender": kwargs.get("contender_name", "rust_gam"),
+                    "model_spec": "cv",
+                    "evaluation": "cv",
+                }
+                _RUN_SUITE.run_rust_gamlss_scenario_cv = lambda *args, **kwargs: None
+                _RUN_SUITE.run_rust_gamlss_survival_cv = _fake_run_rust_gamlss_survival_cv
+                _RUN_SUITE.argparse.ArgumentParser.parse_args = lambda _self: SimpleNamespace(
+                    scenarios=scenario_path,
+                    out=out_path,
+                    scenario_names=None,
+                )
+                _RUN_SUITE.dataset_for_scenario = lambda _scenario: {
+                    "rows": [{"time": 1.0, "event": 1.0, "x": 0.0}],
+                    "features": ["x"],
+                    "time_col": "time",
+                    "event_col": "event",
+                    "family": "survival",
+                }
+                _RUN_SUITE.folds_for_dataset = lambda _ds: []
+                _RUN_SUITE._assert_basis_parity_for_scenario = lambda *args, **kwargs: None
+                _RUN_SUITE.build_shared_fold_artifacts = lambda *args, **kwargs: []
+                _RUN_SUITE._is_contender_enabled = (
+                    lambda _scenario, contender: contender in {"rust_gam_sas", "rust_gamlss_survival"}
+                )
+                _RUN_SUITE.generate_scenario_figures = lambda *_args, **_kwargs: []
+                _RUN_SUITE.zip_figure_dir = lambda *_args, **_kwargs: None
+                _RUN_SUITE.main()
+        finally:
+            _RUN_SUITE.run_rust_scenario_cv = orig_run
+            _RUN_SUITE.run_rust_gamlss_scenario_cv = orig_run_gamlss
+            _RUN_SUITE.run_rust_gamlss_survival_cv = orig_run_gamlss_survival
+            _RUN_SUITE.argparse.ArgumentParser.parse_args = orig_parse_args
+            _RUN_SUITE.dataset_for_scenario = orig_dataset
+            _RUN_SUITE.folds_for_dataset = orig_folds
+            _RUN_SUITE._assert_basis_parity_for_scenario = orig_assert_parity
+            _RUN_SUITE.build_shared_fold_artifacts = orig_shared
+            _RUN_SUITE._is_contender_enabled = orig_enabled
+            _RUN_SUITE.generate_scenario_figures = orig_figures
+            _RUN_SUITE.zip_figure_dir = orig_zip
+
+        self.assertEqual(seen_survival, ["rust_gamlss_survival"])
 
 
 if __name__ == "__main__":

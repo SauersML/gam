@@ -57,6 +57,7 @@ fn tracethird_auto_correction_againstfd() {
         sas_link: None,
         optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
+        compute_inference: true,
         max_iter: 80,
         tol: 1e-6,
         nullspace_dims: vec![0, 0],
@@ -66,7 +67,7 @@ fn tracethird_auto_correction_againstfd() {
     let rho = Array1::from_vec(vec![1.0, 1.5]);
 
     unsafe {
-        std::env::setvar("GAM_DISABLE_GRAD_GATE", "1");
+        std::env::set_var("GAM_DISABLE_GRAD_GATE", "1");
     }
 
     for scale in [4.0_f64, 1.0_f64, 0.25_f64] {

@@ -3842,6 +3842,7 @@ mod tests {
         let (grad, audit) = reml_state
             .compute_gradient_analytic_for_test(&rho)
             .expect("integrated logit analytic gradient");
+        let _ = audit;
         assert!(grad.iter().all(|v| v.is_finite()));
     }
 

@@ -1245,8 +1245,11 @@ mod tests {
             1,
             Some(&[1.0]),
             &mut unit,
-            &mut |ctx: &mut ()| {},
+            &mut |ctx: &mut ()| {
+                let _ = ctx;
+            },
             &mut |ctx: &mut (), rho: &Array1<f64>| {
+                let _ = ctx;
                 if rho.iter().all(|v| v.abs() < 1e-12) {
                     Ok(f64::NAN)
                 } else {

@@ -1899,7 +1899,9 @@ mod tests {
             &mut model_local,
             crate::types::Coefficients::new(beta_init.clone()),
             &opts,
-            |info| {},
+            |info| {
+                let _ = info;
+            },
         )
         .expect("survival constrained PIRLS inner mode");
         out.beta.0
@@ -1970,6 +1972,7 @@ mod tests {
             array![1.0].view(),
             array![1.0].view(),
             |u, design_d, deriv_d, design_m| {
+                let _ = u;
                 design_d[0] = 1.0;
                 deriv_d[0] = 0.0;
                 design_m[0] = 1.0;
@@ -1991,6 +1994,7 @@ mod tests {
             array![1.0].view(),
             array![1.0].view(),
             |u, design_d, deriv_d, design_m| {
+                let _ = u;
                 design_d[0] = 1.0;
                 deriv_d[0] = 0.0;
                 design_m[0] = 1.0;

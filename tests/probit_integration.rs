@@ -40,6 +40,7 @@ fn probit_fit_and_predict_fast_integration() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![1],
@@ -51,7 +52,7 @@ fn probit_fit_and_predict_fast_integration() {
 
     assert_eq!(fit.beta.len(), 2);
     assert_eq!(fit.lambdas.len(), 1);
-    assert!(fit.edf_total.is_finite());
+    assert!(fit.edf_total().is_some_and(f64::is_finite));
 
     let pred = predict_gam(
         x.view(),
@@ -137,6 +138,7 @@ fn cloglog_fit_and_predict_fast_integration() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![1],

@@ -125,6 +125,7 @@ fn firthfd_step_size_sensitivity() {
         sas_link: None,
         optimize_sas: false,
         family: LikelihoodFamily::BinomialLogit,
+        compute_inference: true,
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![1],

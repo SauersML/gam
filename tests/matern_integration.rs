@@ -83,6 +83,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 60,
             tol: 1e-6,
             nullspace_dims: vec![],
@@ -97,7 +98,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
     // and no explicit intercept, the shrinkage block is inactive, so only the
     // primary penalty remains.
     assert_eq!(fitted.fit.lambdas.len(), 1);
-    assert!(fitted.fit.edf_total.is_finite());
+    assert!(fitted.fit.edf_total().is_some_and(f64::is_finite));
 
     let pred = predict_gam(
         fitted.design.design.view(),
@@ -168,6 +169,7 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
+            compute_inference: true,
             max_iter: 10,
             tol: 1e-4,
             nullspace_dims: vec![],

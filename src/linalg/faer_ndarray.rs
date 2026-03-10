@@ -1087,6 +1087,7 @@ mod tests {
 
         let (l, d_diag, d_subdiag, perm_fwd, perm_inv, inertia) =
             ldlt_rook(&a).expect("ldlt_rook should succeed");
+        let _ = perm_fwd;
 
         // L should be unit-lower and upper triangle should be zeroed by construction.
         for i in 0..l.nrows() {

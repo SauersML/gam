@@ -1,6 +1,7 @@
 target/
 target-codex/
 Cargo.lock
+libbuild.rmeta
 __pycache__/
 bench/**/__pycache__/
 benchmarks/**/__pycache__/
