@@ -28,6 +28,7 @@ pub use families::custom_family::{
     KnownLinkWiggle, ParameterBlockSpec, ParameterBlockState, fit_custom_family,
 };
 pub use families::gamlss::{
+    BinomialMeanWiggleFamily, BinomialMeanWiggleSpec,
     BinomialLocationScaleFamily, BinomialLocationScaleSpec, BinomialLocationScaleTermSpec,
     BinomialLocationScaleWiggleFamily, BinomialLocationScaleWiggleSpec,
     BinomialLocationScaleWiggleTermSpec, BinomialLocationScaleWiggleWorkflowConfig,
@@ -40,7 +41,7 @@ pub use families::gamlss::{
     fit_binomial_location_scale_terms, fit_binomial_location_scale_termsworkflow,
     fit_binomial_location_scalewiggle, fit_binomial_location_scalewiggle_terms,
     fit_binomial_location_scalewiggle_terms_auto, fit_binomial_logit, fit_gamma_log,
-    fit_gaussian_location_scale, fit_gaussian_location_scale_terms, fit_poisson_log,
+    fit_binomial_mean_wiggle, fit_gaussian_location_scale, fit_gaussian_location_scale_terms, fit_poisson_log,
     initializewiggle_knots_from_seed,
 };
 pub use families::strategy::{

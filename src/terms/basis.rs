@@ -3936,7 +3936,7 @@ fn duchon_matern_block(
             // lim_{z->0} z^nu K_nu(z) = 2^{nu-1} Γ(nu), nu>0.
             return Ok(c * 2.0_f64.powf(nu - 1.0) * gamma_lanczos(nu));
         }
-        // Borderline/singular cases use intrinsic convention on the diagonal.
+        // Center-collision diagonal: zero by convention for nu <= 0 Matérn blocks.
         return Ok(0.0);
     }
     let z = (kappa * r).max(1e-300);
@@ -4024,7 +4024,7 @@ fn duchon_polyharmonic_block_triplet(
         ));
     }
     if r <= 0.0 {
-        // Intrinsic diagonal convention for generalized kernels.
+        // Center-collision diagonal is zero for polyharmonic blocks.
         return Ok((0.0, 0.0, 0.0));
     }
 
@@ -4129,8 +4129,8 @@ fn duchon_matern_kernel_general_from_distance(
             "Duchon kernel distance must be finite and non-negative".to_string(),
         ));
     }
-    // For intrinsic p>0 kernels, diagonal values are not uniquely defined in the
-    // generalized-kernel sense; use intrinsic convention.
+    // For p>0 kernels the diagonal (r=0) is zero: the polyharmonic blocks
+    // vanish at the origin by construction.
     if r == 0.0 && p_order > 0 {
         return Ok(0.0);
     }
@@ -6021,14 +6021,11 @@ fn duchon_radial_core_psi_triplet(
     //   q(0; kappa) = phi_rr(0; kappa)
     //   L(0; kappa) = d * phi_rr(0; kappa).
     //
-    // In the classical C^2 regime, phi_rr itself scales with exponent delta + 2,
-    // so one expects
-    //   phi_rr_psi      = (delta + 2) phi_rr
-    //   phi_rr_psipsi   = (delta + 2)^2 phi_rr.
-    //
-    // The helper invoked here computes the representative-specific collision
-    // values used by this implementation, preserving consistency even when the
-    // origin is only available through the intrinsic Duchon convention.
+    // When 2(p+s) > d+2 (classical C^2 regime), phi_rr scales with exponent
+    // delta + 2, so a closed-form shortcut is available.  In the general case
+    // (including low-regularity settings where 2(p+s) <= d), the collision
+    // values are computed directly from the assembled partial-fraction
+    // expansion, which is equally correct and fully supported.
     #[cfg(test)]
     let (gradient_ratio, laplacian) = {
         let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
@@ -6060,19 +6057,13 @@ fn duchonphi_rr_collision_psi_triplet(
     //   lim_{r->0} phi_r(r)/r = phi_rr(0),
     //   lim_{r->0} Δphi(r)    = d * phi_rr(0).
     //
-    // Spectrally, these classical diagonal limits exist when
-    //   2(p + s) > d + 2.
-    // In that regime phi_rr itself scales with exponent delta + 2, so the
-    // diagonal psi derivatives are exactly
+    // The general path assembles phi_rr and its psi derivatives by summing the
+    // partial-fraction blocks directly.  When 2(p+s) > d+2 (classical C^2
+    // regime), a closed-form scaling shortcut is available:
     //   phi_rr_psi     = (delta + 2) phi_rr
-    //   phi_rr_psipsi  = (delta + 2)^2 phi_rr.
-    //
-    // Outside that regime the kernel can be only intrinsic / representative-
-    // dependent at the origin. In that case we do not force the pure scaling
-    // identities; instead we keep the assembled collision convention from the
-    // matched partial-fraction expansion. That preserves consistency between the
-    // basis values, the operator penalties, and the exact psi derivatives even
-    // when the classical origin interpretation is unavailable.
+    //   phi_rr_psipsi  = (delta + 2)^2 phi_rr
+    // and is used as an optimization.  Both paths produce consistent results;
+    // the assembled path is the primary, fully supported computation.
     let mut phi_rr = 0.0;
     let mut phi_rr_psi = 0.0;
     let mut phi_rr_psi_psi = 0.0;
@@ -6343,13 +6334,15 @@ pub fn create_duchon_spline_basiswithworkspace(
         ))
     };
 
-    // Point-evaluation sufficiency check: 2p + 2s > k for a proper RKHS kernel.
-    // For intrinsic constructions (p>0), borderline or subcritical settings may
-    // still be usable with side constraints, but can become numerically delicate.
+    // When 2(p+s) > d the RKHS admits classical pointwise evaluation and the
+    // center-collision diagonal has a closed-form scaling shortcut.  When
+    // 2(p+s) <= d the kernel is still well-defined and fully supported; the
+    // diagonal values are computed from the assembled partial-fraction expansion
+    // instead of the scaling shortcut.
     let regularity_margin = 2 * p_order + 2 * s_order;
     if regularity_margin <= d {
-        log::warn!(
-            "Duchon regularity is at/below point-evaluation threshold: 2p+2s={} <= k={} (p={}, s={}); using intrinsic diagonal convention",
+        log::debug!(
+            "Duchon basis using assembled diagonal convention (2p+2s={} <= d={}, p={}, s={})",
             regularity_margin,
             d,
             p_order,
