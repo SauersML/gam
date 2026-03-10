@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
-const MATRIX_FREE_PCG_MIN_P: usize = 512;
+const MATRIX_FREE_PCG_MIN_P: usize = 2048;
 const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 
