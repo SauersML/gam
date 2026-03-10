@@ -417,9 +417,8 @@ impl<'a> RemlState<'a> {
                 {
                     x_mod.scaled_add(amp, x_ij);
                 }
-                let second_components = Self::get_pairwisesecond_penalty_components(
-                    hyper_dirs, i, j,
-                );
+                let second_components =
+                    Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j);
                 Self::add_penalty_components_to_state(&mut s_mod, &second_components, amp)?;
             }
         }
@@ -720,8 +719,7 @@ impl<'a> RemlState<'a> {
             None
         };
         let solve_hvec = |rhs: &Array1<f64>| -> Array1<f64> {
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 let tmp = w_t.dot(rhs);
                 return w.dot(&tmp);
             }
@@ -734,8 +732,7 @@ impl<'a> RemlState<'a> {
             rhs_mat.column(0).to_owned()
         };
         let solve_h_mat = |rhs: &Array2<f64>| -> Array2<f64> {
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 let wt_rhs = fast_ab(w_t, rhs);
                 return fast_ab(w, &wt_rhs);
             }
@@ -747,8 +744,7 @@ impl<'a> RemlState<'a> {
             out
         };
         let trace_hdag = |a: &Array2<f64>| -> f64 {
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 let wt_a = fast_ab(w_t, a);
                 let g = fast_ab(&wt_a, w);
                 g.diag().sum()
@@ -781,8 +777,7 @@ impl<'a> RemlState<'a> {
             )
         };
         let trace_hdag_b_hdag_c = |b: &Array2<f64>, c_mat: &Array2<f64>| -> f64 {
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 let gb = fast_ab(&fast_ab(w_t, b), w);
                 let gc = fast_ab(&fast_ab(w_t, c_mat), w);
                 Self::trace_product(&gb, &gc)
@@ -1099,8 +1094,7 @@ impl<'a> RemlState<'a> {
             None
         };
         let solve_hvec = |rhs: &Array1<f64>| -> Array1<f64> {
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 let tmp = w_t.dot(rhs);
                 return w.dot(&tmp);
             }
@@ -1113,8 +1107,7 @@ impl<'a> RemlState<'a> {
             rhs_mat.column(0).to_owned()
         };
         let solve_h_mat = |rhs: &Array2<f64>| -> Array2<f64> {
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 let wt_rhs = fast_ab(w_t, rhs);
                 return fast_ab(w, &wt_rhs);
             }
@@ -1126,8 +1119,7 @@ impl<'a> RemlState<'a> {
             out
         };
         let trace_hdag = |a: &Array2<f64>| -> f64 {
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 let wt_a = fast_ab(w_t, a);
                 let g = fast_ab(&wt_a, w);
                 g.diag().sum()
@@ -1172,8 +1164,7 @@ impl<'a> RemlState<'a> {
                 )
             };
         let trace_hdag_b_hdag_c = |b: &Array2<f64>, c_mat: &Array2<f64>| -> f64 {
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 let gb = fast_ab(&fast_ab(w_t, b), w);
                 let gc = fast_ab(&fast_ab(w_t, c_mat), w);
                 Self::trace_product(&gb, &gc)
@@ -1731,8 +1722,7 @@ impl<'a> RemlState<'a> {
             if rhs.is_empty() {
                 return rhs.clone();
             }
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 // Minimum-norm active-subspace solve:
                 //   beta_tau = H_+^dagger rhs = W (W' rhs),  H_+^dagger = W W'.
                 let tmp = w_t.dot(rhs);
@@ -1750,8 +1740,7 @@ impl<'a> RemlState<'a> {
             if rhs.ncols() == 0 {
                 return rhs.clone();
             }
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 let wt_rhs = fast_ab(w_t, rhs);
                 return fast_ab(w, &wt_rhs);
             }

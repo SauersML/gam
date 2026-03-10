@@ -969,12 +969,7 @@ mod tests {
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
-        let den = mixedfd
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt()
-            .max(1e-10);
+        let den = mixedfd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-10);
         let rel = num / den;
         assert!(
             rel < 2e-1,
@@ -1291,9 +1286,7 @@ impl DirectionalHyperParam {
             .map(|row| row.as_slice())
     }
 
-    pub(crate) fn penaltysecond_componentrows(
-        &self,
-    ) -> Option<&[Vec<PenaltyDerivativeComponent>]> {
+    pub(crate) fn penaltysecond_componentrows(&self) -> Option<&[Vec<PenaltyDerivativeComponent>]> {
         self.penaltysecond_components.as_deref()
     }
 
@@ -1315,7 +1308,6 @@ impl DirectionalHyperParam {
         }
         Ok(total)
     }
-
 }
 
 #[derive(Clone, Debug)]

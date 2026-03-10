@@ -335,7 +335,7 @@ def _fit_survival_model(
         _run_cmd(fit_args, cwd=ROOT)
         return
 
-    if likelihood != "probit-location-scale":
+    if likelihood != "location-scale":
         raise RuntimeError(f"unsupported likelihood mode: {likelihood}")
     # The dedicated `gam survival` subcommand was removed; fitting via
     # `gam fit` + `Surv(...)` currently routes through transformation survival.
@@ -679,7 +679,7 @@ def generate_plot_for_dataset(
         train_path = td_path / "train.csv"
         model_path = td_path / "model.json"
         fit_df.to_csv(train_path, index=False)
-        _fit_survival_model(rust_bin, ds, train_path, model_path, likelihood="probit-location-scale")
+        _fit_survival_model(rust_bin, ds, train_path, model_path, likelihood="location-scale")
 
         def build_curve_for_current_model() -> tuple[np.ndarray, np.ndarray, int]:
             twin_idx_local = _pick_representative_twin(
@@ -714,9 +714,9 @@ def generate_plot_for_dataset(
             return times_local, surv_local, twin_idx_local
 
         times, surv, twin_idx = build_curve_for_current_model()
-        used_likelihood = "probit-location-scale"
+        used_likelihood = "location-scale"
         if _is_pathological_curve(surv):
-            print(f"[{ds.name}] fallback: probit-location-scale curve is pathological, refitting with transformation likelihood.")
+            print(f"[{ds.name}] fallback: location-scale curve is pathological, refitting with transformation likelihood.")
             _fit_survival_model(rust_bin, ds, train_path, model_path, likelihood="transformation")
             times, surv, twin_idx = build_curve_for_current_model()
             used_likelihood = "transformation"

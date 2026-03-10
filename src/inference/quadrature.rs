@@ -2195,8 +2195,12 @@ pub fn logit_posterior_meanwith_deriv_batch(
     let mut dmu = ndarray::Array1::<f64>::zeros(n);
 
     for i in 0..n {
-        let integrated =
-            integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, eta[i], se_eta[i])?;
+        let integrated = integrated_inverse_link_mean_and_derivative(
+            ctx,
+            LinkFunction::Logit,
+            eta[i],
+            se_eta[i],
+        )?;
         mu[i] = integrated.mean;
         dmu[i] = integrated.dmean_dmu;
     }
@@ -2214,9 +2218,13 @@ pub fn logit_posterior_mean_batch(
 ) -> Result<ndarray::Array1<f64>, EstimationError> {
     let mut out = ndarray::Array1::<f64>::zeros(eta.len());
     for i in 0..eta.len() {
-        out[i] =
-            integrated_inverse_link_mean_and_derivative(ctx, LinkFunction::Logit, eta[i], se_eta[i])?
-                .mean;
+        out[i] = integrated_inverse_link_mean_and_derivative(
+            ctx,
+            LinkFunction::Logit,
+            eta[i],
+            se_eta[i],
+        )?
+        .mean;
     }
     Ok(out)
 }
@@ -2723,11 +2731,7 @@ pub fn logit_posterior_meanvariance(ctx: &QuadratureContext, eta: f64, se_eta: f
 }
 
 #[inline]
-pub fn probit_posterior_meanvariance(
-    ctx: &QuadratureContext,
-    eta: f64,
-    se_eta: f64,
-) -> (f64, f64) {
+pub fn probit_posterior_meanvariance(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
     let m1 = probit_posterior_mean(eta, se_eta);
     let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
         let p = crate::probability::normal_cdf(x);

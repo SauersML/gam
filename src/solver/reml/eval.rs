@@ -498,12 +498,12 @@ impl<'a> RemlState<'a> {
         // This keeps IFT solves (B_k, B_kl) on the same spectral surface as
         // pseudo-logdet derivatives tr(H_+^dagger *), improving exactness near
         // weakly identified directions and avoiding ridge-surface mismatch.
-        let h_posw_for_solve =
-            if free_basis_opt.is_none() && bundle.h_pos_factorw.nrows() == p_dim {
-                Some(bundle.h_pos_factorw.as_ref().clone())
-            } else {
-                None
-            };
+        let h_posw_for_solve = if free_basis_opt.is_none() && bundle.h_pos_factorw.nrows() == p_dim
+        {
+            Some(bundle.h_pos_factorw.as_ref().clone())
+        } else {
+            None
+        };
         let h_posw_for_solve_t = h_posw_for_solve.as_ref().map(|w| w.t().to_owned());
         let use_cached_factor = free_basis_opt.is_none();
         let h_factor_cached = if h_posw_for_solve.is_none() && use_cached_factor {
@@ -520,8 +520,7 @@ impl<'a> RemlState<'a> {
             if rhs.ncols() == 0 {
                 return rhs.clone();
             }
-            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref())
-            {
+            if let (Some(w), Some(w_t)) = (h_posw_for_solve.as_ref(), h_posw_for_solve_t.as_ref()) {
                 let wt_rhs = fast_ab(w_t, rhs);
                 return fast_ab(w, &wt_rhs);
             }

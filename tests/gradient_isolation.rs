@@ -62,7 +62,7 @@ fn analytic_gradient_sign_matches_localcost_trend() {
     let offset = Array1::<f64>::zeros(y.len());
     let opts = default_logit_opts();
 
-    let (analytic, fd) = evaluate_externalgradients(
+    let (analytic, _) = evaluate_externalgradients(
         y.view(),
         w.view(),
         x.view(),

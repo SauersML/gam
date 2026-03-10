@@ -58,7 +58,7 @@ fn analytic_gradient_matchescost_trend() {
         firth_bias_reduction: None,
     };
 
-    let (analytic, fd) = evaluate_externalgradients(
+    let (analytic, _) = evaluate_externalgradients(
         y.view(),
         w.view(),
         x.view(),
@@ -146,7 +146,7 @@ fn hypothesis_analytic_gradient_matchescost_trend() {
     let mut considered = 0usize;
 
     for rhoval in [0.0_f64, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0] {
-        let (analytic, fd) = evaluate_externalgradients(
+        let (analytic, _) = evaluate_externalgradients(
             y.view(),
             w.view(),
             x.view(),

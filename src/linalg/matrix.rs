@@ -1155,7 +1155,8 @@ impl DesignMatrix {
     }
 
     pub fn should_use_matrix_free_pcg(&self) -> bool {
-        <Self as LinearOperator>::uses_matrix_free_pcg(self) && self.ncols() >= MATRIX_FREE_PCG_MIN_P
+        <Self as LinearOperator>::uses_matrix_free_pcg(self)
+            && self.ncols() >= MATRIX_FREE_PCG_MIN_P
     }
 
     pub fn factorize_system(
@@ -1218,7 +1219,9 @@ mod tests {
         penalty: &Array2<f64>,
         ridge: f64,
     ) -> Array1<f64> {
-        let mut h = design.t().dot(&(design * &weights.view().insert_axis(Axis(1))));
+        let mut h = design
+            .t()
+            .dot(&(design * &weights.view().insert_axis(Axis(1))));
         h += penalty;
         if ridge > 0.0 {
             for i in 0..h.nrows() {
@@ -1362,7 +1365,9 @@ mod tests {
                 exact[i]
             );
         }
-        let mut h = x.t().dot(&(x.clone() * &weights.view().insert_axis(Axis(1))));
+        let mut h = x
+            .t()
+            .dot(&(x.clone() * &weights.view().insert_axis(Axis(1))));
         h += &penalty;
         for i in 0..p {
             h[[i, i]] += ridge;
@@ -1419,8 +1424,9 @@ mod tests {
         let mut x = Array2::<f64>::zeros((n, p));
         for i in 0..n {
             for j in 0..p {
-                x[[i, j]] =
-                    (((3 * i + 5 * j + 7) % 29) as f64 / 29.0) + 0.015 * (i as f64) + 1e-4 * j as f64;
+                x[[i, j]] = (((3 * i + 5 * j + 7) % 29) as f64 / 29.0)
+                    + 0.015 * (i as f64)
+                    + 1e-4 * j as f64;
             }
         }
         let design = DesignMatrix::Dense(x.clone());

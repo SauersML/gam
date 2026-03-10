@@ -356,13 +356,7 @@ pub fn stochastic_lanczos_logdet_spd(
             .map_err(|_| "SLQ exact dense-system Cholesky failed".to_string())?;
         return Ok(2.0 * chol.diag().mapv(f64::ln).sum());
     }
-    stochastic_lanczos_logdet_spd_operator(
-        p,
-        |v| matrix.dot(v),
-        num_probes,
-        lanczos_steps,
-        seed,
-    )
+    stochastic_lanczos_logdet_spd_operator(p, |v| matrix.dot(v), num_probes, lanczos_steps, seed)
 }
 
 pub fn stochastic_lanczos_logdet_spd_operator<F>(
@@ -396,11 +390,7 @@ where
     Ok(estimate.sum() / probes as f64)
 }
 
-fn orthogonal_rademacher_probes(
-    dim: usize,
-    probes: usize,
-    rng: &mut StdRng,
-) -> Vec<Array1<f64>> {
+fn orthogonal_rademacher_probes(dim: usize, probes: usize, rng: &mut StdRng) -> Vec<Array1<f64>> {
     let block = probes.min(dim.max(1));
     let mut out = Vec::with_capacity(probes);
     while out.len() < probes {
@@ -534,8 +524,8 @@ where
             tri[[i + 1, i]] = betas[i];
         }
     }
-    let (evals, evecs) =
-        FaerEigh::eigh(&tri, Side::Lower).map_err(|e| format!("SLQ tridiagonal eig failed: {e}"))?;
+    let (evals, evecs) = FaerEigh::eigh(&tri, Side::Lower)
+        .map_err(|e| format!("SLQ tridiagonal eig failed: {e}"))?;
     let mut quad = 0.0_f64;
     for k in 0..m {
         if evals[k] <= 0.0 {
@@ -559,7 +549,11 @@ pub fn default_slq_parameters(dim: usize) -> (usize, usize) {
     } else {
         32
     };
-    let steps = if dim <= 128 { dim.max(8) } else { dim.clamp(32, 96) };
+    let steps = if dim <= 128 {
+        dim.max(8)
+    } else {
+        dim.clamp(32, 96)
+    };
     (probes, steps)
 }
 
@@ -696,11 +690,7 @@ mod tests {
 
     #[test]
     fn stochastic_lanczos_logdet_tracks_exact_spd_logdet() {
-        let h = array![
-            [5.0, 1.0, 0.2],
-            [1.0, 4.0, 0.3],
-            [0.2, 0.3, 3.5]
-        ];
+        let h = array![[5.0, 1.0, 0.2], [1.0, 4.0, 0.3], [0.2, 0.3, 3.5]];
         let exact = h.clone().cholesky(Side::Lower).expect("chol");
         let exact_logdet = 2.0 * exact.diag().mapv(f64::ln).sum();
         let approx = stochastic_lanczos_logdet_spd(&h, 16, 12, 7).expect("slq");
@@ -717,14 +707,8 @@ mod tests {
         ];
         let (probes, steps) = default_slq_parameters(h.nrows());
         let dense = stochastic_lanczos_logdet_spd(&h, probes, steps, 13).expect("dense slq");
-        let op = stochastic_lanczos_logdet_spd_operator(
-            h.nrows(),
-            |v| h.dot(v),
-            probes,
-            steps,
-            13,
-        )
-        .expect("operator slq");
+        let op = stochastic_lanczos_logdet_spd_operator(h.nrows(), |v| h.dot(v), probes, steps, 13)
+            .expect("operator slq");
         assert!((dense - op).abs() < 1e-10);
     }
 }

@@ -208,7 +208,7 @@ impl<T: AD> CoupledQuarticObjectiveFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for CoupledQuarticObjectiveFn<T> {
     const NAME: &'static str = "CoupledQuarticObjectiveFn";
 
-    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
         let rho = inputs[0];
         let lambda = rho.exp();
         let d = T::constant(self.beta2ridge);
@@ -267,33 +267,33 @@ impl CustomFamily for LowerBoundConstrainedExactFamily {
 
     fn exact_newton_joint_hessian(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[1.0]]))
     }
 
     fn exact_newton_hessian_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        block_idx: usize,
-        d_beta: &Array1<f64>,
+        _: &[ParameterBlockState],
+        _: usize,
+        _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        d_beta_flat: &Array1<f64>,
+        _: &[ParameterBlockState],
+        _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(array![[0.0]]))
     }
 
     fn block_linear_constraints(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         block_idx: usize,
-        spec: &ParameterBlockSpec,
+        _: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
         if block_idx != 0 {
             return Ok(None);
@@ -360,7 +360,7 @@ impl<T: AD> ConstrainedExactObjectiveFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for ConstrainedExactObjectiveFn<T> {
     const NAME: &'static str = "ConstrainedExactObjectiveFn";
 
-    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
         let rho = inputs[0];
         let lambda = rho.exp();
         let beta_hat = T::constant(self.lower);
@@ -444,7 +444,7 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
             |x: F1| coupled_quarticobjective_f1(x, center, quartic, beta2ridge),
             rho,
         );
-        let (value_ad, jac) = engine.derivative(&[rho]);
+        let (_, jac) = engine.derivative(&[rho]);
         let gradfd = (coupled_quarticobjective_f64(rho + 1e-6, center, quartic, beta2ridge)
             - coupled_quarticobjective_f64(rho - 1e-6, center, quartic, beta2ridge))
             / (2.0 * 1e-6);
@@ -509,11 +509,8 @@ fn exact_joint_quadratic_lamlgradient_respects_active_constraint_tangent_space()
             |x| constrained_exactobjective_numdual(x, target, lower),
             rho,
         );
-        let grad_autodiff = diff(
-            |x: F1| constrained_exactobjective_f1(x, target, lower),
-            rho,
-        );
-        let (value_ad, jac) = engine.derivative(&[rho]);
+        let grad_autodiff = diff(|x: F1| constrained_exactobjective_f1(x, target, lower), rho);
+        let (_, jac) = engine.derivative(&[rho]);
         let gradfd = (constrained_exactobjective_f64(rho + 1e-6, target, lower)
             - constrained_exactobjective_f64(rho - 1e-6, target, lower))
             / (2.0 * 1e-6);
@@ -601,7 +598,7 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
             |x: F1| coupled_quarticobjective_f1(x, center, quartic, beta2ridge),
             rho,
         );
-        let (value_ad, jac) = engine.derivative(&[rho]);
+        let (_, jac) = engine.derivative(&[rho]);
         let gradfd = (coupled_quarticobjective_f64(rho + 1e-6, center, quartic, beta2ridge)
             - coupled_quarticobjective_f64(rho - 1e-6, center, quartic, beta2ridge))
             / (2.0 * 1e-6);

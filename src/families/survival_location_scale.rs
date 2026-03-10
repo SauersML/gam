@@ -395,12 +395,12 @@ impl SurvivalLocationScaleFamily {
             .as_ref()
             .map(|_| &block_states[Self::BLOCK_LINK_WIGGLE].eta);
         if eta_time.len() != 3 * n || eta_t.len() != n || eta_ls.len() != n {
-            return Err("survival probit-location-scale eta dimension mismatch".to_string());
+            return Err("survival location-scale eta dimension mismatch".to_string());
         }
         if let Some(w) = etaw
             && w.len() != n
         {
-            return Err("survival probit-location-scale wiggle eta dimension mismatch".to_string());
+            return Err("survival location-scale wiggle eta dimension mismatch".to_string());
         }
         Ok((
             eta_time.slice(s![0..n]),
@@ -701,12 +701,12 @@ impl SurvivalLocationScaleFamily {
             Self::clamped_logwith_derivatives(g + soft, 1e-12);
         if !g.is_finite() {
             return Err(format!(
-                "survival probit-location-scale non-finite d_eta/dt at row {row}: {g}"
+                "survival location-scale non-finite d_eta/dt at row {row}: {g}"
             ));
         }
         if guard > 0.0 && g <= guard {
             return Err(format!(
-                "survival probit-location-scale monotonicity violated at row {row}: d_eta/dt={g:.3e} <= guard={:.3e}",
+                "survival location-scale monotonicity violated at row {row}: d_eta/dt={g:.3e} <= guard={:.3e}",
                 guard
             ));
         }
@@ -1046,8 +1046,7 @@ fn design_times_dense(design: &DesignMatrix, rhs: &Array2<f64>) -> Result<Array2
             let mut out = Array2::<f64>::zeros((n, q));
             for j in 0..q {
                 let col = rhs.column(j).to_owned();
-                out.column_mut(j)
-                    .assign(&design.matrixvectormultiply(&col));
+                out.column_mut(j).assign(&design.matrixvectormultiply(&col));
             }
             Ok(out)
         }
@@ -1265,13 +1264,9 @@ fn prediction_linear_predictors(
     }
     Ok(PredictionLinearPredictors {
         h: input.x_time_exit.dot(&fit.beta_time) + &input.eta_time_offset_exit,
-        eta_t: input
-            .x_threshold
-            .matrixvectormultiply(&fit.beta_threshold)
+        eta_t: input.x_threshold.matrixvectormultiply(&fit.beta_threshold)
             + &input.eta_threshold_offset,
-        eta_ls: input
-            .x_log_sigma
-            .matrixvectormultiply(&fit.beta_log_sigma)
+        eta_ls: input.x_log_sigma.matrixvectormultiply(&fit.beta_log_sigma)
             + &input.eta_log_sigma_offset,
         etaw: if let (Some(xw), Some(betaw)) = (&input.x_link_wiggle, &fit.beta_link_wiggle) {
             Some(xw.matrixvectormultiply(betaw))
@@ -2623,9 +2618,7 @@ fn var_hrow(i: usize, input: &SurvivalLocationScalePredictInput, xh_hh: &Array2<
 mod tests {
     use super::*;
     use crate::custom_family::evaluate_custom_family_joint_hyper;
-    use crate::mixture_link::{
-        state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
-    };
+    use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
     use crate::types::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, array};

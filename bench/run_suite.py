@@ -4284,7 +4284,7 @@ def run_rust_gamlss_survival_cv(
     ds: dict | None = None,
     folds: list[Fold] | None = None,
 ):
-    """Run the Rust binary with --survival-likelihood probit-location-scale for survival scenarios."""
+    """Run the Rust binary with --survival-likelihood location-scale for survival scenarios."""
     scenario_name = scenario["name"]
     if ds is None:
         ds = dataset_for_scenario(scenario)
@@ -4343,7 +4343,7 @@ def run_rust_gamlss_survival_cv(
                 str(rust_bin),
                 "fit",
                 "--survival-likelihood",
-                "probit-location-scale",
+                "location-scale",
                 "--out",
                 str(model_path),
             ]
@@ -4433,7 +4433,7 @@ def run_rust_gamlss_survival_cv(
                     "nagelkerke_r2": surv_metrics["nagelkerke_r2"],
                     "n_test": int(len(fold.test_idx)),
                     "model_spec": (
-                        f"{fit_formula} [survival-likelihood=probit-location-scale; "
+                        f"{fit_formula} [survival-likelihood=location-scale; "
                         f"risk_score={score_src}; native survival curve scoring] {_evaluation_suffix(folds)}"
                     ),
                 }

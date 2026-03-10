@@ -284,7 +284,7 @@ impl<T: AD> SasD1Fn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for SasD1Fn<T> {
     const NAME: &'static str = "SasD1Fn";
 
-    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
         vec![sas_eta_d1_ad(self.eta, inputs[0], self.log_delta)]
     }
 
@@ -321,7 +321,7 @@ impl<T: AD> SasD2Fn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for SasD2Fn<T> {
     const NAME: &'static str = "SasD2Fn";
 
-    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
         vec![sas_eta_d2_ad(self.eta, inputs[0], self.log_delta)]
     }
 
@@ -351,12 +351,9 @@ fn sas_epsilon_eta_derivative_partials_match_three_autodiff_engines() {
         let ep_m = gam::mixture_link::sas_inverse_link_jet(eta, epsilon - h, log_delta);
         let fd_d1 = (ep_p.d1 - ep_m.d1) / (2.0 * h);
 
-        let (d1val, d1_nd) =
-            first_derivative(|eps| sas_eta_d1_numdual(eta, eps, log_delta), epsilon);
-        let (d2val, d2_nd) =
-            first_derivative(|eps| sas_eta_d2_numdual(eta, eps, log_delta), epsilon);
-        let (d3val, d3_nd) =
-            first_derivative(|eps| sas_eta_d3_numdual(eta, eps, log_delta), epsilon);
+        let (_, d1_nd) = first_derivative(|eps| sas_eta_d1_numdual(eta, eps, log_delta), epsilon);
+        let (_, d2_nd) = first_derivative(|eps| sas_eta_d2_numdual(eta, eps, log_delta), epsilon);
+        let (_, d3_nd) = first_derivative(|eps| sas_eta_d3_numdual(eta, eps, log_delta), epsilon);
 
         let d1_autodiff = diff(|eps| sas_eta_d1_f1(eta, eps, log_delta), epsilon);
         let d2_autodiff = diff(|eps| sas_eta_d2_f1(eta, eps, log_delta), epsilon);
@@ -364,12 +361,12 @@ fn sas_epsilon_eta_derivative_partials_match_three_autodiff_engines() {
         let d1_std = SasD1Fn::<f64>::new(eta, log_delta);
         let d1_ad = d1_std.to_other_ad_type::<adfn<1>>();
         let d1_engine = FunctionEngine::new(d1_std, d1_ad, ForwardAD::new());
-        let (v1, jac1) = d1_engine.derivative(&[epsilon]);
+        let (_, jac1) = d1_engine.derivative(&[epsilon]);
 
         let d2_std = SasD2Fn::<f64>::new(eta, log_delta);
         let d2_ad = d2_std.to_other_ad_type::<adfn<1>>();
         let d2_engine = FunctionEngine::new(d2_std, d2_ad, ForwardAD::new());
-        let (v2, jac2) = d2_engine.derivative(&[epsilon]);
+        let (_, jac2) = d2_engine.derivative(&[epsilon]);
 
         if (eta, epsilon, log_delta) == (-1.2, -0.4, -0.3) {
             println!(
@@ -488,7 +485,7 @@ fn sas_exact_outergradient_seed19_epsilon_component_matches_profiledfd() {
     };
 
     let theta = array![0.10, 0.12, -0.18];
-    let (cost, analytic) = evaluate_external_thetacostgradient(
+    let (_, analytic) = evaluate_external_thetacostgradient(
         y.view(),
         w.view(),
         x.view(),

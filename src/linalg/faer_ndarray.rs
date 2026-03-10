@@ -660,9 +660,7 @@ pub fn ldlt_rook(
     params.pivoting = PivotingStrategy::Rook;
     let paramsspec = Spec::new(params);
     let mut mem = MemBuffer::new(factor::cholesky_in_place_scratch::<usize, f64>(
-        n,
-        par,
-        paramsspec,
+        n, par, paramsspec,
     ));
     let stack = MemStack::new(&mut mem);
 

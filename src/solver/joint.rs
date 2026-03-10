@@ -54,12 +54,13 @@ use opt::{
 /// With spectral log-det (Wood 2011), the objective is smooth regardless of ridge.
 const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 // FD audit policy for analytic gradient checks.
-// This is a debug/test guardrail only; production optimization keeps analytic
-// gradients and never switches runtime direction fields to FD.
+// Keep this in test builds only. Enabling it in ordinary debug binaries makes
+// flexible-link fits dramatically slower while providing no behavioral benefit,
+// because the runtime path already keeps the analytic gradient either way.
 const JOINT_GRAD_AUDIT_CLAMP_FRAC: f64 = 0.90;
 const JOINT_GRAD_AUDIT_WARMUP_EVALS: usize = 5;
 const JOINT_GRAD_AUDIT_INTERVAL: usize = 20;
-const JOINT_ENABLE_RUNTIME_FD_AUDIT: bool = cfg!(any(test, debug_assertions));
+const JOINT_ENABLE_RUNTIME_FD_AUDIT: bool = cfg!(test);
 
 #[inline]
 fn integrated_binomial_family_from_link(link: LinkFunction) -> Option<GlmLikelihoodFamily> {
@@ -996,7 +997,7 @@ impl<'a> JointModelState<'a> {
     pub fn irls_link_step(
         &mut self,
         bwiggle: &Array2<f64>, // Constrained wiggle basis (NOT including identity)
-        u: &Array1<f64>,        // Current linear predictor u = Xβ (used as offset)
+        u: &Array1<f64>,       // Current linear predictor u = Xβ (used as offset)
         lambda_link: f64,
         weights: &Array1<f64>,
         zworking: &Array1<f64>,
@@ -1035,7 +1036,7 @@ impl<'a> JointModelState<'a> {
     pub fn irls_base_step(
         &mut self,
         bwiggle: &Array2<f64>, // Constrained wiggle basis
-        g_prime: &Array1<f64>,  // Derivative of link: g'(u) = 1 + B'(u)·θ
+        g_prime: &Array1<f64>, // Derivative of link: g'(u) = 1 + B'(u)·θ
         lambda_base: &Array1<f64>,
         damping: f64,
         zworking: &Array1<f64>,
@@ -1048,12 +1049,12 @@ impl<'a> JointModelState<'a> {
         let u = self.base_linear_predictor();
 
         // Current η = u + Bwiggle · θ
-        let wiggle: Array1<f64> =
-            if bwiggle.ncols() > 0 && self.beta_link.len() == bwiggle.ncols() {
-                bwiggle.dot(&self.beta_link)
-            } else {
-                Array1::zeros(n)
-            };
+        let wiggle: Array1<f64> = if bwiggle.ncols() > 0 && self.beta_link.len() == bwiggle.ncols()
+        {
+            bwiggle.dot(&self.beta_link)
+        } else {
+            Array1::zeros(n)
+        };
         let eta: Array1<f64> = &u + &wiggle;
 
         // Correct working response for β update (Gauss-Newton offset):
@@ -2145,11 +2146,11 @@ impl<'a> JointRemlState<'a> {
         // out small/negative eigenvalues in the pseudo-inverse.
         use crate::faer_ndarray::FaerEigh;
         use faer::Side;
-        let (h_eigs, hvecs): (Array1<f64>, Array2<f64>) = h_mat
-            .clone()
-            .eigh(Side::Lower)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
+        let (h_eigs, hvecs): (Array1<f64>, Array2<f64>) =
+            h_mat.clone().eigh(Side::Lower).map_err(|_| {
+                EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                }
             })?;
         let h_max_eig = h_eigs.iter().cloned().fold(0.0_f64, f64::max);
         let h_tol = (h_max_eig * 1e-12).max(1e-100);
@@ -3435,8 +3436,7 @@ pub fn predict_joint(
     };
 
     // Compute η_cal = u + Bwiggle · θ
-    let eta_cal: Array1<f64> = if bwiggle.ncols() > 0 && result.beta_link.len() == bwiggle.ncols()
-    {
+    let eta_cal: Array1<f64> = if bwiggle.ncols() > 0 && result.beta_link.len() == bwiggle.ncols() {
         let wiggle = bwiggle.dot(&result.beta_link);
         eta_base + &wiggle
     } else {

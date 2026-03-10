@@ -2622,11 +2622,6 @@ pub fn run_survival_nuts_sampling_flattened<'a>(
 }
 
 /// Compute split R-hat and autocorrelation-based ESS diagnostics.
-fn compute_rhat_ess(
-    samples: &Array3<f64>,
-    _: usize,
-    _: usize,
-    _: usize,
-) -> (f64, f64) {
+fn compute_rhat_ess(samples: &Array3<f64>, _: usize, _: usize, _: usize) -> (f64, f64) {
     compute_split_rhat_and_ess(samples)
 }
