@@ -55,6 +55,9 @@ _SERIAL_ENV_OVERRIDES = (
     if _FORCE_SERIAL
     else {}
 )
+_EXPECTED_EXTERNAL_FAILURES = (RuntimeError, FileNotFoundError)
+_EXPECTED_OPTIONAL_IMPORT_FAILURES = (ImportError,)
+_EXPECTED_JSON_ARTIFACT_FAILURES = (OSError, json.JSONDecodeError, TypeError, ValueError)
 if not _FORCE_SERIAL:
     # Explicit thread controls for performance runs.
     # 0 or unset means "leave tool defaults unchanged".
@@ -94,7 +97,6 @@ NON_BLOCKING_FAILURE_CONTENDERS = {
     # but occasional fit/predict failures should not fail the whole CI shard.
     "r_gamlss",
     "rust_gamlss",
-    "rust_gamlss_survival",
     "r_gamboostlss",
     "r_bamlss",
 }
@@ -389,6 +391,10 @@ def run_cmd(cmd, cwd=None):
             env=env,
             bufsize=0,
         )
+    except Exception:
+        os.close(out_master)
+        os.close(err_master)
+        raise
     finally:
         os.close(out_slave)
         os.close(err_slave)
@@ -581,12 +587,18 @@ def exp_saturated(x: float) -> float:
     return math.exp(x)
 
 
-def nagelkerke_r2_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> float | None:
+def nagelkerke_r2_score(
+    y: np.ndarray,
+    p: np.ndarray,
+    *,
+    null_mean: float,
+    eps: float = 1e-12,
+) -> float | None:
     y_arr = np.asarray(y, dtype=float).reshape(-1)
     p_arr = np.clip(np.asarray(p, dtype=float).reshape(-1), eps, 1.0 - eps)
     if y_arr.shape != p_arr.shape or y_arr.size == 0:
         return None
-    p_mean = float(np.mean(y_arr))
+    p_mean = float(null_mean)
     if not np.isfinite(p_mean) or p_mean <= 0.0 or p_mean >= 1.0:
         return None
     ll_null = float(np.sum(y_arr * math.log(p_mean) + (1.0 - y_arr) * math.log(1.0 - p_mean)))
@@ -599,10 +611,9 @@ def nagelkerke_r2_score(y: np.ndarray, p: np.ndarray, eps: float = 1e-12) -> flo
     return float(r2_cs / max_r2_cs)
 
 
-def _survival_score_grid(train_df: pd.DataFrame, test_df: pd.DataFrame, time_col: str) -> np.ndarray:
+def _survival_score_grid(train_df: pd.DataFrame, time_col: str) -> np.ndarray:
     train_times = train_df[time_col].to_numpy(dtype=float)
-    test_times = test_df[time_col].to_numpy(dtype=float)
-    times = np.concatenate([train_times, test_times])
+    times = train_times
     times = times[np.isfinite(times) & (times > 0.0)]
     if times.size == 0:
         return np.array([0.0, 1.0], dtype=float)
@@ -694,11 +705,32 @@ def _survival_matrix_from_risk_calibration(
     return surv
 
 
+def _survival_null_curve_from_train(
+    train_df: pd.DataFrame,
+    *,
+    time_col: str,
+    event_col: str,
+    grid: np.ndarray,
+) -> np.ndarray:
+    train_times = train_df[time_col].to_numpy(dtype=float)
+    train_events = (train_df[event_col].to_numpy(dtype=float) > 0.5).astype(float)
+    finite_mask = np.isfinite(train_times) & np.isfinite(train_events) & (train_times > 0.0)
+    if int(np.sum(finite_mask)) == 0:
+        return np.ones_like(grid, dtype=float)
+    km = KaplanMeierFitter()
+    km.fit(train_times[finite_mask], event_observed=train_events[finite_mask])
+    surv = km.predict(grid).to_numpy(dtype=float)
+    surv[0] = 1.0
+    surv = np.clip(surv, 1e-12, 1.0)
+    return np.minimum.accumulate(surv)
+
+
 def survival_lifted_metrics(
     event_times: np.ndarray,
     events: np.ndarray,
     grid: np.ndarray,
     survival_matrix: np.ndarray,
+    null_survival_matrix: np.ndarray | None = None,
     eps: float = 1e-12,
 ) -> dict[str, float | None]:
     times = np.asarray(event_times, dtype=float).reshape(-1)
@@ -748,8 +780,39 @@ def survival_lifted_metrics(
     logloss = float(np.mean(log_losses))
     brier = float(np.mean(brier_losses))
 
-    grid_null = np.asarray(grid, dtype=float)
     nagelkerke = None
+    if null_survival_matrix is not None:
+        null_surv = np.asarray(null_survival_matrix, dtype=float)
+        if null_surv.ndim == 1:
+            null_surv = _repeat_survival_curve(null_surv, times.shape[0])
+        if null_surv.shape == surv.shape:
+            null_surv = np.clip(null_surv, eps, 1.0)
+            null_surv[:, 0] = 1.0
+            null_surv = np.minimum.accumulate(null_surv, axis=1)
+            null_cumhaz = -np.log(np.clip(null_surv, eps, 1.0))
+            null_haz = np.maximum(np.diff(null_cumhaz, axis=1) / dt.reshape(1, -1), 0.0)
+            null_log_losses = np.empty(times.shape[0], dtype=float)
+            for i, z in enumerate(times):
+                j = int(np.searchsorted(grid, z, side="left"))
+                if j >= grid.shape[0]:
+                    j = grid.shape[0] - 1
+                if abs(grid[j] - z) <= 1e-12:
+                    interval_idx = max(j - 1, 0)
+                    h_z = null_haz[i, interval_idx]
+                    hcum_z = null_cumhaz[i, j]
+                else:
+                    interval_idx = max(j - 1, 0)
+                    elapsed = z - grid[interval_idx]
+                    h_z = null_haz[i, interval_idx]
+                    hcum_z = null_cumhaz[i, interval_idx] + h_z * elapsed
+                null_log_losses[i] = float(hcum_z - (math.log(max(h_z, eps)) if obs[i] else 0.0))
+            ll_model = float(-np.sum(log_losses))
+            ll_null = float(-np.sum(null_log_losses))
+            n = int(times.shape[0])
+            r2_cs = 1.0 - exp_saturated((2.0 / n) * (ll_null - ll_model))
+            max_r2_cs = 1.0 - exp_saturated((2.0 / n) * ll_null)
+            if np.isfinite(r2_cs) and np.isfinite(max_r2_cs) and max_r2_cs > 0.0:
+                nagelkerke = float(r2_cs / max_r2_cs)
     return {"brier": brier, "logloss": logloss, "nagelkerke_r2": nagelkerke}
 
 
@@ -772,7 +835,7 @@ def score_survival_fold(
     else:
         if train_risk_score is None:
             raise ValueError("score_survival_fold requires train_risk_score when survival_matrix is not provided")
-        grid = _survival_score_grid(train_df, test_df, time_col)
+        grid = _survival_score_grid(train_df, time_col)
         surv = _survival_matrix_from_risk_calibration(
             train_df,
             test_df,
@@ -782,7 +845,17 @@ def score_survival_fold(
             test_risk=np.asarray(risk_score, dtype=float).reshape(-1),
             grid=grid,
         )
-    proper_metrics = survival_lifted_metrics(event_times, events, grid, surv)
+    null_surv = _repeat_survival_curve(
+        _survival_null_curve_from_train(train_df, time_col=time_col, event_col=event_col, grid=grid),
+        len(test_df),
+    )
+    proper_metrics = survival_lifted_metrics(
+        event_times,
+        events,
+        grid,
+        surv,
+        null_survival_matrix=null_surv,
+    )
     metrics: dict[str, float | None] = {
         "auc": _lifelines_cindex_from_risk(event_times, risk_score, events),
         "brier": proper_metrics["brier"],
@@ -829,6 +902,71 @@ def zscore_train_test(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_col
         tr[col] = (tr[col] - mu) / sdv
         te[col] = (te[col] - mu) / sdv
     return tr, te
+
+
+def _restricted_cubic_spline_knots(
+    train_series: pd.Series, *, n_knots: int
+) -> np.ndarray:
+    vals = train_series.to_numpy(dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size < n_knots:
+        raise RuntimeError(
+            f"cannot build restricted cubic spline with {n_knots} knots from only {vals.size} finite values"
+        )
+    probs = np.linspace(0.05, 0.95, n_knots)
+    knots = np.quantile(vals, probs)
+    knots = np.asarray(knots, dtype=float)
+    if np.unique(knots).size < n_knots:
+        raise RuntimeError(
+            f"restricted cubic spline requires {n_knots} distinct knots; got {np.unique(knots).size}"
+        )
+    return knots
+
+
+def _restricted_cubic_spline_basis(values: np.ndarray, knots: np.ndarray) -> np.ndarray:
+    x = np.asarray(values, dtype=float).reshape(-1)
+    k = np.asarray(knots, dtype=float).reshape(-1)
+    if k.size < 3:
+        raise RuntimeError("restricted cubic spline requires at least 3 knots")
+    k_last = float(k[-1])
+    k_penult = float(k[-2])
+    denom = k_last - k_penult
+    if not np.isfinite(denom) or denom <= 0.0:
+        raise RuntimeError("restricted cubic spline tail knots must be strictly increasing")
+
+    def d(arr: np.ndarray, knot: float) -> np.ndarray:
+        return np.maximum(arr - knot, 0.0) ** 3
+
+    basis_cols: list[np.ndarray] = [x]
+    for knot in k[:-2]:
+        term = d(x, float(knot))
+        term -= d(x, k_penult) * (k_last - float(knot)) / denom
+        term += d(x, k_last) * (k_penult - float(knot)) / denom
+        basis_cols.append(term)
+    return np.column_stack(basis_cols)
+
+
+def _apply_restricted_cubic_spline_train_test(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    *,
+    col: str,
+    n_knots: int,
+    prefix: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    tr = train_df.copy()
+    te = test_df.copy()
+    spline_prefix = prefix or f"{col}_rcs"
+    knots = _restricted_cubic_spline_knots(tr[col], n_knots=n_knots)
+    train_basis = _restricted_cubic_spline_basis(tr[col].to_numpy(dtype=float), knots)
+    test_basis = _restricted_cubic_spline_basis(te[col].to_numpy(dtype=float), knots)
+    basis_cols = [f"{spline_prefix}{j}" for j in range(train_basis.shape[1])]
+    for j, name in enumerate(basis_cols):
+        tr[name] = train_basis[:, j]
+        te[name] = test_basis[:, j]
+    tr = tr.drop(columns=[col])
+    te = te.drop(columns=[col])
+    return tr, te, basis_cols
 
 
 def r2_score(y: np.ndarray, mu: np.ndarray) -> float:
@@ -1128,9 +1266,9 @@ def _normalize_us48_timestamp_to_hour(ts: str) -> float:
     cleaned = (
         ts.replace(" a.m.", " AM")
         .replace(" p.m.", " PM")
-        .replace(" EST", "")
         .strip()
     )
+    cleaned = re.sub(r"\s+(?:EST|EDT)\s*$", "", cleaned, flags=re.IGNORECASE)
     dt = pd.to_datetime(cleaned, format="%m/%d/%Y %I %p", errors="coerce")
     if pd.isna(dt):
         raise ValueError(f"failed to parse timestamp '{ts}'")
@@ -1339,12 +1477,14 @@ def _synthetic_binomial_dataset(n, p, seed):
 
     rows = []
     for i in range(int(n)):
-        rows.append({"x1": float(x[i, 1]), "x2": float(x[i, 2]), "y": float(y[i])})
+        row = {f"x{j}": float(x[i, j]) for j in range(1, p)}
+        row["y"] = float(y[i])
+        rows.append(row)
 
     return {
         "family": "binomial",
         "rows": rows,
-        "features": ["x1", "x2"],
+        "features": [f"x{j}" for j in range(1, p)],
         "target": "y",
     }
 
@@ -2033,14 +2173,14 @@ def _load_hgdp_pc_with_imputed_latlon():
 
     sample_lat = []
     sample_lon = []
-    for _, row in d.iterrows():
-        lat_raw = row["Latitude"]
-        lon_raw = row["Longitude"]
+    for row in d.itertuples(index=False):
+        lat_raw = row.Latitude
+        lon_raw = row.Longitude
         if np.isfinite(lat_raw) and np.isfinite(lon_raw):
             sample_lat.append(float(lat_raw))
             sample_lon.append(float(lon_raw))
         else:
-            lat_i, lon_i = subpop_to_latlon[str(row["Subpopulation"])]
+            lat_i, lon_i = subpop_to_latlon[str(row.Subpopulation)]
             sample_lat.append(lat_i)
             sample_lon.append(lon_i)
     d["lat_imputed"] = np.asarray(sample_lat, dtype=float)
@@ -2078,9 +2218,9 @@ def _geo_latlon_dataset(mode_code, seed=20260401, prevalence_min=0.01, prevalenc
     y = (rng.random(len(d)) < p).astype(float)
 
     rows = []
-    for i, row in d.iterrows():
-        out = {f"pc{j}": float(row[f"PC{j}"]) for j in range(1, 7)}
-        out["y"] = float(y[i])
+    for pos, row in enumerate(d.itertuples(index=False)):
+        out = {f"pc{j}": float(getattr(row, f"PC{j}")) for j in range(1, 7)}
+        out["y"] = float(y[pos])
         rows.append(out)
     return {
         "family": "binomial",
@@ -2347,7 +2487,7 @@ def _dataset_for_scenario_unvalidated(s):
         return _load_us48_demand_dataset("five_day.csv")
     if name == "us48_demand_31day":
         return _load_us48_demand_dataset("31_day.csv")
-    if name == "haberman_survival":
+    if name == "haberman_5yr":
         return _load_haberman_dataset()
     if name == "icu_survival_death":
         return _load_icu_survival_death_dataset()
@@ -2568,6 +2708,128 @@ def aggregate_cv_rows(cv_rows, family):
     }
 
 
+def _init_plot_payload(ds: dict) -> dict:
+    family = str(ds["family"])
+    features = [str(c) for c in ds.get("features", [])]
+    primary_feature = features[0] if len(features) == 1 else None
+    payload = {
+        "family": family,
+        "features": features,
+        "primary_feature": primary_feature,
+        "x": [],
+    }
+    if family == "survival":
+        payload.update(
+            {
+                "time_col": str(ds["time_col"]),
+                "event_col": str(ds["event_col"]),
+                "time": [],
+                "event": [],
+                "risk": [],
+                "pred_time": [],
+            }
+        )
+    else:
+        payload.update(
+            {
+                "target": str(ds["target"]),
+                "actual": [],
+                "predicted": [],
+            }
+        )
+    return payload
+
+
+def _append_supervised_plot_fold(payload: dict, test_df: pd.DataFrame, pred: np.ndarray, target_col: str) -> None:
+    y_true = test_df[target_col].to_numpy(dtype=float).reshape(-1)
+    y_pred = np.asarray(pred, dtype=float).reshape(-1)
+    if y_true.shape[0] != y_pred.shape[0]:
+        raise RuntimeError(
+            f"plot payload supervised fold length mismatch: actual={y_true.shape[0]}, predicted={y_pred.shape[0]}"
+        )
+    payload["actual"].extend(float(v) for v in y_true)
+    payload["predicted"].extend(float(v) for v in y_pred)
+    primary_feature = payload.get("primary_feature")
+    if primary_feature:
+        x = test_df[str(primary_feature)].to_numpy(dtype=float).reshape(-1)
+        payload["x"].extend(float(v) for v in x)
+
+
+def _append_survival_plot_fold(
+    payload: dict,
+    test_df: pd.DataFrame,
+    *,
+    time_col: str,
+    event_col: str,
+    risk_score: np.ndarray,
+    pred_time: np.ndarray | None = None,
+) -> None:
+    times = test_df[time_col].to_numpy(dtype=float).reshape(-1)
+    events = test_df[event_col].to_numpy(dtype=float).reshape(-1)
+    risk = np.asarray(risk_score, dtype=float).reshape(-1)
+    if times.shape[0] != risk.shape[0] or events.shape[0] != risk.shape[0]:
+        raise RuntimeError(
+            "plot payload survival fold length mismatch: "
+            f"time={times.shape[0]}, event={events.shape[0]}, risk={risk.shape[0]}"
+        )
+    payload["time"].extend(float(v) for v in times)
+    payload["event"].extend(float(v) for v in events)
+    payload["risk"].extend(float(v) for v in risk)
+    primary_feature = payload.get("primary_feature")
+    if primary_feature:
+        x = test_df[str(primary_feature)].to_numpy(dtype=float).reshape(-1)
+        payload["x"].extend(float(v) for v in x)
+    if pred_time is not None:
+        pred_time_arr = np.asarray(pred_time, dtype=float).reshape(-1)
+        if pred_time_arr.shape[0] != risk.shape[0]:
+            raise RuntimeError(
+                f"plot payload predicted-time length mismatch: pred_time={pred_time_arr.shape[0]}, risk={risk.shape[0]}"
+            )
+        payload["pred_time"].extend(float(v) for v in pred_time_arr)
+
+
+def _finalize_plot_payload(payload: dict) -> dict | None:
+    family = payload.get("family")
+    if family == "survival":
+        n = len(payload.get("time", []))
+        if n == 0:
+            return None
+        if not payload.get("pred_time"):
+            payload["pred_time"] = None
+        return payload
+    n = len(payload.get("actual", []))
+    if n == 0:
+        return None
+    return payload
+
+
+def _finalize_cv_result(
+    *,
+    contender: str,
+    scenario_name: str,
+    family: str,
+    cv_rows: list[dict],
+    plot_payload: dict | None,
+    model_spec: str,
+    extra_metrics: dict | None = None,
+) -> dict:
+    metrics = aggregate_cv_rows(cv_rows, family)
+    if extra_metrics:
+        metrics.update(extra_metrics)
+    n_folds = len(cv_rows)
+    return {
+        "contender": contender,
+        "family": family,
+        "scenario_name": scenario_name,
+        "status": "ok",
+        "n_folds": int(n_folds),
+        "evaluation": _evaluation_label([None] * n_folds),
+        **metrics,
+        "model_spec": model_spec,
+        "plot_payload": _finalize_plot_payload(plot_payload) if plot_payload is not None else None,
+    }
+
+
 def _rust_fit_mapping(scenario_name):
     geo_eas_cfg = _geo_disease_eas_scenario_cfg(scenario_name)
     papuan_cfg = _papuan_oce_scenario_cfg(scenario_name)
@@ -2664,7 +2926,7 @@ def _rust_fit_mapping(scenario_name):
             smooth_basis="ps",
             knots=12,
         ),
-        "haberman_survival": dict(
+        "haberman_5yr": dict(
             family="binomial-logit",
             smooth_cols=["age", "op_year", "axil_nodes"],
             linear_cols=[],
@@ -3292,14 +3554,6 @@ def _rust_survival_fit_options_for_scenario(scenario_name):
             "time_smooth_lambda": 1e-2,
             "ridge_lambda": 1e-6,
         }
-    if scenario_name == "haberman_survival":
-        return {
-            "time_basis": "ispline",
-            "time_degree": 3,
-            "time_num_internal_knots": 6,
-            "time_smooth_lambda": 2e-2,
-            "ridge_lambda": 1e-6,
-        }
     return {
         "time_basis": "ispline",
         "time_degree": 3,
@@ -3410,7 +3664,7 @@ def run_rust_scenario_cv(
 
     try:
         rust_bin = _ensure_rust_binary()
-    except Exception as e:
+    except _EXPECTED_EXTERNAL_FAILURES as e:
         return {
             "contender": contender_name,
             "scenario_name": scenario_name,
@@ -3420,6 +3674,7 @@ def run_rust_scenario_cv(
 
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
+    plot_payload = _init_plot_payload(ds)
     eval_suffix = _evaluation_suffix(folds)
     ood_rows = []
     continuous_rows = []
@@ -3433,7 +3688,6 @@ def run_rust_scenario_cv(
         for fold_id, fold in enumerate(folds):
             train_df = base_df.iloc[fold.train_idx].copy()
             test_df = base_df.iloc[fold.test_idx].copy()
-            test_eval_df = test_df.copy()
             model_path = td_path / f"model_{fold_id}.json"
             pred_path = td_path / f"pred_{fold_id}.csv"
             shared_artifact = (
@@ -3442,86 +3696,36 @@ def run_rust_scenario_cv(
                 else None
             )
 
-            if ds["family"] == "survival":
+            if shared_artifact is not None:
+                train_path = shared_artifact.train_scaled_csv
+                test_path = shared_artifact.test_scaled_csv
+            else:
                 train_path = td_path / f"train_{fold_id}.csv"
                 test_path = td_path / f"test_{fold_id}.csv"
-                for col in ds["features"]:
-                    mu = float(train_df[col].mean())
-                    sdv = float(train_df[col].std())
-                    if (not np.isfinite(sdv)) or sdv < 1e-8:
-                        sdv = 1.0
-                    train_df[col] = (train_df[col] - mu) / sdv
-                    test_df[col] = (test_df[col] - mu) / sdv
-                train_df["__entry"] = 0.0
-                # Rust survival predict requires an explicit evaluation time.
-                horizon = _survival_eval_horizon(train_df, ds["time_col"])
-                test_pred_df = test_df.copy()
-                test_pred_df["__entry"] = 0.0
-                test_pred_df[ds["time_col"]] = horizon
+                train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
                 train_df.to_csv(train_path, index=False)
-                test_pred_df.to_csv(test_path, index=False)
-                rhs_formula = _rust_survival_formula_for_scenario(scenario_name)
-                fit_formula = (
-                    f"Surv(__entry, {ds['time_col']}, {ds['event_col']}) ~ {rhs_formula}"
-                )
-                fit_cmd = [
-                    str(rust_bin),
-                    "fit",
-                    "--out",
-                    str(model_path),
-                ]
-                fit_cmd.extend(_rust_survival_fit_cli_args(scenario_name))
-            else:
-                if shared_artifact is not None:
-                    train_path = shared_artifact.train_scaled_csv
-                    test_path = shared_artifact.test_scaled_csv
-                else:
-                    train_path = td_path / f"train_{fold_id}.csv"
-                    test_path = td_path / f"test_{fold_id}.csv"
-                    train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
-                    train_df.to_csv(train_path, index=False)
-                    test_df.to_csv(test_path, index=False)
-                _family, formula = _rust_formula_for_scenario(
-                    scenario_name,
-                    ds,
-                    cfg_override=rust_cfg_override,
-                )
-                if ds["family"] == "binomial" and binomial_link:
-                    formula = _append_formula_link_term(formula, binomial_link)
-                    fit_cmd = [
-                        str(rust_bin),
-                        "fit",
-                        "--out",
-                        str(model_path),
-                    ]
-                else:
-                    fit_cmd = [
-                        str(rust_bin),
-                        "fit",
-                        "--out",
-                        str(model_path),
-                    ]
+                test_df.to_csv(test_path, index=False)
+            _family, formula = _rust_formula_for_scenario(
+                scenario_name,
+                ds,
+                cfg_override=rust_cfg_override,
+            )
+            if ds["family"] == "binomial" and binomial_link:
+                formula = _append_formula_link_term(formula, binomial_link)
+            fit_cmd = [
+                str(rust_bin),
+                "fit",
+                "--out",
+                str(model_path),
+            ]
 
             if rust_fit_extra_args:
                 fit_cmd.extend([str(x) for x in rust_fit_extra_args])
             fit_cmd.extend(["--no-summary"])
-            fit_cmd.extend([str(train_path), fit_formula if ds["family"] == "survival" else formula])
-
-            def _looks_like_missing_csv(msg: str) -> bool:
-                m = (msg or "").lower()
-                return ("failed to open csv" in m) and ("no such file or directory" in m)
-
-            def _ensure_fold_csvs():
-                if ds["family"] == "survival":
-                    train_df.to_csv(train_path, index=False)
-                    test_df.to_csv(test_path, index=False)
+            fit_cmd.extend([str(train_path), formula])
 
             t0 = perf_counter()
             code, out, err = run_cmd(fit_cmd, cwd=ROOT)
-            # Defensive retry for sporadic CI file-not-found while opening fold CSVs.
-            if code != 0 and _looks_like_missing_csv(err or out):
-                _ensure_fold_csvs()
-                code, out, err = run_cmd(fit_cmd, cwd=ROOT)
             fit_sec = perf_counter() - t0
             if code != 0:
                 return {
@@ -3559,9 +3763,6 @@ def run_rust_scenario_cv(
             ]
             t1 = perf_counter()
             code, out, err = run_cmd(pred_cmd, cwd=ROOT)
-            if code != 0 and _looks_like_missing_csv(err or out):
-                _ensure_fold_csvs()
-                code, out, err = run_cmd(pred_cmd, cwd=ROOT)
             pred_sec = perf_counter() - t1
             if code != 0:
                 return {
@@ -3582,6 +3783,8 @@ def run_rust_scenario_cv(
 
             if ds["family"] == "binomial":
                 y_test = test_df[ds["target"]].to_numpy(dtype=float)
+                y_train = train_df[ds["target"]].to_numpy(dtype=float)
+                _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
@@ -3589,7 +3792,7 @@ def run_rust_scenario_cv(
                         "auc": auc_score(y_test, pred),
                         "brier": brier_score(y_test, pred),
                         "logloss": log_loss_score(y_test, pred),
-                        "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
+                        "nagelkerke_r2": nagelkerke_r2_score(y_test, pred, null_mean=float(np.mean(y_train))),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": (
                             f"gam fit/predict via release binary {eval_suffix}"
@@ -3634,6 +3837,7 @@ def run_rust_scenario_cv(
                                 )
             elif ds["family"] == "gaussian":
                 y_test = test_df[ds["target"]].to_numpy(dtype=float)
+                _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
                 try:
                     if model_payload is None:
                         model_payload = json.loads(model_path.read_text())
@@ -3643,7 +3847,7 @@ def run_rust_scenario_cv(
                         "standard_deviation", None
                     )
                     sigma_hat = float(sigma_hat_raw)
-                except Exception as e:
+                except _EXPECTED_JSON_ARTIFACT_FAILURES as e:
                     return {
                         "contender": contender_name,
                         "scenario_name": scenario_name,
@@ -3695,7 +3899,7 @@ def run_rust_scenario_cv(
                         "error": str(e),
                     }
                 try:
-                    survival_grid = _survival_score_grid(train_df, test_eval_df, ds["time_col"])
+                    survival_grid = _survival_score_grid(train_df, ds["time_col"])
                     survival_matrix = _rust_native_survival_matrix_from_model(
                         rust_bin=rust_bin,
                         model_path=model_path,
@@ -3719,6 +3923,13 @@ def run_rust_scenario_cv(
                     risk_score=risk_score,
                     survival_grid=survival_grid,
                     survival_matrix=survival_matrix,
+                )
+                _append_survival_plot_fold(
+                    plot_payload,
+                    test_eval_df,
+                    time_col=ds["time_col"],
+                    event_col=ds["event_col"],
+                    risk_score=risk_score,
                 )
                 cv_rows.append(
                     {
@@ -3836,6 +4047,7 @@ def run_rust_scenario_cv(
         "status": "ok",
         **metrics,
         "model_spec": cv_rows[0]["model_spec"],
+        "plot_payload": _finalize_plot_payload(plot_payload),
     }
 
 
@@ -3886,7 +4098,7 @@ def _run_rust_gamlss_scenario_cv_variant(
 
     try:
         rust_bin = _ensure_rust_binary()
-    except Exception as e:
+    except _EXPECTED_EXTERNAL_FAILURES as e:
         return {
             "contender": contender_name,
             "scenario_name": scenario_name,
@@ -3896,9 +4108,12 @@ def _run_rust_gamlss_scenario_cv_variant(
 
     _, mean_formula = _rust_formula_for_scenario(scenario_name, ds)
     cli_family = binomial_cli_family if family == "binomial" else "gaussian"
+    if family == "binomial":
+        mean_formula = _append_formula_link_term(mean_formula, cli_family)
     binom_extra = list(binomial_extra_fit_args or [])
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
+    plot_payload = _init_plot_payload(ds)
     eval_suffix = _evaluation_suffix(folds)
 
     with tempfile.TemporaryDirectory(prefix="gam_bench_rust_gamlss_cv_", dir=str(BENCH_DIR)) as td:
@@ -3922,7 +4137,7 @@ def _run_rust_gamlss_scenario_cv_variant(
                 train_df.to_csv(train_path, index=False)
                 test_df.to_csv(test_path, index=False)
             sigma_rhs = _sigma_feature_rhs(ds, scenario_name, n_train=len(fold.train_idx))
-            noise_formula = "y ~ " + (
+            noise_formula = f"{ds['target']} ~ " + (
                 " + ".join(f"linear({c})" for c in sigma_rhs.split(" + ")) if sigma_rhs != "1" else "1"
             )
             model_path = td_path / f"model_{fold_id}.json"
@@ -3991,8 +4206,15 @@ def _run_rust_gamlss_scenario_cv_variant(
                 }
             pred = pred_df["mean"].to_numpy(dtype=float)
             y_test = test_df[ds["target"]].to_numpy(dtype=float)
+            _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
 
             if family == "binomial":
+                # For binomial location-scale models, the Rust predictor's "mean"
+                # column is already the final event probability implied by the
+                # joint threshold/log-sigma model. Proper scoring rules are
+                # therefore evaluated on this probability, not on a separate
+                # standalone sigma output.
+                y_train = train_df[ds["target"]].to_numpy(dtype=float)
                 cv_rows.append(
                     {
                         "fit_sec": float(fit_sec),
@@ -4000,7 +4222,7 @@ def _run_rust_gamlss_scenario_cv_variant(
                         "auc": auc_score(y_test, pred),
                         "brier": brier_score(y_test, pred),
                         "logloss": log_loss_score(y_test, pred),
-                        "nagelkerke_r2": nagelkerke_r2_score(y_test, pred),
+                        "nagelkerke_r2": nagelkerke_r2_score(y_test, pred, null_mean=float(np.mean(y_train))),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": f"{binomial_model_spec_label} {eval_suffix}",
                     }
@@ -4070,15 +4292,14 @@ def _run_rust_gamlss_scenario_cv_variant(
             "error": "no cross-validation folds generated for scenario",
         }
 
-    metrics = aggregate_cv_rows(cv_rows, family)
-    return {
-        "contender": contender_name,
-        "family": family,
-        "scenario_name": scenario_name,
-        "status": "ok",
-        **metrics,
-        "model_spec": cv_rows[0]["model_spec"],
-    }
+    return _finalize_cv_result(
+        contender=contender_name,
+        scenario_name=scenario_name,
+        family=family,
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=cv_rows[0]["model_spec"],
+    )
 
 
 def run_rust_gamlss_scenario_cv(
@@ -4092,7 +4313,7 @@ def run_rust_gamlss_scenario_cv(
         scenario,
         contender_name="rust_gamlss",
         binomial_cli_family="binomial-probit",
-        binomial_model_spec_label="gamlss binomial-probit location-scale via release binary",
+        binomial_model_spec_label="gamlss binomial-probit location-scale mean-probability via release binary",
         ds=ds,
         folds=folds,
         shared_fold_artifacts=shared_fold_artifacts,
@@ -4116,7 +4337,7 @@ def run_rust_gamlss_survival_cv(
 
     try:
         rust_bin = _ensure_rust_binary()
-    except Exception as e:
+    except _EXPECTED_EXTERNAL_FAILURES as e:
         return {
             "contender": "rust_gamlss_survival",
             "scenario_name": scenario_name,
@@ -4126,6 +4347,7 @@ def run_rust_gamlss_survival_cv(
 
     base_df = pd.DataFrame(ds["rows"])
     cv_rows = []
+    plot_payload = _init_plot_payload(ds)
 
     with tempfile.TemporaryDirectory(prefix="gam_bench_rust_gamlss_surv_cv_", dir=str(BENCH_DIR)) as td:
         td_path = Path(td)
@@ -4210,7 +4432,7 @@ def run_rust_gamlss_survival_cv(
                     "error": str(e),
                 }
             try:
-                survival_grid = _survival_score_grid(train_df, test_eval_df, ds["time_col"])
+                survival_grid = _survival_score_grid(train_df, ds["time_col"])
                 survival_matrix = _rust_native_survival_matrix_from_model(
                     rust_bin=rust_bin,
                     model_path=model_path,
@@ -4235,6 +4457,13 @@ def run_rust_gamlss_survival_cv(
                 survival_grid=survival_grid,
                 survival_matrix=survival_matrix,
             )
+            _append_survival_plot_fold(
+                plot_payload,
+                test_eval_df,
+                time_col=ds["time_col"],
+                event_col=ds["event_col"],
+                risk_score=risk_score,
+            )
             cv_rows.append(
                 {
                     "fit_sec": float(fit_sec),
@@ -4246,7 +4475,7 @@ def run_rust_gamlss_survival_cv(
                     "n_test": int(len(fold.test_idx)),
                         "model_spec": (
                             "survival probit-location-scale via release binary "
-                            f"(c-index on risk score from '{score_src}'; native survival curve scoring) [5-fold CV]"
+                            f"(c-index on risk score from '{score_src}'; native survival curve scoring) {_evaluation_suffix(folds)}"
                     ),
                 }
             )
@@ -4260,15 +4489,14 @@ def run_rust_gamlss_survival_cv(
             "error": "no cross-validation folds generated for scenario",
         }
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "rust_gamlss_survival",
-        "family": ds["family"],
-        "scenario_name": scenario_name,
-        "status": "ok",
-        **metrics,
-        "model_spec": cv_rows[0]["model_spec"],
-    }
+    return _finalize_cv_result(
+        contender="rust_gamlss_survival",
+        scenario_name=scenario_name,
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=cv_rows[0]["model_spec"],
+    )
 
 
 def _is_gamlss_benchmark_scenario(scenario_name: str) -> bool:
@@ -4289,14 +4517,17 @@ def _gamlss_mu_formula_for_scenario(scenario_name: str, ds):
 
     terms = [str(c) for c in cfg.get("linear_cols", [])]
     knot_count = max(4, int(cfg.get("knots", 8)))
+    knot_expr = f"max(1, min({knot_count}, nrow(train_df)-1))"
     smooth_cols = cfg.get("smooth_cols")
     if smooth_cols:
         for col in smooth_cols:
-            # R gamlss::pb uses df (effective basis dimension control).
-            terms.append(f"pb({col}, df=min({knot_count}, nrow(train_df)-1))")
+            # Use the scenario knot count as an actual spline-basis size control
+            # rather than misusing pb(..., df=...) as if it were equivalent to
+            # mgcv/Rust basis rank.
+            terms.append(f"pb({col}, inter={knot_expr})")
     elif cfg.get("smooth_col"):
         col = cfg["smooth_col"]
-        terms.append(f"pb({col}, df=min({knot_count}, nrow(train_df)-1))")
+        terms.append(f"pb({col}, inter={knot_expr})")
 
     if not terms:
         return None
@@ -4309,8 +4540,6 @@ def _sigma_feature_rhs(
     *,
     n_train: int | None = None,
 ) -> str:
-    if ds.get("family") == "binomial":
-        return "1"
     features = [str(c) for c in ds.get("features", [])]
     return " + ".join(features) if features else "1"
 
@@ -4332,7 +4561,7 @@ def run_external_r_gamlss_cv(scenario, *, ds: dict | None = None, folds: list[Fo
     if ds is None:
         ds = dataset_for_scenario(scenario)
     family = ds["family"]
-    if family not in ("binomial", "gaussian"):
+    if family != "gaussian":
         return None
     if folds is None:
         folds = folds_for_dataset(ds)
@@ -4373,13 +4602,12 @@ df <- as.data.frame(payload$dataset$rows)
 target_name <- as.character(payload$dataset$target)
 mu_formula <- as.character(payload$mu_formula)
 sigma_formula <- as.formula(as.character(payload$sigma_formula))
-family_name <- as.character(payload$dataset$family)
-
 train_idx <- scan(train_idx_path, what=integer(), quiet=TRUE) + 1L
 test_idx <- scan(test_idx_path, what=integer(), quiet=TRUE) + 1L
 
 train_df <- df[train_idx, , drop=FALSE]
 test_df <- df[test_idx, , drop=FALSE]
+y_train <- as.numeric(df[[target_name]])[train_idx]
 y_test <- as.numeric(df[[target_name]])[test_idx]
 
 feature_cols <- as.character(payload$dataset$features)
@@ -4391,21 +4619,13 @@ for (cn in feature_cols) {
   test_df[[cn]] <- (test_df[[cn]] - mu) / sdv
 }
 
-# Choose gamlss family based on dataset family.
-if (family_name == "gaussian") {
-  gamlss_family <- NO()
-} else {
-  gamlss_family <- BI()
-}
-# Keep scale model aligned with Rust GAMLSS benchmark path.
-
 t0 <- proc.time()[["elapsed"]]
 fit_formula <- mu_formula
 fit <- tryCatch(
   gamlss(
     as.formula(fit_formula),
     sigma.formula = sigma_formula,
-    family = gamlss_family,
+    family = NO(),
     data = train_df,
     control = gamlss.control(n.cyc=200, trace=FALSE)
   ),
@@ -4438,94 +4658,53 @@ if (inherits(p, "error")) {
   quit(save="no")
 }
 
-if (family_name == "gaussian") {
-  # Gaussian metrics with per-obs sigma from the sigma sub-model.
-  sigma_hat <- tryCatch(
-    pmax(as.numeric(predict(fit, newdata=test_df, what="sigma", type="response")), 1e-12),
-    error = function(e) e
-  )
-  if (inherits(sigma_hat, "error")) {
-    out <- list(status="failed", error=paste0("r_gamlss sigma predict failed: ", conditionMessage(sigma_hat)))
-    write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
-    quit(save="no")
-  }
-  if (length(sigma_hat) != length(y_test)) {
-    out <- list(
-      status="failed",
-      error=paste0("r_gamlss sigma length mismatch (got ", length(sigma_hat), ", expected ", length(y_test), ")")
-    )
-    write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
-    quit(save="no")
-  }
-  if (any(!is.finite(sigma_hat) | sigma_hat <= 0)) {
-    out <- list(status="failed", error="r_gamlss sigma has non-finite or non-positive values")
-    write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
-    quit(save="no")
-  }
-  rmse <- sqrt(mean((y_test - p)^2))
-  mae <- mean(abs(y_test - p))
-  sst <- sum((y_test - mean(y_test))^2)
-  r2 <- if (sst <= 0) 0.0 else 1.0 - sum((y_test - p)^2) / sst
-  logloss <- mean(0.5 * log(2 * pi * sigma_hat^2) + ((y_test - p)^2) / (2 * sigma_hat^2))
-  out <- list(
-    status="ok",
-    fit_sec=fit_sec,
-    predict_sec=pred_sec,
-    auc=NULL,
-    brier=NULL,
-    logloss=logloss,
-    nagelkerke_r2=NULL,
-    rmse=rmse,
-    mae=mae,
-    r2=r2,
-    model_spec=paste0("gamlss(NO; sigma.formula=", deparse(sigma_formula), "): ", fit_formula)
-  )
-} else {
-  # Binomial metrics (original behavior).
-  p_safe <- pmin(pmax(p, 1e-12), 1 - 1e-12)
-  ord <- order(p)
-  yy <- y_test[ord]
-  n_pos <- sum(yy > 0.5)
-  n_neg <- sum(yy <= 0.5)
-  if (n_pos == 0 || n_neg == 0) {
-    auc <- 0.5
-  } else {
-    ranks <- seq_along(yy)
-    rank_sum_pos <- sum(ranks[yy > 0.5])
-    auc <- (rank_sum_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
-  }
-  brier <- mean((y_test - p)^2)
-  logloss <- mean(-(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe)))
-  p_mean <- mean(y_test)
-  if (is.finite(p_mean) && p_mean > 0 && p_mean < 1) {
-    ll_null <- sum(y_test * log(p_mean) + (1 - y_test) * log(1 - p_mean))
-    ll_model <- sum(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe))
-    n_obs <- length(y_test)
-    r2_cs <- 1 - exp((2 / n_obs) * (ll_null - ll_model))
-    max_r2_cs <- 1 - exp((2 / n_obs) * ll_null)
-    nagelkerke_r2 <- if (max_r2_cs > 0) r2_cs / max_r2_cs else NULL
-  } else {
-    nagelkerke_r2 <- NULL
-  }
-  out <- list(
-    status="ok",
-    fit_sec=fit_sec,
-    predict_sec=pred_sec,
-    auc=auc,
-    brier=brier,
-    logloss=logloss,
-    nagelkerke_r2=nagelkerke_r2,
-    rmse=NULL,
-    mae=NULL,
-    r2=NULL,
-    model_spec=paste0("gamlss(BI; sigma.formula=", deparse(sigma_formula), "): ", fit_formula)
-  )
+sigma_hat <- tryCatch(
+  pmax(as.numeric(predict(fit, newdata=test_df, what="sigma", type="response")), 1e-12),
+  error = function(e) e
+)
+if (inherits(sigma_hat, "error")) {
+  out <- list(status="failed", error=paste0("r_gamlss sigma predict failed: ", conditionMessage(sigma_hat)))
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
 }
+if (length(sigma_hat) != length(y_test)) {
+  out <- list(
+    status="failed",
+    error=paste0("r_gamlss sigma length mismatch (got ", length(sigma_hat), ", expected ", length(y_test), ")")
+  )
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+if (any(!is.finite(sigma_hat) | sigma_hat <= 0)) {
+  out <- list(status="failed", error="r_gamlss sigma has non-finite or non-positive values")
+  write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
+  quit(save="no")
+}
+rmse <- sqrt(mean((y_test - p)^2))
+mae <- mean(abs(y_test - p))
+sst <- sum((y_test - mean(y_test))^2)
+r2 <- if (sst <= 0) 0.0 else 1.0 - sum((y_test - p)^2) / sst
+logloss <- mean(0.5 * log(2 * pi * sigma_hat^2) + ((y_test - p)^2) / (2 * sigma_hat^2))
+out <- list(
+  status="ok",
+  fit_sec=fit_sec,
+  predict_sec=pred_sec,
+  pred=as.numeric(p),
+  auc=NULL,
+  brier=NULL,
+  logloss=logloss,
+  nagelkerke_r2=NULL,
+  rmse=rmse,
+  mae=mae,
+  r2=r2,
+  model_spec=paste0("gamlss(NO; sigma.formula=", deparse(sigma_formula), "): ", fit_formula)
+)
 write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
 '''
         script_path.write_text(script)
 
         cv_rows = []
+        plot_payload = _init_plot_payload(ds)
         for fold_id, fold in enumerate(folds):
             train_idx_path = td_path / f"train_idx_{fold_id}.txt"
             test_idx_path = td_path / f"test_idx_{fold_id}.txt"
@@ -4566,18 +4745,35 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     "n_folds": int(len(folds)),
                     "error": str(fold_row.get("error", "r_gamlss fold failed")),
                 }
+            pred = np.asarray(fold_row.get("pred", []), dtype=float).reshape(-1)
+            if pred.shape[0] != len(fold.test_idx):
+                return {
+                    "contender": "r_gamlss",
+                    "scenario_name": scenario_name,
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
+                    "error": (
+                        "r_gamlss fold output missing/invalid prediction vector "
+                        f"(got {pred.shape[0]}, expected {len(fold.test_idx)})"
+                    ),
+                }
+            test_df = pd.DataFrame(ds["rows"]).iloc[fold.test_idx].copy()
+            _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
+            fold_row.pop("pred", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
-    metrics = aggregate_cv_rows(cv_rows, family)
-    return {
-        "contender": "r_gamlss",
-        "family": family,
-        "scenario_name": scenario_name,
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
-    }
+    return _finalize_cv_result(
+        contender="r_gamlss",
+        scenario_name=scenario_name,
+        family=family,
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def run_external_mgcv_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -4704,9 +4900,9 @@ if (family_name == "survival") {
     status="ok",
     fit_sec=fit_sec,
     predict_sec=pred_sec,
-    auc=NULL,
+    risk=as.numeric(risk),
     train_risk=as.numeric(lp_train),
-    risk=risk,
+    auc=NULL,
     brier=NULL,
     logloss=NULL,
     rmse=NULL,
@@ -4746,7 +4942,7 @@ if (family_name == "binomial") {
   brier <- mean((y_test - p)^2)
   p_safe <- pmin(pmax(p, 1e-12), 1 - 1e-12)
   logloss <- mean(-(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe)))
-  p_mean <- mean(y_test)
+  p_mean <- mean(y_train)
   if (is.finite(p_mean) && p_mean > 0 && p_mean < 1) {
     ll_null <- sum(y_test * log(p_mean) + (1 - y_test) * log(1 - p_mean))
     ll_model <- sum(y_test * log(p_safe) + (1 - y_test) * log(1 - p_safe))
@@ -4761,6 +4957,7 @@ if (family_name == "binomial") {
     status="ok",
     fit_sec=fit_sec,
     predict_sec=pred_sec,
+    pred=as.numeric(p),
     auc=auc,
     brier=brier,
     logloss=logloss,
@@ -4793,6 +4990,7 @@ if (family_name == "binomial") {
     status="ok",
     fit_sec=fit_sec,
     predict_sec=pred_sec,
+    pred=as.numeric(p),
     auc=NULL,
     brier=NULL,
     logloss=logloss,
@@ -4808,6 +5006,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         script_path.write_text(script)
 
         cv_rows = []
+        plot_payload = _init_plot_payload(ds)
         all_df = pd.DataFrame(ds["rows"])
         for fold_id, fold in enumerate(folds):
             train_idx_path = td_path / f"train_idx_{fold_id}.txt"
@@ -4870,24 +5069,45 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     risk_score=risk,
                     train_risk_score=train_risk,
                 )
+                _append_survival_plot_fold(
+                    plot_payload,
+                    test_df,
+                    time_col=ds["time_col"],
+                    event_col=ds["event_col"],
+                    risk_score=risk,
+                )
                 fold_row["auc"] = surv_metrics["auc"]
                 fold_row["brier"] = surv_metrics["brier"]
                 fold_row["logloss"] = surv_metrics["logloss"]
                 fold_row["nagelkerke_r2"] = surv_metrics["nagelkerke_r2"]
                 fold_row.pop("risk", None)
                 fold_row.pop("train_risk", None)
+            else:
+                pred = np.asarray(fold_row.get("pred", []), dtype=float).reshape(-1)
+                if pred.shape[0] != len(fold.test_idx):
+                    return {
+                        "contender": contender_name,
+                        "scenario_name": scenario["name"],
+                        "status": "failed",
+                        "error": (
+                            f"{contender_name} fold output missing/invalid prediction vector "
+                            f"(got {pred.shape[0]}, expected {len(fold.test_idx)})"
+                        ),
+                    }
+                test_df = all_df.iloc[fold.test_idx].copy()
+                _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
+                fold_row.pop("pred", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": contender_name,
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
-    }
+    return _finalize_cv_result(
+        contender=contender_name,
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def run_external_mgcv_gaulss_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -5001,20 +5221,21 @@ if (ncol(pred) < 2) {
   write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
   quit(save="no")
 }
-sigma_hat <- as.numeric(pred[,2])
-if (length(sigma_hat) != length(y_test)) {
+inv_sigma_hat <- as.numeric(pred[,2])
+if (length(inv_sigma_hat) != length(y_test)) {
   out <- list(
     status="failed",
-    error=paste0("r_mgcv_gaulss sigma length mismatch (got ", length(sigma_hat), ", expected ", length(y_test), ")")
+    error=paste0("r_mgcv_gaulss inverse-sigma length mismatch (got ", length(inv_sigma_hat), ", expected ", length(y_test), ")")
   )
   write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
   quit(save="no")
 }
-if (any(!is.finite(sigma_hat) | sigma_hat <= 0)) {
-  out <- list(status="failed", error="r_mgcv_gaulss sigma has non-finite or non-positive values")
+if (any(!is.finite(inv_sigma_hat) | inv_sigma_hat <= 0)) {
+  out <- list(status="failed", error="r_mgcv_gaulss inverse-sigma has non-finite or non-positive values")
   write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
   quit(save="no")
 }
+sigma_hat <- 1.0 / inv_sigma_hat
 rmse <- sqrt(mean((y_test - p)^2))
 mae <- mean(abs(y_test - p))
 sst <- sum((y_test - mean(y_test))^2)
@@ -5025,6 +5246,7 @@ out <- list(
   status="ok",
   fit_sec=fit_sec,
   predict_sec=pred_sec,
+  pred=as.numeric(p),
   auc=NULL,
   brier=NULL,
   logloss=logloss,
@@ -5038,6 +5260,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         script_path.write_text(script)
 
         cv_rows = []
+        plot_payload = _init_plot_payload(ds)
         for fold_id, fold in enumerate(folds):
             train_idx_path = td_path / f"train_idx_{fold_id}.txt"
             test_idx_path = td_path / f"test_idx_{fold_id}.txt"
@@ -5078,18 +5301,35 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     "n_folds": int(len(folds)),
                     "error": str(fold_row.get("error", "r_mgcv_gaulss fold failed")),
                 }
+            pred = np.asarray(fold_row.get("pred", []), dtype=float).reshape(-1)
+            if pred.shape[0] != len(fold.test_idx):
+                return {
+                    "contender": "r_mgcv_gaulss",
+                    "scenario_name": scenario["name"],
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
+                    "error": (
+                        "r_mgcv_gaulss fold output missing/invalid prediction vector "
+                        f"(got {pred.shape[0]}, expected {len(fold.test_idx)})"
+                    ),
+                }
+            test_df = pd.DataFrame(ds["rows"]).iloc[fold.test_idx].copy()
+            _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
+            fold_row.pop("pred", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "r_mgcv_gaulss",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
-    }
+    return _finalize_cv_result(
+        contender="r_mgcv_gaulss",
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def _gamboostlss_formulas_for_scenario(scenario_name: str, ds):
@@ -5102,15 +5342,16 @@ def _gamboostlss_formulas_for_scenario(scenario_name: str, ds):
         return None, None
 
     knot_count = max(4, int(cfg.get("knots", 8)))
+    knot_expr = f"max(1, min({knot_count}, nrow(train_df)-1))"
     mu_terms = [f"bols({c}, intercept=FALSE)" for c in cfg.get("linear_cols", [])]
 
     smooth_cols = cfg.get("smooth_cols")
     if smooth_cols:
         for col in smooth_cols:
-            mu_terms.append(f"bbs({col}, df=min({knot_count}, nrow(train_df)-1))")
+            mu_terms.append(f"bbs({col}, knots={knot_expr})")
     elif cfg.get("smooth_col"):
         col = cfg["smooth_col"]
-        mu_terms.append(f"bbs({col}, df=min({knot_count}, nrow(train_df)-1))")
+        mu_terms.append(f"bbs({col}, knots={knot_expr})")
 
     if not mu_terms:
         mu_terms = ["1"]
@@ -5274,6 +5515,7 @@ out <- list(
   status="ok",
   fit_sec=fit_sec,
   predict_sec=pred_sec,
+  pred=as.numeric(p),
   auc=NULL,
   brier=NULL,
   logloss=logloss,
@@ -5294,6 +5536,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         script_path.write_text(script)
 
         cv_rows = []
+        plot_payload = _init_plot_payload(ds)
         for fold_id, fold in enumerate(folds):
             train_idx_path = td_path / f"train_idx_{fold_id}.txt"
             test_idx_path = td_path / f"test_idx_{fold_id}.txt"
@@ -5334,18 +5577,35 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     "n_folds": int(len(folds)),
                     "error": str(fold_row.get("error", "r_gamboostlss fold failed")),
                 }
+            pred = np.asarray(fold_row.get("pred", []), dtype=float).reshape(-1)
+            if pred.shape[0] != len(fold.test_idx):
+                return {
+                    "contender": "r_gamboostlss",
+                    "scenario_name": scenario["name"],
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
+                    "error": (
+                        "r_gamboostlss fold output missing/invalid prediction vector "
+                        f"(got {pred.shape[0]}, expected {len(fold.test_idx)})"
+                    ),
+                }
+            test_df = pd.DataFrame(ds["rows"]).iloc[fold.test_idx].copy()
+            _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
+            fold_row.pop("pred", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "r_gamboostlss",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-    }
+    return _finalize_cv_result(
+        contender="r_gamboostlss",
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def _bamlss_formulas_for_scenario(scenario_name: str, ds):
@@ -5496,6 +5756,7 @@ out <- list(
   status="ok",
   fit_sec=fit_sec,
   predict_sec=pred_sec,
+  pred=as.numeric(p),
   auc=NULL,
   brier=NULL,
   logloss=logloss,
@@ -5509,6 +5770,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         script_path.write_text(script)
 
         cv_rows = []
+        plot_payload = _init_plot_payload(ds)
         for fold_id, fold in enumerate(folds):
             train_idx_path = td_path / f"train_idx_{fold_id}.txt"
             test_idx_path = td_path / f"test_idx_{fold_id}.txt"
@@ -5549,18 +5811,35 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     "n_folds": int(len(folds)),
                     "error": str(fold_row.get("error", "r_bamlss fold failed")),
                 }
+            pred = np.asarray(fold_row.get("pred", []), dtype=float).reshape(-1)
+            if pred.shape[0] != len(fold.test_idx):
+                return {
+                    "contender": "r_bamlss",
+                    "scenario_name": scenario["name"],
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
+                    "error": (
+                        "r_bamlss fold output missing/invalid prediction vector "
+                        f"(got {pred.shape[0]}, expected {len(fold.test_idx)})"
+                    ),
+                }
+            test_df = pd.DataFrame(ds["rows"]).iloc[fold.test_idx].copy()
+            _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
+            fold_row.pop("pred", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "r_bamlss",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-    }
+    return _finalize_cv_result(
+        contender="r_bamlss",
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def run_external_r_brms_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -5693,6 +5972,7 @@ out <- list(
   status="ok",
   fit_sec=fit_sec,
   predict_sec=pred_sec,
+  pred=as.numeric(p),
   auc=NULL,
   brier=NULL,
   logloss=logloss,
@@ -5706,6 +5986,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         script_path.write_text(script)
 
         cv_rows = []
+        plot_payload = _init_plot_payload(ds)
         for fold_id, fold in enumerate(folds):
             train_idx_path = td_path / f"train_idx_{fold_id}.txt"
             test_idx_path = td_path / f"test_idx_{fold_id}.txt"
@@ -5746,18 +6027,35 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     "n_folds": int(len(folds)),
                     "error": str(fold_row.get("error", "r_brms fold failed")),
                 }
+            pred = np.asarray(fold_row.get("pred", []), dtype=float).reshape(-1)
+            if pred.shape[0] != len(fold.test_idx):
+                return {
+                    "contender": "r_brms",
+                    "scenario_name": scenario["name"],
+                    "status": "failed",
+                    "fold_id": int(fold_id),
+                    "n_train": int(len(fold.train_idx)),
+                    "n_test": int(len(fold.test_idx)),
+                    "n_folds": int(len(folds)),
+                    "error": (
+                        "r_brms fold output missing/invalid prediction vector "
+                        f"(got {pred.shape[0]}, expected {len(fold.test_idx)})"
+                    ),
+                }
+            test_df = pd.DataFrame(ds["rows"]).iloc[fold.test_idx].copy()
+            _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
+            fold_row.pop("pred", None)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "r_brms",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-    }
+    return _finalize_cv_result(
+        contender="r_brms",
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def run_external_mgcv_survival_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -5857,6 +6155,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
         script_path.write_text(script)
 
         cv_rows = []
+        plot_payload = _init_plot_payload(ds)
         all_df = pd.DataFrame(ds["rows"])
         for fold_id, fold in enumerate(folds):
             train_idx_path = td_path / f"train_idx_{fold_id}.txt"
@@ -5918,6 +6217,13 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                 risk_score=risk,
                 train_risk_score=train_risk,
             )
+            _append_survival_plot_fold(
+                plot_payload,
+                test_df,
+                time_col=ds["time_col"],
+                event_col=ds["event_col"],
+                risk_score=risk,
+            )
             fold_row["auc"] = surv_metrics["auc"]
             fold_row["brier"] = surv_metrics["brier"]
             fold_row["logloss"] = surv_metrics["logloss"]
@@ -5927,15 +6233,14 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "r_mgcv_coxph",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-    }
+    return _finalize_cv_result(
+        contender="r_mgcv_coxph",
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -5946,7 +6251,7 @@ def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[
     try:
         from sksurv.ensemble import RandomSurvivalForest
         from sksurv.util import Surv
-    except Exception as e:
+    except _EXPECTED_OPTIONAL_IMPORT_FAILURES as e:
         return {
             "contender": "python_sksurv_rsf",
             "scenario_name": scenario["name"],
@@ -5961,6 +6266,7 @@ def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[
     time_col = ds["time_col"]
     event_col = ds["event_col"]
     cv_rows = []
+    plot_payload = _init_plot_payload(ds)
 
     for fold_id, fold in enumerate(folds):
         train_df = df.iloc[fold.train_idx].copy()
@@ -6010,16 +6316,22 @@ def run_external_sksurv_rsf_cv(scenario, *, ds: dict | None = None, folds: list[
                 ),
             }
         )
+        _append_survival_plot_fold(
+            plot_payload,
+            test_df,
+            time_col=time_col,
+            event_col=event_col,
+            risk_score=risk,
+        )
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "python_sksurv_rsf",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-    }
+    return _finalize_cv_result(
+        contender="python_sksurv_rsf",
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def run_external_sksurv_coxnet_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -6030,7 +6342,7 @@ def run_external_sksurv_coxnet_cv(scenario, *, ds: dict | None = None, folds: li
     try:
         from sksurv.linear_model import CoxnetSurvivalAnalysis
         from sksurv.util import Surv
-    except Exception as e:
+    except _EXPECTED_OPTIONAL_IMPORT_FAILURES as e:
         return {
             "contender": "python_sksurv_coxnet",
             "scenario_name": scenario["name"],
@@ -6045,6 +6357,7 @@ def run_external_sksurv_coxnet_cv(scenario, *, ds: dict | None = None, folds: li
     time_col = ds["time_col"]
     event_col = ds["event_col"]
     cv_rows = []
+    plot_payload = _init_plot_payload(ds)
 
     for fold_id, fold in enumerate(folds):
         train_df = df.iloc[fold.train_idx].copy()
@@ -6089,16 +6402,22 @@ def run_external_sksurv_coxnet_cv(scenario, *, ds: dict | None = None, folds: li
                 "model_spec": "CoxnetSurvivalAnalysis(l1_ratio=0.5, alpha_min_ratio=0.01)",
             }
         )
+        _append_survival_plot_fold(
+            plot_payload,
+            test_df,
+            time_col=time_col,
+            event_col=event_col,
+            risk_score=risk,
+        )
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "python_sksurv_coxnet",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-    }
+    return _finalize_cv_result(
+        contender="python_sksurv_coxnet",
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -6114,6 +6433,7 @@ def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, fo
     time_col = ds["time_col"]
     event_col = ds["event_col"]
     cv_rows = []
+    plot_payload = _init_plot_payload(ds)
 
     for fold in folds:
         train_df = df.iloc[fold.train_idx].copy()
@@ -6157,24 +6477,25 @@ def run_external_lifelines_coxph_enet_cv(scenario, *, ds: dict | None = None, fo
                     if conv_warn
                     else None
                 ),
-                "model_spec": (
-                    "CoxPHFitter(train-fold z-score; bmi 6-knot hinge spline; "
-                    "penalizer=0.05; l1_ratio=0.5)"
-                    if scenario["name"] == "icu_survival_death"
-                    else "CoxPHFitter(linear terms; train-fold z-score; penalizer=0.05; l1_ratio=0.5)"
-                ),
+                "model_spec": "CoxPHFitter(linear terms; train-fold z-score; penalizer=0.05; l1_ratio=0.5)",
             }
         )
+        _append_survival_plot_fold(
+            plot_payload,
+            test_df,
+            time_col=time_col,
+            event_col=event_col,
+            risk_score=risk,
+        )
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "python_lifelines_coxph_enet",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-    }
+    return _finalize_cv_result(
+        contender="python_lifelines_coxph_enet",
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def run_external_glmnet_cox_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -6359,15 +6680,14 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             fold_row["n_test"] = int(len(fold.test_idx))
             cv_rows.append(fold_row)
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "r_glmnet_cox",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-    }
+    return _finalize_cv_result(
+        contender="r_glmnet_cox",
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[Fold] | None = None):
@@ -6381,7 +6701,7 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
             GradientBoostingSurvivalAnalysis,
         )
         from sksurv.util import Surv
-    except Exception as e:
+    except _EXPECTED_OPTIONAL_IMPORT_FAILURES as e:
         return {
             "contender": "python_sksurv_gb_coxph",
             "scenario_name": scenario["name"],
@@ -6398,6 +6718,8 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
 
     gb_rows = []
     cgb_rows = []
+    gb_plot_payload = _init_plot_payload(ds)
+    cgb_plot_payload = _init_plot_payload(ds)
     gb_spec = "GradientBoostingSurvivalAnalysis(loss='coxph', n_estimators=300, lr=0.05, max_depth=3)"
     cgb_spec = "ComponentwiseGradientBoostingSurvivalAnalysis(loss='coxph', n_estimators=500, lr=0.05)"
     for fold in folds:
@@ -6443,6 +6765,13 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
                 "model_spec": gb_spec,
             }
         )
+        _append_survival_plot_fold(
+            gb_plot_payload,
+            test_df,
+            time_col=time_col,
+            event_col=event_col,
+            risk_score=gb_risk,
+        )
 
         cgb_model = ComponentwiseGradientBoostingSurvivalAnalysis(
             loss="coxph",
@@ -6473,26 +6802,31 @@ def run_external_sksurv_gb_cv(scenario, *, ds: dict | None = None, folds: list[F
                 "model_spec": cgb_spec,
             }
         )
+        _append_survival_plot_fold(
+            cgb_plot_payload,
+            test_df,
+            time_col=time_col,
+            event_col=event_col,
+            risk_score=cgb_risk,
+        )
 
-    gb_metrics = aggregate_cv_rows(gb_rows, ds["family"])
-    cgb_metrics = aggregate_cv_rows(cgb_rows, ds["family"])
     return [
-        {
-            "contender": "python_sksurv_gb_coxph",
-            "family": ds["family"],
-            "scenario_name": scenario["name"],
-            "status": "ok",
-            **gb_metrics,
-            "model_spec": f"{gb_rows[0]['model_spec']} [5-fold CV]",
-        },
-        {
-            "contender": "python_sksurv_componentwise_gb_coxph",
-            "family": ds["family"],
-            "scenario_name": scenario["name"],
-            "status": "ok",
-            **cgb_metrics,
-            "model_spec": f"{cgb_rows[0]['model_spec']} [5-fold CV]",
-        },
+        _finalize_cv_result(
+            contender="python_sksurv_gb_coxph",
+            scenario_name=scenario["name"],
+            family=ds["family"],
+            cv_rows=gb_rows,
+            plot_payload=gb_plot_payload,
+            model_spec=f"{gb_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+        ),
+        _finalize_cv_result(
+            contender="python_sksurv_componentwise_gb_coxph",
+            scenario_name=scenario["name"],
+            family=ds["family"],
+            cv_rows=cgb_rows,
+            plot_payload=cgb_plot_payload,
+            model_spec=f"{cgb_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+        ),
     ]
 
 
@@ -6511,6 +6845,8 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
 
     weibull_rows = []
     lognormal_rows = []
+    weibull_plot_payload = _init_plot_payload(ds)
+    lognormal_plot_payload = _init_plot_payload(ds)
     weibull_spec = "WeibullAFTFitter(train-fold z-score; penalizer=1e-3; l1_ratio=0.2)"
     lognormal_spec = "LogNormalAFTFitter(train-fold z-score; penalizer=1e-3; l1_ratio=0.2)"
     for fold in folds:
@@ -6558,6 +6894,14 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
                 "model_spec": weibull_spec,
             }
         )
+        _append_survival_plot_fold(
+            weibull_plot_payload,
+            test_df,
+            time_col=time_col,
+            event_col=event_col,
+            risk_score=risk,
+            pred_time=pred_time,
+        )
 
         lognormal = LogNormalAFTFitter(penalizer=1e-3, l1_ratio=0.2)
         fit_start = datetime.now(timezone.utc)
@@ -6597,26 +6941,32 @@ def run_external_lifelines_aft_cv(scenario, *, ds: dict | None = None, folds: li
                 "model_spec": lognormal_spec,
             }
         )
+        _append_survival_plot_fold(
+            lognormal_plot_payload,
+            test_df,
+            time_col=time_col,
+            event_col=event_col,
+            risk_score=risk,
+            pred_time=pred_time,
+        )
 
-    weibull_metrics = aggregate_cv_rows(weibull_rows, ds["family"])
-    lognormal_metrics = aggregate_cv_rows(lognormal_rows, ds["family"])
     return [
-        {
-            "contender": "python_lifelines_weibull_aft",
-            "family": ds["family"],
-            "scenario_name": scenario["name"],
-            "status": "ok",
-            **weibull_metrics,
-            "model_spec": f"{weibull_rows[0]['model_spec']} [5-fold CV]",
-        },
-        {
-            "contender": "python_lifelines_lognormal_aft",
-            "family": ds["family"],
-            "scenario_name": scenario["name"],
-            "status": "ok",
-            **lognormal_metrics,
-            "model_spec": f"{lognormal_rows[0]['model_spec']} [5-fold CV]",
-        },
+        _finalize_cv_result(
+            contender="python_lifelines_weibull_aft",
+            scenario_name=scenario["name"],
+            family=ds["family"],
+            cv_rows=weibull_rows,
+            plot_payload=weibull_plot_payload,
+            model_spec=f"{weibull_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+        ),
+        _finalize_cv_result(
+            contender="python_lifelines_lognormal_aft",
+            scenario_name=scenario["name"],
+            family=ds["family"],
+            cv_rows=lognormal_rows,
+            plot_payload=lognormal_plot_payload,
+            model_spec=f"{lognormal_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+        ),
     ]
 
 
@@ -6627,7 +6977,7 @@ def run_external_xgboost_aft_cv(scenario, *, ds: dict | None = None, folds: list
         return None
     try:
         import xgboost as xgb
-    except Exception as e:
+    except _EXPECTED_OPTIONAL_IMPORT_FAILURES as e:
         return {
             "contender": "python_xgboost_aft",
             "scenario_name": scenario["name"],
@@ -6642,6 +6992,7 @@ def run_external_xgboost_aft_cv(scenario, *, ds: dict | None = None, folds: list
     time_col = ds["time_col"]
     event_col = ds["event_col"]
     cv_rows = []
+    plot_payload = _init_plot_payload(ds)
 
     for fold_id, fold in enumerate(folds):
         train_df = df.iloc[fold.train_idx].copy()
@@ -6711,16 +7062,23 @@ def run_external_xgboost_aft_cv(scenario, *, ds: dict | None = None, folds: list
                 ),
             }
         )
+        _append_survival_plot_fold(
+            plot_payload,
+            test_df,
+            time_col=time_col,
+            event_col=event_col,
+            risk_score=risk,
+            pred_time=pred_time,
+        )
 
-    metrics = aggregate_cv_rows(cv_rows, ds["family"])
-    return {
-        "contender": "python_xgboost_aft",
-        "family": ds["family"],
-        "scenario_name": scenario["name"],
-        "status": "ok",
-        **metrics,
-        "model_spec": f"{cv_rows[0]['model_spec']} [5-fold CV]",
-    }
+    return _finalize_cv_result(
+        contender="python_xgboost_aft",
+        scenario_name=scenario["name"],
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=f"{cv_rows[0]['model_spec']} {_evaluation_suffix(folds)}",
+    )
 
 
 def _assert_basis_parity_for_scenario(s_cfg, *, ds: dict | None = None):
@@ -6757,6 +7115,21 @@ def _is_contender_enabled(s_cfg, contender: str) -> bool:
     return contender not in excluded
 
 
+def _append_enabled_result_rows(results: list[dict], rows, s_cfg) -> None:
+    if rows is None:
+        return
+    if not isinstance(rows, list):
+        rows = [rows]
+    for row in rows:
+        if row is None:
+            continue
+        contender = row.get("contender")
+        if not isinstance(contender, str):
+            raise RuntimeError(f"benchmark row missing valid contender name: {row!r}")
+        if _is_contender_enabled(s_cfg, contender):
+            results.append(row)
+
+
 def _is_non_blocking_failure(row: dict) -> bool:
     return str(row.get("contender", "")) in NON_BLOCKING_FAILURE_CONTENDERS
 
@@ -6775,7 +7148,7 @@ def _format_blocking_failure(row: dict) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run GAM benchmark suite with leakage-safe 5-fold CV.")
+    parser = argparse.ArgumentParser(description="Run GAM benchmark suite with leakage-safe evaluation.")
     parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS)
     parser.add_argument("--out", type=Path, default=BENCH_DIR / "results.json")
     parser.add_argument(
@@ -6987,24 +7360,22 @@ def main():
                 results.append(glmnet_cox_row)
             sksurv_gb_rows = (
                 run_external_sksurv_gb_cv(s_cfg, ds=ds, folds=folds)
-                if _is_contender_enabled(s_cfg, "python_sksurv_gb_coxph")
+                if (
+                    _is_contender_enabled(s_cfg, "python_sksurv_gb_coxph")
+                    or _is_contender_enabled(s_cfg, "python_sksurv_componentwise_gb_coxph")
+                )
                 else None
             )
-            if sksurv_gb_rows is not None:
-                if isinstance(sksurv_gb_rows, list):
-                    results.extend(sksurv_gb_rows)
-                else:
-                    results.append(sksurv_gb_rows)
+            _append_enabled_result_rows(results, sksurv_gb_rows, s_cfg)
             lifelines_aft_rows = (
                 run_external_lifelines_aft_cv(s_cfg, ds=ds, folds=folds)
-                if _is_contender_enabled(s_cfg, "python_lifelines_weibull_aft")
+                if (
+                    _is_contender_enabled(s_cfg, "python_lifelines_weibull_aft")
+                    or _is_contender_enabled(s_cfg, "python_lifelines_lognormal_aft")
+                )
                 else None
             )
-            if lifelines_aft_rows is not None:
-                if isinstance(lifelines_aft_rows, list):
-                    results.extend(lifelines_aft_rows)
-                else:
-                    results.append(lifelines_aft_rows)
+            _append_enabled_result_rows(results, lifelines_aft_rows, s_cfg)
             xgb_aft_row = (
                 run_external_xgboost_aft_cv(s_cfg, ds=ds, folds=folds)
                 if _is_contender_enabled(s_cfg, "python_xgboost_aft")
@@ -7017,13 +7388,26 @@ def main():
         s_name = s_cfg["name"]
         ds = dataset_for_scenario(s_cfg)
         required_contender = "rust_gamlss_survival" if ds["family"] == "survival" else "rust_gam"
-        has_required = any(
-            r.get("scenario_name") == s_name and r.get("contender") == required_contender
+        has_required_ok = any(
+            r.get("scenario_name") == s_name
+            and r.get("contender") == required_contender
+            and r.get("status") == "ok"
             for r in results
         )
-        if not has_required:
+        if not has_required_ok:
+            required_rows = [
+                r
+                for r in results
+                if r.get("scenario_name") == s_name
+                and r.get("contender") == required_contender
+            ]
+            if required_rows:
+                raise SystemExit(
+                    "required contender failed for scenario "
+                    f"'{s_name}': {_format_blocking_failure(required_rows[0])}"
+                )
             raise SystemExit(
-                f"missing required {required_contender} result for scenario '{s_name}'"
+                f"missing required successful {required_contender} result for scenario '{s_name}'"
             )
 
     # Hard guard: benchmark runs must fail in CI for blocking contender failures.
@@ -7037,22 +7421,33 @@ def main():
             msgs.append(_format_blocking_failure(r))
         raise SystemExit("benchmark run failed:\n" + "\n".join(msgs))
 
-    # Hard guard: benchmark outputs must remain CV-based and leakage-safe.
+    # Hard guard: benchmark outputs must declare their evaluation mode.
     for r in results:
         if r.get("status") != "ok":
             continue
         spec = str(r.get("model_spec", ""))
-        if "CV" not in spec and "cv" not in spec:
+        evaluation = str(r.get("evaluation", "")).lower()
+        spec_lower = spec.lower()
+        if evaluation == "holdout":
+            ok = "holdout" in spec_lower
+        elif "cv" in evaluation:
+            ok = "cv" in spec_lower
+        else:
+            ok = False
+        if not ok:
             raise SystemExit(
-                f"non-CV model result detected for {r.get('contender')} / {r.get('scenario_name')}: {spec}"
+                "model result metadata/spec mismatch for "
+                f"{r.get('contender')} / {r.get('scenario_name')}: "
+                f"evaluation={r.get('evaluation')} spec={spec}"
             )
 
     payload = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "cv": {
-            "n_splits": CV_SPLITS,
+        "evaluation": {
+            "default_n_splits": CV_SPLITS,
             "seed": CV_SEED,
             "leakage_safe": True,
+            "scenario_specific_splits": True,
         },
         "results": results,
     }
@@ -7063,6 +7458,7 @@ def main():
     fig_dir = args.out.parent / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     generate_scenario_figures(results, fig_dir)
+    generate_scenario_datapoint_figures(results, fig_dir)
     zip_path = args.out.parent / "figures.zip"
     zip_figure_dir(fig_dir, zip_path)
     print(f"Wrote {zip_path}")
@@ -7107,6 +7503,232 @@ def _short_contender_label(name: str) -> str:
     )
 
 
+def _style_plot_ax(ax, *, bg_card: str, text_color: str, grid_color: str) -> None:
+    ax.set_facecolor(bg_card)
+    ax.tick_params(colors=text_color, which="both")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["bottom"].set_color(grid_color)
+    ax.spines["left"].set_color(grid_color)
+    ax.xaxis.label.set_color(text_color)
+    ax.yaxis.label.set_color(text_color)
+    ax.title.set_color(text_color)
+    ax.grid(color=grid_color, linewidth=0.5, alpha=0.8, zorder=0)
+
+
+def _subsample_plot_df(df: pd.DataFrame, max_points: int, seed: int = 42) -> pd.DataFrame:
+    if len(df) <= max_points:
+        return df
+    rng = np.random.default_rng(seed)
+    keep = np.sort(rng.choice(len(df), size=max_points, replace=False))
+    return df.iloc[keep].copy()
+
+
+def _plot_single_predictor_gaussian(ax, payload: dict, *, accent: str, text_color: str) -> None:
+    df = pd.DataFrame(
+        {
+            "x": payload["x"],
+            "actual": payload["actual"],
+            "predicted": payload["predicted"],
+        }
+    ).sort_values("x")
+    pts = _subsample_plot_df(df, max_points=3000)
+    ax.scatter(pts["x"], pts["actual"], s=11, color="#8b949e", alpha=0.35, linewidths=0, zorder=2)
+    ax.plot(df["x"], df["predicted"], color=accent, linewidth=2.2, alpha=0.95, zorder=3)
+    ax.set_xlabel(str(payload["primary_feature"]))
+    ax.set_ylabel(str(payload["target"]))
+    ax.text(0.02, 0.96, "actual points + OOF prediction", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
+
+
+def _plot_single_predictor_binomial(ax, payload: dict, *, accent: str, text_color: str) -> None:
+    df = pd.DataFrame(
+        {
+            "x": payload["x"],
+            "actual": payload["actual"],
+            "predicted": payload["predicted"],
+        }
+    ).sort_values("x")
+    rng = np.random.default_rng(42)
+    pts = _subsample_plot_df(df, max_points=2500)
+    jitter = rng.normal(loc=0.0, scale=0.04, size=len(pts))
+    ax.scatter(pts["x"], np.clip(pts["actual"] + jitter, -0.08, 1.08), s=12, color="#8b949e", alpha=0.35, linewidths=0, zorder=2)
+    ax.plot(df["x"], np.clip(df["predicted"], 0.0, 1.0), color=accent, linewidth=2.2, alpha=0.95, zorder=3)
+    bins = np.linspace(float(df["x"].min()), float(df["x"].max()), 20)
+    if np.unique(bins).size >= 3:
+        centers = 0.5 * (bins[:-1] + bins[1:])
+        obs = []
+        keep = []
+        x_vals = df["x"].to_numpy(dtype=float)
+        y_vals = df["actual"].to_numpy(dtype=float)
+        for i in range(len(bins) - 1):
+            mask = (x_vals >= bins[i]) & (x_vals < bins[i + 1] if i < len(bins) - 2 else x_vals <= bins[i + 1])
+            if int(np.sum(mask)) >= 5:
+                obs.append(float(np.mean(y_vals[mask])))
+                keep.append(i)
+        if keep:
+            ax.plot(centers[keep], obs, color="#f2cc60", linewidth=1.6, linestyle="--", alpha=0.95, zorder=4)
+    ax.set_ylim(-0.1, 1.1)
+    ax.set_xlabel(str(payload["primary_feature"]))
+    ax.set_ylabel(f"P({payload['target']}=1)")
+    ax.text(0.02, 0.96, "jittered class points + OOF probability", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
+
+
+def _plot_actual_vs_predicted(ax, payload: dict, *, accent: str, text_color: str) -> None:
+    df = pd.DataFrame({"actual": payload["actual"], "predicted": payload["predicted"]})
+    pts = _subsample_plot_df(df, max_points=3000)
+    ax.scatter(pts["actual"], pts["predicted"], s=14, color=accent, alpha=0.5, linewidths=0, zorder=3)
+    lo = float(min(df["actual"].min(), df["predicted"].min()))
+    hi = float(max(df["actual"].max(), df["predicted"].max()))
+    ax.plot([lo, hi], [lo, hi], color="#8b949e", linewidth=1.2, linestyle="--", alpha=0.9, zorder=2)
+    ax.set_xlabel(f"actual {payload['target']}")
+    ax.set_ylabel(f"predicted {payload['target']}")
+    ax.text(0.02, 0.96, "OOF predictions", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
+
+
+def _plot_binary_probability(ax, payload: dict, *, accent: str, text_color: str) -> None:
+    df = pd.DataFrame({"actual": payload["actual"], "predicted": payload["predicted"]}).sort_values("predicted")
+    pts = _subsample_plot_df(df, max_points=2500)
+    rng = np.random.default_rng(42)
+    jitter = rng.normal(loc=0.0, scale=0.04, size=len(pts))
+    ax.scatter(np.clip(pts["predicted"], 0.0, 1.0), np.clip(pts["actual"] + jitter, -0.08, 1.08), s=12, color="#8b949e", alpha=0.35, linewidths=0, zorder=2)
+    bins = np.linspace(0.0, 1.0, 16)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    obs = []
+    keep = []
+    p = np.clip(df["predicted"].to_numpy(dtype=float), 0.0, 1.0)
+    y = df["actual"].to_numpy(dtype=float)
+    for i in range(len(bins) - 1):
+        mask = (p >= bins[i]) & (p < bins[i + 1] if i < len(bins) - 2 else p <= bins[i + 1])
+        if int(np.sum(mask)) >= 5:
+            obs.append(float(np.mean(y[mask])))
+            keep.append(i)
+    if keep:
+        ax.plot(centers[keep], obs, color=accent, linewidth=2.2, zorder=3)
+    ax.plot([0.0, 1.0], [0.0, 1.0], color="#8b949e", linewidth=1.1, linestyle="--", alpha=0.8, zorder=1)
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.1, 1.1)
+    ax.set_xlabel("predicted probability")
+    ax.set_ylabel(f"observed {payload['target']}")
+    ax.text(0.02, 0.96, "jittered datapoints + binned event rate", transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
+
+
+def _plot_survival_panel(ax, payload: dict, *, text_color: str) -> None:
+    df = pd.DataFrame(
+        {
+            "time": payload["time"],
+            "event": payload["event"],
+            "risk": payload["risk"],
+        }
+    )
+    if payload.get("pred_time") is not None:
+        df["pred_time"] = payload["pred_time"]
+    risk = df["risk"].to_numpy(dtype=float)
+    q = np.unique(np.quantile(risk, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]))
+    if q.size < 4:
+        q = np.unique(np.quantile(risk, [0.0, 0.5, 1.0]))
+    if q.size < 3:
+        q = np.array([float(np.min(risk)), float(np.max(risk))], dtype=float)
+    if q.size >= 3:
+        group = pd.qcut(df["risk"], q=min(q.size - 1, 3), labels=False, duplicates="drop")
+    else:
+        group = pd.Series(np.zeros(len(df), dtype=int))
+    df["group"] = group.fillna(0).astype(int)
+    labels = ["Low risk", "Mid risk", "High risk"]
+    colors = ["#56d364", "#d29922", "#f85149"]
+    kmf = KaplanMeierFitter()
+    for grp in sorted(df["group"].unique()):
+        sub = df[df["group"] == grp]
+        if sub.empty:
+            continue
+        label = labels[min(int(grp), len(labels) - 1)]
+        color = colors[min(int(grp), len(colors) - 1)]
+        kmf.fit(sub["time"], event_observed=sub["event"], label=f"{label} (n={len(sub)})")
+        sf = kmf.survival_function_
+        ax.step(sf.index.to_numpy(dtype=float), sf.iloc[:, 0].to_numpy(dtype=float), where="post", color=color, linewidth=2.0, alpha=0.95, zorder=3)
+        censor_times = sub.loc[sub["event"] <= 0.5, "time"].to_numpy(dtype=float)
+        if censor_times.size:
+            censor_y = kmf.predict(censor_times)
+            ax.scatter(censor_times, np.asarray(censor_y, dtype=float), marker="|", s=36, color=color, alpha=0.9, linewidths=1.1, zorder=4)
+    ax.set_ylim(0.0, 1.02)
+    ax.set_xlabel(str(payload["time_col"]))
+    ax.set_ylabel("survival probability")
+    event_rate = float(np.mean(df["event"].to_numpy(dtype=float) > 0.5))
+    summary = f"risk-stratified KM • event rate {event_rate:.1%}"
+    if "pred_time" in df.columns:
+        summary += f" • median predicted time {float(np.median(df['pred_time'])):.2f}"
+    ax.text(0.02, 0.96, summary, transform=ax.transAxes, va="top", color=text_color, fontsize=8, alpha=0.75)
+
+
+def generate_scenario_datapoint_figures(results: list[dict], out_dir: Path) -> list[Path]:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("WARNING: matplotlib not available — skipping datapoint figure generation.")
+        return []
+
+    from collections import defaultdict
+
+    by_scenario: dict[str, list[dict]] = defaultdict(list)
+    for r in results:
+        if r.get("status") == "ok" and r.get("plot_payload"):
+            by_scenario[r["scenario_name"]].append(r)
+
+    bg_dark = "#0d1117"
+    bg_card = "#161b22"
+    text_color = "#c9d1d9"
+    grid_color = "#21262d"
+    accent_colors = [
+        "#58a6ff", "#3fb950", "#d29922", "#f85149",
+        "#bc8cff", "#79c0ff", "#56d364", "#e3b341",
+    ]
+    paths: list[Path] = []
+    for scenario_name, rows in sorted(by_scenario.items()):
+        if not rows:
+            continue
+        n_panels = len(rows)
+        ncols = 2 if n_panels > 1 else 1
+        nrows = int(math.ceil(n_panels / ncols))
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(14, max(4.5, 4.2 * nrows)),
+            facecolor=bg_dark,
+            squeeze=False,
+        )
+        axes_flat = list(axes.reshape(-1))
+        for ax in axes_flat:
+            _style_plot_ax(ax, bg_card=bg_card, text_color=text_color, grid_color=grid_color)
+        for idx, row in enumerate(rows):
+            ax = axes_flat[idx]
+            payload = row["plot_payload"]
+            accent = accent_colors[idx % len(accent_colors)]
+            family = str(payload["family"])
+            if family == "survival":
+                _plot_survival_panel(ax, payload, text_color=text_color)
+            elif payload.get("primary_feature"):
+                if family == "gaussian":
+                    _plot_single_predictor_gaussian(ax, payload, accent=accent, text_color=text_color)
+                else:
+                    _plot_single_predictor_binomial(ax, payload, accent=accent, text_color=text_color)
+            elif family == "gaussian":
+                _plot_actual_vs_predicted(ax, payload, accent=accent, text_color=text_color)
+            else:
+                _plot_binary_probability(ax, payload, accent=accent, text_color=text_color)
+            ax.set_title(_short_contender_label(str(row["contender"])), fontsize=10, loc="left", pad=8)
+        for ax in axes_flat[n_panels:]:
+            ax.set_visible(False)
+        fig.suptitle(f"Benchmark Datapoints: {scenario_name}", fontsize=14, fontweight="bold", color="#f0f6fc", y=0.995)
+        fig.text(0.5, 0.002, "Out-of-fold predictions with raw observed datapoints", ha="center", fontsize=8, color=text_color, alpha=0.65)
+        out_path = out_dir / f"{scenario_name}__datapoints.png"
+        fig.savefig(out_path, dpi=180, facecolor=bg_dark, edgecolor="none", bbox_inches="tight", pad_inches=0.35)
+        plt.close(fig)
+        paths.append(out_path)
+    print(f"Generated {len(paths)} datapoint figure(s) in {out_dir}/")
+    return paths
+
+
 def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
     """Create one beautiful comparison PNG per scenario."""
     try:
@@ -7142,6 +7764,7 @@ def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
         if not rows:
             continue
         family = rows[0].get("family", "gaussian")
+        evaluation = str(rows[0].get("evaluation", "unknown"))
         metrics_cfg = _metric_display_config(family)
         # Filter to metrics that have at least one non-None value.
         active_metrics = []
@@ -7186,7 +7809,7 @@ def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
             vals = []
             for r in rows:
                 v = r.get(key)
-                vals.append(float(v) if v is not None else 0.0)
+                vals.append(float(v) if v is not None else float("nan"))
 
             bars = ax.barh(
                 y_pos, vals, height=0.62,
@@ -7194,14 +7817,14 @@ def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
                 zorder=3,
             )
             # Highlight the best value.
-            valid_vals = [v for v in vals if v != 0.0]
+            valid_vals = [v for v in vals if np.isfinite(v)]
             if valid_vals:
                 if higher_is_better:
                     best_val = max(valid_vals)
                 else:
                     best_val = min(valid_vals)
                 for i, (bar, v) in enumerate(zip(bars, vals)):
-                    if abs(v - best_val) < 1e-12 and v != 0.0:
+                    if np.isfinite(v) and abs(v - best_val) < 1e-12:
                         bar.set_edgecolor("#f0f6fc")
                         bar.set_linewidth(1.8)
                         bar.set_alpha(1.0)
@@ -7216,7 +7839,7 @@ def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
 
             # Value labels on bars.
             for bar, v in zip(bars, vals):
-                if v == 0.0:
+                if not np.isfinite(v):
                     continue
                 if abs(v) < 0.01:
                     fmt = f"{v:.4f}"
@@ -7282,7 +7905,7 @@ def generate_scenario_figures(results: list[dict], out_dir: Path) -> list[Path]:
         )
         fig.text(
             0.5, 0.002,
-            f"family={family}  •  5-fold CV  •  {n_contenders} contenders",
+            f"family={family}  •  {evaluation}  •  {n_contenders} contenders",
             ha="center", fontsize=8, color=text_color, alpha=0.6,
         )
 

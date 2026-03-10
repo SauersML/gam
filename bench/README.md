@@ -33,6 +33,9 @@ python3 bench/run_suite.py
 
 Output:
 - `benchmarks/results.json`
+- `benchmarks/figures/*.png`
+- `benchmarks/figures/*__datapoints.png`
+- `benchmarks/figures.zip`
 
 ## Runtime knobs
 
@@ -58,7 +61,7 @@ Default scenarios:
 - `horse_colic` (real dataset, rows with complete `rectal_temp/pulse/packed_cell_volume`; binomial GAM on severe outcome `outcome != lived` with linear temp/pcv + smooth pulse)
 - `us48_demand_5day` (real dataset, 5-day hourly demand; Gaussian GAM on `Demand` with smooth `hour` + linear forecast/generation/interchange)
 - `us48_demand_31day` (real dataset, 31-day hourly demand; same model family as 5-day benchmark)
-- `haberman_survival` (real dataset, binomial GAM on 5-year survival outcome using linear age/op-year + smooth axillary nodes)
+- `haberman_5yr` (real dataset, binomial GAM on 5-year survival status using linear age/op-year + smooth axillary nodes)
 - `icu_survival_death` (real ICU dataset; time-to-event benchmark with Cox model on time=`pre_icu_los_days`, event=`hospital_death`, and age/BMI/hemodynamics covariates)
 - `icu_survival_los` (real ICU dataset; time-to-event benchmark with Cox model on time=`pre_icu_los_days`, event=`hospital_death`, and age/BMI/hemodynamics/temp covariates)
 - `heart_failure_survival` (real heart-failure dataset; time-to-event benchmark on follow-up `time` and death event with clinical covariates)

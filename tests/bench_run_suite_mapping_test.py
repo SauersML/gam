@@ -157,7 +157,6 @@ class RunSuiteMappingTests(unittest.TestCase):
 
     def test_survival_benchmark_fit_options_require_structural_ispline_basis(self) -> None:
         expected = {
-            "haberman_survival": 6,
             "icu_survival_death": 10,
             "icu_survival_los": 10,
             "heart_failure_survival": 8,
