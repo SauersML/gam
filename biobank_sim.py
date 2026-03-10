@@ -26,6 +26,7 @@ HEARTBEAT_INTERVAL_SEC = 15.0
 HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 MAX_CAPTURE_CHARS = 200000
+MAX_SURVIVAL_GRID_POINTS = 256
 
 
 @dataclass(frozen=True)
@@ -198,6 +199,9 @@ def _survival_score_grid(train_times: np.ndarray) -> np.ndarray:
     if vals.size == 0:
         return np.array([0.0, 1.0], dtype=float)
     grid = np.unique(vals)
+    if grid.size > MAX_SURVIVAL_GRID_POINTS - 1:
+        probs = np.linspace(0.0, 1.0, MAX_SURVIVAL_GRID_POINTS - 1, dtype=float)
+        grid = np.unique(np.quantile(grid, probs, method="linear"))
     if grid[0] > 0.0:
         grid = np.concatenate([[0.0], grid])
     else:
@@ -1032,11 +1036,11 @@ def prepare_dataset_views(rows: list[dict[str, Any]], train_rows: list[dict[str,
         for i, row in enumerate(test_copy):
             row[f"{col}_std"] = float(te_scaled[i])
     disease_fields = [
-        "sample_id", "subpop", "superpop", "continent", "source", "lat_final", "lon_final", "age_entry", "sex",
+        "subpop", "superpop", "continent", "source", "lat_final", "lon_final", "age_entry", "sex",
         "pgs", "phenotype", "geo_prevalence", "portability_distance",
     ] + [f"pc{i}" for i in range(1, 17)] + [f"{c}_std" for c in feature_cols]
     survival_fields = [
-        "sample_id", "subpop", "superpop", "continent", "source", "lat_final", "lon_final", "age_entry", "sex",
+        "subpop", "superpop", "continent", "source", "lat_final", "lon_final", "age_entry", "sex",
         "pgs", "time", "event", "entry_year", "geo_prevalence", "portability_distance",
     ] + [f"pc{i}" for i in range(1, 17)] + [f"{c}_std" for c in feature_cols]
     write_csv_rows(prep_dir / "disease_train.csv", train_copy, disease_fields)
@@ -1154,12 +1158,36 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
     if spec.smooth_kind == "joint":
         linear_terms.append(rust_joint_term(spec.spatial_basis, "lat_final_std", "lon_final_std", int(spec.centers or 60)))
     else:
-        linear_terms.extend(
-            [
-                "s(lat_final_std, type=ps, knots=10)",
-                "s(lon_final_std, type=ps, knots=10)",
-            ]
-        )
+        basis = spec.spatial_basis
+        centers = int(spec.centers or 60)
+        if basis in {"thinplate", "tps"}:
+            linear_terms.extend(
+                [
+                    f"s(lat_final_std, type=tps, centers={centers})",
+                    f"s(lon_final_std, type=tps, centers={centers})",
+                ]
+            )
+        elif basis == "duchon":
+            linear_terms.extend(
+                [
+                    f"s(lat_final_std, type=duchon, centers={centers}, order=0, power=1)",
+                    f"s(lon_final_std, type=duchon, centers={centers}, order=0, power=1)",
+                ]
+            )
+        elif basis == "matern":
+            linear_terms.extend(
+                [
+                    f"s(lat_final_std, type=matern, centers={centers})",
+                    f"s(lon_final_std, type=matern, centers={centers})",
+                ]
+            )
+        else:
+            linear_terms.extend(
+                [
+                    "s(lat_final_std, type=ps, knots=10)",
+                    "s(lon_final_std, type=ps, knots=10)",
+                ]
+            )
     linear_terms.extend(f"linear(pc{i}_std)" for i in range(1, 17))
     mean_formula = "phenotype ~ " + " + ".join(linear_terms) + " + link(type=logit)"
     sigma_terms = ["linear(pgs_std)", "linear(age_entry_std)", "linear(lat_final_std)", "linear(lon_final_std)"]
@@ -1241,12 +1269,13 @@ def run_rust_classification(spec: MethodSpec, train_csv: Path, test_csv: Path, o
     y_train = csv_numeric_column(train_csv, "phenotype")
     y_test = csv_numeric_column(test_csv, "phenotype")
     metrics = classification_metrics(y_test, pred, float(np.mean(y_train)))
+    spatial_desc = f"additive {spec.spatial_basis}" if spec.smooth_kind != "joint" else spec.spatial_basis
     return {
         "fit_sec": fit_sec,
         "predict_sec": predict_sec,
         "metrics": metrics,
         "prediction_path": str(pred_path),
-        "model_spec": f"Rust {spec.spatial_basis} {'GAMLSS' if spec.include_sigma else 'GAM'} holdout",
+        "model_spec": f"Rust {spatial_desc} {'GAMLSS' if spec.include_sigma else 'GAM'} holdout",
     }
 
 
