@@ -6530,12 +6530,8 @@ fn strip_quotes(v: &str) -> &str {
     }
 }
 
-fn spatial_center_strategy_for_dimension(dim: usize, num_centers: usize) -> CenterStrategy {
-    if dim <= 1 {
-        CenterStrategy::EqualMass { num_centers }
-    } else {
-        CenterStrategy::FarthestPoint { num_centers }
-    }
+fn spatial_center_strategy_for_dimension(num_centers: usize) -> CenterStrategy {
+    CenterStrategy::EqualMass { num_centers }
 }
 
 fn build_termspec(
@@ -6798,7 +6794,7 @@ fn build_smooth_basis(
             Ok(SmoothBasisSpec::ThinPlate {
                 feature_cols: cols.to_vec(),
                 spec: ThinPlateBasisSpec {
-                    center_strategy: spatial_center_strategy_for_dimension(cols.len(), centers),
+                    center_strategy: spatial_center_strategy_for_dimension(centers),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                 },
@@ -6814,7 +6810,7 @@ fn build_smooth_basis(
             Ok(SmoothBasisSpec::Matern {
                 feature_cols: cols.to_vec(),
                 spec: MaternBasisSpec {
-                    center_strategy: spatial_center_strategy_for_dimension(cols.len(), centers),
+                    center_strategy: spatial_center_strategy_for_dimension(centers),
                     length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
@@ -6840,7 +6836,7 @@ fn build_smooth_basis(
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
-                    center_strategy: spatial_center_strategy_for_dimension(cols.len(), centers),
+                    center_strategy: spatial_center_strategy_for_dimension(centers),
                     length_scale: option_f64(options, "length_scale"),
                     power,
                     nullspace_order,

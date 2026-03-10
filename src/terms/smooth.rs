@@ -44,6 +44,7 @@ fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
     match strategy {
         CenterStrategy::UserProvided(centers) => format!("{} centers", centers.nrows()),
         CenterStrategy::EqualMass { num_centers }
+        | CenterStrategy::EqualMassCovarRepresentative { num_centers }
         | CenterStrategy::FarthestPoint { num_centers }
         | CenterStrategy::KMeans { num_centers, .. } => format!("{num_centers} centers"),
         CenterStrategy::UniformGrid { points_per_dim } => {
@@ -3626,12 +3627,27 @@ fn compute_spatial_adaptiveweights_for_beta(
                 cache,
                 [epsilon_0, epsilon_g, epsilon_c],
             )?;
+            #[cfg(test)]
+            let (u_0, inv_0) = exact
+                .magnitude
+                .surrogateweights(weight_floor, weight_ceiling);
+            #[cfg(not(test))]
             let (_, inv_0) = exact
                 .magnitude
                 .surrogateweights(weight_floor, weight_ceiling);
+            #[cfg(test)]
+            let (u_g, inv_g) = exact
+                .gradient
+                .surrogateweights(weight_floor, weight_ceiling);
+            #[cfg(not(test))]
             let (_, inv_g) = exact
                 .gradient
                 .surrogateweights(weight_floor, weight_ceiling);
+            #[cfg(test)]
+            let (u_c, inv_c) = exact
+                .curvature
+                .surrogateweights(weight_floor, weight_ceiling);
+            #[cfg(not(test))]
             let (_, inv_c) = exact
                 .curvature
                 .surrogateweights(weight_floor, weight_ceiling);
