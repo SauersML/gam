@@ -1159,20 +1159,17 @@ def do_prepare(args: argparse.Namespace) -> int:
 
 def rust_joint_term(basis: str, cols: list[str], centers: int) -> str:
     joined = ", ".join(cols)
-    if basis == "thinplate":
-        return f"thinplate({joined}, centers={centers})"
     if basis == "duchon":
         return f"duchon({joined}, centers={centers}, order=0, power=1)"
-    if basis == "matern":
-        return f"matern({joined}, centers={centers})"
-    raise RuntimeError(f"unsupported Rust joint basis '{basis}'")
+    raise RuntimeError(f"unsupported Rust biobank basis '{basis}'; use duchon")
 
 
 def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
-    linear_terms = ["linear(age_entry_std)", "linear(sex)"]
     if spec.smooth_kind != "joint":
-        raise RuntimeError("Rust disease biobank methods must use a joint multidimensional smooth")
-    smooth_cols = ["lat_final_std", "lon_final_std", "pgs_std"] + [f"pc{i}_std" for i in range(1, 17)]
+        raise RuntimeError(f"{spec.name} must use a joint Rust smooth")
+    linear_terms = ["linear(age_entry_std)", "linear(sex)"]
+    smooth_cols = ["lat_final_std", "lon_final_std", "pgs_std"]
+    smooth_cols.extend(f"pc{i}_std" for i in range(1, 17))
     linear_terms.append(rust_joint_term(spec.spatial_basis, smooth_cols, int(spec.centers or 60)))
     mean_formula = "phenotype ~ " + " + ".join(linear_terms) + " + link(type=logit)"
     sigma_terms = ["linear(pgs_std)", "linear(age_entry_std)", "linear(lat_final_std)", "linear(lon_final_std)"]
@@ -1254,13 +1251,12 @@ def run_rust_classification(spec: MethodSpec, train_csv: Path, test_csv: Path, o
     y_train = csv_numeric_column(train_csv, "phenotype")
     y_test = csv_numeric_column(test_csv, "phenotype")
     metrics = classification_metrics(y_test, pred, float(np.mean(y_train)))
-    spatial_desc = f"additive {spec.spatial_basis}" if spec.smooth_kind != "joint" else spec.spatial_basis
     return {
         "fit_sec": fit_sec,
         "predict_sec": predict_sec,
         "metrics": metrics,
         "prediction_path": str(pred_path),
-        "model_spec": f"Rust {spatial_desc} {'GAMLSS' if spec.include_sigma else 'GAM'} holdout",
+        "model_spec": f"Rust joint {spec.spatial_basis} {'GAMLSS' if spec.include_sigma else 'GAM'} holdout",
     }
 
 
@@ -1269,7 +1265,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     formula_rhs = rust_formula_survival(spec)
     model_path = out_dir / f"{spec.name}.model.json"
     pred_path = out_dir / f"{spec.name}.pred.csv"
-    likelihood_mode = "transformation" if spec.backend == "rust_survival_transform" else "probit-location-scale"
+    likelihood_mode = "probit-location-scale"
     fit_cmd = [
         str(rust_bin), "fit", "--no-summary",
         "--survival-likelihood", likelihood_mode,
@@ -1423,7 +1419,7 @@ def run_method(spec: MethodSpec, prep_dir: Path, out_dir: Path) -> dict[str, Any
         else:
             raise RuntimeError(f"unsupported disease backend '{spec.backend}'")
     elif spec.dataset == "survival":
-        if spec.backend in {"rust_survival", "rust_survival_transform", "rust_gamlss_survival"}:
+        if spec.backend == "rust_gamlss_survival":
             result = run_rust_survival(spec, survival_train, survival_test, out_dir)
         elif spec.backend == "r_mgcv_survival":
             result = run_r_mgcv_survival(spec, survival_train, survival_test, out_dir)
