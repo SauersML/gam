@@ -2007,25 +2007,30 @@ fn select_equal_mass_centers(
             "equal-mass center selection requires at least one column".to_string(),
         ));
     }
-    #[derive(Clone)]
+    #[derive(Clone, Copy)]
     struct Leaf {
-        indices: Vec<usize>,
+        start: usize,
+        end: usize,
     }
 
     // Recursive equal-mass partition that always splits the leaf along its widest
     // coordinate dimension. This addresses the root cause of PC1-only slicing by
-    // adapting splits to the local geometry of each partition.
+    // adapting splits to the local geometry of each partition. Keep all row indices
+    // in a single buffer and sort subranges in-place so center selection stays exact
+    // without allocating fresh index vectors at every split.
+    let mut order: Vec<usize> = (0..n).collect();
     let mut leaves = vec![Leaf {
-        indices: (0..n).collect(),
+        start: 0,
+        end: n,
     }];
 
-    let choose_split_dim = |idxs: &[usize]| -> usize {
+    let choose_split_dim = |slice: &[usize]| -> usize {
         let mut best_dim = 0usize;
         let mut best_span = f64::NEG_INFINITY;
         for j in 0..d {
             let mut minv = f64::INFINITY;
             let mut maxv = f64::NEG_INFINITY;
-            for &idx in idxs {
+            for &idx in slice {
                 let v = data[[idx, j]];
                 if v < minv {
                     minv = v;
@@ -2047,8 +2052,9 @@ fn select_equal_mass_centers(
         let mut split_pos = None;
         let mut split_size = 0usize;
         for (i, leaf) in leaves.iter().enumerate() {
-            if leaf.indices.len() > split_size && leaf.indices.len() > 1 {
-                split_size = leaf.indices.len();
+            let leaf_size = leaf.end - leaf.start;
+            if leaf_size > split_size && leaf_size > 1 {
+                split_size = leaf_size;
                 split_pos = Some(i);
             }
         }
@@ -2057,23 +2063,26 @@ fn select_equal_mass_centers(
         };
 
         let leaf = leaves.swap_remove(pos);
-        let split_dim = choose_split_dim(&leaf.indices);
-        let mut sorted = leaf.indices;
-        sorted.sort_by(|&a, &b| {
+        let split_dim = choose_split_dim(&order[leaf.start..leaf.end]);
+        order[leaf.start..leaf.end].sort_by(|&a, &b| {
             let ord = data[[a, split_dim]].total_cmp(&data[[b, split_dim]]);
             if ord.is_eq() { a.cmp(&b) } else { ord }
         });
-        let mid = sorted.len() / 2;
-        let left = sorted[..mid].to_vec();
-        let right = sorted[mid..].to_vec();
+        let mid = leaf.start + (split_size / 2);
 
-        if left.is_empty() || right.is_empty() {
-            leaves.push(Leaf { indices: sorted });
+        if mid == leaf.start || mid == leaf.end {
+            leaves.push(leaf);
             break;
         }
 
-        leaves.push(Leaf { indices: left });
-        leaves.push(Leaf { indices: right });
+        leaves.push(Leaf {
+            start: leaf.start,
+            end: mid,
+        });
+        leaves.push(Leaf {
+            start: mid,
+            end: leaf.end,
+        });
     }
 
     if leaves.len() < num_centers {
@@ -2085,9 +2094,10 @@ fn select_equal_mass_centers(
 
     let mut centers = Array2::<f64>::zeros((num_centers, d));
     for (c, leaf) in leaves.iter().take(num_centers).enumerate() {
-        let m = leaf.indices.len() as f64;
+        let slice = &order[leaf.start..leaf.end];
+        let m = slice.len() as f64;
         let mut centroid = vec![0.0_f64; d];
-        for &idx in &leaf.indices {
+        for &idx in slice {
             for j in 0..d {
                 centroid[j] += data[[idx, j]];
             }
@@ -2096,9 +2106,9 @@ fn select_equal_mass_centers(
             *v /= m.max(1.0);
         }
 
-        let mut best_idx = leaf.indices[0];
+        let mut best_idx = slice[0];
         let mut best_d2 = f64::INFINITY;
-        for &idx in &leaf.indices {
+        for &idx in slice {
             let mut d2 = 0.0;
             for j in 0..d {
                 let delta = data[[idx, j]] - centroid[j];

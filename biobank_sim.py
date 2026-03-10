@@ -409,29 +409,39 @@ def survival_metrics(
 
 def ps_snapshot(pid: int) -> dict[str, Any]:
     try:
-        proc = subprocess.run(
+        commands = [
             ["ps", "-p", str(pid), "-o", "pid=,%cpu=,%mem=,rss=,vsz=,etimes=,stat=,comm="],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        line = proc.stdout.strip()
-        if not line:
-            return {}
-        parts = line.split(None, 7)
-        if len(parts) < 8:
-            return {}
-        return {
-            "pid": parts[0],
-            "cpu_pct": parts[1],
-            "mem_pct": parts[2],
-            "rss_kib": int(parts[3]) if parts[3].isdigit() else None,
-            "vsz_kib": int(parts[4]) if parts[4].isdigit() else None,
-            "etimes": parts[5],
-            "stat": parts[6],
-            "comm": parts[7],
-        }
+            ["ps", "-p", str(pid), "-o", "pid=", "-o", "%cpu=", "-o", "%mem=", "-o", "rss=", "-o", "vsz=", "-o", "etime=", "-o", "stat=", "-o", "comm="],
+        ]
+        for cmd in commands:
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            line = proc.stdout.strip()
+            if not line:
+                continue
+            parts = line.split(None, 7)
+            if len(parts) < 8:
+                continue
+            rss_raw = parts[3]
+            vsz_raw = parts[4]
+            rss_kib = int(rss_raw) if rss_raw.isdigit() else None
+            vsz_kib = int(vsz_raw) if vsz_raw.isdigit() else None
+            return {
+                "pid": parts[0],
+                "cpu_pct": parts[1],
+                "mem_pct": parts[2],
+                "rss_kib": rss_kib,
+                "vsz_kib": vsz_kib,
+                "etimes": parts[5],
+                "stat": parts[6],
+                "comm": parts[7],
+            }
+        return {}
     except Exception:
         return {}
 

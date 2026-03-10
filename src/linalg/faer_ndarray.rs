@@ -858,20 +858,21 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
         }
 
         let (rows, cols) = faer_mat.shape();
+        let rank = rows.min(cols);
         let compute_u_flag = if compute_u {
-            ComputeSvdVectors::Full
+            ComputeSvdVectors::Thin
         } else {
             ComputeSvdVectors::No
         };
         let computev_flag = if computevt {
-            ComputeSvdVectors::Full
+            ComputeSvdVectors::Thin
         } else {
             ComputeSvdVectors::No
         };
 
         let mut singular = Diag::<f64>::zeros(rows.min(cols));
-        let mut u_storage = compute_u.then(|| Mat::<f64>::zeros(rows, rows));
-        let mut v_storage = computevt.then(|| Mat::<f64>::zeros(cols, cols));
+        let mut u_storage = compute_u.then(|| Mat::<f64>::zeros(rows, rank));
+        let mut v_storage = computevt.then(|| Mat::<f64>::zeros(cols, rank));
 
         let par = get_global_parallelism();
         let mut mem = MemBuffer::new(svd::svd_scratch::<f64>(
@@ -992,8 +993,8 @@ impl<S: Data<Elem = f64>> FaerQr for ArrayBase<S, Ix2> {
     fn qr(&self) -> Result<(Array2<f64>, Array2<f64>), FaerLinalgError> {
         let faerview = FaerArrayView::new(self);
         let qr = faerview.as_ref().qr();
-        let q = qr.compute_Q();
-        let r = qr.R();
+        let q = qr.compute_thin_Q();
+        let r = qr.thin_R();
         Ok((mat_to_array(q.as_ref()), mat_to_array(r)))
     }
 }
