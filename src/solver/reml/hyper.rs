@@ -150,26 +150,22 @@ impl<'a> RemlState<'a> {
         Ok(out)
     }
 
-    fn get_pairwisesecond_penalty_component(
+    fn get_pairwisesecond_penalty_components(
         hyper_dirs: &[DirectionalHyperParam],
         i: usize,
         j: usize,
-        penalty_index: usize,
-        p: usize,
-    ) -> Array2<f64> {
-        if let Some(component) = hyper_dirs
+    ) -> Vec<PenaltyDerivativeComponent> {
+        if let Some(components) = hyper_dirs
             .get(i)
             .and_then(|dir| dir.penaltysecond_components_for(j))
-            .map(|_| hyper_dirs[i].penaltysecond_component_matrix(j, penalty_index, p))
         {
-            if component.iter().any(|v| *v != 0.0) {
-                return component;
-            }
+            return components.to_vec();
         }
         hyper_dirs
             .get(j)
-            .map(|dir| dir.penaltysecond_component_matrix(i, penalty_index, p))
-            .unwrap_or_else(|| Array2::<f64>::zeros((p, p)))
+            .and_then(|dir| dir.penaltysecond_components_for(i))
+            .map(|components| components.to_vec())
+            .unwrap_or_default()
     }
 
     fn add_penalty_components_to_state(
@@ -421,22 +417,9 @@ impl<'a> RemlState<'a> {
                 {
                     x_mod.scaled_add(amp, x_ij);
                 }
-                let mut second_components = Vec::<PenaltyDerivativeComponent>::new();
-                for penalty_index in 0..s_mod.len() {
-                    let matrix = Self::get_pairwisesecond_penalty_component(
-                        hyper_dirs,
-                        i,
-                        j,
-                        penalty_index,
-                        self.p,
-                    );
-                    if matrix.iter().any(|v| *v != 0.0) {
-                        second_components.push(PenaltyDerivativeComponent {
-                            penalty_index,
-                            matrix,
-                        });
-                    }
-                }
+                let second_components = Self::get_pairwisesecond_penalty_components(
+                    hyper_dirs, i, j,
+                );
                 Self::add_penalty_components_to_state(&mut s_mod, &second_components, amp)?;
             }
         }
@@ -1236,40 +1219,27 @@ impl<'a> RemlState<'a> {
                 )
             })
             .collect();
-        let mut a_tau_tau = vec![vec![Array2::<f64>::zeros((p_dim, p_dim)); psi_dim]; psi_dim];
+        let mut a_tau_tau = vec![vec![None; psi_dim]; psi_dim];
         for i in 0..psi_dim {
             for j in 0..psi_dim {
-                if hyper_dirs[i].penaltysecond_components_for(j).is_none()
-                    && hyper_dirs
-                        .get(j)
-                        .and_then(|dir| dir.penaltysecond_components_for(i))
-                        .is_none()
-                {
+                let second_components =
+                    Self::get_pairwisesecond_penalty_components(hyper_dirs, i, j);
+                if second_components.is_empty() {
                     continue;
                 }
-                let mut total = Array2::<f64>::zeros((p_dim, p_dim));
-                for penalty_index in 0..rho.len() {
-                    let mat = Self::transform_penalty_components(
-                        &[PenaltyDerivativeComponent {
-                            penalty_index,
-                            matrix: Self::get_pairwisesecond_penalty_component(
-                                hyper_dirs,
-                                i,
-                                j,
-                                penalty_index,
-                                self.p,
-                            ),
-                        }],
-                        &reparam_result.qs,
-                        free_basis_opt.as_ref(),
-                    );
-                    if let Some(component) = mat.first() {
-                        if component.matrix.iter().any(|v| *v != 0.0) {
-                            total.scaled_add(rho[penalty_index].exp(), &component.matrix);
-                        }
-                    }
-                }
-                a_tau_tau[i][j] = total;
+                let transformed = Self::transform_penalty_components(
+                    &second_components,
+                    &reparam_result.qs,
+                    free_basis_opt.as_ref(),
+                );
+                let total = transformed.iter().fold(
+                    Array2::<f64>::zeros((p_dim, p_dim)),
+                    |mut acc, component| {
+                        acc.scaled_add(rho[component.penalty_index].exp(), &component.matrix);
+                        acc
+                    },
+                );
+                a_tau_tau[i][j] = Some(total);
             }
         }
         let firth_op = if firth_logit_active {
@@ -1420,7 +1390,10 @@ impl<'a> RemlState<'a> {
                     - term2c
                     - term2d
                     - a_tau[i].dot(&beta_tau[j])
-                    - a_tau_tau[i][j].dot(&beta_eval);
+                    - a_tau_tau[i][j]
+                        .as_ref()
+                        .map(|a| a.dot(&beta_eval))
+                        .unwrap_or_else(|| Array1::<f64>::zeros(p_dim));
                 if let (Some(op), Some(kernels)) = (firth_op.as_ref(), firth_tau_kernels.as_ref()) {
                     let mut btj = Array2::<f64>::zeros((p_dim, 1));
                     btj.column_mut(0).assign(&beta_tau[j]);
@@ -1462,7 +1435,9 @@ impl<'a> RemlState<'a> {
                 h_ij += &x_tau_t[j].t().dot(&Self::row_scale(&x_eval, &diag_i));
                 h_ij += &x_eval.t().dot(&Self::row_scale(&x_tau_t[j], &diag_i));
                 h_ij += &Self::xt_diag_x_dense_into(&x_eval, &diag_ij, &mut weighted);
-                h_ij += &a_tau_tau[i][j];
+                if let Some(aij) = a_tau_tau[i][j].as_ref() {
+                    h_ij += aij;
+                }
 
                 let mut d1_trace_correction = 0.0_f64;
                 let mut d2_trace_correction = 0.0_f64;
@@ -1492,7 +1467,11 @@ impl<'a> RemlState<'a> {
                 }
 
                 let q = beta_eval.dot(&a_tau[i].dot(&beta_tau[j]))
-                    + 0.5 * beta_eval.dot(&a_tau_tau[i][j].dot(&beta_eval));
+                    + 0.5
+                        * a_tau_tau[i][j]
+                            .as_ref()
+                            .map(|aij| beta_eval.dot(&aij.dot(&beta_eval)))
+                            .unwrap_or(0.0);
                 // l = 0.5[ tr(H_+^† H_{ij}) - tr(H_+^† H_j H_+^† H_i) ]
                 // with explicit subtractive Firth trace corrections for:
                 //   D(Hphi)[beta_ij], D²(Hphi)[beta_i,beta_j],
@@ -1505,7 +1484,11 @@ impl<'a> RemlState<'a> {
                         - trace_hdag_b_hdag_c(&h_tau[j], &h_tau[i]));
                 // P_{ij} = -0.5[ tr(S^+ S_{ij}) - tr(S^+ S_j S^+ S_i) ].
                 let p_term = 0.5 * Self::trace_product(&sdag_a[j], &sdag_a[i])
-                    - 0.5 * Self::trace_product(&s_dag, &a_tau_tau[i][j]);
+                    - 0.5
+                        * a_tau_tau[i][j]
+                            .as_ref()
+                            .map(|aij| Self::trace_product(&s_dag, aij))
+                            .unwrap_or(0.0);
                 let val = q + l + p_term;
                 h_tt[[i, j]] = val;
                 h_tt[[j, i]] = val;

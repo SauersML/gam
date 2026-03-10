@@ -1316,22 +1316,6 @@ impl DirectionalHyperParam {
         Ok(total)
     }
 
-    pub(crate) fn penaltysecond_component_matrix(
-        &self,
-        j: usize,
-        penalty_index: usize,
-        p: usize,
-    ) -> Array2<f64> {
-        if let Some(components) = self.penaltysecond_components_for(j) {
-            if let Some(component) = components
-                .iter()
-                .find(|component| component.penalty_index == penalty_index)
-            {
-                return component.matrix.clone();
-            }
-        }
-        Array2::<f64>::zeros((p, p))
-    }
 }
 
 #[derive(Clone, Debug)]
