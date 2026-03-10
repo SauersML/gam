@@ -273,12 +273,30 @@ impl SymmetricMatrix {
     }
 
     pub fn addridge(&self, ridge: f64) -> Result<Self, String> {
-        let n = self.nrows();
-        let mut diagonal = Array2::<f64>::zeros((n, n));
-        for i in 0..n {
-            diagonal[[i, i]] = ridge;
+        if ridge == 0.0 {
+            return Ok(self.clone());
         }
-        self.add_dense(&diagonal)
+        match self {
+            Self::Dense(mat) => {
+                let mut out = mat.clone();
+                for i in 0..out.nrows() {
+                    out[[i, i]] += ridge;
+                }
+                Ok(Self::Dense(out))
+            }
+            Self::Sparse(mat) => {
+                let n = mat.nrows();
+                let mut trip = Vec::with_capacity(n);
+                for i in 0..n {
+                    trip.push(Triplet::new(i, i, ridge));
+                }
+                let diagonal = SparseColMat::<usize, f64>::try_new_from_triplets(n, n, &trip)
+                    .map_err(|_| {
+                        "SymmetricMatrix::addridge failed to assemble sparse diagonal".to_string()
+                    })?;
+                Ok(Self::Sparse(add_sparse_symmetric_upper(mat, &diagonal)?))
+            }
+        }
     }
 
     pub fn nrows(&self) -> usize {

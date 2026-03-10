@@ -1,9 +1,11 @@
 use crate::construction::calculate_condition_number;
+use crate::faer_ndarray::FaerEigh;
 use crate::faer_ndarray::{
     FaerArrayView, FaerLinalgError, array2_to_matmut, factorize_symmetricwith_fallback,
 };
 use faer::Side;
 use ndarray::{Array1, Array2};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
@@ -297,6 +299,99 @@ where
     None
 }
 
+pub(crate) fn stochastic_lanczos_logdet_spd(
+    matrix: &Array2<f64>,
+    num_probes: usize,
+    lanczos_steps: usize,
+    seed: u64,
+) -> Result<f64, String> {
+    let p = matrix.nrows();
+    if matrix.ncols() != p {
+        return Err("SLQ requires a square matrix".to_string());
+    }
+    if p == 0 {
+        return Ok(0.0);
+    }
+    let probes = num_probes.max(1);
+    let steps = lanczos_steps.clamp(2, p.max(2));
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut estimate = 0.0;
+    for _ in 0..probes {
+        let mut z = Array1::<f64>::zeros(p);
+        for i in 0..p {
+            z[i] = if rng.random::<bool>() { 1.0 } else { -1.0 };
+        }
+        estimate += lanczos_logdet_probe(matrix, &z, steps)?;
+    }
+    Ok(estimate / probes as f64)
+}
+
+fn lanczos_logdet_probe(
+    matrix: &Array2<f64>,
+    probe: &Array1<f64>,
+    max_steps: usize,
+) -> Result<f64, String> {
+    let p = probe.len();
+    let probe_norm_sq = probe.dot(probe);
+    if !probe_norm_sq.is_finite() || probe_norm_sq <= 0.0 {
+        return Err("SLQ probe has invalid norm".to_string());
+    }
+    let mut q_prev = Array1::<f64>::zeros(p);
+    let mut q = probe.mapv(|v| v / probe_norm_sq.sqrt());
+    let mut alphas = Vec::<f64>::with_capacity(max_steps);
+    let mut betas = Vec::<f64>::with_capacity(max_steps.saturating_sub(1));
+    let mut beta_prev = 0.0_f64;
+    let tol = 1e-12;
+
+    for _ in 0..max_steps {
+        let mut v = matrix.dot(&q);
+        if beta_prev > 0.0 {
+            v.scaled_add(-beta_prev, &q_prev);
+        }
+        let alpha = q.dot(&v);
+        if !alpha.is_finite() {
+            return Err("SLQ Lanczos produced non-finite alpha".to_string());
+        }
+        v.scaled_add(-alpha, &q);
+        let beta = v.dot(&v).sqrt();
+        alphas.push(alpha);
+        if !beta.is_finite() {
+            return Err("SLQ Lanczos produced non-finite beta".to_string());
+        }
+        if beta <= tol {
+            break;
+        }
+        betas.push(beta);
+        q_prev = q;
+        q = v.mapv(|x| x / beta);
+        beta_prev = beta;
+    }
+
+    let m = alphas.len();
+    if m == 0 {
+        return Err("SLQ Lanczos did not produce any steps".to_string());
+    }
+    let mut tri = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        tri[[i, i]] = alphas[i];
+        if i + 1 < m {
+            tri[[i, i + 1]] = betas[i];
+            tri[[i + 1, i]] = betas[i];
+        }
+    }
+    let (evals, evecs) =
+        FaerEigh::eigh(&tri, Side::Lower).map_err(|e| format!("SLQ tridiagonal eig failed: {e}"))?;
+    let mut quad = 0.0_f64;
+    for k in 0..m {
+        if evals[k] <= 0.0 {
+            return Err("SLQ encountered non-positive Ritz value on SPD surface".to_string());
+        }
+        let weight = evecs[(0, k)] * evecs[(0, k)];
+        quad += weight * evals[k].ln();
+    }
+    Ok(probe_norm_sq * quad)
+}
+
 #[derive(Clone)]
 pub(crate) struct RidgePlanner {
     cond_estimate: Option<f64>,
@@ -392,7 +487,7 @@ impl RidgePlanner {
 
 #[cfg(test)]
 mod tests {
-    use super::{boundary_hit_step_fraction, solve_spd_pcg};
+    use super::{boundary_hit_step_fraction, solve_spd_pcg, stochastic_lanczos_logdet_spd};
     use ndarray::{Array1, array};
 
     #[test]
@@ -421,5 +516,18 @@ mod tests {
         let x = solve_spd_pcg(|v| h.dot(v), &b, &m, 1e-10, 20).expect("pcg solve");
         assert!((x[0] - 0.0909090909).abs() < 1e-8);
         assert!((x[1] - 0.6363636363).abs() < 1e-8);
+    }
+
+    #[test]
+    fn stochastic_lanczos_logdet_tracks_exact_spd_logdet() {
+        let h = array![
+            [5.0, 1.0, 0.2],
+            [1.0, 4.0, 0.3],
+            [0.2, 0.3, 3.5]
+        ];
+        let exact = h.clone().cholesky(Side::Lower).expect("chol");
+        let exact_logdet = 2.0 * exact.diag().mapv(f64::ln).sum();
+        let approx = stochastic_lanczos_logdet_spd(&h, 16, 12, 7).expect("slq");
+        assert!((approx - exact_logdet).abs() < 5e-2);
     }
 }

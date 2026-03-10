@@ -163,6 +163,8 @@ impl From<GlmLikelihoodFamily> for LikelihoodFamily {
 pub enum RidgeDeterminantMode {
     /// Use full log-determinant of the ridged matrix (requires SPD in practice).
     Full,
+    /// Use stochastic Lanczos quadrature on the ridged SPD surface.
+    StochasticLanczos,
     /// Use positive-part pseudo-determinant (sum log ev for ev > floor).
     PositivePart,
 }
@@ -206,6 +208,13 @@ impl RidgePolicy {
     pub fn explicit_stabilization_pospart() -> Self {
         Self {
             determinant_mode: RidgeDeterminantMode::PositivePart,
+            ..Self::explicit_stabilization_full()
+        }
+    }
+
+    pub fn explicit_stabilization_full_slq() -> Self {
+        Self {
+            determinant_mode: RidgeDeterminantMode::StochasticLanczos,
             ..Self::explicit_stabilization_full()
         }
     }
