@@ -1,0 +1,204 @@
+name: Biobank Scale
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 5 * * *"
+
+concurrency:
+  group: biobank-scale-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      cache_key: ${{ steps.cache_key.outputs.cache_key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.3"
+
+      - name: Install Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy matplotlib lifelines pandas xgboost scikit-learn
+
+      - name: Install R packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript -e 'install.packages(c("mgcv","survival","jsonlite"), repos="https://cloud.r-project.org")'
+
+      - name: Compute cache key
+        id: cache_key
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="biobank-scale-${{ runner.os }}-${{ hashFiles('biobank_sim.py', 'biobank_scale.yml', '.github/workflows/biobank_scale.yml', 'Cargo.toml') }}"
+          echo "cache_key=${key}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore prepared cohort cache
+        id: prep_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bench/biobank_scale/prepared
+          key: ${{ steps.cache_key.outputs.cache_key }}
+
+      - name: Prepare full cohort
+        if: ${{ steps.prep_cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 biobank_sim.py prepare --config biobank_scale.yml --out-dir bench/biobank_scale/prepared
+
+      - name: Save prepared cohort cache
+        if: ${{ steps.prep_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: bench/biobank_scale/prepared
+          key: ${{ steps.cache_key.outputs.cache_key }}
+
+      - name: Build method matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix=$(python3 biobank_sim.py matrix --config biobank_scale.yml)
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload prepared cohort
+        uses: actions/upload-artifact@v4
+        with:
+          name: biobank-scale-prepared
+          path: bench/biobank_scale/prepared
+          if-no-files-found: error
+
+  benchmark:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.3"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy matplotlib lifelines pandas xgboost scikit-learn
+
+      - name: Install R packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript -e 'install.packages(c("mgcv","survival","jsonlite"), repos="https://cloud.r-project.org")'
+
+      - name: Download prepared cohort
+        uses: actions/download-artifact@v4
+        with:
+          name: biobank-scale-prepared
+          path: bench/biobank_scale/prepared
+
+      - name: Run benchmark method
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bench/biobank_scale/results bench/biobank_scale/runs/${{ matrix.name }}
+          python3 biobank_sim.py run-method \
+            --config biobank_scale.yml \
+            --prep-dir bench/biobank_scale/prepared \
+            --method "${{ matrix.name }}" \
+            --out-dir "bench/biobank_scale/runs/${{ matrix.name }}" \
+            --out-json "bench/biobank_scale/results/${{ matrix.name }}.json"
+
+      - name: Upload method artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: biobank-scale-${{ matrix.name }}
+          path: |
+            bench/biobank_scale/results/${{ matrix.name }}.json
+            bench/biobank_scale/runs/${{ matrix.name }}
+          if-no-files-found: error
+
+  aggregate:
+    needs: benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy matplotlib lifelines
+
+      - name: Download prepared cohort
+        uses: actions/download-artifact@v4
+        with:
+          name: biobank-scale-prepared
+          path: bench/biobank_scale/prepared
+
+      - name: Download method artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bench/biobank_scale/artifacts
+
+      - name: Collect result jsons
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bench/biobank_scale/results
+          find bench/biobank_scale/artifacts -path '*/results/*.json' -type f -print -exec cp {} bench/biobank_scale/results/ \;
+
+      - name: Aggregate outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 biobank_sim.py aggregate \
+            --config biobank_scale.yml \
+            --prep-dir bench/biobank_scale/prepared \
+            --results-dir bench/biobank_scale/results \
+            --out-dir bench/biobank_scale/final
+
+      - name: Upload aggregate bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: biobank-scale-bundle
+          path: bench/biobank_scale/final/biobank_scale_bundle.zip
+          if-no-files-found: error
