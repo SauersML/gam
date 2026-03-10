@@ -1,7 +1,8 @@
 use crate::construction::calculate_condition_number;
 use crate::faer_ndarray::FaerEigh;
 use crate::faer_ndarray::{
-    FaerArrayView, FaerLinalgError, array2_to_matmut, factorize_symmetricwith_fallback,
+    FaerArrayView, FaerCholesky, FaerLinalgError, array2_to_matmut,
+    factorize_symmetricwith_fallback,
 };
 use faer::Side;
 use ndarray::{Array1, Array2};
@@ -366,6 +367,13 @@ where
     if dim == 0 {
         return Ok(0.0);
     }
+    if dim <= 128 {
+        let matrix = materialize_symmetric_operator(dim, &apply)?;
+        let chol = matrix
+            .cholesky(Side::Lower)
+            .map_err(|_| "SLQ exact tiny-system Cholesky failed".to_string())?;
+        return Ok(2.0 * chol.diag().mapv(f64::ln).sum());
+    }
     let probes = num_probes.max(1);
     let steps = lanczos_steps.clamp(2, dim.max(2));
     let mut rng = StdRng::seed_from_u64(seed);
@@ -378,6 +386,32 @@ where
         estimate += lanczos_logdet_probe_operator(dim, &apply, &z, steps)?;
     }
     Ok(estimate / probes as f64)
+}
+
+fn materialize_symmetric_operator<F>(dim: usize, apply: &F) -> Result<Array2<f64>, String>
+where
+    F: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    let mut matrix = Array2::<f64>::zeros((dim, dim));
+    for j in 0..dim {
+        let mut basis = Array1::<f64>::zeros(dim);
+        basis[j] = 1.0;
+        let col = apply(&basis);
+        if col.len() != dim {
+            return Err("operator returned wrong output dimension".to_string());
+        }
+        for i in 0..dim {
+            matrix[[i, j]] = col[i];
+        }
+    }
+    for i in 0..dim {
+        for j in (i + 1)..dim {
+            let avg = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
+            matrix[[i, j]] = avg;
+            matrix[[j, i]] = avg;
+        }
+    }
+    Ok(matrix)
 }
 
 fn lanczos_logdet_probe_operator<F>(
@@ -396,6 +430,7 @@ where
     }
     let mut q_prev = Array1::<f64>::zeros(p);
     let mut q = probe.mapv(|v| v / probe_norm_sq.sqrt());
+    let mut q_basis = Vec::<Array1<f64>>::with_capacity(max_steps);
     let mut alphas = Vec::<f64>::with_capacity(max_steps);
     let mut betas = Vec::<f64>::with_capacity(max_steps.saturating_sub(1));
     let mut beta_prev = 0.0_f64;
@@ -411,11 +446,24 @@ where
             return Err("SLQ Lanczos produced non-finite alpha".to_string());
         }
         v.scaled_add(-alpha, &q);
+        // Reorthogonalize against the accumulated basis to limit ghost Ritz
+        // values and reduce variance on moderate-dimension SPD systems.
+        for basis_vec in &q_basis {
+            let proj = basis_vec.dot(&v);
+            if proj != 0.0 {
+                v.scaled_add(-proj, basis_vec);
+            }
+        }
+        let q_self_proj = q.dot(&v);
+        if q_self_proj != 0.0 {
+            v.scaled_add(-q_self_proj, &q);
+        }
         let beta = v.dot(&v).sqrt();
         alphas.push(alpha);
         if !beta.is_finite() {
             return Err("SLQ Lanczos produced non-finite beta".to_string());
         }
+        q_basis.push(q.clone());
         if beta <= tol {
             break;
         }
