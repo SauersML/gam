@@ -1159,18 +1159,54 @@ def do_prepare(args: argparse.Namespace) -> int:
 
 def rust_joint_term(basis: str, cols: list[str], centers: int) -> str:
     joined = ", ".join(cols)
+    if basis in {"thinplate", "tps"}:
+        return f"thinplate({joined}, centers={centers})"
+    if basis == "matern":
+        return f"matern({joined}, centers={centers})"
     if basis == "duchon":
         return f"duchon({joined}, centers={centers}, order=0, power=1)"
-    raise RuntimeError(f"unsupported Rust biobank basis '{basis}'; use duchon")
+    raise RuntimeError(f"unsupported Rust biobank basis '{basis}'")
 
 
 def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
-    if spec.smooth_kind != "joint":
-        raise RuntimeError(f"{spec.name} must use a joint Rust smooth")
     linear_terms = ["linear(age_entry_std)", "linear(sex)"]
-    smooth_cols = ["lat_final_std", "lon_final_std", "pgs_std"]
-    smooth_cols.extend(f"pc{i}_std" for i in range(1, 17))
-    linear_terms.append(rust_joint_term(spec.spatial_basis, smooth_cols, int(spec.centers or 60)))
+    linear_terms.append("linear(pgs_std)")
+    if spec.smooth_kind == "joint":
+        smooth_cols = ["lat_final_std", "lon_final_std", "pgs_std"]
+        smooth_cols.extend(f"pc{i}_std" for i in range(1, 17))
+        linear_terms.append(rust_joint_term(spec.spatial_basis, smooth_cols, int(spec.centers or 60)))
+    else:
+        basis = spec.spatial_basis
+        centers = int(spec.centers or 60)
+        if basis in {"thinplate", "tps"}:
+            linear_terms.extend(
+                [
+                    f"s(lat_final_std, type=tps, centers={centers})",
+                    f"s(lon_final_std, type=tps, centers={centers})",
+                ]
+            )
+        elif basis == "duchon":
+            linear_terms.extend(
+                [
+                    f"s(lat_final_std, type=duchon, centers={centers}, order=0, power=1)",
+                    f"s(lon_final_std, type=duchon, centers={centers}, order=0, power=1)",
+                ]
+            )
+        elif basis == "matern":
+            linear_terms.extend(
+                [
+                    f"s(lat_final_std, type=matern, centers={centers})",
+                    f"s(lon_final_std, type=matern, centers={centers})",
+                ]
+            )
+        else:
+            linear_terms.extend(
+                [
+                    "s(lat_final_std, type=ps, knots=10)",
+                    "s(lon_final_std, type=ps, knots=10)",
+                ]
+            )
+    linear_terms.extend(f"linear(pc{i}_std)" for i in range(1, 17))
     mean_formula = "phenotype ~ " + " + ".join(linear_terms) + " + link(type=logit)"
     sigma_terms = ["linear(pgs_std)", "linear(age_entry_std)", "linear(lat_final_std)", "linear(lon_final_std)"]
     sigma_formula = "phenotype ~ " + " + ".join(sigma_terms)
@@ -1234,7 +1270,7 @@ def run_rust_classification(spec: MethodSpec, train_csv: Path, test_csv: Path, o
     fit_cmd = [str(rust_bin), "fit"]
     if spec.include_sigma:
         fit_cmd.extend(["--predict-noise", sigma_formula])
-    fit_cmd.extend(["--no-summary", "--out", str(model_path), str(train_csv), mean_formula])
+    fit_cmd.extend(["--out", str(model_path), str(train_csv), mean_formula])
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
     fit_sec = time.perf_counter() - t0
@@ -1251,12 +1287,13 @@ def run_rust_classification(spec: MethodSpec, train_csv: Path, test_csv: Path, o
     y_train = csv_numeric_column(train_csv, "phenotype")
     y_test = csv_numeric_column(test_csv, "phenotype")
     metrics = classification_metrics(y_test, pred, float(np.mean(y_train)))
+    spatial_desc = f"additive {spec.spatial_basis}" if spec.smooth_kind != "joint" else spec.spatial_basis
     return {
         "fit_sec": fit_sec,
         "predict_sec": predict_sec,
         "metrics": metrics,
         "prediction_path": str(pred_path),
-        "model_spec": f"Rust joint {spec.spatial_basis} {'GAMLSS' if spec.include_sigma else 'GAM'} holdout",
+        "model_spec": f"Rust {spatial_desc} {'GAMLSS' if spec.include_sigma else 'GAM'} holdout",
     }
 
 
@@ -1265,9 +1302,9 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     formula_rhs = rust_formula_survival(spec)
     model_path = out_dir / f"{spec.name}.model.json"
     pred_path = out_dir / f"{spec.name}.pred.csv"
-    likelihood_mode = "probit-location-scale"
+    likelihood_mode = "transformation" if spec.backend == "rust_survival_transform" else "probit-location-scale"
     fit_cmd = [
-        str(rust_bin), "fit", "--no-summary",
+        str(rust_bin), "fit",
         "--survival-likelihood", likelihood_mode,
         "--time-basis", "ispline",
         "--time-degree", "3",
@@ -1302,8 +1339,8 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         raise RuntimeError(err.strip() or out.strip() or f"{spec.name} train predict failed")
     train_pred_rows = read_csv_rows(train_pred_path)
     train_risk = np.array([float(r[risk_key]) for r in train_pred_rows], dtype=float)
-    train_rows = [{k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()} for r in read_csv_rows(train_csv)]
-    test_rows = [{k: (float(v) if k in {"time", "event"} else v) for k, v in r.items()} for r in read_csv_rows(test_csv)]
+    train_rows = [{k: (float(v) if k in {"time0", "time", "event"} else v) for k, v in r.items()} for r in read_csv_rows(train_csv)]
+    test_rows = [{k: (float(v) if k in {"time0", "time", "event"} else v) for k, v in r.items()} for r in read_csv_rows(test_csv)]
     metrics = survival_metrics(train_rows, test_rows, train_risk, test_risk)
     return {
         "fit_sec": fit_sec,
@@ -1419,7 +1456,7 @@ def run_method(spec: MethodSpec, prep_dir: Path, out_dir: Path) -> dict[str, Any
         else:
             raise RuntimeError(f"unsupported disease backend '{spec.backend}'")
     elif spec.dataset == "survival":
-        if spec.backend == "rust_gamlss_survival":
+        if spec.backend in {"rust_survival", "rust_survival_transform", "rust_gamlss_survival"}:
             result = run_rust_survival(spec, survival_train, survival_test, out_dir)
         elif spec.backend == "r_mgcv_survival":
             result = run_r_mgcv_survival(spec, survival_train, survival_test, out_dir)

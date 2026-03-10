@@ -125,7 +125,6 @@ def fit_rust_curve(
             formula,
             "--adaptive-regularization",
             "false",
-            "--no-summary",
             "--out",
             model_path,
         ]
