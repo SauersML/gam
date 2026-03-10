@@ -1415,7 +1415,7 @@ mod tests {
     #[test]
     fn explicit_matrix_free_pcg_reports_convergence_diagnostics() {
         let n = 36usize;
-        let p = 540usize;
+        let p = 2160usize;
         let mut x = Array2::<f64>::zeros((n, p));
         for i in 0..n {
             for j in 0..p {
