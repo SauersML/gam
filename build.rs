@@ -175,7 +175,7 @@ fn detect_total_memory_bytes() -> Option<u64> {
         if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
             for line in meminfo.lines() {
                 if let Some(rest) = line.strip_prefix("MemTotal:") {
-                    let mut parts = rest.splitwhitespace();
+                    let mut parts = rest.split_whitespace();
                     if let Some(rawvalue) = parts.next() {
                         if let Ok(kib) = rawvalue.parse::<u64>() {
                             return Some(kib.saturating_mul(1024));
