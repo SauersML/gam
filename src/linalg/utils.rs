@@ -488,6 +488,7 @@ impl RidgePlanner {
 #[cfg(test)]
 mod tests {
     use super::{boundary_hit_step_fraction, solve_spd_pcg, stochastic_lanczos_logdet_spd};
+    use faer::Side;
     use ndarray::{Array1, array};
 
     #[test]

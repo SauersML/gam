@@ -981,6 +981,7 @@ pub struct ExternalOptimOptions {
     pub optimize_mixture: bool,
     pub sas_link: Option<SasLinkSpec>,
     pub optimize_sas: bool,
+    pub compute_inference: bool,
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
@@ -1908,66 +1909,78 @@ where
         0.0
     };
 
-    // EDF by block using stabilized H and penalty roots in transformed basis
     let lambdas = final_rho.mapv(f64::exp);
-    let h = &pirls_res.stabilizedhessian_transformed;
-    let stable_solver = StableSolver::new("edf stabilized hessian");
-    let mut planner = RidgePlanner::new(h);
-    let cond_display = planner
-        .cond_estimate()
-        .map(|c| format!("{c:.2e}"))
-        .unwrap_or_else(|| "unavailable".to_string());
-    let factor = loop {
-        let ridge = planner.ridge();
-        let candidate = addridge(h, ridge);
-        if let Ok(f) = stable_solver.factorize(&candidate) {
-            if ridge > 0.0 {
+    let p_dim = pirls_res.beta_transformed.len();
+    let mut edf_by_block = vec![f64::NAN; k];
+    let mut edf_total = f64::NAN;
+    let mut smoothing_correction = None;
+    let mut penalized_hessian = Array2::<f64>::zeros((0, 0));
+    let mut beta_covariance = None;
+    let mut beta_standard_errors = None;
+    let mut beta_covariance_corrected = None;
+    let mut beta_standard_errors_corrected = None;
+
+    if opts.compute_inference {
+        // EDF by block using stabilized H and penalty roots in transformed basis.
+        let h = &pirls_res.stabilizedhessian_transformed;
+        let stable_solver = StableSolver::new("edf stabilized hessian");
+        let mut planner = RidgePlanner::new(h);
+        let cond_display = planner
+            .cond_estimate()
+            .map(|c| format!("{c:.2e}"))
+            .unwrap_or_else(|| "unavailable".to_string());
+        let factor = loop {
+            let ridge = planner.ridge();
+            let candidate = addridge(h, ridge);
+            if let Ok(f) = stable_solver.factorize(&candidate) {
+                if ridge > 0.0 {
+                    log::warn!(
+                        "Stabilized Hessian factorized with ridge {:.3e} (cond ≈ {})",
+                        ridge,
+                        cond_display
+                    );
+                }
+                break f;
+            }
+            if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
                 log::warn!(
-                    "Stabilized Hessian factorized with ridge {:.3e} (cond ≈ {})",
+                    "Hessian factorization failed after ridge {:.3e} (cond ≈ {})",
                     ridge,
                     cond_display
                 );
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
             }
-            break f;
+            planner.bumpwith_matrix(h);
+        };
+        let mut traces = vec![0.0f64; k];
+        for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
+            let ekt_arr = rs.t().to_owned();
+            let ektview = FaerArrayView::new(&ekt_arr);
+            let x_sol = factor.solve(ektview.as_ref());
+            let frob = faer_frob_inner(x_sol.as_ref(), ektview.as_ref());
+            traces[kk] = lambdas[kk] * frob;
         }
-        if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
-            log::warn!(
-                "Hessian factorization failed after ridge {:.3e} (cond ≈ {})",
-                ridge,
-                cond_display
-            );
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
+        let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
+        let mp = (p_dim as f64 - penalty_rank as f64).max(0.0);
+        edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
+        for (kk, rs_k) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
+            let p_k = rs_k.nrows() as f64;
+            let edf_k = (p_k - traces[kk]).clamp(0.0, p_k);
+            edf_by_block[kk] = edf_k;
         }
-        planner.bumpwith_matrix(h);
-    };
-    let mut traces = vec![0.0f64; k];
-    for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
-        let ekt_arr = rs.t().to_owned();
-        let ektview = FaerArrayView::new(&ekt_arr);
-        let x_sol = factor.solve(ektview.as_ref());
-        let frob = faer_frob_inner(x_sol.as_ref(), ektview.as_ref());
-        traces[kk] = lambdas[kk] * frob;
-    }
-    let p_dim = pirls_res.beta_transformed.len();
-    let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
-    let mp = (p_dim as f64 - penalty_rank as f64).max(0.0);
-    let edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
-    // Per-block EDF: use block range dimension (rank of R_k) minus λ tr(H^{-1} S_k)
-    // This better reflects penalized coefficients in the transformed basis
-    let mut edf_by_block: Vec<f64> = Vec::with_capacity(k);
-    for (kk, rs_k) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
-        let p_k = rs_k.nrows() as f64;
-        let edf_k = (p_k - traces[kk]).clamp(0.0, p_k);
-        edf_by_block.push(edf_k);
     }
 
     // Persist residual-based scale for Gaussian identity models.
     // Contract: residual standard deviation sigma, not variance.
     let standard_deviation = match cfg.link_function() {
         LinkFunction::Identity => {
-            let denom = (n - edf_total).max(1.0);
+            let denom = if opts.compute_inference {
+                (n - edf_total).max(1.0)
+            } else {
+                n.max(1.0)
+            };
             (weighted_rss / denom).sqrt()
         }
         LinkFunction::Logit
@@ -1988,44 +2001,43 @@ where
         outer_result.finalgrad_norm
     };
 
-    let penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
-    let beta_covariance =
-        matrix_inversewith_regularization(&penalized_hessian, "posterior covariance");
-    let smoothing_correction = reml_state.compute_smoothing_correction_auto(
-        &final_rho,
-        &pirls_res,
-        beta_covariance.as_ref(),
-        finalgrad_norm,
-    );
-    let beta_standard_errors = beta_covariance.as_ref().map(se_from_covariance);
-    let beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
-        (Some(base_cov), Some(corr)) if base_cov.dim() == corr.dim() => {
-            // First-order total covariance assembly:
-            //   Var(beta) ~= Var(beta | rho_hat) + J Var(rho_hat) J^T
-            //             ~= base_cov + corr.
-            let mut corrected = base_cov.clone();
-            corrected += corr;
-            // Keep covariance symmetric after numerical addition.
-            for i in 0..corrected.nrows() {
-                for j in (i + 1)..corrected.ncols() {
-                    let avg = 0.5 * (corrected[[i, j]] + corrected[[j, i]]);
-                    corrected[[i, j]] = avg;
-                    corrected[[j, i]] = avg;
+    if opts.compute_inference {
+        penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
+        beta_covariance =
+            matrix_inversewith_regularization(&penalized_hessian, "posterior covariance");
+        smoothing_correction = reml_state.compute_smoothing_correction_auto(
+            &final_rho,
+            &pirls_res,
+            beta_covariance.as_ref(),
+            finalgrad_norm,
+        );
+        beta_standard_errors = beta_covariance.as_ref().map(se_from_covariance);
+        beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
+            (Some(base_cov), Some(corr)) if base_cov.dim() == corr.dim() => {
+                let mut corrected = base_cov.clone();
+                corrected += corr;
+                for i in 0..corrected.nrows() {
+                    for j in (i + 1)..corrected.ncols() {
+                        let avg = 0.5 * (corrected[[i, j]] + corrected[[j, i]]);
+                        corrected[[i, j]] = avg;
+                        corrected[[j, i]] = avg;
+                    }
                 }
+                Some(corrected)
             }
-            Some(corrected)
-        }
-        (Some(_), Some(corr)) => {
-            log::warn!(
-                "Skipping corrected covariance: dimension mismatch (base {:?}, corr {:?})",
-                beta_covariance.as_ref().map(Array2::dim),
-                Some(corr.dim())
-            );
-            None
-        }
-        _ => None,
-    };
-    let beta_standard_errors_corrected = beta_covariance_corrected.as_ref().map(se_from_covariance);
+            (Some(_), Some(corr)) => {
+                log::warn!(
+                    "Skipping corrected covariance: dimension mismatch (base {:?}, corr {:?})",
+                    beta_covariance.as_ref().map(Array2::dim),
+                    Some(corr.dim())
+                );
+                None
+            }
+            _ => None,
+        };
+        beta_standard_errors_corrected =
+            beta_covariance_corrected.as_ref().map(se_from_covariance);
+    }
     let working_weights = pirls_res.solveweights.clone();
     let working_response = pirls_res.solveworking_response.clone();
     let reparam_qs = Some(pirls_res.reparam_result.qs.clone());
@@ -2284,6 +2296,7 @@ pub struct FitOptions {
     pub optimize_mixture: bool,
     pub sas_link: Option<SasLinkSpec>,
     pub optimize_sas: bool,
+    pub compute_inference: bool,
     pub max_iter: usize,
     pub tol: f64,
     pub nullspace_dims: Vec<usize>,
@@ -3108,6 +3121,7 @@ where
         optimize_mixture: opts.optimize_mixture,
         sas_link: effective_sas_link,
         optimize_sas: opts.optimize_sas,
+        compute_inference: opts.compute_inference,
         max_iter: opts.max_iter,
         tol: opts.tol,
         nullspace_dims: opts.nullspace_dims.clone(),
@@ -4200,6 +4214,7 @@ mod fd_policy_tests {
                 initial_log_delta: 0.0,
             }),
             optimize_sas: true,
+            compute_inference: true,
             max_iter: 80,
             tol: 1e-7,
             nullspace_dims: vec![1],
@@ -4392,6 +4407,7 @@ mod fd_policy_tests {
                 initial_log_delta: 0.0,
             }),
             optimize_sas: true,
+            compute_inference: true,
             max_iter: 80,
             tol: 1e-7,
             nullspace_dims: vec![1],
@@ -4537,6 +4553,7 @@ mod fd_policy_tests {
                 initial_log_delta: 0.0,
             }),
             optimize_sas: true,
+            compute_inference: true,
             max_iter: 80,
             tol: 1e-7,
             nullspace_dims: vec![1],
