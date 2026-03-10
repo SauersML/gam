@@ -120,12 +120,7 @@ impl<'a> RemlState<'a> {
                         acc
                     });
             }
-            out.push(DirectionalHyperParam::new(
-                x_j,
-                s_j,
-                None,
-                None,
-            )?);
+            out.push(DirectionalHyperParam::new(x_j, s_j, None, None)?);
         }
         Ok(out)
     }
@@ -348,10 +343,7 @@ impl<'a> RemlState<'a> {
                 return true;
             }
             if let Some(x2) = dir.x_tau_tau_original.as_ref() {
-                return x2
-                    .iter()
-                    .flatten()
-                    .any(|m| m.iter().any(|v| *v != 0.0));
+                return x2.iter().flatten().any(|m| m.iter().any(|v| *v != 0.0));
             }
             false
         });

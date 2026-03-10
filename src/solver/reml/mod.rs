@@ -901,12 +901,24 @@ mod tests {
         let mut xsecond_1 = vec![None; 2];
         let mut ssecond_1 = vec![None; 2];
         xsecond_0[0] = Some(Array2::from_elem((x.nrows(), x.ncols()), 5e-5));
-        ssecond_0[0] = Some(array![[0.0, 0.0, 0.0], [0.0, 0.06, 0.01], [0.0, 0.01, 0.04],]);
+        ssecond_0[0] = Some(array![
+            [0.0, 0.0, 0.0],
+            [0.0, 0.06, 0.01],
+            [0.0, 0.01, 0.04],
+        ]);
         // Provide cross second derivative from only one side to exercise fallback.
         xsecond_0[1] = Some(Array2::from_elem((x.nrows(), x.ncols()), -2e-5));
-        ssecond_0[1] = Some(array![[0.0, 0.0, 0.0], [0.0, 0.03, -0.005], [0.0, -0.005, 0.02],]);
+        ssecond_0[1] = Some(array![
+            [0.0, 0.0, 0.0],
+            [0.0, 0.03, -0.005],
+            [0.0, -0.005, 0.02],
+        ]);
         xsecond_1[1] = Some(Array2::from_elem((x.nrows(), x.ncols()), 4e-5));
-        ssecond_1[1] = Some(array![[0.0, 0.0, 0.0], [0.0, 0.02, 0.004], [0.0, 0.004, 0.03],]);
+        ssecond_1[1] = Some(array![
+            [0.0, 0.0, 0.0],
+            [0.0, 0.02, 0.004],
+            [0.0, 0.004, 0.03],
+        ]);
         let hyper_dirs = vec![
             DirectionalHyperParam::single_penalty(
                 0,
@@ -1238,7 +1250,9 @@ impl DirectionalHyperParam {
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
                     out.push(match row {
-                        Some(components) => Some(Self::canonicalize_penalty_components(components)?),
+                        Some(components) => {
+                            Some(Self::canonicalize_penalty_components(components)?)
+                        }
                         None => None,
                     });
                 }

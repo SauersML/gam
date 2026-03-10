@@ -1182,8 +1182,12 @@ impl<'a> GamWorkingModel<'a> {
             ..
         } = self;
         let coordinate_frame = match coordinate_design {
-            WorkingCoordinateDesign::OriginalSparseNative => PirlsCoordinateFrame::OriginalSparseNative,
-            WorkingCoordinateDesign::TransformedExplicit { .. } => PirlsCoordinateFrame::TransformedQs,
+            WorkingCoordinateDesign::OriginalSparseNative => {
+                PirlsCoordinateFrame::OriginalSparseNative
+            }
+            WorkingCoordinateDesign::TransformedExplicit { .. } => {
+                PirlsCoordinateFrame::TransformedQs
+            }
             WorkingCoordinateDesign::TransformedImplicit { qs } => {
                 let _ = design_dot_dense_rhs(&x_original, &qs);
                 PirlsCoordinateFrame::TransformedQs

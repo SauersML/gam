@@ -7,8 +7,8 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 use ratatui::prelude::*;
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
-use std::io::{self, IsTerminal, Stdout, Write};
 use std::env;
+use std::io::{self, IsTerminal, Stdout, Write};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -590,9 +590,8 @@ impl VisualizerSession {
             return Self::default();
         }
         let notebook_or_noninteractive = should_use_text_only_progress();
-        let interactive = !notebook_or_noninteractive
-            && io::stdout().is_terminal()
-            && io::stderr().is_terminal();
+        let interactive =
+            !notebook_or_noninteractive && io::stdout().is_terminal() && io::stderr().is_terminal();
         let state = if interactive {
             match InteractiveVisualizer::new() {
                 Ok(v) => VisualizerState::Interactive(v),
@@ -784,7 +783,10 @@ fn classify_model_status(model: &VisualizerModel) -> StatusClass {
         .last()
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
-    if contains_error_signal(&status) || contains_error_signal(&detail) || contains_error_signal(&recent_diag) {
+    if contains_error_signal(&status)
+        || contains_error_signal(&detail)
+        || contains_error_signal(&recent_diag)
+    {
         StatusClass::Error
     } else if contains_warning_signal(&status)
         || contains_warning_signal(&detail)
@@ -807,15 +809,21 @@ fn classify_lane_status(lane: &LaneState, model_class: StatusClass) -> StatusCla
 }
 
 fn contains_error_signal(text: &str) -> bool {
-    ["error", "failed", "indefinite", "abort"].iter().any(|needle| text.contains(needle))
+    ["error", "failed", "indefinite", "abort"]
+        .iter()
+        .any(|needle| text.contains(needle))
 }
 
 fn contains_warning_signal(text: &str) -> bool {
-    ["warning", "stalled", "max iterations", "non-finite"].iter().any(|needle| text.contains(needle))
+    ["warning", "stalled", "max iterations", "non-finite"]
+        .iter()
+        .any(|needle| text.contains(needle))
 }
 
 fn contains_success_signal(text: &str) -> bool {
-    ["complete", "converged", "finished", "done"].iter().any(|needle| text.contains(needle))
+    ["complete", "converged", "finished", "done"]
+        .iter()
+        .any(|needle| text.contains(needle))
 }
 
 fn status_color(class: StatusClass) -> Color {
@@ -878,15 +886,18 @@ fn summary_panel_lines(
     primary_class: StatusClass,
     secondary_class: StatusClass,
 ) -> Vec<TextLine<'static>> {
-    let model_class = if secondary_class == StatusClass::Error || primary_class == StatusClass::Error {
-        StatusClass::Error
-    } else if secondary_class == StatusClass::Warning || primary_class == StatusClass::Warning {
-        StatusClass::Warning
-    } else if primary_class == StatusClass::Success && (secondary_lane.label.is_empty() || secondary_class == StatusClass::Success) {
-        StatusClass::Success
-    } else {
-        StatusClass::Running
-    };
+    let model_class =
+        if secondary_class == StatusClass::Error || primary_class == StatusClass::Error {
+            StatusClass::Error
+        } else if secondary_class == StatusClass::Warning || primary_class == StatusClass::Warning {
+            StatusClass::Warning
+        } else if primary_class == StatusClass::Success
+            && (secondary_lane.label.is_empty() || secondary_class == StatusClass::Success)
+        {
+            StatusClass::Success
+        } else {
+            StatusClass::Running
+        };
     let mut lines = vec![
         TextLine::from(vec![
             Span::styled(
@@ -897,7 +908,12 @@ fn summary_panel_lines(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(stage.to_ascii_uppercase(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                stage.to_ascii_uppercase(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         TextLine::from(Span::styled(
             detail.to_string(),
@@ -983,26 +999,45 @@ fn render_dumb_lane(prefix: &str, lane: &LaneState, model: &VisualizerModel) -> 
             let ratio = lane.current.min(total) as f64 / total as f64;
             let mut parts = vec![
                 format!("{prefix}: {}", lane.label),
-                format!("{:>3}% ▕{}▏", (ratio * 100.0).round() as usize, unicode_bar(ratio, 16)),
+                format!(
+                    "{:>3}% ▕{}▏",
+                    (ratio * 100.0).round() as usize,
+                    unicode_bar(ratio, 16)
+                ),
             ];
             if let Some(eta) = estimate_eta(model, lane) {
                 parts.push(format!("ETA: {eta}"));
             }
             if model.current_cost.is_finite() {
-                parts.push(format!("objective={}", format_metric(model.current_cost, "{:.4}")));
+                parts.push(format!(
+                    "objective={}",
+                    format_metric(model.current_cost, "{:.4}")
+                ));
             }
             if model.current_grad.is_finite() {
-                parts.push(format!("|grad|={}", format_metric(model.current_grad, "{:.3e}")));
+                parts.push(format!(
+                    "|grad|={}",
+                    format_metric(model.current_grad, "{:.3e}")
+                ));
             }
             parts.join(" | ")
         }
         _ => {
-            let mut parts = vec![format!("{prefix}: {}", lane.label), format!("step={}", lane.current)];
+            let mut parts = vec![
+                format!("{prefix}: {}", lane.label),
+                format!("step={}", lane.current),
+            ];
             if model.current_cost.is_finite() {
-                parts.push(format!("objective={}", format_metric(model.current_cost, "{:.4}")));
+                parts.push(format!(
+                    "objective={}",
+                    format_metric(model.current_cost, "{:.4}")
+                ));
             }
             if model.current_grad.is_finite() {
-                parts.push(format!("|grad|={}", format_metric(model.current_grad, "{:.3e}")));
+                parts.push(format!(
+                    "|grad|={}",
+                    format_metric(model.current_grad, "{:.3e}")
+                ));
             }
             parts.join(" | ")
         }
@@ -1134,7 +1169,11 @@ mod tests {
         session.advance_workflow(1);
         let lines = dumb_render_lines(&session.model);
         assert!(lines.iter().all(|line| !line.contains("n/a")));
-        assert!(lines.iter().any(|line| line.contains("Workflow: Survival Fit")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Workflow: Survival Fit"))
+        );
     }
 
     #[test]
@@ -1144,7 +1183,10 @@ mod tests {
             session.push_diagnostic(&format!("line {idx}"));
         }
         assert_eq!(session.model.diagnostics_lines.len(), MAX_DIAGNOSTIC_LINES);
-        assert_eq!(session.model.diagnostics_lines.first().map(String::as_str), Some("line 10"));
+        assert_eq!(
+            session.model.diagnostics_lines.first().map(String::as_str),
+            Some("line 10")
+        );
     }
 
     #[test]

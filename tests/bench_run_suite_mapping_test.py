@@ -292,6 +292,64 @@ class RunSuiteMappingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "run_rust_gamlss_survival_cv"):
             _RUN_SUITE.run_rust_scenario_cv(scenario, ds=ds, folds=[])
 
+    def test_run_rust_scenario_cv_emits_evaluation_metadata(self) -> None:
+        scenario = {"name": "lidar_semipar"}
+        ds = {
+            "family": "gaussian",
+            "rows": [
+                {"range": 0.0, "logratio": 0.0},
+                {"range": 1.0, "logratio": 1.0},
+                {"range": 2.0, "logratio": 2.0},
+                {"range": 3.0, "logratio": 3.0},
+            ],
+            "features": ["range"],
+            "target": "logratio",
+        }
+        folds = [
+            SimpleNamespace(train_idx=[0, 1], test_idx=[2, 3]),
+            SimpleNamespace(train_idx=[2, 3], test_idx=[0, 1]),
+        ]
+        orig_ensure_rust_binary = _RUN_SUITE._ensure_rust_binary
+        orig_run_cmd = _RUN_SUITE.run_cmd
+        orig_tempdir = _RUN_SUITE._workspace_tempdir
+        orig_formula = _RUN_SUITE._rust_formula_for_scenario
+        try:
+            _RUN_SUITE._ensure_rust_binary = lambda: Path("/tmp/fake-rust-gam")
+            _RUN_SUITE._rust_formula_for_scenario = lambda *_args, **_kwargs: (
+                "gaussian",
+                "logratio ~ s(range, type=ps, knots=24)",
+            )
+
+            def _fake_run_cmd(cmd, cwd=None):
+                if len(cmd) >= 2 and cmd[1] == "fit":
+                    out_path = Path(cmd[cmd.index("--out") + 1])
+                    out_path.write_text(json.dumps({"fit_result": {"standard_deviation": 1.25}}))
+                    return 0, "", ""
+                if len(cmd) >= 2 and cmd[1] == "predict":
+                    out_path = Path(cmd[cmd.index("--out") + 1])
+                    out_path.write_text("mean\n1.5\n1.5\n")
+                    return 0, "", ""
+                return 1, "", f"unexpected command: {cmd}"
+
+            _RUN_SUITE.run_cmd = _fake_run_cmd
+
+            with tempfile.TemporaryDirectory() as td:
+                temp_root = Path(td)
+                _RUN_SUITE._workspace_tempdir = lambda prefix="": tempfile.TemporaryDirectory(
+                    prefix=prefix, dir=temp_root
+                )
+                result = _RUN_SUITE.run_rust_scenario_cv(scenario, ds=ds, folds=folds)
+        finally:
+            _RUN_SUITE._ensure_rust_binary = orig_ensure_rust_binary
+            _RUN_SUITE.run_cmd = orig_run_cmd
+            _RUN_SUITE._workspace_tempdir = orig_tempdir
+            _RUN_SUITE._rust_formula_for_scenario = orig_formula
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["evaluation"], "2-fold CV")
+        self.assertEqual(result["n_folds"], 2)
+        self.assertIn("[2-fold CV]", result["model_spec"])
+
     def test_main_does_not_schedule_rust_gam_for_survival_scenarios(self) -> None:
         seen = []
         orig_run = _RUN_SUITE.run_rust_scenario_cv
