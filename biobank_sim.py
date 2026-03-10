@@ -51,6 +51,34 @@ def load_config(path: Path) -> dict[str, Any]:
         ) from exc
 
 
+def survival_generation_params(cfg: dict[str, Any]) -> tuple[float, float]:
+    shape = float(cfg.get("survival_weibull_shape", 1.65))
+    scale = float(cfg.get("survival_weibull_scale", 11.5))
+    if not math.isfinite(shape) or shape <= 0.0:
+        raise RuntimeError("survival_weibull_shape must be finite and > 0")
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise RuntimeError("survival_weibull_scale must be finite and > 0")
+    return shape, scale
+
+
+def survival_anchor_from_prep(prep_dir: Path, cfg: dict[str, Any]) -> tuple[float, float]:
+    prep_meta_path = prep_dir / "prep_metadata.json"
+    if prep_meta_path.exists():
+        prep_meta = json.loads(prep_meta_path.read_text(encoding="utf-8"))
+        trait_meta = prep_meta.get("trait_meta")
+        if isinstance(trait_meta, dict):
+            shape = trait_meta.get("survival_weibull_shape")
+            scale = trait_meta.get("survival_weibull_scale")
+            if shape is not None and scale is not None:
+                return survival_generation_params(
+                    {
+                        "survival_weibull_shape": shape,
+                        "survival_weibull_scale": scale,
+                    }
+                )
+    return survival_generation_params(cfg)
+
+
 def dump_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
@@ -951,7 +979,7 @@ def simulate_traits(rows: list[dict[str, Any]], pc_cols: list[str], cfg: dict[st
     pgs = standardize(pgs_raw)
     entry_year = rng.uniform(2006.0, 2013.5, size=len(rows))
     age_entry = age
-    shape = 1.65
+    shape, base_scale = survival_generation_params(cfg)
     lp_surv = (
         0.38 * standardize(age_entry)
         + 0.52 * genetic_liability
@@ -959,7 +987,6 @@ def simulate_traits(rows: list[dict[str, Any]], pc_cols: list[str], cfg: dict[st
         + 0.12 * sex
         + 0.35 * standardize(np.log(np.clip(geo_prev, 1e-6, 1.0)) - np.log(np.clip(1.0 - geo_prev, 1e-6, 1.0)))
     )
-    base_scale = 11.5
     u = np.clip(rng.random(len(rows)), 1e-9, 1.0 - 1e-9)
     event_time = base_scale * ((-np.log(u)) / np.exp(lp_surv)) ** (1.0 / shape)
     dropout_rate = np.exp(-2.35 + 0.22 * standardize(age_entry) + 0.08 * phenotype)
@@ -1000,6 +1027,8 @@ def simulate_traits(rows: list[dict[str, Any]], pc_cols: list[str], cfg: dict[st
             "q50": float(np.quantile(portability_noise_sd, 0.50)),
             "q95": float(np.quantile(portability_noise_sd, 0.95)),
         },
+        "survival_weibull_shape": shape,
+        "survival_weibull_scale": base_scale,
         "pgs_correlation_with_latitude": float(np.corrcoef(pgs, lat)[0, 1]),
         "pgs_correlation_with_longitude": float(np.corrcoef(pgs, lon)[0, 1]),
     }
@@ -1297,7 +1326,14 @@ def run_rust_classification(spec: MethodSpec, train_csv: Path, test_csv: Path, o
     }
 
 
-def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir: Path) -> dict[str, Any]:
+def run_rust_survival(
+    spec: MethodSpec,
+    train_csv: Path,
+    test_csv: Path,
+    out_dir: Path,
+    prep_dir: Path,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
     rust_bin = load_or_build_rust_binary()
     formula_rhs = rust_formula_survival(spec)
     model_path = out_dir / f"{spec.name}.model.json"
@@ -1311,10 +1347,23 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         "--time-num-internal-knots", "8",
         "--time-smooth-lambda", "0.01",
         "--ridge-lambda", "1e-6",
-        "--out", str(model_path),
-        str(train_csv),
-        f"Surv(time0, time, event) ~ {formula_rhs}",
     ]
+    if spec.backend == "rust_survival_transform":
+        shape, scale = survival_anchor_from_prep(prep_dir, cfg)
+        fit_cmd.extend(
+            [
+                "--baseline-target", "weibull",
+                "--baseline-scale", f"{scale}",
+                "--baseline-shape", f"{shape}",
+            ]
+        )
+    fit_cmd.extend(
+        [
+            "--out", str(model_path),
+            str(train_csv),
+            f"Surv(time0, time, event) ~ {formula_rhs}",
+        ]
+    )
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
     fit_sec = time.perf_counter() - t0
@@ -1443,7 +1492,7 @@ cat(toJSON(list(fit_sec=fit_sec, predict_sec=pred_sec), auto_unbox=TRUE))
     }
 
 
-def run_method(spec: MethodSpec, prep_dir: Path, out_dir: Path) -> dict[str, Any]:
+def run_method(spec: MethodSpec, prep_dir: Path, out_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     disease_train = prep_dir / "disease_train.csv"
     disease_test = prep_dir / "disease_test.csv"
     survival_train = prep_dir / "survival_train.csv"
@@ -1457,7 +1506,7 @@ def run_method(spec: MethodSpec, prep_dir: Path, out_dir: Path) -> dict[str, Any
             raise RuntimeError(f"unsupported disease backend '{spec.backend}'")
     elif spec.dataset == "survival":
         if spec.backend in {"rust_survival", "rust_survival_transform", "rust_gamlss_survival"}:
-            result = run_rust_survival(spec, survival_train, survival_test, out_dir)
+            result = run_rust_survival(spec, survival_train, survival_test, out_dir, prep_dir, cfg)
         elif spec.backend == "r_mgcv_survival":
             result = run_r_mgcv_survival(spec, survival_train, survival_test, out_dir)
         else:
@@ -1481,7 +1530,7 @@ def do_run_method(args: argparse.Namespace) -> int:
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        result = run_method(spec, args.prep_dir.resolve(), out_dir)
+        result = run_method(spec, args.prep_dir.resolve(), out_dir, cfg)
         payload = {
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "status": "ok",

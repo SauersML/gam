@@ -25,6 +25,7 @@
 
 use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
 use crate::types::LikelihoodFamily;
+use crate::visualizer::VisualizerSession;
 use faer::Side;
 use general_mcmc::generic_hmc::HamiltonianTarget;
 use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation, NUTSMassMatrixConfig};
@@ -34,6 +35,91 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rand08::{SeedableRng as SeedableRng08, rngs::StdRng as StdRng08};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+struct SamplingVisualizer {
+    session: VisualizerSession,
+    chain: usize,
+    total_chains: usize,
+    warmup: usize,
+    samples: usize,
+}
+
+impl SamplingVisualizer {
+    fn new(stage: &str, total_chains: usize, warmup: usize, samples: usize) -> Self {
+        let mut session = VisualizerSession::new(true);
+        session.set_stage("sample", stage);
+        session.set_progress(
+            &format!("chains completed ({stage})"),
+            0,
+            Some(total_chains.max(1)),
+        );
+        Self {
+            session,
+            chain: 0,
+            total_chains,
+            warmup,
+            samples,
+        }
+    }
+
+    fn begin_chain(&mut self, chain: usize, label: &str) {
+        self.chain = chain;
+        self.session
+            .set_stage("sample", &format!("[Chain {}] {label}", chain + 1));
+        self.session
+            .set_progress("chains completed", chain, Some(self.total_chains.max(1)));
+        self.session
+            .set_secondary_progress(&format!("[Chain {}] Warmup", chain + 1), 0, Some(self.warmup));
+    }
+
+    fn warmup_step(&mut self, iter: usize) {
+        self.session.set_secondary_progress(
+            &format!("[Chain {}] Warmup", self.chain + 1),
+            iter.min(self.warmup),
+            Some(self.warmup),
+        );
+    }
+
+    fn start_sampling(&mut self) {
+        self.session.finish_secondary_progress(&format!(
+            "chain {} warmup complete",
+            self.chain + 1
+        ));
+        self.session.set_secondary_progress(
+            &format!("[Chain {}] Sample", self.chain + 1),
+            0,
+            Some(self.samples),
+        );
+    }
+
+    fn sample_step(&mut self, iter: usize) {
+        self.session.set_secondary_progress(
+            &format!("[Chain {}] Sample", self.chain + 1),
+            iter.min(self.samples),
+            Some(self.samples),
+        );
+    }
+
+    fn finish_chain(&mut self, accept_rate: f64) {
+        self.session.finish_secondary_progress(&format!(
+            "chain {} sample complete | accepted {:.1}%",
+            self.chain + 1,
+            accept_rate * 100.0
+        ));
+        self.session.set_progress(
+            "chains completed",
+            (self.chain + 1).min(self.total_chains),
+            Some(self.total_chains.max(1)),
+        );
+    }
+
+    fn finish_all(&mut self, rhat: f64, ess: f64) {
+        self.session.push_diagnostic(&format!(
+            "sampling diagnostics | rhat={rhat:.3} | ess={ess:.1}"
+        ));
+        self.session.finish_progress("sampling complete");
+    }
+}
 
 /// Compute split-chain R-hat and ESS using the Gelman-Rubin diagnostic.
 ///
@@ -1330,8 +1416,15 @@ pub fn run_logit_polya_gamma_gibbs(
     let mut mean = Array1::<f64>::zeros(p);
     let mut z = Array1::<f64>::zeros(p);
     let mut noise = Array1::<f64>::zeros(p);
+    let mut progress = SamplingVisualizer::new(
+        "polya-gamma gibbs",
+        config.n_chains,
+        config.nwarmup,
+        config.n_samples,
+    );
 
     for chain in 0..config.n_chains {
+        progress.begin_chain(chain, "polya-gamma gibbs");
         let mut pg_rng = StdRng08::seed_from_u64(
             config.seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul((chain as u64) + 1)),
         );
@@ -1373,13 +1466,20 @@ pub fn run_logit_polya_gamma_gibbs(
             forward_solve_lower_triangular(&l, &z, &mut noise);
             beta.assign(&(&mean + &noise));
 
-            if iter >= config.nwarmup {
+            if iter < config.nwarmup {
+                progress.warmup_step(iter + 1);
+            } else {
+                if iter == config.nwarmup {
+                    progress.start_sampling();
+                }
                 let keep_idx = iter - config.nwarmup;
+                progress.sample_step(keep_idx + 1);
                 samples_array
                     .slice_mut(ndarray::s![chain, keep_idx, ..])
                     .assign(&beta);
             }
         }
+        progress.finish_chain(1.0);
     }
 
     let total_samples = config.n_chains * config.n_samples;
@@ -1403,6 +1503,7 @@ pub fn run_logit_polya_gamma_gibbs(
         (1.0, (total_samples as f64) * 0.5)
     };
     let converged = rhat < 1.1 && ess > 100.0;
+    progress.finish_all(rhat, ess);
 
     Ok(NutsResult {
         samples,
@@ -1622,8 +1723,10 @@ pub fn run_nuts_sampling(
         mass_cfg,
     );
 
-    // Note: run_progress() has blocking issues in some contexts, using run() instead
-    let samples_array = sampler.run(config.n_samples, config.nwarmup);
+    let (samples_array, run_stats) = sampler
+        .run_progress(config.n_samples, config.nwarmup)
+        .map_err(|e| format!("NUTS sampling failed: {e}"))?;
+    log::info!("NUTS sampling complete: {}", run_stats);
 
     // Convert samples from whitened space back to original space
     // samples_array has shape [n_chains, n_samples, dim]
@@ -1653,7 +1756,10 @@ pub fn run_nuts_sampling(
     // Split-chain R-hat: compare variance within vs between chains
     // Gelman-Rubin diagnostic with split chains
     let (rhat, ess) = if n_chains >= 2 && n_samples_out >= 4 {
-        compute_split_rhat_and_ess(&samples_array)
+        (
+            f64::from(run_stats.rhat.mean),
+            f64::from(run_stats.ess.mean),
+        )
     } else {
         // Fall back to simple estimates if not enough chains/samples
         (1.0, (total_samples as f64) * 0.5)

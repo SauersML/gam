@@ -142,18 +142,6 @@ impl PenaltyBlocks {
     }
 }
 
-fn scale_matrix_columns(x: &Array2<f64>, scale: &Array1<f64>) -> Array2<f64> {
-    debug_assert_eq!(x.ncols(), scale.len(), "column scaling dimension mismatch");
-    let mut scaled = x.clone();
-    for (j, factor) in scale.iter().copied().enumerate() {
-        if factor == 1.0 {
-            continue;
-        }
-        scaled.column_mut(j).mapv_inplace(|v| v * factor);
-    }
-    scaled
-}
-
 fn compress_positive_collinear_constraints(
     a: &Array2<f64>,
     b: &Array1<f64>,
@@ -335,9 +323,6 @@ impl WorkingModelSurvival {
     }
 
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
-        if self.structurally_monotonic {
-            return None;
-        }
         let p = self.x_derivative.ncols();
         const DERIVATIVE_ROW_NORM_TOL: f64 = 1e-12;
         if p == 0 {
@@ -517,26 +502,6 @@ impl WorkingModelSurvival {
         Ok(())
     }
 
-    #[allow(clippy::type_complexity)]
-    fn transformed_coefficients(
-        &self,
-        beta: &Array1<f64>,
-    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-        let p = beta.len();
-        let mut theta = beta.clone();
-        let mut jac = Array1::<f64>::ones(p);
-        let mut curvature = Array1::<f64>::zeros(p);
-        if self.structurally_monotonic {
-            for j in 0..self.structural_time_columns {
-                let exp_beta = beta[j].exp();
-                theta[j] = exp_beta;
-                jac[j] = exp_beta;
-                curvature[j] = exp_beta;
-            }
-        }
-        Ok((theta, jac, curvature))
-    }
-
     pub fn update_state(&self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
         if beta.len() != self.x_exit.ncols() {
             return Err(EstimationError::InvalidInput(
@@ -565,18 +530,16 @@ impl WorkingModelSurvival {
         //            + delta_i * (d_i d_i^T) / s_i^2.
         //
         // Monotonicity is enforced through linear inequality constraints on the
-        // derivative design, not through a nonlinear coefficient map. This keeps
-        // the baseline smoothing penalty on the actual spline coefficients.
+        // derivative design. This keeps the baseline smoothing penalty on the
+        // actual spline coefficients and preserves zero-deviation as beta=0.
         //
-        // The loop below computes exact beta-space derivatives and then adds
-        // penalties.
+        // The loop below computes exact beta-space derivatives and then adds penalties.
         // Total predictor = target offset + learned deviation.
         // This is the same architecture used for flexible binary links:
         // principled default, plus penalized wiggle/deviation.
-        let (theta, jac, curvature) = self.transformed_coefficients(beta)?;
-        let eta_entry = self.x_entry.dot(&theta) + &self.offset_eta_entry;
-        let eta_exit = self.x_exit.dot(&theta) + &self.offset_eta_exit;
-        let derivative_raw = self.x_derivative.dot(&theta) + &self.offset_derivative_exit;
+        let eta_entry = self.x_entry.dot(beta) + &self.offset_eta_entry;
+        let eta_exit = self.x_exit.dot(beta) + &self.offset_eta_exit;
+        let derivative_raw = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
 
         let h_entry = eta_entry.mapv(f64::exp);
         let h_exit = eta_exit.mapv(f64::exp);
@@ -585,10 +548,6 @@ impl WorkingModelSurvival {
                 "survival linear predictor produced non-finite cumulative hazard".to_string(),
             ));
         }
-
-        let x_entry_jac = scale_matrix_columns(&self.x_entry, &jac);
-        let x_exit_jac = scale_matrix_columns(&self.x_exit, &jac);
-        let x_derivative_jac = scale_matrix_columns(&self.x_derivative, &jac);
 
         let mut nll = 0.0;
         let mut w_exit_interval = Array1::<f64>::zeros(n);
@@ -655,23 +614,14 @@ impl WorkingModelSurvival {
             }
         }
 
-        let mut grad = fast_atv(&x_exit_jac, &w_exit_interval);
-        grad -= &fast_atv(&x_entry_jac, &w_entry_interval);
-        grad -= &fast_atv(&x_exit_jac, &w_event);
-        grad -= &fast_atv(&x_derivative_jac, &w_event_inv_deriv);
+        let mut grad = fast_atv(&self.x_exit, &w_exit_interval);
+        grad -= &fast_atv(&self.x_entry, &w_entry_interval);
+        grad -= &fast_atv(&self.x_exit, &w_event);
+        grad -= &fast_atv(&self.x_derivative, &w_event_inv_deriv);
 
-        let mut h = fast_xt_diag_x(&x_exit_jac, &w_exit_interval);
-        h -= &fast_xt_diag_x(&x_entry_jac, &w_entry_interval);
-        h += &fast_xt_diag_x(&x_derivative_jac, &w_event_outer);
-
-        let diag_correction = &curvature
-            * &(&fast_atv(&self.x_exit, &w_exit_interval)
-                - &fast_atv(&self.x_entry, &w_entry_interval)
-                - &fast_atv(&self.x_exit, &w_event)
-                - &fast_atv(&self.x_derivative, &w_event_inv_deriv));
-        for j in 0..p {
-            h[[j, j]] += diag_correction[j];
-        }
+        let mut h = fast_xt_diag_x(&self.x_exit, &w_exit_interval);
+        h -= &fast_xt_diag_x(&self.x_entry, &w_entry_interval);
+        h += &fast_xt_diag_x(&self.x_derivative, &w_event_outer);
 
         let penaltygrad = self.penalties.gradient(beta);
         let penalty_dev = self.penalties.deviance(beta);
@@ -836,11 +786,9 @@ impl WorkingModelSurvival {
 
         // Keep outer gradient contractions consistent with the fitted inner state:
         // the working predictor includes target baseline offsets plus learned deviation.
-        let (theta, jac, curvature) = self.transformed_coefficients(beta)?;
-        let third = Array1::<f64>::zeros(p);
-        let eta_entry = self.x_entry.dot(&theta) + &self.offset_eta_entry;
-        let eta_exit = self.x_exit.dot(&theta) + &self.offset_eta_exit;
-        let deriv_raw = self.x_derivative.dot(&theta) + &self.offset_derivative_exit;
+        let eta_entry = self.x_entry.dot(beta) + &self.offset_eta_entry;
+        let eta_exit = self.x_exit.dot(beta) + &self.offset_eta_exit;
+        let deriv_raw = self.x_derivative.dot(beta) + &self.offset_derivative_exit;
         let exp_entry = eta_entry.mapv(f64::exp);
         let exp_exit = eta_exit.mapv(f64::exp);
         let guard = self.derivative_guard();
@@ -856,6 +804,10 @@ impl WorkingModelSurvival {
         let mut te = vec![0.0_f64; p];
         let mut ts = vec![0.0_f64; p];
         let mut tsd = vec![0.0_f64; p];
+
+        let jac = Array1::<f64>::ones(p);
+        let curvature = Array1::<f64>::zeros(p);
+        let third = Array1::<f64>::zeros(p);
 
         // Assemble S(rho) in the same scaling used by update_state.
         let mut s_total = Array2::<f64>::zeros((p, p));
@@ -1750,7 +1702,10 @@ mod tests {
         model
             .set_structural_monotonicity(true, 3)
             .expect("enable structural monotonicity");
-        assert!(model.monotonicity_linear_constraints().is_none());
+        let constraints = model
+            .monotonicity_linear_constraints()
+            .expect("structural mode should still emit derivative constraints");
+        assert_eq!(constraints.a.nrows(), 2);
 
         let beta = array![0.2, 0.2, 0.1, 0.2];
         let state = model.update_state(&beta).expect("state at structural beta");
@@ -1827,7 +1782,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_monotonicity_reparameterizes_time_block_and_drops_linear_constraints() {
+    fn structural_monotonicity_switches_to_tiny_derivative_guard_constraints() {
         let age_entry = array![1.0_f64];
         let age_exit = array![2.0_f64];
         let event_target = array![1u8];
@@ -1865,13 +1820,15 @@ mod tests {
         model
             .set_structural_monotonicity(true, 1)
             .expect("enable structural monotonicity");
-        assert!(
-            model.monotonicity_linear_constraints().is_none(),
-            "structural monotonicity should not emit legacy linear constraints"
-        );
+        let constraints = model
+            .monotonicity_linear_constraints()
+            .expect("structural monotonicity should emit derivative constraints");
+        assert_eq!(constraints.a.nrows(), 1);
+        assert!((constraints.a[[0, 0]] - 1.0).abs() <= 1e-12);
+        assert!((constraints.b[0] - 1e-12).abs() <= 1e-18);
         let state = model
-            .update_state(&beta)
-            .expect("structural monotonicity should reparameterize the time block");
+            .update_state(&array![1e-6])
+            .expect("small positive derivative coefficient should remain feasible");
         assert!(state.deviance.is_finite());
     }
 
@@ -1893,7 +1850,7 @@ mod tests {
             min_step_size: 1e-12,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
-            linear_constraints: None,
+            linear_constraints: model_local.monotonicity_linear_constraints(),
         };
         let out = crate::pirls::runworking_model_pirls(
             &mut model_local,

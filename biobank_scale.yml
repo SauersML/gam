@@ -3,6 +3,8 @@
   "split_seed": 20260311,
   "target_n": 400000,
   "smoke_target_n": 6000,
+  "survival_weibull_shape": 1.65,
+  "survival_weibull_scale": 11.5,
   "train_fraction": 0.8,
   "raw_subpop_n": 320,
   "observed_latlon_fraction": 0.46,
