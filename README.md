@@ -327,12 +327,3 @@ gam fit train.csv \
   --survival-likelihood location-scale \
   --out surv_ls.model.json
 ```
-
-## Project Layout
-
-- `src/`: core library and CLI (`src/main.rs`)
-- `bench/`: benchmark harness, datasets, and analysis helpers
-- `tests/`: integration/regression tests
-- `scripts/`: helper scripts
-
-Benchmark details: [`bench/README.md`](bench/README.md)
