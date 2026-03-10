@@ -4020,15 +4020,15 @@ def run_rust_scenario_cv(
             metrics["thread3_collocation_points"] = float(
                 sum(v * w for v, w in colloc_rows) / max(sum(w for _, w in colloc_rows), 1)
             )
-    return {
-        "contender": contender_name,
-        "family": ds["family"],
-        "scenario_name": scenario_name,
-        "status": "ok",
-        **metrics,
-        "model_spec": cv_rows[0]["model_spec"],
-        "plot_payload": _finalize_plot_payload(plot_payload),
-    }
+    return _finalize_cv_result(
+        contender=contender_name,
+        scenario_name=scenario_name,
+        family=ds["family"],
+        cv_rows=cv_rows,
+        plot_payload=plot_payload,
+        model_spec=cv_rows[0]["model_spec"],
+        extra_metrics=metrics,
+    )
 
 
 def run_rust_sas_scenario_cv(

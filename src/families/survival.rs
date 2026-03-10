@@ -437,6 +437,13 @@ impl WorkingModelSurvival {
     }
 
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
+        // Structural monotone time bases are enforced through coefficient-space
+        // lower bounds. Emitting per-row derivative constraints here would
+        // reintroduce the data-dependent active-set geometry we are explicitly
+        // trying to avoid.
+        if self.structurally_monotonic {
+            return None;
+        }
         let p = self.x_derivative.ncols();
         const DERIVATIVE_ROW_NORM_TOL: f64 = 1e-12;
         if p == 0 {
@@ -1964,10 +1971,20 @@ mod tests {
         model
             .set_structural_monotonicity(true, 3)
             .expect("enable structural monotonicity");
-        let constraints = model
-            .monotonicity_linear_constraints()
-            .expect("structural mode should still emit derivative constraints");
-        assert_eq!(constraints.a.nrows(), 3);
+        assert!(
+            model.monotonicity_linear_constraints().is_none(),
+            "structural mode should not emit per-row derivative constraints"
+        );
+        let lower_bounds = model
+            .structural_time_coefficient_lower_bounds()
+            .expect("structural lower bounds");
+        assert!(
+            lower_bounds
+                .slice(ndarray::s![0..3])
+                .iter()
+                .all(|v| v.is_finite())
+        );
+        assert!(!lower_bounds[3].is_finite());
 
         let beta = array![0.2, 0.2, 0.1, 0.2];
         let state = model.update_state(&beta).expect("state at structural beta");
@@ -2082,12 +2099,15 @@ mod tests {
         model
             .set_structural_monotonicity(true, 1)
             .expect("enable structural monotonicity");
-        let constraints = model
-            .monotonicity_linear_constraints()
-            .expect("structural monotonicity should emit derivative constraints");
-        assert_eq!(constraints.a.nrows(), 1);
-        assert!((constraints.a[[0, 0]] - 1.0).abs() <= 1e-12);
-        assert!((constraints.b[0] - 1e-12).abs() <= 1e-18);
+        assert!(
+            model.monotonicity_linear_constraints().is_none(),
+            "structural monotonicity should use coefficient lower bounds instead of derivative rows"
+        );
+        let lower_bounds = model
+            .structural_time_coefficient_lower_bounds()
+            .expect("structural lower bounds");
+        assert_eq!(lower_bounds.len(), 1);
+        assert!((lower_bounds[0] - 1e-12).abs() <= 1e-18);
         let state = model
             .update_state(&array![1e-6])
             .expect("small positive derivative coefficient should remain feasible");
@@ -2221,26 +2241,59 @@ mod tests {
     }
 
     fn solve_inner_mode(model: &WorkingModelSurvival, beta_init: &Array1<f64>) -> Array1<f64> {
-        let mut model_local = model.clone();
-        let opts = crate::pirls::WorkingModelPirlsOptions {
-            max_iterations: 200,
-            convergence_tolerance: 1e-10,
-            max_step_halving: 40,
-            min_step_size: 1e-12,
-            firth_bias_reduction: false,
-            coefficient_lower_bounds: None,
-            linear_constraints: model_local.monotonicity_linear_constraints(),
-        };
-        let out = crate::pirls::runworking_model_pirls(
-            &mut model_local,
-            crate::types::Coefficients::new(beta_init.clone()),
-            &opts,
-            |info| {
-                let _ = info;
-            },
-        )
-        .expect("survival constrained PIRLS inner mode");
-        out.beta.0
+        if model.structurally_monotonic {
+            let lower_bounds = model
+                .structural_time_coefficient_lower_bounds()
+                .expect("structural inner mode lower bounds");
+            let mut latent_model =
+                StructuralTimeLatentSurvivalModel::new(model.clone(), lower_bounds)
+                    .expect("structural inner latent survival model");
+            let latent_beta0 = latent_model
+                .user_to_latent_coefficients(beta_init)
+                .expect("map structural beta init to latent coordinates");
+            let opts = crate::pirls::WorkingModelPirlsOptions {
+                max_iterations: 200,
+                convergence_tolerance: 1e-10,
+                max_step_halving: 40,
+                min_step_size: 1e-12,
+                firth_bias_reduction: false,
+                coefficient_lower_bounds: None,
+                linear_constraints: None,
+            };
+            let out = crate::pirls::runworking_model_pirls(
+                &mut latent_model,
+                crate::types::Coefficients::new(latent_beta0),
+                &opts,
+                |info| {
+                    let _ = info;
+                },
+            )
+            .expect("structural survival latent PIRLS inner mode");
+            latent_model
+                .latent_to_user_coefficients(out.beta.as_ref())
+                .expect("map structural latent optimum back to user coordinates")
+        } else {
+            let mut model_local = model.clone();
+            let opts = crate::pirls::WorkingModelPirlsOptions {
+                max_iterations: 200,
+                convergence_tolerance: 1e-10,
+                max_step_halving: 40,
+                min_step_size: 1e-12,
+                firth_bias_reduction: false,
+                coefficient_lower_bounds: None,
+                linear_constraints: model_local.monotonicity_linear_constraints(),
+            };
+            let out = crate::pirls::runworking_model_pirls(
+                &mut model_local,
+                crate::types::Coefficients::new(beta_init.clone()),
+                &opts,
+                |info| {
+                    let _ = info;
+                },
+            )
+            .expect("survival constrained PIRLS inner mode");
+            out.beta.0
+        }
     }
 
     fn lamlobjective_at_rho(
@@ -2961,6 +3014,98 @@ mod tests {
             let compressed_ok = (0..compressed_constraints.a.nrows())
                 .all(|i| compressed_constraints.a.row(i).dot(&beta) >= compressed_constraints.b[i]);
             assert_eq!(compressed_ok, uncompressed_ok);
+        }
+    }
+
+    #[test]
+    fn exact_survival_derivatives_are_time_unit_invariant_up_to_constant_shift() {
+        let age_entry = array![10.0_f64, 20.0, 25.0];
+        let age_exit = array![15.0_f64, 30.0, 40.0];
+        let event_target = array![1u8, 0u8, 1u8];
+        let event_competing = array![0u8, 0u8, 0u8];
+        let sampleweight = array![1.0, 2.0, 0.5];
+        let x_entry = array![[0.1, 0.2, 1.0], [0.3, 0.4, 1.0], [0.2, 0.6, 1.0]];
+        let x_exit = array![[0.2, 0.3, 1.0], [0.5, 0.7, 1.0], [0.4, 0.8, 1.0]];
+        let x_derivative = array![[0.04, 0.02, 0.0], [0.03, 0.01, 0.0], [0.02, 0.03, 0.0]];
+        let beta = array![0.8, 1.1, -0.2];
+
+        let base_model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sampleweight: sampleweight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct base survival model");
+        let base_state = base_model
+            .update_state(&beta)
+            .expect("evaluate base survival state");
+
+        let time_scale = 365.25;
+        let scaled_age_entry = age_entry.mapv(|v| v * time_scale);
+        let scaled_age_exit = age_exit.mapv(|v| v * time_scale);
+        let scaled_x_derivative = x_derivative.mapv(|v| v / time_scale);
+        let scaled_model = WorkingModelSurvival::from_engine_inputs(
+            SurvivalEngineInputs {
+                age_entry: scaled_age_entry.view(),
+                age_exit: scaled_age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                sampleweight: sampleweight.view(),
+                x_entry: x_entry.view(),
+                x_exit: x_exit.view(),
+                x_derivative: scaled_x_derivative.view(),
+            },
+            PenaltyBlocks::new(Vec::new()),
+            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct scaled survival model");
+        let scaled_state = scaled_model
+            .update_state(&beta)
+            .expect("evaluate scaled survival state");
+
+        let weighted_events = sampleweight
+            .iter()
+            .zip(event_target.iter())
+            .map(|(w, d)| *w * f64::from(*d))
+            .sum::<f64>();
+        let expected_deviance_shift = 2.0 * weighted_events * time_scale.ln();
+        assert!(
+            (scaled_state.deviance - base_state.deviance - expected_deviance_shift).abs() <= 1e-10,
+            "deviance shift mismatch: scaled={} base={} expected_shift={expected_deviance_shift}",
+            scaled_state.deviance,
+            base_state.deviance
+        );
+
+        for j in 0..beta.len() {
+            assert!(
+                (scaled_state.gradient[j] - base_state.gradient[j]).abs() <= 1e-12,
+                "gradient mismatch at j={j}: scaled={} base={}",
+                scaled_state.gradient[j],
+                base_state.gradient[j]
+            );
+        }
+
+        let base_hessian = base_state.hessian.to_dense();
+        let scaled_hessian = scaled_state.hessian.to_dense();
+        for r in 0..beta.len() {
+            for c in 0..beta.len() {
+                assert!(
+                    (scaled_hessian[[r, c]] - base_hessian[[r, c]]).abs() <= 1e-12,
+                    "hessian mismatch at ({r},{c}): scaled={} base={}",
+                    scaled_hessian[[r, c]],
+                    base_hessian[[r, c]]
+                );
+            }
         }
     }
 }

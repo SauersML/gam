@@ -24,7 +24,7 @@
 //! sharing across chains without duplication when general-mcmc clones the target.
 
 use crate::faer_ndarray::{FaerCholesky, fast_ata_into, fast_atv};
-use crate::types::LikelihoodFamily;
+use crate::types::{Coefficients, LikelihoodFamily};
 use crate::visualizer::VisualizerSession;
 use faer::Side;
 use general_mcmc::generic_hmc::HamiltonianTarget;
@@ -62,27 +62,28 @@ impl SamplingVisualizer {
         self.chain = chain;
         self.session
             .set_stage("sample", &format!("[Chain {}] {label}", chain + 1));
-        self.session.start_workflow("chains completed", self.total_chains.max(1));
+        self.session
+            .start_workflow("chains completed", self.total_chains.max(1));
         self.session.advance_workflow(chain);
         self.session
             .start_secondary_workflow(&format!("[Chain {}] Warmup", chain + 1), self.warmup);
     }
 
     fn warmup_step(&mut self, iter: usize) {
-        self.session.advance_secondary_workflow(iter.min(self.warmup));
+        self.session
+            .advance_secondary_workflow(iter.min(self.warmup));
     }
 
     fn start_sampling(&mut self) {
-        self.session.finish_secondary_progress(&format!(
-            "chain {} warmup complete",
-            self.chain + 1
-        ));
+        self.session
+            .finish_secondary_progress(&format!("chain {} warmup complete", self.chain + 1));
         self.session
             .start_secondary_workflow(&format!("[Chain {}] Sample", self.chain + 1), self.samples);
     }
 
     fn sample_step(&mut self, iter: usize) {
-        self.session.advance_secondary_workflow(iter.min(self.samples));
+        self.session
+            .advance_secondary_workflow(iter.min(self.samples));
     }
 
     fn finish_chain(&mut self, accept_rate: f64) {
@@ -1906,45 +1907,22 @@ pub fn run_nuts_sampling_flattened_family(
 
 mod survival_hmc {
     use super::*;
+    use crate::solver::pirls::WorkingModel;
     use crate::survival::{
-        MonotonicityPenalty, PenaltyBlocks, SurvivalEngineInputs, SurvivalSpec,
-        WorkingModelSurvival,
+        MonotonicityPenalty, PenaltyBlocks, StructuralTimeLatentSurvivalModel,
+        SurvivalEngineInputs, SurvivalSpec, WorkingModelSurvival,
     };
 
     /// Shared data for survival NUTS posterior (wrapped in Arc to prevent cloning).
     #[derive(Clone)]
     struct SharedSurvivalData {
-        /// Entry design matrix
-        x_entry: Arc<Array2<f64>>,
-        /// Exit design matrix
-        x_exit: Arc<Array2<f64>>,
-        /// Exit derivative design matrix
-        x_derivative: Arc<Array2<f64>>,
-        /// Optional baseline offsets carried through the survival predictor.
-        offset_eta_entry: Arc<Array1<f64>>,
-        offset_eta_exit: Arc<Array1<f64>>,
-        offset_derivative_exit: Arc<Array1<f64>>,
-        /// Sample weights
-        sampleweight: Arc<Array1<f64>>,
-        /// Event indicators (1 = event, 0 = censored)
-        event_target: Arc<Array1<u8>>,
-        /// Competing event indicators
-        event_competing: Arc<Array1<u8>>,
-        /// Entry ages
-        age_entry: Arc<Array1<f64>>,
-        /// Exit ages
-        age_exit: Arc<Array1<f64>>,
-        /// Penalty blocks
-        penalties: Arc<PenaltyBlocks>,
-        /// Monotonicity constraint
-        monotonicity: Arc<MonotonicityPenalty>,
-        /// Survival spec
-        spec: SurvivalSpec,
-        /// Whether structural monotonic reparameterization is active.
-        structurally_monotonic: bool,
+        /// Exact survival model in original spline coordinates.
+        base_model: Arc<WorkingModelSurvival>,
+        /// Exact latent-coordinate model for structural monotone time blocks.
+        latent_model: Option<Arc<StructuralTimeLatentSurvivalModel>>,
         /// Number of leading time columns in the structural reparameterization.
         structural_time_columns: usize,
-        /// MAP estimate (mode) μ [dim]
+        /// MAP estimate in the sampler's native coordinates.
         mode: Arc<Array1<f64>>,
     }
 
@@ -1980,58 +1958,6 @@ mod survival_hmc {
             }
         }
 
-        /// Smooth fallback target used only when the exact survival likelihood is
-        /// undefined due to monotonicity violations (`d_eta/dt <= tolerance`).
-        ///
-        /// This avoids an HMC brick wall (`-inf`) and provides a gradient that
-        /// pushes trajectories back toward the feasible monotone region.
-        fn monotonicity_surrogate_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
-            // Transform z (whitened) -> β (original): β = μ + L @ z
-            let beta = self.data.mode.as_ref() + &self.chol.dot(z);
-            // Keep fallback feasibility aligned with the exact monotonicity
-            // guard in WorkingModelSurvival::update_state:
-            //   d_eta_dt = X_derivative * beta + derivative_offset_exit.
-            // The offset shifts the barrier value but has zero beta-derivative.
-            let offset_derivative_exit = self.data.offset_derivative_exit.as_ref();
-            let d_eta_dt = self.data.x_derivative.dot(&beta) + offset_derivative_exit;
-            let tol = self.data.monotonicity.tolerance.max(1e-12);
-
-            // Barrier settings: smooth enough for HMC geometry, steep enough to
-            // strongly repel invalid monotonicity proposals.
-            let soft_scale = (0.1 * tol).max(1e-6);
-            let barrierweight = 100.0_f64;
-
-            let mut barrier = 0.0_f64;
-            let mut grad_beta = Array1::<f64>::zeros(beta.len());
-
-            for i in 0..d_eta_dt.len() {
-                let w = self.data.sampleweight[i];
-                if w <= 0.0 {
-                    continue;
-                }
-                let u = (tol - d_eta_dt[i]) / soft_scale;
-                let sp = Self::softplus(u);
-                let sig = Self::sigmoid(u);
-                barrier += w * sp * sp;
-
-                // d/d(d_eta_dt) [-barrierweight * w * softplus(u)^2]
-                // where u = (tol - d_eta_dt)/soft_scale.
-                let dlogp_dd = barrierweight * w * 2.0 * sp * sig / soft_scale;
-                let xrow = self.data.x_derivative.row(i);
-                for j in 0..grad_beta.len() {
-                    grad_beta[j] += dlogp_dd * xrow[j];
-                }
-            }
-
-            // Weak quadratic anchor in whitened coordinates prevents runaway
-            // excursions when the exact target is undefined.
-            let z2 = z.dot(z);
-            let logp = -0.5 * z2 - barrierweight * barrier;
-            let mut gradz = self.chol_t.dot(&grad_beta);
-            gradz -= z;
-            (logp, gradz)
-        }
-
         /// Creates a new survival posterior target.
         #[allow(clippy::too_many_arguments)]
         pub fn new(
@@ -2054,7 +1980,6 @@ mod survival_hmc {
             mode: ArrayView1<f64>,
             hessian: ArrayView2<f64>,
         ) -> Result<Self, String> {
-            let dim = mode.len();
             let n = age_entry.len();
             let off_eta_entry = offset_eta_entry
                 .map(|v| v.to_owned())
@@ -2066,9 +1991,69 @@ mod survival_hmc {
                 .map(|v| v.to_owned())
                 .unwrap_or_else(|| Array1::zeros(n));
 
+            let mut base_model = WorkingModelSurvival::from_engine_inputswith_offsets(
+                SurvivalEngineInputs {
+                    age_entry,
+                    age_exit,
+                    event_target,
+                    event_competing,
+                    sampleweight,
+                    x_entry,
+                    x_exit,
+                    x_derivative,
+                },
+                Some(crate::survival::SurvivalBaselineOffsets {
+                    eta_entry: off_eta_entry.view(),
+                    eta_exit: off_eta_exit.view(),
+                    derivative_exit: off_deriv_exit.view(),
+                }),
+                penalties,
+                monotonicity,
+                spec,
+            )
+            .map_err(|e| format!("Survival state construction failed: {:?}", e))?;
+            if structurally_monotonic {
+                base_model
+                    .set_structural_monotonicity(true, structural_time_columns)
+                    .map_err(|e| {
+                        format!("Failed to enable structural monotonicity in survival HMC: {e}")
+                    })?;
+            }
+
+            let (sampler_mode, whitening_hessian, latent_model) = if structurally_monotonic {
+                let lower_bounds = base_model
+                    .structural_time_coefficient_lower_bounds()
+                    .ok_or_else(|| {
+                        "structural survival HMC requires structural time lower bounds".to_string()
+                    })?;
+                let latent_model =
+                    StructuralTimeLatentSurvivalModel::new(base_model.clone(), lower_bounds)
+                        .map_err(|e| {
+                            format!("failed to construct structural survival latent HMC model: {e}")
+                        })?;
+                let latent_mode = latent_model
+                    .user_to_latent_coefficients(&mode.to_owned())
+                    .map_err(|e| {
+                        format!("failed to map survival HMC mode to latent coordinates: {e}")
+                    })?;
+                let mut latent_eval_model = latent_model.clone();
+                let latent_state = latent_eval_model
+                    .update(&Coefficients::new(latent_mode.clone()))
+                    .map_err(|e| {
+                        format!("failed to evaluate structural latent survival HMC state: {e}")
+                    })?;
+                (
+                    latent_mode,
+                    latent_state.hessian.to_dense(),
+                    Some(Arc::new(latent_model)),
+                )
+            } else {
+                (mode.to_owned(), hessian.to_owned(), None)
+            };
+            let dim = sampler_mode.len();
+
             // Compute whitening transform via Cholesky of Hessian
-            let hessian_owned = hessian.to_owned();
-            let chol_factor = hessian_owned
+            let chol_factor = whitening_hessian
                 .cholesky(Side::Lower)
                 .map_err(|e| format!("Hessian Cholesky decomposition failed: {:?}", e))?;
             let l_h = chol_factor.lower_triangular();
@@ -2076,23 +2061,10 @@ mod survival_hmc {
             let chol_t = chol.t().to_owned();
 
             let data = SharedSurvivalData {
-                x_entry: Arc::new(x_entry.to_owned()),
-                x_exit: Arc::new(x_exit.to_owned()),
-                x_derivative: Arc::new(x_derivative.to_owned()),
-                offset_eta_entry: Arc::new(off_eta_entry),
-                offset_eta_exit: Arc::new(off_eta_exit),
-                offset_derivative_exit: Arc::new(off_deriv_exit),
-                sampleweight: Arc::new(sampleweight.to_owned()),
-                event_target: Arc::new(event_target.to_owned()),
-                event_competing: Arc::new(event_competing.to_owned()),
-                age_entry: Arc::new(age_entry.to_owned()),
-                age_exit: Arc::new(age_exit.to_owned()),
-                penalties: Arc::new(penalties),
-                monotonicity: Arc::new(monotonicity),
-                spec,
-                structurally_monotonic,
+                base_model: Arc::new(base_model),
+                latent_model,
                 structural_time_columns,
-                mode: Arc::new(mode.to_owned()),
+                mode: Arc::new(sampler_mode),
             };
 
             Ok(Self { data, chol, chol_t })
@@ -2100,54 +2072,34 @@ mod survival_hmc {
 
         /// Compute log-posterior and gradient analytically.
         fn compute_logp_and_grad(&self, z: &Array1<f64>) -> Result<(f64, Array1<f64>), String> {
-            // Transform z (whitened) -> β (original): β = μ + L @ z
-            let beta = self.data.mode.as_ref() + &self.chol.dot(z);
+            let sampler_position = self.data.mode.as_ref() + &self.chol.dot(z);
 
-            // Create a temporary working model to compute likelihood
-            let mut model = WorkingModelSurvival::from_engine_inputswith_offsets(
-                SurvivalEngineInputs {
-                    age_entry: self.data.age_entry.view(),
-                    age_exit: self.data.age_exit.view(),
-                    event_target: self.data.event_target.view(),
-                    event_competing: self.data.event_competing.view(),
-                    sampleweight: self.data.sampleweight.view(),
-                    x_entry: self.data.x_entry.view(),
-                    x_exit: self.data.x_exit.view(),
-                    x_derivative: self.data.x_derivative.view(),
-                },
-                Some(crate::survival::SurvivalBaselineOffsets {
-                    eta_entry: self.data.offset_eta_entry.view(),
-                    eta_exit: self.data.offset_eta_exit.view(),
-                    derivative_exit: self.data.offset_derivative_exit.view(),
-                }),
-                self.data.penalties.as_ref().clone(),
-                self.data.monotonicity.as_ref().clone(),
-                self.data.spec,
-            )
-            .map_err(|e| format!("Survival state construction failed: {:?}", e))?;
-            if self.data.structurally_monotonic {
-                model
-                    .set_structural_monotonicity(true, self.data.structural_time_columns)
-                    .map_err(|e| {
-                        format!("Failed to enable structural monotonicity in survival HMC: {e}")
-                    })?;
+            if let Some(latent_model) = self.data.latent_model.as_ref() {
+                let mut latent_eval_model = latent_model.as_ref().clone();
+                let state = latent_eval_model
+                    .update(&Coefficients::new(sampler_position.clone()))
+                    .map_err(|e| format!("Survival latent state update failed: {e}"))?;
+                let mut grad_latent = state.gradient.mapv(|g| -g);
+                let mut log_jacobian = 0.0_f64;
+                for j in 0..self.data.structural_time_columns {
+                    let theta = sampler_position[j];
+                    let sigmoid = Self::sigmoid(theta);
+                    log_jacobian += -Self::softplus(-theta);
+                    grad_latent[j] += 1.0 - sigmoid;
+                }
+                let logp = -0.5 * (state.deviance + state.penalty_term) + log_jacobian;
+                let gradz = self.chol_t.dot(&grad_latent);
+                return Ok((logp, gradz));
             }
 
-            // Compute state (deviance and gradient in beta space)
-            let state = model
-                .update_state(&beta)
+            let state = self
+                .data
+                .base_model
+                .update_state(&sampler_position)
                 .map_err(|e| format!("Survival state update failed: {:?}", e))?;
-
-            // Survival WorkingState follows the same engine contract as GAM:
-            //   deviance = -2 log-likelihood (without quadratic penalties)
-            //   penalty_term = beta' S beta (+ stabilization ridge term)
-            //   gradient = d/dβ [0.5 * (deviance + penalty_term)].
             let logp = -0.5 * (state.deviance + state.penalty_term);
             let grad_beta = state.gradient.mapv(|g| -g);
-
-            // Chain rule to get gradient in z space: ∇z = L^T @ ∇_β
             let gradz = self.chol_t.dot(&grad_beta);
-
             Ok((logp, gradz))
         }
 
@@ -2170,20 +2122,9 @@ mod survival_hmc {
                     logp
                 }
                 Err(e) => {
-                    if e.contains("monotonicity violated") {
-                        let (logp, gradz) = self.monotonicity_surrogate_logp_and_grad(position);
-                        grad.assign(&gradz);
-                        log::debug!(
-                            "Survival posterior monotonicity fallback engaged (smooth barrier): {}",
-                            e
-                        );
-                        logp
-                    } else {
-                        // Non-monotonicity errors remain hard failures.
-                        log::warn!("Survival posterior evaluation failed: {}", e);
-                        grad.fill(0.0);
-                        f64::NEG_INFINITY
-                    }
+                    log::warn!("Survival posterior evaluation failed: {}", e);
+                    grad.fill(0.0);
+                    f64::NEG_INFINITY
                 }
             }
         }
@@ -2212,8 +2153,6 @@ mod survival_hmc {
         hessian: ArrayView2<f64>,
         config: &NutsConfig,
     ) -> Result<NutsResult, String> {
-        let dim = mode.len();
-
         // Create posterior target
         let target = SurvivalPosterior::new(
             age_entry,
@@ -2239,6 +2178,8 @@ mod survival_hmc {
         // Get Cholesky factor for un-whitening samples later
         let chol = target.chol().clone();
         let mode_arr = target.mode().clone();
+        let latent_model = target.data.latent_model.clone();
+        let dim = mode_arr.len();
 
         // Initialize chains at z=0 with small jitter
         let mut rng = StdRng::seed_from_u64(config.seed);
@@ -2282,8 +2223,18 @@ mod survival_hmc {
                 let zview = samples_array.slice(ndarray::s![chain, sample_i, ..]);
                 z_buffer.assign(&zview);
 
-                // Transform to β: β = μ + L @ z
-                let beta = &mode_arr + &chol.dot(&z_buffer);
+                let sampler_position = &mode_arr + &chol.dot(&z_buffer);
+                let beta = if let Some(latent_model) = latent_model.as_ref() {
+                    latent_model
+                        .latent_to_user_coefficients(&sampler_position)
+                        .map_err(|e| {
+                            format!(
+                                "failed to map structural survival HMC sample back to spline coefficients: {e}"
+                            )
+                        })?
+                } else {
+                    sampler_position
+                };
 
                 let sample_idx = chain * n_samples_out + sample_i;
                 samples.row_mut(sample_idx).assign(&beta);

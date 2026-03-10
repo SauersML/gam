@@ -3057,9 +3057,7 @@ pub(crate) fn fit_joint_modelwith_reml<'a>(
         reml_state
             .visualizer
             .set_stage("joint", &format!("candidate {label}"));
-        reml_state
-            .visualizer
-            .advance_workflow(candidate_idx);
+        reml_state.visualizer.advance_workflow(candidate_idx);
 
         snapshot.restore(&mut reml_state);
         let lower = Array1::<f64>::from_elem(rho.len(), -RHO_BOUND);

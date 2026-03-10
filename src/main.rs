@@ -1803,7 +1803,10 @@ fn run_predict_gaussian_location_scale(
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
 ) -> Result<(), String> {
-    progress.set_stage("predict", "building gaussian location-scale prediction design");
+    progress.set_stage(
+        "predict",
+        "building gaussian location-scale prediction design",
+    );
     let specmu = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -1898,7 +1901,10 @@ fn run_predict_binomial_location_scale(
     saved_mixture_param_cov: Option<&Array2<f64>>,
     saved_sas_param_cov: Option<&Array2<f64>>,
 ) -> Result<(), String> {
-    progress.set_stage("predict", "building binomial location-scale prediction design");
+    progress.set_stage(
+        "predict",
+        "building binomial location-scale prediction design",
+    );
     let spec_t = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -3323,9 +3329,7 @@ fn evaluate_survival_baseline(
     }
 }
 
-fn choose_survival_time_block_initial_coefficient(
-    min_uniform_time_coef: f64,
-) -> f64 {
+fn choose_survival_time_block_initial_coefficient(min_uniform_time_coef: f64) -> f64 {
     const INIT_MARGIN_FACTOR: f64 = 1.5;
     min_uniform_time_coef.max(0.0) * INIT_MARGIN_FACTOR
 }
@@ -4128,7 +4132,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             .map_err(|e| format!("failed to construct structural survival latent model: {e}"))?;
     let latent_beta0 = latent_model
         .user_to_latent_coefficients(&beta0)
-        .map_err(|e| format!("failed to map structural survival start point to latent coordinates: {e}"))?;
+        .map_err(|e| {
+            format!("failed to map structural survival start point to latent coordinates: {e}")
+        })?;
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
         convergence_tolerance: 1e-6,
@@ -4147,10 +4153,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     .map_err(|e| format!("survival latent-coordinate PIRLS failed: {e}"))?;
     let beta = latent_model
         .latent_to_user_coefficients(summary.beta.as_ref())
-        .map_err(|e| format!("failed to map structural survival optimum back to spline coefficients: {e}"))?;
-    let state = latent_model
-        .evaluate_user_state(&beta)
-        .map_err(|e| format!("failed to evaluate structural survival optimum in spline coordinates: {e}"))?;
+        .map_err(|e| {
+            format!("failed to map structural survival optimum back to spline coefficients: {e}")
+        })?;
+    let state = latent_model.evaluate_user_state(&beta).map_err(|e| {
+        format!("failed to evaluate structural survival optimum in spline coordinates: {e}")
+    })?;
     match summary.status {
         gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum => {}
         other => {
@@ -4686,7 +4694,10 @@ fn run_generate_gaussian_location_scale(
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
 ) -> Result<gam::generative::GenerativeSpec, String> {
-    progress.set_stage("generate", "building gaussian location-scale generation design");
+    progress.set_stage(
+        "generate",
+        "building gaussian location-scale generation design",
+    );
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -4747,7 +4758,10 @@ fn run_generate_binomial_location_scale(
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
 ) -> Result<gam::generative::GenerativeSpec, String> {
-    progress.set_stage("generate", "building binomial location-scale generation design");
+    progress.set_stage(
+        "generate",
+        "building binomial location-scale generation design",
+    );
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -8720,9 +8734,9 @@ mod tests {
         LikelihoodFamily, LinkMode, MODEL_VERSION, ParsedTerm, SavedFitSummary, SavedModel,
         SurvivalArgs, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalTimeBasisConfig,
         apply_saved_probitwiggle, build_survival_time_basis, chi_square_survival_approx,
-        classify_cli_error, collect_linear_smooth_overlapwarnings,
-        collect_spatial_smooth_usagewarnings, compute_probit_q0_from_eta, core_saved_fit_result,
-        choose_survival_time_block_initial_coefficient, effectivelinkwiggle_formulaspec,
+        choose_survival_time_block_initial_coefficient, classify_cli_error,
+        collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
+        compute_probit_q0_from_eta, core_saved_fit_result, effectivelinkwiggle_formulaspec,
         evaluate_survival_baseline, parse_duchon_order, parse_duchon_power, parse_formula,
         parse_link_choice, parse_surv_response, parse_survival_baseline_config,
         parse_survival_inverse_link, parse_survival_time_basis_config, pretty_familyname,
@@ -8776,6 +8790,104 @@ mod tests {
             max_abs_eta: 0.0,
             reml_score: 0.0,
         }
+    }
+
+    fn fit_structural_survival_eta_for_unit_test(
+        age_entry: &Array1<f64>,
+        age_exit: &Array1<f64>,
+        event_target: &Array1<u8>,
+        knots: Array1<f64>,
+    ) -> (Array1<f64>, Array1<f64>, f64) {
+        let time_build = build_survival_time_basis(
+            age_entry,
+            age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 2,
+                knots,
+                smooth_lambda: 1e-2,
+            },
+            None,
+        )
+        .expect("build structural survival time basis");
+        let p_time = time_build.x_exit_time.ncols();
+        let penalties = gam::survival::PenaltyBlocks::new(
+            time_build
+                .penalties
+                .iter()
+                .filter(|s| s.nrows() == p_time && s.ncols() == p_time)
+                .map(|s| gam::survival::PenaltyBlock {
+                    matrix: s.clone(),
+                    lambda: 1e-2,
+                    range: 0..p_time,
+                })
+                .collect(),
+        );
+        let event_competing = Array1::zeros(age_entry.len());
+        let weights = Array1::ones(age_entry.len());
+        let eta_offset_entry = Array1::zeros(age_entry.len());
+        let eta_offset_exit = Array1::zeros(age_entry.len());
+        let derivative_offset_exit = Array1::zeros(age_entry.len());
+        let mut model = gam::families::royston_parmar::working_model_from_flattened(
+            penalties,
+            gam::survival::MonotonicityPenalty { tolerance: 0.0 },
+            gam::survival::SurvivalSpec::Net,
+            gam::families::royston_parmar::RoystonParmarInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                weights: weights.view(),
+                x_entry: time_build.x_entry_time.view(),
+                x_exit: time_build.x_exit_time.view(),
+                x_derivative: time_build.x_derivative_time.view(),
+                eta_offset_entry: Some(eta_offset_entry.view()),
+                eta_offset_exit: Some(eta_offset_exit.view()),
+                derivative_offset_exit: Some(derivative_offset_exit.view()),
+            },
+        )
+        .expect("construct structural survival model");
+        model
+            .set_structural_monotonicity(true, p_time)
+            .expect("enable structural monotonicity");
+        let lower_bounds = model
+            .structural_time_coefficient_lower_bounds()
+            .expect("structural lower bounds");
+        let initial_floor = model
+            .structural_time_initial_coefficient_floor(1e-6)
+            .expect("structural initial floor");
+        let mut beta0 = Array1::<f64>::zeros(p_time);
+        let initial_time_coef = choose_survival_time_block_initial_coefficient(initial_floor);
+        beta0.fill(initial_time_coef);
+        let mut latent_model =
+            gam::survival::StructuralTimeLatentSurvivalModel::new(model, lower_bounds)
+                .expect("construct latent structural survival model");
+        let latent_beta0 = latent_model
+            .user_to_latent_coefficients(&beta0)
+            .expect("map structural beta start to latent coordinates");
+        let summary = gam::pirls::runworking_model_pirls(
+            &mut latent_model,
+            gam::types::Coefficients::new(latent_beta0),
+            &gam::pirls::WorkingModelPirlsOptions {
+                max_iterations: 400,
+                convergence_tolerance: 1e-8,
+                max_step_halving: 40,
+                min_step_size: 1e-12,
+                firth_bias_reduction: false,
+                coefficient_lower_bounds: None,
+                linear_constraints: None,
+            },
+            |_| {},
+        )
+        .expect("fit structural survival model");
+        let beta = latent_model
+            .latent_to_user_coefficients(summary.beta.as_ref())
+            .expect("map latent optimum to structural coefficients");
+        let eta = time_build.x_exit_time.dot(&beta);
+        let surv = survival_probability_from_eta(eta.view());
+        let state = latent_model
+            .evaluate_user_state(&beta)
+            .expect("evaluate fitted structural survival state");
+        (eta, surv, state.deviance)
     }
 
     fn csv_mean_at(path: &std::path::Path, row_idx: usize) -> f64 {
@@ -10555,6 +10667,126 @@ mod tests {
     }
 
     #[test]
+    fn ispline_time_basis_is_unit_invariant_up_to_derivative_scale() {
+        let age_entry = Array1::from_vec(vec![10.0, 20.0, 40.0, 80.0]);
+        let age_exit = Array1::from_vec(vec![15.0, 35.0, 60.0, 100.0]);
+        let knots_days = Array1::from_vec(vec![2.0, 2.0, 2.0, 2.0, 3.2, 4.0, 4.7, 4.7, 4.7, 4.7]);
+        let degree = 2usize;
+        let built_days = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree,
+                knots: knots_days.clone(),
+                smooth_lambda: 1e-2,
+            },
+            None,
+        )
+        .expect("build day-scale ispline time basis");
+
+        let time_scale = 365.25;
+        let age_entry_scaled = age_entry.mapv(|v| v / time_scale);
+        let age_exit_scaled = age_exit.mapv(|v| v / time_scale);
+        let knots_scaled = knots_days.mapv(|v| v - time_scale.ln());
+        let built_scaled = build_survival_time_basis(
+            &age_entry_scaled,
+            &age_exit_scaled,
+            SurvivalTimeBasisConfig::ISpline {
+                degree,
+                knots: knots_scaled,
+                smooth_lambda: 1e-2,
+            },
+            None,
+        )
+        .expect("build rescaled ispline time basis");
+
+        assert_eq!(
+            built_days.x_entry_time.dim(),
+            built_scaled.x_entry_time.dim()
+        );
+        assert_eq!(built_days.x_exit_time.dim(), built_scaled.x_exit_time.dim());
+        assert_eq!(
+            built_days.x_derivative_time.dim(),
+            built_scaled.x_derivative_time.dim()
+        );
+
+        for i in 0..built_days.x_entry_time.nrows() {
+            for j in 0..built_days.x_entry_time.ncols() {
+                assert!(
+                    (built_days.x_entry_time[[i, j]] - built_scaled.x_entry_time[[i, j]]).abs()
+                        <= 1e-12,
+                    "entry basis mismatch at ({i},{j})"
+                );
+                assert!(
+                    (built_days.x_exit_time[[i, j]] - built_scaled.x_exit_time[[i, j]]).abs()
+                        <= 1e-12,
+                    "exit basis mismatch at ({i},{j})"
+                );
+                assert!(
+                    (built_days.x_derivative_time[[i, j]]
+                        - built_scaled.x_derivative_time[[i, j]] / time_scale)
+                        .abs()
+                        <= 1e-12,
+                    "derivative basis mismatch at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn structural_survival_fit_is_time_unit_invariant() {
+        let age_entry_days = Array1::from_vec(vec![10.0, 20.0, 40.0, 80.0, 120.0, 160.0]);
+        let age_exit_days = Array1::from_vec(vec![15.0, 35.0, 60.0, 100.0, 150.0, 220.0]);
+        let event_target = Array1::from_vec(vec![1u8, 0u8, 1u8, 0u8, 1u8, 1u8]);
+        let knots_days =
+            Array1::from_vec(vec![2.0, 2.0, 2.0, 2.0, 3.2, 4.0, 4.7, 5.5, 5.5, 5.5, 5.5]);
+
+        let (eta_days, surv_days, deviance_days) = fit_structural_survival_eta_for_unit_test(
+            &age_entry_days,
+            &age_exit_days,
+            &event_target,
+            knots_days.clone(),
+        );
+
+        let time_scale = 365.25;
+        let age_entry_years = age_entry_days.mapv(|v| v / time_scale);
+        let age_exit_years = age_exit_days.mapv(|v| v / time_scale);
+        let knots_years = knots_days.mapv(|v| v - time_scale.ln());
+        let (eta_years, surv_years, deviance_years) = fit_structural_survival_eta_for_unit_test(
+            &age_entry_years,
+            &age_exit_years,
+            &event_target,
+            knots_years,
+        );
+
+        assert_eq!(eta_days.len(), eta_years.len());
+        assert_eq!(surv_days.len(), surv_years.len());
+        for i in 0..eta_days.len() {
+            assert!(
+                (eta_days[i] - eta_years[i]).abs() <= 1e-8,
+                "fitted eta mismatch at row {i}: days={} years={}",
+                eta_days[i],
+                eta_years[i]
+            );
+            assert!(
+                (surv_days[i] - surv_years[i]).abs() <= 1e-10,
+                "fitted survival mismatch at row {i}: days={} years={}",
+                surv_days[i],
+                surv_years[i]
+            );
+        }
+
+        let event_count = event_target.iter().map(|d| f64::from(*d)).sum::<f64>();
+        let expected_deviance_shift = 2.0 * event_count * time_scale.ln();
+        assert!(
+            (deviance_years - deviance_days - expected_deviance_shift).abs() <= 1e-8,
+            "fitted deviance shift mismatch: years={} days={} expected_shift={expected_deviance_shift}",
+            deviance_years,
+            deviance_days
+        );
+    }
+
+    #[test]
     fn ispline_time_basis_inference_falls_backwhen_quantile_knots_degenerate() {
         let age_entry = Array1::from_vec(vec![1e-9; 8]);
         let age_exit = Array1::from_vec(vec![1e-9, 1e-9, 1e-9, 1e-9, 0.5, 1.0, 2.0, 4.0]);
@@ -10636,9 +10868,8 @@ mod tests {
             .expect("entry design");
         let x_exit = Array2::from_shape_vec((2, 3), vec![0.2, 0.4, 1.0, 0.3, 0.5, 1.0])
             .expect("exit design");
-        let x_derivative =
-            Array2::from_shape_vec((2, 3), vec![3e-5, 2e-5, 0.0, 4e-5, 1e-5, 0.0])
-                .expect("derivative design");
+        let x_derivative = Array2::from_shape_vec((2, 3), vec![3e-5, 2e-5, 0.0, 4e-5, 1e-5, 0.0])
+            .expect("derivative design");
         let mut model = gam::survival::WorkingModelSurvival::from_engine_inputs(
             gam::survival::SurvivalEngineInputs {
                 age_entry: age_entry.view(),
