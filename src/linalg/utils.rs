@@ -453,8 +453,10 @@ where
 pub fn default_slq_parameters(dim: usize) -> (usize, usize) {
     let probes = if dim <= 32 {
         256
+    } else if dim <= 64 {
+        512
     } else if dim < 128 {
-        128
+        512
     } else if dim < 512 {
         48
     } else {
