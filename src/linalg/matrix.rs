@@ -21,19 +21,8 @@ struct PenalizedWeightedNormalOperator<'a, O: LinearOperator + ?Sized> {
 
 impl<'a, O: LinearOperator + ?Sized> PenalizedWeightedNormalOperator<'a, O> {
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let xv = self.operator.apply(vector);
-        let mut weighted_xv = xv;
-        for i in 0..weighted_xv.len() {
-            weighted_xv[i] *= self.weights[i].max(0.0);
-        }
-        let mut out = self.operator.apply_transpose(&weighted_xv);
-        if let Some(pen) = self.penalty {
-            out += &pen.dot(vector);
-        }
-        if self.ridge > 0.0 {
-            out += &vector.mapv(|x| self.ridge * x);
-        }
-        out
+        self.operator
+            .apply_weighted_normal(self.weights, vector, self.penalty, self.ridge)
     }
 
     fn jacobi_preconditioner(&self) -> Result<Array1<f64>, String> {
@@ -443,6 +432,27 @@ pub trait LinearOperator {
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64>;
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String>;
+    fn apply_weighted_normal(
+        &self,
+        weights: &Array1<f64>,
+        vector: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        ridge: f64,
+    ) -> Array1<f64> {
+        let xv = self.apply(vector);
+        let mut weighted_xv = xv;
+        for i in 0..weighted_xv.len() {
+            weighted_xv[i] *= weights[i].max(0.0);
+        }
+        let mut out = self.apply_transpose(&weighted_xv);
+        if let Some(pen) = penalty {
+            out += &pen.dot(vector);
+        }
+        if ridge > 0.0 {
+            out += &vector.mapv(|x| ridge * x);
+        }
+        out
+    }
     fn uses_matrix_free_pcg(&self) -> bool {
         false
     }
@@ -647,6 +657,60 @@ impl LinearOperator for DesignMatrix {
                     }
                 }
                 output
+            }
+        }
+    }
+
+    fn apply_weighted_normal(
+        &self,
+        weights: &Array1<f64>,
+        vector: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        ridge: f64,
+    ) -> Array1<f64> {
+        match self {
+            Self::Dense(x) => {
+                let p = x.ncols();
+                let mut out = Array1::<f64>::zeros(p);
+                for i in 0..x.nrows() {
+                    let wi = weights[i].max(0.0);
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    let mut row_dot = 0.0_f64;
+                    for j in 0..p {
+                        row_dot += x[[i, j]] * vector[j];
+                    }
+                    if row_dot == 0.0 {
+                        continue;
+                    }
+                    let scaled = wi * row_dot;
+                    for j in 0..p {
+                        out[j] += scaled * x[[i, j]];
+                    }
+                }
+                if let Some(pen) = penalty {
+                    out += &pen.dot(vector);
+                }
+                if ridge > 0.0 {
+                    out += &vector.mapv(|x| ridge * x);
+                }
+                out
+            }
+            Self::Sparse(_) => {
+                let xv = self.apply(vector);
+                let mut weighted_xv = xv;
+                for i in 0..weighted_xv.len() {
+                    weighted_xv[i] *= weights[i].max(0.0);
+                }
+                let mut out = self.apply_transpose(&weighted_xv);
+                if let Some(pen) = penalty {
+                    out += &pen.dot(vector);
+                }
+                if ridge > 0.0 {
+                    out += &vector.mapv(|x| ridge * x);
+                }
+                out
             }
         }
     }

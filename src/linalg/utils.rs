@@ -268,7 +268,22 @@ where
 
     let tol = rel_tol.max(1e-12) * rhs_norm.max(1.0);
     let mut x = Array1::<f64>::zeros(p);
-    let mut r = rhs.clone();
+    for i in 0..p {
+        x[i] = rhs[i] / preconditioner_diag[i].abs().max(1e-12);
+    }
+    let ax0 = apply(&x);
+    let mut r = rhs - &ax0;
+    let r0_norm = r.dot(&r).sqrt();
+    if r0_norm.is_finite() && r0_norm <= tol {
+        return x.iter().all(|v| v.is_finite()).then_some((
+            x,
+            PcgSolveInfo {
+                iterations: 0,
+                converged: true,
+                relative_residual_norm: r0_norm / rhs_norm.max(1.0),
+            },
+        ));
+    }
     let mut z = Array1::<f64>::zeros(p);
     for i in 0..p {
         z[i] = r[i] / preconditioner_diag[i].abs().max(1e-12);
@@ -291,6 +306,10 @@ where
         }
         x.scaled_add(alpha, &p_dir);
         r.scaled_add(-alpha, &ap);
+        if (iter + 1) % 32 == 0 {
+            let ax = apply(&x);
+            r = rhs - &ax;
+        }
         let r_norm = r.dot(&r).sqrt();
         if r_norm.is_finite() && r_norm <= tol {
             return x.iter().all(|v| v.is_finite()).then_some((
@@ -345,6 +364,13 @@ pub fn stochastic_lanczos_logdet_spd(
     if matrix.ncols() != p {
         return Err("SLQ requires a square matrix".to_string());
     }
+    if p <= 2048 {
+        let chol = matrix
+            .clone()
+            .cholesky(Side::Lower)
+            .map_err(|_| "SLQ exact dense-system Cholesky failed".to_string())?;
+        return Ok(2.0 * chol.diag().mapv(f64::ln).sum());
+    }
     stochastic_lanczos_logdet_spd_operator(
         p,
         |v| matrix.dot(v),
@@ -377,15 +403,53 @@ where
     let probes = num_probes.max(1);
     let steps = lanczos_steps.clamp(2, dim.max(2));
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut estimate = 0.0;
-    for _ in 0..probes {
-        let mut z = Array1::<f64>::zeros(dim);
-        for i in 0..dim {
-            z[i] = if rng.random::<bool>() { 1.0 } else { -1.0 };
-        }
-        estimate += lanczos_logdet_probe_operator(dim, &apply, &z, steps)?;
+    let probe_vectors = orthogonal_rademacher_probes(dim, probes, &mut rng);
+    let mut estimate = KahanSum::default();
+    for z in &probe_vectors {
+        estimate.add(lanczos_logdet_probe_operator(dim, &apply, z, steps)?);
     }
-    Ok(estimate / probes as f64)
+    Ok(estimate.sum() / probes as f64)
+}
+
+fn orthogonal_rademacher_probes(
+    dim: usize,
+    probes: usize,
+    rng: &mut StdRng,
+) -> Vec<Array1<f64>> {
+    let block = probes.min(dim.max(1));
+    let mut out = Vec::with_capacity(probes);
+    while out.len() < probes {
+        let remaining = probes - out.len();
+        let take = remaining.min(block);
+        let mut local = Vec::<Array1<f64>>::with_capacity(take);
+        for _ in 0..take {
+            let mut z = Array1::<f64>::zeros(dim);
+            for i in 0..dim {
+                z[i] = if rng.random::<bool>() { 1.0 } else { -1.0 };
+            }
+            for prev in &local {
+                let proj = prev.dot(&z) / prev.dot(prev).max(1e-12);
+                if proj != 0.0 {
+                    z.scaled_add(-proj, prev);
+                }
+            }
+            let norm = z.dot(&z).sqrt();
+            if norm > 1e-12 {
+                z.mapv_inplace(|v| v * (dim as f64).sqrt() / norm);
+                local.push(z);
+            }
+        }
+        if local.is_empty() {
+            let mut fallback = Array1::<f64>::zeros(dim);
+            for i in 0..dim {
+                fallback[i] = if rng.random::<bool>() { 1.0 } else { -1.0 };
+            }
+            out.push(fallback);
+        } else {
+            out.extend(local);
+        }
+    }
+    out
 }
 
 fn materialize_symmetric_operator<F>(dim: usize, apply: &F) -> Result<Array2<f64>, String>
