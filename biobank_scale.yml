@@ -11,43 +11,23 @@
   "upsample_batch_size": 5000,
   "methods": [
     {
-      "name": "rust_gam_additive_tps60",
-      "dataset": "disease",
-      "backend": "rust_gam",
-      "family": "binomial",
-      "spatial_basis": "thinplate",
-      "centers": 60,
-      "smooth_kind": "separate",
-      "include_sigma": false
-    },
-    {
-      "name": "rust_gam_additive_duchon60",
+      "name": "rust_gam_duchon60",
       "dataset": "disease",
       "backend": "rust_gam",
       "family": "binomial",
       "spatial_basis": "duchon",
       "centers": 60,
-      "smooth_kind": "separate",
+      "smooth_kind": "joint",
       "include_sigma": false
     },
     {
-      "name": "rust_gam_additive_matern60",
-      "dataset": "disease",
-      "backend": "rust_gam",
-      "family": "binomial",
-      "spatial_basis": "matern",
-      "centers": 60,
-      "smooth_kind": "separate",
-      "include_sigma": false
-    },
-    {
-      "name": "rust_gamlss_additive_duchon60",
+      "name": "rust_gamlss_duchon60",
       "dataset": "disease",
       "backend": "rust_gam",
       "family": "binomial",
       "spatial_basis": "duchon",
       "centers": 60,
-      "smooth_kind": "separate",
+      "smooth_kind": "joint",
       "include_sigma": true
     },
     {
@@ -78,15 +58,6 @@
       "spatial_basis": "matern",
       "centers": 60,
       "smooth_kind": "joint",
-      "include_sigma": false
-    },
-    {
-      "name": "rust_survival_transform_ps",
-      "dataset": "survival",
-      "backend": "rust_survival_transform",
-      "family": "survival",
-      "spatial_basis": "ps",
-      "smooth_kind": "separate",
       "include_sigma": false
     },
     {
