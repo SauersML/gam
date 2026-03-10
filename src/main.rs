@@ -774,6 +774,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let offset = Array1::zeros(ds.values.nrows());
     if let Some(choice) = link_choice.as_ref() {
         if matches!(choice.mode, LinkMode::Flexible) {
+            if choice.mixture_components.is_some() {
+                return Err(
+                    "flexible(blended(...)/mixture(...)) is currently supported only with --predict-noise binomial location-scale fitting or --survival-likelihood=location-scale"
+                        .to_string(),
+                );
+            }
             if has_bounded_terms {
                 return Err(
                     "flexible(...) links are not yet supported with bounded() coefficients"
@@ -889,7 +895,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 optimize_mixture: true,
                 sas_link: None,
                 optimize_sas: false,
-                compute_inference: false,
+                compute_inference: true,
                 max_iter: fit_max_iter,
                 tol: fit_tol,
                 nullspace_dims: design.nullspace_dims.clone(),
@@ -917,7 +923,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                     effective_link,
                     LinkFunction::Sas | LinkFunction::BetaLogistic
                 ),
-            compute_inference: false,
+            compute_inference: true,
             max_iter: fit_max_iter,
             tol: fit_tol,
             nullspace_dims: vec![],
@@ -8621,6 +8627,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
+        let td = tempdir().expect("tempdir");
+        let train_path = td.path().join("train.csv");
+        let model_path = td.path().join("model.json");
+        let pred_path = td.path().join("pred.csv");
+
+        fs::write(
+            &train_path,
+            "x1,x2,y\n-1.0,-0.5,0\n-0.8,0.2,0\n-0.3,-0.1,0\n0.1,0.0,0\n0.4,0.2,1\n0.8,0.5,1\n1.1,0.9,1\n1.4,1.0,1\n",
+        )
+        .expect("write training csv");
+
+        let fit_args = FitArgs {
+            data: train_path.clone(),
+            formula_positional: "y ~ x1 + x2".to_string(),
+            predict_noise: None,
+            firth: true,
+            survival_likelihood: "transformation".to_string(),
+            survival_time_anchor: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            time_degree: 3,
+            time_num_internal_knots: 8,
+            time_smooth_lambda: 1e-2,
+            ridge_lambda: 1e-6,
+            adaptive_regularization: false,
+            out: Some(model_path.clone()),
+        };
+        run_fit(fit_args).expect("Firth fit should succeed");
+
+        let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
+        let fit_result = saved
+            .fit_result
+            .as_ref()
+            .expect("fit_result should be saved");
+        assert!(
+            fit_result.beta_covariance().is_some()
+                || fit_result.beta_covariance_corrected().is_some(),
+            "CLI Firth fit should save covariance for default posterior-mean prediction",
+        );
+
+        let predict_args = PredictArgs {
+            model: model_path,
+            new_data: train_path,
+            out: pred_path.clone(),
+            uncertainty: false,
+            level: 0.95,
+            covariance_mode: CovarianceModeArg::Corrected,
+            mode: PredictModeArg::PosteriorMean,
+        };
+        run_predict(predict_args)
+            .expect("default posterior-mean predict should succeed after Firth fit");
+
+        let pred_text = fs::read_to_string(&pred_path).expect("read prediction csv");
+        let header = pred_text.lines().next().unwrap_or("");
+        assert!(
+            header.contains("mean"),
+            "prediction output missing mean column: {header}"
+        );
+    }
+
     fn intercept_only_gaussian_location_scale_model(
         beta_mu: f64,
         beta_log_sigma: f64,
@@ -10130,7 +10202,10 @@ mod tests {
         let link = parse_survival_inverse_link(&args).expect("flexible blended survival link");
         match link {
             InverseLink::Mixture(state) => {
-                assert_eq!(state.components, vec![LinkComponent::Logit, LinkComponent::Probit]);
+                assert_eq!(
+                    state.components,
+                    vec![LinkComponent::Logit, LinkComponent::Probit]
+                );
                 assert_eq!(state.rho.len(), 1);
             }
             other => panic!("expected blended survival inverse link, got {other:?}"),
