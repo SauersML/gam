@@ -5563,66 +5563,55 @@ pub fn compute_final_penalized_hessian(
     weights: &Array1<f64>,
     s_lambda: &Array2<f64>, // This is S_lambda = Σλ_k * S_k
 ) -> Result<Array2<f64>, EstimationError> {
-    use crate::faer_ndarray::{FaerEigh, FaerQr};
-    use ndarray::s;
+    use faer::linalg::matmul::matmul;
+    use faer::{Accum, Par};
 
+    if x.nrows() != weights.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "weights length {} does not match design rows {}",
+            weights.len(),
+            x.nrows()
+        )));
+    }
     let p = x.ncols();
-
-    // Stage: Perform the QR decomposition of sqrt(W)X to get R_bar
-    let sqrtw = weights.mapv(|w| w.max(0.0).sqrt());
-    let wx = &x * &sqrtw.view().insert_axis(ndarray::Axis(1));
-    let (_, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
-    let rrows = r_bar.nrows().min(p);
-    let r1_full = r_bar.slice(s![..rrows, ..]);
-
-    // Stage: Get the square root of the penalty matrix, E
-    // We need to use eigendecomposition as S_lambda is not necessarily from a single root
-    let (eigenvalues, eigenvectors) = s_lambda
-        .eigh(Side::Lower)
-        .map_err(EstimationError::EigendecompositionFailed)?;
-
-    // Find the maximum eigenvalue to create a relative tolerance
-    let max_eigenval = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-
-    // Define a relative tolerance. Use an absolute fallback for zero matrices.
-    let tolerance = if max_eigenval > 0.0 {
-        max_eigenval * 1e-12
-    } else {
-        1e-12
-    };
-
-    let rank_s = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-
-    let mut e = Array2::zeros((p, rank_s));
-    let mut col_idx = 0;
-    for (i, &eigenval) in eigenvalues.iter().enumerate() {
-        if eigenval > tolerance {
-            let scaled_eigvec = eigenvectors.column(i).mapv(|v| v * eigenval.sqrt());
-            e.column_mut(col_idx).assign(&scaled_eigvec);
-            col_idx += 1;
-        }
+    let n = x.nrows();
+    let mut xtwx = Array2::<f64>::zeros((p, p));
+    if n == 0 || p == 0 {
+        return Ok(xtwx + s_lambda);
     }
 
-    // Stage: Form the augmented matrix [R1; E_t]
-    // Note: Here we use the full, un-truncated matrices because we are just computing
-    // the Hessian for a given model, not performing rank detection.
-    let e_t = e.t();
-    let nr = rrows + e_t.nrows();
-    let mut augmented_matrix = Array2::zeros((nr, p));
-    augmented_matrix
-        .slice_mut(s![..rrows, ..])
-        .assign(&r1_full);
-    augmented_matrix.slice_mut(s![rrows.., ..]).assign(&e_t);
+    const MIN_ROWS: usize = 512;
+    const MAX_ROWS: usize = 2048;
+    const TARGET_BYTES: usize = 2 * 1024 * 1024;
+    let bytes_per_row = p.max(1) * std::mem::size_of::<f64>();
+    let chunk_rows = (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS).min(n);
+    let mut weighted_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    let mut xtwx_mat = array2_to_matmut(&mut xtwx);
+    for start in (0..n).step_by(chunk_rows) {
+        let rows = (n - start).min(chunk_rows);
+        {
+            let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
+            for local_row in 0..rows {
+                let src_row = start + local_row;
+                let sqrtw = weights[src_row].max(0.0).sqrt();
+                for col in 0..p {
+                    chunk[[local_row, col]] = x[[src_row, col]] * sqrtw;
+                }
+            }
+        }
+        let chunkview = weighted_chunk.slice(s![0..rows, ..]);
+        let faer_chunk = FaerArrayView::new(&chunkview);
+        matmul(
+            xtwx_mat.as_mut(),
+            Accum::Add,
+            faer_chunk.as_ref().transpose(),
+            faer_chunk.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+    }
 
-    // Stage: Perform the QR decomposition on the augmented matrix
-    let (_, r_aug) = augmented_matrix
-        .qr()
-        .map_err(EstimationError::LinearSystemSolveFailed)?;
-
-    // Stage: Recognize that the penalized Hessian is R_aug' * R_aug
-    let h_final = r_aug.t().dot(&r_aug);
-
-    Ok(h_final)
+    Ok(xtwx + s_lambda)
 }
 
 #[cfg(test)]

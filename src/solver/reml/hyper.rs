@@ -1046,11 +1046,11 @@ impl<'a> RemlState<'a> {
         for dir in hyper_dirs {
             x_tau_t.push(dir.x_tau_original.dot(&reparam_result.qs));
         }
-        let mut x_tau_tau_t = vec![vec![Array2::<f64>::zeros(x_eval.raw_dim()); psi_dim]; psi_dim];
+        let mut x_tau_tau_t = vec![vec![None; psi_dim]; psi_dim];
         for i in 0..psi_dim {
             for j in 0..psi_dim {
                 if let Some(x_ij) = Self::get_pairwisesecond_derivative(hyper_dirs, i, j, true) {
-                    x_tau_tau_t[i][j] = x_ij.dot(&reparam_result.qs);
+                    x_tau_tau_t[i][j] = Some(x_ij.dot(&reparam_result.qs));
                 }
             }
         }
@@ -1064,7 +1064,9 @@ impl<'a> RemlState<'a> {
             }
             for i in 0..psi_dim {
                 for j in 0..psi_dim {
-                    x_tau_tau_t[i][j] = x_tau_tau_t[i][j].dot(z);
+                    if let Some(x_ij) = x_tau_tau_t[i][j].as_mut() {
+                        *x_ij = x_ij.dot(z);
+                    }
                 }
             }
         }
@@ -1237,6 +1239,14 @@ impl<'a> RemlState<'a> {
         let mut a_tau_tau = vec![vec![Array2::<f64>::zeros((p_dim, p_dim)); psi_dim]; psi_dim];
         for i in 0..psi_dim {
             for j in 0..psi_dim {
+                if hyper_dirs[i].penaltysecond_components_for(j).is_none()
+                    && hyper_dirs
+                        .get(j)
+                        .and_then(|dir| dir.penaltysecond_components_for(i))
+                        .is_none()
+                {
+                    continue;
+                }
                 let mut total = Array2::<f64>::zeros((p_dim, p_dim));
                 for penalty_index in 0..rho.len() {
                     let mat = Self::transform_penalty_components(
@@ -1393,11 +1403,16 @@ impl<'a> RemlState<'a> {
                 //   a_tau[i].dot(beta_tau[j]) = S_{τ_i} β_{τ_j}.
                 let u_tau_j = -(w_diag * &eta_tau[j]);
                 let term1 = x_tau_t[i].t().dot(&u_tau_j);
-                let term1_xij = x_tau_tau_t[i][j].t().dot(&u);
+                let x_tau_tau_ij = x_tau_tau_t[i][j].as_ref();
+                let term1_xij = x_tau_tau_ij
+                    .map(|xij| xij.t().dot(&u))
+                    .unwrap_or_else(|| Array1::<f64>::zeros(p_dim));
                 let term2a = x_tau_t[j].t().dot(&(w_diag * &x_tau_beta[i]));
                 let term2b = x_eval.t().dot(&((&(c * &eta_tau[j])) * &x_tau_beta[i]));
                 let term2c = x_eval.t().dot(&(w_diag * &x_tau_t[i].dot(&beta_tau[j])));
-                let xij_beta = x_tau_tau_t[i][j].dot(&beta_eval);
+                let xij_beta = x_tau_tau_ij
+                    .map(|xij| xij.dot(&beta_eval))
+                    .unwrap_or_else(|| Array1::<f64>::zeros(x_eval.nrows()));
                 let term2d = x_eval.t().dot(&(w_diag * &xij_beta));
                 let mut g_ij = term1 + term1_xij
                     - term2a
@@ -1414,18 +1429,17 @@ impl<'a> RemlState<'a> {
                             .column(0)
                             .to_owned();
                     g_ij -= &gphi_ij;
-                    if x_tau_tau_t[i][j].iter().any(|v| *v != 0.0) {
-                        let xij_bundle =
-                            Self::firth_exact_tau_kernel(op, &x_tau_tau_t[i][j], &beta_eval, true);
+                    if let Some(xij) = x_tau_tau_ij {
+                        let xij_bundle = Self::firth_exact_tau_kernel(op, xij, &beta_eval, true);
                         g_ij -= &xij_bundle.gphi_tau;
                     }
                 }
                 let rhs_ij = -(&h_tau[j].dot(&beta_tau[i]) + &g_ij);
                 let beta_ij = solve_hvec(&rhs_ij);
-                let eta_ij = x_tau_tau_t[i][j].dot(&beta_eval)
-                    + x_tau_t[i].dot(&beta_tau[j])
+                let mut eta_ij = x_tau_t[i].dot(&beta_tau[j])
                     + x_tau_t[j].dot(&beta_tau[i])
                     + x_eval.dot(&beta_ij);
+                eta_ij += &xij_beta;
 
                 let diag_i = c * &eta_tau[i];
                 let diag_j = c * &eta_tau[j];
@@ -1433,8 +1447,10 @@ impl<'a> RemlState<'a> {
                 let diag_ij = &(&c_tau_j * &eta_tau[i]) + &(c * &eta_ij);
 
                 let mut h_ij = Array2::<f64>::zeros((p_dim, p_dim));
-                h_ij += &x_tau_tau_t[i][j].t().dot(&Self::row_scale(&x_eval, w_diag));
-                h_ij += &x_eval.t().dot(&Self::row_scale(&x_tau_tau_t[i][j], w_diag));
+                if let Some(xij) = x_tau_tau_ij {
+                    h_ij += &xij.t().dot(&Self::row_scale(&x_eval, w_diag));
+                    h_ij += &x_eval.t().dot(&Self::row_scale(xij, w_diag));
+                }
                 h_ij += &x_tau_t[i].t().dot(&Self::row_scale(&x_eval, &diag_j));
                 h_ij += &x_eval.t().dot(&Self::row_scale(&x_tau_t[i], &diag_j));
                 h_ij += &x_tau_t[i]
@@ -1455,12 +1471,10 @@ impl<'a> RemlState<'a> {
                     let dir_ij = Self::firth_direction(op, &beta_ij);
                     d1_trace_correction = trace_hdag_firth_first(op, &dir_ij);
                     d2_trace_correction = trace_hdag_firthsecond(op, &dirs[i], &dirs[j]);
-                    if x_tau_tau_t[i][j].iter().any(|v| *v != 0.0) {
-                        let xij_bundle =
-                            Self::firth_exact_tau_kernel(op, &x_tau_tau_t[i][j], &beta_eval, true);
+                    if let Some(xij) = x_tau_tau_ij {
+                        let xij_bundle = Self::firth_exact_tau_kernel(op, xij, &beta_eval, true);
                         if let Some(kernel) = xij_bundle.tau_kernel.as_ref() {
-                            dtau_trace_correction +=
-                                trace_hdag_firth_tau_partial(op, &x_tau_tau_t[i][j], kernel);
+                            dtau_trace_correction += trace_hdag_firth_tau_partial(op, xij, kernel);
                         }
                     }
                     if x_tau_t[i].iter().any(|v| *v != 0.0) {

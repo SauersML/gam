@@ -2,7 +2,6 @@ use crate::faer_ndarray::{
     FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
     rrqr_nullspace_basis,
 };
-use crate::linalg::faer_ndarray::FaerSvd;
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
@@ -6991,31 +6990,30 @@ fn stabilize_orthogonality_transform(
     transform: &Array2<f64>,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let constrained_basis = fast_ab(&basis_matrix, transform);
-    let (u_opt, singularvalues, vt_opt) = constrained_basis
-        .svd(true, true)
-        .map_err(BasisError::LinalgError)?;
-    let u = u_opt.expect("full SVD requested left singular vectors");
-    let vt = vt_opt.expect("full SVD requested right singular vectors");
-    let max_sv = singularvalues.iter().copied().fold(0.0_f64, f64::max);
+    let gram = fast_ata(&constrained_basis);
+    let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
+    let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
     let tol = default_rrqr_rank_alpha()
         * f64::EPSILON
         * (constrained_basis
             .nrows()
             .max(constrained_basis.ncols())
             .max(1) as f64)
-        * max_sv.max(1.0);
-    let keep = singularvalues.iter().filter(|&&sv| sv > tol).count();
+        * max_eval.max(1.0);
+    let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
     if keep == 0 {
         return Err(BasisError::ConstraintNullspaceNotFound);
     }
 
-    let basis_orthonormal = u.slice(s![.., 0..keep]).to_owned();
-    let v = vt.t().slice(s![.., 0..keep]).to_owned();
-    let mut inv_sigma = Array2::<f64>::zeros((keep, keep));
-    for i in 0..keep {
-        inv_sigma[[i, i]] = 1.0 / singularvalues[i].max(tol);
+    let eig_start = eigenvalues.len() - keep;
+    let kept_vectors = eigenvectors.slice(s![.., eig_start..]).to_owned();
+    let mut inv_sqrt = Array2::<f64>::zeros((keep, keep));
+    for (out_i, eig_i) in (eig_start..eigenvalues.len()).enumerate() {
+        inv_sqrt[[out_i, out_i]] = 1.0 / eigenvalues[eig_i].max(tol).sqrt();
     }
-    let stabilized_transform = fast_ab(transform, &fast_ab(&v, &inv_sigma));
+    let whitening = fast_ab(&kept_vectors, &inv_sqrt);
+    let basis_orthonormal = fast_ab(&constrained_basis, &whitening);
+    let stabilized_transform = fast_ab(transform, &whitening);
     Ok((basis_orthonormal, stabilized_transform))
 }
 
