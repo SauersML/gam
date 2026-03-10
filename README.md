@@ -173,7 +173,8 @@ gam fit train.csv 'y ~ x1 + smooth(x2)' \
 
 - Gaussian and binomial location-scale are supported.
 - For binomial location-scale with probit-style threshold/noise geometry, prediction semantics follow `P(Y=1|S,x)=Phi((S-T(x))/sigma(x))`.
-- `linkwiggle(...)` is supported on the mean formula path for location-scale workflows.
+- `linkwiggle(...)` is supported on the mean formula path for binomial location-scale workflows.
+- `linkwiggle(...)` is also supported for binomial mean-only fitting with non-flexible binomial links (`logit`, `probit`, `cloglog`, `sas`, `beta-logistic`, `blended(...)`) and for binomial `flexible(...)` mean fitting.
 
 ### 3) Survival fit (`Surv(entry, exit, event) ~ ...`)
 
@@ -201,7 +202,8 @@ Survival-specific behavior:
 
 - `--firth` is for binomial-logit mean models and is not supported with `--predict-noise`.
 - `--firth` is not supported with `bounded(...)` coefficients.
-- `linkwiggle(...)` requires location-scale-style fitting paths.
+- `linkwiggle(...)` is a link-deformation feature, not a location-scale-only feature.
+  Current support: binomial mean-only non-flexible links, binomial mean-only `flexible(...)`, binomial location-scale, and survival `location-scale`.
 - Flexible links are binomial-focused and have restrictions by mode (for example in survival, flexible links require `--survival-likelihood=location-scale`).
 
 ## Model I/O and Defaults
@@ -308,6 +310,14 @@ Prediction/report/sample/generate paths load new data with saved schema expectat
 gam fit train.csv \
   'y ~ bounded(mu_hat, min=0, max=1, target=0.75, strength=8) + smooth(x)' \
   --out bounded.model.json
+```
+
+### Binomial mean-only link wiggle
+
+```bash
+gam fit train.csv \
+  'y ~ smooth(x1) + link(type=blended(logit,cloglog)) + linkwiggle(degree=3, internal_knots=9)' \
+  --out mean_wiggle.model.json
 ```
 
 ### Flexible binomial link with location-scale

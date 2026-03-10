@@ -1111,6 +1111,17 @@ pub struct BinomialLogitSpec {
 }
 
 #[derive(Clone)]
+pub struct BinomialMeanWiggleSpec {
+    pub y: Array1<f64>,
+    pub weights: Array1<f64>,
+    pub link_kind: InverseLink,
+    pub wiggle_knots: Array1<f64>,
+    pub wiggle_degree: usize,
+    pub eta_block: ParameterBlockInput,
+    pub wiggle_block: ParameterBlockInput,
+}
+
+#[derive(Clone)]
 pub struct PoissonLogSpec {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
@@ -1366,6 +1377,49 @@ pub fn fit_binomial_logit(
     };
     let blocks = vec![spec.eta_block.intospec("eta")?];
     Ok(fit_custom_family(&family, &blocks, options)?)
+}
+
+pub fn fit_binomial_mean_wiggle(
+    spec: BinomialMeanWiggleSpec,
+    options: &BlockwiseFitOptions,
+) -> Result<BlockwiseFitResult, String> {
+    let n = spec.y.len();
+    validate_len_match("weights vs y", n, spec.weights.len())?;
+    validateweights(&spec.weights, "fit_binomial_mean_wiggle")?;
+    validate_binomial_response(&spec.y, "fit_binomial_mean_wiggle")?;
+    validate_blockrows("eta", n, &spec.eta_block)?;
+    validate_blockrows("wiggle", n, &spec.wiggle_block)?;
+    if matches!(spec.link_kind, InverseLink::Standard(LinkFunction::Identity)) {
+        return Err(
+            "fit_binomial_mean_wiggle does not support identity link".to_string(),
+        );
+    }
+    if spec.wiggle_degree < 1 {
+        return Err(format!(
+            "fit_binomial_mean_wiggle: wiggle_degree must be >= 1, got {}",
+            spec.wiggle_degree
+        ));
+    }
+    if spec.wiggle_knots.len() < spec.wiggle_degree + 2 {
+        return Err(format!(
+            "fit_binomial_mean_wiggle: wiggle_knots length {} is too short for degree {}",
+            spec.wiggle_knots.len(),
+            spec.wiggle_degree
+        ));
+    }
+
+    let family = BinomialMeanWiggleFamily {
+        y: spec.y,
+        weights: spec.weights,
+        link_kind: spec.link_kind,
+        wiggle_knots: spec.wiggle_knots,
+        wiggle_degree: spec.wiggle_degree,
+    };
+    let blocks = vec![
+        spec.eta_block.intospec("eta")?,
+        spec.wiggle_block.intospec("wiggle")?,
+    ];
+    fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
 }
 
 pub fn fit_poisson_log(
@@ -4724,6 +4778,218 @@ impl CustomFamilyGenerative for BinomialLogitFamily {
         let mean = block_states[Self::BLOCK_ETA]
             .eta
             .mapv(|e| 1.0 / (1.0 + (-e.clamp(-30.0, 30.0)).exp()));
+        Ok(GenerativeSpec {
+            mean,
+            noise: NoiseModel::Bernoulli,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct BinomialMeanWiggleFamily {
+    pub y: Array1<f64>,
+    pub weights: Array1<f64>,
+    pub link_kind: InverseLink,
+    pub wiggle_knots: Array1<f64>,
+    pub wiggle_degree: usize,
+}
+
+impl BinomialMeanWiggleFamily {
+    pub const BLOCK_ETA: usize = 0;
+    pub const BLOCK_WIGGLE: usize = 1;
+
+    fn wiggle_basiswith_options(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        options: BasisOptions,
+    ) -> Result<Array2<f64>, String> {
+        let (basis, _) = create_basis::<Dense>(
+            q0,
+            KnotSource::Provided(self.wiggle_knots.view()),
+            self.wiggle_degree,
+            options,
+        )
+        .map_err(|e| e.to_string())?;
+        let full = (*basis).clone();
+        let (z, _) = compute_geometric_constraint_transform(
+            &self.wiggle_knots,
+            self.wiggle_degree,
+            2,
+        )
+        .map_err(|e| e.to_string())?;
+        if full.ncols() != z.nrows() {
+            return Err(format!(
+                "wiggle basis/constraint mismatch: basis has {} columns but transform has {} rows",
+                full.ncols(),
+                z.nrows()
+            ));
+        }
+        Ok(full.dot(&z))
+    }
+
+    fn wiggle_design(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+        self.wiggle_basiswith_options(q0, BasisOptions::value())
+    }
+
+    fn wiggle_dq_dq0(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        betawiggle: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let d_constrained =
+            self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
+        if d_constrained.ncols() != betawiggle.len() {
+            return Err(format!(
+                "wiggle derivative/beta mismatch: basis has {} columns but betawiggle has {} coefficients",
+                d_constrained.ncols(),
+                betawiggle.len()
+            ));
+        }
+        Ok(d_constrained.dot(&betawiggle) + 1.0)
+    }
+}
+
+impl CustomFamily for BinomialMeanWiggleFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err("BinomialMeanWiggleFamily input size mismatch".to_string());
+        }
+        let dq_dq0 = self.wiggle_dq_dq0(eta.view(), betaw.view())?;
+        if dq_dq0.len() != n {
+            return Err(format!(
+                "BinomialMeanWiggleFamily dq/dq0 length mismatch: got {}, expected {}",
+                dq_dq0.len(),
+                n
+            ));
+        }
+
+        let mut ll = 0.0;
+        let mut z_eta = Array1::<f64>::zeros(n);
+        let mut w_eta = Array1::<f64>::zeros(n);
+        let mut z_wiggle = Array1::<f64>::zeros(n);
+        let mut w_wiggle = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let q = eta[i] + etaw[i];
+            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
+                .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
+            let mu = jet.mu.clamp(1e-12, 1.0 - 1e-12);
+            let yi = self.y[i];
+            let wi = self.weights[i];
+            ll += wi * (yi * mu.ln() + (1.0 - yi) * (1.0 - mu).ln());
+
+            let var = (mu * (1.0 - mu)).max(MIN_PROB);
+            let dmu_deta = jet.d1 * dq_dq0[i];
+            let dmu_dw = jet.d1;
+            if wi == 0.0 || !var.is_finite() {
+                z_eta[i] = eta[i];
+                z_wiggle[i] = etaw[i];
+                continue;
+            }
+
+            if dmu_deta.is_finite() {
+                w_eta[i] = floor_positiveweight(wi * (dmu_deta * dmu_deta / var), MIN_WEIGHT);
+                z_eta[i] = eta[i] + (yi - mu) / signedwith_floor(dmu_deta, MIN_DERIV);
+            } else {
+                z_eta[i] = eta[i];
+            }
+
+            if dmu_dw.is_finite() {
+                w_wiggle[i] = floor_positiveweight(wi * (dmu_dw * dmu_dw / var), MIN_WEIGHT);
+                z_wiggle[i] = etaw[i] + (yi - mu) / signedwith_floor(dmu_dw, MIN_DERIV);
+            } else {
+                z_wiggle[i] = etaw[i];
+            }
+        }
+
+        Ok(FamilyEvaluation {
+            log_likelihood: ll,
+            blockworking_sets: vec![
+                BlockWorkingSet::Diagonal {
+                    working_response: z_eta,
+                    working_weights: w_eta,
+                },
+                BlockWorkingSet::Diagonal {
+                    working_response: z_wiggle,
+                    working_weights: w_wiggle,
+                },
+            ],
+        })
+    }
+
+    fn known_link_wiggle(&self) -> Option<KnownLinkWiggle> {
+        match self.link_kind {
+            InverseLink::Standard(base_link) => Some(KnownLinkWiggle {
+                base_link,
+                wiggle_block: Some(Self::BLOCK_WIGGLE),
+            }),
+            _ => None,
+        }
+    }
+
+    fn block_geometry(
+        &self,
+        block_states: &[ParameterBlockState],
+        spec: &ParameterBlockSpec,
+    ) -> Result<(DesignMatrix, Array1<f64>), String> {
+        if spec.name != "wiggle" {
+            return Ok((spec.design.clone(), spec.offset.clone()));
+        }
+        if block_states.len() < 1 {
+            return Err("wiggle geometry requires eta block".to_string());
+        }
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        if eta.len() != self.y.len() {
+            return Err("BinomialMeanWiggleFamily eta size mismatch".to_string());
+        }
+        let x = self.wiggle_design(eta.view())?;
+        if x.ncols() != spec.design.ncols() {
+            return Err(format!(
+                "dynamic wiggle design col mismatch: got {}, expected {}",
+                x.ncols(),
+                spec.design.ncols()
+            ));
+        }
+        let nrows = x.nrows();
+        Ok((DesignMatrix::Dense(x), Array1::zeros(nrows)))
+    }
+
+    fn block_geometry_is_dynamic(&self) -> bool {
+        true
+    }
+}
+
+impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
+    fn generativespec(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<GenerativeSpec, String> {
+        if block_states.len() != 2 {
+            return Err(format!(
+                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                block_states.len()
+            ));
+        }
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        if eta.len() != self.y.len() || etaw.len() != self.y.len() {
+            return Err("BinomialMeanWiggleFamily generative size mismatch".to_string());
+        }
+        let mut mean = Array1::<f64>::zeros(self.y.len());
+        for i in 0..mean.len() {
+            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, eta[i] + etaw[i])
+                .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
+            mean[i] = jet.mu;
+        }
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Bernoulli,
