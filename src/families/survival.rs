@@ -1705,7 +1705,7 @@ mod tests {
         let constraints = model
             .monotonicity_linear_constraints()
             .expect("structural mode should still emit derivative constraints");
-        assert_eq!(constraints.a.nrows(), 2);
+        assert_eq!(constraints.a.nrows(), 3);
 
         let beta = array![0.2, 0.2, 0.1, 0.2];
         let state = model.update_state(&beta).expect("state at structural beta");

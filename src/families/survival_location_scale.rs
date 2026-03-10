@@ -2804,7 +2804,7 @@ mod tests {
     #[test]
     fn identified_time_blockzeroes_anchorrow() {
         let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
-        let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
+        let design_exit = array![[0.0, 1.0, 0.0], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
         let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
         let time_block = TimeBlockInput {
             design_entry,
