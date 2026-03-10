@@ -161,6 +161,8 @@ impl From<GlmLikelihoodFamily> for LikelihoodFamily {
 /// How ridge-adjusted determinants should be evaluated for outer criteria.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RidgeDeterminantMode {
+    /// Use exact full logdet for smaller systems and SLQ above a size threshold.
+    Auto,
     /// Use full log-determinant of the ridged matrix (requires SPD in practice).
     Full,
     /// Use stochastic Lanczos quadrature on the ridged SPD surface.
@@ -193,14 +195,22 @@ pub struct RidgePolicy {
 
 impl RidgePolicy {
     /// Default policy used by PIRLS/REML path:
-    /// treat stabilization ridge as an explicit `delta I` prior contribution.
+    /// treat stabilization ridge as an explicit `delta I` prior contribution
+    /// with adaptive logdet evaluation.
     pub fn explicit_stabilization_full() -> Self {
         Self {
             rho_independent: true,
             include_quadratic_penalty: true,
             include_penalty_logdet: true,
             include_laplacehessian: true,
+            determinant_mode: RidgeDeterminantMode::Auto,
+        }
+    }
+
+    pub fn explicit_stabilization_full_exact() -> Self {
+        Self {
             determinant_mode: RidgeDeterminantMode::Full,
+            ..Self::explicit_stabilization_full()
         }
     }
 
