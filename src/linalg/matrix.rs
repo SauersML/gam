@@ -10,6 +10,46 @@ const MATRIX_FREE_PCG_MIN_P: usize = 512;
 const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 
+struct PenalizedWeightedNormalOperator<'a, O: LinearOperator + ?Sized> {
+    operator: &'a O,
+    weights: &'a Array1<f64>,
+    penalty: Option<&'a Array2<f64>>,
+    ridge: f64,
+}
+
+impl<'a, O: LinearOperator + ?Sized> PenalizedWeightedNormalOperator<'a, O> {
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let xv = self.operator.apply(vector);
+        let mut weighted_xv = xv;
+        for i in 0..weighted_xv.len() {
+            weighted_xv[i] *= self.weights[i].max(0.0);
+        }
+        let mut out = self.operator.apply_transpose(&weighted_xv);
+        if let Some(pen) = self.penalty {
+            out += &pen.dot(vector);
+        }
+        if self.ridge > 0.0 {
+            out += &vector.mapv(|x| self.ridge * x);
+        }
+        out
+    }
+
+    fn jacobi_preconditioner(&self) -> Result<Array1<f64>, String> {
+        let mut diag = self.operator.diag_gram(self.weights)?;
+        if let Some(pen) = self.penalty {
+            for i in 0..diag.len() {
+                diag[i] += pen[[i, i]];
+            }
+        }
+        if self.ridge > 0.0 {
+            for i in 0..diag.len() {
+                diag[i] += self.ridge;
+            }
+        }
+        Ok(diag)
+    }
+}
+
 #[inline]
 fn dense_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<f64> {
     let nrows = matrix.nrows();
@@ -457,40 +497,21 @@ pub trait LinearOperator {
             0.0
         };
         if self.uses_matrix_free_pcg() && self.ncols() >= MATRIX_FREE_PCG_MIN_P {
-            let mut preconditioner = self.diag_gram(weights)?;
-            if let Some(pen) = penalty {
-                for i in 0..preconditioner.len() {
-                    preconditioner[i] += pen[[i, i]];
-                }
-            }
             for retry in 0..8 {
                 let ridge = if baseridge > 0.0 {
                     baseridge * 10f64.powi(retry as i32)
                 } else {
                     0.0
                 };
-                let mut precond_retry = preconditioner.clone();
-                if ridge > 0.0 {
-                    for i in 0..precond_retry.len() {
-                        precond_retry[i] += ridge;
-                    }
-                }
+                let normal_op = PenalizedWeightedNormalOperator {
+                    operator: self,
+                    weights,
+                    penalty,
+                    ridge,
+                };
+                let precond_retry = normal_op.jacobi_preconditioner()?;
                 let solved = crate::linalg::utils::solve_spd_pcg(
-                    |v| {
-                        let xv = self.apply(v);
-                        let mut weighted_xv = xv;
-                        for i in 0..weighted_xv.len() {
-                            weighted_xv[i] *= weights[i].max(0.0);
-                        }
-                        let mut out = self.apply_transpose(&weighted_xv);
-                        if let Some(pen) = penalty {
-                            out += &pen.dot(v);
-                        }
-                        if ridge > 0.0 {
-                            out += &v.mapv(|x| ridge * x);
-                        }
-                        out
-                    },
+                    |v| normal_op.apply(v),
                     rhs,
                     &precond_retry,
                     MATRIX_FREE_PCG_REL_TOL,
